@@ -55,11 +55,6 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-# Compat alias only: sentry-sdk moved into base dependencies (see above). The old
-# `pip install "multideck[sentry]"` compat is superseded by the rename, but the
-# alias extra survives on the new dist name, so
-# `pip install "magent-multi-ai-agents-manager[sentry]"` still resolves.
-sentry = ["sentry-sdk>=2"]
 toast = ["winotify>=1.1.0"]
 qr = ["qrcode>=7"]
 # pexpect drives the POSIX real-PTY menu tests; pywinpty (win32-only wheels)

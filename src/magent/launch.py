@@ -240,8 +240,7 @@ def _launch_projects(
     win_snapshot = plat.snapshot_windows()
 
     def _is_running(key: str, mode: str) -> bool:
-        # "md-name" is the pre-rename spelling, still accepted as a deprecated alias.
-        if mode in ("magent-name", "md-name"):
+        if mode == "magent-name":
             return any(
                 (parsed := parse_title(t)) is not None and parsed[0] == key
                 for t in win_snapshot

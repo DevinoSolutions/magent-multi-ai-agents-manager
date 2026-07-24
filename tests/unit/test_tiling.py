@@ -267,17 +267,6 @@ class TestPlaceWindows:
         assert (7, Rect(x=0, y=0, w=960, h=1080)) in fp.moved
         assert all(h != 9 for h, _ in fp.moved)
 
-    def test_legacy_md_name_alias_still_resolves(self, fake_sleep):
-        # "md-name" is the pre-rename spelling; it must keep resolving so old
-        # producers/configs still tile. Canonical value is "magent-name".
-        fp = _FakeTilePlat(windows={"magent:api": 7})
-        placements = [Placement(key="api", mode="md-name", slot=_slot())]
-
-        placed, missing = place_windows(fp, placements)
-
-        assert [p.key for p in placed] == ["api"]
-        assert missing == []
-
     def test_magent_name_requires_exact_name_not_substring(self, fake_sleep):
         fp = _FakeTilePlat(windows={"magent:api-v2": 7})
         placements = [Placement(key="api", mode="magent-name", slot=_slot())]

@@ -28,7 +28,7 @@ POLL_INTERVAL_S = 1.0
 @dataclass
 class Placement:
     key: str  # match string: bare name for magent-name, exact title, or substring for contains
-    mode: str  # "magent-name" (legacy alias: "md-name") | "exact" | "contains"
+    mode: str  # "magent-name" | "exact" | "contains"
     slot: TileSlot  # destination rect (carries monitor_index for screen labelling)
     name: str = ""  # display label for callbacks; defaults to key
 
@@ -38,8 +38,7 @@ class Placement:
 
 
 def _lookup(snap: dict[str, object], key: str, mode: str) -> object | None:
-    # "md-name" is the pre-rename spelling, still accepted as a deprecated alias.
-    if mode in ("magent-name", "md-name"):
+    if mode == "magent-name":
         # Match magent-owned windows by parsed name so a state badge in
         # the title (titles.make_title) never breaks resolution.
         for title, handle in snap.items():

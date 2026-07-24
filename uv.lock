@@ -281,9 +281,6 @@ dev = [
 qr = [
     { name = "qrcode" },
 ]
-sentry = [
-    { name = "sentry-sdk" },
-]
 toast = [
     { name = "winotify" },
 ]
@@ -300,12 +297,11 @@ requires-dist = [
     { name = "qrcode", marker = "extra == 'qr'", specifier = ">=7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15" },
     { name = "sentry-sdk", specifier = ">=2" },
-    { name = "sentry-sdk", marker = "extra == 'sentry'", specifier = ">=2" },
     { name = "ty", marker = "extra == 'dev'", specifier = "==0.0.59" },
     { name = "vulture", marker = "extra == 'dev'", specifier = ">=2.14" },
     { name = "winotify", marker = "extra == 'toast'", specifier = ">=1.1.0" },
 ]
-provides-extras = ["sentry", "toast", "qr", "dev", "browser"]
+provides-extras = ["toast", "qr", "dev", "browser"]
 
 [[package]]
 name = "packaging"
