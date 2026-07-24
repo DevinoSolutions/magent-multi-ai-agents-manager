@@ -51,6 +51,16 @@ def test_version(runner):
     assert re.search(r"\d+\.\d+", result.output)
 
 
+def test_version_derives_from_installed_metadata():
+    # Guards against a hardcoded __version__ regression: the dunder must track
+    # the installed distribution's real version, not a literal string.
+    from importlib.metadata import version
+
+    import magent
+
+    assert magent.__version__ == version("magent-multi-ai-agents-manager")
+
+
 def test_docs_runs(runner):
     result = runner.invoke(main, ["docs"])
     assert result.exit_code == 0
