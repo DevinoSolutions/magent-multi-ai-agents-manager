@@ -100,9 +100,15 @@ def _run(entry_point: Path, *args: str, home: Path, cwd: Path, **kw):
 
 
 def test_installed_entry_point_reports_version(packaged, home, neutral_cwd):
+    """The installed CLI must report the version of the wheel it came from
+    (metadata-derived) -- pinning the exact built version catches both a
+    regression to a hardcoded string and a stale-metadata packaging fault."""
+    wheel_version = packaged.wheel.name.split("-")[1]
     r = _run(packaged.entry_point, "--version", home=home, cwd=neutral_cwd)
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
-    assert "1.0.0" in r.stdout, f"version banner missing 1.0.0:\n{r.stdout}"
+    assert wheel_version in r.stdout, (
+        f"version banner missing {wheel_version}:\n{r.stdout}"
+    )
 
 
 def test_installed_entry_point_shows_help(packaged, home, neutral_cwd):
