@@ -1,12 +1,12 @@
 [project]
-name = "multideck"
+name = "magent-multi-ai-agents-manager"
 version = "1.0.0"
 description = "Launch each project's AI coding agent in its own terminal, auto-tiled across every monitor"
 readme = "README.md"
 license = "AGPL-3.0"
 requires-python = ">=3.10"
 # sentry-sdk is a base dep on purpose: error reporting is env-gated (off until
-# MULTIDECK_SENTRY_DSN is set), but when the DSN IS set the SDK must exist —
+# MAGENT_SENTRY_DSN is set), but when the DSN IS set the SDK must exist —
 # bundling makes the "DSN set, SDK missing" state unrepresentable in a healthy
 # install instead of a warning users have to act on.
 dependencies = ["click>=8.0", "pydantic-settings>=2.14", "sentry-sdk>=2"]
@@ -55,8 +55,10 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-# Compat alias only: sentry-sdk moved into base dependencies (see above), but
-# existing `pip install "multideck[sentry]"` invocations must keep resolving.
+# Compat alias only: sentry-sdk moved into base dependencies (see above). The old
+# `pip install "multideck[sentry]"` compat is superseded by the rename, but the
+# alias extra survives on the new dist name, so
+# `pip install "magent-multi-ai-agents-manager[sentry]"` still resolves.
 sentry = ["sentry-sdk>=2"]
 toast = ["winotify>=1.1.0"]
 qr = ["qrcode>=7"]
@@ -71,21 +73,21 @@ dev = ["pytest>=7.0", "pexpect>=4.8", "pywinpty>=2.0; sys_platform == 'win32'", 
 browser = ["playwright>=1.40"]
 
 [project.scripts]
-multideck = "multideck.cli:main"
+magent = "magent.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/DevinoSolutions/multideck-ai-agents-manager"
-Documentation = "https://github.com/DevinoSolutions/multideck-ai-agents-manager#readme"
-Repository = "https://github.com/DevinoSolutions/multideck-ai-agents-manager"
-Issues = "https://github.com/DevinoSolutions/multideck-ai-agents-manager/issues"
-Changelog = "https://github.com/DevinoSolutions/multideck-ai-agents-manager/blob/main/CHANGELOG.md"
+Homepage = "https://magent.io"
+Documentation = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager#readme"
+Repository = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager"
+Issues = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/issues"
+Changelog = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/multideck"]
+packages = ["src/magent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -101,7 +103,7 @@ markers = [
     "wt_cold: wt cold-broker pin (first-ever wt launch on a fresh runner; CI-only, gated on MDTEST_WT_COLD=1)",
     "interaction: real-input interaction tests (SendInput + real clipboard; CI-only, gated on MDTEST_INTERACTION=1)",
     "needs_tailscale: e2e tests that require a live Tailscale node (CI-only, gated on MDTEST_TAILSCALE=1; skipped locally)",
-    "node_contract: run the REAL published agent-state writer under real node and check multideck's reader against it (needs node/npm + npm registry; skips cleanly otherwise)",
+    "node_contract: run the REAL published agent-state writer under real node and check magent's reader against it (needs node/npm + npm registry; skips cleanly otherwise)",
     "soak: long-run daemon stability tests (serve + attention -d under sustained churn for tens of minutes; CI-only, gated on MDTEST_SOAK=1)",
 ]
 
@@ -157,11 +159,11 @@ max-statements = 194
 # here for that reason; they're in scripts/lint_rules.py (MD001/MD002) instead.
 # Staged rollout: click.style lands now (the S->style rename already cleared it);
 # typing.Any joins in Phase 3 (with ANN401, under the Any purge); os.environ /
-# os.getenv join in Phase 5 (once multideck.env owns process-env access).
-"click.style" = { msg = "Use multideck.style.style — the single styling seam [LS-A-003]." }
+# os.getenv join in Phase 5 (once magent.env owns process-env access).
+"click.style" = { msg = "Use magent.style.style — the single styling seam [LS-A-003]." }
 "typing.Any" = { msg = "Use object + isinstance narrowing — no typing.Any anywhere in src [Phase-3 audit §6.2]." }
-"os.environ" = { msg = "Use multideck.env accessors — env.py is the single env-access seam [Phase-5 audit §8]." }
-"os.getenv" = { msg = "Use multideck.env accessors — env.py is the single env-access seam [Phase-5 audit §8]." }
+"os.environ" = { msg = "Use magent.env accessors — env.py is the single env-access seam [Phase-5 audit §8]." }
+"os.getenv" = { msg = "Use magent.env accessors — env.py is the single env-access seam [Phase-5 audit §8]." }
 
 [tool.ruff.lint.per-file-ignores]
 "scripts/**" = ["T201"]  # check.py & tooling print by design
@@ -172,8 +174,8 @@ max-statements = 194
   "ANN401",   # tests are not strict-typed yet (tests-strict is staged); Any is acceptable in test helpers
   "TID251",   # tests import typing.Any freely; the ban targets src only
 ]
-"src/multideck/style.py" = ["TID251"]  # the click.style ban's origin seam (1-line module; residual risk accepted)
-"src/multideck/env.py" = ["TID251"]   # the os.environ ban's origin seam — env.py IS the env-access layer
+"src/magent/style.py" = ["TID251"]  # the click.style ban's origin seam (1-line module; residual risk accepted)
+"src/magent/env.py" = ["TID251"]   # the os.environ ban's origin seam — env.py IS the env-access layer
 
 [tool.ty.environment]
 python-version = "3.13"

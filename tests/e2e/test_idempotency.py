@@ -10,7 +10,7 @@ pytestmark = pytest.mark.e2e
 class TestIdempotency:
     def test_dry_run_twice_same_output(self, tmp_path):
         (tmp_path / "api").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -22,7 +22,7 @@ class TestIdempotency:
         cmd = [
             sys.executable,
             "-m",
-            "multideck",
+            "magent",
             "--go",
             "--dry-run",
             "--config",

@@ -28,7 +28,7 @@ ROOT_ALLOWLIST = frozenset(
         "CLAUDE.md",
         "DESIGN.md",
         "LICENSE",
-        "multideck.config.example.json",
+        "magent.config.example.json",
         "package.json",
         "package-lock.json",
         "pyproject.toml",

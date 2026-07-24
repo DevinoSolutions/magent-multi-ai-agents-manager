@@ -1,4 +1,4 @@
-"""Unit tests for multideck.launch.run_multideck's no-monitors error path
+"""Unit tests for magent.launch.run_magent's no-monitors error path
 (F-D2-003 / F-D2-001: there was previously no test_launch.py at all).
 
 Cross-platform: FakePlatform (tests/conftest.py) stands in for a real
@@ -13,9 +13,9 @@ import time
 
 import pytest
 
-from multideck.config import MultideckConfig, ProjectConfig, Settings, WindowConfig
-from multideck.grid import MonitorRect, Rect, compute_grid
-from multideck.launch import (
+from magent.config import MagentConfig, ProjectConfig, Settings, WindowConfig
+from magent.grid import MonitorRect, Rect, compute_grid
+from magent.launch import (
     RunOpts,
     _dispatch_cli_agent_project,
     _dispatch_ide_project,
@@ -28,9 +28,9 @@ from multideck.launch import (
     _Target,
     _tile_targets,
     eligible_psmux_projects,
-    run_multideck,
+    run_magent,
 )
-from multideck.platform import PsmuxWindowOpts, TerminalNotFoundError
+from magent.platform import PsmuxWindowOpts, TerminalNotFoundError
 from tests.conftest import FakePlatform
 
 
@@ -40,11 +40,11 @@ class TestNoMonitors:
         # set_dpi_aware() -- the no-monitors guard returns before
         # snapshot_windows or anything else on Platform is touched.
         fp = FakePlatform(monitors=[])
-        monkeypatch.setattr("multideck.launch.get_platform", lambda: fp)
-        cfg = MultideckConfig(projects=[])
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+        cfg = MagentConfig(projects=[])
 
-        with caplog.at_level("ERROR", logger="multideck.launch"):
-            rc = run_multideck(cfg, RunOpts())
+        with caplog.at_level("ERROR", logger="magent.launch"):
+            rc = run_magent(cfg, RunOpts())
 
         assert rc == 2
         assert "no monitors detected" in caplog.text
@@ -67,42 +67,42 @@ def fake_sleep(monkeypatch):
     return calls
 
 
-class TestRunMultideckCharacterization:
-    """Whole-function behavior pins for run_multideck (R4), written BEFORE
+class TestRunMagentCharacterization:
+    """Whole-function behavior pins for run_magent (R4), written BEFORE
     the phase extraction so every later extraction step is judged against
-    locked behavior. Each test drives run_multideck directly (not through
+    locked behavior. Each test drives run_magent directly (not through
     the CLI) and asserts on the fake_platform double's call record -- never
     on full-output equality (style/spacing may drift)."""
 
     def test_happy_local_cli_agent_launches_then_tiles(
         self, fake_platform, tmp_path, fake_sleep
     ):
-        cfg = MultideckConfig(
+        cfg = MagentConfig(
             projects=[ProjectConfig(path=str(tmp_path), tool="claude", title="proj")],
             settings=Settings(
                 tools={"claude": "claude --continue"}, default_tool="claude"
             ),
         )
 
-        rc = run_multideck(cfg, RunOpts())
+        rc = run_magent(cfg, RunOpts())
 
         assert rc == 0
         assert len(fake_platform.launched_terminals) == 1
-        assert fake_platform.launched_terminals[0].title == "md:proj"
+        assert fake_platform.launched_terminals[0].title == "magent:proj"
         assert len(fake_platform.moved) == 1
         assert fake_platform.moved[0][1] == Rect(x=0, y=0, w=960, h=1080)
 
     def test_dry_run_launches_and_moves_nothing(
         self, fake_platform, tmp_path, fake_sleep, capsys
     ):
-        cfg = MultideckConfig(
+        cfg = MagentConfig(
             projects=[ProjectConfig(path=str(tmp_path), tool="claude", title="proj")],
             settings=Settings(
                 tools={"claude": "claude --continue"}, default_tool="claude"
             ),
         )
 
-        rc = run_multideck(cfg, RunOpts(dry_run=True))
+        rc = run_magent(cfg, RunOpts(dry_run=True))
 
         assert rc == 0
         assert fake_platform.launched_terminals == []
@@ -111,14 +111,14 @@ class TestRunMultideckCharacterization:
         assert "DRY RUN" in capsys.readouterr().out
 
     def test_ide_project_launches_vscode(self, fake_platform, tmp_path, fake_sleep):
-        cfg = MultideckConfig(
+        cfg = MagentConfig(
             projects=[ProjectConfig(path=str(tmp_path), tool="code")],
             settings=Settings(
                 tools={"claude": "claude --continue"}, default_tool="claude"
             ),
         )
 
-        rc = run_multideck(cfg, RunOpts())
+        rc = run_magent(cfg, RunOpts())
 
         assert rc == 0
         assert len(fake_platform.launched_vscode) == 1
@@ -126,15 +126,15 @@ class TestRunMultideckCharacterization:
 
     def test_psmux_path_collects_and_attaches(self, monkeypatch, tmp_path, fake_sleep):
         fp = FakePlatform(supports_psmux=True)
-        monkeypatch.setattr("multideck.launch.get_platform", lambda: fp)
-        cfg = MultideckConfig(
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+        cfg = MagentConfig(
             projects=[ProjectConfig(path=str(tmp_path), tool="claude", title="proj")],
             settings=Settings(
                 tools={"claude": "claude --continue"}, default_tool="claude", psmux=True
             ),
         )
 
-        rc = run_multideck(cfg, RunOpts())
+        rc = run_magent(cfg, RunOpts())
 
         assert rc == 0
         assert len(fp.launched_psmux) == 1
@@ -144,32 +144,32 @@ class TestRunMultideckCharacterization:
     def test_empty_group_returns_zero(
         self, fake_platform, tmp_path, fake_sleep, capsys
     ):
-        cfg = MultideckConfig(
+        cfg = MagentConfig(
             projects=[ProjectConfig(path=str(tmp_path), tool="claude", title="proj")],
             settings=Settings(
                 tools={"claude": "claude --continue"}, default_tool="claude"
             ),
         )
 
-        rc = run_multideck(cfg, RunOpts(group="nope"))
+        rc = run_magent(cfg, RunOpts(group="nope"))
 
         assert rc == 0
         assert fake_platform.launched_terminals == []
         assert "No projects in group" in capsys.readouterr().err
 
     def test_retile_all_places_running_window(self, monkeypatch, tmp_path, fake_sleep):
-        # Live windows carry md:-grammar titles (possibly badged); resolution
+        # Live windows carry magent:-grammar titles (possibly badged); resolution
         # goes through parse_title, so a badge must not break retiling.
-        fp = FakePlatform(windows={"md:[!] proj": 555})
-        monkeypatch.setattr("multideck.launch.get_platform", lambda: fp)
-        cfg = MultideckConfig(
+        fp = FakePlatform(windows={"magent:[!] proj": 555})
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+        cfg = MagentConfig(
             projects=[ProjectConfig(path=str(tmp_path), tool="claude", title="proj")],
             settings=Settings(
                 tools={"claude": "claude --continue"}, default_tool="claude"
             ),
         )
 
-        rc = run_multideck(cfg, RunOpts(retile_all=True))
+        rc = run_magent(cfg, RunOpts(retile_all=True))
 
         assert rc == 0
         assert fp.launched_terminals == []
@@ -179,7 +179,7 @@ class TestRunMultideckCharacterization:
         self, monkeypatch, tmp_path, fake_sleep, capsys
     ):
         # TF-W-001: when launch_terminal raises TerminalNotFoundError (e.g. wt
-        # not installed), run_multideck aborts cleanly -- rc 2, the actionable
+        # not installed), run_magent aborts cleanly -- rc 2, the actionable
         # install hint on stderr, and no tiling -- never a raw traceback.
         fp = FakePlatform()
 
@@ -190,15 +190,15 @@ class TestRunMultideckCharacterization:
             )
 
         monkeypatch.setattr(fp, "launch_terminal", _boom)
-        monkeypatch.setattr("multideck.launch.get_platform", lambda: fp)
-        cfg = MultideckConfig(
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+        cfg = MagentConfig(
             projects=[ProjectConfig(path=str(tmp_path), tool="claude", title="proj")],
             settings=Settings(
                 tools={"claude": "claude --continue"}, default_tool="claude"
             ),
         )
 
-        rc = run_multideck(cfg, RunOpts())
+        rc = run_magent(cfg, RunOpts())
 
         assert rc == 2
         err = capsys.readouterr().err
@@ -241,20 +241,20 @@ class TestStartPsmuxAndUpload:
             PsmuxWindowOpts(window_name="b", cwd="/tmp/b", command="claude"),
         ]
         colors = {"a": "#111111", "b": None}
-        cfg = MultideckConfig(projects=[])
+        cfg = MagentConfig(projects=[])
         result = _LaunchResult(targets=[], psmux_windows=windows, psmux_colors=colors)
 
         _start_psmux_and_upload(fp, cfg, RunOpts(), result)
 
         assert fp.launched_psmux == windows
         assert len(fp.attached_psmux) == 2
-        assert fp.attached_psmux[0] == ("a", "md:a", "#111111", None)
-        assert fp.attached_psmux[1] == ("b", "md:b", None, None)
+        assert fp.attached_psmux[0] == ("a", "magent:a", "#111111", None)
+        assert fp.attached_psmux[1] == ("b", "magent:b", None, None)
 
     def test_noop_on_dry_run(self):
         fp = FakePlatform(supports_psmux=True)
         windows = [PsmuxWindowOpts(window_name="a", cwd="/tmp/a", command="claude")]
-        cfg = MultideckConfig(projects=[])
+        cfg = MagentConfig(projects=[])
         result = _LaunchResult(
             targets=[], psmux_windows=windows, psmux_colors={"a": None}
         )
@@ -273,7 +273,7 @@ class TestLaunchProjects:
     def test_builds_targets_and_psmux(self, tmp_path, fake_sleep):
         fp = FakePlatform(supports_psmux=True)
         projects = [ProjectConfig(path=str(tmp_path), tool="claude", title="proj")]
-        cfg = MultideckConfig(
+        cfg = MagentConfig(
             projects=projects,
             settings=Settings(
                 tools={"claude": "claude --continue"}, default_tool="claude", psmux=True
@@ -283,7 +283,7 @@ class TestLaunchProjects:
         result = _launch_projects(fp, cfg, RunOpts(), projects, None)
 
         assert result.targets == [
-            _Target(name="proj", key="proj", mode="md-name", is_new=True)
+            _Target(name="proj", key="proj", mode="magent-name", is_new=True)
         ]
         assert len(result.psmux_windows) == 1
         assert result.psmux_windows[0].window_name == "proj"
@@ -291,7 +291,7 @@ class TestLaunchProjects:
     def test_ide_populates_targets(self, tmp_path, fake_sleep):
         fp = FakePlatform()
         projects = [ProjectConfig(path=str(tmp_path), tool="code")]
-        cfg = MultideckConfig(
+        cfg = MagentConfig(
             projects=projects,
             settings=Settings(
                 tools={"claude": "claude --continue"}, default_tool="claude"
@@ -311,7 +311,7 @@ class TestPrepareGrid:
 
     def test_returns_none_without_monitors(self, capsys):
         fp = FakePlatform(monitors=[])
-        cfg = MultideckConfig(projects=[])
+        cfg = MagentConfig(projects=[])
 
         result = _prepare_grid(fp, cfg, RunOpts())
 
@@ -322,7 +322,7 @@ class TestPrepareGrid:
 
     def test_returns_slots(self, capsys):
         fp = FakePlatform()
-        cfg = MultideckConfig(projects=[])
+        cfg = MagentConfig(projects=[])
 
         result = _prepare_grid(fp, cfg, RunOpts())
 
@@ -335,7 +335,7 @@ class TestSelectProjects:
     """Direct unit tests for the extracted project-selection phase (R4, Step 6)."""
 
     def test_filters_group(self):
-        cfg = MultideckConfig(
+        cfg = MagentConfig(
             projects=[
                 ProjectConfig(path="/a", group="a"),
                 ProjectConfig(path="/b", group="b"),
@@ -348,7 +348,7 @@ class TestSelectProjects:
         assert [p.path for p in result] == ["/a"]
 
     def test_empty_group_returns_none(self, capsys):
-        cfg = MultideckConfig(projects=[ProjectConfig(path="/a", group="a")])
+        cfg = MagentConfig(projects=[ProjectConfig(path="/a", group="a")])
 
         result = _select_projects(cfg, RunOpts(group="nope"))
 
@@ -367,7 +367,7 @@ class TestDispatchIdeProject:
     def test_launches_and_returns_delta_one(self, tmp_path, fake_sleep):
         fp = FakePlatform()
         proj = ProjectConfig(path=str(tmp_path), tool="code")
-        cfg = MultideckConfig(projects=[proj])
+        cfg = MagentConfig(projects=[proj])
         targets: list[_Target] = []
 
         delta = _dispatch_ide_project(
@@ -392,7 +392,7 @@ class TestDispatchIdeProject:
     def test_running_skips_launch_and_returns_delta_zero(self, tmp_path, fake_sleep):
         fp = FakePlatform()
         proj = ProjectConfig(path=str(tmp_path), tool="code")
-        cfg = MultideckConfig(projects=[proj])
+        cfg = MagentConfig(projects=[proj])
         targets: list[_Target] = []
 
         delta = _dispatch_ide_project(
@@ -422,7 +422,7 @@ class TestDispatchCliAgentProject:
     def test_launches_terminal_and_returns_delta(self, tmp_path, fake_sleep):
         fp = FakePlatform()
         proj = ProjectConfig(path=str(tmp_path), tool="claude", title="proj")
-        cfg = MultideckConfig(
+        cfg = MagentConfig(
             projects=[proj], settings=Settings(tools={"claude": "claude --continue"})
         )
         targets: list[_Target] = []
@@ -447,16 +447,16 @@ class TestDispatchCliAgentProject:
 
         assert delta == 1
         assert len(fp.launched_terminals) == 1
-        assert fp.launched_terminals[0].title == "md:proj"
+        assert fp.launched_terminals[0].title == "magent:proj"
         assert targets == [
-            _Target(name="proj", key="proj", mode="md-name", is_new=True)
+            _Target(name="proj", key="proj", mode="magent-name", is_new=True)
         ]
         assert psmux_windows == []
 
     def test_psmux_collects_instead_of_launching(self, tmp_path, fake_sleep):
         fp = FakePlatform(supports_psmux=True)
         proj = ProjectConfig(path=str(tmp_path), tool="claude", title="proj")
-        cfg = MultideckConfig(
+        cfg = MagentConfig(
             projects=[proj],
             settings=Settings(tools={"claude": "claude --continue"}, psmux=True),
         )
@@ -489,7 +489,7 @@ class TestDispatchCliAgentProject:
         self, tmp_path, fake_sleep, capsys
     ):
         proj = ProjectConfig(path=str(tmp_path), tool="ghost-tool", title="proj")
-        cfg = MultideckConfig(
+        cfg = MagentConfig(
             projects=[proj], settings=Settings(tools={"claude": "claude --continue"})
         )
         targets: list[_Target] = []
@@ -515,6 +515,76 @@ class TestDispatchCliAgentProject:
         assert "unknown tool" in capsys.readouterr().out
 
 
+class TestWindowTitlePrefixDisabled:
+    """windowTitlePrefix=false: produced titles are bare project names and the
+    launcher tiles by exact-title match instead of the magent-name grammar
+    (the launcher knows the exact title it set, so it needs no prefix to
+    resolve the window)."""
+
+    def test_bare_title_and_exact_tiling(self, tmp_path, fake_sleep):
+        fp = FakePlatform()
+        proj = ProjectConfig(path=str(tmp_path), tool="claude", title="proj")
+        cfg = MagentConfig(
+            projects=[proj],
+            settings=Settings(
+                tools={"claude": "claude --continue"}, window_title_prefix=False
+            ),
+        )
+        targets: list[_Target] = []
+
+        _dispatch_cli_agent_project(
+            fp,
+            cfg,
+            RunOpts(),
+            proj,
+            "claude",
+            False,
+            None,
+            cfg.settings.tools,
+            False,
+            lambda key, mode: False,
+            targets,
+            [],
+            {},
+        )
+
+        # No magent: prefix on the launched terminal title.
+        assert fp.launched_terminals[0].title == "proj"
+        # Tiling target uses exact-title match on the bare name.
+        assert targets == [_Target(name="proj", key="proj", mode="exact", is_new=True)]
+
+    def test_running_check_uses_exact_mode(self, tmp_path, fake_sleep):
+        fp = FakePlatform()
+        proj = ProjectConfig(path=str(tmp_path), tool="claude", title="proj")
+        cfg = MagentConfig(
+            projects=[proj],
+            settings=Settings(
+                tools={"claude": "claude --continue"}, window_title_prefix=False
+            ),
+        )
+        seen: list[tuple[str, str]] = []
+
+        _dispatch_cli_agent_project(
+            fp,
+            cfg,
+            RunOpts(),
+            proj,
+            "claude",
+            False,
+            None,
+            cfg.settings.tools,
+            False,
+            lambda key, mode: (seen.append((key, mode)), False)[1],
+            [],
+            [],
+            {},
+        )
+
+        # The already-running probe must query by exact bare title, not the
+        # magent-name grammar (which would never match a bare-titled window).
+        assert seen == [("proj", "exact")]
+
+
 class TestPerWindowToolOverride:
     """Regression pins for the per-window ``tool`` override (P3-06 follow-up).
 
@@ -530,7 +600,7 @@ class TestPerWindowToolOverride:
     def _dispatch(self, fp, cfg, proj, tool, monkeypatch, session_ids):
         # Fake session discovery: the base tool's ids, one per window.
         monkeypatch.setattr(
-            "multideck.launch._get_session_ids",
+            "magent.launch._get_session_ids",
             lambda _tool, _dir, _count: list(session_ids),
         )
         targets: list[_Target] = []
@@ -560,7 +630,7 @@ class TestPerWindowToolOverride:
             title="proj",
             windows=[WindowConfig(), WindowConfig(tool="codex")],
         )
-        cfg = MultideckConfig(
+        cfg = MagentConfig(
             projects=[proj],
             settings=Settings(
                 tools={"claude": "claude --continue", "codex": "codex"},
@@ -594,7 +664,7 @@ class TestPerWindowToolOverride:
             title="proj",
             windows=[WindowConfig(tool="nope"), WindowConfig()],
         )
-        cfg = MultideckConfig(
+        cfg = MagentConfig(
             projects=[proj],
             settings=Settings(
                 tools={"claude": "claude --continue"}, default_tool="claude"
@@ -629,7 +699,7 @@ class TestBaseDirExpansion:
         proj_dir = tmp_path / "sub" / "proj"
         proj_dir.mkdir(parents=True)
         monkeypatch.setenv("MD_TEST_BASE", str(tmp_path))
-        cfg = MultideckConfig(
+        cfg = MagentConfig(
             projects=[ProjectConfig(path="proj")],
             base_dir="$MD_TEST_BASE/sub",
         )

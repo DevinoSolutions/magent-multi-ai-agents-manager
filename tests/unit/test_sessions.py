@@ -1,18 +1,18 @@
 import os
 import sys
 
-from multideck.sessions.claude import encode_claude_project_path, get_claude_session_ids
-from multideck.sessions.codex import get_codex_session_ids
+from magent.sessions.claude import encode_claude_project_path, get_claude_session_ids
+from magent.sessions.codex import get_codex_session_ids
 
 
 class TestEncodeClaudeProjectPath:
     def test_windows_path(self):
         result = encode_claude_project_path(
-            r"C:\Users\amind\OneDrive\Desktop\Projects\CUSTOM MCPs & PRODUCTIVITY\multideck-ai-agent"
+            r"C:\Users\amind\OneDrive\Desktop\Projects\CUSTOM MCPs & PRODUCTIVITY\magent-multi-ai-agents-manager"
         )
         assert (
             result
-            == "C--Users-amind-OneDrive-Desktop-Projects-CUSTOM-MCPs---PRODUCTIVITY-multideck-ai-agent"
+            == "C--Users-amind-OneDrive-Desktop-Projects-CUSTOM-MCPs---PRODUCTIVITY-magent-multi-ai-agents-manager"
         )
 
     def test_unix_path(self):

@@ -1,6 +1,6 @@
 name: Soak (nightly)
 
-# Long-run daemon-stability soak: stands up a REAL `multideck serve` + a REAL
+# Long-run daemon-stability soak: stands up a REAL `magent serve` + a REAL
 # detached `attention -d` and hammers them with sustained state/upload/health
 # churn for ~25 minutes, asserting heartbeat freshness, upload acceptance, pid
 # survival, bounded RSS, bounded log rotation, and TTL-sweep safety throughout.

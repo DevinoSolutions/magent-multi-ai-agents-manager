@@ -1,13 +1,13 @@
 """REAL daemon/lifecycle tier: `serve`, `serve --ensure`, `attention -d`,
-`status`, and `down --all` driven as actual ``python -m multideck``
+`status`, and `down --all` driven as actual ``python -m magent``
 subprocesses against live processes, real loopback sockets, and real pid /
 heartbeat / lockfiles on disk. No display, no psmux, no fakes inside
-multideck -- so this whole module runs on windows, macos AND linux in the
+magent -- so this whole module runs on windows, macos AND linux in the
 existing e2e job (`pytest tests/e2e/ -m "e2e and not needs_ssh"`).
 
 Everything is isolated the way the sibling real-* e2e tiers do it: HOME (and
 on Windows USERPROFILE/HOMEDRIVE/HOMEPATH) is redirected into a uuid-namespaced
-tmp dir, so every ``~/.multideck`` artifact -- pid files, heartbeats, the
+tmp dir, so every ``~/.magent`` artifact -- pid files, heartbeats, the
 attention lockfile, logs -- lands there and NEVER touches the runner's real
 home. The config is a tmp file passed with ``--config``. Servers bind
 127.0.0.1 only (the one exception, ``serve --ensure``, is the product's own
@@ -69,7 +69,7 @@ import uuid
 
 import pytest
 
-from multideck.procs import pid_alive
+from magent.procs import pid_alive
 
 pytestmark = pytest.mark.e2e
 
@@ -79,11 +79,9 @@ pytestmark = pytest.mark.e2e
 
 def _child_env(home, **extra: str) -> dict[str, str]:
     """A child env with HOME fully redirected into ``home`` on every OS, and
-    every inherited MULTIDECK_* var stripped so the closed env schema can't trip
+    every inherited MAGENT_* var stripped so the closed env schema can't trip
     on the runner's own config."""
-    env = {
-        k: v for k, v in os.environ.items() if not k.upper().startswith("MULTIDECK_")
-    }
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
     home_s = str(home)
     drive, tail = os.path.splitdrive(home_s)
     env["USERPROFILE"] = home_s
@@ -183,14 +181,14 @@ def _make_world(tmp_path, *, attention=None, projects=None):
     settings: dict[str, object] = {"uploadPort": port}
     if attention is not None:
         settings["attention"] = attention
-    cfg = tmp_path / "multideck.config.json"
+    cfg = tmp_path / "magent.config.json"
     cfg.write_text(
         json.dumps({"version": 3, "projects": projects or [], "settings": settings}),
         encoding="utf-8",
     )
     return types.SimpleNamespace(
         home=home,
-        md=home / ".multideck",
+        md=home / ".magent",
         env=_child_env(home),
         port=port,
         cfg=cfg,
@@ -199,11 +197,11 @@ def _make_world(tmp_path, *, attention=None, projects=None):
 
 
 def _run(args, env, timeout: float = 90):
-    """Run a NON-detaching multideck command to completion, capturing output.
+    """Run a NON-detaching magent command to completion, capturing output.
     Safe with PIPE: `status`/`down` neither block nor leave a long-lived child
     holding the pipe. Returns (returncode, stdout, stderr)."""
     p = subprocess.run(
-        [sys.executable, "-m", "multideck", *args],
+        [sys.executable, "-m", "magent", *args],
         capture_output=True,
         text=True,
         env=env,
@@ -220,7 +218,7 @@ def _run_detaching(args, env, err_path, timeout: float = 90) -> int:
     captured stdout. Returns the launcher's exit code."""
     with err_path.open("w", encoding="utf-8") as e:
         p = subprocess.run(
-            [sys.executable, "-m", "multideck", *args],
+            [sys.executable, "-m", "magent", *args],
             stdout=subprocess.DEVNULL,
             stderr=e,
             env=env,
@@ -231,7 +229,7 @@ def _run_detaching(args, env, err_path, timeout: float = 90) -> int:
 
 @contextlib.contextmanager
 def _serve(w):
-    """One real `multideck serve --host 127.0.0.1` process, healthy before the
+    """One real `magent serve --host 127.0.0.1` process, healthy before the
     body runs. Yields the SERVER's recorded pid -- the one run_server writes via
     os.getpid(), which is what status/stop_server target. On a uv/venv Windows
     box that pid differs from the Popen pid (the venv python.exe is a trampoline
@@ -249,7 +247,7 @@ def _serve(w):
         [
             sys.executable,
             "-m",
-            "multideck",
+            "magent",
             "--config",
             str(w.cfg),
             "serve",
@@ -299,7 +297,7 @@ def test_serve_ensure_idempotent_then_survivor(tmp_path):
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--config",
                 str(w.cfg),
                 "serve",
@@ -531,7 +529,7 @@ def test_status_json_invalid_config_exits_1(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
     env = _child_env(home)
-    bad = tmp_path / "multideck.config.json"
+    bad = tmp_path / "magent.config.json"
     bad.write_text("{ this is not valid json ", encoding="utf-8")
     rc, out, err = _run(["--config", str(bad), "status", "--json"], env)
     assert rc == 1, f"out={out} err={err}"

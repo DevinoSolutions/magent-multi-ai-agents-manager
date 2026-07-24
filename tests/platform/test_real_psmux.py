@@ -24,8 +24,8 @@ from pathlib import Path
 
 import pytest
 
-from multideck import psmux
-from multideck.platform import PsmuxWindowOpts, get_platform
+from magent import psmux
+from magent.platform import PsmuxWindowOpts, get_platform
 
 pytestmark = [
     pytest.mark.platform,
@@ -85,7 +85,7 @@ def test_real_session_pane_cwd_and_kill(tmp_path):
 
     created = False
     try:
-        # Bring the session up the way run_multideck does: through the
+        # Bring the session up the way run_magent does: through the
         # platform primitive (real `psmux new-session -d -c <cwd>` + send-keys).
         get_platform().launch_psmux_session(
             [
@@ -133,7 +133,7 @@ def test_real_session_pane_cwd_and_kill(tmp_path):
 # stubs): the ATTACH path. ``platform.attach_psmux`` opens a real Windows
 # Terminal window running ``psmux attach`` against the live session, titled by
 # the product's own ``titles.make_title`` grammar; the window materializes on
-# the real desktop under exactly that ``md:`` title; the psmux server sees a
+# the real desktop under exactly that ``magent:`` title; the psmux server sees a
 # REAL attached client (``list-clients``); and after ``kill_server`` the
 # session is gone and the primitives degrade as promised. Cleanup closes
 # exactly the one uuid-titled window this test opened.
@@ -167,8 +167,8 @@ def _list_clients(name: str) -> str:
 def test_full_chain_create_attach_in_real_wt_window_teardown(tmp_path):
     import ctypes
 
-    from multideck.platform import get_platform
-    from multideck.titles import make_title, parse_title
+    from magent.platform import get_platform
+    from magent.titles import make_title, parse_title
 
     plat = get_platform()
     unique = uuid.uuid4().hex[:12]
@@ -204,8 +204,8 @@ def test_full_chain_create_attach_in_real_wt_window_teardown(tmp_path):
 
         hwnd = _wait_until(lambda: plat.find_window(title), timeout=90)
         assert hwnd, (
-            f"attach window {title!r} never materialized; md: windows visible: "
-            f"{[t for t in plat.snapshot_windows() if t.startswith('md:')]}"
+            f"attach window {title!r} never materialized; magent: windows visible: "
+            f"{[t for t in plat.snapshot_windows() if t.startswith('magent:')]}"
         )
         # The title on the live HWND round-trips through the product grammar.
         parsed = parse_title(title)

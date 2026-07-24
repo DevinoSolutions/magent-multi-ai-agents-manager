@@ -57,9 +57,7 @@ _WM_CLOSE = 0x0010
 
 
 def _child_env(home) -> dict[str, str]:
-    env = {
-        k: v for k, v in os.environ.items() if not k.upper().startswith("MULTIDECK_")
-    }
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
     home_s = str(home)
     drive, tail = os.path.splitdrive(home_s)
     env["USERPROFILE"] = home_s
@@ -83,19 +81,19 @@ def _wait_until(check, timeout: float, interval: float = 0.5):
 def test_first_ever_wt_launch_survives_cold_broker(tmp_path):
     import ctypes
 
-    from multideck.platform import get_platform
+    from magent.platform import get_platform
 
     plat = get_platform()
     unique = uuid.uuid4().hex[:10]
     name = f"mdcold{unique}"
-    title = f"md:{name}"
+    title = f"magent:{name}"
     marker = f"mdcold-marker-{unique}"
 
     proj = tmp_path / f"proj-{unique}"
     proj.mkdir()
     home = tmp_path / "home"
     home.mkdir()
-    cfg = tmp_path / "multideck.config.json"
+    cfg = tmp_path / "magent.config.json"
     # settleSeconds / launchDelayMs deliberately omitted: shipped defaults.
     cfg.write_text(
         json.dumps(
@@ -116,7 +114,7 @@ def test_first_ever_wt_launch_survives_cold_broker(tmp_path):
     started = time.monotonic()
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "multideck", "--go", "--config", str(cfg)],
+            [sys.executable, "-m", "magent", "--go", "--config", str(cfg)],
             capture_output=True,
             text=True,
             timeout=300,
@@ -144,8 +142,8 @@ def test_first_ever_wt_launch_survives_cold_broker(tmp_path):
         # And the window really exists on the desktop afterwards.
         hwnd = _wait_until(lambda: plat.find_window(title), timeout=30)
         assert hwnd, (
-            f"cold-launch window {title!r} not on the desktop; md: windows: "
-            f"{[t for t in plat.snapshot_windows() if t.startswith('md:')]}"
+            f"cold-launch window {title!r} not on the desktop; magent: windows: "
+            f"{[t for t in plat.snapshot_windows() if t.startswith('magent:')]}"
         )
     finally:
         hwnd = plat.find_window(title)

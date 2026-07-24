@@ -13,7 +13,7 @@ def _path_without_ssh(tmp_bin: str | None = None):
     """Build a PATH with ssh removed but other tools (xrandr, swift) preserved.
 
     Directories containing ssh are dropped, but any platform tools needed by
-    multideck that lived alongside ssh are symlinked into tmp_bin so monitor
+    magent that lived alongside ssh are symlinked into tmp_bin so monitor
     detection still works.
     """
     sep = ";" if sys.platform == "win32" else ":"
@@ -51,7 +51,7 @@ def ssh_available():
 
 class TestSSHLaunch:
     def test_ssh_project_dry_run(self, tmp_path, ssh_available):
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -74,7 +74,7 @@ class TestSSHLaunch:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -92,7 +92,7 @@ class TestSSHLaunch:
         tmp_bin = str(tmp_path / "bin")
         os.makedirs(tmp_bin, exist_ok=True)
         no_ssh_path = _path_without_ssh(tmp_bin)
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -104,7 +104,7 @@ class TestSSHLaunch:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",

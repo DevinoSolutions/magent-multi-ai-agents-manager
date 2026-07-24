@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import subprocess
 
-from multideck.cli import main
+from magent.cli import main
 
 
 def _cp(returncode: int, stdout: str) -> subprocess.CompletedProcess[str]:

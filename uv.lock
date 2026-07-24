@@ -256,7 +256,7 @@ wheels = [
 ]
 
 [[package]]
-name = "multideck"
+name = "magent-multi-ai-agents-manager"
 version = "1.0.0"
 source = { editable = "." }
 dependencies = [

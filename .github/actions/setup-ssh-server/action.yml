@@ -5,7 +5,7 @@ description: >-
   real ~/.ssh/config so plain `ssh mdssh <cmd>` -- the exact shape the
   product's attach flow and launch ssh branch send, no -p/-i arguments --
   works non-interactively. Sessions arriving through sshd never see
-  GITHUB_PATH, so each OS also plumbs the hosted-toolcache `multideck`
+  GITHUB_PATH, so each OS also plumbs the hosted-toolcache `magent`
   console script into the PATH that sshd sessions actually get.
 
 runs:
@@ -20,23 +20,23 @@ runs:
         cat ~/.ssh/id_test.pub >> ~/.ssh/authorized_keys
         chmod 600 ~/.ssh/authorized_keys
         sudo sed -i 's/#Port 22/Port 2222/' /etc/ssh/sshd_config
-        # Non-interactive `ssh mdssh "multideck ..."` sessions get sshd's own
+        # Non-interactive `ssh mdssh "magent ..."` sessions get sshd's own
         # PATH, not GITHUB_PATH. Two independent plumbings (run 2 proved the
         # appended-directive one insufficient alone on ubuntu-24.04 --
-        # "multideck: command not found" over the wire):
+        # "magent: command not found" over the wire):
         # 1) symlink the console script into /usr/local/bin, which is on
         #    every default sshd PATH;
         # 2) per-user environment file, enabled via a drop-in that sorts
         #    lexically first (sshd_config.d is Included at the TOP of
         #    sshd_config and first-match wins, so a distro drop-in can beat
         #    a directive appended at the bottom of the main file).
-        sudo ln -sf "$(command -v multideck)" /usr/local/bin/multideck
+        sudo ln -sf "$(command -v magent)" /usr/local/bin/magent
         printf 'PermitUserEnvironment yes\n' | sudo tee /etc/ssh/sshd_config.d/00-mdtest.conf > /dev/null
         echo "PermitUserEnvironment yes" | sudo tee -a /etc/ssh/sshd_config > /dev/null
         echo "PATH=$PATH" > ~/.ssh/environment
         chmod 600 ~/.ssh/environment
         # The host alias the real-SSH e2e tier dials -- exactly what a user
-        # would put in ~/.ssh/config for a remote multideck host.
+        # would put in ~/.ssh/config for a remote magent host.
         cat >> ~/.ssh/config <<EOF
         Host mdssh
           HostName localhost
@@ -67,7 +67,7 @@ runs:
         # Fatal smokes for the real-SSH tier: the alias itself, then the
         # installed console script resolving inside a non-interactive session.
         ssh -o BatchMode=yes mdssh whoami
-        ssh -o BatchMode=yes mdssh "multideck --version"
+        ssh -o BatchMode=yes mdssh "magent --version"
 
     - name: macOS - Setup OpenSSH
       if: runner.os == 'macOS'
@@ -104,7 +104,7 @@ runs:
         # tests -- only when the wire demonstrably works, so the dry-run ssh
         # tests keep running either way and a dead wire skips loudly instead
         # of failing red or passing silently.
-        if ssh -o BatchMode=yes mdssh whoami && ssh -o BatchMode=yes mdssh "multideck --version"; then
+        if ssh -o BatchMode=yes mdssh whoami && ssh -o BatchMode=yes mdssh "magent --version"; then
           echo "MDTEST_SSH_HOST=mdssh" >> "$GITHUB_ENV"
         else
           echo "::warning title=macOS SSH wire unavailable::mdssh alias smoke failed; real-wire SSH e2e tests will skip on macOS (dry-run ssh tests still run)"
@@ -155,7 +155,7 @@ runs:
 
         # Incoming sshd sessions inherit the MACHINE PATH, not GITHUB_PATH
         # (which only reaches workflow steps): export the hosted Python and
-        # its Scripts dir (where pip put multideck.exe) machine-wide, then
+        # its Scripts dir (where pip put magent.exe) machine-wide, then
         # restart sshd so new sessions pick the refreshed environment up.
         $scripts = python -c "import sysconfig; print(sysconfig.get_path('scripts'))"
         $pyhome = python -c "import sys, os; print(os.path.dirname(sys.executable))"
@@ -180,7 +180,7 @@ runs:
         echo "MDTEST_SSH_KEY=$sshDir\id_test" >> $env:GITHUB_ENV
         echo "MDTEST_SSH_HOST=mdssh" >> $env:GITHUB_ENV
 
-        # Fatal smokes: the wire, then multideck and psmux resolving inside a
+        # Fatal smokes: the wire, then magent and psmux resolving inside a
         # real non-interactive sshd session (the machine-PATH contract above).
         # On failure, replay with -vvv and dump the sshd DEBUG3 log so the
         # rejection reason is in the CI log, not a guessing game.
@@ -190,7 +190,7 @@ runs:
           Get-Content "$env:ProgramData\ssh\logs\sshd.log" -Tail 150 -ErrorAction SilentlyContinue
           throw "ssh mdssh whoami failed"
         }
-        ssh -o BatchMode=yes mdssh "multideck --version"
-        if ($LASTEXITCODE -ne 0) { throw "multideck not resolvable in sshd sessions" }
+        ssh -o BatchMode=yes mdssh "magent --version"
+        if ($LASTEXITCODE -ne 0) { throw "magent not resolvable in sshd sessions" }
         ssh -o BatchMode=yes mdssh "where psmux"
         if ($LASTEXITCODE -ne 0) { throw "psmux not resolvable in sshd sessions" }

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from multideck.lockfile import LockHeld, exclusive_lock
+from magent.lockfile import LockHeld, exclusive_lock
 
 
 @pytest.fixture(autouse=True)
@@ -18,13 +18,13 @@ def _isolate_home(tmp_path, monkeypatch):
 class TestExclusiveLock:
     def test_acquires_and_releases(self):
         with exclusive_lock("test"):
-            lock_file = Path.home() / ".multideck" / "test.lock"
+            lock_file = Path.home() / ".magent" / "test.lock"
             assert lock_file.exists()
 
     def test_lock_file_cleaned_up(self):
         with exclusive_lock("test"):
             pass
-        lock_file = Path.home() / ".multideck" / "test.lock"
+        lock_file = Path.home() / ".magent" / "test.lock"
         assert not lock_file.exists()
 
     def test_second_acquire_raises_lock_held(self):
@@ -78,4 +78,4 @@ class TestExclusiveLock:
         nested = tmp_path / "deep" / "nested"
         monkeypatch.setattr(Path, "home", staticmethod(lambda: nested))
         with exclusive_lock("test"):
-            assert (nested / ".multideck" / "test.lock").exists()
+            assert (nested / ".magent" / "test.lock").exists()

@@ -182,7 +182,7 @@ jobs:
     name: "Browser Upload (ubuntu-latest)"
     # NOT a required check by design (same posture as monitor-lab): provisions a
     # real headless Chromium via Playwright and drives the mobile upload page
-    # end-to-end against a real `multideck serve` on loopback. The tier skips
+    # end-to-end against a real `magent serve` on loopback. The tier skips
     # cleanly on a dev box (no MDTEST_BROWSER / no Playwright); here we install
     # the browser extra + chromium and stand up a real tmux session as the psmux
     # shim so session discovery, validation, and injection all hit a live
@@ -209,7 +209,7 @@ jobs:
     name: "Monitor Lab (windows-latest)"
     # NOT a required check by design: installs the parsec-vdd virtual-display
     # driver on a throwaway hosted runner to fabricate a mixed-DPI multi-monitor
-    # topology, then drives multideck's real launch+tile pipeline over it. The
+    # topology, then drives magent's real launch+tile pipeline over it. The
     # runner is discarded at job end; the driver is never installed on a dev box
     # (the tier skips cleanly without MDTEST_MONITOR_LAB=1). Generous timeout:
     # driver install (~15s) + per-topology display settle add up.
@@ -242,7 +242,7 @@ jobs:
     name: "Tailnet (ubuntu-latest)"
     # NOT a required check by design (same posture as monitor-lab / browser-upload):
     # joins a REAL, ephemeral, tag-scoped Tailscale node and exercises tailnet.py's
-    # live `tailscale` probes plus `multideck serve`'s Tailscale-facing default bind.
+    # live `tailscale` probes plus `magent serve`'s Tailscale-facing default bind.
     # The node evaporates when the job ends; the tier skips cleanly on a dev box
     # (no MDTEST_TAILSCALE / no tailscale binary) so nobody must ever join a tailnet
     # on their own machine to run it.

@@ -1,13 +1,13 @@
-"""REAL upload server on the wire: `python -m multideck serve` as a separate
+"""REAL upload server on the wire: `python -m magent serve` as a separate
 OS process bound to a real loopback socket, exercised with real HTTP requests
 from ``http.client`` -- the exact experience a phone (or the Alt+V listener)
 gets, including the P4-02 drain-before-error behavior shipped in PR #44.
 
-What each test proves (no fakes inside multideck, no monkeypatching):
+What each test proves (no fakes inside magent, no monkeypatching):
 
-* healthy path (needs psmux): `multideck up` creates a REAL detached psmux
+* healthy path (needs psmux): `magent up` creates a REAL detached psmux
   session for the configured project; a real multipart POST /upload then lands
-  a real file under the (redirected) ``~/.multideck/uploads`` and injects the
+  a real file under the (redirected) ``~/.magent/uploads`` and injects the
   path into that live session (``injected: true``);
 * a body larger than MAX_UPLOAD_BYTES with an honest Content-Length receives a
   REAL ``413`` + ``{"ok": false, ...}`` JSON envelope on the same connection --
@@ -32,15 +32,13 @@ import uuid
 
 import pytest
 
-from multideck.psmux import find_psmux
+from magent.psmux import find_psmux
 
 pytestmark = pytest.mark.e2e
 
 
 def _child_env(home) -> dict[str, str]:
-    env = {
-        k: v for k, v in os.environ.items() if not k.upper().startswith("MULTIDECK_")
-    }
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
     home_s = str(home)
     drive, tail = os.path.splitdrive(home_s)
     env["USERPROFILE"] = home_s
@@ -84,7 +82,7 @@ def _health_ok(port: int, errors: list[str] | None = None) -> bool:
 
 
 class _Serve:
-    """One real `multideck serve` process plus everything needed to talk to
+    """One real `magent serve` process plus everything needed to talk to
     it and to clean it (and only it) up afterwards."""
 
     def __init__(self, tmp_path):
@@ -97,7 +95,7 @@ class _Serve:
         self.proj.mkdir()
         self.env = _child_env(self.home)
         self.port = _free_port()
-        self.cfg = tmp_path / "multideck.config.json"
+        self.cfg = tmp_path / "magent.config.json"
         self.cfg.write_text(
             json.dumps(
                 {
@@ -123,7 +121,7 @@ class _Serve:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--config",
                 str(self.cfg),
                 "serve",
@@ -143,7 +141,7 @@ class _Serve:
         if _wait_until(lambda: _health_ok(self.port, self.health_errors), timeout=30):
             return
         # Permanent rich failure report -- when a real server fails to come up
-        # the child's own observable state (exit code, redirected ~/.multideck
+        # the child's own observable state (exit code, redirected ~/.magent
         # log/pid artifacts, last connect errors) IS the diagnosis.
         elapsed = time.monotonic() - started
         state_before_kill = self.proc.poll()
@@ -183,8 +181,8 @@ class _Serve:
     def _diagnostics(self) -> str:
         """Child-side facts from the redirected home: the upload log (where
         run_server logs 'listening'/'cannot bind'), the pid file, and the
-        ~/.multideck tree."""
-        md = self.home / ".multideck"
+        ~/.magent tree."""
+        md = self.home / ".magent"
         try:
             tree = sorted(str(p.relative_to(md)) for p in md.rglob("*"))
         except OSError as exc:
@@ -200,7 +198,7 @@ class _Serve:
         except OSError as exc:
             log_text = f"<unreadable: {exc}>"
         return (
-            f"~/.multideck tree: {tree}\n"
+            f"~/.magent tree: {tree}\n"
             f"pid file {pid_file.name}: {pid_text}\n"
             f"upload.log:\n{log_text or '<empty>'}"
         )
@@ -270,9 +268,9 @@ def test_healthy_upload_lands_real_file_and_injects_into_live_session(serve):
     if find_psmux() is None:
         pytest.skip("psmux not installed")
 
-    # Bring the project's psmux session up the real user way: `multideck up`.
+    # Bring the project's psmux session up the real user way: `magent up`.
     r = subprocess.run(
-        [sys.executable, "-m", "multideck", "--config", str(serve.cfg), "up"],
+        [sys.executable, "-m", "magent", "--config", str(serve.cfg), "up"],
         capture_output=True,
         text=True,
         timeout=120,
@@ -282,9 +280,9 @@ def test_healthy_upload_lands_real_file_and_injects_into_live_session(serve):
     assert _wait_until(
         lambda: serve.psmux_run("-L", serve.title, "has-session").returncode == 0,
         timeout=15,
-    ), f"psmux session {serve.title!r} never came up after `multideck up`"
+    ), f"psmux session {serve.title!r} never came up after `magent up`"
 
-    payload = b"multideck-real-e2e \x00\x01\x02 " + serve.unique.encode()
+    payload = b"magent-real-e2e \x00\x01\x02 " + serve.unique.encode()
     body, content_type = _multipart(
         {"project": serve.title, "inject": "1"},
         filename="mdrl_probe_upload",  # extensionless: injected path is inert text
@@ -307,7 +305,7 @@ def test_healthy_upload_lands_real_file_and_injects_into_live_session(serve):
     assert data["ok"] is True
     assert data["injected"] is True, "path was not injected into the live session"
     dest = data["path"]
-    uploads_dir = (serve.home / ".multideck" / "uploads").resolve()
+    uploads_dir = (serve.home / ".magent" / "uploads").resolve()
     assert str(uploads_dir).casefold() in str(dest).casefold(), (
         f"file landed outside the redirected uploads dir: {dest}"
     )
@@ -316,7 +314,7 @@ def test_healthy_upload_lands_real_file_and_injects_into_live_session(serve):
 
 
 def test_oversized_body_gets_real_413_envelope_not_a_reset(serve):
-    from multideck.upload_server import MAX_UPLOAD_BYTES
+    from magent.upload_server import MAX_UPLOAD_BYTES
 
     body = b"x" * (MAX_UPLOAD_BYTES + 1)  # honest Content-Length, really sent
     conn = serve.connect(timeout=120)

@@ -1,6 +1,6 @@
-# multideck — Design Record
+# magent — Design Record
 
-This document records how multideck is built and *why it is shaped the way it
+This document records how magent is built and *why it is shaped the way it
 is*, for an AI agent picking up this codebase cold. It is a design record,
 not a wishlist: it describes what the code on disk actually does. Where the
 shape looks wrong at first glance, that is usually because it was
@@ -45,25 +45,25 @@ own docstring).
 `config_io`, `mobile`, `docs`, `menu`, `session_picker`, `background`, `status`,
 `ui`) purely so their `@main.command` decorators fire at import time, then
 re-exports the ~16 underscore-prefixed names that tests and other call sites
-still reach via `multideck.cli.<name>`. It never imports `paths` or `style`
+still reach via `magent.cli.<name>`. It never imports `paths` or `style`
 directly — those are top-level modules, not part of the `cli` package.
 
 `main` (the click group) lives **alone** in `cli/app.py`, importing nothing
 from sibling command modules at its own top level. This is deliberate: since
 the hub eagerly imports every command module (to register it), and every
-command module needs to `from multideck.cli.app import main` to attach its
+command module needs to `from magent.cli.app import main` to attach its
 own commands, any command module importing back from `app.py` at top level
 would be a real import cycle. `app.py`'s no-subcommand interactive path (the
 menu, `--edit`, `--init`, attach-flow dispatch) needs several sibling
 handlers — `_attach_flow`, `_menu_down`, `_menu_status`, `_menu_up`,
 `_run_discovery`, `_run_sessions_picker`, `_show_menu` — so `main`'s body
-imports them from `multideck.cli` (the hub) **inside the function**, after
+imports them from `magent.cli` (the hub) **inside the function**, after
 all registration has already completed. This in-body import is the
 documented cycle-break, not an oversight.
 
 ### Pure leaves
 
-None of these imports any other `multideck` module (`style.py` imports
+None of these imports any other `magent` module (`style.py` imports
 `click`; the rest are stdlib-only):
 
 - **`grid.py`** — `Rect`/`MonitorRect`/`TileSlot` dataclasses + `compute_grid`,
@@ -82,13 +82,13 @@ None of these imports any other `multideck` module (`style.py` imports
   once in `launch.py`); both call sites now import `style` from here
   (LS-A-003). A transitional `S` alias existed during the multi-PR migration
   and has since been deleted repo-wide — every call site uses `style` directly.
-- **`titles.py`** — owns `MD_TITLE_PREFIX = "md:"` plus `generate_titles`/
+- **`titles.py`** — owns `MAGENT_TITLE_PREFIX = "magent:"` plus `generate_titles`/
   `get_leaf_name` (LS-B-006). This is the single source of truth for the
-  `md:`-prefixed window-title convention: `cli/attach.py` builds titles from
+  `magent:`-prefixed window-title convention: `cli/attach.py` builds titles from
   it (the only two build sites), `hotkey.py` strips it to recover the
   project name.
 - **`log.py`** — rotating file logging (`get_logger`, one logger + one log
-  file per named concern under `~/.multideck/logs/`) and cross-platform
+  file per named concern under `~/.magent/logs/`) and cross-platform
   liveness heartbeats (`write_heartbeat`/`heartbeat_fresh`). Heartbeats live
   here rather than in `hotkey.py` specifically so platform-agnostic callers
   (`status`, Linux CI) can check daemon liveness without importing the
@@ -107,11 +107,11 @@ None of these imports any other `multideck` module (`style.py` imports
   handlers on the hot path of every agent turn, so it must stay
   dependency-light). Has zero tests today (see Known Debt).
 - **`config.py`** — grouped with subsystems below for its behavioral role,
-  but structurally a leaf (no `multideck`-internal imports).
+  but structurally a leaf (no `magent`-internal imports).
 
 ### Subsystems
 
-- **`config.py`** — one dataclass schema (`MultideckConfig`/`Settings`/
+- **`config.py`** — one dataclass schema (`MagentConfig`/`Settings`/
   `ProjectConfig`/`LayoutConfig`/`SSHConfig`), one envelope factory
   (`default_config`), one pair of serializers (`layout_to_dict`/
   `settings_to_dict`) that every config generator delegates through, a pure
@@ -121,7 +121,7 @@ None of these imports any other `multideck` module (`style.py` imports
   default factory and `_parse_settings`'s fallback both copy it
   (`dict(DEFAULT_TOOLS)`) rather than sharing one mutable dict (LS-B-002).
 - **`tiling.py`** — the *one* window resolve-and-place loop, shared by
-  `launch.run_multideck`'s post-launch tiling and `cli/attach.py`'s
+  `launch.run_magent`'s post-launch tiling and `cli/attach.py`'s
   `_tile_titles` (R13). Before this module existed the two call sites each
   hand-rolled their own snapshot/retry loop with independently-drifted magic
   numbers. Its retry constants are named and centralized:
@@ -152,7 +152,7 @@ None of these imports any other `multideck` module (`style.py` imports
   `ValueError` on an unrecognized mode string before any OS dispatch, so a
   bogus mode fails fast instead of reaching a live `osascript`/`xdotool`
   call (LS-B-005). `get_platform()` picks the concrete backend by
-  `sys.platform` and imports it lazily, so importing `multideck.platform`
+  `sys.platform` and imports it lazily, so importing `magent.platform`
   never pulls in Windows- or macOS-specific code on the wrong OS.
 - **`sessions/`** — `AGENT_TOOLS: dict[str, AgentTool]` is the registry of
   per-tool resumability (`claude`, `codex` today). `AgentTool` is a frozen
@@ -177,7 +177,7 @@ None of these imports any other `multideck` module (`style.py` imports
   `config.default_config`/`_derive_tab_color` so its output can't drift from
   `discover.py`'s (F-D5-003).
 - **`launch.py`** — the widest-importing subsystem: `config`, `grid`, `log`,
-  `platform`, `sessions`, `style`, `tiling`, `titles`. `run_multideck` is now
+  `platform`, `sessions`, `style`, `tiling`, `titles`. `run_magent` is now
   a 5-phase composition shell — radon A(4), down from F(83) pre-audit —
   (`_prepare_grid` → `_select_projects` → `_launch_projects` →
   `_start_psmux_and_upload` → `_tile_targets`), each phase returning data or
@@ -198,7 +198,7 @@ None of these imports any other `multideck` module (`style.py` imports
 - **`upload_server.py`** — imports the `psmux` and `tailnet` modules,
   `icons.render_icon`, and `log.get_logger` at the top level, reaching every
   psmux primitive (`find_psmux`, `send_keys`, `discover_sessions`, …) through
-  the `multideck.psmux` module (consolidated in #39) rather than the former
+  the `magent.psmux` module (consolidated in #39) rather than the former
   top-level `launch._psmux_session_name` import, and **never** imports the
   `cli` package (that is the actual invariant LS-A-001 established — not
   "depends on nothing but `paths`," which was an earlier, imprecise
@@ -209,7 +209,7 @@ None of these imports any other `multideck` module (`style.py` imports
   `if sys.platform != "win32": raise ImportError(...)` fires at import time,
   by design — every call site imports it lazily, behind a `supports_hotkey()`
   gate, with a `# ImportError off-Windows (hotkey.py guards); must stay lazy`
-  comment at the import. Imports only `log` and `titles` from `multideck`.
+  comment at the import. Imports only `log` and `titles` from `magent`.
 
 ### `cli/` command modules
 
@@ -260,7 +260,7 @@ laziness.
   see Known Debt), and the `up`/`attach`/`hotkey` commands. Loads typed
   config through `config_io._load_config_or_exit`, whose `as_json` mode powers
   `up --json`'s JSON error envelope (see Key Decisions).
-- **`docs.py`** — the `multideck docs` command: a pure-string Markdown
+- **`docs.py`** — the `magent docs` command: a pure-string Markdown
   generator (~190 content lines) for the full config reference, reading live
   defaults off `config.LayoutConfig`/`config.Settings` — including the
   example-config `tools` block, now derived from the factory defaults so it
@@ -270,7 +270,7 @@ laziness.
 - **`session_picker.py`** — live psmux session listing (`sessions_cmd`) and
   the looping attach-and-return picker (`_run_sessions_picker`). Named
   `session_picker`, not `sessions`, to avoid confusion with the top-level
-  `multideck.sessions` package (recorded at extraction time).
+  `magent.sessions` package (recorded at extraction time).
 - **`status.py`** — `_render_status` (shared by the `status` command and the
   menu's `_menu_status`) plus the `down` command. Owns the daemon-health
   probes: `_health_check` (HTTP GET `/health` — proves the upload server is
@@ -299,9 +299,9 @@ hand-added or forward-compatible config key.
 
 **`load_config` never writes; `migrate_config_file` is the only writer
 (R10).** `load_config` is a pure read: on a schema version below current, it
-prints `Warning: config schema v<N> < v<CURRENT>; run: multideck config
+prints `Warning: config schema v<N> < v<CURRENT>; run: magent config
 migrate` to stderr and returns in-memory data — it never touches the file.
-Persisting a migration (or backfilled colors) requires `multideck config
+Persisting a migration (or backfilled colors) requires `magent config
 migrate` (or a save through the config editor's raw path). A load that
 rewrites the file as a side effect was one of the audited defects; do not
 reintroduce it.
@@ -311,21 +311,21 @@ reintroduce it.
 — in memory only, never written back. The derivation is DETERMINISTIC
 (`_derive_tab_color` hashes the project's title/path → HLS hue, golden-angle
 collision-avoidance within a config), so a colorless project shows the SAME
-color every run (P3-07); `multideck config migrate` (or a config-editor save)
+color every run (P3-07); `magent config migrate` (or a config-editor save)
 still persists it into the file so external readers see it and it becomes
 editable. This keeps `load_config` a pure read; run `migrate` once to pin.
 
-**The dotenv file is `~/.multideck/.env` (`env.ENV_FILE`) — never the
-CWD's `.env`.** multideck is a launcher: it is run from arbitrary project
+**The dotenv file is `~/.magent/.env` (`env.ENV_FILE`) — never the
+CWD's `.env`.** magent is a launcher: it is run from arbitrary project
 directories, and nearly every real project directory carries a `.env` of its
 own. pydantic-settings loads *every* key of a dotenv file (prefixed or not),
 so with the closed schema (`extra="forbid"`) a CWD-relative `env_file`
 hard-failed startup on any foreign project's innocent keys — a day-one field
-incident: running `multideck` inside an eBay project rejected that project's
+incident: running `magent` inside an eBay project rejected that project's
 `EBAY_*` tokens, and the then-current error formatter rebranded them
-`MULTIDECK_EBAY_*`, names that existed in no file. Hence: the dotenv lives
-in multideck's own home dir (beside logs/state), where every key is
-legitimately multideck's to police; `extra="forbid"` stays; foreign extras
+`MAGENT_EBAY_*`, names that existed in no file. Hence: the dotenv lives
+in magent's own home dir (beside logs/state), where every key is
+legitimately magent's to police; `extra="forbid"` stays; foreign extras
 report under their raw names via `env.validation_error_items` (shared by
 `app.py` and `doctor`), and the startup hint names the file. Anyone
 "restoring" CWD dotenv support for dev convenience will reintroduce the
@@ -384,20 +384,20 @@ Windows-only")` runs at module import. Every caller (`cli/attach.py`,
 `cli/status.py`, `cli/background.py`) imports it lazily, inside a function body,
 behind a `get_platform().supports_hotkey()` check, each with a `# ImportError
 off-Windows (hotkey.py guards); must stay lazy` comment on the import line.
-Hoisting any of these imports to module level breaks `import multideck.cli`
+Hoisting any of these imports to module level breaks `import magent.cli`
 on Linux/macOS.
 
 **The in-body "heavy subsystem" import policy in `cli/` exists because the
 registration hub is eager.** `cli/__init__.py` imports every command module
 at package-import time (to fire its `@main.command` decorators), so any
 subsystem a command module imports at its own top level is paid for on
-every `multideck` invocation, including `multideck --help`. `launch`,
+every `magent` invocation, including `magent --help`. `launch`,
 `upload_server`, `discover`, and `agent_state` are therefore imported
 **inside function bodies** in `cli/` command modules, each carrying a
 `# heavy subsystem: in-body per policy` comment. Verified at the tree this
-document ships with: `import multideck.cli` loads none of
-`multideck.launch`/`upload_server`/`discover`/`agent_state`. (The
-`multideck.platform` package `__init__` *is* loaded — `cli/attach.py`
+document ships with: `import magent.cli` loads none of
+`magent.launch`/`upload_server`/`discover`/`agent_state`. (The
+`magent.platform` package `__init__` *is* loaded — `cli/attach.py`
 imports `tiling`, which needs the `Platform` type — but that module is a
 lightweight ABC + lazy factory; the actually-heavy OS backends
 (`platform/windows.py`'s ctypes bindings, etc.) import only when
@@ -461,14 +461,15 @@ regresses pre-1.0, fall back to a scoped 2-file mypy backstop.**
 work (spec §6.5), not an oversight; ruff (lint + format) does cover `tests/`
 today.
 
-**All multideck windows share one title grammar (2026-07-07, 0-users breaking
-change): `md:` + optional `[!]`/`[x]`/`[+]` badge + name.** Before this, only
-the attach path emitted `md:` titles and every consumer did its own string
+**All magent windows share one title grammar (2026-07-07, 0-users breaking
+change): `magent:` + optional `[!]`/`[x]`/`[+]` badge + name.** Before this, only
+the attach path emitted `magent:` titles and every consumer did its own string
 work (hotkey stripped the prefix, tiling matched exact full titles) — which
 made in-place title *rewrites* (the attention daemon's state badges)
 impossible without breaking resolution. Now `titles.make_title` is the only
 producer and `titles.parse_title` the only consumer (hotkey routing, tiling's
-`md-name` mode), so a badge in the title is invisible to matching. The badge
+`magent-name` mode, which still accepts the pre-rename `md-name` alias), so a
+badge in the title is invisible to matching. The badge
 sits at the FRONT because taskbars truncate title tails; working/idle
 deliberately render unbadged (quiet title = nothing needs you). psmux session
 names remain unprefixed — the grammar applies at the window-title boundary
@@ -510,7 +511,7 @@ pretending otherwise.
 *What is now closed (Windows):* the dedicated `monitor-lab` CI job
 (windows-latest, not a required check) installs the parsec-vdd virtual-display
 driver and fabricates a mixed-DPI, multi-monitor topology in-process, then
-drives multideck's REAL `--go` launch+tile pipeline across it and asserts each
+drives magent's REAL `--go` launch+tile pipeline across it and asserts each
 window rect lands in its `compute_grid` cell in physical pixels
 (`tests/platform/test_monitor_lab_tiling.py`, engine in
 `tests/platform/monitor_lab.py`). The offline grid-math layer is pinned
@@ -520,7 +521,7 @@ committed golden topologies (`tests/platform/fixtures/topologies/*.json`) into
 column-collapse. `FakePlatform` unit tests still cover the placement logic on
 every OS/leg.
 
-*Replaying a user's monitor topology:* `multideck doctor --json` emits the
+*Replaying a user's monitor topology:* `magent doctor --json` emits the
 live topology under a top-level `monitors` key (list of `grid.MonitorRect`
 fields — `x/y/w/h/is_primary/scale_factor`), so a bug report can hand us the
 reporter's exact setup. `tests/platform/doctor_replay.py` (a pure, POSIX-safe
@@ -550,8 +551,8 @@ it in the Windows tier.
 **macOS has no window-over-SSH e2e coverage (documented limitation,
 2026-07-10):** the real-SSH e2e tier (`tests/e2e/test_ssh_real.py`, over the
 live loopback sshd `.github/actions/setup-ssh-server` provisions) proves the
-non-interactive attach control channel (`ssh <target> "multideck up --json"`)
-on all three OSes, the full `multideck attach` workflow — remote bring-up,
+non-interactive attach control channel (`ssh <target> "magent up --json"`)
+on all three OSes, the full `magent attach` workflow — remote bring-up,
 psmux-session survival past the ssh session, real `wt` windows, tiling,
 `serve --ensure` survivor — on Windows, and launch.py's nested remote quoting
 (`xterm → ssh -t → bash -lc 'cd … && cmd'`) on Linux. macOS window legs emit
@@ -575,7 +576,7 @@ socket layer" gaps.
 prior test of the no-subcommand interactive path went through Click's
 `CliRunner`, where `sys.stdin.isatty()` is False — so the real first-run/menu
 branch in `cli/app.py` never executed the way a user hits it. These tests drive
-the installed `python -m multideck` under a GENUINE pseudo-terminal (pexpect on
+the installed `python -m magent` under a GENUINE pseudo-terminal (pexpect on
 POSIX via `os.forkpty`, pywinpty/ConPTY on Windows; the uniform driver is
 `tests/e2e/_pty.py`), assert on the plain on-screen text (escape sequences
 stripped first, children launched `NO_COLOR=1` so click emits none of its own),
@@ -588,10 +589,10 @@ render + quit, group-submenu round-trip).
 *Real-browser upload (`tests/e2e/test_upload_browser.py`, marker `browser`,
 dedicated `browser-upload` ubuntu job, CI-only, gated on `MDTEST_BROWSER=1` +
 present Playwright/chromium):* a real headless Chromium loads the real mobile
-upload page served by a real `multideck serve` on loopback, performs the real
+upload page served by a real `magent serve` on loopback, performs the real
 gesture (tap pill → attach a real PNG → the page's own `fetch('/upload')`
 fires), and the test asserts the bytes the product writes to
-`~/.multideck/uploads` are byte-identical to what was attached, plus the page's
+`~/.magent/uploads` are byte-identical to what was attached, plus the page's
 title/form contract so a template regression fails loudly. *Honest gap (small,
 deliberate):* hosted Linux runners have no `psmux` binary and `LinuxPlatform`
 does not implement `launch_psmux_session`, so the test symlinks real `tmux` in
@@ -604,7 +605,7 @@ no-token loopback bind is exercised as-is; no auth was added.
 
 **Real-tailnet coverage (2026-07-15):** `tailnet.py` (`ip4` / `magicdns_host`
 / `probe` — the single owner of every `tailscale` CLI probe) and the
-Tailscale-facing half of `multideck serve`'s default bind
+Tailscale-facing half of `magent serve`'s default bind
 (`upload_server._bind_addresses`) had only ever been unit-mocked: no test had
 ever run the real `tailscale` binary or proven the server listens on the
 machine's Tailscale IPv4. `tests/e2e/test_tailnet_real.py` (marker
@@ -615,7 +616,7 @@ OAuth + `tag:ci`), and the tests assert `tailnet.ip4()` equals real `tailscale
 ip -4` (and is a genuine 100.64.0.0/10 CGNAT address), `probe()` reports the
 live node, `magicdns_host()` equals real `tailscale status --json`
 `Self.DNSName`, `_bind_addresses(None)` is exactly `["127.0.0.1", <ts ip>]`
-(never the wildcard), and a real `multideck serve` with no `--host` answers
+(never the wildcard), and a real `magent serve` with no `--host` answers
 `/health` on both loopback and the Tailscale IP while leaving the LAN wildcard
 provably unbound (a fresh socket still binds the runner's own LAN IP on that
 port). *Deliberate operational note:* the OAuth secrets
@@ -659,12 +660,12 @@ triaged out of the fix pass that produced this document, not overlooked):
 
 | Item (provenance) | Substance |
 |---|---|
-| Phantom `state-sink.mjs` writer (F-NC-001) | **The out-of-repo writer multideck's docs name — `state-sink.mjs`, shipped by `ai-agent-notifier` — does not exist.** Driving the real published `ai-agent-notifier@1.0.6` under node (`tests/e2e/test_state_sink_contract.py`) shows its only hook is `src/notify.mjs`, a pure notifier (toast/ntfy/bell) that writes `~/.ai-agent-notifier/.lock-<source>` and **nothing** to `~/.multideck/state/`. So a user who wires only `ai-agent-notifier` per README "Where agent states come from" gets an EMPTY state store and a blank `watch`/`attention`. The `node_contract` tier pins this gap and flips RED when any wired hook starts writing multideck records. Product decision owed: either ship a real state-writer (in `ai-agent-notifier` or elsewhere) or correct multideck's README/`agent_state.py`/`test_agent_state.py`/CLAUDE.md references to `state-sink.mjs`. Codex `notify` (the other named writer) is likewise unverified by any live tier. |
+| Phantom `state-sink.mjs` writer (F-NC-001) | **The out-of-repo writer magent's docs name — `state-sink.mjs`, shipped by `ai-agent-notifier` — does not exist.** Driving the real published `ai-agent-notifier@1.0.6` under node (`tests/e2e/test_state_sink_contract.py`) shows its only hook is `src/notify.mjs`, a pure notifier (toast/ntfy/bell) that writes `~/.ai-agent-notifier/.lock-<source>` and **nothing** to `~/.magent/state/`. So a user who wires only `ai-agent-notifier` per README "Where agent states come from" gets an EMPTY state store and a blank `watch`/`attention`. The `node_contract` tier pins this gap and flips RED when any wired hook starts writing magent records. Product decision owed: either ship a real state-writer (in `ai-agent-notifier` or elsewhere) or correct magent's README/`agent_state.py`/`test_agent_state.py`/CLAUDE.md references to `state-sink.mjs`. Codex `notify` (the other named writer) is likewise unverified by any live tier. |
 | `IDE_TOOLS` consolidation (F-CT-003) | IDE-vs-CLI-agent tool identity is string-matched in several places instead of one registry — see Key Decisions. |
 | Upload server per-request logging (F-IC-001) | `UploadHandler.log_message` routes the stdlib HTTP access log to DEBUG level (deliberately quiet at INFO to avoid logging `?project=` query strings) — so per-request errors surface nowhere at the default level; the rotating `upload` log covers lifecycle events only. |
 | Upload retry/robustness (F-IC-003) | The hotkey→server upload path is one HTTP attempt; a flaky mobile/Tailscale link just fails once. |
 | Same-second upload filename collision (F-D3-003) | `do_POST` names uploads `f"{int(time.time())}_{basename}"` — two different files for the same project in the same wall-clock second collide. |
-| Upload retention sweep (F-D3-004) | `~/.multideck/uploads` has no cleanup/retention policy; it grows forever. |
+| Upload retention sweep (F-D3-004) | `~/.magent/uploads` has no cleanup/retention policy; it grows forever. |
 | `init_config.scan_for_projects` scan behavior (F-D5-004) | The "found `.git` dirs, else fall back to flat immediate children" heuristic and the 300-repo cap haven't been re-examined since first written. |
 | `init_config` silent `PermissionError` (F-OB-005) | `except PermissionError: continue` skips unreadable directories with no warning that anything was skipped. |
 | Hotkey module architecture (F-CT-005) | `hotkey.py` mixes raw ctypes Win32 bindings, hook lifecycle, upload-trigger logic, and pid-file management in one module; a structural split is future work. |
@@ -695,7 +696,7 @@ change):
   rendered from `Settings().tools` (the `settings_to_dict`/`default_config`
   source), so it lists exactly `DEFAULT_TOOLS` — the fabricated
   `"aider": "aider --model sonnet"` entry is gone — and the `## CLI commands`
-  table now lists `multideck config migrate`. Pinned by
+  table now lists `magent config migrate`. Pinned by
   `test_cli_smoke.py::test_docs_example_config_tools_match_default_tools`.
   (The still-hand-maintained command table remains a smaller latent-drift
   risk; generating it from the live registration set is future work.)
@@ -736,7 +737,7 @@ change):
   `os.kill(pid, 0)` branch) — neither calls the other.
 - **`launch.py`'s base-dir expansion chain is duplicated:** the exact
   `os.path.expandvars(os.path.expanduser(base_dir)).replace("/", os.sep)`
-  sequence appears in `run_multideck`'s body and again in
+  sequence appears in `run_magent`'s body and again in
   `eligible_psmux_projects` — an `_expand_base_dir` helper is the natural
   dedup, not yet extracted.
 - **Up/down command/menu twins are close but not shared:** `up_cmd`/`_menu_up`
@@ -804,7 +805,7 @@ launched as-is, like `cursor-agent`/`agy`), only step 3 applies: one
    `config.DEFAULT_TOOLS` — deliberately separate concerns: `DEFAULT_TOOLS`
    controls what config generators pre-populate; `AGENT_TOOLS` controls
    resume/multi-window capability. Changing `DEFAULT_TOOLS` requires
-   updating `multideck.config.example.json`'s `settings.tools` in the same
+   updating `magent.config.example.json`'s `settings.tools` in the same
    change — `tests/unit/test_config_factory.py::TestExampleConfigMatchesFactory`
    pins the example's settings block to `settings_to_dict(Settings())`
    exactly (that anti-drift pin is the point of the example file).
@@ -829,7 +830,7 @@ launched as-is, like `cursor-agent`/`agy`), only step 3 applies: one
    never a raw `sys.platform` check in business logic.
 
 **(c) Add a CLI command:**
-1. New module under `cli/`, importing `main` from `multideck.cli.app` (never
+1. New module under `cli/`, importing `main` from `magent.cli.app` (never
    from the package `__init__`) and attaching commands with
    `@main.command(...)`. Follow the import policy: stdlib and leaf imports
    (`config_io`, `ui`, `paths`, `style`, `config` types) at top; heavy

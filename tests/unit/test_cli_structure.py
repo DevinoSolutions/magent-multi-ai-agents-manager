@@ -16,7 +16,7 @@ import subprocess
 import click
 import pytest
 
-from multideck import cli
+from magent import cli
 
 
 def _normalize_help(output: str) -> str:
@@ -35,22 +35,22 @@ def _normalize_help(output: str) -> str:
 
 
 HELP_SNAPSHOTS = {
-    (): "Usage: main [OPTIONS] [COMMAND] [ARGS]...\n\n  Open every project in its own terminal and auto-tile across all monitors.\n\nOptions:\n  --go              Skip interactive menu, launch + tile\n  --retile-all      Re-tile every matching window\n  -g, --group TEXT  Launch only projects in this group\n  --init            Re-scan and regenerate config\n  --base-dir PATH   Folder to scan with --init\n  --config PATH     Path to config file\n  --force           With --init, overwrite existing config\n  --edit            Open config in your default editor\n  --attach-to TEXT  Attach to remote psmux sessions (host or user@host)\n  --no-mux          With --attach-to: one plain SSH window per project (no\n                    psmux/tmux)\n  --version         Show the version and exit.\n  --help            Show this message and exit.\n\nCommands:\n  attach     Attach to another machine's multideck sessions over SSH.\n  attention  Ambient attention signals for your agent fleet.\n  config     View and modify your multideck configuration.\n  docs       Print the full configuration reference (Markdown).\n  doctor     Diagnose the environment: config, env vars, tools, display, dirs.\n  down       Shut down running psmux sessions (and optionally the upload...\n  hotkey     Listen for Alt+V to upload clipboard images to psmux sessions.\n  mobile     Show the phone URL + QR for the image-upload app.\n  serve      Start upload server for mobile image transfer.\n  sessions   List psmux sessions or attach to one.\n  status     Show which psmux sessions and services are currently running.\n  termius    Generate SSH config for Termius — one host that opens all...\n  up         Ensure a persistent psmux session per project (host side of...\n  watch      Live view of every agent session — who needs you, sorted first.\n",
+    (): "Usage: main [OPTIONS] [COMMAND] [ARGS]...\n\n  Open every project in its own terminal and auto-tile across all monitors.\n\nOptions:\n  --go              Skip interactive menu, launch + tile\n  --retile-all      Re-tile every matching window\n  -g, --group TEXT  Launch only projects in this group\n  --init            Re-scan and regenerate config\n  --base-dir PATH   Folder to scan with --init\n  --config PATH     Path to config file\n  --force           With --init, overwrite existing config\n  --edit            Open config in your default editor\n  --attach-to TEXT  Attach to remote psmux sessions (host or user@host)\n  --no-mux          With --attach-to: one plain SSH window per project (no\n                    psmux/tmux)\n  --version         Show the version and exit.\n  --help            Show this message and exit.\n\nCommands:\n  attach     Attach to another machine's magent sessions over SSH.\n  attention  Ambient attention signals for your agent fleet.\n  config     View and modify your magent configuration.\n  docs       Print the full configuration reference (Markdown).\n  doctor     Diagnose the environment: config, env vars, tools, display, dirs.\n  down       Shut down running psmux sessions (and optionally the upload...\n  hotkey     Listen for Alt+V to upload clipboard images to psmux sessions.\n  mobile     Show the phone URL + QR for the image-upload app.\n  serve      Start upload server for mobile image transfer.\n  sessions   List psmux sessions or attach to one.\n  status     Show which psmux sessions and services are currently running.\n  termius    Generate SSH config for Termius — one host that opens all...\n  up         Ensure a persistent psmux session per project (host side of...\n  watch      Live view of every agent session — who needs you, sorted first.\n",
     (
         "attention",
-    ): "Usage: main attention [OPTIONS]\n\n  Ambient attention signals for your agent fleet.\n\n  Badges every md: window title with its session state, flashes the taskbar when\n  an agent needs input or errors, and (when enabled in config) sends a Windows\n  toast and/or an ntfy push. States come from the agent-state store that Claude\n  Code hooks / Codex notify already write.\n\nOptions:\n  -d, --daemon      Run detached\n  --stop            Stop the running daemon\n  --interval FLOAT  Seconds between polls (default: attention.pollIntervalS from\n                    config)\n  --help            Show this message and exit.\n",
+    ): "Usage: main attention [OPTIONS]\n\n  Ambient attention signals for your agent fleet.\n\n  Badges every magent: window title with its session state, flashes the taskbar\n  when an agent needs input or errors, and (when enabled in config) sends a\n  Windows toast and/or an ntfy push. States come from the agent-state store that\n  Claude Code hooks / Codex notify already write.\n\nOptions:\n  -d, --daemon      Run detached\n  --stop            Stop the running daemon\n  --interval FLOAT  Seconds between polls (default: attention.pollIntervalS from\n                    config)\n  --help            Show this message and exit.\n",
     (
         "up",
     ): "Usage: main up [OPTIONS]\n\n  Ensure a persistent psmux session per project (host side of `attach`).\n\nOptions:\n  --json            Print session status as JSON without changing anything\n  --all             Recreate every session, not just the ones that are down\n  -g, --group TEXT  Only projects tagged with this group\n  --help            Show this message and exit.\n",
     (
         "attach",
-    ): "Usage: main attach [OPTIONS] [HOST]\n\n  Attach to another machine's multideck sessions over SSH.\n\n  HOST is user@host (omit to be prompted; blank uses the host from your local\n  config). Default tiles one window per remote psmux session with Alt+V image\n  paste; --no-mux opens a direct SSH window per project instead. -g limits the\n  flow to one project group on the host; -y skips the bring-up prompt.\n\nOptions:\n  --no-mux          One plain SSH window per project (no psmux/tmux)\n  -g, --group TEXT  Only attach/bring up projects in this group\n  -y, --yes         Skip the bring-up prompt (bring up everything that's down)\n  --help            Show this message and exit.\n",
+    ): "Usage: main attach [OPTIONS] [HOST]\n\n  Attach to another machine's magent sessions over SSH.\n\n  HOST is user@host (omit to be prompted; blank uses the host from your local\n  config). Default tiles one window per remote psmux session with Alt+V image\n  paste; --no-mux opens a direct SSH window per project instead. -g limits the\n  flow to one project group on the host; -y skips the bring-up prompt.\n\nOptions:\n  --no-mux          One plain SSH window per project (no psmux/tmux)\n  -g, --group TEXT  Only attach/bring up projects in this group\n  -y, --yes         Skip the bring-up prompt (bring up everything that's down)\n  --help            Show this message and exit.\n",
     (
         "hotkey",
-    ): "Usage: main hotkey [OPTIONS]\n\n  Listen for Alt+V to upload clipboard images to psmux sessions.\n\n  Only activates when a 'md:' titled window is focused. Otherwise the keystroke\n  passes through normally.\n\nOptions:\n  -s, --server TEXT  Upload server URL\n  --help             Show this message and exit.\n",
+    ): "Usage: main hotkey [OPTIONS]\n\n  Listen for Alt+V to upload clipboard images to psmux sessions.\n\n  Only activates when a 'magent:' titled window is focused. Otherwise the\n  keystroke passes through normally.\n\nOptions:\n  -s, --server TEXT  Upload server URL\n  --help             Show this message and exit.\n",
     (
         "config",
-    ): "Usage: main config [OPTIONS] COMMAND [ARGS]...\n\n  View and modify your multideck configuration.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  add           Add a project.\n  base-dir      Set the base directory for project paths.\n  default-tool  Set the default tool for new projects.\n  disable       Disable a project without removing it.\n  enable        Enable a disabled project.\n  layout        Set grid layout.\n  migrate       Migrate the config file to the current schema version,...\n  open          Open config file in your default editor.\n  path          Print the config file path.\n  remove        Remove a project by path (or leaf name).\n  remove-tool   Remove a tool.\n  set           Set a field on a project.\n  show          Display current configuration.\n  tool          Add or update a tool command.\n",
+    ): "Usage: main config [OPTIONS] COMMAND [ARGS]...\n\n  View and modify your magent configuration.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  add           Add a project.\n  base-dir      Set the base directory for project paths.\n  default-tool  Set the default tool for new projects.\n  disable       Disable a project without removing it.\n  enable        Enable a disabled project.\n  layout        Set grid layout.\n  migrate       Migrate the config file to the current schema version,...\n  open          Open config file in your default editor.\n  path          Print the config file path.\n  remove        Remove a project by path (or leaf name).\n  remove-tool   Remove a tool.\n  set           Set a field on a project.\n  show          Display current configuration.\n  tool          Add or update a tool command.\n",
     (
         "watch",
     ): "Usage: main watch [OPTIONS]\n\n  Live view of every agent session — who needs you, sorted first.\n\n  Rows come from the same state store the attention daemon reads (needs-input\n  and errors on top, time-in-state alongside). Press a row number to focus that\n  session's window; q quits.\n\nOptions:\n  --interval FLOAT  Refresh seconds  [default: 2.0]\n  --help            Show this message and exit.\n",
@@ -62,16 +62,16 @@ HELP_SNAPSHOTS = {
     ): "Usage: main doctor [OPTIONS]\n\n  Diagnose the environment: config, env vars, tools, display, dirs.\n\n  One line per check with an actionable hint on warn/fail. Exit 0 when nothing\n  failed (warnings allowed), 1 when any check failed.\n\nOptions:\n  --json  Print check results as JSON\n  --help  Show this message and exit.\n",
     (
         "termius",
-    ): "Usage: main termius [OPTIONS]\n\n  Generate SSH config for Termius — one host that opens all projects.\n\n  Connects to the 'multideck' psmux session with all project windows inside.\n  Switch windows with Ctrl+B then number/name.\n\nOptions:\n  --host TEXT  SSH hostname or IP (default: Tailscale IP)\n  --user TEXT  SSH username (default: current user)\n  --install    Write entry to ~/.ssh/config\n  --help       Show this message and exit.\n",
+    ): "Usage: main termius [OPTIONS]\n\n  Generate SSH config for Termius — one host that opens all projects.\n\n  Connects to the 'magent' psmux session with all project windows inside. Switch\n  windows with Ctrl+B then number/name.\n\nOptions:\n  --host TEXT  SSH hostname or IP (default: Tailscale IP)\n  --user TEXT  SSH username (default: current user)\n  --install    Write entry to ~/.ssh/config\n  --help       Show this message and exit.\n",
     (
         "serve",
     ): "Usage: main serve [OPTIONS]\n\n  Start upload server for mobile image transfer.\n\n  Opens a web page on your phone (via Tailscale) where you pick a project,\n  upload an image, and the file path is auto-pasted into that project's Claude\n  session via psmux send-keys.\n\nOptions:\n  -p, --port INTEGER  Port to listen on\n  --host TEXT         Bind a specific address instead of the default (loopback +\n                      Tailscale IP, never the LAN wildcard). Pass 0.0.0.0 to\n                      restore an explicit LAN-wide bind.\n  --ensure            Start the server detached if it isn't already running,\n                      then exit (used by attach).\n  --help              Show this message and exit.\n",
     (
         "mobile",
-    ): "Usage: main mobile [OPTIONS]\n\n  Show the phone URL + QR for the image-upload app.\n\n  Scan it once on your phone, then 'Add to Home Screen' to install the uploader\n  as a standalone app -- after that it's one tap to send an image into any md:\n  session. Run this on the host that serves the uploader.\n\nOptions:\n  -p, --port INTEGER  Upload server port (default: running server, else 8033).\n  --host TEXT         Host/IP for the phone URL (default: Tailscale name or IP).\n  --help              Show this message and exit.\n",
+    ): "Usage: main mobile [OPTIONS]\n\n  Show the phone URL + QR for the image-upload app.\n\n  Scan it once on your phone, then 'Add to Home Screen' to install the uploader\n  as a standalone app -- after that it's one tap to send an image into any\n  magent: session. Run this on the host that serves the uploader.\n\nOptions:\n  -p, --port INTEGER  Upload server port (default: running server, else 8033).\n  --host TEXT         Host/IP for the phone URL (default: Tailscale name or IP).\n  --help              Show this message and exit.\n",
     (
         "sessions",
-    ): "Usage: main sessions [OPTIONS] [NAME]\n\n  List psmux sessions or attach to one. Usage: multideck sessions [name]\n\nOptions:\n  --help  Show this message and exit.\n",
+    ): "Usage: main sessions [OPTIONS] [NAME]\n\n  List psmux sessions or attach to one. Usage: magent sessions [name]\n\nOptions:\n  --help  Show this message and exit.\n",
     (
         "status",
     ): "Usage: main status [OPTIONS]\n\n  Show which psmux sessions and services are currently running.\n\nOptions:\n  --json  Print daemon status as JSON\n  --help  Show this message and exit.\n",
@@ -89,7 +89,7 @@ HELP_SNAPSHOTS = {
     (
         "config",
         "layout",
-    ): "Usage: main config layout [OPTIONS] COLUMNS ROWS\n\n  Set grid layout. Usage: multideck config layout 3 2\n\nOptions:\n  --help  Show this message and exit.\n",
+    ): "Usage: main config layout [OPTIONS] COLUMNS ROWS\n\n  Set grid layout. Usage: magent config layout 3 2\n\nOptions:\n  --help  Show this message and exit.\n",
     (
         "config",
         "base-dir",
@@ -101,7 +101,7 @@ HELP_SNAPSHOTS = {
     (
         "config",
         "tool",
-    ): "Usage: main config tool [OPTIONS] NAME COMMAND\n\n  Add or update a tool command. Usage: multideck config tool aider 'aider\n  --model sonnet'\n\nOptions:\n  --help  Show this message and exit.\n",
+    ): "Usage: main config tool [OPTIONS] NAME COMMAND\n\n  Add or update a tool command. Usage: magent config tool aider 'aider --model\n  sonnet'\n\nOptions:\n  --help  Show this message and exit.\n",
     (
         "config",
         "remove-tool",
@@ -109,7 +109,7 @@ HELP_SNAPSHOTS = {
     (
         "config",
         "add",
-    ): "Usage: main config add [OPTIONS] PATH\n\n  Add a project. Usage: multideck config add ./myapp -g INTERNAL -t claude\n\nOptions:\n  -g, --group TEXT       Group name\n  -t, --tool TEXT        Tool (claude, codex, vscode, ...)\n  -c, --color TEXT       Tab color (#rrggbb)\n  --title TEXT           Custom window title\n  --host TEXT            SSH host for remote projects\n  -w, --windows INTEGER  Number of windows\n  --help                 Show this message and exit.\n",
+    ): "Usage: main config add [OPTIONS] PATH\n\n  Add a project. Usage: magent config add ./myapp -g INTERNAL -t claude\n\nOptions:\n  -g, --group TEXT       Group name\n  -t, --tool TEXT        Tool (claude, codex, vscode, ...)\n  -c, --color TEXT       Tab color (#rrggbb)\n  --title TEXT           Custom window title\n  --host TEXT            SSH host for remote projects\n  -w, --windows INTEGER  Number of windows\n  --help                 Show this message and exit.\n",
     (
         "config",
         "remove",
@@ -125,7 +125,7 @@ HELP_SNAPSHOTS = {
     (
         "config",
         "set",
-    ): "Usage: main config set [OPTIONS] PATH FIELD VALUE\n\n  Set a field on a project. Usage: multideck config set myapp group INTERNAL\n\nOptions:\n  --help  Show this message and exit.\n",
+    ): "Usage: main config set [OPTIONS] PATH FIELD VALUE\n\n  Set a field on a project. Usage: magent config set myapp group INTERNAL\n\nOptions:\n  --help  Show this message and exit.\n",
     (
         "config",
         "open",
@@ -196,11 +196,11 @@ def test_registration_set_config_subcommands():
 
 
 def test_acyclic_imports():
-    """multideck.cli and multideck.upload_server must both import standalone --
+    """magent.cli and magent.upload_server must both import standalone --
     upload_server's deferred `_find_config`/`find_config` import and cli's
     command-module registration must never form a load cycle."""
-    import multideck.cli
-    import multideck.upload_server  # noqa: F401  # reason: imported for its load side-effect — this is the acyclic-import probe
+    import magent.cli
+    import magent.upload_server  # noqa: F401  # reason: imported for its load side-effect — this is the acyclic-import probe
 
 
 class TestConfigMenuCharacterization:
@@ -210,7 +210,7 @@ class TestConfigMenuCharacterization:
     the on-disk JSON mutations plus a stable echo substring per choice."""
 
     def test_scripted_grid_and_happy_toggle(self, tmp_path, monkeypatch, capsys):
-        config_file = tmp_path / "multideck.config.json"
+        config_file = tmp_path / "magent.config.json"
         config_file.write_text(
             json.dumps(
                 {
@@ -244,7 +244,7 @@ class TestAttachFlowCharacterization:
     """Pins _attach_flow (radon D/29) BEFORE it moves into cli/attach.py
     (E6.md Step 0 / Step 10). SSH/subprocess/tiling/hotkey/platform are all
     mocked at the cli module's names -- the psmux path must spawn exactly one
-    `wt ... --title md:<name>` per up-session and hand the titles to
+    `wt ... --title magent:<name>` per up-session and hand the titles to
     _tile_titles; the no-host path must prompt and exit 1 when left blank."""
 
     def test_psmux_path_spawns_and_tiles(self, monkeypatch):
@@ -254,25 +254,23 @@ class TestAttachFlowCharacterization:
             "uploadPort": 8033,
             "projects": [{"name": "myapp", "path": "myapp"}],
         }
-        monkeypatch.setattr("multideck.cli.attach._ssh_json", lambda *a, **k: status)
+        monkeypatch.setattr("magent.cli.attach._ssh_json", lambda *a, **k: status)
         monkeypatch.setattr(
-            "multideck.cli.attach._ssh_capture", lambda *a, **k: (0, "", "")
+            "magent.cli.attach._ssh_capture", lambda *a, **k: (0, "", "")
         )
         popen_calls = []
         monkeypatch.setattr(
             subprocess, "Popen", lambda args, **k: popen_calls.append(args)
         )
         tiled = []
-        monkeypatch.setattr("multideck.cli.attach._tile_titles", tiled.append)
-        monkeypatch.setattr(
-            "multideck.cli.attach._maybe_start_hotkey", lambda url: 1234
-        )
+        monkeypatch.setattr("magent.cli.attach._tile_titles", tiled.append)
+        monkeypatch.setattr("magent.cli.attach._maybe_start_hotkey", lambda url: 1234)
 
         class _FakePlat:
             def supports_hotkey(self) -> bool:
                 return True
 
-        monkeypatch.setattr("multideck.platform.get_platform", _FakePlat)
+        monkeypatch.setattr("magent.platform.get_platform", _FakePlat)
         monkeypatch.setattr("time.sleep", lambda s: None)
 
         cli._attach_flow("user@host", no_mux=False, group=None, yes=False)
@@ -280,11 +278,11 @@ class TestAttachFlowCharacterization:
         assert len(popen_calls) == 1
         assert "wt" in popen_calls[0]
         assert "--title" in popen_calls[0]
-        assert "md:myapp" in popen_calls[0]
-        assert tiled == [["md:myapp"]]
+        assert "magent:myapp" in popen_calls[0]
+        assert tiled == [["magent:myapp"]]
 
     def test_no_host_prompts_then_exits(self, monkeypatch):
-        monkeypatch.setattr("multideck.cli.attach._default_attach_host", lambda: None)
+        monkeypatch.setattr("magent.cli.attach._default_attach_host", lambda: None)
         prompted = []
 
         def fake_prompt(text, **k):

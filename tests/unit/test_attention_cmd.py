@@ -1,4 +1,4 @@
-"""CLI-level tests for `multideck attention` (cli/attention_cmd.py)."""
+"""CLI-level tests for `magent attention` (cli/attention_cmd.py)."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ import json
 import os
 import time
 
-from multideck import agent_state, cli, config, log
-from multideck.cli import attention_cmd
+from magent import agent_state, cli, config, log
+from magent.cli import attention_cmd
 from tests.conftest import FakePlatform
 
 
@@ -61,8 +61,8 @@ class TestForeground:
         monkeypatch.setattr(agent_state, "STATE_DIR", state_dir)
         agent_state.write_state(str(proj_dir), agent_state.NEEDS_INPUT)
 
-        fp = FakePlatform(windows={"md:api": 1}, supports_attention=True)
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
+        fp = FakePlatform(windows={"magent:api": 1}, supports_attention=True)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
         pid_file = tmp_path / "attention.pid"
         monkeypatch.setattr(attention_cmd, "_PID_PATH", pid_file)
 
@@ -74,7 +74,7 @@ class TestForeground:
         assert result.exit_code == 0, result.output
         # Badge on the tick, then stripped back to a clean title when the loop
         # ends — inverse-transience on daemon stop (P6-06).
-        assert fp.titles_set == [(1, "md:[!] api"), (1, "md:api")]
+        assert fp.titles_set == [(1, "magent:[!] api"), (1, "magent:api")]
         assert log.heartbeat_age(attention_cmd.HEARTBEAT_NAME) is not None
         assert not pid_file.exists()  # cleaned up on exit
 
@@ -104,8 +104,8 @@ class TestForeground:
         # ... plus a fresh record that must survive
         agent_state.write_state(str(proj_dir), agent_state.NEEDS_INPUT)
 
-        fp = FakePlatform(windows={"md:api": 1}, supports_attention=True)
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
+        fp = FakePlatform(windows={"magent:api": 1}, supports_attention=True)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
         monkeypatch.setattr(attention_cmd, "_PID_PATH", tmp_path / "attention.pid")
 
         config_path = tmp_config({"version": 2, "projects": [{"path": str(proj_dir)}]})
@@ -121,7 +121,7 @@ class TestForeground:
         self, runner, monkeypatch, tmp_path, tmp_config
     ):
         fp = FakePlatform()  # supports_attention_signals() -> False
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
         monkeypatch.setattr(attention_cmd, "_PID_PATH", tmp_path / "attention.pid")
 
         config_path = tmp_config({"version": 2, "projects": [{"path": "api"}]})
@@ -142,10 +142,10 @@ class TestDaemonPrereqValidation:
         self, runner, monkeypatch, tmp_path, tmp_config
     ):
         fp = FakePlatform()  # supports_attention_signals() -> False
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
         monkeypatch.setattr(attention_cmd, "_PID_PATH", tmp_path / "attention.pid")
         spawned: list = []
-        monkeypatch.setattr("multideck.launch.spawn_detached", spawned.append)
+        monkeypatch.setattr("magent.launch.spawn_detached", spawned.append)
 
         config_path = tmp_config({"version": 2, "projects": [{"path": "api"}]})
         result = runner.invoke(
@@ -158,14 +158,14 @@ class TestDaemonPrereqValidation:
 
     def test_valid_renderer_spawns(self, runner, monkeypatch, tmp_path, tmp_config):
         fp = FakePlatform(supports_attention=True)  # badge/flash enabled & supported
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
         pid_file = tmp_path / "attention.pid"
         monkeypatch.setattr(attention_cmd, "_PID_PATH", pid_file)
 
         def fake_spawn(args):
             pid_file.write_text(str(os.getpid()))  # simulate the child registering
 
-        monkeypatch.setattr("multideck.launch.spawn_detached", fake_spawn)
+        monkeypatch.setattr("magent.launch.spawn_detached", fake_spawn)
 
         config_path = tmp_config({"version": 2, "projects": [{"path": "api"}]})
         result = runner.invoke(
@@ -182,9 +182,9 @@ class TestHeartbeatLifecycle:
 
     def _run_foreground(self, runner, monkeypatch, tmp_path, tmp_config, loop):
         fp = FakePlatform(supports_attention=True)
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
         monkeypatch.setattr(attention_cmd, "_PID_PATH", tmp_path / "attention.pid")
-        monkeypatch.setattr("multideck.attention.run_attention_loop", loop)
+        monkeypatch.setattr("magent.attention.run_attention_loop", loop)
         config_path = tmp_config({"version": 2, "projects": [{"path": "api"}]})
         return runner.invoke(cli.main, ["--config", config_path, "attention"])
 
@@ -296,9 +296,9 @@ class TestIntervalConfigResolution:
         def fake_loop(*_a, poll_interval, **_k):
             captured["poll_interval"] = poll_interval
 
-        monkeypatch.setattr("multideck.attention.run_attention_loop", fake_loop)
+        monkeypatch.setattr("magent.attention.run_attention_loop", fake_loop)
         fp = FakePlatform(supports_attention=True)
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
         monkeypatch.setattr(attention_cmd, "_PID_PATH", tmp_path / "attention.pid")
         config_path = tmp_config(
             {
@@ -334,7 +334,7 @@ class TestPlanRenderersNotifyOnDone:
     off, the flag reaches no renderer (it no-ops)."""
 
     def _plan(self, att):
-        from multideck import attention
+        from magent import attention
 
         fp = FakePlatform(supports_attention=True)
         engine = attention.AttentionEngine()
@@ -343,7 +343,7 @@ class TestPlanRenderersNotifyOnDone:
         )
 
     def _push_renderers(self, renderers):
-        from multideck import attention
+        from magent import attention
 
         return [
             r

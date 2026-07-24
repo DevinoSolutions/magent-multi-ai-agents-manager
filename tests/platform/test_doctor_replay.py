@@ -1,8 +1,8 @@
 """Doctor-replay tier: replay a user's captured monitor topology, live.
 
-When a bug report includes ``multideck doctor --json`` (which now carries the
+When a bug report includes ``magent doctor --json`` (which now carries the
 exact monitor topology under the ``monitors`` key), CI can materialize that
-topology in the parsec-vdd virtual-monitor lab and run multideck's REAL
+topology in the parsec-vdd virtual-monitor lab and run magent's REAL
 ``--go`` tiling assertions against it -- the same physical-pixel, mixed-DPI
 placement proof as ``test_monitor_lab_tiling.py``, but driven from committed
 sample reports (``fixtures/doctor_reports/*.json``) instead of the hand-authored
@@ -93,8 +93,8 @@ def test_replayed_topology_tiles(replay_topology, lab, tmp_path):
         f"{lab.snapshot_json()} (events: {lab.events[-20:]})"
     )
 
-    from multideck.grid import compute_grid
-    from multideck.platform import get_platform
+    from magent.grid import compute_grid
+    from magent.platform import get_platform
 
     plat = get_platform()
     plat.set_dpi_aware()
@@ -106,7 +106,7 @@ def test_replayed_topology_tiles(replay_topology, lab, tmp_path):
     n = len(slots)
 
     # 1. Each materialized virtual monitor reports the PLANNED resolution AND
-    #    DPI through multideck's own list_monitors() view -- the mixed-DPI
+    #    DPI through magent's own list_monitors() view -- the mixed-DPI
     #    precondition in physical pixels. Virtuals are laid out left-to-right in
     #    add order, so virtuals_sorted[k] <-> specs[k] <-> plan.monitors[k].
     virtuals_sorted = sorted(virtuals, key=lambda m: m.x)
@@ -125,13 +125,13 @@ def test_replayed_topology_tiles(replay_topology, lab, tmp_path):
     unique = uuid.uuid4().hex[:8]
     marker = f"mddr-{unique}"
     names = [f"mddr{unique}s{i}" for i in range(n)]
-    titles = [f"md:{nm}" for nm in names]
+    titles = [f"magent:{nm}" for nm in names]
 
     proj = tmp_path / f"proj-{unique}"
     proj.mkdir()
     home = tmp_path / "home"
     home.mkdir()
-    cfg = tmp_path / "multideck.config.json"
+    cfg = tmp_path / "magent.config.json"
     cfg.write_text(
         json.dumps(
             {
@@ -158,7 +158,7 @@ def test_replayed_topology_tiles(replay_topology, lab, tmp_path):
 
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "multideck", "--go", "--config", str(cfg)],
+            [sys.executable, "-m", "magent", "--go", "--config", str(cfg)],
             capture_output=True,
             text=True,
             timeout=300,
@@ -173,8 +173,8 @@ def test_replayed_topology_tiles(replay_topology, lab, tmp_path):
             timeout=lab_harness.MATERIALIZE_TIMEOUT,
         )
         assert handles, (
-            f"{name}: expected {n} windows {titles}; visible md: windows: "
-            f"{[t for t in plat.snapshot_windows() if t.startswith('md:')]}"
+            f"{name}: expected {n} windows {titles}; visible magent: windows: "
+            f"{[t for t in plat.snapshot_windows() if t.startswith('magent:')]}"
         )
 
         # 3. Each window i sits in slots[i], on monitor i -- physical pixels,

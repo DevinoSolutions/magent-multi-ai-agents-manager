@@ -10,16 +10,16 @@ these tests -- ``MDTEST_SSH_PORT`` / ``MDTEST_SSH_KEY`` / ``MDTEST_SSH_HOST``).
 These tests use it. No fakes, no dry-run, no monkeypatched transport:
 
 * ``test_up_json_round_trips_over_live_sshd`` (all OSes) -- the exact
-  non-interactive command shape ``multideck attach`` sends
-  (``_ssh_capture``/``_ssh_json``: ``ssh -o BatchMode=yes <target> "multideck
+  non-interactive command shape ``magent attach`` sends
+  (``_ssh_capture``/``_ssh_json``: ``ssh -o BatchMode=yes <target> "magent
   ... up --json"``) round-trips through sshd: key auth, the sshd session's
   PATH, remote config load, and the one-line JSON envelope all proven live.
 * ``test_attach_over_real_ssh_windows`` (win32 flagship) -- the product's
   headline remote workflow end to end against localhost-as-remote: seed the
-  remote HOME with a uuid-namespaced config, run ``multideck attach mdssh -y``,
+  remote HOME with a uuid-namespaced config, run ``magent attach mdssh -y``,
   and assert psmux sessions were created by the REMOTE bring-up and survive
   the ssh session closing, real ``wt`` windows open running
-  ``ssh -t ... multideck sessions <sid>`` with exact ``md:`` titles, tiling
+  ``ssh -t ... magent sessions <sid>`` with exact ``magent:`` titles, tiling
   places them into their computed cells, and ``serve --ensure`` (sent over
   ssh) leaves a live upload server answering ``/health`` after its ssh
   session is gone (the spawn_detached job-object-breakaway contract).
@@ -197,11 +197,11 @@ def _quoted_config_arg(cfg: Path) -> str:
 
 class TestSshControlChannel:
     def test_up_json_round_trips_over_live_sshd(self, tmp_path, ssh_wire):
-        """`multideck ... up --json` -- the exact remote query `attach` opens
+        """`magent ... up --json` -- the exact remote query `attach` opens
         with -- round-trips through the real sshd: key auth (BatchMode), the
-        sshd session's PATH resolving the installed `multideck`, remote config
+        sshd session's PATH resolving the installed `magent`, remote config
         load, and the single-line JSON envelope parsed from mixed output."""
-        from multideck.cli.attach import _ssh_capture, _ssh_json
+        from magent.cli.attach import _ssh_capture, _ssh_json
 
         unique = uuid.uuid4().hex[:8]
         name_a, name_b = f"mdsshq{unique}a", f"mdsshq{unique}b"
@@ -209,7 +209,7 @@ class TestSshControlChannel:
         proj_b = tmp_path / name_b
         proj_a.mkdir()
         proj_b.mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -232,15 +232,15 @@ class TestSshControlChannel:
         # Transport sanity first, with the full stderr surfaced on failure --
         # this is the line that catches a broken key/alias/PATH before the
         # JSON assertion can only say "None".
-        rc, out, err = _ssh_capture(target, "multideck --version", timeout=60)
+        rc, out, err = _ssh_capture(target, "magent --version", timeout=60)
         assert rc == 0, (
-            f"`ssh {target} multideck --version` failed over the live wire "
+            f"`ssh {target} magent --version` failed over the live wire "
             f"(rc={rc})\nstdout:\n{out}\nstderr:\n{err}"
         )
 
         status = _ssh_json(
             target,
-            f"multideck --config {_quoted_config_arg(cfg)} up --json",
+            f"magent --config {_quoted_config_arg(cfg)} up --json",
             timeout=60,
         )
         assert status is not None, f"no JSON envelope came back over ssh from {target}"
@@ -264,7 +264,7 @@ class TestSshControlChannel:
 
 
 # ---------------------------------------------------------------------------
-# 2. Windows flagship: `multideck attach` against a real remote over real ssh
+# 2. Windows flagship: `magent attach` against a real remote over real ssh
 # ---------------------------------------------------------------------------
 
 
@@ -304,15 +304,15 @@ def _close_windows_and_verify_gone(plat, titles: list[str]) -> list[str]:
 
 
 def _kill_upload_server(port: int) -> None:
-    from multideck.procs import pid_alive
-    from multideck.upload_server import server_pid
+    from magent.procs import pid_alive
+    from magent.upload_server import server_pid
 
     pid = server_pid(port)
     if pid and pid_alive(pid):
         _taskkill(pid)
         _wait_until(lambda: not pid_alive(pid), timeout=10)
     with suppress(OSError):
-        (Path.home() / ".multideck" / f"upload_server-{port}.pid").unlink()
+        (Path.home() / ".magent" / f"upload_server-{port}.pid").unlink()
 
 
 def _seed_files(seeds: list[tuple[Path, str]]) -> list[tuple[Path, bytes | None]]:
@@ -343,10 +343,10 @@ class TestAttachOverRealSsh:
         _require_real_home_ok()
         if shutil.which("wt") is None:
             pytest.skip("Windows Terminal (wt) not on PATH")
-        from multideck import psmux as psmux_mod
-        from multideck.grid import compute_grid
-        from multideck.platform import get_platform
-        from multideck.titles import make_title
+        from magent import psmux as psmux_mod
+        from magent.grid import compute_grid
+        from magent.platform import get_platform
+        from magent.titles import make_title
 
         if psmux_mod.find_psmux() is None:
             pytest.skip("psmux not installed (CI installs it via choco for this leg)")
@@ -387,33 +387,33 @@ class TestAttachOverRealSsh:
                 },
             }
         )
-        # The remote `multideck up --json` runs with the ssh user's real HOME
+        # The remote `magent up --json` runs with the ssh user's real HOME
         # and no --config: seed both places find_config() looks on the far
         # side -- the session cwd (sshd starts commands in %USERPROFILE%) and
         # the canonical APPDATA path. Same user on both ends of the loopback.
         home = Path.home()
-        from multideck.env import config_base
+        from magent.env import config_base
 
         seeded = _seed_files(
             [
-                (home / "multideck.config.json", config_body),
-                (config_base() / "multideck" / "config.json", config_body),
+                (home / "magent.config.json", config_body),
+                (config_base() / "magent" / "config.json", config_body),
             ]
         )
 
         hotkey_pre: int | None = None
         with suppress(ImportError):
-            from multideck.hotkey import listener_pid
+            from magent.hotkey import listener_pid
 
             hotkey_pre = listener_pid()
 
         # Windows Terminal cold start races attach's two rapid `wt -w new`
         # spawns into ONE merged window (observed live in CI run 3: tiling
-        # found neither title within its budget and only the second md: title
+        # found neither title within its budget and only the second magent: title
         # ever existed as a top-level window). A real user attaches with a
         # warm terminal broker; give the test the same reality: open one
         # throwaway window first and hold it open across the attach run. Its
-        # non-md title is invisible to attach's md-name tiling, and cleanup
+        # non-magent title is invisible to attach's magent-name tiling, and cleanup
         # closes it with everything else.
         warm_title = f"mdwarm-{unique}"
         subprocess.Popen(
@@ -441,7 +441,7 @@ class TestAttachOverRealSsh:
                 [
                     sys.executable,
                     "-m",
-                    "multideck",
+                    "magent",
                     "attach",
                     ssh_wire["host"],
                     "-y",
@@ -452,7 +452,7 @@ class TestAttachOverRealSsh:
             )
             assert rc == 0, f"attach exited {rc}\nstdout:\n{out}\nstderr:\n{err}"
 
-            # 1. The REMOTE bring-up (a plain `ssh mdssh "multideck up"`)
+            # 1. The REMOTE bring-up (a plain `ssh mdssh "magent up"`)
             #    created real psmux sessions -- and they survived that ssh
             #    session closing (Windows OpenSSH kills the command's job
             #    object on disconnect; surviving it is the product contract
@@ -464,16 +464,16 @@ class TestAttachOverRealSsh:
                     f"session closing\nattach stdout:\n{out}"
                 )
 
-            # 2. Real wt windows exist with the exact md:<sid> titles, each
-            #    hosting `ssh -t mdssh "multideck sessions <sid>"`.
+            # 2. Real wt windows exist with the exact magent:<sid> titles, each
+            #    hosting `ssh -t mdssh "magent sessions <sid>"`.
             def _both_windows() -> dict[str, object] | None:
                 snap = _snapshot_titles(plat, titles)
                 return snap if len(snap) == 2 else None
 
             handles = _wait_until(_both_windows, timeout=30)
             assert handles, (
-                f"expected windows {titles}; md: windows visible: "
-                f"{[t for t in plat.snapshot_windows() if str(t).startswith('md:')]}"
+                f"expected windows {titles}; magent: windows visible: "
+                f"{[t for t in plat.snapshot_windows() if str(t).startswith('magent:')]}"
                 f"\nattach stdout:\n{out}"
             )
 
@@ -502,7 +502,7 @@ class TestAttachOverRealSsh:
                     f"[{slot.y}, {slot.y + slot.h}]\nattach stdout:\n{out}"
                 )
 
-            # 4. `multideck serve --ensure`, sent over its own ssh session,
+            # 4. `magent serve --ensure`, sent over its own ssh session,
             #    left a detached upload server that outlived it: /health on
             #    the configured (uuid-free but uuid-chosen) port answers.
             assert _wait_until(lambda: _health_ok(upload_port), timeout=20), (
@@ -514,13 +514,13 @@ class TestAttachOverRealSsh:
             killed = psmux_mod.kill_servers([name_a, name_b])
             _kill_upload_server(upload_port)
             with suppress(ImportError):
-                from multideck.hotkey import listener_pid
+                from magent.hotkey import listener_pid
 
                 hotkey_now = listener_pid()
                 if hotkey_now and hotkey_now != hotkey_pre:
                     _taskkill(hotkey_now)
                     with suppress(OSError):
-                        (Path.home() / ".multideck" / "hotkey.pid").unlink()
+                        (Path.home() / ".magent" / "hotkey.pid").unlink()
             _restore_files(seeded)
 
         # Cleanup is part of the contract: nothing this test created survives.
@@ -592,8 +592,8 @@ class TestRemoteLaunchOverRealSshLinux:
             if not shutil.which(tool):
                 pytest.skip(f"{tool} not installed: required for this leg")
 
-        from multideck.platform import get_platform
-        from multideck.titles import make_title
+        from magent.platform import get_platform
+        from magent.titles import make_title
 
         unique = uuid.uuid4().hex[:8]
         name = f"mdsshl{unique}"
@@ -605,7 +605,7 @@ class TestRemoteLaunchOverRealSshLinux:
 
         home = tmp_path / "home"
         home.mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -633,20 +633,18 @@ class TestRemoteLaunchOverRealSshLinux:
             )
         )
 
-        # Child env: HOME redirected (its ~/.multideck never touches the real
+        # Child env: HOME redirected (its ~/.magent never touches the real
         # user's) but the ssh CLIENT resolves ~/.ssh from passwd, not $HOME,
         # so the real ~/.ssh/config mdssh alias (CI-provisioned) still applies.
         env = {
-            k: v
-            for k, v in os.environ.items()
-            if not k.upper().startswith("MULTIDECK_")
+            k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")
         }
         env["HOME"] = str(home)
         env["XDG_CONFIG_HOME"] = str(home / ".config")
 
         try:
             rc, out, err = _run_to_files(
-                [sys.executable, "-m", "multideck", "--go", "--config", str(cfg)],
+                [sys.executable, "-m", "magent", "--go", "--config", str(cfg)],
                 tmp_path,
                 "go-remote",
                 timeout=120,
@@ -662,7 +660,7 @@ class TestRemoteLaunchOverRealSshLinux:
                 f"command did not execute\nstdout:\n{out}\nstderr:\n{err}"
             )
 
-            # 2. The real window exists with the exact md: title...
+            # 2. The real window exists with the exact magent: title...
             assert _wait_until(lambda: bool(_xdotool_ids(title)), timeout=20), (
                 f"expected a real xterm titled {title!r}\nstdout:\n{out}"
             )

@@ -13,7 +13,7 @@ import json
 import socket
 import subprocess
 
-from multideck.cli.background import _tailnet_host
+from magent.cli.background import _tailnet_host
 
 
 def _cp(returncode: int, stdout: str) -> subprocess.CompletedProcess[str]:

@@ -1,4 +1,4 @@
-"""Unit tests for multideck.psmux leaf primitives.
+"""Unit tests for magent.psmux leaf primitives.
 
 Focused on pane_cwd's subprocess guards: the P1-06 extraction (137c8d5) that
 moved the inline session_picker ``cwd()`` closure into psmux.pane_cwd dropped
@@ -14,7 +14,7 @@ import subprocess
 
 import pytest
 
-from multideck import psmux
+from magent import psmux
 
 
 class _FakeCompleted:

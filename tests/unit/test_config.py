@@ -2,15 +2,15 @@ from pathlib import Path
 
 import pytest
 
-from multideck.config import SCHEMA_VERSION, ConfigError, MultideckConfig, load_config
-from multideck.init_config import generate_config, scan_for_projects
+from magent.config import SCHEMA_VERSION, ConfigError, MagentConfig, load_config
+from magent.init_config import generate_config, scan_for_projects
 
 
 class TestLoadConfig:
     def test_minimal_valid_config(self, tmp_config):
         path = tmp_config({"projects": [{"path": "api"}]})
         cfg = load_config(path)
-        assert isinstance(cfg, MultideckConfig)
+        assert isinstance(cfg, MagentConfig)
         assert len(cfg.projects) == 1
         assert cfg.projects[0].path == "api"
 
@@ -159,7 +159,7 @@ class TestLoadConfig:
         # F-D6-003/007: load_config backfills a missing color IN MEMORY so
         # callers always see cfg.projects[*].color populated, but load must
         # never write to disk as a side effect (R10) -- persistence is
-        # `multideck config migrate`'s job now.
+        # `magent config migrate`'s job now.
         path = tmp_config({"projects": [{"path": "api"}]})
         before = Path(path).read_bytes()
         cfg = load_config(path)
@@ -174,7 +174,7 @@ class TestDeterministicColors:
     `config migrate` persists it (no more per-load randomness)."""
 
     def test_derive_is_deterministic(self):
-        from multideck.config import _derive_tab_color
+        from magent.config import _derive_tab_color
 
         a = _derive_tab_color("api", set())
         b = _derive_tab_color("api", set())
@@ -182,12 +182,12 @@ class TestDeterministicColors:
         assert a.startswith("#") and len(a) == 7
 
     def test_distinct_identities_differ(self):
-        from multideck.config import _derive_tab_color
+        from magent.config import _derive_tab_color
 
         assert _derive_tab_color("api", set()) != _derive_tab_color("web", set())
 
     def test_avoids_collision_within_config(self):
-        from multideck.config import _derive_tab_color
+        from magent.config import _derive_tab_color
 
         first = _derive_tab_color("api", set())
         second = _derive_tab_color("api", {first})
@@ -242,7 +242,7 @@ class TestDeterministicColors:
 
     def test_missing_version_defaults_zero_and_warns(self, capsys, tmp_config):
         # R10: a config file with no top-level "version" loads as legacy v0
-        # and nudges the user toward `multideck config migrate`.
+        # and nudges the user toward `magent config migrate`.
         path = tmp_config({"projects": [{"path": "api"}]})
         cfg = load_config(path)
         assert cfg.version == 0
@@ -304,6 +304,37 @@ class TestAttentionSettings:
             }
         )
         assert load_config(path).settings.attention.notify_on_done is True
+
+
+class TestWindowTitlePrefix:
+    def test_defaults_on_when_absent(self, tmp_config):
+        # Additive field with a safe default: an absent windowTitlePrefix parses
+        # to True (the magent: prefix is on), so existing configs are unchanged.
+        path = tmp_config({"version": SCHEMA_VERSION, "projects": [{"path": "api"}]})
+        assert load_config(path).settings.window_title_prefix is True
+
+    def test_explicit_false_parses(self, tmp_config):
+        path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {"windowTitlePrefix": False},
+                "projects": [{"path": "api"}],
+            }
+        )
+        assert load_config(path).settings.window_title_prefix is False
+
+    def test_is_a_known_settings_key(self, capsys, tmp_config):
+        # windowTitlePrefix must be in _ALLOWED_SETTINGS_KEYS -- otherwise
+        # load_config would warn "unknown config key" on every load.
+        path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {"windowTitlePrefix": True},
+                "projects": [{"path": "api"}],
+            }
+        )
+        load_config(path)
+        assert capsys.readouterr().err == ""
 
 
 class TestPathResolution:

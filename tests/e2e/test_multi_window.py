@@ -10,7 +10,7 @@ pytestmark = pytest.mark.e2e
 class TestMultiWindowDryRun:
     def test_windows_int(self, tmp_path):
         (tmp_path / "api").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -23,7 +23,7 @@ class TestMultiWindowDryRun:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -40,7 +40,7 @@ class TestMultiWindowDryRun:
 
     def test_windows_string_array(self, tmp_path):
         (tmp_path / "api").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -53,7 +53,7 @@ class TestMultiWindowDryRun:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -68,7 +68,7 @@ class TestMultiWindowDryRun:
 
     def test_windows_ignored_for_code_tool(self, tmp_path):
         (tmp_path / "api").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -81,7 +81,7 @@ class TestMultiWindowDryRun:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",

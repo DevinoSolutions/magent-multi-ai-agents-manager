@@ -133,9 +133,7 @@ def window_rect(hwnd: object) -> WinRect:
 
 
 def child_env(home: Path) -> dict[str, str]:
-    env = {
-        k: v for k, v in os.environ.items() if not k.upper().startswith("MULTIDECK_")
-    }
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
     home_s = str(home)
     drive, tail = os.path.splitdrive(home_s)
     env["USERPROFILE"] = home_s

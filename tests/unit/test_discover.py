@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from multideck.discover import (
+from magent.discover import (
     _find_base_dir,
     _is_real_project,
     _uri_to_path,
@@ -184,9 +184,9 @@ class TestDiscoverProjects:
         ignores `home` and reads live OS storage -- keeps these codex/claude-
         focused tests deterministic. The real three-way merge (including the
         vscode source) is covered in test_discover_merge.py."""
-        import multideck.discover
+        import magent.discover
 
-        monkeypatch.setattr(multideck.discover, "_discover_vscode_projects", list)
+        monkeypatch.setattr(magent.discover, "_discover_vscode_projects", list)
 
     def test_returns_tuple(self, tmp_path):
         result = discover_projects(home=tmp_path)
@@ -248,7 +248,7 @@ class TestDiscoverProjects:
         proj_dir = tmp_path / "deep" / "nested" / "projects" / "myapp"
         proj_dir.mkdir(parents=True)
 
-        from multideck.sessions.claude import encode_claude_project_path
+        from magent.sessions.claude import encode_claude_project_path
 
         encoded = encode_claude_project_path(str(proj_dir))
         claude_dir = tmp_path / ".claude" / "projects" / encoded

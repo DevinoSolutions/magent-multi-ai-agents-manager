@@ -2,9 +2,9 @@ import sys
 
 import pytest
 
-from multideck.config import WindowConfig
-from multideck.titles import (
-    MD_TITLE_PREFIX,
+from magent.config import WindowConfig
+from magent.titles import (
+    MAGENT_TITLE_PREFIX,
     generate_titles,
     get_leaf_name,
     make_title,
@@ -83,11 +83,11 @@ class TestTitleGrammar:
     tiling) shares. A change to either side must fail loudly here."""
 
     def test_prefix_value(self):
-        assert MD_TITLE_PREFIX == "md:"
+        assert MAGENT_TITLE_PREFIX == "magent:"
 
     def test_plain_title_round_trips(self):
-        assert make_title("api") == "md:api"
-        assert parse_title("md:api") == ("api", None)
+        assert make_title("api") == "magent:api"
+        assert parse_title("magent:api") == ("api", None)
 
     @pytest.mark.parametrize(
         ("state", "glyph"),
@@ -95,12 +95,12 @@ class TestTitleGrammar:
     )
     def test_badged_title_round_trips(self, state, glyph):
         title = make_title("api", state)
-        assert title == f"md:[{glyph}] api"
+        assert title == f"magent:[{glyph}] api"
         assert parse_title(title) == ("api", state)
 
     def test_quiet_states_render_unbadged(self):
-        assert make_title("api", "working") == "md:api"
-        assert make_title("api", "idle") == "md:api"
+        assert make_title("api", "working") == "magent:api"
+        assert make_title("api", "idle") == "magent:api"
 
     def test_non_md_titles_parse_to_none(self):
         assert parse_title("Windows Terminal") is None
@@ -109,20 +109,33 @@ class TestTitleGrammar:
 
     def test_unknown_glyph_is_part_of_the_name(self):
         # A newer writer's badge must degrade readably, not vanish.
-        assert parse_title("md:[?] api") == ("[?] api", None)
+        assert parse_title("magent:[?] api") == ("[?] api", None)
 
     def test_hostile_shapes_do_not_crash(self):
-        assert parse_title("md:") == ("", None)
-        assert parse_title("md:[") == ("[", None)
-        assert parse_title("md:[!]") == ("[!]", None)
-        assert parse_title("md:[!] ") == ("", "needs-input")
+        assert parse_title("magent:") == ("", None)
+        assert parse_title("magent:[") == ("[", None)
+        assert parse_title("magent:[!]") == ("[!]", None)
+        assert parse_title("magent:[!] ") == ("", "needs-input")
+
+    def test_prefix_disabled_yields_bare_name(self):
+        # windowTitlePrefix=false: titles are the bare project name -- no
+        # magent: prefix, and no state badge even when a state is passed.
+        assert make_title("api", prefix=False) == "api"
+        assert make_title("api", "needs-input", prefix=False) == "api"
+        assert make_title("api", "error", prefix=False) == "api"
+
+    def test_prefix_disabled_bare_name_parses_to_none(self):
+        # The consumer contract that makes badging/hotkey/tiling degrade safely:
+        # a bare title carries no grammar, so parse_title returns None and every
+        # grammar-dependent consumer no-ops on it.
+        assert parse_title(make_title("api", prefix=False)) is None
 
     @pytest.mark.skipif(
         sys.platform != "win32",
         reason="hotkey is Windows-only (ImportError off-Windows)",
     )
     def test_hotkey_consumes_the_grammar(self):
-        from multideck.hotkey import project_from_title
+        from magent.hotkey import project_from_title
 
         assert project_from_title(make_title("my-project")) == "my-project"
         assert project_from_title(make_title("my-project", "error")) == "my-project"

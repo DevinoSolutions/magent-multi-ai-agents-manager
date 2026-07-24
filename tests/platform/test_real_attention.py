@@ -1,28 +1,28 @@
-"""REAL attention-badge evidence: the actual ``multideck attention`` daemon
+"""REAL attention-badge evidence: the actual ``magent attention`` daemon
 rewriting the title badges of REAL OS windows as agent-state records change.
 
 The unit suite drives ``AttentionEngine``/``BadgeRenderer`` against a recording
 ``FakePlatform`` — it proves the diff logic, never that a state change reaches a
 live window's title bar. This tier closes that gap with zero fakes: it launches
-a real deck (``python -m multideck --go``), writes agent-state records exactly
+a real deck (``python -m magent --go``), writes agent-state records exactly
 as an external writer would (the pinned ``{state, ts, cwd, session_id}`` schema,
 cwd canonicalized through the product's own ``agent_state.norm_cwd``), runs the
-real detached ``multideck attention -d`` daemon, and then reads each window's
+real detached ``magent attention -d`` daemon, and then reads each window's
 title back through the product's own ``snapshot_windows()`` + ``parse_title`` to
 watch the badge appear, advance, and clear.
 
 What the Windows leg proves with zero fakes (win32 only — see the platform note):
 
 * **badge appears.** A ``needs-input`` record for a project makes the daemon
-  rewrite that project's window title to ``md:[!] <name>`` — observed on the
+  rewrite that project's window title to ``magent:[!] <name>`` — observed on the
   live HWND via ``EnumWindows``/``GetWindowTextW`` (the same snapshot the
   renderer itself uses), parsed by the shipping ``parse_title``.
 * **badge advances (transition).** Overwriting the record with ``error`` flips
-  the live title to ``md:[x] <name>`` on a subsequent daemon tick.
+  the live title to ``magent:[x] <name>`` on a subsequent daemon tick.
 * **badge clears.** Returning the record to ``working`` (an unbadged state)
-  restores the clean ``md:<name>`` title.
+  restores the clean ``magent:<name>`` title.
 * **no cross-talk.** The deck's second window maps to no session; it stays a
-  clean ``md:<name>`` throughout every stage above.
+  clean ``magent:<name>`` throughout every stage above.
 * **heartbeat liveness.** While the daemon is alive its ``attention.heartbeat``
   artifact is present and fresh — the same signal ``status`` reads.
 
@@ -31,7 +31,7 @@ Windows-only in the shipping code — ``Platform.supports_attention_signals()``
 returns True only on ``WindowsPlatform`` and only it implements
 ``set_window_title``/``flash_window``. On Linux/macOS the daemon therefore has
 no window renderer to run; the POSIX leg proves that REAL guard end-to-end
-(``multideck attention -d`` refuses with "badges/flash aren't supported on this
+(``magent attention -d`` refuses with "badges/flash aren't supported on this
 OS" and exits non-zero) and emits a loud ``::warning`` that the live-window
 badge proof runs on Windows only. There is no honest Linux/xterm badge to
 assert because the product sets no titles there.
@@ -39,12 +39,12 @@ assert because the product sets no titles there.
 Deliberately uncovered (documented, never faked): the taskbar FLASH
 (``FlashWindowEx``) is not externally observable, so it is not asserted; the
 toast (winotify) and ntfy push channels would hit the OS notification UI / the
-network, so they are left OFF (no ``MULTIDECK_NTFY_TOPIC``) and unasserted.
+network, so they are left OFF (no ``MAGENT_NTFY_TOPIC``) and unasserted.
 
 Isolation & safety (hard rails): every child process — the ``--go`` launch and
 the ``attention`` daemon alike — gets a redirected HOME (so its
-``~/.multideck`` state store / pid / heartbeat / logs and its ``~/.claude``
-scans hit ONLY tmp, never the real user's), MULTIDECK_* stripped, and a
+``~/.magent`` state store / pid / heartbeat / logs and its ``~/.claude``
+scans hit ONLY tmp, never the real user's), MAGENT_* stripped, and a
 uuid-namespaced shim dir prepended to PATH holding a benign ``claude`` that
 records argv and exits (the real agent is NEVER invoked; asserted pre-flight).
 Every window title / project name / marker is uuid-namespaced. Cleanup kills the
@@ -67,9 +67,9 @@ from pathlib import Path
 
 import pytest
 
-from multideck import agent_state
-from multideck.procs import pid_alive
-from multideck.titles import parse_title
+from magent import agent_state
+from magent.procs import pid_alive
+from magent.titles import parse_title
 
 pytestmark = pytest.mark.platform
 
@@ -95,12 +95,10 @@ def _wait_until(check, timeout: float, interval: float = 0.5):
 
 
 def _child_env(home: Path, shim_dir: Path) -> dict[str, str]:
-    """Real user env, but MULTIDECK_* stripped, HOME redirected under tmp_path
-    (so the child's ~/.multideck state/pid/heartbeat/logs and ~/.claude scans
+    """Real user env, but MAGENT_* stripped, HOME redirected under tmp_path
+    (so the child's ~/.magent state/pid/heartbeat/logs and ~/.claude scans
     hit ONLY tmp), and the benign shim dir prepended to PATH."""
-    env = {
-        k: v for k, v in os.environ.items() if not k.upper().startswith("MULTIDECK_")
-    }
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
     env["PATH"] = str(shim_dir) + os.pathsep + env.get("PATH", "")
     home_s = str(home)
     env["HOME"] = home_s
@@ -151,7 +149,7 @@ def _assert_shim_wins(env: dict[str, str], tool: str, shim_dir: Path) -> None:
 def _write_config(cfg_dir: Path, project: Path, name_a: str, name_b: str) -> Path:
     """A 2-window deck for one project. badge/flash are left at their config
     defaults (both on); ``--interval`` drives the daemon's poll cadence."""
-    cfg = cfg_dir / "multideck.config.json"
+    cfg = cfg_dir / "magent.config.json"
     cfg.write_text(
         json.dumps(
             {
@@ -188,7 +186,7 @@ def _write_state_record(home: Path, cwd: str, state: str, session_id: str) -> No
     the store's own sha1 keying so re-writing the same cwd overwrites one record
     (the daemon globs ``*.json`` and maps by the record's ``cwd`` field, so the
     exact name is cosmetic — but a stable name keeps it to one session)."""
-    state_dir = home / ".multideck" / "state"
+    state_dir = home / ".magent" / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
     norm = agent_state.norm_cwd(cwd)
     # Mirrors agent_state._key (sha1 of the normalized cwd, first 16 hex) so a
@@ -206,7 +204,7 @@ def _write_state_record(home: Path, cwd: str, state: str, session_id: str) -> No
 def _read_pid(home: Path) -> int | None:
     """The pid the attention daemon recorded (whether or not it is still alive)."""
     try:
-        return int((home / ".multideck" / "attention.pid").read_text().strip())
+        return int((home / ".magent" / "attention.pid").read_text().strip())
     except (OSError, ValueError):
         return None
 
@@ -219,7 +217,7 @@ def _live_daemon_pid(home: Path) -> int | None:
 def _heartbeat_fresh(home: Path, max_age: float = 30.0) -> bool:
     """True if the daemon's heartbeat artifact exists and is fresh — the exact
     liveness signal ``status`` reads (log.heartbeat_fresh, HEARTBEAT_MAX_AGE)."""
-    hb = home / ".multideck" / "attention.heartbeat"
+    hb = home / ".magent" / "attention.heartbeat"
     try:
         age = time.time() - hb.stat().st_mtime
     except OSError:
@@ -241,9 +239,9 @@ _skip_no_wt = pytest.mark.skipif(
 
 
 def _states_by_name(plat, names: set[str]) -> dict[str, str | None]:
-    """{parsed name: badge-state} for every md: window currently visible whose
+    """{parsed name: badge-state} for every magent: window currently visible whose
     name is one of ``names``. Absence of a name = that window is not in this
-    snapshot; a value of None = present but unbadged (clean md:<name>)."""
+    snapshot; a value of None = present but unbadged (clean magent:<name>)."""
     out: dict[str, str | None] = {}
     for title in plat.snapshot_windows():
         parsed = parse_title(title)
@@ -276,8 +274,8 @@ def _await_state(plat, names: set[str], target: str, want: str | None, timeout: 
 
 
 def _win_launch_ready():
-    from multideck.grid import compute_grid
-    from multideck.platform import get_platform
+    from magent.grid import compute_grid
+    from magent.platform import get_platform
 
     plat = get_platform()
     plat.set_dpi_aware()
@@ -289,7 +287,7 @@ def _win_launch_ready():
 
 
 def _run_go(cfg: Path, env: dict[str, str], tmp_path: Path, timeout: float = 120):
-    """Run ``multideck --go`` to completion, output to FILES not a pipe (a
+    """Run ``magent --go`` to completion, output to FILES not a pipe (a
     launched terminal inherits stdout and would keep a captured pipe open)."""
     out_path = tmp_path / "go.stdout"
     err_path = tmp_path / "go.stderr"
@@ -298,7 +296,7 @@ def _run_go(cfg: Path, env: dict[str, str], tmp_path: Path, timeout: float = 120
         err_path.open("w", encoding="utf-8") as fe,
     ):
         proc = subprocess.run(
-            [sys.executable, "-m", "multideck", "--go", "--config", str(cfg)],
+            [sys.executable, "-m", "magent", "--go", "--config", str(cfg)],
             stdout=fo,
             stderr=fe,
             timeout=timeout,
@@ -312,7 +310,7 @@ def _run_go(cfg: Path, env: dict[str, str], tmp_path: Path, timeout: float = 120
 
 
 def _start_attention_daemon(cfg: Path, env: dict[str, str], tmp_path: Path):
-    """Launch ``multideck attention -d --interval 1``. The ``-d`` parent spawns
+    """Launch ``magent attention -d --interval 1``. The ``-d`` parent spawns
     a detached child (which inherits this redirected env) and returns; its rc is
     tolerated (a slow CI child can miss the parent's ~2s pid wait), so the caller
     polls the pid file. Output to FILES: the detached child inherits std handles,
@@ -327,7 +325,7 @@ def _start_attention_daemon(cfg: Path, env: dict[str, str], tmp_path: Path):
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--config",
                 str(cfg),
                 "attention",
@@ -353,7 +351,7 @@ def win_cleanup():
     started (by its recorded pid) and close exactly the uuid-named windows it
     created, then verify nothing is left. A failed cleanup is a loud teardown
     error, never a leaked daemon/window on the CI desktop."""
-    from multideck.platform import get_platform
+    from magent.platform import get_platform
 
     reg: dict[str, object] = {"home": None, "names": set()}
     yield reg
@@ -413,7 +411,7 @@ def test_attention_badges_transition_on_live_windows_win(tmp_path, win_cleanup):
     win_cleanup["home"] = home
     win_cleanup["names"] = {name_a, name_b}
 
-    # 1) Real deck: two live wt windows with clean md: titles, no daemon yet.
+    # 1) Real deck: two live wt windows with clean magent: titles, no daemon yet.
     rc, out, err = _run_go(cfg, env, tmp_path)
     assert rc == 0, f"--go failed\nstdout:\n{out}\nstderr:\n{err}"
     both = _wait_until(
@@ -457,7 +455,7 @@ def test_attention_badges_transition_on_live_windows_win(tmp_path, win_cleanup):
     )
     assert name_b in s2 and s2[name_b] is None, f"window B must stay unbadged: {s2}"
 
-    # 4) Return to an unbadged state (working) -> the badge clears to clean md:.
+    # 4) Return to an unbadged state (working) -> the badge clears to clean magent:.
     _write_state_record(home, str(project), agent_state.WORKING, sid)
     s3 = _await_state(plat, {name_a, name_b}, name_a, None, 60)
     assert s3, (
@@ -479,7 +477,7 @@ def test_attention_badges_transition_on_live_windows_win(tmp_path, win_cleanup):
 def test_attention_daemon_reports_badges_unsupported_posix(tmp_path, capsys):
     """On Linux/macOS ``Platform.supports_attention_signals()`` is False and no
     backend implements ``set_window_title``/``flash_window``, so the badge/flash
-    renderers cannot run. This drives the REAL ``multideck attention -d`` and
+    renderers cannot run. This drives the REAL ``magent attention -d`` and
     asserts its shipped guard: it warns that badges/flash are unsupported here
     and exits non-zero (with toast/ntfy off there is nothing left to do). A loud
     ``::warning`` records that the live-window badge proof is Windows-only."""
@@ -495,7 +493,7 @@ def test_attention_daemon_reports_badges_unsupported_posix(tmp_path, capsys):
     # No detached child is spawned on this path (the renderer set is empty, so
     # the -d parent exits before spawn_detached), so a captured pipe is safe.
     proc = subprocess.run(
-        [sys.executable, "-m", "multideck", "--config", str(cfg), "attention", "-d"],
+        [sys.executable, "-m", "magent", "--config", str(cfg), "attention", "-d"],
         env=env,
         capture_output=True,
         text=True,

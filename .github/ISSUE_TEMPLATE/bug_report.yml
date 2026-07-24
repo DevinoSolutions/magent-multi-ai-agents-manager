@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a problem with multideck
+description: Report a problem with magent
 title: "[Bug]: "
 labels: [bug]
 body:
@@ -11,9 +11,9 @@ body:
   - type: input
     id: version
     attributes:
-      label: multideck version
-      description: Output of `multideck --version`.
-      placeholder: "multideck, version 1.0.0"
+      label: magent version
+      description: Output of `magent --version`.
+      placeholder: "magent, version 1.0.0"
     validations:
       required: true
   - type: input
@@ -27,7 +27,7 @@ body:
     id: terminal
     attributes:
       label: Terminal
-      description: Which terminal emulator you launched multideck from.
+      description: Which terminal emulator you launched magent from.
       placeholder: "Windows Terminal / kitty / iTerm2 / gnome-terminal"
     validations:
       required: true
@@ -44,7 +44,7 @@ body:
       label: Steps to reproduce
       description: The exact commands and config that trigger the problem.
       placeholder: |
-        1. Run `multideck ...`
+        1. Run `magent ...`
         2. ...
         3. See error
     validations:
@@ -52,9 +52,9 @@ body:
   - type: textarea
     id: doctor
     attributes:
-      label: multideck doctor output
+      label: magent doctor output
       description: >
-        Paste the output of `multideck doctor --json`. The `--json` form also
+        Paste the output of `magent doctor --json`. The `--json` form also
         captures your exact monitor topology (resolutions, positions, DPI) under
         the `monitors` key, which lets us replay a tiling bug on your setup.
         Rendered as code — no backticks needed.
@@ -66,7 +66,7 @@ body:
     attributes:
       label: Relevant log excerpt
       description: |
-        Logs live at `~/.multideck/logs/<name>.log` (e.g. `launch.log`,
+        Logs live at `~/.magent/logs/<name>.log` (e.g. `launch.log`,
         `upload.log`, `attention.log`, `hotkey.log`, `platform.log`). Paste any
         relevant lines.
       render: text

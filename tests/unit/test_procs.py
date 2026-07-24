@@ -10,7 +10,7 @@ import os
 import subprocess
 import sys
 
-from multideck.procs import pid_alive
+from magent.procs import pid_alive
 
 
 class TestPidAlive:

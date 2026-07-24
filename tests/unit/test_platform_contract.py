@@ -2,9 +2,9 @@ import sys
 
 import pytest
 
-from multideck.platform import Platform
-from multideck.platform.linux import LinuxPlatform
-from multideck.platform.macos import MacOSPlatform
+from magent.platform import Platform
+from magent.platform.linux import LinuxPlatform
+from magent.platform.macos import MacOSPlatform
 
 
 class _Bare(Platform):
@@ -81,12 +81,12 @@ def test_default_launch_psmux_session_raises(platform_cls):
 )
 class TestWindowsCapabilities:
     def test_supports_psmux_true(self):
-        from multideck.platform.windows import WindowsPlatform
+        from magent.platform.windows import WindowsPlatform
 
         assert WindowsPlatform().supports_psmux() is True
 
     def test_supports_hotkey_true(self):
-        from multideck.platform.windows import WindowsPlatform
+        from magent.platform.windows import WindowsPlatform
 
         assert WindowsPlatform().supports_hotkey() is True
 
@@ -101,17 +101,17 @@ class TestWindowsLaunchTerminal:
     install hint, preserving the original error as its cause."""
 
     def test_missing_wt_raises_actionable_terminal_not_found(self, monkeypatch):
-        from multideck.platform import TerminalLaunchOpts, TerminalNotFoundError
-        from multideck.platform.windows import WindowsPlatform
+        from magent.platform import TerminalLaunchOpts, TerminalNotFoundError
+        from magent.platform.windows import WindowsPlatform
 
         def _no_wt(*_args, **_kwargs):
             raise FileNotFoundError(2, "The system cannot find the file specified")
 
-        monkeypatch.setattr("multideck.platform.windows.subprocess.Popen", _no_wt)
+        monkeypatch.setattr("magent.platform.windows.subprocess.Popen", _no_wt)
 
         with pytest.raises(TerminalNotFoundError) as excinfo:
             WindowsPlatform().launch_terminal(
-                TerminalLaunchOpts(title="md:proj", cwd=".", command="claude")
+                TerminalLaunchOpts(title="magent:proj", cwd=".", command="claude")
             )
 
         assert "winget install Microsoft.WindowsTerminal" in str(excinfo.value)
@@ -133,7 +133,7 @@ def test_find_window_unknown_mode_raises(platform_cls):
     sys.platform != "win32", reason="WindowsPlatform binds windll at import"
 )
 def test_find_window_unknown_mode_raises_windows():
-    from multideck.platform.windows import WindowsPlatform
+    from magent.platform.windows import WindowsPlatform
 
     with pytest.raises(ValueError):
         WindowsPlatform().find_window("t", mode="bogus")  # type: ignore[arg-type]  # reason: invalid mode passed on purpose to prove it raises

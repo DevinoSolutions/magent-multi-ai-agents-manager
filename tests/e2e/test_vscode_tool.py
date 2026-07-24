@@ -10,7 +10,7 @@ pytestmark = pytest.mark.e2e
 class TestVSCodeToolAlias:
     def test_vscode_tool_accepted(self, tmp_path):
         (tmp_path / "myapp").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -23,7 +23,7 @@ class TestVSCodeToolAlias:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -37,7 +37,7 @@ class TestVSCodeToolAlias:
 
     def test_code_tool_still_works(self, tmp_path):
         (tmp_path / "myapp").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -50,7 +50,7 @@ class TestVSCodeToolAlias:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -64,7 +64,7 @@ class TestVSCodeToolAlias:
 
     def test_vscode_ignores_windows_config(self, tmp_path):
         (tmp_path / "myapp").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -77,7 +77,7 @@ class TestVSCodeToolAlias:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -91,7 +91,7 @@ class TestVSCodeToolAlias:
 
     def test_cursor_tool_accepted(self, tmp_path):
         (tmp_path / "myapp").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -104,7 +104,7 @@ class TestVSCodeToolAlias:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -118,7 +118,7 @@ class TestVSCodeToolAlias:
 
     def test_cursor_ignores_windows_config(self, tmp_path):
         (tmp_path / "myapp").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -131,7 +131,7 @@ class TestVSCodeToolAlias:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -145,7 +145,7 @@ class TestVSCodeToolAlias:
 
     def test_cursor_agent_tool_accepted(self, tmp_path):
         (tmp_path / "myapp").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -158,7 +158,7 @@ class TestVSCodeToolAlias:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -172,7 +172,7 @@ class TestVSCodeToolAlias:
 
     def test_agy_tool_accepted(self, tmp_path):
         (tmp_path / "myapp").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -185,7 +185,7 @@ class TestVSCodeToolAlias:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -199,7 +199,7 @@ class TestVSCodeToolAlias:
 
     def test_unknown_tool_warns(self, tmp_path):
         (tmp_path / "myapp").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -212,7 +212,7 @@ class TestVSCodeToolAlias:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",

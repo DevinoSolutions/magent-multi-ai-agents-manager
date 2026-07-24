@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from multideck.grid import MonitorRect, compute_grid
+from magent.grid import MonitorRect, compute_grid
 from tests.platform.doctor_replay import (
     DoctorReportError,
     parse_doctor_report,

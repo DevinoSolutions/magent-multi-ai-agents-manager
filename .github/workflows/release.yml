@@ -88,8 +88,8 @@ jobs:
           wheel=$(ls dist/*.whl)
           echo "Installing $wheel into a pristine venv"
           "$BIN/python" -m pip install "$wheel"
-          "$BIN/multideck$EXE" --version
-          "$BIN/multideck$EXE" --help
+          "$BIN/magent$EXE" --version
+          "$BIN/magent$EXE" --help
 
   sdist-smoke:
     name: "Sdist smoke (ubuntu-latest)"
@@ -118,8 +118,8 @@ jobs:
           sdist=$(ls dist/*.tar.gz)
           echo "Installing $sdist into a pristine venv"
           "$BIN/python" -m pip install "$sdist"
-          "$BIN/multideck" --version
-          "$BIN/multideck" --help
+          "$BIN/magent" --version
+          "$BIN/magent" --help
 
   publish:
     name: "Publish to PyPI (Trusted Publishing)"
@@ -134,7 +134,7 @@ jobs:
       # Add required reviewers to this environment in GitHub settings to hold
       # every publish for manual approval (see RELEASING.md).
       name: pypi
-      url: https://pypi.org/p/multideck
+      url: https://pypi.org/p/magent-multi-ai-agents-manager
     permissions:
       id-token: write  # OIDC token for PyPI Trusted Publishing — no API token or secret in the repo
     steps:

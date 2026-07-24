@@ -1,4 +1,4 @@
-"""REAL terminal-fallback tier: prove multideck's terminal-emulator SELECTION
+"""REAL terminal-fallback tier: prove magent's terminal-emulator SELECTION
 chain actually launches real windows for emulators beyond the defaults already
 exercised by the #45/#47 tiers, with zero fakes, zero dry-run, zero
 monkeypatching.
@@ -20,7 +20,7 @@ cleanly when DISPLAY is absent):
   detection, ``wmctrl``+``xdotool`` for the tiling snapshot/move, ``sh`` which
   every emulator execs, ``sleep`` which keeps the window alive, and the benign
   ``mdtool`` shim). kitty/alacritty/gnome-terminal/konsole are all made
-  UNdiscoverable on that PATH (asserted), so real ``multideck --go`` must fall
+  UNdiscoverable on that PATH (asserted), so real ``magent --go`` must fall
   the whole ``shutil.which`` chain THROUGH to its tail — and it does: the window
   exists (xdotool), its title parses via ``titles.parse_title`` to the uuid
   project name, the owning process (title → pid → ``/proc/<pid>/comm``) IS
@@ -58,7 +58,7 @@ preflight probe still guards the render (a runner that cannot open xterm at all
 yields a loud GitHub ``::warning`` + skip, never a silent green).
 
 Windows leg (rides the existing windows platform-integration job): the honest
-finding is that there is NO non-wt fallback — multideck fails fast with
+finding is that there is NO non-wt fallback — magent fails fast with
 actionable guidance rather than launching a degraded console window (TF-W-001).
 ``platform/windows.py::launch_terminal`` is wt-only; its
 ``subprocess.Popen(["wt", ...])`` catches the missing-wt ``FileNotFoundError``
@@ -66,8 +66,8 @@ and re-raises a typed ``TerminalNotFoundError`` carrying an install hint
 (``winget install Microsoft.WindowsTerminal``), which the launch shell prints as
 one clean stderr line — NO raw traceback. ``cli/doctor.py`` carries the same
 install hint in its terminal check. With wt removed from the child PATH, real
-``multideck --go`` reaches the launch phase (the grid banner prints), then aborts
-non-zero with that hint; no ``md:`` window is ever created and the tool shim
+``magent --go`` reaches the launch phase (the grid banner prints), then aborts
+non-zero with that hint; no ``magent:`` window is ever created and the tool shim
 never runs. ``test_go_no_wt_creates_no_window_win`` PINS this contract so a
 future console fallback (a candidate DESIGN.md ledger item — see the PR body)
 would break the pin and force a conscious update, rather than shipping
@@ -75,8 +75,8 @@ unnoticed.
 
 Isolation & safety (hard rails): every child gets a fully redirected HOME
 (``HOME``/``XDG_*`` on POSIX; ``HOME``/``USERPROFILE``/``HOMEDRIVE``/
-``HOMEPATH`` on win32) so its ``~/.multideck`` and agent-session scans never
-touch the real user's; every ``MULTIDECK_*`` var is stripped; all titles,
+``HOMEPATH`` on win32) so its ``~/.magent`` and agent-session scans never
+touch the real user's; every ``MAGENT_*`` var is stripped; all titles,
 configs and markers are uuid-namespaced; the configured tool is a benign shim
 that records-and-sleeps — NEVER a real ``claude``/``codex``. Output is captured
 via FILE redirect, never a pipe (a launched terminal inherits and holds the
@@ -100,9 +100,9 @@ from pathlib import Path
 
 import pytest
 
-from multideck.grid import compute_grid
-from multideck.platform import get_platform
-from multideck.titles import make_title, parse_title
+from magent.grid import compute_grid
+from magent.platform import get_platform
+from magent.titles import make_title, parse_title
 
 pytestmark = pytest.mark.platform
 
@@ -123,8 +123,8 @@ _MATRIX = ("xterm",)
 
 # The exact argv each matrix emulator is launched with, mirrored from
 # platform/linux.py::launch_terminal. Used ONLY by the preflight capability
-# probe; the real assertions always go through multideck's own launch_terminal
-# via `multideck --go`.
+# probe; the real assertions always go through magent's own launch_terminal
+# via `magent --go`.
 _EMULATOR_ARGV = {
     "xterm": lambda title, cwd, cmd: [
         "xterm",
@@ -135,7 +135,7 @@ _EMULATOR_ARGV = {
     ],
 }
 
-# The honest minimal set of binaries multideck shells out to on the Linux
+# The honest minimal set of binaries magent shells out to on the Linux
 # launch+tile path, derived from source: xrandr (list_monitors — without it
 # --go aborts before launching), wmctrl+xdotool (snapshot_windows/move_window
 # tiling), sh (execed by every emulator), sleep (keeps the shim window alive).
@@ -172,7 +172,7 @@ def _emit_ci_warning(capsys, title: str, message: str) -> None:
 
 
 def _run_go(cfg: Path, env: dict[str, str], tmp_path: Path, timeout: float = 90):
-    """Run ``multideck --go`` to completion, capturing output via FILES not a
+    """Run ``magent --go`` to completion, capturing output via FILES not a
     pipe: a launched terminal inherits the child's stdout and holds it for the
     life of its command, so a captured PIPE keeps run() blocked on EOF. Returns
     ``(returncode, stdout, stderr)``."""
@@ -183,7 +183,7 @@ def _run_go(cfg: Path, env: dict[str, str], tmp_path: Path, timeout: float = 90)
         err_path.open("w", encoding="utf-8") as fe,
     ):
         proc = subprocess.run(
-            [sys.executable, "-m", "multideck", "--go", "--config", str(cfg)],
+            [sys.executable, "-m", "magent", "--go", "--config", str(cfg)],
             stdout=fo,
             stderr=fe,
             timeout=timeout,
@@ -203,7 +203,7 @@ def _write_single_window_config(
     """A v3, single-window, 2x1-layout config driving a benign shim ``mdtool``.
     2x1 (not 1x1) so the lone window is tiled into the LEFT cell — real proof it
     was moved, not merely left full-screen."""
-    cfg = tmp_path / "multideck.config.json"
+    cfg = tmp_path / "magent.config.json"
     cfg.write_text(
         json.dumps(
             {
@@ -331,13 +331,11 @@ def _owner_is(pid: str | None, emulator: str) -> bool:
 
 
 def _linux_child_env(home: Path, restricted_bin: Path) -> dict[str, str]:
-    """Real env minus every MULTIDECK_* var, HOME + XDG redirected into the
+    """Real env minus every MAGENT_* var, HOME + XDG redirected into the
     sandbox, PATH restricted to ONLY ``restricted_bin`` (so no stray emulator
     leaks in), and software-GL forced so kitty/alacritty can open a context
     under headless Xvfb. DISPLAY is inherited from os.environ."""
-    env = {
-        k: v for k, v in os.environ.items() if not k.upper().startswith("MULTIDECK_")
-    }
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
     env["PATH"] = str(restricted_bin)
     env["HOME"] = str(home)
     env["XDG_CONFIG_HOME"] = str(home / ".config")
@@ -377,7 +375,7 @@ def _emulator_renders(emulator: str, cwd: str, env: dict[str, str]) -> bool:
     """Preflight: can ``emulator`` open a real window under this X server with
     this (software-GL) env? Launches it exactly as launch_terminal would, polls
     for its window, then kills it. Distinguishes a headless-GL-incapable runner
-    (→ loud skip) from a genuine multideck bug (→ hard fail)."""
+    (→ loud skip) from a genuine magent bug (→ hard fail)."""
     probe_title = f"mdprobe-{uuid.uuid4().hex[:10]}"
     argv = _EMULATOR_ARGV[emulator](probe_title, cwd, "sleep 30")
     proc = subprocess.Popen(
@@ -479,7 +477,7 @@ def _launch_and_assert_owner(
     slots=None,
 ) -> None:
     """Shared driver: expose ``on_path`` emulators on a restricted PATH, launch
-    real ``multideck --go``, and assert the launched md: window is owned by
+    real ``magent --go``, and assert the launched magent: window is owned by
     ``winner`` (and by none of ``losers``). Optionally assert tiling geometry."""
     unique = uuid.uuid4().hex[:10]
     name = f"mdtf{unique}"
@@ -552,8 +550,8 @@ def _launch_and_assert_owner(
             f"(order {_CHAIN_ORDER})"
         )
 
-    # 3. multideck's real invocation carried our title (proves this pid is the
-    #    one multideck launched, not an unrelated process).
+    # 3. magent's real invocation carried our title (proves this pid is the
+    #    one magent launched, not an unrelated process).
     assert title in _proc_cmdline(pid), (
         f"owning process cmdline missing {title!r}: {_proc_cmdline(pid)!r}"
     )
@@ -594,7 +592,7 @@ def test_go_renders_and_selects_emulator_linux(
 ):
     """Chain-tail render + selection: with ONLY ``emulator`` (xterm) discoverable
     on the launch PATH — every higher-priority chain entry asserted absent — real
-    ``multideck --go`` falls the ``shutil.which`` chain through to it and opens a
+    ``magent --go`` falls the ``shutil.which`` chain through to it and opens a
     real window owned by it, correctly titled (parsed by ``titles.parse_title``),
     with the shim command running inside, tiled into its ``compute_grid`` cell."""
     monitors, slots = _linux_ready()
@@ -628,7 +626,7 @@ def _enum_titles() -> list[str]:
 def _no_wt_path() -> str:
     """A PATH with wt made unresolvable: drop the WindowsApps execution-alias
     dir and any dir where wt still resolves, keeping every system dir (System32
-    etc.) so multideck itself runs normally."""
+    etc.) so magent itself runs normally."""
     kept = [
         d
         for d in os.environ.get("PATH", "").split(os.pathsep)
@@ -643,9 +641,7 @@ def _no_wt_path() -> str:
 
 
 def _win_child_env(home: Path, shim_dir: Path, base_path: str) -> dict[str, str]:
-    env = {
-        k: v for k, v in os.environ.items() if not k.upper().startswith("MULTIDECK_")
-    }
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
     env["PATH"] = str(shim_dir) + os.pathsep + base_path
     home_s = str(home)
     env["HOME"] = home_s
@@ -657,25 +653,25 @@ def _win_child_env(home: Path, shim_dir: Path, base_path: str) -> dict[str, str]
 
 
 def _close_md_windows(name: str) -> None:
-    """Belt-and-braces: WM_CLOSE any md:<name> window. None is expected (the
+    """Belt-and-braces: WM_CLOSE any magent:<name> window. None is expected (the
     no-wt path creates none), but if a future fallback ever does, never leak
     it."""
     snap = get_platform().snapshot_windows()
     for title, hwnd in snap.items():
-        if isinstance(title, str) and f"md:{name}" in title:
+        if isinstance(title, str) and f"magent:{name}" in title:
             ctypes.windll.user32.PostMessageW(hwnd, _WM_CLOSE, 0, 0)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows no-wt leg is win32-only")
 def test_go_no_wt_creates_no_window_win(tmp_path, capsys):
     """PIN the wt hard-dependency + its clean-failure contract (TF-W-001): with
-    wt removed from the child PATH, real ``multideck --go`` reaches the launch
+    wt removed from the child PATH, real ``magent --go`` reaches the launch
     phase then aborts with a CLEAN, ACTIONABLE error — non-zero exit, the
     ``winget install Microsoft.WindowsTerminal`` install hint on stderr/stdout,
-    and NO raw traceback — creating NO md: window and never running the tool
-    shim. There is still no console fallback (multideck fails fast with guidance,
+    and NO raw traceback — creating NO magent: window and never running the tool
+    shim. There is still no console fallback (magent fails fast with guidance,
     by design); this pins that reality until one is deliberately added."""
-    from multideck.platform import get_platform as _gp
+    from magent.platform import get_platform as _gp
 
     monitors = _gp().list_monitors()
     if not monitors:
@@ -711,8 +707,8 @@ def test_go_no_wt_creates_no_window_win(tmp_path, capsys):
     cfg = _write_single_window_config(tmp_path, name, project, "claude --continue")
 
     try:
-        before = [t for t in _enum_titles() if f"md:{name}" in t]
-        assert not before, f"a stale md:{name} window already exists: {before}"
+        before = [t for t in _enum_titles() if f"magent:{name}" in t]
+        assert not before, f"a stale magent:{name} window already exists: {before}"
 
         rc, out, err = _run_go(cfg, env, tmp_path)
 
@@ -728,9 +724,9 @@ def test_go_no_wt_creates_no_window_win(tmp_path, capsys):
             f"a raw traceback leaked to stderr instead of a clean error; stderr:\n{err}"
         )
 
-        # 2. No md: window was ever created (poll a beat to be sure none appears).
+        # 2. No magent: window was ever created (poll a beat to be sure none appears).
         appeared = _wait_until(
-            lambda: [t for t in _enum_titles() if f"md:{name}" in t], timeout=10
+            lambda: [t for t in _enum_titles() if f"magent:{name}" in t], timeout=10
         )
         assert not appeared, (
             f"no console fallback expected, but a window appeared: {appeared}"

@@ -11,22 +11,22 @@ pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows-only")
 
 class TestProjectFromTitle:
     def test_extracts_name(self):
-        from multideck.hotkey import project_from_title
+        from magent.hotkey import project_from_title
 
-        assert project_from_title("md:marka") == "marka"
-        assert project_from_title("md:upup") == "upup"
+        assert project_from_title("magent:marka") == "marka"
+        assert project_from_title("magent:upup") == "upup"
 
     def test_extracts_name_through_state_badge(self):
-        # The attention daemon rewrites titles as "md:[!] name" etc.; upload
+        # The attention daemon rewrites titles as "magent:[!] name" etc.; upload
         # routing must keep working while a window is badged.
-        from multideck.hotkey import project_from_title
+        from magent.hotkey import project_from_title
 
-        assert project_from_title("md:[!] marka") == "marka"
-        assert project_from_title("md:[x] upup") == "upup"
-        assert project_from_title("md:[+] api") == "api"
+        assert project_from_title("magent:[!] marka") == "marka"
+        assert project_from_title("magent:[x] upup") == "upup"
+        assert project_from_title("magent:[+] api") == "api"
 
     def test_returns_none_for_non_md(self):
-        from multideck.hotkey import project_from_title
+        from magent.hotkey import project_from_title
 
         assert project_from_title("Windows Terminal") is None
         assert project_from_title("claude") is None
@@ -34,9 +34,9 @@ class TestProjectFromTitle:
 
     def test_agrees_with_the_titles_grammar(self):
         # hotkey consumes what titles.make_title produces — the round-trip
-        # contract that replaced the old shared-MD_TITLE_PREFIX pin.
-        from multideck.hotkey import project_from_title
-        from multideck.titles import make_title
+        # contract that replaced the old shared-MAGENT_TITLE_PREFIX pin.
+        from magent.hotkey import project_from_title
+        from magent.titles import make_title
 
         for state in (None, "needs-input", "error", "done"):
             assert project_from_title(make_title("proj", state)) == "proj"
@@ -47,7 +47,7 @@ class TestAltKeyDetection:
         # A low-level keyboard hook reports the physical Alt as VK_LMENU/VK_RMENU,
         # never the generic VK_MENU. All three must be treated as Alt or Alt+V
         # is never detected (the keystroke falls through to the focused app).
-        from multideck.hotkey import _ALT_KEYS, VK_LMENU, VK_MENU, VK_RMENU
+        from magent.hotkey import _ALT_KEYS, VK_LMENU, VK_MENU, VK_RMENU
 
         assert VK_LMENU == 0xA4
         assert VK_RMENU == 0xA5
@@ -90,7 +90,7 @@ class TestUploadImage:
         self.server.shutdown()
 
     def test_uploads_image(self):
-        from multideck.hotkey import upload_image
+        from magent.hotkey import upload_image
 
         url = f"http://127.0.0.1:{self.port}"
         result = upload_image(url, "marka", b"FAKEBMP")
@@ -111,7 +111,7 @@ class TestUploadImage:
         assert f"\r\n--{boundary}--\r\n".encode() in body
 
     def test_returns_false_on_network_error(self):
-        from multideck.hotkey import upload_image
+        from magent.hotkey import upload_image
 
         result = upload_image("http://127.0.0.1:1", "marka", b"data")
         assert result is False
@@ -120,9 +120,9 @@ class TestUploadImage:
         # P2-07: a failed paste must record WHY (connection refused vs. timeout
         # vs. malformed response), not just a bare False the caller can't
         # explain -- the cause (exception class + message) lands in hotkey.log.
-        from multideck.hotkey import upload_image
+        from magent.hotkey import upload_image
 
-        with caplog.at_level("WARNING", logger="multideck.hotkey"):
+        with caplog.at_level("WARNING", logger="magent.hotkey"):
             result = upload_image("http://127.0.0.1:1", "marka", b"data")
 
         assert result is False
@@ -157,7 +157,7 @@ class TestDibToBmp:
         # masks sit between the 40-byte header and the pixels.
         import struct
 
-        from multideck.hotkey import _dib_to_bmp
+        from magent.hotkey import _dib_to_bmp
 
         header = self._header(2, 2, 32, 3)
         masks = struct.pack("<III", 0x00FF0000, 0x0000FF00, 0x000000FF)
@@ -174,7 +174,7 @@ class TestDibToBmp:
     def test_rgb32_forces_alpha_opaque(self):
         import struct
 
-        from multideck.hotkey import _dib_to_bmp
+        from magent.hotkey import _dib_to_bmp
 
         header = self._header(2, 2, 32, 0)  # BI_RGB, no masks
         pixels = bytes([10, 20, 30, 0] * 4)  # alpha = 0 (transparent -> black)
@@ -188,7 +188,7 @@ class TestDibToBmp:
     def test_rgb24_untouched(self):
         import struct
 
-        from multideck.hotkey import _dib_to_bmp
+        from magent.hotkey import _dib_to_bmp
 
         header = self._header(2, 2, 24, 0)
         pixels = bytes([1, 2, 3] * 4)
@@ -198,7 +198,7 @@ class TestDibToBmp:
         assert bmp[14 + 40 :] == pixels  # 24bpp pixels passed through verbatim
 
     def test_too_small_returns_none(self):
-        from multideck.hotkey import _dib_to_bmp
+        from magent.hotkey import _dib_to_bmp
 
         assert _dib_to_bmp(bytearray(b"\x00" * 10)) is None
 
@@ -206,7 +206,7 @@ class TestDibToBmp:
         # F-D4-005: a header_size claiming ~4GB drives px_start past 2**32,
         # so the offset.to_bytes(4, "little") below crashes with
         # OverflowError on a clipboard payload we don't control.
-        from multideck.hotkey import _dib_to_bmp
+        from magent.hotkey import _dib_to_bmp
 
         header = bytearray(self._header(2, 2, 32, 0))
         header[0:4] = b"\xff\xff\xff\xff"  # biSize
@@ -216,7 +216,7 @@ class TestDibToBmp:
     def test_huge_clr_used_returns_none(self):
         # Same OverflowError, reached via clrUsed instead of biSize: bpp<=8
         # multiplies clr_used straight into the offset with no bound.
-        from multideck.hotkey import _dib_to_bmp
+        from magent.hotkey import _dib_to_bmp
 
         header = bytearray(self._header(2, 2, 8, 0))
         header[32:36] = b"\xff\xff\xff\xff"  # clrUsed
@@ -228,13 +228,13 @@ class TestListenerLifecycle:
     """Pid-file management for the background Alt+V listener."""
 
     def test_pid_none_when_no_file(self, tmp_path, monkeypatch):
-        from multideck import hotkey
+        from magent import hotkey
 
         monkeypatch.setattr(hotkey, "_PID_PATH", tmp_path / "hotkey.pid")
         assert hotkey.listener_pid() is None
 
     def test_pid_returns_live_pid(self, tmp_path, monkeypatch):
-        from multideck import hotkey
+        from magent import hotkey
 
         p = tmp_path / "hotkey.pid"
         p.write_text("4321")
@@ -243,7 +243,7 @@ class TestListenerLifecycle:
         assert hotkey.listener_pid() == 4321
 
     def test_pid_clears_stale_file(self, tmp_path, monkeypatch):
-        from multideck import hotkey
+        from magent import hotkey
 
         p = tmp_path / "hotkey.pid"
         p.write_text("999999")
@@ -255,7 +255,7 @@ class TestListenerLifecycle:
     def test_stop_kills_and_removes(self, tmp_path, monkeypatch):
         import subprocess
 
-        from multideck import hotkey
+        from magent import hotkey
 
         p = tmp_path / "hotkey.pid"
         p.write_text("4321")
@@ -276,7 +276,7 @@ class TestListenerLifecycle:
         assert not p.exists()
 
     def test_stop_noop_when_not_running(self, tmp_path, monkeypatch):
-        from multideck import hotkey
+        from magent import hotkey
 
         monkeypatch.setattr(hotkey, "_PID_PATH", tmp_path / "hotkey.pid")
         assert hotkey.stop_listener() is False
@@ -286,7 +286,7 @@ class TestListenerLifecycle:
         # pid file in place so `status`/a retry can still find the process.
         import subprocess
 
-        from multideck import hotkey
+        from magent import hotkey
 
         p = tmp_path / "hotkey.pid"
         p.write_text("4321")
@@ -303,7 +303,7 @@ class TestListenerLifecycle:
     def test_write_then_clear_pid(self, tmp_path, monkeypatch):
         import os
 
-        from multideck import hotkey
+        from magent import hotkey
 
         p = tmp_path / "hotkey.pid"
         monkeypatch.setattr(hotkey, "_PID_PATH", p)
@@ -320,36 +320,36 @@ class TestDoUploadLogging:
     background thread it runs on."""
 
     def test_logs_info_with_project_and_result(self, monkeypatch, caplog):
-        from multideck import hotkey
+        from magent import hotkey
 
         monkeypatch.setattr(hotkey, "get_clipboard_image", lambda: b"FAKEBMP")
         monkeypatch.setattr(hotkey, "upload_image", lambda url, project, data: True)
 
-        with caplog.at_level("INFO", logger="multideck.hotkey"):
+        with caplog.at_level("INFO", logger="magent.hotkey"):
             hotkey._do_upload("http://x:8034", "marka")
 
         assert "project=marka" in caplog.text
         assert "ok=True" in caplog.text
 
     def test_logs_ok_false_on_failed_upload(self, monkeypatch, caplog):
-        from multideck import hotkey
+        from magent import hotkey
 
         monkeypatch.setattr(hotkey, "get_clipboard_image", lambda: b"FAKEBMP")
         monkeypatch.setattr(hotkey, "upload_image", lambda url, project, data: False)
 
-        with caplog.at_level("INFO", logger="multideck.hotkey"):
+        with caplog.at_level("INFO", logger="magent.hotkey"):
             hotkey._do_upload("http://x:8034", "marka")
 
         assert "ok=False" in caplog.text
 
     def test_no_image_is_a_silent_noop(self, monkeypatch, caplog):
-        from multideck import hotkey
+        from magent import hotkey
 
         monkeypatch.setattr(hotkey, "get_clipboard_image", lambda: None)
         called = []
         monkeypatch.setattr(hotkey, "upload_image", lambda *a: called.append(a))
 
-        with caplog.at_level("INFO", logger="multideck.hotkey"):
+        with caplog.at_level("INFO", logger="magent.hotkey"):
             hotkey._do_upload("http://x:8034", "marka")
 
         assert called == []
@@ -358,14 +358,14 @@ class TestDoUploadLogging:
     def test_unexpected_error_is_caught_and_logged_not_raised(
         self, monkeypatch, caplog
     ):
-        from multideck import hotkey
+        from magent import hotkey
 
         def _boom():
             raise OverflowError("byte must be in range(0, 256)")
 
         monkeypatch.setattr(hotkey, "get_clipboard_image", _boom)
 
-        with caplog.at_level("INFO", logger="multideck.hotkey"):
+        with caplog.at_level("INFO", logger="magent.hotkey"):
             hotkey._do_upload("http://x:8034", "marka")  # must not raise
 
         assert "upload project=marka failed" in caplog.text
@@ -378,7 +378,7 @@ class TestHeartbeatWiring:
     spinning a real message loop (GetMessageW needs a real hook)."""
 
     def test_heartbeat_loop_writes_and_stops_on_event(self, monkeypatch):
-        from multideck import hotkey
+        from magent import hotkey
 
         calls = []
         monkeypatch.setattr(hotkey, "write_heartbeat", calls.append)
@@ -401,18 +401,18 @@ class TestMaybeStartHotkey:
     """attach starts the listener in the background, never a second copy."""
 
     def test_returns_existing_without_spawning(self, monkeypatch):
-        from multideck import cli, hotkey
+        from magent import cli, hotkey
 
         monkeypatch.setattr(hotkey, "listener_pid", lambda: 1234)
         spawned = []
         monkeypatch.setattr(
-            "multideck.launch.spawn_detached", lambda *a, **k: spawned.append(a)
+            "magent.launch.spawn_detached", lambda *a, **k: spawned.append(a)
         )
         assert cli._maybe_start_hotkey("http://x:8034") == 1234
         assert spawned == []  # an already-running listener isn't duplicated
 
     def test_spawns_when_none_running(self, monkeypatch):
-        from multideck import cli, hotkey
+        from magent import cli, hotkey
 
         state = {"pid": None}
         monkeypatch.setattr(hotkey, "listener_pid", lambda: state["pid"])
@@ -420,7 +420,7 @@ class TestMaybeStartHotkey:
         def fake_spawn(args, *a, **k):
             state["pid"] = 5678  # the detached child comes up and writes its pid
 
-        monkeypatch.setattr("multideck.launch.spawn_detached", fake_spawn)
+        monkeypatch.setattr("magent.launch.spawn_detached", fake_spawn)
         assert cli._maybe_start_hotkey("http://x:8034") == 5678
 
 
@@ -428,13 +428,13 @@ class TestHookStructsAndConstants:
     def test_kbdllhookstruct_size(self):
         import ctypes
 
-        from multideck.hotkey import KBDLLHOOKSTRUCT
+        from magent.hotkey import KBDLLHOOKSTRUCT
 
         size = ctypes.sizeof(KBDLLHOOKSTRUCT)
         assert size > 0
 
     def test_constants(self):
-        from multideck.hotkey import CF_DIB, VK_MENU, VK_V, WH_KEYBOARD_LL
+        from magent.hotkey import CF_DIB, VK_MENU, VK_V, WH_KEYBOARD_LL
 
         assert VK_V == 0x56
         assert VK_MENU == 0x12
@@ -442,7 +442,7 @@ class TestHookStructsAndConstants:
         assert WH_KEYBOARD_LL == 13
 
     def test_hookproc_type(self):
-        from multideck.hotkey import HOOKPROC
+        from magent.hotkey import HOOKPROC
 
         assert HOOKPROC is not None
 
@@ -454,7 +454,7 @@ class TestHookProc:
 
     @staticmethod
     def _kb(vk_code):
-        from multideck.hotkey import KBDLLHOOKSTRUCT
+        from magent.hotkey import KBDLLHOOKSTRUCT
 
         return KBDLLHOOKSTRUCT(
             vkCode=vk_code, scanCode=0, flags=0, time=0, dwExtraInfo=None
@@ -463,13 +463,13 @@ class TestHookProc:
     def test_decide_eats_altv_in_md_window(self, monkeypatch):
         import ctypes
 
-        from multideck import hotkey
-        from multideck.hotkey import HC_ACTION, VK_V, WM_KEYDOWN, _hook_decide
+        from magent import hotkey
+        from magent.hotkey import HC_ACTION, VK_V, WM_KEYDOWN, _hook_decide
 
         kb = self._kb(VK_V)
         lparam = ctypes.cast(ctypes.pointer(kb), ctypes.c_void_p).value
 
-        monkeypatch.setattr(hotkey, "get_active_window_title", lambda: "md:marka")
+        monkeypatch.setattr(hotkey, "get_active_window_title", lambda: "magent:marka")
         monkeypatch.setattr(hotkey, "clipboard_has_image", lambda: True)
 
         started = []
@@ -496,7 +496,7 @@ class TestHookProc:
         # the traceback and returns the restype default -- silently breaking
         # the rest of the hook chain for that event. The wrap must always
         # call CallNextHookEx itself instead of relying on that fallback.
-        from multideck import hotkey
+        from magent import hotkey
 
         def _boom(*a, **k):
             raise RuntimeError("boom")
@@ -520,6 +520,6 @@ class TestHookProc:
     def test_run_hotkey_signature_has_no_session_names(self):
         import inspect
 
-        from multideck.hotkey import run_hotkey
+        from magent.hotkey import run_hotkey
 
         assert set(inspect.signature(run_hotkey).parameters) == {"server_url"}

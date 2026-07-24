@@ -1,13 +1,13 @@
 """Behavior pins for the two duplicated tiling code paths (R13 residual) plus
-direct unit tests for the shared multideck.tiling.place_windows helper that
+direct unit tests for the shared magent.tiling.place_windows helper that
 replaces them.
 
-The TestTileTitlesPin/TestRunMultideckTilingPin classes below are written
+The TestTileTitlesPin/TestRunMagentTilingPin classes below are written
 BEFORE the dedup (E9.md Step 1) and must keep passing UNCHANGED after it
 (Steps 3-4): they assert observable behavior (which handles move to which
 slot rects, which lines echo) -- not which lookup method is used -- so the
 same assertions hold pre-conversion (find_window / inline retry) and post
-(snapshot_windows / multideck.tiling.place_windows). That is the whole
+(snapshot_windows / magent.tiling.place_windows). That is the whole
 point: a behavior pin that survives the refactor is the drift tripwire.
 """
 
@@ -17,11 +17,11 @@ import time
 
 import pytest
 
-from multideck import cli
-from multideck.config import load_config
-from multideck.grid import MonitorRect, Rect, TileSlot
-from multideck.launch import RunOpts, run_multideck
-from multideck.tiling import (
+from magent import cli
+from magent.config import load_config
+from magent.grid import MonitorRect, Rect, TileSlot
+from magent.launch import RunOpts, run_magent
+from magent.tiling import (
     RETRY_SECS_CONTAINS,
     RETRY_SECS_EXACT,
     Placement,
@@ -83,7 +83,7 @@ class _FakeTilePlat:
 def fake_sleep(monkeypatch):
     """Patches the real time.sleep function object. cli._tile_titles does a
     LOCAL `import time` (pre-conversion), so there is no module-level
-    `multideck.cli.time` attribute to monkeypatch; `import time` anywhere
+    `magent.cli.time` attribute to monkeypatch; `import time` anywhere
     always binds the same sys.modules['time'] object, so patching it here
     reliably intercepts every caller (cli.py pre-conversion, tiling.py/
     launch.py post-conversion) regardless of import style. Records each
@@ -103,7 +103,7 @@ class TestTileTitlesPin:
 
     def test_moves_known_windows_to_slots(self, monkeypatch, fake_sleep, capsys):
         fp = _FakeTilePlat(windows={"A": 1, "B": 2})
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
 
         cli._tile_titles(["A", "B"])
 
@@ -114,7 +114,7 @@ class TestTileTitlesPin:
 
     def test_reports_missing(self, monkeypatch, fake_sleep, capsys):
         fp = _FakeTilePlat(windows={"A": 1})
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
 
         cli._tile_titles(["A", "B"])
 
@@ -124,9 +124,9 @@ class TestTileTitlesPin:
 
     def test_no_monitors_returns(self, monkeypatch, capsys, caplog):
         fp = _FakeTilePlat(windows={}, monitors=[])
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
 
-        with caplog.at_level("ERROR", logger="multideck.launch"):
+        with caplog.at_level("ERROR", logger="magent.launch"):
             result = cli._tile_titles(["A"])
 
         assert result is None
@@ -136,9 +136,9 @@ class TestTileTitlesPin:
         assert "no monitors detected" in caplog.text
 
 
-class TestRunMultideckTilingPin:
+class TestRunMagentTilingPin:
     """E2's fake_platform/tmp_config fixtures are present (RULING S3-5-3:
-    mandatory here, not skipped). Drives the full run_multideck orchestrator
+    mandatory here, not skipped). Drives the full run_magent orchestrator
     and pins that a newly-launched window lands in slot 0's rect. Must keep
     passing unchanged through Steps 3-4."""
 
@@ -170,7 +170,7 @@ class TestRunMultideckTilingPin:
         )
         cfg = load_config(config_path)
 
-        rc = run_multideck(cfg, RunOpts())
+        rc = run_magent(cfg, RunOpts())
 
         assert rc == 0
         assert (HANDLE, Rect(x=0, y=0, w=960, h=1080)) in fake_platform.moved
@@ -212,7 +212,7 @@ class TestPlaceWindows:
         missing_cb: list[Placement] = []
         placements = [Placement(key="ghost", mode="exact", slot=_slot())]
 
-        with caplog.at_level("WARNING", logger="multideck.launch"):
+        with caplog.at_level("WARNING", logger="magent.launch"):
             placed, missing = place_windows(
                 fp, placements, on_missing=missing_cb.append
             )
@@ -253,23 +253,34 @@ class TestPlaceWindows:
 
         assert len(fake_sleep) == RETRY_SECS_CONTAINS
 
-    def test_md_name_lookup_matches_badged_and_plain_titles(self, fake_sleep):
-        fp = _FakeTilePlat(windows={"md:[!] api": 7, "md:web": 8, "api": 9})
-        badged = Placement(key="api", mode="md-name", slot=_slot())
-        plain = Placement(key="web", mode="md-name", slot=_slot())
+    def test_magent_name_lookup_matches_badged_and_plain_titles(self, fake_sleep):
+        fp = _FakeTilePlat(windows={"magent:[!] api": 7, "magent:web": 8, "api": 9})
+        badged = Placement(key="api", mode="magent-name", slot=_slot())
+        plain = Placement(key="web", mode="magent-name", slot=_slot())
 
         placed, missing = place_windows(fp, [badged, plain])
 
         assert {p.key for p in placed} == {"api", "web"}
         assert missing == []
-        # The bare "api" window (handle 9) is NOT multideck's; the badged
-        # md: window (handle 7) must win the "api" placement.
+        # The bare "api" window (handle 9) is NOT magent's; the badged
+        # magent: window (handle 7) must win the "api" placement.
         assert (7, Rect(x=0, y=0, w=960, h=1080)) in fp.moved
         assert all(h != 9 for h, _ in fp.moved)
 
-    def test_md_name_requires_exact_name_not_substring(self, fake_sleep):
-        fp = _FakeTilePlat(windows={"md:api-v2": 7})
+    def test_legacy_md_name_alias_still_resolves(self, fake_sleep):
+        # "md-name" is the pre-rename spelling; it must keep resolving so old
+        # producers/configs still tile. Canonical value is "magent-name".
+        fp = _FakeTilePlat(windows={"magent:api": 7})
         placements = [Placement(key="api", mode="md-name", slot=_slot())]
+
+        placed, missing = place_windows(fp, placements)
+
+        assert [p.key for p in placed] == ["api"]
+        assert missing == []
+
+    def test_magent_name_requires_exact_name_not_substring(self, fake_sleep):
+        fp = _FakeTilePlat(windows={"magent:api-v2": 7})
+        placements = [Placement(key="api", mode="magent-name", slot=_slot())]
 
         placed, missing = place_windows(fp, placements)
 

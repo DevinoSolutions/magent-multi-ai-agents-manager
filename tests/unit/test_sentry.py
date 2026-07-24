@@ -17,7 +17,7 @@ import sys
 import types
 from typing import TYPE_CHECKING
 
-from multideck.sentry import SENTRY_INSTALL_HINT, init_sentry
+from magent.sentry import SENTRY_INSTALL_HINT, init_sentry
 
 if TYPE_CHECKING:
     import pytest
@@ -97,7 +97,7 @@ class TestCapturabilityContract:
     def test_init_tags_environment_dev_and_release(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Live-verification by-product (MULTIDECK-5/6): the untagged init
+        """Live-verification by-product (MAGENT-5/6): the untagged init
         defaulted environment to 'production' on a dev box and pinned release
         to git HEAD only by accident of running inside the repo. Pin both: a
         fixed 'dev' environment and a release key derived from the installed
@@ -130,7 +130,7 @@ class TestMissingSdkIsQuietButLogged:
     the console: it runs at CLI entry for every command, so a stderr line
     would tax unrelated commands like `attach` on every run. The explanation
     still exists (never silent-with-zero-trace): a rotating-log warning here,
-    plus the repair hint in `multideck doctor`. init still must not raise."""
+    plus the repair hint in `magent doctor`. init still must not raise."""
 
     def test_missing_sdk_logs_warning_console_stays_clean(
         self,
@@ -145,7 +145,7 @@ class TestMissingSdkIsQuietButLogged:
                 records.append(msg % args if args else msg)
 
         monkeypatch.setattr(
-            "multideck.sentry.get_logger", lambda _name: _RecordingLogger()
+            "magent.sentry.get_logger", lambda _name: _RecordingLogger()
         )
 
         init_sentry(_FAKE_DSN)  # must not raise
@@ -159,16 +159,14 @@ class TestMissingSdkIsQuietButLogged:
 
 
 class TestNoEagerImport:
-    """Pin: merely importing multideck.sentry must never pull in sentry_sdk
+    """Pin: merely importing magent.sentry must never pull in sentry_sdk
     -- the SDK is bundled but loads only inside init_sentry's guarded try,
     keeping `--help`-style startup free of its import cost when no DSN is
     set. Runs in a fresh subprocess so no other test's sys.modules state can
     hide a regression here."""
 
     def test_importing_the_module_does_not_import_sentry_sdk(self) -> None:
-        probe = (
-            "import sys; import multideck.sentry; print('sentry_sdk' in sys.modules)"
-        )
+        probe = "import sys; import magent.sentry; print('sentry_sdk' in sys.modules)"
         result = subprocess.run(
             [sys.executable, "-c", probe],
             capture_output=True,

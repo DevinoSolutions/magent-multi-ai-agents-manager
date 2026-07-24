@@ -1,7 +1,7 @@
 """Cross-platform real-PTY driver for the interactive-menu e2e tests.
 
 Not a test module (no ``test_`` prefix, so pytest never collects it): a thin
-uniform wrapper over a REAL pseudo-terminal so one test body drives ``multideck``
+uniform wrapper over a REAL pseudo-terminal so one test body drives ``magent``
 the same way on every OS.
 
 * POSIX -> ``pexpect`` (a real pty via ``os.forkpty``).

@@ -1,9 +1,36 @@
 # Changelog
 
-All notable changes to multideck are documented in this file.
+All notable changes to magent are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- **`settings.windowTitlePrefix`** (default `true`) — set `false` to drop the
+  `magent:` prefix and use bare project-name window titles. Launch-path tiling
+  falls back to exact-title matching so windows still place; the attention
+  daemon's title badges, the Alt+V hotkey, and `magent-name` title matching
+  depend on the prefix and quietly no-op while it is off.
+
+### Changed
+
+- **Project renamed from multideck to magent.** The PyPI distribution is now
+  `magent-multi-ai-agents-manager` (`pip install magent-multi-ai-agents-manager`),
+  the CLI command and import package are both `magent`, and the project homepage
+  is <https://magent.io>. The GitHub repository moved to
+  `DevinoSolutions/magent-multi-ai-agents-manager`.
+- **Environment variable prefix `MULTIDECK_*` → `MAGENT_*`** (for example,
+  `MULTIDECK_SENTRY_DSN` is now `MAGENT_SENTRY_DSN`).
+- **User config/data directory `~/.multideck` → `~/.magent`** (config, logs,
+  agent state, `.env` file, lockfile). An existing config is still read from the
+  legacy `~/.multideck` location as a one-time, read-only fallback with a
+  warning — magent never migrates or writes there automatically.
+- **Window-title prefix `md:` → `magent:`** in the title grammar.
+- **Tiling placement mode `md-name` → `magent-name`**; the old `md-name`
+  spelling is still accepted as a deprecated alias so existing setups keep tiling.
 
 ## [1.0.0] - 2026-07-12
 
@@ -62,4 +89,5 @@ tool, every screen.
   (`click`, `pydantic-settings`) and optional extras for Sentry error reporting
   (`sentry`), Windows toast notifications (`toast`), and QR rendering (`qr`).
 
-[1.0.0]: https://github.com/DevinoSolutions/multideck-ai-agents-manager/releases/tag/v1.0.0
+[Unreleased]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/releases/tag/v1.0.0

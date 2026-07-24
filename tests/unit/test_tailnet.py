@@ -9,8 +9,8 @@ import json
 import shutil
 import subprocess
 
-from multideck import tailnet
-from multideck.tailnet import TailnetProbe
+from magent import tailnet
+from magent.tailnet import TailnetProbe
 
 
 def _cp(returncode: int, stdout: str) -> subprocess.CompletedProcess[str]:

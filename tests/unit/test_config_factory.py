@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from multideck.config import (
+from magent.config import (
     DEFAULT_TOOLS,
     SCHEMA_VERSION,
     ConfigError,
@@ -19,12 +19,10 @@ from multideck.config import (
     migrate_config_file,
     settings_to_dict,
 )
-from multideck.discover import projects_to_config
-from multideck.init_config import generate_config
+from magent.discover import projects_to_config
+from magent.init_config import generate_config
 
-EXAMPLE_CONFIG_PATH = (
-    Path(__file__).resolve().parents[2] / "multideck.config.example.json"
-)
+EXAMPLE_CONFIG_PATH = Path(__file__).resolve().parents[2] / "magent.config.example.json"
 
 
 class TestFactoryRoundtrip:
@@ -219,7 +217,7 @@ class TestExampleConfigMatchesFactory:
 
         # Round-trip through the public loader -- factory-dict equality alone
         # doesn't exercise the path real users hit (NF from MINOR's dropped pin).
-        copy_path = tmp_path / "multideck.config.json"
+        copy_path = tmp_path / "magent.config.json"
         copy_path.write_text(json.dumps(example), encoding="utf-8")
         cfg = load_config(str(copy_path))
 

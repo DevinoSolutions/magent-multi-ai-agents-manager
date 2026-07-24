@@ -5,10 +5,10 @@ The unit suite drives ``_hook_decide`` with fabricated KBDLLHOOKSTRUCTs; it
 never proves the shipping chain. This test does, with zero fakes:
 
 * the listener is started EXACTLY the way the product starts it -- the same
-  ``python -m multideck hotkey -s <server_url>`` argv that
+  ``python -m magent hotkey -s <server_url>`` argv that
   ``cli/background._maybe_start_hotkey`` spawns -- so the real
   ``SetWindowsHookExW(WH_KEYBOARD_LL)`` hook + message loop are live;
-* the upload server is the real ``multideck serve`` subprocess, validating the
+* the upload server is the real ``magent serve`` subprocess, validating the
   project against a LIVE psmux session (``discover_sessions``);
 * the foreground window is a REAL wt window opened by the product attach path
   (``attach_psmux``), titled through ``titles.make_title`` -- the exact title
@@ -21,7 +21,7 @@ never proves the shipping chain. This test does, with zero fakes:
 
 Product-visible effects asserted:
 
-1. the DIB lands as a BMP file in the server's ``~/.multideck/uploads/`` --
+1. the DIB lands as a BMP file in the server's ``~/.magent/uploads/`` --
    byte-for-byte the BMP the product's DIB->BMP wrapper must produce for a
    32bpp BI_RGB DIB (file header + alpha bytes forced opaque);
 2. the uploaded file's path is INJECTED into the live psmux session
@@ -45,7 +45,7 @@ test uses the runner's REAL home for every party, mirroring the SSH attach
 flagship's posture: additionally gated on ``GITHUB_ACTIONS=true`` /
 ``MDTEST_ALLOW_REAL_HOME=1``, uuid-namespaced artifacts, and the chord proof
 is a NEW uploads file (pre-chord snapshot delta) with byte-exact content.
-MULTIDECK_* vars are still stripped from every child.
+MAGENT_* vars are still stripped from every child.
 """
 
 import contextlib
@@ -62,7 +62,7 @@ from urllib.request import urlopen
 
 import pytest
 
-from multideck import psmux
+from magent import psmux
 
 pytestmark = [
     pytest.mark.interaction,
@@ -91,11 +91,9 @@ _CF_DIB = 8
 
 
 def _child_env() -> dict[str, str]:
-    """The real environment minus ambient MULTIDECK_* vars. HOME is NOT
+    """The real environment minus ambient MAGENT_* vars. HOME is NOT
     redirected -- psmux sockets are per-profile (see module docstring)."""
-    return {
-        k: v for k, v in os.environ.items() if not k.upper().startswith("MULTIDECK_")
-    }
+    return {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
 
 
 def _wait_until(check, timeout: float, interval: float = 0.5):
@@ -307,7 +305,7 @@ def _http_ok(url: str, needle: str) -> bool:
 
 
 def _read_log(home, logname: str) -> str:
-    log_file = home / ".multideck" / "logs" / f"{logname}.log"
+    log_file = home / ".magent" / "logs" / f"{logname}.log"
     try:
         return log_file.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -324,9 +322,9 @@ def _tail(path, limit: int = 2000) -> str:
 def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
     import ctypes
 
-    from multideck.platform import get_platform
-    from multideck.psmux import PsmuxWindowOpts
-    from multideck.titles import make_title
+    from magent.platform import get_platform
+    from magent.psmux import PsmuxWindowOpts
+    from magent.titles import make_title
 
     plat = get_platform()
     unique = uuid.uuid4().hex[:10]
@@ -339,7 +337,7 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
     proj.mkdir()
     home = Path.home()  # REAL home: psmux sockets are per-profile (docstring)
     env = _child_env()
-    cfg = tmp_path / "multideck.config.json"
+    cfg = tmp_path / "magent.config.json"
     cfg.write_text(
         json.dumps(
             {
@@ -360,7 +358,7 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
     hotkey_proc = None
     session_created = False
     handles = []
-    uploads = home / ".multideck" / "uploads"
+    uploads = home / ".magent" / "uploads"
     pre_existing = set(uploads.glob("*_clipboard.bmp")) if uploads.is_dir() else set()
 
     def _sink(path):
@@ -391,7 +389,7 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--config",
                 str(cfg),
                 "serve",
@@ -431,7 +429,7 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
         hotkey_out = tmp_path / "hotkey.out.log"
         hotkey_err = tmp_path / "hotkey.err.log"
         hotkey_proc = subprocess.Popen(
-            [sys.executable, "-m", "multideck", "hotkey", "-s", server_url],
+            [sys.executable, "-m", "magent", "hotkey", "-s", server_url],
             env=env,
             stdout=_sink(hotkey_out),
             stderr=_sink(hotkey_err),
@@ -439,7 +437,7 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
         # hotkey.pid is written only AFTER SetWindowsHookExW succeeded -- the
         # product's own "hook is live" signal. Real HOME, so require the pid
         # file to carry OUR child's pid (never a stale leftover).
-        pid_file = home / ".multideck" / "hotkey.pid"
+        pid_file = home / ".magent" / "hotkey.pid"
 
         def _hook_live() -> bool:
             try:
@@ -454,7 +452,7 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
             f"listener stderr:\n{_tail(hotkey_err)}"
         )
 
-        # 4. The REAL md: window via the product attach path; focus it.
+        # 4. The REAL magent: window via the product attach path; focus it.
         plat.attach_psmux(name, title)
         hwnd = _wait_until(lambda: plat.find_window(title), timeout=90)
         assert hwnd, f"attach window {title!r} never materialized"
@@ -537,7 +535,7 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
                 with contextlib.suppress(OSError):
                     f.unlink()
         with contextlib.suppress(OSError):
-            (home / ".multideck" / "hotkey.pid").unlink()
+            (home / ".magent" / "hotkey.pid").unlink()
 
     assert not psmux.has_session(name), f"cleanup left psmux session {name!r} alive"
     assert plat.find_window(title) is None, f"cleanup left window {title!r} open"

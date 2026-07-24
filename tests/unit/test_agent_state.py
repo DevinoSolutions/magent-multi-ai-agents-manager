@@ -19,7 +19,7 @@ import time
 
 import pytest
 
-from multideck import agent_state
+from magent import agent_state
 
 
 @pytest.fixture(autouse=True)

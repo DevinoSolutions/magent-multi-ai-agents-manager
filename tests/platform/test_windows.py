@@ -11,7 +11,7 @@ pytestmark = pytest.mark.platform
 
 @pytest.fixture
 def platform():
-    from multideck.platform import get_platform
+    from magent.platform import get_platform
 
     return get_platform()
 
@@ -66,7 +66,7 @@ class TestFindWindow:
                 [
                     "xterm",
                     "-T",
-                    "test-multideck-find",
+                    "test-magent-find",
                     "-fa",
                     "Monospace",
                     "-fs",
@@ -77,7 +77,7 @@ class TestFindWindow:
                 stderr=subprocess.DEVNULL,
             )
             time.sleep(3)
-            yield "test-multideck-find"
+            yield "test-magent-find"
             proc.kill()
 
     def test_find_existing_window(self, platform, notepad_window):

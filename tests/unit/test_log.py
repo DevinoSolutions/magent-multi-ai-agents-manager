@@ -1,4 +1,4 @@
-"""Unit tests for multideck.log -- rotating file logging + liveness heartbeats.
+"""Unit tests for magent.log -- rotating file logging + liveness heartbeats.
 
 Cross-platform (stdlib only) -- must run clean on the Linux/macOS/Windows CI
 legs, not just Windows.
@@ -12,7 +12,7 @@ import os
 import time
 from pathlib import Path
 
-from multideck import env, log
+from magent import env, log
 
 
 class TestGetLogger:
@@ -48,18 +48,18 @@ class TestGetLogger:
 
 
 class TestLogLevelFromEnv:
-    """P2-01: get_logger honors MULTIDECK_LOG_LEVEL. It was validated in the
+    """P2-01: get_logger honors MAGENT_LOG_LEVEL. It was validated in the
     env schema and documented in .env.example but never applied -- log.py
     hardcoded INFO, so the knob you'd reach for to debug a daemon did nothing."""
 
     def test_honors_debug_from_env(self, monkeypatch):
-        monkeypatch.setenv("MULTIDECK_LOG_LEVEL", "DEBUG")
+        monkeypatch.setenv("MAGENT_LOG_LEVEL", "DEBUG")
         monkeypatch.setattr(env, "_cached_env", None)
         log.reset_logging()
         assert log.get_logger("leveltest").level == logging.DEBUG
 
     def test_defaults_to_info_when_unset(self, monkeypatch):
-        # conftest's autouse strip already removed any ambient MULTIDECK_*.
+        # conftest's autouse strip already removed any ambient MAGENT_*.
         monkeypatch.setattr(env, "_cached_env", None)
         log.reset_logging()
         assert log.get_logger("leveltest").level == logging.INFO
@@ -68,7 +68,7 @@ class TestLogLevelFromEnv:
         # A bad value fails fast at CLI entry; if get_logger is still reached
         # (a detached daemon whose inherited env went bad), it must default to
         # INFO rather than crash the process it exists to observe.
-        monkeypatch.setenv("MULTIDECK_LOG_LEVEL", "BOGUS")
+        monkeypatch.setenv("MAGENT_LOG_LEVEL", "BOGUS")
         monkeypatch.setattr(env, "_cached_env", None)
         log.reset_logging()
         assert log.get_logger("leveltest").level == logging.INFO  # must not raise

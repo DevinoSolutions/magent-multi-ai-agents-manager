@@ -1,4 +1,4 @@
-# multideck is a Windows tool — keep scripts as CRLF so cmd/PowerShell are happy.
+# magent is a Windows tool — keep scripts as CRLF so cmd/PowerShell are happy.
 * text=auto
 *.ps1 text eol=crlf
 *.bat text eol=crlf

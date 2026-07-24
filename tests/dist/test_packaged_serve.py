@@ -1,8 +1,8 @@
-"""The upload server on the wire, started from the INSTALLED ``multideck`` entry
-point (not ``python -m multideck``): a real ``multideck serve`` process bound to
+"""The upload server on the wire, started from the INSTALLED ``magent`` entry
+point (not ``python -m magent``): a real ``magent serve`` process bound to
 a real loopback socket, exercised with real ``http.client`` requests.
 
-What it proves about a ``pip install multideck`` user (socket-real, all OSes,
+What it proves about a ``pip install magent-multi-ai-agents-manager`` user (socket-real, all OSes,
 no mocks): the packaged console script starts a server that answers
 ``/health`` with ``ok: true``, and an oversized ``/upload`` gets the real 413
 ``{"ok": false, ...}`` JSON envelope on the same connection -- the P4-02
@@ -12,7 +12,7 @@ socket is actually gone.
 
 Isolation: the serve child runs with HOME + the win32 APPDATA config base
 redirected into tmp (pid file, uploads, logs all land there), the config is a
-tmp file, ``MULTIDECK_*`` is stripped, and the bind is 127.0.0.1 only. The
+tmp file, ``MAGENT_*`` is stripped, and the bind is 127.0.0.1 only. The
 ``_Serve`` harness is adapted from tests/e2e/test_real_upload.py (light
 duplication, per the tier's convention) with the launcher swapped to the
 installed entry point.
@@ -43,7 +43,7 @@ def _child_env(home: Path) -> dict[str, str]:
     env = {
         k: v
         for k, v in os.environ.items()
-        if not k.upper().startswith("MULTIDECK_")
+        if not k.upper().startswith("MAGENT_")
         and k.upper() not in ("PYTHONPATH", "PYTHONHOME")
     }
     home_s = str(home)
@@ -92,7 +92,7 @@ def _health_ok(port: int, errors: list[str] | None = None) -> bool:
 
 
 class _Serve:
-    """One real `multideck serve` process started from the INSTALLED entry
+    """One real `magent serve` process started from the INSTALLED entry
     point, plus everything needed to talk to it and clean up only it."""
 
     def __init__(self, packaged, tmp_path: Path):
@@ -106,7 +106,7 @@ class _Serve:
         self.proj.mkdir()
         self.env = _child_env(self.home)
         self.port = _free_port()
-        self.cfg = tmp_path / "multideck.config.json"
+        self.cfg = tmp_path / "magent.config.json"
         self.cfg.write_text(
             json.dumps(
                 {
@@ -168,7 +168,7 @@ class _Serve:
         )
 
     def _diagnostics(self) -> str:
-        md = self.home / ".multideck"
+        md = self.home / ".magent"
         try:
             tree = sorted(str(p.relative_to(md)) for p in md.rglob("*"))
         except OSError as exc:
@@ -178,7 +178,7 @@ class _Serve:
             log_text = log_file.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             log_text = f"<unreadable: {exc}>"
-        return f"~/.multideck tree: {tree}\nupload.log:\n{log_text or '<empty>'}"
+        return f"~/.magent tree: {tree}\nupload.log:\n{log_text or '<empty>'}"
 
     def connect(self, timeout: float = 120) -> http.client.HTTPConnection:
         return http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
@@ -215,7 +215,7 @@ def test_installed_serve_answers_health(serve):
 
 
 def test_installed_serve_rejects_oversized_with_413_envelope(serve):
-    from multideck.upload_server import MAX_UPLOAD_BYTES
+    from magent.upload_server import MAX_UPLOAD_BYTES
 
     body = b"x" * (MAX_UPLOAD_BYTES + 1)  # honest Content-Length, really sent
     conn = serve.connect()

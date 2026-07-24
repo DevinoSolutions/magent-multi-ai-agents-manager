@@ -8,8 +8,8 @@ from typing import ClassVar
 
 import pytest
 
-from multideck.psmux import config_sessions
-from multideck.upload_server import (
+from magent.psmux import config_sessions
+from magent.upload_server import (
     UploadHandler,
     _build_html,
     _parse_multipart,
@@ -59,7 +59,7 @@ class TestBuildHtml:
 class TestConfigSessions:
     def test_carries_display_name_and_sanitized_session(self, tmp_path):
         # P3-01: _config_sessions splits the display name from the psmux id.
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -197,7 +197,7 @@ class TestDrainRequestBody:
 
     def test_reads_at_most_the_cap(self, monkeypatch):
         # Feed a source far larger than the cap: consumption must stop at the cap.
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         monkeypatch.setattr(mod, "_DRAIN_CAP_BYTES", 100)
         reader = _DrainReader(b"x" * 500)
@@ -207,7 +207,7 @@ class TestDrainRequestBody:
         assert handler.close_connection is True
 
     def test_tolerates_garbage_content_length(self, monkeypatch):
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         monkeypatch.setattr(mod, "_DRAIN_CAP_BYTES", 100)
         reader = _DrainReader(b"y" * 20)
@@ -217,7 +217,7 @@ class TestDrainRequestBody:
         assert handler.close_connection is True
 
     def test_tolerates_absent_content_length(self, monkeypatch):
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         monkeypatch.setattr(mod, "_DRAIN_CAP_BYTES", 100)
         reader = _DrainReader(b"z" * 15)
@@ -229,7 +229,7 @@ class TestDrainRequestBody:
     def test_stops_on_read_timeout(self, monkeypatch):
         # A blocking socket that times out mid-drain (client declared more than
         # it sent and holds the connection open) raises OSError -- swallowed.
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         monkeypatch.setattr(mod, "_DRAIN_CAP_BYTES", 100)
         reader = _DrainReader(b"w" * 5, raise_when_empty=True)
@@ -239,7 +239,7 @@ class TestDrainRequestBody:
         assert handler.close_connection is True
 
     def test_zero_length_is_noop(self, monkeypatch):
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         monkeypatch.setattr(mod, "_DRAIN_CAP_BYTES", 100)
         reader = _DrainReader(b"unused", raise_when_empty=True)
@@ -253,10 +253,10 @@ class TestDrainRequestBody:
 class TestUploadServerIntegration:
     @pytest.fixture(autouse=True)
     def _server(self, tmp_path, monkeypatch):
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         monkeypatch.setattr(mod, "_UPLOAD_DIR", tmp_path / "uploads")
-        import multideck.psmux as psmux_mod
+        import magent.psmux as psmux_mod
 
         monkeypatch.setattr(psmux_mod, "find_psmux", lambda: None)
         self.upload_dir = tmp_path / "uploads"
@@ -407,7 +407,7 @@ class TestUploadServerIntegration:
             b"------WebKitFormBoundary--\r\n"
         )
 
-        with caplog.at_level("INFO", logger="multideck.upload"):
+        with caplog.at_level("INFO", logger="magent.upload"):
             conn = self._conn()
             conn.request(
                 "POST",
@@ -525,7 +525,7 @@ class TestUploadServerIntegration:
         # P4-02: the reject drains the pending body first, so the client
         # deterministically reads the 413 + JSON envelope instead of a Windows
         # TCP RST ("connection reset") -- no retries, no flake.
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         monkeypatch.setattr(mod, "MAX_UPLOAD_BYTES", 10)
 
@@ -585,14 +585,14 @@ class TestUploadServerIntegration:
         # P2-03: an unexpected error inside a GET handler must become a clean
         # 500 + an ERROR log record (-> logfile + Sentry), never a dropped
         # connection whose traceback vanishes into socketserver stderr.
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         def boom(_sessions):
             raise RuntimeError("boom in GET")
 
         monkeypatch.setattr(mod, "_build_html", boom)
 
-        with caplog.at_level("ERROR", logger="multideck.upload"):
+        with caplog.at_level("ERROR", logger="magent.upload"):
             conn = self._conn()
             conn.request("GET", "/")
             resp = conn.getresponse()
@@ -608,14 +608,14 @@ class TestUploadServerIntegration:
     def test_post_handler_crash_returns_500_and_logs(self, monkeypatch, caplog):
         # P2-03: same guarantee for the POST path -- the finding's motivating
         # case (an unexpected fault while handling an upload).
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         def boom(_handler):
             raise RuntimeError("boom in POST")
 
         monkeypatch.setattr(mod, "_parse_multipart", boom)
 
-        with caplog.at_level("ERROR", logger="multideck.upload"):
+        with caplog.at_level("ERROR", logger="magent.upload"):
             conn = self._conn()
             conn.request(
                 "POST",
@@ -642,10 +642,10 @@ class TestHealth:
 
     @pytest.fixture(autouse=True)
     def _server(self, tmp_path, monkeypatch):
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         monkeypatch.setattr(mod, "_UPLOAD_DIR", tmp_path / "uploads")
-        import multideck.psmux as psmux_mod
+        import magent.psmux as psmux_mod
 
         monkeypatch.setattr(psmux_mod, "find_psmux", lambda: None)
 
@@ -675,7 +675,7 @@ class TestHealth:
         assert resp.status == 200
         data = json.loads(resp.read())
         assert data["ok"] is True
-        assert data["service"] == "multideck-upload"
+        assert data["service"] == "magent-upload"
         assert data["port"] == 8080
         assert data["pid"] == 4321
         # P3-18: the COUNT is `session_count`; `sessions` is the LIST route.
@@ -685,14 +685,14 @@ class TestHealth:
 
 
 class TestInSessionFeedback:
-    """Upload progress is flashed into the md:<project> psmux status line."""
+    """Upload progress is flashed into the magent:<project> psmux status line."""
 
     @pytest.fixture(autouse=True)
     def _server(self, tmp_path, monkeypatch):
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         monkeypatch.setattr(mod, "_UPLOAD_DIR", tmp_path / "uploads")
-        import multideck.psmux as psmux_mod
+        import magent.psmux as psmux_mod
 
         monkeypatch.setattr(psmux_mod, "find_psmux", lambda: "psmux")
         monkeypatch.setattr(mod, "_inflight", {})
@@ -790,7 +790,7 @@ class TestInSessionFeedback:
         assert self._wait_flash("upload failed")
 
     def test_inflight_count_clears_after_upload(self):
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         self._post("/upload?project=marka")
         self._wait_flash("image uploaded")
@@ -803,13 +803,13 @@ class TestStopServer:
 
     def test_no_pid_file_returns_false(self, tmp_path, monkeypatch):
         # Pin: this invariant is unchanged by the taskkill-rc behavior below.
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         monkeypatch.setattr(mod, "_pid_path", lambda port: tmp_path / "nonexistent.pid")
         assert mod.stop_server(9999) is False
 
     def test_keeps_pid_file_when_taskkill_fails(self, tmp_path, monkeypatch):
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         pid_file = tmp_path / "upload_server-9999.pid"
         pid_file.write_text("4321")
@@ -825,7 +825,7 @@ class TestStopServer:
         assert pid_file.exists()
 
     def test_removes_pid_file_when_taskkill_succeeds(self, tmp_path, monkeypatch):
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         pid_file = tmp_path / "upload_server-9999.pid"
         pid_file.write_text("4321")
@@ -847,26 +847,26 @@ class TestBindAddresses:
     working) plus the Tailscale IP when one is available."""
 
     def test_auto_bind_loopback_only_when_no_tailscale(self, monkeypatch):
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         monkeypatch.setattr(mod.tailnet, "ip4", lambda: None)
         assert mod._bind_addresses(None) == ["127.0.0.1"]
         assert "0.0.0.0" not in mod._bind_addresses(None)
 
     def test_auto_bind_includes_tailscale(self, monkeypatch):
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         monkeypatch.setattr(mod.tailnet, "ip4", lambda: "100.64.1.2")
         assert mod._bind_addresses(None) == ["127.0.0.1", "100.64.1.2"]
 
     def test_explicit_host_honored(self):
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         # The --host escape hatch is honored verbatim, including 0.0.0.0.
         assert mod._bind_addresses("0.0.0.0") == ["0.0.0.0"]
 
     def test_run_server_binds_expected(self, tmp_path, monkeypatch):
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         monkeypatch.setattr(mod.tailnet, "ip4", lambda: None)
         monkeypatch.setattr(
@@ -907,7 +907,7 @@ class TestBindAddresses:
         """
         import socket
 
-        import multideck.upload_server as mod
+        import magent.upload_server as mod
 
         def _bomb(name: str = "") -> str:
             raise AssertionError(

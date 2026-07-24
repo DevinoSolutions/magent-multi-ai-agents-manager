@@ -1,12 +1,12 @@
-"""Tests for `multideck watch` (cli/watch.py) and the status agents snapshot."""
+"""Tests for `magent watch` (cli/watch.py) and the status agents snapshot."""
 
 from __future__ import annotations
 
 import json
 import time
 
-from multideck import agent_state, cli
-from multideck.cli.watch import _age_label, _focus_by_name
+from magent import agent_state, cli
+from magent.cli.watch import _age_label, _focus_by_name
 from tests.conftest import FakePlatform
 
 
@@ -34,7 +34,7 @@ class TestAgeLabel:
 
 class TestFocusByName:
     def test_md_window_focused(self):
-        fp = FakePlatform(windows={"md:[!] api": 7}, supports_attention=True)
+        fp = FakePlatform(windows={"magent:[!] api": 7}, supports_attention=True)
 
         assert _focus_by_name(fp, "api") is True
         assert fp.focused == [7]
@@ -51,7 +51,7 @@ class TestFocusByName:
             def focus_window(self, handle) -> bool:
                 return False
 
-        fp = _NoFocus(windows={"md:api": 7}, supports_attention=True)
+        fp = _NoFocus(windows={"magent:api": 7}, supports_attention=True)
 
         assert _focus_by_name(fp, "api") is True
         assert fp.flashed == [7]
@@ -74,7 +74,7 @@ class TestWatchOnce:
         agent_state.write_state(str(web), agent_state.WORKING)
 
         fp = FakePlatform()
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
         config_path = tmp_config(
             {
                 "version": 2,
@@ -90,7 +90,7 @@ class TestWatchOnce:
 
     def test_empty_store_renders_hint(self, runner, monkeypatch, tmp_config):
         fp = FakePlatform()
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
         config_path = tmp_config({"version": 2, "projects": [{"path": "api"}]})
 
         result = runner.invoke(cli.main, ["--config", config_path, "watch", "--once"])
@@ -147,7 +147,7 @@ class TestConfigStaleness:
         api.mkdir()
         _write_aged_working(api)
         fp = FakePlatform()
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
         config_path = tmp_config(
             {
                 "version": 3,

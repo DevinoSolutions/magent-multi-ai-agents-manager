@@ -1,8 +1,8 @@
 """REAL tailnet tier: every test here talks to a live Tailscale node.
 
-``src/multideck/tailnet.py`` (``ip4`` / ``magicdns_host`` / ``probe`` -- the
+``src/magent/tailnet.py`` (``ip4`` / ``magicdns_host`` / ``probe`` -- the
 single owner of every ``tailscale`` CLI probe) and the Tailscale-facing half of
-``multideck serve``'s default bind (``upload_server._bind_addresses``) had only
+``magent serve``'s default bind (``upload_server._bind_addresses``) had only
 ever been unit-mocked: no test had ever run the real ``tailscale`` binary or
 proven the server actually listens on the machine's Tailscale IPv4. CI joins an
 ephemeral, tagged Tailscale node (``tailscale/github-action`` with OAuth) and
@@ -20,7 +20,7 @@ use it. No fakes, no monkeypatched ``subprocess``:
 * ``test_default_bind_list_includes_tailscale_never_wildcard`` -- fed the REAL
   ``tailnet.ip4()``, ``upload_server._bind_addresses(None)`` is exactly
   ``["127.0.0.1", <tailscale ip>]`` and never the ``0.0.0.0`` wildcard.
-* ``test_serve_default_bind_answers_on_tailscale_ip`` -- a real ``multideck
+* ``test_serve_default_bind_answers_on_tailscale_ip`` -- a real ``magent
   serve`` (no ``--host``, so the loopback+Tailscale default) answers ``/health``
   on BOTH ``127.0.0.1`` and the Tailscale IP, and -- proven against the live
   process -- did NOT grab the LAN wildcard: a fresh socket can still bind the
@@ -134,7 +134,7 @@ def _health_ok(host: str, port: int) -> bool:
             if resp.status != 200:
                 return False
             body = json.loads(resp.read())
-            return body.get("ok") is True and body.get("service") == "multideck-upload"
+            return body.get("ok") is True and body.get("service") == "magent-upload"
         finally:
             conn.close()
     except (OSError, ValueError):
@@ -142,11 +142,9 @@ def _health_ok(host: str, port: int) -> bool:
 
 
 def _child_env() -> dict[str, str]:
-    """Child env with no MULTIDECK_* leakage; PATH kept so the child's own
+    """Child env with no MAGENT_* leakage; PATH kept so the child's own
     ``tailnet.ip4()`` still resolves the real ``tailscale`` binary."""
-    return {
-        k: v for k, v in os.environ.items() if not k.upper().startswith("MULTIDECK_")
-    }
+    return {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +156,7 @@ class TestTailnetProbes:
     def test_ip4_agrees_with_real_tailscale(self, tailnet_wire: str) -> None:
         """`tailnet.ip4()` == the first line of real `tailscale ip -4`, and the
         address is a genuine Tailscale CGNAT (100.64.0.0/10) IPv4."""
-        from multideck import tailnet
+        from magent import tailnet
 
         assert tailnet.ip4() == tailnet_wire
         addr = ipaddress.ip_address(tailnet_wire)
@@ -167,7 +165,7 @@ class TestTailnetProbes:
     def test_probe_reports_live_node(self, tailnet_wire: str) -> None:
         """`tailnet.probe()` sees the binary on PATH, the CLI responding, and
         the same IPv4 -- the three-step doctor probe against a real node."""
-        from multideck import tailnet
+        from magent import tailnet
 
         p = tailnet.probe()
         assert p.on_path is True
@@ -178,7 +176,7 @@ class TestTailnetProbes:
         """`tailnet.magicdns_host()` == real `tailscale status --json`
         Self.DNSName with the trailing dot stripped: a non-empty MagicDNS name,
         never a bare label."""
-        from multideck import tailnet
+        from magent import tailnet
 
         r = subprocess.run(
             ["tailscale", "status", "--json"],
@@ -210,7 +208,7 @@ class TestDefaultBindList:
     ) -> None:
         """Fed the real `tailnet.ip4()`, `_bind_addresses(None)` is exactly
         loopback + the Tailscale IP -- the LAN wildcard is never auto-chosen."""
-        from multideck.upload_server import _bind_addresses
+        from magent.upload_server import _bind_addresses
 
         addrs = _bind_addresses(None)
         assert addrs == ["127.0.0.1", tailnet_wire]
@@ -218,7 +216,7 @@ class TestDefaultBindList:
 
 
 # ---------------------------------------------------------------------------
-# 5. A real `multideck serve` answers /health on the Tailscale IP, and did
+# 5. A real `magent serve` answers /health on the Tailscale IP, and did
 #    NOT grab the wildcard
 # ---------------------------------------------------------------------------
 
@@ -227,12 +225,12 @@ class TestServeDefaultBind:
     def test_serve_default_bind_answers_on_tailscale_ip(
         self, tmp_path, tailnet_wire: str
     ) -> None:
-        """A real `multideck serve` with NO --host (the loopback+Tailscale
+        """A real `magent serve` with NO --host (the loopback+Tailscale
         default) answers /health on both 127.0.0.1 and the Tailscale IP, and --
         proven live against the running process -- left the LAN wildcard
         unbound (a fresh socket still binds the runner's LAN IP on that port)."""
         port = _free_port()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         proj = tmp_path / "proj"
         proj.mkdir()
         cfg.write_text(
@@ -260,7 +258,7 @@ class TestServeDefaultBind:
                 [
                     sys.executable,
                     "-m",
-                    "multideck",
+                    "magent",
                     "--config",
                     str(cfg),
                     "serve",

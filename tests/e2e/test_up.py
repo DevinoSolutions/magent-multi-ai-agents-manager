@@ -8,7 +8,7 @@ pytestmark = pytest.mark.e2e
 
 
 def _write_cfg(tmp_path, projects, settings=None):
-    cfg = tmp_path / "multideck.config.json"
+    cfg = tmp_path / "magent.config.json"
     data = {"projects": projects}
     if settings:
         data["settings"] = settings
@@ -18,7 +18,7 @@ def _write_cfg(tmp_path, projects, settings=None):
 
 def _run(cfg, *args):
     return subprocess.run(
-        [sys.executable, "-m", "multideck", "--config", str(cfg), *args],
+        [sys.executable, "-m", "magent", "--config", str(cfg), *args],
         capture_output=True,
         text=True,
     )
@@ -104,7 +104,7 @@ class TestUpJson:
 class TestAttachHelp:
     def test_attach_registered(self):
         r = subprocess.run(
-            [sys.executable, "-m", "multideck", "attach", "--help"],
+            [sys.executable, "-m", "magent", "attach", "--help"],
             capture_output=True,
             text=True,
         )
@@ -115,7 +115,7 @@ class TestAttachHelp:
 class TestServeEnsure:
     def test_ensure_flag_registered(self):
         r = subprocess.run(
-            [sys.executable, "-m", "multideck", "serve", "--help"],
+            [sys.executable, "-m", "magent", "serve", "--help"],
             capture_output=True,
             text=True,
         )
@@ -136,7 +136,7 @@ class TestServeEnsure:
                 [
                     sys.executable,
                     "-m",
-                    "multideck",
+                    "magent",
                     "serve",
                     "-p",
                     str(port),

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from multideck.icons import render_icon
+from magent.icons import render_icon
 
 
 class TestRenderIcon:

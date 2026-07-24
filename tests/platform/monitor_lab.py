@@ -7,7 +7,7 @@ env the monitor-lab CI job provisions.
 
 The lab drives the parsec-vdd virtual-display driver (nomi-san/parsec-vdd
 v0.45.1, WHQL-signed) to fabricate extra monitors with distinct resolutions
-and live per-monitor DPI, so multideck's real tiling pipeline can be exercised
+and live per-monitor DPI, so magent's real tiling pipeline can be exercised
 across a mixed-DPI multi-monitor topology on a headless runner.
 
 Hard-won operational facts baked in (see the spike):
@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from multideck.grid import MonitorRect
+    from magent.grid import MonitorRect
 
 _WIN32 = sys.platform == "win32"
 
@@ -277,7 +277,7 @@ class OVERLAPPED(ctypes.Structure):
 
 def set_dpi_aware() -> None:
     """Make this process per-monitor-DPI-aware so rects/DPI come back physical
-    (matches multideck's own launch-path awareness call)."""
+    (matches magent's own launch-path awareness call)."""
     with contextlib.suppress(OSError, AttributeError):
         user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # PER_MONITOR_V2
         return
@@ -780,8 +780,8 @@ class MonitorLab:
     # -- inspection --------------------------------------------------------
 
     def snapshot(self) -> list[MonitorRect]:
-        """multideck's OWN view of the live topology (physical rects + DPI)."""
-        from multideck.platform import get_platform
+        """magent's OWN view of the live topology (physical rects + DPI)."""
+        from magent.platform import get_platform
 
         plat = get_platform()
         plat.set_dpi_aware()

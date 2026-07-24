@@ -1,4 +1,4 @@
-"""Tests for `multideck doctor` (cli/doctor.py) — every check function in
+"""Tests for `magent doctor` (cli/doctor.py) — every check function in
 isolation with fakes, plus the CLI exit-code and --json contracts."""
 
 from __future__ import annotations
@@ -9,9 +9,9 @@ import subprocess
 import types
 from pathlib import Path
 
-from multideck import cli
-from multideck.cli import doctor
-from multideck.cli.doctor import (
+from magent import cli
+from magent.cli import doctor
+from magent.cli.doctor import (
     FAIL,
     OK,
     WARN,
@@ -23,8 +23,8 @@ from multideck.cli.doctor import (
     _check_upload_port,
     _monitor_topology,
 )
-from multideck.config import SCHEMA_VERSION, load_config
-from multideck.grid import MonitorRect
+from magent.config import SCHEMA_VERSION, load_config
+from magent.grid import MonitorRect
 from tests.conftest import FakePlatform
 
 
@@ -51,14 +51,14 @@ class TestCheckConfig:
 
 class TestCheckEnv:
     def test_invalid_field_fails_naming_the_full_var(self, monkeypatch):
-        monkeypatch.setenv("MULTIDECK_LOG_LEVEL", "BOGUS")
+        monkeypatch.setenv("MAGENT_LOG_LEVEL", "BOGUS")
         status, detail = doctor._check_env()
         assert status == FAIL
-        assert "MULTIDECK_LOG_LEVEL" in detail
+        assert "MAGENT_LOG_LEVEL" in detail
 
     def test_clean_env_is_ok(self, monkeypatch):
         for key in list(os.environ):
-            if key.upper().startswith("MULTIDECK_"):
+            if key.upper().startswith("MAGENT_"):
                 monkeypatch.delenv(key, raising=False)
         assert doctor._check_env()[0] == OK
 
@@ -101,14 +101,14 @@ class TestCheckAgentTools:
 class TestCheckMonitors:
     def test_no_monitors_fails(self, monkeypatch):
         fp = FakePlatform(monitors=[])
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
         status, detail = _check_monitors()
         assert status == FAIL
         assert "tiling" in detail
 
     def test_monitors_ok(self, monkeypatch):
         fp = FakePlatform()
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
         assert _check_monitors()[0] == OK
 
 
@@ -126,7 +126,7 @@ class TestMonitorTopology:
 
     def test_topology_dicts_carry_every_monitorrect_field(self, monkeypatch):
         fp = FakePlatform(monitors=self._two_monitors())
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
         topo = _monitor_topology()
         assert topo == [
             {
@@ -149,7 +149,7 @@ class TestMonitorTopology:
 
     def test_empty_when_no_monitors(self, monkeypatch):
         fp = FakePlatform(monitors=[])
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
         assert _monitor_topology() == []
 
     def test_never_crashes_on_probe_failure(self, monkeypatch):
@@ -157,18 +157,16 @@ class TestMonitorTopology:
             def list_monitors(self):
                 raise OSError("no display")
 
-        monkeypatch.setattr("multideck.platform.get_platform", _Boom)
+        monkeypatch.setattr("magent.platform.get_platform", _Boom)
         assert _monitor_topology() == []
 
     def test_json_envelope_is_additive_and_includes_monitors(
         self, runner, monkeypatch, tmp_config
     ):
         fp = FakePlatform(monitors=self._two_monitors())
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
-        monkeypatch.setattr("multideck.cli.background._probe_port", lambda _p: False)
-        monkeypatch.setattr(
-            "multideck.cli.background._running_upload_port", lambda: None
-        )
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: False)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
         config_path = tmp_config(
             {"version": SCHEMA_VERSION, "projects": [{"path": "api"}]}
         )
@@ -184,11 +182,9 @@ class TestMonitorTopology:
 
     def test_human_output_lists_each_monitor(self, runner, monkeypatch, tmp_config):
         fp = FakePlatform(monitors=self._two_monitors())
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
-        monkeypatch.setattr("multideck.cli.background._probe_port", lambda _p: False)
-        monkeypatch.setattr(
-            "multideck.cli.background._running_upload_port", lambda: None
-        )
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: False)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
         config_path = tmp_config(
             {"version": SCHEMA_VERSION, "projects": [{"path": "api"}]}
         )
@@ -247,18 +243,14 @@ class TestCheckTailscale:
 
 class TestCheckUploadPort:
     def test_free_port_is_ok(self, monkeypatch):
-        monkeypatch.setattr("multideck.cli.background._probe_port", lambda _p: False)
-        monkeypatch.setattr(
-            "multideck.cli.background._running_upload_port", lambda: None
-        )
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: False)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
         status, _ = _check_upload_port(None)
         assert status == OK
 
     def test_foreign_occupant_warns(self, monkeypatch):
-        monkeypatch.setattr("multideck.cli.background._probe_port", lambda _p: True)
-        monkeypatch.setattr(
-            "multideck.cli.background._running_upload_port", lambda: None
-        )
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: True)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
         status, detail = _check_upload_port(None)
         assert status == WARN
         assert "occupied" in detail
@@ -272,7 +264,7 @@ class TestCheckSentry:
 
     def _fake_env(self, monkeypatch, dsn):
         monkeypatch.setattr(
-            "multideck.env.get_env", lambda: types.SimpleNamespace(sentry_dsn=dsn)
+            "magent.env.get_env", lambda: types.SimpleNamespace(sentry_dsn=dsn)
         )
 
     def test_no_dsn_is_ok_and_reports_off(self, monkeypatch):
@@ -283,7 +275,7 @@ class TestCheckSentry:
 
     def test_dsn_with_sdk_installed_is_ok(self, monkeypatch):
         self._fake_env(monkeypatch, "https://example@o0.ingest.sentry.io/0")
-        monkeypatch.setattr("multideck.sentry.sdk_installed", lambda: True)
+        monkeypatch.setattr("magent.sentry.sdk_installed", lambda: True)
         status, detail = _check_sentry()
         assert status == OK
         assert "active" in detail
@@ -292,14 +284,14 @@ class TestCheckSentry:
         self, monkeypatch
     ):
         self._fake_env(monkeypatch, "https://example@o0.ingest.sentry.io/0")
-        monkeypatch.setattr("multideck.sentry.sdk_installed", lambda: False)
+        monkeypatch.setattr("magent.sentry.sdk_installed", lambda: False)
         status, detail = _check_sentry()
         assert status == WARN
         assert "sentry-sdk is missing" in detail
         # sentry-sdk is bundled, so its absence means the install is damaged:
         # the hint must be a repair, not an optional-extra install.
         assert "install looks broken" in detail
-        assert "pip install --force-reinstall multideck" in detail
+        assert "pip install --force-reinstall magent-multi-ai-agents-manager" in detail
         assert "[sentry]" not in detail
 
 
@@ -358,11 +350,9 @@ class TestDoctorCli:
         """No stubbing of _run_checks: the real checks execute against fakes
         and a valid config — proves the composition, not just the runner."""
         fp = FakePlatform()
-        monkeypatch.setattr("multideck.platform.get_platform", lambda: fp)
-        monkeypatch.setattr("multideck.cli.background._probe_port", lambda _p: False)
-        monkeypatch.setattr(
-            "multideck.cli.background._running_upload_port", lambda: None
-        )
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: False)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
         config_path = tmp_config(
             {"version": SCHEMA_VERSION, "projects": [{"path": "api"}]}
         )

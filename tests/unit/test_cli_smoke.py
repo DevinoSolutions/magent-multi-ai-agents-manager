@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from multideck.cli import main
+from magent.cli import main
 
 # The --help matrix is the primary regression net for E6 (cli split): it fails
 # the instant a command is dropped, renamed, or re-parented.
@@ -54,14 +54,14 @@ def test_version(runner):
 def test_docs_runs(runner):
     result = runner.invoke(main, ["docs"])
     assert result.exit_code == 0
-    assert "# multideck Configuration Reference" in result.output
+    assert "# magent Configuration Reference" in result.output
 
 
 def test_docs_example_config_tools_match_default_tools(runner):
     # NF-S3-003: the generated example config's tools block is derived from the
     # factory defaults, so it lists exactly DEFAULT_TOOLS -- no fabricated tool
     # (the old hand-rolled "aider") that is absent from DEFAULT_TOOLS.
-    from multideck.config import DEFAULT_TOOLS
+    from magent.config import DEFAULT_TOOLS
 
     result = runner.invoke(main, ["docs"])
     assert result.exit_code == 0
@@ -143,11 +143,11 @@ def test_termius_prints_block(runner):
     # click.prompt that would otherwise block.
     result = runner.invoke(main, ["termius", "--host", "h.example", "--user", "u"])
     assert result.exit_code == 0
-    assert "Host multideck" in result.output
+    assert "Host magent" in result.output
 
 
 def test_main_dry_run_dispatch(runner, fake_platform, tmp_config, tmp_path):
-    """Pins the whole main -> run_multideck happy-path dispatch: dry-run reaches
+    """Pins the whole main -> run_magent happy-path dispatch: dry-run reaches
     the tiling plan but launches nothing (every launch call is guarded behind
     `not opts.dry_run` in launch.py)."""
     project_dir = tmp_path / "myapp"
@@ -166,7 +166,7 @@ def test_main_dry_run_dispatch(runner, fake_platform, tmp_config, tmp_path):
 
 def test_up_json(runner, tmp_config, monkeypatch):
     monkeypatch.setattr(
-        "multideck.launch.psmux_status", lambda cfg, group=None: ([], [], [])
+        "magent.launch.psmux_status", lambda cfg, group=None: ([], [], [])
     )
     cfgpath = tmp_config({"projects": [{"path": "myapp"}]})
 

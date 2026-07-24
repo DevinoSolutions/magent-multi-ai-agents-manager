@@ -1,4 +1,4 @@
-title = "multideck gitleaks config"
+title = "magent gitleaks config"
 
 [extend]
 useDefault = true

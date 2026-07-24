@@ -1,6 +1,6 @@
 import itertools
 
-from multideck.grid import MonitorRect, TileSlot, compute_grid
+from magent.grid import MonitorRect, TileSlot, compute_grid
 
 
 def _mon(x, y, w, h, primary=False, scale=1.0):

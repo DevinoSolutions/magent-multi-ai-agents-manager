@@ -1,10 +1,10 @@
 """Doctor-report -> monitor-lab replay planner (pure, import-harmless on POSIX).
 
-``multideck doctor --json`` captures a user's exact monitor topology under the
+``magent doctor --json`` captures a user's exact monitor topology under the
 top-level ``monitors`` key (see ``cli/doctor.py``). This module turns one of
 those reports into a :class:`ReplayPlan` the virtual-monitor lab
 (``monitor_lab.py``) can materialize, so a bug-report topology can be replayed
-on a hosted ``windows-latest`` runner and driven through multideck's real
+on a hosted ``windows-latest`` runner and driven through magent's real
 ``--go`` tiling assertions.
 
 Everything here is PURE (no ctypes, no Win32, no driver) so the whole planner
@@ -36,7 +36,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
-from multideck.grid import MonitorRect
+from magent.grid import MonitorRect
 
 # Standard Windows display-scale steps the CCD SetDPI port accepts (mirrors
 # ``monitor_lab.DPI_VALS``). A report scale is snapped to the nearest of these.
@@ -158,7 +158,7 @@ def _monitor_from_dict(raw: object) -> MonitorRect:
 
 
 def parse_doctor_report(text: str) -> list[MonitorRect]:
-    """Parse a ``multideck doctor --json`` blob (or a bare monitors list) into
+    """Parse a ``magent doctor --json`` blob (or a bare monitors list) into
     :class:`MonitorRect`\\ s.
 
     Accepts either the full doctor envelope ``{"ok", "checks", ..., "monitors"}``
@@ -177,8 +177,8 @@ def parse_doctor_report(text: str) -> list[MonitorRect]:
         if "monitors" not in doc:
             raise DoctorReportError(
                 "doctor report has no 'monitors' key -- it was produced by a "
-                "multideck build that predates topology capture. Re-run "
-                "`multideck doctor --json` on a current build."
+                "magent build that predates topology capture. Re-run "
+                "`magent doctor --json` on a current build."
             )
         raw_monitors = doc["monitors"]
     else:

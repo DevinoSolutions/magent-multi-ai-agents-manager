@@ -1,5 +1,5 @@
 name: Feature request
-description: Suggest an idea or improvement for multideck
+description: Suggest an idea or improvement for magent
 title: "[Feature]: "
 labels: [enhancement]
 body:
@@ -14,7 +14,7 @@ body:
     id: solution
     attributes:
       label: Proposed solution
-      description: What would you like multideck to do?
+      description: What would you like magent to do?
     validations:
       required: true
   - type: textarea

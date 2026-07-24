@@ -1,0 +1,69 @@
+{
+  "version": 3,
+  "baseDir": "C:/Users/you/projects",
+  "layout": {
+    "columns": 2,
+    "rows": 1
+  },
+  "settings": {
+    "defaultTool": "claude",
+    "settleSeconds": 3,
+    "launchDelayMs": 400,
+    "happy": false,
+    "psmux": false,
+    "uploadServer": false,
+    "uploadPort": 8033,
+    "windowTitlePrefix": true,
+    "ssh": {
+      "shell": "bash -lc"
+    },
+    "attention": {
+      "badge": true,
+      "flash": true,
+      "toast": false,
+      "ntfy": false,
+      "notifyOnDone": false,
+      "pollIntervalS": 2.0,
+      "stalenessWorkingS": 1800.0,
+      "stalenessNeedsInputS": 3600.0,
+      "debounceS": 300.0,
+      "stateTtlDays": 14
+    },
+    "tools": {
+      "claude": "claude --continue",
+      "codex": "codex",
+      "cursor-agent": "cursor-agent",
+      "agy": "agy"
+    }
+  },
+  "projects": [
+    {
+      "path": "backend/api",
+      "group": "backend",
+      "tool": "claude",
+      "color": "#3b82f6",
+      "enabled": true
+    },
+    {
+      "path": "frontend/web",
+      "group": "frontend",
+      "tool": "codex",
+      "color": "#22c55e",
+      "enabled": true
+    },
+    {
+      "path": "docs-site",
+      "tool": "cursor-agent",
+      "color": "#f59e0b",
+      "enabled": false
+    },
+    {
+      "path": "gpu-worker",
+      "group": "infra",
+      "host": "gpu-box.example.com",
+      "remotePath": "/home/dev/worker",
+      "tool": "codex",
+      "color": "#a855f7"
+    }
+  ]
+}

@@ -11,7 +11,7 @@ class TestLaunchDryRun:
     def test_two_projects_dry_run(self, tmp_path):
         (tmp_path / "api").mkdir()
         (tmp_path / "web").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -27,7 +27,7 @@ class TestLaunchDryRun:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -44,7 +44,7 @@ class TestLaunchDryRun:
     def test_group_filter_dry_run(self, tmp_path):
         (tmp_path / "api").mkdir()
         (tmp_path / "web").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -60,7 +60,7 @@ class TestLaunchDryRun:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "-g",
@@ -77,7 +77,7 @@ class TestLaunchDryRun:
     def test_disabled_project_skipped(self, tmp_path):
         (tmp_path / "api").mkdir()
         (tmp_path / "skip").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -93,7 +93,7 @@ class TestLaunchDryRun:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -107,13 +107,13 @@ class TestLaunchDryRun:
         assert "skip" not in result.stdout.replace("skipped", "")
 
     def test_empty_projects(self, tmp_path):
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(json.dumps({"projects": []}))
         result = subprocess.run(
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",

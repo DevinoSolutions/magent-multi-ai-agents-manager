@@ -1,19 +1,19 @@
-"""The interactive ``multideck`` menu, driven under a REAL pseudo-terminal.
+"""The interactive ``magent`` menu, driven under a REAL pseudo-terminal.
 
 Why this exists: every other test of the no-subcommand interactive path goes
 through Click's ``CliRunner``, which fakes stdin/stdout — it is NOT a terminal,
 so ``sys.stdin.isatty()`` is False and the real first-run/menu branch in
 ``cli/app.py`` never actually executes the way a user hits it. These tests spawn
-the installed module (``python -m multideck``) under a genuine pty (pexpect on
+the installed module (``python -m magent``) under a genuine pty (pexpect on
 POSIX, pywinpty/ConPTY on Windows), assert on what the user literally sees on
 screen, and — for first-run — assert on the config that lands on disk.
 
 Isolation (identical posture to the real-upload/serve tiers): each child runs
 with HOME + the win32 config bases redirected into ``tmp_path`` (so config,
-logs, agent-state all land there, never the real ``~/.multideck``), every
-``MULTIDECK_*`` var stripped, ``NO_COLOR=1`` so click emits plain text, and a
+logs, agent-state all land there, never the real ``~/.magent``), every
+``MAGENT_*`` var stripped, ``NO_COLOR=1`` so click emits plain text, and a
 clean throwaway CWD so first-run discovery can't pick up a stray
-``multideck.config.json``.
+``magent.config.json``.
 
 The three covered flows:
 
@@ -47,12 +47,12 @@ else:
 
 
 def _child_env(home: Path) -> dict[str, str]:
-    """A clean child environment: real PATH etc. preserved, every ``MULTIDECK_*``
+    """A clean child environment: real PATH etc. preserved, every ``MAGENT_*``
     stripped, HOME + config bases redirected into tmp, colour disabled."""
     env = {
         k: v
         for k, v in os.environ.items()
-        if not k.upper().startswith("MULTIDECK_")
+        if not k.upper().startswith("MAGENT_")
         and k.upper() not in ("PYTHONPATH", "PYTHONHOME")
     }
     home_s = str(home)
@@ -75,7 +75,7 @@ def _child_env(home: Path) -> dict[str, str]:
 
 def _spawn(env: dict[str, str], cwd: Path, *args: str) -> Pty:
     return Pty(
-        [sys.executable, "-m", "multideck", *args],
+        [sys.executable, "-m", "magent", *args],
         env=env,
         cwd=str(cwd),
     )
@@ -95,7 +95,7 @@ def _config_json(project_dir: Path, *, group: str | None = None) -> str:
             "projects": [project],
             "settings": {
                 "defaultTool": "probe",
-                "tools": {"probe": "rem multideck-pty-menu-test"},
+                "tools": {"probe": "rem magent-pty-menu-test"},
                 "uploadServer": False,
                 "attention": {
                     "badge": False,
@@ -155,7 +155,7 @@ def test_first_run_discovery_writes_valid_config(tmp_path):
     # config_base() differs per OS (APPDATA on win32, XDG_CONFIG_HOME on Linux,
     # ~/Library/Application Support on macOS) — all rooted under the redirected
     # HOME here, so locate the written config rather than assuming one layout.
-    written = [p for p in home.rglob("config.json") if p.parent.name == "multideck"]
+    written = [p for p in home.rglob("config.json") if p.parent.name == "magent"]
     assert len(written) == 1, (
         f"expected exactly one written config under {home}, got {written}\n"
         f"{pty.transcript}"
@@ -164,7 +164,7 @@ def test_first_run_discovery_writes_valid_config(tmp_path):
     data = json.loads(expected_config.read_text(encoding="utf-8"))
     assert data.get("projects"), "written config has no projects"
     # Prove it parses through the real typed loader, not just as raw JSON.
-    from multideck.config import load_config
+    from magent.config import load_config
 
     cfg = load_config(str(expected_config))
     assert len(cfg.projects) == 1
@@ -180,7 +180,7 @@ def test_main_menu_renders_and_quits(tmp_path):
     work.mkdir()
     project_dir = tmp_path / "proj"
     project_dir.mkdir()
-    cfg = tmp_path / "multideck.config.json"
+    cfg = tmp_path / "magent.config.json"
     cfg.write_text(_config_json(project_dir), encoding="utf-8")
 
     env = _child_env(home)
@@ -206,7 +206,7 @@ def test_menu_group_submenu_and_back(tmp_path):
     work.mkdir()
     project_dir = tmp_path / "proj"
     project_dir.mkdir()
-    cfg = tmp_path / "multideck.config.json"
+    cfg = tmp_path / "magent.config.json"
     cfg.write_text(_config_json(project_dir, group="alpha"), encoding="utf-8")
 
     env = _child_env(home)

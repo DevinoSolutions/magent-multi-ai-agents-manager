@@ -1,4 +1,4 @@
-from multideck.sessions import build_resume_command
+from magent.sessions import build_resume_command
 
 
 class TestBuildResumeCommand:

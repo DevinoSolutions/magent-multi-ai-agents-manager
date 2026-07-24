@@ -10,7 +10,7 @@ pytestmark = pytest.mark.e2e
 class TestCliFlags:
     def test_version(self):
         result = subprocess.run(
-            [sys.executable, "-m", "multideck", "--version"],
+            [sys.executable, "-m", "magent", "--version"],
             capture_output=True,
             text=True,
         )
@@ -19,7 +19,7 @@ class TestCliFlags:
 
     def test_help(self):
         result = subprocess.run(
-            [sys.executable, "-m", "multideck", "--help"],
+            [sys.executable, "-m", "magent", "--help"],
             capture_output=True,
             text=True,
         )
@@ -35,7 +35,7 @@ class TestCliFlags:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--config",
                 str(tmp_path / "nope.json"),
@@ -51,14 +51,14 @@ class TestCliFlags:
         bad = tmp_path / "bad.json"
         bad.write_text("not json{")
         result = subprocess.run(
-            [sys.executable, "-m", "multideck", "--go", "--config", str(bad)],
+            [sys.executable, "-m", "magent", "--go", "--config", str(bad)],
             capture_output=True,
             text=True,
         )
         assert result.returncode != 0
 
     def test_dry_run_no_launch(self, tmp_path):
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -70,7 +70,7 @@ class TestCliFlags:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--dry-run",
                 "--go",
                 "--config",
@@ -88,7 +88,7 @@ class TestCliFlags:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--init",
                 "--base-dir",
                 str(tmp_path),
@@ -105,12 +105,12 @@ class TestCliFlags:
 
     def test_init_writes_config(self, tmp_path):
         (tmp_path / "proj" / ".git").mkdir(parents=True)
-        out = tmp_path / "multideck.config.json"
+        out = tmp_path / "magent.config.json"
         result = subprocess.run(
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--init",
                 "--base-dir",
                 str(tmp_path),

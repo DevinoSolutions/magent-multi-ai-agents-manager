@@ -1,4 +1,4 @@
-"""REAL end-to-end session-resume launch: ``python -m multideck --go`` as a
+"""REAL end-to-end session-resume launch: ``python -m magent --go`` as a
 subprocess, driven against schema-true synthetic Claude/Codex session stores,
 asserting the *actual command line* the spawned terminal receives.
 
@@ -55,8 +55,8 @@ from pathlib import Path
 
 import pytest
 
-from multideck.sessions.claude import encode_claude_project_path
-from multideck.titles import make_title
+from magent.sessions.claude import encode_claude_project_path
+from magent.titles import make_title
 
 pytestmark = pytest.mark.platform
 
@@ -80,13 +80,11 @@ def _wait_until(check, timeout: float, interval: float = 0.25):
 
 
 def _child_env(home: Path, shim_dir: Path) -> dict[str, str]:
-    """Real user env, but: MULTIDECK_* stripped, HOME redirected under tmp_path
+    """Real user env, but: MAGENT_* stripped, HOME redirected under tmp_path
     (so the child's ~/.claude and ~/.codex session scans hit ONLY the fixtures),
     and the benign shim dir prepended to PATH (so a bare ``claude``/``codex``
     resolves to the shim, never the real tool)."""
-    env = {
-        k: v for k, v in os.environ.items() if not k.upper().startswith("MULTIDECK_")
-    }
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
     env["PATH"] = str(shim_dir) + os.pathsep + env.get("PATH", "")
     home_s = str(home)
     env["HOME"] = home_s
@@ -183,7 +181,7 @@ def _write_config(
     windows: list[dict[str, str]],
     happy: bool = False,
 ) -> Path:
-    cfg = tmp_path / "multideck.config.json"
+    cfg = tmp_path / "magent.config.json"
     cfg.write_text(
         json.dumps(
             {
@@ -221,10 +219,10 @@ def _assert_shim_wins(env: dict[str, str], tool: str, shim_dir: Path) -> None:
 def _run_go(
     cfg: Path, env: dict[str, str], tmp_path: Path, timeout: float = 120
 ) -> tuple[int, str, str]:
-    """Run ``multideck --go`` to completion capturing output via FILES, never a
+    """Run ``magent --go`` to completion capturing output via FILES, never a
     pipe: a launched terminal inherits the child's stdout and holds it for the
     life of its command, so a captured PIPE keeps ``run`` blocked on EOF (a
-    multi-minute hang). Files make ``run`` wait only for multideck to exit."""
+    multi-minute hang). Files make ``run`` wait only for magent to exit."""
     out_path = tmp_path / "go.stdout"
     err_path = tmp_path / "go.stderr"
     with (
@@ -232,7 +230,7 @@ def _run_go(
         err_path.open("w", encoding="utf-8") as fe,
     ):
         proc = subprocess.run(
-            [sys.executable, "-m", "multideck", "--go", "--config", str(cfg)],
+            [sys.executable, "-m", "magent", "--go", "--config", str(cfg)],
             stdout=fo,
             stderr=fe,
             timeout=timeout,
@@ -346,7 +344,7 @@ def cleanup_registry():
     """Teardown-as-safety-net: whatever the test registers is closed and verified
     gone even when the body fails; a failed cleanup is a loud teardown error,
     never a leaked real window on the desktop."""
-    from multideck.platform import get_platform
+    from magent.platform import get_platform
 
     reg: dict[str, list[str]] = {"titles": [], "markers": []}
     yield reg
@@ -355,8 +353,8 @@ def cleanup_registry():
 
 
 def _win_launch_ready():
-    from multideck.grid import compute_grid
-    from multideck.platform import get_platform
+    from magent.grid import compute_grid
+    from magent.platform import get_platform
 
     plat = get_platform()
     plat.set_dpi_aware()
@@ -725,7 +723,7 @@ def _linux_kill_and_verify(plat, titles: list[str]) -> list[str]:
 
 @pytest.fixture
 def linux_cleanup():
-    from multideck.platform import get_platform
+    from magent.platform import get_platform
 
     titles: list[str] = []
     yield titles
@@ -741,8 +739,8 @@ def _linux_launch_ready():
         if not shutil.which(tool):
             pytest.skip(f"{tool} not installed: required for the real xterm resume leg")
 
-    from multideck.grid import compute_grid
-    from multideck.platform import get_platform
+    from magent.grid import compute_grid
+    from magent.platform import get_platform
 
     plat = get_platform()
     monitors = plat.list_monitors()

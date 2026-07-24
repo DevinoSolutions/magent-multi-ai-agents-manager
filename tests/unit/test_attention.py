@@ -1,4 +1,4 @@
-"""Unit tests for the attention engine (multideck.attention) and the
+"""Unit tests for the attention engine (magent.attention) and the
 agent_state store additions it reads (all_states, norm_cwd).
 
 Everything runs against a tmp_path STATE_DIR and a fake clock — no real
@@ -15,8 +15,8 @@ import urllib.error
 
 import pytest
 
-from multideck import agent_state, attention
-from multideck.attention import AttentionEngine, name_map_from_projects
+from magent import agent_state, attention
+from magent.attention import AttentionEngine, name_map_from_projects
 
 
 @pytest.fixture
@@ -170,7 +170,7 @@ class TestCorruptRecordWarning:
         _write_record(d, "/ok", agent_state.DONE, 999.0)
         (d / "bad.json").write_text("{not json", encoding="utf-8")
 
-        with caplog.at_level(logging.WARNING, logger="multideck.attention"):
+        with caplog.at_level(logging.WARNING, logger="magent.attention"):
             first = agent_state.all_states()
             second = agent_state.all_states()
 
@@ -189,7 +189,7 @@ class TestCorruptRecordWarning:
         monkeypatch.setattr(agent_state, "_warned_files", set())
         (d / "arr.json").write_text("[1, 2]", encoding="utf-8")
 
-        with caplog.at_level(logging.WARNING, logger="multideck.attention"):
+        with caplog.at_level(logging.WARNING, logger="magent.attention"):
             assert agent_state.all_states() == []
 
         assert any("arr.json" in r.getMessage() for r in caplog.records)
@@ -390,15 +390,15 @@ class TestBadgeRenderer:
         return FakePlatform(windows=windows, supports_attention=True)
 
     def test_badges_attention_states_and_leaves_foreign_windows(self):
-        fp = self._fake({"md:api": 1, "Notepad": 2})
+        fp = self._fake({"magent:api": 1, "Notepad": 2})
         r = attention.BadgeRenderer(fp)
 
         r.render([_view("api", "/a", "needs-input")], [])
 
-        assert fp.titles_set == [(1, "md:[!] api")]
+        assert fp.titles_set == [(1, "magent:[!] api")]
 
     def test_idempotent_when_title_already_correct(self):
-        fp = self._fake({"md:[!] api": 1})
+        fp = self._fake({"magent:[!] api": 1})
         r = attention.BadgeRenderer(fp)
 
         r.render([_view("api", "/a", "needs-input")], [])
@@ -407,15 +407,15 @@ class TestBadgeRenderer:
         assert fp.titles_set == []
 
     def test_unbadges_when_state_goes_quiet(self):
-        fp = self._fake({"md:[!] api": 1})
+        fp = self._fake({"magent:[!] api": 1})
         r = attention.BadgeRenderer(fp)
 
         r.render([_view("api", "/a", "working")], [])
 
-        assert fp.titles_set == [(1, "md:api")]
+        assert fp.titles_set == [(1, "magent:api")]
 
     def test_ignores_md_windows_with_no_session(self):
-        fp = self._fake({"md:api-2": 5})
+        fp = self._fake({"magent:api-2": 5})
         r = attention.BadgeRenderer(fp)
 
         r.render([_view("api", "/a", "error")], [])
@@ -433,7 +433,7 @@ class TestBadgeCollision:
         return FakePlatform(windows=windows, supports_attention=True)
 
     def test_most_urgent_state_wins_on_duplicate_name(self):
-        fp = self._fake({"md:api": 1})
+        fp = self._fake({"magent:api": 1})
         r = attention.BadgeRenderer(fp)
         # two cwds, same display name; needs-input outranks idle. views arrive
         # most-urgent-first, as poll() sorts them.
@@ -443,7 +443,7 @@ class TestBadgeCollision:
 
         # a plain dict comprehension would keep idle (last-wins) and show no
         # badge; urgency-wins de-aliasing keeps the needs-input glyph.
-        assert fp.titles_set == [(1, "md:[!] api")]
+        assert fp.titles_set == [(1, "magent:[!] api")]
 
 
 class TestBadgeCleanup:
@@ -456,19 +456,19 @@ class TestBadgeCleanup:
         return FakePlatform(windows=windows, supports_attention=True)
 
     def test_clear_badges_restores_clean_titles(self):
-        fp = self._fake({"md:api": 1})
+        fp = self._fake({"magent:api": 1})
         r = attention.BadgeRenderer(fp)
         r.render([_view("api", "/a", "needs-input")], [])
-        assert fp.titles_set == [(1, "md:[!] api")]
+        assert fp.titles_set == [(1, "magent:[!] api")]
 
         r.clear_badges()
 
-        assert fp.titles_set[-1] == (1, "md:api")  # glyph stripped on stop
+        assert fp.titles_set[-1] == (1, "magent:api")  # glyph stripped on stop
         r.clear_badges()  # idempotent: nothing left tracked
-        assert fp.titles_set.count((1, "md:api")) == 1
+        assert fp.titles_set.count((1, "magent:api")) == 1
 
     def test_unbadged_window_is_not_touched_on_clear(self):
-        fp = self._fake({"md:api": 1})
+        fp = self._fake({"magent:api": 1})
         r = attention.BadgeRenderer(fp)
         r.render([_view("api", "/a", "working")], [])  # clean state, no badge
 
@@ -477,16 +477,16 @@ class TestBadgeCleanup:
         assert fp.titles_set == []  # nothing was badged, nothing to restore
 
     def test_vanished_session_badge_cleared_next_tick(self):
-        fp = self._fake({"md:api": 1})
+        fp = self._fake({"magent:api": 1})
         r = attention.BadgeRenderer(fp)
         r.render([_view("api", "/a", "error")], [])
-        assert fp.titles_set == [(1, "md:[x] api")]
+        assert fp.titles_set == [(1, "magent:[x] api")]
 
         # the session's record disappears from the store: its name leaves
         # ``desired``, and the badge we set earlier is restored to clean.
         r.render([], [])
 
-        assert fp.titles_set[-1] == (1, "md:api")
+        assert fp.titles_set[-1] == (1, "magent:api")
 
 
 class TestFlashRenderer:
@@ -496,7 +496,7 @@ class TestFlashRenderer:
         return FakePlatform(windows=windows, supports_attention=True)
 
     def test_flashes_on_needs_input_transition(self):
-        fp = self._fake({"md:api": 1})
+        fp = self._fake({"magent:api": 1})
         r = attention.FlashRenderer(fp)
         v = _view("api", "/a", "needs-input")
 
@@ -505,7 +505,7 @@ class TestFlashRenderer:
         assert fp.flashed == [1]
 
     def test_no_flash_without_transition(self):
-        fp = self._fake({"md:api": 1})
+        fp = self._fake({"magent:api": 1})
         r = attention.FlashRenderer(fp)
 
         r.render([_view("api", "/a", "needs-input")], [])
@@ -513,7 +513,7 @@ class TestFlashRenderer:
         assert fp.flashed == []
 
     def test_no_flash_for_quiet_transitions(self):
-        fp = self._fake({"md:api": 1})
+        fp = self._fake({"magent:api": 1})
         r = attention.FlashRenderer(fp)
         v = _view("api", "/a", "done")
 
@@ -531,12 +531,12 @@ class TestToastRenderer:
 
         import logging
 
-        with caplog.at_level(logging.WARNING, logger="multideck.attention"):
+        with caplog.at_level(logging.WARNING, logger="magent.attention"):
             r.render([v], [_trans(v, "working")])
             r.render([v], [_trans(v, "working")])
 
         assert caplog.text.count("winotify") == 1
-        assert "multideck[toast]" in caplog.text
+        assert "magent-multi-ai-agents-manager[toast]" in caplog.text
 
     def test_fires_toast_via_fake_winotify(self, monkeypatch):
         calls: list[dict] = []
@@ -560,8 +560,8 @@ class TestToastRenderer:
 
         assert calls == [
             {
-                "app_id": "multideck",
-                "title": "multideck: api",
+                "app_id": "magent",
+                "title": "magent: api",
                 "msg": "needs-input — waiting on you",
                 "shown": True,
             }
@@ -610,7 +610,7 @@ class TestToastRenderer:
 
         import logging
 
-        with caplog.at_level(logging.WARNING, logger="multideck.attention"):
+        with caplog.at_level(logging.WARNING, logger="magent.attention"):
             r.render([v], [_trans(v, "working")])  # must not raise
 
         assert "toast failed" in caplog.text
@@ -651,7 +651,7 @@ class TestNtfyRenderer:
 
         import logging
 
-        with caplog.at_level(logging.WARNING, logger="multideck.attention"):
+        with caplog.at_level(logging.WARNING, logger="magent.attention"):
             r.render([v], [_trans(v, "working")])
 
         assert "ntfy push failed" in caplog.text
@@ -787,7 +787,7 @@ class TestRunAttentionLoop:
 
         import logging
 
-        with caplog.at_level(logging.INFO, logger="multideck.attention"):
+        with caplog.at_level(logging.INFO, logger="magent.attention"):
             attention.run_attention_loop(engine, [], max_ticks=1, sleep=lambda _s: None)
 
         assert "api" in caplog.text
@@ -820,7 +820,7 @@ class TestRunAttentionLoop:
 
         import logging
 
-        with caplog.at_level(logging.WARNING, logger="multideck.attention"):
+        with caplog.at_level(logging.WARNING, logger="magent.attention"):
             attention.run_attention_loop(
                 engine, [toast, _Recorder()], max_ticks=1, sleep=lambda _s: None
             )

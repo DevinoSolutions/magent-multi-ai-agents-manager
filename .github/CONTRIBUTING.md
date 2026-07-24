@@ -1,6 +1,6 @@
-# Contributing to multideck
+# Contributing to magent
 
-Thanks for your interest in improving multideck! This guide covers local setup,
+Thanks for your interest in improving magent! This guide covers local setup,
 the quality gate every change must pass, and the conventions the codebase
 enforces. Please open an issue to discuss substantial changes before starting,
 so we can agree on the approach.
@@ -14,9 +14,9 @@ npm install                 # one-time: activates the husky git hooks
 
 Optional extras:
 
-- `pip install -e ".[sentry]"` — env-gated Sentry error reporting (`MULTIDECK_SENTRY_DSN`).
-- `pip install -e ".[toast]"` — Windows desktop toast for `multideck attention`.
-- `pip install -e ".[qr]"` — QR code for `multideck mobile`.
+- `pip install -e ".[sentry]"` — env-gated Sentry error reporting (`MAGENT_SENTRY_DSN`).
+- `pip install -e ".[toast]"` — Windows desktop toast for `magent attention`.
+- `pip install -e ".[qr]"` — QR code for `magent mobile`.
 
 ## The quality gate
 
@@ -69,9 +69,9 @@ These are enforced by the gate (ruff TID251 bans + the custom lint) — a violat
 reddens CI:
 
 - **No `typing.Any`** in `src/`. Use `object` + `isinstance` narrowing.
-- **Env access only via `multideck.env`** — `os.environ` / `os.getenv` are banned
+- **Env access only via `magent.env`** — `os.environ` / `os.getenv` are banned
   elsewhere.
-- **Styling via `multideck.style`** — import `style`, never `click.style` directly.
+- **Styling via `magent.style`** — import `style`, never `click.style` directly.
 - **Platform capabilities are gated on `supports_*()` probes**, not bare
   `sys.platform` checks in business logic.
 - **Adding a deeply-integrated agent tool** = one new `sessions/<tool>.py` + one

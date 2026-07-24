@@ -1,14 +1,12 @@
 import json
 
-from multideck import cli
-from multideck.config import MultideckConfig, ProjectConfig, Settings
-from multideck.launch import eligible_psmux_projects
+from magent import cli
+from magent.config import MagentConfig, ProjectConfig, Settings
+from magent.launch import eligible_psmux_projects
 
 
 def _cfg(projects, **settings):
-    return MultideckConfig(
-        projects=projects, base_dir=None, settings=Settings(**settings)
-    )
+    return MagentConfig(projects=projects, base_dir=None, settings=Settings(**settings))
 
 
 class TestEligibleProjects:
@@ -101,13 +99,13 @@ class TestDefaultAttachHost:
                 }
             )
         )
-        monkeypatch.setattr("multideck.cli.attach.find_config", lambda *_: cfgfile)
+        monkeypatch.setattr("magent.cli.attach.find_config", lambda *_: cfgfile)
         assert cli._default_attach_host() == "u@h1"
 
     def test_none_when_no_hosts(self, tmp_path, monkeypatch):
         cfgfile = tmp_path / "c.json"
         cfgfile.write_text(json.dumps({"projects": [{"path": "a"}]}))
-        monkeypatch.setattr("multideck.cli.attach.find_config", lambda *_: cfgfile)
+        monkeypatch.setattr("magent.cli.attach.find_config", lambda *_: cfgfile)
         assert cli._default_attach_host() is None
 
 
@@ -125,16 +123,16 @@ class TestSshJsonParsing:
     def test_skips_banner_lines(self, monkeypatch):
         noisy = 'WARNING: banner\nMOTD line\n{"up": [], "down": []}\n'
         monkeypatch.setattr(
-            "multideck.cli.attach._ssh_capture", lambda *a, **k: (0, noisy, "")
+            "magent.cli.attach._ssh_capture", lambda *a, **k: (0, noisy, "")
         )
-        assert cli._ssh_json("u@h", "multideck up --json") == {"up": [], "down": []}
+        assert cli._ssh_json("u@h", "magent up --json") == {"up": [], "down": []}
 
     def test_returns_none_without_json(self, monkeypatch):
         monkeypatch.setattr(
-            "multideck.cli.attach._ssh_capture",
+            "magent.cli.attach._ssh_capture",
             lambda *a, **k: (255, "no route to host", "err"),
         )
-        assert cli._ssh_json("u@h", "multideck up --json") is None
+        assert cli._ssh_json("u@h", "magent up --json") is None
 
 
 class TestAttachNomux:
@@ -143,7 +141,7 @@ class TestAttachNomux:
     hard-coded literal that could silently drift from the default."""
 
     def _run(self, monkeypatch, projects):
-        from multideck.cli import attach as attach_mod
+        from magent.cli import attach as attach_mod
 
         calls: list[list[str]] = []
         monkeypatch.setattr(
@@ -155,7 +153,7 @@ class TestAttachNomux:
         return calls
 
     def test_fallback_cmd_derived_from_default_tools(self, monkeypatch):
-        from multideck.config import DEFAULT_TOOLS
+        from magent.config import DEFAULT_TOOLS
 
         calls = self._run(monkeypatch, [{"path": "api", "name": "api"}])
         # The remote command is the last Popen argument: `cd <dir> && <cmd>`.

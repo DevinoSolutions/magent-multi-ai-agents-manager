@@ -2,7 +2,7 @@
 
 Coverage today for the upload server is socket/HTTP-level (``test_real_upload``,
 ``test_packaged_serve``): real server, real requests, but no browser. This tier
-closes that gap. It starts the real ``multideck serve`` process on loopback, then
+closes that gap. It starts the real ``magent serve`` process on loopback, then
 drives a real headless Chromium (Playwright) through the exact user gesture — tap
 a project pill, attach a file, let the page's own ``fetch('/upload')`` fire — and
 proves the file the product writes to disk is byte-identical to what was
@@ -10,7 +10,7 @@ attached. It also pins the page's basic contract (title + the pill/file-input
 form) so a template regression fails loudly rather than silently serving a broken
 page.
 
-Nothing about multideck is mocked: the server, the socket, the multipart POST,
+Nothing about magent is mocked: the server, the socket, the multipart POST,
 the file write, and the psmux ``send-keys`` injection all run for real. The one
 substituted piece is the multiplexer *binary*: on the hosted Linux runner there
 is no ``psmux``, so we symlink real ``tmux`` in as ``psmux`` and stand up a real
@@ -93,7 +93,7 @@ def _health_ok(port: int) -> bool:
 
 
 class _BrowserServe:
-    """A real ``multideck serve`` on loopback, backed by a real tmux session
+    """A real ``magent serve`` on loopback, backed by a real tmux session
     reachable through a ``tmux``->``psmux`` symlink, fully isolated in tmp."""
 
     TITLE = "browserproj"  # session_name(title) == title (no . : space)
@@ -121,7 +121,7 @@ class _BrowserServe:
         self.env = self._child_env()
         self.port = _free_port()
 
-        self.cfg = tmp_path / "multideck.config.json"
+        self.cfg = tmp_path / "magent.config.json"
         self.cfg.write_text(
             json.dumps(
                 {
@@ -148,7 +148,7 @@ class _BrowserServe:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--config",
                 str(self.cfg),
                 "serve",
@@ -168,7 +168,7 @@ class _BrowserServe:
         env = {
             k: v
             for k, v in os.environ.items()
-            if not k.upper().startswith("MULTIDECK_")
+            if not k.upper().startswith("MAGENT_")
             and k.upper() not in ("PYTHONPATH", "PYTHONHOME")
         }
         home_s = str(self.home)
@@ -207,7 +207,7 @@ class _BrowserServe:
         state = self.proc.poll()
         self.proc.kill()
         out, err = self.proc.communicate(timeout=30)
-        log = self.home / ".multideck" / "logs" / "upload.log"
+        log = self.home / ".magent" / "logs" / "upload.log"
         log_text = log.read_text(errors="replace") if log.exists() else "<no log>"
         pytest.fail(
             f"serve never healthy on 127.0.0.1:{self.port}; poll={state!r}\n"
@@ -220,7 +220,7 @@ class _BrowserServe:
 
     @property
     def uploads_dir(self) -> Path:
-        return self.home / ".multideck" / "uploads"
+        return self.home / ".magent" / "uploads"
 
     def teardown(self) -> list[str]:
         leftovers: list[str] = []
@@ -258,9 +258,9 @@ def page(serve):
 
 
 def _make_png(path: Path) -> bytes:
-    """Write a real PNG to disk (multideck's own icon renderer) and return its
+    """Write a real PNG to disk (magent's own icon renderer) and return its
     bytes, so the test asserts against exactly what was attached."""
-    from multideck.icons import render_icon
+    from magent.icons import render_icon
 
     data = render_icon(64, True)
     path.write_bytes(data)

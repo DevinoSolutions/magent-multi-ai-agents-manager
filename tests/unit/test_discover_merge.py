@@ -1,4 +1,4 @@
-from multideck.discover import discover_projects
+from magent.discover import discover_projects
 
 
 class TestThreeWayMerge:
@@ -14,7 +14,7 @@ class TestThreeWayMerge:
         project_dir.mkdir(parents=True)
         p = str(project_dir)
 
-        import multideck.discover as discover_mod
+        import magent.discover as discover_mod
 
         monkeypatch.setattr(
             discover_mod,

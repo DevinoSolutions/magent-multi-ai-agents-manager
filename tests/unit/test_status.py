@@ -1,4 +1,4 @@
-"""Unit tests for `multideck status` -- real liveness (HTTP /health + hook
+"""Unit tests for `magent status` -- real liveness (HTTP /health + hook
 heartbeat) instead of presence-only port/pid probes (F-IC-005), plus the new
 degraded exit code and --json (R2's status half).
 
@@ -14,25 +14,25 @@ import json
 import sys
 from pathlib import Path
 
-from multideck import agent_state, cli
+from magent import agent_state, cli
 
 
 def _no_psmux(monkeypatch):
     monkeypatch.setattr(
-        "multideck.launch.psmux_status", lambda cfg, group=None: ([], [], [])
+        "magent.launch.psmux_status", lambda cfg, group=None: ([], [], [])
     )
 
 
 def _both_off(monkeypatch):
     """Baseline: upload server unreachable/absent, listener not running."""
-    monkeypatch.setattr("multideck.cli.status._health_check", lambda port: False)
-    monkeypatch.setattr("multideck.cli.status._probe_port", lambda port: False)
-    monkeypatch.setattr("multideck.upload_server.server_pid", lambda port: None)
-    monkeypatch.setattr("multideck.cli.status.pid_alive", lambda pid: False)
+    monkeypatch.setattr("magent.cli.status._health_check", lambda port: False)
+    monkeypatch.setattr("magent.cli.status._probe_port", lambda port: False)
+    monkeypatch.setattr("magent.upload_server.server_pid", lambda port: None)
+    monkeypatch.setattr("magent.cli.status.pid_alive", lambda pid: False)
     if sys.platform == "win32":
-        monkeypatch.setattr("multideck.hotkey.listener_pid", lambda: None)
+        monkeypatch.setattr("magent.hotkey.listener_pid", lambda: None)
     else:
-        monkeypatch.setattr("multideck.cli.status._listener_state", lambda: "off")
+        monkeypatch.setattr("magent.cli.status._listener_state", lambda: "off")
 
 
 class TestNoConfig:
@@ -98,7 +98,7 @@ class TestUploadServerLiveness:
     def test_health_check_true_means_on_exit_0(self, runner, tmp_config, monkeypatch):
         _no_psmux(monkeypatch)
         _both_off(monkeypatch)
-        monkeypatch.setattr("multideck.cli.status._health_check", lambda port: True)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
         cfgpath = tmp_config({"projects": []})
 
         result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
@@ -112,7 +112,7 @@ class TestUploadServerLiveness:
         # The exact "reports ON while dead" bug (F-IC-005), now surfaced.
         _no_psmux(monkeypatch)
         _both_off(monkeypatch)
-        monkeypatch.setattr("multideck.cli.status._probe_port", lambda port: True)
+        monkeypatch.setattr("magent.cli.status._probe_port", lambda port: True)
         cfgpath = tmp_config({"projects": []})
 
         result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
@@ -125,8 +125,8 @@ class TestUploadServerLiveness:
     ):
         _no_psmux(monkeypatch)
         _both_off(monkeypatch)
-        monkeypatch.setattr("multideck.upload_server.server_pid", lambda port: 4321)
-        monkeypatch.setattr("multideck.cli.status.pid_alive", lambda pid: pid == 4321)
+        monkeypatch.setattr("magent.upload_server.server_pid", lambda port: 4321)
+        monkeypatch.setattr("magent.cli.status.pid_alive", lambda pid: pid == 4321)
         cfgpath = tmp_config({"projects": []})
 
         result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
@@ -142,15 +142,13 @@ class TestListenerLiveness:
         _no_psmux(monkeypatch)
         _both_off(monkeypatch)
         monkeypatch.setattr(
-            "multideck.cli.status._health_check", lambda port: True
+            "magent.cli.status._health_check", lambda port: True
         )  # upload healthy
         if sys.platform == "win32":
-            monkeypatch.setattr("multideck.hotkey.listener_pid", lambda: 9999)
-            monkeypatch.setattr(
-                "multideck.cli.status.heartbeat_fresh", lambda name: False
-            )
+            monkeypatch.setattr("magent.hotkey.listener_pid", lambda: 9999)
+            monkeypatch.setattr("magent.cli.status.heartbeat_fresh", lambda name: False)
         else:
-            monkeypatch.setattr("multideck.cli.status._listener_state", lambda: "stale")
+            monkeypatch.setattr("magent.cli.status._listener_state", lambda: "stale")
         cfgpath = tmp_config({"projects": []})
 
         result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
@@ -165,7 +163,7 @@ class TestJson:
     ):
         _no_psmux(monkeypatch)
         _both_off(monkeypatch)
-        monkeypatch.setattr("multideck.cli.status._health_check", lambda port: True)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
         cfgpath = tmp_config({"projects": []})
 
         result = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
@@ -186,7 +184,7 @@ class TestJson:
         _no_psmux(monkeypatch)
         _both_off(monkeypatch)
         monkeypatch.setattr(
-            "multideck.cli.status._probe_port", lambda port: True
+            "magent.cli.status._probe_port", lambda port: True
         )  # -> dead
         cfgpath = tmp_config({"projects": []})
 
@@ -212,9 +210,9 @@ class TestAttentionLiveness:
     def _attention(self, monkeypatch, *, pid, fresh, age):
         _no_psmux(monkeypatch)
         _both_off(monkeypatch)  # upload + listener both healthy-off
-        monkeypatch.setattr("multideck.cli.attention_cmd.daemon_pid", lambda: pid)
-        monkeypatch.setattr("multideck.cli.status.heartbeat_fresh", lambda name: fresh)
-        monkeypatch.setattr("multideck.cli.status.heartbeat_age", lambda name: age)
+        monkeypatch.setattr("magent.cli.attention_cmd.daemon_pid", lambda: pid)
+        monkeypatch.setattr("magent.cli.status.heartbeat_fresh", lambda name: fresh)
+        monkeypatch.setattr("magent.cli.status.heartbeat_age", lambda name: age)
 
     def test_pid_and_fresh_heartbeat_is_on_exit_0(
         self, runner, tmp_config, monkeypatch
@@ -276,15 +274,15 @@ class TestMenuDownServerReport:
     'Stopped upload server.' regardless of the truthful boolean."""
 
     def _drive(self, monkeypatch, tmp_config, stop_ok):
-        from multideck.cli import status as status_mod
+        from magent.cli import status as status_mod
 
         monkeypatch.setattr(
-            "multideck.launch.psmux_status",
+            "magent.launch.psmux_status",
             lambda cfg, group=None: ([{"name": "api"}], [], []),
         )
-        monkeypatch.setattr("multideck.launch.kill_psmux", lambda targets: None)
-        monkeypatch.setattr("multideck.cli.status._probe_port", lambda port: True)
-        monkeypatch.setattr("multideck.upload_server.stop_server", lambda port: stop_ok)
+        monkeypatch.setattr("magent.launch.kill_psmux", lambda targets: None)
+        monkeypatch.setattr("magent.cli.status._probe_port", lambda port: True)
+        monkeypatch.setattr("magent.upload_server.stop_server", lambda port: stop_ok)
         monkeypatch.setattr(status_mod.click, "prompt", lambda *a, **k: "x")
         monkeypatch.setattr(status_mod.click, "pause", lambda *a, **k: None)
         cfgpath = tmp_config({"version": 2, "projects": [{"path": "api"}]})

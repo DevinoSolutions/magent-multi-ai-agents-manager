@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Single source of truth for the multideck quality gate.
+"""Single source of truth for the magent quality gate.
 
     uv run python scripts/check.py          # full gate (default)
     uv run python scripts/check.py --fast   # pre-commit: seconds, not minutes
@@ -34,9 +34,9 @@ FAST_STEPS: list[tuple[str, list[str]]] = [
             "--error-on-warning",
             # excluded here; checked by the dedicated win32-platform pass below
             "--exclude",
-            "src/multideck/platform/windows.py",
+            "src/magent/platform/windows.py",
             "--exclude",
-            "src/multideck/hotkey.py",
+            "src/magent/hotkey.py",
         ],
     ),
     (
@@ -44,8 +44,8 @@ FAST_STEPS: list[tuple[str, list[str]]] = [
         [
             "ty",
             "check",
-            "src/multideck/platform/windows.py",
-            "src/multideck/hotkey.py",
+            "src/magent/platform/windows.py",
+            "src/magent/hotkey.py",
             "--python-platform",
             "win32",
             "--error-on-warning",
@@ -66,7 +66,7 @@ FULL_ONLY_STEPS: list[tuple[str, list[str]]] = [
             "-m",
             "pytest",
             "tests/unit/",
-            "--cov=multideck",
+            "--cov=magent",
             "--cov-report=term-missing",
             # 52, not 57: the "Lint + Type Check + Coverage" CI job runs this on
             # ubuntu-latest, where platform/windows.py + hotkey.py are 0%-coverable

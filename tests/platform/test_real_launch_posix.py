@@ -1,4 +1,4 @@
-"""REAL end-to-end launch on POSIX: ``python -m multideck --go`` as a subprocess
+"""REAL end-to-end launch on POSIX: ``python -m magent --go`` as a subprocess
 opening two actual terminal windows, tiled by the real platform pipeline -- the
 Linux/macOS sibling of ``test_real_launch.py`` (the win32 tier, PR #45).
 
@@ -6,8 +6,8 @@ What this proves about the user experience (no fakes, no dry-run, no
 monkeypatching):
 
 * a v3 config with two ``windows`` entries launches one real terminal per
-  window, each titled exactly ``md:<name>``;
-* multideck's own launch pipeline -- ``LinuxPlatform.snapshot_windows`` +
+  window, each titled exactly ``magent:<name>``;
+* magent's own launch pipeline -- ``LinuxPlatform.snapshot_windows`` +
   ``move_window`` (wmctrl) -- finds those windows by title and moves them into
   the grid cells ``grid.compute_grid`` derives from the real monitor set;
 * the real windows land inside the screen bounds, in their computed cells,
@@ -25,9 +25,9 @@ Two legs, calibrated to what each CI runner can honestly deliver:
   loud GitHub ``::warning`` + skip. TCC blockage never masquerades as a green
   "tested" leg, and Apple's UI-automation restrictions never fail the job.
 
-Isolation: the child process gets a redirected ``HOME`` (its ``~/.multideck``
+Isolation: the child process gets a redirected ``HOME`` (its ``~/.magent``
 logs and ``~/.claude`` session scans land under tmp_path, never the real user's)
-and no ambient ``MULTIDECK_*`` vars; ``DISPLAY`` is inherited. The configured
+and no ambient ``MAGENT_*`` vars; ``DISPLAY`` is inherited. The configured
 tool is a benign ``sleep`` -- real terminals, real command execution, zero cost,
 NEVER a real ``claude``/``codex``. Cleanup closes exactly the uuid-titled
 windows (and kills the child pids they own) and verifies none survive, failing
@@ -85,12 +85,10 @@ class _Rect:
 
 def _child_env(home) -> dict[str, str]:
     """Env for the child: the real user env, but HOME redirected under tmp_path
-    (so its ~/.multideck logs and ~/.claude session scan never touch the real
-    user's) and every MULTIDECK_* var stripped. DISPLAY is left intact so the
+    (so its ~/.magent logs and ~/.claude session scan never touch the real
+    user's) and every MAGENT_* var stripped. DISPLAY is left intact so the
     child talks to the same X server this test polls."""
-    env = {
-        k: v for k, v in os.environ.items() if not k.upper().startswith("MULTIDECK_")
-    }
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
     home_s = str(home)
     env["HOME"] = home_s
     # Point XDG dirs into the sandbox home too, so a stray ~/.config write can't
@@ -133,7 +131,7 @@ def _write_two_window_config(tmp_path, unique: str) -> tuple[str, list[str], obj
     ``(config_path, [title_a, title_b], home_dir)``."""
     name_a = f"mdrl{unique}a"
     name_b = f"mdrl{unique}b"
-    from multideck.titles import make_title
+    from magent.titles import make_title
 
     title_a, title_b = make_title(name_a), make_title(name_b)
 
@@ -141,7 +139,7 @@ def _write_two_window_config(tmp_path, unique: str) -> tuple[str, list[str], obj
     proj.mkdir()
     home = tmp_path / "home"
     home.mkdir()
-    cfg = tmp_path / "multideck.config.json"
+    cfg = tmp_path / "magent.config.json"
     cfg.write_text(
         json.dumps(
             {
@@ -171,12 +169,12 @@ def _write_two_window_config(tmp_path, unique: str) -> tuple[str, list[str], obj
 
 
 def _run_go(cfg: str, home, tmp_path, timeout: float = 90) -> tuple[int, str, str]:
-    """Run ``multideck --go`` to completion, capturing output via FILES, not a
+    """Run ``magent --go`` to completion, capturing output via FILES, not a
     pipe. Critical: the launched terminal (xterm/Terminal) inherits the child's
     stdout/stderr and holds it open for the life of its ``sleep`` -- a captured
     PIPE keeps ``subprocess.run`` blocked on EOF for the whole sleep (a 120s
     hang, observed on both Linux and macOS). Redirecting to files makes run()
-    wait only for the multideck process itself to exit. Returns
+    wait only for the magent process itself to exit. Returns
     ``(returncode, stdout, stderr)``."""
     out_path = tmp_path / "go.stdout"
     err_path = tmp_path / "go.stderr"
@@ -185,7 +183,7 @@ def _run_go(cfg: str, home, tmp_path, timeout: float = 90) -> tuple[int, str, st
         err_path.open("w", encoding="utf-8") as fe,
     ):
         proc = subprocess.run(
-            [sys.executable, "-m", "multideck", "--go", "--config", cfg],
+            [sys.executable, "-m", "magent", "--go", "--config", cfg],
             stdout=fo,
             stderr=fe,
             timeout=timeout,
@@ -347,7 +345,7 @@ def linux_cleanup():
     """Teardown-as-safety-net: whatever the test registers is closed and
     verified gone even if the body fails, so a broken assertion never leaks a
     real xterm. A failed cleanup is a loud teardown error."""
-    from multideck.platform import get_platform
+    from magent.platform import get_platform
 
     titles: list[str] = []
     yield titles
@@ -374,8 +372,8 @@ def test_go_launches_real_tiled_xterms_linux(tmp_path, linux_cleanup, capsys):
             "(start one in setup-virtual-displays)"
         )
 
-    from multideck.grid import compute_grid
-    from multideck.platform import get_platform
+    from magent.grid import compute_grid
+    from magent.platform import get_platform
 
     plat = get_platform()
     monitors = plat.list_monitors()
@@ -395,17 +393,19 @@ def test_go_launches_real_tiled_xterms_linux(tmp_path, linux_cleanup, capsys):
         f"tiling gave up on a window (snapshot_windows/move_window):\n{out}"
     )
 
-    # 1. Both REAL windows exist with the exact md: titles -- belt and braces:
+    # 1. Both REAL windows exist with the exact magent: titles -- belt and braces:
     #    the platform's own find_window AND raw xdotool must agree.
     both = _wait_until(
         lambda: bool(_xdotool_ids(title_a)) and bool(_xdotool_ids(title_b)),
         timeout=20,
     )
     visible = [
-        t for t in plat.snapshot_windows() if isinstance(t, str) and t.startswith("md:")
+        t
+        for t in plat.snapshot_windows()
+        if isinstance(t, str) and t.startswith("magent:")
     ]
     assert both, (
-        f"expected xterms {title_a!r} and {title_b!r}; md: windows seen: {visible}"
+        f"expected xterms {title_a!r} and {title_b!r}; magent: windows seen: {visible}"
     )
     assert plat.find_window(title_a) is not None, f"find_window missed {title_a!r}"
     assert plat.find_window(title_b) is not None, f"find_window missed {title_b!r}"
@@ -542,13 +542,13 @@ def test_go_launches_real_tiled_terminals_macos(tmp_path, capsys):
             capsys,
             "macOS Terminal automation blocked (TCC)",
             "Terminal.app 'do script' automation is not permitted (a separate TCC "
-            "bucket from System Events); multideck cannot launch windows here, so "
+            "bucket from System Events); magent cannot launch windows here, so "
             "the macOS real-render leg is skipped (not a green pass).",
         )
         pytest.skip("Terminal automation blocked (TCC): cannot launch windows")
 
-    from multideck.grid import compute_grid
-    from multideck.platform import get_platform
+    from magent.grid import compute_grid
+    from magent.platform import get_platform
 
     plat = get_platform()
     monitors = plat.list_monitors()
@@ -570,7 +570,7 @@ def test_go_launches_real_tiled_terminals_macos(tmp_path, capsys):
             _emit_ci_warning(
                 capsys,
                 "macOS real render unattainable",
-                "multideck --go did not complete in time on this runner "
+                "magent --go did not complete in time on this runner "
                 "(Terminal/System Events UI automation too slow or blocked); "
                 "skipping the macOS geometry assertion (not a green pass).",
             )
@@ -579,7 +579,7 @@ def test_go_launches_real_tiled_terminals_macos(tmp_path, capsys):
             _emit_ci_warning(
                 capsys,
                 "macOS real render unattainable",
-                f"multideck --go exited {rc} on this runner; skipping the macOS "
+                f"magent --go exited {rc} on this runner; skipping the macOS "
                 f"geometry assertion (not a green pass).\nstderr:\n{err}",
             )
             pytest.skip(f"--go exited {rc} (UI automation restricted)")
@@ -593,13 +593,13 @@ def test_go_launches_real_tiled_terminals_macos(tmp_path, capsys):
             seen = [
                 t
                 for t in plat.snapshot_windows()
-                if isinstance(t, str) and t.startswith("md:")
+                if isinstance(t, str) and t.startswith("magent:")
             ]
             _emit_ci_warning(
                 capsys,
                 "macOS real render unattainable",
-                "Terminal did not yield both md: windows on this runner "
-                f"(TCC-restricted UI automation); md: windows seen: {seen}.",
+                "Terminal did not yield both magent: windows on this runner "
+                f"(TCC-restricted UI automation); magent: windows seen: {seen}.",
             )
             pytest.skip("Terminal did not materialise the windows (TCC-restricted)")
 

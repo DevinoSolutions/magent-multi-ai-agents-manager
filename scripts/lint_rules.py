@@ -8,28 +8,28 @@ snippet in ``tests/unit/test_lint_rules.py``.
 
 Rules
 -----
-MD001  No ``sys.exit(...)`` / ``raise SystemExit`` outside ``src/multideck/cli/``.
+MD001  No ``sys.exit(...)`` / ``raise SystemExit`` outside ``src/magent/cli/``.
        Subsystems return ints or raise; the exit decision lives in the shells.
-MD002  No ``sys.platform`` outside ``src/multideck/platform/`` unless the file is
+MD002  No ``sys.platform`` outside ``src/magent/platform/`` unless the file is
        on the reasoned MD002_ALLOW list (genuinely OS-behavioral dispatch, not a
        capability gate — capability questions use ``Platform.supports_*()``).
-MD003  No ``"md:"`` string / f-string literal outside ``titles.py`` and
+MD003  No ``"magent:"`` string / f-string literal outside ``titles.py`` and
        ``cli/attach.py``. The window-title prefix is built only from
-       ``titles.MD_TITLE_PREFIX``.
+       ``titles.MAGENT_TITLE_PREFIX``.
 MD004  Every suppression comment (``# noqa`` / ``# type: ignore`` / ``# ty: ignore``)
        must carry a ``reason:`` text — the no-naked-suppressions policy, mechanized.
 MD005  No *module-level* import of a heavy subsystem (``launch``, ``upload_server``,
        ``discover``, ``agent_state``, ``attention``, ``hotkey``, and the platform
        backends ``platform.windows`` / ``macos`` / ``linux``) inside
-       ``src/multideck/cli/``. The cli registration hub imports every command module
-       eagerly, so a top-level heavy import makes ``multideck --help`` pay that
+       ``src/magent/cli/``. The cli registration hub imports every command module
+       eagerly, so a top-level heavy import makes ``magent --help`` pay that
        subsystem's startup cost — they are imported in-body instead. Exempt:
-       ``from multideck.platform import get_platform`` (the package ``__init__`` is
+       ``from magent.platform import get_platform`` (the package ``__init__`` is
        light; only the OS backend modules are heavy) and ``if TYPE_CHECKING:`` imports
        (never executed at runtime).
 
-Scopes: MD001/002/003 apply to ``src/multideck/`` only; MD005 to
-``src/multideck/cli/`` only; MD004 applies to ``src`` + ``scripts`` + ``tests``.
+Scopes: MD001/002/003 apply to ``src/magent/`` only; MD005 to
+``src/magent/cli/`` only; MD004 applies to ``src`` + ``scripts`` + ``tests``.
 """
 
 from __future__ import annotations
@@ -43,57 +43,57 @@ from typing import NamedTuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-SRC_PREFIX = "src/multideck/"
-CLI_PREFIX = "src/multideck/cli/"
-PLATFORM_PREFIX = "src/multideck/platform/"
+SRC_PREFIX = "src/magent/"
+CLI_PREFIX = "src/magent/cli/"
+PLATFORM_PREFIX = "src/magent/platform/"
 
 # MD002: files outside platform/** that legitimately branch on sys.platform for
 # OS-behavioral dispatch — path/env semantics, process primitives, editor /
 # terminal / console commands. None are capability-gates-in-disguise (those use
 # Platform.supports_*()). Each entry is (relpath -> why it is OS-behavioral).
 MD002_ALLOW = {
-    "src/multideck/paths.py": "config-dir location is per-OS (APPDATA / XDG / Library)",
-    "src/multideck/discover.py": "session-store paths, path separators, FS case-folding",
-    "src/multideck/agent_state.py": "state-store path differs per OS",
-    "src/multideck/launch.py": "Windows job-object breakaway in spawn_detached",
-    "src/multideck/upload_server.py": "taskkill vs os.kill process termination",
-    "src/multideck/cli/attention_cmd.py": "taskkill vs os.kill process termination",
-    "src/multideck/cli/watch.py": "non-blocking keypress polling is per-OS (msvcrt vs select)",
-    "src/multideck/cli/doctor.py": "terminal-emulator candidates are per-OS (wt vs POSIX list)",
-    "src/multideck/hotkey.py": "module is Windows-only by construction (raises off-win32)",
-    "src/multideck/sessions/codex.py": "FS case-insensitivity for session-path matching",
-    "src/multideck/cli/ui.py": "OS-specific editor command + Windows console UTF-8 fix",
-    "src/multideck/procs.py": "OpenProcess vs os.kill pid-liveness primitive",
-    "src/multideck/cli/session_picker.py": "terminal reset (cls vs stty/tput) is per-OS",
-    "src/multideck/cli/attach.py": "reports the sys.platform value in JSON status (data, not a gate)",
-    "src/multideck/env.py": "host-env readers (config_base, vscode_storage_base) select per-OS default directories",
-    "src/multideck/lockfile.py": "msvcrt.locking (Windows) vs fcntl.flock (Unix) — each OS has a different locking API",
-    "src/multideck/psmux.py": "psmux binary fallback path is per-OS (LOCALAPPDATA on Windows)",
+    "src/magent/paths.py": "config-dir location is per-OS (APPDATA / XDG / Library)",
+    "src/magent/discover.py": "session-store paths, path separators, FS case-folding",
+    "src/magent/agent_state.py": "state-store path differs per OS",
+    "src/magent/launch.py": "Windows job-object breakaway in spawn_detached",
+    "src/magent/upload_server.py": "taskkill vs os.kill process termination",
+    "src/magent/cli/attention_cmd.py": "taskkill vs os.kill process termination",
+    "src/magent/cli/watch.py": "non-blocking keypress polling is per-OS (msvcrt vs select)",
+    "src/magent/cli/doctor.py": "terminal-emulator candidates are per-OS (wt vs POSIX list)",
+    "src/magent/hotkey.py": "module is Windows-only by construction (raises off-win32)",
+    "src/magent/sessions/codex.py": "FS case-insensitivity for session-path matching",
+    "src/magent/cli/ui.py": "OS-specific editor command + Windows console UTF-8 fix",
+    "src/magent/procs.py": "OpenProcess vs os.kill pid-liveness primitive",
+    "src/magent/cli/session_picker.py": "terminal reset (cls vs stty/tput) is per-OS",
+    "src/magent/cli/attach.py": "reports the sys.platform value in JSON status (data, not a gate)",
+    "src/magent/env.py": "host-env readers (config_base, vscode_storage_base) select per-OS default directories",
+    "src/magent/lockfile.py": "msvcrt.locking (Windows) vs fcntl.flock (Unix) — each OS has a different locking API",
+    "src/magent/psmux.py": "psmux binary fallback path is per-OS (LOCALAPPDATA on Windows)",
 }
 
-# MD003: the only two src files allowed to hold a literal "md:".
-MD003_ALLOW = {"src/multideck/titles.py", "src/multideck/cli/attach.py"}
+# MD003: the only two src files allowed to hold a literal "magent:".
+MD003_ALLOW = {"src/magent/titles.py", "src/magent/cli/attach.py"}
 
 # MD004: a comment is a suppression directive when, after its leading '#' and
 # spaces, it *begins* with one of these — so prose that merely mentions the word
 # (or a marker inside a string literal, which is not a COMMENT token) is exempt.
 _SUPPRESSION_STARTS = ("noqa", "type: ignore", "type:ignore", "ty: ignore", "ty:ignore")
 
-# MD005: fully-qualified module paths a src/multideck/cli/ module must not import
+# MD005: fully-qualified module paths a src/magent/cli/ module must not import
 # at module level (they are imported in-body per the startup-cost policy). Only
 # the OS backend modules under platform/ are heavy; the platform package __init__
 # (get_platform / find_psmux) is light and stays importable at the top.
 HEAVY_CLI_IMPORTS = frozenset(
     {
-        "multideck.launch",
-        "multideck.upload_server",
-        "multideck.discover",
-        "multideck.agent_state",
-        "multideck.attention",
-        "multideck.hotkey",
-        "multideck.platform.windows",
-        "multideck.platform.macos",
-        "multideck.platform.linux",
+        "magent.launch",
+        "magent.upload_server",
+        "magent.discover",
+        "magent.agent_state",
+        "magent.attention",
+        "magent.hotkey",
+        "magent.platform.windows",
+        "magent.platform.macos",
+        "magent.platform.linux",
     }
 )
 
@@ -134,14 +134,25 @@ def _is_sys_platform(node: ast.AST) -> bool:
     )
 
 
+def _is_title_prefix(text: str) -> bool:
+    """True if ``text`` begins a hand-built window title.
+
+    Window titles are ``magent:name`` or ``magent:[!] name`` — the colon is
+    always followed immediately by the name or a ``[badge]``, never by a space.
+    So ``"magent: foo"`` (colon + space) is a brand/notification/message prefix
+    (e.g. ``magent: needs input``), not a title, and is exempt.
+    """
+    return text.startswith("magent:") and not text.startswith("magent: ")
+
+
 def _starts_md(node: ast.AST) -> bool:
-    """True if node is a str literal, or an f-string, whose text begins 'md:'."""
+    """True if node is a str literal, or an f-string, whose text begins the title prefix."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value.startswith("md:")
+        return _is_title_prefix(node.value)
     if isinstance(node, ast.JoinedStr) and node.values:
         first = node.values[0]
         if isinstance(first, ast.Constant) and isinstance(first.value, str):
-            return first.value.startswith("md:")
+            return _is_title_prefix(first.value)
     return False
 
 
@@ -206,7 +217,7 @@ def _imported_module_paths(node: ast.stmt, pkg_parts: list[str]) -> set[str]:
 
 
 def _heavy_import_findings(rel: str, tree: ast.Module) -> list[Finding]:
-    """MD005 — module-level heavy-subsystem imports inside src/multideck/cli/."""
+    """MD005 — module-level heavy-subsystem imports inside src/magent/cli/."""
     pkg_parts = rel.removeprefix("src/").removesuffix(".py").split("/")[:-1]
     out: list[Finding] = []
     for node in _runtime_toplevel_imports(tree):
@@ -220,14 +231,14 @@ def _heavy_import_findings(rel: str, tree: ast.Module) -> list[Finding]:
                     "MD005",
                     f"module-level import of heavy subsystem '{sorted(hits)[0]}' inside "
                     "cli/ — import it in-body (grep 'heavy subsystem: in-body per policy') "
-                    "so `multideck --help` does not pay its startup cost",
+                    "so `magent --help` does not pay its startup cost",
                 )
             )
     return out
 
 
 def _ast_rules(rel: str, source: str) -> list[Finding]:
-    """MD001/002/003 (src/multideck/) + MD005 (src/multideck/cli/)."""
+    """MD001/002/003 (src/magent/) + MD005 (src/magent/cli/)."""
     out: list[Finding] = []
     try:
         tree = ast.parse(source, filename=rel)
@@ -248,7 +259,7 @@ def _ast_rules(rel: str, source: str) -> list[Finding]:
     md003_allowed = rel in MD003_ALLOW
 
     # Constants that are pieces of an f-string are counted via their JoinedStr
-    # parent (below), never again as standalone literals — so f"md:{x}" flags once.
+    # parent (below), never again as standalone literals — so f"magent:{x}" flags once.
     fstring_pieces = {
         id(v)
         for node in ast.walk(tree)
@@ -287,7 +298,7 @@ def _ast_rules(rel: str, source: str) -> list[Finding]:
                     line,
                     col,
                     "MD003",
-                    'string literal starting "md:" — the window-title prefix is built only from titles.MD_TITLE_PREFIX',
+                    'string literal starting "magent:" — the window-title prefix is built only from titles.MAGENT_TITLE_PREFIX',
                 )
             )
     if in_cli:

@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from multideck.grid import MonitorRect, compute_grid
+from magent.grid import MonitorRect, compute_grid
 
 _FIXTURES = Path(__file__).parent.parent / "platform" / "fixtures" / "topologies"
 

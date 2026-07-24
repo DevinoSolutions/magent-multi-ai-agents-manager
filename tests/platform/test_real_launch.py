@@ -1,11 +1,11 @@
-"""REAL end-to-end launch: `python -m multideck --go` as a subprocess opening
+"""REAL end-to-end launch: `python -m magent --go` as a subprocess opening
 two actual Windows Terminal windows, tiled by the real Win32 pipeline.
 
 What this proves about the user experience (no fakes, no monkeypatching):
 
 * a v3 config with per-window ``tool`` overrides (``windows: [{...}]``, PR
   #40/#41) launches one real terminal per window entry, titled exactly
-  ``md:<name>``;
+  ``magent:<name>``;
 * the real windows land inside the virtual screen, in the grid cells that
   ``grid.compute_grid`` derives from the real monitor set, without overlap;
 * the override window's real OS process runs the override tool's command and
@@ -13,7 +13,7 @@ What this proves about the user experience (no fakes, no monkeypatching):
   Win32_Process command lines + creation order).
 
 Isolation: the child process gets a redirected HOME/USERPROFILE (its
-``~/.multideck`` logs land in tmp_path) and a ``--config`` in tmp_path. The
+``~/.magent`` logs land in tmp_path) and a ``--config`` in tmp_path. The
 configured "tools" are benign ``cmd /k rem <uuid>`` commands -- real terminals,
 real command execution, zero cost. Cleanup closes exactly the two uuid-titled
 windows and verifies both the windows and their cmd.exe processes are gone.
@@ -53,12 +53,10 @@ _OVERLAP_TOL = 48  # px: max tolerated intrusion into the neighbour cell
 
 def _child_env(home) -> dict[str, str]:
     """Env for child processes: real user env, but HOME redirected so the
-    child's ~/.multideck (logs, state, pid files) lands under tmp_path, and no
-    ambient MULTIDECK_* vars leak in. Exactly what a real user with that home
+    child's ~/.magent (logs, state, pid files) lands under tmp_path, and no
+    ambient MAGENT_* vars leak in. Exactly what a real user with that home
     directory would experience."""
-    env = {
-        k: v for k, v in os.environ.items() if not k.upper().startswith("MULTIDECK_")
-    }
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
     home_s = str(home)
     drive, tail = os.path.splitdrive(home_s)
     env["USERPROFILE"] = home_s
@@ -193,7 +191,7 @@ def cleanup_registry():
     """Teardown-as-safety-net: whatever the test registers is closed and
     verified gone even when the test body fails; a failed cleanup is a loud
     teardown error, never a leaked real window on the user's desktop."""
-    from multideck.platform import get_platform
+    from magent.platform import get_platform
 
     reg: dict[str, list[str]] = {"titles": [], "markers": []}
     yield reg
@@ -225,8 +223,8 @@ def _assert_rect_matches_slot(rect: _WinRect, slot, label: str) -> None:
 def test_per_window_tool_override_launches_real_tiled_windows(
     tmp_path, cleanup_registry
 ):
-    from multideck.grid import compute_grid
-    from multideck.platform import get_platform
+    from magent.grid import compute_grid
+    from magent.platform import get_platform
 
     plat = get_platform()
     plat.set_dpi_aware()
@@ -239,7 +237,7 @@ def test_per_window_tool_override_launches_real_tiled_windows(
     unique = uuid.uuid4().hex[:10]
     name_a = f"mdrl{unique}a"  # default-tool window
     name_b = f"mdrl{unique}b"  # override-tool window
-    title_a, title_b = f"md:{name_a}", f"md:{name_b}"
+    title_a, title_b = f"magent:{name_a}", f"magent:{name_b}"
     marker_a = f"mdrl-default-{unique}"
     marker_b = f"mdrl-override-{unique}"
 
@@ -247,7 +245,7 @@ def test_per_window_tool_override_launches_real_tiled_windows(
     proj.mkdir()
     home = tmp_path / "home"
     home.mkdir()
-    cfg = tmp_path / "multideck.config.json"
+    cfg = tmp_path / "magent.config.json"
     cfg.write_text(
         json.dumps(
             {
@@ -282,7 +280,7 @@ def test_per_window_tool_override_launches_real_tiled_windows(
     cleanup_registry["markers"] = [marker_a, marker_b]
 
     result = subprocess.run(
-        [sys.executable, "-m", "multideck", "--go", "--config", str(cfg)],
+        [sys.executable, "-m", "magent", "--go", "--config", str(cfg)],
         capture_output=True,
         text=True,
         timeout=180,
@@ -293,7 +291,7 @@ def test_per_window_tool_override_launches_real_tiled_windows(
         f"tiling gave up on a window:\n{result.stdout}"
     )
 
-    # 1. Both REAL windows exist with the exact expected md: titles.
+    # 1. Both REAL windows exist with the exact expected magent: titles.
     #    Slow/overloaded CI VMs can take far longer than a couple of seconds to
     #    actually materialize the wt windows (observed CI flake: window title
     #    "not found"). Poll window enumeration ~1s up to a generous 90s deadline,
@@ -307,8 +305,8 @@ def test_per_window_tool_override_launches_real_tiled_windows(
         interval=1.0,
     )
     assert handles, (
-        f"expected windows {title_a!r} and {title_b!r}; md: windows visible: "
-        f"{[t for t in plat.snapshot_windows() if t.startswith('md:')]}"
+        f"expected windows {title_a!r} and {title_b!r}; magent: windows visible: "
+        f"{[t for t in plat.snapshot_windows() if t.startswith('magent:')]}"
     )
 
     rect_a = _get_window_rect(handles[title_a])

@@ -4,36 +4,36 @@ import os
 import pytest
 from click.testing import CliRunner
 
-from multideck import agent_state, env, log
-from multideck.grid import MonitorRect
-from multideck.platform import (
+from magent import agent_state, env, log
+from magent.grid import MonitorRect
+from magent.platform import (
     Platform,
     PsmuxWindowOpts,
     TerminalLaunchOpts,
     VSCodeLaunchOpts,
 )
-from multideck.titles import get_leaf_name
+from magent.titles import get_leaf_name
 
 
 @pytest.fixture(autouse=True)
-def _isolate_multideck_home(tmp_path, monkeypatch):
+def _isolate_magent_home(tmp_path, monkeypatch):
     """Every test's log/heartbeat/agent-state/env-file reads and writes land
-    under tmp_path, never the real ~/.multideck -- autouse so no test can
+    under tmp_path, never the real ~/.magent -- autouse so no test can
     forget it (and so a developer machine's live agent-state records or
-    ~/.multideck/.env can't leak into assertions)."""
+    ~/.magent/.env can't leak into assertions)."""
     monkeypatch.setattr(log, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(log, "HEARTBEAT_DIR", tmp_path / "hb")
     monkeypatch.setattr(agent_state, "STATE_DIR", tmp_path / "agent-state")
     monkeypatch.setattr(env, "ENV_FILE", tmp_path / "env-file")
     monkeypatch.setattr(env, "_cached_env", None)
     # Isolating ENV_FILE (above) is not enough: an exported process-env
-    # MULTIDECK_* var (a dev shell's real MULTIDECK_SENTRY_DSN) is still read by
+    # MAGENT_* var (a dev shell's real MAGENT_SENTRY_DSN) is still read by
     # get_env(), and on 2026-07-07 that leaked fake test errors to prod Sentry
-    # (MULTIDECK-1..4). Strip every MULTIDECK_* key so no test can init real
+    # (MAGENT-1..4). Strip every MAGENT_* key so no test can init real
     # Sentry or see ambient config -- unknown keys swept too, matching env.py's
     # own closed-schema scan.
     for _key in list(os.environ):
-        if _key.upper().startswith("MULTIDECK_"):
+        if _key.upper().startswith("MAGENT_"):
             monkeypatch.delenv(_key, raising=False)
     log.reset_logging()
     yield
@@ -45,7 +45,7 @@ def tmp_config(tmp_path):
     """Write a config dict to a temp JSON file and return the path."""
 
     def _write(config_dict):
-        p = tmp_path / "multideck.config.json"
+        p = tmp_path / "magent.config.json"
         p.write_text(json.dumps(config_dict))
         return str(p)
 
@@ -93,7 +93,7 @@ def fake_codex_sessions(tmp_path):
 class FakePlatform(Platform):
     """Test double for Platform -- records calls instead of touching real
     windows/monitors/psmux. Reused by E5 to unit-test the decomposed
-    run_multideck pieces (see tests/unit/test_platform_contract.py)."""
+    run_magent pieces (see tests/unit/test_platform_contract.py)."""
 
     def __init__(
         self,
@@ -192,5 +192,5 @@ def runner():
 @pytest.fixture
 def fake_platform(monkeypatch):
     fp = FakePlatform()
-    monkeypatch.setattr("multideck.launch.get_platform", lambda: fp)
+    monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
     return fp

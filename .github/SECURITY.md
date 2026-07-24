@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-multideck follows semantic versioning. Security fixes land on the latest `1.0.x`
+magent follows semantic versioning. Security fixes land on the latest `1.0.x`
 release line published to PyPI.
 
 | Version | Supported          |
@@ -17,10 +17,10 @@ before a fix is available puts every user at risk.
 
 Report privately through GitHub's Private Vulnerability Reporting:
 
-1. Open the [**Security** tab](https://github.com/DevinoSolutions/multideck-ai-agents-manager/security)
+1. Open the [**Security** tab](https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/security)
    of the repository.
 2. Click **Report a vulnerability** to file a private advisory:
-   <https://github.com/DevinoSolutions/multideck-ai-agents-manager/security/advisories/new>
+   <https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/security/advisories/new>
 
 If you are unable to use GitHub's reporting flow, email **amin@devino.ca**
 instead.
@@ -31,13 +31,13 @@ reasonable window to release a patch before any public disclosure.
 
 ## Scope
 
-multideck is a local-first CLI. Its one network surface is the optional mobile
-image-upload server (`multideck serve`, or `uploadServer: true` during launch).
+magent is a local-first CLI. Its one network surface is the optional mobile
+image-upload server (`magent serve`, or `uploadServer: true` during launch).
 
 **By design**, that server binds **only** to loopback and the host's Tailscale IP,
 and it ships **no auth token** — the bind set *is* the access-control model.
 Reaching it requires already being on your tailnet (or on the host itself).
-Passing `multideck serve --host 0.0.0.0` is an explicit, documented opt-out that
+Passing `magent serve --host 0.0.0.0` is an explicit, documented opt-out that
 widens the bind to your LAN; that is a deliberate choice, not a default.
 
 Because of this, **"the default upload server has no auth token" is working as

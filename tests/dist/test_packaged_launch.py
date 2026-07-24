@@ -1,12 +1,12 @@
-"""REAL launch from the INSTALLED artifact: `multideck --go` via the packaged
+"""REAL launch from the INSTALLED artifact: `magent --go` via the packaged
 console-script entry point opens one actual Windows Terminal window, tiled by
-the real Win32 pipeline -- the definitive proof that a ``pip install multideck``
+the real Win32 pipeline -- the definitive proof that a ``pip install magent-multi-ai-agents-manager``
 user's core action works end to end from the shipped wheel.
 
 Scope is deliberately ONE window: tests/e2e/test_real_launch.py already covers
 multi-window geometry, grid cells and per-window tool overrides from the dev
 tree; this test's only job is proving the INSTALLED artifact does the real
-thing at all (real terminal, real ``md:`` window, real command execution),
+thing at all (real terminal, real ``magent:`` window, real command execution),
 cheaply. Isolation + exact-target cleanup mirror test_real_launch: a redirected
 home, a benign ``rem <uuid>`` tool (never a real agent), and teardown that
 closes exactly the one uuid-titled window and kills only its marker cmd.exe.
@@ -51,7 +51,7 @@ def _child_env(home: Path) -> dict[str, str]:
     env = {
         k: v
         for k, v in os.environ.items()
-        if not k.upper().startswith("MULTIDECK_")
+        if not k.upper().startswith("MAGENT_")
         and k.upper() not in ("PYTHONPATH", "PYTHONHOME")
     }
     home_s = str(home)
@@ -148,7 +148,7 @@ def cleanup_registry():
     """Teardown-as-safety-net: whatever the test registers is closed and
     verified gone even when the test body fails -- a failed cleanup is a loud
     teardown error, never a leaked real window on the user's desktop."""
-    from multideck.platform import get_platform
+    from magent.platform import get_platform
 
     reg: dict[str, list[str]] = {"titles": [], "markers": []}
     yield reg
@@ -159,8 +159,8 @@ def cleanup_registry():
 def test_installed_go_launches_one_real_md_window(
     packaged, home, neutral_cwd, tmp_path, cleanup_registry
 ):
-    from multideck.grid import compute_grid
-    from multideck.platform import get_platform
+    from magent.grid import compute_grid
+    from magent.platform import get_platform
 
     plat = get_platform()
     plat.set_dpi_aware()
@@ -171,12 +171,12 @@ def test_installed_go_launches_one_real_md_window(
 
     unique = uuid.uuid4().hex[:10]
     name = f"mddist{unique}"
-    title = f"md:{name}"
+    title = f"magent:{name}"
     marker = f"mddist-launch-{unique}"
 
     proj = tmp_path / f"proj-{unique}"
     proj.mkdir()
-    cfg = tmp_path / "multideck.config.json"
+    cfg = tmp_path / "magent.config.json"
     cfg.write_text(
         json.dumps(
             {
@@ -213,13 +213,13 @@ def test_installed_go_launches_one_real_md_window(
     )
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
 
-    # 1. The REAL window exists with the exact md: title, from the installed CLI.
+    # 1. The REAL window exists with the exact magent: title, from the installed CLI.
     handles = _wait_until(
         lambda: _snapshot_md_handles(plat, [title]) or None, timeout=20
     )
     assert handles and title in handles, (
-        f"expected window {title!r}; md: windows visible: "
-        f"{[t for t in plat.snapshot_windows() if t.startswith('md:')]}\n"
+        f"expected window {title!r}; magent: windows visible: "
+        f"{[t for t in plat.snapshot_windows() if t.startswith('magent:')]}\n"
         f"stdout:\n{result.stdout}"
     )
 

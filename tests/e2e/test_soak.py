@@ -3,7 +3,7 @@
 Every other daemon test in the suite runs for seconds; this one runs for tens of
 minutes (``MDTEST_SOAK_SECONDS``, default 1500s == 25 min of *active* soak) to
 close the honesty-ledger gap "no soak / long-run daemon stability". It stands up
-the two long-lived product processes as REAL detached ``python -m multideck``
+the two long-lived product processes as REAL detached ``python -m magent``
 subprocesses -- ``serve --host 127.0.0.1`` (the upload server) and
 ``attention -d --interval 1`` (the attention daemon) -- and then hammers them
 with a continuous churn loop for the whole duration:
@@ -30,7 +30,7 @@ Sampled THROUGHOUT and again AT THE END (minute 25 as well as minute 1):
 
 Isolation copies the sibling ``test_daemon_lifecycle`` tier verbatim: HOME (and
 on Windows USERPROFILE/HOMEDRIVE/HOMEPATH) is redirected into a uuid-namespaced
-tmp dir, so every ``~/.multideck`` artifact -- pid files, heartbeats, state
+tmp dir, so every ``~/.magent`` artifact -- pid files, heartbeats, state
 records, uploads, logs -- lands there and NEVER touches the runner's real home.
 The config is a tmp file passed with ``--config``; servers bind 127.0.0.1 only;
 every finally block kills ONLY the exact pids this test created.
@@ -68,8 +68,8 @@ from pathlib import Path
 
 import pytest
 
-from multideck import log as mlog
-from multideck.procs import pid_alive
+from magent import log as mlog
+from magent.procs import pid_alive
 
 _SOAK_ENABLED = bool(os.environ.get("MDTEST_SOAK"))
 # Full active-soak duration in seconds. 1500 == 25 min, comfortably inside the
@@ -102,12 +102,10 @@ pytestmark = [
 
 def _child_env(home, extra_path: str | None = None) -> dict[str, str]:
     """A child env with HOME fully redirected on every OS and every inherited
-    MULTIDECK_* var stripped (the closed env schema can't trip on the runner's
+    MAGENT_* var stripped (the closed env schema can't trip on the runner's
     own config). ``extra_path`` is prepended to PATH so the psmux shim resolves
     inside the serve child."""
-    env = {
-        k: v for k, v in os.environ.items() if not k.upper().startswith("MULTIDECK_")
-    }
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
     home_s = str(home)
     drive, tail = os.path.splitdrive(home_s)
     env["USERPROFILE"] = home_s
@@ -192,7 +190,7 @@ def _run_detaching(args, env, err_path, timeout: float = 90) -> int:
     diagnostics. Returns the launcher's exit code."""
     with err_path.open("w", encoding="utf-8") as e:
         p = subprocess.run(
-            [sys.executable, "-m", "multideck", *args],
+            [sys.executable, "-m", "magent", *args],
             stdout=subprocess.DEVNULL,
             stderr=e,
             env=env,
@@ -203,7 +201,7 @@ def _run_detaching(args, env, err_path, timeout: float = 90) -> int:
 
 # --- agent-state writes into the REDIRECTED home ------------------------------
 # The test process's own Path.home() is the runner's real home, so we cannot call
-# multideck.agent_state.write_state (it targets ~/.multideck/state). We replicate
+# magent.agent_state.write_state (it targets ~/.magent/state). We replicate
 # its exact key + atomic-replace contract against the redirected state dir.
 
 
@@ -393,7 +391,7 @@ def _make_world(tmp_path):
     proj.mkdir()
     shim_path = _install_psmux_shim(tmp_path / "shim")
     port = _free_port()
-    cfg = tmp_path / "multideck.config.json"
+    cfg = tmp_path / "magent.config.json"
     cfg.write_text(
         json.dumps(
             {
@@ -405,7 +403,7 @@ def _make_world(tmp_path):
                     "defaultTool": "probe",
                     "tools": {"probe": "rem md-soak"},
                     # toast is the only renderer enable-able on every OS
-                    # (badge/flash need real md: windows + win32 support); with it
+                    # (badge/flash need real magent: windows + win32 support); with it
                     # on, `attention -d` has work to do and won't exit "nothing to
                     # do". The ToastRenderer swallows a missing winotify (one tip,
                     # then quiet), so cycling push states can't crash the loop.
@@ -423,13 +421,13 @@ def _make_world(tmp_path):
     )
     return types.SimpleNamespace(
         home=home,
-        md=home / ".multideck",
+        md=home / ".magent",
         env=_child_env(home, extra_path=shim_path),
         port=port,
         cfg=cfg,
         proj=str(proj),
         workdir=tmp_path,
-        state_dir=home / ".multideck" / "state",
+        state_dir=home / ".magent" / "state",
     )
 
 
@@ -445,7 +443,7 @@ def _start_serve(w):
         [
             sys.executable,
             "-m",
-            "multideck",
+            "magent",
             "--config",
             str(w.cfg),
             "serve",

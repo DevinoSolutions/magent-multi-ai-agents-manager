@@ -2,19 +2,19 @@
 
 WHY THIS TIER EXISTS
 --------------------
-``multideck``'s ``watch`` / ``attention`` / ``status`` never poll agents; they
+``magent``'s ``watch`` / ``attention`` / ``status`` never poll agents; they
 read per-session state records — ``{state, ts, cwd, session_id}`` — that an
-OUT-OF-REPO writer drops into ``~/.multideck/state/*.json`` from the agent's
+OUT-OF-REPO writer drops into ``~/.magent/state/*.json`` from the agent's
 lifecycle hooks. The in-repo ``tests/unit/test_agent_state.py::TestSchemaContract``
-pins the shape of what multideck *writes and reads*, but nothing here ever ran
+pins the shape of what magent *writes and reads*, but nothing here ever ran
 the *real external writer*. This tier closes that gap: it installs the actual
 published companion package, drives its actual hook under real node the way
-Claude Code does, and checks the result against multideck's real reader
-(``multideck.agent_state``, imported — never reimplemented).
+Claude Code does, and checks the result against magent's real reader
+(``magent.agent_state``, imported — never reimplemented).
 
 WHAT THE REAL WRITER ACTUALLY IS  (read from source, not assumed)
 -----------------------------------------------------------------
-multideck's docs/comments name the writer ``state-sink.mjs``, shipped by the
+magent's docs/comments name the writer ``state-sink.mjs``, shipped by the
 ``ai-agent-notifier`` npm package (DevinoSolutions), wired by
 ``npx ai-agent-notifier setup`` as Claude Code ``Notification``/``Stop`` hooks.
 
@@ -30,9 +30,9 @@ FINDING, pinned by this tier so it cannot silently change:
     (``{session_id, cwd, hook_event_name}``), then sends a desktop toast / ntfy
     push / terminal bell. It writes its own dedup lock at
     ``~/.ai-agent-notifier/.lock-<source>`` and **nothing else**.
-  * It writes **zero** records to ``~/.multideck/state/``. So a user who wires
+  * It writes **zero** records to ``~/.magent/state/``. So a user who wires
     only ``ai-agent-notifier`` (as README "Where agent states come from"
-    instructs) gets an EMPTY multideck state store — ``watch`` stays blank.
+    instructs) gets an EMPTY magent state store — ``watch`` stays blank.
 
 The real invocation contract this tier reproduces (stdin JSON, per-source
 ``--source`` arg, per-event mapping) is exactly what ``parse-input.mjs`` /
@@ -45,14 +45,14 @@ For each realistic Claude hook event (``Stop`` → done/task_complete,
 
   (1) the real hook actually executed under a fully-redirected HOME — proven by
       its own side effect, the ``~/.ai-agent-notifier/.lock-<source>`` lock; and
-  (2) multideck's real reader, pointed at ``<HOME>/.multideck/state`` (exactly
+  (2) magent's real reader, pointed at ``<HOME>/.magent/state`` (exactly
       where a compliant writer would drop records), sees NOTHING —
       ``agent_state.all_states() == []`` and no record file exists.
 
 TRIPWIRE / UPGRADE PATH
 -----------------------
 This tier pins a *gap*. The day ``ai-agent-notifier`` (or any wired hook) starts
-writing multideck state records, assertion (2) flips: ``all_states()`` returns a
+writing magent state records, assertion (2) flips: ``all_states()`` returns a
 record and this test goes RED. That is the signal to promote this tier into a
 positive schema-contract test — assert the record lands under the redirected
 HOME, parses through ``agent_state`` field-for-field against
@@ -63,7 +63,7 @@ ships the writer. Do NOT paper over it by adding a fake ``state-sink.mjs``.
 ISOLATION
 ---------
 HOME (and on Windows USERPROFILE/HOMEDRIVE/HOMEPATH) is redirected into a
-uuid-namespaced tmp dir per event, so the real ``~/.multideck`` and
+uuid-namespaced tmp dir per event, so the real ``~/.magent`` and
 ``~/.claude`` are never touched and each event runs against a clean dedup lock
 (``notify.mjs`` self-dedups within 10s per HOME+source). No drivers, no servers,
 no display — tmp-dir only. Rides the existing ``end-to-end`` job (node is
@@ -82,7 +82,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from multideck import agent_state
+from magent import agent_state
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -109,12 +109,10 @@ CLAUDE_EVENTS = [
 
 def _child_env(home: Path, **extra: str) -> dict[str, str]:
     """A child env with HOME fully redirected into ``home`` on every OS, and
-    every inherited MULTIDECK_* var stripped. os.homedir() (which notify.mjs
+    every inherited MAGENT_* var stripped. os.homedir() (which notify.mjs
     keys its lock off) reads USERPROFILE on Windows and HOME on POSIX, so both
     are set. Mirrors tests/e2e/test_daemon_lifecycle.py::_child_env."""
-    env = {
-        k: v for k, v in os.environ.items() if not k.upper().startswith("MULTIDECK_")
-    }
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
     home_s = str(home)
     drive, tail = os.path.splitdrive(home_s)
     env["USERPROFILE"] = home_s
@@ -195,14 +193,14 @@ def _drive_hook(
 
 
 @pytest.mark.parametrize("hook_event_name,mapped", CLAUDE_EVENTS)
-def test_real_writer_populates_nothing_multideck_reads(
+def test_real_writer_populates_nothing_magent_reads(
     installed_notifier, tmp_path, monkeypatch, hook_event_name, mapped
 ):
     """Drive the real published hook with a realistic Claude ``{hook_event_name}``
-    event under a redirected HOME, then check multideck's real reader.
+    event under a redirected HOME, then check magent's real reader.
 
     Pins the true current contract (see module docstring): the wired companion
-    hook runs, but writes ZERO records into multideck's state store — so
+    hook runs, but writes ZERO records into magent's state store — so
     ``agent_state.all_states()`` is empty. Flips RED (forcing a real
     schema-contract test) the day a state-writing hook ships."""
     home = tmp_path / f"home-{uuid.uuid4().hex[:8]}"
@@ -210,10 +208,10 @@ def test_real_writer_populates_nothing_multideck_reads(
     proj.mkdir(parents=True)
     home.mkdir()
 
-    # Point multideck's REAL reader at exactly where a compliant writer would
+    # Point magent's REAL reader at exactly where a compliant writer would
     # drop records under this redirected HOME (the reader computes STATE_DIR from
     # Path.home() at import, which is the real home in this test process).
-    state_dir = home / ".multideck" / "state"
+    state_dir = home / ".magent" / "state"
     monkeypatch.setattr(agent_state, "STATE_DIR", state_dir)
     monkeypatch.setattr(agent_state, "_swept_this_process", False)
     monkeypatch.setattr(agent_state, "_warned_files", set())
@@ -239,12 +237,12 @@ def test_real_writer_populates_nothing_multideck_reads(
         f"stderr:\n{result.stderr}"
     )
 
-    # (2) multideck's REAL reader sees NOTHING — the notifier populates no state
+    # (2) magent's REAL reader sees NOTHING — the notifier populates no state
     # record for this {hook_event_name} -> {mapped} transition.
     records = agent_state.all_states()
     assert records == [], (
         f"HEADLINE-FINDING TRIPWIRE FLIPPED: the real {AINS_PKG}@{AINS_VERSION}"
-        f" hook wrote {len(records)} multideck state record(s) for a Claude"
+        f" hook wrote {len(records)} magent state record(s) for a Claude"
         f" {hook_event_name} event. This tier assumed it writes none. Promote it"
         f" to a positive schema-contract test (see module docstring) and pin the"
         f" schema. Records: {records}"
@@ -253,7 +251,7 @@ def test_real_writer_populates_nothing_multideck_reads(
 
 
 def test_no_state_sink_module(installed_notifier):
-    """Pin the headline finding at the file level: the package multideck's docs
+    """Pin the headline finding at the file level: the package magent's docs
     name as shipping ``state-sink.mjs`` ships no such module (any ``*sink*``
     file). If a future version adds one, this fails — go read it and wire the
     real schema contract."""
@@ -265,7 +263,7 @@ def test_no_state_sink_module(installed_notifier):
     ]
     assert sink_like == [], (
         f"{AINS_PKG}@{AINS_VERSION} now ships sink-like module(s): {sink_like}."
-        f" multideck's docs say state-sink.mjs is the real writer — verify its"
+        f" magent's docs say state-sink.mjs is the real writer — verify its"
         f" output against agent_state's schema and update this tier."
     )
 

@@ -10,7 +10,7 @@ pytestmark = pytest.mark.e2e
 class TestHappyIntegration:
     def test_happy_global_shows_badge(self, tmp_path):
         (tmp_path / "myapp").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -24,7 +24,7 @@ class TestHappyIntegration:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -38,7 +38,7 @@ class TestHappyIntegration:
 
     def test_happy_disabled_no_badge(self, tmp_path):
         (tmp_path / "myapp").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -52,7 +52,7 @@ class TestHappyIntegration:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -67,7 +67,7 @@ class TestHappyIntegration:
     def test_happy_per_project_override(self, tmp_path):
         (tmp_path / "with_happy").mkdir()
         (tmp_path / "without_happy").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -84,7 +84,7 @@ class TestHappyIntegration:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -106,7 +106,7 @@ class TestHappyIntegration:
 
     def test_happy_vscode_not_affected(self, tmp_path):
         (tmp_path / "myapp").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -120,7 +120,7 @@ class TestHappyIntegration:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -134,7 +134,7 @@ class TestHappyIntegration:
 
     def test_happy_accepted_in_config(self, tmp_path):
         (tmp_path / "myapp").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -148,7 +148,7 @@ class TestHappyIntegration:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -164,7 +164,7 @@ class TestHappyIntegration:
 class TestPsmuxIntegration:
     def test_psmux_shows_badge(self, tmp_path):
         (tmp_path / "myapp").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -178,7 +178,7 @@ class TestPsmuxIntegration:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -195,7 +195,7 @@ class TestPsmuxIntegration:
 
     def test_psmux_disabled_no_badge(self, tmp_path):
         (tmp_path / "myapp").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -209,7 +209,7 @@ class TestPsmuxIntegration:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",
@@ -223,7 +223,7 @@ class TestPsmuxIntegration:
 
     def test_psmux_vscode_not_affected(self, tmp_path):
         (tmp_path / "myapp").mkdir()
-        cfg = tmp_path / "multideck.config.json"
+        cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps(
                 {
@@ -237,7 +237,7 @@ class TestPsmuxIntegration:
             [
                 sys.executable,
                 "-m",
-                "multideck",
+                "magent",
                 "--go",
                 "--dry-run",
                 "--config",

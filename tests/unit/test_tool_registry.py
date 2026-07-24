@@ -6,8 +6,8 @@ the whole point of the refactors.
 
 from __future__ import annotations
 
-from multideck.launch import HAPPY_AGENTS
-from multideck.sessions import (
+from magent.launch import HAPPY_AGENTS
+from magent.sessions import (
     AGENT_TOOLS,
     IDE_COMMANDS,
     IDE_TOOLS,
@@ -42,7 +42,7 @@ class TestOneEditExtensionProof:
                 resume_command=lambda base, session: f"{base} R {session}",
             ),
         )
-        monkeypatch.setattr("multideck.sessions.AGENT_TOOLS", extended)
+        monkeypatch.setattr("magent.sessions.AGENT_TOOLS", extended)
 
         assert (
             build_resume_command("mytool", "mytool run", "id-1") == "mytool run R id-1"
@@ -85,7 +85,7 @@ class TestIdeOneEditExtensionProof:
         (is_ide_tool) and command mapping (ide_command) need no code change
         to pick it up."""
         extended = dict(IDE_COMMANDS, zed="zed")
-        monkeypatch.setattr("multideck.sessions.IDE_COMMANDS", extended)
+        monkeypatch.setattr("magent.sessions.IDE_COMMANDS", extended)
 
         assert is_ide_tool("zed")
         assert ide_command("zed") == "zed"
