@@ -4,18 +4,22 @@ import sys
 
 import pytest
 
+from magent import __version__
+
 pytestmark = pytest.mark.e2e
 
 
 class TestCliFlags:
     def test_version(self):
+        """The banner must carry the package-metadata version -- the literal
+        pin this replaced went stale the moment the version bumped."""
         result = subprocess.run(
             [sys.executable, "-m", "magent", "--version"],
             capture_output=True,
             text=True,
         )
         assert result.returncode == 0
-        assert "1.0.0" in result.stdout
+        assert __version__ in result.stdout
 
     def test_help(self):
         result = subprocess.run(
