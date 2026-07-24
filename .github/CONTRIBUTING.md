@@ -12,9 +12,11 @@ pip install -e ".[dev]"     # or: uv sync --extra dev   (uv.lock is committed)
 npm install                 # one-time: activates the husky git hooks
 ```
 
+Sentry error reporting ships in the base install and is env-gated via
+`MAGENT_SENTRY_DSN` (off until set).
+
 Optional extras:
 
-- `pip install -e ".[sentry]"` — env-gated Sentry error reporting (`MAGENT_SENTRY_DSN`).
 - `pip install -e ".[toast]"` — Windows desktop toast for `magent attention`.
 - `pip install -e ".[qr]"` — QR code for `magent mobile`.
 

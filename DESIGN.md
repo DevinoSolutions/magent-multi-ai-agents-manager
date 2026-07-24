@@ -468,7 +468,7 @@ work (hotkey stripped the prefix, tiling matched exact full titles) — which
 made in-place title *rewrites* (the attention daemon's state badges)
 impossible without breaking resolution. Now `titles.make_title` is the only
 producer and `titles.parse_title` the only consumer (hotkey routing, tiling's
-`magent-name` mode, which still accepts the pre-rename `md-name` alias), so a
+`magent-name` mode), so a
 badge in the title is invisible to matching. The badge
 sits at the FRONT because taskbars truncate title tails; working/idle
 deliberately render unbadged (quiet title = nothing needs you). psmux session

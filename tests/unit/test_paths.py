@@ -1,22 +1,18 @@
-"""find_config discovery, including the read-only legacy ~/.multideck fallback.
+"""find_config discovery.
 
-After the multideck -> magent rename, an existing install keeps its config
-under the old ``multideck`` config dir. find_config falls back to it (read
-only, with a one-time stderr warning) when the new ``magent`` dir has none.
+find_config resolves an explicit ``--config`` arg, then a project-local
+``magent.config.json`` (cwd or cwd/scripts), and otherwise the ``magent``
+config dir. There is no legacy fallback: magent knows only ``~/.magent``.
 """
 
 from __future__ import annotations
 
-import pytest
+from typing import TYPE_CHECKING
 
 from magent import paths
 
-
-@pytest.fixture(autouse=True)
-def _reset_warned() -> None:
-    paths._legacy_warned = False
-    yield
-    paths._legacy_warned = False
+if TYPE_CHECKING:
+    import pytest
 
 
 def _prep(monkeypatch: pytest.MonkeyPatch, tmp_path):
@@ -34,42 +30,30 @@ def _write(path, text: str = "{}") -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def test_prefers_new_config_over_legacy(monkeypatch, tmp_path, capsys):
+def test_explicit_arg_wins(monkeypatch, tmp_path):
+    _prep(monkeypatch, tmp_path)
+    assert paths.find_config("some/where.json").as_posix() == "some/where.json"
+
+
+def test_finds_project_local_config(monkeypatch, tmp_path):
+    _prep(monkeypatch, tmp_path)
+    local = tmp_path / "cwd" / "magent.config.json"
+    _write(local)
+
+    assert paths.find_config(None) == local
+
+
+def test_returns_magent_config_path(monkeypatch, tmp_path, capsys):
     base = _prep(monkeypatch, tmp_path)
     new = base / "magent" / "config.json"
     _write(new)
-    _write(base / "multideck" / "config.json")
 
     assert paths.find_config(None) == new
     assert capsys.readouterr().err == ""
 
 
-def test_falls_back_to_legacy_multideck_dir(monkeypatch, tmp_path, capsys):
-    base = _prep(monkeypatch, tmp_path)
-    legacy = base / "multideck" / "config.json"
-    _write(legacy)
-
-    assert paths.find_config(None) == legacy
-    err = capsys.readouterr().err
-    assert "legacy config" in err
-    assert "multideck was renamed to magent" in err
-
-
-def test_no_config_anywhere_returns_new_path_quietly(monkeypatch, tmp_path, capsys):
+def test_no_config_anywhere_returns_magent_path_quietly(monkeypatch, tmp_path, capsys):
     base = _prep(monkeypatch, tmp_path)
 
     assert paths.find_config(None) == base / "magent" / "config.json"
     assert capsys.readouterr().err == ""
-
-
-def test_legacy_warning_fires_only_once(monkeypatch, tmp_path, capsys):
-    base = _prep(monkeypatch, tmp_path)
-    _write(base / "multideck" / "config.json")
-
-    paths.find_config(None)
-    first = capsys.readouterr().err
-    paths.find_config(None)
-    second = capsys.readouterr().err
-
-    assert "legacy config" in first
-    assert second == ""
