@@ -32,8 +32,9 @@ IDLE = "idle"  # session open, nothing pending
 
 _VALID = {WORKING, DONE, NEEDS_INPUT, ERROR, IDLE}
 
-# Schema version — bump when the on-disk record shape changes. External
-# writers (state-sink.mjs, Codex notify) should check this before writing.
+# Schema version — bump when the on-disk record shape changes. The in-repo
+# writer is state_hook.py (the magent-state-hook console script); any external
+# writer should check this before writing.
 # Pinned by tests/unit/test_agent_state.py::TestSchemaContract.
 RECORD_VERSION = 1
 
@@ -49,10 +50,9 @@ _warned_files: set[str] = set()
 
 def _norm(path: str) -> str:
     """Canonicalize a path so the writer's cwd and the picker's pane_current_path
-    map to the same key. MUST match the notifier's state-sink.mjs ``normCwd``
-    (which writes these files for every agent): slashes -> '/', drop trailing
-    '/', lowercase on Windows. Deliberately string-only -- no realpath -- so the
-    JS and Python sides produce byte-identical keys."""
+    map to the same key: slashes -> '/', drop trailing '/', lowercase on
+    Windows. Deliberately string-only -- no realpath -- so any external writer
+    (e.g. a JS hook) can produce byte-identical keys without OS calls."""
     s = (path or "").replace("\\", "/").rstrip("/")
     if sys.platform == "win32":
         s = s.lower()
@@ -163,11 +163,11 @@ def norm_cwd(path: str) -> str:
 
 
 def _warn_bad_record(path: Path, why: str) -> None:
-    """Log ONE warning per offending state file per process (P6-09). State
-    writers are external (Claude Code hooks, Codex notify); if one regresses to
-    malformed JSON or a changed schema, the affected sessions silently vanish
-    from watch/attention. Naming the file makes that visible without spamming
-    the log every poll."""
+    """Log ONE warning per offending state file per process (P6-09). Records
+    arrive from hook subprocesses (state_hook.py today, possibly external
+    writers tomorrow); if a writer regresses to malformed JSON or a changed
+    schema, the affected sessions silently vanish from watch/attention. Naming
+    the file makes that visible without spamming the log every poll."""
     key = str(path)
     if key in _warned_files:
         return

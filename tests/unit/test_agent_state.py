@@ -3,13 +3,13 @@ normalization.
 
 The schema contract (``TestSchemaContract``) pins the on-disk record shape so
 that changes to ``write_state`` are detected by the gate before they can
-silently break out-of-repo writers (Claude Code hooks via ``state-sink.mjs``,
-Codex notify). If the contract test fails after a deliberate schema change:
+silently break writers/readers out of lockstep (the in-repo writer is
+``state_hook.py``; external writers may exist). If the contract test fails
+after a deliberate schema change:
 
 1. Bump ``RECORD_VERSION`` in ``agent_state.py``.
 2. Update ``EXPECTED_KEYS`` and the assertions below.
-3. Update every external writer in lockstep — ``state-sink.mjs`` in the Claude
-   Code hook repo, and any Codex notify adapter.
+3. Update any external writer in lockstep.
 """
 
 from __future__ import annotations
@@ -34,8 +34,9 @@ VALID_STATES = {"working", "done", "needs-input", "error", "idle"}
 
 
 class TestSchemaContract:
-    """Pin the on-disk record shape. External writers (state-sink.mjs, Codex
-    notify) produce records with exactly these keys and value types."""
+    """Pin the on-disk record shape. Writers (state_hook.py in-repo, any
+    external adapter) produce records with exactly these keys and value
+    types."""
 
     def test_record_keys_are_exact(self):
         agent_state.write_state("/projects/foo", "working", session_id="abc")

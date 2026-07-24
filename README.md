@@ -195,6 +195,7 @@ Or skip the menu with flags:
 | `magent mobile` | Phone URL + QR code for installing the uploader as a home-screen app. |
 | `magent termius` | Generate an SSH config entry that opens the session picker. |
 | `magent hotkey` | Run the Alt+V clipboard-upload listener standalone (Windows). |
+| `magent hooks install` | Wire the agent lifecycle hooks that feed the session-state store (`magent hooks status` to inspect) — see [Where agent states come from](#where-agent-states-come-from). |
 | `magent config <subcommand>` | Edit config from the CLI — 14 subcommands incl. `migrate`; see `magent config --help`. |
 
 ## Platform support
@@ -221,15 +222,19 @@ Notes:
 
 ## Where agent states come from
 
-`magent watch`, `magent attention`, and `magent status --json` do not poll your agents directly. They read per-session **state records** — `working`, `needs-input`, `done`, `error`, `idle` — that your coding agent writes through its lifecycle hooks: Claude Code hooks and Codex's `notify` hook. Until those hooks are wired, the state store stays empty and `magent watch` shows an empty table.
+`magent sessions`, `magent watch`, `magent attention`, and `magent status --json` do not poll your agents directly. They read per-session **state records** — `working`, `needs-input`, `done`, `error`, `idle` — that your coding agent writes through its lifecycle hooks. Until those hooks are wired, the state store stays empty and the pickers show no status. Wire them once with:
 
-The companion [`ai-agent-notifier`](https://www.npmjs.com/package/ai-agent-notifier) package (same authors) installs those hooks for you across Claude Code, Codex, and Cursor:
+```bash
+magent hooks install
+```
+
+This merges the bundled `magent-state-hook` writer into Claude Code's `~/.claude/settings.json` (idempotent — your existing hooks are preserved) and prints the one-line `notify` recipe for Codex's `~/.codex/config.toml`. Restart open agent sessions to activate. After that the session picker shows live `still going... 3m` / `done` / `needs input` labels — the hook refreshes the record on every tool call, so `still going...` means the agent really is moving — and `magent watch` / `magent attention -d` light up as your agents change state. `magent hooks status` shows what is wired and how fresh the store is.
+
+The companion [`ai-agent-notifier`](https://www.npmjs.com/package/ai-agent-notifier) package (same authors) adds phone/desktop notifications on top of the same hook events (it is a pure notifier — it does not write state records):
 
 ```bash
 npx ai-agent-notifier setup
 ```
-
-The setup wizard detects your installed agents and wires the hooks; restart your agents to activate. After that, `magent watch` and `magent attention -d` light up as your agents change state.
 
 ## Configuration
 

@@ -5,6 +5,20 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`magent hooks install`** wires the new bundled `magent-state-hook` writer
+  into Claude Code's lifecycle hooks (idempotent; existing hooks are preserved)
+  and prints the Codex `notify` recipe — closing the gap where no writer ever
+  fed the session-state store, so the session picker, `magent watch`, and the
+  attention daemon showed missing or stale `done` / `needs input` states.
+  `magent hooks status` shows what is wired and how fresh the store is.
+- The session picker now shows a live **`still going... <minutes>`** label
+  while a turn is in flight; the hook refreshes the record on every tool call,
+  so the label tracks real activity rather than just the turn's start.
+
 ## [3.0.0] - 2026-07-24
 
 ### Fixed

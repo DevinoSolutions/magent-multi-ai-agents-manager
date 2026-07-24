@@ -69,6 +69,10 @@ browser = ["playwright>=1.40"]
 
 [project.scripts]
 magent = "magent.cli:main"
+# The stdlib-only lifecycle hook Claude Code / Codex invoke per event -- its
+# own entry point (not a magent subcommand) so it skips the CLI registration
+# hub's import cost on every agent turn. Wired by `magent hooks install`.
+magent-state-hook = "magent.state_hook:main"
 
 [project.urls]
 Homepage = "https://magent.io"

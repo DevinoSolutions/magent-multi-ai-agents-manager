@@ -43,11 +43,16 @@ def _session_cwds(psmux: str, names: list[str]) -> dict[str, str]:
         )
 
 
-def _status_label(state: str | None) -> str:
+def _status_label(state: str | None, age_s: float | None = None) -> str:
     from magent import agent_state  # heavy subsystem: in-body per policy
 
+    if state == agent_state.WORKING:
+        # The hook refreshes ts on every tool call, so the age here is time
+        # since the agent last did something -- a live "still going" signal.
+        mins = int(age_s // 60) if age_s is not None and age_s >= 60 else 0
+        text = f"still going... {mins}m" if mins else "still going..."
+        return style(text, fg="yellow", bold=True)
     return {
-        agent_state.WORKING: style("working...", fg="yellow", bold=True),
         agent_state.DONE: style("done", fg="green", bold=True),
         agent_state.NEEDS_INPUT: style("needs input", fg="red", bold=True),
         agent_state.ERROR: style("error", fg="red", bold=True),
@@ -69,14 +74,16 @@ def _session_statuses(cwds: dict[str, str]) -> dict[str, str]:
         rec = agent_state.state_for(cwd) if cwd else None
         raw_state = rec.get("state") if rec else None
         state = raw_state if isinstance(raw_state, str) else None
-        if rec is not None and state is not None and state in stale:
+        age_s: float | None = None
+        if rec is not None and state is not None:
             ts = rec.get("ts", 0)
             ts_num = (
                 ts if isinstance(ts, (int, float)) and not isinstance(ts, bool) else 0
             )
-            if (time.time() - ts_num) > stale[state]:
+            age_s = time.time() - ts_num
+            if state in stale and age_s > stale[state]:
                 state = None
-        out[sock] = _status_label(state)
+        out[sock] = _status_label(state, age_s)
     return out
 
 
