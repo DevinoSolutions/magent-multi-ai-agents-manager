@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `--version`, the menu banner, and `magent docs` reported a stale hardcoded
+  version; the version now derives from package metadata.
+
 ### Removed
 
 - **Pre-rename config-directory fallback dropped.** magent now reads config only
