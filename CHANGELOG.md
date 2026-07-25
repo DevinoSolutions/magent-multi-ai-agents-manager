@@ -5,6 +5,19 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.3] - 2026-07-25
+
+### Fixed
+
+- **Sessions brought up over SSH started without their agent.** On the host
+  side of `magent attach`, sshd kills the remote command's process tree the
+  moment `magent up` returns -- which silently killed the fire-and-forget
+  `send-keys` processes that type each agent command into its new psmux
+  session. Every session came up as a bare shell, so the attached windows
+  showed an empty prompt (or fell back to the session picker) instead of the
+  agent. The keystroke senders are now awaited, guaranteeing the agent command
+  lands before the CLI exits.
+
 ## [3.1.2] - 2026-07-25
 
 ### Fixed
@@ -149,6 +162,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.1.3]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.1.2...v3.1.3
 [3.1.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.1.1...v3.1.2
 [3.1.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.1.0...v3.1.1
 [3.1.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.0.0...v3.1.0
