@@ -18,6 +18,7 @@ support (macOS/Linux, and CI runners without the binary).
 
 import os
 import shutil
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -115,9 +116,32 @@ def test_real_session_pane_cwd_and_kill(tmp_path):
         def _pane_shows_command() -> bool:
             return f"mdrl-{unique}" in psmux.capture_pane(name)
 
-        assert _wait_until(_pane_shows_command, timeout=15), (
-            "send-keys command never appeared in the pane"
-        )
+        if not _wait_until(_pane_shows_command, timeout=15):
+            binary = psmux.find_psmux() or "psmux"
+            panes = subprocess.run(
+                [
+                    binary,
+                    "-L",
+                    name,
+                    "list-panes",
+                    "-F",
+                    "cmd=#{pane_current_command} dead=#{pane_dead}",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            cap = subprocess.run(
+                [binary, "-L", name, "capture-pane", "-p"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            pytest.fail(
+                "send-keys command never appeared in the pane\n"
+                f"  list-panes rc={panes.returncode} out={panes.stdout!r} err={panes.stderr!r}\n"
+                f"  capture rc={cap.returncode} out={cap.stdout!r} err={cap.stderr!r}"
+            )
 
         # Kill THIS session's server and watch the primitives degrade honestly.
         assert psmux.kill_server(name), f"kill_server({name!r}) failed"
