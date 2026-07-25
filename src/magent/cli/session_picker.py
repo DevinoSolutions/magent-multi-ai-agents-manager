@@ -11,8 +11,12 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from magent.cli.app import main
 from magent.cli.background import _running_upload_port, _tailnet_host
@@ -117,6 +121,81 @@ def _set_picker_attached(name: str | None) -> None:
         pass
 
 
+def _config_session_candidates(data: dict[str, object]) -> list[str]:
+    """Eligible project socket names from config, in config order -- liveness
+    is NOT checked here, so a direct-name attach never depends on a sweep."""
+    from magent import psmux as psmux_mod  # heavy subsystem: in-body per policy
+
+    default_tool = _as_str(_as_dict(data.get("settings")).get("defaultTool"), "claude")
+    candidates: list[str] = []
+    for p in _project_dicts(data):
+        if not p.get("enabled", True):
+            continue
+        tool = p.get("tool", default_tool)
+        if isinstance(tool, str) and is_ide_tool(tool):
+            continue
+        title = p.get("title")
+        proj_name = (
+            title
+            if isinstance(title, str) and title
+            else Path(_as_str(p.get("path"))).name
+        )
+        candidates.append(psmux_mod.session_name(proj_name))
+    return candidates
+
+
+def _live_sessions(psmux_bin: str, candidates: list[str]) -> list[str]:
+    """Concurrent liveness sweep with one retry for the misses.
+
+    Under the load of many running agents, individual `psmux has-session`
+    probes flap; the old sequential no-retry sweep both crawled (40+ serial
+    subprocess calls) and silently dropped live sessions from the picker."""
+    from magent import psmux as psmux_mod  # heavy subsystem: in-body per policy
+
+    def _probe(names: list[str]) -> list[bool]:
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            return list(
+                pool.map(lambda n: psmux_mod.has_session(n, psmux=psmux_bin), names)
+            )
+
+    flags = dict(zip(candidates, _probe(candidates), strict=True))
+    missing = [n for n in candidates if not flags[n]]
+    if missing:
+        for n, ok in zip(missing, _probe(missing), strict=True):
+            if ok:
+                flags[n] = True
+    return [n for n in candidates if flags[n]]
+
+
+def _attach_session(psmux_bin: str, target: str, reset: Callable[[], None]) -> None:
+    """Attach to a session; surface and retry a failed attach.
+
+    The old flow cleared the screen the moment the attach client returned, so
+    a failure (e.g. the client losing a resource race on an overloaded host)
+    was invisible -- the picker appeared to 'process' the choice and silently
+    bounce back to the menu."""
+    rc = 0
+    for attempt in (1, 2):
+        _set_picker_attached(target)
+        try:
+            rc = subprocess.call([psmux_bin, "-L", target, "attach"])
+        finally:
+            _set_picker_attached(None)
+            reset()
+        if rc == 0:
+            return
+        if attempt == 1:
+            click.echo(
+                f"  {style('!', fg='yellow')} attach to {target} exited {rc} -- retrying..."
+            )
+            time.sleep(1)
+    click.echo(
+        f"  {style('x', fg='red')} attach to {target} failed twice (exit {rc})."
+        f" {style('The host may be overloaded -- try again in a moment.', dim=True)}"
+    )
+    time.sleep(2)
+
+
 def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
     """Looping psmux session picker: list live sessions, attach to a choice, repeat.
 
@@ -135,31 +214,7 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
         return
 
     data = _load_raw_config(config_file)
-    default_tool = _as_str(_as_dict(data.get("settings")).get("defaultTool"), "claude")
-    sessions: list[str] = []
-    for p in _project_dicts(data):
-        if not p.get("enabled", True):
-            continue
-        tool = p.get("tool", default_tool)
-        if isinstance(tool, str) and is_ide_tool(tool):
-            continue
-        title = p.get("title")
-        proj_name = (
-            title
-            if isinstance(title, str) and title
-            else Path(_as_str(p.get("path"))).name
-        )
-        sock = psmux_mod.session_name(proj_name)
-        if psmux_mod.has_session(sock, psmux=psmux_bin):
-            sessions.append(sock)
-
-    if not sessions:
-        click.echo(f"  {style('x', fg='red')} No active psmux sessions.")
-        click.echo(
-            f"  {style('Run', dim=True)} {style('magent up', bold=True)} {style('or', dim=True)} "
-            f"{style('magent --go', bold=True)} {style('first.', dim=True)}"
-        )
-        return
+    candidates = _config_session_candidates(data)
 
     def _reset_terminal() -> None:
         if sys.platform == "win32":
@@ -169,15 +224,10 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
             subprocess.run(["tput", "reset"], capture_output=True, check=False)
 
     def _attach(target: str) -> None:
-        _set_picker_attached(target)
-        try:
-            subprocess.call([psmux_bin, "-L", target, "attach"])
-        finally:
-            _set_picker_attached(None)
-            _reset_terminal()
+        _attach_session(psmux_bin, target, _reset_terminal)
 
     if name:
-        matches = [s for s in sessions if name.lower() in s.lower()]
+        matches = [s for s in candidates if name.lower() in s.lower()]
         if matches:
             _attach(matches[0])
 
@@ -188,6 +238,17 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
     upload_url = f"http://{_tailnet_host()}:{port}/" if port else None
 
     while True:
+        # Fresh sweep every redraw: sessions created or killed while the
+        # picker was attached elsewhere show up without restarting it.
+        sessions = _live_sessions(psmux_bin, candidates)
+        if not sessions:
+            click.echo(f"  {style('x', fg='red')} No active psmux sessions.")
+            click.echo(
+                f"  {style('Run', dim=True)} {style('magent up', bold=True)} {style('or', dim=True)} "
+                f"{style('magent --go', bold=True)} {style('first.', dim=True)}"
+            )
+            return
+
         # Remote switch: a notification/web tap dropped a target here -> jump to it.
         focus = _consume_focus_target()
         if focus and focus in sessions:
