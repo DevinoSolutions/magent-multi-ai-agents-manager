@@ -135,6 +135,88 @@ class TestSshJsonParsing:
         assert cli._ssh_json("u@h", "magent up --json") is None
 
 
+class TestQueryStatusDiagnostics:
+    """The status read reports WHY it failed (timeout / ssh error / missing
+    magent) instead of one generic line, and retries once with a longer
+    timeout when the host is slow to answer (e.g. just booted)."""
+
+    def test_timeout_retries_with_longer_timeout(self, monkeypatch, capsys):
+        from magent.cli import attach as attach_mod
+
+        timeouts: list[int] = []
+
+        def fake_capture(target, cmd, timeout=30):
+            timeouts.append(timeout)
+            if len(timeouts) == 1:
+                return (124, "", "ssh timed out")
+            return (0, '{"ok": true, "up": []}', "")
+
+        monkeypatch.setattr(attach_mod, "_ssh_capture", fake_capture)
+        status, rc, _ = attach_mod._query_status("u@h", "")
+        assert status == {"ok": True, "up": []}
+        assert rc == 0
+        assert timeouts == [
+            attach_mod._STATUS_TIMEOUT_S,
+            attach_mod._STATUS_RETRY_TIMEOUT_S,
+        ]
+        assert "retrying" in capsys.readouterr().out
+
+    def test_double_timeout_explains_slow_host(self, monkeypatch, capsys):
+        from magent.cli import attach as attach_mod
+
+        monkeypatch.setattr(
+            attach_mod, "_ssh_capture", lambda *a, **k: (124, "", "ssh timed out")
+        )
+        status, rc, err = attach_mod._query_status("u@h", "")
+        assert status is None
+        attach_mod._explain_status_failure("u@h", rc, err)
+        out = capsys.readouterr().out
+        assert "Could not read project status" in out
+        assert "timed out" in out
+
+    def test_ssh_error_shows_stderr_detail(self, monkeypatch, capsys):
+        from magent.cli import attach as attach_mod
+
+        monkeypatch.setattr(
+            attach_mod,
+            "_ssh_capture",
+            lambda *a, **k: (255, "", "Permission denied (publickey)."),
+        )
+        status, rc, err = attach_mod._query_status("u@h", "")
+        assert status is None
+        attach_mod._explain_status_failure("u@h", rc, err)
+        out = capsys.readouterr().out
+        assert "ssh exited 255" in out
+        assert "Permission denied" in out
+
+    def test_command_missing_hints_install(self, monkeypatch, capsys):
+        from magent.cli import attach as attach_mod
+
+        monkeypatch.setattr(
+            attach_mod,
+            "_ssh_capture",
+            lambda *a, **k: (1, "", "'magent' is not recognized as an internal..."),
+        )
+        status, rc, err = attach_mod._query_status("u@h", "")
+        assert status is None
+        attach_mod._explain_status_failure("u@h", rc, err)
+        assert "Is magent installed" in capsys.readouterr().out
+
+    def test_clean_run_without_json_probes_version(self, monkeypatch, capsys):
+        from magent.cli import attach as attach_mod
+
+        def fake_capture(target, cmd, timeout=30):
+            if "--version" in cmd:
+                return (1, "", "")
+            return (0, "interactive wizard text, no JSON", "")
+
+        monkeypatch.setattr(attach_mod, "_ssh_capture", fake_capture)
+        status, rc, err = attach_mod._query_status("u@h", "")
+        assert status is None
+        attach_mod._explain_status_failure("u@h", rc, err)
+        assert "Is magent installed" in capsys.readouterr().out
+
+
 class TestAttachNomux:
     """NF-S3-004 + P4: first coverage of _attach_nomux. Its fallback command
     derives from the tool registry (DEFAULT_TOOLS['claude']), never a

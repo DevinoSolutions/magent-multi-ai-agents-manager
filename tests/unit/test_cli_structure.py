@@ -266,9 +266,11 @@ class TestAttachFlowCharacterization:
             "uploadPort": 8033,
             "projects": [{"name": "myapp", "path": "myapp"}],
         }
-        monkeypatch.setattr("magent.cli.attach._ssh_json", lambda *a, **k: status)
+        # Mock at the ssh boundary: the status query now flows through
+        # _ssh_capture (so _attach_flow can diagnose failures), not _ssh_json.
         monkeypatch.setattr(
-            "magent.cli.attach._ssh_capture", lambda *a, **k: (0, "", "")
+            "magent.cli.attach._ssh_capture",
+            lambda *a, **k: (0, json.dumps(status), ""),
         )
         popen_calls = []
         monkeypatch.setattr(

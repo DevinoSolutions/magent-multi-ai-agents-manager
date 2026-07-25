@@ -85,11 +85,8 @@ def _ssh_capture(
         return r.returncode, r.stdout, r.stderr
 
 
-def _ssh_json(
-    target: str, remote_cmd: str, timeout: int = 30
-) -> dict[str, object] | None:
-    """Run a remote command and parse its last single-line JSON object (skips banners)."""
-    _, out, _ = _ssh_capture(target, remote_cmd, timeout)
+def _last_json_obj(out: str) -> dict[str, object] | None:
+    """Parse the last single-line JSON object out of command output (skips banners)."""
     for line in reversed([ln.strip() for ln in out.splitlines() if ln.strip()]):
         if line.startswith("{") and line.endswith("}"):
             try:
@@ -99,6 +96,64 @@ def _ssh_json(
             if isinstance(obj, dict):
                 return obj
     return None
+
+
+def _ssh_json(
+    target: str, remote_cmd: str, timeout: int = 30
+) -> dict[str, object] | None:
+    """Run a remote command and parse its last single-line JSON object."""
+    _, out, _ = _ssh_capture(target, remote_cmd, timeout)
+    return _last_json_obj(out)
+
+
+# A just-booted host can spend far longer than the steady-state budget on its
+# first `magent up --json` (cold interpreter, cloud-synced project dirs), so a
+# timeout gets one retry with a much longer leash before we give up.
+_STATUS_TIMEOUT_S = 30
+_STATUS_RETRY_TIMEOUT_S = 120
+
+
+def _query_status(
+    target: str, grp_suffix: str
+) -> tuple[dict[str, object] | None, int, str]:
+    """Fetch the host's `magent up --json`, returning (status, ssh rc, stderr)
+    so the caller can say WHY when the read fails instead of a generic error."""
+    cmd = f"magent up --json{grp_suffix}"
+    rc, out, err = _ssh_capture(target, cmd, timeout=_STATUS_TIMEOUT_S)
+    if rc == 124:
+        click.echo(
+            f"  {style('o', fg='yellow')} host is slow to answer -- retrying"
+            f" {style(f'(up to {_STATUS_RETRY_TIMEOUT_S}s)', dim=True)}..."
+        )
+        rc, out, err = _ssh_capture(target, cmd, timeout=_STATUS_RETRY_TIMEOUT_S)
+    return _last_json_obj(out), rc, err
+
+
+def _explain_status_failure(target: str, rc: int, err: str) -> None:
+    """One diagnostic line for a failed status read: timeout, ssh error, or
+    missing-magent -- previously all three collapsed into the same message."""
+    click.echo(
+        f"\n  {style('x', fg='red')} Could not read project status from {target}."
+    )
+    detail = err.strip().splitlines()[-1] if err.strip() else ""
+    if rc == 124:
+        click.echo(
+            f"  {style('SSH timed out -- the host may still be starting up; try again in a minute.', dim=True)}"
+        )
+        return
+    if rc != 0:
+        if detail:
+            click.echo(f"  {style(f'ssh exited {rc}: {detail[:200]}', dim=True)}")
+        if "not recognized" in err or "not found" in err:
+            click.echo(
+                f"  {style('Is magent installed and on PATH on the host?', dim=True)}"
+            )
+        return
+    vrc, _, _ = _ssh_capture(target, "magent --version")
+    if vrc != 0:
+        click.echo(
+            f"  {style('Is magent installed and on PATH on the host?', dim=True)}"
+        )
 
 
 def _tile_titles(titles: list[str]) -> None:
@@ -195,16 +250,9 @@ def _attach_flow(
     click.echo()
 
     click.echo(f"  {style('Querying projects on host...', dim=True)}")
-    status = _ssh_json(target, f"magent up --json{grp}", timeout=30)
+    status, rc, err = _query_status(target, grp)
     if status is None:
-        rc, _, _ = _ssh_capture(target, "magent --version")
-        click.echo(
-            f"\n  {style('x', fg='red')} Could not read project status from {target}."
-        )
-        if rc != 0:
-            click.echo(
-                f"  {style('Is magent installed and on PATH on the host?', dim=True)}"
-            )
+        _explain_status_failure(target, rc, err)
         sys.exit(1)
     if status.get("error"):
         click.echo(f"\n  {style('x', fg='red')} Host error: {status['error']}")
