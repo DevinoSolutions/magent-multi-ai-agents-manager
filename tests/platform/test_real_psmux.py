@@ -107,6 +107,18 @@ def test_real_session_pane_cwd_and_kill(tmp_path):
             f"pane_cwd reported {reported!r}, expected {workdir}"
         )
 
+        # The agent command really landed in the pane. Regression pin: the
+        # send-keys senders used to be fire-and-forget, so a parent that exits
+        # immediately (sshd tears down `magent up`'s process tree on channel
+        # close -- the host side of attach) killed them before the keystrokes
+        # arrived, leaving every session a bare shell with no agent running.
+        def _pane_shows_command() -> bool:
+            return f"mdrl-{unique}" in psmux.capture_pane(name)
+
+        assert _wait_until(_pane_shows_command, timeout=15), (
+            "send-keys command never appeared in the pane"
+        )
+
         # Kill THIS session's server and watch the primitives degrade honestly.
         assert psmux.kill_server(name), f"kill_server({name!r}) failed"
 
