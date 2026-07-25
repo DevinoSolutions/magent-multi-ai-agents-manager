@@ -36,18 +36,26 @@ def _default_settings_file() -> Path:
     return Path.home() / ".claude" / "settings.json"
 
 
-def _hook_command() -> str:
-    """The shell command Claude Code should run per event. Resolved to an
-    absolute path at install time: hooks run with whatever PATH the host
-    session has, which need not include this install's Scripts dir."""
+def _hook_exe() -> str:
+    """Absolute path to the state-hook console script, in forward-slash form.
+    Resolved at install time: hooks run with whatever PATH the host session
+    has, which need not include this install's Scripts dir. Forward slashes
+    because Claude Code executes hook commands through a POSIX shell even on
+    Windows, where a raw backslash path is eaten as escape sequences -- and
+    every Windows API accepts the forward-slash spelling anyway."""
     exe = shutil.which(_MARKER) or _MARKER
+    return Path(exe).as_posix()
+
+
+def _hook_command() -> str:
+    """The shell command Claude Code should run per event."""
+    exe = _hook_exe()
     quoted = f'"{exe}"' if " " in exe else exe
     return f"{quoted} --source claude"
 
 
 def _codex_recipe() -> str:
-    exe = shutil.which(_MARKER) or _MARKER
-    return f'notify = [{json.dumps(exe)}, "--source", "codex"]'
+    return f'notify = [{json.dumps(_hook_exe())}, "--source", "codex"]'
 
 
 def _load_settings(path: Path) -> dict[str, object]:

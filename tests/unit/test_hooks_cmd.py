@@ -45,6 +45,31 @@ class TestInstall:
         cmd = data["hooks"]["Stop"][0]["hooks"][0]["command"]
         assert "magent-state-hook" in cmd and "--source claude" in cmd
 
+    def test_command_is_bash_safe_forward_slashes(self, monkeypatch):
+        # Claude Code runs hook commands through a POSIX shell even on Windows:
+        # a backslash path is eaten as escapes ("c:usersamind..." -> not found).
+        monkeypatch.setattr(
+            hooks_cmd.shutil,
+            "which",
+            lambda _: r"C:\Users\x\Scripts\magent-state-hook.EXE",
+        )
+        assert (
+            hooks_cmd._hook_command()
+            == "C:/Users/x/Scripts/magent-state-hook.EXE --source claude"
+        )
+        assert "\\" not in hooks_cmd._codex_recipe()
+
+    def test_command_with_spaces_is_quoted(self, monkeypatch):
+        monkeypatch.setattr(
+            hooks_cmd.shutil,
+            "which",
+            lambda _: r"C:\Program Files\magent\magent-state-hook.EXE",
+        )
+        assert (
+            hooks_cmd._hook_command()
+            == '"C:/Program Files/magent/magent-state-hook.EXE" --source claude'
+        )
+
     def test_post_tool_use_gets_wildcard_matcher(self, runner, tmp_path):
         settings = tmp_path / "settings.json"
         _install(runner, settings)
