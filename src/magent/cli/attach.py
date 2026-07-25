@@ -194,23 +194,47 @@ def _tile_titles(titles: list[str]) -> None:
     )
 
 
+# Bringing up many agents at once is a cold-start storm on the host (each
+# session spawns a shell plus a full agent process): a 40-project bring-up can
+# genuinely run past five minutes on a loaded machine. The old 300s budget
+# gave up mid-storm and re-queried once, capturing a partial session list --
+# windows then opened onto sessions that weren't up yet.
+_BRING_UP_TIMEOUT_S = 900
+_STABILIZE_POLLS = 20
+_STABILIZE_INTERVAL_S = 3
+
+
 def _bring_up_and_requery(
     target: str, grp_suffix: str, fallback_up: list[dict[str, object]]
 ) -> list[dict[str, object]]:
     click.echo(
-        f"  {style('o', fg='cyan')} starting sessions on host (this can take a moment)..."
+        f"  {style('o', fg='cyan')} starting sessions on host "
+        f"{style('(a large bring-up can take several minutes)', dim=True)}..."
     )
-    rc, _, err = _ssh_capture(target, f"magent up{grp_suffix}", timeout=300)
+    rc, _, err = _ssh_capture(
+        target, f"magent up{grp_suffix}", timeout=_BRING_UP_TIMEOUT_S
+    )
     if rc != 0:
         click.echo(
             f"  {style('!', fg='yellow')} bring-up exited {rc}: {style(err.strip()[:200], dim=True)}"
         )
-    time.sleep(1)
-    new = _ssh_json(target, f"magent up --json{grp_suffix}", timeout=30)
-    if not new:
-        return fallback_up
-    raw_up = new.get("up")
-    return _as_session_list(raw_up) if isinstance(raw_up, list) else fallback_up  # ty: ignore[invalid-argument-type]  # reason: isinstance(raw_up, list) proves list; ty 0.0.56 invariance gap
+    # Sessions can still be materializing on a busy host even after `up`
+    # returns (or times out) -- poll until the up-count stops growing rather
+    # than trusting a single snapshot.
+    best = fallback_up
+    prev = -1
+    for _ in range(_STABILIZE_POLLS):
+        new = _ssh_json(target, f"magent up --json{grp_suffix}", timeout=60)
+        if new:
+            raw_up = new.get("up")
+            cur = _as_session_list(raw_up) if isinstance(raw_up, list) else []  # ty: ignore[invalid-argument-type]  # reason: isinstance(raw_up, list) proves list; ty 0.0.56 invariance gap
+            if len(cur) >= len(best):
+                best = cur
+            if len(cur) == prev:
+                break
+            prev = len(cur)
+        time.sleep(_STABILIZE_INTERVAL_S)
+    return best
 
 
 def _attach_flow(
