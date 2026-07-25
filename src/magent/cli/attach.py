@@ -156,6 +156,21 @@ def _explain_status_failure(target: str, rc: int, err: str) -> None:
         )
 
 
+def _local_grid() -> tuple[int, int]:
+    """The attaching machine's configured window grid (columns, rows), falling
+    back to 2x1 -- attach used to hardcode 2x1 and ignore the local layout."""
+    try:
+        data = _as_dict(json.loads(find_config(None).read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return 2, 1
+    layout = _as_dict(data.get("layout"))
+    from magent.cli.config_io import _as_int  # narrow raw-dict helper
+
+    return max(1, _as_int(layout.get("columns"), 2)), max(
+        1, _as_int(layout.get("rows"), 1)
+    )
+
+
 def _tile_titles(titles: list[str]) -> None:
     """Tile already-opened windows into the monitor grid. magent:-grammar titles
     are matched by parsed name (badge-proof); anything else falls back to an
@@ -171,7 +186,8 @@ def _tile_titles(titles: list[str]) -> None:
             f"  {style('!', fg='yellow')} No monitors detected; windows opened but not tiled."
         )
         return
-    slots = compute_grid(monitors, 2, 1)
+    cols, rows = _local_grid()
+    slots = compute_grid(monitors, cols, rows)
 
     click.echo(f"\n  {style('#', fg='cyan')} Tiling {len(titles)} window(s)...")
     placements = []
@@ -183,10 +199,12 @@ def _tile_titles(titles: list[str]) -> None:
         placements.append(
             Placement(name=title, key=key, mode=mode, slot=slots[i % len(slots)])
         )
+    # A big remote attach opens windows over SSH for tens of seconds; a fixed
+    # 3s settle meant latecomers were never found and stayed unaligned.
     place_windows(
         plat,
         placements,
-        settle_s=3,
+        settle_s=min(90, max(3, len(titles))),
         on_placed=lambda p: click.echo(f"    {style('+', fg='green')} {p.name}"),
         on_missing=lambda p: click.echo(
             f"    {style('x', fg='red')} {p.name} {style('not found', dim=True)}"
@@ -360,7 +378,11 @@ def _attach_flow(
                 "ssh",
                 "-t",
                 target,
-                f"magent sessions {sid}",
+                # Direct psmux attach first: it connects in well under a second,
+                # where booting the full magent CLI per window (python import +
+                # config load, x40 windows on a loaded host) made a big attach
+                # take many minutes. The picker is only the fallback path.
+                f"psmux -L {sid} attach || magent sessions {sid}",
             ]
         )
         titles.append(title)

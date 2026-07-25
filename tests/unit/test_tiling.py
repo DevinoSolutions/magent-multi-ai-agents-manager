@@ -104,6 +104,9 @@ class TestTileTitlesPin:
     def test_moves_known_windows_to_slots(self, monkeypatch, fake_sleep, capsys):
         fp = _FakeTilePlat(windows={"A": 1, "B": 2})
         monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+        # Pin the grid: _tile_titles now honors the attaching machine's local
+        # config layout; this test pins tiling mechanics, not grid sourcing.
+        monkeypatch.setattr("magent.cli.attach._local_grid", lambda: (2, 1))
 
         cli._tile_titles(["A", "B"])
 
@@ -115,6 +118,7 @@ class TestTileTitlesPin:
     def test_reports_missing(self, monkeypatch, fake_sleep, capsys):
         fp = _FakeTilePlat(windows={"A": 1})
         monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.cli.attach._local_grid", lambda: (2, 1))
 
         cli._tile_titles(["A", "B"])
 
