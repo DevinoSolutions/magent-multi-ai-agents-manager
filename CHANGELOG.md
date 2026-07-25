@@ -5,6 +5,17 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.4] - 2026-07-25
+
+### Fixed
+
+- **`magent attach` no longer gives up on a long bring-up.** Cold-starting
+  many agents at once is a several-minute storm on the host; attach previously
+  abandoned it after 300 seconds and opened windows from one snapshot of a
+  still-growing session list, so most windows missed their session. The
+  bring-up budget is now 15 minutes and the requery polls until the host's
+  session count stops growing.
+
 ## [3.1.3] - 2026-07-25
 
 ### Fixed
@@ -162,6 +173,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.1.4]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.1.3...v3.1.4
 [3.1.3]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.1.2...v3.1.3
 [3.1.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.1.1...v3.1.2
 [3.1.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.1.0...v3.1.1
