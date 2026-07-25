@@ -155,11 +155,12 @@ This works **over Tailscale**: the server binds only the loopback and your machi
 Run `magent` with no arguments for the interactive menu:
 
 ```
-           _ _   _    _        _
- _ __ _  _| | |_(_)__| |___ __| |__
-| '  \ || | |  _| / _` / -_) _| / /
-|_|_|_\_,_|_|\__|_\__,_\___\__|_\_\
-  v1.0.0  auto-tile your AI workspace
+                         _
+ _ __  __ _ __ _ ___ _ _| |_
+| '  \/ _` / _` / -_) ' \  _|
+|_|_|_\__,_\__, \___|_||_\__|
+           |___/
+  v3.1.1  auto-tile your AI workspace
 
   ----------------------------------------
 
