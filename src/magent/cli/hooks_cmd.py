@@ -73,6 +73,27 @@ def _event_wired(entries: object) -> bool:
     return isinstance(entries, list) and any(_MARKER in json.dumps(e) for e in entries)
 
 
+def _repair_entries(entries: list[object], cmd: str) -> bool:
+    """Rewrite any wired magent-state-hook command that bash cannot run -- a
+    backslash path from a pre-3.1.2 install (idempotence would otherwise skip
+    the broken entry forever). Returns True when something was rewritten."""
+    changed = False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        hooks = entry.get("hooks")
+        if not isinstance(hooks, list):
+            continue
+        for h in hooks:
+            if not isinstance(h, dict):
+                continue
+            c = h.get("command")
+            if isinstance(c, str) and _MARKER in c and "\\" in c:
+                h["command"] = cmd  # ty: ignore[invalid-assignment]  # reason: known ty 0.0.59 isinstance-dict narrowing gap
+                changed = True
+    return changed
+
+
 @main.group("hooks")
 def hooks_group() -> None:
     """Wire agent lifecycle hooks that feed the session-state store."""
@@ -104,11 +125,14 @@ def hooks_install_cmd(settings_file: Path | None) -> None:
     data["hooks"] = hooks
     cmd = _hook_command()
     added: list[str] = []
+    repaired: list[str] = []
     for event in _EVENTS:
         entries_raw = hooks.get(event)
         entries: list[object] = entries_raw if isinstance(entries_raw, list) else []  # ty: ignore[invalid-assignment]  # reason: known ty 0.0.59 isinstance-list narrowing gap
         hooks[event] = entries
         if _event_wired(entries):
+            if _repair_entries(entries, cmd):
+                repaired.append(event)
             continue
         entry: dict[str, object] = {
             "hooks": [{"type": "command", "command": cmd, "timeout": 10}]
@@ -127,6 +151,12 @@ def hooks_install_cmd(settings_file: Path | None) -> None:
         click.echo(
             f"  {style('+', fg='green', bold=True)} Wired {', '.join(added)} in {style(str(path), dim=True)}"
         )
+    if repaired:
+        click.echo(
+            f"  {style('+', fg='green', bold=True)} Repaired stale hook command for "
+            f"{', '.join(repaired)} {style('(pre-3.1.2 backslash path)', dim=True)}"
+        )
+    if added or repaired:
         click.echo(
             f"  {style('Restart open Claude Code sessions to pick the hooks up.', dim=True)}"
         )

@@ -59,6 +59,44 @@ class TestInstall:
         )
         assert "\\" not in hooks_cmd._codex_recipe()
 
+    def test_reinstall_repairs_backslash_command(self, runner, tmp_path):
+        # A pre-3.1.2 install wired backslash paths bash cannot run; the
+        # marker-based idempotence must not skip them -- reinstall rewrites.
+        settings = tmp_path / "settings.json"
+        stale = r"c:\users\x\scripts\magent-state-hook.EXE --source claude"
+        settings.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "Stop": [
+                            {"hooks": [{"type": "command", "command": stale}]},
+                            {
+                                "hooks": [
+                                    {"type": "command", "command": "node notify.mjs"}
+                                ]
+                            },
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = _install(runner, settings)
+        assert result.exit_code == 0
+        assert "Repaired" in result.output
+        data = json.loads(settings.read_text(encoding="utf-8"))
+        cmds = [h["command"] for e in data["hooks"]["Stop"] for h in e["hooks"]]
+        ours = [c for c in cmds if "magent-state-hook" in c]
+        assert len(ours) == 1 and "\\" not in ours[0]
+        assert "node notify.mjs" in cmds  # foreign hook untouched
+
+    def test_reinstall_healthy_reports_already_wired(self, runner, tmp_path):
+        settings = tmp_path / "settings.json"
+        _install(runner, settings)
+        result = _install(runner, settings)
+        assert "Already wired" in result.output
+        assert "Repaired" not in result.output
+
     def test_command_with_spaces_is_quoted(self, monkeypatch):
         monkeypatch.setattr(
             hooks_cmd.shutil,
