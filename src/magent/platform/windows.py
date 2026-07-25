@@ -285,7 +285,7 @@ class WindowsPlatform(Platform):
             if p.wait() != 0:
                 raise subprocess.CalledProcessError(p.returncode, p.args)
 
-        for w in to_create:
+        senders = [
             subprocess.Popen(
                 [
                     psmux,
@@ -300,6 +300,14 @@ class WindowsPlatform(Platform):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            for w in to_create
+        ]
+        # Must wait: when this runs remotely (`magent up` over SSH -- the host
+        # side of attach), sshd kills the whole process tree the moment the CLI
+        # exits, and fire-and-forget senders die before the keystrokes land --
+        # every session then sits at a bare shell with no agent running.
+        for p in senders:
+            p.wait()
 
     def attach_psmux(
         self,

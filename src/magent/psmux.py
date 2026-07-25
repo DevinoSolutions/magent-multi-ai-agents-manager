@@ -138,6 +138,27 @@ def pane_cwd(name: str, psmux: str | None = None) -> str:
         return (result.stdout or "").strip() if result.returncode == 0 else ""
 
 
+def capture_pane(name: str, psmux: str | None = None) -> str:
+    """Return the active pane's visible text, or ``""``. Same guards as
+    ``pane_cwd``: bounded, decode-tolerant, and never raises."""
+    binary = psmux or find_psmux()
+    if not binary:
+        return ""
+    try:
+        result = subprocess.run(
+            [binary, "-L", name, "capture-pane", "-p", "-t", name],
+            capture_output=True,
+            timeout=3,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    else:
+        return (result.stdout or "") if result.returncode == 0 else ""
+
+
 def flash_message(
     name: str,
     message: str,

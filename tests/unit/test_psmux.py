@@ -26,6 +26,30 @@ class _FakeCompleted:
         self.stdout = stdout
 
 
+class TestCapturePane:
+    def test_returns_pane_text_with_guards(self, monkeypatch):
+        captured: dict[str, object] = {}
+
+        def _fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured.update(kwargs)
+            return _FakeCompleted(returncode=0, stdout="PS C:\\proj> claude\n")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        assert psmux.capture_pane("sess", psmux="psmux") == "PS C:\\proj> claude\n"
+        assert captured["cmd"][:4] == ["psmux", "-L", "sess", "capture-pane"]
+        assert captured["timeout"] == 3
+        assert captured["errors"] == "replace"
+
+    def test_failure_degrades_to_empty(self, monkeypatch):
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **kw: (_ for _ in ()).throw(OSError("no psmux")),
+        )
+        assert psmux.capture_pane("sess", psmux="psmux") == ""
+
+
 class TestPaneCwd:
     def test_passes_timeout_encoding_and_errors_guards(self, monkeypatch):
         captured: dict[str, object] = {}
