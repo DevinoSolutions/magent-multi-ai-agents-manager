@@ -84,6 +84,12 @@ def test_real_session_pane_cwd_and_kill(tmp_path):
     workdir = tmp_path / f"cwd-{unique}"
     workdir.mkdir()
 
+    # The sent command drops a file: rendering-independent proof of delivery
+    # AND execution. (capture-pane is useless as the observable on headless
+    # CI runners -- the pane shell runs but never renders into the virtual
+    # screen, so its buffer stays empty forever.)
+    marker = workdir / f"mdrl-{unique}.delivered"
+
     created = False
     try:
         # Bring the session up the way run_magent does: through the
@@ -93,7 +99,7 @@ def test_real_session_pane_cwd_and_kill(tmp_path):
                 PsmuxWindowOpts(
                     window_name=name,
                     cwd=str(workdir),
-                    command=f"rem mdrl-{unique}",
+                    command=f'echo delivered > "{marker}"',
                 )
             ]
         )
@@ -113,10 +119,7 @@ def test_real_session_pane_cwd_and_kill(tmp_path):
         # immediately (sshd tears down `magent up`'s process tree on channel
         # close -- the host side of attach) killed them before the keystrokes
         # arrived, leaving every session a bare shell with no agent running.
-        def _pane_shows_command() -> bool:
-            return f"mdrl-{unique}" in psmux.capture_pane(name)
-
-        if not _wait_until(_pane_shows_command, timeout=15):
+        if not _wait_until(marker.exists, timeout=20):
             binary = psmux.find_psmux() or "psmux"
             panes = subprocess.run(
                 [
@@ -138,7 +141,7 @@ def test_real_session_pane_cwd_and_kill(tmp_path):
                 check=False,
             )
             pytest.fail(
-                "send-keys command never appeared in the pane\n"
+                "send-keys command never executed (marker file absent)\n"
                 f"  list-panes rc={panes.returncode} out={panes.stdout!r} err={panes.stderr!r}\n"
                 f"  capture rc={cap.returncode} out={cap.stdout!r} err={cap.stderr!r}"
             )

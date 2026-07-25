@@ -29,13 +29,14 @@ _BRING_UP_BATCH = 5
 _BRING_UP_BATCH_PAUSE_S = 2.0
 
 
-def _wait_for_pane_ready(binary: str, name: str, timeout_s: float = 20.0) -> None:
-    """Block until the session's pane has rendered its shell prompt.
+def _wait_for_pane_ready(binary: str, name: str, timeout_s: float = 10.0) -> None:
+    """Best-effort wait for the session's pane to render its shell prompt, so
+    send-keys doesn't race a still-starting shell on a loaded machine.
 
-    Keystrokes sent before the pane's shell is actually reading input can be
-    dropped by the console layer (reliably reproduced on cold CI runners), so
-    send-keys must never race the shell start. Best-effort: on timeout we
-    proceed and let send-keys try anyway."""
+    Bounded and advisory: some environments (headless CI service sessions)
+    never render anything into psmux's virtual screen even though the pane
+    shell runs and accepts input fine -- there the wait burns its budget once
+    per batch and send-keys proceeds regardless."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if capture_pane(name, psmux=binary).strip():
