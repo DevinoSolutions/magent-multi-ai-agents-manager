@@ -217,6 +217,49 @@ class TestQueryStatusDiagnostics:
         assert "Is magent installed" in capsys.readouterr().out
 
 
+class TestBringUpAndRequery:
+    """The bring-up requery polls until the host's up-count stabilizes: on a
+    loaded host, sessions keep materializing after `magent up` returns (or
+    times out), and a single snapshot opened windows onto a partial list."""
+
+    def _run(self, monkeypatch, snapshots, up_rc=0):
+        from magent.cli import attach as attach_mod
+
+        polls = iter(snapshots)
+
+        def fake_capture(target, cmd, timeout=30):
+            assert timeout == attach_mod._BRING_UP_TIMEOUT_S
+            return (up_rc, "", "" if up_rc == 0 else "ssh timed out")
+
+        monkeypatch.setattr(attach_mod, "_ssh_capture", fake_capture)
+        monkeypatch.setattr(
+            attach_mod,
+            "_ssh_json",
+            lambda *a, **k: {"up": [{"name": f"s{i}"} for i in range(next(polls))]},
+        )
+        monkeypatch.setattr(attach_mod.time, "sleep", lambda s: None)
+        return attach_mod._bring_up_and_requery("u@h", "", [])
+
+    def test_waits_for_count_to_stabilize(self, monkeypatch):
+        # Growing 2 -> 5 -> 39, then stable: the final list wins.
+        result = self._run(monkeypatch, [2, 5, 39, 39])
+        assert len(result) == 39
+
+    def test_timeout_still_polls_for_sessions(self, monkeypatch, capsys):
+        result = self._run(monkeypatch, [10, 10], up_rc=124)
+        assert len(result) == 10
+        assert "bring-up exited 124" in capsys.readouterr().out
+
+    def test_unreachable_requery_returns_fallback(self, monkeypatch):
+        from magent.cli import attach as attach_mod
+
+        monkeypatch.setattr(attach_mod, "_ssh_capture", lambda *a, **k: (0, "", ""))
+        monkeypatch.setattr(attach_mod, "_ssh_json", lambda *a, **k: None)
+        monkeypatch.setattr(attach_mod.time, "sleep", lambda s: None)
+        fallback = [{"name": "kept"}]
+        assert attach_mod._bring_up_and_requery("u@h", "", fallback) == fallback
+
+
 class TestAttachNomux:
     """NF-S3-004 + P4: first coverage of _attach_nomux. Its fallback command
     derives from the tool registry (DEFAULT_TOOLS['claude']), never a
