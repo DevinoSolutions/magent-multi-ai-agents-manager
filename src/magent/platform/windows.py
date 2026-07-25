@@ -18,6 +18,7 @@ from magent.platform import (
     VSCodeLaunchOpts,
     find_psmux,
 )
+from magent.psmux import capture_pane
 
 user32 = windll.user32
 shcore = windll.shcore
@@ -26,6 +27,20 @@ shcore = windll.shcore
 # loop in launch_psmux_session).
 _BRING_UP_BATCH = 5
 _BRING_UP_BATCH_PAUSE_S = 2.0
+
+
+def _wait_for_pane_ready(binary: str, name: str, timeout_s: float = 20.0) -> None:
+    """Block until the session's pane has rendered its shell prompt.
+
+    Keystrokes sent before the pane's shell is actually reading input can be
+    dropped by the console layer (reliably reproduced on cold CI runners), so
+    send-keys must never race the shell start. Best-effort: on timeout we
+    proceed and let send-keys try anyway."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if capture_pane(name, psmux=binary).strip():
+            return
+        time.sleep(0.3)
 
 
 class WindowsPlatform(Platform):
@@ -300,6 +315,9 @@ class WindowsPlatform(Platform):
             for p in creates:
                 if p.wait() != 0:
                     raise subprocess.CalledProcessError(p.returncode, p.args)
+
+            for w in batch:
+                _wait_for_pane_ready(psmux, w.window_name)
 
             senders = [
                 subprocess.Popen(
