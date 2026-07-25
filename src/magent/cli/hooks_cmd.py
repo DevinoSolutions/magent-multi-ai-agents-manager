@@ -42,9 +42,11 @@ def _hook_exe() -> str:
     has, which need not include this install's Scripts dir. Forward slashes
     because Claude Code executes hook commands through a POSIX shell even on
     Windows, where a raw backslash path is eaten as escape sequences -- and
-    every Windows API accepts the forward-slash spelling anyway."""
+    every Windows API accepts the forward-slash spelling anyway. Plain
+    replace, not Path.as_posix(): a PosixPath doesn't treat backslash as a
+    separator, so as_posix() would pass a Windows path through unchanged."""
     exe = shutil.which(_MARKER) or _MARKER
-    return Path(exe).as_posix()
+    return exe.replace("\\", "/")
 
 
 def _hook_command() -> str:
