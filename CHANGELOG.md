@@ -5,6 +5,24 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.2] - 2026-07-25
+
+### Fixed
+
+- **`magent hooks install` wired hook commands that never ran on Windows.**
+  Claude Code executes hook commands through a POSIX shell, which consumed the
+  backslashes in the installed path -- so the state hook silently failed on
+  every lifecycle event and session states stayed stale despite a "wired"
+  `hooks status`. Paths are now written in forward-slash form, and re-running
+  `magent hooks install` after upgrading repairs entries wired by 3.1.0/3.1.1
+  in place (foreign hooks untouched).
+- **`magent attach` now says why the project-status read failed.** SSH
+  timeouts, ssh/auth errors, and magent-missing-on-host previously collapsed
+  into one generic "Could not read project status" line. The status query also
+  retries once with a 120-second timeout when the host is slow to answer --
+  a just-booted machine cold-starts far slower than the old hard 30-second
+  budget allowed.
+
 ## [3.1.1] - 2026-07-25
 
 ### Fixed
@@ -131,6 +149,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.1.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.1.1...v3.1.2
 [3.1.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.1.0...v3.1.1
 [3.1.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v2.0.0...v3.0.0
