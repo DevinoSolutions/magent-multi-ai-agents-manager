@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes
 import subprocess
+import time
 from ctypes import POINTER, WINFUNCTYPE, byref, create_unicode_buffer, windll
 from typing import Literal
 
@@ -20,6 +21,11 @@ from magent.platform import (
 
 user32 = windll.user32
 shcore = windll.shcore
+
+# Sessions per bring-up wave, and the pause between waves (see the batched
+# loop in launch_psmux_session).
+_BRING_UP_BATCH = 5
+_BRING_UP_BATCH_PAUSE_S = 2.0
 
 
 class WindowsPlatform(Platform):
@@ -263,51 +269,62 @@ class WindowsPlatform(Platform):
         for p in kills:
             p.wait()
 
-        creates = [
-            subprocess.Popen(
-                [
-                    psmux,
-                    "-L",
-                    w.window_name,
-                    "new-session",
-                    "-d",
-                    "-s",
-                    w.window_name,
-                    "-c",
-                    w.cwd,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            for w in to_create
-        ]
-        for p in creates:
-            if p.wait() != 0:
-                raise subprocess.CalledProcessError(p.returncode, p.args)
+        # Batched bring-up: creating every session AND cold-starting every
+        # agent at once is a resource storm (dozens of ConPTYs + agent
+        # processes spawning simultaneously starved the host to the point
+        # that attaches failed). Each batch is created, gets its agent
+        # command, and is given a beat to start before the next wave.
+        for start in range(0, len(to_create), _BRING_UP_BATCH):
+            batch = to_create[start : start + _BRING_UP_BATCH]
+            if start:
+                time.sleep(_BRING_UP_BATCH_PAUSE_S)
 
-        senders = [
-            subprocess.Popen(
-                [
-                    psmux,
-                    "-L",
-                    w.window_name,
-                    "send-keys",
-                    "-t",
-                    w.window_name,
-                    f"cmd /c {w.command}",
-                    "Enter",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            for w in to_create
-        ]
-        # Must wait: when this runs remotely (`magent up` over SSH -- the host
-        # side of attach), sshd kills the whole process tree the moment the CLI
-        # exits, and fire-and-forget senders die before the keystrokes land --
-        # every session then sits at a bare shell with no agent running.
-        for p in senders:
-            p.wait()
+            creates = [
+                subprocess.Popen(
+                    [
+                        psmux,
+                        "-L",
+                        w.window_name,
+                        "new-session",
+                        "-d",
+                        "-s",
+                        w.window_name,
+                        "-c",
+                        w.cwd,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                for w in batch
+            ]
+            for p in creates:
+                if p.wait() != 0:
+                    raise subprocess.CalledProcessError(p.returncode, p.args)
+
+            senders = [
+                subprocess.Popen(
+                    [
+                        psmux,
+                        "-L",
+                        w.window_name,
+                        "send-keys",
+                        "-t",
+                        w.window_name,
+                        f"cmd /c {w.command}",
+                        "Enter",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                for w in batch
+            ]
+            # Must wait: when this runs remotely (`magent up` over SSH -- the
+            # host side of attach), sshd kills the whole process tree the
+            # moment the CLI exits, and fire-and-forget senders die before
+            # the keystrokes land -- every session then sits at a bare shell
+            # with no agent running.
+            for p in senders:
+                p.wait()
 
     def attach_psmux(
         self,
