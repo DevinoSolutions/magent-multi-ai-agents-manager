@@ -260,6 +260,65 @@ class TestBringUpAndRequery:
         assert attach_mod._bring_up_and_requery("u@h", "", fallback) == fallback
 
 
+class TestLocalGrid:
+    def test_reads_local_layout(self, tmp_path, monkeypatch):
+        from magent.cli import attach as attach_mod
+
+        cfg = tmp_path / "c.json"
+        cfg.write_text(json.dumps({"layout": {"columns": 3, "rows": 2}}))
+        monkeypatch.setattr("magent.cli.attach.find_config", lambda *_: cfg)
+        assert attach_mod._local_grid() == (3, 2)
+
+    def test_defaults_without_config(self, tmp_path, monkeypatch):
+        from magent.cli import attach as attach_mod
+
+        monkeypatch.setattr(
+            "magent.cli.attach.find_config", lambda *_: tmp_path / "missing.json"
+        )
+        assert attach_mod._local_grid() == (2, 1)
+
+    def test_garbage_layout_defaults(self, tmp_path, monkeypatch):
+        from magent.cli import attach as attach_mod
+
+        cfg = tmp_path / "c.json"
+        cfg.write_text(json.dumps({"layout": {"columns": 0, "rows": "x"}}))
+        monkeypatch.setattr("magent.cli.attach.find_config", lambda *_: cfg)
+        assert attach_mod._local_grid() == (1, 1)
+
+
+class TestAttachWindowCommand:
+    def test_remote_command_attaches_directly_with_picker_fallback(self, monkeypatch):
+        # Direct psmux attach is the fast path (no python boot per window);
+        # the full magent picker only runs when that fails.
+        from magent.cli import attach as attach_mod
+
+        status = {
+            "up": [{"name": "myapp", "session": "myapp"}],
+            "down": [],
+            "projects": [{"name": "myapp"}],
+        }
+        monkeypatch.setattr(
+            attach_mod, "_query_status", lambda *a, **k: (status, 0, "")
+        )
+        monkeypatch.setattr(attach_mod, "_ssh_capture", lambda *a, **k: (0, "", ""))
+        popen_calls: list[list[str]] = []
+        monkeypatch.setattr(
+            attach_mod.subprocess, "Popen", lambda args, **k: popen_calls.append(args)
+        )
+        monkeypatch.setattr(attach_mod, "_tile_titles", lambda titles: None)
+        monkeypatch.setattr(attach_mod, "_maybe_start_hotkey", lambda url: None)
+        monkeypatch.setattr(attach_mod.time, "sleep", lambda s: None)
+
+        class _NoHotkey:
+            def supports_hotkey(self) -> bool:
+                return False
+
+        monkeypatch.setattr("magent.platform.get_platform", _NoHotkey)
+
+        attach_mod._attach_flow("user@host", no_mux=False, group=None, yes=False)
+        assert popen_calls[0][-1] == "psmux -L myapp attach || magent sessions myapp"
+
+
 class TestAttachNomux:
     """NF-S3-004 + P4: first coverage of _attach_nomux. Its fallback command
     derives from the tool registry (DEFAULT_TOOLS['claude']), never a
