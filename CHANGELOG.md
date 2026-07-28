@@ -5,6 +5,26 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.5] - 2026-07-25
+
+### Fixed
+
+- **Big attaches stay reliable under load.** Sessions now come up in waves of
+  five (instead of cold-starting every agent at once, which starved the host),
+  and each pane's shell gets a beat to be ready before the agent command is
+  typed, so no session is left sitting at a bare prompt.
+- **The session picker survives an overloaded host.** The liveness scan is
+  concurrent with a retry (it was 40 serial probes that silently dropped live
+  sessions), a direct `magent sessions <name>` resolves from config without
+  the scan, and a failed attach is reported and retried instead of silently
+  bouncing back to the menu.
+- **Remote attach windows connect in about a second.** Each window now runs a
+  direct psmux attach (with the picker as fallback) instead of booting the
+  whole magent CLI first -- a 40-window attach was taking minutes on that
+  alone. Tiling also honors the attaching machine's configured grid (it was
+  hardcoded 2x1) and scales its settle budget with window count, so
+  late-spawning windows get placed instead of being left behind.
+
 ## [3.1.4] - 2026-07-25
 
 ### Fixed
@@ -173,6 +193,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.1.5]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.1.4...v3.1.5
 [3.1.4]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.1.3...v3.1.4
 [3.1.3]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.1.2...v3.1.3
 [3.1.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.1.1...v3.1.2
