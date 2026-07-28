@@ -6,12 +6,14 @@ the `up`/`attach`/`hotkey` commands. Carries E4's supports_hotkey() gates
 
 from __future__ import annotations
 
+import contextlib
 import getpass
 import json
 import subprocess
 import sys
 import time
 from collections import Counter
+from pathlib import Path
 
 import click
 
@@ -48,6 +50,27 @@ def _default_attach_host() -> str | None:
     if not hosts:
         return None
     return Counter(hosts).most_common(1)[0][0]
+
+
+_LAST_HOST_FILE = Path.home() / ".magent" / "last-attach-host"
+
+
+def _read_last_host() -> str | None:
+    """The target of the most recent successful attach, if any."""
+    try:
+        text = _LAST_HOST_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text or None
+
+
+def _remember_last_host(target: str) -> None:
+    """Persist the target once the host has answered a status query, so the
+    next no-argument ``magent attach`` offers it as the prompt default.
+    Best-effort: a read-only home dir must not break the attach itself."""
+    with contextlib.suppress(OSError):
+        _LAST_HOST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _LAST_HOST_FILE.write_text(target, encoding="utf-8")
 
 
 def _split_target(host: str) -> tuple[str, str]:
@@ -269,9 +292,12 @@ def _attach_flow(
     grp = f' -g "{group}"' if group else ""
 
     if not host:
-        default = _default_attach_host()
+        # Prefer the last successfully attached target over the config guess:
+        # re-attaching to the same machine is the overwhelmingly common case.
+        default = _read_last_host() or _default_attach_host()
+        hint = "(user@host -- Enter reuses)" if default else "(user@host)"
         host = click.prompt(
-            f"  {style('SSH host', fg='cyan')} {style('(user@host -- blank uses config)', dim=True)}",
+            f"  {style('SSH host', fg='cyan')} {style(hint, dim=True)}",
             default=default or "",
             show_default=bool(default),
         ).strip()
@@ -305,6 +331,9 @@ def _attach_flow(
             f"\n  {style('x', fg='red')} No eligible projects{where} on the host."
         )
         sys.exit(1)
+
+    # The host answered with a real magent status -- worth remembering.
+    _remember_last_host(target)
 
     if no_mux:
         _attach_nomux(target, status)
@@ -580,10 +609,11 @@ def attach_cmd(
 ) -> None:
     """Attach to another machine's magent sessions over SSH.
 
-    HOST is user@host (omit to be prompted; blank uses the host from your local
-    config). Default tiles one window per remote psmux session with Alt+V image
-    paste; --no-mux opens a direct SSH window per project instead. -g limits the
-    flow to one project group on the host; -y skips the bring-up prompt.
+    HOST is user@host (omit to be prompted; the prompt defaults to the last
+    host you attached to, falling back to your local config). Default tiles one
+    window per remote psmux session with Alt+V image paste; --no-mux opens a
+    direct SSH window per project instead. -g limits the flow to one project
+    group on the host; -y skips the bring-up prompt.
     """
     _attach_flow(host, no_mux=no_mux, group=group, yes=yes)
 
