@@ -44,7 +44,7 @@ HELP_SNAPSHOTS = {
     ): "Usage: main up [OPTIONS]\n\n  Ensure a persistent psmux session per project (host side of `attach`).\n\nOptions:\n  --json            Print session status as JSON without changing anything\n  --all             Recreate every session, not just the ones that are down\n  -g, --group TEXT  Only projects tagged with this group\n  --help            Show this message and exit.\n",
     (
         "attach",
-    ): "Usage: main attach [OPTIONS] [HOST]\n\n  Attach to another machine's magent sessions over SSH.\n\n  HOST is user@host (omit to be prompted; blank uses the host from your local\n  config). Default tiles one window per remote psmux session with Alt+V image\n  paste; --no-mux opens a direct SSH window per project instead. -g limits the\n  flow to one project group on the host; -y skips the bring-up prompt.\n\nOptions:\n  --no-mux          One plain SSH window per project (no psmux/tmux)\n  -g, --group TEXT  Only attach/bring up projects in this group\n  -y, --yes         Skip the bring-up prompt (bring up everything that's down)\n  --help            Show this message and exit.\n",
+    ): "Usage: main attach [OPTIONS] [HOST]\n\n  Attach to another machine's magent sessions over SSH.\n\n  HOST is user@host (omit to be prompted; the prompt defaults to the last host\n  you attached to, falling back to your local config). Default tiles one window\n  per remote psmux session with Alt+V image paste; --no-mux opens a direct SSH\n  window per project instead. -g limits the flow to one project group on the\n  host; -y skips the bring-up prompt.\n\nOptions:\n  --no-mux          One plain SSH window per project (no psmux/tmux)\n  -g, --group TEXT  Only attach/bring up projects in this group\n  -y, --yes         Skip the bring-up prompt (bring up everything that's down)\n  --help            Show this message and exit.\n",
     (
         "hotkey",
     ): "Usage: main hotkey [OPTIONS]\n\n  Listen for Alt+V to upload clipboard images to psmux sessions.\n\n  Only activates when a 'magent:' titled window is focused. Otherwise the\n  keystroke passes through normally.\n\nOptions:\n  -s, --server TEXT  Upload server URL\n  --help             Show this message and exit.\n",
@@ -259,7 +259,10 @@ class TestAttachFlowCharacterization:
     `wt ... --title magent:<name>` per up-session and hand the titles to
     _tile_titles; the no-host path must prompt and exit 1 when left blank."""
 
-    def test_psmux_path_spawns_and_tiles(self, monkeypatch):
+    def test_psmux_path_spawns_and_tiles(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "magent.cli.attach._LAST_HOST_FILE", tmp_path / "last-attach-host"
+        )
         status = {
             "up": [{"name": "myapp"}],
             "down": [],
@@ -297,6 +300,7 @@ class TestAttachFlowCharacterization:
 
     def test_no_host_prompts_then_exits(self, monkeypatch):
         monkeypatch.setattr("magent.cli.attach._default_attach_host", lambda: None)
+        monkeypatch.setattr("magent.cli.attach._read_last_host", lambda: None)
         prompted = []
 
         def fake_prompt(text, **k):

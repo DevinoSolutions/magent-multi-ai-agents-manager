@@ -135,6 +135,84 @@ class TestSshJsonParsing:
         assert cli._ssh_json("u@h", "magent up --json") is None
 
 
+class TestLastAttachHost:
+    """`magent attach` remembers the last successfully attached target and
+    offers it as the prompt default on the next no-argument run, preferring
+    it over the config-derived guess."""
+
+    def _isolate(self, monkeypatch, tmp_path):
+        from magent.cli import attach as attach_mod
+
+        monkeypatch.setattr(attach_mod, "_LAST_HOST_FILE", tmp_path / "last-host")
+        return attach_mod
+
+    def test_roundtrip(self, monkeypatch, tmp_path):
+        attach_mod = self._isolate(monkeypatch, tmp_path)
+        assert attach_mod._read_last_host() is None
+        attach_mod._remember_last_host("amin@desktop.ts.net")
+        assert attach_mod._read_last_host() == "amin@desktop.ts.net"
+
+    def test_blank_file_reads_as_none(self, monkeypatch, tmp_path):
+        attach_mod = self._isolate(monkeypatch, tmp_path)
+        attach_mod._LAST_HOST_FILE.write_text("  \n", encoding="utf-8")
+        assert attach_mod._read_last_host() is None
+
+    def test_remember_survives_unwritable_dir(self, monkeypatch, tmp_path):
+        from magent.cli import attach as attach_mod
+
+        blocked = tmp_path / "not-a-dir"
+        blocked.write_text("file, not dir", encoding="utf-8")
+        monkeypatch.setattr(attach_mod, "_LAST_HOST_FILE", blocked / "last-host")
+        attach_mod._remember_last_host("u@h")  # must not raise
+
+    def test_prompt_prefers_last_host_over_config(self, monkeypatch, tmp_path):
+        import click
+
+        attach_mod = self._isolate(monkeypatch, tmp_path)
+        attach_mod._remember_last_host("amin@last-used")
+        monkeypatch.setattr(attach_mod, "_default_attach_host", lambda: "amin@config")
+        seen: dict[str, object] = {}
+
+        def fake_prompt(text, **kwargs):
+            seen.update(kwargs)
+            return ""
+
+        monkeypatch.setattr(click, "prompt", fake_prompt)
+        import pytest
+
+        with pytest.raises(SystemExit):
+            attach_mod._attach_flow(None, no_mux=False, group=None, yes=False)
+        assert seen["default"] == "amin@last-used"
+
+    def test_successful_status_read_remembers_target(self, monkeypatch, tmp_path):
+        import json as json_mod
+        import subprocess as subprocess_mod
+        import time as time_mod
+
+        attach_mod = self._isolate(monkeypatch, tmp_path)
+        status = {
+            "up": [{"name": "myapp"}],
+            "down": [],
+            "projects": [{"name": "myapp", "path": "myapp"}],
+        }
+        monkeypatch.setattr(
+            attach_mod, "_ssh_capture", lambda *a, **k: (0, json_mod.dumps(status), "")
+        )
+        monkeypatch.setattr(subprocess_mod, "Popen", lambda *a, **k: None)
+        monkeypatch.setattr(attach_mod, "_tile_titles", lambda titles: None)
+        monkeypatch.setattr(attach_mod, "_maybe_start_hotkey", lambda url: None)
+        monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+
+        class _NoHotkeyPlat:
+            def supports_hotkey(self) -> bool:
+                return False
+
+        monkeypatch.setattr("magent.platform.get_platform", _NoHotkeyPlat)
+
+        attach_mod._attach_flow("someone@box", no_mux=False, group=None, yes=False)
+        assert attach_mod._read_last_host() == "someone@box"
+
+
 class TestQueryStatusDiagnostics:
     """The status read reports WHY it failed (timeout / ssh error / missing
     magent) instead of one generic line, and retries once with a longer
