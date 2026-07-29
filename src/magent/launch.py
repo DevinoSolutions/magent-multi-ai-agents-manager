@@ -629,6 +629,15 @@ def bring_up_psmux(
     return psmux.bring_up(config, only, group)
 
 
+def revive_psmux(
+    config: MagentConfig, only: list[str] | None = None, group: str | None = None
+) -> list[str]:
+    """Delegate to ``psmux.revive_sessions``."""
+    from magent import psmux
+
+    return psmux.revive_sessions(config, only, group)
+
+
 def kill_psmux(names: list[str]) -> list[str]:
     """Delegate to ``psmux.kill_servers``."""
     from magent.psmux import kill_servers

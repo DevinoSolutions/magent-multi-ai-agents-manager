@@ -159,6 +159,68 @@ def capture_pane(name: str, psmux: str | None = None) -> str:
         return (result.stdout or "") if result.returncode == 0 else ""
 
 
+# Foreground commands that mean "this pane is sitting at a prompt with no
+# agent running". ``cmd`` is deliberately NOT in this set: on Windows the agent
+# launchers are .cmd shims, so cmd.exe is the foreground interpreter for the
+# seconds an agent takes to boot -- calling that idle would type a second
+# command into a live agent. A genuinely dead pane rests at pwsh (Windows,
+# where sessions are created with a pwsh default shell) or a POSIX shell.
+_IDLE_SHELLS: frozenset[str] = frozenset(
+    {"pwsh", "powershell", "bash", "zsh", "fish", "sh", "dash", "nu", "ksh", "tcsh"}
+)
+
+
+def pane_current_command(name: str, psmux: str | None = None) -> str:
+    """Return the active pane's foreground command (``pwsh``, ``claude``, ...).
+
+    The explicit ``-t <name>`` is REQUIRED: without it ``display-message``
+    answers for the *calling client's own* pane, and magent commands are often
+    run from inside a psmux session -- ``capture_pane`` passes ``-t`` for the
+    same reason. Same guards as ``pane_cwd``: bounded, decode-tolerant, and
+    any OSError/SubprocessError swallowed to ``""``.
+    """
+    binary = psmux or find_psmux()
+    if not binary:
+        return ""
+    try:
+        result = subprocess.run(
+            [
+                binary,
+                "-L",
+                name,
+                "display-message",
+                "-t",
+                name,
+                "-p",
+                "#{pane_current_command}",
+            ],
+            capture_output=True,
+            timeout=3,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    else:
+        return (result.stdout or "").strip() if result.returncode == 0 else ""
+
+
+def agent_idle(name: str, psmux: str | None = None) -> bool:
+    """True when the session's pane rests at a bare shell -- its agent is gone.
+
+    An empty or unreadable reading is False on purpose: never inject keystrokes
+    into a pane whose state we could not establish.
+    """
+    raw = pane_current_command(name, psmux=psmux).strip()
+    if not raw:
+        return False
+    leaf = raw.replace("\\", "/").rsplit("/", 1)[-1]
+    if leaf.lower().endswith(".exe"):
+        leaf = leaf[: -len(".exe")]
+    return leaf.lower() in _IDLE_SHELLS
+
+
 def flash_message(
     name: str,
     message: str,
@@ -235,6 +297,7 @@ def eligible_projects(
         base_dir = _expand_base_dir(base_dir)
 
     out: list[dict[str, object]] = []
+    seen: set[str] = set()
     for proj in config.projects:
         if not proj.enabled:
             continue
@@ -246,10 +309,18 @@ def eligible_projects(
         if proj.host:
             continue
         leaf = proj.title or get_leaf_name(proj.path)
+        sid = session_name(leaf)
+        # One session id, one entry: duplicate config entries for a project
+        # produced two identical status rows, hence two identically-titled
+        # attach windows -- and the second could never be tiled, since both
+        # resolve to the same window handle. First occurrence wins.
+        if sid in seen:
+            continue
+        seen.add(sid)
         out.append(
             {
                 "name": leaf,
-                "session": session_name(leaf),
+                "session": sid,
                 "path": proj.path,
                 "tool": tool,
                 "group": proj.group,
@@ -324,6 +395,60 @@ def bring_up(
     if windows:
         plat.launch_psmux_session(windows)
     return [w.window_name for w in windows]
+
+
+def revive_sessions(
+    config: MagentConfig,
+    only: list[str] | None = None,
+    group: str | None = None,
+) -> list[str]:
+    """Re-launch the agent in live sessions whose pane fell back to a shell.
+
+    A session whose agent was Ctrl-C'ed (or whose original send-keys died)
+    still answers ``has-session``, so ``up``/``attach`` reuse it and hand the
+    user a window parked at a bare prompt forever. Candidates are probed
+    concurrently -- the check is two psmux round-trips per session and a large
+    config would otherwise serialize them. Returns the session ids revived.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    binary = find_psmux()
+    if not binary:
+        return []
+
+    candidates: list[dict[str, object]] = []
+    for p in eligible_projects(config, group):
+        if only is not None and _field_str(p, "session") not in only:
+            continue
+        if not p["cmd"]:
+            continue
+        candidates.append(p)
+    if not candidates:
+        return []
+
+    def _revivable(p: dict[str, object]) -> bool:
+        sid = _field_str(p, "session")
+        return has_session(sid, psmux=binary) and agent_idle(sid, psmux=binary)
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        flags = list(pool.map(_revivable, candidates))
+
+    revived: list[str] = []
+    for p, ok in zip(candidates, flags, strict=True):
+        if not ok:
+            continue
+        sid = _field_str(p, "session")
+        # The configured command already IS the resume command -- claude's
+        # registry default is ``claude --continue``, which picks the dead
+        # pane's conversation back up. ``sessions.build_resume_command`` is
+        # deliberately NOT used here: with no session id claude's builder
+        # *strips* ``--continue``, starting a fresh chat -- the opposite of
+        # reviving. Injection shape mirrors ``launch_psmux_session``.
+        resume = _field_str(p, "cmd")
+        keys = f"cmd /c {resume}" if sys.platform == "win32" else resume
+        if send_keys(sid, keys, "Enter", target=sid, psmux=binary):
+            revived.append(sid)
+    return revived
 
 
 def config_sessions(config_path: str | None) -> list[dict[str, object]]:

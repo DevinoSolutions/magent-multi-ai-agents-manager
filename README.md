@@ -186,7 +186,7 @@ Or skip the menu with flags:
 | `magent doctor [--json]` | Diagnose the environment: config, env vars, agent tools on PATH, terminal, monitors, writable dirs, Tailscale, upload port. Exit 1 on any failure. |
 | `magent sessions` | List active psmux sessions, pick one to attach. |
 | `magent sessions <name>` | Attach directly to a psmux session by name. |
-| `magent up [--json] [-g <group>]` | Host side: ensure a persistent psmux session per project. |
+| `magent up [--json] [-g <group>] [--revive]` | Host side: ensure a persistent psmux session per project, and re-launch the agent in any live session whose pane fell back to a bare shell (e.g. after a Ctrl-C). Reviving is automatic except under `--json`, which stays a pure read unless `--revive` is passed. |
 | `magent attach <host>` | From another PC: bring host sessions up over SSH, tile locally, Alt+V uploads. |
 | `magent watch` | Live table of every agent session, most-urgent first; press a row number to focus that window. |
 | `magent attention [-d] [--stop]` | Attention daemon: badges window titles with agent state, flashes the taskbar on needs-input/error, optional toast/ntfy push (`settings.attention`). Badges/flash/toast are Windows-only; ntfy push is cross-platform — see [Platform support](#platform-support). |
