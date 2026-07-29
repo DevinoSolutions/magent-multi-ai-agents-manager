@@ -252,6 +252,21 @@ class TestConfigMenuCharacterization:
         assert "Happy mobile" in out and "enabled" in out
 
 
+class _FakeProc:
+    """Stand-in for a subprocess.Popen handle: records that it was waited on."""
+
+    def __init__(self, rc: int = 0) -> None:
+        self._rc = rc
+        self.waited = False
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.waited = True
+        return self._rc
+
+    def kill(self) -> None:  # pragma: no cover - only on the timeout path
+        pass
+
+
 class TestAttachFlowCharacterization:
     """Pins _attach_flow (radon D/29) BEFORE it moves into cli/attach.py
     (E6.md Step 0 / Step 10). SSH/subprocess/tiling/hotkey/platform are all
@@ -276,11 +291,24 @@ class TestAttachFlowCharacterization:
             lambda *a, **k: (0, json.dumps(status), ""),
         )
         popen_calls = []
-        monkeypatch.setattr(
-            subprocess, "Popen", lambda args, **k: popen_calls.append(args)
-        )
+        procs = []
+
+        def fake_popen(args, **k):
+            popen_calls.append(args)
+            procs.append(_FakeProc())
+            return procs[-1]
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
         tiled = []
-        monkeypatch.setattr("magent.cli.attach._tile_titles", tiled.append)
+
+        def fake_tile(titles):
+            # The serve --ensure hop is started BEFORE tiling so its SSH
+            # round-trip rides under the tiling poll rather than following it.
+            assert popen_calls[-1][0] == "ssh"
+            assert not procs[-1].waited
+            tiled.append(titles)
+
+        monkeypatch.setattr("magent.cli.attach._tile_titles", fake_tile)
         monkeypatch.setattr("magent.cli.attach._maybe_start_hotkey", lambda url: 1234)
 
         class _FakePlat:
@@ -292,10 +320,14 @@ class TestAttachFlowCharacterization:
 
         cli._attach_flow("user@host", no_mux=False, group=None, yes=False)
 
-        assert len(popen_calls) == 1
+        # One wt spawn per up-session, plus the overlapped serve --ensure hop.
+        assert len(popen_calls) == 2
         assert "wt" in popen_calls[0]
         assert "--title" in popen_calls[0]
         assert "magent:myapp" in popen_calls[0]
+        assert popen_calls[1][0] == "ssh"
+        assert popen_calls[1][-1] == "magent serve -p 8033 --ensure"
+        assert procs[-1].waited
         assert tiled == [["magent:myapp"]]
 
     def test_no_host_prompts_then_exits(self, monkeypatch):

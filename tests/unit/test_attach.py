@@ -9,6 +9,20 @@ def _cfg(projects, **settings):
     return MagentConfig(projects=projects, base_dir=None, settings=Settings(**settings))
 
 
+class _FakeProc:
+    """Stand-in for a subprocess.Popen handle (the attach flow waits on the
+    overlapped `serve --ensure` hop, so a bare None no longer suffices)."""
+
+    def __init__(self, rc: int = 0) -> None:
+        self._rc = rc
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self._rc
+
+    def kill(self) -> None:  # pragma: no cover - only on the timeout path
+        pass
+
+
 class TestEligibleProjects:
     def test_filters_remote_ide_and_disabled(self):
         cfg = _cfg(
@@ -198,7 +212,7 @@ class TestLastAttachHost:
         monkeypatch.setattr(
             attach_mod, "_ssh_capture", lambda *a, **k: (0, json_mod.dumps(status), "")
         )
-        monkeypatch.setattr(subprocess_mod, "Popen", lambda *a, **k: None)
+        monkeypatch.setattr(subprocess_mod, "Popen", lambda *a, **k: _FakeProc())
         monkeypatch.setattr(attach_mod, "_tile_titles", lambda titles: None)
         monkeypatch.setattr(attach_mod, "_maybe_start_hotkey", lambda url: None)
         monkeypatch.setattr(time_mod, "sleep", lambda s: None)
@@ -300,7 +314,7 @@ class TestBringUpAndRequery:
     loaded host, sessions keep materializing after `magent up` returns (or
     times out), and a single snapshot opened windows onto a partial list."""
 
-    def _run(self, monkeypatch, snapshots, up_rc=0):
+    def _run(self, monkeypatch, snapshots, up_rc=0, expected=10**6, track=None):
         from magent.cli import attach as attach_mod
 
         polls = iter(snapshots)
@@ -309,14 +323,20 @@ class TestBringUpAndRequery:
             assert timeout == attach_mod._BRING_UP_TIMEOUT_S
             return (up_rc, "", "" if up_rc == 0 else "ssh timed out")
 
+        def fake_json(*a, **k):
+            n = next(polls)
+            if track is not None:
+                track["queries"].append(n)
+            return {"up": [{"name": f"s{i}"} for i in range(n)]}
+
+        def fake_sleep(s):
+            if track is not None:
+                track["sleeps"].append(s)
+
         monkeypatch.setattr(attach_mod, "_ssh_capture", fake_capture)
-        monkeypatch.setattr(
-            attach_mod,
-            "_ssh_json",
-            lambda *a, **k: {"up": [{"name": f"s{i}"} for i in range(next(polls))]},
-        )
-        monkeypatch.setattr(attach_mod.time, "sleep", lambda s: None)
-        return attach_mod._bring_up_and_requery("u@h", "", [])
+        monkeypatch.setattr(attach_mod, "_ssh_json", fake_json)
+        monkeypatch.setattr(attach_mod.time, "sleep", fake_sleep)
+        return attach_mod._bring_up_and_requery("u@h", "", [], expected)
 
     def test_waits_for_count_to_stabilize(self, monkeypatch):
         # Growing 2 -> 5 -> 39, then stable: the final list wins.
@@ -328,6 +348,27 @@ class TestBringUpAndRequery:
         assert len(result) == 10
         assert "bring-up exited 124" in capsys.readouterr().out
 
+    def test_expected_count_on_first_poll_exits_immediately(self, monkeypatch):
+        # The common path: everything came up. One status query, no sleep --
+        # stall detection has nothing left to detect, and waiting out an
+        # interval to prove it cost ~10s on every attach.
+        track = {"queries": [], "sleeps": []}
+        result = self._run(monkeypatch, [7, 7, 7], expected=7, track=track)
+        assert len(result) == 7
+        assert track["queries"] == [7]
+        assert track["sleeps"] == []
+
+    def test_short_of_expected_falls_back_to_stall_detection(self, monkeypatch):
+        # A session that never comes up: 4 of an expected 5. Two equal readings
+        # end the poll, and the interval sleep between them still happens.
+        from magent.cli import attach as attach_mod
+
+        track = {"queries": [], "sleeps": []}
+        result = self._run(monkeypatch, [4, 4, 4], expected=5, track=track)
+        assert len(result) == 4
+        assert track["queries"] == [4, 4]
+        assert track["sleeps"] == [attach_mod._STABILIZE_INTERVAL_S]
+
     def test_unreachable_requery_returns_fallback(self, monkeypatch):
         from magent.cli import attach as attach_mod
 
@@ -335,7 +376,7 @@ class TestBringUpAndRequery:
         monkeypatch.setattr(attach_mod, "_ssh_json", lambda *a, **k: None)
         monkeypatch.setattr(attach_mod.time, "sleep", lambda s: None)
         fallback = [{"name": "kept"}]
-        assert attach_mod._bring_up_and_requery("u@h", "", fallback) == fallback
+        assert attach_mod._bring_up_and_requery("u@h", "", fallback, 5) == fallback
 
 
 class TestLocalGrid:
@@ -380,9 +421,12 @@ class TestAttachWindowCommand:
         )
         monkeypatch.setattr(attach_mod, "_ssh_capture", lambda *a, **k: (0, "", ""))
         popen_calls: list[list[str]] = []
-        monkeypatch.setattr(
-            attach_mod.subprocess, "Popen", lambda args, **k: popen_calls.append(args)
-        )
+
+        def fake_popen(args, **k):
+            popen_calls.append(args)
+            return _FakeProc()
+
+        monkeypatch.setattr(attach_mod.subprocess, "Popen", fake_popen)
         monkeypatch.setattr(attach_mod, "_tile_titles", lambda titles: None)
         monkeypatch.setattr(attach_mod, "_maybe_start_hotkey", lambda url: None)
         monkeypatch.setattr(attach_mod.time, "sleep", lambda s: None)
