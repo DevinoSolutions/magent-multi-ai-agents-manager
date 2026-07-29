@@ -11,7 +11,6 @@ from pathlib import Path
 
 import click
 
-from magent import __version__
 from magent.cli.config_io import _load_config_or_exit
 from magent.cli.ui import _open_in_editor
 from magent.init_config import write_config
@@ -56,7 +55,9 @@ from magent.paths import find_config
     is_flag=True,
     help="With --attach-to: one plain SSH window per project (no psmux/tmux)",
 )
-@click.version_option(__version__)
+# package_name (not a resolved literal) so click reads the distribution
+# metadata inside the --version callback only -- see magent/__init__.py.
+@click.version_option(package_name="magent-multi-ai-agents-manager")
 @click.pass_context
 def main(
     ctx: click.Context,

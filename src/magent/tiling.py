@@ -3,6 +3,12 @@ launch-path tiling and cli._tile_titles's attach-path tiling (R13 residual --
 see audit/stage2/E9.md). Both call sites used to hand-roll their own
 snapshot/retry loop with no shared helper; this is now the one place that
 logic lives, so a fix here reaches both callers.
+
+Timing model: there is no up-front wait anywhere in this module. Placement
+starts with an immediate snapshot and every window is moved the instant it
+shows up in one; ``deadline_s`` only bounds how long we keep polling for
+windows that have not appeared yet. A caller whose windows are all already
+open therefore finishes in a single sweep, no matter how large its deadline.
 """
 
 from __future__ import annotations
@@ -59,21 +65,23 @@ def place_windows(
     plat: Platform,
     placements: list[Placement],
     *,
-    settle_s: float = 0.0,
+    deadline_s: float | None = None,
     on_placed: Callable[[Placement], None] | None = None,
     on_missing: Callable[[Placement], None] | None = None,
 ) -> tuple[list[Placement], list[Placement]]:
     """Resolve each placement's window and move it into its slot.
 
-    Takes one snapshot and places everything already visible, then retries
-    the rest on a shared poll loop -- bounded by the slowest mode among the
-    still-pending placements -- before giving up. Returns ``(placed,
+    Takes an immediate snapshot and places everything already visible, then
+    polls the still-missing set once per ``POLL_INTERVAL_S`` until nothing is
+    pending or the budget runs out. ``deadline_s`` is that budget in seconds
+    and is a deadline for latecomers, not an up-front wait: windows are placed
+    the moment they appear, so a caller whose windows are all up already
+    returns after the first sweep having slept zero times. When it is None the
+    budget is the slowest mode among the still-pending placements
+    (``RETRY_SECS_CONTAINS``/``RETRY_SECS_EXACT``). Returns ``(placed,
     missing)``; every still-missing placement is logged as a WARNING via
     ``get_logger("launch")`` before ``on_missing`` runs for it.
     """
-    if settle_s:
-        time.sleep(settle_s)
-
     placed: list[Placement] = []
     pending = list(placements)
 
@@ -97,11 +105,18 @@ def place_windows(
     _sweep()
 
     if pending:
-        deadline = max(
-            RETRY_SECS_CONTAINS if p.mode == "contains" else RETRY_SECS_EXACT
-            for p in pending
+        # Only the windows that are still missing cost anything here: each
+        # poll sweeps and places whatever has since appeared, so the budget is
+        # a deadline for latecomers rather than a wait the whole set pays.
+        budget_s = (
+            deadline_s
+            if deadline_s is not None
+            else max(
+                RETRY_SECS_CONTAINS if p.mode == "contains" else RETRY_SECS_EXACT
+                for p in pending
+            )
         )
-        for _ in range(deadline):
+        for _ in range(int(budget_s / POLL_INTERVAL_S)):
             if not pending:
                 break
             time.sleep(POLL_INTERVAL_S)

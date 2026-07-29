@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING
 
 import click
 
-from magent import __version__
 from magent.style import style
 
 if TYPE_CHECKING:
@@ -30,6 +29,10 @@ LOGO_LINES = [
 
 
 def _banner() -> None:
+    # deferred: resolving __version__ costs an importlib.metadata import, and
+    # only the banner needs it -- the banner-free fast paths shouldn't pay it.
+    from magent import __version__
+
     click.echo()
     for line in LOGO_LINES:
         click.echo(f"  {style(line, fg='cyan')}")

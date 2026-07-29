@@ -31,7 +31,7 @@ from magent.grid import compute_grid
 from magent.log import get_logger
 from magent.paths import find_config
 from magent.style import style
-from magent.tiling import Placement, place_windows
+from magent.tiling import RETRY_SECS_CONTAINS, Placement, place_windows
 from magent.titles import make_title, parse_title
 
 
@@ -222,12 +222,16 @@ def _tile_titles(titles: list[str]) -> None:
         placements.append(
             Placement(name=title, key=key, mode=mode, slot=slots[i % len(slots)])
         )
-    # A big remote attach opens windows over SSH for tens of seconds; a fixed
-    # 3s settle meant latecomers were never found and stayed unaligned.
+    # A big remote attach spawns windows over SSH for tens of seconds, so
+    # latecomers need a deadline that scales with the window count -- but
+    # polling from t=0 means windows that are already open tile immediately
+    # instead of waiting out a fixed settle. That settle was the "awkward
+    # finite wait" bug: a 40-window attach slept 40s before touching anything,
+    # even when every session already existed and every window was up in one.
     place_windows(
         plat,
         placements,
-        settle_s=min(90, max(3, len(titles))),
+        deadline_s=min(120, max(RETRY_SECS_CONTAINS, 2 * len(titles))),
         on_placed=lambda p: click.echo(f"    {style('+', fg='green')} {p.name}"),
         on_missing=lambda p: click.echo(
             f"    {style('x', fg='red')} {p.name} {style('not found', dim=True)}"
