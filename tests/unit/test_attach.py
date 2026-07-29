@@ -1,7 +1,7 @@
 import json
 
 from magent import cli
-from magent.config import MagentConfig, ProjectConfig, Settings
+from magent.config import SCHEMA_VERSION, MagentConfig, ProjectConfig, Settings
 from magent.launch import eligible_psmux_projects
 
 
@@ -482,3 +482,143 @@ class TestUpJsonConfigError:
         payload = json.loads(result.stdout)
         assert payload["ok"] is False
         assert payload["error"]
+
+
+# The `projects` shape psmux_status returns (up --json serializes every key).
+_PROJECT_ROWS = [
+    {
+        "name": "api",
+        "session": "api",
+        "path": "/a/api",
+        "tool": "claude",
+        "group": None,
+        "resolved": "/a/api",
+        "cmd": "claude --continue",
+    }
+]
+
+
+class TestUpRevive:
+    """`up` re-launches the agent in sessions that are alive but parked at a
+    bare shell. Interactive runs always do it; `--json` stays a pure read
+    unless --revive is passed, because attach polls it repeatedly."""
+
+    def _config(self, tmp_path):
+        p = tmp_path / "magent.config.json"
+        p.write_text(
+            json.dumps(
+                {
+                    "version": SCHEMA_VERSION,
+                    "projects": [{"path": "/a/api", "tool": "claude"}],
+                    "settings": {"uploadServer": False},
+                }
+            )
+        )
+        return str(p)
+
+    def _patch(self, monkeypatch, revived, up=None):
+        """Stub the two heavy subsystem calls up_cmd makes; record revive args."""
+        calls: list[dict[str, object]] = []
+        rows = up if up is not None else [{"name": "api", "session": "api"}]
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: (rows, [], _PROJECT_ROWS),
+        )
+
+        def fake_revive(cfg, only=None, group=None):
+            calls.append({"only": only, "group": group})
+            return revived
+
+        monkeypatch.setattr("magent.launch.revive_psmux", fake_revive)
+        return calls
+
+    def test_json_is_a_pure_read_by_default(self, runner, tmp_path, monkeypatch):
+        def _fail(*a, **k):
+            raise AssertionError("plain `up --json` must not revive anything")
+
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: (
+                [{"name": "api", "session": "api"}],
+                [],
+                _PROJECT_ROWS,
+            ),
+        )
+        monkeypatch.setattr("magent.launch.revive_psmux", _fail)
+
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_path), "up", "--json"]
+        )
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout)
+        # The key is always present so a consumer can read it unconditionally.
+        assert payload["revived"] == []
+
+    def test_json_revive_flag_revives_the_live_sessions(
+        self, runner, tmp_path, monkeypatch
+    ):
+        calls = self._patch(monkeypatch, revived=["api"])
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_path), "up", "--json", "--revive"]
+        )
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["revived"] == ["api"]
+        # Only sessions that were ALREADY up are candidates -- a session just
+        # created by bring-up may still be booting its agent.
+        assert calls == [{"only": ["api"], "group": None}]
+
+    def test_interactive_up_revives_without_the_flag(
+        self, runner, tmp_path, monkeypatch
+    ):
+        self._patch(monkeypatch, revived=["api", "web"])
+        result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
+        assert result.exit_code == 0
+        assert "Revived agent in" in result.output
+        assert "api, web" in result.output
+
+    def test_interactive_up_stays_quiet_when_nothing_was_dead(
+        self, runner, tmp_path, monkeypatch
+    ):
+        self._patch(monkeypatch, revived=[])
+        result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
+        assert result.exit_code == 0
+        assert "Revived" not in result.output
+
+
+class TestQueryStatusRevives:
+    def test_remote_command_revives_with_legacy_fallback(self, monkeypatch):
+        # A host on an older magent rejects the unknown --revive flag and prints
+        # nothing on stdout; `||` falls back to the plain read so attach still
+        # works (same trick as `psmux attach || magent sessions`).
+        from magent.cli import attach as attach_mod
+
+        seen: list[str] = []
+
+        def fake_capture(target, cmd, timeout=30):
+            seen.append(cmd)
+            return (0, '{"ok": true, "up": []}', "")
+
+        monkeypatch.setattr(attach_mod, "_ssh_capture", fake_capture)
+        attach_mod._query_status("u@h", ' -g "core"')
+
+        assert seen == [
+            'magent up --json --revive -g "core" || magent up --json -g "core"'
+        ]
+
+    def test_retry_reuses_the_same_command(self, monkeypatch):
+        from magent.cli import attach as attach_mod
+
+        seen: list[str] = []
+
+        def fake_capture(target, cmd, timeout=30):
+            seen.append(cmd)
+            if len(seen) == 1:
+                return (124, "", "ssh timed out")
+            return (0, '{"ok": true}', "")
+
+        monkeypatch.setattr(attach_mod, "_ssh_capture", fake_capture)
+        attach_mod._query_status("u@h", "")
+        assert len(seen) == 2
+        assert seen[0] == seen[1]
+        assert "--revive" in seen[0]
+        assert "|| magent up --json" in seen[0]

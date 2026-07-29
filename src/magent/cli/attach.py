@@ -141,7 +141,12 @@ def _query_status(
 ) -> tuple[dict[str, object] | None, int, str]:
     """Fetch the host's `magent up --json`, returning (status, ssh rc, stderr)
     so the caller can say WHY when the read fails instead of a generic error."""
-    cmd = f"magent up --json{grp_suffix}"
+    # Revive dead-agent panes while we're reading status, so a session that is
+    # "up" but parked at a bare shell gets its agent back before we open a
+    # window onto it. A host running an older magent rejects the unknown flag
+    # with nothing on stdout, and the `||` falls back to the plain read -- the
+    # same trick as the `psmux attach || magent sessions` line further down.
+    cmd = f"magent up --json --revive{grp_suffix} || magent up --json{grp_suffix}"
     rc, out, err = _ssh_capture(target, cmd, timeout=_STATUS_TIMEOUT_S)
     if rc == 124:
         click.echo(
@@ -564,8 +569,15 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
 @click.option(
     "-g", "--group", default=None, help="Only projects tagged with this group"
 )
+@click.option(
+    "--revive",
+    is_flag=True,
+    help="Re-launch the agent in live sessions whose pane fell back to a bare shell",
+)
 @click.pass_context
-def up_cmd(ctx: click.Context, as_json: bool, do_all: bool, group: str | None) -> None:
+def up_cmd(
+    ctx: click.Context, as_json: bool, do_all: bool, group: str | None, revive: bool
+) -> None:
     """Ensure a persistent psmux session per project (host side of `attach`)."""
     config_file = find_config(ctx.obj.get("config_path"))
     # Shared as_json config-error envelope (NF-S3-005): --json always gets JSON,
@@ -575,11 +587,19 @@ def up_cmd(ctx: click.Context, as_json: bool, do_all: bool, group: str | None) -
     from magent.launch import (  # heavy subsystem: in-body per policy
         bring_up_psmux,
         psmux_status,
+        revive_psmux,
     )
 
     up, down, projects = psmux_status(cfg, group=group)
+    # Only sessions that were ALREADY up are revive candidates: one created
+    # moments ago by bring_up_psmux may still be booting its agent, and typing
+    # into that pane would double-launch.
+    live_ids = [_as_str(d.get("session")) or _as_str(d.get("name")) for d in up]
 
     if as_json:
+        # `up --json` is a pure read by default (attach polls it repeatedly);
+        # reviving is opt-in so a poll never types into anyone's pane.
+        revived = revive_psmux(cfg, only=live_ids, group=group) if revive else []
         click.echo(
             json.dumps(
                 {
@@ -593,6 +613,9 @@ def up_cmd(ctx: click.Context, as_json: bool, do_all: bool, group: str | None) -
                     # (psmux socket id) from psmux_status (P3-01).
                     "up": up,
                     "down": down,
+                    # Always present (empty without --revive) so a consumer can
+                    # read it unconditionally. P3-03: snake_case.
+                    "revived": revived,
                     "projects": [
                         {
                             "name": p["name"],
@@ -632,6 +655,17 @@ def up_cmd(ctx: click.Context, as_json: bool, do_all: bool, group: str | None) -
         click.echo(
             f"  {style('+', fg='green')} Brought up {style(str(len(created)), fg='green', bold=True)}"
             f" session(s): {style(', '.join(created) or '(none)', dim=True)}"
+        )
+
+    # Unconditional on the interactive path: a session that is up but parked at
+    # a bare shell is exactly what this command is asked to fix, and there is
+    # no poll here to keep pure (unlike --json).
+    revived = revive_psmux(cfg, only=live_ids, group=group)
+    if revived:
+        click.echo(
+            f"  {style('+', fg='green')} Revived agent in"
+            f" {style(str(len(revived)), fg='green', bold=True)}"
+            f" session(s): {style(', '.join(revived), dim=True)}"
         )
 
     if cfg.settings.upload_server:
