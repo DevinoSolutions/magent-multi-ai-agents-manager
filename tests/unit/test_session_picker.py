@@ -1,62 +1,147 @@
-"""Session-picker load hardening: the parallel liveness sweep retries flapping
-probes, direct-name attach resolves from config (no sweep dependency), and a
-failed attach is surfaced + retried instead of being wiped by the redraw.
+"""Session-picker load hardening and first-paint cost: the liveness sweep is a
+process fan-out that retries flapping probes, per-session cwds come from config
+rather than a psmux probe per paint, direct-name attach resolves from config (no
+sweep dependency), and a failed attach is surfaced + retried instead of being
+wiped by the redraw.
 """
 
 from __future__ import annotations
 
+import time
+
 from magent.cli import session_picker
+
+
+class _FakeProc:
+    """Stand-in for the Popen handle `_live_sessions` fans out, logging when it
+    is waited on so the spawn-then-wait ordering can be pinned."""
+
+    def __init__(self, name: str, returncode: int, events: list[str]) -> None:
+        self._name = name
+        self._returncode = returncode
+        self._events = events
+
+    def wait(self) -> int:
+        self._events.append(f"wait:{self._name}")
+        return self._returncode
+
+
+def _fan_out(monkeypatch, results: dict[str, list[bool]]) -> list[str]:
+    """Patch Popen so each `has-session` probe pops the next result for its
+    session. Returns the spawn/wait event log."""
+    events: list[str] = []
+
+    def _fake_popen(cmd, **kwargs):
+        name = cmd[2]
+        events.append(f"spawn:{name}")
+        return _FakeProc(name, 0 if results[name].pop(0) else 1, events)
+
+    monkeypatch.setattr(session_picker.subprocess, "Popen", _fake_popen)
+    return events
 
 
 class TestLiveSessions:
     def test_retries_misses_once(self, monkeypatch):
         # First probe flaps b and c to False; the retry recovers b.
-        calls: list[list[str]] = []
-        flaky = {"a": [True], "b": [False, True], "c": [False, False]}
-
-        def fake_has_session(name, psmux=None):
-            calls.append([name])
-            return flaky[name].pop(0)
-
-        monkeypatch.setattr(
-            "magent.psmux.has_session",
-            lambda n, psmux=None: fake_has_session(n, psmux),
-        )
-        live = session_picker._live_sessions("psmux", ["a", "b", "c"])
-        assert live == ["a", "b"]
+        _fan_out(monkeypatch, {"a": [True], "b": [False, True], "c": [False, False]})
+        assert session_picker._live_sessions("psmux", ["a", "b", "c"]) == ["a", "b"]
 
     def test_config_order_preserved(self, monkeypatch):
-        monkeypatch.setattr("magent.psmux.has_session", lambda n, psmux=None: True)
-        live = session_picker._live_sessions("psmux", ["z", "m", "a"])
-        assert live == ["z", "m", "a"]
+        _fan_out(monkeypatch, {"z": [True], "m": [True], "a": [True]})
+        assert session_picker._live_sessions("psmux", ["z", "m", "a"]) == [
+            "z",
+            "m",
+            "a",
+        ]
 
     def test_no_retry_when_all_alive(self, monkeypatch):
-        counts: dict[str, int] = {}
-
-        def fake(n, psmux=None):
-            counts[n] = counts.get(n, 0) + 1
-            return True
-
-        monkeypatch.setattr("magent.psmux.has_session", fake)
+        events = _fan_out(monkeypatch, {"a": [True], "b": [True]})
         session_picker._live_sessions("psmux", ["a", "b"])
-        assert counts == {"a": 1, "b": 1}
+        assert [e for e in events if e.startswith("spawn:")] == ["spawn:a", "spawn:b"]
 
-
-class TestConfigSessionCandidates:
-    def test_filters_and_sanitizes(self):
-        data = {
-            "settings": {"defaultTool": "claude"},
-            "projects": [
-                {"path": "x/api proj"},
-                {"path": "x/web", "tool": "vscode"},
-                {"path": "x/off", "enabled": False},
-                {"path": "x/y", "title": "My.App"},
-            ],
-        }
-        assert session_picker._config_session_candidates(data) == [
-            "api-proj",
-            "My-App",
+    def test_every_probe_is_spawned_before_any_is_waited_on(self, monkeypatch):
+        # The point of the fan-out: n concurrent psmux round-trips, not n
+        # sequential ones (nor ceil(n/16) thread-pool batches).
+        events = _fan_out(monkeypatch, {"a": [True], "b": [True], "c": [True]})
+        session_picker._live_sessions("psmux", ["a", "b", "c"])
+        assert events == [
+            "spawn:a",
+            "spawn:b",
+            "spawn:c",
+            "wait:a",
+            "wait:b",
+            "wait:c",
         ]
+
+    def test_probe_argv_is_a_per_session_has_session(self, monkeypatch):
+        argvs: list[list[str]] = []
+
+        def _fake_popen(cmd, **kwargs):
+            argvs.append(cmd)
+            return _FakeProc(cmd[2], 0, [])
+
+        monkeypatch.setattr(session_picker.subprocess, "Popen", _fake_popen)
+        session_picker._live_sessions("psmux", ["a"])
+        assert argvs == [["psmux", "-L", "a", "has-session"]]
+
+
+class TestSessionCwds:
+    def test_config_paths_are_used_without_probing_psmux(self, monkeypatch):
+        # The whole perf fix: at 40 sessions the pane_cwd sweep was ~3.4s of a
+        # ~4.8s first paint, and only restated what config already knew.
+        probed: list[str] = []
+
+        def _fake_pane_cwd(name, psmux=None):
+            probed.append(name)
+            return "/probed"
+
+        monkeypatch.setattr("magent.psmux.pane_cwd", _fake_pane_cwd)
+        cwds = session_picker._session_cwds(
+            "psmux", ["a", "b"], {"a": "/proj/a", "b": "/proj/b"}
+        )
+        assert cwds == {"a": "/proj/a", "b": "/proj/b"}
+        assert probed == []
+
+    def test_only_an_unresolved_session_falls_back_to_a_probe(self, monkeypatch):
+        probed: list[str] = []
+
+        def _fake_pane_cwd(name, psmux=None):
+            probed.append(name)
+            return "/live/b"
+
+        monkeypatch.setattr("magent.psmux.pane_cwd", _fake_pane_cwd)
+        cwds = session_picker._session_cwds(
+            "psmux", ["a", "b"], {"a": "/proj/a", "b": ""}
+        )
+        assert cwds == {"a": "/proj/a", "b": "/live/b"}
+        assert probed == ["b"]
+
+    def test_session_missing_from_the_map_falls_back_too(self, monkeypatch):
+        monkeypatch.setattr("magent.psmux.pane_cwd", lambda n, psmux=None: "/live")
+        assert session_picker._session_cwds("psmux", ["ghost"], {}) == {
+            "ghost": "/live"
+        }
+
+
+class TestSessionStatuses:
+    def test_state_is_looked_up_by_the_config_resolved_path(self, monkeypatch):
+        seen: list[str] = []
+
+        def _fake_state_for(cwd, max_age=None):
+            seen.append(cwd)
+            return {"state": "done", "ts": time.time()}
+
+        monkeypatch.setattr("magent.agent_state.state_for", _fake_state_for)
+        statuses = session_picker._session_statuses({"api": "C:/proj/api"})
+        assert seen == ["C:/proj/api"]
+        assert "done" in statuses["api"]
+
+    def test_empty_cwd_is_never_looked_up(self, monkeypatch):
+        def _boom(cwd, max_age=None):
+            raise AssertionError(f"state_for called with {cwd!r}")
+
+        monkeypatch.setattr("magent.agent_state.state_for", _boom)
+        assert session_picker._session_statuses({"api": ""}) == {"api": ""}
 
 
 class TestAttachSession:
