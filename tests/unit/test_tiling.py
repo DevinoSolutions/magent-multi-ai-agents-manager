@@ -126,6 +126,21 @@ class TestTileTitlesPin:
         out = capsys.readouterr().out
         assert "not found" in out
 
+    def test_many_already_open_windows_tile_without_waiting(
+        self, monkeypatch, fake_sleep, capsys
+    ):
+        """Attach's deadline scales with window count, but a set that is
+        already up must tile immediately -- zero sleeps, not a settle."""
+        titles = [f"w{i}" for i in range(8)]
+        fp = _FakeTilePlat(windows={t: i for i, t in enumerate(titles, start=1)})
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.cli.attach._local_grid", lambda: (4, 2))
+
+        cli._tile_titles(titles)
+
+        assert fake_sleep == []
+        assert len(fp.moved) == 8
+
     def test_no_monitors_returns(self, monkeypatch, capsys, caplog):
         fp = _FakeTilePlat(windows={}, monitors=[])
         monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
@@ -227,13 +242,44 @@ class TestPlaceWindows:
         assert "ghost" in caplog.text
         assert len(fake_sleep) == RETRY_SECS_EXACT
 
-    def test_settle_sleeps_before_first_snapshot(self, fake_sleep):
-        fp = _FakeTilePlat(windows={"X": 1})
+    def test_deadline_does_not_delay_windows_already_present(self, fake_sleep):
+        """THE regression pin: deadline_s is a budget for latecomers, never an
+        up-front wait. A big attach whose sessions already existed used to
+        stare at untiled windows for a fixed settle before the first snapshot."""
+        fp = _FakeTilePlat(windows={"X": 1, "Y": 2})
+        placements = [
+            Placement(key="X", mode="exact", slot=_slot()),
+            Placement(key="Y", mode="exact", slot=_slot(x=960)),
+        ]
+
+        placed, missing = place_windows(fp, placements, deadline_s=90)
+
+        assert placed == placements
+        assert missing == []
+        assert fake_sleep == []
+        assert len(fp.moved) == 2
+
+    def test_deadline_bounds_polling_for_missing_windows(self, fake_sleep):
+        fp = _FakeTilePlat(windows={})
+        placements = [Placement(key="ghost", mode="exact", slot=_slot())]
+
+        placed, missing = place_windows(fp, placements, deadline_s=3)
+
+        assert placed == []
+        assert missing == placements
+        assert fake_sleep == [1.0, 1.0, 1.0]
+
+    def test_deadline_extends_beyond_mode_default(self, fake_sleep):
+        # Appears on the 10th snapshot -- past the 6s exact-mode default, so
+        # only the caller's larger deadline can catch it.
+        fp = _FakeTilePlat(windows=[{}] * 9 + [{"X": 5}])
         placements = [Placement(key="X", mode="exact", slot=_slot())]
 
-        place_windows(fp, placements, settle_s=3)
+        placed, missing = place_windows(fp, placements, deadline_s=15)
 
-        assert fake_sleep[0] == 3
+        assert [p.key for p in placed] == ["X"]
+        assert missing == []
+        assert len(fake_sleep) == 9 > RETRY_SECS_EXACT
 
     def test_exact_vs_contains_lookup(self, fake_sleep):
         fp = _FakeTilePlat(windows={"Visual Studio Code - foo": 7})

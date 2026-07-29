@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import click
 
-from magent import __version__
 from magent.cli.app import main
 from magent.config import LayoutConfig, Settings
 
@@ -121,6 +120,10 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
 
 
 def _generate_docs() -> str:
+    # deferred: resolving __version__ costs an importlib.metadata import, and
+    # only this generator needs it -- every other command shouldn't pay it.
+    from magent import __version__
+
     defaults_layout = LayoutConfig()
     defaults_settings = Settings()
 

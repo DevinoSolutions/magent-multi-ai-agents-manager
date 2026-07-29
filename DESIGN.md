@@ -127,10 +127,15 @@ None of these imports any other `magent` module (`style.py` imports
   numbers. Its retry constants are named and centralized:
   `RETRY_SECS_CONTAINS` (20s — `contains`-mode matches like VS Code windows
   are slow to appear), `RETRY_SECS_EXACT` (6s), `POLL_INTERVAL_S` (1.0s).
-  `place_windows` takes one snapshot, places everything already visible, then
-  polls only the still-missing set up to the slower of the two deadlines,
-  logging a WARNING via `get_logger("launch")` for anything still missing
-  before invoking the caller's `on_missing` callback.
+  `place_windows` takes an immediate snapshot, places everything already
+  visible, then polls only the still-missing set up to the slower of the two
+  deadlines, logging a WARNING via `get_logger("launch")` for anything still
+  missing before invoking the caller's `on_missing` callback. Its optional
+  `deadline_s` overrides that per-mode budget, and it is a deadline for
+  latecomers — **never an up-front wait**. There is deliberately no pre-sleep:
+  the attach path used to pass a blind `settle_s` scaled to the window count,
+  so a 40-window attach whose psmux sessions already existed sat on untiled
+  windows for a fixed 40s even though all 40 were up in under a second.
 - **`platform/` (ABC + per-OS backends)** — `Platform` declares the
   cross-platform contract via `@abstractmethod` (`set_dpi_aware`,
   `list_monitors`, `find_window`, `move_window`, `launch_terminal`,
@@ -256,8 +261,8 @@ laziness.
   because `config_editor.py` never imports back from `menu.py`.
 - **`attach.py`** — SSH/attach orchestration: `_attach_flow` (see Key
   Decisions), its no-mux sibling `_attach_nomux`, `_tile_titles` (delegates
-  to `tiling.place_windows` with `settle_s=3` and a hard-coded 2×1 grid —
-  see Known Debt), and the `up`/`attach`/`hotkey` commands. Loads typed
+  to `tiling.place_windows` with a `deadline_s` that scales with the window
+  count — see Known Debt), and the `up`/`attach`/`hotkey` commands. Loads typed
   config through `config_io._load_config_or_exit`, whose `as_json` mode powers
   `up --json`'s JSON error envelope (see Key Decisions).
 - **`docs.py`** — the `magent docs` command: a pure-string Markdown
