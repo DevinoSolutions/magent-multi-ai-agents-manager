@@ -638,6 +638,13 @@ def revive_psmux(
     return psmux.revive_sessions(config, only, group)
 
 
+def decorate_psmux_sessions(names: list[str]) -> list[str]:
+    """Delegate to ``psmux.decorate_sessions``."""
+    from magent import psmux
+
+    return psmux.decorate_sessions(names)
+
+
 def kill_psmux(names: list[str]) -> list[str]:
     """Delegate to ``psmux.kill_servers``."""
     from magent.psmux import kill_servers

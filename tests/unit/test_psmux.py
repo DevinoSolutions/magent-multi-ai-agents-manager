@@ -280,3 +280,75 @@ class TestReviveSessions:
         monkeypatch.setattr(psmux, "find_psmux", lambda: None)
         cfg = _cfg([ProjectConfig(path="/a/api", tool="claude")])
         assert psmux.revive_sessions(cfg) == []
+
+
+class TestDecorateSession:
+    """The status-line hints (` F1 picker  F2 code `) plus the product-owned
+    `bind -n F1 detach-client`. Both are `-L <name>`-scoped so they land on
+    that session's own server and beat whatever its tmux.conf set at start-up.
+    """
+
+    def _run(self, monkeypatch, *, boom: Exception | None = None):
+        cmds: list[list[str]] = []
+
+        def _fake_run(cmd, **kwargs):
+            cmds.append(cmd)
+            if boom is not None:
+                raise boom
+            return _FakeCompleted(returncode=0, stdout="")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        psmux.decorate_session("api", psmux="psmux")
+        return cmds
+
+    def test_binds_f1_to_detach_client(self, monkeypatch):
+        cmds = self._run(monkeypatch)
+        assert cmds[0] == ["psmux", "-L", "api", "bind", "-n", "F1", "detach-client"]
+
+    def test_sets_the_status_right_hint(self, monkeypatch):
+        cmds = self._run(monkeypatch)
+        assert cmds[1] == [
+            "psmux",
+            "-L",
+            "api",
+            "set",
+            "-g",
+            "status-right",
+            " F1 picker  F2 code ",
+        ]
+
+    def test_hint_advertises_both_keys(self):
+        # The literal is defined once; a rename must not silently drop a key.
+        argv = psmux.decoration_argv("api", "psmux")
+        assert "F1" in argv[1][-1] and "F2" in argv[1][-1]
+
+    def test_never_raises_when_the_subprocess_fails(self, monkeypatch):
+        # A status bar is cosmetic: an unlaunchable/hung psmux is logged and
+        # swallowed, never propagated into a bring-up.
+        cmds = self._run(monkeypatch, boom=OSError("no psmux"))
+        assert len(cmds) == 2  # both attempted; neither escaped
+
+    def test_never_raises_on_timeout(self, monkeypatch):
+        self._run(monkeypatch, boom=subprocess.TimeoutExpired("psmux", 3))
+
+    def test_no_binary_is_a_noop(self, monkeypatch):
+        monkeypatch.setattr(psmux, "find_psmux", lambda: None)
+
+        def _boom(*a, **k):
+            raise AssertionError("must not shell out without a psmux binary")
+
+        monkeypatch.setattr(subprocess, "run", _boom)
+        psmux.decorate_session("api")
+
+    def test_fan_out_covers_every_name(self, monkeypatch):
+        seen: list[str] = []
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(
+            psmux, "decorate_session", lambda n, psmux=None: seen.append(n)
+        )
+        assert psmux.decorate_sessions(["api", "web"]) == ["api", "web"]
+        assert sorted(seen) == ["api", "web"]
+
+    def test_fan_out_without_binary_is_a_noop(self, monkeypatch):
+        monkeypatch.setattr(psmux, "find_psmux", lambda: None)
+        assert psmux.decorate_sessions(["api"]) == []

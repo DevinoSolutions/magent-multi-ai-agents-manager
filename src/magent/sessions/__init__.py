@@ -65,3 +65,59 @@ def ide_command(tool: str) -> str:
     """CLI executable that opens `tool`'s IDE window. Unknown tools fall back
     to "code", preserving the historical launch-path behavior."""
     return IDE_COMMANDS.get(tool, "code")
+
+
+# --- "open the focused project in VS Code" (the F2 window hotkey) -------------
+# Pure decision logic for the Alt+V listener's F2 handler. It lives here rather
+# than in hotkey.py because hotkey.py raises ImportError off win32 at import
+# time, and this math must be unit-testable on every OS.
+
+
+def folder_for_session(payload: object, project: str) -> str | None:
+    """The project folder to open, out of an ``/api/sessions`` response body.
+
+    Matches the psmux socket id (``session``) first, then the display ``name``
+    -- window titles carry the socket id, but a caller holding a display name
+    should still resolve. Prefers ``resolved`` (absolute, baseDir-aware) over
+    the raw config ``path``, which may be relative to the host's baseDir and
+    therefore meaningless to a client. Returns None for a wrong-shaped body,
+    an absent project, or an entry with no usable folder.
+    """
+    if not isinstance(payload, dict):
+        return None
+    entries = payload.get("sessions")
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if project not in (entry.get("session"), entry.get("name")):
+            continue
+        for key in ("resolved", "path"):
+            value = entry.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
+    return None
+
+
+def build_code_open_command(
+    folder: str, ssh_host: str | None, code_bin: str
+) -> list[str]:
+    """argv that opens ``folder`` in VS Code, locally or over Remote-SSH.
+
+    With an ssh target the folder lives on that host, so the window is opened
+    through Remote-SSH -- the same ``--remote ssh-remote+<host>`` shape the
+    launch path's ``launch_vscode`` builds. Only the HOSTNAME goes into the
+    authority: a ``user@`` prefix is deliberately stripped, because VS Code
+    resolves the login user from the machine's own ssh config (that is also
+    what makes a plain ``Host`` alias work), and a target that is only a
+    ``user@`` with no host degrades to a local open rather than a broken URI.
+    """
+    args = [code_bin]
+    if ssh_host:
+        host = ssh_host.split("@", 1)[1] if "@" in ssh_host else ssh_host
+        if host:
+            args.extend(["--remote", f"ssh-remote+{host}"])
+    args.append(folder)
+    return args

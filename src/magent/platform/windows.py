@@ -18,7 +18,7 @@ from magent.platform import (
     VSCodeLaunchOpts,
     find_psmux,
 )
-from magent.psmux import capture_pane
+from magent.psmux import capture_pane, decoration_argv
 
 user32 = windll.user32
 shcore = windll.shcore
@@ -350,6 +350,31 @@ class WindowsPlatform(Platform):
             # with no agent running.
             for p in senders:
                 p.wait()
+
+            self._decorate_batch(psmux, batch)
+
+    @staticmethod
+    def _decorate_batch(psmux: str, batch: list[PsmuxWindowOpts]) -> None:
+        """Advertise the F1/F2 hints in a freshly-created batch's status lines.
+
+        Fanned out as Popens like the creates/senders above -- each session is
+        its own psmux server, so serializing two round-trips per session would
+        add real time to a large bring-up. Purely cosmetic, so the whole thing
+        is swallowed on error: a status bar must never fail a bring-up.
+        """
+        try:
+            decorations = [
+                subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                for w in batch
+                for cmd in decoration_argv(w.window_name, psmux)
+            ]
+        except OSError as exc:
+            get_logger("platform").warning("status-line decoration failed: %s", exc)
+            return
+        for p in decorations:
+            p.wait()
 
     def attach_psmux(
         self,

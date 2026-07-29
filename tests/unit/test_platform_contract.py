@@ -118,6 +118,73 @@ class TestWindowsLaunchTerminal:
         assert isinstance(excinfo.value.__cause__, FileNotFoundError)
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="WindowsPlatform binds windll at import"
+)
+class TestWindowsPsmuxDecoration:
+    """Every session created by the launch path advertises the F1/F2 hints in
+    its status line, and a failure to do so is cosmetic -- never fatal to the
+    bring-up."""
+
+    def _run(self, monkeypatch, *, popen_error: Exception | None = None):
+        from magent.platform import PsmuxWindowOpts
+        from magent.platform.windows import WindowsPlatform
+
+        calls: list[list[str]] = []
+
+        class _Proc:
+            returncode = 0
+
+            def wait(self):
+                return 0
+
+        def _popen(cmd, **_kwargs):
+            calls.append(list(cmd))
+            # has-session must report "down" so the session gets created.
+            if "has-session" in cmd:
+                proc = _Proc()
+                proc.returncode = 1
+                proc.wait = lambda: 1
+                return proc
+            if popen_error is not None and "bind" in cmd:
+                raise popen_error
+            return _Proc()
+
+        monkeypatch.setattr("magent.platform.windows.find_psmux", lambda: "psmux")
+        monkeypatch.setattr("magent.platform.windows.subprocess.Popen", _popen)
+        monkeypatch.setattr(
+            "magent.platform.windows._wait_for_panes_ready", lambda *a, **k: None
+        )
+
+        WindowsPlatform().launch_psmux_session(
+            [PsmuxWindowOpts(window_name="api", cwd="/a/api", command="claude")]
+        )
+        return calls
+
+    def test_created_session_is_decorated(self, monkeypatch):
+        calls = self._run(monkeypatch)
+        assert ["psmux", "-L", "api", "bind", "-n", "F1", "detach-client"] in calls
+        assert [
+            "psmux",
+            "-L",
+            "api",
+            "set",
+            "-g",
+            "status-right",
+            " F1 picker  F2 code ",
+        ] in calls
+
+    def test_decoration_happens_after_the_agent_is_sent(self, monkeypatch):
+        calls = self._run(monkeypatch)
+        sent = next(i for i, c in enumerate(calls) if "send-keys" in c)
+        bound = next(i for i, c in enumerate(calls) if "bind" in c)
+        assert bound > sent
+
+    def test_decoration_failure_never_fails_the_bring_up(self, monkeypatch):
+        # No raise: a status bar must never cost the user their sessions.
+        self._run(monkeypatch, popen_error=OSError("spawn failed"))
+
+
 # --- find_window mode contract (LS-B-005) -----------------------------------
 # mode is a Literal["exact", "contains"]; a typo'd mode must fail loudly
 # instead of silently reporting "not found".
