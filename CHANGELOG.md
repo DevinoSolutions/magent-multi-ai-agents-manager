@@ -5,6 +5,25 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.1] - 2026-07-28
+
+### Fixed
+
+- **Attached windows align the moment they appear.** Tiling used to sleep a
+  fixed budget scaled to the window count (40 windows meant a hard 40-second
+  wait) before taking its first look at the screen -- so an attach whose
+  sessions already existed sat on fully-open, untiled windows for the whole
+  budget. That budget is now a deadline for latecomers only: placement polls
+  from the first second, moves each window as soon as it shows up, and
+  finishes immediately once everything is placed.
+
+### Changed
+
+- **The CLI boots faster.** The package version is now resolved lazily, so
+  every command -- including `--help` and the interactive menu -- skips the
+  package-metadata machinery (roughly 75ms of a ~450ms boot) unless it
+  actually prints a version.
+
 ## [3.2.0] - 2026-07-28
 
 ### Added
@@ -204,6 +223,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.2.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.2.0...v3.2.1
 [3.2.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.1.5...v3.2.0
 [3.1.5]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.1.4...v3.1.5
 [3.1.4]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.1.3...v3.1.4
