@@ -115,6 +115,11 @@ def send_keys(
 def pane_cwd(name: str, psmux: str | None = None) -> str:
     """Return the current working directory of the active pane, or ``""``.
 
+    The explicit ``-t <name>`` is REQUIRED: without it ``display-message``
+    answers for the *calling client's own* pane, so a magent run from inside a
+    psmux session reports its own cwd for every session it probes --
+    ``capture_pane`` passes ``-t`` for the same reason.
+
     Guarded like the inline closure it replaced (P1-06): a 3s timeout, utf-8
     decode with ``errors="replace"``, and any OSError/SubprocessError swallowed
     to ``""`` -- a hung, unlaunchable, or non-utf-8 psmux must never propagate
@@ -125,7 +130,16 @@ def pane_cwd(name: str, psmux: str | None = None) -> str:
         return ""
     try:
         result = subprocess.run(
-            [binary, "-L", name, "display-message", "-p", "#{pane_current_path}"],
+            [
+                binary,
+                "-L",
+                name,
+                "display-message",
+                "-t",
+                name,
+                "-p",
+                "#{pane_current_path}",
+            ],
             capture_output=True,
             timeout=3,
             encoding="utf-8",

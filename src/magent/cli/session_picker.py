@@ -20,31 +20,35 @@ if TYPE_CHECKING:
 
 from magent.cli.app import main
 from magent.cli.background import _running_upload_port, _tailnet_host
-from magent.cli.config_io import (
-    _as_dict,
-    _as_str,
-    _load_raw_config,
-    _project_dicts,
-)
+from magent.cli.config_io import _load_config_or_exit
 from magent.cli.ui import _banner, _divider, _menu_item
 from magent.paths import find_config
-from magent.sessions import is_ide_tool
 from magent.style import style
 
 
-def _session_cwds(psmux: str, names: list[str]) -> dict[str, str]:
-    """Each live session's working directory (psmux ``pane_current_path``) -- the
-    key we match against the agent-state store. Fetched concurrently."""
+def _session_cwds(
+    psmux: str, names: list[str], resolved: dict[str, str]
+) -> dict[str, str]:
+    """Each session's working directory -- the key we match against the
+    agent-state store.
+
+    Config is the source of truth here: magent creates every session with
+    ``-c <resolved>``, so the pane cwd is already known without asking psmux.
+    Probing ``pane_cwd`` per session per paint cost ~3.4s of a ~4.8s first
+    paint at 40 live sessions, and matched what config already said. Only a
+    session whose configured path failed to resolve falls back to a live
+    probe -- normally an empty set, so the concurrency here rarely runs."""
     from magent import psmux as psmux_mod  # heavy subsystem: in-body per policy
 
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        return dict(
-            zip(
-                names,
-                pool.map(lambda n: psmux_mod.pane_cwd(n, psmux=psmux), names),
-                strict=True,
+    cwds = {n: resolved.get(n, "") for n in names}
+    missing = [n for n in names if not cwds[n]]
+    if missing:
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            probed = list(
+                pool.map(lambda n: psmux_mod.pane_cwd(n, psmux=psmux), missing)
             )
-        )
+        cwds.update(zip(missing, probed, strict=True))
+    return cwds
 
 
 def _status_label(state: str | None, age_s: float | None = None) -> str:
@@ -121,42 +125,26 @@ def _set_picker_attached(name: str | None) -> None:
         pass
 
 
-def _config_session_candidates(data: dict[str, object]) -> list[str]:
-    """Eligible project socket names from config, in config order -- liveness
-    is NOT checked here, so a direct-name attach never depends on a sweep."""
-    from magent import psmux as psmux_mod  # heavy subsystem: in-body per policy
-
-    default_tool = _as_str(_as_dict(data.get("settings")).get("defaultTool"), "claude")
-    candidates: list[str] = []
-    for p in _project_dicts(data):
-        if not p.get("enabled", True):
-            continue
-        tool = p.get("tool", default_tool)
-        if isinstance(tool, str) and is_ide_tool(tool):
-            continue
-        title = p.get("title")
-        proj_name = (
-            title
-            if isinstance(title, str) and title
-            else Path(_as_str(p.get("path"))).name
-        )
-        candidates.append(psmux_mod.session_name(proj_name))
-    return candidates
-
-
 def _live_sessions(psmux_bin: str, candidates: list[str]) -> list[str]:
-    """Concurrent liveness sweep with one retry for the misses.
+    """Liveness sweep as an unbounded process fan-out, one retry for the misses.
 
-    Under the load of many running agents, individual `psmux has-session`
-    probes flap; the old sequential no-retry sweep both crawled (40+ serial
-    subprocess calls) and silently dropped live sessions from the picker."""
-    from magent import psmux as psmux_mod  # heavy subsystem: in-body per policy
+    Every probe is spawned before any is waited on -- the shape
+    ``psmux.psmux_status`` already uses -- so the sweep costs roughly one psmux
+    round-trip instead of ceil(n/16) of them; the earlier ThreadPool(16) sweep
+    over ``has_session`` (which blocks a worker per call) took ~1s at 40
+    sessions. The retry stays: under the load of many running agents individual
+    probes flap, and a dropped probe silently hides a live session."""
 
     def _probe(names: list[str]) -> list[bool]:
-        with ThreadPoolExecutor(max_workers=16) as pool:
-            return list(
-                pool.map(lambda n: psmux_mod.has_session(n, psmux=psmux_bin), names)
+        procs = [
+            subprocess.Popen(
+                [psmux_bin, "-L", n, "has-session"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
+            for n in names
+        ]
+        return [p.wait() == 0 for p in procs]
 
     flags = dict(zip(candidates, _probe(candidates), strict=True))
     missing = [n for n in candidates if not flags[n]]
@@ -213,8 +201,18 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
         )
         return
 
-    data = _load_raw_config(config_file)
-    candidates = _config_session_candidates(data)
+    # Candidates come from config, in config order -- liveness is NOT checked
+    # here, so a direct-name attach never depends on a sweep. Each project's
+    # resolved path rides along: it is the cwd magent created the session with,
+    # which is what the agent-state lookup keys on.
+    cfg = _load_config_or_exit(config_file)
+    candidates: list[str] = []
+    resolved: dict[str, str] = {}
+    for proj in psmux_mod.eligible_projects(cfg):
+        sid = psmux_mod.socket_id(proj)
+        candidates.append(sid)
+        path = proj.get("resolved")
+        resolved[sid] = path if isinstance(path, str) else ""
 
     def _reset_terminal() -> None:
         if sys.platform == "win32":
@@ -267,7 +265,7 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
                 f"  {style('WebApp To Upload Images', bold=True)}  {style(upload_url, fg='cyan', bold=True)}"
             )
             click.echo()
-        statuses = _session_statuses(_session_cwds(psmux_bin, sessions))
+        statuses = _session_statuses(_session_cwds(psmux_bin, sessions, resolved))
         for i, sess in enumerate(sessions, 1):
             status = statuses.get(sess, "")
             extra = (" " * max(2, 26 - len(sess)) + status) if status else ""

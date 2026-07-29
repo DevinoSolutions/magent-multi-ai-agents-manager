@@ -52,6 +52,25 @@ class TestCapturePane:
 
 
 class TestPaneCwd:
+    def test_targets_the_named_session_explicitly(self, monkeypatch):
+        # Regression pin: without `-t <name>`, display-message answers for the
+        # CALLING client's own pane. Verified live -- running the picker from
+        # inside a psmux session reported the caller's cwd for 41 of 42
+        # sessions, so every status row keyed off the wrong project.
+        captured: dict[str, object] = {}
+
+        def _fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return _FakeCompleted(returncode=0, stdout="/home/proj\n")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+
+        assert psmux.pane_cwd("sess", psmux="psmux") == "/home/proj"
+        cmd = captured["cmd"]
+        assert cmd[:4] == ["psmux", "-L", "sess", "display-message"]
+        assert cmd[cmd.index("-t") + 1] == "sess"
+        assert "#{pane_current_path}" in cmd
+
     def test_passes_timeout_encoding_and_errors_guards(self, monkeypatch):
         captured: dict[str, object] = {}
 
