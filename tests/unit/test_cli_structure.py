@@ -315,6 +315,10 @@ class TestAttachFlowCharacterization:
             def supports_hotkey(self) -> bool:
                 return True
 
+            def snapshot_windows(self) -> dict[str, int]:
+                # Nothing open locally: every up-session gets a fresh window.
+                return {}
+
         monkeypatch.setattr("magent.platform.get_platform", _FakePlat)
         monkeypatch.setattr("time.sleep", lambda s: None)
 

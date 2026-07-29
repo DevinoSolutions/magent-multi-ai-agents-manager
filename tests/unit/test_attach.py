@@ -23,6 +23,26 @@ class _FakeProc:
         pass
 
 
+class _AttachPlatform:
+    """The slice of Platform the attach flow reaches for: the open-window
+    snapshot it consults before spawning, plus the hotkey capability gate."""
+
+    def __init__(self, windows: dict[str, int] | None = None) -> None:
+        self._windows = windows or {}
+
+    def snapshot_windows(self) -> dict[str, int]:
+        return self._windows
+
+    def supports_hotkey(self) -> bool:
+        return False
+
+
+def _fake_platform(monkeypatch, windows: dict[str, int] | None = None) -> None:
+    monkeypatch.setattr(
+        "magent.platform.get_platform", lambda: _AttachPlatform(windows)
+    )
+
+
 class TestEligibleProjects:
     def test_filters_remote_ide_and_disabled(self):
         cfg = _cfg(
@@ -216,12 +236,7 @@ class TestLastAttachHost:
         monkeypatch.setattr(attach_mod, "_tile_titles", lambda titles: None)
         monkeypatch.setattr(attach_mod, "_maybe_start_hotkey", lambda url: None)
         monkeypatch.setattr(time_mod, "sleep", lambda s: None)
-
-        class _NoHotkeyPlat:
-            def supports_hotkey(self) -> bool:
-                return False
-
-        monkeypatch.setattr("magent.platform.get_platform", _NoHotkeyPlat)
+        _fake_platform(monkeypatch)
 
         attach_mod._attach_flow("someone@box", no_mux=False, group=None, yes=False)
         assert attach_mod._read_last_host() == "someone@box"
@@ -430,15 +445,77 @@ class TestAttachWindowCommand:
         monkeypatch.setattr(attach_mod, "_tile_titles", lambda titles: None)
         monkeypatch.setattr(attach_mod, "_maybe_start_hotkey", lambda url: None)
         monkeypatch.setattr(attach_mod.time, "sleep", lambda s: None)
-
-        class _NoHotkey:
-            def supports_hotkey(self) -> bool:
-                return False
-
-        monkeypatch.setattr("magent.platform.get_platform", _NoHotkey)
+        _fake_platform(monkeypatch)
 
         attach_mod._attach_flow("user@host", no_mux=False, group=None, yes=False)
         assert popen_calls[0][-1] == "psmux -L myapp attach || magent sessions myapp"
+
+
+class TestAttachSkipsOpenWindows:
+    """Re-running attach while the previous attach's windows are still open
+    must not stack a second window on the same psmux session. The check reuses
+    tiling.window_open, so a badged title still counts as open -- and an
+    already-open window is still handed to tiling so it lands in the grid."""
+
+    def _run_flow(self, monkeypatch, sessions, windows):
+        from magent.cli import attach as attach_mod
+
+        status = {
+            "up": [{"name": s, "session": s} for s in sessions],
+            "down": [],
+            "projects": [{"name": s} for s in sessions],
+        }
+        monkeypatch.setattr(
+            attach_mod, "_query_status", lambda *a, **k: (status, 0, "")
+        )
+        monkeypatch.setattr(attach_mod, "_ssh_capture", lambda *a, **k: (0, "", ""))
+        spawns: list[list[str]] = []
+
+        def fake_popen(args, **k):
+            # The `serve --ensure` hop is not a window spawn; only count `wt`.
+            if args and args[0] == "wt":
+                spawns.append(args)
+            return _FakeProc()
+
+        sleeps: list[float] = []
+        tiled: list[list[str]] = []
+        monkeypatch.setattr(attach_mod.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(attach_mod, "_tile_titles", tiled.append)
+        monkeypatch.setattr(attach_mod, "_maybe_start_hotkey", lambda url: None)
+        monkeypatch.setattr(attach_mod.time, "sleep", sleeps.append)
+        # Keep the real ~/.magent/last-attach-host out of a unit run.
+        monkeypatch.setattr(attach_mod, "_remember_last_host", lambda target: None)
+        _fake_platform(monkeypatch, windows)
+
+        attach_mod._attach_flow("user@host", no_mux=False, group=None, yes=False)
+        return spawns, sleeps, tiled[0]
+
+    def test_open_session_is_not_respawned_but_is_still_tiled(self, monkeypatch):
+        spawns, sleeps, titles = self._run_flow(monkeypatch, ["api"], {"magent:api": 1})
+        assert spawns == []
+        assert sleeps == []  # no stagger for a window we did not spawn
+        assert titles == ["magent:api"]
+
+    def test_badged_title_still_counts_as_open(self, monkeypatch):
+        # titles.make_title(name, "needs-input") -> "magent:[!] api"
+        spawns, _, titles = self._run_flow(monkeypatch, ["api"], {"magent:[!] api": 1})
+        assert spawns == []
+        assert titles == ["magent:api"]
+
+    def test_mixed_spawns_only_the_missing_one_and_tiles_both(self, monkeypatch):
+        spawns, sleeps, titles = self._run_flow(
+            monkeypatch, ["api", "web"], {"magent:api": 1}
+        )
+        assert len(spawns) == 1
+        assert spawns[0][-1] == "psmux -L web attach || magent sessions web"
+        assert len(sleeps) == 1  # stagger paid once, for the one real spawn
+        assert titles == ["magent:api", "magent:web"]
+
+    def test_all_missing_spawns_every_window(self, monkeypatch):
+        spawns, sleeps, titles = self._run_flow(monkeypatch, ["api", "web"], {})
+        assert len(spawns) == 2
+        assert len(sleeps) == 2
+        assert titles == ["magent:api", "magent:web"]
 
 
 class TestAttachNomux:
@@ -446,28 +523,44 @@ class TestAttachNomux:
     derives from the tool registry (DEFAULT_TOOLS['claude']), never a
     hard-coded literal that could silently drift from the default."""
 
-    def _run(self, monkeypatch, projects):
+    def _run(self, monkeypatch, projects, windows=None):
         from magent.cli import attach as attach_mod
 
         calls: list[list[str]] = []
+        sleeps: list[float] = []
+        tiled: list[list[str]] = []
         monkeypatch.setattr(
             attach_mod.subprocess, "Popen", lambda cmd, *a, **k: calls.append(cmd)
         )
-        monkeypatch.setattr(attach_mod, "_tile_titles", lambda titles: None)
-        monkeypatch.setattr(attach_mod.time, "sleep", lambda *a, **k: None)
+        monkeypatch.setattr(attach_mod, "_tile_titles", tiled.append)
+        monkeypatch.setattr(attach_mod.time, "sleep", sleeps.append)
+        _fake_platform(monkeypatch, windows)
         attach_mod._attach_nomux("u@host", {"projects": projects})
-        return calls
+        return calls, sleeps, tiled[0]
 
     def test_fallback_cmd_derived_from_default_tools(self, monkeypatch):
         from magent.config import DEFAULT_TOOLS
 
-        calls = self._run(monkeypatch, [{"path": "api", "name": "api"}])
+        calls, _, _ = self._run(monkeypatch, [{"path": "api", "name": "api"}])
         # The remote command is the last Popen argument: `cd <dir> && <cmd>`.
         assert calls[0][-1] == f"cd api && {DEFAULT_TOOLS['claude']}"
 
     def test_uses_explicit_cmd_when_present(self, monkeypatch):
-        calls = self._run(monkeypatch, [{"path": "web", "name": "web", "cmd": "codex"}])
+        calls, _, _ = self._run(
+            monkeypatch, [{"path": "web", "name": "web", "cmd": "codex"}]
+        )
         assert calls[0][-1] == "cd web && codex"
+
+    def test_open_window_is_not_respawned_but_is_still_tiled(self, monkeypatch):
+        calls, sleeps, titles = self._run(
+            monkeypatch,
+            [{"path": "api", "name": "api"}, {"path": "web", "name": "web"}],
+            {"magent:[+] api": 1},
+        )
+        assert len(calls) == 1
+        assert calls[0][-1].startswith("cd web && ")
+        assert len(sleeps) == 1
+        assert titles == ["magent:api", "magent:web"]
 
 
 class TestUpJsonConfigError:
