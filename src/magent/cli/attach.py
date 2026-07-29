@@ -239,6 +239,15 @@ def _tile_titles(titles: list[str]) -> None:
     )
 
 
+# Pause between `wt` window spawns. The real constraint is sshd, not the
+# terminal: every window opens its own SSH connection, and spawning too fast
+# trips MaxStartups (default 10:30:100 -- beyond 10 concurrent *unauthenticated*
+# handshakes it starts dropping connections probabilistically). At 4 spawns/sec
+# against ~1s handshakes we sit around 4 in flight, well clear of that; the old
+# 0.4s was purely conservative and cost 16s on a 40-window attach.
+_SPAWN_STAGGER_S = 0.25
+
+
 # Bringing up many agents at once is a cold-start storm on the host (each
 # session spawns a shell plus a full agent process): a 40-project bring-up can
 # genuinely run past five minutes on a loaded machine. The old 300s budget
@@ -250,7 +259,10 @@ _STABILIZE_INTERVAL_S = 3
 
 
 def _bring_up_and_requery(
-    target: str, grp_suffix: str, fallback_up: list[dict[str, object]]
+    target: str,
+    grp_suffix: str,
+    fallback_up: list[dict[str, object]],
+    expected: int,
 ) -> list[dict[str, object]]:
     click.echo(
         f"  {style('o', fg='cyan')} starting sessions on host "
@@ -264,8 +276,9 @@ def _bring_up_and_requery(
             f"  {style('!', fg='yellow')} bring-up exited {rc}: {style(err.strip()[:200], dim=True)}"
         )
     # Sessions can still be materializing on a busy host even after `up`
-    # returns (or times out) -- poll until the up-count stops growing rather
-    # than trusting a single snapshot.
+    # returns (or times out) -- poll until every expected session is accounted
+    # for, falling back to "the up-count stopped growing" when some of them
+    # never come up, rather than trusting a single snapshot.
     best = fallback_up
     prev = -1
     for _ in range(_STABILIZE_POLLS):
@@ -275,6 +288,14 @@ def _bring_up_and_requery(
             cur = _as_session_list(raw_up) if isinstance(raw_up, list) else []  # ty: ignore[invalid-argument-type]  # reason: isinstance(raw_up, list) proves list; ty 0.0.56 invariance gap
             if len(cur) >= len(best):
                 best = cur
+            # Everything asked for is up: the bring-up is complete, so there is
+            # nothing left for stall detection to detect. Breaking here (before
+            # the sleep) saves the second query plus a full interval -- ~10s on
+            # the common "it all came up" path.
+            if len(cur) >= expected:
+                break
+            # Partial bring-up: some sessions may never appear, so fall back to
+            # waiting for the count to stop growing.
             if len(cur) == prev:
                 break
             prev = len(cur)
@@ -350,7 +371,7 @@ def _attach_flow(
     port = status.get("upload_port", 8033)
 
     if down and yes:
-        up = _bring_up_and_requery(target, grp, up)
+        up = _bring_up_and_requery(target, grp, up, len(up) + len(down))
     elif down:
         pickable = _print_session_overview(hostname, up, down)
         opts = [f"{style('a', fg='cyan', bold=True)}=all {len(down)}"]
@@ -374,7 +395,7 @@ def _attach_flow(
         if choice in ("n", "no", "none", "q"):
             pass
         elif choice in ("a", "y", "all", ""):
-            up = _bring_up_and_requery(target, grp, up)
+            up = _bring_up_and_requery(target, grp, up, len(up) + len(down))
         else:
             sel = None
             if choice.isdigit() and 1 <= int(choice) <= len(pickable):
@@ -382,7 +403,14 @@ def _attach_flow(
             else:
                 sel = next((g for g in pickable if g.lower() == choice), None)
             if sel:
-                up = _bring_up_and_requery(target, f' -g "{sel}"', up)
+                in_group = [
+                    d
+                    for d in down
+                    if isinstance(g := d.get("group"), str) and g.lower() == sel.lower()
+                ]
+                up = _bring_up_and_requery(
+                    target, f' -g "{sel}"', up, len(up) + len(in_group)
+                )
             else:
                 click.echo(
                     f"  {style('?', fg='yellow')} unrecognized choice -- bringing up none."
@@ -419,13 +447,33 @@ def _attach_flow(
             ]
         )
         titles.append(title)
-        time.sleep(0.4)
-
-    _tile_titles(titles)
+        time.sleep(_SPAWN_STAGGER_S)
 
     # Guarantee the host runs an upload server for Alt+V -- independent of the
     # host's uploadServer flag and of whether anything was just brought up.
-    rc, _, _ = _ssh_capture(target, f"magent serve -p {port} --ensure", timeout=15)
+    # Started before tiling so the SSH round-trip rides under the tiling poll
+    # instead of adding its own 2-3s afterwards.
+    ensure = subprocess.Popen(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            target,
+            f"magent serve -p {port} --ensure",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    _tile_titles(titles)
+
+    try:
+        rc = ensure.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        ensure.kill()
+        rc = 1
     if rc != 0:
         click.echo(
             f"  {style('!', fg='yellow')} couldn't confirm an upload server on the host"
@@ -491,7 +539,7 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
             ]
         )
         titles.append(title)
-        time.sleep(0.4)
+        time.sleep(_SPAWN_STAGGER_S)
 
     _tile_titles(titles)
     click.echo(

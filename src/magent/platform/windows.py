@@ -29,17 +29,24 @@ _BRING_UP_BATCH = 5
 _BRING_UP_BATCH_PAUSE_S = 2.0
 
 
-def _wait_for_pane_ready(binary: str, name: str, timeout_s: float = 10.0) -> None:
-    """Best-effort wait for the session's pane to render its shell prompt, so
+def _wait_for_panes_ready(
+    binary: str, names: list[str], timeout_s: float = 10.0
+) -> None:
+    """Best-effort wait for a batch's panes to render their shell prompts, so
     send-keys doesn't race a still-starting shell on a loaded machine.
+
+    The whole batch shares ONE deadline: waiting per session multiplied the
+    budget by the batch size, so a degraded host burned up to 50s per wave.
 
     Bounded and advisory: some environments (headless CI service sessions)
     never render anything into psmux's virtual screen even though the pane
     shell runs and accepts input fine -- there the wait burns its budget once
-    per batch and send-keys proceeds regardless."""
+    per batch and send-keys proceeds regardless. Never raises."""
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if capture_pane(name, psmux=binary).strip():
+    pending = list(names)
+    while pending:
+        pending = [n for n in pending if not capture_pane(n, psmux=binary).strip()]
+        if not pending or time.monotonic() >= deadline:
             return
         time.sleep(0.3)
 
@@ -317,8 +324,7 @@ class WindowsPlatform(Platform):
                 if p.wait() != 0:
                     raise subprocess.CalledProcessError(p.returncode, p.args)
 
-            for w in batch:
-                _wait_for_pane_ready(psmux, w.window_name)
+            _wait_for_panes_ready(psmux, [w.window_name for w in batch])
 
             senders = [
                 subprocess.Popen(
