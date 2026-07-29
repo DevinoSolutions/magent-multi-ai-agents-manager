@@ -5,6 +5,25 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.0] - 2026-07-29
+
+### Added
+
+- **Window hotkeys are advertised, and F2 opens the project in VS Code.**
+  Every magent session now shows `F1 picker  F2 code` in its psmux status
+  line. F1 keeps its meaning (detach, back to the picker) and is now set by
+  magent itself, so it works on machines without a personal tmux binding.
+  Pressing F2 in a magent window opens that project's folder in VS Code --
+  over Remote-SSH when you're attached to another machine, so the editor
+  runs where you're sitting and the files stay where they live.
+
+### Fixed
+
+- **Re-attaching no longer duplicates windows.** `magent attach` now checks
+  which projects already have an open window and only spawns the missing
+  ones; existing windows are simply tiled into the grid with everything
+  else.
+
 ## [3.3.0] - 2026-07-29
 
 ### Added
@@ -269,6 +288,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.4.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.3.0...v3.4.0
 [3.3.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.2.2...v3.3.0
 [3.2.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.2.1...v3.2.2
 [3.2.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.2.0...v3.2.1
