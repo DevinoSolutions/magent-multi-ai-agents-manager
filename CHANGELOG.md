@@ -5,6 +5,38 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.0] - 2026-07-29
+
+### Added
+
+- **`magent up` and `magent attach` revive dead agents.** A session whose
+  agent was Ctrl-C'ed (or whose launch keystrokes never landed) still counts
+  as "up", so it used to come back as a window parked at a bare shell.
+  Both commands now spot a pane resting at a shell prompt and re-type the
+  agent's command into it -- for Claude that is `claude --continue`, so the
+  conversation picks up right where it was killed. `up --json` stays a pure
+  read unless the new `--revive` flag is passed, and attaching to a host on
+  an older magent falls back cleanly.
+
+### Fixed
+
+- **Duplicate config entries no longer spawn twin windows.** Two entries
+  pointing at the same project produced two identically-titled windows, the
+  second of which could never be tiled. One session id now maps to one
+  session, first entry wins.
+- **Session statuses are read from the right pane.** The picker's
+  working-directory probe answered for the *caller's* pane when magent was
+  itself run from inside a psmux session, which could mislabel every
+  session's status column.
+
+### Changed
+
+- **`magent sessions` paints in about a third of the time.** With 40 live
+  sessions the first paint dropped from ~4.8s to a projected ~1.5s: the
+  per-session working-directory probes are gone (config already knows each
+  session's directory, since magent created it there), and the liveness
+  sweep now launches every probe at once instead of sixteen at a time.
+
 ## [3.2.2] - 2026-07-28
 
 ### Changed
@@ -237,6 +269,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.3.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.2.2...v3.3.0
 [3.2.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.2.1...v3.2.2
 [3.2.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.2.0...v3.2.1
 [3.2.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.1.5...v3.2.0
