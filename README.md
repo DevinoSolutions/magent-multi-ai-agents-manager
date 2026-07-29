@@ -138,6 +138,16 @@ Enable [psmux](https://github.com/psmux/psmux) (native Windows terminal multiple
 
 Requires psmux installed (`choco install psmux` or download from GitHub). When enabled, magent creates a detached psmux session per project and opens Windows Terminal attached to it. From any SSH client: `psmux attach -t project-name`.
 
+Each magent session advertises its window hotkeys in the psmux status bar (`F1 picker  F2 code`):
+
+| Key | In a `magent:` window |
+| --- | --- |
+| `F1` | Detach the session — back to the picker. |
+| `F2` | Open the project's folder in VS Code. When you're attached to another machine it opens over Remote-SSH, so you edit the files where they actually live. |
+| `Alt+V` | Paste a clipboard image into the session (Windows — see below). |
+
+`F2` needs `code` on your PATH; `magent up` refreshes the hints on sessions that were already running.
+
 ### Mobile image upload (over Tailscale)
 
 Send screenshots from your phone straight into a project's agent session:
@@ -187,7 +197,7 @@ Or skip the menu with flags:
 | `magent sessions` | List active psmux sessions, pick one to attach. |
 | `magent sessions <name>` | Attach directly to a psmux session by name. |
 | `magent up [--json] [-g <group>] [--revive]` | Host side: ensure a persistent psmux session per project, and re-launch the agent in any live session whose pane fell back to a bare shell (e.g. after a Ctrl-C). Reviving is automatic except under `--json`, which stays a pure read unless `--revive` is passed. |
-| `magent attach <host>` | From another PC: bring host sessions up over SSH, tile locally, Alt+V uploads. |
+| `magent attach <host>` | From another PC: bring host sessions up over SSH, tile locally, Alt+V uploads, F2 opens the project in VS Code over Remote-SSH. |
 | `magent watch` | Live table of every agent session, most-urgent first; press a row number to focus that window. |
 | `magent attention [-d] [--stop]` | Attention daemon: badges window titles with agent state, flashes the taskbar on needs-input/error, optional toast/ntfy push (`settings.attention`). Badges/flash/toast are Windows-only; ntfy push is cross-platform — see [Platform support](#platform-support). |
 | `magent status [--json]` | Session + daemon health (incl. an `agents` state list in `--json`). Exit codes: 0 healthy, 1 config error, 3 degraded. |
@@ -195,7 +205,7 @@ Or skip the menu with flags:
 | `magent serve [--host <addr>]` | Run the mobile upload server (see below). |
 | `magent mobile` | Phone URL + QR code for installing the uploader as a home-screen app. |
 | `magent termius` | Generate an SSH config entry that opens the session picker. |
-| `magent hotkey` | Run the Alt+V clipboard-upload listener standalone (Windows). |
+| `magent hotkey [--ssh-host <host>]` | Run the window-hotkey listener standalone (Windows): Alt+V clipboard upload and F2 open-in-VS-Code. `--ssh-host` makes F2 open over Remote-SSH. |
 | `magent hooks install` | Wire the agent lifecycle hooks that feed the session-state store (`magent hooks status` to inspect) — see [Where agent states come from](#where-agent-states-come-from). |
 | `magent config <subcommand>` | Edit config from the CLI — 14 subcommands incl. `migrate`; see `magent config --help`. |
 

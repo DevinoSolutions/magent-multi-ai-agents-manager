@@ -43,13 +43,16 @@ def _maybe_start_upload_server(port: int, config_path: str | None) -> None:
     spawn_detached(args)
 
 
-def _maybe_start_hotkey(server_url: str) -> int | None:
-    """Start the Alt+V listener hidden in the background, unless one is running.
+def _maybe_start_hotkey(server_url: str, ssh_host: str | None = None) -> int | None:
+    """Start the window-hotkey listener hidden in the background, unless one runs.
 
     The listener's progress now shows in the magent: windows, so it needs no terminal
     of its own -- attach launches it detached and returns, instead of blocking a
     terminal on a message loop. Returns the listener pid (existing or freshly
     started), or None if it couldn't be confirmed.
+
+    ``ssh_host`` is forwarded to the child so its F2 handler opens projects
+    through VS Code Remote-SSH; omitted, F2 opens them on this machine.
     """
     from magent.platform import get_platform  # heavy subsystem: in-body per policy
 
@@ -65,6 +68,8 @@ def _maybe_start_hotkey(server_url: str) -> int | None:
         return existing
 
     args = [sys.executable, "-m", "magent", "hotkey", "-s", server_url]
+    if ssh_host:
+        args += ["--ssh-host", ssh_host]
     from magent.launch import spawn_detached  # heavy subsystem: in-body per policy
 
     spawn_detached(args)

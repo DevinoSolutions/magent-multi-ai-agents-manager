@@ -313,6 +313,185 @@ class TestListenerLifecycle:
         assert not p.exists()
 
 
+class TestDoOpenCode:
+    """F2 -> open the focused project's folder in VS Code. Every failure mode
+    is a log line and a no-op: the listener has to outlive a dead server, an
+    unknown project, and a machine with no VS Code on it."""
+
+    def _patch(self, monkeypatch, *, payload=None, code_bin="code"):
+        import contextlib
+        import io
+
+        from magent import hotkey
+
+        spawned: list[list[str]] = []
+        monkeypatch.setattr(hotkey.shutil, "which", lambda _n: code_bin)
+        monkeypatch.setattr(hotkey.subprocess, "Popen", spawned.append)
+
+        body = json.dumps(payload if payload is not None else {}).encode()
+
+        @contextlib.contextmanager
+        def _fake_urlopen(url, timeout=None):
+            assert url.endswith("/api/sessions")
+            yield io.BytesIO(body)
+
+        monkeypatch.setattr(hotkey, "urlopen", _fake_urlopen)
+        return spawned
+
+    def test_opens_the_resolved_folder_locally(self, monkeypatch):
+        from magent import hotkey
+
+        spawned = self._patch(
+            monkeypatch,
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "caly", "session": "caly", "resolved": "/base/caly"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "caly", None)
+        assert spawned == [["code", "/base/caly"]]
+
+    def test_opens_over_remote_ssh_when_attached(self, monkeypatch):
+        from magent import hotkey
+
+        spawned = self._patch(
+            monkeypatch,
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "caly", "session": "caly", "resolved": "/base/caly"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "caly", "amin@deck")
+        assert spawned == [["code", "--remote", "ssh-remote+deck", "/base/caly"]]
+
+    def test_missing_code_binary_warns_and_does_nothing(self, monkeypatch, caplog):
+        from magent import hotkey
+
+        spawned = self._patch(monkeypatch, code_bin=None)
+        with caplog.at_level("WARNING", logger="magent.hotkey"):
+            hotkey._do_open_code("http://x:8034", "caly", None)
+        assert spawned == []
+        assert "not on PATH" in caplog.text
+
+    def test_unknown_project_warns_and_does_nothing(self, monkeypatch, caplog):
+        from magent import hotkey
+
+        spawned = self._patch(monkeypatch, payload={"ok": True, "sessions": []})
+        with caplog.at_level("WARNING", logger="magent.hotkey"):
+            hotkey._do_open_code("http://x:8034", "ghost", None)
+        assert spawned == []
+        assert "no folder for project=ghost" in caplog.text
+
+    def test_unreachable_server_is_caught_not_raised(self, monkeypatch, caplog):
+        from urllib.error import URLError
+
+        from magent import hotkey
+
+        monkeypatch.setattr(hotkey.shutil, "which", lambda _n: "code")
+
+        def _down(url, timeout=None):
+            raise URLError("connection refused")
+
+        monkeypatch.setattr(hotkey, "urlopen", _down)
+        with caplog.at_level("ERROR", logger="magent.hotkey"):
+            hotkey._do_open_code("http://x:8034", "caly", None)  # must not raise
+        assert "F2: open project=caly failed" in caplog.text
+
+
+class TestF2HookDecision:
+    def _lparam(self, vk_code):
+        import ctypes
+
+        from magent.hotkey import KBDLLHOOKSTRUCT
+
+        kb = KBDLLHOOKSTRUCT(
+            vkCode=vk_code, scanCode=0, flags=0, time=0, dwExtraInfo=None
+        )
+        # Keep the struct alive for the duration of the call.
+        self._kb_ref = kb
+        return ctypes.cast(ctypes.pointer(kb), ctypes.c_void_p).value
+
+    def _fake_thread(self, monkeypatch, started):
+        from magent import hotkey
+
+        class _FakeThread:
+            def __init__(self, target=None, args=(), daemon=None):
+                self.target, self.args = target, args
+
+            def start(self):
+                started.append((self.target, self.args))
+
+        monkeypatch.setattr(hotkey.threading, "Thread", _FakeThread)
+
+    def test_f2_in_a_magent_window_is_swallowed_and_handled(self, monkeypatch):
+        from magent import hotkey
+        from magent.hotkey import HC_ACTION, VK_F2, WM_KEYDOWN, _hook_decide
+
+        monkeypatch.setattr(hotkey, "get_active_window_title", lambda: "magent:caly")
+        started: list[tuple[object, tuple[object, ...]]] = []
+        self._fake_thread(monkeypatch, started)
+
+        result = _hook_decide(
+            {"alt_held": False},
+            "http://x:8034",
+            HC_ACTION,
+            WM_KEYDOWN,
+            self._lparam(VK_F2),
+            "amin@deck",
+        )
+        # 1 == swallow: the agent pane must never also receive the F2.
+        assert result == 1
+        assert started[0][0] is hotkey._do_open_code
+        assert started[0][1] == ("http://x:8034", "caly", "amin@deck")
+
+    def test_f2_outside_a_magent_window_passes_through(self, monkeypatch):
+        from magent import hotkey
+        from magent.hotkey import HC_ACTION, VK_F2, WM_KEYDOWN, _hook_decide
+
+        monkeypatch.setattr(hotkey, "get_active_window_title", lambda: "Notepad")
+        started: list[tuple[object, tuple[object, ...]]] = []
+        self._fake_thread(monkeypatch, started)
+        monkeypatch.setattr(hotkey.user32, "CallNextHookEx", lambda *a: 0)
+
+        assert (
+            _hook_decide(
+                {"alt_held": False},
+                "http://x:8034",
+                HC_ACTION,
+                WM_KEYDOWN,
+                self._lparam(VK_F2),
+            )
+            == 0
+        )
+        assert started == []
+
+    def test_alt_v_still_routes_to_the_uploader(self, monkeypatch):
+        # Regression guard: the F2 branch sits above the Alt+V branch.
+        from magent import hotkey
+        from magent.hotkey import HC_ACTION, VK_V, WM_KEYDOWN, _hook_decide
+
+        monkeypatch.setattr(hotkey, "get_active_window_title", lambda: "magent:caly")
+        monkeypatch.setattr(hotkey, "clipboard_has_image", lambda: True)
+        started: list[tuple[object, tuple[object, ...]]] = []
+        self._fake_thread(monkeypatch, started)
+
+        assert (
+            _hook_decide(
+                {"alt_held": True},
+                "http://x:8034",
+                HC_ACTION,
+                WM_KEYDOWN,
+                self._lparam(VK_V),
+            )
+            == 1
+        )
+        assert started[0][0] is hotkey._do_upload
+
+
 class TestDoUploadLogging:
     """_do_upload discards the upload result (F-IC-003/F-D4-001) no longer --
     it now logs the outcome, and an unexpected error (e.g. the OverflowError
@@ -522,4 +701,10 @@ class TestHookProc:
 
         from magent.hotkey import run_hotkey
 
-        assert set(inspect.signature(run_hotkey).parameters) == {"server_url"}
+        # The listener resolves projects from window titles + the server's
+        # /api/sessions, never from a snapshot handed in at start-up. ssh_host
+        # is the attach target F2 opens through, not a session list.
+        assert set(inspect.signature(run_hotkey).parameters) == {
+            "server_url",
+            "ssh_host",
+        }

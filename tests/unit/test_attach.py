@@ -1,4 +1,6 @@
 import json
+import sys
+import types
 
 from magent import cli
 from magent.config import SCHEMA_VERSION, MagentConfig, ProjectConfig, Settings
@@ -610,7 +612,7 @@ class TestUpRevive:
         return str(p)
 
     def _patch(self, monkeypatch, revived, up=None):
-        """Stub the two heavy subsystem calls up_cmd makes; record revive args."""
+        """Stub the heavy subsystem calls up_cmd makes; record revive args."""
         calls: list[dict[str, object]] = []
         rows = up if up is not None else [{"name": "api", "session": "api"}]
         monkeypatch.setattr(
@@ -623,6 +625,9 @@ class TestUpRevive:
             return revived
 
         monkeypatch.setattr("magent.launch.revive_psmux", fake_revive)
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions", lambda names: names
+        )
         return calls
 
     def test_json_is_a_pure_read_by_default(self, runner, tmp_path, monkeypatch):
@@ -638,6 +643,9 @@ class TestUpRevive:
             ),
         )
         monkeypatch.setattr("magent.launch.revive_psmux", _fail)
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions", lambda names: names
+        )
 
         result = runner.invoke(
             cli.main, ["--config", self._config(tmp_path), "up", "--json"]
@@ -646,6 +654,28 @@ class TestUpRevive:
         payload = json.loads(result.stdout)
         # The key is always present so a consumer can read it unconditionally.
         assert payload["revived"] == []
+
+    def test_json_never_decorates(self, runner, tmp_path, monkeypatch):
+        # `up --json` is attach's status query and is polled repeatedly; the
+        # hints cost two psmux round-trips per session, so they stay off it.
+        def _fail(names):
+            raise AssertionError("`up --json` must not decorate any session")
+
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: (
+                [{"name": "api", "session": "api"}],
+                [],
+                _PROJECT_ROWS,
+            ),
+        )
+        monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
+        monkeypatch.setattr("magent.launch.decorate_psmux_sessions", _fail)
+
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_path), "up", "--json"]
+        )
+        assert result.exit_code == 0
 
     def test_json_revive_flag_revives_the_live_sessions(
         self, runner, tmp_path, monkeypatch
@@ -676,6 +706,123 @@ class TestUpRevive:
         result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
         assert result.exit_code == 0
         assert "Revived" not in result.output
+
+
+class TestUpDecorates:
+    """Interactive `up` refreshes the F1/F2 status-line hints on every live
+    session, so a session made before the feature (or by an older magent)
+    gets them without being recreated."""
+
+    def _config(self, tmp_path):
+        p = tmp_path / "magent.config.json"
+        p.write_text(
+            json.dumps(
+                {
+                    "version": SCHEMA_VERSION,
+                    "projects": [{"path": "/a/api", "tool": "claude"}],
+                    "settings": {"uploadServer": False},
+                }
+            )
+        )
+        return str(p)
+
+    def _patch(self, monkeypatch, up, down, created=()):
+        seen: list[list[str]] = []
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: (up, down, _PROJECT_ROWS),
+        )
+        monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
+        monkeypatch.setattr(
+            "magent.launch.bring_up_psmux", lambda *a, **k: list(created)
+        )
+        monkeypatch.setattr("magent.launch.decorate_psmux_sessions", seen.append)
+        return seen
+
+    def test_already_up_sessions_are_decorated(self, runner, tmp_path, monkeypatch):
+        seen = self._patch(monkeypatch, up=[{"name": "api", "session": "api"}], down=[])
+        result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
+        assert result.exit_code == 0
+        assert seen == [["api"]]
+
+    def test_freshly_created_sessions_are_decorated_too(
+        self, runner, tmp_path, monkeypatch
+    ):
+        seen = self._patch(
+            monkeypatch,
+            up=[],
+            down=[{"name": "api", "session": "api"}],
+            created=["api"],
+        )
+        result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
+        assert result.exit_code == 0
+        assert seen == [["api"]]
+
+
+class TestHotkeyCmdSshHost:
+    """`magent hotkey --ssh-host` reaches the listener. The win32-only import
+    is stubbed out the way the rest of the CLI suite stubs platform probes, so
+    this runs on every OS in the matrix."""
+
+    def _patch(self, monkeypatch):
+        seen: list[tuple[str, str | None]] = []
+
+        class _FakePlat:
+            def supports_hotkey(self) -> bool:
+                return True
+
+        monkeypatch.setattr("magent.platform.get_platform", _FakePlat)
+
+        fake = types.ModuleType("magent.hotkey")
+        fake.listener_pid = lambda: None
+        fake.run_hotkey = lambda url, ssh_host=None: seen.append((url, ssh_host))
+        monkeypatch.setitem(sys.modules, "magent.hotkey", fake)
+        return seen
+
+    def test_ssh_host_is_forwarded_to_the_listener(self, runner, monkeypatch):
+        seen = self._patch(monkeypatch)
+        result = runner.invoke(
+            cli.main, ["hotkey", "-s", "http://h:8033", "--ssh-host", "amin@deck"]
+        )
+        assert result.exit_code == 0
+        assert seen == [("http://h:8033", "amin@deck")]
+
+    def test_default_is_none_for_a_local_open(self, runner, monkeypatch):
+        seen = self._patch(monkeypatch)
+        result = runner.invoke(cli.main, ["hotkey", "-s", "http://h:8033"])
+        assert result.exit_code == 0
+        assert seen == [("http://h:8033", None)]
+
+
+class TestMaybeStartHotkeySshHost:
+    """The spawned listener's argv carries --ssh-host only when there is one."""
+
+    def _args(self, monkeypatch, ssh_host):
+        from magent.cli import background
+
+        spawned: list[list[str]] = []
+
+        class _FakePlat:
+            def supports_hotkey(self) -> bool:
+                return True
+
+        monkeypatch.setattr("magent.platform.get_platform", _FakePlat)
+        monkeypatch.setattr("magent.launch.spawn_detached", spawned.append)
+
+        fake = types.ModuleType("magent.hotkey")
+        fake.listener_pid = lambda: None
+        monkeypatch.setitem(sys.modules, "magent.hotkey", fake)
+        monkeypatch.setattr(background.time, "sleep", lambda s: None)
+
+        background._maybe_start_hotkey("http://h:8033", ssh_host)
+        return spawned[0]
+
+    def test_ssh_host_is_passed_through(self, monkeypatch):
+        args = self._args(monkeypatch, "amin@deck")
+        assert args[-4:] == ["-s", "http://h:8033", "--ssh-host", "amin@deck"]
+
+    def test_absent_ssh_host_adds_no_flag(self, monkeypatch):
+        assert "--ssh-host" not in self._args(monkeypatch, None)
 
 
 class TestQueryStatusRevives:

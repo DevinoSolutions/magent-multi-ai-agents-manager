@@ -7,6 +7,8 @@ import ctypes
 import ctypes.wintypes
 import json
 import os
+import shutil
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -17,6 +19,7 @@ from urllib.request import Request, urlopen
 
 from magent.log import HEARTBEAT_INTERVAL, get_logger, write_heartbeat
 from magent.procs import pid_alive
+from magent.sessions import build_code_open_command, folder_for_session
 from magent.titles import parse_title
 
 if TYPE_CHECKING:
@@ -67,6 +70,10 @@ kernel32.GetExitCodeProcess.restype = ctypes.wintypes.BOOL
 kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
 
 VK_V = 0x56
+# F2 opens the focused project's folder in VS Code. No modifier: the magent:
+# window title is the gate, exactly as it is for Alt+V, and F-keys are free in
+# an agent pane (psmux itself owns F1 -> detach-client, see psmux.decorate_session).
+VK_F2 = 0x71
 VK_MENU = 0x12
 VK_LMENU = 0xA4
 VK_RMENU = 0xA5
@@ -270,8 +277,6 @@ def stop_listener() -> bool:
     """Stop the running Alt+V listener. Returns True only if the kill actually
     succeeded. On failure the pid file is kept (not unlinked) so `status` or a
     retry can still find the process."""
-    import subprocess
-
     log = get_logger("hotkey")
     pid = listener_pid()
     if not pid:
@@ -319,6 +324,37 @@ def _do_upload(server_url: str, project: str) -> None:
         log.exception("upload project=%s failed", project)
 
 
+def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
+    """Open the focused project's folder in VS Code, off the hook callback.
+
+    Threaded for the same reason as ``_do_upload``: the /api/sessions round
+    trip must never block a system-wide keyboard hook. Every failure mode --
+    server down, project absent from the payload, no folder on the entry, no
+    ``code`` on PATH -- is a log line and a no-op; the listener has to outlive
+    all of them.
+    """
+    log = get_logger("hotkey")
+    try:
+        code_bin = shutil.which("code")
+        if not code_bin:
+            log.warning("F2: 'code' is not on PATH; cannot open project=%s", project)
+            return
+        with urlopen(f"{server_url}/api/sessions", timeout=10) as resp:
+            payload = json.loads(resp.read())
+        folder = folder_for_session(payload, project)
+        if not folder:
+            log.warning("F2: no folder for project=%s in /api/sessions", project)
+            return
+        # code is code.cmd on Windows; shutil.which resolves the .cmd and
+        # Popen on that resolved path runs it without a shell.
+        subprocess.Popen(build_code_open_command(folder, ssh_host, code_bin))
+        log.info(
+            "F2: opened project=%s folder=%s ssh_host=%s", project, folder, ssh_host
+        )
+    except Exception:
+        log.exception("F2: open project=%s failed", project)
+
+
 def _heartbeat_loop(stop_event: threading.Event) -> None:
     """Pulse a liveness heartbeat on an interval until told to stop.
 
@@ -333,7 +369,12 @@ def _heartbeat_loop(stop_event: threading.Event) -> None:
 
 
 def _hook_decide(
-    state: dict[str, bool], server_url: str, nCode: int, wParam: int, lParam: int
+    state: dict[str, bool],
+    server_url: str,
+    nCode: int,
+    wParam: int,
+    lParam: int,
+    ssh_host: str | None = None,
 ) -> int:
     """Pure decision logic for one keyboard-hook callback. Extracted out of
     the hook callback itself so it's reachable from a unit test without a
@@ -347,6 +388,15 @@ def _hook_decide(
     if kb.vkCode in _ALT_KEYS:
         state["alt_held"] = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
         return int(user32.CallNextHookEx(None, nCode, wParam, lParam))
+
+    if kb.vkCode == VK_F2 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+        project = project_from_title(get_active_window_title())
+        if project is None:
+            return int(user32.CallNextHookEx(None, nCode, wParam, lParam))
+        threading.Thread(
+            target=_do_open_code, args=(server_url, project, ssh_host), daemon=True
+        ).start()
+        return 1
 
     if (
         kb.vkCode == VK_V
@@ -371,7 +421,7 @@ def _hook_decide(
 
 
 def _make_hook_proc(
-    state: dict[str, bool], server_url: str
+    state: dict[str, bool], server_url: str, ssh_host: str | None = None
 ) -> Callable[[int, int, int], int]:
     """Wrap `_hook_decide` so an uncaught exception can never break the hook
     chain. A ctypes WINFUNCTYPE callback can't propagate a Python exception
@@ -383,7 +433,7 @@ def _make_hook_proc(
 
     def hook_proc(nCode: int, wParam: int, lParam: int) -> int:
         try:
-            return _hook_decide(state, server_url, nCode, wParam, lParam)
+            return _hook_decide(state, server_url, nCode, wParam, lParam, ssh_host)
         except Exception:
             log.exception("Alt+V hook callback error")
             return int(
@@ -393,10 +443,16 @@ def _make_hook_proc(
     return hook_proc
 
 
-def run_hotkey(server_url: str) -> None:
+def run_hotkey(server_url: str, ssh_host: str | None = None) -> None:
+    """Run the window-hotkey listener until the message loop ends.
+
+    ``ssh_host`` is the SSH target the magent: windows are attached to, if any:
+    it makes F2 open the project through VS Code Remote-SSH instead of looking
+    for the folder on this machine. None (the local case) opens it locally.
+    """
     log = get_logger("hotkey")
     state = {"alt_held": False}
-    hook_fn = HOOKPROC(_make_hook_proc(state, server_url))
+    hook_fn = HOOKPROC(_make_hook_proc(state, server_url, ssh_host))
 
     hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, hook_fn, None, 0)
     if not hook:

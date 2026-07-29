@@ -77,6 +77,42 @@ class TestConfigSessions:
         assert out[0]["name"] == "my.api"
         assert out[0]["session"] == "my-api"
 
+    def _cfg(self, tmp_path, projects, base_dir=None):
+        cfg = tmp_path / "magent.config.json"
+        body: dict[str, object] = {"projects": projects}
+        if base_dir is not None:
+            body["baseDir"] = base_dir
+        cfg.write_text(json.dumps(body))
+        return str(cfg)
+
+    def test_absolute_path_stays_itself(self, tmp_path):
+        # `resolved` is what a client can actually act on (the F2 open-in-code
+        # hotkey); `path` is the raw config value and may be relative.
+        (tmp_path / "svc").mkdir()
+        out = config_sessions(
+            self._cfg(tmp_path, [{"path": str(tmp_path / "svc"), "tool": "claude"}])
+        )
+        assert out[0]["resolved"] == str(tmp_path / "svc")
+
+    def test_relative_path_resolves_against_base_dir(self, tmp_path):
+        (tmp_path / "INTERNAL" / "caly").mkdir(parents=True)
+        out = config_sessions(
+            self._cfg(
+                tmp_path,
+                [{"path": "INTERNAL/caly", "tool": "claude"}],
+                base_dir=str(tmp_path),
+            )
+        )
+        assert out[0]["path"] == "INTERNAL/caly"  # raw value untouched
+        assert Path(out[0]["resolved"]) == tmp_path / "INTERNAL" / "caly"
+
+    def test_unresolvable_path_is_empty_string(self, tmp_path):
+        # Never None: a JSON consumer reads it as a plain string field.
+        out = config_sessions(
+            self._cfg(tmp_path, [{"path": "nope/missing", "tool": "claude"}])
+        )
+        assert out[0]["resolved"] == ""
+
     def test_html_escapes_names(self):
         sessions = [{"name": "<b>bad</b>", "path": "x&y"}]
         html = _build_html(sessions)

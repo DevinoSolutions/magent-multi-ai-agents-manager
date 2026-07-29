@@ -525,7 +525,9 @@ def _attach_flow(
     from magent.platform import get_platform  # heavy subsystem: in-body per policy
 
     if get_platform().supports_hotkey():
-        pid = _maybe_start_hotkey(server_url)
+        # The attach target rides along so F2 opens the project over VS Code
+        # Remote-SSH -- the folders in the payload live on the host, not here.
+        pid = _maybe_start_hotkey(server_url, target)
         if pid:
             click.echo(
                 f"  {style('+', fg='green')} Alt+V listener running in the background "
@@ -626,6 +628,7 @@ def up_cmd(
 
     from magent.launch import (  # heavy subsystem: in-body per policy
         bring_up_psmux,
+        decorate_psmux_sessions,
         psmux_status,
         revive_psmux,
     )
@@ -685,6 +688,7 @@ def up_cmd(
         if do_all
         else [_as_str(d.get("session")) or _as_str(d.get("name")) for d in down]
     )
+    created: list[str] = []
     if not projects:
         where = f" in group '{group}'" if group else ""
         click.echo(f"  {style('!', fg='yellow')} No eligible projects{where}.")
@@ -707,6 +711,14 @@ def up_cmd(
             f" {style(str(len(revived)), fg='green', bold=True)}"
             f" session(s): {style(', '.join(revived), dim=True)}"
         )
+
+    # Advertise the F1/F2 hints in every live session's status line. Sessions
+    # created by launch_psmux_session are decorated at birth; doing it again
+    # here is what gives a PRE-EXISTING session (made before this feature, or
+    # by an older magent) the hints without forcing a recreate. Interactive
+    # path only -- `up --json` is attach's status query and stays a pure,
+    # fast read, and these are two psmux round-trips per session.
+    decorate_psmux_sessions([*live_ids, *created])
 
     if cfg.settings.upload_server:
         _maybe_start_upload_server(cfg.settings.upload_port, str(config_file))
@@ -748,8 +760,13 @@ def attach_cmd(
 @click.option(
     "--server", "-s", default="http://localhost:8033", help="Upload server URL"
 )
+@click.option(
+    "--ssh-host",
+    default=None,
+    help="SSH target whose projects F2 opens over VS Code Remote-SSH",
+)
 @click.pass_context
-def hotkey_cmd(ctx: click.Context, server: str) -> None:
+def hotkey_cmd(ctx: click.Context, server: str, ssh_host: str | None) -> None:
     """Listen for Alt+V to upload clipboard images to psmux sessions.
 
     Only activates when a 'magent:' titled window is focused. Otherwise
@@ -785,6 +802,10 @@ def hotkey_cmd(ctx: click.Context, server: str) -> None:
     click.echo(
         f"  {style('Alt+V', fg='cyan', bold=True)} uploads clipboard image to the focused project"
     )
+    click.echo(
+        f"  {style('F2', fg='cyan', bold=True)} opens the focused project's folder in VS Code"
+        + (f" {style(f'(over SSH: {ssh_host})', dim=True)}" if ssh_host else "")
+    )
     click.echo(f"  {style('Only active in windows titled magent:<project>', dim=True)}")
     click.echo(f"  {style('Ctrl+C to stop.', dim=True)}")
     click.echo()
@@ -794,7 +815,7 @@ def hotkey_cmd(ctx: click.Context, server: str) -> None:
     )
 
     try:
-        run_hotkey(server)
+        run_hotkey(server, ssh_host)
     except KeyboardInterrupt:
         click.echo(f"\n  {style('Stopped.', dim=True)}")
     except RuntimeError as e:

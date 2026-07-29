@@ -263,6 +263,66 @@ def flash_message(
         )
 
 
+# The hint line every magent session advertises in its psmux status bar.
+# Defined once here so the launch path and the `up` path can never drift.
+_STATUS_HINTS = " F1 picker  F2 code "
+
+
+def decoration_argv(name: str, psmux: str) -> list[list[str]]:
+    """The psmux commands that advertise magent's window hotkeys in ``name``.
+
+    Two of them: magent *owns* F1 -> detach-client per session (the hint has to
+    be truthful on a machine with no personal ``bind -n F1`` in ~/.tmux.conf,
+    and owning the binding keeps the existing "back to the picker" semantics
+    rather than changing them), and the status-right carries the hint text.
+    Both are ``-L <name>``-scoped, so they land on that session's own server
+    and override whatever its tmux.conf set at start-up.
+
+    Split out from ``decorate_session`` so the launch path can fan the same
+    argvs out as raw Popens while callers with one session run them inline.
+    """
+    return [
+        [psmux, "-L", name, "bind", "-n", "F1", "detach-client"],
+        [psmux, "-L", name, "set", "-g", "status-right", _STATUS_HINTS],
+    ]
+
+
+def decorate_session(name: str, psmux: str | None = None) -> None:
+    """Advertise the F1/F2 hints in one session's status line.
+
+    Best-effort and guarded exactly like ``flash_message``: a status bar is
+    cosmetic, so a missing binary, a hung psmux, or a non-zero exit is logged
+    and swallowed -- never propagated into a bring-up.
+    """
+    binary = psmux or find_psmux()
+    if not binary:
+        return
+    for cmd in decoration_argv(name, binary):
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=3, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            get_logger("launch").warning(
+                "status-line decoration failed for session=%s: %s", name, exc
+            )
+
+
+def decorate_sessions(names: list[str]) -> list[str]:
+    """Decorate many sessions concurrently. Returns the names attempted.
+
+    Each session is its own psmux server, so the two round-trips per name
+    would otherwise serialize across a large config -- same fan-out shape as
+    ``revive_sessions``.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    binary = find_psmux()
+    if not binary or not names:
+        return []
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(lambda n: decorate_session(n, psmux=binary), names))
+    return list(names)
+
+
 def detach_client(name: str, psmux: str | None = None) -> bool:
     """Detach the client attached to ``name``. Returns True on success."""
     binary = psmux or find_psmux()
@@ -471,6 +531,11 @@ def config_sessions(config_path: str | None) -> list[dict[str, object]]:
     import json
     from pathlib import Path
 
+    # Same machinery `eligible_projects` uses, imported in-body in the same
+    # style: a configured ``path`` may be relative to ``baseDir``, and every
+    # consumer of this list that has to *act* on the folder (the F2 "open in
+    # VS Code" hotkey) needs an absolute one.
+    from magent.launch import _expand_base_dir, _resolve_path
     from magent.paths import find_config
     from magent.sessions import is_ide_tool
 
@@ -480,6 +545,10 @@ def config_sessions(config_path: str | None) -> list[dict[str, object]]:
 
     data = json.loads(config_file.read_text(encoding="utf-8"))
     default_tool = data.get("settings", {}).get("defaultTool", "claude")
+    raw_base = data.get("baseDir")
+    base_dir = (
+        _expand_base_dir(raw_base) if isinstance(raw_base, str) and raw_base else None
+    )
     out: list[dict[str, object]] = []
     for p in data.get("projects", []):
         if not p.get("enabled", True):
@@ -493,6 +562,9 @@ def config_sessions(config_path: str | None) -> list[dict[str, object]]:
                 "name": proj_name,
                 "session": session_name(proj_name),
                 "path": p["path"],
+                # "" (never None) when the folder can't be resolved, so a JSON
+                # consumer can treat it as a plain string field.
+                "resolved": _resolve_path(p["path"], base_dir) or "",
             }
         )
     return out

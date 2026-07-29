@@ -1,6 +1,7 @@
 import os
 import sys
 
+from magent.sessions import build_code_open_command, folder_for_session
 from magent.sessions.claude import encode_claude_project_path, get_claude_session_ids
 from magent.sessions.codex import get_codex_session_ids
 
@@ -139,3 +140,89 @@ class TestGetCodexSessionIds:
         ids = get_codex_session_ids("/home/user/api", 2, home_override=tmp_path)
         assert ids[0] == "uuid-good"
         assert ids[1] is None
+
+
+class TestBuildCodeOpenCommand:
+    """argv for the F2 "open this project in VS Code" hotkey. Pure and
+    win32-free on purpose: hotkey.py raises ImportError off Windows, so the
+    decision logic lives here where every OS in the matrix can test it."""
+
+    def test_local_open_is_bin_plus_folder(self):
+        assert build_code_open_command("/a/api", None, "code") == ["code", "/a/api"]
+
+    def test_remote_open_uses_ssh_remote_authority(self):
+        assert build_code_open_command("/a/api", "host", "code") == [
+            "code",
+            "--remote",
+            "ssh-remote+host",
+            "/a/api",
+        ]
+
+    def test_user_prefix_is_stripped_from_the_authority(self):
+        # VS Code resolves the login user from the machine's ssh config; the
+        # attach target is user@host, so only the hostname goes into the URI.
+        assert build_code_open_command("/a/api", "amin@deck", "code") == [
+            "code",
+            "--remote",
+            "ssh-remote+deck",
+            "/a/api",
+        ]
+
+    def test_empty_ssh_host_degrades_to_a_local_open(self):
+        assert build_code_open_command("/a/api", "", "code") == ["code", "/a/api"]
+        assert build_code_open_command("/a/api", "amin@", "code") == ["code", "/a/api"]
+
+    def test_resolved_code_binary_is_used_verbatim(self):
+        # shutil.which resolves code.cmd on Windows; Popen runs it directly.
+        argv = build_code_open_command(r"C:\a\api", None, r"C:\bin\code.cmd")
+        assert argv == [r"C:\bin\code.cmd", r"C:\a\api"]
+
+
+class TestFolderForSession:
+    """Picking the folder to open out of an /api/sessions response body."""
+
+    def _payload(self, *entries):
+        return {"ok": True, "sessions": list(entries)}
+
+    def test_prefers_resolved_over_raw_path(self):
+        # `path` is the raw config value and may be relative to the host's
+        # baseDir -- meaningless to the client doing the opening.
+        payload = self._payload(
+            {
+                "name": "caly",
+                "session": "caly",
+                "path": "INTERNAL/caly",
+                "resolved": "/base/INTERNAL/caly",
+            }
+        )
+        assert folder_for_session(payload, "caly") == "/base/INTERNAL/caly"
+
+    def test_falls_back_to_path_when_resolved_is_empty(self):
+        payload = self._payload(
+            {"name": "caly", "session": "caly", "path": "/abs/caly", "resolved": ""}
+        )
+        assert folder_for_session(payload, "caly") == "/abs/caly"
+
+    def test_matches_on_the_display_name_too(self):
+        # Window titles carry the psmux socket id, but a display name must
+        # still resolve -- the two differ whenever the title has dots/spaces.
+        payload = self._payload(
+            {"name": "my.api", "session": "my-api", "resolved": "/a/my.api"}
+        )
+        assert folder_for_session(payload, "my-api") == "/a/my.api"
+        assert folder_for_session(payload, "my.api") == "/a/my.api"
+
+    def test_missing_project_is_none(self):
+        payload = self._payload({"name": "caly", "session": "caly", "path": "/a/caly"})
+        assert folder_for_session(payload, "ghost") is None
+
+    def test_entry_without_any_folder_is_none(self):
+        payload = self._payload({"name": "caly", "session": "caly", "resolved": ""})
+        assert folder_for_session(payload, "caly") is None
+
+    def test_wrong_shaped_payloads_are_none(self):
+        assert folder_for_session(None, "caly") is None
+        assert folder_for_session([], "caly") is None
+        assert folder_for_session({"ok": False}, "caly") is None
+        assert folder_for_session({"sessions": "nope"}, "caly") is None
+        assert folder_for_session({"sessions": ["nope"]}, "caly") is None
