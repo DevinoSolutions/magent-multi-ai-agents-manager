@@ -31,7 +31,7 @@ from magent.grid import compute_grid
 from magent.log import get_logger
 from magent.paths import find_config
 from magent.style import style
-from magent.tiling import RETRY_SECS_CONTAINS, Placement, place_windows
+from magent.tiling import RETRY_SECS_CONTAINS, Placement, place_windows, window_open
 from magent.titles import make_title, parse_title
 
 
@@ -253,6 +253,29 @@ def _tile_titles(titles: list[str]) -> None:
 _SPAWN_STAGGER_S = 0.25
 
 
+def _already_open(names: list[str]) -> set[str]:
+    """The subset of ``names`` that already has a local magent: window.
+
+    Attach used to spawn a `wt` window per remote session unconditionally, so
+    re-attaching while the previous attach's windows were still open stacked a
+    duplicate window on every session. The launch path has always skipped what
+    is already up (launch.py's ``_is_running``); this borrows the same matcher
+    tiling resolves windows with, so a title carrying a state badge still
+    counts as open.
+    """
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    # set_dpi_aware() stays in _tile_titles: enumerating titles needs no DPI
+    # context, and that global side effect should fire exactly once.
+    snap = get_platform().snapshot_windows()
+    return {name for name in names if window_open(snap, name)}
+
+
+def _echo_already_open(title: str) -> None:
+    """The spawn loops' counterpart to their `o <title>` line."""
+    click.echo(f"  {style('=', fg='cyan')} {title} {style('already open', dim=True)}")
+
+
 # Bringing up many agents at once is a cold-start storm on the host (each
 # session spawns a shell plus a full agent process): a 40-project bring-up can
 # genuinely run past five minutes on a loaded machine. The old 300s budget
@@ -425,12 +448,21 @@ def _attach_flow(
         click.echo(f"\n  {style('x', fg='red')} No sessions are up on the host.")
         sys.exit(1)
 
+    # The psmux socket id (P3-01): drives the window title, the wire the
+    # Alt+V hotkey posts back, and the host-side `magent sessions <id>`.
+    sids = [_as_str(s.get("session")) or _as_str(s.get("name")) for s in up]
+    open_already = _already_open(sids)
+
     titles: list[str] = []
-    for sess in up:
-        # The psmux socket id (P3-01): drives the window title, the wire the
-        # Alt+V hotkey posts back, and the host-side `magent sessions <id>`.
-        sid = _as_str(sess.get("session")) or _as_str(sess.get("name"))
+    for sid in sids:
         title = make_title(sid)
+        if sid in open_already:
+            # Still tiled with everything else -- an already-open window belongs
+            # in the grid; it just must not be opened a second time, and costs
+            # no stagger since no SSH handshake follows.
+            _echo_already_open(title)
+            titles.append(title)
+            continue
         click.echo(f"  {style('o', fg='cyan')} {title}")
         subprocess.Popen(
             [
@@ -520,10 +552,18 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
         f"{style('-- direct SSH, no multiplexer', dim=True)}\n"
     )
 
+    # Window title = psmux socket id so the Alt+V hotkey resolves it (P3-01).
+    sids = [_as_str(p.get("session")) or _as_str(p.get("name")) for p in projects]
+    open_already = _already_open(sids)
+
     titles: list[str] = []
-    for p in projects:
-        # Window title = psmux socket id so the Alt+V hotkey resolves it (P3-01).
-        title = make_title(_as_str(p.get("session")) or _as_str(p.get("name")))
+    for sid, p in zip(sids, projects, strict=True):
+        title = make_title(sid)
+        if sid in open_already:
+            # Tiled but not re-spawned, and no stagger: see _attach_flow.
+            _echo_already_open(title)
+            titles.append(title)
+            continue
         remote_dir = _as_str(p.get("resolved")) or _as_str(p.get("path"))
         # NF-S3-004: fall back to the registry default, never a drifting literal.
         cmd = _as_str(p.get("cmd")) or DEFAULT_TOOLS["claude"]

@@ -61,6 +61,17 @@ def _lookup(snap: dict[str, object], key: str, mode: str) -> object | None:
     return None
 
 
+def window_open(snap: dict[str, object], key: str, mode: str = "magent-name") -> bool:
+    """True when ``snap`` already holds a window matching ``key`` in ``mode``.
+
+    The public face of the very matcher ``place_windows`` resolves with, so a
+    caller asking "is this window already up?" before spawning one (cli/attach's
+    spawn loops, mirroring launch.py's ``_is_running``) cannot drift from how
+    tiling will later find it -- badge-proof ``magent-name`` matching included.
+    """
+    return _lookup(snap, key, mode) is not None
+
+
 def place_windows(
     plat: Platform,
     placements: list[Placement],
