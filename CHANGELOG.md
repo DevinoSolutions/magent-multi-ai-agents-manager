@@ -5,6 +5,31 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.5.0] - 2026-07-29
+
+### Added
+
+- **F2 reports its progress in the window's own status line.** Pressing F2
+  now flashes what is happening -- "F2: opening VS Code...", "F2: 'code' not
+  found on PATH", "F2: no folder known for <project>", "F2: VS Code ->
+  <folder>" -- instead of failing silently into `hotkey.log`. The feedback
+  rides the same status-line flash channel upload progress already uses, so
+  it works identically over a remote attach.
+- **Local launches start the hotkey listener too.** `magent --go` and the
+  interactive menu now start the Alt+V / F2 listener (single-instance
+  guarded, pointed at loopback), so the `F2 code` status-bar hint is live
+  everywhere -- previously only `magent attach` started it.
+- **Attach warns when the host runs an older magent.** `magent up --json`
+  now reports the host's version and the attach client prints a loud
+  warning naming both versions and the upgrade command when they differ --
+  missing features now point at the real cause instead of failing silently.
+
+### Fixed
+
+- **Remotely-attached sessions get the F1/F2 status-line hints.** The
+  `up --json` path that `magent attach` drives on the host never decorated
+  pre-existing sessions; only fresh bring-ups got the hints.
+
 ## [3.4.0] - 2026-07-29
 
 ### Added
@@ -288,6 +313,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.5.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.4.0...v3.5.0
 [3.4.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.3.0...v3.4.0
 [3.3.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.2.2...v3.3.0
 [3.2.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.2.1...v3.2.2
