@@ -5,6 +5,19 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.7.0] - 2026-07-30
+
+### Added
+
+- **Edit a remote host's config over SSH.** `magent config edit` (defaults
+  to the last attach host; or `magent config edit user@host`) fetches the
+  host's config, opens it in your JSON editor, validates it on close, and
+  pushes it back only if valid and changed. The host validates again,
+  backs up the previous config, and writes atomically -- an editing
+  mistake can never corrupt the remote config. Powered by two new
+  host-side subcommands, `config cat` and `config put`; hosts too old to
+  have them get a clear upgrade hint.
+
 ## [3.6.0] - 2026-07-29
 
 ### Added
@@ -335,6 +348,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.7.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.6.0...v3.7.0
 [3.6.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.5.0...v3.6.0
 [3.5.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.4.0...v3.5.0
 [3.4.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.3.0...v3.4.0
