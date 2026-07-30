@@ -101,6 +101,7 @@ class FakePlatform(Platform):
         windows=None,
         supports_psmux: bool = False,
         supports_attention: bool = False,
+        supports_hotkey: bool = False,
     ):
         self._monitors = (
             monitors
@@ -112,6 +113,7 @@ class FakePlatform(Platform):
         self._windows = windows if windows is not None else {}
         self._supports_psmux = supports_psmux
         self._supports_attention = supports_attention
+        self._supports_hotkey = supports_hotkey
         self._next_handle = 1
         self.dpi_aware_calls = 0
         self.launched_terminals: list[TerminalLaunchOpts] = []
@@ -160,6 +162,9 @@ class FakePlatform(Platform):
 
     def supports_psmux(self) -> bool:
         return self._supports_psmux
+
+    def supports_hotkey(self) -> bool:
+        return self._supports_hotkey
 
     def supports_attention_signals(self) -> bool:
         return self._supports_attention

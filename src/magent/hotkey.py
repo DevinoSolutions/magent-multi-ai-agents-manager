@@ -19,7 +19,11 @@ from urllib.request import Request, urlopen
 
 from magent.log import HEARTBEAT_INTERVAL, get_logger, write_heartbeat
 from magent.procs import pid_alive
-from magent.sessions import build_code_open_command, folder_for_session
+from magent.sessions import (
+    build_code_open_command,
+    build_flash_url,
+    folder_for_session,
+)
 from magent.titles import parse_title
 
 if TYPE_CHECKING:
@@ -324,26 +328,49 @@ def _do_upload(server_url: str, project: str) -> None:
         log.exception("upload project=%s failed", project)
 
 
+def _flash_status(server_url: str, project: str, message: str) -> None:
+    """Best-effort: show ``message`` in the magent:<project> status line.
+
+    The listener runs hidden with no terminal, so without this every F2 outcome
+    is invisible on screen -- the user sees a key that does nothing while the
+    real reason sits in hotkey.log. The whole call is swallowed on purpose:
+    feedback must never be able to break the action it reports on, and the log
+    line beside each call site stays the durable record.
+    """
+    with (
+        contextlib.suppress(Exception),
+        urlopen(build_flash_url(server_url, project, message), timeout=2),
+    ):
+        pass
+
+
 def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
     """Open the focused project's folder in VS Code, off the hook callback.
 
     Threaded for the same reason as ``_do_upload``: the /api/sessions round
     trip must never block a system-wide keyboard hook. Every failure mode --
     server down, project absent from the payload, no folder on the entry, no
-    ``code`` on PATH -- is a log line and a no-op; the listener has to outlive
-    all of them.
+    ``code`` on PATH -- is a log line, a status-line flash, and a no-op; the
+    listener has to outlive all of them.
     """
     log = get_logger("hotkey")
     try:
+        _flash_status(server_url, project, "F2: opening VS Code...")
         code_bin = shutil.which("code")
         if not code_bin:
             log.warning("F2: 'code' is not on PATH; cannot open project=%s", project)
+            _flash_status(server_url, project, "F2: 'code' not found on PATH")
             return
         with urlopen(f"{server_url}/api/sessions", timeout=10) as resp:
             payload = json.loads(resp.read())
         folder = folder_for_session(payload, project)
         if not folder:
             log.warning("F2: no folder for project=%s in /api/sessions", project)
+            _flash_status(
+                server_url,
+                project,
+                f"F2: no folder known for {project} (host magent too old?)",
+            )
             return
         # code is code.cmd on Windows; shutil.which resolves the .cmd and
         # Popen on that resolved path runs it without a shell.
@@ -351,8 +378,10 @@ def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
         log.info(
             "F2: opened project=%s folder=%s ssh_host=%s", project, folder, ssh_host
         )
+        _flash_status(server_url, project, f"F2: VS Code -> {folder}")
     except Exception:
         log.exception("F2: open project=%s failed", project)
+        _flash_status(server_url, project, "F2: failed - see hotkey.log")
 
 
 def _heartbeat_loop(stop_event: threading.Event) -> None:
