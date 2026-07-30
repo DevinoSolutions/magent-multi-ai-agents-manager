@@ -1013,6 +1013,10 @@ class TestMaybeStartHotkeySshHost:
 
         fake = types.ModuleType("magent.hotkey")
         fake.listener_pid = lambda: None
+        # start_hotkey_listener imports the keep-or-restart pair alongside
+        # listener_pid; with no listener running neither is called.
+        fake.listener_manifest = lambda: None
+        fake.stop_listener = lambda: False
         monkeypatch.setitem(sys.modules, "magent.hotkey", fake)
         # The spawn recipe itself moved to launch.start_hotkey_listener so the
         # launch path can share it; background is now just the capability gate.
