@@ -5,6 +5,28 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.6.0] - 2026-07-29
+
+### Added
+
+- **Attach reclaims the session geometry for your machine.** psmux sizes a
+  session to whatever client sent the last resize event and never
+  recomputes (its `window-size` options are stored but unimplemented), so
+  sessions viewed from another machine rendered clipped/squeezed until a
+  manual zoom nudged the terminal. `magent attach` now nudges every window
+  it handles past a cell boundary and restores its exact tiled rect,
+  forcing the local client's size to win -- the manual Ctrl+/- trick,
+  automated.
+
+### Fixed
+
+- **A stale hotkey listener is restarted instead of trusted.** The Alt+V /
+  F2 listener now records its version, server URL and SSH host; attach and
+  local launches restart it whenever any of those don't match (e.g. after
+  a pip upgrade, or switching between local and remote use). Previously
+  the single-instance guard kept the old process alive with the old code,
+  leaving F2 silently dead after an upgrade.
+
 ## [3.5.0] - 2026-07-29
 
 ### Added
@@ -313,6 +335,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.6.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.5.0...v3.6.0
 [3.5.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.4.0...v3.5.0
 [3.4.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.3.0...v3.4.0
 [3.3.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.2.2...v3.3.0
