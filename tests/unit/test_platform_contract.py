@@ -65,6 +65,18 @@ def test_default_supports_hotkey_false(platform_cls):
 
 
 @pytest.mark.parametrize("platform_cls", _DEFAULT_BACKENDS)
+def test_default_supports_window_nudge_false(platform_cls):
+    assert platform_cls().supports_window_nudge() is False
+
+
+@pytest.mark.parametrize("platform_cls", _DEFAULT_BACKENDS)
+def test_default_nudge_windows_is_a_noop(platform_cls):
+    # A capability the caller gates on supports_window_nudge(); calling it
+    # anyway must be harmless, not an exception.
+    assert platform_cls().nudge_windows([object(), object()]) == 0
+
+
+@pytest.mark.parametrize("platform_cls", _DEFAULT_BACKENDS)
 def test_default_attach_psmux_raises(platform_cls):
     with pytest.raises(NotImplementedError, match="psmux"):
         platform_cls().attach_psmux("s", "t")
@@ -89,6 +101,97 @@ class TestWindowsCapabilities:
         from magent.platform.windows import WindowsPlatform
 
         assert WindowsPlatform().supports_hotkey() is True
+
+    def test_supports_window_nudge_true(self):
+        from magent.platform.windows import WindowsPlatform
+
+        assert WindowsPlatform().supports_window_nudge() is True
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="WindowsPlatform binds windll at import"
+)
+class TestWindowsNudge:
+    """The geometry nudge resizes by a cell-crossing delta, settles once for
+    the whole batch, and restores every window's exact original rect -- the
+    only lever that makes psmux 3.3.6 adopt this client's size."""
+
+    def _driver(self, monkeypatch, rects, *, move_fails_for=()):
+        """Replace the three user32 calls with recorders. `rects` maps handle
+        -> (left, top, right, bottom) as GetWindowRect would fill it."""
+        from magent.platform import windows as win_mod
+
+        moves: list[tuple] = []
+        sleeps: list[float] = []
+
+        def fake_get_rect(handle, out):
+            if handle not in rects:
+                return 0
+            left, top, right, bottom = rects[handle]
+            out._obj.left, out._obj.top = left, top
+            out._obj.right, out._obj.bottom = right, bottom
+            return 1
+
+        def fake_move(handle, x, y, w, h, repaint):
+            if handle in move_fails_for:
+                raise OSError("invalid window handle")
+            moves.append((handle, x, y, w, h))
+            return 1
+
+        monkeypatch.setattr(win_mod.user32, "GetWindowRect", fake_get_rect)
+        monkeypatch.setattr(win_mod.user32, "MoveWindow", fake_move)
+        monkeypatch.setattr(win_mod.time, "sleep", sleeps.append)
+        return moves, sleeps
+
+    def test_shrinks_then_restores_the_exact_rect(self, monkeypatch):
+        from magent.platform.windows import _NUDGE_DELTA_PX, WindowsPlatform
+
+        moves, sleeps = self._driver(monkeypatch, {1: (100, 200, 900, 800)})
+        assert WindowsPlatform().nudge_windows([1]) == 1
+        assert moves == [
+            (1, 100, 200, 800, 600 - _NUDGE_DELTA_PX),
+            (1, 100, 200, 800, 600),
+        ]
+        # The delta must be big enough to cross a character cell -- a 1px
+        # nudge can resize the window without changing the reported grid.
+        assert _NUDGE_DELTA_PX >= 20
+        assert len(sleeps) == 1  # one shared settle for the whole batch
+
+    def test_batch_shares_one_settle(self, monkeypatch):
+        from magent.platform.windows import WindowsPlatform
+
+        moves, sleeps = self._driver(
+            monkeypatch, {1: (0, 0, 800, 600), 2: (800, 0, 1600, 600)}
+        )
+        assert WindowsPlatform().nudge_windows([1, 2]) == 2
+        # Both shrink, then both restore -- so the settle covers every window.
+        assert [m[0] for m in moves] == [1, 2, 1, 2]
+        assert len(sleeps) == 1
+
+    def test_dead_handle_is_skipped_not_fatal(self, monkeypatch):
+        from magent.platform.windows import WindowsPlatform
+
+        moves, _ = self._driver(monkeypatch, {1: (0, 0, 800, 600)})  # 2 has no rect
+        assert WindowsPlatform().nudge_windows([2, 1]) == 1
+        assert [m[0] for m in moves] == [1, 1]
+
+    def test_a_window_dying_mid_nudge_does_not_raise(self, monkeypatch):
+        from magent.platform.windows import WindowsPlatform
+
+        moves, _ = self._driver(
+            monkeypatch,
+            {1: (0, 0, 800, 600), 2: (800, 0, 1600, 600)},
+            move_fails_for=(2,),
+        )
+        assert WindowsPlatform().nudge_windows([1, 2]) == 1
+        assert [m[0] for m in moves] == [1, 1]
+
+    def test_nothing_to_nudge_skips_the_settle(self, monkeypatch):
+        from magent.platform.windows import WindowsPlatform
+
+        moves, sleeps = self._driver(monkeypatch, {})
+        assert WindowsPlatform().nudge_windows([1]) == 0
+        assert moves == [] and sleeps == []
 
 
 @pytest.mark.skipif(

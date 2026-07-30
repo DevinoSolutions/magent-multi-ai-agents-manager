@@ -14,6 +14,7 @@ point: a behavior pin that survives the refactor is the drift tripwire.
 from __future__ import annotations
 
 import time
+from typing import ClassVar
 
 import pytest
 
@@ -25,7 +26,9 @@ from magent.tiling import (
     RETRY_SECS_CONTAINS,
     RETRY_SECS_EXACT,
     Placement,
+    find_in_snapshot,
     place_windows,
+    window_open,
 )
 
 
@@ -325,3 +328,33 @@ class TestPlaceWindows:
 
         assert placed == []
         assert [p.key for p in missing] == ["api"]
+
+
+class TestFindInSnapshot:
+    """The public face of the matcher place_windows resolves with, for callers
+    that need the handle itself (cli/attach's post-tiling geometry nudge). It
+    and window_open must never drift from placement's own lookup."""
+
+    _SNAP: ClassVar[dict] = {
+        "magent:[!] api": 7,
+        "magent:web": 8,
+        "api": 9,
+        "Some Editor - api": 10,
+    }
+
+    def test_magent_name_is_badge_proof(self):
+        assert find_in_snapshot(self._SNAP, "api") == 7
+        assert find_in_snapshot(self._SNAP, "web") == 8
+
+    def test_missing_window_is_none(self):
+        assert find_in_snapshot(self._SNAP, "nope") is None
+
+    def test_exact_and_contains_modes(self):
+        assert find_in_snapshot(self._SNAP, "api", "exact") == 9
+        assert find_in_snapshot(self._SNAP, "some editor", "contains") == 10
+
+    def test_window_open_agrees_with_the_lookup(self):
+        for key in ("api", "web", "nope"):
+            assert window_open(self._SNAP, key) is (
+                find_in_snapshot(self._SNAP, key) is not None
+            )

@@ -102,6 +102,8 @@ class FakePlatform(Platform):
         supports_psmux: bool = False,
         supports_attention: bool = False,
         supports_hotkey: bool = False,
+        supports_nudge: bool = False,
+        nudge_error: Exception | None = None,
     ):
         self._monitors = (
             monitors
@@ -114,6 +116,8 @@ class FakePlatform(Platform):
         self._supports_psmux = supports_psmux
         self._supports_attention = supports_attention
         self._supports_hotkey = supports_hotkey
+        self._supports_nudge = supports_nudge
+        self._nudge_error = nudge_error
         self._next_handle = 1
         self.dpi_aware_calls = 0
         self.launched_terminals: list[TerminalLaunchOpts] = []
@@ -121,6 +125,7 @@ class FakePlatform(Platform):
         self.launched_psmux: list[PsmuxWindowOpts] = []
         self.attached_psmux: list[tuple] = []
         self.moved: list[tuple] = []
+        self.nudged: list[list] = []
         self.titles_set: list[tuple] = []
         self.flashed: list = []
         self.focused: list = []
@@ -168,6 +173,17 @@ class FakePlatform(Platform):
 
     def supports_attention_signals(self) -> bool:
         return self._supports_attention
+
+    def supports_window_nudge(self) -> bool:
+        return self._supports_nudge
+
+    def nudge_windows(self, handles) -> int:
+        """Record the batch instead of resizing real windows. `nudge_error`
+        stands in for a window that died between the snapshot and the resize."""
+        self.nudged.append(list(handles))
+        if self._nudge_error is not None:
+            raise self._nudge_error
+        return len(handles)
 
     def set_window_title(self, handle, title: str) -> bool:
         self.titles_set.append((handle, title))

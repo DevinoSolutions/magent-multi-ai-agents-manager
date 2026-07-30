@@ -5,6 +5,7 @@ import types
 from magent import cli
 from magent.config import SCHEMA_VERSION, MagentConfig, ProjectConfig, Settings
 from magent.launch import eligible_psmux_projects
+from tests.conftest import FakePlatform
 
 
 def _cfg(projects, **settings):
@@ -25,24 +26,13 @@ class _FakeProc:
         pass
 
 
-class _AttachPlatform:
-    """The slice of Platform the attach flow reaches for: the open-window
-    snapshot it consults before spawning, plus the hotkey capability gate."""
-
-    def __init__(self, windows: dict[str, int] | None = None) -> None:
-        self._windows = windows or {}
-
-    def snapshot_windows(self) -> dict[str, int]:
-        return self._windows
-
-    def supports_hotkey(self) -> bool:
-        return False
-
-
-def _fake_platform(monkeypatch, windows: dict[str, int] | None = None) -> None:
-    monkeypatch.setattr(
-        "magent.platform.get_platform", lambda: _AttachPlatform(windows)
-    )
+def _fake_platform(monkeypatch, windows=None, **kwargs) -> FakePlatform:
+    """Stand in for the platform the attach flow reaches for: the open-window
+    snapshot it consults before spawning, the hotkey capability gate, and the
+    post-tiling geometry nudge. Returns the double so a test can assert on it."""
+    fp = FakePlatform(windows=dict(windows or {}), **kwargs)
+    monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+    return fp
 
 
 class TestEligibleProjects:
@@ -518,6 +508,119 @@ class TestAttachSkipsOpenWindows:
         assert len(spawns) == 2
         assert len(sleeps) == 2
         assert titles == ["magent:api", "magent:web"]
+
+
+class TestGeometryReclaim:
+    """psmux 3.3.6 renders a session at whatever geometry the LAST client
+    resize-or-attach event reported and never recomputes it, so a window this
+    machine tiled back onto its own rect (the already-open case) keeps showing
+    another client's size. After tiling, attach forces every window it handled
+    to emit a client resize -- the same lever the manual Ctrl+/- zoom pulls."""
+
+    def _reclaim(self, monkeypatch, titles, windows, **kwargs):
+        from magent.cli import attach as attach_mod
+
+        fp = _fake_platform(monkeypatch, windows, supports_nudge=True, **kwargs)
+        attach_mod._reclaim_geometry(titles)
+        return fp
+
+    def test_every_resolved_window_is_nudged_in_one_batch(self, monkeypatch):
+        fp = self._reclaim(
+            monkeypatch,
+            ["magent:api", "magent:web"],
+            {"magent:api": 1, "magent:web": 2},
+        )
+        # One batch: the settle is shared, so a 40-window attach pays it once.
+        assert fp.nudged == [[1, 2]]
+
+    def test_badged_title_still_resolves(self, monkeypatch):
+        # Same badge-proof matcher tiling resolved the window with moments ago.
+        fp = self._reclaim(monkeypatch, ["magent:api"], {"magent:[!] api": 7})
+        assert fp.nudged == [[7]]
+
+    def test_window_that_vanished_is_skipped_not_fatal(self, monkeypatch):
+        fp = self._reclaim(
+            monkeypatch, ["magent:api", "magent:gone"], {"magent:api": 1}
+        )
+        assert fp.nudged == [[1]]
+
+    def test_no_resolved_windows_never_calls_the_platform(self, monkeypatch):
+        fp = self._reclaim(monkeypatch, ["magent:api"], {})
+        assert fp.nudged == []
+
+    def test_a_failing_nudge_does_not_raise(self, monkeypatch):
+        # A window dying between the snapshot and the resize must not cost the
+        # user their attach.
+        fp = self._reclaim(
+            monkeypatch,
+            ["magent:api"],
+            {"magent:api": 1},
+            nudge_error=OSError("invalid window handle"),
+        )
+        assert fp.nudged == [[1]]
+
+    def test_platform_without_the_capability_is_a_noop(self, monkeypatch):
+        from magent.cli import attach as attach_mod
+
+        fp = _fake_platform(monkeypatch, {"magent:api": 1})  # supports_nudge=False
+        attach_mod._reclaim_geometry(["magent:api"])
+        assert fp.nudged == []
+
+
+class TestAttachFlowReclaimsGeometry:
+    """The nudge runs on the real attach paths, after tiling (so the rect each
+    window is restored to is the final tiled one) and for every title handled
+    -- the deduped already-open ones very much included."""
+
+    def _run(self, monkeypatch, sessions, windows, no_mux=False):
+        from magent.cli import attach as attach_mod
+
+        status = {
+            "up": [{"name": s, "session": s} for s in sessions],
+            "down": [],
+            "projects": [{"name": s, "path": s} for s in sessions],
+        }
+        monkeypatch.setattr(
+            attach_mod, "_query_status", lambda *a, **k: (status, 0, "")
+        )
+        monkeypatch.setattr(attach_mod, "_ssh_capture", lambda *a, **k: (0, "", ""))
+        monkeypatch.setattr(attach_mod.subprocess, "Popen", lambda *a, **k: _FakeProc())
+        monkeypatch.setattr(attach_mod.time, "sleep", lambda s: None)
+        monkeypatch.setattr(attach_mod, "_remember_last_host", lambda target: None)
+        monkeypatch.setattr(attach_mod, "_maybe_start_hotkey", lambda url: None)
+
+        fp = _fake_platform(monkeypatch, windows, supports_nudge=True)
+        events: list[tuple[str, list]] = []
+        monkeypatch.setattr(
+            attach_mod, "_tile_titles", lambda t: events.append(("tile", list(t)))
+        )
+        real_nudge = fp.nudge_windows
+
+        def spy(handles):
+            events.append(("nudge", list(handles)))
+            return real_nudge(handles)
+
+        monkeypatch.setattr(fp, "nudge_windows", spy)
+
+        attach_mod._attach_flow("user@host", no_mux=no_mux, group=None, yes=False)
+        return events
+
+    def test_psmux_path_nudges_after_tiling(self, monkeypatch):
+        # `web` is freshly spawned (and so never lands in the snapshot here);
+        # `api` is the already-open one -- exactly the stale-geometry case.
+        events = self._run(monkeypatch, ["api", "web"], {"magent:api": 1})
+        assert events == [("tile", ["magent:api", "magent:web"]), ("nudge", [1])]
+
+    def test_deduped_windows_are_nudged_too(self, monkeypatch):
+        events = self._run(
+            monkeypatch, ["api", "web"], {"magent:api": 1, "magent:web": 2}
+        )
+        assert events[0][0] == "tile"
+        assert events[1] == ("nudge", [1, 2])
+
+    def test_nomux_path_nudges_after_tiling(self, monkeypatch):
+        events = self._run(monkeypatch, ["api"], {"magent:api": 4}, no_mux=True)
+        assert events == [("tile", ["magent:api"]), ("nudge", [4])]
 
 
 class TestAttachNomux:

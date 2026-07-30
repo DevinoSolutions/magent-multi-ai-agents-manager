@@ -31,7 +31,13 @@ from magent.grid import compute_grid
 from magent.log import get_logger
 from magent.paths import find_config
 from magent.style import style
-from magent.tiling import RETRY_SECS_CONTAINS, Placement, place_windows, window_open
+from magent.tiling import (
+    RETRY_SECS_CONTAINS,
+    Placement,
+    find_in_snapshot,
+    place_windows,
+    window_open,
+)
 from magent.titles import make_title, parse_title
 
 
@@ -233,6 +239,13 @@ def _local_grid() -> tuple[int, int]:
     )
 
 
+def _match_key(title: str) -> tuple[str, str]:
+    """How tiling should look this window up: magent:-grammar titles match on
+    the parsed name (badge-proof), anything else on the exact title."""
+    parsed = parse_title(title)
+    return (parsed[0], "magent-name") if parsed is not None else (title, "exact")
+
+
 def _tile_titles(titles: list[str]) -> None:
     """Tile already-opened windows into the monitor grid. magent:-grammar titles
     are matched by parsed name (badge-proof); anything else falls back to an
@@ -254,10 +267,7 @@ def _tile_titles(titles: list[str]) -> None:
     click.echo(f"\n  {style('#', fg='cyan')} Tiling {len(titles)} window(s)...")
     placements = []
     for i, title in enumerate(titles):
-        parsed = parse_title(title)
-        key, mode = (
-            (parsed[0], "magent-name") if parsed is not None else (title, "exact")
-        )
+        key, mode = _match_key(title)
         placements.append(
             Placement(name=title, key=key, mode=mode, slot=slots[i % len(slots)])
         )
@@ -276,6 +286,63 @@ def _tile_titles(titles: list[str]) -> None:
             f"    {style('x', fg='red')} {p.name} {style('not found', dim=True)}"
         ),
     )
+
+
+def _reclaim_geometry(titles: list[str]) -> None:
+    """Make every window we just tiled re-assert its size to psmux.
+
+    psmux 3.3.6 arbitrates nothing: a session renders at whatever geometry the
+    LAST client resize-or-attach event reported, and nothing server-side ever
+    recomputes it -- detaching or killing the other client does not release its
+    geometry, and `refresh-client`, `resize-pane` and `detach-client -a` are
+    silent no-ops (`resize-window` is worse: a no-op that HANGS under
+    `window-size manual`, so magent must never call it). The symptom is a
+    session sized by another machine rendering squeezed into part of this one's
+    window, with lines clipped.
+
+    The one event psmux always honors is a CLIENT resize -- which is why the
+    manual Ctrl+/Ctrl- zoom trick fixes it: changing the terminal's cell grid
+    makes the client report a new size. So we do the same thing without the
+    zoom: nudge each OS window's size and put it straight back. Over SSH that
+    travels as a real SIGWINCH to the remote psmux client, so the machine
+    actually looking at the session wins.
+
+    Runs AFTER tiling so the rect we restore is the final tiled one, and
+    covers already-open windows too -- those are exactly the stale case, since
+    tiling either skips them or moves them to where they already were, and
+    neither fires a resize event.
+    """
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    plat = get_platform()
+    if not plat.supports_window_nudge():
+        return
+    snap = plat.snapshot_windows()
+    log = get_logger("launch")
+    handles: list[object] = []
+    for title in titles:
+        key, mode = _match_key(title)
+        handle = find_in_snapshot(snap, key, mode)
+        if handle is None:
+            # Closed mid-flight, or never appeared (tiling already said so).
+            log.warning("geometry nudge: window not found: key=%r mode=%s", key, mode)
+            continue
+        handles.append(handle)
+    if not handles:
+        return
+    try:
+        nudged = plat.nudge_windows(handles)
+    except OSError:
+        # Best-effort by construction: a window that dies between the snapshot
+        # and the resize must not cost the user their attach.
+        log.warning("geometry nudge failed", exc_info=True)
+        return
+    log.info("geometry nudge: %d/%d window(s)", nudged, len(titles))
+    if nudged:
+        click.echo(
+            f"  {style('#', fg='cyan')} Reclaimed terminal geometry"
+            f" for {nudged} window(s)."
+        )
 
 
 # Pause between `wt` window spawns. The real constraint is sshd, not the
@@ -542,6 +609,8 @@ def _attach_flow(
     )
 
     _tile_titles(titles)
+    # After placement, so the rect each window is restored to is the tiled one.
+    _reclaim_geometry(titles)
 
     try:
         rc = ensure.wait(timeout=15)
@@ -626,6 +695,9 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
         time.sleep(_SPAWN_STAGGER_S)
 
     _tile_titles(titles)
+    # Same reason as the psmux path: an already-open window tiled back onto its
+    # own rect never emits a resize, so nothing downstream re-reads the size.
+    _reclaim_geometry(titles)
     click.echo(
         f"\n  {style('Done.', fg='green', bold=True)} "
         f"{style('(no-mux mode: Alt+V image paste is not available)', dim=True)}"

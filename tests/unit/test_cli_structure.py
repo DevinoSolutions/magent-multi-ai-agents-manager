@@ -318,6 +318,12 @@ class TestAttachFlowCharacterization:
             def supports_hotkey(self) -> bool:
                 return True
 
+            def supports_window_nudge(self) -> bool:
+                # The post-tiling geometry nudge has its own tests
+                # (test_attach.py::TestAttachFlowReclaimsGeometry); this pin
+                # is about the spawn/tile shape, so opt out of it here.
+                return False
+
             def snapshot_windows(self) -> dict[str, int]:
                 # Nothing open locally: every up-session gets a fresh window.
                 return {}
