@@ -265,6 +265,102 @@ class TestStartPsmuxAndUpload:
         assert fp.attached_psmux == []
 
 
+class TestLocalHotkeyListener:
+    """A local launch starts the Alt+V / F2 listener itself. Before this, only
+    `magent attach` did -- so locally the psmux status bar advertised "F2 code"
+    with no live handler behind it."""
+
+    @pytest.fixture(autouse=True)
+    def _no_real_processes(self, monkeypatch):
+        # The upload server would otherwise really be spawned, and tailnet.ip4
+        # would really shell out to `tailscale`.
+        monkeypatch.setattr("magent.launch.spawn_detached", lambda *a, **k: None)
+        monkeypatch.setattr("magent.launch.tailnet.ip4", lambda: None)
+
+    @pytest.fixture
+    def spawned(self, monkeypatch):
+        """Intercept the detached spawn: the real one needs a Windows-only
+        hotkey import and would leave a keyboard hook running."""
+        calls: list[tuple[str, str | None]] = []
+
+        def _fake(server_url, ssh_host=None):
+            calls.append((server_url, ssh_host))
+            return 4242  # the child came up and wrote its pid
+
+        monkeypatch.setattr("magent.launch.start_hotkey_listener", _fake)
+        return calls
+
+    def _run(self, fp, spawned, **opts):
+        cfg = MagentConfig(
+            projects=[],
+            settings=Settings(psmux=True, upload_server=True, upload_port=9911),
+        )
+        result = _LaunchResult(
+            targets=[],
+            psmux_windows=[
+                PsmuxWindowOpts(window_name="a", cwd="/tmp/a", command="claude")
+            ],
+            psmux_colors={"a": None},
+        )
+        _start_psmux_and_upload(fp, cfg, RunOpts(**opts), result)
+
+    def test_starts_the_listener_pointed_at_loopback(self, spawned, capsys):
+        fp = FakePlatform(supports_psmux=True, supports_hotkey=True)
+
+        self._run(fp, spawned)
+
+        # Loopback, never the tailnet IP: a local listener must not depend on
+        # Tailscale being up to reach its own upload server.
+        assert spawned == [("http://127.0.0.1:9911", None)]
+        out = capsys.readouterr().out
+        assert "hotkey listener" in out
+        assert "Alt+V" in out and "F2" in out
+
+    def test_skipped_when_the_platform_has_no_hotkey_support(self, spawned, capsys):
+        fp = FakePlatform(supports_psmux=True, supports_hotkey=False)
+
+        self._run(fp, spawned)
+
+        assert spawned == []
+        assert "hotkey listener" not in capsys.readouterr().out
+
+    def test_skipped_without_an_upload_server(self, spawned, capsys):
+        # F2 resolves its folder through the server's /api/sessions -- with no
+        # server there is nothing for the listener to do.
+        fp = FakePlatform(supports_psmux=True, supports_hotkey=True)
+        cfg = MagentConfig(projects=[], settings=Settings(psmux=True))
+        result = _LaunchResult(
+            targets=[],
+            psmux_windows=[
+                PsmuxWindowOpts(window_name="a", cwd="/tmp/a", command="claude")
+            ],
+            psmux_colors={"a": None},
+        )
+
+        _start_psmux_and_upload(fp, cfg, RunOpts(), result)
+
+        assert spawned == []
+        assert "hotkey listener" not in capsys.readouterr().out
+
+    def test_skipped_on_dry_run(self, spawned, capsys):
+        fp = FakePlatform(supports_psmux=True, supports_hotkey=True)
+
+        self._run(fp, spawned, dry_run=True)
+
+        assert spawned == []
+        assert "hotkey listener" not in capsys.readouterr().out
+
+    def test_no_echo_when_the_listener_never_confirms(self, monkeypatch, capsys):
+        # start_hotkey_listener returns None when the child never wrote a pid;
+        # claiming it's up would be a lie.
+        monkeypatch.setattr("magent.launch.start_hotkey_listener", lambda *a, **k: None)
+        fp = FakePlatform(supports_psmux=True, supports_hotkey=True)
+
+        self._run(fp, None)
+
+        assert "hotkey listener" not in capsys.readouterr().out
+
+
 class TestLaunchProjects:
     """Direct unit tests for the extracted per-project dispatch loop (R4,
     Step 4), which returns the typed _LaunchResult the downstream phases

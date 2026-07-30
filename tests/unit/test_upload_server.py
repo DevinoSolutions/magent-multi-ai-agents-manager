@@ -833,6 +833,104 @@ class TestInSessionFeedback:
         assert mod._inflight.get("marka", 0) == 0
 
 
+class TestFlashEndpoint:
+    """GET /api/flash -- the on-screen voice of callers that have no screen.
+    The Alt+V/F2 listener runs hidden with no terminal, so this route is the
+    only way an F2 failure reaches the user instead of only hotkey.log."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, tmp_path, monkeypatch):
+        import magent.psmux as psmux_mod
+        import magent.upload_server as mod
+
+        monkeypatch.setattr(mod, "_UPLOAD_DIR", tmp_path / "uploads")
+        monkeypatch.setattr(psmux_mod, "find_psmux", lambda: "psmux")
+
+        self.calls: list[list[str]] = []
+
+        def _rec(args, **kwargs):
+            self.calls.append(list(args))
+
+            class R:
+                returncode = 0
+                stdout = b""
+                stderr = b""
+
+            return R()
+
+        monkeypatch.setattr(psmux_mod.subprocess, "run", _rec)
+
+        UploadHandler.config_path = None
+        UploadHandler.cached_sessions = [{"name": "marka", "path": "INTERNAL/marka"}]
+        UploadHandler.sessions_ts = time.time() + 9999
+
+        from http.server import HTTPServer
+
+        self.server = HTTPServer(("127.0.0.1", 0), UploadHandler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        yield
+        self.server.shutdown()
+
+    def _get(self, path: str):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        return resp.status, json.loads(resp.read())
+
+    def _flashes(self) -> list[list[str]]:
+        return [c for c in self.calls if "display-message" in c]
+
+    def test_flashes_the_decoded_message_at_the_named_project(self):
+        status, data = self._get("/api/flash?project=marka&msg=F2%3A%20opening...")
+        assert status == 200
+        assert data == {"ok": True}
+        flash = self._flashes()[0]
+        # Routed to that project's own psmux socket, with the message decoded.
+        assert flash[:3] == ["psmux", "-L", "marka"]
+        assert flash[-1] == "F2: opening..."
+
+    def test_plus_and_percent_escapes_are_decoded(self):
+        # quote() emits %20 for spaces, but a hand-built or browser-issued URL
+        # can use "+" -- parse_qs decodes both, and neither may leak literally.
+        self._get("/api/flash?project=marka&msg=a+b%20c%26d")
+        assert self._flashes()[0][-1] == "a b c&d"
+
+    def test_long_messages_are_clamped_server_side(self):
+        from magent.sessions import FLASH_MSG_MAX
+
+        self._get(f"/api/flash?project=marka&msg={'z' * (FLASH_MSG_MAX + 200)}")
+        # Clamped independently of the client: a status bar is one line wide.
+        assert self._flashes()[0][-1] == "z" * FLASH_MSG_MAX
+
+    def test_missing_msg_is_400_and_flashes_nothing(self):
+        status, data = self._get("/api/flash?project=marka")
+        assert status == 400
+        assert data["ok"] is False
+        assert data["error"]
+        assert self._flashes() == []
+
+    def test_missing_project_is_400_and_flashes_nothing(self):
+        status, data = self._get("/api/flash?msg=hello")
+        assert status == 400
+        assert data["ok"] is False
+        assert self._flashes() == []
+
+    def test_no_query_at_all_is_400(self):
+        status, data = self._get("/api/flash")
+        assert status == 400
+        assert data["ok"] is False
+
+    def test_post_on_the_flash_route_is_405_not_404(self):
+        # P3-16: /api/flash is a real GET route, so the wrong verb answers 405.
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("POST", "/api/flash", body=b"", headers={"Content-Length": "0"})
+        resp = conn.getresponse()
+        assert resp.status == 405
+        assert json.loads(resp.read())["ok"] is False
+
+
 class TestStopServer:
     """Truthful stop_server: True only when the kill actually succeeded; the
     pid file survives a failed kill so `status`/a retry can still find it."""

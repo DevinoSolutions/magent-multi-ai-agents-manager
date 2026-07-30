@@ -60,6 +60,46 @@ def spawn_detached(args: list[str], extra_flags: int = 0) -> subprocess.Popen[by
         return subprocess.Popen(args, creationflags=base)
 
 
+def start_hotkey_listener(server_url: str, ssh_host: str | None = None) -> int | None:
+    """Start the window-hotkey (Alt+V paste / F2 open-in-VS-Code) listener
+    detached, unless one is already running. Returns its pid, or None if the
+    child never confirmed itself.
+
+    Windows-only: the caller owns the ``supports_hotkey()`` gate (the launch
+    path holds a Platform already, the CLI path resolves one), which is also
+    what keeps the ``magent.hotkey`` import below reachable -- it raises
+    ImportError off win32 at import time.
+
+    Lives here, next to ``spawn_detached``, rather than in ``cli/background.py``
+    where it started: ``launch.py`` must not import the cli package (cli/__init__
+    imports every command module, so a reverse import cycles), and both the
+    launch path and ``magent attach`` need this same recipe.
+
+    ``ssh_host`` is forwarded to the child so its F2 handler opens projects
+    through VS Code Remote-SSH; omitted, F2 opens them on this machine.
+    """
+    from magent.hotkey import (
+        listener_pid,  # ImportError off-Windows (hotkey.py guards); must stay lazy
+    )
+
+    existing = listener_pid()
+    if existing:
+        return existing
+
+    args = [sys.executable, "-m", "magent", "hotkey", "-s", server_url]
+    if ssh_host:
+        args += ["--ssh-host", ssh_host]
+    spawn_detached(args)
+    # The child writes its pid only after the keyboard hook installs; give it a
+    # short window to come up so we can report (and so a hook failure surfaces).
+    for _ in range(20):
+        time.sleep(0.1)
+        pid = listener_pid()
+        if pid:
+            return pid
+    return None
+
+
 @dataclass
 class RunOpts:
     retile_all: bool = False
@@ -512,6 +552,23 @@ def _start_psmux_and_upload(
                 f"\n  {style('#', fg='magenta')} upload server: {style(url, fg='cyan', bold=True)}"
                 f" {style('(open on phone)', dim=True)}"
             )
+
+            # Only `magent attach` used to start the listener, so on a local
+            # launch the psmux status bar advertised "F2 code" with nothing
+            # listening. Point it at loopback, not the tailnet IP: a local
+            # listener must not depend on Tailscale being up. Nested under the
+            # upload_server gate because F2 resolves its folder via that
+            # server's /api/sessions -- no server, nothing for F2 to do.
+            if plat.supports_hotkey():
+                pid = start_hotkey_listener(f"http://127.0.0.1:{port}")
+                if pid:
+                    click.echo(
+                        f"  {style('#', fg='magenta')} hotkey listener: "
+                        f"{style('Alt+V', fg='cyan', bold=True)}"
+                        f" {style('pastes an image,', dim=True)} "
+                        f"{style('F2', fg='cyan', bold=True)}"
+                        f" {style('opens the project in VS Code', dim=True)}"
+                    )
 
 
 def _tile_targets(

@@ -11,7 +11,6 @@ from __future__ import annotations
 import re
 import socket
 import sys
-import time
 from pathlib import Path
 
 from magent import tailnet
@@ -53,34 +52,21 @@ def _maybe_start_hotkey(server_url: str, ssh_host: str | None = None) -> int | N
 
     ``ssh_host`` is forwarded to the child so its F2 handler opens projects
     through VS Code Remote-SSH; omitted, F2 opens them on this machine.
+
+    This is the capability gate around ``launch.start_hotkey_listener``, which
+    owns the spawn recipe so the launch path can reuse it without importing the
+    cli package (that would cycle -- see LS-A-001).
     """
     from magent.platform import get_platform  # heavy subsystem: in-body per policy
 
     if not get_platform().supports_hotkey():
         return None
 
-    from magent.hotkey import (
-        listener_pid,  # ImportError off-Windows (hotkey.py guards); must stay lazy
+    from magent.launch import (
+        start_hotkey_listener,  # heavy subsystem: in-body per policy
     )
 
-    existing = listener_pid()
-    if existing:
-        return existing
-
-    args = [sys.executable, "-m", "magent", "hotkey", "-s", server_url]
-    if ssh_host:
-        args += ["--ssh-host", ssh_host]
-    from magent.launch import spawn_detached  # heavy subsystem: in-body per policy
-
-    spawn_detached(args)
-    # The child writes its pid only after the keyboard hook installs; give it a
-    # short window to come up so we can report (and so a hook failure surfaces).
-    for _ in range(20):
-        time.sleep(0.1)
-        pid = listener_pid()
-        if pid:
-            return pid
-    return None
+    return start_hotkey_listener(server_url, ssh_host)
 
 
 def _probe_port(port: int) -> bool:

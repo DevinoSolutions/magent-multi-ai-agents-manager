@@ -3,6 +3,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -313,10 +314,8 @@ class TestListenerLifecycle:
         assert not p.exists()
 
 
-class TestDoOpenCode:
-    """F2 -> open the focused project's folder in VS Code. Every failure mode
-    is a log line and a no-op: the listener has to outlive a dead server, an
-    unknown project, and a machine with no VS Code on it."""
+class _OpenCodeHarness:
+    """Shared fake for the F2 handler's two round trips (see `_patch`)."""
 
     def _patch(self, monkeypatch, *, payload=None, code_bin="code"):
         import contextlib
@@ -325,6 +324,7 @@ class TestDoOpenCode:
         from magent import hotkey
 
         spawned: list[list[str]] = []
+        self.flashed: list[str] = []
         monkeypatch.setattr(hotkey.shutil, "which", lambda _n: code_bin)
         monkeypatch.setattr(hotkey.subprocess, "Popen", spawned.append)
 
@@ -332,11 +332,23 @@ class TestDoOpenCode:
 
         @contextlib.contextmanager
         def _fake_urlopen(url, timeout=None):
+            # One fake stands in for both round trips the handler makes: the
+            # /api/sessions lookup and every best-effort /api/flash report.
+            if "/api/flash" in url:
+                self.flashed.append(parse_qs(urlparse(url).query)["msg"][0])
+                yield io.BytesIO(b"")
+                return
             assert url.endswith("/api/sessions")
             yield io.BytesIO(body)
 
         monkeypatch.setattr(hotkey, "urlopen", _fake_urlopen)
         return spawned
+
+
+class TestDoOpenCode(_OpenCodeHarness):
+    """F2 -> open the focused project's folder in VS Code. Every failure mode
+    is a log line and a no-op: the listener has to outlive a dead server, an
+    unknown project, and a machine with no VS Code on it."""
 
     def test_opens_the_resolved_folder_locally(self, monkeypatch):
         from magent import hotkey
@@ -400,6 +412,112 @@ class TestDoOpenCode:
         with caplog.at_level("ERROR", logger="magent.hotkey"):
             hotkey._do_open_code("http://x:8034", "caly", None)  # must not raise
         assert "F2: open project=caly failed" in caplog.text
+
+
+class TestDoOpenCodeFeedback(_OpenCodeHarness):
+    """F2's on-screen half. The listener is a hidden background process, so
+    without these flashes a failed F2 is indistinguishable from a dead key --
+    the whole point of the /api/flash endpoint."""
+
+    def test_entry_flash_fires_before_anything_can_fail(self, monkeypatch):
+        from magent import hotkey
+
+        self._patch(
+            monkeypatch,
+            payload={"ok": True, "sessions": [{"session": "caly", "path": "/b/caly"}]},
+        )
+        hotkey._do_open_code("http://x:8034", "caly", None)
+        assert self.flashed[0] == "F2: opening VS Code..."
+
+    def test_success_flash_names_the_folder(self, monkeypatch):
+        from magent import hotkey
+
+        self._patch(
+            monkeypatch,
+            payload={
+                "ok": True,
+                "sessions": [{"session": "caly", "resolved": "/base/caly"}],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "caly", None)
+        assert self.flashed[-1] == "F2: VS Code -> /base/caly"
+
+    def test_missing_code_binary_flashes_the_reason(self, monkeypatch):
+        from magent import hotkey
+
+        self._patch(monkeypatch, code_bin=None)
+        hotkey._do_open_code("http://x:8034", "caly", None)
+        assert self.flashed[-1] == "F2: 'code' not found on PATH"
+
+    def test_unknown_project_flashes_the_version_hint(self, monkeypatch):
+        from magent import hotkey
+
+        self._patch(monkeypatch, payload={"ok": True, "sessions": []})
+        hotkey._do_open_code("http://x:8034", "ghost", None)
+        assert self.flashed[-1] == (
+            "F2: no folder known for ghost (host magent too old?)"
+        )
+
+    def test_unexpected_failure_flashes_and_points_at_the_log(self, monkeypatch):
+        from magent import hotkey
+
+        self._patch(
+            monkeypatch,
+            payload={
+                "ok": True,
+                "sessions": [{"session": "caly", "resolved": "/base/caly"}],
+            },
+        )
+
+        def _boom(_argv):
+            raise OSError("no exe")
+
+        monkeypatch.setattr(hotkey.subprocess, "Popen", _boom)
+        hotkey._do_open_code("http://x:8034", "caly", None)
+        assert self.flashed[-1] == "F2: failed - see hotkey.log"
+
+    def test_a_dead_flash_endpoint_never_breaks_the_open(self, monkeypatch):
+        # Feedback is strictly best-effort: an old host with no /api/flash
+        # route (or a server that just died) must still open VS Code.
+        import contextlib
+        import io
+        from urllib.error import URLError
+
+        from magent import hotkey
+
+        spawned: list[list[str]] = []
+        monkeypatch.setattr(hotkey.shutil, "which", lambda _n: "code")
+        monkeypatch.setattr(hotkey.subprocess, "Popen", spawned.append)
+        body = json.dumps(
+            {"ok": True, "sessions": [{"session": "caly", "resolved": "/base/caly"}]}
+        ).encode()
+
+        @contextlib.contextmanager
+        def _flaky(url, timeout=None):
+            if "/api/flash" in url:
+                raise URLError("404")
+            yield io.BytesIO(body)
+
+        monkeypatch.setattr(hotkey, "urlopen", _flaky)
+        hotkey._do_open_code("http://x:8034", "caly", None)
+        assert spawned == [["code", "/base/caly"]]
+
+    def test_flash_url_is_the_shared_builder_shape(self, monkeypatch):
+        # Pin the client/server contract: the listener must hit the same route
+        # upload_server serves, with the project it was invoked for.
+        from magent import hotkey
+
+        seen: list[str] = []
+
+        def _capture(url, timeout=None):
+            seen.append(url)
+            raise OSError("stop here")
+
+        monkeypatch.setattr(hotkey.shutil, "which", lambda _n: None)
+        monkeypatch.setattr(hotkey, "urlopen", _capture)
+        hotkey._do_open_code("http://127.0.0.1:8033", "caly", None)
+        assert seen[0].startswith("http://127.0.0.1:8033/api/flash?")
+        assert parse_qs(urlparse(seen[0]).query)["project"] == ["caly"]
 
 
 class TestF2HookDecision:

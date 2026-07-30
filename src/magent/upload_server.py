@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 from magent import psmux, tailnet
 from magent.icons import render_icon
 from magent.log import get_logger
+from magent.sessions import FLASH_MSG_MAX
 
 
 def _pid_path(port: int) -> Path:
@@ -113,6 +114,12 @@ _MSG_RED = "bg=red,fg=white,bold"
 _FLASH_UP_MS = 20000
 _FLASH_OK_MS = 2500
 _FLASH_NO_MS = 3000
+
+# /api/flash: how long a caller-supplied message lingers. Long enough to read a
+# whole sentence, short enough that a stale one clears itself. The Alt+V/F2
+# listener is the only caller today -- it runs hidden with no terminal of its
+# own, so this endpoint is its ONLY way to say anything on screen.
+_FLASH_MSG_MS = 4000
 
 # Per-project count of pastes currently in flight, so several at once read as
 # "uploading (2)" / "uploaded (1 more)" instead of stomping each other.
@@ -604,6 +611,7 @@ _GET_PATHS: frozenset[str] = frozenset(
         "/",
         "",
         "/api/sessions",
+        "/api/flash",
         "/install.mobileconfig",
         "/focus",
         "/health",
@@ -789,6 +797,23 @@ class UploadHandler(BaseHTTPRequestHandler):
                 json.dumps({"ok": True, "sessions": self._sessions()}).encode(),
                 "application/json",
             )
+        elif path == "/api/flash":
+            # Status-line flash on behalf of a caller that has no screen of its
+            # own -- today the hidden Alt+V/F2 listener, whose every failure was
+            # otherwise only a line in hotkey.log. Deliberately unauthenticated,
+            # like every other route here: the loopback + Tailscale bind IS the
+            # access control (see DESIGN.md), and the blast radius of the worst
+            # case is a clamped string on a status bar for _FLASH_MSG_MS.
+            query = parse_qs(urlparse(self.path).query)
+            flash_project = query.get("project", [""])[0]
+            message = query.get("msg", [""])[0]
+            if not flash_project or not message:
+                self._json_response(
+                    {"ok": False, "error": "project and msg are required"}, 400
+                )
+            else:
+                _flash(None, flash_project, message[:FLASH_MSG_MAX], _FLASH_MSG_MS)
+                self._json_response({"ok": True})
         elif path == "/install.mobileconfig":
             # Built per-request: the Web Clip URL must match the host:port the
             # phone actually used, which only the Host header knows.

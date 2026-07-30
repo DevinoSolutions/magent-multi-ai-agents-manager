@@ -1,7 +1,13 @@
 import os
 import sys
+from urllib.parse import parse_qs, urlparse
 
-from magent.sessions import build_code_open_command, folder_for_session
+from magent.sessions import (
+    FLASH_MSG_MAX,
+    build_code_open_command,
+    build_flash_url,
+    folder_for_session,
+)
 from magent.sessions.claude import encode_claude_project_path, get_claude_session_ids
 from magent.sessions.codex import get_codex_session_ids
 
@@ -226,3 +232,38 @@ class TestFolderForSession:
         assert folder_for_session({"ok": False}, "caly") is None
         assert folder_for_session({"sessions": "nope"}, "caly") is None
         assert folder_for_session({"sessions": ["nope"]}, "caly") is None
+
+
+class TestBuildFlashUrl:
+    """The URL the hidden F2 listener uses to say something on screen. Pure
+    string math, tested on every OS for the same reason as the argv builder
+    above -- hotkey.py, its only caller, is win32-import-only."""
+
+    def _query(self, url: str) -> dict[str, list[str]]:
+        return parse_qs(urlparse(url).query)
+
+    def test_hits_the_flash_route_with_both_params(self):
+        url = build_flash_url("http://127.0.0.1:8033", "caly", "F2: opening VS Code...")
+        assert url.startswith("http://127.0.0.1:8033/api/flash?")
+        assert self._query(url) == {
+            "project": ["caly"],
+            "msg": ["F2: opening VS Code..."],
+        }
+
+    def test_trailing_slash_on_the_server_url_is_not_doubled(self):
+        url = build_flash_url("http://127.0.0.1:8033/", "caly", "hi")
+        assert "//api/flash" not in url
+        assert url.startswith("http://127.0.0.1:8033/api/flash?")
+
+    def test_special_characters_survive_the_round_trip(self):
+        # Windows paths (backslashes, colons, spaces) and the "&"/"?" that
+        # would otherwise split the query string.
+        msg = r"F2: VS Code -> C:\Users\a b\my api & co?x"
+        url = build_flash_url("http://h:8033", "my project", msg)
+        q = self._query(url)
+        assert q["project"] == ["my project"]
+        assert q["msg"] == [msg]
+
+    def test_long_messages_are_clamped_to_the_shared_budget(self):
+        url = build_flash_url("http://h:8033", "caly", "z" * (FLASH_MSG_MAX + 50))
+        assert self._query(url)["msg"] == ["z" * FLASH_MSG_MAX]

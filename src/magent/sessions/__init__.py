@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from urllib.parse import quote
 
 from magent.sessions.claude import build_claude_resume, get_claude_session_ids
 from magent.sessions.codex import build_codex_resume, get_codex_session_ids
@@ -121,3 +122,24 @@ def build_code_open_command(
             args.extend(["--remote", f"ssh-remote+{host}"])
     args.append(folder)
     return args
+
+
+# Longest status-line message the flash endpoint accepts. A psmux status bar is
+# one line wide, so anything past this is noise that would only push the useful
+# prefix off-screen. Shared by the client (build_flash_url) and the server
+# (upload_server's /api/flash) so both clamp to the same budget.
+FLASH_MSG_MAX = 120
+
+
+def build_flash_url(server_url: str, project: str, message: str) -> str:
+    """URL that flashes ``message`` in the ``magent:<project>`` status line.
+
+    The F2 handler's only channel for on-screen feedback: hotkey.py runs in a
+    hidden background process with no terminal, so a failure it cannot report
+    through the upload server is invisible to the user. Pure string math, so
+    the shape stays testable on every OS (hotkey.py is win32-import-only).
+    """
+    return (
+        f"{server_url.rstrip('/')}/api/flash"
+        f"?project={quote(project)}&msg={quote(message[:FLASH_MSG_MAX])}"
+    )
