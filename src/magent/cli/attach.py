@@ -157,6 +157,40 @@ def _query_status(
     return _last_json_obj(out), rc, err
 
 
+def _warn_version_skew(target: str, status: dict[str, object]) -> None:
+    """Say so, loudly but harmlessly, when the host runs a different magent.
+
+    `up --json` grew a `version` key in this release, so a MISSING key means
+    the host predates it -- that is the exact situation this warns about (a
+    laptop on a new magent silently losing status hints / --revive / the F2
+    folder lookup because the host never implemented them). Purely advisory:
+    printed by the attach CLIENT on stderr so `--json` consumers upstream are
+    untouched, and never fatal -- attach carries on either way.
+    """
+    # deferred: resolving __version__ costs an importlib.metadata import, and
+    # only this one diagnostic needs it (see cli/ui.py::_banner).
+    from magent import __version__
+
+    host_version = _as_str(status.get("version"))
+    if host_version == __version__:
+        return
+    running = f"magent {host_version}" if host_version else "an older magent"
+    click.echo(
+        f"\n  {style('!', fg='yellow')} {style(f'{target} runs {running}', fg='yellow')}"
+        f"{style(f'; this machine runs magent {__version__}.', fg='yellow')}",
+        err=True,
+    )
+    click.echo(
+        f"  {style('Status-line hints, --revive and the F2 folder lookup may be unavailable.', fg='yellow')}",
+        err=True,
+    )
+    click.echo(
+        f"  {style('Upgrade the host with', fg='yellow')}"
+        f" {style('pip install -U magent-multi-ai-agents-manager', fg='yellow', bold=True)}",
+        err=True,
+    )
+
+
 def _explain_status_failure(target: str, rc: int, err: str) -> None:
     """One diagnostic line for a failed status read: timeout, ssh error, or
     missing-magent -- previously all three collapsed into the same message."""
@@ -387,6 +421,9 @@ def _attach_flow(
 
     # The host answered with a real magent status -- worth remembering.
     _remember_last_host(target)
+    # ...and worth checking against ours: a host on an older magent silently
+    # lacks features this client assumes exist.
+    _warn_version_skew(target, status)
 
     if no_mux:
         _attach_nomux(target, status)
@@ -643,11 +680,28 @@ def up_cmd(
         # `up --json` is a pure read by default (attach polls it repeatedly);
         # reviving is opt-in so a poll never types into anyone's pane.
         revived = revive_psmux(cfg, only=live_ids, group=group) if revive else []
+        # Refresh the F1/F2 status-line hints here too. `magent attach` drives
+        # the host through THIS path (`magent up --json --revive` over SSH), so
+        # skipping it left every pre-existing session hint-less on exactly the
+        # flow the hints were built for. Idempotent and silent -- it writes to
+        # the psmux status bar, never to stdout, so `--json` output stays pure
+        # JSON. Sessions created by bring-up are decorated at birth by
+        # launch_psmux_session, and `--json` never brings anything up, so
+        # live_ids is the whole gap.
+        decorate_psmux_sessions(live_ids)
+        # deferred: resolving __version__ costs an importlib.metadata import,
+        # and only the JSON envelope needs it (see cli/ui.py::_banner).
+        from magent import __version__
+
         click.echo(
             json.dumps(
                 {
                     # P3-03: snake_case across all CLI JSON; P3-04: ok-envelope.
                     "ok": True,
+                    # The attach client compares this against its own version
+                    # and warns on skew; a host too old to emit it is exactly
+                    # the case that warning exists for.
+                    "version": __version__,
                     "platform": sys.platform,
                     "psmux": cfg.settings.psmux,
                     "upload_server": cfg.settings.upload_server,
@@ -715,9 +769,8 @@ def up_cmd(
     # Advertise the F1/F2 hints in every live session's status line. Sessions
     # created by launch_psmux_session are decorated at birth; doing it again
     # here is what gives a PRE-EXISTING session (made before this feature, or
-    # by an older magent) the hints without forcing a recreate. Interactive
-    # path only -- `up --json` is attach's status query and stays a pure,
-    # fast read, and these are two psmux round-trips per session.
+    # by an older magent) the hints without forcing a recreate. The `--json`
+    # branch above does the same for its live sessions.
     decorate_psmux_sessions([*live_ids, *created])
 
     if cfg.settings.upload_server:
