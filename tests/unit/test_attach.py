@@ -655,12 +655,11 @@ class TestUpRevive:
         # The key is always present so a consumer can read it unconditionally.
         assert payload["revived"] == []
 
-    def test_json_never_decorates(self, runner, tmp_path, monkeypatch):
-        # `up --json` is attach's status query and is polled repeatedly; the
-        # hints cost two psmux round-trips per session, so they stay off it.
-        def _fail(names):
-            raise AssertionError("`up --json` must not decorate any session")
-
+    def test_json_decorates_the_live_sessions(self, runner, tmp_path, monkeypatch):
+        # `magent attach` drives the host through the --json path, so this is
+        # the ONLY place a remotely-attached pre-existing session can pick up
+        # the F1/F2 hints. Silent: the decoration talks to psmux, never stdout.
+        seen: list[list[str]] = []
         monkeypatch.setattr(
             "magent.launch.psmux_status",
             lambda cfg, group=None: (
@@ -670,12 +669,15 @@ class TestUpRevive:
             ),
         )
         monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
-        monkeypatch.setattr("magent.launch.decorate_psmux_sessions", _fail)
+        monkeypatch.setattr("magent.launch.decorate_psmux_sessions", seen.append)
 
         result = runner.invoke(
             cli.main, ["--config", self._config(tmp_path), "up", "--json"]
         )
         assert result.exit_code == 0
+        assert seen == [["api"]]
+        # stdout stays pure JSON despite the extra work.
+        assert json.loads(result.stdout)["ok"] is True
 
     def test_json_revive_flag_revives_the_live_sessions(
         self, runner, tmp_path, monkeypatch
@@ -757,6 +759,102 @@ class TestUpDecorates:
         result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
         assert result.exit_code == 0
         assert seen == [["api"]]
+
+
+class TestUpJsonVersion:
+    """`up --json` advertises the host's magent version so the attach client
+    can tell the user when the two machines are out of step."""
+
+    def _config(self, tmp_path):
+        p = tmp_path / "magent.config.json"
+        p.write_text(
+            json.dumps(
+                {
+                    "version": SCHEMA_VERSION,
+                    "projects": [{"path": "/a/api", "tool": "claude"}],
+                    "settings": {"uploadServer": False},
+                }
+            )
+        )
+        return str(p)
+
+    def test_payload_carries_the_running_version(self, runner, tmp_path, monkeypatch):
+        from magent import __version__
+
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: ([], [], _PROJECT_ROWS),
+        )
+        monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions", lambda names: names
+        )
+
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_path), "up", "--json"]
+        )
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["version"] == __version__
+
+
+class TestAttachVersionSkew:
+    """The attach CLIENT compares the host's `up --json` version against its
+    own and warns -- non-fatally, on stderr -- when they differ or the host is
+    too old to report one at all."""
+
+    def _warn(self, capsys, status):
+        from magent.cli import attach as attach_mod
+
+        attach_mod._warn_version_skew("amin@desktop", status)
+        return capsys.readouterr()
+
+    def test_silent_when_versions_match(self, capsys):
+        from magent import __version__
+
+        captured = self._warn(capsys, {"version": __version__})
+        assert captured.err == ""
+        assert captured.out == ""
+
+    def test_warns_when_the_host_reports_an_older_version(self, capsys):
+        captured = self._warn(capsys, {"version": "3.1.4"})
+        assert "amin@desktop runs magent 3.1.4" in captured.err
+        assert "pip install -U magent-multi-ai-agents-manager" in captured.err
+        # The warning must never contaminate stdout.
+        assert captured.out == ""
+
+    def test_warns_when_the_version_key_is_missing(self, capsys):
+        # A host predating this release emits no `version` key at all -- the
+        # exact case the warning exists for.
+        captured = self._warn(capsys, {"ok": True, "up": [], "projects": []})
+        assert "an older magent" in captured.err
+        assert "pip install -U magent-multi-ai-agents-manager" in captured.err
+
+    def test_a_mismatch_does_not_stop_the_attach(self, monkeypatch, capsys):
+        from magent.cli import attach as attach_mod
+
+        status = {
+            "version": "3.1.4",
+            "up": [{"name": "api", "session": "api"}],
+            "down": [],
+            "projects": [{"name": "api"}],
+        }
+        monkeypatch.setattr(
+            attach_mod, "_query_status", lambda *a, **k: (status, 0, "")
+        )
+        monkeypatch.setattr(attach_mod, "_ssh_capture", lambda *a, **k: (0, "", ""))
+        monkeypatch.setattr(attach_mod.subprocess, "Popen", lambda *a, **k: _FakeProc())
+        tiled: list[list[str]] = []
+        monkeypatch.setattr(attach_mod, "_tile_titles", tiled.append)
+        monkeypatch.setattr(attach_mod.time, "sleep", lambda s: None)
+        monkeypatch.setattr(attach_mod, "_remember_last_host", lambda target: None)
+        _fake_platform(monkeypatch)
+
+        attach_mod._attach_flow("user@host", no_mux=False, group=None, yes=False)
+        captured = capsys.readouterr()
+        assert "an older magent" not in captured.err
+        assert "user@host runs magent 3.1.4" in captured.err
+        # The flow still opened and tiled the window.
+        assert tiled == [["magent:api"]]
 
 
 class TestHotkeyCmdSshHost:
