@@ -87,9 +87,14 @@ def _split_target(host: str) -> tuple[str, str]:
 
 
 def _ssh_capture(
-    target: str, remote_cmd: str, timeout: int = 30
+    target: str, remote_cmd: str, timeout: int = 30, stdin_text: str | None = None
 ) -> tuple[int, str, str]:
-    """Run a single non-interactive SSH command, returning (rc, stdout, stderr)."""
+    """Run a single non-interactive SSH command, returning (rc, stdout, stderr).
+
+    ``stdin_text`` feeds the remote command on stdin (``magent config put``
+    reads a whole config that way). Keeping it here rather than in a second
+    helper keeps one entry point for every SSH invocation magent makes, so the
+    BatchMode/ConnectTimeout posture can never drift between them."""
     try:
         r = subprocess.run(
             [
@@ -101,6 +106,7 @@ def _ssh_capture(
                 target,
                 remote_cmd,
             ],
+            input=stdin_text,
             capture_output=True,
             text=True,
             timeout=timeout,

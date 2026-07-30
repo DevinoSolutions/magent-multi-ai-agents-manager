@@ -87,6 +87,19 @@ def _open_in_editor(path: Path) -> None:
         subprocess.Popen([editor_command(), path_str])
 
 
+def _edit_and_wait(path: Path) -> None:
+    """Open PATH in the user's editor and BLOCK until that editor is closed.
+
+    ``_open_in_editor``'s fire-and-forget launch is right for "here is your
+    config, carry on" -- but useless for a fetch/edit/push cycle, which must
+    not read the file back before the user has saved and closed it. Windows
+    ``os.startfile`` in particular returns immediately. ``click.edit``
+    resolves VISUAL/EDITOR (falling back to the platform default) and waits
+    for the process, which is exactly the contract that flow needs.
+    """
+    click.edit(filename=str(path))
+
+
 def _confirm_change(message: str) -> None:
     click.echo(f"\n  {style('+', fg='green', bold=True)} {message}")
     click.echo(f"  {style('Press Enter to continue...', dim=True)}", nl=False)

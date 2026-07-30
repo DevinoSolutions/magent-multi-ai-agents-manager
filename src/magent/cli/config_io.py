@@ -10,7 +10,10 @@ not an oversight (E6.md S2.4 / S0 deviation).
 from __future__ import annotations
 
 import json
+import os
 import sys
+import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import click
@@ -19,8 +22,6 @@ from magent.config import load_config
 from magent.style import style
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from magent.config import MagentConfig
 
 
@@ -38,6 +39,39 @@ def _load_raw_config(path: Path) -> dict[str, object]:
 def _save_raw_config(path: Path, data: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _save_raw_config_atomic(path: Path, data: dict[str, object]) -> None:
+    """Write DATA over PATH without ever leaving a half-written config: the
+    JSON lands in a sibling temp file first, then one ``os.replace`` swaps it
+    in. ``_save_raw_config``'s straight write is fine for the interactive
+    editor (the user is right there, watching one field change); a whole config
+    arriving over SSH from another machine is not -- a truncated write there
+    would be discovered much later, by a launch that suddenly has no projects.
+    Sibling, not tempdir: ``os.replace`` is only atomic within a filesystem."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _validate_config_text(text: str) -> str | None:
+    """``None`` when TEXT would load as a valid config, else the reason it
+    would not (bad JSON included -- ConfigError subclasses ValueError).
+
+    Validation runs against a throwaway copy because ``load_config`` reads a
+    path, not a string: nothing is written near the real config until the
+    content has already passed. Both sides of the remote-edit flow call this --
+    ``config edit`` before it pushes, ``config put`` before it writes -- so a
+    mistake is rejected with the same words wherever it is caught."""
+    with tempfile.TemporaryDirectory(prefix="magent-cfgcheck-") as td:
+        probe = Path(td) / "config.json"
+        probe.write_text(text, encoding="utf-8")
+        try:
+            load_config(str(probe))
+        except (ValueError, OSError) as e:
+            return str(e)
+    return None
 
 
 # --- Raw-dict narrowing helpers ------------------------------------------

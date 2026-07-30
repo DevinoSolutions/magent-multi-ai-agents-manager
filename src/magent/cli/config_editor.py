@@ -1,13 +1,24 @@
 """The interactive config editor (`_config_menu`, radon F/48 -- the single
 worst-graded function in the codebase, relocated unchanged per E6.md S2.5:
 "do not smuggle a rewrite into a move") and the `magent config` command
-group with all 14 subcommands (13 original + E7's `migrate`).
+group with all 17 subcommands (13 original, E7's `migrate`, and the
+remote-edit trio `cat`/`put`/`edit`).
+
+The remote-edit trio is one feature split across two machines: `cat` and
+`put` are the HOST side (a laptop asks the desktop for its config, then hands
+one back), `edit` is the CLIENT side that drives them over SSH so nobody has
+to shell into the host to change a project. It is deliberately NOT surfaced
+as a `_config_menu` entry: that function sits exactly on the repo's
+ratchet-down-only complexity ceilings (C901 37 / PLR0912 40 / PLR0915 194),
+so one more branch there is a red gate by design.
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
 import sys
+import tempfile
 from pathlib import Path
 
 import click
@@ -20,13 +31,16 @@ from magent.cli.config_io import (
     _load_raw_config,
     _project_dicts,
     _save_raw_config,
+    _save_raw_config_atomic,
     _sub,
     _sublist,
+    _validate_config_text,
 )
 from magent.cli.ui import (
     _banner,
     _confirm_change,
     _divider,
+    _edit_and_wait,
     _grid_preview,
     _menu_item,
     _open_in_editor,
@@ -744,6 +758,236 @@ def config_open(ctx: click.Context) -> None:
 def config_path_cmd(ctx: click.Context) -> None:
     """Print the config file path."""
     click.echo(str(find_config(ctx.obj.get("config_path"))))
+
+
+# --- remote config editing -------------------------------------------------
+# `cat`/`put` are the HOST half (run over SSH by the client, never by hand);
+# `edit` is the CLIENT half. The host half deliberately says nothing about
+# WHERE its config lives -- it resolves that itself through find_config -- so
+# the client never has to know the host's OS, home directory or config layout.
+
+# One backup, overwritten on every push: the point is "undo the edit I just
+# made", not a history. Named for the flow that wrote it so a host owner
+# finding the file knows where it came from.
+_REMOTE_BACKUP_SUFFIX = ".bak-remote-edit"
+
+_UPGRADE_HOST_HINT = "pip install -U magent-multi-ai-agents-manager"
+
+
+@config.command("cat")
+@click.pass_context
+def config_cat(ctx: click.Context) -> None:
+    """Print this machine's raw config to stdout (host side of `config edit`)."""
+    config_file = find_config(ctx.obj.get("config_path"))
+    try:
+        text = config_file.read_text(encoding="utf-8")
+    except OSError as e:
+        click.echo(f"Error: cannot read {config_file}: {e}", err=True)
+        sys.exit(1)
+    # nl=False: this is a byte pipe, not a message -- the reader on the other
+    # end of the SSH connection compares what comes back against what it sent.
+    click.echo(text, nl=False)
+
+
+@config.command("put")
+@click.pass_context
+def config_put(ctx: click.Context) -> None:
+    """Replace this machine's config with JSON on stdin (host side of `config edit`).
+
+    Invalid JSON and configs this magent would refuse to load are rejected
+    before anything on disk is touched; the previous file is kept alongside
+    the new one as `<config>.bak-remote-edit`.
+    """
+    config_file = find_config(ctx.obj.get("config_path"))
+    text = sys.stdin.read()
+    if not text.strip():
+        click.echo("Error: no config on stdin.", err=True)
+        sys.exit(1)
+
+    problem = _validate_config_text(text)
+    if problem:
+        click.echo(f"Error: refusing to write an invalid config -- {problem}", err=True)
+        sys.exit(1)
+
+    # Validation above already proved this parses to a JSON object; re-parsing
+    # (rather than writing the text through) keeps the host's file in the same
+    # canonical shape every other magent writer produces, while the whole
+    # parsed dict -- unknown/unmodeled keys included -- round-trips.
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        click.echo("Error: config must be a JSON object.", err=True)
+        sys.exit(1)
+
+    if config_file.exists():
+        backup = config_file.with_name(config_file.name + _REMOTE_BACKUP_SUFFIX)
+        backup.write_text(config_file.read_text(encoding="utf-8"), encoding="utf-8")
+        click.echo(f"  Backed up {style(str(backup), dim=True)}")
+    _save_raw_config_atomic(config_file, data)
+    click.echo(f"  Wrote {style(str(config_file), dim=True)}")
+
+
+def _remote_unsupported(err: str) -> bool:
+    """True when the host answered "I have no such command" -- i.e. it runs a
+    magent from before the remote-config trio, not a broken connection."""
+    return "No such command" in err
+
+
+def _explain_remote_too_old(target: str, verb: str) -> None:
+    """A host too old to serve the flow gets the same shape of advice
+    `_warn_version_skew` gives for an old attach host: what is missing, and
+    the one command that fixes it. Never a traceback."""
+    click.echo(
+        f"\n  {style('x', fg='red')} "
+        f"{style(f'{target} runs a magent too old to {verb} its config remotely.', fg='yellow')}",
+        err=True,
+    )
+    click.echo(
+        f"  {style('magent config cat / magent config put shipped in a later release.', fg='yellow')}",
+        err=True,
+    )
+    click.echo(
+        f"  {style('Upgrade the host with', fg='yellow')}"
+        f" {style(_UPGRADE_HOST_HINT, fg='yellow', bold=True)}",
+        err=True,
+    )
+
+
+def _explain_remote_failure(target: str, rc: int, err: str) -> None:
+    """One diagnostic line for a failed fetch: timeout, ssh error, or a host
+    with no magent on PATH -- the same triage `_explain_status_failure` does
+    for attach, so both remote paths fail in the same voice."""
+    click.echo(
+        f"\n  {style('x', fg='red')} Could not read the config from {target}.", err=True
+    )
+    if rc == 124:
+        click.echo(
+            f"  {style('SSH timed out -- the host may be asleep; try again.', dim=True)}",
+            err=True,
+        )
+        return
+    detail = err.strip().splitlines()[-1] if err.strip() else f"ssh exited {rc}"
+    click.echo(f"  {style(detail[:200], dim=True)}", err=True)
+    if "not recognized" in err or "not found" in err:
+        click.echo(
+            f"  {style('Is magent installed and on PATH on the host?', dim=True)}",
+            err=True,
+        )
+
+
+def _scratch_copy(target: str, text: str) -> Path:
+    """Park the fetched config in its own temp dir, named after the host it
+    came from -- an editor tab reading `desktop.config.json` is unambiguous,
+    and the dir survives an abort so the user never loses an edit."""
+    slug = "".join(c if c.isalnum() or c in "-_." else "-" for c in target) or "host"
+    scratch = Path(tempfile.mkdtemp(prefix="magent-remote-config-"))
+    local = scratch / f"{slug}.config.json"
+    local.write_text(text, encoding="utf-8")
+    return local
+
+
+def _remote_config_edit(target: str) -> int:
+    """Fetch TARGET's config, edit it here, push it back. Returns an exit code.
+
+    Nothing is pushed unless the file actually changed AND still validates
+    locally -- a bad edit stops on this machine instead of landing on the host
+    and breaking its next launch.
+    """
+    from magent.cli.attach import _ssh_capture  # heavy subsystem: in-body per policy
+
+    click.echo(f"  Fetching config from {style(target, fg='cyan')}...")
+    rc, out, err = _ssh_capture(target, "magent config cat")
+    if rc != 0:
+        if _remote_unsupported(err):
+            _explain_remote_too_old(target, "read")
+        else:
+            _explain_remote_failure(target, rc, err)
+        return 1
+    if not out.strip():
+        click.echo(
+            f"\n  {style('x', fg='red')} {target} returned an empty config.", err=True
+        )
+        return 1
+
+    local = _scratch_copy(target, out)
+    # Compare against the file as it reads back, not against `out`: the write
+    # /read round trip normalizes line endings, so an untouched file is equal
+    # here and a real edit is the only thing that shows up as a difference.
+    fetched = local.read_text(encoding="utf-8")
+
+    click.echo(f"  Opening {style(str(local), dim=True)} in your editor...")
+    _edit_and_wait(local)
+    edited = local.read_text(encoding="utf-8")
+
+    if edited == fetched:
+        click.echo(f"  {style('unchanged', dim=True)} -- nothing pushed to {target}.")
+        with contextlib.suppress(OSError):
+            local.unlink()
+            local.parent.rmdir()
+        return 0
+
+    problem = _validate_config_text(edited)
+    if problem:
+        click.echo(
+            f"\n  {style('x', fg='red')} Not pushing: the edited config is invalid.",
+            err=True,
+        )
+        click.echo(f"  {style(problem, dim=True)}", err=True)
+        click.echo(f"  {style(f'Your edits are kept at {local}', dim=True)}", err=True)
+        return 1
+
+    click.echo(f"  Pushing to {style(target, fg='cyan')}...")
+    rc, _, err = _ssh_capture(target, "magent config put", stdin_text=edited)
+    if rc != 0:
+        if _remote_unsupported(err):
+            _explain_remote_too_old(target, "write")
+        else:
+            click.echo(
+                f"\n  {style('x', fg='red')} {target} did not accept the config.",
+                err=True,
+            )
+            detail = err.strip().splitlines()[-1] if err.strip() else f"ssh exited {rc}"
+            click.echo(f"  {style(detail[:200], dim=True)}", err=True)
+        click.echo(f"  {style(f'Your edits are kept at {local}', dim=True)}", err=True)
+        return 1
+
+    click.echo(
+        f"  {style('+', fg='green', bold=True)} Updated the config on "
+        f"{style(target, fg='cyan')}."
+    )
+    with contextlib.suppress(OSError):
+        local.unlink()
+        local.parent.rmdir()
+    return 0
+
+
+def _resolve_remote_target(host: str | None) -> str:
+    """HOST, or the last host attached to -- the same memory `magent attach`
+    reads, so the two remote commands stay pointed at the same machine."""
+    from magent.cli.attach import (  # heavy subsystem: in-body per policy
+        _read_last_host,
+    )
+
+    target = host or _read_last_host()
+    if not target:
+        click.echo(
+            "No host given, and no remembered attach host to fall back on.", err=True
+        )
+        click.echo("Usage: magent config edit user@host", err=True)
+        sys.exit(1)
+    return target
+
+
+@config.command("edit")
+@click.argument("host", required=False)
+def config_edit(host: str | None) -> None:
+    """Edit another machine's config in your editor, over SSH.
+
+    HOST is user@host (omit to reuse the last host you attached to). Fetches
+    the host's config with `magent config cat`, opens it here, and pushes it
+    back with `magent config put` -- but only once it still validates, and
+    only if you actually changed something.
+    """
+    sys.exit(_remote_config_edit(_resolve_remote_target(host)))
 
 
 def _set_project_field(
