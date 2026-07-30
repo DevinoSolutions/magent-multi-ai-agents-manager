@@ -352,6 +352,17 @@ def _generate_docs() -> str:
     w(
         "| `magent config migrate` | Stamp the schema version and backfill project colors. |"
     )
+    w(
+        "| `magent config edit [host]` | Edit ANOTHER machine's config in your editor over SSH "
+        "(omit the host to reuse your last attach target). |"
+    )
+    w(
+        "| `magent config cat` | Print this machine's raw config to stdout (host side of `config edit`). |"
+    )
+    w(
+        "| `magent config put` | Replace this machine's config from stdin, validated, with a backup "
+        "(host side of `config edit`). |"
+    )
     w("")
 
     return "\n".join(lines)

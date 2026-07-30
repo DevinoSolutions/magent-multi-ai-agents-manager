@@ -207,7 +207,8 @@ Or skip the menu with flags:
 | `magent termius` | Generate an SSH config entry that opens the session picker. |
 | `magent hotkey [--ssh-host <host>]` | Run the window-hotkey listener standalone (Windows): Alt+V clipboard upload and F2 open-in-VS-Code. `--ssh-host` makes F2 open over Remote-SSH. |
 | `magent hooks install` | Wire the agent lifecycle hooks that feed the session-state store (`magent hooks status` to inspect) — see [Where agent states come from](#where-agent-states-come-from). |
-| `magent config <subcommand>` | Edit config from the CLI — 14 subcommands incl. `migrate`; see `magent config --help`. |
+| `magent config <subcommand>` | Edit config from the CLI — 17 subcommands incl. `migrate`; see `magent config --help`. |
+| `magent config edit [host]` | Edit the config on **another** machine in your editor over SSH — fetch, edit, validate, push back. Omit the host to reuse your last `attach` target. The host side is `magent config cat` / `magent config put`, which you never run by hand. |
 
 ## Platform support
 

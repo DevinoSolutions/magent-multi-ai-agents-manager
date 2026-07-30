@@ -50,7 +50,7 @@ HELP_SNAPSHOTS = {
     ): "Usage: main hotkey [OPTIONS]\n\n  Listen for Alt+V to upload clipboard images to psmux sessions.\n\n  Only activates when a 'magent:' titled window is focused. Otherwise the\n  keystroke passes through normally.\n\nOptions:\n  -s, --server TEXT  Upload server URL\n  --ssh-host TEXT    SSH target whose projects F2 opens over VS Code Remote-SSH\n  --help             Show this message and exit.\n",
     (
         "config",
-    ): "Usage: main config [OPTIONS] COMMAND [ARGS]...\n\n  View and modify your magent configuration.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  add           Add a project.\n  base-dir      Set the base directory for project paths.\n  default-tool  Set the default tool for new projects.\n  disable       Disable a project without removing it.\n  enable        Enable a disabled project.\n  layout        Set grid layout.\n  migrate       Migrate the config file to the current schema version,...\n  open          Open config file in your default editor.\n  path          Print the config file path.\n  remove        Remove a project by path (or leaf name).\n  remove-tool   Remove a tool.\n  set           Set a field on a project.\n  show          Display current configuration.\n  tool          Add or update a tool command.\n",
+    ): "Usage: main config [OPTIONS] COMMAND [ARGS]...\n\n  View and modify your magent configuration.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  add           Add a project.\n  base-dir      Set the base directory for project paths.\n  cat           Print this machine's raw config to stdout (host side of...\n  default-tool  Set the default tool for new projects.\n  disable       Disable a project without removing it.\n  edit          Edit another machine's config in your editor, over SSH.\n  enable        Enable a disabled project.\n  layout        Set grid layout.\n  migrate       Migrate the config file to the current schema version,...\n  open          Open config file in your default editor.\n  path          Print the config file path.\n  put           Replace this machine's config with JSON on stdin (host side...\n  remove        Remove a project by path (or leaf name).\n  remove-tool   Remove a tool.\n  set           Set a field on a project.\n  show          Display current configuration.\n  tool          Add or update a tool command.\n",
     (
         "watch",
     ): "Usage: main watch [OPTIONS]\n\n  Live view of every agent session — who needs you, sorted first.\n\n  Rows come from the same state store the attention daemon reads (needs-input\n  and errors on top, time-in-state alongside). Press a row number to focus that\n  session's window; q quits.\n\nOptions:\n  --interval FLOAT  Refresh seconds  [default: 2.0]\n  --help            Show this message and exit.\n",
@@ -167,13 +167,16 @@ TOP_LEVEL_COMMANDS = [
 CONFIG_SUBCOMMANDS = [
     "add",
     "base-dir",
+    "cat",
     "default-tool",
     "disable",
+    "edit",
     "enable",
     "layout",
     "migrate",
     "open",
     "path",
+    "put",
     "remove",
     "remove-tool",
     "set",
