@@ -5,6 +5,18 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.8.0] - 2026-07-30
+
+### Added
+
+- **Focusing a window reclaims its geometry, continuously.** The hotkey
+  listener now watches window focus: whenever a magent window gains focus
+  it re-nudges it (debounced per project, never while a mouse button is
+  down), so the window you're looking at always carries your machine's
+  geometry even if another attached client resized behind your back.
+  Extends v3.6.0's attach-time reclaim into standing protection; reaches
+  running listeners automatically via the listener auto-restart.
+
 ## [3.7.0] - 2026-07-30
 
 ### Added
@@ -348,6 +360,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.8.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.7.0...v3.8.0
 [3.7.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.6.0...v3.7.0
 [3.6.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.5.0...v3.6.0
 [3.5.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.4.0...v3.5.0
