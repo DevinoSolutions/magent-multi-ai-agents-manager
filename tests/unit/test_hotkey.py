@@ -314,6 +314,122 @@ class TestListenerLifecycle:
         assert not p.exists()
 
 
+class TestListenerManifest:
+    """The listener self-describes beside its pid file.
+
+    Without this the pid file says only "something is alive": an old process
+    survives a pip upgrade running old code (F2 silently dead), and a listener
+    wired to loopback by a local launch blocks the ssh-wired one `magent
+    attach` wants. The manifest is what makes those answerable.
+    """
+
+    @pytest.fixture
+    def paths(self, tmp_path, monkeypatch):
+        from magent import hotkey
+
+        monkeypatch.setattr(hotkey, "_PID_PATH", tmp_path / "hotkey.pid")
+        monkeypatch.setattr(hotkey, "_MANIFEST_PATH", tmp_path / "hotkey.json")
+        return tmp_path
+
+    def test_write_then_read_round_trip(self, paths, monkeypatch):
+        from magent import __version__, hotkey
+
+        hotkey._write_manifest("http://host:8034", "mdssh")
+        assert hotkey.listener_manifest() == {
+            "version": __version__,
+            "server_url": "http://host:8034",
+            "ssh_host": "mdssh",
+        }
+
+    def test_local_listener_records_no_ssh_host(self, paths):
+        from magent import hotkey
+
+        hotkey._write_manifest("http://127.0.0.1:8034", None)
+        assert hotkey.listener_manifest()["ssh_host"] is None
+
+    def test_missing_file_reads_as_none(self, paths):
+        # A pre-3.6.0 listener wrote no manifest at all -- indistinguishable
+        # from "no manifest", and treated the same way: stale.
+        from magent import hotkey
+
+        assert hotkey.listener_manifest() is None
+
+    def test_corrupt_file_reads_as_none(self, paths):
+        from magent import hotkey
+
+        hotkey._MANIFEST_PATH.write_text("{ not json")
+        assert hotkey.listener_manifest() is None
+
+    def test_non_object_json_reads_as_none(self, paths):
+        from magent import hotkey
+
+        hotkey._MANIFEST_PATH.write_text("[1, 2, 3]")
+        assert hotkey.listener_manifest() is None
+
+    def test_non_string_fields_read_as_none(self, paths):
+        from magent import hotkey
+
+        hotkey._MANIFEST_PATH.write_text('{"version": 3, "server_url": []}')
+        assert hotkey.listener_manifest() == {
+            "version": None,
+            "server_url": None,
+            "ssh_host": None,
+        }
+
+    def test_stop_listener_clears_the_manifest(self, paths, monkeypatch):
+        # A killed listener must not leave a manifest vouching for a process
+        # that is gone.
+        import subprocess
+
+        from magent import hotkey
+
+        hotkey._PID_PATH.write_text("4321")
+        hotkey._write_manifest("http://host:8034", None)
+        monkeypatch.setattr(hotkey, "pid_alive", lambda pid: True)
+
+        class _Result:
+            returncode = 0
+
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Result())
+        assert hotkey.stop_listener() is True
+        assert hotkey.listener_manifest() is None
+
+    def test_run_hotkey_writes_it_on_start_and_clears_on_exit(self, paths, monkeypatch):
+        # The manifest rides with the pid: written only after the hook is
+        # installed, removed with it when the message loop ends.
+        from magent import __version__, hotkey
+
+        monkeypatch.setattr(hotkey, "write_heartbeat", lambda _n: None)
+        seen = {}
+
+        class _FakeUser32:
+            def SetWindowsHookExW(self, *a):
+                return 1
+
+            def GetMessageW(self, *a):
+                # Sampled while the listener is "running" -- i.e. after
+                # _write_pid/_write_manifest, before the finally clears them.
+                seen["manifest"] = hotkey.listener_manifest()
+                seen["pid_file"] = hotkey._PID_PATH.exists()
+                return 0  # loop exits immediately
+
+            def UnhookWindowsHookEx(self, *a):
+                return 1
+
+        monkeypatch.setattr(hotkey, "user32", _FakeUser32())
+
+        hotkey.run_hotkey("http://127.0.0.1:8034", "mdssh")
+
+        assert seen["pid_file"] is True
+        assert seen["manifest"] == {
+            "version": __version__,
+            "server_url": "http://127.0.0.1:8034",
+            "ssh_host": "mdssh",
+        }
+        assert hotkey.listener_manifest() is None  # cleared with the pid file
+        assert not hotkey._PID_PATH.exists()
+
+
 class _OpenCodeHarness:
     """Shared fake for the F2 handler's two round trips (see `_patch`)."""
 
@@ -695,30 +811,147 @@ class TestHeartbeatWiring:
 
 
 class TestMaybeStartHotkey:
-    """attach starts the listener in the background, never a second copy."""
+    """attach starts the listener in the background, never a second copy --
+    but a listener that no longer matches this version/target is replaced
+    rather than kept (see launch.hotkey_restart_reason)."""
 
-    def test_returns_existing_without_spawning(self, monkeypatch):
+    @pytest.fixture(autouse=True)
+    def _never_touch_the_real_listener(self, monkeypatch):
+        """The starter now reads a manifest and can taskkill a pid, so both
+        are stubbed for every test here -- an unstubbed run would read (and
+        kill) the developer's own live listener."""
+        from magent import hotkey, launch
+
+        monkeypatch.setattr(hotkey, "listener_manifest", lambda: None)
+        monkeypatch.setattr(hotkey, "stop_listener", lambda: True)
+        monkeypatch.setattr(launch.time, "sleep", lambda _s: None)
+
+    @staticmethod
+    def _manifest(server_url="http://x:8034", ssh_host=None, version=None):
+        from magent import __version__
+
+        return {
+            "version": version or __version__,
+            "server_url": server_url,
+            "ssh_host": ssh_host,
+        }
+
+    def test_returns_matching_listener_without_spawning(self, monkeypatch):
         from magent import cli, hotkey
 
         monkeypatch.setattr(hotkey, "listener_pid", lambda: 1234)
+        monkeypatch.setattr(hotkey, "listener_manifest", self._manifest)
+        killed = []
+        monkeypatch.setattr(hotkey, "stop_listener", lambda: killed.append(True))
         spawned = []
         monkeypatch.setattr(
             "magent.launch.spawn_detached", lambda *a, **k: spawned.append(a)
         )
         assert cli._maybe_start_hotkey("http://x:8034") == 1234
-        assert spawned == []  # an already-running listener isn't duplicated
+        # Idempotent: attach re-runs this on every attach, and a needless
+        # restart drops the keyboard hook for a moment.
+        assert spawned == [] and killed == []
 
     def test_spawns_when_none_running(self, monkeypatch):
         from magent import cli, hotkey
 
         state = {"pid": None}
         monkeypatch.setattr(hotkey, "listener_pid", lambda: state["pid"])
+        killed = []
+        monkeypatch.setattr(hotkey, "stop_listener", lambda: killed.append(True))
 
         def fake_spawn(args, *a, **k):
             state["pid"] = 5678  # the detached child comes up and writes its pid
 
         monkeypatch.setattr("magent.launch.spawn_detached", fake_spawn)
         assert cli._maybe_start_hotkey("http://x:8034") == 5678
+        assert killed == []  # nothing was running, so nothing to kill
+
+    def _restart_harness(self, monkeypatch, manifest):
+        """A live listener described by `manifest`; returns (killed, spawned)."""
+        from magent import hotkey
+
+        state = {"pid": 1234}
+        killed: list[int] = []
+        spawned: list[list[str]] = []
+
+        def _stop():
+            killed.append(state["pid"])
+            state["pid"] = None  # taskkill took; the pid file is gone
+            return True
+
+        def _spawn(args, *a, **k):
+            spawned.append(args)
+            state["pid"] = 5678
+
+        monkeypatch.setattr(hotkey, "listener_pid", lambda: state["pid"])
+        monkeypatch.setattr(hotkey, "listener_manifest", lambda: manifest)
+        monkeypatch.setattr(hotkey, "stop_listener", _stop)
+        monkeypatch.setattr("magent.launch.spawn_detached", _spawn)
+        return killed, spawned
+
+    def test_version_skew_restarts(self, monkeypatch, caplog):
+        # The pip-upgrade bug: the OLD process keeps running OLD code -- an F2
+        # handler it may not even have -- until someone hand-kills it.
+        import logging
+
+        from magent import cli
+
+        killed, spawned = self._restart_harness(
+            monkeypatch, self._manifest(version="0.0.1-ancient")
+        )
+        with caplog.at_level(logging.INFO, logger="magent.hotkey"):
+            assert cli._maybe_start_hotkey("http://x:8034") == 5678
+        assert killed == [1234] and len(spawned) == 1
+        assert "version skew" in caplog.text  # the why is logged, not silent
+
+    def test_missing_manifest_restarts(self, monkeypatch):
+        # Any pre-3.6.0 listener: it cannot describe itself, so it is stale.
+        from magent import cli
+
+        killed, spawned = self._restart_harness(monkeypatch, None)
+        assert cli._maybe_start_hotkey("http://x:8034") == 5678
+        assert killed == [1234] and len(spawned) == 1
+
+    def test_server_url_change_restarts(self, monkeypatch):
+        # A loopback-wired listener (local launch) can't serve the host tailnet
+        # URL `magent attach` needs.
+        from magent import cli
+
+        killed, spawned = self._restart_harness(
+            monkeypatch, self._manifest(server_url="http://127.0.0.1:8034")
+        )
+        assert cli._maybe_start_hotkey("http://host.tailnet:8034") == 5678
+        assert killed == [1234]
+        assert "http://host.tailnet:8034" in spawned[0]
+
+    def test_ssh_host_change_restarts_and_forwards_the_new_target(
+        self, monkeypatch, caplog
+    ):
+        # Same bug, other direction: F2 must open the folder on the machine the
+        # magent: windows are actually attached to.
+        import logging
+
+        from magent import cli
+
+        killed, spawned = self._restart_harness(monkeypatch, self._manifest())
+        with caplog.at_level(logging.INFO, logger="magent.hotkey"):
+            assert cli._maybe_start_hotkey("http://x:8034", "mdssh") == 5678
+        assert killed == [1234]
+        assert "--ssh-host" in spawned[0] and "mdssh" in spawned[0]
+        assert "ssh_host" in caplog.text
+
+    def test_a_kill_that_did_not_take_reports_no_listener(self, monkeypatch):
+        # If the old pid survives taskkill, the wait loop must not read it back
+        # as "the new listener came up" -- that would report a stale listener
+        # as freshly started.
+        from magent import cli, hotkey
+
+        monkeypatch.setattr(hotkey, "listener_pid", lambda: 1234)
+        monkeypatch.setattr(hotkey, "listener_manifest", lambda: None)
+        monkeypatch.setattr(hotkey, "stop_listener", lambda: False)
+        monkeypatch.setattr("magent.launch.spawn_detached", lambda *a, **k: None)
+        assert cli._maybe_start_hotkey("http://x:8034") is None
 
 
 class TestHookStructsAndConstants:

@@ -28,6 +28,7 @@ from magent.launch import (
     _Target,
     _tile_targets,
     eligible_psmux_projects,
+    hotkey_restart_reason,
     run_magent,
 )
 from magent.platform import PsmuxWindowOpts, TerminalNotFoundError
@@ -263,6 +264,89 @@ class TestStartPsmuxAndUpload:
 
         assert fp.launched_psmux == []
         assert fp.attached_psmux == []
+
+
+class TestHotkeyRestartReason:
+    """The keep-or-restart decision for an already-running Alt+V/F2 listener.
+
+    Deliberately OS-agnostic: `magent.hotkey` raises ImportError off win32, so
+    the decision lives in launch.py where every runner can exercise it.
+    """
+
+    CURRENT = "9.9.9-test"
+
+    @pytest.fixture(autouse=True)
+    def _pin_version(self, monkeypatch):
+        monkeypatch.setattr("magent.__version__", self.CURRENT, raising=False)
+
+    def _manifest(self, **over):
+        base = {
+            "version": self.CURRENT,
+            "server_url": "http://127.0.0.1:8034",
+            "ssh_host": None,
+        }
+        base.update(over)
+        return base
+
+    def test_matching_listener_is_kept(self):
+        # Idempotence: attach re-runs the starter on every attach, so an
+        # identical (version, server_url, ssh_host) must never churn the
+        # listener -- a restart drops the keyboard hook for a moment.
+        assert (
+            hotkey_restart_reason(self._manifest(), "http://127.0.0.1:8034", None)
+            is None
+        )
+
+    def test_missing_manifest_is_stale(self):
+        # Every pre-3.6.0 listener wrote no manifest at all; it cannot be
+        # vouched for, so it gets replaced.
+        reason = hotkey_restart_reason(None, "http://127.0.0.1:8034", None)
+        assert reason is not None
+        assert "manifest" in reason
+
+    def test_version_skew_restarts(self):
+        # The pip-upgrade bug: the OLD process keeps running OLD code (no F2
+        # handler at all in some versions) until someone hand-kills it.
+        reason = hotkey_restart_reason(
+            self._manifest(version="3.5.0"), "http://127.0.0.1:8034", None
+        )
+        assert reason is not None
+        assert "version skew" in reason and "3.5.0" in reason
+
+    def test_server_url_change_restarts(self):
+        # A listener wired to loopback by a local launch cannot serve the host
+        # tailnet URL `magent attach` wants.
+        reason = hotkey_restart_reason(
+            self._manifest(), "http://host.tailnet:8034", None
+        )
+        assert reason is not None
+        assert "server_url" in reason
+
+    def test_ssh_host_change_restarts(self):
+        # Same bug, other direction: F2 must open the folder on the machine the
+        # windows are actually attached to.
+        reason = hotkey_restart_reason(
+            self._manifest(), "http://127.0.0.1:8034", "mdssh"
+        )
+        assert reason is not None
+        assert "ssh_host" in reason
+
+    def test_ssh_host_dropped_restarts(self):
+        reason = hotkey_restart_reason(
+            self._manifest(ssh_host="mdssh"), "http://127.0.0.1:8034", None
+        )
+        assert reason is not None
+        assert "ssh_host" in reason
+
+    def test_unreadable_manifest_fields_are_stale(self):
+        # listener_manifest() maps a corrupt/absent field to None, which must
+        # not accidentally compare equal to a real target.
+        reason = hotkey_restart_reason(
+            {"version": None, "server_url": None, "ssh_host": None},
+            "http://127.0.0.1:8034",
+            None,
+        )
+        assert reason is not None
 
 
 class TestLocalHotkeyListener:

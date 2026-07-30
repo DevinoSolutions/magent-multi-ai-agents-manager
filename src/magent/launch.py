@@ -60,10 +60,43 @@ def spawn_detached(args: list[str], extra_flags: int = 0) -> subprocess.Popen[by
         return subprocess.Popen(args, creationflags=base)
 
 
+def hotkey_restart_reason(
+    manifest: dict[str, str | None] | None,
+    server_url: str,
+    ssh_host: str | None,
+) -> str | None:
+    """Why the running listener can't serve ``(server_url, ssh_host)``, or None
+    if it can and must be left alone.
+
+    Pure so it is testable off Windows -- ``magent.hotkey`` raises ImportError
+    at import time there, and this is the whole decision behind "keep or
+    restart the listener". Two real bugs live in the two non-None branches:
+    a pip upgrade leaves the OLD process running old code (an F2 handler it
+    may not even have), and a locally-wired listener answers F2 for the wrong
+    machine when `magent attach` wanted the remote-wired one. A missing or
+    unparseable manifest is a pre-3.6.0 listener: stale by definition.
+    """
+    from magent import __version__  # PEP 562 lazy: skipped unless a pid is live
+
+    if manifest is None:
+        return "no manifest (listener predates self-describing listeners)"
+    running = manifest.get("version")
+    if running != __version__:
+        return f"version skew (listener {running}, want {__version__})"
+    if manifest.get("server_url") != server_url:
+        return (
+            f"target change (server_url {manifest.get('server_url')} -> {server_url})"
+        )
+    if manifest.get("ssh_host") != ssh_host:
+        return f"target change (ssh_host {manifest.get('ssh_host')} -> {ssh_host})"
+    return None
+
+
 def start_hotkey_listener(server_url: str, ssh_host: str | None = None) -> int | None:
     """Start the window-hotkey (Alt+V paste / F2 open-in-VS-Code) listener
-    detached, unless one is already running. Returns its pid, or None if the
-    child never confirmed itself.
+    detached, unless a listener matching this exact version and target is
+    already running. Returns its pid, or None if the child never confirmed
+    itself.
 
     Windows-only: the caller owns the ``supports_hotkey()`` gate (the launch
     path holds a Platform already, the CLI path resolves one), which is also
@@ -77,14 +110,28 @@ def start_hotkey_listener(server_url: str, ssh_host: str | None = None) -> int |
 
     ``ssh_host`` is forwarded to the child so its F2 handler opens projects
     through VS Code Remote-SSH; omitted, F2 opens them on this machine.
+
+    A live listener is kept only when its manifest says it is this version and
+    this exact target (see ``hotkey_restart_reason``); anything else is killed
+    and respawned. Repeat calls with identical arguments are therefore a no-op,
+    which matters because `magent attach` re-runs this on every attach.
     """
-    from magent.hotkey import (
-        listener_pid,  # ImportError off-Windows (hotkey.py guards); must stay lazy
+    from magent.hotkey import (  # ImportError off-Windows (hotkey.py guards); must stay lazy
+        listener_manifest,
+        listener_pid,
+        stop_listener,
     )
 
     existing = listener_pid()
     if existing:
-        return existing
+        reason = hotkey_restart_reason(listener_manifest(), server_url, ssh_host)
+        if reason is None:
+            return existing  # same version, same target: nothing to do
+        get_logger("hotkey").info("restarting listener pid=%d: %s", existing, reason)
+        # Reuse the taskkill recipe stop_listener already owns; it tolerates a
+        # pid that has since died (listener_pid clears the stale file and it
+        # returns False), and either way the spawn below replaces it.
+        stop_listener()
 
     args = [sys.executable, "-m", "magent", "hotkey", "-s", server_url]
     if ssh_host:
@@ -92,10 +139,12 @@ def start_hotkey_listener(server_url: str, ssh_host: str | None = None) -> int |
     spawn_detached(args)
     # The child writes its pid only after the keyboard hook installs; give it a
     # short window to come up so we can report (and so a hook failure surfaces).
+    # `pid != existing` guards the restart path: a kill that didn't take must
+    # not read back as "the new listener came up".
     for _ in range(20):
         time.sleep(0.1)
         pid = listener_pid()
-        if pid:
+        if pid and pid != existing:
             return pid
     return None
 

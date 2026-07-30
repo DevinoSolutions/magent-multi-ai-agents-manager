@@ -260,8 +260,17 @@ def upload_image(server_url: str, project: str, image_data: bytes) -> bool:
 # attach starts the Alt+V listener hidden in the background (no terminal of its
 # own), because its progress now shows in the magent: windows. A pid file lets
 # `magent status` report it and `magent down --all` stop it.
+#
+# Beside the pid file the listener writes a manifest describing itself -- the
+# magent version it runs and the (server_url, ssh_host) target it was wired to.
+# Without it the listener is opaque: `launch.start_hotkey_listener` sees a live
+# pid and keeps it, so an old process survives a pip upgrade running old code
+# (F2 silently dead), and a locally-wired listener blocks the remote-wired one
+# `magent attach` wants (F2 opens the wrong thing). The manifest is what makes
+# "is this listener still the one I want?" answerable.
 
 _PID_PATH = Path.home() / ".magent" / "hotkey.pid"
+_MANIFEST_PATH = Path.home() / ".magent" / "hotkey.json"
 
 
 def listener_pid() -> int | None:
@@ -293,7 +302,33 @@ def stop_listener() -> bool:
         return False
     with contextlib.suppress(OSError):
         _PID_PATH.unlink()
+    _clear_manifest()
     return True
+
+
+def listener_manifest() -> dict[str, str | None] | None:
+    """What the running listener was started with -- ``version``, ``server_url``
+    and ``ssh_host`` -- or None when there is no readable manifest.
+
+    None is also what every pre-3.6.0 listener yields (it wrote no manifest at
+    all), which callers must read as "too old to describe itself", i.e. stale.
+    """
+    try:
+        raw = json.loads(_MANIFEST_PATH.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+
+    def _text(key: str) -> str | None:
+        value = raw.get(key)
+        return value if isinstance(value, str) else None
+
+    return {
+        "version": _text("version"),
+        "server_url": _text("server_url"),
+        "ssh_host": _text("ssh_host"),
+    }
 
 
 def _write_pid() -> None:
@@ -304,12 +339,41 @@ def _write_pid() -> None:
         pass
 
 
+def _write_manifest(server_url: str, ssh_host: str | None) -> None:
+    """Self-describe: record the version and target this listener runs with.
+
+    Best-effort like ``_write_pid``: an unwritable manifest reads back as None,
+    which only makes a later starter restart the listener -- never worse than
+    the pre-manifest behavior.
+    """
+    from magent import __version__  # PEP 562 lazy; only paid by a real listener
+
+    try:
+        _MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _MANIFEST_PATH.write_text(
+            json.dumps(
+                {
+                    "version": __version__,
+                    "server_url": server_url,
+                    "ssh_host": ssh_host,
+                }
+            )
+        )
+    except OSError:
+        pass
+
+
 def _clear_pid() -> None:
     try:
         if _PID_PATH.read_text().strip() == str(os.getpid()):
             _PID_PATH.unlink()
     except OSError:
         pass
+
+
+def _clear_manifest() -> None:
+    with contextlib.suppress(OSError):
+        _MANIFEST_PATH.unlink()
 
 
 def _do_upload(server_url: str, project: str) -> None:
@@ -488,8 +552,10 @@ def run_hotkey(server_url: str, ssh_host: str | None = None) -> None:
         raise RuntimeError("Failed to install keyboard hook")
 
     # Record the pid only once the hook is actually installed, so a failed
-    # listener never leaves a pid file claiming it's running.
+    # listener never leaves a pid file claiming it's running. The manifest
+    # rides with it: pid says "alive", manifest says "and this is what I am".
     _write_pid()
+    _write_manifest(server_url, ssh_host)
     stop_event = threading.Event()
     threading.Thread(target=_heartbeat_loop, args=(stop_event,), daemon=True).start()
     log.info("listener started")
@@ -502,4 +568,5 @@ def run_hotkey(server_url: str, ssh_host: str | None = None) -> None:
         stop_event.set()
         user32.UnhookWindowsHookEx(hook)
         _clear_pid()
+        _clear_manifest()
         log.info("listener stopped")
