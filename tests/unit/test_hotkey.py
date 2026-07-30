@@ -406,6 +406,9 @@ class TestListenerManifest:
             def SetWindowsHookExW(self, *a):
                 return 1
 
+            def SetWinEventHook(self, *a):
+                return 7
+
             def GetMessageW(self, *a):
                 # Sampled while the listener is "running" -- i.e. after
                 # _write_pid/_write_manifest, before the finally clears them.
@@ -414,6 +417,9 @@ class TestListenerManifest:
                 return 0  # loop exits immediately
 
             def UnhookWindowsHookEx(self, *a):
+                return 1
+
+            def UnhookWinEvent(self, *a):
                 return 1
 
         monkeypatch.setattr(hotkey, "user32", _FakeUser32())
@@ -1059,3 +1065,360 @@ class TestHookProc:
             "server_url",
             "ssh_host",
         }
+
+
+class TestFocusDecide:
+    """The pure decision behind the focus geometry reclaim. Same split as
+    `_hook_decide`: the code that runs on every foreground change system-wide
+    is reachable here without a live hook, a message loop, or a real window."""
+
+    @staticmethod
+    def _decide(title, last_nudge, now, *, mouse_down=False):
+        from magent.hotkey import _focus_decide
+
+        return _focus_decide(title, last_nudge, now, lambda: mouse_down)
+
+    def test_magent_window_is_nudged_and_stamped(self):
+        last = {}
+        assert self._decide("magent:caly", last, 100.0) == "caly"
+        assert last == {"caly": 100.0}
+
+    def test_state_badge_in_the_title_still_resolves(self):
+        # The titles grammar is the gate -- a badged title (titles.make_title)
+        # must not read as "not one of ours".
+        from magent.titles import make_title
+
+        last = {}
+        title = make_title("caly", state="needs-input")
+        assert self._decide(title, last, 100.0) == "caly"
+
+    def test_foreign_window_is_skipped_and_stamps_nothing(self):
+        last = {}
+        assert self._decide("Notepad", last, 100.0) is None
+        assert self._decide("", last, 100.0) is None
+        assert last == {}
+
+    def test_second_focus_inside_the_debounce_is_skipped(self):
+        from magent.hotkey import FOCUS_NUDGE_DEBOUNCE_S
+
+        last = {}
+        assert self._decide("magent:caly", last, 100.0) == "caly"
+        # Alt-tabbing back and forth must not storm nudges.
+        assert self._decide("magent:caly", last, 100.0) is None
+        assert self._decide("magent:caly", last, 100.0 + 0.5) is None
+        assert (
+            self._decide("magent:caly", last, 100.0 + FOCUS_NUDGE_DEBOUNCE_S - 0.01)
+            is None
+        )
+        assert last == {"caly": 100.0}  # the stamp never moved
+
+    def test_focus_after_the_debounce_expires_nudges_again(self):
+        from magent.hotkey import FOCUS_NUDGE_DEBOUNCE_S
+
+        last = {}
+        self._decide("magent:caly", last, 100.0)
+        later = 100.0 + FOCUS_NUDGE_DEBOUNCE_S
+        assert self._decide("magent:caly", last, later) == "caly"
+        assert last == {"caly": later}
+
+    def test_separate_windows_debounce_independently(self):
+        last = {}
+        assert self._decide("magent:caly", last, 100.0) == "caly"
+        # marka has never been nudged: caly's fresh stamp must not silence it.
+        assert self._decide("magent:marka", last, 100.5) == "marka"
+        assert self._decide("magent:caly", last, 101.0) is None
+        assert last == {"caly": 100.0, "marka": 100.5}
+
+    def test_mouse_down_skips_without_burning_the_debounce(self):
+        # Never fight a user mid-drag/mid-resize -- and because the skip stamps
+        # nothing, the very next focus event reclaims instead of waiting 15s.
+        last = {}
+        assert self._decide("magent:caly", last, 100.0, mouse_down=True) is None
+        assert last == {}
+        assert self._decide("magent:caly", last, 100.1) == "caly"
+
+    def test_mouse_probe_is_not_consulted_for_foreign_windows(self):
+        # The title gate is first: a click anywhere else on the desktop must not
+        # even cost a GetAsyncKeyState round trip.
+        from magent.hotkey import _focus_decide
+
+        probed = []
+
+        def _probe():
+            probed.append(1)
+            return False
+
+        assert _focus_decide("Notepad", {}, 100.0, _probe) is None
+        assert probed == []
+
+    def test_default_probe_reads_the_mouse_buttons(self, monkeypatch):
+        # The production default is the real GetAsyncKeyState probe: assert the
+        # down-bit is what it looks at, so a signed-short return (the API
+        # reports "down" as the 0x8000 bit, i.e. a negative c_short) reads as
+        # down and not as "no button".
+        from magent import hotkey
+
+        asked = []
+
+        def _fake_get_async_key_state(vk):
+            asked.append(vk)
+            return -32768 if vk == hotkey.VK_LBUTTON else 0
+
+        monkeypatch.setattr(
+            hotkey.user32, "GetAsyncKeyState", _fake_get_async_key_state
+        )
+        assert hotkey._mouse_button_down() is True
+        assert hotkey.VK_LBUTTON in asked
+
+        monkeypatch.setattr(hotkey.user32, "GetAsyncKeyState", lambda vk: 0)
+        assert hotkey._mouse_button_down() is False
+
+        # And that default is what _focus_decide uses when nothing is injected.
+        monkeypatch.setattr(hotkey.user32, "GetAsyncKeyState", lambda vk: -32768)
+        assert hotkey._focus_decide("magent:caly", {}, 100.0) is None
+
+
+class TestDoNudge:
+    """`_do_nudge` reuses the platform primitive `magent attach` reclaims with
+    -- it must not reimplement MoveWindow arithmetic of its own."""
+
+    def _platform(self, monkeypatch, plat):
+        import magent.platform
+
+        monkeypatch.setattr(magent.platform, "get_platform", lambda: plat)
+
+    def test_delegates_the_handle_to_the_platform_nudge(self, monkeypatch, caplog):
+        from magent import hotkey
+        from tests.conftest import FakePlatform
+
+        plat = FakePlatform(supports_nudge=True)
+        self._platform(monkeypatch, plat)
+        with caplog.at_level("INFO", logger="magent.hotkey"):
+            hotkey._do_nudge(4242, "caly")
+        assert plat.nudged == [[4242]]
+        assert "focus nudge project=caly" in caplog.text
+
+    def test_platform_without_nudge_support_is_a_noop(self, monkeypatch):
+        from magent import hotkey
+        from tests.conftest import FakePlatform
+
+        plat = FakePlatform()  # supports_nudge=False
+        self._platform(monkeypatch, plat)
+        hotkey._do_nudge(1, "caly")
+        assert plat.nudged == []
+
+    def test_a_failing_nudge_is_logged_not_raised(self, monkeypatch, caplog):
+        # It runs on a daemon thread: an exception here would vanish into an
+        # invisible stderr, so the log line is the only record there can be.
+        from magent import hotkey
+        from tests.conftest import FakePlatform
+
+        plat = FakePlatform(
+            supports_nudge=True, nudge_error=OSError("invalid window handle")
+        )
+        self._platform(monkeypatch, plat)
+        with caplog.at_level("ERROR", logger="magent.hotkey"):
+            hotkey._do_nudge(1, "caly")
+        assert "focus nudge project=caly failed" in caplog.text
+
+
+class TestFocusEventProc:
+    """The EVENT_SYSTEM_FOREGROUND callback: dispatch off the hook thread, and
+    never let an exception cross the ctypes boundary."""
+
+    def _fake_thread(self, monkeypatch, started):
+        from magent import hotkey
+
+        class _FakeThread:
+            def __init__(self, target=None, args=(), daemon=None):
+                self.target, self.args, self.daemon = target, args, daemon
+
+            def start(self):
+                started.append((self.target, self.args, self.daemon))
+
+        monkeypatch.setattr(hotkey.threading, "Thread", _FakeThread)
+
+    @staticmethod
+    def _fire(proc, hwnd):
+        from magent.hotkey import EVENT_SYSTEM_FOREGROUND
+
+        proc(1, EVENT_SYSTEM_FOREGROUND, hwnd, 0, 0, 0, 0)
+
+    def test_dispatches_the_event_hwnd_to_a_worker_thread(self, monkeypatch):
+        from magent import hotkey
+
+        monkeypatch.setattr(hotkey, "window_title", lambda hwnd: "magent:caly")
+        monkeypatch.setattr(hotkey.user32, "GetAsyncKeyState", lambda vk: 0)
+        started = []
+        self._fake_thread(monkeypatch, started)
+
+        self._fire(hotkey._make_win_event_proc({}), 4242)
+
+        # The HWND comes from the event, not from a second GetForegroundWindow
+        # query that could race it.
+        assert started == [(hotkey._do_nudge, (4242, "caly"), True)]
+
+    def test_foreign_window_starts_nothing(self, monkeypatch):
+        from magent import hotkey
+
+        monkeypatch.setattr(hotkey, "window_title", lambda hwnd: "Notepad")
+        monkeypatch.setattr(hotkey.user32, "GetAsyncKeyState", lambda vk: 0)
+        started = []
+        self._fake_thread(monkeypatch, started)
+
+        self._fire(hotkey._make_win_event_proc({}), 4242)
+        assert started == []
+
+    def test_null_hwnd_is_ignored(self, monkeypatch):
+        # SetWinEventHook can deliver events with no window; asking for that
+        # window's title would be a wasted round trip at best.
+        from magent import hotkey
+
+        titled = []
+
+        def _title(hwnd):
+            titled.append(hwnd)
+            return "magent:caly"
+
+        monkeypatch.setattr(hotkey, "window_title", _title)
+        started = []
+        self._fake_thread(monkeypatch, started)
+
+        self._fire(hotkey._make_win_event_proc({}), 0)
+        self._fire(hotkey._make_win_event_proc({}), None)
+        assert titled == []
+        assert started == []
+
+    def test_debounce_state_persists_across_events(self, monkeypatch):
+        # One dict lives in the closure for the listener's whole life -- so two
+        # focus events in quick succession produce exactly one nudge.
+        from magent import hotkey
+
+        monkeypatch.setattr(hotkey, "window_title", lambda hwnd: "magent:caly")
+        monkeypatch.setattr(hotkey.user32, "GetAsyncKeyState", lambda vk: 0)
+        started = []
+        self._fake_thread(monkeypatch, started)
+
+        proc = hotkey._make_win_event_proc({})
+        self._fire(proc, 4242)
+        self._fire(proc, 4242)
+        assert len(started) == 1
+
+    def test_callback_exception_never_propagates(self, monkeypatch, caplog):
+        # A ctypes WINFUNCTYPE callback cannot carry a Python exception across
+        # the C boundary: without this guard a bad event would dump a traceback
+        # to a hidden daemon's invisible stderr and take the hook with it.
+        from magent import hotkey
+
+        def _boom(*a, **k):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(hotkey, "_focus_decide", _boom)
+        proc = hotkey._make_win_event_proc({})
+        with caplog.at_level("ERROR", logger="magent.hotkey"):
+            self._fire(proc, 4242)  # must not raise
+        assert "foreground-event callback error" in caplog.text
+
+    def test_the_proc_survives_the_ctypes_round_trip(self, monkeypatch):
+        # Realism check on the WINEVENTPROC signature itself: wrapping the
+        # callback and calling it through ctypes proves the argument types line
+        # up with what Windows will actually deliver.
+        from magent import hotkey
+        from magent.hotkey import EVENT_SYSTEM_FOREGROUND, WINEVENTPROC
+
+        monkeypatch.setattr(hotkey, "window_title", lambda hwnd: "magent:caly")
+        monkeypatch.setattr(hotkey.user32, "GetAsyncKeyState", lambda vk: 0)
+        started = []
+        self._fake_thread(monkeypatch, started)
+
+        trampoline = WINEVENTPROC(hotkey._make_win_event_proc({}))
+        trampoline(1, EVENT_SYSTEM_FOREGROUND, 4242, 0, 0, 0, 0)
+        assert started[0][1] == (4242, "caly")
+
+
+class TestFocusHookLifecycle:
+    """The event hook is registered and unregistered alongside the keyboard
+    hook, and the existing message loop pumps both."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, tmp_path, monkeypatch):
+        from magent import hotkey
+
+        monkeypatch.setattr(hotkey, "_PID_PATH", tmp_path / "hotkey.pid")
+        monkeypatch.setattr(hotkey, "_MANIFEST_PATH", tmp_path / "hotkey.json")
+        monkeypatch.setattr(hotkey, "write_heartbeat", lambda _n: None)
+
+    def _drive(self, monkeypatch, *, event_hook=7):
+        """Run run_hotkey against a fully faked user32 (never the real desktop:
+        no hook is installed and no window is touched). Returns the call log."""
+        from magent import hotkey
+
+        calls = []
+
+        class _FakeUser32:
+            def SetWindowsHookExW(self, *a):
+                calls.append(("SetWindowsHookExW", a))
+                return 1
+
+            def SetWinEventHook(self, *a):
+                calls.append(("SetWinEventHook", a))
+                return event_hook
+
+            def GetMessageW(self, *a):
+                return 0  # loop exits immediately
+
+            def UnhookWindowsHookEx(self, *a):
+                calls.append(("UnhookWindowsHookEx", a))
+                return 1
+
+            def UnhookWinEvent(self, *a):
+                calls.append(("UnhookWinEvent", a))
+                return 1
+
+        monkeypatch.setattr(hotkey, "user32", _FakeUser32())
+        hotkey.run_hotkey("http://127.0.0.1:8034")
+        return calls
+
+    def test_foreground_hook_installed_and_removed_in_the_lifecycle(self, monkeypatch):
+        from magent.hotkey import EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT
+
+        calls = self._drive(monkeypatch)
+        names = [name for name, _ in calls]
+        assert names == [
+            "SetWindowsHookExW",
+            "SetWinEventHook",
+            "UnhookWindowsHookEx",
+            "UnhookWinEvent",  # same finally as the keyboard hook
+        ]
+        args = dict(calls)["SetWinEventHook"]
+        # Exactly the one event, delivered out-of-context (a pure-Python
+        # listener cannot host an in-context hook).
+        assert args[0] == EVENT_SYSTEM_FOREGROUND
+        assert args[1] == EVENT_SYSTEM_FOREGROUND
+        assert args[2] is None  # hmodWinEventProc
+        assert args[4:] == (0, 0, WINEVENT_OUTOFCONTEXT)  # all processes/threads
+
+    def test_the_unhook_gets_the_handle_that_was_returned(self, monkeypatch):
+        calls = self._drive(monkeypatch, event_hook=31337)
+        assert dict(calls)["UnhookWinEvent"] == (31337,)
+
+    def test_a_refused_event_hook_still_leaves_altv_working(self, monkeypatch, caplog):
+        # The focus reclaim is a bonus, not the product: a listener that got its
+        # keyboard hook must keep Alt+V and F2 even if SetWinEventHook refuses.
+        with caplog.at_level("WARNING", logger="magent.hotkey"):
+            calls = self._drive(monkeypatch, event_hook=0)
+        names = [name for name, _ in calls]
+        assert "SetWindowsHookExW" in names
+        assert "UnhookWinEvent" not in names  # nothing to unhook
+        assert "focus geometry reclaim disabled" in caplog.text
+
+    def test_the_callback_trampoline_outlives_the_hook(self, monkeypatch):
+        # A WINEVENTPROC that gets garbage-collected while the hook is live is
+        # a crash waiting for the next foreground change, so the trampoline has
+        # to be a local of the frame that owns the message loop.
+        import inspect
+
+        from magent.hotkey import run_hotkey
+
+        source = inspect.getsource(run_hotkey)
+        assert "event_fn = WINEVENTPROC(" in source

@@ -1,4 +1,17 @@
-"""Global Alt+V hotkey listener for clipboard image upload to psmux sessions."""
+"""Global window listener for the magent: windows on this machine.
+
+Three jobs, all gated on the same thing -- the focused window's title parsing
+as a magent: title (titles.parse_title), never a hand-rolled prefix check:
+
+  * Alt+V  -- upload the clipboard image into that project's psmux pane.
+  * F2     -- open that project's folder in VS Code (locally or over Remote-SSH).
+  * focus  -- re-assert that window's geometry to psmux when it gains focus,
+              so the session renders at THIS machine's size (see _focus_decide).
+
+Alt+V and F2 ride a low-level keyboard hook; the focus job rides a
+SetWinEventHook on EVENT_SYSTEM_FOREGROUND. Both are pumped by the one message
+loop in run_hotkey.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.error import URLError
@@ -60,6 +74,22 @@ user32.SetWindowsHookExW.restype = ctypes.c_void_p
 
 user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
 
+user32.SetWinEventHook.argtypes = [
+    ctypes.wintypes.DWORD,  # eventMin
+    ctypes.wintypes.DWORD,  # eventMax
+    ctypes.c_void_p,  # hmodWinEventProc
+    ctypes.c_void_p,  # pfnWinEventProc
+    ctypes.wintypes.DWORD,  # idProcess
+    ctypes.wintypes.DWORD,  # idThread
+    ctypes.wintypes.DWORD,  # dwFlags
+]
+user32.SetWinEventHook.restype = ctypes.c_void_p
+
+user32.UnhookWinEvent.argtypes = [ctypes.c_void_p]
+
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
+
 kernel32.OpenProcess.argtypes = [
     ctypes.wintypes.DWORD,
     ctypes.wintypes.BOOL,
@@ -84,6 +114,13 @@ VK_RMENU = 0xA5
 # A low-level keyboard hook reports the physical Alt as VK_LMENU/VK_RMENU,
 # never the generic VK_MENU -- match all three or Alt is never detected.
 _ALT_KEYS = (VK_MENU, VK_LMENU, VK_RMENU)
+# Mouse buttons, read through GetAsyncKeyState: a button held down means the
+# user is mid-drag/mid-resize on the window, and the focus nudge must not fight
+# them for it (see _focus_decide).
+VK_LBUTTON = 0x01
+VK_RBUTTON = 0x02
+_MOUSE_BUTTONS = (VK_LBUTTON, VK_RBUTTON)
+_KEY_DOWN_MASK = 0x8000
 CF_DIB = 8
 BI_BITFIELDS = 3
 WH_KEYBOARD_LL = 13
@@ -91,11 +128,34 @@ WM_KEYDOWN = 0x0100
 WM_SYSKEYDOWN = 0x0104
 HC_ACTION = 0
 
+# Foreground-change accessibility event, delivered out-of-context (i.e. posted
+# to this process's message queue rather than injected into the foreground one,
+# which a pure-Python listener cannot host).
+EVENT_SYSTEM_FOREGROUND = 0x0003
+WINEVENT_OUTOFCONTEXT = 0x0000
+
+# How long a project's window is left alone after a focus nudge. Alt-tabbing
+# around a wall of magent: windows must not turn into a storm of resizes: one
+# reclaim per window per quarter-minute is plenty to keep the geometry this
+# machine's, and cheap enough to be invisible.
+FOCUS_NUDGE_DEBOUNCE_S = 15.0
+
 HOOKPROC = ctypes.WINFUNCTYPE(
     ctypes.c_long,
     ctypes.c_int,
     ctypes.wintypes.WPARAM,
     ctypes.wintypes.LPARAM,
+)
+
+WINEVENTPROC = ctypes.WINFUNCTYPE(
+    None,
+    ctypes.c_void_p,  # hWinEventHook
+    ctypes.wintypes.DWORD,  # event
+    ctypes.c_void_p,  # hwnd
+    ctypes.c_long,  # idObject
+    ctypes.c_long,  # idChild
+    ctypes.wintypes.DWORD,  # idEventThread
+    ctypes.wintypes.DWORD,  # dwmsEventTime
 )
 
 
@@ -109,13 +169,23 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
     ]
 
 
+def window_title(hwnd: int) -> str:
+    """The title of one window by handle, or "" if it has none.
+
+    Split out of ``get_active_window_title`` because the foreground event hook
+    is handed the HWND directly -- re-querying GetForegroundWindow from the
+    callback would race the very event being reported.
+    """
+    buf = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(hwnd, buf, 512)
+    return buf.value
+
+
 def get_active_window_title() -> str:
     hwnd = user32.GetForegroundWindow()
     if not hwnd:
         return ""
-    buf = ctypes.create_unicode_buffer(512)
-    user32.GetWindowTextW(hwnd, buf, 512)
-    return buf.value
+    return window_title(hwnd)
 
 
 def clipboard_has_image() -> bool:
@@ -448,6 +518,126 @@ def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
         _flash_status(server_url, project, "F2: failed - see hotkey.log")
 
 
+# --- Focus-driven geometry reclaim -------------------------------------------
+# psmux 3.3.6 arbitrates no geometry of its own: a session renders at whatever
+# the LAST client resize-or-attach event reported and nothing server-side ever
+# recomputes it -- its `window-size` options are unimplemented, a client
+# detaching or dying releases nothing, and the server-side resize commands are
+# no-ops (`resize-window` is worse: a no-op that HANGS under `window-size
+# manual`, so magent never calls any of them). `magent attach` already reclaims
+# the geometry once, at attach time (cli/attach._reclaim_geometry) -- but the
+# moment the OTHER machine resizes its window, it takes the session back and
+# this machine's windows render squeezed again until the next attach.
+#
+# So the listener keeps reclaiming: when a magent: window GAINS FOCUS, nudge it.
+# The window you are actually looking at therefore always ends up carrying this
+# machine's geometry, with no config surface and nothing for the user to run.
+
+
+def _mouse_button_down() -> bool:
+    """True while a mouse button is physically held down.
+
+    The probe that keeps the nudge off a window the user has hold of: a drag or
+    an edge-resize is exactly a stream of foreground/geometry activity, and
+    moving the window out from under the pointer mid-gesture would be the one
+    way this feature could be worse than the stale size it fixes.
+    """
+    return any(user32.GetAsyncKeyState(vk) & _KEY_DOWN_MASK for vk in _MOUSE_BUTTONS)
+
+
+def _focus_decide(
+    title: str,
+    last_nudge: dict[str, float],
+    now: float,
+    mouse_down: Callable[[], bool] = _mouse_button_down,
+) -> str | None:
+    """Pure decision for one foreground-change event: the project whose window
+    should be re-nudged, or None to skip.
+
+    Extracted out of the callback itself for the same reason as
+    ``_hook_decide``: the code that runs on every foreground change
+    system-wide has to be reachable from a unit test without a live hook.
+    ``last_nudge`` carries the per-project debounce stamps across calls (and is
+    stamped here, so the decision and its record cannot drift apart);
+    ``mouse_down`` is injected so the probe can be faked.
+
+    Skips, in order: a window that is not one of ours (the titles grammar is
+    the gate, exactly as it is for Alt+V and F2), a project nudged less than
+    ``FOCUS_NUDGE_DEBOUNCE_S`` ago, and a window the user has hold of. Only the
+    debounce skip stamps anything -- a mouse-down skip leaves the stamp alone,
+    so the very next focus event retries instead of waiting out the window.
+    """
+    project = project_from_title(title)
+    if project is None:
+        return None
+    previous = last_nudge.get(project)
+    if previous is not None and now - previous < FOCUS_NUDGE_DEBOUNCE_S:
+        return None
+    if mouse_down():
+        return None
+    last_nudge[project] = now
+    return project
+
+
+def _do_nudge(hwnd: int, project: str) -> None:
+    """Re-assert one window's geometry to psmux, off the hook callback.
+
+    Threaded for the same reason as ``_do_upload``/``_do_open_code``: the nudge
+    sleeps through a settle beat (platform.nudge_windows) and a foreground-event
+    callback must never block. The resize logic itself is NOT reimplemented here
+    -- it is the one platform primitive that `magent attach` reclaims with, so
+    both paths keep the same delta, settle and restore-exact-rect behavior.
+    """
+    log = get_logger("hotkey")
+    try:
+        # heavy subsystem: in-body per policy (and keeps the listener's import
+        # graph identical to what it was before this hook existed).
+        from magent.platform import get_platform
+
+        plat = get_platform()
+        if not plat.supports_window_nudge():
+            return
+        nudged = plat.nudge_windows([hwnd])
+        log.info("focus nudge project=%s hwnd=%s nudged=%d", project, hwnd, nudged)
+    except Exception:
+        log.exception("focus nudge project=%s failed", project)
+
+
+def _make_win_event_proc(
+    last_nudge: dict[str, float],
+) -> Callable[[int, int, int, int, int, int, int], None]:
+    """Wrap ``_focus_decide`` so an uncaught exception can never break the
+    event hook -- the same guard, for the same ctypes-callback reason, as
+    ``_make_hook_proc`` gives the keyboard hook: a Python exception cannot
+    cross the C boundary, so without this a bad event would dump a traceback to
+    a hidden daemon's invisible stderr instead of into hotkey.log.
+    """
+    log = get_logger("hotkey")
+
+    def win_event_proc(
+        _hook: int,
+        _event: int,
+        hwnd: int,
+        _id_object: int,
+        _id_child: int,
+        _thread_id: int,
+        _timestamp: int,
+    ) -> None:
+        try:
+            if not hwnd:
+                return
+            project = _focus_decide(window_title(hwnd), last_nudge, time.monotonic())
+            if project is None:
+                return
+            threading.Thread(
+                target=_do_nudge, args=(hwnd, project), daemon=True
+            ).start()
+        except Exception:
+            log.exception("foreground-event callback error")
+
+    return win_event_proc
+
+
 def _heartbeat_loop(stop_event: threading.Event) -> None:
     """Pulse a liveness heartbeat on an interval until told to stop.
 
@@ -537,7 +727,12 @@ def _make_hook_proc(
 
 
 def run_hotkey(server_url: str, ssh_host: str | None = None) -> None:
-    """Run the window-hotkey listener until the message loop ends.
+    """Run the window listener until the message loop ends.
+
+    Installs both hooks the module needs -- the low-level keyboard hook behind
+    Alt+V and F2, and the EVENT_SYSTEM_FOREGROUND hook behind the focus geometry
+    reclaim -- and lets one GetMessageW loop pump them until it ends, then
+    unhooks both.
 
     ``ssh_host`` is the SSH target the magent: windows are attached to, if any:
     it makes F2 open the project through VS Code Remote-SSH instead of looking
@@ -550,6 +745,28 @@ def run_hotkey(server_url: str, ssh_host: str | None = None) -> None:
     hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, hook_fn, None, 0)
     if not hook:
         raise RuntimeError("Failed to install keyboard hook")
+
+    # The focus hook is a bonus, not the product: a listener that installed the
+    # keyboard hook already earns its keep, so a SetWinEventHook that refuses
+    # degrades to "no continuous reclaim" (attach-time reclaim still works) and
+    # never costs the user Alt+V or F2. Both ctypes trampolines are locals of
+    # this frame on purpose -- they must outlive the hooks that call them.
+    event_fn = WINEVENTPROC(_make_win_event_proc({}))
+    event_hook: object = None
+    try:
+        event_hook = user32.SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            None,
+            event_fn,
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        )
+    except OSError:
+        log.exception("focus geometry reclaim: SetWinEventHook raised")
+    if not event_hook:
+        log.warning("focus geometry reclaim disabled: no foreground event hook")
 
     # Record the pid only once the hook is actually installed, so a failed
     # listener never leaves a pid file claiming it's running. The manifest
@@ -567,6 +784,8 @@ def run_hotkey(server_url: str, ssh_host: str | None = None) -> None:
     finally:
         stop_event.set()
         user32.UnhookWindowsHookEx(hook)
+        if event_hook:
+            user32.UnhookWinEvent(event_hook)
         _clear_pid()
         _clear_manifest()
         log.info("listener stopped")
