@@ -105,6 +105,29 @@ class Platform(ABC):
         """Rewrite a window's title in place. False = unsupported or failed."""
         return False
 
+    def supports_window_nudge(self) -> bool:
+        """True if this platform can force a terminal window to re-emit a
+        client resize event (see ``nudge_windows``)."""
+        return False
+
+    def nudge_windows(self, handles: list[object]) -> int:
+        """Make each window emit a resize event, then restore its exact rect.
+
+        A terminal only tells whatever it hosts (a psmux client, and over SSH
+        the remote one via SIGWINCH) about its character grid when the OS
+        window is resized. psmux 3.3.6 has no size arbitration of its own: a
+        session renders at whatever the LAST client resize-or-attach event
+        reported, and nothing server-side ever recomputes it -- so a session
+        another machine sized stays squeezed for this one until a local client
+        resize says otherwise. This is the one lever that always works.
+
+        Implementations resize by a delta guaranteed to cross a character
+        cell, pause long enough for the terminal to propagate it, then put the
+        window back exactly where it was. Best-effort per window; returns how
+        many were actually nudged. The ABC default is a no-op.
+        """
+        return 0
+
     def flash_window(self, handle: object) -> bool:
         """Flash the window's taskbar presence to request the user's attention."""
         return False

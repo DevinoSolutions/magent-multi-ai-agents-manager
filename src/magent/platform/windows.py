@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import ctypes.wintypes
 import subprocess
@@ -27,6 +28,14 @@ shcore = windll.shcore
 # loop in launch_psmux_session).
 _BRING_UP_BATCH = 5
 _BRING_UP_BATCH_PAUSE_S = 2.0
+
+# Geometry-reclaim nudge (see Platform.nudge_windows). The delta must be large
+# enough to change the terminal's character grid -- a sub-cell nudge resizes
+# the window without changing the rows/cols it reports, which tells the psmux
+# client nothing. The settle is the beat the terminal needs to push the new
+# grid down its pty before we put the window back.
+_NUDGE_DELTA_PX = 40
+_NUDGE_SETTLE_S = 0.15
 
 
 def _wait_for_panes_ready(
@@ -180,6 +189,47 @@ class WindowsPlatform(Platform):
             user32.ShowWindow(handle, 9)  # SW_RESTORE
         user32.MoveWindow(handle, rect.x, rect.y, rect.w, rect.h, True)
         user32.MoveWindow(handle, rect.x, rect.y, rect.w, rect.h, True)
+
+    def supports_window_nudge(self) -> bool:
+        return True
+
+    def nudge_windows(self, handles: list[object]) -> int:
+        """Shrink each window by a cell-crossing delta, let the terminals
+        propagate the new grid, then restore every original rect.
+
+        Batched on purpose: the settle is one shared pause rather than one per
+        window, so a 40-window attach pays ~0.15s total instead of ~6s. Every
+        step is guarded -- a window closed mid-flight (dead HWND, or a rect
+        query that fails) is skipped, never fatal.
+        """
+        # A 1px nudge can land inside the same character cell and change
+        # nothing the terminal would report; 40px crosses a row at any
+        # sane font size, and the window is restored before it can be seen.
+        delta = _NUDGE_DELTA_PX
+        restore: list[tuple[object, int, int, int, int]] = []
+        for handle in handles:
+            rect = ctypes.wintypes.RECT()
+            with contextlib.suppress(OSError):
+                if not user32.GetWindowRect(handle, byref(rect)):
+                    continue
+                w, h = rect.right - rect.left, rect.bottom - rect.top
+                if w <= delta or h <= delta:
+                    continue
+                user32.MoveWindow(handle, rect.left, rect.top, w, h - delta, True)
+                restore.append((handle, rect.left, rect.top, w, h))
+        if not restore:
+            return 0
+        # The terminal needs a beat to notice the new size and push it down
+        # its pty (over SSH: a real SIGWINCH to the remote psmux client).
+        # Shrink and restore back-to-back and the pair can coalesce into "no
+        # net change", which is exactly the stale state we are clearing.
+        time.sleep(_NUDGE_SETTLE_S)
+        nudged = 0
+        for handle, x, y, w, h in restore:
+            with contextlib.suppress(OSError):
+                user32.MoveWindow(handle, x, y, w, h, True)
+                nudged += 1
+        return nudged
 
     def supports_attention_signals(self) -> bool:
         return True
