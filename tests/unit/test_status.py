@@ -14,6 +14,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 from magent import agent_state, cli
 
 
@@ -33,6 +35,24 @@ def _both_off(monkeypatch):
         monkeypatch.setattr("magent.hotkey.listener_pid", lambda: None)
     else:
         monkeypatch.setattr("magent.cli.status._listener_state", lambda: "off")
+
+
+def _fake_psmux(monkeypatch, up, projects=None, apps=None, down=()):
+    """Pretend psmux reports `up` live sessions whose panes run `apps`.
+
+    Never touches a real psmux server: `psmux_status` (the liveness fan-out)
+    and `pane_current_commands` (the foreground-app fan-out) are both faked, so
+    this machine's ~40 real sessions are never probed.
+    """
+    monkeypatch.setattr(
+        "magent.launch.psmux_status",
+        lambda cfg, group=None: (up, list(down), projects if projects else up),
+    )
+    monkeypatch.setattr("magent.psmux.find_psmux", lambda: "psmux")
+    monkeypatch.setattr(
+        "magent.psmux.pane_current_commands",
+        lambda names, psmux=None: {n: (apps or {}).get(n, "") for n in names},
+    )
 
 
 class TestNoConfig:
@@ -176,6 +196,7 @@ class TestJson:
             "listener": "off",
             "attention": "off",
             "agents": [],
+            "psmux_sessions": [],
         }
 
     def test_degraded_emits_parseable_status_and_exit_3(
@@ -199,6 +220,7 @@ class TestJson:
             "listener": "off",
             "attention": "off",
             "agents": [],
+            "psmux_sessions": [],
         }
 
 
@@ -302,6 +324,281 @@ class TestMenuDownServerReport:
         out = capsys.readouterr().out
         assert "could not be stopped" in out
         assert "Stopped upload server on port" not in out
+
+
+class TestPsmuxSessionSection:
+    """The agents live inside the psmux sessions, so `status` reports each live
+    one's foreground app and agent state -- not just the daemons around them."""
+
+    def _live(self, monkeypatch, tmp_path, apps, state=None, down=()):
+        _both_off(monkeypatch)
+        api = tmp_path / "api"
+        api.mkdir()
+        if state:
+            agent_state.write_state(str(api), state)
+        up = [{"name": "api", "session": "api", "group": "core"}]
+        projects = [{"name": "api", "session": "api", "resolved": str(api)}]
+        _fake_psmux(monkeypatch, up, projects, apps, down=down)
+
+    def test_lists_live_session_with_app_and_state(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        self._live(
+            monkeypatch, tmp_path, {"api": "claude"}, state=agent_state.NEEDS_INPUT
+        )
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+
+        assert result.exit_code == 0
+        assert "api" in result.output
+        assert "claude" in result.output
+        assert "needs input" in result.output
+
+    def test_bare_shell_reads_as_idle(self, runner, tmp_config, tmp_path, monkeypatch):
+        self._live(monkeypatch, tmp_path, {"api": "pwsh"})
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+
+        assert result.exit_code == 0
+        assert "idle" in result.output
+        # The shell name itself is the diagnosis, not the display.
+        assert "pwsh" not in result.output
+
+    def test_unreadable_pane_never_claims_idle(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        self._live(monkeypatch, tmp_path, {"api": ""})
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+
+        assert result.exit_code == 0
+        assert "idle" not in result.output
+
+    def test_not_live_sessions_are_summarized_not_listed(
+        self, runner, tmp_config, monkeypatch
+    ):
+        _both_off(monkeypatch)
+        down = [{"name": f"p{i}", "session": f"p{i}"} for i in range(9)]
+        _fake_psmux(monkeypatch, [], [], {}, down=down)
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+
+        assert result.exit_code == 0
+        assert "9 not running" in result.output
+        assert "p8" not in result.output  # summarized: only a short preview
+
+    def test_no_sessions_never_probes_psmux(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # Fast path unchanged: nothing configured -> not one psmux round-trip.
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr(
+            "magent.psmux.pane_current_commands",
+            lambda names, psmux=None: pytest.fail("probed psmux with no sessions"),
+        )
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+
+        assert result.exit_code == 0
+
+
+class TestPsmuxSessionsJson:
+    def test_additive_key_carries_name_app_idle_state(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _both_off(monkeypatch)
+        api = tmp_path / "api"
+        api.mkdir()
+        agent_state.write_state(str(api), agent_state.WORKING)
+        web = tmp_path / "web"
+        web.mkdir()
+        up = [
+            {"name": "api", "session": "api", "group": None},
+            {"name": "web", "session": "web", "group": None},
+        ]
+        projects = [
+            {"name": "api", "session": "api", "resolved": str(api)},
+            {"name": "web", "session": "web", "resolved": str(web)},
+        ]
+        _fake_psmux(monkeypatch, up, projects, {"api": "claude", "web": "pwsh"})
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
+
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout)
+        assert payload["psmux_sessions"] == [
+            {
+                "name": "api",
+                "app": "claude",
+                "idle": False,
+                "state": agent_state.WORKING,
+            },
+            {"name": "web", "app": "pwsh", "idle": True, "state": ""},
+        ]
+
+    def test_existing_envelope_and_exit_codes_are_undisturbed(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # Additive only: a live psmux session is not a degraded daemon.
+        _both_off(monkeypatch)
+        api = tmp_path / "api"
+        api.mkdir()
+        _fake_psmux(
+            monkeypatch,
+            [{"name": "api", "session": "api"}],
+            [{"name": "api", "session": "api", "resolved": str(api)}],
+            {"api": "pwsh"},
+        )
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
+
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is True
+        assert payload["upload_server"] == "off"
+        assert payload["listener"] == "off"
+        assert payload["attention"] == "off"
+        assert payload["agents"] == []
+
+
+class TestSessionActions:
+    """The interactive status flow can act on what it just listed: attach to a
+    session, or revive one whose agent fell back to a bare shell."""
+
+    def _rows(self):
+        return [
+            {"name": "api", "app": "claude", "idle": False, "state": ""},
+            {"name": "web", "app": "pwsh", "idle": True, "state": ""},
+        ]
+
+    def _drive(self, monkeypatch, tmp_config, choice):
+        from magent.cli import status as status_mod
+
+        monkeypatch.setattr(status_mod.click, "prompt", lambda *a, **k: choice)
+        monkeypatch.setattr(status_mod.click, "pause", lambda *a, **k: None)
+        opened: list[str] = []
+        revived: list[str] = []
+        monkeypatch.setattr(status_mod, "_open_session", opened.append)
+        monkeypatch.setattr(
+            status_mod, "_revive_session", lambda cfg_file, sid: revived.append(sid)
+        )
+        status_mod._session_actions(
+            Path(tmp_config({"version": 3, "projects": []})), self._rows()
+        )
+        return opened, revived
+
+    def test_digit_opens_that_session(self, monkeypatch, tmp_config):
+        assert self._drive(monkeypatch, tmp_config, "1") == (["api"], [])
+
+    def test_r_digit_revives_that_session(self, monkeypatch, tmp_config):
+        assert self._drive(monkeypatch, tmp_config, "r2") == ([], ["web"])
+
+    def test_quit_does_nothing(self, monkeypatch, tmp_config):
+        assert self._drive(monkeypatch, tmp_config, "q") == ([], [])
+
+    def test_out_of_range_does_nothing(self, monkeypatch, tmp_config, capsys):
+        assert self._drive(monkeypatch, tmp_config, "9") == ([], [])
+        assert "Invalid choice" in capsys.readouterr().out
+
+    def test_bare_r_does_nothing(self, monkeypatch, tmp_config):
+        assert self._drive(monkeypatch, tmp_config, "r") == ([], [])
+
+    def test_open_reuses_the_pickers_attach_path(self, monkeypatch):
+        from magent.cli import status as status_mod
+
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: "psmux")
+        seen: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            "magent.cli.session_picker._attach_session",
+            lambda binary, target, reset: seen.append((binary, target)),
+        )
+        status_mod._open_session("api")
+        assert seen == [("psmux", "api")]
+
+    def test_open_without_psmux_is_reported_not_crashed(self, monkeypatch, capsys):
+        from magent.cli import status as status_mod
+
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        status_mod._open_session("api")
+        assert "psmux not found" in capsys.readouterr().out
+
+    def test_revive_targets_only_that_session(self, monkeypatch, tmp_config, capsys):
+        from magent.cli import status as status_mod
+
+        calls: list[list[str] | None] = []
+
+        def _fake_revive(cfg, only=None, group=None):
+            calls.append(only)
+            return only or []
+
+        monkeypatch.setattr("magent.psmux.revive_sessions", _fake_revive)
+        status_mod._revive_session(
+            Path(tmp_config({"version": 3, "projects": []})), "web"
+        )
+        assert calls == [["web"]]
+        assert "Revived" in capsys.readouterr().out
+
+    def test_revive_reports_a_no_op_truthfully(self, monkeypatch, tmp_config, capsys):
+        from magent.cli import status as status_mod
+
+        monkeypatch.setattr(
+            "magent.psmux.revive_sessions", lambda cfg, only=None, group=None: []
+        )
+        status_mod._revive_session(
+            Path(tmp_config({"version": 3, "projects": []})), "web"
+        )
+        out = capsys.readouterr().out
+        assert "Nothing to revive" in out
+        assert "Revived" not in out
+
+    def test_menu_status_prompts_only_when_sessions_are_listed(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        from magent.cli import status as status_mod
+
+        _both_off(monkeypatch)
+        api = tmp_path / "api"
+        api.mkdir()
+        _fake_psmux(
+            monkeypatch,
+            [{"name": "api", "session": "api"}],
+            [{"name": "api", "session": "api", "resolved": str(api)}],
+            {"api": "claude"},
+        )
+        acted: list[list[dict[str, object]]] = []
+        monkeypatch.setattr(
+            status_mod, "_session_actions", lambda cf, sessions: acted.append(sessions)
+        )
+        monkeypatch.setattr(status_mod.click, "pause", lambda *a, **k: None)
+        status_mod._menu_status(Path(tmp_config({"version": 3, "projects": []})))
+        assert [s["name"] for s in acted[0]] == ["api"]
+
+    def test_menu_status_falls_back_to_a_pause_with_no_sessions(
+        self, monkeypatch, tmp_config
+    ):
+        from magent.cli import status as status_mod
+
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr(
+            status_mod,
+            "_session_actions",
+            lambda cf, sessions: pytest.fail("prompted with nothing to act on"),
+        )
+        paused: list[bool] = []
+        monkeypatch.setattr(
+            status_mod.click, "pause", lambda *a, **k: paused.append(True)
+        )
+        status_mod._menu_status(Path(tmp_config({"version": 3, "projects": []})))
+        assert paused == [True]
 
 
 class TestAgentsRollup:
