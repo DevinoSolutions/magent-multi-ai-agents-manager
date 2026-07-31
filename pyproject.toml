@@ -1,6 +1,6 @@
 [project]
 name = "magent-multi-ai-agents-manager"
-version = "3.9.0"
+version = "3.9.1"
 description = "Launch each project's AI coding agent in its own terminal, auto-tiled across every monitor"
 readme = "README.md"
 license = "AGPL-3.0"
