@@ -165,13 +165,13 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>md upload</title>
+<title>magent upload</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <meta name="theme-color" content="#1e1e2e">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="md upload">
+<meta name="apple-mobile-web-app-title" content="magent upload">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="icon" type="image/png" href="/icon-192.png">
 <style>
@@ -231,7 +231,7 @@ body{font-family:-apple-system,system-ui,sans-serif;background:#1e1e2e;color:#cd
 </head>
 <body>
 <div class="head">
-  <h1>MD</h1>
+  <h1>magent</h1>
   <span>tap project &rsaquo; tap file or Ctrl+V &rsaquo; done</span>
 </div>
 
@@ -471,7 +471,7 @@ if ('serviceWorker' in navigator && window.isSecureContext) {
   const btn = document.getElementById('install-btn');
   const standalone = window.matchMedia('(display-mode: standalone)').matches
     || window.navigator.standalone === true;
-  if (standalone || localStorage.getItem('md-install-hide')) return;
+  if (standalone || localStorage.getItem('magent-install-hide')) return;
 
   const ios = /iphone|ipad|ipod/i.test(navigator.userAgent);
   if (ios) {
@@ -488,7 +488,7 @@ if ('serviceWorker' in navigator && window.isSecureContext) {
     window.addEventListener('beforeinstallprompt', e => {
       e.preventDefault();
       deferred = e;
-      text.innerHTML = "Install <b>md upload</b> to your home screen for one-tap access.";
+      text.innerHTML = "Install <b>magent upload</b> to your home screen for one-tap access.";
       btn.style.display = 'block';
     });
     btn.addEventListener('click', async () => {
@@ -502,7 +502,7 @@ if ('serviceWorker' in navigator && window.isSecureContext) {
   box.classList.add('show');
   document.getElementById('install-x').addEventListener('click', () => {
     box.classList.remove('show');
-    localStorage.setItem('md-install-hide', '1');
+    localStorage.setItem('magent-install-hide', '1');
   });
 })();
 </script>
@@ -539,7 +539,7 @@ def _build_html(sessions: list[dict[str, object]]) -> str:
 _MANIFEST = json.dumps(
     {
         "name": "magent upload",
-        "short_name": "md upload",
+        "short_name": "magent",
         "description": "Send images straight into your magent: sessions",
         "start_url": "/",
         "scope": "/",
@@ -572,13 +572,20 @@ _MANIFEST = json.dumps(
 
 # Cache the shell; never the dynamic session list or the upload endpoint.
 _SERVICE_WORKER = b"""\
-const C = 'md-v1';
+const C = 'magent-v1';
 const SHELL = ['/icon-192.png', '/icon-512.png', '/manifest.webmanifest'];
 self.addEventListener('install', e => {
   self.skipWaiting();
   e.waitUntil(caches.open(C).then(c => c.addAll(SHELL)).catch(() => {}));
 });
-self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+// Drop every cache but the current one, so a renamed/bumped C never leaves an
+// orphan behind on an already-installed client.
+self.addEventListener('activate', e => e.waitUntil(
+  caches.keys()
+    .then(ks => Promise.all(ks.filter(k => k !== C).map(k => caches.delete(k))))
+    .catch(() => {})
+    .then(() => self.clients.claim())
+));
 self.addEventListener('fetch', e => {
   const u = new URL(e.request.url);
   if (e.request.method !== 'GET' || u.pathname === '/upload' || u.pathname === '/api/sessions'
@@ -647,9 +654,9 @@ def _mobileconfig(host: str) -> bytes:
       <key>Icon</key>
       <data>{icon_b64}</data>
       <key>IsRemovable</key><true/>
-      <key>Label</key><string>md upload</string>
-      <key>PayloadDescription</key><string>Adds the md upload Home Screen icon.</string>
-      <key>PayloadDisplayName</key><string>md upload</string>
+      <key>Label</key><string>magent upload</string>
+      <key>PayloadDescription</key><string>Adds the magent upload Home Screen icon.</string>
+      <key>PayloadDisplayName</key><string>magent upload</string>
       <key>PayloadIdentifier</key><string>ca.devino.magent.webclip</string>
       <key>PayloadType</key><string>com.apple.webClip.managed</string>
       <key>PayloadUUID</key><string>{_WEBCLIP_UUID}</string>
@@ -658,8 +665,8 @@ def _mobileconfig(host: str) -> bytes:
       <key>URL</key><string>{url}</string>
     </dict>
   </array>
-  <key>PayloadDescription</key><string>Install the md upload app on your Home Screen.</string>
-  <key>PayloadDisplayName</key><string>md upload</string>
+  <key>PayloadDescription</key><string>Install the magent upload app on your Home Screen.</string>
+  <key>PayloadDisplayName</key><string>magent upload</string>
   <key>PayloadIdentifier</key><string>ca.devino.magent</string>
   <key>PayloadRemovalDisallowed</key><false/>
   <key>PayloadType</key><string>Configuration</string>
@@ -822,7 +829,8 @@ class UploadHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/x-apple-aspen-config")
             self.send_header(
-                "Content-Disposition", 'attachment; filename="md-upload.mobileconfig"'
+                "Content-Disposition",
+                'attachment; filename="magent-upload.mobileconfig"',
             )
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()

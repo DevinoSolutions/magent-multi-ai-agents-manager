@@ -283,9 +283,10 @@ class TestReviveSessions:
 
 
 class TestDecorateSession:
-    """The status-line hints (` F1 picker  F2 code `) plus the product-owned
-    `bind -n F1 detach-client`. Both are `-L <name>`-scoped so they land on
-    that session's own server and beat whatever its tmux.conf set at start-up.
+    """The status-line hints (` F1 picker  F2 code `), the product-owned
+    `bind -n F1 detach-client`, and the product-owned status-left brand (+ the
+    length budget it needs). All are `-L <name>`-scoped so they land on that
+    session's own server and beat whatever its tmux.conf set at start-up.
     """
 
     def _run(self, monkeypatch, *, boom: Exception | None = None):
@@ -317,16 +318,53 @@ class TestDecorateSession:
             " F1 picker  F2 code ",
         ]
 
+    def test_sets_the_status_left_brand(self, monkeypatch):
+        cmds = self._run(monkeypatch)
+        assert cmds[2] == [
+            "psmux",
+            "-L",
+            "api",
+            "set",
+            "-g",
+            "status-left",
+            "#[bold,fg=green] magent #[default]",
+        ]
+
+    def test_sets_the_status_left_length_alongside_the_brand(self, monkeypatch):
+        # Load-bearing: a personal tmux.conf with a tighter status-left-length
+        # would truncate the brand mid-word, so magent sets both or neither.
+        cmds = self._run(monkeypatch)
+        assert cmds[3] == [
+            "psmux",
+            "-L",
+            "api",
+            "set",
+            "-g",
+            "status-left-length",
+            "10",
+        ]
+
+    def test_status_left_length_fits_the_brand(self):
+        # The number is only correct relative to the brand text; pin the
+        # relationship, not just the two literals.
+        assert int(psmux._STATUS_BRAND_LEN) >= len(" magent ")
+
     def test_hint_advertises_both_keys(self):
         # The literal is defined once; a rename must not silently drop a key.
         argv = psmux.decoration_argv("api", "psmux")
         assert "F1" in argv[1][-1] and "F2" in argv[1][-1]
 
+    def test_brand_names_the_product(self):
+        # Same guard on the other literal: the status-left is branding, so the
+        # product name is the part that must survive a restyle.
+        argv = psmux.decoration_argv("api", "psmux")
+        assert "magent" in argv[2][-1]
+
     def test_never_raises_when_the_subprocess_fails(self, monkeypatch):
         # A status bar is cosmetic: an unlaunchable/hung psmux is logged and
         # swallowed, never propagated into a bring-up.
         cmds = self._run(monkeypatch, boom=OSError("no psmux"))
-        assert len(cmds) == 2  # both attempted; neither escaped
+        assert len(cmds) == 4  # all attempted; none escaped
 
     def test_never_raises_on_timeout(self, monkeypatch):
         self._run(monkeypatch, boom=subprocess.TimeoutExpired("psmux", 3))
