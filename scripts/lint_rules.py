@@ -145,7 +145,7 @@ def _is_title_prefix(text: str) -> bool:
     return text.startswith("magent:") and not text.startswith("magent: ")
 
 
-def _starts_md(node: ast.AST) -> bool:
+def _starts_title_prefix(node: ast.AST) -> bool:
     """True if node is a str literal, or an f-string, whose text begins the title prefix."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return _is_title_prefix(node.value)
@@ -291,7 +291,11 @@ def _ast_rules(rel: str, source: str) -> list[Finding]:
                     "sys.platform outside platform/ — gate on a Platform.supports_*() probe, or add a reasoned MD002_ALLOW entry if genuinely OS-behavioral",
                 )
             )
-        if not md003_allowed and _starts_md(node) and id(node) not in fstring_pieces:
+        if (
+            not md003_allowed
+            and _starts_title_prefix(node)
+            and id(node) not in fstring_pieces
+        ):
             out.append(
                 Finding(
                     rel,

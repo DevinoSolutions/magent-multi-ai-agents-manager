@@ -277,6 +277,29 @@ class TestWindowsPsmuxDecoration:
             " F1 picker  F2 code ",
         ] in calls
 
+    def test_created_session_is_branded(self, monkeypatch):
+        # decoration_argv is the single source, so the creation batch picks the
+        # brand up with no call-site change -- this pins that it actually does.
+        calls = self._run(monkeypatch)
+        assert [
+            "psmux",
+            "-L",
+            "api",
+            "set",
+            "-g",
+            "status-left",
+            "#[bold,fg=green] magent #[default]",
+        ] in calls
+        assert [
+            "psmux",
+            "-L",
+            "api",
+            "set",
+            "-g",
+            "status-left-length",
+            "10",
+        ] in calls
+
     def test_decoration_happens_after_the_agent_is_sent(self, monkeypatch):
         calls = self._run(monkeypatch)
         sent = next(i for i, c in enumerate(calls) if "send-keys" in c)

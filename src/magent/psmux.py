@@ -267,16 +267,28 @@ def flash_message(
 # Defined once here so the launch path and the `up` path can never drift.
 _STATUS_HINTS = " F1 picker  F2 code "
 
+# The product's own status-left brand, same plainness as the hints: one word,
+# one accent. magent *owns* this per session rather than inheriting whatever a
+# personal ~/.tmux.conf set, so every magent window reads the same.
+_STATUS_BRAND = "#[bold,fg=green] magent #[default]"
+
+# ...and the width budget has to travel with it. tmux truncates status-left at
+# `status-left-length` (default 10, but a personal conf may set it far tighter),
+# so setting the brand without the length can render it mid-word. Style
+# directives don't count toward the limit; " magent " is 8 columns.
+_STATUS_BRAND_LEN = "10"
+
 
 def decoration_argv(name: str, psmux: str) -> list[list[str]]:
-    """The psmux commands that advertise magent's window hotkeys in ``name``.
+    """The psmux commands that brand ``name`` and advertise its window hotkeys.
 
-    Two of them: magent *owns* F1 -> detach-client per session (the hint has to
+    Four of them: magent *owns* F1 -> detach-client per session (the hint has to
     be truthful on a machine with no personal ``bind -n F1`` in ~/.tmux.conf,
     and owning the binding keeps the existing "back to the picker" semantics
-    rather than changing them), and the status-right carries the hint text.
-    Both are ``-L <name>``-scoped, so they land on that session's own server
-    and override whatever its tmux.conf set at start-up.
+    rather than changing them), the status-right carries the hint text, and the
+    status-left carries the product brand plus the width budget it needs. All
+    are ``-L <name>``-scoped, so they land on that session's own server and
+    override whatever its tmux.conf set at start-up.
 
     Split out from ``decorate_session`` so the launch path can fan the same
     argvs out as raw Popens while callers with one session run them inline.
@@ -284,11 +296,13 @@ def decoration_argv(name: str, psmux: str) -> list[list[str]]:
     return [
         [psmux, "-L", name, "bind", "-n", "F1", "detach-client"],
         [psmux, "-L", name, "set", "-g", "status-right", _STATUS_HINTS],
+        [psmux, "-L", name, "set", "-g", "status-left", _STATUS_BRAND],
+        [psmux, "-L", name, "set", "-g", "status-left-length", _STATUS_BRAND_LEN],
     ]
 
 
 def decorate_session(name: str, psmux: str | None = None) -> None:
-    """Advertise the F1/F2 hints in one session's status line.
+    """Brand one session's status line and advertise its F1/F2 hints.
 
     Best-effort and guarded exactly like ``flash_message``: a status bar is
     cosmetic, so a missing binary, a hung psmux, or a non-zero exit is logged
@@ -309,7 +323,7 @@ def decorate_session(name: str, psmux: str | None = None) -> None:
 def decorate_sessions(names: list[str]) -> list[str]:
     """Decorate many sessions concurrently. Returns the names attempted.
 
-    Each session is its own psmux server, so the two round-trips per name
+    Each session is its own psmux server, so the round-trips per name
     would otherwise serialize across a large config -- same fan-out shape as
     ``revive_sessions``.
     """

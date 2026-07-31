@@ -68,12 +68,12 @@ def _render_frame(views: list[SessionView]) -> None:
 
 
 def _focus_by_name(plat: Platform, name: str) -> bool:
-    """Focus the window for ``name``: md-grammar match first, then a
+    """Focus the window for ``name``: magent-grammar match first, then a
     contains fallback (IDE windows carry their own titles). Flash as the
     consolation signal when focus itself fails."""
     from magent import attention  # heavy subsystem: in-body per policy
 
-    handle = attention.md_windows_by_name(plat).get(name)
+    handle = attention.magent_windows_by_name(plat).get(name)
     if handle is None:
         handle = plat.find_window(name, "contains")
     if handle is None:

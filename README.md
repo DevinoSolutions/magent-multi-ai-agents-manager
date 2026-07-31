@@ -138,7 +138,7 @@ Enable [psmux](https://github.com/psmux/psmux) (native Windows terminal multiple
 
 Requires psmux installed (`choco install psmux` or download from GitHub). When enabled, magent creates a detached psmux session per project and opens Windows Terminal attached to it. From any SSH client: `psmux attach -t project-name`.
 
-Each magent session advertises its window hotkeys in the psmux status bar (`F1 picker  F2 code`):
+Each magent session brands its psmux status bar — `magent` on the left, its window hotkeys on the right (`F1 picker  F2 code`):
 
 | Key | In a `magent:` window |
 | --- | --- |
@@ -146,7 +146,7 @@ Each magent session advertises its window hotkeys in the psmux status bar (`F1 p
 | `F2` | Open the project's folder in VS Code. When you're attached to another machine it opens over Remote-SSH, so you edit the files where they actually live. |
 | `Alt+V` | Paste a clipboard image into the session (Windows — see below). |
 
-`F2` needs `code` on your PATH; `magent up` refreshes the hints on sessions that were already running.
+`F2` needs `code` on your PATH; `magent up` refreshes the branding and hints on sessions that were already running. magent sets both halves per session, so they win over a personal `~/.tmux.conf`.
 
 ### Mobile image upload (over Tailscale)
 
