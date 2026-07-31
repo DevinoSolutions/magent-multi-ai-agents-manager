@@ -5,6 +5,25 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.9.1] - 2026-07-31
+
+### Fixed
+
+- **"Re-tile all open windows" no longer duplicates open windows or
+  reopens closed ones.** Two defects, one report. First, for psmux
+  projects the launch pipeline collected every window for create+attach
+  before checking whether that window was already open -- and each attach
+  spawns a brand-new terminal window with no dedupe of its own (psmux's
+  `has-session` probe only dedupes sessions), so any re-run with windows
+  open produced one duplicate per open session. The collection is now
+  gated on the same window-open probe the plain-terminal path always
+  used: an open window is left untouched, a closed window with a live
+  session gets reattached, and a dead session is recreated. Second, menu
+  option 2 and a bare `--retile-all` rode the full launch pipeline, so a
+  window you deliberately closed came back. Both are now tile-only: they
+  place what is open and launch nothing. `--go --retile-all` keeps the
+  combined meaning -- launch whatever is missing, then tile everything.
+
 ## [3.9.0] - 2026-07-31
 
 ### Added
@@ -390,6 +409,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.9.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.9.0...v3.9.1
 [3.9.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.8.0...v3.9.0
 [3.8.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.7.0...v3.8.0
 [3.7.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.6.0...v3.7.0
