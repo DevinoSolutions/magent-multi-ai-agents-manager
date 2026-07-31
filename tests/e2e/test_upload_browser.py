@@ -271,7 +271,7 @@ def test_upload_page_contract(serve, page):
     """The served page is the real uploader: correct title and the
     pill/file-input form a user needs. A template regression fails here."""
     page.goto(serve.url)
-    expect(page).to_have_title("md upload")
+    expect(page).to_have_title("magent upload")
     # The file input and at least the seeded project's pill must be present.
     assert page.locator("#file").count() == 1, "file input missing from page"
     expect(page.locator(".pill", has_text=serve.TITLE)).to_be_visible()
@@ -285,7 +285,7 @@ def test_real_browser_upload_lands_byte_identical_file(serve, page, tmp_path):
     expected = _make_png(png_path)
 
     page.goto(serve.url)
-    expect(page).to_have_title("md upload")
+    expect(page).to_have_title("magent upload")
 
     pill = page.locator(".pill", has_text=serve.TITLE)
     pill.click()  # enables the (initially disabled) file input
@@ -327,7 +327,7 @@ def test_clipboard_paste_upload_confirms_and_lands_byte_identical(
     expected = _make_png(png_path)
 
     page.goto(serve.url)
-    expect(page).to_have_title("md upload")
+    expect(page).to_have_title("magent upload")
 
     page.evaluate(
         """(b64) => {
