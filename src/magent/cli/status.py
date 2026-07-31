@@ -6,13 +6,20 @@ gates (_listener_state, down_cmd). NF-S3-001 resolved (pass-2): _menu_down
 now branches on stop_server()'s return value like down_cmd; and status --json
 routes an invalid-config load through _load_config_or_exit's as_json mode, so
 it emits a JSON error envelope instead of a stderr line (NF-S3-005).
+
+`_psmux_sessions` adds the missing half of "what's running": the psmux
+sessions the agents actually live in (and that an SSH client attaches to),
+with each one's foreground app and agent state. It is pure data -- rendered
+by `_render_status`, published additively under `status --json`'s
+`psmux_sessions` key, and made actionable (attach / revive) by
+`_session_actions` off the interactive status menu.
 """
 
 from __future__ import annotations
 
 import json
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -25,6 +32,7 @@ from magent.cli.ui import (
     _banner,
     _divider,
     _grouped,
+    _menu_item,
     _print_names,
     _print_session_overview,
 )
@@ -126,6 +134,68 @@ def _agents_attention_rollup(cfg: MagentConfig) -> None:
     )
 
 
+def _psmux_sessions(
+    up: list[dict[str, object]], projects: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    """One row per LIVE psmux session: ``{name, app, idle, state}``.
+
+    The agents themselves live inside these sessions -- they are what an SSH
+    client attaches to -- so a report that stops at the daemons says nothing
+    about the actual work. Liveness is already settled by ``psmux_status``'s
+    fan-out; the only added cost is one ``#{pane_current_command}`` probe per
+    live session, and those go out as a single unbounded fan-out
+    (``psmux.pane_current_commands``), so 40 sessions stay ~one psmux
+    round-trip. Agent states come from the same store the picker reads, so the
+    two surfaces can never disagree. Pure data: the shell decides how to print
+    it and what to exit with.
+    """
+    from magent import psmux as psmux_mod  # heavy subsystem: in-body per policy
+    from magent.cli.session_picker import _session_cwds, _session_states
+
+    sids = [psmux_mod.socket_id(u) for u in up]
+    if not sids:
+        return []
+    binary = psmux_mod.find_psmux() or ""
+    apps = psmux_mod.pane_current_commands(sids, psmux=binary or None)
+    resolved = {psmux_mod.socket_id(p): _as_str(p.get("resolved")) for p in projects}
+    states = _session_states(_session_cwds(binary, sids, resolved))
+    rows: list[dict[str, object]] = []
+    for sid in sids:
+        app = apps.get(sid, "")
+        state, _age = states.get(sid, (None, None))
+        rows.append(
+            {
+                "name": sid,
+                "app": app,
+                "idle": psmux_mod.is_idle_command(app),
+                # "" (never None) when the store has no record, so a JSON
+                # consumer treats it as a plain string field -- the same
+                # convention psmux.config_sessions uses for "resolved".
+                "state": state or "",
+            }
+        )
+    return rows
+
+
+def _print_session_row(idx: int, row: dict[str, object]) -> None:
+    """One live-session line: pick index, socket id, foreground app, agent state."""
+    from magent.cli.session_picker import (
+        _status_label,  # sibling module: one label vocabulary for both surfaces
+    )
+
+    sid = _as_str(row.get("name"))
+    idle = bool(row.get("idle"))
+    app = "idle" if idle else (_as_str(row.get("app")) or "?")
+    app_txt = (
+        style(app, fg="yellow", bold=True) if idle else style(app, fg="cyan", dim=True)
+    )
+    extra = f"{' ' * max(2, 26 - len(sid))}{app_txt}"
+    label = _status_label(_as_str(row.get("state")) or None)
+    if label:
+        extra += f"{' ' * max(2, 14 - len(app))}{label}"
+    _menu_item(str(idx), sid, extra=extra)
+
+
 def _gather_status(cfg: MagentConfig) -> dict[str, str]:
     return {
         "upload_server": _upload_state(cfg.settings.upload_port),
@@ -142,13 +212,28 @@ def _is_degraded(status: dict[str, str]) -> bool:
     )
 
 
-def _render_status(config_file: Path) -> bool:
-    """Prints the status report; returns True if any daemon is degraded
-    (dead/stale). Never exits -- shared with the menu's _menu_status."""
+class StatusReport(NamedTuple):
+    """What ``_render_status`` just printed, for a caller that acts on it.
+
+    ``sessions`` are the live psmux rows in the exact on-screen order, so the
+    interactive menu's pick numbers line up with the printed ones without
+    re-probing psmux (and without the list drifting between paint and pick).
+    """
+
+    degraded: bool
+    sessions: list[dict[str, object]]
+
+
+def _render_status(config_file: Path) -> StatusReport:
+    """Prints the status report; reports whether any daemon is degraded
+    (dead/stale) plus the live psmux sessions it listed, in display order.
+    Never exits -- shared with the menu's _menu_status."""
     from magent.launch import psmux_status  # heavy subsystem: in-body per policy
 
     cfg = _load_config_or_exit(config_file)
-    up, down, _ = psmux_status(cfg)
+    up, down, projects = psmux_status(cfg)
+    rows = {_as_str(r.get("name")): r for r in _psmux_sessions(up, projects)}
+    listed: list[dict[str, object]] = []
 
     _banner()
     click.echo(
@@ -163,7 +248,12 @@ def _render_status(config_file: Path) -> bool:
             click.echo(
                 f"  {style(g, fg='green', bold=True)}  {style(f'({len(buckets[g])})', dim=True)}"
             )
-            _print_names(buckets[g])
+            for sid in buckets[g]:
+                row = rows.get(
+                    sid, {"name": sid, "app": "", "idle": False, "state": ""}
+                )
+                listed.append(row)
+                _print_session_row(len(listed), row)
     else:
         click.echo(
             f"  {style('No sessions running.', dim=True)}  "
@@ -213,7 +303,7 @@ def _render_status(config_file: Path) -> bool:
 
     _agents_attention_rollup(cfg)
 
-    return _is_degraded(status)
+    return StatusReport(_is_degraded(status), listed)
 
 
 @main.command("status")
@@ -231,16 +321,25 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
         sys.exit(1)
 
     if as_json:
+        from magent.launch import (
+            psmux_status,  # heavy subsystem: in-body per policy
+        )
+
         cfg = _load_config_or_exit(config_file, as_json=True)
         status = _gather_status(cfg)
         # P3-04: `ok: true` is the success discriminator (only errors carry
         # ok: false); degraded is still signalled by the state fields + exit 3.
         payload: dict[str, object] = {"ok": True, **status}
         payload["agents"] = _agents_snapshot(cfg)
+        # Additive (P3-04): a new key alongside the existing envelope, never a
+        # change to its shape or to the 0/1/3 exit contract -- a dead psmux
+        # session is a "not running" row, not a degraded daemon.
+        up, _down, projects = psmux_status(cfg)
+        payload["psmux_sessions"] = _psmux_sessions(up, projects)
         click.echo(json.dumps(payload))
         sys.exit(3 if _is_degraded(status) else 0)
 
-    if _render_status(config_file):
+    if _render_status(config_file).degraded:
         sys.exit(3)
 
 
@@ -324,9 +423,80 @@ def down_cmd(
             click.echo(f"  {style('-', dim=True)} Attention daemon was not running.")
 
 
+def _open_session(sid: str) -> None:
+    """Attach this terminal to a live session -- the picker's own attach path
+    (retry + surfaced failure + terminal reset), not a second copy of it."""
+    from magent import psmux as psmux_mod  # heavy subsystem: in-body per policy
+    from magent.cli.session_picker import _attach_session, _reset_terminal
+
+    binary = psmux_mod.find_psmux()
+    if not binary:
+        click.echo(
+            f"  {style('x', fg='red')} psmux not found on PATH. Install: choco install psmux"
+        )
+        return
+    _attach_session(binary, sid, _reset_terminal)
+
+
+def _revive_session(config_file: Path, sid: str) -> None:
+    """Re-launch the agent in a live session whose pane fell back to a shell."""
+    from magent import psmux as psmux_mod  # heavy subsystem: in-body per policy
+
+    cfg = _load_config_or_exit(config_file)
+    if psmux_mod.revive_sessions(cfg, only=[sid]):
+        click.echo(f"  {style('+', fg='green')} Revived {style(sid, bold=True)}.")
+    else:
+        click.echo(
+            f"  {style('-', dim=True)} Nothing to revive in {sid}"
+            f" (its agent is still running), or the relaunch failed -- see logs."
+        )
+
+
+def _session_actions(config_file: Path, sessions: list[dict[str, object]]) -> None:
+    """Act on one of the psmux sessions `_render_status` just listed.
+
+    Its own prompt rather than more branches inside `_menu_status`: the menu
+    handlers in this module stay thin shells and the complexity ceilings in
+    pyproject.toml ratchet DOWN only. Indices are the printed ones, so what
+    you see is what you act on.
+    """
+    click.echo(
+        f"  {style('Session', bold=True)}   "
+        f"{style('1-' + str(len(sessions)), fg='cyan', bold=True)}=attach   "
+        f"{style('r<n>', fg='cyan', bold=True)}=revive a stopped agent   "
+        f"{style('q', fg='cyan', bold=True)}=back"
+    )
+    choice = (
+        click.prompt(
+            f"  {style('>', fg='cyan', bold=True)}",
+            default="q",
+            show_default=False,
+            prompt_suffix=" ",
+        )
+        .strip()
+        .lower()
+    )
+    if choice in ("", "q", "n", "no", "back"):
+        return
+    revive = choice.startswith("r")
+    digits = choice[1:].strip() if revive else choice
+    if not digits.isdigit() or not 1 <= int(digits) <= len(sessions):
+        click.echo(f"  {style('x', fg='red')} Invalid choice.")
+        return
+    sid = _as_str(sessions[int(digits) - 1].get("name"))
+    if not revive:
+        _open_session(sid)
+        return
+    _revive_session(config_file, sid)
+    click.pause(info=f"  {style('press any key to return', dim=True)}")
+
+
 def _menu_status(config_file: Path) -> None:
-    _render_status(config_file)
+    report = _render_status(config_file)
     click.echo()
+    if report.sessions:
+        _session_actions(config_file, report.sessions)
+        return
     click.pause(info=f"  {style('press any key to return', dim=True)}")
 
 

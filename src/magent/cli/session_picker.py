@@ -67,17 +67,21 @@ def _status_label(state: str | None, age_s: float | None = None) -> str:
     }.get(state, "")
 
 
-def _session_statuses(cwds: dict[str, str]) -> dict[str, str]:
-    """Map each session to a status label read from the agent-state store, which
-    agents populate via their own lifecycle events (Claude Code hooks, Codex
-    notify, ...) -- ground truth, not terminal scraping. A staleness guard keeps
-    a session killed mid-turn from showing 'working...' forever."""
+def _session_states(cwds: dict[str, str]) -> dict[str, tuple[str | None, float | None]]:
+    """Map each session to its ``(state, age_s)`` from the agent-state store,
+    which agents populate via their own lifecycle events (Claude Code hooks,
+    Codex notify, ...) -- ground truth, not terminal scraping. A staleness guard
+    keeps a session killed mid-turn from showing 'working...' forever.
+
+    Split out of ``_session_statuses`` so ``magent status`` can report the same
+    ground truth as *data* (its ``--json`` session rows) instead of re-deriving
+    it from a styled label."""
     from magent import agent_state  # heavy subsystem: in-body per policy
     from magent.attention import (
         STALENESS_S as stale,  # heavy subsystem: in-body per policy
     )
 
-    out: dict[str, str] = {}
+    out: dict[str, tuple[str | None, float | None]] = {}
     for sock, cwd in cwds.items():
         rec = agent_state.state_for(cwd) if cwd else None
         raw_state = rec.get("state") if rec else None
@@ -91,8 +95,16 @@ def _session_statuses(cwds: dict[str, str]) -> dict[str, str]:
             age_s = time.time() - ts_num
             if state in stale and age_s > stale[state]:
                 state = None
-        out[sock] = _status_label(state, age_s)
+        out[sock] = (state, age_s)
     return out
+
+
+def _session_statuses(cwds: dict[str, str]) -> dict[str, str]:
+    """The picker's display face of ``_session_states``: one styled label each."""
+    return {
+        sock: _status_label(state, age_s)
+        for sock, (state, age_s) in _session_states(cwds).items()
+    }
 
 
 _FOCUS_TARGET_FILE = Path.home() / ".magent" / "focus-target"
@@ -155,6 +167,19 @@ def _live_sessions(psmux_bin: str, candidates: list[str]) -> list[str]:
     return [n for n in candidates if flags[n]]
 
 
+def _reset_terminal() -> None:
+    """Put the terminal back in a sane state after a psmux client detaches.
+
+    Module level (not a closure inside the picker loop) so every attach site --
+    the picker and the status menu's session actions -- shares one definition.
+    """
+    if sys.platform == "win32":
+        subprocess.run(["cmd", "/c", "cls"], shell=False, check=False)
+    else:
+        subprocess.run(["stty", "sane"], capture_output=True, check=False)
+        subprocess.run(["tput", "reset"], capture_output=True, check=False)
+
+
 def _attach_session(psmux_bin: str, target: str, reset: Callable[[], None]) -> None:
     """Attach to a session; surface and retry a failed attach.
 
@@ -213,13 +238,6 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
         candidates.append(sid)
         path = proj.get("resolved")
         resolved[sid] = path if isinstance(path, str) else ""
-
-    def _reset_terminal() -> None:
-        if sys.platform == "win32":
-            subprocess.run(["cmd", "/c", "cls"], shell=False, check=False)
-        else:
-            subprocess.run(["stty", "sane"], capture_output=True, check=False)
-            subprocess.run(["tput", "reset"], capture_output=True, check=False)
 
     def _attach(target: str) -> None:
         _attach_session(psmux_bin, target, _reset_terminal)

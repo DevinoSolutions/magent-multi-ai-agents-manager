@@ -220,19 +220,80 @@ def pane_current_command(name: str, psmux: str | None = None) -> str:
         return (result.stdout or "").strip() if result.returncode == 0 else ""
 
 
+def pane_current_commands(names: list[str], psmux: str | None = None) -> dict[str, str]:
+    """``pane_current_command`` for many sessions in ONE process fan-out.
+
+    Every probe is spawned before any is read -- the shape the picker's
+    liveness sweep already uses -- so a caller building a table over 40 live
+    sessions pays roughly one psmux round-trip instead of 40 sequential ones.
+    Guarded exactly like the single-session form: bounded, decode-tolerant, and
+    a failed, hung, or unlaunchable probe degrades to ``""`` for that session
+    rather than propagating.
+    """
+    binary = psmux or find_psmux()
+    if not binary or not names:
+        return dict.fromkeys(names, "")
+    procs: dict[str, subprocess.Popen[str] | None] = {}
+    for name in names:
+        try:
+            procs[name] = subprocess.Popen(
+                [
+                    binary,
+                    "-L",
+                    name,
+                    "display-message",
+                    "-t",
+                    name,
+                    "-p",
+                    "#{pane_current_command}",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError:
+            procs[name] = None
+
+    out: dict[str, str] = {}
+    for name, proc in procs.items():
+        if proc is None:
+            out[name] = ""
+            continue
+        try:
+            stdout, _ = proc.communicate(timeout=5)
+        except subprocess.SubprocessError:
+            proc.kill()
+            out[name] = ""
+        else:
+            out[name] = (stdout or "").strip() if proc.returncode == 0 else ""
+    return out
+
+
+def is_idle_command(raw: str) -> bool:
+    """True when a ``#{pane_current_command}`` reading is a bare shell.
+
+    Split out of ``agent_idle`` so a caller that already holds a pane's
+    foreground command (``status``'s session table) classifies it without
+    paying a second psmux round-trip. An empty or unreadable reading is False
+    on purpose -- see ``agent_idle``.
+    """
+    stripped = raw.strip()
+    if not stripped:
+        return False
+    leaf = stripped.replace("\\", "/").rsplit("/", 1)[-1]
+    if leaf.lower().endswith(".exe"):
+        leaf = leaf[: -len(".exe")]
+    return leaf.lower() in _IDLE_SHELLS
+
+
 def agent_idle(name: str, psmux: str | None = None) -> bool:
     """True when the session's pane rests at a bare shell -- its agent is gone.
 
     An empty or unreadable reading is False on purpose: never inject keystrokes
     into a pane whose state we could not establish.
     """
-    raw = pane_current_command(name, psmux=psmux).strip()
-    if not raw:
-        return False
-    leaf = raw.replace("\\", "/").rsplit("/", 1)[-1]
-    if leaf.lower().endswith(".exe"):
-        leaf = leaf[: -len(".exe")]
-    return leaf.lower() in _IDLE_SHELLS
+    return is_idle_command(pane_current_command(name, psmux=psmux))
 
 
 def flash_message(

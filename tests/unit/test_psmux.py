@@ -202,6 +202,123 @@ class TestAgentIdle:
         assert psmux.agent_idle("sess", psmux="psmux") is idle
 
 
+class _FakePopen:
+    """Stand-in for one fanned-out `display-message` probe, logging when it is
+    read so the spawn-then-read ordering can be pinned."""
+
+    def __init__(self, name, stdout, returncode, events, timeout=False):
+        self._name = name
+        self._stdout = stdout
+        self.returncode = returncode
+        self._events = events
+        self._timeout = timeout
+        self.killed = False
+
+    def communicate(self, timeout=None):
+        self._events.append(f"read:{self._name}")
+        if self._timeout:
+            raise subprocess.TimeoutExpired(cmd="psmux", timeout=timeout or 0)
+        return self._stdout, ""
+
+    def kill(self):
+        self.killed = True
+
+
+class TestPaneCurrentCommands:
+    def _fan(self, monkeypatch, results, timeouts=()):
+        events: list[str] = []
+
+        def _fake_popen(cmd, **kwargs):
+            name = cmd[2]
+            events.append(f"spawn:{name}")
+            return _FakePopen(
+                name,
+                results.get(name, ("", 0))[0],
+                results.get(name, ("", 0))[1],
+                events,
+                timeout=name in timeouts,
+            )
+
+        monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+        return events
+
+    def test_returns_one_reading_per_session(self, monkeypatch):
+        self._fan(monkeypatch, {"a": ("claude\n", 0), "b": ("pwsh\n", 0)})
+        assert psmux.pane_current_commands(["a", "b"], psmux="psmux") == {
+            "a": "claude",
+            "b": "pwsh",
+        }
+
+    def test_every_probe_is_spawned_before_any_is_read(self, monkeypatch):
+        # The point of the fan-out: n concurrent psmux round-trips, not n
+        # sequential ones -- `status` must stay fast at 40+ sessions.
+        events = self._fan(
+            monkeypatch, {"a": ("claude", 0), "b": ("claude", 0), "c": ("claude", 0)}
+        )
+        psmux.pane_current_commands(["a", "b", "c"], psmux="psmux")
+        assert events == [
+            "spawn:a",
+            "spawn:b",
+            "spawn:c",
+            "read:a",
+            "read:b",
+            "read:c",
+        ]
+
+    def test_targets_each_session_explicitly(self, monkeypatch):
+        argvs: list[list[str]] = []
+
+        def _fake_popen(cmd, **kwargs):
+            argvs.append(cmd)
+            return _FakePopen(cmd[2], "claude", 0, [])
+
+        monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+        psmux.pane_current_commands(["sess"], psmux="psmux")
+        cmd = argvs[0]
+        assert cmd[:4] == ["psmux", "-L", "sess", "display-message"]
+        assert cmd[cmd.index("-t") + 1] == "sess"
+        assert "#{pane_current_command}" in cmd
+
+    def test_nonzero_and_timeout_degrade_to_empty(self, monkeypatch):
+        self._fan(monkeypatch, {"a": ("claude", 1), "b": ("x", 0)}, timeouts=("b",))
+        assert psmux.pane_current_commands(["a", "b"], psmux="psmux") == {
+            "a": "",
+            "b": "",
+        }
+
+    def test_unlaunchable_probe_degrades_to_empty(self, monkeypatch):
+        monkeypatch.setattr(
+            subprocess,
+            "Popen",
+            lambda cmd, **kw: (_ for _ in ()).throw(OSError("no psmux")),
+        )
+        assert psmux.pane_current_commands(["a"], psmux="psmux") == {"a": ""}
+
+    def test_no_binary_returns_empty_readings(self, monkeypatch):
+        monkeypatch.setattr(psmux, "find_psmux", lambda: None)
+        assert psmux.pane_current_commands(["a", "b"]) == {"a": "", "b": ""}
+
+    def test_no_names_spawns_nothing(self, monkeypatch):
+        monkeypatch.setattr(
+            subprocess,
+            "Popen",
+            lambda cmd, **kw: pytest.fail("spawned a probe for zero sessions"),
+        )
+        assert psmux.pane_current_commands([], psmux="psmux") == {}
+
+
+class TestIsIdleCommand:
+    """`agent_idle` now delegates here, so a caller that already holds the
+    reading (status's session table) classifies it without a second probe."""
+
+    @pytest.mark.parametrize(
+        ("reading", "idle"),
+        [("pwsh", True), ("C:\\x\\bash.exe", True), ("claude", False), ("", False)],
+    )
+    def test_classification_matches_agent_idle(self, reading, idle):
+        assert psmux.is_idle_command(reading) is idle
+
+
 def _cfg(projects, **settings):
     return MagentConfig(projects=projects, base_dir=None, settings=Settings(**settings))
 
