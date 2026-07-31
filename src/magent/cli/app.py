@@ -206,10 +206,15 @@ def main(
         run_magent,
     )
 
+    # Menu option 2 ("Re-tile all open windows") and a bare `--retile-all` both
+    # promise tiling, not launching -- re-opening a window the user just closed
+    # is what the flag is least expected to do. `--go --retile-all` keeps the
+    # combined meaning: launch whatever is missing, then tile everything.
     rc = run_magent(
         cfg,
         RunOpts(
             retile_all=retile_all,
+            tile_only=retile_all and not go,
             dry_run=dry_run,
             group=group,
             config_path=str(config_file),

@@ -863,6 +863,243 @@ class TestPerWindowToolOverride:
         assert "nope" not in fp.launched_terminals[0].command
 
 
+class TestPsmuxWindowDedupe:
+    """Regression pins for the duplicate-window bug: a user with windows open
+    picked menu option 2 ("Re-tile all open windows") and got a second window
+    per already-open psmux session.
+
+    Cause: the psmux collection block ran BEFORE (and independently of) the
+    `is_running` probe, and every collected window gets an `attach_psmux` --
+    which is `wt -w new ... psmux attach`, a brand-new window with no dedupe of
+    its own. `launch_psmux_session`'s `has-session` probe only dedupes
+    SESSIONS. The non-psmux path was already gated on `not running`; these pin
+    the psmux path to the same window-level rule (the attach path's v3.4.0
+    dedupe, `tiling.window_open` in cli/attach.py, is the precedent)."""
+
+    def test_open_window_is_not_collected_or_attached(
+        self, monkeypatch, tmp_path, fake_sleep
+    ):
+        fp = FakePlatform(supports_psmux=True, windows={"magent:proj": 555})
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+        cfg = MagentConfig(
+            projects=[ProjectConfig(path=str(tmp_path), tool="claude", title="proj")],
+            settings=Settings(
+                tools={"claude": "claude --continue"}, default_tool="claude", psmux=True
+            ),
+        )
+
+        rc = run_magent(cfg, RunOpts())
+
+        assert rc == 0
+        # Nothing collected => _start_psmux_and_upload no-ops entirely: no
+        # session create, no attach, so the live session is left untouched.
+        assert fp.launched_psmux == []
+        assert fp.attached_psmux == []
+        assert fp.launched_terminals == []
+
+    def test_closed_window_is_still_collected(self, monkeypatch, tmp_path, fake_sleep):
+        # The other half of the three-way rule: window closed => collected, so
+        # attach reopens a window (onto the live session when has-session
+        # answers, onto a freshly created one when it doesn't).
+        fp = FakePlatform(supports_psmux=True)
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+        cfg = MagentConfig(
+            projects=[ProjectConfig(path=str(tmp_path), tool="claude", title="proj")],
+            settings=Settings(
+                tools={"claude": "claude --continue"}, default_tool="claude", psmux=True
+            ),
+        )
+
+        rc = run_magent(cfg, RunOpts())
+
+        assert rc == 0
+        assert [w.window_name for w in fp.launched_psmux] == ["proj"]
+        assert len(fp.attached_psmux) == 1
+
+    def test_only_the_closed_window_of_a_mixed_fleet_is_collected(
+        self, monkeypatch, tmp_path, fake_sleep
+    ):
+        open_dir = tmp_path / "alpha"
+        open_dir.mkdir()
+        closed_dir = tmp_path / "beta"
+        closed_dir.mkdir()
+        fp = FakePlatform(supports_psmux=True, windows={"magent:alpha": 555})
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+        cfg = MagentConfig(
+            projects=[
+                ProjectConfig(path=str(open_dir), tool="claude", title="alpha"),
+                ProjectConfig(path=str(closed_dir), tool="claude", title="beta"),
+            ],
+            settings=Settings(
+                tools={"claude": "claude --continue"}, default_tool="claude", psmux=True
+            ),
+        )
+
+        rc = run_magent(cfg, RunOpts(retile_all=True))
+
+        assert rc == 0
+        assert [w.window_name for w in fp.launched_psmux] == ["beta"]
+        assert [a[0] for a in fp.attached_psmux] == ["beta"]
+        # Both windows are still tiling targets -- retile_all places the open
+        # one too; only the duplicate SPAWN is suppressed.
+        assert (555, Rect(x=0, y=0, w=960, h=1080)) in fp.moved
+
+    def test_dispatch_skips_collection_when_running(self, tmp_path, fake_sleep):
+        fp = FakePlatform(supports_psmux=True)
+        proj = ProjectConfig(path=str(tmp_path), tool="claude", title="proj")
+        cfg = MagentConfig(
+            projects=[proj],
+            settings=Settings(tools={"claude": "claude --continue"}, psmux=True),
+        )
+        targets: list[_Target] = []
+        psmux_windows: list[PsmuxWindowOpts] = []
+        psmux_colors: dict[str, str | None] = {}
+
+        delta = _dispatch_cli_agent_project(
+            fp,
+            cfg,
+            RunOpts(),
+            proj,
+            "claude",
+            False,
+            None,
+            cfg.settings.tools,
+            True,
+            lambda key, mode: True,
+            targets,
+            psmux_windows,
+            psmux_colors,
+        )
+
+        assert delta == 0
+        assert psmux_windows == []
+        assert psmux_colors == {}
+        assert fp.launched_terminals == []
+        # The window is still a tiling target, flagged as already-open.
+        assert targets == [
+            _Target(name="proj", key="proj", mode="magent-name", is_new=False)
+        ]
+
+
+class TestTileOnly:
+    """`RunOpts.tile_only`: build every tiling target but launch nothing.
+
+    Menu option 2 and a bare `--retile-all` promise a re-tile; before this they
+    ran the whole launch phase, so a window the user had just closed came back
+    (terminal path) or was collected and attached (psmux path)."""
+
+    def test_no_terminal_launched(self, tmp_path, fake_sleep):
+        fp = FakePlatform()
+        proj = ProjectConfig(path=str(tmp_path), tool="claude", title="proj")
+        cfg = MagentConfig(
+            projects=[proj], settings=Settings(tools={"claude": "claude --continue"})
+        )
+        targets: list[_Target] = []
+
+        _dispatch_cli_agent_project(
+            fp,
+            cfg,
+            RunOpts(retile_all=True, tile_only=True),
+            proj,
+            "claude",
+            False,
+            None,
+            cfg.settings.tools,
+            False,
+            lambda key, mode: False,
+            targets,
+            [],
+            {},
+        )
+
+        assert fp.launched_terminals == []
+        # The target is still built, so _tile_targets can place it if it IS
+        # open; a closed window simply reports "not found".
+        assert targets == [
+            _Target(name="proj", key="proj", mode="magent-name", is_new=True)
+        ]
+
+    def test_no_psmux_collection(self, tmp_path, fake_sleep):
+        fp = FakePlatform(supports_psmux=True)
+        proj = ProjectConfig(path=str(tmp_path), tool="claude", title="proj")
+        cfg = MagentConfig(
+            projects=[proj],
+            settings=Settings(tools={"claude": "claude --continue"}, psmux=True),
+        )
+        targets: list[_Target] = []
+        psmux_windows: list[PsmuxWindowOpts] = []
+
+        _dispatch_cli_agent_project(
+            fp,
+            cfg,
+            RunOpts(retile_all=True, tile_only=True),
+            proj,
+            "claude",
+            False,
+            None,
+            cfg.settings.tools,
+            True,
+            lambda key, mode: False,
+            targets,
+            psmux_windows,
+            {},
+        )
+
+        assert psmux_windows == []
+        assert len(targets) == 1
+
+    def test_no_vscode_launched(self, tmp_path, fake_sleep):
+        fp = FakePlatform()
+        proj = ProjectConfig(path=str(tmp_path), tool="code")
+        cfg = MagentConfig(projects=[proj])
+        targets: list[_Target] = []
+
+        delta = _dispatch_ide_project(
+            fp,
+            cfg,
+            RunOpts(retile_all=True, tile_only=True),
+            proj,
+            "code",
+            False,
+            None,
+            lambda key, mode: False,
+            targets,
+        )
+
+        assert fp.launched_vscode == []
+        assert delta == 1  # bookkeeping unchanged; only the spawn is skipped
+        assert len(targets) == 1
+
+    def test_run_magent_tiles_open_windows_and_launches_nothing(
+        self, monkeypatch, tmp_path, fake_sleep
+    ):
+        open_dir = tmp_path / "alpha"
+        open_dir.mkdir()
+        closed_dir = tmp_path / "beta"
+        closed_dir.mkdir()
+        fp = FakePlatform(supports_psmux=True, windows={"magent:alpha": 555})
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+        cfg = MagentConfig(
+            projects=[
+                ProjectConfig(path=str(open_dir), tool="claude", title="alpha"),
+                ProjectConfig(path=str(closed_dir), tool="claude", title="beta"),
+            ],
+            settings=Settings(
+                tools={"claude": "claude --continue"}, default_tool="claude", psmux=True
+            ),
+        )
+
+        rc = run_magent(cfg, RunOpts(retile_all=True, tile_only=True))
+
+        assert rc == 0
+        assert fp.launched_terminals == []
+        assert fp.launched_vscode == []
+        assert fp.launched_psmux == []
+        assert fp.attached_psmux == []
+        # The open window still gets re-tiled; the closed one stays closed.
+        assert fp.moved == [(555, Rect(x=0, y=0, w=960, h=1080))]
+
+
 class TestBaseDirExpansion:
     """Characterization pin (P1-08), written before the _expand_base_dir
     extraction: a configured base_dir gets env vars expanded and forward

@@ -155,6 +155,11 @@ class RunOpts:
     dry_run: bool = False
     group: str | None = None
     config_path: str = ""
+    # Tile what is already open and launch nothing: the dispatchers still build
+    # the full target list (so retile_all can place every open window) but skip
+    # every spawn -- no IDE, no terminal, no psmux collection. A window the user
+    # closed must stay closed; it simply reports "not found" during tiling.
+    tile_only: bool = False
 
 
 @dataclass
@@ -398,7 +403,7 @@ def _dispatch_ide_project(
     )
     name = proj.title or key
     running = is_running(key, "contains")
-    if not running and not opts.dry_run:
+    if not running and not opts.dry_run and not opts.tile_only:
         vsc_dir = (
             proj.remote_path or proj.path
             if is_remote
@@ -509,7 +514,16 @@ def _dispatch_cli_agent_project(
             cmd = _wrap_happy(win_tool, cmd)
 
         proj_psmux = use_psmux and not is_remote
-        if proj_psmux and not opts.dry_run:
+        running = is_running(win_title, match_mode)
+        # Window-level dedupe, the same three-way rule the attach path uses:
+        # an already-OPEN window is never collected, because every collected
+        # window gets an `attach_psmux` -- which spawns a BRAND-NEW terminal
+        # (`wt -w new ... psmux attach`) with no dedupe of its own. Only
+        # `launch_psmux_session`'s `has-session` probe dedupes, and that
+        # dedupes sessions, not windows. Closed window + live session =>
+        # collected, create is skipped, attach reopens onto the live session;
+        # dead session => collected, created, attached.
+        if proj_psmux and not running and not opts.dry_run and not opts.tile_only:
             resolved_dir = _resolve_path(proj.path, base_dir)
             if resolved_dir:
                 wname = _psmux_session_name(win_title)
@@ -521,8 +535,7 @@ def _dispatch_cli_agent_project(
                     )
                 )
                 psmux_colors[wname] = proj.color
-        running = is_running(win_title, match_mode)
-        if not running and not opts.dry_run and not proj_psmux:
+        if not running and not opts.dry_run and not opts.tile_only and not proj_psmux:
             if is_remote:
                 resolved_dir = proj.remote_path or proj.path
                 plat.launch_terminal(
