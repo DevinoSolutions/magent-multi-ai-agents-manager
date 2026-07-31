@@ -5,6 +5,36 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.9.0] - 2026-07-31
+
+### Added
+
+- **`magent status` shows the psmux sessions your agents live in -- and
+  acts on them.** The status report now lists each live session with its
+  foreground app (or `idle` when the agent fell back to a shell) and its
+  agent state, read from the same store the session picker uses. From the
+  interactive menu you can attach this terminal to any listed session or
+  revive a stopped agent in place. `status --json` gains an additive
+  `psmux_sessions` key; the envelope shape and 0/1/3 exit codes are
+  unchanged. Probes fan out concurrently, so a large session table still
+  costs about one psmux round-trip.
+- **magent brands its own status bar.** Every magent psmux session now
+  sets its status-left to ` magent ` (with the width budget it needs), so
+  the branding is consistent per session and wins over whatever a personal
+  `~/.tmux.conf` set. `magent up` refreshes it on already-running
+  sessions, same as the F1/F2 hints.
+
+### Changed
+
+- **Pre-rename "md" leftovers renamed to magent.** The mobile upload page
+  is now "magent upload" end to end -- page title, logotype, iOS install
+  banner and Web Clip profile, the downloaded `.mobileconfig` filename,
+  and the PWA's cache/storage keys (the service worker cleans up the old
+  cache on upgrade; the install banner may reappear once on existing
+  mobile clients). Internal `md_*` helper names followed. Test-tier
+  gates (`MDTEST_*`), the CI `mdssh` alias, and the `MD001`-`MD005` lint
+  rule IDs are deliberately unchanged.
+
 ## [3.8.0] - 2026-07-30
 
 ### Added
@@ -360,6 +390,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.9.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.8.0...v3.9.0
 [3.8.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.7.0...v3.8.0
 [3.7.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.6.0...v3.7.0
 [3.6.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.5.0...v3.6.0
