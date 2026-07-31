@@ -174,6 +174,45 @@ def test_main_dry_run_dispatch(runner, fake_platform, tmp_config, tmp_path):
     assert fake_platform.dpi_aware_calls >= 1
 
 
+@pytest.fixture
+def captured_run_opts(monkeypatch):
+    """Capture the RunOpts main builds, without running the launch pipeline.
+    app.py imports run_magent in-body (heavy-subsystem policy), so patching the
+    launch module's attribute intercepts the real call site."""
+    seen = []
+
+    def _fake_run_magent(cfg, opts):
+        seen.append(opts)
+        return 0
+
+    monkeypatch.setattr("magent.launch.run_magent", _fake_run_magent)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("flags", "tile_only"),
+    [
+        # A bare --retile-all promises a re-tile, so it must not relaunch a
+        # window the user deliberately closed (menu option 2 takes this same
+        # path: retile_all from the menu dict, go always False there).
+        (["--retile-all"], True),
+        # Combined with --go the launch phase is explicitly asked for.
+        (["--go", "--retile-all"], False),
+        (["--go"], False),
+    ],
+    ids=["retile-all", "go-retile-all", "go"],
+)
+def test_tile_only_wiring(runner, tmp_config, captured_run_opts, flags, tile_only):
+    cfgpath = tmp_config({"projects": [{"path": "myapp"}]})
+
+    result = runner.invoke(main, ["--config", cfgpath, *flags])
+
+    assert result.exit_code == 0
+    assert len(captured_run_opts) == 1
+    assert captured_run_opts[0].tile_only is tile_only
+    assert captured_run_opts[0].retile_all is ("--retile-all" in flags)
+
+
 def test_up_json(runner, tmp_config, monkeypatch):
     monkeypatch.setattr(
         "magent.launch.psmux_status", lambda cfg, group=None: ([], [], [])
