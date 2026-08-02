@@ -326,7 +326,28 @@ def flash_message(
 
 # The hint line every magent session advertises in its psmux status bar.
 # Defined once here so the launch path and the `up` path can never drift.
-_STATUS_HINTS = " F1 picker  F2 code "
+# Each key name is its own badge (bold + accent, same `#[...]` idiom as
+# _STATUS_BRAND below) so "F1"/"F2" read as keys rather than as stray words, and
+# each label says what the key actually does: the old " F1 picker  F2 code " was
+# four bare tokens with nothing marking which half was the key. The two glyphs
+# are written as \N{...} escapes rather than pasted in, so which glyph is meant
+# survives any editor that mangles them: a LEFTWARDS ARROW for "leave -- back to
+# the picker", a PERSONAL COMPUTER for "open an editor". Both are ordinary
+# Unicode/emoji codepoints -- no Nerd-Font private-use range -- so they render in
+# Windows Terminal without a patched font.
+_STATUS_HINTS = (
+    "#[bold,fg=cyan] F1 #[default]\N{LEFTWARDS ARROW} picker   "
+    "#[bold,fg=cyan] F2 #[default]\N{PERSONAL COMPUTER} VS Code "
+)
+
+# ...and the width budget has to travel with it, exactly like the brand's below.
+# tmux truncates status-right at `status-right-length` (default 40, but a
+# personal conf may set it far tighter), so the now-wider hint can render
+# mid-label. Style directives don't count toward the limit; what's left --
+# " F1 ", the arrow, " picker", the gap, " F2 ", the laptop and " VS Code " --
+# is 30 columns, the laptop emoji counting 2. 36 carries that plus headroom for
+# a label tweak.
+_STATUS_HINTS_LEN = "36"
 
 # The product's own status-left brand, same plainness as the hints: one word,
 # one accent. magent *owns* this per session rather than inheriting whatever a
@@ -343,13 +364,15 @@ _STATUS_BRAND_LEN = "10"
 def decoration_argv(name: str, psmux: str) -> list[list[str]]:
     """The psmux commands that brand ``name`` and advertise its window hotkeys.
 
-    Four of them: magent *owns* F1 -> detach-client per session (the hint has to
+    Five of them: magent *owns* F1 -> detach-client per session (the hint has to
     be truthful on a machine with no personal ``bind -n F1`` in ~/.tmux.conf,
     and owning the binding keeps the existing "back to the picker" semantics
-    rather than changing them), the status-right carries the hint text, and the
-    status-left carries the product brand plus the width budget it needs. All
-    are ``-L <name>``-scoped, so they land on that session's own server and
-    override whatever its tmux.conf set at start-up.
+    rather than changing them), the status-right carries the hint text plus the
+    width budget it needs, and the status-left carries the product brand plus
+    the width budget *it* needs. Each half sets its text and its length together
+    or neither: a personal conf with a tighter ``status-*-length`` would truncate
+    the other half mid-label. All are ``-L <name>``-scoped, so they land on that
+    session's own server and override whatever its tmux.conf set at start-up.
 
     Split out from ``decorate_session`` so the launch path can fan the same
     argvs out as raw Popens while callers with one session run them inline.
@@ -357,6 +380,7 @@ def decoration_argv(name: str, psmux: str) -> list[list[str]]:
     return [
         [psmux, "-L", name, "bind", "-n", "F1", "detach-client"],
         [psmux, "-L", name, "set", "-g", "status-right", _STATUS_HINTS],
+        [psmux, "-L", name, "set", "-g", "status-right-length", _STATUS_HINTS_LEN],
         [psmux, "-L", name, "set", "-g", "status-left", _STATUS_BRAND],
         [psmux, "-L", name, "set", "-g", "status-left-length", _STATUS_BRAND_LEN],
     ]

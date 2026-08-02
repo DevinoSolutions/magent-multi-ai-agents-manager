@@ -221,6 +221,14 @@ class TestWindowsLaunchTerminal:
         assert isinstance(excinfo.value.__cause__, FileNotFoundError)
 
 
+# The status-right hint, restated rather than imported: the point of the pin is
+# that a restyle in psmux.py has to be a deliberate edit here too.
+_EXPECTED_HINT = (
+    "#[bold,fg=cyan] F1 #[default]\N{LEFTWARDS ARROW} picker   "
+    "#[bold,fg=cyan] F2 #[default]\N{PERSONAL COMPUTER} VS Code "
+)
+
+
 @pytest.mark.skipif(
     sys.platform != "win32", reason="WindowsPlatform binds windll at import"
 )
@@ -274,7 +282,17 @@ class TestWindowsPsmuxDecoration:
             "set",
             "-g",
             "status-right",
-            " F1 picker  F2 code ",
+            _EXPECTED_HINT,
+        ] in calls
+        # The hint's width budget travels with the hint, same as the brand's.
+        assert [
+            "psmux",
+            "-L",
+            "api",
+            "set",
+            "-g",
+            "status-right-length",
+            "36",
         ] in calls
 
     def test_created_session_is_branded(self, monkeypatch):

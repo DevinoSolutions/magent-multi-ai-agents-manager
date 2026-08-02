@@ -138,7 +138,7 @@ Enable [psmux](https://github.com/psmux/psmux) (native Windows terminal multiple
 
 Requires psmux installed (`choco install psmux` or download from GitHub). When enabled, magent creates a detached psmux session per project and opens Windows Terminal attached to it. From any SSH client: `psmux attach -t project-name`.
 
-Each magent session brands its psmux status bar — `magent` on the left, its window hotkeys on the right (`F1 picker  F2 code`):
+Each magent session brands its psmux status bar — `magent` on the left, its window hotkeys on the right (`F1 ← picker   F2 💻 VS Code`, each key name badged in bold cyan):
 
 | Key | In a `magent:` window |
 | --- | --- |
