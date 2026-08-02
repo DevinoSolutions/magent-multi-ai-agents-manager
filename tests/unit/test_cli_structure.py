@@ -77,7 +77,7 @@ HELP_SNAPSHOTS = {
     ): "Usage: main status [OPTIONS]\n\n  Show which psmux sessions and services are currently running.\n\nOptions:\n  --json  Print daemon status as JSON\n  --help  Show this message and exit.\n",
     (
         "down",
-    ): "Usage: main down [OPTIONS] [NAMES]...\n\n  Shut down running psmux sessions (and optionally the upload server).\n\nOptions:\n  -g, --group TEXT  Only sessions in this group\n  --all             Stop every session, the upload server, and the Alt+V\n                    listener\n  --server          Also stop the upload server\n  --help            Show this message and exit.\n",
+    ): "Usage: main down [OPTIONS] [NAMES]...\n\n  Shut down running psmux sessions (and optionally the upload server).\n\nOptions:\n  -g, --group TEXT  Only sessions in this group\n  --all             Stop every session, the upload server, and the Alt+V\n                    listener\n  --server          Also stop the upload server\n  --host TEXT       Stop the sessions on this SSH target instead of locally\n                    (default: the host you last attached to, when nothing\n                    matches on this machine)\n  --help            Show this message and exit.\n",
     (
         "hooks",
     ): "Usage: main hooks [OPTIONS] COMMAND [ARGS]...\n\n  Wire agent lifecycle hooks that feed the session-state store.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  install  Add magent's state hook to Claude Code so session states stay...\n  status   Show which lifecycle hooks are wired and how fresh the state...\n",

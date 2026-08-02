@@ -201,7 +201,7 @@ Or skip the menu with flags:
 | `magent watch` | Live table of every agent session, most-urgent first; press a row number to focus that window. |
 | `magent attention [-d] [--stop]` | Attention daemon: badges window titles with agent state, flashes the taskbar on needs-input/error, optional toast/ntfy push (`settings.attention`). Badges/flash/toast are Windows-only; ntfy push is cross-platform — see [Platform support](#platform-support). |
 | `magent status [--json]` | Session + daemon health (incl. an `agents` state list in `--json`). Exit codes: 0 healthy, 1 config error, 3 degraded. |
-| `magent down [--all] [--server]` | Stop sessions; `--all`/`--server` also stop the upload server (and listener). |
+| `magent down [--all] [--server] [--host <host>]` | Stop sessions; `--all`/`--server` also stop the upload server (and listener). From an attach client there are no local sessions, so the shutdown is forwarded over SSH to the host you last attached to (or to `--host`), closing the local attach windows first. |
 | `magent serve [--host <addr>]` | Run the mobile upload server (see below). |
 | `magent mobile` | Phone URL + QR code for installing the uploader as a home-screen app. |
 | `magent termius` | Generate an SSH config entry that opens the session picker. |
