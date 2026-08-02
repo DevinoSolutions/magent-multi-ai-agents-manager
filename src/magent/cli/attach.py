@@ -384,6 +384,31 @@ def _already_open(names: list[str]) -> set[str]:
     return {name for name in names if window_open(snap, name)}
 
 
+def _open_attach_sids(snap: dict[str, object]) -> list[str]:
+    """Every session name that currently has a local magent: window."""
+    return sorted({p[0] for t in snap if (p := parse_title(t)) is not None})
+
+
+def _partition_open_sids(up_sids: Sequence[str]) -> tuple[set[str], set[str]]:
+    """One window snapshot, split into ``(windows for up_sids, everything else)``.
+
+    The second half is what v3.10's corpse machinery never looked at. Its whole
+    world was ``_already_open(up_sids)``, so a magent: window whose SESSION is
+    also gone -- the host rebooted, the session was killed, or the user answered
+    ``n`` / picked one group at the bring-up prompt -- was never scanned, never
+    closed and never flagged: a terminated pane sitting in the grid forever.
+
+    Empty names are dropped from both halves: a degenerate bare ``magent:``
+    title is nobody's session and must not become a close target.
+    """
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    snap = get_platform().snapshot_windows()
+    open_all = {sid for sid in _open_attach_sids(snap) if sid}
+    wanted = {sid for sid in up_sids if sid}
+    return open_all & wanted, open_all - wanted
+
+
 def _echo_already_open(title: str) -> None:
     """The spawn loops' counterpart to their `o <title>` line."""
     click.echo(f"  {style('=', fg='cyan')} {title} {style('already open', dim=True)}")
@@ -402,14 +427,24 @@ _CLIENT_PROCESS_NAMES = ["ssh.exe", "psmux.exe"]
 def _attach_markers(sid: str) -> tuple[str, ...]:
     """Every spelling of "this process is attached to ``sid``" magent can spawn.
 
-    The bare form is what both spawn sites build today; the quoted variants
-    cover a session id that a shell (or a future call site) chose to quote, so
-    a quoting change cannot silently turn every live window into a corpse.
+    The binary NAME is deliberately not part of the marker. The remote path
+    spawns a literal ``psmux -L <sid> attach`` string inside ssh, but the local
+    launch path (platform/windows.py::attach_psmux) execs the *resolved* binary
+    -- an absolute path to psmux.exe -- so a ``psmux -L`` prefix would miss it
+    and score every locally-launched window a corpse. That never mattered while
+    corpse detection only ever saw the remote host's up-sessions; it matters now
+    that ``_sweep_dead_windows`` looks at every magent: window on the machine.
+    ``_CLIENT_PROCESS_NAMES`` already narrows the scan to ssh/psmux processes,
+    so ``-L <sid> attach`` is signal enough on its own.
+
+    The quoted variants cover a session id that a shell (or a future call site)
+    chose to quote, so a quoting change cannot silently turn every live window
+    into a corpse.
     """
     return (
-        f"psmux -L {sid} attach",
-        f'psmux -L "{sid}" attach',
-        f"psmux -L '{sid}' attach",
+        f"-L {sid} attach",
+        f'-L "{sid}" attach',
+        f"-L '{sid}' attach",
     )
 
 
@@ -491,6 +526,30 @@ def _dead_sids(open_sids: set[str]) -> set[str]:
     return _corpses(open_sids, cmdlines)
 
 
+# The two fates a dead magent: window can meet, as the user reads them.
+# A corpse whose session is still up gets reopened by the spawn loop; one whose
+# session is gone is closed for good, because there is nothing to attach to.
+_NOTE_REOPEN = "dead window closed -- reopening"
+_NOTE_STALE = "dead window closed (session is not up)"
+
+
+def _close_and_echo(
+    plat: Platform, snap: dict[str, object], sids: Sequence[str], note: str
+) -> list[str]:
+    """Close each window and print one `~ magent:<sid> <note>` line per success.
+
+    Shared by the two close sites so the corpse-repair and stale-sweep paths
+    cannot drift in how they resolve, close or report a window -- only in what
+    they say about it.
+    """
+    closed = _close_windows(plat, snap, sids)
+    for sid in closed:
+        click.echo(
+            f"  {style('~', fg='yellow')} {make_title(sid)} {style(note, dim=True)}"
+        )
+    return closed
+
+
 def _repair_corpses(open_sids: set[str]) -> set[str]:
     """Close every open magent: window whose attach client is dead.
 
@@ -503,6 +562,10 @@ def _repair_corpses(open_sids: set[str]) -> set[str]:
     changes, ``_already_open`` counted that corpse as a live window and every
     later `magent attach` skipped the session forever.
 
+    Scoped to sessions the caller knows are UP -- the post-tiling verification
+    pass, which only ever asks about the windows it just spawned. The start-of
+    attach sweep is ``_sweep_dead_windows``, which covers the other kind too.
+
     Capability-gated on both halves (scan + close) via ``_dead_sids``, so
     macOS/Linux clients take the ABC defaults and simply keep today's
     title-only dedupe.
@@ -512,25 +575,74 @@ def _repair_corpses(open_sids: set[str]) -> set[str]:
     dead = _dead_sids(open_sids)
     if not dead:
         return set()
-    log = get_logger("launch")
     plat = get_platform()
-    closed = _close_windows(plat, plat.snapshot_windows(), sorted(dead))
-    for sid in closed:
-        click.echo(
-            f"  {style('~', fg='yellow')} {make_title(sid)}"
-            f" {style('dead window closed -- reopening', dim=True)}"
-        )
-    log.info("attach: closed %d dead window(s): %s", len(closed), ", ".join(closed))
+    closed = _close_and_echo(plat, plat.snapshot_windows(), sorted(dead), _NOTE_REOPEN)
+    get_logger("launch").info(
+        "attach: closed %d dead window(s): %s", len(closed), ", ".join(closed)
+    )
     return set(closed)
 
 
+def _sweep_dead_windows(up_sids: Sequence[str]) -> set[str]:
+    """Close EVERY dead local magent: window; return the up-session ones left live.
+
+    Two kinds of corpse, one pass:
+
+    * a window for a session that IS up -- ``_repair_corpses``' case. Closed,
+      and dropped from the returned set so the spawn loop reopens it.
+    * a window for a session that is NOT in ``up_sids``. Closed and left closed:
+      the session died with a previous attach (host rebooted, session killed, or
+      the user answered ``n`` / picked one group at the bring-up prompt), so
+      there is nothing on the host to attach it back to. v3.10 never looked
+      here at all -- it built its candidate set from the up list -- which is why
+      a terminated terminal survived every subsequent `magent attach`.
+
+    A LIVE window outside ``up_sids`` is left strictly alone. Under ``-g
+    <group>`` the host's up/down lists are group-filtered, so another group's
+    perfectly healthy windows are "not up" from this run's point of view;
+    liveness, never list membership, is what decides. That is also why the
+    stale half runs the SAME ``_dead_sids`` check as the up half rather than
+    anything looser.
+
+    Scan economy: one window snapshot to partition, one ``_dead_sids`` process
+    scan for both halves, one snapshot to close from (fresh, because the scan
+    sits between). Capability-gated through ``_dead_sids``: a platform without
+    process-scan + window-close closes nothing and prints nothing, exactly as
+    before.
+    """
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    open_up, open_stale = _partition_open_sids(up_sids)
+    dead = _dead_sids(open_up | open_stale)
+    if not dead:
+        return open_up
+    plat = get_platform()
+    snap = plat.snapshot_windows()
+    log = get_logger("launch")
+    reopened = _close_and_echo(plat, snap, sorted(dead & open_up), _NOTE_REOPEN)
+    stale = _close_and_echo(plat, snap, sorted(dead & open_stale), _NOTE_STALE)
+    if reopened:
+        log.info(
+            "attach: closed %d dead window(s): %s", len(reopened), ", ".join(reopened)
+        )
+    if stale:
+        log.info(
+            "attach: closed %d dead window(s) with no live session: %s",
+            len(stale),
+            ", ".join(stale),
+        )
+    return open_up - set(reopened)
+
+
 def _annotate_dead_windows(up: Sequence[dict[str, object]]) -> None:
-    """Say, right under the session overview, which "ready" sessions have a
-    DEAD window on THIS machine.
+    """Say, right under the session overview, which local magent: windows are
+    DEAD -- both the ones a "ready" host session is hiding and the ones whose
+    session is gone entirely.
 
     The overview is pure host truth: a psmux session that exists on the host
     renders as a green ``N/N ready`` row even when the pane here is a corpse
-    whose SSH dropped. On a 40-window attach that is exactly the misleading
+    whose SSH dropped, and a corpse whose session is NOT up does not appear in
+    the overview at all. On a 40-window attach that is exactly the misleading
     case -- the user reads "41 up" and sees several panes stuck on
     `[process exited with code 255]`.
 
@@ -541,18 +653,31 @@ def _annotate_dead_windows(up: Sequence[dict[str, object]]) -> None:
     Read-only and capability-gated through ``_dead_sids``: nothing is closed
     here. The real repair happens in the spawn phase off its own FRESH scan,
     because a bring-up can run for minutes and this snapshot would be stale by
-    the time it mattered.
+    the time it mattered. At most two lines, and only for the halves that are
+    actually non-empty.
     """
     sids = [_as_str(s.get("session")) or _as_str(s.get("name")) for s in up]
-    dead = _dead_sids(_already_open(sids))
+    open_up, open_stale = _partition_open_sids(sids)
+    # One scan for both halves; the partition happens on the RESULT.
+    dead = _dead_sids(open_up | open_stale)
     if not dead:
         return
-    click.echo(
-        f"  {style('!', fg='yellow')} {style(str(len(dead)), fg='yellow', bold=True)}"
-        f" {style('window(s) here are dead (ssh connection dropped)', fg='yellow')}"
-        f" {style('-- they will be closed and reopened:', fg='yellow')}"
-        f" {style(', '.join(sorted(dead)), fg='yellow', bold=True)}"
-    )
+    reopen = sorted(dead & open_up)
+    stale = sorted(dead & open_stale)
+    if reopen:
+        click.echo(
+            f"  {style('!', fg='yellow')} {style(str(len(reopen)), fg='yellow', bold=True)}"
+            f" {style('window(s) here are dead (ssh connection dropped)', fg='yellow')}"
+            f" {style('-- they will be closed and reopened:', fg='yellow')}"
+            f" {style(', '.join(reopen), fg='yellow', bold=True)}"
+        )
+    if stale:
+        click.echo(
+            f"  {style('!', fg='yellow')} {style(str(len(stale)), fg='yellow', bold=True)}"
+            f" {style('dead window(s) from a previous session (session down)', fg='yellow')}"
+            f" {style('-- will be closed:', fg='yellow')}"
+            f" {style(', '.join(stale), fg='yellow', bold=True)}"
+        )
 
 
 def _spawn_windows(
@@ -682,11 +807,6 @@ def _verify_and_respawn(target: str, sids: Sequence[str]) -> None:
         f" {style('Re-run', fg='yellow')} {style('magent attach', fg='yellow', bold=True)}"
         f" {style('once it settles.', fg='yellow')}"
     )
-
-
-def _open_attach_sids(snap: dict[str, object]) -> list[str]:
-    """Every session name that currently has a local magent: window."""
-    return sorted({p[0] for t in snap if (p := parse_title(t)) is not None})
 
 
 def _close_attach_windows(names: Sequence[str]) -> int:
@@ -959,11 +1079,13 @@ def _attach_flow(
     # The psmux socket id (P3-01): drives the window title, the wire the
     # Alt+V hotkey posts back, and the host-side `magent sessions <id>`.
     sids = [_as_str(s.get("session")) or _as_str(s.get("name")) for s in up]
-    open_already = _already_open(sids)
     # An open window is not proof of a live attach: a dead SSH client leaves the
     # pane (and its title) behind, and title-only dedupe then skipped that
-    # session forever. Close those corpses so the spawn loop below reopens them.
-    open_already -= _repair_corpses(open_already)
+    # session forever. Sweep every magent: window here, not just the up ones --
+    # a corpse whose session ALSO died is the one case no reopen can heal, and
+    # the one the previous machinery could not even see. Corpses of live
+    # sessions come back out of the spawn loop below; the rest just go away.
+    open_already = _sweep_dead_windows(sids)
 
     titles = _spawn_windows(target, sids, open_already, _SPAWN_STAGGER_S)
 
