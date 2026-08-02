@@ -327,10 +327,15 @@ def _generate_docs() -> str:
     w(
         "| `magent status` | Show which psmux sessions and the upload server are running. |"
     )
-    w("| `magent down` | Shut down all running psmux sessions. |")
+    w(
+        "| `magent down` | Shut down all running psmux sessions (falls back to the host you last attached to when none are local). |"
+    )
     w("| `magent down -g <group>` | Shut down only one group's sessions. |")
     w("| `magent down <name> [<name>...]` | Shut down specific sessions by name. |")
     w("| `magent down --all` | Stop every session and the upload server. |")
+    w(
+        "| `magent down --host <user@host>` | Run the same shutdown on that machine over SSH, closing the local attach windows first. |"
+    )
     w("| `magent serve` | Start upload server for mobile image transfer. |")
     w("| `magent serve -p 9090` | Use a custom port (default 8033). |")
     w("| `magent hotkey` | Listen for Alt+V to upload clipboard images (standalone). |")

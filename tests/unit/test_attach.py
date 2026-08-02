@@ -1070,3 +1070,319 @@ class TestQueryStatusRevives:
         assert seen[0] == seen[1]
         assert "--revive" in seen[0]
         assert "|| magent up --json" in seen[0]
+
+
+class TestCorpseDecision:
+    """The pure half of dead-window repair.
+
+    A window is a corpse when it is open but NO live local process is running
+    its attach command. Keeping the decision pure means the risky half (closing
+    someone's window) is pinned without a single real process, and the
+    conservative bias -- when in doubt, DON'T close -- is testable directly.
+    """
+
+    def _corpses(self, open_sids, cmdlines):
+        from magent.cli import attach as attach_mod
+
+        return attach_mod._corpses(set(open_sids), list(cmdlines))
+
+    def test_live_ssh_client_is_not_a_corpse(self):
+        # What _attach_flow spawns: wt -- ssh -t user@host "psmux -L api attach || ..."
+        cmd = "ssh -t user@host psmux -L api attach || magent sessions api"
+        assert self._corpses(["api"], [cmd]) == set()
+
+    def test_live_local_psmux_client_is_not_a_corpse(self):
+        # What the launch path spawns (platform/windows.py::attach_psmux).
+        assert self._corpses(["api"], ["psmux -L api attach"]) == set()
+
+    def test_quoted_session_id_still_counts_as_live(self):
+        assert self._corpses(["api"], ['psmux -L "api" attach']) == set()
+        assert self._corpses(["api"], ["psmux -L 'api' attach"]) == set()
+
+    def test_no_client_at_all_is_a_corpse(self):
+        # The reported bug: wt keeps the pane (and its magent: title) after
+        # `client_loop: send disconnect` / `[process exited with code 255]`.
+        assert self._corpses(["api"], ["ssh -t user@host echo hi"]) == {"api"}
+
+    def test_empty_process_list_makes_every_open_window_a_corpse(self):
+        assert self._corpses(["api", "web"], []) == {"api", "web"}
+
+    def test_another_sessions_client_does_not_rescue_this_one(self):
+        assert self._corpses(["api", "web"], ["psmux -L web attach"]) == {"api"}
+
+    def test_a_longer_session_name_is_not_a_prefix_match(self):
+        # `psmux -L api2 attach` must not read as a live client for "api":
+        # the marker carries the trailing " attach", so the ids can't blur.
+        assert self._corpses(["api"], ["psmux -L api2 attach"]) == {"api"}
+
+    def test_matching_is_case_insensitive(self):
+        assert self._corpses(["API"], ["PSMUX -L api ATTACH"]) == set()
+
+
+class TestRepairCorpses:
+    """The effectful half: scan, decide, close -- every step capability-gated,
+    and a scan that could not run leaves every window alone."""
+
+    def _repair(self, monkeypatch, open_sids, windows, **kwargs):
+        from magent.cli import attach as attach_mod
+
+        fp = _fake_platform(monkeypatch, windows, **kwargs)
+        freed = attach_mod._repair_corpses(set(open_sids))
+        return fp, freed
+
+    def test_dead_window_is_closed_and_freed(self, monkeypatch):
+        fp, freed = self._repair(
+            monkeypatch,
+            ["api"],
+            {"magent:api": 7},
+            supports_close=True,
+            supports_scan=True,
+            cmdlines=["ssh -t user@host echo hi"],
+        )
+        assert freed == {"api"}
+        assert fp.closed == [7]
+        # Only ssh/psmux clients are worth scanning for.
+        assert fp.scanned == [["ssh.exe", "psmux.exe"]]
+
+    def test_live_window_is_left_alone(self, monkeypatch):
+        fp, freed = self._repair(
+            monkeypatch,
+            ["api"],
+            {"magent:api": 7},
+            supports_close=True,
+            supports_scan=True,
+            cmdlines=["ssh -t user@host psmux -L api attach || magent sessions api"],
+        )
+        assert freed == set()
+        assert fp.closed == []
+
+    def test_badged_title_resolves_to_the_same_window(self, monkeypatch):
+        # titles.make_title("api", "needs-input") -> "magent:[!] api"
+        fp, freed = self._repair(
+            monkeypatch,
+            ["api"],
+            {"magent:[!] api": 7},
+            supports_close=True,
+            supports_scan=True,
+            cmdlines=[],
+        )
+        assert freed == {"api"}
+        assert fp.closed == [7]
+
+    def test_failed_scan_closes_nothing(self, monkeypatch):
+        # "We could not look" is not "nothing is running" -- acting on a failed
+        # scan would close every LIVE window at once.
+        fp, freed = self._repair(
+            monkeypatch,
+            ["api", "web"],
+            {"magent:api": 7, "magent:web": 8},
+            supports_close=True,
+            supports_scan=True,
+            scan_error=OSError("powershell exploded"),
+        )
+        assert freed == set()
+        assert fp.closed == []
+
+    def test_platform_without_the_capabilities_skips_detection(self, monkeypatch):
+        # macOS/Linux clients take the ABC defaults: no scan, no close, and
+        # today's title-only dedupe is preserved untouched.
+        fp, freed = self._repair(monkeypatch, ["api"], {"magent:api": 7})
+        assert freed == set()
+        assert fp.closed == []
+        assert fp.scanned == []
+
+    def test_no_open_windows_never_scans(self, monkeypatch):
+        fp, freed = self._repair(
+            monkeypatch, [], {}, supports_close=True, supports_scan=True
+        )
+        assert freed == set()
+        assert fp.scanned == []
+
+    def test_a_handle_that_dies_mid_close_is_not_fatal(self, monkeypatch):
+        _fp, freed = self._repair(
+            monkeypatch,
+            ["api"],
+            {"magent:api": 7},
+            supports_close=True,
+            supports_scan=True,
+            cmdlines=[],
+            close_error=OSError("invalid window handle"),
+        )
+        assert freed == set()
+
+
+class TestAttachReopensCorpseWindows:
+    """End-to-end through _attach_flow: the corpse is closed AND respawned,
+    which is the whole point -- title-only dedupe used to skip it forever."""
+
+    def _run_flow(self, monkeypatch, sessions, windows, cmdlines):
+        from magent.cli import attach as attach_mod
+
+        status = {
+            "up": [{"name": s, "session": s} for s in sessions],
+            "down": [],
+            "projects": [{"name": s} for s in sessions],
+        }
+        monkeypatch.setattr(
+            attach_mod, "_query_status", lambda *a, **k: (status, 0, "")
+        )
+        monkeypatch.setattr(attach_mod, "_ssh_capture", lambda *a, **k: (0, "", ""))
+        spawns: list[list[str]] = []
+
+        def fake_popen(args, **k):
+            if args and args[0] == "wt":
+                spawns.append(args)
+            return _FakeProc()
+
+        tiled: list[list[str]] = []
+        monkeypatch.setattr(attach_mod.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(attach_mod, "_tile_titles", tiled.append)
+        monkeypatch.setattr(attach_mod, "_maybe_start_hotkey", lambda url: None)
+        monkeypatch.setattr(attach_mod.time, "sleep", lambda s: None)
+        monkeypatch.setattr(attach_mod, "_remember_last_host", lambda target: None)
+        fp = _fake_platform(
+            monkeypatch,
+            windows,
+            supports_close=True,
+            supports_scan=True,
+            cmdlines=cmdlines,
+        )
+        attach_mod._attach_flow("user@host", no_mux=False, group=None, yes=False)
+        return fp, spawns, tiled[0]
+
+    def test_dead_window_is_closed_then_respawned(self, monkeypatch):
+        fp, spawns, titles = self._run_flow(monkeypatch, ["api"], {"magent:api": 7}, [])
+        assert fp.closed == [7]
+        assert len(spawns) == 1
+        assert spawns[0][-1] == "psmux -L api attach || magent sessions api"
+        assert titles == ["magent:api"]
+
+    def test_live_window_is_still_skipped(self, monkeypatch):
+        fp, spawns, titles = self._run_flow(
+            monkeypatch,
+            ["api"],
+            {"magent:api": 7},
+            ["ssh -t user@host psmux -L api attach || magent sessions api"],
+        )
+        assert fp.closed == []
+        assert spawns == []
+        assert titles == ["magent:api"]
+
+    def test_only_the_corpse_of_a_mixed_pair_is_reopened(self, monkeypatch):
+        fp, spawns, titles = self._run_flow(
+            monkeypatch,
+            ["api", "web"],
+            {"magent:api": 7, "magent:web": 8},
+            ["ssh -t user@host psmux -L web attach || magent sessions web"],
+        )
+        assert fp.closed == [7]
+        assert len(spawns) == 1
+        assert spawns[0][-1] == "psmux -L api attach || magent sessions api"
+        assert titles == ["magent:api", "magent:web"]
+
+
+class TestCloseAttachWindows:
+    """`down --host` closes the local windows before the remote kill strands
+    them. An empty selection means every magent: window."""
+
+    def test_named_subset_closes_only_those_windows(self, monkeypatch):
+        from magent.cli import attach as attach_mod
+
+        fp = _fake_platform(
+            monkeypatch,
+            {"magent:api": 1, "magent:web": 2, "magent:db": 3},
+            supports_close=True,
+        )
+        assert attach_mod._close_attach_windows(["api", "db"]) == 2
+        assert fp.closed == [1, 3]
+
+    def test_empty_selection_closes_every_attach_window(self, monkeypatch):
+        from magent.cli import attach as attach_mod
+
+        fp = _fake_platform(
+            monkeypatch,
+            {"magent:api": 1, "magent:[!] web": 2, "Some Other App": 9},
+            supports_close=True,
+        )
+        assert attach_mod._close_attach_windows(()) == 2
+        # The non-magent window is never touched; the badged one still matches.
+        assert sorted(fp.closed) == [1, 2]
+
+    def test_platform_without_close_support_is_a_no_op(self, monkeypatch):
+        from magent.cli import attach as attach_mod
+
+        fp = _fake_platform(monkeypatch, {"magent:api": 1})
+        assert attach_mod._close_attach_windows(["api"]) == 0
+        assert fp.closed == []
+
+
+class TestRemoteDownCommand:
+    """The host-side line must carry the user's selection VERBATIM -- a `down`
+    that quietly widened or narrowed its scope over SSH would be worse than the
+    no-op it replaces."""
+
+    def _cmd(self, names=(), group=None, do_all=False, stop_srv=False):
+        from magent.cli import attach as attach_mod
+
+        return attach_mod._remote_down_command(names, group, do_all, stop_srv)
+
+    def test_bare(self):
+        assert self._cmd() == "magent down"
+
+    def test_all(self):
+        assert self._cmd(do_all=True) == "magent down --all"
+
+    def test_server(self):
+        assert self._cmd(stop_srv=True) == "magent down --server"
+
+    def test_group_is_quoted_like_every_other_remote_command(self):
+        assert self._cmd(group="core one") == 'magent down -g "core one"'
+
+    def test_names_are_forwarded_in_order(self):
+        assert self._cmd(names=("api", "web")) == 'magent down "api" "web"'
+
+    def test_everything_at_once(self):
+        assert (
+            self._cmd(names=("api",), group="core", do_all=True, stop_srv=True)
+            == 'magent down "api" -g "core" --all --server'
+        )
+
+
+class TestRemoteDown:
+    """SSH failure is a loud, non-zero result -- never a silent no-op."""
+
+    def _run(self, monkeypatch, rc, out="", err="", names=()):
+        from magent.cli import attach as attach_mod
+
+        order: list[str] = []
+
+        def fake_close(sids):
+            order.append(f"close:{list(sids)}")
+            return 1
+
+        def fake_ssh(target, remote_cmd, timeout=30, stdin_text=None):
+            order.append(f"ssh:{remote_cmd}")
+            return rc, out, err
+
+        monkeypatch.setattr(attach_mod, "_close_attach_windows", fake_close)
+        monkeypatch.setattr(attach_mod, "_ssh_capture", fake_ssh)
+        code = attach_mod._remote_down("u@h", names, None, True, False)
+        return code, order
+
+    def test_success_returns_zero(self, monkeypatch):
+        code, _ = self._run(monkeypatch, 0, out="  + Stopped 3 session(s)")
+        assert code == 0
+
+    def test_windows_are_closed_before_the_remote_kill(self, monkeypatch):
+        # Otherwise the kill strands one corpse window per session -- bug 1,
+        # recreated at scale.
+        _code, order = self._run(monkeypatch, 0, names=("api",))
+        assert order == ["close:['api']", 'ssh:magent down "api" --all']
+
+    def test_ssh_failure_is_surfaced_and_propagated(self, monkeypatch):
+        code, _ = self._run(monkeypatch, 255, err="ssh: connect to host: timed out")
+        assert code == 255
+
+    def test_timeout_is_propagated(self, monkeypatch):
+        code, _ = self._run(monkeypatch, 124, err="ssh timed out")
+        assert code == 124

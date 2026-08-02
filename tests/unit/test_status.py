@@ -649,3 +649,180 @@ class TestAgentsRollup:
 
         assert result.exit_code == 0
         assert "need you" not in result.output
+
+
+class TestDownActsOnTheAttachHost:
+    """`magent down` on an attach CLIENT used to be a near no-op: there are no
+    local psmux sessions on a laptop, so it stopped the local Alt+V listener and
+    nothing else -- while `attach`'s own goodbye line advertises that exact
+    command for stopping the sessions it just opened.
+
+    Now: an explicit --host always wins, and with nothing matching locally the
+    shutdown auto-targets the remembered attach host. On the HOST itself local
+    sessions match, so the auto path never fires there.
+    """
+
+    def _run(
+        self,
+        runner,
+        tmp_config,
+        monkeypatch,
+        argv,
+        *,
+        up=(),
+        last_host=None,
+        rc=0,
+        out="",
+        err="",
+    ):
+        from magent.cli import attach as attach_mod
+
+        cfgpath = tmp_config({"projects": [{"path": "myapp"}]})
+        rows = [{"name": n, "session": n} for n in up]
+        monkeypatch.setattr(
+            "magent.launch.psmux_status", lambda cfg, group=None: (rows, [], [])
+        )
+        killed: list[list[str]] = []
+        monkeypatch.setattr("magent.launch.kill_psmux", killed.append)
+        monkeypatch.setattr(attach_mod, "_read_last_host", lambda: last_host)
+        closed: list[list[str]] = []
+        monkeypatch.setattr(
+            attach_mod,
+            "_close_attach_windows",
+            lambda names: (closed.append(list(names)), len(list(names)))[1],
+        )
+        sent: list[tuple[str, str]] = []
+
+        def fake_ssh(target, remote_cmd, timeout=30, stdin_text=None):
+            sent.append((target, remote_cmd))
+            return rc, out, err
+
+        monkeypatch.setattr(attach_mod, "_ssh_capture", fake_ssh)
+        # The local daemon half is unchanged by this feature; keep it inert so
+        # no test touches a real server/listener/daemon.
+        monkeypatch.setattr("magent.upload_server.stop_server", lambda port: False)
+        monkeypatch.setattr("magent.cli.attention_cmd.stop_daemon", lambda: False)
+        if sys.platform == "win32":
+            monkeypatch.setattr("magent.hotkey.stop_listener", lambda: False)
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "down", *argv])
+        return result, sent, killed, closed
+
+    def test_explicit_host_wins_even_with_live_local_sessions(
+        self, runner, tmp_config, monkeypatch
+    ):
+        result, sent, killed, _ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--host", "user@box", "--all"],
+            up=("api",),
+        )
+        assert result.exit_code == 0
+        assert sent == [("user@box", "magent down --all")]
+        assert killed == []  # nothing local was stopped
+
+    def test_auto_targets_the_remembered_host_when_nothing_matches_locally(
+        self, runner, tmp_config, monkeypatch
+    ):
+        result, sent, killed, _ = self._run(
+            runner, tmp_config, monkeypatch, ["--all"], up=(), last_host="me@host"
+        )
+        assert result.exit_code == 0
+        assert sent == [("me@host", "magent down --all")]
+        assert killed == []
+
+    def test_live_local_sessions_keep_the_shutdown_local(
+        self, runner, tmp_config, monkeypatch
+    ):
+        # This is the HOST case: sessions match here, so a remembered attach
+        # host must never hijack the shutdown.
+        result, sent, killed, _ = self._run(
+            runner, tmp_config, monkeypatch, [], up=("api",), last_host="me@host"
+        )
+        assert result.exit_code == 0
+        assert sent == []
+        assert killed == [["api"]]
+
+    def test_no_local_sessions_and_no_remembered_host_stays_local(
+        self, runner, tmp_config, monkeypatch
+    ):
+        result, sent, killed, _ = self._run(runner, tmp_config, monkeypatch, [])
+        assert result.exit_code == 0
+        assert sent == []
+        assert killed == []
+        assert "No matching running sessions." in result.output
+
+    @pytest.mark.parametrize(
+        ("argv", "expected"),
+        [
+            ([], "magent down"),
+            (["--all"], "magent down --all"),
+            (["--server"], "magent down --server"),
+            (["-g", "core"], 'magent down -g "core"'),
+            (["api", "web"], 'magent down "api" "web"'),
+            (["api", "--server"], 'magent down "api" --server'),
+        ],
+        ids=["bare", "all", "server", "group", "names", "name+server"],
+    )
+    def test_selection_is_forwarded_verbatim(
+        self, runner, tmp_config, monkeypatch, argv, expected
+    ):
+        result, sent, _killed, _ = self._run(
+            runner, tmp_config, monkeypatch, ["--host", "u@h", *argv]
+        )
+        assert result.exit_code == 0
+        assert sent == [("u@h", expected)]
+
+    def test_named_selection_closes_only_those_local_windows(
+        self, runner, tmp_config, monkeypatch
+    ):
+        _result, _sent, _killed, closed = self._run(
+            runner, tmp_config, monkeypatch, ["--host", "u@h", "api"]
+        )
+        assert closed == [["api"]]
+
+    def test_all_closes_every_local_attach_window(
+        self, runner, tmp_config, monkeypatch
+    ):
+        # An empty selection means "every magent: window": killing the remote
+        # psmux servers makes every attached ssh client exit at once.
+        _result, _sent, _killed, closed = self._run(
+            runner, tmp_config, monkeypatch, ["--host", "u@h", "--all"]
+        )
+        assert closed == [[]]
+
+    def test_ssh_failure_exits_non_zero(self, runner, tmp_config, monkeypatch):
+        result, sent, _killed, _ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--host", "u@h", "--all"],
+            rc=255,
+            err="ssh: connect to host u@h port 22: Connection refused",
+        )
+        assert result.exit_code == 255
+        assert len(sent) == 1
+        assert "did not run the shutdown" in result.output
+
+    def test_remote_output_is_surfaced(self, runner, tmp_config, monkeypatch):
+        result, _sent, _killed, _ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--host", "u@h", "--all"],
+            out="  + Stopped 4 session(s): api, web, db, ops\n",
+        )
+        assert "Stopped 4 session(s): api, web, db, ops" in result.output
+
+    def test_local_daemon_stops_still_run_on_a_remote_all(
+        self, runner, tmp_config, monkeypatch
+    ):
+        # Unchanged behavior: --all still stops THIS machine's upload server,
+        # Alt+V listener and attention daemon (the remote `--all` handles the
+        # host's own copies).
+        result, _sent, _killed, _ = self._run(
+            runner, tmp_config, monkeypatch, ["--host", "u@h", "--all"]
+        )
+        assert "Upload server not running" in result.output
+        assert "Attention daemon was not running." in result.output

@@ -104,6 +104,11 @@ class FakePlatform(Platform):
         supports_hotkey: bool = False,
         supports_nudge: bool = False,
         nudge_error: Exception | None = None,
+        supports_close: bool = False,
+        supports_scan: bool = False,
+        cmdlines=None,
+        scan_error: Exception | None = None,
+        close_error: Exception | None = None,
     ):
         self._monitors = (
             monitors
@@ -118,7 +123,14 @@ class FakePlatform(Platform):
         self._supports_hotkey = supports_hotkey
         self._supports_nudge = supports_nudge
         self._nudge_error = nudge_error
+        self._supports_close = supports_close
+        self._supports_scan = supports_scan
+        self._cmdlines = list(cmdlines or [])
+        self._scan_error = scan_error
+        self._close_error = close_error
         self._next_handle = 1
+        self.closed: list = []
+        self.scanned: list[list[str]] = []
         self.dpi_aware_calls = 0
         self.launched_terminals: list[TerminalLaunchOpts] = []
         self.launched_vscode: list[VSCodeLaunchOpts] = []
@@ -184,6 +196,33 @@ class FakePlatform(Platform):
         if self._nudge_error is not None:
             raise self._nudge_error
         return len(handles)
+
+    def supports_window_close(self) -> bool:
+        return self._supports_close
+
+    def close_window(self, handle) -> bool:
+        """Record the WM_CLOSE instead of posting one, and drop the window from
+        the snapshot -- what a real close does, so a later lookup misses it.
+        `close_error` stands in for a handle that died first."""
+        if self._close_error is not None:
+            raise self._close_error
+        self.closed.append(handle)
+        for t, h in list(self._windows.items()):
+            if h == handle:
+                del self._windows[t]
+                break
+        return True
+
+    def supports_process_scan(self) -> bool:
+        return self._supports_scan
+
+    def process_cmdlines(self, names: list[str]) -> list[str]:
+        """Serve the canned command lines. `scan_error` stands in for a scan
+        that could not run at all -- the "do not act on this" case."""
+        self.scanned.append(list(names))
+        if self._scan_error is not None:
+            raise self._scan_error
+        return list(self._cmdlines)
 
     def set_window_title(self, handle, title: str) -> bool:
         self.titles_set.append((handle, title))

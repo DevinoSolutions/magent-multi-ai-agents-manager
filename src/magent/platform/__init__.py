@@ -128,6 +128,39 @@ class Platform(ABC):
         """
         return 0
 
+    def supports_window_close(self) -> bool:
+        """True if this platform can ask a window to close (see ``close_window``)."""
+        return False
+
+    def close_window(self, handle: object) -> bool:
+        """Ask a window to close itself, gracefully. False = it refused.
+
+        Graceful by contract: implementations post the window manager's own
+        close request (Windows: ``WM_CLOSE``) and never terminate a process.
+        The caller is repairing a window whose *client* already died -- if the
+        handle turns out to still be alive and busy, the right outcome is
+        "nothing happened", not a killed terminal.
+        """
+        raise NotImplementedError("closing windows is only supported on Windows")
+
+    def supports_process_scan(self) -> bool:
+        """True if this platform can enumerate live process command lines."""
+        return False
+
+    def process_cmdlines(self, names: list[str]) -> list[str]:
+        """Command lines of every live process whose executable is in ``names``.
+
+        The one question this exists to answer is "is anything actually running
+        the command this window was opened for?" -- a window can outlive its
+        process (Windows Terminal keeps a pane open after ``[process exited]``),
+        and the title alone cannot tell the two apart.
+
+        Raises ``OSError`` when the scan itself fails, so a caller can tell
+        "nothing matched" (an empty list, actionable) from "we could not look"
+        (unknowable -- and acting on it would close live windows).
+        """
+        raise NotImplementedError("process scanning is only supported on Windows")
+
     def flash_window(self, handle: object) -> bool:
         """Flash the window's taskbar presence to request the user's attention."""
         return False

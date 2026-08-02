@@ -14,6 +14,7 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 
@@ -39,6 +40,11 @@ from magent.tiling import (
     window_open,
 )
 from magent.titles import make_title, parse_title
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Sequence
+
+    from magent.platform import Platform
 
 
 def _as_session_list(raw: list[object]) -> list[dict[str, object]]:
@@ -383,6 +389,212 @@ def _echo_already_open(title: str) -> None:
     click.echo(f"  {style('=', fg='cyan')} {title} {style('already open', dim=True)}")
 
 
+# The local processes that can be a live attach CLIENT for a psmux session:
+# the SSH client the remote path spawns (`ssh -t <target> "psmux -L <sid>
+# attach || ..."`) and the psmux client a locally-launched window runs directly
+# (platform/windows.py::attach_psmux). Both carry the session's attach command
+# in their command line, which is the only thing that distinguishes a live
+# window from a corpse -- the TITLE cannot, because attach spawns wt with
+# --suppressApplicationTitle, so `magent:<sid>` survives the process it named.
+_CLIENT_PROCESS_NAMES = ["ssh.exe", "psmux.exe"]
+
+
+def _attach_markers(sid: str) -> tuple[str, ...]:
+    """Every spelling of "this process is attached to ``sid``" magent can spawn.
+
+    The bare form is what both spawn sites build today; the quoted variants
+    cover a session id that a shell (or a future call site) chose to quote, so
+    a quoting change cannot silently turn every live window into a corpse.
+    """
+    return (
+        f"psmux -L {sid} attach",
+        f'psmux -L "{sid}" attach',
+        f"psmux -L '{sid}' attach",
+    )
+
+
+def _corpses(open_sids: set[str], live_cmdlines: list[str]) -> set[str]:
+    """Which open windows have no live attach client behind them.
+
+    Pure on purpose -- the whole decision is "does any of these command lines
+    mention this session's attach command", so it is unit-testable without a
+    single real process, and the one risky judgement (close a window) is made
+    somewhere a test can pin it.
+
+    Deliberately conservative: a session counts as dead only when NEITHER an
+    ssh client NOR a psmux client is running its attach command. Falsely
+    closing a live window costs the user their session; leaving a corpse costs
+    them one re-run of attach.
+    """
+    haystack = [c.lower() for c in live_cmdlines if c]
+    return {
+        sid
+        for sid in open_sids
+        if not any(
+            marker.lower() in cmdline
+            for cmdline in haystack
+            for marker in _attach_markers(sid)
+        )
+    }
+
+
+def _close_windows(
+    plat: Platform, snap: dict[str, object], sids: Iterable[str]
+) -> list[str]:
+    """Ask each session's magent: window to close; report which ones accepted.
+
+    Resolves handles through the same badge-proof matcher tiling uses, so a
+    window carrying a state badge is still found. Best-effort per window: one
+    that died between the snapshot and the close is skipped, never fatal.
+    """
+    closed: list[str] = []
+    for sid in sids:
+        handle = find_in_snapshot(snap, sid, "magent-name")
+        if handle is None:
+            continue
+        with contextlib.suppress(OSError):
+            if plat.close_window(handle):
+                closed.append(sid)
+    return closed
+
+
+def _repair_corpses(open_sids: set[str]) -> set[str]:
+    """Close every open magent: window whose attach client is dead.
+
+    Returns the sessions freed, so the caller can drop them from its
+    "already open" set and let the normal spawn loop reopen them.
+
+    The bug this exists for: an attach window's SSH connection dies
+    (`client_loop: send disconnect: Connection reset`) and wt keeps the pane
+    open showing `[process exited with code 255]`. Because the title never
+    changes, ``_already_open`` counted that corpse as a live window and every
+    later `magent attach` skipped the session forever.
+
+    Capability-gated on both halves (scan + close), so macOS/Linux clients take
+    the ABC defaults and simply keep today's title-only dedupe.
+    """
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    if not open_sids:
+        return set()
+    plat = get_platform()
+    if not (plat.supports_process_scan() and plat.supports_window_close()):
+        return set()
+    log = get_logger("launch")
+    try:
+        cmdlines = plat.process_cmdlines(_CLIENT_PROCESS_NAMES)
+    except OSError:
+        # "We could not look" is not "nothing is running": acting on a failed
+        # scan would close every live window at once. Leave them all alone.
+        log.warning("attach: could not scan attach clients", exc_info=True)
+        return set()
+    dead = _corpses(open_sids, cmdlines)
+    if not dead:
+        return set()
+    closed = _close_windows(plat, plat.snapshot_windows(), sorted(dead))
+    for sid in closed:
+        click.echo(
+            f"  {style('~', fg='yellow')} {make_title(sid)}"
+            f" {style('dead window closed -- reopening', dim=True)}"
+        )
+    log.info("attach: closed %d dead window(s): %s", len(closed), ", ".join(closed))
+    return set(closed)
+
+
+def _open_attach_sids(snap: dict[str, object]) -> list[str]:
+    """Every session name that currently has a local magent: window."""
+    return sorted({p[0] for t in snap if (p := parse_title(t)) is not None})
+
+
+def _close_attach_windows(names: Sequence[str]) -> int:
+    """Close the local attach windows for ``names`` -- every magent: window
+    when ``names`` is empty -- and report how many the OS accepted.
+
+    Killing a psmux server makes every client attached to it exit, and a wt
+    pane whose process exited keeps its magent: title: one corpse window per
+    session. Closing them BEFORE the sessions die is what stops `down --host`
+    from recreating, at scale, the very bug ``_repair_corpses`` repairs.
+
+    An empty ``names`` deliberately means "all of them": a group-scoped or
+    whole-machine shutdown cannot be resolved to a session subset from the
+    client (group membership lives in the host's config), and closing a window
+    is non-destructive -- the session it was viewing is what `down` is about
+    to stop anyway.
+    """
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    plat = get_platform()
+    if not plat.supports_window_close():
+        return 0
+    snap = plat.snapshot_windows()
+    return len(_close_windows(plat, snap, list(names) or _open_attach_sids(snap)))
+
+
+# `magent down` on the host is a handful of psmux kills plus a couple of pid
+# stops -- fast, but it runs after an SSH handshake on a possibly-loaded box.
+_REMOTE_DOWN_TIMEOUT_S = 60
+
+
+def _remote_down_command(
+    names: Sequence[str], group: str | None, do_all: bool, stop_srv: bool
+) -> str:
+    """The host-side `magent down` line for this local selection, verbatim.
+
+    Quoting matches the rest of this module's remote commands (`-g "<group>"`).
+    """
+    parts = ["magent", "down", *(f'"{n}"' for n in names)]
+    if group:
+        parts += ["-g", f'"{group}"']
+    if do_all:
+        parts.append("--all")
+    if stop_srv:
+        parts.append("--server")
+    return " ".join(parts)
+
+
+def _remote_down(
+    target: str,
+    names: Sequence[str],
+    group: str | None,
+    do_all: bool,
+    stop_srv: bool,
+) -> int:
+    """Run the user's `down` selection on the attach host, over SSH.
+
+    Returns the exit code the calling shell should carry -- 0 on success, ssh's
+    own otherwise. Never a silent no-op: on a laptop `magent down --all` used
+    to stop the local Alt+V listener and nothing else, while attach's own
+    goodbye line told the user that command stops their sessions.
+
+    Local windows are closed FIRST (see ``_close_attach_windows``), because the
+    remote kill is what strands them.
+    """
+    closed = _close_attach_windows(names)
+    if closed:
+        click.echo(
+            f"  {style('~', fg='yellow')} Closed {style(str(closed), bold=True)}"
+            f" local attach window(s)."
+        )
+    remote_cmd = _remote_down_command(names, group, do_all, stop_srv)
+    click.echo(
+        f"  {style('#', fg='cyan')} Stopping sessions on {style(target, bold=True)}"
+        f" {style(f'({remote_cmd})', dim=True)}..."
+    )
+    rc, out, err = _ssh_capture(target, remote_cmd, timeout=_REMOTE_DOWN_TIMEOUT_S)
+    if out.strip():
+        click.echo(out.rstrip())
+    if rc == 0:
+        return 0
+    click.echo(
+        f"  {style('x', fg='red')} {target} did not run the shutdown"
+        f" {style(f'(ssh exit {rc})', dim=True)}."
+    )
+    detail = err.strip().splitlines()[-1] if err.strip() else ""
+    if detail:
+        click.echo(f"  {style(detail[:200], dim=True)}")
+    return rc
+
+
 # Bringing up many agents at once is a cold-start storm on the host (each
 # session spawns a shell plus a full agent process): a 40-project bring-up can
 # genuinely run past five minutes on a loaded machine. The old 300s budget
@@ -562,6 +774,10 @@ def _attach_flow(
     # Alt+V hotkey posts back, and the host-side `magent sessions <id>`.
     sids = [_as_str(s.get("session")) or _as_str(s.get("name")) for s in up]
     open_already = _already_open(sids)
+    # An open window is not proof of a live attach: a dead SSH client leaves the
+    # pane (and its title) behind, and title-only dedupe then skipped that
+    # session forever. Close those corpses so the spawn loop below reopens them.
+    open_already -= _repair_corpses(open_already)
 
     titles: list[str] = []
     for sid in sids:

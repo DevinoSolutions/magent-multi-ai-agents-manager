@@ -37,6 +37,12 @@ _BRING_UP_BATCH_PAUSE_S = 2.0
 _NUDGE_DELTA_PX = 40
 _NUDGE_SETTLE_S = 0.15
 
+# Budget for the one-shot process-command-line scan (see process_cmdlines).
+# It runs in front of attach's window spawning, so it must fail fast rather
+# than stall the flow; a timeout is reported as "we could not look", and the
+# caller then leaves every window alone.
+_PROC_SCAN_TIMEOUT_S = 10.0
+
 
 def _wait_for_panes_ready(
     binary: str, names: list[str], timeout_s: float = 10.0
@@ -230,6 +236,69 @@ class WindowsPlatform(Platform):
                 user32.MoveWindow(handle, x, y, w, h, True)
                 nudged += 1
         return nudged
+
+    def supports_window_close(self) -> bool:
+        return True
+
+    def close_window(self, handle: object) -> bool:
+        """Post WM_CLOSE -- the same request the window's own X button sends.
+
+        Deliberately never TerminateProcess: this is called to clear a pane
+        whose process already exited, and a stale handle that turns out to be
+        alive must be allowed to refuse. PostMessage is asynchronous, so a True
+        here means "the request was queued", not "the window is gone".
+        """
+        WM_CLOSE = 0x0010
+        return bool(user32.PostMessageW(handle, WM_CLOSE, 0, 0))
+
+    def supports_process_scan(self) -> bool:
+        return True
+
+    def process_cmdlines(self, names: list[str]) -> list[str]:
+        """One CIM query for every matching process's command line.
+
+        One subprocess for the whole batch (the filter is OR-ed server-side)
+        rather than one per name: this runs on the attach path, in front of
+        window spawning, so it has to cost a fixed ~fraction of a second no
+        matter how many sessions are involved. ctypes would avoid the
+        PowerShell boot, but reading another process's command line that way
+        means NtQueryInformationProcess + a cross-bitness PEB walk, which is a
+        lot of fragile surface for a diagnostic.
+        """
+        if not names:
+            return []
+        # Every name is a module-level literal in cli/attach.py, never user
+        # input -- but keep the filter to bare executable names so it stays
+        # that way and cannot grow into an injection seam.
+        safe = [n for n in names if n.replace(".", "").replace("-", "").isalnum()]
+        if not safe:
+            return []
+        where = " or ".join(f"Name='{n}'" for n in safe)
+        script = (
+            f'Get-CimInstance Win32_Process -Filter "{where}"'
+            " | ForEach-Object { $_.CommandLine } | Where-Object { $_ }"
+        )
+        try:
+            proc = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    script,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_PROC_SCAN_TIMEOUT_S,
+                check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise OSError(f"process scan failed: {exc}") from exc
+        if proc.returncode != 0:
+            detail = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else ""
+            raise OSError(f"process scan exited {proc.returncode}: {detail[:200]}")
+        return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
     def supports_attention_signals(self) -> bool:
         return True

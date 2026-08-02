@@ -343,6 +343,28 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
         sys.exit(3)
 
 
+def _down_host(explicit: str | None, local_targets: list[str]) -> str | None:
+    """Which machine this `down` should act on -- None meaning "this one".
+
+    An explicit ``--host`` always wins. Otherwise the auto rule: when nothing
+    local matched AND this machine has attached to a host before, act there.
+    That is the reported bug -- on the attach CLIENT there are no local psmux
+    sessions, so `magent down --all` stopped the local Alt+V listener and
+    nothing else, while `attach`'s own goodbye line advertises that exact
+    command for stopping the sessions it just opened. On the host itself local
+    sessions match, so the auto path never fires there.
+    """
+    if explicit:
+        return explicit
+    if local_targets:
+        return None
+    from magent.cli.attach import (
+        _read_last_host,  # sibling module: one last-attach-host store
+    )
+
+    return _read_last_host()
+
+
 @main.command("down")
 @click.argument("names", nargs=-1)
 @click.option("-g", "--group", default=None, help="Only sessions in this group")
@@ -353,6 +375,12 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
     help="Stop every session, the upload server, and the Alt+V listener",
 )
 @click.option("--server", "stop_srv", is_flag=True, help="Also stop the upload server")
+@click.option(
+    "--host",
+    default=None,
+    help="Stop the sessions on this SSH target instead of locally (default: the"
+    " host you last attached to, when nothing matches on this machine)",
+)
 @click.pass_context
 def down_cmd(
     ctx: click.Context,
@@ -360,6 +388,7 @@ def down_cmd(
     group: str | None,
     do_all: bool,
     stop_srv: bool,
+    host: str | None,
 ) -> None:
     """Shut down running psmux sessions (and optionally the upload server)."""
     config_file = find_config(ctx.obj.get("config_path"))
@@ -379,7 +408,15 @@ def down_cmd(
     else:
         targets = up_names
 
-    if targets:
+    remote = _down_host(host, targets)
+    remote_rc = 0
+    if remote:
+        from magent.cli.attach import (
+            _remote_down,  # sibling module: every SSH invocation lives in attach
+        )
+
+        remote_rc = _remote_down(remote, names, group, do_all, stop_srv)
+    elif targets:
         kill_psmux(targets)
         click.echo(
             f"  {style('+', fg='green')} Stopped {style(str(len(targets)), fg='green', bold=True)}"
@@ -421,6 +458,12 @@ def down_cmd(
             click.echo(f"  {style('+', fg='green')} Stopped the attention daemon.")
         else:
             click.echo(f"  {style('-', dim=True)} Attention daemon was not running.")
+
+    # Last, so the local daemons still stop when the host is unreachable -- but
+    # never zero: a failed remote shutdown that exits 0 is the silent no-op this
+    # whole path exists to remove.
+    if remote_rc:
+        sys.exit(remote_rc)
 
 
 def _open_session(sid: str) -> None:
