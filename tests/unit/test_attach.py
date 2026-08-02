@@ -1096,6 +1096,15 @@ class TestCorpseDecision:
         # What the launch path spawns (platform/windows.py::attach_psmux).
         assert self._corpses(["api"], ["psmux -L api attach"]) == set()
 
+    def test_absolute_path_psmux_client_is_not_a_corpse(self):
+        # attach_psmux execs the RESOLVED binary, so the real local cmdline
+        # carries a full path. A marker anchored on the literal word "psmux "
+        # missed it and scored every locally-launched window a corpse -- which
+        # only became dangerous once _sweep_dead_windows started judging
+        # windows outside the host's up list too.
+        cmd = r"C:\Users\me\AppData\Local\psmux\psmux.exe -L api attach"
+        assert self._corpses(["api"], [cmd]) == set()
+
     def test_quoted_session_id_still_counts_as_live(self):
         assert self._corpses(["api"], ['psmux -L "api" attach']) == set()
         assert self._corpses(["api"], ["psmux -L 'api' attach"]) == set()
@@ -1282,6 +1291,217 @@ class TestAttachReopensCorpseWindows:
         assert titles == ["magent:api", "magent:web"]
 
 
+class TestStaleCorpseSweep:
+    """The gap v3.10's corpse machinery left open.
+
+    Repair only ever saw ``_already_open(up_sids)``: windows whose session was
+    UP on the host at spawn time. A pane whose SESSION also died -- host
+    rebooted, session killed earlier, or the user answered `n` / picked one
+    group at the bring-up prompt -- was never scanned, never closed and never
+    flagged, so a terminated terminal sat in the grid through every subsequent
+    `magent attach`.
+
+    The sweep now looks at every local magent: window. What protects another
+    group's healthy windows is the LIVENESS check, never list membership --
+    with `-g <group>` the host's up list is group-filtered, so perfectly good
+    windows are legitimately "not up" from this run's point of view.
+    """
+
+    def _run_flow(self, monkeypatch, capsys, sessions, windows, cmdlines, **fp_kwargs):
+        """Drive the psmux path with ``windows`` already on screen.
+
+        ``sessions`` is what the host reports as up; ``windows`` is every
+        magent: window this machine has, which is deliberately allowed to carry
+        titles ``sessions`` knows nothing about. Spawned windows are NOT
+        registered in the snapshot (mirroring TestAttachReopensCorpseWindows),
+        so the post-tiling verification pass finds nothing to close and the
+        assertions stay about the sweep.
+        """
+        from magent.cli import attach as attach_mod
+
+        status = {
+            "up": [{"name": s, "session": s} for s in sessions],
+            "down": [],
+            "projects": [{"name": s} for s in sessions],
+        }
+        monkeypatch.setattr(
+            attach_mod, "_query_status", lambda *a, **k: (status, 0, "")
+        )
+        monkeypatch.setattr(attach_mod, "_ssh_capture", lambda *a, **k: (0, "", ""))
+        spawns: list[list[str]] = []
+
+        def fake_popen(args, **k):
+            if args and args[0] == "wt":
+                spawns.append(args)
+            return _FakeProc()
+
+        tiled: list[list[str]] = []
+        monkeypatch.setattr(attach_mod.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(attach_mod, "_tile_titles", lambda t: tiled.append(list(t)))
+        monkeypatch.setattr(attach_mod, "_maybe_start_hotkey", lambda url: None)
+        monkeypatch.setattr(attach_mod.time, "sleep", lambda s: None)
+        monkeypatch.setattr(attach_mod, "_remember_last_host", lambda target: None)
+        fp = _fake_platform(monkeypatch, windows, cmdlines=cmdlines, **fp_kwargs)
+        attach_mod._attach_flow("user@host", no_mux=False, group=None, yes=False)
+        return fp, spawns, tiled, capsys.readouterr().out
+
+    _CAPABLE: ClassVar[dict[str, bool]] = {
+        "supports_close": True,
+        "supports_scan": True,
+    }
+
+    @staticmethod
+    def _live(sid: str) -> str:
+        return f"ssh -t user@host psmux -L {sid} attach || magent sessions {sid}"
+
+    def test_dead_window_of_a_down_session_is_closed_and_not_respawned(
+        self, monkeypatch, capsys
+    ):
+        # The reported bug: `ghost` died with a previous session and the host
+        # does not list it at all, so nothing can be attached back to it.
+        fp, spawns, tiled, out = self._run_flow(
+            monkeypatch,
+            capsys,
+            ["api"],
+            {"magent:api": 1, "magent:ghost": 2},
+            [self._live("api")],
+            **self._CAPABLE,
+        )
+        assert fp.closed == [2]
+        assert "magent:ghost" in out
+        assert "session is not up" in out
+        # Closed, never reopened: there is nothing on the host to attach to.
+        assert spawns == []
+        assert tiled == [["magent:api"]]
+
+    def test_live_window_outside_the_up_list_is_left_strictly_alone(
+        self, monkeypatch, capsys
+    ):
+        # `-g <group>` filters the host's up list, so another group's windows
+        # look "not up" here while having a real client behind them.
+        fp, spawns, tiled, out = self._run_flow(
+            monkeypatch,
+            capsys,
+            ["api"],
+            {"magent:api": 1, "magent:other": 2},
+            [self._live("api"), self._live("other")],
+            **self._CAPABLE,
+        )
+        assert fp.closed == []
+        assert spawns == []
+        assert "session is not up" not in out
+        assert tiled == [["magent:api"]]
+
+    def test_up_session_corpse_is_still_closed_and_reopened(self, monkeypatch, capsys):
+        # The v3.10 behavior is untouched, and rides the same single scan as
+        # the new stale half.
+        fp, spawns, _tiled, out = self._run_flow(
+            monkeypatch,
+            capsys,
+            ["api"],
+            {"magent:api": 1, "magent:ghost": 2},
+            [],
+            **self._CAPABLE,
+        )
+        assert fp.closed == [1, 2]
+        assert "dead window closed -- reopening" in out
+        assert "session is not up" in out
+        # Only the up session comes back.
+        assert len(spawns) == 1
+        assert spawns[0][-1] == "psmux -L api attach || magent sessions api"
+
+    def test_the_sweep_costs_exactly_one_process_scan(self, monkeypatch, capsys):
+        fp, _spawns, _tiled, _out = self._run_flow(
+            monkeypatch,
+            capsys,
+            ["api"],
+            {"magent:api": 1, "magent:other": 2},
+            [self._live("api"), self._live("other")],
+            **self._CAPABLE,
+        )
+        # Two, and only two: the sweep's single scan (both halves partitioned
+        # off ONE result) plus the pre-existing post-tiling verification pass.
+        # Widening the sweep to every magent: window bought no extra scan.
+        assert fp.scanned == [["ssh.exe", "psmux.exe"]] * 2
+
+    def test_capability_less_platform_sweeps_nothing(self, monkeypatch, capsys):
+        # macOS/Linux clients take the ABC defaults: no scan, no close, no
+        # output -- and today's title-only dedupe is preserved untouched.
+        fp, spawns, tiled, out = self._run_flow(
+            monkeypatch,
+            capsys,
+            ["api"],
+            {"magent:api": 1, "magent:ghost": 2},
+            [],
+        )
+        assert fp.closed == []
+        assert fp.scanned == []
+        assert "dead window closed" not in out
+        assert spawns == []
+        assert tiled == [["magent:api"]]
+
+
+class TestSweepDeadWindows:
+    """The sweep helper on its own: what it closes, and what it hands back to
+    the spawn loop as still-open."""
+
+    def _sweep(self, monkeypatch, up_sids, windows, **kwargs):
+        from magent.cli import attach as attach_mod
+
+        fp = _fake_platform(monkeypatch, windows, **kwargs)
+        return fp, attach_mod._sweep_dead_windows(up_sids)
+
+    def test_returns_the_live_up_windows_only(self, monkeypatch):
+        fp, open_already = self._sweep(
+            monkeypatch,
+            ["api", "web"],
+            {"magent:api": 1, "magent:web": 2, "magent:ghost": 3},
+            supports_close=True,
+            supports_scan=True,
+            cmdlines=["ssh -t user@host psmux -L web attach || magent sessions web"],
+        )
+        # api's corpse is closed (and dropped, so the spawn loop reopens it);
+        # ghost is closed and simply gone; web survives as already-open.
+        assert open_already == {"web"}
+        assert fp.closed == [1, 3]
+        # Both halves come off ONE process scan.
+        assert fp.scanned == [["ssh.exe", "psmux.exe"]]
+
+    def test_a_failed_scan_closes_nothing_and_keeps_every_up_window(self, monkeypatch):
+        fp, open_already = self._sweep(
+            monkeypatch,
+            ["api"],
+            {"magent:api": 1, "magent:ghost": 2},
+            supports_close=True,
+            supports_scan=True,
+            scan_error=OSError("powershell exploded"),
+        )
+        assert open_already == {"api"}
+        assert fp.closed == []
+
+    def test_no_windows_at_all_never_scans(self, monkeypatch):
+        fp, open_already = self._sweep(
+            monkeypatch, ["api"], {}, supports_close=True, supports_scan=True
+        )
+        assert open_already == set()
+        assert fp.scanned == []
+
+    def test_a_bare_prefix_title_is_never_a_close_target(self, monkeypatch):
+        # A degenerate `magent:` window parses to an empty name; it belongs to
+        # no session and must not become collateral.
+        fp, open_already = self._sweep(
+            monkeypatch,
+            ["api"],
+            {"magent:": 1},
+            supports_close=True,
+            supports_scan=True,
+            cmdlines=[],
+        )
+        assert open_already == set()
+        assert fp.closed == []
+        assert fp.scanned == []
+
+
 class TestSpawnRetryAfterHandshakeFailure:
     """A big attach opens one SSH connection per window; during a bring-up
     storm the host's sshd hits MaxStartups and drops some of them, leaving
@@ -1455,6 +1675,62 @@ class TestDeadWindowAnnotation:
         assert "api" in out
         # Read-only: the close belongs to the spawn phase's own fresh scan.
         assert fp.closed == []
+
+    def test_dead_window_of_a_down_session_gets_its_own_wording(
+        self, monkeypatch, capsys
+    ):
+        # `ghost` is not in the up list at all, so "will be closed and
+        # reopened" would be a lie -- there is nothing to reopen it against.
+        fp, out = self._annotate(
+            monkeypatch,
+            capsys,
+            ["api"],
+            {"magent:api": 1, "magent:ghost": 2},
+            supports_close=True,
+            supports_scan=True,
+            cmdlines=["ssh -t user@host psmux -L api attach || magent sessions api"],
+        )
+        assert "1 dead window(s) from a previous session (session down)" in out
+        assert "will be closed:" in out
+        assert "ghost" in out
+        assert "closed and reopened" not in out
+        assert fp.closed == []
+
+    def test_both_kinds_render_as_two_lines_off_one_scan(self, monkeypatch, capsys):
+        fp, out = self._annotate(
+            monkeypatch,
+            capsys,
+            ["api"],
+            {"magent:api": 1, "magent:ghost": 2},
+            supports_close=True,
+            supports_scan=True,
+            cmdlines=[],
+        )
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        assert len(lines) == 2
+        assert "window(s) here are dead" in lines[0]
+        assert "closed and reopened" in lines[0]
+        assert "from a previous session (session down)" in lines[1]
+        # One process scan feeds both halves; the partition is on the RESULT.
+        assert fp.scanned == [["ssh.exe", "psmux.exe"]]
+        assert fp.closed == []
+
+    def test_a_live_window_outside_the_up_list_is_not_annotated(
+        self, monkeypatch, capsys
+    ):
+        _fp, out = self._annotate(
+            monkeypatch,
+            capsys,
+            ["api"],
+            {"magent:api": 1, "magent:other": 2},
+            supports_close=True,
+            supports_scan=True,
+            cmdlines=[
+                "ssh -t user@host psmux -L api attach || magent sessions api",
+                "ssh -t user@host psmux -L other attach || magent sessions other",
+            ],
+        )
+        assert out == ""
 
     def test_all_live_prints_nothing(self, monkeypatch, capsys):
         _fp, out = self._annotate(
