@@ -5,6 +5,33 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.10.0] - 2026-08-02
+
+### Added
+
+- **`magent down` acts on the attach host.** On an attach client there are
+  no local psmux sessions, so `magent down --all` used to stop the local
+  Alt+V listener and nothing else -- while attach's own goodbye line
+  advertises that exact command. Now, when nothing matches locally and the
+  machine has attached to a host before, the shutdown is forwarded over SSH
+  to that host (a new `--host <target>` option overrides the choice
+  explicitly), forwarding names / `-g` / `--all` / `--server` verbatim and
+  carrying the remote exit code. Local attach windows are closed first --
+  killing the remote sessions would otherwise strand one dead pane per
+  window.
+
+### Fixed
+
+- **`magent attach` repairs dead attach windows instead of skipping them
+  forever.** When an attach window's SSH connection dies, Windows Terminal
+  keeps the pane open (`[process exited with code 255]`) with its
+  `magent:<session>` title intact -- and attach's title-based dedupe then
+  counted that corpse as open and never reopened the session. Attach now
+  verifies each open window has a live attach client (an `ssh`/`psmux`
+  process running that session's attach command); a dead pane is closed
+  gracefully and the session's window respawned. Deliberately conservative:
+  if the process scan itself fails, no window is touched.
+
 ## [3.9.1] - 2026-07-31
 
 ### Fixed
@@ -409,6 +436,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.10.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.9.1...v3.10.0
 [3.9.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.9.0...v3.9.1
 [3.9.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.8.0...v3.9.0
 [3.8.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.7.0...v3.8.0
