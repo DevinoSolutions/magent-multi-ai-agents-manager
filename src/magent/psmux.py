@@ -331,14 +331,19 @@ def flash_message(
 # each label says what the key actually does: the old " F1 picker  F2 code " was
 # four bare tokens with nothing marking which half was the key. F1 gets a TRIGRAM
 # FOR HEAVEN -- the universal "menu/list" hamburger -- because the picker *is* a
-# session list; it's written as a \N{...} escape rather than pasted in so which
-# glyph is meant survives an editor that mangles it, and it's an ordinary
+# list, and the label names what it lists ("Proj. Picker"; a bare "picker" never
+# said what it picked). Both labels are capitalized so the two halves match
+# register. The glyph is written as a \N{...} escape rather than pasted in so
+# which one is meant survives an editor that mangles it, and it's an ordinary
 # Unicode codepoint (no Nerd-Font private-use range), so it renders in Windows
-# Terminal without a patched font. F2 gets plain ASCII `</>`: Unicode has no VS
-# Code / editor sign outside those same private-use ranges, and `</>` is the
-# universal "code" mark -- zero font support required, no emoji width quirks.
+# Terminal without a patched font. No space separates it from its label on
+# purpose: U+2630 is East-Asian *ambiguous* width, so a terminal that renders it
+# wide already pads it, and an explicit space read as a gap. F2 gets plain ASCII
+# `</>`: Unicode has no VS Code / editor sign outside those same private-use
+# ranges, and `</>` is the universal "code" mark -- zero font support required,
+# no width ambiguity, hence the ordinary space before its label.
 _STATUS_HINTS = (
-    "#[bold,fg=cyan] F1 #[default]\N{TRIGRAM FOR HEAVEN} picker   "
+    "#[bold,fg=cyan] F1 #[default]\N{TRIGRAM FOR HEAVEN}Proj. Picker   "
     "#[bold,fg=cyan] F2 #[default]</> VS Code "
 )
 
@@ -346,10 +351,12 @@ _STATUS_HINTS = (
 # tmux truncates status-right at `status-right-length` (default 40, but a
 # personal conf may set it far tighter), so the now-wider hint can render
 # mid-label. Style directives don't count toward the limit; what's left --
-# " F1 ", the menu glyph, " picker", the gap, " F2 ", "</>" and " VS Code " -- is
-# 31 columns, every character a single cell. 36 carries that plus headroom for a
-# label tweak.
-_STATUS_HINTS_LEN = "36"
+# " F1 ", the menu glyph, "Proj. Picker", the gap, " F2 ", "</>" and " VS Code "
+# -- is 4 + 2 + 12 + 3 + 4 + 3 + 9 = 37 columns worst case: everything is a
+# single cell except the menu glyph, counted as 2 because its East-Asian
+# *ambiguous* width lets a terminal render it either way. 44 carries the wide
+# case plus headroom for a label tweak.
+_STATUS_HINTS_LEN = "44"
 
 # The product's own status-left brand, same plainness as the hints: one word,
 # one accent. magent *owns* this per session rather than inheriting whatever a

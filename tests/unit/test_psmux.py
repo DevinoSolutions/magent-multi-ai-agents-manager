@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import unicodedata
 
 import pytest
 
@@ -403,20 +404,22 @@ class TestReviveSessions:
 # The status-right hint, restated here on purpose: an independent copy is what
 # makes these pins catch a drive-by restyle instead of following it.
 _EXPECTED_HINT = (
-    "#[bold,fg=cyan] F1 #[default]\N{TRIGRAM FOR HEAVEN} picker   "
+    "#[bold,fg=cyan] F1 #[default]\N{TRIGRAM FOR HEAVEN}Proj. Picker   "
     "#[bold,fg=cyan] F2 #[default]</> VS Code "
 )
 
 
 def _visible_cells(status: str) -> int:
-    """Columns `status` occupies: tmux style directives are free, emoji cost 2.
+    """Worst-case columns `status` occupies. tmux style directives are free.
 
-    Today's hint is all single-cell, so the emoji term contributes nothing --
-    it stays so the budget check keeps telling the truth if a future label
-    reaches for a double-width glyph again.
+    Wide and fullwidth characters cost 2 cells; so does an *ambiguous*-width one
+    like the menu glyph, which a terminal may render either way -- the budget is
+    only safe if it assumes the wide rendering.
     """
     text = re.sub(r"#\[[^\]]*\]", "", status)
-    return len(text) + sum(1 for ch in text if ord(ch) > 0xFFFF)
+    return sum(
+        2 if unicodedata.east_asian_width(ch) in {"W", "F", "A"} else 1 for ch in text
+    )
 
 
 class TestDecorateSession:
@@ -468,7 +471,7 @@ class TestDecorateSession:
             "set",
             "-g",
             "status-right-length",
-            "36",
+            "44",
         ]
 
     def test_sets_the_status_left_brand(self, monkeypatch):
@@ -516,8 +519,8 @@ class TestDecorateSession:
         assert int(psmux._STATUS_BRAND_LEN) >= len(" magent ")
 
     def test_status_right_length_fits_the_hint(self):
-        # Same relationship on the other half. Style directives are free and a
-        # double-width glyph would cost 2, so count cells, not characters.
+        # Same relationship on the other half. Style directives are free and the
+        # menu glyph may render double-width, so count cells, not characters.
         assert int(psmux._STATUS_HINTS_LEN) >= _visible_cells(psmux._STATUS_HINTS)
 
     def test_hint_advertises_both_keys(self):
@@ -536,9 +539,11 @@ class TestDecorateSession:
         # The other half of the fix: " F1 picker  F2 code " told the user
         # nothing. The labels, not the styling, are what must survive.
         hint = psmux.decoration_argv("api", "psmux")[1][-1]
-        assert "picker" in hint
+        assert "Proj. Picker" in hint
         assert "VS Code" in hint
-        assert "\N{TRIGRAM FOR HEAVEN} picker" in hint
+        # No space after the menu glyph: it is East-Asian-ambiguous width, so a
+        # terminal that renders it wide supplies the gap itself.
+        assert "\N{TRIGRAM FOR HEAVEN}Proj. Picker" in hint
         assert "</> VS Code" in hint
 
     def test_brand_names_the_product(self):

@@ -224,7 +224,7 @@ class TestWindowsLaunchTerminal:
 # The status-right hint, restated rather than imported: the point of the pin is
 # that a restyle in psmux.py has to be a deliberate edit here too.
 _EXPECTED_HINT = (
-    "#[bold,fg=cyan] F1 #[default]\N{TRIGRAM FOR HEAVEN} picker   "
+    "#[bold,fg=cyan] F1 #[default]\N{TRIGRAM FOR HEAVEN}Proj. Picker   "
     "#[bold,fg=cyan] F2 #[default]</> VS Code "
 )
 
@@ -292,7 +292,7 @@ class TestWindowsPsmuxDecoration:
             "set",
             "-g",
             "status-right-length",
-            "36",
+            "44",
         ] in calls
 
     def test_created_session_is_branded(self, monkeypatch):
