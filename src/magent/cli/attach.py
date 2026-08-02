@@ -680,6 +680,29 @@ def _annotate_dead_windows(up: Sequence[dict[str, object]]) -> None:
         )
 
 
+# Keepalive posture for the INTERACTIVE attach windows (`_ssh_capture` is a
+# separate, already-timeout-bounded path and deliberately untouched).
+#
+# WHY: OpenSSH sends nothing on an idle session by default, so after a laptop
+# sleep or a network change the TCP connection under an attach window is dead
+# while ssh.exe keeps running -- blocked forever on a socket that will never
+# answer. That is exactly the shape ``_dead_sids`` cannot see: the dead-window
+# scan looks for a live ssh/psmux process carrying the ``-L <sid> attach``
+# marker, and this zombie carries it. The window counts LIVE, the overview says
+# "N/N ready" with no annotation, the spawn loop skips it as "already open",
+# and no sweep will ever repair the frozen pane the user is staring at.
+#
+# 15s x 4 makes the client give up at most ~60s after the connection dies. The
+# pane then becomes a `[process exited]` corpse -- a shape the existing
+# machinery already handles: ``_sweep_dead_windows`` closes it and
+# ``_verify_and_respawn`` / the next attach reopens it.
+#
+# Losing the ssh client never loses work: the psmux session lives on the HOST
+# and is untouched by the client dying, so the reopened window reattaches to
+# the same running agent.
+_SSH_KEEPALIVE_OPTS = ("-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4")
+
+
 def _spawn_windows(
     target: str, sids: Sequence[str], open_already: set[str], stagger: float
 ) -> list[str]:
@@ -687,7 +710,8 @@ def _spawn_windows(
 
     Split out of ``_attach_flow`` so the post-tiling verification pass can call
     it a second time for the windows that died at the SSH handshake -- the
-    retry needs the same spawn, only staggered further apart.
+    retry needs the same spawn, only staggered further apart. Both the initial
+    and the retry batch therefore inherit ``_SSH_KEEPALIVE_OPTS`` from here.
     """
     titles: list[str] = []
     for sid in sids:
@@ -710,6 +734,7 @@ def _spawn_windows(
                 "--suppressApplicationTitle",
                 "--",
                 "ssh",
+                *_SSH_KEEPALIVE_OPTS,
                 "-t",
                 target,
                 # Direct psmux attach first: it connects in well under a second,
