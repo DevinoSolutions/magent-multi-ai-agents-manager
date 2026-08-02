@@ -172,15 +172,52 @@ def _grouped(
     return order, buckets
 
 
-def _print_names(names: list[str], indent: str = "       ", width: int = 66) -> None:
+def _down_reasons(entries: list[dict[str, object]]) -> dict[str, str]:
+    """Map psmux socket id -> why it is down, for the entries that carry one.
+
+    ``reason`` is optional and additive (``psmux_status`` only sets it on the
+    projects it never even probed), so an entry without one simply renders as
+    the bare name it always did.
+    """
+    out: dict[str, str] = {}
+    for e in entries:
+        raw = e.get("session") or e.get("name")
+        why = e.get("reason")
+        if isinstance(raw, str) and raw and isinstance(why, str) and why:
+            out[raw] = why
+    return out
+
+
+def _print_names(
+    names: list[str],
+    indent: str = "       ",
+    width: int = 66,
+    reasons: dict[str, str] | None = None,
+) -> None:
+    """Wrap session names across dim lines, annotating the ones with a reason.
+
+    A named reason renders as ``eBay (folder not found)``. It is plain data
+    from ``psmux_status``, never attach-specific wording, so this stays correct
+    for the host-side `up`/`status` flows that share this renderer.
+    """
+    # `plain` carries the unstyled text the width math needs; `line` carries
+    # the same content with per-token styling (ANSI would corrupt len()).
+    plain = indent
     line = indent
     for nm in names:
-        if line.strip() and len(line) + len(nm) + 2 > width:
-            click.echo(style(line, dim=True))
+        why = (reasons or {}).get(nm)
+        token = f"{nm} ({why})" if why else nm
+        if plain.strip() and len(plain) + len(token) + 2 > width:
+            click.echo(line)
+            plain = indent
             line = indent
-        line += nm + "  "
-    if line.strip():
-        click.echo(style(line, dim=True))
+        plain += token + "  "
+        line += style(nm, dim=True)
+        if why:
+            line += " " + style(f"({why})", dim=True)
+        line += "  "
+    if plain.strip():
+        click.echo(line)
 
 
 def _print_session_overview(
@@ -189,6 +226,7 @@ def _print_session_overview(
     """Render a grouped up/down overview; return the ordered list of pickable groups."""
     dn_order, dn_buckets = _grouped(down)
     up_order, up_buckets = _grouped(up)
+    dn_reasons = _down_reasons(down)
 
     click.echo()
     click.echo(
@@ -213,7 +251,7 @@ def _print_session_overview(
             click.echo(
                 f"  {num}  {style(g, bold=True)}  {style(f'{up_n}/{total} up', dim=True)}"
             )
-        _print_names(names)
+        _print_names(names, reasons=dn_reasons)
 
     for g in up_order:
         if g not in dn_buckets:

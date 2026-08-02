@@ -110,6 +110,24 @@ class TestGroupedOverview:
         out = capsys.readouterr().out
         assert "INTERNAL" in out and "LEAD" in out and "AUTOMATIONS" in out
 
+    def test_down_reason_renders_next_to_the_name(self, capsys):
+        # A project whose folder no longer resolves was reported down forever
+        # with zero explanation, here and in `up`. The reason is plain data on
+        # the entry, so this renderer stays neutral between host and client.
+        down = [
+            {"name": "eBay", "group": "SALES", "reason": "folder not found"},
+            {"name": "api", "group": "SALES"},
+        ]
+        cli._print_session_overview("host", [], down)
+        out = capsys.readouterr().out
+        assert "eBay (folder not found)" in out
+        # A reason-less neighbour on the same line stays a bare name.
+        assert "api (" not in out
+
+    def test_no_reasons_leaves_the_names_bare(self, capsys):
+        cli._print_session_overview("host", [], [{"name": "api", "group": "SALES"}])
+        assert "api (" not in capsys.readouterr().out
+
 
 class TestDefaultAttachHost:
     def test_picks_most_common_host(self, tmp_path, monkeypatch):
@@ -1585,6 +1603,11 @@ class TestSpawnRetryAfterHandshakeFailure:
         # The corpse pane is closed, and only that session is opened again.
         assert len(spawns) == 3
         assert spawns[-1][-1] == "psmux -L api attach || magent sessions api"
+        # The retry batch goes through the same _spawn_windows, so it inherits
+        # the keepalives too -- a respawned window must not be able to zombie.
+        keepalives = list(attach_mod._SSH_KEEPALIVE_OPTS)
+        for argv in spawns:
+            assert argv[argv.index("ssh") + 1 : argv.index("-t")] == keepalives
         assert fp.closed == [1]  # handle of the first `magent:api` window
         # First pass keeps the fast stagger; the retry slows down deliberately,
         # then a short bounded settle precedes the single re-check.
@@ -1835,6 +1858,25 @@ class TestSpawnWindows:
         assert titles == ["magent:api", "magent:web"]
         assert len(spawns) == 1
         assert sleeps == [0.25]
+
+    def test_ssh_carries_keepalives_before_the_tty_flag(self, monkeypatch):
+        # Without keepalives, a post-sleep ssh whose TCP connection died hangs
+        # forever and is indistinguishable from a live client to _dead_sids --
+        # the pane is frozen while the overview reports it ready. They must
+        # also land as ssh OPTIONS (before -t, i.e. before the target and the
+        # remote command), or ssh would read them as part of the command line.
+        spawns, _sleeps, _titles = self._spawn(monkeypatch, ["api"], [], 0.0)
+        argv = spawns[0]
+        i_ssh, i_t = argv.index("ssh"), argv.index("-t")
+        assert argv[i_ssh + 1 : i_t] == [
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=4",
+        ]
+        assert i_t < argv.index("user@host")
+        # ...and the attach marker _dead_sids scans for is untouched.
+        assert argv[-1] == "psmux -L api attach || magent sessions api"
 
 
 class TestDeadSids:

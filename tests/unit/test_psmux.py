@@ -340,6 +340,65 @@ class TestEligibleProjectsDedupe:
         assert out[0]["path"] == "/a/api"
 
 
+class TestPsmuxStatusDownReason:
+    """A project that is short-circuited to down -- never probed at all --
+    carries WHY. The live case that motivated this: a project whose folder was
+    deleted reported down forever and `up` silently skipped it, with no output
+    anywhere naming the folder as the problem."""
+
+    def _status(self, monkeypatch, cfg, *, binary="psmux"):
+        monkeypatch.setattr(psmux, "find_psmux", lambda: binary)
+        monkeypatch.setattr(
+            subprocess,
+            "Popen",
+            lambda *a, **k: pytest.fail("probed a project that cannot be probed"),
+        )
+        _up, down, _all = psmux.psmux_status(cfg)
+        return down
+
+    def test_unresolved_folder_says_so(self, monkeypatch):
+        cfg = _cfg([ProjectConfig(path="/nope/eBay", tool="claude")])
+        down = self._status(monkeypatch, cfg)
+        assert [d["name"] for d in down] == ["eBay"]
+        assert down[0]["reason"] == "folder not found"
+
+    def test_empty_command_says_so(self, monkeypatch, tmp_path):
+        proj = tmp_path / "api"
+        proj.mkdir()
+        cfg = _cfg([ProjectConfig(path=str(proj), tool="claude")], tools={})
+        down = self._status(monkeypatch, cfg)
+        assert down[0]["reason"] == "no agent command"
+
+    def test_missing_binary_wins_over_the_per_project_reason(
+        self, monkeypatch, tmp_path
+    ):
+        # Precedence is binary-first: with no psmux installed nothing can be
+        # brought up anyway, so naming the machine-wide blocker beats naming a
+        # folder the user still could not launch.
+        cfg = _cfg([ProjectConfig(path="/nope/eBay", tool="claude")])
+        down = self._status(monkeypatch, cfg, binary=None)
+        assert down[0]["reason"] == "psmux not installed"
+
+    def test_a_probed_session_that_is_simply_down_carries_no_reason(
+        self, monkeypatch, tmp_path
+    ):
+        # Ordinary down (has-session said no) is self-explanatory -- annotating
+        # it would put "(...)" next to every session on a cold machine.
+        proj = tmp_path / "api"
+        proj.mkdir()
+        cfg = _cfg([ProjectConfig(path=str(proj), tool="claude")])
+
+        class _NoSession:
+            def wait(self):
+                return 1
+
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: _NoSession())
+        _up, down, _all = psmux.psmux_status(cfg)
+        assert [d["name"] for d in down] == ["api"]
+        assert "reason" not in down[0]
+
+
 class TestReviveSessions:
     """A psmux session whose agent was Ctrl-C'ed still answers `has-session`,
     so up/attach reuse it and hand back a window at a bare prompt. Revive
