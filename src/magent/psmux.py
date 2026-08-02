@@ -331,12 +331,13 @@ def flash_message(
 # each label says what the key actually does: the old " F1 picker  F2 code " was
 # four bare tokens with nothing marking which half was the key. The two glyphs
 # are written as \N{...} escapes rather than pasted in, so which glyph is meant
-# survives any editor that mangles them: a LEFTWARDS ARROW for "leave -- back to
-# the picker", a PERSONAL COMPUTER for "open an editor". Both are ordinary
-# Unicode/emoji codepoints -- no Nerd-Font private-use range -- so they render in
-# Windows Terminal without a patched font.
+# survives any editor that mangles them: a TRIGRAM FOR HEAVEN -- the universal
+# "menu/list" hamburger -- because the picker *is* a session list, and a PERSONAL
+# COMPUTER for "open an editor". Both are ordinary Unicode/emoji codepoints --
+# no Nerd-Font private-use range -- so they render in Windows Terminal without a
+# patched font.
 _STATUS_HINTS = (
-    "#[bold,fg=cyan] F1 #[default]\N{LEFTWARDS ARROW} picker   "
+    "#[bold,fg=cyan] F1 #[default]\N{TRIGRAM FOR HEAVEN} picker   "
     "#[bold,fg=cyan] F2 #[default]\N{PERSONAL COMPUTER} VS Code "
 )
 
@@ -344,9 +345,9 @@ _STATUS_HINTS = (
 # tmux truncates status-right at `status-right-length` (default 40, but a
 # personal conf may set it far tighter), so the now-wider hint can render
 # mid-label. Style directives don't count toward the limit; what's left --
-# " F1 ", the arrow, " picker", the gap, " F2 ", the laptop and " VS Code " --
-# is 30 columns, the laptop emoji counting 2. 36 carries that plus headroom for
-# a label tweak.
+# " F1 ", the menu glyph, " picker", the gap, " F2 ", the laptop and " VS Code "
+# -- is 30 columns: the menu glyph is a single cell, the laptop emoji counts 2.
+# 36 carries that plus headroom for a label tweak.
 _STATUS_HINTS_LEN = "36"
 
 # The product's own status-left brand, same plainness as the hints: one word,

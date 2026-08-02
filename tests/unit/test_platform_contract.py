@@ -224,7 +224,7 @@ class TestWindowsLaunchTerminal:
 # The status-right hint, restated rather than imported: the point of the pin is
 # that a restyle in psmux.py has to be a deliberate edit here too.
 _EXPECTED_HINT = (
-    "#[bold,fg=cyan] F1 #[default]\N{LEFTWARDS ARROW} picker   "
+    "#[bold,fg=cyan] F1 #[default]\N{TRIGRAM FOR HEAVEN} picker   "
     "#[bold,fg=cyan] F2 #[default]\N{PERSONAL COMPUTER} VS Code "
 )
 

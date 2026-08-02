@@ -403,7 +403,7 @@ class TestReviveSessions:
 # The status-right hint, restated here on purpose: an independent copy is what
 # makes these pins catch a drive-by restyle instead of following it.
 _EXPECTED_HINT = (
-    "#[bold,fg=cyan] F1 #[default]\N{LEFTWARDS ARROW} picker   "
+    "#[bold,fg=cyan] F1 #[default]\N{TRIGRAM FOR HEAVEN} picker   "
     "#[bold,fg=cyan] F2 #[default]\N{PERSONAL COMPUTER} VS Code "
 )
 
@@ -533,7 +533,7 @@ class TestDecorateSession:
         hint = psmux.decoration_argv("api", "psmux")[1][-1]
         assert "picker" in hint
         assert "VS Code" in hint
-        assert "\N{LEFTWARDS ARROW}" in hint
+        assert "\N{TRIGRAM FOR HEAVEN}" in hint
         assert "\N{PERSONAL COMPUTER}" in hint
 
     def test_brand_names_the_product(self):
