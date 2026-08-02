@@ -327,6 +327,15 @@ class TestAttachFlowCharacterization:
                 # is about the spawn/tile shape, so opt out of it here.
                 return False
 
+            def supports_process_scan(self) -> bool:
+                # Same reason: the post-spawn handshake-casualty check is pinned
+                # by test_attach.py::TestSpawnRetryAfterHandshakeFailure, so opt
+                # this pin out of it and keep it about the spawn/tile shape.
+                return False
+
+            def supports_window_close(self) -> bool:
+                return False
+
             def snapshot_windows(self) -> dict[str, int]:
                 # Nothing open locally: every up-session gets a fresh window.
                 return {}

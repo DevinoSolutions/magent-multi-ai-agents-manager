@@ -458,6 +458,39 @@ def _close_windows(
     return closed
 
 
+def _dead_sids(open_sids: set[str]) -> set[str]:
+    """Which of ``open_sids`` have a magent: window but no live attach client.
+
+    The read-only half of ``_repair_corpses``: same capability gates, same
+    conservative "a scan we could not run saw nothing" posture, but it closes
+    nothing. The post-retry verification uses it on its own so a window that is
+    STILL dead after two spawn attempts is reported rather than closed --
+    closing it would leave the user with neither a session nor the pane whose
+    error text says why.
+
+    Gated on window-close too, not just process-scan, so "can this client
+    repair corpses at all" is one question with one answer: a platform without
+    both capabilities skips corpse detection entirely, as it always has.
+    """
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    if not open_sids:
+        return set()
+    plat = get_platform()
+    if not (plat.supports_process_scan() and plat.supports_window_close()):
+        return set()
+    try:
+        cmdlines = plat.process_cmdlines(_CLIENT_PROCESS_NAMES)
+    except OSError:
+        # "We could not look" is not "nothing is running": acting on a failed
+        # scan would close every live window at once. Leave them all alone.
+        get_logger("launch").warning(
+            "attach: could not scan attach clients", exc_info=True
+        )
+        return set()
+    return _corpses(open_sids, cmdlines)
+
+
 def _repair_corpses(open_sids: set[str]) -> set[str]:
     """Close every open magent: window whose attach client is dead.
 
@@ -470,27 +503,17 @@ def _repair_corpses(open_sids: set[str]) -> set[str]:
     changes, ``_already_open`` counted that corpse as a live window and every
     later `magent attach` skipped the session forever.
 
-    Capability-gated on both halves (scan + close), so macOS/Linux clients take
-    the ABC defaults and simply keep today's title-only dedupe.
+    Capability-gated on both halves (scan + close) via ``_dead_sids``, so
+    macOS/Linux clients take the ABC defaults and simply keep today's
+    title-only dedupe.
     """
     from magent.platform import get_platform  # heavy subsystem: in-body per policy
 
-    if not open_sids:
-        return set()
-    plat = get_platform()
-    if not (plat.supports_process_scan() and plat.supports_window_close()):
-        return set()
-    log = get_logger("launch")
-    try:
-        cmdlines = plat.process_cmdlines(_CLIENT_PROCESS_NAMES)
-    except OSError:
-        # "We could not look" is not "nothing is running": acting on a failed
-        # scan would close every live window at once. Leave them all alone.
-        log.warning("attach: could not scan attach clients", exc_info=True)
-        return set()
-    dead = _corpses(open_sids, cmdlines)
+    dead = _dead_sids(open_sids)
     if not dead:
         return set()
+    log = get_logger("launch")
+    plat = get_platform()
     closed = _close_windows(plat, plat.snapshot_windows(), sorted(dead))
     for sid in closed:
         click.echo(
@@ -499,6 +522,166 @@ def _repair_corpses(open_sids: set[str]) -> set[str]:
         )
     log.info("attach: closed %d dead window(s): %s", len(closed), ", ".join(closed))
     return set(closed)
+
+
+def _annotate_dead_windows(up: Sequence[dict[str, object]]) -> None:
+    """Say, right under the session overview, which "ready" sessions have a
+    DEAD window on THIS machine.
+
+    The overview is pure host truth: a psmux session that exists on the host
+    renders as a green ``N/N ready`` row even when the pane here is a corpse
+    whose SSH dropped. On a 40-window attach that is exactly the misleading
+    case -- the user reads "41 up" and sees several panes stuck on
+    `[process exited with code 255]`.
+
+    Annotating at the attach call site (rather than teaching
+    ``_print_session_overview`` about it) keeps that renderer shared with the
+    host-side `up` flows, where "the local window" has no meaning at all.
+
+    Read-only and capability-gated through ``_dead_sids``: nothing is closed
+    here. The real repair happens in the spawn phase off its own FRESH scan,
+    because a bring-up can run for minutes and this snapshot would be stale by
+    the time it mattered.
+    """
+    sids = [_as_str(s.get("session")) or _as_str(s.get("name")) for s in up]
+    dead = _dead_sids(_already_open(sids))
+    if not dead:
+        return
+    click.echo(
+        f"  {style('!', fg='yellow')} {style(str(len(dead)), fg='yellow', bold=True)}"
+        f" {style('window(s) here are dead (ssh connection dropped)', fg='yellow')}"
+        f" {style('-- they will be closed and reopened:', fg='yellow')}"
+        f" {style(', '.join(sorted(dead)), fg='yellow', bold=True)}"
+    )
+
+
+def _spawn_windows(
+    target: str, sids: Sequence[str], open_already: set[str], stagger: float
+) -> list[str]:
+    """Open one `wt` window per session id and return their titles, in order.
+
+    Split out of ``_attach_flow`` so the post-tiling verification pass can call
+    it a second time for the windows that died at the SSH handshake -- the
+    retry needs the same spawn, only staggered further apart.
+    """
+    titles: list[str] = []
+    for sid in sids:
+        title = make_title(sid)
+        if sid in open_already:
+            # Still tiled with everything else -- an already-open window belongs
+            # in the grid; it just must not be opened a second time, and costs
+            # no stagger since no SSH handshake follows.
+            _echo_already_open(title)
+            titles.append(title)
+            continue
+        click.echo(f"  {style('o', fg='cyan')} {title}")
+        subprocess.Popen(
+            [
+                "wt",
+                "-w",
+                "new",
+                "--title",
+                title,
+                "--suppressApplicationTitle",
+                "--",
+                "ssh",
+                "-t",
+                target,
+                # Direct psmux attach first: it connects in well under a second,
+                # where booting the full magent CLI per window (python import +
+                # config load, x40 windows on a loaded host) made a big attach
+                # take many minutes. The picker is only the fallback path.
+                f"psmux -L {sid} attach || magent sessions {sid}",
+            ]
+        )
+        titles.append(title)
+        time.sleep(stagger)
+    return titles
+
+
+# Stagger for the RETRY batch. A casualty proves the host's sshd was already
+# turning connections away at 4/sec, so the retry buys headroom with time: one
+# handshake per second keeps roughly one connection unauthenticated at a time
+# even when a loaded host takes several seconds to answer. The batch is only
+# the windows that actually died, so the extra seconds are cheap.
+_RETRY_STAGGER_S = 1.0
+
+# Bounded settle before the FINAL scan. A respawned ssh that is still mid
+# handshake is a live process carrying the attach marker, so it would pass a
+# scan it is about to fail; the retry's own tiling pass usually covers that on
+# its own, and this tops it up for the small-batch case where tiling returns
+# almost immediately. Deliberately short and fixed -- it is only ever paid on
+# the (rare) retry path, and a straggler is reported, never closed.
+_RETRY_SETTLE_S = 5.0
+
+
+def _verify_and_respawn(target: str, sids: Sequence[str]) -> None:
+    """Reopen the windows whose SSH connection died during the spawn storm.
+
+    A big attach opens one SSH connection per window, and Windows OpenSSH has
+    no ControlMaster, so they cannot be shared. During a bring-up storm the
+    host is cold-starting dozens of agent processes and handshakes stretch from
+    ~1s to many seconds; concurrent *unauthenticated* connections then pile up
+    past sshd's MaxStartups (default 10:30:100) and it starts dropping
+    newcomers probabilistically -- `Connection closed by <host> port 22` or
+    `kex_exchange_identification: read: Connection reset`, then
+    `[process exited with code 255]` in the pane.
+
+    ``_repair_corpses`` already heals those, but only at the START of the next
+    attach: the run that spawned them still ended with dead panes on screen.
+    This closes that gap by checking the windows this run just opened.
+
+    Timing is the whole trick: an ssh mid-handshake is a live process carrying
+    the attach marker, so scanning right after the spawn loop would clear every
+    window that is about to die. The caller runs this AFTER tiling and the
+    geometry nudge, by which time those phases have already spent tens of
+    seconds on a big attach and the casualties have settled.
+
+    Costs the common (zero-casualty) case exactly one process scan and no
+    output, and is skipped outright on platforms without the scan/close
+    capabilities.
+    """
+    casualties = _repair_corpses(set(sids))
+    if not casualties:
+        return
+    # Respawn in the caller's order so the retiling lands them predictably.
+    retry = [sid for sid in sids if sid in casualties]
+    click.echo(
+        f"\n  {style('~', fg='yellow')} {style(str(len(retry)), bold=True)}"
+        f" window(s) died during SSH handshake -- reopening"
+        f" {style('(slower, to stay under the host connection limit)', dim=True)}"
+    )
+    get_logger("launch").info(
+        "attach: respawning %d handshake casualt(y/ies): %s",
+        len(retry),
+        ", ".join(retry),
+    )
+    titles = _spawn_windows(target, retry, set(), _RETRY_STAGGER_S)
+    _tile_titles(titles)
+    _reclaim_geometry(titles)
+
+    time.sleep(_RETRY_SETTLE_S)
+    # Exactly one more look, and a read-only one: two spawns is the budget, so
+    # anything still dead is reported and left on screen (its pane carries the
+    # ssh error) instead of being closed for a third attempt that would never
+    # come.
+    still_dead = _dead_sids(set(retry))
+    if not still_dead:
+        return
+    names = ", ".join(sorted(still_dead))
+    get_logger("launch").warning(
+        "attach: %d window(s) still dead: %s", len(still_dead), names
+    )
+    click.echo(
+        f"\n  {style('!', fg='yellow')} {style(str(len(still_dead)), fg='yellow', bold=True)}"
+        f" {style(f'window(s) still could not connect to {target}:', fg='yellow')}"
+        f" {style(names, fg='yellow', bold=True)}"
+    )
+    click.echo(
+        f"  {style('The host is likely still rate-limiting new SSH connections.', fg='yellow')}"
+        f" {style('Re-run', fg='yellow')} {style('magent attach', fg='yellow', bold=True)}"
+        f" {style('once it settles.', fg='yellow')}"
+    )
 
 
 def _open_attach_sids(snap: dict[str, object]) -> list[str]:
@@ -724,6 +907,9 @@ def _attach_flow(
         up = _bring_up_and_requery(target, grp, up, len(up) + len(down))
     elif down:
         pickable = _print_session_overview(hostname, up, down)
+        # Host truth alone reads "ready" for a session whose local pane is a
+        # corpse; say so BEFORE the prompt, while the user is still choosing.
+        _annotate_dead_windows(up)
         opts = [f"{style('a', fg='cyan', bold=True)}=all {len(down)}"]
         if pickable:
             opts.append(
@@ -779,38 +965,7 @@ def _attach_flow(
     # session forever. Close those corpses so the spawn loop below reopens them.
     open_already -= _repair_corpses(open_already)
 
-    titles: list[str] = []
-    for sid in sids:
-        title = make_title(sid)
-        if sid in open_already:
-            # Still tiled with everything else -- an already-open window belongs
-            # in the grid; it just must not be opened a second time, and costs
-            # no stagger since no SSH handshake follows.
-            _echo_already_open(title)
-            titles.append(title)
-            continue
-        click.echo(f"  {style('o', fg='cyan')} {title}")
-        subprocess.Popen(
-            [
-                "wt",
-                "-w",
-                "new",
-                "--title",
-                title,
-                "--suppressApplicationTitle",
-                "--",
-                "ssh",
-                "-t",
-                target,
-                # Direct psmux attach first: it connects in well under a second,
-                # where booting the full magent CLI per window (python import +
-                # config load, x40 windows on a loaded host) made a big attach
-                # take many minutes. The picker is only the fallback path.
-                f"psmux -L {sid} attach || magent sessions {sid}",
-            ]
-        )
-        titles.append(title)
-        time.sleep(_SPAWN_STAGGER_S)
+    titles = _spawn_windows(target, sids, open_already, _SPAWN_STAGGER_S)
 
     # Guarantee the host runs an upload server for Alt+V -- independent of the
     # host's uploadServer flag and of whether anything was just brought up.
@@ -833,6 +988,9 @@ def _attach_flow(
     _tile_titles(titles)
     # After placement, so the rect each window is restored to is the tiled one.
     _reclaim_geometry(titles)
+    # ...and only now, once those two phases have given every handshake time to
+    # either connect or fail, is a process scan meaningful (see the docstring).
+    _verify_and_respawn(target, sids)
 
     try:
         rc = ensure.wait(timeout=15)
