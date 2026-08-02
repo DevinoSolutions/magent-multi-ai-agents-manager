@@ -404,12 +404,17 @@ class TestReviveSessions:
 # makes these pins catch a drive-by restyle instead of following it.
 _EXPECTED_HINT = (
     "#[bold,fg=cyan] F1 #[default]\N{TRIGRAM FOR HEAVEN} picker   "
-    "#[bold,fg=cyan] F2 #[default]\N{PERSONAL COMPUTER} VS Code "
+    "#[bold,fg=cyan] F2 #[default]</> VS Code "
 )
 
 
 def _visible_cells(status: str) -> int:
-    """Columns `status` occupies: tmux style directives are free, emoji cost 2."""
+    """Columns `status` occupies: tmux style directives are free, emoji cost 2.
+
+    Today's hint is all single-cell, so the emoji term contributes nothing --
+    it stays so the budget check keeps telling the truth if a future label
+    reaches for a double-width glyph again.
+    """
     text = re.sub(r"#\[[^\]]*\]", "", status)
     return len(text) + sum(1 for ch in text if ord(ch) > 0xFFFF)
 
@@ -511,8 +516,8 @@ class TestDecorateSession:
         assert int(psmux._STATUS_BRAND_LEN) >= len(" magent ")
 
     def test_status_right_length_fits_the_hint(self):
-        # Same relationship on the other half. Style directives are free and the
-        # laptop emoji is double-width, so count cells, not characters.
+        # Same relationship on the other half. Style directives are free and a
+        # double-width glyph would cost 2, so count cells, not characters.
         assert int(psmux._STATUS_HINTS_LEN) >= _visible_cells(psmux._STATUS_HINTS)
 
     def test_hint_advertises_both_keys(self):
@@ -533,8 +538,8 @@ class TestDecorateSession:
         hint = psmux.decoration_argv("api", "psmux")[1][-1]
         assert "picker" in hint
         assert "VS Code" in hint
-        assert "\N{TRIGRAM FOR HEAVEN}" in hint
-        assert "\N{PERSONAL COMPUTER}" in hint
+        assert "\N{TRIGRAM FOR HEAVEN} picker" in hint
+        assert "</> VS Code" in hint
 
     def test_brand_names_the_product(self):
         # Same guard on the other literal: the status-left is branding, so the
