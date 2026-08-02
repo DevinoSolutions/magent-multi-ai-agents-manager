@@ -5,6 +5,29 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.10.1] - 2026-08-02
+
+### Fixed
+
+- **A big `magent attach` no longer ends with dead panes from the SSH
+  spawn storm.** Each window opens its own SSH connection (Windows OpenSSH
+  has no connection sharing), and while the host is cold-starting dozens of
+  agents its handshakes stretch past sshd's concurrent-handshake limit
+  (`MaxStartups`), which then drops newcomers -- panes stuck on
+  `Connection closed by <host> port 22` or `kex_exchange_identification:
+  read: Connection reset`. Attach now verifies its own spawns after tiling
+  settles: panes that died at the handshake are closed and respawned with a
+  slower stagger, re-tiled, and checked once more. Anything still dead
+  after two attempts is reported (its pane keeps the SSH error on screen)
+  with a hint to re-run attach -- never a silent corpse, never an infinite
+  loop.
+- **The session overview no longer calls a session "ready" while its
+  window here is dead.** The overview is host truth (the psmux session
+  really is up); when the local pane is a corpse, attach now says so right
+  under the table -- naming the sessions and noting they will be closed
+  and reopened -- before the bring-up prompt, while you are still
+  choosing.
+
 ## [3.10.0] - 2026-08-02
 
 ### Added
@@ -436,6 +459,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.10.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.0...v3.10.1
 [3.10.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.9.1...v3.10.0
 [3.9.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.9.0...v3.9.1
 [3.9.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.8.0...v3.9.0
