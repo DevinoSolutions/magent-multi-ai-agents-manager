@@ -514,10 +514,32 @@ def eligible_projects(
     return out
 
 
+def _down_reason(binary: str | None, project: dict[str, object]) -> str:
+    """Name the one thing that keeps ``project`` from ever being probed."""
+    if not binary:
+        return "psmux not installed"
+    if not project["resolved"]:
+        return "folder not found"
+    return "no agent command"
+
+
 def psmux_status(
     config: MagentConfig, group: str | None = None
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
-    """Return ``(up, down, all_projects)`` for eligible projects."""
+    """Return ``(up, down, all_projects)`` for eligible projects.
+
+    A project that never gets probed at all (no psmux binary, a path that does
+    not resolve on this machine, or no agent command) carries a ``reason`` on
+    its down entry. Without it such a project reports down forever with zero
+    explanation -- ``bring_up`` skips exactly the same projects silently, so
+    "it says down and `up` does nothing" was the only symptom. Sessions that
+    DID get probed and simply failed ``has-session`` stay reason-less: that is
+    ordinary down, and nothing to explain.
+
+    Precedence is binary-first: a missing psmux is a machine-wide blocker that
+    makes every other reason moot, so naming it once beats telling the user
+    about a folder they would still not be able to launch.
+    """
     binary = find_psmux()
     projects = eligible_projects(config, group)
     up: list[dict[str, object]] = []
@@ -540,6 +562,7 @@ def psmux_status(
             )
             checkable.append((info, proc))
         else:
+            info["reason"] = _down_reason(binary, p)
             down.append(info)
 
     for info, proc in checkable:
