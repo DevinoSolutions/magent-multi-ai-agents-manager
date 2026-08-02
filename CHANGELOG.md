@@ -5,6 +5,40 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.10.3] - 2026-08-02
+
+### Fixed
+
+- **Frozen attach windows can no longer masquerade as "ready".** After a
+  laptop sleep or a network change, the TCP connection under an attach
+  window dies but the ssh client keeps running -- OpenSSH sends nothing on
+  an idle session, so the zombie blocks forever. The dead-window scan
+  judges liveness by "a live ssh/psmux process carries this session's
+  attach command", and a zombie carries it -- so the window counted as
+  live and "already open", the overview said `N/N ready` with no
+  annotation, and no sweep would ever repair the frozen pane. Attach
+  windows now spawn ssh with keepalives (`ServerAliveInterval=15`,
+  `ServerAliveCountMax=4`): a dead connection makes the client exit at
+  most ~60s later, the pane becomes an ordinary `[process exited]` corpse,
+  and the existing sweep closes and reopens it. The host-side psmux
+  session is untouched by the client dying -- no work is lost.
+- **Sessions that can never come up now say why.** A project whose folder
+  does not resolve on the host (or has no agent command, or no psmux
+  binary) was reported down forever with zero explanation -- bring-up
+  silently skipped it every time. The down entry now carries a `reason`
+  and the session overview renders it next to the name, e.g.
+  `eBay (folder not found)`. Probed-but-down sessions stay reason-less:
+  ordinary down needs no explanation.
+
+### Changed
+
+- **The psmux status-bar hints are readable.** `F1 picker  F2 code` was
+  four bare tokens with nothing marking which half is a key. Each key name
+  is now a bold accent badge and each label says what the key does:
+  `F1 ☰Proj. Picker   F2 </> VS Code`. No special fonts required, and the
+  status bar sets its own width budget so a personal tmux config can no
+  longer truncate the hint mid-label.
+
 ## [3.10.2] - 2026-08-02
 
 ### Fixed
@@ -481,6 +515,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.10.3]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.2...v3.10.3
 [3.10.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.1...v3.10.2
 [3.10.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.0...v3.10.1
 [3.10.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.9.1...v3.10.0
