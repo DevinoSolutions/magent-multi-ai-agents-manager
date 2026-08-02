@@ -10,7 +10,9 @@ pane_cwd across every live session concurrently).
 
 from __future__ import annotations
 
+import re
 import subprocess
+import unicodedata
 
 import pytest
 
@@ -458,11 +460,33 @@ class TestReviveSessions:
         assert psmux.revive_sessions(cfg) == []
 
 
+# The status-right hint, restated here on purpose: an independent copy is what
+# makes these pins catch a drive-by restyle instead of following it.
+_EXPECTED_HINT = (
+    "#[bold,fg=cyan] F1 #[default]\N{TRIGRAM FOR HEAVEN}Proj. Picker   "
+    "#[bold,fg=cyan] F2 #[default]</> VS Code "
+)
+
+
+def _visible_cells(status: str) -> int:
+    """Worst-case columns `status` occupies. tmux style directives are free.
+
+    Wide and fullwidth characters cost 2 cells; so does an *ambiguous*-width one
+    like the menu glyph, which a terminal may render either way -- the budget is
+    only safe if it assumes the wide rendering.
+    """
+    text = re.sub(r"#\[[^\]]*\]", "", status)
+    return sum(
+        2 if unicodedata.east_asian_width(ch) in {"W", "F", "A"} else 1 for ch in text
+    )
+
+
 class TestDecorateSession:
-    """The status-line hints (` F1 picker  F2 code `), the product-owned
-    `bind -n F1 detach-client`, and the product-owned status-left brand (+ the
-    length budget it needs). All are `-L <name>`-scoped so they land on that
-    session's own server and beat whatever its tmux.conf set at start-up.
+    """The status-line hints (badged `F1`/`F2` keys with spelled-out labels),
+    the product-owned `bind -n F1 detach-client`, and the product-owned
+    status-left brand -- each half paired with the length budget it needs. All
+    are `-L <name>`-scoped so they land on that session's own server and beat
+    whatever its tmux.conf set at start-up.
     """
 
     def _run(self, monkeypatch, *, boom: Exception | None = None):
@@ -491,12 +515,27 @@ class TestDecorateSession:
             "set",
             "-g",
             "status-right",
-            " F1 picker  F2 code ",
+            _EXPECTED_HINT,
+        ]
+
+    def test_sets_the_status_right_length_alongside_the_hint(self, monkeypatch):
+        # Same load-bearing pairing as the brand below: the badged hint is far
+        # wider than the old text, and a personal tmux.conf with a tighter
+        # status-right-length would cut it mid-label.
+        cmds = self._run(monkeypatch)
+        assert cmds[2] == [
+            "psmux",
+            "-L",
+            "api",
+            "set",
+            "-g",
+            "status-right-length",
+            "44",
         ]
 
     def test_sets_the_status_left_brand(self, monkeypatch):
         cmds = self._run(monkeypatch)
-        assert cmds[2] == [
+        assert cmds[3] == [
             "psmux",
             "-L",
             "api",
@@ -510,7 +549,7 @@ class TestDecorateSession:
         # Load-bearing: a personal tmux.conf with a tighter status-left-length
         # would truncate the brand mid-word, so magent sets both or neither.
         cmds = self._run(monkeypatch)
-        assert cmds[3] == [
+        assert cmds[4] == [
             "psmux",
             "-L",
             "api",
@@ -520,27 +559,63 @@ class TestDecorateSession:
             "10",
         ]
 
+    def test_the_argv_is_the_five_decorations(self):
+        # The list is what every call site fans out, so its shape is contract:
+        # a sixth command (or a dropped one) has to be a deliberate edit here.
+        argv = psmux.decoration_argv("api", "psmux")
+        assert len(argv) == 5
+        assert argv[0][3:] == ["bind", "-n", "F1", "detach-client"]
+        assert [cmd[5] for cmd in argv[1:]] == [
+            "status-right",
+            "status-right-length",
+            "status-left",
+            "status-left-length",
+        ]
+
     def test_status_left_length_fits_the_brand(self):
         # The number is only correct relative to the brand text; pin the
         # relationship, not just the two literals.
         assert int(psmux._STATUS_BRAND_LEN) >= len(" magent ")
+
+    def test_status_right_length_fits_the_hint(self):
+        # Same relationship on the other half. Style directives are free and the
+        # menu glyph may render double-width, so count cells, not characters.
+        assert int(psmux._STATUS_HINTS_LEN) >= _visible_cells(psmux._STATUS_HINTS)
 
     def test_hint_advertises_both_keys(self):
         # The literal is defined once; a rename must not silently drop a key.
         argv = psmux.decoration_argv("api", "psmux")
         assert "F1" in argv[1][-1] and "F2" in argv[1][-1]
 
+    def test_hint_badges_each_key_name(self):
+        # The readability fix: each key name is its own bold accent badge, so
+        # "F1"/"F2" can't read as words in the label next to them.
+        hint = psmux.decoration_argv("api", "psmux")[1][-1]
+        assert "#[bold,fg=cyan] F1 #[default]" in hint
+        assert "#[bold,fg=cyan] F2 #[default]" in hint
+
+    def test_hint_spells_out_what_each_key_does(self):
+        # The other half of the fix: " F1 picker  F2 code " told the user
+        # nothing. The labels, not the styling, are what must survive.
+        hint = psmux.decoration_argv("api", "psmux")[1][-1]
+        assert "Proj. Picker" in hint
+        assert "VS Code" in hint
+        # No space after the menu glyph: it is East-Asian-ambiguous width, so a
+        # terminal that renders it wide supplies the gap itself.
+        assert "\N{TRIGRAM FOR HEAVEN}Proj. Picker" in hint
+        assert "</> VS Code" in hint
+
     def test_brand_names_the_product(self):
         # Same guard on the other literal: the status-left is branding, so the
         # product name is the part that must survive a restyle.
         argv = psmux.decoration_argv("api", "psmux")
-        assert "magent" in argv[2][-1]
+        assert "magent" in argv[3][-1]
 
     def test_never_raises_when_the_subprocess_fails(self, monkeypatch):
         # A status bar is cosmetic: an unlaunchable/hung psmux is logged and
         # swallowed, never propagated into a bring-up.
         cmds = self._run(monkeypatch, boom=OSError("no psmux"))
-        assert len(cmds) == 4  # all attempted; none escaped
+        assert len(cmds) == 5  # all attempted; none escaped
 
     def test_never_raises_on_timeout(self, monkeypatch):
         self._run(monkeypatch, boom=subprocess.TimeoutExpired("psmux", 3))
