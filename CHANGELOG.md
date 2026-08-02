@@ -5,6 +5,28 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.10.2] - 2026-08-02
+
+### Fixed
+
+- **`magent attach` now clears terminated terminals whose session is gone
+  too.** The corpse repair shipped in 3.10.0/3.10.1 only examined windows
+  whose session was UP on the host, so a dead pane left by a previous
+  session -- host rebooted, session killed earlier, or a declined bring-up
+  -- was never scanned and sat in the grid through every subsequent
+  attach. The start-of-attach pass now sweeps EVERY local `magent:`
+  window: a dead pane whose session is up is closed and reopened (as
+  before); a dead pane whose session is not up is closed for good, and
+  named in the pre-prompt annotation as a dead window from a previous
+  session. A live window outside the current session list -- for example
+  another group's windows under `-g` -- is left strictly alone: liveness,
+  never list membership, decides.
+- **Locally-launched psmux windows can no longer be mistaken for
+  corpses.** The liveness marker matched the literal `psmux -L <session>
+  attach`, but locally-launched windows exec the resolved absolute path to
+  psmux.exe. Harmless while only remote up-sessions were examined; fixed
+  now that the sweep judges every `magent:` window.
+
 ## [3.10.1] - 2026-08-02
 
 ### Fixed
@@ -459,6 +481,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.10.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.1...v3.10.2
 [3.10.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.0...v3.10.1
 [3.10.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.9.1...v3.10.0
 [3.9.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.9.0...v3.9.1
