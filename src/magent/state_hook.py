@@ -10,6 +10,16 @@ with ``magent hooks install``.
 Import-cheap by contract (stdlib + ``magent.agent_state`` only) because it
 runs as a subprocess on every hook event, and it must never fail the hosting
 agent's turn: any unusable input exits 0 silently.
+
+The mapping is event-name-driven with one payload-driven exception: ``Stop``
+means "the main agent's turn ended", NOT "the work finished". A turn that has
+just dispatched background subagents or background shell tasks ends
+immediately, so a naive Stop-to-done painted sessions green while their
+subagents ground on for minutes. Claude Code's own pending-work ledger --
+``background_tasks`` on the Stop payload -- is the arbiter, and the harness
+re-invokes the main agent when that work lands (firing ``UserPromptSubmit``,
+already mapped to working), which guarantees a later Stop carrying a drained
+ledger. That final Stop is the one that writes done.
 """
 
 from __future__ import annotations
@@ -26,8 +36,12 @@ from magent import agent_state
 # alive, throttled so back-to-back tool calls don't rewrite the file per call.
 REFRESH_S = 30.0
 
-# Claude Code hook_event_name -> store state. SessionEnd clears instead of
-# writing and PostToolUse throttles, so both are dispatched separately.
+# Claude Code hook_event_name -> store state: the base mapping, kept whole as
+# the one place the vocabulary is stated. Several events need a payload-aware
+# branch on top of their entry, so they never reach the table lookup itself --
+# SessionEnd clears instead of writing, PostToolUse throttles, Notification
+# drops the idle nag, and Stop degrades to WORKING while background_tasks
+# still lists live work.
 _CLAUDE_EVENT_STATES = {
     "UserPromptSubmit": agent_state.WORKING,
     "Stop": agent_state.DONE,
@@ -46,8 +60,38 @@ def _refresh_due(cwd: str, now: float | None = None) -> bool:
     return (ref - ts_num) > REFRESH_S
 
 
+def _has_live_background_work(payload: dict[str, object]) -> bool:
+    """Does this Stop payload's ``background_tasks`` ledger still list work?
+
+    Entries look like ``{"id": ..., "type": "subagent"|"shell", "status":
+    "running", ...}``; the field is ``[]`` when nothing is pending and absent
+    entirely on Claude Code versions predating the ledger. Only an explicit
+    non-"running" status string (``completed``/``failed``/...) settles an
+    entry -- an unknown shape counts as live, because a premature ``done`` is
+    the expensive error (it paints a grinding session green and the user walks
+    away) while a late one self-corrects on the very next Stop.
+    """
+    tasks = payload.get("background_tasks")
+    if not isinstance(tasks, list):
+        return False
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        status = task.get("status")
+        if not isinstance(status, str) or status == "running":
+            return True
+    return False
+
+
 def handle_claude(payload: dict[str, object]) -> None:
     """Map one Claude Code hook event onto the store.
+
+    ``Stop`` fires when the MAIN agent's turn ends, which is immediate when
+    that turn just launched background subagents or shell tasks -- so it is
+    written as ``done`` only once the payload's ``background_tasks`` ledger is
+    drained, and as ``working`` while any entry is still live. The harness
+    re-invokes the agent when background work completes (a fresh
+    ``UserPromptSubmit``), so a final drained Stop is guaranteed to arrive.
 
     The idle nag ("Claude is waiting for your input") is deliberately NOT
     mapped to needs-input: it fires ~60s after a turn ends, when the store
@@ -70,6 +114,10 @@ def handle_claude(payload: dict[str, object]) -> None:
         if isinstance(msg, str) and "waiting for your input" in msg.lower():
             return
         agent_state.write_state(cwd, agent_state.NEEDS_INPUT, sid)
+    elif event == "Stop":
+        done = not _has_live_background_work(payload)
+        state = agent_state.DONE if done else agent_state.WORKING
+        agent_state.write_state(cwd, state, sid)
     elif event in _CLAUDE_EVENT_STATES:
         agent_state.write_state(cwd, _CLAUDE_EVENT_STATES[event], sid)
 

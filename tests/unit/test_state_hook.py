@@ -1,7 +1,7 @@
 """magent-state-hook tests -- the in-repo lifecycle writer (closes F-NC-001's
 "no live writer" gap): Claude Code event mapping, the PostToolUse refresh
-throttle, the idle-nag Notification filter, Codex notify, and the
-never-fail-the-turn contract of ``main``.
+throttle, the idle-nag Notification filter, the ``background_tasks`` guard on
+Stop, Codex notify, and the never-fail-the-turn contract of ``main``.
 """
 
 from __future__ import annotations
@@ -21,8 +21,21 @@ def _isolate_state(tmp_path, monkeypatch):
     monkeypatch.setattr(agent_state, "_warned_files", set())
 
 
-def _claude_event(event: str, cwd: str = "/projects/foo", **extra: str) -> dict:
+def _claude_event(event: str, cwd: str = "/projects/foo", **extra: object) -> dict:
     return {"hook_event_name": event, "cwd": cwd, "session_id": "sid-1", **extra}
+
+
+def _task(kind: str = "subagent", status: object = "running", **extra: object) -> dict:
+    """One ``background_tasks`` entry shaped like the real Claude Code payload."""
+    task: dict[str, object] = {
+        "id": "a10ca6de",
+        "type": kind,
+        "description": "run lighthouse CI",
+        **extra,
+    }
+    if status is not None:
+        task["status"] = status
+    return task
 
 
 def _stored_state(cwd: str = "/projects/foo") -> str | None:
@@ -76,6 +89,82 @@ class TestClaudeMapping:
         state_hook.handle_claude(_claude_event("Stop"))
         rec = agent_state.state_for("/projects/foo")
         assert rec is not None and rec["session_id"] == "sid-1"
+
+
+class TestStopBackgroundTasks:
+    """``Stop`` means "the main agent's turn ended", not "the work finished".
+
+    A turn that has just spawned background subagents / background shells ends
+    immediately, so an unconditional done would paint a session green while
+    lighthouse-CI subagents grind on for minutes. The harness's own pending-work
+    ledger (``background_tasks``) is the arbiter: any still-running entry keeps
+    the record working; the final Stop with a drained ledger writes done.
+    """
+
+    @pytest.mark.parametrize("kind", ["subagent", "shell"])
+    def test_running_task_keeps_working(self, kind):
+        state_hook.handle_claude(
+            _claude_event("Stop", background_tasks=[_task(kind=kind)])
+        )
+        assert _stored_state() == agent_state.WORKING
+
+    @pytest.mark.parametrize(
+        "tasks",
+        [
+            pytest.param([], id="empty-list"),
+            pytest.param([_task(status="completed")], id="completed-only"),
+            pytest.param(
+                [_task(status="completed"), _task(status="failed")], id="all-settled"
+            ),
+        ],
+    )
+    def test_drained_ledger_writes_done(self, tasks):
+        state_hook.handle_claude(_claude_event("Stop", background_tasks=tasks))
+        assert _stored_state() == agent_state.DONE
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("running", id="string"),
+            pytest.param(3, id="int"),
+            pytest.param({"id": "x", "status": "running"}, id="bare-dict"),
+            pytest.param(None, id="null"),
+        ],
+    )
+    def test_non_list_field_writes_done(self, value):
+        """Old Claude Code versions have no ledger at all -- a non-list value
+        must not be read as pending work."""
+        state_hook.handle_claude(_claude_event("Stop", background_tasks=value))
+        assert _stored_state() == agent_state.DONE
+
+    def test_absent_field_writes_done(self):
+        state_hook.handle_claude(_claude_event("Stop"))
+        assert _stored_state() == agent_state.DONE
+
+    def test_non_dict_entry_does_not_mask_a_running_one(self):
+        state_hook.handle_claude(
+            _claude_event("Stop", background_tasks=["junk", None, _task()])
+        )
+        assert _stored_state() == agent_state.WORKING
+
+    @pytest.mark.parametrize(
+        "status",
+        [pytest.param(None, id="missing"), pytest.param(7, id="non-string")],
+    )
+    def test_unknown_status_shape_counts_as_running(self, status):
+        """Unknown shapes fail toward "still running" -- a premature done is the
+        expensive error; a late done self-corrects on the next Stop."""
+        state_hook.handle_claude(
+            _claude_event("Stop", background_tasks=[_task(status=status)])
+        )
+        assert _stored_state() == agent_state.WORKING
+
+    def test_session_id_propagated_on_suppressed_done(self):
+        state_hook.handle_claude(_claude_event("Stop", background_tasks=[_task()]))
+        rec = agent_state.state_for("/projects/foo")
+        assert rec is not None
+        assert rec["state"] == agent_state.WORKING
+        assert rec["session_id"] == "sid-1"
 
 
 class TestPostToolUseThrottle:

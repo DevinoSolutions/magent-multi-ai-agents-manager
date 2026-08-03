@@ -240,7 +240,7 @@ Notes:
 magent hooks install
 ```
 
-This merges the bundled `magent-state-hook` writer into Claude Code's `~/.claude/settings.json` (idempotent — your existing hooks are preserved) and prints the one-line `notify` recipe for Codex's `~/.codex/config.toml`. Restart open agent sessions to activate. After that the session picker shows live `still going... 3m` / `done` / `needs input` labels — the hook refreshes the record on every tool call, so `still going...` means the agent really is moving — and `magent watch` / `magent attention -d` light up as your agents change state. `magent hooks status` shows what is wired and how fresh the store is.
+This merges the bundled `magent-state-hook` writer into Claude Code's `~/.claude/settings.json` (idempotent — your existing hooks are preserved) and prints the one-line `notify` recipe for Codex's `~/.codex/config.toml`. Restart open agent sessions to activate. After that the session picker shows live `still going... 3m` / `done` / `needs input` labels — the hook refreshes the record on every tool call, so `still going...` means the agent really is moving, and a session reads `done` only when its turn ends with no background tasks (subagents, background shells) still running — and `magent watch` / `magent attention -d` light up as your agents change state. `magent hooks status` shows what is wired and how fresh the store is.
 
 The companion [`ai-agent-notifier`](https://www.npmjs.com/package/ai-agent-notifier) package (same authors) adds phone/desktop notifications on top of the same hook events (it is a pure notifier — it does not write state records):
 
