@@ -5,6 +5,26 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.10.7] - 2026-08-03
+
+### Fixed
+
+- **`done` now means done -- not "the orchestrator stopped talking".** The
+  `magent-state-hook` writer mapped Claude Code's `Stop` event straight to
+  `done`, but `Stop` fires when the main agent's TURN ends -- an agent
+  that just dispatched background subagents (or long background shell
+  commands) ends its turn in seconds and goes quiet while that work
+  grinds on, so sessions running multi-minute background jobs were badged
+  `done` almost immediately. The Stop payload carries Claude Code's own
+  pending-work ledger (`background_tasks`, verified against the live
+  CLI); the hook now consults it -- a Stop with live entries writes
+  `working`, and only a Stop with a drained ledger writes `done`. The
+  harness re-invokes the session when background work completes, so the
+  final drained Stop arrives on its own. Unknown ledger shapes count as
+  still-running (premature `done` misleads; a late one self-corrects);
+  Claude Code versions predating the ledger keep the old behavior. No
+  hook re-wiring needed -- open sessions pick the fix up on upgrade.
+
 ## [3.10.6] - 2026-08-03
 
 ### Fixed
@@ -563,6 +583,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.10.7]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.6...v3.10.7
 [3.10.6]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.5...v3.10.6
 [3.10.5]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.4...v3.10.5
 [3.10.4]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.3...v3.10.4
