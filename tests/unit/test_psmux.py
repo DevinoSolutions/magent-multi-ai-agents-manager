@@ -467,6 +467,13 @@ _EXPECTED_HINT = (
     "#[bold,fg=cyan] F2 #[default]</> VS Code "
 )
 
+# ...and what a machine with no VS Code gets instead: the F1 half alone. F2 is
+# the hotkey listener's, and the listener needs `code` on PATH -- advertising
+# it on a box without VS Code is a lie the user can only discover by pressing
+# the key. Restated here for the same reason as the full hint: a restyle in
+# psmux.py must be a deliberate edit here too.
+_EXPECTED_HINT_F1_ONLY = "#[bold,fg=cyan] F1 #[default]Proj. Picker "
+
 
 def _visible_cells(status: str) -> int:
     """Worst-case columns `status` occupies. tmux style directives are free.
@@ -491,7 +498,9 @@ class TestDecorateSession:
     whatever its tmux.conf set at start-up.
     """
 
-    def _run(self, monkeypatch, *, boom: Exception | None = None):
+    def _run(
+        self, monkeypatch, *, boom: Exception | None = None, code_hint: bool = True
+    ):
         cmds: list[list[str]] = []
 
         def _fake_run(cmd, **kwargs):
@@ -501,6 +510,10 @@ class TestDecorateSession:
             return _FakeCompleted(returncode=0, stdout="")
 
         monkeypatch.setattr(subprocess, "run", _fake_run)
+        # Pinned, never probed: the dev box and the CI runners disagree about
+        # whether `code` is on PATH, and a hint pin that reads the ambient
+        # PATH pins nothing.
+        monkeypatch.setattr(psmux, "code_on_path", lambda: code_hint)
         psmux.decorate_session("api", psmux="psmux")
         return cmds
 
@@ -561,10 +574,13 @@ class TestDecorateSession:
             "10",
         ]
 
-    def test_the_argv_is_the_five_decorations(self):
+    @pytest.mark.parametrize("code_hint", [True, False])
+    def test_the_argv_is_the_five_decorations(self, code_hint):
         # The list is what every call site fans out, so its shape is contract:
         # a sixth command (or a dropped one) has to be a deliberate edit here.
-        argv = psmux.decoration_argv("api", "psmux")
+        # Gating F2 changes the hint TEXT, never the command shape -- dropping
+        # a `set` would leave a personal tmux.conf's value in place.
+        argv = psmux.decoration_argv("api", "psmux", code_hint)
         assert len(argv) == 5
         assert argv[0][3:] == ["bind", "-n", "F1", "detach-client"]
         assert [cmd[5] for cmd in argv[1:]] == [
@@ -579,36 +595,46 @@ class TestDecorateSession:
         # relationship, not just the two literals.
         assert int(psmux._STATUS_BRAND_LEN) >= len(" magent ")
 
-    def test_status_right_length_fits_the_hint(self):
+    @pytest.mark.parametrize("code_hint", [True, False])
+    def test_status_right_length_fits_the_hint(self, code_hint):
         # Same relationship on the other half. Style directives are free; count
         # cells, not characters, so a future wide glyph cannot shrink the check.
-        assert int(psmux._STATUS_HINTS_LEN) >= _visible_cells(psmux._STATUS_HINTS)
+        # Both variants: the F1-only budget is a smaller number guarding a
+        # shorter string, and it has to keep fitting it.
+        hint, budget = psmux.status_hints(code_hint)
+        assert int(budget) >= _visible_cells(hint)
 
-    def test_hint_is_pure_ascii(self):
+    @pytest.mark.parametrize("code_hint", [True, False])
+    def test_hint_is_pure_ascii(self, code_hint):
         # The load-bearing invariant behind the 3.10.3 hotfix: an East-Asian
         # AMBIGUOUS-width glyph (the U+2630 menu hamburger) made psmux and
         # Windows Terminal disagree on cell arithmetic -- a stray highlighted
         # cell inside the bar and a wrapped phantom row under it. A status bar
         # needs the renderer and the multiplexer to agree on width, so the hint
-        # stays ASCII-only. This must fail before any glyph goes back in.
+        # stays ASCII-only. This must fail before any glyph goes back in --
+        # for every variant, and for each half on its own, so a glyph cannot
+        # sneak into the half the default probe happens not to emit.
+        assert psmux.status_hints(code_hint)[0].isascii()
+        assert psmux._STATUS_HINTS_F1.isascii()
+        assert psmux._STATUS_HINTS_F2.isascii()
         assert psmux._STATUS_HINTS.isascii()
 
     def test_hint_advertises_both_keys(self):
         # The literal is defined once; a rename must not silently drop a key.
-        argv = psmux.decoration_argv("api", "psmux")
+        argv = psmux.decoration_argv("api", "psmux", True)
         assert "F1" in argv[1][-1] and "F2" in argv[1][-1]
 
     def test_hint_badges_each_key_name(self):
         # The readability fix: each key name is its own bold accent badge, so
         # "F1"/"F2" can't read as words in the label next to them.
-        hint = psmux.decoration_argv("api", "psmux")[1][-1]
+        hint = psmux.decoration_argv("api", "psmux", True)[1][-1]
         assert "#[bold,fg=cyan] F1 #[default]" in hint
         assert "#[bold,fg=cyan] F2 #[default]" in hint
 
     def test_hint_spells_out_what_each_key_does(self):
         # The other half of the fix: " F1 picker  F2 code " told the user
         # nothing. The labels, not the styling, are what must survive.
-        hint = psmux.decoration_argv("api", "psmux")[1][-1]
+        hint = psmux.decoration_argv("api", "psmux", True)[1][-1]
         assert "Proj. Picker" in hint
         assert "VS Code" in hint
         assert "</> VS Code" in hint
@@ -616,8 +642,87 @@ class TestDecorateSession:
     def test_brand_names_the_product(self):
         # Same guard on the other literal: the status-left is branding, so the
         # product name is the part that must survive a restyle.
-        argv = psmux.decoration_argv("api", "psmux")
+        argv = psmux.decoration_argv("api", "psmux", True)
         assert "magent" in argv[3][-1]
+
+    def test_the_full_hint_is_the_two_halves_with_a_three_column_seam(self):
+        # The split must not change what a VS-Code machine renders: the seam
+        # is still exactly three columns wide, as it was when the hint was one
+        # literal. Off-by-one here is invisible in review and obvious on screen.
+        assert psmux._STATUS_HINTS == _EXPECTED_HINT
+        assert psmux._STATUS_HINTS == (
+            _EXPECTED_HINT_F1_ONLY + psmux._STATUS_HINTS_GAP + psmux._STATUS_HINTS_F2
+        )
+        # One trailing space on the F1 half + the two-space seam = 3 columns.
+        assert psmux._STATUS_HINTS_F1.endswith(" ")
+        assert not psmux._STATUS_HINTS_F1.endswith("  ")
+        assert psmux._STATUS_HINTS_GAP == "  "
+
+    def test_with_code_the_hint_is_the_full_text_and_budget(self, monkeypatch):
+        cmds = self._run(monkeypatch, code_hint=True)
+        assert cmds[1][-1] == _EXPECTED_HINT
+        assert cmds[2][-1] == "40"
+
+    def test_without_code_the_f2_half_is_gone_from_every_argv(self, monkeypatch):
+        # The user-visible promise: on a machine with no VS Code, nothing in
+        # what magent sends mentions the key it cannot honour.
+        cmds = self._run(monkeypatch, code_hint=False)
+        assert cmds[1][-1] == _EXPECTED_HINT_F1_ONLY
+        assert cmds[2][-1] == psmux._STATUS_HINTS_F1_LEN
+        flat = " ".join(arg for cmd in cmds for arg in cmd)
+        assert "</>" not in flat
+        assert "VS Code" not in flat
+        assert "F2" not in flat
+
+    def test_without_code_the_budget_is_smaller_than_the_full_one(self):
+        # Not just "some number": dropping half the text without dropping the
+        # budget would leave the constant documenting a string it no longer
+        # guards.
+        assert int(psmux._STATUS_HINTS_F1_LEN) < int(psmux._STATUS_HINTS_LEN)
+        assert int(psmux._STATUS_HINTS_F1_LEN) >= _visible_cells(psmux._STATUS_HINTS_F1)
+
+    def test_f1_is_bound_either_way(self, monkeypatch):
+        # F1 is magent's own psmux binding, installed right here -- it is true
+        # for any viewer of the session, so no probe may gate it.
+        for hint in (True, False):
+            cmds = self._run(monkeypatch, code_hint=hint)
+            assert cmds[0] == [
+                "psmux",
+                "-L",
+                "api",
+                "bind",
+                "-n",
+                "F1",
+                "detach-client",
+            ]
+
+    def test_code_hint_defaults_to_probing_this_machine(self, monkeypatch):
+        # `code_hint=None` means "ask here" -- the decorating machine is the
+        # one whose PATH decides.
+        cmds: list[list[str]] = []
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **k: (
+                cmds.append(cmd),
+                _FakeCompleted(returncode=0, stdout=""),
+            )[1],
+        )
+        monkeypatch.setattr(psmux, "code_on_path", lambda: False)
+        psmux.decorate_session("api", psmux="psmux")
+        assert cmds[1][-1] == _EXPECTED_HINT_F1_ONLY
+
+    def test_code_on_path_asks_shutil_for_code(self, monkeypatch):
+        # The one owner of the probe; hotkey.py::_do_open_code resolves the
+        # very same name, and the hint must not promise a different binary.
+        asked: list[str] = []
+        monkeypatch.setattr(
+            psmux.shutil, "which", lambda n: asked.append(n) or "/usr/bin/code"
+        )
+        assert psmux.code_on_path() is True
+        assert asked == ["code"]
+        monkeypatch.setattr(psmux.shutil, "which", lambda n: None)
+        assert psmux.code_on_path() is False
 
     def test_never_raises_when_the_subprocess_fails(self, monkeypatch):
         # A status bar is cosmetic: an unlaunchable/hung psmux is logged and
@@ -640,11 +745,46 @@ class TestDecorateSession:
     def test_fan_out_covers_every_name(self, monkeypatch):
         seen: list[str] = []
         monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(psmux, "code_on_path", lambda: True)
         monkeypatch.setattr(
-            psmux, "decorate_session", lambda n, psmux=None: seen.append(n)
+            psmux,
+            "decorate_session",
+            lambda n, psmux=None, code_hint=None: seen.append(n),
         )
         assert psmux.decorate_sessions(["api", "web"]) == ["api", "web"]
         assert sorted(seen) == ["api", "web"]
+
+    def test_fan_out_probes_for_code_exactly_once(self, monkeypatch):
+        # The answer is a property of the machine, not of a session: probing
+        # per name would be one filesystem sweep each for one shared answer.
+        probes: list[int] = []
+        hints: list[bool | None] = []
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(psmux, "code_on_path", lambda: (probes.append(1), True)[1])
+        monkeypatch.setattr(
+            psmux,
+            "decorate_session",
+            lambda n, psmux=None, code_hint=None: hints.append(code_hint),
+        )
+        psmux.decorate_sessions(["api", "web", "docs"])
+        assert len(probes) == 1
+        assert hints == [True, True, True]
+
+    def test_fan_out_passes_an_explicit_hint_through_without_probing(self, monkeypatch):
+        hints: list[bool | None] = []
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+
+        def _boom():
+            raise AssertionError("must not probe when the caller already knows")
+
+        monkeypatch.setattr(psmux, "code_on_path", _boom)
+        monkeypatch.setattr(
+            psmux,
+            "decorate_session",
+            lambda n, psmux=None, code_hint=None: hints.append(code_hint),
+        )
+        psmux.decorate_sessions(["api", "web"], code_hint=False)
+        assert hints == [False, False]
 
     def test_fan_out_without_binary_is_a_noop(self, monkeypatch):
         monkeypatch.setattr(psmux, "find_psmux", lambda: None)

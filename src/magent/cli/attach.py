@@ -1287,6 +1287,11 @@ def up_cmd(
         # JSON. Sessions created by bring-up are decorated at birth by
         # launch_psmux_session, and `--json` never brings anything up, so
         # live_ids is the whole gap.
+        #
+        # No code_hint: this command runs ON the session host (attach drives it
+        # over SSH), the status line is that host's, and psmux scopes it per
+        # session rather than per client -- so the host's own `code` is the only
+        # answer the protocol lets us give. Probed once inside, for all names.
         decorate_psmux_sessions(live_ids)
         # deferred: resolving __version__ costs an importlib.metadata import,
         # and only the JSON envelope needs it (see cli/ui.py::_banner).
@@ -1369,7 +1374,8 @@ def up_cmd(
     # created by launch_psmux_session are decorated at birth; doing it again
     # here is what gives a PRE-EXISTING session (made before this feature, or
     # by an older magent) the hints without forcing a recreate. The `--json`
-    # branch above does the same for its live sessions.
+    # branch above does the same for its live sessions. Same host-side `code`
+    # probe as there: one for the batch, not one per session.
     decorate_psmux_sessions([*live_ids, *created])
 
     if cfg.settings.upload_server:
