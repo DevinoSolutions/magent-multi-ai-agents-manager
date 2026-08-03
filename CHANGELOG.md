@@ -5,6 +5,19 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.10.4] - 2026-08-02
+
+### Fixed
+
+- **The status-bar hint no longer corrupts the bar.** The ☰ menu glyph
+  shipped in 3.10.3 is U+2630, an East-Asian *ambiguous*-width codepoint:
+  psmux counts it as one cell, Windows Terminal draws it as two, so every
+  cell after it shifted right -- a stray highlighted cell inside the bar
+  and, when the shift spilled the last column, a wrapped phantom row of
+  black space under it. The hint is now pure ASCII
+  (`F1 Proj. Picker   F2 </> VS Code`), pinned by a test that fails before
+  any non-ASCII glyph can go back in.
+
 ## [3.10.3] - 2026-08-02
 
 ### Fixed
@@ -515,6 +528,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.10.4]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.3...v3.10.4
 [3.10.3]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.2...v3.10.3
 [3.10.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.1...v3.10.2
 [3.10.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.0...v3.10.1
