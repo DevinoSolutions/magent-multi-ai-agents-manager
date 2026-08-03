@@ -463,7 +463,7 @@ class TestReviveSessions:
 # The status-right hint, restated here on purpose: an independent copy is what
 # makes these pins catch a drive-by restyle instead of following it.
 _EXPECTED_HINT = (
-    "#[bold,fg=cyan] F1 #[default]\N{TRIGRAM FOR HEAVEN}Proj. Picker   "
+    "#[bold,fg=cyan] F1 #[default]Proj. Picker   "
     "#[bold,fg=cyan] F2 #[default]</> VS Code "
 )
 
@@ -471,9 +471,11 @@ _EXPECTED_HINT = (
 def _visible_cells(status: str) -> int:
     """Worst-case columns `status` occupies. tmux style directives are free.
 
-    Wide and fullwidth characters cost 2 cells; so does an *ambiguous*-width one
-    like the menu glyph, which a terminal may render either way -- the budget is
-    only safe if it assumes the wide rendering.
+    Wide and fullwidth characters cost 2 cells; so does an *ambiguous*-width
+    one, which a terminal may render either way -- the budget is only safe if
+    it assumes the wide rendering. Today's hint is pure ASCII (pinned below),
+    so the 2-cell term contributes nothing; it stays so the budget check keeps
+    telling the truth if a wide glyph ever sneaks back in.
     """
     text = re.sub(r"#\[[^\]]*\]", "", status)
     return sum(
@@ -530,7 +532,7 @@ class TestDecorateSession:
             "set",
             "-g",
             "status-right-length",
-            "44",
+            "40",
         ]
 
     def test_sets_the_status_left_brand(self, monkeypatch):
@@ -578,9 +580,18 @@ class TestDecorateSession:
         assert int(psmux._STATUS_BRAND_LEN) >= len(" magent ")
 
     def test_status_right_length_fits_the_hint(self):
-        # Same relationship on the other half. Style directives are free and the
-        # menu glyph may render double-width, so count cells, not characters.
+        # Same relationship on the other half. Style directives are free; count
+        # cells, not characters, so a future wide glyph cannot shrink the check.
         assert int(psmux._STATUS_HINTS_LEN) >= _visible_cells(psmux._STATUS_HINTS)
+
+    def test_hint_is_pure_ascii(self):
+        # The load-bearing invariant behind the 3.10.3 hotfix: an East-Asian
+        # AMBIGUOUS-width glyph (the U+2630 menu hamburger) made psmux and
+        # Windows Terminal disagree on cell arithmetic -- a stray highlighted
+        # cell inside the bar and a wrapped phantom row under it. A status bar
+        # needs the renderer and the multiplexer to agree on width, so the hint
+        # stays ASCII-only. This must fail before any glyph goes back in.
+        assert psmux._STATUS_HINTS.isascii()
 
     def test_hint_advertises_both_keys(self):
         # The literal is defined once; a rename must not silently drop a key.
@@ -600,9 +611,6 @@ class TestDecorateSession:
         hint = psmux.decoration_argv("api", "psmux")[1][-1]
         assert "Proj. Picker" in hint
         assert "VS Code" in hint
-        # No space after the menu glyph: it is East-Asian-ambiguous width, so a
-        # terminal that renders it wide supplies the gap itself.
-        assert "\N{TRIGRAM FOR HEAVEN}Proj. Picker" in hint
         assert "</> VS Code" in hint
 
     def test_brand_names_the_product(self):
