@@ -5,6 +5,25 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.10.6] - 2026-08-03
+
+### Fixed
+
+- **Agent commands can no longer be silently swallowed at bring-up.** A
+  fresh psmux session is a bare shell and the agent command is TYPED into
+  it via send-keys -- a channel with no delivery acknowledgment. Under a
+  spawn storm a still-initializing PowerShell can flush pending console
+  input and swallow the command outright: the pane then rests at an empty
+  prompt forever while passing every liveness probe, and the revive net
+  never sees it (it only sweeps sessions that existed before the
+  bring-up). Bring-up now verifies delivery: after each batch's sends,
+  every pane's current process is probed in one fan-out and any pane
+  still at the bare shell gets the configured command re-typed --
+  bounded at two retries, never injecting into a pane whose agent is
+  already running (or whose state can't be read), with a warning per
+  re-send and an error when a pane stays bare. Costs one 2s settle per
+  batch of five on a healthy bring-up.
+
 ## [3.10.5] - 2026-08-02
 
 ### Changed
@@ -544,6 +563,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.10.6]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.5...v3.10.6
 [3.10.5]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.4...v3.10.5
 [3.10.4]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.3...v3.10.4
 [3.10.3]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.2...v3.10.3
