@@ -5,6 +5,22 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.10.5] - 2026-08-02
+
+### Changed
+
+- **The status bar only advertises F2 where VS Code exists.** F1 (detach
+  back to the picker) is a psmux binding magent installs on the session's
+  own server, so it works for any viewer; F2 is handled by the magent
+  hotkey listener, which shells out to VS Code's `code` launcher -- on a
+  machine with no VS Code the hint advertised a key that would do nothing.
+  The `F2 </> VS Code` half is now emitted only when `code` resolves on
+  the machine decorating the session (probed once per batch); without it
+  the bar reads `F1 Proj. Picker` alone. Both variants stay pure ASCII --
+  the 3.10.4 invariant now pins each half on its own. tmux status lines
+  are session-scoped, not per-client, so the hint reflects the session
+  host's `code`; a per-viewer hint is outside the protocol.
+
 ## [3.10.4] - 2026-08-02
 
 ### Fixed
@@ -528,6 +544,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.10.5]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.4...v3.10.5
 [3.10.4]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.3...v3.10.4
 [3.10.3]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.2...v3.10.3
 [3.10.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.1...v3.10.2
