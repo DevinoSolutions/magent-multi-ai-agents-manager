@@ -228,6 +228,10 @@ _EXPECTED_HINT = (
     "#[bold,fg=cyan] F2 #[default]</> VS Code "
 )
 
+# ...and what the launch path sends on a machine with no VS Code: the F1 half
+# alone. F2 is the hotkey listener's key and the listener needs `code` on PATH.
+_EXPECTED_HINT_F1_ONLY = "#[bold,fg=cyan] F1 #[default]Proj. Picker "
+
 
 @pytest.mark.skipif(
     sys.platform != "win32", reason="WindowsPlatform binds windll at import"
@@ -237,7 +241,14 @@ class TestWindowsPsmuxDecoration:
     its status line, and a failure to do so is cosmetic -- never fatal to the
     bring-up."""
 
-    def _run(self, monkeypatch, *, popen_error: Exception | None = None):
+    def _run(
+        self,
+        monkeypatch,
+        *,
+        popen_error: Exception | None = None,
+        code_hint: bool = True,
+        windows: list[str] | None = None,
+    ):
         from magent.platform import PsmuxWindowOpts
         from magent.platform.windows import WindowsPlatform
 
@@ -261,19 +272,35 @@ class TestWindowsPsmuxDecoration:
                 raise popen_error
             return _Proc()
 
+        probes: list[int] = []
+
         monkeypatch.setattr("magent.platform.windows.find_psmux", lambda: "psmux")
         monkeypatch.setattr("magent.platform.windows.subprocess.Popen", _popen)
         monkeypatch.setattr(
             "magent.platform.windows._wait_for_panes_ready", lambda *a, **k: None
         )
-
-        WindowsPlatform().launch_psmux_session(
-            [PsmuxWindowOpts(window_name="api", cwd="/a/api", command="claude")]
+        # The inter-batch settle pause is real seconds; nothing here waits on
+        # a real process, so it only slows the multi-batch case down.
+        monkeypatch.setattr("magent.platform.windows.time.sleep", lambda _s: None)
+        # Pinned, never probed: a CI runner may or may not ship `code`, and a
+        # pin that reads the runner's PATH pins nothing. `probes` rides along
+        # so the once-per-bring-up contract is checkable.
+        monkeypatch.setattr(
+            "magent.platform.windows.code_on_path",
+            lambda: (probes.append(1), code_hint)[1],
         )
-        return calls
+
+        names = windows or ["api"]
+        WindowsPlatform().launch_psmux_session(
+            [
+                PsmuxWindowOpts(window_name=n, cwd=f"/a/{n}", command="claude")
+                for n in names
+            ]
+        )
+        return calls, probes
 
     def test_created_session_is_decorated(self, monkeypatch):
-        calls = self._run(monkeypatch)
+        calls, _ = self._run(monkeypatch, code_hint=True)
         assert ["psmux", "-L", "api", "bind", "-n", "F1", "detach-client"] in calls
         assert [
             "psmux",
@@ -295,10 +322,58 @@ class TestWindowsPsmuxDecoration:
             "40",
         ] in calls
 
+    def test_without_code_the_launch_path_advertises_f1_alone(self, monkeypatch):
+        # The machine launching IS the machine displaying these windows, so its
+        # own PATH is the right authority -- and when `code` isn't on it, the
+        # F2 key must not be advertised anywhere in what magent sends.
+        calls, _ = self._run(monkeypatch, code_hint=False)
+        assert ["psmux", "-L", "api", "bind", "-n", "F1", "detach-client"] in calls
+        assert [
+            "psmux",
+            "-L",
+            "api",
+            "set",
+            "-g",
+            "status-right",
+            _EXPECTED_HINT_F1_ONLY,
+        ] in calls
+        assert [
+            "psmux",
+            "-L",
+            "api",
+            "set",
+            "-g",
+            "status-right-length",
+            "22",
+        ] in calls
+        flat = " ".join(arg for cmd in calls for arg in cmd)
+        assert "</>" not in flat
+        assert "VS Code" not in flat
+        assert "F2" not in flat
+
+    def test_code_is_probed_once_per_bring_up_not_per_window(self, monkeypatch):
+        # Two batches' worth of sessions (_BRING_UP_BATCH is 5), so a probe
+        # inside the batch loop -- or inside _decorate_batch -- would show up
+        # as more than one call.
+        names = [f"p{i}" for i in range(7)]
+        calls, probes = self._run(monkeypatch, windows=names)
+        assert len(probes) == 1
+        # ...and every session still got the hint the single probe decided.
+        for n in names:
+            assert [
+                "psmux",
+                "-L",
+                n,
+                "set",
+                "-g",
+                "status-right",
+                _EXPECTED_HINT,
+            ] in calls
+
     def test_created_session_is_branded(self, monkeypatch):
         # decoration_argv is the single source, so the creation batch picks the
         # brand up with no call-site change -- this pins that it actually does.
-        calls = self._run(monkeypatch)
+        calls, _ = self._run(monkeypatch)
         assert [
             "psmux",
             "-L",
@@ -319,7 +394,7 @@ class TestWindowsPsmuxDecoration:
         ] in calls
 
     def test_decoration_happens_after_the_agent_is_sent(self, monkeypatch):
-        calls = self._run(monkeypatch)
+        calls, _ = self._run(monkeypatch)
         sent = next(i for i, c in enumerate(calls) if "send-keys" in c)
         bound = next(i for i, c in enumerate(calls) if "bind" in c)
         assert bound > sent

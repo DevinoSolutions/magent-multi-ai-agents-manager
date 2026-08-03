@@ -341,10 +341,22 @@ def flash_message(
 # the multiplexer's width arithmetic must agree, so: no ambiguous-width glyphs
 # here, ever. `</>` is the universal "code" mark for the VS Code half -- three
 # plain ASCII cells, zero font support required.
-_STATUS_HINTS = (
-    "#[bold,fg=cyan] F1 #[default]Proj. Picker   "
-    "#[bold,fg=cyan] F2 #[default]</> VS Code "
-)
+#
+# The two halves are separate literals because only F1 is unconditionally
+# true. F1 is a psmux binding this module installs on the session's own
+# server, so it works for any viewer of that session. F2 is handled by the
+# magent hotkey listener, which shells out to `code` -- on a machine with no
+# VS Code that half advertises a key that does nothing, so it is only emitted
+# when `code` resolves (see `status_hints`).
+_STATUS_HINTS_F1 = "#[bold,fg=cyan] F1 #[default]Proj. Picker "
+
+_STATUS_HINTS_F2 = "#[bold,fg=cyan] F2 #[default]</> VS Code "
+
+# Two more spaces between the halves: each half already carries one trailing
+# space, so the seam reads as the same 3-column gap it always has.
+_STATUS_HINTS_GAP = "  "
+
+_STATUS_HINTS = _STATUS_HINTS_F1 + _STATUS_HINTS_GAP + _STATUS_HINTS_F2
 
 # ...and the width budget has to travel with it, exactly like the brand's below.
 # tmux truncates status-right at `status-right-length` (default 40, but a
@@ -354,6 +366,13 @@ _STATUS_HINTS = (
 # 4 + 12 + 3 + 4 + 3 + 9 = 35 columns, every one a single unambiguous cell.
 # 40 carries that plus headroom for a label tweak.
 _STATUS_HINTS_LEN = "40"
+
+# The F1-only variant needs its own budget: leaving 40 here would be harmless
+# on paper but wrong in spirit -- the number is documentation of the text it
+# guards. Visible cells are " F1 " + "Proj. Picker" + the half's own trailing
+# space = 4 + 12 + 1 = 17, and 22 carries that plus the same 5 columns of
+# headroom the full hint's 40 gives its 35.
+_STATUS_HINTS_F1_LEN = "22"
 
 # The product's own status-left brand, same plainness as the hints: one word,
 # one accent. magent *owns* this per session rather than inheriting whatever a
@@ -367,7 +386,34 @@ _STATUS_BRAND = "#[bold,fg=green] magent #[default]"
 _STATUS_BRAND_LEN = "10"
 
 
-def decoration_argv(name: str, psmux: str) -> list[list[str]]:
+def code_on_path() -> bool:
+    """True when VS Code's ``code`` launcher resolves on THIS machine.
+
+    The single owner of that probe, so the ``"code"`` literal and the hotkey
+    listener's own ``shutil.which("code")`` in ``hotkey.py::_do_open_code``
+    can't drift into advertising a key the listener would then refuse.
+    """
+    return shutil.which("code") is not None
+
+
+def status_hints(code_hint: bool) -> tuple[str, str]:
+    """The status-right text and its width budget, as a pair.
+
+    Returned together because they are one decision: the budget documents the
+    text it guards, and setting one without the other lets a personal
+    ``~/.tmux.conf`` truncate the hint mid-label.
+
+    ``code_hint`` is whether the F2 half is truthful here -- see
+    ``decoration_argv``. Every variant is pure ASCII by construction (both
+    halves are), which is load-bearing: an ambiguous-width glyph in a status
+    bar desyncs psmux's and Windows Terminal's cell arithmetic.
+    """
+    if code_hint:
+        return _STATUS_HINTS, _STATUS_HINTS_LEN
+    return _STATUS_HINTS_F1, _STATUS_HINTS_F1_LEN
+
+
+def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
     """The psmux commands that brand ``name`` and advertise its window hotkeys.
 
     Five of them: magent *owns* F1 -> detach-client per session (the hint has to
@@ -382,18 +428,34 @@ def decoration_argv(name: str, psmux: str) -> list[list[str]]:
 
     Split out from ``decorate_session`` so the launch path can fan the same
     argvs out as raw Popens while callers with one session run them inline.
+
+    ``code_hint`` gates the F2 half of the status-right and has no default:
+    every call site has to decide. F1 (detach -> back to the picker) is a
+    host-side psmux binding installed right here, so it is true for any viewer
+    of the session; F2 is handled by the magent hotkey listener, which needs
+    ``code`` on PATH, so its half is advertised only when ``code`` resolves on
+    the machine doing the decorating. tmux's status line is session-scoped, not
+    per-client, so a single answer per session is all the protocol allows --
+    a per-viewer hint is out of scope, not an oversight.
     """
+    hints, hints_len = status_hints(code_hint)
     return [
         [psmux, "-L", name, "bind", "-n", "F1", "detach-client"],
-        [psmux, "-L", name, "set", "-g", "status-right", _STATUS_HINTS],
-        [psmux, "-L", name, "set", "-g", "status-right-length", _STATUS_HINTS_LEN],
+        [psmux, "-L", name, "set", "-g", "status-right", hints],
+        [psmux, "-L", name, "set", "-g", "status-right-length", hints_len],
         [psmux, "-L", name, "set", "-g", "status-left", _STATUS_BRAND],
         [psmux, "-L", name, "set", "-g", "status-left-length", _STATUS_BRAND_LEN],
     ]
 
 
-def decorate_session(name: str, psmux: str | None = None) -> None:
+def decorate_session(
+    name: str, psmux: str | None = None, code_hint: bool | None = None
+) -> None:
     """Brand one session's status line and advertise its F1/F2 hints.
+
+    ``code_hint=None`` means "probe here": this machine is decorating, so
+    whether ``code`` resolves here is exactly the question. Callers that
+    already probed (``decorate_sessions``) pass the answer down instead.
 
     Best-effort and guarded exactly like ``flash_message``: a status bar is
     cosmetic, so a missing binary, a hung psmux, or a non-zero exit is logged
@@ -402,7 +464,9 @@ def decorate_session(name: str, psmux: str | None = None) -> None:
     binary = psmux or find_psmux()
     if not binary:
         return
-    for cmd in decoration_argv(name, binary):
+    if code_hint is None:
+        code_hint = code_on_path()
+    for cmd in decoration_argv(name, binary, code_hint):
         try:
             subprocess.run(cmd, capture_output=True, timeout=3, check=False)
         except (OSError, subprocess.SubprocessError) as exc:
@@ -411,20 +475,28 @@ def decorate_session(name: str, psmux: str | None = None) -> None:
             )
 
 
-def decorate_sessions(names: list[str]) -> list[str]:
+def decorate_sessions(names: list[str], code_hint: bool | None = None) -> list[str]:
     """Decorate many sessions concurrently. Returns the names attempted.
 
     Each session is its own psmux server, so the round-trips per name
     would otherwise serialize across a large config -- same fan-out shape as
     ``revive_sessions``.
+
+    The ``code`` probe is resolved ONCE for the whole batch and passed down:
+    the answer is a property of this machine, not of a session, so a
+    per-session ``shutil.which`` would be one filesystem sweep per name for
+    one shared answer.
     """
     from concurrent.futures import ThreadPoolExecutor
 
     binary = find_psmux()
     if not binary or not names:
         return []
+    hint = code_on_path() if code_hint is None else code_hint
     with ThreadPoolExecutor(max_workers=16) as pool:
-        list(pool.map(lambda n: decorate_session(n, psmux=binary), names))
+        list(
+            pool.map(lambda n: decorate_session(n, psmux=binary, code_hint=hint), names)
+        )
     return list(names)
 
 

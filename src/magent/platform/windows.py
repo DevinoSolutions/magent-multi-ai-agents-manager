@@ -19,7 +19,7 @@ from magent.platform import (
     VSCodeLaunchOpts,
     find_psmux,
 )
-from magent.psmux import capture_pane, decoration_argv
+from magent.psmux import capture_pane, code_on_path, decoration_argv
 
 user32 = windll.user32
 shcore = windll.shcore
@@ -411,6 +411,11 @@ class WindowsPlatform(Platform):
         for p in kills:
             p.wait()
 
+        # One probe for the whole bring-up: the launching machine IS the one
+        # whose windows these are, and `code` is not going to appear on PATH
+        # between two batches. Per-window would be one filesystem sweep each.
+        code_hint = code_on_path()
+
         # Batched bring-up: creating every session AND cold-starting every
         # agent at once is a resource storm (dozens of ConPTYs + agent
         # processes spawning simultaneously starved the host to the point
@@ -470,16 +475,20 @@ class WindowsPlatform(Platform):
             for p in senders:
                 p.wait()
 
-            self._decorate_batch(psmux, batch)
+            self._decorate_batch(psmux, batch, code_hint)
 
     @staticmethod
-    def _decorate_batch(psmux: str, batch: list[PsmuxWindowOpts]) -> None:
-        """Advertise the F1/F2 hints in a freshly-created batch's status lines.
+    def _decorate_batch(
+        psmux: str, batch: list[PsmuxWindowOpts], code_hint: bool
+    ) -> None:
+        """Advertise the F1 (and, when truthful, F2) hints in a fresh batch.
 
         Fanned out as Popens like the creates/senders above -- each session is
         its own psmux server, so serializing two round-trips per session would
         add real time to a large bring-up. Purely cosmetic, so the whole thing
         is swallowed on error: a status bar must never fail a bring-up.
+
+        ``code_hint`` is resolved once by the caller for the whole bring-up.
         """
         try:
             decorations = [
@@ -487,7 +496,7 @@ class WindowsPlatform(Platform):
                     cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                 )
                 for w in batch
-                for cmd in decoration_argv(w.window_name, psmux)
+                for cmd in decoration_argv(w.window_name, psmux, code_hint)
             ]
         except OSError as exc:
             get_logger("platform").warning("status-line decoration failed: %s", exc)

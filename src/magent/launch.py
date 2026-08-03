@@ -757,11 +757,18 @@ def revive_psmux(
     return psmux.revive_sessions(config, only, group)
 
 
-def decorate_psmux_sessions(names: list[str]) -> list[str]:
-    """Delegate to ``psmux.decorate_sessions``."""
+def decorate_psmux_sessions(
+    names: list[str], code_hint: bool | None = None
+) -> list[str]:
+    """Delegate to ``psmux.decorate_sessions``.
+
+    ``code_hint`` stays optional here (unlike ``decoration_argv``'s required
+    one) so existing callers keep working and get the default "probe on this
+    machine" behaviour, which is what every one of them wants.
+    """
     from magent import psmux
 
-    return psmux.decorate_sessions(names)
+    return psmux.decorate_sessions(names, code_hint=code_hint)
 
 
 def kill_psmux(names: list[str]) -> list[str]:
