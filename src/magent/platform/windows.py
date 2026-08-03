@@ -19,7 +19,13 @@ from magent.platform import (
     VSCodeLaunchOpts,
     find_psmux,
 )
-from magent.psmux import capture_pane, code_on_path, decoration_argv
+from magent.psmux import (
+    capture_pane,
+    code_on_path,
+    decoration_argv,
+    is_idle_command,
+    pane_current_commands,
+)
 
 user32 = windll.user32
 shcore = windll.shcore
@@ -28,6 +34,22 @@ shcore = windll.shcore
 # loop in launch_psmux_session).
 _BRING_UP_BATCH = 5
 _BRING_UP_BATCH_PAUSE_S = 2.0
+
+# Send-keys verification (see _verify_sends_landed). A fresh session is a bare
+# pwsh and the agent command is TYPED into it, so a shell that is still
+# initializing can flush the pending input away (PSReadLine does exactly this)
+# and swallow the command outright -- the pane then rests at a prompt forever
+# while passing every liveness probe.
+#
+# The settle must outlast an ordinary-but-slow start: `cmd /c <agent>` needs to
+# have spawned cmd before the probe runs, or a merely-slow pane reads as a
+# casualty and gets a second command typed on top of it. Same order as
+# _BRING_UP_BATCH_PAUSE_S, for the same reason (a loaded host).
+_SEND_VERIFY_SETTLE_S = 2.0
+# Total sends per pane INCLUDING the original -- so at most two re-sends. A
+# pane still bare after that is a real fault to report, not one to keep
+# hammering: each attempt costs the batch another settle.
+_SEND_MAX_ATTEMPTS = 3
 
 # Geometry-reclaim nudge (see Platform.nudge_windows). The delta must be large
 # enough to change the terminal's character grid -- a sub-cell nudge resizes
@@ -42,6 +64,25 @@ _NUDGE_SETTLE_S = 0.15
 # than stall the flow; a timeout is reported as "we could not look", and the
 # caller then leaves every window alone.
 _PROC_SCAN_TIMEOUT_S = 10.0
+
+
+def _send_argv(psmux: str, w: PsmuxWindowOpts) -> list[str]:
+    """The one argv that types a window's agent command into its pane.
+
+    Shared by the first send and every re-send (_verify_sends_landed): a retry
+    that diverged from the original would resurrect the pane with a command
+    the user never configured.
+    """
+    return [
+        psmux,
+        "-L",
+        w.window_name,
+        "send-keys",
+        "-t",
+        w.window_name,
+        f"cmd /c {w.command}",
+        "Enter",
+    ]
 
 
 def _wait_for_panes_ready(
@@ -452,16 +493,7 @@ class WindowsPlatform(Platform):
 
             senders = [
                 subprocess.Popen(
-                    [
-                        psmux,
-                        "-L",
-                        w.window_name,
-                        "send-keys",
-                        "-t",
-                        w.window_name,
-                        f"cmd /c {w.command}",
-                        "Enter",
-                    ],
+                    _send_argv(psmux, w),
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
@@ -475,7 +507,78 @@ class WindowsPlatform(Platform):
             for p in senders:
                 p.wait()
 
+            # A send-keys that *exits 0* still proves nothing: the keystrokes
+            # reached psmux, not necessarily the shell reading its console.
+            self._verify_sends_landed(psmux, batch)
+
             self._decorate_batch(psmux, batch, code_hint)
+
+    @staticmethod
+    def _verify_sends_landed(psmux: str, batch: list[PsmuxWindowOpts]) -> None:
+        """Re-type the agent command into any pane the send-keys never reached.
+
+        Detection is the same primitive ``revive_sessions`` uses -- a pane
+        whose ``#{pane_current_command}`` is a bare shell has no agent. The
+        probe runs immediately before each re-send and is the ONLY guard
+        against the dangerous edge: re-sending into a live agent would type
+        the command text into its input box. So anything that is not a shell
+        is left alone, and an empty/unreadable reading counts as "not a
+        casualty" -- never inject into a pane whose state we could not
+        establish (``psmux.agent_idle`` takes the same posture).
+
+        Probed as one fan-out per round (``pane_current_commands``), not a
+        round-trip per session: a full batch would otherwise serialize five.
+
+        Never raises. A pane that stays bare through every attempt is logged
+        and left as-is -- at worst exactly what it was before this pass -- so
+        one stuck pane cannot cost the wave its remaining sessions.
+        """
+        log = get_logger("platform")
+        pending = {w.window_name: w for w in batch}
+        sends = 1  # the caller already typed the command once
+        while True:
+            time.sleep(_SEND_VERIFY_SETTLE_S)
+            readings = pane_current_commands(list(pending), psmux=psmux)
+            pending = {
+                name: w
+                for name, w in pending.items()
+                if is_idle_command(readings.get(name, ""))
+            }
+            if not pending:
+                return
+            names = ", ".join(pending)
+            if sends >= _SEND_MAX_ATTEMPTS:
+                log.error(
+                    "agent command never landed in %s after %d sends; "
+                    "pane left at a bare shell",
+                    names,
+                    sends,
+                )
+                return
+            sends += 1
+            log.warning(
+                "send-keys did not land in %s; re-sending (send %d of %d)",
+                names,
+                sends,
+                _SEND_MAX_ATTEMPTS,
+            )
+            try:
+                resends = [
+                    subprocess.Popen(
+                        _send_argv(psmux, w),
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    for w in pending.values()
+                ]
+            except OSError:
+                # Spawning the retry itself failed -- same outcome as a pane
+                # that never recovers (bare shell), so it reports at the same
+                # level, with the traceback since this one is a host fault.
+                log.exception("could not spawn a send-keys re-send for %s", names)
+                return
+            for p in resends:
+                p.wait()
 
     @staticmethod
     def _decorate_batch(
