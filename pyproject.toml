@@ -60,7 +60,7 @@ qr = ["qrcode>=7"]
 # pexpect drives the POSIX real-PTY menu tests; pywinpty (win32-only wheels)
 # drives the same tests over a real ConPTY on Windows — hence the platform
 # marker so `pip install -e ".[dev]"` still resolves on macOS/Linux.
-dev = ["pytest>=7.0", "pexpect>=4.8", "pywinpty>=2.0; sys_platform == 'win32'", "ruff>=0.15", "pytest-cov>=5.0", "ty==0.0.59", "vulture>=2.14"]
+dev = ["pytest>=7.0", "pexpect>=4.8", "pywinpty>=2.0; sys_platform == 'win32'", "ruff>=0.15", "pytest-cov>=5.0", "ty==0.0.65", "vulture>=2.14"]
 # Kept out of `dev` on purpose: Playwright + its browser download are heavy and
 # only the dedicated browser-upload CI job needs them, so the OS x Py unit matrix
 # and the quality gate stay lean. Never a runtime dep (the dist import-sweep
