@@ -35,6 +35,16 @@ from magent.platform import PsmuxWindowOpts, TerminalNotFoundError
 from tests.conftest import FakePlatform
 
 
+@pytest.fixture(autouse=True)
+def _no_real_psmux_probe(monkeypatch):
+    """`_start_psmux_and_upload` now runs the same creation verify the attach
+    path's `bring_up` does, and that verify shells out to the host's psmux
+    binary. A unit test must not depend on whether the machine running it has
+    psmux installed, so the binary reads as absent (the verify's documented
+    no-op) unless a test opts back in -- TestGoPathCreationVerify does."""
+    monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+
+
 class TestNoMonitors:
     def test_returns_2_and_logs_error(self, monkeypatch, caplog):
         # FakePlatform's list_monitors() needs only monitors=[] and a no-op
@@ -264,6 +274,45 @@ class TestStartPsmuxAndUpload:
 
         assert fp.launched_psmux == []
         assert fp.attached_psmux == []
+
+
+class TestGoPathCreationVerify:
+    """The --go path reaches psmux through the same `launch_psmux_session` the
+    attach path's `bring_up` does, so it shares the creation verify: a session
+    that never came up is named in the log and respawned once. Without this,
+    only `magent attach`/`up` would have proof a session exists."""
+
+    def _run(self, monkeypatch, *, missing):
+        fp = FakePlatform(supports_psmux=True, psmux_launch_failures=set(missing))
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: "psmux")
+        monkeypatch.setattr("magent.psmux.time.sleep", lambda _s: None)
+        monkeypatch.setattr(
+            "magent.psmux.has_session",
+            lambda name, psmux=None, timeout=None: name in fp.psmux_sessions,
+        )
+        windows = [
+            PsmuxWindowOpts(window_name=n, cwd=f"/tmp/{n}", command="claude")
+            for n in ("a", "b")
+        ]
+        result = _LaunchResult(
+            targets=[], psmux_windows=windows, psmux_colors={"a": None, "b": None}
+        )
+        _start_psmux_and_upload(fp, MagentConfig(projects=[]), RunOpts(), result)
+        return fp
+
+    def test_a_session_that_never_came_up_is_respawned(self, monkeypatch):
+        fp = self._run(monkeypatch, missing=["a"])
+        assert fp.psmux_launches == [["a", "b"], ["a"]]
+
+    def test_a_healthy_go_launch_is_never_respawned(self, monkeypatch):
+        fp = self._run(monkeypatch, missing=[])
+        assert fp.psmux_launches == [["a", "b"]]
+
+    def test_attach_still_covers_every_window(self, monkeypatch):
+        # The verify is additive: the respawn must not change which windows
+        # get attached, nor attach the recreated one twice.
+        fp = self._run(monkeypatch, missing=["a"])
+        assert [c[0] for c in fp.attached_psmux] == ["a", "b"]
 
 
 class TestHotkeyRestartReason:

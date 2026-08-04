@@ -16,11 +16,13 @@ import functools
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from magent.config import MagentConfig
+    from magent.platform import Platform
 
 from magent.log import get_logger
 
@@ -54,19 +56,30 @@ def session_name(title: str) -> str:
     return title.replace(".", "-").replace(":", "-").replace(" ", "-")
 
 
-def has_session(name: str, psmux: str | None = None) -> bool:
-    """True if a psmux session named ``name`` is alive."""
+def has_session(
+    name: str, psmux: str | None = None, timeout: float | None = None
+) -> bool:
+    """True if a psmux session named ``name`` is alive.
+
+    ``timeout`` bounds the probe and a timed-out probe answers False. Left at
+    the default the call blocks exactly as before -- only the bring-up creation
+    verify passes a bound, because a wedged psmux server answers nothing at all
+    and would otherwise hold the whole fan-out hostage.
+    """
     binary = psmux or find_psmux()
     if not binary:
         return False
-    return (
-        subprocess.run(
+    try:
+        result = subprocess.run(
             [binary, "-L", name, "has-session"],
             capture_output=True,
+            timeout=timeout,
             check=False,
-        ).returncode
-        == 0
-    )
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    else:
+        return result.returncode == 0
 
 
 def kill_server(name: str, psmux: str | None = None) -> bool:
@@ -667,8 +680,98 @@ def bring_up(
             )
         )
     if windows:
-        plat.launch_psmux_session(windows)
+        launch_verified(plat, windows)
     return [w.window_name for w in windows]
+
+
+# Mirrors ``platform/windows.py::_SEND_VERIFY_SETTLE_S`` on purpose: a freshly
+# created psmux server needs a beat before it answers control commands, and the
+# two verifies run back to back in the same bring-up, so a different pause here
+# would only be a second number to reason about.
+_CREATE_VERIFY_SETTLE_S = 2.0
+# A wedged psmux server answers nothing at all -- in the incident below every
+# control command against its socket timed out. Bound each probe so one wedged
+# server costs its own timeout instead of the whole fan-out's.
+_CREATE_PROBE_TIMEOUT_S = 3.0
+
+
+def _missing_sessions(names: list[str], binary: str) -> list[str]:
+    """The subset of ``names`` whose session does not answer ``has-session``.
+
+    Concurrent fan-out, the shape ``revive_sessions`` already uses: one bounded
+    probe per session, all in flight together, so a 40-session bring-up pays
+    roughly one round-trip rather than 40 sequential ones.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _up(name: str) -> bool:
+        return has_session(name, psmux=binary, timeout=_CREATE_PROBE_TIMEOUT_S)
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        flags = list(pool.map(_up, names))
+    return [n for n, ok in zip(names, flags, strict=True) if not ok]
+
+
+def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> list[str]:
+    """Create ``windows`` through the platform, then prove each session exists.
+
+    ``launch_psmux_session`` reports success the moment its ``new-session``
+    processes exit 0, which is not the same thing as a live psmux server.
+    During a ~40-session attach bring-up storm one project's server wedged --
+    every control command against its socket timed out -- and NOTHING detected
+    it: creation had no verify at all, so the picker showed that project down
+    forever and only a second, storm-free bring-up recreated it. This is the
+    creation-level twin of ``platform/windows.py::_verify_sends_landed``.
+
+    ASYMMETRY WITH THE SEND VERIFIER, deliberately: that one treats an
+    empty/unreadable pane reading as "not a casualty", because re-sending into
+    a pane whose state is unknown would type the agent command into a live
+    agent. Here the remedy is ``new-session``, which ``launch_psmux_session``
+    already skips for any session that answers ``has-session`` -- so re-running
+    it is safe, and an unknown state (including a probe that TIMED OUT against
+    a wedged server) counts as MISSING and is retried. Unknown is safe to
+    re-create; it is not safe to inject into.
+
+    Never raises out of the verify: one stuck session must not cost the wave
+    its remaining ones. Returns the names still missing after the one retry.
+    """
+    if not windows:
+        return []
+    plat.launch_psmux_session(windows)
+
+    log = get_logger("launch")
+    binary = find_psmux()
+    if not binary:
+        return []
+
+    # Settle first: the storm's timeouts were transient churn, and probing at
+    # t=0 would misclassify slow-but-fine servers on a loaded host.
+    time.sleep(_CREATE_VERIFY_SETTLE_S)
+    missing = _missing_sessions([w.window_name for w in windows], binary)
+    if not missing:
+        return []
+
+    log.warning(
+        "session did not come up after bring-up; respawning: %s", ", ".join(missing)
+    )
+    stuck = set(missing)
+    try:
+        # Back through the full launch path on purpose -- a hand-rolled
+        # ``new-session`` here would diverge from the original recipe (batch
+        # pacing, send-keys verification, status-line decoration).
+        plat.launch_psmux_session([w for w in windows if w.window_name in stuck])
+    except (OSError, subprocess.SubprocessError):
+        log.exception("respawn failed for %s", ", ".join(missing))
+        return missing
+
+    time.sleep(_CREATE_VERIFY_SETTLE_S)
+    still_missing = _missing_sessions(missing, binary)
+    if still_missing:
+        log.error(
+            "session never came up after respawn; left down: %s",
+            ", ".join(still_missing),
+        )
+    return still_missing
 
 
 def revive_sessions(
