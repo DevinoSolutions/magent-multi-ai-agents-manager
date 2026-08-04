@@ -5,6 +5,32 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.10.8] - 2026-08-04
+
+### Fixed
+
+- **A session that never comes up during a bring-up storm is now detected
+  and respawned.** A big attach (or `--go`) launching dozens of sessions
+  at once can wedge an individual psmux server hard enough that its
+  session never materializes -- and nothing noticed: the send-keys
+  verifier (3.10.6) deliberately leaves unreadable panes alone, so a
+  session that never EXISTED was invisible to it, and the project simply
+  showed "down" in the picker until the next `magent attach` happened to
+  recreate it. Bring-up now proves every session it launched answers
+  `has-session` (bounded concurrent probe after a short settle), respawns
+  the missing ones exactly once through the full original launch path --
+  send-keys verification and decoration included -- and re-probes;
+  still-missing sessions are named in an error log and left alone, so one
+  stuck session can never cost the wave. The retry posture is
+  deliberately the opposite of the send verifier's: re-typing into an
+  unreadable pane could stomp a live agent, but re-running `new-session`
+  is harmless, so here an unknown (including a probe timeout against a
+  wedged server) counts as missing and gets the retry. Both bring-up
+  entry points share the verify -- attach storms and `--go` launches.
+  Greppable telemetry in `launch.log`: `session did not come up after
+  bring-up; respawning: <names>` / `session never came up after respawn;
+  left down: <names>`.
+
 ## [3.10.7] - 2026-08-03
 
 ### Fixed
