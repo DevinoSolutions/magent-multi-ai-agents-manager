@@ -109,6 +109,7 @@ class FakePlatform(Platform):
         cmdlines=None,
         scan_error: Exception | None = None,
         close_error: Exception | None = None,
+        psmux_launch_failures=None,
     ):
         self._monitors = (
             monitors
@@ -135,6 +136,13 @@ class FakePlatform(Platform):
         self.launched_terminals: list[TerminalLaunchOpts] = []
         self.launched_vscode: list[VSCodeLaunchOpts] = []
         self.launched_psmux: list[PsmuxWindowOpts] = []
+        # A session name in `psmux_launch_failures` does NOT become live on its
+        # first launch -- the storm-wedged psmux server the bring-up creation
+        # verify exists to catch (new-session exits 0, no server answers). A
+        # later launch of the same name succeeds, so a respawn is provable.
+        self._psmux_launch_failures = set(psmux_launch_failures or ())
+        self.psmux_sessions: set[str] = set()
+        self.psmux_launches: list[list[str]] = []
         self.attached_psmux: list[tuple] = []
         self.moved: list[tuple] = []
         self.nudged: list[list] = []
@@ -173,6 +181,12 @@ class FakePlatform(Platform):
 
     def launch_psmux_session(self, windows) -> None:
         self.launched_psmux.extend(windows)
+        self.psmux_launches.append([w.window_name for w in windows])
+        for w in windows:
+            if w.window_name in self._psmux_launch_failures:
+                self._psmux_launch_failures.discard(w.window_name)
+                continue
+            self.psmux_sessions.add(w.window_name)
 
     def attach_psmux(self, session_name, title, color=None, config_path=None) -> None:
         self.attached_psmux.append((session_name, title, color, config_path))

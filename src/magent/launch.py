@@ -584,7 +584,15 @@ def _start_psmux_and_upload(
     psmux_windows = result.psmux_windows
     psmux_colors = result.psmux_colors
     if psmux_windows and not opts.dry_run:
-        plat.launch_psmux_session(psmux_windows)
+        # In-body like every other psmux call here: psmux.eligible_projects
+        # imports back into this module, so neither side may import the other
+        # at top level. `launch_verified` is `launch_psmux_session` plus the
+        # creation verify the attach path's `bring_up` gets -- the --go path
+        # reaches sessions through the same platform call, so it would
+        # otherwise be the one bring-up left with no proof a session came up.
+        from magent import psmux
+
+        psmux.launch_verified(plat, psmux_windows)
         for pw in psmux_windows:
             plat.attach_psmux(
                 pw.window_name,
