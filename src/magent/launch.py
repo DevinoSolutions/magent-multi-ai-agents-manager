@@ -779,6 +779,20 @@ def decorate_psmux_sessions(
     return psmux.decorate_sessions(names, code_hint=code_hint)
 
 
+def decorate_psmux_sessions_async(
+    names: list[str], code_hint: bool | None = None
+) -> list[str]:
+    """Delegate to ``psmux.decorate_sessions_async``.
+
+    The status-path variant: fires the same commands without waiting, and is
+    throttled by a stamp file. `up --json` uses this one so a slow psmux can
+    never delay (or fail) a status query -- see the psmux docstring.
+    """
+    from magent import psmux
+
+    return psmux.decorate_sessions_async(names, code_hint=code_hint)
+
+
 def kill_psmux(names: list[str]) -> list[str]:
     """Delegate to ``psmux.kill_servers``."""
     from magent.psmux import kill_servers

@@ -375,7 +375,12 @@ class TestWindowsPsmuxDecoration:
             "status-right-length",
             "22",
         ] in calls
-        flat = " ".join(arg for cmd in calls for arg in cmd)
+        # The `unbind-key -n F2` retraction is the one command allowed to name
+        # the key here (it removes a stale binding rather than advertising one),
+        # so it is excluded before the "nothing mentions F2" sweep.
+        advertised = [cmd for cmd in calls if "unbind-key" not in cmd]
+        assert ["psmux", "-L", "api", "unbind-key", "-n", "F2"] in calls
+        flat = " ".join(arg for cmd in advertised for arg in cmd)
         assert "</>" not in flat
         assert "VS Code" not in flat
         assert "F2" not in flat

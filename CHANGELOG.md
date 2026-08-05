@@ -5,6 +5,47 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.10.9] - 2026-08-05
+
+### Fixed
+
+- **`magent attach` no longer waits minutes on a cosmetic status bar.**
+  `magent up --json` (the host command attach runs over SSH for session
+  status) refreshed every live session's F1/F2 status-line hints
+  synchronously: five psmux control commands per session, run serially
+  under a 3-second timeout each. On a busy host -- 41 agent sessions all
+  working -- those commands time out rather than answer, so decorating
+  cost ~15s per session and ~45s for the pass, all of it before a byte of
+  JSON was printed. The attach client's 30s status timeout fired
+  mid-pass, and its retry (120s) re-ran the whole host command from
+  scratch, so an attach where every session was ALREADY up still took
+  minutes and re-entered the revive path concurrently with itself.
+  Evidence from a real run: 518 `status-line decoration failed ... timed
+  out after 3 seconds` lines in 92 seconds of `launch.log`. Decoration
+  has always been cosmetic and best-effort, so the status path now fires
+  it and returns: all commands go out at once as detached processes
+  (every stdio handle at `DEVNULL`, nothing waited on), the same shape
+  the launch path already used for a fresh batch. A stamp file
+  (`~/.magent/state/decor.stamp`, 60s TTL) keeps attach's repeated
+  bring-up polls from piling up processes against a psmux server that is
+  already struggling. Sessions created during a bring-up are unaffected:
+  they are still decorated directly at birth.
+
+### Added
+
+- **F2 now says something in viewers that can't honour it.** The status
+  bar advertises `F2 </> VS Code`, but F2 is handled by the Windows
+  magent hotkey listener -- so in Termius, a phone SSH app, or a plain
+  `ssh` from another machine the key fell through to the pane and did
+  nothing, silently, while the hint still promised it. Sessions whose F2
+  hint is advertised now also carry `bind -n F2 display-message` on their
+  own psmux server, explaining that F2 opens VS Code only from a magent
+  window on Windows. It cannot double-fire where the listener IS running:
+  the low-level hook swallows F2 before the terminal ever sees it, so the
+  message reaches exactly the viewers that were getting nothing. Hosts
+  with no `code` on PATH (which never advertise the F2 half) now send
+  `unbind-key -n F2` instead, so a stale binding can't outlive the hint.
+
 ## [3.10.8] - 2026-08-04
 
 ### Fixed
