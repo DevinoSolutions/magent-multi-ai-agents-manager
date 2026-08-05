@@ -12,12 +12,14 @@ in the dependency graph.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -398,6 +400,15 @@ _STATUS_BRAND = "#[bold,fg=green] magent #[default]"
 # directives don't count toward the limit; " magent " is 8 columns.
 _STATUS_BRAND_LEN = "10"
 
+# What a raw F2 says when it actually reaches psmux. See `decoration_argv` for
+# why this can never double-fire on a Windows attach window. Pure ASCII for the
+# same reason the hints are (this text lands in the status line via
+# display-message), and one line: display-message truncates at the bar's width.
+_F2_FALLBACK_MSG = (
+    "F2 opens VS Code only from a magent window on Windows"
+    " (hotkey listener not running in this client)"
+)
+
 
 def code_on_path() -> bool:
     """True when VS Code's ``code`` launcher resolves on THIS machine.
@@ -429,15 +440,16 @@ def status_hints(code_hint: bool) -> tuple[str, str]:
 def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
     """The psmux commands that brand ``name`` and advertise its window hotkeys.
 
-    Five of them: magent *owns* F1 -> detach-client per session (the hint has to
+    Six of them: magent *owns* F1 -> detach-client per session (the hint has to
     be truthful on a machine with no personal ``bind -n F1`` in ~/.tmux.conf,
     and owning the binding keeps the existing "back to the picker" semantics
     rather than changing them), the status-right carries the hint text plus the
-    width budget it needs, and the status-left carries the product brand plus
-    the width budget *it* needs. Each half sets its text and its length together
-    or neither: a personal conf with a tighter ``status-*-length`` would truncate
-    the other half mid-label. All are ``-L <name>``-scoped, so they land on that
-    session's own server and override whatever its tmux.conf set at start-up.
+    width budget it needs, the status-left carries the product brand plus
+    the width budget *it* needs, and the sixth is the F2 fallback below. Each
+    half sets its text and its length together or neither: a personal conf with
+    a tighter ``status-*-length`` would truncate the other half mid-label. All
+    are ``-L <name>``-scoped, so they land on that session's own server and
+    override whatever its tmux.conf set at start-up.
 
     Split out from ``decorate_session`` so the launch path can fan the same
     argvs out as raw Popens while callers with one session run them inline.
@@ -450,14 +462,35 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
     the machine doing the decorating. tmux's status line is session-scoped, not
     per-client, so a single answer per session is all the protocol allows --
     a per-viewer hint is out of scope, not an oversight.
+
+    ...which is exactly why the sixth command exists. The hint is one answer for
+    every viewer, but F2 itself is NOT: it is handled by the Windows hotkey
+    listener, which intercepts the key in a magent-titled window and swallows it
+    (``hotkey.py::_hook_decide`` returns 1, so the keystroke never reaches the
+    terminal). Any other viewer of the same session -- Termius, a phone SSH app,
+    a plain ``ssh`` from another box -- has no listener, so F2 fell through to
+    the pane and died silently while the bar still advertised it. So when the F2
+    half is advertised, magent also binds F2 on the session's own server to a
+    ``display-message`` explaining the situation: that binding can only fire for
+    a viewer where the key was going to be lost anyway, because the listener
+    swallows it first everywhere else. When the F2 half is NOT advertised the
+    sixth command is the matching ``unbind-key``, so a session that was
+    decorated back when ``code`` resolved on this host doesn't keep answering a
+    key nothing advertises any more.
     """
     hints, hints_len = status_hints(code_hint)
+    f2 = (
+        [psmux, "-L", name, "bind", "-n", "F2", "display-message", _F2_FALLBACK_MSG]
+        if code_hint
+        else [psmux, "-L", name, "unbind-key", "-n", "F2"]
+    )
     return [
         [psmux, "-L", name, "bind", "-n", "F1", "detach-client"],
         [psmux, "-L", name, "set", "-g", "status-right", hints],
         [psmux, "-L", name, "set", "-g", "status-right-length", hints_len],
         [psmux, "-L", name, "set", "-g", "status-left", _STATUS_BRAND],
         [psmux, "-L", name, "set", "-g", "status-left-length", _STATUS_BRAND_LEN],
+        f2,
     ]
 
 
@@ -511,6 +544,101 @@ def decorate_sessions(names: list[str], code_hint: bool | None = None) -> list[s
             pool.map(lambda n: decorate_session(n, psmux=binary, code_hint=hint), names)
         )
     return list(names)
+
+
+# Runtime state, not config: the stamp lives beside the agent-state store and
+# the logs under ~/.magent/ (same home as log.LOG_DIR / agent_state.STATE_DIR).
+# It is a cache -- deleting it only costs one extra decoration pass.
+DECOR_STAMP = Path.home() / ".magent" / "state" / "decor.stamp"
+
+# How long a fired decoration pass counts as fresh. `magent attach` polls
+# `up --json` up to ~20 times while it waits for a bring-up to stabilize, and
+# each poll would otherwise fire six psmux commands per session (240+ processes
+# against a host that is already busy). A minute is far longer than any single
+# stabilization loop and far shorter than "the user changed something and
+# re-attached", and newborn sessions never depend on it -- the launch/revive
+# path decorates those directly at creation.
+DECOR_TTL_S = 60.0
+
+
+def _decor_stamp_fresh() -> bool:
+    """True when a decoration pass ran within ``DECOR_TTL_S``.
+
+    A missing/unreadable stamp answers False (decorate), and so does a stamp
+    dated in the future: a bad clock must not be able to switch decoration off
+    for longer than the TTL.
+    """
+    try:
+        age = time.time() - DECOR_STAMP.stat().st_mtime
+    except OSError:
+        return False
+    return 0 <= age < DECOR_TTL_S
+
+
+def _touch_decor_stamp() -> None:
+    """Mark a decoration pass as just-fired. Best-effort: a read-only home
+    costs an un-throttled decoration, never an error."""
+    with contextlib.suppress(OSError):
+        DECOR_STAMP.parent.mkdir(parents=True, exist_ok=True)
+        DECOR_STAMP.touch()
+
+
+def decorate_sessions_async(
+    names: list[str], code_hint: bool | None = None
+) -> list[str]:
+    """Fire the decoration commands and return WITHOUT waiting for any of them.
+
+    The status-query variant of ``decorate_sessions``. That one runs each
+    session's argvs serially under ``subprocess.run(..., timeout=3)``, so a host
+    whose psmux servers are busy enough to time out pays 15s per session -- and
+    `up --json` (the host side of `magent attach`) called it synchronously, so
+    a 40-session config could spend ~45s decorating a status bar before printing
+    a byte of JSON. The attach client's status timeout fired at 30s and retried
+    with a 120s one, re-running the whole thing. Decoration is cosmetic and has
+    always been best-effort, so the status path must never wait on it at all.
+
+    The argvs for one session are order-independent (a ``bind``, four
+    ``set -g``, and the F2 bind/unbind), so everything goes out at once as raw
+    Popens -- same shape the launch path already uses for a fresh batch
+    (``platform/windows.py::WindowsPlatform._decorate_batch``), minus the wait.
+    All three stdio handles go to DEVNULL, which is load-bearing rather than
+    tidy: this command is usually running under ``ssh``, and a child holding an
+    inherited pipe open would keep that channel open after the JSON was printed.
+
+    Throttled by ``DECOR_STAMP``: returns ``[]`` without firing anything when a
+    pass ran less than ``DECOR_TTL_S`` ago, so attach's repeated status polls
+    can't pile up hundreds of orphan processes against a wedged psmux server.
+
+    Returns the names it fired for (``[]`` when throttled or unable to run).
+    """
+    binary = find_psmux()
+    if not binary or not names:
+        return []
+    if _decor_stamp_fresh():
+        return []
+    hint = code_on_path() if code_hint is None else code_hint
+    log = get_logger("launch")
+    fired: list[str] = []
+    for name in names:
+        try:
+            for cmd in decoration_argv(name, binary, hint):
+                subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except OSError as exc:
+            # Same posture as decorate_session's: cosmetic, so a session whose
+            # commands can't even be spawned is logged and skipped.
+            log.warning(
+                "status-line decoration could not be spawned for %s: %s", name, exc
+            )
+        else:
+            fired.append(name)
+    _touch_decor_stamp()
+    log.info("fired status-line decoration for %d session(s)", len(fired))
+    return fired
 
 
 def detach_client(name: str, psmux: str | None = None) -> bool:

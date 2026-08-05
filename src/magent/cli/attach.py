@@ -1265,6 +1265,7 @@ def up_cmd(
     from magent.launch import (  # heavy subsystem: in-body per policy
         bring_up_psmux,
         decorate_psmux_sessions,
+        decorate_psmux_sessions_async,
         psmux_status,
         revive_psmux,
     )
@@ -1292,7 +1293,16 @@ def up_cmd(
         # over SSH), the status line is that host's, and psmux scopes it per
         # session rather than per client -- so the host's own `code` is the only
         # answer the protocol lets us give. Probed once inside, for all names.
-        decorate_psmux_sessions(live_ids)
+        #
+        # ...and it is the ASYNC variant here, which is load-bearing. The
+        # synchronous one runs each session's commands under a 3s-timeout
+        # subprocess.run, so a host busy enough for those to time out spent ~15s
+        # per session decorating before this command printed a byte of JSON --
+        # past the attach client's 30s status timeout, which then retried with a
+        # 120s one and re-ran the whole thing. A status query must never wait on
+        # a cosmetic status bar; the async variant fires and returns, throttled
+        # by a stamp so attach's repeated polls can't pile up processes.
+        decorate_psmux_sessions_async(live_ids)
         # deferred: resolving __version__ costs an importlib.metadata import,
         # and only the JSON envelope needs it (see cli/ui.py::_banner).
         from magent import __version__

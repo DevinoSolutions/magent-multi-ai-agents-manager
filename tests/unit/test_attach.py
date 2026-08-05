@@ -750,6 +750,9 @@ class TestUpRevive:
         monkeypatch.setattr(
             "magent.launch.decorate_psmux_sessions", lambda names: names
         )
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions_async", lambda names: names
+        )
         return calls
 
     def test_json_is_a_pure_read_by_default(self, runner, tmp_path, monkeypatch):
@@ -766,7 +769,7 @@ class TestUpRevive:
         )
         monkeypatch.setattr("magent.launch.revive_psmux", _fail)
         monkeypatch.setattr(
-            "magent.launch.decorate_psmux_sessions", lambda names: names
+            "magent.launch.decorate_psmux_sessions_async", lambda names: names
         )
 
         result = runner.invoke(
@@ -791,7 +794,7 @@ class TestUpRevive:
             ),
         )
         monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
-        monkeypatch.setattr("magent.launch.decorate_psmux_sessions", seen.append)
+        monkeypatch.setattr("magent.launch.decorate_psmux_sessions_async", seen.append)
 
         result = runner.invoke(
             cli.main, ["--config", self._config(tmp_path), "up", "--json"]
@@ -799,6 +802,38 @@ class TestUpRevive:
         assert result.exit_code == 0
         assert seen == [["api"]]
         # stdout stays pure JSON despite the extra work.
+        assert json.loads(result.stdout)["ok"] is True
+
+    def test_json_never_uses_the_blocking_decoration(
+        self, runner, tmp_path, monkeypatch
+    ):
+        # The regression this release fixes: the synchronous fan-out runs each
+        # session's commands under a 3s-timeout subprocess.run, so a loaded host
+        # spent ~15s per session decorating before printing a byte of JSON --
+        # past the attach client's 30s status timeout, which retried with a 120s
+        # one and re-ran the whole command. A status query must never wait on a
+        # cosmetic status bar.
+        def _blocking(*a, **k):
+            raise AssertionError("`up --json` must not block on decoration")
+
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: (
+                [{"name": "api", "session": "api"}],
+                [],
+                _PROJECT_ROWS,
+            ),
+        )
+        monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
+        monkeypatch.setattr("magent.launch.decorate_psmux_sessions", _blocking)
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions_async", lambda names: names
+        )
+
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_path), "up", "--json"]
+        )
+        assert result.exit_code == 0
         assert json.loads(result.stdout)["ok"] is True
 
     def test_json_revive_flag_revives_the_live_sessions(
@@ -909,7 +944,7 @@ class TestUpJsonVersion:
         )
         monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
         monkeypatch.setattr(
-            "magent.launch.decorate_psmux_sessions", lambda names: names
+            "magent.launch.decorate_psmux_sessions_async", lambda names: names
         )
 
         result = runner.invoke(

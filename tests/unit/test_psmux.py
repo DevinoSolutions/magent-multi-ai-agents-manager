@@ -11,9 +11,12 @@ pane_cwd across every live session concurrently).
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
+import time
 import unicodedata
+from typing import ClassVar
 
 import pytest
 
@@ -824,20 +827,22 @@ class TestDecorateSession:
         ]
 
     @pytest.mark.parametrize("code_hint", [True, False])
-    def test_the_argv_is_the_five_decorations(self, code_hint):
+    def test_the_argv_is_the_six_decorations(self, code_hint):
         # The list is what every call site fans out, so its shape is contract:
-        # a sixth command (or a dropped one) has to be a deliberate edit here.
-        # Gating F2 changes the hint TEXT, never the command shape -- dropping
-        # a `set` would leave a personal tmux.conf's value in place.
+        # a seventh command (or a dropped one) has to be a deliberate edit here.
+        # Gating F2 changes the hint TEXT and the LAST command's form, never the
+        # four `set`s -- dropping one of those would leave a personal tmux.conf's
+        # value in place.
         argv = psmux.decoration_argv("api", "psmux", code_hint)
-        assert len(argv) == 5
+        assert len(argv) == 6
         assert argv[0][3:] == ["bind", "-n", "F1", "detach-client"]
-        assert [cmd[5] for cmd in argv[1:]] == [
+        assert [cmd[5] for cmd in argv[1:5]] == [
             "status-right",
             "status-right-length",
             "status-left",
             "status-left-length",
         ]
+        assert argv[5][3] in {"bind", "unbind-key"}
 
     def test_status_left_length_fits_the_brand(self):
         # The number is only correct relative to the brand text; pin the
@@ -913,15 +918,42 @@ class TestDecorateSession:
         assert cmds[2][-1] == "40"
 
     def test_without_code_the_f2_half_is_gone_from_every_argv(self, monkeypatch):
-        # The user-visible promise: on a machine with no VS Code, nothing in
-        # what magent sends mentions the key it cannot honour.
+        # The user-visible promise: on a machine with no VS Code, nothing magent
+        # sends ADVERTISES the key it cannot honour. The one remaining mention
+        # is the `unbind-key -n F2` that retracts a stale binding from back when
+        # `code` did resolve here -- checked separately below.
         cmds = self._run(monkeypatch, code_hint=False)
         assert cmds[1][-1] == _EXPECTED_HINT_F1_ONLY
         assert cmds[2][-1] == psmux._STATUS_HINTS_F1_LEN
-        flat = " ".join(arg for cmd in cmds for arg in cmd)
+        flat = " ".join(arg for cmd in cmds[:5] for arg in cmd)
         assert "</>" not in flat
         assert "VS Code" not in flat
         assert "F2" not in flat
+        assert cmds[5] == ["psmux", "-L", "api", "unbind-key", "-n", "F2"]
+
+    def test_with_code_f2_falls_back_to_an_explanatory_message(self, monkeypatch):
+        # The Termius story: a viewer with no magent hotkey listener would
+        # otherwise lose F2 into the pane while the bar still advertises it.
+        cmds = self._run(monkeypatch, code_hint=True)
+        assert cmds[5][:6] == ["psmux", "-L", "api", "bind", "-n", "F2"]
+        assert cmds[5][6] == "display-message"
+        assert cmds[5][7] == psmux._F2_FALLBACK_MSG
+
+    def test_the_f2_fallback_message_is_pure_ascii(self):
+        # Same load-bearing invariant as the hint's: this text renders in the
+        # status bar via display-message, and an ambiguous-width glyph there
+        # desyncs psmux's and Windows Terminal's cell arithmetic.
+        msg = psmux.decoration_argv("api", "psmux", True)[5][-1]
+        assert all(ord(c) < 128 for c in msg)
+        assert msg.isascii()
+        assert "\n" not in msg
+
+    def test_the_f2_fallback_message_explains_the_situation(self):
+        # A message that just said "F2" would be no better than silence.
+        msg = psmux._F2_FALLBACK_MSG
+        assert "F2" in msg
+        assert "VS Code" in msg
+        assert "listener" in msg
 
     def test_without_code_the_budget_is_smaller_than_the_full_one(self):
         # Not just "some number": dropping half the text without dropping the
@@ -977,7 +1009,7 @@ class TestDecorateSession:
         # A status bar is cosmetic: an unlaunchable/hung psmux is logged and
         # swallowed, never propagated into a bring-up.
         cmds = self._run(monkeypatch, boom=OSError("no psmux"))
-        assert len(cmds) == 5  # all attempted; none escaped
+        assert len(cmds) == 6  # all attempted; none escaped
 
     def test_never_raises_on_timeout(self, monkeypatch):
         self._run(monkeypatch, boom=subprocess.TimeoutExpired("psmux", 3))
@@ -1038,3 +1070,140 @@ class TestDecorateSession:
     def test_fan_out_without_binary_is_a_noop(self, monkeypatch):
         monkeypatch.setattr(psmux, "find_psmux", lambda: None)
         assert psmux.decorate_sessions(["api"]) == []
+
+
+class _SpawnRecorder:
+    """Records what was spawned and screams if anyone waits on it."""
+
+    spawned: ClassVar[list[tuple[list[str], dict[str, object]]]] = []
+
+    def __init__(self, cmd, **kwargs):
+        type(self).spawned.append((cmd, kwargs))
+        self.returncode = None
+
+    def wait(self, timeout=None):
+        raise AssertionError("the status path must never wait on decoration")
+
+    def communicate(self, *args, **kwargs):
+        raise AssertionError("the status path must never wait on decoration")
+
+
+class TestDecorateSessionsAsync:
+    """The status-path variant: `up --json` (the host side of `magent attach`)
+    must never wait on a cosmetic status bar. The synchronous fan-out runs each
+    session's commands under a 3s-timeout `subprocess.run`, so a busy host paid
+    ~15s per session before printing any JSON -- past the attach client's 30s
+    timeout, which then retried with a 120s one.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, monkeypatch, tmp_path):
+        # Never touch the real ~/.magent/state/decor.stamp from a unit test.
+        monkeypatch.setattr(psmux, "DECOR_STAMP", tmp_path / "decor.stamp")
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(psmux, "code_on_path", lambda: True)
+        _SpawnRecorder.spawned = []
+        monkeypatch.setattr(subprocess, "Popen", _SpawnRecorder)
+
+    def test_fires_every_argv_for_every_session(self):
+        assert psmux.decorate_sessions_async(["api", "web"]) == ["api", "web"]
+        cmds = [cmd for cmd, _ in _SpawnRecorder.spawned]
+        assert len(cmds) == 2 * len(psmux.decoration_argv("api", "psmux", True))
+        assert ["psmux", "-L", "api", "bind", "-n", "F1", "detach-client"] in cmds
+        assert ["psmux", "-L", "web", "bind", "-n", "F1", "detach-client"] in cmds
+
+    def test_never_waits_and_detaches_every_stdio_handle(self):
+        # A wait here is the whole bug; DEVNULL on all three keeps a decoration
+        # from writing into the JSON the caller is about to print, or from
+        # blocking on a pipe nobody drains.
+        psmux.decorate_sessions_async(["api"])
+        assert _SpawnRecorder.spawned
+        for _cmd, kwargs in _SpawnRecorder.spawned:
+            assert kwargs["stdin"] is subprocess.DEVNULL
+            assert kwargs["stdout"] is subprocess.DEVNULL
+            assert kwargs["stderr"] is subprocess.DEVNULL
+        # _SpawnRecorder.wait() raises, so a wait anywhere above would have failed.
+
+    def test_never_runs_the_blocking_subprocess_run(self, monkeypatch):
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("the status path must not block on subprocess.run")
+            ),
+        )
+        psmux.decorate_sessions_async(["api"])
+
+    def test_a_second_call_inside_the_ttl_fires_nothing(self):
+        psmux.decorate_sessions_async(["api"])
+        fired = len(_SpawnRecorder.spawned)
+        assert fired > 0
+        # attach polls `up --json` up to ~20 times per bring-up; without the
+        # throttle each poll would spawn another full wave.
+        assert psmux.decorate_sessions_async(["api"]) == []
+        assert len(_SpawnRecorder.spawned) == fired
+
+    def test_a_stale_stamp_fires_again(self, monkeypatch):
+        psmux.decorate_sessions_async(["api"])
+        fired = len(_SpawnRecorder.spawned)
+        stale = time.time() - (psmux.DECOR_TTL_S + 1)
+        os.utime(psmux.DECOR_STAMP, (stale, stale))
+        assert psmux.decorate_sessions_async(["api"]) == ["api"]
+        assert len(_SpawnRecorder.spawned) > fired
+
+    def test_the_first_call_stamps(self):
+        assert not psmux.DECOR_STAMP.exists()
+        psmux.decorate_sessions_async(["api"])
+        assert psmux.DECOR_STAMP.is_file()
+
+    def test_a_future_dated_stamp_is_not_treated_as_fresh(self, monkeypatch):
+        psmux.decorate_sessions_async(["api"])
+        ahead = time.time() + 10 * psmux.DECOR_TTL_S
+        os.utime(psmux.DECOR_STAMP, (ahead, ahead))
+        # A bad clock must not be able to switch decoration off indefinitely.
+        assert psmux.decorate_sessions_async(["api"]) == ["api"]
+
+    def test_an_unstampable_home_still_decorates(self, monkeypatch):
+        # Read-only home: the throttle degrades to "always fire", never to an
+        # error out of a status query.
+        def _boom(*a, **k):
+            raise OSError("read-only")
+
+        monkeypatch.setattr(psmux.Path, "mkdir", _boom)
+        assert psmux.decorate_sessions_async(["api"]) == ["api"]
+
+    def test_a_spawn_failure_is_swallowed_and_the_rest_continue(self, monkeypatch):
+        seen: list[str] = []
+
+        def _picky(cmd, **kwargs):
+            if cmd[2] == "api":
+                raise OSError("cannot spawn")
+            seen.append(cmd[2])
+            return _SpawnRecorder(cmd, **kwargs)
+
+        monkeypatch.setattr(subprocess, "Popen", _picky)
+        assert psmux.decorate_sessions_async(["api", "web"]) == ["web"]
+        assert set(seen) == {"web"}
+
+    def test_probes_for_code_exactly_once_for_the_batch(self, monkeypatch):
+        probes: list[int] = []
+        monkeypatch.setattr(psmux, "code_on_path", lambda: (probes.append(1), True)[1])
+        psmux.decorate_sessions_async(["api", "web", "docs"])
+        assert len(probes) == 1
+
+    def test_an_explicit_hint_skips_the_probe(self, monkeypatch):
+        def _boom():
+            raise AssertionError("must not probe when the caller already knows")
+
+        monkeypatch.setattr(psmux, "code_on_path", _boom)
+        psmux.decorate_sessions_async(["api"], code_hint=False)
+        cmds = [cmd for cmd, _ in _SpawnRecorder.spawned]
+        assert ["psmux", "-L", "api", "unbind-key", "-n", "F2"] in cmds
+
+    def test_no_binary_or_no_names_is_a_noop(self, monkeypatch):
+        assert psmux.decorate_sessions_async([]) == []
+        monkeypatch.setattr(psmux, "find_psmux", lambda: None)
+        assert psmux.decorate_sessions_async(["api"]) == []
+        assert _SpawnRecorder.spawned == []
+        # ...and a no-op must not stamp: nothing was decorated.
+        assert not psmux.DECOR_STAMP.exists()
