@@ -621,25 +621,44 @@ class TestWindowsBringUpPsmuxInvocation:
         # dedupe would skip creating every session on a cold machine.
         assert probes == [["psmux", "-L", "api", "has-session", "-t", "api"]]
 
-    def test_every_child_runs_without_the_nesting_markers(self, monkeypatch):
-        from tests.unit.test_psmux import _markers_in
-
-        seen: list[object] = []
+    def _spawns(self, monkeypatch):
+        """Every (argv, env) the launch path spawns, under an environment that
+        claims we are inside a psmux pane."""
+        calls: list[list[str]] = []
+        envs: list[object] = []
         monkeypatch.setenv("PSMUX_SESSION", "api")
         monkeypatch.setenv("TMUX", "/tmp/psmux-1/default,1,0")
-        # A relocated socket dir rides along: it is configuration, not a
-        # nesting marker, and every child needs it to find the server at all.
+        # A relocated socket dir rides along: configuration, not a marker.
         monkeypatch.setenv("TMUX_TMPDIR", "/tmp/private-sockets")
-        _drive_bring_up(
+        calls, _ = _drive_bring_up(
             monkeypatch,
             windows=["api"],
             pane_states={"api": ["pwsh", "claude"]},  # forces a re-send too
-            envs=seen,
+            envs=envs,
         )
-        assert seen, "nothing was spawned"
-        for env in seen:
+        assert len(calls) == len(envs)
+        return list(zip(calls, envs, strict=True))
+
+    def test_only_new_session_gets_the_cleaned_environment(self, monkeypatch):
+        from tests.unit.test_psmux import _markers_in
+
+        spawns = self._spawns(monkeypatch)
+        creates = [(c, e) for c, e in spawns if "new-session" in c]
+        assert creates, "no session was created"
+        for _cmd, env in creates:
+            # The guard fires here and only here, so this is where the markers
+            # must not survive -- and where the socket dir still must.
             assert _markers_in(env) == []
             assert env["TMUX_TMPDIR"] == "/tmp/private-sockets"
+
+    def test_control_commands_inherit_the_environment(self, monkeypatch):
+        # send-keys / has-session / kill-server / the decoration `set`s are
+        # measurably indifferent to the markers (see the psmux-side pin), so
+        # they spawn exactly as they did before this change: env=None.
+        spawns = self._spawns(monkeypatch)
+        others = [(c, e) for c, e in spawns if "new-session" not in c]
+        assert others, "the bring-up ran no control commands"
+        assert {e for _c, e in others} == {None}
 
 
 # --- find_window mode contract (LS-B-005) -----------------------------------

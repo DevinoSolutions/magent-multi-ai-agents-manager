@@ -426,14 +426,6 @@ class WindowsPlatform(Platform):
         if not windows:
             return
 
-        # Every psmux child below runs with the multiplexer's nesting markers
-        # stripped (see env.psmux_child_env). magent is routinely driven FROM a
-        # magent psmux window -- the interactive menu's "u" especially -- and a
-        # psmux that sees PSMUX_SESSION/TMUX in its environment refuses to
-        # create a sibling session ("sessions should be nested with care") while
-        # still exiting 0, so the whole wave silently produced nothing.
-        env = child_env()
-
         checks = [
             (
                 w,
@@ -444,7 +436,6 @@ class WindowsPlatform(Platform):
                     [psmux, "-L", w.window_name, "has-session", "-t", w.window_name],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    env=env,
                 ),
             )
             for w in windows
@@ -459,7 +450,6 @@ class WindowsPlatform(Platform):
                 [psmux, "-L", w.window_name, "kill-server"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                env=env,
             )
             for w in to_create
         ]
@@ -481,6 +471,17 @@ class WindowsPlatform(Platform):
             if start:
                 time.sleep(_BRING_UP_BATCH_PAUSE_S)
 
+            # `env=child_env()` on THIS spawn and no other in this file: psmux's
+            # nested-session guard fires for `new-session` alone. magent is
+            # routinely driven FROM a magent psmux window -- the interactive
+            # menu's "u" especially -- and a psmux that sees PSMUX_SESSION/TMUX
+            # refuses to create a sibling session ("sessions should be nested
+            # with care") while still exiting 0, so the whole wave silently
+            # produced nothing. Control commands (has-session, kill-server,
+            # send-keys, display-message, capture-pane, the decoration `set`s)
+            # are measurably indifferent to the markers -- byte-identical
+            # results with and without -- so they keep the plain inherited
+            # environment rather than a rebuilt block under every round-trip.
             creates = [
                 subprocess.Popen(
                     [
@@ -496,7 +497,7 @@ class WindowsPlatform(Platform):
                     ],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    env=env,
+                    env=child_env(),
                 )
                 for w in wave
             ]
@@ -530,7 +531,6 @@ class WindowsPlatform(Platform):
                     _send_argv(psmux, w),
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    env=env,
                 )
                 for w in batch
             ]
@@ -603,7 +603,6 @@ class WindowsPlatform(Platform):
                         _send_argv(psmux, w),
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
-                        env=child_env(),
                     )
                     for w in pending.values()
                 ]
@@ -629,14 +628,10 @@ class WindowsPlatform(Platform):
 
         ``code_hint`` is resolved once by the caller for the whole bring-up.
         """
-        env = child_env()
         try:
             decorations = [
                 subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    env=env,
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                 )
                 for w in batch
                 for cmd in decoration_argv(w.window_name, psmux, code_hint)

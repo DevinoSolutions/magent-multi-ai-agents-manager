@@ -13,20 +13,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing.** psmux (like tmux) exports `PSMUX_SESSION`,
   `PSMUX_TARGET_SESSION`, `TMUX`, `TMUX_PANE` and friends into every pane it
   owns, and magent is routinely driven from inside one of its own windows --
-  the interactive menu's `u` especially. Every psmux child then inherited
-  those markers and hit the nested-session guard: `psmux: sessions should be
-  nested with care, unset PSMUX_SESSION to force`, after which psmux 3.3.6
-  exits 0 having created nothing at all. magent's sessions are SIBLINGS by
-  construction -- one session per socket, never a session inside a session --
-  so every creation, control and probe child now runs with those markers
-  stripped (`env.psmux_child_env`, the one module allowed to touch
-  `os.environ`). Exactly the in-a-session markers go: `TMUX`, `TMUX_PANE` and
-  the `PSMUX*` family. `TMUX_TMPDIR` (and any future `*_TMPDIR`) is kept --
-  it names the directory the server's sockets live in, so a child that loses
-  it looks in the default location, finds nothing, and reports every session
-  dead. The user-facing *attach* client keeps the inherited environment on
-  purpose: attaching from inside a pane really is nesting, and psmux's warning
-  is right to fire there.
+  the interactive menu's `u` especially. The `new-session` child then
+  inherited those markers and hit the nested-session guard: `psmux: sessions
+  should be nested with care, unset PSMUX_SESSION to force`, after which psmux
+  3.3.6 exits 0 having created nothing at all. magent's sessions are SIBLINGS
+  by construction -- one session per socket, never a session inside a session
+  -- so that one child now runs with the markers stripped
+  (`env.psmux_child_env`, the one module allowed to touch `os.environ`).
+  Scoped to session CREATION deliberately: measured against the real binary
+  from inside a live pane, control and probe commands (`has-session -t`,
+  `display-message -t`, `capture-pane -t`) return the same exit code and the
+  same bytes whether the markers are present or stripped -- the guard fires
+  for `new-session` alone -- so they keep plain inheritance instead of a
+  rebuilt environment block under every psmux round-trip. Exactly the
+  in-a-session markers go: `TMUX`, `TMUX_PANE` and the `PSMUX*` family.
+  `TMUX_TMPDIR` (and any future `*_TMPDIR`) is kept -- it names the directory
+  the server's sockets live in, so a child that loses it looks in the default
+  location, finds nothing, and reports every session dead. The user-facing
+  *attach* client keeps the inherited environment on purpose: attaching from
+  inside a pane really is nesting, and psmux's warning is right to fire there.
 - **Liveness probes tell the truth.** `psmux -L <name> has-session` with no
   `-t` exits 0 even when no server exists on that socket (proven live:
   `psmux -L definitely-not-a-session-xyz has-session` -> rc 0; psmux also

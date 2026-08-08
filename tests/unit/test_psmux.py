@@ -575,20 +575,27 @@ def _markers_in(env: object) -> list[str]:
     ]
 
 
-class TestChildrenRunWithoutNestingMarkers:
-    """Every psmux CREATION/CONTROL/PROBE child runs with the nesting markers
-    stripped (see env.psmux_child_env). The bug this closes: running the menu
-    from inside a magent psmux window made psmux refuse the sibling session it
-    was asked to create -- "sessions should be nested with care, unset
-    PSMUX_SESSION to force" -- while still exiting 0."""
+class TestControlCommandsInheritTheEnvironment:
+    """Only SESSION CREATION gets the cleaned environment; control and probe
+    commands spawn with plain inheritance.
+
+    Scope measured against real psmux 3.3.6 from inside a live pane: with the
+    markers present and with them stripped, ``has-session -t``,
+    ``display-message -t`` and ``capture-pane -t`` return the same exit code
+    and the same bytes -- the nested-session guard only ever fires for
+    ``new-session``. Cleaning the environment here would buy nothing while
+    putting a rebuilt environment block under every psmux round-trip magent
+    makes, and the launch path makes hundreds. The one thing an inherited
+    ``$TMUX`` could still do -- let a target-less command answer for the
+    CALLER's own pane -- is closed explicitly by the ``-t <session>`` every
+    command in this module now passes.
+    """
 
     @pytest.fixture(autouse=True)
     def _inside_a_session(self, monkeypatch):
         monkeypatch.setenv("PSMUX_SESSION", "api")
         monkeypatch.setenv("TMUX", "/tmp/psmux-1/default,123,0")
         monkeypatch.setenv("TMUX_PANE", "%1")
-        # ...and a relocated socket dir, which every child still needs.
-        monkeypatch.setenv("TMUX_TMPDIR", "/tmp/private-sockets")
 
     def _env_of(self, monkeypatch, call):
         seen: list[object] = []
@@ -615,25 +622,24 @@ class TestChildrenRunWithoutNestingMarkers:
             lambda: psmux.flash_message("api", "hi", 100, psmux="psmux"),
         ],
     )
-    def test_the_markers_never_reach_the_child(self, monkeypatch, call):
-        for env in self._env_of(monkeypatch, call):
-            assert _markers_in(env) == []
+    def test_no_env_is_passed_at_all(self, monkeypatch, call):
+        # `env=None` is "inherit", which is what every one of these wants.
+        assert self._env_of(monkeypatch, call) == [None]
 
-    def test_the_socket_dir_does_reach_the_child(self, monkeypatch):
-        # The other half of the contract: strip the markers, keep the address.
-        envs = self._env_of(
-            monkeypatch, lambda: psmux.has_session("api", psmux="psmux")
-        )
-        assert envs[0]["TMUX_TMPDIR"] == "/tmp/private-sockets"
+    def test_the_accessor_still_strips_for_the_creating_caller(self):
+        # `child_env` stays: platform/windows.py's `new-session` is its one
+        # caller, and that IS the command the guard fires for.
+        assert _markers_in(psmux.child_env()) == []
 
-    def test_the_decoration_pass_is_cleaned_too(self, monkeypatch):
+    def test_the_decoration_pass_inherits_too(self, monkeypatch):
         monkeypatch.setattr(psmux, "code_on_path", lambda: True)
-        for env in self._env_of(
-            monkeypatch, lambda: psmux.decorate_session("api", psmux="psmux")
-        ):
-            assert _markers_in(env) == []
+        assert set(
+            self._env_of(
+                monkeypatch, lambda: psmux.decorate_session("api", psmux="psmux")
+            )
+        ) == {None}
 
-    def test_the_pane_command_fan_out_is_cleaned_too(self, monkeypatch):
+    def test_the_pane_command_fan_out_inherits_too(self, monkeypatch):
         seen: list[object] = []
 
         class _Proc:
@@ -648,14 +654,11 @@ class TestChildrenRunWithoutNestingMarkers:
 
         monkeypatch.setattr(subprocess, "Popen", _popen)
         psmux.pane_current_commands(["api"], psmux="psmux")
-        assert seen and all(_markers_in(env) == [] for env in seen)
+        assert seen == [None]
 
-    def test_the_rest_of_the_environment_is_preserved(self, monkeypatch):
+    def test_the_accessor_preserves_the_rest_of_the_environment(self, monkeypatch):
         monkeypatch.setenv("MDTEST_KEEP", "yes")
-        envs = self._env_of(
-            monkeypatch, lambda: psmux.has_session("api", psmux="psmux")
-        )
-        assert envs[0]["MDTEST_KEEP"] == "yes"
+        assert psmux.child_env()["MDTEST_KEEP"] == "yes"
 
 
 class TestBringUpCreationVerify:

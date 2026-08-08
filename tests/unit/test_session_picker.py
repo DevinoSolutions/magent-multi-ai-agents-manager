@@ -88,10 +88,12 @@ class TestLiveSessions:
         # session as live and the picker offered dead ones for attaching.
         assert argvs == [["psmux", "-L", "a", "has-session", "-t", "a"]]
 
-    def test_probes_run_with_the_nesting_markers_stripped(self, monkeypatch):
+    def test_probes_inherit_the_environment(self, monkeypatch):
         # The picker is normally driven from inside a psmux window, whose env
-        # carries PSMUX_SESSION/TMUX; a psmux child that sees them can refuse
-        # to act on a sibling session.
+        # carries PSMUX_SESSION/TMUX -- but a PROBE is not a session-creating
+        # command, and psmux's nested guard only fires for `new-session`
+        # (measured against the real binary). So this stays a plain inherited
+        # spawn; `-t` above is what makes the answer truthful.
         envs: list[object] = []
 
         def _fake_popen(cmd, **kwargs):
@@ -100,14 +102,9 @@ class TestLiveSessions:
 
         monkeypatch.setenv("PSMUX_SESSION", "api")
         monkeypatch.setenv("TMUX", "/tmp/sock,1,0")
-        monkeypatch.setenv("TMUX_TMPDIR", "/tmp/private-sockets")
         monkeypatch.setattr(session_picker.subprocess, "Popen", _fake_popen)
         session_picker._live_sessions("psmux", ["a"])
-        assert envs and all(isinstance(e, dict) for e in envs)
-        assert all("PSMUX_SESSION" not in e and "TMUX" not in e for e in envs)
-        # ...but the socket dir survives, or the probe looks for the server in
-        # the wrong place and reports every session dead.
-        assert all(e["TMUX_TMPDIR"] == "/tmp/private-sockets" for e in envs)
+        assert envs == [None]
 
 
 class TestSessionCwds:

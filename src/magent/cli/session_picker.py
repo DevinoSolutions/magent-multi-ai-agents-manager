@@ -146,20 +146,18 @@ def _live_sessions(psmux_bin: str, candidates: list[str]) -> list[str]:
     over ``has_session`` (which blocks a worker per call) took ~1s at 40
     sessions. The retry stays: under the load of many running agents individual
     probes flap, and a dropped probe silently hides a live session."""
-    from magent import psmux as psmux_mod  # heavy subsystem: in-body per policy
-
-    env = psmux_mod.child_env()
 
     def _probe(names: list[str]) -> list[bool]:
         procs = [
             subprocess.Popen(
                 # `-t <n>` for the same reason `psmux.has_session` passes it:
                 # a bare has-session exits 0 for a socket with no server, so
-                # this sweep listed dead sessions as live.
+                # this sweep listed dead sessions as live. (Plain inherited
+                # env: a probe is not a session-creating command, so psmux's
+                # nesting guard has nothing to say about it.)
                 [psmux_bin, "-L", n, "has-session", "-t", n],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                env=env,
             )
             for n in names
         ]

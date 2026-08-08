@@ -45,14 +45,25 @@ def find_psmux() -> str | None:
 
 
 def child_env() -> dict[str, str]:
-    """Environment for a psmux creation/control/probe child.
+    """Environment for a psmux child that CREATES a session.
 
     Delegates to ``env.psmux_child_env`` -- the only module allowed to touch
-    ``os.environ`` -- and is re-exported here so every psmux spawn site (this
-    module plus ``platform/windows.py``'s batched launcher) reaches it through
-    the module that owns psmux subprocess behaviour. Imported in-body because
+    ``os.environ`` -- and is re-exported here so the one spawn site that needs
+    it (``platform/windows.py``'s ``new-session``) reaches it through the module
+    that owns psmux subprocess behaviour. Imported in-body because
     ``magent.env`` pulls pydantic in, and this module is a leaf that only
     imports ``magent.log`` at module level.
+
+    SCOPE, measured rather than assumed: psmux's nested-session guard fires for
+    ``new-session`` alone. Run from inside a live pane against a live session,
+    ``has-session -t``, ``display-message -t`` and ``capture-pane -t`` return
+    byte-identical results with the markers present and with them stripped --
+    no warning, same exit code. So every CONTROL and PROBE command in this
+    module spawns with the plain inherited environment: cleaning it there would
+    buy nothing and would put a rebuilt environment block under every psmux
+    round-trip magent makes. (The one thing an inherited ``$TMUX`` could still
+    do -- let a target-less command answer for the calling client's own pane --
+    is closed explicitly by the ``-t <session>`` every command here passes.)
     """
     from magent.env import psmux_child_env
 
@@ -105,7 +116,6 @@ def has_session(
             capture_output=True,
             timeout=timeout,
             check=False,
-            env=child_env(),
         )
     except subprocess.TimeoutExpired:
         return False
@@ -123,7 +133,6 @@ def kill_server(name: str, psmux: str | None = None) -> bool:
             [binary, "-L", name, "kill-server"],
             capture_output=True,
             check=False,
-            env=child_env(),
         ).returncode
         == 0
     )
@@ -154,12 +163,7 @@ def send_keys(
         cmd += ["-t", target]
     cmd.append("--")
     cmd.extend(keys)
-    return (
-        subprocess.run(
-            cmd, capture_output=True, check=False, env=child_env()
-        ).returncode
-        == 0
-    )
+    return subprocess.run(cmd, capture_output=True, check=False).returncode == 0
 
 
 def pane_cwd(name: str, psmux: str | None = None) -> str:
@@ -195,7 +199,6 @@ def pane_cwd(name: str, psmux: str | None = None) -> str:
             encoding="utf-8",
             errors="replace",
             check=False,
-            env=child_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -217,7 +220,6 @@ def capture_pane(name: str, psmux: str | None = None) -> str:
             encoding="utf-8",
             errors="replace",
             check=False,
-            env=child_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -265,7 +267,6 @@ def pane_current_command(name: str, psmux: str | None = None) -> str:
             encoding="utf-8",
             errors="replace",
             check=False,
-            env=child_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -287,7 +288,6 @@ def pane_current_commands(names: list[str], psmux: str | None = None) -> dict[st
     if not binary or not names:
         return dict.fromkeys(names, "")
     procs: dict[str, subprocess.Popen[str] | None] = {}
-    env = child_env()
     for name in names:
         try:
             procs[name] = subprocess.Popen(
@@ -305,7 +305,6 @@ def pane_current_commands(names: list[str], psmux: str | None = None) -> dict[st
                 stderr=subprocess.DEVNULL,
                 encoding="utf-8",
                 errors="replace",
-                env=env,
             )
         except OSError:
             procs[name] = None
@@ -372,9 +371,7 @@ def flash_message(
         cmd += ["set", "-g", "message-style", style, ";"]
     cmd += ["display-message", "-d", str(duration_ms), message]
     try:
-        subprocess.run(
-            cmd, capture_output=True, timeout=3, check=False, env=child_env()
-        )
+        subprocess.run(cmd, capture_output=True, timeout=3, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         get_logger("upload").warning(
             "status-line flash failed for project=%s: %s", name, exc
@@ -554,10 +551,9 @@ def decorate_session(
         return
     if code_hint is None:
         code_hint = code_on_path()
-    env = child_env()
     for cmd in decoration_argv(name, binary, code_hint):
         try:
-            subprocess.run(cmd, capture_output=True, timeout=3, check=False, env=env)
+            subprocess.run(cmd, capture_output=True, timeout=3, check=False)
         except (OSError, subprocess.SubprocessError) as exc:
             get_logger("launch").warning(
                 "status-line decoration failed for session=%s: %s", name, exc
@@ -661,7 +657,6 @@ def decorate_sessions_async(
         return []
     hint = code_on_path() if code_hint is None else code_hint
     log = get_logger("launch")
-    env = child_env()
     fired: list[str] = []
     for name in names:
         try:
@@ -671,7 +666,6 @@ def decorate_sessions_async(
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    env=env,
                 )
         except OSError as exc:
             # Same posture as decorate_session's: cosmetic, so a session whose
@@ -697,7 +691,6 @@ def detach_client(name: str, psmux: str | None = None) -> bool:
             capture_output=True,
             timeout=3,
             check=False,
-            env=child_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -802,7 +795,6 @@ def psmux_status(
     down: list[dict[str, object]] = []
 
     checkable: list[tuple[dict[str, object], subprocess.Popen[bytes]]] = []
-    env = child_env()
     for p in projects:
         info: dict[str, object] = {
             "name": p["name"],
@@ -820,7 +812,6 @@ def psmux_status(
                 [binary, "-L", sid, "has-session", "-t", sid],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                env=env,
             )
             checkable.append((info, proc))
         else:
