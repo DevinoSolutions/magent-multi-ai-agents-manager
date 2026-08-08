@@ -82,7 +82,28 @@ class TestLiveSessions:
 
         monkeypatch.setattr(session_picker.subprocess, "Popen", _fake_popen)
         session_picker._live_sessions("psmux", ["a"])
-        assert argvs == [["psmux", "-L", "a", "has-session"]]
+        # `-t a` is load-bearing, not decoration: a BARE has-session exits 0
+        # against a socket with no server at all (psmux 3.3.6 answers from its
+        # internal __warm__ spare), so this sweep listed every configured
+        # session as live and the picker offered dead ones for attaching.
+        assert argvs == [["psmux", "-L", "a", "has-session", "-t", "a"]]
+
+    def test_probes_run_with_the_nesting_markers_stripped(self, monkeypatch):
+        # The picker is normally driven from inside a psmux window, whose env
+        # carries PSMUX_SESSION/TMUX; a psmux child that sees them can refuse
+        # to act on a sibling session.
+        envs: list[object] = []
+
+        def _fake_popen(cmd, **kwargs):
+            envs.append(kwargs.get("env"))
+            return _FakeProc(cmd[2], 0, [])
+
+        monkeypatch.setenv("PSMUX_SESSION", "api")
+        monkeypatch.setenv("TMUX", "/tmp/sock,1,0")
+        monkeypatch.setattr(session_picker.subprocess, "Popen", _fake_popen)
+        session_picker._live_sessions("psmux", ["a"])
+        assert envs and all(isinstance(e, dict) for e in envs)
+        assert all("PSMUX_SESSION" not in e and "TMUX" not in e for e in envs)
 
 
 class TestSessionCwds:

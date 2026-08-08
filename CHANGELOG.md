@@ -5,6 +5,56 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.10.10] - 2026-08-08
+
+### Fixed
+
+- **Bringing sessions up from inside a magent window no longer creates
+  nothing.** psmux (like tmux) exports `PSMUX_SESSION`,
+  `PSMUX_TARGET_SESSION`, `TMUX`, `TMUX_PANE` and friends into every pane it
+  owns, and magent is routinely driven from inside one of its own windows --
+  the interactive menu's `u` especially. Every psmux child then inherited
+  those markers and hit the nested-session guard: `psmux: sessions should be
+  nested with care, unset PSMUX_SESSION to force`, after which psmux 3.3.6
+  exits 0 having created nothing at all. magent's sessions are SIBLINGS by
+  construction -- one session per socket, never a session inside a session --
+  so every creation, control and probe child now runs with those markers
+  stripped (`env.psmux_child_env`, the one module allowed to touch
+  `os.environ`). The user-facing *attach* client keeps the inherited
+  environment on purpose: attaching from inside a pane really is nesting, and
+  psmux's warning is right to fire there.
+- **Liveness probes tell the truth.** `psmux -L <name> has-session` with no
+  `-t` exits 0 even when no server exists on that socket (proven live:
+  `psmux -L definitely-not-a-session-xyz has-session` -> rc 0; psmux also
+  keeps internal `__warm__` spare servers per socket that answer it). Every
+  probe in the product was therefore blind -- `magent status` reported 42 of
+  42 sessions up where the truthful probe found 40 up and 2 down, the menu
+  said "All N session(s) already running", the bring-up creation verify could
+  never detect a casualty, and revive and the corpse sweeps had nothing to
+  act on. All three probe sites (`psmux.has_session`, `psmux_status`'s
+  fan-out, the picker's liveness sweep) and the launch path's dedupe check now
+  pass `-t <session>`. Safe by construction: magent runs one session per
+  socket and the session name is the socket name, so `-t`'s prefix matching
+  has nothing else to match.
+- **One session psmux refuses no longer aborts the whole bring-up with a
+  traceback.** A `new-session` that exited non-zero (`psmux: failed to create
+  session 'X'`) raised `CalledProcessError` out of `launch_psmux_session`, and
+  `launch_verified`'s first launch call was the one call in that function not
+  wrapped -- so `magent up` and the menu's `u` ended in a traceback (the
+  reported "error towards the end") with every remaining session in the wave
+  abandoned. A refused window is now logged and skipped, the rest of its batch
+  and every later batch still run, and the creation verify -- which already
+  knows how to respawn what is missing -- is what decides the outcome.
+- **A bring-up no longer reports casualties as successes.** `psmux.bring_up`
+  discarded the creation verify's answer and returned every name it had
+  attempted, so `magent up` and the menu printed "Brought up N session(s)"
+  for sessions the same run had logged as `never came up after respawn; left
+  down`. It now returns `(created, failed)`, and both interactive paths (plus
+  the `--go` launch path) print a red `x N session(s) failed to come up:
+  <names>` line naming them. `up --json` is unchanged: it is a pure read that
+  never brings anything up, so it has no casualty set to report -- a session
+  that failed shows up in its existing `down` list.
+
 ## [3.10.9] - 2026-08-05
 
 ### Fixed

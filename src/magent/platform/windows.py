@@ -21,6 +21,7 @@ from magent.platform import (
 )
 from magent.psmux import (
     capture_pane,
+    child_env,
     code_on_path,
     decoration_argv,
     is_idle_command,
@@ -425,13 +426,25 @@ class WindowsPlatform(Platform):
         if not windows:
             return
 
+        # Every psmux child below runs with the multiplexer's nesting markers
+        # stripped (see env.psmux_child_env). magent is routinely driven FROM a
+        # magent psmux window -- the interactive menu's "u" especially -- and a
+        # psmux that sees PSMUX_SESSION/TMUX in its environment refuses to
+        # create a sibling session ("sessions should be nested with care") while
+        # still exiting 0, so the whole wave silently produced nothing.
+        env = child_env()
+
         checks = [
             (
                 w,
                 subprocess.Popen(
-                    [psmux, "-L", w.window_name, "has-session"],
+                    # `-t <name>`: a bare has-session exits 0 even for a socket
+                    # with no server, which made this dedupe skip creating every
+                    # session on a cold machine. See psmux.has_session.
+                    [psmux, "-L", w.window_name, "has-session", "-t", w.window_name],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    env=env,
                 ),
             )
             for w in windows
@@ -446,6 +459,7 @@ class WindowsPlatform(Platform):
                 [psmux, "-L", w.window_name, "kill-server"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=env,
             )
             for w in to_create
         ]
@@ -463,7 +477,7 @@ class WindowsPlatform(Platform):
         # that attaches failed). Each batch is created, gets its agent
         # command, and is given a beat to start before the next wave.
         for start in range(0, len(to_create), _BRING_UP_BATCH):
-            batch = to_create[start : start + _BRING_UP_BATCH]
+            wave = to_create[start : start + _BRING_UP_BATCH]
             if start:
                 time.sleep(_BRING_UP_BATCH_PAUSE_S)
 
@@ -482,12 +496,32 @@ class WindowsPlatform(Platform):
                     ],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    env=env,
                 )
-                for w in batch
+                for w in wave
             ]
-            for p in creates:
-                if p.wait() != 0:
-                    raise subprocess.CalledProcessError(p.returncode, p.args)
+            # A window psmux refuses to create ("failed to create session 'X'",
+            # rc 1 -- a stale socket, a vanished cwd, a nesting guard) used to
+            # raise CalledProcessError straight out of here, killing the whole
+            # bring-up: every later batch was abandoned and the caller got a
+            # traceback instead of its sessions. One bad window now costs only
+            # itself. Nothing is raised: `psmux.launch_verified` re-probes every
+            # name right after this returns, respawns what is missing, and
+            # reports what stayed down -- that is the component that owns the
+            # "did it come up?" answer, and it can only do its job if it runs.
+            batch = []
+            for w, p in zip(wave, creates, strict=True):
+                if p.wait() == 0:
+                    batch.append(w)
+                else:
+                    get_logger("platform").error(
+                        "psmux new-session for %s exited %s; skipping it and"
+                        " continuing the bring-up",
+                        w.window_name,
+                        p.returncode,
+                    )
+            if not batch:
+                continue
 
             _wait_for_panes_ready(psmux, [w.window_name for w in batch])
 
@@ -496,6 +530,7 @@ class WindowsPlatform(Platform):
                     _send_argv(psmux, w),
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    env=env,
                 )
                 for w in batch
             ]
@@ -568,6 +603,7 @@ class WindowsPlatform(Platform):
                         _send_argv(psmux, w),
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
+                        env=child_env(),
                     )
                     for w in pending.values()
                 ]
@@ -593,10 +629,14 @@ class WindowsPlatform(Platform):
 
         ``code_hint`` is resolved once by the caller for the whole bring-up.
         """
+        env = child_env()
         try:
             decorations = [
                 subprocess.Popen(
-                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=env,
                 )
                 for w in batch
                 for cmd in decoration_argv(w.window_name, psmux, code_hint)
@@ -628,6 +668,13 @@ class WindowsPlatform(Platform):
             args.extend(["--tabColor", color])
         args.append("--suppressApplicationTitle")
         args.extend(["--", psmux, "-L", session_name, "attach"])
+        # No `env=child_env()` here, deliberately: this is the user-facing
+        # ATTACH client, not a creation/control command. Attaching is the one
+        # psmux operation where nesting is a real question rather than a false
+        # alarm, and psmux's own guard is the right authority on it. Stripping
+        # the markers here would be magent overriding a warning meant for the
+        # human, and it buys nothing -- the spawn goes through `wt`, which the
+        # markers do not concern.
         subprocess.Popen(args)
 
     def supports_psmux(self) -> bool:

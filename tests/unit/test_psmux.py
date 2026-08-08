@@ -504,6 +504,138 @@ class TestHasSessionTimeout:
         assert seen == [None]
 
 
+class TestHasSessionTargetsTheSession:
+    """A BARE ``has-session`` is not a liveness probe.
+
+    Proven live on psmux 3.3.6: ``psmux -L definitely-not-a-session-xyz
+    has-session`` exits 0 -- there is no server on that socket at all, and psmux
+    keeps internal ``__warm__`` spares that answer anyway. Every probe in the
+    product therefore reported UP for dead sessions (status said 42/42 up where
+    ``-t`` correctly said 40 up / 2 down), which blinded the menu's "already
+    running", the creation verify, revive and the corpse sweeps at once.
+    """
+
+    def _argv(self, monkeypatch, **kwargs):
+        seen: list[list[str]] = []
+
+        def _run(cmd, **_kw):
+            seen.append(list(cmd))
+            return _FakeCompleted(returncode=0)
+
+        monkeypatch.setattr(subprocess, "run", _run)
+        psmux.has_session("api", psmux="psmux", **kwargs)
+        return seen[0]
+
+    def test_the_probe_names_the_session_with_t(self, monkeypatch):
+        assert self._argv(monkeypatch) == [
+            "psmux",
+            "-L",
+            "api",
+            "has-session",
+            "-t",
+            "api",
+        ]
+
+    def test_the_bounded_form_targets_it_too(self, monkeypatch):
+        # The creation verify uses the bounded call; both forms are one argv.
+        assert self._argv(monkeypatch, timeout=3.0)[-2:] == ["-t", "api"]
+
+    def test_the_status_fan_out_targets_each_session(self, monkeypatch, tmp_path):
+        argvs: list[list[str]] = []
+
+        class _Proc:
+            def wait(self):
+                return 0
+
+        def _popen(cmd, **_kw):
+            argvs.append(list(cmd))
+            return _Proc()
+
+        (tmp_path / "api").mkdir()
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(subprocess, "Popen", _popen)
+        psmux.psmux_status(_cfg([ProjectConfig(path=str(tmp_path / "api"))]))
+        assert argvs == [["psmux", "-L", "api", "has-session", "-t", "api"]]
+
+
+class TestChildrenRunWithoutNestingMarkers:
+    """Every psmux CREATION/CONTROL/PROBE child runs with PSMUX_*/TMUX_*
+    stripped (see env.psmux_child_env). The bug this closes: running the menu
+    from inside a magent psmux window made psmux refuse the sibling session it
+    was asked to create -- "sessions should be nested with care, unset
+    PSMUX_SESSION to force" -- while still exiting 0."""
+
+    @pytest.fixture(autouse=True)
+    def _inside_a_session(self, monkeypatch):
+        monkeypatch.setenv("PSMUX_SESSION", "api")
+        monkeypatch.setenv("TMUX", "/tmp/psmux-1/default,123,0")
+        monkeypatch.setenv("TMUX_PANE", "%1")
+
+    def _env_of(self, monkeypatch, call):
+        seen: list[object] = []
+
+        def _record(cmd, **kwargs):
+            seen.append(kwargs.get("env"))
+            return _FakeCompleted(returncode=0, stdout="")
+
+        monkeypatch.setattr(subprocess, "run", _record)
+        call()
+        assert seen, "nothing was spawned"
+        return seen
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda: psmux.has_session("api", psmux="psmux"),
+            lambda: psmux.kill_server("api", psmux="psmux"),
+            lambda: psmux.send_keys("api", "claude", "Enter", psmux="psmux"),
+            lambda: psmux.pane_cwd("api", psmux="psmux"),
+            lambda: psmux.capture_pane("api", psmux="psmux"),
+            lambda: psmux.pane_current_command("api", psmux="psmux"),
+            lambda: psmux.detach_client("api", psmux="psmux"),
+            lambda: psmux.flash_message("api", "hi", 100, psmux="psmux"),
+        ],
+    )
+    def test_the_markers_never_reach_the_child(self, monkeypatch, call):
+        for env in self._env_of(monkeypatch, call):
+            assert isinstance(env, dict)
+            assert not [k for k in env if k.upper().startswith(("PSMUX", "TMUX"))]
+
+    def test_the_decoration_pass_is_cleaned_too(self, monkeypatch):
+        monkeypatch.setattr(psmux, "code_on_path", lambda: True)
+        for env in self._env_of(
+            monkeypatch, lambda: psmux.decorate_session("api", psmux="psmux")
+        ):
+            assert not [k for k in env if k.upper().startswith(("PSMUX", "TMUX"))]
+
+    def test_the_pane_command_fan_out_is_cleaned_too(self, monkeypatch):
+        seen: list[object] = []
+
+        class _Proc:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return "claude", ""
+
+        def _popen(cmd, **kwargs):
+            seen.append(kwargs.get("env"))
+            return _Proc()
+
+        monkeypatch.setattr(subprocess, "Popen", _popen)
+        psmux.pane_current_commands(["api"], psmux="psmux")
+        assert seen and all(
+            not [k for k in env if k.upper().startswith(("PSMUX", "TMUX"))]
+            for env in seen
+        )
+
+    def test_the_rest_of_the_environment_is_preserved(self, monkeypatch):
+        monkeypatch.setenv("MDTEST_KEEP", "yes")
+        envs = self._env_of(
+            monkeypatch, lambda: psmux.has_session("api", psmux="psmux")
+        )
+        assert envs[0]["MDTEST_KEEP"] == "yes"
+
+
 class TestBringUpCreationVerify:
     """Session CREATION is verified, and one bounded respawn is attempted.
 
@@ -574,13 +706,14 @@ class TestBringUpCreationVerify:
         assert retried.command == "claude --continue"
         assert retried.cwd == str(tmp_path / "api")
 
-    def test_every_name_attempted_is_still_returned(self, monkeypatch, tmp_path, slept):
-        # Contract pin: the verify is additive -- `bring_up` still answers with
-        # the names it tried to create, stuck ones included.
-        created, _fp = self._bring_up(
+    def test_a_recovered_session_counts_as_created(self, monkeypatch, tmp_path, slept):
+        # `api` fails its first launch and comes up on the respawn, so the wave
+        # really did bring up both -- nothing is reported failed.
+        (created, failed), _fp = self._bring_up(
             monkeypatch, tmp_path, names=["api", "web"], failures=["api"]
         )
         assert created == ["api", "web"]
+        assert failed == []
 
     def test_the_probe_gets_a_settle_before_it_runs(self, monkeypatch, tmp_path, slept):
         # Probing at t=0 would misclassify a slow-but-fine server on a loaded
@@ -668,7 +801,11 @@ class TestBringUpCreationVerify:
         assert errors and "api" in errors[0].getMessage()
         # Exactly one retry: the wave must not be spent on one stuck session.
         assert len(fp.psmux_launches) == 2
-        assert created == ["api"]
+        # ...and the casualty is REPORTED, not counted as a success. `bring_up`
+        # used to discard the verify's answer and return every attempted name,
+        # so the caller printed "Brought up 1 session(s)" for a session the log
+        # in the very same run called "never came up".
+        assert created == ([], ["api"])
 
     def test_a_respawn_that_cannot_be_launched_never_raises(
         self, monkeypatch, tmp_path, slept, caplog
@@ -690,7 +827,7 @@ class TestBringUpCreationVerify:
             created, _fp = self._bring_up(
                 monkeypatch, tmp_path, names=["api"], failures=["api"], plat=fp
             )
-        assert created == ["api"]
+        assert created == ([], ["api"])
         assert len(calls) == 2
 
     def test_no_psmux_binary_skips_the_verify_entirely(
@@ -707,9 +844,109 @@ class TestBringUpCreationVerify:
             "has_session",
             lambda *a, **k: pytest.fail("probed with no psmux binary"),
         )
-        psmux.bring_up(_cfg([ProjectConfig(path=str(tmp_path / "api"), tool="claude")]))
+        created = psmux.bring_up(
+            _cfg([ProjectConfig(path=str(tmp_path / "api"), tool="claude")])
+        )
         assert fp.psmux_launches == [["api"]]
         assert slept == []
+        # Unprovable is not "fine": with no binary to probe with, nothing may be
+        # claimed as created either.
+        assert created == ([], ["api"])
+
+
+class TestBringUpContainsCreationFailures:
+    """A window psmux refuses must cost only itself.
+
+    Live repro of the user's "error towards the end": one project's
+    ``new-session`` exited 1 (``psmux: failed to create session 'EmailSESFix'``)
+    and ``platform/windows.py`` raised ``CalledProcessError`` through
+    ``launch_verified``'s FIRST, unguarded ``launch_psmux_session`` call -- a
+    traceback out of `magent up` and out of the menu's `u`, with every remaining
+    session in the wave abandoned.
+    """
+
+    @pytest.fixture
+    def slept(self, monkeypatch):
+        out: list[float] = []
+        monkeypatch.setattr("magent.psmux.time.sleep", out.append)
+        return out
+
+    def _plat(self, monkeypatch, *, boom, live):
+        from tests.conftest import FakePlatform
+
+        fp = FakePlatform(supports_psmux=True)
+        calls: list[list[str]] = []
+
+        def _launch(windows):
+            calls.append([w.window_name for w in windows])
+            if len(calls) == 1:
+                raise boom
+            for w in windows:
+                fp.psmux_sessions.add(w.window_name)
+
+        fp.launch_psmux_session = _launch
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+        monkeypatch.setattr(
+            psmux,
+            "has_session",
+            lambda name, psmux=None, timeout=None: (
+                name in live or name in fp.psmux_sessions
+            ),
+        )
+        return fp, calls
+
+    def _windows(self, names):
+        return [
+            psmux.PsmuxWindowOpts(window_name=n, cwd=f"/a/{n}", command="claude")
+            for n in names
+        ]
+
+    def test_a_raising_first_launch_does_not_propagate(self, monkeypatch, slept):
+        boom = subprocess.CalledProcessError(1, ["psmux", "new-session"])
+        fp, calls = self._plat(monkeypatch, boom=boom, live={"web"})
+        # No pytest.raises: the point is that nothing escapes.
+        failed = psmux.launch_verified(fp, self._windows(["api", "web"]))
+        assert calls[0] == ["api", "web"]
+        assert failed == []
+
+    def test_the_verify_still_runs_and_respawns_the_missing(self, monkeypatch, slept):
+        boom = subprocess.CalledProcessError(1, ["psmux", "new-session"])
+        fp, calls = self._plat(monkeypatch, boom=boom, live={"web"})
+        psmux.launch_verified(fp, self._windows(["api", "web"]))
+        # `web` was already live; only `api` is respawned -- the wave's other
+        # sessions are not re-created, and none of them were abandoned.
+        assert calls[1] == ["api"]
+
+    def test_the_raise_is_logged_with_its_traceback(self, monkeypatch, slept, caplog):
+        boom = OSError("psmux vanished")
+        fp, _calls = self._plat(monkeypatch, boom=boom, live={"api"})
+        with caplog.at_level(logging.ERROR, logger="magent.launch"):
+            psmux.launch_verified(fp, self._windows(["api"]))
+        assert any("bring-up raised" in r.getMessage() for r in caplog.records)
+
+    def test_a_session_that_stays_down_is_returned_as_a_casualty(
+        self, monkeypatch, slept
+    ):
+        # First launch raises, the respawn is a silent no-op, the session never
+        # answers: it is REPORTED, never claimed as created.
+        from tests.conftest import FakePlatform
+
+        fp = FakePlatform(supports_psmux=True)
+        calls: list[int] = []
+
+        def _launch(windows):
+            calls.append(1)
+            if len(calls) == 1:
+                raise subprocess.CalledProcessError(1, ["psmux", "new-session"])
+
+        fp.launch_psmux_session = _launch
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(
+            psmux, "has_session", lambda name, psmux=None, timeout=None: False
+        )
+        assert psmux.launch_verified(fp, self._windows(["api"])) == ["api"]
+        assert len(calls) == 2
 
 
 # The status-right hint, restated here on purpose: an independent copy is what

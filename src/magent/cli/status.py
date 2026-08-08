@@ -594,11 +594,20 @@ def _menu_up(config_file: Path) -> None:
                 click.echo(f"  {style('?', fg='yellow')} cancelled.")
                 return
             only = dn_buckets[sel]
-        created = bring_up_psmux(cfg, only=only)
+        created, failed = bring_up_psmux(cfg, only=only)
         click.echo(
             f"  {style('+', fg='green')} Brought up {style(str(len(created)), fg='green', bold=True)} "
             f"session(s) headlessly {style('(switch with the session switcher)', dim=True)}."
         )
+        # The casualties `launch_verified` already logged, said out loud. This
+        # menu used to report every attempted session as brought up, so a wave
+        # that half-failed looked identical to one that worked.
+        if failed:
+            click.echo(
+                f"  {style('x', fg='red')} {style(str(len(failed)), fg='red', bold=True)}"
+                f" session(s) failed to come up: {style(', '.join(failed), fg='red')}"
+                f" {style('(see ~/.magent/logs/launch.log)', dim=True)}"
+            )
         if cfg.settings.upload_server:
             _maybe_start_upload_server(cfg.settings.upload_port, str(config_file))
     click.echo()

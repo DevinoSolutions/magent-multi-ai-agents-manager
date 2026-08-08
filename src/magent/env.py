@@ -126,6 +126,43 @@ def editor_command() -> str:
     return os.environ.get("EDITOR", "xdg-open")
 
 
+# Every environment variable a psmux/tmux server exports into its panes to say
+# "you are inside a session": PSMUX_SESSION, PSMUX_TARGET_SESSION, TMUX,
+# TMUX_PANE, PSMUX_CLAUDE_TEAMMATE_MODE, ... Matched by PREFIX rather than by an
+# exact list, because the set is the multiplexer's to grow, not ours.
+_MUX_NESTING_PREFIXES = ("PSMUX", "TMUX")
+
+
+def psmux_child_env() -> dict[str, str]:
+    """The process environment with every psmux/tmux nesting marker removed.
+
+    magent's sessions are SIBLINGS by construction -- one session per socket,
+    never a session inside a session -- but a magent command run from inside a
+    magent psmux window inherits that window's ``PSMUX_SESSION``/``TMUX``, and
+    the psmux binary then refuses the child with::
+
+        psmux: sessions should be nested with care, unset PSMUX_SESSION to force
+
+    (and, on psmux 3.3.6, still exits 0 while creating nothing). Stripping the
+    markers is what makes a bring-up launched from inside a session behave
+    exactly like one launched from a bare shell.
+
+    It also removes the ambient default target: with ``$TMUX`` unset, no
+    control command can silently answer for "the calling client's own session"
+    -- the same class of bug ``pane_cwd``'s explicit ``-t`` exists to close.
+
+    Used for CREATION/CONTROL/PROBE children only. A user-facing ``attach``
+    client is a different question (attaching from inside a pane really IS
+    nesting, and psmux's guard is right to fire there), so those call sites
+    keep the inherited environment on purpose.
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith(_MUX_NESTING_PREFIXES)
+    }
+
+
 def config_base() -> Path:
     """The platform-appropriate config base directory."""
     if sys.platform == "win32":
