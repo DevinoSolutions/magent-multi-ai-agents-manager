@@ -126,15 +126,36 @@ def editor_command() -> str:
     return os.environ.get("EDITOR", "xdg-open")
 
 
-# Every environment variable a psmux/tmux server exports into its panes to say
-# "you are inside a session": PSMUX_SESSION, PSMUX_TARGET_SESSION, TMUX,
-# TMUX_PANE, PSMUX_CLAUDE_TEAMMATE_MODE, ... Matched by PREFIX rather than by an
-# exact list, because the set is the multiplexer's to grow, not ours.
-_MUX_NESTING_PREFIXES = ("PSMUX", "TMUX")
+# The tmux-side "you are inside a session" markers, by exact name: tmux sets
+# TMUX (socket,pid,session of the CLIENT) and TMUX_PANE, and those two alone are
+# what its nested-session guard reads. NOT a prefix match -- see _MUX_KEEP_SUFFIX.
+_MUX_NESTING_VARS = frozenset({"TMUX", "TMUX_PANE"})
+
+# psmux's own markers (PSMUX_SESSION, PSMUX_TARGET_SESSION,
+# PSMUX_CLAUDE_TEAMMATE_MODE, ...) ARE prefix-matched: that set is psmux's to
+# grow, not ours, and every member so far is a session marker.
+_MUX_NESTING_PREFIX = "PSMUX"
+
+# ...with one carve-out, in both families. A ``*_TMPDIR`` variable is
+# CONFIGURATION, not a nesting marker: TMUX_TMPDIR names the directory the
+# server's sockets live in, so a child that loses it looks for the server in a
+# different place and finds nothing at all. Every session then probes DEAD --
+# the exact failure the browser-upload CI tier hit (it confines its real-tmux
+# shim to a private TMUX_TMPDIR, so stripping it emptied /api/sessions), and the
+# same would happen to any user who relocates their sockets.
+_MUX_KEEP_SUFFIX = "_TMPDIR"
+
+
+def _is_mux_nesting_marker(key: str) -> bool:
+    """True for the env vars that say "this process is INSIDE a session"."""
+    upper = key.upper()
+    if upper.endswith(_MUX_KEEP_SUFFIX):
+        return False
+    return upper in _MUX_NESTING_VARS or upper.startswith(_MUX_NESTING_PREFIX)
 
 
 def psmux_child_env() -> dict[str, str]:
-    """The process environment with every psmux/tmux nesting marker removed.
+    """The process environment with the psmux/tmux nesting markers removed.
 
     magent's sessions are SIBLINGS by construction -- one session per socket,
     never a session inside a session -- but a magent command run from inside a
@@ -147,9 +168,19 @@ def psmux_child_env() -> dict[str, str]:
     markers is what makes a bring-up launched from inside a session behave
     exactly like one launched from a bare shell.
 
-    It also removes the ambient default target: with ``$TMUX`` unset, no
-    control command can silently answer for "the calling client's own session"
-    -- the same class of bug ``pane_cwd``'s explicit ``-t`` exists to close.
+    Removing ``TMUX``/``TMUX_PANE`` also removes the ambient default target:
+    with them unset, no control command can silently answer for "the calling
+    client's own session" -- the same class of bug ``pane_cwd``'s explicit
+    ``-t`` exists to close.
+
+    What must SURVIVE, and why: ``TMUX_TMPDIR`` (and any future ``*_TMPDIR``)
+    tells the binary WHERE the server sockets live -- it is how you reach a
+    server, not a claim to be running inside one. A child without it falls back
+    to the default socket dir, finds no server there, and reports every session
+    dead. Load-bearing for anyone who relocates their sockets, and proven by
+    CI: the browser-upload tier confines its real-tmux shim to a private
+    ``TMUX_TMPDIR``, and a blanket ``TMUX*`` strip made the upload page render
+    an empty project list.
 
     Used for CREATION/CONTROL/PROBE children only. A user-facing ``attach``
     client is a different question (attaching from inside a pane really IS
@@ -159,7 +190,7 @@ def psmux_child_env() -> dict[str, str]:
     return {
         key: value
         for key, value in os.environ.items()
-        if not key.upper().startswith(_MUX_NESTING_PREFIXES)
+        if not _is_mux_nesting_marker(key)
     }
 
 

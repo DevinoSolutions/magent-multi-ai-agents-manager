@@ -622,9 +622,14 @@ class TestWindowsBringUpPsmuxInvocation:
         assert probes == [["psmux", "-L", "api", "has-session", "-t", "api"]]
 
     def test_every_child_runs_without_the_nesting_markers(self, monkeypatch):
+        from tests.unit.test_psmux import _markers_in
+
         seen: list[object] = []
         monkeypatch.setenv("PSMUX_SESSION", "api")
         monkeypatch.setenv("TMUX", "/tmp/psmux-1/default,1,0")
+        # A relocated socket dir rides along: it is configuration, not a
+        # nesting marker, and every child needs it to find the server at all.
+        monkeypatch.setenv("TMUX_TMPDIR", "/tmp/private-sockets")
         _drive_bring_up(
             monkeypatch,
             windows=["api"],
@@ -633,8 +638,8 @@ class TestWindowsBringUpPsmuxInvocation:
         )
         assert seen, "nothing was spawned"
         for env in seen:
-            assert isinstance(env, dict)
-            assert not [k for k in env if k.upper().startswith(("PSMUX", "TMUX"))]
+            assert _markers_in(env) == []
+            assert env["TMUX_TMPDIR"] == "/tmp/private-sockets"
 
 
 # --- find_window mode contract (LS-B-005) -----------------------------------

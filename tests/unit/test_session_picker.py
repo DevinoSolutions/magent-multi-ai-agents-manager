@@ -100,10 +100,14 @@ class TestLiveSessions:
 
         monkeypatch.setenv("PSMUX_SESSION", "api")
         monkeypatch.setenv("TMUX", "/tmp/sock,1,0")
+        monkeypatch.setenv("TMUX_TMPDIR", "/tmp/private-sockets")
         monkeypatch.setattr(session_picker.subprocess, "Popen", _fake_popen)
         session_picker._live_sessions("psmux", ["a"])
         assert envs and all(isinstance(e, dict) for e in envs)
         assert all("PSMUX_SESSION" not in e and "TMUX" not in e for e in envs)
+        # ...but the socket dir survives, or the probe looks for the server in
+        # the wrong place and reports every session dead.
+        assert all(e["TMUX_TMPDIR"] == "/tmp/private-sockets" for e in envs)
 
 
 class TestSessionCwds:

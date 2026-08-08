@@ -558,8 +558,25 @@ class TestHasSessionTargetsTheSession:
         assert argvs == [["psmux", "-L", "api", "has-session", "-t", "api"]]
 
 
+def _markers_in(env: object) -> list[str]:
+    """The nesting markers still present in a child's environment.
+
+    Deliberately NOT a blanket ``PSMUX*``/``TMUX*`` sweep: ``TMUX_TMPDIR`` is
+    the socket directory and MUST survive (see
+    test_env_schema.py::TestPsmuxChildEnv::test_the_socket_dir_survives), so a
+    prefix assertion here would demand the very bug that broke CI.
+    """
+    assert isinstance(env, dict)
+    return [
+        k
+        for k in env
+        if not k.upper().endswith("_TMPDIR")
+        and (k.upper() in ("TMUX", "TMUX_PANE") or k.upper().startswith("PSMUX"))
+    ]
+
+
 class TestChildrenRunWithoutNestingMarkers:
-    """Every psmux CREATION/CONTROL/PROBE child runs with PSMUX_*/TMUX_*
+    """Every psmux CREATION/CONTROL/PROBE child runs with the nesting markers
     stripped (see env.psmux_child_env). The bug this closes: running the menu
     from inside a magent psmux window made psmux refuse the sibling session it
     was asked to create -- "sessions should be nested with care, unset
@@ -570,6 +587,8 @@ class TestChildrenRunWithoutNestingMarkers:
         monkeypatch.setenv("PSMUX_SESSION", "api")
         monkeypatch.setenv("TMUX", "/tmp/psmux-1/default,123,0")
         monkeypatch.setenv("TMUX_PANE", "%1")
+        # ...and a relocated socket dir, which every child still needs.
+        monkeypatch.setenv("TMUX_TMPDIR", "/tmp/private-sockets")
 
     def _env_of(self, monkeypatch, call):
         seen: list[object] = []
@@ -598,15 +617,21 @@ class TestChildrenRunWithoutNestingMarkers:
     )
     def test_the_markers_never_reach_the_child(self, monkeypatch, call):
         for env in self._env_of(monkeypatch, call):
-            assert isinstance(env, dict)
-            assert not [k for k in env if k.upper().startswith(("PSMUX", "TMUX"))]
+            assert _markers_in(env) == []
+
+    def test_the_socket_dir_does_reach_the_child(self, monkeypatch):
+        # The other half of the contract: strip the markers, keep the address.
+        envs = self._env_of(
+            monkeypatch, lambda: psmux.has_session("api", psmux="psmux")
+        )
+        assert envs[0]["TMUX_TMPDIR"] == "/tmp/private-sockets"
 
     def test_the_decoration_pass_is_cleaned_too(self, monkeypatch):
         monkeypatch.setattr(psmux, "code_on_path", lambda: True)
         for env in self._env_of(
             monkeypatch, lambda: psmux.decorate_session("api", psmux="psmux")
         ):
-            assert not [k for k in env if k.upper().startswith(("PSMUX", "TMUX"))]
+            assert _markers_in(env) == []
 
     def test_the_pane_command_fan_out_is_cleaned_too(self, monkeypatch):
         seen: list[object] = []
@@ -623,10 +648,7 @@ class TestChildrenRunWithoutNestingMarkers:
 
         monkeypatch.setattr(subprocess, "Popen", _popen)
         psmux.pane_current_commands(["api"], psmux="psmux")
-        assert seen and all(
-            not [k for k in env if k.upper().startswith(("PSMUX", "TMUX"))]
-            for env in seen
-        )
+        assert seen and all(_markers_in(env) == [] for env in seen)
 
     def test_the_rest_of_the_environment_is_preserved(self, monkeypatch):
         monkeypatch.setenv("MDTEST_KEEP", "yes")

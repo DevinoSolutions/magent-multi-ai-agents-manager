@@ -91,6 +91,23 @@ class TestPsmuxChildEnv:
         monkeypatch.setenv(key, "whatever")
         assert key not in env_module.psmux_child_env()
 
+    @pytest.mark.parametrize("key", ["TMUX_TMPDIR", "PSMUX_TMPDIR"])
+    def test_the_socket_dir_survives(
+        self, monkeypatch: pytest.MonkeyPatch, key: str
+    ) -> None:
+        """``*_TMPDIR`` is where the server's sockets live -- configuration for
+        REACHING a server, not a claim to be running inside one.
+
+        Caught by CI, not by review: the first cut stripped every ``TMUX*`` key,
+        which took ``TMUX_TMPDIR`` with it. The browser-upload tier confines its
+        real-tmux shim to a private socket dir, so every probe then looked in
+        the default one, found no server, and answered dead -- the upload page
+        rendered an empty project list and all three tests failed on locators.
+        The same breaks any user who relocates their sockets.
+        """
+        monkeypatch.setenv(key, "/tmp/private-sockets")
+        assert env_module.psmux_child_env()[key] == "/tmp/private-sockets"
+
     def test_a_lowercase_marker_is_removed_too(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -98,6 +115,26 @@ class TestPsmuxChildEnv:
         # the upper-cased name so neither host can smuggle a marker through.
         monkeypatch.setenv("tmux", "/tmp/sock,1,0")
         assert not [k for k in env_module.psmux_child_env() if k.lower() == "tmux"]
+
+    def test_a_lowercase_tmpdir_survives_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Looked up case-insensitively: Windows upper-cases env keys on set,
+        # POSIX keeps them verbatim, and the accessor must keep the var under
+        # whichever name the host chose.
+        monkeypatch.setenv("tmux_tmpdir", "/tmp/private-sockets")
+        child = env_module.psmux_child_env()
+        assert [v for k, v in child.items() if k.upper() == "TMUX_TMPDIR"] == [
+            "/tmp/private-sockets"
+        ]
+
+    def test_an_unrelated_tmux_prefixed_var_is_left_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Only TMUX and TMUX_PANE are tmux's in-a-session markers; the strip is
+        # an exact match on that family, not a prefix sweep over it.
+        monkeypatch.setenv("TMUXP_CONFIGDIR", "/home/u/.tmuxp")
+        assert env_module.psmux_child_env()["TMUXP_CONFIGDIR"] == "/home/u/.tmuxp"
 
     def test_everything_else_survives(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # The child still needs PATH to find psmux, HOME for its socket dir...
@@ -111,7 +148,8 @@ class TestPsmuxChildEnv:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         for key in list(os.environ):
-            if key.upper().startswith(("PSMUX", "TMUX")):
+            upper = key.upper()
+            if upper in ("TMUX", "TMUX_PANE") or upper.startswith("PSMUX"):
                 monkeypatch.delenv(key, raising=False)
         assert env_module.psmux_child_env() == dict(os.environ)
 

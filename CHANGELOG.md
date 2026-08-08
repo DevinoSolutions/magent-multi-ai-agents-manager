@@ -20,9 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   construction -- one session per socket, never a session inside a session --
   so every creation, control and probe child now runs with those markers
   stripped (`env.psmux_child_env`, the one module allowed to touch
-  `os.environ`). The user-facing *attach* client keeps the inherited
-  environment on purpose: attaching from inside a pane really is nesting, and
-  psmux's warning is right to fire there.
+  `os.environ`). Exactly the in-a-session markers go: `TMUX`, `TMUX_PANE` and
+  the `PSMUX*` family. `TMUX_TMPDIR` (and any future `*_TMPDIR`) is kept --
+  it names the directory the server's sockets live in, so a child that loses
+  it looks in the default location, finds nothing, and reports every session
+  dead. The user-facing *attach* client keeps the inherited environment on
+  purpose: attaching from inside a pane really is nesting, and psmux's warning
+  is right to fire there.
 - **Liveness probes tell the truth.** `psmux -L <name> has-session` with no
   `-t` exits 0 even when no server exists on that socket (proven live:
   `psmux -L definitely-not-a-session-xyz has-session` -> rc 0; psmux also
