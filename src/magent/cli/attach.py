@@ -1363,11 +1363,20 @@ def up_cmd(
     elif not do_all and not down:
         click.echo(f"  {style('+', fg='green')} All {len(up)} session(s) already up.")
     else:
-        created = bring_up_psmux(cfg, only=targets, group=group)
+        created, failed = bring_up_psmux(cfg, only=targets, group=group)
         click.echo(
             f"  {style('+', fg='green')} Brought up {style(str(len(created)), fg='green', bold=True)}"
             f" session(s): {style(', '.join(created) or '(none)', dim=True)}"
         )
+        # `created` now means "the verify proved it is up", so the sessions it
+        # does NOT contain have to be named -- this line is what `magent attach`
+        # relays from the host, and a silent casualty there reads as success.
+        if failed:
+            click.echo(
+                f"  {style('x', fg='red')} {style(str(len(failed)), fg='red', bold=True)}"
+                f" session(s) failed to come up: {style(', '.join(failed), fg='red')}"
+                f" {style('(see ~/.magent/logs/launch.log on the host)', dim=True)}"
+            )
 
     # Unconditional on the interactive path: a session that is up but parked at
     # a bare shell is exactly what this command is asked to fix, and there is

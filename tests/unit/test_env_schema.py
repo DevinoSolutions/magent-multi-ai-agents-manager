@@ -64,6 +64,104 @@ class TestEnvExampleMatchesSchema:
         assert key in _example_keys(), f"{key} missing from .env.example"
 
 
+class TestPsmuxChildEnv:
+    """`psmux_child_env` strips the multiplexer's nesting markers and nothing
+    else.
+
+    Live repro: running the menu inside a magent psmux window put
+    PSMUX_SESSION/PSMUX_TARGET_SESSION/TMUX/TMUX_PANE in every child's
+    environment, and psmux answered `new-session` with "sessions should be
+    nested with care, unset PSMUX_SESSION to force" -- then exited 0 having
+    created nothing. magent's sessions are siblings, never nested.
+    """
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "PSMUX_SESSION",
+            "PSMUX_TARGET_SESSION",
+            "PSMUX_CLAUDE_TEAMMATE_MODE",
+            "TMUX",
+            "TMUX_PANE",
+        ],
+    )
+    def test_every_nesting_marker_is_removed(
+        self, monkeypatch: pytest.MonkeyPatch, key: str
+    ) -> None:
+        monkeypatch.setenv(key, "whatever")
+        assert key not in env_module.psmux_child_env()
+
+    @pytest.mark.parametrize("key", ["TMUX_TMPDIR", "PSMUX_TMPDIR"])
+    def test_the_socket_dir_survives(
+        self, monkeypatch: pytest.MonkeyPatch, key: str
+    ) -> None:
+        """``*_TMPDIR`` is where the server's sockets live -- configuration for
+        REACHING a server, not a claim to be running inside one.
+
+        Caught by CI, not by review: the first cut stripped every ``TMUX*`` key,
+        which took ``TMUX_TMPDIR`` with it. The browser-upload tier confines its
+        real-tmux shim to a private socket dir, so every probe then looked in
+        the default one, found no server, and answered dead -- the upload page
+        rendered an empty project list and all three tests failed on locators.
+        The same breaks any user who relocates their sockets.
+        """
+        monkeypatch.setenv(key, "/tmp/private-sockets")
+        assert env_module.psmux_child_env()[key] == "/tmp/private-sockets"
+
+    def test_a_lowercase_marker_is_removed_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Windows env keys are case-insensitive; POSIX ones are not. Match on
+        # the upper-cased name so neither host can smuggle a marker through.
+        monkeypatch.setenv("tmux", "/tmp/sock,1,0")
+        assert not [k for k in env_module.psmux_child_env() if k.lower() == "tmux"]
+
+    def test_a_lowercase_tmpdir_survives_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Looked up case-insensitively: Windows upper-cases env keys on set,
+        # POSIX keeps them verbatim, and the accessor must keep the var under
+        # whichever name the host chose.
+        monkeypatch.setenv("tmux_tmpdir", "/tmp/private-sockets")
+        child = env_module.psmux_child_env()
+        assert [v for k, v in child.items() if k.upper() == "TMUX_TMPDIR"] == [
+            "/tmp/private-sockets"
+        ]
+
+    def test_an_unrelated_tmux_prefixed_var_is_left_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Only TMUX and TMUX_PANE are tmux's in-a-session markers; the strip is
+        # an exact match on that family, not a prefix sweep over it.
+        monkeypatch.setenv("TMUXP_CONFIGDIR", "/home/u/.tmuxp")
+        assert env_module.psmux_child_env()["TMUXP_CONFIGDIR"] == "/home/u/.tmuxp"
+
+    def test_everything_else_survives(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The child still needs PATH to find psmux, HOME for its socket dir...
+        monkeypatch.setenv("PATH", os.environ.get("PATH", "/usr/bin"))
+        monkeypatch.setenv("MDTEST_UNRELATED", "keep-me")
+        child = env_module.psmux_child_env()
+        assert child["MDTEST_UNRELATED"] == "keep-me"
+        assert child["PATH"]
+
+    def test_a_clean_environment_is_passed_through_whole(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for key in list(os.environ):
+            upper = key.upper()
+            if upper in ("TMUX", "TMUX_PANE") or upper.startswith("PSMUX"):
+                monkeypatch.delenv(key, raising=False)
+        assert env_module.psmux_child_env() == dict(os.environ)
+
+    def test_psmux_module_re_exports_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Every psmux spawn site reaches the accessor through psmux.child_env,
+        # so the module that owns psmux subprocess behaviour owns this too.
+        from magent import psmux
+
+        monkeypatch.setenv("PSMUX_SESSION", "api")
+        assert "PSMUX_SESSION" not in psmux.child_env()
+
+
 class TestClosedSchemaRejectsUnknownVars:
     """R2-01: extra="forbid" alone never sees env-sourced keys — the
     _no_unknown_magent_vars validator is what actually closes the schema."""

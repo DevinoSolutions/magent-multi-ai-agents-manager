@@ -326,6 +326,47 @@ class TestMenuDownServerReport:
         assert "Stopped upload server on port" not in out
 
 
+class TestMenuUpReportsCasualties:
+    """The menu's `u` tells the truth about what came up.
+
+    Live repro: one project's session was refused by psmux, `launch_verified`
+    logged "session never came up after respawn; left down: ...", and the menu
+    printed "+ Brought up 2 session(s) headlessly" anyway -- `bring_up`
+    discarded the verify's answer and returned every attempted name.
+    """
+
+    def _drive(self, monkeypatch, tmp_config, *, created, failed):
+        from magent.cli import status as status_mod
+
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: ([], [{"name": "api", "session": "api"}], [{}]),
+        )
+        monkeypatch.setattr(
+            "magent.launch.bring_up_psmux",
+            lambda cfg, only=None, group=None: (list(created), list(failed)),
+        )
+        monkeypatch.setattr(status_mod.click, "prompt", lambda *a, **k: "a")
+        monkeypatch.setattr(status_mod.click, "pause", lambda *a, **k: None)
+        cfgpath = tmp_config({"version": 2, "projects": [{"path": "api"}]})
+        status_mod._menu_up(Path(cfgpath))
+
+    def test_failed_sessions_are_named_in_red(self, monkeypatch, tmp_config, capsys):
+        self._drive(monkeypatch, tmp_config, created=["web"], failed=["api"])
+        out = capsys.readouterr().out
+        assert "Brought up 1 session(s)" in out
+        assert "1 session(s) failed to come up" in out
+        assert "api" in out
+
+    def test_a_clean_wave_says_nothing_about_failures(
+        self, monkeypatch, tmp_config, capsys
+    ):
+        self._drive(monkeypatch, tmp_config, created=["api", "web"], failed=[])
+        out = capsys.readouterr().out
+        assert "Brought up 2 session(s)" in out
+        assert "failed to come up" not in out
+
+
 class TestPsmuxSessionSection:
     """The agents live inside the psmux sessions, so `status` reports each live
     one's foreground app and agent state -- not just the daemons around them."""

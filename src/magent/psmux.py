@@ -44,6 +44,32 @@ def find_psmux() -> str | None:
     return None
 
 
+def child_env() -> dict[str, str]:
+    """Environment for a psmux child that CREATES a session.
+
+    Delegates to ``env.psmux_child_env`` -- the only module allowed to touch
+    ``os.environ`` -- and is re-exported here so the one spawn site that needs
+    it (``platform/windows.py``'s ``new-session``) reaches it through the module
+    that owns psmux subprocess behaviour. Imported in-body because
+    ``magent.env`` pulls pydantic in, and this module is a leaf that only
+    imports ``magent.log`` at module level.
+
+    SCOPE, measured rather than assumed: psmux's nested-session guard fires for
+    ``new-session`` alone. Run from inside a live pane against a live session,
+    ``has-session -t``, ``display-message -t`` and ``capture-pane -t`` return
+    byte-identical results with the markers present and with them stripped --
+    no warning, same exit code. So every CONTROL and PROBE command in this
+    module spawns with the plain inherited environment: cleaning it there would
+    buy nothing and would put a rebuilt environment block under every psmux
+    round-trip magent makes. (The one thing an inherited ``$TMUX`` could still
+    do -- let a target-less command answer for the calling client's own pane --
+    is closed explicitly by the ``-t <session>`` every command here passes.)
+    """
+    from magent.env import psmux_child_env
+
+    return psmux_child_env()
+
+
 @dataclass
 class PsmuxWindowOpts:
     """One window to create inside a psmux session."""
@@ -63,6 +89,19 @@ def has_session(
 ) -> bool:
     """True if a psmux session named ``name`` is alive.
 
+    The explicit ``-t <name>`` is REQUIRED, exactly as it is for
+    ``display-message``: a BARE ``has-session`` exits 0 on this machine's psmux
+    3.3.6 for a socket that has no server at all (``psmux -L
+    definitely-not-a-session-xyz has-session`` -> rc 0; psmux also keeps
+    internal ``__warm__`` spare servers per socket that answer it), so every
+    liveness probe in the product reported UP for dead sessions -- status, the
+    menu's "already running", the bring-up creation verify, revive, the corpse
+    sweeps. With ``-t`` the answer is truthful on live and dead sockets alike.
+
+    ``-t`` prefix-matches in tmux, which is safe here by construction: magent
+    runs ONE session per socket and the session name equals the socket name, so
+    no second session can share ``-L <name>`` to be matched by accident.
+
     ``timeout`` bounds the probe and a timed-out probe answers False. Left at
     the default the call blocks exactly as before -- only the bring-up creation
     verify passes a bound, because a wedged psmux server answers nothing at all
@@ -73,7 +112,7 @@ def has_session(
         return False
     try:
         result = subprocess.run(
-            [binary, "-L", name, "has-session"],
+            [binary, "-L", name, "has-session", "-t", name],
             capture_output=True,
             timeout=timeout,
             check=False,
@@ -765,8 +804,12 @@ def psmux_status(
             "group": p.get("group"),
         }
         if binary and p["resolved"] and p["cmd"]:
+            sid = _field_str(p, "session")
             proc = subprocess.Popen(
-                [binary, "-L", _field_str(p, "session"), "has-session"],
+                # `-t <sid>` for the same reason `has_session` passes it: a bare
+                # has-session exits 0 for a socket with no server at all, so
+                # every row in this table read "up" on a cold machine.
+                [binary, "-L", sid, "has-session", "-t", sid],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -785,11 +828,19 @@ def bring_up(
     config: MagentConfig,
     only: list[str] | None = None,
     group: str | None = None,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """Create detached psmux sessions for eligible projects.
 
     ``only`` restricts creation to the given session names; ``group``
-    restricts to a single project group. Returns the names (re)created.
+    restricts to a single project group.
+
+    Returns ``(created, failed)``: the sessions the creation verify PROVED are
+    up, and the ones still missing after ``launch_verified``'s one respawn.
+    The casualties used to be discarded here -- ``launch_verified`` logged
+    "session never came up after respawn" while this function answered with
+    every name it had attempted, so both callers printed "Brought up N
+    session(s)" for sessions that were never created. A caller cannot report
+    honestly on a list that never distinguished the two.
     """
     from magent.platform import get_platform
 
@@ -807,9 +858,12 @@ def bring_up(
                 command=_field_str(p, "cmd"),
             )
         )
-    if windows:
-        launch_verified(plat, windows)
-    return [w.window_name for w in windows]
+    names = [w.window_name for w in windows]
+    if not windows:
+        return [], []
+    failed = launch_verified(plat, windows)
+    stuck = set(failed)
+    return [n for n in names if n not in stuck], failed
 
 
 # Mirrors ``platform/windows.py::_SEND_VERIFY_SETTLE_S`` on purpose: a freshly
@@ -860,22 +914,41 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> list[str]
     a wedged server) counts as MISSING and is retried. Unknown is safe to
     re-create; it is not safe to inject into.
 
-    Never raises out of the verify: one stuck session must not cost the wave
-    its remaining ones. Returns the names still missing after the one retry.
+    Never raises out of the verify -- and, since v3.10.10, never raises out of
+    the CREATION either: one stuck session must not cost the wave its remaining
+    ones. The first ``launch_psmux_session`` was the one call here left
+    unguarded, so a single window psmux refused to create ("failed to create
+    session 'X'", rc 1) escaped as a ``CalledProcessError`` traceback out of
+    `magent up` and out of the interactive menu's "u", aborting every remaining
+    session in the wave. A raise is now logged and falls through to the probe
+    below, which is the component that already knows how to respawn what is
+    missing and report what stayed down.
+
+    Returns the names still missing after the one retry.
     """
     if not windows:
         return []
-    plat.launch_psmux_session(windows)
-
+    names = [w.window_name for w in windows]
     log = get_logger("launch")
+    try:
+        plat.launch_psmux_session(windows)
+    except (OSError, subprocess.SubprocessError):
+        # Same handling the respawn below has always had. Deliberately NOT a
+        # re-raise: the probe decides what actually came up, and a partial
+        # batch is exactly the case worth verifying.
+        log.exception("bring-up raised while creating %s", ", ".join(names))
+
     binary = find_psmux()
     if not binary:
-        return []
+        # Nothing can be probed, so nothing can be claimed. Every name is
+        # reported missing rather than silently passed off as created -- with
+        # no psmux binary the creation above cannot have succeeded either.
+        return names
 
     # Settle first: the storm's timeouts were transient churn, and probing at
     # t=0 would misclassify slow-but-fine servers on a loaded host.
     time.sleep(_CREATE_VERIFY_SETTLE_S)
-    missing = _missing_sessions([w.window_name for w in windows], binary)
+    missing = _missing_sessions(names, binary)
     if not missing:
         return []
 

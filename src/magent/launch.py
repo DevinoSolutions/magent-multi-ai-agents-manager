@@ -592,7 +592,16 @@ def _start_psmux_and_upload(
         # otherwise be the one bring-up left with no proof a session came up.
         from magent import psmux
 
-        psmux.launch_verified(plat, psmux_windows)
+        failed = psmux.launch_verified(plat, psmux_windows)
+        if failed:
+            # Same honesty the attach/menu bring-up paths now have: a session
+            # the verify proved never came up must not be counted among the
+            # ones this path reports below.
+            click.echo(
+                f"\n  {style('x', fg='red')} {style(str(len(failed)), fg='red', bold=True)}"
+                f" session(s) failed to come up: {style(', '.join(failed), fg='red')}"
+                f" {style('(see ~/.magent/logs/launch.log)', dim=True)}"
+            )
         for pw in psmux_windows:
             plat.attach_psmux(
                 pw.window_name,
@@ -749,8 +758,8 @@ def psmux_status(
 
 def bring_up_psmux(
     config: MagentConfig, only: list[str] | None = None, group: str | None = None
-) -> list[str]:
-    """Delegate to ``psmux.bring_up``."""
+) -> tuple[list[str], list[str]]:
+    """Delegate to ``psmux.bring_up``. Returns ``(created, failed)``."""
     from magent import psmux
 
     return psmux.bring_up(config, only, group)

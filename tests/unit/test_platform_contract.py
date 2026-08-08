@@ -241,6 +241,8 @@ def _drive_bring_up(
     windows: list[str] | None = None,
     pane_states: dict[str, list[str]] | None = None,
     pane_probes: list[list[str]] | None = None,
+    create_failures: set[str] | None = None,
+    envs: list[object] | None = None,
 ):
     """Drive a real ``launch_psmux_session`` over a fully faked psmux seam.
 
@@ -261,10 +263,18 @@ def _drive_bring_up(
         def wait(self):
             return 0
 
-    def _popen(cmd, **_kwargs):
+    def _popen(cmd, **kwargs):
         calls.append(list(cmd))
+        if envs is not None:
+            envs.append(kwargs.get("env"))
         # has-session must report "down" so the session gets created.
         if "has-session" in cmd:
+            proc = _Proc()
+            proc.returncode = 1
+            proc.wait = lambda: 1
+            return proc
+        # A session psmux refuses to create ("failed to create session 'X'").
+        if "new-session" in cmd and cmd[2] in (create_failures or set()):
             proc = _Proc()
             proc.returncode = 1
             proc.wait = lambda: 1
@@ -542,6 +552,113 @@ class TestWindowsSendKeysVerification:
         sends = _sends_for(calls, "api")
         assert all(c == sends[0] for c in sends[1:])
         assert sends[0][-2:] == ["cmd /c claude", "Enter"]
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="WindowsPlatform binds windll at import"
+)
+class TestWindowsBringUpContainsCreationFailures:
+    """One window psmux refuses must not cost the wave its remaining ones.
+
+    Live repro: ``psmux: failed to create session 'EmailSESFix'`` (rc 1) raised
+    ``CalledProcessError`` out of ``launch_psmux_session``, so `magent up` and
+    the interactive menu's `u` ended in a traceback with every later batch
+    abandoned -- the user's "error towards the end".
+    """
+
+    def test_a_refused_session_does_not_raise(self, monkeypatch):
+        # No pytest.raises: the contract is that nothing escapes at all.
+        _drive_bring_up(monkeypatch, windows=["api"], create_failures={"api"})
+
+    def test_the_other_sessions_in_the_batch_still_get_their_agent(self, monkeypatch):
+        calls, _ = _drive_bring_up(
+            monkeypatch, windows=["api", "web"], create_failures={"api"}
+        )
+        assert len(_sends_for(calls, "web")) == 1
+        # ...and the refused one is never sent keys or decorated: there is no
+        # session behind it to receive them.
+        assert _sends_for(calls, "api") == []
+        assert ["psmux", "-L", "api", "bind", "-n", "F1", "detach-client"] not in calls
+        assert ["psmux", "-L", "web", "bind", "-n", "F1", "detach-client"] in calls
+
+    def test_a_later_batch_still_runs(self, monkeypatch):
+        from magent.platform.windows import _BRING_UP_BATCH
+
+        names = [f"p{i}" for i in range(_BRING_UP_BATCH + 2)]
+        calls, _ = _drive_bring_up(
+            monkeypatch, windows=names, create_failures={names[0]}
+        )
+        # The failure is in batch 1; the last name lives in batch 2 and must
+        # still have been created and sent its command.
+        assert len(_sends_for(calls, names[-1])) == 1
+
+    def test_a_whole_failed_batch_is_skipped_not_fatal(self, monkeypatch):
+        calls, _ = _drive_bring_up(
+            monkeypatch, windows=["api", "web"], create_failures={"api", "web"}
+        )
+        assert [c for c in calls if "send-keys" in c] == []
+
+    def test_the_refusal_is_logged_with_the_session_name(self, monkeypatch, caplog):
+        import logging
+
+        with caplog.at_level(logging.ERROR, logger="magent.platform"):
+            _drive_bring_up(monkeypatch, windows=["api"], create_failures={"api"})
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any("api" in r.getMessage() for r in errors)
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="WindowsPlatform binds windll at import"
+)
+class TestWindowsBringUpPsmuxInvocation:
+    """The launch path's psmux children: truthful probes, and an environment
+    with the multiplexer's nesting markers stripped."""
+
+    def test_the_dedupe_probe_targets_the_session(self, monkeypatch):
+        calls, _ = _drive_bring_up(monkeypatch, windows=["api"])
+        probes = [c for c in calls if "has-session" in c]
+        # A bare has-session exits 0 for a socket with no server, so this
+        # dedupe would skip creating every session on a cold machine.
+        assert probes == [["psmux", "-L", "api", "has-session", "-t", "api"]]
+
+    def _spawns(self, monkeypatch):
+        """Every (argv, env) the launch path spawns, under an environment that
+        claims we are inside a psmux pane."""
+        calls: list[list[str]] = []
+        envs: list[object] = []
+        monkeypatch.setenv("PSMUX_SESSION", "api")
+        monkeypatch.setenv("TMUX", "/tmp/psmux-1/default,1,0")
+        # A relocated socket dir rides along: configuration, not a marker.
+        monkeypatch.setenv("TMUX_TMPDIR", "/tmp/private-sockets")
+        calls, _ = _drive_bring_up(
+            monkeypatch,
+            windows=["api"],
+            pane_states={"api": ["pwsh", "claude"]},  # forces a re-send too
+            envs=envs,
+        )
+        assert len(calls) == len(envs)
+        return list(zip(calls, envs, strict=True))
+
+    def test_only_new_session_gets_the_cleaned_environment(self, monkeypatch):
+        from tests.unit.test_psmux import _markers_in
+
+        spawns = self._spawns(monkeypatch)
+        creates = [(c, e) for c, e in spawns if "new-session" in c]
+        assert creates, "no session was created"
+        for _cmd, env in creates:
+            # The guard fires here and only here, so this is where the markers
+            # must not survive -- and where the socket dir still must.
+            assert _markers_in(env) == []
+            assert env["TMUX_TMPDIR"] == "/tmp/private-sockets"
+
+    def test_control_commands_inherit_the_environment(self, monkeypatch):
+        # send-keys / has-session / kill-server / the decoration `set`s are
+        # measurably indifferent to the markers (see the psmux-side pin), so
+        # they spawn exactly as they did before this change: env=None.
+        spawns = self._spawns(monkeypatch)
+        others = [(c, e) for c, e in spawns if "new-session" not in c]
+        assert others, "the bring-up ran no control commands"
+        assert {e for _c, e in others} == {None}
 
 
 # --- find_window mode contract (LS-B-005) -----------------------------------

@@ -893,7 +893,7 @@ class TestUpDecorates:
         )
         monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
         monkeypatch.setattr(
-            "magent.launch.bring_up_psmux", lambda *a, **k: list(created)
+            "magent.launch.bring_up_psmux", lambda *a, **k: (list(created), [])
         )
         monkeypatch.setattr("magent.launch.decorate_psmux_sessions", seen.append)
         return seen
@@ -916,6 +916,84 @@ class TestUpDecorates:
         result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
         assert result.exit_code == 0
         assert seen == [["api"]]
+
+
+class TestUpReportsCasualties:
+    """`up` reports what actually came up.
+
+    `bring_up` used to discard the creation verify's answer and return every
+    name it had attempted, so a wave whose sessions psmux never created still
+    printed "Brought up N session(s)" -- while the very same run logged
+    "session never came up after respawn; left down: ...".
+    """
+
+    def _config(self, tmp_path):
+        p = tmp_path / "magent.config.json"
+        p.write_text(
+            json.dumps(
+                {
+                    "version": SCHEMA_VERSION,
+                    "projects": [{"path": "/a/api", "tool": "claude"}],
+                    "settings": {"uploadServer": False},
+                }
+            )
+        )
+        return str(p)
+
+    def _patch(self, monkeypatch, *, created, failed):
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: ([], [{"name": "api", "session": "api"}], [{}]),
+        )
+        monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
+        monkeypatch.setattr("magent.launch.decorate_psmux_sessions", lambda *a, **k: [])
+        monkeypatch.setattr(
+            "magent.launch.bring_up_psmux",
+            lambda cfg, only=None, group=None: (list(created), list(failed)),
+        )
+
+    def test_failed_sessions_are_named(self, runner, tmp_path, monkeypatch):
+        self._patch(monkeypatch, created=["web"], failed=["api"])
+        result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
+        assert result.exit_code == 0
+        assert "Brought up 1" in result.output
+        assert "1 session(s) failed to come up" in result.output
+        assert "api" in result.output
+
+    def test_a_clean_wave_says_nothing_about_failures(
+        self, runner, tmp_path, monkeypatch
+    ):
+        self._patch(monkeypatch, created=["api"], failed=[])
+        result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
+        assert result.exit_code == 0
+        assert "failed to come up" not in result.output
+
+    def test_json_is_a_pure_read_and_never_brings_anything_up(
+        self, runner, tmp_path, monkeypatch
+    ):
+        # Why `up --json` carries no "failed" key: it never creates a session,
+        # so there is no casualty set for it to report. `attach` polls this
+        # command repeatedly; a bring-up here would type into panes on a poll.
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: ([], [{"name": "api", "session": "api"}], []),
+        )
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions_async", lambda *a, **k: []
+        )
+        brought_up: list[object] = []
+        monkeypatch.setattr(
+            "magent.launch.bring_up_psmux",
+            lambda *a, **k: (brought_up.append(a), ([], []))[1],
+        )
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_path), "up", "--json"]
+        )
+        assert result.exit_code == 0
+        assert brought_up == []
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is True
+        assert payload["down"] == [{"name": "api", "session": "api"}]
 
 
 class TestUpJsonVersion:
