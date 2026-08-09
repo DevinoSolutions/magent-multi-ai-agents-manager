@@ -215,6 +215,16 @@ None of these imports any other `magent` module (`style.py` imports
   by design — every call site imports it lazily, behind a `supports_hotkey()`
   gate, with a `# ImportError off-Windows (hotkey.py guards); must stay lazy`
   comment at the import. Imports only `log` and `titles` from `magent`.
+- **`attach_client.py`** — the reconnecting ssh supervisor that runs inside
+  every `magent attach` pane, shipped as its own `magent-attach-client`
+  console script (see Key Decisions). Imports `magent.style` only; `argparse`
+  is imported in-body because `cli/attach.py` imports this module at the top
+  level (for `SSH_KEEPALIVE_OPTS` / `remote_attach_command` / the client exe
+  name) and the registration hub would otherwise put argparse on `magent
+  --help`'s critical path. It owns the two strings `cli/attach.py`'s corpse
+  detection is coupled to — the ssh keepalive options and the remote attach
+  command — so the marker `_attach_markers` scans for and the command a pane
+  actually runs cannot drift apart.
 
 ### `cli/` command modules
 
@@ -493,9 +503,67 @@ retroactively turn an unrelated commit red at pre-push. The same reasoning
 keeps the job out of the branch ruleset's required checks initially; promote
 it once its flake rate is known.
 
+**Attach panes are supervised, and the supervisor is a console script, not a
+subcommand (added 2026-08-09).** An attach pane used to be `wt -- ssh -t
+<target> "psmux -L <sid> attach || magent sessions <sid>"`. The first
+disconnect killed it dead: OpenSSH exits 255, Windows Terminal keeps the pane,
+and the user was left closing forty `[process exited with code 255]` terminals
+by hand before re-running `magent attach`. `attach_client.py` now runs between
+wt and ssh and redials on transport failure. Three decisions inside that are
+easy to "clean up" wrongly:
+
+*Why a separate entry point.* `magent-attach-client` exists for exactly the
+reason `magent-state-hook` does: a 40-window attach starts 40 of these, and
+booting the click CLI in each (the registration hub imports every command
+module, then a config load) is the cost that once made a big attach take
+minutes. That is also why the remote command is still a direct `psmux attach`
+with the session picker only as a fallback.
+
+*Why the exit code decides, and why 255 is special.* OpenSSH reserves 255 for
+its own failures, so anything else came from the remote command over a
+connection that demonstrably worked. Retrying THAT would re-run a command that
+just failed for a reason a retry cannot change — a hot loop against a healthy
+sshd — so the supervisor stops and names the likely cause instead. Exit 0 is a
+deliberate detach and is never second-guessed. Only 255 loops, forever, on a
+2s-doubling ladder capped at 30s (an all-night outage is then two handshakes a
+minute), with the ladder reset after any connection that lasted 30s so a
+long-lived pane heals a blip in two seconds rather than at the cap.
+
+*Why the supervisor must carry the attach marker.* `cli/attach.py` decides a
+pane is a corpse by scanning live process command lines for `-L <sid> attach`.
+During a backoff sleep there is NO ssh process — so if the supervisor's own
+command line did not carry that marker, `_sweep_dead_windows` would close the
+window precisely while it was healing itself. `_spawn_windows` therefore passes
+the remote command as the supervisor's `--remote` argument (rather than letting
+it rebuild the command from `--session`), which puts the marker in the argv for
+free, and `_CLIENT_PROCESS_NAMES` gained `magent-attach-client.exe`. Widening
+that list can only ever make FEWER windows look dead, so the risky direction of
+the corpse decision was not widened. The corpse machinery is NOT redundant
+afterwards: it now answers "is anything driving this pane at all", which is
+still "no" for a supervisor that failed to spawn, one the user Ctrl+C'd, one
+that stopped on a failing remote command, and every pane from `--no-reconnect`
+or an older magent.
+
+*Not applied to `--no-mux`.* Without a multiplexer the agent is a child of the
+ssh session, so a drop kills it; reconnecting would start a SECOND agent on a
+conversation the user believes is still running. Reconnect is a psmux feature
+because psmux is what makes the far side outlive the connection.
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.
+
+**Attach-pane reconnect is only reachable from a Windows client (2026-08-09):**
+`attach_client.py` itself is OS-agnostic (stdlib + click; `subprocess.call`
+inherits the console on POSIX exactly as it does on Windows) and its unit tier
+runs everywhere, but the only code that spawns it is `cli/attach.py::
+_spawn_windows`, which opens `wt` windows. There is no macOS/Linux client
+window-spawn path for remote attach to wire it into — a pre-existing gap this
+change neither widens nor closes. A future POSIX attach client should call
+`_pane_command` as-is. Related and narrower: the corpse scan recognizes the
+supervisor by its Windows executable name (`magent-attach-client.exe`), which
+is fine because `process_cmdlines` is Windows-only today; a POSIX process scan
+would need the extensionless name added.
 
 **Title badges are ambient state, not guaranteed state (2026-07-07):** the
 attention daemon's `BadgeRenderer` rewrites window titles via

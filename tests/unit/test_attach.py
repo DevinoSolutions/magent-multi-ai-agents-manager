@@ -1,7 +1,10 @@
 import json
+import subprocess
 import sys
 import types
 from typing import ClassVar
+
+import pytest
 
 from magent import cli
 from magent.config import SCHEMA_VERSION, MagentConfig, ProjectConfig, Settings
@@ -11,6 +14,35 @@ from tests.conftest import FakePlatform
 
 def _cfg(projects, **settings):
     return MagentConfig(projects=projects, base_dir=None, settings=Settings(**settings))
+
+
+# Every process name the corpse scan asks the OS about. Stated once here and
+# pinned against the product constant by TestClientProcessNames, so the five
+# call sites that assert "exactly one scan, of exactly these" don't each carry
+# a literal that has to be edited when a new client kind is added.
+_SCANNED_NAMES = ["ssh.exe", "psmux.exe", "magent-attach-client.exe"]
+
+# A stand-in for the resolved magent-attach-client binary. Tests monkeypatch
+# _attach_client_exe with this rather than letting shutil.which decide: the
+# console script IS installed in the venv the suite runs from, so a test that
+# trusted PATH would silently exercise a different pane command depending on
+# how the developer invoked pytest.
+_FAKE_SUPERVISOR = r"C:\venv\Scripts\magent-attach-client.EXE"
+
+
+@pytest.fixture(autouse=True)
+def _supervisor_on_path(monkeypatch):
+    """Pin PATH resolution of the reconnect supervisor for the whole module.
+
+    Without this the answer depends on how the suite was invoked (the console
+    script exists inside the project venv, so `uv run pytest` resolves it and a
+    bare `pytest` from another interpreter may not) -- and the resolution
+    decides which command every attach pane is spawned with. Tests about the
+    NOT-on-PATH fallback override this locally.
+    """
+    from magent.cli import attach as attach_mod
+
+    monkeypatch.setattr(attach_mod, "_attach_client_exe", lambda: _FAKE_SUPERVISOR)
 
 
 class _FakeProc:
@@ -1282,8 +1314,8 @@ class TestRepairCorpses:
         )
         assert freed == {"api"}
         assert fp.closed == [7]
-        # Only ssh/psmux clients are worth scanning for.
-        assert fp.scanned == [["ssh.exe", "psmux.exe"]]
+        # Only processes that can BE an attach client are worth scanning for.
+        assert fp.scanned == [_SCANNED_NAMES]
 
     def test_live_window_is_left_alone(self, monkeypatch):
         fp, freed = self._repair(
@@ -1553,7 +1585,7 @@ class TestStaleCorpseSweep:
         # Two, and only two: the sweep's single scan (both halves partitioned
         # off ONE result) plus the pre-existing post-tiling verification pass.
         # Widening the sweep to every magent: window bought no extra scan.
-        assert fp.scanned == [["ssh.exe", "psmux.exe"]] * 2
+        assert fp.scanned == [_SCANNED_NAMES] * 2
 
     def test_capability_less_platform_sweeps_nothing(self, monkeypatch, capsys):
         # macOS/Linux clients take the ABC defaults: no scan, no close, no
@@ -1596,7 +1628,7 @@ class TestSweepDeadWindows:
         assert open_already == {"web"}
         assert fp.closed == [1, 3]
         # Both halves come off ONE process scan.
-        assert fp.scanned == [["ssh.exe", "psmux.exe"]]
+        assert fp.scanned == [_SCANNED_NAMES]
 
     def test_a_failed_scan_closes_nothing_and_keeps_every_up_window(self, monkeypatch):
         fp, open_already = self._sweep(
@@ -1716,11 +1748,18 @@ class TestSpawnRetryAfterHandshakeFailure:
         # The corpse pane is closed, and only that session is opened again.
         assert len(spawns) == 3
         assert spawns[-1][-1] == "psmux -L api attach || magent sessions api"
-        # The retry batch goes through the same _spawn_windows, so it inherits
-        # the keepalives too -- a respawned window must not be able to zombie.
-        keepalives = list(attach_mod._SSH_KEEPALIVE_OPTS)
+        # The retry batch goes through the same _spawn_windows, so a respawned
+        # window is supervised (and therefore reconnecting) exactly like the
+        # first batch -- it must not silently regress to a bare ssh that can
+        # only die once.
         for argv in spawns:
-            assert argv[argv.index("ssh") + 1 : argv.index("-t")] == keepalives
+            assert argv[argv.index("--") + 1] == _FAKE_SUPERVISOR
+            assert (
+                attach_mod._corpses(
+                    {argv[argv.index("--session") + 1]}, [subprocess.list2cmdline(argv)]
+                )
+                == set()
+            )
         assert fp.closed == [1]  # handle of the first `magent:api` window
         # First pass keeps the fast stagger; the retry slows down deliberately,
         # then a short bounded settle precedes the single re-check.
@@ -1763,7 +1802,7 @@ class TestSpawnRetryAfterHandshakeFailure:
             **self._CAPABLE,
         )
         assert len(spawns) == 2  # nothing respawned
-        assert scans == [["ssh.exe", "psmux.exe"]]  # exactly one scan
+        assert scans == [_SCANNED_NAMES]  # exactly one scan
         assert fp.closed == []
         assert tiled == [["magent:api", "magent:web"]]
         assert "died during SSH handshake" not in out
@@ -1848,7 +1887,7 @@ class TestDeadWindowAnnotation:
         assert "closed and reopened" in lines[0]
         assert "from a previous session (session down)" in lines[1]
         # One process scan feeds both halves; the partition is on the RESULT.
-        assert fp.scanned == [["ssh.exe", "psmux.exe"]]
+        assert fp.scanned == [_SCANNED_NAMES]
         assert fp.closed == []
 
     def test_a_live_window_outside_the_up_list_is_not_annotated(
@@ -1941,10 +1980,10 @@ class TestDeadWindowAnnotation:
 
 
 class TestSpawnWindows:
-    """The extracted per-sid spawn helper: same wt/ssh line both passes use,
-    same already-open dedupe, and the stagger is the caller's to choose."""
+    """The extracted per-sid spawn helper: same wt line both passes use, same
+    already-open dedupe, and the stagger is the caller's to choose."""
 
-    def _spawn(self, monkeypatch, sids, open_already, stagger):
+    def _spawn(self, monkeypatch, sids, open_already, stagger, **kwargs):
         from magent.cli import attach as attach_mod
 
         spawns: list[list[str]] = []
@@ -1954,7 +1993,7 @@ class TestSpawnWindows:
         )
         monkeypatch.setattr(attach_mod.time, "sleep", sleeps.append)
         titles = attach_mod._spawn_windows(
-            "user@host", sids, set(open_already), stagger
+            "user@host", sids, set(open_already), stagger, **kwargs
         )
         return spawns, sleeps, titles
 
@@ -1972,13 +2011,42 @@ class TestSpawnWindows:
         assert len(spawns) == 1
         assert sleeps == [0.25]
 
-    def test_ssh_carries_keepalives_before_the_tty_flag(self, monkeypatch):
+    def test_pane_runs_the_reconnect_supervisor_by_default(self, monkeypatch):
+        # The headline change: a pane is no longer a bare ssh that dies with
+        # its connection. wt drives the supervisor, the supervisor drives ssh.
+        spawns, _sleeps, _titles = self._spawn(monkeypatch, ["api"], [], 0.0)
+        argv = spawns[0]
+        assert argv[argv.index("--") + 1] == _FAKE_SUPERVISOR
+        assert "ssh" not in argv
+        assert argv[-4:] == [
+            "--session",
+            "api",
+            "--remote",
+            "psmux -L api attach || magent sessions api",
+        ]
+        assert argv[argv.index("--target") + 1] == "user@host"
+
+    def test_supervisor_argv_carries_the_attach_marker(self, monkeypatch):
+        # COHERENCE PIN. During a backoff sleep the supervisor is the only
+        # process left, so if its command line stopped carrying the session's
+        # attach marker, _dead_sids would call a reconnecting pane a corpse and
+        # _sweep_dead_windows would close the window that was healing itself.
+        from magent.cli import attach as attach_mod
+
+        spawns, _sleeps, _titles = self._spawn(monkeypatch, ["api"], [], 0.0)
+        # Exactly the shape a Windows process table reports for this spawn.
+        cmdline = subprocess.list2cmdline(spawns[0])
+        assert attach_mod._corpses({"api"}, [cmdline]) == set()
+
+    def test_no_reconnect_spawns_the_historical_bare_ssh_pane(self, monkeypatch):
         # Without keepalives, a post-sleep ssh whose TCP connection died hangs
         # forever and is indistinguishable from a live client to _dead_sids --
         # the pane is frozen while the overview reports it ready. They must
         # also land as ssh OPTIONS (before -t, i.e. before the target and the
         # remote command), or ssh would read them as part of the command line.
-        spawns, _sleeps, _titles = self._spawn(monkeypatch, ["api"], [], 0.0)
+        spawns, _sleeps, _titles = self._spawn(
+            monkeypatch, ["api"], [], 0.0, reconnect=False
+        )
         argv = spawns[0]
         i_ssh, i_t = argv.index("ssh"), argv.index("-t")
         assert argv[i_ssh + 1 : i_t] == [
@@ -1986,10 +2054,57 @@ class TestSpawnWindows:
             "ServerAliveInterval=15",
             "-o",
             "ServerAliveCountMax=4",
+            "-o",
+            "ConnectTimeout=20",
         ]
         assert i_t < argv.index("user@host")
         # ...and the attach marker _dead_sids scans for is untouched.
         assert argv[-1] == "psmux -L api attach || magent sessions api"
+
+    def test_supervisor_off_path_degrades_to_bare_ssh_and_says_so(
+        self, monkeypatch, capsys
+    ):
+        # A stale editable install, or a PATH exposing `magent` without its
+        # siblings. Forty windows that fail to start would be far worse than
+        # forty windows with the old behavior plus one honest warning.
+        from magent.cli import attach as attach_mod
+
+        monkeypatch.setattr(attach_mod, "_attach_client_exe", lambda: None)
+        spawns, _sleeps, _titles = self._spawn(monkeypatch, ["api", "web"], [], 0.0)
+        out = capsys.readouterr().out
+        assert "magent-attach-client" in out
+        assert "will not auto-reconnect" in out
+        # Warned once for the batch, not once per window.
+        assert out.count("not on PATH") == 1
+        for argv in spawns:
+            assert argv[argv.index("--") + 1] == "ssh"
+
+    def test_no_reconnect_never_warns_about_a_binary_it_does_not_want(
+        self, monkeypatch, capsys
+    ):
+        from magent.cli import attach as attach_mod
+
+        monkeypatch.setattr(attach_mod, "_attach_client_exe", lambda: None)
+        self._spawn(monkeypatch, ["api"], [], 0.0, reconnect=False)
+        assert "not on PATH" not in capsys.readouterr().out
+
+
+class TestClientProcessNames:
+    """The scan's name list, pinned once so the five 'exactly one scan of
+    exactly these' assertions elsewhere can reference it."""
+
+    def test_the_scan_covers_every_kind_of_attach_client(self):
+        from magent.cli import attach as attach_mod
+
+        assert attach_mod._CLIENT_PROCESS_NAMES == _SCANNED_NAMES
+
+    def test_every_name_survives_the_platform_scan_filter(self):
+        # platform/windows.py::process_cmdlines drops any name that is not
+        # alnum-after-stripping-dots-and-dashes, to keep the CIM filter free of
+        # an injection seam. A name that silently fails that check would remove
+        # a whole client kind from the scan without a single test going red.
+        for name in _SCANNED_NAMES:
+            assert name.replace(".", "").replace("-", "").isalnum(), name
 
 
 class TestDeadSids:

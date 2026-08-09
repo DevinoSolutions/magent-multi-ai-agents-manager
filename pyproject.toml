@@ -73,6 +73,11 @@ magent = "magent.cli:main"
 # own entry point (not a magent subcommand) so it skips the CLI registration
 # hub's import cost on every agent turn. Wired by `magent hooks install`.
 magent-state-hook = "magent.state_hook:main"
+# The reconnecting ssh supervisor each `magent attach` pane runs. Its own entry
+# point for the same startup-cost reason (a 40-window attach starts 40 of
+# them), and the process name cli/attach.py scans for when deciding whether a
+# pane is alive -- see attach_client.py's corpse-coherence note.
+magent-attach-client = "magent.attach_client:main"
 
 [project.urls]
 Homepage = "https://magent.io"
