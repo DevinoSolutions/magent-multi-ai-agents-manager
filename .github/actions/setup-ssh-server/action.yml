@@ -16,6 +16,10 @@ runs:
       shell: bash
       run: |
         sudo apt-get install -yq openssh-server
+        # The self-hosted ARC container image has no ~/.ssh (hosted runners ship
+        # one), and ssh-keygen will not create the parent dir -- mkdir first, the
+        # way the macOS branch already does.
+        mkdir -p ~/.ssh && chmod 700 ~/.ssh
         ssh-keygen -t ed25519 -f ~/.ssh/id_test -N ""
         cat ~/.ssh/id_test.pub >> ~/.ssh/authorized_keys
         chmod 600 ~/.ssh/authorized_keys
@@ -47,19 +51,34 @@ runs:
           UserKnownHostsFile ~/.ssh/known_hosts_mdtest
         EOF
         chmod 600 ~/.ssh/config
-        # ubuntu-24.04 runners socket-activate ssh: systemd itself listens on
-        # 22 and sshd_config's Port is ignored, so 2222 was never bound
-        # (observed live: "connect to host localhost port 2222: Connection
-        # refused"). Disable the socket so sshd binds Port 2222 itself, then
-        # prove something is actually listening before smoking.
-        sudo systemctl disable --now ssh.socket 2>/dev/null || true
-        sudo systemctl daemon-reload
-        sudo systemctl restart ssh || sudo service ssh restart
+        # Two start paths, because Linux CI runs on two very different hosts:
+        #
+        # systemd host (hosted ubuntu-24.04): the distro socket-activates ssh --
+        # systemd itself listens on 22 and sshd_config's Port is ignored, so 2222
+        # was never bound (observed live: "connect to host localhost port 2222:
+        # Connection refused"). Disable the socket so sshd binds Port 2222 itself.
+        #
+        # Container host (self-hosted ubuntu-devino, an ARC runner pod): there is
+        # no systemd and no PID-1 init at all -- apt even logs "invoke-rc.d:
+        # could not determine current runlevel". Exec sshd directly; it
+        # daemonizes on its own and honours the same sshd_config.
+        sudo mkdir -p /run/sshd
+        if sudo systemctl daemon-reload 2>/dev/null; then
+          sudo systemctl disable --now ssh.socket 2>/dev/null || true
+          sudo systemctl restart ssh || sudo service ssh restart
+        else
+          echo "No usable systemd (container runner) -- starting sshd directly"
+          sudo /usr/sbin/sshd
+        fi
+        # Listen probe via bash's /dev/tcp rather than `ss`: iproute2 is not
+        # installed on the container image, and a missing `ss` must not read as
+        # "sshd is down".
+        listening() { (exec 3<>/dev/tcp/127.0.0.1/2222) 2>/dev/null; }
         for _ in $(seq 1 20); do
-          ss -tln | grep -q ':2222 ' && break
+          listening && break
           sleep 0.5
         done
-        ss -tln | grep -q ':2222 ' || { echo "sshd is not listening on 2222"; sudo systemctl status ssh --no-pager || true; exit 1; }
+        listening || { echo "sshd is not listening on 2222"; sudo systemctl status ssh --no-pager 2>/dev/null || true; exit 1; }
         echo "MDTEST_SSH_PORT=2222" >> "$GITHUB_ENV"
         echo "MDTEST_SSH_KEY=$HOME/.ssh/id_test" >> "$GITHUB_ENV"
         echo "MDTEST_SSH_HOST=mdssh" >> "$GITHUB_ENV"
