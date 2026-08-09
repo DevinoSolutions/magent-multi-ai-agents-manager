@@ -157,6 +157,18 @@ def verdict(rc: int) -> str:
     ``-signum`` from ``subprocess`` on POSIX. Landing those in "stop" is the
     safe direction: something deliberately killed the client, and a supervisor
     that answered a kill by dialling again would be unstoppable.
+
+    ONE PLATFORM CAVEAT, measured (see the real-ssh tier's
+    ``test_a_failing_remote_command_stops_instead_of_hammering_sshd``):
+    **Windows OpenSSH does not propagate a remote command's exit status over a
+    pty session.** ``ssh -t win-host "exit 7"`` reports 0 where POSIX sshd
+    reports 7. Since a magent host is usually Windows (psmux is Windows-native)
+    the third branch is effectively unreachable there: a pane whose session is
+    gone reads as a clean detach, and says "detached" instead of naming the
+    cause. Both verdicts STOP, so the behavior is right either way and only the
+    message is less specific -- and reconnect is untouched, because 255 for a
+    dead transport is produced by the local ssh CLIENT, not reported by the
+    server.
     """
     if rc == 0:
         return DETACHED

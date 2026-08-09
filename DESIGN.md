@@ -529,6 +529,19 @@ deliberate detach and is never second-guessed. Only 255 loops, forever, on a
 minute), with the ladder reset after any connection that lasted 30s so a
 long-lived pane heals a blip in two seconds rather than at the cap.
 
+*Measured caveat: Windows OpenSSH does not propagate a remote command's exit
+status over a pty.* `ssh -t win-host "exit 7"` reports 0 where POSIX sshd
+reports 7 (pinned by `test_a_failing_remote_command_stops_instead_of_hammering_sshd`,
+which asserts the win32 shape explicitly so a future OpenSSH fix goes red
+rather than silent). A magent host is usually Windows — psmux is Windows-native
+— so the "remote command failed" branch is effectively unreachable there and
+collapses into "detached". Both verdicts stop, so the behavior is right either
+way and only the message is less specific. Reconnect is untouched, because a
+transport 255 is produced by the local ssh CLIENT, not reported by the server.
+This is also why the real-ssh redial test dials an unroutable address instead
+of asking a remote command to exit 255: that stand-in silently became a no-op
+on Windows and reported a green reconnect that never happened.
+
 *Why the supervisor must carry the attach marker.* `cli/attach.py` decides a
 pane is a corpse by scanning live process command lines for `-L <sid> attach`.
 During a backoff sleep there is NO ssh process — so if the supervisor's own
