@@ -159,7 +159,9 @@ Each magent session brands its psmux status bar — `magent` on the left, its wi
 
 Nothing is lost while it waits: the psmux session lives on the **host**, so the reattached pane comes back to the same running agent and the same scrollback. You do not have to close a wall of dead terminals and re-run `magent attach` any more.
 
-Three cases deliberately do **not** reconnect: you detached on purpose (`F1`, or `psmux detach`) — the pane says so and exits; the host answered but the session is gone (rebooted, killed) — the pane tells you to run `magent attach` to bring it back, rather than hammering a healthy SSH server; and `Ctrl+C`, which stops the supervisor immediately. `magent attach --no-reconnect` restores the old one-shot behavior. `--no-mux` panes are never supervised — without a multiplexer the agent dies with the connection, so there is nothing to reattach to.
+Three cases deliberately do **not** reconnect: you detached on purpose (`F1`, or `psmux detach`) — the pane says so and exits; the host answered but the session is gone (rebooted, killed) — the pane stops and tells you to run `magent attach` to bring it back, rather than hammering a healthy SSH server; and `Ctrl+C`, which stops the supervisor immediately. `magent attach --no-reconnect` restores the old one-shot behavior. `--no-mux` panes are never supervised — without a multiplexer the agent dies with the connection, so there is nothing to reattach to.
+
+(Small honesty note: Windows OpenSSH doesn't report a remote command's exit status back over an interactive session, so when the **host** is Windows that second case reads as a plain `detached from <session>` rather than the more specific message. It still stops either way, and reconnect is unaffected — a dropped connection is detected by your own SSH client, not reported by the host.)
 
 ### Mobile image upload (over Tailscale)
 
