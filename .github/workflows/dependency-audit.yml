@@ -37,7 +37,14 @@ jobs:
       - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v5.4.2
         with:
           enable-cache: true
+      # pip-audit builds a throwaway venv, which needs `ensurepip`. The
+      # self-hosted `ubuntu-devino` container's system python3.12 is the Debian
+      # split-package build with no `python3.12-venv`, so uvx picking it up
+      # fails with "ensurepip is not available". Run the tool under a
+      # uv-managed CPython instead (standalone builds bundle ensurepip) —
+      # hermetic, and it does not depend on the runner image's apt state.
+      - run: uv python install 3.13
       # Export the full locked closure (all extras, no local project) and
       # audit exactly those pins — --no-deps skips pip resolution entirely.
       - run: uv export --all-extras --no-hashes --no-emit-project -o requirements-audit.txt
-      - run: uvx pip-audit==2.10.1 -r requirements-audit.txt --no-deps
+      - run: uvx --python 3.13 pip-audit==2.10.1 -r requirements-audit.txt --no-deps
