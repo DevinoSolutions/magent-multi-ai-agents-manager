@@ -31,7 +31,7 @@ concurrency:
 jobs:
   build:
     name: "Build (sdist + wheel)"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-devino
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -59,7 +59,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-devino, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
@@ -92,9 +92,9 @@ jobs:
           "$BIN/magent$EXE" --help
 
   sdist-smoke:
-    name: "Sdist smoke (ubuntu-latest)"
+    name: "Sdist smoke (ubuntu-devino)"
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-devino
     timeout-minutes: 10
     steps:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
@@ -128,7 +128,7 @@ jobs:
     # excluded here, so a dispatch can never publish — regardless of the
     # dry_run input. `!inputs.dry_run` is a defensive second gate.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !inputs.dry_run
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-devino
     timeout-minutes: 10
     environment:
       # Add required reviewers to this environment in GitHub settings to hold
@@ -152,7 +152,7 @@ jobs:
     name: "GitHub Release"
     needs: [build, publish]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !inputs.dry_run
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-devino
     timeout-minutes: 10
     permissions:
       contents: write  # create the GitHub Release and attach the built artifacts
