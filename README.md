@@ -148,6 +148,21 @@ Each magent session brands its psmux status bar — `magent` on the left, its wi
 
 `F2` needs `code` on your PATH; `magent up` refreshes the branding and hints on sessions that were already running. magent sets both halves per session, so they win over a personal `~/.tmux.conf`.
 
+#### Attach windows reconnect themselves
+
+`magent attach <host>` opens one window per remote session, and each one runs a small supervisor (`magent-attach-client`) instead of a bare `ssh`. When the connection dies — laptop sleep, wi-fi change, VPN flap, host reboot — the pane no longer freezes on `client_loop: send disconnect` and then sits there dead as `[process exited with code 255]`. It prints one line, waits (2s, doubling to a 30s ceiling) and dials again, forever, until the host answers:
+
+```text
+  ~ connection to me@desk lost (ssh exit 255) -- reconnecting in 4s (attempt 2; Ctrl+C to stop)
+  o reconnecting to me@desk...
+```
+
+Nothing is lost while it waits: the psmux session lives on the **host**, so the reattached pane comes back to the same running agent and the same scrollback. You do not have to close a wall of dead terminals and re-run `magent attach` any more.
+
+Three cases deliberately do **not** reconnect: you detached on purpose (`F1`, or `psmux detach`) — the pane says so and exits; the host answered but the session is gone (rebooted, killed) — the pane stops and tells you to run `magent attach` to bring it back, rather than hammering a healthy SSH server; and `Ctrl+C`, which stops the supervisor immediately. `magent attach --no-reconnect` restores the old one-shot behavior. `--no-mux` panes are never supervised — without a multiplexer the agent dies with the connection, so there is nothing to reattach to.
+
+(Small honesty note: Windows OpenSSH doesn't report a remote command's exit status back over an interactive session, so when the **host** is Windows that second case reads as a plain `detached from <session>` rather than the more specific message. It still stops either way, and reconnect is unaffected — a dropped connection is detected by your own SSH client, not reported by the host.)
+
 ### Mobile image upload (over Tailscale)
 
 Send screenshots from your phone straight into a project's agent session:
@@ -197,7 +212,7 @@ Or skip the menu with flags:
 | `magent sessions` | List active psmux sessions, pick one to attach. |
 | `magent sessions <name>` | Attach directly to a psmux session by name. |
 | `magent up [--json] [-g <group>] [--revive]` | Host side: ensure a persistent psmux session per project, and re-launch the agent in any live session whose pane fell back to a bare shell (e.g. after a Ctrl-C). Reviving is automatic except under `--json`, which stays a pure read unless `--revive` is passed. |
-| `magent attach <host>` | From another PC: bring host sessions up over SSH, tile locally, Alt+V uploads, F2 opens the project in VS Code over Remote-SSH. |
+| `magent attach <host> [--no-reconnect]` | From another PC: bring host sessions up over SSH, tile locally, Alt+V uploads, F2 opens the project in VS Code over Remote-SSH. Panes reconnect themselves after a dropped connection (see below); `--no-reconnect` opts out. |
 | `magent watch` | Live table of every agent session, most-urgent first; press a row number to focus that window. |
 | `magent attention [-d] [--stop]` | Attention daemon: badges window titles with agent state, flashes the taskbar on needs-input/error, optional toast/ntfy push (`settings.attention`). Badges/flash/toast are Windows-only; ntfy push is cross-platform — see [Platform support](#platform-support). |
 | `magent status [--json]` | Session + daemon health (incl. an `agents` state list in `--json`). Exit codes: 0 healthy, 1 config error, 3 degraded. |
