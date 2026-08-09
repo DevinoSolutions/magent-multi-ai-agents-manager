@@ -5,6 +5,35 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.11.0] - 2026-08-09
+
+### Added
+
+- **Attach windows now reconnect on their own after a connection loss.**
+  Remote attach panes used to die with `client_loop: send disconnect` /
+  `[process exited with code 255]` whenever the client machine slept or the
+  network changed, leaving every terminal a corpse until the next
+  `magent attach` closed and reopened them all. Each pane now runs a small
+  supervisor (`magent-attach-client`) around the ssh client: when the
+  connection drops it prints a reconnect countdown and redials on a backoff
+  ladder (2s doubling, capped at 30s, reset after any connection that lasted
+  at least 30s) until the host answers again -- panes heal themselves even
+  when the host comes back hours later. A deliberate detach (F1 /
+  clean exit) and Ctrl+C still end the pane without redialling, and a remote
+  command that fails over a healthy connection stops with the cause named
+  instead of hammering the host's sshd. `magent attach --no-reconnect`
+  restores the previous one-shot behaviour, `--no-mux` panes are never
+  supervised (redialling would start a second agent), and the spawn falls
+  back to bare ssh with a warning if the supervisor script is not on PATH.
+  The ssh dial also gained `-o ConnectTimeout=20` so a redial against a
+  sleeping host fails fast instead of hanging for minutes.
+
+  Platform note: Windows OpenSSH does not propagate a remote command's exit
+  status over a pty, so on a Windows *host* a remote-command failure is
+  indistinguishable from a clean detach -- both stop the pane; reconnect
+  itself is unaffected because connection failures are reported by the local
+  ssh client.
+
 ## [3.10.10] - 2026-08-08
 
 ### Fixed
@@ -709,6 +738,10 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.11.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.10...v3.11.0
+[3.10.10]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.9...v3.10.10
+[3.10.9]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.8...v3.10.9
+[3.10.8]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.7...v3.10.8
 [3.10.7]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.6...v3.10.7
 [3.10.6]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.5...v3.10.6
 [3.10.5]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.4...v3.10.5
