@@ -31,18 +31,19 @@ jobs:
   pip-audit:
     name: "Dependency Audit (pip-audit)"
     timeout-minutes: 10
-    runs-on: ubuntu-devino
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v5.4.2
         with:
           enable-cache: true
-      # pip-audit builds a throwaway venv, which needs `ensurepip`. The
-      # self-hosted `ubuntu-devino` container's system python3.12 is the Debian
-      # split-package build with no `python3.12-venv`, so uvx picking it up
-      # fails with "ensurepip is not available". Run the tool under a
-      # uv-managed CPython instead (standalone builds bundle ensurepip) —
-      # hermetic, and it does not depend on the runner image's apt state.
+      # pip-audit builds a throwaway venv, which needs `ensurepip`. A distro
+      # system python can be the Debian split-package build with no
+      # `pythonX.Y-venv`, and uvx picking that interpreter up fails with
+      # "ensurepip is not available" (observed live on a container runner). Run
+      # the tool under a uv-managed CPython instead (standalone builds bundle
+      # ensurepip) — hermetic, and it does not depend on the runner image's
+      # apt state.
       - run: uv python install 3.13
       # Export the full locked closure (all extras, no local project) and
       # audit exactly those pins — --no-deps skips pip resolution entirely.

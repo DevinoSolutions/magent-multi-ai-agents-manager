@@ -652,7 +652,7 @@ end > 1.8× start AND absolute growth > 64 MiB, a leak guard not a benchmark);
 `RotatingFileHandler` keeps ≤ `backupCount+1` bounded files per logger; and the
 state store's TTL sweep never destroys the fresh records. It rides a dedicated
 nightly workflow (`.github/workflows/soak.yml`, `schedule` + `workflow_dispatch`)
-on ubuntu-devino (self-hosted) and windows-latest — non-required by design (same posture as
+on ubuntu-latest and windows-latest — non-required by design (same posture as
 monitor-lab / browser-upload). *Honest gap (small, deliberate):* the upload-accept
 path needs a valid multiplexer session, so — like the browser tier's `tmux`-as-`psmux`
 symlink — the soak drops a no-op `psmux` shim on the child PATH (exits 0 for
