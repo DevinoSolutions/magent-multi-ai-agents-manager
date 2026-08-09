@@ -8,7 +8,7 @@ name: Soak (nightly)
 # NOT a required check by design (same posture as monitor-lab / browser-upload):
 # it deliberately runs for tens of minutes, so it rides a dedicated nightly
 # schedule plus on-demand dispatch rather than every push/PR. Two legs:
-# ubuntu-devino (cheapest, the POSIX daemon path) and windows-latest (where the
+# ubuntu-latest (cheapest, the POSIX daemon path) and windows-latest (where the
 # attention badge/flash renderers and the SendInput chain actually ship).
 
 on:
@@ -37,7 +37,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-devino, windows-latest]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     env:
       MDTEST_SOAK: "1"

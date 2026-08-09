@@ -13,15 +13,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# Linux legs run on `ubuntu-devino` — the org's self-hosted ARC runner scale set
-# (ephemeral containers, Default runner group, private repos only). Windows and
-# macOS legs stay on GitHub-hosted runners: there is no self-hosted equivalent,
-# and those platform tiers are load-bearing (real wt/psmux/SendInput, Terminal.app).
 jobs:
   secret-scan:
     name: "Secret Scan (gitleaks)"
     timeout-minutes: 5
-    runs-on: ubuntu-devino
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
@@ -44,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-devino]
+        os: [windows-latest, macos-latest, ubuntu-latest]
         python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
@@ -59,7 +55,7 @@ jobs:
   lint-typecheck-coverage:
     name: "Lint + Type Check + Coverage"
     timeout-minutes: 10
-    runs-on: ubuntu-devino
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v5.4.2
@@ -75,7 +71,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-devino]
+        os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -131,7 +127,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-devino]
+        os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -165,7 +161,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-devino]
+        os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -183,7 +179,7 @@ jobs:
       - run: pytest tests/dist/ -v -m dist
 
   browser-upload:
-    name: "Browser Upload (ubuntu-devino)"
+    name: "Browser Upload (ubuntu-latest)"
     # NOT a required check by design (same posture as monitor-lab): provisions a
     # real headless Chromium via Playwright and drives the mobile upload page
     # end-to-end against a real `magent serve` on loopback. The tier skips
@@ -192,7 +188,7 @@ jobs:
     # shim so session discovery, validation, and injection all hit a live
     # multiplexer. Every other CI job stays byte-identical.
     timeout-minutes: 20
-    runs-on: ubuntu-devino
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
@@ -243,7 +239,7 @@ jobs:
           -m monitor_lab -q
 
   tailnet:
-    name: "Tailnet (ubuntu-devino)"
+    name: "Tailnet (ubuntu-latest)"
     # NOT a required check by design (same posture as monitor-lab / browser-upload):
     # joins a REAL, ephemeral, tag-scoped Tailscale node and exercises tailnet.py's
     # live `tailscale` probes plus `magent serve`'s Tailscale-facing default bind.
@@ -262,13 +258,8 @@ jobs:
     #        TS_OAUTH_CLIENT_ID  = the OAuth client id
     #        TS_OAUTH_SECRET     = the OAuth client secret
     #   Once those three are in place the job goes fully live with NO code change.
-    #
-    # RUNNER CAVEAT: tailscaled needs /dev/net/tun (or userspace-networking mode).
-    # An ARC container runner may not expose it; if this job ever goes live and
-    # the Tailscale step fails on a missing TUN device, either grant the pod
-    # NET_ADMIN + /dev/net/tun or move this one job back to ubuntu-latest.
     timeout-minutes: 15
-    runs-on: ubuntu-devino
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
