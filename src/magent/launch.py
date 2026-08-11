@@ -25,6 +25,7 @@ from magent.platform import (
 from magent.sessions import (
     AGENT_TOOLS,
     build_resume_command,
+    build_start_command,
     ide_command,
     is_ide_tool,
 )
@@ -458,12 +459,16 @@ def _dispatch_cli_agent_project(
     titles = generate_titles(proj.title, proj.path, windows_cfg)
     window_count = len(titles)
 
+    # The directory the agent command will actually run in, or None when this
+    # machine cannot honestly answer for it. A remote project's command runs on
+    # the far host, so neither the resume scan below nor the fresh-start probe
+    # may consult THIS machine's session store.
+    agent_dir = None if is_remote else _resolve_path(proj.path, base_dir)
+
     session_ids: list[str | None] = [None] * window_count
     caps = AGENT_TOOLS.get(tool)
-    if window_count > 1 and caps and caps.multi_window and not is_remote:
-        resolved_dir = _resolve_path(proj.path, base_dir)
-        if resolved_dir:
-            session_ids = _get_session_ids(tool, resolved_dir, window_count)
+    if window_count > 1 and caps and caps.multi_window and agent_dir:
+        session_ids = _get_session_ids(tool, agent_dir, window_count)
 
     base_cmd = tools.get(tool)
     if not base_cmd:
@@ -494,6 +499,8 @@ def _dispatch_cli_agent_project(
             win_tool, win_base = tool, base_cmd
 
         if win_cfg and win_cfg.command:
+            # A per-window `command` is the user's literal command line. It is
+            # never rewritten -- not even to drop a resume flag.
             cmd = win_cfg.command
         elif win_tool != tool:
             # Per-window override: the discovered session ids belong to the
@@ -501,14 +508,17 @@ def _dispatch_cli_agent_project(
             cmd = (
                 build_resume_command(win_tool, win_base, None)
                 if window_count > 1
-                else win_base
+                else build_start_command(win_tool, win_base, agent_dir)
             )
         elif window_count > 1 and session_ids[i] is not None:
             cmd = build_resume_command(win_tool, win_base, session_ids[i])
         elif window_count > 1:
             cmd = build_resume_command(win_tool, win_base, None)
         else:
-            cmd = win_base
+            # Single window: the configured command runs verbatim, so this is
+            # the one place a bare `claude --continue` reaches a project
+            # directory that may have no conversation to continue.
+            cmd = build_start_command(win_tool, win_base, agent_dir)
 
         if use_happy:
             cmd = _wrap_happy(win_tool, cmd)

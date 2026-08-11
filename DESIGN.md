@@ -562,6 +562,52 @@ ssh session, so a drop kills it; reconnecting would start a SECOND agent on a
 conversation the user believes is still running. Reconnect is a psmux feature
 because psmux is what makes the far side outlive the connection.
 
+**A resume flag with nothing to resume is dropped at COMMAND-BUILD time, never
+retried at runtime (2026-08-11).** `claude --continue` — the registry default —
+resumes the most recent conversation *for the current working directory*. In a
+directory that never hosted one (a project just added to magent, a fresh
+machine, a cleaned `~/.claude/projects`) claude prints "No conversation found to
+continue" and exits, so the pane is a dead shell, the agent never starts, and
+`revive` re-runs the same failing command forever. `sessions.build_start_command`
+is the single function every command-build site routes through: it asks the
+tool's registry entry (`AgentTool.fresh_command`) whether the configured command
+carries an *implicit* resume flag and whether that directory has any stored
+session, and drops the flag only when the answer is "yes, and no".
+
+*Why not a shell fallback.* `claude --continue || claude` was the obvious fix
+and is forbidden. It fires on ANY nonzero exit, so a mid-session crash, an auth
+failure or a CLI regression would silently relaunch a FRESH agent — discarding a
+live conversation and disguising a real defect as a working pane. It is also
+unobservable: agent commands are delivered into psmux panes with `send-keys`, so
+magent never sees the command's exit code and could not tell the two apart even
+if it wanted to. The deterministic host-side probe (does
+`~/.claude/projects/<encoded cwd>/` hold any `*.jsonl`) is the honest test, and
+it is taken where the command is built.
+
+*Only a positive "no session here" rewrites anything.* An unknown tool, a tool
+with no probe, an unresolvable directory, a command with no implicit-resume
+flag, an explicitly named session (`--resume <id>`, `-r <id>`, or the bare
+`--resume` picker), a per-window `command` override, and a probe that ERRORS all
+keep the configured command byte-for-byte. A session file that exists but is
+empty or corrupt counts as "a session exists" and keeps `--continue`: that
+failure is a real defect the user needs to SEE in the pane. Every rewrite is
+logged (`launch.log`, "no prior <tool> session in <dir>; starting fresh"), so
+the decision is auditable after the fact.
+
+*Where the probe runs matters.* The verdict is only valid on the machine that
+will RUN the command, so callers pass None for a remote project rather than
+consulting the local store: `launch.py` nulls `agent_dir` when `is_remote`, and
+`psmux.eligible_projects` (which excludes remote projects outright) is the one
+chokepoint feeding `bring_up`, `revive_sessions` and the `up --json`
+`projects[].cmd` the attach client spawns no-mux windows from — all of which the
+HOST computes over ssh, on the filesystem being probed.
+
+*codex needs no special case.* Its resume form is the explicit
+`codex resume <id>` subcommand, which magent only builds when it HAS an id, so
+the default `codex` has nothing to rewrite. `codex_fresh_command` exists for
+symmetry and handles the one hand-configured shape with the same hazard,
+`codex resume --last`.
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.

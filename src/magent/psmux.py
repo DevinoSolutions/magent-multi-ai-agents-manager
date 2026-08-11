@@ -718,9 +718,19 @@ def eligible_projects(
     A project is eligible when it is enabled, runs a CLI agent (not an IDE),
     and is local (no ``host``). When ``group`` is given, only projects tagged
     with that group (case-insensitive) are returned.
+
+    The ``cmd`` each entry carries is fresh-start aware: a project directory
+    with no stored session for its tool gets the configured command WITHOUT its
+    implicit-resume flag, because ``claude --continue`` in such a directory
+    errors out and leaves the pane at a dead shell. Every consumer of that key
+    -- ``bring_up``, ``revive_sessions``, and the ``up --json`` payload the
+    attach client spawns no-mux windows from -- inherits the decision, and all
+    of them run the command on THIS machine, the one just probed (remote
+    projects are excluded above, so the probe never answers for a foreign
+    filesystem).
     """
     from magent.launch import _expand_base_dir, _resolve_path
-    from magent.sessions import is_ide_tool
+    from magent.sessions import build_start_command, is_ide_tool
     from magent.titles import get_leaf_name
 
     base_dir = config.base_dir
@@ -748,6 +758,7 @@ def eligible_projects(
         if sid in seen:
             continue
         seen.add(sid)
+        resolved = _resolve_path(proj.path, base_dir)
         out.append(
             {
                 "name": leaf,
@@ -755,8 +766,10 @@ def eligible_projects(
                 "path": proj.path,
                 "tool": tool,
                 "group": proj.group,
-                "resolved": _resolve_path(proj.path, base_dir),
-                "cmd": config.settings.tools.get(tool, ""),
+                "resolved": resolved,
+                "cmd": build_start_command(
+                    tool, config.settings.tools.get(tool, ""), resolved
+                ),
                 "color": proj.color,
             }
         )
@@ -1020,8 +1033,12 @@ def revive_sessions(
         # registry default is ``claude --continue``, which picks the dead
         # pane's conversation back up. ``sessions.build_resume_command`` is
         # deliberately NOT used here: with no session id claude's builder
-        # *strips* ``--continue``, starting a fresh chat -- the opposite of
-        # reviving. Injection shape mirrors ``launch_psmux_session``.
+        # *strips* ``--continue`` unconditionally, starting a fresh chat -- the
+        # opposite of reviving. ``eligible_projects`` has already dropped that
+        # flag for the one case where keeping it cannot work (a directory with
+        # no stored conversation, where ``--continue`` would only re-kill the
+        # pane the revive is trying to rescue), and left it alone everywhere
+        # else. Injection shape mirrors ``launch_psmux_session``.
         resume = _field_str(p, "cmd")
         keys = f"cmd /c {resume}" if sys.platform == "win32" else resume
         if send_keys(sid, keys, "Enter", target=sid, psmux=binary):

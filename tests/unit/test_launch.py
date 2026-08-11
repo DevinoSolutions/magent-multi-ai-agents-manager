@@ -814,6 +814,130 @@ class TestWindowTitlePrefixDisabled:
         assert seen == [("proj", "exact")]
 
 
+class TestFreshStartInANewProjectDirectory:
+    """`claude --continue` resumes the CWD's most recent conversation. In a
+    project directory that never hosted one -- one just added to magent, a
+    fresh machine, a cleaned ~/.claude/projects -- there is nothing to
+    continue: claude errors out, the pane is left at a dead shell, the agent
+    never starts, and every revive re-runs the same failing command. The
+    single-window path is where the configured command reaches such a
+    directory verbatim (multi-window already routes through
+    build_resume_command, which strips the flag when it has no session id)."""
+
+    def _dispatch(self, monkeypatch, proj, cfg, *, has_session, is_remote=False):
+        monkeypatch.setattr(
+            "magent.sessions.claude.has_claude_session",
+            lambda project_dir, home_override=None: has_session,
+        )
+        fp = FakePlatform()
+        _dispatch_cli_agent_project(
+            fp,
+            cfg,
+            RunOpts(),
+            proj,
+            proj.tool or "claude",
+            is_remote,
+            None,
+            cfg.settings.tools,
+            False,
+            lambda key, mode: False,
+            [],
+            [],
+            {},
+        )
+        return fp.launched_terminals[0].command
+
+    def _cfg(self, proj, **tools):
+        return MagentConfig(
+            projects=[proj],
+            settings=Settings(tools=tools or {"claude": "claude --continue"}),
+        )
+
+    def test_no_prior_conversation_drops_the_continue_flag(
+        self, tmp_path, fake_sleep, monkeypatch
+    ):
+        proj = ProjectConfig(path=str(tmp_path), tool="claude", title="proj")
+        cmd = self._dispatch(monkeypatch, proj, self._cfg(proj), has_session=False)
+        assert cmd == "claude"
+
+    def test_a_prior_conversation_is_still_continued(
+        self, tmp_path, fake_sleep, monkeypatch
+    ):
+        proj = ProjectConfig(path=str(tmp_path), tool="claude", title="proj")
+        cmd = self._dispatch(monkeypatch, proj, self._cfg(proj), has_session=True)
+        assert cmd == "claude --continue"
+
+    def test_a_remote_project_is_never_decided_from_the_local_store(
+        self, tmp_path, fake_sleep, monkeypatch
+    ):
+        # The command runs on the far host: this machine's ~/.claude has no
+        # bearing on whether that host has a conversation to continue.
+        proj = ProjectConfig(
+            path=str(tmp_path), tool="claude", title="proj", host="deck"
+        )
+        monkeypatch.setattr(
+            "magent.sessions.claude.has_claude_session",
+            lambda project_dir, home_override=None: pytest.fail(
+                "probed the local session store for a remote project"
+            ),
+        )
+        fp = FakePlatform()
+        _dispatch_cli_agent_project(
+            fp,
+            self._cfg(proj),
+            RunOpts(),
+            proj,
+            "claude",
+            True,
+            None,
+            self._cfg(proj).settings.tools,
+            False,
+            lambda key, mode: False,
+            [],
+            [],
+            {},
+        )
+        assert fp.launched_terminals[0].command == "claude --continue"
+
+    def test_an_explicit_per_window_command_is_never_rewritten(
+        self, tmp_path, fake_sleep, monkeypatch
+    ):
+        # windows[i].command is the user's literal command line. Even in a
+        # directory with no conversation, magent runs exactly what it says.
+        proj = ProjectConfig(
+            path=str(tmp_path),
+            tool="claude",
+            title="proj",
+            windows=[WindowConfig(command="claude --continue --verbose")],
+        )
+        cmd = self._dispatch(monkeypatch, proj, self._cfg(proj), has_session=False)
+        assert cmd == "claude --continue --verbose"
+
+    def test_a_per_window_tool_override_gets_the_same_treatment(
+        self, tmp_path, fake_sleep, monkeypatch
+    ):
+        # One window, overridden to a tool whose configured command carries
+        # the flag: the override runs through the same probe as the base tool.
+        proj = ProjectConfig(
+            path=str(tmp_path),
+            tool="codex",
+            title="proj",
+            windows=[WindowConfig(tool="claude")],
+        )
+        cfg = self._cfg(proj, codex="codex", claude="claude --continue")
+        cmd = self._dispatch(monkeypatch, proj, cfg, has_session=False)
+        assert cmd == "claude"
+
+    def test_a_tool_with_no_resume_flag_is_untouched(
+        self, tmp_path, fake_sleep, monkeypatch
+    ):
+        proj = ProjectConfig(path=str(tmp_path), tool="codex", title="proj")
+        cmd = self._dispatch(
+            monkeypatch, proj, self._cfg(proj, codex="codex"), has_session=False
+        )
+        assert cmd == "codex"
+
+
 class TestPerWindowToolOverride:
     """Regression pins for the per-window ``tool`` override (P3-06 follow-up).
 

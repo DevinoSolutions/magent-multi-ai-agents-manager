@@ -8,8 +8,13 @@ from magent.sessions import (
     build_flash_url,
     folder_for_session,
 )
-from magent.sessions.claude import encode_claude_project_path, get_claude_session_ids
-from magent.sessions.codex import get_codex_session_ids
+from magent.sessions.claude import (
+    claude_fresh_command,
+    encode_claude_project_path,
+    get_claude_session_ids,
+    has_claude_session,
+)
+from magent.sessions.codex import codex_fresh_command, get_codex_session_ids
 
 
 class TestEncodeClaudeProjectPath:
@@ -77,6 +82,141 @@ class TestGetClaudeSessionIds:
         fake_claude_sessions(encoded, [("uuid-1", 1000.0), ("uuid-2", 2000.0)])
         ids = get_claude_session_ids("test-project", 1, home_override=home)
         assert ids == ["uuid-2"]
+
+
+class TestHasClaudeSession:
+    """The "is this a brand-new project directory?" probe. Existence only --
+    it must not care which session is newest, or what is inside the file."""
+
+    def test_true_when_a_session_file_exists(self, fake_claude_sessions, tmp_path):
+        fake_claude_sessions("test-project", [("uuid-1", 1000.0)])
+        assert has_claude_session("test-project", home_override=tmp_path) is True
+
+    def test_false_for_a_directory_with_no_session_files(
+        self, fake_claude_sessions, tmp_path
+    ):
+        fake_claude_sessions("test-project", [])
+        assert has_claude_session("test-project", home_override=tmp_path) is False
+
+    def test_false_when_the_project_was_never_opened(self, tmp_path):
+        # The headline case: a project just added to magent, or a fresh
+        # machine -- ~/.claude/projects/<encoded> does not exist at all.
+        assert has_claude_session("nonexistent", home_override=tmp_path) is False
+
+    def test_the_project_path_is_encoded_like_claude_encodes_it(self, tmp_path):
+        sess_dir = tmp_path / ".claude" / "projects" / "-home-user-api"
+        sess_dir.mkdir(parents=True)
+        (sess_dir / "uuid-1.jsonl").write_text("{}\n")
+        assert has_claude_session("/home/user/api", home_override=tmp_path) is True
+
+    def test_non_jsonl_files_do_not_count(self, tmp_path):
+        sess_dir = tmp_path / ".claude" / "projects" / "test-project"
+        sess_dir.mkdir(parents=True)
+        (sess_dir / "notes.txt").write_text("hi")
+        assert has_claude_session("test-project", home_override=tmp_path) is False
+
+
+class TestClaudeFreshCommand:
+    """`claude --continue` in a directory with no stored conversation errors
+    out and leaves a dead pane. These pin exactly when the flag is dropped --
+    and, just as importantly, when it is kept so the failure stays visible."""
+
+    def _fresh(self, cmd, tmp_path, project="test-project"):
+        return claude_fresh_command(cmd, project, home_override=tmp_path)
+
+    def test_new_directory_drops_the_continue_flag(self, tmp_path):
+        assert self._fresh("claude --continue", tmp_path) == "claude"
+
+    def test_the_short_flag_is_deliberately_not_matched(self, tmp_path):
+        # `-c` is claude's own alias for --continue, but the same token belongs
+        # to a WRAPPER in `bash -c claude ...`, and corrupting a working command
+        # is worse than leaving the rarer spelling on its old behavior.
+        assert self._fresh("claude -c", tmp_path) is None
+
+    def test_an_interpreter_wrapped_command_is_not_corrupted(self, tmp_path):
+        # The wrapper's own -c survives; only claude's long flag goes.
+        assert self._fresh("bash -c claude --continue", tmp_path) == "bash -c claude"
+
+    def test_a_quoted_wrapper_payload_is_left_alone(self, tmp_path):
+        # --continue is followed by a quote, not whitespace: no token match, so
+        # magent does not try to rewrite inside someone else's argument.
+        assert self._fresh('bash -c "claude --continue"', tmp_path) is None
+
+    def test_other_arguments_are_preserved(self, tmp_path):
+        assert (
+            self._fresh("claude --continue --dangerously-skip-permissions", tmp_path)
+            == "claude --dangerously-skip-permissions"
+        )
+        assert (
+            self._fresh("claude --model opus --continue", tmp_path)
+            == "claude --model opus"
+        )
+
+    def test_existing_session_keeps_the_command_untouched(
+        self, fake_claude_sessions, tmp_path
+    ):
+        fake_claude_sessions("test-project", [("uuid-1", 1000.0)])
+        assert self._fresh("claude --continue", tmp_path) is None
+
+    def test_an_empty_session_file_still_counts_as_a_session(self, tmp_path):
+        # Deliberate posture: a session file that exists but is empty or
+        # corrupt keeps --continue. That failure is a real defect the user
+        # needs to SEE in the pane, not one to paper over with a fresh chat.
+        sess_dir = tmp_path / ".claude" / "projects" / "test-project"
+        sess_dir.mkdir(parents=True)
+        (sess_dir / "uuid-1.jsonl").write_text("")
+        assert self._fresh("claude --continue", tmp_path) is None
+
+    def test_an_explicitly_named_session_is_never_rewritten(self, tmp_path):
+        # The user spelled out which conversation they want; a new-directory
+        # probe has no business overriding that.
+        assert self._fresh("claude --resume abc123", tmp_path) is None
+        assert self._fresh("claude --resume=abc123", tmp_path) is None
+        assert self._fresh("claude -r abc123", tmp_path) is None
+
+    def test_the_interactive_resume_picker_is_never_rewritten(self, tmp_path):
+        assert self._fresh("claude --resume", tmp_path) is None
+
+    def test_a_command_that_asks_for_both_is_left_alone(self, tmp_path):
+        assert self._fresh("claude --continue --resume abc123", tmp_path) is None
+
+    def test_a_command_with_no_resume_flag_is_left_alone(self, tmp_path):
+        assert self._fresh("claude", tmp_path) is None
+        assert self._fresh("claude --model opus", tmp_path) is None
+
+    def test_a_longer_flag_that_merely_starts_the_same_is_not_matched(self, tmp_path):
+        assert self._fresh("claude --continue-on-error", tmp_path) is None
+        assert self._fresh("claude --config x", tmp_path) is None
+
+
+class TestCodexFreshCommand:
+    """codex's symmetric case. Its resume form is the explicit subcommand
+    `codex resume <id>`, so the default `codex` has nothing to rewrite -- the
+    only hazardous shape is a hand-configured `codex resume --last`."""
+
+    def test_the_registry_default_is_never_rewritten(self, tmp_path):
+        assert codex_fresh_command("codex", "/home/user/api", tmp_path) is None
+
+    def test_resume_last_in_a_new_directory_drops_back_to_the_binary(self, tmp_path):
+        assert (
+            codex_fresh_command("codex resume --last", "/home/user/api", tmp_path)
+            == "codex"
+        )
+
+    def test_resume_last_with_a_stored_session_is_left_alone(
+        self, fake_codex_sessions, tmp_path
+    ):
+        fake_codex_sessions([("/home/user/api", "uuid-1", 1000.0)])
+        assert (
+            codex_fresh_command("codex resume --last", "/home/user/api", tmp_path)
+            is None
+        )
+
+    def test_an_explicitly_named_session_is_never_rewritten(self, tmp_path):
+        assert (
+            codex_fresh_command("codex resume uuid-1", "/home/user/api", tmp_path)
+            is None
+        )
 
 
 class TestGetCodexSessionIds:
