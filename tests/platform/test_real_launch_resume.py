@@ -977,6 +977,78 @@ def test_go_falls_back_to_fresh_start_empty_store_linux(tmp_path, linux_cleanup)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="real xterm leg is linux-only")
+def test_go_single_window_new_project_starts_fresh_linux(tmp_path, linux_cleanup):
+    """The reported edge case, real spawn (Linux): ONE window in a project
+    directory that has never hosted a conversation. The `--continue` the config
+    carries would exit immediately there and leave a dead shell, so the launch
+    path must drop it -- and must NOT invent a `--resume` in its place."""
+    _linux_launch_ready()
+    unique = uuid.uuid4().hex[:10]
+    project, home, shim_dir, marker = _prepare(tmp_path, unique, ["claude"])
+    # No store seeded: home has no ~/.claude at all -- a brand-new project.
+
+    name_a = f"mdrs{unique}a"
+    title_a = make_title(name_a)
+    cfg = _write_config(
+        tmp_path,
+        project,
+        default_tool="claude",
+        tools={"claude": "claude --continue"},
+        windows=[{"name": name_a}],
+    )
+    linux_cleanup.append(title_a)
+
+    env = _child_env(home, shim_dir)
+    _assert_shim_wins(env, "claude", shim_dir)
+    rc, out, err = _run_go(cfg, env, tmp_path)
+    assert rc == 0, f"--go failed\nstdout:\n{out}\nstderr:\n{err}"
+
+    cl = _wait_cmdlines([title_a])[title_a]
+    assert "--continue" not in cl, f"a new project must start fresh: {cl!r}"
+    assert "--resume" not in cl, f"an empty store must not invent a session: {cl!r}"
+
+    _wait_until(lambda: len(_marker_args(marker, "claude")) == 1, timeout=15)
+    args = _marker_args(marker, "claude")
+    assert args == [""], f"a new project must start fresh, shim saw: {args!r}"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="real xterm leg is linux-only")
+def test_go_single_window_existing_conversation_continues_linux(
+    tmp_path, linux_cleanup
+):
+    """The other half of the same decision: where a conversation DOES exist,
+    the configured `--continue` is passed through untouched, so a real resume
+    failure stays visible in the pane instead of being papered over."""
+    _linux_launch_ready()
+    unique = uuid.uuid4().hex[:10]
+    project, home, shim_dir, marker = _prepare(tmp_path, unique, ["claude"])
+    _seed_claude_store(home, str(project), [(str(uuid.uuid4()), time.time() - 100)])
+
+    name_a = f"mdrs{unique}a"
+    title_a = make_title(name_a)
+    cfg = _write_config(
+        tmp_path,
+        project,
+        default_tool="claude",
+        tools={"claude": "claude --continue"},
+        windows=[{"name": name_a}],
+    )
+    linux_cleanup.append(title_a)
+
+    env = _child_env(home, shim_dir)
+    _assert_shim_wins(env, "claude", shim_dir)
+    rc, out, err = _run_go(cfg, env, tmp_path)
+    assert rc == 0, f"--go failed\nstdout:\n{out}\nstderr:\n{err}"
+
+    cl = _wait_cmdlines([title_a])[title_a]
+    assert "--continue" in cl, f"an existing conversation must be continued: {cl!r}"
+
+    _wait_until(lambda: len(_marker_args(marker, "claude")) == 1, timeout=15)
+    args = _marker_args(marker, "claude")
+    assert args == ["--continue"], f"expected --continue kept, shim saw: {args!r}"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="real xterm leg is linux-only")
 def test_go_codex_override_does_not_reuse_claude_session_linux(tmp_path, linux_cleanup):
     """PR #41 regression, real-spawn (Linux): the per-window ``codex`` override
     window must not receive ``codex resume <claude-uuid>``."""
