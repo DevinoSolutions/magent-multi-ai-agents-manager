@@ -534,6 +534,84 @@ def test_go_falls_back_to_fresh_start_empty_store_win(tmp_path, cleanup_registry
 
 @_skip_not_win
 @_skip_no_wt
+def test_go_single_window_new_project_starts_fresh_win(tmp_path, cleanup_registry):
+    """The reported edge case, real spawn: ONE window in a project directory
+    that has never hosted a conversation.
+
+    Multi-window projects were already safe (they route through
+    build_resume_command, which strips the flag when it has no session id).
+    A single window runs the configured command verbatim, so this is where
+    `claude --continue` reached a directory with nothing to continue -- claude
+    exits, the pane is a dead shell, and revive re-runs it forever.
+    """
+    plat = _win_launch_ready()
+    unique = uuid.uuid4().hex[:10]
+    project, home, shim_dir, marker = _prepare(tmp_path, unique, ["claude"])
+    # No store seeded: home has no ~/.claude at all -- a brand-new project.
+
+    name_a = f"mdrs{unique}a"
+    title_a = make_title(name_a)
+    cfg = _write_config(
+        tmp_path,
+        project,
+        default_tool="claude",
+        tools={"claude": "claude --continue"},
+        windows=[{"name": name_a}],
+    )
+    cleanup_registry["titles"] = [title_a]
+    cleanup_registry["markers"] = []
+
+    env = _child_env(home, shim_dir)
+    _assert_shim_wins(env, "claude", shim_dir)
+    rc, out, err = _run_go(cfg, env, tmp_path)
+    assert rc == 0, f"--go failed\nstdout:\n{out}\nstderr:\n{err}"
+
+    _wait_until(lambda: len(_snapshot_md_handles(plat, [title_a])) == 1, timeout=20)
+
+    _wait_until(lambda: len(_marker_args(marker, "claude")) == 1, timeout=15)
+    args = _marker_args(marker, "claude")
+    assert args == [""], f"a new project must start fresh, shim saw: {args!r}"
+
+
+@_skip_not_win
+@_skip_no_wt
+def test_go_single_window_existing_conversation_continues_win(
+    tmp_path, cleanup_registry
+):
+    """The other half of the same decision: where a conversation DOES exist,
+    the configured `--continue` is passed through untouched. A resume failure
+    there is a real defect and must stay visible in the pane."""
+    plat = _win_launch_ready()
+    unique = uuid.uuid4().hex[:10]
+    project, home, shim_dir, marker = _prepare(tmp_path, unique, ["claude"])
+    _seed_claude_store(home, str(project), [(str(uuid.uuid4()), time.time() - 100)])
+
+    name_a = f"mdrs{unique}a"
+    title_a = make_title(name_a)
+    cfg = _write_config(
+        tmp_path,
+        project,
+        default_tool="claude",
+        tools={"claude": "claude --continue"},
+        windows=[{"name": name_a}],
+    )
+    cleanup_registry["titles"] = [title_a]
+    cleanup_registry["markers"] = []
+
+    env = _child_env(home, shim_dir)
+    _assert_shim_wins(env, "claude", shim_dir)
+    rc, out, err = _run_go(cfg, env, tmp_path)
+    assert rc == 0, f"--go failed\nstdout:\n{out}\nstderr:\n{err}"
+
+    _wait_until(lambda: len(_snapshot_md_handles(plat, [title_a])) == 1, timeout=20)
+
+    _wait_until(lambda: len(_marker_args(marker, "claude")) == 1, timeout=15)
+    args = _marker_args(marker, "claude")
+    assert args == ["--continue"], f"expected --continue kept, shim saw: {args!r}"
+
+
+@_skip_not_win
+@_skip_no_wt
 def test_go_codex_override_does_not_reuse_claude_session_win(
     tmp_path, cleanup_registry
 ):

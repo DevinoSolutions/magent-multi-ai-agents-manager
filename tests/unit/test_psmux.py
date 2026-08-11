@@ -346,6 +346,56 @@ class TestEligibleProjectsDedupe:
         assert out[0]["path"] == "/a/api"
 
 
+class TestEligibleProjectsFreshStart:
+    """`cmd` is the command every psmux consumer runs -- bring_up creates
+    sessions with it, revive_sessions injects it into a fallen-back pane, and
+    `up --json` ships it to the attach client for no-mux windows. A project
+    directory with no stored conversation must not get `claude --continue`
+    there: claude exits with "no conversation found", the pane is left at a
+    dead shell, and revive re-runs the same failing command forever."""
+
+    def _cmd(self, monkeypatch, tmp_path, *, has_session):
+        monkeypatch.setattr(
+            "magent.sessions.claude.has_claude_session",
+            lambda project_dir, home_override=None: has_session,
+        )
+        cfg = _cfg(
+            [ProjectConfig(path=str(tmp_path), tool="claude", title="api")],
+            tools={"claude": "claude --continue"},
+        )
+        return psmux.eligible_projects(cfg)[0]["cmd"]
+
+    def test_a_directory_with_no_conversation_starts_fresh(self, monkeypatch, tmp_path):
+        assert self._cmd(monkeypatch, tmp_path, has_session=False) == "claude"
+
+    def test_a_directory_with_a_conversation_still_continues_it(
+        self, monkeypatch, tmp_path
+    ):
+        assert self._cmd(monkeypatch, tmp_path, has_session=True) == "claude --continue"
+
+    def test_an_unresolvable_folder_leaves_the_command_alone(self, monkeypatch):
+        # Nothing on this machine to probe -- and the entry is reported down
+        # with "folder not found" anyway. Guessing "new" here would be a
+        # verdict taken with no evidence.
+        monkeypatch.setattr(
+            "magent.sessions.claude.has_claude_session",
+            lambda project_dir, home_override=None: pytest.fail(
+                "probed a folder that does not resolve"
+            ),
+        )
+        cfg = _cfg(
+            [ProjectConfig(path="/nope/api", tool="claude")],
+            tools={"claude": "claude --continue"},
+        )
+        assert psmux.eligible_projects(cfg)[0]["cmd"] == "claude --continue"
+
+    def test_a_tool_with_no_configured_command_stays_empty(self, tmp_path):
+        # "" is how psmux_status/bring_up spell "no agent command" -- the
+        # fresh-start probe must not turn it into something runnable.
+        cfg = _cfg([ProjectConfig(path=str(tmp_path), tool="ghost")], tools={})
+        assert psmux.eligible_projects(cfg)[0]["cmd"] == ""
+
+
 class TestPsmuxStatusDownReason:
     """A project that is short-circuited to down -- never probed at all --
     carries WHY. The live case that motivated this: a project whose folder was
@@ -728,7 +778,12 @@ class TestBringUpCreationVerify:
         )
         retried = fp.launched_psmux[-1]
         assert retried.window_name == "api"
-        assert retried.command == "claude --continue"
+        # The tmp project dir has no stored claude conversation, so
+        # `eligible_projects` already dropped --continue (build_start_command);
+        # what matters here is that the respawn replays THAT command verbatim
+        # rather than rebuilding a different one.
+        assert retried.command == "claude"
+        assert retried.command == fp.launched_psmux[0].command
         assert retried.cwd == str(tmp_path / "api")
 
     def test_a_recovered_session_counts_as_created(self, monkeypatch, tmp_path, slept):

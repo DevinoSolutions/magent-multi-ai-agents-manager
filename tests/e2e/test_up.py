@@ -1,8 +1,11 @@
 import json
+import os
 import subprocess
 import sys
 
 import pytest
+
+from magent.sessions.claude import encode_claude_project_path
 
 pytestmark = pytest.mark.e2e
 
@@ -16,11 +19,19 @@ def _write_cfg(tmp_path, projects, settings=None):
     return cfg
 
 
-def _run(cfg, *args):
+def _run(cfg, *args, home=None):
+    env = None
+    if home is not None:
+        # Redirect the child's HOME so the claude session store it probes is a
+        # fixture, never the developer's real ~/.claude.
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env["USERPROFILE"] = str(home)  # what Path.home() reads on Windows
     return subprocess.run(
         [sys.executable, "-m", "magent", "--config", str(cfg), *args],
         capture_output=True,
         text=True,
+        env=env,
     )
 
 
@@ -54,9 +65,12 @@ class TestUpJson:
         assert sorted(d["name"] for d in data["down"]) == ["api", "web"]
         # P3-01: every eligible entry carries both name (display) and session.
         assert all("session" in p for p in data["projects"])
-        # eligible entries carry the launch command used to create the session
+        # eligible entries carry the launch command used to create the session.
+        # These tmp project dirs have no stored claude conversation, so the
+        # command comes back fresh-start (--continue dropped); both branches of
+        # that decision are pinned in TestUpJsonFreshStart below.
         api = next(p for p in data["projects"] if p["name"] == "api")
-        assert api["cmd"] == "claude --continue"
+        assert api["cmd"] == "claude"
 
     def test_name_display_vs_session_split(self, tmp_path):
         # P3-01: a dotted title surfaces as `name` verbatim but `session`
@@ -150,6 +164,41 @@ class TestServeEnsure:
             assert "ensured" in r.stdout.lower()
         finally:
             srv.close()
+
+
+class TestUpJsonFreshStart:
+    """`projects[].cmd` is the command bring_up creates sessions with AND the
+    one the attach client spawns no-mux SSH windows with -- and it is computed
+    on the machine that will run it. A project directory with no stored
+    conversation must not get `claude --continue` there: claude exits with "no
+    conversation found", leaving a dead shell that revive re-kills forever.
+
+    Real CLI, real config, real (redirected) session store on both sides of
+    the decision."""
+
+    def _api_cmd(self, tmp_path, home):
+        project = tmp_path / "api"
+        project.mkdir(exist_ok=True)
+        cfg = _write_cfg(tmp_path, [{"path": str(project), "tool": "claude"}])
+        r = _run(cfg, "up", "--json", home=home)
+        assert r.returncode == 0, r.stderr
+        data = json.loads(r.stdout.strip().splitlines()[-1])
+        return next(p for p in data["projects"] if p["name"] == "api")["cmd"]
+
+    def test_a_brand_new_project_directory_starts_fresh(self, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        assert self._api_cmd(tmp_path, home) == "claude"
+
+    def test_a_directory_with_a_conversation_still_continues_it(self, tmp_path):
+        home = tmp_path / "home"
+        encoded = encode_claude_project_path(str(tmp_path / "api"))
+        sess_dir = home / ".claude" / "projects" / encoded
+        sess_dir.mkdir(parents=True)
+        (sess_dir / "11111111-2222-3333-4444-555555555555.jsonl").write_text(
+            '{"type":"message"}\n', encoding="utf-8"
+        )
+        assert self._api_cmd(tmp_path, home) == "claude --continue"
 
 
 class TestStatusDown:

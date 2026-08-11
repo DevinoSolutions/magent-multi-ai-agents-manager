@@ -4,8 +4,17 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
-from magent.sessions.claude import build_claude_resume, get_claude_session_ids
-from magent.sessions.codex import build_codex_resume, get_codex_session_ids
+from magent.log import get_logger
+from magent.sessions.claude import (
+    build_claude_resume,
+    claude_fresh_command,
+    get_claude_session_ids,
+)
+from magent.sessions.codex import (
+    build_codex_resume,
+    codex_fresh_command,
+    get_codex_session_ids,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -17,6 +26,10 @@ class AgentTool:
 
     session_ids: Callable[[str, int], list[str | None]] | None = None
     resume_command: Callable[[str, str | None], str] | None = None
+    # (base_cmd, project_dir) -> the command to run when that directory has NO
+    # prior session for this tool to resume, or None to run base_cmd unchanged.
+    # See `build_start_command`.
+    fresh_command: Callable[[str, str], str | None] | None = None
     happy: bool = False  # can be wrapped with `happy` for mobile access
 
     @property
@@ -28,10 +41,14 @@ AGENT_TOOLS: dict[str, AgentTool] = {
     "claude": AgentTool(
         session_ids=get_claude_session_ids,
         resume_command=build_claude_resume,
+        fresh_command=claude_fresh_command,
         happy=True,
     ),
     "codex": AgentTool(
-        session_ids=get_codex_session_ids, resume_command=build_codex_resume, happy=True
+        session_ids=get_codex_session_ids,
+        resume_command=build_codex_resume,
+        fresh_command=codex_fresh_command,
+        happy=True,
     ),
 }
 
@@ -41,6 +58,60 @@ def build_resume_command(tool: str, base_cmd: str, session_id: str | None) -> st
     if caps and caps.resume_command:
         return caps.resume_command(base_cmd, session_id)
     return base_cmd
+
+
+def build_start_command(tool: str, base_cmd: str, project_dir: str | None) -> str:
+    """``base_cmd``, with its implicit "resume the latest conversation" flag
+    dropped when ``project_dir`` has nothing to resume.
+
+    The edge this exists for: ``claude --continue`` (the registry default)
+    fails outright in a directory that never hosted a conversation, leaving the
+    pane at a dead shell that every retry and every revive re-kills the same
+    way. The verdict is taken HERE, at command-build time, and never at
+    runtime: agent commands are delivered into psmux panes with send-keys, so
+    magent never observes the command's exit code -- and a shell-level
+    ``claude --continue || claude`` would relaunch a FRESH agent on any later
+    nonzero exit, silently discarding a live conversation and hiding auth or
+    CLI failures behind a fake recovery.
+
+    Only a positively-determined "this directory has no stored session"
+    rewrites anything. An unknown tool, a tool with no probe, an unresolvable
+    directory, a command carrying no implicit-resume flag, an explicitly named
+    session, and a probe that ERRORS all keep ``base_cmd`` exactly as
+    configured -- so a genuine resume failure stays visible in the pane, where
+    the user can read it.
+
+    ``project_dir`` must be a directory on the machine that will RUN the
+    command: pass None for a remote project rather than deciding it from this
+    machine's session store.
+    """
+    caps = AGENT_TOOLS.get(tool)
+    if not base_cmd or not project_dir or not caps or not caps.fresh_command:
+        return base_cmd
+    log = get_logger("launch")
+    try:
+        fresh = caps.fresh_command(base_cmd, project_dir)
+    except OSError:
+        # A probe that cannot read the session store proves nothing about
+        # whether a session exists. Keep the configured command and say so.
+        log.warning(
+            "could not probe %s sessions in %s; running %r as configured",
+            tool,
+            project_dir,
+            base_cmd,
+            exc_info=True,
+        )
+        return base_cmd
+    if fresh is None or fresh == base_cmd:
+        return base_cmd
+    log.info(
+        "no prior %s session in %s; starting fresh: %r -> %r",
+        tool,
+        project_dir,
+        base_cmd,
+        fresh,
+    )
+    return fresh
 
 
 # --- IDE tools (REC-F4) -------------------------------------------------------
