@@ -127,8 +127,20 @@ class TestClaudeFreshCommand:
     def test_new_directory_drops_the_continue_flag(self, tmp_path):
         assert self._fresh("claude --continue", tmp_path) == "claude"
 
-    def test_new_directory_drops_the_short_flag_too(self, tmp_path):
-        assert self._fresh("claude -c", tmp_path) == "claude"
+    def test_the_short_flag_is_deliberately_not_matched(self, tmp_path):
+        # `-c` is claude's own alias for --continue, but the same token belongs
+        # to a WRAPPER in `bash -c claude ...`, and corrupting a working command
+        # is worse than leaving the rarer spelling on its old behavior.
+        assert self._fresh("claude -c", tmp_path) is None
+
+    def test_an_interpreter_wrapped_command_is_not_corrupted(self, tmp_path):
+        # The wrapper's own -c survives; only claude's long flag goes.
+        assert self._fresh("bash -c claude --continue", tmp_path) == "bash -c claude"
+
+    def test_a_quoted_wrapper_payload_is_left_alone(self, tmp_path):
+        # --continue is followed by a quote, not whitespace: no token match, so
+        # magent does not try to rewrite inside someone else's argument.
+        assert self._fresh('bash -c "claude --continue"', tmp_path) is None
 
     def test_other_arguments_are_preserved(self, tmp_path):
         assert (

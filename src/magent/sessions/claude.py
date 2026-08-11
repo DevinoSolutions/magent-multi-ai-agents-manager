@@ -17,10 +17,19 @@ def build_claude_resume(base_cmd: str, session_id: str | None) -> str:
 
 
 # "Pick the current directory's most recent conversation back up", with no
-# session named. Matched as whole tokens (and with the trailing run of spaces,
+# session named. Matched as a whole token (and with the trailing run of spaces,
 # so removing one leaves no double space) rather than as a substring, so a
 # longer flag that merely starts the same way is never touched.
-_CONTINUE_RE = re.compile(r"(?:(?<=\s)|\A)(?:--continue|-c)(?=\s|\Z)\s*")
+#
+# Long form ONLY, deliberately. claude also accepts `-c`, but a configured
+# command may run claude through an interpreter -- `bash -c claude --continue`
+# -- where that same token belongs to the WRAPPER, and stripping it would
+# corrupt a working command. That is far worse than leaving the rarer
+# `claude -c` spelling on its pre-existing behavior. The token lookahead
+# handles the fully quoted wrapper payload (`bash -c "claude --continue"`) for
+# free: the flag is followed by a quote, not whitespace, so nothing matches and
+# the command is left exactly as the user wrote it.
+_CONTINUE_RE = re.compile(r"(?:(?<=\s)|\A)--continue(?=\s|\Z)\s*")
 # A session the user named explicitly (``--resume <id>``, ``--resume=<id>``,
 # ``-r <id>``) or claude's interactive resume picker (a bare ``--resume``).
 # Either way the command spells out what the user wants; the fresh-start
