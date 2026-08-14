@@ -1,0 +1,12 @@
+{
+  "name": "@magent/cli",
+  "version": "0.0.1",
+  "description": "Placeholder — the official Magent CLI. Coming soon.",
+  "license": "MIT",
+  "homepage": "https://magent.now",
+  "main": "index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DevinoSolutions/magent-multi-ai-agents-manager.git"
+  }
+}
