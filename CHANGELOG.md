@@ -5,6 +5,33 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.11.1] - 2026-08-14
+
+### Fixed
+
+- **A brand-new project no longer opens a dead pane.** The default claude
+  command carries `--continue`, which resumes the most recent conversation
+  *for the current working directory* -- and in a directory that has never
+  hosted one, claude exits with "No conversation found to continue": the
+  agent never starts, and revive re-runs the same failing command forever.
+  Every command-build site (fresh launch, session bring-up, revive, and the
+  command list attach uses for `--no-mux` windows) now routes through one
+  seam, `sessions.build_start_command`, which checks the project's stored
+  sessions on the machine that will run the command and drops the implicit
+  resume flag only when there is positively nothing to resume -- starting a
+  fresh `claude` instead, with a `launch.log` line recording the decision.
+  Deliberately narrow so real failures stay visible instead of being papered
+  over: an explicit `--resume <id>`, a per-window `command` override, a
+  remote project, a probe that errors, and present-but-unreadable session
+  files all keep the configured command byte-for-byte -- if `--continue`
+  then genuinely fails, the error stays on screen where it can be read.
+  There is no shell-level `|| claude` fallback anywhere: it would fire on
+  *any* nonzero exit (masking auth failures, corrupted sessions, CLI
+  regressions), and magent never observes the command's exit code in a
+  psmux pane in the first place. Codex needs no equivalent (its resume form
+  is the explicit `codex resume <id>`, only built when an id exists), but a
+  hand-configured `codex resume --last` gets the same guard.
+
 ## [3.11.0] - 2026-08-09
 
 ### Added
@@ -738,6 +765,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.11.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.11.0...v3.11.1
 [3.11.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.10...v3.11.0
 [3.10.10]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.9...v3.10.10
 [3.10.9]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.8...v3.10.9
