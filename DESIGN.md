@@ -656,6 +656,80 @@ recycling: stamping `magent:<name>` onto a stranger's window would not merely
 mislabel it, it would get that window **tiled**. A missing badge is a worse-
 looking bug and a much cheaper one.
 
+### The Alt+V listener is supervised, not spawned once (2026-08-15)
+
+The listener used to be a ONE-SHOT spawn: whichever `magent --go` or `magent
+attach` ran last called `start_hotkey_listener`, and after that nothing in the
+product ever looked at it again. Observed live: a listener last started eight
+days and one reboot earlier, upload server still running, `magent status`
+reporting `Alt+V listener   off  (starts with 'magent attach')` and exiting 0.
+Two failures at once — the hotkey was dead, and the tool said that was normal.
+
+**Owner: `serve`.** The upload server is the long-lived process the Alt+V chain
+already posts into, so "serve is up" and "Alt+V works" collapse into one fact.
+`upload_server._supervise_hotkey` runs on a daemon thread off `run_server`,
+checks immediately and then every `HOTKEY_SUPERVISE_INTERVAL_S` (30s), and
+delegates to `launch.ensure_hotkey_listener`. Every failure is a log line and
+another try next interval: supervision must never take down the thing actually
+serving uploads.
+
+*Why a second entry point.* `ensure_hotkey_listener` is NOT
+`start_hotkey_listener`. The launch/attach paths are the *wiring* callers — they
+know which target the listener should serve and deliberately re-aim it when that
+changes, which is what `hotkey_restart_reason`'s "target change" branches are
+for. A supervisor knows no such thing: `magent attach` points the listener at a
+REMOTE host so F2 opens projects over VS Code Remote-SSH, and a supervisor that
+re-applied its own loopback URL every 30 seconds would fight attach forever —
+killing the remote-wired listener on every pass and permanently breaking F2 on
+remote fleets. So `ensure_hotkey_listener` re-checks a live listener against
+**its own manifest target** (`supervised_hotkey_target`) and only chooses a
+target for a listener that is not there. Version skew still restarts it, in
+place, on its own target.
+
+*The listener is deliberately NOT stopped with serve.* `down --all` already
+stops both — server first, listener second, so the supervisor is gone before the
+listener is and cannot resurrect it — and a user restarting serve should not
+lose their hotkey in between.
+
+*Never two listeners.* Unchanged: the pid-file + manifest dedupe inside
+`start_hotkey_listener` is what guarantees it, and every caller still routes
+through it. `exclusive_lock("hotkey-supervisor")` is taken by the supervisor
+alone (two serve daemons on different ports would otherwise both spawn) and
+deliberately NOT by launch/attach, so an interactive attach re-aiming the
+listener can never be blocked by a background thread.
+
+**`MAGENT_HOTKEY_SUPERVISOR` (default on) is a test-isolation requirement, not a
+preference knob.** The listener installs a SYSTEM-WIDE low-level keyboard hook,
+which no HOME redirect can contain — so without an opt-out, every tier that
+starts a real `magent serve` (e2e, soak, dist, browser, and a plain
+`pytest tests/e2e/` on a developer's own Windows box) would install one on the
+machine running the tests. Every such fixture sets it to `0`; the `interaction`
+tier sets it to `0` because it spawns the listener itself, and its new
+supervision test sets it back to `1` as the behavior under test. It doubles as
+the escape hatch for a user who wants to own the listener's lifetime.
+
+**Observability.** `cli/status.py::_listener_state` gained a fourth state,
+`dead` — no listener, on a hotkey-capable platform, while the upload server is
+*serving* **and permitted to supervise**. It is red, carries
+`LISTENER_REPAIR_HINT`, and degrades the exit code to 3, consistent with the
+documented contract. `off` is reserved for the cases where nobody promised a
+listener, and its hint says which one: no hotkey support, no server, or
+supervision opted out. Two exclusions matter, and both are "do not invent a
+promise": a *dead* upload server does not also report a dead listener (the
+upload line already says so, and a second red line for the downstream symptom is
+noise), and neither does a server whose owner set `MAGENT_HOTKEY_SUPERVISOR=0`.
+`doctor`'s `hotkey` check imports the same state machine rather than reimplement
+it, so the two surfaces cannot disagree about whether Alt+V works.
+
+**Per-press feedback.** Every Alt+V press now ends in exactly one
+`ALTV outcome=<x> project=<y>` line in `hotkey.log` (closed vocabulary,
+`hotkey.ALTV_OUTCOMES`), and every failure also reaches the screen through the
+`/api/flash` psmux status line F2 already used — no new notification subsystem.
+The one deliberate silence is `not-a-magent-window`: Alt+V outside a magent
+window is another app's chord, not a failure, so it is DEBUG-only (at INFO it
+would log every Alt+V the user ever presses). `no-image` still passes the chord
+through — the pane may want a plain Alt+V — but says why nothing was uploaded.
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.

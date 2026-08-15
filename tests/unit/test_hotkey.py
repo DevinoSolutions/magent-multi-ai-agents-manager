@@ -731,50 +731,139 @@ class TestF2HookDecision:
         )
         assert started[0][0] is hotkey._do_upload
 
+    def test_alt_v_with_no_clipboard_image_reports_instead_of_going_quiet(
+        self, monkeypatch
+    ):
+        # The exact "I pressed it in the right window and nothing happened"
+        # case. The chord still PASSES THROUGH (the pane may want a plain
+        # Alt+V) -- but the user is told why nothing was uploaded.
+        from magent import hotkey
+        from magent.hotkey import HC_ACTION, VK_V, WM_KEYDOWN, _hook_decide
 
-class TestDoUploadLogging:
-    """_do_upload discards the upload result (F-IC-003/F-D4-001) no longer --
-    it now logs the outcome, and an unexpected error (e.g. the OverflowError
-    _dib_to_bmp can raise) is caught and logged instead of vanishing on the
-    background thread it runs on."""
+        monkeypatch.setattr(hotkey, "get_active_window_title", lambda: "magent:caly")
+        monkeypatch.setattr(hotkey, "clipboard_has_image", lambda: False)
+        monkeypatch.setattr(hotkey.user32, "CallNextHookEx", lambda *a: 0)
+        started: list[tuple[object, tuple[object, ...]]] = []
+        self._fake_thread(monkeypatch, started)
 
-    def test_logs_info_with_project_and_result(self, monkeypatch, caplog):
+        assert (
+            _hook_decide(
+                {"alt_held": True},
+                "http://x:8034",
+                HC_ACTION,
+                WM_KEYDOWN,
+                self._lparam(VK_V),
+            )
+            == 0
+        )
+        assert started[0][0] is hotkey._altv_report
+        assert started[0][1][:3] == ("http://x:8034", "caly", "no-image")
+        assert "clipboard has no image" in started[0][1][3]
+
+    def test_alt_v_outside_a_magent_window_stays_a_silent_pass_through(
+        self, monkeypatch
+    ):
+        # Not a failure -- the chord belongs to whatever app is focused. It is
+        # recorded at DEBUG only; reporting it would fire on every Alt+V the
+        # user ever presses anywhere.
+        from magent import hotkey
+        from magent.hotkey import HC_ACTION, VK_V, WM_KEYDOWN, _hook_decide
+
+        monkeypatch.setattr(hotkey, "get_active_window_title", lambda: "Notepad")
+        monkeypatch.setattr(hotkey.user32, "CallNextHookEx", lambda *a: 0)
+        started: list[tuple[object, tuple[object, ...]]] = []
+        self._fake_thread(monkeypatch, started)
+
+        assert (
+            _hook_decide(
+                {"alt_held": True},
+                "http://x:8034",
+                HC_ACTION,
+                WM_KEYDOWN,
+                self._lparam(VK_V),
+            )
+            == 0
+        )
+        assert started == []
+
+
+class TestAltVOutcomeReporting:
+    """Every Alt+V press ends in exactly one greppable ``ALTV outcome=...``
+    line, and every FAILURE also reaches the user's screen through the flash
+    channel.
+
+    The listener runs hidden with no terminal, so a press that silently does
+    nothing is indistinguishable from a listener that is not running -- which
+    is the whole "we don't know when Alt+V doesn't work" complaint. Silence was
+    the old contract here (``test_no_image_is_a_silent_noop``); it is now a
+    regression.
+    """
+
+    def _flashes(self, monkeypatch):
+        seen: list[tuple[str, str, str]] = []
+        from magent import hotkey
+
+        monkeypatch.setattr(
+            hotkey,
+            "_flash_status",
+            lambda url, project, message: seen.append((url, project, message)),
+        )
+        return seen
+
+    def test_success_logs_ok_and_flashes_nothing(self, monkeypatch, caplog):
         from magent import hotkey
 
         monkeypatch.setattr(hotkey, "get_clipboard_image", lambda: b"FAKEBMP")
         monkeypatch.setattr(hotkey, "upload_image", lambda url, project, data: True)
+        flashes = self._flashes(monkeypatch)
 
         with caplog.at_level("INFO", logger="magent.hotkey"):
             hotkey._do_upload("http://x:8034", "marka")
 
-        assert "project=marka" in caplog.text
-        assert "ok=True" in caplog.text
+        assert "ALTV outcome=ok project=marka" in caplog.text
+        # The server drives the progress line on the happy path; a second
+        # message from the listener would double-report it.
+        assert flashes == []
 
-    def test_logs_ok_false_on_failed_upload(self, monkeypatch, caplog):
+    def test_rejected_upload_is_logged_and_shown(self, monkeypatch, caplog):
         from magent import hotkey
 
         monkeypatch.setattr(hotkey, "get_clipboard_image", lambda: b"FAKEBMP")
         monkeypatch.setattr(hotkey, "upload_image", lambda url, project, data: False)
+        flashes = self._flashes(monkeypatch)
 
         with caplog.at_level("INFO", logger="magent.hotkey"):
             hotkey._do_upload("http://x:8034", "marka")
 
-        assert "ok=False" in caplog.text
+        assert "ALTV outcome=upload-rejected project=marka" in caplog.text
+        assert flashes == [
+            (
+                "http://x:8034",
+                "marka",
+                "Alt+V: upload failed - is `magent serve` running?",
+            )
+        ]
 
-    def test_no_image_is_a_silent_noop(self, monkeypatch, caplog):
+    def test_unreadable_clipboard_is_logged_and_shown_not_silent(
+        self, monkeypatch, caplog
+    ):
+        # clipboard_has_image() said yes at the hook, so an empty read is a
+        # real failure -- it used to return with no trace at all.
         from magent import hotkey
 
         monkeypatch.setattr(hotkey, "get_clipboard_image", lambda: None)
         called = []
         monkeypatch.setattr(hotkey, "upload_image", lambda *a: called.append(a))
+        flashes = self._flashes(monkeypatch)
 
         with caplog.at_level("INFO", logger="magent.hotkey"):
             hotkey._do_upload("http://x:8034", "marka")
 
-        assert called == []
-        assert "project=marka" not in caplog.text
+        assert called == []  # still never uploads a non-image
+        assert "ALTV outcome=clipboard-unreadable project=marka" in caplog.text
+        assert len(flashes) == 1
 
-    def test_unexpected_error_is_caught_and_logged_not_raised(
+    def test_unexpected_error_is_caught_logged_and_shown_not_raised(
         self, monkeypatch, caplog
     ):
         from magent import hotkey
@@ -783,11 +872,41 @@ class TestDoUploadLogging:
             raise OverflowError("byte must be in range(0, 256)")
 
         monkeypatch.setattr(hotkey, "get_clipboard_image", _boom)
+        flashes = self._flashes(monkeypatch)
 
         with caplog.at_level("INFO", logger="magent.hotkey"):
             hotkey._do_upload("http://x:8034", "marka")  # must not raise
 
-        assert "upload project=marka failed" in caplog.text
+        assert "ALTV outcome=error project=marka" in caplog.text
+        assert "OverflowError" in caplog.text  # the traceback rides along
+        assert len(flashes) == 1
+
+    def test_a_broken_flash_channel_cannot_break_the_report(self, monkeypatch, caplog):
+        # Feedback must never be able to break the action it reports on --
+        # _flash_status swallows everything, so a dead server is still logged.
+        from magent import hotkey
+
+        monkeypatch.setattr(hotkey, "get_clipboard_image", lambda: b"FAKEBMP")
+        monkeypatch.setattr(hotkey, "upload_image", lambda url, project, data: False)
+
+        with caplog.at_level("INFO", logger="magent.hotkey"):
+            hotkey._do_upload("http://127.0.0.1:1", "marka")  # nothing listening
+
+        assert "ALTV outcome=upload-rejected project=marka" in caplog.text
+
+    def test_every_outcome_name_is_declared(self):
+        # The vocabulary is closed on purpose: `grep 'ALTV outcome=no-image'`
+        # has to keep working as a diagnosis, not just `grep ALTV`.
+        from magent import hotkey
+
+        assert set(hotkey.ALTV_OUTCOMES) == {
+            "ok",
+            "not-a-magent-window",
+            "no-image",
+            "clipboard-unreadable",
+            "upload-rejected",
+            "error",
+        }
 
 
 class TestHeartbeatWiring:

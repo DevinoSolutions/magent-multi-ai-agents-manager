@@ -47,6 +47,13 @@ if TYPE_CHECKING:
     from magent.config import MagentConfig
 
 
+# The one repair instruction for a dead/stale Alt+V listener, shared by
+# `status` and `doctor`'s hotkey check so the two can never drift into telling
+# the user different things. `down --all` stops the server first and the
+# listener second, and the fresh server supervises a fresh listener back up.
+LISTENER_REPAIR_HINT = "magent down --all, then magent serve (or magent attach)"
+
+
 def _health_check(port: int) -> bool:
     """HTTP GET /health -- proves the upload server is actually SERVING, not
     just that something is bound to the port or that a pid is alive."""
@@ -72,8 +79,30 @@ def _upload_state(port: int) -> str:
     return "off"
 
 
-def _listener_state() -> str:
-    """ "on" (heartbeat fresh) / "stale" (pid alive, heartbeat expired) / "off"."""
+def _listener_state(upload_state: str) -> str:
+    """Liveness of the Alt+V listener, judged against whether one is EXPECTED.
+
+    Four states, and the distinction between the last two is the point:
+
+    * "on"    -- pid alive, heartbeat fresh.
+    * "stale" -- pid alive, heartbeat expired (the message loop is wedged).
+    * "dead"  -- no listener, on a hotkey-capable platform, while the upload
+      server is SERVING and allowed to supervise one. The upload server owns
+      the listener (``upload_server._supervise_hotkey``), so a healthy server
+      with no listener is a real fault: Alt+V does nothing, and until this
+      state existed that was reported as a benign "off  (starts with `magent
+      attach`)" with exit 0 -- the observability hole this closes.
+    * "off"   -- nobody promised a listener: a platform without hotkey support,
+      no upload server running, or supervision turned off.
+
+    ``upload_state`` comes from ``_upload_state`` rather than being re-probed
+    here, so one status pass makes one health request. Only a genuinely
+    *serving* server ("on") implies a listener -- when the server itself is
+    "dead" its own line already says so, and a second red line for the
+    downstream symptom would be noise. And only a server *permitted* to
+    supervise implies one: reporting DEAD to somebody who set
+    MAGENT_HOTKEY_SUPERVISOR=0 would invent a promise nobody made.
+    """
     from magent.platform import get_platform  # heavy subsystem: in-body per policy
 
     if not get_platform().supports_hotkey():
@@ -84,8 +113,18 @@ def _listener_state() -> str:
 
     pid = listener_pid()
     if not pid:
-        return "off"
+        return "dead" if upload_state == "on" and _supervised() else "off"
     return "on" if heartbeat_fresh("hotkey") else "stale"
+
+
+def _supervised() -> bool:
+    """Is `serve` allowed to keep an Alt+V listener alive? (the one owner of
+    that question is ``upload_server``; this is only the in-body import)."""
+    from magent.upload_server import (
+        supervision_enabled,  # heavy subsystem: in-body per policy
+    )
+
+    return supervision_enabled()
 
 
 def _attention_state() -> str:
@@ -197,9 +236,10 @@ def _print_session_row(idx: int, row: dict[str, object]) -> None:
 
 
 def _gather_status(cfg: MagentConfig) -> dict[str, str]:
+    upload = _upload_state(cfg.settings.upload_port)
     return {
-        "upload_server": _upload_state(cfg.settings.upload_port),
-        "listener": _listener_state(),
+        "upload_server": upload,
+        "listener": _listener_state(upload),
         "attention": _attention_state(),
     }
 
@@ -207,7 +247,7 @@ def _gather_status(cfg: MagentConfig) -> dict[str, str]:
 def _is_degraded(status: dict[str, str]) -> bool:
     return (
         status["upload_server"] == "dead"
-        or status["listener"] == "stale"
+        or status["listener"] in ("stale", "dead")
         or status["attention"] in ("stale", "crashed")
     )
 
@@ -285,11 +325,31 @@ def _render_status(config_file: Path) -> StatusReport:
     listener_labels = {
         "on": style("ON", fg="green", bold=True),
         "stale": style("STALE  (heartbeat expired)", fg="red", bold=True),
-        "off": style("off  (starts with `magent attach`)", dim=True),
+        "dead": style(
+            "DEAD  (upload server is up but no listener — Alt+V does nothing)",
+            fg="red",
+            bold=True,
+        ),
+        # Two ways to be off, and they have different truths behind them:
+        # normally the upload server would start one, but not if the user took
+        # ownership with MAGENT_HOTKEY_SUPERVISOR=0.
+        "off": style(
+            "off  (starts with the upload server)"
+            if _supervised()
+            else "off  (supervision disabled by MAGENT_HOTKEY_SUPERVISOR)",
+            dim=True,
+        ),
     }
     click.echo(
         f"  {style('Alt+V listener', bold=True)}   {listener_labels[status['listener']]}"
     )
+    if status["listener"] in ("dead", "stale"):
+        # A red line the user cannot act on is only half an answer. The repair
+        # is the same either way: the upload server is what supervises the
+        # listener, so restarting it re-establishes one within the interval.
+        click.echo(
+            f"  {style('Repair:', dim=True)} {style(LISTENER_REPAIR_HINT, bold=True)}"
+        )
 
     attention_labels = {
         "on": style("ON", fg="green", bold=True),

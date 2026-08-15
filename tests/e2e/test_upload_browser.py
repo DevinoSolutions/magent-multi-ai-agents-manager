@@ -173,6 +173,11 @@ class _BrowserServe:
         }
         home_s = str(self.home)
         env["HOME"] = home_s
+        # The Alt+V listener installs a SYSTEM-WIDE keyboard hook, and a real
+        # `serve` now supervises one into existence. Redirecting HOME does not
+        # contain a global hook, so tests that start a real server opt out
+        # rather than install one on the machine running them.
+        env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
         env["USERPROFILE"] = home_s
         env["XDG_CONFIG_HOME"] = home_s
         env["TMUX_TMPDIR"] = str(self.tmux_tmp)

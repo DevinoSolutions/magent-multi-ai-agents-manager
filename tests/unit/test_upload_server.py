@@ -1025,11 +1025,19 @@ class TestBindAddresses:
 
         # run_server constructs _NoFqdnHTTPServer (the no-reverse-DNS subclass).
         monkeypatch.setattr(mod, "_NoFqdnHTTPServer", _FakeServer)
+        # ...and it now also supervises the Alt+V listener, which spawns a
+        # process that installs a SYSTEM-WIDE keyboard hook. Never from a unit
+        # test: the wiring is pinned separately, with a stub.
+        supervised = []
+        monkeypatch.setattr(
+            mod, "_supervise_hotkey", lambda url, stop, **kw: supervised.append(url)
+        )
 
         with pytest.raises(KeyboardInterrupt):
             mod.run_server(port=0)
 
         assert constructed == [("127.0.0.1", 0)]  # loopback only, never 0.0.0.0
+        assert supervised == ["http://127.0.0.1:0"]  # the listener gets an owner
 
     def test_server_bind_never_reverse_resolves(self, monkeypatch):
         """Pin the macOS-wedge fix: server_bind must not call socket.getfqdn.
@@ -1056,3 +1064,184 @@ class TestBindAddresses:
             assert srv.server_port != 0
         finally:
             srv.server_close()
+
+
+class TestLocalUrl:
+    """Which URL the supervised listener is handed. It must be reachable from
+    THIS machine without Tailscale being up -- the listener posts every Alt+V
+    image through it."""
+
+    def test_default_bind_uses_loopback(self):
+        import magent.upload_server as mod
+
+        assert mod.local_url(["127.0.0.1", "100.64.0.1"], 8034) == (
+            "http://127.0.0.1:8034"
+        )
+
+    def test_lan_wildcard_still_resolves_to_loopback(self):
+        # `serve --host 0.0.0.0` binds loopback too; "http://0.0.0.0:..." is
+        # not a URL a client should be handed.
+        import magent.upload_server as mod
+
+        assert mod.local_url(["0.0.0.0"], 8034) == "http://127.0.0.1:8034"
+
+    def test_a_bind_that_excluded_loopback_uses_what_was_bound(self):
+        # `serve --host <tailscale-ip>`: loopback is genuinely not listening,
+        # so claiming it would hand the listener a dead URL.
+        import magent.upload_server as mod
+
+        assert mod.local_url(["100.64.0.1"], 8034) == "http://100.64.0.1:8034"
+
+
+class _Env:
+    """Stand-in for MagentEnv over the fields this code path reads: the
+    supervisor's own switch, plus log_level (get_logger consults it)."""
+
+    log_level = None
+
+    def __init__(self, hotkey_supervisor: bool) -> None:
+        self.hotkey_supervisor = hotkey_supervisor
+
+
+class TestHotkeySupervisor:
+    """serve owns the Alt+V listener's liveness.
+
+    Before this, the listener was a one-shot spawn by whichever launch/attach
+    ran last: a reboot or a crash left Alt+V dead with nothing ever re-checking
+    it, and `status` reported that as a benign default.
+    """
+
+    def _mod(self):
+        import magent.upload_server as mod
+
+        return mod
+
+    def _fake_platform(self, monkeypatch, *, supports_hotkey):
+        from tests.conftest import FakePlatform
+
+        fp = FakePlatform(supports_hotkey=supports_hotkey)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+
+    def _ensure(self, monkeypatch, result=4242):
+        calls: list[str] = []
+
+        def _fake(url):
+            calls.append(url)
+            return result
+
+        monkeypatch.setattr("magent.launch.ensure_hotkey_listener", _fake)
+        return calls
+
+    def test_checks_immediately_and_then_every_interval(self, monkeypatch):
+        self._fake_platform(monkeypatch, supports_hotkey=True)
+        calls = self._ensure(monkeypatch)
+        stop = threading.Event()
+        waits: list[float] = []
+
+        def _wait(timeout):
+            waits.append(timeout)
+            return len(waits) >= 3  # stop on the third pass
+
+        monkeypatch.setattr(stop, "wait", _wait)
+
+        self._mod()._supervise_hotkey("http://127.0.0.1:8034", stop, interval=30.0)
+
+        # The first check is NOT deferred by an interval: a serve that just
+        # started must not leave Alt+V dead for 30 more seconds.
+        assert calls == ["http://127.0.0.1:8034"] * 3
+        assert waits == [30.0, 30.0, 30.0]
+
+    def test_the_env_opt_out_stops_it_before_it_touches_anything(self, monkeypatch):
+        # MAGENT_HOTKEY_SUPERVISOR=0 is what keeps a test that starts a real
+        # serve from installing a system-wide keyboard hook on a dev machine.
+        self._fake_platform(monkeypatch, supports_hotkey=True)
+        calls = self._ensure(monkeypatch)
+        monkeypatch.setattr("magent.env.get_env", lambda: _Env(False))
+
+        self._mod()._supervise_hotkey("http://127.0.0.1:8034", threading.Event())
+
+        assert calls == []
+
+    def test_a_broken_environment_still_supervises(self, monkeypatch, caplog):
+        # A detached daemon must not lose a feature because some unrelated
+        # MAGENT_* var went bad after it started (same posture as log.py).
+        from pydantic import ValidationError
+
+        self._fake_platform(monkeypatch, supports_hotkey=True)
+        calls = self._ensure(monkeypatch)
+
+        def _bad():
+            raise ValidationError.from_exception_data("MagentEnv", [])
+
+        monkeypatch.setattr("magent.env.get_env", _bad)
+        stop = threading.Event()
+        monkeypatch.setattr(stop, "wait", lambda timeout: True)
+
+        with caplog.at_level("WARNING", logger="magent.hotkey"):
+            self._mod()._supervise_hotkey("http://127.0.0.1:8034", stop, interval=1.0)
+
+        assert calls == ["http://127.0.0.1:8034"]
+        assert "did not validate" in caplog.text
+
+    def test_returns_immediately_where_the_platform_has_no_hotkey(self, monkeypatch):
+        self._fake_platform(monkeypatch, supports_hotkey=False)
+        calls = self._ensure(monkeypatch)
+
+        self._mod()._supervise_hotkey("http://127.0.0.1:8034", threading.Event())
+
+        assert calls == []  # and no unbounded loop on a non-Windows serve
+
+    def test_a_failed_spawn_is_logged_and_retried_not_fatal(self, monkeypatch, caplog):
+        self._fake_platform(monkeypatch, supports_hotkey=True)
+        calls = self._ensure(monkeypatch, result=None)  # child never confirmed
+        stop = threading.Event()
+        monkeypatch.setattr(stop, "wait", lambda timeout: len(calls) >= 2)
+
+        with caplog.at_level("WARNING", logger="magent.hotkey"):
+            self._mod()._supervise_hotkey("http://127.0.0.1:8034", stop, interval=1.0)
+
+        assert len(calls) == 2  # it tried again rather than giving up
+        assert "no Alt+V listener came up" in caplog.text
+
+    def test_an_exception_cannot_take_down_the_server_thread(self, monkeypatch, caplog):
+        self._fake_platform(monkeypatch, supports_hotkey=True)
+        boom: list[int] = []
+
+        def _explode(url):
+            boom.append(1)
+            raise RuntimeError("pid file on fire")
+
+        monkeypatch.setattr("magent.launch.ensure_hotkey_listener", _explode)
+        stop = threading.Event()
+        monkeypatch.setattr(stop, "wait", lambda timeout: len(boom) >= 2)
+
+        with caplog.at_level("ERROR", logger="magent.hotkey"):
+            self._mod()._supervise_hotkey("http://127.0.0.1:8034", stop, interval=1.0)
+
+        assert len(boom) == 2
+        assert "listener check failed" in caplog.text
+
+    def test_a_second_server_supervising_backs_off_instead_of_racing(self, monkeypatch):
+        # Two serve daemons on different ports would otherwise both decide the
+        # listener is missing and both spawn one.
+        mod = self._mod()
+        self._fake_platform(monkeypatch, supports_hotkey=True)
+        calls = self._ensure(monkeypatch)
+
+        def _held(name):
+            raise mod.LockHeld(name)
+
+        monkeypatch.setattr(mod, "exclusive_lock", _held)
+        stop = threading.Event()
+        seen: list[int] = []
+
+        def _wait(timeout):
+            seen.append(1)
+            return True
+
+        monkeypatch.setattr(stop, "wait", _wait)
+
+        mod._supervise_hotkey("http://127.0.0.1:8034", stop, interval=1.0)
+
+        assert calls == []  # never spawned behind the other supervisor's back
+        assert seen == [1]  # and still slept rather than spinning

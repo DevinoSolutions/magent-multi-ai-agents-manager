@@ -163,12 +163,51 @@ def _monitor_lines(monitors: list[dict[str, object]]) -> list[str]:
     return lines
 
 
-def _check_hotkey() -> CheckResult:
+def _check_hotkey(cfg: MagentConfig | None) -> CheckResult:
+    """Is Alt+V actually working, not merely available.
+
+    The old version answered "does this OS support the hotkey", which is true on
+    every Windows box whether or not a listener has run since the last reboot --
+    so a machine where Alt+V had been dead for days passed this check. It now
+    reports the real listener liveness, through the same state machine `status`
+    renders (``cli.status._listener_state``) so the two surfaces can never
+    disagree about whether Alt+V works.
+    """
     from magent.platform import get_platform  # heavy subsystem: in-body per policy
 
-    if get_platform().supports_hotkey():
-        return (OK, "Alt+V clipboard-upload hotkey available")
-    return (OK, "hotkey not supported on this OS (Windows-only feature)")
+    if not get_platform().supports_hotkey():
+        return (OK, "hotkey not supported on this OS (Windows-only feature)")
+
+    from magent.cli.status import (
+        LISTENER_REPAIR_HINT,
+        _listener_state,
+        _upload_state,
+    )
+
+    port = cfg.settings.upload_port if cfg else 8033
+    state = _listener_state(_upload_state(port))
+    if state == "on":
+        return (OK, "Alt+V listener running (heartbeat fresh)")
+    if state == "dead":
+        return (
+            FAIL,
+            "upload server is running but no Alt+V listener — pasting an image "
+            f"into a magent: window does nothing. Repair: {LISTENER_REPAIR_HINT}",
+        )
+    if state == "stale":
+        return (
+            FAIL,
+            "Alt+V listener process is alive but its heartbeat expired — its "
+            "message loop is wedged and key presses are being dropped. "
+            f"Repair: {LISTENER_REPAIR_HINT}",
+        )
+    from magent.upload_server import (
+        supervision_enabled,  # heavy subsystem: in-body per policy
+    )
+
+    if not supervision_enabled():
+        return (OK, "Alt+V listener off — supervision disabled (you own its lifetime)")
+    return (OK, "Alt+V listener off — it starts with the upload server")
 
 
 def _writable(d: Path) -> bool:
@@ -261,7 +300,7 @@ def _run_checks(config_file: Path) -> list[dict[str, str]]:
         ("agent tools", lambda: _check_agent_tools(cfg)),
         ("terminal", _check_terminal),
         ("monitors", _check_monitors),
-        ("hotkey", _check_hotkey),
+        ("hotkey", lambda: _check_hotkey(cfg)),
         ("logs dir", _check_logs_dir),
         ("state dir", _check_state_dir),
         ("sentry", _check_sentry),

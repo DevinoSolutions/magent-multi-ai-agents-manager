@@ -26,7 +26,8 @@ Product-visible effects asserted:
    32bpp BI_RGB DIB (file header + alpha bytes forced opaque);
 2. the uploaded file's path is INJECTED into the live psmux session
    (``send_keys``), observed via a real ``capture-pane``;
-3. the listener's own log records ``ok=True`` for the project.
+3. the listener's own log records ``ALTV outcome=ok project=<name>`` -- the
+   greppable per-press outcome line every Alt+V now ends in.
 
 Gating (never on a dev machine): SendInput fires GLOBAL keystrokes and the
 test stomps the machine clipboard, so this runs only under
@@ -92,8 +93,17 @@ _CF_DIB = 8
 
 def _child_env() -> dict[str, str]:
     """The real environment minus ambient MAGENT_* vars. HOME is NOT
-    redirected -- psmux sockets are per-profile (see module docstring)."""
-    return {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
+    redirected -- psmux sockets are per-profile (see module docstring).
+
+    Serve's own Alt+V listener supervision is turned OFF here: this tier spawns
+    the listener ITSELF (below), because the whole point is to drive the exact
+    ``python -m magent hotkey -s <url>`` argv the product spawns. Leaving serve
+    to supervise as well would put two listeners on the machine, and both would
+    answer the same real Alt+V chord.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
+    env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
+    return env
 
 
 def _wait_until(check, timeout: float, interval: float = 0.5):
@@ -319,6 +329,97 @@ def _tail(path, limit: int = 2000) -> str:
         return "<no output file>"
 
 
+def test_a_real_serve_supervises_a_real_listener_into_existence(tmp_path):
+    """serve running => Alt+V listener alive, with nothing else involved.
+
+    The failure this closes, observed live: the listener was a ONE-SHOT spawn
+    by whichever `magent --go` / `magent attach` ran last. After a reboot
+    nothing respawned it -- the upload server was up, `magent status` said
+    ``off  (starts with `magent attach`)`` and exited 0, and Alt+V had silently
+    done nothing for eight days.
+
+    Deliberately NOT sharing the flagship's fixture: this proves the ONE link
+    that no unit test can (a real serve process really spawning a real listener
+    process), and nothing else. No psmux session, no keystrokes, no clipboard.
+    ``MAGENT_HOTKEY_SUPERVISOR`` is forced ON here -- ``_child_env`` turns it
+    off for the flagship, which spawns its own listener.
+    """
+    from magent.hotkey import listener_pid
+    from magent.procs import pid_alive
+
+    home = Path.home()  # REAL home: the listener's pid file is per-profile
+    pid_file = home / ".magent" / "hotkey.pid"
+    if listener_pid() is not None:
+        pytest.skip("a listener is already running on this machine")
+
+    port = _free_port()
+    env = _child_env()
+    env["MAGENT_HOTKEY_SUPERVISOR"] = "1"  # the behavior under test
+    cfg = tmp_path / "magent.config.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "layout": {"columns": 1, "rows": 1},
+                "settings": {"psmux": True, "uploadServer": False},
+                "projects": [],
+            }
+        )
+    )
+    out, err = tmp_path / "serve.out.log", tmp_path / "serve.err.log"
+    handles = [out.open("wb"), err.open("wb")]
+    serve_proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "magent",
+            "--config",
+            str(cfg),
+            "serve",
+            "-p",
+            str(port),
+        ],
+        env=env,
+        stdout=handles[0],
+        stderr=handles[1],
+    )
+    listener = None
+    try:
+        assert _wait_until(
+            lambda: _http_ok(f"http://127.0.0.1:{port}/health", '"ok": true'),
+            timeout=60,
+        ), f"upload server never answered /health\nstderr:\n{_tail(err)}"
+
+        # The supervisor checks immediately, so this is seconds, not its
+        # 30s interval. The generous deadline is for a loaded runner.
+        listener = _wait_until(listener_pid, timeout=60)
+        assert listener, (
+            "serve did not supervise an Alt+V listener into existence\n"
+            f"hotkey.log:\n{_read_log(home, 'hotkey')}"
+        )
+        assert pid_alive(listener), "the listener wrote a pid then died"
+    finally:
+        serve_proc.kill()
+        serve_proc.wait(timeout=15)
+        if listener:
+            subprocess.run(
+                ["taskkill", "/PID", str(listener), "/F"],
+                capture_output=True,
+                check=False,
+            )
+        for fh in handles:
+            with contextlib.suppress(OSError):
+                fh.close()
+        with contextlib.suppress(OSError):
+            pid_file.unlink()
+
+    # A supervised listener must not outlive this test: it holds a system-wide
+    # keyboard hook, and the next test in this tier sends real keystrokes.
+    assert _wait_until(lambda: listener_pid() is None, timeout=15), (
+        "cleanup left a listener running"
+    )
+
+
 def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
     import ctypes
 
@@ -506,9 +607,11 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
             f"{_capture_pane(name)}"
         )
 
-        # 7c. The listener's own log recorded the success.
+        # 7c. The listener's own log recorded the success -- in the ALTV
+        #     outcome grammar every press now uses, so `grep ALTV` is the whole
+        #     history of the chord (hotkey.ALTV_LOG_PREFIX / ALTV_OUTCOMES).
         assert _wait_until(
-            lambda: f"upload project={name} ok=True" in _read_log(home, "hotkey"),
+            lambda: f"ALTV outcome=ok project={name}" in _read_log(home, "hotkey"),
             timeout=10,
         ), f"hotkey log missing success line:\n{_read_log(home, 'hotkey')}"
     finally:

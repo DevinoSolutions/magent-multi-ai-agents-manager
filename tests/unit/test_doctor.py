@@ -17,6 +17,7 @@ from magent.cli.doctor import (
     WARN,
     _check_agent_tools,
     _check_config,
+    _check_hotkey,
     _check_monitors,
     _check_sentry,
     _check_tailscale,
@@ -254,6 +255,60 @@ class TestCheckUploadPort:
         status, detail = _check_upload_port(None)
         assert status == WARN
         assert "occupied" in detail
+
+
+class TestCheckHotkey:
+    """The hotkey check used to answer "does this OS support Alt+V" -- true on
+    every Windows box whether or not a listener had run since the last reboot,
+    so a machine where Alt+V had been dead for days passed it. It now reports
+    the real listener liveness, through the same state machine `status` renders
+    so the two surfaces can never disagree."""
+
+    def _platform(self, monkeypatch, *, supports_hotkey):
+        fp = FakePlatform(supports_hotkey=supports_hotkey)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+
+    def _listener(self, monkeypatch, state):
+        monkeypatch.setattr("magent.cli.status._upload_state", lambda port: "on")
+        monkeypatch.setattr("magent.cli.status._listener_state", lambda upload: state)
+
+    def test_platform_without_hotkey_support_is_ok(self, monkeypatch):
+        self._platform(monkeypatch, supports_hotkey=False)
+        status, detail = _check_hotkey(None)
+        assert status == OK
+        assert "Windows-only" in detail
+
+    def test_running_listener_is_ok(self, monkeypatch):
+        self._platform(monkeypatch, supports_hotkey=True)
+        self._listener(monkeypatch, "on")
+        status, detail = _check_hotkey(None)
+        assert status == OK
+        assert "heartbeat fresh" in detail
+
+    def test_dead_listener_fails_with_the_shared_repair_hint(self, monkeypatch):
+        from magent.cli.status import LISTENER_REPAIR_HINT
+
+        self._platform(monkeypatch, supports_hotkey=True)
+        self._listener(monkeypatch, "dead")
+        status, detail = _check_hotkey(None)
+        assert status == FAIL
+        assert "no Alt+V listener" in detail
+        assert LISTENER_REPAIR_HINT in detail
+
+    def test_wedged_listener_fails_and_says_so(self, monkeypatch):
+        self._platform(monkeypatch, supports_hotkey=True)
+        self._listener(monkeypatch, "stale")
+        status, detail = _check_hotkey(None)
+        assert status == FAIL
+        assert "heartbeat expired" in detail
+
+    def test_listener_off_by_design_is_ok_and_names_its_owner(self, monkeypatch):
+        self._platform(monkeypatch, supports_hotkey=True)
+        monkeypatch.setattr("magent.cli.status._upload_state", lambda port: "off")
+        monkeypatch.setattr("magent.cli.status._listener_state", lambda upload: "off")
+        status, detail = _check_hotkey(None)
+        assert status == OK
+        assert "starts with the upload server" in detail
 
 
 class TestCheckSentry:

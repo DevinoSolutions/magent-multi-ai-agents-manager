@@ -175,6 +175,17 @@ Send screenshots from your phone straight into a project's agent session:
 
 This works **over Tailscale**: the server binds only the loopback and your machine's Tailscale IP — never the LAN wildcard — and `attach`/`mobile`/`termius` shell out to the `tailscale` CLI to resolve hosts. Devices must be on your tailnet; there is deliberately no auth token, since the bind set is the access control. To bind something else (e.g. LAN-wide), use the escape hatch: `magent serve --host 0.0.0.0`.
 
+#### The Alt+V listener stays alive by itself
+
+The upload server owns the Alt+V listener: while `magent serve` runs it makes sure a listener exists, restarts one that died or is running older code after an upgrade, and leaves alone one that `magent attach` pointed at another machine. So Alt+V survives reboots, crashes and upgrades — start the server (directly, or via `magent --go` / `magent attach`) and the hotkey follows.
+
+If it *isn't* working you will be told, rather than left guessing:
+
+- `magent status` prints `Alt+V listener   DEAD  (upload server is up but no listener — Alt+V does nothing)` in red and **exits 3**, with the repair command underneath. `magent doctor` fails the `hotkey` check with the same hint. A listener that is simply not expected yet (no server running) still reads as a quiet `off`.
+- Every Alt+V press is recorded in `~/.magent/logs/hotkey.log` as one `ALTV outcome=… project=…` line — so `grep ALTV ~/.magent/logs/hotkey.log` is the whole history of the chord — and any press that can't complete (no image on the clipboard, the server unreachable, the upload rejected) also says so in that project's status line instead of doing nothing.
+
+To own the listener's lifetime yourself, set `MAGENT_HOTKEY_SUPERVISOR=0`; `status` still reports whether one is running.
+
 ## Usage
 
 Run `magent` with no arguments for the interactive menu:

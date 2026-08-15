@@ -64,6 +64,11 @@ def _child_env(home) -> dict[str, str]:
     env["HOMEDRIVE"] = drive
     env["HOMEPATH"] = tail or "\\"
     env["HOME"] = home_s
+    # The Alt+V listener installs a SYSTEM-WIDE keyboard hook, and a real
+    # `serve` now supervises one into existence. Redirecting HOME does not
+    # contain a global hook, so tests that start a real server opt out
+    # rather than install one on the machine running them.
+    env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
     return env
 
 

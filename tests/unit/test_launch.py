@@ -9,10 +9,12 @@ touching any OS-specific window/monitor API.
 from __future__ import annotations
 
 import os
+import sys
 import time
 
 import pytest
 
+from magent import launch
 from magent.config import MagentConfig, ProjectConfig, Settings, WindowConfig
 from magent.grid import MonitorRect, Rect, compute_grid
 from magent.launch import (
@@ -396,6 +398,95 @@ class TestHotkeyRestartReason:
             None,
         )
         assert reason is not None
+
+
+class TestSupervisedHotkeyTarget:
+    """The supervisor must never RE-AIM a listener, only keep one alive.
+
+    `magent attach` deliberately points the listener at a REMOTE host so F2
+    opens projects over VS Code Remote-SSH. A serve-owned supervisor that
+    re-applied its own loopback URL every interval would fight attach forever:
+    each pass would see a "target change", kill the remote-wired listener and
+    spawn a local one, and F2 would be permanently broken on remote fleets.
+    Hence a separate entry point from ``start_hotkey_listener``, and hence this
+    pin.
+    """
+
+    def test_a_live_listener_keeps_its_own_url_and_ssh_host(self):
+        manifest = {
+            "version": "9.9.9",
+            "server_url": "http://deck:8034",
+            "ssh_host": "amin@deck",
+        }
+        assert launch.supervised_hotkey_target(manifest, "http://127.0.0.1:8034") == (
+            "http://deck:8034",
+            "amin@deck",
+        )
+
+    def test_a_local_listener_keeps_its_null_ssh_host(self):
+        manifest = {
+            "version": "9.9.9",
+            "server_url": "http://127.0.0.1:8034",
+            "ssh_host": None,
+        }
+        assert launch.supervised_hotkey_target(manifest, "http://other:1") == (
+            "http://127.0.0.1:8034",
+            None,
+        )
+
+    def test_no_manifest_falls_back_to_the_supervisors_own_target(self):
+        # A pre-3.6.0 listener; it is being restarted anyway ("no manifest" is
+        # a restart reason), and the default is the only target we can claim.
+        assert launch.supervised_hotkey_target(None, "http://127.0.0.1:8034") == (
+            "http://127.0.0.1:8034",
+            None,
+        )
+
+    def test_a_manifest_missing_its_url_falls_back_rather_than_aiming_at_none(self):
+        manifest = {"version": "9.9.9", "server_url": None, "ssh_host": "amin@deck"}
+        url, ssh_host = launch.supervised_hotkey_target(manifest, "http://fallback:1")
+        assert url == "http://fallback:1"
+        assert ssh_host == "amin@deck"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="hotkey is Windows-only")
+class TestEnsureHotkeyListener:
+    """The supervision entry point: idempotent, and target-preserving."""
+
+    def _wire(self, monkeypatch, *, pid, manifest=None):
+        calls: list[tuple[str, str | None]] = []
+        monkeypatch.setattr("magent.hotkey.listener_pid", lambda: pid)
+        monkeypatch.setattr("magent.hotkey.listener_manifest", lambda: manifest)
+        monkeypatch.setattr(
+            "magent.launch.start_hotkey_listener",
+            lambda url, ssh_host=None: calls.append((url, ssh_host)) or 4242,
+        )
+        return calls
+
+    def test_no_listener_spawns_one_at_the_supervisors_url(self, monkeypatch):
+        calls = self._wire(monkeypatch, pid=None)
+
+        assert launch.ensure_hotkey_listener("http://127.0.0.1:8034") == 4242
+        assert calls == [("http://127.0.0.1:8034", None)]
+
+    def test_a_remote_wired_listener_is_re_checked_against_its_own_target(
+        self, monkeypatch
+    ):
+        calls = self._wire(
+            monkeypatch,
+            pid=777,
+            manifest={
+                "version": "9.9.9",
+                "server_url": "http://deck:8034",
+                "ssh_host": "amin@deck",
+            },
+        )
+
+        launch.ensure_hotkey_listener("http://127.0.0.1:8034")
+
+        # NOT the supervisor's own loopback URL -- that would read as a target
+        # change and kill the listener `magent attach` set up.
+        assert calls == [("http://deck:8034", "amin@deck")]
 
 
 class TestLocalHotkeyListener:
