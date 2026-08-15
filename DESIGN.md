@@ -608,6 +608,54 @@ the default `codex` has nothing to rewrite. `codex_fresh_command` exists for
 symmetry and handles the one hand-configured shape with the same hazard,
 `codex resume --last`.
 
+### Window titles are magent's, not the app's (2026-08-15)
+
+The `magent:` title is not decoration. Four separate consumers resolve a window
+*by* it — tiling's `magent-name` placement mode, `cli/attach.py`'s already-open
+dedupe, the corpse scanner's window↔process pairing, and
+`hotkey.py::project_from_title` — so a title rewritten out of the grammar does
+not degrade one feature, it removes the window from the product. And every
+program magent puts in a pane wants to write it: Claude Code emits OSC 0/2 title
+escapes for its status, shells advertise their cwd, ssh names the host.
+
+Two layers, in this order:
+
+**1. The spawn-side lock — primary.** Every `wt` spawn passes
+`--suppressApplicationTitle`, which tells Windows Terminal to ignore the tab
+program's title entirely. This has been on all four spawn sites since the first
+Windows backend, but it was hand-repeated with nothing enforcing it, so a fifth
+spawn site could ship without it silently. It is now a lint rule (**MD006**,
+`scripts/lint_rules.py`): a literal `wt` argv in `src/magent/` that lacks the
+flag fails the gate. That rule is deliberately shallow — it reads the argv
+*literal*, so the flag has to sit in the list next to the `"wt"` token rather
+than be `args.append`-ed further down. That is the point: an append two branches
+later is exactly the shape that loses the flag in a refactor and says nothing.
+(Both Windows sites were appending; they now carry it in the literal.)
+
+*POSIX is a mixed bag, honestly.* `--title` is only an INITIAL title on most X11
+emulators, so each backend takes the strongest lever it actually has: kitty's
+`--title` permanently fixes the OS window title (so it already is a lock),
+alacritty gets `-o window.dynamic_title=false`, xterm gets
+`-xrm XTerm*allowTitleOps:false`. gnome-terminal, konsole, Terminal.app and
+iTerm expose no per-launch equivalent — see the known-debt ledger.
+
+**2. Reassertion — the repair, Windows only.** The lock cannot be universal (no
+lever on some emulators; a window can be adopted from a spawn magent did not
+make), and a stomped title is otherwise *permanent*: `parse_title` stops
+recognizing it, so nothing in the product can find that window again — including
+the code that would fix it. `BadgeRenderer` (attention daemon) therefore
+remembers each window it has resolved **by handle**, an identity that survives a
+title rewrite, and retitles a remembered handle whose title stops parsing. It
+rides the `snapshot_windows()` pass that already runs every tick — no new poller,
+and still zero writes on a quiet tick.
+
+*Why the repair is narrowly gated.* It only fires when the remembered name still
+has a live session in the agent-state store, and both bookkeeping maps are pruned
+to the live window set every tick. The failure mode being bought off is handle
+recycling: stamping `magent:<name>` onto a stranger's window would not merely
+mislabel it, it would get that window **tiled**. A missing badge is a worse-
+looking bug and a much cheaper one.
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.
@@ -624,13 +672,31 @@ supervisor by its Windows executable name (`magent-attach-client.exe`), which
 is fine because `process_cmdlines` is Windows-only today; a POSIX process scan
 would need the extensionless name added.
 
-**Title badges are ambient state, not guaranteed state (2026-07-07):** the
-attention daemon's `BadgeRenderer` rewrites window titles via
+**Title badges are ambient state, not guaranteed state (2026-07-07, narrowed
+2026-08-15):** the attention daemon's `BadgeRenderer` rewrites window titles via
 `SetWindowTextW`, but shells/terminals with their own title logic (OSC 0/2
 sequences, Windows Terminal tab-title settings) can overwrite a badge at any
-time. The flash (and toast/ntfy when enabled) are the *reliable* signals;
-the badge is best-effort ambience. Revisit only if a real terminal in the
-fleet proves badge-hostile in practice.
+time. The flash (and toast/ntfy when enabled) are the *reliable* signals; the
+badge is best-effort ambience.
+
+*Narrowed:* a title overwritten out of the `magent:` grammar is now repaired on
+the next daemon tick (see "Window titles are magent's, not the app's"), so the
+loss is bounded by the poll interval rather than permanent — but only while the
+attention daemon runs, only on Windows, and only for sessions still live in the
+agent-state store. With no daemon there is no repair, and the spawn-side lock is
+the whole defense.
+
+**POSIX terminals with no title lock (2026-08-15):** gnome-terminal's `--title`
+is deprecated and VTE yields to the application's title; konsole's title format
+is a profile-only setting; Terminal.app's `custom title` and iTerm's session
+`name` are the stickiest channels those apps expose but the *displayed* title is
+still composed per profile. So on those four emulators a program in the pane can
+still rename a magent window out of the grammar — and unlike Windows there is no
+repair, because neither POSIX backend implements `supports_attention_signals()`,
+so `BadgeRenderer` never runs there. kitty (both OSes), alacritty and xterm ARE
+locked. Closing this properly means either a POSIX attention backend (wmctrl /
+System Events retitling) or shipping per-emulator profile config, neither of
+which the current fleet needs.
 
 **CI multi-monitor emulation is unavailable on the SHARED legs (R4-05 →
 partially closed on Windows + user-topology replay, 2026-07-15):** hosted
@@ -982,7 +1048,7 @@ launched as-is, like `cursor-agent`/`agy`), only step 3 applies: one
 ## 5. How this document stays honest
 
 Three mechanisms: **the gate** (`scripts/check.py`: ruff (lint + `format
---check`) + custom lint MD001-MD005 + ty strict + compileall + vulture +
+--check`) + custom lint MD001-MD006 + ty strict + compileall + vulture +
 pytest unit tests with a coverage floor, required green before every commit,
 so nothing described here as tested or type-checked silently stops being
 so); **pins-first discipline** (every relocation described above as "unchanged"

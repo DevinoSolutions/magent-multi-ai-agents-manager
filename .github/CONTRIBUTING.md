@@ -35,7 +35,7 @@ The **full** gate runs, in order:
 
 - `ruff check` — lint (with the Python 3.10 syntax floor)
 - `ruff format --check` — formatting
-- custom lint — `scripts/lint_rules.py`, rules MD001–MD005
+- custom lint — `scripts/lint_rules.py`, rules MD001–MD006
 - `ty` strict type check — src + scripts, plus a second win32-platform pass over
   `platform/windows.py` + `hotkey.py`
 - `compileall`

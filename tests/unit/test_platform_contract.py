@@ -661,6 +661,53 @@ class TestWindowsBringUpPsmuxInvocation:
         assert {e for _c, e in others} == {None}
 
 
+# --- POSIX title locks -------------------------------------------------------
+# The magent: title is what tiling, attach dedupe and the hotkey resolve a
+# window by, so the program in the pane must not be able to rename it. Windows
+# Terminal has one flag for it (pinned statically by the MD006 lint rule); on
+# X11 each emulator needs its own lever, and `--title` alone is NOT one -- it is
+# only an initial value on both alacritty and xterm.
+
+
+class TestLinuxTitleLock:
+    def _argv(self, monkeypatch, emulator):
+        from magent.platform import TerminalLaunchOpts
+        from magent.platform.linux import LinuxPlatform
+
+        spawns = []
+        monkeypatch.setattr(
+            "magent.platform.linux.shutil.which", lambda n: n if n == emulator else None
+        )
+        monkeypatch.setattr(
+            "magent.platform.linux.subprocess.Popen", lambda a, **k: spawns.append(a)
+        )
+        LinuxPlatform().launch_terminal(
+            TerminalLaunchOpts(title="magent:api", cwd="/p", command="claude")
+        )
+        return spawns[0]
+
+    def test_alacritty_disables_dynamic_title(self, monkeypatch):
+        from magent.platform.linux import ALACRITTY_TITLE_LOCK
+
+        argv = self._argv(monkeypatch, "alacritty")
+        assert argv[argv.index("-o") + 1] == ALACRITTY_TITLE_LOCK
+        assert argv[argv.index("--title") + 1] == "magent:api"
+
+    def test_xterm_refuses_title_escape_sequences(self, monkeypatch):
+        from magent.platform.linux import XTERM_TITLE_LOCK
+
+        argv = self._argv(monkeypatch, "xterm")
+        assert argv[argv.index("-xrm") + 1] == XTERM_TITLE_LOCK
+        assert argv[argv.index("-T") + 1] == "magent:api"
+
+    def test_kitty_title_is_the_lock_and_needs_no_extra_flag(self, monkeypatch):
+        # kitty's --title permanently fixes the OS window title (documented
+        # kitty behavior), so the flag IS the lock -- pinned so a future edit
+        # that "modernizes" it to a soft title option is a deliberate one.
+        argv = self._argv(monkeypatch, "kitty")
+        assert argv[argv.index("--title") + 1] == "magent:api"
+
+
 # --- find_window mode contract (LS-B-005) -----------------------------------
 # mode is a Literal["exact", "contains"]; a typo'd mode must fail loudly
 # instead of silently reporting "not found".

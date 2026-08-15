@@ -169,6 +169,29 @@ class MacOSPlatform(Platform):
         subprocess.run(["osascript", "-e", script], timeout=10, check=False)
 
     def launch_terminal(self, opts: TerminalLaunchOpts) -> None:
+        """Open one project window, titled with magent's grammar.
+
+        Title ownership (the same concern as the Windows
+        ``--suppressApplicationTitle`` flag and the Linux backend's per-emulator
+        locks): every branch below already uses the stickiest channel the app
+        offers, and none of the three can be made airtight from the outside.
+
+        * kitty -- ``--title`` permanently fixes the OS window title (documented
+          kitty behavior). This one IS a lock.
+        * iTerm -- ``set name of session`` is the explicit session name, which
+          iTerm prefers over the app-supplied title; but the displayed title is
+          composed from the profile's Title Components, so a profile that
+          includes the app title can still show one. HONEST GAP, no per-launch
+          lever.
+        * Terminal.app -- ``custom title`` is the sticky channel (an app OSC
+          title cannot clear it), but the profile's Window settings decide
+          whether the process name is appended alongside it. HONEST GAP for the
+          exact-string match tiling wants.
+
+        macOS also has no attention backend (``supports_attention_signals()`` is
+        False), so unlike Windows there is no reassertion pass to repair a
+        stomped title. Tracked in DESIGN.md's known-debt ledger.
+        """
         if opts.ssh_host:
             remote_dir = opts.ssh_remote_dir or opts.cwd
             inner = f"cd {remote_dir} && {opts.command}"

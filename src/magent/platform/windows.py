@@ -383,6 +383,15 @@ class WindowsPlatform(Platform):
             "wt",
             "-w",
             "new",
+            # The title lock, in the argv literal rather than appended later:
+            # magent's window title is what tiling, attach's already-open
+            # dedupe, corpse pairing and the Alt+V hotkey resolve a window BY,
+            # and without this flag the program in the tab (Claude Code, the
+            # shell, ssh) renames it out of the grammar with one OSC escape and
+            # every one of those consumers loses the window for good. Keeping it
+            # inseparable from the `wt` token is what lets the MD006 lint rule
+            # prove no spawn site can ever ship without it.
+            "--suppressApplicationTitle",
             "-d",
             opts.cwd,
             "--title",
@@ -390,7 +399,6 @@ class WindowsPlatform(Platform):
         ]
         if opts.color:
             args.extend(["--tabColor", opts.color])
-        args.append("--suppressApplicationTitle")
 
         if opts.ssh_host:
             remote_dir = opts.ssh_remote_dir or opts.cwd
@@ -656,12 +664,15 @@ class WindowsPlatform(Platform):
             "wt",
             "-w",
             "new",
+            # In the literal, not appended: see launch_terminal. This pane is
+            # the one that matters most -- a psmux attach hosts an agent for
+            # days and re-renders its title constantly.
+            "--suppressApplicationTitle",
             "--title",
             title,
         ]
         if color:
             args.extend(["--tabColor", color])
-        args.append("--suppressApplicationTitle")
         args.extend(["--", psmux, "-L", session_name, "attach"])
         # No `env=child_env()` here, deliberately: this is the user-facing
         # ATTACH client, not a creation/control command. Attaching is the one

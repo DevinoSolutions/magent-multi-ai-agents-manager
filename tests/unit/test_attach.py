@@ -2011,6 +2011,23 @@ class TestSpawnWindows:
         assert len(spawns) == 1
         assert sleeps == [0.25]
 
+    def test_the_pane_title_is_locked_against_the_program_inside_it(self, monkeypatch):
+        # A supervised pane is the loudest writer magent has: on every redial
+        # the supervisor prints status lines, ssh prints its own, and the remote
+        # agent emits OSC title escapes for the whole session. The wt title lock
+        # is what keeps `magent:api` on the window through all of it -- and the
+        # corpse scanner depends on exactly that (it pairs windows to processes
+        # BECAUSE the title outlives the process that named it).
+        for reconnect in (True, False):
+            spawns, _sleeps, _titles = self._spawn(
+                monkeypatch, ["api"], [], 0.0, reconnect=reconnect
+            )
+            argv = spawns[0]
+            assert "--suppressApplicationTitle" in argv
+            # ...and before the `--`, or wt would pass it to the pane command.
+            assert argv.index("--suppressApplicationTitle") < argv.index("--")
+            assert argv[argv.index("--title") + 1] == "magent:api"
+
     def test_pane_runs_the_reconnect_supervisor_by_default(self, monkeypatch):
         # The headline change: a pane is no longer a bare ssh that dies with
         # its connection. wt drives the supervisor, the supervisor drives ssh.
