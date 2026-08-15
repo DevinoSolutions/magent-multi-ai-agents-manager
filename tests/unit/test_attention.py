@@ -489,6 +489,82 @@ class TestBadgeCleanup:
         assert fp.titles_set[-1] == (1, "magent:api")
 
 
+class TestBadgeTitleReassertion:
+    """Title ownership: a program inside a window (Claude Code, a shell prompt,
+    ssh) that renames the window out of the magent: grammar takes it out of
+    tiling, attach dedupe, corpse pairing and the Alt+V hotkey — permanently,
+    because every one of those looks the window up BY title. The spawn-side lock
+    is the primary defense; this is the repair for the paths that have none."""
+
+    def _fake(self, windows):
+        from tests.conftest import FakePlatform
+
+        return FakePlatform(windows=windows, supports_attention=True)
+
+    def _stomp(self, fp, old_title, new_title):
+        """Rewrite a window's title behind the renderer's back, keeping its
+        handle — exactly what an OSC title escape does."""
+        fp._windows[new_title] = fp._windows.pop(old_title)
+
+    def test_stomped_title_is_restored_on_the_next_tick(self):
+        fp = self._fake({"magent:api": 1})
+        r = attention.BadgeRenderer(fp)
+        r.render([_view("api", "/a", "working")], [])  # learns handle 1 == api
+        assert fp.titles_set == []
+
+        self._stomp(fp, "magent:api", "✳ Cooking… (esc to interrupt)")
+        r.render([_view("api", "/a", "working")], [])
+
+        assert fp.titles_set == [(1, "magent:api")]
+
+    def test_repair_and_badge_land_in_one_write(self):
+        fp = self._fake({"magent:api": 1})
+        r = attention.BadgeRenderer(fp)
+        r.render([_view("api", "/a", "working")], [])
+
+        self._stomp(fp, "magent:api", "bash")
+        r.render([_view("api", "/a", "needs-input")], [])
+
+        # not "restore, then badge on the tick after" — the badged title is
+        # what a repaired window is worth going to the OS for.
+        assert fp.titles_set == [(1, "magent:[!] api")]
+
+    def test_never_touches_a_window_it_never_saw_as_magents(self):
+        fp = self._fake({"Notepad": 2, "magent:api": 1})
+        r = attention.BadgeRenderer(fp)
+
+        r.render([_view("api", "/a", "needs-input")], [])
+        r.render([_view("api", "/a", "needs-input")], [])
+
+        assert fp.titles_set == [(1, "magent:[!] api")]  # Notepad untouched
+
+    def test_stomped_window_with_no_live_session_is_left_alone(self):
+        # The narrow guard against handle recycling: without a live session for
+        # the remembered name we do NOT stamp a magent: title back on, because a
+        # mislabeled stranger would then be tiled — worse than a lost badge.
+        fp = self._fake({"magent:api": 1})
+        r = attention.BadgeRenderer(fp)
+        r.render([_view("api", "/a", "working")], [])
+
+        self._stomp(fp, "magent:api", "Some Other App")
+        r.render([], [])
+
+        assert fp.titles_set == []
+
+    def test_handle_bookkeeping_is_pruned_when_a_window_closes(self):
+        fp = self._fake({"magent:api": 1})
+        r = attention.BadgeRenderer(fp)
+        r.render([_view("api", "/a", "error")], [])
+        assert r._known == {1: "api"} and r._badged == {1: "api"}
+
+        fp._windows.clear()  # the window is closed
+        r.render([_view("api", "/a", "error")], [])
+
+        # Both maps are bounded by the live window set, so a long-running daemon
+        # cannot accumulate handles and cannot act on a recycled one.
+        assert r._known == {} and r._badged == {}
+
+
 class TestFlashRenderer:
     def _fake(self, windows):
         from tests.conftest import FakePlatform

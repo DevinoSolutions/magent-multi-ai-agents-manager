@@ -27,8 +27,15 @@ MD005  No *module-level* import of a heavy subsystem (``launch``, ``upload_serve
        ``from magent.platform import get_platform`` (the package ``__init__`` is
        light; only the OS backend modules are heavy) and ``if TYPE_CHECKING:`` imports
        (never executed at runtime).
+MD006  Every ``wt`` argv literal must carry ``--suppressApplicationTitle``. The
+       ``magent:`` window title is load-bearing (tiling's ``magent-name`` mode,
+       attach's already-open dedupe, corpse window<->process pairing,
+       ``hotkey.project_from_title``), and without that flag the program inside
+       the tab — Claude Code, a shell prompt, ssh — renames the window out of the
+       grammar with one OSC escape and the window becomes invisible to every one
+       of those consumers.
 
-Scopes: MD001/002/003 apply to ``src/magent/`` only; MD005 to
+Scopes: MD001/002/003/006 apply to ``src/magent/`` only; MD005 to
 ``src/magent/cli/`` only; MD004 applies to ``src`` + ``scripts`` + ``tests``.
 """
 
@@ -98,6 +105,18 @@ HEAVY_CLI_IMPORTS = frozenset(
 )
 
 
+# MD006: the Windows Terminal flag that hands magent sole ownership of a tab's
+# title. Repeated at every wt spawn site rather than centralized, because the
+# argv lists live in two packages that must not import each other's internals
+# (platform/windows.py and cli/attach.py) -- so the invariant is mechanized here
+# instead of by a shared helper.
+WT_TITLE_LOCK_FLAG = "--suppressApplicationTitle"
+
+# MD006: exec name that identifies a Windows Terminal spawn argv, matched on the
+# FIRST element of a list/tuple display (`["wt", "-w", "new", ...]`).
+WT_EXEC_NAMES = ("wt", "wt.exe")
+
+
 class Finding(NamedTuple):
     path: str  # repo-relative, posix
     line: int
@@ -154,6 +173,53 @@ def _starts_title_prefix(node: ast.AST) -> bool:
         if isinstance(first, ast.Constant) and isinstance(first.value, str):
             return _is_title_prefix(first.value)
     return False
+
+
+def _is_wt_argv(node: ast.List | ast.Tuple) -> bool:
+    """True for a list/tuple display whose first element is the ``wt`` exec name.
+
+    Deliberately shallow: only the argv literal written in the source is
+    checked, so the flag has to live in the literal itself rather than be
+    appended to the list afterwards. That is the point, not a limitation -- an
+    ``args.append(...)`` two branches later is exactly the shape that lets a
+    spawn site lose the flag in a refactor and say nothing.
+    """
+    if not node.elts:
+        return False
+    first = node.elts[0]
+    return (
+        isinstance(first, ast.Constant)
+        and isinstance(first.value, str)
+        and first.value.lower() in WT_EXEC_NAMES
+    )
+
+
+def _wt_argv_findings(rel: str, tree: ast.Module) -> list[Finding]:
+    """MD006 — a literal ``wt`` argv missing the title-lock flag."""
+    out: list[Finding] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.List, ast.Tuple)) or not _is_wt_argv(node):
+            continue
+        flags = {
+            e.value
+            for e in node.elts
+            if isinstance(e, ast.Constant) and isinstance(e.value, str)
+        }
+        if WT_TITLE_LOCK_FLAG in flags:
+            continue
+        out.append(
+            Finding(
+                rel,
+                node.lineno,
+                node.col_offset + 1,
+                "MD006",
+                f"`wt` argv without {WT_TITLE_LOCK_FLAG} — the program inside the "
+                "tab would be free to rename the window out of the magent: "
+                "grammar, making it invisible to tiling, attach dedupe, corpse "
+                "detection and the Alt+V hotkey",
+            )
+        )
+    return out
 
 
 def _is_type_checking_guard(test: ast.expr) -> bool:
@@ -238,7 +304,7 @@ def _heavy_import_findings(rel: str, tree: ast.Module) -> list[Finding]:
 
 
 def _ast_rules(rel: str, source: str) -> list[Finding]:
-    """MD001/002/003 (src/magent/) + MD005 (src/magent/cli/)."""
+    """MD001/002/003/006 (src/magent/) + MD005 (src/magent/cli/)."""
     out: list[Finding] = []
     try:
         tree = ast.parse(source, filename=rel)
@@ -305,6 +371,7 @@ def _ast_rules(rel: str, source: str) -> list[Finding]:
                     'string literal starting "magent:" — the window-title prefix is built only from titles.MAGENT_TITLE_PREFIX',
                 )
             )
+    out += _wt_argv_findings(rel, tree)
     if in_cli:
         out += _heavy_import_findings(rel, tree)
     return out
