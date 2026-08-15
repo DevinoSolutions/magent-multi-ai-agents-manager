@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from magent import agent_state, cli
+from magent.cli import status as status_mod
 
 
 def _no_psmux(monkeypatch):
@@ -26,15 +27,24 @@ def _no_psmux(monkeypatch):
 
 
 def _both_off(monkeypatch):
-    """Baseline: upload server unreachable/absent, listener not running."""
+    """Baseline: upload server unreachable/absent, listener off BY DESIGN.
+
+    The listener half is stubbed at ``_listener_state`` on every platform (it
+    takes the upload state as an argument since the serve daemon supervises it).
+    Tests that care about the listener's own state machine drive
+    ``_listener_state`` directly -- see TestListenerStateMachine -- rather than
+    reaching through this baseline.
+    """
     monkeypatch.setattr("magent.cli.status._health_check", lambda port: False)
     monkeypatch.setattr("magent.cli.status._probe_port", lambda port: False)
     monkeypatch.setattr("magent.upload_server.server_pid", lambda port: None)
     monkeypatch.setattr("magent.cli.status.pid_alive", lambda pid: False)
-    if sys.platform == "win32":
-        monkeypatch.setattr("magent.hotkey.listener_pid", lambda: None)
-    else:
-        monkeypatch.setattr("magent.cli.status._listener_state", lambda: "off")
+    monkeypatch.setattr("magent.cli.status._listener_state", lambda upload: "off")
+
+
+def _listener(monkeypatch, state):
+    """Force the rendered listener state, whatever the real machine is doing."""
+    monkeypatch.setattr("magent.cli.status._listener_state", lambda upload: state)
 
 
 def _fake_psmux(monkeypatch, up, projects=None, apps=None, down=()):
@@ -155,26 +165,135 @@ class TestUploadServerLiveness:
         assert "DEAD" in result.output
 
 
-class TestListenerLiveness:
-    def test_heartbeat_not_fresh_with_live_pid_means_stale_exit_3(
-        self, runner, tmp_config, monkeypatch
-    ):
+@pytest.mark.skipif(sys.platform != "win32", reason="hotkey is Windows-only")
+class TestListenerStateMachine:
+    """The listener's four states, driven directly.
+
+    The headline is ``dead``: no listener, on a hotkey-capable platform, while
+    the upload server is SERVING. Before the serve daemon supervised the
+    listener, that exact situation -- observed live, a listener last started 8
+    days and one reboot earlier -- rendered as `off  (starts with `magent
+    attach`)` and exit 0: a benign default hiding a broken Alt+V.
+    """
+
+    def _machine(self, monkeypatch, *, pid, fresh=True, supervised=True):
+        monkeypatch.setattr("magent.hotkey.listener_pid", lambda: pid)
+        monkeypatch.setattr("magent.cli.status.heartbeat_fresh", lambda name: fresh)
+        monkeypatch.setattr(
+            "magent.upload_server.supervision_enabled", lambda: supervised
+        )
+
+    def test_live_pid_and_fresh_heartbeat_is_on(self, monkeypatch):
+        self._machine(monkeypatch, pid=4242, fresh=True)
+        assert status_mod._listener_state("on") == "on"
+
+    def test_live_pid_with_expired_heartbeat_is_stale(self, monkeypatch):
+        self._machine(monkeypatch, pid=4242, fresh=False)
+        assert status_mod._listener_state("on") == "stale"
+
+    def test_no_listener_while_the_server_serves_is_dead(self, monkeypatch):
+        self._machine(monkeypatch, pid=None)
+        assert status_mod._listener_state("on") == "dead"
+
+    def test_no_listener_and_no_server_is_off_not_dead(self, monkeypatch):
+        # Nobody promised a listener: serve is what supervises one.
+        self._machine(monkeypatch, pid=None)
+        assert status_mod._listener_state("off") == "off"
+
+    def test_a_dead_server_does_not_also_report_a_dead_listener(self, monkeypatch):
+        # The upload line already says DEAD; a second red line for the
+        # downstream symptom would be noise, not information.
+        self._machine(monkeypatch, pid=None)
+        assert status_mod._listener_state("dead") == "off"
+
+    def test_no_listener_is_not_dead_when_supervision_is_opted_out(self, monkeypatch):
+        # MAGENT_HOTKEY_SUPERVISOR=0 means the user owns the listener's
+        # lifetime. Reporting DEAD would invent a promise nobody made.
+        self._machine(monkeypatch, pid=None, supervised=False)
+        assert status_mod._listener_state("on") == "off"
+
+    def test_a_wedged_listener_is_still_stale_with_supervision_off(self, monkeypatch):
+        # Who STARTS it has no bearing on whether a running one is healthy.
+        self._machine(monkeypatch, pid=4242, fresh=False, supervised=False)
+        assert status_mod._listener_state("on") == "stale"
+
+
+def test_listener_state_is_off_where_the_platform_has_no_hotkey(
+    monkeypatch, fake_platform
+):
+    # Cross-platform: a machine that cannot run the listener is never "dead"
+    # for not running it, however healthy the upload server is.
+    monkeypatch.setattr("magent.platform.get_platform", lambda: fake_platform)
+    assert status_mod._listener_state("on") == "off"
+
+
+class TestListenerRendering:
+    """What the three states actually put on screen, and what they exit with."""
+
+    def _render(self, runner, tmp_config, monkeypatch, state, *, serving=True):
         _no_psmux(monkeypatch)
         _both_off(monkeypatch)
-        monkeypatch.setattr(
-            "magent.cli.status._health_check", lambda port: True
-        )  # upload healthy
-        if sys.platform == "win32":
-            monkeypatch.setattr("magent.hotkey.listener_pid", lambda: 9999)
-            monkeypatch.setattr("magent.cli.status.heartbeat_fresh", lambda name: False)
-        else:
-            monkeypatch.setattr("magent.cli.status._listener_state", lambda: "stale")
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: serving)
+        _listener(monkeypatch, state)
         cfgpath = tmp_config({"projects": []})
+        return runner.invoke(cli.main, ["--config", cfgpath, "status"])
 
-        result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+    def test_dead_is_red_actionable_and_exit_3(self, runner, tmp_config, monkeypatch):
+        result = self._render(runner, tmp_config, monkeypatch, "dead")
+
+        assert result.exit_code == 3
+        assert "upload server is up but no listener" in result.output
+        assert "Alt+V does nothing" in result.output
+        assert status_mod.LISTENER_REPAIR_HINT in result.output
+
+    def test_stale_is_red_actionable_and_exit_3(self, runner, tmp_config, monkeypatch):
+        result = self._render(runner, tmp_config, monkeypatch, "stale")
 
         assert result.exit_code == 3
         assert "STALE" in result.output
+        assert status_mod.LISTENER_REPAIR_HINT in result.output
+
+    def test_off_names_the_new_owner_and_stays_exit_0(
+        self, runner, tmp_config, monkeypatch
+    ):
+        monkeypatch.setattr("magent.upload_server.supervision_enabled", lambda: True)
+        result = self._render(runner, tmp_config, monkeypatch, "off", serving=False)
+
+        assert result.exit_code == 0
+        # The old hint said "starts with `magent attach`", which stopped being
+        # the whole truth when serve took ownership.
+        assert "starts with the upload server" in result.output
+        assert "`magent attach`" not in result.output
+        assert status_mod.LISTENER_REPAIR_HINT not in result.output
+
+    def test_off_says_so_differently_when_supervision_is_opted_out(
+        self, runner, tmp_config, monkeypatch
+    ):
+        monkeypatch.setattr("magent.upload_server.supervision_enabled", lambda: False)
+        result = self._render(runner, tmp_config, monkeypatch, "off", serving=False)
+
+        assert result.exit_code == 0
+        # "starts with the upload server" would be a lie here.
+        assert "MAGENT_HOTKEY_SUPERVISOR" in result.output
+        assert "starts with the upload server" not in result.output
+
+    def test_on_prints_no_repair_hint(self, runner, tmp_config, monkeypatch):
+        result = self._render(runner, tmp_config, monkeypatch, "on")
+
+        assert result.exit_code == 0
+        assert status_mod.LISTENER_REPAIR_HINT not in result.output
+
+    def test_dead_is_published_in_json(self, runner, tmp_config, monkeypatch):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        _listener(monkeypatch, "dead")
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
+
+        assert result.exit_code == 3
+        assert json.loads(result.stdout)["listener"] == "dead"
 
 
 class TestJson:

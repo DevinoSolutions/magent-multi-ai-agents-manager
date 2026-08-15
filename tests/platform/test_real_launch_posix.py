@@ -91,6 +91,11 @@ def _child_env(home) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
     home_s = str(home)
     env["HOME"] = home_s
+    # The Alt+V listener installs a SYSTEM-WIDE keyboard hook, and a real
+    # `serve` now supervises one into existence. Redirecting HOME does not
+    # contain a global hook, so tests that start a real server opt out
+    # rather than install one on the machine running them.
+    env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
     # Point XDG dirs into the sandbox home too, so a stray ~/.config write can't
     # escape into the real user's dotfiles.
     env["XDG_CONFIG_HOME"] = str(home / ".config")

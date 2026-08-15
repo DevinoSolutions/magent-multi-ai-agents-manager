@@ -150,6 +150,60 @@ def start_hotkey_listener(server_url: str, ssh_host: str | None = None) -> int |
     return None
 
 
+def supervised_hotkey_target(
+    manifest: dict[str, str | None] | None, default_url: str
+) -> tuple[str, str | None]:
+    """The ``(server_url, ssh_host)`` a SUPERVISED restart must use.
+
+    Pure so it is testable off Windows, like ``hotkey_restart_reason``.
+
+    The distinction this encodes is the whole reason ``ensure_hotkey_listener``
+    exists as a separate entry point. The launch and attach paths KNOW which
+    target the listener should serve and deliberately re-aim it when that
+    changes -- that is what ``hotkey_restart_reason``'s "target change" branches
+    are for. A supervisor knows no such thing: ``magent attach`` aims the
+    listener at a REMOTE host so F2 opens projects over VS Code Remote-SSH, and
+    a supervisor that re-aimed it at its own loopback URL every interval would
+    fight attach forever, silently breaking F2 on every remote fleet. So a
+    listener that is already running keeps whatever target it was wired to; the
+    supervisor's default is only ever used for a listener that is not there.
+
+    A missing/unreadable manifest yields the default: that listener is getting
+    restarted anyway ("no manifest" is a restart reason), and the default is
+    the only target we can honestly claim to know.
+    """
+    if manifest is None:
+        return default_url, None
+    return manifest.get("server_url") or default_url, manifest.get("ssh_host")
+
+
+def ensure_hotkey_listener(default_url: str) -> int | None:
+    """Make sure SOME Alt+V listener is running; never re-aim a healthy one.
+
+    The supervision entry point (``upload_server``'s serve loop calls this on an
+    interval), as opposed to ``start_hotkey_listener``, which is the *wiring*
+    entry point the launch and attach paths use. See
+    ``supervised_hotkey_target`` for why the two must differ.
+
+    Idempotent by construction -- it delegates to ``start_hotkey_listener``, so
+    a healthy current listener is a pid-file read plus a manifest read and no
+    spawn, and the "never two listeners" property is exactly the one that
+    function already had.
+
+    Windows-only, like everything hotkey: the caller owns the
+    ``supports_hotkey()`` gate that keeps the import below reachable.
+    """
+    from magent.hotkey import (  # ImportError off-Windows (hotkey.py guards); must stay lazy
+        listener_manifest,
+        listener_pid,
+    )
+
+    if listener_pid() is None:
+        return start_hotkey_listener(default_url, None)
+    url, ssh_host = supervised_hotkey_target(listener_manifest(), default_url)
+    return start_hotkey_listener(url, ssh_host)
+
+
 @dataclass
 class RunOpts:
     retile_all: bool = False

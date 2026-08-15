@@ -53,6 +53,18 @@ class MagentEnv(BaseSettings):
     sentry_dsn: HttpUrl | None = None
     ntfy_topic: HttpUrl | None = None
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] | None = None
+    # Whether `magent serve` keeps the Alt+V listener alive (see
+    # upload_server._supervise_hotkey). On by default -- a serve daemon with no
+    # listener means Alt+V silently does nothing, which is the failure this
+    # supervision exists to end.
+    #
+    # The opt-out is not decoration. The listener installs a SYSTEM-WIDE
+    # low-level keyboard hook, so any test that starts a real `magent serve` on
+    # Windows would otherwise install one on the developer's own desktop -- the
+    # e2e/soak/dist serve fixtures set this to 0 for exactly that reason (the
+    # same posture as the opt-in `MDTEST_INTERACTION` tier). It doubles as the
+    # escape hatch for a user who wants to own the listener's lifetime.
+    hotkey_supervisor: bool = True
 
     @model_validator(mode="after")
     def _no_unknown_magent_vars(self) -> MagentEnv:

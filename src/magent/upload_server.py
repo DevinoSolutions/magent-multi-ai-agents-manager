@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 from magent import psmux, tailnet
 from magent.icons import render_icon
+from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import get_logger
 from magent.sessions import FLASH_MSG_MAX
 
@@ -1120,6 +1121,109 @@ def _bind_addresses(host: str | None) -> list[str]:
     return addrs
 
 
+# --- Alt+V listener supervision ----------------------------------------------
+# The listener used to be a ONE-SHOT spawn: whichever `magent --go` or `magent
+# attach` ran last started it, and after that nothing ever looked again. A
+# reboot, a crash, or a pip upgrade left Alt+V silently dead until the user
+# happened to run attach again -- observed live: a listener last started 8 days
+# and one reboot earlier, with the upload server still running and `status`
+# reporting the whole thing as a benign default.
+#
+# serve is the right owner. It is the long-lived process the Alt+V chain already
+# posts into, so "serve is up" and "Alt+V works" become one fact rather than two
+# independent ones. The listener is deliberately NOT killed when serve stops:
+# `down --all` already stops both (server first, listener second, so this
+# supervisor is gone before the listener is), and a user restarting serve should
+# not lose their hotkey in between.
+HOTKEY_SUPERVISE_INTERVAL_S = 30.0
+
+
+def local_url(bound_addrs: list[str], port: int) -> str:
+    """The URL a process on THIS machine should use to reach this server.
+
+    Loopback whenever it is reachable -- including under an explicit
+    `--host 0.0.0.0`, which binds it -- so the listener never depends on
+    Tailscale being up. Only a bind that deliberately excluded loopback
+    (`serve --host <tailscale-ip>`) falls back to the address actually bound.
+    """
+    if "127.0.0.1" in bound_addrs or "0.0.0.0" in bound_addrs:
+        return f"http://127.0.0.1:{port}"
+    return f"http://{bound_addrs[0]}:{port}"
+
+
+def supervision_enabled() -> bool:
+    """Whether MAGENT_HOTKEY_SUPERVISOR permits serve to own the listener.
+
+    Public because ``status``/``doctor`` must ask the same question the
+    supervisor answers: a running server only implies a running listener if
+    serve was actually allowed to supervise one. Reporting a DEAD listener to
+    somebody who turned supervision off would be inventing a promise nobody
+    made.
+
+    A daemon must never die of a bad environment variable it does not use, and
+    every other MAGENT_* consumer has already failed loudly at CLI entry by the
+    time serve is running -- so an env that has gone bad underneath a detached
+    process degrades to the default (supervise) with a log line, exactly as
+    ``log._configured_level`` does for MAGENT_LOG_LEVEL.
+    """
+    from pydantic import ValidationError
+
+    from magent.env import get_env
+
+    try:
+        return get_env().hotkey_supervisor
+    except ValidationError:
+        get_logger("hotkey").warning(
+            "supervisor: environment did not validate; supervising anyway"
+        )
+        return True
+
+
+def _supervise_hotkey(
+    server_url: str,
+    stop_event: threading.Event,
+    interval: float = HOTKEY_SUPERVISE_INTERVAL_S,
+) -> None:
+    """Keep an Alt+V listener alive for as long as this server runs.
+
+    Runs on a daemon thread off ``run_server``. Every failure mode is a log line
+    and another try next interval -- supervision must never be able to take down
+    the server it rides on, which is the thing actually serving uploads.
+
+    The lock is what stops two serve daemons (different ports, same machine)
+    from racing each other into two listeners; it is deliberately NOT taken by
+    the launch/attach spawn paths, so an interactive `magent attach` re-aiming
+    the listener can never be blocked by a background supervisor.
+    """
+    from magent.platform import get_platform  # in-body: the OS backends are heavy
+
+    if not get_platform().supports_hotkey():
+        return
+    log = get_logger("hotkey")
+    if not supervision_enabled():
+        log.info("supervisor: disabled by MAGENT_HOTKEY_SUPERVISOR")
+        return
+    # heavy subsystem: in-body per policy. launch owns the spawn recipe; this
+    # module must not import the cli package (LS-A-001).
+    from magent.launch import ensure_hotkey_listener
+
+    while True:
+        try:
+            with exclusive_lock("hotkey-supervisor"):
+                if ensure_hotkey_listener(server_url) is None:
+                    log.warning(
+                        "supervisor: no Alt+V listener came up for %s; retrying in %ss",
+                        server_url,
+                        interval,
+                    )
+        except LockHeld:
+            log.debug("supervisor: another server is supervising the listener")
+        except Exception:
+            log.exception("supervisor: Alt+V listener check failed")
+        if stop_event.wait(interval):
+            return
+
+
 def run_server(
     port: int = 8080, config_path: str | None = None, host: str | None = None
 ) -> None:
@@ -1150,9 +1254,21 @@ def run_server(
 
     for s in servers[1:]:
         threading.Thread(target=s.serve_forever, daemon=True).start()
+
+    # Alt+V is only as alive as its listener, and nothing else in the product
+    # ever re-checks it. Daemon thread: it must not hold the process open, and
+    # a serve that is going down has nothing left to supervise anyway.
+    hotkey_stop = threading.Event()
+    threading.Thread(
+        target=_supervise_hotkey,
+        args=(local_url(bound_addrs, port), hotkey_stop),
+        daemon=True,
+    ).start()
+
     try:
         servers[0].serve_forever()
     finally:
+        hotkey_stop.set()
         for s in servers[1:]:
             s.shutdown()  # called from a different thread than its serve_forever -> safe
         for s in servers:

@@ -20,11 +20,14 @@ def _write_cfg(tmp_path, projects, settings=None):
 
 
 def _run(cfg, *args, home=None):
-    env = None
+    env = dict(os.environ)
+    # `up` can start a detached upload server, which supervises an Alt+V
+    # listener into existence -- and that listener installs a SYSTEM-WIDE
+    # keyboard hook, which no HOME redirect can contain.
+    env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
     if home is not None:
         # Redirect the child's HOME so the claude session store it probes is a
         # fixture, never the developer's real ~/.claude.
-        env = dict(os.environ)
         env["HOME"] = str(home)
         env["USERPROFILE"] = str(home)  # what Path.home() reads on Windows
     return subprocess.run(

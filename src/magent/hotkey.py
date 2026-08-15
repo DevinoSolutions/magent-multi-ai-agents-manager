@@ -31,7 +31,12 @@ from urllib.error import URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-from magent.log import HEARTBEAT_INTERVAL, get_logger, write_heartbeat
+from magent.log import (
+    HEARTBEAT_INTERVAL,
+    clear_heartbeat,
+    get_logger,
+    write_heartbeat,
+)
 from magent.procs import pid_alive
 from magent.sessions import (
     build_code_open_command,
@@ -373,6 +378,10 @@ def stop_listener() -> bool:
     with contextlib.suppress(OSError):
         _PID_PATH.unlink()
     _clear_manifest()
+    # taskkill /F gives the listener no chance to run run_hotkey's finally, so
+    # its heartbeat file would otherwise outlive it and read as a listener that
+    # crashed rather than one that was deliberately stopped.
+    clear_heartbeat("hotkey")
     return True
 
 
@@ -446,20 +455,83 @@ def _clear_manifest() -> None:
         _MANIFEST_PATH.unlink()
 
 
+# Every Alt+V press ends in exactly one line carrying this prefix, so the whole
+# history of the chord is one grep:
+#
+#     grep ALTV ~/.magent/logs/hotkey.log
+#
+# The listener runs hidden with no terminal of its own, so without a record like
+# this a press that goes nowhere is indistinguishable from a press that was
+# never delivered -- which is precisely the "we don't know when it doesn't work"
+# problem. Outcomes are a closed vocabulary (ALTV_OUTCOMES) so the log stays
+# greppable per-outcome, not just per-prefix.
+ALTV_LOG_PREFIX = "ALTV"
+
+ALTV_OUTCOMES = (
+    "ok",  # image uploaded and injected
+    "not-a-magent-window",  # pass-through: the chord was not ours to handle
+    "no-image",  # magent window focused, but the clipboard holds no image
+    "clipboard-unreadable",  # CF_DIB said yes, the read came back empty
+    "upload-rejected",  # the server answered, and said no
+    "error",  # anything unforeseen, with a traceback in the log
+)
+
+
+def _altv_report(
+    server_url: str, project: str, outcome: str, message: str | None = None
+) -> None:
+    """Record one Alt+V outcome, and show the failing ones to the user.
+
+    ``message`` (a failure) goes to the magent:<project> status line through the
+    same flash channel F2 already uses -- no new notification subsystem, and no
+    dependence on the listener having a console. The log line is written either
+    way and is the durable record; the flash is best-effort by construction
+    (``_flash_status`` swallows everything) because feedback must never be able
+    to break the action it reports on.
+    """
+    log = get_logger("hotkey")
+    if message is None:
+        log.info("%s outcome=%s project=%s", ALTV_LOG_PREFIX, outcome, project)
+        return
+    log.warning(
+        "%s outcome=%s project=%s: %s", ALTV_LOG_PREFIX, outcome, project, message
+    )
+    _flash_status(server_url, project, f"Alt+V: {message}")
+
+
 def _do_upload(server_url: str, project: str) -> None:
     """Run upload in a thread so the hook callback returns quickly.
 
-    No feedback is printed here: progress shows in the magent:<project> window's own
-    status line, driven by the upload server (see upload_server._flash).
+    Progress on the happy path shows in the magent:<project> window's own status
+    line, driven by the upload server (see upload_server._flash). Every FAILURE
+    path reports itself through ``_altv_report``: a press that silently does
+    nothing is the worst outcome available here, because the user cannot tell it
+    from a listener that is not running at all.
     """
-    log = get_logger("hotkey")
     try:
         image_data = get_clipboard_image()
-        if image_data:
-            ok = upload_image(server_url, project, image_data)
-            log.info("upload project=%s ok=%s", project, ok)
-    except Exception:
-        log.exception("upload project=%s failed", project)
+        if not image_data:
+            # clipboard_has_image() said yes at the hook, so this is a real
+            # read failure (a format we cannot decode, or a race with another
+            # app taking the clipboard), not an empty clipboard.
+            _altv_report(
+                server_url, project, "clipboard-unreadable", "could not read the image"
+            )
+            return
+        if upload_image(server_url, project, image_data):
+            _altv_report(server_url, project, "ok")
+        else:
+            _altv_report(
+                server_url,
+                project,
+                "upload-rejected",
+                "upload failed - is `magent serve` running?",
+            )
+    except Exception:  # noqa: BLE001  # reason: this runs on a detached background thread with no console; anything that escapes here would vanish, so everything is logged and shown instead
+        get_logger("hotkey").exception(
+            "%s outcome=error project=%s", ALTV_LOG_PREFIX, project
+        )
+        _flash_status(server_url, project, "Alt+V: upload error - see hotkey.log")
 
 
 def _flash_status(server_url: str, project: str, message: str) -> None:
@@ -690,9 +762,33 @@ def _hook_decide(
         project = project_from_title(title)
 
         if project is None:
+            # A pass-through, not a failure: Alt+V outside a magent: window is
+            # the other app's chord. Recorded at DEBUG (with the title, which is
+            # the whole diagnosis when a user swears they WERE focused on one)
+            # -- at INFO this would log every Alt+V the user ever presses.
+            get_logger("hotkey").debug(
+                "%s outcome=not-a-magent-window title=%r",
+                ALTV_LOG_PREFIX,
+                title,
+            )
             return int(user32.CallNextHookEx(None, nCode, wParam, lParam))
 
         if not clipboard_has_image():
+            # Pass the chord through (the pane may want a plain Alt+V), but say
+            # why nothing was uploaded. Pressing it in the right window and
+            # getting silence is the exact complaint this exists to answer.
+            # Threaded because the report does a socket round-trip and this is
+            # a system-wide keyboard hook.
+            threading.Thread(
+                target=_altv_report,
+                args=(
+                    server_url,
+                    project,
+                    "no-image",
+                    "clipboard has no image - copy one first",
+                ),
+                daemon=True,
+            ).start()
             return int(user32.CallNextHookEx(None, nCode, wParam, lParam))
 
         threading.Thread(
