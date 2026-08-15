@@ -26,7 +26,8 @@ Product-visible effects asserted:
    32bpp BI_RGB DIB (file header + alpha bytes forced opaque);
 2. the uploaded file's path is INJECTED into the live psmux session
    (``send_keys``), observed via a real ``capture-pane``;
-3. the listener's own log records ``ok=True`` for the project.
+3. the listener's own log records ``ALTV outcome=ok project=<name>`` -- the
+   greppable per-press outcome line every Alt+V now ends in.
 
 Gating (never on a dev machine): SendInput fires GLOBAL keystrokes and the
 test stomps the machine clipboard, so this runs only under
@@ -606,9 +607,11 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
             f"{_capture_pane(name)}"
         )
 
-        # 7c. The listener's own log recorded the success.
+        # 7c. The listener's own log recorded the success -- in the ALTV
+        #     outcome grammar every press now uses, so `grep ALTV` is the whole
+        #     history of the chord (hotkey.ALTV_LOG_PREFIX / ALTV_OUTCOMES).
         assert _wait_until(
-            lambda: f"upload project={name} ok=True" in _read_log(home, "hotkey"),
+            lambda: f"ALTV outcome=ok project={name}" in _read_log(home, "hotkey"),
             timeout=10,
         ), f"hotkey log missing success line:\n{_read_log(home, 'hotkey')}"
     finally:
