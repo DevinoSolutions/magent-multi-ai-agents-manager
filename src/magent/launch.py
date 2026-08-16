@@ -30,7 +30,7 @@ from magent.sessions import (
     is_ide_tool,
 )
 from magent.style import style
-from magent.tiling import Placement, place_windows
+from magent.tiling import Placement, magent_window_names, place_windows
 from magent.titles import generate_titles, get_leaf_name, make_title, parse_title
 
 if TYPE_CHECKING:
@@ -211,9 +211,10 @@ class RunOpts:
     group: str | None = None
     config_path: str = ""
     # Tile what is already open and launch nothing: the dispatchers still build
-    # the full target list (so retile_all can place every open window) but skip
-    # every spawn -- no IDE, no terminal, no psmux collection. A window the user
-    # closed must stay closed; it simply reports "not found" during tiling.
+    # the full target list but skip every spawn -- no IDE, no terminal, no
+    # psmux collection. A window the user closed must stay closed, and under
+    # `retile_all` it is dropped from the tiling set entirely (see
+    # `_retile_targets`) rather than waited on and reported "not found".
     tile_only: bool = False
 
 
@@ -301,7 +302,10 @@ def run_magent(config: MagentConfig, opts: RunOpts) -> int:
 
     _start_psmux_and_upload(plat, config, opts, result)
 
-    _tile_targets(plat, opts, slots, result.targets)
+    targets = (
+        _retile_targets(config, opts, result) if opts.retile_all else result.targets
+    )
+    _tile_targets(plat, opts, slots, targets)
 
     return 0
 
@@ -361,6 +365,62 @@ class _LaunchResult:
     targets: list[_Target]
     psmux_windows: list[PsmuxWindowOpts]
     psmux_colors: dict[str, str | None]
+    # Window titles as the launch phase saw them -- the same snapshot its
+    # already-running probe used. `_retile_targets` reads it to find
+    # magent-owned windows that no configured project accounts for.
+    open_titles: tuple[str, ...] = ()
+
+
+def _discovered_targets(
+    open_titles: tuple[str, ...], targets: list[_Target], prefix: bool
+) -> list[_Target]:
+    """magent-owned windows on screen that no configured project accounts for.
+
+    These are `magent attach` panes: real magent windows whose names are the
+    REMOTE host's session names, so they never appear in this machine's config
+    and were invisible to `--retile-all` until now. They are never `is_new`
+    (they are open by definition and nothing here launches them), so a plain
+    `--go` still ignores them -- only a retile picks them up.
+
+    Discovery is only possible with ``settings.windowTitlePrefix`` ON. With it
+    off, magent's own titles are bare project names (``titles.make_title``
+    with ``prefix=False``), indistinguishable from any other application's
+    window, so there is nothing to key on and this returns nothing rather than
+    guess.
+    """
+    if not prefix:
+        return []
+    known = {t.key for t in targets if t.mode == "magent-name"}
+    return [
+        _Target(name=name, key=name, mode="magent-name", is_new=False)
+        for name in magent_window_names(open_titles)
+        if name not in known
+    ]
+
+
+def _retile_targets(
+    config: MagentConfig, opts: RunOpts, result: _LaunchResult
+) -> list[_Target]:
+    """The window set a `--retile-all` places: only what is on screen.
+
+    Configured targets come first (config order), then the discovered extras
+    in snapshot order, so slot assignment is deterministic. Under
+    ``tile_only`` -- a retile that launches nothing -- a configured window
+    that is not open right now is dropped: it can never appear, so enqueueing
+    it would only buy `place_windows` a poll deadline and the user a red "not
+    found" line. ``--go --retile-all`` keeps every configured target (the
+    launch phase is bringing the missing ones up) and still gains the extras,
+    which is the "then tile everything" half of its documented meaning.
+    """
+    base = (
+        [t for t in result.targets if not t.is_new]
+        if opts.tile_only
+        else result.targets
+    )
+    extras = _discovered_targets(
+        result.open_titles, result.targets, config.settings.window_title_prefix
+    )
+    return [*base, *extras]
 
 
 def _launch_projects(
@@ -433,7 +493,10 @@ def _launch_projects(
         )
 
     return _LaunchResult(
-        targets=targets, psmux_windows=psmux_windows, psmux_colors=_psmux_colors
+        targets=targets,
+        psmux_windows=psmux_windows,
+        psmux_colors=_psmux_colors,
+        open_titles=tuple(win_snapshot),
     )
 
 
@@ -719,11 +782,22 @@ def _tile_targets(
 ) -> None:
     """Place (or, under dry_run, preview) each target into a slot. Delegates
     the resolve-and-move-with-retry logic to magent.tiling.place_windows
-    (R13/E9's shared helper) -- no lookup/retry loop is re-implemented here."""
+    (R13/E9's shared helper) -- no lookup/retry loop is re-implemented here.
+
+    Under ``retile_all`` the caller has already narrowed `targets` to the
+    windows that are actually on screen (`_retile_targets`), so everything
+    here gets placed."""
     to_place = targets if opts.retile_all else [t for t in targets if t.is_new]
 
     if not to_place:
-        click.echo(f"\n  {style('+', fg='green')} All windows already positioned.")
+        # A retile with an empty set means nothing is open -- saying "already
+        # positioned" would claim windows exist that don't.
+        note = (
+            "No open magent windows to tile."
+            if opts.retile_all
+            else "All windows already positioned."
+        )
+        click.echo(f"\n  {style('+', fg='green')} {note}")
         return
 
     mode_label = (

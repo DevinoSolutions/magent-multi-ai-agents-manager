@@ -22,7 +22,7 @@ from magent.log import get_logger
 from magent.titles import parse_title
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
 
     from magent.platform import Platform
 
@@ -83,6 +83,29 @@ def window_open(snap: dict[str, object], key: str, mode: str = "magent-name") ->
     later find it.
     """
     return find_in_snapshot(snap, key, mode) is not None
+
+
+def magent_window_names(titles: Iterable[str]) -> list[str]:
+    """Parsed names of every on-screen window under the ``magent:`` grammar,
+    in snapshot order, de-duplicated.
+
+    The discovery counterpart to ``find_in_snapshot``: that one answers "where
+    is the window for this name", this one answers "which magent windows are
+    on screen at all". It is the only way a magent-owned window that no local
+    config accounts for -- a ``magent attach`` pane, whose name is the REMOTE
+    host's session name -- can be found and tiled. Goes through
+    ``titles.parse_title`` like every other consumer, so a state badge in the
+    title never hides a window.
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    for title in titles:
+        parsed = parse_title(title)
+        if parsed is None or parsed[0] in seen:
+            continue
+        seen.add(parsed[0])
+        names.append(parsed[0])
+    return names
 
 
 def place_windows(

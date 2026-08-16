@@ -241,6 +241,139 @@ class TestTileTargets:
         assert "not found" in capsys.readouterr().out
 
 
+class TestRetileVisibleWindows:
+    """`--retile-all` (and menu option 2) tiles what is ON SCREEN right now.
+
+    Two bugs this pins shut: a `magent attach` pane -- a real magent-owned
+    window whose name is the REMOTE host's session name, so it is in no local
+    project -- used never to be tiled at all; and a configured window the user
+    had CLOSED was still enqueued, buying a poll deadline and a red "not
+    found" line for a window that (nothing launches under a retile) could
+    never appear.
+    """
+
+    def _cfg(self, tmp_path, *, prefix: bool = True, psmux: bool = False):
+        return MagentConfig(
+            projects=[ProjectConfig(path=str(tmp_path), tool="claude", title="proj")],
+            settings=Settings(
+                tools={"claude": "claude --continue"},
+                default_tool="claude",
+                psmux=psmux,
+                window_title_prefix=prefix,
+            ),
+        )
+
+    def _retile(self, monkeypatch, fp, cfg, **over):
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+        opts = RunOpts(retile_all=True, tile_only=True, **over)
+        return run_magent(cfg, opts)
+
+    def test_attach_window_absent_from_config_is_tiled(
+        self, monkeypatch, tmp_path, fake_sleep
+    ):
+        # "remote-host-api" is an attach pane: magent:-grammar title, no
+        # matching project. Badged, to prove discovery goes through parse_title.
+        fp = FakePlatform(
+            windows={"magent:proj": 111, "magent:[!] remote-host-api": 222}
+        )
+
+        rc = self._retile(monkeypatch, fp, self._cfg(tmp_path))
+
+        assert rc == 0
+        assert sorted(h for h, _ in fp.moved) == [111, 222]
+
+    def test_configured_but_closed_window_is_not_enqueued(
+        self, monkeypatch, tmp_path, fake_sleep, capsys
+    ):
+        fp = FakePlatform(windows={})
+
+        rc = self._retile(monkeypatch, fp, self._cfg(tmp_path))
+
+        assert rc == 0
+        assert fp.moved == []
+        out = capsys.readouterr().out
+        assert "not found" not in out
+        # No placement enqueued => place_windows never polls its deadline.
+        assert fake_sleep == []
+
+    def test_retile_launches_nothing(self, monkeypatch, tmp_path, fake_sleep):
+        # The hard requirement: a retile may move windows and nothing else,
+        # even with psmux configured and every configured window closed.
+        fp = FakePlatform(
+            supports_psmux=True, windows={"magent:[+] remote-host-api": 222}
+        )
+
+        rc = self._retile(monkeypatch, fp, self._cfg(tmp_path, psmux=True))
+
+        assert rc == 0
+        assert fp.launched_terminals == []
+        assert fp.launched_vscode == []
+        assert fp.launched_psmux == []
+        assert fp.attached_psmux == []
+        assert [h for h, _ in fp.moved] == [222]
+
+    def test_go_retile_all_still_launches_missing(
+        self, monkeypatch, tmp_path, fake_sleep
+    ):
+        # --go --retile-all keeps its combined meaning: launch what is missing,
+        # then tile everything -- including the attach pane.
+        fp = FakePlatform(windows={"magent:[!] remote-host-api": 222})
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+
+        rc = run_magent(self._cfg(tmp_path), RunOpts(retile_all=True, tile_only=False))
+
+        assert rc == 0
+        assert [t.title for t in fp.launched_terminals] == ["magent:proj"]
+        assert 222 in [h for h, _ in fp.moved]
+
+    def test_config_order_first_then_snapshot_order(
+        self, monkeypatch, tmp_path, fake_sleep
+    ):
+        # Deterministic slot assignment: configured targets keep config order,
+        # discovered windows follow in snapshot order.
+        fp = FakePlatform(
+            monitors=[
+                MonitorRect(x=0, y=0, w=1920, h=1080, is_primary=True, scale_factor=1.0)
+            ],
+            windows={"magent:extra-b": 2, "magent:proj": 1, "magent:extra-a": 3},
+        )
+        cfg = self._cfg(tmp_path)
+        cfg.layout.columns, cfg.layout.rows = 3, 1
+
+        rc = self._retile(monkeypatch, fp, cfg)
+
+        assert rc == 0
+        assert [h for h, _ in fp.moved] == [1, 2, 3]
+
+    def test_prefix_off_discovers_nothing(self, monkeypatch, tmp_path, fake_sleep):
+        # windowTitlePrefix off => titles are bare project names, so an
+        # on-screen window cannot be told apart from any other app's. Only the
+        # configured (exact-title) windows are tiled; nothing is guessed.
+        fp = FakePlatform(windows={"proj": 111, "magent:remote-host-api": 222})
+
+        rc = self._retile(monkeypatch, fp, self._cfg(tmp_path, prefix=False))
+
+        assert rc == 0
+        assert [h for h, _ in fp.moved] == [111]
+
+    def test_dry_run_preview_matches_the_corrected_set(
+        self, monkeypatch, tmp_path, fake_sleep, capsys
+    ):
+        fp = FakePlatform(windows={"magent:[x] remote-host-api": 222})
+
+        rc = self._retile(monkeypatch, fp, self._cfg(tmp_path), dry_run=True)
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Tiling 1 window(s)" in out
+        # Only the tiling preview is in scope here; the per-project launch log
+        # above it still lists every configured project.
+        preview = out.split("Tiling", 1)[1]
+        assert "remote-host-api" in preview
+        assert "proj" not in preview  # closed, so not previewed either
+        assert fp.moved == []
+
+
 class TestStartPsmuxAndUpload:
     """Direct unit tests for the extracted psmux+upload-server phase (R4,
     Step 3; renamed from the plan's _bring_up_psmux -- launch.py already has
