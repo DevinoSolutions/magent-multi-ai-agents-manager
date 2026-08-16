@@ -5,6 +5,58 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.12.0] - 2026-08-16
+
+### Added
+
+- **`magent serve` now owns the Alt+V listener -- and magent says when
+  Alt+V is broken.** The hotkey listener used to be spawned once by whatever
+  launched it and then forgotten: a reboot, a crash, or an upgrade left
+  Alt+V silently dead, with `magent status` showing a healthy system. The
+  upload server now supervises the listener -- it starts one if none is
+  running, re-checks every 30 seconds, and restarts it if it dies -- so "the
+  upload server is up" and "Alt+V works" are the same fact. A live listener
+  aimed at a remote host by `magent attach` is left exactly as aimed; the
+  supervisor only ever fills an empty slot. `MAGENT_HOTKEY_SUPERVISOR=0`
+  opts out.
+
+  The health is now visible instead of guessed: `magent status` reports the
+  listener three-state -- `ON`, a red `DEAD (upload server is up but no
+  listener -- Alt+V does nothing)` that also sets exit code 3 and prints the
+  repair command, or an honest `off (starts with the upload server)`.
+  `magent doctor` gained a matching `hotkey` check. Every Alt+V press now
+  writes one `ALTV outcome=<x> project=<y>` line to
+  `~/.magent/logs/hotkey.log`, and every failure (no image on the clipboard,
+  clipboard unreadable, upload rejected, unexpected error) flashes a
+  plain-words explanation into the project's psmux status line -- a press
+  that does nothing now always says why.
+
+### Fixed
+
+- **Window titles stay magent's, even when the app inside rewrites them.**
+  A terminal tab renamed by the agent running in it (or by the shell)
+  dropped out of the `magent:` title grammar -- removing that window from
+  tiling, attach dedupe, corpse pairing, and the Alt+V project lookup all at
+  once. The attention daemon now remembers magent windows *by OS handle* and
+  repairs a stomped title on its next tick, and a new lint rule (MD006)
+  makes it impossible to add a Windows Terminal spawn that forgets
+  `--suppressApplicationTitle`. Linux terminals that support locking the
+  title get the equivalent flag at spawn time (alacritty, xterm; kitty's is
+  already permanent).
+
+- **Re-tile now tiles what is actually on screen -- attach panes included.**
+  `magent --retile-all` (and menu option 2) built its window list from the
+  local config's projects, so the windows `magent attach` opens -- whose
+  names are the *remote* host's session names, present in no local config --
+  were never re-tiled, while configured projects whose windows were closed
+  were enqueued anyway and sat through a retry deadline before a red "not
+  found". Retile now snapshots the screen and tiles exactly the magent-owned
+  windows that are open right now: configured windows first (in config
+  order), then every other window carrying a `magent:` title, badge-proof
+  and deduped by name. Closed windows are skipped outright, and nothing is
+  ever spawned. `magent --go --retile-all` keeps its combined meaning --
+  launch whatever is missing, then tile everything, attach panes included.
+
 ## [3.11.1] - 2026-08-14
 
 ### Fixed
@@ -765,6 +817,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.12.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.11.1...v3.12.0
 [3.11.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.11.0...v3.11.1
 [3.11.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.10...v3.11.0
 [3.10.10]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.9...v3.10.10
