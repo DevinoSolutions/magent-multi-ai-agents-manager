@@ -213,7 +213,7 @@ Or skip the menu with flags:
 | --- | --- |
 | `magent` | Interactive menu. |
 | `magent --go` | Launch + tile new windows, no menu. |
-| `magent --retile-all` | Re-tile every matching window. |
+| `magent --retile-all` | Re-tile every magent window that is open right now — including `magent attach` windows, which belong to a remote host's sessions and are in no local project. Launches nothing; a closed window is skipped, not waited on. |
 | `magent -g <name>` | Launch only projects in a group. |
 | `magent --init` | Re-scan sessions and regenerate config. |
 | `magent --init --base-dir <folder>` | Generate config from a folder of git repos. |
