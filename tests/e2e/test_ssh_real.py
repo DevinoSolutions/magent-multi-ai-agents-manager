@@ -32,16 +32,24 @@ These tests use it. No fakes, no dry-run, no monkeypatched transport:
   mdssh \"bash -lc 'cd <dir> && touch <marker> && sleep 300'\""``. The marker
   file appearing proves the full nested-quoting chain executed on the far
   side of a real connection.
+* ``TestSessionsOutliveTheirSshConnection`` (win32) -- the survival contract
+  the whole remote workflow rests on, tested the only way that can see it:
+  create a psmux session through a live ``ssh <host> "magent up"``, then KILL
+  THE CONNECTION while the session is still up, and assert the session (and
+  the work in it) is still there afterwards. The flagship above closes its ssh
+  session gracefully; this one reproduces a wi-fi flap, which is the case that
+  was broken.
 * ``TestReconnectSupervisorOverRealSsh`` (all OSes) -- the reconnect
   supervisor each attach pane runs (``magent-attach-client``) driving a REAL
   ssh client. A dial at an unroutable address produces a real client-side
   exit 255 and the supervisor really redials after the real 2s backoff (the
-  reported bug's exact shape); through the live sshd, a clean remote exit
-  connects exactly once and stays detached, and a FAILING remote command
-  connects exactly once and stops rather than hammering a healthy sshd. That
-  last one also pins a platform finding no other tier can see: Windows
-  OpenSSH does not propagate a remote exit status over a pty (read its
-  docstring before touching the decision table).
+  reported bug's exact shape); through the live sshd, a remote command that
+  ends while the session is NOT on the host is retried and only then given up
+  on (identically on every OS -- that sameness is the fix), and
+  ``--no-reconnect`` still stops on the first exit. The retry leg also pins a
+  platform finding no other tier can see: Windows OpenSSH does not propagate a
+  remote exit status over a pty, which is why exit code alone may never decide
+  a pane's fate (read its docstring before touching the decision table).
 * macOS window legs are a LOUD skip (``::warning``), mirroring the
   tests/platform PR-#47 precedent: Terminal automation is TCC-blocked on
   hosted runners, and the windowless wire coverage above still runs there.
@@ -566,6 +574,120 @@ class TestAttachOverRealSsh:
 
 
 # ---------------------------------------------------------------------------
+# 2b. The session-survival contract: a dead CONNECTION must not be a dead
+#     SESSION. Windows-only, because the job object that used to couple the
+#     two is a Windows OpenSSH construct and POSIX sshd has no equivalent.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason=(
+        "job-object session teardown is Windows OpenSSH behavior; POSIX sshd "
+        "has no equivalent, so there is nothing here for a POSIX leg to prove"
+    ),
+)
+class TestSessionsOutliveTheirSshConnection:
+    """A client disconnect must never kill work on the server.
+
+    THE INCIDENT this exists for: a laptop on flaky wi-fi attached to a Windows
+    host. ``magent attach`` sends ``magent up`` over SSH, and Windows OpenSSH
+    runs every session command inside a job object marked kill-on-close. Job
+    membership is inherited by every descendant, so each psmux SERVER that
+    bring-up created -- and the agent inside it -- was born owned by the WI-FI.
+    One flap and sshd tore the job down: 45 sessions at 10:50, 16 at 11:03,
+    with no magent process running in between, and the survivors were exactly
+    the sessions that had been created locally on the host.
+
+    No other tier can see this. The flagship attach test above closes its ssh
+    session GRACEFULLY, after the remote command returned; this one kills the
+    connection out from under a live session, which is the case that was
+    broken. ``procs.spawn_unjobbed`` is the fix and this is its proof.
+    """
+
+    def test_a_session_created_over_ssh_survives_the_connection_dying(
+        self, tmp_path, ssh_wire
+    ):
+        _require_real_home_ok()
+        from magent import psmux as psmux_mod
+        from magent.env import config_base
+
+        if psmux_mod.find_psmux() is None:
+            pytest.skip("psmux not installed (CI installs it via choco for this leg)")
+
+        unique = uuid.uuid4().hex[:8]
+        name = f"mdsurv{unique}"
+        proj = tmp_path / name
+        proj.mkdir()
+        # A long-lived, harmless pane command: the session must still be there
+        # a moment later for its own reasons, not because a fast agent exited.
+        config_body = json.dumps(
+            {
+                "version": 3,
+                "projects": [{"path": str(proj), "title": name}],
+                "settings": {
+                    "defaultTool": "probe",
+                    "psmux": True,
+                    "uploadServer": False,
+                    "tools": {"probe": "ping -n 900 127.0.0.1"},
+                },
+            }
+        )
+        home = Path.home()
+        seeded = _seed_files(
+            [
+                (home / "magent.config.json", config_body),
+                (config_base() / "magent" / "config.json", config_body),
+            ]
+        )
+
+        target = _ssh_target(ssh_wire["host"])
+        proc = subprocess.Popen(
+            ["ssh", "-o", "BatchMode=yes", target, "magent up"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+        )
+        try:
+            # The session must exist while the connection that made it is
+            # STILL OPEN -- killing it after `magent up` returned would only
+            # re-test the graceful close the flagship already covers.
+            assert _wait_until(
+                lambda: psmux_mod.has_session(name), timeout=180, interval=0.5
+            ), f"remote bring-up never created {name!r}"
+            assert proc.poll() is None, (
+                "the ssh command finished before the session could be caught "
+                "mid-connection; this leg needs a slower bring-up to be honest"
+            )
+
+            # The wi-fi flap, faithfully: the ssh CLIENT dies without warning,
+            # the transport drops, and sshd tears the session (and its job)
+            # down. Nothing asks psmux to stop.
+            _kill_tree(proc)
+
+            # sshd's teardown is not instantaneous, so a session that is going
+            # to die needs to be given the chance to. A pass here means it
+            # never had a job to be killed with.
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                assert psmux_mod.has_session(name), (
+                    f"psmux session {name!r} died with the SSH connection "
+                    f"that created it -- the session-creation spawn is back "
+                    f"inside sshd's kill-on-close job object "
+                    f"(see procs.spawn_unjobbed)"
+                )
+                time.sleep(1)
+        finally:
+            _kill_tree(proc)
+            psmux_mod.kill_servers([name])
+            _restore_files(seeded)
+
+        assert _wait_until(lambda: not psmux_mod.has_session(name), timeout=15), (
+            "psmux session survived kill_servers"
+        )
+
+
+# ---------------------------------------------------------------------------
 # 3. Linux: real `--go` remote launch -- the nested ssh quoting, live
 # ---------------------------------------------------------------------------
 
@@ -813,11 +935,13 @@ def _connect_timeout_s() -> int:
 class TestReconnectSupervisorOverRealSsh:
     """`magent-attach-client` driving a REAL ssh client.
 
-    The unit tier scripts ssh's exit codes; nothing there proves the supervisor
-    can drive a real ssh client at all, or that OpenSSH behaves the way the
-    decision table assumes. The two sshd legs are genuine key-authenticated
-    sessions through the CI loopback server; the redial leg deliberately fails
-    to reach a host instead, because that is where a real 255 comes from.
+    The unit tier scripts ssh's exit codes and fakes the session probe; nothing
+    there proves the supervisor can drive a real ssh client at all, or that
+    OpenSSH behaves the way the decision table assumes. The two sshd legs are
+    genuine key-authenticated sessions through the CI loopback server -- and
+    they now exercise the REAL out-of-band probe too, which on a runner with no
+    such session honestly answers "gone". The redial leg deliberately fails to
+    reach a host instead, because that is where a real 255 comes from.
     """
 
     def test_a_dropping_connection_is_redialled_for_real(self, tmp_path, ssh_wire):
@@ -872,65 +996,38 @@ class TestReconnectSupervisorOverRealSsh:
         assert "reconnecting in 2s" in text, text
         assert "attempt 1" in text, text
 
-    def test_a_clean_remote_exit_does_not_reconnect(self, tmp_path, ssh_wire):
-        """A user who detaches stays detached: exit 0 means "I meant that".
+    def test_a_vanished_session_is_retried_then_given_up_on(self, tmp_path, ssh_wire):
+        """The reported bug, against a real sshd: a remote command that ends
+        while the session is NOT on the host must not close the pane.
 
-        Real key auth, real sshd, real pty -- and exactly one connection."""
-        exe = _attach_client_exe()
-        target = _ssh_target(ssh_wire["host"])
-        python = _remote_python(target)
-        marker = tmp_path / f"clean-{uuid.uuid4().hex[:8]}.log"
+        Before the session probe existed this connected once and stopped -- on
+        a Windows host announcing a "detach" the user never asked for, because
+        Windows OpenSSH reports 0 for a remote command that failed over a pty
+        (see the finding pinned below). Now the supervisor asks the host, over
+        a separate non-pty connection, whether the session is still there.
+        ``retry-probe`` is not a session on any runner, so the honest answer is
+        "gone" and the pane keeps trying -- exactly what a user wants while a
+        host is rebooting or a 45-session ``magent up`` is still working.
 
-        rc, out, err = _run_to_files(
-            [
-                exe,
-                "--target",
-                target,
-                "--session",
-                "detach-probe",
-                "--remote",
-                _exit_with(python, 0, marker),
-            ],
-            tmp_path,
-            "clean-exit",
-            timeout=120,
-        )
-        assert rc == 0, f"stdout:\n{out}\nstderr:\n{err}"
-        assert marker.read_text(encoding="utf-8").splitlines() == ["x"], (
-            "a clean exit must connect exactly once"
-        )
-        assert "detached from detach-probe" in out
-
-    def test_a_failing_remote_command_stops_instead_of_hammering_sshd(
-        self, tmp_path, ssh_wire
-    ):
-        """The connection worked; the session did not. Whatever the supervisor
-        says, it must connect ONCE and stop -- retrying would re-run a command
-        that just failed, forever, against a perfectly healthy sshd.
+        The other half of the contract is in the same assertion: it gives up
+        after ``SESSION_MISSING_MAX`` tries rather than dialling a healthy sshd
+        forever over a session that is never coming back.
 
         FINDING, pinned here because it is invisible to every other tier:
         **Windows OpenSSH does not propagate a remote command's exit status
         over a pty session.** ``ssh -t win-host "exit 7"`` reports 0, where
-        POSIX sshd reports 7. So on a Windows HOST -- the common magent host,
-        since psmux is Windows-native -- the supervisor's ``remote-failed``
-        branch is unreachable: a pane whose session is gone reads as a clean
-        detach and says "detached from <sid>" instead of naming the cause.
-
-        Both verdicts stop, so the safety property this test exists for holds
-        on every OS; only the message is less specific on a Windows host. And
-        the reconnect path is untouched either way, because a transport 255 is
-        generated by the ssh CLIENT, not reported by the server (which is why
-        the redial leg above dials an unreachable host rather than asking a
-        remote command to exit 255 -- that stand-in silently became a no-op on
-        Windows and was reporting a green reconnect that never happened).
-
-        If a future OpenSSH fixes the Windows propagation, this test goes red
-        on Windows and the branch above is what should be deleted.
+        POSIX sshd reports 7. That asymmetry is why exit code alone can no
+        longer decide a pane's fate, and why the probe deliberately drops
+        ``-t``. The assertions below are IDENTICAL on both platforms now --
+        that sameness is the point, and it is what regressed for Windows users
+        when the decision rested on rc.
         """
+        from magent.attach_client import SESSION_MISSING_MAX
+
         exe = _attach_client_exe()
         target = _ssh_target(ssh_wire["host"])
         python = _remote_python(target)
-        marker = tmp_path / f"failed-{uuid.uuid4().hex[:8]}.log"
+        marker = tmp_path / f"retry-{uuid.uuid4().hex[:8]}.log"
 
         rc, out, err = _run_to_files(
             [
@@ -938,29 +1035,60 @@ class TestReconnectSupervisorOverRealSsh:
                 "--target",
                 target,
                 "--session",
-                "gone-probe",
+                "retry-probe",
                 "--remote",
                 _exit_with(python, 7, marker),
             ],
             tmp_path,
-            "remote-failed",
+            "session-missing",
+            timeout=600,
+        )
+        dials = marker.read_text(encoding="utf-8").splitlines()
+        assert len(dials) == SESSION_MISSING_MAX, (
+            f"expected exactly {SESSION_MISSING_MAX} dials before giving up, "
+            f"got {len(dials)}\nstdout:\n{out}\nstderr:\n{err}"
+        )
+        assert "retry-probe is not on" in out, out
+        assert "is not a session there" in out, out
+        # Never 0: a pane that gave up must not read as a clean detach to
+        # whatever inspects its exit code.
+        assert rc != 0, f"stdout:\n{out}"
+
+    def test_no_reconnect_still_stops_on_the_first_exit(self, tmp_path, ssh_wire):
+        """``--no-reconnect`` promises the historical bare-ssh pane, and this
+        is what proves the new probe did not quietly break that promise: one
+        connection, one exit code, no second dial of any kind."""
+        exe = _attach_client_exe()
+        target = _ssh_target(ssh_wire["host"])
+        python = _remote_python(target)
+        marker = tmp_path / f"once-{uuid.uuid4().hex[:8]}.log"
+
+        rc, out, err = _run_to_files(
+            [
+                exe,
+                "--target",
+                target,
+                "--session",
+                "once-probe",
+                "--remote",
+                _exit_with(python, 7, marker),
+                "--no-reconnect",
+            ],
+            tmp_path,
+            "no-reconnect",
             timeout=120,
         )
-        # The invariant that matters on every OS: exactly one connection, then
-        # stop. A hot loop would show many marker lines and never return.
         assert marker.read_text(encoding="utf-8").splitlines() == ["x"], (
-            f"supervisor re-ran a failing remote command\nstdout:\n{out}"
+            f"--no-reconnect dialled more than once; stdout:\n{out}"
         )
         if sys.platform == "win32":
-            assert rc == 0, (
-                "Windows sshd started propagating pty exit codes -- delete the "
-                f"win32 branch here and in attach_client.verdict\nstdout:\n{out}"
-            )
-            assert "detached from gone-probe" in out
+            # The pty caveat again: a Windows host reports 0 for the failing
+            # remote command, so the rc-only table reads a clean detach.
+            assert rc == 0, f"stdout:\n{out}\nstderr:\n{err}"
+            assert "detached from once-probe" in out
         else:
             assert rc == 7, f"stdout:\n{out}\nstderr:\n{err}"
             assert "could not be attached" in out
-            assert "magent attach" in out
 
 
 # ---------------------------------------------------------------------------

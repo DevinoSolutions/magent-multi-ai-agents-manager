@@ -519,28 +519,58 @@ module, then a config load) is the cost that once made a big attach take
 minutes. That is also why the remote command is still a direct `psmux attach`
 with the session picker only as a fallback.
 
-*Why the exit code decides, and why 255 is special.* OpenSSH reserves 255 for
-its own failures, so anything else came from the remote command over a
-connection that demonstrably worked. Retrying THAT would re-run a command that
-just failed for a reason a retry cannot change — a hot loop against a healthy
-sshd — so the supervisor stops and names the likely cause instead. Exit 0 is a
-deliberate detach and is never second-guessed. Only 255 loops, forever, on a
-2s-doubling ladder capped at 30s (an all-night outage is then two handshakes a
-minute), with the ladder reset after any connection that lasted 30s so a
-long-lived pane heals a blip in two seconds rather than at the cap.
+*Why 255 is special.* OpenSSH reserves 255 for its own failures, and it is the
+LOCAL client that reports it, so it is trustworthy on every OS and needs no
+corroboration. It loops, forever, on a 2s-doubling ladder capped at 30s (an
+all-night outage is then two handshakes a minute), with the ladder reset after
+any connection that lasted 30s so a long-lived pane heals a blip in two seconds
+rather than at the cap. This is the flaky-wi-fi hot path and it deliberately
+costs no extra round-trip.
 
-*Measured caveat: Windows OpenSSH does not propagate a remote command's exit
-status over a pty.* `ssh -t win-host "exit 7"` reports 0 where POSIX sshd
-reports 7 (pinned by `test_a_failing_remote_command_stops_instead_of_hammering_sshd`,
-which asserts the win32 shape explicitly so a future OpenSSH fix goes red
-rather than silent). A magent host is usually Windows — psmux is Windows-native
-— so the "remote command failed" branch is effectively unreachable there and
-collapses into "detached". Both verdicts stop, so the behavior is right either
-way and only the message is less specific. Reconnect is untouched, because a
-transport 255 is produced by the local ssh CLIENT, not reported by the server.
-This is also why the real-ssh redial test dials an unroutable address instead
-of asking a remote command to exit 255: that stand-in silently became a no-op
-on Windows and reported a green reconnect that never happened.
+*Why exit 0 is NOT trusted, and what replaced it (revised 2026-08-17).* The
+original table read exit 0 as "the user detached" and everything else as "the
+remote command failed"; both stopped the pane. **Windows OpenSSH does not
+propagate a remote command's exit status over a pty** — `ssh -t win-host
+"exit 7"` reports 0 where POSIX sshd reports 7 — and a magent host is usually
+Windows, because psmux is Windows-native. So a session that DIED on the host
+handed the pane a 0 and the pane closed, announcing a detach the user never
+asked for. Reported live: flaky wi-fi, forty windows gone, every one of them
+claiming it was deliberate.
+
+The fix is a second, out-of-band question. After any exit that is not 255 the
+supervisor runs `ssh <target> "psmux -L <sid> has-session -t <sid>"` —
+**without `-t`**, which is the whole trick: remote exit codes ARE truthful over
+a non-pty channel on every OS. Alive means the client left while the work kept
+running (a real detach, a quit picker, a killed ssh child) and the pane stops.
+Anything else means keep dialling. Three details are load-bearing:
+
+- *Only a positive rc 0 stops a pane.* A host with psmux missing from its sshd
+  PATH answers 9009/127, an unreachable host answers 255, a timeout answers
+  nothing — all of which keep the pane trying. Biasing every ambiguous answer
+  toward "retry" is the direction the user asked for on a flaky link.
+- *`-t <sid>` is mandatory* for the same reason `psmux.has_session` documents:
+  a bare `has-session` exits 0 for a socket with no server (psmux keeps
+  `__warm__` spares), which here would report every dead session as a
+  deliberate detach — reintroducing the exact bug.
+- *"Gone" is bounded, not infinite.* A host mid-reboot, or a 45-session
+  `magent up` still working, genuinely answers "gone" for a minute and then
+  "alive", so the pane retries; but a session the user really did `magent down`
+  is never coming back, so after `SESSION_MISSING_MAX` consecutive gone answers
+  the pane stops and says why rather than dialling a healthy sshd forever.
+
+*Why not an in-band sentinel.* The obvious alternative — have the remote
+command echo a marker on clean detach and scan the pane's output for it —
+requires the supervisor to sit between ssh and the console. `_run_ssh`'s entire
+contract is that it never does: the child inherits the real console handles, so
+colors, mouse reporting and resize reach ssh untouched. Piping to read a
+sentinel would cost every attach pane its interactivity to answer one question
+a second connection answers for free. The probe also needs nothing new on the
+host, so an old host works with a new client, and an old client (which never
+probes) behaves exactly as it did.
+
+*Why the real-ssh redial test dials an unroutable address* instead of asking a
+remote command to exit 255: that stand-in silently became a no-op on Windows
+and reported a green reconnect that never happened.
 
 *Why the supervisor must carry the attach marker.* `cli/attach.py` decides a
 pane is a corpse by scanning live process command lines for `-L <sid> attach`.
@@ -561,6 +591,44 @@ or an older magent.
 ssh session, so a drop kills it; reconnecting would start a SECOND agent on a
 conversation the user believes is still running. Reconnect is a psmux feature
 because psmux is what makes the far side outlive the connection.
+
+**A psmux session must outlive the SSH connection that created it
+(2026-08-17).** The premise the whole reconnect story rests on — "losing the
+ssh client never loses work, because the session lives on the HOST" — was not
+actually true on Windows. `magent attach` brings the host up by sending
+`magent up` over SSH; Windows OpenSSH runs every session command inside a job
+object marked kill-on-close, and job membership is inherited by every
+descendant. `WindowsPlatform.launch_psmux_session` created each session with a
+plain `Popen`, so the psmux SERVER it forked — and the agent that server would
+host for the next eight hours — was born inside a job whose lifetime was the
+laptop's wi-fi. Measured on a real host: 45 sessions decorated at 10:50, 16 at
+11:03, with no magent process running in between, and the survivors were
+exactly the sessions that had been created locally.
+
+`procs.spawn_unjobbed` is the fix: `CREATE_BREAKAWAY_FROM_JOB`, falling back to
+a plain spawn because CreateProcess fails outright when the parent job forbids
+breakaway (and a bring-up must never raise). Three deliberate scoping choices:
+
+- *It lives in `procs.py`, not `launch.py`.* The recipe already existed inside
+  `launch.spawn_detached`, but `platform/windows.py` cannot import `launch`
+  (launch imports platform). Two copies of a Windows process primitive is how
+  one of them rots, so it moved down to the leaf and both callers reach it.
+  `spawn_detached` keeps only its own half — the detached console.
+- *It changes job membership and NOTHING else.* No console flags are added at
+  the psmux call site, so the `new-session` child keeps inheriting the caller's
+  console exactly as before; psmux allocates the session's pty itself and
+  detaching the console would be a second, unrelated change to a spawn that
+  works.
+- *Only the creation spawn gets it.* `has-session`, `kill-server`, `send-keys`
+  and the decoration `set`s are awaited inline and own nothing that must
+  outlive anything, so they stay plain Popens.
+
+The only tier that can see this is `TestSessionsOutliveTheirSshConnection` in
+the real-ssh suite (win32): it creates a session through a live
+`ssh <host> "magent up"` and then KILLS THE CONNECTION while the session is
+still up. The pre-existing flagship closes its ssh session gracefully, after
+the remote command returned, which is why the regression hid behind a green
+test for so long.
 
 **A resume flag with nothing to resume is dropped at COMMAND-BUILD time, never
 retried at runtime (2026-08-11).** `claude --continue` — the registry default —

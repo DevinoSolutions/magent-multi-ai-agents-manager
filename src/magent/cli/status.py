@@ -432,7 +432,8 @@ def _down_host(explicit: str | None, local_targets: list[str]) -> str | None:
     "--all",
     "do_all",
     is_flag=True,
-    help="Stop every session, the upload server, and the Alt+V listener",
+    help="Stop EVERY psmux session (killing the agent running in each), plus"
+    " the upload server and the Alt+V listener",
 )
 @click.option("--server", "stop_srv", is_flag=True, help="Also stop the upload server")
 @click.option(

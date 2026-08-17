@@ -243,6 +243,7 @@ def _drive_bring_up(
     pane_probes: list[list[str]] | None = None,
     create_failures: set[str] | None = None,
     envs: list[object] | None = None,
+    spawners: list[str] | None = None,
 ):
     """Drive a real ``launch_psmux_session`` over a fully faked psmux seam.
 
@@ -267,6 +268,8 @@ def _drive_bring_up(
         calls.append(list(cmd))
         if envs is not None:
             envs.append(kwargs.get("env"))
+        if spawners is not None:
+            spawners.append("plain")
         # has-session must report "down" so the session gets created.
         if "has-session" in cmd:
             proc = _Proc()
@@ -302,8 +305,18 @@ def _drive_bring_up(
             seen[n] = seen.get(n, 0) + 1
         return out
 
+    def _unjobbed(cmd, **kwargs):
+        proc = _popen(cmd, **kwargs)
+        if spawners is not None:
+            spawners[-1] = "unjobbed"
+        return proc
+
     monkeypatch.setattr("magent.platform.windows.find_psmux", lambda: "psmux")
     monkeypatch.setattr("magent.platform.windows.subprocess.Popen", _popen)
+    # The session-creation spawn goes through the job-object breakaway helper,
+    # not a plain Popen -- patched separately so a pin can tell which spawner
+    # each argv used (see TestSessionsOutliveTheirSshConnection).
+    monkeypatch.setattr("magent.platform.windows.spawn_unjobbed", _unjobbed)
     monkeypatch.setattr(
         "magent.platform.windows._wait_for_panes_ready", lambda *a, **k: None
     )
@@ -650,6 +663,33 @@ class TestWindowsBringUpPsmuxInvocation:
             # must not survive -- and where the socket dir still must.
             assert _markers_in(env) == []
             assert env["TMUX_TMPDIR"] == "/tmp/private-sockets"
+
+    def test_session_creation_breaks_out_of_the_launching_job(self, monkeypatch):
+        # A client disconnect must never kill work on the server. When the
+        # bring-up runs over SSH (`magent attach` sends `magent up` to the
+        # host), Windows OpenSSH has wrapped the session in a kill-on-close job
+        # object and job membership is inherited by every descendant -- so a
+        # plain Popen here ties each psmux SERVER, and the agent it hosts, to
+        # the laptop's wi-fi. Measured: 45 sessions at 10:50, 16 at 11:03, with
+        # no magent process running in between.
+        spawners: list[str] = []
+        calls, _ = _drive_bring_up(monkeypatch, windows=["api"], spawners=spawners)
+        pairs = list(zip(calls, spawners, strict=True))
+        creates = [s for c, s in pairs if "new-session" in c]
+        assert creates, "no session was created"
+        assert set(creates) == {"unjobbed"}
+
+    def test_control_commands_still_use_a_plain_spawn(self, monkeypatch):
+        # Breakaway is for processes that must OUTLIVE the connection. A
+        # has-session / send-keys / decoration round-trip is awaited inline and
+        # owns nothing, so it stays a plain Popen -- widening the change would
+        # be a second, unrelated behavior shift on every psmux call.
+        spawners: list[str] = []
+        calls, _ = _drive_bring_up(monkeypatch, windows=["api"], spawners=spawners)
+        pairs = list(zip(calls, spawners, strict=True))
+        others = [s for c, s in pairs if "new-session" not in c]
+        assert others, "the bring-up ran no control commands"
+        assert set(others) == {"plain"}
 
     def test_control_commands_inherit_the_environment(self, monkeypatch):
         # send-keys / has-session / kill-server / the decoration `set`s are

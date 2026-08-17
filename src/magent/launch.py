@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -22,6 +21,7 @@ from magent.platform import (
     VSCodeLaunchOpts,
     get_platform,
 )
+from magent.procs import spawn_unjobbed
 from magent.sessions import (
     AGENT_TOOLS,
     build_resume_command,
@@ -34,6 +34,7 @@ from magent.tiling import Placement, magent_window_names, place_windows
 from magent.titles import generate_titles, get_leaf_name, make_title, parse_title
 
 if TYPE_CHECKING:
+    import subprocess
     from collections.abc import Callable
 
     from magent.config import MagentConfig, ProjectConfig
@@ -42,23 +43,21 @@ if TYPE_CHECKING:
 def spawn_detached(args: list[str], extra_flags: int = 0) -> subprocess.Popen[bytes]:
     """Popen a process that outlives both this process and a launching SSH session.
 
-    On Windows, OpenSSH puts the command's children in a job object marked
-    kill-on-close, so when the SSH session ends the children are terminated.
-    ``DETACHED_PROCESS`` only detaches the console -- it does not escape the job.
-    ``CREATE_BREAKAWAY_FROM_JOB`` does, but CreateProcess fails outright if the
-    parent job forbids breakaway, so fall back to a plain detached spawn (the
-    normal case when launched from an interactive console, not under a job).
+    Two independent halves, and only one of them lives here now. The CONSOLE
+    half is this function's own: ``DETACHED_PROCESS | CREATE_NO_WINDOW`` gives
+    the child no console to be killed with and no window to flash. The JOB half
+    -- escaping the kill-on-close job object Windows OpenSSH wraps every SSH
+    session in -- is ``procs.spawn_unjobbed``, shared with the psmux
+    session-creation spawn in ``platform/windows.py`` so the recipe that decides
+    whether work survives a disconnect exists exactly once.
     """
     if sys.platform != "win32":
-        return subprocess.Popen(args)
+        return spawn_unjobbed(args)
     CREATE_NO_WINDOW = 0x08000000
     DETACHED_PROCESS = 0x00000008
-    CREATE_BREAKAWAY_FROM_JOB = 0x01000000
-    base = CREATE_NO_WINDOW | DETACHED_PROCESS | extra_flags
-    try:
-        return subprocess.Popen(args, creationflags=base | CREATE_BREAKAWAY_FROM_JOB)
-    except OSError:
-        return subprocess.Popen(args, creationflags=base)
+    return spawn_unjobbed(
+        args, creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS | extra_flags
+    )
 
 
 def hotkey_restart_reason(
