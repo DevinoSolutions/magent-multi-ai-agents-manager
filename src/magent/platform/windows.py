@@ -516,7 +516,7 @@ class WindowsPlatform(Platform):
             # allocates the session's pty itself, and detaching the console
             # would be a second, unrelated change to a spawn that works.
             creates = [
-                spawn_unjobbed(
+                subprocess.Popen(  # CONTROL EXPERIMENT -- do not merge
                     [
                         psmux,
                         "-L",
