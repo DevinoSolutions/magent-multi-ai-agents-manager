@@ -623,12 +623,23 @@ breakaway (and a bring-up must never raise). Three deliberate scoping choices:
   and the decoration `set`s are awaited inline and own nothing that must
   outlive anything, so they stay plain Popens.
 
-The only tier that can see this is `TestSessionsOutliveTheirSshConnection` in
-the real-ssh suite (win32): it creates a session through a live
-`ssh <host> "magent up"` and then KILLS THE CONNECTION while the session is
-still up. The pre-existing flagship closes its ssh session gracefully, after
-the remote command returned, which is why the regression hid behind a green
-test for so long.
+**What this fix does NOT claim.** `TestSessionsOutliveTheirSshConnection`
+(real-ssh, win32) kills the connection out from under a live session — both the
+one that CREATED it and one ATTACHED to it. A control run with the breakaway
+reverted to a plain `Popen` (PR #160) **passed either way** on
+`windows-latest` with psmux 3.3.6: that runner's psmux already detaches its
+server far enough to survive. So the job object is a real hazard the product
+must not rely on luck to avoid — the escape costs one flag and the repo already
+documented the mechanism — but it is **not a proven reproduction of the
+reporter's 45→16**. The measured facts about that incident remain: 29 psmux
+servers vanished between two `magent up` snapshots with no magent process
+running in between, so something outside magent killed them.
+
+The next instrument is already in place: the attached-client leg
+(`test_a_session_survives_its_attached_client_dying`) tests the shape that
+actually matches the incident — a flap kills every attach client at once, and a
+server that followed its client would take exactly the attached sessions and
+spare the rest. If that ever goes red, the cause is psmux-side and named.
 
 **A resume flag with nothing to resume is dropped at COMMAND-BUILD time, never
 retried at runtime (2026-08-11).** `claude --continue` — the registry default —

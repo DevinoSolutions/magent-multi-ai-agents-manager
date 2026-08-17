@@ -33,12 +33,12 @@ These tests use it. No fakes, no dry-run, no monkeypatched transport:
   file appearing proves the full nested-quoting chain executed on the far
   side of a real connection.
 * ``TestSessionsOutliveTheirSshConnection`` (win32) -- the survival contract
-  the whole remote workflow rests on, tested the only way that can see it:
-  create a psmux session through a live ``ssh <host> "magent up"``, then KILL
-  THE CONNECTION while the session is still up, and assert the session (and
-  the work in it) is still there afterwards. The flagship above closes its ssh
-  session gracefully; this one reproduces a wi-fi flap, which is the case that
-  was broken.
+  the whole remote workflow rests on, tested the only way that can see it: KILL
+  THE CONNECTION while a session is still up, and assert the session (and the
+  work in it) is still there afterwards. Both connections a session can have
+  are covered: the one that CREATED it (a live ``ssh <host> "magent up"``) and
+  one ATTACHED to it. The flagship above only ever closes its ssh session
+  gracefully. Read the class docstring for what these do and do not prove.
 * ``TestReconnectSupervisorOverRealSsh`` (all OSes) -- the reconnect
   supervisor each attach pane runs (``magent-attach-client``) driving a REAL
   ssh client. A dial at an unroutable address produces a real client-side
@@ -600,9 +600,19 @@ class TestSessionsOutliveTheirSshConnection:
     the sessions that had been created locally on the host.
 
     No other tier can see this. The flagship attach test above closes its ssh
-    session GRACEFULLY, after the remote command returned; this one kills the
-    connection out from under a live session, which is the case that was
-    broken. ``procs.spawn_unjobbed`` is the fix and this is its proof.
+    session GRACEFULLY, after the remote command returned; these kill the
+    connection out from under a live session.
+
+    HONEST RESULT, measured (PR #160, a control run with the breakaway spawn
+    reverted to a plain ``Popen``): on ``windows-latest`` with psmux 3.3.6
+    these PASS either way. So the job object is a real hazard the product must
+    not rely on luck to avoid -- ``procs.spawn_unjobbed`` closes it, and the
+    repo already documented the mechanism in ``launch.spawn_detached`` -- but
+    it is NOT a reproduction of the reporter's session deaths, and nothing here
+    should be read as having proven that cause. These are contract tests: they
+    guard the property the whole remote workflow assumes, on both the creating
+    connection and the attached one, and they go red if magent or psmux ever
+    starts coupling a session's life to a socket.
     """
 
     def test_a_session_created_over_ssh_survives_the_connection_dying(
@@ -673,14 +683,107 @@ class TestSessionsOutliveTheirSshConnection:
                 assert psmux_mod.has_session(name), (
                     f"psmux session {name!r} died with the SSH connection "
                     f"that created it -- the session-creation spawn is back "
-                    f"inside sshd's kill-on-close job object "
-                    f"(see procs.spawn_unjobbed)"
+                    f"inside sshd's kill-on-close job object, or psmux stopped "
+                    f"detaching its server (see procs.spawn_unjobbed)"
                 )
                 time.sleep(1)
         finally:
             _kill_tree(proc)
             psmux_mod.kill_servers([name])
             _restore_files(seeded)
+
+        assert _wait_until(lambda: not psmux_mod.has_session(name), timeout=15), (
+            "psmux session survived kill_servers"
+        )
+
+    def test_a_session_survives_its_attached_client_dying(self, tmp_path, ssh_wire):
+        """The other half, and the one that matches the incident's shape.
+
+        The test above kills the connection that CREATED a session. This one
+        kills a connection that is ATTACHED to a live session -- which is what
+        a wi-fi flap actually does to a user with forty open attach panes. If a
+        psmux server followed its client into the grave, every attached session
+        would die at once and every unattached one would survive, which is
+        precisely the pattern the reporter saw (45 sessions -> 16, with no
+        magent process running in between).
+
+        The session is created LOCALLY here on purpose, so the two variables
+        stay separated: whatever this asserts is about the ATTACH connection
+        alone, with no job object from a creating connection in the picture.
+
+        A tmux-family server orphans its clients rather than dying with them,
+        so this should hold -- it is a contract test guarding a property the
+        whole remote workflow assumes, not a reproduction of a known break.
+        """
+        from magent import psmux as psmux_mod
+        from magent.platform import PsmuxWindowOpts
+        from magent.platform.windows import WindowsPlatform
+
+        binary = psmux_mod.find_psmux()
+        if binary is None:
+            pytest.skip("psmux not installed (CI installs it via choco for this leg)")
+
+        name = f"mdatt{uuid.uuid4().hex[:8]}"
+        proj = tmp_path / name
+        proj.mkdir()
+        target = _ssh_target(ssh_wire["host"])
+        proc: subprocess.Popen | None = None
+        try:
+            WindowsPlatform().launch_psmux_session(
+                [
+                    PsmuxWindowOpts(
+                        window_name=name,
+                        cwd=str(proj),
+                        command="ping -n 900 127.0.0.1",
+                    )
+                ]
+            )
+            assert _wait_until(
+                lambda: psmux_mod.has_session(name), timeout=60, interval=0.5
+            ), f"local bring-up never created {name!r}"
+
+            # A real interactive attach over a real connection -- `-t`, exactly
+            # as an attach pane runs it.
+            proc = subprocess.Popen(
+                ["ssh", "-o", "BatchMode=yes", "-t", target, f"psmux -L {name} attach"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+
+            def _client_attached() -> bool:
+                out = subprocess.run(
+                    [binary, "-L", name, "list-clients"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                return out.returncode == 0 and bool(out.stdout.strip())
+
+            if not _wait_until(_client_attached, timeout=60, interval=1.0):
+                # Never assert a pass that was not earned: with no client, the
+                # kill below proves nothing about session survival.
+                pytest.skip(
+                    "no psmux client ever registered for the ssh attach; this "
+                    "leg cannot prove anything without one"
+                )
+
+            # The flap: the attached ssh client dies without warning.
+            _kill_tree(proc)
+
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                assert psmux_mod.has_session(name), (
+                    f"psmux session {name!r} died when the client ATTACHED to "
+                    f"it was killed -- a server must orphan its clients, not "
+                    f"follow them. This is the shape of the reported incident."
+                )
+                time.sleep(1)
+        finally:
+            if proc is not None:
+                _kill_tree(proc)
+            psmux_mod.kill_servers([name])
 
         assert _wait_until(lambda: not psmux_mod.has_session(name), timeout=15), (
             "psmux session survived kill_servers"
