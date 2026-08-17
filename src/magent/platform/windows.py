@@ -19,6 +19,7 @@ from magent.platform import (
     VSCodeLaunchOpts,
     find_psmux,
 )
+from magent.procs import spawn_unjobbed
 from magent.psmux import (
     capture_pane,
     child_env,
@@ -479,19 +480,43 @@ class WindowsPlatform(Platform):
             if start:
                 time.sleep(_BRING_UP_BATCH_PAUSE_S)
 
-            # `env=child_env()` on THIS spawn and no other in this file: psmux's
-            # nested-session guard fires for `new-session` alone. magent is
-            # routinely driven FROM a magent psmux window -- the interactive
-            # menu's "u" especially -- and a psmux that sees PSMUX_SESSION/TMUX
-            # refuses to create a sibling session ("sessions should be nested
-            # with care") while still exiting 0, so the whole wave silently
-            # produced nothing. Control commands (has-session, kill-server,
-            # send-keys, display-message, capture-pane, the decoration `set`s)
-            # are measurably indifferent to the markers -- byte-identical
-            # results with and without -- so they keep the plain inherited
-            # environment rather than a rebuilt block under every round-trip.
+            # TWO things are special about THIS spawn, and no other in this
+            # file. Both exist because this is the one call that gives a psmux
+            # session its SERVER -- the process that will host the project's
+            # agent for the rest of the day.
+            #
+            # 1. `spawn_unjobbed`: the server must not be born inside the job
+            #    object of whatever created it. When the bring-up runs over SSH
+            #    (`magent attach` sends `magent up` to the host -- the normal
+            #    remote path) Windows OpenSSH has wrapped the whole session in a
+            #    kill-on-close job, and job membership is inherited all the way
+            #    down. A plain Popen here therefore couples every session's
+            #    lifetime to the LAPTOP'S WI-FI: one flap and sshd tears the job
+            #    down, killing the psmux servers and the agents inside them,
+            #    while sessions created locally on the host survive untouched.
+            #    Measured exactly that way -- 45 sessions at 10:50, 16 at 11:03,
+            #    with no magent process running in between. See
+            #    `procs.spawn_unjobbed`.
+            #
+            # 2. `env=child_env()`: psmux's nested-session guard fires for
+            #    `new-session` alone. magent is routinely driven FROM a magent
+            #    psmux window -- the interactive menu's "u" especially -- and a
+            #    psmux that sees PSMUX_SESSION/TMUX refuses to create a sibling
+            #    session ("sessions should be nested with care") while still
+            #    exiting 0, so the whole wave silently produced nothing. Control
+            #    commands (has-session, kill-server, send-keys, display-message,
+            #    capture-pane, the decoration `set`s) are measurably indifferent
+            #    to the markers -- byte-identical results with and without -- so
+            #    they keep the plain inherited environment rather than a rebuilt
+            #    block under every round-trip.
+            #
+            # Deliberately NOT added here: any console flag. `spawn_unjobbed`
+            # changes job membership and nothing else, so this child keeps
+            # inheriting the caller's console exactly as it always has -- psmux
+            # allocates the session's pty itself, and detaching the console
+            # would be a second, unrelated change to a spawn that works.
             creates = [
-                subprocess.Popen(
+                spawn_unjobbed(
                     [
                         psmux,
                         "-L",

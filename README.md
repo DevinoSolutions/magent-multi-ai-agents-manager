@@ -159,9 +159,17 @@ Each magent session brands its psmux status bar — `magent` on the left, its wi
 
 Nothing is lost while it waits: the psmux session lives on the **host**, so the reattached pane comes back to the same running agent and the same scrollback. You do not have to close a wall of dead terminals and re-run `magent attach` any more.
 
-Three cases deliberately do **not** reconnect: you detached on purpose (`F1`, or `psmux detach`) — the pane says so and exits; the host answered but the session is gone (rebooted, killed) — the pane stops and tells you to run `magent attach` to bring it back, rather than hammering a healthy SSH server; and `Ctrl+C`, which stops the supervisor immediately. `magent attach --no-reconnect` restores the old one-shot behavior. `--no-mux` panes are never supervised — without a multiplexer the agent dies with the connection, so there is nothing to reattach to.
+Only a **deliberate detach** closes a pane. When a connection ends, the supervisor asks the host — over a separate, one-shot SSH check — whether your session is still alive. If it is, you left on purpose (`F1`, or `psmux detach`), the pane says `detached from <session>` and exits. If the session is *not* there (host rebooting, a bring-up still in progress), the pane keeps dialling for a few more tries and only then stops and tells you to run `magent attach` — so it never hammers a healthy SSH server over a session that is gone for good. `Ctrl+C` stops the supervisor immediately at any point.
 
-(Small honesty note: Windows OpenSSH doesn't report a remote command's exit status back over an interactive session, so when the **host** is Windows that second case reads as a plain `detached from <session>` rather than the more specific message. It still stops either way, and reconnect is unaffected — a dropped connection is detected by your own SSH client, not reported by the host.)
+That check exists because an exit code alone cannot be trusted: **Windows OpenSSH doesn't report a remote command's exit status back over an interactive session**, so a session that *died* on the host looked exactly like a clean detach. Panes used to close on that — one wi-fi flap, forty windows gone, each announcing a "detach" you never asked for. The separate check drops the interactive pseudo-terminal, which is what makes the host's answer truthful on every OS.
+
+`magent attach --no-reconnect` restores the old one-shot behavior (one connection, no check). `--no-mux` panes are never supervised — without a multiplexer the agent dies with the connection, so there is nothing to reattach to.
+
+#### Your sessions survive your connection
+
+A dropped connection must never kill work on the host. That is not automatic on Windows: OpenSSH runs everything an SSH session starts inside a *job object* that it destroys when the connection closes, and every child inherits it — so a psmux session created by a remote `magent up` (which is exactly what `magent attach` does) used to be owned by your laptop's wi-fi. One flap and the host's psmux servers, and the agents inside them, were killed. magent now creates sessions with an explicit break-out from that job, so a session's lifetime is tied to the host, not to the connection that asked for it.
+
+Note that `magent down --all` *is* the deliberate way to stop everything: it kills every psmux session on the machine along with the agent running in each, not just the daemons. Name sessions explicitly (`magent down api web`) or use `-g/--group` to stop a subset.
 
 ### Mobile image upload (over Tailscale)
 

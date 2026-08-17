@@ -14,37 +14,136 @@ corpse) is pinned from the attach side, where the spawn argv is actually built:
 
 from __future__ import annotations
 
+import subprocess
+from typing import NamedTuple
+
 import pytest
 
 from magent import attach_client
 
 
-class TestVerdict:
-    """What one ssh exit code means. Three outcomes; getting the middle one
-    wrong either abandons a healable pane or hot-loops on someone's sshd."""
+class _Completed(NamedTuple):
+    """The one field ``_probe_session`` reads off ``subprocess.run``."""
 
-    def test_clean_exit_is_a_deliberate_detach(self):
-        # `psmux detach`, or the picker quitting: the user asked to leave.
+    returncode: int
+
+
+class TestVerdict:
+    """What one ssh exit MEANS. Getting this wrong either abandons a healable
+    pane (the reported bug: forty windows closed by one wi-fi flap) or
+    hot-loops on someone's sshd."""
+
+    def test_a_transport_failure_reconnects_without_even_asking_the_host(self):
+        # `client_loop: send disconnect`, connection refused, host unreachable,
+        # DNS, auth -- OpenSSH reserves 255 for all of its own failures, and it
+        # is the LOCAL client that reports it, so it is trustworthy on every
+        # OS. This is the flaky-wi-fi path: it must cost no extra round-trip.
+        assert attach_client.verdict(255) == attach_client.RECONNECT
+        assert (
+            attach_client.verdict(255, attach_client.SESSION_GONE)
+            == attach_client.RECONNECT
+        )
+
+    def test_a_live_session_is_the_only_proof_of_a_deliberate_detach(self):
+        # The client left while the work kept running: `psmux detach`, a quit
+        # picker, a killed ssh child. Reconnecting would fight the user.
+        assert (
+            attach_client.verdict(0, attach_client.SESSION_ALIVE)
+            == attach_client.DETACHED
+        )
+
+    @pytest.mark.parametrize("rc", [0, 1, 130, 3221225786])
+    def test_exit_zero_alone_never_closes_a_pane_again(self, rc):
+        # THE REGRESSION GUARD. Windows OpenSSH reports 0 for a remote command
+        # that failed over a pty, so a session killed on the host looked
+        # exactly like a deliberate detach -- and the pane closed, announcing
+        # a detach that never happened.
+        assert (
+            attach_client.verdict(rc, attach_client.SESSION_GONE)
+            == attach_client.SESSION_MISSING
+        )
+
+    @pytest.mark.parametrize("rc", [0, 1, 127, -9])
+    def test_an_unanswerable_probe_keeps_trying(self, rc):
+        # "I could not ask the host" is far likelier to mean "the network is
+        # still bad" than "the user detached"; closing the pane on that guess
+        # is the whole bug.
+        assert (
+            attach_client.verdict(rc, attach_client.PROBE_FAILED)
+            == attach_client.RECONNECT
+        )
+
+    @pytest.mark.parametrize("rc", [1, 2, 126, 127, 130, 254, -15, 3840])
+    def test_without_a_probe_the_historical_table_is_preserved(self, rc):
+        # probe=None is the --no-reconnect path, whose entire promise is that
+        # the pane behaves exactly as a bare ssh always did.
+        assert attach_client.verdict(rc) == attach_client.REMOTE_FAILED
+
+    def test_without_a_probe_a_clean_exit_is_still_a_detach(self):
         assert attach_client.verdict(0) == attach_client.DETACHED
 
-    def test_255_is_a_transport_failure_worth_retrying(self):
-        # `client_loop: send disconnect`, connection refused, host unreachable,
-        # DNS, auth -- OpenSSH reserves 255 for all of its own failures.
-        assert attach_client.verdict(255) == attach_client.RECONNECT
 
-    @pytest.mark.parametrize("rc", [1, 2, 126, 127, 130, 254])
-    def test_any_other_code_came_from_the_remote_command(self, rc):
-        # The CONNECTION worked; the remote side failed. Reconnecting would
-        # re-run a command that just failed for a reason a retry cannot fix.
-        assert attach_client.verdict(rc) == attach_client.REMOTE_FAILED
+class TestSessionProbe:
+    """The deliberate-detach signal. Out-of-band on purpose: scanning the
+    pane's output for a sentinel would make this process a middleman on the
+    console, and the interactive session would lose colors and resize."""
 
-    @pytest.mark.parametrize("rc", [-15, -9, 3840, 3221225786])
-    def test_a_killed_ssh_child_stops_rather_than_redialling(self, rc):
-        # POSIX subprocess reports -signum; Windows reports the raw code
-        # (3221225786 == STATUS_CONTROL_C_EXIT, 3840 seen from a harness kill).
-        # Something deliberately killed the client -- a supervisor that
-        # answered a kill by dialling again would be unstoppable.
-        assert attach_client.verdict(rc) == attach_client.REMOTE_FAILED
+    def test_the_probe_asks_psmux_not_magent(self):
+        # Old host, new client must work: psmux is installed on any host that
+        # has sessions to attach to, a magent new enough to answer a probe
+        # subcommand is not.
+        argv = attach_client.session_probe_argv("me@box", "api")
+        assert argv[0] == "ssh"
+        assert argv[-2] == "me@box"
+        assert argv[-1] == "psmux -L api has-session -t api"
+
+    def test_it_drops_the_pty_so_the_remote_exit_code_is_truthful(self):
+        # Windows OpenSSH loses a remote status over `-t` and keeps it without.
+        # That asymmetry is the only reason this probe can answer at all.
+        assert "-t" not in attach_client.session_probe_argv("me@box", "api")
+
+    def test_it_carries_the_explicit_target_that_makes_has_session_honest(self):
+        # A BARE `has-session` exits 0 for a socket with no server at all
+        # (psmux keeps __warm__ spares), which here would report every dead
+        # session as a deliberate detach and close the pane -- the exact bug.
+        assert "-t api" in attach_client.session_probe_argv("me@box", "api")[-1]
+
+    def test_it_never_prompts(self):
+        assert "BatchMode=yes" in attach_client.session_probe_argv("me@box", "api")
+
+    @pytest.mark.parametrize(
+        ("rc", "expected"),
+        [
+            (0, attach_client.SESSION_ALIVE),
+            (1, attach_client.SESSION_GONE),
+            (9009, attach_client.SESSION_GONE),  # cmd.exe: command not found
+            (127, attach_client.SESSION_GONE),  # POSIX sh: command not found
+            (255, attach_client.PROBE_FAILED),  # ssh itself could not connect
+        ],
+    )
+    def test_only_a_positive_zero_reports_the_session_alive(
+        self, monkeypatch, rc, expected
+    ):
+        # Everything that is not an unambiguous yes keeps the pane trying. A
+        # host missing psmux from its sshd PATH must not close forty windows.
+        monkeypatch.setattr(
+            attach_client.subprocess, "run", lambda *_a, **_k: _Completed(rc)
+        )
+        assert attach_client._probe_session("me@box", "api") == expected
+
+    @pytest.mark.parametrize(
+        "exc", [OSError("no ssh"), subprocess.TimeoutExpired("ssh", 20)]
+    )
+    def test_a_probe_that_cannot_run_learns_nothing_rather_than_crashing(
+        self, monkeypatch, exc
+    ):
+        def boom(*_a, **_k):
+            raise exc
+
+        monkeypatch.setattr(attach_client.subprocess, "run", boom)
+        assert (
+            attach_client._probe_session("me@box", "api") == attach_client.PROBE_FAILED
+        )
 
 
 class TestBackoffLadder:
@@ -81,8 +180,12 @@ class TestAttemptCounter:
         assert attach_client.next_attempt(9, elapsed=3600.0) == 1
 
 
-def _drive(monkeypatch, codes, *, durations=None, **kwargs):
+def _drive(monkeypatch, codes, *, durations=None, probes=None, **kwargs):
     """Run ``supervise`` against a scripted sequence of ssh exit codes.
+
+    ``probes`` scripts what the host answers about the session after each
+    disconnect; it defaults to ``SESSION_ALIVE``, which is the historical
+    "exit 0 means detached" reading and keeps the older assertions honest.
 
     Returns ``(rc, calls, sleeps)``: the supervisor's own exit code, the argv
     of every ssh it ran, and every backoff it waited out. A sequence that runs
@@ -91,6 +194,7 @@ def _drive(monkeypatch, codes, *, durations=None, **kwargs):
     """
     remaining = list(codes)
     clock = list(durations or [])
+    answers = list(probes or [])
     calls: list[list[str]] = []
     sleeps: list[float] = []
     now = [0.0]
@@ -102,8 +206,12 @@ def _drive(monkeypatch, codes, *, durations=None, **kwargs):
         now[0] += clock.pop(0) if clock else 0.0
         return remaining.pop(0)
 
+    def fake_probe(_target, _session):
+        return answers.pop(0) if answers else attach_client.SESSION_ALIVE
+
     monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/usr/bin/ssh")
     monkeypatch.setattr(attach_client, "_run_ssh", fake_run)
+    monkeypatch.setattr(attach_client, "_probe_session", fake_probe)
     monkeypatch.setattr(attach_client.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(attach_client.time, "sleep", sleeps.append)
     rc = attach_client.supervise("user@host", "psmux -L api attach", "api", **kwargs)
@@ -159,21 +267,98 @@ class TestSupervise:
         )
         assert sleeps == [2.0, 4.0, 2.0]
 
-    def test_a_failing_remote_command_stops_instead_of_hot_looping(
+    def test_a_session_killed_on_the_host_is_retried_not_announced_as_a_detach(
         self, monkeypatch, capsys
     ):
-        # The host answered -- the connection is fine. Retrying would hammer a
-        # perfectly healthy sshd forever over a session that no longer exists.
-        rc, calls, sleeps = _drive(monkeypatch, [1])
-        assert (rc, len(calls), sleeps) == (1, 1, [])
+        # THE REPORTED BUG, end to end. A wi-fi flap killed the host's psmux
+        # session; ssh handed the pane exit 0 (Windows OpenSSH loses a remote
+        # status over a pty) and the pane closed saying "detached". Now the
+        # host is asked, says the session is gone, and the pane waits for
+        # `magent up` to bring it back instead of vanishing.
+        rc, calls, sleeps = _drive(
+            monkeypatch,
+            [0, 0, 0],
+            probes=[
+                attach_client.SESSION_GONE,
+                attach_client.SESSION_GONE,
+                attach_client.SESSION_ALIVE,
+            ],
+        )
+        assert rc == 0
+        assert len(calls) == 3
+        assert sleeps == [2.0, 4.0]
         out = capsys.readouterr().out
-        assert "could not be attached" in out
+        assert "api is not on user@host yet" in out
+        assert "detached" not in out.split("api is not on")[0]
+
+    def test_a_session_that_stays_gone_stops_instead_of_hammering_sshd(
+        self, monkeypatch, capsys
+    ):
+        # The other half of the same contract: the host is perfectly healthy
+        # and the session is simply not coming back (`magent down` ran). A
+        # supervisor that redialled forever would dial that sshd every 30s
+        # until the machine was rebooted.
+        rc, calls, _sleeps = _drive(
+            monkeypatch,
+            [0] * attach_client.SESSION_MISSING_MAX,
+            probes=[attach_client.SESSION_GONE] * attach_client.SESSION_MISSING_MAX,
+        )
+        assert len(calls) == attach_client.SESSION_MISSING_MAX
+        # Never 0: a pane that gave up must not look like a clean detach to
+        # whatever reads its exit code.
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "is not a session there" in out
         assert "magent attach" in out
+
+    def test_a_flapping_host_never_accumulates_its_way_to_a_stop(
+        self, monkeypatch, capsys
+    ):
+        # Only a STEADILY absent session stops a pane. Alternating answers --
+        # exactly what a host mid-reboot or mid-bring-up produces -- must reset
+        # the counter, or a long flaky day would close the window by attrition.
+        codes = [0, 255] * attach_client.SESSION_MISSING_MAX
+        # Only the non-255 dials consult the host, so there are exactly
+        # SESSION_MISSING_MAX "gone" answers -- each one cleared by the 255
+        # that follows it -- and then a clean detach.
+        probes = [attach_client.SESSION_GONE] * attach_client.SESSION_MISSING_MAX
+        rc, calls, _sleeps = _drive(
+            monkeypatch,
+            [*codes, 0],
+            probes=[*probes, attach_client.SESSION_ALIVE],
+        )
+        assert (rc, len(calls)) == (0, len(codes) + 1)
+        assert "is not a session there" not in capsys.readouterr().out
+
+    def test_an_unreachable_host_is_never_probed_and_never_gives_up(self, monkeypatch):
+        # The flaky-wi-fi hot path: exit 255 comes from the LOCAL ssh client,
+        # is trustworthy on every OS, and must cost no extra round-trip -- so
+        # a scripted probe list that would run dry proves none was consulted.
+        rc, calls, sleeps = _drive(
+            monkeypatch, [255] * 12 + [0], probes=[attach_client.SESSION_ALIVE]
+        )
+        assert (rc, len(calls)) == (0, 13)
+        assert sleeps[-1] == attach_client.BACKOFF_MAX_S
 
     def test_no_reconnect_reports_the_drop_and_exits(self, monkeypatch, capsys):
         rc, calls, sleeps = _drive(monkeypatch, [255], reconnect=False)
         assert (rc, len(calls), sleeps) == (255, 1, [])
         assert "--no-reconnect" in capsys.readouterr().out
+
+    def test_no_reconnect_never_probes_the_host(self, monkeypatch, capsys):
+        # That flag's whole promise is the historical bare-ssh pane: one
+        # connection, one exit code, no second dial of any kind.
+        def never(*_a, **_k):
+            raise AssertionError("--no-reconnect must not probe the host")
+
+        monkeypatch.setattr(attach_client, "_probe_session", never)
+        monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/usr/bin/ssh")
+        monkeypatch.setattr(attach_client, "_run_ssh", lambda _argv: 1)
+        rc = attach_client.supervise(
+            "user@host", "psmux -L api attach", "api", reconnect=False
+        )
+        assert rc == 1
+        assert "could not be attached" in capsys.readouterr().out
 
     def test_a_missing_ssh_client_fails_fast_and_loudly(self, monkeypatch, capsys):
         monkeypatch.setattr(attach_client.shutil, "which", lambda _n: None)

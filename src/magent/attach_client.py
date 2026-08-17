@@ -11,12 +11,25 @@ keeps a pane open after its process exits, so every window became a
 terminals by hand and re-running ``magent attach``.
 
 This runs *between* wt and ssh instead: it execs the same ssh, with the same
-options and the same remote command, then reads the exit code and reconnects
-when the answer is "the transport died". Nothing about the interactive
-experience changes -- the child inherits this process's console handles
-directly (no pipes, no PTY emulation), so colors, mouse reporting and terminal
-resize reach ssh exactly as before. While a connection is up this process does
-nothing at all but wait on the child.
+options and the same remote command, then decides whether to dial again.
+Nothing about the interactive experience changes -- the child inherits this
+process's console handles directly (no pipes, no PTY emulation), so colors,
+mouse reporting and terminal resize reach ssh exactly as before. While a
+connection is up this process does nothing at all but wait on the child.
+
+WHAT STOPS A PANE. The default answer is "almost nothing": a user on flaky
+wi-fi wants the window to keep trying until the host comes back, not to close
+because one packet went missing. The pane therefore reconnects on every exit
+EXCEPT a proven deliberate detach, and "proven" is the load-bearing word --
+exit 0 does not prove it. Windows OpenSSH does not propagate a remote command's
+exit status over a pty, so a host-side session that DIED under the pane also
+reports 0, indistinguishable from ``psmux detach``. Deciding on rc alone is
+what once made every wi-fi flap close forty windows and announce them as
+detaches. The truth is fetched instead: after a disconnect the supervisor asks
+the host, over a separate non-pty connection where remote exit codes ARE
+truthful, whether the session is still alive (``session_probe_argv``). Alive
+means the user left on purpose and the pane stops; anything else means keep
+trying. See ``verdict`` for the whole table.
 
 WHY ITS OWN CONSOLE SCRIPT rather than a ``magent`` subcommand: the same reason
 ``state_hook.py`` is one (see pyproject ``[project.scripts]``). A 40-window
@@ -115,6 +128,47 @@ ESTABLISHED_S = 30.0
 RECONNECT = "reconnect"
 DETACHED = "detached"
 REMOTE_FAILED = "remote-failed"
+# The connection worked and the SESSION is not on the host. Worth a bounded
+# number of redials (a host mid-reboot, or a `magent up` about to recreate it),
+# never an unbounded one -- see SESSION_MISSING_MAX.
+SESSION_MISSING = "session-missing"
+
+# What the post-disconnect liveness probe learned about the session. This is
+# the DELIBERATE-DETACH SIGNAL, and it is out-of-band on purpose: the obvious
+# in-band design (have the remote command echo a sentinel and scan the pane's
+# output for it) would require this process to sit between ssh and the console,
+# and `_run_ssh`'s whole contract is that it never does -- piping would cost the
+# session its colors, mouse reporting and resize handling.
+SESSION_ALIVE = "session-alive"
+SESSION_GONE = "session-gone"
+PROBE_FAILED = "probe-failed"
+
+# The probe runs WITHOUT `-t`. That is the entire trick: Windows OpenSSH does
+# not propagate a remote command's exit status over a pty (see `verdict`), but
+# it does over a plain non-pty channel, on every OS. So the pane keeps its
+# interactive `-t` connection and the truth about the session is fetched over a
+# second, one-shot, non-interactive one.
+#
+# BatchMode: never prompt. A probe that stopped to ask for a password would
+# hang a pane that is trying to heal itself.
+SESSION_PROBE_OPTS = (
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=10",
+)
+# Hard ceiling on the probe, belt to ConnectTimeout's braces: a half-open
+# socket can leave ssh blocked long after connect() succeeded, and this runs on
+# the path between a dropped pane and its reconnect message.
+SESSION_PROBE_TIMEOUT_S = 20.0
+
+# Consecutive "connected fine, session isn't there" answers before the pane
+# stops and says so. Non-zero because a host that is rebooting, or a `magent
+# up` that is still working through a 45-session bring-up, genuinely does
+# answer "gone" for a minute and then "alive". Bounded because a session the
+# user really did `magent down` is never coming back on its own, and the ladder
+# would otherwise dial that host every 30s forever.
+SESSION_MISSING_MAX = 5
 
 
 def remote_attach_command(sid: str) -> str:
@@ -137,44 +191,105 @@ def ssh_argv(target: str, remote: str) -> list[str]:
     return ["ssh", *SSH_CONNECTION_OPTS, "-t", target, remote]
 
 
-def verdict(rc: int) -> str:
-    """What one ssh exit code means for the pane.
+def session_probe_argv(target: str, session: str) -> list[str]:
+    """The one-shot, non-interactive question "is ``session`` still alive?".
 
-    Three outcomes, and the middle one is the whole feature:
+    ``psmux``, not ``magent``: the answer must not depend on the host having a
+    magent new enough to have grown a probe subcommand, and psmux is by
+    definition installed on any host that has sessions to attach to. Old host,
+    new client works; the reverse is unaffected because an old client simply
+    never runs this.
 
-    * ``0`` -- the remote command finished cleanly. The user detached
-      (``psmux detach``) or quit the picker, and reconnecting would fight them.
-    * ``255`` -- ssh itself failed: refused, unreachable, DNS, auth, or a
-      mid-session disconnect. The session on the host is untouched, so this is
-      the case worth retrying, forever.
-    * anything else -- the CONNECTION worked and the remote command exited
-      non-zero (no such psmux session after a host reboot, picker error, ...).
-      Retrying re-runs a command that just failed for a reason a retry cannot
-      change, so the loop stops and says why rather than hot-looping on sshd.
+    The explicit ``-t <session>`` is REQUIRED and is the same lesson
+    ``psmux.has_session`` documents: a BARE ``has-session`` exits 0 for a socket
+    with no server at all (psmux keeps ``__warm__`` spare servers per socket),
+    which here would report every dead session as a deliberate detach and close
+    the pane -- precisely the bug being fixed.
 
-    The catch-all also swallows a ssh child that was KILLED rather than exited
-    -- ``STATUS_CONTROL_C_EXIT`` / a harness timeout on Windows, a negative
-    ``-signum`` from ``subprocess`` on POSIX. Landing those in "stop" is the
-    safe direction: something deliberately killed the client, and a supervisor
-    that answered a kill by dialling again would be unstoppable.
-
-    ONE PLATFORM CAVEAT, measured (see the real-ssh tier's
-    ``test_a_failing_remote_command_stops_instead_of_hammering_sshd``):
-    **Windows OpenSSH does not propagate a remote command's exit status over a
-    pty session.** ``ssh -t win-host "exit 7"`` reports 0 where POSIX sshd
-    reports 7. Since a magent host is usually Windows (psmux is Windows-native)
-    the third branch is effectively unreachable there: a pane whose session is
-    gone reads as a clean detach, and says "detached" instead of naming the
-    cause. Both verdicts STOP, so the behavior is right either way and only the
-    message is less specific -- and reconnect is untouched, because 255 for a
-    dead transport is produced by the local ssh CLIENT, not reported by the
-    server.
+    A host where ``psmux`` is not on the SSH session's PATH answers
+    "command not found" (9009 on cmd, 127 on a POSIX shell), i.e. non-zero, i.e.
+    NOT ``SESSION_ALIVE`` -- so the pane keeps trying rather than closing. Only
+    a positive, unambiguous rc 0 is allowed to stop a pane.
     """
+    return [
+        "ssh",
+        *SESSION_PROBE_OPTS,
+        target,
+        f"psmux -L {session} has-session -t {session}",
+    ]
+
+
+def _probe_session(target: str, session: str) -> str:
+    """Ask the host whether ``session`` is still there. Never raises."""
+    try:
+        rc = subprocess.run(
+            session_probe_argv(target, session),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            timeout=SESSION_PROBE_TIMEOUT_S,
+            check=False,
+        ).returncode
+    except (OSError, subprocess.SubprocessError):
+        # No ssh, a timeout, anything unexpected: we learned nothing. The
+        # caller reads that as "keep trying", which is the direction the user
+        # asked for on a flaky link.
+        return PROBE_FAILED
     if rc == 0:
-        return DETACHED
+        return SESSION_ALIVE
+    if rc == SSH_TRANSPORT_RC:
+        # ssh's own failure, not the remote command's: the host is unreachable
+        # right now, so the session's fate is simply unknown.
+        return PROBE_FAILED
+    return SESSION_GONE
+
+
+def verdict(rc: int, probe: str | None = None) -> str:
+    """What one ssh exit means for the pane.
+
+    ``rc`` alone is not enough, and that is the bug this signature exists to
+    fix. **Windows OpenSSH does not propagate a remote command's exit status
+    over a pty session** (measured; see the real-ssh tier's
+    ``test_a_failing_remote_command_stops_instead_of_hammering_sshd``):
+    ``ssh -t win-host "exit 7"`` reports 0 where POSIX sshd reports 7. A magent
+    host is usually Windows -- psmux is Windows-native -- so when a host-side
+    session died under the pane, ssh handed back 0 and the old table read that
+    as "the user detached", closed the pane, and told them so. On a flaky link
+    that turned every wi-fi flap into forty closed windows.
+
+    So exit 0 is no longer trusted to mean "deliberate detach". ``probe`` is,
+    because it is fetched over a NON-pty connection where the remote status is
+    truthful on every OS (see ``session_probe_argv``).
+
+    The table:
+
+    * ``rc == 255`` -- ssh's own failure: refused, unreachable, DNS, auth, or a
+      mid-session ``client_loop: send disconnect``. Produced by the LOCAL ssh
+      client, so it is trustworthy everywhere and needs no probe. The session on
+      the host is untouched; retry, forever. This is the flaky-wi-fi path and it
+      is deliberately the one branch that costs no extra round-trip.
+    * probe says the session is ALIVE -- the client left while the work kept
+      running: a real ``psmux detach``, a quit picker, or a killed ssh child.
+      Stop; reconnecting would fight the user.
+    * probe says the session is GONE -- the connection worked and the thing to
+      attach to is not there. Retry, but counted: see ``SESSION_MISSING_MAX``.
+    * probe learned nothing -- reconnect. On a link that is dropping, "I could
+      not ask" is far likelier to mean "the network is still bad" than "the user
+      detached", and closing the pane on that guess is what this fixes.
+
+    ``probe=None`` is the ``--no-reconnect`` path only, and keeps the historical
+    rc-only table byte for byte: that flag's entire promise is that the pane
+    behaves exactly as a bare ssh did.
+    """
     if rc == SSH_TRANSPORT_RC:
         return RECONNECT
-    return REMOTE_FAILED
+    if probe is None:
+        return DETACHED if rc == 0 else REMOTE_FAILED
+    if probe == SESSION_ALIVE:
+        return DETACHED
+    if probe == SESSION_GONE:
+        return SESSION_MISSING
+    return RECONNECT
 
 
 def backoff_delay(attempt: int) -> float:
@@ -238,11 +353,22 @@ def supervise(target: str, remote: str, session: str, *, reconnect: bool = True)
 
     argv = ssh_argv(target, remote)
     attempt = 0
+    # Consecutive SESSION_MISSING answers. Reset by anything else, so a host
+    # that flaps between "gone" and "reachable" never accumulates its way to a
+    # stop -- only a session that is steadily absent does.
+    missing = 0
     while True:
         started = time.monotonic()
         rc = _run_ssh(argv)
         elapsed = time.monotonic() - started
-        outcome = verdict(rc)
+        # `--no-reconnect` asks for the historical bare-ssh pane, which means no
+        # probe either: one connection, one rc, one message.
+        probe = (
+            None
+            if not reconnect or rc == SSH_TRANSPORT_RC
+            else _probe_session(target, session)
+        )
+        outcome = verdict(rc, probe)
         if outcome == DETACHED:
             _echo(
                 f"\n  {style('+', fg='green')} detached from {style(session, bold=True)}."
@@ -268,11 +394,36 @@ def supervise(target: str, remote: str, session: str, *, reconnect: bool = True)
             )
             return rc
 
+        if outcome == SESSION_MISSING:
+            missing += 1
+            if missing >= SESSION_MISSING_MAX:
+                _echo(
+                    f"\n  {style('x', fg='red')} {target} is reachable, but"
+                    f" {style(session, bold=True)} is not a session there"
+                    f" {style(f'(checked {missing} times)', dim=True)}."
+                )
+                _echo(
+                    f"  {style('Run', dim=True)}"
+                    f" {style('magent attach', bold=True)}"
+                    f" {style('to bring it back.', dim=True)}"
+                )
+                # rc is untrustworthy here by construction (a Windows host
+                # reports 0 for a remote command that failed), so a stop that
+                # means "this pane gave up" must not be able to exit 0.
+                return rc or 1
+        else:
+            missing = 0
+
         attempt = next_attempt(attempt, elapsed)
         delay = backoff_delay(attempt)
+        lost = (
+            f"{session} is not on {target} yet"
+            if outcome == SESSION_MISSING
+            else f"connection to {target} lost"
+        )
         _echo(
             f"\n  {style('~', fg='yellow')}"
-            f" {style(f'connection to {target} lost', fg='yellow')}"
+            f" {style(lost, fg='yellow')}"
             f" {style(f'(ssh exit {rc})', dim=True)}"
             f" {style(f'-- reconnecting in {delay:.0f}s', fg='yellow')}"
             f" {style(f'(attempt {attempt}; Ctrl+C to stop)', dim=True)}"
