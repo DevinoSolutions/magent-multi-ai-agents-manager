@@ -646,6 +646,68 @@ inside it. Four decisions worth keeping:
   expects them. `--no-reconnect`'s promise is the historical bare-ssh pane down
   to which fd ssh writes on, so it opts out of both regardless of the tty.
 
+**The status line owns the bottom row, and only the bottom row (2026-08-18).**
+The first version of the above drew with a bare `\r\x1b[2K` — carriage return,
+erase this row — at wherever the cursor happened to be. That turned out to be
+the single worst place available. When ssh dies mid-session the terminal is
+still in the ALTERNATE SCREEN: the remote psmux sent `\x1b[?1049h` on attach and
+the process that would have sent the matching `l` is the one that just died. So
+the pane keeps showing the agent's frozen last frame, with the cursor parked
+exactly where that TUI left it — inside the prompt box, at the end of whatever
+the user had typed and not yet sent. The reconnect warning erased their
+sentence. Reported as "don't replace the text that is written in Claude Code,
+because we may have text typed from before that we'd want to still send".
+
+Every claim in that paragraph was measured under a real pty rather than reasoned
+about (`tests/e2e/test_pty_attach_status.py`, which stages a real frozen frame
+and replays the real byte stream through a small VT model in
+`tests/e2e/_screen.py`, because a pty reports what a child WROTE and the
+question is about what the terminal DREW). Four decisions:
+
+- *There is no free row in a full-screen TUI, so stop looking for one.* The
+  obvious fix is "own your own line": emit one `\n` to scroll a blank row into
+  existence and repaint only there. On the normal screen that is free — the
+  displaced row lands in scrollback. In the ALTERNATE screen there is no
+  scrollback, so the scroll does not create a row, it DESTROYS the top one and
+  shifts every remaining row up. That trades the bottom row (a hint line) for
+  the top row (the oldest visible conversation) plus a whole-frame jump.
+- *So the bottom row is taken deliberately, absolutely, and idempotently.* Every
+  repaint is `\x1b7` + `\x1b[<rows>;1H` + `\x1b[2K` + text + `\x1b8`: save the
+  cursor, jump to the last row, erase that row alone, put the cursor back. No
+  newline is emitted for the whole of an outage, so nothing ever shifts. Because
+  the address is absolute there is no per-outage "do we still own this row?"
+  state — which matters, because after a reconnect the remote app repaints every
+  row including ours and there is no signal that says so. The one-row cost is
+  repaired by the remote's own redraw on reattach.
+- *`\x1b[9999;1H` and a trust in CUP clamping is a trap — do not go back to it.*
+  It is the standard "go to the last row without asking how tall the terminal
+  is", and it fails on Windows: click's echo runs through colorama's
+  ANSI-to-Win32 converter, which turns CUP into `SetConsoleCursorPosition` and
+  silently DROPS a row outside the buffer. The cursor then never moves and the
+  erase lands on the prompt after all — caught by the pty tier on its first run,
+  invisible to every unit assertion. `_term_rows()` re-reads the real height on
+  every repaint instead, which also follows a pane that is retiled mid-outage.
+  The DECSC/DECRC cursor restore is best-effort for the same reason (colorama
+  does not interpret those two, so a non-VT Windows console just leaves the
+  caret on the status row); nothing depends on it, because the erase is absolute.
+- *Leaving the alternate screen was considered and rejected.* `\x1b[?1049l`
+  would hand back genuinely free real estate, but `1049` is defined to CLEAR the
+  alternate buffer on the way out — the frozen frame the user asked to keep
+  looking at would vanish for the whole outage — and its cursor restore is
+  undefined when nothing ever saved one (the no-TUI remote command case).
+
+**Keystrokes typed during an outage are forwarded, not eaten (2026-08-18).**
+Measured, not assumed: the supervisor never reads stdin, so bytes typed while no
+ssh child exists stay in the TERMINAL's own input buffer and are handed to the
+next ssh child, which forwards them to the remote as if nothing had happened.
+The user's "continue to type in the prompt section" therefore already works.
+Pinned by `test_typing_during_an_outage_reaches_the_next_connection`, and worth
+pinning because the tempting hardening — drain stdin so stray keys cannot echo
+into the frozen frame — would throw away input the user meant to send. Two
+honest caveats: the buffer belongs to the terminal, so a very long paste during
+a very long outage can overflow it, and the terminal echoes those keystrokes at
+wherever the cursor is, which the remote's redraw repairs on reattach.
+
 **A psmux session must outlive the SSH connection that created it
 (2026-08-17).** The premise the whole reconnect story rests on — "losing the
 ssh client never loses work, because the session lives on the HOST" — was not

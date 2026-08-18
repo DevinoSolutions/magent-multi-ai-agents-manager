@@ -50,6 +50,14 @@ These tests use it. No fakes, no dry-run, no monkeypatched transport:
   platform finding no other tier can see: Windows OpenSSH does not propagate a
   remote exit status over a pty, which is why exit code alone may never decide
   a pane's fate (read its docstring before touching the decision table).
+* ``TestTypedTextSurvivesARealDrop`` (all OSes) -- the user-facing half of the
+  reconnect story, and the only tier that can show both halves at once: a real
+  session over a real pty, text typed into it, the ssh CLIENT killed
+  out-of-band (a wi-fi failure, not a remote command choosing to exit), and
+  then the redial. Asserts the typed text is still on screen DURING the outage
+  on a row the status line never touched, and that the reattach restores the
+  HOST's copy of it. The local rendering guarantee is pinned cell by cell,
+  without a network, by ``tests/e2e/test_pty_attach_status.py``.
 * macOS window legs are a LOUD skip (``::warning``), mirroring the
   tests/platform PR-#47 precedent: Terminal automation is TCC-blocked on
   hosted runners, and the windowless wire coverage above still runs there.
@@ -1195,6 +1203,190 @@ class TestReconnectSupervisorOverRealSsh:
         else:
             assert rc == 7, f"stdout:\n{out}\nstderr:\n{err}"
             assert "could not be attached" in out
+
+
+# ---------------------------------------------------------------------------
+# 4b. All OSes: typed-but-unsent text survives a real drop, over a real pty
+# ---------------------------------------------------------------------------
+
+
+# A stand-in for the remote SESSION -- the thing psmux would be holding open.
+# It keeps its "screen" in a file on the host, redraws that file on every
+# attach (which is what psmux does on reattach), and appends whatever is typed
+# at it. That is the whole of what the user's question depends on: their unsent
+# sentence lives in the REMOTE process, so a dropped client cannot lose it and
+# a reattach must show it again. Loopback sshd, so "a file on the host" is a
+# file this test can also read.
+_REMOTE_SESSION_PY = """\
+import sys, time
+buf = sys.argv[1]
+try:
+    prev = open(buf, encoding="utf-8").read().replace("\\n", " ").strip()
+except OSError:
+    prev = ""
+# The alternate screen, entered exactly as psmux/an agent TUI enters it: this
+# is what leaves the local terminal frozen mid-frame when the link dies.
+sys.stdout.write("\\x1b[?1049h\\x1b[2J\\x1b[1;1H")
+sys.stdout.write("REMOTE-READY\\r\\n")
+sys.stdout.write("BUFFER>" + prev + "<\\r\\n")
+sys.stdout.flush()
+deadline = time.monotonic() + 180
+while time.monotonic() < deadline:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    text = line.strip()
+    if not text:
+        continue
+    with open(buf, "a", encoding="utf-8") as fh:
+        fh.write(text + "\\n")
+    sys.stdout.write("ECHO>" + text + "<\\r\\n")
+    sys.stdout.flush()
+"""
+
+
+def _pty_backend_or_skip() -> None:
+    if sys.platform == "win32":
+        pytest.importorskip("winpty", reason="pywinpty needed to drive a real pty")
+    else:
+        pytest.importorskip("pexpect", reason="pexpect needed to drive a real pty")
+
+
+def _kill_ssh_carrying(token: str) -> None:
+    """Kill the ssh CLIENT whose command line carries ``token``, and only it.
+
+    Out-of-band on purpose: the drop has to look to the supervisor exactly like
+    a wi-fi failure -- something outside the process killing the connection --
+    rather than a remote command choosing to exit. Narrowed to processes
+    actually named ``ssh`` so the supervisor itself, whose argv carries the same
+    token in ``--remote``, is never the one that dies.
+    """
+    if sys.platform == "win32":
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name='ssh.exe'\" | "
+                f"Where-Object {{ $_.CommandLine -like '*{token}*' }} | "
+                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
+            ],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        return
+    found = subprocess.run(
+        ["pgrep", "-f", token], capture_output=True, text=True, timeout=30, check=False
+    )
+    for pid in found.stdout.split():
+        comm = subprocess.run(
+            ["ps", "-o", "comm=", "-p", pid],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if os.path.basename(comm.stdout.strip()) == "ssh":
+            with suppress(OSError, ValueError):
+                os.kill(int(pid), 9)
+
+
+class TestTypedTextSurvivesARealDrop:
+    """The user's actual question, answered over the real wire.
+
+    "When we get the reconnecting warning, don't replace the text that is
+    written in Claude Code, because we may have text typed from before that
+    we'd want to still send." Two halves, and only a real connection can show
+    both at once:
+
+    * the LOCAL half -- the reconnect status line must not erase the frozen
+      frame the user is looking at. Pinned in detail, grid cell by grid cell,
+      by the real-pty tier (``test_pty_attach_status.py``), which can stage a
+      frozen frame deterministically without a network.
+    * the REMOTE half -- the sentence itself lives in the remote process, so
+      killing the connection cannot lose it and the reattach must bring it
+      back. THAT is what needs a real ssh, a real out-of-band kill, and a real
+      redial, and it is what this test is for.
+    """
+
+    def test_typed_text_survives_a_real_reconnect(self, tmp_path, ssh_wire):
+        _pty_backend_or_skip()
+        from tests.e2e._pty import Pty
+        from tests.e2e._screen import Screen
+
+        exe = _attach_client_exe()
+        target = _ssh_target(ssh_wire["host"])
+        python = _remote_python(target)
+        token = f"unsent{uuid.uuid4().hex[:8]}"
+        script = tmp_path / f"{token}-session.py"
+        script.write_text(_REMOTE_SESSION_PY, encoding="utf-8")
+        buffer = tmp_path / f"{token}-buffer.txt"
+        remote = f'{python} "{script.as_posix()}" "{buffer.as_posix()}"'
+
+        rows, cols = 24, 80
+        pty = Pty(
+            [exe, "--target", target, "--session", token, "--remote", remote],
+            # COLUMNS/LINES stripped for the same reason the pty tier strips
+            # them: `shutil.get_terminal_size` prefers them over the real pty,
+            # and the bottom-row assertions below depend on the real one.
+            env={
+                k: v
+                for k, v in os.environ.items()
+                if k.upper() not in ("PYTHONPATH", "COLUMNS", "LINES")
+            },
+            cwd=str(tmp_path),
+            dimensions=(rows, cols),
+        )
+        try:
+            # 1. A real session, over a real connection.
+            pty.expect("REMOTE-READY", timeout=180)
+            # 2. The user types, and it lands on the HOST.
+            pty.send_line(token)
+            pty.expect(f"ECHO>{token}<", timeout=120)
+            assert _wait_until(
+                lambda: buffer.exists() and token in buffer.read_text(encoding="utf-8"),
+                timeout=60,
+            ), "the typed text never reached the host"
+
+            # 3. The wi-fi "drops": something outside the pane kills the client.
+            _kill_ssh_carrying(token)
+
+            # 4. The pane heals itself, and while it does, the status line is
+            #    on screen -- this is the moment the old code erased the frame.
+            pty.expect("reconnecting", timeout=180)
+            mid_outage = Screen(rows=rows, cols=cols).feed(pty.raw)
+
+            # 5. The reattach redraws the session, typed text and all.
+            pty.expect(f"BUFFER>{token}<", timeout=300)
+            healed = Screen(rows=rows, cols=cols).feed(pty.raw)
+        finally:
+            with suppress(Exception):
+                pty.close()
+            _kill_ssh_carrying(token)
+
+        mid_report = f"\n--- mid-outage screen ---\n{mid_outage.text}"
+        # The status line owns the bottom row and nothing else -- so whatever
+        # the user was looking at above it is still there to read.
+        assert "reconnecting" in mid_outage.line(rows - 1), (
+            f"the status line is not on the bottom row{mid_report}"
+        )
+        assert sum("reconnecting" in line for line in mid_outage.lines) == 1, (
+            f"the status line was drawn more than once{mid_report}"
+        )
+        # THE HEADLINE: the sentence the user typed and did not send is still
+        # on the screen during the outage, on a row the status line never
+        # touched.
+        typed_row = mid_outage.row_of(f"ECHO>{token}<")
+        assert typed_row not in (-1, rows - 1), (
+            f"the typed text was erased by the reconnect warning{mid_report}"
+        )
+        # ...and after the redial it is the REMOTE's copy that comes back,
+        # which is the reason it was never really at risk.
+        assert f"BUFFER>{token}<" in healed.text, (
+            f"the reattached session did not restore the typed text\n"
+            f"--- healed screen ---\n{healed.text}"
+        )
 
 
 # ---------------------------------------------------------------------------

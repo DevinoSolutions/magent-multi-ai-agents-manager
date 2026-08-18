@@ -45,9 +45,25 @@ outage scrolled thirty lines of the same news past the user's work. The pane
 now renders ONE line, rewritten in place, that carries every changing number
 (attempt, countdown, last error). ``status_text`` composes it and truncates it
 to the terminal width, because a status line that wraps cannot be rewritten by
-a carriage return and degenerates into exactly the scroll it replaces. See
-``_StderrPump`` for what happens to ssh's own noise, and ``_stdout_is_tty`` for
-the piped/redirected fallback.
+a carriage return and degenerates into exactly the scroll it replaces. That one
+line is drawn on the BOTTOM ROW and nowhere else -- when ssh dies the terminal
+is still showing the frozen last frame of the remote TUI, cursor parked in the
+user's half-typed prompt, and drawing "at the cursor" wiped that sentence. See
+``STATUS_HOME`` for the whole story. See ``_StderrPump`` for what happens to
+ssh's own noise, and ``_stdout_is_tty`` for the piped/redirected fallback.
+
+KEYSTROKES TYPED DURING AN OUTAGE reach the remote agent after the reconnect,
+and that is deliberate rather than accidental. This process never reads stdin
+-- not to drain it, not to poll it -- so bytes typed while no ssh child exists
+stay in the TERMINAL's own input buffer and are handed to the next ssh child,
+which forwards them to the remote as if the connection had never dropped.
+Measured under a real pty (``test_typing_during_an_outage_reaches_the_next
+_connection``). Two honest caveats, neither worth "fixing": the buffer is the
+terminal's, so a very long paste during a very long outage can overflow it, and
+the terminal echoes those keystrokes locally at wherever the cursor happens to
+be -- inside the frozen frame -- which the remote's full redraw repairs on
+reattach. Do NOT add a stdin drain here: it would throw away input the user
+meant to send.
 
 CORPSE COHERENCE -- read this before changing the argv. ``cli/attach.py``
 decides a pane is dead by scanning live process command lines for
@@ -188,9 +204,70 @@ SESSION_MISSING_MAX = 5
 # Presentation. Everything below draws the outage; nothing below decides it.
 # ---------------------------------------------------------------------------
 
-# Rewrite-in-place control sequence: carriage return, then erase the whole line.
+# WHERE THE STATUS LINE IS ALLOWED TO DRAW, and this is the part that was wrong.
+#
+# When ssh dies mid-session the terminal is still in the ALTERNATE SCREEN: the
+# remote psmux sent `\x1b[?1049h` on attach and nothing ever sent the matching
+# `l`, because the process that would have sent it is the one that just died.
+# Measured under a real pty (tests/e2e/test_pty_attach_status.py): the child's
+# `?1049h` reaches the terminal, no `?1049l` follows from anybody, and the
+# cursor is left exactly where the remote TUI parked it -- which for a Claude
+# Code pane is INSIDE THE PROMPT BOX, at the end of whatever the user had typed
+# and not yet sent.
+#
+# The first version of this file repainted with a bare `\r\x1b[2K` at that
+# cursor. That erases the row the cursor is on, i.e. the user's half-written
+# prompt, and replaces it with the reconnect line. The text was never actually
+# lost -- it lives in the REMOTE process, and psmux repaints it on reattach --
+# but a user watching their sentence get wiped by a warning has no way to know
+# that, and the pane they were about to hit Enter in now shows our text instead.
+#
+# So the status line no longer draws "here". It draws on the BOTTOM ROW,
+# absolutely addressed, with the cursor saved first and restored after:
+#
+#   * `\x1b7` / `\x1b8` (DECSC/DECRC) leave the frame's own cursor -- and its
+#     colors -- exactly as the dead TUI left them, so the caret stays blinking
+#     in the prompt box where the user expects it and our yellow never leaks.
+#     Best-effort, and deliberately so: on a Windows console that has NOT
+#     enabled virtual-terminal processing, colorama handles the CSI sequences
+#     via the console API while these two pass through uninterpreted, so the
+#     caret just stays parked on the status row instead. Nothing depends on the
+#     restore -- the erase jumps to the bottom row ABSOLUTELY on every repaint,
+#     so a cursor left anywhere still cannot put an erase on the user's prompt.
+#   * `\x1b[<rows>;1H` puts us on the last row, with `<rows>` re-read from the
+#     terminal on every repaint (`_term_rows`) so a resized pane is followed.
+#     The tempting version of this is `\x1b[9999;1H` and a trust that terminals
+#     clamp CUP -- do NOT go back to it. On Windows, click's echo runs through
+#     colorama's ANSI-to-Win32 converter, which turns CUP into a
+#     `SetConsoleCursorPosition` call and SILENTLY DROPS a row outside the
+#     buffer: the cursor then never moves, and the erase that follows lands on
+#     the user's prompt after all. Measured -- it is what
+#     `tests/e2e/test_pty_attach_status.py` caught on the first run.
+#   * `\x1b[2K` then erases ONE row: the bottom one, and only after the cursor
+#     is provably on it. That row is the only thing this module ever touches.
+#
+# WHY NOT SCROLL A FRESH LINE INTO EXISTENCE INSTEAD (`\n` at the bottom), which
+# is the obvious "own your own row" move: in the alternate screen there is no
+# scrollback, so a scroll does not create a row -- it DESTROYS the top one and
+# shifts every remaining row up by one. That trades the bottom row (a hint line)
+# for the top row (the oldest visible conversation) plus a full-frame jump, and
+# it needs per-outage ownership bookkeeping that cannot be kept honest: after a
+# reconnect the remote app repaints every row, so a row we "own" from before is
+# not ours any more and we have no signal that says so. Absolute addressing
+# needs no such state -- every repaint is idempotent.
+#
+# WHY NOT LEAVE THE ALTERNATE SCREEN (`\x1b[?1049l`) so there is genuinely free
+# real estate: because `?1049l` is defined to CLEAR the alternate buffer on the
+# way out, so the frozen frame -- the very thing the user asked to keep looking
+# at, typed prompt and all -- would vanish for the whole outage. Its cursor
+# restore is also undefined when nothing ever saved one, which is the
+# no-TUI-remote-command case (`--no-mux`, the session picker).
+#
 # Only ever written when stdout is a tty (see `_stdout_is_tty`).
-ERASE_LINE = "\r\x1b[2K"
+SAVE_CURSOR = "\x1b7"
+RESTORE_CURSOR = "\x1b8"
+BOTTOM_ROW = "\x1b[{row};1H"
+ERASE_LINE = "\x1b[2K"
 
 # How long the "last: ..." clause may get before it is elided. Sized so the
 # longest real ssh diagnostic that matters ("Connection timed out",
@@ -224,6 +301,11 @@ TICK_S = 1.0
 # Narrowest width the status line is composed for. Below this a terminal cannot
 # show anything useful anyway, and the clipping math stops being meaningful.
 MIN_WIDTH = 20
+
+# Shortest pane the bottom row is addressed in. A reported height of 0 (or a
+# negative one, from a terminal that answers nonsense while it is being
+# resized) would build `\x1b[0;1H`, which no terminal reads as a row.
+MIN_ROWS = 1
 
 
 def remote_attach_command(sid: str) -> str:
@@ -392,11 +474,12 @@ def _write(text: str) -> None:
 
     ``color=True`` is not a style choice, it is the whole mechanism: click
     strips every ``\\x1b[...]`` sequence from a stream it does not consider a
-    color sink, and ``ERASE_LINE`` is such a sequence. Stripped, the repaint
-    becomes a bare carriage return that overwrites only the first N characters
-    of the previous line and leaves its tail behind -- the exact wrap-garbage
-    this is meant to remove. Only ever reached when ``_stdout_is_tty`` already
-    said yes, so forcing the sequences through is honest.
+    color sink, and ``status_home()`` is nothing BUT such sequences. Stripped,
+    the repaint loses its cursor save, its jump to the bottom row and its
+    erase, and degenerates into the status text being typed straight into
+    whatever the user was reading -- the exact damage this module exists to
+    avoid. Only ever reached when ``_stdout_is_tty`` already said yes, so
+    forcing the sequences through is honest.
     """
     click.echo(text, nl=False, color=True)
     with contextlib.suppress(OSError, ValueError):
@@ -420,16 +503,44 @@ def _stdout_is_tty() -> bool:
 def _term_width() -> int:
     """Columns available for the status line, re-read on every repaint.
 
-    One column is held back deliberately. Writing exactly ``columns``
-    characters puts the cursor past the last cell, which on the Windows console
-    scrolls a line -- and a status line that scrolls is a status line the next
-    carriage return can no longer reach.
+    One column is held back deliberately, and it matters more now than it did:
+    writing exactly ``columns`` characters on the BOTTOM row puts the cursor
+    past the last cell, which scrolls the screen -- and in the alternate screen
+    a scroll shifts the whole frozen frame up and pushes its top row into a
+    scrollback that does not exist. One spare column is what keeps a repaint
+    from moving the user's work.
     """
     try:
         columns = shutil.get_terminal_size(fallback=(80, 24)).columns
     except (OSError, ValueError):
         columns = 80
     return max(MIN_WIDTH, columns - 1)
+
+
+def _term_rows() -> int:
+    """Which row is the bottom one, re-read on every repaint.
+
+    Re-read rather than cached because a pane can be resized mid-outage (magent
+    tiles forty of them; a monitor change retiles every one), and a status line
+    addressed at the OLD bottom row would start erasing a row in the middle of
+    the frozen frame -- the exact damage this whole mechanism avoids.
+
+    The fallback is 24 for the same reason ``_term_width``'s is 80: a terminal
+    that cannot report its size is far likelier to be small than huge, and
+    aiming too LOW only costs a row of frame that the reconnect repaints
+    anyway, where aiming too high would put the cursor off-screen.
+    """
+    try:
+        lines = shutil.get_terminal_size(fallback=(80, 24)).lines
+    except (OSError, ValueError):
+        lines = 24
+    return max(MIN_ROWS, lines)
+
+
+def status_home() -> str:
+    """The prefix every repaint starts with: save the cursor, park on the
+    bottom row, blank that row. Never emitted without ``RESTORE_CURSOR``."""
+    return SAVE_CURSOR + BOTTOM_ROW.format(row=_term_rows()) + ERASE_LINE
 
 
 def _clip(text: str, width: int) -> str:
@@ -533,11 +644,27 @@ def _duration(seconds: float) -> str:
 class StatusLine:
     """The single pane row an outage owns, rewritten in place.
 
+    THE ROW IS THE BOTTOM ONE, AND NOTHING ELSE IS EVER TOUCHED. Every write is
+    ``status_home()`` (save cursor, jump to the bottom row, erase that row) then
+    the text then ``RESTORE_CURSOR`` -- see the ``SAVE_CURSOR`` block above for
+    why the frozen alternate-screen frame makes "draw at the cursor" the wrong
+    answer. Three consequences worth keeping:
+
+    * NOT ONE NEWLINE is emitted, ever. The frame never scrolls, so nothing
+      shifts and the alternate screen's top row (which has no scrollback to
+      fall into) is never pushed out of existence.
+    * Every repaint is idempotent and absolutely addressed, so there is no
+      "do we still own this row?" state to get wrong across a reconnect --
+      after which the remote app has repainted every row including ours.
+    * The user's half-typed prompt, wherever the dead TUI left it, is left
+      alone: the only row this can land on is the bottom one, and the caret is
+      put straight back where the frame had it.
+
     Not a spinner class for its own sake: it exists so that exactly one place
-    knows whether a status line is currently on screen. Erasing a line that was
-    never drawn would blank whatever the remote session left behind, and
-    forgetting to erase one leaves ``reconnecting ... retry in 1s`` frozen
-    above the restored session forever.
+    knows whether a status line is currently on screen. Erasing a row that was
+    never drawn on would blank whatever the remote session left at the bottom
+    for no reason, and forgetting to erase one leaves ``reconnecting ... retry
+    in 1s`` stranded under the restored session forever.
 
     ``tty=False`` makes every method a no-op; the caller then prints one plain
     line per attempt instead.
@@ -550,12 +677,12 @@ class StatusLine:
     def show(self, text: str) -> None:
         if not self._tty:
             return
-        _write(ERASE_LINE + style(text, fg="yellow"))
+        _write(status_home() + style(text, fg="yellow") + RESTORE_CURSOR)
         self._shown = True
 
     def clear(self) -> None:
         if self._tty and self._shown:
-            _write(ERASE_LINE)
+            _write(status_home() + RESTORE_CURSOR)
             self._shown = False
 
 
@@ -766,7 +893,9 @@ def supervise(target: str, remote: str, session: str, *, reconnect: bool = True)
             detail = dial.detail
             # From here on the terminal is ours again, so the outage's status
             # line -- last seen reading "dialing" -- goes before anything else
-            # is printed.
+            # is printed. Safe to fire even after a session that ran for hours
+            # and repainted every row: `clear` only ever blanks the BOTTOM row,
+            # absolutely addressed, and puts the cursor straight back.
             status.clear()
             if attempt and elapsed >= ESTABLISHED_S:
                 # The permanent record of a healed outage, and the only line an

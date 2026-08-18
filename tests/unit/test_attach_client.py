@@ -15,6 +15,7 @@ corpse) is pinned from the attach side, where the spawn argv is actually built:
 from __future__ import annotations
 
 import io
+import os
 import subprocess
 from typing import NamedTuple
 
@@ -520,39 +521,144 @@ class TestCondenseError:
 
 
 class TestStatusLineWriter:
-    """The terminal half: erase-then-write, and only when there is a terminal."""
+    """The terminal half: WHERE the status line is allowed to draw.
 
-    def test_a_tty_pane_rewrites_one_line_in_place(self, capsys):
+    When ssh dies mid-session the terminal is still showing the remote TUI's
+    frozen last frame, with the cursor parked in the user's half-typed prompt.
+    The first version of this repainted with a bare ``\\r\\x1b[2K`` right there
+    and erased the sentence the user was about to send -- the reported bug. The
+    contract below is what replaced it, and it is stated in escape sequences
+    because that is what the guarantee is made of; the same guarantee stated as
+    "the text is still on screen" lives in the real-pty tier
+    (``tests/e2e/test_pty_attach_status.py``).
+    """
+
+    def test_every_repaint_erases_only_after_jumping_to_the_bottom_row(
+        self, capsys, monkeypatch
+    ):
+        # THE REGRESSION GUARD. An erase that is not preceded by an absolute
+        # move to the bottom row is an erase landing on whatever row the dead
+        # TUI left the cursor on.
+        monkeypatch.setattr(attach_client, "_term_rows", lambda: 24)
         line = attach_client.StatusLine(tty=True)
         line.show("first")
         line.show("second")
         out = capsys.readouterr().out
+        home = attach_client.SAVE_CURSOR + "\x1b[24;1H" + attach_client.ERASE_LINE
         assert out.count(attach_client.ERASE_LINE) == 2
-        assert "\n" not in out
+        assert out.count(home) == 2
         # Every repaint erases before it writes, so the row shows only the
         # newest text -- never "second" printed over the tail of "first".
         assert out.index("second") > out.index("first")
-        assert out.rindex(attach_client.ERASE_LINE) < out.index("second")
+        assert out.rindex(home) < out.index("second")
 
-    def test_clearing_erases_only_a_line_that_was_drawn(self, capsys):
+    def test_the_old_erase_at_the_cursor_repaint_is_gone(self, capsys):
+        # Spelled out rather than implied: this exact sequence is the bug.
+        attach_client.StatusLine(tty=True).show("anything")
+        assert "\r\x1b[2K" not in capsys.readouterr().out
+
+    def test_not_one_newline_is_ever_emitted(self, capsys):
+        # "Scroll a fresh row into existence" is the obvious way to own a line
+        # and it is wrong here: the alternate screen has no scrollback, so a
+        # scroll destroys the frame's top row and shoves everything else up.
+        line = attach_client.StatusLine(tty=True)
+        line.show("first")
+        line.show("second")
+        line.clear()
+        assert "\n" not in capsys.readouterr().out
+
+    def test_the_frames_own_cursor_is_put_back_after_every_write(self, capsys):
+        line = attach_client.StatusLine(tty=True)
+        line.show("x")
+        out = capsys.readouterr().out
+        assert out.startswith(attach_client.SAVE_CURSOR)
+        assert out.endswith(attach_client.RESTORE_CURSOR)
+
+    def test_the_bottom_row_is_re_read_so_a_resized_pane_is_followed(
+        self, capsys, monkeypatch
+    ):
+        # A pane can be retiled mid-outage; a status line still addressed at the
+        # old bottom row would start erasing a row inside the frozen frame.
+        line = attach_client.StatusLine(tty=True)
+        monkeypatch.setattr(attach_client, "_term_rows", lambda: 24)
+        line.show("x")
+        monkeypatch.setattr(attach_client, "_term_rows", lambda: 50)
+        line.show("x")
+        out = capsys.readouterr().out
+        assert "\x1b[24;1H" in out
+        assert "\x1b[50;1H" in out
+
+    def test_clearing_erases_only_a_line_that_was_drawn(self, capsys, monkeypatch):
+        monkeypatch.setattr(attach_client, "_term_rows", lambda: 24)
         line = attach_client.StatusLine(tty=True)
         line.clear()
         assert capsys.readouterr().out == ""
         line.show("x")
         capsys.readouterr()
         line.clear()
-        assert capsys.readouterr().out == attach_client.ERASE_LINE
+        assert capsys.readouterr().out == (
+            attach_client.SAVE_CURSOR
+            + "\x1b[24;1H"
+            + attach_client.ERASE_LINE
+            + attach_client.RESTORE_CURSOR
+        )
         # ...and a second clear is a no-op, so it cannot blank whatever the
         # restored remote session printed next.
         line.clear()
         assert capsys.readouterr().out == ""
 
     def test_a_redirected_pane_gets_no_escape_sequences_at_all(self, capsys):
-        # Carriage-return animation in a log file is unreadable garbage.
+        # Cursor animation in a log file is unreadable garbage.
         line = attach_client.StatusLine(tty=False)
         line.show("anything")
         line.clear()
         assert capsys.readouterr().out == ""
+
+
+def _fake_terminal(monkeypatch, answer):
+    """Make ONLY ``attach_client``'s view of ``shutil`` answer ``answer``.
+
+    Not ``monkeypatch.setattr(shutil, "get_terminal_size", ...)``: that is the
+    real stdlib module, and pytest's own terminal writer calls the same function
+    to size its output. Patching it globally took the whole session down with an
+    INTERNALERROR the moment pytest tried to print a line while the patch was
+    live -- which is exactly what happened in CI (`-v` prints per test) and not
+    locally (`-q` does not). Swapping the module OBJECT inside this one
+    namespace keeps the blast radius at the module under test.
+    """
+    import shutil as real_shutil
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        attach_client,
+        "shutil",
+        SimpleNamespace(get_terminal_size=answer, which=real_shutil.which),
+    )
+
+
+class TestBottomRowProbe:
+    """``_term_rows``: which row the status line is allowed to own."""
+
+    def test_it_reports_the_terminals_real_height(self, monkeypatch):
+        _fake_terminal(monkeypatch, lambda **_k: os.terminal_size((120, 40)))
+        assert attach_client._term_rows() == 40
+
+    @pytest.mark.parametrize("boom", [OSError("no tty"), ValueError("nonsense")])
+    def test_a_terminal_that_cannot_answer_falls_back_rather_than_crashing(
+        self, monkeypatch, boom
+    ):
+        def raise_it(**_kwargs):
+            raise boom
+
+        _fake_terminal(monkeypatch, raise_it)
+        assert attach_client._term_rows() == 24
+
+    def test_a_nonsense_height_never_builds_a_row_zero_move(self, monkeypatch):
+        # `\x1b[0;1H` is not a row on any terminal; a pane being resized can
+        # briefly report a height of 0.
+        _fake_terminal(monkeypatch, lambda **_k: os.terminal_size((80, 0)))
+        assert attach_client._term_rows() >= 1
+        assert "[0;1H" not in attach_client.status_home()
 
 
 class TestQuietReconnects:
