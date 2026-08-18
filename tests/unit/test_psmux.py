@@ -1806,3 +1806,49 @@ class TestKillPrimitives:
         )
         assert psmux.kill_servers(["a", "b"]) == ["a", "b"]
         assert sorted(killed) == ["a", "b"]
+
+
+class TestSendKeysIsBounded:
+    """``send-keys`` was the one psmux call in this module with NO timeout, and
+    the one an HTTP request handler ran inline. An Alt+V upload was measured
+    answering 74 s after the press because of it -- by which time the listener
+    had given up at 20 s and told the user the upload had failed."""
+
+    def _timeouts(self, monkeypatch) -> list[object]:
+        seen: list[object] = []
+
+        def _run(cmd, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            return _FakeCompleted(0, "")
+
+        monkeypatch.setattr(subprocess, "run", _run)
+        return seen
+
+    def test_it_asks_for_a_timeout_by_default(self, monkeypatch):
+        seen = self._timeouts(monkeypatch)
+        psmux.send_keys("api", "hello", psmux="psmux")
+        assert seen == [psmux.SEND_KEYS_TIMEOUT_S]
+        assert psmux.SEND_KEYS_TIMEOUT_S > 0
+
+    def test_a_caller_with_its_own_budget_wins(self, monkeypatch):
+        seen = self._timeouts(monkeypatch)
+        psmux.send_keys("api", "hello", psmux="psmux", timeout=5.0)
+        assert seen == [5.0]
+
+    def test_a_hung_psmux_is_a_false_not_an_exception(self, monkeypatch, caplog):
+        def _boom(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="psmux", timeout=1)
+
+        monkeypatch.setattr(subprocess, "run", _boom)
+        with caplog.at_level(logging.WARNING, logger="magent.launch"):
+            assert psmux.send_keys("api", "hello", psmux="psmux") is False
+        # Silence is how a paste vanishes without a trace; the give-up names
+        # the project and the wait it cost.
+        assert "send-keys" in caplog.text and "api" in caplog.text
+
+    def test_an_unlaunchable_psmux_is_a_false_too(self, monkeypatch):
+        def _boom(*a, **k):
+            raise OSError("no such binary")
+
+        monkeypatch.setattr(subprocess, "run", _boom)
+        assert psmux.send_keys("api", "hello", psmux="psmux") is False

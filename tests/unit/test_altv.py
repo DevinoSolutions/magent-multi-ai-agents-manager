@@ -247,6 +247,35 @@ class TestFailuresAreSpecific:
         assert outcome == "inject-failed"
         assert seen[-1] == f"{altv.FLASH_PREFIX}{altv.OUTCOME_REASONS['inject-failed']}"
 
+    def test_a_pending_paste_is_narrated_as_saved_never_as_a_failure(self, monkeypatch):
+        # The measured defect: a psmux control command that stalled 74s made the
+        # listener time out at 20s and flash "upload failed - is `magent serve`
+        # running?" about a file that was already on disk and that psmux went on
+        # to paste. The server now answers early and says so; the bar must carry
+        # that distinction rather than collapse it into a failure.
+        seen = self._dispatched(monkeypatch)
+        server = _Upload(
+            {
+                "ok": True,
+                "path": "/tmp/x.bmp",
+                "injected": False,
+                "inject_pending": True,
+            }
+        )
+        try:
+            outcome = altv.handle_press(server.url, "marka", lambda: b"BMP")
+        finally:
+            server.close()
+
+        assert outcome == "inject-pending"
+        assert (
+            seen[-1] == f"{altv.FLASH_PREFIX}{altv.OUTCOME_REASONS['inject-pending']}"
+        )
+        assert "fail" not in seen[-1].lower(), seen[-1]
+        # The image is named as SAVED -- that is what stops a rerun, and a rerun
+        # is what pastes the same screenshot twice.
+        assert "saved" in seen[-1].lower(), seen[-1]
+
     def test_an_unexpected_error_is_caught_logged_and_shown_not_raised(
         self, monkeypatch, caplog
     ):
@@ -280,6 +309,7 @@ class TestFailuresAreSpecific:
             "serve-unreachable",
             "upload-rejected",
             "inject-failed",
+            "inject-pending",
             "error",
         }
         # Every outcome the user can SEE needs words for the bar. The
@@ -287,6 +317,14 @@ class TestFailuresAreSpecific:
         assert set(altv.OUTCOME_REASONS) == set(altv.ALTV_OUTCOMES) - {
             "not-a-magent-window"
         }
+
+    def test_the_safe_outcomes_are_the_ones_whose_image_is_on_disk(self):
+        # The tint and the wording both key off this set, so it must not drift
+        # into "every outcome that is not an exception". Exactly two outcomes
+        # leave the screenshot recoverable: the paste landed, or it has not
+        # landed YET.
+        assert set(altv.ALTV_SAFE_OUTCOMES) == {"ok", "inject-pending"}
+        assert set(altv.ALTV_SAFE_OUTCOMES) <= set(altv.ALTV_OUTCOMES)
 
 
 class TestTheFlashCanNeverHurtThePress:
@@ -332,6 +370,19 @@ class TestTheFlashCanNeverHurtThePress:
         from magent import psmux
 
         assert altv.FLASH_HTTP_TIMEOUT_S > psmux.FLASH_TIMEOUT_S
+
+    def test_the_press_outwaits_the_servers_own_answer_deadline(self):
+        # The false "upload failed" was this inequality inverted: the handler
+        # pasted inline with NO bound while the press gave up at 20s, so the
+        # client timed out on a request the server was still (successfully)
+        # working on. The server now owes an answer inside INJECT_GRACE_S, and
+        # it must stay comfortably the smaller of the two.
+        from magent import upload_server
+
+        assert upload_server.INJECT_GRACE_S < altv.UPLOAD_HTTP_TIMEOUT_S
+        # ...comfortably: the reply also has to carry a multi-megabyte body's
+        # read time, so a grace that merely squeaked under would still be a race.
+        assert upload_server.INJECT_GRACE_S * 2 < altv.UPLOAD_HTTP_TIMEOUT_S
 
     def test_a_dead_server_is_swallowed_by_the_transport_itself(self):
         # flash_status is best-effort by construction: nothing listening on
@@ -387,6 +438,26 @@ class TestTint:
         # ...and the phases before it were not pre-emptively red.
         assert seen[0].startswith(f"{FLASH_TINT_OK}:"), seen
 
+    def test_a_pending_paste_stays_green_because_the_image_is_safe(self, monkeypatch):
+        # Red on this bar reads as "your screenshot is gone". The file is in
+        # ~/.magent/uploads and psmux is still being asked to paste it, so red
+        # would be the same lie as the old "upload failed".
+        from magent.sessions import FLASH_TINT_OK
+
+        seen = self._tints(monkeypatch)
+        monkeypatch.setattr(
+            altv,
+            "upload_image",
+            lambda *a: (
+                "inject-pending",
+                altv.OUTCOME_REASONS["inject-pending"],
+                "inject_pending=true",
+            ),
+        )
+        altv.handle_press("http://x:8034", "marka", lambda: b"BMP")
+        _drain()
+        assert all(m.startswith(f"{FLASH_TINT_OK}:") for m in seen), seen
+
     def test_the_url_carries_the_tint(self):
         from magent.sessions import FLASH_TINT_ERR, build_flash_url
 
@@ -430,6 +501,28 @@ class TestUploadImage:
             server.close()
         assert outcome == "ok"
         assert reason == altv.OUTCOME_REASONS["ok"]
+
+    def test_the_three_paste_states_are_read_as_three_different_outcomes(self):
+        # `injected` alone cannot distinguish "psmux refused" from "psmux has
+        # not answered yet", and conflating them is what produced a failure
+        # message for a screenshot that was safe on disk.
+        cases = {
+            ("ok",): {"ok": True, "injected": True},
+            ("inject-pending",): {
+                "ok": True,
+                "injected": False,
+                "inject_pending": True,
+            },
+            ("inject-failed",): {"ok": True, "injected": False},
+        }
+        for (expected,), reply in cases.items():
+            server = _Upload(reply)
+            try:
+                outcome, reason, _ = altv.upload_image(server.url, "marka", b"x")
+            finally:
+                server.close()
+            assert outcome == expected, reply
+            assert reason == altv.OUTCOME_REASONS[expected]
 
     def test_the_upload_flags_itself_so_the_server_stays_off_the_status_line(self):
         # ?project= is how the server knows this paste already has a narrator.

@@ -64,6 +64,8 @@ with open(LOG, "a", encoding="utf-8") as fh:
     fh.write(json.dumps({"t": time.time(), "argv": argv}) + "\\n")
 if DELAY and "display-message" in argv:
     time.sleep(DELAY)
+if INJECT_DELAY and "send-keys" in argv:
+    time.sleep(INJECT_DELAY)
 sys.exit(0)
 """
 
@@ -71,7 +73,9 @@ sys.exit(0)
 class _Fleet:
     """One real `magent serve` + one recording multiplexer on its PATH."""
 
-    def __init__(self, tmp_path, flash_delay_s: float = 0.0):
+    def __init__(
+        self, tmp_path, flash_delay_s: float = 0.0, inject_delay_s: float = 0.0
+    ):
         self.unique = uuid.uuid4().hex[:10]
         self.project = f"mdaltv-{self.unique}"
         self.home = tmp_path / "home"
@@ -81,7 +85,7 @@ class _Fleet:
         self.log = tmp_path / "psmux-calls.jsonl"
         self.bin_dir = tmp_path / "bin"
         self.bin_dir.mkdir()
-        self._write_shim(flash_delay_s)
+        self._write_shim(flash_delay_s, inject_delay_s)
 
         self.port = _free_port()
         self.url = f"http://127.0.0.1:{self.port}"
@@ -149,16 +153,22 @@ class _Fleet:
         env["PATH"] = str(self.bin_dir) + os.pathsep + env.get("PATH", "")
         return env
 
-    def _write_shim(self, delay_s: float) -> None:
+    def _write_shim(self, delay_s: float, inject_delay_s: float = 0.0) -> None:
         """A REAL executable named `psmux`, recording every argv it is given.
 
         Not a mock inside the product: the server resolves it off PATH with the
         same shutil.which every install uses, and spawns it with the same
         subprocess call, so the recorded argv IS what psmux would have got.
+
+        The two delays are separate because the two stalls are: a slow STATUS
+        LINE (``display-message``) is a narration problem, and a slow PASTE
+        (``send-keys``) is the one that used to hold an HTTP reply open past the
+        listener's patience.
         """
         script = self.bin_dir / "psmux_shim.py"
         script.write_text(
-            f"LOG = {str(self.log)!r}\nDELAY = {delay_s!r}\n" + _SHIM_BODY,
+            f"LOG = {str(self.log)!r}\nDELAY = {delay_s!r}\n"
+            f"INJECT_DELAY = {inject_delay_s!r}\n" + _SHIM_BODY,
             encoding="utf-8",
         )
         if sys.platform == "win32":
@@ -320,6 +330,98 @@ def slow_fleet(tmp_path):
     f.wait_ready()
     yield f
     f.teardown()
+
+
+@pytest.fixture
+def stalled_paste_fleet(tmp_path):
+    """Same, but the PASTE stalls for 30 real seconds.
+
+    This is the measured production condition, not a hypothetical: a psmux
+    control command against a session whose terminal is busy or unfocused has
+    been timed from 3 s to past 70 s, and `send-keys` was the one call in
+    psmux.py with no bound at all -- run inline in the HTTP handler, before the
+    reply. 30 s is comfortably past the listener's own 20 s patience, which is
+    what turned a stored image into "upload failed" on the bar.
+    """
+    f = _Fleet(tmp_path, inject_delay_s=30.0)
+    f.wait_ready()
+    yield f
+    f.teardown()
+
+
+# What a press may cost the user before the bar tells them how it went, when
+# the multiplexer behind it has stalled. The server's own answer deadline is
+# `upload_server.INJECT_GRACE_S` (3 s); the rest is the POST, the flash pump and
+# one process spawn on a cold runner. The number that matters is the comparison:
+# the same press used to cost 20 s and then LIE.
+_PENDING_BUDGET_S = 10.0
+
+
+def test_a_stalled_paste_is_answered_quickly_and_never_called_a_failure(
+    stalled_paste_fleet,
+):
+    """The 60-75 s false failure, end to end, with nothing mocked.
+
+    Real serve, real handle_press, and a real multiplexer binary that sits on
+    `send-keys` for 30 s. Every clause here is one half of the reported bug:
+    the press must come back fast, and what it says must be true.
+    """
+    fleet = stalled_paste_fleet
+    payload = b"BM" + fleet.unique.encode()
+
+    started = time.monotonic()
+    outcome = altv.handle_press(fleet.url, fleet.project, lambda: payload)
+    elapsed = time.monotonic() - started
+
+    assert outcome == "inject-pending", f"flashes={fleet.flashes()}"
+    assert elapsed < _PENDING_BUDGET_S, (
+        f"the press took {elapsed:.1f}s to reach an outcome behind a stalled "
+        "paste; it must not wait out the multiplexer"
+    )
+
+    # The narration: specific, ASCII, and never the old lie.
+    stamp, message = fleet.wait_for_flash("pending", timeout=_PENDING_BUDGET_S)
+    assert message == f"{altv.FLASH_PREFIX}{altv.OUTCOME_REASONS['inject-pending']}"
+    assert message.isascii(), message
+    messages = fleet.wait_for_count(3)
+    assert messages == [
+        "Alt+V: capturing...",
+        "Alt+V: uploading...",
+        f"Alt+V: {altv.OUTCOME_REASONS['inject-pending']}",
+    ], messages
+    assert not any("failed" in m.lower() for m in messages), messages
+    assert not any("cannot reach" in m.lower() for m in messages), messages
+    assert stamp  # it really rendered, through a real multiplexer
+
+
+def test_the_image_behind_a_stalled_paste_is_on_disk_byte_for_byte(
+    stalled_paste_fleet,
+):
+    """The reason "upload failed" was the damaging wording: the file is fine.
+
+    A user told the upload failed reruns the press -- and the eventual paste
+    plus the rerun's paste put the same screenshot into the prompt twice.
+    """
+    fleet = stalled_paste_fleet
+    payload = b"BM" + (fleet.unique * 4).encode()
+
+    assert altv.handle_press(fleet.url, fleet.project, lambda: payload) == (
+        "inject-pending"
+    )
+
+    uploads = fleet.home / ".magent" / "uploads"
+    written = [p for p in uploads.iterdir() if p.is_file()]
+    assert written, "no file landed in the redirected uploads dir"
+    assert any(p.read_bytes() == payload for p in written), (
+        "the stored image is not byte-identical to what was pressed"
+    )
+    # ...and the paste really was attempted, at this fleet's own socket.
+    sends = [
+        c["argv"]
+        for c in fleet.calls()
+        if "send-keys" in c["argv"] and fleet.unique in c["argv"][1]
+    ]
+    assert len(sends) == 1, f"expected exactly one paste attempt, got {sends}"
 
 
 def test_a_press_narrates_capture_upload_and_success_in_order(fleet):

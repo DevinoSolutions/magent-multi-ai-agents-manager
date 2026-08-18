@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import threading
 import time
 from http.client import HTTPConnection
@@ -833,6 +834,187 @@ class TestInSessionFeedback:
         # Unknown project"); a generic "upload failed" from here would stomp it.
         assert self._post("/upload?project=marka", project_field="evil")["ok"] is False
         assert not self._wait_flash("upload failed", timeout=0.6)
+
+
+class TestASlowPasteNeverBecomesAFailedUpload:
+    """The reply must not be hostage to the multiplexer.
+
+    Measured on a live machine: `psmux.send_keys` ran INLINE in this handler
+    with no timeout at all, a control command stalled while the session's
+    terminal was busy, and the request was answered 74 seconds after the press.
+    The listener had given up at 20 s and flashed "upload failed - is `magent
+    serve` running?" -- about an image that was already on disk, and that psmux
+    went on to paste a minute later. The file being safe is exactly why calling
+    that a failure was the damaging part: the user reruns the press, and the
+    same screenshot is pasted twice.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _server(self, tmp_path, monkeypatch):
+        import magent.psmux as psmux_mod
+        import magent.upload_server as mod
+
+        monkeypatch.setattr(mod, "_UPLOAD_DIR", tmp_path / "uploads")
+        monkeypatch.setattr(psmux_mod, "find_psmux", lambda: "psmux")
+        # A short grace keeps the test honest AND fast: the assertion is that
+        # the reply lands inside whatever the grace is, not that 3s is magic.
+        monkeypatch.setattr(mod, "INJECT_GRACE_S", 0.3)
+
+        self.release = threading.Event()
+        self.entered = threading.Event()
+        self.entered_at = 0.0
+        self.worker: threading.Thread | None = None
+        self.pastes: list[str] = []
+
+        def _paste(name, *keys, target=None, psmux=None, timeout=None):
+            # Recorded from INSIDE the worker: the product times its own paste
+            # from that thread's clock, and on a loaded runner the thread can
+            # start well after the handler's grace has already expired. Tests
+            # that want a LATE paste have to synchronize on this, not on the
+            # request's return -- see `_stall_past_the_grace`.
+            self.pastes.append(name)
+            self.entered_at = time.monotonic()
+            self.worker = threading.current_thread()
+            self.entered.set()
+            self.release.wait(20)
+            return True
+
+        monkeypatch.setattr(psmux_mod, "send_keys", _paste)
+
+        UploadHandler.config_path = None
+        UploadHandler.cached_sessions = [{"name": "marka", "path": "INTERNAL/marka"}]
+        UploadHandler.sessions_ts = time.time() + 9999
+
+        from http.server import HTTPServer
+
+        self.server = HTTPServer(("127.0.0.1", 0), UploadHandler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        yield
+        self.release.set()  # never leave a stalled paste thread behind
+        self.server.shutdown()
+
+    def _upload(self) -> tuple[dict, float]:
+        body = (
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="project"\r\n\r\nmarka\r\n'
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="inject"\r\n\r\n1\r\n'
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="c.png"\r\n\r\n'
+            b"FAKEPNG\r\n"
+            b"------B--\r\n"
+        )
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        started = time.monotonic()
+        conn.request(
+            "POST",
+            "/upload?project=marka",
+            body=body,
+            headers={
+                "Content-Type": "multipart/form-data; boundary=----B",
+                "Content-Length": str(len(body)),
+            },
+        )
+        data = json.loads(conn.getresponse().read())
+        return data, time.monotonic() - started
+
+    def _stall_past_the_grace_then_finish(self) -> None:
+        """Release the paste only once it is provably LATE, then join it.
+
+        Both halves close a real race, and the first one is why this test was
+        red on a Windows CI runner while passing locally:
+
+        * The product judges lateness against the WORKER's own clock. Releasing
+          as soon as the request returns says nothing about that clock -- if the
+          thread was slow to be scheduled it starts, returns instantly against
+          an already-set event, measures ~1 ms, and correctly logs nothing. The
+          poll that followed then waited out its budget against a line that was
+          never going to be written. Sleeping to the worker's own deadline is
+          the precondition of the assertion, not a guess at a duration.
+        * Joining the worker is what makes the log line already WRITTEN when the
+          assertion runs: the record is emitted in `_inject_paste`'s `finally`,
+          on this thread, after the fake returns. No polling needed.
+        """
+        import magent.upload_server as mod
+
+        assert self.entered.wait(15), "the paste worker never started"
+        # `entered_at` is taken at or after the worker's own `started`, so
+        # waiting out the grace from here guarantees the product sees it too.
+        time.sleep(max(0.0, self.entered_at + mod.INJECT_GRACE_S - time.monotonic()))
+        self.release.set()
+        assert self.worker is not None
+        self.worker.join(timeout=30)
+        assert not self.worker.is_alive(), "the paste worker never finished"
+
+    def test_the_reply_lands_inside_the_grace_and_the_file_is_on_disk(self):
+        data, elapsed = self._upload()
+
+        # The stalled paste blocks for 20s. Anything well under that proves the
+        # reply is no longer hostage to it; the budget is deliberately loose
+        # because a cold runner's cost belongs to the request, not the fix.
+        assert elapsed < 5.0, f"the reply waited {elapsed:.2f}s on a stalled paste"
+        # ok=True is the whole point: the bytes ARE stored.
+        assert data["ok"] is True
+        assert Path(data["path"]).read_bytes() == b"FAKEPNG"
+
+    def test_a_stalled_paste_is_reported_as_pending_not_as_a_refusal(self):
+        data, _ = self._upload()
+        # Three states, not two. `injected: false` alone is indistinguishable
+        # from "psmux said no", which is what the bar rendered as a failure.
+        assert data["injected"] is False
+        assert data["inject_pending"] is True
+
+    def test_a_paste_that_lands_in_time_is_plainly_injected(self, monkeypatch):
+        # The mirror race: with a 0.3s grace, a worker thread that is merely
+        # SLOW TO BE SCHEDULED on a loaded runner would be reported pending
+        # even though the paste itself is instant. The grace is a ceiling, not
+        # a delay -- the handler returns the moment the worker does -- so a
+        # generous one costs this test nothing and removes the flake.
+        import magent.upload_server as mod
+
+        monkeypatch.setattr(mod, "INJECT_GRACE_S", 30.0)
+        self.release.set()
+        data, elapsed = self._upload()
+        assert data["injected"] is True
+        assert data["inject_pending"] is False
+        # ...and it really returned on the paste, not on the ceiling.
+        assert elapsed < 10.0, f"the reply took {elapsed:.2f}s on an instant paste"
+
+    def test_the_stalled_paste_is_still_running_and_is_never_re_sent(self):
+        # One attempt, ever. A `send-keys` that is merely slow is still in
+        # flight; a retry on top of it pastes the same image twice.
+        self._upload()
+        assert self.entered.wait(15), "the paste worker never started"
+        assert self.pastes == ["marka"]
+        # ...and letting the (single) attempt run to completion adds no second
+        # one -- a retry would have to happen after this point to exist at all.
+        self._stall_past_the_grace_then_finish()
+        assert self.pastes == ["marka"]
+
+    def test_the_late_verdict_reaches_the_log_since_it_cannot_reach_the_bar(
+        self, caplog
+    ):
+        # A flagged (?project=) upload has a narrator already and the server
+        # must not become a second one -- so the deferred result is recorded
+        # here instead. Silence would make "did it ever paste?" unanswerable.
+        with caplog.at_level(logging.WARNING, logger="magent.upload"):
+            self._upload()
+            self._stall_past_the_grace_then_finish()
+            assert "finished late" in caplog.text
+            assert "marka" in caplog.text
+
+    def test_the_pending_flag_is_in_the_outcome_log_line(self, caplog):
+        # This one is written on the SERVER thread, in do_POST's `finally`,
+        # after the response is already on the wire -- the same documented
+        # race `_wait_log` exists for above, so it polls rather than joins.
+        with caplog.at_level(logging.INFO, logger="magent.upload"):
+            self._upload()
+            deadline = time.time() + 10
+            while time.time() < deadline and "pending=True" not in caplog.text:
+                time.sleep(0.02)
+            assert "pending=True" in caplog.text
 
 
 class TestFlashEndpoint:

@@ -325,13 +325,37 @@ def stop_sessions(
     )
 
 
+# How long one `send-keys` may take before we stop waiting on it.
+#
+# This was the ONE psmux call in this module with no bound at all, and it is
+# the one an HTTP request handler ran inline: an Alt+V upload was measured
+# taking 74 s to answer because the control command behind it stalled while the
+# session's attached terminal was busy. A control command against a loaded
+# socket has been measured anywhere from 3 s to past 70 s, so the default is
+# generous (a paste that arrives late is still the paste the user wanted) but
+# finite (a caller must never be hostage to a wedged socket forever). Callers
+# with their own budget pass `timeout=`.
+#
+# On expiry `subprocess.run` KILLS the client, so this is exactly one attempt
+# and never a re-send: a killed `send-keys` may or may not have reached the
+# server, and a retry on top of that is how the same image gets pasted twice.
+SEND_KEYS_TIMEOUT_S = 20.0
+
+
 def send_keys(
     name: str,
     *keys: str,
     target: str | None = None,
     psmux: str | None = None,
+    timeout: float = SEND_KEYS_TIMEOUT_S,
 ) -> bool:
-    """Send keystrokes to a psmux session. Returns True on success."""
+    """Send keystrokes to a psmux session. Returns True on success.
+
+    Bounded and non-raising, like every other probe here: a timeout, a psmux
+    that will not launch, or a socket that answers nothing all come back as
+    ``False`` with a WARNING in launch.log, never as an exception on a caller
+    fanning this out (or, worse, as an unbounded wait on a request handler).
+    """
     binary = psmux or find_psmux()
     if not binary:
         return False
@@ -340,7 +364,19 @@ def send_keys(
         cmd += ["-t", target]
     cmd.append("--")
     cmd.extend(keys)
-    return subprocess.run(cmd, capture_output=True, check=False).returncode == 0
+    started = time.monotonic()
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        get_logger("launch").warning(
+            "send-keys to project=%s gave up after %.1fs: %s",
+            name,
+            time.monotonic() - started,
+            exc,
+        )
+        return False
+    else:
+        return result.returncode == 0
 
 
 def pane_cwd(name: str, psmux: str | None = None) -> str:
