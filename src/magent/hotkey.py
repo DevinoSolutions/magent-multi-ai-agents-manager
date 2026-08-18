@@ -44,6 +44,7 @@ from magent.log import (
 )
 from magent.procs import pid_alive
 from magent.sessions import (
+    FLASH_TINT_ERR,
     build_code_open_command,
     folder_for_session,
 )
@@ -441,7 +442,9 @@ def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
         code_bin = shutil.which("code")
         if not code_bin:
             log.warning("F2: 'code' is not on PATH; cannot open project=%s", project)
-            flash_async(server_url, project, "F2: 'code' not found on PATH")
+            flash_async(
+                server_url, project, "F2: 'code' not found on PATH", tint=FLASH_TINT_ERR
+            )
             return
         with urlopen(f"{server_url}/api/sessions", timeout=10) as resp:
             payload = json.loads(resp.read())
@@ -452,6 +455,7 @@ def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
                 server_url,
                 project,
                 f"F2: no folder known for {project} (host magent too old?)",
+                tint=FLASH_TINT_ERR,
             )
             return
         # code is code.cmd on Windows; shutil.which resolves the .cmd and
@@ -474,7 +478,9 @@ def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
         flash_async(server_url, project, f"F2: VS Code -> {folder}")
     except Exception:
         log.exception("F2: open project=%s failed", project)
-        flash_async(server_url, project, "F2: failed - see hotkey.log")
+        flash_async(
+            server_url, project, "F2: failed - see hotkey.log", tint=FLASH_TINT_ERR
+        )
 
 
 # --- Focus-driven geometry reclaim -------------------------------------------

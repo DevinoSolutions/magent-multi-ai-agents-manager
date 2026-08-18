@@ -395,8 +395,8 @@ class _OpenCodeHarness:
         monkeypatch.setattr(
             hotkey,
             "flash_async",
-            lambda url, project, message, duration_ms=None: self.flashed.append(
-                message
+            lambda url, project, message, duration_ms=None, tint=None: (
+                self.flashed.append(message)
             ),
         )
         return spawned

@@ -40,7 +40,12 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from magent.log import get_logger
-from magent.sessions import FLASH_MSG_MAX, build_flash_url
+from magent.sessions import (
+    FLASH_MSG_MAX,
+    FLASH_TINT_ERR,
+    FLASH_TINT_OK,
+    build_flash_url,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -88,10 +93,18 @@ PHASE_UPLOADING = "uploading..."
 FLASH_PREFIX = "Alt+V: "
 
 # How long a queued flash may spend on the wire before the pump gives up on it
-# and moves to the next. Generous on purpose: this wait happens on the pump
-# thread, never on the press, and abandoning a flash early is how the bar went
-# blank in the first place (see psmux.flash_message).
-FLASH_HTTP_TIMEOUT_S = 5.0
+# and moves to the next.
+#
+# This must stay LARGER than the server's own status-line bound
+# (``psmux.FLASH_TIMEOUT_S``), and a test pins that. The reason is the ordering
+# guarantee: `/api/flash` answers only once psmux has the message, so the reply
+# is what paces the pump. If the pump abandons a request the server is still
+# working on, the next phase overlaps it and the two can land out of order --
+# precisely under the load (a slow status line) this whole change exists to
+# survive. The wait is affordable because it happens on the pump thread, never
+# on the press; and abandoning a flash early is how the bar went blank in the
+# first place (see psmux.flash_message).
+FLASH_HTTP_TIMEOUT_S = 25.0
 
 # Bound on the pump's backlog. A wedged server must cost memory nothing; 32 is
 # far more than a human can generate (3 per press) and a full queue drops the
@@ -103,7 +116,7 @@ FLASH_QUEUE_MAX = 32
 # channel exists to end. Outcomes take the server's own (shorter) default.
 PHASE_FLASH_MS = 20000
 
-_flash_queue: queue.Queue[tuple[str, str, str, int | None]] = queue.Queue(
+_flash_queue: queue.Queue[tuple[str, str, str, int | None, str]] = queue.Queue(
     maxsize=FLASH_QUEUE_MAX
 )
 _pump_lock = threading.Lock()
@@ -119,7 +132,11 @@ def _ascii_clip(message: str) -> str:
 
 
 def flash_status(
-    server_url: str, project: str, message: str, duration_ms: int | None = None
+    server_url: str,
+    project: str,
+    message: str,
+    duration_ms: int | None = None,
+    tint: str = FLASH_TINT_OK,
 ) -> None:
     """Blocking: show ``message`` in the magent:<project> status line.
 
@@ -129,7 +146,7 @@ def flash_status(
     """
     try:
         with urlopen(
-            build_flash_url(server_url, project, message, duration_ms),
+            build_flash_url(server_url, project, message, duration_ms, tint),
             timeout=FLASH_HTTP_TIMEOUT_S,
         ):
             pass
@@ -148,9 +165,9 @@ def _pump_loop() -> None:
     class of bug this whole module exists to close.
     """
     while True:
-        server_url, project, message, duration_ms = _flash_queue.get()
+        server_url, project, message, duration_ms, tint = _flash_queue.get()
         try:
-            flash_status(server_url, project, message, duration_ms)
+            flash_status(server_url, project, message, duration_ms, tint)
         except Exception:  # noqa: BLE001  # reason: the pump must outlive every possible bad message; see the docstring
             get_logger("hotkey").exception("flash pump: delivery raised")
         finally:
@@ -158,7 +175,11 @@ def _pump_loop() -> None:
 
 
 def flash_async(
-    server_url: str, project: str, message: str, duration_ms: int | None = None
+    server_url: str,
+    project: str,
+    message: str,
+    duration_ms: int | None = None,
+    tint: str = FLASH_TINT_OK,
 ) -> None:
     """Queue a status-line flash and return immediately.
 
@@ -176,7 +197,7 @@ def flash_async(
                     target=_pump_loop, name="magent-altv-flash", daemon=True
                 )
                 _pump.start()
-        _flash_queue.put_nowait((server_url, project, text, duration_ms))
+        _flash_queue.put_nowait((server_url, project, text, duration_ms, tint))
     except (RuntimeError, queue.Full) as exc:
         # Thread exhaustion or a wedged pump. The press carries on regardless.
         get_logger("hotkey").warning("flash dropped project=%s: %s", project, exc)
@@ -198,7 +219,12 @@ def report(server_url: str, project: str, outcome: str, detail: str = "") -> Non
         log.warning(
             "%s outcome=%s project=%s: %s", ALTV_LOG_PREFIX, outcome, project, reason
         )
-    flash_async(server_url, project, FLASH_PREFIX + reason)
+    flash_async(
+        server_url,
+        project,
+        FLASH_PREFIX + reason,
+        tint=FLASH_TINT_OK if outcome == "ok" else FLASH_TINT_ERR,
+    )
 
 
 def _transport_reason(exc: BaseException) -> str:
@@ -334,7 +360,12 @@ def handle_press(
         # This runs on a detached background thread with no console: anything
         # that escapes here would vanish, so everything is logged AND shown.
         log.exception("%s outcome=error project=%s", ALTV_LOG_PREFIX, project)
-        flash_async(server_url, project, FLASH_PREFIX + OUTCOME_REASONS["error"])
+        flash_async(
+            server_url,
+            project,
+            FLASH_PREFIX + OUTCOME_REASONS["error"],
+            tint=FLASH_TINT_ERR,
+        )
         return "error"
     else:
         return outcome

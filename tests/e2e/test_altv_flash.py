@@ -177,6 +177,7 @@ class _Fleet:
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if _health_ok(self.port):
+                self._warm()
                 return
         self.proc.kill()
         stdout, stderr = self.proc.communicate(timeout=30)
@@ -184,6 +185,24 @@ class _Fleet:
             f"serve never became healthy on 127.0.0.1:{self.port}\n"
             f"stdout:\n{stdout}\nstderr:\n{stderr}"
         )
+
+    def _warm(self) -> None:
+        """Spawn the multiplexer once before anything is measured.
+
+        The FIRST process spawn on a cold Windows runner pays for itself
+        several times over (image load + AV scan), which would otherwise land
+        inside a latency assertion and make it a measurement of the runner.
+        /api/sessions fans out `has-session` through the same shim.
+        """
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+            try:
+                conn.request("GET", "/api/sessions")
+                conn.getresponse().read()
+            finally:
+                conn.close()
+        except OSError:
+            pass
 
     def calls(self) -> list[dict]:
         try:
@@ -206,6 +225,22 @@ class _Fleet:
             if "display-message" in argv:
                 found.append((call["t"], argv[-1]))
         return found
+
+    def wait_for_count(self, n: int, timeout: float = 30.0) -> list[str]:
+        """Wait for n flashes to have LANDED before reading the sequence.
+
+        `wait_for_flash("image sent")` only proves the last message arrived --
+        the shim writes its line when it starts, so a slow-starting earlier
+        spawn can still be in flight. Snapshotting there would make an
+        ordering assertion a race on process startup.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            found = self.flashes()
+            if len(found) >= n:
+                break
+            time.sleep(0.05)
+        return [m for _, m in self.flashes()]
 
     def wait_for_flash(self, needle: str, timeout: float = 15.0) -> tuple[float, str]:
         deadline = time.monotonic() + timeout
@@ -248,7 +283,7 @@ def test_a_press_narrates_capture_upload_and_success_in_order(fleet):
 
     assert outcome == "ok", f"press did not succeed; flashes={fleet.flashes()}"
     fleet.wait_for_flash("image sent")
-    messages = [m for _, m in fleet.flashes()]
+    messages = fleet.wait_for_count(3)
     assert messages == [
         "Alt+V: capturing...",
         "Alt+V: uploading...",
@@ -296,8 +331,8 @@ def test_the_flash_channel_never_delays_the_press(slow_fleet):
     assert outcome == "ok"
     assert elapsed < 1.5, f"the press waited {elapsed:.2f}s on its own status line"
     # ...and the messages still arrive, in order, once the pump catches up.
-    slow_fleet.wait_for_flash("image sent")
-    assert [m for _, m in slow_fleet.flashes()] == [
+    slow_fleet.wait_for_flash("image sent", timeout=30)
+    assert slow_fleet.wait_for_count(3) == [
         "Alt+V: capturing...",
         "Alt+V: uploading...",
         "Alt+V: image sent",
@@ -353,6 +388,23 @@ def test_the_server_adds_no_second_voice_to_a_narrated_press(fleet):
 
     messages = [m for _, m in fleet.flashes()]
     assert all(m.startswith("Alt+V: ") for m in messages), messages
+
+
+def test_a_failure_really_reaches_the_multiplexer_in_red(fleet):
+    """Colour is asked for on the real argv, not just intended.
+
+    psmux's message-style is global on the socket: without a tint on every
+    message a red failure leaks into the next press's "capturing...". Both
+    halves are asserted here against the recorded argv.
+    """
+    altv.handle_press(fleet.url, "no-such-project", lambda: b"BM-fake-image")
+    fleet.wait_for_flash("HTTP 400")
+
+    styled = [c["argv"] for c in fleet.calls() if "message-style" in c["argv"]]
+    assert styled, f"no message-style was ever set; calls={fleet.calls()}"
+    assert any("bg=red,fg=white,bold" in a for a in styled), styled
+    # The phases that ran before the failure asked for the healthy tint.
+    assert any("bg=green,fg=black,bold" in a for a in styled), styled
 
 
 def test_every_flash_is_ascii_on_the_wire(fleet):

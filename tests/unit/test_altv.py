@@ -83,7 +83,9 @@ class TestPhaseOrder:
         monkeypatch.setattr(
             altv,
             "flash_async",
-            lambda url, project, message, duration_ms=None: seen.append(message),
+            lambda url, project, message, duration_ms=None, tint=None: seen.append(
+                message
+            ),
         )
         return seen
 
@@ -97,7 +99,7 @@ class TestPhaseOrder:
         monkeypatch.setattr(
             altv,
             "flash_async",
-            lambda url, project, message, duration_ms=None: order.append(
+            lambda url, project, message, duration_ms=None, tint=None: order.append(
                 f"flash:{message}"
             ),
         )
@@ -140,7 +142,9 @@ class TestPhaseOrder:
         monkeypatch.setattr(
             altv,
             "flash_status",
-            lambda url, project, message, duration_ms=None: delivered.append(message),
+            lambda url, project, message, duration_ms=None, tint=None: delivered.append(
+                message
+            ),
         )
         monkeypatch.setattr(
             altv, "upload_image", lambda *a: ("ok", altv.OUTCOME_REASONS["ok"], "")
@@ -162,7 +166,7 @@ class TestPhaseOrder:
         monkeypatch.setattr(
             altv,
             "flash_async",
-            lambda url, project, message, duration_ms=None: durations.append(
+            lambda url, project, message, duration_ms=None, tint=None: durations.append(
                 duration_ms
             ),
         )
@@ -185,7 +189,9 @@ class TestFailuresAreSpecific:
         monkeypatch.setattr(
             altv,
             "flash_async",
-            lambda url, project, message, duration_ms=None: seen.append(message),
+            lambda url, project, message, duration_ms=None, tint=None: seen.append(
+                message
+            ),
         )
         return seen
 
@@ -288,7 +294,7 @@ class TestTheFlashCanNeverHurtThePress:
         # The regression this exists to catch: making the flash a plain call.
         # A status-bar round trip has been measured at seconds under load, and
         # a press must never wait on its own progress report.
-        def _slow(url, project, message, duration_ms=None):
+        def _slow(url, project, message, duration_ms=None, tint=None):
             time.sleep(0.4)
 
         monkeypatch.setattr(altv, "flash_status", _slow)
@@ -304,7 +310,7 @@ class TestTheFlashCanNeverHurtThePress:
         _drain(timeout=10)
 
     def test_a_broken_flash_channel_cannot_break_the_press(self, monkeypatch):
-        def _explode(url, project, message, duration_ms=None):
+        def _explode(url, project, message, duration_ms=None, tint=None):
             raise RuntimeError("status bar is on fire")
 
         monkeypatch.setattr(altv, "flash_status", _explode)
@@ -318,6 +324,14 @@ class TestTheFlashCanNeverHurtThePress:
         # one bad message strands every message queued behind it, which is how a
         # status line goes quiet for an hour without anyone noticing.
         assert altv._pump is not None and altv._pump.is_alive()
+
+    def test_the_pump_outwaits_the_servers_own_status_line_bound(self):
+        # Ordering depends on it: /api/flash answers only once psmux has the
+        # message, so a client timeout SHORTER than the server's psmux bound
+        # lets the next phase overlap this one and arrive first.
+        from magent import psmux
+
+        assert altv.FLASH_HTTP_TIMEOUT_S > psmux.FLASH_TIMEOUT_S
 
     def test_a_dead_server_is_swallowed_by_the_transport_itself(self):
         # flash_status is best-effort by construction: nothing listening on
@@ -334,6 +348,52 @@ class TestTheFlashCanNeverHurtThePress:
         monkeypatch.setattr(altv, "_flash_queue", _Full())
         for _ in range(5):
             altv.flash_async("http://x:8034", "marka", "hello")  # must not raise
+
+
+class TestTint:
+    """psmux's ``message-style`` is GLOBAL on that socket, so a tint set once
+    for a failure survives into the next message. Every flash therefore carries
+    its own: a green "cannot reach magent serve" is worse than no colour."""
+
+    def _tints(self, monkeypatch) -> list[str]:
+        seen: list[str] = []
+        monkeypatch.setattr(
+            altv,
+            "flash_status",
+            lambda url, project, message, duration_ms=None, tint=None: seen.append(
+                f"{tint}:{message}"
+            ),
+        )
+        return seen
+
+    def test_a_healthy_press_is_green_throughout(self, monkeypatch):
+        from magent.sessions import FLASH_TINT_OK
+
+        seen = self._tints(monkeypatch)
+        monkeypatch.setattr(
+            altv, "upload_image", lambda *a: ("ok", altv.OUTCOME_REASONS["ok"], "")
+        )
+        altv.handle_press("http://x:8034", "marka", lambda: b"BMP")
+        _drain()
+        assert all(m.startswith(f"{FLASH_TINT_OK}:") for m in seen), seen
+
+    def test_a_failure_turns_the_bar_red(self, monkeypatch):
+        from magent.sessions import FLASH_TINT_ERR, FLASH_TINT_OK
+
+        seen = self._tints(monkeypatch)
+        altv.handle_press("http://127.0.0.1:1", "marka", lambda: b"BMP")
+        _drain()
+        assert seen[-1].startswith(f"{FLASH_TINT_ERR}:"), seen
+        # ...and the phases before it were not pre-emptively red.
+        assert seen[0].startswith(f"{FLASH_TINT_OK}:"), seen
+
+    def test_the_url_carries_the_tint(self):
+        from magent.sessions import FLASH_TINT_ERR, build_flash_url
+
+        url = build_flash_url("http://x:1", "marka", "boom", 1000, FLASH_TINT_ERR)
+        assert "tint=err" in url and "ms=1000" in url
+        # Omitted, nothing is asked of the style at all.
+        assert "tint=" not in build_flash_url("http://x:1", "marka", "boom")
 
 
 class TestStatusBarHygiene:

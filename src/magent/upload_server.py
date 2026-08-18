@@ -24,7 +24,7 @@ from magent import psmux, tailnet
 from magent.icons import render_icon
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import get_logger
-from magent.sessions import FLASH_MSG_MAX
+from magent.sessions import FLASH_MSG_MAX, FLASH_TINT_ERR, FLASH_TINT_OK
 
 
 def _pid_path(port: int) -> Path:
@@ -109,6 +109,11 @@ _FB_NO = "✗"  # ballot x   -- failed
 # only styles the transient message line, never the agent pane.
 _MSG_GREEN = "bg=green,fg=black,bold"
 _MSG_RED = "bg=red,fg=white,bold"
+
+# What a caller-supplied ``tint=`` maps to. An unknown value leaves the style
+# alone rather than failing the flash -- the message matters more than its
+# colour.
+_FLASH_TINTS = {FLASH_TINT_OK: _MSG_GREEN, FLASH_TINT_ERR: _MSG_RED}
 
 # How long each status-line flash lingers (ms).
 _FLASH_OK_MS = 2500
@@ -827,6 +832,7 @@ class UploadHandler(BaseHTTPRequestHandler):
                     flash_project,
                     clamped,
                     _flash_duration(query.get("ms", [""])[0]),
+                    style=_FLASH_TINTS.get(query.get("tint", [""])[0]),
                 )
                 # Answered only once psmux has the message, which is what paces
                 # a caller flashing a SEQUENCE: it waits for each reply before
