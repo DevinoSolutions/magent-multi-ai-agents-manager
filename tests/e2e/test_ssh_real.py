@@ -1096,8 +1096,11 @@ class TestReconnectSupervisorOverRealSsh:
         text = _text()
         assert "connection to" in text and "lost" in text, text
         assert "ssh exit 255" in text, text
-        assert "reconnecting in 2s" in text, text
+        # Redirected to a file, so the pane takes the plain-line fallback --
+        # no carriage-return animation, one readable line per attempt.
+        assert "retry in 2s" in text, text
         assert "attempt 1" in text, text
+        assert "\x1b[" not in text, text
 
     def test_a_vanished_session_is_retried_then_given_up_on(self, tmp_path, ssh_wire):
         """The reported bug, against a real sshd: a remote command that ends

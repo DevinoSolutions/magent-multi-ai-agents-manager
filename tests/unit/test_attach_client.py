@@ -14,6 +14,7 @@ corpse) is pinned from the attach side, where the spawn argv is actually built:
 
 from __future__ import annotations
 
+import io
 import subprocess
 from typing import NamedTuple
 
@@ -180,8 +181,19 @@ class TestAttemptCounter:
         assert attach_client.next_attempt(9, elapsed=3600.0) == 1
 
 
-def _drive(monkeypatch, codes, *, durations=None, probes=None, **kwargs):
+def _dial(rc, error="", detail=()):
+    """One scripted ssh connection, as ``_run_ssh`` reports it."""
+    return attach_client.Dial(rc, error, tuple(detail))
+
+
+def _drive(monkeypatch, codes, *, durations=None, probes=None, tty=False, **kwargs):
     """Run ``supervise`` against a scripted sequence of ssh exit codes.
+
+    ``codes`` entries are plain exit codes, or ``Dial``s when a test cares what
+    ssh wrote to stderr. ``tty`` decides which of the two rendering modes runs:
+    the default (False) is the plain-line fallback, which is also what a real
+    piped/logged pane gets, and it keeps the sleep ladder one sleep per backoff
+    so the ladder assertions below stay readable.
 
     ``probes`` scripts what the host answers about the session after each
     disconnect; it defaults to ``SESSION_ALIVE``, which is the historical
@@ -199,12 +211,13 @@ def _drive(monkeypatch, codes, *, durations=None, probes=None, **kwargs):
     sleeps: list[float] = []
     now = [0.0]
 
-    def fake_run(argv):
+    def fake_run(argv, **_kwargs):
         calls.append(list(argv))
         if not remaining:
             raise AssertionError("supervise asked for more connections than scripted")
         now[0] += clock.pop(0) if clock else 0.0
-        return remaining.pop(0)
+        code = remaining.pop(0)
+        return code if isinstance(code, attach_client.Dial) else _dial(code)
 
     def fake_probe(_target, _session):
         return answers.pop(0) if answers else attach_client.SESSION_ALIVE
@@ -212,6 +225,8 @@ def _drive(monkeypatch, codes, *, durations=None, probes=None, **kwargs):
     monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/usr/bin/ssh")
     monkeypatch.setattr(attach_client, "_run_ssh", fake_run)
     monkeypatch.setattr(attach_client, "_probe_session", fake_probe)
+    monkeypatch.setattr(attach_client, "_stdout_is_tty", lambda: tty)
+    monkeypatch.setattr(attach_client, "_term_width", lambda: 100)
     monkeypatch.setattr(attach_client.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(attach_client.time, "sleep", sleeps.append)
     rc = attach_client.supervise("user@host", "psmux -L api attach", "api", **kwargs)
@@ -234,7 +249,7 @@ class TestSupervise:
         assert sleeps == [2.0, 4.0, 8.0]
         out = capsys.readouterr().out
         assert out.count("connection to user@host lost") == 3
-        assert "reconnecting in 2s" in out
+        assert "retry in 2s" in out
         assert "attempt 3" in out
 
     def test_every_attempt_redials_the_identical_command(self, monkeypatch):
@@ -353,7 +368,7 @@ class TestSupervise:
 
         monkeypatch.setattr(attach_client, "_probe_session", never)
         monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/usr/bin/ssh")
-        monkeypatch.setattr(attach_client, "_run_ssh", lambda _argv: 1)
+        monkeypatch.setattr(attach_client, "_run_ssh", lambda *_a, **_k: _dial(1))
         rc = attach_client.supervise(
             "user@host", "psmux -L api attach", "api", reconnect=False
         )
@@ -371,10 +386,362 @@ class TestSupervise:
         # shows a message instead of a stack trace.
         monkeypatch.setattr(
             attach_client.subprocess,
-            "call",
-            lambda _argv: (_ for _ in ()).throw(FileNotFoundError()),
+            "Popen",
+            lambda *_a, **_k: (_ for _ in ()).throw(FileNotFoundError()),
         )
-        assert attach_client._run_ssh(["ssh"]) == attach_client.SSH_MISSING_RC
+        assert attach_client._run_ssh(["ssh"]).rc == attach_client.SSH_MISSING_RC
+
+
+class TestStatusText:
+    """The one line an outage owns. Pure and tested apart from the writer on
+    purpose: what has to be provable is the TEXT (it fits one row, it says what
+    changed), not the escape sequences that paint it."""
+
+    def test_it_says_everything_that_changes_in_one_line(self):
+        line = attach_client.status_text(
+            target="amind@amin-desktop",
+            attempt=3,
+            remaining=8.0,
+            last_error="ssh: connect to host amin-desktop port 22: Connection timed out",
+            width=120,
+        )
+        assert "\n" not in line
+        assert "reconnecting to amind@amin-desktop" in line
+        assert "attempt 3" in line
+        assert "retry in 8s" in line
+        assert "last: Connection timed out" in line
+        assert "Ctrl+C to stop" in line
+
+    @pytest.mark.parametrize("width", [20, 32, 47, 60, 79, 80, 100, 200])
+    def test_it_never_exceeds_the_width_it_was_given(self, width):
+        # THE LOAD-BEARING PROPERTY. A status line wider than the terminal
+        # wraps, and a wrapped line cannot be rewritten by a carriage return --
+        # the next repaint lands on the remnant and the pane fills with exactly
+        # the garbage this feature removes.
+        line = attach_client.status_text(
+            target="a-very-long-user@a-very-long-hostname.example.internal",
+            attempt=17,
+            remaining=30.0,
+            last_error="ssh: connect to host x port 22: Connection timed out",
+            width=width,
+        )
+        assert len(line) <= width
+
+    def test_a_tiled_pane_keeps_the_reason_and_drops_the_hint_then_the_target(
+        self,
+    ):
+        # Narrow panes are the NORMAL case here -- forty windows tiled across
+        # the monitors is the product. The fixed "Ctrl+C to stop" hint goes
+        # first (it never changes), then the target (it is in the window title
+        # already); the reason survives both because it is the only genuinely
+        # new information on the line.
+        kwargs = {
+            "attempt": 4,
+            "remaining": 16.0,
+            "last_error": "Connection timed out",
+        }
+        line = attach_client.status_text(
+            target="amind@amin-desktop", width=72, **kwargs
+        )
+        assert "last: Connection timed out" in line
+        assert "Ctrl+C" not in line
+        assert "amind@amin-desktop" not in line
+        assert "attempt 4" in line
+        assert "retry in 16s" in line
+
+    def test_the_numbers_are_the_last_thing_standing(self):
+        # Below every other sacrifice, "this pane is alive and will try again"
+        # is the whole message.
+        line = attach_client.status_text(
+            target="amind@amin-desktop",
+            attempt=4,
+            remaining=16.0,
+            last_error="Connection timed out",
+            width=42,
+        )
+        assert "attempt 4" in line
+        assert "retry in 16s" in line
+        assert "last:" not in line
+
+    def test_a_finished_countdown_reads_as_dialing(self):
+        # The line stays on screen for the whole of the next dial (up to a 20s
+        # ConnectTimeout), so it must not keep claiming "retry in 0s".
+        line = attach_client.status_text(target="user@host", attempt=2, width=120)
+        assert "dialing" in line
+        assert "retry in" not in line
+
+    def test_it_is_plain_text_with_no_escape_sequences_baked_in(self):
+        # Coloring happens in the writer, over the already-clipped string, so
+        # len() stays the rendered width.
+        line = attach_client.status_text(
+            target="user@host", attempt=1, remaining=2.0, width=120
+        )
+        assert "\x1b" not in line
+
+
+class TestCondenseError:
+    """ssh's diagnostics, squeezed into a status-line clause."""
+
+    def test_it_keeps_only_the_part_of_an_ssh_error_that_varies(self):
+        assert (
+            attach_client.condense_error(
+                "ssh: connect to host amin-desktop port 22: Connection timed out"
+            )
+            == "Connection timed out"
+        )
+
+    def test_a_non_ssh_prefixed_line_is_kept_whole(self):
+        assert (
+            attach_client.condense_error("client_loop: send disconnect: Broken pipe")
+            == "client_loop: send disconnect: Broken pipe"
+        )
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "Connection closed by\n1.2.3.4 port 22",
+            "Connection closed by\t1.2.3.4 port 22",
+            "  Connection closed by 1.2.3.4 port 22  ",
+        ],
+    )
+    def test_it_flattens_anything_that_would_break_the_line_in_two(self, raw):
+        out = attach_client.condense_error(raw)
+        assert out == "Connection closed by 1.2.3.4 port 22"
+
+    def test_it_is_ascii_so_len_is_the_rendered_width(self):
+        # The clipping math counts characters; a multi-byte or wide glyph from
+        # a chatty sshd would make the "one row" promise a lie.
+        out = attach_client.condense_error("Connection closed by — hôte")
+        assert out.isascii()
+
+    def test_a_pathological_line_is_elided_not_wrapped(self):
+        out = attach_client.condense_error("x" * 500)
+        assert len(out) <= attach_client.LAST_ERROR_MAX
+
+
+class TestStatusLineWriter:
+    """The terminal half: erase-then-write, and only when there is a terminal."""
+
+    def test_a_tty_pane_rewrites_one_line_in_place(self, capsys):
+        line = attach_client.StatusLine(tty=True)
+        line.show("first")
+        line.show("second")
+        out = capsys.readouterr().out
+        assert out.count(attach_client.ERASE_LINE) == 2
+        assert "\n" not in out
+        # Every repaint erases before it writes, so the row shows only the
+        # newest text -- never "second" printed over the tail of "first".
+        assert out.index("second") > out.index("first")
+        assert out.rindex(attach_client.ERASE_LINE) < out.index("second")
+
+    def test_clearing_erases_only_a_line_that_was_drawn(self, capsys):
+        line = attach_client.StatusLine(tty=True)
+        line.clear()
+        assert capsys.readouterr().out == ""
+        line.show("x")
+        capsys.readouterr()
+        line.clear()
+        assert capsys.readouterr().out == attach_client.ERASE_LINE
+        # ...and a second clear is a no-op, so it cannot blank whatever the
+        # restored remote session printed next.
+        line.clear()
+        assert capsys.readouterr().out == ""
+
+    def test_a_redirected_pane_gets_no_escape_sequences_at_all(self, capsys):
+        # Carriage-return animation in a log file is unreadable garbage.
+        line = attach_client.StatusLine(tty=False)
+        line.show("anything")
+        line.clear()
+        assert capsys.readouterr().out == ""
+
+
+class TestQuietReconnects:
+    """The reported UX bug: a wi-fi outage scrolled three lines per attempt."""
+
+    def test_a_tty_outage_costs_one_line_no_matter_how_long_it_lasts(
+        self, monkeypatch, capsys
+    ):
+        rc, _calls, _sleeps = _drive(monkeypatch, [255] * 6 + [0], tty=True)
+        out = capsys.readouterr().out
+        # Not one newline is emitted while the pane heals itself, so everything
+        # before the closing "detached" message is repaint traffic on a single
+        # row -- 42 seconds of backoff across six attempts, one line.
+        healing, _, rest = out.partition("\n")
+        assert rc == 0
+        assert healing.count(attach_client.ERASE_LINE) > 6
+        assert "detached from" in rest
+
+    def test_a_redirected_pane_falls_back_to_one_plain_line_per_attempt(
+        self, monkeypatch, capsys
+    ):
+        rc, _calls, sleeps = _drive(monkeypatch, [255, 255, 0], tty=False)
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert attach_client.ERASE_LINE not in out
+        assert out.count("reconnecting to user@host") == 2
+        # One sleep per backoff, not one per second: a log does not animate.
+        assert sleeps == [2.0, 4.0]
+
+    def test_the_countdown_ticks_down_in_place_during_the_backoff(
+        self, monkeypatch, capsys
+    ):
+        rc, _calls, sleeps = _drive(monkeypatch, [255, 0], tty=True)
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert sleeps == [1.0, 1.0]  # 2s backoff, 1s granularity
+        assert "retry in 2s" in out
+        assert "retry in 1s" in out
+        assert "dialing" in out
+
+    def test_ssh_s_own_last_word_becomes_the_status_line_s_reason(
+        self, monkeypatch, capsys
+    ):
+        # The noise the user reported comes from the ssh CHILD. Captured, it
+        # stops scrolling and reappears as one clause on the one line.
+        rc, _calls, _sleeps = _drive(
+            monkeypatch,
+            [
+                _dial(255, "ssh: connect to host box port 22: Connection timed out"),
+                _dial(0),
+            ],
+            tty=True,
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "last: Connection timed out" in out
+
+    def test_a_healed_outage_leaves_exactly_one_permanent_line(
+        self, monkeypatch, capsys
+    ):
+        # The record is written at the drop that ENDED the restored session,
+        # never the moment it came back: at that moment ssh owns the console
+        # and the remote psmux is repainting an alternate screen, so anything
+        # printed lands inside the user's agent pane as unrepairable garbage.
+        rc, _calls, _sleeps = _drive(
+            monkeypatch,
+            [255, 255, 255, 0],
+            durations=[0.1, 0.1, 3600.0, 0.0],
+            tty=True,
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert out.count("reconnected to user@host") == 1
+        assert "after 2 attempt(s); stayed up 1h00m" in out
+
+    def test_a_first_connection_that_never_dropped_is_not_announced_as_healed(
+        self, monkeypatch, capsys
+    ):
+        _rc, _calls, _sleeps = _drive(monkeypatch, [0], durations=[3600.0], tty=True)
+        assert "reconnected to" not in capsys.readouterr().out
+
+    def test_a_pane_that_gives_up_hands_back_what_ssh_actually_said(
+        self, monkeypatch, capsys
+    ):
+        # Swallowing ssh's stderr is only defensible because a pane that STOPS
+        # trying flushes it: otherwise the last thing a dead pane shows is a
+        # message we wrote, and the real diagnostic is gone.
+        rc, _calls, _sleeps = _drive(
+            monkeypatch,
+            [_dial(0, "boom", ("psmux: no server running", "boom"))]
+            * attach_client.SESSION_MISSING_MAX,
+            probes=[attach_client.SESSION_GONE] * attach_client.SESSION_MISSING_MAX,
+            tty=True,
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "ssh said:" in out
+        assert "psmux: no server running" in out
+
+    def test_no_reconnect_keeps_ssh_s_stderr_on_ssh_s_stderr(self, monkeypatch):
+        # That flag's promise is the historical bare-ssh pane, down to which fd
+        # ssh's errors land on -- so it must never pipe them.
+        captured: list[bool] = []
+
+        def spy(_argv, *, capture=False):
+            captured.append(capture)
+            return _dial(255)
+
+        monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/usr/bin/ssh")
+        monkeypatch.setattr(attach_client, "_stdout_is_tty", lambda: True)
+        monkeypatch.setattr(attach_client, "_run_ssh", spy)
+        attach_client.supervise(
+            "user@host", "psmux -L api attach", "api", reconnect=False
+        )
+        assert captured == [False]
+
+
+class TestStderrCapture:
+    """Why piping ssh's fd 2 is safe: prompts use the tty, and with ``-t`` the
+    remote session's output arrives on STDOUT. Only client diagnostics land
+    here, which is exactly what the status line reports."""
+
+    def test_it_keeps_the_last_line_and_a_bounded_tail(self):
+        pump = attach_client._StderrPump(
+            io.BytesIO(b"first\nsecond\n\nthird\n"),
+        )
+        last, tail = pump.close()
+        assert last == "third"
+        assert tail == ("first", "second", "third")
+
+    def test_the_tail_cannot_grow_without_bound(self):
+        blob = b"".join(f"line {n}\n".encode() for n in range(200))
+        _last, tail = attach_client._StderrPump(io.BytesIO(blob)).close()
+        assert len(tail) == attach_client.STDERR_TAIL_LINES
+        assert tail[-1] == "line 199"
+
+    def test_undecodable_bytes_never_crash_the_pane(self):
+        last, _tail = attach_client._StderrPump(io.BytesIO(b"\xff\xfe bad\n")).close()
+        assert last.endswith("bad")
+
+    def test_a_changed_host_key_is_never_swallowed(self, capsys):
+        # The one exception to "quiet during an outage": a changed host key is
+        # a security event, and a 255 loop may never reach a stop path that
+        # would flush the tail. Safe to print because host-key verification
+        # fails during the handshake -- there is no live session to corrupt.
+        attach_client._StderrPump(
+            io.BytesIO(b"@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@\n"),
+        ).close()
+        assert "REMOTE HOST IDENTIFICATION HAS CHANGED" in capsys.readouterr().err
+
+    def test_the_interactive_child_never_has_its_stdin_or_stdout_piped(
+        self, monkeypatch
+    ):
+        # The module's whole contract: a waiter, never a middleman. Piping
+        # stdout would cost the session its colors, mouse reporting and resize.
+        seen: dict[str, object] = {}
+
+        class _Proc:
+            stderr = None
+
+            def wait(self):
+                return 0
+
+        def fake_popen(argv, **kwargs):
+            seen.update(argv=argv, **kwargs)
+            return _Proc()
+
+        monkeypatch.setattr(attach_client.subprocess, "Popen", fake_popen)
+        attach_client._run_ssh(["ssh", "host"], capture=True)
+        assert "stdin" not in seen
+        assert "stdout" not in seen
+        assert seen["stderr"] == subprocess.PIPE
+
+    def test_without_capture_even_stderr_stays_inherited(self, monkeypatch):
+        seen: dict[str, object] = {}
+
+        class _Proc:
+            stderr = None
+
+            def wait(self):
+                return 3
+
+        monkeypatch.setattr(
+            attach_client.subprocess,
+            "Popen",
+            lambda argv, **kw: (seen.update(argv=argv, **kw), _Proc())[1],
+        )
+        assert attach_client._run_ssh(["ssh", "host"]).rc == 3
+        assert seen["stderr"] is None
 
 
 class TestArgumentParsing:
