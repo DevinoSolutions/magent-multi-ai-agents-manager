@@ -202,15 +202,42 @@ def build_code_open_command(
 FLASH_MSG_MAX = 120
 
 
-def build_flash_url(server_url: str, project: str, message: str) -> str:
+# What a flash asks the status bar to LOOK like. Two values only: this is a
+# one-line bar saying whether the thing you pressed worked, not a palette.
+# It travels with EVERY message rather than only with failures, because psmux's
+# ``message-style`` is a global option on that socket -- set it once for a red
+# failure and every later message inherits red until something sets it back. A
+# green "cannot reach magent serve" is worse than no colour at all.
+FLASH_TINT_OK = "ok"
+FLASH_TINT_ERR = "err"
+
+
+def build_flash_url(
+    server_url: str,
+    project: str,
+    message: str,
+    duration_ms: int | None = None,
+    tint: str | None = None,
+) -> str:
     """URL that flashes ``message`` in the ``magent:<project>`` status line.
 
-    The F2 handler's only channel for on-screen feedback: hotkey.py runs in a
-    hidden background process with no terminal, so a failure it cannot report
-    through the upload server is invisible to the user. Pure string math, so
-    the shape stays testable on every OS (hotkey.py is win32-import-only).
+    The Alt+V/F2 handler's only channel for on-screen feedback: hotkey.py runs
+    in a hidden background process with no terminal, so a failure it cannot
+    report through the upload server is invisible to the user. Pure string math,
+    so the shape stays testable on every OS (hotkey.py is win32-import-only).
+
+    ``duration_ms`` is for a message that is a PHASE rather than a result: an
+    "uploading..." that expires while the upload is still running leaves a blank
+    bar, which reads exactly like the silence this whole channel exists to end.
+    Omitted, the server picks its own default. ``tint`` is FLASH_TINT_OK /
+    FLASH_TINT_ERR -- see their note on why it rides along on every message.
     """
-    return (
+    url = (
         f"{server_url.rstrip('/')}/api/flash"
         f"?project={quote(project)}&msg={quote(message[:FLASH_MSG_MAX])}"
     )
+    if duration_ms:
+        url = f"{url}&ms={int(duration_ms)}"
+    if tint:
+        url = f"{url}&tint={quote(tint)}"
+    return url

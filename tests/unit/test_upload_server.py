@@ -721,7 +721,16 @@ class TestHealth:
 
 
 class TestInSessionFeedback:
-    """Upload progress is flashed into the magent:<project> psmux status line."""
+    """Upload progress is flashed into the magent:<project> psmux status line
+    -- for the MOBILE page, which has no other screen in that window.
+
+    An Alt+V paste is different: it arrives with ``?project=`` and narrates
+    itself (altv.handle_press said "capturing..." before the clipboard was even
+    read, and will say the specific outcome when the reply lands). The status
+    line is ONE line, so a second voice on it can only race the first, and the
+    loser is whichever message the user actually needed. Hence: flagged
+    uploads get silence from the server, by design.
+    """
 
     @pytest.fixture(autouse=True)
     def _server(self, tmp_path, monkeypatch):
@@ -731,7 +740,6 @@ class TestInSessionFeedback:
         import magent.psmux as psmux_mod
 
         monkeypatch.setattr(psmux_mod, "find_psmux", lambda: "psmux")
-        monkeypatch.setattr(mod, "_inflight", {})
 
         self.calls: list[list[str]] = []
 
@@ -798,39 +806,33 @@ class TestInSessionFeedback:
             time.sleep(0.02)
         return False
 
-    def test_query_flashes_uploading_then_uploaded(self):
-        assert self._post("/upload?project=marka")["ok"] is True
-        # early flash lands before the response, so it's already recorded
-        assert any("uploading image" in f for f in self._flashes())
-        # the early flash targets the right session socket (a message-style
-        # tint may sit between the socket flag and display-message)
+    def test_a_mobile_upload_is_confirmed_on_the_bar(self):
+        assert self._post("/upload", project_field="marka")["ok"] is True
+        assert self._wait_flash("image uploaded")
+        # ...at the right session's own socket (a message-style tint may sit
+        # between the socket flag and display-message).
         assert any(
-            "-L marka" in f and "display-message" in f and "uploading" in f
+            "-L marka" in f and "display-message" in f and "image uploaded" in f
             for f in self._flashes()
         )
-        # result flash lands just after the response
-        assert self._wait_flash("image uploaded")
 
-    def test_no_query_skips_early_flash_but_confirms(self):
-        assert self._post("/upload", project_field="marka")["ok"] is True
-        assert self._wait_flash("image uploaded")  # still confirmed
-        assert not any(
-            "uploading image" in f for f in self._flashes()
-        )  # no early flash
+    def test_a_mobile_failure_is_shown_too(self):
+        assert self._post("/upload", project_field="evil")["ok"] is False
+        # An unknown project has no window to flash into; a KNOWN one does.
+        assert not self._flashes()
 
-    def test_failure_flashes_when_flagged_upload_rejected(self):
-        # query flags marka (valid early flash) but the body names an unknown
-        # project -> the upload is rejected and the session sees a failure.
+    def test_an_alt_v_upload_gets_no_second_voice_from_the_server(self):
+        # Regression pin for the "which message won?" race: ?project= means the
+        # listener is already narrating this press, so the server says nothing.
+        assert self._post("/upload?project=marka")["ok"] is True
+        assert not self._wait_flash("image uploaded", timeout=0.6)
+        assert not self._wait_flash("uploading image", timeout=0.1)
+
+    def test_an_alt_v_failure_is_left_to_the_listeners_specific_reason(self):
+        # The listener's flash says WHICH failure ("serve said HTTP 400:
+        # Unknown project"); a generic "upload failed" from here would stomp it.
         assert self._post("/upload?project=marka", project_field="evil")["ok"] is False
-        assert any("uploading image" in f for f in self._flashes())
-        assert self._wait_flash("upload failed")
-
-    def test_inflight_count_clears_after_upload(self):
-        import magent.upload_server as mod
-
-        self._post("/upload?project=marka")
-        self._wait_flash("image uploaded")
-        assert mod._inflight.get("marka", 0) == 0
+        assert not self._wait_flash("upload failed", timeout=0.6)
 
 
 class TestFlashEndpoint:
@@ -921,6 +923,42 @@ class TestFlashEndpoint:
         status, data = self._get("/api/flash")
         assert status == 400
         assert data["ok"] is False
+
+    def test_a_phase_message_can_ask_to_linger(self):
+        # A phase ("uploading...") that expires while the step is still running
+        # leaves a blank bar, which reads exactly like the silence this route
+        # exists to end -- so the caller may set its own duration.
+        self._get("/api/flash?project=marka&msg=working&ms=20000")
+        assert "20000" in self._flashes()[0]
+
+    def test_an_absurd_or_broken_duration_is_clamped_not_obeyed(self):
+        import magent.upload_server as mod
+
+        self._get("/api/flash?project=marka&msg=a&ms=99999999")
+        self._get("/api/flash?project=marka&msg=b&ms=notanumber")
+        self._get("/api/flash?project=marka&msg=c&ms=-5")
+        durations = [f[f.index("-d") + 1] for f in self._flashes()]
+        assert durations == [
+            str(mod._FLASH_MSG_MS_MAX),
+            str(mod._FLASH_MSG_MS),  # unparseable falls back, never fails the flash
+            str(mod._FLASH_MSG_MS_MIN),
+        ]
+
+    def test_the_tint_reaches_the_message_style(self):
+        # psmux's message-style is GLOBAL on the socket, so the caller sets it
+        # on every message; err must not leak into the next ok (and vice versa).
+        import magent.upload_server as mod
+
+        self._get("/api/flash?project=marka&msg=bad&tint=err")
+        self._get("/api/flash?project=marka&msg=fine&tint=ok")
+        styled = [c for c in self.calls if "message-style" in c]
+        assert mod._MSG_RED in styled[0]
+        assert mod._MSG_GREEN in styled[1]
+
+    def test_an_unknown_tint_leaves_the_style_alone_and_still_flashes(self):
+        self._get("/api/flash?project=marka&msg=hello&tint=chartreuse")
+        assert self._flashes()[0][-1] == "hello"
+        assert not any("message-style" in c for c in self.calls)
 
     def test_post_on_the_flash_route_is_405_not_404(self):
         # P3-16: /api/flash is a real GET route, so the wrong verb answers 405.
