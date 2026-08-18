@@ -1217,9 +1217,16 @@ class TestReconnectSupervisorOverRealSsh:
 # sentence lives in the REMOTE process, so a dropped client cannot lose it and
 # a reattach must show it again. Loopback sshd, so "a file on the host" is a
 # file this test can also read.
+#
+# argv[2] is a START MARKER, touched before anything else is attempted. It
+# answers the one question a silent pane cannot: did the remote side run at
+# all? "ssh never delivered the command" and "the command ran but its output
+# never reached the pane" have completely different causes, and without the
+# marker both look identical from the local end -- an empty transcript.
 _REMOTE_SESSION_PY = """\
 import sys, time
 buf = sys.argv[1]
+open(sys.argv[2], "a", encoding="utf-8").close()
 try:
     prev = open(buf, encoding="utf-8").read().replace("\\n", " ").strip()
 except OSError:
@@ -1243,6 +1250,38 @@ while time.monotonic() < deadline:
     sys.stdout.write("ECHO>" + text + "<\\r\\n")
     sys.stdout.flush()
 """
+
+
+# WALL-CLOCK BUDGETS FOR THE TYPED-TEXT TEST, and the arithmetic behind them.
+#
+# The `End-to-End` job is `timeout-minutes: 20`. Measured on a real run: setup
+# and the SSH-less e2e leg take ~4m20s, the earlier `needs_ssh` tests another
+# ~2m15s, so this test starts about 6.5 minutes in with ~13.5 minutes left. Its
+# original stage timeouts (180 + 120 + 60 + 180 + 300) summed to ~840s -- more
+# than the job could pay -- so one stuck stage produced a CANCELLED job with no
+# transcript instead of a failing test with one. Fantasy budgets do not make a
+# test more tolerant; they only convert its failures into cancellations.
+#
+# Calibrated against the healthy path, which completes in ~4 seconds end to end
+# (measured on the ubuntu leg). Each stage below is set to what a badly loaded
+# runner could plausibly need, then the TOTAL clamps the lot: whatever goes
+# wrong, this test is done inside four minutes and the job keeps nine.
+#
+# What the test proves is untouched -- the same five stages, the same
+# assertions on the same real drop.
+TYPED_TEXT_BUDGET_S = 240.0
+# ssh handshake + remote shell + interpreter start. The slowest stage by far on
+# Windows, where every earlier ssh round-trip in this file costs ~20s.
+STAGE_READY_S = 90.0
+# A round-trip through an already-open connection.
+STAGE_ECHO_S = 30.0
+# The host-side file, written by the same process that already echoed.
+STAGE_HOST_FILE_S = 20.0
+# The supervisor notices a KILLED ssh child immediately (rc 255 needs no
+# liveness probe) and paints the status line on its first backoff tick.
+STAGE_RECONNECT_S = 45.0
+# One backoff (2s) plus a second full dial and remote start.
+STAGE_REDRAW_S = 90.0
 
 
 def _pty_backend_or_skip() -> None:
@@ -1312,7 +1351,7 @@ class TestTypedTextSurvivesARealDrop:
 
     def test_typed_text_survives_a_real_reconnect(self, tmp_path, ssh_wire):
         _pty_backend_or_skip()
-        from tests.e2e._pty import Pty
+        from tests.e2e._pty import Budget, Pty, PtyTimeout
         from tests.e2e._screen import Screen
 
         exe = _attach_client_exe()
@@ -1322,7 +1361,19 @@ class TestTypedTextSurvivesARealDrop:
         script = tmp_path / f"{token}-session.py"
         script.write_text(_REMOTE_SESSION_PY, encoding="utf-8")
         buffer = tmp_path / f"{token}-buffer.txt"
-        remote = f'{python} "{script.as_posix()}" "{buffer.as_posix()}"'
+        started_marker = tmp_path / f"{token}-started.txt"
+        remote = (
+            f'{python} "{script.as_posix()}" "{buffer.as_posix()}"'
+            f' "{started_marker.as_posix()}"'
+        )
+        # ONE allowance for the whole test, clamping every stage below. The
+        # per-stage numbers used to sum to ~840s, which is more than the
+        # `End-to-End` job's entire 20-minute timeout has left by the time this
+        # test starts (~6.5 min in) -- so a single stuck stage did not fail the
+        # test, it CANCELLED the job, discarding the transcript that would have
+        # explained it. The healthy path finishes in about four seconds; this is
+        # sixty times that, and still leaves the job most of its budget.
+        budget = Budget(TYPED_TEXT_BUDGET_S)
 
         rows, cols = 24, 80
         pty = Pty(
@@ -1337,16 +1388,35 @@ class TestTypedTextSurvivesARealDrop:
             },
             cwd=str(tmp_path),
             dimensions=(rows, cols),
+            budget=budget,
         )
         try:
-            # 1. A real session, over a real connection.
-            pty.expect("REMOTE-READY", timeout=180)
+            # 1. A real session, over a real connection. This is the stage that
+            #    can fail for a reason no transcript names -- the remote command
+            #    never being delivered at all -- so its failure is annotated
+            #    with the start marker and the command that was supposed to
+            #    write it, rather than left as "no output".
+            try:
+                pty.expect("REMOTE-READY", timeout=STAGE_READY_S)
+            except PtyTimeout as timed_out:
+                raise AssertionError(
+                    f"{timed_out}\n--- remote side ---\n"
+                    f"start marker {'WAS' if started_marker.exists() else 'was NEVER'}"
+                    f" written ({started_marker}), so the remote command "
+                    + (
+                        "RAN and its output did not reach the pane"
+                        if started_marker.exists()
+                        else "never ran: ssh did not deliver it, or the remote "
+                        "shell could not parse/resolve it"
+                    )
+                    + f"\ncommand: {remote}\ntarget: {target}"
+                ) from timed_out
             # 2. The user types, and it lands on the HOST.
             pty.send_line(token)
-            pty.expect(f"ECHO>{token}<", timeout=120)
+            pty.expect(f"ECHO>{token}<", timeout=STAGE_ECHO_S)
             assert _wait_until(
                 lambda: buffer.exists() and token in buffer.read_text(encoding="utf-8"),
-                timeout=60,
+                timeout=min(STAGE_HOST_FILE_S, max(budget.remaining(), 1.0)),
             ), "the typed text never reached the host"
 
             # 3. The wi-fi "drops": something outside the pane kills the client.
@@ -1354,11 +1424,11 @@ class TestTypedTextSurvivesARealDrop:
 
             # 4. The pane heals itself, and while it does, the status line is
             #    on screen -- this is the moment the old code erased the frame.
-            pty.expect("reconnecting", timeout=180)
+            pty.expect("reconnecting", timeout=STAGE_RECONNECT_S)
             mid_outage = Screen(rows=rows, cols=cols).feed(pty.raw)
 
             # 5. The reattach redraws the session, typed text and all.
-            pty.expect(f"BUFFER>{token}<", timeout=300)
+            pty.expect(f"BUFFER>{token}<", timeout=STAGE_REDRAW_S)
             healed = Screen(rows=rows, cols=cols).feed(pty.raw)
         finally:
             with suppress(Exception):
