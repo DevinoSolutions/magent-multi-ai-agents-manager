@@ -615,15 +615,32 @@ class TestStatusLineWriter:
         assert capsys.readouterr().out == ""
 
 
+def _fake_terminal(monkeypatch, answer):
+    """Make ONLY ``attach_client``'s view of ``shutil`` answer ``answer``.
+
+    Not ``monkeypatch.setattr(shutil, "get_terminal_size", ...)``: that is the
+    real stdlib module, and pytest's own terminal writer calls the same function
+    to size its output. Patching it globally took the whole session down with an
+    INTERNALERROR the moment pytest tried to print a line while the patch was
+    live -- which is exactly what happened in CI (`-v` prints per test) and not
+    locally (`-q` does not). Swapping the module OBJECT inside this one
+    namespace keeps the blast radius at the module under test.
+    """
+    import shutil as real_shutil
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        attach_client,
+        "shutil",
+        SimpleNamespace(get_terminal_size=answer, which=real_shutil.which),
+    )
+
+
 class TestBottomRowProbe:
     """``_term_rows``: which row the status line is allowed to own."""
 
     def test_it_reports_the_terminals_real_height(self, monkeypatch):
-        monkeypatch.setattr(
-            attach_client.shutil,
-            "get_terminal_size",
-            lambda **_k: os.terminal_size((120, 40)),
-        )
+        _fake_terminal(monkeypatch, lambda **_k: os.terminal_size((120, 40)))
         assert attach_client._term_rows() == 40
 
     @pytest.mark.parametrize("boom", [OSError("no tty"), ValueError("nonsense")])
@@ -633,17 +650,13 @@ class TestBottomRowProbe:
         def raise_it(**_kwargs):
             raise boom
 
-        monkeypatch.setattr(attach_client.shutil, "get_terminal_size", raise_it)
+        _fake_terminal(monkeypatch, raise_it)
         assert attach_client._term_rows() == 24
 
     def test_a_nonsense_height_never_builds_a_row_zero_move(self, monkeypatch):
         # `\x1b[0;1H` is not a row on any terminal; a pane being resized can
         # briefly report a height of 0.
-        monkeypatch.setattr(
-            attach_client.shutil,
-            "get_terminal_size",
-            lambda **_k: os.terminal_size((80, 0)),
-        )
+        _fake_terminal(monkeypatch, lambda **_k: os.terminal_size((80, 0)))
         assert attach_client._term_rows() >= 1
         assert "[0;1H" not in attach_client.status_home()
 
