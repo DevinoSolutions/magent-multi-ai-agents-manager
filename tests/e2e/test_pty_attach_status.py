@@ -31,7 +31,7 @@ import uuid
 import pytest
 
 from tests.e2e import _attach_pane as pane_mod
-from tests.e2e._pty import Pty
+from tests.e2e._pty import Budget, Pty
 from tests.e2e._screen import Screen
 
 pytestmark = [pytest.mark.e2e, pytest.mark.pty]
@@ -42,6 +42,17 @@ else:
     pytest.importorskip("pexpect", reason="pexpect needed for the POSIX PTY tests")
 
 ROWS, COLS = 24, 80
+
+# One wall-clock allowance per pane, clamping every stage inside it.
+#
+# These tests have no network in them -- the stand-in TUI and the supervisor
+# both run locally and the whole thing finishes in a couple of seconds -- but
+# their per-stage timeouts sum to ~360s EACH, so five of them could ask for
+# half an hour inside a job that has twenty minutes. Nobody chose that number;
+# it is just what five reasonable-looking stages add up to. The total is chosen,
+# and it is what a hosted runner under load could plausibly need for a local
+# process to paint a countdown, with room to spare.
+PANE_BUDGET_S = 120.0
 
 
 def _env() -> dict[str, str]:
@@ -88,6 +99,7 @@ class TestTheFrozenFrameSurvivesTheStatusLine:
             env=_env(),
             cwd=str(tmp_path),
             dimensions=(ROWS, COLS),
+            budget=Budget(PANE_BUDGET_S),
         )
         try:
             pty.expect(pane_mod.PANE_READY, timeout=60)
@@ -139,6 +151,7 @@ class TestTheFrozenFrameSurvivesTheStatusLine:
             env=_env(),
             cwd=str(tmp_path),
             dimensions=(ROWS, COLS),
+            budget=Budget(PANE_BUDGET_S),
         )
         try:
             pty.expect(pane_mod.PANE_READY, timeout=60)
@@ -178,6 +191,7 @@ class TestTheFrozenFrameSurvivesTheStatusLine:
             env=_env(),
             cwd=str(tmp_path),
             dimensions=(ROWS, COLS),
+            budget=Budget(PANE_BUDGET_S),
         )
         try:
             pty.expect(pane_mod.PANE_READY, timeout=60)
@@ -210,6 +224,7 @@ class TestTheFrozenFrameSurvivesTheStatusLine:
             env=_env(),
             cwd=str(tmp_path),
             dimensions=(ROWS, COLS),
+            budget=Budget(PANE_BUDGET_S),
         )
         try:
             pty.expect(pane_mod.PANE_READY, timeout=60)
@@ -254,6 +269,7 @@ class TestKeystrokesTypedDuringAnOutage:
             env=_env(),
             cwd=str(tmp_path),
             dimensions=(ROWS, COLS),
+            budget=Budget(PANE_BUDGET_S),
         )
         try:
             pty.expect(pane_mod.PANE_READY, timeout=60)

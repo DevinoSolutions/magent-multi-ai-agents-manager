@@ -34,7 +34,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.e2e._pty import Pty
+from tests.e2e._pty import Budget, Pty
 
 pytestmark = [pytest.mark.e2e, pytest.mark.pty]
 
@@ -78,11 +78,19 @@ def _child_env(home: Path) -> dict[str, str]:
     return env
 
 
+# One wall-clock allowance per menu run, clamping every stage inside it. Each
+# test here is a handful of `expect`s at the driver's 30s default, which sum to
+# a worst case nobody picked; the total is picked. A local `python -m magent`
+# that has not painted its menu in a minute and a half is broken, not slow.
+MENU_BUDGET_S = 90.0
+
+
 def _spawn(env: dict[str, str], cwd: Path, *args: str) -> Pty:
     return Pty(
         [sys.executable, "-m", "magent", *args],
         env=env,
         cwd=str(cwd),
+        budget=Budget(MENU_BUDGET_S),
     )
 
 

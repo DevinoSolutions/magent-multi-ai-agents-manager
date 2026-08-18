@@ -1056,6 +1056,28 @@ latency was never in the multiplexer.
 
 Ordered roughly by how likely a future change is to collide with it.
 
+**Typed text cannot be delivered through a nested ConPTY over `ssh -t`
+(2026-08-18):** `tests/e2e/test_ssh_real.py::test_typed_text_survives_a_real
+_reconnect` is a loud `::warning` skip on win32. The test drives the real
+supervisor under a pywinpty pseudoconsole, over a real `ssh -t`, into the
+Windows sshd's own pseudoconsole — two ConPTYs in series. The typed text
+arrives fine and is echoed by the remote; the ENTER does not. It arrives as a
+literal win32-input-mode key record (`ESC [ 13 ; 28 ; 13 ; 1 ; 0 ; 1 _`, i.e.
+VK_RETURN/CR — the same stream carries the `ESC [ ? 9001 h` DECSET that enables
+that mode), so the remote's `readline()` never completes. Measured, with the
+transcript quoted in the skip helper's docstring — and only measurable once
+`_pty.expect` grew a real deadline, because before that the leg simply hung
+until GitHub cancelled the job.
+
+Not a product defect and not a user-visible one: a real attach pane is hosted
+by Windows Terminal's ConPTY, where the keystroke arrives as a keystroke (the
+CI-only `interaction` tier drives real `SendInput` chords through it). The
+guarantee this test exists for is still covered on Windows by
+`tests/e2e/test_pty_attach_status.py`, which pins the local rendering half cell
+by cell, and the test itself runs for real on ubuntu and macOS. Worth trying
+next: pywinpty's WinPTY back end (`PtyProcess.spawn(backend=Backend.WinPTY)`),
+which predates win32-input-mode and may pass the CR through unencoded.
+
 **Attach-pane reconnect is only reachable from a Windows client (2026-08-09):**
 `attach_client.py` itself is OS-agnostic (stdlib + click; the `Popen` in
 `_run_ssh` inherits the console on POSIX exactly as it does on Windows) and its unit tier
