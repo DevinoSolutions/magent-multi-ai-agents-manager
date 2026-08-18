@@ -30,6 +30,7 @@ import subprocess
 import sys
 import time
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -57,17 +58,111 @@ def _health_ok(port: int) -> bool:
         return False
 
 
+# One record file per invocation, published atomically -- NOT appended lines in
+# one shared log.
+#
+# Measured, not guessed. The shared-append recorder this replaces lost records
+# in CI (four windows-latest sightings: a phase vanished from an otherwise
+# correct, correctly ordered narration; once it was the `send-keys` record that
+# went instead). The product is not the loser: `/api/flash` runs
+# `psmux.flash_message` to completion BEFORE it replies, and the pump waits for
+# each reply, so the flash spawns are strictly serialized. But the paste
+# (`upload_server._inject_paste`, on its own worker since the deferred-inject
+# change) and the session probes run CONCURRENTLY with them, and Windows has no
+# atomic append: the CRT implements ``open(path, "a")`` as seek-to-end followed
+# by write, with nothing holding the file between the two, so two overlapping
+# spawns resolve the same offset and the second write lands on top of the
+# first. A local probe -- 6 processes x 300 lines, exactly this write -- lost
+# 316 of 1800 records and left 50 torn lines, which the old reader then dropped
+# silently in its ``except ValueError: continue``.
+#
+# So: a unique name per invocation (ns stamp + pid + token), written to a dot
+# file and moved into place with os.replace. Nothing shares a byte range with
+# anything, and a reader can only ever see a whole record or no record at all.
+# The name is zero-padded so lexicographic order IS spawn order.
+#
+# Nothing new is imported to build that name (`os.urandom`, not `uuid`). Every
+# record is stamped by a freshly booted interpreter and the press-to-bar
+# latency assertions read those stamps, so anything this shim does before
+# recording is charged to the PRODUCT's measured latency. Spawn cost here is
+# 80-275 ms and heavy-tailed even on an idle box, which is already most of the
+# budget in `test_the_press_is_acknowledged_...`; the recorder must not add to
+# it to buy itself convenience.
 _SHIM_BODY = """
 import json, os, sys, time
 argv = sys.argv[1:]
-with open(LOG, "a", encoding="utf-8") as fh:
-    fh.write(json.dumps({"t": time.time(), "argv": argv}) + "\\n")
+uniq = "%020d-%08d-%s" % (time.time_ns(), os.getpid(), os.urandom(4).hex())
+tmp = os.path.join(RECDIR, "." + uniq)
+with open(tmp, "w", encoding="utf-8") as fh:
+    fh.write(json.dumps({"t": time.time(), "argv": argv}))
+final = os.path.join(RECDIR, uniq + ".json")
+for attempt in range(50):
+    try:
+        os.replace(tmp, final)
+        break
+    except OSError:
+        # A virus scanner holding the freshly written file is the one thing
+        # that can fail an os.replace here, and it is transient. Losing the
+        # record is the failure mode this whole scheme exists to remove, so
+        # this retries rather than shrugging.
+        time.sleep(0.02)
+else:
+    sys.exit("shim could not publish its record: " + final)
 if DELAY and "display-message" in argv:
     time.sleep(DELAY)
 if INJECT_DELAY and "send-keys" in argv:
     time.sleep(INJECT_DELAY)
 sys.exit(0)
 """
+
+
+def _write_shim(
+    bin_dir: Path, rec_dir: Path, delay_s: float = 0.0, inject_delay_s: float = 0.0
+) -> None:
+    """Put a REAL executable named `psmux` on ``bin_dir``, recording every argv.
+
+    Not a mock inside the product: the server resolves it off PATH with the
+    same shutil.which every install uses, and spawns it with the same
+    subprocess call, so the recorded argv IS what psmux would have got.
+
+    The two delays are separate because the two stalls are: a slow STATUS LINE
+    (``display-message``) is a narration problem, and a slow PASTE
+    (``send-keys``) is the one that used to hold an HTTP reply open past the
+    listener's patience. Both are applied AFTER the record is published, so a
+    stalled multiplexer still timestamps its spawn honestly.
+    """
+    script = bin_dir / "psmux_shim.py"
+    script.write_text(
+        f"RECDIR = {str(rec_dir)!r}\nDELAY = {delay_s!r}\n"
+        f"INJECT_DELAY = {inject_delay_s!r}\n" + _SHIM_BODY,
+        encoding="utf-8",
+    )
+    if sys.platform == "win32":
+        (bin_dir / "psmux.cmd").write_text(
+            f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8"
+        )
+    else:
+        shim = bin_dir / "psmux"
+        shim.write_text(
+            f'#!/bin/sh\nexec {sys.executable!r} {str(script)!r} "$@"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+
+
+def _read_calls(rec_dir: Path) -> list[dict]:
+    """Every recorded invocation, in spawn order.
+
+    A record that was published is a record that is read: each file is written
+    whole and moved into place atomically, so there is no torn tail to skip --
+    and this deliberately does NOT swallow a parse error. Silently discarding a
+    record is precisely how the loss it replaces stayed invisible for four CI
+    runs; a malformed file here is a harness bug and must say so.
+    """
+    return [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(rec_dir.glob("*.json"))
+    ]
 
 
 class _Fleet:
@@ -82,10 +177,11 @@ class _Fleet:
         self.home.mkdir()
         self.proj_dir = tmp_path / f"proj-{self.unique}"
         self.proj_dir.mkdir()
-        self.log = tmp_path / "psmux-calls.jsonl"
+        self.rec_dir = tmp_path / "psmux-calls"
+        self.rec_dir.mkdir()
         self.bin_dir = tmp_path / "bin"
         self.bin_dir.mkdir()
-        self._write_shim(flash_delay_s, inject_delay_s)
+        _write_shim(self.bin_dir, self.rec_dir, flash_delay_s, inject_delay_s)
 
         self.port = _free_port()
         self.url = f"http://127.0.0.1:{self.port}"
@@ -153,36 +249,6 @@ class _Fleet:
         env["PATH"] = str(self.bin_dir) + os.pathsep + env.get("PATH", "")
         return env
 
-    def _write_shim(self, delay_s: float, inject_delay_s: float = 0.0) -> None:
-        """A REAL executable named `psmux`, recording every argv it is given.
-
-        Not a mock inside the product: the server resolves it off PATH with the
-        same shutil.which every install uses, and spawns it with the same
-        subprocess call, so the recorded argv IS what psmux would have got.
-
-        The two delays are separate because the two stalls are: a slow STATUS
-        LINE (``display-message``) is a narration problem, and a slow PASTE
-        (``send-keys``) is the one that used to hold an HTTP reply open past the
-        listener's patience.
-        """
-        script = self.bin_dir / "psmux_shim.py"
-        script.write_text(
-            f"LOG = {str(self.log)!r}\nDELAY = {delay_s!r}\n"
-            f"INJECT_DELAY = {inject_delay_s!r}\n" + _SHIM_BODY,
-            encoding="utf-8",
-        )
-        if sys.platform == "win32":
-            (self.bin_dir / "psmux.cmd").write_text(
-                f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8"
-            )
-        else:
-            shim = self.bin_dir / "psmux"
-            shim.write_text(
-                f'#!/bin/sh\nexec {sys.executable!r} {str(script)!r} "$@"\n',
-                encoding="utf-8",
-            )
-            shim.chmod(0o755)
-
     def wait_ready(self) -> None:
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -215,17 +281,7 @@ class _Fleet:
             pass
 
     def calls(self) -> list[dict]:
-        try:
-            raw = self.log.read_text(encoding="utf-8")
-        except OSError:
-            return []
-        out = []
-        for line in raw.splitlines():
-            try:
-                out.append(json.loads(line))
-            except ValueError:  # a torn last line while the shim is writing
-                continue
-        return out
+        return _read_calls(self.rec_dir)
 
     def flashes(self) -> list[tuple[float, str]]:
         """(timestamp, message) for every display-message aimed at THIS fleet.
@@ -440,25 +496,38 @@ def test_a_press_narrates_capture_upload_and_success_in_order(fleet):
 def test_the_press_is_acknowledged_while_the_capture_is_still_running(fleet):
     """The user-visible fix: the bar answers the KEYPRESS, not the upload.
 
-    The capture here takes 2 real seconds (a big screenshot off a busy
-    clipboard is not instant). The acknowledgement has to be on the bar long
-    before it finishes, or the whole "why is the status so late?" complaint is
-    back.
+    The capture here takes 4 real seconds (a big screenshot off a busy
+    clipboard is not instant). The acknowledgement has to be on the bar before
+    it finishes, or the whole "why is the status so late?" complaint is back.
+
+    The assertion compares two clocks from the SAME run rather than checking a
+    stopwatch against a constant, and that is deliberate. The old form allowed
+    the press 1.0 s to reach the bar -- but the recorded timestamp comes from
+    the stand-in multiplexer, which is a Python script, so every reading
+    included a fresh interpreter's startup. Measured on this machine over 20
+    runs: 0.09 s to 1.55 s, blowing the 1.0 s budget 3 times. Instrumenting the
+    stages showed press->pump-dispatch and press->serve-received both at 0.00 s
+    on exactly the runs that failed, so the number under assertion was python
+    booting, not the product answering. What the product actually promises is
+    that the acknowledgement does not wait on the capture -- so that is what is
+    asserted, and it stays sharp: were the flash made synchronous again, it
+    could not possibly land before the capture it now sits behind.
     """
-    pressed = time.time()
+    finished: list[float] = []
 
     def _slow_capture():
-        time.sleep(2.0)
+        time.sleep(4.0)
+        finished.append(time.time())
         return b"BM-fake-image"
 
     altv.handle_press(fleet.url, fleet.project, _slow_capture)
 
     stamp, message = fleet.wait_for_flash("capturing")
     assert message == "Alt+V: capturing..."
-    latency = stamp - pressed
-    assert latency < 1.0, (
-        f"the press acknowledgement took {latency:.2f}s to reach the status "
-        "line; it must not wait on the capture"
+    assert finished, "the capture never ran"
+    assert stamp < finished[0], (
+        f"the acknowledgement reached the status line {stamp - finished[0]:.2f}s "
+        "AFTER the capture finished; it must not wait on the capture"
     )
 
 
@@ -576,3 +645,61 @@ def test_the_upload_still_lands_and_injects_through_the_real_server(fleet):
     assert any(p.read_bytes() == payload for p in written)
     # ...and the server really asked the multiplexer to paste it.
     assert any("send-keys" in c["argv"] for c in fleet.calls())
+
+
+def test_the_recorder_loses_nothing_when_spawns_overlap(tmp_path):
+    """Harness correctness, pinned -- because a lost RECORD reads as a lost FLASH.
+
+    This is not a nicety. The recorder used to append lines to one shared file
+    and it dropped records under exactly the overlap this tier creates (the
+    paste worker and the session probes run alongside the serialized flashes):
+    four windows-latest CI failures where a phase was simply absent from an
+    otherwise perfect narration, and the accusation landed on the product every
+    time. A recorder that can lose a line cannot testify about a channel whose
+    whole job is not losing messages.
+
+    Both halves are asserted, and the second is what makes the first honest:
+    every argv comes back (no loss under real concurrency), AND there is one
+    record file per invocation (nothing SHARES a file, so there is nothing for
+    a lost race to overwrite). Any regression to a shared log fails the second
+    assertion deterministically, rather than flaking back at 1-in-3.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    rec_dir = tmp_path / "rec"
+    rec_dir.mkdir()
+    _write_shim(bin_dir, rec_dir)
+    shim = bin_dir / ("psmux.cmd" if sys.platform == "win32" else "psmux")
+
+    spawns = 12
+    procs = [
+        subprocess.Popen(
+            [
+                str(shim),
+                "-L",
+                f"sock-{n}",
+                "display-message",
+                "-d",
+                "20000",
+                f"msg-{n}",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for n in range(spawns)
+    ]
+    for proc in procs:
+        _, stderr = proc.communicate(timeout=120)
+        assert proc.returncode == 0, stderr
+
+    calls = _read_calls(rec_dir)
+    recorded = {c["argv"][-1] for c in calls}
+    assert recorded == {f"msg-{n}" for n in range(spawns)}, (
+        f"the recorder lost {spawns - len(recorded)} of {spawns} overlapping "
+        f"invocations; saw {sorted(recorded)}"
+    )
+    assert len(list(rec_dir.glob("*.json"))) == spawns, (
+        "invocations shared a record file; concurrent writers must never be "
+        "able to land on the same bytes"
+    )
