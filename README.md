@@ -158,9 +158,11 @@ A whole outage costs **one line**, rewritten in place — not a scroll of retrie
   ~ reconnecting to me@desk (attempt 4, retry in 16s, last: Connection timed out) -- Ctrl+C to stop
 ```
 
+That line lives on the **bottom row of the pane, and nowhere else**. When the connection dies your agent's screen is left exactly as it was — mid-answer, and with whatever you had typed into the prompt box and not yet sent still sitting there, readable, on the row it was always on. The reconnect warning never draws over it. (It used to: it painted wherever the cursor happened to be, which in an agent pane is the end of your half-written sentence.)
+
 Narrow panes drop the hint, then the host name, then the reason — the attempt and the countdown are the last things to go. Redirected panes (`magent attach ... > log`) get one plain line per attempt instead, with no cursor tricks. When a reconnected session eventually ends, the pane leaves one permanent record of the outage it survived (`+ reconnected to me@desk after 4 attempt(s); stayed up 1h04m`).
 
-Nothing is lost while it waits: the psmux session lives on the **host**, so the reattached pane comes back to the same running agent and the same scrollback. You do not have to close a wall of dead terminals and re-run `magent attach` any more.
+Nothing is lost while it waits: the psmux session lives on the **host**, so the reattached pane comes back to the same running agent, the same scrollback, and the same unsent prompt text — the agent is holding it, not your terminal. You can even keep typing during the outage: what you type is buffered by your terminal and delivered to the agent as soon as the connection is back. You do not have to close a wall of dead terminals and re-run `magent attach` any more.
 
 Only a **deliberate detach** closes a pane. When a connection ends, the supervisor asks the host — over a separate, one-shot SSH check — whether your session is still alive. If it is, you left on purpose (`F1`, or `psmux detach`), the pane says `detached from <session>` and exits. If the session is *not* there (host rebooting, a bring-up still in progress), the pane keeps dialling for a few more tries and only then stops and tells you to run `magent attach` — so it never hammers a healthy SSH server over a session that is gone for good. `Ctrl+C` stops the supervisor immediately at any point.
 
