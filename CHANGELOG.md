@@ -5,6 +5,40 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.13.1] - 2026-08-18
+
+### Fixed
+
+- **The upload reply is no longer hostage to the paste.** Sending a
+  snip used to mean waiting out the paste into the agent's pane inside
+  the upload request itself: when psmux was slow to accept `send-keys`
+  (measured at 74 seconds under load), the Alt+V listener's own
+  20-second deadline expired first and narrated `upload failed - is
+  magent serve running?` for an upload that had in fact landed on disk
+  and would eventually paste. The paste now runs on its own worker with
+  exactly one attempt (bounded at 60 seconds -- a retry against a
+  slow-but-live psmux double-pastes), every `psmux send-keys` call is
+  bounded instead of hanging forever, and the upload reply waits at
+  most 3 seconds before answering with one of three honest paste
+  states: pasted, still pasting, or refused. A stalled paste now
+  narrates `Alt+V: image saved - psmux is slow, paste still pending`
+  -- a success tint, because the image is safe on disk -- instead of a
+  false failure. Measured press-to-outcome against a 30-second psmux
+  stall: 3.1 seconds. A new non-mocked end-to-end test drives that
+  exact stall through a real `magent serve` and pins the fast answer,
+  the pending narration, the byte-identical file, and the
+  single-attempt guarantee on every OS.
+- **The Alt+V end-to-end tier no longer loses its own evidence on
+  Windows.** The tier's recording multiplexer appended all records to
+  one shared file, and Windows appends are not atomic -- concurrent
+  invocations tore or dropped lines, failing roughly two of every
+  three Windows CI runs with phantom "missing flash" and "missing
+  paste" verdicts. The product itself never lost a flash (the flash
+  pipeline is serialized end-to-end; that is now proven and pinned).
+  Each recorder invocation writes its own atomically-published record
+  file, a torn record is a loud failure instead of a silent skip, and
+  a regression test pins zero loss under twelve concurrent spawns.
+
 ## [3.13.0] - 2026-08-18
 
 ### Added
@@ -961,6 +995,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.13.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.13.0...v3.13.1
 [3.13.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.3...v3.13.0
 [3.12.3]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.2...v3.12.3
 [3.12.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.1...v3.12.2
