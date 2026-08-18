@@ -82,9 +82,12 @@ def _health_ok(port: int) -> bool:
 # The name is zero-padded so lexicographic order IS spawn order.
 #
 # Nothing new is imported to build that name (`os.urandom`, not `uuid`). Every
-# record is timestamped by a freshly booted interpreter, and the press-to-bar
-# timings read off those stamps, so an import here is charged to the product:
-# `uuid` alone measured ~64 ms of extra startup over 10 spawns.
+# record is stamped by a freshly booted interpreter and the press-to-bar
+# latency assertions read those stamps, so anything this shim does before
+# recording is charged to the PRODUCT's measured latency. Spawn cost here is
+# 80-275 ms and heavy-tailed even on an idle box, which is already most of the
+# budget in `test_the_press_is_acknowledged_...`; the recorder must not add to
+# it to buy itself convenience.
 _SHIM_BODY = """
 import json, os, sys, time
 argv = sys.argv[1:]
@@ -671,7 +674,15 @@ def test_the_recorder_loses_nothing_when_spawns_overlap(tmp_path):
     spawns = 12
     procs = [
         subprocess.Popen(
-            [str(shim), "-L", f"sock-{n}", "display-message", "-d", "20000", f"msg-{n}"],
+            [
+                str(shim),
+                "-L",
+                f"sock-{n}",
+                "display-message",
+                "-d",
+                "20000",
+                f"msg-{n}",
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
