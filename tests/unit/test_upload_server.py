@@ -924,6 +924,42 @@ class TestFlashEndpoint:
         assert status == 400
         assert data["ok"] is False
 
+    def test_a_phase_message_can_ask_to_linger(self):
+        # A phase ("uploading...") that expires while the step is still running
+        # leaves a blank bar, which reads exactly like the silence this route
+        # exists to end -- so the caller may set its own duration.
+        self._get("/api/flash?project=marka&msg=working&ms=20000")
+        assert "20000" in self._flashes()[0]
+
+    def test_an_absurd_or_broken_duration_is_clamped_not_obeyed(self):
+        import magent.upload_server as mod
+
+        self._get("/api/flash?project=marka&msg=a&ms=99999999")
+        self._get("/api/flash?project=marka&msg=b&ms=notanumber")
+        self._get("/api/flash?project=marka&msg=c&ms=-5")
+        durations = [f[f.index("-d") + 1] for f in self._flashes()]
+        assert durations == [
+            str(mod._FLASH_MSG_MS_MAX),
+            str(mod._FLASH_MSG_MS),  # unparseable falls back, never fails the flash
+            str(mod._FLASH_MSG_MS_MIN),
+        ]
+
+    def test_the_tint_reaches_the_message_style(self):
+        # psmux's message-style is GLOBAL on the socket, so the caller sets it
+        # on every message; err must not leak into the next ok (and vice versa).
+        import magent.upload_server as mod
+
+        self._get("/api/flash?project=marka&msg=bad&tint=err")
+        self._get("/api/flash?project=marka&msg=fine&tint=ok")
+        styled = [c for c in self.calls if "message-style" in c]
+        assert mod._MSG_RED in styled[0]
+        assert mod._MSG_GREEN in styled[1]
+
+    def test_an_unknown_tint_leaves_the_style_alone_and_still_flashes(self):
+        self._get("/api/flash?project=marka&msg=hello&tint=chartreuse")
+        assert self._flashes()[0][-1] == "hello"
+        assert not any("message-style" in c for c in self.calls)
+
     def test_post_on_the_flash_route_is_405_not_404(self):
         # P3-16: /api/flash is a real GET route, so the wrong verb answers 405.
         conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
