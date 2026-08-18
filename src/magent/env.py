@@ -166,13 +166,106 @@ def _is_mux_nesting_marker(key: str) -> bool:
     return upper in _MUX_NESTING_VARS or upper.startswith(_MUX_NESTING_PREFIX)
 
 
-def psmux_child_env() -> dict[str, str]:
-    """The process environment with the psmux/tmux nesting markers removed.
+# The AGENT-HARNESS session markers, by exact name. Same doctrine as
+# _MUX_NESTING_VARS above, one level up: a magent pane hosts somebody else's
+# agent, and an agent that inherits ANOTHER agent's session identity is a child
+# session of a process it has never met.
+#
+# Measured incident (v3.12.1 era): `magent up` was run from a shell inside a
+# Claude Code session, so all 45 psmux sessions were created with the launching
+# session's markers. Every `claude` in them printed
+#
+#     Transcript saving is off -- inherited CLAUDE_CODE_CHILD_SESSION marker
+#
+# and STOPPED WRITING TRANSCRIPTS for a day, which silently breaks
+# `claude --continue` -- the resume that magent's whole session model is built
+# on. Upstream sees the same class of damage from the same block:
+# anthropics/claude-code#26190 has nested `claude -p` hanging forever purely
+# because CLAUDECODE/CLAUDE_CODE_ENTRYPOINT were inherited.
+#
+# WHY AN EXACT LIST AND NOT THE WHOLE `CLAUDE_CODE_*` NAMESPACE -- the real
+# tradeoff, deliberately taken: that namespace is overwhelmingly USER
+# CONFIGURATION, not session state. It holds credentials such as
+# CLAUDE_CODE_OAUTH_TOKEN, provider selection such as CLAUDE_CODE_USE_BEDROCK
+# and CLAUDE_CODE_USE_VERTEX, and accessibility settings such as
+# CLAUDE_AX_SCREEN_READER -- machine-wide things a user sets on purpose. A
+# blanket prefix strip would log the agent out, silently move it off Bedrock, or
+# turn off a screen reader, which is a worse failure than the one being fixed.
+# This repo has already paid for a blanket prefix strip once: _MUX_KEEP_SUFFIX
+# exists because stripping every `TMUX*` took TMUX_TMPDIR with it and made every
+# session probe dead. So the cost of THIS choice is named too: a future Claude
+# Code release could add an identity marker that is not on this list, and it
+# would leak until someone adds it here. That failure is loud (the agent itself
+# prints the inherited-marker warning) and the fix is one line; logging every
+# agent out is neither.
+#
+# The tuning vars observed alongside these in the incident
+# (CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING, CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS,
+# CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY, CLAUDE_CODE_NO_FLICKER) SURVIVE for
+# exactly that reason: they are indistinguishable from a machine-wide user
+# preference, and none of them changes who the child thinks it is.
+_AGENT_SESSION_VARS = frozenset(
+    {
+        "CLAUDECODE",  # "1" in every subprocess Claude Code spawns
+        "CLAUDE_PID",  # the LAUNCHING session's pid
+        "CLAUDE_CODE_CHILD_SESSION",  # the transcript-persistence gate
+        "CLAUDE_CODE_SESSION_ID",  # the launching session's uuid
+        "CLAUDE_CODE_ENTRYPOINT",  # how the PARENT was started (cli/sdk/...)
+    }
+)
+# TODO(codex): Codex CLI has no documented inherited session-identity marker --
+# its shell_environment_policy sanitizes the child env from the other side, and
+# CODEX_HOME/CODEX_API_KEY are configuration, not session state. Add names here
+# if one is ever identified; do not guess at them.
 
-    magent's sessions are SIBLINGS by construction -- one session per socket,
-    never a session inside a session -- but a magent command run from inside a
-    magent psmux window inherits that window's ``PSMUX_SESSION``/``TMUX``, and
-    the psmux binary then refuses the child with::
+# The PRESENTATION overrides. Not session identity -- an opinion about ONE
+# process's stdout that has no business outliving the process that formed it.
+#
+# Second live incident, same mechanism, same day: the harness shell that ran
+# `magent up` carried NO_COLOR=1, so all 35 sessions it created rendered
+# monochrome ("the texts are all white" over SSH) while the 10 created from a
+# normal interactive shell had color.
+#
+# All four go, symmetrically, and the symmetry is the point: whatever the
+# launching shell decided about ITS OWN output, it is the wrong authority for an
+# interactive agent pane whose rendering the terminal chain (wt / ssh / psmux /
+# ConPTY) is there to negotiate. Stripping NO_COLOR while keeping FORCE_COLOR
+# would just be a different shell's opinion winning. A user who genuinely wants
+# colorless panes sets it in the shell profile that the pane's own shell sources
+# -- which is the authority that survives this strip, and the one that should.
+#
+# TERM is deliberately NOT touched in either direction. Nothing here removes it,
+# and nothing here invents one: psmux/tmux sets the pane's own TERM from
+# `default-terminal`, and the POSIX emulators set it for the shell they spawn,
+# so a launcher with no TERM at all never gets to decide the pane's.
+_PRESENTATION_VARS = frozenset(
+    {"NO_COLOR", "FORCE_COLOR", "CLICOLOR", "CLICOLOR_FORCE"}
+)
+
+# The one scrub list, public so tests can pin it by name rather than re-typing
+# it (a test that restates the list can drift from the list).
+SCRUBBED_INHERITED_VARS = _AGENT_SESSION_VARS | _PRESENTATION_VARS
+
+
+def _is_inherited_marker(key: str) -> bool:
+    """True for env vars that belong to the LAUNCHING process, not the child."""
+    return key.upper() in SCRUBBED_INHERITED_VARS
+
+
+def spawn_child_env() -> dict[str, str]:
+    """The process environment with every inherited-identity marker removed.
+
+    THE one seam for "what environment does a magent-spawned pane start with?".
+    Three families go, and each has its own block comment above: the psmux/tmux
+    nesting markers, the agent-harness session markers, and the presentation
+    overrides. Every spawn that can end up hosting an agent routes through here
+    -- psmux ``new-session`` (via ``psmux.child_env``), the launch-path terminal
+    spawns, and the IDE launches -- so the list lives in exactly one place.
+
+    On the psmux/tmux half: magent's sessions are SIBLINGS by construction --
+    one session per socket, never a session inside a session -- but a magent
+    command run from inside a magent psmux window inherits that window's
+    ``PSMUX_SESSION``/``TMUX``, and the psmux binary then refuses the child::
 
         psmux: sessions should be nested with care, unset PSMUX_SESSION to force
 
@@ -194,15 +287,16 @@ def psmux_child_env() -> dict[str, str]:
     ``TMUX_TMPDIR``, and a blanket ``TMUX*`` strip made the upload page render
     an empty project list.
 
-    Used for CREATION/CONTROL/PROBE children only. A user-facing ``attach``
-    client is a different question (attaching from inside a pane really IS
-    nesting, and psmux's guard is right to fire there), so those call sites
-    keep the inherited environment on purpose.
+    Used for CREATION children only. A user-facing ``attach`` client is a
+    different question (attaching from inside a pane really IS nesting, and
+    psmux's guard is right to fire there), and psmux's CONTROL/PROBE commands
+    are measurably indifferent to all of this, so those call sites keep the
+    inherited environment on purpose.
     """
     return {
         key: value
         for key, value in os.environ.items()
-        if not _is_mux_nesting_marker(key)
+        if not _is_mux_nesting_marker(key) and not _is_inherited_marker(key)
     }
 
 

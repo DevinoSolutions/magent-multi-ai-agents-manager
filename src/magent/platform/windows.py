@@ -413,8 +413,22 @@ class WindowsPlatform(Platform):
         else:
             args.extend(["--", "cmd", "/k", opts.command])
 
+        # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+        from magent.env import spawn_child_env
+
         try:
-            subprocess.Popen(args)
+            # `env=`: this window hosts the project's agent exactly like a psmux
+            # pane does, so it gets the same scrubbed block -- no inherited
+            # CLAUDE_CODE_* session identity, no inherited NO_COLOR. See
+            # env.spawn_child_env.
+            #
+            # Best-effort on Windows, honestly: `wt -w new` is a request to the
+            # running Windows Terminal MONARCH when one exists, and the tab it
+            # opens is then a child of THAT process's environment, not of this
+            # Popen's. It binds when wt is cold (and on every POSIX backend).
+            # The airtight path is psmux `new-session`, which is the default
+            # here; this is the belt to its braces.
+            subprocess.Popen(args, env=spawn_child_env())
         except FileNotFoundError as exc:
             # wt is a hard dependency: turn the raw FileNotFoundError into a
             # typed, actionable error the launch shell surfaces as one clean
@@ -422,11 +436,17 @@ class WindowsPlatform(Platform):
             raise TerminalNotFoundError(WT_NOT_FOUND_MESSAGE) from exc
 
     def launch_vscode(self, opts: VSCodeLaunchOpts) -> None:
+        # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+        from magent.env import spawn_child_env
+
         args = ["cmd", "/c", opts.command]
         if opts.ssh_host:
             args.extend(["--remote", f"ssh-remote+{opts.ssh_host}"])
         args.append(opts.dir)
-        subprocess.Popen(args)
+        # An IDE window is an agent host too: its integrated terminal inherits
+        # the editor's environment, and that is where a user runs `claude`.
+        # Same monarch caveat as `wt` -- `code` forwards to a running instance.
+        subprocess.Popen(args, env=spawn_child_env())
 
     def launch_psmux_session(self, windows: list[PsmuxWindowOpts]) -> None:
         psmux = find_psmux()

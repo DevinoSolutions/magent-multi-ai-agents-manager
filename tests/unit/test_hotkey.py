@@ -446,9 +446,15 @@ class _OpenCodeHarness:
         from magent import hotkey
 
         spawned: list[list[str]] = []
+        self.spawn_envs: list[object] = []
         self.flashed: list[str] = []
         monkeypatch.setattr(hotkey.shutil, "which", lambda _n: code_bin)
-        monkeypatch.setattr(hotkey.subprocess, "Popen", spawned.append)
+
+        def _popen(argv, **kwargs):
+            spawned.append(argv)
+            self.spawn_envs.append(kwargs.get("env"))
+
+        monkeypatch.setattr(hotkey.subprocess, "Popen", _popen)
 
         body = json.dumps(payload if payload is not None else {}).encode()
 
@@ -501,6 +507,33 @@ class TestDoOpenCode(_OpenCodeHarness):
         )
         hotkey._do_open_code("http://x:8034", "caly", "amin@deck")
         assert spawned == [["code", "--remote", "ssh-remote+deck", "/base/caly"]]
+
+    def test_the_editor_gets_a_scrubbed_environment(self, monkeypatch):
+        # The listener is a long-lived descendant of whatever shell started
+        # magent, so it carries that shell's agent-session markers for days.
+        # The editor it opens hands its environment to the integrated terminal,
+        # which is where a user runs `claude` -- so the same seam applies here
+        # as at psmux new-session. See env.spawn_child_env.
+        from magent import hotkey
+
+        monkeypatch.setenv("CLAUDE_CODE_CHILD_SESSION", "1")
+        monkeypatch.setenv("NO_COLOR", "1")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-keep-me")
+        self._patch(
+            monkeypatch,
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "caly", "session": "caly", "resolved": "/base/caly"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "caly", None)
+        env = self.spawn_envs[0]
+        assert env is not None
+        assert "CLAUDE_CODE_CHILD_SESSION" not in env
+        assert "NO_COLOR" not in env
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-keep-me"
 
     def test_missing_code_binary_warns_and_does_nothing(self, monkeypatch, caplog):
         from magent import hotkey
@@ -591,7 +624,7 @@ class TestDoOpenCodeFeedback(_OpenCodeHarness):
             },
         )
 
-        def _boom(_argv):
+        def _boom(_argv, **_kwargs):
             raise OSError("no exe")
 
         monkeypatch.setattr(hotkey.subprocess, "Popen", _boom)
@@ -609,7 +642,9 @@ class TestDoOpenCodeFeedback(_OpenCodeHarness):
 
         spawned: list[list[str]] = []
         monkeypatch.setattr(hotkey.shutil, "which", lambda _n: "code")
-        monkeypatch.setattr(hotkey.subprocess, "Popen", spawned.append)
+        monkeypatch.setattr(
+            hotkey.subprocess, "Popen", lambda argv, **_k: spawned.append(argv)
+        )
         body = json.dumps(
             {"ok": True, "sessions": [{"session": "caly", "resolved": "/base/caly"}]}
         ).encode()

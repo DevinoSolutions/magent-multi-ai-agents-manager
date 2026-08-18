@@ -643,6 +643,13 @@ class TestWindowsBringUpPsmuxInvocation:
         monkeypatch.setenv("TMUX", "/tmp/psmux-1/default,1,0")
         # A relocated socket dir rides along: configuration, not a marker.
         monkeypatch.setenv("TMUX_TMPDIR", "/tmp/private-sockets")
+        # ...and the launching AGENT HARNESS's own block, which is how the real
+        # incident happened: `magent up` typed into a Claude Code session.
+        monkeypatch.setenv("CLAUDE_CODE_CHILD_SESSION", "1")
+        monkeypatch.setenv("CLAUDECODE", "1")
+        monkeypatch.setenv("NO_COLOR", "1")
+        # Configuration that must reach the agent intact.
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-keep-me")
         calls, _ = _drive_bring_up(
             monkeypatch,
             windows=["api"],
@@ -663,6 +670,22 @@ class TestWindowsBringUpPsmuxInvocation:
             # must not survive -- and where the socket dir still must.
             assert _markers_in(env) == []
             assert env["TMUX_TMPDIR"] == "/tmp/private-sockets"
+
+    def test_new_session_also_drops_the_launching_harness_markers(self, monkeypatch):
+        # The psmux server this spawn creates is what hosts the agent for the
+        # rest of the day, so it is the one place the LAUNCHING agent session's
+        # identity must not survive: 45 real sessions inherited
+        # CLAUDE_CODE_CHILD_SESSION and stopped writing transcripts, and 35
+        # inherited NO_COLOR and rendered monochrome.
+        spawns = self._spawns(monkeypatch)
+        creates = [(c, e) for c, e in spawns if "new-session" in c]
+        assert creates, "no session was created"
+        for _cmd, env in creates:
+            assert "CLAUDE_CODE_CHILD_SESSION" not in env
+            assert "CLAUDECODE" not in env
+            assert "NO_COLOR" not in env
+            # ...while the agent's credentials still reach it.
+            assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-keep-me"
 
     def test_session_creation_breaks_out_of_the_launching_job(self, monkeypatch):
         # A client disconnect must never kill work on the server. When the
@@ -767,3 +790,142 @@ def test_find_window_unknown_mode_raises_windows():
 
     with pytest.raises(ValueError):
         WindowsPlatform().find_window("t", mode="bogus")  # type: ignore[arg-type]  # reason: invalid mode passed on purpose to prove it raises
+
+
+# --- inherited-marker scrub: the launch-path spawn sites ---------------------
+# psmux `new-session` is pinned above (TestWindowsBringUpPsmuxInvocation). These
+# are the OTHER windows a launch can open -- a plain terminal when psmux is off
+# or unavailable, and an IDE whose integrated terminal is where a user runs
+# `claude`. A `magent --go` from inside a Claude Code session leaks the same
+# block into all of them unless every one passes the seam's environment.
+
+
+@pytest.fixture
+def _dirty_launcher_env(monkeypatch):
+    """A launching shell that is inside a Claude Code session and colour-less."""
+    monkeypatch.setenv("CLAUDE_CODE_CHILD_SESSION", "1")
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "0000-1111")
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-keep-me")
+
+
+def _assert_scrubbed(env) -> None:
+    assert env is not None, "spawned with the inherited environment"
+    assert "CLAUDE_CODE_CHILD_SESSION" not in env
+    assert "CLAUDECODE" not in env
+    assert "CLAUDE_CODE_SESSION_ID" not in env
+    assert "NO_COLOR" not in env
+    # Configuration is not identity: the agent still needs to authenticate.
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-keep-me"
+
+
+@pytest.mark.usefixtures("_dirty_launcher_env")
+class TestLaunchPathSpawnsScrubTheInheritedMarkers:
+    def _envs(self, monkeypatch, module, call) -> list[object]:
+        envs: list[object] = []
+        monkeypatch.setattr(
+            f"magent.platform.{module}.subprocess.Popen",
+            lambda a, **k: envs.append(k.get("env")),
+        )
+        call()
+        assert envs, "nothing was spawned"
+        return envs
+
+    @pytest.mark.parametrize(
+        "emulator", ["kitty", "alacritty", "gnome-terminal", "konsole", "xterm"]
+    )
+    def test_linux_terminal(self, monkeypatch, emulator):
+        from magent.platform import TerminalLaunchOpts
+        from magent.platform.linux import LinuxPlatform
+
+        monkeypatch.setattr(
+            "magent.platform.linux.shutil.which", lambda n: n if n == emulator else None
+        )
+        envs = self._envs(
+            monkeypatch,
+            "linux",
+            lambda: LinuxPlatform().launch_terminal(
+                TerminalLaunchOpts(title="magent:api", cwd="/p", command="claude")
+            ),
+        )
+        _assert_scrubbed(envs[0])
+
+    def test_linux_vscode(self, monkeypatch):
+        from magent.platform import VSCodeLaunchOpts
+        from magent.platform.linux import LinuxPlatform
+
+        envs = self._envs(
+            monkeypatch,
+            "linux",
+            lambda: LinuxPlatform().launch_vscode(
+                VSCodeLaunchOpts(command="code", dir="/p")
+            ),
+        )
+        _assert_scrubbed(envs[0])
+
+    def test_macos_kitty_terminal(self, monkeypatch):
+        # kitty is the one macOS branch this Popen actually owns. The iTerm and
+        # Terminal.app branches spawn `osascript` against an already-running,
+        # launchd-started app whose environment no caller can reach -- an
+        # honest gap, documented in MacOSPlatform.launch_terminal rather than
+        # papered over with an env= that would do nothing.
+        from magent.platform import TerminalLaunchOpts
+        from magent.platform.macos import MacOSPlatform
+
+        monkeypatch.setattr(
+            "magent.platform.macos.shutil.which", lambda n: n if n == "kitty" else None
+        )
+        envs = self._envs(
+            monkeypatch,
+            "macos",
+            lambda: MacOSPlatform().launch_terminal(
+                TerminalLaunchOpts(title="magent:api", cwd="/p", command="claude")
+            ),
+        )
+        _assert_scrubbed(envs[0])
+
+    def test_macos_vscode(self, monkeypatch):
+        from magent.platform import VSCodeLaunchOpts
+        from magent.platform.macos import MacOSPlatform
+
+        envs = self._envs(
+            monkeypatch,
+            "macos",
+            lambda: MacOSPlatform().launch_vscode(
+                VSCodeLaunchOpts(command="code", dir="/p")
+            ),
+        )
+        _assert_scrubbed(envs[0])
+
+    @pytest.mark.skipif(
+        sys.platform != "win32", reason="WindowsPlatform binds windll at import"
+    )
+    def test_windows_terminal(self, monkeypatch):
+        from magent.platform import TerminalLaunchOpts
+        from magent.platform.windows import WindowsPlatform
+
+        envs = self._envs(
+            monkeypatch,
+            "windows",
+            lambda: WindowsPlatform().launch_terminal(
+                TerminalLaunchOpts(title="magent:api", cwd="C:/p", command="claude")
+            ),
+        )
+        _assert_scrubbed(envs[0])
+
+    @pytest.mark.skipif(
+        sys.platform != "win32", reason="WindowsPlatform binds windll at import"
+    )
+    def test_windows_vscode(self, monkeypatch):
+        from magent.platform import VSCodeLaunchOpts
+        from magent.platform.windows import WindowsPlatform
+
+        envs = self._envs(
+            monkeypatch,
+            "windows",
+            lambda: WindowsPlatform().launch_vscode(
+                VSCodeLaunchOpts(command="code", dir="C:/p")
+            ),
+        )
+        _assert_scrubbed(envs[0])
