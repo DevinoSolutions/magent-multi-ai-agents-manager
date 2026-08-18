@@ -218,13 +218,35 @@ class _Fleet:
         return out
 
     def flashes(self) -> list[tuple[float, str]]:
-        """(timestamp, message) for every display-message the server spawned."""
+        """(timestamp, message) for every display-message aimed at THIS fleet.
+
+        Attribution by the fleet's unique token inside the ``-L <socket>`` on
+        the recorded argv, not "everything the shim saw": the flash pump is a
+        process-wide singleton, and a message a previous test left queued can
+        be delivered into this fleet's server when Windows recycles the
+        ephemeral port — recording a decoy ``[uploading..., image sent]`` that
+        a sequence assertion then reads as this press's narration. A leaked
+        message carries the OTHER fleet's unique in its socket name, so
+        filtering here makes every ordering assertion immune to the leak
+        without loosening it. The token (not the exact project) is the key so
+        that presses aimed at a deliberately unknown project — named
+        ``bad_project()`` to stay fleet-scoped — are still attributed.
+        """
         found = []
         for call in self.calls():
             argv = call["argv"]
-            if "display-message" in argv:
+            if (
+                "display-message" in argv
+                and argv[:1] == ["-L"]
+                and self.unique in argv[1]
+            ):
                 found.append((call["t"], argv[-1]))
         return found
+
+    def bad_project(self) -> str:
+        """A project this fleet's server does not know, but that still carries
+        the fleet's unique so its failure flash attributes to this fleet."""
+        return f"no-such-{self.unique}"
 
     def wait_for_count(self, n: int, timeout: float = 30.0) -> list[str]:
         """Wait for n flashes to have LANDED before reading the sequence.
@@ -255,9 +277,31 @@ class _Fleet:
         )
 
     def teardown(self) -> None:
+        # Drain BEFORE killing serve: a message still queued in the
+        # process-wide pump at teardown would otherwise chase this fleet's
+        # port into the next test (ephemeral ports recycle immediately on
+        # Windows) and land in that fleet's recording as a decoy.
+        _drain()
         if self.proc.poll() is None:
             self.proc.kill()
         self.proc.communicate(timeout=30)
+
+
+def _drain(timeout: float = 10.0) -> None:
+    """Wait (boundedly) for the shared flash pump to finish what it holds."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not getattr(altv._flash_queue, "unfinished_tasks", 0):
+            return
+        time.sleep(0.01)
+
+
+@pytest.fixture(autouse=True)
+def _drain_pump():
+    """Leave the shared flash pump empty between tests (mirror of the unit
+    suite's autouse drain — the e2e fleets share the same singleton pump)."""
+    yield
+    _drain()
 
 
 @pytest.fixture
@@ -361,7 +405,9 @@ def test_an_unreachable_serve_names_itself_on_the_bar(fleet):
 
 def test_a_rejected_upload_says_which_rejection_it_was(fleet):
     """Generic failure text is the regression: the bar has to say WHY."""
-    outcome = altv.handle_press(fleet.url, "no-such-project", lambda: b"BM-fake-image")
+    outcome = altv.handle_press(
+        fleet.url, fleet.bad_project(), lambda: b"BM-fake-image"
+    )
 
     assert outcome == "upload-rejected"
     _, message = fleet.wait_for_flash("HTTP 400")
@@ -397,7 +443,7 @@ def test_a_failure_really_reaches_the_multiplexer_in_red(fleet):
     message a red failure leaks into the next press's "capturing...". Both
     halves are asserted here against the recorded argv.
     """
-    altv.handle_press(fleet.url, "no-such-project", lambda: b"BM-fake-image")
+    altv.handle_press(fleet.url, fleet.bad_project(), lambda: b"BM-fake-image")
     fleet.wait_for_flash("HTTP 400")
 
     styled = [c["argv"] for c in fleet.calls() if "message-style" in c["argv"]]
