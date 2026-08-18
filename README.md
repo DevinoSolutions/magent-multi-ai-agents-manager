@@ -150,12 +150,15 @@ Each magent session brands its psmux status bar — `magent` on the left, its wi
 
 #### Attach windows reconnect themselves
 
-`magent attach <host>` opens one window per remote session, and each one runs a small supervisor (`magent-attach-client`) instead of a bare `ssh`. When the connection dies — laptop sleep, wi-fi change, VPN flap, host reboot — the pane no longer freezes on `client_loop: send disconnect` and then sits there dead as `[process exited with code 255]`. It prints one line, waits (2s, doubling to a 30s ceiling) and dials again, forever, until the host answers:
+`magent attach <host>` opens one window per remote session, and each one runs a small supervisor (`magent-attach-client`) instead of a bare `ssh`. When the connection dies — laptop sleep, wi-fi change, VPN flap, host reboot — the pane no longer freezes on `client_loop: send disconnect` and then sits there dead as `[process exited with code 255]`. It waits (2s, doubling to a 30s ceiling) and dials again, forever, until the host answers.
+
+A whole outage costs **one line**, rewritten in place — not a scroll of retries. The counters tick down where they are, and ssh's own `connect to host ... timed out` noise is folded into the `last:` clause instead of filling the pane:
 
 ```text
-  ~ connection to me@desk lost (ssh exit 255) -- reconnecting in 4s (attempt 2; Ctrl+C to stop)
-  o reconnecting to me@desk...
+  ~ reconnecting to me@desk (attempt 4, retry in 16s, last: Connection timed out) -- Ctrl+C to stop
 ```
+
+Narrow panes drop the hint, then the host name, then the reason — the attempt and the countdown are the last things to go. Redirected panes (`magent attach ... > log`) get one plain line per attempt instead, with no cursor tricks. When a reconnected session eventually ends, the pane leaves one permanent record of the outage it survived (`+ reconnected to me@desk after 4 attempt(s); stayed up 1h04m`).
 
 Nothing is lost while it waits: the psmux session lives on the **host**, so the reattached pane comes back to the same running agent and the same scrollback. You do not have to close a wall of dead terminals and re-run `magent attach` any more.
 

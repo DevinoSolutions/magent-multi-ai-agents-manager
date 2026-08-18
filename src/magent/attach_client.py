@@ -38,6 +38,17 @@ registration hub imports every command module, then a config load follows -- is
 exactly the cost that once made a big attach take minutes. Imports here are
 stdlib plus ``click`` (already a base dependency, and only for echo/styling).
 
+WHAT AN OUTAGE LOOKS LIKE. Loudly, once: a pane on flaky wi-fi used to print
+three lines per attempt -- ours announcing the drop, ours announcing the
+redial, and ssh's own ``connect to host ... timed out`` -- so a ten-minute
+outage scrolled thirty lines of the same news past the user's work. The pane
+now renders ONE line, rewritten in place, that carries every changing number
+(attempt, countdown, last error). ``status_text`` composes it and truncates it
+to the terminal width, because a status line that wraps cannot be rewritten by
+a carriage return and degenerates into exactly the scroll it replaces. See
+``_StderrPump`` for what happens to ssh's own noise, and ``_stdout_is_tty`` for
+the piped/redirected fallback.
+
 CORPSE COHERENCE -- read this before changing the argv. ``cli/attach.py``
 decides a pane is dead by scanning live process command lines for
 ``-L <sid> attach`` (``_attach_markers``) among ``_CLIENT_PROCESS_NAMES``.
@@ -58,11 +69,14 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import click
 
 from magent.style import style
+
+if TYPE_CHECKING:
+    from typing import IO
 
 # The console-script name, so cli/attach.py resolves the binary and names the
 # process to scan for from one place instead of two drifting literals.
@@ -83,7 +97,7 @@ CLIENT_EXE_NAME = "magent-attach-client"
 #
 # CONNECT TIMEOUT. Without it a dial at a host that is off, asleep, or behind a
 # black-holing network hangs in connect() for the OS default (minutes on
-# Windows) -- so "reconnecting in 4s" would be a lie, and a host that came back
+# Windows) -- so "retry in 4s" would be a lie, and a host that came back
 # during that hang would not be noticed until the kernel gave up. 20s is
 # deliberately looser than `_ssh_capture`'s 10s: that one is a snappy control
 # query the user is waiting on, this one only decides how fast a pane notices a
@@ -169,6 +183,47 @@ SESSION_PROBE_TIMEOUT_S = 20.0
 # user really did `magent down` is never coming back on its own, and the ladder
 # would otherwise dial that host every 30s forever.
 SESSION_MISSING_MAX = 5
+
+# ---------------------------------------------------------------------------
+# Presentation. Everything below draws the outage; nothing below decides it.
+# ---------------------------------------------------------------------------
+
+# Rewrite-in-place control sequence: carriage return, then erase the whole line.
+# Only ever written when stdout is a tty (see `_stdout_is_tty`).
+ERASE_LINE = "\r\x1b[2K"
+
+# How long the "last: ..." clause may get before it is elided. Sized so the
+# longest real ssh diagnostic that matters ("Connection timed out",
+# "Host key verification failed", "Permission denied (publickey,password)")
+# survives whole, and a pathological multi-hundred-character line does not.
+LAST_ERROR_MAX = 64
+
+# How many of the failed dial's stderr lines are kept for the stop paths. The
+# pane swallows ssh's noise while it is healing itself, so a pane that GIVES UP
+# has to be able to hand back what ssh actually said -- 12 lines covers the
+# whole host-key-changed block, which is the longest thing ssh emits.
+STDERR_TAIL_LINES = 12
+
+# The one thing the pump refuses to swallow. A changed host key is a security
+# event, not connection noise, and the pane may never reach a stop path that
+# would flush the tail (a 255 loop redials forever). Safe to print mid-outage
+# by construction: host-key verification fails during the handshake, so there
+# is no live remote session for the write to land in.
+STDERR_ALWAYS_SHOW = ("REMOTE HOST IDENTIFICATION HAS CHANGED",)
+
+# Ceiling on waiting for the stderr reader to finish after ssh exits. The pipe
+# is at EOF by then so the thread returns immediately; this only exists so a
+# wedged reader can never wedge the pane.
+STDERR_JOIN_S = 2.0
+
+# The countdown repaints at this cadence. 1s is under the threshold where a
+# static number reads as a hung pane, and costs one ~100-byte write per second
+# during an outage.
+TICK_S = 1.0
+
+# Narrowest width the status line is composed for. Below this a terminal cannot
+# show anything useful anyway, and the clipping math stops being meaningful.
+MIN_WIDTH = 20
 
 
 def remote_attach_command(sid: str) -> str:
@@ -310,7 +365,12 @@ def next_attempt(attempt: int, elapsed: float) -> int:
 
 
 def _echo(text: str) -> None:
-    """One status line into the pane, flushed immediately.
+    """One PERMANENT line into the pane, flushed immediately.
+
+    Everything that scrolls goes through here; everything that is rewritten in
+    place goes through ``StatusLine`` instead. The split is the whole feature:
+    an outage now leaves at most one permanent line behind it, not three per
+    attempt.
 
     ASCII-only markers on purpose: this text can render inside a terminal whose
     encoding we do not control.
@@ -318,26 +378,359 @@ def _echo(text: str) -> None:
     The flush is not decoration. Python block-buffers stdout whenever it is not
     a tty, and this process then spends most of its life asleep in a backoff --
     so a redirected or piped pane (a captured log, a test harness, anything but
-    a live console) would hold "reconnecting in 30s" in a buffer for minutes,
-    and lose it entirely if the pane were killed. A status line the user is
-    supposed to act on must never be sitting in a buffer.
+    a live console) would hold "retry in 30s" in a buffer for minutes, and lose
+    it entirely if the pane were killed. A status line the user is supposed to
+    act on must never be sitting in a buffer.
     """
     click.echo(text)
     with contextlib.suppress(OSError, ValueError):
         sys.stdout.flush()
 
 
-def _run_ssh(argv: list[str]) -> int:
-    """Run ssh with this process's console INHERITED, and return its exit code.
+def _write(text: str) -> None:
+    """Raw, unterminated write to the pane. Used only for in-place repaints.
 
-    No pipes and no capture, deliberately: ssh must own the real console so the
-    interactive session keeps its colors, mouse reporting and resize handling.
-    This process is a waiter, never a middleman.
+    ``color=True`` is not a style choice, it is the whole mechanism: click
+    strips every ``\\x1b[...]`` sequence from a stream it does not consider a
+    color sink, and ``ERASE_LINE`` is such a sequence. Stripped, the repaint
+    becomes a bare carriage return that overwrites only the first N characters
+    of the previous line and leaves its tail behind -- the exact wrap-garbage
+    this is meant to remove. Only ever reached when ``_stdout_is_tty`` already
+    said yes, so forcing the sequences through is honest.
+    """
+    click.echo(text, nl=False, color=True)
+    with contextlib.suppress(OSError, ValueError):
+        sys.stdout.flush()
+
+
+def _stdout_is_tty() -> bool:
+    """Whether the pane can be repainted in place.
+
+    Checked ONCE per supervisor, not per repaint: a redirected pane (a captured
+    log, a test harness, ``magent attach ... > file``) must get one plain line
+    per attempt instead of a stream of carriage returns and erase-line escapes,
+    which in a log file are unreadable garbage rather than an animation.
     """
     try:
-        return subprocess.call(argv)
+        return bool(sys.stdout.isatty())
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _term_width() -> int:
+    """Columns available for the status line, re-read on every repaint.
+
+    One column is held back deliberately. Writing exactly ``columns``
+    characters puts the cursor past the last cell, which on the Windows console
+    scrolls a line -- and a status line that scrolls is a status line the next
+    carriage return can no longer reach.
+    """
+    try:
+        columns = shutil.get_terminal_size(fallback=(80, 24)).columns
+    except (OSError, ValueError):
+        columns = 80
+    return max(MIN_WIDTH, columns - 1)
+
+
+def _clip(text: str, width: int) -> str:
+    """``text`` shortened to at most ``width`` printable cells."""
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return text[: width - 3] + "..."
+
+
+def condense_error(line: str) -> str:
+    """One short, single-line, ASCII-safe summary of an ssh diagnostic.
+
+    Three jobs, all of them about fitting inside a status line that must stay
+    exactly one terminal row:
+
+    * ``ssh: connect to host box port 22: Connection timed out`` keeps only the
+      part that varies ("Connection timed out"). The prefix is the same on
+      every failure and would crowd out the countdown.
+    * control characters and non-ASCII are flattened, so ``len()`` is the real
+      rendered width -- the truncation math depends on that, and a stray
+      newline from a chatty sshd would break the line into two.
+    * a pathological length is elided rather than allowed to wrap.
+    """
+    ascii_only = line.encode("ascii", "replace").decode("ascii")
+    text = " ".join(ascii_only.split())
+    if text.startswith("ssh: "):
+        _head, sep, tail = text.rpartition(": ")
+        if sep and tail:
+            text = tail
+    return _clip(text.rstrip("."), LAST_ERROR_MAX)
+
+
+def status_text(
+    *,
+    target: str,
+    attempt: int,
+    remaining: float | None = None,
+    last_error: str = "",
+    width: int = 80,
+) -> str:
+    """The whole outage as one plain line, already clipped to ``width``.
+
+    Pure, and separate from the writer, so the thing that has to be exactly one
+    row wide is provable without a terminal: a line that exceeds the width
+    wraps, and a wrapped line cannot be rewritten by a carriage return -- the
+    next repaint then lands on the wrap remnant and the pane fills with the
+    garbage this whole change exists to remove.
+
+    ``remaining=None`` means the countdown is over and ssh is dialing right
+    now; the line stays up during the dial because ssh writes nothing to the
+    console until the remote session paints over it.
+
+    WHAT GETS SACRIFICED, NARROWEST FIRST, and the order is a judgement about
+    a TILED pane -- magent's whole point is forty windows across the monitors,
+    so 60-column panes are the normal case, not the edge one:
+
+    * the ``Ctrl+C to stop`` hint goes first. It never changes, and a user who
+      has read it once does not need it on every repaint.
+    * the target goes next. It is already in the window title (magent owns
+      those), so the pane is not ambiguous without it -- whereas the reason is
+      genuinely new information the user has nowhere else.
+    * the attempt number and the countdown are last, because they are what say
+      "this pane is alive and will try again", which is the entire message.
+    """
+    when = ", dialing" if remaining is None else f", retry in {remaining:.0f}s"
+    reason = condense_error(last_error) if last_error else ""
+    wide = f"~ reconnecting to {target} (attempt {attempt}{when}"
+    narrow = f"~ reconnecting (attempt {attempt}{when}"
+    hint = ") -- Ctrl+C to stop"
+    said = f", last: {reason}" if reason else ""
+    for candidate in (
+        f"{wide}{said}{hint}",
+        f"{wide}{said})",
+        f"{narrow}{said}{hint}",
+        f"{narrow}{said})",
+        f"{wide}{hint}",
+        f"{wide})",
+        f"{narrow}{hint}",
+        f"{narrow})",
+    ):
+        if len(candidate) <= width:
+            return candidate
+    # Nothing fits whole. Keep the numbers, elide the rest.
+    return _clip(f"{narrow})", width)
+
+
+def _duration(seconds: float) -> str:
+    """Compact, ASCII-only run length for the reconnected record."""
+    total = max(int(seconds), 0)
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        return f"{total // 60}m"
+    return f"{total // 3600}h{(total % 3600) // 60:02d}m"
+
+
+class StatusLine:
+    """The single pane row an outage owns, rewritten in place.
+
+    Not a spinner class for its own sake: it exists so that exactly one place
+    knows whether a status line is currently on screen. Erasing a line that was
+    never drawn would blank whatever the remote session left behind, and
+    forgetting to erase one leaves ``reconnecting ... retry in 1s`` frozen
+    above the restored session forever.
+
+    ``tty=False`` makes every method a no-op; the caller then prints one plain
+    line per attempt instead.
+    """
+
+    def __init__(self, *, tty: bool) -> None:
+        self._tty = tty
+        self._shown = False
+
+    def show(self, text: str) -> None:
+        if not self._tty:
+            return
+        _write(ERASE_LINE + style(text, fg="yellow"))
+        self._shown = True
+
+    def clear(self) -> None:
+        if self._tty and self._shown:
+            _write(ERASE_LINE)
+            self._shown = False
+
+
+class _StderrPump:
+    """Reads a failed dial's stderr off a pipe so it never scrolls the pane.
+
+    WHY CAPTURING ssh's STDERR IS SAFE, and this is the reasoning to re-check
+    before widening it. The noise the user reported -- ``ssh: connect to host
+    ... Connection timed out``, ``client_loop: send disconnect``, ``Connection
+    closed by <ip>`` -- is written by the ssh CHILD, not by us, so no amount of
+    in-place repainting on our side can stop it scrolling. The only way to
+    quiet it is to give ssh a pipe for fd 2.
+
+    That is safe here for two independent reasons:
+
+    * **Interactive prompts do not use stderr.** OpenSSH asks for passwords,
+      passphrases and host-key confirmations through ``read_passphrase()``,
+      which opens the controlling terminal directly (``/dev/tty`` on POSIX, the
+      console on the Windows port) precisely so prompts survive redirection.
+      Piping fd 2 therefore cannot swallow a prompt or the answer to one.
+    * **A live session's output does not use stderr either.** The connection is
+      made with ``-t``, so the remote command's stdout AND stderr are both
+      multiplexed through the pty and arrive on our STDOUT, which stays
+      inherited and untouched. Local fd 2 carries only the ssh client's own
+      diagnostics.
+
+    What is left -- ssh client diagnostics -- is exactly what the status line's
+    ``last: ...`` clause is for, so nothing is lost, only relocated. Two escape
+    hatches keep that honest anyway: ``STDERR_ALWAYS_SHOW`` passes a changed
+    host key straight through, and the tail is flushed verbatim when the pane
+    gives up (see ``_dump``). Redirected panes and ``--no-reconnect`` never
+    capture at all -- they keep fd 2 inherited, exactly as before.
+    """
+
+    def __init__(self, stream: IO[bytes]) -> None:
+        # In-body per this module's startup-cost policy (see `parse_args`): a
+        # 40-window attach imports this module 40 times and only a pane that is
+        # actually mid-outage ever needs a thread.
+        import threading
+
+        self._stream = stream
+        self.last = ""
+        self._tail: list[str] = []
+        self._thread = threading.Thread(target=self._pump, daemon=True)
+        self._thread.start()
+
+    def _pump(self) -> None:
+        with contextlib.suppress(OSError, ValueError):
+            for raw in self._stream:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                self.last = line
+                self._tail.append(line)
+                del self._tail[:-STDERR_TAIL_LINES]
+                if any(marker in line for marker in STDERR_ALWAYS_SHOW):
+                    click.echo(line, err=True)
+
+    def close(self) -> tuple[str, tuple[str, ...]]:
+        """Stop reading and return ``(last line, tail)``.
+
+        The join comes first and the close second, never the other way round:
+        ssh has already exited by the time this is called, so the pipe is at
+        EOF and the reader returns on its own. Closing under a live reader
+        would only trade a tidy exit for a suppressed exception.
+        """
+        self._thread.join(timeout=STDERR_JOIN_S)
+        with contextlib.suppress(OSError, ValueError):
+            self._stream.close()
+        return self.last, tuple(self._tail)
+
+
+class Dial(NamedTuple):
+    """One ssh connection, as the loop sees it after the fact."""
+
+    rc: int
+    # Last line ssh wrote to stderr, or "" when stderr was left inherited.
+    error: str
+    # Bounded tail of the same, kept only so a pane that GIVES UP can hand back
+    # what ssh actually said instead of having quietly eaten it.
+    detail: tuple[str, ...]
+
+
+def _run_ssh(argv: list[str], *, capture: bool = False) -> Dial:
+    """Run ssh with this process's console INHERITED, and report how it went.
+
+    stdin and stdout are never touched: ssh must own the real console so the
+    interactive session keeps its colors, mouse reporting and resize handling.
+    This process is a waiter, never a middleman. ``capture`` redirects fd 2
+    ONLY -- see ``_StderrPump`` for why that is safe and why it is off for
+    redirected panes and ``--no-reconnect``.
+    """
+    try:
+        proc = subprocess.Popen(argv, stderr=subprocess.PIPE if capture else None)
     except FileNotFoundError:
-        return SSH_MISSING_RC
+        return Dial(SSH_MISSING_RC, "", ())
+    pump = _StderrPump(proc.stderr) if capture and proc.stderr is not None else None
+    rc = proc.wait()
+    if pump is None:
+        return Dial(rc, "", ())
+    last, tail = pump.close()
+    return Dial(rc, last, tail)
+
+
+def _dump(detail: tuple[str, ...]) -> None:
+    """Hand back the ssh output a healing pane swallowed, when it stops trying.
+
+    Only ever reached on a stop path: while the pane is still redialing the
+    same three lines every attempt are noise, but a pane that is about to sit
+    there dead owes the user the real diagnostic.
+    """
+    if not detail:
+        return
+    _echo(f"  {style('ssh said:', dim=True)}")
+    for line in detail:
+        _echo(f"    {style(condense_error(line), dim=True)}")
+
+
+def _wait(
+    status: StatusLine,
+    *,
+    target: str,
+    attempt: int,
+    delay: float,
+    last_error: str,
+    tty: bool,
+) -> None:
+    """Sleep out one backoff, saying so.
+
+    On a tty the countdown is repainted in place once a second, so an outage
+    costs one screen row no matter how long it lasts. Off a tty it is one plain
+    line and one plain sleep -- carriage returns in a log file are noise, and
+    the per-second repaints would be a hundred identical log lines.
+    """
+    if not tty:
+        _echo(
+            "  "
+            + style(
+                status_text(
+                    target=target,
+                    attempt=attempt,
+                    remaining=delay,
+                    last_error=last_error,
+                    width=10_000,
+                ),
+                fg="yellow",
+            )
+        )
+        time.sleep(delay)
+        return
+    remaining = delay
+    while remaining > 0:
+        status.show(
+            status_text(
+                target=target,
+                attempt=attempt,
+                remaining=remaining,
+                last_error=last_error,
+                width=_term_width(),
+            )
+        )
+        step = TICK_S if remaining > TICK_S else remaining
+        time.sleep(step)
+        remaining -= step
+    # The line stays up, now reading "dialing", for the whole of the next dial:
+    # ssh prints nothing to the console until the remote session paints over
+    # it, so this is the pane's only sign of life during a 20s connect timeout.
+    status.show(
+        status_text(
+            target=target,
+            attempt=attempt,
+            last_error=last_error,
+            width=_term_width(),
+        )
+    )
 
 
 def supervise(target: str, remote: str, session: str, *, reconnect: bool = True) -> int:
@@ -352,86 +745,127 @@ def supervise(target: str, remote: str, session: str, *, reconnect: bool = True)
         return SSH_MISSING_RC
 
     argv = ssh_argv(target, remote)
+    # In-place repainting and stderr capture are one decision, taken once, and
+    # both are off for `--no-reconnect` -- that flag's whole promise is the
+    # historical bare-ssh pane, down to which fd ssh's errors land on.
+    tty = reconnect and _stdout_is_tty()
+    status = StatusLine(tty=tty)
     attempt = 0
     # Consecutive SESSION_MISSING answers. Reset by anything else, so a host
     # that flaps between "gone" and "reachable" never accumulates its way to a
     # stop -- only a session that is steadily absent does.
     missing = 0
-    while True:
-        started = time.monotonic()
-        rc = _run_ssh(argv)
-        elapsed = time.monotonic() - started
-        # `--no-reconnect` asks for the historical bare-ssh pane, which means no
-        # probe either: one connection, one rc, one message.
-        probe = (
-            None
-            if not reconnect or rc == SSH_TRANSPORT_RC
-            else _probe_session(target, session)
-        )
-        outcome = verdict(rc, probe)
-        if outcome == DETACHED:
-            _echo(
-                f"\n  {style('+', fg='green')} detached from {style(session, bold=True)}."
-            )
-            return 0
-        if outcome == REMOTE_FAILED:
-            _echo(
-                f"\n  {style('x', fg='red')} {target} answered, but"
-                f" {style(session, bold=True)} could not be attached"
-                f" {style(f'(exit {rc})', dim=True)}."
-            )
-            _echo(
-                f"  {style('The session may be gone on the host. Run', dim=True)}"
-                f" {style('magent attach', bold=True)}"
-                f" {style('to bring it back.', dim=True)}"
-            )
-            return rc
-        if not reconnect:
-            _echo(
-                f"\n  {style('x', fg='red')} connection to {target} lost"
-                f" {style(f'(ssh exit {rc})', dim=True)}"
-                f" {style('-- auto-reconnect is off (--no-reconnect).', dim=True)}"
-            )
-            return rc
-
-        if outcome == SESSION_MISSING:
-            missing += 1
-            if missing >= SESSION_MISSING_MAX:
+    last_error = ""
+    detail: tuple[str, ...] = ()
+    try:
+        while True:
+            started = time.monotonic()
+            dial = _run_ssh(argv, capture=tty)
+            rc = dial.rc
+            elapsed = time.monotonic() - started
+            detail = dial.detail
+            # From here on the terminal is ours again, so the outage's status
+            # line -- last seen reading "dialing" -- goes before anything else
+            # is printed.
+            status.clear()
+            if attempt and elapsed >= ESTABLISHED_S:
+                # The permanent record of a healed outage, and the only line an
+                # outage leaves in the scrollback. It is written HERE, at the
+                # drop that ended the session, rather than the moment the
+                # session came back, because at that moment ssh owns the
+                # console: the remote psmux has entered the alternate screen
+                # and anything we print lands inside the user's agent pane as
+                # garbage no redraw will repair. This module never writes into
+                # a live session -- see the class docstring's "waiter, never a
+                # middleman". Scrollback order is unaffected either way: the
+                # line still sits between the outage it ended and the next one.
                 _echo(
-                    f"\n  {style('x', fg='red')} {target} is reachable, but"
-                    f" {style(session, bold=True)} is not a session there"
-                    f" {style(f'(checked {missing} times)', dim=True)}."
+                    f"  {style('+', fg='green')} reconnected to"
+                    f" {style(target, bold=True)}"
+                    f" {style(f'after {attempt} attempt(s); stayed up', dim=True)}"
+                    f" {style(_duration(elapsed), dim=True)}."
                 )
+            # `--no-reconnect` asks for the historical bare-ssh pane, which
+            # means no probe either: one connection, one rc, one message.
+            probe = (
+                None
+                if not reconnect or rc == SSH_TRANSPORT_RC
+                else _probe_session(target, session)
+            )
+            outcome = verdict(rc, probe)
+            if outcome == DETACHED:
                 _echo(
-                    f"  {style('Run', dim=True)}"
+                    f"\n  {style('+', fg='green')} detached from"
+                    f" {style(session, bold=True)}."
+                )
+                return 0
+            if outcome == REMOTE_FAILED:
+                _echo(
+                    f"\n  {style('x', fg='red')} {target} answered, but"
+                    f" {style(session, bold=True)} could not be attached"
+                    f" {style(f'(exit {rc})', dim=True)}."
+                )
+                _dump(detail)
+                _echo(
+                    f"  {style('The session may be gone on the host. Run', dim=True)}"
                     f" {style('magent attach', bold=True)}"
                     f" {style('to bring it back.', dim=True)}"
                 )
-                # rc is untrustworthy here by construction (a Windows host
-                # reports 0 for a remote command that failed), so a stop that
-                # means "this pane gave up" must not be able to exit 0.
-                return rc or 1
-        else:
-            missing = 0
+                return rc
+            if not reconnect:
+                _echo(
+                    f"\n  {style('x', fg='red')} connection to {target} lost"
+                    f" {style(f'(ssh exit {rc})', dim=True)}"
+                    f" {style('-- auto-reconnect is off (--no-reconnect).', dim=True)}"
+                )
+                return rc
 
-        attempt = next_attempt(attempt, elapsed)
-        delay = backoff_delay(attempt)
-        lost = (
-            f"{session} is not on {target} yet"
-            if outcome == SESSION_MISSING
-            else f"connection to {target} lost"
-        )
-        _echo(
-            f"\n  {style('~', fg='yellow')}"
-            f" {style(lost, fg='yellow')}"
-            f" {style(f'(ssh exit {rc})', dim=True)}"
-            f" {style(f'-- reconnecting in {delay:.0f}s', fg='yellow')}"
-            f" {style(f'(attempt {attempt}; Ctrl+C to stop)', dim=True)}"
-        )
-        time.sleep(delay)
-        _echo(
-            f"  {style('o', fg='cyan')} reconnecting to {style(target, bold=True)}..."
-        )
+            if outcome == SESSION_MISSING:
+                missing += 1
+                if missing >= SESSION_MISSING_MAX:
+                    _echo(
+                        f"\n  {style('x', fg='red')} {target} is reachable, but"
+                        f" {style(session, bold=True)} is not a session there"
+                        f" {style(f'(checked {missing} times)', dim=True)}."
+                    )
+                    _dump(detail)
+                    _echo(
+                        f"  {style('Run', dim=True)}"
+                        f" {style('magent attach', bold=True)}"
+                        f" {style('to bring it back.', dim=True)}"
+                    )
+                    # rc is untrustworthy here by construction (a Windows host
+                    # reports 0 for a remote command that failed), so a stop
+                    # that means "this pane gave up" must not be able to exit 0.
+                    return rc or 1
+            else:
+                missing = 0
+
+            # One sentence for what went wrong, reused by every repaint of the
+            # countdown. ssh's own last word wins when we captured it; the
+            # fallbacks keep a redirected pane (where fd 2 is inherited and we
+            # never saw it) just as informative as it was before.
+            if outcome == SESSION_MISSING:
+                last_error = f"{session} is not on {target} yet"
+            elif dial.error:
+                last_error = dial.error
+            else:
+                last_error = f"connection to {target} lost (ssh exit {rc})"
+
+            attempt = next_attempt(attempt, elapsed)
+            _wait(
+                status,
+                target=target,
+                attempt=attempt,
+                delay=backoff_delay(attempt),
+                last_error=last_error,
+                tty=tty,
+            )
+    except KeyboardInterrupt:
+        # The status line is mid-repaint when Ctrl+C lands; leaving it there
+        # would freeze "retry in 7s" above whatever prints next.
+        status.clear()
+        raise
 
 
 class Options(NamedTuple):

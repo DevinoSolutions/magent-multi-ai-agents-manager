@@ -592,6 +592,53 @@ ssh session, so a drop kills it; reconnecting would start a SECOND agent on a
 conversation the user believes is still running. Reconnect is a psmux feature
 because psmux is what makes the far side outlive the connection.
 
+**An outage is a status line, not a log (2026-08-18).** Reconnecting correctly
+turned out to be only half the job: a real wi-fi outage printed three lines per
+attempt — our drop notice, our redial notice, and ssh's own `connect to host
+... Connection timed out` — so ten minutes of flapping pushed thirty lines of
+identical news through the pane the user was working in. The supervisor now
+owns exactly one row while it is healing (`status_text` composes it,
+`StatusLine` rewrites it with `\r\x1b[2K`), and the changing numbers live
+inside it. Four decisions worth keeping:
+
+- *The line is clipped to the terminal width, always.* This is the load-bearing
+  one. A status line wider than the pane wraps, the next carriage return then
+  lands on the wrap remnant instead of the line's start, and the "one row"
+  becomes an unbounded scroll of half-lines — which is precisely the garbage
+  the user reported seeing. `status_text` is pure and separate from the writer
+  so that property is provable without a terminal, and it degrades in a
+  deliberate order: the fixed `Ctrl+C` hint goes first, then the target (it is
+  in the window title already), and the attempt/countdown go last.
+- *ssh's own stderr is captured, not fought.* The noisiest lines come from the
+  ssh CHILD, so no amount of repainting on our side can quiet them; only a pipe
+  on fd 2 can. That is safe for two independent reasons, both verified rather
+  than assumed: OpenSSH asks for passwords, passphrases and host-key
+  confirmations through `read_passphrase()`, which opens the controlling
+  terminal directly (`/dev/tty`, or the console on the Windows port) precisely
+  so prompts survive redirection — so piping fd 2 cannot swallow a prompt; and
+  the connection is made with `-t`, so the remote command's stdout AND stderr
+  arrive multiplexed through the pty on our STDOUT, which stays inherited. Only
+  ssh's own diagnostics land on the pipe, which is exactly what the `last: ...`
+  clause reports. stdin and stdout are never redirected — the module stays a
+  waiter, never a middleman. Two escape hatches keep the swallow honest: a
+  changed host key is passed straight through (`STDERR_ALWAYS_SHOW`), and the
+  captured tail is dumped verbatim when the pane gives up.
+- *The "reconnected" record is written at the drop that ENDED the restored
+  session, not the moment it came back.* At that moment ssh owns the console
+  and the remote psmux has entered the alternate screen, so a line printed
+  there lands inside the user's agent pane as garbage no redraw will repair.
+  There is also no reliable establishment signal to print on: `ConnectTimeout`
+  is 20s, so a child alive at t+2s is just as likely to be a hanging connect as
+  a live session, and announcing on that guess would print a lie per attempt
+  against a host that is down. Scrollback order is identical either way — the
+  record still sits between the outage it ended and the next one.
+- *Redirected panes and `--no-reconnect` get none of it.* `_stdout_is_tty` is
+  checked once; without a tty there is no cursor animation (carriage returns in
+  a log file are unreadable) and no stderr capture, so a piped pane keeps one
+  plain line per attempt and ssh's errors keep landing on fd 2 where a log
+  expects them. `--no-reconnect`'s promise is the historical bare-ssh pane down
+  to which fd ssh writes on, so it opts out of both regardless of the tty.
+
 **A psmux session must outlive the SSH connection that created it
 (2026-08-17).** The premise the whole reconnect story rests on — "losing the
 ssh client never loses work, because the session lives on the HOST" — was not
@@ -865,8 +912,8 @@ the config the sweep had not reached — a config-order tail.
 Ordered roughly by how likely a future change is to collide with it.
 
 **Attach-pane reconnect is only reachable from a Windows client (2026-08-09):**
-`attach_client.py` itself is OS-agnostic (stdlib + click; `subprocess.call`
-inherits the console on POSIX exactly as it does on Windows) and its unit tier
+`attach_client.py` itself is OS-agnostic (stdlib + click; the `Popen` in
+`_run_ssh` inherits the console on POSIX exactly as it does on Windows) and its unit tier
 runs everywhere, but the only code that spawns it is `cli/attach.py::
 _spawn_windows`, which opens `wt` windows. There is no macOS/Linux client
 window-spawn path for remote attach to wire it into — a pre-existing gap this
