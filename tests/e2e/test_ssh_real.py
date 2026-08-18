@@ -1284,6 +1284,65 @@ STAGE_RECONNECT_S = 45.0
 STAGE_REDRAW_S = 90.0
 
 
+def _typed_text_win32_gap_or_skip(capsys) -> None:
+    """The Windows leg of the typed-text test is a LOUD skip, never a green pass.
+
+    MEASURED, not assumed. This leg was the thing that used to hang the job
+    forever; once `_pty.expect` grew a real deadline it failed in 30 seconds
+    instead, and the transcript it printed says exactly what is wrong:
+
+        REMOTE-READY
+        BUFFER><
+        unsent040308b7[13;28;13;1;0;1_
+
+    The typed TEXT reached the host and was echoed back. What follows it is not
+    a newline -- it is a **win32-input-mode key record** (`ESC [ Vk ; Sc ; Uc ;
+    Kd ; Cs ; Rc _`, here Vk=13/VK_RETURN, Uc=13/CR), arriving as literal bytes.
+    The same stream carries `ESC [ ? 9001 h` twice, which is the DECSET that
+    turns win32-input-mode on. So the Enter key is encoded as an escape sequence
+    somewhere in the nest -- pywinpty's ConPTY -> `ssh -t` -> the Windows sshd's
+    own ConPTY -> cmd.exe -> python -- and is delivered to the far end as text
+    rather than as a carriage return, so the remote's `sys.stdin.readline()`
+    never completes and no `ECHO>` is ever written.
+
+    That is a property of nesting two pseudoconsoles, NOT a magent defect and
+    NOT something a real user meets: an attach pane is hosted by Windows
+    Terminal's ConPTY, where the same keystroke arrives as a keystroke (proven
+    by the CI-only `interaction` tier, which drives real `SendInput` chords).
+
+    What is still covered on Windows, so this skip costs no product guarantee:
+
+    * the LOCAL half -- that the reconnect status line owns the bottom row and
+      never erases the user's frozen frame -- is pinned cell by cell by
+      ``tests/e2e/test_pty_attach_status.py``, which runs and passes here;
+    * this very test runs for real, typed text and all, on ubuntu and macOS;
+    * everything else in this file (attach over real ssh, session survival, the
+      reconnect supervisor's whole decision table) is win32-first and unaffected.
+
+    Loud on purpose, following the macOS window-leg precedent below: a
+    ``::warning`` in the job log, never a quiet green. Tracked in DESIGN.md's
+    known-debt ledger with the one idea worth trying next (pywinpty's WinPTY
+    back end, which predates win32-input-mode).
+    """
+    if sys.platform != "win32":
+        return
+    _emit_ci_warning(
+        capsys,
+        "typed-text-over-real-ssh leg skipped (nested ConPTY)",
+        "Enter reaches the remote as a win32-input-mode key record "
+        "(ESC[13;28;13;1;0;1_) instead of a CR, so the remote readline never "
+        "completes: an artifact of pywinpty's ConPTY nested inside the Windows "
+        "sshd's ConPTY, not a product defect. The local rendering half is "
+        "pinned on Windows by test_pty_attach_status.py; this test runs for "
+        "real on ubuntu and macOS. Not a green pass.",
+    )
+    pytest.skip(
+        "typed text cannot be delivered through a nested ConPTY over ssh -t "
+        "(win32-input-mode encodes Enter as an escape sequence); leg unrun on "
+        "win32 -- see DESIGN.md known debt"
+    )
+
+
 def _pty_backend_or_skip() -> None:
     if sys.platform == "win32":
         pytest.importorskip("winpty", reason="pywinpty needed to drive a real pty")
@@ -1349,8 +1408,9 @@ class TestTypedTextSurvivesARealDrop:
       redial, and it is what this test is for.
     """
 
-    def test_typed_text_survives_a_real_reconnect(self, tmp_path, ssh_wire):
+    def test_typed_text_survives_a_real_reconnect(self, tmp_path, ssh_wire, capsys):
         _pty_backend_or_skip()
+        _typed_text_win32_gap_or_skip(capsys)
         from tests.e2e._pty import Budget, Pty, PtyTimeout
         from tests.e2e._screen import Screen
 
