@@ -677,6 +677,71 @@ def _mobileconfig(host: str) -> bytes:
 """.encode()
 
 
+# How long the HTTP response will wait for the paste before answering anyway.
+#
+# The file is already on disk by the time this wait starts, so everything past
+# it is a courtesy: waiting a beat lets the overwhelmingly common fast paste be
+# reported as the plain `injected: true` it is, and the bound is what stops a
+# stalled multiplexer from turning a successful upload into a client timeout.
+# Must stay comfortably under `altv.UPLOAD_HTTP_TIMEOUT_S` (a test pins that) --
+# the whole defect being fixed here is a server that outlived its client's
+# patience and left the user reading "upload failed" about a file that landed.
+INJECT_GRACE_S = 3.0
+
+# The whole life of one paste attempt, wherever it finishes. Deliberately ONE
+# attempt: a `send-keys` that is merely slow is still in flight, and a retry on
+# top of it pastes the same image twice into the agent's prompt. Past this the
+# worker gives up and says so in upload.log, so a paste can never arrive
+# minutes later on top of whatever the user did in the meantime.
+INJECT_TIMEOUT_S = 60.0
+
+
+def _inject_paste(project: str, dest: Path) -> tuple[bool, bool]:
+    """Paste ``dest`` into ``project``'s pane. Returns ``(injected, pending)``.
+
+    The paste runs on its own thread and the caller waits only ``INJECT_GRACE_S``
+    for it, because an HTTP handler must not be hostage to a multiplexer: this
+    call used to be inline and unbounded, and a control command that stalled for
+    74 s answered a listener that had given up at 20 s -- so a screenshot that
+    was safely on disk, and that psmux eventually pasted, was reported to the
+    user as "upload failed".
+
+    The two flags are exhaustive and honest: ``(True, False)`` pasted,
+    ``(False, True)`` still trying (the reply is early, not wrong), and
+    ``(False, False)`` a real refusal the caller may name as one. Nothing is
+    retried and nothing is re-sent -- see ``INJECT_TIMEOUT_S``.
+    """
+    log = get_logger("upload")
+    done = threading.Event()
+    outcome: list[bool] = []
+
+    def _run() -> None:
+        started = time.monotonic()
+        try:
+            pasted = psmux.send_keys(
+                project, str(dest), target=project, timeout=INJECT_TIMEOUT_S
+            )
+            outcome.append(pasted)
+        finally:
+            done.set()
+            elapsed = time.monotonic() - started
+            if elapsed >= INJECT_GRACE_S:
+                # The reply already said `inject_pending`; this line is the only
+                # place that late verdict is recorded, so it is a WARNING and it
+                # carries the wait it cost.
+                log.warning(
+                    "inject project=%s finished late after %.1fs pasted=%s",
+                    project,
+                    elapsed,
+                    outcome[-1] if outcome else False,
+                )
+
+    threading.Thread(target=_run, name="magent-upload-inject", daemon=True).start()
+    if done.wait(INJECT_GRACE_S):
+        return (bool(outcome and outcome[0]), False)
+    return (False, True)
+
+
 def _parse_multipart(
     handler: BaseHTTPRequestHandler,
 ) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
@@ -927,12 +992,22 @@ class UploadHandler(BaseHTTPRequestHandler):
         # first -- and the loser is whichever message the user needed. The
         # server therefore stays silent for flagged uploads and speaks only for
         # the mobile page, whose sender is looking at a phone, not at the bar.
+        #
+        # That silence extends to the DEFERRED paste verdict (`inject_pending`),
+        # deliberately. The tempting fix -- flash "pasted" once the worker
+        # finishes -- reintroduces the second writer under the exact condition
+        # this code path exists for: the listener's own closing message is still
+        # queued behind a slow status line when the worker lands, so the two
+        # would race and the bar could show "pasted" and then "paste pending".
+        # The late verdict goes to upload.log instead, and to the pane, where
+        # the pasted path is its own proof.
         flagged = parse_qs(parsed.query).get("project", [""])[0]
         flagged = flagged if flagged in valid_sessions else ""
 
         ok = False
         project = flagged
         injected = False
+        inject_pending = False
         byte_count = 0
         suffix = ""
         try:
@@ -977,7 +1052,7 @@ class UploadHandler(BaseHTTPRequestHandler):
             dest.write_bytes(data)
 
             if inject and psmux.find_psmux():
-                injected = psmux.send_keys(project, str(dest), target=project)
+                injected, inject_pending = _inject_paste(project, dest)
             elif inject:
                 log.warning(
                     "upload project=%s requested inject but psmux is unavailable",
@@ -990,17 +1065,22 @@ class UploadHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "path": str(dest),
                     "injected": injected,
+                    # Three states, not two: pasted, definitely not pasted, and
+                    # "still trying". A client that cannot tell the last two
+                    # apart has to call a slow paste a failed upload.
+                    "inject_pending": inject_pending,
                 }
             )
         finally:
             # INFO outcome line -- project + byte-count + injected + suffix only,
             # NEVER the original filename (personal data; F-hygiene).
             log.info(
-                "upload project=%s ok=%s bytes=%d injected=%s suffix=%s",
+                "upload project=%s ok=%s bytes=%d injected=%s pending=%s suffix=%s",
                 project,
                 ok,
                 byte_count,
                 injected,
+                inject_pending,
                 suffix,
             )
             # Confirm in the same magent: status line -- for MOBILE uploads only.

@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import threading
 import time
 from http.client import HTTPConnection
@@ -833,6 +834,136 @@ class TestInSessionFeedback:
         # Unknown project"); a generic "upload failed" from here would stomp it.
         assert self._post("/upload?project=marka", project_field="evil")["ok"] is False
         assert not self._wait_flash("upload failed", timeout=0.6)
+
+
+class TestASlowPasteNeverBecomesAFailedUpload:
+    """The reply must not be hostage to the multiplexer.
+
+    Measured on a live machine: `psmux.send_keys` ran INLINE in this handler
+    with no timeout at all, a control command stalled while the session's
+    terminal was busy, and the request was answered 74 seconds after the press.
+    The listener had given up at 20 s and flashed "upload failed - is `magent
+    serve` running?" -- about an image that was already on disk, and that psmux
+    went on to paste a minute later. The file being safe is exactly why calling
+    that a failure was the damaging part: the user reruns the press, and the
+    same screenshot is pasted twice.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _server(self, tmp_path, monkeypatch):
+        import magent.psmux as psmux_mod
+        import magent.upload_server as mod
+
+        monkeypatch.setattr(mod, "_UPLOAD_DIR", tmp_path / "uploads")
+        monkeypatch.setattr(psmux_mod, "find_psmux", lambda: "psmux")
+        # A short grace keeps the test honest AND fast: the assertion is that
+        # the reply lands inside whatever the grace is, not that 3s is magic.
+        monkeypatch.setattr(mod, "INJECT_GRACE_S", 0.3)
+
+        self.release = threading.Event()
+        self.pastes: list[str] = []
+
+        def _paste(name, *keys, target=None, psmux=None, timeout=None):
+            self.pastes.append(name)
+            self.release.wait(20)
+            return True
+
+        self.paste = _paste
+        monkeypatch.setattr(psmux_mod, "send_keys", _paste)
+
+        UploadHandler.config_path = None
+        UploadHandler.cached_sessions = [{"name": "marka", "path": "INTERNAL/marka"}]
+        UploadHandler.sessions_ts = time.time() + 9999
+
+        from http.server import HTTPServer
+
+        self.server = HTTPServer(("127.0.0.1", 0), UploadHandler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        yield
+        self.release.set()  # never leave a stalled paste thread behind
+        self.server.shutdown()
+
+    def _upload(self) -> tuple[dict, float]:
+        body = (
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="project"\r\n\r\nmarka\r\n'
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="inject"\r\n\r\n1\r\n'
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="c.png"\r\n\r\n'
+            b"FAKEPNG\r\n"
+            b"------B--\r\n"
+        )
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        started = time.monotonic()
+        conn.request(
+            "POST",
+            "/upload?project=marka",
+            body=body,
+            headers={
+                "Content-Type": "multipart/form-data; boundary=----B",
+                "Content-Length": str(len(body)),
+            },
+        )
+        data = json.loads(conn.getresponse().read())
+        return data, time.monotonic() - started
+
+    def test_the_reply_lands_inside_the_grace_and_the_file_is_on_disk(self):
+        import magent.upload_server as mod
+
+        data, elapsed = self._upload()
+
+        assert elapsed < mod.INJECT_GRACE_S * 6, (
+            f"the reply waited {elapsed:.2f}s on a stalled paste"
+        )
+        # ok=True is the whole point: the bytes ARE stored.
+        assert data["ok"] is True
+        assert Path(data["path"]).read_bytes() == b"FAKEPNG"
+
+    def test_a_stalled_paste_is_reported_as_pending_not_as_a_refusal(self):
+        data, _ = self._upload()
+        # Three states, not two. `injected: false` alone is indistinguishable
+        # from "psmux said no", which is what the bar rendered as a failure.
+        assert data["injected"] is False
+        assert data["inject_pending"] is True
+
+    def test_a_paste_that_lands_in_time_is_plainly_injected(self):
+        self.release.set()
+        data, _ = self._upload()
+        assert data["injected"] is True
+        assert data["inject_pending"] is False
+
+    def test_the_stalled_paste_is_still_running_and_is_never_re_sent(self):
+        # One attempt, ever. A `send-keys` that is merely slow is still in
+        # flight; a retry on top of it pastes the same image twice.
+        self._upload()
+        time.sleep(0.3)
+        assert self.pastes == ["marka"]
+
+    def test_the_late_verdict_reaches_the_log_since_it_cannot_reach_the_bar(
+        self, caplog
+    ):
+        # A flagged (?project=) upload has a narrator already and the server
+        # must not become a second one -- so the deferred result is recorded
+        # here instead. Silence would make "did it ever paste?" unanswerable.
+        with caplog.at_level(logging.WARNING, logger="magent.upload"):
+            self._upload()
+            self.release.set()
+            deadline = time.time() + 5
+            while time.time() < deadline and "finished late" not in caplog.text:
+                time.sleep(0.02)
+        assert "finished late" in caplog.text
+        assert "marka" in caplog.text
+
+    def test_the_pending_flag_is_in_the_outcome_log_line(self, caplog):
+        with caplog.at_level(logging.INFO, logger="magent.upload"):
+            self._upload()
+            deadline = time.time() + 3
+            while time.time() < deadline and "pending=True" not in caplog.text:
+                time.sleep(0.02)
+        assert "pending=True" in caplog.text
 
 
 class TestFlashEndpoint:

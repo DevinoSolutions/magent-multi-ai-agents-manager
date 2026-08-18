@@ -1052,6 +1052,71 @@ DISPLAY (non-`-p`) case. `set -g status-left` repaints immediately too. There
 is no `status-interval` tick to wait for and no `refresh-client` to add; the
 latency was never in the multiplexer.
 
+### The upload reply is not hostage to the paste (2026-08-18)
+
+The narration above was honest about everything except its own worst case. A
+press on this machine took 60-75 seconds and ended in "Alt+V: upload failed -
+is magent serve running?" — while the SAME upload is logged completing
+`ok=True injected=True` 74 s after the press. Nothing had failed. The user was
+told their screenshot was gone, about a file already sitting in
+`~/.magent/uploads`.
+
+Three facts composed into that lie:
+
+* `psmux.send_keys` was the **only** psmux call in that module with no
+  subprocess timeout at all — and the one an HTTP request handler ran inline,
+  before replying. Every other probe here (`pane_cwd`, `capture_pane`,
+  `flash_message`, `kill_server`) had been bounded already; this one was
+  missed because it is the only one whose result the *product* wanted rather
+  than a diagnostic.
+* A psmux control command against a session whose attached terminal is busy or
+  unfocused has been measured from 3 s to past 70 s. It is not a rare stall; it
+  is the same load that made every status-line flash in months of `upload.log`
+  time out.
+* The listener bounded its POST at 20 s. Server unbounded + client bounded is a
+  guaranteed false negative under exactly the load the feature is used in.
+
+**The fix keeps the paste, and stops waiting for it.** `send_keys` takes a
+`timeout` (default `SEND_KEYS_TIMEOUT_S`, 20 s) and degrades to `False` with a
+WARNING instead of hanging or raising. `upload_server._inject_paste` then runs
+the paste on its own thread and waits `INJECT_GRACE_S` (3 s) for it: the
+overwhelmingly common fast paste is still reported as the plain
+`injected: true` it is, and a stalled one is answered early and honestly. The
+reply grew a third state — `inject_pending` — because `injected: false` alone
+cannot tell "psmux refused" from "psmux has not answered yet", and collapsing
+those two is precisely what rendered as a failure. `altv` reads all three:
+`ok` / `inject-pending` / `inject-failed`, with `inject-pending` carrying
+"image saved - psmux is slow, paste still pending" **in the healthy tint** —
+red on that bar reads as "your screenshot is gone".
+
+Measured against a real serve and a real multiplexer binary that sits on
+`send-keys` for 30 s (`tests/e2e/test_altv_flash.py`, the `stalled_paste_fleet`
+tier): **3.1 s from the press to the outcome on the bar**, versus 20 s and a
+false failure.
+
+**One attempt, never a re-send.** The paste worker does not retry, and the
+whole attempt is capped at `INJECT_TIMEOUT_S` (60 s). A `send-keys` that is
+merely slow is still in flight and a second one would paste the same image
+twice; and `subprocess.run(timeout=...)` kills the client, which leaves it
+genuinely unknown whether the first one landed. Bounding one attempt is the
+only shape that cannot double-paste. The wording matters for the same reason:
+a user told "upload failed" reruns the press, and the eventual paste plus the
+rerun's paste put the screenshot in the prompt twice — the failure mode the
+honest wording exists to prevent.
+
+**Where the late verdict goes, and why not to the bar.** A flagged
+(`?project=`) upload already has a narrator, and the tempting completion flash
+would reintroduce the second writer under the exact condition this code path
+exists for: when the status line is slow, the listener's own closing message is
+still queued in its pump while the worker finishes, so the two would race and
+the bar could show "pasted" and then "paste pending". Cross-process ordering is
+not available and is not worth inventing here. The deferred verdict therefore
+goes to `upload.log` as a WARNING naming the project and the wait it cost
+(`inject project=… finished late after 41.2s pasted=True`) — and to the pane,
+where the pasted path is its own proof. The listener's closing message is
+already terminal and already true: the image is saved, and the paste is
+pending.
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.

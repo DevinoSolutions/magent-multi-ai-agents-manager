@@ -67,8 +67,15 @@ ALTV_OUTCOMES = (
     "serve-unreachable",  # nothing answered on server_url
     "upload-rejected",  # the server answered, and said no
     "inject-failed",  # the server stored it, psmux would not paste it
+    "inject-pending",  # the server stored it, psmux is still being asked
     "error",  # anything unforeseen, with a traceback in the log
 )
+
+# Outcomes that mean THE IMAGE IS SAFE. They take the healthy tint and are not
+# failures, even when the paste has not landed: red on this bar reads as "your
+# screenshot is gone", and saying that about a file sitting in ~/.magent/uploads
+# is the same lie as the "upload failed" this vocabulary exists to retire.
+ALTV_SAFE_OUTCOMES = ("ok", "inject-pending")
 
 # What each outcome says on the status bar. Split from the log vocabulary so a
 # reason can be reworded without breaking `grep ALTV outcome=...`, and kept
@@ -82,6 +89,7 @@ OUTCOME_REASONS: dict[str, str] = {
     "serve-unreachable": "cannot reach magent serve",
     "upload-rejected": "magent serve refused it",
     "inject-failed": "saved, but psmux would not paste it",
+    "inject-pending": "image saved - psmux is slow, paste still pending",
     "error": "unexpected error - see hotkey.log",
 }
 
@@ -115,6 +123,17 @@ FLASH_QUEUE_MAX = 32
 # expires mid-upload leaves the bar blank, which is the silence this whole
 # channel exists to end. Outcomes take the server's own (shorter) default.
 PHASE_FLASH_MS = 20000
+
+# How long the press will wait for `/upload` to answer.
+#
+# The server owes an answer inside its own `upload_server.INJECT_GRACE_S` (a
+# test pins that this stays the larger of the two), so this bound is a
+# backstop against a wedged or half-dead serve, NOT the thing that decides
+# whether a press succeeded. It used to be both: the handler pasted inline with
+# no bound of its own, so a 74 s psmux stall hit this timeout at 20 s and the
+# bar said "upload failed - is `magent serve` running?" about an image that was
+# already on disk and that psmux went on to paste a minute later.
+UPLOAD_HTTP_TIMEOUT_S = 20.0
 
 _flash_queue: queue.Queue[tuple[str, str, str, int | None, str]] = queue.Queue(
     maxsize=FLASH_QUEUE_MAX
@@ -223,7 +242,7 @@ def report(server_url: str, project: str, outcome: str, detail: str = "") -> Non
         server_url,
         project,
         FLASH_PREFIX + reason,
-        tint=FLASH_TINT_OK if outcome == "ok" else FLASH_TINT_ERR,
+        tint=FLASH_TINT_OK if outcome in ALTV_SAFE_OUTCOMES else FLASH_TINT_ERR,
     )
 
 
@@ -288,7 +307,7 @@ def upload_image(
     )
     log = get_logger("hotkey")
     try:
-        with urlopen(req, timeout=20) as resp:
+        with urlopen(req, timeout=UPLOAD_HTTP_TIMEOUT_S) as resp:
             payload = json.loads(resp.read())
     except HTTPError as exc:
         # The server answered and said no -- carry ITS words, not ours.
@@ -317,6 +336,17 @@ def upload_image(
         tail = f": {detail}" if detail else ""
         return ("upload-rejected", f"magent serve refused it{tail}", detail)
     if not payload.get("injected", False):
+        if payload.get("inject_pending", False):
+            # Not a verdict at all: the server answered early ON PURPOSE so the
+            # press stays bounded, and psmux is still being asked. The image is
+            # on disk either way, so the one thing the bar must not do is call
+            # this a failure -- the user would rerun the press and end up with
+            # the screenshot pasted twice.
+            return (
+                "inject-pending",
+                OUTCOME_REASONS["inject-pending"],
+                "inject_pending=true",
+            )
         # The bytes are safe on disk; only the paste failed. Saying "upload
         # failed" here would send the user hunting for a lost screenshot.
         return ("inject-failed", OUTCOME_REASONS["inject-failed"], "injected=false")
