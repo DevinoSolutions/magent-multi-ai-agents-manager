@@ -5,6 +5,38 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.12.2] - 2026-08-18
+
+### Fixed
+
+- **Launching from inside an AI agent no longer poisons the spawned
+  sessions.** Running `magent up` from a shell hosted by a coding agent
+  (Claude Code, a CI harness) leaked that harness's environment into every
+  spawned session: inherited session markers made the child agent believe
+  it was a nested sub-session -- silently disabling transcript saving --
+  and an inherited `NO_COLOR` rendered every pane in plain white. Every
+  spawn that hosts an agent (psmux sessions, launch-path terminals, VS Code
+  windows, the F2 editor) now routes through one scrubbing seam that strips
+  the launcher's agent-session markers, its colour overrides
+  (`NO_COLOR`/`FORCE_COLOR`/`CLICOLOR`/`CLICOLOR_FORCE`), and the
+  multiplexer nesting markers. The scrub is an exact list, not a namespace
+  sweep -- credentials and user configuration pass through untouched, and
+  `TERM` is never modified.
+
+- **`magent down` now stops every session it promised, verifies the kills,
+  and reports only what it proved.** Three defects let sessions survive a
+  `down --all` while the report claimed success: session liveness had three
+  independent implementations with different retry policies, so under load
+  `down` could see fewer live sessions than the picker did and silently
+  skip the rest; `down --all` acted on that one unretried probe instead of
+  the configured session list; and the summary counted kill *attempts*,
+  never re-checking reality. Liveness is now one shared seam (probe with
+  one retry), `down` targets the configured sessions themselves, kills in a
+  bounded parallel fan-out (no more sequential sweep a remote 60s timeout
+  could truncate to a config-order tail -- the remote budget is now 300s),
+  then re-probes and re-kills survivors -- and the report names, in red,
+  any session that would not stop instead of counting it as stopped.
+
 ## [3.12.1] - 2026-08-18
 
 ### Fixed
@@ -851,6 +883,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.12.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.1...v3.12.2
 [3.12.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.0...v3.12.1
 [3.12.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.11.1...v3.12.0
 [3.11.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.11.0...v3.11.1
