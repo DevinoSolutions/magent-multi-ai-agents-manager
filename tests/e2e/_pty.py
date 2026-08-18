@@ -187,3 +187,14 @@ class Pty:
     @property
     def transcript(self) -> str:
         return strip_ansi(self._raw)
+
+    @property
+    def raw(self) -> str:
+        """Everything read so far, escapes INTACT.
+
+        The menu tests want ``transcript`` -- what a human reads. The status-line
+        tests want this: whether an erase landed on the user's half-typed prompt
+        is a question about the escape sequences themselves, and about the grid
+        they drive (see ``_screen.Screen``), not about the text that survived.
+        """
+        return self._raw
