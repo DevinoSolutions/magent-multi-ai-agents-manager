@@ -230,9 +230,15 @@ class TestBudget:
 
     def test_a_stage_is_clamped_to_what_is_left(self):
         budget = Budget(10.0)
+        # A stage asking for less than the total gets its ask, untouched.
         assert budget.clamp(2.0) == pytest.approx(2.0, abs=0.5)
-        # A stage asking for more than the total gets the total, not its ask.
-        assert budget.clamp(600.0) <= 10.0
+        # A stage asking for more gets the total, not its ask. Compared with a
+        # float tolerance rather than `<= 10.0`: `remaining()` is a difference
+        # of two `time.monotonic()` readings, and on a Windows runner whose
+        # clock has not ticked between them that lands a few ULPs ABOVE the
+        # total (measured: 10.000000000000057). The guarantee is "the ask does
+        # not survive", not "the arithmetic is exact".
+        assert budget.clamp(600.0) == pytest.approx(10.0, abs=0.5)
 
     def test_an_exhausted_budget_yields_zero_not_a_negative(self):
         budget = Budget(0.0)
