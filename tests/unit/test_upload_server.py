@@ -942,7 +942,15 @@ class TestASlowPasteNeverBecomesAFailedUpload:
         assert self.entered.wait(15), "the paste worker never started"
         # `entered_at` is taken at or after the worker's own `started`, so
         # waiting out the grace from here guarantees the product sees it too.
-        time.sleep(max(0.0, self.entered_at + mod.INJECT_GRACE_S - time.monotonic()))
+        # The 50ms margin is not slack: before Python 3.13, Windows'
+        # time.monotonic() is GetTickCount64 with 15.6ms granularity, so the
+        # worker's final clock read can land a tick short of real time and
+        # measure `elapsed` just under the grace -- correctly skipping the
+        # late-verdict branch this helper exists to force.
+        margin = 0.05
+        time.sleep(
+            max(0.0, self.entered_at + mod.INJECT_GRACE_S + margin - time.monotonic())
+        )
         self.release.set()
         assert self.worker is not None
         self.worker.join(timeout=30)
