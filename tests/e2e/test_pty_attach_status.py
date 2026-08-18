@@ -50,7 +50,11 @@ def _env() -> dict[str, str]:
         k: v
         for k, v in os.environ.items()
         if not k.upper().startswith("MAGENT_")
-        and k.upper() not in ("PYTHONPATH", "PYTHONHOME")
+        # COLUMNS/LINES are checked by `shutil.get_terminal_size` BEFORE it asks
+        # the real terminal, so a shell that exported them would make the pane
+        # address a bottom row the pty does not have -- and the row assertions
+        # below are the whole test.
+        and k.upper() not in ("PYTHONPATH", "PYTHONHOME", "COLUMNS", "LINES")
     }
     env["NO_COLOR"] = "1"
     env["PYTHONUTF8"] = "1"

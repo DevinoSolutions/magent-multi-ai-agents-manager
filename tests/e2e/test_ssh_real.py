@@ -1327,7 +1327,14 @@ class TestTypedTextSurvivesARealDrop:
         rows, cols = 24, 80
         pty = Pty(
             [exe, "--target", target, "--session", token, "--remote", remote],
-            env={k: v for k, v in os.environ.items() if k.upper() != "PYTHONPATH"},
+            # COLUMNS/LINES stripped for the same reason the pty tier strips
+            # them: `shutil.get_terminal_size` prefers them over the real pty,
+            # and the bottom-row assertions below depend on the real one.
+            env={
+                k: v
+                for k, v in os.environ.items()
+                if k.upper() not in ("PYTHONPATH", "COLUMNS", "LINES")
+            },
             cwd=str(tmp_path),
             dimensions=(rows, cols),
         )
