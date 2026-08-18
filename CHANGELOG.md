@@ -5,6 +5,59 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.13.0] - 2026-08-18
+
+### Added
+
+- **Every Alt+V press narrates itself on the status line, from the chord.**
+  Pressing Alt+V used to give no feedback until the whole upload finished
+  -- and under load, often no feedback at all, because the status-line
+  flash was killed by its own 3-second subprocess timeout before the bar
+  could repaint. The press pipeline now flashes three phases into the
+  project's status line: `Alt+V: capturing...` the moment the chord is
+  recognized (before the clipboard is even read), `Alt+V: uploading...`
+  once the image is in hand, and then the outcome -- success included.
+  Failures name their cause specifically (`clipboard has no image - copy
+  one first`, `cannot reach magent serve (connection refused)`,
+  `serve said HTTP 400: <reason>`, `saved, but psmux would not paste it`)
+  instead of a generic error. Flashes are dispatched through one FIFO
+  pump, so a press never waits on its own progress report and the phases
+  can never arrive out of order; the serve no longer adds a second voice
+  to a press the listener already narrates. Measured press-to-bar latency:
+  65-176 ms. A new non-mocked end-to-end tier drives a real press against
+  a real `magent serve` and a real recorded multiplexer on every OS, so
+  the phase order, the failure texts, and the latency budget are pinned
+  against regression.
+
+### Fixed
+
+- **The reconnect status line no longer erases what you were typing.**
+  When a connection dropped mid-session, the in-place "reconnecting"
+  line was drawn wherever the cursor happened to sit -- which, in an
+  agent session, is usually inside the prompt box, on top of the sentence
+  you had typed but not yet sent. The supervisor now paints the status
+  line on the terminal's bottom row with an absolute jump-and-return
+  (save cursor, draw, restore), so the frozen frame -- your typed text
+  included -- stays exactly where it was through the whole outage and is
+  still there after the link heals. Keystrokes made during the outage are
+  forwarded, not swallowed. A real-terminal test tier replays the actual
+  byte stream into a screen model and asserts the grid: only the bottom
+  row may change. This runs on the *attaching* machine, so the client
+  side must upgrade to see it.
+
+- **A silent or chatty child can no longer hang the end-to-end suite
+  until CI cancels the job.** The pseudo-terminal test driver had two
+  deadline holes (an untimed read on Windows, and a deadline check
+  skipped whenever output kept arriving) that let one blocked test burn
+  the whole job's time budget and take every other result with it. The
+  driver now enforces a wall-clock deadline on every wait and carries the
+  partial transcript in the failure, and every pty test runs under a
+  whole-test time budget. Exposed along the way: driving a Windows
+  pseudo-terminal *over* Windows OpenSSH nests two ConPTYs and mangles
+  Enter into a raw key record the remote shell never accepts -- that leg
+  is now a loud skip on Windows (it still runs for real on Linux and
+  macOS) and a ledger entry.
+
 ## [3.12.3] - 2026-08-18
 
 ### Fixed
@@ -908,6 +961,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.13.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.3...v3.13.0
 [3.12.3]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.2...v3.12.3
 [3.12.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.1...v3.12.2
 [3.12.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.0...v3.12.1
