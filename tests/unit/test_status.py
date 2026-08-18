@@ -421,7 +421,9 @@ class TestMenuDownServerReport:
             "magent.launch.psmux_status",
             lambda cfg, group=None: ([{"name": "api"}], [], []),
         )
-        monkeypatch.setattr("magent.launch.kill_psmux", lambda targets: None)
+        monkeypatch.setattr(
+            "magent.launch.stop_psmux", lambda targets: (list(targets), [])
+        )
         monkeypatch.setattr("magent.cli.status._probe_port", lambda port: True)
         monkeypatch.setattr("magent.upload_server.stop_server", lambda port: stop_ok)
         monkeypatch.setattr(status_mod.click, "prompt", lambda *a, **k: "x")
@@ -811,6 +813,119 @@ class TestAgentsRollup:
         assert "need you" not in result.output
 
 
+class TestDownStopsWhatItPromisesAndReportsWhatItProved:
+    """The reported bug, from both ends.
+
+    Field report 1 (30 running / 15 stopped, then `down --all` naming only the
+    config-order TAIL): `down` iterated the liveness snapshot, so every session
+    that snapshot missed was neither stopped nor mentioned -- "these stay
+    always".
+
+    Field report 2 (`down --all` printed "Stopped 46" while 11 were still alive
+    and attachable): the report was the length of the list the command had
+    TRIED, and nothing re-probed.
+    """
+
+    def _run(self, runner, tmp_config, monkeypatch, argv, *, up, configured, result):
+        cfgpath = tmp_config({"projects": [{"path": "myapp"}]})
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: (
+                [{"name": n, "session": n} for n in up],
+                [],
+                [{"name": n, "session": n} for n in configured],
+            ),
+        )
+        killed: list[list[str]] = []
+        monkeypatch.setattr(
+            "magent.launch.stop_psmux",
+            lambda targets: (killed.append(list(targets)), result)[1],
+        )
+        monkeypatch.setattr("magent.cli.attach._read_last_host", lambda: None)
+        monkeypatch.setattr("magent.upload_server.stop_server", lambda port: False)
+        monkeypatch.setattr("magent.cli.attention_cmd.stop_daemon", lambda: False)
+        if sys.platform == "win32":
+            monkeypatch.setattr("magent.hotkey.stop_listener", lambda: False)
+        out = runner.invoke(cli.main, ["--config", cfgpath, "down", *argv])
+        return out, killed
+
+    def test_all_kills_sessions_the_liveness_probe_missed(
+        self, runner, tmp_config, monkeypatch
+    ):
+        # `--all` says "stop EVERY psmux session". The probe saw only the head
+        # of the config; the tail must still be killed, because kill-server
+        # against a dead socket is a harmless no-op and skipping it is the bug.
+        _out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            up=("api",),
+            configured=("api", "web", "db"),
+            result=(["api", "web", "db"], []),
+        )
+        assert killed == [["api", "web", "db"]]
+
+    def test_a_named_selection_matches_config_not_only_the_live_snapshot(
+        self, runner, tmp_config, monkeypatch
+    ):
+        _out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["web"],
+            up=("api",),
+            configured=("api", "web"),
+            result=(["web"], []),
+        )
+        assert killed == [["web"]]
+
+    def test_the_report_names_only_verified_stops(
+        self, runner, tmp_config, monkeypatch
+    ):
+        out, _killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            up=("api", "web"),
+            configured=("api", "web"),
+            result=(["api"], ["web"]),
+        )
+        assert "Stopped 1 session(s): api" in out.output
+        assert "Stopped 2 session(s)" not in out.output
+
+    def test_survivors_are_named_loudly(self, runner, tmp_config, monkeypatch):
+        out, _killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            up=("api", "web"),
+            configured=("api", "web"),
+            result=(["api"], ["web"]),
+        )
+        assert "1 session(s) would NOT stop: web" in out.output
+
+    def test_nothing_running_says_so_instead_of_claiming_a_shutdown(
+        self, runner, tmp_config, monkeypatch
+    ):
+        out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            up=(),
+            configured=("api",),
+            result=([], []),
+        )
+        # Still ATTEMPTED (the probe may be the thing that is wrong)...
+        assert killed == [["api"]]
+        # ...but nothing is claimed.
+        assert "No running sessions to stop." in out.output
+        assert "Stopped" not in out.output.split("Upload server")[0]
+
+
 class TestDownActsOnTheAttachHost:
     """`magent down` on an attach CLIENT used to be a near no-op: there are no
     local psmux sessions on a laptop, so it stopped the local Alt+V listener and
@@ -830,6 +945,7 @@ class TestDownActsOnTheAttachHost:
         argv,
         *,
         up=(),
+        configured=None,
         last_host=None,
         rc=0,
         out="",
@@ -839,11 +955,20 @@ class TestDownActsOnTheAttachHost:
 
         cfgpath = tmp_config({"projects": [{"path": "myapp"}]})
         rows = [{"name": n, "session": n} for n in up]
+        # The third element is what `down` KILLS (every configured eligible
+        # session); `up` is only what decides local-vs-remote.
+        projects = [
+            {"name": n, "session": n}
+            for n in (up if configured is None else configured)
+        ]
         monkeypatch.setattr(
-            "magent.launch.psmux_status", lambda cfg, group=None: (rows, [], [])
+            "magent.launch.psmux_status", lambda cfg, group=None: (rows, [], projects)
         )
         killed: list[list[str]] = []
-        monkeypatch.setattr("magent.launch.kill_psmux", killed.append)
+        monkeypatch.setattr(
+            "magent.launch.stop_psmux",
+            lambda targets: (killed.append(list(targets)), (list(targets), []))[1],
+        )
         monkeypatch.setattr(attach_mod, "_read_last_host", lambda: last_host)
         closed: list[list[str]] = []
         monkeypatch.setattr(
@@ -911,7 +1036,7 @@ class TestDownActsOnTheAttachHost:
         assert result.exit_code == 0
         assert sent == []
         assert killed == []
-        assert "No matching running sessions." in result.output
+        assert "No matching sessions in config." in result.output
 
     @pytest.mark.parametrize(
         ("argv", "expected"),

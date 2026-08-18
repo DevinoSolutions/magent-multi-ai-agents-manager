@@ -939,9 +939,15 @@ def _close_attach_windows(names: Sequence[str]) -> int:
     return len(_close_windows(plat, snap, list(names) or _open_attach_sids(snap)))
 
 
-# `magent down` on the host is a handful of psmux kills plus a couple of pid
-# stops -- fast, but it runs after an SSH handshake on a possibly-loaded box.
-_REMOTE_DOWN_TIMEOUT_S = 60
+# `magent down` on the host is a psmux kill fan-out plus a verify pass plus a
+# couple of pid stops, after an SSH handshake, on a possibly-loaded box. The
+# old 60s budget was measured against a handful of sessions and became a
+# TRUNCATION mechanism at scale: 46 sockets could outrun it, ssh was killed
+# mid-shutdown, and what survived was exactly the part of the config the
+# shutdown had not reached yet -- the reported "the tail always stays" tail.
+# Sized like `_BRING_UP_TIMEOUT_S`: generous enough that only a genuinely
+# unreachable host hits it.
+_REMOTE_DOWN_TIMEOUT_S = 300
 
 
 def _remote_down_command(

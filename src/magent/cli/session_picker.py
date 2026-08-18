@@ -1,6 +1,14 @@
 """The psmux session picker: live-session listing (`sessions_cmd`) and the
 looping attach-and-return picker (`_run_sessions_picker`). Named
 session_picker (not "sessions") to avoid confusion with magent.sessions.
+
+Liveness is NOT decided here: the sweep is `psmux.live_sessions`, the one
+enumeration `status`/`down`/the upload server also use. This module used to
+carry the product's only retrying probe, which made the picker the one surface
+that could see a flapping session -- and `magent down` the one that skipped it.
+Per-session cwds still come from config rather than a psmux probe per paint,
+direct-name attach resolves from config (no sweep dependency), and a failed
+attach is surfaced + retried instead of being wiped by the redraw.
 """
 
 from __future__ import annotations
@@ -137,41 +145,6 @@ def _set_picker_attached(name: str | None) -> None:
         pass
 
 
-def _live_sessions(psmux_bin: str, candidates: list[str]) -> list[str]:
-    """Liveness sweep as an unbounded process fan-out, one retry for the misses.
-
-    Every probe is spawned before any is waited on -- the shape
-    ``psmux.psmux_status`` already uses -- so the sweep costs roughly one psmux
-    round-trip instead of ceil(n/16) of them; the earlier ThreadPool(16) sweep
-    over ``has_session`` (which blocks a worker per call) took ~1s at 40
-    sessions. The retry stays: under the load of many running agents individual
-    probes flap, and a dropped probe silently hides a live session."""
-
-    def _probe(names: list[str]) -> list[bool]:
-        procs = [
-            subprocess.Popen(
-                # `-t <n>` for the same reason `psmux.has_session` passes it:
-                # a bare has-session exits 0 for a socket with no server, so
-                # this sweep listed dead sessions as live. (Plain inherited
-                # env: a probe is not a session-creating command, so psmux's
-                # nesting guard has nothing to say about it.)
-                [psmux_bin, "-L", n, "has-session", "-t", n],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            for n in names
-        ]
-        return [p.wait() == 0 for p in procs]
-
-    flags = dict(zip(candidates, _probe(candidates), strict=True))
-    missing = [n for n in candidates if not flags[n]]
-    if missing:
-        for n, ok in zip(missing, _probe(missing), strict=True):
-            if ok:
-                flags[n] = True
-    return [n for n in candidates if flags[n]]
-
-
 def _reset_terminal() -> None:
     """Put the terminal back in a sane state after a psmux client detaches.
 
@@ -260,8 +233,12 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
 
     while True:
         # Fresh sweep every redraw: sessions created or killed while the
-        # picker was attached elsewhere show up without restarting it.
-        sessions = _live_sessions(psmux_bin, candidates)
+        # picker was attached elsewhere show up without restarting it. The
+        # sweep is `psmux.live_sessions` -- the SAME call `status` and `down`
+        # make, so the picker can no longer be the only surface that sees a
+        # session (this module used to own the only retrying probe in the
+        # product, which is why `down` skipped what the picker was showing).
+        sessions = psmux_mod.live_sessions(candidates, psmux=psmux_bin)
         if not sessions:
             click.echo(f"  {style('x', fg='red')} No active psmux sessions.")
             click.echo(

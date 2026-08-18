@@ -1,110 +1,41 @@
-"""Session-picker load hardening and first-paint cost: the liveness sweep is a
-process fan-out that retries flapping probes, per-session cwds come from config
-rather than a psmux probe per paint, direct-name attach resolves from config (no
-sweep dependency), and a failed attach is surfaced + retried instead of being
-wiped by the redraw.
+"""Session-picker load hardening and first-paint cost: per-session cwds come
+from config rather than a psmux probe per paint, direct-name attach resolves
+from config (no sweep dependency), and a failed attach is surfaced + retried
+instead of being wiped by the redraw.
+
+The liveness sweep itself is no longer this module's -- it is
+`psmux.live_sessions`, pinned by `test_psmux.py::TestLiveSessions`. The picker
+owning the product's only retrying probe is exactly how `status`/`down` came to
+disagree with it about which sessions exist.
 """
 
 from __future__ import annotations
 
 import time
 
+from magent import psmux as psmux_mod
 from magent.cli import session_picker
 
 
-class _FakeProc:
-    """Stand-in for the Popen handle `_live_sessions` fans out, logging when it
-    is waited on so the spawn-then-wait ordering can be pinned."""
+class TestPickerSweepIsTheSharedSeam:
+    def test_the_picker_sweeps_through_psmux_live_sessions(
+        self, monkeypatch, tmp_config
+    ):
+        # A pin on the seam, not on the probe: whatever the shared enumeration
+        # answers is what the picker lists, so the picker can never again be
+        # the one surface that sees a session `down` will skip.
+        from pathlib import Path
 
-    def __init__(self, name: str, returncode: int, events: list[str]) -> None:
-        self._name = name
-        self._returncode = returncode
-        self._events = events
-
-    def wait(self) -> int:
-        self._events.append(f"wait:{self._name}")
-        return self._returncode
-
-
-def _fan_out(monkeypatch, results: dict[str, list[bool]]) -> list[str]:
-    """Patch Popen so each `has-session` probe pops the next result for its
-    session. Returns the spawn/wait event log."""
-    events: list[str] = []
-
-    def _fake_popen(cmd, **kwargs):
-        name = cmd[2]
-        events.append(f"spawn:{name}")
-        return _FakeProc(name, 0 if results[name].pop(0) else 1, events)
-
-    monkeypatch.setattr(session_picker.subprocess, "Popen", _fake_popen)
-    return events
-
-
-class TestLiveSessions:
-    def test_retries_misses_once(self, monkeypatch):
-        # First probe flaps b and c to False; the retry recovers b.
-        _fan_out(monkeypatch, {"a": [True], "b": [False, True], "c": [False, False]})
-        assert session_picker._live_sessions("psmux", ["a", "b", "c"]) == ["a", "b"]
-
-    def test_config_order_preserved(self, monkeypatch):
-        _fan_out(monkeypatch, {"z": [True], "m": [True], "a": [True]})
-        assert session_picker._live_sessions("psmux", ["z", "m", "a"]) == [
-            "z",
-            "m",
-            "a",
-        ]
-
-    def test_no_retry_when_all_alive(self, monkeypatch):
-        events = _fan_out(monkeypatch, {"a": [True], "b": [True]})
-        session_picker._live_sessions("psmux", ["a", "b"])
-        assert [e for e in events if e.startswith("spawn:")] == ["spawn:a", "spawn:b"]
-
-    def test_every_probe_is_spawned_before_any_is_waited_on(self, monkeypatch):
-        # The point of the fan-out: n concurrent psmux round-trips, not n
-        # sequential ones (nor ceil(n/16) thread-pool batches).
-        events = _fan_out(monkeypatch, {"a": [True], "b": [True], "c": [True]})
-        session_picker._live_sessions("psmux", ["a", "b", "c"])
-        assert events == [
-            "spawn:a",
-            "spawn:b",
-            "spawn:c",
-            "wait:a",
-            "wait:b",
-            "wait:c",
-        ]
-
-    def test_probe_argv_is_a_per_session_has_session(self, monkeypatch):
-        argvs: list[list[str]] = []
-
-        def _fake_popen(cmd, **kwargs):
-            argvs.append(cmd)
-            return _FakeProc(cmd[2], 0, [])
-
-        monkeypatch.setattr(session_picker.subprocess, "Popen", _fake_popen)
-        session_picker._live_sessions("psmux", ["a"])
-        # `-t a` is load-bearing, not decoration: a BARE has-session exits 0
-        # against a socket with no server at all (psmux 3.3.6 answers from its
-        # internal __warm__ spare), so this sweep listed every configured
-        # session as live and the picker offered dead ones for attaching.
-        assert argvs == [["psmux", "-L", "a", "has-session", "-t", "a"]]
-
-    def test_probes_inherit_the_environment(self, monkeypatch):
-        # The picker is normally driven from inside a psmux window, whose env
-        # carries PSMUX_SESSION/TMUX -- but a PROBE is not a session-creating
-        # command, and psmux's nested guard only fires for `new-session`
-        # (measured against the real binary). So this stays a plain inherited
-        # spawn; `-t` above is what makes the answer truthful.
-        envs: list[object] = []
-
-        def _fake_popen(cmd, **kwargs):
-            envs.append(kwargs.get("env"))
-            return _FakeProc(cmd[2], 0, [])
-
-        monkeypatch.setenv("PSMUX_SESSION", "api")
-        monkeypatch.setenv("TMUX", "/tmp/sock,1,0")
-        monkeypatch.setattr(session_picker.subprocess, "Popen", _fake_popen)
-        session_picker._live_sessions("psmux", ["a"])
-        assert envs == [None]
+        seen: list[tuple[list[str], str | None]] = []
+        monkeypatch.setattr(psmux_mod, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(
+            psmux_mod,
+            "live_sessions",
+            lambda names, psmux=None, **kw: (seen.append((list(names), psmux)), [])[1],
+        )
+        cfgpath = tmp_config({"projects": [{"path": "api"}, {"path": "web"}]})
+        session_picker._run_sessions_picker(Path(cfgpath))
+        assert seen == [(["api", "web"], "psmux")]
 
 
 class TestSessionCwds:
