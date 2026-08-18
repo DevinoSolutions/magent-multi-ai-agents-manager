@@ -425,6 +425,37 @@ def _down_host(explicit: str | None, local_targets: list[str]) -> str | None:
     return _read_last_host()
 
 
+def _report_shutdown(stopped: list[str], still: list[str]) -> None:
+    """Say what was PROVED stopped, and say the survivors loudly.
+
+    The old line was ``Stopped {len(targets)} session(s)`` off the list the
+    command had *tried* -- printed verbatim on a machine where 11 of the 46 it
+    claimed were still alive and attachable. A shutdown report that cannot be
+    wrong about the world is not a report.
+    """
+    if stopped:
+        click.echo(
+            f"  {style('+', fg='green')} Stopped {style(str(len(stopped)), fg='green', bold=True)}"
+            f" session(s): {style(', '.join(stopped), dim=True)}"
+        )
+    elif not still:
+        click.echo(f"  {style('-', dim=True)} No running sessions to stop.")
+    if still:
+        click.echo(
+            f"  {style('x', fg='red')} {style(str(len(still)), fg='red', bold=True)}"
+            f" session(s) would NOT stop: {style(', '.join(still), fg='red')}"
+            f" {style('(two kill attempts each -- see ~/.magent/logs/launch.log)', dim=True)}"
+        )
+
+
+def _select_targets(pool: list[str], names: tuple[str, ...]) -> list[str]:
+    """``names`` filtered out of ``pool`` (case-insensitively), or all of it."""
+    if not names:
+        return list(pool)
+    wanted = {n.lower() for n in names}
+    return [n for n in pool if n.lower() in wanted]
+
+
 @main.command("down")
 @click.argument("names", nargs=-1)
 @click.option("-g", "--group", default=None, help="Only sessions in this group")
@@ -451,25 +482,42 @@ def down_cmd(
     stop_srv: bool,
     host: str | None,
 ) -> None:
-    """Shut down running psmux sessions (and optionally the upload server)."""
+    """Shut down psmux sessions (and optionally the upload server).
+
+    Stops every configured session in scope -- not just the ones a liveness
+    probe happens to see -- then re-probes and reports only what it PROVED
+    stopped, naming any survivor.
+    """
     config_file = find_config(ctx.obj.get("config_path"))
     cfg = _load_config_or_exit(config_file)
 
     from magent.launch import (  # heavy subsystem: in-body per policy
-        kill_psmux,
         psmux_status,
+        stop_psmux,
     )
 
-    up, _, _ = psmux_status(cfg, group=group)
-    # Kill keys off the psmux socket id (P3-01); `status` shows the same ids.
-    up_names = [_as_str(u.get("session")) or _as_str(u.get("name")) for u in up]
-    if names:
-        wanted = {n.lower() for n in names}
-        targets = [n for n in up_names if n.lower() in wanted]
-    else:
-        targets = up_names
+    up, _, projects = psmux_status(cfg, group=group)
+    # Two lists, on purpose. Kill keys off the psmux socket id (P3-01); `status`
+    # shows the same ids.
+    #
+    # `targets` (what gets killed) is CONFIGURED, not live: `--all` promises to
+    # stop every psmux session and used to deliver "stop whatever one un-retried
+    # has-session fan-out called up", so a session the probe missed was neither
+    # stopped nor mentioned -- the reported "these stay always" survivors.
+    # kill-server against a socket with no server is a harmless no-op, so
+    # over-targeting costs nothing and under-targeting costs the whole feature.
+    #
+    # `live` (what decides local-vs-remote) stays live: on an attach CLIENT
+    # nothing is RUNNING locally, and that -- not "config lists no projects" --
+    # is what makes `down --all` act on the remembered host.
+    live = _select_targets(
+        [_as_str(u.get("session")) or _as_str(u.get("name")) for u in up], names
+    )
+    targets = _select_targets(
+        [_as_str(p.get("session")) or _as_str(p.get("name")) for p in projects], names
+    )
 
-    remote = _down_host(host, targets)
+    remote = _down_host(host, live)
     remote_rc = 0
     if remote:
         from magent.cli.attach import (
@@ -478,13 +526,9 @@ def down_cmd(
 
         remote_rc = _remote_down(remote, names, group, do_all, stop_srv)
     elif targets:
-        kill_psmux(targets)
-        click.echo(
-            f"  {style('+', fg='green')} Stopped {style(str(len(targets)), fg='green', bold=True)}"
-            f" session(s): {style(', '.join(targets), dim=True)}"
-        )
+        _report_shutdown(*stop_psmux(targets))
     else:
-        click.echo(f"  {style('-', dim=True)} No matching running sessions.")
+        click.echo(f"  {style('-', dim=True)} No matching sessions in config.")
 
     if do_all or stop_srv:
         from magent.upload_server import (
@@ -677,8 +721,8 @@ def _menu_up(config_file: Path) -> None:
 
 def _menu_down(config_file: Path) -> None:
     from magent.launch import (  # heavy subsystem: in-body per policy
-        kill_psmux,
         psmux_status,
+        stop_psmux,
     )
 
     cfg = _load_config_or_exit(config_file)
@@ -733,10 +777,10 @@ def _menu_down(config_file: Path) -> None:
                 click.echo(f"  {style('?', fg='yellow')} cancelled.")
                 return
             targets = buckets[sel]
-        kill_psmux(targets)
-        click.echo(
-            f"  {style('+', fg='green')} Stopped {style(str(len(targets)), fg='green', bold=True)} session(s)."
-        )
+        # Same verified report the `down` command gives: the menu used to
+        # print the length of the list it had tried, which is the half of
+        # NF-S3-001 that survived pass-2 (the server line was fixed then).
+        _report_shutdown(*stop_psmux(targets))
         if also_server:
             from magent.upload_server import (
                 stop_server,  # heavy subsystem: in-body per policy

@@ -1524,3 +1524,285 @@ class TestDecorateSessionsAsync:
         assert _SpawnRecorder.spawned == []
         # ...and a no-op must not stamp: nothing was decorated.
         assert not psmux.DECOR_STAMP.exists()
+
+
+class _LiveProbe:
+    """Stand-in for one fanned-out `has-session` probe, logging when it is
+    waited on so the spawn-then-wait ordering can be pinned. A ``None``
+    returncode means "this probe never answers"."""
+
+    def __init__(self, name: str, returncode: int | None, events: list[str]) -> None:
+        self._name = name
+        self._returncode = returncode
+        self._events = events
+        self.killed = False
+
+    def wait(self, timeout: float | None = None) -> int:
+        self._events.append(f"wait:{self._name}")
+        if self._returncode is None:
+            raise subprocess.TimeoutExpired(cmd="psmux", timeout=timeout or 0)
+        return self._returncode
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def _fan_out(monkeypatch, results: dict[str, list[bool]]) -> list[str]:
+    """Patch Popen so each `has-session` probe pops the next result for its
+    session. Returns the spawn/wait event log."""
+    events: list[str] = []
+
+    def _fake_popen(cmd, **kwargs):
+        name = cmd[2]
+        events.append(f"spawn:{name}")
+        return _LiveProbe(name, 0 if results[name].pop(0) else 1, events)
+
+    monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+    return events
+
+
+class TestLiveSessions:
+    """The ONE liveness enumeration. These pins moved here from
+    session_picker, which used to own the product's only retrying probe:
+    `psmux_status` (and therefore `status` and `down`) ran the same fan-out
+    with NO retry, so the picker and the shutdown could disagree about the same
+    session at the same moment -- and the shutdown's direction of error was to
+    silently skip a live one."""
+
+    def test_retries_misses_once(self, monkeypatch):
+        # First probe flaps b and c to False; the retry recovers b.
+        _fan_out(monkeypatch, {"a": [True], "b": [False, True], "c": [False, False]})
+        assert psmux.live_sessions(["a", "b", "c"], "psmux") == ["a", "b"]
+
+    def test_config_order_preserved(self, monkeypatch):
+        _fan_out(monkeypatch, {"z": [True], "m": [True], "a": [True]})
+        assert psmux.live_sessions(["z", "m", "a"], "psmux") == ["z", "m", "a"]
+
+    def test_no_retry_when_all_alive(self, monkeypatch):
+        events = _fan_out(monkeypatch, {"a": [True], "b": [True]})
+        psmux.live_sessions(["a", "b"], "psmux")
+        assert [e for e in events if e.startswith("spawn:")] == ["spawn:a", "spawn:b"]
+
+    def test_retries_zero_takes_the_first_answer(self, monkeypatch):
+        # The bring-up creation verify's mode: it owns its own respawn cycle,
+        # so a probe retry folded in here would only delay the respawn.
+        _fan_out(monkeypatch, {"a": [False, True]})
+        assert psmux.live_sessions(["a"], "psmux", retries=0) == []
+
+    def test_a_timed_out_probe_is_not_live_and_is_killed(self, monkeypatch):
+        procs: list[_LiveProbe] = []
+
+        def _fake_popen(cmd, **kwargs):
+            proc = _LiveProbe(cmd[2], None, [])
+            procs.append(proc)
+            return proc
+
+        monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+        assert psmux.live_sessions(["a"], "psmux", timeout=0.1, retries=0) == []
+        assert [p.killed for p in procs] == [True]
+
+    def test_every_probe_is_spawned_before_any_is_waited_on(self, monkeypatch):
+        # The point of the fan-out: n concurrent psmux round-trips, not n
+        # sequential ones (nor ceil(n/16) thread-pool batches).
+        events = _fan_out(monkeypatch, {"a": [True], "b": [True], "c": [True]})
+        psmux.live_sessions(["a", "b", "c"], "psmux")
+        assert events == [
+            "spawn:a",
+            "spawn:b",
+            "spawn:c",
+            "wait:a",
+            "wait:b",
+            "wait:c",
+        ]
+
+    def test_probe_argv_is_a_per_session_has_session(self, monkeypatch):
+        argvs: list[list[str]] = []
+
+        def _fake_popen(cmd, **kwargs):
+            argvs.append(cmd)
+            return _LiveProbe(cmd[2], 0, [])
+
+        monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+        psmux.live_sessions(["a"], "psmux")
+        # `-t a` is load-bearing, not decoration: a BARE has-session exits 0
+        # against a socket with no server at all (psmux 3.3.6 answers from its
+        # internal __warm__ spare), so this sweep listed every configured
+        # session as live and the picker offered dead ones for attaching.
+        assert argvs == [["psmux", "-L", "a", "has-session", "-t", "a"]]
+
+    def test_probes_inherit_the_environment(self, monkeypatch):
+        # A PROBE is not a session-creating command, and psmux's nested guard
+        # only fires for `new-session` (measured against the real binary), so
+        # this stays a plain inherited spawn; `-t` above is what makes the
+        # answer truthful.
+        envs: list[object] = []
+
+        def _fake_popen(cmd, **kwargs):
+            envs.append(kwargs.get("env"))
+            return _LiveProbe(cmd[2], 0, [])
+
+        monkeypatch.setenv("PSMUX_SESSION", "api")
+        monkeypatch.setenv("TMUX", "/tmp/sock,1,0")
+        monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+        psmux.live_sessions(["a"], "psmux")
+        assert envs == [None]
+
+    def test_an_unspawnable_probe_is_not_live_rather_than_raising(self, monkeypatch):
+        def _boom(cmd, **kwargs):
+            raise OSError("no fork today")
+
+        monkeypatch.setattr(subprocess, "Popen", _boom)
+        assert psmux.live_sessions(["a"], "psmux") == []
+
+    def test_no_binary_or_no_names_is_a_noop(self, monkeypatch):
+        monkeypatch.setattr(
+            subprocess, "Popen", lambda *a, **k: pytest.fail("must not probe")
+        )
+        assert psmux.live_sessions([], "psmux") == []
+        monkeypatch.setattr(psmux, "find_psmux", lambda: None)
+        assert psmux.live_sessions(["a"]) == []
+
+
+class TestPsmuxStatusLiveness:
+    """`psmux_status` reads liveness through `live_sessions`, retry included --
+    it used to run a private single-shot fan-out, which is how `status` could
+    call a session stopped while the picker was attached to it."""
+
+    def _cfgdir(self, tmp_path, names):
+        projects = []
+        for name in names:
+            (tmp_path / name).mkdir()
+            projects.append(ProjectConfig(path=str(tmp_path / name), tool="claude"))
+        return _cfg(projects, tools={"claude": "claude"})
+
+    def test_a_flapping_probe_is_retried_not_reported_down(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        _fan_out(monkeypatch, {"api": [True], "web": [False, True]})
+        up, down, _all = psmux.psmux_status(self._cfgdir(tmp_path, ["api", "web"]))
+        assert [u["name"] for u in up] == ["api", "web"]
+        assert down == []
+
+    def test_a_genuinely_dead_session_survives_the_retry(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        _fan_out(monkeypatch, {"api": [True], "web": [False, False]})
+        up, down, _all = psmux.psmux_status(self._cfgdir(tmp_path, ["api", "web"]))
+        assert [u["name"] for u in up] == ["api"]
+        assert [d["name"] for d in down] == ["web"]
+
+
+class _StopHarness:
+    """Drives `stop_sessions` against a fake psmux: ``alive`` is the world, and
+    ``stubborn`` names sessions that ignore their first kill (psmux 3.3.6 still
+    exits 0 for those, which is why the answer comes from a re-probe)."""
+
+    def __init__(self, monkeypatch, *, alive, stubborn=()):
+        self.alive = set(alive)
+        self.stubborn = set(stubborn)
+        self.kills: list[str] = []
+        self.probes: list[list[str]] = []
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(psmux.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(psmux, "kill_server", self._kill)
+        monkeypatch.setattr(psmux, "live_sessions", self._live)
+
+    def _kill(self, name, psmux=None):
+        self.kills.append(name)
+        if name in self.stubborn:
+            self.stubborn.discard(name)
+        else:
+            self.alive.discard(name)
+        return True
+
+    def _live(self, names, psmux=None, **kwargs):
+        self.probes.append(list(names))
+        return [n for n in names if n in self.alive]
+
+
+class TestStopSessions:
+    """`down` reports the world, not the loop it ran.
+
+    Live repro: `magent down --all` printed "Stopped 46 session(s)" while 11 of
+    them were still alive and attachable, because `kill_servers` discarded
+    every `kill_server` return value and answered with the full list of names
+    it had tried."""
+
+    def test_reports_only_sessions_it_proved_stopped(self, monkeypatch):
+        _StopHarness(monkeypatch, alive={"api", "web"})
+        assert psmux.stop_sessions(["api", "web"]) == (["api", "web"], [])
+
+    def test_a_survivor_is_named_not_counted_as_stopped(self, monkeypatch):
+        harness = _StopHarness(monkeypatch, alive={"api", "web"})
+        monkeypatch.setattr(
+            psmux,
+            "kill_server",
+            lambda name, psmux=None: (
+                harness.kills.append(name),
+                name != "web" and harness.alive.discard(name),
+                True,
+            )[-1],
+        )
+        assert psmux.stop_sessions(["api", "web"]) == (["api"], ["web"])
+
+    def test_a_stubborn_session_gets_a_second_kill(self, monkeypatch):
+        harness = _StopHarness(monkeypatch, alive={"api", "web"}, stubborn={"web"})
+        assert psmux.stop_sessions(["api", "web"]) == (["api", "web"], [])
+        assert harness.kills == ["api", "web", "web"]
+
+    def test_a_session_that_was_never_running_is_not_claimed_as_stopped(
+        self, monkeypatch
+    ):
+        _StopHarness(monkeypatch, alive={"api"})
+        assert psmux.stop_sessions(["api", "ghost"]) == (["api"], [])
+
+    def test_every_name_is_killed_even_ones_the_probe_called_dead(self, monkeypatch):
+        # THE fix for the reported bug: a session the liveness probe missed
+        # must still be killed. kill-server against a socket with no server is
+        # a harmless no-op, so over-targeting costs nothing -- while skipping
+        # whatever the probe missed leaves it running forever.
+        harness = _StopHarness(monkeypatch, alive=set())
+        psmux.stop_sessions(["api", "web"])
+        assert sorted(harness.kills) == ["api", "web"]
+
+    def test_no_binary_or_no_names_claims_nothing(self, monkeypatch):
+        monkeypatch.setattr(psmux, "find_psmux", lambda: None)
+        assert psmux.stop_sessions(["api"]) == ([], [])
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        assert psmux.stop_sessions([]) == ([], [])
+
+    def test_a_survivor_is_logged_as_an_error(self, monkeypatch, caplog):
+        _StopHarness(monkeypatch, alive={"web"})
+        monkeypatch.setattr(psmux, "kill_server", lambda name, psmux=None: True)
+        with caplog.at_level(logging.ERROR, logger="magent.launch"):
+            psmux.stop_sessions(["web"])
+        assert "still running after two kill attempts" in caplog.text
+
+
+class TestKillPrimitives:
+    def test_kill_server_never_raises_out_of_a_hung_psmux(self, monkeypatch):
+        def _boom(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="psmux", timeout=1)
+
+        monkeypatch.setattr(subprocess, "run", _boom)
+        assert psmux.kill_server("api", psmux="psmux") is False
+
+    def test_kill_server_is_bounded(self, monkeypatch):
+        seen: list[object] = []
+
+        def _run(cmd, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            return _FakeCompleted(0, "")
+
+        monkeypatch.setattr(subprocess, "run", _run)
+        psmux.kill_server("api", psmux="psmux")
+        # A wedged psmux server answers nothing at all; one stuck socket must
+        # not hold a 46-session shutdown hostage.
+        assert seen == [psmux._KILL_TIMEOUT_S]
+
+    def test_kill_servers_attempts_every_name(self, monkeypatch):
+        killed: list[str] = []
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(
+            psmux, "kill_server", lambda n, psmux=None: (killed.append(n), True)[1]
+        )
+        assert psmux.kill_servers(["a", "b"]) == ["a", "b"]
+        assert sorted(killed) == ["a", "b"]

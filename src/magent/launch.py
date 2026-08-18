@@ -939,8 +939,13 @@ def decorate_psmux_sessions_async(
     return psmux.decorate_sessions_async(names, code_hint=code_hint)
 
 
-def kill_psmux(names: list[str]) -> list[str]:
-    """Delegate to ``psmux.kill_servers``."""
-    from magent.psmux import kill_servers
+def stop_psmux(names: list[str]) -> tuple[list[str], list[str]]:
+    """Delegate to ``psmux.stop_sessions``. Returns ``(stopped, still_running)``.
 
-    return kill_servers(names)
+    Replaces the old ``kill_psmux`` (a pass-through to the attempt-only
+    ``kill_servers``): a shutdown command has to be able to tell the user what
+    it PROVED it stopped, and what it could not.
+    """
+    from magent.psmux import stop_sessions
+
+    return stop_sessions(names)

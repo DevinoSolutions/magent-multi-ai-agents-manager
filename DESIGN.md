@@ -809,6 +809,57 @@ window is another app's chord, not a failure, so it is DEBUG-only (at INFO it
 would log every Alt+V the user ever presses). `no-image` still passes the chord
 through — the pane may want a plain Alt+V — but says why nothing was uploaded.
 
+### One liveness enumeration, and a shutdown that verifies (2026-08-18)
+
+Reported twice on a live 46-session Windows host: after `magent down --all`, a
+fixed set of sessions "stay always" — and they were always the TAIL of the
+config, in config order. Two contradictory data points came with it. On the
+17th, `status` said 30 running / 15 stopped and the `down --all` a moment later
+named only the last 16, five of which `status` had just called *not* running.
+On the 18th, `down --all` said "Stopped 46" while the laptop's picker still
+listed the last 11 as alive and attachable.
+
+Three defects, each independently sufficient to produce that.
+
+**"Which sessions are live" had three answers.** `psmux.psmux_status` (behind
+`status`, `down`, the menu), `session_picker._live_sessions` (the picker) and
+`psmux.discover_sessions` (the upload server) each ran their own
+`has-session -t` sweep with a different retry policy. Only the picker retried
+its misses — with a comment saying, correctly, that probes flap under the load
+of many running agents and that *a dropped probe silently hides a live
+session*. So the picker could be attached to a session `status` called stopped
+and `down` therefore never touched. Now there is one function,
+`psmux.live_sessions`, and all three call it; the bring-up creation verify
+(`_missing_sessions`) stays separate on purpose and says why in its docstring.
+
+**`down --all` acted on a probe result, not on a promise.** Its own help says
+"Stop EVERY psmux session", and it was implemented as "stop whatever that
+single fan-out happened to return" — so a session the probe missed was neither
+stopped nor mentioned. `down` now kills every *configured* eligible session in
+scope. `kill-server` against a socket with no server is a harmless no-op, so
+over-targeting costs one wasted subprocess while under-targeting costs the
+whole feature. The local-vs-remote decision still keys off the LIVE local
+sessions, because "nothing is running here" is what tells an attach client to
+act on the remembered host.
+
+**`down` reported the loop it ran, not the world it changed.** `kill_servers`
+discarded every `kill_server` return value and answered with the full list of
+names it had attempted; the command printed that length. With psmux 3.3.6
+exiting 0 for kills that do not take, honouring the rc would not have been
+enough either. `psmux.stop_sessions` is the answer: probe → kill → settle →
+re-probe → kill the survivors again → re-probe, returning
+`(stopped, still_running)`. `down` and the menu now print only what was proved
+stopped and name any survivor in red. A survivor is also an ERROR in
+`launch.log`.
+
+Two contributing timeouts went with it: `kill_server` is now bounded (a wedged
+psmux server answers nothing, and one stuck socket must not hold a 46-session
+shutdown hostage), the kill is a bounded fan-out rather than a sequential
+sweep, and `cli/attach.py::_REMOTE_DOWN_TIMEOUT_S` went 60s → 300s. That last
+one was itself a tail-truncation mechanism: 46 sockets could outrun a 60s SSH
+budget, ssh was killed mid-shutdown, and what survived was exactly the part of
+the config the sweep had not reached — a config-order tail.
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.
