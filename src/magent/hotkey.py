@@ -580,7 +580,18 @@ def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
             return
         # code is code.cmd on Windows; shutil.which resolves the .cmd and
         # Popen on that resolved path runs it without a shell.
-        subprocess.Popen(build_code_open_command(folder, ssh_host, code_bin))
+        #
+        # `env=`: same reason as the platform backends' launch_vscode. This
+        # listener is a long-lived descendant of whatever shell started magent,
+        # so it carries that shell's agent-session markers for days; the editor
+        # it opens must not hand them to its integrated terminal.
+        # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+        from magent.env import spawn_child_env
+
+        subprocess.Popen(
+            build_code_open_command(folder, ssh_host, code_bin),
+            env=spawn_child_env(),
+        )
         log.info(
             "F2: opened project=%s folder=%s ssh_host=%s", project, folder, ssh_host
         )

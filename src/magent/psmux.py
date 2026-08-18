@@ -47,27 +47,36 @@ def find_psmux() -> str | None:
 def child_env() -> dict[str, str]:
     """Environment for a psmux child that CREATES a session.
 
-    Delegates to ``env.psmux_child_env`` -- the only module allowed to touch
-    ``os.environ`` -- and is re-exported here so the one spawn site that needs
-    it (``platform/windows.py``'s ``new-session``) reaches it through the module
-    that owns psmux subprocess behaviour. Imported in-body because
+    Delegates to ``env.spawn_child_env`` -- the only module allowed to touch
+    ``os.environ``, and the one seam every agent-hosting spawn in the product
+    routes through -- and is re-exported here so the psmux spawn site that
+    needs it (``platform/windows.py``'s ``new-session``) reaches it through the
+    module that owns psmux subprocess behaviour. Imported in-body because
     ``magent.env`` pulls pydantic in, and this module is a leaf that only
     imports ``magent.log`` at module level.
 
-    SCOPE, measured rather than assumed: psmux's nested-session guard fires for
-    ``new-session`` alone. Run from inside a live pane against a live session,
-    ``has-session -t``, ``display-message -t`` and ``capture-pane -t`` return
-    byte-identical results with the markers present and with them stripped --
-    no warning, same exit code. So every CONTROL and PROBE command in this
-    module spawns with the plain inherited environment: cleaning it there would
-    buy nothing and would put a rebuilt environment block under every psmux
-    round-trip magent makes. (The one thing an inherited ``$TMUX`` could still
-    do -- let a target-less command answer for the calling client's own pane --
-    is closed explicitly by the ``-t <session>`` every command here passes.)
-    """
-    from magent.env import psmux_child_env
+    This session is the one that will host the project's agent for the rest of
+    the day, so the strip is wider than psmux's own concern: the multiplexer
+    nesting markers, the launching agent harness's session markers, and the
+    launching shell's colour overrides all go. See ``env.spawn_child_env``.
 
-    return psmux_child_env()
+    SCOPE of the psmux half, measured rather than assumed: psmux's
+    nested-session guard fires for ``new-session`` alone. Run from inside a live
+    pane against a live session, ``has-session -t``, ``display-message -t`` and
+    ``capture-pane -t`` return byte-identical results with the markers present
+    and with them stripped -- no warning, same exit code. So every CONTROL and
+    PROBE command in this module spawns with the plain inherited environment:
+    cleaning it there would buy nothing and would put a rebuilt environment
+    block under every psmux round-trip magent makes. (The one thing an inherited
+    ``$TMUX`` could still do -- let a target-less command answer for the calling
+    client's own pane -- is closed explicitly by the ``-t <session>`` every
+    command here passes.) The harness/colour markers are the same story from the
+    other side: a control command's environment never reaches the pane, only
+    ``new-session``'s does.
+    """
+    from magent.env import spawn_child_env
+
+    return spawn_child_env()
 
 
 @dataclass

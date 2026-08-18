@@ -211,6 +211,9 @@ class LinuxPlatform(Platform):
                      (``supports_attention_signals()`` is False). Tracked in
                      DESIGN.md's known-debt ledger.
         """
+        # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+        from magent.env import spawn_child_env
+
         if opts.ssh_host:
             remote_dir = opts.ssh_remote_dir or opts.cwd
             inner = f"cd {remote_dir} && {opts.command}"
@@ -221,6 +224,13 @@ class LinuxPlatform(Platform):
         else:
             cmd = opts.command
 
+        # Every branch gets the same scrubbed block: this window hosts the
+        # project's agent, so it must not inherit the LAUNCHING shell's agent
+        # session identity or its colour opinion. See env.spawn_child_env.
+        # (Unlike `wt`, these emulators really are spawned by this Popen, so the
+        # environment binds -- gnome-terminal is the one that can hand off to a
+        # running server, and only when it does.)
+        env = spawn_child_env()
         if shutil.which("kitty"):
             subprocess.Popen(
                 [
@@ -232,7 +242,8 @@ class LinuxPlatform(Platform):
                     "sh",
                     "-c",
                     cmd,
-                ]
+                ],
+                env=env,
             )
         elif shutil.which("alacritty"):
             subprocess.Popen(
@@ -248,7 +259,8 @@ class LinuxPlatform(Platform):
                     "sh",
                     "-c",
                     cmd,
-                ]
+                ],
+                env=env,
             )
         elif shutil.which("gnome-terminal"):
             subprocess.Popen(
@@ -260,7 +272,8 @@ class LinuxPlatform(Platform):
                     "sh",
                     "-c",
                     cmd,
-                ]
+                ],
+                env=env,
             )
         elif shutil.which("konsole"):
             subprocess.Popen(
@@ -274,7 +287,8 @@ class LinuxPlatform(Platform):
                     "sh",
                     "-c",
                     cmd,
-                ]
+                ],
+                env=env,
             )
         elif shutil.which("xterm"):
             subprocess.Popen(
@@ -286,7 +300,8 @@ class LinuxPlatform(Platform):
                     opts.title,
                     "-e",
                     f"cd {opts.cwd} && {cmd}",
-                ]
+                ],
+                env=env,
             )
         else:
             raise RuntimeError(
@@ -294,8 +309,13 @@ class LinuxPlatform(Platform):
             )
 
     def launch_vscode(self, opts: VSCodeLaunchOpts) -> None:
+        # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+        from magent.env import spawn_child_env
+
         args = [opts.command]
         if opts.ssh_host:
             args.extend(["--remote", f"ssh-remote+{opts.ssh_host}"])
         args.append(opts.dir)
-        subprocess.Popen(args)
+        # An IDE window is an agent host too -- its integrated terminal is where
+        # a user runs `claude`, and it inherits the editor's environment.
+        subprocess.Popen(args, env=spawn_child_env())
