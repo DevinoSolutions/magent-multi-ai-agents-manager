@@ -5,6 +5,40 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.12.1] - 2026-08-18
+
+### Fixed
+
+- **A flaky connection no longer closes attach panes -- they redial until
+  the host answers.** The reconnect supervisor trusted the ssh exit code to
+  tell a deliberate detach (exit 0, stop) from a connection failure (255,
+  reconnect). But a Windows host never propagates a remote command's exit
+  status over a pty: a session that *died* also handed the pane a clean 0,
+  so during a wifi flap every pane closed announcing a detach the user never
+  made. On any exit other than 255 the supervisor now asks the host over a
+  separate non-pty connection -- where exit codes are truthful on every
+  OS -- whether the session still exists: alive means a real detach (the
+  pane stops as before); gone or unanswerable means the pane keeps
+  redialling, bounded so a session that is genuinely never coming back
+  stops with the cause named after five looks. Only a positive "the session
+  is alive" answer can ever close a pane. The probe asks psmux, not magent,
+  so it works against older hosts; the attach command itself is
+  byte-identical, so corpse detection and `--no-reconnect` behave exactly
+  as before.
+
+- **Session creation now breaks out of the launching process's job.** psmux
+  servers were started with a plain spawn, inheriting whatever Windows Job
+  Object the launcher sat in -- so a session's lifetime could in principle
+  be coupled to the process tree that created it (an ssh connection, a
+  terminal about to close). Servers are now spawned through the same
+  breakaway path the upload server already used. Hardening: CI could not
+  reproduce a session dying with its connection even without this change,
+  so it closes a documented gap rather than a demonstrated one.
+
+- **`magent down --all` now says what it does.** Its help and the README
+  state plainly that it stops every psmux session *and the agent running
+  inside each* -- not just the background daemons.
+
 ## [3.12.0] - 2026-08-16
 
 ### Added
@@ -817,6 +851,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.12.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.0...v3.12.1
 [3.12.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.11.1...v3.12.0
 [3.11.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.11.0...v3.11.1
 [3.11.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.10...v3.11.0
