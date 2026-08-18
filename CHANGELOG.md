@@ -5,6 +5,31 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.12.3] - 2026-08-18
+
+### Fixed
+
+- **An outage is a status line, not a log.** During a connection drop, an
+  attach pane used to print a fresh multi-line block for every redial
+  attempt -- plus ssh's own raw noise (`Connection timed out`,
+  `client_loop: send disconnect`) -- so a long wifi flap scrolled the pane
+  full of junk that then wrapped into overlapping garbage. The reconnect
+  supervisor now renders the whole outage as **one line updated in
+  place**: target, attempt count, a live retry countdown, ssh's last
+  complaint condensed, and the Ctrl+C hint -- clipped to the pane width so
+  it can never wrap (narrow panes drop the hint first, then the target,
+  never the countdown). ssh's stderr is captured off-screen during redial;
+  host-key-changed warnings still pass straight through, and if the pane
+  gives up, ssh's last lines are printed so the cause is never hidden.
+  When the link heals, the status line is erased and the session takes
+  back over cleanly, with a one-line "reconnected after N attempts"
+  record kept in scrollback. Panes with redirected output keep plain
+  one-line-per-attempt logging. Auth prompts are unaffected -- ssh asks
+  for passwords via the terminal directly, not stderr. The reconnect
+  decision logic (redial on 255, out-of-band session probe, bounded
+  give-up) is byte-for-byte unchanged; this runs on the *attaching*
+  machine, so the client side must upgrade to see it.
+
 ## [3.12.2] - 2026-08-18
 
 ### Fixed
@@ -883,6 +908,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.12.3]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.2...v3.12.3
 [3.12.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.1...v3.12.2
 [3.12.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.0...v3.12.1
 [3.12.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.11.1...v3.12.0
