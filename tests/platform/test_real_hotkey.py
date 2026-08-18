@@ -644,7 +644,6 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
         dib, expected_bmp = _make_dib()
         _set_clipboard_dib(dib)
         flashes_before = len(_served_flashes(home, name))
-        chord_at = time.time()
 
         # 6. The chord, with focus re-asserted per attempt (hosted-runner
         #    foreground quirks are expected; the assertion stays strict --
@@ -657,12 +656,14 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
             return new[-1] if new else None
 
         attempts_log: list[str] = []
+        chord_times: list[float] = []
         for attempt in range(6):
             focused = _force_foreground(plat, hwnd, title)
             attempts_log.append(
                 f"attempt {attempt}: focused={focused} "
                 f"foreground={_foreground_title()!r}"
             )
+            chord_times.append(time.time())
             _send_alt_v()
             if _wait_until(_uploaded, timeout=10, interval=0.5):
                 break
@@ -712,8 +713,15 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
             f"flashes={_served_flashes(home, name)[flashes_before:]}\n"
             f"upload log:\n{_read_log(home, 'upload')}"
         )
+        # The tail, not the whole slice: a hosted runner can swallow a chord
+        # and the loop above re-sends, so a retried press may have narrated
+        # more than once. What must hold is that a press's three phases arrive
+        # in order and end in the outcome.
         phases = _served_flashes(home, name)[flashes_before:]
-        assert phases == [
+        assert phases[:1] == ["Alt+V: capturing..."], (
+            f"the first thing said was not the acknowledgement: {phases}"
+        )
+        assert phases[-3:] == [
             "Alt+V: capturing...",
             "Alt+V: uploading...",
             "Alt+V: image sent",
@@ -736,9 +744,13 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
         )
         ack_at = _log_stamp(ack_line)
         if ack_at is not None:
-            assert ack_at - chord_at < 5.0, (
-                f"the press acknowledgement took {ack_at - chord_at:.1f}s to "
-                f"reach the status line ({ack_line})"
+            # Measured against the chord that produced it, not the first chord
+            # attempted -- a swallowed chord and a re-send must not read as
+            # slowness in the thing being measured.
+            waits = [ack_at - c for c in chord_times if c <= ack_at]
+            assert waits and min(waits) < 5.0, (
+                f"the press acknowledgement took {min(waits, default=-1):.1f}s "
+                f"to reach the status line ({ack_line}); chords={chord_times}"
             )
     finally:
         if hotkey_proc is not None:
