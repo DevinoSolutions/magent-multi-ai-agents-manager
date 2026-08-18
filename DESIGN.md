@@ -77,6 +77,13 @@ None of these imports any other `magent` module (`style.py` imports
   config-path leaf lived inside `cli`, `upload_server` would depend back on
   the very package that transitively pulls it in) — this is the structural
   fix for what used to be a latent `cli`↔`upload_server` load cycle (LS-A-001).
+- **`altv.py`** — one Alt+V press, from chord to outcome: the phase
+  narration, the upload, the closed outcome vocabulary and the single FIFO
+  flash pump. Imports `log` and `sessions` only. It is deliberately NOT part
+  of `hotkey.py`: that module raises `ImportError` off win32, and everything
+  here is plain sockets and strings, so keeping it separate is what makes the
+  press pipeline importable — and testable against a real `magent serve` — on
+  Linux and macOS.
 - **`style.py`** — `style = click.style`, a one-line shared shortcut. It used
   to be independently defined twice (once in the old monolithic `cli.py`,
   once in `launch.py`); both call sites now import `style` from here
@@ -906,6 +913,82 @@ sweep, and `cli/attach.py::_REMOTE_DOWN_TIMEOUT_S` went 60s → 300s. That last
 one was itself a tail-truncation mechanism: 46 sockets could outrun a 60s SSH
 budget, ssh was killed mid-shutdown, and what survived was exactly the part of
 the config the sweep had not reached — a config-order tail.
+
+### A press narrates itself, and nothing on that path may block it (2026-08-18)
+
+Reported as two complaints about one feature: "Alt+V is working but the status
+isn't showing", and "the status always shows up pretty late". Both were real,
+and neither had the cause the architecture suggested.
+
+**Why nothing showed.** `psmux.flash_message` bounded its `display-message`
+subprocess at 3 seconds — and `subprocess.run(timeout=...)` does not merely
+stop waiting, it KILLS the child. On an idle socket that command costs 60-130
+ms (measured against this machine's live sessions), but under real load — 46
+live sessions, a discovery fan-out, a spawn storm, all competing for Cygwin
+process creation — it routinely ran past 3 s. The production log is unambiguous:
+every flash in one Alt+V burst reads `status-line flash failed for
+project=<p>: Command '[...display-message...]' timed out after 3 seconds`. The
+product was throwing its own feedback away, on purpose, exactly when the
+machine was busy enough for the user to want it. The bound is now 20 s
+(`psmux.FLASH_TIMEOUT_S`): the wait happens on an HTTP handler thread, never on
+a press, and waiting is what keeps a project's messages in order.
+
+**Why it was late.** The earliest feedback a press could produce was the
+server's "uploading" flash — which fired only after the clipboard read, the
+BMP wrap, the whole multipart POST, and (on a cold 10 s cache) a full
+`discover_sessions` fan-out inline in the request handler: 438-861 ms on this
+machine's 46 sessions when idle. And success flashed nothing at all from the
+listener, by an earlier deliberate decision ("the server drives the progress
+line on the happy path") that left a working Alt+V indistinguishable from a
+dead listener.
+
+**The shape of the fix.** The press pipeline moved out of `hotkey.py` into
+`altv.py`, and narrates itself: `capturing...` is dispatched as the FIRST
+statement of `handle_press`, before the clipboard is touched; `uploading...`
+brackets the POST; the outcome — success included — replaces it. Measured end
+to end (real serve, real subprocess spawn, ~900 KB image): **65-176 ms from the
+press to the acknowledgement on the bar**, versus a first message that
+previously arrived after the whole upload if it arrived at all.
+
+Three constraints hold it together, each with a test that fails if it is
+undone:
+
+* **Async, so a press never waits on its own progress report.** A status-line
+  write has been measured in seconds; three synchronous phases would put that
+  on the critical path of the paste.
+* **ONE pump, so the phases stay in order.** Three fire-and-forget threads
+  would race, and an "image sent" that overtakes an "uploading..." leaves the
+  bar lying. The pump is FIFO, waits for each flash to land before sending the
+  next (`/api/flash` answers only once psmux has the message — that reply IS
+  the pacing signal), and cannot die: a pump that ends on one bad message
+  strands every message queued behind it.
+* **One bar, one narrator.** `upload_server` no longer flashes for uploads
+  carrying `?project=` (the listener's marker). Two writers on a one-line bar
+  can only race, and the loser would be the specific message — the server's
+  text is generic by construction, the listener's says *which* failure it was.
+  Mobile uploads, whose sender is looking at a phone, keep the server's flash.
+
+The outcome vocabulary grew to carry that specificity (`serve-unreachable` and
+`inject-failed` split out of what was one `upload-rejected`), and every member
+except the pass-through has a status-bar reason in `altv.OUTCOME_REASONS`; a
+test asserts no two outcomes share a sentence, because a collapsed vocabulary
+is precisely how "it failed" came back.
+
+Two things this also bought, both cheap: `/api/flash` logs every message it
+serves (`flash project=… msg=…`), so "the status isn't showing" is answerable
+from `upload.log` after the fact rather than only by reproducing it; and the
+phase messages carry their own linger time (`ms=`), because a phase that
+expires mid-upload leaves a blank bar that reads exactly like the silence the
+channel exists to end.
+
+**What was disproven along the way,** recorded so it is not re-suspected: psmux
+3.3.6 (a Cygwin tmux 3.3.6 build) repaints the status bar IMMEDIATELY on
+`display-message` — measured on a throwaway socket under a real ConPTY client
+at 60-100 ms from command issue, with a later message replacing a live one just
+as fast, and with no difference between the `-t` and target-less forms for the
+DISPLAY (non-`-p`) case. `set -g status-left` repaints immediately too. There
+is no `status-interval` tick to wait for and no `refresh-client` to add; the
+latency was never in the multiplexer.
 
 ## 3. Known debt
 

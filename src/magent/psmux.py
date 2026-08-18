@@ -527,6 +527,21 @@ def agent_idle(name: str, psmux: str | None = None) -> bool:
     return is_idle_command(pane_current_command(name, psmux=psmux))
 
 
+# How long one status-line flash may take before we give up on it.
+#
+# Measured, not guessed: on an idle socket a `display-message` costs 60-130 ms
+# and the attached client repaints within another ~80 ms. Under real load
+# (dozens of live sessions, a discovery fan-out and a spawn storm competing for
+# Cygwin process creation) the SAME command routinely ran past 3 s -- and the
+# old 3 s bound did not merely time the wait out, it KILLED the child, so the
+# message never reached the bar at all. Every "status-line flash failed ...
+# timed out after 3 seconds" line in upload.log is one press whose feedback the
+# product threw away on purpose. The wait is affordable: it happens on an HTTP
+# handler thread, never on the press itself, and it is what keeps a project's
+# phase messages in the order they were sent.
+FLASH_TIMEOUT_S = 20.0
+
+
 def flash_message(
     name: str,
     message: str,
@@ -537,8 +552,12 @@ def flash_message(
 ) -> None:
     """Flash a transient message in the session's psmux status line.
 
-    Non-disruptive — ``display-message`` repaints the status bar, not the
-    agent pane. Never raises and never blocks for long.
+    Non-disruptive — ``display-message`` repaints the status bar (immediately:
+    it sets the client's message and marks the status line for redraw, it does
+    not wait for the `status-interval` tick), not the agent pane. Never raises.
+
+    Returns only when the message has actually been handed to psmux, so callers
+    that flash a SEQUENCE get it on screen in order.
     """
     binary = psmux or find_psmux()
     if not binary:
@@ -547,11 +566,15 @@ def flash_message(
     if style:
         cmd += ["set", "-g", "message-style", style, ";"]
     cmd += ["display-message", "-d", str(duration_ms), message]
+    started = time.monotonic()
     try:
-        subprocess.run(cmd, capture_output=True, timeout=3, check=False)
+        subprocess.run(cmd, capture_output=True, timeout=FLASH_TIMEOUT_S, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         get_logger("upload").warning(
-            "status-line flash failed for project=%s: %s", name, exc
+            "status-line flash failed for project=%s after %.1fs: %s",
+            name,
+            time.monotonic() - started,
+            exc,
         )
 
 

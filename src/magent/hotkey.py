@@ -27,10 +27,15 @@ import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.error import URLError
-from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import urlopen
 
+from magent.altv import (
+    ALTV_LOG_PREFIX,
+    OUTCOME_REASONS,
+    flash_async,
+    handle_press,
+)
+from magent.altv import report as _altv_report
 from magent.log import (
     HEARTBEAT_INTERVAL,
     clear_heartbeat,
@@ -40,7 +45,6 @@ from magent.log import (
 from magent.procs import pid_alive
 from magent.sessions import (
     build_code_open_command,
-    build_flash_url,
     folder_for_session,
 )
 from magent.titles import parse_title
@@ -286,51 +290,6 @@ def project_from_title(title: str) -> str | None:
     return parsed[0] if parsed is not None else None
 
 
-def upload_image(server_url: str, project: str, image_data: bytes) -> bool:
-    boundary = "----MagentUpload"
-    delim = f"--{boundary}"
-    body = (
-        (
-            f"{delim}\r\n"
-            f'Content-Disposition: form-data; name="project"\r\n'
-            f"\r\n"
-            f"{project}\r\n"
-            f"{delim}\r\n"
-            f'Content-Disposition: form-data; name="inject"\r\n'
-            f"\r\n"
-            f"1\r\n"
-            f"{delim}\r\n"
-            f'Content-Disposition: form-data; name="file"; filename="clipboard.bmp"\r\n'
-            f"Content-Type: image/bmp\r\n"
-            f"\r\n"
-        ).encode()
-        + image_data
-        + f"\r\n{delim}--\r\n".encode()
-    )
-
-    # ?project= lets the server flash "uploading" in the magent:<project> status line
-    # the moment the request lands -- before it reads the image bytes -- so the
-    # feedback shows in the same window you pasted into.
-    req = Request(
-        f"{server_url}/upload?project={quote(project)}",
-        data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        method="POST",
-    )
-    try:
-        with urlopen(req, timeout=20) as resp:
-            result = json.loads(resp.read())
-            return bool(result.get("ok", False)) if isinstance(result, dict) else False
-    except (URLError, OSError, json.JSONDecodeError) as exc:
-        # Log the specific cause (server down vs. 20s timeout vs. malformed
-        # response) -- the caller only sees the bare False, so without this the
-        # reason a paste failed is unrecoverable from the logs (P2-07).
-        get_logger("hotkey").warning(
-            "upload transport error (%s): %s", type(exc).__name__, exc
-        )
-        return False
-
-
 # --- Background-listener lifecycle -------------------------------------------
 # attach starts the Alt+V listener hidden in the background (no terminal of its
 # own), because its progress now shows in the magent: windows. A pid file lets
@@ -455,99 +414,16 @@ def _clear_manifest() -> None:
         _MANIFEST_PATH.unlink()
 
 
-# Every Alt+V press ends in exactly one line carrying this prefix, so the whole
-# history of the chord is one grep:
-#
-#     grep ALTV ~/.magent/logs/hotkey.log
-#
-# The listener runs hidden with no terminal of its own, so without a record like
-# this a press that goes nowhere is indistinguishable from a press that was
-# never delivered -- which is precisely the "we don't know when it doesn't work"
-# problem. Outcomes are a closed vocabulary (ALTV_OUTCOMES) so the log stays
-# greppable per-outcome, not just per-prefix.
-ALTV_LOG_PREFIX = "ALTV"
-
-ALTV_OUTCOMES = (
-    "ok",  # image uploaded and injected
-    "not-a-magent-window",  # pass-through: the chord was not ours to handle
-    "no-image",  # magent window focused, but the clipboard holds no image
-    "clipboard-unreadable",  # CF_DIB said yes, the read came back empty
-    "upload-rejected",  # the server answered, and said no
-    "error",  # anything unforeseen, with a traceback in the log
-)
-
-
-def _altv_report(
-    server_url: str, project: str, outcome: str, message: str | None = None
-) -> None:
-    """Record one Alt+V outcome, and show the failing ones to the user.
-
-    ``message`` (a failure) goes to the magent:<project> status line through the
-    same flash channel F2 already uses -- no new notification subsystem, and no
-    dependence on the listener having a console. The log line is written either
-    way and is the durable record; the flash is best-effort by construction
-    (``_flash_status`` swallows everything) because feedback must never be able
-    to break the action it reports on.
-    """
-    log = get_logger("hotkey")
-    if message is None:
-        log.info("%s outcome=%s project=%s", ALTV_LOG_PREFIX, outcome, project)
-        return
-    log.warning(
-        "%s outcome=%s project=%s: %s", ALTV_LOG_PREFIX, outcome, project, message
-    )
-    _flash_status(server_url, project, f"Alt+V: {message}")
-
-
 def _do_upload(server_url: str, project: str) -> None:
-    """Run upload in a thread so the hook callback returns quickly.
+    """Run one press off the hook callback, on a thread.
 
-    Progress on the happy path shows in the magent:<project> window's own status
-    line, driven by the upload server (see upload_server._flash). Every FAILURE
-    path reports itself through ``_altv_report``: a press that silently does
-    nothing is the worst outcome available here, because the user cannot tell it
-    from a listener that is not running at all.
+    The whole pipeline -- press acknowledgement, capture, upload, outcome -- is
+    ``altv.handle_press``; this module supplies only the win32 half (reading a
+    CF_DIB off the clipboard). Keeping the pipeline out of here is what lets a
+    real-serve e2e drive a press on Linux and macOS, where this module cannot
+    even be imported.
     """
-    try:
-        image_data = get_clipboard_image()
-        if not image_data:
-            # clipboard_has_image() said yes at the hook, so this is a real
-            # read failure (a format we cannot decode, or a race with another
-            # app taking the clipboard), not an empty clipboard.
-            _altv_report(
-                server_url, project, "clipboard-unreadable", "could not read the image"
-            )
-            return
-        if upload_image(server_url, project, image_data):
-            _altv_report(server_url, project, "ok")
-        else:
-            _altv_report(
-                server_url,
-                project,
-                "upload-rejected",
-                "upload failed - is `magent serve` running?",
-            )
-    except Exception:  # noqa: BLE001  # reason: this runs on a detached background thread with no console; anything that escapes here would vanish, so everything is logged and shown instead
-        get_logger("hotkey").exception(
-            "%s outcome=error project=%s", ALTV_LOG_PREFIX, project
-        )
-        _flash_status(server_url, project, "Alt+V: upload error - see hotkey.log")
-
-
-def _flash_status(server_url: str, project: str, message: str) -> None:
-    """Best-effort: show ``message`` in the magent:<project> status line.
-
-    The listener runs hidden with no terminal, so without this every F2 outcome
-    is invisible on screen -- the user sees a key that does nothing while the
-    real reason sits in hotkey.log. The whole call is swallowed on purpose:
-    feedback must never be able to break the action it reports on, and the log
-    line beside each call site stays the durable record.
-    """
-    with (
-        contextlib.suppress(Exception),
-        urlopen(build_flash_url(server_url, project, message), timeout=2),
-    ):
-        pass
+    handle_press(server_url, project, get_clipboard_image)
 
 
 def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
@@ -561,18 +437,18 @@ def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
     """
     log = get_logger("hotkey")
     try:
-        _flash_status(server_url, project, "F2: opening VS Code...")
+        flash_async(server_url, project, "F2: opening VS Code...")
         code_bin = shutil.which("code")
         if not code_bin:
             log.warning("F2: 'code' is not on PATH; cannot open project=%s", project)
-            _flash_status(server_url, project, "F2: 'code' not found on PATH")
+            flash_async(server_url, project, "F2: 'code' not found on PATH")
             return
         with urlopen(f"{server_url}/api/sessions", timeout=10) as resp:
             payload = json.loads(resp.read())
         folder = folder_for_session(payload, project)
         if not folder:
             log.warning("F2: no folder for project=%s in /api/sessions", project)
-            _flash_status(
+            flash_async(
                 server_url,
                 project,
                 f"F2: no folder known for {project} (host magent too old?)",
@@ -595,10 +471,10 @@ def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
         log.info(
             "F2: opened project=%s folder=%s ssh_host=%s", project, folder, ssh_host
         )
-        _flash_status(server_url, project, f"F2: VS Code -> {folder}")
+        flash_async(server_url, project, f"F2: VS Code -> {folder}")
     except Exception:
         log.exception("F2: open project=%s failed", project)
-        _flash_status(server_url, project, "F2: failed - see hotkey.log")
+        flash_async(server_url, project, "F2: failed - see hotkey.log")
 
 
 # --- Focus-driven geometry reclaim -------------------------------------------
@@ -796,7 +672,7 @@ def _hook_decide(
                     server_url,
                     project,
                     "no-image",
-                    "clipboard has no image - copy one first",
+                    OUTCOME_REASONS["no-image"],
                 ),
                 daemon=True,
             ).start()

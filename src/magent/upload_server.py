@@ -93,10 +93,11 @@ _DRAIN_CAP_BYTES = MAX_UPLOAD_BYTES
 _DRAIN_CHUNK_BYTES = 64 * 1024
 _DRAIN_TIMEOUT_S = 0.5
 
-# In-session upload feedback: a paste's progress shows in the SAME magent:<project>
-# window it landed in, via the psmux (tmux) status line -- never drawn into the
-# agent pane. tmux 3.3 renders these UTF-8 glyphs intact.
-_FB_UP = "↑"  # up arrow   -- uploading
+# In-session upload feedback for the MOBILE page: a paste's progress shows in
+# the SAME magent:<project> window it landed in, via the psmux (tmux) status
+# line -- never drawn into the agent pane. tmux 3.3 renders these UTF-8 glyphs
+# intact. An Alt+V paste narrates itself instead (see altv.handle_press and the
+# `flagged` note in _handle_post): one bar, one voice.
 _FB_OK = "✓"  # check mark -- uploaded
 _FB_NO = "✗"  # ballot x   -- failed
 
@@ -109,23 +110,22 @@ _FB_NO = "✗"  # ballot x   -- failed
 _MSG_GREEN = "bg=green,fg=black,bold"
 _MSG_RED = "bg=red,fg=white,bold"
 
-# How long each status-line flash lingers (ms). "uploading" is given a generous
-# ceiling so it stays put until the result overwrites it; if something stalls
-# without raising, it still clears on its own.
-_FLASH_UP_MS = 20000
+# How long each status-line flash lingers (ms).
 _FLASH_OK_MS = 2500
 _FLASH_NO_MS = 3000
 
-# /api/flash: how long a caller-supplied message lingers. Long enough to read a
-# whole sentence, short enough that a stale one clears itself. The Alt+V/F2
-# listener is the only caller today -- it runs hidden with no terminal of its
-# own, so this endpoint is its ONLY way to say anything on screen.
+# /api/flash: how long a caller-supplied message lingers by default. Long enough
+# to read a whole sentence, short enough that a stale one clears itself. The
+# Alt+V/F2 listener is the only caller today -- it runs hidden with no terminal
+# of its own, so this endpoint is its ONLY way to say anything on screen.
 _FLASH_MSG_MS = 4000
 
-# Per-project count of pastes currently in flight, so several at once read as
-# "uploading (2)" / "uploaded (1 more)" instead of stomping each other.
-_inflight: dict[str, int] = {}
-_inflight_lock = threading.Lock()
+# ...and the bounds on what a caller may ask for instead. A PHASE message
+# ("uploading...") must outlive the operation it describes or the bar goes
+# blank mid-press; the ceiling keeps a bad or hostile value from parking a
+# message on the bar for the rest of the day.
+_FLASH_MSG_MS_MIN = 500
+_FLASH_MSG_MS_MAX = 60000
 
 # Guards UploadHandler.cached_sessions / sessions_ts: UploadHandler is
 # instantiated per-request by ThreadingHTTPServer, so refresh must be
@@ -133,21 +133,15 @@ _inflight_lock = threading.Lock()
 _sessions_lock = threading.Lock()
 
 
-def _inflight_inc(project: str) -> int:
-    with _inflight_lock:
-        n = _inflight.get(project, 0) + 1
-        _inflight[project] = n
-        return n
-
-
-def _inflight_dec(project: str) -> int:
-    with _inflight_lock:
-        n = max(0, _inflight.get(project, 1) - 1)
-        if n:
-            _inflight[project] = n
-        else:
-            _inflight.pop(project, None)
-        return n
+def _flash_duration(raw: str) -> int:
+    """Clamp a caller-supplied ``ms=`` to the allowed window. Anything absent or
+    unparseable takes the default rather than failing the flash: a malformed
+    duration must never be the reason a message does not reach the screen."""
+    try:
+        wanted = int(raw)
+    except (TypeError, ValueError):
+        return _FLASH_MSG_MS
+    return max(_FLASH_MSG_MS_MIN, min(_FLASH_MSG_MS_MAX, wanted))
 
 
 def _flash(
@@ -820,7 +814,23 @@ class UploadHandler(BaseHTTPRequestHandler):
                     {"ok": False, "error": "project and msg are required"}, 400
                 )
             else:
-                _flash(None, flash_project, message[:FLASH_MSG_MAX], _FLASH_MSG_MS)
+                clamped = message[:FLASH_MSG_MAX]
+                # One INFO line per served flash. The caller is a hidden
+                # process narrating into a status bar that keeps no history, so
+                # without this "the status isn't showing" is unanswerable after
+                # the fact: this says which phase messages arrived, and when.
+                get_logger("upload").info(
+                    "flash project=%s msg=%r", flash_project, clamped
+                )
+                _flash(
+                    None,
+                    flash_project,
+                    clamped,
+                    _flash_duration(query.get("ms", [""])[0]),
+                )
+                # Answered only once psmux has the message, which is what paces
+                # a caller flashing a SEQUENCE: it waits for each reply before
+                # sending the next, so the phases cannot arrive out of order.
                 self._json_response({"ok": True})
         elif path == "/install.mobileconfig":
             # Built per-request: the Web Clip URL must match the host:port the
@@ -904,22 +914,15 @@ class UploadHandler(BaseHTTPRequestHandler):
         # psmux socket id (P3-01), so we validate against `session` ids.
         valid_sessions = {_sid(s) for s in self._sessions()}
 
-        # The Alt+V listener passes ?project= so we can flash "uploading" the
-        # instant the request lands -- before the image bytes are even read off
-        # the socket -- right in that project's magent: window. (The mobile web UI
-        # doesn't, so it skips straight to the result flash below.)
+        # ?project= marks an upload that already HAS a narrator: the Alt+V
+        # listener flashed "Alt+V: capturing..." before it touched the clipboard
+        # and will flash the specific outcome the moment this reply lands. The
+        # status line is one line, so a second voice on it can only race the
+        # first -- and the loser is whichever message the user needed. The
+        # server therefore stays silent for flagged uploads and speaks only for
+        # the mobile page, whose sender is looking at a phone, not at the bar.
         flagged = parse_qs(parsed.query).get("project", [""])[0]
         flagged = flagged if flagged in valid_sessions else ""
-        if flagged:
-            n = _inflight_inc(flagged)
-            tail = f" ({n})" if n > 1 else ""
-            _flash(
-                None,
-                flagged,
-                f"magent  {_FB_UP} uploading image{tail}",
-                _FLASH_UP_MS,
-                style=_MSG_GREEN,
-            )
 
         ok = False
         project = flagged
@@ -994,17 +997,16 @@ class UploadHandler(BaseHTTPRequestHandler):
                 injected,
                 suffix,
             )
-            # Confirm in the same magent: status line -- for both the listener (paired
-            # with the early "uploading" flash) and mobile uploads.
-            remaining = _inflight_dec(flagged) if flagged else 0
+            # Confirm in the same magent: status line -- for MOBILE uploads only.
+            # A flagged (Alt+V) upload reports its own, more specific outcome;
+            # see the `flagged` note above.
             done = project if project in valid_sessions else flagged
-            if done:
-                more = f"  ({remaining} more)" if remaining else ""
+            if done and not flagged:
                 if ok:
                     _flash(
                         None,
                         done,
-                        f"magent  {_FB_OK} image uploaded{more}",
+                        f"magent  {_FB_OK} image uploaded",
                         _FLASH_OK_MS,
                         style=_MSG_GREEN,
                     )
@@ -1012,7 +1014,7 @@ class UploadHandler(BaseHTTPRequestHandler):
                     _flash(
                         None,
                         done,
-                        f"magent  {_FB_NO} upload failed{more}",
+                        f"magent  {_FB_NO} upload failed",
                         _FLASH_NO_MS,
                         style=_MSG_RED,
                     )

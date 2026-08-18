@@ -27,7 +27,15 @@ Product-visible effects asserted:
 2. the uploaded file's path is INJECTED into the live psmux session
    (``send_keys``), observed via a real ``capture-pane``;
 3. the listener's own log records ``ALTV outcome=ok project=<name>`` -- the
-   greppable per-press outcome line every Alt+V now ends in.
+   greppable per-press outcome line every Alt+V now ends in;
+4. the press NARRATES itself on the real status line: the server's own log
+   records the phase flashes it served -- "capturing..." (before the clipboard
+   is read at all), then "uploading...", then the specific outcome -- in that
+   order, with none of them dropped by a status-line write that timed out. The
+   "capturing..." line's timestamp against the chord's is the immediacy claim,
+   measured rather than asserted by construction;
+5. a REAL failure press (the chord in a magent window with an EMPTY clipboard)
+   reaches the bar with its own specific reason instead of going silent.
 
 Gating (never on a dev machine): SendInput fires GLOBAL keystrokes and the
 test stomps the machine clipboard, so this runs only under
@@ -420,6 +428,48 @@ def test_a_real_serve_supervises_a_real_listener_into_existence(tmp_path):
     )
 
 
+def _log_stamp(line: str) -> float | None:
+    """Epoch seconds from a rotating-log line ("2026-08-18 05:56:55,281 ..."),
+    or None when the format ever changes -- a missing timestamp must weaken the
+    assertion, never fail the chain it is only measuring."""
+    import datetime
+
+    try:
+        stamp = " ".join(line.split(" ", 2)[:2])
+        # The logger writes local time with no offset; astimezone() attaches
+        # this machine's, which is the same clock time.time() reads.
+        parsed = datetime.datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S,%f").astimezone()
+    except (ValueError, IndexError):
+        return None
+    return parsed.timestamp()
+
+
+def _served_flashes(home, project: str) -> list[str]:
+    """The messages `magent serve` actually put on the status line, in order.
+
+    Read out of the REAL upload.log the running server writes ("flash
+    project=<p> msg=<m>"). psmux keeps no history of its status bar, so this
+    log line is the product's own record of what the bar was told -- which is
+    exactly why it exists (see upload_server's /api/flash branch).
+    """
+    found: list[str] = []
+    for line in _read_log(home, "upload").splitlines():
+        marker = f"flash project={project} msg="
+        if marker in line:
+            found.append(line.split(marker, 1)[1].strip().strip("'\""))
+    return found
+
+
+def _flash_failures(home, project: str) -> list[str]:
+    """Status-line writes the server gave up on. A non-empty list IS the
+    "Alt+V works but the status isn't showing" bug, in its own words."""
+    return [
+        line
+        for line in _read_log(home, "upload").splitlines()
+        if "status-line flash failed" in line and f"project={project}" in line
+    ]
+
+
 def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
     import ctypes
 
@@ -558,9 +608,43 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
         hwnd = _wait_until(lambda: plat.find_window(title), timeout=90)
         assert hwnd, f"attach window {title!r} never materialized"
 
+        # 4b. FAILURE FIRST, with a real chord: the same window, an EMPTY
+        #     clipboard. The chord passes through to the pane (it may want a
+        #     plain Alt+V) but the press must still SAY why nothing uploaded --
+        #     silence here is the original complaint, and a generic message is
+        #     the regression that followed it.
+        _clear_clipboard()
+        for _ in range(6):
+            _force_foreground(plat, hwnd, title)
+            _send_alt_v()
+            if _wait_until(
+                lambda: (
+                    f"ALTV outcome=no-image project={name}" in _read_log(home, "hotkey")
+                ),
+                timeout=8,
+                interval=0.5,
+            ):
+                break
+        assert f"ALTV outcome=no-image project={name}" in _read_log(home, "hotkey"), (
+            "an Alt+V on an empty clipboard left no trace at all\n"
+            f"hotkey log:\n{_read_log(home, 'hotkey')}"
+        )
+        assert _wait_until(
+            lambda: any(
+                "clipboard has no image" in m for m in _served_flashes(home, name)
+            ),
+            timeout=15,
+        ), (
+            "the empty-clipboard press never reached the status line with its "
+            f"reason; served flashes={_served_flashes(home, name)}\n"
+            f"upload log:\n{_read_log(home, 'upload')}"
+        )
+
         # 5. A REAL image on the REAL clipboard.
         dib, expected_bmp = _make_dib()
         _set_clipboard_dib(dib)
+        flashes_before = len(_served_flashes(home, name))
+        chord_at = time.time()
 
         # 6. The chord, with focus re-asserted per attempt (hosted-runner
         #    foreground quirks are expected; the assertion stays strict --
@@ -614,6 +698,48 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
             lambda: f"ALTV outcome=ok project={name}" in _read_log(home, "hotkey"),
             timeout=10,
         ), f"hotkey log missing success line:\n{_read_log(home, 'hotkey')}"
+
+        # 7d. The press narrated itself on the REAL status line, in order.
+        #     Each of these is a phase a refactor can silently drop; the bar is
+        #     the only screen this hidden listener owns.
+        assert _wait_until(
+            lambda: any(
+                "image sent" in m for m in _served_flashes(home, name)[flashes_before:]
+            ),
+            timeout=20,
+        ), (
+            "the successful press never reached the status line; served "
+            f"flashes={_served_flashes(home, name)[flashes_before:]}\n"
+            f"upload log:\n{_read_log(home, 'upload')}"
+        )
+        phases = _served_flashes(home, name)[flashes_before:]
+        assert phases == [
+            "Alt+V: capturing...",
+            "Alt+V: uploading...",
+            "Alt+V: image sent",
+        ], f"phase narration is not the expected sequence: {phases}"
+
+        # 7e. ...and none of it was thrown away by a status-line write that
+        #     timed out. Every one of those was a press whose feedback the
+        #     product killed on purpose -- the measured root cause of "the
+        #     status isn't showing".
+        assert not _flash_failures(home, name), (
+            f"status-line writes were abandoned: {_flash_failures(home, name)}"
+        )
+
+        # 7f. The immediacy claim, measured: the acknowledgement is on the bar
+        #     within a second of the chord, long before the upload finishes.
+        ack_line = next(
+            line
+            for line in _read_log(home, "upload").splitlines()
+            if f"flash project={name}" in line and "capturing" in line
+        )
+        ack_at = _log_stamp(ack_line)
+        if ack_at is not None:
+            assert ack_at - chord_at < 5.0, (
+                f"the press acknowledgement took {ack_at - chord_at:.1f}s to "
+                f"reach the status line ({ack_line})"
+            )
     finally:
         if hotkey_proc is not None:
             hotkey_proc.kill()

@@ -202,15 +202,23 @@ def build_code_open_command(
 FLASH_MSG_MAX = 120
 
 
-def build_flash_url(server_url: str, project: str, message: str) -> str:
+def build_flash_url(
+    server_url: str, project: str, message: str, duration_ms: int | None = None
+) -> str:
     """URL that flashes ``message`` in the ``magent:<project>`` status line.
 
-    The F2 handler's only channel for on-screen feedback: hotkey.py runs in a
-    hidden background process with no terminal, so a failure it cannot report
-    through the upload server is invisible to the user. Pure string math, so
-    the shape stays testable on every OS (hotkey.py is win32-import-only).
+    The Alt+V/F2 handler's only channel for on-screen feedback: hotkey.py runs
+    in a hidden background process with no terminal, so a failure it cannot
+    report through the upload server is invisible to the user. Pure string math,
+    so the shape stays testable on every OS (hotkey.py is win32-import-only).
+
+    ``duration_ms`` is for a message that is a PHASE rather than a result: an
+    "uploading..." that expires while the upload is still running leaves a blank
+    bar, which reads exactly like the silence this whole channel exists to end.
+    Omitted, the server picks its own default.
     """
-    return (
+    url = (
         f"{server_url.rstrip('/')}/api/flash"
         f"?project={quote(project)}&msg={quote(message[:FLASH_MSG_MAX])}"
     )
+    return f"{url}&ms={int(duration_ms)}" if duration_ms else url

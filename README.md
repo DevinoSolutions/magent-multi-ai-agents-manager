@@ -193,7 +193,8 @@ The upload server owns the Alt+V listener: while `magent serve` runs it makes su
 If it *isn't* working you will be told, rather than left guessing:
 
 - `magent status` prints `Alt+V listener   DEAD  (upload server is up but no listener — Alt+V does nothing)` in red and **exits 3**, with the repair command underneath. `magent doctor` fails the `hotkey` check with the same hint. A listener that is simply not expected yet (no server running) still reads as a quiet `off`.
-- Every Alt+V press is recorded in `~/.magent/logs/hotkey.log` as one `ALTV outcome=… project=…` line — so `grep ALTV ~/.magent/logs/hotkey.log` is the whole history of the chord — and any press that can't complete (no image on the clipboard, the server unreachable, the upload rejected) also says so in that project's status line instead of doing nothing.
+- Every press narrates itself in that project's status line, starting the instant the chord is detected: `Alt+V: capturing...` (before the clipboard is even read) → `Alt+V: uploading...` → `Alt+V: image sent`. A press that can't complete ends in a **specific** reason rather than a generic failure — `clipboard has no image - copy one first`, `cannot reach magent serve (connection refused)`, `serve said HTTP 400: Unknown project`, `saved, but psmux would not paste it`. The narration never delays the press: it is queued and delivered on its own thread, and a dead server costs a paste nothing.
+- Every press is also recorded in `~/.magent/logs/hotkey.log` as one `ALTV outcome=… project=…` line — so `grep ALTV ~/.magent/logs/hotkey.log` is the whole history of the chord — and `magent serve` logs each status-line message it served (`flash project=… msg=…` in `~/.magent/logs/upload.log`), so "the status didn't show" is answerable after the fact.
 
 To own the listener's lifetime yourself, set `MAGENT_HOTKEY_SUPERVISOR=0`; `status` still reports whether one is running.
 
