@@ -96,6 +96,9 @@ def _child_env(home) -> dict[str, str]:
     # contain a global hook, so tests that start a real server opt out
     # rather than install one on the machine running them.
     env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
+    # ...and `attention -d` now supervises `magent serve` the same way, so a
+    # test daemon would otherwise start a REAL upload server on this machine.
+    env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
     # Point XDG dirs into the sandbox home too, so a stray ~/.config write can't
     # escape into the real user's dotfiles.
     env["XDG_CONFIG_HOME"] = str(home / ".config")

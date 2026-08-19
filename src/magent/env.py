@@ -65,6 +65,25 @@ class MagentEnv(BaseSettings):
     # same posture as the opt-in `MDTEST_INTERACTION` tier). It doubles as the
     # escape hatch for a user who wants to own the listener's lifetime.
     hotkey_supervisor: bool = True
+    # Whether `magent attention -d` keeps `magent serve` alive (see
+    # launch.UploadServerSupervisor). On by default -- serve is the one
+    # long-lived process nothing watched, and it died silently twice in one day
+    # with the first symptom being an Alt+V press that did nothing.
+    #
+    # The opt-out exists for the same class of reason as hotkey_supervisor: an
+    # attention daemon that quietly starts a REAL upload server is not something
+    # a test (or a user who runs serve under their own supervisor -- nssm, a
+    # systemd unit, a terminal they watch) can be surprised by. Every test
+    # fixture that starts a real `attention -d` sets this to 0 unless the
+    # supervisor itself is what is under test.
+    upload_supervisor: bool = True
+    # Minimum seconds between two respawn ATTEMPTS by that supervisor
+    # (default: launch.UPLOAD_RESPAWN_COOLDOWN_S). The knob exists because the
+    # cooldown is the only thing standing between a serve that crashes on
+    # startup and a respawn loop, so its value has to be observable and
+    # settable -- the e2e tier drives a real revive twice and would otherwise
+    # have to sit out the production default to prove the second one.
+    upload_respawn_cooldown_s: float | None = None
 
     @model_validator(mode="after")
     def _no_unknown_magent_vars(self) -> MagentEnv:

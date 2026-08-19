@@ -26,6 +26,8 @@ from magent.style import style
 from magent.titles import get_leaf_name
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from magent import attention
     from magent.config import AttentionSettings, MagentConfig
     from magent.platform import Platform
@@ -172,6 +174,56 @@ def _plan_renderers(
                 "(see .env.example)"
             )
     return renderers, warnings
+
+
+def _upload_watchdog(
+    cfg: MagentConfig, config_path: str | None
+) -> Callable[[list[attention.SessionView]], None] | None:
+    """The per-tick hook that keeps ``magent serve`` alive, or None when this
+    daemon must not supervise one.
+
+    Two gates, and they answer different questions. ``settings.uploadServer`` is
+    the config's own "does this machine run an upload server" switch: a user who
+    turned it off is not second-guessed, and nothing is resurrected on a machine
+    that never had one. ``MAGENT_UPLOAD_SUPERVISOR`` is the runtime opt-out for
+    somebody who runs serve under their own supervisor -- and the reason every
+    test fixture that starts a real ``attention -d`` can be sure it will not
+    quietly spawn a real server on the runner.
+
+    Riding the poll tick rather than a second timer is deliberate: the daemon
+    already wakes on an interval, the probe is one refused loopback connect, and
+    the RESPAWN rate is bounded by the supervisor's cooldown rather than by how
+    often it looks (see ``launch.UploadServerSupervisor``).
+    """
+    from magent.launch import (  # heavy subsystem: in-body per policy
+        UploadServerSupervisor,
+        upload_supervision_enabled,
+    )
+    from magent.log import get_logger  # heavy subsystem: in-body per policy
+
+    log = get_logger("attention")
+    if not cfg.settings.upload_server:
+        log.info("upload supervisor: off (settings.uploadServer is false)")
+        return None
+    if not upload_supervision_enabled():
+        log.info("upload supervisor: disabled by MAGENT_UPLOAD_SUPERVISOR")
+        return None
+    supervisor = UploadServerSupervisor(cfg.settings.upload_port, config_path)
+    log.info(
+        "upload supervisor: watching port %d (respawn cooldown %.0fs)",
+        cfg.settings.upload_port,
+        supervisor.cooldown_s,
+    )
+
+    def _tick(_views: list[attention.SessionView]) -> None:
+        try:
+            supervisor.tick()
+        except Exception:
+            # Supervision must never be able to kill the daemon it rides on --
+            # the whole point is that something survives to look again.
+            log.exception("upload supervisor: check failed")
+
+    return _tick
 
 
 def _setup_from_config(
@@ -335,6 +387,7 @@ def attention_cmd(
             renderers,
             poll_interval=poll_s,
             max_ticks=ticks,
+            on_tick=_upload_watchdog(cfg, str(config_path) if config_path else None),
         )
     except KeyboardInterrupt:
         click.echo(f"\n  {style('Stopped.', dim=True)}")

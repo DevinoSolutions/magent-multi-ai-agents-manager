@@ -165,6 +165,66 @@ class TestUploadServerLiveness:
         assert "DEAD" in result.output
 
 
+class TestDeadUploadServerWithNoWatchdog:
+    """A red line the user cannot act on is half an answer. The attention
+    daemon is the upload server's supervisor, so a DEAD server with the daemon
+    off is a fault that nothing will repair on its own -- and the report says
+    so, once, next to the line it explains."""
+
+    def _dead_server(self, monkeypatch, *, attention: str):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._probe_port", lambda port: True)
+        monkeypatch.setattr("magent.cli.status._attention_state", lambda: attention)
+        # The suite-wide isolation fixture pins the supervisor OFF (so no unit
+        # test can spawn a real server); the hint is only offered when it WOULD
+        # supervise, so this tier asks for the shipped default back. `status`
+        # only reads the flag -- it never starts anything.
+        monkeypatch.setenv("MAGENT_UPLOAD_SUPERVISOR", "1")
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+    def test_the_repair_names_the_daemon(self, runner, tmp_config, monkeypatch):
+        self._dead_server(monkeypatch, attention="off")
+        cfgpath = tmp_config({"projects": [], "settings": {"uploadServer": True}})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+
+        assert status_mod.UPLOAD_WATCHDOG_HINT in result.output
+
+    def test_a_running_daemon_needs_no_hint(self, runner, tmp_config, monkeypatch):
+        # It is already watching; the next tick revives the server.
+        self._dead_server(monkeypatch, attention="on")
+        cfgpath = tmp_config({"projects": [], "settings": {"uploadServer": True}})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+
+        assert status_mod.UPLOAD_WATCHDOG_HINT not in result.output
+
+    def test_no_hint_when_the_config_has_no_upload_server(
+        self, runner, tmp_config, monkeypatch
+    ):
+        self._dead_server(monkeypatch, attention="off")
+        cfgpath = tmp_config({"projects": [], "settings": {"uploadServer": False}})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+
+        assert status_mod.UPLOAD_WATCHDOG_HINT not in result.output
+
+    def test_no_hint_when_the_user_owns_the_servers_lifetime(
+        self, runner, tmp_config, monkeypatch
+    ):
+        # Advice that would do nothing: with MAGENT_UPLOAD_SUPERVISOR=0 the
+        # daemon deliberately supervises nothing.
+        self._dead_server(monkeypatch, attention="off")
+        monkeypatch.setenv("MAGENT_UPLOAD_SUPERVISOR", "0")
+        monkeypatch.setattr("magent.env._cached_env", None)
+        cfgpath = tmp_config({"projects": [], "settings": {"uploadServer": True}})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+
+        assert status_mod.UPLOAD_WATCHDOG_HINT not in result.output
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="hotkey is Windows-only")
 class TestListenerStateMachine:
     """The listener's four states, driven directly.

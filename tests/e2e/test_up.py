@@ -25,6 +25,9 @@ def _run(cfg, *args, home=None):
     # listener into existence -- and that listener installs a SYSTEM-WIDE
     # keyboard hook, which no HOME redirect can contain.
     env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
+    # ...and `attention -d` now supervises `magent serve` the same way, so a
+    # test daemon would otherwise start a REAL upload server on this machine.
+    env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
     if home is not None:
         # Redirect the child's HOME so the claude session store it probes is a
         # fixture, never the developer's real ~/.claude.

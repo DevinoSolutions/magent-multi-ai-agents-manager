@@ -1313,6 +1313,116 @@ class TestLocalUrl:
 
         assert mod.local_url(["0.0.0.0"], 8034) == "http://127.0.0.1:8034"
 
+
+class TestCrashVisibility:
+    """serve died silently twice in one day and left NOTHING behind: no
+    traceback (a detached process has no console), no log line, only a pid file
+    whose process was gone. Every exit now names its reason, and a crash is
+    logged at exception level -- which is also what hands it to Sentry
+    (errors-only, logging integration at ERROR). Nothing is swallowed.
+    """
+
+    def _fake_server(self, fail: BaseException | None):
+        class _FakeServer:
+            def __init__(self, address, handler_cls):
+                self.server_address = address
+
+            def serve_forever(self):
+                if fail is not None:
+                    raise fail
+
+            def shutdown(self):
+                pass
+
+            def server_close(self):
+                pass
+
+        return _FakeServer
+
+    def _run(self, mod, monkeypatch, tmp_path, fail):
+        monkeypatch.setattr(mod.tailnet, "ip4", lambda: None)
+        monkeypatch.setattr(
+            mod, "_pid_path", lambda port: tmp_path / f"upload-{port}.pid"
+        )
+        monkeypatch.setattr(mod, "_NoFqdnHTTPServer", self._fake_server(fail))
+        # Never install a system-wide keyboard hook from a unit test.
+        monkeypatch.setattr(mod, "_supervise_hotkey", lambda url, stop, **kw: None)
+        mod.run_server(port=0)
+
+    def test_a_clean_stop_logs_one_line_naming_the_reason(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import magent.upload_server as mod
+
+        with (
+            caplog.at_level("INFO", logger="magent.upload"),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            self._run(mod, monkeypatch, tmp_path, KeyboardInterrupt())
+
+        assert "stopped: keyboard interrupt" in caplog.text
+        # A clean stop is not an error -- nothing for Sentry to capture.
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+    def test_a_crash_is_logged_at_exception_level_and_still_propagates(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import magent.upload_server as mod
+
+        boom = RuntimeError("accept loop exploded")
+        with (
+            caplog.at_level("INFO", logger="magent.upload"),
+            pytest.raises(RuntimeError),
+        ):
+            self._run(mod, monkeypatch, tmp_path, boom)
+
+        crashes = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert crashes, "a fatal serve exception must reach the log"
+        assert crashes[0].exc_info is not None  # log.exception, not log.error
+        assert "upload server crashed" in caplog.text
+        assert "stopped: crashed" in caplog.text
+
+    def test_no_bindable_address_is_an_error_line_not_just_a_traceback(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import magent.upload_server as mod
+
+        class _Unbindable:
+            def __init__(self, address, handler_cls):
+                raise OSError("address in use")
+
+        monkeypatch.setattr(mod.tailnet, "ip4", lambda: None)
+        monkeypatch.setattr(
+            mod, "_pid_path", lambda port: tmp_path / f"upload-{port}.pid"
+        )
+        monkeypatch.setattr(mod, "_NoFqdnHTTPServer", _Unbindable)
+
+        with (
+            caplog.at_level("ERROR", logger="magent.upload"),
+            pytest.raises(RuntimeError),
+        ):
+            mod.run_server(port=0)
+
+        assert "no bindable address" in caplog.text
+
+    def test_a_secondary_bind_crash_is_logged_and_never_re_raised(self, caplog):
+        """The Tailscale bind runs on its own daemon thread. Its death must not
+        take the loopback bind with it, but it must not be silent either."""
+        import logging
+
+        import magent.upload_server as mod
+
+        class _Dying:
+            server_address = ("100.64.1.2", 8034)
+
+            def serve_forever(self):
+                raise OSError("interface went away")
+
+        with caplog.at_level("ERROR", logger="magent.upload"):
+            mod._serve_bind(_Dying(), logging.getLogger("magent.upload"))
+
+        assert "stopped serving" in caplog.text
+
     def test_a_bind_that_excluded_loopback_uses_what_was_bound(self):
         # `serve --host <tailscale-ip>`: loopback is genuinely not listening,
         # so claiming it would hand the listener a dead URL.

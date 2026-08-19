@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, ClassVar
 from urllib.parse import parse_qs, urlparse
 
 if TYPE_CHECKING:
+    import logging
     from collections.abc import Callable
 
 from magent import psmux, tailnet
@@ -1312,6 +1313,22 @@ def _supervise_hotkey(
             return
 
 
+def _serve_bind(server: ThreadingHTTPServer, log: logging.Logger) -> None:
+    """``serve_forever`` for a SECONDARY bind, on its own daemon thread.
+
+    Only the primary bind's loop can propagate to the CLI shell; a crash in the
+    second one (the Tailscale address) would otherwise print a thread traceback
+    to a console the daemon does not have and take that address down in total
+    silence, with the loopback bind still answering /health. It is logged at
+    exception level -- loud in the logfile, and captured by Sentry -- and not
+    re-raised, because the server that is still serving must keep serving.
+    """
+    try:
+        server.serve_forever()
+    except Exception:
+        log.exception("upload server: bind %s stopped serving", server.server_address)
+
+
 def run_server(
     port: int = 8080, config_path: str | None = None, host: str | None = None
 ) -> None:
@@ -1327,7 +1344,14 @@ def run_server(
         except OSError as e:
             log.warning("upload server: cannot bind %s:%d (%s)", addr, port, e)
     if not servers:
-        raise RuntimeError(f"upload server: no bindable address on port {port}")
+        # The one startup failure that is fatal rather than degraded. ERROR
+        # level (not just the exception that follows) because a detached serve
+        # has no console for the traceback to reach, and because ERROR is what
+        # Sentry's logging integration captures -- see the crash-visibility
+        # note on the serve loop below.
+        detail = f"upload server: no bindable address on port {port}"
+        log.error("%s", detail)
+        raise RuntimeError(detail)
 
     UploadHandler.port = port
     UploadHandler.pid = os.getpid()
@@ -1341,7 +1365,7 @@ def run_server(
     pid_file.write_text(str(os.getpid()))
 
     for s in servers[1:]:
-        threading.Thread(target=s.serve_forever, daemon=True).start()
+        threading.Thread(target=_serve_bind, args=(s, log), daemon=True).start()
 
     # Alt+V is only as alive as its listener, and nothing else in the product
     # ever re-checks it. Daemon thread: it must not hold the process open, and
@@ -1353,8 +1377,24 @@ def run_server(
         daemon=True,
     ).start()
 
+    # Why this is not a bare `try/finally` any more: serve died silently twice
+    # in one day and left NOTHING behind -- no traceback (a detached process has
+    # no console), no log line, only a pid file whose process was gone. The
+    # `finally` logged the same "stopped" for a Ctrl+C and for a crash, so even
+    # the log could not tell an operator which had happened. Every exit now
+    # names its reason, and a crash is logged at exception level -- which is
+    # also what hands it to Sentry (errors-only, logging integration at ERROR).
+    # Nothing is swallowed: both handlers re-raise.
+    reason = "loop returned"
     try:
         servers[0].serve_forever()
+    except KeyboardInterrupt:
+        reason = "keyboard interrupt"
+        raise
+    except Exception:
+        reason = "crashed"
+        log.exception("upload server crashed on port %d", port)
+        raise
     finally:
         hotkey_stop.set()
         for s in servers[1:]:
@@ -1363,4 +1403,4 @@ def run_server(
             s.server_close()  # servers[0] exited via KeyboardInterrupt; just closes the socket
         with contextlib.suppress(OSError):
             pid_file.unlink()
-        log.info("stopped")
+        log.info("stopped: %s", reason)
