@@ -153,6 +153,9 @@ def _child_env() -> dict[str, str]:
     """
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
     env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
+    # ...and `attention -d` now supervises `magent serve` the same way, so a
+    # test daemon would otherwise start a REAL upload server on this machine.
+    env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
     return env
 
 

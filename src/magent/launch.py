@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 import sys
 import time
 from dataclasses import dataclass
@@ -21,7 +22,7 @@ from magent.platform import (
     VSCodeLaunchOpts,
     get_platform,
 )
-from magent.procs import spawn_unjobbed
+from magent.procs import pid_alive, spawn_unjobbed
 from magent.sessions import (
     AGENT_TOOLS,
     build_resume_command,
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from magent.config import MagentConfig, ProjectConfig
+    from magent.env import MagentEnv
 
 
 def spawn_detached(args: list[str], extra_flags: int = 0) -> subprocess.Popen[bytes]:
@@ -201,6 +203,195 @@ def ensure_hotkey_listener(default_url: str) -> int | None:
         return start_hotkey_listener(default_url, None)
     url, ssh_host = supervised_hotkey_target(listener_manifest(), default_url)
     return start_hotkey_listener(url, ssh_host)
+
+
+# --- Upload-server supervision ------------------------------------------------
+# The same doctrine as the Alt+V listener above, one process up. `magent serve`
+# is what every mobile upload and every Alt+V press goes through, and nothing in
+# the product ever re-checked that it was still there: attach panes redial,
+# sessions get revived, the listener is supervised -- serve alone had no
+# supervisor and left no trace when it died. It died silently twice in one day
+# (a machine-wide ConPTY wedge, then an unexplained disappearance over three
+# hours), and both times the first symptom was an Alt+V press doing nothing.
+#
+# serve cannot supervise itself: a supervisor that only ran while serve ran
+# would supervise nothing the moment serve died. The attention daemon is the
+# other long-lived process, it already polls on an interval, and it is the one
+# users leave running -- so it is the owner.
+#
+# All of this lives here, next to spawn_detached and ensure_hotkey_listener,
+# rather than in cli/background.py where the spawn recipe started: launch.py
+# must not import the cli package (cli/__init__ imports every command module, so
+# a reverse import cycles -- LS-A-001), and a supervisor in a src module cannot
+# reach a recipe that lives in one. cli/background._maybe_start_upload_server is
+# now a thin delegation to ensure_upload_server for exactly that reason.
+
+UPLOAD_RESPAWN_COOLDOWN_S = 60.0
+
+
+def _probe_upload_port(port: int) -> bool:
+    """True when something accepts a TCP connection on loopback ``port``.
+
+    The same question ``cli/background._probe_port`` and ``status`` ask, with
+    the same 0.3s budget: a refused loopback connect answers instantly, and a
+    probe that could block would freeze the loop it rides on.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.settimeout(0.3)
+    try:
+        probe.connect(("127.0.0.1", port))
+    except OSError:
+        return False
+    else:
+        return True
+    finally:
+        probe.close()
+
+
+def upload_server_argv(port: int, config_path: str | None) -> list[str]:
+    """The argv of a detached ``magent serve`` on ``port``.
+
+    One builder for both spawn sites (the bring-up ensure and the supervisor),
+    so the revived server can never drift from the one the launch path starts --
+    same interpreter, same ``--config``, same port.
+    """
+    args = [sys.executable, "-m", "magent"]
+    if config_path:
+        args += ["--config", config_path]
+    return [*args, "serve", "-p", str(port)]
+
+
+def ensure_upload_server(port: int, config_path: str | None = None) -> bool:
+    """Start the upload server detached unless something already answers on
+    ``port``. Returns True when a spawn was actually issued.
+
+    Detached because it must outlive the SSH bring-up command that spawns it --
+    see ``spawn_detached``.
+    """
+    if _probe_upload_port(port):
+        return False
+    spawn_detached(upload_server_argv(port, config_path))
+    return True
+
+
+def _validated_env() -> MagentEnv | None:
+    """The env singleton, or None if it no longer validates.
+
+    A daemon must never die of an environment variable it does not use, and by
+    the time the attention loop is running every other MAGENT_* consumer has
+    already failed loudly at CLI entry -- so an env that goes bad underneath a
+    detached process degrades to the defaults with a log line, exactly as
+    ``upload_server.supervision_enabled`` and ``log._configured_level`` do.
+    """
+    from pydantic import ValidationError
+
+    from magent.env import get_env
+
+    try:
+        return get_env()
+    except ValidationError:
+        get_logger("attention").warning(
+            "upload supervisor: environment did not validate; using defaults"
+        )
+        return None
+
+
+def upload_supervision_enabled() -> bool:
+    """Whether MAGENT_UPLOAD_SUPERVISOR permits the attention daemon to keep
+    ``magent serve`` alive. Public because ``status`` must ask the same question
+    the supervisor answers before it offers the daemon as a repair."""
+    env = _validated_env()
+    return True if env is None else env.upload_supervisor
+
+
+def upload_respawn_cooldown_s() -> float:
+    """The configured minimum seconds between two respawn attempts."""
+    env = _validated_env()
+    configured = None if env is None else env.upload_respawn_cooldown_s
+    if configured is None:
+        return UPLOAD_RESPAWN_COOLDOWN_S
+    return max(0.0, configured)
+
+
+class UploadServerSupervisor:
+    """Revives a dead ``magent serve``, at most once per cooldown.
+
+    ``tick`` is called once per attention poll, so DETECTION latency is the poll
+    interval while the RESPAWN RATE is bounded by ``cooldown_s``. The split is
+    the whole design: a serve that dies at 03:00 must not wait out a long timer
+    before anyone notices, and a serve that crashes on startup must not be
+    respawned in a tight loop. Looking is free; spawning is not.
+
+    Liveness is the loopback TCP probe. The recorded pid is read too, but only
+    for the log line, and deliberately so: ``run_server`` writes its pid file
+    AFTER the bind, so the pid can never be the earlier signal, and a pid number
+    the OS later recycles onto an unrelated process would blind the watchdog
+    permanently. What the pid does buy is a truthful diagnosis in the log --
+    "recorded pid 8123 is gone" (the observed failure) reads very differently
+    from "pid 8123 is alive but not answering", which is a wedge, not a death.
+
+    Nothing here raises on a failed spawn: the caller logs and ticks again next
+    poll. A supervisor that could take down the daemon it rides on would be
+    trading one silent death for another.
+    """
+
+    def __init__(
+        self,
+        port: int,
+        config_path: str | None = None,
+        *,
+        cooldown_s: float | None = None,
+        now: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._port = port
+        self._config_path = config_path
+        self._cooldown = (
+            upload_respawn_cooldown_s() if cooldown_s is None else cooldown_s
+        )
+        self._now = now
+        self._last_spawn: float | None = None
+
+    @property
+    def cooldown_s(self) -> float:
+        """The resolved cooldown — read by the daemon's startup log line so the
+        value in force is visible without re-deriving it from the env."""
+        return self._cooldown
+
+    def _pid_note(self) -> str:
+        """How the recorded pid contradicts (or corroborates) the dead port."""
+        from magent.upload_server import (  # in-body: upload_server imports launch back, and only one direction may be a module-level import
+            server_pid,
+        )
+
+        pid = server_pid(self._port)
+        if pid is None:
+            return "no pid file"
+        return f"recorded pid {pid} is {'alive' if pid_alive(pid) else 'gone'}"
+
+    def tick(self) -> bool:
+        """One liveness check. True when a respawn was issued."""
+        if _probe_upload_port(self._port):
+            return False
+        log = get_logger("attention")
+        now = self._now()
+        if self._last_spawn is not None and (now - self._last_spawn) < self._cooldown:
+            log.debug(
+                "upload supervisor: port %d still dead, within the %.0fs cooldown",
+                self._port,
+                self._cooldown,
+            )
+            return False
+        self._last_spawn = now
+        # ASCII only: this line goes to a rotating logfile that gets read back
+        # through whatever the host console's code page happens to be.
+        log.warning(
+            "upload supervisor: nothing answering on port %d (%s); starting a new "
+            "magent serve",
+            self._port,
+            self._pid_note(),
+        )
+        spawn_detached(upload_server_argv(self._port, self._config_path))
+        return True
 
 
 @dataclass

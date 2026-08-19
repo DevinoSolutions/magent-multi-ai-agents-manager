@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import re
 import socket
-import sys
 from pathlib import Path
 
 from magent import tailnet
@@ -18,28 +17,18 @@ from magent.procs import pid_alive
 
 
 def _maybe_start_upload_server(port: int, config_path: str | None) -> None:
-    """Start the upload server detached, unless something is already on the port."""
+    """Start the upload server detached, unless something is already on the port.
 
-    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    probe.settimeout(0.3)
-    try:
-        probe.connect(("127.0.0.1", port))
-    except OSError:
-        pass
-    else:
-        return  # already listening
-    finally:
-        probe.close()
-
-    args = [sys.executable, "-m", "magent"]
-    if config_path:
-        args += ["--config", config_path]
-    args += ["serve", "-p", str(port)]
+    The probe + argv + detached spawn moved to ``launch.ensure_upload_server``:
+    the attention daemon's watchdog needs the identical recipe and lives in a
+    src module, which cannot import this one (LS-A-001). This is the cli-side
+    name for it, kept so every existing call site reads unchanged.
+    """
     # heavy subsystem: in-body per policy. Must outlive the SSH bring-up
     # command that spawns it -- see spawn_detached.
-    from magent.launch import spawn_detached
+    from magent.launch import ensure_upload_server
 
-    spawn_detached(args)
+    ensure_upload_server(port, config_path)
 
 
 def _maybe_start_hotkey(server_url: str, ssh_host: str | None = None) -> int | None:

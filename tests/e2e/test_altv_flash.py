@@ -245,6 +245,9 @@ class _Fleet:
         # contain a global hook, so this tier opts out rather than install one
         # on the machine running it.
         env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
+        # ...and `attention -d` now supervises `magent serve` the same way, so a
+        # test daemon would otherwise start a REAL upload server on this machine.
+        env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
         # Our recording multiplexer must win the PATH lookup find_psmux does.
         env["PATH"] = str(self.bin_dir) + os.pathsep + env.get("PATH", "")
         return env

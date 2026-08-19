@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from typing import ClassVar
 
 from magent import agent_state, cli, config, log
 from magent.cli import attention_cmd
@@ -370,3 +371,112 @@ class TestPlanRenderersNotifyOnDone:
         renderers, _ = self._plan(att)
         # notifyOnDone widens nothing: there is no toast/ntfy renderer to widen.
         assert self._push_renderers(renderers) == []
+
+
+class _RecordingSupervisor:
+    """Stands in for launch.UploadServerSupervisor: records construction and
+    every tick, and can be told to blow up."""
+
+    instances: ClassVar[list[_RecordingSupervisor]] = []
+
+    def __init__(self, port, config_path=None, **_kw):
+        self.port = port
+        self.config_path = config_path
+        self.ticks = 0
+        self.raises = False
+        self.cooldown_s = 60.0
+        _RecordingSupervisor.instances.append(self)
+
+    def tick(self) -> bool:
+        self.ticks += 1
+        if self.raises:
+            raise OSError("spawn refused")
+        return False
+
+
+class TestUploadWatchdog:
+    """The attention daemon is the upload server's supervisor — `serve` cannot
+    supervise itself, and a supervisor that only ran while serve ran would
+    supervise nothing the moment serve died."""
+
+    def _cfg(self, *, upload_server: bool, port: int = 8099):
+        return config.MagentConfig(
+            projects=[config.ProjectConfig(path="api")],
+            settings=config.Settings(upload_server=upload_server, upload_port=port),
+        )
+
+    def _wire(self, monkeypatch):
+        _RecordingSupervisor.instances = []
+        monkeypatch.setattr(
+            "magent.launch.UploadServerSupervisor", _RecordingSupervisor
+        )
+        return _RecordingSupervisor.instances
+
+    def test_it_supervises_the_configured_port(self, monkeypatch):
+        made = self._wire(monkeypatch)
+
+        hook = attention_cmd._upload_watchdog(self._cfg(upload_server=True), "cfg.json")
+
+        assert hook is not None
+        hook([])
+        assert [(s.port, s.config_path, s.ticks) for s in made] == [
+            (8099, "cfg.json", 1)
+        ]
+
+    def test_a_config_with_no_upload_server_is_not_second_guessed(self, monkeypatch):
+        made = self._wire(monkeypatch)
+
+        assert (
+            attention_cmd._upload_watchdog(self._cfg(upload_server=False), None) is None
+        )
+        assert made == []
+
+    def test_the_env_opt_out_disables_it(self, monkeypatch):
+        made = self._wire(monkeypatch)
+        monkeypatch.setenv("MAGENT_UPLOAD_SUPERVISOR", "0")
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+        assert (
+            attention_cmd._upload_watchdog(self._cfg(upload_server=True), None) is None
+        )
+        assert made == []
+
+    def test_a_failing_check_is_logged_not_raised(self, monkeypatch, caplog):
+        # Supervision must never be able to kill the daemon it rides on: the
+        # whole point is that something survives to look again next tick.
+        made = self._wire(monkeypatch)
+        hook = attention_cmd._upload_watchdog(self._cfg(upload_server=True), None)
+        assert hook is not None
+        made[0].raises = True
+
+        with caplog.at_level("ERROR", logger="magent.attention"):
+            hook([])  # must not raise
+
+        assert "upload supervisor" in caplog.text
+
+    def test_the_daemon_loop_is_handed_the_hook(
+        self, runner, monkeypatch, tmp_path, tmp_config
+    ):
+        """End of the wiring: the real command passes it to run_attention_loop."""
+        self._wire(monkeypatch)
+        captured: dict[str, object] = {}
+
+        def fake_loop(*_a, on_tick=None, **_k):
+            captured["on_tick"] = on_tick
+
+        monkeypatch.setattr("magent.attention.run_attention_loop", fake_loop)
+        fp = FakePlatform(supports_attention=True)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+        monkeypatch.setattr(attention_cmd, "_PID_PATH", tmp_path / "attention.pid")
+        config_path = tmp_config(
+            {
+                "version": config.SCHEMA_VERSION,
+                "projects": [{"path": "api"}],
+                "settings": {"uploadServer": True, "uploadPort": 8099},
+            }
+        )
+
+        result = runner.invoke(cli.main, ["--config", config_path, "attention"])
+
+        assert result.exit_code == 0, result.output
+        assert captured["on_tick"] is not None

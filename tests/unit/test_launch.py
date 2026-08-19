@@ -1522,3 +1522,215 @@ class TestBaseDirExpansion:
 
         assert len(out) == 1
         assert out[0]["resolved"] == str(proj_dir)
+
+
+class TestUploadServerLiveness:
+    """The probe + argv the upload-server watchdog is built out of.
+
+    Both spawn sites (the bring-up ensure and the attention daemon's
+    supervisor) share one argv builder on purpose: a revived server that
+    differed from the one the launch path starts -- a different interpreter, a
+    dropped --config, another port -- would be a second, subtly different
+    product running under the same name.
+    """
+
+    def test_the_argv_carries_the_interpreter_config_and_port(self):
+        argv = launch.upload_server_argv(8099, "C:/cfg/magent.config.json")
+
+        assert argv == [
+            sys.executable,
+            "-m",
+            "magent",
+            "--config",
+            "C:/cfg/magent.config.json",
+            "serve",
+            "-p",
+            "8099",
+        ]
+
+    def test_no_config_path_means_the_child_resolves_its_own(self):
+        assert "--config" not in launch.upload_server_argv(8099, None)
+
+    def test_ensure_spawns_when_nothing_answers(self, monkeypatch):
+        spawned: list[list[str]] = []
+        monkeypatch.setattr(launch, "_probe_upload_port", lambda _p: False)
+        monkeypatch.setattr(launch, "spawn_detached", spawned.append)
+
+        assert launch.ensure_upload_server(8099, "cfg.json") is True
+        assert spawned and spawned[0][-2:] == ["-p", "8099"]
+
+    def test_ensure_is_a_no_op_when_the_port_answers(self, monkeypatch):
+        spawned: list[list[str]] = []
+        monkeypatch.setattr(launch, "_probe_upload_port", lambda _p: True)
+        monkeypatch.setattr(launch, "spawn_detached", spawned.append)
+
+        assert launch.ensure_upload_server(8099, "cfg.json") is False
+        assert spawned == []
+
+
+class TestUploadSupervisionSettings:
+    """The two env knobs, read through the same degrade-to-default posture the
+    hotkey supervisor uses: a detached daemon must never die of an environment
+    variable it doesn't use."""
+
+    def test_supervision_is_on_by_default(self):
+        assert launch.upload_supervision_enabled() is True
+
+    def test_the_env_var_turns_it_off(self, monkeypatch):
+        monkeypatch.setenv("MAGENT_UPLOAD_SUPERVISOR", "0")
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+        assert launch.upload_supervision_enabled() is False
+
+    def test_the_default_cooldown_is_the_module_constant(self):
+        assert launch.upload_respawn_cooldown_s() == launch.UPLOAD_RESPAWN_COOLDOWN_S
+
+    def test_the_cooldown_is_configurable(self, monkeypatch):
+        monkeypatch.setenv("MAGENT_UPLOAD_RESPAWN_COOLDOWN_S", "2.5")
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+        assert launch.upload_respawn_cooldown_s() == 2.5
+
+    def test_a_negative_cooldown_clamps_to_zero(self, monkeypatch):
+        monkeypatch.setenv("MAGENT_UPLOAD_RESPAWN_COOLDOWN_S", "-5")
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+        assert launch.upload_respawn_cooldown_s() == 0.0
+
+    def test_a_broken_environment_degrades_to_supervising(self, monkeypatch):
+        # An unknown MAGENT_* var makes the closed schema raise. Every other
+        # consumer has already failed loudly at CLI entry by the time a daemon
+        # is running, so the supervisor keeps supervising rather than dying.
+        monkeypatch.setenv("MAGENT_NOT_A_REAL_SETTING", "1")
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+        assert launch.upload_supervision_enabled() is True
+        assert launch.upload_respawn_cooldown_s() == launch.UPLOAD_RESPAWN_COOLDOWN_S
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+class TestUploadServerSupervisor:
+    """The decision logic behind `attention -d`'s revive of a dead `serve`.
+
+    Detection latency is the poll interval; the RESPAWN rate is bounded by the
+    cooldown. That split is the whole design -- looking is free, spawning is
+    not, and a serve that crashes on startup must not be hot-respawned.
+    """
+
+    def _wire(self, monkeypatch, *, alive: list[bool]) -> list[list[str]]:
+        """`alive` is consumed one entry per tick (the port probe's answer)."""
+        spawned: list[list[str]] = []
+        answers = iter(alive)
+        monkeypatch.setattr(launch, "_probe_upload_port", lambda _p: next(answers))
+        monkeypatch.setattr(launch, "spawn_detached", spawned.append)
+        return spawned
+
+    def test_a_dead_port_is_respawned_on_the_configured_port(self, monkeypatch):
+        spawned = self._wire(monkeypatch, alive=[False])
+        sup = launch.UploadServerSupervisor(8099, "cfg.json", now=_FakeClock())
+
+        assert sup.tick() is True
+        assert spawned == [
+            [
+                sys.executable,
+                "-m",
+                "magent",
+                "--config",
+                "cfg.json",
+                "serve",
+                "-p",
+                "8099",
+            ]
+        ]
+
+    def test_a_live_port_is_left_alone(self, monkeypatch):
+        spawned = self._wire(monkeypatch, alive=[True])
+        sup = launch.UploadServerSupervisor(8099, now=_FakeClock())
+
+        assert sup.tick() is False
+        assert spawned == []
+
+    def test_the_cooldown_suppresses_a_second_spawn(self, monkeypatch):
+        spawned = self._wire(monkeypatch, alive=[False, False, False])
+        clock = _FakeClock()
+        sup = launch.UploadServerSupervisor(8099, cooldown_s=60.0, now=clock)
+
+        assert sup.tick() is True
+        clock.t += 1.0
+        assert sup.tick() is False
+        clock.t += 58.0  # still inside the 60s window
+        assert sup.tick() is False
+        assert len(spawned) == 1
+
+    def test_it_tries_again_once_the_cooldown_expires(self, monkeypatch):
+        spawned = self._wire(monkeypatch, alive=[False, False])
+        clock = _FakeClock()
+        sup = launch.UploadServerSupervisor(8099, cooldown_s=60.0, now=clock)
+
+        assert sup.tick() is True
+        clock.t += 60.0
+        assert sup.tick() is True
+        assert len(spawned) == 2
+
+    def test_a_healthy_tick_inside_the_cooldown_costs_nothing(self, monkeypatch):
+        # The cooldown gate is reached only when the port is dead: a server that
+        # came up is never probed for a pid or judged against a timer.
+        spawned = self._wire(monkeypatch, alive=[False, True])
+        clock = _FakeClock()
+        sup = launch.UploadServerSupervisor(8099, cooldown_s=60.0, now=clock)
+
+        sup.tick()
+        clock.t += 1.0
+        assert sup.tick() is False
+        assert len(spawned) == 1
+
+    def test_the_default_cooldown_comes_from_the_environment(self, monkeypatch):
+        monkeypatch.setenv("MAGENT_UPLOAD_RESPAWN_COOLDOWN_S", "3")
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+        assert launch.UploadServerSupervisor(8099).cooldown_s == 3.0
+
+    def test_the_warning_diagnoses_the_recorded_pid(self, monkeypatch, caplog):
+        # The pid is diagnostic, never decisive: run_server writes its pid file
+        # AFTER the bind, so the pid can't be the earlier signal, and a recycled
+        # pid number would blind the watchdog forever. What it buys is a log
+        # line that tells "the process is gone" (the observed failure) apart
+        # from "it's alive but not answering" (a wedge).
+        self._wire(monkeypatch, alive=[False])
+        monkeypatch.setattr("magent.upload_server.server_pid", lambda _p: 4321)
+        monkeypatch.setattr(launch, "pid_alive", lambda _p: False)
+        sup = launch.UploadServerSupervisor(8099, now=_FakeClock())
+
+        with caplog.at_level("WARNING", logger="magent.attention"):
+            sup.tick()
+
+        assert "recorded pid 4321 is gone" in caplog.text
+        assert "8099" in caplog.text
+
+    def test_a_wedged_server_is_still_reported_honestly(self, monkeypatch, caplog):
+        self._wire(monkeypatch, alive=[False])
+        monkeypatch.setattr("magent.upload_server.server_pid", lambda _p: 4321)
+        monkeypatch.setattr(launch, "pid_alive", lambda _p: True)
+        sup = launch.UploadServerSupervisor(8099, now=_FakeClock())
+
+        with caplog.at_level("WARNING", logger="magent.attention"):
+            sup.tick()
+
+        assert "recorded pid 4321 is alive" in caplog.text
+
+    def test_no_pid_file_says_so(self, monkeypatch, caplog):
+        self._wire(monkeypatch, alive=[False])
+        monkeypatch.setattr("magent.upload_server.server_pid", lambda _p: None)
+        sup = launch.UploadServerSupervisor(8099, now=_FakeClock())
+
+        with caplog.at_level("WARNING", logger="magent.attention"):
+            sup.tick()
+
+        assert "no pid file" in caplog.text

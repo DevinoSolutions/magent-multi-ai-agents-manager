@@ -925,6 +925,78 @@ window is another app's chord, not a failure, so it is DEBUG-only (at INFO it
 would log every Alt+V the user ever presses). `no-image` still passes the chord
 through — the pane may want a plain Alt+V — but says why nothing was uploaded.
 
+### The upload server is supervised too, and by the attention daemon (2026-08-19)
+
+The listener decision above ends one level short. `serve` supervises the
+listener, sessions get revived, attach panes redial — and nothing at all watched
+`serve` itself, the process every mobile upload and every Alt+V press goes
+through. On 2026-08-18 it died silently twice on the same live host: once inside
+a machine-wide ConPTY wedge, once unexplained between ~13:00 and ~16:10. Both
+times the first symptom was the owner pressing Alt+V and getting nothing, hours
+after the fact, and the machine had almost nothing to say about it afterwards.
+
+Two separate defects, fixed separately.
+
+**1. A death that leaves a trace.** `run_server`'s `try/finally` logged the same
+`stopped` for a Ctrl+C and for a crash, and a detached serve has no console for a
+traceback to reach — so even the logfile could not distinguish "the user stopped
+it" from "it fell over". Every exit now names its reason (`stopped: keyboard
+interrupt` / `stopped: crashed` / `stopped: loop returned`), a crash is logged at
+**exception level before it propagates** (which is also what hands it to Sentry —
+errors-only, logging integration at ERROR), and the fatal "no bindable address"
+startup failure gets an ERROR line of its own rather than only an exception into
+the void. Nothing is swallowed: both handlers re-raise, and the CLI still exits
+non-zero. The secondary (Tailscale) bind's `serve_forever` runs through
+`_serve_bind`, which logs its own death and does **not** re-raise — that thread
+dying must not take the loopback bind with it, but it must not be silent either.
+
+**2. Owner: the attention daemon.** `serve` cannot supervise itself; a supervisor
+that only ran while serve ran would supervise nothing the moment serve died. The
+attention daemon is the other long-lived process, it already polls on an
+interval, and it is the one users leave running — so
+`cli/attention_cmd._upload_watchdog` hands `run_attention_loop` an `on_tick` hook
+driving `launch.UploadServerSupervisor`.
+
+*Where the seam lives, and why it moved.* Everything — the loopback probe, the
+argv builder, the detached spawn — is in `launch.py`, next to `spawn_detached`
+and `ensure_hotkey_listener`. It used to live in `cli/background.py`, and a src
+module cannot import the cli package (LS-A-001: `cli/__init__` imports every
+command module for registration, so a reverse import cycles). Rather than write a
+second spawn recipe, `cli/background._maybe_start_upload_server` became a thin
+delegation to `launch.ensure_upload_server`, so the server the watchdog revives
+is byte-for-byte the one the launch path starts.
+
+*Detection is cheap, respawning is not.* The probe rides the existing poll tick
+(one refused loopback connect; no second timer, no new thread), while the
+**respawn rate** is bounded by `UPLOAD_RESPAWN_COOLDOWN_S` (60s, overridable via
+`MAGENT_UPLOAD_RESPAWN_COOLDOWN_S`). Splitting the two is the whole design: a
+serve that dies at 03:00 must not wait out a long timer before anyone notices,
+and a serve that crashes on startup must not be respawned in a tight loop.
+
+*The pid is diagnostic, never decisive.* Liveness is the TCP probe alone. The
+recorded pid is read only for the log line, deliberately: `run_server` writes its
+pid file **after** the bind, so the pid can never be the earlier signal, and a pid
+number the OS later recycles onto an unrelated process would blind the watchdog
+permanently. What it buys is a truthful diagnosis — "recorded pid 8123 is gone"
+(the observed failure) reads very differently from "pid 8123 is alive but not
+answering", which is a wedge, not a death.
+
+*Two gates, answering different questions.* `settings.uploadServer` is the
+config's own switch: a user who turned the upload server off is not
+second-guessed, and nothing is resurrected on a machine that never had one.
+`MAGENT_UPLOAD_SUPERVISOR` (default on) is the runtime opt-out for somebody who
+runs serve under their own supervisor — and, exactly like
+`MAGENT_HOTKEY_SUPERVISOR`, it is a **test-isolation requirement**: an
+`attention -d` fixture that quietly spawned a real `magent serve` on a runner
+would leak a process no teardown knows the pid of. Every fixture that starts a
+real daemon sets it to `0`; the `e2e` watchdog tier sets it to `1` as the
+behavior under test.
+
+*Observability.* `status` prints one `Repair:` line — `magent attention -d` —
+when the upload server reads DEAD **and** the daemon is off **and** it would
+actually supervise (config on, env not opted out). Suggesting the daemon to
+someone who disabled it would be advice that does nothing.
+
 ### One liveness enumeration, and a shutdown that verifies (2026-08-18)
 
 Reported twice on a live 46-session Windows host: after `magent down --all`, a

@@ -53,6 +53,12 @@ if TYPE_CHECKING:
 # listener second, and the fresh server supervises a fresh listener back up.
 LISTENER_REPAIR_HINT = "magent down --all, then magent serve (or magent attach)"
 
+# Offered only when the upload server is DEAD and nothing is watching it: the
+# attention daemon is the upload server's supervisor, so with it off a dead
+# server stays dead until a human notices -- which is precisely the failure
+# that supervision exists to end.
+UPLOAD_WATCHDOG_HINT = "magent attention -d  (it revives a dead upload server)"
+
 
 def _health_check(port: int) -> bool:
     """HTTP GET /health -- proves the upload server is actually SERVING, not
@@ -125,6 +131,16 @@ def _supervised() -> bool:
     )
 
     return supervision_enabled()
+
+
+def _upload_supervised() -> bool:
+    """Is `attention -d` allowed to keep the upload server alive? (the one owner
+    of that question is ``launch``; this is only the in-body import)."""
+    from magent.launch import (
+        upload_supervision_enabled,  # heavy subsystem: in-body per policy
+    )
+
+    return upload_supervision_enabled()
 
 
 def _attention_state() -> str:
@@ -321,6 +337,21 @@ def _render_status(config_file: Path) -> StatusReport:
     click.echo(
         f"  {style('Upload server', bold=True)}   {upload_labels[status['upload_server']]}"
     )
+    if (
+        status["upload_server"] == "dead"
+        and status["attention"] == "off"
+        and cfg.settings.upload_server
+        and _upload_supervised()
+    ):
+        # Same doctrine as the listener's Repair line: a red line the user
+        # cannot act on is half an answer. The attention daemon is what watches
+        # the upload server -- with it off, nothing will bring this one back.
+        # Suggested only when it WOULD supervise: offering the daemon to
+        # somebody who set MAGENT_UPLOAD_SUPERVISOR=0, or whose config has no
+        # upload server at all, would be advice that does nothing.
+        click.echo(
+            f"  {style('Repair:', dim=True)} {style(UPLOAD_WATCHDOG_HINT, bold=True)}"
+        )
 
     listener_labels = {
         "on": style("ON", fg="green", bold=True),
