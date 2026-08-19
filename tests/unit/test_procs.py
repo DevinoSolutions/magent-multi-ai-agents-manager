@@ -37,8 +37,13 @@ class TestCountProcesses:
 
     @pytest.mark.skipif(sys.platform != "win32", reason="Toolhelp is win32-only")
     def test_it_is_case_insensitive_like_windows(self):
+        # Deliberately NOT `count(UPPER) == count(lower)`: two snapshots of a
+        # live machine are two different machines (this box churns
+        # python.exe constantly). Both spellings must FIND our interpreter --
+        # that is the property; the exact population is not.
         exe = os.path.basename(sys.executable)
-        assert count_processes(exe.upper()) == count_processes(exe.lower())
+        assert count_processes(exe.upper()) >= 1
+        assert count_processes(exe.lower()) >= 1
 
     @pytest.mark.skipif(sys.platform != "win32", reason="Toolhelp is win32-only")
     def test_a_name_nothing_runs_is_zero_not_none(self):

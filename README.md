@@ -233,7 +233,7 @@ Or skip the menu with flags:
 | `magent --init --base-dir <folder>` | Generate config from a folder of git repos. |
 | `magent --edit` | Open config in your default editor. |
 | `magent docs` | Print full config reference (Markdown). |
-| `magent doctor [--json]` | Diagnose the environment: config, env vars, agent tools on PATH, terminal, monitors, writable dirs, Tailscale, upload port. Exit 1 on any failure. |
+| `magent doctor [--json]` | Diagnose the environment: config, env vars, agent tools on PATH, terminal, a wedged psmux control plane (see below), monitors, writable dirs, Tailscale, upload port. Exit 1 on any failure. |
 | `magent sessions` | List active psmux sessions, pick one to attach. |
 | `magent sessions <name>` | Attach directly to a psmux session by name. |
 | `magent up [--json] [-g <group>] [--revive]` | Host side: ensure a persistent psmux session per project, and re-launch the agent in any live session whose pane fell back to a bare shell (e.g. after a Ctrl-C). Reviving is automatic except under `--json`, which stays a pure read unless `--revive` is passed. |
@@ -249,6 +249,23 @@ Or skip the menu with flags:
 | `magent hooks install` | Wire the agent lifecycle hooks that feed the session-state store (`magent hooks status` to inspect) — see [Where agent states come from](#where-agent-states-come-from). |
 | `magent config <subcommand>` | Edit config from the CLI — 17 subcommands incl. `migrate`; see `magent config --help`. |
 | `magent config edit [host]` | Edit the config on **another** machine in your editor over SSH — fetch, edit, validate, push back. Omit the host to reuse your last `attach` target. The host side is `magent config cat` / `magent config put`, which you never run by hand. |
+
+### When every psmux command hangs (the wedge)
+
+Rare, and worth knowing before it happens: psmux's control plane can wedge
+machine-wide. Every command — `has-session`, `list-sessions`, `new-session` —
+hangs forever, from any console, and the whole fleet looks dead.
+
+It isn't. `magent doctor` probes the control plane once (bounded, 5 s) and
+fails the `psmux wedge` check with the repair:
+
+- your sessions are **frozen, not dead** — do not restart them, and do not
+  reboot;
+- find the `conhost.exe` processes whose parent chain reaches a dead pid or a
+  `psmux.exe`, and kill only those (it was 14 of 874 conhosts in the incident
+  this check comes from);
+- psmux answers again immediately afterwards, and every session comes back
+  intact.
 
 ## Platform support
 
