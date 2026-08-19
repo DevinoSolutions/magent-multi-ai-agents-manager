@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import getpass
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -18,6 +19,11 @@ from typing import TYPE_CHECKING
 
 import click
 
+from magent.attach_client import (
+    CLIENT_EXE_NAME,
+    SSH_CONNECTION_OPTS,
+    remote_attach_command,
+)
 from magent.cli.app import main
 from magent.cli.background import _maybe_start_hotkey, _maybe_start_upload_server
 from magent.cli.config_io import (
@@ -415,13 +421,27 @@ def _echo_already_open(title: str) -> None:
 
 
 # The local processes that can be a live attach CLIENT for a psmux session:
-# the SSH client the remote path spawns (`ssh -t <target> "psmux -L <sid>
-# attach || ..."`) and the psmux client a locally-launched window runs directly
-# (platform/windows.py::attach_psmux). Both carry the session's attach command
-# in their command line, which is the only thing that distinguishes a live
-# window from a corpse -- the TITLE cannot, because attach spawns wt with
-# --suppressApplicationTitle, so `magent:<sid>` survives the process it named.
-_CLIENT_PROCESS_NAMES = ["ssh.exe", "psmux.exe"]
+#
+# * the SSH client the remote path ultimately runs (`ssh -t <target> "psmux -L
+#   <sid> attach || ..."`),
+# * the psmux client a locally-launched window runs directly
+#   (platform/windows.py::attach_psmux), and
+# * the reconnect supervisor that now sits between wt and ssh
+#   (attach_client.py). This one is load-bearing: while it waits out a backoff
+#   there is NO ssh process on the machine, and a scan that only knew about
+#   ssh/psmux would score a pane a corpse precisely while it was healing
+#   itself -- then close it, and take the reconnect down with it.
+#
+# All three carry the session's attach command in their command line, which is
+# the only thing that distinguishes a live window from a corpse -- the TITLE
+# cannot, because attach spawns wt with --suppressApplicationTitle, so the
+# window's magent: title survives the process it named.
+#
+# The supervisor is spawned via its console script, whose Windows launcher stub
+# keeps the script's own name (`magent-attach-client.exe`) and the full argv,
+# and waits on the python child it starts -- so scanning for the stub finds a
+# live supervisor for its whole lifetime, backoff sleeps included.
+_CLIENT_PROCESS_NAMES = ["ssh.exe", "psmux.exe", f"{CLIENT_EXE_NAME}.exe"]
 
 
 def _attach_markers(sid: str) -> tuple[str, ...]:
@@ -434,12 +454,21 @@ def _attach_markers(sid: str) -> tuple[str, ...]:
     and score every locally-launched window a corpse. That never mattered while
     corpse detection only ever saw the remote host's up-sessions; it matters now
     that ``_sweep_dead_windows`` looks at every magent: window on the machine.
-    ``_CLIENT_PROCESS_NAMES`` already narrows the scan to ssh/psmux processes,
-    so ``-L <sid> attach`` is signal enough on its own.
+    ``_CLIENT_PROCESS_NAMES`` already narrows the scan to attach-client
+    processes, so ``-L <sid> attach`` is signal enough on its own.
+
+    Not naming the binary is also what let the reconnect supervisor join the
+    scan for free: ``_spawn_windows`` passes the remote command it would have
+    given ssh as the supervisor's ``--remote`` argument, so the same marker
+    string appears in the supervisor's own command line -- including while it
+    is between connections and no ssh process exists at all. The one rule that
+    keeps this honest is stated at ``attach_client.remote_attach_command``: the
+    remote command has exactly one spelling, and these markers match it.
 
     The quoted variants cover a session id that a shell (or a future call site)
     chose to quote, so a quoting change cannot silently turn every live window
-    into a corpse.
+    into a corpse. They also cover the supervisor argv on any platform whose
+    process table re-quotes arguments.
     """
     return (
         f"-L {sid} attach",
@@ -456,10 +485,14 @@ def _corpses(open_sids: set[str], live_cmdlines: list[str]) -> set[str]:
     single real process, and the one risky judgement (close a window) is made
     somewhere a test can pin it.
 
-    Deliberately conservative: a session counts as dead only when NEITHER an
-    ssh client NOR a psmux client is running its attach command. Falsely
-    closing a live window costs the user their session; leaving a corpse costs
-    them one re-run of attach.
+    Deliberately conservative: a session counts as dead only when NO local
+    attach client at all -- ssh, psmux, or the reconnect supervisor -- is
+    running its attach command. Falsely closing a live window costs the user
+    their session; leaving a corpse costs them one re-run of attach.
+
+    That conservatism is what makes the supervisor safe to add here: widening
+    ``_CLIENT_PROCESS_NAMES`` can only ever make FEWER windows look dead, never
+    more, so the risky direction of this decision was never widened.
     """
     haystack = [c.lower() for c in live_cmdlines if c]
     return {
@@ -562,6 +595,15 @@ def _repair_corpses(open_sids: set[str]) -> set[str]:
     changes, ``_already_open`` counted that corpse as a live window and every
     later `magent attach` skipped the session forever.
 
+    Since the reconnect supervisor (attach_client.py) that is no longer the
+    COMMON case -- a dropped connection is healed in the pane, seconds later,
+    without anyone running attach again. What still lands here is the residue:
+    a pane whose supervisor never started (missing/blocked binary), one the
+    user stopped with Ctrl+C, one that stopped because the host answered but
+    the session was gone, and every pane spawned by an older magent or with
+    ``--no-reconnect``. Those are real corpses, and closing them is still the
+    right call.
+
     Scoped to sessions the caller knows are UP -- the post-tiling verification
     pass, which only ever asks about the windows it just spawned. The start-of
     attach sweep is ``_sweep_dead_windows``, which covers the other kind too.
@@ -639,6 +681,11 @@ def _annotate_dead_windows(up: Sequence[dict[str, object]]) -> None:
     DEAD -- both the ones a "ready" host session is hiding and the ones whose
     session is gone entirely.
 
+    "Dead" means no attach client of any kind is running the session's attach
+    command. A pane merely waiting out a reconnect backoff is NOT dead: its
+    supervisor is live and carries the marker, so it is never listed here (and
+    never closed below). What this reports is a pane nothing is driving.
+
     The overview is pure host truth: a psmux session that exists on the host
     renders as a green ``N/N ready`` row even when the pane here is a corpse
     whose SSH dropped, and a corpse whose session is NOT up does not appear in
@@ -667,7 +714,7 @@ def _annotate_dead_windows(up: Sequence[dict[str, object]]) -> None:
     if reopen:
         click.echo(
             f"  {style('!', fg='yellow')} {style(str(len(reopen)), fg='yellow', bold=True)}"
-            f" {style('window(s) here are dead (ssh connection dropped)', fg='yellow')}"
+            f" {style('window(s) here are dead (no attach client running)', fg='yellow')}"
             f" {style('-- they will be closed and reopened:', fg='yellow')}"
             f" {style(', '.join(reopen), fg='yellow', bold=True)}"
         )
@@ -680,39 +727,67 @@ def _annotate_dead_windows(up: Sequence[dict[str, object]]) -> None:
         )
 
 
-# Keepalive posture for the INTERACTIVE attach windows (`_ssh_capture` is a
-# separate, already-timeout-bounded path and deliberately untouched).
-#
-# WHY: OpenSSH sends nothing on an idle session by default, so after a laptop
-# sleep or a network change the TCP connection under an attach window is dead
-# while ssh.exe keeps running -- blocked forever on a socket that will never
-# answer. That is exactly the shape ``_dead_sids`` cannot see: the dead-window
-# scan looks for a live ssh/psmux process carrying the ``-L <sid> attach``
-# marker, and this zombie carries it. The window counts LIVE, the overview says
-# "N/N ready" with no annotation, the spawn loop skips it as "already open",
-# and no sweep will ever repair the frozen pane the user is staring at.
-#
-# 15s x 4 makes the client give up at most ~60s after the connection dies. The
-# pane then becomes a `[process exited]` corpse -- a shape the existing
-# machinery already handles: ``_sweep_dead_windows`` closes it and
-# ``_verify_and_respawn`` / the next attach reopens it.
-#
-# Losing the ssh client never loses work: the psmux session lives on the HOST
-# and is untouched by the client dying, so the reopened window reattaches to
-# the same running agent.
-_SSH_KEEPALIVE_OPTS = ("-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4")
+def _attach_client_exe() -> str | None:
+    """The local ``magent-attach-client`` binary, or None if it is not on PATH.
+
+    Never assumed present: an editable checkout that predates the console
+    script, a PATH that exposes ``magent`` from somewhere its siblings are not,
+    or a partially-upgraded install all reach here. The caller degrades to a
+    bare ssh pane (today's historical behavior) and says so once, rather than
+    spawning forty windows that fail to start.
+    """
+    return shutil.which(CLIENT_EXE_NAME)
+
+
+def _pane_command(target: str, sid: str, supervisor: str | None) -> list[str]:
+    """What one attach pane runs: the reconnect supervisor, or bare ssh.
+
+    Both spellings drive the SAME ssh options and the SAME remote command
+    (``attach_client`` owns both), so the only difference between them is who
+    is left standing when the connection drops: with the supervisor the pane
+    reconnects itself, without it the pane becomes a corpse for the next
+    ``magent attach`` to sweep.
+
+    The supervisor form passes ``--remote`` explicitly rather than letting the
+    supervisor derive it: that argument is what puts the ``-L <sid> attach``
+    marker into the supervisor's own command line, which is how
+    ``_dead_sids`` can tell a pane mid-reconnect from a dead one.
+    """
+    remote = remote_attach_command(sid)
+    if supervisor is None:
+        return ["ssh", *SSH_CONNECTION_OPTS, "-t", target, remote]
+    return [supervisor, "--target", target, "--session", sid, "--remote", remote]
 
 
 def _spawn_windows(
-    target: str, sids: Sequence[str], open_already: set[str], stagger: float
+    target: str,
+    sids: Sequence[str],
+    open_already: set[str],
+    stagger: float,
+    *,
+    reconnect: bool = True,
 ) -> list[str]:
     """Open one `wt` window per session id and return their titles, in order.
 
     Split out of ``_attach_flow`` so the post-tiling verification pass can call
     it a second time for the windows that died at the SSH handshake -- the
     retry needs the same spawn, only staggered further apart. Both the initial
-    and the retry batch therefore inherit ``_SSH_KEEPALIVE_OPTS`` from here.
+    and the retry batch therefore get the same pane command from here.
+
+    ``reconnect=False`` (``magent attach --no-reconnect``) reproduces the
+    historical bare-ssh pane exactly.
     """
+    supervisor = _attach_client_exe() if reconnect else None
+    if reconnect and supervisor is None:
+        click.echo(
+            f"  {style('!', fg='yellow')} {style(CLIENT_EXE_NAME, bold=True)}"
+            f" {style('is not on PATH -- panes will not auto-reconnect.', fg='yellow')}"
+        )
+        click.echo(
+            f"  {style('Reinstall with', dim=True)}"
+            f" {style('pip install -U magent-multi-ai-agents-manager', bold=True)}"
+            f"{style('.', dim=True)}"
+        )
     titles: list[str] = []
     for sid in sids:
         title = make_title(sid)
@@ -733,15 +808,7 @@ def _spawn_windows(
                 title,
                 "--suppressApplicationTitle",
                 "--",
-                "ssh",
-                *_SSH_KEEPALIVE_OPTS,
-                "-t",
-                target,
-                # Direct psmux attach first: it connects in well under a second,
-                # where booting the full magent CLI per window (python import +
-                # config load, x40 windows on a loaded host) made a big attach
-                # take many minutes. The picker is only the fallback path.
-                f"psmux -L {sid} attach || magent sessions {sid}",
+                *_pane_command(target, sid, supervisor),
             ]
         )
         titles.append(title)
@@ -765,8 +832,10 @@ _RETRY_STAGGER_S = 1.0
 _RETRY_SETTLE_S = 5.0
 
 
-def _verify_and_respawn(target: str, sids: Sequence[str]) -> None:
-    """Reopen the windows whose SSH connection died during the spawn storm.
+def _verify_and_respawn(
+    target: str, sids: Sequence[str], *, reconnect: bool = True
+) -> None:
+    """Reopen the windows whose supervisor never got a connection up at all.
 
     A big attach opens one SSH connection per window, and Windows OpenSSH has
     no ControlMaster, so they cannot be shared. During a bring-up storm the
@@ -781,11 +850,23 @@ def _verify_and_respawn(target: str, sids: Sequence[str]) -> None:
     attach: the run that spawned them still ended with dead panes on screen.
     This closes that gap by checking the windows this run just opened.
 
-    Timing is the whole trick: an ssh mid-handshake is a live process carrying
-    the attach marker, so scanning right after the spawn loop would clear every
-    window that is about to die. The caller runs this AFTER tiling and the
-    geometry nudge, by which time those phases have already spent tens of
-    seconds on a big attach and the casualties have settled.
+    What the reconnect supervisor changed, and what it did NOT. A handshake
+    casualty is now healed IN the pane: ssh exits 255, the supervisor waits two
+    seconds and dials again, and the storm drains itself. So this pass fires
+    far less often than it used to -- but it is not redundant, because it
+    answers a different question. It asks whether anything at all is driving
+    the pane, and the answer is still "no" when the supervisor could not be
+    spawned (missing binary, blocked executable, wt refusing the window), when
+    it stopped because the host answered with a failing remote command, or when
+    the run used ``--no-reconnect``. Those panes are as dead as they ever were.
+
+    Timing is still the trick, and now a friendlier one: a supervisor is a live
+    process carrying the attach marker from the instant it starts -- through
+    the handshake, through every backoff -- so this scan can only ever conclude
+    "dead" about a pane that has genuinely stopped. Scanning right after the
+    spawn loop would still be wrong (a supervisor that is about to fail to
+    exec has not failed yet), so the caller keeps running this AFTER tiling and
+    the geometry nudge.
 
     Costs the common (zero-casualty) case exactly one process scan and no
     output, and is skipped outright on platforms without the scan/close
@@ -806,7 +887,7 @@ def _verify_and_respawn(target: str, sids: Sequence[str]) -> None:
         len(retry),
         ", ".join(retry),
     )
-    titles = _spawn_windows(target, retry, set(), _RETRY_STAGGER_S)
+    titles = _spawn_windows(target, retry, set(), _RETRY_STAGGER_S, reconnect=reconnect)
     _tile_titles(titles)
     _reclaim_geometry(titles)
 
@@ -858,9 +939,15 @@ def _close_attach_windows(names: Sequence[str]) -> int:
     return len(_close_windows(plat, snap, list(names) or _open_attach_sids(snap)))
 
 
-# `magent down` on the host is a handful of psmux kills plus a couple of pid
-# stops -- fast, but it runs after an SSH handshake on a possibly-loaded box.
-_REMOTE_DOWN_TIMEOUT_S = 60
+# `magent down` on the host is a psmux kill fan-out plus a verify pass plus a
+# couple of pid stops, after an SSH handshake, on a possibly-loaded box. The
+# old 60s budget was measured against a handful of sessions and became a
+# TRUNCATION mechanism at scale: 46 sockets could outrun it, ssh was killed
+# mid-shutdown, and what survived was exactly the part of the config the
+# shutdown had not reached yet -- the reported "the tail always stays" tail.
+# Sized like `_BRING_UP_TIMEOUT_S`: generous enough that only a genuinely
+# unreachable host hits it.
+_REMOTE_DOWN_TIMEOUT_S = 300
 
 
 def _remote_down_command(
@@ -979,14 +1066,20 @@ def _bring_up_and_requery(
 
 
 def _attach_flow(
-    host: str | None, no_mux: bool = False, group: str | None = None, yes: bool = False
+    host: str | None,
+    no_mux: bool = False,
+    group: str | None = None,
+    yes: bool = False,
+    reconnect: bool = True,
 ) -> None:
     """Remote-PC attach: bring the host's sessions up, then open local windows.
 
     Default (psmux): tile one local window per remote psmux session and run the
     Alt+V image hotkey. ``--no-mux``: open one plain SSH window per project that
     runs the agent directly (no multiplexer). ``group`` limits the whole flow to
-    one project group on the host; ``yes`` skips the bring-up prompt.
+    one project group on the host; ``yes`` skips the bring-up prompt;
+    ``reconnect`` (off via ``--no-reconnect``) decides whether each pane runs
+    the reconnect supervisor or a bare ssh.
     """
 
     grp = f' -g "{group}"' if group else ""
@@ -1112,7 +1205,9 @@ def _attach_flow(
     # sessions come back out of the spawn loop below; the rest just go away.
     open_already = _sweep_dead_windows(sids)
 
-    titles = _spawn_windows(target, sids, open_already, _SPAWN_STAGGER_S)
+    titles = _spawn_windows(
+        target, sids, open_already, _SPAWN_STAGGER_S, reconnect=reconnect
+    )
 
     # Guarantee the host runs an upload server for Alt+V -- independent of the
     # host's uploadServer flag and of whether anything was just brought up.
@@ -1137,7 +1232,7 @@ def _attach_flow(
     _reclaim_geometry(titles)
     # ...and only now, once those two phases have given every handshake time to
     # either connect or fail, is a process scan meaningful (see the docstring).
-    _verify_and_respawn(target, sids)
+    _verify_and_respawn(target, sids, reconnect=reconnect)
 
     try:
         rc = ensure.wait(timeout=15)
@@ -1175,7 +1270,15 @@ def _attach_flow(
 
 
 def _attach_nomux(target: str, status: dict[str, object]) -> None:
-    """Open one plain SSH window per project, running the agent directly (no psmux)."""
+    """Open one plain SSH window per project, running the agent directly (no psmux).
+
+    Deliberately NOT supervised by the reconnect client. Without a multiplexer
+    the agent is a child of the ssh session itself, so a dropped connection
+    kills the agent on the host -- there is no surviving session to reattach
+    to, and dialing back in would silently start a SECOND agent on a
+    conversation the user thinks is still running. Reconnect is a psmux
+    feature because psmux is what makes the far side outlive the connection.
+    """
 
     projects = _project_dicts(status)
     if not projects:
@@ -1418,9 +1521,19 @@ def up_cmd(
     is_flag=True,
     help="Skip the bring-up prompt (bring up everything that's down)",
 )
+@click.option(
+    "--no-reconnect",
+    is_flag=True,
+    help="Don't auto-reconnect attach panes when the SSH connection drops",
+)
 @click.pass_context
 def attach_cmd(
-    ctx: click.Context, host: str | None, no_mux: bool, group: str | None, yes: bool
+    ctx: click.Context,
+    host: str | None,
+    no_mux: bool,
+    group: str | None,
+    yes: bool,
+    no_reconnect: bool,
 ) -> None:
     """Attach to another machine's magent sessions over SSH.
 
@@ -1429,8 +1542,11 @@ def attach_cmd(
     window per remote psmux session with Alt+V image paste; --no-mux opens a
     direct SSH window per project instead. -g limits the flow to one project
     group on the host; -y skips the bring-up prompt.
+
+    Each pane survives a dropped connection and reattaches on its own once the
+    host is reachable again; --no-reconnect restores the old one-shot ssh pane.
     """
-    _attach_flow(host, no_mux=no_mux, group=group, yes=yes)
+    _attach_flow(host, no_mux=no_mux, group=group, yes=yes, reconnect=not no_reconnect)
 
 
 @main.command("hotkey")

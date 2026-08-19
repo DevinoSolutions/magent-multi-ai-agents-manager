@@ -645,6 +645,14 @@ def _win_child_env(home: Path, shim_dir: Path, base_path: str) -> dict[str, str]
     env["PATH"] = str(shim_dir) + os.pathsep + base_path
     home_s = str(home)
     env["HOME"] = home_s
+    # The Alt+V listener installs a SYSTEM-WIDE keyboard hook, and a real
+    # `serve` now supervises one into existence. Redirecting HOME does not
+    # contain a global hook, so tests that start a real server opt out
+    # rather than install one on the machine running them.
+    env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
+    # ...and `attention -d` now supervises `magent serve` the same way, so a
+    # test daemon would otherwise start a REAL upload server on this machine.
+    env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
     drive, tail = os.path.splitdrive(home_s)
     env["USERPROFILE"] = home_s
     env["HOMEDRIVE"] = drive

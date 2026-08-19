@@ -65,8 +65,7 @@ class TestEnvExampleMatchesSchema:
 
 
 class TestPsmuxChildEnv:
-    """`psmux_child_env` strips the multiplexer's nesting markers and nothing
-    else.
+    """`spawn_child_env` strips the multiplexer's nesting markers.
 
     Live repro: running the menu inside a magent psmux window put
     PSMUX_SESSION/PSMUX_TARGET_SESSION/TMUX/TMUX_PANE in every child's
@@ -89,7 +88,7 @@ class TestPsmuxChildEnv:
         self, monkeypatch: pytest.MonkeyPatch, key: str
     ) -> None:
         monkeypatch.setenv(key, "whatever")
-        assert key not in env_module.psmux_child_env()
+        assert key not in env_module.spawn_child_env()
 
     @pytest.mark.parametrize("key", ["TMUX_TMPDIR", "PSMUX_TMPDIR"])
     def test_the_socket_dir_survives(
@@ -106,7 +105,7 @@ class TestPsmuxChildEnv:
         The same breaks any user who relocates their sockets.
         """
         monkeypatch.setenv(key, "/tmp/private-sockets")
-        assert env_module.psmux_child_env()[key] == "/tmp/private-sockets"
+        assert env_module.spawn_child_env()[key] == "/tmp/private-sockets"
 
     def test_a_lowercase_marker_is_removed_too(
         self, monkeypatch: pytest.MonkeyPatch
@@ -114,7 +113,7 @@ class TestPsmuxChildEnv:
         # Windows env keys are case-insensitive; POSIX ones are not. Match on
         # the upper-cased name so neither host can smuggle a marker through.
         monkeypatch.setenv("tmux", "/tmp/sock,1,0")
-        assert not [k for k in env_module.psmux_child_env() if k.lower() == "tmux"]
+        assert not [k for k in env_module.spawn_child_env() if k.lower() == "tmux"]
 
     def test_a_lowercase_tmpdir_survives_too(
         self, monkeypatch: pytest.MonkeyPatch
@@ -123,7 +122,7 @@ class TestPsmuxChildEnv:
         # POSIX keeps them verbatim, and the accessor must keep the var under
         # whichever name the host chose.
         monkeypatch.setenv("tmux_tmpdir", "/tmp/private-sockets")
-        child = env_module.psmux_child_env()
+        child = env_module.spawn_child_env()
         assert [v for k, v in child.items() if k.upper() == "TMUX_TMPDIR"] == [
             "/tmp/private-sockets"
         ]
@@ -134,13 +133,13 @@ class TestPsmuxChildEnv:
         # Only TMUX and TMUX_PANE are tmux's in-a-session markers; the strip is
         # an exact match on that family, not a prefix sweep over it.
         monkeypatch.setenv("TMUXP_CONFIGDIR", "/home/u/.tmuxp")
-        assert env_module.psmux_child_env()["TMUXP_CONFIGDIR"] == "/home/u/.tmuxp"
+        assert env_module.spawn_child_env()["TMUXP_CONFIGDIR"] == "/home/u/.tmuxp"
 
     def test_everything_else_survives(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # The child still needs PATH to find psmux, HOME for its socket dir...
         monkeypatch.setenv("PATH", os.environ.get("PATH", "/usr/bin"))
         monkeypatch.setenv("MDTEST_UNRELATED", "keep-me")
-        child = env_module.psmux_child_env()
+        child = env_module.spawn_child_env()
         assert child["MDTEST_UNRELATED"] == "keep-me"
         assert child["PATH"]
 
@@ -149,9 +148,13 @@ class TestPsmuxChildEnv:
     ) -> None:
         for key in list(os.environ):
             upper = key.upper()
-            if upper in ("TMUX", "TMUX_PANE") or upper.startswith("PSMUX"):
+            if (
+                upper in ("TMUX", "TMUX_PANE")
+                or upper.startswith("PSMUX")
+                or upper in env_module.SCRUBBED_INHERITED_VARS
+            ):
                 monkeypatch.delenv(key, raising=False)
-        assert env_module.psmux_child_env() == dict(os.environ)
+        assert env_module.spawn_child_env() == dict(os.environ)
 
     def test_psmux_module_re_exports_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Every psmux spawn site reaches the accessor through psmux.child_env,
@@ -160,6 +163,130 @@ class TestPsmuxChildEnv:
 
         monkeypatch.setenv("PSMUX_SESSION", "api")
         assert "PSMUX_SESSION" not in psmux.child_env()
+
+
+class TestInheritedMarkerScrub:
+    """The scrub list a magent-spawned pane starts WITHOUT, pinned by name.
+
+    Two live incidents, one mechanism, same day. `magent up` was run from a
+    shell that was itself inside a Claude Code session, so every one of the 45
+    psmux sessions it created inherited the launching session's block:
+
+    1. Session identity. Every `claude` in those panes printed "Transcript
+       saving is off -- inherited CLAUDE_CODE_CHILD_SESSION marker" and stopped
+       writing transcripts for a day, which silently breaks `claude --continue`
+       -- the resume magent's whole session model is built on.
+    2. Presentation. That same shell carried NO_COLOR=1, so the 35 sessions it
+       created rendered monochrome while the 10 from an interactive shell had
+       colour.
+
+    The list is asserted through `SCRUBBED_INHERITED_VARS` rather than retyped:
+    a test that restates the list can drift from the list.
+    """
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "CLAUDECODE",
+            "CLAUDE_PID",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "NO_COLOR",
+            "FORCE_COLOR",
+            "CLICOLOR",
+            "CLICOLOR_FORCE",
+        ],
+    )
+    def test_every_scrubbed_var_is_removed(
+        self, monkeypatch: pytest.MonkeyPatch, key: str
+    ) -> None:
+        assert key in env_module.SCRUBBED_INHERITED_VARS
+        monkeypatch.setenv(key, "1")
+        assert key not in env_module.spawn_child_env()
+
+    def test_the_scrub_list_is_exactly_these_names(self) -> None:
+        # The whole list, in one assertion: adding a name is a deliberate act
+        # that updates this pin, and so is removing one.
+        expected = {
+            "CLAUDECODE",
+            "CLAUDE_PID",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "NO_COLOR",
+            "FORCE_COLOR",
+            "CLICOLOR",
+            "CLICOLOR_FORCE",
+        }
+        assert expected == env_module.SCRUBBED_INHERITED_VARS
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            # The deliberate NARROW strip: the CLAUDE_CODE_* namespace is
+            # overwhelmingly user configuration, so it is an exact-name list and
+            # not a prefix sweep. A blanket strip would log the agent out
+            # (OAUTH_TOKEN), silently move it off its provider (USE_BEDROCK), or
+            # disable a screen reader (CLAUDE_AX_SCREEN_READER) -- all worse
+            # than the bug being fixed. Same lesson as TMUX_TMPDIR.
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_AX_SCREEN_READER",
+            "ANTHROPIC_API_KEY",
+            # The tuning vars observed in the incident alongside the markers:
+            # indistinguishable from a machine-wide user preference, and none of
+            # them changes who the child thinks it is.
+            "CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY",
+            "CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING",
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
+            "CLAUDE_CODE_NO_FLICKER",
+            # ...and an unrelated var that merely LOOKS like the family.
+            "CLAUDE_LIKE_USER_VAR",
+        ],
+    )
+    def test_user_configuration_survives(
+        self, monkeypatch: pytest.MonkeyPatch, key: str
+    ) -> None:
+        monkeypatch.setenv(key, "keep-me")
+        assert env_module.spawn_child_env()[key] == "keep-me"
+
+    def test_term_is_never_touched(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Neither removed nor invented. psmux sets the pane's own TERM from
+        # `default-terminal` and the POSIX emulators set it for the shell they
+        # spawn, so the launcher never gets to decide it -- but a launcher that
+        # HAS one must not have it taken away either.
+        monkeypatch.setenv("TERM", "xterm-256color")
+        assert env_module.spawn_child_env()["TERM"] == "xterm-256color"
+
+    def test_a_missing_term_is_not_fabricated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("TERM", raising=False)
+        assert "TERM" not in env_module.spawn_child_env()
+
+    def test_a_lowercase_marker_is_removed_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Windows env keys are case-insensitive; POSIX ones are not. Matched on
+        # the upper-cased name so neither host can smuggle a marker through.
+        monkeypatch.setenv("no_color", "1")
+        assert not [k for k in env_module.spawn_child_env() if k.lower() == "no_color"]
+
+    def test_the_psmux_creation_seam_scrubs_them_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # psmux `new-session` is the spawn that gives a session the server that
+        # hosts the agent, and it reaches the seam through psmux.child_env.
+        from magent import psmux
+
+        monkeypatch.setenv("CLAUDE_CODE_CHILD_SESSION", "1")
+        monkeypatch.setenv("NO_COLOR", "1")
+        child = psmux.child_env()
+        assert "CLAUDE_CODE_CHILD_SESSION" not in child
+        assert "NO_COLOR" not in child
 
 
 class TestClosedSchemaRejectsUnknownVars:

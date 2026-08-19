@@ -13,7 +13,7 @@ import json
 import socket
 import subprocess
 
-from magent.cli.background import _tailnet_host
+from magent.cli.background import _maybe_start_upload_server, _tailnet_host
 
 
 def _cp(returncode: int, stdout: str) -> subprocess.CompletedProcess[str]:
@@ -71,3 +71,20 @@ class TestTailnetHost:
         monkeypatch.setattr(subprocess, "run", _run)
         monkeypatch.setattr(socket, "gethostbyname", _no_dns)
         assert _tailnet_host() == "localhost"
+
+
+class TestUploadServerBringUpDelegates:
+    """The probe + argv + detached spawn now live in ``launch`` so the
+    attention daemon's watchdog can reach the identical recipe: a src module
+    cannot import the cli package (LS-A-001). This side keeps only the name."""
+
+    def test_it_calls_the_launch_seam_with_the_port_and_config(self, monkeypatch):
+        calls: list[tuple[int, str | None]] = []
+        monkeypatch.setattr(
+            "magent.launch.ensure_upload_server",
+            lambda port, config_path: calls.append((port, config_path)) or True,
+        )
+
+        _maybe_start_upload_server(8099, "cfg.json")
+
+        assert calls == [(8099, "cfg.json")]

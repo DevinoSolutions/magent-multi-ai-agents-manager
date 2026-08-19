@@ -4,8 +4,17 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
-from magent.sessions.claude import build_claude_resume, get_claude_session_ids
-from magent.sessions.codex import build_codex_resume, get_codex_session_ids
+from magent.log import get_logger
+from magent.sessions.claude import (
+    build_claude_resume,
+    claude_fresh_command,
+    get_claude_session_ids,
+)
+from magent.sessions.codex import (
+    build_codex_resume,
+    codex_fresh_command,
+    get_codex_session_ids,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -17,6 +26,10 @@ class AgentTool:
 
     session_ids: Callable[[str, int], list[str | None]] | None = None
     resume_command: Callable[[str, str | None], str] | None = None
+    # (base_cmd, project_dir) -> the command to run when that directory has NO
+    # prior session for this tool to resume, or None to run base_cmd unchanged.
+    # See `build_start_command`.
+    fresh_command: Callable[[str, str], str | None] | None = None
     happy: bool = False  # can be wrapped with `happy` for mobile access
 
     @property
@@ -28,10 +41,14 @@ AGENT_TOOLS: dict[str, AgentTool] = {
     "claude": AgentTool(
         session_ids=get_claude_session_ids,
         resume_command=build_claude_resume,
+        fresh_command=claude_fresh_command,
         happy=True,
     ),
     "codex": AgentTool(
-        session_ids=get_codex_session_ids, resume_command=build_codex_resume, happy=True
+        session_ids=get_codex_session_ids,
+        resume_command=build_codex_resume,
+        fresh_command=codex_fresh_command,
+        happy=True,
     ),
 }
 
@@ -41,6 +58,60 @@ def build_resume_command(tool: str, base_cmd: str, session_id: str | None) -> st
     if caps and caps.resume_command:
         return caps.resume_command(base_cmd, session_id)
     return base_cmd
+
+
+def build_start_command(tool: str, base_cmd: str, project_dir: str | None) -> str:
+    """``base_cmd``, with its implicit "resume the latest conversation" flag
+    dropped when ``project_dir`` has nothing to resume.
+
+    The edge this exists for: ``claude --continue`` (the registry default)
+    fails outright in a directory that never hosted a conversation, leaving the
+    pane at a dead shell that every retry and every revive re-kills the same
+    way. The verdict is taken HERE, at command-build time, and never at
+    runtime: agent commands are delivered into psmux panes with send-keys, so
+    magent never observes the command's exit code -- and a shell-level
+    ``claude --continue || claude`` would relaunch a FRESH agent on any later
+    nonzero exit, silently discarding a live conversation and hiding auth or
+    CLI failures behind a fake recovery.
+
+    Only a positively-determined "this directory has no stored session"
+    rewrites anything. An unknown tool, a tool with no probe, an unresolvable
+    directory, a command carrying no implicit-resume flag, an explicitly named
+    session, and a probe that ERRORS all keep ``base_cmd`` exactly as
+    configured -- so a genuine resume failure stays visible in the pane, where
+    the user can read it.
+
+    ``project_dir`` must be a directory on the machine that will RUN the
+    command: pass None for a remote project rather than deciding it from this
+    machine's session store.
+    """
+    caps = AGENT_TOOLS.get(tool)
+    if not base_cmd or not project_dir or not caps or not caps.fresh_command:
+        return base_cmd
+    log = get_logger("launch")
+    try:
+        fresh = caps.fresh_command(base_cmd, project_dir)
+    except OSError:
+        # A probe that cannot read the session store proves nothing about
+        # whether a session exists. Keep the configured command and say so.
+        log.warning(
+            "could not probe %s sessions in %s; running %r as configured",
+            tool,
+            project_dir,
+            base_cmd,
+            exc_info=True,
+        )
+        return base_cmd
+    if fresh is None or fresh == base_cmd:
+        return base_cmd
+    log.info(
+        "no prior %s session in %s; starting fresh: %r -> %r",
+        tool,
+        project_dir,
+        base_cmd,
+        fresh,
+    )
+    return fresh
 
 
 # --- IDE tools (REC-F4) -------------------------------------------------------
@@ -131,15 +202,42 @@ def build_code_open_command(
 FLASH_MSG_MAX = 120
 
 
-def build_flash_url(server_url: str, project: str, message: str) -> str:
+# What a flash asks the status bar to LOOK like. Two values only: this is a
+# one-line bar saying whether the thing you pressed worked, not a palette.
+# It travels with EVERY message rather than only with failures, because psmux's
+# ``message-style`` is a global option on that socket -- set it once for a red
+# failure and every later message inherits red until something sets it back. A
+# green "cannot reach magent serve" is worse than no colour at all.
+FLASH_TINT_OK = "ok"
+FLASH_TINT_ERR = "err"
+
+
+def build_flash_url(
+    server_url: str,
+    project: str,
+    message: str,
+    duration_ms: int | None = None,
+    tint: str | None = None,
+) -> str:
     """URL that flashes ``message`` in the ``magent:<project>`` status line.
 
-    The F2 handler's only channel for on-screen feedback: hotkey.py runs in a
-    hidden background process with no terminal, so a failure it cannot report
-    through the upload server is invisible to the user. Pure string math, so
-    the shape stays testable on every OS (hotkey.py is win32-import-only).
+    The Alt+V/F2 handler's only channel for on-screen feedback: hotkey.py runs
+    in a hidden background process with no terminal, so a failure it cannot
+    report through the upload server is invisible to the user. Pure string math,
+    so the shape stays testable on every OS (hotkey.py is win32-import-only).
+
+    ``duration_ms`` is for a message that is a PHASE rather than a result: an
+    "uploading..." that expires while the upload is still running leaves a blank
+    bar, which reads exactly like the silence this whole channel exists to end.
+    Omitted, the server picks its own default. ``tint`` is FLASH_TINT_OK /
+    FLASH_TINT_ERR -- see their note on why it rides along on every message.
     """
-    return (
+    url = (
         f"{server_url.rstrip('/')}/api/flash"
         f"?project={quote(project)}&msg={quote(message[:FLASH_MSG_MAX])}"
     )
+    if duration_ms:
+        url = f"{url}&ms={int(duration_ms)}"
+    if tint:
+        url = f"{url}&tint={quote(tint)}"
+    return url

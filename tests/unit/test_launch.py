@@ -9,10 +9,12 @@ touching any OS-specific window/monitor API.
 from __future__ import annotations
 
 import os
+import sys
 import time
 
 import pytest
 
+from magent import launch
 from magent.config import MagentConfig, ProjectConfig, Settings, WindowConfig
 from magent.grid import MonitorRect, Rect, compute_grid
 from magent.launch import (
@@ -239,6 +241,139 @@ class TestTileTargets:
         assert "not found" in capsys.readouterr().out
 
 
+class TestRetileVisibleWindows:
+    """`--retile-all` (and menu option 2) tiles what is ON SCREEN right now.
+
+    Two bugs this pins shut: a `magent attach` pane -- a real magent-owned
+    window whose name is the REMOTE host's session name, so it is in no local
+    project -- used never to be tiled at all; and a configured window the user
+    had CLOSED was still enqueued, buying a poll deadline and a red "not
+    found" line for a window that (nothing launches under a retile) could
+    never appear.
+    """
+
+    def _cfg(self, tmp_path, *, prefix: bool = True, psmux: bool = False):
+        return MagentConfig(
+            projects=[ProjectConfig(path=str(tmp_path), tool="claude", title="proj")],
+            settings=Settings(
+                tools={"claude": "claude --continue"},
+                default_tool="claude",
+                psmux=psmux,
+                window_title_prefix=prefix,
+            ),
+        )
+
+    def _retile(self, monkeypatch, fp, cfg, **over):
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+        opts = RunOpts(retile_all=True, tile_only=True, **over)
+        return run_magent(cfg, opts)
+
+    def test_attach_window_absent_from_config_is_tiled(
+        self, monkeypatch, tmp_path, fake_sleep
+    ):
+        # "remote-host-api" is an attach pane: magent:-grammar title, no
+        # matching project. Badged, to prove discovery goes through parse_title.
+        fp = FakePlatform(
+            windows={"magent:proj": 111, "magent:[!] remote-host-api": 222}
+        )
+
+        rc = self._retile(monkeypatch, fp, self._cfg(tmp_path))
+
+        assert rc == 0
+        assert sorted(h for h, _ in fp.moved) == [111, 222]
+
+    def test_configured_but_closed_window_is_not_enqueued(
+        self, monkeypatch, tmp_path, fake_sleep, capsys
+    ):
+        fp = FakePlatform(windows={})
+
+        rc = self._retile(monkeypatch, fp, self._cfg(tmp_path))
+
+        assert rc == 0
+        assert fp.moved == []
+        out = capsys.readouterr().out
+        assert "not found" not in out
+        # No placement enqueued => place_windows never polls its deadline.
+        assert fake_sleep == []
+
+    def test_retile_launches_nothing(self, monkeypatch, tmp_path, fake_sleep):
+        # The hard requirement: a retile may move windows and nothing else,
+        # even with psmux configured and every configured window closed.
+        fp = FakePlatform(
+            supports_psmux=True, windows={"magent:[+] remote-host-api": 222}
+        )
+
+        rc = self._retile(monkeypatch, fp, self._cfg(tmp_path, psmux=True))
+
+        assert rc == 0
+        assert fp.launched_terminals == []
+        assert fp.launched_vscode == []
+        assert fp.launched_psmux == []
+        assert fp.attached_psmux == []
+        assert [h for h, _ in fp.moved] == [222]
+
+    def test_go_retile_all_still_launches_missing(
+        self, monkeypatch, tmp_path, fake_sleep
+    ):
+        # --go --retile-all keeps its combined meaning: launch what is missing,
+        # then tile everything -- including the attach pane.
+        fp = FakePlatform(windows={"magent:[!] remote-host-api": 222})
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+
+        rc = run_magent(self._cfg(tmp_path), RunOpts(retile_all=True, tile_only=False))
+
+        assert rc == 0
+        assert [t.title for t in fp.launched_terminals] == ["magent:proj"]
+        assert 222 in [h for h, _ in fp.moved]
+
+    def test_config_order_first_then_snapshot_order(
+        self, monkeypatch, tmp_path, fake_sleep
+    ):
+        # Deterministic slot assignment: configured targets keep config order,
+        # discovered windows follow in snapshot order.
+        fp = FakePlatform(
+            monitors=[
+                MonitorRect(x=0, y=0, w=1920, h=1080, is_primary=True, scale_factor=1.0)
+            ],
+            windows={"magent:extra-b": 2, "magent:proj": 1, "magent:extra-a": 3},
+        )
+        cfg = self._cfg(tmp_path)
+        cfg.layout.columns, cfg.layout.rows = 3, 1
+
+        rc = self._retile(monkeypatch, fp, cfg)
+
+        assert rc == 0
+        assert [h for h, _ in fp.moved] == [1, 2, 3]
+
+    def test_prefix_off_discovers_nothing(self, monkeypatch, tmp_path, fake_sleep):
+        # windowTitlePrefix off => titles are bare project names, so an
+        # on-screen window cannot be told apart from any other app's. Only the
+        # configured (exact-title) windows are tiled; nothing is guessed.
+        fp = FakePlatform(windows={"proj": 111, "magent:remote-host-api": 222})
+
+        rc = self._retile(monkeypatch, fp, self._cfg(tmp_path, prefix=False))
+
+        assert rc == 0
+        assert [h for h, _ in fp.moved] == [111]
+
+    def test_dry_run_preview_matches_the_corrected_set(
+        self, monkeypatch, tmp_path, fake_sleep, capsys
+    ):
+        fp = FakePlatform(windows={"magent:[x] remote-host-api": 222})
+
+        rc = self._retile(monkeypatch, fp, self._cfg(tmp_path), dry_run=True)
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Tiling 1 window(s)" in out
+        # Only the tiling preview is in scope here; the per-project launch log
+        # above it still lists every configured project.
+        preview = out.split("Tiling", 1)[1]
+        assert "remote-host-api" in preview
+        assert "proj" not in preview  # closed, so not previewed either
+        assert fp.moved == []
+
+
 class TestStartPsmuxAndUpload:
     """Direct unit tests for the extracted psmux+upload-server phase (R4,
     Step 3; renamed from the plan's _bring_up_psmux -- launch.py already has
@@ -396,6 +531,95 @@ class TestHotkeyRestartReason:
             None,
         )
         assert reason is not None
+
+
+class TestSupervisedHotkeyTarget:
+    """The supervisor must never RE-AIM a listener, only keep one alive.
+
+    `magent attach` deliberately points the listener at a REMOTE host so F2
+    opens projects over VS Code Remote-SSH. A serve-owned supervisor that
+    re-applied its own loopback URL every interval would fight attach forever:
+    each pass would see a "target change", kill the remote-wired listener and
+    spawn a local one, and F2 would be permanently broken on remote fleets.
+    Hence a separate entry point from ``start_hotkey_listener``, and hence this
+    pin.
+    """
+
+    def test_a_live_listener_keeps_its_own_url_and_ssh_host(self):
+        manifest = {
+            "version": "9.9.9",
+            "server_url": "http://deck:8034",
+            "ssh_host": "amin@deck",
+        }
+        assert launch.supervised_hotkey_target(manifest, "http://127.0.0.1:8034") == (
+            "http://deck:8034",
+            "amin@deck",
+        )
+
+    def test_a_local_listener_keeps_its_null_ssh_host(self):
+        manifest = {
+            "version": "9.9.9",
+            "server_url": "http://127.0.0.1:8034",
+            "ssh_host": None,
+        }
+        assert launch.supervised_hotkey_target(manifest, "http://other:1") == (
+            "http://127.0.0.1:8034",
+            None,
+        )
+
+    def test_no_manifest_falls_back_to_the_supervisors_own_target(self):
+        # A pre-3.6.0 listener; it is being restarted anyway ("no manifest" is
+        # a restart reason), and the default is the only target we can claim.
+        assert launch.supervised_hotkey_target(None, "http://127.0.0.1:8034") == (
+            "http://127.0.0.1:8034",
+            None,
+        )
+
+    def test_a_manifest_missing_its_url_falls_back_rather_than_aiming_at_none(self):
+        manifest = {"version": "9.9.9", "server_url": None, "ssh_host": "amin@deck"}
+        url, ssh_host = launch.supervised_hotkey_target(manifest, "http://fallback:1")
+        assert url == "http://fallback:1"
+        assert ssh_host == "amin@deck"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="hotkey is Windows-only")
+class TestEnsureHotkeyListener:
+    """The supervision entry point: idempotent, and target-preserving."""
+
+    def _wire(self, monkeypatch, *, pid, manifest=None):
+        calls: list[tuple[str, str | None]] = []
+        monkeypatch.setattr("magent.hotkey.listener_pid", lambda: pid)
+        monkeypatch.setattr("magent.hotkey.listener_manifest", lambda: manifest)
+        monkeypatch.setattr(
+            "magent.launch.start_hotkey_listener",
+            lambda url, ssh_host=None: calls.append((url, ssh_host)) or 4242,
+        )
+        return calls
+
+    def test_no_listener_spawns_one_at_the_supervisors_url(self, monkeypatch):
+        calls = self._wire(monkeypatch, pid=None)
+
+        assert launch.ensure_hotkey_listener("http://127.0.0.1:8034") == 4242
+        assert calls == [("http://127.0.0.1:8034", None)]
+
+    def test_a_remote_wired_listener_is_re_checked_against_its_own_target(
+        self, monkeypatch
+    ):
+        calls = self._wire(
+            monkeypatch,
+            pid=777,
+            manifest={
+                "version": "9.9.9",
+                "server_url": "http://deck:8034",
+                "ssh_host": "amin@deck",
+            },
+        )
+
+        launch.ensure_hotkey_listener("http://127.0.0.1:8034")
+
+        # NOT the supervisor's own loopback URL -- that would read as a target
+        # change and kill the listener `magent attach` set up.
+        assert calls == [("http://deck:8034", "amin@deck")]
 
 
 class TestLocalHotkeyListener:
@@ -814,6 +1038,130 @@ class TestWindowTitlePrefixDisabled:
         assert seen == [("proj", "exact")]
 
 
+class TestFreshStartInANewProjectDirectory:
+    """`claude --continue` resumes the CWD's most recent conversation. In a
+    project directory that never hosted one -- one just added to magent, a
+    fresh machine, a cleaned ~/.claude/projects -- there is nothing to
+    continue: claude errors out, the pane is left at a dead shell, the agent
+    never starts, and every revive re-runs the same failing command. The
+    single-window path is where the configured command reaches such a
+    directory verbatim (multi-window already routes through
+    build_resume_command, which strips the flag when it has no session id)."""
+
+    def _dispatch(self, monkeypatch, proj, cfg, *, has_session, is_remote=False):
+        monkeypatch.setattr(
+            "magent.sessions.claude.has_claude_session",
+            lambda project_dir, home_override=None: has_session,
+        )
+        fp = FakePlatform()
+        _dispatch_cli_agent_project(
+            fp,
+            cfg,
+            RunOpts(),
+            proj,
+            proj.tool or "claude",
+            is_remote,
+            None,
+            cfg.settings.tools,
+            False,
+            lambda key, mode: False,
+            [],
+            [],
+            {},
+        )
+        return fp.launched_terminals[0].command
+
+    def _cfg(self, proj, **tools):
+        return MagentConfig(
+            projects=[proj],
+            settings=Settings(tools=tools or {"claude": "claude --continue"}),
+        )
+
+    def test_no_prior_conversation_drops_the_continue_flag(
+        self, tmp_path, fake_sleep, monkeypatch
+    ):
+        proj = ProjectConfig(path=str(tmp_path), tool="claude", title="proj")
+        cmd = self._dispatch(monkeypatch, proj, self._cfg(proj), has_session=False)
+        assert cmd == "claude"
+
+    def test_a_prior_conversation_is_still_continued(
+        self, tmp_path, fake_sleep, monkeypatch
+    ):
+        proj = ProjectConfig(path=str(tmp_path), tool="claude", title="proj")
+        cmd = self._dispatch(monkeypatch, proj, self._cfg(proj), has_session=True)
+        assert cmd == "claude --continue"
+
+    def test_a_remote_project_is_never_decided_from_the_local_store(
+        self, tmp_path, fake_sleep, monkeypatch
+    ):
+        # The command runs on the far host: this machine's ~/.claude has no
+        # bearing on whether that host has a conversation to continue.
+        proj = ProjectConfig(
+            path=str(tmp_path), tool="claude", title="proj", host="deck"
+        )
+        monkeypatch.setattr(
+            "magent.sessions.claude.has_claude_session",
+            lambda project_dir, home_override=None: pytest.fail(
+                "probed the local session store for a remote project"
+            ),
+        )
+        fp = FakePlatform()
+        _dispatch_cli_agent_project(
+            fp,
+            self._cfg(proj),
+            RunOpts(),
+            proj,
+            "claude",
+            True,
+            None,
+            self._cfg(proj).settings.tools,
+            False,
+            lambda key, mode: False,
+            [],
+            [],
+            {},
+        )
+        assert fp.launched_terminals[0].command == "claude --continue"
+
+    def test_an_explicit_per_window_command_is_never_rewritten(
+        self, tmp_path, fake_sleep, monkeypatch
+    ):
+        # windows[i].command is the user's literal command line. Even in a
+        # directory with no conversation, magent runs exactly what it says.
+        proj = ProjectConfig(
+            path=str(tmp_path),
+            tool="claude",
+            title="proj",
+            windows=[WindowConfig(command="claude --continue --verbose")],
+        )
+        cmd = self._dispatch(monkeypatch, proj, self._cfg(proj), has_session=False)
+        assert cmd == "claude --continue --verbose"
+
+    def test_a_per_window_tool_override_gets_the_same_treatment(
+        self, tmp_path, fake_sleep, monkeypatch
+    ):
+        # One window, overridden to a tool whose configured command carries
+        # the flag: the override runs through the same probe as the base tool.
+        proj = ProjectConfig(
+            path=str(tmp_path),
+            tool="codex",
+            title="proj",
+            windows=[WindowConfig(tool="claude")],
+        )
+        cfg = self._cfg(proj, codex="codex", claude="claude --continue")
+        cmd = self._dispatch(monkeypatch, proj, cfg, has_session=False)
+        assert cmd == "claude"
+
+    def test_a_tool_with_no_resume_flag_is_untouched(
+        self, tmp_path, fake_sleep, monkeypatch
+    ):
+        proj = ProjectConfig(path=str(tmp_path), tool="codex", title="proj")
+        cmd = self._dispatch(
+            monkeypatch, proj, self._cfg(proj, codex="codex"), has_session=False
+        )
+        assert cmd == "codex"
+
+
 class TestPerWindowToolOverride:
     """Regression pins for the per-window ``tool`` override (P3-06 follow-up).
 
@@ -1174,3 +1522,221 @@ class TestBaseDirExpansion:
 
         assert len(out) == 1
         assert out[0]["resolved"] == str(proj_dir)
+
+
+class TestUploadServerLiveness:
+    """The probe + argv the upload-server watchdog is built out of.
+
+    Both spawn sites (the bring-up ensure and the attention daemon's
+    supervisor) share one argv builder on purpose: a revived server that
+    differed from the one the launch path starts -- a different interpreter, a
+    dropped --config, another port -- would be a second, subtly different
+    product running under the same name.
+    """
+
+    def test_the_argv_carries_the_interpreter_config_and_port(self):
+        argv = launch.upload_server_argv(8099, "C:/cfg/magent.config.json")
+
+        assert argv == [
+            sys.executable,
+            "-m",
+            "magent",
+            "--config",
+            "C:/cfg/magent.config.json",
+            "serve",
+            "-p",
+            "8099",
+        ]
+
+    def test_no_config_path_means_the_child_resolves_its_own(self):
+        assert "--config" not in launch.upload_server_argv(8099, None)
+
+    def test_ensure_spawns_when_nothing_answers(self, monkeypatch):
+        spawned: list[list[str]] = []
+        monkeypatch.setattr(launch, "_probe_upload_port", lambda _p: False)
+        monkeypatch.setattr(launch, "spawn_detached", spawned.append)
+
+        assert launch.ensure_upload_server(8099, "cfg.json") is True
+        assert spawned and spawned[0][-2:] == ["-p", "8099"]
+
+    def test_ensure_is_a_no_op_when_the_port_answers(self, monkeypatch):
+        spawned: list[list[str]] = []
+        monkeypatch.setattr(launch, "_probe_upload_port", lambda _p: True)
+        monkeypatch.setattr(launch, "spawn_detached", spawned.append)
+
+        assert launch.ensure_upload_server(8099, "cfg.json") is False
+        assert spawned == []
+
+
+class TestUploadSupervisionSettings:
+    """The two env knobs, read through the same degrade-to-default posture the
+    hotkey supervisor uses: a detached daemon must never die of an environment
+    variable it doesn't use."""
+
+    def test_supervision_is_on_by_default(self, monkeypatch):
+        # The PRODUCT default, read with the var genuinely absent -- the suite's
+        # own isolation fixture pins it to "0" so no unit test can spawn a real
+        # server, and that must not be mistaken for the shipped behaviour.
+        monkeypatch.delenv("MAGENT_UPLOAD_SUPERVISOR", raising=False)
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+        assert launch.upload_supervision_enabled() is True
+
+    def test_the_env_var_turns_it_off(self, monkeypatch):
+        monkeypatch.setenv("MAGENT_UPLOAD_SUPERVISOR", "0")
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+        assert launch.upload_supervision_enabled() is False
+
+    def test_the_default_cooldown_is_the_module_constant(self):
+        assert launch.upload_respawn_cooldown_s() == launch.UPLOAD_RESPAWN_COOLDOWN_S
+
+    def test_the_cooldown_is_configurable(self, monkeypatch):
+        monkeypatch.setenv("MAGENT_UPLOAD_RESPAWN_COOLDOWN_S", "2.5")
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+        assert launch.upload_respawn_cooldown_s() == 2.5
+
+    def test_a_negative_cooldown_clamps_to_zero(self, monkeypatch):
+        monkeypatch.setenv("MAGENT_UPLOAD_RESPAWN_COOLDOWN_S", "-5")
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+        assert launch.upload_respawn_cooldown_s() == 0.0
+
+    def test_a_broken_environment_degrades_to_supervising(self, monkeypatch):
+        # An unknown MAGENT_* var makes the closed schema raise. Every other
+        # consumer has already failed loudly at CLI entry by the time a daemon
+        # is running, so the supervisor keeps supervising rather than dying.
+        monkeypatch.setenv("MAGENT_NOT_A_REAL_SETTING", "1")
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+        assert launch.upload_supervision_enabled() is True
+        assert launch.upload_respawn_cooldown_s() == launch.UPLOAD_RESPAWN_COOLDOWN_S
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+class TestUploadServerSupervisor:
+    """The decision logic behind `attention -d`'s revive of a dead `serve`.
+
+    Detection latency is the poll interval; the RESPAWN rate is bounded by the
+    cooldown. That split is the whole design -- looking is free, spawning is
+    not, and a serve that crashes on startup must not be hot-respawned.
+    """
+
+    def _wire(self, monkeypatch, *, alive: list[bool]) -> list[list[str]]:
+        """`alive` is consumed one entry per tick (the port probe's answer)."""
+        spawned: list[list[str]] = []
+        answers = iter(alive)
+        monkeypatch.setattr(launch, "_probe_upload_port", lambda _p: next(answers))
+        monkeypatch.setattr(launch, "spawn_detached", spawned.append)
+        return spawned
+
+    def test_a_dead_port_is_respawned_on_the_configured_port(self, monkeypatch):
+        spawned = self._wire(monkeypatch, alive=[False])
+        sup = launch.UploadServerSupervisor(8099, "cfg.json", now=_FakeClock())
+
+        assert sup.tick() is True
+        assert spawned == [
+            [
+                sys.executable,
+                "-m",
+                "magent",
+                "--config",
+                "cfg.json",
+                "serve",
+                "-p",
+                "8099",
+            ]
+        ]
+
+    def test_a_live_port_is_left_alone(self, monkeypatch):
+        spawned = self._wire(monkeypatch, alive=[True])
+        sup = launch.UploadServerSupervisor(8099, now=_FakeClock())
+
+        assert sup.tick() is False
+        assert spawned == []
+
+    def test_the_cooldown_suppresses_a_second_spawn(self, monkeypatch):
+        spawned = self._wire(monkeypatch, alive=[False, False, False])
+        clock = _FakeClock()
+        sup = launch.UploadServerSupervisor(8099, cooldown_s=60.0, now=clock)
+
+        assert sup.tick() is True
+        clock.t += 1.0
+        assert sup.tick() is False
+        clock.t += 58.0  # still inside the 60s window
+        assert sup.tick() is False
+        assert len(spawned) == 1
+
+    def test_it_tries_again_once_the_cooldown_expires(self, monkeypatch):
+        spawned = self._wire(monkeypatch, alive=[False, False])
+        clock = _FakeClock()
+        sup = launch.UploadServerSupervisor(8099, cooldown_s=60.0, now=clock)
+
+        assert sup.tick() is True
+        clock.t += 60.0
+        assert sup.tick() is True
+        assert len(spawned) == 2
+
+    def test_a_healthy_tick_inside_the_cooldown_costs_nothing(self, monkeypatch):
+        # The cooldown gate is reached only when the port is dead: a server that
+        # came up is never probed for a pid or judged against a timer.
+        spawned = self._wire(monkeypatch, alive=[False, True])
+        clock = _FakeClock()
+        sup = launch.UploadServerSupervisor(8099, cooldown_s=60.0, now=clock)
+
+        sup.tick()
+        clock.t += 1.0
+        assert sup.tick() is False
+        assert len(spawned) == 1
+
+    def test_the_default_cooldown_comes_from_the_environment(self, monkeypatch):
+        monkeypatch.setenv("MAGENT_UPLOAD_RESPAWN_COOLDOWN_S", "3")
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+        assert launch.UploadServerSupervisor(8099).cooldown_s == 3.0
+
+    def test_the_warning_diagnoses_the_recorded_pid(self, monkeypatch, caplog):
+        # The pid is diagnostic, never decisive: run_server writes its pid file
+        # AFTER the bind, so the pid can't be the earlier signal, and a recycled
+        # pid number would blind the watchdog forever. What it buys is a log
+        # line that tells "the process is gone" (the observed failure) apart
+        # from "it's alive but not answering" (a wedge).
+        self._wire(monkeypatch, alive=[False])
+        monkeypatch.setattr("magent.upload_server.server_pid", lambda _p: 4321)
+        monkeypatch.setattr(launch, "pid_alive", lambda _p: False)
+        sup = launch.UploadServerSupervisor(8099, now=_FakeClock())
+
+        with caplog.at_level("WARNING", logger="magent.attention"):
+            sup.tick()
+
+        assert "recorded pid 4321 is gone" in caplog.text
+        assert "8099" in caplog.text
+
+    def test_a_wedged_server_is_still_reported_honestly(self, monkeypatch, caplog):
+        self._wire(monkeypatch, alive=[False])
+        monkeypatch.setattr("magent.upload_server.server_pid", lambda _p: 4321)
+        monkeypatch.setattr(launch, "pid_alive", lambda _p: True)
+        sup = launch.UploadServerSupervisor(8099, now=_FakeClock())
+
+        with caplog.at_level("WARNING", logger="magent.attention"):
+            sup.tick()
+
+        assert "recorded pid 4321 is alive" in caplog.text
+
+    def test_no_pid_file_says_so(self, monkeypatch, caplog):
+        self._wire(monkeypatch, alive=[False])
+        monkeypatch.setattr("magent.upload_server.server_pid", lambda _p: None)
+        sup = launch.UploadServerSupervisor(8099, now=_FakeClock())
+
+        with caplog.at_level("WARNING", logger="magent.attention"):
+            sup.tick()
+
+        assert "no pid file" in caplog.text

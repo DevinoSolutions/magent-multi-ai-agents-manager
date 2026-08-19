@@ -148,6 +148,34 @@ Each magent session brands its psmux status bar — `magent` on the left, its wi
 
 `F2` needs `code` on your PATH; `magent up` refreshes the branding and hints on sessions that were already running. magent sets both halves per session, so they win over a personal `~/.tmux.conf`.
 
+#### Attach windows reconnect themselves
+
+`magent attach <host>` opens one window per remote session, and each one runs a small supervisor (`magent-attach-client`) instead of a bare `ssh`. When the connection dies — laptop sleep, wi-fi change, VPN flap, host reboot — the pane no longer freezes on `client_loop: send disconnect` and then sits there dead as `[process exited with code 255]`. It waits (2s, doubling to a 30s ceiling) and dials again, forever, until the host answers.
+
+A whole outage costs **one line**, rewritten in place — not a scroll of retries. The counters tick down where they are, and ssh's own `connect to host ... timed out` noise is folded into the `last:` clause instead of filling the pane:
+
+```text
+  ~ reconnecting to me@desk (attempt 4, retry in 16s, last: Connection timed out) -- Ctrl+C to stop
+```
+
+That line lives on the **bottom row of the pane, and nowhere else**. When the connection dies your agent's screen is left exactly as it was — mid-answer, and with whatever you had typed into the prompt box and not yet sent still sitting there, readable, on the row it was always on. The reconnect warning never draws over it. (It used to: it painted wherever the cursor happened to be, which in an agent pane is the end of your half-written sentence.)
+
+Narrow panes drop the hint, then the host name, then the reason — the attempt and the countdown are the last things to go. Redirected panes (`magent attach ... > log`) get one plain line per attempt instead, with no cursor tricks. When a reconnected session eventually ends, the pane leaves one permanent record of the outage it survived (`+ reconnected to me@desk after 4 attempt(s); stayed up 1h04m`).
+
+Nothing is lost while it waits: the psmux session lives on the **host**, so the reattached pane comes back to the same running agent, the same scrollback, and the same unsent prompt text — the agent is holding it, not your terminal. You can even keep typing during the outage: what you type is buffered by your terminal and delivered to the agent as soon as the connection is back. You do not have to close a wall of dead terminals and re-run `magent attach` any more.
+
+Only a **deliberate detach** closes a pane. When a connection ends, the supervisor asks the host — over a separate, one-shot SSH check — whether your session is still alive. If it is, you left on purpose (`F1`, or `psmux detach`), the pane says `detached from <session>` and exits. If the session is *not* there (host rebooting, a bring-up still in progress), the pane keeps dialling for a few more tries and only then stops and tells you to run `magent attach` — so it never hammers a healthy SSH server over a session that is gone for good. `Ctrl+C` stops the supervisor immediately at any point.
+
+That check exists because an exit code alone cannot be trusted: **Windows OpenSSH doesn't report a remote command's exit status back over an interactive session**, so a session that *died* on the host looked exactly like a clean detach. Panes used to close on that — one wi-fi flap, forty windows gone, each announcing a "detach" you never asked for. The separate check drops the interactive pseudo-terminal, which is what makes the host's answer truthful on every OS.
+
+`magent attach --no-reconnect` restores the old one-shot behavior (one connection, no check). `--no-mux` panes are never supervised — without a multiplexer the agent dies with the connection, so there is nothing to reattach to.
+
+#### Your sessions survive your connection
+
+A dropped connection must never kill work on the host. That is not automatic on Windows: OpenSSH runs everything an SSH session starts inside a *job object* that it destroys when the connection closes, and every child inherits it — so a psmux session created by a remote `magent up` (which is exactly what `magent attach` does) used to be owned by your laptop's wi-fi. One flap and the host's psmux servers, and the agents inside them, were killed. magent now creates sessions with an explicit break-out from that job, so a session's lifetime is tied to the host, not to the connection that asked for it.
+
+Note that `magent down --all` *is* the deliberate way to stop everything: it kills every psmux session on the machine along with the agent running in each, not just the daemons. Name sessions explicitly (`magent down api web`) or use `-g/--group` to stop a subset.
+
 ### Mobile image upload (over Tailscale)
 
 Send screenshots from your phone straight into a project's agent session:
@@ -156,9 +184,21 @@ Send screenshots from your phone straight into a project's agent session:
 "settings": { "psmux": true, "uploadServer": true, "uploadPort": 8033 }
 ```
 
-`magent serve` (or `uploadServer: true` during launch) starts a small HTTP server; `magent mobile` prints the phone URL + a QR code you can install as a home-screen app (the QR code needs the optional `qr` extra: `pip install magent-multi-ai-agents-manager[qr]`). Pick a project on the phone, upload an image, and its path is pasted into that project's session. On a desktop browser you can also **Ctrl+V** an image from the clipboard: the page stages it with a preview showing which project it will go to, waits for you to confirm with **Send**, and shows live upload progress until the "pasted into …" confirmation. The Alt+V hotkey (Windows) does the same for whatever `magent:` session is focused.
+`magent serve` (or `uploadServer: true` during launch) starts a small HTTP server on this config's `uploadPort` — the same port `magent status`, `up` and `doctor` watch, so a bare `magent serve` and the rest of the tool can't disagree about where the server is (`-p` still overrides it; with no readable config the port falls back to 8033). `magent mobile` prints the phone URL + a QR code you can install as a home-screen app (the QR code needs the optional `qr` extra: `pip install magent-multi-ai-agents-manager[qr]`). Pick a project on the phone, upload an image, and its path is pasted into that project's session. On a desktop browser you can also **Ctrl+V** an image from the clipboard: the page stages it with a preview showing which project it will go to, waits for you to confirm with **Send**, and shows live upload progress until the "pasted into …" confirmation. The Alt+V hotkey (Windows) does the same for whatever `magent:` session is focused.
 
 This works **over Tailscale**: the server binds only the loopback and your machine's Tailscale IP — never the LAN wildcard — and `attach`/`mobile`/`termius` shell out to the `tailscale` CLI to resolve hosts. Devices must be on your tailnet; there is deliberately no auth token, since the bind set is the access control. To bind something else (e.g. LAN-wide), use the escape hatch: `magent serve --host 0.0.0.0`.
+
+#### The Alt+V listener stays alive by itself
+
+The upload server owns the Alt+V listener: while `magent serve` runs it makes sure a listener exists, restarts one that died or is running older code after an upgrade, and leaves alone one that `magent attach` pointed at another machine. So Alt+V survives reboots, crashes and upgrades — start the server (directly, or via `magent --go` / `magent attach`) and the hotkey follows.
+
+If it *isn't* working you will be told, rather than left guessing:
+
+- `magent status` prints `Alt+V listener   DEAD  (upload server is up but no listener — Alt+V does nothing)` in red and **exits 3**, with the repair command underneath. `magent doctor` fails the `hotkey` check with the same hint. A listener that is simply not expected yet (no server running) still reads as a quiet `off`.
+- Every press narrates itself in that project's status line, starting the instant the chord is detected: `Alt+V: capturing...` (before the clipboard is even read) → `Alt+V: uploading...` → `Alt+V: image sent`. A press that can't complete ends in a **specific** reason rather than a generic failure — `clipboard has no image - copy one first`, `cannot reach magent serve (connection refused)`, `serve said HTTP 400: Unknown project`, `saved, but psmux would not paste it`. The narration never delays the press: it is queued and delivered on its own thread, and a dead server costs a paste nothing.
+- Every press is also recorded in `~/.magent/logs/hotkey.log` as one `ALTV outcome=… project=…` line — so `grep ALTV ~/.magent/logs/hotkey.log` is the whole history of the chord — and `magent serve` logs each status-line message it served (`flash project=… msg=…` in `~/.magent/logs/upload.log`), so "the status didn't show" is answerable after the fact.
+
+To own the listener's lifetime yourself, set `MAGENT_HOTKEY_SUPERVISOR=0`; `status` still reports whether one is running.
 
 ## Usage
 
@@ -187,17 +227,17 @@ Or skip the menu with flags:
 | --- | --- |
 | `magent` | Interactive menu. |
 | `magent --go` | Launch + tile new windows, no menu. |
-| `magent --retile-all` | Re-tile every matching window. |
+| `magent --retile-all` | Re-tile every magent window that is open right now — including `magent attach` windows, which belong to a remote host's sessions and are in no local project. Launches nothing; a closed window is skipped, not waited on. |
 | `magent -g <name>` | Launch only projects in a group. |
 | `magent --init` | Re-scan sessions and regenerate config. |
 | `magent --init --base-dir <folder>` | Generate config from a folder of git repos. |
 | `magent --edit` | Open config in your default editor. |
 | `magent docs` | Print full config reference (Markdown). |
-| `magent doctor [--json]` | Diagnose the environment: config, env vars, agent tools on PATH, terminal, monitors, writable dirs, Tailscale, upload port. Exit 1 on any failure. |
+| `magent doctor [--json]` | Diagnose the environment: config, env vars, agent tools on PATH, terminal, a wedged psmux control plane (see below), monitors, writable dirs, Tailscale, upload port. Exit 1 on any failure. |
 | `magent sessions` | List active psmux sessions, pick one to attach. |
 | `magent sessions <name>` | Attach directly to a psmux session by name. |
 | `magent up [--json] [-g <group>] [--revive]` | Host side: ensure a persistent psmux session per project, and re-launch the agent in any live session whose pane fell back to a bare shell (e.g. after a Ctrl-C). Reviving is automatic except under `--json`, which stays a pure read unless `--revive` is passed. |
-| `magent attach <host>` | From another PC: bring host sessions up over SSH, tile locally, Alt+V uploads, F2 opens the project in VS Code over Remote-SSH. |
+| `magent attach <host> [--no-reconnect]` | From another PC: bring host sessions up over SSH, tile locally, Alt+V uploads, F2 opens the project in VS Code over Remote-SSH. Panes reconnect themselves after a dropped connection (see below); `--no-reconnect` opts out. |
 | `magent watch` | Live table of every agent session, most-urgent first; press a row number to focus that window. |
 | `magent attention [-d] [--stop]` | Attention daemon: badges window titles with agent state, flashes the taskbar on needs-input/error, optional toast/ntfy push (`settings.attention`). Badges/flash/toast are Windows-only; ntfy push is cross-platform — see [Platform support](#platform-support). |
 | `magent status [--json]` | Session + daemon health (incl. an `agents` state list in `--json`). Exit codes: 0 healthy, 1 config error, 3 degraded. |
@@ -209,6 +249,23 @@ Or skip the menu with flags:
 | `magent hooks install` | Wire the agent lifecycle hooks that feed the session-state store (`magent hooks status` to inspect) — see [Where agent states come from](#where-agent-states-come-from). |
 | `magent config <subcommand>` | Edit config from the CLI — 17 subcommands incl. `migrate`; see `magent config --help`. |
 | `magent config edit [host]` | Edit the config on **another** machine in your editor over SSH — fetch, edit, validate, push back. Omit the host to reuse your last `attach` target. The host side is `magent config cat` / `magent config put`, which you never run by hand. |
+
+### When every psmux command hangs (the wedge)
+
+Rare, and worth knowing before it happens: psmux's control plane can wedge
+machine-wide. Every command — `has-session`, `list-sessions`, `new-session` —
+hangs forever, from any console, and the whole fleet looks dead.
+
+It isn't. `magent doctor` probes the control plane once (bounded, 5 s) and
+fails the `psmux wedge` check with the repair:
+
+- your sessions are **frozen, not dead** — do not restart them, and do not
+  reboot;
+- find the `conhost.exe` processes whose parent chain reaches a dead pid or a
+  `psmux.exe`, and kill only those (it was 14 of 874 conhosts in the incident
+  this check comes from);
+- psmux answers again immediately afterwards, and every session comes back
+  intact.
 
 ## Platform support
 

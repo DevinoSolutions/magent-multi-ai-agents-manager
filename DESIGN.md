@@ -77,6 +77,13 @@ None of these imports any other `magent` module (`style.py` imports
   config-path leaf lived inside `cli`, `upload_server` would depend back on
   the very package that transitively pulls it in) — this is the structural
   fix for what used to be a latent `cli`↔`upload_server` load cycle (LS-A-001).
+- **`altv.py`** — one Alt+V press, from chord to outcome: the phase
+  narration, the upload, the closed outcome vocabulary and the single FIFO
+  flash pump. Imports `log` and `sessions` only. It is deliberately NOT part
+  of `hotkey.py`: that module raises `ImportError` off win32, and everything
+  here is plain sockets and strings, so keeping it separate is what makes the
+  press pipeline importable — and testable against a real `magent serve` — on
+  Linux and macOS.
 - **`style.py`** — `style = click.style`, a one-line shared shortcut. It used
   to be independently defined twice (once in the old monolithic `cli.py`,
   once in `launch.py`); both call sites now import `style` from here
@@ -215,6 +222,16 @@ None of these imports any other `magent` module (`style.py` imports
   by design — every call site imports it lazily, behind a `supports_hotkey()`
   gate, with a `# ImportError off-Windows (hotkey.py guards); must stay lazy`
   comment at the import. Imports only `log` and `titles` from `magent`.
+- **`attach_client.py`** — the reconnecting ssh supervisor that runs inside
+  every `magent attach` pane, shipped as its own `magent-attach-client`
+  console script (see Key Decisions). Imports `magent.style` only; `argparse`
+  is imported in-body because `cli/attach.py` imports this module at the top
+  level (for `SSH_KEEPALIVE_OPTS` / `remote_attach_command` / the client exe
+  name) and the registration hub would otherwise put argparse on `magent
+  --help`'s critical path. It owns the two strings `cli/attach.py`'s corpse
+  detection is coupled to — the ssh keepalive options and the remote attach
+  command — so the marker `_attach_markers` scans for and the command a pane
+  actually runs cannot drift apart.
 
 ### `cli/` command modules
 
@@ -493,17 +510,789 @@ retroactively turn an unrelated commit red at pre-push. The same reasoning
 keeps the job out of the branch ruleset's required checks initially; promote
 it once its flake rate is known.
 
+**Attach panes are supervised, and the supervisor is a console script, not a
+subcommand (added 2026-08-09).** An attach pane used to be `wt -- ssh -t
+<target> "psmux -L <sid> attach || magent sessions <sid>"`. The first
+disconnect killed it dead: OpenSSH exits 255, Windows Terminal keeps the pane,
+and the user was left closing forty `[process exited with code 255]` terminals
+by hand before re-running `magent attach`. `attach_client.py` now runs between
+wt and ssh and redials on transport failure. Three decisions inside that are
+easy to "clean up" wrongly:
+
+*Why a separate entry point.* `magent-attach-client` exists for exactly the
+reason `magent-state-hook` does: a 40-window attach starts 40 of these, and
+booting the click CLI in each (the registration hub imports every command
+module, then a config load) is the cost that once made a big attach take
+minutes. That is also why the remote command is still a direct `psmux attach`
+with the session picker only as a fallback.
+
+*Why 255 is special.* OpenSSH reserves 255 for its own failures, and it is the
+LOCAL client that reports it, so it is trustworthy on every OS and needs no
+corroboration. It loops, forever, on a 2s-doubling ladder capped at 30s (an
+all-night outage is then two handshakes a minute), with the ladder reset after
+any connection that lasted 30s so a long-lived pane heals a blip in two seconds
+rather than at the cap. This is the flaky-wi-fi hot path and it deliberately
+costs no extra round-trip.
+
+*Why exit 0 is NOT trusted, and what replaced it (revised 2026-08-17).* The
+original table read exit 0 as "the user detached" and everything else as "the
+remote command failed"; both stopped the pane. **Windows OpenSSH does not
+propagate a remote command's exit status over a pty** — `ssh -t win-host
+"exit 7"` reports 0 where POSIX sshd reports 7 — and a magent host is usually
+Windows, because psmux is Windows-native. So a session that DIED on the host
+handed the pane a 0 and the pane closed, announcing a detach the user never
+asked for. Reported live: flaky wi-fi, forty windows gone, every one of them
+claiming it was deliberate.
+
+The fix is a second, out-of-band question. After any exit that is not 255 the
+supervisor runs `ssh <target> "psmux -L <sid> has-session -t <sid>"` —
+**without `-t`**, which is the whole trick: remote exit codes ARE truthful over
+a non-pty channel on every OS. Alive means the client left while the work kept
+running (a real detach, a quit picker, a killed ssh child) and the pane stops.
+Anything else means keep dialling. Three details are load-bearing:
+
+- *Only a positive rc 0 stops a pane.* A host with psmux missing from its sshd
+  PATH answers 9009/127, an unreachable host answers 255, a timeout answers
+  nothing — all of which keep the pane trying. Biasing every ambiguous answer
+  toward "retry" is the direction the user asked for on a flaky link.
+- *`-t <sid>` is mandatory* for the same reason `psmux.has_session` documents:
+  a bare `has-session` exits 0 for a socket with no server (psmux keeps
+  `__warm__` spares), which here would report every dead session as a
+  deliberate detach — reintroducing the exact bug.
+- *"Gone" is bounded, not infinite.* A host mid-reboot, or a 45-session
+  `magent up` still working, genuinely answers "gone" for a minute and then
+  "alive", so the pane retries; but a session the user really did `magent down`
+  is never coming back, so after `SESSION_MISSING_MAX` consecutive gone answers
+  the pane stops and says why rather than dialling a healthy sshd forever.
+
+*Why not an in-band sentinel.* The obvious alternative — have the remote
+command echo a marker on clean detach and scan the pane's output for it —
+requires the supervisor to sit between ssh and the console. `_run_ssh`'s entire
+contract is that it never does: the child inherits the real console handles, so
+colors, mouse reporting and resize reach ssh untouched. Piping to read a
+sentinel would cost every attach pane its interactivity to answer one question
+a second connection answers for free. The probe also needs nothing new on the
+host, so an old host works with a new client, and an old client (which never
+probes) behaves exactly as it did.
+
+*Why the real-ssh redial test dials an unroutable address* instead of asking a
+remote command to exit 255: that stand-in silently became a no-op on Windows
+and reported a green reconnect that never happened.
+
+*Why the supervisor must carry the attach marker.* `cli/attach.py` decides a
+pane is a corpse by scanning live process command lines for `-L <sid> attach`.
+During a backoff sleep there is NO ssh process — so if the supervisor's own
+command line did not carry that marker, `_sweep_dead_windows` would close the
+window precisely while it was healing itself. `_spawn_windows` therefore passes
+the remote command as the supervisor's `--remote` argument (rather than letting
+it rebuild the command from `--session`), which puts the marker in the argv for
+free, and `_CLIENT_PROCESS_NAMES` gained `magent-attach-client.exe`. Widening
+that list can only ever make FEWER windows look dead, so the risky direction of
+the corpse decision was not widened. The corpse machinery is NOT redundant
+afterwards: it now answers "is anything driving this pane at all", which is
+still "no" for a supervisor that failed to spawn, one the user Ctrl+C'd, one
+that stopped on a failing remote command, and every pane from `--no-reconnect`
+or an older magent.
+
+*Not applied to `--no-mux`.* Without a multiplexer the agent is a child of the
+ssh session, so a drop kills it; reconnecting would start a SECOND agent on a
+conversation the user believes is still running. Reconnect is a psmux feature
+because psmux is what makes the far side outlive the connection.
+
+**An outage is a status line, not a log (2026-08-18).** Reconnecting correctly
+turned out to be only half the job: a real wi-fi outage printed three lines per
+attempt — our drop notice, our redial notice, and ssh's own `connect to host
+... Connection timed out` — so ten minutes of flapping pushed thirty lines of
+identical news through the pane the user was working in. The supervisor now
+owns exactly one row while it is healing (`status_text` composes it,
+`StatusLine` rewrites it with `\r\x1b[2K`), and the changing numbers live
+inside it. Four decisions worth keeping:
+
+- *The line is clipped to the terminal width, always.* This is the load-bearing
+  one. A status line wider than the pane wraps, the next carriage return then
+  lands on the wrap remnant instead of the line's start, and the "one row"
+  becomes an unbounded scroll of half-lines — which is precisely the garbage
+  the user reported seeing. `status_text` is pure and separate from the writer
+  so that property is provable without a terminal, and it degrades in a
+  deliberate order: the fixed `Ctrl+C` hint goes first, then the target (it is
+  in the window title already), and the attempt/countdown go last.
+- *ssh's own stderr is captured, not fought.* The noisiest lines come from the
+  ssh CHILD, so no amount of repainting on our side can quiet them; only a pipe
+  on fd 2 can. That is safe for two independent reasons, both verified rather
+  than assumed: OpenSSH asks for passwords, passphrases and host-key
+  confirmations through `read_passphrase()`, which opens the controlling
+  terminal directly (`/dev/tty`, or the console on the Windows port) precisely
+  so prompts survive redirection — so piping fd 2 cannot swallow a prompt; and
+  the connection is made with `-t`, so the remote command's stdout AND stderr
+  arrive multiplexed through the pty on our STDOUT, which stays inherited. Only
+  ssh's own diagnostics land on the pipe, which is exactly what the `last: ...`
+  clause reports. stdin and stdout are never redirected — the module stays a
+  waiter, never a middleman. Two escape hatches keep the swallow honest: a
+  changed host key is passed straight through (`STDERR_ALWAYS_SHOW`), and the
+  captured tail is dumped verbatim when the pane gives up.
+- *The "reconnected" record is written at the drop that ENDED the restored
+  session, not the moment it came back.* At that moment ssh owns the console
+  and the remote psmux has entered the alternate screen, so a line printed
+  there lands inside the user's agent pane as garbage no redraw will repair.
+  There is also no reliable establishment signal to print on: `ConnectTimeout`
+  is 20s, so a child alive at t+2s is just as likely to be a hanging connect as
+  a live session, and announcing on that guess would print a lie per attempt
+  against a host that is down. Scrollback order is identical either way — the
+  record still sits between the outage it ended and the next one.
+- *Redirected panes and `--no-reconnect` get none of it.* `_stdout_is_tty` is
+  checked once; without a tty there is no cursor animation (carriage returns in
+  a log file are unreadable) and no stderr capture, so a piped pane keeps one
+  plain line per attempt and ssh's errors keep landing on fd 2 where a log
+  expects them. `--no-reconnect`'s promise is the historical bare-ssh pane down
+  to which fd ssh writes on, so it opts out of both regardless of the tty.
+
+**The status line owns the bottom row, and only the bottom row (2026-08-18).**
+The first version of the above drew with a bare `\r\x1b[2K` — carriage return,
+erase this row — at wherever the cursor happened to be. That turned out to be
+the single worst place available. When ssh dies mid-session the terminal is
+still in the ALTERNATE SCREEN: the remote psmux sent `\x1b[?1049h` on attach and
+the process that would have sent the matching `l` is the one that just died. So
+the pane keeps showing the agent's frozen last frame, with the cursor parked
+exactly where that TUI left it — inside the prompt box, at the end of whatever
+the user had typed and not yet sent. The reconnect warning erased their
+sentence. Reported as "don't replace the text that is written in Claude Code,
+because we may have text typed from before that we'd want to still send".
+
+Every claim in that paragraph was measured under a real pty rather than reasoned
+about (`tests/e2e/test_pty_attach_status.py`, which stages a real frozen frame
+and replays the real byte stream through a small VT model in
+`tests/e2e/_screen.py`, because a pty reports what a child WROTE and the
+question is about what the terminal DREW). Four decisions:
+
+- *There is no free row in a full-screen TUI, so stop looking for one.* The
+  obvious fix is "own your own line": emit one `\n` to scroll a blank row into
+  existence and repaint only there. On the normal screen that is free — the
+  displaced row lands in scrollback. In the ALTERNATE screen there is no
+  scrollback, so the scroll does not create a row, it DESTROYS the top one and
+  shifts every remaining row up. That trades the bottom row (a hint line) for
+  the top row (the oldest visible conversation) plus a whole-frame jump.
+- *So the bottom row is taken deliberately, absolutely, and idempotently.* Every
+  repaint is `\x1b7` + `\x1b[<rows>;1H` + `\x1b[2K` + text + `\x1b8`: save the
+  cursor, jump to the last row, erase that row alone, put the cursor back. No
+  newline is emitted for the whole of an outage, so nothing ever shifts. Because
+  the address is absolute there is no per-outage "do we still own this row?"
+  state — which matters, because after a reconnect the remote app repaints every
+  row including ours and there is no signal that says so. The one-row cost is
+  repaired by the remote's own redraw on reattach.
+- *`\x1b[9999;1H` and a trust in CUP clamping is a trap — do not go back to it.*
+  It is the standard "go to the last row without asking how tall the terminal
+  is", and it fails on Windows: click's echo runs through colorama's
+  ANSI-to-Win32 converter, which turns CUP into `SetConsoleCursorPosition` and
+  silently DROPS a row outside the buffer. The cursor then never moves and the
+  erase lands on the prompt after all — caught by the pty tier on its first run,
+  invisible to every unit assertion. `_term_rows()` re-reads the real height on
+  every repaint instead, which also follows a pane that is retiled mid-outage.
+  The DECSC/DECRC cursor restore is best-effort for the same reason (colorama
+  does not interpret those two, so a non-VT Windows console just leaves the
+  caret on the status row); nothing depends on it, because the erase is absolute.
+- *Leaving the alternate screen was considered and rejected.* `\x1b[?1049l`
+  would hand back genuinely free real estate, but `1049` is defined to CLEAR the
+  alternate buffer on the way out — the frozen frame the user asked to keep
+  looking at would vanish for the whole outage — and its cursor restore is
+  undefined when nothing ever saved one (the no-TUI remote command case).
+
+**Keystrokes typed during an outage are forwarded, not eaten (2026-08-18).**
+Measured, not assumed: the supervisor never reads stdin, so bytes typed while no
+ssh child exists stay in the TERMINAL's own input buffer and are handed to the
+next ssh child, which forwards them to the remote as if nothing had happened.
+The user's "continue to type in the prompt section" therefore already works.
+Pinned by `test_typing_during_an_outage_reaches_the_next_connection`, and worth
+pinning because the tempting hardening — drain stdin so stray keys cannot echo
+into the frozen frame — would throw away input the user meant to send. Two
+honest caveats: the buffer belongs to the terminal, so a very long paste during
+a very long outage can overflow it, and the terminal echoes those keystrokes at
+wherever the cursor is, which the remote's redraw repairs on reattach.
+
+**A psmux session must outlive the SSH connection that created it
+(2026-08-17).** The premise the whole reconnect story rests on — "losing the
+ssh client never loses work, because the session lives on the HOST" — was not
+actually true on Windows. `magent attach` brings the host up by sending
+`magent up` over SSH; Windows OpenSSH runs every session command inside a job
+object marked kill-on-close, and job membership is inherited by every
+descendant. `WindowsPlatform.launch_psmux_session` created each session with a
+plain `Popen`, so the psmux SERVER it forked — and the agent that server would
+host for the next eight hours — was born inside a job whose lifetime was the
+laptop's wi-fi. Measured on a real host: 45 sessions decorated at 10:50, 16 at
+11:03, with no magent process running in between, and the survivors were
+exactly the sessions that had been created locally.
+
+`procs.spawn_unjobbed` is the fix: `CREATE_BREAKAWAY_FROM_JOB`, falling back to
+a plain spawn because CreateProcess fails outright when the parent job forbids
+breakaway (and a bring-up must never raise). Three deliberate scoping choices:
+
+- *It lives in `procs.py`, not `launch.py`.* The recipe already existed inside
+  `launch.spawn_detached`, but `platform/windows.py` cannot import `launch`
+  (launch imports platform). Two copies of a Windows process primitive is how
+  one of them rots, so it moved down to the leaf and both callers reach it.
+  `spawn_detached` keeps only its own half — the detached console.
+- *It changes job membership and NOTHING else.* No console flags are added at
+  the psmux call site, so the `new-session` child keeps inheriting the caller's
+  console exactly as before; psmux allocates the session's pty itself and
+  detaching the console would be a second, unrelated change to a spawn that
+  works.
+- *Only the creation spawn gets it.* `has-session`, `kill-server`, `send-keys`
+  and the decoration `set`s are awaited inline and own nothing that must
+  outlive anything, so they stay plain Popens.
+
+**What this fix does NOT claim.** `TestSessionsOutliveTheirSshConnection`
+(real-ssh, win32) kills the connection out from under a live session — both the
+one that CREATED it and one ATTACHED to it. A control run with the breakaway
+reverted to a plain `Popen` (PR #160) **passed either way** on
+`windows-latest` with psmux 3.3.6: that runner's psmux already detaches its
+server far enough to survive. So the job object is a real hazard the product
+must not rely on luck to avoid — the escape costs one flag and the repo already
+documented the mechanism — but it is **not a proven reproduction of the
+reporter's 45→16**. The measured facts about that incident remain: 29 psmux
+servers vanished between two `magent up` snapshots with no magent process
+running in between, so something outside magent killed them.
+
+The next instrument is already in place: the attached-client leg
+(`test_a_session_survives_its_attached_client_dying`) tests the shape that
+actually matches the incident — a flap kills every attach client at once, and a
+server that followed its client would take exactly the attached sessions and
+spare the rest. If that ever goes red, the cause is psmux-side and named.
+
+**A resume flag with nothing to resume is dropped at COMMAND-BUILD time, never
+retried at runtime (2026-08-11).** `claude --continue` — the registry default —
+resumes the most recent conversation *for the current working directory*. In a
+directory that never hosted one (a project just added to magent, a fresh
+machine, a cleaned `~/.claude/projects`) claude prints "No conversation found to
+continue" and exits, so the pane is a dead shell, the agent never starts, and
+`revive` re-runs the same failing command forever. `sessions.build_start_command`
+is the single function every command-build site routes through: it asks the
+tool's registry entry (`AgentTool.fresh_command`) whether the configured command
+carries an *implicit* resume flag and whether that directory has any stored
+session, and drops the flag only when the answer is "yes, and no".
+
+*Why not a shell fallback.* `claude --continue || claude` was the obvious fix
+and is forbidden. It fires on ANY nonzero exit, so a mid-session crash, an auth
+failure or a CLI regression would silently relaunch a FRESH agent — discarding a
+live conversation and disguising a real defect as a working pane. It is also
+unobservable: agent commands are delivered into psmux panes with `send-keys`, so
+magent never sees the command's exit code and could not tell the two apart even
+if it wanted to. The deterministic host-side probe (does
+`~/.claude/projects/<encoded cwd>/` hold any `*.jsonl`) is the honest test, and
+it is taken where the command is built.
+
+*Only a positive "no session here" rewrites anything.* An unknown tool, a tool
+with no probe, an unresolvable directory, a command with no implicit-resume
+flag, an explicitly named session (`--resume <id>`, `-r <id>`, or the bare
+`--resume` picker), a per-window `command` override, and a probe that ERRORS all
+keep the configured command byte-for-byte. A session file that exists but is
+empty or corrupt counts as "a session exists" and keeps `--continue`: that
+failure is a real defect the user needs to SEE in the pane. Every rewrite is
+logged (`launch.log`, "no prior <tool> session in <dir>; starting fresh"), so
+the decision is auditable after the fact.
+
+*Where the probe runs matters.* The verdict is only valid on the machine that
+will RUN the command, so callers pass None for a remote project rather than
+consulting the local store: `launch.py` nulls `agent_dir` when `is_remote`, and
+`psmux.eligible_projects` (which excludes remote projects outright) is the one
+chokepoint feeding `bring_up`, `revive_sessions` and the `up --json`
+`projects[].cmd` the attach client spawns no-mux windows from — all of which the
+HOST computes over ssh, on the filesystem being probed.
+
+*codex needs no special case.* Its resume form is the explicit
+`codex resume <id>` subcommand, which magent only builds when it HAS an id, so
+the default `codex` has nothing to rewrite. `codex_fresh_command` exists for
+symmetry and handles the one hand-configured shape with the same hazard,
+`codex resume --last`.
+
+### Window titles are magent's, not the app's (2026-08-15)
+
+The `magent:` title is not decoration. Four separate consumers resolve a window
+*by* it — tiling's `magent-name` placement mode, `cli/attach.py`'s already-open
+dedupe, the corpse scanner's window↔process pairing, and
+`hotkey.py::project_from_title` — so a title rewritten out of the grammar does
+not degrade one feature, it removes the window from the product. And every
+program magent puts in a pane wants to write it: Claude Code emits OSC 0/2 title
+escapes for its status, shells advertise their cwd, ssh names the host.
+
+Two layers, in this order:
+
+**1. The spawn-side lock — primary.** Every `wt` spawn passes
+`--suppressApplicationTitle`, which tells Windows Terminal to ignore the tab
+program's title entirely. This has been on all four spawn sites since the first
+Windows backend, but it was hand-repeated with nothing enforcing it, so a fifth
+spawn site could ship without it silently. It is now a lint rule (**MD006**,
+`scripts/lint_rules.py`): a literal `wt` argv in `src/magent/` that lacks the
+flag fails the gate. That rule is deliberately shallow — it reads the argv
+*literal*, so the flag has to sit in the list next to the `"wt"` token rather
+than be `args.append`-ed further down. That is the point: an append two branches
+later is exactly the shape that loses the flag in a refactor and says nothing.
+(Both Windows sites were appending; they now carry it in the literal.)
+
+*POSIX is a mixed bag, honestly.* `--title` is only an INITIAL title on most X11
+emulators, so each backend takes the strongest lever it actually has: kitty's
+`--title` permanently fixes the OS window title (so it already is a lock),
+alacritty gets `-o window.dynamic_title=false`, xterm gets
+`-xrm XTerm*allowTitleOps:false`. gnome-terminal, konsole, Terminal.app and
+iTerm expose no per-launch equivalent — see the known-debt ledger.
+
+**2. Reassertion — the repair, Windows only.** The lock cannot be universal (no
+lever on some emulators; a window can be adopted from a spawn magent did not
+make), and a stomped title is otherwise *permanent*: `parse_title` stops
+recognizing it, so nothing in the product can find that window again — including
+the code that would fix it. `BadgeRenderer` (attention daemon) therefore
+remembers each window it has resolved **by handle**, an identity that survives a
+title rewrite, and retitles a remembered handle whose title stops parsing. It
+rides the `snapshot_windows()` pass that already runs every tick — no new poller,
+and still zero writes on a quiet tick.
+
+*Why the repair is narrowly gated.* It only fires when the remembered name still
+has a live session in the agent-state store, and both bookkeeping maps are pruned
+to the live window set every tick. The failure mode being bought off is handle
+recycling: stamping `magent:<name>` onto a stranger's window would not merely
+mislabel it, it would get that window **tiled**. A missing badge is a worse-
+looking bug and a much cheaper one.
+
+### The Alt+V listener is supervised, not spawned once (2026-08-15)
+
+The listener used to be a ONE-SHOT spawn: whichever `magent --go` or `magent
+attach` ran last called `start_hotkey_listener`, and after that nothing in the
+product ever looked at it again. Observed live: a listener last started eight
+days and one reboot earlier, upload server still running, `magent status`
+reporting `Alt+V listener   off  (starts with 'magent attach')` and exiting 0.
+Two failures at once — the hotkey was dead, and the tool said that was normal.
+
+**Owner: `serve`.** The upload server is the long-lived process the Alt+V chain
+already posts into, so "serve is up" and "Alt+V works" collapse into one fact.
+`upload_server._supervise_hotkey` runs on a daemon thread off `run_server`,
+checks immediately and then every `HOTKEY_SUPERVISE_INTERVAL_S` (30s), and
+delegates to `launch.ensure_hotkey_listener`. Every failure is a log line and
+another try next interval: supervision must never take down the thing actually
+serving uploads.
+
+*Why a second entry point.* `ensure_hotkey_listener` is NOT
+`start_hotkey_listener`. The launch/attach paths are the *wiring* callers — they
+know which target the listener should serve and deliberately re-aim it when that
+changes, which is what `hotkey_restart_reason`'s "target change" branches are
+for. A supervisor knows no such thing: `magent attach` points the listener at a
+REMOTE host so F2 opens projects over VS Code Remote-SSH, and a supervisor that
+re-applied its own loopback URL every 30 seconds would fight attach forever —
+killing the remote-wired listener on every pass and permanently breaking F2 on
+remote fleets. So `ensure_hotkey_listener` re-checks a live listener against
+**its own manifest target** (`supervised_hotkey_target`) and only chooses a
+target for a listener that is not there. Version skew still restarts it, in
+place, on its own target.
+
+*The listener is deliberately NOT stopped with serve.* `down --all` already
+stops both — server first, listener second, so the supervisor is gone before the
+listener is and cannot resurrect it — and a user restarting serve should not
+lose their hotkey in between.
+
+*Never two listeners.* Unchanged: the pid-file + manifest dedupe inside
+`start_hotkey_listener` is what guarantees it, and every caller still routes
+through it. `exclusive_lock("hotkey-supervisor")` is taken by the supervisor
+alone (two serve daemons on different ports would otherwise both spawn) and
+deliberately NOT by launch/attach, so an interactive attach re-aiming the
+listener can never be blocked by a background thread.
+
+**`MAGENT_HOTKEY_SUPERVISOR` (default on) is a test-isolation requirement, not a
+preference knob.** The listener installs a SYSTEM-WIDE low-level keyboard hook,
+which no HOME redirect can contain — so without an opt-out, every tier that
+starts a real `magent serve` (e2e, soak, dist, browser, and a plain
+`pytest tests/e2e/` on a developer's own Windows box) would install one on the
+machine running the tests. Every such fixture sets it to `0`; the `interaction`
+tier sets it to `0` because it spawns the listener itself, and its new
+supervision test sets it back to `1` as the behavior under test. It doubles as
+the escape hatch for a user who wants to own the listener's lifetime.
+
+**Observability.** `cli/status.py::_listener_state` gained a fourth state,
+`dead` — no listener, on a hotkey-capable platform, while the upload server is
+*serving* **and permitted to supervise**. It is red, carries
+`LISTENER_REPAIR_HINT`, and degrades the exit code to 3, consistent with the
+documented contract. `off` is reserved for the cases where nobody promised a
+listener, and its hint says which one: no hotkey support, no server, or
+supervision opted out. Two exclusions matter, and both are "do not invent a
+promise": a *dead* upload server does not also report a dead listener (the
+upload line already says so, and a second red line for the downstream symptom is
+noise), and neither does a server whose owner set `MAGENT_HOTKEY_SUPERVISOR=0`.
+`doctor`'s `hotkey` check imports the same state machine rather than reimplement
+it, so the two surfaces cannot disagree about whether Alt+V works.
+
+**Per-press feedback.** Every Alt+V press now ends in exactly one
+`ALTV outcome=<x> project=<y>` line in `hotkey.log` (closed vocabulary,
+`hotkey.ALTV_OUTCOMES`), and every failure also reaches the screen through the
+`/api/flash` psmux status line F2 already used — no new notification subsystem.
+The one deliberate silence is `not-a-magent-window`: Alt+V outside a magent
+window is another app's chord, not a failure, so it is DEBUG-only (at INFO it
+would log every Alt+V the user ever presses). `no-image` still passes the chord
+through — the pane may want a plain Alt+V — but says why nothing was uploaded.
+
+### The upload server is supervised too, and by the attention daemon (2026-08-19)
+
+The listener decision above ends one level short. `serve` supervises the
+listener, sessions get revived, attach panes redial — and nothing at all watched
+`serve` itself, the process every mobile upload and every Alt+V press goes
+through. On 2026-08-18 it died silently twice on the same live host: once inside
+a machine-wide ConPTY wedge, once unexplained between ~13:00 and ~16:10. Both
+times the first symptom was the owner pressing Alt+V and getting nothing, hours
+after the fact, and the machine had almost nothing to say about it afterwards.
+
+Two separate defects, fixed separately.
+
+**1. A death that leaves a trace.** `run_server`'s `try/finally` logged the same
+`stopped` for a Ctrl+C and for a crash, and a detached serve has no console for a
+traceback to reach — so even the logfile could not distinguish "the user stopped
+it" from "it fell over". Every exit now names its reason (`stopped: keyboard
+interrupt` / `stopped: crashed` / `stopped: loop returned`), a crash is logged at
+**exception level before it propagates** (which is also what hands it to Sentry —
+errors-only, logging integration at ERROR), and the fatal "no bindable address"
+startup failure gets an ERROR line of its own rather than only an exception into
+the void. Nothing is swallowed: both handlers re-raise, and the CLI still exits
+non-zero. The secondary (Tailscale) bind's `serve_forever` runs through
+`_serve_bind`, which logs its own death and does **not** re-raise — that thread
+dying must not take the loopback bind with it, but it must not be silent either.
+
+**2. Owner: the attention daemon.** `serve` cannot supervise itself; a supervisor
+that only ran while serve ran would supervise nothing the moment serve died. The
+attention daemon is the other long-lived process, it already polls on an
+interval, and it is the one users leave running — so
+`cli/attention_cmd._upload_watchdog` hands `run_attention_loop` an `on_tick` hook
+driving `launch.UploadServerSupervisor`.
+
+*Where the seam lives, and why it moved.* Everything — the loopback probe, the
+argv builder, the detached spawn — is in `launch.py`, next to `spawn_detached`
+and `ensure_hotkey_listener`. It used to live in `cli/background.py`, and a src
+module cannot import the cli package (LS-A-001: `cli/__init__` imports every
+command module for registration, so a reverse import cycles). Rather than write a
+second spawn recipe, `cli/background._maybe_start_upload_server` became a thin
+delegation to `launch.ensure_upload_server`, so the server the watchdog revives
+is byte-for-byte the one the launch path starts.
+
+*Detection is cheap, respawning is not.* The probe rides the existing poll tick
+(one refused loopback connect; no second timer, no new thread), while the
+**respawn rate** is bounded by `UPLOAD_RESPAWN_COOLDOWN_S` (60s, overridable via
+`MAGENT_UPLOAD_RESPAWN_COOLDOWN_S`). Splitting the two is the whole design: a
+serve that dies at 03:00 must not wait out a long timer before anyone notices,
+and a serve that crashes on startup must not be respawned in a tight loop.
+
+*The pid is diagnostic, never decisive.* Liveness is the TCP probe alone. The
+recorded pid is read only for the log line, deliberately: `run_server` writes its
+pid file **after** the bind, so the pid can never be the earlier signal, and a pid
+number the OS later recycles onto an unrelated process would blind the watchdog
+permanently. What it buys is a truthful diagnosis — "recorded pid 8123 is gone"
+(the observed failure) reads very differently from "pid 8123 is alive but not
+answering", which is a wedge, not a death.
+
+*Two gates, answering different questions.* `settings.uploadServer` is the
+config's own switch: a user who turned the upload server off is not
+second-guessed, and nothing is resurrected on a machine that never had one.
+`MAGENT_UPLOAD_SUPERVISOR` (default on) is the runtime opt-out for somebody who
+runs serve under their own supervisor — and, exactly like
+`MAGENT_HOTKEY_SUPERVISOR`, it is a **test-isolation requirement**: an
+`attention -d` fixture that quietly spawned a real `magent serve` on a runner
+would leak a process no teardown knows the pid of. Every fixture that starts a
+real daemon sets it to `0`; the `e2e` watchdog tier sets it to `1` as the
+behavior under test.
+
+*Observability.* `status` prints one `Repair:` line — `magent attention -d` —
+when the upload server reads DEAD **and** the daemon is off **and** it would
+actually supervise (config on, env not opted out). Suggesting the daemon to
+someone who disabled it would be advice that does nothing.
+
+### One liveness enumeration, and a shutdown that verifies (2026-08-18)
+
+Reported twice on a live 46-session Windows host: after `magent down --all`, a
+fixed set of sessions "stay always" — and they were always the TAIL of the
+config, in config order. Two contradictory data points came with it. On the
+17th, `status` said 30 running / 15 stopped and the `down --all` a moment later
+named only the last 16, five of which `status` had just called *not* running.
+On the 18th, `down --all` said "Stopped 46" while the laptop's picker still
+listed the last 11 as alive and attachable.
+
+Three defects, each independently sufficient to produce that.
+
+**"Which sessions are live" had three answers.** `psmux.psmux_status` (behind
+`status`, `down`, the menu), `session_picker._live_sessions` (the picker) and
+`psmux.discover_sessions` (the upload server) each ran their own
+`has-session -t` sweep with a different retry policy. Only the picker retried
+its misses — with a comment saying, correctly, that probes flap under the load
+of many running agents and that *a dropped probe silently hides a live
+session*. So the picker could be attached to a session `status` called stopped
+and `down` therefore never touched. Now there is one function,
+`psmux.live_sessions`, and all three call it; the bring-up creation verify
+(`_missing_sessions`) stays separate on purpose and says why in its docstring.
+
+**`down --all` acted on a probe result, not on a promise.** Its own help says
+"Stop EVERY psmux session", and it was implemented as "stop whatever that
+single fan-out happened to return" — so a session the probe missed was neither
+stopped nor mentioned. `down` now kills every *configured* eligible session in
+scope. `kill-server` against a socket with no server is a harmless no-op, so
+over-targeting costs one wasted subprocess while under-targeting costs the
+whole feature. The local-vs-remote decision still keys off the LIVE local
+sessions, because "nothing is running here" is what tells an attach client to
+act on the remembered host.
+
+**`down` reported the loop it ran, not the world it changed.** `kill_servers`
+discarded every `kill_server` return value and answered with the full list of
+names it had attempted; the command printed that length. With psmux 3.3.6
+exiting 0 for kills that do not take, honouring the rc would not have been
+enough either. `psmux.stop_sessions` is the answer: probe → kill → settle →
+re-probe → kill the survivors again → re-probe, returning
+`(stopped, still_running)`. `down` and the menu now print only what was proved
+stopped and name any survivor in red. A survivor is also an ERROR in
+`launch.log`.
+
+Two contributing timeouts went with it: `kill_server` is now bounded (a wedged
+psmux server answers nothing, and one stuck socket must not hold a 46-session
+shutdown hostage), the kill is a bounded fan-out rather than a sequential
+sweep, and `cli/attach.py::_REMOTE_DOWN_TIMEOUT_S` went 60s → 300s. That last
+one was itself a tail-truncation mechanism: 46 sockets could outrun a 60s SSH
+budget, ssh was killed mid-shutdown, and what survived was exactly the part of
+the config the sweep had not reached — a config-order tail.
+
+### A press narrates itself, and nothing on that path may block it (2026-08-18)
+
+Reported as two complaints about one feature: "Alt+V is working but the status
+isn't showing", and "the status always shows up pretty late". Both were real,
+and neither had the cause the architecture suggested.
+
+**Why nothing showed.** `psmux.flash_message` bounded its `display-message`
+subprocess at 3 seconds — and `subprocess.run(timeout=...)` does not merely
+stop waiting, it KILLS the child. On an idle socket that command costs 60-130
+ms (measured against this machine's live sessions), but under real load — 46
+live sessions, a discovery fan-out, a spawn storm, all competing for Cygwin
+process creation — it routinely ran past 3 s. The production log is unambiguous:
+every flash in one Alt+V burst reads `status-line flash failed for
+project=<p>: Command '[...display-message...]' timed out after 3 seconds`. The
+product was throwing its own feedback away, on purpose, exactly when the
+machine was busy enough for the user to want it. The bound is now 20 s
+(`psmux.FLASH_TIMEOUT_S`): the wait happens on an HTTP handler thread, never on
+a press, and waiting is what keeps a project's messages in order.
+
+**Why it was late.** The earliest feedback a press could produce was the
+server's "uploading" flash — which fired only after the clipboard read, the
+BMP wrap, the whole multipart POST, and (on a cold 10 s cache) a full
+`discover_sessions` fan-out inline in the request handler: 438-861 ms on this
+machine's 46 sessions when idle. And success flashed nothing at all from the
+listener, by an earlier deliberate decision ("the server drives the progress
+line on the happy path") that left a working Alt+V indistinguishable from a
+dead listener.
+
+**The shape of the fix.** The press pipeline moved out of `hotkey.py` into
+`altv.py`, and narrates itself: `capturing...` is dispatched as the FIRST
+statement of `handle_press`, before the clipboard is touched; `uploading...`
+brackets the POST; the outcome — success included — replaces it. Measured end
+to end (real serve, real subprocess spawn, ~900 KB image): **65-176 ms from the
+press to the acknowledgement on the bar**, versus a first message that
+previously arrived after the whole upload if it arrived at all.
+
+Three constraints hold it together, each with a test that fails if it is
+undone:
+
+* **Async, so a press never waits on its own progress report.** A status-line
+  write has been measured in seconds; three synchronous phases would put that
+  on the critical path of the paste.
+* **ONE pump, so the phases stay in order.** Three fire-and-forget threads
+  would race, and an "image sent" that overtakes an "uploading..." leaves the
+  bar lying. The pump is FIFO, waits for each flash to land before sending the
+  next (`/api/flash` answers only once psmux has the message — that reply IS
+  the pacing signal), and cannot die: a pump that ends on one bad message
+  strands every message queued behind it.
+* **One bar, one narrator.** `upload_server` no longer flashes for uploads
+  carrying `?project=` (the listener's marker). Two writers on a one-line bar
+  can only race, and the loser would be the specific message — the server's
+  text is generic by construction, the listener's says *which* failure it was.
+  Mobile uploads, whose sender is looking at a phone, keep the server's flash.
+
+The outcome vocabulary grew to carry that specificity (`serve-unreachable` and
+`inject-failed` split out of what was one `upload-rejected`), and every member
+except the pass-through has a status-bar reason in `altv.OUTCOME_REASONS`; a
+test asserts no two outcomes share a sentence, because a collapsed vocabulary
+is precisely how "it failed" came back.
+
+Two things this also bought, both cheap: `/api/flash` logs every message it
+serves (`flash project=… msg=…`), so "the status isn't showing" is answerable
+from `upload.log` after the fact rather than only by reproducing it; and the
+phase messages carry their own linger time (`ms=`), because a phase that
+expires mid-upload leaves a blank bar that reads exactly like the silence the
+channel exists to end.
+
+**What was disproven along the way,** recorded so it is not re-suspected: psmux
+3.3.6 (a Cygwin tmux 3.3.6 build) repaints the status bar IMMEDIATELY on
+`display-message` — measured on a throwaway socket under a real ConPTY client
+at 60-100 ms from command issue, with a later message replacing a live one just
+as fast, and with no difference between the `-t` and target-less forms for the
+DISPLAY (non-`-p`) case. `set -g status-left` repaints immediately too. There
+is no `status-interval` tick to wait for and no `refresh-client` to add; the
+latency was never in the multiplexer.
+
+### The upload reply is not hostage to the paste (2026-08-18)
+
+The narration above was honest about everything except its own worst case. A
+press on this machine took 60-75 seconds and ended in "Alt+V: upload failed -
+is magent serve running?" — while the SAME upload is logged completing
+`ok=True injected=True` 74 s after the press. Nothing had failed. The user was
+told their screenshot was gone, about a file already sitting in
+`~/.magent/uploads`.
+
+Three facts composed into that lie:
+
+* `psmux.send_keys` was the **only** psmux call in that module with no
+  subprocess timeout at all — and the one an HTTP request handler ran inline,
+  before replying. Every other probe here (`pane_cwd`, `capture_pane`,
+  `flash_message`, `kill_server`) had been bounded already; this one was
+  missed because it is the only one whose result the *product* wanted rather
+  than a diagnostic.
+* A psmux control command against a session whose attached terminal is busy or
+  unfocused has been measured from 3 s to past 70 s. It is not a rare stall; it
+  is the same load that made every status-line flash in months of `upload.log`
+  time out.
+* The listener bounded its POST at 20 s. Server unbounded + client bounded is a
+  guaranteed false negative under exactly the load the feature is used in.
+
+**The fix keeps the paste, and stops waiting for it.** `send_keys` takes a
+`timeout` (default `SEND_KEYS_TIMEOUT_S`, 20 s) and degrades to `False` with a
+WARNING instead of hanging or raising. `upload_server._inject_paste` then runs
+the paste on its own thread and waits `INJECT_GRACE_S` (3 s) for it: the
+overwhelmingly common fast paste is still reported as the plain
+`injected: true` it is, and a stalled one is answered early and honestly. The
+reply grew a third state — `inject_pending` — because `injected: false` alone
+cannot tell "psmux refused" from "psmux has not answered yet", and collapsing
+those two is precisely what rendered as a failure. `altv` reads all three:
+`ok` / `inject-pending` / `inject-failed`, with `inject-pending` carrying
+"image saved - psmux is slow, paste still pending" **in the healthy tint** —
+red on that bar reads as "your screenshot is gone".
+
+Measured against a real serve and a real multiplexer binary that sits on
+`send-keys` for 30 s (`tests/e2e/test_altv_flash.py`, the `stalled_paste_fleet`
+tier): **3.1 s from the press to the outcome on the bar**, versus 20 s and a
+false failure.
+
+**One attempt, never a re-send.** The paste worker does not retry, and the
+whole attempt is capped at `INJECT_TIMEOUT_S` (60 s). A `send-keys` that is
+merely slow is still in flight and a second one would paste the same image
+twice; and `subprocess.run(timeout=...)` kills the client, which leaves it
+genuinely unknown whether the first one landed. Bounding one attempt is the
+only shape that cannot double-paste. The wording matters for the same reason:
+a user told "upload failed" reruns the press, and the eventual paste plus the
+rerun's paste put the screenshot in the prompt twice — the failure mode the
+honest wording exists to prevent.
+
+**Where the late verdict goes, and why not to the bar.** A flagged
+(`?project=`) upload already has a narrator, and the tempting completion flash
+would reintroduce the second writer under the exact condition this code path
+exists for: when the status line is slow, the listener's own closing message is
+still queued in its pump while the worker finishes, so the two would race and
+the bar could show "pasted" and then "paste pending". Cross-process ordering is
+not available and is not worth inventing here. The deferred verdict therefore
+goes to `upload.log` as a WARNING naming the project and the wait it cost
+(`inject project=… finished late after 41.2s pasted=True`) — and to the pane,
+where the pasted path is its own proof. The listener's closing message is
+already terminal and already true: the image is saved, and the paste is
+pending.
+
+### Doctor names the wedge, and the probe that finds it cannot join it (2026-08-19)
+
+Twice on the live 40-session host: every psmux control command — `has-session`,
+`list-sessions`, `new-session` — hung forever, from any console, including
+sockets that had never existed. ConPTY itself was fine (a raw pywinpty spawn
+was instant). The whole fleet looked dead for hours.
+
+It was not dead. The holders were `conhost.exe` processes whose parent chain
+reached a dead pid or a `psmux.exe`; killing exactly those 14 of the box's 874
+conhosts unwedged psmux instantly (`new-session` went from an infinite hang to
+892 ms), and **every session then probed alive**. So the reaction the outage
+invites — mass-restart, or a reboot — was the one action that would have
+destroyed 40 live agents. That is the fact `magent doctor`'s `psmux wedge`
+check exists to put in front of whoever finds the machine next: the sessions
+are FROZEN, not dead; kill only those conhosts; nothing else is needed.
+
+**Why it is a responsiveness probe and not a liveness sweep.** "Which sessions
+are live" has exactly one owner (`psmux.live_sessions`) and this must not
+become a fourth answer to it. `psmux.probe_control_plane` enumerates nothing,
+names no configured session, and runs `list-sessions` on a throwaway socket no
+session name can collide with — a control command on a FRESH socket hanging
+*was* the incident's own reproduction, and `list-sessions` starts no server, so
+a doctor run leaves nothing behind. A version flag would be cheaper and would
+prove nothing: `psmux -V` never touches the plumbing the wedge holds.
+
+**`subprocess.run(capture_output=True, timeout=…)` is not a bound on Windows.**
+The probe was built that way first and answered its 5 s timeout in 90 s. On
+expiry `run` kills the direct child and then calls `communicate()`, which waits
+for the pipe write ends to close — and a grandchild the wedged client left
+behind still holds them. The probe now discards output (`DEVNULL`), which has
+nothing to wait on; the timeout is a real bound again. This was caught by
+`tests/e2e/test_doctor_wedge.py`, whose ceiling is on the whole `magent doctor`
+run rather than on the probe, against a real executable named `psmux` that
+records its argv and then stops answering.
+
+The enrichment (`procs.count_processes`, a Toolhelp snapshot: how many
+`psmux.exe` are resident) is optional by construction — it corroborates the
+finding, costs no subprocess, and answers `None` rather than `0` when it cannot
+look, because "0 psmux.exe resident" printed on a machine nobody counted would
+be an invented fact.
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.
 
-**Title badges are ambient state, not guaranteed state (2026-07-07):** the
-attention daemon's `BadgeRenderer` rewrites window titles via
+**Typed text cannot be delivered through a nested ConPTY over `ssh -t`
+(2026-08-18):** `tests/e2e/test_ssh_real.py::test_typed_text_survives_a_real
+_reconnect` is a loud `::warning` skip on win32. The test drives the real
+supervisor under a pywinpty pseudoconsole, over a real `ssh -t`, into the
+Windows sshd's own pseudoconsole — two ConPTYs in series. The typed text
+arrives fine and is echoed by the remote; the ENTER does not. It arrives as a
+literal win32-input-mode key record (`ESC [ 13 ; 28 ; 13 ; 1 ; 0 ; 1 _`, i.e.
+VK_RETURN/CR — the same stream carries the `ESC [ ? 9001 h` DECSET that enables
+that mode), so the remote's `readline()` never completes. Measured, with the
+transcript quoted in the skip helper's docstring — and only measurable once
+`_pty.expect` grew a real deadline, because before that the leg simply hung
+until GitHub cancelled the job.
+
+Not a product defect and not a user-visible one: a real attach pane is hosted
+by Windows Terminal's ConPTY, where the keystroke arrives as a keystroke (the
+CI-only `interaction` tier drives real `SendInput` chords through it). The
+guarantee this test exists for is still covered on Windows by
+`tests/e2e/test_pty_attach_status.py`, which pins the local rendering half cell
+by cell, and the test itself runs for real on ubuntu and macOS. Worth trying
+next: pywinpty's WinPTY back end (`PtyProcess.spawn(backend=Backend.WinPTY)`),
+which predates win32-input-mode and may pass the CR through unencoded.
+
+**Attach-pane reconnect is only reachable from a Windows client (2026-08-09):**
+`attach_client.py` itself is OS-agnostic (stdlib + click; the `Popen` in
+`_run_ssh` inherits the console on POSIX exactly as it does on Windows) and its unit tier
+runs everywhere, but the only code that spawns it is `cli/attach.py::
+_spawn_windows`, which opens `wt` windows. There is no macOS/Linux client
+window-spawn path for remote attach to wire it into — a pre-existing gap this
+change neither widens nor closes. A future POSIX attach client should call
+`_pane_command` as-is. Related and narrower: the corpse scan recognizes the
+supervisor by its Windows executable name (`magent-attach-client.exe`), which
+is fine because `process_cmdlines` is Windows-only today; a POSIX process scan
+would need the extensionless name added.
+
+**Title badges are ambient state, not guaranteed state (2026-07-07, narrowed
+2026-08-15):** the attention daemon's `BadgeRenderer` rewrites window titles via
 `SetWindowTextW`, but shells/terminals with their own title logic (OSC 0/2
 sequences, Windows Terminal tab-title settings) can overwrite a badge at any
-time. The flash (and toast/ntfy when enabled) are the *reliable* signals;
-the badge is best-effort ambience. Revisit only if a real terminal in the
-fleet proves badge-hostile in practice.
+time. The flash (and toast/ntfy when enabled) are the *reliable* signals; the
+badge is best-effort ambience.
+
+*Narrowed:* a title overwritten out of the `magent:` grammar is now repaired on
+the next daemon tick (see "Window titles are magent's, not the app's"), so the
+loss is bounded by the poll interval rather than permanent — but only while the
+attention daemon runs, only on Windows, and only for sessions still live in the
+agent-state store. With no daemon there is no repair, and the spawn-side lock is
+the whole defense.
+
+**POSIX terminals with no title lock (2026-08-15):** gnome-terminal's `--title`
+is deprecated and VTE yields to the application's title; konsole's title format
+is a profile-only setting; Terminal.app's `custom title` and iTerm's session
+`name` are the stickiest channels those apps expose but the *displayed* title is
+still composed per profile. So on those four emulators a program in the pane can
+still rename a magent window out of the grammar — and unlike Windows there is no
+repair, because neither POSIX backend implements `supports_attention_signals()`,
+so `BadgeRenderer` never runs there. kitty (both OSes), alacritty and xterm ARE
+locked. Closing this properly means either a POSIX attention backend (wmctrl /
+System Events retitling) or shipping per-emulator profile config, neither of
+which the current fleet needs.
 
 **CI multi-monitor emulation is unavailable on the SHARED legs (R4-05 →
 partially closed on Windows + user-topology replay, 2026-07-15):** hosted
@@ -855,7 +1644,7 @@ launched as-is, like `cursor-agent`/`agy`), only step 3 applies: one
 ## 5. How this document stays honest
 
 Three mechanisms: **the gate** (`scripts/check.py`: ruff (lint + `format
---check`) + custom lint MD001-MD005 + ty strict + compileall + vulture +
+--check`) + custom lint MD001-MD006 + ty strict + compileall + vulture +
 pytest unit tests with a coverage floor, required green before every commit,
 so nothing described here as tested or type-checked silently stops being
 so); **pins-first discipline** (every relocation described above as "unchanged"

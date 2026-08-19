@@ -5,6 +5,292 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.13.1] - 2026-08-18
+
+### Fixed
+
+- **The upload reply is no longer hostage to the paste.** Sending a
+  snip used to mean waiting out the paste into the agent's pane inside
+  the upload request itself: when psmux was slow to accept `send-keys`
+  (measured at 74 seconds under load), the Alt+V listener's own
+  20-second deadline expired first and narrated `upload failed - is
+  magent serve running?` for an upload that had in fact landed on disk
+  and would eventually paste. The paste now runs on its own worker with
+  exactly one attempt (bounded at 60 seconds -- a retry against a
+  slow-but-live psmux double-pastes), every `psmux send-keys` call is
+  bounded instead of hanging forever, and the upload reply waits at
+  most 3 seconds before answering with one of three honest paste
+  states: pasted, still pasting, or refused. A stalled paste now
+  narrates `Alt+V: image saved - psmux is slow, paste still pending`
+  -- a success tint, because the image is safe on disk -- instead of a
+  false failure. Measured press-to-outcome against a 30-second psmux
+  stall: 3.1 seconds. A new non-mocked end-to-end test drives that
+  exact stall through a real `magent serve` and pins the fast answer,
+  the pending narration, the byte-identical file, and the
+  single-attempt guarantee on every OS.
+- **The Alt+V end-to-end tier no longer loses its own evidence on
+  Windows.** The tier's recording multiplexer appended all records to
+  one shared file, and Windows appends are not atomic -- concurrent
+  invocations tore or dropped lines, failing roughly two of every
+  three Windows CI runs with phantom "missing flash" and "missing
+  paste" verdicts. The product itself never lost a flash (the flash
+  pipeline is serialized end-to-end; that is now proven and pinned).
+  Each recorder invocation writes its own atomically-published record
+  file, a torn record is a loud failure instead of a silent skip, and
+  a regression test pins zero loss under twelve concurrent spawns.
+
+## [3.13.0] - 2026-08-18
+
+### Added
+
+- **Every Alt+V press narrates itself on the status line, from the chord.**
+  Pressing Alt+V used to give no feedback until the whole upload finished
+  -- and under load, often no feedback at all, because the status-line
+  flash was killed by its own 3-second subprocess timeout before the bar
+  could repaint. The press pipeline now flashes three phases into the
+  project's status line: `Alt+V: capturing...` the moment the chord is
+  recognized (before the clipboard is even read), `Alt+V: uploading...`
+  once the image is in hand, and then the outcome -- success included.
+  Failures name their cause specifically (`clipboard has no image - copy
+  one first`, `cannot reach magent serve (connection refused)`,
+  `serve said HTTP 400: <reason>`, `saved, but psmux would not paste it`)
+  instead of a generic error. Flashes are dispatched through one FIFO
+  pump, so a press never waits on its own progress report and the phases
+  can never arrive out of order; the serve no longer adds a second voice
+  to a press the listener already narrates. Measured press-to-bar latency:
+  65-176 ms. A new non-mocked end-to-end tier drives a real press against
+  a real `magent serve` and a real recorded multiplexer on every OS, so
+  the phase order, the failure texts, and the latency budget are pinned
+  against regression.
+
+### Fixed
+
+- **The reconnect status line no longer erases what you were typing.**
+  When a connection dropped mid-session, the in-place "reconnecting"
+  line was drawn wherever the cursor happened to sit -- which, in an
+  agent session, is usually inside the prompt box, on top of the sentence
+  you had typed but not yet sent. The supervisor now paints the status
+  line on the terminal's bottom row with an absolute jump-and-return
+  (save cursor, draw, restore), so the frozen frame -- your typed text
+  included -- stays exactly where it was through the whole outage and is
+  still there after the link heals. Keystrokes made during the outage are
+  forwarded, not swallowed. A real-terminal test tier replays the actual
+  byte stream into a screen model and asserts the grid: only the bottom
+  row may change. This runs on the *attaching* machine, so the client
+  side must upgrade to see it.
+
+- **A silent or chatty child can no longer hang the end-to-end suite
+  until CI cancels the job.** The pseudo-terminal test driver had two
+  deadline holes (an untimed read on Windows, and a deadline check
+  skipped whenever output kept arriving) that let one blocked test burn
+  the whole job's time budget and take every other result with it. The
+  driver now enforces a wall-clock deadline on every wait and carries the
+  partial transcript in the failure, and every pty test runs under a
+  whole-test time budget. Exposed along the way: driving a Windows
+  pseudo-terminal *over* Windows OpenSSH nests two ConPTYs and mangles
+  Enter into a raw key record the remote shell never accepts -- that leg
+  is now a loud skip on Windows (it still runs for real on Linux and
+  macOS) and a ledger entry.
+
+## [3.12.3] - 2026-08-18
+
+### Fixed
+
+- **An outage is a status line, not a log.** During a connection drop, an
+  attach pane used to print a fresh multi-line block for every redial
+  attempt -- plus ssh's own raw noise (`Connection timed out`,
+  `client_loop: send disconnect`) -- so a long wifi flap scrolled the pane
+  full of junk that then wrapped into overlapping garbage. The reconnect
+  supervisor now renders the whole outage as **one line updated in
+  place**: target, attempt count, a live retry countdown, ssh's last
+  complaint condensed, and the Ctrl+C hint -- clipped to the pane width so
+  it can never wrap (narrow panes drop the hint first, then the target,
+  never the countdown). ssh's stderr is captured off-screen during redial;
+  host-key-changed warnings still pass straight through, and if the pane
+  gives up, ssh's last lines are printed so the cause is never hidden.
+  When the link heals, the status line is erased and the session takes
+  back over cleanly, with a one-line "reconnected after N attempts"
+  record kept in scrollback. Panes with redirected output keep plain
+  one-line-per-attempt logging. Auth prompts are unaffected -- ssh asks
+  for passwords via the terminal directly, not stderr. The reconnect
+  decision logic (redial on 255, out-of-band session probe, bounded
+  give-up) is byte-for-byte unchanged; this runs on the *attaching*
+  machine, so the client side must upgrade to see it.
+
+## [3.12.2] - 2026-08-18
+
+### Fixed
+
+- **Launching from inside an AI agent no longer poisons the spawned
+  sessions.** Running `magent up` from a shell hosted by a coding agent
+  (Claude Code, a CI harness) leaked that harness's environment into every
+  spawned session: inherited session markers made the child agent believe
+  it was a nested sub-session -- silently disabling transcript saving --
+  and an inherited `NO_COLOR` rendered every pane in plain white. Every
+  spawn that hosts an agent (psmux sessions, launch-path terminals, VS Code
+  windows, the F2 editor) now routes through one scrubbing seam that strips
+  the launcher's agent-session markers, its colour overrides
+  (`NO_COLOR`/`FORCE_COLOR`/`CLICOLOR`/`CLICOLOR_FORCE`), and the
+  multiplexer nesting markers. The scrub is an exact list, not a namespace
+  sweep -- credentials and user configuration pass through untouched, and
+  `TERM` is never modified.
+
+- **`magent down` now stops every session it promised, verifies the kills,
+  and reports only what it proved.** Three defects let sessions survive a
+  `down --all` while the report claimed success: session liveness had three
+  independent implementations with different retry policies, so under load
+  `down` could see fewer live sessions than the picker did and silently
+  skip the rest; `down --all` acted on that one unretried probe instead of
+  the configured session list; and the summary counted kill *attempts*,
+  never re-checking reality. Liveness is now one shared seam (probe with
+  one retry), `down` targets the configured sessions themselves, kills in a
+  bounded parallel fan-out (no more sequential sweep a remote 60s timeout
+  could truncate to a config-order tail -- the remote budget is now 300s),
+  then re-probes and re-kills survivors -- and the report names, in red,
+  any session that would not stop instead of counting it as stopped.
+
+## [3.12.1] - 2026-08-18
+
+### Fixed
+
+- **A flaky connection no longer closes attach panes -- they redial until
+  the host answers.** The reconnect supervisor trusted the ssh exit code to
+  tell a deliberate detach (exit 0, stop) from a connection failure (255,
+  reconnect). But a Windows host never propagates a remote command's exit
+  status over a pty: a session that *died* also handed the pane a clean 0,
+  so during a wifi flap every pane closed announcing a detach the user never
+  made. On any exit other than 255 the supervisor now asks the host over a
+  separate non-pty connection -- where exit codes are truthful on every
+  OS -- whether the session still exists: alive means a real detach (the
+  pane stops as before); gone or unanswerable means the pane keeps
+  redialling, bounded so a session that is genuinely never coming back
+  stops with the cause named after five looks. Only a positive "the session
+  is alive" answer can ever close a pane. The probe asks psmux, not magent,
+  so it works against older hosts; the attach command itself is
+  byte-identical, so corpse detection and `--no-reconnect` behave exactly
+  as before.
+
+- **Session creation now breaks out of the launching process's job.** psmux
+  servers were started with a plain spawn, inheriting whatever Windows Job
+  Object the launcher sat in -- so a session's lifetime could in principle
+  be coupled to the process tree that created it (an ssh connection, a
+  terminal about to close). Servers are now spawned through the same
+  breakaway path the upload server already used. Hardening: CI could not
+  reproduce a session dying with its connection even without this change,
+  so it closes a documented gap rather than a demonstrated one.
+
+- **`magent down --all` now says what it does.** Its help and the README
+  state plainly that it stops every psmux session *and the agent running
+  inside each* -- not just the background daemons.
+
+## [3.12.0] - 2026-08-16
+
+### Added
+
+- **`magent serve` now owns the Alt+V listener -- and magent says when
+  Alt+V is broken.** The hotkey listener used to be spawned once by whatever
+  launched it and then forgotten: a reboot, a crash, or an upgrade left
+  Alt+V silently dead, with `magent status` showing a healthy system. The
+  upload server now supervises the listener -- it starts one if none is
+  running, re-checks every 30 seconds, and restarts it if it dies -- so "the
+  upload server is up" and "Alt+V works" are the same fact. A live listener
+  aimed at a remote host by `magent attach` is left exactly as aimed; the
+  supervisor only ever fills an empty slot. `MAGENT_HOTKEY_SUPERVISOR=0`
+  opts out.
+
+  The health is now visible instead of guessed: `magent status` reports the
+  listener three-state -- `ON`, a red `DEAD (upload server is up but no
+  listener -- Alt+V does nothing)` that also sets exit code 3 and prints the
+  repair command, or an honest `off (starts with the upload server)`.
+  `magent doctor` gained a matching `hotkey` check. Every Alt+V press now
+  writes one `ALTV outcome=<x> project=<y>` line to
+  `~/.magent/logs/hotkey.log`, and every failure (no image on the clipboard,
+  clipboard unreadable, upload rejected, unexpected error) flashes a
+  plain-words explanation into the project's psmux status line -- a press
+  that does nothing now always says why.
+
+### Fixed
+
+- **Window titles stay magent's, even when the app inside rewrites them.**
+  A terminal tab renamed by the agent running in it (or by the shell)
+  dropped out of the `magent:` title grammar -- removing that window from
+  tiling, attach dedupe, corpse pairing, and the Alt+V project lookup all at
+  once. The attention daemon now remembers magent windows *by OS handle* and
+  repairs a stomped title on its next tick, and a new lint rule (MD006)
+  makes it impossible to add a Windows Terminal spawn that forgets
+  `--suppressApplicationTitle`. Linux terminals that support locking the
+  title get the equivalent flag at spawn time (alacritty, xterm; kitty's is
+  already permanent).
+
+- **Re-tile now tiles what is actually on screen -- attach panes included.**
+  `magent --retile-all` (and menu option 2) built its window list from the
+  local config's projects, so the windows `magent attach` opens -- whose
+  names are the *remote* host's session names, present in no local config --
+  were never re-tiled, while configured projects whose windows were closed
+  were enqueued anyway and sat through a retry deadline before a red "not
+  found". Retile now snapshots the screen and tiles exactly the magent-owned
+  windows that are open right now: configured windows first (in config
+  order), then every other window carrying a `magent:` title, badge-proof
+  and deduped by name. Closed windows are skipped outright, and nothing is
+  ever spawned. `magent --go --retile-all` keeps its combined meaning --
+  launch whatever is missing, then tile everything, attach panes included.
+
+## [3.11.1] - 2026-08-14
+
+### Fixed
+
+- **A brand-new project no longer opens a dead pane.** The default claude
+  command carries `--continue`, which resumes the most recent conversation
+  *for the current working directory* -- and in a directory that has never
+  hosted one, claude exits with "No conversation found to continue": the
+  agent never starts, and revive re-runs the same failing command forever.
+  Every command-build site (fresh launch, session bring-up, revive, and the
+  command list attach uses for `--no-mux` windows) now routes through one
+  seam, `sessions.build_start_command`, which checks the project's stored
+  sessions on the machine that will run the command and drops the implicit
+  resume flag only when there is positively nothing to resume -- starting a
+  fresh `claude` instead, with a `launch.log` line recording the decision.
+  Deliberately narrow so real failures stay visible instead of being papered
+  over: an explicit `--resume <id>`, a per-window `command` override, a
+  remote project, a probe that errors, and present-but-unreadable session
+  files all keep the configured command byte-for-byte -- if `--continue`
+  then genuinely fails, the error stays on screen where it can be read.
+  There is no shell-level `|| claude` fallback anywhere: it would fire on
+  *any* nonzero exit (masking auth failures, corrupted sessions, CLI
+  regressions), and magent never observes the command's exit code in a
+  psmux pane in the first place. Codex needs no equivalent (its resume form
+  is the explicit `codex resume <id>`, only built when an id exists), but a
+  hand-configured `codex resume --last` gets the same guard.
+
+## [3.11.0] - 2026-08-09
+
+### Added
+
+- **Attach windows now reconnect on their own after a connection loss.**
+  Remote attach panes used to die with `client_loop: send disconnect` /
+  `[process exited with code 255]` whenever the client machine slept or the
+  network changed, leaving every terminal a corpse until the next
+  `magent attach` closed and reopened them all. Each pane now runs a small
+  supervisor (`magent-attach-client`) around the ssh client: when the
+  connection drops it prints a reconnect countdown and redials on a backoff
+  ladder (2s doubling, capped at 30s, reset after any connection that lasted
+  at least 30s) until the host answers again -- panes heal themselves even
+  when the host comes back hours later. A deliberate detach (F1 /
+  clean exit) and Ctrl+C still end the pane without redialling, and a remote
+  command that fails over a healthy connection stops with the cause named
+  instead of hammering the host's sshd. `magent attach --no-reconnect`
+  restores the previous one-shot behaviour, `--no-mux` panes are never
+  supervised (redialling would start a second agent), and the spawn falls
+  back to bare ssh with a warning if the supervisor script is not on PATH.
+  The ssh dial also gained `-o ConnectTimeout=20` so a redial against a
+  sleeping host fails fast instead of hanging for minutes.
+
+  Platform note: Windows OpenSSH does not propagate a remote command's exit
+  status over a pty, so on a Windows *host* a remote-command failure is
+  indistinguishable from a clean detach -- both stop the pane; reconnect
+  itself is unaffected because connection failures are reported by the local
+  ssh client.
+
 ## [3.10.10] - 2026-08-08
 
 ### Fixed
@@ -709,6 +995,17 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.13.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.13.0...v3.13.1
+[3.13.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.3...v3.13.0
+[3.12.3]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.2...v3.12.3
+[3.12.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.1...v3.12.2
+[3.12.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.0...v3.12.1
+[3.12.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.11.1...v3.12.0
+[3.11.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.11.0...v3.11.1
+[3.11.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.10...v3.11.0
+[3.10.10]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.9...v3.10.10
+[3.10.9]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.8...v3.10.9
+[3.10.8]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.7...v3.10.8
 [3.10.7]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.6...v3.10.7
 [3.10.6]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.5...v3.10.6
 [3.10.5]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.10.4...v3.10.5

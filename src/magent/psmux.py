@@ -47,27 +47,36 @@ def find_psmux() -> str | None:
 def child_env() -> dict[str, str]:
     """Environment for a psmux child that CREATES a session.
 
-    Delegates to ``env.psmux_child_env`` -- the only module allowed to touch
-    ``os.environ`` -- and is re-exported here so the one spawn site that needs
-    it (``platform/windows.py``'s ``new-session``) reaches it through the module
-    that owns psmux subprocess behaviour. Imported in-body because
+    Delegates to ``env.spawn_child_env`` -- the only module allowed to touch
+    ``os.environ``, and the one seam every agent-hosting spawn in the product
+    routes through -- and is re-exported here so the psmux spawn site that
+    needs it (``platform/windows.py``'s ``new-session``) reaches it through the
+    module that owns psmux subprocess behaviour. Imported in-body because
     ``magent.env`` pulls pydantic in, and this module is a leaf that only
     imports ``magent.log`` at module level.
 
-    SCOPE, measured rather than assumed: psmux's nested-session guard fires for
-    ``new-session`` alone. Run from inside a live pane against a live session,
-    ``has-session -t``, ``display-message -t`` and ``capture-pane -t`` return
-    byte-identical results with the markers present and with them stripped --
-    no warning, same exit code. So every CONTROL and PROBE command in this
-    module spawns with the plain inherited environment: cleaning it there would
-    buy nothing and would put a rebuilt environment block under every psmux
-    round-trip magent makes. (The one thing an inherited ``$TMUX`` could still
-    do -- let a target-less command answer for the calling client's own pane --
-    is closed explicitly by the ``-t <session>`` every command here passes.)
-    """
-    from magent.env import psmux_child_env
+    This session is the one that will host the project's agent for the rest of
+    the day, so the strip is wider than psmux's own concern: the multiplexer
+    nesting markers, the launching agent harness's session markers, and the
+    launching shell's colour overrides all go. See ``env.spawn_child_env``.
 
-    return psmux_child_env()
+    SCOPE of the psmux half, measured rather than assumed: psmux's
+    nested-session guard fires for ``new-session`` alone. Run from inside a live
+    pane against a live session, ``has-session -t``, ``display-message -t`` and
+    ``capture-pane -t`` return byte-identical results with the markers present
+    and with them stripped -- no warning, same exit code. So every CONTROL and
+    PROBE command in this module spawns with the plain inherited environment:
+    cleaning it there would buy nothing and would put a rebuilt environment
+    block under every psmux round-trip magent makes. (The one thing an inherited
+    ``$TMUX`` could still do -- let a target-less command answer for the calling
+    client's own pane -- is closed explicitly by the ``-t <session>`` every
+    command here passes.) The harness/colour markers are the same story from the
+    other side: a control command's environment never reaches the pane, only
+    ``new-session``'s does.
+    """
+    from magent.env import spawn_child_env
+
+    return spawn_child_env()
 
 
 @dataclass
@@ -123,29 +132,294 @@ def has_session(
         return result.returncode == 0
 
 
-def kill_server(name: str, psmux: str | None = None) -> bool:
-    """Kill the psmux server backing a single session. Returns True on success."""
+def _probe_live(names: list[str], binary: str, timeout: float | None) -> set[str]:
+    """One fan-out pass: which of ``names`` answer ``has-session -t``.
+
+    Every probe is spawned before any is waited on, so n sessions cost roughly
+    one psmux round-trip instead of n sequential ones. A probe that could not
+    be spawned, or that outran ``timeout``, counts as NOT live -- the caller
+    decides whether to retry it.
+    """
+    procs: list[tuple[str, subprocess.Popen[bytes] | None]] = []
+    for name in names:
+        try:
+            procs.append(
+                (
+                    name,
+                    subprocess.Popen(
+                        # `-t <name>` is load-bearing -- see ``has_session``.
+                        [binary, "-L", name, "has-session", "-t", name],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    ),
+                )
+            )
+        except OSError:
+            procs.append((name, None))
+
+    live: set[str] = set()
+    for name, proc in procs:
+        if proc is None:
+            continue
+        try:
+            rc = proc.wait() if timeout is None else proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            continue
+        if rc == 0:
+            live.add(name)
+    return live
+
+
+def live_sessions(
+    names: list[str],
+    psmux: str | None = None,
+    *,
+    timeout: float | None = None,
+    retries: int = 1,
+) -> list[str]:
+    """THE liveness enumeration: which of ``names`` are live, in input order.
+
+    Every surface that answers "which sessions are running" goes through this
+    one function -- ``psmux_status`` (and so ``magent status``, ``magent
+    down``, the menu), the session picker's sweep, and the upload server's
+    ``discover_sessions``. They used to each roll their own: same probe, three
+    different retry policies, and therefore three different answers on the same
+    machine at the same moment. The picker retried flapping probes and the
+    other two did not, so ``status``/``down`` could call a session stopped that
+    the picker was happily attaching to -- and ``down`` then never stopped it
+    and never mentioned it (the "these stay always" bug).
+
+    ``retries`` re-probes only the misses: under the load of many running
+    agents an individual probe flaps, and a dropped probe silently HIDES a live
+    session, which is the dangerous direction for a shutdown. ``retries=0`` is
+    for the bring-up creation verify, which owns its own respawn-and-re-probe
+    cycle and must not have a second retry folded into it.
+
+    ``timeout`` bounds each probe; a timed-out probe counts as not live. Left
+    at the default the wait is unbounded, which is what the status/down/picker
+    surfaces want: a psmux server that is merely SLOW (measured at ~19s for one
+    46-socket fan-out on a loaded host) must not be reported dead.
+    """
+    binary = psmux or find_psmux()
+    if not binary or not names:
+        return []
+    live = _probe_live(names, binary, timeout)
+    for _ in range(max(0, retries)):
+        missing = [n for n in names if n not in live]
+        if not missing:
+            break
+        live |= _probe_live(missing, binary, timeout)
+    return [n for n in names if n in live]
+
+
+# How long the control plane gets to answer one cheap command before `magent
+# doctor` calls it wedged. Deliberately short: this is a diagnostic, and the
+# failure it looks for is not "slow" but "never" -- a wedged psmux answers
+# nothing at all, from any console, for as long as the machine stays up.
+CONTROL_PROBE_TIMEOUT_S = 5.0
+
+# A socket name no magent session can ever have (session names come from window
+# titles). The probe must not aim at a project's socket: a control command
+# against a live session competes with the agent using it, and the wedge is
+# machine-global anyway -- the incident's own reproduction was a command on a
+# FRESH socket hanging forever.
+CONTROL_PROBE_SOCKET = "magent-doctor-probe"
+
+
+@dataclass(frozen=True)
+class ControlProbe:
+    """What one bounded control-plane command did: answered, or ran out the
+    clock. ``responsive`` ignores the exit code on purpose -- "no server on
+    this socket" is a perfectly healthy ANSWER, and the only thing being
+    measured here is whether psmux answers at all."""
+
+    responsive: bool
+    timed_out: bool
+    elapsed_s: float
+
+
+def probe_control_plane(
+    psmux: str | None = None, *, timeout: float = CONTROL_PROBE_TIMEOUT_S
+) -> ControlProbe:
+    """Is the psmux control plane answering commands at all? Bounded, one shot.
+
+    This is a RESPONSIVENESS probe and explicitly NOT a fourth liveness sweep:
+    it enumerates nothing, names no configured session, and its answer is
+    "psmux replies" rather than "these sessions are live". That question has
+    exactly one owner -- ``live_sessions`` -- and must keep having one.
+
+    ``list-sessions`` is the cheapest control command that reaches the server
+    layer: tmux/psmux does not START a server for it (a socket with no server
+    answers "no server running" and exits non-zero, which is a fine answer
+    here), so a doctor run leaves nothing behind. A version flag would be
+    cheaper still and would prove nothing -- ``psmux -V`` never touches the
+    ConPTY plumbing that the machine-wide wedge holds.
+
+    Never raises and never blocks past ``timeout``: a timed-out probe is the
+    finding, not an error.
+
+    The output is DISCARDED rather than captured, and that is load-bearing on
+    Windows, not a style choice. ``subprocess.run(capture_output=True,
+    timeout=...)`` is NOT bounded here: on expiry it kills the direct child and
+    then calls ``communicate()``, which waits for the pipe write ends to close
+    -- and any grandchild the wedged client left behind still holds them. Built
+    that way first, this probe took 90 s (the stalled fake's whole lifetime) to
+    answer a 5 s timeout. Nothing is read from a `list-sessions` here anyway:
+    the answer is "it answered", not what it said.
+    """
     binary = psmux or find_psmux()
     if not binary:
-        return False
-    return (
+        return ControlProbe(responsive=False, timed_out=False, elapsed_s=0.0)
+    started = time.monotonic()
+    try:
         subprocess.run(
-            [binary, "-L", name, "kill-server"],
-            capture_output=True,
+            [binary, "-L", CONTROL_PROBE_SOCKET, "list-sessions"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
             check=False,
-        ).returncode
-        == 0
+        )
+    except subprocess.TimeoutExpired:
+        return ControlProbe(
+            responsive=False, timed_out=True, elapsed_s=time.monotonic() - started
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ControlProbe(
+            responsive=False, timed_out=False, elapsed_s=time.monotonic() - started
+        )
+    return ControlProbe(
+        responsive=True, timed_out=False, elapsed_s=time.monotonic() - started
     )
 
 
-def kill_servers(names: list[str]) -> list[str]:
-    """Kill multiple psmux servers. Returns the names that were attempted."""
-    binary = find_psmux()
+# `kill-server` on this machine's psmux 3.3.6 has been observed to exit 0
+# without the server dying, and a wedged server answers nothing at all -- so
+# the kill is bounded (one stuck socket must not hold the whole shutdown
+# hostage) and the ANSWER always comes from a re-probe, never from the rc.
+_KILL_TIMEOUT_S = 10.0
+# `kill-server` returns before the server is fully gone; probing at t=0 would
+# report a session that is on its way out as a survivor.
+_STOP_SETTLE_S = 1.0
+
+
+def kill_server(name: str, psmux: str | None = None) -> bool:
+    """Attempt to kill the psmux server backing a single session.
+
+    True means the command exited 0, which is NOT the same thing as the session
+    being gone (psmux 3.3.6 exits 0 for kills that do not take). Nothing in the
+    product is allowed to report a shutdown off this boolean -- see
+    ``stop_sessions``.
+    """
+    binary = psmux or find_psmux()
     if not binary:
+        return False
+    try:
+        result = subprocess.run(
+            [binary, "-L", name, "kill-server"],
+            capture_output=True,
+            timeout=_KILL_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    else:
+        return result.returncode == 0
+
+
+def _kill_batch(names: list[str], binary: str) -> None:
+    """Fire ``kill-server`` at every name concurrently.
+
+    Concurrent rather than sequential because the sequential sweep was itself a
+    failure mode: 46 sockets x one bounded subprocess each ran long enough that
+    ``down --host``'s SSH budget could guillotine the remote shutdown partway,
+    leaving exactly the un-reached tail of the config alive.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(lambda n: kill_server(n, psmux=binary), names))
+
+
+def kill_servers(names: list[str]) -> list[str]:
+    """Kill multiple psmux servers. Returns the names that were attempted.
+
+    ATTEMPT-only, and deliberately so: it cannot say what actually stopped.
+    Every user-facing shutdown goes through ``stop_sessions`` instead.
+    """
+    binary = find_psmux()
+    if not binary or not names:
         return []
-    for name in names:
-        kill_server(name, psmux=binary)
+    _kill_batch(names, binary)
     return list(names)
+
+
+def stop_sessions(
+    names: list[str], psmux: str | None = None
+) -> tuple[list[str], list[str]]:
+    """Stop every session in ``names`` and PROVE what happened.
+
+    Returns ``(stopped, still_running)``: the sessions that were live before
+    and are verifiably gone after, and the ones that survived two kill attempts.
+
+    This exists because ``magent down`` used to report the loop it had run
+    rather than the world it had changed: ``kill_servers`` threw away every
+    ``kill_server`` return value and answered with the full list of names it
+    had tried, so "Stopped 46 session(s)" was printed on a machine where 11 of
+    them were still alive and attachable. With psmux 3.3.6 exiting 0 for kills
+    that do not take, honouring the rc would not have been enough either -- the
+    only truthful answer is a re-probe, and the only useful reaction to a
+    survivor is to kill it again.
+
+    Every name is killed, including ones the liveness probe called dead:
+    ``kill-server`` against a socket with no server is a harmless no-op, and a
+    shutdown that skips whatever a flaky probe happened to miss is exactly the
+    bug. ``before`` is what keeps the REPORT honest -- a name that was already
+    dead is not claimed as a session this command stopped.
+    """
+    binary = psmux or find_psmux()
+    if not binary or not names:
+        return [], []
+    log = get_logger("launch")
+
+    before = set(live_sessions(names, psmux=binary))
+    _kill_batch(names, binary)
+    time.sleep(_STOP_SETTLE_S)
+    alive = set(live_sessions(names, psmux=binary))
+    if alive:
+        log.warning(
+            "kill-server did not stop %s; killing again", ", ".join(sorted(alive))
+        )
+        retry = sorted(alive)
+        _kill_batch(retry, binary)
+        time.sleep(_STOP_SETTLE_S)
+        alive = set(live_sessions(retry, psmux=binary))
+    if alive:
+        log.error(
+            "session(s) still running after two kill attempts: %s",
+            ", ".join(sorted(alive)),
+        )
+    return (
+        [n for n in names if n in before and n not in alive],
+        [n for n in names if n in alive],
+    )
+
+
+# How long one `send-keys` may take before we stop waiting on it.
+#
+# This was the ONE psmux call in this module with no bound at all, and it is
+# the one an HTTP request handler ran inline: an Alt+V upload was measured
+# taking 74 s to answer because the control command behind it stalled while the
+# session's attached terminal was busy. A control command against a loaded
+# socket has been measured anywhere from 3 s to past 70 s, so the default is
+# generous (a paste that arrives late is still the paste the user wanted) but
+# finite (a caller must never be hostage to a wedged socket forever). Callers
+# with their own budget pass `timeout=`.
+#
+# On expiry `subprocess.run` KILLS the client, so this is exactly one attempt
+# and never a re-send: a killed `send-keys` may or may not have reached the
+# server, and a retry on top of that is how the same image gets pasted twice.
+SEND_KEYS_TIMEOUT_S = 20.0
 
 
 def send_keys(
@@ -153,8 +427,15 @@ def send_keys(
     *keys: str,
     target: str | None = None,
     psmux: str | None = None,
+    timeout: float = SEND_KEYS_TIMEOUT_S,
 ) -> bool:
-    """Send keystrokes to a psmux session. Returns True on success."""
+    """Send keystrokes to a psmux session. Returns True on success.
+
+    Bounded and non-raising, like every other probe here: a timeout, a psmux
+    that will not launch, or a socket that answers nothing all come back as
+    ``False`` with a WARNING in launch.log, never as an exception on a caller
+    fanning this out (or, worse, as an unbounded wait on a request handler).
+    """
     binary = psmux or find_psmux()
     if not binary:
         return False
@@ -163,7 +444,19 @@ def send_keys(
         cmd += ["-t", target]
     cmd.append("--")
     cmd.extend(keys)
-    return subprocess.run(cmd, capture_output=True, check=False).returncode == 0
+    started = time.monotonic()
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        get_logger("launch").warning(
+            "send-keys to project=%s gave up after %.1fs: %s",
+            name,
+            time.monotonic() - started,
+            exc,
+        )
+        return False
+    else:
+        return result.returncode == 0
 
 
 def pane_cwd(name: str, psmux: str | None = None) -> str:
@@ -350,6 +643,21 @@ def agent_idle(name: str, psmux: str | None = None) -> bool:
     return is_idle_command(pane_current_command(name, psmux=psmux))
 
 
+# How long one status-line flash may take before we give up on it.
+#
+# Measured, not guessed: on an idle socket a `display-message` costs 60-130 ms
+# and the attached client repaints within another ~80 ms. Under real load
+# (dozens of live sessions, a discovery fan-out and a spawn storm competing for
+# Cygwin process creation) the SAME command routinely ran past 3 s -- and the
+# old 3 s bound did not merely time the wait out, it KILLED the child, so the
+# message never reached the bar at all. Every "status-line flash failed ...
+# timed out after 3 seconds" line in upload.log is one press whose feedback the
+# product threw away on purpose. The wait is affordable: it happens on an HTTP
+# handler thread, never on the press itself, and it is what keeps a project's
+# phase messages in the order they were sent.
+FLASH_TIMEOUT_S = 20.0
+
+
 def flash_message(
     name: str,
     message: str,
@@ -360,8 +668,12 @@ def flash_message(
 ) -> None:
     """Flash a transient message in the session's psmux status line.
 
-    Non-disruptive — ``display-message`` repaints the status bar, not the
-    agent pane. Never raises and never blocks for long.
+    Non-disruptive — ``display-message`` repaints the status bar (immediately:
+    it sets the client's message and marks the status line for redraw, it does
+    not wait for the `status-interval` tick), not the agent pane. Never raises.
+
+    Returns only when the message has actually been handed to psmux, so callers
+    that flash a SEQUENCE get it on screen in order.
     """
     binary = psmux or find_psmux()
     if not binary:
@@ -370,11 +682,15 @@ def flash_message(
     if style:
         cmd += ["set", "-g", "message-style", style, ";"]
     cmd += ["display-message", "-d", str(duration_ms), message]
+    started = time.monotonic()
     try:
-        subprocess.run(cmd, capture_output=True, timeout=3, check=False)
+        subprocess.run(cmd, capture_output=True, timeout=FLASH_TIMEOUT_S, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         get_logger("upload").warning(
-            "status-line flash failed for project=%s: %s", name, exc
+            "status-line flash failed for project=%s after %.1fs: %s",
+            name,
+            time.monotonic() - started,
+            exc,
         )
 
 
@@ -718,9 +1034,19 @@ def eligible_projects(
     A project is eligible when it is enabled, runs a CLI agent (not an IDE),
     and is local (no ``host``). When ``group`` is given, only projects tagged
     with that group (case-insensitive) are returned.
+
+    The ``cmd`` each entry carries is fresh-start aware: a project directory
+    with no stored session for its tool gets the configured command WITHOUT its
+    implicit-resume flag, because ``claude --continue`` in such a directory
+    errors out and leaves the pane at a dead shell. Every consumer of that key
+    -- ``bring_up``, ``revive_sessions``, and the ``up --json`` payload the
+    attach client spawns no-mux windows from -- inherits the decision, and all
+    of them run the command on THIS machine, the one just probed (remote
+    projects are excluded above, so the probe never answers for a foreign
+    filesystem).
     """
     from magent.launch import _expand_base_dir, _resolve_path
-    from magent.sessions import is_ide_tool
+    from magent.sessions import build_start_command, is_ide_tool
     from magent.titles import get_leaf_name
 
     base_dir = config.base_dir
@@ -748,6 +1074,7 @@ def eligible_projects(
         if sid in seen:
             continue
         seen.add(sid)
+        resolved = _resolve_path(proj.path, base_dir)
         out.append(
             {
                 "name": leaf,
@@ -755,8 +1082,10 @@ def eligible_projects(
                 "path": proj.path,
                 "tool": tool,
                 "group": proj.group,
-                "resolved": _resolve_path(proj.path, base_dir),
-                "cmd": config.settings.tools.get(tool, ""),
+                "resolved": resolved,
+                "cmd": build_start_command(
+                    tool, config.settings.tools.get(tool, ""), resolved
+                ),
                 "color": proj.color,
             }
         )
@@ -788,13 +1117,19 @@ def psmux_status(
     Precedence is binary-first: a missing psmux is a machine-wide blocker that
     makes every other reason moot, so naming it once beats telling the user
     about a folder they would still not be able to launch.
+
+    Liveness comes from ``live_sessions`` -- the same call the session picker
+    and the upload server make -- so the three surfaces can no longer answer
+    differently. It used to run its own single-shot fan-out with no retry while
+    the picker retried its misses, which is how ``status``/``down`` came to
+    report sessions stopped that the picker was still attaching to.
     """
     binary = find_psmux()
     projects = eligible_projects(config, group)
     up: list[dict[str, object]] = []
     down: list[dict[str, object]] = []
 
-    checkable: list[tuple[dict[str, object], subprocess.Popen[bytes]]] = []
+    probeable: list[dict[str, object]] = []
     for p in projects:
         info: dict[str, object] = {
             "name": p["name"],
@@ -804,22 +1139,16 @@ def psmux_status(
             "group": p.get("group"),
         }
         if binary and p["resolved"] and p["cmd"]:
-            sid = _field_str(p, "session")
-            proc = subprocess.Popen(
-                # `-t <sid>` for the same reason `has_session` passes it: a bare
-                # has-session exits 0 for a socket with no server at all, so
-                # every row in this table read "up" on a cold machine.
-                [binary, "-L", sid, "has-session", "-t", sid],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            checkable.append((info, proc))
+            probeable.append(info)
         else:
             info["reason"] = _down_reason(binary, p)
             down.append(info)
 
-    for info, proc in checkable:
-        (up if proc.wait() == 0 else down).append(info)
+    live = set(
+        live_sessions([_field_str(i, "session") for i in probeable], psmux=binary)
+    )
+    for info in probeable:
+        (up if _field_str(info, "session") in live else down).append(info)
 
     return up, down, projects
 
@@ -883,6 +1212,13 @@ def _missing_sessions(names: list[str], binary: str) -> list[str]:
     Concurrent fan-out, the shape ``revive_sessions`` already uses: one bounded
     probe per session, all in flight together, so a 40-session bring-up pays
     roughly one round-trip rather than 40 sequential ones.
+
+    Deliberately NOT ``live_sessions``: that seam answers the user-facing
+    question "what is running" and retries flapping misses, while this one
+    answers "what did creation fail to produce", where a probe that timed out
+    against a wedged server must count as MISSING and be re-CREATED --
+    ``launch_verified`` owns that retry, and folding a second probe retry in
+    here would only delay its respawn.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1020,8 +1356,12 @@ def revive_sessions(
         # registry default is ``claude --continue``, which picks the dead
         # pane's conversation back up. ``sessions.build_resume_command`` is
         # deliberately NOT used here: with no session id claude's builder
-        # *strips* ``--continue``, starting a fresh chat -- the opposite of
-        # reviving. Injection shape mirrors ``launch_psmux_session``.
+        # *strips* ``--continue`` unconditionally, starting a fresh chat -- the
+        # opposite of reviving. ``eligible_projects`` has already dropped that
+        # flag for the one case where keeping it cannot work (a directory with
+        # no stored conversation, where ``--continue`` would only re-kill the
+        # pane the revive is trying to rescue), and left it alone everywhere
+        # else. Injection shape mirrors ``launch_psmux_session``.
         resume = _field_str(p, "cmd")
         keys = f"cmd /c {resume}" if sys.platform == "win32" else resume
         if send_keys(sid, keys, "Enter", target=sid, psmux=binary):
@@ -1075,15 +1415,10 @@ def config_sessions(config_path: str | None) -> list[dict[str, object]]:
 
 
 def discover_sessions(config_path: str | None) -> list[dict[str, object]]:
-    """Active psmux sessions from config — concurrent liveness check."""
-    from concurrent.futures import ThreadPoolExecutor
-
+    """Active psmux sessions from config — through the one liveness seam."""
     candidates = config_sessions(config_path)
     binary = find_psmux()
     if not candidates or not binary:
         return []
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        flags = list(
-            pool.map(lambda c: has_session(socket_id(c), psmux=binary), candidates)
-        )
-    return [c for c, ok in zip(candidates, flags, strict=True) if ok]
+    live = set(live_sessions([socket_id(c) for c in candidates], psmux=binary))
+    return [c for c in candidates if socket_id(c) in live]

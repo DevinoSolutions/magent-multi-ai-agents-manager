@@ -67,6 +67,14 @@ def _child_env(home: Path) -> dict[str, str]:
     env["HOMEDRIVE"] = drive
     env["HOMEPATH"] = tail or "\\"
     env["HOME"] = home_s
+    # The Alt+V listener installs a SYSTEM-WIDE keyboard hook, and a real
+    # `serve` now supervises one into existence. Redirecting HOME does not
+    # contain a global hook, so tests that start a real server opt out
+    # rather than install one on the machine running them.
+    env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
+    # ...and `attention -d` now supervises `magent serve` the same way, so a
+    # test daemon would otherwise start a REAL upload server on this machine.
+    env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
     env["APPDATA"] = home_s  # win32 config_base()
     env["LOCALAPPDATA"] = home_s
     env["XDG_CONFIG_HOME"] = home_s  # linux config_base()
@@ -117,6 +125,29 @@ def test_installed_entry_point_shows_help(packaged, home, neutral_cwd):
     assert "Usage" in r.stdout
     # The group docstring proves the real app object loaded, not a stub.
     assert "Open every project" in r.stdout
+
+
+def test_attach_client_console_script_installs_next_to_magent(
+    packaged, home, neutral_cwd
+):
+    """``magent attach`` resolves its reconnect supervisor with
+    ``shutil.which("magent-attach-client")``, so the script has to land in the
+    SAME scripts directory a working ``magent`` came from -- an entry point
+    declared but not built would silently drop every pane back to a one-shot
+    ssh that dies with its connection, with only a warning line to show for it.
+
+    Runs it for real rather than stat-ing the file: a stub that cannot boot its
+    module is exactly as useless as a missing one, and only executing it tells
+    the two apart on base dependencies alone.
+    """
+    exe = ".exe" if os.name == "nt" else ""
+    script = packaged.entry_point.with_name(f"magent-attach-client{exe}")
+    assert script.exists(), f"attach-client entry point missing at {script}"
+
+    r = _run(script, "--help", home=home, cwd=neutral_cwd)
+    assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    assert "--target" in r.stdout and "--session" in r.stdout
+    assert "--no-reconnect" in r.stdout
 
 
 # --- dev-dependency leak detector -------------------------------------------

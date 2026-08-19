@@ -19,6 +19,7 @@ from magent.platform import (
     VSCodeLaunchOpts,
     find_psmux,
 )
+from magent.procs import spawn_unjobbed
 from magent.psmux import (
     capture_pane,
     child_env,
@@ -383,6 +384,15 @@ class WindowsPlatform(Platform):
             "wt",
             "-w",
             "new",
+            # The title lock, in the argv literal rather than appended later:
+            # magent's window title is what tiling, attach's already-open
+            # dedupe, corpse pairing and the Alt+V hotkey resolve a window BY,
+            # and without this flag the program in the tab (Claude Code, the
+            # shell, ssh) renames it out of the grammar with one OSC escape and
+            # every one of those consumers loses the window for good. Keeping it
+            # inseparable from the `wt` token is what lets the MD006 lint rule
+            # prove no spawn site can ever ship without it.
+            "--suppressApplicationTitle",
             "-d",
             opts.cwd,
             "--title",
@@ -390,7 +400,6 @@ class WindowsPlatform(Platform):
         ]
         if opts.color:
             args.extend(["--tabColor", opts.color])
-        args.append("--suppressApplicationTitle")
 
         if opts.ssh_host:
             remote_dir = opts.ssh_remote_dir or opts.cwd
@@ -404,8 +413,22 @@ class WindowsPlatform(Platform):
         else:
             args.extend(["--", "cmd", "/k", opts.command])
 
+        # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+        from magent.env import spawn_child_env
+
         try:
-            subprocess.Popen(args)
+            # `env=`: this window hosts the project's agent exactly like a psmux
+            # pane does, so it gets the same scrubbed block -- no inherited
+            # CLAUDE_CODE_* session identity, no inherited NO_COLOR. See
+            # env.spawn_child_env.
+            #
+            # Best-effort on Windows, honestly: `wt -w new` is a request to the
+            # running Windows Terminal MONARCH when one exists, and the tab it
+            # opens is then a child of THAT process's environment, not of this
+            # Popen's. It binds when wt is cold (and on every POSIX backend).
+            # The airtight path is psmux `new-session`, which is the default
+            # here; this is the belt to its braces.
+            subprocess.Popen(args, env=spawn_child_env())
         except FileNotFoundError as exc:
             # wt is a hard dependency: turn the raw FileNotFoundError into a
             # typed, actionable error the launch shell surfaces as one clean
@@ -413,11 +436,17 @@ class WindowsPlatform(Platform):
             raise TerminalNotFoundError(WT_NOT_FOUND_MESSAGE) from exc
 
     def launch_vscode(self, opts: VSCodeLaunchOpts) -> None:
+        # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+        from magent.env import spawn_child_env
+
         args = ["cmd", "/c", opts.command]
         if opts.ssh_host:
             args.extend(["--remote", f"ssh-remote+{opts.ssh_host}"])
         args.append(opts.dir)
-        subprocess.Popen(args)
+        # An IDE window is an agent host too: its integrated terminal inherits
+        # the editor's environment, and that is where a user runs `claude`.
+        # Same monarch caveat as `wt` -- `code` forwards to a running instance.
+        subprocess.Popen(args, env=spawn_child_env())
 
     def launch_psmux_session(self, windows: list[PsmuxWindowOpts]) -> None:
         psmux = find_psmux()
@@ -471,19 +500,43 @@ class WindowsPlatform(Platform):
             if start:
                 time.sleep(_BRING_UP_BATCH_PAUSE_S)
 
-            # `env=child_env()` on THIS spawn and no other in this file: psmux's
-            # nested-session guard fires for `new-session` alone. magent is
-            # routinely driven FROM a magent psmux window -- the interactive
-            # menu's "u" especially -- and a psmux that sees PSMUX_SESSION/TMUX
-            # refuses to create a sibling session ("sessions should be nested
-            # with care") while still exiting 0, so the whole wave silently
-            # produced nothing. Control commands (has-session, kill-server,
-            # send-keys, display-message, capture-pane, the decoration `set`s)
-            # are measurably indifferent to the markers -- byte-identical
-            # results with and without -- so they keep the plain inherited
-            # environment rather than a rebuilt block under every round-trip.
+            # TWO things are special about THIS spawn, and no other in this
+            # file. Both exist because this is the one call that gives a psmux
+            # session its SERVER -- the process that will host the project's
+            # agent for the rest of the day.
+            #
+            # 1. `spawn_unjobbed`: the server must not be born inside the job
+            #    object of whatever created it. When the bring-up runs over SSH
+            #    (`magent attach` sends `magent up` to the host -- the normal
+            #    remote path) Windows OpenSSH has wrapped the whole session in a
+            #    kill-on-close job, and job membership is inherited all the way
+            #    down. A plain Popen here therefore couples every session's
+            #    lifetime to the LAPTOP'S WI-FI: one flap and sshd tears the job
+            #    down, killing the psmux servers and the agents inside them,
+            #    while sessions created locally on the host survive untouched.
+            #    Measured exactly that way -- 45 sessions at 10:50, 16 at 11:03,
+            #    with no magent process running in between. See
+            #    `procs.spawn_unjobbed`.
+            #
+            # 2. `env=child_env()`: psmux's nested-session guard fires for
+            #    `new-session` alone. magent is routinely driven FROM a magent
+            #    psmux window -- the interactive menu's "u" especially -- and a
+            #    psmux that sees PSMUX_SESSION/TMUX refuses to create a sibling
+            #    session ("sessions should be nested with care") while still
+            #    exiting 0, so the whole wave silently produced nothing. Control
+            #    commands (has-session, kill-server, send-keys, display-message,
+            #    capture-pane, the decoration `set`s) are measurably indifferent
+            #    to the markers -- byte-identical results with and without -- so
+            #    they keep the plain inherited environment rather than a rebuilt
+            #    block under every round-trip.
+            #
+            # Deliberately NOT added here: any console flag. `spawn_unjobbed`
+            # changes job membership and nothing else, so this child keeps
+            # inheriting the caller's console exactly as it always has -- psmux
+            # allocates the session's pty itself, and detaching the console
+            # would be a second, unrelated change to a spawn that works.
             creates = [
-                subprocess.Popen(
+                spawn_unjobbed(
                     [
                         psmux,
                         "-L",
@@ -656,12 +709,15 @@ class WindowsPlatform(Platform):
             "wt",
             "-w",
             "new",
+            # In the literal, not appended: see launch_terminal. This pane is
+            # the one that matters most -- a psmux attach hosts an agent for
+            # days and re-renders its title constantly.
+            "--suppressApplicationTitle",
             "--title",
             title,
         ]
         if color:
             args.extend(["--tabColor", color])
-        args.append("--suppressApplicationTitle")
         args.extend(["--", psmux, "-L", session_name, "attach"])
         # No `env=child_env()` here, deliberately: this is the user-facing
         # ATTACH client, not a creation/control command. Attaching is the one

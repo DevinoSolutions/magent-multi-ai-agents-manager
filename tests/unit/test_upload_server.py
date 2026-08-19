@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import threading
 import time
 from http.client import HTTPConnection
@@ -721,7 +722,16 @@ class TestHealth:
 
 
 class TestInSessionFeedback:
-    """Upload progress is flashed into the magent:<project> psmux status line."""
+    """Upload progress is flashed into the magent:<project> psmux status line
+    -- for the MOBILE page, which has no other screen in that window.
+
+    An Alt+V paste is different: it arrives with ``?project=`` and narrates
+    itself (altv.handle_press said "capturing..." before the clipboard was even
+    read, and will say the specific outcome when the reply lands). The status
+    line is ONE line, so a second voice on it can only race the first, and the
+    loser is whichever message the user actually needed. Hence: flagged
+    uploads get silence from the server, by design.
+    """
 
     @pytest.fixture(autouse=True)
     def _server(self, tmp_path, monkeypatch):
@@ -731,7 +741,6 @@ class TestInSessionFeedback:
         import magent.psmux as psmux_mod
 
         monkeypatch.setattr(psmux_mod, "find_psmux", lambda: "psmux")
-        monkeypatch.setattr(mod, "_inflight", {})
 
         self.calls: list[list[str]] = []
 
@@ -798,39 +807,222 @@ class TestInSessionFeedback:
             time.sleep(0.02)
         return False
 
-    def test_query_flashes_uploading_then_uploaded(self):
-        assert self._post("/upload?project=marka")["ok"] is True
-        # early flash lands before the response, so it's already recorded
-        assert any("uploading image" in f for f in self._flashes())
-        # the early flash targets the right session socket (a message-style
-        # tint may sit between the socket flag and display-message)
+    def test_a_mobile_upload_is_confirmed_on_the_bar(self):
+        assert self._post("/upload", project_field="marka")["ok"] is True
+        assert self._wait_flash("image uploaded")
+        # ...at the right session's own socket (a message-style tint may sit
+        # between the socket flag and display-message).
         assert any(
-            "-L marka" in f and "display-message" in f and "uploading" in f
+            "-L marka" in f and "display-message" in f and "image uploaded" in f
             for f in self._flashes()
         )
-        # result flash lands just after the response
-        assert self._wait_flash("image uploaded")
 
-    def test_no_query_skips_early_flash_but_confirms(self):
-        assert self._post("/upload", project_field="marka")["ok"] is True
-        assert self._wait_flash("image uploaded")  # still confirmed
-        assert not any(
-            "uploading image" in f for f in self._flashes()
-        )  # no early flash
+    def test_a_mobile_failure_is_shown_too(self):
+        assert self._post("/upload", project_field="evil")["ok"] is False
+        # An unknown project has no window to flash into; a KNOWN one does.
+        assert not self._flashes()
 
-    def test_failure_flashes_when_flagged_upload_rejected(self):
-        # query flags marka (valid early flash) but the body names an unknown
-        # project -> the upload is rejected and the session sees a failure.
+    def test_an_alt_v_upload_gets_no_second_voice_from_the_server(self):
+        # Regression pin for the "which message won?" race: ?project= means the
+        # listener is already narrating this press, so the server says nothing.
+        assert self._post("/upload?project=marka")["ok"] is True
+        assert not self._wait_flash("image uploaded", timeout=0.6)
+        assert not self._wait_flash("uploading image", timeout=0.1)
+
+    def test_an_alt_v_failure_is_left_to_the_listeners_specific_reason(self):
+        # The listener's flash says WHICH failure ("serve said HTTP 400:
+        # Unknown project"); a generic "upload failed" from here would stomp it.
         assert self._post("/upload?project=marka", project_field="evil")["ok"] is False
-        assert any("uploading image" in f for f in self._flashes())
-        assert self._wait_flash("upload failed")
+        assert not self._wait_flash("upload failed", timeout=0.6)
 
-    def test_inflight_count_clears_after_upload(self):
+
+class TestASlowPasteNeverBecomesAFailedUpload:
+    """The reply must not be hostage to the multiplexer.
+
+    Measured on a live machine: `psmux.send_keys` ran INLINE in this handler
+    with no timeout at all, a control command stalled while the session's
+    terminal was busy, and the request was answered 74 seconds after the press.
+    The listener had given up at 20 s and flashed "upload failed - is `magent
+    serve` running?" -- about an image that was already on disk, and that psmux
+    went on to paste a minute later. The file being safe is exactly why calling
+    that a failure was the damaging part: the user reruns the press, and the
+    same screenshot is pasted twice.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _server(self, tmp_path, monkeypatch):
+        import magent.psmux as psmux_mod
         import magent.upload_server as mod
 
-        self._post("/upload?project=marka")
-        self._wait_flash("image uploaded")
-        assert mod._inflight.get("marka", 0) == 0
+        monkeypatch.setattr(mod, "_UPLOAD_DIR", tmp_path / "uploads")
+        monkeypatch.setattr(psmux_mod, "find_psmux", lambda: "psmux")
+        # A short grace keeps the test honest AND fast: the assertion is that
+        # the reply lands inside whatever the grace is, not that 3s is magic.
+        monkeypatch.setattr(mod, "INJECT_GRACE_S", 0.3)
+
+        self.release = threading.Event()
+        self.entered = threading.Event()
+        self.entered_at = 0.0
+        self.worker: threading.Thread | None = None
+        self.pastes: list[str] = []
+
+        def _paste(name, *keys, target=None, psmux=None, timeout=None):
+            # Recorded from INSIDE the worker: the product times its own paste
+            # from that thread's clock, and on a loaded runner the thread can
+            # start well after the handler's grace has already expired. Tests
+            # that want a LATE paste have to synchronize on this, not on the
+            # request's return -- see `_stall_past_the_grace`.
+            self.pastes.append(name)
+            self.entered_at = time.monotonic()
+            self.worker = threading.current_thread()
+            self.entered.set()
+            self.release.wait(20)
+            return True
+
+        monkeypatch.setattr(psmux_mod, "send_keys", _paste)
+
+        UploadHandler.config_path = None
+        UploadHandler.cached_sessions = [{"name": "marka", "path": "INTERNAL/marka"}]
+        UploadHandler.sessions_ts = time.time() + 9999
+
+        from http.server import HTTPServer
+
+        self.server = HTTPServer(("127.0.0.1", 0), UploadHandler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        yield
+        self.release.set()  # never leave a stalled paste thread behind
+        self.server.shutdown()
+
+    def _upload(self) -> tuple[dict, float]:
+        body = (
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="project"\r\n\r\nmarka\r\n'
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="inject"\r\n\r\n1\r\n'
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="c.png"\r\n\r\n'
+            b"FAKEPNG\r\n"
+            b"------B--\r\n"
+        )
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        started = time.monotonic()
+        conn.request(
+            "POST",
+            "/upload?project=marka",
+            body=body,
+            headers={
+                "Content-Type": "multipart/form-data; boundary=----B",
+                "Content-Length": str(len(body)),
+            },
+        )
+        data = json.loads(conn.getresponse().read())
+        return data, time.monotonic() - started
+
+    def _stall_past_the_grace_then_finish(self) -> None:
+        """Release the paste only once it is provably LATE, then join it.
+
+        Both halves close a real race, and the first one is why this test was
+        red on a Windows CI runner while passing locally:
+
+        * The product judges lateness against the WORKER's own clock. Releasing
+          as soon as the request returns says nothing about that clock -- if the
+          thread was slow to be scheduled it starts, returns instantly against
+          an already-set event, measures ~1 ms, and correctly logs nothing. The
+          poll that followed then waited out its budget against a line that was
+          never going to be written. Sleeping to the worker's own deadline is
+          the precondition of the assertion, not a guess at a duration.
+        * Joining the worker is what makes the log line already WRITTEN when the
+          assertion runs: the record is emitted in `_inject_paste`'s `finally`,
+          on this thread, after the fake returns. No polling needed.
+        """
+        import magent.upload_server as mod
+
+        assert self.entered.wait(15), "the paste worker never started"
+        # `entered_at` is taken at or after the worker's own `started`, so
+        # waiting out the grace from here guarantees the product sees it too.
+        # The 50ms margin is not slack: before Python 3.13, Windows'
+        # time.monotonic() is GetTickCount64 with 15.6ms granularity, so the
+        # worker's final clock read can land a tick short of real time and
+        # measure `elapsed` just under the grace -- correctly skipping the
+        # late-verdict branch this helper exists to force.
+        margin = 0.05
+        time.sleep(
+            max(0.0, self.entered_at + mod.INJECT_GRACE_S + margin - time.monotonic())
+        )
+        self.release.set()
+        assert self.worker is not None
+        self.worker.join(timeout=30)
+        assert not self.worker.is_alive(), "the paste worker never finished"
+
+    def test_the_reply_lands_inside_the_grace_and_the_file_is_on_disk(self):
+        data, elapsed = self._upload()
+
+        # The stalled paste blocks for 20s. Anything well under that proves the
+        # reply is no longer hostage to it; the budget is deliberately loose
+        # because a cold runner's cost belongs to the request, not the fix.
+        assert elapsed < 5.0, f"the reply waited {elapsed:.2f}s on a stalled paste"
+        # ok=True is the whole point: the bytes ARE stored.
+        assert data["ok"] is True
+        assert Path(data["path"]).read_bytes() == b"FAKEPNG"
+
+    def test_a_stalled_paste_is_reported_as_pending_not_as_a_refusal(self):
+        data, _ = self._upload()
+        # Three states, not two. `injected: false` alone is indistinguishable
+        # from "psmux said no", which is what the bar rendered as a failure.
+        assert data["injected"] is False
+        assert data["inject_pending"] is True
+
+    def test_a_paste_that_lands_in_time_is_plainly_injected(self, monkeypatch):
+        # The mirror race: with a 0.3s grace, a worker thread that is merely
+        # SLOW TO BE SCHEDULED on a loaded runner would be reported pending
+        # even though the paste itself is instant. The grace is a ceiling, not
+        # a delay -- the handler returns the moment the worker does -- so a
+        # generous one costs this test nothing and removes the flake.
+        import magent.upload_server as mod
+
+        monkeypatch.setattr(mod, "INJECT_GRACE_S", 30.0)
+        self.release.set()
+        data, elapsed = self._upload()
+        assert data["injected"] is True
+        assert data["inject_pending"] is False
+        # ...and it really returned on the paste, not on the ceiling.
+        assert elapsed < 10.0, f"the reply took {elapsed:.2f}s on an instant paste"
+
+    def test_the_stalled_paste_is_still_running_and_is_never_re_sent(self):
+        # One attempt, ever. A `send-keys` that is merely slow is still in
+        # flight; a retry on top of it pastes the same image twice.
+        self._upload()
+        assert self.entered.wait(15), "the paste worker never started"
+        assert self.pastes == ["marka"]
+        # ...and letting the (single) attempt run to completion adds no second
+        # one -- a retry would have to happen after this point to exist at all.
+        self._stall_past_the_grace_then_finish()
+        assert self.pastes == ["marka"]
+
+    def test_the_late_verdict_reaches_the_log_since_it_cannot_reach_the_bar(
+        self, caplog
+    ):
+        # A flagged (?project=) upload has a narrator already and the server
+        # must not become a second one -- so the deferred result is recorded
+        # here instead. Silence would make "did it ever paste?" unanswerable.
+        with caplog.at_level(logging.WARNING, logger="magent.upload"):
+            self._upload()
+            self._stall_past_the_grace_then_finish()
+            assert "finished late" in caplog.text
+            assert "marka" in caplog.text
+
+    def test_the_pending_flag_is_in_the_outcome_log_line(self, caplog):
+        # This one is written on the SERVER thread, in do_POST's `finally`,
+        # after the response is already on the wire -- the same documented
+        # race `_wait_log` exists for above, so it polls rather than joins.
+        with caplog.at_level(logging.INFO, logger="magent.upload"):
+            self._upload()
+            deadline = time.time() + 10
+            while time.time() < deadline and "pending=True" not in caplog.text:
+                time.sleep(0.02)
+            assert "pending=True" in caplog.text
 
 
 class TestFlashEndpoint:
@@ -921,6 +1113,42 @@ class TestFlashEndpoint:
         status, data = self._get("/api/flash")
         assert status == 400
         assert data["ok"] is False
+
+    def test_a_phase_message_can_ask_to_linger(self):
+        # A phase ("uploading...") that expires while the step is still running
+        # leaves a blank bar, which reads exactly like the silence this route
+        # exists to end -- so the caller may set its own duration.
+        self._get("/api/flash?project=marka&msg=working&ms=20000")
+        assert "20000" in self._flashes()[0]
+
+    def test_an_absurd_or_broken_duration_is_clamped_not_obeyed(self):
+        import magent.upload_server as mod
+
+        self._get("/api/flash?project=marka&msg=a&ms=99999999")
+        self._get("/api/flash?project=marka&msg=b&ms=notanumber")
+        self._get("/api/flash?project=marka&msg=c&ms=-5")
+        durations = [f[f.index("-d") + 1] for f in self._flashes()]
+        assert durations == [
+            str(mod._FLASH_MSG_MS_MAX),
+            str(mod._FLASH_MSG_MS),  # unparseable falls back, never fails the flash
+            str(mod._FLASH_MSG_MS_MIN),
+        ]
+
+    def test_the_tint_reaches_the_message_style(self):
+        # psmux's message-style is GLOBAL on the socket, so the caller sets it
+        # on every message; err must not leak into the next ok (and vice versa).
+        import magent.upload_server as mod
+
+        self._get("/api/flash?project=marka&msg=bad&tint=err")
+        self._get("/api/flash?project=marka&msg=fine&tint=ok")
+        styled = [c for c in self.calls if "message-style" in c]
+        assert mod._MSG_RED in styled[0]
+        assert mod._MSG_GREEN in styled[1]
+
+    def test_an_unknown_tint_leaves_the_style_alone_and_still_flashes(self):
+        self._get("/api/flash?project=marka&msg=hello&tint=chartreuse")
+        assert self._flashes()[0][-1] == "hello"
+        assert not any("message-style" in c for c in self.calls)
 
     def test_post_on_the_flash_route_is_405_not_404(self):
         # P3-16: /api/flash is a real GET route, so the wrong verb answers 405.
@@ -1025,11 +1253,19 @@ class TestBindAddresses:
 
         # run_server constructs _NoFqdnHTTPServer (the no-reverse-DNS subclass).
         monkeypatch.setattr(mod, "_NoFqdnHTTPServer", _FakeServer)
+        # ...and it now also supervises the Alt+V listener, which spawns a
+        # process that installs a SYSTEM-WIDE keyboard hook. Never from a unit
+        # test: the wiring is pinned separately, with a stub.
+        supervised = []
+        monkeypatch.setattr(
+            mod, "_supervise_hotkey", lambda url, stop, **kw: supervised.append(url)
+        )
 
         with pytest.raises(KeyboardInterrupt):
             mod.run_server(port=0)
 
         assert constructed == [("127.0.0.1", 0)]  # loopback only, never 0.0.0.0
+        assert supervised == ["http://127.0.0.1:0"]  # the listener gets an owner
 
     def test_server_bind_never_reverse_resolves(self, monkeypatch):
         """Pin the macOS-wedge fix: server_bind must not call socket.getfqdn.
@@ -1056,3 +1292,294 @@ class TestBindAddresses:
             assert srv.server_port != 0
         finally:
             srv.server_close()
+
+
+class TestLocalUrl:
+    """Which URL the supervised listener is handed. It must be reachable from
+    THIS machine without Tailscale being up -- the listener posts every Alt+V
+    image through it."""
+
+    def test_default_bind_uses_loopback(self):
+        import magent.upload_server as mod
+
+        assert mod.local_url(["127.0.0.1", "100.64.0.1"], 8034) == (
+            "http://127.0.0.1:8034"
+        )
+
+    def test_lan_wildcard_still_resolves_to_loopback(self):
+        # `serve --host 0.0.0.0` binds loopback too; "http://0.0.0.0:..." is
+        # not a URL a client should be handed.
+        import magent.upload_server as mod
+
+        assert mod.local_url(["0.0.0.0"], 8034) == "http://127.0.0.1:8034"
+
+
+class TestCrashVisibility:
+    """serve died silently twice in one day and left NOTHING behind: no
+    traceback (a detached process has no console), no log line, only a pid file
+    whose process was gone. Every exit now names its reason, and a crash is
+    logged at exception level -- which is also what hands it to Sentry
+    (errors-only, logging integration at ERROR). Nothing is swallowed.
+    """
+
+    def _fake_server(self, fail: BaseException | None):
+        class _FakeServer:
+            def __init__(self, address, handler_cls):
+                self.server_address = address
+
+            def serve_forever(self):
+                if fail is not None:
+                    raise fail
+
+            def shutdown(self):
+                pass
+
+            def server_close(self):
+                pass
+
+        return _FakeServer
+
+    def _run(self, mod, monkeypatch, tmp_path, fail):
+        monkeypatch.setattr(mod.tailnet, "ip4", lambda: None)
+        monkeypatch.setattr(
+            mod, "_pid_path", lambda port: tmp_path / f"upload-{port}.pid"
+        )
+        monkeypatch.setattr(mod, "_NoFqdnHTTPServer", self._fake_server(fail))
+        # Never install a system-wide keyboard hook from a unit test.
+        monkeypatch.setattr(mod, "_supervise_hotkey", lambda url, stop, **kw: None)
+        mod.run_server(port=0)
+
+    def test_a_clean_stop_logs_one_line_naming_the_reason(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import magent.upload_server as mod
+
+        with (
+            caplog.at_level("INFO", logger="magent.upload"),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            self._run(mod, monkeypatch, tmp_path, KeyboardInterrupt())
+
+        assert "stopped: keyboard interrupt" in caplog.text
+        # A clean stop is not an error -- nothing for Sentry to capture.
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+    def test_a_crash_is_logged_at_exception_level_and_still_propagates(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import magent.upload_server as mod
+
+        boom = RuntimeError("accept loop exploded")
+        with (
+            caplog.at_level("INFO", logger="magent.upload"),
+            pytest.raises(RuntimeError),
+        ):
+            self._run(mod, monkeypatch, tmp_path, boom)
+
+        crashes = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert crashes, "a fatal serve exception must reach the log"
+        assert crashes[0].exc_info is not None  # log.exception, not log.error
+        assert "upload server crashed" in caplog.text
+        assert "stopped: crashed" in caplog.text
+
+    def test_no_bindable_address_is_an_error_line_not_just_a_traceback(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import magent.upload_server as mod
+
+        class _Unbindable:
+            def __init__(self, address, handler_cls):
+                raise OSError("address in use")
+
+        monkeypatch.setattr(mod.tailnet, "ip4", lambda: None)
+        monkeypatch.setattr(
+            mod, "_pid_path", lambda port: tmp_path / f"upload-{port}.pid"
+        )
+        monkeypatch.setattr(mod, "_NoFqdnHTTPServer", _Unbindable)
+
+        with (
+            caplog.at_level("ERROR", logger="magent.upload"),
+            pytest.raises(RuntimeError),
+        ):
+            mod.run_server(port=0)
+
+        assert "no bindable address" in caplog.text
+
+    def test_a_secondary_bind_crash_is_logged_and_never_re_raised(self, caplog):
+        """The Tailscale bind runs on its own daemon thread. Its death must not
+        take the loopback bind with it, but it must not be silent either."""
+        import logging
+
+        import magent.upload_server as mod
+
+        class _Dying:
+            server_address = ("100.64.1.2", 8034)
+
+            def serve_forever(self):
+                raise OSError("interface went away")
+
+        with caplog.at_level("ERROR", logger="magent.upload"):
+            mod._serve_bind(_Dying(), logging.getLogger("magent.upload"))
+
+        assert "stopped serving" in caplog.text
+
+    def test_a_bind_that_excluded_loopback_uses_what_was_bound(self):
+        # `serve --host <tailscale-ip>`: loopback is genuinely not listening,
+        # so claiming it would hand the listener a dead URL.
+        import magent.upload_server as mod
+
+        assert mod.local_url(["100.64.0.1"], 8034) == "http://100.64.0.1:8034"
+
+
+class _Env:
+    """Stand-in for MagentEnv over the fields this code path reads: the
+    supervisor's own switch, plus log_level (get_logger consults it)."""
+
+    log_level = None
+
+    def __init__(self, hotkey_supervisor: bool) -> None:
+        self.hotkey_supervisor = hotkey_supervisor
+
+
+class TestHotkeySupervisor:
+    """serve owns the Alt+V listener's liveness.
+
+    Before this, the listener was a one-shot spawn by whichever launch/attach
+    ran last: a reboot or a crash left Alt+V dead with nothing ever re-checking
+    it, and `status` reported that as a benign default.
+    """
+
+    def _mod(self):
+        import magent.upload_server as mod
+
+        return mod
+
+    def _fake_platform(self, monkeypatch, *, supports_hotkey):
+        from tests.conftest import FakePlatform
+
+        fp = FakePlatform(supports_hotkey=supports_hotkey)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+
+    def _ensure(self, monkeypatch, result=4242):
+        calls: list[str] = []
+
+        def _fake(url):
+            calls.append(url)
+            return result
+
+        monkeypatch.setattr("magent.launch.ensure_hotkey_listener", _fake)
+        return calls
+
+    def test_checks_immediately_and_then_every_interval(self, monkeypatch):
+        self._fake_platform(monkeypatch, supports_hotkey=True)
+        calls = self._ensure(monkeypatch)
+        stop = threading.Event()
+        waits: list[float] = []
+
+        def _wait(timeout):
+            waits.append(timeout)
+            return len(waits) >= 3  # stop on the third pass
+
+        monkeypatch.setattr(stop, "wait", _wait)
+
+        self._mod()._supervise_hotkey("http://127.0.0.1:8034", stop, interval=30.0)
+
+        # The first check is NOT deferred by an interval: a serve that just
+        # started must not leave Alt+V dead for 30 more seconds.
+        assert calls == ["http://127.0.0.1:8034"] * 3
+        assert waits == [30.0, 30.0, 30.0]
+
+    def test_the_env_opt_out_stops_it_before_it_touches_anything(self, monkeypatch):
+        # MAGENT_HOTKEY_SUPERVISOR=0 is what keeps a test that starts a real
+        # serve from installing a system-wide keyboard hook on a dev machine.
+        self._fake_platform(monkeypatch, supports_hotkey=True)
+        calls = self._ensure(monkeypatch)
+        monkeypatch.setattr("magent.env.get_env", lambda: _Env(False))
+
+        self._mod()._supervise_hotkey("http://127.0.0.1:8034", threading.Event())
+
+        assert calls == []
+
+    def test_a_broken_environment_still_supervises(self, monkeypatch, caplog):
+        # A detached daemon must not lose a feature because some unrelated
+        # MAGENT_* var went bad after it started (same posture as log.py).
+        from pydantic import ValidationError
+
+        self._fake_platform(monkeypatch, supports_hotkey=True)
+        calls = self._ensure(monkeypatch)
+
+        def _bad():
+            raise ValidationError.from_exception_data("MagentEnv", [])
+
+        monkeypatch.setattr("magent.env.get_env", _bad)
+        stop = threading.Event()
+        monkeypatch.setattr(stop, "wait", lambda timeout: True)
+
+        with caplog.at_level("WARNING", logger="magent.hotkey"):
+            self._mod()._supervise_hotkey("http://127.0.0.1:8034", stop, interval=1.0)
+
+        assert calls == ["http://127.0.0.1:8034"]
+        assert "did not validate" in caplog.text
+
+    def test_returns_immediately_where_the_platform_has_no_hotkey(self, monkeypatch):
+        self._fake_platform(monkeypatch, supports_hotkey=False)
+        calls = self._ensure(monkeypatch)
+
+        self._mod()._supervise_hotkey("http://127.0.0.1:8034", threading.Event())
+
+        assert calls == []  # and no unbounded loop on a non-Windows serve
+
+    def test_a_failed_spawn_is_logged_and_retried_not_fatal(self, monkeypatch, caplog):
+        self._fake_platform(monkeypatch, supports_hotkey=True)
+        calls = self._ensure(monkeypatch, result=None)  # child never confirmed
+        stop = threading.Event()
+        monkeypatch.setattr(stop, "wait", lambda timeout: len(calls) >= 2)
+
+        with caplog.at_level("WARNING", logger="magent.hotkey"):
+            self._mod()._supervise_hotkey("http://127.0.0.1:8034", stop, interval=1.0)
+
+        assert len(calls) == 2  # it tried again rather than giving up
+        assert "no Alt+V listener came up" in caplog.text
+
+    def test_an_exception_cannot_take_down_the_server_thread(self, monkeypatch, caplog):
+        self._fake_platform(monkeypatch, supports_hotkey=True)
+        boom: list[int] = []
+
+        def _explode(url):
+            boom.append(1)
+            raise RuntimeError("pid file on fire")
+
+        monkeypatch.setattr("magent.launch.ensure_hotkey_listener", _explode)
+        stop = threading.Event()
+        monkeypatch.setattr(stop, "wait", lambda timeout: len(boom) >= 2)
+
+        with caplog.at_level("ERROR", logger="magent.hotkey"):
+            self._mod()._supervise_hotkey("http://127.0.0.1:8034", stop, interval=1.0)
+
+        assert len(boom) == 2
+        assert "listener check failed" in caplog.text
+
+    def test_a_second_server_supervising_backs_off_instead_of_racing(self, monkeypatch):
+        # Two serve daemons on different ports would otherwise both decide the
+        # listener is missing and both spawn one.
+        mod = self._mod()
+        self._fake_platform(monkeypatch, supports_hotkey=True)
+        calls = self._ensure(monkeypatch)
+
+        def _held(name):
+            raise mod.LockHeld(name)
+
+        monkeypatch.setattr(mod, "exclusive_lock", _held)
+        stop = threading.Event()
+        seen: list[int] = []
+
+        def _wait(timeout):
+            seen.append(1)
+            return True
+
+        monkeypatch.setattr(stop, "wait", _wait)
+
+        mod._supervise_hotkey("http://127.0.0.1:8034", stop, interval=1.0)
+
+        assert calls == []  # never spawned behind the other supervisor's back
+        assert seen == [1]  # and still slept rather than spinning

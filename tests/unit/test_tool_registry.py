@@ -13,6 +13,7 @@ from magent.sessions import (
     IDE_TOOLS,
     AgentTool,
     build_resume_command,
+    build_start_command,
     ide_command,
     is_ide_tool,
 )
@@ -55,8 +56,97 @@ class TestOneEditExtensionProof:
         minimal = AgentTool()
         assert minimal.session_ids is None
         assert minimal.resume_command is None
+        assert minimal.fresh_command is None
         assert minimal.happy is False
         assert minimal.multi_window is False
+
+    def test_fresh_start_is_one_dict_entry_too(self, monkeypatch):
+        """A tool teaches the fresh-start dispatcher about its own
+        implicit-resume flag with one more field on its registry entry --
+        build_start_command needs no code change to honor it."""
+        extended = dict(
+            AGENT_TOOLS,
+            mytool=AgentTool(
+                fresh_command=lambda base, d: (
+                    base.replace(" --pickup", "") if d == "/new" else None
+                ),
+            ),
+        )
+        monkeypatch.setattr("magent.sessions.AGENT_TOOLS", extended)
+
+        assert build_start_command("mytool", "mytool --pickup", "/new") == "mytool"
+        assert (
+            build_start_command("mytool", "mytool --pickup", "/old")
+            == "mytool --pickup"
+        )
+
+
+class TestBuildStartCommand:
+    """The one function every command-build site routes through. Its whole
+    contract is that ONLY a positively-determined "this directory has no
+    stored session" rewrites anything -- everything else, including a failing
+    probe, runs the configured command so a real failure stays visible."""
+
+    def _registry(self, monkeypatch, fresh_command):
+        monkeypatch.setattr(
+            "magent.sessions.AGENT_TOOLS",
+            dict(AGENT_TOOLS, mytool=AgentTool(fresh_command=fresh_command)),
+        )
+
+    def test_unknown_tool_runs_the_configured_command(self):
+        assert (
+            build_start_command("ghost", "ghost --continue", "/a/api")
+            == "ghost --continue"
+        )
+
+    def test_a_tool_with_no_probe_runs_the_configured_command(self, monkeypatch):
+        monkeypatch.setattr(
+            "magent.sessions.AGENT_TOOLS", dict(AGENT_TOOLS, mytool=AgentTool())
+        )
+        assert build_start_command("mytool", "mytool --go", "/a/api") == "mytool --go"
+
+    def test_no_project_dir_runs_the_configured_command(self, monkeypatch):
+        # A remote project's command runs on the far host: callers pass None
+        # rather than deciding it from this machine's session store.
+        self._registry(monkeypatch, lambda base, d: "rewritten")
+        assert build_start_command("mytool", "mytool --go", None) == "mytool --go"
+
+    def test_empty_command_stays_empty(self, monkeypatch):
+        # eligible_projects uses "" to mean "this tool has no command at all";
+        # the probe must not turn that into something runnable.
+        self._registry(monkeypatch, lambda base, d: "rewritten")
+        assert build_start_command("mytool", "", "/a/api") == ""
+
+    def test_a_probe_that_fails_runs_the_configured_command(self, monkeypatch):
+        """An unreadable session store proves nothing about whether a session
+        exists -- guessing "new" here would silently start a fresh chat over a
+        conversation that does exist."""
+
+        def _boom(base, project_dir):
+            raise PermissionError(13, "denied")
+
+        self._registry(monkeypatch, _boom)
+        assert build_start_command("mytool", "mytool --go", "/a/api") == "mytool --go"
+
+    def test_claude_default_is_stripped_in_a_new_directory(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "magent.sessions.claude.has_claude_session", lambda d, home=None: False
+        )
+        assert (
+            build_start_command("claude", "claude --continue", str(tmp_path))
+            == "claude"
+        )
+
+    def test_claude_default_survives_where_a_conversation_exists(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(
+            "magent.sessions.claude.has_claude_session", lambda d, home=None: True
+        )
+        assert (
+            build_start_command("claude", "claude --continue", str(tmp_path))
+            == "claude --continue"
+        )
 
 
 class TestIdeRegistryShape:

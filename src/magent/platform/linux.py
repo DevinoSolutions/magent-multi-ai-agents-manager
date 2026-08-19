@@ -11,6 +11,15 @@ from magent.platform import Platform, TerminalLaunchOpts, VSCodeLaunchOpts
 
 _log = get_logger("platform")
 
+# Per-launch title locks -- the POSIX counterparts of Windows Terminal's
+# `--suppressApplicationTitle` (see LinuxPlatform.launch_terminal). Both are
+# overrides of a *config* setting rather than plain flags, which is why they are
+# spelled out here instead of inline: `--title` alone is only an initial value
+# on either emulator, and the program in the pane wins the moment it emits an
+# OSC title escape.
+ALACRITTY_TITLE_LOCK = "window.dynamic_title=false"
+XTERM_TITLE_LOCK = "XTerm*allowTitleOps:false"
+
 
 class LinuxPlatform(Platform):
     def set_dpi_aware(self) -> None:
@@ -176,6 +185,35 @@ class LinuxPlatform(Platform):
             )
 
     def launch_terminal(self, opts: TerminalLaunchOpts) -> None:
+        """Open one project window, with the title locked to magent's grammar
+        wherever the emulator gives us a lever.
+
+        The title is not cosmetic: tiling's ``magent-name`` mode, attach's
+        already-open dedupe and ``hotkey.project_from_title`` all parse it, and
+        every one of them loses the window the moment the program inside (Claude
+        Code, a shell prompt, ssh) rewrites it with an OSC-0/2 escape. Windows
+        Terminal has one flag for this (``--suppressApplicationTitle``, pinned by
+        the MD006 lint rule); the X11 emulators are a mixed bag, so each branch
+        below takes the strongest lever it actually has:
+
+        * kitty   -- ``--title`` *permanently* fixes the OS window title
+                     (documented kitty behavior), so it is already a lock.
+        * alacritty -- ``--title`` is only the INITIAL title; the lock is the
+                     ``window.dynamic_title`` config, overridden per-launch here.
+        * xterm   -- ``-T`` is likewise initial-only; ``allowTitleOps: false``
+                     is the resource that refuses title escape sequences.
+        * gnome-terminal / konsole -- HONEST GAP. Neither exposes a per-launch
+                     way to refuse the application's title (gnome-terminal's
+                     ``--title`` is deprecated and ignored by VTE once the app
+                     sets one; konsole's title format is a profile-only
+                     setting). Windows there can still be renamed out of the
+                     grammar, and Linux has no attention backend to reassert it
+                     (``supports_attention_signals()`` is False). Tracked in
+                     DESIGN.md's known-debt ledger.
+        """
+        # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+        from magent.env import spawn_child_env
+
         if opts.ssh_host:
             remote_dir = opts.ssh_remote_dir or opts.cwd
             inner = f"cd {remote_dir} && {opts.command}"
@@ -186,6 +224,13 @@ class LinuxPlatform(Platform):
         else:
             cmd = opts.command
 
+        # Every branch gets the same scrubbed block: this window hosts the
+        # project's agent, so it must not inherit the LAUNCHING shell's agent
+        # session identity or its colour opinion. See env.spawn_child_env.
+        # (Unlike `wt`, these emulators really are spawned by this Popen, so the
+        # environment binds -- gnome-terminal is the one that can hand off to a
+        # running server, and only when it does.)
+        env = spawn_child_env()
         if shutil.which("kitty"):
             subprocess.Popen(
                 [
@@ -197,12 +242,15 @@ class LinuxPlatform(Platform):
                     "sh",
                     "-c",
                     cmd,
-                ]
+                ],
+                env=env,
             )
         elif shutil.which("alacritty"):
             subprocess.Popen(
                 [
                     "alacritty",
+                    "-o",
+                    ALACRITTY_TITLE_LOCK,
                     "--title",
                     opts.title,
                     "--working-directory",
@@ -211,7 +259,8 @@ class LinuxPlatform(Platform):
                     "sh",
                     "-c",
                     cmd,
-                ]
+                ],
+                env=env,
             )
         elif shutil.which("gnome-terminal"):
             subprocess.Popen(
@@ -223,7 +272,8 @@ class LinuxPlatform(Platform):
                     "sh",
                     "-c",
                     cmd,
-                ]
+                ],
+                env=env,
             )
         elif shutil.which("konsole"):
             subprocess.Popen(
@@ -237,11 +287,21 @@ class LinuxPlatform(Platform):
                     "sh",
                     "-c",
                     cmd,
-                ]
+                ],
+                env=env,
             )
         elif shutil.which("xterm"):
             subprocess.Popen(
-                ["xterm", "-T", opts.title, "-e", f"cd {opts.cwd} && {cmd}"]
+                [
+                    "xterm",
+                    "-xrm",
+                    XTERM_TITLE_LOCK,
+                    "-T",
+                    opts.title,
+                    "-e",
+                    f"cd {opts.cwd} && {cmd}",
+                ],
+                env=env,
             )
         else:
             raise RuntimeError(
@@ -249,8 +309,13 @@ class LinuxPlatform(Platform):
             )
 
     def launch_vscode(self, opts: VSCodeLaunchOpts) -> None:
+        # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+        from magent.env import spawn_child_env
+
         args = [opts.command]
         if opts.ssh_host:
             args.extend(["--remote", f"ssh-remote+{opts.ssh_host}"])
         args.append(opts.dir)
-        subprocess.Popen(args)
+        # An IDE window is an agent host too -- its integrated terminal is where
+        # a user runs `claude`, and it inherits the editor's environment.
+        subprocess.Popen(args, env=spawn_child_env())

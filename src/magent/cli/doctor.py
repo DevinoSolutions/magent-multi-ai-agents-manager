@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 import click
 
-from magent import log, tailnet
+from magent import log, psmux, tailnet
 from magent.cli.app import main
 from magent.paths import find_config
 from magent.style import style
@@ -118,6 +118,67 @@ def _check_terminal() -> CheckResult:
     return (OK, f"terminal: {found[0]}")
 
 
+# The three facts an operator needs at 2am, in the order they need them. ASCII
+# only: this lands in a psmux status line and in bug reports pasted anywhere.
+WEDGE_REPAIR_HINT = (
+    "The sessions behind it are FROZEN, not dead -- do NOT restart them, do "
+    "NOT reboot; both destroy live agents that would otherwise come back.\n"
+    "Recovery: find the conhost.exe processes whose parent chain reaches a dead "
+    "pid or a psmux.exe, and kill ONLY those (measured: 14 of 874 conhosts).\n"
+    "psmux answers again immediately after that (a hung new-session went to "
+    "892 ms) and every session returns intact."
+)
+
+
+def _resident_psmux() -> str:
+    """`` (N psmux.exe resident)``, or nothing at all.
+
+    Enrichment only, and strictly optional: the count corroborates the wedge
+    (the incident left psmux.exe processes that ignored ``taskkill /F``) but the
+    repair does not depend on it, so an unknown count says nothing rather than
+    guessing zero. ``count_processes`` is a Toolhelp snapshot -- single-digit
+    milliseconds, no subprocess -- and answers None off Windows, so this can
+    never add measurable time to a doctor run.
+    """
+    from magent.procs import count_processes
+
+    found = count_processes("psmux.exe")
+    return f" ({found} psmux.exe resident)" if found else ""
+
+
+def _check_psmux_wedge() -> CheckResult:
+    """Is the psmux CONTROL PLANE answering, or is the machine wedged?
+
+    The failure this exists to name took hours to diagnose live: every psmux
+    command -- has-session, list-sessions, new-session -- hung forever from any
+    console, while ConPTY itself was healthy (a raw pywinpty spawn was
+    instant). The whole fleet looked dead. It was not: after the wedge was
+    cleared every session probed alive, so the expensive mistake available at
+    that moment was mass-restarting 40 live agents.
+
+    One bounded probe, and it is deliberately not a liveness sweep -- see
+    ``psmux.probe_control_plane``.
+    """
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    if not get_platform().supports_psmux():
+        return (OK, "psmux not used on this OS (Windows-only feature)")
+    if not psmux.find_psmux():
+        return (OK, "skipped -- psmux not installed (see the terminal check)")
+
+    probe = psmux.probe_control_plane()
+    if probe.timed_out:
+        return (
+            FAIL,
+            f"psmux answered nothing in {probe.elapsed_s:.0f}s"
+            f"{_resident_psmux()}: the control plane is WEDGED machine-wide.\n"
+            f"{WEDGE_REPAIR_HINT}",
+        )
+    if not probe.responsive:
+        return (WARN, "psmux is installed but would not run (see the terminal check)")
+    return (OK, f"psmux control plane responded in {probe.elapsed_s:.2f}s")
+
+
 def _check_monitors() -> CheckResult:
     from magent.platform import get_platform  # heavy subsystem: in-body per policy
 
@@ -163,12 +224,51 @@ def _monitor_lines(monitors: list[dict[str, object]]) -> list[str]:
     return lines
 
 
-def _check_hotkey() -> CheckResult:
+def _check_hotkey(cfg: MagentConfig | None) -> CheckResult:
+    """Is Alt+V actually working, not merely available.
+
+    The old version answered "does this OS support the hotkey", which is true on
+    every Windows box whether or not a listener has run since the last reboot --
+    so a machine where Alt+V had been dead for days passed this check. It now
+    reports the real listener liveness, through the same state machine `status`
+    renders (``cli.status._listener_state``) so the two surfaces can never
+    disagree about whether Alt+V works.
+    """
     from magent.platform import get_platform  # heavy subsystem: in-body per policy
 
-    if get_platform().supports_hotkey():
-        return (OK, "Alt+V clipboard-upload hotkey available")
-    return (OK, "hotkey not supported on this OS (Windows-only feature)")
+    if not get_platform().supports_hotkey():
+        return (OK, "hotkey not supported on this OS (Windows-only feature)")
+
+    from magent.cli.status import (
+        LISTENER_REPAIR_HINT,
+        _listener_state,
+        _upload_state,
+    )
+
+    port = cfg.settings.upload_port if cfg else 8033
+    state = _listener_state(_upload_state(port))
+    if state == "on":
+        return (OK, "Alt+V listener running (heartbeat fresh)")
+    if state == "dead":
+        return (
+            FAIL,
+            "upload server is running but no Alt+V listener — pasting an image "
+            f"into a magent: window does nothing. Repair: {LISTENER_REPAIR_HINT}",
+        )
+    if state == "stale":
+        return (
+            FAIL,
+            "Alt+V listener process is alive but its heartbeat expired — its "
+            "message loop is wedged and key presses are being dropped. "
+            f"Repair: {LISTENER_REPAIR_HINT}",
+        )
+    from magent.upload_server import (
+        supervision_enabled,  # heavy subsystem: in-body per policy
+    )
+
+    if not supervision_enabled():
+        return (OK, "Alt+V listener off — supervision disabled (you own its lifetime)")
+    return (OK, "Alt+V listener off — it starts with the upload server")
 
 
 def _writable(d: Path) -> bool:
@@ -260,8 +360,9 @@ def _run_checks(config_file: Path) -> list[dict[str, str]]:
         ("env", _check_env),
         ("agent tools", lambda: _check_agent_tools(cfg)),
         ("terminal", _check_terminal),
+        ("psmux wedge", _check_psmux_wedge),
         ("monitors", _check_monitors),
-        ("hotkey", _check_hotkey),
+        ("hotkey", lambda: _check_hotkey(cfg)),
         ("logs dir", _check_logs_dir),
         ("state dir", _check_state_dir),
         ("sentry", _check_sentry),
@@ -317,10 +418,17 @@ def doctor_cmd(ctx: click.Context, as_json: bool) -> None:
     click.echo()
     for r in results:
         mark, color = _MARKS[r["status"]]
+        dim = r["status"] == OK
+        # A detail may be several lines (a repair runbook, not a sentence);
+        # continuation lines are indented under the first so the checklist
+        # column survives.
+        first, *rest = r["detail"].split("\n")
         click.echo(
             f"  {style(mark, fg=color, bold=True)} {r['name']:<12} "
-            f"{style(r['detail'], dim=(r['status'] == OK))}"
+            f"{style(first, dim=dim)}"
         )
+        for line in rest:
+            click.echo(f"    {' ' * 12} {style(line, dim=dim)}")
     for line in _monitor_lines(monitors):
         click.echo(f"      {style(line, dim=True)}")
     click.echo()

@@ -2,7 +2,6 @@ import json
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -55,80 +54,6 @@ class TestAltKeyDetection:
         assert VK_LMENU in _ALT_KEYS
         assert VK_RMENU in _ALT_KEYS
         assert VK_MENU in _ALT_KEYS
-
-
-class TestUploadImage:
-    @pytest.fixture(autouse=True)
-    def _server(self):
-        self.last_request = {}
-
-        parent = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                length = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(length)
-                parent.last_request = {
-                    "path": self.path,
-                    "body": body,
-                    "content_type": self.headers.get("Content-Type", ""),
-                }
-                resp = json.dumps({"ok": True, "injected": True}).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(resp)))
-                self.end_headers()
-                self.wfile.write(resp)
-
-            def log_message(self, *args):
-                pass
-
-        self.server = HTTPServer(("127.0.0.1", 0), Handler)
-        self.port = self.server.server_address[1]
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        yield
-        self.server.shutdown()
-
-    def test_uploads_image(self):
-        from magent.hotkey import upload_image
-
-        url = f"http://127.0.0.1:{self.port}"
-        result = upload_image(url, "marka", b"FAKEBMP")
-        assert result is True
-        # project rides in the query string so the server can flash "uploading"
-        # before reading the body, and still in the multipart body for validation.
-        assert self.last_request["path"].startswith("/upload")
-        assert "project=marka" in self.last_request["path"]
-        assert b"marka" in self.last_request["body"]
-        assert b"FAKEBMP" in self.last_request["body"]
-        assert "multipart/form-data" in self.last_request["content_type"]
-        # Boundary consistency: the Content-Type header's boundary must match
-        # the delimiters actually written into the body.
-        ct = self.last_request["content_type"]
-        boundary = ct.split("boundary=")[1].strip()
-        body = self.last_request["body"]
-        assert f"--{boundary}\r\n".encode() in body
-        assert f"\r\n--{boundary}--\r\n".encode() in body
-
-    def test_returns_false_on_network_error(self):
-        from magent.hotkey import upload_image
-
-        result = upload_image("http://127.0.0.1:1", "marka", b"data")
-        assert result is False
-
-    def test_network_error_logs_specific_transport_cause(self, caplog):
-        # P2-07: a failed paste must record WHY (connection refused vs. timeout
-        # vs. malformed response), not just a bare False the caller can't
-        # explain -- the cause (exception class + message) lands in hotkey.log.
-        from magent.hotkey import upload_image
-
-        with caplog.at_level("WARNING", logger="magent.hotkey"):
-            result = upload_image("http://127.0.0.1:1", "marka", b"data")
-
-        assert result is False
-        assert "transport error" in caplog.text
-        assert "URLError" in caplog.text  # the specific class, not a generic line
 
 
 class TestDibToBmp:
@@ -446,24 +371,34 @@ class _OpenCodeHarness:
         from magent import hotkey
 
         spawned: list[list[str]] = []
+        self.spawn_envs: list[object] = []
         self.flashed: list[str] = []
         monkeypatch.setattr(hotkey.shutil, "which", lambda _n: code_bin)
-        monkeypatch.setattr(hotkey.subprocess, "Popen", spawned.append)
+
+        def _popen(argv, **kwargs):
+            spawned.append(argv)
+            self.spawn_envs.append(kwargs.get("env"))
+
+        monkeypatch.setattr(hotkey.subprocess, "Popen", _popen)
 
         body = json.dumps(payload if payload is not None else {}).encode()
 
         @contextlib.contextmanager
         def _fake_urlopen(url, timeout=None):
-            # One fake stands in for both round trips the handler makes: the
-            # /api/sessions lookup and every best-effort /api/flash report.
-            if "/api/flash" in url:
-                self.flashed.append(parse_qs(urlparse(url).query)["msg"][0])
-                yield io.BytesIO(b"")
-                return
             assert url.endswith("/api/sessions")
             yield io.BytesIO(body)
 
         monkeypatch.setattr(hotkey, "urlopen", _fake_urlopen)
+        # Flashes are QUEUED, never called inline (see altv.flash_async), so
+        # they are recorded where they are dispatched -- delivery happens on
+        # the pump thread and its timing is not this handler's contract.
+        monkeypatch.setattr(
+            hotkey,
+            "flash_async",
+            lambda url, project, message, duration_ms=None, tint=None: (
+                self.flashed.append(message)
+            ),
+        )
         return spawned
 
 
@@ -501,6 +436,33 @@ class TestDoOpenCode(_OpenCodeHarness):
         )
         hotkey._do_open_code("http://x:8034", "caly", "amin@deck")
         assert spawned == [["code", "--remote", "ssh-remote+deck", "/base/caly"]]
+
+    def test_the_editor_gets_a_scrubbed_environment(self, monkeypatch):
+        # The listener is a long-lived descendant of whatever shell started
+        # magent, so it carries that shell's agent-session markers for days.
+        # The editor it opens hands its environment to the integrated terminal,
+        # which is where a user runs `claude` -- so the same seam applies here
+        # as at psmux new-session. See env.spawn_child_env.
+        from magent import hotkey
+
+        monkeypatch.setenv("CLAUDE_CODE_CHILD_SESSION", "1")
+        monkeypatch.setenv("NO_COLOR", "1")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-keep-me")
+        self._patch(
+            monkeypatch,
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "caly", "session": "caly", "resolved": "/base/caly"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "caly", None)
+        env = self.spawn_envs[0]
+        assert env is not None
+        assert "CLAUDE_CODE_CHILD_SESSION" not in env
+        assert "NO_COLOR" not in env
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-keep-me"
 
     def test_missing_code_binary_warns_and_does_nothing(self, monkeypatch, caplog):
         from magent import hotkey
@@ -591,7 +553,7 @@ class TestDoOpenCodeFeedback(_OpenCodeHarness):
             },
         )
 
-        def _boom(_argv):
+        def _boom(_argv, **_kwargs):
             raise OSError("no exe")
 
         monkeypatch.setattr(hotkey.subprocess, "Popen", _boom)
@@ -600,34 +562,38 @@ class TestDoOpenCodeFeedback(_OpenCodeHarness):
 
     def test_a_dead_flash_endpoint_never_breaks_the_open(self, monkeypatch):
         # Feedback is strictly best-effort: an old host with no /api/flash
-        # route (or a server that just died) must still open VS Code.
+        # route (or a server that just died) must still open VS Code. Driven
+        # through the REAL flash path (queue + pump + transport) against a port
+        # that refuses instantly, so the whole chain is proven harmless.
         import contextlib
         import io
-        from urllib.error import URLError
 
         from magent import hotkey
 
         spawned: list[list[str]] = []
         monkeypatch.setattr(hotkey.shutil, "which", lambda _n: "code")
-        monkeypatch.setattr(hotkey.subprocess, "Popen", spawned.append)
+        monkeypatch.setattr(
+            hotkey.subprocess, "Popen", lambda argv, **_k: spawned.append(argv)
+        )
         body = json.dumps(
             {"ok": True, "sessions": [{"session": "caly", "resolved": "/base/caly"}]}
         ).encode()
 
         @contextlib.contextmanager
-        def _flaky(url, timeout=None):
-            if "/api/flash" in url:
-                raise URLError("404")
+        def _sessions_only(url, timeout=None):
+            assert url.endswith("/api/sessions")
             yield io.BytesIO(body)
 
-        monkeypatch.setattr(hotkey, "urlopen", _flaky)
-        hotkey._do_open_code("http://x:8034", "caly", None)
+        monkeypatch.setattr(hotkey, "urlopen", _sessions_only)
+        hotkey._do_open_code("http://127.0.0.1:1", "caly", None)
         assert spawned == [["code", "/base/caly"]]
 
     def test_flash_url_is_the_shared_builder_shape(self, monkeypatch):
         # Pin the client/server contract: the listener must hit the same route
-        # upload_server serves, with the project it was invoked for.
-        from magent import hotkey
+        # upload_server serves, with the project it was invoked for. The flash
+        # leaves on the pump thread now, so this waits for it rather than
+        # assuming it already happened.
+        from magent import altv, hotkey
 
         seen: list[str] = []
 
@@ -636,10 +602,19 @@ class TestDoOpenCodeFeedback(_OpenCodeHarness):
             raise OSError("stop here")
 
         monkeypatch.setattr(hotkey.shutil, "which", lambda _n: None)
-        monkeypatch.setattr(hotkey, "urlopen", _capture)
+        monkeypatch.setattr(altv, "urlopen", _capture)
         hotkey._do_open_code("http://127.0.0.1:8033", "caly", None)
-        assert seen[0].startswith("http://127.0.0.1:8033/api/flash?")
-        assert parse_qs(urlparse(seen[0]).query)["project"] == ["caly"]
+
+        def _ours() -> list[str]:
+            # The pump is one process-wide queue, so a flash another test left
+            # in it can be delivered here too; match on this call's own server.
+            return [u for u in seen if u.startswith("http://127.0.0.1:8033/")]
+
+        deadline = time.time() + 5
+        while not _ours() and time.time() < deadline:
+            time.sleep(0.01)
+        assert _ours()[0].startswith("http://127.0.0.1:8033/api/flash?")
+        assert parse_qs(urlparse(_ours()[0]).query)["project"] == ["caly"]
 
 
 class TestF2HookDecision:
@@ -731,63 +706,90 @@ class TestF2HookDecision:
         )
         assert started[0][0] is hotkey._do_upload
 
-
-class TestDoUploadLogging:
-    """_do_upload discards the upload result (F-IC-003/F-D4-001) no longer --
-    it now logs the outcome, and an unexpected error (e.g. the OverflowError
-    _dib_to_bmp can raise) is caught and logged instead of vanishing on the
-    background thread it runs on."""
-
-    def test_logs_info_with_project_and_result(self, monkeypatch, caplog):
-        from magent import hotkey
-
-        monkeypatch.setattr(hotkey, "get_clipboard_image", lambda: b"FAKEBMP")
-        monkeypatch.setattr(hotkey, "upload_image", lambda url, project, data: True)
-
-        with caplog.at_level("INFO", logger="magent.hotkey"):
-            hotkey._do_upload("http://x:8034", "marka")
-
-        assert "project=marka" in caplog.text
-        assert "ok=True" in caplog.text
-
-    def test_logs_ok_false_on_failed_upload(self, monkeypatch, caplog):
-        from magent import hotkey
-
-        monkeypatch.setattr(hotkey, "get_clipboard_image", lambda: b"FAKEBMP")
-        monkeypatch.setattr(hotkey, "upload_image", lambda url, project, data: False)
-
-        with caplog.at_level("INFO", logger="magent.hotkey"):
-            hotkey._do_upload("http://x:8034", "marka")
-
-        assert "ok=False" in caplog.text
-
-    def test_no_image_is_a_silent_noop(self, monkeypatch, caplog):
-        from magent import hotkey
-
-        monkeypatch.setattr(hotkey, "get_clipboard_image", lambda: None)
-        called = []
-        monkeypatch.setattr(hotkey, "upload_image", lambda *a: called.append(a))
-
-        with caplog.at_level("INFO", logger="magent.hotkey"):
-            hotkey._do_upload("http://x:8034", "marka")
-
-        assert called == []
-        assert "project=marka" not in caplog.text
-
-    def test_unexpected_error_is_caught_and_logged_not_raised(
-        self, monkeypatch, caplog
+    def test_alt_v_with_no_clipboard_image_reports_instead_of_going_quiet(
+        self, monkeypatch
     ):
+        # The exact "I pressed it in the right window and nothing happened"
+        # case. The chord still PASSES THROUGH (the pane may want a plain
+        # Alt+V) -- but the user is told why nothing was uploaded.
         from magent import hotkey
+        from magent.hotkey import HC_ACTION, VK_V, WM_KEYDOWN, _hook_decide
 
-        def _boom():
-            raise OverflowError("byte must be in range(0, 256)")
+        monkeypatch.setattr(hotkey, "get_active_window_title", lambda: "magent:caly")
+        monkeypatch.setattr(hotkey, "clipboard_has_image", lambda: False)
+        monkeypatch.setattr(hotkey.user32, "CallNextHookEx", lambda *a: 0)
+        started: list[tuple[object, tuple[object, ...]]] = []
+        self._fake_thread(monkeypatch, started)
 
-        monkeypatch.setattr(hotkey, "get_clipboard_image", _boom)
+        assert (
+            _hook_decide(
+                {"alt_held": True},
+                "http://x:8034",
+                HC_ACTION,
+                WM_KEYDOWN,
+                self._lparam(VK_V),
+            )
+            == 0
+        )
+        assert started[0][0] is hotkey._altv_report
+        assert started[0][1][:3] == ("http://x:8034", "caly", "no-image")
+        assert "clipboard has no image" in started[0][1][3]
 
-        with caplog.at_level("INFO", logger="magent.hotkey"):
-            hotkey._do_upload("http://x:8034", "marka")  # must not raise
+    def test_alt_v_outside_a_magent_window_stays_a_silent_pass_through(
+        self, monkeypatch
+    ):
+        # Not a failure -- the chord belongs to whatever app is focused. It is
+        # recorded at DEBUG only; reporting it would fire on every Alt+V the
+        # user ever presses anywhere.
+        from magent import hotkey
+        from magent.hotkey import HC_ACTION, VK_V, WM_KEYDOWN, _hook_decide
 
-        assert "upload project=marka failed" in caplog.text
+        monkeypatch.setattr(hotkey, "get_active_window_title", lambda: "Notepad")
+        monkeypatch.setattr(hotkey.user32, "CallNextHookEx", lambda *a: 0)
+        started: list[tuple[object, tuple[object, ...]]] = []
+        self._fake_thread(monkeypatch, started)
+
+        assert (
+            _hook_decide(
+                {"alt_held": True},
+                "http://x:8034",
+                HC_ACTION,
+                WM_KEYDOWN,
+                self._lparam(VK_V),
+            )
+            == 0
+        )
+        assert started == []
+
+
+class TestAltVIsDelegated:
+    """The press pipeline itself lives in ``magent.altv`` (platform-neutral, so
+    a real-serve e2e can drive a press on any OS). What must stay pinned HERE
+    is only the win32 half: the hook hands a press to that pipeline, with this
+    machine's clipboard reader as the capture step.
+
+    The pipeline's own contract -- phase order, specific failure reasons, the
+    flash never blocking a press -- is pinned in tests/unit/test_altv.py.
+    """
+
+    def test_do_upload_runs_the_shared_press_pipeline_with_the_win32_capture(
+        self, monkeypatch
+    ):
+        from magent import altv, hotkey
+
+        seen: list[tuple[str, str, object]] = []
+        monkeypatch.setattr(
+            hotkey,
+            "handle_press",
+            lambda url, project, capture: seen.append((url, project, capture)),
+        )
+        hotkey._do_upload("http://x:8034", "marka")
+
+        assert seen == [("http://x:8034", "marka", hotkey.get_clipboard_image)]
+        # ...and the names the hook branches reach for are that module's, so a
+        # rename cannot leave the listener reporting into a void.
+        assert hotkey._altv_report is altv.report
+        assert hotkey.OUTCOME_REASONS is altv.OUTCOME_REASONS
 
 
 class TestHeartbeatWiring:

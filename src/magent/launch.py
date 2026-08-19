@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
+import socket
 import sys
 import time
 from dataclasses import dataclass
@@ -22,42 +22,44 @@ from magent.platform import (
     VSCodeLaunchOpts,
     get_platform,
 )
+from magent.procs import pid_alive, spawn_unjobbed
 from magent.sessions import (
     AGENT_TOOLS,
     build_resume_command,
+    build_start_command,
     ide_command,
     is_ide_tool,
 )
 from magent.style import style
-from magent.tiling import Placement, place_windows
+from magent.tiling import Placement, magent_window_names, place_windows
 from magent.titles import generate_titles, get_leaf_name, make_title, parse_title
 
 if TYPE_CHECKING:
+    import subprocess
     from collections.abc import Callable
 
     from magent.config import MagentConfig, ProjectConfig
+    from magent.env import MagentEnv
 
 
 def spawn_detached(args: list[str], extra_flags: int = 0) -> subprocess.Popen[bytes]:
     """Popen a process that outlives both this process and a launching SSH session.
 
-    On Windows, OpenSSH puts the command's children in a job object marked
-    kill-on-close, so when the SSH session ends the children are terminated.
-    ``DETACHED_PROCESS`` only detaches the console -- it does not escape the job.
-    ``CREATE_BREAKAWAY_FROM_JOB`` does, but CreateProcess fails outright if the
-    parent job forbids breakaway, so fall back to a plain detached spawn (the
-    normal case when launched from an interactive console, not under a job).
+    Two independent halves, and only one of them lives here now. The CONSOLE
+    half is this function's own: ``DETACHED_PROCESS | CREATE_NO_WINDOW`` gives
+    the child no console to be killed with and no window to flash. The JOB half
+    -- escaping the kill-on-close job object Windows OpenSSH wraps every SSH
+    session in -- is ``procs.spawn_unjobbed``, shared with the psmux
+    session-creation spawn in ``platform/windows.py`` so the recipe that decides
+    whether work survives a disconnect exists exactly once.
     """
     if sys.platform != "win32":
-        return subprocess.Popen(args)
+        return spawn_unjobbed(args)
     CREATE_NO_WINDOW = 0x08000000
     DETACHED_PROCESS = 0x00000008
-    CREATE_BREAKAWAY_FROM_JOB = 0x01000000
-    base = CREATE_NO_WINDOW | DETACHED_PROCESS | extra_flags
-    try:
-        return subprocess.Popen(args, creationflags=base | CREATE_BREAKAWAY_FROM_JOB)
-    except OSError:
-        return subprocess.Popen(args, creationflags=base)
+    return spawn_unjobbed(
+        args, creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS | extra_flags
+    )
 
 
 def hotkey_restart_reason(
@@ -149,6 +151,252 @@ def start_hotkey_listener(server_url: str, ssh_host: str | None = None) -> int |
     return None
 
 
+def supervised_hotkey_target(
+    manifest: dict[str, str | None] | None, default_url: str
+) -> tuple[str, str | None]:
+    """The ``(server_url, ssh_host)`` a SUPERVISED restart must use.
+
+    Pure so it is testable off Windows, like ``hotkey_restart_reason``.
+
+    The distinction this encodes is the whole reason ``ensure_hotkey_listener``
+    exists as a separate entry point. The launch and attach paths KNOW which
+    target the listener should serve and deliberately re-aim it when that
+    changes -- that is what ``hotkey_restart_reason``'s "target change" branches
+    are for. A supervisor knows no such thing: ``magent attach`` aims the
+    listener at a REMOTE host so F2 opens projects over VS Code Remote-SSH, and
+    a supervisor that re-aimed it at its own loopback URL every interval would
+    fight attach forever, silently breaking F2 on every remote fleet. So a
+    listener that is already running keeps whatever target it was wired to; the
+    supervisor's default is only ever used for a listener that is not there.
+
+    A missing/unreadable manifest yields the default: that listener is getting
+    restarted anyway ("no manifest" is a restart reason), and the default is
+    the only target we can honestly claim to know.
+    """
+    if manifest is None:
+        return default_url, None
+    return manifest.get("server_url") or default_url, manifest.get("ssh_host")
+
+
+def ensure_hotkey_listener(default_url: str) -> int | None:
+    """Make sure SOME Alt+V listener is running; never re-aim a healthy one.
+
+    The supervision entry point (``upload_server``'s serve loop calls this on an
+    interval), as opposed to ``start_hotkey_listener``, which is the *wiring*
+    entry point the launch and attach paths use. See
+    ``supervised_hotkey_target`` for why the two must differ.
+
+    Idempotent by construction -- it delegates to ``start_hotkey_listener``, so
+    a healthy current listener is a pid-file read plus a manifest read and no
+    spawn, and the "never two listeners" property is exactly the one that
+    function already had.
+
+    Windows-only, like everything hotkey: the caller owns the
+    ``supports_hotkey()`` gate that keeps the import below reachable.
+    """
+    from magent.hotkey import (  # ImportError off-Windows (hotkey.py guards); must stay lazy
+        listener_manifest,
+        listener_pid,
+    )
+
+    if listener_pid() is None:
+        return start_hotkey_listener(default_url, None)
+    url, ssh_host = supervised_hotkey_target(listener_manifest(), default_url)
+    return start_hotkey_listener(url, ssh_host)
+
+
+# --- Upload-server supervision ------------------------------------------------
+# The same doctrine as the Alt+V listener above, one process up. `magent serve`
+# is what every mobile upload and every Alt+V press goes through, and nothing in
+# the product ever re-checked that it was still there: attach panes redial,
+# sessions get revived, the listener is supervised -- serve alone had no
+# supervisor and left no trace when it died. It died silently twice in one day
+# (a machine-wide ConPTY wedge, then an unexplained disappearance over three
+# hours), and both times the first symptom was an Alt+V press doing nothing.
+#
+# serve cannot supervise itself: a supervisor that only ran while serve ran
+# would supervise nothing the moment serve died. The attention daemon is the
+# other long-lived process, it already polls on an interval, and it is the one
+# users leave running -- so it is the owner.
+#
+# All of this lives here, next to spawn_detached and ensure_hotkey_listener,
+# rather than in cli/background.py where the spawn recipe started: launch.py
+# must not import the cli package (cli/__init__ imports every command module, so
+# a reverse import cycles -- LS-A-001), and a supervisor in a src module cannot
+# reach a recipe that lives in one. cli/background._maybe_start_upload_server is
+# now a thin delegation to ensure_upload_server for exactly that reason.
+
+UPLOAD_RESPAWN_COOLDOWN_S = 60.0
+
+
+def _probe_upload_port(port: int) -> bool:
+    """True when something accepts a TCP connection on loopback ``port``.
+
+    The same question ``cli/background._probe_port`` and ``status`` ask, with
+    the same 0.3s budget: a refused loopback connect answers instantly, and a
+    probe that could block would freeze the loop it rides on.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.settimeout(0.3)
+    try:
+        probe.connect(("127.0.0.1", port))
+    except OSError:
+        return False
+    else:
+        return True
+    finally:
+        probe.close()
+
+
+def upload_server_argv(port: int, config_path: str | None) -> list[str]:
+    """The argv of a detached ``magent serve`` on ``port``.
+
+    One builder for both spawn sites (the bring-up ensure and the supervisor),
+    so the revived server can never drift from the one the launch path starts --
+    same interpreter, same ``--config``, same port.
+    """
+    args = [sys.executable, "-m", "magent"]
+    if config_path:
+        args += ["--config", config_path]
+    return [*args, "serve", "-p", str(port)]
+
+
+def ensure_upload_server(port: int, config_path: str | None = None) -> bool:
+    """Start the upload server detached unless something already answers on
+    ``port``. Returns True when a spawn was actually issued.
+
+    Detached because it must outlive the SSH bring-up command that spawns it --
+    see ``spawn_detached``.
+    """
+    if _probe_upload_port(port):
+        return False
+    spawn_detached(upload_server_argv(port, config_path))
+    return True
+
+
+def _validated_env() -> MagentEnv | None:
+    """The env singleton, or None if it no longer validates.
+
+    A daemon must never die of an environment variable it does not use, and by
+    the time the attention loop is running every other MAGENT_* consumer has
+    already failed loudly at CLI entry -- so an env that goes bad underneath a
+    detached process degrades to the defaults with a log line, exactly as
+    ``upload_server.supervision_enabled`` and ``log._configured_level`` do.
+    """
+    from pydantic import ValidationError
+
+    from magent.env import get_env
+
+    try:
+        return get_env()
+    except ValidationError:
+        get_logger("attention").warning(
+            "upload supervisor: environment did not validate; using defaults"
+        )
+        return None
+
+
+def upload_supervision_enabled() -> bool:
+    """Whether MAGENT_UPLOAD_SUPERVISOR permits the attention daemon to keep
+    ``magent serve`` alive. Public because ``status`` must ask the same question
+    the supervisor answers before it offers the daemon as a repair."""
+    env = _validated_env()
+    return True if env is None else env.upload_supervisor
+
+
+def upload_respawn_cooldown_s() -> float:
+    """The configured minimum seconds between two respawn attempts."""
+    env = _validated_env()
+    configured = None if env is None else env.upload_respawn_cooldown_s
+    if configured is None:
+        return UPLOAD_RESPAWN_COOLDOWN_S
+    return max(0.0, configured)
+
+
+class UploadServerSupervisor:
+    """Revives a dead ``magent serve``, at most once per cooldown.
+
+    ``tick`` is called once per attention poll, so DETECTION latency is the poll
+    interval while the RESPAWN RATE is bounded by ``cooldown_s``. The split is
+    the whole design: a serve that dies at 03:00 must not wait out a long timer
+    before anyone notices, and a serve that crashes on startup must not be
+    respawned in a tight loop. Looking is free; spawning is not.
+
+    Liveness is the loopback TCP probe. The recorded pid is read too, but only
+    for the log line, and deliberately so: ``run_server`` writes its pid file
+    AFTER the bind, so the pid can never be the earlier signal, and a pid number
+    the OS later recycles onto an unrelated process would blind the watchdog
+    permanently. What the pid does buy is a truthful diagnosis in the log --
+    "recorded pid 8123 is gone" (the observed failure) reads very differently
+    from "pid 8123 is alive but not answering", which is a wedge, not a death.
+
+    A spawn that fails outright (``spawn_detached`` raising) propagates to the
+    caller, which logs it and ticks again next poll -- see
+    ``cli/attention_cmd._upload_watchdog``. The handling lives there, at the
+    boundary with the loop that must survive, rather than here: a supervisor
+    that could take down the daemon it rides on would be trading one silent
+    death for another.
+    """
+
+    def __init__(
+        self,
+        port: int,
+        config_path: str | None = None,
+        *,
+        cooldown_s: float | None = None,
+        now: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._port = port
+        self._config_path = config_path
+        self._cooldown = (
+            upload_respawn_cooldown_s() if cooldown_s is None else cooldown_s
+        )
+        self._now = now
+        self._last_spawn: float | None = None
+
+    @property
+    def cooldown_s(self) -> float:
+        """The resolved cooldown — read by the daemon's startup log line so the
+        value in force is visible without re-deriving it from the env."""
+        return self._cooldown
+
+    def _pid_note(self) -> str:
+        """How the recorded pid contradicts (or corroborates) the dead port."""
+        from magent.upload_server import (  # in-body: upload_server imports launch back, and only one direction may be a module-level import
+            server_pid,
+        )
+
+        pid = server_pid(self._port)
+        if pid is None:
+            return "no pid file"
+        return f"recorded pid {pid} is {'alive' if pid_alive(pid) else 'gone'}"
+
+    def tick(self) -> bool:
+        """One liveness check. True when a respawn was issued."""
+        if _probe_upload_port(self._port):
+            return False
+        log = get_logger("attention")
+        now = self._now()
+        if self._last_spawn is not None and (now - self._last_spawn) < self._cooldown:
+            log.debug(
+                "upload supervisor: port %d still dead, within the %.0fs cooldown",
+                self._port,
+                self._cooldown,
+            )
+            return False
+        self._last_spawn = now
+        # ASCII only: this line goes to a rotating logfile that gets read back
+        # through whatever the host console's code page happens to be.
+        log.warning(
+            "upload supervisor: nothing answering on port %d (%s); starting a new "
+            "magent serve",
+            self._port,
+            self._pid_note(),
+        )
+        spawn_detached(upload_server_argv(self._port, self._config_path))
+        return True
+
+
 @dataclass
 class RunOpts:
     retile_all: bool = False
@@ -156,9 +404,10 @@ class RunOpts:
     group: str | None = None
     config_path: str = ""
     # Tile what is already open and launch nothing: the dispatchers still build
-    # the full target list (so retile_all can place every open window) but skip
-    # every spawn -- no IDE, no terminal, no psmux collection. A window the user
-    # closed must stay closed; it simply reports "not found" during tiling.
+    # the full target list but skip every spawn -- no IDE, no terminal, no
+    # psmux collection. A window the user closed must stay closed, and under
+    # `retile_all` it is dropped from the tiling set entirely (see
+    # `_retile_targets`) rather than waited on and reported "not found".
     tile_only: bool = False
 
 
@@ -246,7 +495,10 @@ def run_magent(config: MagentConfig, opts: RunOpts) -> int:
 
     _start_psmux_and_upload(plat, config, opts, result)
 
-    _tile_targets(plat, opts, slots, result.targets)
+    targets = (
+        _retile_targets(config, opts, result) if opts.retile_all else result.targets
+    )
+    _tile_targets(plat, opts, slots, targets)
 
     return 0
 
@@ -306,6 +558,62 @@ class _LaunchResult:
     targets: list[_Target]
     psmux_windows: list[PsmuxWindowOpts]
     psmux_colors: dict[str, str | None]
+    # Window titles as the launch phase saw them -- the same snapshot its
+    # already-running probe used. `_retile_targets` reads it to find
+    # magent-owned windows that no configured project accounts for.
+    open_titles: tuple[str, ...] = ()
+
+
+def _discovered_targets(
+    open_titles: tuple[str, ...], targets: list[_Target], prefix: bool
+) -> list[_Target]:
+    """magent-owned windows on screen that no configured project accounts for.
+
+    These are `magent attach` panes: real magent windows whose names are the
+    REMOTE host's session names, so they never appear in this machine's config
+    and were invisible to `--retile-all` until now. They are never `is_new`
+    (they are open by definition and nothing here launches them), so a plain
+    `--go` still ignores them -- only a retile picks them up.
+
+    Discovery is only possible with ``settings.windowTitlePrefix`` ON. With it
+    off, magent's own titles are bare project names (``titles.make_title``
+    with ``prefix=False``), indistinguishable from any other application's
+    window, so there is nothing to key on and this returns nothing rather than
+    guess.
+    """
+    if not prefix:
+        return []
+    known = {t.key for t in targets if t.mode == "magent-name"}
+    return [
+        _Target(name=name, key=name, mode="magent-name", is_new=False)
+        for name in magent_window_names(open_titles)
+        if name not in known
+    ]
+
+
+def _retile_targets(
+    config: MagentConfig, opts: RunOpts, result: _LaunchResult
+) -> list[_Target]:
+    """The window set a `--retile-all` places: only what is on screen.
+
+    Configured targets come first (config order), then the discovered extras
+    in snapshot order, so slot assignment is deterministic. Under
+    ``tile_only`` -- a retile that launches nothing -- a configured window
+    that is not open right now is dropped: it can never appear, so enqueueing
+    it would only buy `place_windows` a poll deadline and the user a red "not
+    found" line. ``--go --retile-all`` keeps every configured target (the
+    launch phase is bringing the missing ones up) and still gains the extras,
+    which is the "then tile everything" half of its documented meaning.
+    """
+    base = (
+        [t for t in result.targets if not t.is_new]
+        if opts.tile_only
+        else result.targets
+    )
+    extras = _discovered_targets(
+        result.open_titles, result.targets, config.settings.window_title_prefix
+    )
+    return [*base, *extras]
 
 
 def _launch_projects(
@@ -378,7 +686,10 @@ def _launch_projects(
         )
 
     return _LaunchResult(
-        targets=targets, psmux_windows=psmux_windows, psmux_colors=_psmux_colors
+        targets=targets,
+        psmux_windows=psmux_windows,
+        psmux_colors=_psmux_colors,
+        open_titles=tuple(win_snapshot),
     )
 
 
@@ -458,12 +769,16 @@ def _dispatch_cli_agent_project(
     titles = generate_titles(proj.title, proj.path, windows_cfg)
     window_count = len(titles)
 
+    # The directory the agent command will actually run in, or None when this
+    # machine cannot honestly answer for it. A remote project's command runs on
+    # the far host, so neither the resume scan below nor the fresh-start probe
+    # may consult THIS machine's session store.
+    agent_dir = None if is_remote else _resolve_path(proj.path, base_dir)
+
     session_ids: list[str | None] = [None] * window_count
     caps = AGENT_TOOLS.get(tool)
-    if window_count > 1 and caps and caps.multi_window and not is_remote:
-        resolved_dir = _resolve_path(proj.path, base_dir)
-        if resolved_dir:
-            session_ids = _get_session_ids(tool, resolved_dir, window_count)
+    if window_count > 1 and caps and caps.multi_window and agent_dir:
+        session_ids = _get_session_ids(tool, agent_dir, window_count)
 
     base_cmd = tools.get(tool)
     if not base_cmd:
@@ -494,6 +809,8 @@ def _dispatch_cli_agent_project(
             win_tool, win_base = tool, base_cmd
 
         if win_cfg and win_cfg.command:
+            # A per-window `command` is the user's literal command line. It is
+            # never rewritten -- not even to drop a resume flag.
             cmd = win_cfg.command
         elif win_tool != tool:
             # Per-window override: the discovered session ids belong to the
@@ -501,14 +818,17 @@ def _dispatch_cli_agent_project(
             cmd = (
                 build_resume_command(win_tool, win_base, None)
                 if window_count > 1
-                else win_base
+                else build_start_command(win_tool, win_base, agent_dir)
             )
         elif window_count > 1 and session_ids[i] is not None:
             cmd = build_resume_command(win_tool, win_base, session_ids[i])
         elif window_count > 1:
             cmd = build_resume_command(win_tool, win_base, None)
         else:
-            cmd = win_base
+            # Single window: the configured command runs verbatim, so this is
+            # the one place a bare `claude --continue` reaches a project
+            # directory that may have no conversation to continue.
+            cmd = build_start_command(win_tool, win_base, agent_dir)
 
         if use_happy:
             cmd = _wrap_happy(win_tool, cmd)
@@ -655,11 +975,22 @@ def _tile_targets(
 ) -> None:
     """Place (or, under dry_run, preview) each target into a slot. Delegates
     the resolve-and-move-with-retry logic to magent.tiling.place_windows
-    (R13/E9's shared helper) -- no lookup/retry loop is re-implemented here."""
+    (R13/E9's shared helper) -- no lookup/retry loop is re-implemented here.
+
+    Under ``retile_all`` the caller has already narrowed `targets` to the
+    windows that are actually on screen (`_retile_targets`), so everything
+    here gets placed."""
     to_place = targets if opts.retile_all else [t for t in targets if t.is_new]
 
     if not to_place:
-        click.echo(f"\n  {style('+', fg='green')} All windows already positioned.")
+        # A retile with an empty set means nothing is open -- saying "already
+        # positioned" would claim windows exist that don't.
+        note = (
+            "No open magent windows to tile."
+            if opts.retile_all
+            else "All windows already positioned."
+        )
+        click.echo(f"\n  {style('+', fg='green')} {note}")
         return
 
     mode_label = (
@@ -802,8 +1133,13 @@ def decorate_psmux_sessions_async(
     return psmux.decorate_sessions_async(names, code_hint=code_hint)
 
 
-def kill_psmux(names: list[str]) -> list[str]:
-    """Delegate to ``psmux.kill_servers``."""
-    from magent.psmux import kill_servers
+def stop_psmux(names: list[str]) -> tuple[list[str], list[str]]:
+    """Delegate to ``psmux.stop_sessions``. Returns ``(stopped, still_running)``.
 
-    return kill_servers(names)
+    Replaces the old ``kill_psmux`` (a pass-through to the attempt-only
+    ``kill_servers``): a shutdown command has to be able to tell the user what
+    it PROVED it stopped, and what it could not.
+    """
+    from magent.psmux import stop_sessions
+
+    return stop_sessions(names)

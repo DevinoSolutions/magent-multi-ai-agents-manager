@@ -35,6 +35,14 @@ def _isolate_magent_home(tmp_path, monkeypatch):
     for _key in list(os.environ):
         if _key.upper().startswith("MAGENT_"):
             monkeypatch.delenv(_key, raising=False)
+    # ...with one deliberate exception, put back after the sweep: the attention
+    # daemon supervises `magent serve`, and its loop IS driven for real in unit
+    # tests (`attention --ticks N`). Today every such test uses the default
+    # `uploadServer: false`, so the watchdog is never built -- but a future test
+    # that flips that key would otherwise spawn a REAL detached upload server on
+    # the machine running the suite, on the config's port, with no pid for any
+    # teardown to kill. Tests that are ABOUT the supervisor set it back to "1".
+    monkeypatch.setenv("MAGENT_UPLOAD_SUPERVISOR", "0")
     log.reset_logging()
     yield
     log.reset_logging()

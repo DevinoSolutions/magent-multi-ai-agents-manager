@@ -143,8 +143,20 @@ def _health_ok(host: str, port: int) -> bool:
 
 def _child_env() -> dict[str, str]:
     """Child env with no MAGENT_* leakage; PATH kept so the child's own
-    ``tailnet.ip4()`` still resolves the real ``tailscale`` binary."""
-    return {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
+    ``tailnet.ip4()`` still resolves the real ``tailscale`` binary.
+
+    Serve's Alt+V listener supervision is off: this tier is about bind
+    addresses, and a real listener installs a system-wide keyboard hook. (This
+    job is ubuntu-only, where ``supports_hotkey()`` is False and the supervisor
+    would return anyway -- set explicitly so the isolation does not silently
+    depend on which OS the job happens to run on.)
+    """
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
+    env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
+    # ...and `attention -d` now supervises `magent serve` the same way, so a
+    # test daemon would otherwise start a REAL upload server on this machine.
+    env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
+    return env
 
 
 # ---------------------------------------------------------------------------

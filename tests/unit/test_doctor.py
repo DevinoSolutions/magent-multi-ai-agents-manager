@@ -9,15 +9,21 @@ import subprocess
 import types
 from pathlib import Path
 
+import pytest
+
 from magent import cli
+from magent import psmux as psmux_mod
 from magent.cli import doctor
 from magent.cli.doctor import (
     FAIL,
     OK,
     WARN,
+    WEDGE_REPAIR_HINT,
     _check_agent_tools,
     _check_config,
+    _check_hotkey,
     _check_monitors,
+    _check_psmux_wedge,
     _check_sentry,
     _check_tailscale,
     _check_upload_port,
@@ -256,6 +262,237 @@ class TestCheckUploadPort:
         assert "occupied" in detail
 
 
+class TestCheckHotkey:
+    """The hotkey check used to answer "does this OS support Alt+V" -- true on
+    every Windows box whether or not a listener had run since the last reboot,
+    so a machine where Alt+V had been dead for days passed it. It now reports
+    the real listener liveness, through the same state machine `status` renders
+    so the two surfaces can never disagree."""
+
+    def _platform(self, monkeypatch, *, supports_hotkey):
+        fp = FakePlatform(supports_hotkey=supports_hotkey)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+
+    def _listener(self, monkeypatch, state):
+        monkeypatch.setattr("magent.cli.status._upload_state", lambda port: "on")
+        monkeypatch.setattr("magent.cli.status._listener_state", lambda upload: state)
+
+    def test_platform_without_hotkey_support_is_ok(self, monkeypatch):
+        self._platform(monkeypatch, supports_hotkey=False)
+        status, detail = _check_hotkey(None)
+        assert status == OK
+        assert "Windows-only" in detail
+
+    def test_running_listener_is_ok(self, monkeypatch):
+        self._platform(monkeypatch, supports_hotkey=True)
+        self._listener(monkeypatch, "on")
+        status, detail = _check_hotkey(None)
+        assert status == OK
+        assert "heartbeat fresh" in detail
+
+    def test_dead_listener_fails_with_the_shared_repair_hint(self, monkeypatch):
+        from magent.cli.status import LISTENER_REPAIR_HINT
+
+        self._platform(monkeypatch, supports_hotkey=True)
+        self._listener(monkeypatch, "dead")
+        status, detail = _check_hotkey(None)
+        assert status == FAIL
+        assert "no Alt+V listener" in detail
+        assert LISTENER_REPAIR_HINT in detail
+
+    def test_wedged_listener_fails_and_says_so(self, monkeypatch):
+        self._platform(monkeypatch, supports_hotkey=True)
+        self._listener(monkeypatch, "stale")
+        status, detail = _check_hotkey(None)
+        assert status == FAIL
+        assert "heartbeat expired" in detail
+
+    def test_listener_off_by_design_is_ok_and_names_its_owner(self, monkeypatch):
+        self._platform(monkeypatch, supports_hotkey=True)
+        monkeypatch.setattr("magent.cli.status._upload_state", lambda port: "off")
+        monkeypatch.setattr("magent.cli.status._listener_state", lambda upload: "off")
+        status, detail = _check_hotkey(None)
+        assert status == OK
+        assert "starts with the upload server" in detail
+
+
+class TestCheckPsmuxWedge:
+    """The machine-wide psmux control-plane wedge (2026-08-18/19): every psmux
+    command hangs forever from any console while ConPTY itself is healthy, and
+    the sessions behind it are FROZEN, not dead. It cost hours to diagnose and
+    the tempting reaction -- mass-restart, or reboot -- would have destroyed 40
+    live agent sessions. The check exists to say all of that in one line."""
+
+    def _platform(self, monkeypatch, *, supports_psmux):
+        fp = FakePlatform(supports_psmux=supports_psmux)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+
+    def _probe(self, monkeypatch, probe, *, binary="/x/psmux"):
+        monkeypatch.setattr(doctor.psmux, "find_psmux", lambda: binary)
+        monkeypatch.setattr(doctor.psmux, "probe_control_plane", lambda: probe)
+
+    def _no_zombies(self, monkeypatch):
+        monkeypatch.setattr("magent.procs.count_processes", lambda _name: None)
+
+    def test_platform_without_psmux_never_probes(self, monkeypatch):
+        """The capability gate is the FIRST thing, not a fallback: on a
+        platform that cannot run psmux the check must not spawn anything."""
+
+        def _boom() -> object:
+            raise AssertionError("the probe ran on a platform without psmux")
+
+        self._platform(monkeypatch, supports_psmux=False)
+        monkeypatch.setattr(doctor.psmux, "probe_control_plane", _boom)
+
+        status, detail = _check_psmux_wedge()
+
+        assert status == OK
+        assert "Windows-only" in detail
+
+    def test_missing_binary_is_skipped_not_failed(self, monkeypatch):
+        self._platform(monkeypatch, supports_psmux=True)
+        monkeypatch.setattr(doctor.psmux, "find_psmux", lambda: None)
+        monkeypatch.setattr(
+            doctor.psmux,
+            "probe_control_plane",
+            lambda: pytest.fail("probed without a binary"),
+        )
+
+        status, detail = _check_psmux_wedge()
+
+        assert status == OK
+        assert "not installed" in detail
+
+    def test_a_responsive_control_plane_passes_quietly(self, monkeypatch):
+        self._platform(monkeypatch, supports_psmux=True)
+        self._probe(
+            monkeypatch,
+            psmux_mod.ControlProbe(responsive=True, timed_out=False, elapsed_s=0.89),
+        )
+
+        status, detail = _check_psmux_wedge()
+
+        assert status == OK
+        assert "responded in 0.89s" in detail
+
+    def test_a_timed_out_probe_fails_with_the_three_facts(self, monkeypatch):
+        self._platform(monkeypatch, supports_psmux=True)
+        self._probe(
+            monkeypatch,
+            psmux_mod.ControlProbe(responsive=False, timed_out=True, elapsed_s=5.0),
+        )
+        self._no_zombies(monkeypatch)
+
+        status, detail = _check_psmux_wedge()
+
+        assert status == FAIL
+        # (a) it is a global control-plane wedge and the sessions are alive
+        assert "WEDGED machine-wide" in detail
+        assert "FROZEN, not dead" in detail
+        assert "do NOT restart them, do NOT reboot" in detail
+        # (b) the recovery, precisely enough to act on
+        assert "conhost.exe" in detail
+        assert "kill ONLY those" in detail
+        # (c) what to expect afterwards
+        assert "every session returns intact" in detail
+
+    def test_the_hint_is_ascii_and_stays_short(self):
+        # It is read on a broken machine and pasted into bug reports; the
+        # status-line/ASCII rule applies (a ambiguous-width glyph once
+        # corrupted the psmux bar).
+        assert WEDGE_REPAIR_HINT.isascii()
+        assert 3 <= len(WEDGE_REPAIR_HINT.splitlines()) <= 5
+
+    def test_resident_zombies_enrich_the_finding(self, monkeypatch):
+        self._platform(monkeypatch, supports_psmux=True)
+        self._probe(
+            monkeypatch,
+            psmux_mod.ControlProbe(responsive=False, timed_out=True, elapsed_s=5.0),
+        )
+        monkeypatch.setattr("magent.procs.count_processes", lambda _name: 14)
+
+        status, detail = _check_psmux_wedge()
+
+        assert status == FAIL
+        assert "(14 psmux.exe resident)" in detail
+
+    def test_an_unknown_count_is_never_rendered_as_zero(self, monkeypatch):
+        self._platform(monkeypatch, supports_psmux=True)
+        self._probe(
+            monkeypatch,
+            psmux_mod.ControlProbe(responsive=False, timed_out=True, elapsed_s=5.0),
+        )
+        self._no_zombies(monkeypatch)
+
+        _status, detail = _check_psmux_wedge()
+
+        assert "psmux.exe resident" not in detail
+
+    def test_a_binary_that_will_not_run_warns_rather_than_crying_wedge(
+        self, monkeypatch
+    ):
+        self._platform(monkeypatch, supports_psmux=True)
+        self._probe(
+            monkeypatch,
+            psmux_mod.ControlProbe(responsive=False, timed_out=False, elapsed_s=0.0),
+        )
+
+        status, detail = _check_psmux_wedge()
+
+        assert status == WARN
+        assert "would not run" in detail
+
+    def test_the_multi_line_detail_reaches_json_whole(
+        self, runner, monkeypatch, tmp_config
+    ):
+        """The JSON shape is unchanged (name/status/detail) and the runbook
+        survives as one string -- a bug report carries the repair, not a
+        truncated first sentence."""
+        monkeypatch.setattr(
+            doctor,
+            "_check_psmux_wedge",
+            lambda: (FAIL, f"wedged.\n{WEDGE_REPAIR_HINT}"),
+        )
+        monkeypatch.setattr("magent.platform.get_platform", FakePlatform)
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: False)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
+        config_path = tmp_config(
+            {"version": SCHEMA_VERSION, "projects": [{"path": "api"}]}
+        )
+
+        result = runner.invoke(cli.main, ["--config", config_path, "doctor", "--json"])
+
+        payload = json.loads(result.stdout)
+        wedge = next(c for c in payload["checks"] if c["name"] == "psmux wedge")
+        assert set(wedge) == {"name", "status", "detail"}
+        assert wedge["status"] == FAIL
+        assert WEDGE_REPAIR_HINT in wedge["detail"]
+        assert result.exit_code == 1
+
+    def test_the_human_report_indents_the_runbook(
+        self, runner, monkeypatch, tmp_config
+    ):
+        monkeypatch.setattr(
+            doctor,
+            "_check_psmux_wedge",
+            lambda: (FAIL, "wedged.\nline two of the runbook"),
+        )
+        monkeypatch.setattr("magent.platform.get_platform", FakePlatform)
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: False)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
+        config_path = tmp_config(
+            {"version": SCHEMA_VERSION, "projects": [{"path": "api"}]}
+        )
+
+        result = runner.invoke(cli.main, ["--config", config_path, "doctor"])
+
+        first = "  x psmux wedge  wedged."
+        assert first in result.output
+        # continuation lines start under the detail column, not at column 0
+        column = first.index("wedged.")
+        assert f"\n{' ' * column}line two of the runbook" in result.output
+
+
 class TestCheckSentry:
     """The DSN-set-but-SDK-missing state surfaces HERE (as a broken-install
     warning with a repair hint — sentry-sdk is a base dependency), never as a
@@ -366,6 +603,7 @@ class TestDoctorCli:
             "env",
             "agent tools",
             "terminal",
+            "psmux wedge",
             "monitors",
             "hotkey",
             "logs dir",

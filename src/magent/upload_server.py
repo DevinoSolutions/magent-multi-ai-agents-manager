@@ -18,12 +18,14 @@ from typing import TYPE_CHECKING, ClassVar
 from urllib.parse import parse_qs, urlparse
 
 if TYPE_CHECKING:
+    import logging
     from collections.abc import Callable
 
 from magent import psmux, tailnet
 from magent.icons import render_icon
+from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import get_logger
-from magent.sessions import FLASH_MSG_MAX
+from magent.sessions import FLASH_MSG_MAX, FLASH_TINT_ERR, FLASH_TINT_OK
 
 
 def _pid_path(port: int) -> Path:
@@ -92,10 +94,11 @@ _DRAIN_CAP_BYTES = MAX_UPLOAD_BYTES
 _DRAIN_CHUNK_BYTES = 64 * 1024
 _DRAIN_TIMEOUT_S = 0.5
 
-# In-session upload feedback: a paste's progress shows in the SAME magent:<project>
-# window it landed in, via the psmux (tmux) status line -- never drawn into the
-# agent pane. tmux 3.3 renders these UTF-8 glyphs intact.
-_FB_UP = "↑"  # up arrow   -- uploading
+# In-session upload feedback for the MOBILE page: a paste's progress shows in
+# the SAME magent:<project> window it landed in, via the psmux (tmux) status
+# line -- never drawn into the agent pane. tmux 3.3 renders these UTF-8 glyphs
+# intact. An Alt+V paste narrates itself instead (see altv.handle_press and the
+# `flagged` note in _handle_post): one bar, one voice.
 _FB_OK = "✓"  # check mark -- uploaded
 _FB_NO = "✗"  # ballot x   -- failed
 
@@ -108,23 +111,27 @@ _FB_NO = "✗"  # ballot x   -- failed
 _MSG_GREEN = "bg=green,fg=black,bold"
 _MSG_RED = "bg=red,fg=white,bold"
 
-# How long each status-line flash lingers (ms). "uploading" is given a generous
-# ceiling so it stays put until the result overwrites it; if something stalls
-# without raising, it still clears on its own.
-_FLASH_UP_MS = 20000
+# What a caller-supplied ``tint=`` maps to. An unknown value leaves the style
+# alone rather than failing the flash -- the message matters more than its
+# colour.
+_FLASH_TINTS = {FLASH_TINT_OK: _MSG_GREEN, FLASH_TINT_ERR: _MSG_RED}
+
+# How long each status-line flash lingers (ms).
 _FLASH_OK_MS = 2500
 _FLASH_NO_MS = 3000
 
-# /api/flash: how long a caller-supplied message lingers. Long enough to read a
-# whole sentence, short enough that a stale one clears itself. The Alt+V/F2
-# listener is the only caller today -- it runs hidden with no terminal of its
-# own, so this endpoint is its ONLY way to say anything on screen.
+# /api/flash: how long a caller-supplied message lingers by default. Long enough
+# to read a whole sentence, short enough that a stale one clears itself. The
+# Alt+V/F2 listener is the only caller today -- it runs hidden with no terminal
+# of its own, so this endpoint is its ONLY way to say anything on screen.
 _FLASH_MSG_MS = 4000
 
-# Per-project count of pastes currently in flight, so several at once read as
-# "uploading (2)" / "uploaded (1 more)" instead of stomping each other.
-_inflight: dict[str, int] = {}
-_inflight_lock = threading.Lock()
+# ...and the bounds on what a caller may ask for instead. A PHASE message
+# ("uploading...") must outlive the operation it describes or the bar goes
+# blank mid-press; the ceiling keeps a bad or hostile value from parking a
+# message on the bar for the rest of the day.
+_FLASH_MSG_MS_MIN = 500
+_FLASH_MSG_MS_MAX = 60000
 
 # Guards UploadHandler.cached_sessions / sessions_ts: UploadHandler is
 # instantiated per-request by ThreadingHTTPServer, so refresh must be
@@ -132,21 +139,15 @@ _inflight_lock = threading.Lock()
 _sessions_lock = threading.Lock()
 
 
-def _inflight_inc(project: str) -> int:
-    with _inflight_lock:
-        n = _inflight.get(project, 0) + 1
-        _inflight[project] = n
-        return n
-
-
-def _inflight_dec(project: str) -> int:
-    with _inflight_lock:
-        n = max(0, _inflight.get(project, 1) - 1)
-        if n:
-            _inflight[project] = n
-        else:
-            _inflight.pop(project, None)
-        return n
+def _flash_duration(raw: str) -> int:
+    """Clamp a caller-supplied ``ms=`` to the allowed window. Anything absent or
+    unparseable takes the default rather than failing the flash: a malformed
+    duration must never be the reason a message does not reach the screen."""
+    try:
+        wanted = int(raw)
+    except (TypeError, ValueError):
+        return _FLASH_MSG_MS
+    return max(_FLASH_MSG_MS_MIN, min(_FLASH_MSG_MS_MAX, wanted))
 
 
 def _flash(
@@ -677,6 +678,71 @@ def _mobileconfig(host: str) -> bytes:
 """.encode()
 
 
+# How long the HTTP response will wait for the paste before answering anyway.
+#
+# The file is already on disk by the time this wait starts, so everything past
+# it is a courtesy: waiting a beat lets the overwhelmingly common fast paste be
+# reported as the plain `injected: true` it is, and the bound is what stops a
+# stalled multiplexer from turning a successful upload into a client timeout.
+# Must stay comfortably under `altv.UPLOAD_HTTP_TIMEOUT_S` (a test pins that) --
+# the whole defect being fixed here is a server that outlived its client's
+# patience and left the user reading "upload failed" about a file that landed.
+INJECT_GRACE_S = 3.0
+
+# The whole life of one paste attempt, wherever it finishes. Deliberately ONE
+# attempt: a `send-keys` that is merely slow is still in flight, and a retry on
+# top of it pastes the same image twice into the agent's prompt. Past this the
+# worker gives up and says so in upload.log, so a paste can never arrive
+# minutes later on top of whatever the user did in the meantime.
+INJECT_TIMEOUT_S = 60.0
+
+
+def _inject_paste(project: str, dest: Path) -> tuple[bool, bool]:
+    """Paste ``dest`` into ``project``'s pane. Returns ``(injected, pending)``.
+
+    The paste runs on its own thread and the caller waits only ``INJECT_GRACE_S``
+    for it, because an HTTP handler must not be hostage to a multiplexer: this
+    call used to be inline and unbounded, and a control command that stalled for
+    74 s answered a listener that had given up at 20 s -- so a screenshot that
+    was safely on disk, and that psmux eventually pasted, was reported to the
+    user as "upload failed".
+
+    The two flags are exhaustive and honest: ``(True, False)`` pasted,
+    ``(False, True)`` still trying (the reply is early, not wrong), and
+    ``(False, False)`` a real refusal the caller may name as one. Nothing is
+    retried and nothing is re-sent -- see ``INJECT_TIMEOUT_S``.
+    """
+    log = get_logger("upload")
+    done = threading.Event()
+    outcome: list[bool] = []
+
+    def _run() -> None:
+        started = time.monotonic()
+        try:
+            pasted = psmux.send_keys(
+                project, str(dest), target=project, timeout=INJECT_TIMEOUT_S
+            )
+            outcome.append(pasted)
+        finally:
+            done.set()
+            elapsed = time.monotonic() - started
+            if elapsed >= INJECT_GRACE_S:
+                # The reply already said `inject_pending`; this line is the only
+                # place that late verdict is recorded, so it is a WARNING and it
+                # carries the wait it cost.
+                log.warning(
+                    "inject project=%s finished late after %.1fs pasted=%s",
+                    project,
+                    elapsed,
+                    outcome[-1] if outcome else False,
+                )
+
+    threading.Thread(target=_run, name="magent-upload-inject", daemon=True).start()
+    if done.wait(INJECT_GRACE_S):
+        return (bool(outcome and outcome[0]), False)
+    return (False, True)
+
+
 def _parse_multipart(
     handler: BaseHTTPRequestHandler,
 ) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
@@ -819,7 +885,24 @@ class UploadHandler(BaseHTTPRequestHandler):
                     {"ok": False, "error": "project and msg are required"}, 400
                 )
             else:
-                _flash(None, flash_project, message[:FLASH_MSG_MAX], _FLASH_MSG_MS)
+                clamped = message[:FLASH_MSG_MAX]
+                # One INFO line per served flash. The caller is a hidden
+                # process narrating into a status bar that keeps no history, so
+                # without this "the status isn't showing" is unanswerable after
+                # the fact: this says which phase messages arrived, and when.
+                get_logger("upload").info(
+                    "flash project=%s msg=%r", flash_project, clamped
+                )
+                _flash(
+                    None,
+                    flash_project,
+                    clamped,
+                    _flash_duration(query.get("ms", [""])[0]),
+                    style=_FLASH_TINTS.get(query.get("tint", [""])[0]),
+                )
+                # Answered only once psmux has the message, which is what paces
+                # a caller flashing a SEQUENCE: it waits for each reply before
+                # sending the next, so the phases cannot arrive out of order.
                 self._json_response({"ok": True})
         elif path == "/install.mobileconfig":
             # Built per-request: the Web Clip URL must match the host:port the
@@ -903,26 +986,29 @@ class UploadHandler(BaseHTTPRequestHandler):
         # psmux socket id (P3-01), so we validate against `session` ids.
         valid_sessions = {_sid(s) for s in self._sessions()}
 
-        # The Alt+V listener passes ?project= so we can flash "uploading" the
-        # instant the request lands -- before the image bytes are even read off
-        # the socket -- right in that project's magent: window. (The mobile web UI
-        # doesn't, so it skips straight to the result flash below.)
+        # ?project= marks an upload that already HAS a narrator: the Alt+V
+        # listener flashed "Alt+V: capturing..." before it touched the clipboard
+        # and will flash the specific outcome the moment this reply lands. The
+        # status line is one line, so a second voice on it can only race the
+        # first -- and the loser is whichever message the user needed. The
+        # server therefore stays silent for flagged uploads and speaks only for
+        # the mobile page, whose sender is looking at a phone, not at the bar.
+        #
+        # That silence extends to the DEFERRED paste verdict (`inject_pending`),
+        # deliberately. The tempting fix -- flash "pasted" once the worker
+        # finishes -- reintroduces the second writer under the exact condition
+        # this code path exists for: the listener's own closing message is still
+        # queued behind a slow status line when the worker lands, so the two
+        # would race and the bar could show "pasted" and then "paste pending".
+        # The late verdict goes to upload.log instead, and to the pane, where
+        # the pasted path is its own proof.
         flagged = parse_qs(parsed.query).get("project", [""])[0]
         flagged = flagged if flagged in valid_sessions else ""
-        if flagged:
-            n = _inflight_inc(flagged)
-            tail = f" ({n})" if n > 1 else ""
-            _flash(
-                None,
-                flagged,
-                f"magent  {_FB_UP} uploading image{tail}",
-                _FLASH_UP_MS,
-                style=_MSG_GREEN,
-            )
 
         ok = False
         project = flagged
         injected = False
+        inject_pending = False
         byte_count = 0
         suffix = ""
         try:
@@ -967,7 +1053,7 @@ class UploadHandler(BaseHTTPRequestHandler):
             dest.write_bytes(data)
 
             if inject and psmux.find_psmux():
-                injected = psmux.send_keys(project, str(dest), target=project)
+                injected, inject_pending = _inject_paste(project, dest)
             elif inject:
                 log.warning(
                     "upload project=%s requested inject but psmux is unavailable",
@@ -980,30 +1066,34 @@ class UploadHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "path": str(dest),
                     "injected": injected,
+                    # Three states, not two: pasted, definitely not pasted, and
+                    # "still trying". A client that cannot tell the last two
+                    # apart has to call a slow paste a failed upload.
+                    "inject_pending": inject_pending,
                 }
             )
         finally:
             # INFO outcome line -- project + byte-count + injected + suffix only,
             # NEVER the original filename (personal data; F-hygiene).
             log.info(
-                "upload project=%s ok=%s bytes=%d injected=%s suffix=%s",
+                "upload project=%s ok=%s bytes=%d injected=%s pending=%s suffix=%s",
                 project,
                 ok,
                 byte_count,
                 injected,
+                inject_pending,
                 suffix,
             )
-            # Confirm in the same magent: status line -- for both the listener (paired
-            # with the early "uploading" flash) and mobile uploads.
-            remaining = _inflight_dec(flagged) if flagged else 0
+            # Confirm in the same magent: status line -- for MOBILE uploads only.
+            # A flagged (Alt+V) upload reports its own, more specific outcome;
+            # see the `flagged` note above.
             done = project if project in valid_sessions else flagged
-            if done:
-                more = f"  ({remaining} more)" if remaining else ""
+            if done and not flagged:
                 if ok:
                     _flash(
                         None,
                         done,
-                        f"magent  {_FB_OK} image uploaded{more}",
+                        f"magent  {_FB_OK} image uploaded",
                         _FLASH_OK_MS,
                         style=_MSG_GREEN,
                     )
@@ -1011,7 +1101,7 @@ class UploadHandler(BaseHTTPRequestHandler):
                     _flash(
                         None,
                         done,
-                        f"magent  {_FB_NO} upload failed{more}",
+                        f"magent  {_FB_NO} upload failed",
                         _FLASH_NO_MS,
                         style=_MSG_RED,
                     )
@@ -1120,6 +1210,125 @@ def _bind_addresses(host: str | None) -> list[str]:
     return addrs
 
 
+# --- Alt+V listener supervision ----------------------------------------------
+# The listener used to be a ONE-SHOT spawn: whichever `magent --go` or `magent
+# attach` ran last started it, and after that nothing ever looked again. A
+# reboot, a crash, or a pip upgrade left Alt+V silently dead until the user
+# happened to run attach again -- observed live: a listener last started 8 days
+# and one reboot earlier, with the upload server still running and `status`
+# reporting the whole thing as a benign default.
+#
+# serve is the right owner. It is the long-lived process the Alt+V chain already
+# posts into, so "serve is up" and "Alt+V works" become one fact rather than two
+# independent ones. The listener is deliberately NOT killed when serve stops:
+# `down --all` already stops both (server first, listener second, so this
+# supervisor is gone before the listener is), and a user restarting serve should
+# not lose their hotkey in between.
+HOTKEY_SUPERVISE_INTERVAL_S = 30.0
+
+
+def local_url(bound_addrs: list[str], port: int) -> str:
+    """The URL a process on THIS machine should use to reach this server.
+
+    Loopback whenever it is reachable -- including under an explicit
+    `--host 0.0.0.0`, which binds it -- so the listener never depends on
+    Tailscale being up. Only a bind that deliberately excluded loopback
+    (`serve --host <tailscale-ip>`) falls back to the address actually bound.
+    """
+    if "127.0.0.1" in bound_addrs or "0.0.0.0" in bound_addrs:
+        return f"http://127.0.0.1:{port}"
+    return f"http://{bound_addrs[0]}:{port}"
+
+
+def supervision_enabled() -> bool:
+    """Whether MAGENT_HOTKEY_SUPERVISOR permits serve to own the listener.
+
+    Public because ``status``/``doctor`` must ask the same question the
+    supervisor answers: a running server only implies a running listener if
+    serve was actually allowed to supervise one. Reporting a DEAD listener to
+    somebody who turned supervision off would be inventing a promise nobody
+    made.
+
+    A daemon must never die of a bad environment variable it does not use, and
+    every other MAGENT_* consumer has already failed loudly at CLI entry by the
+    time serve is running -- so an env that has gone bad underneath a detached
+    process degrades to the default (supervise) with a log line, exactly as
+    ``log._configured_level`` does for MAGENT_LOG_LEVEL.
+    """
+    from pydantic import ValidationError
+
+    from magent.env import get_env
+
+    try:
+        return get_env().hotkey_supervisor
+    except ValidationError:
+        get_logger("hotkey").warning(
+            "supervisor: environment did not validate; supervising anyway"
+        )
+        return True
+
+
+def _supervise_hotkey(
+    server_url: str,
+    stop_event: threading.Event,
+    interval: float = HOTKEY_SUPERVISE_INTERVAL_S,
+) -> None:
+    """Keep an Alt+V listener alive for as long as this server runs.
+
+    Runs on a daemon thread off ``run_server``. Every failure mode is a log line
+    and another try next interval -- supervision must never be able to take down
+    the server it rides on, which is the thing actually serving uploads.
+
+    The lock is what stops two serve daemons (different ports, same machine)
+    from racing each other into two listeners; it is deliberately NOT taken by
+    the launch/attach spawn paths, so an interactive `magent attach` re-aiming
+    the listener can never be blocked by a background supervisor.
+    """
+    from magent.platform import get_platform  # in-body: the OS backends are heavy
+
+    if not get_platform().supports_hotkey():
+        return
+    log = get_logger("hotkey")
+    if not supervision_enabled():
+        log.info("supervisor: disabled by MAGENT_HOTKEY_SUPERVISOR")
+        return
+    # heavy subsystem: in-body per policy. launch owns the spawn recipe; this
+    # module must not import the cli package (LS-A-001).
+    from magent.launch import ensure_hotkey_listener
+
+    while True:
+        try:
+            with exclusive_lock("hotkey-supervisor"):
+                if ensure_hotkey_listener(server_url) is None:
+                    log.warning(
+                        "supervisor: no Alt+V listener came up for %s; retrying in %ss",
+                        server_url,
+                        interval,
+                    )
+        except LockHeld:
+            log.debug("supervisor: another server is supervising the listener")
+        except Exception:
+            log.exception("supervisor: Alt+V listener check failed")
+        if stop_event.wait(interval):
+            return
+
+
+def _serve_bind(server: ThreadingHTTPServer, log: logging.Logger) -> None:
+    """``serve_forever`` for a SECONDARY bind, on its own daemon thread.
+
+    Only the primary bind's loop can propagate to the CLI shell; a crash in the
+    second one (the Tailscale address) would otherwise print a thread traceback
+    to a console the daemon does not have and take that address down in total
+    silence, with the loopback bind still answering /health. It is logged at
+    exception level -- loud in the logfile, and captured by Sentry -- and not
+    re-raised, because the server that is still serving must keep serving.
+    """
+    try:
+        server.serve_forever()
+    except Exception:
+        log.exception("upload server: bind %s stopped serving", server.server_address)
+
+
 def run_server(
     port: int = 8080, config_path: str | None = None, host: str | None = None
 ) -> None:
@@ -1135,7 +1344,14 @@ def run_server(
         except OSError as e:
             log.warning("upload server: cannot bind %s:%d (%s)", addr, port, e)
     if not servers:
-        raise RuntimeError(f"upload server: no bindable address on port {port}")
+        # The one startup failure that is fatal rather than degraded. ERROR
+        # level (not just the exception that follows) because a detached serve
+        # has no console for the traceback to reach, and because ERROR is what
+        # Sentry's logging integration captures -- see the crash-visibility
+        # note on the serve loop below.
+        detail = f"upload server: no bindable address on port {port}"
+        log.error("%s", detail)
+        raise RuntimeError(detail)
 
     UploadHandler.port = port
     UploadHandler.pid = os.getpid()
@@ -1149,14 +1365,42 @@ def run_server(
     pid_file.write_text(str(os.getpid()))
 
     for s in servers[1:]:
-        threading.Thread(target=s.serve_forever, daemon=True).start()
+        threading.Thread(target=_serve_bind, args=(s, log), daemon=True).start()
+
+    # Alt+V is only as alive as its listener, and nothing else in the product
+    # ever re-checks it. Daemon thread: it must not hold the process open, and
+    # a serve that is going down has nothing left to supervise anyway.
+    hotkey_stop = threading.Event()
+    threading.Thread(
+        target=_supervise_hotkey,
+        args=(local_url(bound_addrs, port), hotkey_stop),
+        daemon=True,
+    ).start()
+
+    # Why this is not a bare `try/finally` any more: serve died silently twice
+    # in one day and left NOTHING behind -- no traceback (a detached process has
+    # no console), no log line, only a pid file whose process was gone. The
+    # `finally` logged the same "stopped" for a Ctrl+C and for a crash, so even
+    # the log could not tell an operator which had happened. Every exit now
+    # names its reason, and a crash is logged at exception level -- which is
+    # also what hands it to Sentry (errors-only, logging integration at ERROR).
+    # Nothing is swallowed: both handlers re-raise.
+    reason = "loop returned"
     try:
         servers[0].serve_forever()
+    except KeyboardInterrupt:
+        reason = "keyboard interrupt"
+        raise
+    except Exception:
+        reason = "crashed"
+        log.exception("upload server crashed on port %d", port)
+        raise
     finally:
+        hotkey_stop.set()
         for s in servers[1:]:
             s.shutdown()  # called from a different thread than its serve_forever -> safe
         for s in servers:
             s.server_close()  # servers[0] exited via KeyboardInterrupt; just closes the socket
         with contextlib.suppress(OSError):
             pid_file.unlink()
-        log.info("stopped")
+        log.info("stopped: %s", reason)
