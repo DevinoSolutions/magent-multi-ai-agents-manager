@@ -213,6 +213,86 @@ def live_sessions(
     return [n for n in names if n in live]
 
 
+# How long the control plane gets to answer one cheap command before `magent
+# doctor` calls it wedged. Deliberately short: this is a diagnostic, and the
+# failure it looks for is not "slow" but "never" -- a wedged psmux answers
+# nothing at all, from any console, for as long as the machine stays up.
+CONTROL_PROBE_TIMEOUT_S = 5.0
+
+# A socket name no magent session can ever have (session names come from window
+# titles). The probe must not aim at a project's socket: a control command
+# against a live session competes with the agent using it, and the wedge is
+# machine-global anyway -- the incident's own reproduction was a command on a
+# FRESH socket hanging forever.
+CONTROL_PROBE_SOCKET = "magent-doctor-probe"
+
+
+@dataclass(frozen=True)
+class ControlProbe:
+    """What one bounded control-plane command did: answered, or ran out the
+    clock. ``responsive`` ignores the exit code on purpose -- "no server on
+    this socket" is a perfectly healthy ANSWER, and the only thing being
+    measured here is whether psmux answers at all."""
+
+    responsive: bool
+    timed_out: bool
+    elapsed_s: float
+
+
+def probe_control_plane(
+    psmux: str | None = None, *, timeout: float = CONTROL_PROBE_TIMEOUT_S
+) -> ControlProbe:
+    """Is the psmux control plane answering commands at all? Bounded, one shot.
+
+    This is a RESPONSIVENESS probe and explicitly NOT a fourth liveness sweep:
+    it enumerates nothing, names no configured session, and its answer is
+    "psmux replies" rather than "these sessions are live". That question has
+    exactly one owner -- ``live_sessions`` -- and must keep having one.
+
+    ``list-sessions`` is the cheapest control command that reaches the server
+    layer: tmux/psmux does not START a server for it (a socket with no server
+    answers "no server running" and exits non-zero, which is a fine answer
+    here), so a doctor run leaves nothing behind. A version flag would be
+    cheaper still and would prove nothing -- ``psmux -V`` never touches the
+    ConPTY plumbing that the machine-wide wedge holds.
+
+    Never raises and never blocks past ``timeout``: a timed-out probe is the
+    finding, not an error.
+
+    The output is DISCARDED rather than captured, and that is load-bearing on
+    Windows, not a style choice. ``subprocess.run(capture_output=True,
+    timeout=...)`` is NOT bounded here: on expiry it kills the direct child and
+    then calls ``communicate()``, which waits for the pipe write ends to close
+    -- and any grandchild the wedged client left behind still holds them. Built
+    that way first, this probe took 90 s (the stalled fake's whole lifetime) to
+    answer a 5 s timeout. Nothing is read from a `list-sessions` here anyway:
+    the answer is "it answered", not what it said.
+    """
+    binary = psmux or find_psmux()
+    if not binary:
+        return ControlProbe(responsive=False, timed_out=False, elapsed_s=0.0)
+    started = time.monotonic()
+    try:
+        subprocess.run(
+            [binary, "-L", CONTROL_PROBE_SOCKET, "list-sessions"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return ControlProbe(
+            responsive=False, timed_out=True, elapsed_s=time.monotonic() - started
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ControlProbe(
+            responsive=False, timed_out=False, elapsed_s=time.monotonic() - started
+        )
+    return ControlProbe(
+        responsive=True, timed_out=False, elapsed_s=time.monotonic() - started
+    )
+
+
 # `kill-server` on this machine's psmux 3.3.6 has been observed to exit 0
 # without the server dying, and a wedged server answers nothing at all -- so
 # the kill is bounded (one stuck socket must not hold the whole shutdown

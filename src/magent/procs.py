@@ -30,6 +30,11 @@ import sys
 # connection -- including a psmux SERVER, and with it the agent it hosts.
 CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 
+# Toolhelp constants for ``count_processes``: snapshot the process list, and
+# the sentinel CreateToolhelp32Snapshot returns when it cannot.
+TH32CS_SNAPPROCESS = 0x00000002
+INVALID_HANDLE_VALUE = -1
+
 
 def pid_alive(pid: int | None) -> bool:
     """Portable best-effort liveness check for a pid (None/0/negative: dead)."""
@@ -54,6 +59,62 @@ def pid_alive(pid: int | None) -> bool:
         return False
     else:
         return True
+
+
+def count_processes(exe_name: str) -> int | None:
+    """How many live processes run ``exe_name`` (case-insensitive). None = we
+    could not look, which is NOT the same as zero and must never be rendered
+    as one.
+
+    Toolhelp, not a CIM/PowerShell query: this is called from ``magent
+    doctor``'s wedge check, i.e. from a machine that is already misbehaving,
+    and a diagnostic that costs a PowerShell boot (~1 s, and 10 s bounded on
+    the attach path -- see ``platform/windows.py::process_cmdlines``) would
+    make the report slower than the thing it reports on. One snapshot walk over
+    ~900 processes costs single-digit milliseconds and needs no privileges.
+
+    Names only, never command lines: reading another process's command line
+    means NtQueryInformationProcess plus a cross-bitness PEB walk, which is a
+    lot of fragile surface for a count. Off Windows there is no cheap
+    stdlib-only equivalent, so this answers None rather than shelling out.
+    """
+    if sys.platform != "win32":
+        return None
+    import ctypes  # win-only: ctypes.windll doesn't exist off Windows
+    from ctypes import wintypes
+
+    class _ProcessEntry32(ctypes.Structure):
+        _fields_ = (
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        )
+
+    k = ctypes.windll.kernel32
+    snapshot = k.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snapshot == INVALID_HANDLE_VALUE:
+        return None
+    try:
+        entry = _ProcessEntry32()
+        entry.dwSize = ctypes.sizeof(_ProcessEntry32)
+        if not k.Process32FirstW(snapshot, ctypes.byref(entry)):
+            return None
+        wanted = exe_name.casefold()
+        found = 0
+        while True:
+            if entry.szExeFile.casefold() == wanted:
+                found += 1
+            if not k.Process32NextW(snapshot, ctypes.byref(entry)):
+                return found
+    finally:
+        k.CloseHandle(snapshot)
 
 
 def spawn_unjobbed(

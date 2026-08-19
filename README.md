@@ -184,7 +184,7 @@ Send screenshots from your phone straight into a project's agent session:
 "settings": { "psmux": true, "uploadServer": true, "uploadPort": 8033 }
 ```
 
-`magent serve` (or `uploadServer: true` during launch) starts a small HTTP server; `magent mobile` prints the phone URL + a QR code you can install as a home-screen app (the QR code needs the optional `qr` extra: `pip install magent-multi-ai-agents-manager[qr]`). Pick a project on the phone, upload an image, and its path is pasted into that project's session. On a desktop browser you can also **Ctrl+V** an image from the clipboard: the page stages it with a preview showing which project it will go to, waits for you to confirm with **Send**, and shows live upload progress until the "pasted into …" confirmation. The Alt+V hotkey (Windows) does the same for whatever `magent:` session is focused.
+`magent serve` (or `uploadServer: true` during launch) starts a small HTTP server on this config's `uploadPort` — the same port `magent status`, `up` and `doctor` watch, so a bare `magent serve` and the rest of the tool can't disagree about where the server is (`-p` still overrides it; with no readable config the port falls back to 8033). `magent mobile` prints the phone URL + a QR code you can install as a home-screen app (the QR code needs the optional `qr` extra: `pip install magent-multi-ai-agents-manager[qr]`). Pick a project on the phone, upload an image, and its path is pasted into that project's session. On a desktop browser you can also **Ctrl+V** an image from the clipboard: the page stages it with a preview showing which project it will go to, waits for you to confirm with **Send**, and shows live upload progress until the "pasted into …" confirmation. The Alt+V hotkey (Windows) does the same for whatever `magent:` session is focused.
 
 This works **over Tailscale**: the server binds only the loopback and your machine's Tailscale IP — never the LAN wildcard — and `attach`/`mobile`/`termius` shell out to the `tailscale` CLI to resolve hosts. Devices must be on your tailnet; there is deliberately no auth token, since the bind set is the access control. To bind something else (e.g. LAN-wide), use the escape hatch: `magent serve --host 0.0.0.0`.
 
@@ -233,7 +233,7 @@ Or skip the menu with flags:
 | `magent --init --base-dir <folder>` | Generate config from a folder of git repos. |
 | `magent --edit` | Open config in your default editor. |
 | `magent docs` | Print full config reference (Markdown). |
-| `magent doctor [--json]` | Diagnose the environment: config, env vars, agent tools on PATH, terminal, monitors, writable dirs, Tailscale, upload port. Exit 1 on any failure. |
+| `magent doctor [--json]` | Diagnose the environment: config, env vars, agent tools on PATH, terminal, a wedged psmux control plane (see below), monitors, writable dirs, Tailscale, upload port. Exit 1 on any failure. |
 | `magent sessions` | List active psmux sessions, pick one to attach. |
 | `magent sessions <name>` | Attach directly to a psmux session by name. |
 | `magent up [--json] [-g <group>] [--revive]` | Host side: ensure a persistent psmux session per project, and re-launch the agent in any live session whose pane fell back to a bare shell (e.g. after a Ctrl-C). Reviving is automatic except under `--json`, which stays a pure read unless `--revive` is passed. |
@@ -249,6 +249,23 @@ Or skip the menu with flags:
 | `magent hooks install` | Wire the agent lifecycle hooks that feed the session-state store (`magent hooks status` to inspect) — see [Where agent states come from](#where-agent-states-come-from). |
 | `magent config <subcommand>` | Edit config from the CLI — 17 subcommands incl. `migrate`; see `magent config --help`. |
 | `magent config edit [host]` | Edit the config on **another** machine in your editor over SSH — fetch, edit, validate, push back. Omit the host to reuse your last `attach` target. The host side is `magent config cat` / `magent config put`, which you never run by hand. |
+
+### When every psmux command hangs (the wedge)
+
+Rare, and worth knowing before it happens: psmux's control plane can wedge
+machine-wide. Every command — `has-session`, `list-sessions`, `new-session` —
+hangs forever, from any console, and the whole fleet looks dead.
+
+It isn't. `magent doctor` probes the control plane once (bounded, 5 s) and
+fails the `psmux wedge` check with the repair:
+
+- your sessions are **frozen, not dead** — do not restart them, and do not
+  reboot;
+- find the `conhost.exe` processes whose parent chain reaches a dead pid or a
+  `psmux.exe`, and kill only those (it was 14 of 874 conhosts in the incident
+  this check comes from);
+- psmux answers again immediately afterwards, and every session comes back
+  intact.
 
 ## Platform support
 
