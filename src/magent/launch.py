@@ -330,9 +330,12 @@ class UploadServerSupervisor:
     "recorded pid 8123 is gone" (the observed failure) reads very differently
     from "pid 8123 is alive but not answering", which is a wedge, not a death.
 
-    Nothing here raises on a failed spawn: the caller logs and ticks again next
-    poll. A supervisor that could take down the daemon it rides on would be
-    trading one silent death for another.
+    A spawn that fails outright (``spawn_detached`` raising) propagates to the
+    caller, which logs it and ticks again next poll -- see
+    ``cli/attention_cmd._upload_watchdog``. The handling lives there, at the
+    boundary with the loop that must survive, rather than here: a supervisor
+    that could take down the daemon it rides on would be trading one silent
+    death for another.
     """
 
     def __init__(

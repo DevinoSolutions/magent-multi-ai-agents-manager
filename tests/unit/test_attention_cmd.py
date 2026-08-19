@@ -410,6 +410,12 @@ class TestUploadWatchdog:
         monkeypatch.setattr(
             "magent.launch.UploadServerSupervisor", _RecordingSupervisor
         )
+        # The suite-wide isolation fixture pins the supervisor OFF so that no
+        # unit test can spawn a real server. This tier is the one that turns it
+        # back on -- safely, because the recording stand-in above is what would
+        # do the spawning.
+        monkeypatch.setenv("MAGENT_UPLOAD_SUPERVISOR", "1")
+        monkeypatch.setattr("magent.env._cached_env", None)
         return _RecordingSupervisor.instances
 
     def test_it_supervises_the_configured_port(self, monkeypatch):

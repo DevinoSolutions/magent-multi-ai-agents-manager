@@ -1573,7 +1573,13 @@ class TestUploadSupervisionSettings:
     hotkey supervisor uses: a detached daemon must never die of an environment
     variable it doesn't use."""
 
-    def test_supervision_is_on_by_default(self):
+    def test_supervision_is_on_by_default(self, monkeypatch):
+        # The PRODUCT default, read with the var genuinely absent -- the suite's
+        # own isolation fixture pins it to "0" so no unit test can spawn a real
+        # server, and that must not be mistaken for the shipped behaviour.
+        monkeypatch.delenv("MAGENT_UPLOAD_SUPERVISOR", raising=False)
+        monkeypatch.setattr("magent.env._cached_env", None)
+
         assert launch.upload_supervision_enabled() is True
 
     def test_the_env_var_turns_it_off(self, monkeypatch):

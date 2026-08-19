@@ -176,6 +176,12 @@ class TestDeadUploadServerWithNoWatchdog:
         _both_off(monkeypatch)
         monkeypatch.setattr("magent.cli.status._probe_port", lambda port: True)
         monkeypatch.setattr("magent.cli.status._attention_state", lambda: attention)
+        # The suite-wide isolation fixture pins the supervisor OFF (so no unit
+        # test can spawn a real server); the hint is only offered when it WOULD
+        # supervise, so this tier asks for the shipped default back. `status`
+        # only reads the flag -- it never starts anything.
+        monkeypatch.setenv("MAGENT_UPLOAD_SUPERVISOR", "1")
+        monkeypatch.setattr("magent.env._cached_env", None)
 
     def test_the_repair_names_the_daemon(self, runner, tmp_config, monkeypatch):
         self._dead_server(monkeypatch, attention="off")
