@@ -14,7 +14,53 @@ import sys
 
 import pytest
 
-from magent.procs import CREATE_BREAKAWAY_FROM_JOB, pid_alive, spawn_unjobbed
+from magent.procs import (
+    CREATE_BREAKAWAY_FROM_JOB,
+    count_processes,
+    pid_alive,
+    spawn_unjobbed,
+)
+
+
+class TestCountProcesses:
+    """Enrichment for doctor's psmux-wedge finding: the wedge left psmux.exe
+    processes that ignored ``taskkill /F``, so a count corroborates it. It must
+    stay cheap (a Toolhelp snapshot, no subprocess) and must never pass off
+    "could not look" as zero."""
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Toolhelp is win32-only")
+    def test_it_counts_a_real_running_process(self):
+        # Our own interpreter is running, by definition.
+        found = count_processes(os.path.basename(sys.executable))
+        assert found is not None
+        assert found >= 1
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Toolhelp is win32-only")
+    def test_it_is_case_insensitive_like_windows(self):
+        exe = os.path.basename(sys.executable)
+        assert count_processes(exe.upper()) == count_processes(exe.lower())
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Toolhelp is win32-only")
+    def test_a_name_nothing_runs_is_zero_not_none(self):
+        assert count_processes("magent-definitely-not-running.exe") == 0
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Toolhelp is win32-only")
+    def test_it_costs_no_subprocess(self, monkeypatch):
+        # A PowerShell/CIM query would make the diagnostic slower than the
+        # machine it is diagnosing.
+        monkeypatch.setattr(
+            subprocess, "run", lambda *a, **k: pytest.fail("spawned a subprocess")
+        )
+        monkeypatch.setattr(
+            subprocess, "Popen", lambda *a, **k: pytest.fail("spawned a subprocess")
+        )
+        count_processes("psmux.exe")
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the None branch is POSIX")
+    def test_off_windows_it_admits_it_cannot_look(self):
+        # None, never 0: a caller that rendered "0 psmux.exe resident" on Linux
+        # would be inventing a fact.
+        assert count_processes("psmux.exe") is None
 
 
 class TestPidAlive:

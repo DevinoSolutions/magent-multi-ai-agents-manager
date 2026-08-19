@@ -1852,3 +1852,88 @@ class TestSendKeysIsBounded:
 
         monkeypatch.setattr(subprocess, "run", _boom)
         assert psmux.send_keys("api", "hello", psmux="psmux") is False
+
+
+class TestProbeControlPlane:
+    """The doctor-only responsiveness probe. Its whole job is to come back:
+    the failure it looks for is a psmux that answers NOTHING, machine-wide,
+    for as long as the box stays up (2026-08-18/19), so an unbounded or
+    raising probe would reproduce the outage inside the tool meant to
+    diagnose it."""
+
+    def _run(self, monkeypatch, run):
+        monkeypatch.setattr(subprocess, "run", run)
+        return psmux.probe_control_plane(psmux="psmux")
+
+    def test_an_answer_is_responsive_whatever_the_exit_code(self, monkeypatch):
+        # "no server running on this socket" is rc != 0 and is a perfectly
+        # healthy ANSWER -- the probe measures replies, not sessions.
+        probe = self._run(monkeypatch, lambda cmd, **kw: _FakeCompleted(returncode=1))
+        assert (probe.responsive, probe.timed_out) == (True, False)
+        assert probe.elapsed_s >= 0.0
+
+    def test_a_timeout_is_the_finding_not_an_exception(self, monkeypatch):
+        def _hang(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+
+        probe = self._run(monkeypatch, _hang)
+        assert (probe.responsive, probe.timed_out) == (False, True)
+
+    def test_an_unlaunchable_binary_is_not_a_wedge(self, monkeypatch):
+        # A psmux that will not start is a broken install, not a frozen fleet,
+        # and the two repair hints could not be more different.
+        def _boom(cmd, **kwargs):
+            raise OSError("no such binary")
+
+        probe = self._run(monkeypatch, _boom)
+        assert (probe.responsive, probe.timed_out) == (False, False)
+
+    def test_no_binary_at_all_answers_without_probing(self, monkeypatch):
+        monkeypatch.setattr(psmux, "find_psmux", lambda: None)
+        monkeypatch.setattr(
+            subprocess, "run", lambda *a, **k: pytest.fail("probed with no binary")
+        )
+        probe = psmux.probe_control_plane()
+        assert (probe.responsive, probe.timed_out) == (False, False)
+
+    def test_the_bound_is_handed_to_subprocess_and_is_short(self, monkeypatch):
+        seen: list[object] = []
+
+        def _run(cmd, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            return _FakeCompleted(returncode=0)
+
+        self._run(monkeypatch, _run)
+        assert seen == [psmux.CONTROL_PROBE_TIMEOUT_S]
+        assert 0 < psmux.CONTROL_PROBE_TIMEOUT_S <= 10
+
+    def test_it_never_captures_output(self, monkeypatch):
+        """Measured, not stylistic: with ``capture_output=True`` the timeout is
+        not a bound at all on Windows -- ``subprocess.run`` kills the direct
+        child and then waits on the pipes, which a grandchild of a wedged psmux
+        still holds. The first build of this probe answered a 5 s timeout in
+        90 s for exactly that reason."""
+        seen: list[dict] = []
+
+        def _run(cmd, **kwargs):
+            seen.append(kwargs)
+            return _FakeCompleted(returncode=0)
+
+        self._run(monkeypatch, _run)
+        assert seen[0].get("capture_output") is None
+        assert seen[0]["stdout"] is subprocess.DEVNULL
+        assert seen[0]["stderr"] is subprocess.DEVNULL
+
+    def test_it_probes_its_own_socket_and_enumerates_nothing(self, monkeypatch):
+        """Not a fourth liveness sweep: no configured session is named, and
+        the command cannot start a server on a project's socket."""
+        seen: list[list[str]] = []
+
+        def _run(cmd, **kwargs):
+            seen.append(list(cmd))
+            return _FakeCompleted(returncode=0)
+
+        self._run(monkeypatch, _run)
+        assert seen == [["psmux", "-L", psmux.CONTROL_PROBE_SOCKET, "list-sessions"]]
+        assert "has-session" not in seen[0]
+        assert "new-session" not in seen[0]
