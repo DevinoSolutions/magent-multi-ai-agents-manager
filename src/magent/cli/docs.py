@@ -337,7 +337,9 @@ def _generate_docs() -> str:
         "| `magent down --host <user@host>` | Run the same shutdown on that machine over SSH, closing the local attach windows first. |"
     )
     w("| `magent serve` | Start upload server for mobile image transfer. |")
-    w("| `magent serve -p 9090` | Use a custom port (default 8033). |")
+    w(
+        "| `magent serve -p 9090` | Use a custom port (default: this config's `uploadPort`, else 8033). |"
+    )
     w("| `magent hotkey` | Listen for Alt+V to upload clipboard images (standalone). |")
     w("| `magent sessions` | List active psmux sessions, pick one to attach. |")
     w("| `magent sessions <name>` | Attach directly to a psmux session by name. |")
