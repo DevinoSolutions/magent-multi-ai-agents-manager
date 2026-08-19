@@ -1117,6 +1117,47 @@ where the pasted path is its own proof. The listener's closing message is
 already terminal and already true: the image is saved, and the paste is
 pending.
 
+### Doctor names the wedge, and the probe that finds it cannot join it (2026-08-19)
+
+Twice on the live 40-session host: every psmux control command — `has-session`,
+`list-sessions`, `new-session` — hung forever, from any console, including
+sockets that had never existed. ConPTY itself was fine (a raw pywinpty spawn
+was instant). The whole fleet looked dead for hours.
+
+It was not dead. The holders were `conhost.exe` processes whose parent chain
+reached a dead pid or a `psmux.exe`; killing exactly those 14 of the box's 874
+conhosts unwedged psmux instantly (`new-session` went from an infinite hang to
+892 ms), and **every session then probed alive**. So the reaction the outage
+invites — mass-restart, or a reboot — was the one action that would have
+destroyed 40 live agents. That is the fact `magent doctor`'s `psmux wedge`
+check exists to put in front of whoever finds the machine next: the sessions
+are FROZEN, not dead; kill only those conhosts; nothing else is needed.
+
+**Why it is a responsiveness probe and not a liveness sweep.** "Which sessions
+are live" has exactly one owner (`psmux.live_sessions`) and this must not
+become a fourth answer to it. `psmux.probe_control_plane` enumerates nothing,
+names no configured session, and runs `list-sessions` on a throwaway socket no
+session name can collide with — a control command on a FRESH socket hanging
+*was* the incident's own reproduction, and `list-sessions` starts no server, so
+a doctor run leaves nothing behind. A version flag would be cheaper and would
+prove nothing: `psmux -V` never touches the plumbing the wedge holds.
+
+**`subprocess.run(capture_output=True, timeout=…)` is not a bound on Windows.**
+The probe was built that way first and answered its 5 s timeout in 90 s. On
+expiry `run` kills the direct child and then calls `communicate()`, which waits
+for the pipe write ends to close — and a grandchild the wedged client left
+behind still holds them. The probe now discards output (`DEVNULL`), which has
+nothing to wait on; the timeout is a real bound again. This was caught by
+`tests/e2e/test_doctor_wedge.py`, whose ceiling is on the whole `magent doctor`
+run rather than on the probe, against a real executable named `psmux` that
+records its argv and then stops answering.
+
+The enrichment (`procs.count_processes`, a Toolhelp snapshot: how many
+`psmux.exe` are resident) is optional by construction — it corroborates the
+finding, costs no subprocess, and answers `None` rather than `0` when it cannot
+look, because "0 psmux.exe resident" printed on a machine nobody counted would
+be an invented fact.
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.
