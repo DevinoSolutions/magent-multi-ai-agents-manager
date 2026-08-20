@@ -101,7 +101,10 @@ None of these imports any other `magent` module (`style.py` imports
   (`status`, Linux CI) can check daemon liveness without importing the
   Windows-only hotkey module. Logging setup is best-effort by design — a
   failure falls back to `NullHandler` rather than raising, because the
-  daemons that call it run detached with no console to crash to.
+  daemons that call it run detached with no console to crash to. One log
+  file per *concern*, not per process: several magent processes write the
+  same name concurrently, which is why the handler is
+  `_SharedRotatingFileHandler` — see §2 "One log file, many processes".
 - **`terminals.py`** — `detect_terminal()` + per-OS terminal-priority lists.
   Note for a cold agent: no `src/` module currently calls it —
   `platform/linux.py` and `platform/macos.py` each hard-code their own
@@ -1189,6 +1192,26 @@ where the pasted path is its own proof. The listener's closing message is
 already terminal and already true: the image is saved, and the paste is
 pending.
 
+**The phone is the other client, and it was the last one still lying**
+(2026-08-19). `altv` read all three states from the day the reply grew them;
+the mobile upload page's JS still read `d.injected` alone, so the same slow
+paste that the status line now narrates honestly rendered on a phone as a
+failure-looking result — about a file already on disk. It reads all three now,
+in the same vocabulary: `injected` → "pasted into <project>", `inject_pending`
+→ "saved - psmux is slow, paste still pending" **in the success tint** (a
+`pend` marker class dashes the border; it never takes the error red), and
+neither → the plain "sent" it has always been. That last one stays a success
+deliberately: with no psmux installed, or with inject off, both flags are false
+and nothing failed — a page that called that state a failure would be the same
+lie pointed at a different user. The only failure on that page is `ok:false`.
+
+The proof is a real browser against a real multiplexer that stalls only
+`send-keys`, past `INJECT_GRACE_S` (`tests/e2e/test_upload_browser.py`,
+`stalled_serve`). Its assertions read every class the result surfaces ever
+took — recorded by an in-page `MutationObserver` installed before the upload —
+because the page resets the drop zone two seconds after an outcome, and the
+question is not what it shows now but whether it ever showed red.
+
 ### Doctor names the wedge, and the probe that finds it cannot join it (2026-08-19)
 
 Twice on the live 40-session host: every psmux control command — `has-session`,
@@ -1229,6 +1252,104 @@ The enrichment (`procs.count_processes`, a Toolhelp snapshot: how many
 finding, costs no subprocess, and answers `None` rather than `0` when it cannot
 look, because "0 psmux.exe resident" printed on a machine nobody counted would
 be an invented fact.
+
+### One log file, many processes (2026-08-19)
+
+A log NAME in `~/.magent/logs/` is not owned by one process, and nothing in the
+design ever said it was. Traced writer sets:
+
+| file | processes that write it |
+|---|---|
+| `hotkey.log` | the Alt+V listener (`python -m magent hotkey`), `magent serve` (`upload_server._supervise_hotkey` / `supervision_enabled`), any foreground `magent up`/`attach` (`launch.ensure_hotkey_listener`) |
+| `launch.log` | the foreground CLI (`launch`, `tiling`, `sessions`), `magent serve` (every `psmux.send_keys` / bring-up warning), the listener's F2 path |
+| `attention.log` | `magent attention -d`, `magent watch`, `magent status` — anything that READS the agent-state store and hits `agent_state._warn_unusable`, plus `launch.UploadServerSupervisor` |
+| `upload.log` | `magent serve`, and `psmux`'s flash-timeout warning wherever it runs |
+| `platform.log` | every process that imports a platform backend at all |
+
+`logging.handlers.RotatingFileHandler` is a single-process design, and it fails
+**silently and expensively** when shared. It keeps the file open for the
+process's lifetime and rotates by renaming it out from under itself. On Windows
+a second process holding that file open makes the rename fail:
+
+```
+PermissionError: [WinError 32] The process cannot access the file because it is
+being used by another process: '…\logs\mplogtest.log' -> '…\logs\mplogtest.log.1'
+```
+
+`doRollover` has already dropped the stream by then, so the record goes to
+`handleError` (a traceback to a stderr no detached daemon has) and is LOST — and
+the next record retries the same doomed rename, whose reopen now fails too
+(`[Errno 13] Permission denied`; the rename left the path delete-pending). So it
+is not one bad record: the log stops rotating *and* stops recording for as long
+as contention lasts. Measured on this box with 4 real writers × 200 records:
+**272 of 800 records lost**, and the backup chain came out with holes (`.3` and
+`.8` missing, clobbered by overlapping rename cascades). On POSIX the rename
+succeeds instead and the losing process keeps writing into the file it renamed
+away, so those records land in a backup the next rotation overwrites — the same
+loss, quieter. The second, independent hazard is that **Windows has no atomic
+append**: the CRT implements `open(path, "a")` as seek-to-end followed by write
+with nothing holding the file in between, so two overlapping writers resolve the
+same offset and one lands on top of the other (the finding `test_altv_flash.py`
+records for its own recorder shim).
+
+**Decision: hold no file across records; serialize each record with a
+cross-process lock.** `log._SharedRotatingFileHandler` takes an exclusive lock
+on a sidecar (`msvcrt.locking` on Windows, `fcntl.flock` elsewhere — the same
+per-OS split `lockfile.py` already makes), then opens the log, rotates it if it
+has crossed `maxBytes`, writes, and closes, all inside that lock. Because nobody
+holds the log outside the critical section the rename can never be blocked, two
+writers can never rotate the same file twice, and no two writes can resolve the
+same offset. Both OS locks are released by the kernel when the holder dies, so a
+crashed writer cannot wedge the others.
+
+**That platform split is bound once at import, never per record** — a trap this
+change fell into and CI caught on every POSIX leg. The OS does not change while
+a process runs, but `sys.platform` does: tests monkeypatch it to drive the win32
+branches of platform-specific code (`upload_server.stop_server`'s taskkill path
+is one), and that code *logs*. A logger that re-read `sys.platform` per record
+therefore tried to `import msvcrt` on Linux and took down the very call it exists
+to observe. `tests/unit/test_log.py::…::test_a_faked_sys_platform_cannot_break_logging`
+pins it in both directions.
+
+Rejected alternatives:
+
+- *Per-process files* (`<name>-<pid>.log` plus a stale-pid sweep) — rotation-safe
+  and lock-free, but it changes the on-disk layout that a dozen consumers depend
+  on (the soak tier's `glob("<name>.log*")`, the dist/e2e/platform tiers that
+  read `logs/upload.log` and `logs/attention.log` by name, and every human who
+  greps `~/.magent/logs/hotkey.log`), and it scatters one narrative across N
+  files. A logging fix must not make the logs harder to read.
+- *Tolerating the failed rename* (catch `OSError` in `doRollover`, retry later) —
+  minimal, but it only addresses the crash. Records still interleave, the losing
+  process still writes into a renamed-away file on POSIX, and the file grows
+  unbounded exactly when contention is worst.
+- *`concurrent-log-handler`* — off the table; no new third-party dependency.
+
+The price is one lock + one open/close per record: **13 µs → 235 µs** on this
+box. These are lifecycle logs at a few records a second, not a request stream,
+so the cost is unobservable and the correctness is not.
+
+Two loudness rules ride along, both stricter than the stdlib's. A rotation that
+still fails **writes the record anyway** and reports the rotation failure through
+`handleError` (the stdlib drops the record instead). A lock that cannot be taken
+within `_LOCK_TIMEOUT_S` degrades to an unlocked write — keeping the record,
+which is the whole point — and says so once per process **in the log file
+itself**, because that is the only channel a detached daemon has and reaching for
+`get_logger` from inside a handler would recurse.
+
+The public seam is unchanged (`get_logger(name)`, one handler, still a
+`RotatingFileHandler`, still `<name>.log` + `<name>.log.N`), so no consumer
+moved. The interlock sidecar is deliberately `<name>.lock` and **not**
+`<name>.log.lock`: `glob("<name>.log*")` is how rotated files are enumerated, and
+a lock file must not read as a log file. `tests/unit/test_log.py` pins that.
+
+Proof: `tests/e2e/test_log_multiprocess.py` (marker `e2e`, all three OSes) drives
+N real writer processes released off a shared wall clock, with a tiny `maxBytes`
+so rotation is forced repeatedly *during* the burst, and asserts on what is on
+disk — every record present exactly once, no torn line, no `--- Logging error ---`
+on any child's stderr, rotation demonstrably happened, and the retained files sat
+well under capacity so "missing" can only mean "lost", never "aged out". It goes
+RED on the old handler with the traceback above.
 
 ## 3. Known debt
 

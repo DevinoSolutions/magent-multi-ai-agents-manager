@@ -43,21 +43,45 @@ def _drain(timeout: float = 5.0) -> None:
 
 
 class _Upload:
-    """A real HTTP server standing in for `magent serve`'s /upload."""
+    """A real HTTP server standing in for `magent serve`'s /upload.
 
-    def __init__(self, reply: dict, status: int = 200):
+    ``reply`` is answered as JSON. ``raw=`` answers with those bytes verbatim
+    instead, for the "serve said something that isn't JSON" case.
+
+    Every reply is preceded by a full read of the request body, which is
+    load-bearing rather than tidy. ``BaseHTTPRequestHandler`` speaks HTTP/1.0,
+    so the connection is closed the moment the handler returns -- and closing a
+    TCP socket that still has unread received data sends an RST rather than a
+    FIN (RFC 1122 4.2.2.13). An RST discards whatever the client had buffered
+    but not yet read, so `upload_image`'s `resp.read()` raises
+    ConnectionResetError (an OSError), which it correctly classifies as
+    `serve-unreachable` -- turning a test about a REPLY into a test about a
+    dead server. It is a genuine race: urllib sends the headers and the body in
+    two separate `send()` calls, so under load the body can still be in the
+    kernel queue when the handler answers. Draining first removes the race
+    instead of making it rarer.
+    """
+
+    def __init__(
+        self, reply: dict | None = None, status: int = 200, raw: bytes | None = None
+    ):
         self.reply = reply
         self.status = status
+        self.raw = raw
         self.requests: list[tuple[str, bytes]] = []
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", 0))
+                # Drain BEFORE replying -- see the class docstring.
                 outer.requests.append((self.path, self.rfile.read(length)))
-                body = json.dumps(outer.reply).encode()
+                json_reply = outer.raw is None
+                body = json.dumps(outer.reply).encode() if json_reply else outer.raw
                 self.send_response(outer.status)
-                self.send_header("Content-Type", "application/json")
+                self.send_header(
+                    "Content-Type", "application/json" if json_reply else "text/plain"
+                )
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -67,10 +91,18 @@ class _Upload:
 
         self.server = HTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self._thread.start()
 
     def close(self):
+        # shutdown() stops the accept loop; server_close() releases the
+        # listening socket, which a `serve_forever`-only teardown leaks for the
+        # rest of the session. The join is bounded so a wedged handler fails
+        # the run it belongs to rather than hanging the suite.
         self.server.shutdown()
+        self.server.server_close()
+        self._thread.join(timeout=10)
+        assert not self._thread.is_alive(), "the stand-in upload server never stopped"
 
 
 class TestPhaseOrder:
@@ -549,25 +581,21 @@ class TestUploadImage:
         assert "Missing file or project" in reason
 
     def test_a_non_json_reply_is_a_rejection_with_a_reason(self):
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                self.send_response(200)
-                self.send_header("Content-Length", "9")
-                self.end_headers()
-                self.wfile.write(b"not-json!")
-
-            def log_message(self, *args):
-                pass
-
-        server = HTTPServer(("127.0.0.1", 0), Handler)
-        url = f"http://127.0.0.1:{server.server_address[1]}"
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        # A 200 whose body is not JSON is the server's problem, not the
+        # network's -- so it must reach the JSONDecodeError branch and be
+        # named a rejection, never a transport failure. This used its own
+        # bare handler that answered without reading the request body, which
+        # made the reply race an RST; it now shares `_Upload`'s drained one.
+        server = _Upload(raw=b"not-json!")
         try:
-            outcome, reason, _ = altv.upload_image(url, "marka", b"x")
+            outcome, reason, _ = altv.upload_image(server.url, "marka", b"x")
         finally:
-            server.shutdown()
+            server.close()
         assert outcome == "upload-rejected"
         assert reason
+        # ...and specifically the unreadable-reply reason, not a transport one:
+        # the distinction is exactly what the RST race used to erase.
+        assert reason == "serve sent an unreadable reply"
 
 
 class TestTransportReasons:

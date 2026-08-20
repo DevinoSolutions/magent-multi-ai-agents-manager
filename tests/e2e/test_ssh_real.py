@@ -90,7 +90,14 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = [pytest.mark.e2e, pytest.mark.needs_ssh]
+# real_home: this tier is the one place that MUST keep the machine's own home.
+# It drives magent over a loopback sshd as the SAME user, and `attach` cannot
+# inject `--config` remotely -- so the far side reads the runner's real
+# ~/.magent and ~/.ssh/config, which this module seeds by absolute path via
+# Path.home(). It is CI-only twice over (needs_ssh env vars absent locally,
+# and the HOME-seeding tests are additionally gated on GITHUB_ACTIONS /
+# MDTEST_ALLOW_REAL_HOME), so the opt-out can never fire on a dev box.
+pytestmark = [pytest.mark.e2e, pytest.mark.needs_ssh, pytest.mark.real_home]
 
 _WM_CLOSE = 0x0010
 

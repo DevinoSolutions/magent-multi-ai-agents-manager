@@ -916,18 +916,38 @@ DECOR_STAMP = Path.home() / ".magent" / "state" / "decor.stamp"
 DECOR_TTL_S = 60.0
 
 
+# How far "in the future" a stamp may read before the clock is called bad.
+#
+# The stamp's age is a difference between two DIFFERENT readings of the same
+# wall clock -- `time.time()` and a filesystem mtime -- so it can come out
+# slightly negative for an instant that is genuinely in the past. Measured on
+# Windows/CPython 3.10, 3000 create-then-read cycles: 10.2% of them read the
+# stamp as 2.384185791015625e-07s (exactly one float ULP at the current epoch)
+# in the FUTURE, because `os.stat` builds st_mtime as `sec + 1e-9*nsec` while
+# `time.time()` divides an integer nanosecond count -- two roundings of one
+# instant. Under CPython 3.13+ the same loop never goes negative (`time.time()`
+# moved to GetSystemTimePreciseAsFileTime, so the read is microseconds LATER
+# than the 15.625ms-granular mtime instead of exactly equal to it).
+#
+# Two seconds also covers the coarse end of the real spread -- one Windows
+# clock tick is 15.625ms, and FAT/exFAT store mtimes at 2s granularity -- while
+# staying 1/30 of the TTL, so a clock that really is wrong still cannot switch
+# decoration off for meaningfully longer than one TTL.
+_STAMP_FUTURE_SLOP_S = 2.0
+
+
 def _decor_stamp_fresh() -> bool:
     """True when a decoration pass ran within ``DECOR_TTL_S``.
 
     A missing/unreadable stamp answers False (decorate), and so does a stamp
-    dated in the future: a bad clock must not be able to switch decoration off
-    for longer than the TTL.
+    dated in the future by more than ``_STAMP_FUTURE_SLOP_S``: a bad clock must
+    not be able to switch decoration off for longer than the TTL.
     """
     try:
         age = time.time() - DECOR_STAMP.stat().st_mtime
     except OSError:
         return False
-    return 0 <= age < DECOR_TTL_S
+    return -_STAMP_FUTURE_SLOP_S <= age < DECOR_TTL_S
 
 
 def _touch_decor_stamp() -> None:
