@@ -57,6 +57,52 @@ class TestBuildHtml:
             assert anchor in html, f"paste-upload UI anchor missing: {anchor}"
 
 
+class TestThePageReadsAllThreePasteStates:
+    """The mobile page must not collapse `inject_pending` into a failure.
+
+    `/upload` answers with three paste states -- pasted, still trying, refused
+    (DESIGN.md "The upload reply is not hostage to the paste"). The page's JS
+    read only `injected`, so the slow-but-successful paste -- the exact
+    condition the server-side fix exists for -- rendered on the phone as a
+    failure-looking result about a file that was already safely on disk.
+
+    These are drift pins on the SERVED page, deliberately cheap: they fail the
+    moment the field or the shared wording is dropped again. The behavioural
+    proof (a real browser, a real serve, a real multiplexer stalling past
+    INJECT_GRACE_S) is the `browser` e2e tier.
+    """
+
+    def _html(self) -> str:
+        return _build_html([{"name": "p", "path": "x"}])
+
+    def test_the_page_js_reads_the_inject_pending_field(self):
+        html = self._html()
+        assert "inject_pending" in html, (
+            "the page dropped `inject_pending`; a slow paste is a failure again"
+        )
+        assert "d.injected" in html  # ...and still distinguishes the fast one
+
+    def test_the_pending_wording_matches_the_alt_v_narration(self):
+        # One vocabulary for one event: the phone and the psmux status line
+        # must not describe the same pending paste differently.
+        from magent.altv import OUTCOME_REASONS
+
+        shared = OUTCOME_REASONS["inject-pending"].removeprefix("image ")
+        assert shared in self._html(), (
+            f"the page's pending wording drifted from altv's {shared!r}"
+        )
+
+    def test_pending_is_tinted_healthy_and_never_as_an_error(self):
+        # Same call the status line makes: the bytes are on disk, so red would
+        # read as "your screenshot is gone". Both result surfaces (the drop
+        # zone and the toast) carry the ok class alongside the pend marker.
+        html = self._html()
+        for healthy in ("'drop ok pend'", "'toast ok pend'"):
+            assert healthy in html, f"pending lost its healthy tint: {healthy}"
+        for wrong in ("drop err pend", "toast err pend"):
+            assert wrong not in html, f"pending is styled as a failure: {wrong}"
+
+
 class TestConfigSessions:
     def test_carries_display_name_and_sanitized_session(self, tmp_path):
         # P3-01: _config_sessions splits the display name from the psmux id.
@@ -411,6 +457,39 @@ class TestUploadServerIntegration:
         saved = Path(data["path"])
         assert saved.exists()
         assert saved.read_bytes() == b"FAKEPNG"
+
+    def test_no_paste_at_all_is_neither_injected_nor_pending(self):
+        # The THIRD state of the reply envelope, on the path a client can reach
+        # with no multiplexer installed at all (this fixture's find_psmux is
+        # None). Both flags false is what tells a client "no paste happened,
+        # and none is coming" -- it is NOT a failed upload, and the page must
+        # keep reporting it as the plain "sent" it is. The other two states are
+        # pinned in TestASlowPasteNeverBecomesAFailedUpload.
+        body = (
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="project"\r\n\r\nmarka\r\n'
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="inject"\r\n\r\n1\r\n'
+            b"------B\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="s.png"\r\n\r\n'
+            b"FAKEPNG\r\n"
+            b"------B--\r\n"
+        )
+        conn = self._conn()
+        conn.request(
+            "POST",
+            "/upload",
+            body=body,
+            headers={
+                "Content-Type": "multipart/form-data; boundary=----B",
+                "Content-Length": str(len(body)),
+            },
+        )
+        data = json.loads(conn.getresponse().read())
+
+        assert data["ok"] is True
+        assert data["injected"] is False
+        assert data["inject_pending"] is False
 
     def _wait_log(self, caplog, substr: str, timeout: float = 3.0) -> bool:
         # The outcome INFO logs in the do_POST `finally` block, which runs on
