@@ -6,6 +6,15 @@ _config_dir for the config/*.json home). Logging is best-effort: setup
 failures fall back to a NullHandler rather than raising, since the daemons
 that call get_logger() run detached with no console to report a crash to.
 
+A log NAME is not owned by one process. ``hotkey.log`` is written by the Alt+V
+listener, by ``magent serve`` (its listener supervisor) and by any foreground
+``magent up``/``attach``; ``launch.log`` by the foreground CLI, by ``serve``
+(every psmux warning) and by the listener; ``attention.log`` by the attention
+daemon, by ``magent watch`` and by anything that reads a bad agent-state record;
+``platform.log`` by every process that imports a platform backend at all. The
+stdlib's ``RotatingFileHandler`` is a single-process design, so the handler here
+is a shared-file subclass -- see ``_SharedRotatingFileHandler``.
+
 Heartbeats live here (not in hotkey.py) so cross-platform callers -- `status`,
 Linux CI -- can check liveness without importing the Windows-only hotkey
 module.
@@ -16,6 +25,8 @@ from __future__ import annotations
 import contextlib
 import logging
 import logging.handlers
+import os
+import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -32,6 +43,14 @@ HEARTBEAT_MAX_AGE = 30  # 3x the interval, tolerant of scheduler jitter
 _MAX_BYTES = 1_000_000
 _BACKUP_COUNT = 3
 _FORMAT = "%(asctime)s %(levelname)s %(process)d %(name)s %(message)s"
+
+# How long a writer waits for the cross-process interlock before giving up and
+# writing anyway. Generous on purpose: the critical section is one open/write/
+# close, so a wait this long means something pathological (a paused process
+# under a debugger), not ordinary contention. Both OS locks are released by the
+# kernel when the holder dies, so a crashed writer cannot wedge the others.
+_LOCK_TIMEOUT_S = 5.0
+_LOCK_POLL_S = 0.002
 
 _CONFIGURED_ATTR = "_magent_log_configured"
 
@@ -61,12 +80,217 @@ def _configured_level() -> int:
     return value if isinstance(value, int) else logging.INFO
 
 
+def _lock_exclusive(fd: int) -> None:
+    """Take the OS's exclusive lock on ``fd``, or raise OSError immediately.
+
+    Mirrors ``lockfile.exclusive_lock``'s platform split (msvcrt on Windows,
+    flock elsewhere) rather than reusing it: that helper is a one-shot
+    non-blocking daemon guard that unlinks the file on release, which is the
+    opposite of what a lock re-taken thousands of times per process needs.
+    ``msvcrt.locking`` locks a byte range from the CURRENT offset, so the seek
+    is load-bearing, not decoration.
+    """
+    if sys.platform == "win32":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock(fd: int) -> None:
+    if sys.platform == "win32":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+class _SharedRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """A ``RotatingFileHandler`` that several magent PROCESSES may point at the
+    same file.
+
+    The stdlib handler keeps the log open for the process's lifetime and rotates
+    by renaming it. Both halves break when the file is shared, and both were
+    measured (``tests/e2e/test_log_multiprocess.py``, 4 real writers x 200
+    records, Windows):
+
+    * ``doRollover`` renames the live file. A second process holding it open
+      makes that ``os.rename`` fail with ``PermissionError: [WinError 32]``;
+      the handler has already dropped its stream, so the record goes to
+      ``handleError`` and the NEXT record retries the same doomed rename -- and
+      the reopen then fails too (``[Errno 13] Permission denied``, the rename
+      left the path delete-pending). **272 of 800 records were lost** and the
+      backup chain came out with holes (``.3`` and ``.8`` missing, clobbered by
+      overlapping cascades). On POSIX the rename succeeds instead, and the other
+      process keeps writing into the file it renamed away -- the same records,
+      lost more quietly.
+    * Windows has no atomic append: the CRT implements ``open(path, "a")`` as
+      seek-to-end then write, with nothing holding the file in between, so two
+      overlapping writers resolve the same offset and one lands on top of the
+      other (the same finding ``test_altv_flash.py`` records for its shim).
+
+    So this handler holds no file across records. Every emit takes a
+    cross-process exclusive lock on a sidecar, opens the log, rotates it if it
+    has crossed ``maxBytes``, writes, and closes -- all inside the lock. Because
+    nobody holds the log outside the critical section, the rename can never be
+    blocked, two writers can never rotate the same file twice, and no two writes
+    can resolve the same offset.
+
+    The sidecar is ``<name>.lock``, deliberately NOT ``<name>.log.lock``: the
+    soak tier (and anyone at a shell) enumerates rotated files with
+    ``glob("<name>.log*")``, and a lock file must not read as a log file.
+
+    Cost is one lock + one open/close per record. These logs are lifecycle
+    events at a few records per second, not a request stream, so that buys
+    correctness at a price nothing here can feel.
+    """
+
+    def __init__(
+        self, filename: Path, *, max_bytes: int, backup_count: int, encoding: str
+    ) -> None:
+        super().__init__(
+            filename,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding=encoding,
+            # Load-bearing: the stream must be opened per record inside the
+            # lock, never left open across records, or the rename this class
+            # exists to protect is blocked again.
+            delay=True,
+        )
+        self._lock_path = Path(self.baseFilename).with_suffix(".lock")
+        self._lock_fd: int | None = None
+        self._warned_unlocked = False
+
+    # --- the cross-process critical section ---------------------------------
+
+    def _acquire(self) -> bool:
+        """Hold the interlock, or report honestly that we could not."""
+        if self._lock_fd is None:
+            try:
+                self._lock_fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            except OSError:
+                return False  # narrated by _warn_unlocked, never silent
+        deadline = time.monotonic() + _LOCK_TIMEOUT_S
+        while True:
+            try:
+                _lock_exclusive(self._lock_fd)
+            except OSError:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(_LOCK_POLL_S)
+            else:
+                return True
+
+    def _release(self) -> None:
+        if self._lock_fd is not None:
+            with contextlib.suppress(OSError):
+                _unlock(self._lock_fd)
+
+    def _warn_unlocked(self, record: logging.LogRecord) -> None:
+        """Say, once per process, that writes are no longer interlocked.
+
+        Degrading to an unlocked write keeps the RECORD (losing it is the defect
+        this class exists to remove) but reopens the interleaving window, so it
+        must not be silent. The notice goes into the log file itself on this
+        very write: a detached daemon has no console, and reaching for
+        ``get_logger`` from inside a handler would recurse.
+        """
+        if self._warned_unlocked:
+            return
+        self._warned_unlocked = True
+        logging.FileHandler.emit(
+            self,
+            logging.LogRecord(
+                record.name,
+                logging.WARNING,
+                record.pathname,
+                record.lineno,
+                "log interlock unavailable after %.0fs (%s); records from this "
+                "process may now interleave with other magent processes",
+                (_LOCK_TIMEOUT_S, self._lock_path),
+                None,
+            ),
+        )
+
+    def _rollover_if_full(self) -> None:
+        """Rotate when the file has crossed ``maxBytes``.
+
+        Deliberately measures the file, not a cached stream offset: another
+        process may have rotated or grown it since our last record. A file is
+        therefore rotated on the record AFTER it crosses the threshold, so it
+        can exceed ``maxBytes`` by at most one line -- a bound that, unlike the
+        stdlib's "would this record fit" arithmetic, cannot be thrown off by a
+        record whose formatting raises.
+        """
+        if self.maxBytes <= 0:
+            return
+        try:
+            size = os.path.getsize(self.baseFilename)
+        except OSError:
+            return  # absent (or just rotated away): _open() recreates it
+        if size < self.maxBytes:
+            return
+        # self.stream is None here -- every emit closes it -- so doRollover has
+        # nothing to close, nobody else holds the file, and delay=True leaves it
+        # closed for the write below to reopen.
+        self.doRollover()
+
+    def _close_stream(self) -> None:
+        stream = self.stream
+        self.stream = None
+        if stream is None:
+            return
+        # StreamHandler.emit already flushed the record to the OS, so a failure
+        # here cannot mean a lost line and must not be reported as one.
+        with contextlib.suppress(OSError):
+            stream.close()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        locked = self._acquire()
+        try:
+            if not locked:
+                self._warn_unlocked(record)
+            try:
+                self._rollover_if_full()
+            except OSError:
+                # Rotation is bounded growth; the record is the point. Report
+                # the rotation failure through the stdlib's own channel and
+                # still write the line -- unlike the stdlib, which drops it.
+                self.handleError(record)
+            logging.FileHandler.emit(self, record)
+        finally:
+            self._close_stream()
+            if locked:
+                self._release()
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            fd, self._lock_fd = self._lock_fd, None
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+
+
 def get_logger(name: str) -> logging.Logger:
     """Return the ``magent.<name>`` logger, attaching a rotating file
     handler under LOG_DIR on first use. Idempotent -- repeat calls return the
     same logger without stacking handlers. Never raises: if LOG_DIR can't be
     created (read-only home, permissions), the logger falls back to a
     NullHandler and stays otherwise usable.
+
+    Safe to call for the same ``name`` from several magent processes at once --
+    see ``_SharedRotatingFileHandler``.
     """
     logger = logging.getLogger(f"magent.{name}")
     if getattr(logger, _CONFIGURED_ATTR, False):
@@ -75,11 +299,10 @@ def get_logger(name: str) -> logging.Logger:
     handler: logging.Handler
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        handler = logging.handlers.RotatingFileHandler(
+        handler = _SharedRotatingFileHandler(
             LOG_DIR / f"{name}.log",
-            maxBytes=_MAX_BYTES,
-            backupCount=_BACKUP_COUNT,
-            delay=True,
+            max_bytes=_MAX_BYTES,
+            backup_count=_BACKUP_COUNT,
             encoding="utf-8",
         )
         handler.setFormatter(logging.Formatter(_FORMAT))

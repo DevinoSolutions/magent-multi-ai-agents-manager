@@ -47,6 +47,77 @@ class TestGetLogger:
         logger.info("must not raise")  # best-effort: still usable
 
 
+class TestSharedRotatingHandler:
+    """The handler several magent processes point at the same file.
+
+    The end-to-end proof is ``tests/e2e/test_log_multiprocess.py`` (real
+    processes, real contention). These are the cheap, all-OS pins on the
+    properties that make it work -- and on the one thing consumers can see.
+    """
+
+    def test_no_file_is_held_open_between_records(self):
+        """The invariant the whole design rests on: nothing holds the log
+        across records, so another process's rollover rename can never be
+        blocked (WinError 32) and no two writers can resolve the same offset."""
+        logger = log.get_logger("shared")
+        handler = logger.handlers[0]
+        logger.info("first")
+        assert handler.stream is None
+        logger.info("second")
+        assert handler.stream is None
+        text = (log.LOG_DIR / "shared.log").read_text(encoding="utf-8")
+        assert "first" in text
+        assert "second" in text
+
+    def test_lock_sidecar_is_not_mistaken_for_a_rotated_log(self):
+        """Consumers enumerate rotated files with ``glob("<name>.log*")`` --
+        tests/e2e/test_soak.py::_assert_logs_bounded is one, a shell is
+        another. The interlock's sidecar must sit outside that glob."""
+        log.get_logger("shared").info("touch")
+        assert (log.LOG_DIR / "shared.lock").exists()
+        assert sorted(p.name for p in log.LOG_DIR.glob("shared.log*")) == ["shared.log"]
+
+    def test_rotation_still_happens_and_stays_bounded(self, monkeypatch):
+        monkeypatch.setattr(log, "_MAX_BYTES", 2_000)
+        monkeypatch.setattr(log, "_BACKUP_COUNT", 2)
+        log.reset_logging()
+        logger = log.get_logger("shared")
+        for i in range(200):
+            logger.info("record %03d %s", i, "z" * 60)
+
+        rotated = sorted(p.name for p in log.LOG_DIR.glob("shared.log*"))
+        assert rotated == ["shared.log", "shared.log.1", "shared.log.2"]
+        for name in rotated:
+            size = (log.LOG_DIR / name).stat().st_size
+            # maxBytes plus at most the one record that crossed the threshold.
+            assert size <= 2_000 + 512, f"{name} is {size} bytes"
+
+    def test_close_releases_the_lock_file(self):
+        """A leaked lock descriptor would make the sidecar undeletable on
+        Windows -- and would outlive reset_logging() in the test suite."""
+        log.get_logger("shared").info("touch")
+        lock = log.LOG_DIR / "shared.lock"
+        log.reset_logging()
+        lock.unlink()  # PermissionError on Windows if the fd is still open
+        assert not lock.exists()
+
+    def test_unobtainable_lock_still_writes_the_record_and_says_so(self, monkeypatch):
+        """Degrading to an unlocked write keeps the record -- losing it is the
+        defect this handler exists to remove -- but must never be silent."""
+        logger = log.get_logger("shared")
+        handler = logger.handlers[0]
+        monkeypatch.setattr(handler, "_acquire", lambda: False)
+
+        logger.info("degraded one")
+        logger.info("degraded two")
+
+        text = (log.LOG_DIR / "shared.log").read_text(encoding="utf-8")
+        assert "degraded one" in text
+        assert "degraded two" in text
+        assert text.count("log interlock unavailable") == 1  # once per process
+        assert "WARNING" in text
+
+
 class TestLogLevelFromEnv:
     """P2-01: get_logger honors MAGENT_LOG_LEVEL. It was validated in the
     env schema and documented in .env.example but never applied -- log.py
