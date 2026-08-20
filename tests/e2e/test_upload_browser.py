@@ -27,10 +27,12 @@ shim is a POSIX construct.
 from __future__ import annotations
 
 import base64
+import contextlib
 import http.client
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -92,13 +94,29 @@ def _health_ok(port: int) -> bool:
         return False
 
 
+# How long the stalled-paste fixture's multiplexer sits on a `send-keys`.
+#
+# It only has to be comfortably past the server's answer deadline
+# (``upload_server.INJECT_GRACE_S``, 3 s) so the reply is the early, honest
+# ``inject_pending`` one -- and comfortably under its give-up bound
+# (``INJECT_TIMEOUT_S``, 60 s) so the paste genuinely COMPLETES afterwards.
+# That is the production condition being reproduced: slow, not broken.
+_INJECT_STALL_S = 8.0
+
+# Ceiling for waiting on the page to render an upload outcome. The reply itself
+# is due one grace period (3 s) after the POST; the rest is browser + CI slack.
+# Bounded on purpose: an unbounded wait here does not fail the test, it burns
+# the job's timeout-minutes and gets the whole job cancelled.
+_OUTCOME_TIMEOUT_MS = 25_000
+
+
 class _BrowserServe:
     """A real ``magent serve`` on loopback, backed by a real tmux session
     reachable through a ``tmux``->``psmux`` symlink, fully isolated in tmp."""
 
     TITLE = "browserproj"  # session_name(title) == title (no . : space)
 
-    def __init__(self, tmp_path: Path) -> None:
+    def __init__(self, tmp_path: Path, inject_stall_s: float = 0.0) -> None:
         self.unique = uuid.uuid4().hex[:8]
         self.home = tmp_path / "home"
         self.home.mkdir()
@@ -116,7 +134,7 @@ class _BrowserServe:
             pytest.skip("tmux not installed (needed as the psmux shim)")
         self.bindir = tmp_path / "bin"
         self.bindir.mkdir()
-        os.symlink(tmux, self.bindir / "psmux")
+        self._install_psmux(tmux, inject_stall_s)
 
         self.env = self._child_env()
         self.port = _free_port()
@@ -163,6 +181,33 @@ class _BrowserServe:
             env=self.env,
             cwd=str(self.work),
         )
+
+    def _install_psmux(self, tmux: str, stall_s: float) -> None:
+        """Put a ``psmux`` on PATH that IS real tmux.
+
+        With no stall that is the plain symlink this tier has always used. With
+        one it becomes a two-line ``sh`` wrapper that sleeps before a
+        ``send-keys`` and then execs the SAME real tmux, so the paste is merely
+        slow and still lands -- the measured production condition (a control
+        command against a busy or unfocused terminal has been timed from 3 s to
+        past 70 s), and the only one that makes ``/upload`` answer
+        ``inject_pending``. Every other subcommand -- the session probes, the
+        status-line flashes, teardown's ``kill-server`` -- goes straight
+        through, so nothing but the paste is delayed and the multiplexer under
+        test stays a real one.
+        """
+        link = self.bindir / "psmux"
+        if not stall_s:
+            os.symlink(tmux, link)
+            return
+        link.write_text(
+            "#!/bin/sh\n"
+            'for a in "$@"; do\n'
+            f'  if [ "$a" = "send-keys" ]; then sleep {stall_s:g}; break; fi\n'
+            "done\n"
+            f'exec {shlex.quote(tmux)} "$@"\n'
+        )
+        link.chmod(0o755)
 
     def _child_env(self) -> dict[str, str]:
         env = {
@@ -255,14 +300,35 @@ def serve(tmp_path):
 
 
 @pytest.fixture
-def page(serve):
+def stalled_serve(tmp_path):
+    """The same fleet, with a multiplexer that stalls the PASTE (only)."""
+    srv = _BrowserServe(tmp_path, inject_stall_s=_INJECT_STALL_S)
+    srv.wait_ready()
+    yield srv
+    leftovers = srv.teardown()
+    assert not leftovers, f"cleanup left real resources behind: {leftovers}"
+
+
+@contextlib.contextmanager
+def _chromium_page():
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        pg = browser.new_page()
         try:
-            yield pg
+            yield browser.new_page()
         finally:
             browser.close()
+
+
+@pytest.fixture
+def page(serve):
+    with _chromium_page() as pg:
+        yield pg
+
+
+@pytest.fixture
+def stalled_page(stalled_serve):
+    with _chromium_page() as pg:
+        yield pg
 
 
 def _make_png(path: Path) -> bytes:
@@ -304,6 +370,11 @@ def test_real_browser_upload_lands_byte_identical_file(serve, page, tmp_path):
     # with a live tmux session the injection also succeeds ("pasted into ...").
     expect(page.locator("#drop")).to_have_class(re.compile(r"\bok\b"))
     expect(page.locator("#toast")).to_contain_text("sent")
+    # ...and a paste that lands in time is reported as the plain success it is:
+    # the pending marker belongs to a stalled multiplexer only (see
+    # test_a_stalled_paste_reads_as_saved_and_pending_never_as_a_failure).
+    expect(page.locator("#drop")).not_to_have_class(re.compile(r"\bpend\b"))
+    expect(page.locator("#toast")).not_to_contain_text("pending")
 
     # The product wrote the bytes to the redirected uploads dir; compare exactly.
     landed = _wait_until(
@@ -377,3 +448,93 @@ def test_clipboard_paste_upload_confirms_and_lands_byte_identical(
     assert "paste-" in landed[0].name and landed[0].name.endswith(".png"), landed[
         0
     ].name
+
+
+# Every class/text the result surfaces ever took, recorded from inside the page.
+#
+# The page RESETS the drop zone two seconds after an outcome, so sampling it
+# from Python is a race against that timer -- and the question being asked here
+# is not "what does it show now" but "did it ever show a failure". A
+# MutationObserver installed before the upload answers exactly that, and it
+# cannot miss a state that existed for one frame.
+_RECORDER = """() => {
+  window.__seen = [];
+  const drop = document.getElementById('drop');
+  const label = document.getElementById('drop-label');
+  const toast = document.getElementById('toast');
+  const snap = () => window.__seen.push({
+    drop: drop.className, label: label.textContent,
+    toast: toast.className, toastText: toast.textContent,
+  });
+  snap();
+  const obs = new MutationObserver(snap);
+  const how = {attributes: true, childList: true, subtree: true,
+               characterData: true};
+  obs.observe(drop, how);
+  obs.observe(toast, how);
+}"""
+
+
+def test_a_stalled_paste_reads_as_saved_and_pending_never_as_a_failure(
+    stalled_serve, stalled_page, tmp_path
+):
+    """The mobile half of "the upload reply is not hostage to the paste".
+
+    A real browser, a real ``magent serve``, and a real multiplexer that sits on
+    ``send-keys`` for longer than the server's answer deadline. The reply is
+    therefore the honest early one -- ``ok:true, injected:false,
+    inject_pending:true`` -- and this is the exact case the page used to render
+    from ``d.injected`` alone, telling a phone the upload did not work about a
+    screenshot that was already on disk and about to paste.
+
+    Three things are asserted, and they are the three halves of that bug:
+    the page says PENDING (not "sent", not "failed"), it never once tints the
+    result as an error, and the bytes on disk are the bytes that were sent.
+    """
+    png_path = tmp_path / "slow.png"
+    expected = _make_png(png_path)
+
+    stalled_page.goto(stalled_serve.url)
+    expect(stalled_page).to_have_title("magent upload")
+    stalled_page.locator(".pill", has_text=stalled_serve.TITLE).click()
+    stalled_page.evaluate(_RECORDER)
+
+    stalled_page.set_input_files("#file", str(png_path))
+
+    # The toast is the one surface the page does NOT reset, so it is what the
+    # wait hangs on -- bounded, and generously past the 3 s grace.
+    expect(stalled_page.locator("#toast")).to_contain_text(
+        "paste still pending", timeout=_OUTCOME_TIMEOUT_MS
+    )
+    expect(stalled_page.locator("#toast")).to_have_class(re.compile(r"\bok\b"))
+
+    seen = stalled_page.evaluate("() => window.__seen")
+    assert seen, "the mutation recorder captured nothing"
+    # Never a failure, at any point in the sequence: red on either surface is
+    # what sends a user hunting for a screenshot that is safely stored.
+    for state in seen:
+        assert "err" not in state["drop"].split(), f"drop went red: {seen}"
+        assert "err" not in state["toast"].split(), f"toast went red: {seen}"
+        assert "failed" not in state["label"].lower(), seen
+        assert "failed" not in state["toastText"].lower(), seen
+    # ...and it really rendered the pending state, healthily tinted.
+    pending = [s for s in seen if "pend" in s["drop"].split()]
+    assert pending, f"the drop zone never showed the pending state: {seen}"
+    assert all("ok" in s["drop"].split() for s in pending), pending
+    assert any("pending" in s["label"] for s in pending), pending
+    # The claim the page must NOT make while psmux is still trying.
+    assert not any("pasted into" in s["label"] for s in seen), seen
+
+    landed = _wait_until(
+        lambda: (
+            sorted(stalled_serve.uploads_dir.glob("*"))
+            if stalled_serve.uploads_dir.is_dir()
+            else []
+        ),
+        timeout=10,
+    )
+    assert landed, f"no file landed in {stalled_serve.uploads_dir}"
+    assert len(landed) == 1, f"expected exactly one upload, got {landed}"
+    assert landed[0].read_bytes() == expected, (
+        "the image behind a stalled paste is not byte-identical on disk"
+    )
