@@ -194,6 +194,9 @@ body{font-family:-apple-system,system-ui,sans-serif;background:#1e1e2e;color:#cd
 .drop.ready{border-color:#89b4fa;color:#89b4fa;border-style:solid}
 .drop.busy{border-color:#f9e2af;color:#f9e2af}
 .drop.ok{border-color:#a6e3a1;color:#a6e3a1}
+/* Paste still pending: the healthy tint, but unfinished. Green says the file
+   is safe (it is, on disk); the dashed edge says psmux has not answered yet. */
+.drop.pend{border-style:dashed}
 .drop.err{border-color:#f38ba8;color:#f38ba8}
 .drop input{position:absolute;inset:0;opacity:0;cursor:pointer;font-size:0}
 .paste{display:none;margin-bottom:8px;border:1.5px solid #45475a;border-radius:10px;
@@ -271,6 +274,28 @@ const label = document.getElementById('drop-label');
 const input = document.getElementById('file');
 const toast = document.getElementById('toast');
 
+// The upload reply carries THREE paste states, not two (DESIGN.md "The upload
+// reply is not hostage to the paste"):
+//
+//   injected:true                    -> it is in the agent's pane;
+//   inject_pending:true              -> the FILE IS ON DISK and psmux has not
+//                                       answered yet -- the reply is early,
+//                                       not wrong;
+//   neither                          -> no paste happened (psmux refused it,
+//                                       or there is no psmux at all).
+//
+// Only `ok:false` is a failed upload. Reading `injected` alone, as this page
+// used to, collapses the middle state into the last one and shows a
+// failure-looking result about a screenshot that is safely stored and about to
+// paste -- exactly the lie the status line was fixed for. The pending wording
+// mirrors altv.OUTCOME_REASONS['inject-pending'] (a unit test pins the two
+// together) so the phone and the status bar say the same thing, and it keeps
+// the healthy tint for the same reason the bar does: red reads as "your
+// screenshot is gone".
+const PEND_LABEL = 'saved - paste still pending';
+const PEND_NOTE = ' saved - psmux is slow, paste still pending';
+function isPending(d) { return !!(d && !d.injected && d.inject_pending); }
+
 pills.forEach(p => p.addEventListener('click', () => {
   pills.forEach(b => b.classList.remove('on'));
   p.classList.add('on');
@@ -306,10 +331,12 @@ input.addEventListener('change', async () => {
     const r = await fetch('/upload', {method:'POST', body:form});
     const d = await r.json();
     if (d.ok) {
-      drop.className = 'drop ok';
-      label.textContent = d.injected ? 'pasted into ' + proj : file.name;
-      toast.textContent = file.name + ' sent';
-      toast.className = 'toast ok';
+      const pending = isPending(d);
+      drop.className = pending ? 'drop ok pend' : 'drop ok';
+      label.textContent = d.injected ? 'pasted into ' + proj
+        : pending ? PEND_LABEL : file.name;
+      toast.textContent = file.name + (pending ? PEND_NOTE : ' sent');
+      toast.className = pending ? 'toast ok pend' : 'toast ok';
     } else {
       drop.className = 'drop err';
       label.textContent = d.error || 'failed';
@@ -436,11 +463,13 @@ psend.addEventListener('click', () => {
     try { d = JSON.parse(xhr.responseText); } catch (e) {}
     if (xhr.status === 200 && d.ok) {
       pfill.style.width = '100%';
-      psend.className = 'ok';
-      psend.textContent = (d.injected ? 'Pasted into ' + proj : 'Sent') + ' ✓';
-      toast.textContent = staged.name
-        + (d.injected ? ' pasted into ' + proj : ' sent');
-      toast.className = 'toast ok';
+      const pending = isPending(d);
+      psend.className = pending ? 'ok pend' : 'ok';
+      psend.textContent = pending ? 'Saved, pasting...'
+        : (d.injected ? 'Pasted into ' + proj : 'Sent') + ' ✓';
+      toast.textContent = staged.name + (pending ? PEND_NOTE
+        : (d.injected ? ' pasted into ' + proj : ' sent'));
+      toast.className = pending ? 'toast ok pend' : 'toast ok';
       setTimeout(clearStage, 2500);
     } else {
       pasteFail(d.error || 'upload failed');
