@@ -18,6 +18,11 @@ detached ``tmux`` session on a private socket. That makes session discovery,
 validation, AND injection genuinely exercise a live multiplexer — the file
 transfer, the deliverable under test, is 100% real.
 
+One test needs that multiplexer to be SLOW rather than fast, to reach the
+reply's third paste state (``inject_pending``): there the symlink becomes a
+one-line ``sh`` wrapper that sleeps before a ``send-keys`` and then execs the
+same real tmux. See ``_BrowserServe._install_psmux``.
+
 CI-only by design (same posture as the monitor-lab tier): gated on
 ``MDTEST_BROWSER=1`` and a present Playwright/chromium, so a dev machine that
 lacks them skips the module cleanly. Linux-only in practice — the tmux-as-psmux
