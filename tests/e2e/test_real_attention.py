@@ -125,8 +125,10 @@ def _write_state_via_real_writer(env: dict[str, str], cwd: str, state: str) -> N
         [
             sys.executable,
             "-c",
-            "import sys; from magent import agent_state; "
-            "agent_state.write_state(sys.argv[1], sys.argv[2])",
+            (
+                "import sys; from magent import agent_state; "
+                "agent_state.write_state(sys.argv[1], sys.argv[2])"
+            ),
             cwd,
             state,
         ],

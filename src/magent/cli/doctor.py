@@ -105,8 +105,10 @@ def _check_terminal() -> CheckResult:
         if not wt:
             return (
                 FAIL,
-                "Windows Terminal (wt) not on PATH — nothing can launch. "
-                f"Install: {WT_INSTALL_HINT}",
+                (
+                    "Windows Terminal (wt) not on PATH — nothing can launch. "
+                    f"Install: {WT_INSTALL_HINT}"
+                ),
             )
         if get_platform().supports_psmux() and not psmux:
             return (WARN, "psmux not found — `up`/`attach` sessions unavailable")
@@ -170,9 +172,11 @@ def _check_psmux_wedge() -> CheckResult:
     if probe.timed_out:
         return (
             FAIL,
-            f"psmux answered nothing in {probe.elapsed_s:.0f}s"
-            f"{_resident_psmux()}: the control plane is WEDGED machine-wide.\n"
-            f"{WEDGE_REPAIR_HINT}",
+            (
+                f"psmux answered nothing in {probe.elapsed_s:.0f}s"
+                f"{_resident_psmux()}: the control plane is WEDGED machine-wide.\n"
+                f"{WEDGE_REPAIR_HINT}"
+            ),
         )
     if not probe.responsive:
         return (WARN, "psmux is installed but would not run (see the terminal check)")
@@ -252,15 +256,19 @@ def _check_hotkey(cfg: MagentConfig | None) -> CheckResult:
     if state == "dead":
         return (
             FAIL,
-            "upload server is running but no Alt+V listener — pasting an image "
-            f"into a magent: window does nothing. Repair: {LISTENER_REPAIR_HINT}",
+            (
+                "upload server is running but no Alt+V listener — pasting an image "
+                f"into a magent: window does nothing. Repair: {LISTENER_REPAIR_HINT}"
+            ),
         )
     if state == "stale":
         return (
             FAIL,
-            "Alt+V listener process is alive but its heartbeat expired — its "
-            "message loop is wedged and key presses are being dropped. "
-            f"Repair: {LISTENER_REPAIR_HINT}",
+            (
+                "Alt+V listener process is alive but its heartbeat expired — its "
+                "message loop is wedged and key presses are being dropped. "
+                f"Repair: {LISTENER_REPAIR_HINT}"
+            ),
         )
     from magent.upload_server import (
         supervision_enabled,  # heavy subsystem: in-body per policy
@@ -320,9 +328,11 @@ def _check_sentry() -> CheckResult:
     if not sdk_installed():
         return (
             WARN,
-            "MAGENT_SENTRY_DSN is set but sentry-sdk is missing — error "
-            "reporting is OFF. sentry-sdk ships with magent, so this "
-            f"install looks broken. Repair: {SENTRY_INSTALL_HINT}",
+            (
+                "MAGENT_SENTRY_DSN is set but sentry-sdk is missing — error "
+                "reporting is OFF. sentry-sdk ships with magent, so this "
+                f"install looks broken. Repair: {SENTRY_INSTALL_HINT}"
+            ),
         )
     return (OK, "error reporting active (DSN set, sentry-sdk installed)")
 
