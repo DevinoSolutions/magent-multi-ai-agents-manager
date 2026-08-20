@@ -1460,6 +1460,25 @@ class TestDecorateSessionsAsync:
         assert psmux.decorate_sessions_async(["api"]) == []
         assert len(_SpawnRecorder.spawned) == fired
 
+    def test_a_stamp_a_hair_in_the_future_is_still_fresh(self):
+        # Not a hypothetical: this test's sibling above used to flake on
+        # windows-latest/py3.10+3.11 with `assert ['api'] == []` because the
+        # throttle read its own fresh stamp as future-dated. The stamp's age is
+        # a difference between two readings of the same wall clock (`time.time()`
+        # vs a filesystem mtime), and before CPython 3.13 -- where Windows'
+        # `time.time()` was GetSystemTimeAsFileTime, 15.625ms granular -- both
+        # reads land in the SAME tick and the answer is decided by float
+        # rounding: `os.stat` builds st_mtime as `sec + 1e-9*nsec`, `time.time()`
+        # divides an integer nanosecond count, and the two disagree by one ULP.
+        # Measured on this box under 3.10: 10.2% of 3000 create-then-read cycles
+        # came out at -2.384185791015625e-07s. Under 3.13 (precise clock): 0%.
+        psmux.decorate_sessions_async(["api"])
+        fired = len(_SpawnRecorder.spawned)
+        ahead = time.time() + psmux._STAMP_FUTURE_SLOP_S / 2
+        os.utime(psmux.DECOR_STAMP, (ahead, ahead))
+        assert psmux.decorate_sessions_async(["api"]) == []
+        assert len(_SpawnRecorder.spawned) == fired
+
     def test_a_stale_stamp_fires_again(self, monkeypatch):
         psmux.decorate_sessions_async(["api"])
         fired = len(_SpawnRecorder.spawned)
@@ -1478,6 +1497,8 @@ class TestDecorateSessionsAsync:
         ahead = time.time() + 10 * psmux.DECOR_TTL_S
         os.utime(psmux.DECOR_STAMP, (ahead, ahead))
         # A bad clock must not be able to switch decoration off indefinitely.
+        # "Ahead" here has to stay well past `_STAMP_FUTURE_SLOP_S` -- inside
+        # that slop a future date is measurement noise, not a bad clock.
         assert psmux.decorate_sessions_async(["api"]) == ["api"]
 
     def test_an_unstampable_home_still_decorates(self, monkeypatch):
