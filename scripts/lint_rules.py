@@ -75,6 +75,7 @@ MD002_ALLOW = {
     "src/magent/cli/attach.py": "reports the sys.platform value in JSON status (data, not a gate)",
     "src/magent/env.py": "host-env readers (config_base, vscode_storage_base) select per-OS default directories",
     "src/magent/lockfile.py": "msvcrt.locking (Windows) vs fcntl.flock (Unix) — each OS has a different locking API",
+    "src/magent/log.py": "msvcrt.locking (Windows) vs fcntl.flock (Unix) for the shared-log interlock — same per-OS locking API split as lockfile.py",
     "src/magent/psmux.py": "psmux binary fallback path is per-OS (LOCALAPPDATA on Windows)",
 }
 
