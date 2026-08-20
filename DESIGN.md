@@ -1189,6 +1189,26 @@ where the pasted path is its own proof. The listener's closing message is
 already terminal and already true: the image is saved, and the paste is
 pending.
 
+**The phone is the other client, and it was the last one still lying**
+(2026-08-19). `altv` read all three states from the day the reply grew them;
+the mobile upload page's JS still read `d.injected` alone, so the same slow
+paste that the status line now narrates honestly rendered on a phone as a
+failure-looking result — about a file already on disk. It reads all three now,
+in the same vocabulary: `injected` → "pasted into <project>", `inject_pending`
+→ "saved - psmux is slow, paste still pending" **in the success tint** (a
+`pend` marker class dashes the border; it never takes the error red), and
+neither → the plain "sent" it has always been. That last one stays a success
+deliberately: with no psmux installed, or with inject off, both flags are false
+and nothing failed — a page that called that state a failure would be the same
+lie pointed at a different user. The only failure on that page is `ok:false`.
+
+The proof is a real browser against a real multiplexer that stalls only
+`send-keys`, past `INJECT_GRACE_S` (`tests/e2e/test_upload_browser.py`,
+`stalled_serve`). Its assertions read every class the result surfaces ever
+took — recorded by an in-page `MutationObserver` installed before the upload —
+because the page resets the drop zone two seconds after an outcome, and the
+question is not what it shows now but whether it ever showed red.
+
 ### Doctor names the wedge, and the probe that finds it cannot join it (2026-08-19)
 
 Twice on the live 40-session host: every psmux control command — `has-session`,
