@@ -103,10 +103,9 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
         home = tmp_path.parent / f"{tmp_path.name}-home"
         home.mkdir(exist_ok=True)
         drive, tail = os.path.splitdrive(str(home))
-        monkeypatch.setenv("HOME", str(home))
-        monkeypatch.setenv("USERPROFILE", str(home))
-        monkeypatch.setenv("HOMEDRIVE", drive)
-        monkeypatch.setenv("HOMEPATH", tail or os.sep)
+        values = (str(home), str(home), drive, tail or os.sep)
+        for var, value in zip(_HOME_VARS, values, strict=True):
+            monkeypatch.setenv(var, value)
         assert Path.home() == home, (
             f"HOME redirect did not take: Path.home() is {Path.home()}, wanted {home}"
         )
