@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -91,6 +92,25 @@ class TestSharedRotatingHandler:
             size = (log.LOG_DIR / name).stat().st_size
             # maxBytes plus at most the one record that crossed the threshold.
             assert size <= 2_000 + 512, f"{name} is {size} bytes"
+
+    def test_a_faked_sys_platform_cannot_break_logging(self, monkeypatch):
+        """Tests monkeypatch ``sys.platform`` to drive the win32 branches of
+        platform-specific code (`test_upload_server.py`'s taskkill path is one),
+        and that code logs. A logger that re-read ``sys.platform`` per record
+        would try to `import msvcrt` on Linux and take down the very call it
+        exists to observe -- which is exactly what happened on this change's
+        first CI run. The locking primitive is bound once at import instead."""
+        logger = log.get_logger("shared")
+        # Resolved BEFORE the fakes: monkeypatch.undo() would also revert
+        # conftest's LOG_DIR redirect and send this read at the real ~/.magent.
+        log_file = log.LOG_DIR / "shared.log"
+        for faked in ("win32", "linux", "darwin"):
+            monkeypatch.setattr(sys, "platform", faked)
+            logger.info("logged while sys.platform said %s", faked)
+
+        text = log_file.read_text(encoding="utf-8")
+        for faked in ("win32", "linux", "darwin"):
+            assert f"sys.platform said {faked}" in text
 
     def test_close_releases_the_lock_file(self):
         """A leaked lock descriptor would make the sidecar undeletable on

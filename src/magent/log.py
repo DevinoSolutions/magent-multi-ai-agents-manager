@@ -34,6 +34,43 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import threading
 
+# The shared-log interlock's primitive, bound ONCE at import: msvcrt on Windows,
+# flock elsewhere -- the same per-OS locking-API split lockfile.py makes.
+#
+# Bound at import, not per call, because the OS does not change while a process
+# runs but ``sys.platform`` DOES: tests monkeypatch it to drive the win32
+# branches of platform-specific code (`test_upload_server.py`'s taskkill path is
+# one), and a logger that re-read it per record would try to `import msvcrt` on
+# Linux and take down the very call it was asked to observe. It did, on the
+# first CI run of this change. Binding here also makes the hot path one name
+# lookup instead of a comparison plus an import.
+if sys.platform == "win32":
+    import msvcrt
+
+    def _lock_exclusive(fd: int) -> None:
+        """Take the exclusive lock, or raise OSError immediately.
+
+        ``msvcrt.locking`` locks a byte range from the CURRENT offset, so the
+        seek is load-bearing, not decoration.
+        """
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+
+    def _unlock(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+else:
+    import fcntl
+
+    def _lock_exclusive(fd: int) -> None:
+        """Take the exclusive lock, or raise OSError immediately."""
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 LOG_DIR = Path.home() / ".magent" / "logs"
 HEARTBEAT_DIR = Path.home() / ".magent"
 
@@ -78,39 +115,6 @@ def _configured_level() -> int:
         return logging.INFO
     value = getattr(logging, level)
     return value if isinstance(value, int) else logging.INFO
-
-
-def _lock_exclusive(fd: int) -> None:
-    """Take the OS's exclusive lock on ``fd``, or raise OSError immediately.
-
-    Mirrors ``lockfile.exclusive_lock``'s platform split (msvcrt on Windows,
-    flock elsewhere) rather than reusing it: that helper is a one-shot
-    non-blocking daemon guard that unlinks the file on release, which is the
-    opposite of what a lock re-taken thousands of times per process needs.
-    ``msvcrt.locking`` locks a byte range from the CURRENT offset, so the seek
-    is load-bearing, not decoration.
-    """
-    if sys.platform == "win32":
-        import msvcrt
-
-        os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-    else:
-        import fcntl
-
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-
-def _unlock(fd: int) -> None:
-    if sys.platform == "win32":
-        import msvcrt
-
-        os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-    else:
-        import fcntl
-
-        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 class _SharedRotatingFileHandler(logging.handlers.RotatingFileHandler):
