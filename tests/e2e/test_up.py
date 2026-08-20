@@ -10,6 +10,14 @@ from magent.sessions.claude import encode_claude_project_path
 pytestmark = pytest.mark.e2e
 
 
+@pytest.fixture
+def home(tmp_path):
+    """A redirected home for every magent child this module spawns."""
+    h = tmp_path / "home"
+    h.mkdir()
+    return h
+
+
 def _write_cfg(tmp_path, projects, settings=None):
     cfg = tmp_path / "magent.config.json"
     data = {"projects": projects}
@@ -19,7 +27,7 @@ def _write_cfg(tmp_path, projects, settings=None):
     return cfg
 
 
-def _run(cfg, *args, home=None):
+def _child_env(home):
     env = dict(os.environ)
     # `up` can start a detached upload server, which supervises an Alt+V
     # listener into existence -- and that listener installs a SYSTEM-WIDE
@@ -28,21 +36,37 @@ def _run(cfg, *args, home=None):
     # ...and `attention -d` now supervises `magent serve` the same way, so a
     # test daemon would otherwise start a REAL upload server on this machine.
     env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
-    if home is not None:
-        # Redirect the child's HOME so the claude session store it probes is a
-        # fixture, never the developer's real ~/.claude.
-        env["HOME"] = str(home)
-        env["USERPROFILE"] = str(home)  # what Path.home() reads on Windows
+    # Redirect the child's home so every ~/.magent artifact it writes -- and the
+    # ~/.claude session store it probes -- is a fixture. USERPROFILE (plus the
+    # HOMEDRIVE/HOMEPATH fallback) is what Path.home() actually reads on
+    # Windows; HOME alone would leave the child pointed at the real home.
+    home.mkdir(parents=True, exist_ok=True)
+    home_s = str(home)
+    drive, tail = os.path.splitdrive(home_s)
+    env["HOME"] = home_s
+    env["USERPROFILE"] = home_s
+    env["HOMEDRIVE"] = drive
+    env["HOMEPATH"] = tail or "\\"
+    return env
+
+
+def _run(cfg, *args, home):
+    """Drive a real `magent` child. `home` is MANDATORY, and deliberately has
+    no default: `down` stops sessions, stops the upload server, kills the Alt+V
+    listener and forwards the shutdown over ssh to whatever host is recorded in
+    ``~/.magent/last-attach-host``. A run of this helper that inherited the
+    developer's home did all four -- and hung 124s on the ssh forward -- because
+    `home` used to default to None and TestStatusDown never passed one."""
     return subprocess.run(
         [sys.executable, "-m", "magent", "--config", str(cfg), *args],
         capture_output=True,
         text=True,
-        env=env,
+        env=_child_env(home),
     )
 
 
 class TestUpJson:
-    def test_lists_eligible_only(self, tmp_path):
+    def test_lists_eligible_only(self, tmp_path, home):
         for name in ("api", "web", "docs"):
             (tmp_path / name).mkdir()
         cfg = _write_cfg(
@@ -59,7 +83,7 @@ class TestUpJson:
             ],
             settings={"uploadPort": 9091},
         )
-        r = _run(cfg, "up", "--json")
+        r = _run(cfg, "up", "--json", home=home)
         assert r.returncode == 0, r.stderr
         data = json.loads(r.stdout.strip().splitlines()[-1])
         # P3-04: ok-envelope; P3-03: snake_case keys (upload_server/upload_port).
@@ -78,7 +102,7 @@ class TestUpJson:
         api = next(p for p in data["projects"] if p["name"] == "api")
         assert api["cmd"] == "claude"
 
-    def test_name_display_vs_session_split(self, tmp_path):
+    def test_name_display_vs_session_split(self, tmp_path, home):
         # P3-01: a dotted title surfaces as `name` verbatim but `session`
         # (the psmux socket id) is sanitized -- so a consumer can correlate by
         # display name across up/status while the wire keeps the safe id.
@@ -87,7 +111,7 @@ class TestUpJson:
             tmp_path,
             [{"path": str(tmp_path / "svc"), "tool": "claude", "title": "my.api"}],
         )
-        r = _run(cfg, "up", "--json")
+        r = _run(cfg, "up", "--json", home=home)
         assert r.returncode == 0, r.stderr
         data = json.loads(r.stdout.strip().splitlines()[-1])
         proj = data["projects"][0]
@@ -96,14 +120,14 @@ class TestUpJson:
         assert data["down"][0]["name"] == "my.api"
         assert data["down"][0]["session"] == "my-api"
 
-    def test_bad_config_errors_as_json(self, tmp_path):
+    def test_bad_config_errors_as_json(self, tmp_path, home):
         cfg = tmp_path / "bad.json"
         cfg.write_text("not json{")
-        r = _run(cfg, "up", "--json")
+        r = _run(cfg, "up", "--json", home=home)
         assert r.returncode != 0
         assert "error" in r.stdout.lower()
 
-    def test_group_filter(self, tmp_path):
+    def test_group_filter(self, tmp_path, home):
         for name in ("a", "b", "c"):
             (tmp_path / name).mkdir()
         cfg = _write_cfg(
@@ -114,7 +138,7 @@ class TestUpJson:
                 {"path": str(tmp_path / "c"), "tool": "claude", "group": "X"},
             ],
         )
-        r = _run(cfg, "up", "--json", "-g", "X")
+        r = _run(cfg, "up", "--json", "-g", "X", home=home)
         assert r.returncode == 0, r.stderr
         data = json.loads(r.stdout.strip().splitlines()[-1])
         assert sorted(p["name"] for p in data["projects"]) == ["a", "c"]
@@ -142,7 +166,7 @@ class TestServeEnsure:
         assert r.returncode == 0
         assert "--ensure" in r.stdout
 
-    def test_ensure_returns_immediately_when_already_listening(self):
+    def test_ensure_returns_immediately_when_already_listening(self, home):
         import socket
 
         # Hold a port so the ensure probe finds it listening and spawns nothing.
@@ -152,6 +176,10 @@ class TestServeEnsure:
         port = srv.getsockname()[1]
         try:
             # Must NOT block on a foreground server -- a short timeout proves it.
+            # The redirected env matters even though the probe short-circuits:
+            # the day `--ensure` stops short-circuiting, an un-redirected child
+            # is a REAL detached server plus a system-wide keyboard hook on the
+            # machine running the suite.
             r = subprocess.run(
                 [
                     sys.executable,
@@ -165,6 +193,7 @@ class TestServeEnsure:
                 capture_output=True,
                 text=True,
                 timeout=20,
+                env=_child_env(home),
             )
             assert r.returncode == 0, r.stderr
             assert "ensured" in r.stdout.lower()
@@ -208,24 +237,24 @@ class TestUpJsonFreshStart:
 
 
 class TestStatusDown:
-    def test_status_runs(self, tmp_path):
+    def test_status_runs(self, tmp_path, home):
         (tmp_path / "api").mkdir()
         cfg = _write_cfg(tmp_path, [{"path": str(tmp_path / "api"), "tool": "claude"}])
-        r = _run(cfg, "status")
+        r = _run(cfg, "status", home=home)
         assert r.returncode == 0, r.stderr
         assert "Status" in r.stdout
         assert "running" in r.stdout
 
-    def test_down_all_no_sessions(self, tmp_path):
+    def test_down_all_no_sessions(self, tmp_path, home):
         (tmp_path / "api").mkdir()
         cfg = _write_cfg(tmp_path, [{"path": str(tmp_path / "api"), "tool": "claude"}])
-        r = _run(cfg, "down", "--all")
+        r = _run(cfg, "down", "--all", home=home)
         assert r.returncode == 0, r.stderr
         # nothing was running, so nothing to stop -- but it must exit cleanly
         assert "session" in r.stdout.lower() or "server" in r.stdout.lower()
 
-    def test_down_named_no_session(self, tmp_path):
+    def test_down_named_no_session(self, tmp_path, home):
         (tmp_path / "api").mkdir()
         cfg = _write_cfg(tmp_path, [{"path": str(tmp_path / "api"), "tool": "claude"}])
-        r = _run(cfg, "down", "nonexistent")
+        r = _run(cfg, "down", "nonexistent", home=home)
         assert r.returncode == 0, r.stderr

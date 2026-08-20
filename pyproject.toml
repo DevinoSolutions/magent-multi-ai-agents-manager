@@ -117,6 +117,7 @@ markers = [
     "needs_tailscale: e2e tests that require a live Tailscale node (CI-only, gated on MDTEST_TAILSCALE=1; skipped locally)",
     "node_contract: run the REAL published agent-state writer under real node and check magent's reader against it (needs node/npm + npm registry; skips cleanly otherwise)",
     "soak: long-run daemon stability tests (serve + attention -d under sustained churn for tens of minutes; CI-only, gated on MDTEST_SOAK=1)",
+    "real_home: opt OUT of the autouse HOME redirect -- the test legitimately needs the machine's own home (CI-only tiers that seed the real ~/, e.g. the ssh flagship). Never use on a test that can run on a dev box.",
 ]
 
 [tool.ruff]
