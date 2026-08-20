@@ -25,6 +25,7 @@ Its real-wire counterpart, with ssh and the probe unsubstituted, is
 from __future__ import annotations
 
 import os
+import re
 import sys
 import uuid
 
@@ -78,6 +79,58 @@ def _render(raw: str) -> Screen:
     return Screen(rows=ROWS, cols=COLS).feed(raw)
 
 
+# The alternate-screen entry the stand-in TUI writes as its first act on EVERY
+# dial. Nothing else in a pane ever emits it: the supervisor deliberately never
+# enters or leaves the alternate screen (DESIGN.md, "the status line owns the
+# bottom row"), so a SECOND occurrence means "the next connection has started
+# drawing", and means nothing else.
+ALT_SCREEN_ON = "\x1b[?1049h"
+
+# An ESC, or an ESC + a CSI that never got its final byte, at the very end of a
+# snapshot. A cut there is not a rendering: `Screen` prints the leftovers as
+# text, at the cursor, on the user's row.
+_DANGLING_ESCAPE = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*)?\Z")
+
+
+def _during_the_outage(raw: str) -> str:
+    """``raw`` cut where the NEXT connection starts drawing.
+
+    THE SNAPSHOT'S BOUNDARY HAS TO COME FROM THE STREAM, NOT FROM LUCK. `expect`
+    returns as soon as its needle lands in a chunk, but it cannot stop the child
+    writing, and `Pty._raw` grows by whole 4096-byte reads -- so `pty.raw`
+    straight after `expect("dialing")` holds "everything up to the dialing
+    repaint" only if the reader happened to stop there. It often does not: the
+    supervisor redials the instant the countdown ends, the stand-in's first act
+    on dial 2 is `ESC[?1049h ESC[2J` (a full-screen CLEAR) followed by a
+    row-by-row repaint, and the pane then prints its closing "detached from
+    demo." line. One read can return all of it.
+
+    Two of those over-long snapshots reproduce the reported failure EXACTLY --
+    assertions 1-3 green, "a row other than the bottom one changed" red -- when
+    replayed through the real `_screen.Screen` with the real byte shapes:
+
+    * cut inside dial 2's repaint, between the typed row and the box below it:
+      row 11 is blank because the clear landed and the repaint had not reached
+      it yet;
+    * cut past the whole repaint: the "detached" line lands at the restored
+      cursor and `\\n` (ONLCR'd to `\\r\\n` by the pty) puts it on row 11.
+
+    Why macos-latest and not the others: the POSIX driver only reads when
+    `expect` asks (`read_nonblocking`), so a test descheduled for ~100ms finds
+    the dialing repaint, the whole of dial 2 and the closing line waiting in one
+    chunk. The Windows driver drains continuously off a daemon thread, so the
+    dialing write is almost always captured on its own, and ubuntu runners are
+    far less contended than the 3-core macOS ones.
+
+    Nothing is weakened by cutting here: every byte of dial 1's frame and every
+    outage repaint is still in the snapshot, so a status line that landed off
+    the bottom row still fails. What is removed is only what the product wrote
+    AFTER the outage it is being judged on.
+    """
+    parts = raw.split(ALT_SCREEN_ON)
+    return _DANGLING_ESCAPE.sub("", ALT_SCREEN_ON.join(parts[:2]))
+
+
 class TestTheFrozenFrameSurvivesTheStatusLine:
     """One outage, drawn on top of a real frozen alternate-screen frame."""
 
@@ -105,7 +158,7 @@ class TestTheFrozenFrameSurvivesTheStatusLine:
             pty.expect(pane_mod.PANE_READY, timeout=60)
             pty.expect(pane_mod.HINT, timeout=60)  # the frame is drawn
             pty.expect("dialing", timeout=60)  # the outage is fully painted
-            mid_outage = pty.raw
+            mid_outage = _during_the_outage(pty.raw)
             pty.expect(pane_mod.PANE_DONE, timeout=120)
             status = pty.wait_exit(timeout=60)
         finally:
@@ -156,7 +209,7 @@ class TestTheFrozenFrameSurvivesTheStatusLine:
         try:
             pty.expect(pane_mod.PANE_READY, timeout=60)
             pty.expect("dialing", timeout=60)
-            mid_outage = pty.raw
+            mid_outage = _during_the_outage(pty.raw)
             pty.expect(pane_mod.PANE_DONE, timeout=120)
             pty.wait_exit(timeout=60)
         finally:
@@ -196,9 +249,9 @@ class TestTheFrozenFrameSurvivesTheStatusLine:
         try:
             pty.expect(pane_mod.PANE_READY, timeout=60)
             pty.expect(pane_mod.HINT, timeout=60)
-            frame_drawn = _render(pty.raw).scrolls
+            frame_drawn = _render(_during_the_outage(pty.raw)).scrolls
             pty.expect("dialing", timeout=60)
-            mid_outage = pty.raw
+            mid_outage = _during_the_outage(pty.raw)
             pty.expect(pane_mod.PANE_DONE, timeout=120)
             pty.wait_exit(timeout=60)
         finally:
@@ -246,6 +299,123 @@ class TestTheFrozenFrameSurvivesTheStatusLine:
         # message is a deliberate permanent line and scrolls the screen the way
         # any output does. What is being pinned is that the sentence came back,
         # not that the frame is pixel-identical to the ghost that replaced it.
+
+
+class TestTheOutageSnapshotIsBoundedByTheStream:
+    """The harness property the frame assertions above rest on.
+
+    No pty and no child: these replay the byte shapes the pane really writes
+    through the real screen model, at the read boundaries a loaded runner can
+    really produce. They exist because the alternative -- discovering the
+    boundary is wrong via an intermittent macOS failure -- costs a CI job and
+    tells you nothing about which byte did it. Same reasoning as
+    ``test_pty_driver.py``: a harness that can lie has to be pinned like
+    product code.
+    """
+
+    _FRAME_TOP_1BASED = pane_mod.FRAME_TOP_ROW
+    _PROMPT_1BASED = pane_mod.PROMPT_ROW
+
+    def _frame(self, token: str) -> str:
+        """One dial's worth of stand-in TUI output, in one flush.
+
+        Written as one string on purpose: the stand-in's stdout is a tty and
+        none of its writes carries a newline, so all of them reach the pty in a
+        single write -- which is why an over-long snapshot cuts either at a
+        frame boundary or inside one, never at a half-written escape.
+        """
+        typed = f"| > {token}"
+        box = "+" + "-" * 38 + "+"
+        return (
+            f"{ALT_SCREEN_ON}\x1b[2J"
+            f"\x1b[{self._FRAME_TOP_1BASED};1H{pane_mod.FRAME_TOP}"
+            f"\x1b[{self._FRAME_TOP_1BASED + 1};1HFRAME-BODY assistant reply text"
+            f"\x1b[{self._PROMPT_1BASED - 1};1H{box}"
+            f"\x1b[{self._PROMPT_1BASED};1H{typed}"
+            f"\x1b[{self._PROMPT_1BASED + 1};1H{box}"
+            f"\x1b[{pane_mod.HINT_ROW};1H{pane_mod.HINT}"
+            f"\x1b[{self._PROMPT_1BASED};{len(typed) + 1}H"
+        )
+
+    def _outage(self) -> str:
+        """Three real ``StatusLine.show`` writes: save, bottom row, erase,
+        yellow text, restore."""
+        return "".join(
+            f"\x1b7\x1b[{ROWS};1H\x1b[2K\x1b[33m{text}\x1b[0m\x1b8"
+            for text in (
+                "reconnecting to user@stand-in (attempt 1) -- retry in 2s",
+                "reconnecting to user@stand-in (attempt 1) -- retry in 1s",
+                "reconnecting to user@stand-in (attempt 1) -- dialing",
+            )
+        )
+
+    def _frame_rows(self, token: str) -> dict[int, str]:
+        """Every row but the bottom one, as the frozen frame has them."""
+        box = "+" + "-" * 38 + "+"
+        rows = dict.fromkeys(range(ROWS - 1), "")
+        rows[pane_mod.FRAME_TOP_ROW - 1] = pane_mod.FRAME_TOP
+        rows[pane_mod.FRAME_TOP_ROW] = "FRAME-BODY assistant reply text"
+        rows[pane_mod.PROMPT_ROW - 2] = box
+        rows[pane_mod.PROMPT_ROW - 1] = f"| > {token}"
+        rows[pane_mod.PROMPT_ROW] = box
+        return rows
+
+    def _overruns(self, token: str) -> dict[str, str]:
+        """The streams a single over-long read can hand back."""
+        outage = self._frame(token) + self._outage()
+        redraw = self._frame(token)
+        # `_echo` writes text + "\n" and this one's text OPENS with "\n"; the
+        # pty's ONLCR makes both of them "\r\n". That leading newline is why
+        # the line lands one row BELOW the restored cursor -- on the prompt
+        # box's bottom border rather than on the sentence itself.
+        detached = "\r\n  \x1b[32m+\x1b[0m detached from \x1b[1mdemo\x1b[0m.\r\n"
+        return {
+            "the outage alone": outage,
+            "plus all of the next dial's repaint": outage + redraw,
+            "plus the pane's closing line": outage + redraw + detached,
+            "cut inside the next dial's repaint": outage
+            + redraw[: redraw.index(f"\x1b[{self._PROMPT_1BASED + 1};1H")],
+        }
+
+    def test_every_over_long_read_still_shows_the_frozen_frame(self):
+        token = "TYPED-BUT-UNSENT-deadbeef"
+        expected = self._frame_rows(token)
+        for label, raw in self._overruns(token).items():
+            screen = _render(_during_the_outage(raw))
+            assert {row: screen.line(row) for row in expected} == expected, (
+                f"{label}: a row other than the bottom one changed\n{screen.text}"
+            )
+            assert screen.line(ROWS - 1).endswith("dialing"), (
+                f"{label}: the outage's own status line was cut away\n{screen.text}"
+            )
+
+    def test_the_cut_is_what_makes_the_difference(self):
+        # The counter-proof: without it, two of those same four streams fail
+        # the frame assertion exactly the way macos-latest reported it. If this
+        # ever goes green, the race is gone and `_during_the_outage` can go too.
+        token = "TYPED-BUT-UNSENT-deadbeef"
+        expected = self._frame_rows(token)
+        broken = [
+            label
+            for label, raw in self._overruns(token).items()
+            if {row: _render(raw).line(row) for row in expected} != expected
+        ]
+        assert broken == [
+            "plus the pane's closing line",
+            "cut inside the next dial's repaint",
+        ]
+
+    def test_a_snapshot_that_ends_mid_escape_prints_no_garbage(self):
+        # The other way a live-stream snapshot lies: cut between the ESC and
+        # the final byte of a CSI and the model prints the leftovers as text,
+        # at the cursor -- which is parked on the user's sentence.
+        token = "TYPED-BUT-UNSENT-deadbeef"
+        raw = self._frame(token) + self._outage()
+        for cut in range(1, 8):
+            screen = _render(_during_the_outage(raw + "\x1b[?1049h"[:cut]))
+            assert screen.line(pane_mod.PROMPT_ROW - 1) == f"| > {token}", (
+                f"a {cut}-byte partial escape reached the grid\n{screen.text}"
+            )
 
 
 class TestKeystrokesTypedDuringAnOutage:
