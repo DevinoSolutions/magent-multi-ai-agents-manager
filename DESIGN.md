@@ -1302,6 +1302,15 @@ writers can never rotate the same file twice, and no two writes can resolve the
 same offset. Both OS locks are released by the kernel when the holder dies, so a
 crashed writer cannot wedge the others.
 
+**That platform split is bound once at import, never per record** — a trap this
+change fell into and CI caught on every POSIX leg. The OS does not change while
+a process runs, but `sys.platform` does: tests monkeypatch it to drive the win32
+branches of platform-specific code (`upload_server.stop_server`'s taskkill path
+is one), and that code *logs*. A logger that re-read `sys.platform` per record
+therefore tried to `import msvcrt` on Linux and took down the very call it exists
+to observe. `tests/unit/test_log.py::…::test_a_faked_sys_platform_cannot_break_logging`
+pins it in both directions.
+
 Rejected alternatives:
 
 - *Per-process files* (`<name>-<pid>.log` plus a stale-pid sweep) — rotation-safe
