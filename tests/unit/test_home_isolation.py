@@ -23,10 +23,12 @@ import pytest
 
 from magent import lockfile
 from tests.conftest import (
+    PLAYWRIGHT_BROWSERS_PATH,
     REAL_HOME,
     REAL_MAGENT_DIR,
     _env_points_at_real_home,
     _leaked_module_paths,
+    _playwright_browsers_path,
     _tripwire_disabled,
 )
 
@@ -62,6 +64,55 @@ class TestTheRedirectHolds:
             taken = Path.home() / ".magent" / "home-isolation-pin.lock"
             assert taken.exists()
             assert not (REAL_MAGENT_DIR / "home-isolation-pin.lock").exists()
+
+
+class TestToolCachesSurviveTheRedirect:
+    """A redirected home moves every tool cache keyed off ``~``, not just
+    magent's own state -- and a cache the CI job populated in the runner's real
+    home before pytest started is then simply GONE.
+
+    This regressed for real: PR #183's first CI run failed all four
+    `browser-upload` tests with `BrowserType.launch: Executable doesn't exist
+    at /tmp/pytest-of-runner/pytest-0/<test>-home/.cache/ms-playwright/...`,
+    because the job's `playwright install --with-deps chromium` step writes the
+    runner's home and Playwright resolves that cache at launch time.
+
+    The browser tier is CI-only, so nothing local can catch this; these pins
+    run everywhere and fail the moment the export goes away or drifts.
+    """
+
+    def test_the_browser_cache_is_pinned_outside_the_tmp_home(self):
+        pinned = Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"])
+        assert pinned == PLAYWRIGHT_BROWSERS_PATH
+        # The whole point: NOT under the home this test was given.
+        assert not pinned.is_relative_to(Path.home())
+
+    def test_the_pin_survives_alongside_a_still_redirected_magent_home(self):
+        # It must move the browser BINARIES only. If ~/.magent came back with
+        # it, the browser tier would be uploading into the developer's fleet.
+        assert Path.home() != REAL_HOME
+        assert not Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"]).is_relative_to(
+            REAL_MAGENT_DIR
+        )
+
+    @pytest.mark.parametrize(
+        ("platform", "tail"),
+        [
+            ("linux", (".cache", "ms-playwright")),
+            ("darwin", ("Library", "Caches", "ms-playwright")),
+            ("win32", ("AppData", "Local", "ms-playwright")),
+        ],
+    )
+    def test_the_location_matches_playwrights_own_per_os_default(
+        self, monkeypatch, platform, tail
+    ):
+        # The mapping is the part that can silently drift: point it one
+        # directory wrong and the browser job fails with the same "Executable
+        # doesn't exist" it failed with before the fix. ubuntu is the platform
+        # the browser job actually runs on; the other two are pinned so a
+        # future non-linux browser leg does not inherit a guess.
+        monkeypatch.setattr(sys, "platform", platform)
+        assert _playwright_browsers_path() == REAL_HOME.joinpath(*tail)
 
 
 class TestTheTripwireFires:

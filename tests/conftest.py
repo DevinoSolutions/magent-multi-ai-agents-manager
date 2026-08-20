@@ -40,6 +40,24 @@ _KEEP_REAL_HOME_DIRS = ("platform",)
 # there -- the exact hole that let `magent down` act on the real ~/.magent.
 _HOME_VARS = ("HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH")
 
+
+def _playwright_browsers_path() -> Path:
+    """Playwright's own default browser cache, under the ORIGINAL home.
+
+    Playwright resolves this relative to ~ at LAUNCH time, so a redirected home
+    sends it looking in a tmp directory the `playwright install` step never
+    wrote to. Mirrors Playwright's documented per-OS default exactly; the
+    mapping is pinned by tests/unit/test_home_isolation.py.
+    """
+    if sys.platform == "win32":
+        return REAL_HOME / "AppData" / "Local" / "ms-playwright"
+    if sys.platform == "darwin":
+        return REAL_HOME / "Library" / "Caches" / "ms-playwright"
+    return REAL_HOME / ".cache" / "ms-playwright"
+
+
+PLAYWRIGHT_BROWSERS_PATH = _playwright_browsers_path()
+
 # ~/.magent paths that product modules bind at IMPORT time. The env redirect
 # below cannot reach these: the constant was computed the moment the module was
 # first imported (during collection), against the real home. Each is a file a
@@ -114,6 +132,21 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
             # not exist because nothing can reach it either.
             with contextlib.suppress(ImportError):
                 monkeypatch.setattr(f"{module}.{attr}", home / ".magent" / leaf)
+        # A redirected home moves more than magent's own state: it also moves
+        # every tool cache keyed off ~, and the browser tier's CI job installs
+        # Chromium into the RUNNER's home with `playwright install` in a step
+        # that runs long before pytest. Playwright resolves that cache at
+        # launch time, so the redirect above sent it hunting inside this test's
+        # tmp home ("Executable doesn't exist at .../-home/.cache/ms-playwright
+        # /chromium_headless_shell-.../..."), failing all four browser tests.
+        # Pin the cache to where the install actually put it. This moves the
+        # browser BINARIES only -- ~/.magent stays redirected, so the browser
+        # tier is still fully isolated from the developer's fleet -- and an
+        # explicit PLAYWRIGHT_BROWSERS_PATH already in the environment wins.
+        if "PLAYWRIGHT_BROWSERS_PATH" not in os.environ:
+            monkeypatch.setenv(
+                "PLAYWRIGHT_BROWSERS_PATH", str(PLAYWRIGHT_BROWSERS_PATH)
+            )
     # Isolating ENV_FILE (above) is not enough: an exported process-env
     # MAGENT_* var (a dev shell's real MAGENT_SENTRY_DSN) is still read by
     # get_env(), and on 2026-07-07 that leaked fake test errors to prod Sentry
