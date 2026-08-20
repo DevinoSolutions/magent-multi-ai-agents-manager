@@ -149,7 +149,7 @@ def _load_json_object(text: str) -> dict[str, object]:
 
 def _obj(raw: dict[str, object], key: str) -> dict[str, object]:
     value = raw.get(key)
-    return value if isinstance(value, dict) else {}  # ty: ignore[invalid-return-type]  # reason: isinstance narrows; ty 0.0.56 invariance gap
+    return value if isinstance(value, dict) else {}
 
 
 def _str(raw: dict[str, object], key: str, default: str) -> str:
@@ -201,9 +201,9 @@ def _windows(raw: dict[str, object]) -> list[WindowConfig] | None:
             elif isinstance(item, dict):
                 out.append(
                     WindowConfig(
-                        name=_str_or_none(item, "name"),  # ty: ignore[invalid-argument-type]  # reason: isinstance guard; ty 0.0.56 invariance gap
-                        tool=_str_or_none(item, "tool"),  # ty: ignore[invalid-argument-type]  # reason: isinstance guard; ty 0.0.56 invariance gap
-                        command=_str_or_none(item, "command"),  # ty: ignore[invalid-argument-type]  # reason: isinstance guard; ty 0.0.56 invariance gap
+                        name=_str_or_none(item, "name"),
+                        tool=_str_or_none(item, "tool"),
+                        command=_str_or_none(item, "command"),
                     )
                 )
         return out or None
@@ -482,17 +482,17 @@ def load_config(path: str) -> MagentConfig:
     projects: list[ProjectConfig] = []
     for i, p in enumerate(projects_raw):
         p_obj = p if isinstance(p, dict) else {}
-        _warn_unknown_keys(p_obj, _ALLOWED_PROJECT_KEYS, f"projects[{i}]")  # ty: ignore[invalid-argument-type]  # reason: isinstance guard; ty 0.0.56 invariance gap
+        _warn_unknown_keys(p_obj, _ALLOWED_PROJECT_KEYS, f"projects[{i}]")
         w_raw = p_obj.get("windows")
         if isinstance(w_raw, list):
             for j, w in enumerate(w_raw):
                 if isinstance(w, dict):
                     _warn_unknown_keys(
-                        w,  # ty: ignore[invalid-argument-type]  # reason: isinstance guard; ty 0.0.56 invariance gap
+                        w,
                         _ALLOWED_WINDOW_KEYS,
                         f"projects[{i}].windows[{j}]",
                     )
-        projects.append(_parse_project(p_obj))  # ty: ignore[invalid-argument-type]  # reason: isinstance guard; ty 0.0.56 invariance gap
+        projects.append(_parse_project(p_obj))
     _backfill_colors(projects)
 
     return MagentConfig(
@@ -517,7 +517,7 @@ def _migrate_1_to_2(raw: dict[str, object]) -> dict[str, object]:
     raw = dict(raw)
     settings = raw.get("settings")
     if isinstance(settings, dict) and "attention" not in settings:
-        settings["attention"] = {  # ty: ignore[invalid-assignment]  # reason: isinstance guard; ty 0.0.56 invariance gap
+        settings["attention"] = {
             "badge": True,
             "flash": True,
             "toast": False,
@@ -542,9 +542,9 @@ def _migrate_2_to_3(raw: dict[str, object]) -> dict[str, object]:
                 continue
             w = p.get("windows")
             if isinstance(w, bool):
-                del p["windows"]  # ty: ignore[invalid-argument-type]  # reason: isinstance guard; ty 0.0.56 invariance gap
+                del p["windows"]
             elif isinstance(w, int) and w > 1:
-                p["windows"] = [{}] * w  # ty: ignore[invalid-assignment]  # reason: isinstance guard; ty 0.0.56 invariance gap
+                p["windows"] = [{}] * w
             elif isinstance(w, list):
                 migrated: list[object] = []
                 for item in w:
@@ -553,7 +553,7 @@ def _migrate_2_to_3(raw: dict[str, object]) -> dict[str, object]:
                     elif isinstance(item, dict):
                         migrated.append(item)
                 if migrated:
-                    p["windows"] = migrated  # ty: ignore[invalid-assignment]  # reason: isinstance guard; ty 0.0.56 invariance gap
+                    p["windows"] = migrated
     raw["version"] = 3
     return raw
 
@@ -592,12 +592,12 @@ def migrate_config_file(path: str) -> bool:
 
     projects_raw = raw.get("projects")
     projects_list = projects_raw if isinstance(projects_raw, list) else []
-    projects = [_parse_project(p if isinstance(p, dict) else {}) for p in projects_list]  # ty: ignore[invalid-argument-type]  # reason: isinstance guard; ty 0.0.56 invariance gap
+    projects = [_parse_project(p if isinstance(p, dict) else {}) for p in projects_list]
     colors_changed = _backfill_colors(projects)
     for i, p in enumerate(projects):
         entry = projects_list[i]
         if isinstance(entry, dict):
-            entry["color"] = p.color  # ty: ignore[invalid-assignment]  # reason: isinstance guard; ty 0.0.56 invariance gap
+            entry["color"] = p.color
 
     if not version_changed and not colors_changed:
         return False

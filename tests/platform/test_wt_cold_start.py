@@ -164,9 +164,11 @@ def test_first_ever_wt_launch_survives_cold_broker(tmp_path):
                 "powershell",
                 "-NoProfile",
                 "-Command",
-                f"Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | "
-                f"Where-Object {{ $_.CommandLine -like '*{marker}*' }} | "
-                f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}",
+                (
+                    f"Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | "
+                    f"Where-Object {{ $_.CommandLine -like '*{marker}*' }} | "
+                    f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}"
+                ),
             ],
             capture_output=True,
             check=False,

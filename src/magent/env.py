@@ -108,7 +108,7 @@ def get_env() -> MagentEnv:
     """Return the validated env singleton (instantiated on first call)."""
     global _cached_env  # noqa: PLW0603  # reason: module-level cache singleton pattern
     if _cached_env is None:
-        _cached_env = MagentEnv(_env_file=ENV_FILE)  # ty: ignore[unknown-argument]  # reason: _env_file is pydantic-settings' documented per-call dotenv override; ty can't see BaseSettings' synthesized __init__
+        _cached_env = MagentEnv(_env_file=ENV_FILE)
     return _cached_env
 
 

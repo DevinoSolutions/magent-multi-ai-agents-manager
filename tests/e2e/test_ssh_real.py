@@ -1372,9 +1372,11 @@ def _kill_ssh_carrying(token: str) -> None:
                 "powershell",
                 "-NoProfile",
                 "-Command",
-                "Get-CimInstance Win32_Process -Filter \"Name='ssh.exe'\" | "
-                f"Where-Object {{ $_.CommandLine -like '*{token}*' }} | "
-                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
+                (
+                    "Get-CimInstance Win32_Process -Filter \"Name='ssh.exe'\" | "
+                    f"Where-Object {{ $_.CommandLine -like '*{token}*' }} | "
+                    "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+                ),
             ],
             capture_output=True,
             timeout=60,

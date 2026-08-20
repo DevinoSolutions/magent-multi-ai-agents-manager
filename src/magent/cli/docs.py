@@ -70,13 +70,15 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
         "windowTitlePrefix",
         "boolean",
         "`true`",
-        "Prefix every window title with `magent:` so the attention daemon's "
-        "badges, the Alt+V hotkey, and `magent-name` tiling can recognize magent "
-        "windows. Set `false` for bare project-name titles — then title badges, "
-        "the Alt+V hotkey, and `project_from_title` no-op, and launch-path tiling "
-        "falls back to exact-title matching. `magent attach` windows always keep "
-        "the prefix: there the title carries the psmux session id (P3-01), so it "
-        "is load-bearing, not cosmetic.",
+        (
+            "Prefix every window title with `magent:` so the attention daemon's "
+            "badges, the Alt+V hotkey, and `magent-name` tiling can recognize magent "
+            "windows. Set `false` for bare project-name titles — then title badges, "
+            "the Alt+V hotkey, and `project_from_title` no-op, and launch-path tiling "
+            "falls back to exact-title matching. `magent attach` windows always keep "
+            "the prefix: there the title carries the psmux session id (P3-01), so it "
+            "is load-bearing, not cosmetic."
+        ),
     ),
     (
         "tools",
@@ -113,8 +115,10 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
         "attention.notifyOnDone",
         "boolean",
         "`false`",
-        "Also push toast/ntfy when an agent finishes (enters `done`). Opt-in; "
-        "does nothing unless `toast` or `ntfy` is on.",
+        (
+            "Also push toast/ntfy when an agent finishes (enters `done`). Opt-in; "
+            "does nothing unless `toast` or `ntfy` is on."
+        ),
     ),
 ]
 

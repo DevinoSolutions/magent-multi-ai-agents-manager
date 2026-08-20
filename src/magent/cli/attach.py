@@ -55,7 +55,7 @@ if TYPE_CHECKING:
 
 def _as_session_list(raw: list[object]) -> list[dict[str, object]]:
     """Narrow a JSON list of unknown objects to a list of string-keyed dicts."""
-    return [item for item in raw if isinstance(item, dict)]  # ty: ignore[invalid-return-type]  # reason: isinstance(item, dict) narrows; ty 0.0.56 invariance gap
+    return [item for item in raw if isinstance(item, dict)]
 
 
 def _default_attach_host() -> str | None:
@@ -1047,7 +1047,7 @@ def _bring_up_and_requery(
         new = _ssh_json(target, f"magent up --json{grp_suffix}", timeout=60)
         if new:
             raw_up = new.get("up")
-            cur = _as_session_list(raw_up) if isinstance(raw_up, list) else []  # ty: ignore[invalid-argument-type]  # reason: isinstance(raw_up, list) proves list; ty 0.0.56 invariance gap
+            cur = _as_session_list(raw_up) if isinstance(raw_up, list) else []
             if len(cur) >= len(best):
                 best = cur
             # Everything asked for is up: the bring-up is complete, so there is
@@ -1137,8 +1137,8 @@ def _attach_flow(
 
     raw_up = status.get("up")
     raw_down = status.get("down")
-    up = _as_session_list(raw_up) if isinstance(raw_up, list) else []  # ty: ignore[invalid-argument-type]  # reason: isinstance guard; ty 0.0.56 invariance gap
-    down = _as_session_list(raw_down) if isinstance(raw_down, list) else []  # ty: ignore[invalid-argument-type]  # reason: isinstance guard; ty 0.0.56 invariance gap
+    up = _as_session_list(raw_up) if isinstance(raw_up, list) else []
+    down = _as_session_list(raw_down) if isinstance(raw_down, list) else []
     port = status.get("upload_port", 8033)
 
     if down and yes:
