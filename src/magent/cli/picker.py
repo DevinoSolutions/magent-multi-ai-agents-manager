@@ -258,7 +258,14 @@ def _read_key_posix() -> str:
         # Raw only for the duration of the read: every repaint happens in
         # cooked mode, so a newline still carries its carriage return and the
         # list does not walk off to the right.
-        tty.setraw(fd)
+        #
+        # TCSANOW, never tty.setraw's TCSAFLUSH DEFAULT: flushing DISCARDS
+        # input already waiting on the descriptor. Mode is re-entered once per
+        # keystroke, so anything typed while the previous repaint was on screen
+        # is exactly what would be thrown away -- a fast typist would watch
+        # characters vanish, and a whole string written at once (a paste, or a
+        # test typing "web") would arrive as its first character alone.
+        tty.setraw(fd, termios.TCSANOW)
         ch = read_char(fd)
         if ch != "\x1b":
             return _classify(ch)
