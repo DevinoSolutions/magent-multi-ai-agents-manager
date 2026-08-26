@@ -26,12 +26,17 @@ import click
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+from magent.cli import picker
 from magent.cli.app import main
 from magent.cli.background import _running_upload_port, _tailnet_host
 from magent.cli.config_io import _load_config_or_exit
-from magent.cli.ui import _banner, _divider, _menu_item
+from magent.cli.ui import _banner, _divider
 from magent.paths import find_config
 from magent.style import style
+
+# The one answer that is a command rather than a search here, so a session
+# literally named `queue` can never shadow "go back".
+_PICKER_COMMANDS = frozenset({"q"})
 
 
 def _session_cwds(
@@ -187,6 +192,64 @@ def _attach_session(psmux_bin: str, target: str, reset: Callable[[], None]) -> N
     time.sleep(2)
 
 
+def _session_rows(
+    sessions: list[str], statuses: dict[str, str]
+) -> list[picker.PickerItem]:
+    """The picker's rows: one per live session, then Back.
+
+    A row's key is its PRINTED number, so filtering the list never renumbers
+    what you can see -- and the caller's index math is the same one it has
+    always run on a typed digit.
+    """
+    rows = []
+    for i, sess in enumerate(sessions, 1):
+        status = statuses.get(sess, "")
+        extra = (" " * max(2, 26 - len(sess)) + status) if status else ""
+        rows.append(picker.PickerItem(str(i), sess, extra=extra))
+    rows.append(picker.PickerItem("q", "Back", key_fg="yellow", gap_before=True))
+    return rows
+
+
+def _read_choice(rows: list[picker.PickerItem], upload_url: str | None) -> str | None:
+    """Paint the session list and return the answer, lowercased. None means the
+    user escaped out, which is the same as choosing Back."""
+
+    def _header() -> None:
+        _banner()
+        click.echo(
+            f"  {style('psmux sessions', bold=True)}  {style('(synced with desktop)', dim=True)}"
+        )
+        _divider()
+        click.echo()
+        if upload_url:
+            click.echo(
+                f"  {style('WebApp To Upload Images', bold=True)}  {style(upload_url, fg='cyan', bold=True)}"
+            )
+            click.echo()
+
+    if picker.raw_mode_available():
+        result = picker.pick(
+            rows,
+            _header,
+            commands=_PICKER_COMMANDS,
+            prompt=f"  {style('attach to', fg='cyan')} ",
+        )
+        if result.kind == picker.CANCEL:
+            return None
+        return result.value.strip().lower()
+    picker.show(rows, _header)
+    return (
+        click.prompt(
+            f"  {style('attach to', fg='cyan')}",
+            default="1",
+            show_default=False,
+            prompt_suffix=" ",
+        )
+        .strip()
+        .lower()
+    )
+
+
 def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
     """Looping psmux session picker: list live sessions, attach to a choice, repeat.
 
@@ -253,39 +316,9 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
             _attach(focus)
             continue
 
-        click.clear()
-        _banner()
-        click.echo(
-            f"  {style('psmux sessions', bold=True)}  {style('(synced with desktop)', dim=True)}"
-        )
-        _divider()
-        click.echo()
-        if upload_url:
-            click.echo(
-                f"  {style('WebApp To Upload Images', bold=True)}  {style(upload_url, fg='cyan', bold=True)}"
-            )
-            click.echo()
         statuses = _session_statuses(_session_cwds(psmux_bin, sessions, resolved))
-        for i, sess in enumerate(sessions, 1):
-            status = statuses.get(sess, "")
-            extra = (" " * max(2, 26 - len(sess)) + status) if status else ""
-            _menu_item(str(i), sess, extra=extra)
-        click.echo()
-        _menu_item("q", "Back", key_fg="yellow")
-        click.echo()
-
-        choice = (
-            click.prompt(
-                f"  {style('attach to', fg='cyan')}",
-                default="1",
-                show_default=False,
-                prompt_suffix=" ",
-            )
-            .strip()
-            .lower()
-        )
-
-        if choice == "q":
+        choice = _read_choice(_session_rows(sessions, statuses), upload_url)
+        if choice is None or choice == "q":
             return
 
         target = None

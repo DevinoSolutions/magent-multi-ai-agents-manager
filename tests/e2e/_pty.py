@@ -296,6 +296,20 @@ class Pty:
         else:
             self._child.send(text + "\n")
 
+    def send_keys(self, text: str) -> None:
+        """Type raw characters with NO Enter appended.
+
+        The type-to-filter picker reads KEYS, not lines: every character it is
+        sent must land as its own keystroke, and an Enter it did not ask for
+        would commit the very prompt the test is still typing into. Escape
+        sequences (``\\x1b[B`` for Down) go through here too — this is the only
+        way to press a key that is not a character.
+        """
+        if IS_WIN:
+            self._win.write(text)
+        else:
+            self._child.send(text)
+
     # -- lifecycle -----------------------------------------------------------
 
     def wait_exit(self, timeout: float = 30.0, *, budget: Budget | None = None) -> int:
