@@ -11,7 +11,11 @@ disagree with it about which sessions exist.
 
 from __future__ import annotations
 
+import sys
 import time
+from pathlib import Path
+
+import pytest
 
 from magent import psmux as psmux_mod
 from magent.cli import session_picker
@@ -24,8 +28,6 @@ class TestPickerSweepIsTheSharedSeam:
         # A pin on the seam, not on the probe: whatever the shared enumeration
         # answers is what the picker lists, so the picker can never again be
         # the one surface that sees a session `down` will skip.
-        from pathlib import Path
-
         seen: list[tuple[list[str], str | None]] = []
         monkeypatch.setattr(psmux_mod, "find_psmux", lambda: "psmux")
         monkeypatch.setattr(
@@ -128,3 +130,68 @@ class TestAttachSession:
         assert len(calls) == 2
         out = capsys.readouterr().out
         assert "failed twice" in out and "overloaded" in out
+
+
+@pytest.fixture
+def fake_fleet(monkeypatch, tmp_config):
+    """Drive `_run_sessions_picker` over a fake fleet with scripted typed lines.
+
+    Characterization: stdin is NOT a terminal here, which is exactly the path a
+    pipe / `CliRunner` / a script takes. The raw-key type-to-filter picker is
+    gated on a real tty, so everything pinned through this fixture must stay
+    byte-for-byte identical forever.
+    """
+
+    def _run(names, *answers, record_prompt=None):
+        attached: list[str] = []
+        seq = iter(answers)
+        monkeypatch.setattr(psmux_mod, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(
+            psmux_mod, "live_sessions", lambda live, psmux=None, **kw: list(names)
+        )
+        monkeypatch.setattr(
+            session_picker, "_session_statuses", lambda cwds: dict.fromkeys(cwds, "")
+        )
+        monkeypatch.setattr(session_picker, "_running_upload_port", lambda: None)
+        monkeypatch.setattr(session_picker, "_consume_focus_target", lambda: None)
+        monkeypatch.setattr(
+            session_picker, "_attach_session", lambda b, t, r: attached.append(t)
+        )
+        monkeypatch.setattr(session_picker.click, "clear", lambda: None)
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: False, raising=False)
+
+        def _prompt(text, **kwargs):
+            if record_prompt is not None:
+                record_prompt.append(kwargs.get("default"))
+            return next(seq)
+
+        monkeypatch.setattr(session_picker.click, "prompt", _prompt)
+        cfg = tmp_config({"projects": [{"path": n} for n in names]})
+        session_picker._run_sessions_picker(Path(cfg))
+        return attached
+
+    return _run
+
+
+class TestPickerLineInputIsUnchanged:
+    def test_a_digit_attaches_to_that_row(self, fake_fleet):
+        assert fake_fleet(["api", "web", "docs"], "2", "q") == ["web"]
+
+    def test_q_returns_without_attaching(self, fake_fleet):
+        assert fake_fleet(["api", "web"], "q") == []
+
+    def test_a_substring_attaches_to_the_first_match(self, fake_fleet):
+        assert fake_fleet(["api", "webapp", "web-docs"], "web", "q") == ["webapp"]
+
+    def test_an_unmatchable_choice_reports_and_reprompts(self, fake_fleet, capsys):
+        assert fake_fleet(["api"], "zzz", "q") == []
+        assert "Invalid choice" in capsys.readouterr().out
+
+    def test_out_of_range_digit_is_invalid(self, fake_fleet, capsys):
+        assert fake_fleet(["api"], "9", "q") == []
+        assert "Invalid choice" in capsys.readouterr().out
+
+    def test_the_prompt_declares_1_as_its_default(self, fake_fleet):
+        defaults: list[object] = []
+        fake_fleet(["api"], "q", record_prompt=defaults)
+        assert defaults == ["1"]

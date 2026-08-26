@@ -221,6 +221,23 @@ Run `magent` with no arguments for the interactive menu:
    q   Quit
 ```
 
+**Just start typing.** In a real terminal every list magent shows you — the
+menu above, its group submenu, and the `magent sessions` switcher — filters as
+you type, with the closest match marked `>`:
+
+```
+  attach to web
+
+ > 2   beta-web                   still going... 4m
+   3   gamma-web-docs             needs input
+```
+
+Up/Down move the mark, Enter takes it, Esc clears the query (and, on an empty
+query, backs out). Nothing else changed: the row numbers still work, `q` is
+still Quit even if you have a project called `queue-worker`, and pressing Enter
+on an untouched menu still takes the default it always did. Piped or scripted
+input keeps the plain line-based prompt.
+
 Or skip the menu with flags:
 
 | Command | What it does |

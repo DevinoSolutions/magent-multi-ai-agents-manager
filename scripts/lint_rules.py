@@ -72,6 +72,7 @@ MD002_ALLOW = {
     "src/magent/cli/ui.py": "OS-specific editor command + Windows console UTF-8 fix",
     "src/magent/procs.py": "OpenProcess vs os.kill pid-liveness primitive",
     "src/magent/cli/session_picker.py": "terminal reset (cls vs stty/tput) is per-OS",
+    "src/magent/cli/picker.py": "raw single-key console reads are per-OS (msvcrt vs termios/tty), same split as cli/watch.py",
     "src/magent/cli/attach.py": "reports the sys.platform value in JSON status (data, not a gate)",
     "src/magent/env.py": "host-env readers (config_base, vscode_storage_base) select per-OS default directories",
     "src/magent/lockfile.py": "msvcrt.locking (Windows) vs fcntl.flock (Unix) — each OS has a different locking API",
