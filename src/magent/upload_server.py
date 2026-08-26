@@ -182,12 +182,32 @@ body{font-family:-apple-system,system-ui,sans-serif;background:#1e1e2e;color:#cd
 .head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
 .head h1{font-size:.85rem;color:#a6e3a1;font-weight:700;letter-spacing:.5px}
 .head span{color:#45475a;font-size:.7rem}
-.pills{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+.pills{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
 .pill{background:#313244;border:1.5px solid #45475a;border-radius:20px;
   padding:6px 14px;font-size:.8rem;color:#bac2de;cursor:pointer;
   transition:all .12s;white-space:nowrap;-webkit-user-select:none;user-select:none}
 .pill:active{transform:scale(.96)}
 .pill.on{border-color:#89b4fa;background:#1e3a5f;color:#89b4fa;font-weight:600}
+/* Filtered out by the typeahead. Hidden, never removed: the pill keeps its
+   listeners and its config position, so clearing the query restores the list
+   exactly as the config wrote it. */
+.pill.off{display:none}
+/* The keyboard highlight. A ring rather than a recolour, so it composes with
+   `.on` instead of fighting it -- the highlighted pill and the SELECTED pill
+   are different questions and a phone user needs both answers at once. */
+.pill.hi{box-shadow:0 0 0 2px #f9e2af}
+#proj-filter{width:100%;padding:9px 12px;margin-bottom:8px;font-family:inherit;
+  font-size:.85rem;color:#cdd6f4;background:#181825;border:1.5px solid #45475a;
+  border-radius:8px}
+#proj-filter:focus{outline:none;border-color:#89b4fa}
+#proj-filter::placeholder{color:#585b70}
+.nomatch{display:none;color:#f9e2af;font-size:.78rem;padding:2px 0 6px}
+.nomatch.show{display:block}
+/* The selected project, always on screen -- the filter can hide the pill that
+   carries the `.on` state, and "which session am I about to send to" must not
+   be a question the query can erase. */
+.chosen{font-size:.75rem;color:#585b70;margin-bottom:10px}
+.chosen.on{color:#89b4fa;font-weight:600}
 .drop{border:1.5px dashed #45475a;border-radius:10px;padding:18px 12px;
   text-align:center;color:#585b70;font-size:.8rem;position:relative;
   transition:all .15s;margin-bottom:8px}
@@ -236,10 +256,15 @@ body{font-family:-apple-system,system-ui,sans-serif;background:#1e1e2e;color:#cd
 <body>
 <div class="head">
   <h1>magent</h1>
-  <span>tap project &rsaquo; tap file or Ctrl+V &rsaquo; done</span>
+  <span>tap or type a project &rsaquo; tap file or Ctrl+V &rsaquo; done</span>
 </div>
 
+<input type="text" id="proj-filter" placeholder="type to filter projects"
+  autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+  enterkeyhint="go" aria-label="filter projects">
 <div class="pills" id="pills">PROJECTS_PLACEHOLDER</div>
+<p class="nomatch" id="proj-nomatch">no project matches</p>
+<div class="chosen" id="proj-chosen">no project selected</div>
 
 <div class="drop" id="drop">
   <span id="drop-label">select a project first</span>
@@ -296,10 +321,14 @@ const PEND_LABEL = 'saved - paste still pending';
 const PEND_NOTE = ' saved - psmux is slow, paste still pending';
 function isPending(d) { return !!(d && !d.injected && d.inject_pending); }
 
+const chosen = document.getElementById('proj-chosen');
+
 pills.forEach(p => p.addEventListener('click', () => {
   pills.forEach(b => b.classList.remove('on'));
   p.classList.add('on');
   proj = p.dataset.name;
+  chosen.textContent = 'project: ' + proj;
+  chosen.className = 'chosen on';
   input.disabled = false;
   drop.className = 'drop ready';
   label.textContent = 'tap to select file';
@@ -307,12 +336,112 @@ pills.forEach(p => p.addEventListener('click', () => {
   toast.className = 'toast';
 }));
 
+// --- type-to-filter project picker ---------------------------------------
+//
+// This page is used from a phone, so TAP stays the primary gesture: every pill
+// is still a tap target and nothing below requires the keyboard. The text box
+// is the second way in, for a fleet with more sessions than fit a thumb's
+// scroll -- type a few letters, the list narrows, Enter takes the best match.
+//
+// Ranking mirrors the CLI picker's, so the same query picks the same project
+// on both surfaces: case-insensitive, and scored by HOW a name matched rather
+// than by how much of it did --
+//
+//   prefix          "api" -> apiserver
+//   word boundary   "api" -> web-api          (a separator precedes the hit)
+//   substring       "api" -> rapidly
+//   subsequence     "api" -> alpha-pipeline   (a, p, i in order, not adjacent)
+//
+// Within one tier the order is the CONFIG's: the sort is stable and the pills
+// start in config order, so a tie never reshuffles a list the user has already
+// learned the shape of.
+const T_PREFIX = 0, T_WORD = 1, T_SUB = 2, T_SUBSEQ = 3, T_NONE = 4;
+
+function matchTier(name, query) {
+  const n = String(name).toLowerCase(), q = query.toLowerCase();
+  if (!q) return T_PREFIX;              // empty query: everything, config order
+  if (n.startsWith(q)) return T_PREFIX;
+  for (let i = 1; i < n.length; i++) {
+    if (!/[a-z0-9]/.test(n[i - 1]) && n.startsWith(q, i)) return T_WORD;
+  }
+  if (n.includes(q)) return T_SUB;
+  let k = 0;
+  for (const ch of n) {
+    if (ch === q[k] && ++k === q.length) return T_SUBSEQ;
+  }
+  return T_NONE;
+}
+
+const filterBox = document.getElementById('proj-filter');
+const pillWrap = document.getElementById('pills');
+const nomatch = document.getElementById('proj-nomatch');
+const allPills = [...pills];
+let shown = allPills.slice();
+let hi = -1;
+
+function setHighlight(idx) {
+  hi = idx;
+  allPills.forEach(p => p.classList.remove('hi'));
+  if (hi >= 0 && shown[hi]) {
+    shown[hi].classList.add('hi');
+    shown[hi].scrollIntoView({block: 'nearest'});
+  }
+}
+
+function renderFilter() {
+  const q = filterBox.value.trim();
+  const ranked = allPills
+    .map((p, i) => ({p: p, i: i, t: matchTier(p.dataset.name, q)}))
+    .filter(x => x.t !== T_NONE);
+  ranked.sort((a, b) => a.t - b.t || a.i - b.i);
+  shown = ranked.map(x => x.p);
+  allPills.forEach(p => p.classList.add('off'));
+  // Re-append in rank order: a hidden pill's position no longer matters, and
+  // moving a node keeps its listeners, so the tap path is untouched.
+  shown.forEach(p => { p.classList.remove('off'); pillWrap.appendChild(p); });
+  nomatch.classList.toggle('show', shown.length === 0);
+  setHighlight(shown.length ? 0 : -1);
+}
+
+filterBox.addEventListener('input', renderFilter);
+filterBox.addEventListener('keydown', e => {
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    if (!shown.length) return;
+    e.preventDefault();
+    const step = e.key === 'ArrowDown' ? 1 : -1;
+    setHighlight(hi < 0 ? (step > 0 ? 0 : shown.length - 1)
+                        : (hi + step + shown.length) % shown.length);
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    // Selection goes through the pill's own click, so keyboard and thumb
+    // reach the identical code path -- there is one way to pick a project.
+    if (hi >= 0 && shown[hi]) shown[hi].click();
+  } else if (e.key === 'Escape') {
+    filterBox.value = '';
+    renderFilter();
+  }
+});
+// A tap picks whatever it landed on; the highlight follows so Enter after a
+// tap can never mean a different project than the one on screen.
+allPills.forEach(p => p.addEventListener('click', () => {
+  const at = shown.indexOf(p);
+  if (at >= 0) setHighlight(at);
+}));
+
+if (allPills.length) {
+  renderFilter();
+} else {
+  // No sessions: the list says so already, and an input that can only ever
+  // answer "no match" is noise.
+  filterBox.style.display = 'none';
+}
+
 // Deep link: ?project=<name> (e.g. from a notification) pre-selects that
 // project's pill on open, so a tap lands you straight on the right session.
 (function () {
   const want = new URLSearchParams(location.search).get('project');
   if (!want) return;
-  const pill = [...pills].find(p => p.dataset.name === want);
+  const pill = allPills.find(p => p.dataset.name === want);
   if (pill) { pill.click(); pill.scrollIntoView({block: 'center'}); }
 })();
 
