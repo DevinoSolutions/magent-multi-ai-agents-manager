@@ -13,6 +13,8 @@ the real-PTY tier covers that.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from magent.cli import picker
@@ -297,6 +299,61 @@ class TestKeyDecoding:
         st = _state(["api"])
         assert st.press(picker.IGNORED) is None
         assert st.query == "" and not st.moved
+
+
+class TestReadCharIsUnbuffered:
+    """`read_char` must take bytes off the DESCRIPTOR, never through a
+    TextIOWrapper: the POSIX arrow decoder asks `select` whether more of an
+    escape sequence is pending, and a buffered read would have already swallowed
+    it -- turning an arrow into a lone Esc followed by two typed characters.
+    A real pipe stands in for the terminal here (os.read behaves the same on
+    both), so this runs on every OS.
+    """
+
+    def _pipe(self, payload: bytes):
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, payload)
+        os.close(write_fd)
+        return read_fd
+
+    def test_one_ascii_character_at_a_time(self):
+        fd = self._pipe(b"ab")
+        try:
+            assert picker.read_char(fd) == "a"
+            assert picker.read_char(fd) == "b"
+        finally:
+            os.close(fd)
+
+    def test_an_escape_sequence_is_not_over_read(self):
+        # The whole point: the tail must still be ON the descriptor afterwards.
+        fd = self._pipe(b"\x1b[B")
+        try:
+            assert picker.read_char(fd) == "\x1b"
+            assert os.read(fd, 2) == b"[B"
+        finally:
+            os.close(fd)
+
+    def test_a_multibyte_character_is_drained_whole(self):
+        fd = self._pipe("é!".encode())
+        try:
+            assert picker.read_char(fd) == "é"
+            assert picker.read_char(fd) == "!"
+        finally:
+            os.close(fd)
+
+    def test_end_of_stream_is_empty(self):
+        fd = self._pipe(b"")
+        try:
+            assert picker.read_char(fd) == ""
+        finally:
+            os.close(fd)
+
+    def test_a_stray_continuation_byte_does_not_hang(self):
+        fd = self._pipe(b"\x80")
+        try:
+            assert picker.read_char(fd) == "�"
+        finally:
+            os.close(fd)
 
 
 class TestRawModeGate:

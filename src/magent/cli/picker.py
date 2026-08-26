@@ -41,6 +41,7 @@ is exactly what the real-PTY tier asserts against.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -209,6 +210,39 @@ def _pushback(ch: str) -> str:
     return ENTER
 
 
+def read_char(fd: int) -> str:
+    """One character straight off ``fd`` -- unbuffered, and UTF-8 aware.
+
+    Deliberately ``os.read`` and NOT ``sys.stdin.read``: a TextIOWrapper reads
+    a whole chunk into its own buffer, so an arrow's three bytes arrive
+    together, the first is returned, and ``select`` on the file descriptor then
+    reports NOTHING PENDING while ``[B`` sits in Python's buffer. The escape
+    would be mistaken for a lone Esc and its tail replayed as two typed
+    characters. Reading the descriptor directly keeps ``select``'s answer and
+    the stream's contents the same thing.
+
+    Multi-byte input is drained by the leading byte's own length rather than by
+    guessing: a project name with an accent in it must not turn into three
+    keystrokes.
+    """
+    first = os.read(fd, 1)
+    if not first:
+        return ""
+    lead = first[0]
+    if lead < 0x80:
+        return chr(lead)
+    if lead < 0xC0:  # stray continuation byte -- nothing coherent to build
+        return first.decode("utf-8", "replace")
+    width = 2 if lead < 0xE0 else 3 if lead < 0xF0 else 4
+    buf = bytearray(first)
+    while len(buf) < width:
+        more = os.read(fd, width - len(buf))
+        if not more:
+            break
+        buf += more
+    return bytes(buf).decode("utf-8", "replace")
+
+
 def _read_key_posix() -> str:
     # Mirror of the guard in ``_read_key_windows``: termios/tty do not exist on
     # Windows, and this half is only ever reached off it.
@@ -221,17 +255,20 @@ def _read_key_posix() -> str:
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     try:
+        # Raw only for the duration of the read: every repaint happens in
+        # cooked mode, so a newline still carries its carriage return and the
+        # list does not walk off to the right.
         tty.setraw(fd)
-        ch = sys.stdin.read(1)
+        ch = read_char(fd)
         if ch != "\x1b":
             return _classify(ch)
-        if not select.select([sys.stdin], [], [], _ESC_TAIL_S)[0]:
+        if not select.select([fd], [], [], _ESC_TAIL_S)[0]:
             return ESC
-        if sys.stdin.read(1) != "[":
+        if read_char(fd) != "[":
             return IGNORED
-        if not select.select([sys.stdin], [], [], _ESC_TAIL_S)[0]:
+        if not select.select([fd], [], [], _ESC_TAIL_S)[0]:
             return IGNORED
-        return _CSI_SPECIAL.get(sys.stdin.read(1), IGNORED)
+        return _CSI_SPECIAL.get(read_char(fd), IGNORED)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
