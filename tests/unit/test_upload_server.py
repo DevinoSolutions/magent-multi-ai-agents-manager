@@ -57,6 +57,113 @@ class TestBuildHtml:
             assert anchor in html, f"paste-upload UI anchor missing: {anchor}"
 
 
+class TestTheProjectPickerFiltersAsYouType:
+    """The mobile picker is type-to-filter, and tap stays the primary gesture.
+
+    A fleet outgrows a thumb's scroll long before it outgrows the config, so
+    the page carries a text box that live-filters the pills, highlights the
+    best match, and takes Enter/ArrowUp/ArrowDown -- while every pill stays a
+    tap target and nothing below the input needs a keyboard.
+
+    These are drift pins on the SERVED page, in the same cheap style as the
+    paste-state pins above: they fail the moment an element, a key, or a
+    ranking tier is dropped. The behavioural proof -- typing into real
+    Chromium, reading the filtered list, selecting by tap AND by Enter -- is
+    the `browser` e2e tier.
+    """
+
+    def _html(self, *names: str) -> str:
+        return _build_html([{"name": n, "path": "x"} for n in (names or ("p",))])
+
+    def test_the_filter_input_and_its_chrome_ship_on_the_page(self):
+        html = self._html("alpha", "beta")
+        for anchor in (
+            'id="proj-filter"',  # the text box itself
+            'id="pills"',  # ...the list it filters
+            'id="proj-nomatch"',  # ...what a query matching nothing says
+            'id="proj-chosen"',  # ...and the standing "which project" answer
+        ):
+            assert anchor in html, f"typeahead anchor missing: {anchor}"
+        # Touch-first: the box is an aid, never a gate. Autofocus would pop the
+        # phone keyboard over the pills the user came to tap.
+        assert "autofocus" not in html, "the filter must not steal focus on a phone"
+
+    def test_the_keys_are_wired_on_the_filter_box(self):
+        html = self._html("alpha", "beta")
+        for anchor in (
+            "filterBox.addEventListener('input', renderFilter)",
+            "filterBox.addEventListener('keydown'",
+            "'ArrowDown'",
+            "'ArrowUp'",
+            "e.key === 'Enter'",
+        ):
+            assert anchor in html, f"typeahead key wiring missing: {anchor}"
+
+    def test_enter_selects_through_the_same_click_a_thumb_would(self):
+        # One selection path, not two: Enter dispatches the highlighted pill's
+        # own click, so the keyboard can never diverge from the tap -- which is
+        # also what keeps `refreshPaste` (the Send gate) firing either way.
+        assert "shown[hi].click()" in self._html("alpha", "beta")
+
+    def test_the_highlight_is_a_class_distinct_from_the_selection(self):
+        # `hi` (where Enter would land) and `on` (what is selected) answer
+        # different questions and must both be readable at once.
+        html = self._html("alpha", "beta")
+        assert ".pill.hi{" in html, "the highlight lost its own style"
+        assert "classList.add('hi')" in html
+        assert "classList.add('on')" in html
+
+    def test_ranking_mirrors_the_cli_tiers_in_order(self):
+        # Case-insensitive, and scored by HOW the name matched: prefix beats
+        # word-boundary beats substring beats in-order subsequence, with ties
+        # left in config order by a stable sort. Drift here means the same
+        # query picks different projects on the phone and in the menu.
+        html = self._html("alpha", "beta")
+        assert (
+            "const T_PREFIX = 0, T_WORD = 1, T_SUB = 2, T_SUBSEQ = 3, T_NONE = 4;"
+            in html
+        ), "the ranking tiers changed shape or order"
+        assert "function matchTier(" in html
+        assert "toLowerCase()" in html, "ranking stopped being case-insensitive"
+        assert "n.startsWith(q)" in html  # prefix
+        assert "n.startsWith(q, i)" in html  # word boundary
+        assert "n.includes(q)" in html  # substring
+        assert "a.t - b.t || a.i - b.i" in html, (
+            "ties stopped falling back to config order"
+        )
+
+    def test_a_filtered_out_pill_is_hidden_not_destroyed(self):
+        # Hiding keeps the pill's listeners and its config index, so clearing
+        # the query restores exactly the list the config wrote.
+        html = self._html("alpha", "beta")
+        assert ".pill.off{display:none}" in html
+        assert "classList.add('off')" in html
+        assert "classList.remove('off')" in html
+
+    def test_the_selected_project_survives_being_filtered_out(self):
+        # The query can hide the pill carrying `.on`; the standing line must
+        # still say which session the next Send goes to.
+        html = self._html("alpha", "beta")
+        assert "chosen.textContent = 'project: ' + proj" in html
+        assert ">no project selected<" in html
+
+    def test_send_is_still_gated_on_a_selected_project(self):
+        # The typeahead adds a way to CHOOSE, never a way to skip choosing.
+        html = self._html("alpha", "beta")
+        assert 'id="paste-send" disabled' in html, "Send no longer starts disabled"
+        assert "psend.disabled = sending || !proj" in html, (
+            "Send stopped being gated on a selected project"
+        )
+        assert 'id="file" accept=' in html and " disabled>" in html
+
+    def test_no_sessions_means_no_filter_box_to_type_into(self):
+        # An input whose only possible answer is "no match" is noise; the
+        # empty-list message already says everything there is to say.
+        html = _build_html([])
+        assert "no active sessions" in html
+        assert "filterBox.style.display = 'none'" in html
+
+
 class TestThePageReadsAllThreePasteStates:
     """The mobile page must not collapse `inject_pending` into a failure.
 
