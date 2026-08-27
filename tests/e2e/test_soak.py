@@ -120,6 +120,10 @@ def _child_env(home, extra_path: str | None = None) -> dict[str, str]:
     # ...and `attention -d` now supervises `magent serve` the same way, so a
     # test daemon would otherwise start a REAL upload server on this machine.
     env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
+    # ...and the psmux priority sweep reaches processes by IMAGE NAME, which
+    # no HOME redirect contains: a test-spawned serve/daemon must never
+    # re-prioritise the developer's real psmux fleet.
+    env["MAGENT_PSMUX_BOOST"] = "0"
     if extra_path:
         env["PATH"] = extra_path + os.pathsep + env.get("PATH", "")
     return env

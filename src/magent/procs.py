@@ -23,6 +23,10 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
 
 # CreateProcess flag: the new process is NOT assigned to its parent's job
 # object. Windows OpenSSH puts everything a session runs into a job marked
@@ -30,10 +34,35 @@ import sys
 # connection -- including a psmux SERVER, and with it the agent it hosts.
 CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 
-# Toolhelp constants for ``count_processes``: snapshot the process list, and
+# Toolhelp constants for the process snapshot: snapshot the process list, and
 # the sentinel CreateToolhelp32Snapshot returns when it cannot.
 TH32CS_SNAPPROCESS = 0x00000002
 INVALID_HANDLE_VALUE = -1
+
+# OpenProcess rights for ``raise_priority_above_normal``: the minimum pair that
+# lets a same-user, NON-ELEVATED caller read a priority class and set it.
+# PROCESS_SET_INFORMATION is the write half; PROCESS_QUERY_LIMITED_INFORMATION
+# (not the full PROCESS_QUERY_INFORMATION) is the read half that a normal user
+# is granted against their own processes.
+PROCESS_SET_INFORMATION = 0x0200
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+# The priority classes this module cares about. ABOVE_NORMAL is the only value
+# ever SET; the frozenset is the only set of values it may be set FROM.
+ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+NORMAL_PRIORITY_CLASS = 0x00000020
+BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+IDLE_PRIORITY_CLASS = 0x00000040
+
+# A raise, never a change. HIGH (0x80) and REALTIME (0x100) are ABSENT on
+# purpose: somebody -- a user, another tool, the process itself -- put a
+# process there deliberately, and a sweep that ran every 30 seconds and quietly
+# demoted it would be a background process fighting a foreground decision.
+# GetPriorityClass answers 0 when it fails, which is in no set here, so a failed
+# read can never be mistaken for a boostable NORMAL.
+_RAISABLE_FROM = frozenset(
+    {NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, IDLE_PRIORITY_CLASS}
+)
 
 
 def pid_alive(pid: int | None) -> bool:
@@ -61,21 +90,27 @@ def pid_alive(pid: int | None) -> bool:
         return True
 
 
-def count_processes(exe_name: str) -> int | None:
-    """How many live processes run ``exe_name`` (case-insensitive). None = we
-    could not look, which is NOT the same as zero and must never be rendered
-    as one.
+def snapshot_processes() -> list[tuple[str, int]] | None:
+    """``(image name, pid)`` for every live process, or None when we could not
+    look -- which is NOT the same as "nothing is running" and must never be
+    rendered as one. Off Windows: always None.
 
-    Toolhelp, not a CIM/PowerShell query: this is called from ``magent
-    doctor``'s wedge check, i.e. from a machine that is already misbehaving,
-    and a diagnostic that costs a PowerShell boot (~1 s, and 10 s bounded on
-    the attach path -- see ``platform/windows.py::process_cmdlines``) would
-    make the report slower than the thing it reports on. One snapshot walk over
-    ~900 processes costs single-digit milliseconds and needs no privileges.
+    THE one process enumeration in the product, deliberately: both callers
+    (``count_processes`` for doctor's wedge count, ``pids_by_image_name`` for
+    the psmux priority sweep) want the same Toolhelp walk over the same struct,
+    and a second copy of a Windows process primitive is exactly how one of them
+    silently rots -- the lesson ``spawn_unjobbed`` already encodes.
+
+    Toolhelp, not a CIM/PowerShell query: doctor calls this from a machine that
+    is already misbehaving, and a diagnostic that costs a PowerShell boot (~1 s,
+    and 10 s bounded on the attach path -- see
+    ``platform/windows.py::process_cmdlines``) would make the report slower than
+    the thing it reports on. One snapshot walk over ~900 processes costs
+    single-digit milliseconds and needs no privileges.
 
     Names only, never command lines: reading another process's command line
     means NtQueryInformationProcess plus a cross-bitness PEB walk, which is a
-    lot of fragile surface for a count. Off Windows there is no cheap
+    lot of fragile surface for a name match. Off Windows there is no cheap
     stdlib-only equivalent, so this answers None rather than shelling out.
     """
     if sys.platform != "win32":
@@ -106,15 +141,99 @@ def count_processes(exe_name: str) -> int | None:
         entry.dwSize = ctypes.sizeof(_ProcessEntry32)
         if not k.Process32FirstW(snapshot, ctypes.byref(entry)):
             return None
-        wanted = exe_name.casefold()
-        found = 0
+        found: list[tuple[str, int]] = []
         while True:
-            if entry.szExeFile.casefold() == wanted:
-                found += 1
+            found.append((entry.szExeFile, int(entry.th32ProcessID)))
             if not k.Process32NextW(snapshot, ctypes.byref(entry)):
                 return found
     finally:
         k.CloseHandle(snapshot)
+
+
+def count_processes(exe_name: str) -> int | None:
+    """How many live processes run ``exe_name`` (case-insensitive). None = we
+    could not look, which is NOT the same as zero and must never be rendered
+    as one (``magent doctor``'s psmux-wedge finding renders this)."""
+    entries = snapshot_processes()
+    if entries is None:
+        return None
+    wanted = exe_name.casefold()
+    return sum(1 for name, _pid in entries if name.casefold() == wanted)
+
+
+def pids_by_image_name(names: Iterable[str]) -> list[int]:
+    """Live pids whose image name is one of ``names``, matched case-insensitively
+    (Windows filenames are). Empty off Windows, and empty when the snapshot
+    fails -- a sweep that cannot see anything simply has nothing to do, which
+    is not the same claim ``count_processes`` has to make to a human reader.
+    """
+    wanted = {name.casefold() for name in names}
+    return [
+        pid for name, pid in snapshot_processes() or () if name.casefold() in wanted
+    ]
+
+
+def raise_priority_above_normal(pid: int) -> bool:
+    """Raise ``pid`` to ABOVE_NORMAL_PRIORITY_CLASS, if and only if it is
+    currently at or below NORMAL. True when this call actually changed it.
+
+    Every failure is a False, never an exception: the caller sweeps a live
+    process list, so a pid that exited between the snapshot and the OpenProcess
+    is the NORMAL case, not an error, and a pid owned by another user (or
+    protected) is a permission answer we simply accept. No elevation is needed
+    to raise one's own processes to ABOVE_NORMAL -- unlike HIGH/REALTIME, which
+    is one of the reasons ABOVE_NORMAL is the target.
+    """
+    if sys.platform != "win32":
+        return False
+    import ctypes  # win-only: ctypes.windll doesn't exist off Windows
+
+    k = ctypes.windll.kernel32
+    try:
+        handle = k.OpenProcess(
+            PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            return False
+        try:
+            if k.GetPriorityClass(handle) not in _RAISABLE_FROM:
+                return False
+            return bool(k.SetPriorityClass(handle, ABOVE_NORMAL_PRIORITY_CLASS))
+        finally:
+            k.CloseHandle(handle)
+    except OSError:
+        return False
+
+
+def boost_above_normal(
+    names: Iterable[str],
+    *,
+    list_pids: Callable[[Iterable[str]], list[int]] = pids_by_image_name,
+    raise_priority: Callable[[int], bool] = raise_priority_above_normal,
+) -> int:
+    """Raise every live process named in ``names`` to ABOVE_NORMAL. Returns how
+    many were actually raised (already-boosted ones count zero, which is what
+    makes repeat sweeps quiet).
+
+    Idempotent, admin-free, and it NEVER raises: a per-pid failure is skipped
+    silently because the alternative -- a sweep that aborts halfway through the
+    fleet because one pid died -- boosts an arbitrary prefix of it.
+
+    The two seams are injectable so the policy above (match by name, raise only
+    upward, tolerate per-pid failure) can be tested without a single real
+    process being touched; the defaults are the real Windows primitives.
+    """
+    boosted = 0
+    for pid in list_pids(names):
+        try:
+            raised = raise_priority(pid)
+        except OSError:
+            # A pid that died mid-sweep, or one the OS refuses us. Both are
+            # ordinary on a live box; neither is a reason to stop sweeping.
+            continue
+        if raised:
+            boosted += 1
+    return boosted
 
 
 def spawn_unjobbed(

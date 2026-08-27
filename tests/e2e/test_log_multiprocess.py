@@ -122,6 +122,10 @@ def _child_env(home: Path) -> dict[str, str]:
     # Nothing here starts serve/attention, but the isolation laws are absolute.
     env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
     env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
+    # ...and the psmux priority sweep reaches processes by IMAGE NAME, which
+    # no HOME redirect contains: a test-spawned serve/daemon must never
+    # re-prioritise the developer's real psmux fleet.
+    env["MAGENT_PSMUX_BOOST"] = "0"
     env["PYTHONUNBUFFERED"] = "1"
     return env
 

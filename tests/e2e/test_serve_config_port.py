@@ -160,6 +160,10 @@ class _Serve:
         # a HOME redirect does not contain one. Opt out rather than install it
         # on the machine running the suite.
         env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
+        # ...and the psmux priority sweep reaches processes by IMAGE NAME, which
+        # no HOME redirect contains: a test-spawned serve must never
+        # re-prioritise the developer's real psmux fleet.
+        env["MAGENT_PSMUX_BOOST"] = "0"
         env["PATH"] = self.shim_path + os.pathsep + env.get("PATH", "")
         return env
 

@@ -186,7 +186,7 @@ runs:
         # psmux for the attach-over-SSH flagship leg (pinned). The choco shim
         # dir is already on the machine PATH, so sshd sessions resolve it
         # after the restart below.
-        choco install psmux -y --version=3.3.6 --no-progress
+        choco install psmux -y --version=3.3.8 --no-progress
         if ($LASTEXITCODE -ne 0) { throw "choco install psmux failed" }
 
         # Incoming sshd sessions inherit the MACHINE PATH, not GITHUB_PATH

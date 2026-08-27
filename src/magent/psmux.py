@@ -79,6 +79,83 @@ def child_env() -> dict[str, str]:
     return spawn_child_env()
 
 
+# --- Priority of the interactive path -----------------------------------------
+# Every image name a psmux process can be running under, lower-cased.
+#
+# Checked against the real artifact rather than assumed: the Windows release zip
+# (both v3.3.6 and v3.3.8) ships FIVE entries -- LICENSE, README.md, and THREE
+# copies of the same binary named ``psmux.exe``, ``pmux.exe`` and ``tmux.exe``.
+# ``Expand-Archive`` drops all three side by side (this box's
+# ``%LOCALAPPDATA%\psmux`` has exactly that), so which name a running server
+# carries is simply whichever one was invoked. magent's own ``find_psmux`` only
+# ever resolves ``psmux``, and this machine's live fleet is 169 ``psmux.exe`` --
+# but a user who put that directory on PATH and typed ``pmux`` gets a server
+# named ``pmux.exe`` hosting exactly the same pane, and it should feel the same.
+#
+# ``tmux.exe`` is deliberately NOT in the set, and that is the one judgement
+# call here. The name is not psmux's to claim: an MSYS2/Cygwin/Git-for-Windows
+# box can carry an unrelated ``tmux.exe``, and a sweep that reached it would be
+# raising the priority of a process magent never launched and knows nothing
+# about. The cost of leaving it out is bounded and visible -- a user who invokes
+# the tmux-named copy keeps today's Normal priority, i.e. today's behaviour.
+PSMUX_IMAGE_NAMES = frozenset({"psmux.exe", "pmux.exe"})
+
+
+def boost_enabled() -> bool:
+    """Whether ``MAGENT_PSMUX_BOOST`` permits the priority sweep.
+
+    Same degradation doctrine as ``upload_server.supervision_enabled`` and
+    ``launch.upload_supervision_enabled``: a long-lived process must never die
+    of an environment variable it does not use, and every other MAGENT_*
+    consumer has already failed loudly at CLI entry by the time a supervisor
+    thread is running -- so an env that has gone bad underneath one degrades to
+    the default (sweep) rather than taking the sweep's owner down with it.
+    """
+    from pydantic import ValidationError
+
+    from magent.env import get_env
+
+    try:
+        return get_env().psmux_boost
+    except ValidationError:
+        get_logger("launch").warning(
+            "psmux boost: environment did not validate; boosting anyway"
+        )
+        return True
+
+
+def boost_priority() -> int:
+    """Raise every live psmux process to ABOVE_NORMAL. Returns how many this
+    call actually raised (0 on a fleet that is already boosted, off Windows, and
+    whenever ``MAGENT_PSMUX_BOOST=0``).
+
+    THE one seam for the whole feature -- the launch-path bring-up, the
+    attention daemon's tick and the serve supervisor all call exactly this, so
+    "who boosts" is a question about call sites and never about behaviour. It is
+    idempotent (a process already above NORMAL is skipped) and a per-pid failure
+    -- a pid that exited mid-sweep, one the OS refuses -- is skipped rather than
+    aborting the rest of the fleet. Each of the three owners still wraps the
+    call, on the same doctrine as ``UploadServerSupervisor``: the handling
+    belongs at the boundary with the loop that has to survive.
+
+    Rationale for ABOVE_NORMAL, for a sweep rather than a spawn flag, and for
+    the no-downgrade rule: DESIGN.md §2 "The interactive path outranks the
+    fleet".
+    """
+    from magent.procs import boost_above_normal  # in-body: keeps this leaf thin
+
+    if not boost_enabled():
+        return 0
+    boosted = boost_above_normal(PSMUX_IMAGE_NAMES)
+    if boosted:
+        # Only the transitions are logged. A steady state that logged every 30
+        # seconds would be the loudest line in the file and say nothing.
+        get_logger("launch").info(
+            "psmux boost: raised %d process(es) to above-normal priority", boosted
+        )
+    return boosted
+
+
 @dataclass
 class PsmuxWindowOpts:
     """One window to create inside a psmux session."""

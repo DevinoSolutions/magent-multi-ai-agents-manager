@@ -1471,6 +1471,45 @@ def _supervise_hotkey(
             return
 
 
+# --- psmux priority supervision ----------------------------------------------
+# The third owner of ``psmux.boost_priority``, and on a real fleet the one that
+# matters most: the launch path boosts what it just created, the attention
+# daemon boosts on every poll -- but the attention daemon is frequently NOT
+# running, while `magent serve` effectively always is (it is what every upload
+# and every Alt+V press goes through, and `attention -d` revives it). A psmux
+# server created by `magent attach`, by `up`, or by hand hours after the last
+# bring-up would otherwise never be swept at all.
+#
+# Its own thread rather than a branch inside _supervise_hotkey, for one reason:
+# that supervisor returns early on `MAGENT_HOTKEY_SUPERVISOR=0`, and somebody
+# who owns their listener's lifetime has said nothing whatsoever about process
+# priority. Same cadence, separate gate.
+PSMUX_BOOST_INTERVAL_S = 30.0
+
+
+def _supervise_psmux_priority(
+    stop_event: threading.Event, interval: float = PSMUX_BOOST_INTERVAL_S
+) -> None:
+    """Keep the psmux fleet at above-normal priority for as long as serve runs.
+
+    Runs on a daemon thread off ``run_server``. Idempotent and cheap (one
+    Toolhelp snapshot plus an OpenProcess per psmux pid), so re-running it every
+    interval costs milliseconds and is what makes a session created between two
+    sweeps get boosted at all. Every failure is a log line and another try next
+    interval -- this must never be able to take down the server it rides on.
+    """
+    if sys.platform != "win32":
+        return  # priority classes are a Windows concept; nothing to sweep
+    log = get_logger("launch")
+    while True:
+        try:
+            psmux.boost_priority()
+        except Exception:
+            log.exception("psmux boost: priority sweep failed")
+        if stop_event.wait(interval):
+            return
+
+
 def _serve_bind(server: ThreadingHTTPServer, log: logging.Logger) -> None:
     """``serve_forever`` for a SECONDARY bind, on its own daemon thread.
 
@@ -1535,6 +1574,14 @@ def run_server(
         daemon=True,
     ).start()
 
+    # ...and the typing latency of every pane is only as good as the priority of
+    # the psmux processes carrying it. Same reasoning, same thread shape: serve
+    # is the process that is always there, so it is the one that keeps sweeping.
+    boost_stop = threading.Event()
+    threading.Thread(
+        target=_supervise_psmux_priority, args=(boost_stop,), daemon=True
+    ).start()
+
     # Why this is not a bare `try/finally` any more: serve died silently twice
     # in one day and left NOTHING behind -- no traceback (a detached process has
     # no console), no log line, only a pid file whose process was gone. The
@@ -1555,6 +1602,7 @@ def run_server(
         raise
     finally:
         hotkey_stop.set()
+        boost_stop.set()
         for s in servers[1:]:
             s.shutdown()  # called from a different thread than its serve_forever -> safe
         for s in servers:

@@ -164,6 +164,14 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     # the machine running the suite, on the config's port, with no pid for any
     # teardown to kill. Tests that are ABOUT the supervisor set it back to "1".
     monkeypatch.setenv("MAGENT_UPLOAD_SUPERVISOR", "0")
+    # ...and a second, for the sharpest reason of the three. The psmux priority
+    # sweep (psmux.boost_priority) is the ONE thing in this product that reaches
+    # processes it did not spawn, by IMAGE NAME, and no HOME redirect can
+    # contain it: a test that starts a real `serve` or `attention -d` on this
+    # developer's box would re-prioritise the machine's entire live fleet (169
+    # psmux.exe at last count). Off for every tier; the tests that are ABOUT the
+    # sweep drive the seam directly and never the real Windows primitives.
+    monkeypatch.setenv("MAGENT_PSMUX_BOOST", "0")
     log.reset_logging()
     yield
     log.reset_logging()
