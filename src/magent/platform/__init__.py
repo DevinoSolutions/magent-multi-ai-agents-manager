@@ -101,6 +101,11 @@ class Platform(ABC):
         """True if this platform can badge titles / flash / focus windows."""
         return False
 
+    def supports_wt_keybindings(self) -> bool:
+        """True if this platform has a Windows Terminal settings.json whose
+        ``sendInput`` keybindings magent can install (see ``magent.wt_keys``)."""
+        return False
+
     def set_window_title(self, handle: object, title: str) -> bool:
         """Rewrite a window's title in place. False = unsupported or failed."""
         return False

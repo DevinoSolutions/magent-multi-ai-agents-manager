@@ -279,6 +279,54 @@ def _check_hotkey(cfg: MagentConfig | None) -> CheckResult:
     return (OK, "Alt+V listener off — it starts with the upload server")
 
 
+def _check_wt_keys() -> CheckResult:
+    """Do Ctrl+Backspace and Shift+Enter survive psmux?
+
+    Never a FAIL, deliberately: a missing binding costs the user a word-delete
+    and a soft newline, not a working fleet, and doctor's exit code is what CI
+    and `magent status` read. Everything here is WARN-at-worst so the finding
+    is loud without turning an ergonomic gap into a red machine.
+    """
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    if not get_platform().supports_wt_keybindings():
+        return (OK, "Windows Terminal keys not applicable on this OS (Windows-only)")
+
+    from magent import wt_keys
+    from magent.cli.terminal_cmd import REPAIR_HINT
+
+    path = wt_keys.find_settings()
+    if path is None:
+        return (OK, "Windows Terminal settings.json not found -- nothing to configure")
+    try:
+        doc = wt_keys.load_settings(path)
+    except (wt_keys.SettingsParseError, OSError) as exc:
+        return (
+            WARN,
+            (
+                f"cannot read {path}: {exc} -- run `{REPAIR_HINT}` for the snippet "
+                "to paste by hand"
+            ),
+        )
+    states = wt_keys.states(doc)
+    conflicts = [s.keys for s in states if s.state == wt_keys.CONFLICT]
+    missing = [s.keys for s in states if s.state == wt_keys.MISSING]
+    if not conflicts and not missing:
+        return (OK, "Ctrl+Backspace and Shift+Enter survive psmux")
+    parts = []
+    if missing:
+        parts.append(f"not bound: {', '.join(missing)}")
+    if conflicts:
+        parts.append(f"bound to something else: {', '.join(conflicts)}")
+    return (
+        WARN,
+        (
+            f"{'; '.join(parts)} -- psmux eats the modifier, so these do nothing "
+            f"in a pane. Repair: {REPAIR_HINT}"
+        ),
+    )
+
+
 def _writable(d: Path) -> bool:
     try:
         d.mkdir(parents=True, exist_ok=True)
@@ -373,6 +421,7 @@ def _run_checks(config_file: Path) -> list[dict[str, str]]:
         ("psmux wedge", _check_psmux_wedge),
         ("monitors", _check_monitors),
         ("hotkey", lambda: _check_hotkey(cfg)),
+        ("wt-keys", _check_wt_keys),
         ("logs dir", _check_logs_dir),
         ("state dir", _check_state_dir),
         ("sentry", _check_sentry),

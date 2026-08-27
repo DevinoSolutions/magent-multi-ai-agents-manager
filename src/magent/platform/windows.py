@@ -346,6 +346,9 @@ class WindowsPlatform(Platform):
     def supports_attention_signals(self) -> bool:
         return True
 
+    def supports_wt_keybindings(self) -> bool:
+        return True
+
     def set_window_title(self, handle: object, title: str) -> bool:
         return bool(user32.SetWindowTextW(handle, title))
 
