@@ -188,7 +188,10 @@ def _psmux_boost_tick() -> Callable[[], None]:
     nothing a user could be surprised by beyond the boost itself.
     """
     from magent.log import get_logger  # heavy subsystem: in-body per policy
-    from magent.psmux import boost_priority  # heavy subsystem: in-body per policy
+
+    # psmux is a leaf, not a heavy subsystem -- in-body only to keep this
+    # module's top-level import list matching its siblings' shape.
+    from magent.psmux import boost_priority
 
     log = get_logger("attention")
 
