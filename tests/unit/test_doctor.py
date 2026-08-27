@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from magent import cli
+from magent import cli, wt_keys
 from magent import psmux as psmux_mod
 from magent.cli import doctor
 from magent.cli.doctor import (
@@ -316,6 +316,75 @@ class TestCheckHotkey:
         assert "starts with the upload server" in detail
 
 
+class TestCheckWtKeys:
+    """The Ctrl+Backspace / Shift+Enter bindings that survive psmux. Never a
+    FAIL by design: a missing binding costs ergonomics, not a working fleet,
+    and doctor's exit code is read by CI and by `magent status`."""
+
+    def _platform(self, monkeypatch, *, supported):
+        fp = FakePlatform(supports_wt_keybindings=supported)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+
+    def _settings(self, monkeypatch, tmp_path, doc):
+        path = tmp_path / "settings.json"
+        path.write_text(doc if isinstance(doc, str) else json.dumps(doc), "utf-8")
+        monkeypatch.setattr("magent.wt_keys.find_settings", lambda: path)
+        return path
+
+    def test_other_os_is_ok_and_never_touches_a_settings_file(self, monkeypatch):
+        self._platform(monkeypatch, supported=False)
+        monkeypatch.setattr(
+            "magent.wt_keys.find_settings",
+            lambda: pytest.fail("probed for settings.json off Windows"),
+        )
+        status, detail = doctor._check_wt_keys()
+        assert status == OK
+        assert "Windows-only" in detail
+
+    def test_no_windows_terminal_is_ok_not_a_finding(self, monkeypatch):
+        self._platform(monkeypatch, supported=True)
+        monkeypatch.setattr("magent.wt_keys.find_settings", lambda: None)
+        status, detail = doctor._check_wt_keys()
+        assert status == OK
+        assert "not found" in detail
+
+    def test_missing_bindings_warn_with_the_repair_hint(self, monkeypatch, tmp_path):
+        self._platform(monkeypatch, supported=True)
+        self._settings(monkeypatch, tmp_path, {})
+        status, detail = doctor._check_wt_keys()
+        assert status == WARN
+        assert "ctrl+backspace" in detail and "shift+enter" in detail
+        assert "magent terminal install" in detail
+
+    def test_installed_bindings_are_ok(self, monkeypatch, tmp_path):
+        self._platform(monkeypatch, supported=True)
+        doc: dict[str, object] = {}
+        for binding in wt_keys.BINDINGS:
+            wt_keys._add_binding(doc, binding, wt_keys.SCHEMA_SPLIT)
+        self._settings(monkeypatch, tmp_path, doc)
+        status, detail = doctor._check_wt_keys()
+        assert status == OK
+        assert "survive psmux" in detail
+
+    def test_a_foreign_binding_is_reported_as_a_conflict(self, monkeypatch, tmp_path):
+        self._platform(monkeypatch, supported=True)
+        doc: dict[str, object] = {
+            "actions": [{"command": {"action": "copy"}, "keys": "ctrl+backspace"}]
+        }
+        wt_keys._add_binding(doc, wt_keys.BINDINGS[1], wt_keys.SCHEMA_ACTIONS_INLINE)
+        self._settings(monkeypatch, tmp_path, doc)
+        status, detail = doctor._check_wt_keys()
+        assert status == WARN
+        assert "bound to something else: ctrl+backspace" in detail
+
+    def test_jsonc_settings_warn_rather_than_fail(self, monkeypatch, tmp_path):
+        self._platform(monkeypatch, supported=True)
+        self._settings(monkeypatch, tmp_path, "{ // comment\n }")
+        status, detail = doctor._check_wt_keys()
+        assert status == WARN
+        assert "magent terminal install" in detail
+
+
 class TestCheckPsmuxWedge:
     """The machine-wide psmux control-plane wedge (2026-08-18/19): every psmux
     command hangs forever from any console while ConPTY itself is healthy, and
@@ -606,6 +675,7 @@ class TestDoctorCli:
             "psmux wedge",
             "monitors",
             "hotkey",
+            "wt-keys",
             "logs dir",
             "state dir",
             "sentry",

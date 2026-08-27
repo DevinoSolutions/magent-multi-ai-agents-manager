@@ -345,6 +345,12 @@ def _generate_docs() -> str:
         "| `magent serve -p 9090` | Use a custom port (default: this config's `uploadPort`, else 8033). |"
     )
     w("| `magent hotkey` | Listen for Alt+V to upload clipboard images (standalone). |")
+    w(
+        "| `magent terminal install` | Bind Ctrl+Backspace / Shift+Enter in Windows Terminal so they survive psmux. |"
+    )
+    w(
+        "| `magent terminal status` | Report whether those keybindings are installed, conflicting or missing. |"
+    )
     w("| `magent sessions` | List active psmux sessions, pick one to attach. |")
     w("| `magent sessions <name>` | Attach directly to a psmux session by name. |")
     w("| `magent config show` | Display current config. |")

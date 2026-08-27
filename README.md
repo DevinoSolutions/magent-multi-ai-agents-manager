@@ -270,8 +270,46 @@ Or skip the menu with flags:
 | `magent termius` | Generate an SSH config entry that opens the session picker. |
 | `magent hotkey [--ssh-host <host>]` | Run the window-hotkey listener standalone (Windows): Alt+V clipboard upload and F2 open-in-VS-Code. `--ssh-host` makes F2 open over Remote-SSH. |
 | `magent hooks install` | Wire the agent lifecycle hooks that feed the session-state store (`magent hooks status` to inspect) — see [Where agent states come from](#where-agent-states-come-from). |
+| `magent terminal install` | Bind Ctrl+Backspace and Shift+Enter in Windows Terminal so they still work inside a psmux pane (`magent terminal status` to inspect) — see [Typing through psmux](#typing-through-psmux). |
 | `magent config <subcommand>` | Edit config from the CLI — 17 subcommands incl. `migrate`; see `magent config --help`. |
 | `magent config edit [host]` | Edit the config on **another** machine in your editor over SSH — fetch, edit, validate, push back. Omit the host to reuse your last `attach` target. The host side is `magent config cat` / `magent config put`, which you never run by hand. |
+
+### Typing through psmux
+
+Two keys stop working the moment your agent runs inside a psmux pane:
+
+- **Ctrl+Backspace** arrives as a plain Backspace — one character, no word-delete.
+- **Shift+Enter** arrives as a plain Enter — which *submits* in Claude Code
+  instead of inserting a newline.
+
+Neither is your terminal's fault. psmux drops the key **modifier** in transit;
+the child only ever sees the bare key. The real fix upstream is win32-input-mode
+(psmux#159), which died unmerged — we filed psmux#610 and #611 to revive it.
+
+Until then the mitigation is to resolve the chord **before psmux sees it**, in
+Windows Terminal itself, with a `sendInput` binding that writes the resulting
+bytes straight into the pty — a byte has no modifier left to lose:
+
+```
+magent terminal install     # writes the bindings (backup first, never clobbers)
+magent terminal status      # installed / missing / conflicting, per key
+```
+
+- `ctrl+backspace` → `0x17`, the Ctrl+W word-erase byte every readline already
+  honors. The same trick VS Code ships. Works through psmux **today**.
+- `shift+enter` → `0x1b 0x0d` (ESC CR), exactly what Claude Code's
+  `/terminal-setup` installs. Works outside psmux now, and inside it once
+  upstream fixes its ESC+CR decode — installing it is right either way.
+
+magent ships this itself because `/terminal-setup` **refuses to run inside a
+tmux/psmux pane**, which is precisely where magent users live.
+
+The install is idempotent and never clobbers: a key you have already bound to
+something else is reported and left alone (the other key still installs), and a
+timestamped backup lands beside `settings.json` before any write. If your
+`settings.json` uses JSONC (comments, trailing commas) magent refuses to rewrite
+it and prints the exact snippet to paste by hand instead. `magent doctor`
+reports the same per-key state under `wt-keys` — as a warning, never a failure.
 
 ### When every psmux command hangs (the wedge)
 
@@ -303,6 +341,7 @@ Launching, tiling, and the mobile/notification plumbing run on all three OSes. A
 | ntfy phone push (`settings.attention.ntfy`) | Yes | Yes | Yes |
 | Persistent psmux sessions (`up` / `sessions` / `attach`) | Yes | No | No |
 | Global Alt+V clipboard-image hotkey | Yes | No | No |
+| psmux-safe keybindings (`terminal install`) | Yes | No | No |
 | Mobile upload server (`serve` / `mobile`) | Yes | Yes | Yes |
 
 Notes:
@@ -310,6 +349,7 @@ Notes:
 - **Badges, flash, and toast** are gated on `Platform.supports_attention_signals()`, which returns `True` only in `platform/windows.py`. On macOS/Linux the daemon prints `window badges/flash aren't supported on this OS` and those renderers stay off. Toast additionally uses the Windows-only `winotify` (`[toast]` extra). **ntfy push is cross-platform** — it is stdlib `urllib` over HTTP — so phone notifications work on every OS.
 - **The `magent:` title prefix** can be turned off with `settings.windowTitlePrefix: false` — window titles then become the bare project name (e.g. `api` instead of `magent:api`). Launch-path tiling still places windows (it matches the exact title it set), but the features that read the `magent:` grammar degrade to a safe no-op while the prefix is off: the attention daemon's title **badges**, the **Alt+V** clipboard hotkey (which only fires in `magent:`-titled windows), and `magent-name` title matching all stop recognizing your windows. One deliberate exception: `magent attach` windows always keep the prefix — there the title carries the psmux session id that the hotkey chain resolves, so it is load-bearing rather than cosmetic. Leave the setting on unless you specifically want prefix-free titles.
 - **Persistent psmux sessions and the Alt+V hotkey** are gated on `supports_psmux()` / `supports_hotkey()` (also Windows-only). Off Windows the psmux entry points raise `NotImplementedError` and importing `hotkey` raises `ImportError`.
+- **`magent terminal install`** is gated on `supports_wt_keybindings()` — it edits Windows Terminal's own `settings.json`, which no other OS has. Elsewhere it says so and does nothing (see [Typing through psmux](#typing-through-psmux)).
 - The **mobile upload server** itself (serving the PWA over loopback + Tailscale and receiving images) runs everywhere; auto-pasting the uploaded path into a *live* agent session uses psmux, so that last hop is Windows-only. Likewise, `watch`'s table renders on every OS but its press-a-number-to-focus action uses the same Windows-only window primitives.
 
 ## Where agent states come from

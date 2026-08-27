@@ -443,6 +443,7 @@ class FakePlatform(Platform):
         supports_psmux: bool = False,
         supports_attention: bool = False,
         supports_hotkey: bool = False,
+        supports_wt_keybindings: bool = False,
         supports_nudge: bool = False,
         nudge_error: Exception | None = None,
         supports_close: bool = False,
@@ -463,6 +464,7 @@ class FakePlatform(Platform):
         self._supports_psmux = supports_psmux
         self._supports_attention = supports_attention
         self._supports_hotkey = supports_hotkey
+        self._supports_wt_keybindings = supports_wt_keybindings
         self._supports_nudge = supports_nudge
         self._nudge_error = nudge_error
         self._supports_close = supports_close
@@ -537,6 +539,9 @@ class FakePlatform(Platform):
 
     def supports_hotkey(self) -> bool:
         return self._supports_hotkey
+
+    def supports_wt_keybindings(self) -> bool:
+        return self._supports_wt_keybindings
 
     def supports_attention_signals(self) -> bool:
         return self._supports_attention

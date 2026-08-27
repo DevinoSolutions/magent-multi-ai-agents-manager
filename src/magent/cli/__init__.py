@@ -20,6 +20,7 @@ from magent.cli import (  # noqa: F401  # reason: side-effect import — runs ea
     mobile,
     session_picker,
     status,
+    terminal_cmd,
     ui,
     watch,
 )

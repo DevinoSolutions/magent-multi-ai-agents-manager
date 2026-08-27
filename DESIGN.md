@@ -1471,6 +1471,76 @@ and all three owners shown calling the one seam.
 changes a real process's priority, and it does so against a child it spawned and
 kills itself — never a pid it merely found.
 
+### The modifier is resolved before the multiplexer sees it (2026-08-27)
+
+psmux drops key MODIFIERS in transit. Verified on the live fleet: Ctrl+Backspace
+reaches the child as a plain Backspace (no word-delete) and Shift+Enter as a
+plain Enter — which in Claude Code SUBMITS instead of inserting a newline. Both
+are daily-driver keys; neither failure is the terminal's fault, and no amount of
+configuration inside the pane can recover a modifier that never arrived.
+
+The correct fix is upstream's: win32-input-mode (psmux#159), which encodes the
+full key event rather than a decoded byte. That PR died unmerged; we filed
+psmux#610 / #611 to revive it. Until one of those lands, the only place with
+both halves of the chord is the TERMINAL — so that is where magent fixes it. A
+Windows Terminal `sendInput` keybinding translates the chord locally and writes
+the resulting BYTES into the pty, and a byte has no modifier left to lose:
+
+- `ctrl+backspace` → `0x17`, the Ctrl+W word-erase byte every readline already
+  honors — the same workaround VS Code ships. Works through psmux **today**.
+- `shift+enter` → `0x1b 0x0d` (ESC CR), byte-for-byte what Claude Code's
+  `/terminal-setup` installs. Works outside psmux now and inside it once
+  upstream fixes its ESC+CR decode; installing it is correct either way.
+
+Why magent ships this rather than pointing at `/terminal-setup`: that command
+**refuses to run inside a tmux/psmux pane**, which is exactly and only where
+magent users are sitting when they hit the bug.
+
+Four properties the implementation is built around, each of which bit us live:
+
+1. **Round-trip the whole document, and refuse what you cannot parse.** Windows
+   Terminal accepts JSONC; the stdlib parser does not. A file magent cannot
+   parse is a file it must not REWRITE — `json.dump`-ing a guess would silently
+   delete the user's comments. `SettingsParseError` is a clean refusal that
+   prints the exact snippet to paste by hand, and nothing is written.
+2. **Control characters are ESCAPE TEXT in the file, never raw bytes.** A raw
+   `0x17` is invalid JSON and can break Windows Terminal outright. `BINDINGS`
+   holds real control characters in Python and `json.dump`'s default
+   `ensure_ascii=True` is what converts them — so nothing hand-writes the
+   escapes, and a unit test pins the literal escape text (backslash-u-0017, and backslash-u-001b backslash-r) in the
+   written bytes rather than trusting the encoder.
+3. **Two schema generations, and the file's own shape wins.** Modern (1.16+)
+   splits an entry in two — `actions` carries `command` + `id`, `keybindings`
+   carries `id` + `keys`; legacy carries `command` + `keys` inline (under
+   `actions`, or under `keybindings` in the oldest files). `detect_schema`
+   reads which one the file is written in and `_add_binding` matches it. The
+   `id`s are stable strings, because a reinstall that invented a new one would
+   grow a duplicate action every run.
+4. **Idempotent, and the user's binding always wins.** Already bound to our
+   exact `sendInput` → report and write nothing. Bound to ANYTHING else → warn,
+   skip that key, and still install the other one; conflicts are matched
+   through normalized key spelling (`Backspace+Ctrl` is the same chord as
+   `ctrl+backspace`) because a conflict we fail to SEE is a binding we would
+   silently duplicate. A timestamped backup lands beside the file before any
+   write.
+
+Surfaces: `magent terminal install` / `magent terminal status` (shaped after
+`magent hooks`), plus a `wt-keys` check in `magent doctor`. That check is
+WARN-at-worst by deliberate choice — a missing binding costs a word-delete, not
+a working fleet, and doctor's exit code is what CI and `magent status` read.
+
+Layering: the engine is the leaf `wt_keys.py` (stdlib + `magent.env` only, no
+I/O beyond the file it is handed) and the resolver is a seam
+(`candidate_paths` / `find_settings`, plus `--settings-file`), so no test and no
+smoke run ever touches a real settings.json. The OS gate is a capability probe
+(`Platform.supports_wt_keybindings()`), not a `sys.platform` branch.
+
+Proof: `tests/unit/test_wt_keys.py` — both schemas, the escape-text pin, the
+JSONC refusal (file byte-identical, snippet printed), the conflict skip with the
+other key still installing, the no-op rerun, the backup contents, and the
+off-Windows message. `tests/unit/test_doctor.py::TestCheckWtKeys` pins the
+check's four states and that it never fails a doctor run.
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.
