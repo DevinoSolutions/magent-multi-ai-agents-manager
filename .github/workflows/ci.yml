@@ -102,14 +102,18 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $url = "https://github.com/psmux/psmux/releases/download/v3.3.6/psmux-v3.3.6-windows-x64.zip"
-          $sha = "a56a890ea0829567818b9a368f16dcbd39c087f27328573df17c10dd39618947"
+          $url = "https://github.com/psmux/psmux/releases/download/v3.3.8/psmux-v3.3.8-windows-x64.zip"
+          $sha = "1ad127ba937194a890b933a73d9b023e297bd73dc742abd841bf159984c2effe"
           Invoke-WebRequest -Uri $url -OutFile psmux.zip
           $actual = (Get-FileHash psmux.zip -Algorithm SHA256).Hash.ToLower()
           if ($actual -ne $sha) { throw "psmux.zip sha256 mismatch: $actual" }
           $dest = Join-Path $env:LOCALAPPDATA "psmux"
           Expand-Archive psmux.zip -DestinationPath $dest -Force
           Add-Content $env:GITHUB_PATH $dest
+          # The zip ships the SAME binary under three names (psmux.exe,
+          # pmux.exe, tmux.exe) plus LICENSE/README. psmux.exe is the one
+          # find_psmux() looks for and the one psmux.PSMUX_IMAGE_NAMES sweeps,
+          # so that is the one whose presence and version must be proven here.
           & (Join-Path $dest "psmux.exe") -V
       - run: pytest tests/platform/ -v -m platform
       # Real-input tier: global SendInput chord + machine clipboard. CI-only

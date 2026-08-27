@@ -99,6 +99,10 @@ def _child_env(home) -> dict[str, str]:
     # ...and `attention -d` now supervises `magent serve` the same way, so a
     # test daemon would otherwise start a REAL upload server on this machine.
     env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
+    # ...and the psmux priority sweep reaches processes by IMAGE NAME, which
+    # no HOME redirect contains: a test-spawned serve/daemon must never
+    # re-prioritise the developer's real psmux fleet.
+    env["MAGENT_PSMUX_BOOST"] = "0"
     # Point XDG dirs into the sandbox home too, so a stray ~/.config write can't
     # escape into the real user's dotfiles.
     env["XDG_CONFIG_HOME"] = str(home / ".config")

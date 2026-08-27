@@ -176,6 +176,36 @@ def _plan_renderers(
     return renderers, warnings
 
 
+def _psmux_boost_tick() -> Callable[[], None]:
+    """The per-tick psmux priority sweep (see ``psmux.boost_priority``).
+
+    Unconditional -- no config gate and no second env gate -- because the sweep
+    has exactly one gate of its own (``MAGENT_PSMUX_BOOST``, read inside
+    ``boost_priority`` so every owner asks the same question) and is a no-op
+    off Windows and on an already-boosted fleet. A daemon that ticked for hours
+    while the fleet it watches typed slowly is precisely the gap this closes,
+    and unlike the upload server there is nothing here to spawn, so there is
+    nothing a user could be surprised by beyond the boost itself.
+    """
+    from magent.log import get_logger  # heavy subsystem: in-body per policy
+
+    # psmux is a leaf, not a heavy subsystem -- in-body only to keep this
+    # module's top-level import list matching its siblings' shape.
+    from magent.psmux import boost_priority
+
+    log = get_logger("attention")
+
+    def _tick() -> None:
+        try:
+            boost_priority()
+        except Exception:
+            # Same doctrine as the upload watchdog below: supervision must
+            # never take down the loop that is supposed to survive to look again.
+            log.exception("psmux boost: priority sweep failed")
+
+    return _tick
+
+
 def _upload_watchdog(
     cfg: MagentConfig, config_path: str | None
 ) -> Callable[[list[attention.SessionView]], None] | None:
@@ -222,6 +252,23 @@ def _upload_watchdog(
             # Supervision must never be able to kill the daemon it rides on --
             # the whole point is that something survives to look again.
             log.exception("upload supervisor: check failed")
+
+    return _tick
+
+
+def _daemon_tick(
+    cfg: MagentConfig, config_path: str | None
+) -> Callable[[list[attention.SessionView]], None]:
+    """Everything the daemon does per poll besides rendering: the psmux
+    priority sweep (always) and the upload-server watchdog (when this daemon
+    owns one). One hook, because ``run_attention_loop`` takes one."""
+    boost = _psmux_boost_tick()
+    watchdog = _upload_watchdog(cfg, config_path)
+
+    def _tick(views: list[attention.SessionView]) -> None:
+        boost()
+        if watchdog is not None:
+            watchdog(views)
 
     return _tick
 
@@ -387,7 +434,7 @@ def attention_cmd(
             renderers,
             poll_interval=poll_s,
             max_ticks=ticks,
-            on_tick=_upload_watchdog(cfg, str(config_path) if config_path else None),
+            on_tick=_daemon_tick(cfg, str(config_path) if config_path else None),
         )
     except KeyboardInterrupt:
         click.echo(f"\n  {style('Stopped.', dim=True)}")

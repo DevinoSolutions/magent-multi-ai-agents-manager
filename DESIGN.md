@@ -1351,6 +1351,126 @@ on any child's stderr, rotation demonstrably happened, and the retained files sa
 well under capacity so "missing" can only mean "lost", never "aged out". It goes
 RED on the old handler with the traceback above.
 
+### The interactive path outranks the fleet (2026-08-27)
+
+**Symptom.** Typing into a magent pane lagged badly whenever the box was under
+load — a visible delay between key and echo — while an ordinary Windows textbox
+on the same machine at the same moment stayed snappy. So it was not "the
+machine is busy"; it was *this* path being busy-starved.
+
+**Why that path is the one that loses.** A keystroke's echo crosses Windows
+Terminal → the psmux attach client → a named pipe → the psmux server → the
+ConPTY child, and all the way back, with the client repainting off a ~10 ms
+poll. Every hop is a separate process, and three facts about those processes
+compound:
+
+1. All of them run at `NORMAL_PRIORITY_CLASS`. Measured live: 169 `psmux.exe`
+   on the reporting machine, not one of them above normal.
+2. None of them gets the foreground-window boost Windows gives an interactive
+   app, because none of them owns a window — psmux is windowless by design.
+3. psmux never calls `SetPriorityClass` anywhere, so nothing was ever going to
+   change that on its own.
+
+Meanwhile the fleet those panes host — a dozen agents, their language servers,
+their builds — is genuinely CPU-hungry and *does* compete. The relay carrying
+the human's keystrokes was scheduled as an equal of the work it exists to let
+the human steer.
+
+**Decision: raise every psmux process to `ABOVE_NORMAL_PRIORITY_CLASS`, and
+keep it there with an idempotent sweep.**
+
+*Why `ABOVE_NORMAL` and not `HIGH`.* These processes are I/O-bound — blocked on
+a pipe, not spinning — so what they need is to be *picked* promptly when a key
+arrives, not to be given a larger share of CPU. `ABOVE_NORMAL` wins the wake-up
+race and costs the compute fleet essentially nothing, because a process that is
+blocked consumes no quantum however high its class. `HIGH` is a different
+promise (it outranks most of the system, including things a user is entitled to
+have go first), and unlike `ABOVE_NORMAL` it is the class where a runaway
+starts to hurt. It also matters that raising one's own processes to
+`ABOVE_NORMAL` needs **no elevation** — this is a feature that must work on a
+normal user's desktop with no UAC prompt, or it is a feature nobody has on.
+
+*Why a sweep and not a spawn-time flag,* which is the part that decides the
+whole shape: a Windows priority class is **not inherited by grandchildren**, and
+magent never `CreateProcess`-es the psmux SERVER at all — the one-shot psmux
+client forks it. There is no magent-owned spawn for a flag to ride on. Anything
+that only acted at creation time would therefore boost the client that exits a
+second later and miss the server that lives for eight hours. An enumeration of
+the live process list is the only thing that can reach the process that matters,
+which is why this is a background job rather than a launch argument.
+
+*Why it never downgrades.* The sweep raises from `NORMAL` / `BELOW_NORMAL` /
+`IDLE` and touches nothing else. `HIGH` and `REALTIME` are absent from
+`procs._RAISABLE_FROM` on purpose: somebody — a user, another tool, the process
+itself — put a process there deliberately, and a job that ran every 30 seconds
+and quietly demoted it would be a background sweep overruling a foreground
+decision. (`GetPriorityClass` answers 0 on failure, which is in no set here, so
+a failed read can never be mistaken for a boostable `NORMAL`.) Per-pid failures
+— a pid that exited between the snapshot and the `OpenProcess`, another user's
+process, a protected one — are skipped rather than raised, because an aborted
+sweep boosts an arbitrary *prefix* of the fleet, which is worse than not
+sweeping at all.
+
+*Why three owners.* Each covers a hole the other two leave, and the seam
+(`psmux.boost_priority`) is identical for all three so "who boosts" is never a
+question about behaviour:
+
+- **The launch path** (`launch._start_psmux_and_upload`) boosts the fleet it
+  has just created — the moment the boost is most obviously owed.
+- **The attention daemon** re-sweeps on every poll, which is what catches
+  sessions born later: `magent attach`, `magent up`, a hand-run `psmux
+  new-session` hours after the last bring-up.
+- **`magent serve`** sweeps too, on its own daemon thread. This is the one that
+  matters most in practice and the reason two owners were not enough: on a real
+  box serve is effectively always running (every upload and every Alt+V press
+  goes through it, and `attention -d` revives it) while the attention daemon
+  frequently is not. It is a separate thread from `_supervise_hotkey` rather
+  than a branch inside it because that supervisor returns early on
+  `MAGENT_HOTKEY_SUPERVISOR=0`, and a user who owns their listener's lifetime
+  has said nothing whatsoever about process priority.
+
+Three owners are safe precisely because the sweep is idempotent and cheap — one
+Toolhelp snapshot plus one `OpenProcess` per psmux pid, single-digit
+milliseconds — and because it logs only transitions, so a steady state is
+silent rather than the loudest line in the file.
+
+*The image-name set,* decided against the real artifact rather than assumed: the
+Windows release zip (v3.3.6 and v3.3.8 alike) ships the same binary three times
+— `psmux.exe`, `pmux.exe`, `tmux.exe` — and `Expand-Archive` drops all three
+side by side, so which name a running server carries is whichever one was
+invoked. `psmux.PSMUX_IMAGE_NAMES` claims the first two. `tmux.exe` is
+deliberately excluded: that name is not psmux's to claim (an MSYS2 / Cygwin /
+Git-for-Windows box can carry an unrelated `tmux.exe`), and a sweep that reached
+it would be re-prioritising a process magent never launched and knows nothing
+about. The cost of the omission is bounded and visible — a user who invokes the
+tmux-named copy keeps today's `NORMAL`, i.e. today's behaviour.
+
+*The kill switch is a test-isolation law, not a preference.*
+`MAGENT_PSMUX_BOOST=0` joins `MAGENT_HOTKEY_SUPERVISOR` and
+`MAGENT_UPLOAD_SUPERVISOR`, and it is the sharpest of the three: this sweep is
+the only thing in the product that reaches processes it did not spawn, matched
+by IMAGE NAME, and no HOME redirect can contain that. A test that started a real
+`serve` or `attention -d` on the developer's box would otherwise re-prioritise
+that box's entire live fleet. `tests/conftest.py` pins it off for every tier and
+every fixture that builds an explicit child `env=` sets it alongside the other
+two.
+
+Layering: the ctypes primitive lives in `procs.py` (the leaf that already owns
+`pid_alive` and `spawn_unjobbed`), and `count_processes` was refactored onto the
+same `snapshot_processes` walk it needed — a second copy of a Windows process
+primitive is exactly how one of them silently rots, the lesson `spawn_unjobbed`
+already encodes. The psmux-specific policy (which names, which env gate, the log
+line) lives in `psmux.py`, the module that already owns every other fact about
+the psmux binary.
+
+Proof: `tests/unit/test_psmux_boost.py` drives the injected
+enumerator/setter seams — only-matching-names-opened, never-downgrades,
+idempotent, per-pid failure tolerated, kill switch honoured, off-Windows no-op,
+and all three owners shown calling the one seam.
+`tests/unit/test_procs.py::TestRaisePriorityAboveNormal` is the only test that
+changes a real process's priority, and it does so against a child it spawned and
+kills itself — never a pid it merely found.
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.

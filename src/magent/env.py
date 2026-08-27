@@ -84,6 +84,20 @@ class MagentEnv(BaseSettings):
     # settable -- the e2e tier drives a real revive twice and would otherwise
     # have to sit out the production default to prove the second one.
     upload_respawn_cooldown_s: float | None = None
+    # Whether magent raises every live psmux process to ABOVE_NORMAL priority
+    # (see psmux.boost_priority). On by default -- psmux processes are the
+    # keystroke path for every agent pane, they are I/O-bound (blocked on a
+    # pipe, not competing for CPU), and they get no foreground-window boost
+    # because they own no window.
+    #
+    # The opt-out is the third member of the same test-isolation law as
+    # hotkey_supervisor and upload_supervisor, and for the sharpest reason of
+    # the three: the sweep is the ONE thing in this product that reaches
+    # processes it did not spawn and that no HOME redirect can contain. A test
+    # that starts a real `serve` or `attention -d` on a developer's box would
+    # otherwise re-prioritise that box's entire live fleet. tests/conftest.py
+    # pins it to 0 for every tier, exactly as it does upload_supervisor.
+    psmux_boost: bool = True
 
     @model_validator(mode="after")
     def _no_unknown_magent_vars(self) -> MagentEnv:

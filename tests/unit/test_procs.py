@@ -15,9 +15,12 @@ import sys
 import pytest
 
 from magent.procs import (
+    ABOVE_NORMAL_PRIORITY_CLASS,
     CREATE_BREAKAWAY_FROM_JOB,
     count_processes,
     pid_alive,
+    pids_by_image_name,
+    raise_priority_above_normal,
     spawn_unjobbed,
 )
 
@@ -66,6 +69,88 @@ class TestCountProcesses:
         # None, never 0: a caller that rendered "0 psmux.exe resident" on Linux
         # would be inventing a fact.
         assert count_processes("psmux.exe") is None
+
+
+class TestPidsByImageName:
+    """The enumerator half of the psmux priority sweep. READ-ONLY here by
+    design: it is asked about this interpreter's own image name, so the
+    assertion never depends on -- and never touches -- anything else running on
+    the machine."""
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Toolhelp is win32-only")
+    def test_it_finds_our_own_process(self):
+        assert os.getpid() in pids_by_image_name({os.path.basename(sys.executable)})
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Toolhelp is win32-only")
+    def test_it_matches_case_insensitively_like_windows(self):
+        exe = os.path.basename(sys.executable)
+        assert os.getpid() in pids_by_image_name({exe.upper()})
+        assert os.getpid() in pids_by_image_name({exe.lower()})
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Toolhelp is win32-only")
+    def test_a_name_nothing_runs_finds_nothing(self):
+        assert pids_by_image_name({"magent-definitely-not-running.exe"}) == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the POSIX branch")
+    def test_off_windows_it_is_empty(self):
+        assert pids_by_image_name({"psmux.exe"}) == []
+
+
+class TestRaisePriorityAboveNormal:
+    """The setter half. The ONLY test in the suite that changes a real
+    process's priority class, and it does so against a child it spawned itself
+    and kills in the same test -- never a pid it merely found. (The developer
+    box this feature was written on runs a 169-process psmux fleet; a test that
+    swept it would be re-prioritising production.)"""
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="priority classes are win32")
+    def test_it_really_raises_a_child_we_spawned(self):
+        import ctypes
+
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            assert raise_priority_above_normal(child.pid) is True
+
+            k = ctypes.windll.kernel32
+            handle = k.OpenProcess(0x1000, False, child.pid)  # QUERY_LIMITED
+            try:
+                assert k.GetPriorityClass(handle) == ABOVE_NORMAL_PRIORITY_CLASS
+            finally:
+                k.CloseHandle(handle)
+
+            # Idempotent: a second call finds it already above normal and
+            # reports no change, which is what keeps a 30s sweep silent.
+            assert raise_priority_above_normal(child.pid) is False
+        finally:
+            child.kill()
+            child.wait()
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="priority classes are win32")
+    def test_a_pid_we_cannot_open_is_false_not_an_exception(self):
+        # PID 4 is the System process: OpenProcess refuses a non-elevated
+        # caller outright, so nothing is read and nothing is written. This is
+        # the shape of every per-pid failure the sweep meets on a live box (a
+        # pid that exited between the snapshot and the open, another user's
+        # process, a protected one) and none of them may raise -- an exception
+        # here would abort the sweep partway through the fleet.
+        assert raise_priority_above_normal(4) is False
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="priority classes are win32")
+    def test_an_exited_child_whose_handle_we_still_hold_is_harmless(self):
+        # Measured, and deliberately NOT asserted as False: while a Popen keeps
+        # the process HANDLE open, Windows keeps the process object alive, so
+        # OpenProcess/SetPriorityClass both succeed against a pid whose program
+        # has exited. That is a no-op on a corpse, and it cannot reach the real
+        # sweep anyway -- pids_by_image_name only ever yields processes the
+        # Toolhelp snapshot listed as running. What matters is that it does not
+        # raise.
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        assert raise_priority_above_normal(child.pid) in (True, False)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the POSIX branch")
+    def test_off_windows_it_reports_no_change(self):
+        assert raise_priority_above_normal(os.getpid()) is False
 
 
 class TestPidAlive:

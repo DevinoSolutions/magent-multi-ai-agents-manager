@@ -259,6 +259,10 @@ class _World:
         # default ever changes.
         env["MAGENT_UPLOAD_SUPERVISOR"] = "1"
         env["MAGENT_UPLOAD_RESPAWN_COOLDOWN_S"] = str(_COOLDOWN_S)
+        # ...and the psmux priority sweep reaches processes by IMAGE NAME, which
+        # no HOME redirect contains: a test-spawned serve/daemon must never
+        # re-prioritise the developer's real psmux fleet.
+        env["MAGENT_PSMUX_BOOST"] = "0"
         env["PATH"] = shim_path + os.pathsep + env.get("PATH", "")
         return env
 

@@ -176,6 +176,12 @@ A dropped connection must never kill work on the host. That is not automatic on 
 
 Note that `magent down --all` *is* the deliberate way to stop everything: it kills every psmux session on the machine along with the agent running in each, not just the daemons. Name sessions explicitly (`magent down api web`) or use `-g/--group` to stop a subset.
 
+#### Your typing outranks your fleet
+
+On Windows, magent keeps every psmux process at **above-normal** priority. Your keystrokes reach an agent through a chain of psmux processes, none of which owns a window — so Windows never gives them the boost it gives a foreground app, and under load they queue behind the very builds and language servers they are hosting. That is the difference between typing that feels instant and typing that lags while a normal text box on the same machine stays snappy. The processes are waiting on a pipe rather than burning CPU, so the boost costs your agents nothing.
+
+It needs no administrator rights, it only ever *raises* a process (anything you or another tool put at high/realtime priority is left alone), and it re-runs periodically so sessions created later are covered too. Set `MAGENT_PSMUX_BOOST=0` to leave every process's priority exactly as it is.
+
 ### Mobile image upload (over Tailscale)
 
 Send screenshots from your phone straight into a project's agent session:

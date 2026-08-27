@@ -928,6 +928,16 @@ def _start_psmux_and_upload(
                 make_title(pw.window_name, prefix=config.settings.window_title_prefix),
                 psmux_colors.get(pw.window_name),
             )
+        # The fleet that was just created IS the interactive path -- every
+        # keystroke in every pane crosses one of these processes. Sweeping here
+        # (rather than flagging the spawn) is the only thing that can work: the
+        # psmux SERVER is a grandchild forked by the one-shot client, and a
+        # Windows priority class is not inherited across that. Failure is never
+        # this path's problem -- the sessions are up either way.
+        try:
+            psmux.boost_priority()
+        except OSError as exc:
+            get_logger("launch").warning("psmux boost: priority sweep failed (%s)", exc)
         click.echo(
             f"\n  {style('#', fg='yellow')} psmux: {style(str(len(psmux_windows)), fg='yellow', bold=True)} sessions"
             f" {style('(synced with mobile)', dim=True)}"
