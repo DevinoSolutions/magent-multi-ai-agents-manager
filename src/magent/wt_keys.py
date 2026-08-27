@@ -353,14 +353,14 @@ def _add_binding(doc: dict[str, object], binding: WtBinding, schema: str) -> Non
 
 @dataclass
 class InstallReport:
+    """What ``install`` did. ``backup is None`` means nothing was written --
+    the backup is created only alongside a real change, so it doubles as the
+    "did this run touch the file" answer."""
+
     path: Path
     schema: str
     outcomes: list[KeyState] = field(default_factory=list)
     backup: Path | None = None
-
-    @property
-    def changed(self) -> bool:
-        return self.backup is not None
 
 
 ADDED = "added"
