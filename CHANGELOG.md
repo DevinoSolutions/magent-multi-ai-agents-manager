@@ -5,6 +5,34 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.15.0] - 2026-08-31
+
+### Changed
+
+- **A local Alt+V press pastes natively -- the capture/upload pipeline
+  is for machines apart.** The BMP capture, HTTP upload and `send-keys`
+  inject exist to move an image between machines (laptop viewer to
+  desktop host over attach; phone to host over the upload page). On the
+  same machine they are pure overhead: the pane's agent reads the
+  clipboard itself on a paste keystroke, and locally that clipboard is
+  the one you copied into. A press whose listener is locally wired now
+  sends exactly one Ctrl+V into the pane and the agent pastes a real
+  attachment -- no capture, no upload, no file under
+  `~/.magent/uploads`. Remote-attach and phone uploads are untouched,
+  and `MAGENT_ALTV_NATIVE=0` restores the upload path locally for
+  agents without native clipboard paste. The status line narrates the
+  shorter script: `Alt+V: pasting...` then `Alt+V: pasted from
+  clipboard`.
+
+### Added
+
+- **A real end-to-end guard against the empty-terminal storm.** A new
+  cross-OS test tier drives a genuinely console-less `magent serve`
+  through flash, upload-inject and session-probe traffic and asserts
+  no psmux spawn ever opens a visible console window -- the regression
+  behind 3.14.0's burst-of-empty-terminals fix can no longer return
+  silently.
+
 ## [3.14.0] - 2026-08-31
 
 ### Added
