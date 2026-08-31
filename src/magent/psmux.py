@@ -966,6 +966,16 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
         [psmux, "-L", name, "set", "-g", "status-left", _STATUS_BRAND],
         [psmux, "-L", name, "set", "-g", "status-left-length", _STATUS_BRAND_LEN],
         f2,
+        # The window NAME is magent's too (same doctrine as window titles):
+        # psmux's automatic-rename shows the pane's current command, so the bar
+        # read "0:claude.exe.old" after Claude Code's self-update renamed its
+        # own binary -- an implementation detail of the pane's process, not
+        # what the user is working on. The rename is idempotent, sticks across
+        # command changes (verified live on psmux 3.3.8), and self-repairs on
+        # every decoration pass; the explicit automatic-rename off is belt and
+        # braces for a psmux that ever starts re-renaming.
+        [psmux, "-L", name, "rename-window", "-t", name, name],
+        [psmux, "-L", name, "set", "-g", "automatic-rename", "off"],
     ]
 
 

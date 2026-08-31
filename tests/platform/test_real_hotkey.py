@@ -152,14 +152,17 @@ def _free_port() -> int:
 # --- real Win32 primitives (defined lazily: module must import on POSIX) -----
 
 
-def _make_dib() -> tuple[bytes, bytes]:
-    """A real 4x4 32bpp BI_RGB DIB and the exact BMP the product must write.
+def _make_dib() -> tuple[bytes, list[bytes]]:
+    """A real 4x4 32bpp BI_RGB DIB and the RGB pixel rows (top-first) any
+    faithful encoding of it must carry.
 
-    The product's DIB->BMP wrapper (hotkey._dib_to_bmp) prepends a 14-byte BMP
-    file header and forces every 4th (alpha) byte opaque for 32bpp DIBs. The
-    pixels here already carry 0xFF alpha, so expected == header + dib
-    unchanged -- an independent hand-built expectation, not a call into the
-    code under test.
+    The product now encodes this mainstream DIB shape as a PNG
+    (hotkey._dib_to_png; BMP is only the fallback for shapes the encoder
+    refuses). The expectation stays independent of the code under test: the
+    rows are hand-derived from the same generator that builds the DIB
+    (bottom-up BGRA -> top-first RGB, alpha dropped), and the assertion
+    decodes the uploaded file with a hand-rolled zlib/struct reader -- the
+    reverse direction of the encoder.
     """
     width = height = 4
     pixels = b"".join(
@@ -177,16 +180,49 @@ def _make_dib() -> tuple[bytes, bytes]:
         + b"\x00" * 16  # x/y ppm, clr used, clr important
     )
     dib = header + pixels
-    file_size = 14 + len(dib)
-    offset = 14 + 40
-    bmp = (
-        b"BM"
-        + file_size.to_bytes(4, "little")
-        + b"\x00\x00\x00\x00"
-        + offset.to_bytes(4, "little")
-        + dib
-    )
-    return dib, bmp
+    rows = []
+    for row in range(height - 1, -1, -1):  # bottom-up storage -> top-first
+        chunk = pixels[row * width * 4 : (row + 1) * width * 4]
+        rows.append(
+            b"".join(
+                bytes((chunk[o + 2], chunk[o + 1], chunk[o]))  # BGRA -> RGB
+                for o in range(0, len(chunk), 4)
+            )
+        )
+    return dib, rows
+
+
+def _decode_png(data: bytes) -> tuple[int, int, list[bytes]]:
+    """Minimal independent PNG reader for the assertion: signature, IHDR,
+    concatenated-IDAT inflate, filter-0 scanlines only -- anything fancier
+    fails loudly rather than being silently tolerated."""
+    import struct
+    import zlib
+
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG signature"
+    pos = 8
+    ihdr = None
+    idat = b""
+    while pos + 8 <= len(data):
+        (length,) = struct.unpack(">I", data[pos : pos + 4])
+        tag = data[pos + 4 : pos + 8]
+        payload = data[pos + 8 : pos + 8 + length]
+        if tag == b"IHDR":
+            ihdr = struct.unpack(">IIBBBBB", payload)
+        elif tag == b"IDAT":
+            idat += payload
+        pos += 12 + length
+    assert ihdr is not None, "PNG has no IHDR"
+    width, height, depth, color, comp, filt, interlace = ihdr
+    assert (depth, color, comp, filt, interlace) == (8, 2, 0, 0, 0), ihdr
+    raw = zlib.decompress(idat)
+    stride = 1 + width * 3
+    rows = []
+    for r in range(height):
+        line = raw[r * stride : (r + 1) * stride]
+        assert line[0] == 0, f"row {r} uses filter {line[0]}, expected 0"
+        rows.append(line[1:])
+    return width, height, rows
 
 
 def _set_clipboard_dib(dib: bytes) -> None:
@@ -528,7 +564,7 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
     session_created = False
     handles = []
     uploads = home / ".magent" / "uploads"
-    pre_existing = set(uploads.glob("*_clipboard.bmp")) if uploads.is_dir() else set()
+    pre_existing = set(uploads.glob("*_clipboard.*")) if uploads.is_dir() else set()
 
     def _sink(path):
         fh = path.open("wb")
@@ -659,7 +695,7 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
         )
 
         # 5. A REAL image on the REAL clipboard.
-        dib, expected_bmp = _make_dib()
+        dib, expected_rows = _make_dib()
         _set_clipboard_dib(dib)
         flashes_before = len(_served_flashes(home, name))
 
@@ -670,7 +706,7 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
         def _uploaded():
             if not uploads.is_dir():
                 return None
-            new = sorted(set(uploads.glob("*_clipboard.bmp")) - pre_existing)
+            new = sorted(set(uploads.glob("*_clipboard.*")) - pre_existing)
             return new[-1] if new else None
 
         attempts_log: list[str] = []
@@ -697,11 +733,15 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
             + _read_log(home, "upload")
         )
 
-        # 7a. The uploaded artifact is byte-for-byte the BMP the product's
-        #     DIB->BMP wrapper must produce for our DIB.
-        assert dest.read_bytes() == expected_bmp, (
-            f"uploaded BMP does not match the expected wrap of the clipboard "
-            f"DIB ({dest})"
+        # 7a. The uploaded artifact is a PNG faithfully carrying our DIB's
+        #     pixels. A 32bpp BI_RGB DIB is the mainstream shape, so .png is
+        #     asserted, not just tolerated -- a BMP fallback here would be a
+        #     capture regression.
+        assert dest.suffix == ".png", f"expected a PNG upload, got {dest.name}"
+        png_w, png_h, png_rows = _decode_png(dest.read_bytes())
+        assert (png_w, png_h) == (4, 4), (png_w, png_h)
+        assert png_rows == expected_rows, (
+            f"uploaded PNG pixels do not match the clipboard DIB ({dest})"
         )
 
         # 7b. The path was injected into the LIVE psmux session.
@@ -790,7 +830,7 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
         # Real-HOME tidy-up: remove exactly the artifacts this test created
         # (uploaded file, stale listener pid left by the hard kill).
         if uploads.is_dir():
-            for f in set(uploads.glob("*_clipboard.bmp")) - pre_existing:
+            for f in set(uploads.glob("*_clipboard.*")) - pre_existing:
                 with contextlib.suppress(OSError):
                     f.unlink()
         with contextlib.suppress(OSError):

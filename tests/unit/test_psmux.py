@@ -1147,14 +1147,17 @@ class TestDecorateSession:
         ]
 
     @pytest.mark.parametrize("code_hint", [True, False])
-    def test_the_argv_is_the_six_decorations(self, code_hint):
+    def test_the_argv_is_the_eight_decorations(self, code_hint):
         # The list is what every call site fans out, so its shape is contract:
-        # a seventh command (or a dropped one) has to be a deliberate edit here.
-        # Gating F2 changes the hint TEXT and the LAST command's form, never the
+        # a ninth command (or a dropped one) has to be a deliberate edit here.
+        # Gating F2 changes the hint TEXT and the F2 command's form, never the
         # four `set`s -- dropping one of those would leave a personal tmux.conf's
-        # value in place.
+        # value in place. The last two own the WINDOW NAME: psmux's
+        # automatic-rename showed the pane's command ("0:claude.exe.old" after
+        # a Claude self-update), so every decoration pass pins the window name
+        # back to the project and turns the auto-rename off.
         argv = psmux.decoration_argv("api", "psmux", code_hint)
-        assert len(argv) == 6
+        assert len(argv) == 8
         assert argv[0][3:] == ["bind", "-n", "F1", "detach-client"]
         assert [cmd[5] for cmd in argv[1:5]] == [
             "status-right",
@@ -1163,6 +1166,8 @@ class TestDecorateSession:
             "status-left-length",
         ]
         assert argv[5][3] in {"bind", "unbind-key"}
+        assert argv[6][3:] == ["rename-window", "-t", "api", "api"]
+        assert argv[7][3:] == ["set", "-g", "automatic-rename", "off"]
 
     def test_status_left_length_fits_the_brand(self):
         # The number is only correct relative to the brand text; pin the
@@ -1329,7 +1334,7 @@ class TestDecorateSession:
         # A status bar is cosmetic: an unlaunchable/hung psmux is logged and
         # swallowed, never propagated into a bring-up.
         cmds = self._run(monkeypatch, boom=OSError("no psmux"))
-        assert len(cmds) == 6  # all attempted; none escaped
+        assert len(cmds) == 8  # all attempted; none escaped
 
     def test_never_raises_on_timeout(self, monkeypatch):
         self._run(monkeypatch, boom=subprocess.TimeoutExpired("psmux", 3))

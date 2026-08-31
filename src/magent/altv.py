@@ -283,6 +283,15 @@ def upload_image(
     non-ASCII) cause for hotkey.log. Splitting the three is what lets the bar
     stay short and specific while the log stays complete.
     """
+    # The capture hands over encoded bytes, not a format promise: the win32
+    # side emits PNG for the common screenshot DIBs and falls back to BMP for
+    # exotic ones, so the filename the server suffixes from is sniffed off the
+    # actual magic rather than hardcoded.
+    ext, mime = (
+        ("png", "image/png")
+        if image_data.startswith(b"\x89PNG\r\n\x1a\n")
+        else ("bmp", "image/bmp")
+    )
     boundary = "----MagentUpload"
     delim = f"--{boundary}"
     body = (
@@ -296,8 +305,8 @@ def upload_image(
             f"\r\n"
             f"1\r\n"
             f"{delim}\r\n"
-            f'Content-Disposition: form-data; name="file"; filename="clipboard.bmp"\r\n'
-            f"Content-Type: image/bmp\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="clipboard.{ext}"\r\n'
+            f"Content-Type: {mime}\r\n"
             f"\r\n"
         ).encode()
         + image_data
