@@ -154,6 +154,65 @@ class TestRunMagentCharacterization:
         assert len(fp.attached_psmux) == 1
         assert fp.launched_terminals == []
 
+    def test_a_space_named_project_keys_on_the_sanitized_name(
+        self, monkeypatch, tmp_path, fake_sleep
+    ):
+        # The psmux window's REAL title carries the sanitized session name
+        # ("GitHub Advertisment" -> "GitHub-Advertisment"; spaces, dots and
+        # colons become "-"), so the session, the attach title and the tiling
+        # target must all share that one key. Before this pin the raw title
+        # was the key: the already-running probe hunted a title no window
+        # ever carries (respawning the project on every --go) and the tile
+        # pass printed "x ... not found" for it.
+        fp = FakePlatform(supports_psmux=True)
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+        cfg = MagentConfig(
+            projects=[
+                ProjectConfig(
+                    path=str(tmp_path), tool="claude", title="GitHub Advertisment"
+                )
+            ],
+            settings=Settings(
+                tools={"claude": "claude --continue"}, default_tool="claude", psmux=True
+            ),
+        )
+
+        rc = run_magent(cfg, RunOpts())
+
+        assert rc == 0
+        assert [w.window_name for w in fp.launched_psmux] == ["GitHub-Advertisment"]
+        assert fp.attached_psmux[0][:2] == (
+            "GitHub-Advertisment",
+            "magent:GitHub-Advertisment",
+        )
+
+    def test_a_space_named_project_with_its_window_open_is_not_respawned(
+        self, monkeypatch, tmp_path, fake_sleep
+    ):
+        # The dedupe half: a window titled with the sanitized name IS this
+        # project's window, so nothing is launched -- and under a retile it
+        # is found and moved, not reported missing.
+        fp = FakePlatform(
+            supports_psmux=True, windows={"magent:GitHub-Advertisment": 7}
+        )
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+        cfg = MagentConfig(
+            projects=[
+                ProjectConfig(
+                    path=str(tmp_path), tool="claude", title="GitHub Advertisment"
+                )
+            ],
+            settings=Settings(
+                tools={"claude": "claude --continue"}, default_tool="claude", psmux=True
+            ),
+        )
+
+        rc = run_magent(cfg, RunOpts(retile_all=True))
+
+        assert rc == 0
+        assert fp.launched_psmux == []
+        assert [h for h, _rect in fp.moved] == [7]
+
     def test_empty_group_returns_zero(
         self, fake_platform, tmp_path, fake_sleep, capsys
     ):

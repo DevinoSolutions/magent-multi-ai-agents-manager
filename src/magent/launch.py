@@ -834,7 +834,16 @@ def _dispatch_cli_agent_project(
             cmd = _wrap_happy(win_tool, cmd)
 
         proj_psmux = use_psmux and not is_remote
-        running = is_running(win_title, match_mode)
+        # A psmux window's REAL title carries the sanitized session name --
+        # that is what `attach_psmux` titles it with (spaces/dots/colons
+        # become "-", see `psmux.session_name`). The already-running probe and
+        # the tiling target must key on that same string: probing with the raw
+        # title meant a project named "GitHub Advertisment" respawned a fresh
+        # window on every --go and its tile pass hunted a title that never
+        # exists ("x ... not found"). Non-psmux windows are titled with the
+        # raw title, so they keep keying on it.
+        tile_key = _psmux_session_name(win_title) if proj_psmux else win_title
+        running = is_running(tile_key, match_mode)
         # Window-level dedupe, the same three-way rule the attach path uses:
         # an already-OPEN window is never collected, because every collected
         # window gets an `attach_psmux` -- which spawns a BRAND-NEW terminal
@@ -846,15 +855,14 @@ def _dispatch_cli_agent_project(
         if proj_psmux and not running and not opts.dry_run and not opts.tile_only:
             resolved_dir = _resolve_path(proj.path, base_dir)
             if resolved_dir:
-                wname = _psmux_session_name(win_title)
                 psmux_windows.append(
                     PsmuxWindowOpts(
-                        window_name=wname,
+                        window_name=tile_key,
                         cwd=resolved_dir,
                         command=cmd,
                     )
                 )
-                psmux_colors[wname] = proj.color
+                psmux_colors[tile_key] = proj.color
         if not running and not opts.dry_run and not opts.tile_only and not proj_psmux:
             if is_remote:
                 resolved_dir = proj.remote_path or proj.path
@@ -887,7 +895,7 @@ def _dispatch_cli_agent_project(
         if not running:
             new_count += 1
         targets.append(
-            _Target(name=win_title, key=win_title, mode=match_mode, is_new=not running)
+            _Target(name=tile_key, key=tile_key, mode=match_mode, is_new=not running)
         )
         _log_project(
             win_title, win_tool, running, proj.host, happy=use_happy, psmux=proj_psmux
