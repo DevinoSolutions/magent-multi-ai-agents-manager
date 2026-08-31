@@ -28,6 +28,29 @@ if TYPE_CHECKING:
 
 from magent.log import get_logger
 
+# Every one-shot psmux client this module spawns is a CONTROL or PROBE command
+# whose output is piped or discarded -- no human ever looks at its console. On
+# Windows that console is not free: a console-subsystem child whose parent has
+# no console gets a brand-new one, and on Windows 11 the default terminal is
+# Windows Terminal, so each spawn materializes as a real, empty, focus-stealing
+# WT window. The processes that call into this module without a console are
+# exactly the supervised fleet -- `magent serve`, `attention -d`, and the
+# hotkey listener are all spawned `DETACHED_PROCESS | CREATE_NO_WINDOW` (see
+# `launch.spawn_detached`) -- so one Alt+V press (three narration flashes, the
+# paste `send-keys`, a discovery fan-out probing every configured session)
+# opened dozens of empty terminals at once and froze the desktop (observed
+# live 2026-08-31). CREATE_NO_WINDOW gives each child a windowless conhost
+# instead: psmux control commands are indifferent to it (verified against the
+# real 3.3.8 binary -- `-V` and a bogus-socket `list-sessions` both answer
+# rc 0 under the flag). The value is hand-defined because the attribute only
+# exists on Windows (same pattern as `launch.spawn_detached`); POSIX passes 0,
+# which `Popen` accepts as "no flags". The one psmux spawn that must NOT carry
+# this lives in `platform/windows.py` (`new-session`, which deliberately
+# inherits the caller's console -- see the comment there); every spawn in THIS
+# module must, and a unit contract test walks the AST to enforce it.
+_CREATE_NO_WINDOW = 0x08000000  # subprocess.CREATE_NO_WINDOW, a win32-only attr
+_SPAWN_FLAGS = _CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
 
 @functools.lru_cache(maxsize=1)
 def find_psmux() -> str | None:
@@ -202,6 +225,7 @@ def has_session(
             capture_output=True,
             timeout=timeout,
             check=False,
+            creationflags=_SPAWN_FLAGS,
         )
     except subprocess.TimeoutExpired:
         return False
@@ -228,6 +252,7 @@ def _probe_live(names: list[str], binary: str, timeout: float | None) -> set[str
                         [binary, "-L", name, "has-session", "-t", name],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
+                        creationflags=_SPAWN_FLAGS,
                     ),
                 )
             )
@@ -356,6 +381,7 @@ def probe_control_plane(
             stderr=subprocess.DEVNULL,
             timeout=timeout,
             check=False,
+            creationflags=_SPAWN_FLAGS,
         )
     except subprocess.TimeoutExpired:
         return ControlProbe(
@@ -397,6 +423,7 @@ def kill_server(name: str, psmux: str | None = None) -> bool:
             capture_output=True,
             timeout=_KILL_TIMEOUT_S,
             check=False,
+            creationflags=_SPAWN_FLAGS,
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -523,7 +550,13 @@ def send_keys(
     cmd.extend(keys)
     started = time.monotonic()
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            creationflags=_SPAWN_FLAGS,
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         get_logger("launch").warning(
             "send-keys to project=%s gave up after %.1fs: %s",
@@ -569,6 +602,7 @@ def pane_cwd(name: str, psmux: str | None = None) -> str:
             encoding="utf-8",
             errors="replace",
             check=False,
+            creationflags=_SPAWN_FLAGS,
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -590,6 +624,7 @@ def capture_pane(name: str, psmux: str | None = None) -> str:
             encoding="utf-8",
             errors="replace",
             check=False,
+            creationflags=_SPAWN_FLAGS,
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -637,6 +672,7 @@ def pane_current_command(name: str, psmux: str | None = None) -> str:
             encoding="utf-8",
             errors="replace",
             check=False,
+            creationflags=_SPAWN_FLAGS,
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -675,6 +711,7 @@ def pane_current_commands(names: list[str], psmux: str | None = None) -> dict[st
                 stderr=subprocess.DEVNULL,
                 encoding="utf-8",
                 errors="replace",
+                creationflags=_SPAWN_FLAGS,
             )
         except OSError:
             procs[name] = None
@@ -761,7 +798,13 @@ def flash_message(
     cmd += ["display-message", "-d", str(duration_ms), message]
     started = time.monotonic()
     try:
-        subprocess.run(cmd, capture_output=True, timeout=FLASH_TIMEOUT_S, check=False)
+        subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=FLASH_TIMEOUT_S,
+            check=False,
+            creationflags=_SPAWN_FLAGS,
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         get_logger("upload").warning(
             "status-line flash failed for project=%s after %.1fs: %s",
@@ -946,7 +989,13 @@ def decorate_session(
         code_hint = code_on_path()
     for cmd in decoration_argv(name, binary, code_hint):
         try:
-            subprocess.run(cmd, capture_output=True, timeout=3, check=False)
+            subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=3,
+                check=False,
+                creationflags=_SPAWN_FLAGS,
+            )
         except (OSError, subprocess.SubprocessError) as exc:
             get_logger("launch").warning(
                 "status-line decoration failed for session=%s: %s", name, exc
@@ -1079,6 +1128,7 @@ def decorate_sessions_async(
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    creationflags=_SPAWN_FLAGS,
                 )
         except OSError as exc:
             # Same posture as decorate_session's: cosmetic, so a session whose
@@ -1104,6 +1154,7 @@ def detach_client(name: str, psmux: str | None = None) -> bool:
             capture_output=True,
             timeout=3,
             check=False,
+            creationflags=_SPAWN_FLAGS,
         )
     except (OSError, subprocess.SubprocessError):
         return False
