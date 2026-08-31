@@ -59,6 +59,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Alt+V no longer spawns a burst of empty terminal windows.** On
+  Windows, a console-subsystem child of a console-less parent is
+  given a brand-new console, and Windows 11's default-terminal
+  setting materializes each one as a real, empty Windows Terminal
+  window. The background fleet (`magent serve`, `attention -d`, the
+  hotkey listener) runs console-less, so every one-shot psmux client
+  it launched popped a window -- one press (three narration flashes,
+  the paste injection, and a discovery fan-out probing every
+  configured session at once) opened dozens of empty terminals,
+  froze the desktop's terminals, and only then landed the paste.
+  Every psmux control/probe spawn now carries `CREATE_NO_WINDOW`,
+  pinned by a contract test that fails the gate on any future spawn
+  without it.
+- **The picker no longer drops keys typed between keystrokes on
+  macOS.** The interactive picker used to toggle the terminal into
+  raw mode around every read; macOS discards input queued during
+  that toggle (Linux preserves it), so a fast typist or a paste
+  could lose characters. One cbreak session now spans the whole
+  pick loop. The real-pty test tier also learned that a pty child
+  is only as alive as its reader: waits that poll the filesystem
+  now keep draining the terminal, which unblocked a deterministic
+  macOS CI failure.
 - **Concurrent magent processes no longer lose log records to
   rotation.** Several processes share one log name; the stdlib
   rotating handler renames the live file to rotate, which fails on
