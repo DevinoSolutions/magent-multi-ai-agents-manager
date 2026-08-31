@@ -5,6 +5,102 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.14.0] - 2026-08-31
+
+### Added
+
+- **Type-to-filter project picker in the interactive menu and session
+  switcher.** Start typing a project name and the list narrows and
+  reorders to the closest matches -- prefix beats word-boundary beats
+  substring beats in-order subsequence, ties keep config order -- with
+  arrow keys to move the highlight and Enter to launch the top match.
+  Digit shortcuts, single-key commands (`q`, `d`, ...) and the
+  bare-Enter default are byte-for-byte unchanged, and non-tty callers
+  keep the line-based prompt through the same renderer. One shared
+  component (`cli/picker.py`) drives the menu, the group submenu and
+  the session switcher; a real-pseudo-terminal test tier pins the
+  interactive path on Windows, macOS and Linux.
+- **The same typeahead on the mobile upload page.** The project pills
+  gain a filter box with the identical ranking rules as the CLI;
+  typing narrows and reorders, arrows walk the highlight, and Enter
+  and a tap share one selection path. Pinned by real-Chromium
+  browser tests.
+- **`magent terminal install` / `magent terminal status`.** Installs
+  Windows Terminal `sendInput` keybindings that survive psmux, which
+  drops key modifiers in transit: Ctrl+Backspace becomes the Ctrl+W
+  word-erase byte and Shift+Enter becomes ESC CR (what Claude Code's
+  `/terminal-setup` writes -- and that tool refuses to run inside a
+  tmux/psmux pane, which is why magent ships this). The engine
+  round-trips the whole settings file and refuses -- never rewrites --
+  one the stdlib parser can't read (Windows Terminal accepts JSONC),
+  writes control characters as escape text, supports both settings
+  schema generations, never overrides a user's existing binding, and
+  backs the file up before any write. `magent doctor` gains a
+  matching `wt-keys` check, warn-at-worst.
+- **The psmux fleet runs at above-normal priority, kept there by a
+  sweep.** Typing into a magent window under heavy fleet CPU load
+  used to lag badly: the multiplexer's client and server are
+  windowless normal-priority processes Windows never boosts, so a
+  saturated box starved the interactive path. Three owners now hold
+  every psmux process at AboveNormal -- the launch bring-up, the
+  attention daemon's poll tick, and a `magent serve` supervisor
+  thread -- admin-free, idempotent, and never downgrading a process
+  someone set higher. `MAGENT_PSMUX_BOOST=0` opts out. CI pins
+  psmux 3.3.8, which carries the matching upstream fix.
+- **`magent attention -d` now supervises the upload server.** The
+  daemon probes the configured port every tick and respawns a dead
+  `magent serve` (rate-limited by a 60-second cooldown), so a crashed
+  server heals without anyone noticing the phone uploads went dark.
+  `magent status`/`doctor` name the death instead of hiding it.
+  Gated on `settings.uploadServer` and `MAGENT_UPLOAD_SUPERVISOR=0`.
+- **`magent doctor` diagnoses a machine-wide psmux control-plane
+  wedge** -- the state where every psmux command hangs and nothing
+  else on the box says why.
+
+### Fixed
+
+- **Alt+V no longer spawns a burst of empty terminal windows.** On
+  Windows, a console-subsystem child of a console-less parent is
+  given a brand-new console, and Windows 11's default-terminal
+  setting materializes each one as a real, empty Windows Terminal
+  window. The background fleet (`magent serve`, `attention -d`, the
+  hotkey listener) runs console-less, so every one-shot psmux client
+  it launched popped a window -- one press (three narration flashes,
+  the paste injection, and a discovery fan-out probing every
+  configured session at once) opened dozens of empty terminals,
+  froze the desktop's terminals, and only then landed the paste.
+  Every psmux control/probe spawn now carries `CREATE_NO_WINDOW`,
+  pinned by a contract test that fails the gate on any future spawn
+  without it.
+- **The picker no longer drops keys typed between keystrokes on
+  macOS.** The interactive picker used to toggle the terminal into
+  raw mode around every read; macOS discards input queued during
+  that toggle (Linux preserves it), so a fast typist or a paste
+  could lose characters. One cbreak session now spans the whole
+  pick loop. The real-pty test tier also learned that a pty child
+  is only as alive as its reader: waits that poll the filesystem
+  now keep draining the terminal, which unblocked a deterministic
+  macOS CI failure.
+- **Concurrent magent processes no longer lose log records to
+  rotation.** Several processes share one log name; the stdlib
+  rotating handler renames the live file to rotate, which fails on
+  Windows under contention and then silently drops every subsequent
+  record while the file grows unbounded (measured: 272 of 800 records
+  lost). The shared handler now holds no file across records and
+  serializes each one under a cross-process lock. A multi-process
+  end-to-end test pins every-record-present-exactly-once on all
+  three OSes.
+- **The phone no longer calls a slow paste a failed upload.** The
+  mobile page reads all three paste states -- pasted, still pending,
+  refused -- and shows a stalled-but-saved upload in the healthy
+  tint with honest wording instead of a false failure.
+- **`magent serve` defaults its port to the config's `uploadPort`**
+  instead of a hard-coded literal.
+- Three test-suite flakes burned down root-cause-first (one was a
+  product bug), and the suite is now provably isolated from the
+  developer's real `~/.magent` -- a leaking test once stopped a
+  live machine's Alt+V listener with a green suite.
+
 ## [3.13.1] - 2026-08-18
 
 ### Fixed
@@ -995,6 +1091,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.14.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.13.1...v3.14.0
 [3.13.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.13.0...v3.13.1
 [3.13.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.3...v3.13.0
 [3.12.3]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.2...v3.12.3
