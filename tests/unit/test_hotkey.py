@@ -777,15 +777,25 @@ class TestAltVIsDelegated:
     ):
         from magent import altv, hotkey
 
-        seen: list[tuple[str, str, object]] = []
+        seen: list[tuple[str, str, object, bool]] = []
         monkeypatch.setattr(
             hotkey,
             "handle_press",
-            lambda url, project, capture: seen.append((url, project, capture)),
+            lambda url, project, capture, native=False: seen.append(
+                (url, project, capture, native)
+            ),
         )
+        monkeypatch.delenv("MAGENT_ALTV_NATIVE", raising=False)
+        monkeypatch.setattr("magent.env._cached_env", None)
         hotkey._do_upload("http://x:8034", "marka")
 
-        assert seen == [("http://x:8034", "marka", hotkey.get_clipboard_image)]
+        # No ssh host in the manifest means the panes are LOCAL: the press is
+        # one native Ctrl+V, not the capture/upload pipeline.
+        assert seen == [("http://x:8034", "marka", hotkey.get_clipboard_image, True)]
+        # A remote-wired listener keeps the upload path -- the viewer's
+        # clipboard is not the host's, so native paste would read the wrong one.
+        hotkey._do_upload("http://x:8034", "marka", ssh_host="deskpc")
+        assert seen[1] == ("http://x:8034", "marka", hotkey.get_clipboard_image, False)
         # ...and the names the hook branches reach for are that module's, so a
         # rename cannot leave the listener reporting into a void.
         assert hotkey._altv_report is altv.report
@@ -1026,7 +1036,10 @@ class TestHookProc:
 
         assert result == 1
         assert started  # a thread was started
-        assert started[0][1] == ("http://x:8034", "marka")
+        # The third member is the ssh_host the decide call runs with (None =
+        # local wiring), threaded through so _do_upload can pick the native
+        # path without re-reading the manifest on a keypress.
+        assert started[0][1] == ("http://x:8034", "marka", None)
 
     def test_wrap_calls_callnext_on_exception(self, monkeypatch):
         # The hook callback runs in a ctypes WINFUNCTYPE callback: an

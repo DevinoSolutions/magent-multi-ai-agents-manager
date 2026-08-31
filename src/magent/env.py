@@ -98,6 +98,18 @@ class MagentEnv(BaseSettings):
     # otherwise re-prioritise that box's entire live fleet. tests/conftest.py
     # pins it to 0 for every tier, exactly as it does upload_supervisor.
     psmux_boost: bool = True
+    # Should a LOCAL Alt+V press paste natively instead of uploading?
+    # (default: 1 / on.) When the listener is wired to THIS machine (its
+    # manifest carries no ssh host), the agent process already shares the
+    # user's clipboard, so the press just delivers one Ctrl+V (0x16) into the
+    # pane and the agent reads the image itself -- a real attachment, no BMP
+    # capture, no upload, no file under ~/.magent/uploads, no send-keys of a
+    # path. A remote-wired listener (`magent attach`) is untouched by this
+    # flag: the viewer's clipboard is not the host's, so the upload path is
+    # the only correct one there, and the phone page never involved Alt+V at
+    # all. Set to 0 to force the upload path locally too (the pane's agent
+    # may not support native image paste -- Claude Code does).
+    altv_native: bool = True
 
     @model_validator(mode="after")
     def _no_unknown_magent_vars(self) -> MagentEnv:

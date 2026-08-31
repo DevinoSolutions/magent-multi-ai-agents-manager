@@ -118,6 +118,17 @@ def _child_env() -> dict[str, str]:
     # no HOME redirect contains: a test-spawned serve/daemon must never
     # re-prioritise the developer's real psmux fleet.
     env["MAGENT_PSMUX_BOOST"] = "0"
+    # This tier pins the CAPTURE/UPLOAD chain end to end (SendInput chord ->
+    # hook -> CF_DIB read -> POST -> byte-identical file -> inject) -- the
+    # machinery every remote-wired press rides. A locally-wired listener
+    # (manifest ssh_host=None, which is what this test spawns) would otherwise
+    # take the local-native fork and send one C-v instead of uploading, and
+    # this test would sit waiting for an upload that correctly never happens.
+    # The fork itself is pinned in tests/unit/test_altv.py::TestNativePress
+    # and tests/e2e/test_altv_flash.py::TestNativeLocalPress (the real spawn
+    # path); here the documented escape hatch keeps the upload chain under the
+    # real keyboard.
+    env["MAGENT_ALTV_NATIVE"] = "0"
     return env
 
 
