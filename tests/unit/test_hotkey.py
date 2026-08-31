@@ -372,12 +372,14 @@ class _OpenCodeHarness:
 
         spawned: list[list[str]] = []
         self.spawn_envs: list[object] = []
+        self.spawn_kwargs: list[dict[str, object]] = []
         self.flashed: list[str] = []
         monkeypatch.setattr(hotkey.shutil, "which", lambda _n: code_bin)
 
         def _popen(argv, **kwargs):
             spawned.append(argv)
             self.spawn_envs.append(kwargs.get("env"))
+            self.spawn_kwargs.append(kwargs)
 
         monkeypatch.setattr(hotkey.subprocess, "Popen", _popen)
 
@@ -421,6 +423,36 @@ class TestDoOpenCode(_OpenCodeHarness):
         )
         hotkey._do_open_code("http://x:8034", "caly", None)
         assert spawned == [["code", "/base/caly"]]
+
+    def test_the_editor_spawn_opens_no_console_and_inherits_no_streams(
+        self, monkeypatch
+    ):
+        # The listener is console-less (serve spawns it detached) and code.cmd
+        # is a console-subsystem shim: without CREATE_NO_WINDOW Windows
+        # allocates it a brand-new VISIBLE console that streams VS Code's
+        # `[main ...]` logs at the user for as long as the editor runs
+        # (observed live 2026-08-31; same incident family as
+        # psmux._SPAWN_FLAGS). The devnull streams keep the shim from holding
+        # -- or blocking on -- console handles it doesn't have.
+        import subprocess
+
+        from magent import hotkey
+
+        self._patch(
+            monkeypatch,
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "caly", "session": "caly", "resolved": "/base/caly"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "caly", None)
+        (kwargs,) = self.spawn_kwargs
+        assert kwargs["creationflags"] == subprocess.CREATE_NO_WINDOW
+        assert kwargs["stdin"] is subprocess.DEVNULL
+        assert kwargs["stdout"] is subprocess.DEVNULL
+        assert kwargs["stderr"] is subprocess.DEVNULL
 
     def test_opens_over_remote_ssh_when_attached(self, monkeypatch):
         from magent import hotkey
@@ -785,17 +817,25 @@ class TestAltVIsDelegated:
                 (url, project, capture, native)
             ),
         )
+        # Native local paste is OPT-IN (Claude Code ignores an injected 0x16;
+        # DESIGN.md section 2): by default even a LOCAL press takes the
+        # capture/upload pipeline.
         monkeypatch.delenv("MAGENT_ALTV_NATIVE", raising=False)
         monkeypatch.setattr("magent.env._cached_env", None)
         hotkey._do_upload("http://x:8034", "marka")
+        assert seen == [("http://x:8034", "marka", hotkey.get_clipboard_image, False)]
 
-        # No ssh host in the manifest means the panes are LOCAL: the press is
-        # one native Ctrl+V, not the capture/upload pipeline.
-        assert seen == [("http://x:8034", "marka", hotkey.get_clipboard_image, True)]
-        # A remote-wired listener keeps the upload path -- the viewer's
-        # clipboard is not the host's, so native paste would read the wrong one.
+        # Opted in + no ssh host in the manifest = the panes are LOCAL and the
+        # press is one native Ctrl+V, not the capture/upload pipeline.
+        monkeypatch.setenv("MAGENT_ALTV_NATIVE", "1")
+        monkeypatch.setattr("magent.env._cached_env", None)
+        hotkey._do_upload("http://x:8034", "marka")
+        assert seen[1] == ("http://x:8034", "marka", hotkey.get_clipboard_image, True)
+        # A remote-wired listener keeps the upload path even when opted in --
+        # the viewer's clipboard is not the host's, so native paste would read
+        # the wrong one.
         hotkey._do_upload("http://x:8034", "marka", ssh_host="deskpc")
-        assert seen[1] == ("http://x:8034", "marka", hotkey.get_clipboard_image, False)
+        assert seen[2] == ("http://x:8034", "marka", hotkey.get_clipboard_image, False)
         # ...and the names the hook branches reach for are that module's, so a
         # rename cannot leave the listener reporting into a void.
         assert hotkey._altv_report is altv.report

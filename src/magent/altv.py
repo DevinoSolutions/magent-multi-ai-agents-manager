@@ -361,11 +361,15 @@ def upload_image(
 
 
 def native_enabled() -> bool:
-    """Whether ``MAGENT_ALTV_NATIVE`` permits the local native-paste path.
+    """Whether ``MAGENT_ALTV_NATIVE=1`` opts in to the local native-paste path.
 
-    Same degradation doctrine as ``psmux.boost_enabled``: the listener is a
-    long-lived hidden process, and an environment that has gone bad underneath
-    it must degrade to the default (native) rather than kill the press.
+    Opt-in, not opt-out: Claude Code on Windows acts only on a physical
+    Ctrl+V and ignores the 0x16 a psmux ``send-keys`` injects (see
+    ``native_paste``), so defaulting to native made a press silently dead in
+    the flagship pane. Same degradation doctrine as ``psmux.boost_enabled``:
+    the listener is a long-lived hidden process, and an environment that has
+    gone bad underneath it must degrade to the default (the upload path)
+    rather than kill the press.
     """
     from pydantic import ValidationError
 
@@ -375,23 +379,31 @@ def native_enabled() -> bool:
         return get_env().altv_native
     except ValidationError:
         get_logger("hotkey").warning(
-            "altv native: environment did not validate; pasting natively anyway"
+            "altv native: environment did not validate; using the upload path"
         )
-        return True
+        return False
 
 
 def native_paste(project: str) -> tuple[str, str]:
     """Deliver ONE Ctrl+V into the project's pane; the agent does the rest.
 
-    This is the whole local pipeline: the agent process (Claude Code) reads
-    the image off the clipboard ITSELF when it receives the paste key, and
-    locally that clipboard is the very one the user just copied into -- so
-    there is nothing to capture, upload, save, or path-inject. ``C-v`` is a
-    plain control byte (0x16) that psmux passes through unmangled (unlike the
-    modifier chords `magent terminal` exists for), and the send mirrors the
-    server's inject exactly: same primitive, same ``-t`` target, and the same
-    exactly-one-attempt law -- ``send_keys`` is bounded and a killed send may
-    or may not have landed, so a retry is how a screenshot gets pasted twice.
+    This is the whole local pipeline: an agent that honors the injected key
+    reads the image off the clipboard ITSELF, and locally that clipboard is
+    the very one the user just copied into -- so there is nothing to capture,
+    upload, save, or path-inject. ``C-v`` is a plain control byte (0x16) that
+    psmux delivers as a functional Ctrl+V (verified live: PSReadLine pastes on
+    it), and the send mirrors the server's inject exactly: same primitive,
+    same ``-t`` target, and the same exactly-one-attempt law -- ``send_keys``
+    is bounded and a killed send may or may not have landed, so a retry is how
+    a screenshot gets pasted twice.
+
+    OPT-IN, because delivery is only half the story: Claude Code on Windows
+    acts on a PHYSICAL Ctrl+V but ignores this injected byte (verified live
+    2026-08-31 -- the same send pastes in a PSReadLine pane and does nothing
+    in a Claude pane), so with the flagship agent this path reports
+    ``ok-native`` while nothing pastes. ``native_enabled`` gates it off by
+    default; the upload path's path-text inject is the one delivery every
+    agent demonstrably accepts.
 
     Returns ``(outcome, reason)`` -- ``ok-native`` or ``native-failed``, both
     members of ``ALTV_OUTCOMES``. Failure keeps the honest half of the story:
