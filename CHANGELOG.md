@@ -5,6 +5,27 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.15.1] - 2026-08-31
+
+### Fixed
+
+- **Alt+V went silently dead on local machines in 3.15.0 -- native local
+  paste is now opt-in.** 3.15.0 made a local press deliver one injected
+  Ctrl+V instead of running the capture/upload pipeline, but Claude Code
+  on Windows reacts only to a *physical* Ctrl+V and ignores the injected
+  key -- so the press reported success while nothing pasted. The default
+  is back to the proven capture/upload path everywhere; set
+  `MAGENT_ALTV_NATIVE=1` to opt in to native delivery for panes whose
+  agent demonstrably pastes on an injected Ctrl+V. (psmux delivers the
+  key correctly -- the same injection pastes fine in a PowerShell pane;
+  the agent's input stack is the boundary.)
+- **Pressing F2 no longer pops a console window full of VS Code logs.**
+  The hotkey listener is a console-less process, so the `code.cmd` shim
+  it spawned was allocated a brand-new visible console that streamed VS
+  Code's internal logs for as long as the editor ran. The spawn is now
+  windowless with detached streams -- same family as 3.14.0's
+  empty-terminal-storm fix, on the one spawn it missed.
+
 ## [3.15.0] - 2026-08-31
 
 ### Changed

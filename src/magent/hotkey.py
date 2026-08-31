@@ -428,9 +428,10 @@ def _do_upload(server_url: str, project: str, ssh_host: str | None = None) -> No
     ``ssh_host`` is the local/remote fork, and it is already the listener's
     self-description (the manifest field F2 routes on): no host means the panes
     this listener serves run on THIS machine, where the agent shares the
-    presser's clipboard and one native Ctrl+V (``altv.native_paste``) replaces
-    the whole capture/upload/inject pipeline. ``MAGENT_ALTV_NATIVE=0`` forces
-    the upload path back for panes whose agent cannot paste natively.
+    presser's clipboard and one native Ctrl+V (``altv.native_paste``) could
+    replace the whole capture/upload/inject pipeline. That fork is OPT-IN via
+    ``MAGENT_ALTV_NATIVE=1`` -- Claude Code ignores an injected 0x16 (see
+    ``altv.native_enabled``), so the default stays the upload path.
     """
     handle_press(
         server_url,
@@ -481,9 +482,20 @@ def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
         # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
         from magent.env import spawn_child_env
 
+        # CREATE_NO_WINDOW + devnull streams: this listener is console-less
+        # (serve spawns it detached), and `code.cmd` is a console-subsystem
+        # shim -- without the flag Windows allocates it a brand-new visible
+        # console that fills with VS Code's `[main ...]` logs and sits there
+        # for as long as the editor runs. Same incident family as
+        # psmux._SPAWN_FLAGS; this module is win32-only, so the stdlib
+        # constant is always present.
         subprocess.Popen(
             build_code_open_command(folder, ssh_host, code_bin),
             env=spawn_child_env(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         log.info(
             "F2: opened project=%s folder=%s ssh_host=%s", project, folder, ssh_host

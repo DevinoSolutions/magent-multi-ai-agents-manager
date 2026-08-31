@@ -99,17 +99,20 @@ class MagentEnv(BaseSettings):
     # pins it to 0 for every tier, exactly as it does upload_supervisor.
     psmux_boost: bool = True
     # Should a LOCAL Alt+V press paste natively instead of uploading?
-    # (default: 1 / on.) When the listener is wired to THIS machine (its
-    # manifest carries no ssh host), the agent process already shares the
-    # user's clipboard, so the press just delivers one Ctrl+V (0x16) into the
-    # pane and the agent reads the image itself -- a real attachment, no BMP
-    # capture, no upload, no file under ~/.magent/uploads, no send-keys of a
-    # path. A remote-wired listener (`magent attach`) is untouched by this
-    # flag: the viewer's clipboard is not the host's, so the upload path is
-    # the only correct one there, and the phone page never involved Alt+V at
-    # all. Set to 0 to force the upload path locally too (the pane's agent
-    # may not support native image paste -- Claude Code does).
-    altv_native: bool = True
+    # (default: 0 / off -- OPT-IN.) When the listener is wired to THIS machine
+    # (its manifest carries no ssh host), the agent process already shares the
+    # user's clipboard, so the press could just deliver one Ctrl+V (0x16) into
+    # the pane and let the agent read the image itself. Off by default because
+    # the flagship agent cannot hear it: Claude Code on Windows reacts only to
+    # a PHYSICAL Ctrl+V and ignores the 0x16 a psmux `send-keys` writes into
+    # the pane (verified live 2026-08-31 -- the same injected byte pastes in a
+    # PSReadLine pane and does nothing in a Claude pane), so the default-on
+    # fork made Alt+V silently dead. Set to 1 only if your pane's agent
+    # demonstrably pastes on an injected 0x16. A remote-wired listener
+    # (`magent attach`) is untouched by this flag either way: the viewer's
+    # clipboard is not the host's, so the upload path is the only correct one
+    # there, and the phone page never involved Alt+V at all.
+    altv_native: bool = False
 
     @model_validator(mode="after")
     def _no_unknown_magent_vars(self) -> MagentEnv:

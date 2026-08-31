@@ -735,17 +735,25 @@ class TestNativePress:
 
 
 class TestNativeEnabledGate:
-    """MAGENT_ALTV_NATIVE is the listener's escape hatch back to the upload
-    path (a pane's agent may not support native image paste). Same degradation
-    doctrine as psmux.boost_enabled: a long-lived listener must never die of a
-    bad environment."""
+    """MAGENT_ALTV_NATIVE=1 is an OPT-IN to the native local-paste path.
+    Off by default because Claude Code on Windows ignores an injected 0x16
+    (it acts only on a physical Ctrl+V), so a default-on fork reports
+    ok-native while the press pastes nothing -- a silently dead hotkey,
+    verified live 2026-08-31. Same degradation doctrine as
+    psmux.boost_enabled: a long-lived listener must never die of a bad
+    environment, and it degrades to the upload path (the default)."""
 
-    def test_on_by_default(self, monkeypatch):
+    def test_off_by_default(self, monkeypatch):
         monkeypatch.delenv("MAGENT_ALTV_NATIVE", raising=False)
+        monkeypatch.setattr("magent.env._cached_env", None)
+        assert altv.native_enabled() is False
+
+    def test_one_opts_in(self, monkeypatch):
+        monkeypatch.setenv("MAGENT_ALTV_NATIVE", "1")
         monkeypatch.setattr("magent.env._cached_env", None)
         assert altv.native_enabled() is True
 
-    def test_zero_forces_the_upload_path(self, monkeypatch):
+    def test_zero_stays_on_the_upload_path(self, monkeypatch):
         monkeypatch.setenv("MAGENT_ALTV_NATIVE", "0")
         monkeypatch.setattr("magent.env._cached_env", None)
         assert altv.native_enabled() is False

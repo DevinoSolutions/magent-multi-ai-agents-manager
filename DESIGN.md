@@ -1541,18 +1541,18 @@ other key still installing, the no-op rerun, the backup contents, and the
 off-Windows message. `tests/unit/test_doctor.py::TestCheckWtKeys` pins the
 check's four states and that it never fails a doctor run.
 
-### A local press pastes natively; the pipeline is for machines apart (2026-08-31)
+### Native local paste is opt-in; the pipeline is the default everywhere (2026-08-31)
 
 The Alt+V capture/upload/inject pipeline exists to move an image between
 MACHINES: a laptop viewer's clipboard to the desktop host over `magent attach`,
 or a phone screenshot to the host over the upload page. Run on the same machine
-it is pure overhead -- the pane's agent (Claude Code) reads the clipboard
-ITSELF when it receives a paste keystroke, and locally that clipboard is the
-very one the user copied into. So a press whose listener manifest carries no
-ssh host short-circuits to `altv.native_paste`: one `send-keys C-v` (0x16 -- a
-plain control byte psmux passes through unmangled, unlike the modifier chords
-`magent terminal` exists for), and the agent pastes a real attachment. Nothing
-is captured, nothing is uploaded, nothing lands in `~/.magent/uploads`.
+it looks like pure overhead -- an agent that honors a paste keystroke reads
+the clipboard ITSELF, and locally that clipboard is the very one the user
+copied into. So with `MAGENT_ALTV_NATIVE=1`, a press whose listener manifest
+carries no ssh host short-circuits to `altv.native_paste`: one `send-keys C-v`
+(0x16, which psmux delivers to the pane as a functional Ctrl+V), and the agent
+pastes a real attachment. Nothing is captured, nothing is uploaded, nothing
+lands in `~/.magent/uploads`.
 
 Three boundaries were chosen deliberately:
 
@@ -1566,9 +1566,21 @@ Three boundaries were chosen deliberately:
   not have landed, so there is no retry and no fallback to the upload path: a
   fallback after a landed C-v is how a screenshot gets pasted twice, the same
   double-paste the inject path already refuses to risk.
-- **`MAGENT_ALTV_NATIVE=0` restores the upload path locally** (a pane's agent
-  may not support native image paste), with `boost_enabled`-style degradation:
-  a listener must never die of a bad environment.
+- **The fork is OPT-IN (`MAGENT_ALTV_NATIVE=1`), not opt-out.** It shipped
+  default-on in 3.15.0 and was reverted the same day: Claude Code on Windows
+  acts only on a PHYSICAL Ctrl+V and ignores the injected 0x16 -- verified
+  live by injecting the same byte into a PSReadLine pane (pastes the
+  clipboard) and a Claude pane (nothing) -- so the default-on fork reported
+  `ok-native` while the user saw a dead hotkey. Delivery is not the failure
+  (psmux hands the pane a real Ctrl+V); the agent's input stack is, kin to
+  the psmux modifier-drop lore one layer deeper. The upload path's path-text
+  inject is the one delivery every agent demonstrably accepts, so it stays
+  the default, and the `boost_enabled`-style degradation (a listener must
+  never die of a bad environment) degrades to the upload path too. The trap
+  that let this ship: the native e2e proves the recorded argv through a shim,
+  and the real-psmux interaction tier pins the upload chain under the
+  opt-out -- no automated tier drives an injected C-v into a REAL agent pane,
+  so "the agent heard it" was assumed, not proven.
 
 The narration keeps its acknowledgement-first law with a shorter script:
 `pasting...` then `pasted from clipboard` / `paste key not delivered -
