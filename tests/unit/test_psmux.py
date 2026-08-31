@@ -10,10 +10,13 @@ pane_cwd across every live session concurrently).
 
 from __future__ import annotations
 
+import ast
+import inspect
 import logging
 import os
 import re
 import subprocess
+import sys
 import time
 import unicodedata
 from typing import ClassVar
@@ -1958,3 +1961,48 @@ class TestProbeControlPlane:
         assert seen == [["psmux", "-L", psmux.CONTROL_PROBE_SOCKET, "list-sessions"]]
         assert "has-session" not in seen[0]
         assert "new-session" not in seen[0]
+
+
+class TestEveryOneShotSpawnHidesItsConsole:
+    """Every psmux control/probe spawn must carry ``creationflags=_SPAWN_FLAGS``.
+
+    Why this is a contract and not hygiene: the fleet's supervised processes
+    (``magent serve``, ``attention -d``, the hotkey listener) run with NO
+    console (``launch.spawn_detached`` uses DETACHED_PROCESS|CREATE_NO_WINDOW),
+    and on Windows a console-subsystem child of a console-less parent is given
+    a brand-new console -- which Windows 11's default-terminal setting
+    materializes as a real, empty Windows Terminal window. Observed live
+    2026-08-31: one Alt+V press (three narration flashes + the paste
+    ``send-keys`` + a discovery fan-out probing every configured session)
+    opened dozens of empty terminals at once and froze the desktop. A single
+    forgotten call site brings the storm back, so the AST is walked instead of
+    trusting review to catch the fourteenth spawn.
+    """
+
+    def test_every_subprocess_call_in_psmux_carries_the_flags(self):
+        offenders: list[int] = []
+        tree = ast.parse(inspect.getsource(psmux))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "subprocess"
+                and node.func.attr
+                in ("run", "Popen", "call", "check_call", "check_output")
+                and "creationflags" not in [k.arg for k in node.keywords]
+            ):
+                offenders.append(node.lineno)
+        assert not offenders, (
+            f"psmux.py spawns a subprocess without creationflags at line(s) "
+            f"{offenders} -- from a console-less serve/daemon each such spawn "
+            f"opens an empty terminal window on Windows"
+        )
+
+    def test_the_flags_hide_the_console_exactly_on_windows(self):
+        """CREATE_NO_WINDOW on win32 (hand-defined -- the stdlib attribute only
+        exists there), and exactly 0 elsewhere so POSIX Popen accepts it."""
+        if sys.platform == "win32":
+            assert psmux._SPAWN_FLAGS == subprocess.CREATE_NO_WINDOW
+        else:
+            assert psmux._SPAWN_FLAGS == 0
