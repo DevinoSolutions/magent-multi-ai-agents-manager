@@ -170,15 +170,44 @@ def _calls(rec_dir: Path) -> list[list[str]]:
     ]
 
 
-def _await_attach(rec_dir: Path, deadline_s: float) -> list[str] | None:
-    """Wait, BOUNDED, for the product to spawn an `attach`; return its argv."""
+def _await_attach(pty: Pty, rec_dir: Path, deadline_s: float) -> list[str] | None:
+    """Wait, BOUNDED, for the product to spawn an `attach`; return its argv.
+
+    Drains the pty on every poll, and that drain is load-bearing: the attach
+    only happens after the child finishes repainting, and on macOS that paint
+    blocks on the kernel's small pty buffer until somebody reads it. Without
+    the drain, this loop starved the very child it was waiting on for exactly
+    its whole window -- the instrumented run showed the attach firing the
+    moment ``wait_exit`` finally pumped, 30.7s after Enter (#190).
+    """
     end = time.monotonic() + deadline_s
     while time.monotonic() < end:
+        pty.drain()
         for argv in _calls(rec_dir):
             if "attach" in argv:
                 return argv
         time.sleep(0.1)
     return None
+
+
+def _recorded_debug(rec_dir: Path) -> str:
+    """Every record with its wall-clock stamp -- the failure's evidence.
+
+    A miss has three distinguishable shapes and this dump separates them: an
+    attach record stamped INSIDE the poll window means the test could not see
+    a file that existed (visibility bug); one stamped AFTER the window means
+    the product was stalled between Enter and the spawn (measure where); no
+    attach record at all -- while the has-session probes that painted the rows
+    ARE here -- means the spawn itself never happened.
+    """
+    lines = [f"now={time.time():.3f}"]
+    for p in sorted(rec_dir.glob("*.json")):
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+            lines.append(f"  t={rec['t']:.3f} argv={rec['argv']}")
+        except (OSError, ValueError, KeyError) as exc:
+            lines.append(f"  UNREADABLE {p.name}: {exc!r}")
+    return "\n".join(lines)
 
 
 class TestTheMenuFiltersAsYouType:
@@ -284,7 +313,7 @@ class TestTheSessionSwitcherFiltersTheSameWay:
             pty.send_keys(DOWN)
             pty.expect("> 3   gamma-webdocs")
             pty.send_keys(ENTER)
-            attach = _await_attach(rec_dir, 30.0)
+            attach = _await_attach(pty, rec_dir, 30.0)
             # Leave the switcher, then the menu.
             pty.send_line("q")
             pty.send_line("q")
@@ -292,7 +321,10 @@ class TestTheSessionSwitcherFiltersTheSameWay:
         finally:
             pty.close()
 
-        assert attach is not None, f"nothing ever attached\n{pty.transcript}"
+        assert attach is not None, (
+            f"nothing ever attached\n--- recorded psmux calls ---\n"
+            f"{_recorded_debug(rec_dir)}\n--- transcript ---\n{pty.transcript}"
+        )
         assert attach == ["-L", "gamma-webdocs", "attach"], (
             f"attached to the wrong session: {attach}\n{pty.transcript}"
         )

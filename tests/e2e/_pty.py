@@ -236,6 +236,23 @@ class Pty:
             # be the thing that raises out of a timeout path.
             return False
 
+    def drain(self) -> None:
+        """Consume whatever output is ready, without waiting for more.
+
+        A pty child is only as alive as its reader: a repaint that overruns
+        the kernel's output buffer BLOCKS the child mid-write until someone
+        reads (macOS's pty buffer is small enough that a few un-drained frame
+        tails do it), and a blocked painter never reaches its next input
+        read. ``expect`` stops consuming the moment its needle matches, so
+        any wait that is NOT an expect -- polling for a file the child should
+        cause to exist, sleeping out an external deadline -- must call this
+        in its loop, or the wait itself starves the child it is waiting on.
+        That exact shape held the session switcher's Enter hostage for a full
+        30-second poll window on every macOS run (#190).
+        """
+        while self._pump():
+            pass
+
     # -- matching ------------------------------------------------------------
 
     def expect(
