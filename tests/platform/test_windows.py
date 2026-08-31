@@ -81,7 +81,14 @@ class TestFindWindow:
             proc.kill()
 
     def test_find_existing_window(self, platform, notepad_window):
+        # Poll: on a cold hosted runner the app's window can take well over
+        # the fixture's settle sleep to exist. A missing window still fails
+        # loudly at the deadline.
+        deadline = time.time() + 15
         handle = platform.find_window(notepad_window, mode="contains")
+        while handle is None and time.time() < deadline:
+            time.sleep(0.5)
+            handle = platform.find_window(notepad_window, mode="contains")
         assert handle is not None
 
     def test_find_nonexistent_window(self, platform):
