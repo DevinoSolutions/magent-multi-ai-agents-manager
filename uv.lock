@@ -257,7 +257,7 @@ wheels = [
 
 [[package]]
 name = "magent-multi-ai-agents-manager"
-version = "3.15.1"
+version = "3.16.0"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
