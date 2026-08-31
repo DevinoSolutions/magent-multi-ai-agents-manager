@@ -528,6 +528,24 @@ class TestStatusBarHygiene:
 
 
 class TestUploadImage:
+    def test_the_filename_and_mime_follow_the_bytes(self):
+        # The capture emits PNG for the common screenshot DIBs and BMP for
+        # exotic ones; the multipart filename is what the server derives the
+        # on-disk suffix from, so it must follow the actual magic rather than
+        # a hardcoded ".bmp" (1.7 MB BMPs were piling up in
+        # ~/.magent/uploads before the PNG capture landed).
+        server = _Upload({"ok": True, "injected": True})
+        try:
+            altv.upload_image(server.url, "marka", b"\x89PNG\r\n\x1a\nrest")
+            altv.upload_image(server.url, "marka", b"BM-not-a-png")
+        finally:
+            server.close()
+        png_body, bmp_body = (body for _path, body in server.requests)
+        assert b'filename="clipboard.png"' in png_body
+        assert b"Content-Type: image/png" in png_body
+        assert b'filename="clipboard.bmp"' in bmp_body
+        assert b"Content-Type: image/bmp" in bmp_body
+
     def test_a_healthy_upload_reports_ok(self):
         server = _Upload({"ok": True, "path": "/tmp/x.bmp", "injected": True})
         try:

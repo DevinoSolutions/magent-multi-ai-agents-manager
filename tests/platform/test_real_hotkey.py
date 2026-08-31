@@ -528,7 +528,7 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
     session_created = False
     handles = []
     uploads = home / ".magent" / "uploads"
-    pre_existing = set(uploads.glob("*_clipboard.bmp")) if uploads.is_dir() else set()
+    pre_existing = set(uploads.glob("*_clipboard.*")) if uploads.is_dir() else set()
 
     def _sink(path):
         fh = path.open("wb")
@@ -670,7 +670,7 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
         def _uploaded():
             if not uploads.is_dir():
                 return None
-            new = sorted(set(uploads.glob("*_clipboard.bmp")) - pre_existing)
+            new = sorted(set(uploads.glob("*_clipboard.*")) - pre_existing)
             return new[-1] if new else None
 
         attempts_log: list[str] = []
@@ -790,7 +790,7 @@ def test_real_alt_v_uploads_clipboard_image_into_live_session(tmp_path):
         # Real-HOME tidy-up: remove exactly the artifacts this test created
         # (uploaded file, stale listener pid left by the hard kill).
         if uploads.is_dir():
-            for f in set(uploads.glob("*_clipboard.bmp")) - pre_existing:
+            for f in set(uploads.glob("*_clipboard.*")) - pre_existing:
                 with contextlib.suppress(OSError):
                     f.unlink()
         with contextlib.suppress(OSError):

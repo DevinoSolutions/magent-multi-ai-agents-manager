@@ -9,6 +9,118 @@ import pytest
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows-only")
 
 
+class TestDibToPng:
+    """Clipboard DIB -> PNG encoding (the 1.7 MB-per-screenshot fix).
+
+    A wrong image is worse than a big one, so every shape the encoder does not
+    positively recognize must come back None (BMP fallback), and every shape it
+    does must round-trip pixel-exactly -- the decode below is a real chunk
+    parse + zlib inflate, not a prefix check."""
+
+    @staticmethod
+    def _header(width, height, bpp, compression):
+        import struct
+
+        # Same BITMAPINFOHEADER builder as TestDibToBmp (duplicated: that
+        # class is defined further down this module).
+        return struct.pack(
+            "<IiiHHIIiiII", 40, width, height, 1, bpp, compression, 0, 0, 0, 0, 0
+        )
+
+    @staticmethod
+    def _decode(png):
+        import struct
+        import zlib
+
+        assert png[:8] == b"\x89PNG\r\n\x1a\n"
+        off, chunks = 8, {}
+        while off < len(png):
+            ln = int.from_bytes(png[off : off + 4], "big")
+            tag = bytes(png[off + 4 : off + 8])
+            payload = png[off + 8 : off + 8 + ln]
+            crc = int.from_bytes(png[off + 8 + ln : off + 12 + ln], "big")
+            assert crc == zlib.crc32(tag + payload) & 0xFFFFFFFF
+            chunks[tag] = chunks.get(tag, b"") + payload
+            off += 12 + ln
+        w, h, depth, color, comp, filt, interlace = struct.unpack(
+            ">IIBBBBB", chunks[b"IHDR"]
+        )
+        assert (depth, color, comp, filt, interlace) == (8, 2, 0, 0, 0)
+        raw = zlib.decompress(chunks[b"IDAT"])
+        stride = 1 + w * 3
+        assert len(raw) == stride * h
+        rows = [raw[r * stride : (r + 1) * stride] for r in range(h)]
+        assert all(r[0] == 0 for r in rows)  # filter None on every scanline
+        return w, h, [bytes(r[1:]) for r in rows]
+
+    def test_bottom_up_rgb32_round_trips_top_first(self):
+        from magent.hotkey import _dib_to_png
+
+        header = self._header(2, 2, 32, 0)  # BI_RGB, positive height=bottom-up
+        bottom = bytes([255, 0, 0, 0]) + bytes([0, 255, 0, 0])  # blue, green
+        top = bytes([0, 0, 255, 0]) + bytes([255, 255, 255, 0])  # red, white
+        png = _dib_to_png(bytearray(header + bottom + top))
+        w, h, rows = self._decode(png)
+        assert (w, h) == (2, 2)
+        assert rows[0] == bytes([255, 0, 0, 255, 255, 255])  # red, white (top)
+        assert rows[1] == bytes([0, 0, 255, 0, 255, 0])  # blue, green
+
+    def test_top_down_negative_height(self):
+        from magent.hotkey import _dib_to_png
+
+        header = self._header(2, -2, 32, 0)  # top-down: storage row 0 IS the top
+        top = bytes([0, 0, 255, 0]) + bytes([255, 255, 255, 0])
+        bottom = bytes([255, 0, 0, 0]) + bytes([0, 255, 0, 0])
+        png = _dib_to_png(bytearray(header + top + bottom))
+        _w, _h, rows = self._decode(png)
+        assert rows[0] == bytes([255, 0, 0, 255, 255, 255])
+        assert rows[1] == bytes([0, 0, 255, 0, 255, 0])
+
+    def test_bitfields_standard_masks_accepted(self):
+        import struct
+
+        from magent.hotkey import _dib_to_png
+
+        header = self._header(1, 1, 32, 3)  # BI_BITFIELDS
+        masks = struct.pack("<III", 0x00FF0000, 0x0000FF00, 0x000000FF)
+        png = _dib_to_png(bytearray(header + masks + bytes([1, 2, 3, 0])))
+        _w, _h, rows = self._decode(png)
+        assert rows == [bytes([3, 2, 1])]
+
+    def test_nonstandard_masks_fall_back(self):
+        import struct
+
+        from magent.hotkey import _dib_to_png
+
+        header = self._header(1, 1, 32, 3)
+        masks = struct.pack("<III", 0x000000FF, 0x0000FF00, 0x00FF0000)  # RGBA order
+        assert _dib_to_png(bytearray(header + masks + bytes(4))) is None
+
+    def test_rgb24_stride_padding_not_leaked(self):
+        from magent.hotkey import _dib_to_png
+
+        # width=1 at 24bpp: 3 pixel bytes + 1 pad byte per row (stride 4).
+        header = self._header(1, 2, 24, 0)
+        pixels = bytes([1, 2, 3, 0xEE]) + bytes([4, 5, 6, 0xEE])  # pad = 0xEE
+        png = _dib_to_png(bytearray(header + pixels))
+        _w, _h, rows = self._decode(png)
+        assert rows[0] == bytes([6, 5, 4])  # top row, BGR -> RGB
+        assert rows[1] == bytes([3, 2, 1])
+        assert not any(0xEE in r for r in rows)
+
+    def test_unrecognized_shapes_fall_back_to_bmp(self):
+        from magent.hotkey import _dib_to_bmp, _dib_to_png
+
+        # 16bpp: PNG refuses, the BMP wrap still delivers -- the fallback pair.
+        header16 = self._header(2, 2, 16, 0)
+        pixels16 = bytes(2 * 2 * 2)
+        assert _dib_to_png(bytearray(header16 + pixels16)) is None
+        assert _dib_to_bmp(bytearray(header16 + pixels16)) is not None
+        # RLE compression and truncated pixel buffers refuse too.
+        assert _dib_to_png(bytearray(self._header(2, 2, 24, 1) + bytes(16))) is None
+        assert _dib_to_png(bytearray(self._header(4, 4, 32, 0) + bytes(8))) is None
+
+
 class TestProjectFromTitle:
     def test_extracts_name(self):
         from magent.hotkey import project_from_title

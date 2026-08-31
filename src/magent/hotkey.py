@@ -21,10 +21,12 @@ import ctypes.wintypes
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import threading
 import time
+import zlib
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.request import urlopen
@@ -133,6 +135,7 @@ VK_RBUTTON = 0x02
 _MOUSE_BUTTONS = (VK_LBUTTON, VK_RBUTTON)
 _KEY_DOWN_MASK = 0x8000
 CF_DIB = 8
+BI_RGB = 0
 BI_BITFIELDS = 3
 WH_KEYBOARD_LL = 13
 WM_KEYDOWN = 0x0100
@@ -229,11 +232,93 @@ def get_clipboard_image() -> bytes | None:
     finally:
         user32.CloseClipboard()
 
-    return _dib_to_bmp(dib_data)
+    # PNG first (typically 10-20x smaller than the raw DIB -- a 1080p
+    # screenshot is ~8 MB of BMP and a few hundred KB of PNG, and these
+    # accumulate under ~/.magent/uploads). The encoder deliberately handles
+    # only the shapes real screenshot tools put on the clipboard; anything
+    # exotic falls back to the lossless BMP wrap.
+    return _dib_to_png(dib_data) or _dib_to_bmp(dib_data)
 
 
 _DIB_HEADER_SIZES = frozenset({40, 52, 56, 108, 124})  # BITMAPINFOHEADER..V5
 _DIB_BPP = frozenset({1, 4, 8, 16, 24, 32})
+
+# The one channel layout GDI/.NET/screenshot tools actually use for
+# BI_BITFIELDS: BGRA in memory, i.e. masks R=00FF0000 G=0000FF00 B=000000FF.
+_STANDARD_BGRA_MASKS = (0x00FF0000, 0x0000FF00, 0x000000FF)
+
+
+def _png_chunk(tag: bytes, payload: bytes) -> bytes:
+    crc = zlib.crc32(tag + payload) & 0xFFFFFFFF
+    return len(payload).to_bytes(4, "big") + tag + payload + crc.to_bytes(4, "big")
+
+
+def _dib_to_png(dib: bytearray) -> bytes | None:
+    """Encode the common screenshot DIBs (uncompressed 24/32bpp) as PNG.
+
+    stdlib-only (zlib + struct): Pillow is not a dependency and must not
+    become one for a hotkey listener. Alpha is dropped on purpose -- clipboard
+    32bpp DIBs usually carry an all-zero alpha channel (the same lie
+    ``_dib_to_bmp`` forces opaque), so the honest output is RGB. Anything this
+    function does not positively recognize -- palettes, 16bpp, RLE,
+    nonstandard BI_BITFIELDS masks, truncated pixels -- returns ``None`` and
+    the caller falls back to the BMP wrap; a wrong image is worse than a big
+    one.
+    """
+    if len(dib) < 40:
+        return None
+    header_size = int.from_bytes(dib[0:4], "little")
+    width = int.from_bytes(dib[4:8], "little", signed=True)
+    height = int.from_bytes(dib[8:12], "little", signed=True)
+    bpp = int.from_bytes(dib[14:16], "little")
+    compression = int.from_bytes(dib[16:20], "little")
+    if header_size not in _DIB_HEADER_SIZES or bpp not in (24, 32):
+        return None
+    if compression not in (BI_RGB, BI_BITFIELDS):
+        return None
+    if compression == BI_BITFIELDS:
+        # A plain BITMAPINFOHEADER stores the 3 masks after the header; V4/V5
+        # embed them at the same fixed offset 40 inside the header itself.
+        if len(dib) < 52:
+            return None
+        masks = tuple(
+            int.from_bytes(dib[40 + 4 * i : 44 + 4 * i], "little") for i in range(3)
+        )
+        if masks != _STANDARD_BGRA_MASKS:
+            return None
+    if not (0 < width <= 0x7FFF) or not (0 < abs(height) <= 0x7FFF):
+        return None
+
+    px_start = header_size + (
+        12 if (compression == BI_BITFIELDS and header_size == 40) else 0
+    )
+    rows = abs(height)
+    bytes_pp = bpp // 8
+    stride = (width * bytes_pp + 3) & ~3  # DIB rows are 4-byte aligned
+    if px_start + stride * rows > len(dib):
+        return None
+
+    # Positive height = bottom-up storage; negative = top-down.
+    row_order = range(rows - 1, -1, -1) if height > 0 else range(rows)
+    raw = bytearray()
+    rgb = bytearray(width * 3)
+    for r in row_order:
+        base = px_start + r * stride
+        row = dib[base : base + width * bytes_pp]
+        # BGR(A) -> RGB via strided slice assignment (C speed, no per-pixel loop).
+        rgb[0::3] = row[2::bytes_pp]
+        rgb[1::3] = row[1::bytes_pp]
+        rgb[2::3] = row[0::bytes_pp]
+        raw.append(0)  # PNG filter type None for this scanline
+        raw += rgb
+
+    ihdr = struct.pack(">IIBBBBB", width, rows, 8, 2, 0, 0, 0)  # 8-bit RGB
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+        + _png_chunk(b"IEND", b"")
+    )
 
 
 def _dib_to_bmp(dib: bytearray) -> bytes | None:
