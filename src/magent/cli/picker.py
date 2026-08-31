@@ -40,6 +40,7 @@ is exactly what the real-PTY tier asserts against.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import os
 import sys
@@ -52,7 +53,7 @@ from magent.cli.ui import _menu_item
 from magent.style import style
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
 
 # -- ranking ------------------------------------------------------------------
 
@@ -243,41 +244,63 @@ def read_char(fd: int) -> str:
     return bytes(buf).decode("utf-8", "replace")
 
 
-def _read_key_posix() -> str:
-    # Mirror of the guard in ``_read_key_windows``: termios/tty do not exist on
-    # Windows, and this half is only ever reached off it.
+@contextlib.contextmanager
+def key_session() -> Iterator[None]:
+    """Hold the terminal in cbreak for a WHOLE picker run, not per keystroke.
+
+    The input mode used to be toggled around every single read -- raw for the
+    keypress, cooked again for the repaint. That put a mode transition between
+    every two keystrokes, and on macOS ``tcsetattr``'s ICANON toggle DISCARDS
+    input queued across it (Linux preserves it): a key landing in the repaint
+    gap -- a fast typist, a paste, the pty tier pressing Enter the instant the
+    frame appeared -- simply vanished. The session-switcher pty test failed on
+    exactly that Enter on every macOS CI run.
+
+    cbreak rather than raw, so the repaints need no changes: ``OPOST``/``ONLCR``
+    stay on (``click.echo``'s newlines still carry their carriage returns) and
+    input ``ICRNL`` maps Enter's CR to LF, which ``_classify`` already accepts.
+    ``ISIG`` stays on too, so Ctrl+C arrives as the same ``KeyboardInterrupt``
+    the raw path re-created by hand. TCSANOW on entry and TCSADRAIN on exit --
+    never TCSAFLUSH, which throws away pending keystrokes by design.
+
+    Windows needs no mode at all (``msvcrt`` reads keys directly), and the
+    non-tty path never gets here (``raw_mode_available`` gates every caller).
+    """
     if sys.platform == "win32":
-        return IGNORED
-    import select
+        yield
+        return
     import termios
     import tty
 
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
+    tty.setcbreak(fd, termios.TCSANOW)
     try:
-        # Raw only for the duration of the read: every repaint happens in
-        # cooked mode, so a newline still carries its carriage return and the
-        # list does not walk off to the right.
-        #
-        # TCSANOW, never tty.setraw's TCSAFLUSH DEFAULT: flushing DISCARDS
-        # input already waiting on the descriptor. Mode is re-entered once per
-        # keystroke, so anything typed while the previous repaint was on screen
-        # is exactly what would be thrown away -- a fast typist would watch
-        # characters vanish, and a whole string written at once (a paste, or a
-        # test typing "web") would arrive as its first character alone.
-        tty.setraw(fd, termios.TCSANOW)
-        ch = read_char(fd)
-        if ch != "\x1b":
-            return _classify(ch)
-        if not select.select([fd], [], [], _ESC_TAIL_S)[0]:
-            return ESC
-        if read_char(fd) != "[":
-            return IGNORED
-        if not select.select([fd], [], [], _ESC_TAIL_S)[0]:
-            return IGNORED
-        return _CSI_SPECIAL.get(read_char(fd), IGNORED)
+        yield
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def _read_key_posix() -> str:
+    # Mirror of the guard in ``_read_key_windows``: termios/tty do not exist on
+    # Windows, and this half is only ever reached off it. The terminal is
+    # already in cbreak -- ``pick`` holds ``key_session`` open around the whole
+    # loop -- so this is a plain read plus escape-sequence decoding.
+    if sys.platform == "win32":
+        return IGNORED
+    import select
+
+    fd = sys.stdin.fileno()
+    ch = read_char(fd)
+    if ch != "\x1b":
+        return _classify(ch)
+    if not select.select([fd], [], [], _ESC_TAIL_S)[0]:
+        return ESC
+    if read_char(fd) != "[":
+        return IGNORED
+    if not select.select([fd], [], [], _ESC_TAIL_S)[0]:
+        return IGNORED
+    return _CSI_SPECIAL.get(read_char(fd), IGNORED)
 
 
 def read_key() -> str:
@@ -479,9 +502,12 @@ def pick(
     """Run the raw-key picker until the user commits. Callers must have checked
     ``raw_mode_available`` first."""
     state = PickerState(list(items), frozenset(c.lower() for c in commands))
-    while True:
-        paint(state, render_header, hint=hint, prompt=prompt)
-        result = state.press(read_key())
-        if result is not None:
-            click.echo()
-            return result
+    # One key session for the whole run: entered BEFORE the first paint, so a
+    # keystroke sent the moment that frame is visible has nowhere to be lost.
+    with key_session():
+        while True:
+            paint(state, render_header, hint=hint, prompt=prompt)
+            result = state.press(read_key())
+            if result is not None:
+                click.echo()
+                return result
