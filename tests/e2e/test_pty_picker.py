@@ -181,6 +181,26 @@ def _await_attach(rec_dir: Path, deadline_s: float) -> list[str] | None:
     return None
 
 
+def _recorded_debug(rec_dir: Path) -> str:
+    """Every record with its wall-clock stamp -- the failure's evidence.
+
+    A miss has three distinguishable shapes and this dump separates them: an
+    attach record stamped INSIDE the poll window means the test could not see
+    a file that existed (visibility bug); one stamped AFTER the window means
+    the product was stalled between Enter and the spawn (measure where); no
+    attach record at all -- while the has-session probes that painted the rows
+    ARE here -- means the spawn itself never happened.
+    """
+    lines = [f"now={time.time():.3f}"]
+    for p in sorted(rec_dir.glob("*.json")):
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+            lines.append(f"  t={rec['t']:.3f} argv={rec['argv']}")
+        except (OSError, ValueError, KeyError) as exc:
+            lines.append(f"  UNREADABLE {p.name}: {exc!r}")
+    return "\n".join(lines)
+
+
 class TestTheMenuFiltersAsYouType:
     def test_typing_narrows_the_menu_and_enter_takes_the_marked_row(self, tmp_path):
         """``qui`` leaves exactly one row standing, marked -- and Enter takes
@@ -292,7 +312,10 @@ class TestTheSessionSwitcherFiltersTheSameWay:
         finally:
             pty.close()
 
-        assert attach is not None, f"nothing ever attached\n{pty.transcript}"
+        assert attach is not None, (
+            f"nothing ever attached\n--- recorded psmux calls ---\n"
+            f"{_recorded_debug(rec_dir)}\n--- transcript ---\n{pty.transcript}"
+        )
         assert attach == ["-L", "gamma-webdocs", "attach"], (
             f"attached to the wrong session: {attach}\n{pty.transcript}"
         )
