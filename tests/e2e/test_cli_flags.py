@@ -85,6 +85,36 @@ class TestCliFlags:
         )
         assert result.returncode == 0
 
+    def test_go_implies_a_full_retile(self, tmp_path):
+        # `magent --go` tiles EVERYTHING, not just newly-launched windows: a
+        # top-up --go used to slot only the new window(s) from index 0 and
+        # leave the rest of the fleet untouched (one new window could land on
+        # top of an existing one), forcing a manual retile afterwards. The
+        # "retile all" tiling label through the REAL CLI is the wiring proof.
+        cfg = tmp_path / "magent.config.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "projects": [{"path": str(tmp_path)}],
+                }
+            )
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "magent",
+                "--dry-run",
+                "--go",
+                "--config",
+                str(cfg),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert "retile all" in result.stdout
+
     def test_init_with_base_dir(self, tmp_path):
         (tmp_path / "proj" / ".git").mkdir(parents=True)
         out = tmp_path / "init_out.json"

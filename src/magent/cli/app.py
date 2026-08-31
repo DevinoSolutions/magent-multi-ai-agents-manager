@@ -211,12 +211,15 @@ def main(
     # is what the flag is least expected to do. So `tile_only` means exactly
     # the open windows: configured projects that are up right now PLUS every
     # other magent-owned window on screen (`magent attach` panes), and nothing
-    # closed. `--go --retile-all` keeps the combined meaning: launch whatever
-    # is missing, then tile everything.
+    # closed. `--go` always carries the combined meaning: launch whatever is
+    # missing, then tile EVERYTHING -- tiling only the new windows assigned
+    # them slots from index 0 with the rest of the fleet ignored, so a top-up
+    # --go dropped its one new window on top of an existing one and the user
+    # had to run a manual retile to get the grid back.
     rc = run_magent(
         cfg,
         RunOpts(
-            retile_all=retile_all,
+            retile_all=retile_all or go,
             tile_only=retile_all and not go,
             dry_run=dry_run,
             group=group,

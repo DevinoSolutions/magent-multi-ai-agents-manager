@@ -1147,17 +1147,19 @@ class TestDecorateSession:
         ]
 
     @pytest.mark.parametrize("code_hint", [True, False])
-    def test_the_argv_is_the_eight_decorations(self, code_hint):
+    def test_the_argv_is_the_ten_decorations(self, code_hint):
         # The list is what every call site fans out, so its shape is contract:
-        # a ninth command (or a dropped one) has to be a deliberate edit here.
-        # Gating F2 changes the hint TEXT and the F2 command's form, never the
-        # four `set`s -- dropping one of those would leave a personal tmux.conf's
-        # value in place. The last two own the WINDOW NAME: psmux's
-        # automatic-rename showed the pane's command ("0:claude.exe.old" after
-        # a Claude self-update), so every decoration pass pins the window name
-        # back to the project and turns the auto-rename off.
+        # an eleventh command (or a dropped one) has to be a deliberate edit
+        # here. Gating F2 changes the hint TEXT and the F2 command's form,
+        # never the `set`s -- dropping one of those would leave a personal
+        # tmux.conf's value in place. Commands 7-10 own the WINDOW NAME and
+        # its rendering: psmux's automatic-rename showed the pane's command
+        # ("0:claude.exe.old" after a Claude self-update), so every decoration
+        # pass pins the window name back to the project, turns the auto-rename
+        # off, and renders the bar entry as the name alone -- no `0:` index
+        # (one window per session makes it noise), verified live on 3.3.8.
         argv = psmux.decoration_argv("api", "psmux", code_hint)
-        assert len(argv) == 8
+        assert len(argv) == 10
         assert argv[0][3:] == ["bind", "-n", "F1", "detach-client"]
         assert [cmd[5] for cmd in argv[1:5]] == [
             "status-right",
@@ -1168,6 +1170,29 @@ class TestDecorateSession:
         assert argv[5][3] in {"bind", "unbind-key"}
         assert argv[6][3:] == ["rename-window", "-t", "api", "api"]
         assert argv[7][3:] == ["set", "-g", "automatic-rename", "off"]
+        assert argv[8][3:] == ["set", "-g", "window-status-format", "#W"]
+        assert argv[9][3:] == ["set", "-g", "window-status-current-format", "#W"]
+
+    def test_a_long_name_renames_to_the_truncated_display_form(self):
+        # The rename argument is the DISPLAY name; the `-t` target stays the
+        # session name so a re-decoration of an already-truncated window still
+        # resolves (a session target names its current window, whatever it is
+        # called).
+        name = "magent-multi-ai-agents-manager"
+        argv = psmux.decoration_argv(name, "psmux", False)
+        rename = argv[6]
+        assert rename[3:6] == ["rename-window", "-t", name]
+        assert rename[6] == "magent-multi-..."
+
+    def test_window_display_name_truncates_only_past_the_budget(self):
+        # <= 16 columns: untouched, including exactly 16. Past it: first 13 +
+        # "..." == 16 columns, pure ASCII (the bar's cell-arithmetic law).
+        assert psmux.window_display_name("api") == "api"
+        assert psmux.window_display_name("a" * 16) == "a" * 16
+        long_form = psmux.window_display_name("a" * 17)
+        assert long_form == "a" * 13 + "..."
+        assert len(long_form) == 16
+        assert long_form.isascii()
 
     def test_status_left_length_fits_the_brand(self):
         # The number is only correct relative to the brand text; pin the
@@ -1334,7 +1359,7 @@ class TestDecorateSession:
         # A status bar is cosmetic: an unlaunchable/hung psmux is logged and
         # swallowed, never propagated into a bring-up.
         cmds = self._run(monkeypatch, boom=OSError("no psmux"))
-        assert len(cmds) == 8  # all attempted; none escaped
+        assert len(cmds) == 10  # all attempted; none escaped
 
     def test_never_raises_on_timeout(self, monkeypatch):
         self._run(monkeypatch, boom=subprocess.TimeoutExpired("psmux", 3))

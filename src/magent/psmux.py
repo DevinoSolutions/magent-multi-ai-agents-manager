@@ -885,6 +885,33 @@ _F2_FALLBACK_MSG = (
 )
 
 
+# The status-bar window entry is the NAME alone: the default tmux format is
+# `#I:#W#F`, and with one window per session (magent's invariant) the `0:`
+# index is pure noise stealing bar columns from the name. Verified live on
+# psmux 3.3.8: `set -g window-status-format "#W"` renders exactly the name.
+_WINDOW_STATUS_FORMAT = "#W"
+
+# ...and the name itself is width-budgeted like every other bar element. A
+# 30-char project name eats the whole bar; longer than this renders as the
+# first 13 chars + "..." (ASCII-only, same law as the hints -- an
+# ambiguous-width glyph desyncs psmux's and the terminal's cell arithmetic).
+_WINDOW_NAME_MAX = 16
+
+
+def window_display_name(name: str) -> str:
+    """The status-bar window name for session ``name``.
+
+    Whole when it fits ``_WINDOW_NAME_MAX`` columns; otherwise truncated with
+    a trailing ``...`` so the bar SHOWS it was cut rather than silently
+    clipping mid-word. Display-only: the session name, socket name, window
+    titles and every probe keep the full name -- nothing matches on the psmux
+    window name (magent owns it precisely so nothing has to).
+    """
+    if len(name) <= _WINDOW_NAME_MAX:
+        return name
+    return name[: _WINDOW_NAME_MAX - 3] + "..."
+
+
 def code_on_path() -> bool:
     """True when VS Code's ``code`` launcher resolves on THIS machine.
 
@@ -973,9 +1000,24 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
         # what the user is working on. The rename is idempotent, sticks across
         # command changes (verified live on psmux 3.3.8), and self-repairs on
         # every decoration pass; the explicit automatic-rename off is belt and
-        # braces for a psmux that ever starts re-renaming.
-        [psmux, "-L", name, "rename-window", "-t", name, name],
+        # braces for a psmux that ever starts re-renaming. The rename target
+        # stays the SESSION name (`-t name` resolves the session's current
+        # window whatever it is called), so re-decorating an already-truncated
+        # window still lands.
+        [psmux, "-L", name, "rename-window", "-t", name, window_display_name(name)],
         [psmux, "-L", name, "set", "-g", "automatic-rename", "off"],
+        # ...and the entry renders as the name alone: no `0:` index (one
+        # window per session makes it noise), no flags suffix.
+        [psmux, "-L", name, "set", "-g", "window-status-format", _WINDOW_STATUS_FORMAT],
+        [
+            psmux,
+            "-L",
+            name,
+            "set",
+            "-g",
+            "window-status-current-format",
+            _WINDOW_STATUS_FORMAT,
+        ],
     ]
 
 
