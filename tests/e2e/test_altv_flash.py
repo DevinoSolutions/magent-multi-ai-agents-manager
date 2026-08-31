@@ -710,3 +710,62 @@ def test_the_recorder_loses_nothing_when_spawns_overlap(tmp_path):
         "invocations shared a record file; concurrent writers must never be "
         "able to land on the same bytes"
     )
+
+
+@pytest.fixture
+def native_fleet(fleet, monkeypatch):
+    """The `fleet`, with its recording multiplexer ALSO winning the TEST
+    process's PATH.
+
+    The upload-path tests never need this: their psmux spawns happen inside
+    the serve child, which gets the shimmed PATH from ``_Fleet._env``. The
+    native path is different by design -- ``altv.native_paste`` runs
+    ``psmux.send_keys`` in the LISTENER's own process (here: the test), so
+    without this the press would resolve the developer's real psmux binary.
+    ``find_psmux`` is lru-cached for the process lifetime, so the cache is
+    cleared on the way in AND on the way out (monkeypatch restores PATH after
+    this fixture's teardown, in that order, so the second clear leaves the
+    next test resolving whatever its own PATH says).
+    """
+    from magent import psmux
+
+    monkeypatch.setenv(
+        "PATH", str(fleet.bin_dir) + os.pathsep + os.environ.get("PATH", "")
+    )
+    psmux.find_psmux.cache_clear()
+    yield fleet
+    psmux.find_psmux.cache_clear()
+
+
+class TestNativeLocalPress:
+    """A LOCAL press (listener manifest carries no ssh host) is ONE native
+    Ctrl+V through the real spawn path -- no capture, no upload, no file."""
+
+    def test_a_local_press_is_one_ctrl_v_and_never_uploads(self, native_fleet):
+        fleet = native_fleet
+        outcome = altv.handle_press(
+            fleet.url,
+            fleet.project,
+            capture=lambda: pytest.fail("a native press must never read the clipboard"),
+            native=True,
+        )
+        assert outcome == "ok-native"
+
+        # Exactly one send-keys, and it is the paste key aimed at the pane --
+        # the same argv shape as the server's inject, with C-v where the file
+        # path used to be. (0x16 is what the user's own Ctrl+V would arrive
+        # as; the agent then reads the clipboard it shares with the presser.)
+        sends = [c["argv"] for c in fleet.calls() if "send-keys" in c["argv"]]
+        assert sends == [
+            ["-L", fleet.project, "send-keys", "-t", fleet.project, "--", "C-v"]
+        ]
+
+        # Nothing was uploaded: the serve's upload dir was never even created.
+        uploads = fleet.home / ".magent" / "uploads"
+        assert not uploads.exists() or not any(uploads.iterdir())
+
+        # The press still narrates: acknowledgement first, then the outcome.
+        messages = fleet.wait_for_count(2)
+        pasting = next(i for i, m in enumerate(messages) if "pasting..." in m)
+        pasted = next(i for i, m in enumerate(messages) if "pasted from clipboard" in m)
+        assert pasting < pasted

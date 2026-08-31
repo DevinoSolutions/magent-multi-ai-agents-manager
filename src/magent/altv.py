@@ -61,6 +61,7 @@ ALTV_LOG_PREFIX = "ALTV"
 
 ALTV_OUTCOMES = (
     "ok",  # image uploaded and injected into the pane
+    "ok-native",  # local press: one Ctrl+V delivered, the agent pastes natively
     "not-a-magent-window",  # pass-through: the chord was not ours to handle
     "no-image",  # magent window focused, but the clipboard holds no image
     "clipboard-unreadable",  # CF_DIB said yes, the read came back empty
@@ -68,6 +69,7 @@ ALTV_OUTCOMES = (
     "upload-rejected",  # the server answered, and said no
     "inject-failed",  # the server stored it, psmux would not paste it
     "inject-pending",  # the server stored it, psmux is still being asked
+    "native-failed",  # local press: the paste key never reached the pane
     "error",  # anything unforeseen, with a traceback in the log
 )
 
@@ -75,7 +77,9 @@ ALTV_OUTCOMES = (
 # failures, even when the paste has not landed: red on this bar reads as "your
 # screenshot is gone", and saying that about a file sitting in ~/.magent/uploads
 # is the same lie as the "upload failed" this vocabulary exists to retire.
-ALTV_SAFE_OUTCOMES = ("ok", "inject-pending")
+# (`ok-native` is safe for the simpler reason: nothing was consumed -- the
+# image is still on the clipboard either way.)
+ALTV_SAFE_OUTCOMES = ("ok", "ok-native", "inject-pending")
 
 # What each outcome says on the status bar. Split from the log vocabulary so a
 # reason can be reworded without breaking `grep ALTV outcome=...`, and kept
@@ -84,6 +88,8 @@ ALTV_SAFE_OUTCOMES = ("ok", "inject-pending")
 # "it did nothing and I cannot tell why".
 OUTCOME_REASONS: dict[str, str] = {
     "ok": "image sent",
+    "ok-native": "pasted from clipboard",
+    "native-failed": "paste key not delivered - clipboard still has the image",
     "no-image": "clipboard has no image - copy one first",
     "clipboard-unreadable": "could not read the image from the clipboard",
     "serve-unreachable": "cannot reach magent serve",
@@ -95,6 +101,7 @@ OUTCOME_REASONS: dict[str, str] = {
 
 PHASE_CAPTURING = "capturing..."
 PHASE_UPLOADING = "uploading..."
+PHASE_PASTING = "pasting..."
 
 # Prefix every flash so a message on the bar is attributable at a glance -- the
 # same window also carries F2's messages and the server's own.
@@ -353,8 +360,59 @@ def upload_image(
     return ("ok", OUTCOME_REASONS["ok"], "")
 
 
+def native_enabled() -> bool:
+    """Whether ``MAGENT_ALTV_NATIVE`` permits the local native-paste path.
+
+    Same degradation doctrine as ``psmux.boost_enabled``: the listener is a
+    long-lived hidden process, and an environment that has gone bad underneath
+    it must degrade to the default (native) rather than kill the press.
+    """
+    from pydantic import ValidationError
+
+    from magent.env import get_env
+
+    try:
+        return get_env().altv_native
+    except ValidationError:
+        get_logger("hotkey").warning(
+            "altv native: environment did not validate; pasting natively anyway"
+        )
+        return True
+
+
+def native_paste(project: str) -> tuple[str, str]:
+    """Deliver ONE Ctrl+V into the project's pane; the agent does the rest.
+
+    This is the whole local pipeline: the agent process (Claude Code) reads
+    the image off the clipboard ITSELF when it receives the paste key, and
+    locally that clipboard is the very one the user just copied into -- so
+    there is nothing to capture, upload, save, or path-inject. ``C-v`` is a
+    plain control byte (0x16) that psmux passes through unmangled (unlike the
+    modifier chords `magent terminal` exists for), and the send mirrors the
+    server's inject exactly: same primitive, same ``-t`` target, and the same
+    exactly-one-attempt law -- ``send_keys`` is bounded and a killed send may
+    or may not have landed, so a retry is how a screenshot gets pasted twice.
+
+    Returns ``(outcome, reason)`` -- ``ok-native`` or ``native-failed``, both
+    members of ``ALTV_OUTCOMES``. Failure keeps the honest half of the story:
+    the clipboard still holds the image, nothing was consumed.
+    """
+    # In-body on the same grounds as the config import in `sessions`: psmux is
+    # a leaf over `log`, so this keeps altv import-light without a cycle risk.
+    from magent import psmux
+
+    delivered = psmux.send_keys(project, "C-v", target=project)
+    if delivered:
+        return ("ok-native", OUTCOME_REASONS["ok-native"])
+    return ("native-failed", OUTCOME_REASONS["native-failed"])
+
+
 def handle_press(
-    server_url: str, project: str, capture: Callable[[], bytes | None]
+    server_url: str,
+    project: str,
+    capture: Callable[[], bytes | None],
+    *,
+    native: bool = False,
 ) -> str:
     """Run one Alt+V press to completion and return its outcome.
 
@@ -362,8 +420,34 @@ def handle_press(
     microseconds), so this is allowed to be slow -- but it may never be silent.
     The phase flashes bracket the two operations that can actually take time:
     reading a large image off the clipboard, and shipping it.
+
+    ``native=True`` is the local short-circuit (the listener's manifest carries
+    no ssh host, so the pane's agent shares the presser's clipboard): the press
+    becomes one ``send-keys C-v`` and ``capture`` is never called -- the BMP
+    capture/upload/inject pipeline exists to move an image between MACHINES,
+    and locally there is only one. Remote-wired listeners and the phone page
+    keep the upload path, where it is the only correct one.
     """
     log = get_logger("hotkey")
+    if native:
+        # Same acknowledgement-first law as the upload path: the bar answers
+        # the keypress before anything that can take time (a loaded psmux
+        # socket has stalled a control command past 70s).
+        flash_async(server_url, project, FLASH_PREFIX + PHASE_PASTING, PHASE_FLASH_MS)
+        try:
+            outcome, reason = native_paste(project)
+            report(server_url, project, outcome, reason)
+        except Exception:
+            log.exception("%s outcome=error project=%s", ALTV_LOG_PREFIX, project)
+            flash_async(
+                server_url,
+                project,
+                FLASH_PREFIX + OUTCOME_REASONS["error"],
+                tint=FLASH_TINT_ERR,
+            )
+            return "error"
+        else:
+            return outcome
     # First statement on purpose: the acknowledgement is dispatched BEFORE the
     # clipboard is touched, so the bar answers the keypress, not the upload.
     flash_async(server_url, project, FLASH_PREFIX + PHASE_CAPTURING, PHASE_FLASH_MS)

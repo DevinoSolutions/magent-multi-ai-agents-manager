@@ -335,6 +335,7 @@ class TestFailuresAreSpecific:
         # has to keep working as a diagnosis, not just `grep ALTV`.
         assert set(altv.ALTV_OUTCOMES) == {
             "ok",
+            "ok-native",
             "not-a-magent-window",
             "no-image",
             "clipboard-unreadable",
@@ -342,6 +343,7 @@ class TestFailuresAreSpecific:
             "upload-rejected",
             "inject-failed",
             "inject-pending",
+            "native-failed",
             "error",
         }
         # Every outcome the user can SEE needs words for the bar. The
@@ -352,10 +354,11 @@ class TestFailuresAreSpecific:
 
     def test_the_safe_outcomes_are_the_ones_whose_image_is_on_disk(self):
         # The tint and the wording both key off this set, so it must not drift
-        # into "every outcome that is not an exception". Exactly two outcomes
-        # leave the screenshot recoverable: the paste landed, or it has not
-        # landed YET.
-        assert set(altv.ALTV_SAFE_OUTCOMES) == {"ok", "inject-pending"}
+        # into "every outcome that is not an exception". Exactly three
+        # outcomes leave the screenshot recoverable: the paste landed (upload
+        # or native -- native consumes nothing, the clipboard still holds it),
+        # or it has not landed YET.
+        assert set(altv.ALTV_SAFE_OUTCOMES) == {"ok", "ok-native", "inject-pending"}
         assert set(altv.ALTV_SAFE_OUTCOMES) <= set(altv.ALTV_OUTCOMES)
 
 
@@ -617,3 +620,132 @@ class TestTransportReasons:
             "machine actively refused it, and here is a great deal more text"
         )
         assert len(altv._transport_reason(URLError(blob))) <= 60
+
+
+class TestNativePress:
+    """A LOCAL press is one Ctrl+V, not a pipeline.
+
+    ``native=True`` means the listener's manifest carries no ssh host: the
+    pane's agent shares the presser's clipboard, so the press delivers the
+    paste key and the agent reads the image itself. Nothing is captured,
+    nothing is uploaded, and -- exactly-one-attempt law, same as the server's
+    inject -- nothing is ever retried.
+    """
+
+    def _sends(self, monkeypatch, delivered: bool = True) -> list[tuple]:
+        from magent import psmux
+
+        calls: list[tuple] = []
+
+        def _send_keys(name, *keys, target=None, timeout=psmux.SEND_KEYS_TIMEOUT_S):
+            calls.append((name, keys, target))
+            return delivered
+
+        monkeypatch.setattr(psmux, "send_keys", _send_keys)
+        return calls
+
+    def test_one_ctrl_v_no_capture_no_upload(self, monkeypatch):
+        calls = self._sends(monkeypatch)
+        monkeypatch.setattr(
+            altv,
+            "upload_image",
+            lambda *a, **k: pytest.fail("the native path must never upload"),
+        )
+        monkeypatch.setattr(altv, "flash_async", lambda *a, **k: None)
+        outcome = altv.handle_press(
+            "http://127.0.0.1:1",
+            "proj",
+            capture=lambda: pytest.fail("the native path must never capture"),
+            native=True,
+        )
+        assert outcome == "ok-native"
+        # Mirrors the server's inject exactly: same primitive, same -t target.
+        assert calls == [("proj", ("C-v",), "proj")]
+
+    def test_the_press_is_acknowledged_before_the_send(self, monkeypatch):
+        from magent import psmux
+
+        order: list[str] = []
+        monkeypatch.setattr(
+            altv,
+            "flash_async",
+            lambda url, project, message, duration_ms=None, tint=None: order.append(
+                f"flash:{message}"
+            ),
+        )
+        monkeypatch.setattr(
+            psmux,
+            "send_keys",
+            lambda name, *keys, **kw: order.append("send") or True,
+        )
+        altv.handle_press(
+            "http://127.0.0.1:1", "proj", capture=lambda: b"", native=True
+        )
+        assert order[0] == "flash:" + altv.FLASH_PREFIX + altv.PHASE_PASTING
+        assert "send" in order
+
+    def test_a_failed_send_reports_native_failed_with_its_own_reason(self, monkeypatch):
+        self._sends(monkeypatch, delivered=False)
+        flashes: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            altv,
+            "flash_async",
+            lambda url, project, message, duration_ms=None, tint=None: flashes.append(
+                (message, tint)
+            ),
+        )
+        outcome = altv.handle_press(
+            "http://127.0.0.1:1", "proj", capture=lambda: b"", native=True
+        )
+        assert outcome == "native-failed"
+        message, tint = flashes[-1]
+        assert altv.OUTCOME_REASONS["native-failed"] in message
+        # An error tint, but an honest one: the reason says the clipboard
+        # still holds the image, so nothing sends the user hunting for a file.
+        from magent.sessions import FLASH_TINT_ERR
+
+        assert tint == FLASH_TINT_ERR
+        assert "clipboard still has the image" in message
+
+    def test_the_native_outcomes_are_vocabulary_members(self):
+        assert "ok-native" in altv.ALTV_OUTCOMES
+        assert "native-failed" in altv.ALTV_OUTCOMES
+        # Success is safe by the simplest argument in the module: nothing was
+        # consumed. Failure is NOT safe -- the press did not do its job.
+        assert "ok-native" in altv.ALTV_SAFE_OUTCOMES
+        assert "native-failed" not in altv.ALTV_SAFE_OUTCOMES
+
+    def test_without_the_flag_the_upload_path_is_byte_for_byte_today_s(
+        self, monkeypatch
+    ):
+        # Compatibility pin: every existing caller that does not pass `native`
+        # (the e2e tiers, the remote-wired listener) gets the capture/upload
+        # pipeline unchanged -- capture IS called.
+        captured: list[bool] = []
+        monkeypatch.setattr(altv, "flash_async", lambda *a, **k: None)
+        monkeypatch.setattr(
+            altv,
+            "upload_image",
+            lambda url, project, data: ("ok", altv.OUTCOME_REASONS["ok"], ""),
+        )
+        altv.handle_press(
+            "http://127.0.0.1:1", "proj", capture=lambda: captured.append(True) or b"x"
+        )
+        assert captured == [True]
+
+
+class TestNativeEnabledGate:
+    """MAGENT_ALTV_NATIVE is the listener's escape hatch back to the upload
+    path (a pane's agent may not support native image paste). Same degradation
+    doctrine as psmux.boost_enabled: a long-lived listener must never die of a
+    bad environment."""
+
+    def test_on_by_default(self, monkeypatch):
+        monkeypatch.delenv("MAGENT_ALTV_NATIVE", raising=False)
+        monkeypatch.setattr("magent.env._cached_env", None)
+        assert altv.native_enabled() is True
+
+    def test_zero_forces_the_upload_path(self, monkeypatch):
+        monkeypatch.setenv("MAGENT_ALTV_NATIVE", "0")
+        monkeypatch.setattr("magent.env._cached_env", None)
+        assert altv.native_enabled() is False

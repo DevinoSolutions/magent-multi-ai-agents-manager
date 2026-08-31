@@ -34,6 +34,7 @@ from magent.altv import (
     OUTCOME_REASONS,
     flash_async,
     handle_press,
+    native_enabled,
 )
 from magent.altv import report as _altv_report
 from magent.log import (
@@ -415,7 +416,7 @@ def _clear_manifest() -> None:
         _MANIFEST_PATH.unlink()
 
 
-def _do_upload(server_url: str, project: str) -> None:
+def _do_upload(server_url: str, project: str, ssh_host: str | None = None) -> None:
     """Run one press off the hook callback, on a thread.
 
     The whole pipeline -- press acknowledgement, capture, upload, outcome -- is
@@ -423,8 +424,20 @@ def _do_upload(server_url: str, project: str) -> None:
     CF_DIB off the clipboard). Keeping the pipeline out of here is what lets a
     real-serve e2e drive a press on Linux and macOS, where this module cannot
     even be imported.
+
+    ``ssh_host`` is the local/remote fork, and it is already the listener's
+    self-description (the manifest field F2 routes on): no host means the panes
+    this listener serves run on THIS machine, where the agent shares the
+    presser's clipboard and one native Ctrl+V (``altv.native_paste``) replaces
+    the whole capture/upload/inject pipeline. ``MAGENT_ALTV_NATIVE=0`` forces
+    the upload path back for panes whose agent cannot paste natively.
     """
-    handle_press(server_url, project, get_clipboard_image)
+    handle_press(
+        server_url,
+        project,
+        get_clipboard_image,
+        native=ssh_host is None and native_enabled(),
+    )
 
 
 def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
@@ -685,7 +698,7 @@ def _hook_decide(
             return int(user32.CallNextHookEx(None, nCode, wParam, lParam))
 
         threading.Thread(
-            target=_do_upload, args=(server_url, project), daemon=True
+            target=_do_upload, args=(server_url, project, ssh_host), daemon=True
         ).start()
         return 1
 
