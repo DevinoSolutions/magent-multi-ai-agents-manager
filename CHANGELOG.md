@@ -5,6 +5,31 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.16.0] - 2026-08-31
+
+### Added
+
+- **Clipboard captures are PNG now -- ~10-20x smaller than the BMPs they
+  replace.** An Alt+V screenshot used to land as a ~1.7 MB uncompressed
+  BMP under `~/.magent/uploads`; the capture now encodes the mainstream
+  clipboard shapes (uncompressed 24/32bpp DIBs, standard channel masks)
+  as PNG with a pure-stdlib encoder, and the upload names the file and
+  its MIME type from the actual bytes. Anything the encoder does not
+  positively recognize still ships as the proven BMP wrap -- a wrong
+  image is worse than a big one, so unrecognized shapes are refused,
+  never guessed at.
+
+### Fixed
+
+- **psmux window names belong to magent, not to whatever the pane is
+  running.** psmux's automatic rename showed the pane's current command
+  in the status line -- after a Claude Code self-update that read
+  `0:claude.exe.old` instead of anything about your project. Every
+  status-line decoration pass now pins the window name to the project
+  name and switches automatic renaming off, so existing sessions heal on
+  their next decoration tick -- the same ownership doctrine the window
+  *titles* already follow.
+
 ## [3.15.1] - 2026-08-31
 
 ### Fixed
