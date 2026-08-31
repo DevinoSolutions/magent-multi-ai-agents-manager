@@ -170,10 +170,19 @@ def _calls(rec_dir: Path) -> list[list[str]]:
     ]
 
 
-def _await_attach(rec_dir: Path, deadline_s: float) -> list[str] | None:
-    """Wait, BOUNDED, for the product to spawn an `attach`; return its argv."""
+def _await_attach(pty: Pty, rec_dir: Path, deadline_s: float) -> list[str] | None:
+    """Wait, BOUNDED, for the product to spawn an `attach`; return its argv.
+
+    Drains the pty on every poll, and that drain is load-bearing: the attach
+    only happens after the child finishes repainting, and on macOS that paint
+    blocks on the kernel's small pty buffer until somebody reads it. Without
+    the drain, this loop starved the very child it was waiting on for exactly
+    its whole window -- the instrumented run showed the attach firing the
+    moment ``wait_exit`` finally pumped, 30.7s after Enter (#190).
+    """
     end = time.monotonic() + deadline_s
     while time.monotonic() < end:
+        pty.drain()
         for argv in _calls(rec_dir):
             if "attach" in argv:
                 return argv
@@ -304,7 +313,7 @@ class TestTheSessionSwitcherFiltersTheSameWay:
             pty.send_keys(DOWN)
             pty.expect("> 3   gamma-webdocs")
             pty.send_keys(ENTER)
-            attach = _await_attach(rec_dir, 30.0)
+            attach = _await_attach(pty, rec_dir, 30.0)
             # Leave the switcher, then the menu.
             pty.send_line("q")
             pty.send_line("q")
