@@ -5,6 +5,35 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.17.0] - 2026-09-04
+
+### Changed
+
+- **`magent --go` always ends with a full retile.** It used to tile only
+  the windows it had just launched, slotting them from grid position 0
+  with the rest of the fleet ignored -- so a top-up `--go` could drop a
+  new window on top of an old one and needed a manual retile afterwards.
+  `--go` now launches whatever is missing and then tiles every open
+  magent window, pre-existing ones and attach panes included, exactly as
+  `--retile-all` does. A `--go --dry-run` therefore previews the whole
+  on-screen fleet, not just the new windows.
+
+- **psmux status-bar entries show the project name alone.** The window
+  entry no longer carries the `0:` index prefix, and a name longer than
+  16 columns is shown truncated (`magent-multi-...`). Display only:
+  session names, window titles and every probe keep the full name, so
+  nothing that matches on it changes.
+
+### Fixed
+
+- **Projects with a space, dot or colon in their name were respawned on
+  every `--go` and reported "not found" by the tile pass.** psmux cannot
+  carry those characters in a session name, so the window was created
+  and titled under the sanitized form (`GitHub-Advertisment`) while the
+  launch path probed and tiled by the raw one (`GitHub Advertisment`).
+  Both now share the sanitized key: the live session is recognized, the
+  window is found, and it tiles with the rest.
+
 ## [3.16.0] - 2026-08-31
 
 ### Added
