@@ -585,10 +585,13 @@ class TestTheSchtasksResolver:
         assert Path(windows._schtasks_exe()).parent != plant
 
 
+@pytestmark_win
 class TestThePowerShellQuoting:
     """Two quoting layers stand between an argv and the desktop's child
     process, and a mistake in either splits an argument silently. Pure string
-    assertions, so they run on every OS."""
+    assertions -- but they live in ``platform/windows.py``, which imports
+    ``ctypes.WINFUNCTYPE`` at module level and so cannot be imported anywhere
+    else (CI proved it: 5 ImportErrors on every macOS/Linux leg)."""
 
     def test_a_literal_is_single_quoted_and_doubled(self):
         from magent.platform.windows import _ps_quote
