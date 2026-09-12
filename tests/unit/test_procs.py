@@ -17,6 +17,8 @@ import pytest
 from magent.procs import (
     ABOVE_NORMAL_PRIORITY_CLASS,
     CREATE_BREAKAWAY_FROM_JOB,
+    NO_CONSOLE_SESSION,
+    active_console_session_id,
     count_processes,
     current_session_id,
     pid_alive,
@@ -289,3 +291,28 @@ class TestLogonSessionIds:
     def test_a_bogus_pid_is_unknowable_everywhere(self):
         assert session_id_of(0) is None
         assert session_id_of(-1) is None
+
+
+class TestActiveConsoleSession:
+    """Read to answer "is there a desktop to hand work to at all?" -- and
+    deliberately never to PICK a session. The id can name an RDP session that
+    is not the desktop the user is looking at, so anything built on "find the
+    interactive session" is wrong on some real machine."""
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the POSIX branch")
+    def test_off_windows_there_is_no_console_session(self):
+        assert active_console_session_id() is None
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32 console sessions")
+    def test_a_logged_on_box_reports_a_usable_session(self):
+        session = active_console_session_id()
+        assert isinstance(session, int)
+        # This suite runs from a logged-on desktop or a CI runner; either way
+        # the call answers. Whether the value is USABLE is the platform
+        # probe's judgement, not this module's -- see NO_CONSOLE_SESSION.
+        assert session >= 0
+
+    def test_the_two_non_answers_are_named_not_guessed(self):
+        # 0 is the services session; 0xFFFFFFFF is "nothing attached". Both are
+        # "no desktop", and neither may be mistaken for a session id.
+        assert NO_CONSOLE_SESSION == (0, 0xFFFFFFFF)

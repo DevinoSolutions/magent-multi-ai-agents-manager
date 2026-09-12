@@ -65,6 +65,7 @@ def _handoff_ensure(port: int, config_path: str | None) -> bool:
         SESSION0_SERVE_TIMEOUT_S,
         relay_handoff,
         session0_disposition,
+        session0_refusal,
     )
     from magent.platform import get_platform  # heavy subsystem: in-body per policy
 
@@ -73,7 +74,8 @@ def _handoff_ensure(port: int, config_path: str | None) -> bool:
     if disposition == "run":
         return False
     if disposition == "refuse":
-        click.echo(f"  {style('x', fg='red')} {SESSION0_SERVE_REFUSAL}", err=True)
+        reason = session0_refusal(plat, SESSION0_SERVE_REFUSAL)
+        click.echo(f"  {style('x', fg='red')} {reason}", err=True)
         sys.exit(1)
     argv = [sys.executable, "-m", "magent"]
     if config_path:

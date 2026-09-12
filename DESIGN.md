@@ -1619,14 +1619,57 @@ the command re-runs itself where it belongs.
 **Task Scheduler, not `CreateProcessAsUser`.** The API route needs a token
 from another session, which means `SeTcbPrivilege` -- an ELEVATED magent -- for
 something the user is plainly entitled to do to their own desktop. A one-shot
-`/it` task ("run only when the user is logged on") needs no stored credential,
-no admin right and no password, and it is *Windows* that places the process in
-the interactive session rather than magent picking one. That last point is the
-important half: a "find the interactive session" heuristic is wrong on any
-machine whose active console session is not the session holding the desktop.
-Verified on the incident machine from a real Session-0 sshd login: Session 1,
-Medium integrity, desktop visible, ~1.6s. `/tr` truncates at 261 characters, so
-the task runs a generated shim file and never the real command line.
+`/IT` task ("run only when the user is logged on") needs no stored credential,
+no admin right and no password -- hence no `/RU`/`/RP` -- and it is *Windows*
+that places the process in the interactive session rather than magent picking
+one. That last point is the important half, and it is why
+`supports_desktop_handoff()` reads `WTSGetActiveConsoleSessionId` only to ask
+"is there a usable console session AT ALL" and never to choose one: that id can
+name an RDP session that is not the physical desktop, so every "find the
+interactive session" heuristic is wrong on some real machine. When the answer
+is 0 or `0xFFFFFFFF` the disposition falls to `refuse` with its own wording --
+nobody is logged on, so "run it on the desktop" would be advice the user cannot
+take. Verified on the incident machine from a real Session-0 sshd login:
+Session 1, Medium integrity, desktop visible, ~1.6s. `/ST 00:00` is deliberately
+in the PAST, so a task stranded by a killed caller (an ssh drop takes the
+host-side `magent up` with it) can never fire on its own; `/Run` ignores the
+trigger entirely.
+
+**The task runs a PowerShell file, and both quoting layers are load-bearing.**
+`/TR` truncates SILENTLY past ~261 characters, so it carries only a fixed
+launcher (`powershell.exe -NoProfile -ExecutionPolicy Bypass -File <script>`;
+Windows PowerShell, not `pwsh`, which is not on every box) and the real argv
+lives in the script. PowerShell rather than a `.cmd` shim fixes three things a
+batch file gets wrong: `-WindowStyle Hidden` means the desktop is not shown a
+console window for a command nobody typed; `$p.ExitCode` is the real exit
+status rather than a parsed `%ERRORLEVEL%`; and cmd would read an `&` in an
+unquoted argument as a command separator, which `list2cmdline` does not defend
+against (it quotes for whitespace and quotes only) -- on a machine whose
+project path literally contains `&`, that is not hypothetical. The two layers
+are `subprocess.list2cmdline(argv)` building one command line by the MS
+C-runtime rules the child's own parser uses, then `_ps_quote` making that whole
+string ONE PowerShell literal for `-ArgumentList`. Passing a LIST to
+`-ArgumentList` skips the first layer: PowerShell joins array elements with
+bare spaces and does not re-quote, so `--config C:\A B\magent.json` arrives as
+two arguments.
+
+One measured trap worth keeping: a `Start-Process -PassThru` object's
+`.ExitCode` is `$null` forever unless `$p.Handle` is touched while the process
+is still alive. PowerShell does not hold the handle, so once the child exits
+the OS has nothing left to ask. `rc.txt` came back EMPTY on every run until
+that line existed, and the hand-off then reported an "unreadable exit code" for
+commands that had succeeded.
+
+**`schtasks` comes from the system directory, not PATH.** `run_on_desktop` is
+reached from an ssh login, and letting that login's PATH choose what runs as
+the logged-on user would turn a hand-off into an execution primitive for
+whoever set it. The consequence is a deliberate test gap: a real child process
+cannot be pointed at a fake, so there is no e2e proof of a SUCCESSFUL hand-off
+-- the alternatives were a test-only environment variable or writing real
+scheduled tasks on the machine running the suite. The full choreography is
+proven in the unit tier through the `_schtasks_exe` seam, with real processes
+on both ends of the launcher; the e2e tier proves the detection and that
+nothing is ever created in place.
 
 **Two signals, not one.** `WindowsPlatform.logon_session_is_interactive()` is
 false when `procs.current_session_id()` is 0 OR when `env.is_ssh_login()` is
@@ -1656,12 +1699,20 @@ that setting cannot change a normal desktop launch. Off Windows every platform
 reports interactive and nothing changes at all -- tmux over ssh is how people
 work there.
 
-Two smaller details that are load-bearing: the shim `cd /d`s back into the
-caller's working directory (a scheduled task starts in `system32`, and
-`find_config` walks up from the cwd, so the desktop copy would otherwise bring
-up a different config's projects), and it exports `MAGENT_SESSION0_POLICY=refuse`
-for its child so a hand-off that somehow landed in Session 0 again cannot
-recurse -- a recursion whose every level writes a scheduled task.
+Three smaller details that are load-bearing. The launcher passes
+`-WorkingDirectory` the caller's directory (a scheduled task starts in
+`system32`, and `find_config` walks up from the cwd, so the desktop copy would
+otherwise bring up a different config's projects). It exports
+`MAGENT_SESSION0_POLICY=refuse` for its child, so a hand-off that somehow
+landed in Session 0 again cannot recurse -- a recursion whose every level
+writes a scheduled task. And it writes `pid.txt` the moment `Start-Process`
+returns and `rc.txt` only after `WaitForExit`, which is what lets the poll tell
+three failures apart: no pid after the start grace means Task Scheduler never
+ran the task, a pid that is gone with no rc means the launcher lost its child
+and nothing is coming, and neither is the caller's budget simply running out.
+On that last one the delegated child is deliberately NOT killed: a bring-up
+still running on the desktop is doing the work that was asked for, and the pid
+is a number Windows recycles freely.
 
 Diagnostics are the other half: `doctor`'s `psmux-session0` check and one
 `status` stderr line count psmux servers still stranded there (by image name
@@ -1670,10 +1721,10 @@ high-integrity ones). WARN, never FAIL, and additive in `status --json`
 (`psmux_session0`): magent did not start them and cannot stop them, so they
 must not move the 0/1/3 exit contract.
 
-Proof: `tests/unit/test_desktop_handoff.py` (the policy, the relay, and the
-real create/run/poll/delete choreography against a FAKE `schtasks` first on
-PATH -- which is why `run_on_desktop` resolves the binary with `shutil.which`
-rather than out of the system directory), `tests/unit/test_attach.py::
+Proof: `tests/unit/test_desktop_handoff.py` (the policy, the refusal wordings,
+the relay, both quoting layers, and the real create/run/poll/delete
+choreography against a FAKE `schtasks` installed through the `_schtasks_exe`
+seam), `tests/unit/test_attach.py::
 TestUpHandsOffFromSessionZero`, `tests/unit/test_serve_port.py::
 TestEnsureHandsOffFromSessionZero`, and `tests/e2e/test_session0_handoff.py`
 (a REAL `magent up` child told it is an ssh login). `tests/conftest.py` pins

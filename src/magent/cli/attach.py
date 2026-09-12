@@ -1405,7 +1405,6 @@ def up_cmd(
     cfg = _load_config_or_exit(config_file, as_json=as_json)
 
     from magent.launch import (  # heavy subsystem: in-body per policy
-        SESSION0_REFUSAL,
         SESSION0_UP_TIMEOUT_S,
         bring_up_psmux,
         decorate_psmux_sessions,
@@ -1415,6 +1414,7 @@ def up_cmd(
         revive_psmux,
         session0_disposition,
         session0_note,
+        session0_refusal,
     )
 
     # This is the command `magent attach` runs on the host over ssh, and on
@@ -1432,7 +1432,7 @@ def up_cmd(
         plat = get_platform()
         disposition = session0_disposition(plat)
         if disposition == "refuse":
-            click.echo(f"  {style('x', fg='red')} {SESSION0_REFUSAL}", err=True)
+            click.echo(f"  {style('x', fg='red')} {session0_refusal(plat)}", err=True)
             sys.exit(1)
         if disposition == "handoff":
             sys.exit(

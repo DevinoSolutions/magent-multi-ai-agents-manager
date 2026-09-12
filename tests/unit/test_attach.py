@@ -2449,6 +2449,9 @@ class TestUpHandsOffFromSessionZero:
     def test_a_platform_without_a_mechanism_refuses(
         self, runner, tmp_path, monkeypatch
     ):
+        # On Windows this is specifically "nobody is logged on at the console",
+        # and the refusal has to say so -- telling that user to run it on the
+        # desktop would be advice they cannot take.
         plat = self._plat(monkeypatch, supports_handoff=False)
         self._policy(monkeypatch, "handoff")
 
@@ -2456,6 +2459,7 @@ class TestUpHandsOffFromSessionZero:
 
         assert result.exit_code == 1
         assert plat.handoffs == []
+        assert "no user is logged on" in result.output
 
     def test_allow_runs_it_right_here(self, runner, tmp_path, monkeypatch):
         # A headless Windows host reached only over ssh has no desktop to hand

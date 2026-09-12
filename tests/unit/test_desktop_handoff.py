@@ -7,10 +7,12 @@ servers and 42 agents -- was born in logon Session 0, invisible to and
 unkillable from the desktop it was meant to appear on, while holding every
 session name the desktop's own bring-up wanted.
 
-NOTHING here creates a real scheduled task. The Windows tier shadows
-``schtasks`` with a recording fake first on PATH, which is the entire reason
-``run_on_desktop`` resolves the binary with ``shutil.which`` instead of out of
-the system directory.
+NOTHING here creates a real scheduled task. The Windows tier replaces the
+``_schtasks_exe`` seam with a recording fake -- NOT by shadowing PATH, because
+the real resolver reads the system directory first (an ssh login's PATH must
+not get to choose what runs as the logged-on user), so a PATH plant would miss
+and write a real task. Everything downstream of the scheduler is real: the
+generated PowerShell, the four result files, and the exit-code round trip.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -28,6 +31,7 @@ from magent.launch import (
     relay_handoff,
     session0_disposition,
     session0_note,
+    session0_refusal,
 )
 from magent.platform import HandoffResult, Platform
 from tests.conftest import FakePlatform
@@ -96,6 +100,44 @@ class TestTheDisposition:
         note = session0_note()
         assert note is not None
         assert "MAGENT_SESSION0_POLICY=allow" in note
+
+
+class TestTheRefusalNamesItsCause:
+    """Two different situations wear the same `refuse` disposition, and telling
+    them apart is the difference between actionable advice and advice the user
+    cannot take."""
+
+    def test_a_policy_refusal_says_run_it_on_the_desktop(self, monkeypatch):
+        _policy(monkeypatch, "refuse")
+        plat = FakePlatform(interactive_session=False, supports_handoff=True)
+
+        assert "Run 'magent up' on the host's own desktop" in session0_refusal(plat)
+
+    def test_no_desktop_says_nobody_is_logged_on(self, monkeypatch):
+        # The policy DID ask for a hand-off; there is simply nowhere to hand
+        # off to. "Run it on the desktop" would be advice with no desktop.
+        _policy(monkeypatch, "handoff")
+        plat = FakePlatform(interactive_session=False, supports_handoff=False)
+
+        reason = session0_refusal(plat)
+        assert "no user is logged on" in reason
+        assert "Run 'magent up' on the host's own desktop" not in reason
+
+    def test_the_serve_wording_is_carried_through(self, monkeypatch):
+        from magent.launch import SESSION0_SERVE_REFUSAL
+
+        _policy(monkeypatch, "refuse")
+        plat = FakePlatform(interactive_session=False, supports_handoff=True)
+
+        assert session0_refusal(plat, SESSION0_SERVE_REFUSAL) == SESSION0_SERVE_REFUSAL
+
+    def test_no_desktop_overrides_even_the_serve_wording(self, monkeypatch):
+        from magent.launch import SESSION0_SERVE_REFUSAL
+
+        _policy(monkeypatch, "handoff")
+        plat = FakePlatform(interactive_session=False, supports_handoff=False)
+
+        assert "no user is logged on" in session0_refusal(plat, SESSION0_SERVE_REFUSAL)
 
 
 class TestTheRelay:
@@ -208,7 +250,10 @@ tasks = json.loads(state.read_text(encoding="utf-8")) if state.exists() else {}
 
 
 def value(flag):
-    return args[args.index(flag) + 1] if flag in args else None
+    # schtasks is case-insensitive about its own switches, so the fake must be
+    # too -- otherwise it pins a spelling instead of the recipe.
+    lowered = [a.lower() for a in args]
+    return args[lowered.index(flag) + 1] if flag in lowered else None
 
 
 mode = args[0].lower() if args else ""
@@ -249,12 +294,18 @@ pytestmark_win = pytest.mark.skipif(
 
 @pytest.fixture
 def fake_schtasks(tmp_path, monkeypatch):
-    """A recording ``schtasks`` first on PATH that REALLY runs the shim.
+    """A recording ``schtasks`` that REALLY runs the launcher script.
 
-    Not a mock of the module's own subprocess calls: the thing worth proving is
-    that the shim cmd file, its three result files and the exit-code round trip
-    all work, and a stubbed-out runner would prove only that the code calls
-    functions. The fake owns the scheduler, not the shim.
+    Installed by monkeypatching the ``_schtasks_exe`` SEAM, not by shadowing
+    PATH: the real resolver reads the system directory first (an ssh login's
+    PATH must not get to choose what runs as the logged-on user), so PATH
+    shadowing would silently miss and write a real scheduled task.
+
+    Not a mock of the module's own subprocess calls either. What is worth
+    proving is that the generated PowerShell, its four result files and the
+    exit-code round trip all work against a real process; a stubbed-out runner
+    would prove only that the code calls functions. The fake owns the
+    scheduler, never the launcher.
 
     The scratch ROOT is redirected into tmp_path as well. ``run_on_desktop``
     deliberately leaves its directory behind on failure and names it in
@@ -265,11 +316,12 @@ def fake_schtasks(tmp_path, monkeypatch):
     bin_dir.mkdir()
     helper = bin_dir / "schtasks_helper.py"
     helper.write_text(_FAKE_SCHTASKS, encoding="utf-8")
-    (bin_dir / "schtasks.cmd").write_text(
+    fake = bin_dir / "schtasks.cmd"
+    fake.write_text(
         f'@echo off\r\n"{sys.executable}" "{helper}" %*\r\nexit /b %ERRORLEVEL%\r\n',
         encoding="utf-8",
     )
-    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+    monkeypatch.setattr("magent.platform.windows._schtasks_exe", lambda: str(fake))
     scratch = tmp_path / "systemp"
     scratch.mkdir()
     monkeypatch.setattr(
@@ -297,8 +349,24 @@ class TestRunOnDesktopOnWindows:
 
         return WindowsPlatform()
 
-    def test_windows_claims_the_mechanism(self):
+    def test_a_logged_on_console_session_offers_the_mechanism(self, monkeypatch):
+        monkeypatch.setattr(
+            "magent.platform.windows.active_console_session_id", lambda: 1
+        )
+
         assert self._plat().supports_desktop_handoff() is True
+
+    @pytest.mark.parametrize("session", [0, 0xFFFFFFFF, None])
+    def test_no_usable_console_session_withdraws_it(self, monkeypatch, session):
+        # 0 is the services session, 0xFFFFFFFF means nothing is attached to
+        # the console, None means the probe would not answer. None of the three
+        # is a desktop, and a hand-off aimed at one would sit waiting out its
+        # whole budget for a task Windows is never going to start.
+        monkeypatch.setattr(
+            "magent.platform.windows.active_console_session_id", lambda: session
+        )
+
+        assert self._plat().supports_desktop_handoff() is False
 
     def test_an_ssh_login_is_not_an_interactive_session(self, monkeypatch):
         # On Windows OpenSSH is a SERVICE, so an ssh login is Session 0 by
@@ -361,31 +429,39 @@ class TestRunOnDesktopOnWindows:
 
         calls = _calls(fake_schtasks)
         modes = [c[0] for c in calls]
-        assert modes == ["/create", "/run", "/delete"]
+        assert modes == ["/Create", "/Run", "/Delete"]
         create = calls[0]
-        task = create[create.index("/tn") + 1]
+        task = create[create.index("/TN") + 1]
         assert task.startswith("magent-handoff-")
-        # /it is the whole point: "run only when the user is logged on" is what
-        # puts the process in the interactive session. /f makes a re-run
-        # idempotent; /sc once + /st is the trigger schtasks demands and /run
-        # never waits for.
-        for flag in ("/it", "/f"):
-            assert flag in create
-        assert create[create.index("/sc") + 1] == "once"
-        assert "/st" in create
-        # ...and the delete really names the same task, on every path: a
-        # one-shot task left behind fires tonight and re-runs the bring-up.
-        assert calls[-1] == ["/delete", "/tn", task, "/f"]
+        # /IT is the whole point: "run only when the user is logged on" is what
+        # puts the process in the interactive session, with no stored
+        # credential. /F makes a re-run idempotent. /SC ONCE + /ST is the
+        # trigger schtasks demands and /Run never waits for -- and 00:00 is
+        # deliberately in the past, so a task stranded by a killed caller can
+        # never fire on its own tonight.
+        assert "/IT" in create
+        assert "/F" in create
+        assert create[create.index("/SC") + 1] == "ONCE"
+        assert create[create.index("/ST") + 1] == "00:00"
+        # No /RU and no /RP: a logged-on-only task needs no password and no
+        # admin rights, and asking for either would make this unusable.
+        assert "/RU" not in create
+        assert "/RP" not in create
+        # ...and the delete really names the same task, on every path.
+        assert calls[-1] == ["/Delete", "/F", "/TN", task]
 
-    def test_the_run_spec_stays_under_the_schtasks_limit(self, fake_schtasks):
+    def test_the_run_spec_is_a_fixed_launcher_under_the_limit(self, fake_schtasks):
         self._plat().run_on_desktop([sys.executable, "-c", "pass"], timeout_s=60)
 
         create = _calls(fake_schtasks)[0]
-        run_spec = create[create.index("/tr") + 1]
-        # schtasks truncates /tr silently past 261 characters -- which is why
-        # the task runs a shim FILE and not the real command line.
+        run_spec = create[create.index("/TR") + 1]
+        # schtasks truncates /TR silently past 261 characters -- which is why
+        # the task runs a SCRIPT FILE and not the real command line.
         assert len(run_spec) <= 261
-        assert run_spec.endswith('run.cmd"')
+        # powershell.exe, not pwsh: PowerShell 7 is not on every Windows box.
+        assert run_spec.startswith("powershell.exe -NoProfile")
+        assert "-ExecutionPolicy Bypass" in run_spec
+        assert run_spec.endswith('run.ps1"')
 
     def test_a_slow_command_times_out_without_a_fabricated_code(self, fake_schtasks):
         result = self._plat().run_on_desktop(
@@ -399,7 +475,11 @@ class TestRunOnDesktopOnWindows:
         # ...and the task is still deleted: its trigger is past-dated so it can
         # never fire, but a leftover task is clutter and a name the next
         # hand-off cannot reuse.
-        assert _calls(fake_schtasks)[-1][0] == "/delete"
+        assert _calls(fake_schtasks)[-1][0] == "/Delete"
+        # No kill: a bring-up still running on the desktop past our budget is
+        # doing the work that was asked for, and the pid we hold is a number
+        # Windows recycles freely.
+        assert "may still be running" in result.detail
 
     def test_a_task_that_never_starts_is_not_waited_out(
         self, fake_schtasks, monkeypatch
@@ -418,10 +498,8 @@ class TestRunOnDesktopOnWindows:
         assert "never started" in result.detail
         assert "logged on" in result.detail
 
-    def test_no_schtasks_is_a_named_failure_not_a_crash(self, tmp_path, monkeypatch):
-        empty = tmp_path / "nothing"
-        empty.mkdir()
-        monkeypatch.setenv("PATH", str(empty))
+    def test_no_schtasks_is_a_named_failure_not_a_crash(self, monkeypatch):
+        monkeypatch.setattr("magent.platform.windows._schtasks_exe", lambda: None)
 
         result = self._plat().run_on_desktop(["whatever"], timeout_s=5)
 
@@ -434,10 +512,18 @@ class TestRunOnDesktopOnWindows:
 
         assert list(root.iterdir()) == []
 
+    def test_the_scratch_root_does_not_grow_across_calls(self, fake_schtasks):
+        # One directory per call, deleted on success -- so a machine that hands
+        # off all day does not accumulate a launcher script per bring-up.
+        for _ in range(3):
+            self._plat().run_on_desktop([sys.executable, "-c", "pass"], timeout_s=60)
+
+        assert list(_scratch_root(fake_schtasks).iterdir()) == []
+
     def test_a_failed_handoff_keeps_its_evidence(self, fake_schtasks, monkeypatch):
         # The other half of the same rule: on failure the directory STAYS and
-        # is named in `detail`, because the shim and whatever the command
-        # managed to write are the only evidence there is.
+        # is named in `detail`, because the launcher script and whatever the
+        # command managed to write are the only evidence there is.
         monkeypatch.setenv("MDTEST_HANDOFF_NEVER_STARTS", "1")
         monkeypatch.setattr("magent.platform.windows._HANDOFF_START_GRACE_S", 0.2)
 
@@ -448,29 +534,156 @@ class TestRunOnDesktopOnWindows:
         left = list(_scratch_root(fake_schtasks).iterdir())
         assert len(left) == 1
         assert str(left[0]) in result.detail
-        assert (left[0] / "run.cmd").is_file()
+        assert (left[0] / "run.ps1").is_file()
+
+    def test_a_child_that_dies_without_an_exit_code_fails_fast(
+        self, fake_schtasks, monkeypatch
+    ):
+        # pid.txt present, process gone, no rc.txt: the launcher lost its child
+        # and nothing is ever going to write one. Reporting that now beats
+        # spending the caller's whole 900s budget proving it.
+        started = time.monotonic()
+        monkeypatch.setattr("magent.platform.windows._read_pid", lambda _p: 4)
+        monkeypatch.setattr("magent.platform.windows.pid_alive", lambda _p: False)
+
+        result = self._plat().run_on_desktop(
+            [sys.executable, "-c", "pass"], timeout_s=60
+        )
+
+        assert result.rc is None
+        assert result.timed_out is False
+        assert "without an exit code" in result.detail
+        assert time.monotonic() - started < 30
 
 
 @pytestmark_win
-class TestTheShimItself:
-    """The batch file is the only thing standing between an argv and cmd.exe's
-    own parsing, so its quoting is worth pinning directly."""
+class TestTheSchtasksResolver:
+    """PATH is not this function's to trust: ``run_on_desktop`` is reached from
+    an ssh login, and letting that login's PATH choose what runs as the
+    logged-on user would turn a hand-off into an execution primitive."""
 
-    def test_a_path_with_spaces_survives_the_command_line(self, tmp_path):
-        from magent.platform.windows import _handoff_shim
+    def test_it_prefers_the_system_directory(self):
+        from magent.platform import windows
+
+        resolved = windows._schtasks_exe()
+
+        assert resolved is not None
+        assert Path(resolved).name.lower() == "schtasks.exe"
+        assert Path(resolved).is_file()
+        # System32 (or SysWOW64 under a 32-bit host), never a PATH entry
+        # somebody else can write.
+        assert Path(resolved).parent.name.lower() in ("system32", "syswow64")
+
+    def test_a_path_plant_does_not_win(self, tmp_path, monkeypatch):
+        plant = tmp_path / "evil"
+        plant.mkdir()
+        (plant / "schtasks.exe").write_text("not really", encoding="utf-8")
+        monkeypatch.setenv("PATH", str(plant) + os.pathsep + os.environ.get("PATH", ""))
+
+        from magent.platform import windows
+
+        assert Path(windows._schtasks_exe()).parent != plant
+
+
+class TestThePowerShellQuoting:
+    """Two quoting layers stand between an argv and the desktop's child
+    process, and a mistake in either splits an argument silently. Pure string
+    assertions, so they run on every OS."""
+
+    def test_a_literal_is_single_quoted_and_doubled(self):
+        from magent.platform.windows import _ps_quote
+
+        # Single quotes so nothing inside is expanded: these are paths and a
+        # whole command line, and a `$` or a backtick must arrive verbatim.
+        assert _ps_quote(r"C:\a $b `c") == r"'C:\a $b `c'"
+        assert _ps_quote("it's") == "'it''s'"
+
+    def test_the_argv_becomes_one_argument_list_string(self):
+        from magent.platform.windows import _handoff_script
+
+        script = _handoff_script(
+            ["py.exe", "--config", r"C:\A B\magent.json", "up"],
+            r"C:\work",
+            Path("o"),
+            Path("e"),
+            Path("p"),
+            Path("r"),
+        )
+
+        # list2cmdline quoted the space-bearing path, and _ps_quote then made
+        # the WHOLE command line one PowerShell literal. Passing a list to
+        # -ArgumentList instead would join with bare spaces and split that
+        # path into two arguments.
+        assert "-ArgumentList '--config \"C:\\A B\\magent.json\" up'" in script
+        assert "-FilePath 'py.exe'" in script
+
+    def test_it_carries_the_three_load_bearing_instructions(self):
+        from magent.platform.windows import _handoff_script
+
+        script = _handoff_script(
+            ["py.exe"], r"C:\work", Path("o"), Path("e"), Path("p"), Path("r")
+        )
+
+        # No recursion: a hand-off that landed in Session 0 again refuses.
+        assert "$env:MAGENT_SESSION0_POLICY = 'refuse'" in script
+        # The caller's directory, because find_config walks up from the cwd and
+        # a scheduled task starts in system32.
+        assert "-WorkingDirectory 'C:\\work'" in script
+        # No console flashed at the desktop by a command nobody typed.
+        assert "-WindowStyle Hidden" in script
+
+    def test_the_exit_code_is_written_last(self):
+        from magent.platform.windows import _handoff_script
+
+        script = _handoff_script(
+            ["py.exe"], r"C:\work", Path("o"), Path("e"), Path("pid"), Path("rc")
+        )
+
+        # pid.txt is the "it really started" signal and must land first; rc.txt
+        # is the completion signal and must land after WaitForExit, so a reader
+        # that sees it can never read a half-written out.txt.
+        assert script.index("'pid'") < script.index("WaitForExit")
+        assert script.index("WaitForExit") < script.index("'rc'")
+
+    def test_the_process_handle_is_cached_before_the_wait(self):
+        from magent.platform.windows import _handoff_script
+
+        script = _handoff_script(
+            ["py.exe"], r"C:\work", Path("o"), Path("e"), Path("p"), Path("r")
+        )
+
+        # A `Start-Process -PassThru` object's .ExitCode is $null FOREVER
+        # unless the handle is cached while the process is alive: PowerShell
+        # does not hold it, so once the child exits there is nothing left to
+        # ask. Measured, not theorised -- rc.txt came back empty on every run
+        # until this line existed, and the whole hand-off then reported an
+        # "unreadable exit code" for commands that had succeeded.
+        assert "$null = $p.Handle" in script
+        assert script.index("$p.Handle") < script.index("WaitForExit")
+
+
+@pytestmark_win
+class TestTheLauncherReallyRuns:
+    """The generated PowerShell, executed for real, from a directory whose name
+    has a space in it."""
+
+    def test_a_path_with_spaces_survives_both_layers(self, tmp_path):
+        from magent.platform.windows import _HANDOFF_SHELL, _handoff_script
 
         work = tmp_path / "a b c"
         work.mkdir()
-        shim = work / "run.cmd"
-        out, err, rc = work / "out.txt", work / "err.txt", work / "rc.txt"
-        shim.write_text(
-            _handoff_shim(
-                [sys.executable, "-c", "print('ok')"], str(work), out, err, rc
+        script = work / "run.ps1"
+        out, err = work / "out.txt", work / "err.txt"
+        pid, rc = work / "pid.txt", work / "rc.txt"
+        script.write_text(
+            _handoff_script(
+                [sys.executable, "-c", "print('ok')"], str(work), out, err, pid, rc
             ),
             encoding="utf-8",
         )
 
-        subprocess.run(["cmd", "/c", str(shim)], check=True, timeout=60)
+        subprocess.run([*_HANDOFF_SHELL.split(), str(script)], check=True, timeout=120)
 
         assert out.read_text(encoding="utf-8").strip() == "ok"
         assert rc.read_text(encoding="utf-8").strip() == "0"
+        assert pid.read_text(encoding="utf-8").strip().isdigit()

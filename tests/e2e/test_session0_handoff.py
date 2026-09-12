@@ -164,38 +164,24 @@ def _calls(bin_dir: Path) -> list[list[str]]:
 @pytest.mark.skipif(
     sys.platform != "win32", reason="the Task Scheduler hand-off is win32-only"
 )
-class TestAWindowsSshLoginHandsOffToTheDesktop:
-    def test_the_bring_up_is_re_run_on_the_desktop(self, tmp_path):
-        started = time.monotonic()
-        bin_dir = tmp_path / "bin"
-        _fake_psmux(bin_dir)
-        _fake_schtasks(bin_dir)
-        env = _child_env(
-            tmp_path / "home",
-            bin_dir,
-            SSH_CONNECTION="1.2.3.4 1 5.6.7.8 22",
-            MAGENT_SESSION0_POLICY="handoff",
-        )
+class TestAWindowsSshLoginNeverCreatesSessionsInPlace:
+    """What a real `magent up` child does when it is told it is an ssh login.
 
-        result = _run_up(_config(tmp_path), env, timeout=_BUDGET_S)
-
-        assert "re-running on the desktop" in result.stdout, result.stderr
-        # The whole choreography really happened against a real binary named
-        # schtasks: create the one-shot task, run it, delete it.
-        calls = _calls(bin_dir)
-        modes = [c[0] for c in calls]
-        assert modes.count("/create") >= 1
-        assert modes.count("/run") >= 1
-        assert modes[-1] == "/delete"
-        create = calls[0]
-        assert create[create.index("/tn") + 1].startswith("magent-handoff-")
-        assert "/it" in create
-        # ...and the desktop copy really ran: its own `up` output came back up
-        # the pipe, through the shim's out.txt, into this child's stdout.
-        assert "Bring up sessions" in result.stdout
-        assert time.monotonic() - started < _BUDGET_S
+    DELIBERATE GAP: there is no real-process test of the hand-off SUCCEEDING.
+    `run_on_desktop` resolves schtasks out of the system directory precisely so
+    an ssh login's PATH cannot choose what runs as the logged-on user, which
+    means a child process cannot be pointed at a fake -- and the alternatives
+    are a test-only environment variable (forbidden) or writing a REAL
+    scheduled task on the machine running the suite (worse). The full
+    create/run/poll/delete choreography is proven in
+    ``tests/unit/test_desktop_handoff.py`` against the ``_schtasks_exe`` seam,
+    with real processes on both ends of the launcher. What lives here is the
+    half a child process CAN prove: the detection, and that nothing is ever
+    created in place.
+    """
 
     def test_refuse_creates_nothing_and_says_why(self, tmp_path):
+        started = time.monotonic()
         bin_dir = tmp_path / "bin"
         _fake_psmux(bin_dir)
         _fake_schtasks(bin_dir)
@@ -210,7 +196,31 @@ class TestAWindowsSshLoginHandsOffToTheDesktop:
 
         assert result.returncode == 1
         assert "refusing to start psmux sessions" in result.stderr
-        # Nothing was scheduled: a refusal must not also write a task.
+        # It never reached the bring-up banner, so no session was attempted.
+        assert "Bring up sessions" not in result.stdout
+        # Nothing was scheduled either: a refusal must not also write a task.
+        assert _calls(bin_dir) == []
+        assert time.monotonic() - started < _BUDGET_S
+
+    def test_allow_is_the_escape_hatch_for_a_headless_host(self, tmp_path):
+        # The same child, same ssh environment, one policy value apart: a
+        # genuinely headless Windows host reached only over ssh has no desktop
+        # to hand off to, and Session 0 is where its fleet belongs.
+        bin_dir = tmp_path / "bin"
+        _fake_psmux(bin_dir)
+        _fake_schtasks(bin_dir)
+        env = _child_env(
+            tmp_path / "home",
+            bin_dir,
+            SSH_CONNECTION="1.2.3.4 1 5.6.7.8 22",
+            MAGENT_SESSION0_POLICY="allow",
+        )
+
+        result = _run_up(_config(tmp_path), env, timeout=_BUDGET_S)
+
+        assert result.returncode == 0, result.stderr
+        assert "Bring up sessions" in result.stdout
+        assert "refusing to start psmux sessions" not in result.stderr
         assert _calls(bin_dir) == []
 
 

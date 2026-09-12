@@ -92,6 +92,16 @@ SESSION0_SERVE_REFUSAL = (
     "needs for Alt+V. Run 'magent serve' on the host's own desktop, or set "
     "MAGENT_SESSION0_POLICY=allow for a headless host."
 )
+# The same refusal with a different cause, and worth its own sentence: the
+# policy DID ask for a hand-off and there is simply nowhere to hand off TO.
+# Telling that user to "run it on the desktop" would be advice they cannot
+# take, and telling them to set a policy they already set would be noise.
+SESSION0_NO_DESKTOP = (
+    "no user is logged on at this host's desktop, so there is nowhere to hand "
+    "the work to (and a session started here would be invisible to that "
+    "desktop when someone does log in). Log in at the console and retry, or "
+    "set MAGENT_SESSION0_POLICY=allow for a headless host."
+)
 # The hand-off inherits the budget of the command it replaces: a bring-up is a
 # cold-start storm (attach allows 900s over ssh for the same work), while
 # `serve --ensure` returns the moment a detached server answers.
@@ -123,6 +133,22 @@ def session0_disposition(plat: Platform) -> Literal["run", "handoff", "refuse"]:
     return "handoff" if plat.supports_desktop_handoff() else "refuse"
 
 
+def session0_refusal(plat: Platform, base: str = SESSION0_REFUSAL) -> str:
+    """The refusal wording that fits THIS machine.
+
+    Two different situations wear the same disposition. Usually the policy said
+    no. But when the policy asked for a hand-off and the platform reports no
+    mechanism, the cause on Windows is specifically that nobody is logged on at
+    the console -- and a user who is told to "run it on the desktop" when there
+    is no desktop has been given advice they cannot take.
+    """
+    from magent.env import get_env  # heavy subsystem: in-body per policy
+
+    if get_env().session0_policy == "handoff" and not plat.supports_desktop_handoff():
+        return SESSION0_NO_DESKTOP
+    return base
+
+
 def session0_note() -> str | None:
     """The one-line reason session creation is blocked here, or None.
 
@@ -130,9 +156,10 @@ def session0_note() -> str | None:
     carries its cause. A user staring at 40 failed names must not have to find
     launch.log to learn that nothing was even attempted.
     """
-    if session0_disposition(get_platform()) == "run":
+    plat = get_platform()
+    if session0_disposition(plat) == "run":
         return None
-    return SESSION0_REFUSAL
+    return session0_refusal(plat)
 
 
 def relay_handoff(plat: Platform, argv: list[str], *, timeout_s: float) -> int:

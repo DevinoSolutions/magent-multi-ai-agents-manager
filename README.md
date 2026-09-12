@@ -182,7 +182,7 @@ Note that `magent down --all` *is* the deliberate way to stop everything: it kil
 
 So a bring-up that finds itself in Session 0 does not run there. It hands the same command to the logged-on desktop through Task Scheduler, waits for it, and relays its output back down the SSH pipe — you see the host's normal `up` output on your laptop, prefixed by one `hand-off: ...` line. No password, no elevation, no scheduled task left behind. The same applies to the upload server `attach` ensures on the host. A plain foreground `magent serve` is left alone.
 
-`MAGENT_SESSION0_POLICY` controls it: `handoff` (default), `allow` for a headless Windows host that is only ever reached over SSH and has no desktop to hand off to, or `refuse` to make the situation loud instead. Nothing changes on macOS or Linux, where there is no session isolation and tmux over SSH is simply how people work. If servers from an older magent are still stranded, `magent doctor` and `magent status` count them for you.
+`MAGENT_SESSION0_POLICY` controls it: `handoff` (default), `allow` for a headless Windows host that is only ever reached over SSH and has no desktop to hand off to, or `refuse` to make the situation loud instead. If nobody is logged on at the host's console there is nowhere to hand off to, so the bring-up refuses and says exactly that rather than waiting out a scheduled task Windows is never going to start. Nothing changes on macOS or Linux, where there is no session isolation and tmux over SSH is simply how people work. If servers from an older magent are still stranded, `magent doctor` and `magent status` count them for you.
 
 #### Your typing outranks your fleet
 

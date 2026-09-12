@@ -1507,10 +1507,12 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> list[str]
     #
     # In-body import, the same way `eligible_projects` reaches launch: launch
     # imports this module, so neither side may import the other at top level.
-    from magent.launch import SESSION0_REFUSAL, session0_disposition
+    from magent.launch import session0_disposition, session0_refusal
 
     if session0_disposition(plat) != "run":
-        log.error("%s (would have created: %s)", SESSION0_REFUSAL, ", ".join(names))
+        log.error(
+            "%s (would have created: %s)", session0_refusal(plat), ", ".join(names)
+        )
         return names
 
     try:

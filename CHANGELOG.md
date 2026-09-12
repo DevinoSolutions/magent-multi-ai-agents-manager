@@ -21,7 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   task left behind), wait for it, relay its output and exit with its code.
   `MAGENT_SESSION0_POLICY` chooses: `handoff` (default), `allow` for a
   headless Windows host that is only ever reached over SSH, or `refuse`.
-  Nothing changes on macOS or Linux, where an SSH login is ordinary work.
+  With nobody logged on at the console there is nowhere to hand off to, so the
+  bring-up refuses and says so instead of waiting out a task that will never
+  start. Nothing changes on macOS or Linux, where an SSH login is ordinary
+  work.
 - `magent doctor` gains a `psmux-session0` check and `magent status` a warning
   line (plus an additive `psmux_session0` count in `--json`) counting psmux
   servers already stranded in logon Session 0 — the reason a session name can
