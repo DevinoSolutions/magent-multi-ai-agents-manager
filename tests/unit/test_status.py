@@ -24,6 +24,10 @@ def _no_psmux(monkeypatch):
     monkeypatch.setattr(
         "magent.launch.psmux_status", lambda cfg, group=None: ([], [], [])
     )
+    # The Session-0 scan walks the machine's REAL process list, so leaving it
+    # live would make every status assertion depend on whether this developer
+    # (or this runner) happens to have ssh'd in lately.
+    monkeypatch.setattr("magent.cli.status.session0_server_pids", list)
 
 
 def _both_off(monkeypatch):
@@ -376,6 +380,7 @@ class TestJson:
             "attention": "off",
             "agents": [],
             "psmux_sessions": [],
+            "psmux_session0": 0,
         }
 
     def test_degraded_emits_parseable_status_and_exit_3(
@@ -400,6 +405,7 @@ class TestJson:
             "attention": "off",
             "agents": [],
             "psmux_sessions": [],
+            "psmux_session0": 0,
         }
 
 
@@ -1171,3 +1177,60 @@ class TestDownActsOnTheAttachHost:
         )
         assert "Upload server not running" in result.output
         assert "Attention daemon was not running." in result.output
+
+
+class TestSessionZeroServers:
+    """`status` is the surface a user is already looking at when a session
+    refuses to come up, and a psmux server stranded in logon Session 0 is the
+    reason: it holds the name (the ~/.psmux registry is shared) while being
+    invisible to this desktop."""
+
+    def _world(self, monkeypatch, pids):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr(
+            "magent.cli.status.session0_server_pids", lambda: list(pids)
+        )
+
+    def test_a_clean_machine_says_nothing(self, runner, tmp_config, monkeypatch):
+        self._world(monkeypatch, [])
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+
+        assert "Session 0" not in result.output
+
+    def test_stranded_servers_are_reported_with_the_repair(
+        self, runner, tmp_config, monkeypatch
+    ):
+        self._world(monkeypatch, [11, 22])
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+
+        assert "2 psmux server(s) run in logon Session 0" in result.output
+        assert "elevated shell" in result.output
+
+    def test_it_does_not_change_the_exit_contract(
+        self, runner, tmp_config, monkeypatch
+    ):
+        # These servers are nothing this magent started or can stop, so they
+        # are not a DEGRADED daemon -- the 0/1/3 contract every script reads
+        # must not move because somebody once ssh'd into this box.
+        self._world(monkeypatch, [11])
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        monkeypatch.setattr("magent.cli.status._listener_state", lambda up: "off")
+        monkeypatch.setattr("magent.cli.status._attention_state", lambda: "off")
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+
+        assert result.exit_code == 0
+
+    def test_the_json_count_is_additive(self, runner, tmp_config, monkeypatch):
+        self._world(monkeypatch, [11, 22, 33])
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
+
+        assert json.loads(result.stdout)["psmux_session0"] == 3

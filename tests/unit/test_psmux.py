@@ -798,6 +798,67 @@ class TestBringUpCreationVerify:
         assert created == ["api", "web"]
         assert failed == []
 
+    def test_session_zero_never_reaches_the_spawn(self, monkeypatch, tmp_path, slept):
+        # THE choke point's safety net. Every session magent creates goes
+        # through launch_verified, so this is the one place that can guarantee
+        # no path -- `--go`, the menu's "u", `revive` -- ever puts a psmux
+        # server in a logon session the user cannot see. The command shells
+        # hand off BEFORE they get here, so arriving here in Session 0 means a
+        # path that did not, and the honest outcome is a loud, named failure
+        # rather than a second hand-off from inside a subsystem.
+        from tests.conftest import FakePlatform
+
+        monkeypatch.setenv("MAGENT_SESSION0_POLICY", "refuse")
+        monkeypatch.setattr("magent.env._cached_env", None)
+        fp = FakePlatform(supports_psmux=True, interactive_session=False)
+
+        (created, failed), fp = self._bring_up(
+            monkeypatch, tmp_path, names=["api", "web"], plat=fp
+        )
+
+        assert created == []
+        assert failed == ["api", "web"]
+        assert fp.psmux_launches == []
+
+    def test_a_handoff_disposition_also_never_spawns_here(
+        self, monkeypatch, tmp_path, slept
+    ):
+        # "handoff" reaching the choke point means the command shell above did
+        # not hand off. Creating the sessions anyway would be the defect; so
+        # would handing off from here, which is how a subsystem starts writing
+        # scheduled tasks.
+        from tests.conftest import FakePlatform
+
+        monkeypatch.setenv("MAGENT_SESSION0_POLICY", "handoff")
+        monkeypatch.setattr("magent.env._cached_env", None)
+        fp = FakePlatform(
+            supports_psmux=True, interactive_session=False, supports_handoff=True
+        )
+
+        (_created, failed), fp = self._bring_up(
+            monkeypatch, tmp_path, names=["api"], plat=fp
+        )
+
+        assert failed == ["api"]
+        assert fp.psmux_launches == []
+        assert fp.handoffs == []
+
+    def test_allow_still_creates_them_where_it_stands(
+        self, monkeypatch, tmp_path, slept
+    ):
+        from tests.conftest import FakePlatform
+
+        monkeypatch.setenv("MAGENT_SESSION0_POLICY", "allow")
+        monkeypatch.setattr("magent.env._cached_env", None)
+        fp = FakePlatform(supports_psmux=True, interactive_session=False)
+
+        (created, failed), fp = self._bring_up(
+            monkeypatch, tmp_path, names=["api"], plat=fp
+        )
+
+        assert created == ["api"]
+        assert failed == []
+
     def test_the_probe_gets_a_settle_before_it_runs(self, monkeypatch, tmp_path, slept):
         # Probing at t=0 would misclassify a slow-but-fine server on a loaded
         # host -- the storm's timeouts were transient churn.

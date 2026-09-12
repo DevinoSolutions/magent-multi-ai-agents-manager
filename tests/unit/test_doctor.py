@@ -385,6 +385,57 @@ class TestCheckWtKeys:
         assert "magent terminal install" in detail
 
 
+class TestCheckPsmuxSessionZero:
+    """psmux servers stranded in logon Session 0 -- the residue of the incident
+    the desktop hand-off prevents. They are worse than dead: the ``~/.psmux``
+    registry is shared across sessions, so such a server answers
+    ``has-session`` and HOLDS its name while being invisible and unattachable
+    from the desktop, which is why every bring-up there logged "session never
+    came up after respawn"."""
+
+    def _platform(self, monkeypatch, *, supports_psmux=True):
+        fp = FakePlatform(supports_psmux=supports_psmux)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+
+    def _stranded(self, monkeypatch, pids):
+        monkeypatch.setattr(doctor.psmux, "session0_server_pids", lambda: list(pids))
+
+    def test_a_platform_without_psmux_never_looks(self, monkeypatch):
+        self._platform(monkeypatch, supports_psmux=False)
+        monkeypatch.setattr(
+            doctor.psmux,
+            "session0_server_pids",
+            lambda: pytest.fail("scanned on a platform without psmux"),
+        )
+
+        status, detail = doctor._check_psmux_session0()
+
+        assert status == OK
+        assert "Windows-only" in detail
+
+    def test_a_clean_machine_is_quiet(self, monkeypatch):
+        self._platform(monkeypatch)
+        self._stranded(monkeypatch, [])
+
+        status, detail = doctor._check_psmux_session0()
+
+        assert status == OK
+        assert "Session 0" in detail
+
+    def test_stranded_servers_are_counted_and_named(self, monkeypatch):
+        self._platform(monkeypatch)
+        self._stranded(monkeypatch, [11, 22, 33])
+
+        status, detail = doctor._check_psmux_session0()
+
+        # WARN, never FAIL: magent did not start these and cannot stop them, so
+        # this must not start failing doctor on a machine whose only problem is
+        # that somebody once ssh'd in.
+        assert status == WARN
+        assert "3 psmux server(s)" in detail
+        assert "elevated shell" in detail
+
+
 class TestCheckPsmuxWedge:
     """The machine-wide psmux control-plane wedge (2026-08-18/19): every psmux
     command hangs forever from any console while ConPTY itself is healthy, and
@@ -673,6 +724,7 @@ class TestDoctorCli:
             "agent tools",
             "terminal",
             "psmux wedge",
+            "psmux-session0",
             "monitors",
             "hotkey",
             "wt-keys",

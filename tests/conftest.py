@@ -11,6 +11,7 @@ from click.testing import CliRunner
 from magent import agent_state, env, log
 from magent.grid import MonitorRect
 from magent.platform import (
+    HandoffResult,
     Platform,
     PsmuxWindowOpts,
     TerminalLaunchOpts,
@@ -172,6 +173,16 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     # psmux.exe at last count). Off for every tier; the tests that are ABOUT the
     # sweep drive the seam directly and never the real Windows primitives.
     monkeypatch.setenv("MAGENT_PSMUX_BOOST", "0")
+    # ...and a third, whose reason is the RUNNER rather than the developer's
+    # fleet: the Session-0 hand-off asks "am I in an interactive logon session?"
+    # and a CI agent (or a test driven over ssh) legitimately is not. With the
+    # default `handoff` policy such a runner would create REAL scheduled tasks
+    # aimed at somebody's desktop; with `refuse` every bring-up test would fail
+    # for a reason that has nothing to do with the code under test. `allow`
+    # means "run it right here", i.e. exactly today's behaviour, on every
+    # machine the suite runs on. Tests that are ABOUT the hand-off set the
+    # policy explicitly.
+    monkeypatch.setenv("MAGENT_SESSION0_POLICY", "allow")
     log.reset_logging()
     yield
     log.reset_logging()
@@ -452,6 +463,9 @@ class FakePlatform(Platform):
         scan_error: Exception | None = None,
         close_error: Exception | None = None,
         psmux_launch_failures=None,
+        interactive_session: bool = True,
+        supports_handoff: bool = False,
+        handoff_result=None,
     ):
         self._monitors = (
             monitors
@@ -484,6 +498,14 @@ class FakePlatform(Platform):
         # verify exists to catch (new-session exits 0, no server answers). A
         # later launch of the same name succeeds, so a respawn is provable.
         self._psmux_launch_failures = set(psmux_launch_failures or ())
+        # Session-0 hand-off. The defaults are the ordinary desktop: an
+        # interactive logon session and no hand-off mechanism, which is what
+        # every platform except Windows reports and what keeps every existing
+        # test on the "run it here" path.
+        self._interactive_session = interactive_session
+        self._supports_handoff = supports_handoff
+        self._handoff_result = handoff_result
+        self.handoffs: list[tuple[list[str], float]] = []
         self.psmux_sessions: set[str] = set()
         self.psmux_launches: list[list[str]] = []
         self.attached_psmux: list[tuple] = []
@@ -542,6 +564,20 @@ class FakePlatform(Platform):
 
     def supports_wt_keybindings(self) -> bool:
         return self._supports_wt_keybindings
+
+    def logon_session_is_interactive(self) -> bool:
+        return self._interactive_session
+
+    def supports_desktop_handoff(self) -> bool:
+        return self._supports_handoff
+
+    def run_on_desktop(self, argv, *, timeout_s) -> HandoffResult:
+        """Record the hand-off instead of writing a real scheduled task. The
+        canned result stands in for whatever the desktop copy decided."""
+        self.handoffs.append((list(argv), timeout_s))
+        if self._handoff_result is None:
+            return HandoffResult(rc=0)
+        return self._handoff_result
 
     def supports_attention_signals(self) -> bool:
         return self._supports_attention

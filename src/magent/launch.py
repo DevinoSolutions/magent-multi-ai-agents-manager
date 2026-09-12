@@ -7,7 +7,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import click
 
@@ -60,6 +60,112 @@ def spawn_detached(args: list[str], extra_flags: int = 0) -> subprocess.Popen[by
     return spawn_unjobbed(
         args, creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS | extra_flags
     )
+
+
+# --- Session-0 desktop hand-off ----------------------------------------------
+# The incident, in one paragraph: a laptop ran `magent attach <desktop>`, the
+# host reported sessions down, and attach ran `magent up` on the host over ssh.
+# Windows OpenSSH is a SERVICE, so that bring-up -- and everything it created --
+# was born in logon Session 0: 82 psmux servers and 42 agents on a desktop
+# nobody can see. The desktop's own magent called them stopped, every later
+# bring-up logged "session never came up after respawn" (psmux's registry under
+# ~/.psmux is shared, so `new-session` for a held name just exits 1), tiling
+# logged "window not found", and the Session-0 `serve` had taken 127.0.0.1:8034
+# out from under the desktop's Alt+V. Clearing it needed an elevated kill of
+# 1172 processes.
+#
+# Every wording below is shared so the host's answer reads identically whether
+# it is printed locally or relayed up an ssh pipe by `magent attach`.
+SESSION0_HANDOFF_LINE = (
+    "hand-off: this magent runs in a non-interactive logon session (Session 0);"
+    " re-running on the desktop..."
+)
+SESSION0_REFUSAL = (
+    "refusing to start psmux sessions from a non-interactive logon session "
+    "(Session 0 / ssh): they would be invisible to this host's desktop and "
+    "block the same names. Run 'magent up' on the host's own desktop, or set "
+    "MAGENT_SESSION0_POLICY=allow for a headless host."
+)
+SESSION0_SERVE_REFUSAL = (
+    "refusing to start the upload server from a non-interactive logon session "
+    "(Session 0 / ssh): it would take the loopback port this host's desktop "
+    "needs for Alt+V. Run 'magent serve' on the host's own desktop, or set "
+    "MAGENT_SESSION0_POLICY=allow for a headless host."
+)
+# The hand-off inherits the budget of the command it replaces: a bring-up is a
+# cold-start storm (attach allows 900s over ssh for the same work), while
+# `serve --ensure` returns the moment a detached server answers.
+SESSION0_UP_TIMEOUT_S = 900.0
+SESSION0_SERVE_TIMEOUT_S = 60.0
+
+
+def session0_disposition(plat: Platform) -> Literal["run", "handoff", "refuse"]:
+    """What a session-creating command should do on THIS machine.
+
+    ONE decision, in one place, for every caller -- the command shells that can
+    hand off, and the psmux choke point that can only refuse. A second copy of
+    this policy is how one of them ends up creating a Session-0 fleet again.
+
+    An interactive logon session is always "run", before the policy is even
+    read: a normal desktop launch must not be able to change behaviour because
+    of an environment variable somebody set for a headless host. Off Windows
+    every platform reports interactive, so nothing changes there at all.
+    """
+    from magent.env import get_env  # heavy subsystem: in-body per policy
+
+    if plat.logon_session_is_interactive():
+        return "run"
+    policy = get_env().session0_policy
+    if policy == "allow":
+        return "run"
+    if policy == "refuse":
+        return "refuse"
+    return "handoff" if plat.supports_desktop_handoff() else "refuse"
+
+
+def session0_note() -> str | None:
+    """The one-line reason session creation is blocked here, or None.
+
+    What the "N session(s) failed to come up" printers add so a casualty list
+    carries its cause. A user staring at 40 failed names must not have to find
+    launch.log to learn that nothing was even attempted.
+    """
+    if session0_disposition(get_platform()) == "run":
+        return None
+    return SESSION0_REFUSAL
+
+
+def relay_handoff(plat: Platform, argv: list[str], *, timeout_s: float) -> int:
+    """Run ``argv`` on the desktop, relay its output verbatim, return its code.
+
+    Verbatim and unindented on purpose: the command being handed off is the
+    same command the user asked for, so its output IS this command's output.
+    `magent attach` indents the whole remote stream by two spaces on the
+    laptop, which is where the nesting belongs.
+    """
+    click.echo(SESSION0_HANDOFF_LINE)
+    result = plat.run_on_desktop(argv, timeout_s=timeout_s)
+    if result.stdout.strip():
+        click.echo(result.stdout.rstrip())
+    if result.stderr.strip():
+        click.echo(result.stderr.rstrip(), err=True)
+    if result.timed_out:
+        click.echo(
+            f"  {style('x', fg='red')} hand-off timed out after "
+            f"{timeout_s:.0f}s -- the desktop copy may still be running "
+            f"(see ~/.magent/logs/launch.log on this host). {result.detail}",
+            err=True,
+        )
+        return 1
+    if result.rc is None:
+        click.echo(
+            f"  {style('x', fg='red')} hand-off could not run on the desktop: "
+            f"{result.detail} "
+            "(see ~/.magent/logs/launch.log on this host)",
+            err=True,
+        )
+        return 1
+    return result.rc
 
 
 def hotkey_restart_reason(
@@ -930,6 +1036,13 @@ def _start_psmux_and_upload(
                 f" session(s) failed to come up: {style(', '.join(failed), fg='red')}"
                 f" {style('(see ~/.magent/logs/launch.log)', dim=True)}"
             )
+            # `--go` never hands off (it is a local, interactive command by
+            # definition), so reaching here in Session 0 means the choke point
+            # refused -- and a casualty list with no cause is what sent a user
+            # hunting through launch.log last time.
+            note = session0_note()
+            if note:
+                click.echo(f"  {style(note, dim=True)}")
         for pw in psmux_windows:
             plat.attach_psmux(
                 pw.window_name,

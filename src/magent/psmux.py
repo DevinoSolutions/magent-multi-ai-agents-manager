@@ -124,6 +124,36 @@ def child_env() -> dict[str, str]:
 PSMUX_IMAGE_NAMES = frozenset({"psmux.exe", "pmux.exe"})
 
 
+def session0_server_pids() -> list[int]:
+    """Live psmux processes running in Windows logon Session 0.
+
+    The diagnostic half of the desktop hand-off: the hand-off stops magent from
+    CREATING these, and this finds the ones already there -- started by an older
+    magent, by a bare `psmux` typed over ssh, or by any other service. Empty off
+    Windows and empty when the process snapshot cannot be taken, which is the
+    right answer for a diagnostic that must never invent a problem.
+
+    ``session_id_of`` needs no process handle, so this sees servers the desktop
+    user could not open: a Session-0 psmux started over ssh runs at High
+    integrity and an ordinary shell cannot touch it, which is exactly why the
+    repair hint says "elevated".
+    """
+    from magent.procs import pids_by_image_name, session_id_of
+
+    return [
+        pid for pid in pids_by_image_name(PSMUX_IMAGE_NAMES) if session_id_of(pid) == 0
+    ]
+
+
+def session0_message(count: int) -> str:
+    """The one wording `doctor` and `status` both report a Session-0 fleet in."""
+    return (
+        f"{count} psmux server(s) run in logon Session 0 (started over ssh?) "
+        "— invisible to this desktop and blocking their names; stop them from "
+        "an elevated shell"
+    )
+
+
 def boost_enabled() -> bool:
     """Whether ``MAGENT_PSMUX_BOOST`` permits the priority sweep.
 
@@ -1466,6 +1496,23 @@ def launch_verified(plat: Platform, windows: list[PsmuxWindowOpts]) -> list[str]
         return []
     names = [w.window_name for w in windows]
     log = get_logger("launch")
+
+    # THE choke point's safety net. Every session this product creates goes
+    # through here, so this is the one place that can guarantee no path -- not
+    # `--go`, not the menu's "u", not `revive` -- ever creates a psmux server in
+    # a logon session the user cannot see. The command shells hand off BEFORE
+    # reaching this function, so anything that arrives here in Session 0 is a
+    # path that did not, and the honest outcome is a loud, named failure rather
+    # than a silent second hand-off from inside a subsystem.
+    #
+    # In-body import, the same way `eligible_projects` reaches launch: launch
+    # imports this module, so neither side may import the other at top level.
+    from magent.launch import SESSION0_REFUSAL, session0_disposition
+
+    if session0_disposition(plat) != "run":
+        log.error("%s (would have created: %s)", SESSION0_REFUSAL, ", ".join(names))
+        return names
+
     try:
         plat.launch_psmux_session(windows)
     except (OSError, subprocess.SubprocessError):

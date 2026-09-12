@@ -183,6 +183,31 @@ def _check_psmux_wedge() -> CheckResult:
     return (OK, f"psmux control plane responded in {probe.elapsed_s:.2f}s")
 
 
+def _check_psmux_session0() -> CheckResult:
+    """Is anything of ours stranded in the logon session nobody can see?
+
+    A psmux server in Session 0 is worse than a dead one: it answers
+    ``has-session`` for its own socket (the registry under ``~/.psmux`` is
+    shared across sessions), so it HOLDS the name while being invisible to the
+    desktop's windows, unattachable from it, and — since Windows OpenSSH hands
+    admins a full token — usually above the desktop user's integrity level too.
+    That is the whole shape of the incident: every desktop bring-up logged
+    "session never came up after respawn" for names a Session-0 server owned.
+
+    WARN, never FAIL: magent did not start these (the hand-off exists so it
+    never will again) and cannot stop them, so this must not start failing a
+    doctor run on a machine whose only problem is that somebody once ssh'd in.
+    """
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    if not get_platform().supports_psmux():
+        return (OK, "psmux not used on this OS (Windows-only feature)")
+    stranded = psmux.session0_server_pids()
+    if not stranded:
+        return (OK, "no psmux server runs in logon Session 0")
+    return (WARN, psmux.session0_message(len(stranded)))
+
+
 def _check_monitors() -> CheckResult:
     from magent.platform import get_platform  # heavy subsystem: in-body per policy
 
@@ -419,6 +444,7 @@ def _run_checks(config_file: Path) -> list[dict[str, str]]:
         ("agent tools", lambda: _check_agent_tools(cfg)),
         ("terminal", _check_terminal),
         ("psmux wedge", _check_psmux_wedge),
+        ("psmux-session0", _check_psmux_session0),
         ("monitors", _check_monitors),
         ("hotkey", lambda: _check_hotkey(cfg)),
         ("wt-keys", _check_wt_keys),

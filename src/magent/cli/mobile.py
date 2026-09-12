@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import getpass
 import re
+import sys
 from pathlib import Path
 
 import click
@@ -50,6 +51,38 @@ def _configured_upload_port(config_path: str | None) -> int:
         return load_config(str(config_file)).settings.upload_port
     except (ValueError, OSError):
         return _FALLBACK_UPLOAD_PORT
+
+
+def _handoff_ensure(port: int, config_path: str | None) -> bool:
+    """Hand `serve -p <port> --ensure` to the desktop, or refuse, per policy.
+
+    Returns True when this invocation is DONE -- the desktop copy ran (and this
+    process is about to exit with its code), or the policy refused. False means
+    "carry on here", which is every ordinary local `--ensure`.
+    """
+    from magent.launch import (  # heavy subsystem: in-body per policy
+        SESSION0_SERVE_REFUSAL,
+        SESSION0_SERVE_TIMEOUT_S,
+        relay_handoff,
+        session0_disposition,
+    )
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    plat = get_platform()
+    disposition = session0_disposition(plat)
+    if disposition == "run":
+        return False
+    if disposition == "refuse":
+        click.echo(f"  {style('x', fg='red')} {SESSION0_SERVE_REFUSAL}", err=True)
+        sys.exit(1)
+    argv = [sys.executable, "-m", "magent"]
+    if config_path:
+        argv.extend(["--config", str(config_path)])
+    argv.extend(["serve", "-p", str(port), "--ensure"])
+    rc = relay_handoff(plat, argv, timeout_s=SESSION0_SERVE_TIMEOUT_S)
+    if rc != 0:
+        sys.exit(rc)
+    return True
 
 
 @main.command("termius")
@@ -163,6 +196,16 @@ def serve_cmd(
         # attach calls this over SSH so the host always has a server for Alt+V,
         # regardless of the uploadServer config flag or whether anything was
         # just brought up.
+        #
+        # ...and that ssh call is a logon-Session-0 process on Windows, so the
+        # detached server it spawns is one too: it binds 127.0.0.1 in a session
+        # the desktop cannot reach, and the desktop's own Alt+V then talks to a
+        # server that can see none of its sessions (observed -- the Session-0
+        # serve had taken 8034). A plain foreground `magent serve` is left
+        # alone: that one is a command somebody is watching, wherever they ran
+        # it, and it is `--ensure` that plants a survivor.
+        if _handoff_ensure(port, config_path):
+            return
         _maybe_start_upload_server(port, config_path)
         click.echo(f"upload server ensured on port {port}")
         return

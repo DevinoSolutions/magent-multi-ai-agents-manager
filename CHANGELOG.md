@@ -5,6 +5,42 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A bring-up that finds itself in a non-interactive logon session re-runs
+  itself on the desktop.** On Windows, OpenSSH is a service, so the
+  `magent up` that `magent attach` asks a host to run — and the upload server
+  it ensures there — were born in logon Session 0, which has no desktop
+  attached to any monitor. Those sessions are real, invisible and unkillable
+  from the host's own desktop, and because psmux's session registry is shared
+  they hold their names, so every later bring-up on the real desktop fails
+  with "session never came up". Both commands now hand the work to the
+  logged-on desktop through Task Scheduler (no password, no elevation, no
+  task left behind), wait for it, relay its output and exit with its code.
+  `MAGENT_SESSION0_POLICY` chooses: `handoff` (default), `allow` for a
+  headless Windows host that is only ever reached over SSH, or `refuse`.
+  Nothing changes on macOS or Linux, where an SSH login is ordinary work.
+- `magent doctor` gains a `psmux-session0` check and `magent status` a warning
+  line (plus an additive `psmux_session0` count in `--json`) counting psmux
+  servers already stranded in logon Session 0 — the reason a session name can
+  refuse to come up on a machine that looks idle. Both are warn-at-worst:
+  magent did not start those processes and cannot stop them.
+
+### Fixed
+
+- **`magent attach` no longer discards what the host said about its own
+  bring-up.** The remote `magent up`'s stdout was thrown away, so a laptop
+  watched a bring-up "succeed" while the host printed its casualties into a
+  pipe nobody read. Every non-empty line now reaches the attaching machine,
+  indented.
+- Session creation can no longer happen in a non-interactive logon session by
+  any route. `psmux.launch_verified` — the one choke point every session magent
+  creates passes through — refuses instead of spawning, and the "N session(s)
+  failed to come up" report carries the reason rather than leaving it in
+  `~/.magent/logs/launch.log`.
+
 ## [3.17.0] - 2026-09-04
 
 ### Changed

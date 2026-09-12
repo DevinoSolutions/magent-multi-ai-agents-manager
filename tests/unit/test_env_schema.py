@@ -405,3 +405,67 @@ class TestEnvFileIsMagentsOwn:
         env_module.ENV_FILE.write_text("MAGENT_LOG_LEVEL=DEBUG\n", encoding="utf-8")
 
         assert env_module.get_env().log_level == "DEBUG"
+
+
+class TestSession0Policy:
+    """MAGENT_SESSION0_POLICY -- what a session-creating magent does when it
+    finds itself in a logon session nobody can see."""
+
+    def test_the_default_is_handoff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The default has to be the SAFE answer for the machine the incident
+        # happened on: a Windows desktop reached over ssh, where running the
+        # bring-up in place is what stranded 82 psmux servers.
+        _clear_magent_env(monkeypatch)
+        assert MagentEnv(_env_file=None).session0_policy == "handoff"
+
+    @pytest.mark.parametrize("value", ["handoff", "allow", "refuse"])
+    def test_every_documented_value_parses(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        _clear_magent_env(monkeypatch)
+        monkeypatch.setenv("MAGENT_SESSION0_POLICY", value)
+        assert MagentEnv(_env_file=None).session0_policy == value
+
+    def test_an_unknown_policy_is_a_hard_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A typo must not degrade to the default: "hand-off" silently meaning
+        # "handoff" is how a headless host that asked for `allow` ends up
+        # creating scheduled tasks nobody is there to see.
+        _clear_magent_env(monkeypatch)
+        monkeypatch.setenv("MAGENT_SESSION0_POLICY", "maybe")
+        with pytest.raises(ValidationError):
+            MagentEnv(_env_file=None)
+
+
+class TestIsSshLogin:
+    """The environment half of "am I in a non-interactive logon session?".
+    sshd exports these; nobody configures them."""
+
+    @pytest.mark.parametrize("var", ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"])
+    def test_any_one_of_them_is_the_login(
+        self, monkeypatch: pytest.MonkeyPatch, var: str
+    ) -> None:
+        # Any ONE, because a command run over ssh with no pty (which is exactly
+        # how `magent attach` drives a host) has SSH_CONNECTION and no SSH_TTY.
+        for name in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(var, "1.2.3.4 1 5.6.7.8 22")
+        assert env_module.is_ssh_login() is True
+
+    def test_a_local_shell_is_not_a_login(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for name in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
+            monkeypatch.delenv(name, raising=False)
+        assert env_module.is_ssh_login() is False
+
+    def test_an_empty_value_is_not_a_login(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # An exported-but-empty var is how a careless wrapper "clears" one;
+        # treating it as a login would send every local launch to the desktop
+        # hand-off it is already sitting on.
+        for name in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
+            monkeypatch.setenv(name, "")
+        assert env_module.is_ssh_login() is False
