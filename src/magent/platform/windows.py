@@ -91,8 +91,13 @@ _HANDOFF_POLL_S = 0.25
 # How long the task gets to write pid.txt before we conclude it never started.
 # Distinct from the caller's timeout: "the command is slow" and "Task Scheduler
 # never ran it" are different answers, and only the second one is worth
-# abandoning a 900s budget for.
-_HANDOFF_START_GRACE_S = 5.0
+# abandoning a 900s budget for. Generous because the signal comes from a COLD
+# powershell.exe: ~1.6s measured on an idle desktop, but a loaded box (CI
+# proved it -- 5s was not enough on 2 of 5 windows-latest runners) can take
+# well over 5s just to reach `Start-Process`. A false "never started" here
+# abandons a bring-up that is in fact under way, so the grace errs long; a
+# task that truly never ran is still reported, only 30s later.
+_HANDOFF_START_GRACE_S = 30.0
 # Every schtasks call itself is bounded -- Create/Run/Query/Delete are local and
 # instant, so a hang is a wedge, not work.
 _SCHTASKS_TIMEOUT_S = 15.0
