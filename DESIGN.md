@@ -1596,6 +1596,142 @@ psmux from the LISTENER process (the test itself), so the recording shim must
 win the test process's PATH and `find_psmux`'s lru cache must be cleared both
 ways.
 
+### The host brings itself up on its own desktop (2026-09-12)
+
+`magent attach <host>` asks the host to run `magent up` over ssh, and on
+Windows OpenSSH is a **service** -- so every process that bring-up creates is
+born in logon **Session 0**, the services session, which has no desktop
+composited onto any monitor. Measured, once: 82 psmux servers and 42 Claude
+agents alive there, plus a `magent serve` holding `127.0.0.1:8034`. The desktop
+could not see any of it. `magent status` called those sessions stopped; every
+desktop bring-up logged "session never came up after respawn" for exactly those
+names, because psmux's registry under `~/.psmux` is shared across sessions and
+a held name makes `new-session` exit 1; tiling logged "window not found"; and
+the desktop's Alt+V talked to a server that could see none of the desktop's
+sessions. Clearing it took an elevated kill of 1172 processes -- Windows
+OpenSSH hands an admin the full token, so those servers also outranked the
+desktop user's own shell.
+
+The fix is **not** to detect it and warn. A bring-up run in the wrong session
+is not a degraded bring-up, it is a fleet that has to be destroyed by hand, so
+the command re-runs itself where it belongs.
+
+**Task Scheduler, not `CreateProcessAsUser`.** The API route needs a token
+from another session, which means `SeTcbPrivilege` -- an ELEVATED magent -- for
+something the user is plainly entitled to do to their own desktop. A one-shot
+`/IT` task ("run only when the user is logged on") needs no stored credential,
+no admin right and no password -- hence no `/RU`/`/RP` -- and it is *Windows*
+that places the process in the interactive session rather than magent picking
+one. That last point is the important half, and it is why
+`supports_desktop_handoff()` reads `WTSGetActiveConsoleSessionId` only to ask
+"is there a usable console session AT ALL" and never to choose one: that id can
+name an RDP session that is not the physical desktop, so every "find the
+interactive session" heuristic is wrong on some real machine. When the answer
+is 0 or `0xFFFFFFFF` the disposition falls to `refuse` with its own wording --
+nobody is logged on, so "run it on the desktop" would be advice the user cannot
+take. Verified on the incident machine from a real Session-0 sshd login:
+Session 1, Medium integrity, desktop visible, ~1.6s. `/ST 00:00` is deliberately
+in the PAST, so a task stranded by a killed caller (an ssh drop takes the
+host-side `magent up` with it) can never fire on its own; `/Run` ignores the
+trigger entirely.
+
+**The task runs a PowerShell file, and both quoting layers are load-bearing.**
+`/TR` truncates SILENTLY past ~261 characters, so it carries only a fixed
+launcher (`powershell.exe -NoProfile -ExecutionPolicy Bypass -File <script>`;
+Windows PowerShell, not `pwsh`, which is not on every box) and the real argv
+lives in the script. PowerShell rather than a `.cmd` shim fixes three things a
+batch file gets wrong: `-WindowStyle Hidden` means the desktop is not shown a
+console window for a command nobody typed; `$p.ExitCode` is the real exit
+status rather than a parsed `%ERRORLEVEL%`; and cmd would read an `&` in an
+unquoted argument as a command separator, which `list2cmdline` does not defend
+against (it quotes for whitespace and quotes only) -- on a machine whose
+project path literally contains `&`, that is not hypothetical. The two layers
+are `subprocess.list2cmdline(argv)` building one command line by the MS
+C-runtime rules the child's own parser uses, then `_ps_quote` making that whole
+string ONE PowerShell literal for `-ArgumentList`. Passing a LIST to
+`-ArgumentList` skips the first layer: PowerShell joins array elements with
+bare spaces and does not re-quote, so `--config C:\A B\magent.json` arrives as
+two arguments.
+
+One measured trap worth keeping: a `Start-Process -PassThru` object's
+`.ExitCode` is `$null` forever unless `$p.Handle` is touched while the process
+is still alive. PowerShell does not hold the handle, so once the child exits
+the OS has nothing left to ask. `rc.txt` came back EMPTY on every run until
+that line existed, and the hand-off then reported an "unreadable exit code" for
+commands that had succeeded.
+
+**`schtasks` comes from the system directory, not PATH.** `run_on_desktop` is
+reached from an ssh login, and letting that login's PATH choose what runs as
+the logged-on user would turn a hand-off into an execution primitive for
+whoever set it. The consequence is a deliberate test gap: a real child process
+cannot be pointed at a fake, so there is no e2e proof of a SUCCESSFUL hand-off
+-- the alternatives were a test-only environment variable or writing real
+scheduled tasks on the machine running the suite. The full choreography is
+proven in the unit tier through the `_schtasks_exe` seam, with real processes
+on both ends of the launcher; the e2e tier proves the detection and that
+nothing is ever created in place.
+
+**Two signals, not one.** `WindowsPlatform.logon_session_is_interactive()` is
+false when `procs.current_session_id()` is 0 OR when `env.is_ssh_login()` is
+true. The second is a fact about Windows, not a test hook -- OpenSSH is a
+service, so there is no configuration in which an ssh login lands on the
+desktop -- and it covers the case where the ctypes probe answers None. An
+UNKNOWN session id counts as interactive: a probe that fails on some future
+Windows must never be able to stop an ordinary desktop launch.
+
+**One policy function, two enforcement altitudes.** `launch.session0_disposition`
+is the only place the question is answered (`run` / `handoff` / `refuse`,
+per `MAGENT_SESSION0_POLICY`). The COMMAND shells hand off: `up` and
+`serve --ensure`, the two things `magent attach` fires on a host. The CHOKE
+POINT -- `psmux.launch_verified`, which every session magent creates passes
+through -- only ever REFUSES, and that asymmetry is deliberate. Reaching the
+choke point in Session 0 means a path that did not hand off (`--go`, the menu's
+`u`, `revive`), and the honest outcome there is a loud failure naming the cause
+rather than a subsystem quietly writing scheduled tasks. The three "N session(s)
+failed to come up" printers add `launch.session0_note()` so the casualty list
+never arrives without its reason -- last time a user read 40 failed names and
+had to find `launch.log` to learn nothing had been attempted.
+
+`allow` exists because a headless Windows host reached only over ssh has no
+desktop to hand off to, and Session 0 is genuinely where its fleet belongs.
+An interactive session short-circuits to `run` BEFORE the policy is read, so
+that setting cannot change a normal desktop launch. Off Windows every platform
+reports interactive and nothing changes at all -- tmux over ssh is how people
+work there.
+
+Three smaller details that are load-bearing. The launcher passes
+`-WorkingDirectory` the caller's directory (a scheduled task starts in
+`system32`, and `find_config` walks up from the cwd, so the desktop copy would
+otherwise bring up a different config's projects). It exports
+`MAGENT_SESSION0_POLICY=refuse` for its child, so a hand-off that somehow
+landed in Session 0 again cannot recurse -- a recursion whose every level
+writes a scheduled task. And it writes `pid.txt` the moment `Start-Process`
+returns and `rc.txt` only after `WaitForExit`, which is what lets the poll tell
+three failures apart: no pid after the start grace means Task Scheduler never
+ran the task, a pid that is gone with no rc means the launcher lost its child
+and nothing is coming, and neither is the caller's budget simply running out.
+On that last one the delegated child is deliberately NOT killed: a bring-up
+still running on the desktop is doing the work that was asked for, and the pid
+is a number Windows recycles freely.
+
+Diagnostics are the other half: `doctor`'s `psmux-session0` check and one
+`status` stderr line count psmux servers still stranded there (by image name
+plus `procs.session_id_of`, which needs no process handle and so can see the
+high-integrity ones). WARN, never FAIL, and additive in `status --json`
+(`psmux_session0`): magent did not start them and cannot stop them, so they
+must not move the 0/1/3 exit contract.
+
+Proof: `tests/unit/test_desktop_handoff.py` (the policy, the refusal wordings,
+the relay, both quoting layers, and the real create/run/poll/delete
+choreography against a FAKE `schtasks` installed through the `_schtasks_exe`
+seam), `tests/unit/test_attach.py::
+TestUpHandsOffFromSessionZero`, `tests/unit/test_serve_port.py::
+TestEnsureHandsOffFromSessionZero`, and `tests/e2e/test_session0_handoff.py`
+(a REAL `magent up` child told it is an ssh login). `tests/conftest.py` pins
+`MAGENT_SESSION0_POLICY=allow` for every tier, and every fixture that builds an
+explicit child `env=` carries it: a CI runner is legitimately non-interactive,
+and the default would have it writing real scheduled tasks.
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.

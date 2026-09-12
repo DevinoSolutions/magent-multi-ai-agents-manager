@@ -39,6 +39,7 @@ from magent.cli.ui import (
 from magent.log import heartbeat_age, heartbeat_fresh
 from magent.paths import find_config
 from magent.procs import pid_alive
+from magent.psmux import session0_message, session0_server_pids
 from magent.style import style
 
 if TYPE_CHECKING:
@@ -394,6 +395,17 @@ def _render_status(config_file: Path) -> StatusReport:
 
     _agents_attention_rollup(cfg)
 
+    # stderr, and deliberately NOT part of the degraded verdict: these servers
+    # are nothing this magent started or can stop, so they must not change the
+    # 0/1/3 exit contract -- but they ARE the reason a name refuses to come up,
+    # and this is the surface the user is already looking at when that happens.
+    session0 = session0_server_pids()
+    if session0:
+        click.echo(
+            f"  {style('!', fg='yellow')} {session0_message(len(session0))}",
+            err=True,
+        )
+
     return StatusReport(_is_degraded(status), listed)
 
 
@@ -427,6 +439,11 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
         # session is a "not running" row, not a degraded daemon.
         up, _down, projects = psmux_status(cfg)
         payload["psmux_sessions"] = _psmux_sessions(up, projects)
+        # Additive too, and for the same reason the human line is on stderr and
+        # not in the verdict: a count of psmux servers stranded in logon
+        # Session 0 is a fact about the machine, not about magent's daemons, so
+        # it changes neither the envelope's shape nor the exit contract.
+        payload["psmux_session0"] = len(session0_server_pids())
         click.echo(json.dumps(payload))
         sys.exit(3 if _is_degraded(status) else 0)
 
@@ -744,6 +761,14 @@ def _menu_up(config_file: Path) -> None:
                 f" session(s) failed to come up: {style(', '.join(failed), fg='red')}"
                 f" {style('(see ~/.magent/logs/launch.log)', dim=True)}"
             )
+            # The menu is a local, interactive surface and never hands off, so
+            # a Session-0 refusal from the choke point is the one cause it can
+            # name here (see launch.session0_note).
+            from magent.launch import session0_note
+
+            note = session0_note()
+            if note:
+                click.echo(f"  {style(note, dim=True)}")
         if cfg.settings.upload_server:
             _maybe_start_upload_server(cfg.settings.upload_port, str(config_file))
     click.echo()

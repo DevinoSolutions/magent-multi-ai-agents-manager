@@ -476,8 +476,10 @@ class TestGoPathCreationVerify:
     that never came up is named in the log and respawned once. Without this,
     only `magent attach`/`up` would have proof a session exists."""
 
-    def _run(self, monkeypatch, *, missing):
-        fp = FakePlatform(supports_psmux=True, psmux_launch_failures=set(missing))
+    def _run(self, monkeypatch, *, missing, plat=None):
+        fp = plat or FakePlatform(
+            supports_psmux=True, psmux_launch_failures=set(missing)
+        )
         monkeypatch.setattr("magent.psmux.find_psmux", lambda: "psmux")
         monkeypatch.setattr("magent.psmux.time.sleep", lambda _s: None)
         monkeypatch.setattr(
@@ -507,6 +509,26 @@ class TestGoPathCreationVerify:
         # get attached, nor attach the recreated one twice.
         fp = self._run(monkeypatch, missing=["a"])
         assert [c[0] for c in fp.attached_psmux] == ["a", "b"]
+
+    def test_session_zero_fails_loudly_instead_of_creating_a_ghost_fleet(
+        self, monkeypatch, capsys
+    ):
+        # `--go` is a local, interactive command and never hands off, so a
+        # Session-0 `--go` reaches the choke point and must come back as a
+        # named failure. The reason has to be ON SCREEN: last time a user read
+        # 40 failed names and had to find launch.log to learn that nothing was
+        # even attempted.
+        monkeypatch.setenv("MAGENT_SESSION0_POLICY", "refuse")
+        monkeypatch.setattr("magent.env._cached_env", None)
+        plat = FakePlatform(supports_psmux=True, interactive_session=False)
+        monkeypatch.setattr("magent.launch.get_platform", lambda: plat)
+
+        fp = self._run(monkeypatch, missing=[], plat=plat)
+
+        assert fp.psmux_launches == []
+        out = capsys.readouterr().out
+        assert "2 session(s) failed to come up" in out
+        assert "refusing to start psmux sessions" in out
 
 
 class TestHotkeyRestartReason:

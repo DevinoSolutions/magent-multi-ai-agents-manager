@@ -3,15 +3,20 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import ctypes.wintypes
+import shutil
 import subprocess
+import tempfile
 import time
+import uuid
 from ctypes import POINTER, WINFUNCTYPE, byref, create_unicode_buffer, windll
+from pathlib import Path
 from typing import Literal
 
 from magent.grid import MonitorRect, Rect
 from magent.log import get_logger
 from magent.platform import (
     WT_NOT_FOUND_MESSAGE,
+    HandoffResult,
     Platform,
     PsmuxWindowOpts,
     TerminalLaunchOpts,
@@ -19,7 +24,13 @@ from magent.platform import (
     VSCodeLaunchOpts,
     find_psmux,
 )
-from magent.procs import spawn_unjobbed
+from magent.procs import (
+    NO_CONSOLE_SESSION,
+    active_console_session_id,
+    current_session_id,
+    pid_alive,
+    spawn_unjobbed,
+)
 from magent.psmux import (
     capture_pane,
     child_env,
@@ -66,6 +77,205 @@ _NUDGE_SETTLE_S = 0.15
 # than stall the flow; a timeout is reported as "we could not look", and the
 # caller then leaves every window alone.
 _PROC_SCAN_TIMEOUT_S = 10.0
+
+# --- Session-0 desktop hand-off (see run_on_desktop) --------------------------
+# Scratch root for one per-call directory holding the launcher script and its
+# result files. Under the system temp dir rather than ~/.magent because the
+# hand-off has to work before any magent state exists, and because the directory
+# is per-call and deleted on success.
+_HANDOFF_DIR_NAME = "magent-handoff"
+_HANDOFF_TASK_PREFIX = "magent-handoff-"
+# How often the poll looks for the result files. Small enough that a hand-off of
+# a fast command (a `serve --ensure` is ~1s) does not feel like a round trip.
+_HANDOFF_POLL_S = 0.25
+# How long the task gets to write pid.txt before we conclude it never started.
+# Distinct from the caller's timeout: "the command is slow" and "Task Scheduler
+# never ran it" are different answers, and only the second one is worth
+# abandoning a 900s budget for. Generous because the signal comes from a COLD
+# powershell.exe: ~1.6s measured on an idle desktop, but a loaded box (CI
+# proved it -- 5s was not enough on 2 of 5 windows-latest runners) can take
+# well over 5s just to reach `Start-Process`. A false "never started" here
+# abandons a bring-up that is in fact under way, so the grace errs long; a
+# task that truly never ran is still reported, only 30s later.
+_HANDOFF_START_GRACE_S = 30.0
+# How long a child that is GONE gets to still have its exit code written. The
+# launcher writes rc.txt only after its WaitForExit returns, so between the
+# child's last breath and rc.txt landing there is a window in which "pid dead,
+# no rc.txt" is the ordinary success path mid-flight, not a lost child. CI
+# proved the window is real: on 3 of 5 windows-latest runners a `-c "exit 7"`
+# child was reported "exited without an exit code" with its stdout already on
+# disk. A launcher that truly died never writes it, and that is still caught --
+# after this grace, not before.
+_HANDOFF_EXIT_GRACE_S = 15.0
+# How long to keep retrying the scratch-directory delete after success. The
+# launcher (powershell.exe) still holds the two redirect files open for the few
+# milliseconds between writing rc.txt and exiting, and on Windows an open file
+# makes rmtree fail -- silently, with ignore_errors, which is how CI grew a
+# scratch directory per successful hand-off.
+_HANDOFF_CLEANUP_GRACE_S = 5.0
+# Every schtasks call itself is bounded -- Create/Run/Query/Delete are local and
+# instant, so a hang is a wedge, not work.
+_SCHTASKS_TIMEOUT_S = 15.0
+# schtasks truncates /TR at ~261 characters -- silently, so past it the task
+# runs a DIFFERENT command. That is why /TR carries only a fixed-length launcher
+# and the real argv lives in the script file.
+_TR_MAX_CHARS = 261
+# Bare `powershell.exe`, not an absolute path, and not `pwsh`: Windows PowerShell
+# ships on every Windows box while PowerShell 7 does not, and /TR's length budget
+# is the scarce resource here. Leaving it unqualified is not the same exposure as
+# resolving OUR OWN schtasks off PATH (see _schtasks_exe): this string is run by
+# Task Scheduler inside the logged-on user's session, against the user's own
+# PATH, not against the possibly-hostile PATH of an ssh login.
+_HANDOFF_SHELL = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File"
+
+
+def _schtasks_exe() -> str | None:
+    """Absolute path to ``schtasks.exe``, or None when it cannot be found.
+
+    THE seam the unit tier monkeypatches to point at a recording fake -- no
+    test may create a real scheduled task, and there is no test-only
+    environment variable anywhere in this path.
+
+    System directory FIRST, PATH only as a fallback. ``run_on_desktop`` is
+    reached from an ssh login, whose PATH is not this machine's to trust, and
+    handing that PATH the choice of what to execute as the logged-on user would
+    make a hand-off into an execution primitive for whoever set it.
+    """
+    try:
+        buffer = create_unicode_buffer(260)
+        if windll.kernel32.GetSystemDirectoryW(buffer, 260):
+            candidate = Path(buffer.value) / "schtasks.exe"
+            if candidate.exists():
+                return str(candidate)
+    except OSError:
+        get_logger("launch").warning(
+            "session-0 hand-off: system-directory probe failed; falling back to PATH"
+        )
+    return shutil.which("schtasks")
+
+
+def _ps_quote(value: str) -> str:
+    """Wrap ``value`` as ONE PowerShell single-quoted literal.
+
+    Single-quoted, so nothing inside is expanded: these are paths and a whole
+    Windows command line, and a ``$`` or a backtick in either must arrive at
+    the child exactly as written. Doubling is the only escape a single-quoted
+    PowerShell string has.
+    """
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _handoff_script(
+    argv: list[str], cwd: str, out: Path, err: Path, pid: Path, rc: Path
+) -> str:
+    """The PowerShell the scheduled task runs in the user's own session.
+
+    PowerShell rather than a ``.cmd`` shim, for three reasons that are all
+    defects in the batch version: ``-WindowStyle Hidden`` means the desktop
+    does not get a console window flashed at it by a command the user did not
+    type; ``$p.ExitCode`` is the real exit status rather than a parsed
+    ``%ERRORLEVEL%``; and cmd would interpret an ``&`` in an unquoted argument
+    as a command separator, which ``list2cmdline`` does not protect against
+    (it only quotes for whitespace and quotes).
+
+    TWO QUOTING LAYERS, both load-bearing. ``subprocess.list2cmdline`` builds
+    the command line by the MS C-runtime rules the child's own argv parser
+    uses, so a path with spaces survives; ``_ps_quote`` then makes that whole
+    string ONE PowerShell literal. Passing a LIST to ``-ArgumentList`` would
+    skip the first layer entirely -- PowerShell joins array elements with bare
+    spaces and does not re-quote them, so ``--config C:\\A B\\magent.json``
+    would arrive at magent as two arguments.
+
+    Three other things it must do, all load-bearing:
+
+    * ``-WorkingDirectory`` the CALLER's directory. ``find_config`` walks up
+      from the working directory and a scheduled task starts in ``system32``,
+      so a hand-off without this could bring up a different config's projects
+      than the command the user actually typed.
+    * export ``MAGENT_SESSION0_POLICY=refuse`` for the child, so a hand-off
+      that somehow landed in Session 0 again refuses instead of handing off in
+      turn -- a recursion whose every level writes a scheduled task.
+    * write ``pid.txt`` as soon as the process exists and ``rc.txt`` LAST.
+      pid.txt is the "it really started" signal the start-grace check reads;
+      rc.txt is the completion signal, and the redirections are closed by the
+      time it is written, so a reader that sees it can never read a
+      half-written out.txt.
+    """
+    command_line = subprocess.list2cmdline(argv[1:])
+    return "\n".join(
+        (
+            "$ErrorActionPreference = 'Stop'",
+            "$env:MAGENT_SESSION0_POLICY = 'refuse'",
+            "$p = Start-Process -PassThru -WindowStyle Hidden"
+            f" -FilePath {_ps_quote(argv[0])}"
+            + (f" -ArgumentList {_ps_quote(command_line)}" if command_line else "")
+            + f" -WorkingDirectory {_ps_quote(cwd)}"
+            f" -RedirectStandardOutput {_ps_quote(str(out))}"
+            f" -RedirectStandardError {_ps_quote(str(err))}",
+            # Touching .Handle is not decoration -- it is the documented
+            # workaround for a `Start-Process -PassThru` object whose
+            # `.ExitCode` is $null forever. PowerShell does not cache the
+            # process handle, so once the child exits the OS has nothing left
+            # to ask and the exit code is lost. Measured here first: rc.txt
+            # came back EMPTY on every run until this line existed.
+            "$null = $p.Handle",
+            f"Set-Content -LiteralPath {_ps_quote(str(pid))} -Value $p.Id",
+            "$p.WaitForExit()",
+            f"Set-Content -LiteralPath {_ps_quote(str(rc))} -Value $p.ExitCode",
+            "",
+        )
+    )
+
+
+def _remove_scratch(work: Path) -> None:
+    """Delete a finished hand-off's scratch directory, retrying briefly.
+
+    The launcher still holds the redirect files open for the few milliseconds
+    between writing rc.txt and exiting, and an open file makes rmtree fail on
+    Windows. Bounded by ``_HANDOFF_CLEANUP_GRACE_S``; a directory that outlives
+    it is left behind rather than fought over (the next call uses a new one).
+    """
+    deadline = time.monotonic() + _HANDOFF_CLEANUP_GRACE_S
+    while True:
+        shutil.rmtree(work, ignore_errors=True)
+        if not work.exists() or time.monotonic() >= deadline:
+            return
+        time.sleep(0.1)
+
+
+def _one_line(text: str, limit: int = 200) -> str:
+    """The last non-empty line of a tool's output, clipped -- diagnostics go in
+    a single ``detail`` string, and schtasks answers in a multi-line table."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1][:limit] if lines else ""
+
+
+def _read_pid(path: Path) -> int | None:
+    """The pid the launcher recorded, or None until it has written one.
+
+    None covers every "not yet": the file is absent, or it is present but
+    half-written (``Set-Content`` is not atomic, and this poll reads every
+    250ms). Both mean "no answer yet", never "it failed".
+    """
+    raw = _read_handoff_text(path).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _read_handoff_text(path: Path) -> str:
+    """Read one of the shim's output files; absent or unreadable reads empty.
+
+    ``errors="replace"`` rather than a codepage guess: the child's console
+    encoding is the machine's, this text is RELAYED to a human, and a mojibake
+    character in a diagnostic is strictly better than losing the diagnostic to a
+    UnicodeDecodeError.
+    """
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def _send_argv(psmux: str, w: PsmuxWindowOpts) -> list[str]:
@@ -730,6 +940,289 @@ class WindowsPlatform(Platform):
         # human, and it buys nothing -- the spawn goes through `wt`, which the
         # markers do not concern.
         subprocess.Popen(args)
+
+    def logon_session_is_interactive(self) -> bool:
+        """False when this magent runs where no desktop can see it.
+
+        Two independent signals, either of which is enough, because on Windows
+        they name the same fact from opposite ends:
+
+        * ``procs.current_session_id() == 0`` -- logon Session 0, the services
+          session, which has no desktop composited onto any monitor.
+        * ``env.is_ssh_login()`` -- Windows OpenSSH is a SERVICE, so every
+          process it spawns for a login is in Session 0 by construction. This
+          is a truthful signal about Windows, not a test hook: there is no
+          Windows configuration in which an incoming ssh login lands on the
+          interactive desktop. It is carried as well as the session id because
+          the ctypes probe can answer None on a machine the environment can
+          still speak plainly about.
+
+        An UNKNOWN session id counts as interactive. A probe that fails on some
+        future Windows must not be able to stop an ordinary desktop launch --
+        the cost of a false "not interactive" is a user who cannot start their
+        fleet, and the cost of a false "interactive" is the Session-0 fleet we
+        already know how to detect afterwards.
+        """
+        # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+        from magent.env import is_ssh_login
+
+        if is_ssh_login():
+            return False
+        return current_session_id() != 0
+
+    def supports_desktop_handoff(self) -> bool:
+        """True when there is a logged-on desktop to hand work TO.
+
+        Note what this does NOT do: pick a session. ``WTSGetActiveConsoleSessionId``
+        can name an RDP session that is not the physical desktop the user is
+        looking at, so every "find the interactive session" heuristic is wrong
+        on some real machine. This reads one OS fact -- is any usable console
+        session attached at all -- and leaves the PLACING to Task Scheduler's
+        "run only when the user is logged on" trigger.
+
+        False when nobody is logged on, which makes the disposition ``refuse``
+        with a message that says so, rather than a hand-off that would sit
+        waiting out its budget for a task Windows is never going to start.
+        """
+        session = active_console_session_id()
+        return session is not None and session not in NO_CONSOLE_SESSION
+
+    def _schtasks(
+        self, exe: str, args: list[str]
+    ) -> subprocess.CompletedProcess[str] | None:
+        """One bounded, console-less schtasks call. None = it would not run.
+
+        ``CREATE_NO_WINDOW`` for the same reason every psmux control spawn
+        carries it: the caller is often a console-less process (a `serve`, an
+        ssh command with no tty), and a console-subsystem child of one gets a
+        brand-new Windows Terminal window it flashes on the user's desktop --
+        which, on the hand-off path, is the very desktop we are trying not to
+        disturb.
+        """
+        try:
+            return subprocess.run(
+                [exe, *args],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=_SCHTASKS_TIMEOUT_S,
+                check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def _schtasks_detail(
+        self, phase: str, done: subprocess.CompletedProcess[str] | None, work: Path
+    ) -> str:
+        if done is None:
+            return f"schtasks /{phase} would not run; scratch left at {work}"
+        return (
+            f"schtasks /{phase} exited {done.returncode}: "
+            f"{_one_line(done.stderr) or _one_line(done.stdout)}; "
+            f"scratch left at {work}"
+        )
+
+    def run_on_desktop(self, argv: list[str], *, timeout_s: float) -> HandoffResult:
+        """Run ``argv`` in the logged-on user's session via Task Scheduler.
+
+        Task Scheduler and not ``CreateProcessAsUser``: the API route needs a
+        token from another session, which means ``SeTcbPrivilege`` -- i.e. an
+        elevated magent -- for something the user is entitled to do to their own
+        desktop. A one-shot ``/it`` ("run only when the user is logged on") task
+        needs no stored credentials, no admin rights and no password, and it is
+        WINDOWS that places the process in the interactive session rather than
+        magent picking one. Measured on this machine from a real Session-0 sshd
+        login: Session 1, Medium integrity, desktop visible, ~1.6s.
+
+        The task runs a SCRIPT FILE, never the real command line: ``/TR`` is
+        capped at ~261 characters and truncates silently past it, so a long
+        ``--config`` path would otherwise have Task Scheduler run a different
+        command than the one asked for.
+
+        ``schtasks`` comes from ``_schtasks_exe()`` -- the system directory
+        first, and the one seam the unit tier replaces with a recording fake.
+        No test may create a real scheduled task.
+
+        Never raises; every failure is an ``rc=None`` result whose ``detail``
+        names the phase and, when something is worth looking at, the task name
+        and the scratch directory it was left in.
+        """
+        log = get_logger("launch")
+        schtasks = _schtasks_exe()
+        if not schtasks:
+            return HandoffResult(rc=None, detail="schtasks not found")
+
+        nonce = uuid.uuid4().hex[:12]
+        task = f"{_HANDOFF_TASK_PREFIX}{nonce}"
+        work = Path(tempfile.gettempdir()) / _HANDOFF_DIR_NAME / nonce
+        script = work / "run.ps1"
+        out, err = work / "out.txt", work / "err.txt"
+        pid_file, rc_file = work / "pid.txt", work / "rc.txt"
+        try:
+            work.mkdir(parents=True, exist_ok=True)
+            script.write_text(
+                _handoff_script(argv, str(Path.cwd()), out, err, pid_file, rc_file),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            return HandoffResult(
+                rc=None, detail=f"could not stage the hand-off in {work}: {exc}"
+            )
+
+        run_spec = f'{_HANDOFF_SHELL} "{script}"'
+        if len(run_spec) > _TR_MAX_CHARS:
+            return HandoffResult(
+                rc=None,
+                detail=(
+                    f"/TR would be {len(run_spec)} characters and schtasks "
+                    f"truncates at {_TR_MAX_CHARS}; scratch left at {work}"
+                ),
+            )
+
+        log.info("session-0 hand-off %s: %s", task, subprocess.list2cmdline(argv)[:500])
+        # `/sc once` demands a trigger, and `/run` fires the task now, so the
+        # trigger time exists only to satisfy schtasks. `/st 00:00` is TODAY at
+        # midnight -- already in the past, so the trigger can never fire on its
+        # own. That matters on the one path `finally` cannot cover: a caller
+        # killed mid-wait (an ssh drop takes the whole host-side `magent up`
+        # with it) leaves the task registered, and a future-dated trigger would
+        # re-run somebody's bring-up tonight. schtasks prints a "may not run
+        # because /ST is earlier than current time" warning and exits 0
+        # (measured); `/run` ignores the trigger entirely. `/it` is the whole
+        # point -- "run only when the user is logged on" is what puts the
+        # process in their interactive session, and it needs no stored
+        # credentials to do it. `/f` makes a re-run idempotent rather than an
+        # "already exists" failure.
+        create_argv = ["/Create", "/F", "/TN", task, "/TR", run_spec]
+        create_argv += ["/SC", "ONCE", "/ST", "00:00", "/IT"]
+        try:
+            created = self._schtasks(schtasks, create_argv)
+            if created is None or created.returncode != 0:
+                log.error("session-0 hand-off %s: create failed", task)
+                return HandoffResult(
+                    rc=None, detail=self._schtasks_detail("Create", created, work)
+                )
+            started = self._schtasks(schtasks, ["/Run", "/TN", task])
+            if started is None or started.returncode != 0:
+                log.error("session-0 hand-off %s: run failed", task)
+                return HandoffResult(
+                    rc=None, detail=self._schtasks_detail("Run", started, work)
+                )
+            result = self._await_handoff(
+                schtasks, task, work, (out, err, pid_file, rc_file), timeout_s
+            )
+        finally:
+            # Always, on every path, and it must not be able to raise: this
+            # runs while the real error may already be propagating. A one-shot
+            # task left behind is clutter in Task Scheduler and a name the next
+            # hand-off cannot reuse (the past-dated trigger above is what keeps
+            # it from ever FIRING).
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                self._schtasks(schtasks, ["/Delete", "/F", "/TN", task])
+        log.info(
+            "session-0 hand-off %s: rc=%s timed_out=%s %s",
+            task,
+            result.rc,
+            result.timed_out,
+            result.detail,
+        )
+        return result
+
+    def _await_handoff(
+        self,
+        schtasks: str,
+        task: str,
+        work: Path,
+        files: tuple[Path, Path, Path, Path],
+        timeout_s: float,
+    ) -> HandoffResult:
+        """Poll for the launcher's ``rc.txt``, bailing early on a task that
+        never started or a child that died without writing one.
+
+        ``pid.txt`` is the "it really started" signal -- the launcher writes it
+        the moment ``Start-Process`` returns, before the command has produced a
+        byte. Two different failures hide behind "no rc.txt yet", and both
+        deserve a precise answer instead of the caller's whole budget spent in
+        silence: no pid.txt after the start grace means TASK SCHEDULER never
+        ran the task (nobody logged on, a policy refusal), while a pid that is
+        gone with no rc.txt means the LAUNCHER died mid-flight and nothing will
+        ever write one.
+        """
+        out, err, pid_file, rc_file = files
+        deadline = time.monotonic() + timeout_s
+        start_deadline = time.monotonic() + _HANDOFF_START_GRACE_S
+        checked_start = False
+        gone_since: float | None = None
+        while time.monotonic() < deadline:
+            if rc_file.exists():
+                stdout, stderr = _read_handoff_text(out), _read_handoff_text(err)
+                raw = _read_handoff_text(rc_file).strip()
+                try:
+                    rc = int(raw)
+                except ValueError:
+                    return HandoffResult(
+                        rc=None,
+                        stdout=stdout,
+                        stderr=stderr,
+                        detail=(
+                            f"the desktop launcher wrote an unreadable exit code "
+                            f"{raw!r}; task {task}, scratch left at {work}"
+                        ),
+                    )
+                # The hand-off itself worked, whatever the command decided.
+                _remove_scratch(work)
+                return HandoffResult(rc=rc, stdout=stdout, stderr=stderr)
+            pid = _read_pid(pid_file)
+            if pid is not None and not pid_alive(pid):
+                # It ran and is gone with no exit code. Usually the launcher
+                # is a few milliseconds from writing one; only after the exit
+                # grace is this a launcher that lost its child (a crash, a
+                # kill) and nothing is coming.
+                if gone_since is None:
+                    gone_since = time.monotonic()
+                if time.monotonic() - gone_since >= _HANDOFF_EXIT_GRACE_S:
+                    return HandoffResult(
+                        rc=None,
+                        stdout=_read_handoff_text(out),
+                        stderr=_read_handoff_text(err),
+                        detail=(
+                            f"the desktop command (pid {pid}) exited without an exit "
+                            f"code; task {task}, scratch left at {work}"
+                        ),
+                    )
+            if not checked_start and pid is None and time.monotonic() > start_deadline:
+                checked_start = True
+                query = self._schtasks(schtasks, ["/Query", "/TN", task])
+                said = _one_line(query.stdout if query else "")
+                # Only a task that is NOT running is abandoned. The status
+                # column is localized, so this reads as "we could see it
+                # running" rather than "we parsed the table".
+                if "running" not in said.casefold():
+                    return HandoffResult(
+                        rc=None,
+                        detail=(
+                            "Task Scheduler never started the hand-off within "
+                            f"{_HANDOFF_START_GRACE_S:.0f}s (is anyone logged "
+                            f"on at the desktop?); schtasks /Query said "
+                            f"{said!r}; task {task}, scratch left at {work}"
+                        ),
+                    )
+            time.sleep(_HANDOFF_POLL_S)
+        # Deliberately NO kill. A bring-up still running on the desktop past
+        # our budget is doing the work that was asked for, and the pid we hold
+        # is a number Windows recycles freely -- killing it could take out an
+        # unrelated process of the user's. We stop waiting; we do not intervene.
+        return HandoffResult(
+            rc=None,
+            timed_out=True,
+            stdout=_read_handoff_text(out),
+            stderr=_read_handoff_text(err),
+            detail=(
+                f"the desktop command wrote no exit code within {timeout_s:.0f}s "
+                f"and may still be running; task {task}, scratch left at {work}"
+            ),
+        )
 
     def supports_psmux(self) -> bool:
         return True

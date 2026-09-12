@@ -176,6 +176,14 @@ A dropped connection must never kill work on the host. That is not automatic on 
 
 Note that `magent down --all` *is* the deliberate way to stop everything: it kills every psmux session on the machine along with the agent running in each, not just the daemons. Name sessions explicitly (`magent down api web`) or use `-g/--group` to stop a subset.
 
+#### The host brings itself up on its own desktop
+
+`magent attach` asks the host to run `magent up` for you, over SSH. On Windows that is a problem nobody sees coming: OpenSSH is a *service*, so every process an SSH login starts lives in logon **Session 0** — a session with no desktop attached to any monitor. Sessions created there are real and running, and completely useless: the host's own `magent status` reports them stopped, nothing can tile or attach to them, and because psmux's session registry is shared they *hold their names*, so every later bring-up on the real desktop fails with "session never came up". (Measured once: 82 psmux servers and 42 agents, plus an upload server squatting the loopback port the desktop's Alt+V needed. Clearing it took an elevated kill of 1172 processes.)
+
+So a bring-up that finds itself in Session 0 does not run there. It hands the same command to the logged-on desktop through Task Scheduler, waits for it, and relays its output back down the SSH pipe — you see the host's normal `up` output on your laptop, prefixed by one `hand-off: ...` line. No password, no elevation, no scheduled task left behind. The same applies to the upload server `attach` ensures on the host. A plain foreground `magent serve` is left alone.
+
+`MAGENT_SESSION0_POLICY` controls it: `handoff` (default), `allow` for a headless Windows host that is only ever reached over SSH and has no desktop to hand off to, or `refuse` to make the situation loud instead. If nobody is logged on at the host's console there is nowhere to hand off to, so the bring-up refuses and says exactly that rather than waiting out a scheduled task Windows is never going to start. Nothing changes on macOS or Linux, where there is no session isolation and tmux over SSH is simply how people work. If servers from an older magent are still stranded, `magent doctor` and `magent status` count them for you.
+
 #### Your typing outranks your fleet
 
 On Windows, magent keeps every psmux process at **above-normal** priority. Your keystrokes reach an agent through a chain of psmux processes, none of which owns a window — so Windows never gives them the boost it gives a foreground app, and under load they queue behind the very builds and language servers they are hosting. That is the difference between typing that feels instant and typing that lags while a normal text box on the same machine stays snappy. The processes are waiting on a pipe rather than burning CPU, so the boost costs your agents nothing.

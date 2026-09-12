@@ -113,6 +113,25 @@ class MagentEnv(BaseSettings):
     # clipboard is not the host's, so the upload path is the only correct one
     # there, and the phone page never involved Alt+V at all.
     altv_native: bool = False
+    # What a session-creating magent does when it finds itself in a
+    # NON-INTERACTIVE logon session -- on Windows, the Session 0 every process
+    # an sshd service spawns is born into (see procs.current_session_id).
+    #
+    #   handoff (default) -- re-run the same command on the logged-on desktop
+    #     via Task Scheduler, relay its output, exit with its code. The sessions
+    #     land where the user can see, tile and attach to them.
+    #   allow -- run it right here. The honest setting for a headless Windows
+    #     host that is ONLY ever reached over ssh: there is no desktop to hand
+    #     off to, and Session 0 is where its fleet belongs.
+    #   refuse -- do nothing and say why. For a machine where a Session-0 fleet
+    #     is always a mistake and a silent hand-off would hide it.
+    #
+    # Not a bool because "run it anyway" and "re-run it somewhere visible" are
+    # genuinely different answers, and the wrong default for either machine is
+    # an invisible fleet: the incident this exists for left 82 psmux servers and
+    # 42 agents alive in Session 0, unkillable from the desktop and holding
+    # every session name the user's own bring-up wanted.
+    session0_policy: Literal["handoff", "allow", "refuse"] = "handoff"
 
     @model_validator(mode="after")
     def _no_unknown_magent_vars(self) -> MagentEnv:
@@ -184,6 +203,31 @@ def localappdata_dir() -> Path:
 
 def editor_command() -> str:
     return os.environ.get("EDITOR", "xdg-open")
+
+
+# The variables OpenSSH exports into every login it serves. SSH_CONNECTION and
+# SSH_CLIENT carry the socket's addresses; SSH_TTY names the pty when one was
+# allocated (so a `-T`/BatchMode command run -- exactly how `magent attach`
+# drives a host -- has the first two and not the third). Any one of them being
+# set and non-empty is the login; all three empty is a local shell.
+_SSH_LOGIN_VARS = ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")
+
+
+def is_ssh_login() -> bool:
+    """True when this process descends from an incoming SSH login.
+
+    Host-infrastructure, not app config: sshd sets these, nobody configures
+    them. It lives here because ``env.py`` is the only module allowed to read
+    ``os.environ`` at all.
+
+    On Windows this is the second, independent signal for the same fact as
+    ``procs.current_session_id() == 0``: OpenSSH is a service there, so an ssh
+    login IS a Session-0 process. Two signals rather than one because the
+    session id can be unknowable (the ctypes probe may fail) while the
+    environment cannot, and because an ssh login with a desktop is not a case
+    Windows actually produces.
+    """
+    return any(os.environ.get(name) for name in _SSH_LOGIN_VARS)
 
 
 # The tmux-side "you are inside a session" markers, by exact name: tmux sets

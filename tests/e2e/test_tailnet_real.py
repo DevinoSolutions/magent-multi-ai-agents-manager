@@ -160,6 +160,11 @@ def _child_env() -> dict[str, str]:
     # no HOME redirect contains: a test-spawned serve/daemon must never
     # re-prioritise the developer's real psmux fleet.
     env["MAGENT_PSMUX_BOOST"] = "0"
+    # ...and the Session-0 hand-off must never fire from a test: a runner
+    # (or an ssh-driven leg) is legitimately non-interactive, and the
+    # default policy would create a REAL scheduled task on somebody's
+    # desktop. "allow" is today's behaviour, everywhere.
+    env["MAGENT_SESSION0_POLICY"] = "allow"
     return env
 
 

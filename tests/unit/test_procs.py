@@ -17,10 +17,14 @@ import pytest
 from magent.procs import (
     ABOVE_NORMAL_PRIORITY_CLASS,
     CREATE_BREAKAWAY_FROM_JOB,
+    NO_CONSOLE_SESSION,
+    active_console_session_id,
     count_processes,
+    current_session_id,
     pid_alive,
     pids_by_image_name,
     raise_priority_above_normal,
+    session_id_of,
     spawn_unjobbed,
 )
 
@@ -245,3 +249,70 @@ class TestSpawnUnjobbed:
             "args": ["x"],
             "kwargs": {"stdout": None, "stderr": None, "env": None},
         }
+
+
+class TestLogonSessionIds:
+    """The two probes behind the Session-0 desktop hand-off. Both answer None
+    rather than raising, because every caller treats "we could not tell" as
+    "interactive" -- a probe that failed must never be able to stop a normal
+    desktop launch."""
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the POSIX branch")
+    def test_off_windows_there_are_no_logon_sessions(self):
+        # Not a degradation: POSIX has no session isolation and tmux over ssh
+        # is the ordinary way to work there, so the question does not arise.
+        assert current_session_id() is None
+        assert session_id_of(os.getpid()) is None
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32 logon sessions")
+    def test_this_process_reports_an_integer_session(self):
+        session = current_session_id()
+        assert isinstance(session, int)
+        assert session >= 0
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32 logon sessions")
+    def test_our_own_pid_agrees_with_our_own_session(self):
+        # session_id_of takes no process HANDLE, so it must answer for a pid
+        # the same way the handle-free "current" call answers for us.
+        assert session_id_of(os.getpid()) == current_session_id()
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32 logon sessions")
+    def test_a_pid_that_cannot_exist_is_unknowable_not_session_zero(self):
+        # The trap this guards: a failed ProcessIdToSessionId leaves its DWORD
+        # out-parameter at 0, and 0 is the SERVICES session -- so reading that
+        # value without checking the call's RETURN would report every pid it
+        # could not resolve as the exact thing the diagnostics hunt for.
+        #
+        # A number above the pid space rather than a just-exited child: a
+        # terminated process whose handle is still open is still resolvable, so
+        # "I killed it" is not the same claim as "there is no such pid".
+        assert session_id_of(0xFFFFFFF0) is None
+
+    def test_a_bogus_pid_is_unknowable_everywhere(self):
+        assert session_id_of(0) is None
+        assert session_id_of(-1) is None
+
+
+class TestActiveConsoleSession:
+    """Read to answer "is there a desktop to hand work to at all?" -- and
+    deliberately never to PICK a session. The id can name an RDP session that
+    is not the desktop the user is looking at, so anything built on "find the
+    interactive session" is wrong on some real machine."""
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the POSIX branch")
+    def test_off_windows_there_is_no_console_session(self):
+        assert active_console_session_id() is None
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32 console sessions")
+    def test_a_logged_on_box_reports_a_usable_session(self):
+        session = active_console_session_id()
+        assert isinstance(session, int)
+        # This suite runs from a logged-on desktop or a CI runner; either way
+        # the call answers. Whether the value is USABLE is the platform
+        # probe's judgement, not this module's -- see NO_CONSOLE_SESSION.
+        assert session >= 0
+
+    def test_the_two_non_answers_are_named_not_guessed(self):
+        # 0 is the services session; 0xFFFFFFFF is "nothing attached". Both are
+        # "no desktop", and neither may be mistaken for a session id.
+        assert NO_CONSOLE_SESSION == (0, 0xFFFFFFFF)

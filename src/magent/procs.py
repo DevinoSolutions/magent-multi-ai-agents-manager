@@ -90,6 +90,91 @@ def pid_alive(pid: int | None) -> bool:
         return True
 
 
+def current_session_id() -> int | None:
+    """The Windows logon session this process runs in, or None when unknown.
+
+    Session 0 is the one nobody can see. Since Vista, Windows isolates SERVICES
+    into logon session 0 and gives every interactive logon its own session (1,
+    2, ...) with the only window station a monitor is ever composited from.
+    Windows OpenSSH is a service, so EVERY process an ssh login spawns is born
+    in Session 0 -- including, before this module could say so, a whole psmux
+    fleet: 82 servers and 42 agents that the desktop's own magent could neither
+    see (`status` called them stopped) nor kill, while psmux's shared registry
+    under ``~/.psmux`` made their names unusable for the sessions the user was
+    actually looking at.
+
+    None is "we could not tell", NOT "session 0": every caller treats an
+    unknown answer as interactive, because a probe that fails on some future
+    Windows must not be able to stop a normal desktop launch. Off Windows this
+    is always None -- POSIX has no logon sessions and tmux over ssh is the
+    ordinary way to work there, so the whole question does not arise.
+    """
+    if sys.platform != "win32":
+        return None
+    import ctypes  # win-only: ctypes.windll doesn't exist off Windows
+    from ctypes import wintypes
+
+    try:
+        k = ctypes.windll.kernel32
+        sid = wintypes.DWORD()
+        ok = k.ProcessIdToSessionId(k.GetCurrentProcessId(), ctypes.byref(sid))
+    except (OSError, AttributeError):
+        return None
+    return int(sid.value) if ok else None
+
+
+# WTSGetActiveConsoleSessionId's two non-answers. 0 is the isolated services
+# session, never composited onto a screen since Vista; 0xFFFFFFFF means no
+# session is currently attached to the console at all.
+NO_CONSOLE_SESSION = (0, 0xFFFFFFFF)
+
+
+def active_console_session_id() -> int | None:
+    """The logon session attached to the physical console, or None if unknown.
+
+    Read to answer ONE question -- "is there a desktop to hand work to at all?"
+    -- and deliberately never to PICK a session. The id this returns can name
+    an RDP session that is not the desktop a user is looking at, so anything
+    built on "find the interactive session" is wrong on some real machine.
+    Task Scheduler's "run only when the user is logged on" trigger does the
+    placing; this only decides whether the offer exists.
+
+    Never raises: the caller is a capability probe whose whole job is to
+    explain why something cannot happen, so it must not be able to fail for an
+    unrelated reason.
+    """
+    if sys.platform != "win32":
+        return None
+    import ctypes  # win-only: ctypes.windll doesn't exist off Windows
+
+    try:
+        return int(ctypes.windll.kernel32.WTSGetActiveConsoleSessionId())
+    except (OSError, AttributeError):
+        return None
+
+
+def session_id_of(pid: int) -> int | None:
+    """The Windows logon session ``pid`` runs in, or None when unknowable.
+
+    ``ProcessIdToSessionId`` needs no process HANDLE -- it reads the session
+    from the pid alone -- so this answers for processes a normal user could not
+    open, which is exactly the population the Session-0 diagnostics ask about
+    (a psmux server an sshd service started runs at a higher integrity level
+    than the desktop's own shell). A dead or bogus pid answers None.
+    """
+    if sys.platform != "win32" or not pid or pid < 0:
+        return None
+    import ctypes  # win-only: ctypes.windll doesn't exist off Windows
+    from ctypes import wintypes
+
+    try:
+        sid = wintypes.DWORD()
+        ok = ctypes.windll.kernel32.ProcessIdToSessionId(pid, ctypes.byref(sid))
+    except (OSError, AttributeError):
+        return None
+    return int(sid.value) if ok else None
+
+
 def snapshot_processes() -> list[tuple[str, int]] | None:
     """``(image name, pid)`` for every live process, or None when we could not
     look -- which is NOT the same as "nothing is running" and must never be

@@ -11,11 +11,13 @@ the detached child's argv), the blocking path hands it to `run_server`.
 """
 
 import json
+import sys
 
 import pytest
 
 from magent import cli
 from magent.cli.mobile import _FALLBACK_UPLOAD_PORT, _configured_upload_port
+from tests.conftest import FakePlatform
 
 
 def _write_config(path, port=None, extra_settings=None):
@@ -172,3 +174,92 @@ class TestConfiguredUploadPortResolver:
             _configured_upload_port(str(tmp_path / "nope.json"))
             == _FALLBACK_UPLOAD_PORT
         )
+
+
+class TestEnsureHandsOffFromSessionZero:
+    """A Session-0 upload server is not merely useless, it is HARMFUL: it takes
+    the loopback port the desktop's own Alt+V needs, so every press then talks
+    to a server that can see none of the desktop's sessions. `magent attach`
+    fires this command on the host over ssh, which on Windows is Session 0."""
+
+    def _plat(self, monkeypatch, **kwargs):
+        plat = FakePlatform(interactive_session=False, **kwargs)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: plat)
+        return plat
+
+    def _policy(self, monkeypatch, value):
+        monkeypatch.setenv("MAGENT_SESSION0_POLICY", value)
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+    def test_it_reruns_ensure_on_the_desktop(
+        self, runner, tmp_path, monkeypatch, ensured
+    ):
+        plat = self._plat(monkeypatch, supports_handoff=True)
+        self._policy(monkeypatch, "handoff")
+        cfg = _write_config(tmp_path / "magent.config.json", port=8034)
+
+        result = runner.invoke(cli.main, ["--config", cfg, "serve", "--ensure"])
+
+        from magent.launch import SESSION0_SERVE_TIMEOUT_S
+
+        assert result.exit_code == 0
+        # Nothing was started HERE -- that is the whole point.
+        assert ensured == []
+        argv, timeout = plat.handoffs[0]
+        assert argv == [
+            sys.executable,
+            "-m",
+            "magent",
+            "--config",
+            cfg,
+            "serve",
+            "-p",
+            "8034",
+            "--ensure",
+        ]
+        # A short budget: `--ensure` returns the moment a detached server is up,
+        # unlike a bring-up storm.
+        assert timeout == SESSION0_SERVE_TIMEOUT_S
+
+    def test_refuse_names_the_port_contention(
+        self, runner, tmp_path, monkeypatch, ensured
+    ):
+        self._plat(monkeypatch, supports_handoff=True)
+        self._policy(monkeypatch, "refuse")
+        cfg = _write_config(tmp_path / "magent.config.json", port=8034)
+
+        result = runner.invoke(cli.main, ["--config", cfg, "serve", "--ensure"])
+
+        assert result.exit_code == 1
+        assert ensured == []
+        assert "refusing to start the upload server" in result.output
+
+    def test_allow_ensures_it_right_here(self, runner, tmp_path, monkeypatch, ensured):
+        plat = self._plat(monkeypatch, supports_handoff=True)
+        self._policy(monkeypatch, "allow")
+        cfg = _write_config(tmp_path / "magent.config.json", port=8034)
+
+        result = runner.invoke(cli.main, ["--config", cfg, "serve", "--ensure"])
+
+        assert result.exit_code == 0
+        assert ensured == [(8034, cfg)]
+        assert plat.handoffs == []
+
+    def test_a_foreground_serve_is_left_alone(self, runner, tmp_path, monkeypatch):
+        # A plain `magent serve` is a command somebody is watching, wherever
+        # they ran it. It is `--ensure` that plants a survivor nobody sees.
+        plat = self._plat(monkeypatch, supports_handoff=True)
+        self._policy(monkeypatch, "handoff")
+        served: list[object] = []
+        monkeypatch.setattr(
+            "magent.upload_server.run_server",
+            lambda **kwargs: served.append(kwargs),
+        )
+        monkeypatch.setattr("magent.tailnet.ip4", lambda: None)
+        cfg = _write_config(tmp_path / "magent.config.json", port=8034)
+
+        result = runner.invoke(cli.main, ["--config", cfg, "serve"])
+
+        assert result.exit_code == 0
+        assert plat.handoffs == []
+        assert served and served[0]["port"] == 8034

@@ -1030,9 +1030,19 @@ def _bring_up_and_requery(
         f"  {style('o', fg='cyan')} starting sessions on host "
         f"{style('(a large bring-up can take several minutes)', dim=True)}..."
     )
-    rc, _, err = _ssh_capture(
+    rc, out, err = _ssh_capture(
         target, f"magent up{grp_suffix}", timeout=_BRING_UP_TIMEOUT_S
     )
+    # The host's stdout used to be thrown away, and that is how a laptop user
+    # watched a bring-up "succeed" while the host printed "N session(s) failed
+    # to come up" into a pipe nobody read. Everything the host says about its
+    # own bring-up belongs on this screen -- including, now, the Session-0
+    # hand-off line, which is the only notice the user gets that the sessions
+    # were created somewhere other than where the command ran. Indented two
+    # spaces because it is nested output: it is the HOST talking, not us.
+    for line in out.splitlines():
+        if line.strip():
+            click.echo(f"  {line.rstrip()}")
     if rc != 0:
         click.echo(
             f"  {style('!', fg='yellow')} bring-up exited {rc}: {style(err.strip()[:200], dim=True)}"
@@ -1334,6 +1344,35 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
     )
 
 
+def _up_handoff_argv(ctx: click.Context) -> list[str]:
+    """The `magent up` the desktop copy must re-run, rebuilt from click.
+
+    From ``ctx.params``, never ``sys.argv``: the command may have been reached
+    through any spelling of its options (``-g``/``--group``), and the group-level
+    ``--config`` sits in ``ctx.obj``, not in this command's argv at all. It IS
+    carried across: ``find_config`` walks up from the working directory, so a
+    hand-off that dropped it could bring up a different config's projects than
+    the one the user pointed at.
+
+    ``sys.executable -m magent`` rather than a bare ``magent``: the desktop copy
+    must be THIS install, not whatever a differently-ordered desktop PATH
+    resolves -- and a console-script shim may not even be on a scheduled task's
+    PATH.
+    """
+    argv = [sys.executable, "-m", "magent"]
+    config_path = ctx.obj.get("config_path")
+    if config_path:
+        argv.extend(["--config", str(config_path)])
+    argv.append("up")
+    if ctx.params.get("group"):
+        argv.extend(["-g", str(ctx.params["group"])])
+    if ctx.params.get("do_all"):
+        argv.append("--all")
+    if ctx.params.get("revive"):
+        argv.append("--revive")
+    return argv
+
+
 @main.command("up")
 @click.option(
     "--json",
@@ -1366,12 +1405,41 @@ def up_cmd(
     cfg = _load_config_or_exit(config_file, as_json=as_json)
 
     from magent.launch import (  # heavy subsystem: in-body per policy
+        SESSION0_UP_TIMEOUT_S,
         bring_up_psmux,
         decorate_psmux_sessions,
         decorate_psmux_sessions_async,
         psmux_status,
+        relay_handoff,
         revive_psmux,
+        session0_disposition,
+        session0_note,
+        session0_refusal,
     )
+
+    # This is the command `magent attach` runs on the host over ssh, and on
+    # Windows an ssh login is logon Session 0 -- so without this gate a remote
+    # attach creates a whole fleet on a desktop nobody can see (the incident in
+    # launch.py's SESSION0_* block). Before any work, and only on the
+    # session-CREATING path: `--json` never brings anything up, and it is the
+    # status read attach polls repeatedly, so refusing it would break the very
+    # flow this gate exists to repair.
+    if not as_json:
+        from magent.platform import (  # heavy subsystem: in-body per policy
+            get_platform,
+        )
+
+        plat = get_platform()
+        disposition = session0_disposition(plat)
+        if disposition == "refuse":
+            click.echo(f"  {style('x', fg='red')} {session0_refusal(plat)}", err=True)
+            sys.exit(1)
+        if disposition == "handoff":
+            sys.exit(
+                relay_handoff(
+                    plat, _up_handoff_argv(ctx), timeout_s=SESSION0_UP_TIMEOUT_S
+                )
+            )
 
     up, down, projects = psmux_status(cfg, group=group)
     # Only sessions that were ALREADY up are revive candidates: one created
@@ -1480,6 +1548,12 @@ def up_cmd(
                 f" session(s) failed to come up: {style(', '.join(failed), fg='red')}"
                 f" {style('(see ~/.magent/logs/launch.log on the host)', dim=True)}"
             )
+            # Only ever set when the choke point refused -- the hand-off and
+            # refusal above have already returned on every other Session-0
+            # path -- so this is the "policy said no" case wearing its reason.
+            note = session0_note()
+            if note:
+                click.echo(f"  {style(note, dim=True)}")
 
     # Unconditional on the interactive path: a session that is up but parked at
     # a bare shell is exactly what this command is asked to fix, and there is

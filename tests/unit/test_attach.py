@@ -372,14 +372,22 @@ class TestBringUpAndRequery:
     loaded host, sessions keep materializing after `magent up` returns (or
     times out), and a single snapshot opened windows onto a partial list."""
 
-    def _run(self, monkeypatch, snapshots, up_rc=0, expected=10**6, track=None):
+    def _run(
+        self,
+        monkeypatch,
+        snapshots,
+        up_rc=0,
+        expected=10**6,
+        track=None,
+        up_stdout="",
+    ):
         from magent.cli import attach as attach_mod
 
         polls = iter(snapshots)
 
         def fake_capture(target, cmd, timeout=30):
             assert timeout == attach_mod._BRING_UP_TIMEOUT_S
-            return (up_rc, "", "" if up_rc == 0 else "ssh timed out")
+            return (up_rc, up_stdout, "" if up_rc == 0 else "ssh timed out")
 
         def fake_json(*a, **k):
             n = next(polls)
@@ -395,6 +403,40 @@ class TestBringUpAndRequery:
         monkeypatch.setattr(attach_mod, "_ssh_json", fake_json)
         monkeypatch.setattr(attach_mod.time, "sleep", fake_sleep)
         return attach_mod._bring_up_and_requery("u@h", "", [], expected)
+
+    def test_the_hosts_own_words_reach_the_laptop(self, monkeypatch, capsys):
+        # The host's stdout used to be discarded, so a laptop user watched a
+        # bring-up "succeed" while the host printed its casualties into a pipe
+        # nobody read. Everything the HOST says about its own bring-up belongs
+        # on this screen -- including the Session-0 hand-off line, which is the
+        # only notice that the sessions were created somewhere else.
+        self._run(
+            monkeypatch,
+            [1, 1],
+            up_stdout=(
+                "hand-off: this magent runs in a non-interactive logon session"
+                " (Session 0); re-running on the desktop...\n"
+                "\n"
+                "  x 2 session(s) failed to come up: api, web\n"
+            ),
+        )
+
+        out = capsys.readouterr().out
+        assert "hand-off: this magent runs in a non-interactive" in out
+        assert "2 session(s) failed to come up: api, web" in out
+
+    def test_remote_lines_are_indented_as_nested_output(self, monkeypatch, capsys):
+        # It is the host talking, not us: two spaces mark whose voice it is.
+        self._run(monkeypatch, [1, 1], up_stdout="+ Brought up 3 session(s)\n")
+
+        assert "  + Brought up 3 session(s)" in capsys.readouterr().out
+
+    def test_a_silent_host_adds_no_blank_lines(self, monkeypatch, capsys):
+        self._run(monkeypatch, [1, 1], up_stdout="\n\n   \n")
+
+        out = capsys.readouterr().out
+        # Only the command's own "starting sessions" line.
+        assert len([line for line in out.splitlines() if line.strip()]) == 1
 
     def test_waits_for_count_to_stabilize(self, monkeypatch):
         # Growing 2 -> 5 -> 39, then stable: the final list wins.
@@ -2286,3 +2328,183 @@ class TestRemoteDown:
     def test_timeout_is_propagated(self, monkeypatch):
         code, _ = self._run(monkeypatch, 124, err="ssh timed out")
         assert code == 124
+
+
+class TestUpHandsOffFromSessionZero:
+    """`magent up` is the command `magent attach` fires on the host over ssh,
+    and on Windows an ssh login IS logon Session 0 -- so without this gate a
+    remote attach builds the host's whole fleet on a desktop nobody can see.
+    That is the incident: 82 psmux servers and 42 agents, invisible to the
+    desktop's own magent and holding every session name it wanted."""
+
+    def _config(self, tmp_path):
+        p = tmp_path / "magent.config.json"
+        p.write_text(
+            json.dumps(
+                {
+                    "version": SCHEMA_VERSION,
+                    "projects": [{"path": "/a/api", "tool": "claude"}],
+                    "settings": {"uploadServer": False},
+                }
+            )
+        )
+        return str(p)
+
+    def _plat(self, monkeypatch, **kwargs):
+        plat = FakePlatform(interactive_session=False, **kwargs)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: plat)
+        monkeypatch.setattr("magent.launch.get_platform", lambda: plat)
+        monkeypatch.setattr(
+            "magent.launch.bring_up_psmux",
+            lambda *a, **k: pytest.fail("Session 0 must never create sessions"),
+        )
+        monkeypatch.setattr("magent.launch.psmux_status", lambda *a, **k: ([], [], []))
+        monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
+        monkeypatch.setattr("magent.launch.decorate_psmux_sessions", lambda *a, **k: [])
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions_async", lambda *a, **k: []
+        )
+        return plat
+
+    def _policy(self, monkeypatch, value):
+        monkeypatch.setenv("MAGENT_SESSION0_POLICY", value)
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+    def test_it_reruns_itself_on_the_desktop(self, runner, tmp_path, monkeypatch):
+        from magent.platform import HandoffResult
+
+        plat = self._plat(monkeypatch, supports_handoff=True)
+        plat._handoff_result = HandoffResult(rc=0, stdout="+ Brought up 3 session(s)")
+        self._policy(monkeypatch, "handoff")
+
+        result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
+
+        assert result.exit_code == 0
+        assert "re-running on the desktop" in result.output
+        assert "+ Brought up 3 session(s)" in result.output
+
+    def test_the_handed_off_argv_is_this_install_and_this_config(
+        self, runner, tmp_path, monkeypatch
+    ):
+        # Rebuilt from click's params, never sys.argv: `--config` is a
+        # GROUP-level option that never appears in this command's own argv, and
+        # dropping it would bring up a different config's projects (find_config
+        # walks up from the working directory, and a scheduled task starts in
+        # system32). `-m magent` under the current interpreter, because a
+        # scheduled task's PATH may not carry the console-script shim at all.
+        plat = self._plat(monkeypatch, supports_handoff=True)
+        self._policy(monkeypatch, "handoff")
+        config = self._config(tmp_path)
+
+        runner.invoke(cli.main, ["--config", config, "up", "-g", "lead-gen"])
+
+        from magent.launch import SESSION0_UP_TIMEOUT_S
+
+        argv, timeout = plat.handoffs[0]
+        assert argv == [
+            sys.executable,
+            "-m",
+            "magent",
+            "--config",
+            config,
+            "up",
+            "-g",
+            "lead-gen",
+        ]
+        assert timeout == SESSION0_UP_TIMEOUT_S
+
+    def test_the_flags_survive_the_handoff(self, runner, tmp_path, monkeypatch):
+        plat = self._plat(monkeypatch, supports_handoff=True)
+        self._policy(monkeypatch, "handoff")
+
+        runner.invoke(
+            cli.main,
+            ["--config", self._config(tmp_path), "up", "--all", "--revive"],
+        )
+
+        argv, _timeout = plat.handoffs[0]
+        assert argv[-3:] == ["up", "--all", "--revive"]
+
+    def test_the_desktop_exit_code_is_ours(self, runner, tmp_path, monkeypatch):
+        from magent.platform import HandoffResult
+
+        plat = self._plat(monkeypatch, supports_handoff=True)
+        plat._handoff_result = HandoffResult(rc=5)
+        self._policy(monkeypatch, "handoff")
+
+        result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
+
+        assert result.exit_code == 5
+
+    def test_refuse_says_why_and_exits_one(self, runner, tmp_path, monkeypatch):
+        self._plat(monkeypatch, supports_handoff=True)
+        self._policy(monkeypatch, "refuse")
+
+        result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
+
+        assert result.exit_code == 1
+        assert "refusing to start psmux sessions" in result.output
+        assert "MAGENT_SESSION0_POLICY=allow" in result.output
+
+    def test_a_platform_without_a_mechanism_refuses(
+        self, runner, tmp_path, monkeypatch
+    ):
+        # On Windows this is specifically "nobody is logged on at the console",
+        # and the refusal has to say so -- telling that user to run it on the
+        # desktop would be advice they cannot take.
+        plat = self._plat(monkeypatch, supports_handoff=False)
+        self._policy(monkeypatch, "handoff")
+
+        result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
+
+        assert result.exit_code == 1
+        assert plat.handoffs == []
+        assert "no user is logged on" in result.output
+
+    def test_allow_runs_it_right_here(self, runner, tmp_path, monkeypatch):
+        # A headless Windows host reached only over ssh has no desktop to hand
+        # off to, and Session 0 is where its fleet belongs.
+        plat = FakePlatform(interactive_session=False, supports_handoff=True)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: plat)
+        monkeypatch.setattr("magent.launch.get_platform", lambda: plat)
+        monkeypatch.setattr("magent.launch.psmux_status", lambda *a, **k: ([], [], []))
+        monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
+        monkeypatch.setattr("magent.launch.decorate_psmux_sessions", lambda *a, **k: [])
+        self._policy(monkeypatch, "allow")
+
+        result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
+
+        assert result.exit_code == 0
+        assert plat.handoffs == []
+        assert "re-running on the desktop" not in result.output
+
+    def test_json_is_never_handed_off(self, runner, tmp_path, monkeypatch):
+        # `up --json` creates nothing and is the status read `magent attach`
+        # polls repeatedly over ssh -- from Session 0, every time. Gating it
+        # would break the very flow this hand-off exists to repair.
+        plat = self._plat(monkeypatch, supports_handoff=True)
+        self._policy(monkeypatch, "handoff")
+
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_path), "up", "--json"]
+        )
+
+        assert result.exit_code == 0
+        assert plat.handoffs == []
+        assert json.loads(result.stdout)["ok"] is True
+
+    def test_an_interactive_desktop_is_untouched(self, runner, tmp_path, monkeypatch):
+        plat = FakePlatform(interactive_session=True, supports_handoff=True)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: plat)
+        monkeypatch.setattr("magent.launch.get_platform", lambda: plat)
+        monkeypatch.setattr("magent.launch.psmux_status", lambda *a, **k: ([], [], []))
+        monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
+        monkeypatch.setattr("magent.launch.decorate_psmux_sessions", lambda *a, **k: [])
+        # Even with the policy set for a headless host: an interactive logon
+        # session is decided before the policy is read at all.
+        self._policy(monkeypatch, "refuse")
+
+        result = runner.invoke(cli.main, ["--config", self._config(tmp_path), "up"])
+
+        assert result.exit_code == 0
+        assert plat.handoffs == []
