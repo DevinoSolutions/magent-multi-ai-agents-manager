@@ -98,6 +98,21 @@ _HANDOFF_POLL_S = 0.25
 # abandons a bring-up that is in fact under way, so the grace errs long; a
 # task that truly never ran is still reported, only 30s later.
 _HANDOFF_START_GRACE_S = 30.0
+# How long a child that is GONE gets to still have its exit code written. The
+# launcher writes rc.txt only after its WaitForExit returns, so between the
+# child's last breath and rc.txt landing there is a window in which "pid dead,
+# no rc.txt" is the ordinary success path mid-flight, not a lost child. CI
+# proved the window is real: on 3 of 5 windows-latest runners a `-c "exit 7"`
+# child was reported "exited without an exit code" with its stdout already on
+# disk. A launcher that truly died never writes it, and that is still caught --
+# after this grace, not before.
+_HANDOFF_EXIT_GRACE_S = 15.0
+# How long to keep retrying the scratch-directory delete after success. The
+# launcher (powershell.exe) still holds the two redirect files open for the few
+# milliseconds between writing rc.txt and exiting, and on Windows an open file
+# makes rmtree fail -- silently, with ignore_errors, which is how CI grew a
+# scratch directory per successful hand-off.
+_HANDOFF_CLEANUP_GRACE_S = 5.0
 # Every schtasks call itself is bounded -- Create/Run/Query/Delete are local and
 # instant, so a hang is a wedge, not work.
 _SCHTASKS_TIMEOUT_S = 15.0
@@ -210,6 +225,22 @@ def _handoff_script(
             "",
         )
     )
+
+
+def _remove_scratch(work: Path) -> None:
+    """Delete a finished hand-off's scratch directory, retrying briefly.
+
+    The launcher still holds the redirect files open for the few milliseconds
+    between writing rc.txt and exiting, and an open file makes rmtree fail on
+    Windows. Bounded by ``_HANDOFF_CLEANUP_GRACE_S``; a directory that outlives
+    it is left behind rather than fought over (the next call uses a new one).
+    """
+    deadline = time.monotonic() + _HANDOFF_CLEANUP_GRACE_S
+    while True:
+        shutil.rmtree(work, ignore_errors=True)
+        if not work.exists() or time.monotonic() >= deadline:
+            return
+        time.sleep(0.1)
 
 
 def _one_line(text: str, limit: int = 200) -> str:
@@ -1122,6 +1153,7 @@ class WindowsPlatform(Platform):
         deadline = time.monotonic() + timeout_s
         start_deadline = time.monotonic() + _HANDOFF_START_GRACE_S
         checked_start = False
+        gone_since: float | None = None
         while time.monotonic() < deadline:
             if rc_file.exists():
                 stdout, stderr = _read_handoff_text(out), _read_handoff_text(err)
@@ -1139,21 +1171,26 @@ class WindowsPlatform(Platform):
                         ),
                     )
                 # The hand-off itself worked, whatever the command decided.
-                shutil.rmtree(work, ignore_errors=True)
+                _remove_scratch(work)
                 return HandoffResult(rc=rc, stdout=stdout, stderr=stderr)
             pid = _read_pid(pid_file)
             if pid is not None and not pid_alive(pid):
-                # It ran and is gone, with no exit code: the launcher lost the
-                # process (a crash, a kill) and nothing is coming.
-                return HandoffResult(
-                    rc=None,
-                    stdout=_read_handoff_text(out),
-                    stderr=_read_handoff_text(err),
-                    detail=(
-                        f"the desktop command (pid {pid}) exited without an exit "
-                        f"code; task {task}, scratch left at {work}"
-                    ),
-                )
+                # It ran and is gone with no exit code. Usually the launcher
+                # is a few milliseconds from writing one; only after the exit
+                # grace is this a launcher that lost its child (a crash, a
+                # kill) and nothing is coming.
+                if gone_since is None:
+                    gone_since = time.monotonic()
+                if time.monotonic() - gone_since >= _HANDOFF_EXIT_GRACE_S:
+                    return HandoffResult(
+                        rc=None,
+                        stdout=_read_handoff_text(out),
+                        stderr=_read_handoff_text(err),
+                        detail=(
+                            f"the desktop command (pid {pid}) exited without an exit "
+                            f"code; task {task}, scratch left at {work}"
+                        ),
+                    )
             if not checked_start and pid is None and time.monotonic() > start_deadline:
                 checked_start = True
                 query = self._schtasks(schtasks, ["/Query", "/TN", task])

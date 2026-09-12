@@ -545,6 +545,15 @@ class TestRunOnDesktopOnWindows:
         started = time.monotonic()
         monkeypatch.setattr("magent.platform.windows._read_pid", lambda _p: 4)
         monkeypatch.setattr("magent.platform.windows.pid_alive", lambda _p: False)
+        # A gone pid is given a grace to still have its exit code written (the
+        # launcher writes rc.txt after WaitForExit returns); shrink it so this
+        # test proves the failure path, not the grace.
+        monkeypatch.setattr("magent.platform.windows._HANDOFF_EXIT_GRACE_S", 0.5)
+        # ...and the real launcher must not win the race by writing rc.txt: a
+        # launcher that exits without writing one IS the lost-child case.
+        monkeypatch.setattr(
+            "magent.platform.windows._handoff_script", lambda *_a, **_k: "exit 0\n"
+        )
 
         result = self._plat().run_on_desktop(
             [sys.executable, "-c", "pass"], timeout_s=60
