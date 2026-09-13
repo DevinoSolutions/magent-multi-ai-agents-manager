@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import types
@@ -759,6 +760,53 @@ class TestAttachNomux:
         assert calls[0][-1].startswith("cd web && ")
         assert len(sleeps) == 1
         assert titles == ["magent:api", "magent:web"]
+
+
+class TestAttachPanesLoseOnlyALeakedColourOverride:
+    """Both local `wt` spawns route through env.attach_client_env.
+
+    2026-09-13: `magent --go` from a Claude Code tool shell (NO_COLOR=1 in every
+    subprocess it spawns) opened 57 monochrome attach windows. A pane's renderer
+    is the client inside it, so the inherited NO_COLOR is the only one it ever
+    sees -- but a human who exports NO_COLOR deliberately must keep it, which is
+    why the harness marker, not the variable, is the gate.
+    """
+
+    def _env(self, monkeypatch, *, marker: bool, spawn: str):
+        from magent import env as env_module
+        from magent.cli import attach as attach_mod
+
+        for key in list(os.environ):
+            if key.upper() in env_module._AGENT_SESSION_VARS:
+                monkeypatch.delenv(key, raising=False)
+        if marker:
+            monkeypatch.setenv("CLAUDECODE", "1")
+        monkeypatch.setenv("NO_COLOR", "1")
+        envs: list[object] = []
+        monkeypatch.setattr(
+            attach_mod.subprocess, "Popen", lambda args, **k: envs.append(k.get("env"))
+        )
+        monkeypatch.setattr(attach_mod.time, "sleep", lambda s: None)
+        monkeypatch.setattr(attach_mod, "_tile_titles", lambda t: None)
+        _fake_platform(monkeypatch)
+        if spawn == "supervised":
+            attach_mod._spawn_windows("u@host", ["api"], set(), 0.0, reconnect=False)
+        else:
+            attach_mod._attach_nomux(
+                "u@host", {"projects": [{"path": "api", "name": "api"}]}
+            )
+        assert envs, "nothing was spawned"
+        return envs[0]
+
+    @pytest.mark.parametrize("spawn", ["supervised", "nomux"])
+    def test_a_leaked_no_color_is_removed(self, monkeypatch, spawn):
+        env = self._env(monkeypatch, marker=True, spawn=spawn)
+        assert env is not None, "spawned with the inherited environment"
+        assert "NO_COLOR" not in env
+
+    @pytest.mark.parametrize("spawn", ["supervised", "nomux"])
+    def test_a_humans_no_color_is_plain_inheritance(self, monkeypatch, spawn):
+        assert self._env(monkeypatch, marker=False, spawn=spawn) is None
 
 
 class TestUpJsonConfigError:

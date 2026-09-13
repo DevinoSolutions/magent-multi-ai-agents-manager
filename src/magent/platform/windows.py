@@ -932,14 +932,21 @@ class WindowsPlatform(Platform):
         if color:
             args.extend(["--tabColor", color])
         args.extend(["--", psmux, "-L", session_name, "attach"])
-        # No `env=child_env()` here, deliberately: this is the user-facing
+        # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+        from magent.env import attach_client_env
+
+        # Not `spawn_child_env()` here, deliberately: this is the user-facing
         # ATTACH client, not a creation/control command. Attaching is the one
         # psmux operation where nesting is a real question rather than a false
-        # alarm, and psmux's own guard is the right authority on it. Stripping
-        # the markers here would be magent overriding a warning meant for the
-        # human, and it buys nothing -- the spawn goes through `wt`, which the
-        # markers do not concern.
-        subprocess.Popen(args)
+        # alarm, and psmux's own guard is the right authority on it -- so the
+        # nesting markers still are NOT stripped. `attach_client_env` removes
+        # exactly one thing, and only when it can prove it was inherited: a
+        # colour override an agent harness set for its own tool output, which
+        # would otherwise render this window monochrome (the psmux client is
+        # this pane's renderer and honours NO_COLOR). A human's own NO_COLOR
+        # survives, and with no harness marker this is `env=None` -- the plain
+        # inherited environment, exactly as before. See env.attach_client_env.
+        subprocess.Popen(args, env=attach_client_env())
 
     def logon_session_is_interactive(self) -> bool:
         """False when this magent runs where no desktop can see it.
