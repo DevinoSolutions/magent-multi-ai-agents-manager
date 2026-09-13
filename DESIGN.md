@@ -1732,6 +1732,44 @@ TestEnsureHandsOffFromSessionZero`, and `tests/e2e/test_session0_handoff.py`
 explicit child `env=` carries it: a CI runner is legitimately non-interactive,
 and the default would have it writing real scheduled tasks.
 
+### The attach client is the renderer, so the human's colour setting wins (2026-09-13)
+
+`env.spawn_child_env()` has stripped the launching shell's colour overrides
+since the 2026-08-18 incident, on the reasoning that a pane's own shell sources
+the profile that should decide its rendering. A user-facing **attach** window is
+the other case, and this is the day it cost something: `magent --go` run from a
+Claude Code tool shell (which puts `NO_COLOR=1` and `CLAUDECODE=1` into every
+subprocess it spawns) opened 57 attach windows that rendered monochrome around
+agents that were themselves perfectly colourful — the created sessions went
+through the seam, the attach client did not. The psmux client honours
+`NO_COLOR`, and for an attach pane that client IS the renderer, so the inherited
+environment is the only one it will ever have.
+
+That asymmetry is why the fix is a second, narrower seam
+(`env.attach_client_env()`) and not a reuse of the first. For a created session
+the launching shell is always the wrong authority. For an attach client it is
+usually the RIGHT one: magent is for other people's machines too, and a user who
+exports `NO_COLOR` in their own shell means it. So the strip is conditional, and
+the condition is an agent-harness session marker (`_AGENT_SESSION_VARS`) — the
+harness set `NO_COLOR` for its own tool output, never for the human's windows,
+so the marker is proof the override was inherited rather than chosen. No marker,
+no dict: the function returns `None` and the spawn inherits, byte-for-byte the
+historical behaviour. The psmux/tmux nesting markers survive here either way,
+which is the exception `attach_psmux` has always documented — attaching from
+inside a pane really is nesting, and psmux's own guard is the right authority on
+it. The harness markers themselves survive too: they are identity for a CREATED
+agent, and an attach client creates none.
+
+No knob was added, deliberately. A `MAGENT_*` opt-out would ask the user to
+configure their way out of a bug they did not cause, and it would need an
+`.env.example` entry and a schema pin to carry a question the marker already
+answers. Three call sites route through the seam — `attach_psmux` plus the
+supervised-pane and `--no-mux` `wt` spawns in `cli/attach.py`. Pins:
+`tests/unit/test_env_schema.py::TestAttachClientEnv`,
+`tests/unit/test_platform_contract.py::
+TestAttachClientKeepsNestingMarkersButNotALeakedNoColor`, and
+`tests/unit/test_attach.py::TestAttachPanesLoseOnlyALeakedColourOverride`.
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.

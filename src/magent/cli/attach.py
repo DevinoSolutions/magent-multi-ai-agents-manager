@@ -788,6 +788,9 @@ def _spawn_windows(
             f" {style('pip install -U magent-multi-ai-agents-manager', bold=True)}"
             f"{style('.', dim=True)}"
         )
+    # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+    from magent.env import attach_client_env
+
     titles: list[str] = []
     for sid in sids:
         title = make_title(sid)
@@ -799,6 +802,10 @@ def _spawn_windows(
             titles.append(title)
             continue
         click.echo(f"  {style('o', fg='cyan')} {title}")
+        # `env=`: an attach pane is a RENDERER, not an agent host -- everything
+        # survives (nesting markers included) except a colour override an agent
+        # harness leaked into us, which would paint this pane monochrome. None
+        # when no harness marker is present, i.e. plain inheritance.
         subprocess.Popen(
             [
                 "wt",
@@ -809,7 +816,8 @@ def _spawn_windows(
                 "--suppressApplicationTitle",
                 "--",
                 *_pane_command(target, sid, supervisor),
-            ]
+            ],
+            env=attach_client_env(),
         )
         titles.append(title)
         time.sleep(stagger)
@@ -1304,6 +1312,9 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
     sids = [_as_str(p.get("session")) or _as_str(p.get("name")) for p in projects]
     open_already = _already_open(sids)
 
+    # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+    from magent.env import attach_client_env
+
     titles: list[str] = []
     for sid, p in zip(sids, projects, strict=True):
         title = make_title(sid)
@@ -1316,6 +1327,8 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
         # NF-S3-004: fall back to the registry default, never a drifting literal.
         cmd = _as_str(p.get("cmd")) or DEFAULT_TOOLS["claude"]
         click.echo(f"  {style('o', fg='cyan')} {title}")
+        # Same seam as the supervised panes above: strip only a harness-leaked
+        # colour override, keep everything else, `None` for a human's shell.
         subprocess.Popen(
             [
                 "wt",
@@ -1329,7 +1342,8 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
                 "-t",
                 target,
                 f"cd {remote_dir} && {cmd}",
-            ]
+            ],
+            env=attach_client_env(),
         )
         titles.append(title)
         time.sleep(_SPAWN_STAGGER_S)

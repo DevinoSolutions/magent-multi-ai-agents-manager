@@ -5,6 +5,21 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Attach windows no longer come up colourless when magent is launched from
+  an AI agent's terminal.** An agent harness sets `NO_COLOR=1` in every command
+  it runs, so a `magent --go` typed into one handed that setting to every attach
+  window it opened — the multiplexer client inside each pane is what paints it,
+  and it obeys `NO_COLOR`. The result was a screen full of black-and-white
+  windows wrapped around agents that were themselves in full colour. The
+  override is now dropped from a local attach window, but only when the
+  environment also shows that an agent harness put it there. `NO_COLOR` set in
+  your own shell still does exactly what you asked, and nothing else about the
+  window's environment changes.
+
 ## [3.18.0] - 2026-09-12
 
 ### Added

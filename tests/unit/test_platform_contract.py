@@ -1,3 +1,4 @@
+import os
 import sys
 
 import pytest
@@ -929,3 +930,58 @@ class TestLaunchPathSpawnsScrubTheInheritedMarkers:
             ),
         )
         _assert_scrubbed(envs[0])
+
+
+# --- the ATTACH client is the OTHER rule ------------------------------------
+# `attach_psmux` opens a window that RENDERS an existing session; it hosts no
+# agent and creates nothing. So it keeps the inherited environment -- nesting
+# markers included, which is the exception it has always documented -- and
+# parts with exactly one thing: a colour override an agent harness leaked into
+# magent for its own tool output. (2026-09-13: `magent --go` from a Claude Code
+# tool shell carrying NO_COLOR=1 opened 57 monochrome attach windows.) A human
+# who sets NO_COLOR in their own shell keeps colourless windows.
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="WindowsPlatform binds windll at import"
+)
+class TestAttachClientKeepsNestingMarkersButNotALeakedNoColor:
+    def _env(self, monkeypatch):
+        from magent.platform.windows import WindowsPlatform
+
+        envs: list[object] = []
+        monkeypatch.setattr("magent.platform.windows.find_psmux", lambda: "psmux")
+        monkeypatch.setattr(
+            "magent.platform.windows.subprocess.Popen",
+            lambda a, **k: envs.append(k.get("env")),
+        )
+        WindowsPlatform().attach_psmux("api", "magent:api")
+        assert envs, "nothing was spawned"
+        return envs[0]
+
+    @pytest.mark.usefixtures("_dirty_launcher_env")
+    def test_a_leaked_no_color_is_removed(self, monkeypatch):
+        env = self._env(monkeypatch)
+        assert env is not None, "spawned with the inherited environment"
+        assert "NO_COLOR" not in env
+
+    @pytest.mark.usefixtures("_dirty_launcher_env")
+    def test_the_nesting_markers_survive(self, monkeypatch):
+        # THE difference from the launch-path spawns above, which strip these.
+        # Attaching from inside a pane really IS nesting, and psmux's own guard
+        # is the right authority on it -- magent must not silence the warning.
+        monkeypatch.setenv("PSMUX_SESSION", "api")
+        monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,123,0")
+        env = self._env(monkeypatch)
+        assert env is not None
+        assert env["PSMUX_SESSION"] == "api"
+        assert env["TMUX"] == "/tmp/tmux-1000/default,123,0"
+
+    def test_a_humans_no_color_is_plain_inheritance(self, monkeypatch):
+        from magent import env as env_module
+
+        for key in list(os.environ):
+            if key.upper() in env_module._AGENT_SESSION_VARS:
+                monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("NO_COLOR", "1")
+        assert self._env(monkeypatch) is None

@@ -381,14 +381,71 @@ def spawn_child_env() -> dict[str, str]:
 
     Used for CREATION children only. A user-facing ``attach`` client is a
     different question (attaching from inside a pane really IS nesting, and
-    psmux's guard is right to fire there), and psmux's CONTROL/PROBE commands
-    are measurably indifferent to all of this, so those call sites keep the
+    psmux's guard is right to fire there) -- see ``attach_client_env``, the
+    narrower seam it uses instead -- and psmux's CONTROL/PROBE commands are
+    measurably indifferent to all of this, so those call sites keep the
     inherited environment on purpose.
     """
     return {
         key: value
         for key, value in os.environ.items()
         if not _is_mux_nesting_marker(key) and not _is_inherited_marker(key)
+    }
+
+
+def _has_agent_session_marker() -> bool:
+    """True when this process was spawned by an agent harness's tool shell."""
+    return any(key.upper() in _AGENT_SESSION_VARS for key in os.environ)
+
+
+def attach_client_env() -> dict[str, str] | None:
+    """The environment for a local ATTACH window: colour leak removed, nothing else.
+
+    THE one seam for "what environment does a user-facing attach client start
+    with?" -- ``WindowsPlatform.attach_psmux`` and the two local ``wt`` spawns
+    in ``cli/attach.py`` (supervised remote panes, ``--no-mux`` ssh panes).
+    ``None`` means "spawn with the plain inherited environment", so a caller
+    writes ``env=attach_client_env()`` unconditionally and the no-op case costs
+    nothing.
+
+    The incident (2026-09-13): ``magent --go`` run from a Claude Code tool
+    shell, which sets ``NO_COLOR=1`` (and ``CLAUDECODE=1``) in every subprocess
+    it spawns. The created sessions were fine -- they go through
+    ``spawn_child_env`` -- but all 57 ATTACH windows inherited ``NO_COLOR`` and
+    rendered monochrome around perfectly colourful agents. The psmux client
+    honours ``NO_COLOR`` (the string is in the binary), and for an attach window
+    the psmux client IS the renderer, so its environment decides what the human
+    sees. This is the 2026-08-18 leak one layer up.
+
+    Why this is not just ``spawn_child_env``, in two parts:
+
+    * The presentation strip is CONDITIONAL here. For a created session the
+      launching shell's ``NO_COLOR`` is always the wrong authority, because the
+      pane's own shell sources the profile that should win. For an attach client
+      there is no such second chance: the inherited environment is the only
+      environment the renderer will ever have, so a human who deliberately
+      exports ``NO_COLOR`` in their shell must keep colourless attach windows.
+      An agent-harness session marker is what tells the two apart -- the harness
+      set ``NO_COLOR`` for ITS OWN tool output, never for the human's windows,
+      so its presence is proof the override was inherited rather than chosen.
+      No marker, no strip, byte-for-byte the historical behaviour.
+    * The nesting markers SURVIVE, marker or not. Attaching from inside a pane
+      really is nesting and psmux's own guard is the right authority on it --
+      the exception ``attach_psmux`` has always documented, unchanged.
+
+    The harness's session markers themselves also survive: they are identity for
+    a CREATED agent, and an attach client creates no agent. ``TERM`` is never
+    touched, here as everywhere. And there is deliberately no knob: a
+    ``MAGENT_*`` opt-out would ask the user to configure their way out of a bug
+    they did not cause, when the marker already answers the only question that
+    matters.
+    """
+    if not _has_agent_session_marker():
+        return None
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() not in _PRESENTATION_VARS
     }
 
 

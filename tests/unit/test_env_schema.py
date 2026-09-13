@@ -289,6 +289,140 @@ class TestInheritedMarkerScrub:
         assert "NO_COLOR" not in child
 
 
+def _clean_human_shell(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A human's shell: no agent-harness marker anywhere in the environment."""
+    for key in list(os.environ):
+        if key.upper() in env_module._AGENT_SESSION_VARS:
+            monkeypatch.delenv(key, raising=False)
+
+
+class TestAttachClientEnv:
+    """The ATTACH client's environment: only a LEAKED colour override goes.
+
+    Third incident, same mechanism, one layer up (2026-09-13): `magent --go`
+    was run from a Claude Code tool shell, which puts NO_COLOR=1 in every
+    subprocess it spawns. The 57 sessions it CREATED were fine -- they go
+    through `spawn_child_env` -- but every attach window inherited NO_COLOR and
+    rendered monochrome around a perfectly colourful agent, because the psmux
+    client is the attach pane's renderer and honours NO_COLOR.
+
+    The rule this pins is a product decision, not an oversight: for an attach
+    client the inherited environment is the only one the renderer ever gets, so
+    a human who exports NO_COLOR in their own shell must KEEP colourless attach
+    windows. An agent-harness session marker is what separates the two cases --
+    the harness set NO_COLOR for its own tool output, never for the human's
+    windows. And the psmux/tmux nesting markers survive either way: attaching
+    from inside a pane really is nesting, and psmux's guard is right to fire.
+    """
+
+    def test_a_humans_no_color_survives_as_plain_inheritance(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _clean_human_shell(monkeypatch)
+        monkeypatch.setenv("NO_COLOR", "1")
+        # None, not a dict: the caller passes it straight to Popen(env=...), so
+        # "no harness marker" is byte-for-byte the historical plain inheritance.
+        assert env_module.attach_client_env() is None
+
+    @pytest.mark.parametrize("marker", sorted(env_module._AGENT_SESSION_VARS))
+    @pytest.mark.parametrize(
+        "presentation", ["NO_COLOR", "FORCE_COLOR", "CLICOLOR", "CLICOLOR_FORCE"]
+    )
+    def test_a_leaked_presentation_override_is_removed(
+        self, monkeypatch: pytest.MonkeyPatch, marker: str, presentation: str
+    ) -> None:
+        _clean_human_shell(monkeypatch)
+        monkeypatch.setenv(marker, "1")
+        for key in env_module._PRESENTATION_VARS:
+            monkeypatch.setenv(key, "1")
+        child = env_module.attach_client_env()
+        assert child is not None
+        assert presentation not in child
+        # Every member, not just the parametrized one: all four go together.
+        assert not env_module._PRESENTATION_VARS & set(child)
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            # The nesting markers -- the documented attach exception. psmux's
+            # own guard is the right authority on whether a nested attach is a
+            # mistake, so magent must not silence it.
+            ("PSMUX_SESSION", "api"),
+            ("TMUX", "/tmp/tmux-1000/default,123,0"),
+            ("TMUX_PANE", "%7"),
+            ("TMUX_TMPDIR", "/tmp/private-sockets"),
+            # Presentation is the ONLY family this seam touches.
+            ("TERM", "xterm-256color"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "sk-keep-me"),
+            # Identity is for a CREATED agent; an attach client creates none,
+            # so the marker that gated the strip is itself left in place.
+            ("CLAUDECODE", "1"),
+        ],
+    )
+    def test_everything_else_survives_with_its_value(
+        self, monkeypatch: pytest.MonkeyPatch, key: str, value: str
+    ) -> None:
+        _clean_human_shell(monkeypatch)
+        monkeypatch.setenv("CLAUDECODE", "1")
+        monkeypatch.setenv("NO_COLOR", "1")
+        monkeypatch.setenv(key, value)
+        child = env_module.attach_client_env()
+        assert child is not None
+        assert child[key] == value
+
+    def test_a_lowercase_override_is_removed_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Windows env keys are case-insensitive; matched on the upper-cased
+        # name so neither host can smuggle one through.
+        _clean_human_shell(monkeypatch)
+        monkeypatch.setenv("CLAUDECODE", "1")
+        monkeypatch.setenv("no_color", "1")
+        child = env_module.attach_client_env()
+        assert child is not None
+        assert not [k for k in child if k.lower() == "no_color"]
+
+    def test_a_lowercase_marker_gates_the_strip_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _clean_human_shell(monkeypatch)
+        monkeypatch.setenv("claudecode", "1")
+        monkeypatch.setenv("NO_COLOR", "1")
+        child = env_module.attach_client_env()
+        assert child is not None
+        assert "NO_COLOR" not in child
+
+    def test_a_marker_with_nothing_to_strip_still_returns_the_whole_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gate is the MARKER, not "would anything change?".
+
+        Pinned as a dict equal to os.environ rather than None so there is one
+        decision point, not two: the seam asks "did a harness spawn us?" and
+        nothing else. The spawn is identical either way -- a full copy of the
+        environment and inheriting it are the same child -- so collapsing this
+        case to None would buy nothing and add a second branch to reason about.
+        """
+        _clean_human_shell(monkeypatch)
+        for key in env_module._PRESENTATION_VARS:
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("CLAUDECODE", "1")
+        assert env_module.attach_client_env() == dict(os.environ)
+
+    def test_the_creation_seam_is_unchanged_by_all_of_this(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A created session is the OTHER rule: there the launching shell is
+        # always the wrong authority, marker or no marker, because the pane's
+        # own shell sources the profile that should win.
+        _clean_human_shell(monkeypatch)
+        monkeypatch.setenv("NO_COLOR", "1")
+        monkeypatch.setenv("PSMUX_SESSION", "api")
+        child = env_module.spawn_child_env()
+        assert "NO_COLOR" not in child
+        assert "PSMUX_SESSION" not in child
+
+
 class TestClosedSchemaRejectsUnknownVars:
     """R2-01: extra="forbid" alone never sees env-sourced keys — the
     _no_unknown_magent_vars validator is what actually closes the schema."""
