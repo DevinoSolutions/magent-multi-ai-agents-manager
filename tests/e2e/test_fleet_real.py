@@ -31,8 +31,9 @@ the Windows leg (real psmux 3.3.8, provisioned by ``.github/actions/
 install-psmux``) is for. A missing multiplexer therefore FAILS on CI and only
 skips locally -- a runner without one is a provisioning bug, never a skip.
 
-Two measured facts about the multiplexers shape the harness, both verified on
-this repo's Windows box against real psmux 3.3.8:
+Three measured facts about the multiplexers shape the harness, the first two
+verified on this repo's Windows box against real psmux 3.3.8 and the third on a
+macOS CI runner:
 
 * **A pane command is read by a SHELL, not exec'd.** ``new-session ... <python>
   <script>`` with a script path containing a space and an ``&`` came up as a
@@ -43,6 +44,11 @@ this repo's Windows box against real psmux 3.3.8:
 * **A detached pane does not echo, and the Windows console over-echoes.** See
   ``_fleet_agent``'s module docstring: the stand-in owns its input line in raw
   mode, like the real TUI does.
+* **A tmux socket does not fit under pytest's tmp_path on macOS.** A UNIX socket
+  path is capped at ~104 bytes there; pytest's tmp root made it 183 and every
+  ``new-session`` failed with "File name too long". So ``TMUX_TMPDIR`` lives in a
+  short ``/tmp/mgf-XXXXXXXX`` and the session names are short too -- see
+  :func:`_resolve_multiplexer`.
 """
 
 from __future__ import annotations
@@ -54,6 +60,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -100,14 +107,27 @@ def _missing_multiplexer(name: str) -> NoReturn:
     pytest.skip(message)
 
 
-def _resolve_multiplexer(tmp_path: Path) -> tuple[str, dict[str, str]]:
-    """``(binary, extra child env)``: real psmux on Windows, tmux-as-psmux else.
+def _resolve_multiplexer(tmp_path: Path) -> tuple[str, dict[str, str], str | None]:
+    """``(binary, extra child env, socket dir to clean up)``.
 
-    The POSIX half copies the browser tier's device faithfully
+    Real psmux on Windows; on POSIX the browser tier's device copied faithfully
     (``test_upload_browser._BrowserServe._install_psmux``): a symlink named
     ``psmux`` in a tmp bindir that is PREPENDED to PATH, so the magent
     subprocess's own ``find_psmux()`` resolves it, plus a private 0700
     ``TMUX_TMPDIR`` so no socket of this tier's can collide with a real one.
+
+    That socket directory is deliberately NOT under ``tmp_path``, and moving it
+    back would break macOS only: a UNIX socket path is capped at the ~104 bytes
+    of ``sockaddr_un.sun_path`` (108 on Linux), and pytest's own tmp root is
+    long enough to blow it on its own -- measured on a macOS runner, the socket
+    came to 183 characters under ``/private/var/folders/...
+    /pytest-of-runner/pytest-0/<test name>0/tmux/tmux-501/<session>`` and every
+    ``new-session`` failed with "File name too long". Linux survived the same
+    layout purely because ``/tmp/pytest-of-runner/...`` is shorter, and Windows
+    because psmux uses named pipes. So the socket dir is a short
+    ``/tmp/mgf-XXXXXXXX`` and the session names are short too (the socket FILE
+    name counts toward the same budget); everything that does not go in a
+    ``sun_path`` -- logs, config, launcher shims -- stays under ``tmp_path``.
     """
     if sys.platform == "win32":
         from magent import psmux
@@ -115,7 +135,7 @@ def _resolve_multiplexer(tmp_path: Path) -> tuple[str, dict[str, str]]:
         binary = psmux.find_psmux()
         if not binary:
             _missing_multiplexer("psmux")
-        return str(binary), {}
+        return str(binary), {}, None
 
     tmux = shutil.which("tmux")
     if not tmux:
@@ -124,12 +144,19 @@ def _resolve_multiplexer(tmp_path: Path) -> tuple[str, dict[str, str]]:
     bindir.mkdir()
     link = bindir / "psmux"
     os.symlink(str(tmux), link)
-    tmux_tmp = tmp_path / "tmux"
-    tmux_tmp.mkdir(mode=0o700)  # a tmux requirement, not a preference
-    return str(link), {
-        "TMUX_TMPDIR": str(tmux_tmp),
-        "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", ""),
-    }
+    # mkdtemp is already 0700, which tmux REQUIRES of its socket dir. `/tmp` is
+    # the shortest directory both POSIX runners have (and on macOS it resolves
+    # to the equally short `/private/tmp`).
+    root = "/tmp" if Path("/tmp").is_dir() else None
+    tmux_tmp = tempfile.mkdtemp(prefix="mgf-", dir=root)
+    return (
+        str(link),
+        {
+            "TMUX_TMPDIR": tmux_tmp,
+            "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", ""),
+        },
+        tmux_tmp,
+    )
 
 
 def _pane_command(script: Path) -> str:
@@ -221,14 +248,18 @@ class _Fleet:
 
     def __init__(self, tmp_path: Path, budget: Budget) -> None:
         self.budget = budget
-        self.binary, extra_env = _resolve_multiplexer(tmp_path)
+        self.binary, extra_env, self.socket_dir = _resolve_multiplexer(tmp_path)
         # UNIQUE per run, and that is a safety property rather than tidiness:
         # this repo's dev box carries dozens of live psmux sessions, and a name
         # collision would make `kill-server` in teardown stop a real agent.
-        stem = f"mgfleet-{os.getpid()}-{uuid.uuid4().hex[:6]}"
-        self.alpha = f"{stem}-alpha"
-        self.beta = f"{stem}-beta"
-        self.dead = f"{stem}-dead"
+        # SHORT, because on POSIX the name is also the socket's file name and
+        # counts toward the sun_path budget -- see _resolve_multiplexer. Still
+        # an obviously non-production shape, and `psmux.session_name()` maps it
+        # to itself (it only rewrites "." ":" and " ").
+        stem = f"mgf-{uuid.uuid4().hex[:8]}"
+        self.alpha = f"{stem}-a"
+        self.beta = f"{stem}-b"
+        self.dead = f"{stem}-d"
         self.work = tmp_path / "work"
         self.work.mkdir()
         self.logs: dict[str, Path] = {}
@@ -452,6 +483,10 @@ class _Fleet:
         for name in self.created:
             if not _wait_until(lambda n=name: not self._live(n), 10.0):
                 leftovers.append(f"session {name} survived kill-server")
+        # Only AFTER the re-probe: the probe needs the socket the dir holds.
+        # Not under tmp_path, so pytest's own cleanup never sees it.
+        if self.socket_dir:
+            shutil.rmtree(self.socket_dir, ignore_errors=True)
         return leftovers
 
 
