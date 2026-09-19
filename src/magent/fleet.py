@@ -34,7 +34,9 @@ from magent import psmux
 # this source file stays pure ASCII; we only ever READ it (the ASCII-only rule
 # is about status bars magent renders, not about the agent's own UI we parse).
 _MIDDOT = "\u00b7"
-# The selection caret Claude Code draws beside a numbered menu option, U+276F.
+# U+276F, which Claude Code draws in two places: beside a numbered menu option
+# (a dialog -- see ``_DIALOG_RE``) and at the head of the INPUT line (see
+# ``input_line``). Spelled as an escape for the same reason as ``_MIDDOT``.
 _CARET = "\u276f"
 
 EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max", "auto")
@@ -79,6 +81,9 @@ _MODEL_DISPLAY: dict[str, str] = {
 _LITERAL_SEND_TIMEOUT_S = 30.0
 _ENTER_SETTLE_S = 0.3
 _SWITCH_SETTLE_S = 2.5
+# How long a just-pasted command gets to take visible effect before an "idle"
+# reading is believed. See ``wait_for_idle``'s ``settle``.
+COMMAND_SETTLE_S = 2.0
 # Below this many characters a prompt is too short to reliably tell "still
 # sitting unsent in the input line" from "echoed in the agent's reply", so
 # send-verification passes rather than risk a false "not confirmed".
@@ -185,19 +190,44 @@ def paste_and_enter(
     return psmux.send_keys(name, "Enter", target=name, psmux=psmux_bin)
 
 
+def input_line(pane: str) -> str | None:
+    """The pane's INPUT line: the last line whose text starts with the caret.
+
+    Claude Code's input line is not the bottom of the pane -- below it sit a
+    rule, the model/effort footer, and a permissions/hints row. ``None`` means
+    no caret line was found at all, which is the only case where the pane's
+    last line is the best available guess.
+    """
+    for line in reversed((pane or "").rstrip().splitlines()):
+        if line.strip().startswith(_CARET):
+            return line
+    return None
+
+
 def looks_unsent(pane: str, text: str) -> bool:
     """True if the prompt appears to be STILL sitting in the input line.
 
     Heuristic used to confirm the Enter actually submitted: if the head of the
-    (whitespace-collapsed) prompt is still on the pane's last line, it was not
-    sent. Very short prompts are unverifiable and always report "sent".
+    (whitespace-collapsed) prompt is still on the INPUT line, it was not sent.
+    Very short prompts are unverifiable and always report "sent".
+
+    The input line is found by its caret, NOT taken as the pane's last line,
+    and that distinction is the whole check. Captured from a real Claude Code
+    pane, the bottom four rows are a rule, the caret line, a rule, the footer
+    and the hints row -- so an unsent prompt sits FOUR lines above the bottom
+    and a last-line test could never see it. Measured that way: exit code 4
+    ("send not confirmed") was unreachable in practice against the real agent.
+    Panes with no caret at all (a bare shell, an agent mid-boot) keep the
+    last-line behaviour, which is the only signal there is.
     """
     flat = re.sub(r"\s+", " ", text.strip())
     head = flat[:25]
     if len(head) < _VERIFY_MIN_CHARS:
         return False
-    last = (pane.rstrip().splitlines() or [""])[-1]
-    return head in last
+    line = input_line(pane)
+    if line is None:
+        line = ((pane or "").rstrip().splitlines() or [""])[-1]
+    return head in line
 
 
 def wait_for_idle(
@@ -206,13 +236,27 @@ def wait_for_idle(
     psmux_bin: str | None = None,
     deadline: float,
     poll: float = 2.0,
+    settle: float = 0.0,
 ) -> bool:
     """Poll until ``name``'s pane classifies as idle, or ``deadline`` passes.
 
     ``deadline`` is an absolute ``time.monotonic()`` value. Returns True the
     moment the session is idle; on timeout it takes one final reading so a
     session that just went idle is not reported busy by a stale poll.
+
+    ``settle`` postpones the FIRST reading, and exists because "idle" is
+    ambiguous right after a command was pasted: the agent has not reacted yet,
+    so the pane still looks exactly like an idle one. Callers that just SENT
+    the thing they are now waiting out (``send --compact``) must not believe
+    that reading -- caught against a real multiplexer, where ``/compact``'s
+    idle answer came back instantly, the follow-up prompt was pasted into a
+    session that was about to start compacting, and it sat echoed-but-unsent in
+    the input line until the turn ended: a false exit 4 on a prompt that was in
+    fact queued. Callers that are only ASKING (``--wait-idle``) leave it at 0,
+    where an immediate idle answer is both correct and the point.
     """
+    if settle > 0:
+        time.sleep(settle)
     while time.monotonic() < deadline:
         if classify_state(psmux.capture_pane(name, psmux=psmux_bin)) == "idle":
             return True

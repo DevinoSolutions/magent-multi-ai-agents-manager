@@ -79,6 +79,34 @@ def _resolve_or_exit(session: str, live: list[str]) -> str:
     sys.exit(_EXIT_NOT_FOUND)
 
 
+def _stdout_safe(text: str) -> str:
+    """``text`` reduced to what THIS process's stdout can actually encode.
+
+    A pane is the AGENT's screen, not magent's, so it carries whatever glyphs
+    the agent paints: Claude Code's input caret (U+276F), the footer's middle
+    dot (U+00B7), box-drawing rules. magent's own output obeys an ASCII-only
+    rule (see ``psmux``'s status-bar comments); text captured from someone
+    else's UI cannot.
+
+    On Windows a REDIRECTED stdout is the legacy code page -- measured cp1252 on
+    a stock box -- and echoing a real Claude Code pane through it died with
+    ``UnicodeEncodeError`` and exit 1. So ``magent peek proj`` worked in a
+    console and CRASHED as ``magent peek proj > tail.txt`` or ``| findstr``.
+    Unencodable characters become ``?``: ``peek`` is a lossy glance by
+    definition, and losing a glyph is strictly better than losing the command.
+    The symmetric move to ``psmux.capture_pane``'s ``errors="replace"`` decode.
+    """
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        return text.encode(encoding, errors="replace").decode(
+            encoding, errors="replace"
+        )
+    except LookupError:
+        # An stdout naming a codec this interpreter does not have. Nothing can
+        # be transcoded, and refusing to print would be the worse answer.
+        return text
+
+
 def _footer(state: dict[str, object]) -> str:
     """Render a parsed ``{model, effort}`` as ASCII ``model / effort``."""
     model = state.get("model") or "?"
@@ -145,7 +173,13 @@ def send_cmd(
             click.echo(f"  {style('x', fg='red')} /compact send failed.", err=True)
             sys.exit(_EXIT_PSMUX_ERROR)
         idle = fleet.wait_for_idle(
-            name, psmux_bin=psmux_bin, deadline=time.monotonic() + timeout
+            name,
+            psmux_bin=psmux_bin,
+            deadline=time.monotonic() + timeout,
+            # The /compact was pasted a moment ago and has not taken effect yet,
+            # so the pane is still idle -- believing that reading pastes the
+            # prompt into a session about to start compacting. See ``settle``.
+            settle=fleet.COMMAND_SETTLE_S,
         )
         click.echo(f"  /compact sent to {style(name, bold=True)}; idle={idle}")
         if not body.strip():
@@ -326,4 +360,4 @@ def peek_cmd(ctx: click.Context, session: str, lines: int) -> None:
     name = _resolve_or_exit(session, _live_names(ctx.obj.get("config_path"), psmux_bin))
     pane = psmux.capture_pane(name, psmux=psmux_bin)
     tail = "\n".join(pane.rstrip().splitlines()[-max(1, lines) :])
-    click.echo(tail)
+    click.echo(_stdout_safe(tail))

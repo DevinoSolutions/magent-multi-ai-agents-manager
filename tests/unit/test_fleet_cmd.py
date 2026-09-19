@@ -17,6 +17,9 @@ from magent import cli
 from tests.unit._fake_psmux import make_fake_psmux
 
 MID = "·"
+# U+276F, the caret Claude Code draws at the head of its input line. Spelled
+# via chr() so this source file stays pure ASCII (ruff RUF001 flags the glyph).
+CARET = chr(0x276F)
 
 
 @pytest.fixture(autouse=True)
@@ -273,6 +276,13 @@ class TestModel:
         assert result.exit_code == 2  # usage error
 
 
+class _Stdout:
+    """A stand-in for ``sys.stdout`` that only has to answer "what encoding?"."""
+
+    def __init__(self, encoding: str) -> None:
+        self.encoding = encoding
+
+
 class TestPeek:
     def test_prints_the_tail(self, runner, tmp_config, tmp_path, monkeypatch):
         fake = make_fake_psmux(
@@ -297,6 +307,30 @@ class TestPeek:
         result = runner.invoke(cli.main, ["--config", cfg, "peek", "ghost"])
 
         assert result.exit_code == 2
+
+    def test_a_legacy_code_page_stdout_loses_glyphs_not_the_command(self, monkeypatch):
+        # The pane is the AGENT's UI and carries its glyphs; a redirected
+        # Windows stdout is cp1252. This used to raise UnicodeEncodeError out of
+        # click.echo and exit 1 -- `magent peek proj > tail.txt` crashed while
+        # the same command in a console worked.
+        from magent.cli import fleet_cmd
+
+        monkeypatch.setattr(fleet_cmd.sys, "stdout", _Stdout("cp1252"))
+        out = fleet_cmd._stdout_safe(f"{CARET} prompt\n  Fable 5.1 {MID} high")
+
+        # cp1252 HAS the middle dot (0xB7) and not the caret, so only the
+        # genuinely unrepresentable glyph degrades.
+        assert f"Fable 5.1 {MID} high" in out
+        assert "? prompt" in out
+        assert out.encode("cp1252")  # the whole point: it can now be written
+
+    def test_a_utf8_stdout_keeps_every_glyph(self, monkeypatch):
+        from magent.cli import fleet_cmd
+
+        pane = f"{CARET} prompt {MID} here"
+        monkeypatch.setattr(fleet_cmd.sys, "stdout", _Stdout("utf-8"))
+
+        assert fleet_cmd._stdout_safe(pane) == pane
 
 
 class TestSessionsJson:
