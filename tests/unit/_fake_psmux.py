@@ -51,7 +51,12 @@ if "has-session" in args:
 if "capture-pane" in args:
     pane = BASE / "pane.txt"
     if pane.exists():
-        sys.stdout.write(pane.read_text(encoding="utf-8"))
+        # Write raw UTF-8 bytes: the parent (psmux.capture_pane) decodes with
+        # encoding="utf-8", but a bare sys.stdout.write() on Windows encodes to
+        # the console code page (cp1252), which mangles the U+00B7 footer
+        # separator and made the whole fleet-state parse fail on CI while
+        # passing locally under PYTHONIOENCODING=utf-8. Real psmux emits UTF-8.
+        sys.stdout.buffer.write(pane.read_text(encoding="utf-8").encode("utf-8"))
     sys.exit(0)
 
 sys.exit(0)
