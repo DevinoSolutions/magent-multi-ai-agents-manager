@@ -1989,6 +1989,29 @@ symlink — the soak drops a no-op `psmux` shim on the child PATH (exits 0 for
 body and written to disk by the product before inject, only the multiplexer
 behind the session id is faked.
 
+**Real-multiplexer fleet-control coverage (2026-09-19):** `magent send` / `model`
+/ `peek` / `sessions --json` were covered only through `tests/unit/_fake_psmux.py`
+— a real on-disk binary that RECORDS argv but is not a terminal — so the argv
+magent builds was pinned and the WIRE was not. `tests/e2e/test_fleet_real.py`
+(marker `e2e`, rides the existing `end-to-end` job on all three OSes) drives the
+real CLI against real detached sessions hosting `tests/e2e/_fleet_agent.py`, a
+stand-in that imitates Claude Code's on-screen contract (`❯` input line, `·`
+footer, hints row last) and logs every line it reads, so "arrived verbatim" is
+read off disk rather than scraped off a screen. *Honest gap (the same one the
+browser tier carries):* Linux and macOS have no `psmux` binary, so real `tmux` is
+symlinked in as `psmux` on a tmp PATH with a private `TMUX_TMPDIR`; the Windows
+leg runs REAL psmux 3.3.8 from the shared `.github/actions/install-psmux`, and a
+missing multiplexer FAILS on CI rather than skipping. It paid for itself
+immediately, finding three defects a fake terminal structurally could not: send
+verification read the pane's LAST line, which on a real Claude Code pane is the
+hints row four rows below the input line (so exit 4 was unreachable — the tier
+is RED without the fix and reports `OK sent` for a prompt visibly sitting
+unsent); `send --compact`'s idle wait believed a reading taken before `/compact`
+could take effect, pasting the prompt into a session about to go busy and then
+reporting a false exit 4 on it; and `magent peek` died with `UnicodeEncodeError`
+whenever stdout was redirected on Windows, because a pane carries the AGENT's
+glyphs and a redirected stdout is cp1252.
+
 **Ten findings carried open into the next audit cycle** (deliberately
 triaged out of the fix pass that produced this document, not overlooked):
 

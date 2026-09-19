@@ -316,8 +316,11 @@ case-insensitively and refuse a name that is not live.
 > The slash-commands `send`/`model` issue (`/compact`, `/model`, `/effort`) are
 > built inside magent and handed to psmux as a list argument, never through a
 > shell — so Git Bash / MSYS can't rewrite a leading `/model` into a Windows
-> path. If you script these from Git Bash yourself, quote slash-leading
-> arguments the same way.
+> path. Typing one yourself as a prompt is different: in Git Bash, `magent send
+> caramel "/compact"` reaches magent as `C:/Program Files/Git/compact`, because
+> the MSYS runtime rewrites the argument before magent starts and quoting does
+> not stop it. Use the `--compact` flag, or set `MSYS_NO_PATHCONV=1` for that
+> command.
 
 ### Typing through psmux
 
