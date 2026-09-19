@@ -267,6 +267,10 @@ Or skip the menu with flags:
 | `magent doctor [--json]` | Diagnose the environment: config, env vars, agent tools on PATH, terminal, a wedged psmux control plane (see below), monitors, writable dirs, Tailscale, upload port. Exit 1 on any failure. |
 | `magent sessions` | List active psmux sessions, pick one to attach. |
 | `magent sessions <name>` | Attach directly to a psmux session by name. |
+| `magent sessions --json` | Print every configured session as JSON — name, cwd, a live flag, and (for live ones) the model, effort, and state read from the pane. Non-interactive; attaches nothing. |
+| `magent send <session> "<text>" [--file f] [--wait-idle] [--compact] [--timeout s]` | Type a prompt into one running agent by name and submit it. Resolves the name case-insensitively (exact, then unique substring/prefix); refuses if it is not live. Exit codes: 0 sent, 2 not found, 3 psmux error, 4 not confirmed. See [below](#driving-a-session-from-another-shell). |
+| `magent model <session\|--all> <model> [--effort low\|medium\|high\|xhigh\|max]` | Switch a session's model (and optionally effort) while it is idle, retrying busy sessions until `--max-minutes`; prints a per-session before/after table. |
+| `magent peek <session> [-n <lines>]` | Print the last N pane lines of a session — a read-only glance. |
 | `magent up [--json] [-g <group>] [--revive]` | Host side: ensure a persistent psmux session per project, and re-launch the agent in any live session whose pane fell back to a bare shell (e.g. after a Ctrl-C). Reviving is automatic except under `--json`, which stays a pure read unless `--revive` is passed. |
 | `magent attach <host> [--no-reconnect]` | From another PC: bring host sessions up over SSH, tile locally, Alt+V uploads, F2 opens the project in VS Code over Remote-SSH. Panes reconnect themselves after a dropped connection (see below); `--no-reconnect` opts out. |
 | `magent watch` | Live table of every agent session, most-urgent first; press a row number to focus that window. |
@@ -281,6 +285,39 @@ Or skip the menu with flags:
 | `magent terminal install` | Bind Ctrl+Backspace and Shift+Enter in Windows Terminal so they still work inside a psmux pane (`magent terminal status` to inspect) — see [Typing through psmux](#typing-through-psmux). |
 | `magent config <subcommand>` | Edit config from the CLI — 17 subcommands incl. `migrate`; see `magent config --help`. |
 | `magent config edit [host]` | Edit the config on **another** machine in your editor over SSH — fetch, edit, validate, push back. Omit the host to reuse your last `attach` target. The host side is `magent config cat` / `magent config put`, which you never run by hand. |
+
+### Driving a session from another shell
+
+`magent send`, `magent model`, and `magent peek` turn the fleet into something
+you can script — an API-ish way to talk to a specific agent, or all of them,
+without switching windows. They build on the same psmux plumbing everything
+else here uses.
+
+```bash
+magent send caramel "Continue the release; be token-efficient."
+magent send caramel --file prompts/caramel.txt        # long prompt from a file
+magent send caramel --compact "New task..."           # /compact first, wait, then send
+magent send caramel --wait-idle "Next step"            # hold until the agent is free
+magent peek caramel -n 60                              # look without touching
+magent model caramel opus --effort high                # switch one session
+magent model --all fable --effort high                 # put the whole fleet on one model
+magent sessions --json                                 # machine-readable fleet state
+```
+
+`send` pastes the text **literally** (`send-keys -l`) and then presses Enter as
+a separate key, so the whole prompt lands on one input line and submits once.
+It confirms the prompt actually left the input line before reporting success,
+and its exit codes (0/2/3/4) make it safe to drive from a script. `model` only
+switches a session while it is **idle** — never mid-turn — and re-reads the
+`<Model> · <effort>` footer to verify the change took, retrying anything busy
+until `--max-minutes` runs out. All three resolve a session name
+case-insensitively and refuse a name that is not live.
+
+> The slash-commands `send`/`model` issue (`/compact`, `/model`, `/effort`) are
+> built inside magent and handed to psmux as a list argument, never through a
+> shell — so Git Bash / MSYS can't rewrite a leading `/model` into a Windows
+> path. If you script these from Git Bash yourself, quote slash-leading
+> arguments the same way.
 
 ### Typing through psmux
 

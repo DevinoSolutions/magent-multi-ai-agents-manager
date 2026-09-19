@@ -560,6 +560,7 @@ def send_keys(
     name: str,
     *keys: str,
     target: str | None = None,
+    literal: bool = False,
     psmux: str | None = None,
     timeout: float = SEND_KEYS_TIMEOUT_S,
 ) -> bool:
@@ -569,6 +570,13 @@ def send_keys(
     that will not launch, or a socket that answers nothing all come back as
     ``False`` with a WARNING in launch.log, never as an exception on a caller
     fanning this out (or, worse, as an unbounded wait on a request handler).
+
+    ``literal=True`` adds ``-l``, so ``keys`` are pasted as verbatim text and
+    key names like ``Enter`` are NOT looked up. This is how ``magent send``
+    types a prompt into an agent's input line -- and why a prompt that begins
+    with ``/model`` reaches the agent as the literal slash-command it is: the
+    argv is a list handed straight to psmux, never a shell, so no MSYS/Git-Bash
+    path rewrite can turn ``/model`` into ``C:/Program Files/Git/model``.
     """
     binary = psmux or find_psmux()
     if not binary:
@@ -576,6 +584,8 @@ def send_keys(
     cmd: list[str] = [binary, "-L", name, "send-keys"]
     if target:
         cmd += ["-t", target]
+    if literal:
+        cmd.append("-l")
     cmd.append("--")
     cmd.extend(keys)
     started = time.monotonic()
