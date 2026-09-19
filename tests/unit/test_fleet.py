@@ -14,7 +14,28 @@ from magent import fleet, psmux
 from tests.unit._fake_psmux import make_fake_psmux
 
 MID = "\u00b7"  # the footer separator Claude Code paints
-CARET = "\u276f"  # the menu selection caret
+CARET = "\u276f"  # the menu selection caret AND the input-line caret
+RULE = "\u2500" * 62
+
+
+def real_pane(typed: str = "", *, effort: str = "high") -> str:
+    """The bottom of a REAL Claude Code pane, captured read-only from a live
+    session: rule, the caret INPUT line, rule, footer, hints row. The hints row
+    being last is exactly why ``looks_unsent`` cannot read the last line."""
+    return "\n".join(
+        [
+            "  I'll start by reading the repo's key files.",
+            "",
+            RULE,
+            f"{CARET} {typed}".rstrip(),
+            RULE,
+            f"  Fable 5.1 {MID} {effort} {MID} 221K/550K {MID} ai-agent-notify",
+            (
+                f"  \u23f5\u23f5 bypass permissions on (shift+tab to cycle) {MID} "
+                "\u2190 for agents"
+            ),
+        ]
+    )
 
 
 class TestParseFooter:
@@ -114,6 +135,35 @@ class TestLooksUnsent:
     def test_very_short_prompt_is_unverifiable(self):
         # Too short to tell "unsent" from "echoed"; never a false failure.
         assert fleet.looks_unsent("> hi", "hi") is False
+
+
+class TestLooksUnsentOnARealClaudeCodePane:
+    """The geometry that made exit 4 unreachable: on a real pane the input line
+    sits FOUR rows above the bottom, under a rule/footer/hints stack."""
+
+    PROMPT = "this text stays unsent 4242"
+
+    def test_prompt_on_the_caret_line_is_unsent(self):
+        assert fleet.looks_unsent(real_pane(self.PROMPT), self.PROMPT) is True
+
+    def test_empty_caret_line_is_sent(self):
+        assert fleet.looks_unsent(real_pane(), self.PROMPT) is False
+
+    def test_the_caret_line_is_found_not_the_last_line(self):
+        pane = real_pane(self.PROMPT)
+        assert fleet.input_line(pane) == f"{CARET} {self.PROMPT}"
+        assert "for agents" in pane.splitlines()[-1]
+
+    def test_a_pane_with_no_caret_falls_back_to_the_last_line(self):
+        # A bare shell or an agent mid-boot has no input line to find, and the
+        # last line is then the only signal there is.
+        assert fleet.input_line("PS C:\\p> claude\nstarting...") is None
+        assert fleet.looks_unsent(f"PS C:\\p> {self.PROMPT}", self.PROMPT) is True
+
+    def test_flattened_prompt_matches_the_single_echoed_line(self):
+        # magent flattens newlines before pasting, so the pane shows one line.
+        multi = "this text stays\n   unsent 4242"
+        assert fleet.looks_unsent(real_pane(fleet.flatten(multi)), multi) is True
 
 
 class TestVerifySwitch:

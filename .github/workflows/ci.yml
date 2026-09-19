@@ -93,28 +93,12 @@ jobs:
           MDTEST_WT_COLD: "1"
         run: pytest tests/platform/test_wt_cold_start.py -v -m wt_cold
       # Pinned psmux so the real psmux tier (lifecycle + full attach chain)
-      # actually runs instead of skipping on the binary check. Release zip
-      # pinned by version + sha256 (gitleaks pattern) rather than choco: the
-      # community feed 504s often enough to fail unrelated runs. Installed to
+      # actually runs instead of skipping on the binary check. Installed to
       # %LOCALAPPDATA%\psmux (the product's own find_psmux() fallback dir) and
-      # added to PATH like a normal user install.
+      # added to PATH like a normal user install. The version + sha256 pin lives
+      # in the action, which the end-to-end Windows leg shares.
       - name: Install psmux (pinned)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $url = "https://github.com/psmux/psmux/releases/download/v3.3.8/psmux-v3.3.8-windows-x64.zip"
-          $sha = "1ad127ba937194a890b933a73d9b023e297bd73dc742abd841bf159984c2effe"
-          Invoke-WebRequest -Uri $url -OutFile psmux.zip
-          $actual = (Get-FileHash psmux.zip -Algorithm SHA256).Hash.ToLower()
-          if ($actual -ne $sha) { throw "psmux.zip sha256 mismatch: $actual" }
-          $dest = Join-Path $env:LOCALAPPDATA "psmux"
-          Expand-Archive psmux.zip -DestinationPath $dest -Force
-          Add-Content $env:GITHUB_PATH $dest
-          # The zip ships the SAME binary under three names (psmux.exe,
-          # pmux.exe, tmux.exe) plus LICENSE/README. psmux.exe is the one
-          # find_psmux() looks for and the one psmux.PSMUX_IMAGE_NAMES sweeps,
-          # so that is the one whose presence and version must be proven here.
-          & (Join-Path $dest "psmux.exe") -V
+        uses: ./.github/actions/install-psmux
       - run: pytest tests/platform/ -v -m platform
       # Real-input tier: global SendInput chord + machine clipboard. CI-only
       # by design (MDTEST_INTERACTION=1 is set nowhere else); a dev box run
@@ -144,6 +128,22 @@ jobs:
       # xterm hosts the Linux real-SSH remote-launch leg (test_ssh_real.py)
       - name: Install terminal emulators
         uses: ./.github/actions/install-terminals
+      # A REAL multiplexer for the fleet tier (tests/e2e/test_fleet_real.py):
+      # real psmux on Windows, real tmux shimmed in as psmux on POSIX. These
+      # steps are what make that tier's "missing multiplexer FAILS on CI" rule
+      # honest -- it must never be silently skippable here.
+      - name: Install psmux (pinned)
+        uses: ./.github/actions/install-psmux
+      - name: Ensure tmux (the POSIX psmux stand-in)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Ensure tmux (the POSIX psmux stand-in)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        # `brew install` on an already-present formula can exit non-zero, and
+        # the runner image may well ship tmux -- ask before installing.
+        run: brew list tmux || brew install tmux
       - name: Run e2e tests
         # needs_tailscale is excluded here exactly like needs_ssh: it runs only
         # in the dedicated `tailnet` job, which joins a live Tailscale node.
