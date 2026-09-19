@@ -24,13 +24,22 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 _RECORDER = """\
-import json, sys
+import json, os, sys, time
 from pathlib import Path
 
 BASE = Path(r"{base}")
 args = sys.argv[1:]
-with (BASE / "calls.jsonl").open("a", encoding="utf-8") as fh:
-    fh.write(json.dumps(args) + "\\n")
+
+# One file per invocation, never a shared append: liveness probing fans out
+# several psmux processes at once, and concurrent appends to one log tore a
+# line on CI (a half-written record that then failed json.loads). A unique
+# name (monotonic ns + pid) is written by exactly one process, so it can never
+# be torn; the reader orders by the ns prefix.
+calldir = BASE / "calls"
+calldir.mkdir(parents=True, exist_ok=True)
+(calldir / (str(time.time_ns()) + "-" + str(os.getpid()) + ".json")).write_text(
+    json.dumps(args), encoding="utf-8"
+)
 
 
 def _target():
@@ -81,10 +90,11 @@ class FakePsmux:
             live.write_text("\n".join(names), encoding="utf-8")
 
     def calls(self) -> list[list[str]]:
-        f = self.base / "calls.jsonl"
-        if not f.exists():
+        d = self.base / "calls"
+        if not d.exists():
             return []
-        return [json.loads(line) for line in f.read_text(encoding="utf-8").splitlines()]
+        files = sorted(d.glob("*.json"), key=lambda p: int(p.name.split("-")[0]))
+        return [json.loads(p.read_text(encoding="utf-8")) for p in files]
 
     def send_key_calls(self) -> list[list[str]]:
         return [c for c in self.calls() if "send-keys" in c]
