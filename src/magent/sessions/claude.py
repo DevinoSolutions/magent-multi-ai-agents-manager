@@ -37,22 +37,53 @@ _CONTINUE_RE = re.compile(r"(?:(?<=\s)|\A)--continue(?=\s|\Z)\s*")
 _EXPLICIT_RESUME_RE = re.compile(r"(?:(?<=\s)|\A)(?:--resume|-r)(?=[\s=]|\Z)")
 
 
-def has_claude_session(project_dir: str, home_override: Path | None = None) -> bool:
-    """True when ``project_dir`` has at least one stored claude conversation.
+def default_config_dir() -> Path:
+    """Claude Code's own config directory, ``~/.claude`` -- the store that
+    answers for a project no account was chosen for.
+
+    Resolved at CALL time and deliberately not a module constant: an
+    import-bound ``Path.home()`` is computed once, before any environment
+    redirect can reach it, which is precisely the defect class
+    ``tests/conftest.py``'s ``_IMPORT_BOUND_PATHS`` tripwire exists to catch.
+    """
+    return Path.home() / ".claude"
+
+
+def _projects_dir(config_dir: Path | None, project_dir: str) -> Path:
+    """Where this store keeps ``project_dir``'s conversations.
+
+    ``config_dir`` is a claude CONFIG directory -- the value of
+    ``CLAUDE_CONFIG_DIR`` -- not a home directory: claude keeps its transcripts
+    in ``<config dir>/projects/<encoded cwd>``, and under an account profile
+    that config dir is the profile, not ``~``. None means the default store, so
+    every caller that names no account reads exactly the path it always did.
+    """
+    root = config_dir if config_dir is not None else default_config_dir()
+    return root / "projects" / encode_claude_project_path(project_dir)
+
+
+def has_claude_session(project_dir: str, config_dir: Path | None = None) -> bool:
+    """True when ``project_dir`` has at least one stored claude conversation
+    IN ``config_dir``'s store (the default ``~/.claude`` one when None).
 
     Existence only -- first hit wins, no stat and no sort. This runs once per
     project on every status/attach sweep, so it must stay a directory peek
     rather than the full mtime-ordered listing ``get_claude_session_ids``
     builds. ``Path.glob`` over a directory that does not exist yields nothing
     instead of raising, which is exactly the "no sessions here" answer.
+
+    Which store answers is a real question, not a test seam: a pane launched
+    under ``CLAUDE_CONFIG_DIR=<profile>`` writes its transcripts there, so a
+    probe that always read ``~/.claude`` would answer for a store that pane
+    never touches -- dropping ``--continue`` from a project that does have a
+    conversation, or keeping it for one that does not.
     """
-    home = home_override or Path.home()
-    sess_dir = home / ".claude" / "projects" / encode_claude_project_path(project_dir)
+    sess_dir = _projects_dir(config_dir, project_dir)
     return next(sess_dir.glob("*.jsonl"), None) is not None
 
 
 def claude_fresh_command(
-    base_cmd: str, project_dir: str, home_override: Path | None = None
+    base_cmd: str, project_dir: str, config_dir: Path | None = None
 ) -> str | None:
     """``base_cmd`` minus its implicit-resume flag when ``project_dir`` has no
     conversation to resume -- or None to run ``base_cmd`` exactly as configured.
@@ -67,14 +98,19 @@ def claude_fresh_command(
     was an agent in that folder.
 
     The probe answers exactly one question -- does this directory have a stored
-    conversation at all -- and only a NO rewrites anything. A session file that
-    exists but is empty or corrupt counts as YES and keeps ``--continue``: that
-    failure is a real defect the user needs to SEE in the pane, not something
-    to paper over with a silently fresh chat.
+    conversation at all, in ``config_dir``'s store -- and only a NO rewrites
+    anything. A session file that exists but is empty or corrupt counts as YES
+    and keeps ``--continue``: that failure is a real defect the user needs to
+    SEE in the pane, not something to paper over with a silently fresh chat.
+
+    A project whose account changed has no transcript in the NEW store, so this
+    answers NO and the agent starts fresh rather than dying on "No conversation
+    found to continue" at a dead shell. That is the honest answer for that
+    store; surfacing it to the user is the caller's job.
     """
     if _EXPLICIT_RESUME_RE.search(base_cmd) or not _CONTINUE_RE.search(base_cmd):
         return None
-    if has_claude_session(project_dir, home_override):
+    if has_claude_session(project_dir, config_dir):
         return None
     return _CONTINUE_RE.sub("", base_cmd).strip()
 
@@ -82,11 +118,11 @@ def claude_fresh_command(
 def get_claude_session_ids(
     project_dir: str,
     count: int,
-    home_override: Path | None = None,
+    config_dir: Path | None = None,
 ) -> list[str | None]:
-    encoded = encode_claude_project_path(project_dir)
-    home = home_override or Path.home()
-    sess_dir = home / ".claude" / "projects" / encoded
+    """``project_dir``'s stored conversation ids, newest first, out of
+    ``config_dir``'s store (the default ``~/.claude`` one when None)."""
+    sess_dir = _projects_dir(config_dir, project_dir)
 
     if not sess_dir.is_dir():
         return [None] * count
