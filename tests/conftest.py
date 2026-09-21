@@ -206,6 +206,29 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     log.reset_logging()
 
 
+@pytest.fixture(autouse=True)
+def _no_real_ccswap(monkeypatch):
+    """No test resolves the REAL ``ccswap`` binary. A test that installed no
+    fake sees "not installed", which is a shape every caller already handles.
+
+    In the same family as the three env opt-outs above, and for the sharpest
+    version of their reason: ccswap owns the user's account CREDENTIALS, the
+    installed build's ``list`` performs a credential-adoption pass that WRITES
+    to its store, and **no HOME redirect contains a binary on PATH**. Measured,
+    not theoretical: while `magent account` was being written, one test that
+    simply forgot the fake spawned the real ccswap three times (`list`,
+    ``config get``, ``--version``) -- it answered out of the redirected tmp home,
+    so nothing was damaged, and that was luck rather than design.
+
+    Patched on the MODULE attribute, so ``accounts.read_accounts`` and friends
+    see it while ``tests/unit/test_accounts.py``'s by-value import of
+    ``find_ccswap`` (the test that proves PATH resolution itself) still gets the
+    real resolver. A test that wants a fake monkeypatches the same attribute
+    afterwards and wins, as it does today.
+    """
+    monkeypatch.setattr("magent.accounts.find_ccswap", lambda: None)
+
+
 # --- The tripwire -------------------------------------------------------------
 # The redirect above is the fix; this is the alarm that keeps it fixed, because
 # the failure mode is silent BY CONSTRUCTION: a test that forgets the redirect

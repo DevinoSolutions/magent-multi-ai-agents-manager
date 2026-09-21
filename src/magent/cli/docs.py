@@ -419,6 +419,20 @@ def _generate_docs() -> str:
     )
     w("| `magent sessions` | List active psmux sessions, pick one to attach. |")
     w("| `magent sessions <name>` | Attach directly to a psmux session by name. |")
+    w(
+        "| `magent account` | Show every Claude account ccswap reports, its usage, "
+        "and which projects sit on it. |"
+    )
+    w(
+        "| `magent account plan` | Show which account each project WOULD get, and "
+        "why. Changes nothing. |"
+    )
+    w(
+        "| `magent account pin <project> <account>` | Always run that project on "
+        "that account (written to this config). |"
+    )
+    w("| `magent account unpin <project>` | Remove the pin. |")
+    w("| `magent account refresh` | Ask ccswap for fresher usage numbers. |")
     w("| `magent config show` | Display current config. |")
     w("| `magent config layout <cols> <rows>` | Set window grid. |")
     w("| `magent config base-dir <path>` | Set projects folder. |")
