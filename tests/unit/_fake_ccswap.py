@@ -27,7 +27,7 @@ _RECORDER = """\
 import json, os, sys, time
 from pathlib import Path
 
-BASE = Path(r"{base}")
+BASE = Path(r"<<BASE>>")
 args = sys.argv[1:]
 
 calldir = BASE / "calls"
@@ -53,7 +53,29 @@ if mode == "timeout":
     time.sleep(120)
     sys.exit(0)
 
+if "--version" in args:
+    version = (BASE / "version.txt").read_text(encoding="utf-8").strip() if (BASE / "version.txt").exists() else "ccswap 0.31.0+pr308.2"
+    sys.stdout.buffer.write((version + "\\n").encode("utf-8"))
+    sys.exit(0)
+
+if args[:2] == ["config", "get"]:
+    key = args[2] if len(args) > 2 else ""
+    settings = json.loads((BASE / "settings.json").read_text(encoding="utf-8")) if (BASE / "settings.json").exists() else {}
+    if key not in settings:
+        sys.stderr.write("unknown setting\\n")
+        sys.exit(1)
+    value = settings[key]
+    # `config get` prints a strict boolean and nothing else.
+    sys.stdout.buffer.write((str(value).lower() + "\\n").encode("utf-8"))
+    sys.exit(0)
+
 if "refresh" in args:
+    body = {"schemaVersion": 1, "results": [
+        {"number": "13", "email": "<user>@example.test", "fetched": True,
+         "skippedReason": None, "usageFetchedAt": "2026-09-21T03:40:00Z",
+         "usageAgeSeconds": 0}
+    ]}
+    sys.stdout.buffer.write(json.dumps(body).encode("utf-8"))
     sys.exit(0)
 
 payload = (BASE / "payload.json").read_text(encoding="utf-8")
@@ -65,13 +87,23 @@ sys.exit(0)
 """
 
 
+# The ccswap build these shapes were taken from.
+FAKE_VERSION = "ccswap 0.31.0+pr308.2"
+
+# `ccswap config get` answers a strict boolean. Both PRODUCT defaults are the
+# value magent cannot route under (persistent profiles off, autoswitch on), so
+# the fake's default settings are deliberately the unhappy ones.
+DEFAULT_SETTINGS = {"profiles.persistent": False, "autoswitch.enabled": True}
+MAGENT_READY_SETTINGS = {"profiles.persistent": True, "autoswitch.enabled": False}
+
+
 def account(
     acct_id: str,
     *,
     label: str = "user@example.test",
     kind: str = "subscription",
     active: bool = False,
-    profile_dir: str | None = None,
+    profile_path: str | None = None,
     hydrated: bool = True,
     eligible: bool = True,
     ineligible_reason: str | None = None,
@@ -81,9 +113,16 @@ def account(
     five_hour_resets: str | None = "2026-09-21T09:30:00Z",
     seven_day_resets: str | None = "2026-09-27T09:30:00Z",
     overage_status: str = "rejected",
+    live_sessions: int = 0,
+    unreadable_records: int = 0,
+    identity_drifted: bool = False,
+    token_expires_at: str | None = "2026-09-21T11:00:00Z",
 ) -> dict:
-    """One `accounts[]` entry in the C-1 shape. Utilizations are 0-1 floats or
-    None, and None is emitted as JSON null -- never as 0."""
+    """One `accounts[]` entry in the shipped ccswap shape (0.31.0+pr308.2).
+
+    Utilizations are 0-1 floats or None, and None is emitted as JSON null --
+    never as 0. `ineligibleReason` is one of ccswap's closed codes or null.
+    """
     usage: dict[str, object] = {
         "fiveHour": {"utilization": five_hour, "resetsAt": five_hour_resets},
         "sevenDay": {"utilization": seven_day, "resetsAt": seven_day_resets},
@@ -98,8 +137,12 @@ def account(
         "provider": "claude",
         "kind": kind,
         "active": active,
-        "profileDir": profile_dir or f"/ccswap/sessions/{acct_id}-profile",
+        "profilePath": profile_path or f"/ccswap/sessions/{acct_id}-profile",
         "profileHydrated": hydrated,
+        "profileLiveSessions": live_sessions,
+        "profileUnreadableRecords": unreadable_records,
+        "profileIdentityDrifted": identity_drifted,
+        "profileTokenExpiresAt": token_expires_at,
         "eligible": eligible,
         "ineligibleReason": ineligible_reason,
         "usage": usage,
@@ -111,19 +154,27 @@ def payload(
     accounts: list[dict] | None = None,
     *,
     age_s: float | None = 660,
-    fetched_at: str = "2026-09-21T03:40:00Z",
-    settings: dict | None = None,
+    fetched_at: str | None = "2026-09-21T03:40:00Z",
+    serve_ttl_s: float | None = 300,
+    stale_ok_s: float | None = 900,
     duplicates: list[str] | None = None,
+    schema_version: int = 1,
 ) -> dict:
     """A whole `ccswap list --json --provider claude --profiles` body."""
-    body: dict[str, object] = {
-        "usageCache": {"fetchedAt": fetched_at, "ageS": age_s},
+    cache: dict[str, object] = {
+        "serveTtlSeconds": serve_ttl_s,
+        "staleOkSeconds": stale_ok_s,
+    }
+    if fetched_at is not None:
+        cache["fetchedAt"] = fetched_at
+    if age_s is not None:
+        cache["ageSeconds"] = age_s
+    return {
+        "schemaVersion": schema_version,
+        "usageCache": cache,
         "duplicateAccountWarnings": duplicates or [],
         "accounts": accounts if accounts is not None else [account("13")],
     }
-    if settings is not None:
-        body["settings"] = settings
-    return body
 
 
 @dataclass
@@ -144,6 +195,15 @@ class FakeCcswap:
         seam promises to survive."""
         (self.base / "mode.txt").write_text(mode, encoding="utf-8")
 
+    def set_settings(self, settings: dict) -> None:
+        """What `config get <key>` answers. A key absent from the dict exits
+        non-zero, which is how ccswap reports one it does not know."""
+        (self.base / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+
+    def set_version(self, version: str) -> None:
+        """The whole `--version` line, program name included."""
+        (self.base / "version.txt").write_text(version, encoding="utf-8")
+
     def calls(self) -> list[list[str]]:
         d = self.base / "calls"
         if not d.exists():
@@ -155,12 +215,16 @@ class FakeCcswap:
 def make_fake_ccswap(tmp_path: Path, *, body: dict | None = None) -> FakeCcswap:
     base = tmp_path / "fakeccswap"
     base.mkdir(parents=True, exist_ok=True)
+    # `replace`, not `format`: the recorder builds JSON literals, and every
+    # brace in them would have to be doubled for `str.format` -- a trap the
+    # next person to add a response shape would fall into.
     (base / "recorder.py").write_text(
-        _RECORDER.format(base=str(base)), encoding="utf-8"
+        _RECORDER.replace("<<BASE>>", str(base)), encoding="utf-8"
     )
     (base / "payload.json").write_text(
         json.dumps(body if body is not None else payload()), encoding="utf-8"
     )
+    (base / "version.txt").write_text(FAKE_VERSION, encoding="utf-8")
 
     if sys.platform == "win32":
         launcher = base / "ccswap.cmd"

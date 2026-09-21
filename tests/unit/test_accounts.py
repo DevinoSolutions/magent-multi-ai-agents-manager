@@ -15,14 +15,17 @@ from __future__ import annotations
 import json
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from magent import accounts
 from magent.accounts import (
     ACCOUNT_MAP_PATH,
+    INELIGIBLE_REASONS,
     MAP_SCHEMA,
+    MIN_CCSWAP_VERSION,
+    REFRESH_MIN_MAX_AGE_S,
     Account,
     AccountsSnapshot,
     MapEntry,
@@ -33,10 +36,21 @@ from magent.accounts import (
     profile_env,
     read_accounts,
     read_map,
+    read_settings,
+    read_version,
+    redact_email,
     refresh_usage,
+    version_at_least,
     write_map,
 )
-from tests.unit._fake_ccswap import account, make_fake_ccswap, payload
+from tests.unit._fake_ccswap import (
+    DEFAULT_SETTINGS,
+    FAKE_VERSION,
+    MAGENT_READY_SETTINGS,
+    account,
+    make_fake_ccswap,
+    payload,
+)
 
 # 2026-09-21T09:30:00+00:00 in epoch seconds, computed here rather than by the
 # code under test so the assertion is independent of it.
@@ -57,16 +71,20 @@ class TestReadingTheAccountList:
             [
                 account(
                     "13",
-                    label="user@example.test",
+                    label="somebody@example.test",
                     kind="subscription",
                     active=True,
-                    profile_dir="/ccswap/sessions/13-user",
+                    profile_path="/ccswap/sessions/13-user",
                     hydrated=True,
                     eligible=True,
                     five_hour=0.17,
                     seven_day=0.21,
                     fable=1.0,
                     overage_status="rejected",
+                    live_sessions=3,
+                    unreadable_records=1,
+                    identity_drifted=True,
+                    token_expires_at="2026-09-21T09:30:00Z",
                 )
             ]
         )
@@ -75,10 +93,9 @@ class TestReadingTheAccountList:
         assert snap.error is None
         (acct,) = snap.accounts
         assert acct.id == "13"
-        assert acct.label == "user@example.test"
         assert acct.kind == "subscription"
         assert acct.active is True
-        assert acct.profile_dir == "/ccswap/sessions/13-user"
+        assert acct.profile_dir == "/ccswap/sessions/13-user"  # from profilePath
         assert acct.hydrated is True
         assert acct.eligible is True
         assert acct.ineligible_reason is None
@@ -86,7 +103,71 @@ class TestReadingTheAccountList:
         assert acct.seven_day.utilization == pytest.approx(0.21)
         assert acct.scoped["fable"].utilization == pytest.approx(1.0)
         assert acct.overage_status == "rejected"
+        assert acct.live_sessions == 3
+        assert acct.unreadable_records == 1
+        assert acct.identity_drifted is True
+        assert acct.token_expires_at == pytest.approx(_UTC_2026_09_21_0930)
         assert snap.usage_age_s == pytest.approx(660.0)
+        assert snap.serve_ttl_s == pytest.approx(300.0)
+        assert snap.stale_ok_s == pytest.approx(900.0)
+        assert snap.schema_version == 1
+
+    def test_the_label_is_redacted_at_parse_time(self, ccswap):
+        """ccswap's label IS the account's email. Redacting at parse means the
+        raw address is never in memory for a print site to leak."""
+        ccswap.set_accounts([account("13", label="amin.dhouib@outlook.com")])
+        (acct,) = read_accounts().accounts
+        assert acct.label == "<user>@outlook.com"
+
+    def test_a_newer_list_schema_is_refused_rather_than_guessed_at(self, ccswap):
+        ccswap.set_accounts([account("13")], schema_version=2)
+        snap = read_accounts()
+        assert snap.accounts == ()
+        assert snap.schema_version == 2
+        assert "schema 2" in (snap.error or "")
+
+    def test_a_missing_schema_version_is_read_as_the_known_one(self, ccswap):
+        body = payload([account("13")])
+        del body["schemaVersion"]
+        ccswap.set_payload(body)
+        snap = read_accounts()
+        assert snap.error is None
+        assert snap.schema_version == 1
+
+    def test_the_usage_age_falls_back_to_the_fetch_stamp(self, ccswap):
+        # ccswap may report only when it fetched; the age is then this
+        # machine's business to compute, and it must never come back negative.
+        fetched = datetime.now(timezone.utc) - timedelta(seconds=120)
+        ccswap.set_accounts([account("13")], age_s=None, fetched_at=fetched.isoformat())
+        assert read_accounts().usage_age_s == pytest.approx(120.0, abs=30.0)
+
+    def test_no_freshness_at_all_is_unknown_not_zero(self, ccswap):
+        ccswap.set_accounts([account("13")], age_s=None, fetched_at=None)
+        assert read_accounts().usage_age_s is None
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "disabled",
+            "api_key",
+            "relogin_required",
+            "no_credentials",
+            "foreign_credential",
+            "keychain_unavailable",
+        ],
+    )
+    def test_every_ineligible_code_round_trips_and_translates(self, ccswap, code):
+        ccswap.set_accounts([account("22", eligible=False, ineligible_reason=code)])
+        (acct,) = read_accounts().accounts
+        assert acct.ineligible_reason == code  # carried verbatim
+        assert acct.ineligible_text == INELIGIBLE_REASONS[code]
+
+    def test_an_unknown_ineligible_code_is_shown_as_ccswap_sent_it(self, ccswap):
+        ccswap.set_accounts(
+            [account("22", eligible=False, ineligible_reason="mystery")]
+        )
+        (acct,) = read_accounts().accounts
+        assert acct.ineligible_text == "mystery"
 
     def test_reset_times_come_back_as_epoch_seconds(self, ccswap):
         ccswap.set_accounts(
@@ -165,32 +246,106 @@ class TestReadingTheAccountList:
 
 
 class TestTheRequiredCcswapSettings:
-    def test_a_setting_with_the_wrong_value_is_reported_with_its_fix(self, ccswap):
-        ccswap.set_accounts(
-            [account("13")],
-            settings={"autoswitch.enabled": True, "profiles.persistent": True},
-        )
-        problems = read_accounts().settings_problems
-        assert len(problems) == 1
-        assert "autoswitch.enabled" in problems[0]
-        assert "ccswap config set autoswitch.enabled false" in problems[0]
+    """`ccswap config get <key>` per required setting -- one reader, one
+    answer, so `magent account` and `doctor` cannot each derive their own."""
 
-    def test_correct_settings_report_nothing(self, ccswap):
-        ccswap.set_accounts(
-            [account("13")],
-            settings={
-                "profiles.persistent": True,
-                "autoswitch.enabled": False,
-                "autoswitch.warmupFiveHour": False,
-            },
-        )
-        assert read_accounts().settings_problems == ()
+    def test_settings_magent_can_route_under_report_nothing(self, ccswap):
+        ccswap.set_settings(MAGENT_READY_SETTINGS)
+        report = read_settings()
+        assert report.problems == ()
+        assert report.error is None
+        assert report.ok is True
+        assert report.values == {
+            "profiles.persistent": True,
+            "autoswitch.enabled": False,
+        }
 
-    def test_a_setting_ccswap_does_not_report_is_not_a_problem(self, ccswap):
-        """Absence is not a verdict: an older ccswap that predates the field
-        must not be reported as misconfigured."""
-        ccswap.set_accounts([account("13")])
-        assert read_accounts().settings_problems == ()
+    def test_the_product_defaults_are_both_problems_with_their_fixes(self, ccswap):
+        # Persistent profiles default OFF and autoswitch defaults ON: a fresh
+        # ccswap needs both flipped, by the user, never by magent.
+        ccswap.set_settings(DEFAULT_SETTINGS)
+        report = read_settings()
+        assert len(report.problems) == 2
+        assert report.ok is False
+        joined = "\n".join(report.problems)
+        assert "ccswap config set profiles.persistent true" in joined
+        assert "ccswap config set autoswitch.enabled false" in joined
+
+    def test_a_setting_that_cannot_be_read_is_an_error_not_a_pass(self, ccswap):
+        """ "Could not ask" must never be treated as "the answer was yes"."""
+        ccswap.set_settings({"profiles.persistent": True})  # autoswitch missing
+        report = read_settings()
+        assert report.values["autoswitch.enabled"] is None
+        assert "autoswitch.enabled" in (report.error or "")
+        assert report.ok is False
+
+    def test_a_non_boolean_answer_is_unknown_not_false(self, ccswap):
+        # A help banner or an error line must not read as "autoswitch is off".
+        ccswap.set_settings({"profiles.persistent": "yes", "autoswitch.enabled": False})
+        report = read_settings()
+        assert report.values["profiles.persistent"] is None
+        assert report.ok is False
+
+    def test_the_settings_reader_uses_config_get_and_never_config_set(self, ccswap):
+        ccswap.set_settings(MAGENT_READY_SETTINGS)
+        read_settings()
+        assert [c[:2] for c in ccswap.calls()] == [["config", "get"], ["config", "get"]]
+
+    def test_without_a_binary_it_is_an_error_not_a_verdict(self, monkeypatch):
+        monkeypatch.setattr("magent.accounts.find_ccswap", lambda: None)
+        report = read_settings()
+        assert report.ok is False
+        assert "not installed" in (report.error or "")
+
+
+class TestTheCcswapVersion:
+    def test_the_version_line_is_read_without_its_program_name(self, ccswap):
+        # The fake prints the whole line, "ccswap <version>", as ccswap does.
+        assert FAKE_VERSION.endswith(read_version() or "\0")
+        assert read_version() == MIN_CCSWAP_VERSION
+
+    def test_an_older_build_is_reported_as_too_old(self, ccswap):
+        ccswap.set_version("ccswap 0.30.0")
+        assert version_at_least(read_version()) is False
+
+    def test_the_shipped_build_satisfies_the_floor(self, ccswap):
+        assert version_at_least(read_version()) is True
+
+    @pytest.mark.parametrize(
+        ("version", "ok"),
+        [
+            ("0.31.0+pr308.2", True),
+            ("0.31.0", True),
+            ("0.31.1", True),
+            ("1.0.0", True),
+            ("0.30.9", False),
+            ("0.9.0", False),
+            ("", False),
+            (None, False),
+            ("not-a-version", False),
+        ],
+    )
+    def test_only_the_numeric_release_orders_the_comparison(self, version, ok):
+        assert version_at_least(version) is ok
+
+    def test_an_unreadable_version_is_none_not_a_crash(self, ccswap):
+        ccswap.set_mode("rc1")
+        assert read_version() is None
+
+
+class TestEmailRedaction:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("amin.dhouib@outlook.com", "<user>@outlook.com"),
+            ("a@b.co", "<user>@b.co"),
+            ("someone@", "<user>"),
+            ("not-an-email", "not-an-email"),
+            ("", ""),
+        ],
+    )
+    def test_the_local_part_never_survives(self, raw, expected):
+        assert redact_email(raw) == expected
 
 
 class TestEveryFailureModeDegrades:
@@ -246,21 +401,46 @@ class TestTheArgvMagentActuallyRuns:
         (call,) = ccswap.calls()
         assert call == ["list", "--json", "--provider", "claude", "--profiles"]
 
-    def test_refresh_passes_the_max_age_as_whole_seconds(self, ccswap):
+    def test_refresh_passes_the_max_age_as_whole_seconds_and_asks_for_json(
+        self, ccswap
+    ):
         assert refresh_usage(900.0) is True
         (call,) = ccswap.calls()
-        assert call == ["usage", "refresh", "--max-age", "900"]
+        assert call == ["usage", "refresh", "--max-age", "900", "--json"]
+
+    def test_the_max_age_is_clamped_to_ccswaps_own_floor(self, ccswap):
+        refresh_usage(5.0)
+        assert ccswap.calls()[0] == [
+            "usage",
+            "refresh",
+            "--max-age",
+            str(REFRESH_MIN_MAX_AGE_S),
+            "--json",
+        ]
 
     def test_refresh_without_a_binary_is_false_not_an_error(self, monkeypatch):
         monkeypatch.setattr("magent.accounts.find_ccswap", lambda: None)
         assert refresh_usage(900.0) is False
 
     def test_magent_never_runs_a_mutating_verb(self, ccswap):
+        """Every ccswap command magent runs is a read, and the list is closed.
+        `profile hydrate` exists and works -- magent still does not call it:
+        hydrating mutates somebody else's store, and a bring-up is the worst
+        possible moment to take that."""
+        ccswap.set_settings(MAGENT_READY_SETTINGS)
         read_accounts()
         refresh_usage(60.0)
-        verbs = {call[0] for call in ccswap.calls()}
-        assert verbs == {"list", "usage"}
-        assert not verbs & {"switch", "auto", "map", "add", "hydrate"}
+        read_settings()
+        read_version()
+        commands = [" ".join(call[:2]) for call in ccswap.calls()]
+        assert set(commands) == {
+            "list --json",
+            "usage refresh",
+            "config get",
+            "--version",
+        }
+        flat = {token for call in ccswap.calls() for token in call}
+        assert not flat & {"switch", "auto", "map", "add", "hydrate", "set", "run"}
 
     def test_the_binary_is_resolved_off_path_and_cached(self, tmp_path, monkeypatch):
         fake = make_fake_ccswap(tmp_path)

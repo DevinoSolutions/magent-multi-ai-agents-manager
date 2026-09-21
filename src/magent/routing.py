@@ -240,7 +240,8 @@ def _blocker(acct: Account, policy: Policy, klass: str, *, placing: bool) -> str
     if acct.kind and acct.kind != SUBSCRIPTION_KIND:
         return f"not a subscription account ({acct.kind})"
     if not acct.eligible:
-        return acct.ineligible_reason or "ccswap reports it as ineligible"
+        # ccswap's verdict, in its own words -- magent does not re-derive one.
+        return acct.ineligible_text or "ccswap reports it as ineligible"
     if not acct.hydrated:
         return "its profile holds no usable login"
     per = policy.account_policy(acct.id)

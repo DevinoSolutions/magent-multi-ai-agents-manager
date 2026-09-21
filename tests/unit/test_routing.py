@@ -288,7 +288,9 @@ class TestStickiness:
     @pytest.mark.parametrize(
         ("broken", "expected_in_warning"),
         [
-            (acct("13", eligible=False, reason="needs-login"), "needs-login"),
+            # ccswap's closed vocabulary, shown in magent's words.
+            (acct("13", eligible=False, reason="relogin_required"), "fresh login"),
+            (acct("13", eligible=False, reason="mystery"), "mystery"),
             (acct("13", hydrated=False), "no usable login"),
             (acct("13", kind="api-key"), "not a subscription"),
         ],
