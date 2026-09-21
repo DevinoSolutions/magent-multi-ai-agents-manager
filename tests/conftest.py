@@ -183,6 +183,15 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     # machine the suite runs on. Tests that are ABOUT the hand-off set the
     # policy explicitly.
     monkeypatch.setenv("MAGENT_SESSION0_POLICY", "allow")
+    # ...and a fourth, which is psmux_boost's reason at its sharpest. Account
+    # routing is the ONE thing in this product that shells out to a tool holding
+    # the user's real account CREDENTIALS -- `ccswap`, resolved off PATH -- and
+    # no HOME redirect contains a binary on PATH. Off for every tier. It is
+    # belt-and-braces over two other gates (settings.accounts.enabled is false
+    # by default, and every test fakes the `find_ccswap` seam), which is exactly
+    # the point: neither of those is something a test yet unwritten can be
+    # trusted to remember.
+    monkeypatch.setenv("MAGENT_ACCOUNT_ROUTING", "0")
     log.reset_logging()
     yield
     log.reset_logging()
