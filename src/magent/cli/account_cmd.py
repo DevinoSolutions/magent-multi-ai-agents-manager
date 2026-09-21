@@ -71,6 +71,29 @@ def _as_str(value: object, default: str = "") -> str:
     return value if isinstance(value, str) else default
 
 
+def routing_allowed() -> bool:
+    """``MAGENT_ACCOUNT_ROUTING`` -- the product-wide kill switch, honoured here.
+
+    Folded into the policy rather than checked at a launch site, because `plan`
+    promises to be a truthful dry run of what a bring-up would do: a preview
+    that ignored the kill switch would show routed rows for a fleet about to
+    launch unrouted, which is the one way this command could lie.
+
+    An environment magent cannot parse is NOT read as an opt-out -- the config
+    still decides, and `doctor`'s env check is the surface that names the broken
+    variable. Guessing "off" there would disable a working fleet's routing over
+    an unrelated typo.
+    """
+    from pydantic import ValidationError  # heavy subsystem: in-body per policy
+
+    from magent import env  # heavy subsystem: in-body per policy
+
+    try:
+        return env.get_env().account_routing
+    except ValidationError:
+        return True
+
+
 def policy_for(cfg: MagentConfig) -> routing_mod.Policy:
     """``settings.accounts`` as the planner's ``Policy``.
 
@@ -87,7 +110,7 @@ def policy_for(cfg: MagentConfig) -> routing_mod.Policy:
 
     block = cfg.settings.accounts
     return routing.Policy(
-        enabled=block.enabled,
+        enabled=block.enabled and routing_allowed(),
         soft_threshold=block.soft_threshold,
         hard_threshold=block.hard_threshold,
         on_limit=block.on_limit,
@@ -298,6 +321,21 @@ def _placement_counts(
     return counts
 
 
+def routing_off_reason() -> str:
+    """WHICH gate is holding routing off -- there are two, and they need
+    different actions. Naming the config key while an environment variable is
+    the real cause sends someone to edit a file that is already correct."""
+    if not routing_allowed():
+        return (
+            "account routing is OFF -- MAGENT_ACCOUNT_ROUTING=0 is set, which "
+            "overrides the config; unset it to route again"
+        )
+    return (
+        "account routing is OFF -- set settings.accounts.enabled to true to turn "
+        "it on (nothing routes until then)"
+    )
+
+
 def _note(text: str) -> None:
     click.echo(f"  {style('!', fg='yellow')} {text}")
 
@@ -308,10 +346,7 @@ def _print_notes(
     refusals: list[str],
 ) -> None:
     if not policy.enabled:
-        _note(
-            "account routing is OFF -- set settings.accounts.enabled to true to "
-            "turn it on (nothing routes until then)"
-        )
+        _note(routing_off_reason())
     if snapshot.usage_age_s is not None and snapshot.usage_age_s > policy.stale_after_s:
         _note(
             f"ccswap usage data is {snapshot.usage_age_s / 60:.0f}m old -- refresh "

@@ -60,6 +60,21 @@ def _cfg(
     return tmp_config(data)
 
 
+@pytest.fixture(autouse=True)
+def _routing_allowed(monkeypatch):
+    """This module is ABOUT routing, so it opts back in to the env gate
+    `tests/conftest.py` pins off for every tier -- exactly as the tests about
+    the upload supervisor set `MAGENT_UPLOAD_SUPERVISOR` back to 1. The CONFIG
+    gate still decides per test; only the kill switch is lifted.
+
+    `_cached_env` is cleared with it: `get_env()` memoises, and a test that
+    changed the variable after something already read it would otherwise assert
+    against the previous answer.
+    """
+    monkeypatch.setenv("MAGENT_ACCOUNT_ROUTING", "1")
+    monkeypatch.setattr("magent.env._cached_env", None)
+
+
 @pytest.fixture
 def ccswap(tmp_path, monkeypatch):
     """A ready-to-route fake ccswap: current version, magent-compatible
@@ -132,6 +147,26 @@ class TestTheAccountTable:
         assert result.exit_code == 0
         assert "account routing is OFF" in result.output
         assert "settings.accounts.enabled" in result.output
+
+    def test_the_env_kill_switch_overrides_an_enabled_config(
+        self, runner, tmp_config, tmp_path, ccswap, monkeypatch
+    ):
+        """`MAGENT_ACCOUNT_ROUTING=0` is the documented "put every pane back on
+        the default login" switch. A preview that ignored it would show routed
+        rows for a fleet about to launch unrouted -- and it names the VARIABLE,
+        not the config key, because editing the config would not help."""
+        monkeypatch.setenv("MAGENT_ACCOUNT_ROUTING", "0")
+        monkeypatch.setattr("magent.env._cached_env", None)
+        cfg = _cfg(tmp_config, tmp_path, ["caramel"], routing=ON)
+
+        result = runner.invoke(cli.main, ["--config", cfg, "account"])
+        rows = _rows(
+            runner.invoke(cli.main, ["--config", cfg, "account", "plan", "--json"])
+        )
+
+        assert "MAGENT_ACCOUNT_ROUTING=0" in result.output
+        assert "settings.accounts.enabled" not in result.output
+        assert rows[0]["reason"] == "unrouted-disabled"
 
     def test_stale_usage_data_is_named_with_the_fix(
         self, runner, tmp_config, tmp_path, ccswap

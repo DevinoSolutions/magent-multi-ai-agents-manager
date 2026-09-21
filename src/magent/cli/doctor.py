@@ -441,12 +441,14 @@ def _check_account_routing(cfg: MagentConfig | None) -> CheckResult:
     on an ordinary machine this costs no subprocess at all.
     """
     from magent import accounts  # heavy subsystem: in-body per policy
-    from magent.cli.account_cmd import policy_for
+    from magent.cli.account_cmd import policy_for, routing_off_reason
 
     if cfg is None:
         return (OK, "skipped -- the config did not load (see the config check)")
     if not policy_for(cfg).enabled:
-        return (OK, "account routing is off (settings.accounts.enabled)")
+        # Both gates are read through one reader, so this can never report
+        # "off in the config" at a machine whose env var is what turned it off.
+        return (OK, routing_off_reason())
 
     binary = accounts.find_ccswap()
     if not binary:

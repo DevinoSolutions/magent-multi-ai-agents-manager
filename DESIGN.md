@@ -1819,7 +1819,13 @@ reason.
 snapshot, applies the same refusals and calls the same `routing.plan`. A preview
 that can disagree with the real thing is worse than no preview, so there is one
 function and no parallel implementation — the property `routing.py`'s purity
-exists to make checkable.
+exists to make checkable. The same reasoning is why `policy_for` ANDs
+`settings.accounts.enabled` with the `MAGENT_ACCOUNT_ROUTING` kill switch rather
+than leaving the variable to the launch path: a preview that ignored it would
+show routed rows for a fleet about to come up unrouted. Because there are two
+gates and they need different actions, `routing_off_reason()` names whichever
+one is actually holding routing off — pointing someone at a config key while an
+environment variable is the cause sends them to edit a correct file.
 
 **Five refusals, and every one of them still launches the fleet.** ccswap older
 than `MIN_CCSWAP_VERSION`, a required ccswap setting not in effect, a non-empty

@@ -368,6 +368,11 @@ warm-up pass moves the active login and spends headroom magent just budgeted.
 old to have checked one of them. `magent sessions --json` carries each session's
 `account` — `null` when it is unrouted.
 
+If a routed fleet ever misbehaves, `MAGENT_ACCOUNT_ROUTING=0` is the kill switch:
+one variable, no config edit, every pane back on the default login. `magent
+account` and `magent account plan` honour it too, and name it as the reason
+rather than pointing you at a config key that is already correct.
+
 > **Expected, not a bug:** a *mutating* ccswap command typed inside a routed
 > agent pane refuses, because the pane exports `CLAUDE_CONFIG_DIR`. That is the
 > safety property working — it is what stops a stray `ccswap switch 19` in one

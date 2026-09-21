@@ -667,6 +667,30 @@ class TestCheckAccountRouting:
     runs is a read, and with routing off it runs none at all.
     """
 
+    @pytest.fixture(autouse=True)
+    def _routing_allowed(self, monkeypatch):
+        """These tests are ABOUT routing, so they lift the env kill switch
+        `tests/conftest.py` pins off for every tier (the config gate still
+        decides per test). One case deliberately puts it back."""
+        monkeypatch.setenv("MAGENT_ACCOUNT_ROUTING", "1")
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+    def test_the_env_kill_switch_is_reported_as_the_cause(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        monkeypatch.setenv("MAGENT_ACCOUNT_ROUTING", "0")
+        monkeypatch.setattr("magent.env._cached_env", None)
+        monkeypatch.setattr(
+            "magent.accounts.find_ccswap",
+            lambda: pytest.fail("probed for ccswap with the kill switch on"),
+        )
+        cfg = self._cfg(tmp_config, tmp_path, {"enabled": True})
+
+        status, detail = doctor._check_account_routing(cfg)
+
+        assert status == OK
+        assert "MAGENT_ACCOUNT_ROUTING=0" in detail
+
     def _cfg(self, tmp_config, tmp_path, routing):
         settings = {"accounts": routing} if routing is not None else {}
         path = tmp_config(
@@ -696,7 +720,8 @@ class TestCheckAccountRouting:
         status, detail = doctor._check_account_routing(cfg)
 
         assert status == OK
-        assert "off" in detail
+        assert "account routing is OFF" in detail
+        assert "settings.accounts.enabled" in detail
 
     def test_an_unloadable_config_is_skipped_not_failed(self, tmp_path):
         status, detail = doctor._check_account_routing(None)
