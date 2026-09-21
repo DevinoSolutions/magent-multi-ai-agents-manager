@@ -739,6 +739,15 @@ def _entry(value: object) -> MapEntry | None:
     )
 
 
+def now_stamp() -> str:
+    """The timestamp a ``MapEntry`` records, in the map file's own format.
+
+    One spelling, here, so a record written by the launch path and the
+    ``updatedAt`` ``write_map`` stamps cannot disagree about what a time is.
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 def read_map(path: Path | None = None) -> dict[str, MapEntry]:
     """The recorded placement per psmux session id, or ``{}``.
 
@@ -778,7 +787,7 @@ def write_map(entries: Mapping[str, MapEntry], path: Path | None = None) -> bool
     target = path or ACCOUNT_MAP_PATH
     body = {
         "schema": MAP_SCHEMA,
-        "updatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "updatedAt": now_stamp(),
         "entries": {
             session: {
                 "account": e.account,

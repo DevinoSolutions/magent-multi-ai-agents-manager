@@ -1889,6 +1889,90 @@ Deferred deliberately, with the vocabulary already in place: `magent account
 move` (it recreates a live session under a different `CLAUDE_CONFIG_DIR`, so it
 needs the launch path's per-window env overlay) and the status-left account
 brand.
+### The account is environment, not a command line (2026-09-21)
+
+A routed pane runs as a particular Claude account because it starts with
+`CLAUDE_CONFIG_DIR=<that account's ccswap profile>` and for no other reason. The
+obvious alternative was a command prefix (`ccswap run <n> claude …`), and it is
+ruled out by how a pane is started, not by taste: the agent command is **typed
+into the pane by `send-keys`**, so magent never sees its exit code and could
+never verify that the prefix took. `new-session`'s environment, by contrast, is
+fixed exactly once, by a call magent makes itself. (`ccswap run` also strips
+`ANTHROPIC_BASE_URL` and is mutually exclusive with other tooling, but the
+unverifiability is the reason that would have been enough on its own.) The same
+fact makes a "move this project to another account" a session **recreate** and
+never a mutation — there is no second moment at which a pane's environment can
+be set.
+
+So the overlay is **per window**, not per wave: `PsmuxWindowOpts.env` /
+`TerminalLaunchOpts.env` carry it, `psmux.child_env(overlay, drop=…)` passes it
+to `env.spawn_child_env`, and one bring-up places different projects on
+different accounts. Both fields default to empty, which is why an unrouted
+window's environment is byte-for-byte what it has always been.
+
+The credential drop (`env.ACCOUNT_OVERRIDE_VARS` —
+`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_BASE_URL`) is
+**conditional on routing**, and that asymmetry is the same one
+`attach_client_env` above is built on. An ambient `ANTHROPIC_API_KEY` silently
+outranks the account the overlay just chose and bills the API instead of the
+subscription whose headroom the planner budgeted; `ANTHROPIC_BASE_URL` disables
+tool deferral outright (measured: a hard 400 on 200k-context models). But those
+names are USER CONFIGURATION — `_AGENT_SESSION_VARS`' own comment is the
+precedent — so stripping them from an unrouted spawn would log somebody out of a
+feature they never enabled. The strip travels with the overlay and never alone.
+
+**Routing is three independent gates and five named refusals, and it can never
+be why a bring-up fails.** The phase is `launch._route_projects`, between
+`_select_projects` and `_launch_projects` because both things a routed window
+needs — the overlay and the config dir its session probe answers from — must
+exist before any command is built. It runs only when the config asked for it,
+ccswap is at least `accounts.MIN_CCSWAP_VERSION`, and ccswap's own required
+settings are in effect (`profiles.persistent` on, `autoswitch.enabled` off — the
+two `SettingsReport` can actually read); it refuses (naming the reason and
+launching unrouted) on an old ccswap, a required setting that is wrong or
+unreadable, a non-empty `duplicateAccountWarnings`, a snapshot error, or no
+eligible account. The whole phase sits under ONE budget (`ROUTE_BUDGET_S`);
+expiring it launches the fleet unrouted rather than late. `psmux.bring_up` (the
+`magent up`/attach path) calls the same function, so the two paths cannot drift.
+
+**magent stays READ-ONLY toward ccswap**, and this phase is where that was
+tested. The `CLAUDE_CONFIG_DIR` seam only launches a profile that holds a usable
+grant, so a bring-up that found an un-hydrated one had an obvious repair
+available: `ccswap profile hydrate`. It is not taken. ccswap's store holds the
+user's live credentials, its write-back is skipped while any session pid exists,
+and a bring-up — when a routed fleet is about to become a permanently live pid on
+every account — is the worst possible moment to write into it. The alternative
+costs nothing that matters: with `profiles.persistent` on, one `ccswap profile
+hydrate --all` keeps profiles hydrated, so this is a setup step the user takes
+once. So `profileHydrated: false` is honoured as the verdict it is —
+`routing._blocker` refuses the account, its projects are re-planned onto other
+eligible accounts (or launch unrouted), and `_hydration_hints` prints the one
+command that brings it back. An account silently sitting out looks exactly like
+an account that does not exist, which is why the hint is not optional even
+though the mutation is. The closed verb list is pinned twice: at the seam
+(`test_accounts.py::test_magent_never_runs_a_mutating_verb`) and at the phase
+(`test_launch_routing.py::TestTheBringUpNeverWritesIntoCcswap`).
+
+Two consequences are surfaced rather than hidden. A routed project with no
+transcript in its account's store starts a fresh conversation (the probe is
+config-dir-aware, so the command is correct for that store) and the launch table
+says `[fresh]` beside `[a<id>]`. And the *assignment* lives in
+`~/.magent/account-map.json`, never in the config: the pin is the user's intent
+and belongs in a file they hand-edit, while a guess derived from live
+utilization must not be indistinguishable from it — nor turn a config load into
+a write.
+
+The one assumption this design rests on is measured, not inferred: the psmux
+**server** is a grandchild the `new-session` client forks, and Windows does not
+inherit a priority class across that boundary (the reason `boost_priority` is a
+sweep). `tests/e2e/test_fleet_real.py::
+TestTheAccountCrossesThePsmuxServerBoundary` proves the ENVIRONMENT does: the
+stand-in agent records its own `CLAUDE_CONFIG_DIR` into the JSON log the tier
+already treats as ground truth, on all three OSes, plus a Windows leg driving
+the real `launch_psmux_session`. If it had come back empty the fallback was
+`new-session -e VAR=value` (tmux ≥3.2) at the same call site. Unit pins:
+`tests/unit/test_launch_routing.py`, `tests/unit/test_env_schema.py::
+TestTheRoutedOverlay`.
 
 ## 3. Known debt
 
