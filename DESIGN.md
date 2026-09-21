@@ -296,6 +296,16 @@ laziness.
   the looping attach-and-return picker (`_run_sessions_picker`). Named
   `session_picker`, not `sessions`, to avoid confusion with the top-level
   `magent.sessions` package (recorded at extraction time).
+- **`account_cmd.py`** — the `account` group: the account table, `plan` (the
+  launch path's dry run), `pin`/`unpin` (the only writer, and it writes the
+  config through `config_io`'s raw-dict seam, never a running session) and
+  `refresh`. A shell over the `accounts` + `routing` leaves: it owns the tables,
+  the five refusals and the exit codes (0/2/3), and decides no placement of its
+  own. `policy_for` is its one outward-facing function, so `doctor`'s
+  `account-routing` check reads routing settings through the same reader. Also
+  holds a clearly-fenced temporary adapter that reads the routing settings from
+  the typed config OR the raw JSON, so it is correct both before and after the
+  schema PR lands — deleted on that rebase.
 - **`status.py`** — `_render_status` (shared by the `status` command and the
   menu's `_menu_status`) plus the `down` command. Owns the daemon-health
   probes: `_health_check` (HTTP GET `/health` — proves the upload server is
@@ -1784,6 +1794,80 @@ supervised-pane and `--no-mux` `wt` spawns in `cli/attach.py`. Pins:
 `tests/unit/test_platform_contract.py::
 TestAttachClientKeepsNestingMarkersButNotALeakedNoColor`, and
 `tests/unit/test_attach.py::TestAttachPanesLoseOnlyALeakedColourOverride`.
+
+### The pin is config, the assignment is not, and both are read-only here (2026-09-21)
+
+`magent account` is four surfaces over the account router, and the shape of the
+command is an argument about where each kind of knowledge belongs.
+
+A **pin** — "this project always runs on account 13" — is user intent. It is
+typed by a human, it should be git-visible and hand-editable, and it must
+survive a magent that knows nothing about it, so it lives in the config as
+`projects[i].account` and is written through the round-tripping raw-dict seam
+(`cli/config_io._load_raw_config`/`_save_raw_config`), which preserves every key
+magent does not model. An **assignment** — "the planner put this project on 15
+because 13 was at 91%" — is machine state derived from a live reading. It lives
+in `~/.magent/account-map.json`. Keeping them apart is not tidiness: if a
+computed assignment were written back into the config, a later `--go` could not
+tell which entries it was allowed to move, and `load_config` would have become a
+writer, which is an audited defect this repo does not reintroduce. `magent
+account` shows them in one table and labels each row `pin` or `map` for the same
+reason.
+
+**`plan` is `--go`'s dry run, not a second opinion.** It builds the same
+snapshot, applies the same refusals and calls the same `routing.plan`. A preview
+that can disagree with the real thing is worse than no preview, so there is one
+function and no parallel implementation — the property `routing.py`'s purity
+exists to make checkable.
+
+**Five refusals, and every one of them still launches the fleet.** ccswap older
+than `MIN_CCSWAP_VERSION`, a required ccswap setting not in effect, a non-empty
+`duplicateAccountWarnings`, a snapshot error, or no eligible account. The first
+three invalidate the whole *snapshot* rather than any one account (duplicates
+most sharply: two slots claiming one login means a utilization reading may be
+attributed to the wrong account, so placing work on those numbers places it by
+somebody else's), so they are handed to the planner as an ERROR snapshot and
+every row comes back `unrouted-no-data` out of the closed vocabulary. No new
+reason code, no second code path, and routing can never be the reason a bring-up
+fails. Each refusal prints the exact `ccswap config set ...` that clears it and
+magent never runs it: the `wt-keys` posture, where the user's own configuration
+always wins and magent warns and skips.
+
+**Two measured facts drive the user-facing wording.** Switching the *active
+slot* (the ccswap TUI, `ccswap switch`, autoswitch) rewrites
+`~/.claude/.credentials.json` and logs out every session that is not routed —
+which is why `autoswitch.enabled true` is a refusal rather than a warning, and
+why the README says so beside the feature. And a mutating `ccswap` command typed
+*inside* a routed pane refuses, because the pane exports `CLAUDE_CONFIG_DIR`.
+That reads like a bug and is the safety property working: it is what stops a
+stray `ccswap switch` in one window moving the active login out from under sixty
+sessions. Both are documented as expected behaviour, not worked around.
+
+`doctor`'s `account-routing` check is WARN-at-worst on the `wt-keys` precedent —
+every condition it reports degrades to "launches unrouted", which is today's
+behaviour, so none of it may move an exit code CI and `magent status` read. It
+is skipped entirely while routing is off (the default), so it costs an ordinary
+machine no subprocess at all. What it does report on the OK path is the
+early-warning surface for the hazard this feature lives with: ccswap's
+store-to-profile write-back is skipped while a live session pid exists, and a
+resident routed fleet IS a permanently live pid on every account it uses, so a
+slot drifting toward `invalid_grant` shows up as `eligible: false` with ccswap's
+own reason before it costs a re-login.
+
+One test-isolation law came out of writing this and is now autouse in
+`tests/conftest.py`: **no test resolves the real `ccswap` binary**
+(`_no_real_ccswap`). It is in the same family as `MAGENT_PSMUX_BOOST=0` and for
+the sharpest version of that reason — ccswap owns the user's account
+credentials, the installed build's `list` performs a credential-adoption pass
+that writes to its store, and no HOME redirect contains a binary on PATH. It is
+not theoretical: one test here that simply forgot the fake spawned the real
+ccswap three times. The redirected home is what kept that harmless, which is
+luck rather than design.
+
+Deferred deliberately, with the vocabulary already in place: `magent account
+move` (it recreates a live session under a different `CLAUDE_CONFIG_DIR`, so it
+needs the launch path's per-window env overlay) and the status-left account
+brand.
 
 ## 3. Known debt
 

@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
+    from magent import accounts as accounts_mod
     from magent.config import MagentConfig
 
 OK = "ok"
@@ -352,6 +353,113 @@ def _check_wt_keys() -> CheckResult:
     )
 
 
+def _unusable_accounts(snapshot: accounts_mod.AccountsSnapshot) -> list[str]:
+    """``"14: needs a fresh login"`` per account that cannot host work.
+
+    Reported on the OK path as well as the WARN one, because this is the
+    early-warning surface for the hazard the feature lives with: ccswap's
+    store-to-profile write-back is skipped while a live session pid exists, and a
+    resident routed fleet IS a permanently live pid on every account it uses --
+    so a slot on its way to `invalid_grant` shows up here, with ccswap's own
+    reason, before it costs a re-login. A reason ccswap gave is never re-derived.
+    """
+    from magent.accounts import SUBSCRIPTION_KIND
+
+    out: list[str] = []
+    for acct in snapshot.accounts:
+        if acct.kind and acct.kind != SUBSCRIPTION_KIND:
+            continue  # an api-key slot is not a routing target and never was
+        if not acct.eligible:
+            out.append(f"{acct.id}: {acct.ineligible_text or 'ineligible in ccswap'}")
+        elif not acct.hydrated:
+            out.append(f"{acct.id}: its profile holds no usable login")
+    return out
+
+
+def _check_account_routing(cfg: MagentConfig | None, config_file: Path) -> CheckResult:
+    """Can per-project account routing work -- and is any slot drifting?
+
+    WARN-at-worst, deliberately, on the `wt-keys` precedent: every condition
+    here degrades to "the fleet launches unrouted", which is today's behaviour,
+    so none of it may move doctor's exit code (which CI and `magent status`
+    read). It also never MUTATES: every ccswap command it runs is a read, and
+    the whole check is skipped while routing is off -- which is the default, so
+    on an ordinary machine this costs no subprocess at all.
+    """
+    from magent import accounts  # heavy subsystem: in-body per policy
+    from magent.cli.account_cmd import policy_for
+
+    if cfg is None:
+        return (OK, "skipped -- the config did not load (see the config check)")
+    if not policy_for(cfg, config_file).enabled:
+        return (OK, "account routing is off (settings.accountRouting.enabled)")
+
+    binary = accounts.find_ccswap()
+    if not binary:
+        return (
+            WARN,
+            (
+                "routing is on but ccswap is not on PATH, so every project "
+                "launches unrouted -- install ccswap or turn routing off"
+            ),
+        )
+    version = accounts.read_version(ccswap=binary)
+    if not accounts.version_at_least(version):
+        return (
+            WARN,
+            (
+                f"ccswap {version or 'version unreadable'} is older than "
+                f"{accounts.MIN_CCSWAP_VERSION}, the build with a read-only "
+                "`list --profiles`; magent will not route until it is upgraded"
+            ),
+        )
+    settings = accounts.read_settings(ccswap=binary)
+    if settings.problems:
+        return (WARN, "; ".join(settings.problems))
+    if settings.error:
+        return (WARN, f"{settings.error} -- magent will not read that as a yes")
+
+    snapshot = accounts.read_accounts(ccswap=binary)
+    if snapshot.error:
+        return (WARN, snapshot.error)
+    if snapshot.duplicate_warnings:
+        return (
+            WARN,
+            (
+                "ccswap reports duplicate accounts, so a utilization reading may "
+                "belong to the wrong slot -- magent will not route on it: "
+                + "; ".join(snapshot.duplicate_warnings)
+            ),
+        )
+    usable = [
+        a
+        for a in snapshot.accounts
+        if a.eligible and a.hydrated and a.kind == accounts.SUBSCRIPTION_KIND
+    ]
+    age = (
+        ""
+        if snapshot.usage_age_s is None
+        else f", usage data {snapshot.usage_age_s / 60:.0f}m old"
+    )
+    unusable = _unusable_accounts(snapshot)
+    tail = ("\n" + "; ".join(unusable)) if unusable else ""
+    if not usable:
+        return (
+            WARN,
+            (
+                f"{len(snapshot.accounts)} ccswap account(s), none of them both "
+                f"eligible and hydrated -- nothing to route to{age}{tail}"
+            ),
+        )
+    return (
+        OK,
+        (
+            f"{len(usable)}/{len(snapshot.accounts)} ccswap account(s) can host "
+            f"work{age}{tail}"
+        ),
+    )
+
+
 def _writable(d: Path) -> bool:
     try:
         d.mkdir(parents=True, exist_ok=True)
@@ -448,6 +556,7 @@ def _run_checks(config_file: Path) -> list[dict[str, str]]:
         ("monitors", _check_monitors),
         ("hotkey", lambda: _check_hotkey(cfg)),
         ("wt-keys", _check_wt_keys),
+        ("account-routing", lambda: _check_account_routing(cfg, config_file)),
         ("logs dir", _check_logs_dir),
         ("state dir", _check_state_dir),
         ("sentry", _check_sentry),

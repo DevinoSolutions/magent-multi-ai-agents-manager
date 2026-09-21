@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from magent import accounts as accounts_mod
 from magent import cli, wt_keys
 from magent import psmux as psmux_mod
 from magent.cli import doctor
@@ -32,6 +33,11 @@ from magent.cli.doctor import (
 from magent.config import SCHEMA_VERSION, load_config
 from magent.grid import MonitorRect
 from tests.conftest import FakePlatform
+from tests.unit._fake_ccswap import (
+    MAGENT_READY_SETTINGS,
+    make_fake_ccswap,
+)
+from tests.unit._fake_ccswap import account as ccswap_account
 
 
 class TestCheckConfig:
@@ -652,6 +658,179 @@ class TestCheckSentry:
         assert "[sentry]" not in detail
 
 
+class TestCheckAccountRouting:
+    """Per-project account routing, as a health check.
+
+    Two contracts, and both are the point of the check rather than details of
+    it: it is WARN-at-worst (nothing here may move doctor's exit code, which CI
+    and `magent status` read), and it NEVER mutates -- every ccswap command it
+    runs is a read, and with routing off it runs none at all.
+    """
+
+    def _cfg(self, tmp_config, tmp_path, routing):
+        settings = {"accountRouting": routing} if routing is not None else {}
+        path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "projects": [{"path": str(tmp_path / "api")}],
+                "settings": settings,
+            }
+        )
+        return load_config(path), Path(path)
+
+    def _ccswap(self, tmp_path, monkeypatch, **kwargs):
+        fake = make_fake_ccswap(tmp_path)
+        fake.set_settings(kwargs.pop("settings", MAGENT_READY_SETTINGS))
+        monkeypatch.setattr("magent.accounts.find_ccswap", lambda: fake.path)
+        return fake
+
+    def test_routing_off_never_runs_ccswap_at_all(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        monkeypatch.setattr(
+            "magent.accounts.find_ccswap",
+            lambda: pytest.fail("probed for ccswap with routing off"),
+        )
+        cfg, path = self._cfg(tmp_config, tmp_path, None)
+
+        status, detail = doctor._check_account_routing(cfg, path)
+
+        assert status == OK
+        assert "off" in detail
+
+    def test_an_unloadable_config_is_skipped_not_failed(self, tmp_path):
+        status, detail = doctor._check_account_routing(None, tmp_path / "nope.json")
+        assert status == OK
+        assert "skipped" in detail
+
+    def test_routing_on_without_ccswap_warns(self, monkeypatch, tmp_config, tmp_path):
+        monkeypatch.setattr("magent.accounts.find_ccswap", lambda: None)
+        cfg, path = self._cfg(tmp_config, tmp_path, {"enabled": True})
+
+        status, detail = doctor._check_account_routing(cfg, path)
+
+        assert status == WARN
+        assert "not on PATH" in detail
+
+    def test_a_healthy_fleet_reports_counts(self, monkeypatch, tmp_config, tmp_path):
+        fake = self._ccswap(tmp_path, monkeypatch)
+        fake.set_accounts([ccswap_account("13"), ccswap_account("15")])
+        cfg, path = self._cfg(tmp_config, tmp_path, {"enabled": True})
+
+        status, detail = doctor._check_account_routing(cfg, path)
+
+        assert status == OK
+        assert "2/2 ccswap account(s) can host work" in detail
+        assert "11m old" in detail
+
+    def test_an_old_ccswap_warns_with_the_floor(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        fake = self._ccswap(tmp_path, monkeypatch)
+        fake.set_version("ccswap 0.30.1")
+        cfg, path = self._cfg(tmp_config, tmp_path, {"enabled": True})
+
+        status, detail = doctor._check_account_routing(cfg, path)
+
+        assert status == WARN
+        assert accounts_mod.MIN_CCSWAP_VERSION in detail
+
+    def test_a_required_setting_warns_with_its_fix(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        self._ccswap(
+            tmp_path,
+            monkeypatch,
+            settings={"profiles.persistent": True, "autoswitch.enabled": True},
+        )
+        cfg, path = self._cfg(tmp_config, tmp_path, {"enabled": True})
+
+        status, detail = doctor._check_account_routing(cfg, path)
+
+        assert status == WARN
+        assert "ccswap config set autoswitch.enabled false" in detail
+
+    def test_duplicate_accounts_warn_and_refuse_to_route(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        fake = self._ccswap(tmp_path, monkeypatch)
+        fake.set_accounts([ccswap_account("13")], duplicates=["13 and 14 collide"])
+        cfg, path = self._cfg(tmp_config, tmp_path, {"enabled": True})
+
+        status, detail = doctor._check_account_routing(cfg, path)
+
+        assert status == WARN
+        assert "will not route on it" in detail
+
+    def test_a_drifting_slot_is_named_on_the_ok_path(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        """The early-warning surface for the write-back hazard: a resident routed
+        fleet keeps a live pid on every account, so a slot heading for
+        `invalid_grant` must be visible before it costs a re-login -- and visible
+        WITHOUT turning a working machine's doctor run yellow."""
+        fake = self._ccswap(tmp_path, monkeypatch)
+        fake.set_accounts(
+            [
+                ccswap_account("13"),
+                ccswap_account(
+                    "14", eligible=False, ineligible_reason="relogin_required"
+                ),
+            ]
+        )
+        cfg, path = self._cfg(tmp_config, tmp_path, {"enabled": True})
+
+        status, detail = doctor._check_account_routing(cfg, path)
+
+        assert status == OK
+        assert "1/2 ccswap account(s) can host work" in detail
+        assert "14: needs a fresh login" in detail
+
+    def test_nothing_usable_warns(self, monkeypatch, tmp_config, tmp_path):
+        fake = self._ccswap(tmp_path, monkeypatch)
+        fake.set_accounts([ccswap_account("13", hydrated=False)])
+        cfg, path = self._cfg(tmp_config, tmp_path, {"enabled": True})
+
+        status, detail = doctor._check_account_routing(cfg, path)
+
+        assert status == WARN
+        assert "nothing to route to" in detail
+
+    def test_an_api_key_slot_is_not_reported_as_a_broken_one(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        fake = self._ccswap(tmp_path, monkeypatch)
+        fake.set_accounts(
+            [
+                ccswap_account("13"),
+                ccswap_account("99", kind="api-key", eligible=False),
+            ]
+        )
+        cfg, path = self._cfg(tmp_config, tmp_path, {"enabled": True})
+
+        status, detail = doctor._check_account_routing(cfg, path)
+
+        assert status == OK
+        assert "99" not in detail
+
+    def test_it_can_never_fail_the_gate(self, monkeypatch, tmp_config, tmp_path):
+        """One pin over every shape this check can take: none of them is a FAIL,
+        so routing can never be the reason `magent doctor` exits 1."""
+        cfg, path = self._cfg(tmp_config, tmp_path, {"enabled": True})
+        fake = self._ccswap(tmp_path, monkeypatch)
+        for mutate in (
+            lambda: fake.set_mode("rc1"),
+            lambda: fake.set_mode("garbage"),
+            lambda: fake.set_mode("ok"),
+            lambda: fake.set_accounts([]),
+            lambda: fake.set_version("nonsense"),
+            lambda: fake.set_settings({}),
+        ):
+            mutate()
+            status, _ = doctor._check_account_routing(cfg, path)
+            assert status in (OK, WARN)
+
+
 class TestDoctorCli:
     def _all_ok(self, monkeypatch):
         monkeypatch.setattr(
@@ -728,6 +907,7 @@ class TestDoctorCli:
             "monitors",
             "hotkey",
             "wt-keys",
+            "account-routing",
             "logs dir",
             "state dir",
             "sentry",
