@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from magent.config import MagentConfig
     from magent.platform import Platform
 
@@ -1267,7 +1269,10 @@ def _field_str(d: dict[str, object], key: str) -> str:
 
 
 def eligible_projects(
-    config: MagentConfig, group: str | None = None
+    config: MagentConfig,
+    group: str | None = None,
+    *,
+    config_dirs: Mapping[str, Path] | None = None,
 ) -> list[dict[str, object]]:
     """Projects that map to a persistent psmux session.
 
@@ -1284,6 +1289,13 @@ def eligible_projects(
     of them run the command on THIS machine, the one just probed (remote
     projects are excluded above, so the probe never answers for a foreign
     filesystem).
+
+    ``config_dirs`` names, per psmux session id, WHICH of the tool's stores
+    that project's probe must read -- the config directory its pane will run
+    under. It is keyed by session id (not by path) because that is the key the
+    rest of the product already uses for a project. A session absent from the
+    mapping, and the default None, both mean the tool's own default store,
+    which is byte-for-byte today's probe for every project.
     """
     from magent.launch import _expand_base_dir, _resolve_path
     from magent.sessions import build_start_command, is_ide_tool
@@ -1324,7 +1336,10 @@ def eligible_projects(
                 "group": proj.group,
                 "resolved": resolved,
                 "cmd": build_start_command(
-                    tool, config.settings.tools.get(tool, ""), resolved
+                    tool,
+                    config.settings.tools.get(tool, ""),
+                    resolved,
+                    config_dir=config_dirs.get(sid) if config_dirs else None,
                 ),
                 "color": proj.color,
             }

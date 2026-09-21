@@ -171,8 +171,8 @@ None of these imports any other `magent` module (`style.py` imports
   never pulls in Windows- or macOS-specific code on the wrong OS.
 - **`sessions/`** — `AGENT_TOOLS: dict[str, AgentTool]` is the registry of
   per-tool resumability (`claude`, `codex` today). `AgentTool` is a frozen
-  dataclass: `session_ids` (a `(project_dir, count) -> list[str|None]`
-  callable), `resume_command`, and `happy` (whether the tool can be wrapped
+  dataclass: `session_ids` (a `(project_dir, count, config_dir) ->
+  list[str|None]` callable), `resume_command`, and `happy` (whether the tool can be wrapped
   with the `happy` mobile/web relay); `multi_window` is a derived property
   (`session_ids is not None`). `build_resume_command` is the one dispatcher;
   an unregistered tool falls back to its own base command unchanged.
@@ -779,8 +779,23 @@ live conversation and disguising a real defect as a working pane. It is also
 unobservable: agent commands are delivered into psmux panes with `send-keys`, so
 magent never sees the command's exit code and could not tell the two apart even
 if it wanted to. The deterministic host-side probe (does
-`~/.claude/projects/<encoded cwd>/` hold any `*.jsonl`) is the honest test, and
-it is taken where the command is built.
+`<config dir>/projects/<encoded cwd>/` hold any `*.jsonl`) is the honest test,
+and it is taken where the command is built.
+
+*Which store answers is part of the question (2026-09-21).* claude keeps a
+project's transcripts under the config directory the pane runs with, so
+`~/.claude` is the right answer only for a pane that runs with no
+`CLAUDE_CONFIG_DIR`. The probe therefore takes a `config_dir` — threaded through
+`AgentTool.session_ids`/`fresh_command`, `build_start_command(...,
+config_dir=)`, `launch._get_session_ids` and `psmux.eligible_projects(...,
+config_dirs=)`, and resolved to `~/.claude` at CALL time when it is None, which
+is every caller today. A probe that always read `~/.claude` would answer for a
+store the pane never writes: it would drop `--continue` from a project that does
+have a conversation on its own store, or keep it for one that does not — the
+same dead-shell failure this decision exists to prevent, arrived at from the
+other direction. Which store answers is a per-TOOL question, so the registry
+asks the tool rather than resolving a path for it: `sessions/codex.py` accepts
+the argument and ignores it, because `~/.codex` is one store per machine.
 
 *Only a positive "no session here" rewrites anything.* An unknown tool, a tool
 with no probe, an unresolvable directory, a command with no implicit-resume
@@ -2153,8 +2168,16 @@ launched as-is, like `cursor-agent`/`agy`), only step 3 applies: one
 `claude`/`codex`), do all four steps:
 1. Add `sessions/<tool>.py` with the same two-function shape as
    `sessions/claude.py`: `get_<tool>_session_ids(project_dir, count,
-   home_override=None) -> list[str | None]` and
-   `build_<tool>_resume(base_cmd, session_id) -> str`.
+   config_dir=None) -> list[str | None]` and
+   `build_<tool>_resume(base_cmd, session_id) -> str`. `config_dir` is the
+   registry's "which of this tool's stores answers for the project"
+   argument — claude reads `<config_dir>/projects/<encoded cwd>`, i.e. the
+   `CLAUDE_CONFIG_DIR` a routed pane runs under, and `None` is its default
+   `~/.claude`. A tool whose store is not account-scoped accepts and ignores
+   it (`sessions/codex.py` does; `~/.codex` is one store per machine, and it
+   keeps `home_override` as its own keyword-only test seam). Resolve the
+   default at CALL time, never as a module-level `Path.home()` constant —
+   `tests/conftest.py`'s tripwire exists for exactly that defect class.
 2. Add one entry to `AGENT_TOOLS` in `sessions/__init__.py`, wiring those
    two functions in as `session_ids`/`resume_command`; set `happy=True` if
    the tool should be eligible for the Happy mobile/web wrap.
