@@ -568,10 +568,18 @@ def _expand_base_dir(base_dir: str) -> str:
     return os.path.expandvars(os.path.expanduser(base_dir)).replace("/", os.sep)
 
 
-def _get_session_ids(tool: str, project_dir: str, count: int) -> list[str | None]:
+def _get_session_ids(
+    tool: str, project_dir: str, count: int, config_dir: Path | None = None
+) -> list[str | None]:
+    """``project_dir``'s resumable session ids for ``tool``, newest first.
+
+    ``config_dir`` names which of that tool's stores answers for the project --
+    None is its default store, i.e. today's answer for every project no account
+    was chosen for. See ``sessions.build_start_command``.
+    """
     caps = AGENT_TOOLS.get(tool)
     if caps and caps.session_ids:
-        return caps.session_ids(project_dir, count)
+        return caps.session_ids(project_dir, count, config_dir)
     return [None] * count
 
 
