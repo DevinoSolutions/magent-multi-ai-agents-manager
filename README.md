@@ -359,6 +359,22 @@ Two ideas are worth knowing, because everything else follows from them:
   show each refusal with the exact `ccswap config set ...` that clears it; magent
   never flips one for you.
 
+A project's work also has a **class**, and that is what decides which usage cap
+it is budgeted against. `modelClass` on a project is how you say it outright:
+
+```jsonc
+{ "path": "web", "modelClass": "fable" }
+```
+
+`fable` means this project's work counts against a model-scoped weekly window of
+its own *as well as* the account's 5-hour and 7-day ones; `standard` means only
+those two — which is exactly what lets an account with its Fable cap spent keep
+hosting Opus/Sonnet work instead of sitting idle. Leave the key out and magent
+infers the class: what it last observed running in that pane, otherwise
+`standard`. It guesses that way on purpose — guessing standard only spends 7-day
+headroom that was going to waste, while guessing fable can block an agent
+outright. A value that is neither is ignored with a warning, never an error.
+
 Three ccswap settings have to be right before anything routes:
 `profiles.persistent true`, `autoswitch.enabled false` and
 `autoswitch.warmupFiveHour false` — the last two because a global switch or a
