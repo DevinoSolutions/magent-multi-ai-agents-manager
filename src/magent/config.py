@@ -319,6 +319,28 @@ def _parse_attention(raw: dict[str, object]) -> AttentionSettings:
     )
 
 
+def _account_id(raw: dict[str, object], key: str) -> str | None:
+    """An account id, or None. A JSON NUMBER is accepted and stringified.
+
+    The only accessor here that coerces rather than degrading, and it earns the
+    exception: ccswap's ids are numeric ("13"), JSON has no natural way to
+    write one as a string without the user remembering to, and
+    ``magent config set <proj> account 13`` parses its argument as an int
+    before it ever reaches the file. Degrading that to None would leave a pin
+    the user typed, can see in their config, and that silently does nothing --
+    the worst failure shape a pin can have. A genuinely wrong type (a list, an
+    object, a boolean) still degrades.
+    """
+    value = raw.get(key)
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    return None
+
+
 def _model_class(raw: dict[str, object], key: str) -> str | None:
     """A model class, normalised, or None for "infer it".
 
@@ -493,7 +515,7 @@ def _parse_project(raw: dict[str, object]) -> ProjectConfig:
         host=_str_or_none(raw, "host"),
         remote_path=_str_or_none(raw, "remotePath"),
         windows=_windows(raw),
-        account=_str_or_none(raw, "account"),
+        account=_account_id(raw, "account"),
         model_class=_model_class(raw, "modelClass"),
     )
 

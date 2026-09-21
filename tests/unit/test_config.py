@@ -519,8 +519,17 @@ class TestProjectAccountFields:
         assert load_config(path).projects[0].account == "nope"
         assert capsys.readouterr().err == ""
 
-    def test_a_mistyped_pin_degrades_to_none(self, tmp_config):
+    def test_an_unquoted_numeric_pin_is_accepted(self, tmp_config):
+        # The one coercion in this module. ccswap's ids are numeric, and
+        # `magent config set api account 13` parses its argument as an int
+        # before it ever reaches the file -- degrading that would leave a pin
+        # the user typed, can see, and that silently does nothing.
         path = tmp_config({"projects": [{"path": "api", "account": 13}]})
+        assert load_config(path).projects[0].account == "13"
+
+    @pytest.mark.parametrize("value", [True, ["13"], {"id": "13"}, ""])
+    def test_a_genuinely_mistyped_pin_degrades_to_none(self, tmp_config, value):
+        path = tmp_config({"projects": [{"path": "api", "account": value}]})
         assert load_config(path).projects[0].account is None
 
 
