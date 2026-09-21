@@ -16,14 +16,13 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 import pytest
 
 from magent import accounts, launch
-from magent.config import MagentConfig, ProjectConfig, Settings
+from magent.config import AccountSettings, MagentConfig, ProjectConfig, Settings
 from magent.env import ACCOUNT_OVERRIDE_VARS
 from magent.launch import RunOpts, run_magent
 from tests.conftest import FakePlatform
@@ -38,23 +37,10 @@ if TYPE_CHECKING:
     from tests.unit._fake_ccswap import FakeCcswap
 
 
-@dataclass
-class _RoutingSettings:
-    """Stand-in for ``settings.accountRouting``, whose typed field lands in a
-    sibling PR. The adapter under test (``launch._routing_policy``) reads it by
-    attribute name, so this is the same surface the real dataclass presents --
-    and when that one arrives, this class is what gets deleted."""
-
-    enabled: bool = True
-    soft: float = 85.0
-    hard: float = 95.0
-    on_limit: str = "move-if-reset>2h"
-    stale_after_s: float = 900.0
-    per_account: dict[str, object] = field(default_factory=dict)
-
-
 def _enable_routing(cfg: MagentConfig, **kwargs: object) -> None:
-    cfg.settings.account_routing = _RoutingSettings(**kwargs)  # type: ignore[attr-defined]  # reason: PR-2 lands the typed field; the adapter reads it by name
+    """Turn the CONFIG gate on. The env gate is lifted for the whole module
+    (``_routing_allowed`` below); these tests are about everything after."""
+    cfg.settings.accounts = AccountSettings(**{"enabled": True, **kwargs})  # type: ignore[arg-type]  # reason: kwargs are the dataclass's own fields, typed per call site
 
 
 def _cfg(tmp_path: Path, count: int = 1, *, psmux: bool = True) -> MagentConfig:
@@ -80,27 +66,38 @@ def ccswap(tmp_path, monkeypatch) -> FakeCcswap:
 
     Never PATH: the seam is what every test uses so no test can reach the
     developer's real ccswap -- the one tool in this product that holds live
-    account credentials. The lru_cache is cleared on the way in and out, the
-    documented ``find_psmux`` caveat applied to its sibling.
+    account credentials. `tests/conftest.py::_no_real_ccswap` has already
+    replaced the module attribute (cache and all) with a "not installed"
+    answer; this overrides that same attribute, which is the documented way to
+    win over it.
     """
     fake = make_fake_ccswap(tmp_path)
     # The fake's DEFAULT settings are deliberately the ones magent cannot route
     # under (a fresh ccswap), so every test that expects routing to happen has
     # to say so -- which is the gate working, not boilerplate.
     fake.set_settings(MAGENT_READY_SETTINGS)
-    resolver = accounts.find_ccswap
-    resolver.cache_clear()
     monkeypatch.setattr(accounts, "find_ccswap", lambda: fake.path)
-    yield fake
-    # The real resolver, by reference: at teardown the module attribute is still
-    # the stand-in (monkeypatch undoes after this), and a lambda has no cache.
-    resolver.cache_clear()
+    return fake
 
 
 @pytest.fixture
 def fake_sleep(monkeypatch):
     """No real launch_delay_ms / tiling retry sleeps."""
     monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+
+@pytest.fixture(autouse=True)
+def _routing_allowed(monkeypatch):
+    """This module is ABOUT routing, so it opts back in to the env gate
+    `tests/conftest.py` pins off for every tier -- the same move the upload
+    supervisor's tests make. The CONFIG gate still decides per test.
+
+    `_cached_env` goes with it: `get_env()` memoises, so a test that changed
+    the variable after something already read it would assert against the
+    previous answer.
+    """
+    monkeypatch.setenv("MAGENT_ACCOUNT_ROUTING", "1")
+    monkeypatch.setattr("magent.env._cached_env", None)
 
 
 @pytest.fixture(autouse=True)
@@ -153,6 +150,39 @@ class TestRoutingIsOffUnlessEverythingSaysYes:
         assert ccswap.calls() == []
         assert [w.env for w in fp.launched_psmux] == [None]
         assert "routing" not in capsys.readouterr().out
+
+    def test_the_kill_switch_beats_a_config_that_asked_for_routing(
+        self, tmp_path, ccswap, monkeypatch
+    ):
+        # The second gate, and the only one that can contradict the user: the
+        # config says route, the environment says no. Nothing is spawned, and
+        # the note names the VARIABLE -- pointing at the config key here would
+        # send somebody to edit a file that is already correct.
+        monkeypatch.setenv("MAGENT_ACCOUNT_ROUTING", "0")
+        monkeypatch.setattr("magent.env._cached_env", None)
+        cfg = _cfg(tmp_path)
+        _enable_routing(cfg)
+
+        plan = launch._route_projects(cfg, cfg.projects)
+
+        assert plan.routes == {}
+        assert ccswap.calls() == []
+        assert "MAGENT_ACCOUNT_ROUTING" in plan.notes[0]
+        assert "settings.accounts.enabled" not in plan.notes[0]
+
+    def test_an_unparseable_kill_switch_is_not_an_opt_out(
+        self, tmp_path, ccswap, monkeypatch
+    ):
+        # An environment magent cannot parse must not disable a working fleet's
+        # routing over an unrelated typo -- the config still decides.
+        monkeypatch.setenv("MAGENT_ACCOUNT_ROUTING", "yes-please")
+        monkeypatch.setattr("magent.env._cached_env", None)
+        cfg = _cfg(tmp_path)
+        _enable_routing(cfg)
+
+        plan = launch._route_projects(cfg, cfg.projects)
+
+        assert set(plan.routes) == {"proj0"}
 
     def test_an_old_ccswap_refuses_and_names_the_version(
         self, tmp_path, ccswap, caplog

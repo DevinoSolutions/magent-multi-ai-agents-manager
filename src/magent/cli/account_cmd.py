@@ -72,60 +72,28 @@ def _as_str(value: object, default: str = "") -> str:
 
 
 def routing_allowed() -> bool:
-    """``MAGENT_ACCOUNT_ROUTING`` -- the product-wide kill switch, honoured here.
+    """``MAGENT_ACCOUNT_ROUTING`` -- the product-wide kill switch.
 
-    Folded into the policy rather than checked at a launch site, because `plan`
-    promises to be a truthful dry run of what a bring-up would do: a preview
-    that ignored the kill switch would show routed rows for a fleet about to
-    launch unrouted, which is the one way this command could lie.
-
-    An environment magent cannot parse is NOT read as an opt-out -- the config
-    still decides, and `doctor`'s env check is the surface that names the broken
-    variable. Guessing "off" there would disable a working fleet's routing over
-    an unrelated typo.
-    """
-    from pydantic import ValidationError  # heavy subsystem: in-body per policy
-
-    from magent import env  # heavy subsystem: in-body per policy
-
-    try:
-        return env.get_env().account_routing
-    except ValidationError:
-        return True
-
-
-def policy_for(cfg: MagentConfig) -> routing_mod.Policy:
-    """``settings.accounts`` as the planner's ``Policy``.
-
-    The planner takes plain values on purpose -- it predates the schema and has
-    to stay testable without one -- so somebody must map the config onto it, and
-    that somebody is whoever read the config. One translation, used by the
-    table, the plan and `doctor`'s check alike, so the three can never disagree
-    about whether routing is even on.
-
-    Thresholds cross unchanged: both sides spell them as PERCENT, and the one
-    conversion to ccswap's 0-1 fractions happens inside the planner.
+    Delegates: the launch path needs the same answer and a src module may not
+    import this package (LS-A-001), so the implementation lives in
+    ``routing.py`` and both callers read it from there.
     """
     from magent import routing  # heavy subsystem: in-body per policy
 
-    block = cfg.settings.accounts
-    return routing.Policy(
-        enabled=block.enabled and routing_allowed(),
-        soft_threshold=block.soft_threshold,
-        hard_threshold=block.hard_threshold,
-        on_limit=block.on_limit,
-        stale_after_s=block.stale_after_s,
-        per_account={
-            acct_id: routing.AccountPolicy(
-                exclude=override.exclude,
-                # The config normalises the spelling; lower-casing here as well
-                # costs nothing and keeps the comparison in the planner exact.
-                klass=(override.klass or "").strip().lower() or None,
-                on_limit=override.on_limit,
-            )
-            for acct_id, override in block.per_account.items()
-        },
-    )
+    return routing.routing_allowed()
+
+
+def policy_for(cfg: MagentConfig) -> routing_mod.Policy:
+    """``settings.accounts`` as the planner's ``Policy``, kill switch included.
+
+    One translation used by the table, the plan, `doctor`'s check and the
+    bring-up alike, so none of them can disagree about whether routing is even
+    on. It lives in ``routing.py`` for the same reason as ``routing_allowed``
+    above; this is the config-shaped front door onto it.
+    """
+    from magent import routing  # heavy subsystem: in-body per policy
+
+    return routing.policy_for(cfg.settings.accounts)
 
 
 def _projects(cfg: MagentConfig) -> list[routing_mod.Project]:
@@ -323,17 +291,11 @@ def _placement_counts(
 
 def routing_off_reason() -> str:
     """WHICH gate is holding routing off -- there are two, and they need
-    different actions. Naming the config key while an environment variable is
-    the real cause sends someone to edit a file that is already correct."""
-    if not routing_allowed():
-        return (
-            "account routing is OFF -- MAGENT_ACCOUNT_ROUTING=0 is set, which "
-            "overrides the config; unset it to route again"
-        )
-    return (
-        "account routing is OFF -- set settings.accounts.enabled to true to turn "
-        "it on (nothing routes until then)"
-    )
+    different actions. Shared with the bring-up, so a `doctor` line and a
+    launch line cannot name different causes; see ``routing.py``."""
+    from magent import routing  # heavy subsystem: in-body per policy
+
+    return routing.routing_off_reason()
 
 
 def _note(text: str) -> None:

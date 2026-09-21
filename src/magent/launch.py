@@ -39,9 +39,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from magent.accounts import AccountsSnapshot, SettingsReport
-    from magent.config import MagentConfig, ProjectConfig, Settings
+    from magent.config import MagentConfig, ProjectConfig
     from magent.env import MagentEnv
-    from magent.routing import AccountPolicy, Policy, Project
 
 
 def spawn_detached(args: list[str], extra_flags: int = 0) -> subprocess.Popen[bytes]:
@@ -621,99 +620,6 @@ def routing_session_id(proj: ProjectConfig) -> str:
     return _psmux_session_name(proj.title or get_leaf_name(proj.path))
 
 
-def _attr_number(obj: object, names: tuple[str, ...], default: float) -> float:
-    """The first of ``names`` that is a real number on ``obj``.
-
-    Part of the temporary schema adapter below: several names per value
-    because the typed config field is landing in a sibling PR, and one
-    isinstance wall because ``getattr`` answers with whatever is there
-    (``bool`` is excluded -- it is an ``int`` subclass and no threshold).
-    """
-    for name in names:
-        value = getattr(obj, name, None)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return float(value)
-    return default
-
-
-def _attr_flag(obj: object, names: tuple[str, ...], default: bool) -> bool:
-    for name in names:
-        value = getattr(obj, name, None)
-        if isinstance(value, bool):
-            return value
-    return default
-
-
-def _attr_text(obj: object, names: tuple[str, ...], default: str) -> str:
-    for name in names:
-        value = getattr(obj, name, None)
-        if isinstance(value, str) and value:
-            return value
-    return default
-
-
-def _per_account_policy(raw: object) -> dict[str, AccountPolicy]:
-    """``settings.accountRouting.perAccount``, whatever shape it arrives in."""
-    from magent.routing import AccountPolicy
-
-    entries: dict[str, object] = {}
-    if isinstance(raw, dict):
-        entries = {str(k): v for k, v in raw.items()}
-    out: dict[str, AccountPolicy] = {}
-    for acct_id, value in entries.items():
-        source: object = value
-        if isinstance(value, dict):
-            source = type("_Entry", (), {str(k): v for k, v in value.items()})()
-        out[acct_id] = AccountPolicy(
-            exclude=_attr_flag(source, ("exclude",), False),
-            klass=(_attr_text(source, ("klass", "class_", "model_class"), "") or None),
-            on_limit=_attr_text(source, ("on_limit",), ""),
-        )
-    return out
-
-
-def _routing_policy(settings: Settings) -> Policy:
-    """The planner's ``Policy`` read off ``settings.accountRouting``.
-
-    TEMPORARY ADAPTER. The typed config field lands in its own PR; until then
-    this reads whatever is (not) there, and an absent block means routing is
-    OFF -- which is also its shipped default, so the adapter's disabled answer
-    and the typed field's disabled answer are the same answer. Delete this
-    function and read the dataclass directly once that field exists; the names
-    are tried in both spellings so the deletion is the only change needed.
-    """
-    from magent.routing import Policy
-
-    raw = getattr(settings, "account_routing", None)
-    if raw is None:
-        return Policy()
-    return Policy(
-        enabled=_attr_flag(raw, ("enabled",), False),
-        soft_threshold=_attr_number(raw, ("soft", "soft_threshold"), 85.0),
-        hard_threshold=_attr_number(raw, ("hard", "hard_threshold"), 95.0),
-        on_limit=_attr_text(raw, ("on_limit",), "move-if-reset>2h"),
-        stale_after_s=_attr_number(raw, ("stale_after_s",), 900.0),
-        per_account=_per_account_policy(getattr(raw, "per_account", None)),
-    )
-
-
-def _routing_project(proj: ProjectConfig) -> Project:
-    """What the planner needs to know about one project.
-
-    The pin and the class are read BY NAME, with the same temporary-adapter
-    caveat as ``_routing_policy``: the typed project fields land in a sibling
-    PR, and until then absent means "no pin", which is every project today.
-    """
-    from magent.routing import Project
-
-    return Project(
-        session=routing_session_id(proj),
-        name=proj.title or get_leaf_name(proj.path),
-        account=_attr_text(proj, ("account",), "") or None,
-        model_class=_attr_text(proj, ("account_class", "model_class"), "") or None,
-    )
-
-
 def _remaining(deadline: float) -> float:
     return deadline - time.monotonic()
 
@@ -799,11 +705,19 @@ def _route_projects(
     from magent import accounts, routing
     from magent.env import ACCOUNT_OVERRIDE_VARS
 
-    policy = _routing_policy(config.settings)
+    policy = routing.policy_for(config.settings.accounts)
     if not policy.enabled:
-        # Silent: off is the default, and a line saying so on every launch
-        # would be the loudest thing in the output for the least reason.
-        return RoutePlan()
+        if not config.settings.accounts.enabled:
+            # Silent: off is the default, and a line saying so on every launch
+            # would be the loudest thing in the output for the least reason.
+            return RoutePlan()
+        # The config DID ask for routing, so the kill switch is holding it off
+        # and the user is about to get an unrouted fleet they did not choose.
+        # One shared sentence with `magent account` and `doctor`, because it
+        # names WHICH of the two gates is the cause.
+        reason = routing.routing_off_reason()
+        get_logger("launch").info("%s", reason)
+        return RoutePlan(notes=(reason,))
 
     deadline = time.monotonic() + ROUTE_BUDGET_S
     log = get_logger("launch")
@@ -844,7 +758,10 @@ def _route_projects(
 
     prior_map = accounts.read_map()
     planned = routing.plan(
-        [_routing_project(p) for p in candidates],
+        [
+            routing.project_from_config(p, session=routing_session_id(p))
+            for p in candidates
+        ],
         snapshot,
         policy,
         prior_map,

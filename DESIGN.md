@@ -1921,27 +1921,39 @@ names are USER CONFIGURATION — `_AGENT_SESSION_VARS`' own comment is the
 precedent — so stripping them from an unrouted spawn would log somebody out of a
 feature they never enabled. The strip travels with the overlay and never alone.
 
-**Routing is three independent gates and five named refusals, and it can never
-be why a bring-up fails.** The phase is `launch._route_projects`, between
+**Four independent gates, five named refusals, and routing can never be why a
+bring-up fails.** The phase is `launch._route_projects`, between
 `_select_projects` and `_launch_projects` because both things a routed window
 needs — the overlay and the config dir its session probe answers from — must
-exist before any command is built. It runs only when the config asked for it,
-ccswap is at least `accounts.MIN_CCSWAP_VERSION`, and ccswap's own required
-settings are in effect (`profiles.persistent` on, `autoswitch.enabled` off,
-`autoswitch.warmupFiveHour` off — exactly ccswap's three strict-boolean keys, so
-every answer is a real true/false, and each read by its DOTTED name because a
-bare `warmupFiveHour` is not a key ccswap knows and would report as unaskable
-forever); it refuses (naming the reason and
-launching unrouted) on an old ccswap, a required setting that is wrong or
-unreadable, a non-empty `duplicateAccountWarnings`, a snapshot error, or no
-eligible account. The whole phase sits under ONE budget (`ROUTE_BUDGET_S`);
-expiring it launches the fleet unrouted rather than late. `psmux.bring_up` (the
-`magent up`/attach path) calls the same function, so the two paths cannot drift.
+exist before any command is built. It runs only when `settings.accounts.enabled`
+is true, `MAGENT_ACCOUNT_ROUTING` has not killed it, ccswap is at least
+`accounts.MIN_CCSWAP_VERSION`, and ccswap's own required settings are in effect;
+the five refusals above then apply unchanged, each launching the fleet unrouted.
+The whole phase sits under ONE budget (`ROUTE_BUDGET_S`); expiring it launches
+the fleet unrouted rather than late. `psmux.bring_up` (the `magent up`/attach
+path) calls the same function, so the two paths cannot drift.
+
+The two ENABLE gates are asked through `routing.policy_for` and named by
+`routing.routing_off_reason`, the same pair `magent account` and `doctor` use —
+the mapping lives in `routing.py` and not in either caller because a src module
+may not import the `cli` package (LS-A-001), and a second copy of "is routing
+on" is exactly how a dry run starts disagreeing with a launch. A bring-up whose
+CONFIG never asked for routing says nothing (off is the default, and a line
+about it on every launch would be the loudest thing in the output for the least
+reason); one whose config DID ask and was overruled by the kill switch prints
+that reason, because a fleet silently coming up unrouted looks identical to one
+that routed.
+
+`REQUIRED_SETTINGS` is three and each is read by its DOTTED name — a bare
+`warmupFiveHour` is not a key ccswap knows, and a reader spelling it that way
+would report the gate as unaskable forever rather than ever passing it. They are
+exactly ccswap's strict-boolean keys, so every answer is a real true/false.
 Both `autoswitch` keys are required off for the same reason in two flavours: a
 second process acting on the same accounts makes magent's placement a guess.
 `enabled` moves the active account underneath a running fleet; `warmupFiveHour`
 starts five-hour windows on cold accounts — including the ones just planned onto
-— so the utilization the plan was built from is being spent behind it. Neither is
+— so the utilization the plan was built from is being spent behind it. The
+warm-up ships off, so an untouched ccswap is never told to change it. Neither is
 flipped by magent: the refusal names the setting and the `ccswap config set` that
 fixes it, because the user's own configuration wins (the `wt-keys` posture).
 
