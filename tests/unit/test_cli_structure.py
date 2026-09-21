@@ -174,7 +174,7 @@ HELP_SNAPSHOTS = {
     (
         "account",
         "refresh",
-    ): "Usage: main account refresh [OPTIONS]\n\n  Ask ccswap to re-read usage older than settings.accountRouting.staleAfterS.\n\n  Interactive only. A bring-up never calls this: it must not block on somebody\n  else's network read, and launch-time placement is exactly the use ccswap's own\n  cache is adequate for.\n\nOptions:\n  --help  Show this message and exit.\n",
+    ): "Usage: main account refresh [OPTIONS]\n\n  Ask ccswap to re-read usage older than settings.accounts.staleAfterS.\n\n  Interactive only. A bring-up never calls this: it must not block on somebody\n  else's network read, and launch-time placement is exactly the use ccswap's own\n  cache is adequate for.\n\nOptions:\n  --help  Show this message and exit.\n",
 }
 
 TOP_LEVEL_COMMANDS = [

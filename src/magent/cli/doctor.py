@@ -430,7 +430,7 @@ def _duplicate_login_warning(warnings: tuple[str, ...]) -> str:
     )
 
 
-def _check_account_routing(cfg: MagentConfig | None, config_file: Path) -> CheckResult:
+def _check_account_routing(cfg: MagentConfig | None) -> CheckResult:
     """Can per-project account routing work -- and is any slot drifting?
 
     WARN-at-worst, deliberately, on the `wt-keys` precedent: every condition
@@ -445,8 +445,8 @@ def _check_account_routing(cfg: MagentConfig | None, config_file: Path) -> Check
 
     if cfg is None:
         return (OK, "skipped -- the config did not load (see the config check)")
-    if not policy_for(cfg, config_file).enabled:
-        return (OK, "account routing is off (settings.accountRouting.enabled)")
+    if not policy_for(cfg).enabled:
+        return (OK, "account routing is off (settings.accounts.enabled)")
 
     binary = accounts.find_ccswap()
     if not binary:
@@ -608,7 +608,7 @@ def _run_checks(config_file: Path) -> list[dict[str, str]]:
         ("monitors", _check_monitors),
         ("hotkey", lambda: _check_hotkey(cfg)),
         ("wt-keys", _check_wt_keys),
-        ("account-routing", lambda: _check_account_routing(cfg, config_file)),
+        ("account-routing", lambda: _check_account_routing(cfg)),
         ("logs dir", _check_logs_dir),
         ("state dir", _check_state_dir),
         ("sentry", _check_sentry),

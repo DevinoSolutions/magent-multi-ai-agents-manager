@@ -23,6 +23,7 @@ import pytest
 
 from magent import accounts, cli
 from magent.accounts import MapEntry
+from magent.config import SCHEMA_VERSION
 from tests.unit._fake_ccswap import (
     MAGENT_READY_SETTINGS,
     account,
@@ -49,11 +50,11 @@ def _cfg(
         if pins and title in pins:
             entry["account"] = pins[title]
         if classes and title in classes:
-            entry["accountClass"] = classes[title]
+            entry["modelClass"] = classes[title]
         projects.append(entry)
-    data: dict[str, object] = {"projects": projects}
+    data: dict[str, object] = {"version": SCHEMA_VERSION, "projects": projects}
     if routing is not None:
-        data["settings"] = {"accountRouting": routing}
+        data["settings"] = {"accounts": routing}
     if extra:
         data.update(extra)
     return tmp_config(data)
@@ -130,7 +131,7 @@ class TestTheAccountTable:
         result = runner.invoke(cli.main, ["--config", cfg, "account"])
         assert result.exit_code == 0
         assert "account routing is OFF" in result.output
-        assert "settings.accountRouting.enabled" in result.output
+        assert "settings.accounts.enabled" in result.output
 
     def test_stale_usage_data_is_named_with_the_fix(
         self, runner, tmp_config, tmp_path, ccswap

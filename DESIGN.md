@@ -301,11 +301,12 @@ laziness.
   config through `config_io`'s raw-dict seam, never a running session) and
   `refresh`. A shell over the `accounts` + `routing` leaves: it owns the tables,
   the five refusals and the exit codes (0/2/3), and decides no placement of its
-  own. `policy_for` is its one outward-facing function, so `doctor`'s
-  `account-routing` check reads routing settings through the same reader. Also
-  holds a clearly-fenced temporary adapter that reads the routing settings from
-  the typed config OR the raw JSON, so it is correct both before and after the
-  schema PR lands — deleted on that rebase.
+  own. `policy_for` is its one outward-facing function — the single translation
+  of `settings.accounts` into the planner's `routing.Policy` (the planner takes
+  plain values on purpose, so somebody has to map the schema onto it, and that
+  somebody is whoever read the config) — and `doctor`'s `account-routing` check
+  reads through it too, so the table, the plan and the health check can never
+  disagree about whether routing is on.
 - **`status.py`** — `_render_status` (shared by the `status` command and the
   menu's `_menu_status`) plus the `down` command. Owns the daemon-health
   probes: `_health_check` (HTTP GET `/health` — proves the upload server is

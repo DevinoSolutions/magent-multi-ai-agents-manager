@@ -63,24 +63,6 @@ _EXIT_NOT_FOUND = 2
 _EXIT_CCSWAP_ERROR = 3
 
 
-# --- temporary config adapter: DELETE ON REBASE onto the config PR -----------
-# The config PR adds `Settings.accountRouting` (enabled / softThreshold /
-# hardThreshold / onLimit / staleAfterS / perAccount) and the per-project
-# `account` + `accountClass` fields. This module has to be green on today's main
-# AND correct the moment those land, so every routing setting is read through the
-# four `_opt_*` helpers below: the typed attribute when the dataclass has one,
-# else the raw JSON the user's file already carries, else the shipped default.
-# On the rebase that follows that PR, delete these helpers and read
-# `cfg.settings.account_routing` / `project.account` directly; every call site
-# keeps its shape.
-
-
-def _as_dict(value: object) -> dict[str, object]:
-    if not isinstance(value, dict):
-        return {}
-    return {str(k): v for k, v in value.items()}
-
-
 def _as_list(value: object) -> list[object]:
     return list(value) if isinstance(value, list) else []
 
@@ -89,127 +71,41 @@ def _as_str(value: object, default: str = "") -> str:
     return value if isinstance(value, str) else default
 
 
-def _opt_bool(typed: object, attr: str, block: Mapping[str, object], key: str) -> bool:
-    value = getattr(typed, attr, None)
-    if isinstance(value, bool):
-        return value
-    raw = block.get(key)
-    return raw if isinstance(raw, bool) else False
+def policy_for(cfg: MagentConfig) -> routing_mod.Policy:
+    """``settings.accounts`` as the planner's ``Policy``.
 
+    The planner takes plain values on purpose -- it predates the schema and has
+    to stay testable without one -- so somebody must map the config onto it, and
+    that somebody is whoever read the config. One translation, used by the
+    table, the plan and `doctor`'s check alike, so the three can never disagree
+    about whether routing is even on.
 
-def _opt_float(
-    typed: object, attr: str, block: Mapping[str, object], key: str, default: float
-) -> float:
-    for value in (getattr(typed, attr, None), block.get(key)):
-        # bool is an int subclass; a JSON `true` must not read back as 1 percent.
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return float(value)
-    return default
-
-
-def _opt_str(
-    typed: object, attr: str, block: Mapping[str, object], key: str, default: str
-) -> str:
-    for value in (getattr(typed, attr, None), block.get(key)):
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return default
-
-
-def _opt_map(
-    typed: object, attr: str, block: Mapping[str, object], key: str
-) -> dict[str, object]:
-    value = getattr(typed, attr, None)
-    if isinstance(value, dict):
-        return _as_dict(value)
-    return _as_dict(block.get(key))
-
-
-def _project_field(
-    typed: object, raw: Mapping[str, object], attr: str, key: str
-) -> str | None:
-    """One per-project routing field, typed-then-raw. None when unset."""
-    for value in (getattr(typed, attr, None), raw.get(key)):
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-# --- end of the temporary config adapter -------------------------------------
-
-
-def _policy(cfg: MagentConfig, raw: Mapping[str, object]) -> routing_mod.Policy:
-    """``settings.accountRouting`` as the planner's ``Policy``.
-
-    ``enabled`` defaults FALSE: a config that says nothing about routing must
-    behave exactly as it does today, and this feature ships dark.
+    Thresholds cross unchanged: both sides spell them as PERCENT, and the one
+    conversion to ccswap's 0-1 fractions happens inside the planner.
     """
     from magent import routing  # heavy subsystem: in-body per policy
 
-    typed = getattr(cfg.settings, "account_routing", None)
-    block = _as_dict(_as_dict(raw.get("settings")).get("accountRouting"))
-    per: dict[str, routing.AccountPolicy] = {}
-    for acct_id, value in _opt_map(typed, "per_account", block, "perAccount").items():
-        entry = _as_dict(value)
-        klass = _as_str(entry.get("class")).strip().lower()
-        per[str(acct_id)] = routing.AccountPolicy(
-            exclude=entry.get("exclude") is True,
-            klass=klass or None,
-            on_limit=_as_str(entry.get("onLimit")),
-        )
+    block = cfg.settings.accounts
     return routing.Policy(
-        enabled=_opt_bool(typed, "enabled", block, "enabled"),
-        soft_threshold=_opt_float(
-            typed, "soft_threshold", block, "softThreshold", 85.0
-        ),
-        hard_threshold=_opt_float(
-            typed, "hard_threshold", block, "hardThreshold", 95.0
-        ),
-        on_limit=_opt_str(
-            typed, "on_limit", block, "onLimit", routing.DEFAULT_ON_LIMIT
-        ),
-        stale_after_s=_opt_float(typed, "stale_after_s", block, "staleAfterS", 900.0),
-        per_account=per,
+        enabled=block.enabled,
+        soft_threshold=block.soft_threshold,
+        hard_threshold=block.hard_threshold,
+        on_limit=block.on_limit,
+        stale_after_s=block.stale_after_s,
+        per_account={
+            acct_id: routing.AccountPolicy(
+                exclude=override.exclude,
+                # The config normalises the spelling; lower-casing here as well
+                # costs nothing and keeps the comparison in the planner exact.
+                klass=(override.klass or "").strip().lower() or None,
+                on_limit=override.on_limit,
+            )
+            for acct_id, override in block.per_account.items()
+        },
     )
 
 
-def _raw_or_empty(config_file: Path) -> dict[str, object]:
-    """The raw config dict, or ``{}`` on any failure.
-
-    For the caller that already holds a validated typed config and must not be
-    able to fail on a second read of the same file -- `doctor`'s check, whose
-    whole contract is that it cannot move an exit code.
-    """
-    try:
-        return _as_dict(json.loads(config_file.read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        return {}
-
-
-def policy_for(cfg: MagentConfig, config_file: Path) -> routing_mod.Policy:
-    """``settings.accountRouting`` for a caller outside this module (`doctor`).
-
-    One reader for the routing settings, so the table, the plan and the health
-    check can never disagree about whether routing is even on.
-    """
-    return _policy(cfg, _raw_or_empty(config_file))
-
-
-def _load_both(
-    config_file: Path, *, as_json: bool = False
-) -> tuple[MagentConfig, dict[str, object]]:
-    """The typed config (validated) and the raw dict (round-trippable).
-
-    Typed first, deliberately: it owns the message for an unloadable config, and
-    reaching the raw loader at all proves the file is there and is an object.
-    """
-    cfg = _load_config_or_exit(config_file, as_json=as_json)
-    return cfg, _load_raw_config(config_file)
-
-
-def _projects(
-    cfg: MagentConfig, raw: Mapping[str, object]
-) -> list[routing_mod.Project]:
+def _projects(cfg: MagentConfig) -> list[routing_mod.Project]:
     """The projects routing applies to, in config order.
 
     ``psmux.eligible_projects`` decides the set, so this command can never
@@ -219,27 +115,16 @@ def _projects(
     """
     from magent import psmux, routing  # heavy subsystem: in-body per policy
 
-    raw_by_path: dict[str, dict[str, object]] = {}
-    for entry in _as_list(raw.get("projects")):
-        item = _as_dict(entry)
-        path = _as_str(item.get("path"))
-        if path and path not in raw_by_path:
-            raw_by_path[path] = item
     typed_by_path = {p.path: p for p in cfg.projects}
-
     out: list[routing.Project] = []
     for descriptor in psmux.eligible_projects(cfg):
-        path = _as_str(descriptor.get("path"))
-        typed = typed_by_path.get(path)
-        raw_project = raw_by_path.get(path, {})
+        project = typed_by_path.get(_as_str(descriptor.get("path")))
         out.append(
             routing.Project(
                 session=psmux.socket_id(descriptor),
                 name=_as_str(descriptor.get("name")),
-                account=_project_field(typed, raw_project, "account", "account"),
-                model_class=_project_field(
-                    typed, raw_project, "account_class", "accountClass"
-                ),
+                account=project.account if project else None,
+                model_class=project.model_class if project else None,
             )
         )
     return out
@@ -319,7 +204,6 @@ def _read_everything(
     config_file: Path, *, as_json: bool = False
 ) -> tuple[
     MagentConfig,
-    dict[str, object],
     accounts_mod.AccountsSnapshot,
     accounts_mod.SettingsReport,
     list[str],
@@ -333,12 +217,12 @@ def _read_everything(
     """
     from magent import accounts  # heavy subsystem: in-body per policy
 
-    cfg, raw = _load_both(config_file, as_json=as_json)
+    cfg = _load_config_or_exit(config_file, as_json=as_json)
     binary = accounts.find_ccswap()
     snapshot = accounts.read_accounts(ccswap=binary)
     settings = accounts.read_settings(ccswap=binary)
     version = accounts.read_version(ccswap=binary)
-    return cfg, raw, snapshot, settings, _refusals(snapshot, settings, version)
+    return cfg, snapshot, settings, _refusals(snapshot, settings, version)
 
 
 # --- rendering (ASCII only: these tables land in bug reports and log pastes) --
@@ -425,8 +309,8 @@ def _print_notes(
 ) -> None:
     if not policy.enabled:
         _note(
-            "account routing is OFF -- set settings.accountRouting.enabled to "
-            "true to turn it on (nothing routes until then)"
+            "account routing is OFF -- set settings.accounts.enabled to true to "
+            "turn it on (nothing routes until then)"
         )
     if snapshot.usage_age_s is not None and snapshot.usage_age_s > policy.stale_after_s:
         _note(
@@ -459,9 +343,9 @@ def _row(cells: list[str], widths: tuple[int, ...]) -> str:
 def _print_account_table(config_file: Path) -> None:
     from magent import accounts, routing  # heavy subsystem: in-body per policy
 
-    cfg, raw, snapshot, _settings, refusals = _read_everything(config_file)
-    policy = _policy(cfg, raw)
-    projects = _projects(cfg, raw)
+    cfg, snapshot, _settings, refusals = _read_everything(config_file)
+    policy = policy_for(cfg)
+    projects = _projects(cfg)
     prior = accounts.read_map()
     counts = _placement_counts(projects, prior)
     now = time.time()
@@ -498,7 +382,7 @@ def _print_account_table(config_file: Path) -> None:
     click.echo()
     if any(policy.account_policy(a.id).klass for a in snapshot.accounts):
         click.echo(
-            f"  {style('* class reserved in settings.accountRouting.perAccount', dim=True)}"
+            f"  {style('* class reserved in settings.accounts.perAccount', dim=True)}"
         )
     _print_notes(policy, snapshot, refusals)
     _print_placements(projects, prior)
@@ -714,12 +598,10 @@ def account_plan(ctx: click.Context, as_json: bool) -> None:
     from magent import accounts, routing  # heavy subsystem: in-body per policy
 
     config_file = find_config(ctx.obj.get("config_path"))
-    cfg, raw, snapshot, _settings, refusals = _read_everything(
-        config_file, as_json=as_json
-    )
-    policy = _policy(cfg, raw)
+    cfg, snapshot, _settings, refusals = _read_everything(config_file, as_json=as_json)
+    policy = policy_for(cfg)
     plan = routing.plan(
-        _projects(cfg, raw),
+        _projects(cfg),
         _snapshot_for_plan(snapshot, refusals),
         policy,
         accounts.read_map(),
@@ -745,8 +627,7 @@ def account_pin(ctx: click.Context, project: str, account: str) -> None:
     does not report is reported by `magent account plan`, with the pin ignored.
     """
     config_file = find_config(ctx.obj.get("config_path"))
-    cfg, raw = _load_both(config_file)
-    target = _project_or_exit(project, _projects(cfg, raw))
+    target = _project_or_exit(project, _projects(_load_config_or_exit(config_file)))
     _write_pin(config_file, target, account.strip())
     click.echo(
         f"  {style('OK', fg='green')} {style(target.name or target.session, bold=True)}"
@@ -764,8 +645,7 @@ def account_pin(ctx: click.Context, project: str, account: str) -> None:
 def account_unpin(ctx: click.Context, project: str) -> None:
     """Remove PROJECT's account pin, letting the planner place it again."""
     config_file = find_config(ctx.obj.get("config_path"))
-    cfg, raw = _load_both(config_file)
-    target = _project_or_exit(project, _projects(cfg, raw))
+    target = _project_or_exit(project, _projects(_load_config_or_exit(config_file)))
     _write_pin(config_file, target, None)
     click.echo(
         f"  {style('OK', fg='green')} {style(target.name or target.session, bold=True)}"
@@ -776,7 +656,7 @@ def account_unpin(ctx: click.Context, project: str) -> None:
 @account_group.command("refresh")
 @click.pass_context
 def account_refresh(ctx: click.Context) -> None:
-    """Ask ccswap to re-read usage older than settings.accountRouting.staleAfterS.
+    """Ask ccswap to re-read usage older than settings.accounts.staleAfterS.
 
     Interactive only. A bring-up never calls this: it must not block on somebody
     else's network read, and launch-time placement is exactly the use ccswap's
@@ -785,8 +665,7 @@ def account_refresh(ctx: click.Context) -> None:
     from magent import accounts  # heavy subsystem: in-body per policy
 
     config_file = find_config(ctx.obj.get("config_path"))
-    cfg, raw = _load_both(config_file)
-    policy = _policy(cfg, raw)
+    policy = policy_for(_load_config_or_exit(config_file))
     if not accounts.find_ccswap():
         click.echo(
             f"  {style('x', fg='red')} ccswap is not on PATH -- nothing to refresh.",

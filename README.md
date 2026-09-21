@@ -331,7 +331,7 @@ limit. **It ships off.** Nothing routes until you turn it on:
 ```jsonc
 // magent.config.json
 "settings": {
-  "accountRouting": { "enabled": true }   // softThreshold 85, hardThreshold 95
+  "accounts": { "enabled": true }   // softThreshold 85, hardThreshold 95
 }
 ```
 
