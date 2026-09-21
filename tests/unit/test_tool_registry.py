@@ -6,6 +6,8 @@ the whole point of the refactors.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from magent.launch import HAPPY_AGENTS
 from magent.sessions import (
     AGENT_TOOLS,
@@ -67,7 +69,7 @@ class TestOneEditExtensionProof:
         extended = dict(
             AGENT_TOOLS,
             mytool=AgentTool(
-                fresh_command=lambda base, d: (
+                fresh_command=lambda base, d, config_dir=None: (
                     base.replace(" --pickup", "") if d == "/new" else None
                 ),
             ),
@@ -79,6 +81,31 @@ class TestOneEditExtensionProof:
             build_start_command("mytool", "mytool --pickup", "/old")
             == "mytool --pickup"
         )
+
+    def test_a_tool_decides_for_itself_what_a_config_dir_means(self, monkeypatch):
+        """The registry asks each tool WHICH store answers for a project; the
+        tool answers. A store that is not account-scoped ignores the argument
+        (codex does exactly that) and one that is reads it -- still one dict
+        entry, with the callables carrying one more optional argument."""
+        seen: list[object] = []
+
+        def _fresh(base, d, config_dir=None):
+            seen.append(config_dir)
+            return None if config_dir else "mytool"
+
+        monkeypatch.setattr(
+            "magent.sessions.AGENT_TOOLS",
+            dict(AGENT_TOOLS, mytool=AgentTool(fresh_command=_fresh)),
+        )
+
+        assert build_start_command("mytool", "mytool --pickup", "/a") == "mytool"
+        assert (
+            build_start_command(
+                "mytool", "mytool --pickup", "/a", config_dir=Path("/profiles/13")
+            )
+            == "mytool --pickup"
+        )
+        assert seen == [None, Path("/profiles/13")]
 
 
 class TestBuildStartCommand:
@@ -108,13 +135,13 @@ class TestBuildStartCommand:
     def test_no_project_dir_runs_the_configured_command(self, monkeypatch):
         # A remote project's command runs on the far host: callers pass None
         # rather than deciding it from this machine's session store.
-        self._registry(monkeypatch, lambda base, d: "rewritten")
+        self._registry(monkeypatch, lambda base, d, config_dir=None: "rewritten")
         assert build_start_command("mytool", "mytool --go", None) == "mytool --go"
 
     def test_empty_command_stays_empty(self, monkeypatch):
         # eligible_projects uses "" to mean "this tool has no command at all";
         # the probe must not turn that into something runnable.
-        self._registry(monkeypatch, lambda base, d: "rewritten")
+        self._registry(monkeypatch, lambda base, d, config_dir=None: "rewritten")
         assert build_start_command("mytool", "", "/a/api") == ""
 
     def test_a_probe_that_fails_runs_the_configured_command(self, monkeypatch):
@@ -122,7 +149,7 @@ class TestBuildStartCommand:
         exists -- guessing "new" here would silently start a fresh chat over a
         conversation that does exist."""
 
-        def _boom(base, project_dir):
+        def _boom(base, project_dir, config_dir=None):
             raise PermissionError(13, "denied")
 
         self._registry(monkeypatch, _boom)
@@ -130,7 +157,8 @@ class TestBuildStartCommand:
 
     def test_claude_default_is_stripped_in_a_new_directory(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
-            "magent.sessions.claude.has_claude_session", lambda d, home=None: False
+            "magent.sessions.claude.has_claude_session",
+            lambda d, config_dir=None: False,
         )
         assert (
             build_start_command("claude", "claude --continue", str(tmp_path))
@@ -141,7 +169,7 @@ class TestBuildStartCommand:
         self, monkeypatch, tmp_path
     ):
         monkeypatch.setattr(
-            "magent.sessions.claude.has_claude_session", lambda d, home=None: True
+            "magent.sessions.claude.has_claude_session", lambda d, config_dir=None: True
         )
         assert (
             build_start_command("claude", "claude --continue", str(tmp_path))

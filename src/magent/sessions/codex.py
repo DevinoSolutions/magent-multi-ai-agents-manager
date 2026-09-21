@@ -14,7 +14,11 @@ def build_codex_resume(base_cmd: str, session_id: str | None) -> str:
 
 
 def codex_fresh_command(
-    base_cmd: str, project_dir: str, home_override: Path | None = None
+    base_cmd: str,
+    project_dir: str,
+    config_dir: Path | None = None,
+    *,
+    home_override: Path | None = None,
 ) -> str | None:
     """The codex twin of ``claude_fresh_command`` -- almost always None.
 
@@ -29,7 +33,13 @@ def codex_fresh_command(
     last session to resume. That form (and only that form) drops back to the
     bare binary. ``resume <id>`` is the user naming a session explicitly and is
     left alone, exactly like claude's ``--resume <id>``.
+
+    ``config_dir`` is accepted and ignored, on purpose -- see
+    ``get_codex_session_ids``. ``home_override`` is codex's own store seam and
+    stays keyword-only so the registry's positional third argument can never
+    land in it by accident.
     """
+    del config_dir  # deliberately ignored: codex's store is not account-scoped
     tokens = base_cmd.split()
     if "resume" not in tokens:
         return None
@@ -37,7 +47,10 @@ def codex_fresh_command(
     rest = tokens[at + 1 :]
     if rest[:1] != ["--last"]:
         return None
-    if get_codex_session_ids(project_dir, 1, home_override)[0] is not None:
+    if (
+        get_codex_session_ids(project_dir, 1, home_override=home_override)[0]
+        is not None
+    ):
         return None
     return " ".join(tokens[:at] + rest[1:])
 
@@ -45,8 +58,20 @@ def codex_fresh_command(
 def get_codex_session_ids(
     project_dir: str,
     count: int,
+    config_dir: Path | None = None,
+    *,
     home_override: Path | None = None,
 ) -> list[str | None]:
+    """``project_dir``'s stored codex session ids, newest first.
+
+    ``config_dir`` is the registry's "which store answers for this project"
+    argument and codex ACCEPTS AND IGNORES it. That is not an omission: it
+    names a claude ``CLAUDE_CONFIG_DIR`` profile, and codex keeps its sessions
+    in ``~/.codex``, one store per machine with no account scoping at all. The
+    question is legitimately per-tool, which is why the registry asks each tool
+    rather than resolving a path for them.
+    """
+    del config_dir  # deliberately ignored: codex's store is not account-scoped
     home = home_override or Path.home()
     sess_root = home / ".codex" / "sessions"
 
