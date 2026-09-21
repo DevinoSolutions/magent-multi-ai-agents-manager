@@ -353,14 +353,20 @@ Two ideas are worth knowing, because everything else follows from them:
   is machine state and lives in `~/.magent/account-map.json`, so a pin and a
   guess can never be confused on disk.
 - **Routing can never be the reason a launch fails.** ccswap missing, too old, a
-  required ccswap setting not in effect, duplicate accounts, no usable account —
-  every one of those prints a named reason and launches the fleet unrouted,
-  exactly as it does today. `magent account`/`plan` show each refusal with the
-  exact `ccswap config set ...` that clears it; magent never flips one for you.
+  required ccswap setting not in effect, the same login sitting in two ccswap
+  slots, no usable account — every one of those prints a named reason and
+  launches the fleet unrouted, exactly as it does today. `magent account`/`plan`
+  show each refusal with the exact `ccswap config set ...` that clears it; magent
+  never flips one for you.
 
-`magent doctor` reports the same thing under `account-routing`, as a warning at
-worst (it can never fail a doctor run), and `magent sessions --json` carries each
-session's `account` — `null` when it is unrouted.
+Three ccswap settings have to be right before anything routes:
+`profiles.persistent true`, `autoswitch.enabled false` and
+`autoswitch.warmupFiveHour false` — the last two because a global switch or a
+warm-up pass moves the active login and spends headroom magent just budgeted.
+`magent doctor` reports all three under `account-routing`, as a warning at worst
+(it can never fail a doctor run), and says so explicitly if your magent is too
+old to have checked one of them. `magent sessions --json` carries each session's
+`account` — `null` when it is unrouted.
 
 > **Expected, not a bug:** a *mutating* ccswap command typed inside a routed
 > agent pane refuses, because the pane exports `CLAUDE_CONFIG_DIR`. That is the

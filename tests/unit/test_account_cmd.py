@@ -305,7 +305,10 @@ class TestTheFiveRefusals:
         assert rows[0]["reason"] == "unrouted-no-data"
         assert any("autoswitch.enabled" in r and "not read" in r for r in refusals)
 
-    def test_duplicate_accounts(self, runner, tmp_config, tmp_path, ccswap):
+    def test_one_login_in_two_slots(self, runner, tmp_config, tmp_path, ccswap):
+        """The hazard is an ambiguous READING, not a shared organization: two
+        different logins under one org is ordinary and ccswap does not report
+        it, so the wording must not point anyone at that."""
         ccswap.set_accounts(
             [account("13")], duplicates=["13 and 14 report the same login"]
         )
@@ -314,7 +317,8 @@ class TestTheFiveRefusals:
         rows, refusals = self._refused(runner, cfg)
 
         assert rows[0]["reason"] == "unrouted-no-data"
-        assert any("duplicate accounts" in r for r in refusals)
+        assert any("same login in more than one slot" in r for r in refusals)
+        assert not any("organization" in r.lower() for r in refusals)
 
     def test_ccswap_that_will_not_answer(self, runner, tmp_config, tmp_path, ccswap):
         ccswap.set_mode("rc1")

@@ -1824,14 +1824,17 @@ exists to make checkable.
 than `MIN_CCSWAP_VERSION`, a required ccswap setting not in effect, a non-empty
 `duplicateAccountWarnings`, a snapshot error, or no eligible account. The first
 three invalidate the whole *snapshot* rather than any one account (duplicates
-most sharply: two slots claiming one login means a utilization reading may be
-attributed to the wrong account, so placing work on those numbers places it by
-somebody else's), so they are handed to the planner as an ERROR snapshot and
-every row comes back `unrouted-no-data` out of the closed vocabulary. No new
-reason code, no second code path, and routing can never be the reason a bring-up
-fails. Each refusal prints the exact `ccswap config set ...` that clears it and
-magent never runs it: the `wt-keys` posture, where the user's own configuration
-always wins and magent warns and skips.
+most sharply: the same login present in more than one slot makes it ambiguous
+whose quota a reading describes, so placing work on those numbers places it by
+somebody else's — it is emphatically **not** about two different logins sharing
+an organization, which is an ordinary setup ccswap deliberately does not report,
+and wording that blurred the two would send people hunting a non-problem), so
+they are handed to the planner as an ERROR snapshot and every row comes back
+`unrouted-no-data` out of the closed vocabulary. No new reason code, no second
+code path, and routing can never be the reason a bring-up fails. Each refusal
+prints the exact `ccswap config set ...` that clears it and magent never runs
+it: the `wt-keys` posture, where the user's own configuration always wins and
+magent warns and skips.
 
 **Two measured facts drive the user-facing wording.** Switching the *active
 slot* (the ccswap TUI, `ccswap switch`, autoswitch) rewrites
@@ -1842,6 +1845,17 @@ why the README says so beside the feature. And a mutating `ccswap` command typed
 That reads like a bug and is the safety property working: it is what stops a
 stray `ccswap switch` in one window moving the active login out from under sixty
 sessions. Both are documented as expected behaviour, not worked around.
+
+The settings half has a **third** state that is neither "right" nor "wrong", and
+it gets its own wording: a required setting this build never *asked* about.
+`accounts.read_settings` answers for the keys it knows, so a key added to the
+contract after a magent shipped is simply absent from the report — and absence
+there reads as "verified" when it means "not verified". `doctor` names those
+explicitly (`_WANTED_CCSWAP_SETTINGS`, today `profiles.persistent`,
+`autoswitch.enabled` and `autoswitch.warmupFiveHour`), because an unverified
+`warmupFiveHour` spends exactly the headroom the planner just budgeted, silently.
+It is carried on every verdict including the OK one, since a gap in what the
+check PROVED is not something to hide behind a louder finding.
 
 `doctor`'s `account-routing` check is WARN-at-worst on the `wt-keys` precedent —
 every condition it reports degrades to "launches unrouted", which is today's

@@ -753,6 +753,10 @@ class TestCheckAccountRouting:
     def test_duplicate_accounts_warn_and_refuse_to_route(
         self, monkeypatch, tmp_config, tmp_path
     ):
+        """Worded as the hazard it is -- the SAME LOGIN in two slots, which makes
+        it ambiguous whose quota a reading describes. Two different logins
+        sharing an organization is an ordinary setup that ccswap deliberately
+        does not report, and this check must not send anyone hunting it."""
         fake = self._ccswap(tmp_path, monkeypatch)
         fake.set_accounts([ccswap_account("13")], duplicates=["13 and 14 collide"])
         cfg, path = self._cfg(tmp_config, tmp_path, {"enabled": True})
@@ -760,7 +764,62 @@ class TestCheckAccountRouting:
         status, detail = doctor._check_account_routing(cfg, path)
 
         assert status == WARN
+        assert "same login in more than one slot" in detail
         assert "will not route on it" in detail
+        assert "organization" not in detail.lower()
+
+    def test_a_setting_this_build_never_asked_about_is_named(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        """The third state, between "wrong value" and "could not read": nobody
+        looked. An unverified `autoswitch.warmupFiveHour` spends exactly the
+        headroom the planner budgeted, so silence about it is not acceptable."""
+        fake = self._ccswap(tmp_path, monkeypatch)
+        fake.set_accounts([ccswap_account("13")])
+        cfg, path = self._cfg(tmp_config, tmp_path, {"enabled": True})
+
+        status, detail = doctor._check_account_routing(cfg, path)
+
+        checked = {key for key, _wanted, _why, _fix in accounts_mod.REQUIRED_SETTINGS}
+        unchecked = [k for k, _ in doctor._WANTED_CCSWAP_SETTINGS if k not in checked]
+        assert status == OK
+        for key in unchecked:
+            assert key in detail
+        assert ("not verified by this build" in detail) is bool(unchecked)
+
+    def test_it_goes_quiet_once_accounts_checks_every_setting(
+        self, monkeypatch, tmp_config, tmp_path
+    ):
+        """Forward pin: the moment `accounts.REQUIRED_SETTINGS` learns the third
+        key, this check stops reporting it as unverified and starts reporting its
+        VALUE like the other two -- without an edit here."""
+        wanted = {
+            "profiles.persistent": True,
+            "autoswitch.enabled": False,
+            "autoswitch.warmupFiveHour": False,
+        }
+        monkeypatch.setattr(
+            "magent.accounts.REQUIRED_SETTINGS",
+            tuple(
+                (key, value, "why", f"ccswap config set {key} {str(value).lower()}")
+                for key, value in wanted.items()
+            ),
+        )
+        fake = self._ccswap(tmp_path, monkeypatch, settings=dict(wanted))
+        fake.set_accounts([ccswap_account("13")])
+        cfg, path = self._cfg(tmp_config, tmp_path, {"enabled": True})
+
+        status, detail = doctor._check_account_routing(cfg, path)
+
+        assert status == OK
+        assert "not verified by this build" not in detail
+
+        fake.set_settings({**wanted, "autoswitch.warmupFiveHour": True})
+        status, detail = doctor._check_account_routing(cfg, path)
+
+        assert status == WARN
+        assert "autoswitch.warmupFiveHour" in detail
+        assert "ccswap config set autoswitch.warmupFiveHour false" in detail
 
     def test_a_drifting_slot_is_named_on_the_ok_path(
         self, monkeypatch, tmp_config, tmp_path

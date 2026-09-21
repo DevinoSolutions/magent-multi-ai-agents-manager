@@ -262,9 +262,12 @@ def _refusals(
 
     Version and settings come first because they invalidate the whole snapshot
     rather than any one account. ``duplicate_warnings`` is the sharpest of them:
-    two slots claiming one login means a utilization reading may be attributed
-    to the wrong account, so the distrust is of the SNAPSHOT, not of an account,
-    and routing on it would place work by somebody else's numbers.
+    the SAME LOGIN present in more than one slot makes it ambiguous whose quota
+    a reading describes, so the distrust is of the SNAPSHOT, not of an account,
+    and routing on it would place work by somebody else's numbers. It is not
+    about two different logins sharing an ORGANIZATION -- that is an ordinary
+    setup which ccswap deliberately does not report, and wording that blurred
+    the two would send people hunting a non-problem.
     """
     from magent import accounts  # heavy subsystem: in-body per policy
 
@@ -280,8 +283,9 @@ def _refusals(
         out.append(f"{settings.error} -- magent will not read that as a yes")
     if snapshot.duplicate_warnings:
         out.append(
-            "ccswap reports duplicate accounts, so a utilization reading may "
-            "belong to the wrong slot: " + "; ".join(snapshot.duplicate_warnings)
+            "ccswap reports the same login in more than one slot, so a "
+            "utilization reading may be attributed to the wrong account: "
+            + "; ".join(snapshot.duplicate_warnings)
         )
     if snapshot.error:
         out.append(snapshot.error)

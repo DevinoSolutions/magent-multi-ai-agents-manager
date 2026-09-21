@@ -376,6 +376,60 @@ def _unusable_accounts(snapshot: accounts_mod.AccountsSnapshot) -> list[str]:
     return out
 
 
+# The ccswap settings magent must be able to VERIFY before it routes, with the
+# value each one needs. `accounts.REQUIRED_SETTINGS` is the authority on what is
+# actually read; this names them again for one purpose only -- to notice a key
+# that was never ASKED about, because a key added to the contract after this
+# magent shipped is simply absent from the report, and absence there reads as
+# "verified" when it means "not verified". Delete an entry here only when it
+# leaves the contract, and if a name ever disagrees with `accounts`' spelling
+# the check says so out loud rather than going quiet.
+_WANTED_CCSWAP_SETTINGS: tuple[tuple[str, str], ...] = (
+    ("profiles.persistent", "true"),
+    ("autoswitch.enabled", "false"),
+    ("autoswitch.warmupFiveHour", "false"),
+)
+
+
+def _unverified_settings(report: accounts_mod.SettingsReport) -> str:
+    """The required ccswap settings this build never asked about, or ``""``.
+
+    Distinct from a setting that read the wrong value (that is a `problem`) and
+    from one that could not be read (that is the report's `error`): this is the
+    third state, where nobody looked. It is named rather than assumed, because
+    an unverified `autoswitch.warmupFiveHour` spends the very headroom the
+    planner just budgeted, silently.
+    """
+    missing = [
+        f"{key} (magent needs {wanted})"
+        for key, wanted in _WANTED_CCSWAP_SETTINGS
+        if key not in report.values
+    ]
+    if not missing:
+        return ""
+    return (
+        f"not verified by this build: {', '.join(missing)} -- upgrade magent, or "
+        "check by hand with `ccswap config get <key>`"
+    )
+
+
+def _duplicate_login_warning(warnings: tuple[str, ...]) -> str:
+    """The duplicate-slot refusal, worded as the hazard it actually is.
+
+    ccswap reports this when the SAME LOGIN is present in more than one slot,
+    which makes it ambiguous whose quota a utilization reading describes -- so
+    magent refuses to place work by numbers that may belong to another account.
+    It is emphatically NOT about two different logins sharing an organization:
+    that is a perfectly ordinary setup, and ccswap deliberately does not report
+    it. Wording that blurred the two would send people hunting a non-problem.
+    """
+    return (
+        "ccswap reports the same login in more than one slot, so a utilization "
+        "reading may be attributed to the wrong account -- magent will not route "
+        "on it: " + "; ".join(warnings)
+    )
+
+
 def _check_account_routing(cfg: MagentConfig | None, config_file: Path) -> CheckResult:
     """Can per-project account routing work -- and is any slot drifting?
 
@@ -414,23 +468,21 @@ def _check_account_routing(cfg: MagentConfig | None, config_file: Path) -> Check
             ),
         )
     settings = accounts.read_settings(ccswap=binary)
+    # Carried by every verdict from here on, including the OK one: a setting
+    # nobody read is a gap in what this check PROVED, and hiding it behind a
+    # louder finding is how it would stay unnoticed.
+    unverified = _unverified_settings(settings)
+    notes = f"\n{unverified}" if unverified else ""
     if settings.problems:
-        return (WARN, "; ".join(settings.problems))
+        return (WARN, "; ".join(settings.problems) + notes)
     if settings.error:
-        return (WARN, f"{settings.error} -- magent will not read that as a yes")
+        return (WARN, f"{settings.error} -- magent will not read that as a yes{notes}")
 
     snapshot = accounts.read_accounts(ccswap=binary)
     if snapshot.error:
-        return (WARN, snapshot.error)
+        return (WARN, snapshot.error + notes)
     if snapshot.duplicate_warnings:
-        return (
-            WARN,
-            (
-                "ccswap reports duplicate accounts, so a utilization reading may "
-                "belong to the wrong slot -- magent will not route on it: "
-                + "; ".join(snapshot.duplicate_warnings)
-            ),
-        )
+        return (WARN, _duplicate_login_warning(snapshot.duplicate_warnings) + notes)
     usable = [
         a
         for a in snapshot.accounts
@@ -448,14 +500,14 @@ def _check_account_routing(cfg: MagentConfig | None, config_file: Path) -> Check
             WARN,
             (
                 f"{len(snapshot.accounts)} ccswap account(s), none of them both "
-                f"eligible and hydrated -- nothing to route to{age}{tail}"
+                f"eligible and hydrated -- nothing to route to{age}{tail}{notes}"
             ),
         )
     return (
         OK,
         (
             f"{len(usable)}/{len(snapshot.accounts)} ccswap account(s) can host "
-            f"work{age}{tail}"
+            f"work{age}{tail}{notes}"
         ),
     )
 
