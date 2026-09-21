@@ -28,8 +28,16 @@ REAL_HOME = Path.home()
 REAL_MAGENT_DIR = REAL_HOME / ".magent"
 # The product state directories under that home -- NOT the home itself, because
 # on Windows the pytest tmp root lives at %LOCALAPPDATA%\Temp, i.e. inside it.
-# These are the trees a leaking test actually damages.
-_REAL_STATE_ROOTS = (REAL_MAGENT_DIR, REAL_HOME / ".claude")
+# These are the trees a leaking test actually damages. ~/.claude-swap-backup is
+# the ccswap store: it holds the user's real account CREDENTIALS, magent never
+# reads or writes inside it, and listing it here makes guard A flag any magent
+# module attribute that ever points into it -- automatically, for code nobody
+# has written yet.
+_REAL_STATE_ROOTS = (
+    REAL_MAGENT_DIR,
+    REAL_HOME / ".claude",
+    REAL_HOME / ".claude-swap-backup",
+)
 
 # Tests under this directory keep the machine's own home. tests/platform is the
 # CI-only tier that drives REAL windows, monitors and psmux against the session
@@ -74,6 +82,7 @@ _IMPORT_BOUND_PATHS = (
     ("magent.upload_server", "_PICKER_ATTACHED_FILE", "picker-attached"),
     ("magent.upload_server", "_UPLOAD_DIR", "uploads"),
     ("magent.psmux", "DECOR_STAMP", "decor.stamp"),
+    ("magent.accounts", "ACCOUNT_MAP_PATH", "account-map.json"),
     # win32-only module (it raises ImportError elsewhere by design), so this
     # entry is skipped rather than imported off-Windows.
     ("magent.hotkey", "_PID_PATH", "hotkey.pid"),
