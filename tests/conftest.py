@@ -206,6 +206,11 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     log.reset_logging()
 
 
+# Not tidiness: the installed ccswap's `list` runs a credential ADOPTION pass
+# that WRITES to the user's real store, so a test that forgets its fake can
+# mutate live credentials. Pinned by EFFECT (and by why MAGENT_ACCOUNT_ROUTING=0
+# does not cover it) in
+# tests/unit/test_home_isolation.py::TestNoTestResolvesTheRealCcswap.
 @pytest.fixture(autouse=True)
 def _no_real_ccswap(monkeypatch):
     """No test resolves the REAL ``ccswap`` binary. A test that installed no
