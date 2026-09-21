@@ -34,7 +34,7 @@ The two loud rules, each learned from a measurement:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 from magent.accounts import EMPTY_WINDOW, SUBSCRIPTION_KIND
@@ -223,6 +223,11 @@ def _until(resets_at: float | None, now: float) -> str:
     if remaining <= 0:
         return ""
     hours, minutes = divmod(remaining // 60, 60)
+    days, hours = divmod(hours, 24)
+    # A 7-day window resets days out, and "in 135h 27m" is a number nobody
+    # converts in their head -- the largest unit present leads.
+    if days:
+        return f"in {days}d {hours:02d}h"
     return f"in {hours}h {minutes:02d}m" if hours else f"in {minutes}m"
 
 
@@ -510,11 +515,66 @@ def policy_from_settings(settings: AccountSettings) -> Policy:
         per_account={
             acct: AccountPolicy(
                 exclude=override.exclude,
-                klass=override.klass,
+                # The config normalises the spelling already; doing it here too
+                # costs nothing and keeps the planner's comparison exact for a
+                # hand-built settings object that never went through a load.
+                klass=(override.klass or "").strip().lower() or None,
                 on_limit=override.on_limit,
             )
             for acct, override in settings.per_account.items()
         },
+    )
+
+
+def routing_allowed() -> bool:
+    """``MAGENT_ACCOUNT_ROUTING`` -- the product-wide kill switch.
+
+    The mapping layer's one impure edge, and it is here rather than at each
+    call site so the launch path and `magent account` cannot disagree about
+    whether routing is on: a preview that ignored the switch would show routed
+    rows for a fleet about to come up unrouted.
+
+    An environment magent cannot parse is NOT read as an opt-out -- the config
+    still decides, and `doctor`'s env check is the surface that names the
+    broken variable. Guessing "off" here would disable a working fleet's
+    routing over an unrelated typo.
+    """
+    from pydantic import ValidationError  # heavy subsystem: in-body per policy
+
+    from magent import env  # heavy subsystem: in-body per policy
+
+    try:
+        return env.get_env().account_routing
+    except ValidationError:
+        return True
+
+
+def policy_for(settings: AccountSettings) -> Policy:
+    """``policy_from_settings`` with the kill switch folded in.
+
+    The function every caller that has a config should use; the pure mapping
+    above stays available for tests that want a policy with no environment in
+    the question. `plan` itself is untouched by either -- it is handed a
+    ``Policy`` and never asks where it came from.
+    """
+    policy = policy_from_settings(settings)
+    if policy.enabled and not routing_allowed():
+        return replace(policy, enabled=False)
+    return policy
+
+
+def routing_off_reason() -> str:
+    """WHICH gate is holding routing off -- there are two, and they need
+    different actions. Naming the config key while an environment variable is
+    the real cause sends someone to edit a file that is already correct."""
+    if not routing_allowed():
+        return (
+            "account routing is OFF -- MAGENT_ACCOUNT_ROUTING=0 is set, which "
+            "overrides the config; unset it to route again"
+        )
+    return (
+        "account routing is OFF -- set settings.accounts.enabled to true to turn "
+        "it on (nothing routes until then)"
     )
 
 

@@ -90,11 +90,21 @@ sys.exit(0)
 # The ccswap build these shapes were taken from.
 FAKE_VERSION = "ccswap 0.31.0+pr308.2"
 
-# `ccswap config get` answers a strict boolean. Both PRODUCT defaults are the
-# value magent cannot route under (persistent profiles off, autoswitch on), so
-# the fake's default settings are deliberately the unhappy ones.
-DEFAULT_SETTINGS = {"profiles.persistent": False, "autoswitch.enabled": True}
-MAGENT_READY_SETTINGS = {"profiles.persistent": True, "autoswitch.enabled": False}
+# `ccswap config get` answers a strict boolean, and these are the PRODUCT
+# defaults verbatim: two of them are the value magent cannot route under
+# (persistent profiles off, autoswitch on), so the fake's default settings are
+# deliberately the unhappy ones -- while the five-hour warm-up is opt-in and
+# starts off, which is the value magent needs.
+DEFAULT_SETTINGS = {
+    "profiles.persistent": False,
+    "autoswitch.enabled": True,
+    "autoswitch.warmupFiveHour": False,
+}
+MAGENT_READY_SETTINGS = {
+    "profiles.persistent": True,
+    "autoswitch.enabled": False,
+    "autoswitch.warmupFiveHour": False,
+}
 
 
 def account(
