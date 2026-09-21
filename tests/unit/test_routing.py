@@ -289,6 +289,21 @@ class TestStickiness:
         assert "97%" in row.warning
         assert "resets in 2h 05m" in row.warning
 
+    def test_a_seven_day_reset_is_counted_in_days(self):
+        # The 7-day window resets days out, and "in 135h 27m" is a number
+        # nobody converts in their head -- the largest unit present leads.
+        result = plan(
+            [proj("api")],
+            snap(
+                acct("13", five=0.10, seven=0.97, resets=NOW + 5 * 86400 + 15 * 3600),
+                acct("15", five=0.01),
+            ),
+            pol(hard_threshold=95.0),
+            {"api": MapEntry(account="13")},
+            now=NOW,
+        )
+        assert "resets in 5d 15h" in (row_of(result, "api").warning or "")
+
     @pytest.mark.parametrize(
         ("broken", "expected_in_warning"),
         [
