@@ -746,21 +746,29 @@ def _route_projects(
     # machine, where magent sets no environment at all, and an IDE window is not
     # an agent pane -- neither can be routed, and pretending otherwise would put
     # an account in a table for a window that never reads it.
-    candidates = [
-        p
-        for p in projects
-        if p.enabled
-        and not p.host
-        and not is_ide_tool(p.tool or config.settings.default_tool)
-    ]
+    # Same rules as `psmux.eligible_projects`, INCLUDING its first-occurrence-
+    # wins de-duplication by session id: two config entries that resolve to one
+    # session are one pane, and planning it twice would place one account in
+    # the map and start the pane on the other. Not delegated to that function
+    # because it probes each project's stored sessions to build a command, and
+    # WHICH store to probe is the answer this phase has not computed yet.
+    candidates: dict[str, ProjectConfig] = {}
+    for p in projects:
+        if (
+            not p.enabled
+            or p.host
+            or is_ide_tool(p.tool or config.settings.default_tool)
+        ):
+            continue
+        candidates.setdefault(routing_session_id(p), p)
     if not candidates:
         return RoutePlan()
 
     prior_map = accounts.read_map()
     planned = routing.plan(
         [
-            routing.project_from_config(p, session=routing_session_id(p))
-            for p in candidates
+            routing.project_from_config(p, session=session)
+            for session, p in candidates.items()
         ],
         snapshot,
         policy,
