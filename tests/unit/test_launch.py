@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -22,6 +23,7 @@ from magent.launch import (
     _dispatch_cli_agent_project,
     _dispatch_ide_project,
     _expand_base_dir,
+    _get_session_ids,
     _launch_projects,
     _LaunchResult,
     _prepare_grid,
@@ -1119,6 +1121,34 @@ class TestWindowTitlePrefixDisabled:
         assert seen == [("proj", "exact")]
 
 
+class TestGetSessionIdsNamesTheStore:
+    """The multi-window resume scan asks the registry for ids; which STORE
+    answers is the caller's to name. None -- what every unrouted project
+    passes -- is the tool's own default store, i.e. today's answer."""
+
+    def test_the_config_dir_reaches_the_registry_callable(self, monkeypatch):
+        seen: list[object] = []
+
+        def _ids(project_dir, count, config_dir=None):
+            seen.append(config_dir)
+            return ["sid-1"] + [None] * (count - 1)
+
+        from magent.sessions import AGENT_TOOLS, AgentTool
+
+        # launch.py holds its own reference to the registry -- patch THAT one.
+        monkeypatch.setattr(
+            "magent.launch.AGENT_TOOLS",
+            dict(AGENT_TOOLS, mytool=AgentTool(session_ids=_ids)),
+        )
+        profile = Path("profiles") / "13"
+        assert _get_session_ids("mytool", "/a/api", 2) == ["sid-1", None]
+        assert _get_session_ids("mytool", "/a/api", 2, profile) == ["sid-1", None]
+        assert seen == [None, profile]
+
+    def test_a_tool_with_no_probe_still_answers_nothing(self):
+        assert _get_session_ids("ghost", "/a/api", 3) == [None, None, None]
+
+
 class TestFreshStartInANewProjectDirectory:
     """`claude --continue` resumes the CWD's most recent conversation. In a
     project directory that never hosted one -- one just added to magent, a
@@ -1132,7 +1162,7 @@ class TestFreshStartInANewProjectDirectory:
     def _dispatch(self, monkeypatch, proj, cfg, *, has_session, is_remote=False):
         monkeypatch.setattr(
             "magent.sessions.claude.has_claude_session",
-            lambda project_dir, home_override=None: has_session,
+            lambda project_dir, config_dir=None: has_session,
         )
         fp = FakePlatform()
         _dispatch_cli_agent_project(
@@ -1182,7 +1212,7 @@ class TestFreshStartInANewProjectDirectory:
         )
         monkeypatch.setattr(
             "magent.sessions.claude.has_claude_session",
-            lambda project_dir, home_override=None: pytest.fail(
+            lambda project_dir, config_dir=None: pytest.fail(
                 "probed the local session store for a remote project"
             ),
         )
@@ -1259,7 +1289,9 @@ class TestPerWindowToolOverride:
         # Fake session discovery: the base tool's ids, one per window.
         monkeypatch.setattr(
             "magent.launch._get_session_ids",
-            lambda _tool, _dir, _count: list(session_ids),
+            # The trailing config dir is which STORE answers for the project:
+            # None for every unrouted one, which is what this test is.
+            lambda _tool, _dir, _count, _config_dir=None: list(session_ids),
         )
         targets: list[_Target] = []
         return _dispatch_cli_agent_project(

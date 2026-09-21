@@ -18,18 +18,24 @@ from magent.sessions.codex import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
 
 @dataclass(frozen=True)
 class AgentTool:
     """Per-tool capabilities of a CLI agent (claude, codex, ...)."""
 
-    session_ids: Callable[[str, int], list[str | None]] | None = None
+    # (project_dir, count, config_dir) -> that directory's resumable session
+    # ids, newest first. `config_dir` names WHICH STORE answers for the project
+    # (claude's CLAUDE_CONFIG_DIR); None means the tool's default store, which
+    # is what every unrouted project passes. A tool whose store is not
+    # account-scoped accepts and ignores it -- see `sessions/codex.py`.
+    session_ids: Callable[[str, int, Path | None], list[str | None]] | None = None
     resume_command: Callable[[str, str | None], str] | None = None
-    # (base_cmd, project_dir) -> the command to run when that directory has NO
-    # prior session for this tool to resume, or None to run base_cmd unchanged.
-    # See `build_start_command`.
-    fresh_command: Callable[[str, str], str | None] | None = None
+    # (base_cmd, project_dir, config_dir) -> the command to run when that
+    # directory has NO prior session for this tool to resume in that store, or
+    # None to run base_cmd unchanged. See `build_start_command`.
+    fresh_command: Callable[[str, str, Path | None], str | None] | None = None
     happy: bool = False  # can be wrapped with `happy` for mobile access
 
     @property
@@ -60,7 +66,13 @@ def build_resume_command(tool: str, base_cmd: str, session_id: str | None) -> st
     return base_cmd
 
 
-def build_start_command(tool: str, base_cmd: str, project_dir: str | None) -> str:
+def build_start_command(
+    tool: str,
+    base_cmd: str,
+    project_dir: str | None,
+    *,
+    config_dir: Path | None = None,
+) -> str:
     """``base_cmd``, with its implicit "resume the latest conversation" flag
     dropped when ``project_dir`` has nothing to resume.
 
@@ -84,13 +96,20 @@ def build_start_command(tool: str, base_cmd: str, project_dir: str | None) -> st
     ``project_dir`` must be a directory on the machine that will RUN the
     command: pass None for a remote project rather than deciding it from this
     machine's session store.
+
+    ``config_dir`` names WHICH of that tool's stores the probe must answer
+    from -- the config directory the pane will run under. None is the tool's
+    default store and reads exactly the files it always read; a routed pane
+    passes its account's profile, because that is the store its transcripts
+    will land in. Keyword-only: this is a property of the environment the
+    command runs in, never a fourth thing to confuse with the command itself.
     """
     caps = AGENT_TOOLS.get(tool)
     if not base_cmd or not project_dir or not caps or not caps.fresh_command:
         return base_cmd
     log = get_logger("launch")
     try:
-        fresh = caps.fresh_command(base_cmd, project_dir)
+        fresh = caps.fresh_command(base_cmd, project_dir, config_dir)
     except OSError:
         # A probe that cannot read the session store proves nothing about
         # whether a session exists. Keep the configured command and say so.

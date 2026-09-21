@@ -21,7 +21,8 @@ from pathlib import Path
 
 import pytest
 
-from magent import lockfile
+from magent import accounts, cli, lockfile
+from magent.config import SCHEMA_VERSION
 from tests.conftest import (
     PLAYWRIGHT_BROWSERS_PATH,
     REAL_HOME,
@@ -31,6 +32,7 @@ from tests.conftest import (
     _playwright_browsers_path,
     _tripwire_disabled,
 )
+from tests.unit._fake_ccswap import MAGENT_READY_SETTINGS, make_fake_ccswap
 
 # The per-test guards are a dev-machine device: CI homes are disposable and
 # some CI-only tiers write them on purpose, so the tripwire stands down there
@@ -167,6 +169,89 @@ class TestTheTripwireFires:
             "a constant pointing at the real ~/.magent went unreported"
         )
         assert _leaked_module_paths() == []
+
+
+class TestNoTestResolvesTheRealCcswap:
+    """``tests/conftest.py::_no_real_ccswap``, pinned by its EFFECT.
+
+    The hazard is not tidiness. ccswap owns the user's account CREDENTIALS, the
+    installed build (0.31.0+pr308.2) performs a credential ADOPTION pass on
+    ``list`` that WRITES to that store, and no HOME redirect contains a binary
+    resolved off PATH -- so a unit test that forgets its fake does not merely
+    read something it shouldn't, it can mutate the user's real credentials. One
+    already did: a test written for `magent account` spawned the real ccswap
+    three times before this fixture existed.
+
+    **The env pin is not what stops it.** With ``MAGENT_ACCOUNT_ROUTING=0`` --
+    the value `conftest` applies to every tier -- `magent account` and `magent
+    account plan` each still call ``find_ccswap()`` four times, because that
+    variable gates ROUTING, not READING: the table's whole job is to explain
+    WHY routing is off, and it has to ask ccswap to do that. Only this fixture
+    keeps the real binary out of a test run, which is why the pins below assert
+    what it DOES rather than that it is present -- a test that merely checked
+    for the fixture would be deletable in the same breath as the fixture.
+    """
+
+    def _config(self, tmp_config, tmp_path) -> str:
+        """Routing ENABLED, so the command genuinely wants ccswap."""
+        return tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "projects": [{"path": str(tmp_path / "api"), "title": "api"}],
+                "settings": {"accounts": {"enabled": True}},
+            }
+        )
+
+    def test_a_ccswap_on_path_is_still_not_resolved(self, tmp_path, monkeypatch):
+        """A real executable named ``ccswap`` sits on PATH -- the shape of any
+        developer install -- and the resolver must still answer "not installed".
+
+        This is the half that also fails on CI, where no real ccswap exists:
+        delete the fixture and this goes red everywhere, not only on the one
+        machine that has credentials to lose. No ``cache_clear`` is needed (or
+        possible): the guard replaces the resolver outright rather than seeding
+        its cache.
+        """
+        fake = make_fake_ccswap(tmp_path)
+        monkeypatch.setenv("PATH", str(fake.base))
+
+        assert accounts.find_ccswap() is None
+
+    def test_a_read_only_command_spawns_nothing(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        spawned: list[list[str]] = []
+        monkeypatch.setattr(
+            accounts, "_run", lambda args, timeout: spawned.append(list(args))
+        )
+
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_config, tmp_path), "account"]
+        )
+
+        assert result.exit_code == 0
+        assert spawned == [], f"a ccswap subprocess was built: {spawned}"
+        # ...and it reached for ccswap anyway, under the env pin. That is the
+        # measurement this whole class exists for, asserted rather than recited.
+        assert "MAGENT_ACCOUNT_ROUTING=0" in result.output
+
+    def test_the_same_command_does_shell_out_to_a_fake(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        """The control, without which the pin above is vacuous: give that exact
+        invocation a resolvable ccswap and it spawns one immediately. So "no
+        subprocess" is the guard working, not the command having nothing to do.
+        """
+        fake = make_fake_ccswap(tmp_path)
+        fake.set_settings(MAGENT_READY_SETTINGS)
+        monkeypatch.setattr("magent.accounts.find_ccswap", lambda: fake.path)
+
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_config, tmp_path), "account"]
+        )
+
+        assert result.exit_code == 0
+        assert any(call[:1] == ["list"] for call in fake.calls()), fake.calls()
 
 
 class TestEnvInspection:

@@ -360,7 +360,7 @@ class TestEligibleProjectsFreshStart:
     def _cmd(self, monkeypatch, tmp_path, *, has_session):
         monkeypatch.setattr(
             "magent.sessions.claude.has_claude_session",
-            lambda project_dir, home_override=None: has_session,
+            lambda project_dir, config_dir=None: has_session,
         )
         cfg = _cfg(
             [ProjectConfig(path=str(tmp_path), tool="claude", title="api")],
@@ -382,7 +382,7 @@ class TestEligibleProjectsFreshStart:
         # verdict taken with no evidence.
         monkeypatch.setattr(
             "magent.sessions.claude.has_claude_session",
-            lambda project_dir, home_override=None: pytest.fail(
+            lambda project_dir, config_dir=None: pytest.fail(
                 "probed a folder that does not resolve"
             ),
         )
@@ -391,6 +391,32 @@ class TestEligibleProjectsFreshStart:
             tools={"claude": "claude --continue"},
         )
         assert psmux.eligible_projects(cfg)[0]["cmd"] == "claude --continue"
+
+    def test_a_named_store_answers_for_that_session(self, monkeypatch, tmp_path):
+        """`config_dirs` says WHICH store each session's probe reads -- keyed
+        by psmux session id, the key the rest of the product already uses. A
+        session absent from the mapping keeps the default store."""
+        seen: dict[str, object] = {}
+
+        def _probe(project_dir, config_dir=None):
+            seen[project_dir] = config_dir
+            return config_dir is None
+
+        monkeypatch.setattr("magent.sessions.claude.has_claude_session", _probe)
+        api, web = tmp_path / "api", tmp_path / "web"
+        api.mkdir()
+        web.mkdir()
+        cfg = _cfg(
+            [
+                ProjectConfig(path=str(api), tool="claude", title="api"),
+                ProjectConfig(path=str(web), tool="claude", title="web"),
+            ],
+            tools={"claude": "claude --continue"},
+        )
+        profile = tmp_path / "profiles" / "13"
+        out = psmux.eligible_projects(cfg, config_dirs={"api": profile})
+        assert [p["cmd"] for p in out] == ["claude", "claude --continue"]
+        assert seen == {str(api): profile, str(web): None}
 
     def test_a_tool_with_no_configured_command_stays_empty(self, tmp_path):
         # "" is how psmux_status/bring_up spell "no agent command" -- the

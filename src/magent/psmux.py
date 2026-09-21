@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from magent.config import MagentConfig
     from magent.platform import Platform
 
@@ -67,7 +69,11 @@ def find_psmux() -> str | None:
     return None
 
 
-def child_env() -> dict[str, str]:
+def child_env(
+    overlay: Mapping[str, str] | None = None,
+    *,
+    drop: frozenset[str] = frozenset(),
+) -> dict[str, str]:
     """Environment for a psmux child that CREATES a session.
 
     Delegates to ``env.spawn_child_env`` -- the only module allowed to touch
@@ -96,10 +102,15 @@ def child_env() -> dict[str, str]:
     command here passes.) The harness/colour markers are the same story from the
     other side: a control command's environment never reaches the pane, only
     ``new-session``'s does.
+
+    ``overlay``/``drop`` are passed straight through -- they are PER-WINDOW
+    (see ``PsmuxWindowOpts.env``), because the account a pane runs as is a
+    property of the project, not of the wave. Both default to "nothing", which
+    is byte-for-byte today's environment.
     """
     from magent.env import spawn_child_env
 
-    return spawn_child_env()
+    return spawn_child_env(overlay, drop=drop)
 
 
 # --- Priority of the interactive path -----------------------------------------
@@ -211,11 +222,25 @@ def boost_priority() -> int:
 
 @dataclass
 class PsmuxWindowOpts:
-    """One window to create inside a psmux session."""
+    """One window to create inside a psmux session.
+
+    ``env``/``drop_env`` are this window's own environment overlay, handed to
+    ``child_env`` at ``new-session`` time. PER-WINDOW rather than per-wave
+    because that is the grain the thing they carry has: ``CLAUDE_CONFIG_DIR``
+    names the account THIS project's agent runs as, and a bring-up places
+    different projects on different accounts in one pass. ``None``/empty is
+    every unrouted window, i.e. today's environment exactly.
+
+    The pane's environment is fixed ONCE, here, by the process that creates the
+    session -- which is also why moving a live project to another account is a
+    session RECREATE and never a mutation.
+    """
 
     window_name: str
     cwd: str
     command: str
+    env: Mapping[str, str] | None = None
+    drop_env: frozenset[str] = frozenset()
 
 
 def session_name(title: str) -> str:
@@ -560,6 +585,7 @@ def send_keys(
     name: str,
     *keys: str,
     target: str | None = None,
+    literal: bool = False,
     psmux: str | None = None,
     timeout: float = SEND_KEYS_TIMEOUT_S,
 ) -> bool:
@@ -569,6 +595,13 @@ def send_keys(
     that will not launch, or a socket that answers nothing all come back as
     ``False`` with a WARNING in launch.log, never as an exception on a caller
     fanning this out (or, worse, as an unbounded wait on a request handler).
+
+    ``literal=True`` adds ``-l``, so ``keys`` are pasted as verbatim text and
+    key names like ``Enter`` are NOT looked up. This is how ``magent send``
+    types a prompt into an agent's input line -- and why a prompt that begins
+    with ``/model`` reaches the agent as the literal slash-command it is: the
+    argv is a list handed straight to psmux, never a shell, so no MSYS/Git-Bash
+    path rewrite can turn ``/model`` into ``C:/Program Files/Git/model``.
     """
     binary = psmux or find_psmux()
     if not binary:
@@ -576,6 +609,8 @@ def send_keys(
     cmd: list[str] = [binary, "-L", name, "send-keys"]
     if target:
         cmd += ["-t", target]
+    if literal:
+        cmd.append("-l")
     cmd.append("--")
     cmd.extend(keys)
     started = time.monotonic()
@@ -1257,7 +1292,10 @@ def _field_str(d: dict[str, object], key: str) -> str:
 
 
 def eligible_projects(
-    config: MagentConfig, group: str | None = None
+    config: MagentConfig,
+    group: str | None = None,
+    *,
+    config_dirs: Mapping[str, Path] | None = None,
 ) -> list[dict[str, object]]:
     """Projects that map to a persistent psmux session.
 
@@ -1274,6 +1312,13 @@ def eligible_projects(
     of them run the command on THIS machine, the one just probed (remote
     projects are excluded above, so the probe never answers for a foreign
     filesystem).
+
+    ``config_dirs`` names, per psmux session id, WHICH of the tool's stores
+    that project's probe must read -- the config directory its pane will run
+    under. It is keyed by session id (not by path) because that is the key the
+    rest of the product already uses for a project. A session absent from the
+    mapping, and the default None, both mean the tool's own default store,
+    which is byte-for-byte today's probe for every project.
     """
     from magent.launch import _expand_base_dir, _resolve_path
     from magent.sessions import build_start_command, is_ide_tool
@@ -1314,7 +1359,10 @@ def eligible_projects(
                 "group": proj.group,
                 "resolved": resolved,
                 "cmd": build_start_command(
-                    tool, config.settings.tools.get(tool, ""), resolved
+                    tool,
+                    config.settings.tools.get(tool, ""),
+                    resolved,
+                    config_dir=config_dirs.get(sid) if config_dirs else None,
                 ),
                 "color": proj.color,
             }
@@ -1400,21 +1448,33 @@ def bring_up(
     every name it had attempted, so both callers printed "Brought up N
     session(s)" for sessions that were never created. A caller cannot report
     honestly on a list that never distinguished the two.
+
+    Account routing runs through the SAME function the ``--go`` path uses
+    (``launch._route_projects``), and its answer is consumed twice: the config
+    dirs go into ``eligible_projects``, so each project's session probe reads
+    its own account's store, and the overlay goes onto each window, so the pane
+    starts under it. Two callers, one decision -- a second copy of the policy
+    is how one of these paths quietly stops routing.
     """
+    from magent.launch import _route_projects
     from magent.platform import get_platform
 
     plat = get_platform()
+    routes = _route_projects(config, config.projects)
     windows: list[PsmuxWindowOpts] = []
-    for p in eligible_projects(config, group):
+    for p in eligible_projects(config, group, config_dirs=routes.config_dirs()):
         if only is not None and _field_str(p, "session") not in only:
             continue
         if not p["resolved"] or not p["cmd"]:
             continue
+        route = routes.route(_field_str(p, "session"))
         windows.append(
             PsmuxWindowOpts(
                 window_name=_field_str(p, "session"),
                 cwd=_field_str(p, "resolved"),
                 command=_field_str(p, "cmd"),
+                env=route.env if route else None,
+                drop_env=route.drop_env if route else frozenset(),
             )
         )
     names = [w.window_name for w in windows]

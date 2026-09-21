@@ -30,6 +30,26 @@ _PROJECT_FIELD_DOCS: list[tuple[str, str, str, str]] = [
         "none",
         'List of window objects `{"name", "tool", "command"}` with per-window tool/command overrides. Legacy `int` / `["name1", "name2"]` forms still parse (normalized by `magent config migrate`).',
     ),
+    (
+        "account",
+        "string",
+        "none",
+        (
+            "Pin this project to one Claude account id (see `settings.accounts`). "
+            "Your intent — magent never writes this field, and honours it even "
+            "over the hard usage threshold."
+        ),
+    ),
+    (
+        "modelClass",
+        "string",
+        "inferred",
+        (
+            "`fable` or `standard`. Which usage cap this project's work counts "
+            "against, when magent should not guess. An unknown value is ignored "
+            "with a warning."
+        ),
+    ),
 ]
 
 
@@ -119,6 +139,52 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
             "Also push toast/ntfy when an agent finishes (enters `done`). Opt-in; "
             "does nothing unless `toast` or `ntfy` is on."
         ),
+    ),
+    (
+        "accounts.enabled",
+        "boolean",
+        "`false`",
+        (
+            "Spread projects across your Claude accounts. Off by default: with it "
+            "off magent runs no `ccswap` and every pane starts on your default "
+            "login, exactly as before this setting existed."
+        ),
+    ),
+    (
+        "accounts.softThreshold",
+        "number",
+        "`85`",
+        "Percent of an account's binding usage window at which magent stops placing *new* projects on it (it never evicts one already there).",
+    ),
+    (
+        "accounts.hardThreshold",
+        "number",
+        "`95`",
+        "Percent at which an account is excluded from assignment altogether, and a project on it is offered a move.",
+    ),
+    (
+        "accounts.onLimit",
+        "string",
+        '`"move-if-reset>2h"`',
+        "What to recommend for a session whose account hit its limit: `wait`, `move`, or `move-if-reset>Nh`. An unrecognised value warns and falls back to `wait`.",
+    ),
+    (
+        "accounts.staleAfterS",
+        "number",
+        "`900`",
+        "Seconds after which ccswap's cached usage numbers are reported as stale. A caveat on the table, never a refusal to launch.",
+    ),
+    (
+        "accounts.statusLeft",
+        "boolean",
+        "`true`",
+        "Show the routed account id in each session's psmux status bar.",
+    ),
+    (
+        "accounts.perAccount",
+        "object",
+        "`{}`",
+        'Per-account overrides keyed by ccswap account id: `{"13": {"class": "fable", "exclude": false, "onLimit": "wait"}}`. `class` reserves an account for one model class; `exclude` takes it out of routing.',
     ),
 ]
 
@@ -353,6 +419,20 @@ def _generate_docs() -> str:
     )
     w("| `magent sessions` | List active psmux sessions, pick one to attach. |")
     w("| `magent sessions <name>` | Attach directly to a psmux session by name. |")
+    w(
+        "| `magent account` | Show every Claude account ccswap reports, its usage, "
+        "and which projects sit on it. |"
+    )
+    w(
+        "| `magent account plan` | Show which account each project WOULD get, and "
+        "why. Changes nothing. |"
+    )
+    w(
+        "| `magent account pin <project> <account>` | Always run that project on "
+        "that account (written to this config). |"
+    )
+    w("| `magent account unpin <project>` | Remove the pin. |")
+    w("| `magent account refresh` | Ask ccswap for fresher usage numbers. |")
     w("| `magent config show` | Display current config. |")
     w("| `magent config layout <cols> <rows>` | Set window grid. |")
     w("| `magent config base-dir <path>` | Set projects folder. |")

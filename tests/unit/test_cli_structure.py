@@ -35,7 +35,7 @@ def _normalize_help(output: str) -> str:
 
 
 HELP_SNAPSHOTS = {
-    (): "Usage: main [OPTIONS] [COMMAND] [ARGS]...\n\n  Open every project in its own terminal and auto-tile across all monitors.\n\nOptions:\n  --go              Skip interactive menu, launch + tile\n  --retile-all      Re-tile every matching window\n  -g, --group TEXT  Launch only projects in this group\n  --init            Re-scan and regenerate config\n  --base-dir PATH   Folder to scan with --init\n  --config PATH     Path to config file\n  --force           With --init, overwrite existing config\n  --edit            Open config in your default editor\n  --attach-to TEXT  Attach to remote psmux sessions (host or user@host)\n  --no-mux          With --attach-to: one plain SSH window per project (no\n                    psmux/tmux)\n  --version         Show the version and exit.\n  --help            Show this message and exit.\n\nCommands:\n  attach     Attach to another machine's magent sessions over SSH.\n  attention  Ambient attention signals for your agent fleet.\n  config     View and modify your magent configuration.\n  docs       Print the full configuration reference (Markdown).\n  doctor     Diagnose the environment: config, env vars, tools, display, dirs.\n  down       Shut down psmux sessions (and optionally the upload server).\n  hooks      Wire agent lifecycle hooks that feed the session-state store.\n  hotkey     Listen for Alt+V to upload clipboard images to psmux sessions.\n  mobile     Show the phone URL + QR for the image-upload app.\n  serve      Start upload server for mobile image transfer.\n  sessions   List psmux sessions or attach to one.\n  status     Show which psmux sessions and services are currently running.\n  terminal   Keyboard fixes for the terminal your psmux sessions run in.\n  termius    Generate SSH config for Termius — one host that opens all...\n  up         Ensure a persistent psmux session per project (host side of...\n  watch      Live view of every agent session — who needs you, sorted first.\n",
+    (): "Usage: main [OPTIONS] [COMMAND] [ARGS]...\n\n  Open every project in its own terminal and auto-tile across all monitors.\n\nOptions:\n  --go              Skip interactive menu, launch + tile\n  --retile-all      Re-tile every matching window\n  -g, --group TEXT  Launch only projects in this group\n  --init            Re-scan and regenerate config\n  --base-dir PATH   Folder to scan with --init\n  --config PATH     Path to config file\n  --force           With --init, overwrite existing config\n  --edit            Open config in your default editor\n  --attach-to TEXT  Attach to remote psmux sessions (host or user@host)\n  --no-mux          With --attach-to: one plain SSH window per project (no\n                    psmux/tmux)\n  --version         Show the version and exit.\n  --help            Show this message and exit.\n\nCommands:\n  account    Which Claude account each project runs on.\n  attach     Attach to another machine's magent sessions over SSH.\n  attention  Ambient attention signals for your agent fleet.\n  config     View and modify your magent configuration.\n  docs       Print the full configuration reference (Markdown).\n  doctor     Diagnose the environment: config, env vars, tools, display, dirs.\n  down       Shut down psmux sessions (and optionally the upload server).\n  hooks      Wire agent lifecycle hooks that feed the session-state store.\n  hotkey     Listen for Alt+V to upload clipboard images to psmux sessions.\n  mobile     Show the phone URL + QR for the image-upload app.\n  model      Switch a session's model (and optionally effort), only while...\n  peek       Print the last LINES of a session's pane -- a read-only glance.\n  send       Deliver a prompt to one running agent by name.\n  serve      Start upload server for mobile image transfer.\n  sessions   List psmux sessions or attach to one.\n  status     Show which psmux sessions and services are currently running.\n  terminal   Keyboard fixes for the terminal your psmux sessions run in.\n  termius    Generate SSH config for Termius — one host that opens all...\n  up         Ensure a persistent psmux session per project (host side of...\n  watch      Live view of every agent session — who needs you, sorted first.\n",
     (
         "attention",
     ): "Usage: main attention [OPTIONS]\n\n  Ambient attention signals for your agent fleet.\n\n  Badges every magent: window title with its session state, flashes the taskbar\n  when an agent needs input or errors, and (when enabled in config) sends a\n  Windows toast and/or an ntfy push. States come from the agent-state store that\n  Claude Code hooks / Codex notify already write.\n\nOptions:\n  -d, --daemon      Run detached\n  --stop            Stop the running daemon\n  --interval FLOAT  Seconds between polls (default: attention.pollIntervalS from\n                    config)\n  --help            Show this message and exit.\n",
@@ -71,7 +71,7 @@ HELP_SNAPSHOTS = {
     ): "Usage: main mobile [OPTIONS]\n\n  Show the phone URL + QR for the image-upload app.\n\n  Scan it once on your phone, then 'Add to Home Screen' to install the uploader\n  as a standalone app -- after that it's one tap to send an image into any\n  magent: session. Run this on the host that serves the uploader.\n\nOptions:\n  -p, --port INTEGER  Upload server port (default: running server, else the\n                      config's upload_port).\n  --host TEXT         Host/IP for the phone URL (default: Tailscale name or IP).\n  --help              Show this message and exit.\n",
     (
         "sessions",
-    ): "Usage: main sessions [OPTIONS] [NAME]\n\n  List psmux sessions or attach to one. Usage: magent sessions [name]\n\nOptions:\n  --help  Show this message and exit.\n",
+    ): "Usage: main sessions [OPTIONS] [NAME]\n\n  List psmux sessions or attach to one. Usage: magent sessions [name]\n\nOptions:\n  --json  Print live sessions as JSON (name, cwd, model, effort, state, account)\n          and exit.\n  --help  Show this message and exit.\n",
     (
         "status",
     ): "Usage: main status [OPTIONS]\n\n  Show which psmux sessions and services are currently running.\n\nOptions:\n  --json  Print daemon status as JSON\n  --help  Show this message and exit.\n",
@@ -156,9 +156,29 @@ HELP_SNAPSHOTS = {
         "config",
         "path",
     ): "Usage: main config path [OPTIONS]\n\n  Print the config file path.\n\nOptions:\n  --help  Show this message and exit.\n",
+    (
+        "account",
+    ): "Usage: main account [OPTIONS] [COMMAND] [ARGS]...\n\n  Which Claude account each project runs on.\n\n  With no subcommand: the account table -- what ccswap reports for every\n  account, how much of each one's quota is spent, and how many projects sit on\n  it. Reads only. The one command here that writes is `pin`/`unpin`, and it\n  writes the config, never a running session.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  pin      Pin PROJECT to ACCOUNT in the config -- user intent, never...\n  plan     Show which account each project WOULD get.\n  refresh  Ask ccswap to re-read usage older than...\n  unpin    Remove PROJECT's account pin, letting the planner place it again.\n",
+    (
+        "account",
+        "plan",
+    ): "Usage: main account plan [OPTIONS]\n\n  Show which account each project WOULD get. Changes nothing.\n\n  The same snapshot, the same refusals and the same planner a launch uses, so\n  this is a dry run rather than a second opinion. Every row carries a reason\n  from the planner's closed vocabulary.\n\nOptions:\n  --json  Print the plan as JSON.\n  --help  Show this message and exit.\n",
+    (
+        "account",
+        "pin",
+    ): "Usage: main account pin [OPTIONS] PROJECT ACCOUNT\n\n  Pin PROJECT to ACCOUNT in the config -- user intent, never overridden.\n\n  A pin wins over every threshold: the planner honours it even on an account\n  that is over the hard limit, and says so rather than quietly re-routing.\n  ACCOUNT is a ccswap account id (see `magent account`) and is not validated\n  here, so pinning never depends on ccswap being reachable -- an id ccswap does\n  not report is reported by `magent account plan`, with the pin ignored.\n\nOptions:\n  --help  Show this message and exit.\n",
+    (
+        "account",
+        "unpin",
+    ): "Usage: main account unpin [OPTIONS] PROJECT\n\n  Remove PROJECT's account pin, letting the planner place it again.\n\nOptions:\n  --help  Show this message and exit.\n",
+    (
+        "account",
+        "refresh",
+    ): "Usage: main account refresh [OPTIONS]\n\n  Ask ccswap to re-read usage older than settings.accounts.staleAfterS.\n\n  Interactive only. A bring-up never calls this: it must not block on somebody\n  else's network read, and launch-time placement is exactly the use ccswap's own\n  cache is adequate for.\n\nOptions:\n  --help  Show this message and exit.\n",
 }
 
 TOP_LEVEL_COMMANDS = [
+    "account",
     "attach",
     "attention",
     "config",
@@ -168,6 +188,9 @@ TOP_LEVEL_COMMANDS = [
     "hooks",
     "hotkey",
     "mobile",
+    "model",
+    "peek",
+    "send",
     "serve",
     "sessions",
     "status",
@@ -177,6 +200,7 @@ TOP_LEVEL_COMMANDS = [
     "watch",
 ]
 TERMINAL_SUBCOMMANDS = ["install", "status"]
+ACCOUNT_SUBCOMMANDS = ["pin", "plan", "refresh", "unpin"]
 CONFIG_SUBCOMMANDS = [
     "add",
     "base-dir",
@@ -225,6 +249,12 @@ def test_registration_set_config_subcommands():
 
 def test_registration_set_terminal_subcommands():
     assert sorted(cli.main.commands["terminal"].commands) == TERMINAL_SUBCOMMANDS
+
+
+def test_registration_set_account_subcommands():
+    """`move` is deliberately absent: it recreates a live session under a new
+    CLAUDE_CONFIG_DIR, which needs the launch path's per-window env overlay."""
+    assert sorted(cli.main.commands["account"].commands) == ACCOUNT_SUBCOMMANDS
 
 
 def test_acyclic_imports():
