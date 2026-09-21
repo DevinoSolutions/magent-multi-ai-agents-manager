@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import pytest
 
+from magent import config
 from magent.accounts import Account, AccountsSnapshot, MapEntry, Window
 from magent.routing import (
     CLASS_FABLE,
     CLASS_STANDARD,
+    CLASSES,
     DEFAULT_ON_LIMIT,
     ON_LIMIT_MOVE,
     ON_LIMIT_MOVE_IF_RESET,
@@ -31,6 +33,8 @@ from magent.routing import (
     binding_window,
     parse_on_limit,
     plan,
+    policy_from_settings,
+    project_from_config,
 )
 
 NOW = 1_789_000_000.0
@@ -574,3 +578,134 @@ class TestParseOnLimit:
         # A misspelled policy must never be read as permission to move a live
         # session out from under an agent.
         assert parse_on_limit(raw) == (ON_LIMIT_WAIT, None)
+
+
+class TestTheConfigVocabularyCannotDrift:
+    """``config.py`` RESTATES this module's two vocabularies rather than
+    importing them, because config is on the ``magent --help`` import path and
+    this module pulls the ccswap subprocess seam in behind it. These are the
+    pins that make the restatement safe: change one side and this fails."""
+
+    def test_the_model_classes_are_the_same_two(self):
+        assert config.MODEL_CLASSES == CLASSES
+
+    def test_the_default_on_limit_is_the_same_string(self):
+        assert config.DEFAULT_ON_LIMIT == DEFAULT_ON_LIMIT
+
+    def test_the_fallback_is_what_the_parser_degrades_to(self):
+        # config warns and stores ON_LIMIT_FALLBACK; the parser independently
+        # degrades to the same mode. Two code paths, one answer.
+        assert parse_on_limit(config.ON_LIMIT_FALLBACK) == (ON_LIMIT_WAIT, None)
+        assert config.ON_LIMIT_FALLBACK == ON_LIMIT_WAIT
+
+    @pytest.mark.parametrize(
+        "value", ["wait", "move", "move-if-reset>2h", "move-if-reset>0.5h"]
+    )
+    def test_config_recognises_exactly_what_the_parser_parses(self, value):
+        assert config._recognised_on_limit(value) is True
+
+    @pytest.mark.parametrize(
+        "value", ["", "nonsense", "move-if-reset", "move-if-reset>2", "move-if-reset>h"]
+    )
+    def test_config_rejects_exactly_what_the_parser_degrades(self, value):
+        # Both directions, over the same table the parser's own test uses: a
+        # string config accepted but the parser degraded would be stored as a
+        # policy and then silently mean `wait`.
+        assert config._recognised_on_limit(value) is False
+        assert parse_on_limit(value) == (ON_LIMIT_WAIT, None)
+
+
+class TestPolicyFromSettings:
+    """The ONE adapter from the typed config to the planner's knobs. It exists
+    so the launch path and `magent account` cannot read the same settings two
+    different ways."""
+
+    def test_the_shipped_defaults_map_to_a_disabled_policy(self):
+        # The headline property of schema v4: a config nobody has touched
+        # produces a policy that routes nothing.
+        policy = policy_from_settings(config.AccountSettings())
+        assert policy == Policy()
+        assert policy.enabled is False
+
+    def test_every_knob_crosses_over(self):
+        policy = policy_from_settings(
+            config.AccountSettings(
+                enabled=True,
+                soft_threshold=70.0,
+                hard_threshold=90.0,
+                on_limit="wait",
+                stale_after_s=60.0,
+                status_left=False,
+                per_account={
+                    "13": config.AccountOverride(klass=CLASS_FABLE, exclude=True),
+                    "19": config.AccountOverride(on_limit="move"),
+                },
+            )
+        )
+        assert policy.enabled is True
+        assert policy.soft_threshold == 70.0
+        assert policy.hard_threshold == 90.0
+        assert policy.on_limit == "wait"
+        assert policy.stale_after_s == 60.0
+        assert policy.account_policy("13") == AccountPolicy(
+            exclude=True, klass=CLASS_FABLE
+        )
+        assert policy.account_policy("19") == AccountPolicy(on_limit="move")
+        # An account with no override still answers, with the inert one.
+        assert policy.account_policy("99") == AccountPolicy()
+
+    def test_status_left_is_deliberately_not_a_planner_knob(self):
+        # It decides what the psmux status bar shows, which is not a placement
+        # question -- so it must not reach the planner at all.
+        assert not hasattr(
+            policy_from_settings(config.AccountSettings()), "status_left"
+        )
+
+    def test_a_config_policy_drives_a_real_plan(self):
+        # End to end over the seam: the config's own `exclude` keeps an account
+        # out of a plan, proving the mapping is load-bearing and not decorative.
+        settings = config.AccountSettings(
+            enabled=True,
+            per_account={"1": config.AccountOverride(exclude=True)},
+        )
+        snapshot = AccountsSnapshot(accounts=(acct("1"), acct("2")))
+        result = plan(
+            [Project(session="api")],
+            snapshot,
+            policy_from_settings(settings),
+            {},
+            now=NOW,
+        )
+        assert result.rows[0].account == "2"
+
+
+class TestProjectFromConfig:
+    def test_the_pin_and_the_class_cross_over(self):
+        project = project_from_config(
+            config.ProjectConfig(path="repos/api", account="13", model_class="fable"),
+            session="api",
+        )
+        assert project == Project(
+            session="api",
+            name="repos/api",
+            account="13",
+            model_class=CLASS_FABLE,
+        )
+
+    def test_a_title_is_the_display_name_when_there_is_one(self):
+        project = project_from_config(
+            config.ProjectConfig(path="repos/api", title="my-api"), session="api"
+        )
+        assert project.name == "my-api"
+
+    def test_an_unpinned_project_carries_no_account(self):
+        project = project_from_config(config.ProjectConfig(path="api"), session="api")
+        assert project.account is None
+        assert project.model_class is None
+
+    def test_the_session_id_is_the_callers_to_give(self):
+        # Not derived from the path: a project with three `windows` is three
+        # sessions, placed independently, and only the launch path knows their
+        # names.
+        one = project_from_config(config.ProjectConfig(path="api"), session="api-2")
+        assert one.session == "api-2"
