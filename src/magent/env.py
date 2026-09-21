@@ -132,6 +132,23 @@ class MagentEnv(BaseSettings):
     # 42 agents alive in Session 0, unkillable from the desktop and holding
     # every session name the user's own bring-up wanted.
     session0_policy: Literal["handoff", "allow", "refuse"] = "handoff"
+    # Whether magent may route projects onto per-account Claude profiles at all
+    # (see config.AccountSettings / routing.py). On by default, because the
+    # feature is already off by default one level down: `settings.accounts` has
+    # `enabled: false`, so a config that never opts in never routes and this
+    # variable changes nothing for it.
+    #
+    # The opt-out is the fourth member of the same test-isolation law as
+    # hotkey_supervisor / upload_supervisor / psmux_boost, and it is in that
+    # family for the sharpest version of psmux_boost's reason: routing is the
+    # ONE thing in this product that shells out to a tool holding the user's
+    # real account CREDENTIALS (`ccswap`, resolved off PATH), and no HOME
+    # redirect contains a binary on PATH. tests/conftest.py pins it to 0 for
+    # every tier -- belt and braces over the config gate and the `find_ccswap`
+    # seam, neither of which a future test can be trusted to remember. For a
+    # user it is the kill switch for a routed fleet that is misbehaving: one
+    # variable, no config edit, every pane back on the default login.
+    account_routing: bool = True
 
     @model_validator(mode="after")
     def _no_unknown_magent_vars(self) -> MagentEnv:
