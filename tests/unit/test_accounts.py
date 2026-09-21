@@ -258,11 +258,14 @@ class TestTheRequiredCcswapSettings:
         assert report.values == {
             "profiles.persistent": True,
             "autoswitch.enabled": False,
+            "autoswitch.warmupFiveHour": False,
         }
 
     def test_the_product_defaults_are_both_problems_with_their_fixes(self, ccswap):
         # Persistent profiles default OFF and autoswitch defaults ON: a fresh
-        # ccswap needs both flipped, by the user, never by magent.
+        # ccswap needs both flipped, by the user, never by magent. The warm-up
+        # is the third required setting and is NOT one of them -- it ships off,
+        # so an untouched ccswap is never told to change it.
         ccswap.set_settings(DEFAULT_SETTINGS)
         report = read_settings()
         assert len(report.problems) == 2
@@ -270,6 +273,24 @@ class TestTheRequiredCcswapSettings:
         joined = "\n".join(report.problems)
         assert "ccswap config set profiles.persistent true" in joined
         assert "ccswap config set autoswitch.enabled false" in joined
+        assert "warmupFiveHour" not in joined
+
+    def test_the_five_hour_warm_up_is_read_by_its_dotted_name(self, ccswap):
+        """Opt-in, so only a box that turned it on hears about it.
+
+        It is read as `autoswitch.warmupFiveHour`; the bare `warmupFiveHour` is
+        not a key ccswap knows, and a reader asking for that would get "unknown
+        setting" and report the whole gate as unaskable forever.
+        """
+        ccswap.set_settings(
+            {**MAGENT_READY_SETTINGS, "autoswitch.warmupFiveHour": True}
+        )
+        report = read_settings()
+        assert report.ok is False
+        assert report.error is None  # it answered -- the ANSWER is the problem
+        (problem,) = report.problems
+        assert "ccswap config set autoswitch.warmupFiveHour false" in problem
+        assert ["config", "get", "autoswitch.warmupFiveHour"] in ccswap.calls()
 
     def test_a_setting_that_cannot_be_read_is_an_error_not_a_pass(self, ccswap):
         """ "Could not ask" must never be treated as "the answer was yes"."""
@@ -289,7 +310,7 @@ class TestTheRequiredCcswapSettings:
     def test_the_settings_reader_uses_config_get_and_never_config_set(self, ccswap):
         ccswap.set_settings(MAGENT_READY_SETTINGS)
         read_settings()
-        assert [c[:2] for c in ccswap.calls()] == [["config", "get"], ["config", "get"]]
+        assert [c[:2] for c in ccswap.calls()] == [["config", "get"]] * 3
 
     def test_without_a_binary_it_is_an_error_not_a_verdict(self, monkeypatch):
         monkeypatch.setattr("magent.accounts.find_ccswap", lambda: None)

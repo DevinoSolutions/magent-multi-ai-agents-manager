@@ -183,10 +183,17 @@ class TestRoutingIsOffUnlessEverythingSaysYes:
         assert plan.routes == {}
         assert "not installed" in plan.notes[0]
 
+    @pytest.mark.parametrize(
+        ("key", "wanted", "fix"),
+        [(key, wanted, fix) for key, wanted, _why, fix in accounts.REQUIRED_SETTINGS],
+        ids=[key for key, *_ in accounts.REQUIRED_SETTINGS],
+    )
     def test_a_required_ccswap_setting_not_in_effect_refuses_with_its_fix(
-        self, tmp_path, ccswap
+        self, tmp_path, ccswap, key, wanted, fix
     ):
-        ccswap.set_settings({**MAGENT_READY_SETTINGS, "autoswitch.enabled": True})
+        # Driven by the product tuple, so a fourth required setting is gated the
+        # day it is added rather than the day somebody remembers this test.
+        ccswap.set_settings({**MAGENT_READY_SETTINGS, key: not wanted})
         cfg = _cfg(tmp_path)
         _enable_routing(cfg)
 
@@ -194,10 +201,10 @@ class TestRoutingIsOffUnlessEverythingSaysYes:
 
         assert plan.routes == {}
         note = "\n".join(plan.notes)
-        assert "autoswitch.enabled" in note
+        assert key in note
         # Reported with the command that fixes it -- magent never flips a
         # setting in somebody else's tool.
-        assert "ccswap config set autoswitch.enabled false" in note
+        assert fix in note
 
     def test_a_setting_that_cannot_be_read_is_also_a_refusal(self, tmp_path, ccswap):
         # "Could not ask" must never read as "the answer was yes" for a global
@@ -455,6 +462,8 @@ class TestTheBringUpNeverWritesIntoCcswap:
         verbs = _verbs(ccswap)
         assert verbs.count("list --json") == 1, verbs
         assert verbs.count("--version") == 1, verbs
+        # The settings gate is one read per required setting for the whole wave.
+        assert verbs.count("config get") == len(accounts.REQUIRED_SETTINGS), verbs
 
 
 class TestAnUnhydratedProfileIsIneligibleAndSaysSo:

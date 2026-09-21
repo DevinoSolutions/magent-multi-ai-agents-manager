@@ -137,12 +137,18 @@ INELIGIBLE_REASONS: dict[str, str] = {
 }
 
 # The ccswap settings magent requires and NEVER changes, as
-# `(setting, wanted, why, the command that sets it)`. Each is read with
-# `ccswap config get <key>`, which answers a strict boolean. Both defaults are
-# the value magent cannot work with -- persistent profiles default OFF and
-# autoswitch defaults ON -- so a fresh ccswap needs both flipped, by the user.
-# A refusal that does not say how to fix itself is a dead end; magent warns and
-# skips, and the user's own configuration always wins (the `wt-keys` posture).
+# `(setting, wanted, why, the command that sets it)`. Each is read with its
+# DOTTED name via `ccswap config get <key>` -- the bare `warmupFiveHour` is not
+# a key ccswap knows, and asking for it answers "unknown setting", which this
+# module must report as "could not ask", never as a pass. These three are
+# exactly ccswap's strict-boolean settings, so each answer is a real true/false
+# and never a coerced string. Two PRODUCT defaults are the value magent cannot
+# work with -- persistent profiles default OFF and autoswitch defaults ON -- so
+# a fresh ccswap needs both flipped, by the user; the five-hour warm-up is
+# opt-in and already off, so it is only ever a problem where somebody turned it
+# on. A refusal that does not say how to fix itself is a dead end; magent warns
+# and skips, and the user's own configuration always wins (the `wt-keys`
+# posture).
 REQUIRED_SETTINGS: tuple[tuple[str, bool, str, str], ...] = (
     (
         "profiles.persistent",
@@ -155,6 +161,16 @@ REQUIRED_SETTINGS: tuple[tuple[str, bool, str, str], ...] = (
         False,
         "a global switch fighting magent's placement is silent and fleet-wide",
         "ccswap config set autoswitch.enabled false",
+    ),
+    (
+        "autoswitch.warmupFiveHour",
+        False,
+        (
+            "the warmer starts five-hour windows on the very accounts magent is "
+            "placing work on, so the utilization the plan was built from is "
+            "being spent behind it"
+        ),
+        "ccswap config set autoswitch.warmupFiveHour false",
     ),
 )
 

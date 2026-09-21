@@ -1927,13 +1927,23 @@ be why a bring-up fails.** The phase is `launch._route_projects`, between
 needs — the overlay and the config dir its session probe answers from — must
 exist before any command is built. It runs only when the config asked for it,
 ccswap is at least `accounts.MIN_CCSWAP_VERSION`, and ccswap's own required
-settings are in effect (`profiles.persistent` on, `autoswitch.enabled` off — the
-two `SettingsReport` can actually read); it refuses (naming the reason and
+settings are in effect (`profiles.persistent` on, `autoswitch.enabled` off,
+`autoswitch.warmupFiveHour` off — exactly ccswap's three strict-boolean keys, so
+every answer is a real true/false, and each read by its DOTTED name because a
+bare `warmupFiveHour` is not a key ccswap knows and would report as unaskable
+forever); it refuses (naming the reason and
 launching unrouted) on an old ccswap, a required setting that is wrong or
 unreadable, a non-empty `duplicateAccountWarnings`, a snapshot error, or no
 eligible account. The whole phase sits under ONE budget (`ROUTE_BUDGET_S`);
 expiring it launches the fleet unrouted rather than late. `psmux.bring_up` (the
 `magent up`/attach path) calls the same function, so the two paths cannot drift.
+Both `autoswitch` keys are required off for the same reason in two flavours: a
+second process acting on the same accounts makes magent's placement a guess.
+`enabled` moves the active account underneath a running fleet; `warmupFiveHour`
+starts five-hour windows on cold accounts — including the ones just planned onto
+— so the utilization the plan was built from is being spent behind it. Neither is
+flipped by magent: the refusal names the setting and the `ccswap config set` that
+fixes it, because the user's own configuration wins (the `wt-keys` posture).
 
 **magent stays READ-ONLY toward ccswap**, and this phase is where that was
 tested. The `CLAUDE_CONFIG_DIR` seam only launches a profile that holds a usable
