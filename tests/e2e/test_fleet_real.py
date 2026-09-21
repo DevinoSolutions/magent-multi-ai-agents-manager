@@ -279,6 +279,10 @@ class _Fleet:
         self.env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
         self.env["MAGENT_PSMUX_BOOST"] = "0"
         self.env["MAGENT_SESSION0_POLICY"] = "allow"
+        # ...and routing must never run a real `ccswap`: it is the one
+        # feature that shells out to a tool holding the user's real account
+        # credentials, and no HOME redirect contains a binary on PATH.
+        self.env["MAGENT_ACCOUNT_ROUTING"] = "0"
         self.env.update(extra_env)
 
         self.projdirs = {}

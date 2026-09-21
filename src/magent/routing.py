@@ -44,6 +44,10 @@ if TYPE_CHECKING:
 
     from magent.accounts import Account, AccountsSnapshot, MapEntry, Window
 
+    # Typing only -- see policy_from_settings. Importing config at RUNTIME
+    # would reverse the dependency that keeps this module a pure leaf.
+    from magent.config import AccountSettings, ProjectConfig
+
 # --- the model classes --------------------------------------------------------
 # Two, deliberately. `fable` names the work that consumes a model-scoped weekly
 # cap of its own; `standard` is everything else. The asymmetry is the whole
@@ -473,4 +477,57 @@ def plan(
         stale=stale,
         usage_age_s=snapshot.usage_age_s,
         error=None,
+    )
+
+
+# --- the config adapter -------------------------------------------------------
+# The planner takes plain values, for the reasons in the module docstring. These
+# two functions are the ONE place those values are built from the typed config,
+# so the launch path and `magent account` cannot read the same knobs two
+# different ways -- the same doctrine as `live_sessions` being the one liveness
+# enumeration. They live here rather than in `config.py` for two reasons that
+# point the same way: `Policy`/`Project` are this module's vocabulary, and
+# `config.py` is on the `magent --help` import path while this module pulls the
+# ccswap subprocess seam in behind it. The config types are imported for TYPING
+# only, so `plan` still runs with no config object in sight -- which is what
+# keeps the whole algorithm testable against hand-built inputs.
+
+
+def policy_from_settings(settings: AccountSettings) -> Policy:
+    """``config.AccountSettings`` -> the planner's ``Policy``.
+
+    A straight field mapping, deliberately: the config spells the thresholds in
+    percent because that is what a human says, and ``Policy`` documents the
+    same units, so there is nothing to convert here and no place for the two
+    schemas to disagree quietly.
+    """
+    return Policy(
+        enabled=settings.enabled,
+        soft_threshold=settings.soft_threshold,
+        hard_threshold=settings.hard_threshold,
+        on_limit=settings.on_limit,
+        stale_after_s=settings.stale_after_s,
+        per_account={
+            acct: AccountPolicy(
+                exclude=override.exclude,
+                klass=override.klass,
+                on_limit=override.on_limit,
+            )
+            for acct, override in settings.per_account.items()
+        },
+    )
+
+
+def project_from_config(project: ProjectConfig, *, session: str) -> Project:
+    """One config project -> one planner ``Project``.
+
+    ``session`` is supplied by the caller and not derived here: the planner is
+    keyed by psmux session id, and a project with three ``windows`` is three
+    sessions placed independently. Only the launch path knows their names.
+    """
+    return Project(
+        session=session,
+        name=project.title or project.path,
+        account=project.account,
+        model_class=project.model_class,
     )

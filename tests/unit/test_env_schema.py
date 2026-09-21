@@ -572,6 +572,40 @@ class TestSession0Policy:
             MagentEnv(_env_file=None)
 
 
+class TestAccountRoutingKillSwitch:
+    """MAGENT_ACCOUNT_ROUTING -- the fourth member of the same test-isolation
+    law as MAGENT_HOTKEY_SUPERVISOR / MAGENT_UPLOAD_SUPERVISOR /
+    MAGENT_PSMUX_BOOST, and it is in that family for the sharpest version of
+    psmux_boost's reason: routing is the one feature that shells out to a tool
+    holding the user's real account credentials (`ccswap`, resolved off PATH),
+    and no HOME redirect contains a binary on PATH."""
+
+    def test_it_is_on_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # On, because the feature is already off one level down:
+        # settings.accounts.enabled is false, so a config that never opts in
+        # never routes and this variable changes nothing for it.
+        _clear_magent_env(monkeypatch)
+        assert MagentEnv(_env_file=None).account_routing is True
+
+    @pytest.mark.parametrize("value", ["0", "false", "False"])
+    def test_the_opt_out_parses(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        _clear_magent_env(monkeypatch)
+        monkeypatch.setenv("MAGENT_ACCOUNT_ROUTING", value)
+        assert MagentEnv(_env_file=None).account_routing is False
+
+    def test_the_suite_pins_it_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # conftest's autouse fixture is what actually holds the line, and it is
+        # asserted through the env schema rather than by reading the file: a
+        # pin that stopped being applied must fail HERE, in the tier every
+        # other tier inherits. (The cache is cleared first because get_env's
+        # singleton may predate this test's environment.)
+        monkeypatch.setattr(env_module, "_cached_env", None)
+        assert os.environ["MAGENT_ACCOUNT_ROUTING"] == "0"
+        assert env_module.get_env().account_routing is False
+
+
 class TestIsSshLogin:
     """The environment half of "am I in a non-interactive logon session?".
     sshd exports these; nobody configures them."""
