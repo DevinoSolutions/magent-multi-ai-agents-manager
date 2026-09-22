@@ -12,6 +12,7 @@ from magent.config import (
     LayoutConfig,
     Settings,
     _migrate_2_to_3,
+    _migrate_3_to_4,
     _parse_settings,
     default_config,
     layout_to_dict,
@@ -199,6 +200,84 @@ class TestMigrate2To3Windows:
         assert raw["version"] == 3
 
 
+class TestMigrate3To4Accounts:
+    """v4 adds ``settings.accounts``. Same shape as _migrate_1_to_2's
+    ``attention``: stamp the version, materialise the section so a hand-editor
+    can see the knobs, and touch nothing else."""
+
+    def test_the_block_is_materialised_with_routing_off(self):
+        raw = _migrate_3_to_4(
+            {"version": 3, "settings": {"defaultTool": "claude"}, "projects": []}
+        )
+        assert raw["version"] == 4
+        settings = raw["settings"]
+        assert isinstance(settings, dict)
+        assert settings["accounts"] == {
+            "enabled": False,
+            "softThreshold": 85.0,
+            "hardThreshold": 95.0,
+            "onLimit": "move-if-reset>2h",
+            "staleAfterS": 900.0,
+            "statusLeft": True,
+            "perAccount": {},
+        }
+        # ...and the settings it found are still there.
+        assert settings["defaultTool"] == "claude"
+
+    def test_a_config_with_no_settings_block_only_gets_the_version(self):
+        raw = _migrate_3_to_4({"version": 3, "projects": [{"path": "api"}]})
+        assert raw["version"] == 4
+        assert "settings" not in raw
+
+    def test_an_existing_block_is_left_alone(self):
+        raw = _migrate_3_to_4(
+            {"version": 3, "settings": {"accounts": {"enabled": True}}, "projects": []}
+        )
+        settings = raw["settings"]
+        assert isinstance(settings, dict)
+        assert settings["accounts"] == {"enabled": True}
+
+    def test_projects_are_never_given_an_account(self):
+        # The pin is user intent. A migration that invented one would be
+        # guessing, and the whole reason the pin lives in config while the
+        # computed assignment does not is that the two stay distinguishable.
+        raw = _migrate_3_to_4(
+            {"version": 3, "settings": {}, "projects": [{"path": "api"}]}
+        )
+        projects = raw["projects"]
+        assert isinstance(projects, list)
+        assert projects[0] == {"path": "api"}
+
+    def test_a_v3_file_migrates_end_to_end(self, tmp_config):
+        path = tmp_config(
+            {
+                "version": 3,
+                "settings": {"defaultTool": "claude"},
+                "projects": [{"path": "api", "color": "#111111"}],
+            }
+        )
+
+        assert migrate_config_file(path) is True
+
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        assert data["version"] == SCHEMA_VERSION == 4
+        assert data["settings"]["accounts"]["enabled"] is False
+
+    def test_a_v3_file_still_loads_with_only_the_version_warning(
+        self, tmp_config, capsys
+    ):
+        # Nothing about v4 is required to READ a v3 config: the new fields are
+        # all absent-means-default, so the only complaint is the standing
+        # "run: magent config migrate" line.
+        path = tmp_config({"version": 3, "projects": [{"path": "api"}]})
+        cfg = load_config(path)
+        assert cfg.settings.accounts.enabled is False
+        err = capsys.readouterr().err
+        assert "v3 < v4" in err
+        assert "magent config migrate" in err
+
+
 class TestExampleConfigMatchesFactory:
     def test_example_config_matches_factory(self, tmp_path, capsys):
         with open(EXAMPLE_CONFIG_PATH, encoding="utf-8") as f:
@@ -214,6 +293,11 @@ class TestExampleConfigMatchesFactory:
         assert any(p.get("enabled") is False for p in example["projects"])
         assert all("color" in p for p in example["projects"])
         assert any("tool" in p for p in example["projects"])
+        # ...and the schema-v4 account-routing surfaces, which are otherwise
+        # invisible: settings equality above covers the settings block, but a
+        # per-project pin has no default to compare against.
+        assert any("account" in p for p in example["projects"])
+        assert any("modelClass" in p for p in example["projects"])
 
         # Round-trip through the public loader -- factory-dict equality alone
         # doesn't exercise the path real users hit (NF from MINOR's dropped pin).

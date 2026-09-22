@@ -267,6 +267,10 @@ Or skip the menu with flags:
 | `magent doctor [--json]` | Diagnose the environment: config, env vars, agent tools on PATH, terminal, a wedged psmux control plane (see below), monitors, writable dirs, Tailscale, upload port. Exit 1 on any failure. |
 | `magent sessions` | List active psmux sessions, pick one to attach. |
 | `magent sessions <name>` | Attach directly to a psmux session by name. |
+| `magent sessions --json` | Print every configured session as JSON — name, cwd, a live flag, and (for live ones) the model, effort, and state read from the pane. Non-interactive; attaches nothing. |
+| `magent send <session> "<text>" [--file f] [--wait-idle] [--compact] [--timeout s]` | Type a prompt into one running agent by name and submit it. Resolves the name case-insensitively (exact, then unique substring/prefix); refuses if it is not live. Exit codes: 0 sent, 2 not found, 3 psmux error, 4 not confirmed. See [below](#driving-a-session-from-another-shell). |
+| `magent model <session\|--all> <model> [--effort low\|medium\|high\|xhigh\|max]` | Switch a session's model (and optionally effort) while it is idle, retrying busy sessions until `--max-minutes`; prints a per-session before/after table. |
+| `magent peek <session> [-n <lines>]` | Print the last N pane lines of a session — a read-only glance. |
 | `magent up [--json] [-g <group>] [--revive]` | Host side: ensure a persistent psmux session per project, and re-launch the agent in any live session whose pane fell back to a bare shell (e.g. after a Ctrl-C). Reviving is automatic except under `--json`, which stays a pure read unless `--revive` is passed. |
 | `magent attach <host> [--no-reconnect]` | From another PC: bring host sessions up over SSH, tile locally, Alt+V uploads, F2 opens the project in VS Code over Remote-SSH. Panes reconnect themselves after a dropped connection (see below); `--no-reconnect` opts out. |
 | `magent watch` | Live table of every agent session, most-urgent first; press a row number to focus that window. |
@@ -281,6 +285,121 @@ Or skip the menu with flags:
 | `magent terminal install` | Bind Ctrl+Backspace and Shift+Enter in Windows Terminal so they still work inside a psmux pane (`magent terminal status` to inspect) — see [Typing through psmux](#typing-through-psmux). |
 | `magent config <subcommand>` | Edit config from the CLI — 17 subcommands incl. `migrate`; see `magent config --help`. |
 | `magent config edit [host]` | Edit the config on **another** machine in your editor over SSH — fetch, edit, validate, push back. Omit the host to reuse your last `attach` target. The host side is `magent config cat` / `magent config put`, which you never run by hand. |
+
+### Driving a session from another shell
+
+`magent send`, `magent model`, and `magent peek` turn the fleet into something
+you can script — an API-ish way to talk to a specific agent, or all of them,
+without switching windows. They build on the same psmux plumbing everything
+else here uses.
+
+```bash
+magent send caramel "Continue the release; be token-efficient."
+magent send caramel --file prompts/caramel.txt        # long prompt from a file
+magent send caramel --compact "New task..."           # /compact first, wait, then send
+magent send caramel --wait-idle "Next step"            # hold until the agent is free
+magent peek caramel -n 60                              # look without touching
+magent model caramel opus --effort high                # switch one session
+magent model --all fable --effort high                 # put the whole fleet on one model
+magent sessions --json                                 # machine-readable fleet state
+```
+
+`send` pastes the text **literally** (`send-keys -l`) and then presses Enter as
+a separate key, so the whole prompt lands on one input line and submits once.
+It confirms the prompt actually left the input line before reporting success,
+and its exit codes (0/2/3/4) make it safe to drive from a script. `model` only
+switches a session while it is **idle** — never mid-turn — and re-reads the
+`<Model> · <effort>` footer to verify the change took, retrying anything busy
+until `--max-minutes` runs out. All three resolve a session name
+case-insensitively and refuse a name that is not live.
+
+> The slash-commands `send`/`model` issue (`/compact`, `/model`, `/effort`) are
+> built inside magent and handed to psmux as a list argument, never through a
+> shell — so Git Bash / MSYS can't rewrite a leading `/model` into a Windows
+> path. Typing one yourself as a prompt is different: in Git Bash, `magent send
+> caramel "/compact"` reaches magent as `C:/Program Files/Git/compact`, because
+> the MSYS runtime rewrites the argument before magent starts and quoting does
+> not stop it. Use the `--compact` flag, or set `MSYS_NO_PATHCONV=1` for that
+> command.
+
+### Per-project Claude accounts
+
+If you keep several Claude subscriptions in `ccswap`, magent can put each project
+on a *different* account instead of everything sharing one login and one rate
+limit. **It ships off.** Nothing routes until you turn it on:
+
+```jsonc
+// magent.config.json
+"settings": {
+  "accounts": { "enabled": true }   // softThreshold 85, hardThreshold 95
+}
+```
+
+```bash
+magent account              # the table: every account, its 5h/7d/fable usage, projects on it
+magent account plan         # which account each project WOULD get, and why. Changes nothing.
+magent account plan --json  # the same, machine-readable
+magent account pin web 13   # this project always runs on account 13
+magent account unpin web    # let the planner place it again
+magent account refresh      # ask ccswap for fresher usage numbers
+```
+
+Two ideas are worth knowing, because everything else follows from them:
+
+- **A pin is yours; an assignment is magent's.** `magent account pin` writes
+  `account` on that project in your config — user intent, git-visible,
+  hand-editable, and honoured even when the account is over its limit (magent
+  says so rather than quietly re-routing). What magent *works out* for the rest
+  is machine state and lives in `~/.magent/account-map.json`, so a pin and a
+  guess can never be confused on disk.
+- **Routing can never be the reason a launch fails.** ccswap missing, too old, a
+  required ccswap setting not in effect, the same login sitting in two ccswap
+  slots, no usable account — every one of those prints a named reason and
+  launches the fleet unrouted, exactly as it does today. `magent account`/`plan`
+  show each refusal with the exact `ccswap config set ...` that clears it; magent
+  never flips one for you.
+
+A project's work also has a **class**, and that is what decides which usage cap
+it is budgeted against. `modelClass` on a project is how you say it outright:
+
+```jsonc
+{ "path": "web", "modelClass": "fable" }
+```
+
+`fable` means this project's work counts against a model-scoped weekly window of
+its own *as well as* the account's 5-hour and 7-day ones; `standard` means only
+those two — which is exactly what lets an account with its Fable cap spent keep
+hosting Opus/Sonnet work instead of sitting idle. Leave the key out and magent
+infers the class: what it last observed running in that pane, otherwise
+`standard`. It guesses that way on purpose — guessing standard only spends 7-day
+headroom that was going to waste, while guessing fable can block an agent
+outright. A value that is neither is ignored with a warning, never an error.
+
+Three ccswap settings have to be right before anything routes:
+`profiles.persistent true`, `autoswitch.enabled false` and
+`autoswitch.warmupFiveHour false` — the last two because a global switch or a
+warm-up pass moves the active login and spends headroom magent just budgeted.
+`magent doctor` reports all three under `account-routing`, as a warning at worst
+(it can never fail a doctor run), and says so explicitly if your magent is too
+old to have checked one of them. `magent sessions --json` carries each session's
+`account` — `null` when it is unrouted.
+
+If a routed fleet ever misbehaves, `MAGENT_ACCOUNT_ROUTING=0` is the kill switch:
+one variable, no config edit, every pane back on the default login. `magent
+account` and `magent account plan` honour it too, and name it as the reason
+rather than pointing you at a config key that is already correct.
+
+> **Expected, not a bug:** a *mutating* ccswap command typed inside a routed
+> agent pane refuses, because the pane exports `CLAUDE_CONFIG_DIR`. That is the
+> safety property working — it is what stops a stray `ccswap switch 19` in one
+> window moving the active login out from under every other session. Reads still
+> work. Change placement with `magent account pin` instead.
+>
+> And the reason that matters: switching the *active slot* (the ccswap TUI,
+> `ccswap switch`, or autoswitch) rewrites `~/.claude/.credentials.json`, which
+> **logs out every session that is not routed**. Routed panes are unaffected;
+> anything still on the default login is not. With `autoswitch.enabled true`
+> magent refuses to route at all, for the same reason.
 
 ### Typing through psmux
 

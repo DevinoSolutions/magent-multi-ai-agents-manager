@@ -339,8 +339,78 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
 
 @main.command("sessions")
 @click.argument("name", required=False)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help=(
+        "Print live sessions as JSON (name, cwd, model, effort, state, account) "
+        "and exit."
+    ),
+)
 @click.pass_context
-def sessions_cmd(ctx: click.Context, name: str | None) -> None:
+def sessions_cmd(ctx: click.Context, name: str | None, as_json: bool) -> None:
     """List psmux sessions or attach to one. Usage: magent sessions [name]"""
     config_file = find_config(ctx.obj.get("config_path"))
+    if as_json:
+        _emit_sessions_json(ctx.obj.get("config_path"))
+        return
     _run_sessions_picker(config_file, name)
+
+
+def _emit_sessions_json(config_path: str | None) -> None:
+    """Print each configured session with its live state, one JSON array.
+
+    Only stdout carries the JSON: this reads config with the raw
+    ``config_sessions`` loader (no `load_config` version warning), and the
+    per-session pane reads fan out on a small pool so a big fleet stays quick.
+
+    ``account`` is the recorded placement from ``~/.magent/account-map.json``,
+    and null when the session is unrouted. Read from the MAP and never from
+    ccswap: this command is what scripts poll, and a subprocess to somebody
+    else's CLI per poll is exactly the cost the map exists to avoid.
+    """
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+
+    from magent import accounts, fleet, psmux  # heavy subsystem: in-body per policy
+
+    dicts = psmux.config_sessions(config_path)
+    names = [psmux.socket_id(d) for d in dicts]
+    resolved = {psmux.socket_id(d): str(d.get("resolved") or "") for d in dicts}
+    routed = accounts.read_map()
+    binary = psmux.find_psmux()
+    live = set(psmux.live_sessions(names, psmux=binary)) if binary and names else set()
+
+    def _row(name: str) -> dict[str, object]:
+        entry = routed.get(name)
+        account = entry.account if entry else None
+        if name not in live:
+            return {
+                "name": name,
+                "cwd": resolved.get(name, ""),
+                "live": False,
+                "state": "dead",
+                "model": None,
+                "effort": None,
+                "account": account,
+            }
+        st = fleet.read_state(name, psmux_bin=binary)
+        return {
+            "name": name,
+            "cwd": resolved.get(name, ""),
+            "live": True,
+            "state": st["state"],
+            "model": st["model"],
+            "effort": st["effort"],
+            "account": account,
+        }
+
+    live_names = [n for n in names if n in live]
+    read: dict[str, dict[str, object]] = {}
+    if live_names:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for name, row in zip(live_names, pool.map(_row, live_names), strict=True):
+                read[name] = row
+    rows = [read[n] if n in read else _row(n) for n in names]
+    click.echo(json.dumps(rows, indent=2))

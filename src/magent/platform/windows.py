@@ -641,7 +641,7 @@ class WindowsPlatform(Platform):
             # Popen's. It binds when wt is cold (and on every POSIX backend).
             # The airtight path is psmux `new-session`, which is the default
             # here; this is the belt to its braces.
-            subprocess.Popen(args, env=spawn_child_env())
+            subprocess.Popen(args, env=spawn_child_env(opts.env, drop=opts.drop_env))
         except FileNotFoundError as exc:
             # wt is a hard dependency: turn the raw FileNotFoundError into a
             # typed, actionable error the launch shell surfaces as one clean
@@ -743,6 +743,15 @@ class WindowsPlatform(Platform):
             #    they keep the plain inherited environment rather than a rebuilt
             #    block under every round-trip.
             #
+            # 3. ...and it is PER WINDOW. `w.env` is that project's account
+            #    overlay (`CLAUDE_CONFIG_DIR`) and `w.drop_env` the credential
+            #    variables that would silently outrank it; both are empty for
+            #    every unrouted window, so this argument is today's `child_env()`
+            #    byte for byte unless routing chose something. The overlay has to
+            #    land HERE and nowhere later: this call is the only moment a
+            #    pane's environment is set, and the psmux SERVER it forks is what
+            #    the agent eventually inherits from.
+            #
             # Deliberately NOT added here: any console flag. `spawn_unjobbed`
             # changes job membership and nothing else, so this child keeps
             # inheriting the caller's console exactly as it always has -- psmux
@@ -763,7 +772,7 @@ class WindowsPlatform(Platform):
                     ],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    env=child_env(),
+                    env=child_env(w.env, drop=w.drop_env),
                 )
                 for w in wave
             ]

@@ -1,15 +1,19 @@
+import json
 import os
 import sys
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from magent.sessions import (
     FLASH_MSG_MAX,
     build_code_open_command,
     build_flash_url,
+    build_start_command,
     folder_for_session,
 )
 from magent.sessions.claude import (
     claude_fresh_command,
+    default_config_dir,
     encode_claude_project_path,
     get_claude_session_ids,
     has_claude_session,
@@ -56,32 +60,152 @@ class TestGetClaudeSessionIds:
                 ("uuid-middle", 2000.0),
             ],
         )
-        ids = get_claude_session_ids("test-project", 3, home_override=home)
+        ids = get_claude_session_ids("test-project", 3, config_dir=home / ".claude")
         assert ids == ["uuid-newest", "uuid-middle", "uuid-oldest"]
 
     def test_returns_fewer_than_requested(self, fake_claude_sessions, tmp_path):
         home = tmp_path
         encoded = "test-project"
         fake_claude_sessions(encoded, [("uuid-1", 1000.0), ("uuid-2", 2000.0)])
-        ids = get_claude_session_ids("test-project", 5, home_override=home)
+        ids = get_claude_session_ids("test-project", 5, config_dir=home / ".claude")
         assert ids == ["uuid-2", "uuid-1", None, None, None]
 
     def test_empty_dir(self, fake_claude_sessions, tmp_path):
         home = tmp_path
         fake_claude_sessions("test-project", [])
-        ids = get_claude_session_ids("test-project", 3, home_override=home)
+        ids = get_claude_session_ids("test-project", 3, config_dir=home / ".claude")
         assert ids == [None, None, None]
 
     def test_no_dir_exists(self, tmp_path):
-        ids = get_claude_session_ids("nonexistent", 2, home_override=tmp_path)
+        ids = get_claude_session_ids("nonexistent", 2, config_dir=tmp_path / ".claude")
         assert ids == [None, None]
 
     def test_count_one(self, fake_claude_sessions, tmp_path):
         home = tmp_path
         encoded = "test-project"
         fake_claude_sessions(encoded, [("uuid-1", 1000.0), ("uuid-2", 2000.0)])
-        ids = get_claude_session_ids("test-project", 1, home_override=home)
+        ids = get_claude_session_ids("test-project", 1, config_dir=home / ".claude")
         assert ids == ["uuid-2"]
+
+
+class TestTheDefaultStoreIsTheHomeClaudeDir:
+    """Characterization pins for the store each probe reads when the caller
+    names none. Written against the redirected HOME (tests/conftest.py's
+    autouse isolation), so they assert the DEFAULT resolution -- ``~/.claude``
+    for claude, ``~/.codex`` for codex -- rather than whatever seam parameter
+    happens to be spelled today. That is exactly the property the config-dir
+    rework must not move: an unrouted project keeps reading the same files.
+    """
+
+    def _write_claude(self, slug: str, name: str = "uuid-1") -> None:
+        sess_dir = Path.home() / ".claude" / "projects" / slug
+        sess_dir.mkdir(parents=True, exist_ok=True)
+        (sess_dir / f"{name}.jsonl").write_text('{"type":"message"}\n')
+
+    def test_has_claude_session_reads_home_claude_projects(self):
+        assert has_claude_session("/home/user/api") is False
+        self._write_claude("-home-user-api")
+        assert has_claude_session("/home/user/api") is True
+
+    def test_get_claude_session_ids_reads_home_claude_projects(self):
+        assert get_claude_session_ids("/home/user/api", 2) == [None, None]
+        self._write_claude("-home-user-api", "uuid-a")
+        assert get_claude_session_ids("/home/user/api", 2) == ["uuid-a", None]
+
+    def test_claude_fresh_command_probes_home_claude_projects(self):
+        assert claude_fresh_command("claude --continue", "/home/user/api") == "claude"
+        self._write_claude("-home-user-api")
+        assert claude_fresh_command("claude --continue", "/home/user/api") is None
+
+    def test_build_start_command_drops_continue_off_the_default_store(self):
+        assert (
+            build_start_command("claude", "claude --continue", "/home/user/api")
+            == "claude"
+        )
+        self._write_claude("-home-user-api")
+        assert (
+            build_start_command("claude", "claude --continue", "/home/user/api")
+            == "claude --continue"
+        )
+
+    def test_get_codex_session_ids_reads_home_codex_sessions(self):
+        assert get_codex_session_ids("/home/user/api", 1) == [None]
+        day = Path.home() / ".codex" / "sessions" / "2026" / "06" / "20"
+        day.mkdir(parents=True, exist_ok=True)
+        (day / "session-0-uuid-c.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {"id": "uuid-c", "cwd": "/home/user/api"},
+                }
+            )
+            + "\n"
+        )
+        assert get_codex_session_ids("/home/user/api", 1) == ["uuid-c"]
+
+
+class TestANamedConfigDirAnswersForTheProject:
+    """The account-routing half: under ``CLAUDE_CONFIG_DIR=<profile>`` claude
+    writes ``<profile>/projects/<encoded cwd>``, so a probe told which store to
+    read must read THAT one -- and must keep answering out of ``~/.claude``
+    when told nothing."""
+
+    def _write(self, root: Path, slug: str, name: str = "uuid-1") -> None:
+        sess_dir = root / "projects" / slug
+        sess_dir.mkdir(parents=True, exist_ok=True)
+        (sess_dir / f"{name}.jsonl").write_text('{"type":"message"}\n')
+
+    def test_the_named_store_is_read_and_the_home_one_is_not(self, tmp_path):
+        profile = tmp_path / "sessions" / "13-acct"
+        self._write(profile, "-home-user-api", "uuid-routed")
+        # The default store has a DIFFERENT conversation for the same project.
+        self._write(Path.home() / ".claude", "-home-user-api", "uuid-default")
+
+        assert get_claude_session_ids("/home/user/api", 1, profile) == ["uuid-routed"]
+        assert get_claude_session_ids("/home/user/api", 1) == ["uuid-default"]
+        assert has_claude_session("/home/user/api", profile) is True
+
+    def test_a_project_with_no_history_in_that_store_starts_fresh(self, tmp_path):
+        # The move case: the conversation exists on the OLD account only, so
+        # the new account's store honestly answers "nothing to continue".
+        self._write(Path.home() / ".claude", "-home-user-api")
+        profile = tmp_path / "sessions" / "19-acct"
+        profile.mkdir(parents=True)
+
+        assert has_claude_session("/home/user/api", profile) is False
+        assert claude_fresh_command("claude --continue", "/home/user/api") is None
+        assert (
+            claude_fresh_command("claude --continue", "/home/user/api", profile)
+            == "claude"
+        )
+
+    def test_build_start_command_threads_the_config_dir_through(self, tmp_path):
+        profile = tmp_path / "sessions" / "13-acct"
+        self._write(profile, "-home-user-api")
+
+        assert (
+            build_start_command(
+                "claude", "claude --continue", "/home/user/api", config_dir=profile
+            )
+            == "claude --continue"
+        )
+        # Same project, same command, a store with no transcript for it.
+        assert (
+            build_start_command(
+                "claude",
+                "claude --continue",
+                "/home/user/api",
+                config_dir=tmp_path / "sessions" / "19-acct",
+            )
+            == "claude"
+        )
+
+    def test_default_config_dir_is_resolved_at_call_time(self, tmp_path, monkeypatch):
+        # Never an import-bound constant: the value has to follow a redirected
+        # home, which is what keeps the test tripwire meaningful.
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert default_config_dir() == tmp_path / ".claude"
 
 
 class TestHasClaudeSession:
@@ -90,30 +214,30 @@ class TestHasClaudeSession:
 
     def test_true_when_a_session_file_exists(self, fake_claude_sessions, tmp_path):
         fake_claude_sessions("test-project", [("uuid-1", 1000.0)])
-        assert has_claude_session("test-project", home_override=tmp_path) is True
+        assert has_claude_session("test-project", tmp_path / ".claude") is True
 
     def test_false_for_a_directory_with_no_session_files(
         self, fake_claude_sessions, tmp_path
     ):
         fake_claude_sessions("test-project", [])
-        assert has_claude_session("test-project", home_override=tmp_path) is False
+        assert has_claude_session("test-project", tmp_path / ".claude") is False
 
     def test_false_when_the_project_was_never_opened(self, tmp_path):
         # The headline case: a project just added to magent, or a fresh
-        # machine -- ~/.claude/projects/<encoded> does not exist at all.
-        assert has_claude_session("nonexistent", home_override=tmp_path) is False
+        # machine -- <config dir>/projects/<encoded> does not exist at all.
+        assert has_claude_session("nonexistent", tmp_path / ".claude") is False
 
     def test_the_project_path_is_encoded_like_claude_encodes_it(self, tmp_path):
         sess_dir = tmp_path / ".claude" / "projects" / "-home-user-api"
         sess_dir.mkdir(parents=True)
         (sess_dir / "uuid-1.jsonl").write_text("{}\n")
-        assert has_claude_session("/home/user/api", home_override=tmp_path) is True
+        assert has_claude_session("/home/user/api", tmp_path / ".claude") is True
 
     def test_non_jsonl_files_do_not_count(self, tmp_path):
         sess_dir = tmp_path / ".claude" / "projects" / "test-project"
         sess_dir.mkdir(parents=True)
         (sess_dir / "notes.txt").write_text("hi")
-        assert has_claude_session("test-project", home_override=tmp_path) is False
+        assert has_claude_session("test-project", tmp_path / ".claude") is False
 
 
 class TestClaudeFreshCommand:
@@ -122,7 +246,7 @@ class TestClaudeFreshCommand:
     and, just as importantly, when it is kept so the failure stays visible."""
 
     def _fresh(self, cmd, tmp_path, project="test-project"):
-        return claude_fresh_command(cmd, project, home_override=tmp_path)
+        return claude_fresh_command(cmd, project, tmp_path / ".claude")
 
     def test_new_directory_drops_the_continue_flag(self, tmp_path):
         assert self._fresh("claude --continue", tmp_path) == "claude"
@@ -195,11 +319,16 @@ class TestCodexFreshCommand:
     only hazardous shape is a hand-configured `codex resume --last`."""
 
     def test_the_registry_default_is_never_rewritten(self, tmp_path):
-        assert codex_fresh_command("codex", "/home/user/api", tmp_path) is None
+        assert (
+            codex_fresh_command("codex", "/home/user/api", home_override=tmp_path)
+            is None
+        )
 
     def test_resume_last_in_a_new_directory_drops_back_to_the_binary(self, tmp_path):
         assert (
-            codex_fresh_command("codex resume --last", "/home/user/api", tmp_path)
+            codex_fresh_command(
+                "codex resume --last", "/home/user/api", home_override=tmp_path
+            )
             == "codex"
         )
 
@@ -208,15 +337,38 @@ class TestCodexFreshCommand:
     ):
         fake_codex_sessions([("/home/user/api", "uuid-1", 1000.0)])
         assert (
-            codex_fresh_command("codex resume --last", "/home/user/api", tmp_path)
+            codex_fresh_command(
+                "codex resume --last", "/home/user/api", home_override=tmp_path
+            )
             is None
         )
 
     def test_an_explicitly_named_session_is_never_rewritten(self, tmp_path):
         assert (
-            codex_fresh_command("codex resume uuid-1", "/home/user/api", tmp_path)
+            codex_fresh_command(
+                "codex resume uuid-1", "/home/user/api", home_override=tmp_path
+            )
             is None
         )
+
+    def test_a_claude_config_dir_is_accepted_and_ignored(
+        self, fake_codex_sessions, tmp_path
+    ):
+        """codex's store is ~/.codex, one per machine and not account-scoped:
+        the registry's config_dir argument must change nothing here."""
+        fake_codex_sessions([("/home/user/api", "uuid-1", 1000.0)])
+        assert (
+            codex_fresh_command(
+                "codex resume --last",
+                "/home/user/api",
+                tmp_path / "profile-13",
+                home_override=tmp_path,
+            )
+            is None
+        )
+        assert get_codex_session_ids(
+            "/home/user/api", 1, tmp_path / "profile-13", home_override=tmp_path
+        ) == ["uuid-1"]
 
 
 class TestGetCodexSessionIds:

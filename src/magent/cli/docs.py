@@ -1,5 +1,8 @@
-"""The `magent docs` command: a 190-line pure-string Markdown generator
-for the full config reference. No I/O beyond stdout via click.echo.
+"""The `magent docs` command: a pure-string Markdown generator for the full
+config reference. No I/O beyond stdout via click.echo.
+
+Three hand-written tables (`_PROJECT_FIELD_DOCS`, `_SETTINGS_FIELD_DOCS`,
+`_CLI_COMMAND_DOCS`) supply the prose; `_generate_docs` only lays it out.
 """
 
 from __future__ import annotations
@@ -29,6 +32,26 @@ _PROJECT_FIELD_DOCS: list[tuple[str, str, str, str]] = [
         "list",
         "none",
         'List of window objects `{"name", "tool", "command"}` with per-window tool/command overrides. Legacy `int` / `["name1", "name2"]` forms still parse (normalized by `magent config migrate`).',
+    ),
+    (
+        "account",
+        "string",
+        "none",
+        (
+            "Pin this project to one Claude account id (see `settings.accounts`). "
+            "Your intent — magent never writes this field, and honours it even "
+            "over the hard usage threshold."
+        ),
+    ),
+    (
+        "modelClass",
+        "string",
+        "inferred",
+        (
+            "`fable` or `standard`. Which usage cap this project's work counts "
+            "against, when magent should not guess. An unknown value is ignored "
+            "with a warning."
+        ),
     ),
 ]
 
@@ -118,6 +141,273 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
         (
             "Also push toast/ntfy when an agent finishes (enters `done`). Opt-in; "
             "does nothing unless `toast` or `ntfy` is on."
+        ),
+    ),
+    (
+        "accounts.enabled",
+        "boolean",
+        "`false`",
+        (
+            "Spread projects across your Claude accounts. Off by default: with it "
+            "off magent runs no `ccswap` and every pane starts on your default "
+            "login, exactly as before this setting existed."
+        ),
+    ),
+    (
+        "accounts.softThreshold",
+        "number",
+        "`85`",
+        "Percent of an account's binding usage window at which magent stops placing *new* projects on it (it never evicts one already there).",
+    ),
+    (
+        "accounts.hardThreshold",
+        "number",
+        "`95`",
+        "Percent at which an account is excluded from assignment altogether, and a project on it is offered a move.",
+    ),
+    (
+        "accounts.onLimit",
+        "string",
+        '`"move-if-reset>2h"`',
+        "What to recommend for a session whose account hit its limit: `wait`, `move`, or `move-if-reset>Nh`. An unrecognised value warns and falls back to `wait`.",
+    ),
+    (
+        "accounts.staleAfterS",
+        "number",
+        "`900`",
+        "Seconds after which ccswap's cached usage numbers are reported as stale. A caveat on the table, never a refusal to launch.",
+    ),
+    (
+        "accounts.statusLeft",
+        "boolean",
+        "`true`",
+        "Show the routed account id in each session's psmux status bar.",
+    ),
+    (
+        "accounts.perAccount",
+        "object",
+        "`{}`",
+        'Per-account overrides keyed by ccswap account id: `{"13": {"class": "fable", "exclude": false, "onLimit": "wait"}}`. `class` reserves an account for one model class; `exclude` takes it out of routing.',
+    ),
+]
+
+
+# The CLI-commands table: (invocation, what it does). Hand-written on purpose
+# -- these descriptions say what a command is FOR and what is surprising about
+# it, which a generator reading click's one-line help could not. The price of
+# hand-writing is drift, and it was paid: nine commands once shipped with no
+# row at all. `tests/unit/test_docs.py` walks the real click registry and fails
+# until every registered command has a row here, in both directions.
+_CLI_COMMAND_DOCS: list[tuple[str, str]] = [
+    ("magent", "Interactive menu."),
+    ("magent --go", "Launch + tile, skip menu."),
+    ("magent --retile-all", "Re-tile every matching window."),
+    ("magent -g <name>", "Launch only projects in a group."),
+    ("magent --init", "Re-scan sessions and regenerate config."),
+    ("magent --init --base-dir <dir>", "Generate config from a folder of repos."),
+    ("magent --edit", "Open config in your default editor."),
+    ("magent docs", "Print this reference (pipe to file for AI context)."),
+    ("magent up", "(Host side) ensure a persistent psmux session per project."),
+    (
+        "magent up --json",
+        "Print session status (up/down/projects) as JSON, change nothing.",
+    ),
+    ("magent up -g <group>", "Bring up sessions for only one project group."),
+    (
+        "magent attach [host]",
+        "From another PC: bring host sessions up over SSH, tile locally, Alt+V hotkey.",
+    ),
+    (
+        "magent attach <host> -g <group>",
+        "Attach to only one project group on the host.",
+    ),
+    (
+        "magent attach <host> --no-mux",
+        "Attach with a direct SSH window per project (no psmux/tmux).",
+    ),
+    ("magent --attach-to <host>", "(deprecated alias for `magent attach <host>`)."),
+    (
+        "magent status",
+        "Show which psmux sessions and the upload server are running.",
+    ),
+    (
+        "magent doctor",
+        (
+            "Check the environment one line at a time -- config, env vars, tools, "
+            "monitors, Alt+V, psmux -- each with a repair hint. Exits 1 only if a "
+            "check FAILED; warnings still pass. `--json` for the same as data."
+        ),
+    ),
+    (
+        "magent watch",
+        (
+            "Live table of every agent session, whoever needs you first. Press a "
+            "row's digit to focus that window; `q` quits."
+        ),
+    ),
+    (
+        "magent attention",
+        (
+            "Ambient signals for the whole fleet: badge each `magent:` title with "
+            "its session state, flash the taskbar on needs-input/error, and (per "
+            "`settings.attention`) toast or ntfy. Also keeps `magent serve` alive "
+            "and the psmux fleet at above-normal priority."
+        ),
+    ),
+    (
+        "magent attention -d",
+        (
+            "The same, detached, one per machine. Its heartbeat shows in `magent "
+            "status`; `--stop` ends it, and so does `down --all`."
+        ),
+    ),
+    (
+        "magent hooks install",
+        (
+            "Wire magent's state hook into Claude Code's lifecycle events, so "
+            "session states are reported by the agent rather than scraped off a "
+            "screen. Idempotent; prints the Codex `notify` recipe to paste "
+            "yourself."
+        ),
+    ),
+    (
+        "magent hooks status",
+        "Show which lifecycle events are wired and how fresh the state store is.",
+    ),
+    (
+        "magent down",
+        (
+            "Shut down all running psmux sessions (falls back to the host you last "
+            "attached to when none are local)."
+        ),
+    ),
+    ("magent down -g <group>", "Shut down only one group's sessions."),
+    ("magent down <name> [<name>...]", "Shut down specific sessions by name."),
+    ("magent down --all", "Stop every session and the upload server."),
+    (
+        "magent down --host <user@host>",
+        (
+            "Run the same shutdown on that machine over SSH, closing the local "
+            "attach windows first."
+        ),
+    ),
+    ("magent serve", "Start upload server for mobile image transfer."),
+    (
+        "magent serve -p 9090",
+        "Use a custom port (default: this config's `uploadPort`, else 8033).",
+    ),
+    (
+        "magent mobile",
+        (
+            "Print the uploader's phone URL and a QR for it, so you can scan once "
+            "and Add to Home Screen. Run it on the machine that serves the uploader."
+        ),
+    ),
+    (
+        "magent termius",
+        (
+            "Print an SSH config block for a single `magent` host that opens the "
+            "session picker on connect. `--install` writes it into `~/.ssh/config` "
+            "between markers, replacing its own previous block."
+        ),
+    ),
+    ("magent hotkey", "Listen for Alt+V to upload clipboard images (standalone)."),
+    (
+        "magent terminal install",
+        "Bind Ctrl+Backspace / Shift+Enter in Windows Terminal so they survive psmux.",
+    ),
+    (
+        "magent terminal status",
+        "Report whether those keybindings are installed, conflicting or missing.",
+    ),
+    ("magent sessions", "List active psmux sessions, pick one to attach."),
+    ("magent sessions <name>", "Attach directly to a psmux session by name."),
+    (
+        "magent sessions --json",
+        (
+            "Print every configured session as JSON -- `name`, `cwd`, `live`, "
+            "`state`, `model`, `effort`, `account` -- and exit. The read surface "
+            "for scripts; `account` is null when a session is unrouted."
+        ),
+    ),
+    (
+        "magent send <session> <text>",
+        (
+            "Paste a prompt into one running agent and press Enter, then confirm it "
+            "left the input line. SESSION matches case-insensitively (exact, then a "
+            "unique prefix/substring). `--file` reads the text from a file, "
+            "`--wait-idle` holds until the agent is between turns, `--compact` runs "
+            "`/compact` first. Exit 2 no such live session, 3 psmux error, 4 send "
+            "unconfirmed."
+        ),
+    ),
+    (
+        "magent model <session> <model>",
+        (
+            "Switch a session's model, only while it is idle -- never mid-turn -- "
+            "then re-read the pane footer to verify the switch took. `--effort` "
+            "sets reasoning effort too; `--all` does every live session, retrying "
+            "busy ones until `--max-minutes` runs out."
+        ),
+    ),
+    (
+        "magent peek <session>",
+        (
+            "Print the last lines of a session's pane, a read-only glance (`-n` for "
+            "how many). Safe to redirect: glyphs this console cannot encode become "
+            "`?` rather than crashing."
+        ),
+    ),
+    (
+        "magent account",
+        (
+            "Show every Claude account ccswap reports, its usage, and which "
+            "projects sit on it."
+        ),
+    ),
+    (
+        "magent account plan",
+        "Show which account each project WOULD get, and why. Changes nothing.",
+    ),
+    (
+        "magent account pin <project> <account>",
+        "Always run that project on that account (written to this config).",
+    ),
+    ("magent account unpin <project>", "Remove the pin."),
+    ("magent account refresh", "Ask ccswap for fresher usage numbers."),
+    ("magent config show", "Display current config."),
+    ("magent config layout <cols> <rows>", "Set window grid."),
+    ("magent config base-dir <path>", "Set projects folder."),
+    ("magent config default-tool <tool>", "Set default AI tool."),
+    ("magent config tool <name> <cmd>", "Add/update a tool command."),
+    ("magent config remove-tool <name>", "Remove a tool."),
+    ("magent config add <path> [-g GROUP] [-t TOOL]", "Add a project."),
+    ("magent config remove <path>", "Remove a project."),
+    ("magent config enable <path>", "Enable a project."),
+    ("magent config disable <path>", "Disable a project."),
+    ("magent config set <path> <field> <value>", "Set a project field."),
+    ("magent config open", "Open config in editor."),
+    ("magent config path", "Print config file path."),
+    (
+        "magent config migrate",
+        "Stamp the schema version and backfill project colors.",
+    ),
+    (
+        "magent config edit [host]",
+        (
+            "Edit ANOTHER machine's config in your editor over SSH (omit the host "
+            "to reuse your last attach target)."
+        ),
+    ),
+    (
+        "magent config cat",
+        "Print this machine's raw config to stdout (host side of `config edit`).",
+    ),
+    (
+        "magent config put",
+        (
+            "Replace this machine's config from stdin, validated, with a backup "
+            "(host side of `config edit`)."
         ),
     ),
 ]
@@ -303,83 +593,8 @@ def _generate_docs() -> str:
     w("")
     w("| Command | Description |")
     w("| --- | --- |")
-    w("| `magent` | Interactive menu. |")
-    w("| `magent --go` | Launch + tile, skip menu. |")
-    w("| `magent --retile-all` | Re-tile every matching window. |")
-    w("| `magent -g <name>` | Launch only projects in a group. |")
-    w("| `magent --init` | Re-scan sessions and regenerate config. |")
-    w("| `magent --init --base-dir <dir>` | Generate config from a folder of repos. |")
-    w("| `magent --edit` | Open config in your default editor. |")
-    w("| `magent docs` | Print this reference (pipe to file for AI context). |")
-    w("| `magent up` | (Host side) ensure a persistent psmux session per project. |")
-    w(
-        "| `magent up --json` | Print session status (up/down/projects) as JSON, change nothing. |"
-    )
-    w("| `magent up -g <group>` | Bring up sessions for only one project group. |")
-    w(
-        "| `magent attach [host]` | From another PC: bring host sessions up over SSH, tile locally, Alt+V hotkey. |"
-    )
-    w(
-        "| `magent attach <host> -g <group>` | Attach to only one project group on the host. |"
-    )
-    w(
-        "| `magent attach <host> --no-mux` | Attach with a direct SSH window per project (no psmux/tmux). |"
-    )
-    w(
-        "| `magent --attach-to <host>` | (deprecated alias for `magent attach <host>`). |"
-    )
-    w(
-        "| `magent status` | Show which psmux sessions and the upload server are running. |"
-    )
-    w(
-        "| `magent down` | Shut down all running psmux sessions (falls back to the host you last attached to when none are local). |"
-    )
-    w("| `magent down -g <group>` | Shut down only one group's sessions. |")
-    w("| `magent down <name> [<name>...]` | Shut down specific sessions by name. |")
-    w("| `magent down --all` | Stop every session and the upload server. |")
-    w(
-        "| `magent down --host <user@host>` | Run the same shutdown on that machine over SSH, closing the local attach windows first. |"
-    )
-    w("| `magent serve` | Start upload server for mobile image transfer. |")
-    w(
-        "| `magent serve -p 9090` | Use a custom port (default: this config's `uploadPort`, else 8033). |"
-    )
-    w("| `magent hotkey` | Listen for Alt+V to upload clipboard images (standalone). |")
-    w(
-        "| `magent terminal install` | Bind Ctrl+Backspace / Shift+Enter in Windows Terminal so they survive psmux. |"
-    )
-    w(
-        "| `magent terminal status` | Report whether those keybindings are installed, conflicting or missing. |"
-    )
-    w("| `magent sessions` | List active psmux sessions, pick one to attach. |")
-    w("| `magent sessions <name>` | Attach directly to a psmux session by name. |")
-    w("| `magent config show` | Display current config. |")
-    w("| `magent config layout <cols> <rows>` | Set window grid. |")
-    w("| `magent config base-dir <path>` | Set projects folder. |")
-    w("| `magent config default-tool <tool>` | Set default AI tool. |")
-    w("| `magent config tool <name> <cmd>` | Add/update a tool command. |")
-    w("| `magent config remove-tool <name>` | Remove a tool. |")
-    w("| `magent config add <path> [-g GROUP] [-t TOOL]` | Add a project. |")
-    w("| `magent config remove <path>` | Remove a project. |")
-    w("| `magent config enable <path>` | Enable a project. |")
-    w("| `magent config disable <path>` | Disable a project. |")
-    w("| `magent config set <path> <field> <value>` | Set a project field. |")
-    w("| `magent config open` | Open config in editor. |")
-    w("| `magent config path` | Print config file path. |")
-    w(
-        "| `magent config migrate` | Stamp the schema version and backfill project colors. |"
-    )
-    w(
-        "| `magent config edit [host]` | Edit ANOTHER machine's config in your editor over SSH "
-        "(omit the host to reuse your last attach target). |"
-    )
-    w(
-        "| `magent config cat` | Print this machine's raw config to stdout (host side of `config edit`). |"
-    )
-    w(
-        "| `magent config put` | Replace this machine's config from stdin, validated, with a backup "
-        "(host side of `config edit`). |"
-    )
+    for command, desc in _CLI_COMMAND_DOCS:
+        w(f"| `{command}` | {desc} |")
     w("")
 
     return "\n".join(lines)
