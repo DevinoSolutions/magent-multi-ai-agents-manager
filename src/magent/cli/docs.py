@@ -281,8 +281,11 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
         "magent attach [host]",
         (
             "From another PC: bring host sessions up over SSH, tile locally, Alt+V "
-            "hotkey. Each pane is supervised and reattaches itself once the host is "
-            "reachable again; `--no-reconnect` restores a plain one-shot ssh pane."
+            "hotkey. Each psmux pane is supervised and reattaches itself once the "
+            "host is reachable again -- except with `--no-reconnect` (a plain "
+            "one-shot ssh pane), with `--no-mux` (its direct-ssh windows are never "
+            "supervised), or when `magent-attach-client` is not on PATH (every pane "
+            "degrades to bare ssh, with one warning)."
         ),
     ),
     (
@@ -300,15 +303,15 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "Show which psmux sessions, the upload server, the Alt+V listener and "
             "the attention daemon are running, plus a count of agents waiting on "
             "you. Exit 0 healthy, 1 no readable config, 3 degraded (a dead upload "
-            "server, or a stale/crashed listener or daemon)."
+            "server, a stale or dead listener, or a stale/crashed attention daemon)."
         ),
     ),
     (
         "magent doctor",
         (
             "Check the environment one line at a time -- config, env vars, tools, "
-            "monitors, Alt+V, psmux -- with an actionable hint on anything that "
-            "warns or fails. Exits 1 only if a check FAILED; warnings still pass. "
+            "monitors, Alt+V, psmux -- most with a repair hint when they warn or "
+            "fail. Exits 1 only if a check FAILED; warnings still pass. "
             "`--json` for the same as data, including monitor topology."
         ),
     ),
