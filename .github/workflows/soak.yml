@@ -38,7 +38,10 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    # matrix.os stays literal ubuntu-latest; only the runner label is
+    # redirected. soak.yml is schedule/workflow_dispatch only (never
+    # pull_request), so the fork check is defense-in-depth here.
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && (github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubuntu-devino') || matrix.os }}
     env:
       MDTEST_SOAK: "1"
       # Dispatch supplies soak_seconds; the scheduled run has no inputs, so fall

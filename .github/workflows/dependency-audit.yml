@@ -31,7 +31,9 @@ jobs:
   pip-audit:
     name: "Dependency Audit (pip-audit)"
     timeout-minutes: 10
-    runs-on: ubuntu-latest
+    # Fork PRs fall back to the hosted label: self-hosted ubuntu-devino runners
+    # execute fork-PR code, and the repo is public.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubuntu-devino' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v5.4.2

@@ -17,7 +17,9 @@ jobs:
   secret-scan:
     name: "Secret Scan (gitleaks)"
     timeout-minutes: 5
-    runs-on: ubuntu-latest
+    # Fork PRs fall back to the hosted label: self-hosted ubuntu-devino runners
+    # execute fork-PR code, and the repo is public.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubuntu-devino' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -42,7 +44,11 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
         python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
-    runs-on: ${{ matrix.os }}
+    # matrix.os stays literal ubuntu-latest (job name embeds it); only the
+    # actual runner label is redirected, and only for that entry. Fork PRs
+    # fall back to the hosted label since self-hosted runners execute
+    # fork-PR code and the repo is public.
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && (github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubuntu-devino') || matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -55,7 +61,9 @@ jobs:
   lint-typecheck-coverage:
     name: "Lint + Type Check + Coverage"
     timeout-minutes: 10
-    runs-on: ubuntu-latest
+    # This is the ONE required check (repo ruleset) -- the job NAME is
+    # untouched, only where it runs. Fork PRs fall back to the hosted label.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubuntu-devino' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v5.4.2
@@ -72,7 +80,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+    # matrix.os stays literal ubuntu-latest; only the runner label is
+    # redirected. Fork PRs fall back to the hosted label.
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && (github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubuntu-devino') || matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -116,13 +126,25 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+    # matrix.os stays literal ubuntu-latest; only the runner label is
+    # redirected. Fork PRs fall back to the hosted label.
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && (github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubuntu-devino') || matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
+      # Every GitHub-hosted image ships node preinstalled; a self-hosted
+      # ubuntu-devino container image is not guaranteed to. The node_contract
+      # tier (tests/e2e/test_state_sink_contract.py) skips cleanly without
+      # node/npm, but that silently drops real coverage -- make sure it's
+      # there instead of hoping the image has it.
+      - name: Ensure Node.js (for the node_contract tier)
+        if: runner.os == 'Linux'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: "20"
       - name: Setup virtual displays
         uses: ./.github/actions/setup-virtual-displays
       # xterm hosts the Linux real-SSH remote-launch leg (test_ssh_real.py)
@@ -166,7 +188,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+    # matrix.os stays literal ubuntu-latest; only the runner label is
+    # redirected. Fork PRs fall back to the hosted label.
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && (github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubuntu-devino') || matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -192,7 +216,9 @@ jobs:
     # shim so session discovery, validation, and injection all hit a live
     # multiplexer. Every other CI job stays byte-identical.
     timeout-minutes: 20
-    runs-on: ubuntu-latest
+    # Fork PRs fall back to the hosted label: self-hosted ubuntu-devino runners
+    # execute fork-PR code, and the repo is public.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubuntu-devino' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -263,7 +289,9 @@ jobs:
     #        TS_OAUTH_SECRET     = the OAuth client secret
     #   Once those three are in place the job goes fully live with NO code change.
     timeout-minutes: 15
-    runs-on: ubuntu-latest
+    # Fork PRs fall back to the hosted label: self-hosted ubuntu-devino runners
+    # execute fork-PR code, and the repo is public.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubuntu-devino' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
