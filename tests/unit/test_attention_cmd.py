@@ -286,6 +286,63 @@ class TestEngineFromConfig:
         assert views[0].state == agent_state.WORKING
 
 
+class TestStalenessFromConfig:
+    """`staleness_from_config` is the ONE translation of settings.attention into
+    the ``{state: seconds}`` window map. Both the engine builder above and the
+    per-session state reads in session_picker/status go through it, because a
+    second copy is exactly the drift that left `magent sessions` (and `status`'s
+    psmux-session table) reading the module defaults while the daemon honored
+    config. Same doctrine as account_cmd.policy_for: the cli module owns the
+    config translation, the consumer takes plain values."""
+
+    def test_config_values_become_the_window_map(self, tmp_config):
+        cfg = config.load_config(
+            tmp_config(
+                {
+                    "version": config.SCHEMA_VERSION,
+                    "projects": [],
+                    "settings": {
+                        "attention": {
+                            "stalenessWorkingS": 10,
+                            "stalenessNeedsInputS": 20,
+                        }
+                    },
+                }
+            )
+        )
+
+        assert attention_cmd.staleness_from_config(cfg) == {
+            agent_state.WORKING: 10.0,
+            agent_state.NEEDS_INPUT: 20.0,
+        }
+
+    def test_an_unset_setting_lands_on_the_module_default(self, tmp_config):
+        # A drift pin in both directions: the config defaults and
+        # attention.STALENESS_S are the same two windows, so "no config" and
+        # "default config" can never disagree about what stale means.
+        from magent import attention
+
+        cfg = config.load_config(
+            tmp_config({"version": config.SCHEMA_VERSION, "projects": []})
+        )
+
+        assert attention_cmd.staleness_from_config(cfg) == attention.STALENESS_S
+
+    def test_the_engine_builder_reads_through_it(self, monkeypatch, tmp_config):
+        # The engine must not keep its own inline copy of the translation:
+        # whatever this seam answers is what the engine ages with.
+        cfg = config.load_config(
+            tmp_config({"version": config.SCHEMA_VERSION, "projects": []})
+        )
+        monkeypatch.setattr(
+            attention_cmd, "staleness_from_config", lambda _cfg: {"working": 7.0}
+        )
+
+        engine = attention_cmd.engine_from_config(cfg)
+
+        assert engine._staleness == {"working": 7.0}
+
+
 class TestIntervalConfigResolution:
     """`--interval` defaults to None (a real sentinel), so an explicit value wins
     over settings.attention.pollIntervalS while an omitted flag falls back to it
