@@ -707,6 +707,46 @@ class TestPsmuxSessionsJson:
             {"name": "api", "app": "claude", "idle": False, "state": ""}
         ]
 
+    def test_the_default_config_still_reports_that_same_working_record(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        """Control for the pin above, and the half that makes it a pin at all:
+        the identical 120s-old record under an untouched config keeps its
+        `working` state. Without this, a `_psmux_sessions` that blanked the
+        column for any reason -- a broken lookup, a hardcoded window, a
+        re-imported `attention.STALENESS_S` that happened to be small -- would
+        pass the configured-window test by accident. Paired, the two say the
+        column is aged by whatever `staleness_from_config` answers and nothing
+        else."""
+        _both_off(monkeypatch)
+        api = tmp_path / "api"
+        api.mkdir()
+        agent_state.write_state(str(api), agent_state.WORKING)
+        rec_path = agent_state._path_for(str(api))
+        rec = json.loads(rec_path.read_text(encoding="utf-8"))
+        rec["ts"] = rec["ts"] - 120.0
+        rec_path.write_text(json.dumps(rec), encoding="utf-8")
+        _fake_psmux(
+            monkeypatch,
+            [{"name": "api", "session": "api"}],
+            [{"name": "api", "session": "api", "resolved": str(api)}],
+            {"api": "claude"},
+        )
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
+
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout)
+        assert payload["psmux_sessions"] == [
+            {
+                "name": "api",
+                "app": "claude",
+                "idle": False,
+                "state": agent_state.WORKING,
+            }
+        ]
+
     def test_existing_envelope_and_exit_codes_are_undisturbed(
         self, runner, tmp_config, tmp_path, monkeypatch
     ):
