@@ -1339,9 +1339,7 @@ class TestPerWindowToolOverride:
         # Fake session discovery: the base tool's ids, one per window.
         monkeypatch.setattr(
             "magent.launch._get_session_ids",
-            # The trailing config dir is which STORE answers for the project:
-            # None for every unrouted one, which is what this test is.
-            lambda _tool, _dir, _count, _config_dir=None: list(session_ids),
+            lambda _tool, _dir, _count: list(session_ids),
         )
         targets: list[_Target] = []
         return _dispatch_cli_agent_project(

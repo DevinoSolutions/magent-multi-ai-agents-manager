@@ -70,23 +70,8 @@ import pytest
 
 from tests.e2e._pty import Budget
 
-# The unit tier's fake ccswap, reused rather than forked: CLAUDE.md forbids a
-# second one, and the reason is the single thing a fake ccswap exists to make
-# impossible -- resolving the REAL binary, which owns the user's live account
-# credentials and whose `list` performs a credential-adoption pass that WRITES
-# to its store. It is already a genuine on-disk executable, which is exactly
-# what an e2e tier needs, so nothing about it had to change.
-from tests.unit._fake_ccswap import (
-    MAGENT_READY_SETTINGS,
-    account,
-    make_fake_ccswap,
-)
-
 if TYPE_CHECKING:
     from typing import NoReturn
-
-    from magent.launch import RoutePlan
-    from tests.unit._fake_ccswap import FakeCcswap
 
 pytestmark = [pytest.mark.e2e]
 
@@ -245,60 +230,6 @@ def _bashify(arg: str) -> str:
     return arg
 
 
-def _write_agent_shim(tmp_path: Path, name: str, log: Path) -> Path:
-    """A launcher shim that runs the stand-in agent, logging to ``log``.
-
-    A shim rather than an argv because a pane command is read by a SHELL: psmux
-    handed a multi-argument command to pwsh, which turned a path containing ``&``
-    into a background job. One shell-quoted argument pointing at a file is the
-    only shape that is safe on both multiplexers.
-    """
-    shim = tmp_path / f"run-{name}{'.cmd' if sys.platform == 'win32' else '.sh'}"
-    argv = [
-        sys.executable,
-        str(_AGENT),
-        "--log",
-        str(log),
-        "--name",
-        name,
-        "--compact-seconds",
-        str(_COMPACT_S),
-    ]
-    if sys.platform == "win32":
-        shim.write_text(
-            "@echo off\r\n" + subprocess.list2cmdline(argv) + "\r\n", encoding="utf-8"
-        )
-    else:
-        shim.write_text("#!/bin/sh\nexec " + shlex.join(argv) + "\n", encoding="utf-8")
-        shim.chmod(0o755)
-    return shim
-
-
-def _records(log: Path) -> list[dict[str, object]]:
-    """Every JSON record the stand-in has appended to ``log``, in order.
-
-    Two shapes share the file: one ``startup`` record and one record per line
-    read. A reader takes the shape it wants and ignores the other, so either can
-    grow without breaking the other's tests.
-    """
-    if not log.exists():
-        return []
-    return [
-        json.loads(raw)
-        for raw in log.read_text(encoding="utf-8").splitlines()
-        if raw.strip()
-    ]
-
-
-def _startup_env(log: Path) -> dict[str, object] | None:
-    """The pane agent's own view of its routing environment, or None."""
-    for record in _records(log):
-        startup = record.get("startup")
-        if isinstance(startup, dict):
-            return startup
-    return None
-
-
 def _wait_until(check, timeout: float, interval: float = 0.25):
     """Poll ``check`` until it is truthy or ``timeout`` runs out; return the last
     value either way, so the caller's assertion reports the real state."""
@@ -348,10 +279,6 @@ class _Fleet:
         self.env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
         self.env["MAGENT_PSMUX_BOOST"] = "0"
         self.env["MAGENT_SESSION0_POLICY"] = "allow"
-        # ...and routing must never run a real `ccswap`: it is the one
-        # feature that shells out to a tool holding the user's real account
-        # credentials, and no HOME redirect contains a binary on PATH.
-        self.env["MAGENT_ACCOUNT_ROUTING"] = "0"
         self.env.update(extra_env)
 
         self.projdirs = {}
@@ -411,7 +338,27 @@ class _Fleet:
     def _start(self, name: str, tmp_path: Path) -> None:
         log = tmp_path / f"{name}.jsonl"
         self.logs[name] = log
-        shim = _write_agent_shim(tmp_path, name, log)
+        shim = tmp_path / f"run-{name}{'.cmd' if sys.platform == 'win32' else '.sh'}"
+        argv = [
+            sys.executable,
+            str(_AGENT),
+            "--log",
+            str(log),
+            "--name",
+            name,
+            "--compact-seconds",
+            str(_COMPACT_S),
+        ]
+        if sys.platform == "win32":
+            shim.write_text(
+                "@echo off\r\n" + subprocess.list2cmdline(argv) + "\r\n",
+                encoding="utf-8",
+            )
+        else:
+            shim.write_text(
+                "#!/bin/sh\nexec " + shlex.join(argv) + "\n", encoding="utf-8"
+            )
+            shim.chmod(0o755)
 
         result = self.psmux(
             "-L",
@@ -462,8 +409,13 @@ class _Fleet:
 
     def received(self, name: str) -> list[str]:
         """Every line the stand-in has read, in order -- the wire's own record."""
+        log = self.logs[name]
+        if not log.exists():
+            return []
         return [
-            record["line"] for record in _records(self.logs[name]) if "line" in record
+            json.loads(raw)["line"]
+            for raw in log.read_text(encoding="utf-8").splitlines()
+            if raw.strip()
         ]
 
     # -- the product ----------------------------------------------------------
@@ -548,498 +500,6 @@ def fleet(tmp_path):
     finally:
         leftovers = f.teardown()
     assert not leftovers, f"cleanup left real multiplexer state behind: {leftovers}"
-
-
-class _RoutedFleet:
-    """Panes created WITH and WITHOUT an account overlay, nothing else.
-
-    Separate from ``_Fleet`` because it answers a different question and must
-    answer it cheaply: no magent CLI, no config, no waiting for a painted
-    screen -- just "what environment did the agent at the far end of the psmux
-    server actually get?".
-    """
-
-    def __init__(
-        self, tmp_path: Path, budget: Budget, *, ccswap: FakeCcswap | None = None
-    ) -> None:
-        self.budget = budget
-        self.tmp = tmp_path
-        self.binary, self.extra_env, self.socket_dir = _resolve_multiplexer(tmp_path)
-        # The fake ccswap the PRODUCT reads when the test is about the whole
-        # chain rather than about the psmux boundary alone. None for the legs
-        # that hand an overlay in; reached through `ccswap` below, which refuses
-        # rather than let a leg plan against "ccswap is not installed".
-        self._ccswap = ccswap
-        stem = f"mgr-{uuid.uuid4().hex[:8]}"
-        self.routed = f"{stem}-r"
-        self.plain = f"{stem}-p"
-        self.product = f"{stem}-w"
-        # ...and three more for the legs whose overlay the PLANNER computes: one
-        # routed pane, one whose snapshot was refused (and must therefore come
-        # up unrouted), and one created by the real launch path. Short, for the
-        # sun_path budget `_resolve_multiplexer` documents.
-        self.planned = f"{stem}-n"
-        self.refused = f"{stem}-u"
-        self.planned_real = f"{stem}-q"
-        # Stands in for a ccswap profile directory. Nothing reads inside it: the
-        # test asserts on the STRING the pane received, which is the whole
-        # contract between magent and the agent.
-        self.profile = tmp_path / "profile-13"
-        self.profile.mkdir()
-        self.work = tmp_path / "work"
-        self.work.mkdir()
-        self.logs: dict[str, Path] = {}
-        self.created: list[str] = []
-
-    @property
-    def control_env(self) -> dict[str, str]:
-        """Environment for the harness's own psmux CONTROL commands."""
-        return {**os.environ, **self.extra_env}
-
-    @property
-    def ccswap(self) -> FakeCcswap:
-        """The fake ccswap, asserted present.
-
-        A leg that plans without one would have ``find_ccswap()`` answer None,
-        the phase would refuse for a reason that has nothing to do with the code
-        under test, and the pane would come up unrouted -- green, and proving
-        nothing. So absence is a loud failure rather than a silent unrouted pass.
-        """
-        assert self._ccswap is not None, (
-            "this leg plans through the product and needs the fake ccswap; "
-            "use the planned_fleet fixture"
-        )
-        return self._ccswap
-
-    def psmux(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [self.binary, *args],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=self.control_env,
-            check=False,
-            timeout=max(5.0, self.budget.clamp(30.0)),
-        )
-
-    def _shim(self, name: str) -> Path:
-        log = self.tmp / f"{name}.jsonl"
-        self.logs[name] = log
-        return _write_agent_shim(self.tmp, name, log)
-
-    def create(
-        self,
-        name: str,
-        overlay: dict[str, str] | None,
-        *,
-        drop: frozenset[str] | None = None,
-    ) -> None:
-        """Create one pane through the product's OWN environment composition.
-
-        ``psmux.child_env`` is the seam ``platform/windows.py`` passes to its
-        ``new-session`` spawn, so the environment block here is the one a routed
-        bring-up builds -- byte for byte, including the three strips and the
-        conditional credential drop. What is substituted is only the spawn call
-        itself, and only because ``launch_psmux_session`` is Windows-only by
-        design (``supports_psmux()`` is False on POSIX): the same honest gap this
-        tier already carries for the psmux binary.
-
-        ``drop`` defaults to the credential strip that travels with any overlay.
-        A caller holding a ``RoutedProject`` passes the PLANNER's own drop set
-        instead, so a leg about the routing chain re-derives nothing.
-        """
-        from magent.env import ACCOUNT_OVERRIDE_VARS
-        from magent.psmux import child_env
-
-        if drop is None:
-            drop = ACCOUNT_OVERRIDE_VARS if overlay else frozenset()
-        env = {**child_env(overlay, drop=drop), **self.extra_env}
-        result = subprocess.run(
-            [
-                self.binary,
-                "-L",
-                name,
-                "new-session",
-                "-d",
-                "-s",
-                name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "-c",
-                str(self.work),
-                _pane_command(self._shim(name)),
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-            check=False,
-            timeout=max(5.0, self.budget.clamp(30.0)),
-        )
-        assert result.returncode == 0, (
-            f"new-session {name} failed rc={result.returncode}: {result.stderr}"
-        )
-        self.created.append(name)
-
-    def create_through_the_product(
-        self,
-        name: str,
-        overlay: dict[str, str],
-        *,
-        drop: frozenset[str] | None = None,
-    ) -> None:
-        """Create one pane by calling the REAL ``launch_psmux_session``.
-
-        Windows only, because that method is: this is the leg where nothing at
-        all is substituted -- the product builds the environment, spawns the
-        ``new-session`` client unjobbed, types the command into the pane, and
-        the agent at the far end records what it got.
-
-        ``drop`` as in :meth:`create`: defaulted here, supplied from the plan by
-        the leg whose overlay the planner computed.
-        """
-        from magent.env import ACCOUNT_OVERRIDE_VARS
-        from magent.platform import PsmuxWindowOpts
-        from magent.platform.windows import WindowsPlatform
-
-        shim = self._shim(name)
-        self.created.append(name)
-        WindowsPlatform().launch_psmux_session(
-            [
-                PsmuxWindowOpts(
-                    window_name=name,
-                    cwd=str(self.work),
-                    command=f'"{shim}"',
-                    env=overlay,
-                    drop_env=ACCOUNT_OVERRIDE_VARS if drop is None else drop,
-                )
-            ]
-        )
-
-    # -- the product's own routing decision -----------------------------------
-
-    def plan_through_the_product(self, name: str) -> RoutePlan:
-        """The routing phase, run for real against the fake ccswap on disk.
-
-        Nothing here composes an overlay. ``launch._route_projects`` is the whole
-        phase the ``--go`` and ``up`` paths both call: the ``--version`` probe,
-        one ``config get`` per required setting, the ``list --json`` snapshot,
-        ``routing.plan``, and the map write. What comes back is the
-        ``RoutedProject`` a real bring-up would put on ``PsmuxWindowOpts`` -- so
-        a test that feeds the pane from this answer is feeding it the product's
-        arithmetic, not its own.
-
-        The config is built rather than loaded because the FILE is not what this
-        leg is about, and ``title`` is the session id routing keys by
-        (``launch.routing_session_id`` -> ``psmux.session_name``, which only
-        rewrites "." ":" and " "), so the planner's key and the pane's name are
-        the same string with no mapping step in between.
-        """
-        from magent import launch
-        from magent.config import (
-            AccountSettings,
-            MagentConfig,
-            ProjectConfig,
-            Settings,
-        )
-
-        assert self.ccswap.path  # loud now rather than an unrouted pass later
-        project_dir = self.tmp / f"proj-{name}"
-        project_dir.mkdir(exist_ok=True)
-        config = MagentConfig(
-            projects=[ProjectConfig(path=str(project_dir), tool="claude", title=name)],
-            settings=Settings(
-                tools={"claude": "claude"},
-                default_tool="claude",
-                # The CONFIG gate. The ENV gate is the fixture's business (it is
-                # pinned off for every tier), and both have to say yes.
-                accounts=AccountSettings(enabled=True),
-            ),
-        )
-        return launch._route_projects(config, config.projects)
-
-    def ccswap_verbs(self) -> list[str]:
-        """The ccswap command of every invocation, spelled as the unit tier
-        spells it -- the witness that a real subprocess produced the snapshot."""
-        return [" ".join(call[:2]) for call in self.ccswap.calls()]
-
-    def startup(self, name: str) -> dict[str, object]:
-        """The agent's own startup record, waited for. Fails loudly without it."""
-        got = _wait_until(
-            lambda: _startup_env(self.logs[name]), self.budget.clamp(_READY_S)
-        )
-        assert got is not None, (
-            f"{name}'s stand-in agent never recorded its environment. "
-            f"pane:\n{self.psmux('-L', name, 'capture-pane', '-p', '-t', name).stdout!r}"
-        )
-        return got
-
-    def teardown(self) -> list[str]:
-        leftovers = []
-        for name in self.created:
-            self.psmux("-L", name, "kill-server")
-        for name in self.created:
-            live = _wait_until(
-                lambda n=name: (
-                    self.psmux("-L", n, "has-session", "-t", n).returncode != 0
-                ),
-                10.0,
-            )
-            if not live:
-                leftovers.append(f"session {name} survived kill-server")
-        if self.socket_dir:
-            shutil.rmtree(self.socket_dir, ignore_errors=True)
-        return leftovers
-
-
-@pytest.fixture
-def routed_fleet(tmp_path, monkeypatch):
-    # An ambient credential, set the way a user's shell would. A routed pane must
-    # not see it (it silently outranks the account the overlay chose, and bills
-    # the API instead of the subscription); an UNROUTED pane must still see it,
-    # because it is the user's own configuration.
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-not-a-real-key")
-    fleet = _RoutedFleet(tmp_path, Budget(_BUDGET_S))
-    try:
-        yield fleet
-    finally:
-        leftovers = fleet.teardown()
-    assert not leftovers, f"cleanup left real multiplexer state behind: {leftovers}"
-
-
-@pytest.fixture
-def planned_fleet(tmp_path, monkeypatch):
-    """``routed_fleet`` plus a real fake ccswap the PRODUCT reads.
-
-    Everything the routing phase needs to say YES, and nothing more, because a
-    leg that routes nothing proves nothing:
-
-    * the ENV gate, put back. ``tests/conftest.py`` pins
-      ``MAGENT_ACCOUNT_ROUTING=0`` for every tier -- this module's legs are about
-      what happens after a user opts in, the same move the upload supervisor's
-      tests make. ``_cached_env`` goes with it, because ``get_env()`` memoises
-      and a read that already happened would answer 0 forever.
-    * the fake installed through the ``find_ccswap`` SEAM, never PATH.
-      ``tests/conftest.py::_no_real_ccswap`` has already made that attribute
-      answer "not installed"; overriding the same attribute is the documented way
-      to win over it without a ``ccswap`` ever being resolvable from PATH.
-    * settings that clear the three ``REQUIRED_SETTINGS`` gates -- the fake's
-      DEFAULTS are deliberately the ones magent cannot route under, so a test
-      that wants routing has to say so.
-    * one eligible, hydrated subscription account whose profile dir is a TMP
-      directory. Never the real ``~/.claude-swap-backup``: that is the user's
-      live credential store, magent never reads inside it, and conftest's guard A
-      watches it.
-    """
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-not-a-real-key")
-    monkeypatch.setenv("MAGENT_ACCOUNT_ROUTING", "1")
-    monkeypatch.setattr("magent.env._cached_env", None)
-    fake = make_fake_ccswap(tmp_path)
-    fake.set_settings(MAGENT_READY_SETTINGS)
-    fleet = _RoutedFleet(tmp_path, Budget(_BUDGET_S), ccswap=fake)
-    fake.set_accounts([account("13", profile_path=str(fleet.profile))])
-    monkeypatch.setattr("magent.accounts.find_ccswap", lambda: fake.path)
-    try:
-        yield fleet
-    finally:
-        leftovers = fleet.teardown()
-    assert not leftovers, f"cleanup left real multiplexer state behind: {leftovers}"
-
-
-class TestTheAccountCrossesThePsmuxServerBoundary:
-    """R-1, measured rather than assumed -- this tier's whole reason to exist.
-
-    A routed pane's account is an environment variable set exactly once, on the
-    ``new-session`` CLIENT. The psmux SERVER that hosts the agent is a grandchild
-    that client forks, and Windows does not inherit a priority class across that
-    boundary (the reason ``psmux.boost_priority`` is a sweep and not a spawn
-    flag). If the environment is dropped there too, every routed pane silently
-    runs on the default login -- the worst failure this feature has, because
-    nothing on screen would say so.
-
-    The witness is the agent's own JSON log, not a screen scrape: it is the only
-    thing that can report what the process at the far end actually received.
-    """
-
-    def test_a_routed_pane_reports_its_accounts_config_dir_verbatim(self, routed_fleet):
-        routed_fleet.create(
-            routed_fleet.routed, {"CLAUDE_CONFIG_DIR": str(routed_fleet.profile)}
-        )
-
-        startup = routed_fleet.startup(routed_fleet.routed)
-
-        # Verbatim, not a prefix: the agent writes its transcripts under exactly
-        # this path, and magent's session probe reads exactly this path.
-        assert startup["CLAUDE_CONFIG_DIR"] == str(routed_fleet.profile)
-        # ...and the ambient credential that would have outranked it is gone.
-        assert startup["anthropic_api_key_set"] is False
-
-    def test_an_unrouted_pane_sees_no_account_and_keeps_the_users_own_key(
-        self, routed_fleet
-    ):
-        routed_fleet.create(routed_fleet.plain, None)
-
-        startup = routed_fleet.startup(routed_fleet.plain)
-
-        assert startup["CLAUDE_CONFIG_DIR"] is None
-        # The strip travels with the overlay and never on its own: stripping a
-        # user's own ANTHROPIC_API_KEY out of an unrouted pane would log them
-        # out of a feature they never enabled.
-        assert startup["anthropic_api_key_set"] is True
-
-    @pytest.mark.skipif(
-        sys.platform != "win32",
-        reason="launch_psmux_session is Windows-only by design (supports_psmux)",
-    )
-    def test_the_real_launch_path_delivers_the_overlay_into_the_pane(
-        self, routed_fleet
-    ):
-        # The leg with nothing substituted: the product builds the environment,
-        # spawns the client, types the command, and the agent reports back.
-        routed_fleet.create_through_the_product(
-            routed_fleet.product, {"CLAUDE_CONFIG_DIR": str(routed_fleet.profile)}
-        )
-
-        startup = routed_fleet.startup(routed_fleet.product)
-
-        assert startup["CLAUDE_CONFIG_DIR"] == str(routed_fleet.profile)
-        assert startup["anthropic_api_key_set"] is False
-
-
-class TestTheAccountTheProductChoseIsTheAccountThePaneRunsOn:
-    """The two halves of R-1, joined -- the gap the class above leaves open.
-
-    ``TestTheAccountCrossesThePsmuxServerBoundary`` hands
-    ``launch_psmux_session`` an overlay dict the TEST wrote, so it proves the
-    second half (an environment set on the ``new-session`` client survives the
-    fork to the server that hosts the agent) and says nothing about the first.
-    The first half -- ccswap's JSON -> ``routing.plan`` -> ``accounts.profile_env``
-    -> ``RoutedProject.env`` -- was pinned only in ``tests/unit/
-    test_launch_routing.py``, where the psmux boundary does not exist. Nothing
-    proved the two joined, and a feature whose halves are each proven separately
-    can still be broken at the seam between them.
-
-    So here nothing in the middle is hand-fed. A real ``ccswap`` subprocess
-    prints a snapshot, ``launch._route_projects`` turns it into a route, and the
-    pane is created carrying exactly ``route.env``/``route.drop_env`` -- the same
-    expression ``launch._dispatch_cli_agent_project`` writes onto
-    ``PsmuxWindowOpts``. The witness stays the agent's own JSON log, because it
-    is the only thing that can report what the process at the far end received.
-
-    Every assertion about a routed pane is paired with the ROW that routed it,
-    which is the guard that matters: routing can never be the reason a bring-up
-    fails, so a leg whose five refusals were not all satisfied would come up
-    unrouted and pass vacuously. The refusal leg below is the other side of the
-    same guard -- it proves an unrouted pane looks DIFFERENT.
-    """
-
-    def test_the_overlay_the_planner_computed_reaches_the_pane(self, planned_fleet):
-        from magent import accounts
-
-        plan = planned_fleet.plan_through_the_product(planned_fleet.planned)
-
-        # Routed, and provably so BEFORE the pane exists. Every one of the five
-        # refusals (old ccswap, a required setting not in effect, a duplicate
-        # warning, a snapshot error, no eligible account) leaves the row
-        # `unrouted-*` and names itself in a note -- so an empty note tuple plus
-        # a route is the whole gate, read from the product's own answer.
-        assert plan.notes == (), plan.notes
-        route = plan.route(planned_fleet.planned)
-        assert route is not None, (
-            "the planner routed nothing, so this leg would have proven only that "
-            "an unrouted pane comes up -- check the fake's snapshot"
-        )
-        assert route.account == "13"
-        assert route.env == {"CLAUDE_CONFIG_DIR": str(planned_fleet.profile)}
-        # ...and it was computed from a real subprocess's output, not a stub.
-        assert "list --json" in planned_fleet.ccswap_verbs()
-
-        # The pane is fed the plan and nothing else -- both halves of the
-        # environment, overlay AND credential strip, off the RoutedProject that
-        # `_dispatch_cli_agent_project` would hand to PsmuxWindowOpts.
-        planned_fleet.create(planned_fleet.planned, route.env, drop=route.drop_env)
-        startup = planned_fleet.startup(planned_fleet.planned)
-
-        # The chain's far end: the path ccswap reported, through the planner,
-        # through `child_env`, through the psmux client -> server fork, as the
-        # agent process itself sees it. Verbatim, not a prefix -- transcripts are
-        # written under exactly this directory and the session probe reads it.
-        assert startup["CLAUDE_CONFIG_DIR"] == route.env["CLAUDE_CONFIG_DIR"]
-        # ...and the ambient credential that would have silently outranked the
-        # account the planner chose (billing the API instead of the
-        # subscription) is gone, because the strip rode along with the overlay.
-        assert startup["anthropic_api_key_set"] is False
-
-        # The product's own record of the decision agrees with the pane: same
-        # session, same account. A map that named a different one would mean
-        # every status surface describing this pane is wrong about it.
-        assert accounts.read_map()[planned_fleet.planned].account == route.account
-
-    def test_a_refused_snapshot_starts_the_pane_unrouted(self, planned_fleet):
-        """The negative control, and a product law in its own right: routing can
-        never be the reason a bring-up fails.
-
-        Without this the leg above could be green for the wrong reason -- a pane
-        that shows no ``CLAUDE_CONFIG_DIR`` is indistinguishable from a pane
-        whose overlay never arrived unless something proves the two states look
-        different. One refusal is enough to prove it (the version gate is the
-        cheapest and the most specific), and the same fake, fixture and pane
-        machinery answer it.
-        """
-        planned_fleet.ccswap.set_version("ccswap 0.30.9")
-
-        plan = planned_fleet.plan_through_the_product(planned_fleet.refused)
-
-        route = plan.route(planned_fleet.refused)
-        assert route is None
-        assert "0.30.9" in "\n".join(plan.notes), plan.notes
-
-        # `route.env if route else None` / `route.drop_env if route else
-        # frozenset()` is verbatim what `_dispatch_cli_agent_project` writes onto
-        # PsmuxWindowOpts, so this pane is created exactly as the product would
-        # create it for a project the phase refused to route.
-        planned_fleet.create(
-            planned_fleet.refused,
-            route.env if route else None,
-            drop=route.drop_env if route else frozenset(),
-        )
-        startup = planned_fleet.startup(planned_fleet.refused)
-
-        assert startup["CLAUDE_CONFIG_DIR"] is None
-        # The user's own key survives: the strip travels with an overlay and
-        # never on its own, so a refusal must not log them out of a feature they
-        # never enabled.
-        assert startup["anthropic_api_key_set"] is True
-
-    @pytest.mark.skipif(
-        sys.platform != "win32",
-        reason="launch_psmux_session is Windows-only by design (supports_psmux)",
-    )
-    def test_the_real_launch_path_delivers_the_planners_overlay(self, planned_fleet):
-        """The whole chain with nothing substituted at all.
-
-        Same honest gap as the class above, in the same direction: only Windows
-        has a ``launch_psmux_session`` to call (``supports_psmux()`` is False on
-        POSIX), so the cross-OS legs stop one call short of it and this one goes
-        the rest of the way -- the product composes the environment, spawns the
-        ``new-session`` client unjobbed, types the command into the pane, and the
-        agent reports what it inherited.
-        """
-        plan = planned_fleet.plan_through_the_product(planned_fleet.planned_real)
-        route = plan.route(planned_fleet.planned_real)
-        assert route is not None, plan.notes
-
-        planned_fleet.create_through_the_product(
-            planned_fleet.planned_real, route.env, drop=route.drop_env
-        )
-        startup = planned_fleet.startup(planned_fleet.planned_real)
-
-        assert startup["CLAUDE_CONFIG_DIR"] == str(planned_fleet.profile)
-        assert startup["anthropic_api_key_set"] is False
 
 
 class TestTheFleetIsReadThroughARealMultiplexer:

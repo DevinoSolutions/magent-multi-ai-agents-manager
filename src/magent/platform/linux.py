@@ -230,10 +230,7 @@ class LinuxPlatform(Platform):
         # (Unlike `wt`, these emulators really are spawned by this Popen, so the
         # environment binds -- gnome-terminal is the one that can hand off to a
         # running server, and only when it does.)
-        #
-        # ...plus this window's own account overlay, if routing chose one for
-        # the project. Empty for every unrouted window.
-        env = spawn_child_env(opts.env, drop=opts.drop_env)
+        env = spawn_child_env()
         if shutil.which("kitty"):
             subprocess.Popen(
                 [

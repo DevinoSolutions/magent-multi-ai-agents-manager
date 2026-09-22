@@ -105,10 +105,6 @@ def _child_env(home, **extra: str) -> dict[str, str]:
     # default policy would create a REAL scheduled task on somebody's
     # desktop. "allow" is today's behaviour, everywhere.
     env["MAGENT_SESSION0_POLICY"] = "allow"
-    # ...and routing must never run a real `ccswap`: it is the one
-    # feature that shells out to a tool holding the user's real account
-    # credentials, and no HOME redirect contains a binary on PATH.
-    env["MAGENT_ACCOUNT_ROUTING"] = "0"
     env.update(extra)
     return env
 
