@@ -5,7 +5,7 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.19.0] - 2026-09-22
 
 ### Added
 
@@ -24,6 +24,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enabled project launches, unchanged. `--all` (`-a`) is the same escape hatch
   on a terminal, `-g <group>` narrows the checklist to that group, and
   `--retile-all` is never asked, since it launches nothing.
+
+- **`magent send`, `magent model`, `magent peek` and `magent sessions --json` —
+  drive a running fleet from any other shell.** Until now the only way to type
+  into an agent was to find its window. `magent send <session> "<text>"` names a
+  session (case-insensitively, by prefix or a unique substring), pastes the text
+  into it literally and presses Enter, then confirms the prompt actually left the
+  input line — `--wait-idle` holds until the agent is between turns, `--compact`
+  compacts first, and the exit code says which of "not found" (2), "the
+  multiplexer refused" (3) and "typed but not confirmed sent" (4) happened, so a
+  script can tell them apart. `magent model <session|--all> <model> [--effort]`
+  switches models only while a session is idle, retrying the busy ones and
+  re-reading the pane footer to verify the switch landed. `magent peek <session>`
+  tails a pane read-only, and is safe to redirect to a file. `magent sessions
+  --json` prints every configured session with its name, cwd, live flag and —
+  for the live ones — the model, effort and state read off the pane.
+
+  Every one of these is exercised in CI against real multiplexer sessions on
+  Windows, macOS and Linux, not a mock, which is how three defects in them were
+  caught and fixed before this release.
+
+### Changed
+
+- Development tooling and CI actions were refreshed (`ty` 0.0.74 → 0.0.80 and
+  three other dev-only pins, plus `astral-sh/setup-uv`). Nothing in the installed
+  package changes.
+
+### Fixed
+
+- **`magent sessions` and `magent status` now age agent states with the
+  staleness windows you configured.** `settings.attention.stalenessWorkingS` and
+  `stalenessNeedsInputS` were honoured by the attention daemon, `magent watch`
+  and `status --json`'s `agents` array — and silently ignored by the session
+  picker and by `status`'s psmux-session table. A single `magent status` run
+  could therefore age the two halves of its own report by different rules and
+  disagree with itself about the same session. There is now one translation of
+  `settings.attention` into those windows, and every surface reads it.
+
+- **`magent docs` describes the CLI that is installed.** Nine top-level commands
+  (`send`, `model`, `peek`, `doctor`, `watch`, `attention`, `mobile`, `termius`,
+  `hooks`) and `sessions --json` had no row at all in the generated reference,
+  and fifteen of the rows that did exist were wrong or stale — `down --all` never
+  mentioned that it also stops the Alt+V listener and the attention daemon, and
+  `down`'s row contradicted `down`'s own docstring. Five real
+  `settings.attention` fields (`pollIntervalS`, `stalenessWorkingS`,
+  `stalenessNeedsInputS`, `debounceS`, `stateTtlDays`) were undocumented while
+  `magent attention --help` pointed at one of them. The reference is now pinned
+  to the click registry and to the settings serializer in both directions, so a
+  command or setting can no longer appear, vanish or be renamed without the row
+  following it.
+
+- **The homepage and PyPI badges pointed at other people's projects.** The
+  `Homepage` link on the PyPI page — the highest-authority inbound link this
+  project has — sent every visitor to `magent.io`, a parked domain that is not
+  ours and advertises itself as for sale; it now points at `magent.now`. The
+  README's version and downloads badges read the PyPI project `magent`, an
+  unrelated multi-agent-RL library, so the top of the README advertised its
+  version and its download counts as ours. Both now read
+  `magent-multi-ai-agents-manager`.
 
 ## [3.18.1] - 2026-09-13
 
@@ -1268,6 +1326,13 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.19.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.18.1...v3.19.0
+[3.18.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.18.0...v3.18.1
+[3.18.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.17.0...v3.18.0
+[3.17.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.16.0...v3.17.0
+[3.16.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.15.1...v3.16.0
+[3.15.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.15.0...v3.15.1
+[3.15.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.14.0...v3.15.0
 [3.14.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.13.1...v3.14.0
 [3.13.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.13.0...v3.13.1
 [3.13.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.12.3...v3.13.0
