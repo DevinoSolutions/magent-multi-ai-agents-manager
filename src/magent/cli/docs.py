@@ -331,7 +331,8 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "its session state, flash the taskbar on needs-input/error, and (per "
             "`settings.attention`) toast or ntfy. Every poll also sweeps the psmux "
             "fleet back to above-normal priority, and revives `magent serve` when "
-            "`settings.uploadServer` is on."
+            "`settings.uploadServer` is on and `MAGENT_UPLOAD_SUPERVISOR` has not "
+            "turned the supervisor off."
         ),
     ),
     (
