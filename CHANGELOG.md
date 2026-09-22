@@ -5,6 +5,26 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`magent --go` now asks which projects to launch.** A fleet grows, and most
+  launches want four of its fourteen windows; until now `--go` meant all of
+  them. On a real terminal it shows a checklist first — projects grouped by
+  their `group` field, ungrouped ones last under `other`, and **everything
+  already checked**, so pressing Enter is byte-for-byte the old behaviour.
+  Up/Down (or `j`/`k`) move, Space toggles a row, `a`/`n` check or clear
+  everything, `g` toggles the whole section the cursor is in, digits 1-9 toggle
+  that numbered row, Enter launches the checked set, and `q`/Esc leaves with
+  `Nothing launched.` — as does Enter with nothing checked. The interactive
+  menu's launch row goes through the same prompt.
+
+  Off a terminal — a script, cron, CI, a pipe — there is no prompt and every
+  enabled project launches, unchanged. `--all` (`-a`) is the same escape hatch
+  on a terminal, `-g <group>` narrows the checklist to that group, and
+  `--retile-all` is never asked, since it launches nothing.
+
 ## [3.18.1] - 2026-09-13
 
 ### Fixed
