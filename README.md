@@ -257,7 +257,8 @@ Or skip the menu with flags:
 | Command | What it does |
 | --- | --- |
 | `magent` | Interactive menu. |
-| `magent --go` | Launch + tile new windows, no menu. |
+| `magent --go` | Launch + tile new windows, no menu. On a terminal it first asks **which** projects (see below). |
+| `magent --go --all` | Same, but launch every enabled project with no checklist (`-a` for short). |
 | `magent --retile-all` | Re-tile every magent window that is open right now — including `magent attach` windows, which belong to a remote host's sessions and are in no local project. Launches nothing; a closed window is skipped, not waited on. |
 | `magent -g <name>` | Launch only projects in a group. |
 | `magent --init` | Re-scan sessions and regenerate config. |
@@ -285,6 +286,30 @@ Or skip the menu with flags:
 | `magent terminal install` | Bind Ctrl+Backspace and Shift+Enter in Windows Terminal so they still work inside a psmux pane (`magent terminal status` to inspect) — see [Typing through psmux](#typing-through-psmux). |
 | `magent config <subcommand>` | Edit config from the CLI — 17 subcommands incl. `migrate`; see `magent config --help`. |
 | `magent config edit [host]` | Edit the config on **another** machine in your editor over SSH — fetch, edit, validate, push back. Omit the host to reuse your last `attach` target. The host side is `magent config cat` / `magent config put`, which you never run by hand. |
+
+### Choosing what to launch
+
+A fleet grows, and most launches want four of its fourteen windows. So `magent --go` (and the menu's **Launch & tile new windows**) asks first, on a real terminal, with **everything already checked** — pressing Enter is exactly the old "launch them all":
+
+```
+  Launch which projects?
+  ----------------------------------------
+
+  work
+  >  1  [x] api-gateway
+     2  [x] web-app
+     3  [ ] admin-console
+
+  other
+     4  [x] scratch
+
+  3 of 4 selected
+  space toggle   a all   n none   g section   up/down move   enter launch   q cancel
+```
+
+Up/Down (or `j`/`k`) move, **Space** toggles the row, **`a`**/**`n`** check or clear everything, **`g`** toggles the whole section the cursor is in, digits **1-9** toggle that numbered row, **Enter** launches the checked set, and **`q`**/Esc walks away with `Nothing launched.` (as does Enter with nothing checked). Projects are grouped by their `group` field; ungrouped ones sit last under `other`.
+
+Off a terminal — a script, cron, CI, anything piped — there is **no prompt at all** and every enabled project launches, exactly as before. `--all` (`-a`) is the same escape hatch when you *are* on a terminal. `-g <group>` narrows the checklist to that group, and `--retile-all` never asks, since it launches nothing.
 
 ### Driving a session from another shell
 

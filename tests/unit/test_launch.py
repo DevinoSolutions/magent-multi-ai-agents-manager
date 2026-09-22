@@ -893,6 +893,56 @@ class TestSelectProjects:
         assert "No projects in group" in err
         assert "a" in err
 
+    def test_only_narrows_to_the_checked_names(self):
+        cfg = MagentConfig(
+            projects=[
+                ProjectConfig(path="/alpha"),
+                ProjectConfig(path="/beta"),
+                ProjectConfig(path="/gamma", title="renamed"),
+            ]
+        )
+
+        result = _select_projects(cfg, RunOpts(only=frozenset({"beta", "renamed"})))
+
+        assert result is not None
+        # Matched by the name every other surface shows: the title when there is
+        # one, the path's leaf otherwise.
+        assert [p.path for p in result] == ["/beta", "/gamma"]
+
+    def test_only_applies_after_the_group_narrowing(self):
+        # A name checked in another group cannot widen `-g` back out.
+        cfg = MagentConfig(
+            projects=[
+                ProjectConfig(path="/alpha", group="a"),
+                ProjectConfig(path="/beta", group="b"),
+            ]
+        )
+
+        result = _select_projects(
+            cfg, RunOpts(group="a", only=frozenset({"alpha", "beta"}))
+        )
+
+        assert result is not None
+        assert [p.path for p in result] == ["/alpha"]
+
+    def test_only_none_is_every_enabled_project(self):
+        cfg = MagentConfig(
+            projects=[
+                ProjectConfig(path="/alpha"),
+                ProjectConfig(path="/beta", enabled=False),
+            ]
+        )
+
+        result = _select_projects(cfg, RunOpts(only=None))
+
+        assert result is not None
+        assert [p.path for p in result] == ["/alpha"]
+
+    def test_only_matching_nothing_returns_none(self):
+        cfg = MagentConfig(projects=[ProjectConfig(path="/alpha")])
+
+        assert _select_projects(cfg, RunOpts(only=frozenset({"nope"}))) is None
+
 
 class TestDispatchIdeProject:
     """Direct unit tests for the IDE-branch dispatch helper (R4, C7) split

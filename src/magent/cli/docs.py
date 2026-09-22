@@ -180,7 +180,22 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
 # until every registered command has a row here, in both directions.
 _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
     ("magent", "Interactive menu."),
-    ("magent --go", "Launch + tile, skip menu."),
+    (
+        "magent --go",
+        (
+            "Launch + tile, skip menu. On a terminal it first shows a project "
+            "checklist (everything checked, grouped by `group`) so you can "
+            "launch a subset; off a terminal there is no prompt and every "
+            "enabled project launches."
+        ),
+    ),
+    (
+        "magent --go --all",
+        (
+            "Launch + tile every enabled project with no checklist. `-a` is the "
+            "short form; it is what a script or CI already gets for free."
+        ),
+    ),
     ("magent --retile-all", "Re-tile every matching window."),
     ("magent -g <name>", "Launch only projects in a group."),
     (
