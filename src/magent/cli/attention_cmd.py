@@ -121,8 +121,8 @@ def staleness_from_config(cfg: MagentConfig) -> dict[str, float]:
     psmux-session table, and it used to import ``attention.STALENESS_S``
     directly — so a widened window was honored by the daemon, `watch` and
     `status --json`'s agents array while those two surfaces silently kept the
-    module defaults. Same shape as ``account_cmd.policy_for``: the cli module
-    owns the config translation and hands its consumers plain values."""
+    module defaults. The cli module owns the config translation and hands its
+    consumers plain values."""
     from magent import agent_state  # heavy subsystem: in-body per policy
 
     att = cfg.settings.attention

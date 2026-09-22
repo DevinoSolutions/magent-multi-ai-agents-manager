@@ -292,8 +292,8 @@ class TestStalenessFromConfig:
     per-session state reads in session_picker/status go through it, because a
     second copy is exactly the drift that left `magent sessions` (and `status`'s
     psmux-session table) reading the module defaults while the daemon honored
-    config. Same doctrine as account_cmd.policy_for: the cli module owns the
-    config translation, the consumer takes plain values."""
+    config. The cli module owns the config translation, the consumer takes
+    plain values."""
 
     def test_config_values_become_the_window_map(self, tmp_config):
         cfg = config.load_config(

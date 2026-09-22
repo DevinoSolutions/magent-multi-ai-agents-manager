@@ -8,8 +8,6 @@ from typing import TYPE_CHECKING, Literal
 from magent.psmux import PsmuxWindowOpts, find_psmux
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
     from magent.grid import MonitorRect, Rect
 
 __all__ = ["PsmuxWindowOpts", "find_psmux"]
@@ -17,17 +15,6 @@ __all__ = ["PsmuxWindowOpts", "find_psmux"]
 
 @dataclass
 class TerminalLaunchOpts:
-    """One terminal window to open for a project.
-
-    ``env``/``drop_env`` are the same per-window overlay ``PsmuxWindowOpts``
-    carries, for the launch path that opens a real terminal instead of a psmux
-    pane (psmux off, or a platform that has no psmux). The window hosts the
-    project's agent either way, so the account it runs as has to reach it the
-    same way -- and a field that existed on only one of the two dispatch paths
-    would make "is this project routed?" depend on a setting nobody relates to
-    accounts.
-    """
-
     title: str
     cwd: str
     command: str
@@ -35,8 +22,6 @@ class TerminalLaunchOpts:
     ssh_host: str | None = None
     ssh_remote_dir: str | None = None
     ssh_shell: str = "bash -lc"
-    env: Mapping[str, str] | None = None
-    drop_env: frozenset[str] = frozenset()
 
 
 @dataclass

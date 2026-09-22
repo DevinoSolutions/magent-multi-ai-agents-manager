@@ -28,7 +28,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
-    from magent import accounts as accounts_mod
     from magent.config import MagentConfig
 
 OK = "ok"
@@ -353,167 +352,6 @@ def _check_wt_keys() -> CheckResult:
     )
 
 
-def _unusable_accounts(snapshot: accounts_mod.AccountsSnapshot) -> list[str]:
-    """``"14: needs a fresh login"`` per account that cannot host work.
-
-    Reported on the OK path as well as the WARN one, because this is the
-    early-warning surface for the hazard the feature lives with: ccswap's
-    store-to-profile write-back is skipped while a live session pid exists, and a
-    resident routed fleet IS a permanently live pid on every account it uses --
-    so a slot on its way to `invalid_grant` shows up here, with ccswap's own
-    reason, before it costs a re-login. A reason ccswap gave is never re-derived.
-    """
-    from magent.accounts import SUBSCRIPTION_KIND
-
-    out: list[str] = []
-    for acct in snapshot.accounts:
-        if acct.kind and acct.kind != SUBSCRIPTION_KIND:
-            continue  # an api-key slot is not a routing target and never was
-        if not acct.eligible:
-            out.append(f"{acct.id}: {acct.ineligible_text or 'ineligible in ccswap'}")
-        elif not acct.hydrated:
-            out.append(f"{acct.id}: its profile holds no usable login")
-    return out
-
-
-# The ccswap settings magent must be able to VERIFY before it routes, with the
-# value each one needs. `accounts.REQUIRED_SETTINGS` is the authority on what is
-# actually read; this names them again for one purpose only -- to notice a key
-# that was never ASKED about, because a key added to the contract after this
-# magent shipped is simply absent from the report, and absence there reads as
-# "verified" when it means "not verified". Delete an entry here only when it
-# leaves the contract, and if a name ever disagrees with `accounts`' spelling
-# the check says so out loud rather than going quiet.
-_WANTED_CCSWAP_SETTINGS: tuple[tuple[str, str], ...] = (
-    ("profiles.persistent", "true"),
-    ("autoswitch.enabled", "false"),
-    ("autoswitch.warmupFiveHour", "false"),
-)
-
-
-def _unverified_settings(report: accounts_mod.SettingsReport) -> str:
-    """The required ccswap settings this build never asked about, or ``""``.
-
-    Distinct from a setting that read the wrong value (that is a `problem`) and
-    from one that could not be read (that is the report's `error`): this is the
-    third state, where nobody looked. It is named rather than assumed, because
-    an unverified `autoswitch.warmupFiveHour` spends the very headroom the
-    planner just budgeted, silently.
-    """
-    missing = [
-        f"{key} (magent needs {wanted})"
-        for key, wanted in _WANTED_CCSWAP_SETTINGS
-        if key not in report.values
-    ]
-    if not missing:
-        return ""
-    return (
-        f"not verified by this build: {', '.join(missing)} -- upgrade magent, or "
-        "check by hand with `ccswap config get <key>`"
-    )
-
-
-def _duplicate_login_warning(warnings: tuple[str, ...]) -> str:
-    """The duplicate-slot refusal, worded as the hazard it actually is.
-
-    ccswap reports this when the SAME LOGIN is present in more than one slot,
-    which makes it ambiguous whose quota a utilization reading describes -- so
-    magent refuses to place work by numbers that may belong to another account.
-    It is emphatically NOT about two different logins sharing an organization:
-    that is a perfectly ordinary setup, and ccswap deliberately does not report
-    it. Wording that blurred the two would send people hunting a non-problem.
-    """
-    return (
-        "ccswap reports the same login in more than one slot, so a utilization "
-        "reading may be attributed to the wrong account -- magent will not route "
-        "on it: " + "; ".join(warnings)
-    )
-
-
-def _check_account_routing(cfg: MagentConfig | None) -> CheckResult:
-    """Can per-project account routing work -- and is any slot drifting?
-
-    WARN-at-worst, deliberately, on the `wt-keys` precedent: every condition
-    here degrades to "the fleet launches unrouted", which is today's behaviour,
-    so none of it may move doctor's exit code (which CI and `magent status`
-    read). It also never MUTATES: every ccswap command it runs is a read, and
-    the whole check is skipped while routing is off -- which is the default, so
-    on an ordinary machine this costs no subprocess at all.
-    """
-    from magent import accounts  # heavy subsystem: in-body per policy
-    from magent.cli.account_cmd import policy_for, routing_off_reason
-
-    if cfg is None:
-        return (OK, "skipped -- the config did not load (see the config check)")
-    if not policy_for(cfg).enabled:
-        # Both gates are read through one reader, so this can never report
-        # "off in the config" at a machine whose env var is what turned it off.
-        return (OK, routing_off_reason())
-
-    binary = accounts.find_ccswap()
-    if not binary:
-        return (
-            WARN,
-            (
-                "routing is on but ccswap is not on PATH, so every project "
-                "launches unrouted -- install ccswap or turn routing off"
-            ),
-        )
-    version = accounts.read_version(ccswap=binary)
-    if not accounts.version_at_least(version):
-        return (
-            WARN,
-            (
-                f"ccswap {version or 'version unreadable'} is older than "
-                f"{accounts.MIN_CCSWAP_VERSION}, the build with a read-only "
-                "`list --profiles`; magent will not route until it is upgraded"
-            ),
-        )
-    settings = accounts.read_settings(ccswap=binary)
-    # Carried by every verdict from here on, including the OK one: a setting
-    # nobody read is a gap in what this check PROVED, and hiding it behind a
-    # louder finding is how it would stay unnoticed.
-    unverified = _unverified_settings(settings)
-    notes = f"\n{unverified}" if unverified else ""
-    if settings.problems:
-        return (WARN, "; ".join(settings.problems) + notes)
-    if settings.error:
-        return (WARN, f"{settings.error} -- magent will not read that as a yes{notes}")
-
-    snapshot = accounts.read_accounts(ccswap=binary)
-    if snapshot.error:
-        return (WARN, snapshot.error + notes)
-    if snapshot.duplicate_warnings:
-        return (WARN, _duplicate_login_warning(snapshot.duplicate_warnings) + notes)
-    usable = [
-        a
-        for a in snapshot.accounts
-        if a.eligible and a.hydrated and a.kind == accounts.SUBSCRIPTION_KIND
-    ]
-    age = (
-        ""
-        if snapshot.usage_age_s is None
-        else f", usage data {snapshot.usage_age_s / 60:.0f}m old"
-    )
-    unusable = _unusable_accounts(snapshot)
-    tail = ("\n" + "; ".join(unusable)) if unusable else ""
-    if not usable:
-        return (
-            WARN,
-            (
-                f"{len(snapshot.accounts)} ccswap account(s), none of them both "
-                f"eligible and hydrated -- nothing to route to{age}{tail}{notes}"
-            ),
-        )
-    return (
-        OK,
-        (
-            f"{len(usable)}/{len(snapshot.accounts)} ccswap account(s) can host "
-            f"work{age}{tail}{notes}"
-        ),
-    )
-
-
 def _writable(d: Path) -> bool:
     try:
         d.mkdir(parents=True, exist_ok=True)
@@ -610,7 +448,6 @@ def _run_checks(config_file: Path) -> list[dict[str, str]]:
         ("monitors", _check_monitors),
         ("hotkey", lambda: _check_hotkey(cfg)),
         ("wt-keys", _check_wt_keys),
-        ("account-routing", lambda: _check_account_routing(cfg)),
         ("logs dir", _check_logs_dir),
         ("state dir", _check_state_dir),
         ("sentry", _check_sentry),
