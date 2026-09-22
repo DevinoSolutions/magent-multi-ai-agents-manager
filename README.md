@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="https://magent.io"><strong>magent.io</strong></a>
+  <a href="https://magent.now"><strong>magent.now</strong></a>
 </p>
 
 <!--
@@ -20,8 +20,8 @@
 
 
 <p align="center">
-  <a href="https://pypi.org/project/magent-multi-ai-agents-manager"><img src="https://img.shields.io/pypi/v/magent?color=3776AB&label=pypi" alt="PyPI version" /></a>
-  <a href="https://pypi.org/project/magent-multi-ai-agents-manager"><img src="https://img.shields.io/pypi/dm/magent?color=blue" alt="PyPI downloads" /></a>
+  <a href="https://pypi.org/project/magent-multi-ai-agents-manager"><img src="https://img.shields.io/pypi/v/magent-multi-ai-agents-manager?color=3776AB&label=pypi" alt="PyPI version" /></a>
+  <a href="https://pypi.org/project/magent-multi-ai-agents-manager"><img src="https://img.shields.io/pypi/dm/magent-multi-ai-agents-manager?color=blue" alt="PyPI downloads" /></a>
   <a href="https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License: AGPL-3.0" /></a>
   <a href="https://www.python.org"><img src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10+" /></a>
   <img src="https://img.shields.io/badge/dependencies-click-success" alt="Minimal Dependencies" />
@@ -358,6 +358,22 @@ Two ideas are worth knowing, because everything else follows from them:
   launches the fleet unrouted, exactly as it does today. `magent account`/`plan`
   show each refusal with the exact `ccswap config set ...` that clears it; magent
   never flips one for you.
+
+A project's work also has a **class**, and that is what decides which usage cap
+it is budgeted against. `modelClass` on a project is how you say it outright:
+
+```jsonc
+{ "path": "web", "modelClass": "fable" }
+```
+
+`fable` means this project's work counts against a model-scoped weekly window of
+its own *as well as* the account's 5-hour and 7-day ones; `standard` means only
+those two — which is exactly what lets an account with its Fable cap spent keep
+hosting Opus/Sonnet work instead of sitting idle. Leave the key out and magent
+infers the class: what it last observed running in that pane, otherwise
+`standard`. It guesses that way on purpose — guessing standard only spends 7-day
+headroom that was going to waste, while guessing fable can block an agent
+outright. A value that is neither is ignored with a warning, never an error.
 
 Three ccswap settings have to be right before anything routes:
 `profiles.persistent true`, `autoswitch.enabled false` and

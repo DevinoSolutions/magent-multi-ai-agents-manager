@@ -191,7 +191,9 @@ def _agents_attention_rollup(cfg: MagentConfig) -> None:
 
 
 def _psmux_sessions(
-    up: list[dict[str, object]], projects: list[dict[str, object]]
+    up: list[dict[str, object]],
+    projects: list[dict[str, object]],
+    staleness: dict[str, float],
 ) -> list[dict[str, object]]:
     """One row per LIVE psmux session: ``{name, app, idle, state}``.
 
@@ -202,8 +204,11 @@ def _psmux_sessions(
     live session, and those go out as a single unbounded fan-out
     (``psmux.pane_current_commands``), so 40 sessions stay ~one psmux
     round-trip. Agent states come from the same store the picker reads, so the
-    two surfaces can never disagree. Pure data: the shell decides how to print
-    it and what to exit with.
+    two surfaces can never disagree -- which is why ``staleness`` is a required
+    argument and not a default: the same config windows the `agents` array ages
+    with (``_agents_snapshot`` -> ``engine_from_config``) must age this column,
+    or the two halves of one report contradict each other about one record.
+    Pure data: the shell decides how to print it and what to exit with.
     """
     from magent import psmux as psmux_mod  # heavy subsystem: in-body per policy
     from magent.cli.session_picker import _session_cwds, _session_states
@@ -214,7 +219,7 @@ def _psmux_sessions(
     binary = psmux_mod.find_psmux() or ""
     apps = psmux_mod.pane_current_commands(sids, psmux=binary or None)
     resolved = {psmux_mod.socket_id(p): _as_str(p.get("resolved")) for p in projects}
-    states = _session_states(_session_cwds(binary, sids, resolved))
+    states = _session_states(_session_cwds(binary, sids, resolved), staleness)
     rows: list[dict[str, object]] = []
     for sid in sids:
         app = apps.get(sid, "")
@@ -285,11 +290,15 @@ def _render_status(config_file: Path) -> StatusReport:
     """Prints the status report; reports whether any daemon is degraded
     (dead/stale) plus the live psmux sessions it listed, in display order.
     Never exits -- shared with the menu's _menu_status."""
+    from magent.cli.attention_cmd import staleness_from_config
     from magent.launch import psmux_status  # heavy subsystem: in-body per policy
 
     cfg = _load_config_or_exit(config_file)
     up, down, projects = psmux_status(cfg)
-    rows = {_as_str(r.get("name")): r for r in _psmux_sessions(up, projects)}
+    rows = {
+        _as_str(r.get("name")): r
+        for r in _psmux_sessions(up, projects, staleness_from_config(cfg))
+    }
     listed: list[dict[str, object]] = []
 
     _banner()
@@ -424,6 +433,7 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
         sys.exit(1)
 
     if as_json:
+        from magent.cli.attention_cmd import staleness_from_config
         from magent.launch import (
             psmux_status,  # heavy subsystem: in-body per policy
         )
@@ -438,7 +448,9 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
         # change to its shape or to the 0/1/3 exit contract -- a dead psmux
         # session is a "not running" row, not a degraded daemon.
         up, _down, projects = psmux_status(cfg)
-        payload["psmux_sessions"] = _psmux_sessions(up, projects)
+        payload["psmux_sessions"] = _psmux_sessions(
+            up, projects, staleness_from_config(cfg)
+        )
         # Additive too, and for the same reason the human line is on stderr and
         # not in the verdict: a count of psmux servers stranded in logon
         # Session 0 is a fact about the machine, not about magent's daemons, so

@@ -111,6 +111,27 @@ def name_pairs_from_config(cfg: MagentConfig) -> list[tuple[str, str]]:
     return pairs
 
 
+def staleness_from_config(cfg: MagentConfig) -> dict[str, float]:
+    """``settings.attention``'s staleness keys as the ``{state: seconds}`` window
+    map every state-aging surface takes.
+
+    The ONE translation, and deliberately not inlined into the engine builder
+    below: the engine is not the only reader. ``session_picker._session_states``
+    ages the per-session rows behind `magent sessions` AND `status`'s
+    psmux-session table, and it used to import ``attention.STALENESS_S``
+    directly — so a widened window was honored by the daemon, `watch` and
+    `status --json`'s agents array while those two surfaces silently kept the
+    module defaults. Same shape as ``account_cmd.policy_for``: the cli module
+    owns the config translation and hands its consumers plain values."""
+    from magent import agent_state  # heavy subsystem: in-body per policy
+
+    att = cfg.settings.attention
+    return {
+        agent_state.WORKING: att.staleness_working_s,
+        agent_state.NEEDS_INPUT: att.staleness_needs_input_s,
+    }
+
+
 def engine_from_config(cfg: MagentConfig) -> attention.AttentionEngine:
     """Build an AttentionEngine whose staleness/debounce come from
     ``settings.attention`` — so `status`/`watch` age states with the SAME
@@ -118,17 +139,12 @@ def engine_from_config(cfg: MagentConfig) -> attention.AttentionEngine:
     is derived from the enabled projects. Daemon-only concerns (renderers, ntfy
     topic) stay at the daemon call site; this helper covers the config-derived
     kwargs common to all three surfaces."""
-    from magent import agent_state, attention  # heavy subsystem: in-body per policy
+    from magent import attention  # heavy subsystem: in-body per policy
 
-    att = cfg.settings.attention
-    staleness = {
-        agent_state.WORKING: att.staleness_working_s,
-        agent_state.NEEDS_INPUT: att.staleness_needs_input_s,
-    }
     return attention.AttentionEngine(
         attention.name_map_from_projects(name_pairs_from_config(cfg)),
-        staleness=staleness,
-        debounce_s=att.debounce_s,
+        staleness=staleness_from_config(cfg),
+        debounce_s=cfg.settings.attention.debounce_s,
     )
 
 

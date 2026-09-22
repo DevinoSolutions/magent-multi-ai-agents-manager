@@ -80,20 +80,32 @@ def _status_label(state: str | None, age_s: float | None = None) -> str:
     }.get(state, "")
 
 
-def _session_states(cwds: dict[str, str]) -> dict[str, tuple[str | None, float | None]]:
+def _session_states(
+    cwds: dict[str, str], staleness: dict[str, float] | None = None
+) -> dict[str, tuple[str | None, float | None]]:
     """Map each session to its ``(state, age_s)`` from the agent-state store,
     which agents populate via their own lifecycle events (Claude Code hooks,
     Codex notify, ...) -- ground truth, not terminal scraping. A staleness guard
     keeps a session killed mid-turn from showing 'working...' forever.
+
+    ``staleness`` is the ``{state: seconds}`` window map, built once by the
+    caller from config (``attention_cmd.staleness_from_config``) -- passed in
+    rather than read here because this function had the module default
+    hardcoded, which made `magent sessions` and `status`'s psmux-session table
+    the only surfaces that ignored ``settings.attention.stalenessWorkingS``.
+    ``None`` keeps ``attention.STALENESS_S`` reachable as the documented
+    no-config fallback: a caller without a config degrades to the shipped
+    windows, never to a crash or a blank state column.
 
     Split out of ``_session_statuses`` so ``magent status`` can report the same
     ground truth as *data* (its ``--json`` session rows) instead of re-deriving
     it from a styled label."""
     from magent import agent_state  # heavy subsystem: in-body per policy
     from magent.attention import (
-        STALENESS_S as stale,  # heavy subsystem: in-body per policy
+        STALENESS_S,  # heavy subsystem: in-body per policy
     )
 
+    stale = STALENESS_S if staleness is None else staleness
     out: dict[str, tuple[str | None, float | None]] = {}
     for sock, cwd in cwds.items():
         rec = agent_state.state_for(cwd) if cwd else None
@@ -112,11 +124,13 @@ def _session_states(cwds: dict[str, str]) -> dict[str, tuple[str | None, float |
     return out
 
 
-def _session_statuses(cwds: dict[str, str]) -> dict[str, str]:
+def _session_statuses(
+    cwds: dict[str, str], staleness: dict[str, float] | None = None
+) -> dict[str, str]:
     """The picker's display face of ``_session_states``: one styled label each."""
     return {
         sock: _status_label(state, age_s)
-        for sock, (state, age_s) in _session_states(cwds).items()
+        for sock, (state, age_s) in _session_states(cwds, staleness).items()
     }
 
 
@@ -260,6 +274,10 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
 
     from magent import psmux as psmux_mod  # heavy subsystem: in-body per policy
 
+    # sibling module: the one config -> staleness-window translation, shared with
+    # the attention daemon / watch / status so no surface ages states differently.
+    from magent.cli.attention_cmd import staleness_from_config
+
     psmux_bin = psmux_mod.find_psmux()
     if not psmux_bin:
         click.echo(
@@ -272,6 +290,9 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
     # resolved path rides along: it is the cwd magent created the session with,
     # which is what the agent-state lookup keys on.
     cfg = _load_config_or_exit(config_file)
+    # Read once here rather than per paint: the windows cannot change under a
+    # running picker, and every redraw must age states the same way.
+    staleness = staleness_from_config(cfg)
     candidates: list[str] = []
     resolved: dict[str, str] = {}
     for proj in psmux_mod.eligible_projects(cfg):
@@ -316,7 +337,9 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
             _attach(focus)
             continue
 
-        statuses = _session_statuses(_session_cwds(psmux_bin, sessions, resolved))
+        statuses = _session_statuses(
+            _session_cwds(psmux_bin, sessions, resolved), staleness
+        )
         choice = _read_choice(_session_rows(sessions, statuses), upload_url)
         if choice is None or choice == "q":
             return
