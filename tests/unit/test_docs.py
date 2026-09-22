@@ -31,7 +31,8 @@ import click
 import pytest
 
 from magent import cli
-from magent.cli.docs import _generate_docs
+from magent.cli.docs import _SETTINGS_FIELD_DOCS, _generate_docs
+from magent.config import Settings, settings_to_dict
 
 # A token that could be a command name: lowercase word, possibly hyphenated.
 # Everything else in a row -- `--json`, `<host>`, `[host]`, `9090` -- is an
@@ -144,6 +145,74 @@ class TestEveryRowNamesARealCommand:
             + ", ".join(f"`{c}`" for c in stale)
             + " -- a reader (or an agent) will try to run these."
         )
+
+
+# Settings keys that are user-keyed MAPS: their members are named by the user
+# (a tool name, a ccswap account id), so each is documented as one row whose
+# prose carries the inner shape, and recursing would demand a row per member.
+# A new open map belongs here deliberately -- until it is added the pin fails
+# naming its members, which is the loud version of the same decision.
+_OPEN_MAPS = frozenset({"tools", "accounts.perAccount"})
+
+
+def _emitted_settings_keys() -> list[str]:
+    """Every settings field the factory emits, as dotted names.
+
+    `settings_to_dict` is the one serializer every config generator delegates
+    to, so it is the honest answer to "what settings exist" -- flatter than
+    walking the dataclasses and already in the config file's own spelling
+    (`stalenessWorkingS`, not `staleness_working_s`).
+    """
+    names: list[str] = []
+
+    def walk(prefix: str, block: dict[str, object]) -> None:
+        for key, value in block.items():
+            dotted = f"{prefix}{key}"
+            # An EMPTY dict counts as a leaf too, so a block that happens to be
+            # empty under the defaults can never silently vanish from the
+            # expected set -- it must be documented or fail.
+            if dotted in _OPEN_MAPS or not isinstance(value, dict) or not value:
+                names.append(dotted)
+                continue
+            walk(f"{dotted}.", value)
+
+    walk("", settings_to_dict(Settings()))
+    return names
+
+
+class TestEverySettingsFieldHasARow:
+    """Same rot, the other table. `_SETTINGS_FIELD_DOCS` was hand-written
+    against the dataclasses and five real `attention.*` timing fields never got
+    a row -- `magent attention --help` even advertised "default:
+    attention.pollIntervalS from config" for a field the reference did not
+    name."""
+
+    def test_every_emitted_settings_field_is_documented(self):
+        documented = {name for name, *_ in _SETTINGS_FIELD_DOCS}
+        missing = [k for k in _emitted_settings_keys() if k not in documented]
+        assert not missing, (
+            "`magent docs` does not document these settings fields: "
+            + ", ".join(missing)
+            + " -- add a row to _SETTINGS_FIELD_DOCS in src/magent/cli/docs.py, "
+            "saying what changing the field COSTS rather than restating its "
+            "default."
+        )
+
+    def test_no_row_documents_a_field_the_factory_does_not_emit(self):
+        emitted = set(_emitted_settings_keys())
+        stale = [name for name, *_ in _SETTINGS_FIELD_DOCS if name not in emitted]
+        assert not stale, (
+            "`magent docs` documents settings fields the factory does not emit: "
+            + ", ".join(stale)
+            + " -- a reader will set these and nothing will happen."
+        )
+
+    def test_the_settings_table_reaches_the_output(self):
+        # Ties the two assertions above to what a user actually reads: a row in
+        # the list that never rendered would satisfy them both.
+        doc = _generate_docs()
+        for name, *_ in _SETTINGS_FIELD_DOCS:
+            assert f"| `{name}` |" in doc
 
 
 class TestTheMachineReadableFlagsKeepTheirRows:

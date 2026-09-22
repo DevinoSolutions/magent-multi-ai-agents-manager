@@ -144,6 +144,53 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
         ),
     ),
     (
+        "attention.pollIntervalS",
+        "number",
+        "`2`",
+        (
+            "Seconds between daemon polls. Every tick also sweeps the psmux "
+            "fleet's process priority and, when `uploadServer` is on, probes the "
+            "upload server -- so a shorter interval multiplies real work, not "
+            "just repaints. `magent attention --interval` overrides it for one run."
+        ),
+    ),
+    (
+        "attention.stalenessWorkingS",
+        "number",
+        "`1800`",
+        (
+            "Seconds after which a `working` record stops counting as working. "
+            "This is what keeps a session killed mid-turn from showing "
+            "'still going...' forever. Read by the attention daemon, `watch` "
+            "and `status`."
+        ),
+    ),
+    (
+        "attention.stalenessNeedsInputS",
+        "number",
+        "`3600`",
+        "The same window for `needs-input`.",
+    ),
+    (
+        "attention.debounceS",
+        "number",
+        "`300`",
+        (
+            "Minimum seconds between pushes for the same session in the same "
+            "state. Gates `toast`/`ntfy` only -- title badges and the taskbar "
+            "flash are never debounced."
+        ),
+    ),
+    (
+        "attention.stateTtlDays",
+        "int",
+        "`14`",
+        (
+            "Days a session's state record survives in `~/.magent/state/` before "
+            "the sweep deletes it."
+        ),
+    ),
+    (
         "accounts.enabled",
         "boolean",
         "`false`",
@@ -203,19 +250,41 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
     ("magent --go", "Launch + tile, skip menu."),
     ("magent --retile-all", "Re-tile every matching window."),
     ("magent -g <name>", "Launch only projects in a group."),
-    ("magent --init", "Re-scan sessions and regenerate config."),
+    (
+        "magent --init",
+        (
+            "Re-scan sessions and regenerate config. Refuses with exit 1 if a "
+            "config already exists; `--force` overwrites it."
+        ),
+    ),
     ("magent --init --base-dir <dir>", "Generate config from a folder of repos."),
     ("magent --edit", "Open config in your default editor."),
     ("magent docs", "Print this reference (pipe to file for AI context)."),
-    ("magent up", "(Host side) ensure a persistent psmux session per project."),
+    (
+        "magent up",
+        (
+            "(Host side) ensure a persistent psmux session per project, and start "
+            "the upload server when `settings.uploadServer` is on. On Windows an "
+            "SSH login lands in logon Session 0, which has no desktop -- there this "
+            "re-runs itself on yours instead, per `MAGENT_SESSION0_POLICY`."
+        ),
+    ),
     (
         "magent up --json",
-        "Print session status (up/down/projects) as JSON, change nothing.",
+        (
+            "Print session status (up/down/projects) as JSON. Creates nothing -- "
+            "this is the read `magent attach` polls over SSH -- though it does "
+            "refresh each live session's psmux status line."
+        ),
     ),
     ("magent up -g <group>", "Bring up sessions for only one project group."),
     (
         "magent attach [host]",
-        "From another PC: bring host sessions up over SSH, tile locally, Alt+V hotkey.",
+        (
+            "From another PC: bring host sessions up over SSH, tile locally, Alt+V "
+            "hotkey. Each pane is supervised and reattaches itself once the host is "
+            "reachable again; `--no-reconnect` restores a plain one-shot ssh pane."
+        ),
     ),
     (
         "magent attach <host> -g <group>",
@@ -228,21 +297,29 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
     ("magent --attach-to <host>", "(deprecated alias for `magent attach <host>`)."),
     (
         "magent status",
-        "Show which psmux sessions and the upload server are running.",
+        (
+            "Show which psmux sessions, the upload server, the Alt+V listener and "
+            "the attention daemon are running, plus a count of agents waiting on "
+            "you. Exit 0 healthy, 1 no readable config, 3 degraded (a dead upload "
+            "server, or a stale/crashed listener or daemon)."
+        ),
     ),
     (
         "magent doctor",
         (
             "Check the environment one line at a time -- config, env vars, tools, "
-            "monitors, Alt+V, psmux -- each with a repair hint. Exits 1 only if a "
-            "check FAILED; warnings still pass. `--json` for the same as data."
+            "monitors, Alt+V, psmux -- with an actionable hint on anything that "
+            "warns or fails. Exits 1 only if a check FAILED; warnings still pass. "
+            "`--json` for the same as data, including monitor topology."
         ),
     ),
     (
         "magent watch",
         (
-            "Live table of every agent session, whoever needs you first. Press a "
-            "row's digit to focus that window; `q` quits."
+            "Live table of every session in the agent-state store, whoever needs you "
+            "first -- so a fleet with no lifecycle hooks wired shows nothing (see "
+            "`magent hooks install`). Keys 1-9 focus that window, `q` quits; on "
+            "POSIX the key needs Enter after it."
         ),
     ),
     (
@@ -250,8 +327,9 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
         (
             "Ambient signals for the whole fleet: badge each `magent:` title with "
             "its session state, flash the taskbar on needs-input/error, and (per "
-            "`settings.attention`) toast or ntfy. Also keeps `magent serve` alive "
-            "and the psmux fleet at above-normal priority."
+            "`settings.attention`) toast or ntfy. Every poll also sweeps the psmux "
+            "fleet back to above-normal priority, and revives `magent serve` when "
+            "`settings.uploadServer` is on."
         ),
     ),
     (
@@ -277,13 +355,22 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
     (
         "magent down",
         (
-            "Shut down all running psmux sessions (falls back to the host you last "
-            "attached to when none are local)."
+            "Shut down every psmux session this config lists in scope -- "
+            "deliberately not just the ones a liveness probe happens to see -- then "
+            "re-probe and report only what it PROVED stopped, naming any survivor. "
+            "Falls back to the host you last attached to when none are local."
         ),
     ),
     ("magent down -g <group>", "Shut down only one group's sessions."),
     ("magent down <name> [<name>...]", "Shut down specific sessions by name."),
-    ("magent down --all", "Stop every session and the upload server."),
+    (
+        "magent down --all",
+        (
+            "Stop every session, the upload server, the Alt+V listener and the "
+            "attention daemon. The broadest shutdown there is -- a plain `down` "
+            "leaves all three of those daemons running."
+        ),
+    ),
     (
         "magent down --host <user@host>",
         (
@@ -291,10 +378,25 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "attach windows first."
         ),
     ),
-    ("magent serve", "Start upload server for mobile image transfer."),
+    (
+        "magent serve",
+        (
+            "Start the upload server for mobile image transfer. Binds loopback plus "
+            "this machine's Tailscale IP, and never the LAN wildcard: there is no "
+            "auth token, so that bind IS the access control. Phone upload stays "
+            "dark until Tailscale is up."
+        ),
+    ),
     (
         "magent serve -p 9090",
         "Use a custom port (default: this config's `uploadPort`, else 8033).",
+    ),
+    (
+        "magent serve --host 0.0.0.0",
+        (
+            "Deliberately bind LAN-wide instead. The escape hatch, not a default -- "
+            "see the bind note above before using it."
+        ),
     ),
     (
         "magent mobile",
@@ -335,10 +437,12 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
         (
             "Paste a prompt into one running agent and press Enter, then confirm it "
             "left the input line. SESSION matches case-insensitively (exact, then a "
-            "unique prefix/substring). `--file` reads the text from a file, "
-            "`--wait-idle` holds until the agent is between turns, `--compact` runs "
-            "`/compact` first. Exit 2 no such live session, 3 psmux error, 4 send "
-            "unconfirmed."
+            "unique prefix/substring). Newlines are collapsed to spaces -- `--file` "
+            "bodies included -- because a lone Enter would submit the prompt early, "
+            "one line at a time. `--wait-idle` holds until the agent is between "
+            "turns and `--compact` runs `/compact` first, both bounded by "
+            "`--timeout` (180s). Exit 2 no such live session, 3 psmux error, 4 the "
+            "send went unconfirmed or the session never went idle."
         ),
     ),
     (
@@ -346,8 +450,9 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
         (
             "Switch a session's model, only while it is idle -- never mid-turn -- "
             "then re-read the pane footer to verify the switch took. `--effort` "
-            "sets reasoning effort too; `--all` does every live session, retrying "
-            "busy ones until `--max-minutes` runs out."
+            "sets reasoning effort too; `--all` does every live session. A busy "
+            "session is retried until `--max-minutes` runs out, and abandoned after "
+            "3 failed attempts. Exit 4 if any session's switch went unconfirmed."
         ),
     ),
     (
@@ -371,7 +476,13 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
     ),
     (
         "magent account pin <project> <account>",
-        "Always run that project on that account (written to this config).",
+        (
+            "Record in this config that PROJECT belongs on that account; the pin "
+            "wins over every usage threshold. It applies at that project's next "
+            "launch and never moves a running session, and it only routes anything "
+            "while routing is enabled (`settings.accounts.enabled`, off by "
+            "default) -- the pin is written either way, so you can set it up first."
+        ),
     ),
     ("magent account unpin <project>", "Remove the pin."),
     ("magent account refresh", "Ask ccswap for fresher usage numbers."),
