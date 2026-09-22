@@ -15,6 +15,7 @@ from __future__ import annotations
 import colorsys
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -24,7 +25,7 @@ import click
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 DEFAULT_TOOLS: dict[str, str] = {
     "claude": "claude --continue",
@@ -32,6 +33,33 @@ DEFAULT_TOOLS: dict[str, str] = {
     "cursor-agent": "cursor-agent",
     "agy": "agy",
 }
+
+# --- account-routing vocabularies -------------------------------------------
+# Restated here rather than imported from ``routing.py``, deliberately.
+# ``config.py`` is a leaf that EVERY command pays for at import time, and
+# ``routing`` pulls the ccswap seam (``accounts.py``) in behind it -- so a
+# `from magent.routing import CLASSES` would put a subprocess module on the
+# `magent --help` path to spell two words. The restatement cannot drift:
+# ``tests/unit/test_routing.py`` pins each of these equal to the planner's own.
+
+# The two model classes a project can be pinned to. ``fable`` names work that
+# consumes a model-scoped weekly cap of its own; ``standard`` is everything
+# else. Absent means "infer it" -- never "standard", which is the planner's
+# fallback and not a thing the user said.
+MODEL_CLASSES = ("fable", "standard")
+
+# ``settings.accounts.onLimit`` -- what to do about a session on an account
+# that has hit its limit. Closed vocabulary with one parameterised member.
+DEFAULT_ON_LIMIT = "move-if-reset>2h"
+
+# What an UNRECOGNISED onLimit degrades to. `wait` is the do-nothing answer on
+# purpose: a misspelled policy must never be read as permission to recreate a
+# live session. (The general accessor doctrine below is "degrade to the
+# default"; this one field degrades to the *safest* value instead, because its
+# default is not the inert one.)
+ON_LIMIT_FALLBACK = "wait"
+
+_ON_LIMIT_RE = re.compile(r"^(?:wait|move|move-if-reset>\d+(?:\.\d+)?h)$")
 
 
 class ConfigError(ValueError):
@@ -80,6 +108,50 @@ class AttentionSettings:
 
 
 @dataclass
+class AccountOverride:
+    """One entry of ``settings.accounts.perAccount`` — what the user says about
+    ONE ccswap account, keyed by that account's id.
+
+    ``klass`` reserves an account for a single model class (it then takes only
+    that class's work); ``exclude`` takes it out of routing entirely without
+    removing it from ccswap; ``on_limit`` overrides the global policy for it.
+    Empty/absent values all mean "inherit", which is why ``on_limit`` is a
+    plain ``str`` defaulting to ``""`` rather than an Optional — there is no
+    third state to model.
+    """
+
+    klass: str | None = None
+    on_limit: str = ""
+    exclude: bool = False
+
+
+@dataclass
+class AccountSettings:
+    """Per-project Claude account routing (schema v4).
+
+    **This block ships dark.** ``enabled`` defaults to false and with it off
+    every byte of magent's behaviour is what it was before the block existed —
+    no ccswap is run, no ``CLAUDE_CONFIG_DIR`` is set, no session is placed.
+    That is not timidity: routing is the one feature that shells out to a tool
+    holding the user's real account credentials, so opting in has to be an act.
+
+    Thresholds are PERCENT (0-100) of an account's binding usage window, not
+    the 0-1 fractions ccswap reports — the config spells the number a human
+    would say, and the one conversion happens in the planner.
+    ``soft_threshold`` stops NEW work being placed on an account;
+    ``hard_threshold`` also excludes it from assignment and marks it movable.
+    """
+
+    enabled: bool = False
+    soft_threshold: float = 85.0
+    hard_threshold: float = 95.0
+    on_limit: str = DEFAULT_ON_LIMIT
+    stale_after_s: float = 900.0
+    status_left: bool = True
+    per_account: dict[str, AccountOverride] = field(default_factory=dict)
+
+
+@dataclass
 class Settings:
     default_tool: str = "claude"
     settle_seconds: int = 3
@@ -91,6 +163,7 @@ class Settings:
     window_title_prefix: bool = True
     ssh: SSHConfig = field(default_factory=SSHConfig)
     attention: AttentionSettings = field(default_factory=AttentionSettings)
+    accounts: AccountSettings = field(default_factory=AccountSettings)
     tools: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_TOOLS))
 
 
@@ -115,6 +188,14 @@ class ProjectConfig:
     host: str | None = None
     remote_path: str | None = None
     windows: list[WindowConfig] | None = None
+    # The account PIN: user intent, hand-editable, git-visible, and never
+    # written by a launch. What magent's own planner decided lives in
+    # ~/.magent/account-map.json instead, so a pin and a guess can never be
+    # confused on disk (and so a load can stay a load -- see load_config).
+    account: str | None = None
+    # The model-class override. None means "infer it"; it is NOT a synonym for
+    # "standard", which is what the planner falls back to on its own.
+    model_class: str | None = None
 
 
 @dataclass
@@ -238,6 +319,104 @@ def _parse_attention(raw: dict[str, object]) -> AttentionSettings:
     )
 
 
+def _account_id(raw: dict[str, object], key: str) -> str | None:
+    """An account id, or None. A JSON NUMBER is accepted and stringified.
+
+    The only accessor here that coerces rather than degrading, and it earns the
+    exception: ccswap's ids are numeric ("13"), JSON has no natural way to
+    write one as a string without the user remembering to, and
+    ``magent config set <proj> account 13`` parses its argument as an int
+    before it ever reaches the file. Degrading that to None would leave a pin
+    the user typed, can see in their config, and that silently does nothing --
+    the worst failure shape a pin can have. A genuinely wrong type (a list, an
+    object, a boolean) still degrades.
+    """
+    value = raw.get(key)
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    return None
+
+
+def _model_class(raw: dict[str, object], key: str) -> str | None:
+    """A model class, normalised, or None for "infer it".
+
+    An unknown string degrades to None rather than raising -- the accessor
+    block's doctrine -- and ``load_config`` warns about it separately, so a
+    typo is visible without being fatal to a bring-up.
+    """
+    value = _str_or_none(raw, key)
+    if value is None:
+        return None
+    normalised = value.strip().lower()
+    return normalised if normalised in MODEL_CLASSES else None
+
+
+def _recognised_on_limit(value: str) -> bool:
+    """Is ``value`` a policy at all? The PARSE (into a mode and its hours)
+    belongs to ``routing.parse_on_limit``; this module only has to know
+    whether the user typed something it should warn about."""
+    return bool(_ON_LIMIT_RE.match(value.strip().lower()))
+
+
+def _on_limit(
+    raw: dict[str, object], default: str, *, inheritable: bool = False
+) -> str:
+    """``onLimit``, degraded to ON_LIMIT_FALLBACK when it is not a policy.
+
+    ``inheritable`` is what a ``perAccount`` entry gets: there an empty value
+    means "use the global policy", so it must stay empty rather than becoming
+    ``wait``. At the top level there is nothing to inherit, so an empty string
+    is just one more thing that is not a policy.
+    """
+    value = _str(raw, "onLimit", default)
+    if inheritable and not value:
+        return ""
+    return value if _recognised_on_limit(value) else ON_LIMIT_FALLBACK
+
+
+def _parse_account_override(raw: dict[str, object]) -> AccountOverride:
+    return AccountOverride(
+        klass=_model_class(raw, "class"),
+        on_limit=_on_limit(raw, "", inheritable=True),
+        exclude=_bool(raw, "exclude", False),
+    )
+
+
+def _per_account(raw: dict[str, object]) -> dict[str, AccountOverride]:
+    """``perAccount``, entry by entry.
+
+    A non-object entry is DROPPED rather than defaulted: every other accessor
+    here degrades a mistyped field to its default, but an override that
+    degraded to "no overrides" would silently un-exclude an account the user
+    meant to keep out of routing -- and this is the one map whose keys magent
+    cannot check (see load_config).
+    """
+    value = raw.get("perAccount")
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): _parse_account_override(entry)
+        for key, entry in value.items()
+        if isinstance(entry, dict)
+    }
+
+
+def _parse_accounts(raw: dict[str, object]) -> AccountSettings:
+    return AccountSettings(
+        enabled=_bool(raw, "enabled", False),
+        soft_threshold=_float(raw, "softThreshold", 85.0),
+        hard_threshold=_float(raw, "hardThreshold", 95.0),
+        on_limit=_on_limit(raw, DEFAULT_ON_LIMIT),
+        stale_after_s=_float(raw, "staleAfterS", 900.0),
+        status_left=_bool(raw, "statusLeft", True),
+        per_account=_per_account(raw),
+    )
+
+
 def _parse_settings(raw: dict[str, object] | None) -> Settings:
     if not raw:
         return Settings()
@@ -252,6 +431,7 @@ def _parse_settings(raw: dict[str, object] | None) -> Settings:
         window_title_prefix=_bool(raw, "windowTitlePrefix", True),
         ssh=_parse_ssh(_obj(raw, "ssh")),
         attention=_parse_attention(_obj(raw, "attention")),
+        accounts=_parse_accounts(_obj(raw, "accounts")),
         tools=_tools(raw, DEFAULT_TOOLS),
     )
 
@@ -286,6 +466,22 @@ def settings_to_dict(settings: Settings) -> dict[str, object]:
             "debounceS": settings.attention.debounce_s,
             "stateTtlDays": settings.attention.state_ttl_days,
         },
+        "accounts": {
+            "enabled": settings.accounts.enabled,
+            "softThreshold": settings.accounts.soft_threshold,
+            "hardThreshold": settings.accounts.hard_threshold,
+            "onLimit": settings.accounts.on_limit,
+            "staleAfterS": settings.accounts.stale_after_s,
+            "statusLeft": settings.accounts.status_left,
+            "perAccount": {
+                acct: {
+                    "class": override.klass,
+                    "onLimit": override.on_limit,
+                    "exclude": override.exclude,
+                }
+                for acct, override in settings.accounts.per_account.items()
+            },
+        },
         "tools": dict(settings.tools),
     }
 
@@ -319,6 +515,8 @@ def _parse_project(raw: dict[str, object]) -> ProjectConfig:
         host=_str_or_none(raw, "host"),
         remote_path=_str_or_none(raw, "remotePath"),
         windows=_windows(raw),
+        account=_account_id(raw, "account"),
+        model_class=_model_class(raw, "modelClass"),
     )
 
 
@@ -403,9 +601,20 @@ _ALLOWED_SETTINGS_KEYS = {
     "windowTitlePrefix",
     "ssh",
     "attention",
+    "accounts",
     "tools",
 }
 _ALLOWED_SSH_KEYS = {"shell"}
+_ALLOWED_ACCOUNTS_KEYS = {
+    "enabled",
+    "softThreshold",
+    "hardThreshold",
+    "onLimit",
+    "staleAfterS",
+    "statusLeft",
+    "perAccount",
+}
+_ALLOWED_ACCOUNT_OVERRIDE_KEYS = {"class", "onLimit", "exclude"}
 _ALLOWED_ATTENTION_KEYS = {
     "badge",
     "flash",
@@ -429,6 +638,8 @@ _ALLOWED_PROJECT_KEYS = {
     "host",
     "remotePath",
     "windows",
+    "account",
+    "modelClass",
 }
 _ALLOWED_WINDOW_KEYS = {"name", "tool", "command"}
 
@@ -437,6 +648,52 @@ def _warn_unknown_keys(raw: dict[str, object], allowed: set[str], path: str) -> 
     for key in sorted(set(raw) - allowed):
         field_path = f"{path}.{key}" if path else key
         click.echo(f"Warning: unknown config key: {field_path}", err=True)
+
+
+def _warn_bad_model_class(raw: dict[str, object], path: str, key: str) -> None:
+    value = _str_or_none(raw, key)
+    if value is not None and value.strip().lower() not in MODEL_CLASSES:
+        click.echo(
+            f"Warning: {path}.{key}: unknown class {value!r}; "
+            f"expected one of {', '.join(MODEL_CLASSES)} (ignoring it)",
+            err=True,
+        )
+
+
+def _warn_bad_on_limit(
+    raw: dict[str, object], path: str, *, inheritable: bool = False
+) -> None:
+    value = _str_or_none(raw, "onLimit")
+    if value is None or (inheritable and not value):
+        return
+    if not _recognised_on_limit(value):
+        click.echo(
+            f"Warning: {path}.onLimit: unknown policy {value!r}; "
+            f"using {ON_LIMIT_FALLBACK!r}",
+            err=True,
+        )
+
+
+def _warn_accounts_keys(settings_raw: dict[str, object]) -> None:
+    """Validate ``settings.accounts`` -- and, inside it, every ``perAccount``
+    VALUE but never a ``perAccount`` KEY.
+
+    That is the one place in this schema where a key space is deliberately not
+    checked against an allow-list, and it has to be: the keys are ccswap
+    account ids, which come from the user's ccswap store and not from magent.
+    A "did you mean?" here would warn about every account magent has simply
+    never heard of.
+    """
+    accounts_raw = _obj(settings_raw, "accounts")
+    _warn_unknown_keys(accounts_raw, _ALLOWED_ACCOUNTS_KEYS, "settings.accounts")
+    _warn_bad_on_limit(accounts_raw, "settings.accounts")
+    per_account_raw = _obj(accounts_raw, "perAccount")
+    for acct_id in sorted(per_account_raw):
+        entry = _obj(per_account_raw, acct_id)
+        path = f"settings.accounts.perAccount.{acct_id}"
+        _warn_unknown_keys(entry, _ALLOWED_ACCOUNT_OVERRIDE_KEYS, path)
+        _warn_bad_on_limit(entry, path, inheritable=True)
+        _warn_bad_model_class(entry, path, "class")
 
 
 def _parse_layout(raw: dict[str, object]) -> LayoutConfig:
@@ -478,11 +735,13 @@ def load_config(path: str) -> MagentConfig:
     _warn_unknown_keys(
         _obj(settings_raw, "attention"), _ALLOWED_ATTENTION_KEYS, "settings.attention"
     )
+    _warn_accounts_keys(settings_raw)
 
     projects: list[ProjectConfig] = []
     for i, p in enumerate(projects_raw):
         p_obj = p if isinstance(p, dict) else {}
         _warn_unknown_keys(p_obj, _ALLOWED_PROJECT_KEYS, f"projects[{i}]")
+        _warn_bad_model_class(p_obj, f"projects[{i}]", "modelClass")
         w_raw = p_obj.get("windows")
         if isinstance(w_raw, list):
             for j, w in enumerate(w_raw):
@@ -558,10 +817,46 @@ def _migrate_2_to_3(raw: dict[str, object]) -> dict[str, object]:
     return raw
 
 
+def _migrate_3_to_4(raw: dict[str, object]) -> dict[str, object]:
+    """v4 adds ``settings.accounts`` — per-project Claude account routing.
+
+    Absent keys parse to their defaults, so this only stamps the version and
+    MATERIALISES the section (so a hand-editor can see the knobs exist), and
+    only when ``settings`` is already there — exactly what _migrate_1_to_2 did
+    for ``attention``.
+
+    The values are written out literally rather than derived from
+    ``AccountSettings()``. A migration is a HISTORICAL transform: what it
+    produces must not change retroactively because a default moved later, or
+    two users running `config migrate` on the same v3 file at different
+    magent versions would get different v4 files.
+
+    Projects are untouched. ``account`` and ``modelClass`` are pins the user
+    types; a migration that invented one would be guessing at intent, and the
+    whole point of keeping the pin in config and the assignment out of it is
+    that the two are never confused.
+    """
+    raw = dict(raw)
+    settings = raw.get("settings")
+    if isinstance(settings, dict) and "accounts" not in settings:
+        settings["accounts"] = {
+            "enabled": False,
+            "softThreshold": 85.0,
+            "hardThreshold": 95.0,
+            "onLimit": "move-if-reset>2h",
+            "staleAfterS": 900.0,
+            "statusLeft": True,
+            "perAccount": {},
+        }
+    raw["version"] = 4
+    return raw
+
+
 _MIGRATIONS: dict[int, Callable[[dict[str, object]], dict[str, object]]] = {
     0: _migrate_0_to_1,
     1: _migrate_1_to_2,
     2: _migrate_2_to_3,
+    3: _migrate_3_to_4,
 }
 
 

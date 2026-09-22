@@ -230,6 +230,60 @@ def _bashify(arg: str) -> str:
     return arg
 
 
+def _write_agent_shim(tmp_path: Path, name: str, log: Path) -> Path:
+    """A launcher shim that runs the stand-in agent, logging to ``log``.
+
+    A shim rather than an argv because a pane command is read by a SHELL: psmux
+    handed a multi-argument command to pwsh, which turned a path containing ``&``
+    into a background job. One shell-quoted argument pointing at a file is the
+    only shape that is safe on both multiplexers.
+    """
+    shim = tmp_path / f"run-{name}{'.cmd' if sys.platform == 'win32' else '.sh'}"
+    argv = [
+        sys.executable,
+        str(_AGENT),
+        "--log",
+        str(log),
+        "--name",
+        name,
+        "--compact-seconds",
+        str(_COMPACT_S),
+    ]
+    if sys.platform == "win32":
+        shim.write_text(
+            "@echo off\r\n" + subprocess.list2cmdline(argv) + "\r\n", encoding="utf-8"
+        )
+    else:
+        shim.write_text("#!/bin/sh\nexec " + shlex.join(argv) + "\n", encoding="utf-8")
+        shim.chmod(0o755)
+    return shim
+
+
+def _records(log: Path) -> list[dict[str, object]]:
+    """Every JSON record the stand-in has appended to ``log``, in order.
+
+    Two shapes share the file: one ``startup`` record and one record per line
+    read. A reader takes the shape it wants and ignores the other, so either can
+    grow without breaking the other's tests.
+    """
+    if not log.exists():
+        return []
+    return [
+        json.loads(raw)
+        for raw in log.read_text(encoding="utf-8").splitlines()
+        if raw.strip()
+    ]
+
+
+def _startup_env(log: Path) -> dict[str, object] | None:
+    """The pane agent's own view of its routing environment, or None."""
+    for record in _records(log):
+        startup = record.get("startup")
+        if isinstance(startup, dict):
+            return startup
+    return None
+
+
 def _wait_until(check, timeout: float, interval: float = 0.25):
     """Poll ``check`` until it is truthy or ``timeout`` runs out; return the last
     value either way, so the caller's assertion reports the real state."""
@@ -279,6 +333,10 @@ class _Fleet:
         self.env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
         self.env["MAGENT_PSMUX_BOOST"] = "0"
         self.env["MAGENT_SESSION0_POLICY"] = "allow"
+        # ...and routing must never run a real `ccswap`: it is the one
+        # feature that shells out to a tool holding the user's real account
+        # credentials, and no HOME redirect contains a binary on PATH.
+        self.env["MAGENT_ACCOUNT_ROUTING"] = "0"
         self.env.update(extra_env)
 
         self.projdirs = {}
@@ -338,27 +396,7 @@ class _Fleet:
     def _start(self, name: str, tmp_path: Path) -> None:
         log = tmp_path / f"{name}.jsonl"
         self.logs[name] = log
-        shim = tmp_path / f"run-{name}{'.cmd' if sys.platform == 'win32' else '.sh'}"
-        argv = [
-            sys.executable,
-            str(_AGENT),
-            "--log",
-            str(log),
-            "--name",
-            name,
-            "--compact-seconds",
-            str(_COMPACT_S),
-        ]
-        if sys.platform == "win32":
-            shim.write_text(
-                "@echo off\r\n" + subprocess.list2cmdline(argv) + "\r\n",
-                encoding="utf-8",
-            )
-        else:
-            shim.write_text(
-                "#!/bin/sh\nexec " + shlex.join(argv) + "\n", encoding="utf-8"
-            )
-            shim.chmod(0o755)
+        shim = _write_agent_shim(tmp_path, name, log)
 
         result = self.psmux(
             "-L",
@@ -409,13 +447,8 @@ class _Fleet:
 
     def received(self, name: str) -> list[str]:
         """Every line the stand-in has read, in order -- the wire's own record."""
-        log = self.logs[name]
-        if not log.exists():
-            return []
         return [
-            json.loads(raw)["line"]
-            for raw in log.read_text(encoding="utf-8").splitlines()
-            if raw.strip()
+            record["line"] for record in _records(self.logs[name]) if "line" in record
         ]
 
     # -- the product ----------------------------------------------------------
@@ -500,6 +533,231 @@ def fleet(tmp_path):
     finally:
         leftovers = f.teardown()
     assert not leftovers, f"cleanup left real multiplexer state behind: {leftovers}"
+
+
+class _RoutedFleet:
+    """Panes created WITH and WITHOUT an account overlay, nothing else.
+
+    Separate from ``_Fleet`` because it answers a different question and must
+    answer it cheaply: no magent CLI, no config, no waiting for a painted
+    screen -- just "what environment did the agent at the far end of the psmux
+    server actually get?".
+    """
+
+    def __init__(self, tmp_path: Path, budget: Budget) -> None:
+        self.budget = budget
+        self.tmp = tmp_path
+        self.binary, self.extra_env, self.socket_dir = _resolve_multiplexer(tmp_path)
+        stem = f"mgr-{uuid.uuid4().hex[:8]}"
+        self.routed = f"{stem}-r"
+        self.plain = f"{stem}-p"
+        self.product = f"{stem}-w"
+        # Stands in for a ccswap profile directory. Nothing reads inside it: the
+        # test asserts on the STRING the pane received, which is the whole
+        # contract between magent and the agent.
+        self.profile = tmp_path / "profile-13"
+        self.profile.mkdir()
+        self.work = tmp_path / "work"
+        self.work.mkdir()
+        self.logs: dict[str, Path] = {}
+        self.created: list[str] = []
+
+    @property
+    def control_env(self) -> dict[str, str]:
+        """Environment for the harness's own psmux CONTROL commands."""
+        return {**os.environ, **self.extra_env}
+
+    def psmux(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [self.binary, *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=self.control_env,
+            check=False,
+            timeout=max(5.0, self.budget.clamp(30.0)),
+        )
+
+    def _shim(self, name: str) -> Path:
+        log = self.tmp / f"{name}.jsonl"
+        self.logs[name] = log
+        return _write_agent_shim(self.tmp, name, log)
+
+    def create(self, name: str, overlay: dict[str, str] | None) -> None:
+        """Create one pane through the product's OWN environment composition.
+
+        ``psmux.child_env`` is the seam ``platform/windows.py`` passes to its
+        ``new-session`` spawn, so the environment block here is the one a routed
+        bring-up builds -- byte for byte, including the three strips and the
+        conditional credential drop. What is substituted is only the spawn call
+        itself, and only because ``launch_psmux_session`` is Windows-only by
+        design (``supports_psmux()`` is False on POSIX): the same honest gap this
+        tier already carries for the psmux binary.
+        """
+        from magent.env import ACCOUNT_OVERRIDE_VARS
+        from magent.psmux import child_env
+
+        drop = ACCOUNT_OVERRIDE_VARS if overlay else frozenset()
+        env = {**child_env(overlay, drop=drop), **self.extra_env}
+        result = subprocess.run(
+            [
+                self.binary,
+                "-L",
+                name,
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "-c",
+                str(self.work),
+                _pane_command(self._shim(name)),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            check=False,
+            timeout=max(5.0, self.budget.clamp(30.0)),
+        )
+        assert result.returncode == 0, (
+            f"new-session {name} failed rc={result.returncode}: {result.stderr}"
+        )
+        self.created.append(name)
+
+    def create_through_the_product(self, name: str, overlay: dict[str, str]) -> None:
+        """Create one pane by calling the REAL ``launch_psmux_session``.
+
+        Windows only, because that method is: this is the leg where nothing at
+        all is substituted -- the product builds the environment, spawns the
+        ``new-session`` client unjobbed, types the command into the pane, and
+        the agent at the far end records what it got.
+        """
+        from magent.env import ACCOUNT_OVERRIDE_VARS
+        from magent.platform import PsmuxWindowOpts
+        from magent.platform.windows import WindowsPlatform
+
+        shim = self._shim(name)
+        self.created.append(name)
+        WindowsPlatform().launch_psmux_session(
+            [
+                PsmuxWindowOpts(
+                    window_name=name,
+                    cwd=str(self.work),
+                    command=f'"{shim}"',
+                    env=overlay,
+                    drop_env=ACCOUNT_OVERRIDE_VARS,
+                )
+            ]
+        )
+
+    def startup(self, name: str) -> dict[str, object]:
+        """The agent's own startup record, waited for. Fails loudly without it."""
+        got = _wait_until(
+            lambda: _startup_env(self.logs[name]), self.budget.clamp(_READY_S)
+        )
+        assert got is not None, (
+            f"{name}'s stand-in agent never recorded its environment. "
+            f"pane:\n{self.psmux('-L', name, 'capture-pane', '-p', '-t', name).stdout!r}"
+        )
+        return got
+
+    def teardown(self) -> list[str]:
+        leftovers = []
+        for name in self.created:
+            self.psmux("-L", name, "kill-server")
+        for name in self.created:
+            live = _wait_until(
+                lambda n=name: (
+                    self.psmux("-L", n, "has-session", "-t", n).returncode != 0
+                ),
+                10.0,
+            )
+            if not live:
+                leftovers.append(f"session {name} survived kill-server")
+        if self.socket_dir:
+            shutil.rmtree(self.socket_dir, ignore_errors=True)
+        return leftovers
+
+
+@pytest.fixture
+def routed_fleet(tmp_path, monkeypatch):
+    # An ambient credential, set the way a user's shell would. A routed pane must
+    # not see it (it silently outranks the account the overlay chose, and bills
+    # the API instead of the subscription); an UNROUTED pane must still see it,
+    # because it is the user's own configuration.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-not-a-real-key")
+    fleet = _RoutedFleet(tmp_path, Budget(_BUDGET_S))
+    try:
+        yield fleet
+    finally:
+        leftovers = fleet.teardown()
+    assert not leftovers, f"cleanup left real multiplexer state behind: {leftovers}"
+
+
+class TestTheAccountCrossesThePsmuxServerBoundary:
+    """R-1, measured rather than assumed -- this tier's whole reason to exist.
+
+    A routed pane's account is an environment variable set exactly once, on the
+    ``new-session`` CLIENT. The psmux SERVER that hosts the agent is a grandchild
+    that client forks, and Windows does not inherit a priority class across that
+    boundary (the reason ``psmux.boost_priority`` is a sweep and not a spawn
+    flag). If the environment is dropped there too, every routed pane silently
+    runs on the default login -- the worst failure this feature has, because
+    nothing on screen would say so.
+
+    The witness is the agent's own JSON log, not a screen scrape: it is the only
+    thing that can report what the process at the far end actually received.
+    """
+
+    def test_a_routed_pane_reports_its_accounts_config_dir_verbatim(self, routed_fleet):
+        routed_fleet.create(
+            routed_fleet.routed, {"CLAUDE_CONFIG_DIR": str(routed_fleet.profile)}
+        )
+
+        startup = routed_fleet.startup(routed_fleet.routed)
+
+        # Verbatim, not a prefix: the agent writes its transcripts under exactly
+        # this path, and magent's session probe reads exactly this path.
+        assert startup["CLAUDE_CONFIG_DIR"] == str(routed_fleet.profile)
+        # ...and the ambient credential that would have outranked it is gone.
+        assert startup["anthropic_api_key_set"] is False
+
+    def test_an_unrouted_pane_sees_no_account_and_keeps_the_users_own_key(
+        self, routed_fleet
+    ):
+        routed_fleet.create(routed_fleet.plain, None)
+
+        startup = routed_fleet.startup(routed_fleet.plain)
+
+        assert startup["CLAUDE_CONFIG_DIR"] is None
+        # The strip travels with the overlay and never on its own: stripping a
+        # user's own ANTHROPIC_API_KEY out of an unrouted pane would log them
+        # out of a feature they never enabled.
+        assert startup["anthropic_api_key_set"] is True
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="launch_psmux_session is Windows-only by design (supports_psmux)",
+    )
+    def test_the_real_launch_path_delivers_the_overlay_into_the_pane(
+        self, routed_fleet
+    ):
+        # The leg with nothing substituted: the product builds the environment,
+        # spawns the client, types the command, and the agent reports back.
+        routed_fleet.create_through_the_product(
+            routed_fleet.product, {"CLAUDE_CONFIG_DIR": str(routed_fleet.profile)}
+        )
+
+        startup = routed_fleet.startup(routed_fleet.product)
+
+        assert startup["CLAUDE_CONFIG_DIR"] == str(routed_fleet.profile)
+        assert startup["anthropic_api_key_set"] is False
 
 
 class TestTheFleetIsReadThroughARealMultiplexer:

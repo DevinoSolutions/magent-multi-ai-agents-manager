@@ -1180,7 +1180,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Project renamed from multideck to magent.** The PyPI distribution is now
   `magent-multi-ai-agents-manager` (`pip install magent-multi-ai-agents-manager`),
   the CLI command and import package are both `magent`, and the project homepage
-  is <https://magent.io>. The GitHub repository moved to
+  is <https://magent.now>. The GitHub repository moved to
   `DevinoSolutions/magent-multi-ai-agents-manager`.
 - **Environment variable prefix is now `MAGENT_*`** (for example, the Sentry DSN
   is read from `MAGENT_SENTRY_DSN`).

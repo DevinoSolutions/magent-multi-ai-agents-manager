@@ -354,6 +354,31 @@ class TestSessionsJson:
         assert by_name["caramel"]["effort"] == "high"
         assert by_name["upup"]["live"] is False
         assert by_name["upup"]["state"] == "dead"
+        # Unrouted is null, not missing: a consumer reads the key either way.
+        assert by_name["caramel"]["account"] is None
+        assert by_name["upup"]["account"] is None
+
+    def test_a_routed_session_carries_its_account(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        """The account comes from the assignment MAP, never from a ccswap call:
+        this command is what scripts poll, and a subprocess to somebody else's
+        CLI per poll is exactly the cost the map exists to avoid."""
+        from magent import accounts
+
+        fake = make_fake_psmux(
+            tmp_path, pane=f"PS> claude\nFable 5.1 {MID} high", live=["caramel"]
+        )
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        accounts.write_map({"caramel": accounts.MapEntry(account="13")})
+        cfg = _cfg(tmp_config, tmp_path, ["caramel", "upup"])
+
+        result = runner.invoke(cli.main, ["--config", cfg, "sessions", "--json"])
+
+        assert result.exit_code == 0
+        by_name = {r["name"]: r for r in json.loads(result.stdout)}
+        assert by_name["caramel"]["account"] == "13"
+        assert by_name["upup"]["account"] is None
 
     def test_empty_config_is_empty_array(
         self, runner, tmp_config, tmp_path, monkeypatch
