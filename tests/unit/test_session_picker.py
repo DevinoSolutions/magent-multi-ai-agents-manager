@@ -17,8 +17,9 @@ from pathlib import Path
 
 import pytest
 
+from magent import agent_state, attention
 from magent import psmux as psmux_mod
-from magent.cli import session_picker
+from magent.cli import picker, session_picker
 
 
 class TestPickerSweepIsTheSharedSeam:
@@ -99,6 +100,108 @@ class TestSessionStatuses:
         assert session_picker._session_statuses({"api": ""}) == {"api": ""}
 
 
+class TestPickerStalenessComesFromConfig:
+    """`settings.attention.stalenessWorkingS` / `stalenessNeedsInputS` decide
+    what the picker calls stale -- not `attention.STALENESS_S`.
+
+    The picker used to import the module default outright, so a user who widened
+    the window got it honored by the attention daemon, `watch` and `status`'s
+    agents array, and silently ignored by `magent sessions` (and by `status`'s
+    psmux-session table, which reads these same helpers). The window map now
+    arrives as a plain argument, built once by
+    `attention_cmd.staleness_from_config`.
+    """
+
+    def _working_record(self, monkeypatch, age_s: float) -> None:
+        monkeypatch.setattr(
+            "magent.agent_state.state_for",
+            lambda cwd, max_age=None: {
+                "state": agent_state.WORKING,
+                "ts": time.time() - age_s,
+            },
+        )
+
+    def test_a_configured_window_ages_a_working_record(self, monkeypatch):
+        # 120s old: far younger than the 1800s module default, well past a 10s
+        # configured window -- so which map is in force decides the answer.
+        self._working_record(monkeypatch, 120.0)
+
+        states = session_picker._session_states(
+            {"api": "/proj/api"}, {agent_state.WORKING: 10.0}
+        )
+
+        assert states["api"][0] is None
+
+    def test_no_staleness_argument_falls_back_to_the_module_default(self, monkeypatch):
+        # Named behaviour, not an accident: `_session_states` stays callable
+        # without a config, and then the shipped defaults apply -- never a crash
+        # and never a blank state column.
+        default = attention.STALENESS_S[agent_state.WORKING]
+
+        self._working_record(monkeypatch, default / 2)
+        assert (
+            session_picker._session_states({"api": "/proj/api"})["api"][0]
+            == agent_state.WORKING
+        )
+
+        self._working_record(monkeypatch, default + 60)
+        assert session_picker._session_states({"api": "/proj/api"})["api"][0] is None
+
+    def test_the_picker_paints_the_configured_window_not_the_default(
+        self, monkeypatch, tmp_config
+    ):
+        # The pin that fails on the shipped code: a `staleness` parameter nobody
+        # threads through is still the bug, so this drives the real picker loop
+        # and reads the LABEL it drew.
+        self._working_record(monkeypatch, 120.0)
+        rows = self._paint(
+            monkeypatch,
+            tmp_config(
+                {
+                    "projects": [{"path": "api"}],
+                    "settings": {"attention": {"stalenessWorkingS": 10}},
+                }
+            ),
+        )
+
+        assert [r.label for r in rows] == ["api", "Back"]
+        assert rows[0].extra == ""
+
+    def test_the_default_config_still_paints_a_live_working_session(
+        self, monkeypatch, tmp_config
+    ):
+        # Control for the above: the same 120s-old record under an untouched
+        # config keeps its "still going..." label, so the blank column there is
+        # genuinely config-driven aging and not a broken lookup.
+        self._working_record(monkeypatch, 120.0)
+        rows = self._paint(monkeypatch, tmp_config({"projects": [{"path": "api"}]}))
+
+        assert "still going" in rows[0].extra
+
+    def _paint(self, monkeypatch, cfgpath: str) -> list[picker.PickerItem]:
+        """Run one picker iteration and return the rows it painted."""
+        painted: list[list[picker.PickerItem]] = []
+        monkeypatch.setattr(psmux_mod, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(
+            psmux_mod, "live_sessions", lambda names, psmux=None, **kw: ["api"]
+        )
+        monkeypatch.setattr(
+            session_picker, "_session_cwds", lambda *a: {"api": "/proj/api"}
+        )
+        monkeypatch.setattr(session_picker, "_consume_focus_target", lambda: None)
+        monkeypatch.setattr(session_picker, "_running_upload_port", lambda: None)
+        monkeypatch.setattr(
+            session_picker,
+            "_read_choice",
+            lambda rows, url: (painted.append(rows), "q")[1],
+        )
+
+        session_picker._run_sessions_picker(Path(cfgpath))
+
+        assert len(painted) == 1
+        return painted[0]
+
+
 class TestAttachSession:
     def _run(self, monkeypatch, rcs):
         seq = iter(rcs)
@@ -150,7 +253,9 @@ def fake_fleet(monkeypatch, tmp_config):
             psmux_mod, "live_sessions", lambda live, psmux=None, **kw: list(names)
         )
         monkeypatch.setattr(
-            session_picker, "_session_statuses", lambda cwds: dict.fromkeys(cwds, "")
+            session_picker,
+            "_session_statuses",
+            lambda cwds, staleness=None: dict.fromkeys(cwds, ""),
         )
         monkeypatch.setattr(session_picker, "_running_upload_port", lambda: None)
         monkeypatch.setattr(session_picker, "_consume_focus_target", lambda: None)
