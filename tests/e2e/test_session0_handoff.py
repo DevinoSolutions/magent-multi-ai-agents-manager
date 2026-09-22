@@ -114,10 +114,6 @@ def _child_env(home: Path, bin_dir: Path, **extra: str) -> dict[str, str]:
     env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
     env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
     env["MAGENT_PSMUX_BOOST"] = "0"
-    # ...and routing must never run a real `ccswap`: it is the one
-    # feature that shells out to a tool holding the user's real account
-    # credentials, and no HOME redirect contains a binary on PATH.
-    env["MAGENT_ACCOUNT_ROUTING"] = "0"
     home.mkdir(parents=True, exist_ok=True)
     home_s = str(home)
     drive, tail = os.path.splitdrive(home_s)

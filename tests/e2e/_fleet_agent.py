@@ -44,17 +44,6 @@ box against real psmux 3.3.8:
 Every line received on stdin is appended to ``--log`` as one JSON record, so
 the test's ground truth for "the text arrived VERBATIM" is the bytes this
 program read, not a screen scrape.
-
-The first record is different: it is this process's own view of the two
-environment variables account routing turns on (``startup``, written by
-:meth:`Pane.record_startup`). Nothing else can answer that question. A routed
-pane's account is set exactly once, on the ``new-session`` client, and the psmux
-SERVER that ends up hosting the agent is a grandchild that client forks -- the
-same boundary Windows refuses to inherit a priority class across, which is why
-``psmux.boost_priority`` has to exist. So whether the environment survives it is
-a measurement, not an inference, and the only witness is the program at the far
-end. The credential variable is recorded as a PRESENCE, never a value: this log
-is a CI artifact.
 """
 
 from __future__ import annotations
@@ -237,30 +226,6 @@ class Pane:
         with self.log.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps({"line": line, "ts": time.time()}) + "\n")
 
-    def record_startup(self) -> None:
-        """Append what THIS process sees of the routing environment.
-
-        ``CLAUDE_CONFIG_DIR`` is recorded verbatim -- it is a directory path and
-        the value under test. ``ANTHROPIC_API_KEY`` is recorded as a presence
-        flag only: a real key must never reach a log, and "was it stripped?" is
-        the entire question anyway.
-        """
-        with self.log.open("a", encoding="utf-8") as fh:
-            fh.write(
-                json.dumps(
-                    {
-                        "startup": {
-                            "CLAUDE_CONFIG_DIR": os.environ.get("CLAUDE_CONFIG_DIR"),
-                            "anthropic_api_key_set": bool(
-                                os.environ.get("ANTHROPIC_API_KEY")
-                            ),
-                        },
-                        "ts": time.time(),
-                    }
-                )
-                + "\n"
-            )
-
     # -- behaviour ------------------------------------------------------------
 
     def run_busy(self, message: str, seconds: float, done: str) -> None:
@@ -354,9 +319,6 @@ def main(argv: list[str] | None = None) -> int:
         name=args.name,
         compact_seconds=args.compact_seconds,
     )
-    # Before the first paint: a test that is only asking "what environment did
-    # this pane get?" must not have to wait for a terminal to render.
-    pane.record_startup()
     reader = threading.Thread(target=pane.read_forever, daemon=True)
     reader.start()
     pane.serve()

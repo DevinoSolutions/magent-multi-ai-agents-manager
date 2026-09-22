@@ -8,7 +8,6 @@ after that re-exports every symbol tests/external code still reach via
 from __future__ import annotations
 
 from magent.cli import (  # noqa: F401  # reason: side-effect import — runs each module's @main.command registration
-    account_cmd,
     attach,
     attention_cmd,
     background,

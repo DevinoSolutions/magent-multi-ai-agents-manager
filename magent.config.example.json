@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 3,
   "baseDir": "C:/Users/you/projects",
   "layout": {
     "columns": 2,
@@ -29,15 +29,6 @@
       "debounceS": 300.0,
       "stateTtlDays": 14
     },
-    "accounts": {
-      "enabled": false,
-      "softThreshold": 85.0,
-      "hardThreshold": 95.0,
-      "onLimit": "move-if-reset>2h",
-      "staleAfterS": 900.0,
-      "statusLeft": true,
-      "perAccount": {}
-    },
     "tools": {
       "claude": "claude --continue",
       "codex": "codex",
@@ -51,16 +42,14 @@
       "group": "backend",
       "tool": "claude",
       "color": "#3b82f6",
-      "enabled": true,
-      "account": "13"
+      "enabled": true
     },
     {
       "path": "frontend/web",
       "group": "frontend",
       "tool": "codex",
       "color": "#22c55e",
-      "enabled": true,
-      "modelClass": "fable"
+      "enabled": true
     },
     {
       "path": "docs-site",

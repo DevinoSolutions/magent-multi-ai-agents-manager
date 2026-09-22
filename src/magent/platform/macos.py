@@ -204,12 +204,6 @@ class MacOSPlatform(Platform):
           ``env=`` on this Popen would look like a fix and be a no-op. Passing
           it anyway would be worse than not passing it, so it is left off
           deliberately and named here instead.
-
-        A routed project's account overlay (``opts.env``) rides on exactly the
-        same split, and the gap is therefore the same one: kitty carries it,
-        and an iTerm/Terminal.app window cannot be routed at all. That is
-        honest rather than silent -- the routed path on macOS is a psmux/tmux
-        pane, which this backend does not open.
         """
         # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
         from magent.env import spawn_child_env
@@ -235,7 +229,7 @@ class MacOSPlatform(Platform):
                 "-c",
                 cmd,
             ]
-            subprocess.Popen(args, env=spawn_child_env(opts.env, drop=opts.drop_env))
+            subprocess.Popen(args, env=spawn_child_env())
         elif self._has_app("iTerm"):
             script = f"""
             tell application "iTerm"

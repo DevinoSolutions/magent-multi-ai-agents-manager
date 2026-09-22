@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 from pydantic import (
     HttpUrl,  # reason: pydantic needs HttpUrl at runtime for model validation
@@ -28,9 +28,6 @@ from pydantic import (
     model_validator,
 )
 from pydantic_settings import BaseSettings
-
-if TYPE_CHECKING:
-    from collections.abc import Mapping
 
 # magent's own dotenv file — module attribute (not baked into model_config)
 # so tests can monkeypatch it and get_env() reads the patched value at call
@@ -135,23 +132,6 @@ class MagentEnv(BaseSettings):
     # 42 agents alive in Session 0, unkillable from the desktop and holding
     # every session name the user's own bring-up wanted.
     session0_policy: Literal["handoff", "allow", "refuse"] = "handoff"
-    # Whether magent may route projects onto per-account Claude profiles at all
-    # (see config.AccountSettings / routing.py). On by default, because the
-    # feature is already off by default one level down: `settings.accounts` has
-    # `enabled: false`, so a config that never opts in never routes and this
-    # variable changes nothing for it.
-    #
-    # The opt-out is the fourth member of the same test-isolation law as
-    # hotkey_supervisor / upload_supervisor / psmux_boost, and it is in that
-    # family for the sharpest version of psmux_boost's reason: routing is the
-    # ONE thing in this product that shells out to a tool holding the user's
-    # real account CREDENTIALS (`ccswap`, resolved off PATH), and no HOME
-    # redirect contains a binary on PATH. tests/conftest.py pins it to 0 for
-    # every tier -- belt and braces over the config gate and the `find_ccswap`
-    # seam, neither of which a future test can be trusted to remember. For a
-    # user it is the kill switch for a routed fleet that is misbehaving: one
-    # variable, no config edit, every pane back on the default login.
-    account_routing: bool = True
 
     @model_validator(mode="after")
     def _no_unknown_magent_vars(self) -> MagentEnv:
@@ -358,43 +338,13 @@ _PRESENTATION_VARS = frozenset(
 # it (a test that restates the list can drift from the list).
 SCRUBBED_INHERITED_VARS = _AGENT_SESSION_VARS | _PRESENTATION_VARS
 
-# The variables that silently OUTRANK a routed pane's account, dropped only on
-# the routed path (``spawn_child_env(overlay, drop=ACCOUNT_OVERRIDE_VARS)``).
-#
-# Deliberately NOT part of SCRUBBED_INHERITED_VARS, and the asymmetry is the
-# whole point. ``_AGENT_SESSION_VARS``' own comment establishes the rule these
-# names would otherwise break: a credential or a provider selection is USER
-# CONFIGURATION, machine-wide and set on purpose, and blanket-stripping it logs
-# somebody out or silently moves them off Bedrock. So the strip is conditional
-# on the user having asked for routing -- the narrowest honest form.
-#
-# Why it is a real strip and not a nicety, once routing IS on:
-#
-# * ``ANTHROPIC_API_KEY`` / ``ANTHROPIC_AUTH_TOKEN`` override the account the
-#   ``CLAUDE_CONFIG_DIR`` overlay just selected, and bill the API instead of the
-#   subscription whose headroom the planner budgeted -- i.e. the exact opposite
-#   of what the user asked for, invisibly.
-# * ``ANTHROPIC_BASE_URL`` disables tool deferral outright (measured: a hard 400
-#   on 200k-context models), so a routed pane would fail in a way that looks
-#   like magent's bug and is an inherited environment's.
-#
-# An unrouted pane is untouched by all of this: the drop travels with the
-# overlay, never on its own.
-ACCOUNT_OVERRIDE_VARS = frozenset(
-    {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"}
-)
-
 
 def _is_inherited_marker(key: str) -> bool:
     """True for env vars that belong to the LAUNCHING process, not the child."""
     return key.upper() in SCRUBBED_INHERITED_VARS
 
 
-def spawn_child_env(
-    overlay: Mapping[str, str] | None = None,
-    *,
-    drop: frozenset[str] = frozenset(),
-) -> dict[str, str]:
+def spawn_child_env() -> dict[str, str]:
     """The process environment with every inherited-identity marker removed.
 
     THE one seam for "what environment does a magent-spawned pane start with?".
@@ -435,34 +385,12 @@ def spawn_child_env(
     narrower seam it uses instead -- and psmux's CONTROL/PROBE commands are
     measurably indifferent to all of this, so those call sites keep the
     inherited environment on purpose.
-
-    ``overlay`` is the FOURTH family, and it goes the other way: values this
-    pane must start with that the launching process does not have. Today that
-    is one thing -- ``CLAUDE_CONFIG_DIR``, which chooses the account a routed
-    pane's agent runs as. It is environment rather than a command line because
-    of how a pane is started: the agent command is TYPED into the pane by
-    ``send-keys`` and magent never sees its exit code, so a per-account command
-    prefix could never be verified, while ``new-session``'s environment is
-    fixed once, by this call, and is the one thing the pane cannot argue with.
-    Applied LAST, after all three strips, so an overlay always wins; the
-    no-overlay call is byte-for-byte what it has always been.
-
-    ``drop`` removes names the caller has decided must not reach THIS child --
-    see ``ACCOUNT_OVERRIDE_VARS``, the only set anything passes today, and only
-    alongside a routing overlay. Case-insensitive, like every other comparison
-    here, because Windows environment names are.
     """
-    dropped = {name.upper() for name in drop}
-    base = {
+    return {
         key: value
         for key, value in os.environ.items()
-        if not _is_mux_nesting_marker(key)
-        and not _is_inherited_marker(key)
-        and key.upper() not in dropped
+        if not _is_mux_nesting_marker(key) and not _is_inherited_marker(key)
     }
-    if overlay:
-        base.update(overlay)
-    return base
 
 
 def _has_agent_session_marker() -> bool:
