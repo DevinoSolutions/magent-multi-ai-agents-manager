@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="https://magent.io"><strong>magent.io</strong></a>
+  <a href="https://magent.now"><strong>magent.now</strong></a>
 </p>
 
 <!--
@@ -20,8 +20,8 @@
 
 
 <p align="center">
-  <a href="https://pypi.org/project/magent-multi-ai-agents-manager"><img src="https://img.shields.io/pypi/v/magent?color=3776AB&label=pypi" alt="PyPI version" /></a>
-  <a href="https://pypi.org/project/magent-multi-ai-agents-manager"><img src="https://img.shields.io/pypi/dm/magent?color=blue" alt="PyPI downloads" /></a>
+  <a href="https://pypi.org/project/magent-multi-ai-agents-manager"><img src="https://img.shields.io/pypi/v/magent-multi-ai-agents-manager?color=3776AB&label=pypi" alt="PyPI version" /></a>
+  <a href="https://pypi.org/project/magent-multi-ai-agents-manager"><img src="https://img.shields.io/pypi/dm/magent-multi-ai-agents-manager?color=blue" alt="PyPI downloads" /></a>
   <a href="https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License: AGPL-3.0" /></a>
   <a href="https://www.python.org"><img src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10+" /></a>
   <img src="https://img.shields.io/badge/dependencies-click-success" alt="Minimal Dependencies" />

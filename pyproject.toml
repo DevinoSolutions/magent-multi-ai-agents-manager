@@ -80,7 +80,7 @@ magent-state-hook = "magent.state_hook:main"
 magent-attach-client = "magent.attach_client:main"
 
 [project.urls]
-Homepage = "https://magent.io"
+Homepage = "https://magent.now"
 Documentation = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager#readme"
 Repository = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager"
 Issues = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/issues"
