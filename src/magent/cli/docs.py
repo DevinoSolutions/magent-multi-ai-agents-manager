@@ -161,8 +161,7 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
         (
             "Seconds after which a `working` record stops counting as working. "
             "This is what keeps a session killed mid-turn from showing "
-            "'still going...' forever. Read by the attention daemon, `watch` "
-            "and `status`."
+            "'still going...' forever."
         ),
     ),
     (
