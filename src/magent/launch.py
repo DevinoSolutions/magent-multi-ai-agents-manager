@@ -5,7 +5,7 @@ import shutil
 import socket
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -36,8 +36,9 @@ from magent.titles import generate_titles, get_leaf_name, make_title, parse_titl
 
 if TYPE_CHECKING:
     import subprocess
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
+    from magent.accounts import AccountsSnapshot, SettingsReport
     from magent.config import MagentConfig, ProjectConfig
     from magent.env import MagentEnv
 
@@ -530,6 +531,316 @@ class UploadServerSupervisor:
         return True
 
 
+# --- Account routing ----------------------------------------------------------
+# One phase, between selecting the projects and launching them, because both
+# things a routed window needs -- the environment overlay and the config dir its
+# session probe must answer from -- have to exist BEFORE any window's command is
+# built. Like every other phase here it returns data and decides no exit code.
+#
+# Three properties are load-bearing, and all three point the same way: routing
+# can never be the reason a bring-up fails, is slow, or surprises anyone.
+#
+# * It is OFF unless three independent gates all say yes -- the config asked for
+#   it, ccswap is new enough (accounts.MIN_CCSWAP_VERSION), and ccswap's own
+#   required settings are in effect. With routing off not one byte of this
+#   module's behaviour changes: no ccswap process is spawned, no window carries
+#   an overlay, and every command is built exactly as it is today.
+# * Every refusal is NAMED and falls through to an unrouted launch. Five of
+#   them: ccswap too old, a required ccswap setting not in effect, a non-empty
+#   `duplicateAccountWarnings` (which means utilization readings may be
+#   attributed to the wrong account -- distrusting the SNAPSHOT, not an
+#   account), a snapshot error, and no eligible account at all.
+# * The whole phase is bounded by ONE budget. Expiring it launches the fleet
+#   unrouted rather than late: a bring-up must not wait on somebody else's
+#   credential tool.
+#
+# ...and one property that is about the OTHER tool rather than about magent:
+# this phase is READ-ONLY toward ccswap. It runs the four reads `accounts.py`
+# owns and no mutation -- not even `profile hydrate`, which exists and would
+# work. A bring-up is the worst possible moment to write into a store holding
+# the user's live credentials, and the alternative costs nothing that matters:
+# with `profiles.persistent` on, a one-time `ccswap profile hydrate --all`
+# keeps profiles hydrated, so an un-hydrated profile is a setup step the user
+# takes once. magent makes that account INELIGIBLE (ccswap's own
+# `profileHydrated` is the signal, `routing._blocker` the refusal), re-plans its
+# projects onto other eligible accounts, and prints the one command that fixes
+# it (`_hydration_hints`).
+#
+# Rationale for `CLAUDE_CONFIG_DIR` rather than a command prefix, and for the
+# pin living in the config while the ASSIGNMENT does not: DESIGN.md §2.
+
+# How long the whole phase gets -- the version probe, the settings reads and the
+# snapshot together. Generous for a handful of local CLI calls, finite because
+# the alternative is a fleet that does not come up while ccswap thinks.
+ROUTE_BUDGET_S = 20.0
+
+
+@dataclass(frozen=True)
+class RoutedProject:
+    """One project's account, and what that costs its window's environment."""
+
+    account: str
+    config_dir: Path
+    env: dict[str, str]
+    drop_env: frozenset[str]
+
+
+@dataclass(frozen=True)
+class RoutePlan:
+    """What the routing phase decided, keyed by psmux session id.
+
+    Empty is the ordinary answer: routing off, ccswap absent, a refusal, or a
+    budget that ran out. ``notes`` are the human lines the caller prints -- a
+    refusal that nobody can read is the silent failure this feature must not
+    have.
+    """
+
+    routes: dict[str, RoutedProject] = field(default_factory=dict)
+    notes: tuple[str, ...] = ()
+
+    def route(self, session: str) -> RoutedProject | None:
+        return self.routes.get(session)
+
+    def config_dirs(self) -> dict[str, Path]:
+        """``{session id: config dir}`` -- what a session probe must read.
+
+        The shape ``psmux.eligible_projects`` takes, so the ``up`` path asks
+        the same question the ``--go`` path does.
+        """
+        return {sid: r.config_dir for sid, r in self.routes.items()}
+
+
+def routing_session_id(proj: ProjectConfig) -> str:
+    """The psmux session id routing keys a project by.
+
+    The same string ``psmux.eligible_projects`` derives, so the map, the
+    overlay and every status surface agree on what a project is called without
+    a translation step anywhere.
+    """
+    return _psmux_session_name(proj.title or get_leaf_name(proj.path))
+
+
+def _remaining(deadline: float) -> float:
+    return deadline - time.monotonic()
+
+
+def _routing_refusals(
+    snapshot: AccountsSnapshot, settings: SettingsReport
+) -> list[str]:
+    """Every reason this snapshot must not be routed on, named.
+
+    ``duplicate_warnings`` is the one refusal that fires while ccswap reports
+    every account eligible, and it is the sharpest: a known ccswap bug can flip
+    which slot is reported active, so each utilization reading may belong to a
+    different account than the one it is printed against. Placing work by
+    numbers that belong to somebody else is worse than not placing it at all.
+
+    A setting that could not be READ is a refusal too, not a pass: "could not
+    ask" must never be treated as "the answer was yes" for a switch that would
+    otherwise fight every placement magent makes.
+    """
+    problems: list[str] = []
+    if settings.error:
+        problems.append(settings.error)
+    problems.extend(settings.problems)
+    if snapshot.duplicate_warnings:
+        problems.append(
+            "ccswap reports duplicate accounts, so a usage reading may belong "
+            "to a different account than it is shown against: "
+            + "; ".join(snapshot.duplicate_warnings)
+        )
+    return problems
+
+
+def _hydration_hints(snapshot: AccountsSnapshot) -> tuple[str, ...]:
+    """One line per account that only an un-hydrated profile keeps out of play.
+
+    magent is READ-ONLY toward ccswap -- it runs four reads and no mutation, so
+    it does not hydrate a profile itself. `profileHydrated: false` therefore
+    makes an account ineligible (``routing._blocker`` refuses it), its projects
+    are re-planned onto other eligible accounts, and the way back is a command
+    the USER runs. Which is why the hint exists at all: an account silently
+    sitting out is the same symptom as an account that does not exist, and the
+    repair is one line of ccswap the user has to be told.
+
+    Scoped to accounts ccswap otherwise calls usable, so a disabled or
+    api-key slot never grows a hint suggesting hydration would help it.
+    """
+    # heavy subsystem: in-body per policy (accounts spawns ccswap).
+    from magent.accounts import SUBSCRIPTION_KIND
+
+    return tuple(
+        f"account {acct.id} is not hydrated, so nothing was placed on it; "
+        f"run: ccswap profile hydrate {acct.id}"
+        for acct in snapshot.accounts
+        if acct.eligible and not acct.hydrated and acct.kind in ("", SUBSCRIPTION_KIND)
+    )
+
+
+def _unrouted(reason: str) -> RoutePlan:
+    """No routing, and the reason said out loud."""
+    get_logger("launch").info("account routing off: %s", reason)
+    return RoutePlan(notes=(f"account routing is off: {reason}",))
+
+
+def _route_projects(
+    config: MagentConfig,
+    projects: Sequence[ProjectConfig],
+    *,
+    now: float | None = None,
+) -> RoutePlan:
+    """Decide which account each project's pane starts on. Never raises.
+
+    The phase between ``_select_projects`` and ``_launch_projects``. Returns an
+    empty plan for every "no" -- routing disabled, ccswap missing or too old, a
+    refusal, a budget that expired, no account able to take the work -- and the
+    caller launches exactly as it does today.
+
+    Read-only toward ccswap: four reads, no mutation. An account whose profile
+    is not hydrated is one ccswap reports as unusable, so it is simply not
+    placed on, and the hint that fixes it is printed (``_hydration_hints``).
+    """
+    # heavy subsystem: in-body per policy (accounts spawns ccswap; env pulls
+    # pydantic in, and neither is paid for by an unrouted bring-up).
+    from magent import accounts, routing
+    from magent.env import ACCOUNT_OVERRIDE_VARS
+
+    policy = routing.policy_for(config.settings.accounts)
+    if not policy.enabled:
+        if not config.settings.accounts.enabled:
+            # Silent: off is the default, and a line saying so on every launch
+            # would be the loudest thing in the output for the least reason.
+            return RoutePlan()
+        # The config DID ask for routing, so the kill switch is holding it off
+        # and the user is about to get an unrouted fleet they did not choose.
+        # One shared sentence with `magent account` and `doctor`, because it
+        # names WHICH of the two gates is the cause.
+        reason = routing.routing_off_reason()
+        get_logger("launch").info("%s", reason)
+        return RoutePlan(notes=(reason,))
+
+    deadline = time.monotonic() + ROUTE_BUDGET_S
+    log = get_logger("launch")
+
+    version = accounts.read_version(timeout=_remaining(deadline))
+    if not accounts.version_at_least(version):
+        return _unrouted(
+            f"ccswap {version or 'is not installed'} is below the "
+            f"{accounts.MIN_CCSWAP_VERSION} magent needs to route safely"
+        )
+
+    snapshot = accounts.read_accounts(timeout=_remaining(deadline))
+    if snapshot.error:
+        return _unrouted(snapshot.error)
+    refusals = _routing_refusals(
+        snapshot, accounts.read_settings(timeout=_remaining(deadline))
+    )
+    if refusals:
+        return RoutePlan(notes=tuple(f"account routing is off: {r}" for r in refusals))
+    if not snapshot.accounts:
+        return _unrouted("ccswap reports no claude accounts")
+    if _remaining(deadline) <= 0:
+        return _unrouted(f"reading ccswap took longer than {ROUTE_BUDGET_S:.0f}s")
+
+    # Local CLI-agent projects only. A remote project's command runs on the far
+    # machine, where magent sets no environment at all, and an IDE window is not
+    # an agent pane -- neither can be routed, and pretending otherwise would put
+    # an account in a table for a window that never reads it.
+    # Same rules as `psmux.eligible_projects`, INCLUDING its first-occurrence-
+    # wins de-duplication by session id: two config entries that resolve to one
+    # session are one pane, and planning it twice would place one account in
+    # the map and start the pane on the other. Not delegated to that function
+    # because it probes each project's stored sessions to build a command, and
+    # WHICH store to probe is the answer this phase has not computed yet.
+    candidates: dict[str, ProjectConfig] = {}
+    for p in projects:
+        if (
+            not p.enabled
+            or p.host
+            or is_ide_tool(p.tool or config.settings.default_tool)
+        ):
+            continue
+        candidates.setdefault(routing_session_id(p), p)
+    if not candidates:
+        return RoutePlan()
+
+    prior_map = accounts.read_map()
+    planned = routing.plan(
+        [
+            routing.project_from_config(p, session=session)
+            for session, p in candidates.items()
+        ],
+        snapshot,
+        policy,
+        prior_map,
+        now=time.time() if now is None else now,
+    )
+    rows = planned.rows
+
+    by_id = snapshot.by_id()
+    if not any(r.account for r in rows):
+        return RoutePlan(
+            notes=(
+                *_hydration_hints(snapshot),
+                "account routing is off: no account can take these projects right now",
+            )
+        )
+
+    routes: dict[str, RoutedProject] = {}
+    notes: list[str] = list(_hydration_hints(snapshot))
+    new_map = dict(prior_map)
+    stamp = accounts.now_stamp()
+    for row in rows:
+        acct = by_id.get(row.account) if row.account else None
+        overlay = accounts.profile_env(acct) if acct else {}
+        if acct is None or not overlay:
+            new_map.pop(row.session, None)
+            continue
+        routes[row.session] = RoutedProject(
+            account=acct.id,
+            config_dir=Path(accounts.config_dir(acct)),
+            env=overlay,
+            drop_env=ACCOUNT_OVERRIDE_VARS,
+        )
+        new_map[row.session] = accounts.MapEntry(
+            account=acct.id,
+            klass=row.klass,
+            class_source=row.class_source,
+            assigned_at=stamp,
+            reason=row.reason,
+        )
+        if row.warning:
+            notes.append(f"{row.project}: {row.warning}")
+
+    # `planned.stale` rather than a second comparison of the same two numbers:
+    # "is this data too old" is the planner's decision, and two copies of it can
+    # disagree -- which would mean the table and the warning telling different
+    # stories about the same snapshot. Stale is a CAVEAT, never a refusal: a
+    # launch-time placement on ten-minute-old readings is exactly the use
+    # ccswap's cache is adequate for, and the thresholds carry the margin.
+    if planned.stale and planned.usage_age_s is not None:
+        notes.append(
+            f"ccswap usage data is {planned.usage_age_s / 60:.0f}m old; "
+            "routing on it anyway"
+        )
+    if not routes:
+        # Nothing placed. Whatever was already collected SAYS WHY (a hydrate
+        # that failed, a pin that named nothing), so the notes are kept rather
+        # than replaced by a generic line -- and the map is left exactly as it
+        # was, because a pass that placed nothing has decided nothing.
+        reason = "no account could take these projects"
+        log.info("account routing off: %s", reason)
+        return RoutePlan(notes=(*notes, f"account routing is off: {reason}"))
+
+    accounts.write_map(new_map)
+    log.info(
+        "account routing: %d project(s) placed across %d account(s)",
+        len(routes),
+        len({r.account for r in routes.values()}),
+    )
+    return RoutePlan(routes=routes, notes=tuple(notes))
+
+
 @dataclass
 class RunOpts:
     retile_all: bool = False
@@ -620,12 +931,20 @@ def run_magent(config: MagentConfig, opts: RunOpts) -> int:
     if projects is None:
         return 0
 
+    # Between selection and launch: both things a routed window needs -- its
+    # environment overlay and the config dir its session probe answers from --
+    # have to exist before any window's command is built. Empty (and silent)
+    # whenever routing is off, which is the default.
+    routes = _route_projects(config, projects)
+    for note in routes.notes:
+        click.echo(f"  {style('!', fg='yellow')} {style(note, dim=True)}")
+
     base_dir = config.base_dir
     if base_dir:
         base_dir = _expand_base_dir(base_dir)
 
     try:
-        result = _launch_projects(plat, config, opts, projects, base_dir)
+        result = _launch_projects(plat, config, opts, projects, base_dir, routes)
     except TerminalNotFoundError as exc:
         # The OS terminal emulator is missing (e.g. Windows Terminal not
         # installed). Surface the actionable install hint as one clean line --
@@ -763,10 +1082,14 @@ def _launch_projects(
     opts: RunOpts,
     projects: list[ProjectConfig],
     base_dir: str | None,
+    routes: RoutePlan | None = None,
 ) -> _LaunchResult:
     """The per-project dispatch loop: launch IDEs/terminals (or collect psmux
     windows), build the tiling target list. Pure w.r.t. tiling -- it never
-    moves a window."""
+    moves a window.
+
+    ``routes`` is the routing phase's answer. None (and an empty plan) mean
+    every window is unrouted, i.e. today's behaviour exactly."""
     has_remote = any(p.host for p in projects)
     if has_remote and not shutil.which("ssh"):
         click.echo(
@@ -824,6 +1147,7 @@ def _launch_projects(
             targets,
             psmux_windows,
             _psmux_colors,
+            None if routes is None else routes.route(routing_session_id(proj)),
         )
 
     return _LaunchResult(
@@ -890,13 +1214,25 @@ def _dispatch_cli_agent_project(
     targets: list[_Target],
     psmux_windows: list[PsmuxWindowOpts],
     psmux_colors: dict[str, str | None],
+    route: RoutedProject | None = None,
 ) -> int:
     """Generate this project's window titles, resolve resumable sessions, and
     launch (or collect into the caller-owned `psmux_windows`) each window;
     append its tiling target(s) to the caller-owned `targets` list. Returns
     the new_count delta (windows newly launched or newly collected, summed
-    across every window this project owns)."""
+    across every window this project owns).
+
+    ``route`` is this project's account, if the routing phase chose one. It
+    does two things and only two: it names the store the session probe reads
+    (``config_dir``), and it rides along as the window's environment overlay.
+    The COMMAND is never rewritten for it -- the account is environment, which
+    is exactly the property that makes it verifiable."""
     new_count = 0
+
+    # The store that answers for this project: its account's profile when it is
+    # routed, the tool's own default otherwise. None here is today's probe for
+    # every project, byte for byte.
+    config_dir = route.config_dir if route else None
 
     # windowTitlePrefix off: titles are bare project names, so the magent:
     # grammar can't resolve them. The launcher set the title itself, so it
@@ -919,7 +1255,7 @@ def _dispatch_cli_agent_project(
     session_ids: list[str | None] = [None] * window_count
     caps = AGENT_TOOLS.get(tool)
     if window_count > 1 and caps and caps.multi_window and agent_dir:
-        session_ids = _get_session_ids(tool, agent_dir, window_count)
+        session_ids = _get_session_ids(tool, agent_dir, window_count, config_dir)
 
     base_cmd = tools.get(tool)
     if not base_cmd:
@@ -959,7 +1295,9 @@ def _dispatch_cli_agent_project(
             cmd = (
                 build_resume_command(win_tool, win_base, None)
                 if window_count > 1
-                else build_start_command(win_tool, win_base, agent_dir)
+                else build_start_command(
+                    win_tool, win_base, agent_dir, config_dir=config_dir
+                )
             )
         elif window_count > 1 and session_ids[i] is not None:
             cmd = build_resume_command(win_tool, win_base, session_ids[i])
@@ -968,8 +1306,19 @@ def _dispatch_cli_agent_project(
         else:
             # Single window: the configured command runs verbatim, so this is
             # the one place a bare `claude --continue` reaches a project
-            # directory that may have no conversation to continue.
-            cmd = build_start_command(win_tool, win_base, agent_dir)
+            # directory that may have no conversation to continue -- or, for a
+            # routed project, one whose ACCOUNT has no conversation for it.
+            cmd = build_start_command(
+                win_tool, win_base, agent_dir, config_dir=config_dir
+            )
+
+        # A routed project whose command lost its implicit resume flag is one
+        # whose account holds no transcript for this directory: the agent will
+        # start FRESH. Visible rather than silent -- a user who wanted
+        # continuity can pin the project back to its old account. Unrouted rows
+        # are unchanged, because for them "no conversation here" is just a new
+        # project directory and has always been unremarkable.
+        fresh_start = route is not None and cmd != win_base
 
         if use_happy:
             cmd = _wrap_happy(win_tool, cmd)
@@ -1001,6 +1350,8 @@ def _dispatch_cli_agent_project(
                         window_name=tile_key,
                         cwd=resolved_dir,
                         command=cmd,
+                        env=route.env if route else None,
+                        drop_env=route.drop_env if route else frozenset(),
                     )
                 )
                 psmux_colors[tile_key] = proj.color
@@ -1029,6 +1380,8 @@ def _dispatch_cli_agent_project(
                         cwd=resolved_dir,
                         command=cmd,
                         color=proj.color,
+                        env=route.env if route else None,
+                        drop_env=route.drop_env if route else frozenset(),
                     )
                 )
             if not proj_psmux:
@@ -1039,7 +1392,14 @@ def _dispatch_cli_agent_project(
             _Target(name=tile_key, key=tile_key, mode=match_mode, is_new=not running)
         )
         _log_project(
-            win_title, win_tool, running, proj.host, happy=use_happy, psmux=proj_psmux
+            win_title,
+            win_tool,
+            running,
+            proj.host,
+            happy=use_happy,
+            psmux=proj_psmux,
+            account=route.account if route else None,
+            fresh=fresh_start,
         )
 
     return new_count
@@ -1212,7 +1572,17 @@ def _log_project(
     host: str | None,
     happy: bool = False,
     psmux: bool = False,
+    account: str | None = None,
+    fresh: bool = False,
 ) -> None:
+    """One launch-table row.
+
+    ``account``/``fresh`` are the routing annotations, and both default to the
+    unrouted answer so an unrouted row is byte-for-byte the row it has always
+    been. ``fresh`` is deliberately only ever set for a ROUTED window: it means
+    "this account holds no transcript for this project, so the agent starts a
+    new conversation", which is a thing the user may want to undo before it
+    happens. ASCII only, like every other badge here."""
     if running:
         icon = style("*", fg="green")
         label = style("open", dim=True)
@@ -1226,6 +1596,10 @@ def _log_project(
         extras += style(" [happy]", fg="magenta")
     if psmux:
         extras += style(" [psmux]", fg="yellow")
+    if account:
+        extras += style(f" [a{account}]", fg="cyan")
+    if fresh:
+        extras += style(" [fresh]", fg="yellow")
     click.echo(f"  {icon} {name:<30} {label}  {tool_badge}{extras}{loc}")
 
 

@@ -289,6 +289,123 @@ class TestInheritedMarkerScrub:
         assert "NO_COLOR" not in child
 
 
+class TestTheRoutedOverlay:
+    """`spawn_child_env(overlay, drop=...)` -- the account a pane runs as.
+
+    The account is ENVIRONMENT, not a command line: the agent command is typed
+    into the pane by `send-keys` and magent never sees its exit code, so a
+    per-account command prefix could never be verified, while `new-session`'s
+    environment is fixed exactly once and cannot be argued with.
+
+    Every assertion here has a second half: with no overlay and no drop the
+    answer must be byte-for-byte the one every unrouted pane has always got.
+    """
+
+    def test_no_overlay_is_byte_for_byte_todays_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SOME_PROJECT_VAR", "1")
+        assert env_module.spawn_child_env() == env_module.spawn_child_env(
+            None, drop=frozenset()
+        )
+
+    def test_the_overlay_reaches_the_child(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        child = env_module.spawn_child_env({"CLAUDE_CONFIG_DIR": "/profiles/13"})
+        assert child["CLAUDE_CONFIG_DIR"] == "/profiles/13"
+
+    def test_the_overlay_outranks_an_inherited_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A magent run from inside a routed pane inherits THAT pane's account.
+        # The overlay is applied last precisely so the project being launched
+        # decides its own account, never the shell that launched it.
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/profiles/inherited")
+        child = env_module.spawn_child_env({"CLAUDE_CONFIG_DIR": "/profiles/19"})
+        assert child["CLAUDE_CONFIG_DIR"] == "/profiles/19"
+
+    def test_the_overlay_changes_nothing_else(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("UNRELATED_VAR", "untouched")
+        plain = env_module.spawn_child_env()
+        routed = env_module.spawn_child_env({"CLAUDE_CONFIG_DIR": "/profiles/13"})
+        assert {k: v for k, v in routed.items() if k != "CLAUDE_CONFIG_DIR"} == {
+            k: v for k, v in plain.items() if k != "CLAUDE_CONFIG_DIR"
+        }
+
+    @pytest.mark.parametrize("key", sorted(env_module.ACCOUNT_OVERRIDE_VARS))
+    def test_a_credential_override_goes_only_on_the_routed_path(
+        self, monkeypatch: pytest.MonkeyPatch, key: str
+    ) -> None:
+        # The conditional strip, both halves in one test. An ambient
+        # ANTHROPIC_API_KEY silently outranks the account the overlay chose (and
+        # bills the API instead of the subscription); ANTHROPIC_BASE_URL
+        # disables tool deferral outright. But they are USER CONFIGURATION, so
+        # an unrouted spawn must keep them -- stripping them there would log
+        # somebody out for a feature they never enabled.
+        monkeypatch.setenv(key, "set-by-the-user")
+        assert env_module.spawn_child_env()[key] == "set-by-the-user"
+        routed = env_module.spawn_child_env(
+            {"CLAUDE_CONFIG_DIR": "/profiles/13"},
+            drop=env_module.ACCOUNT_OVERRIDE_VARS,
+        )
+        assert key not in routed
+
+    def test_the_drop_list_is_pinned_by_name(self) -> None:
+        # Restating it here is the point: a name added to the product list
+        # without a reason recorded in review fails this.
+        expected = frozenset(
+            {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"}
+        )
+        assert expected == env_module.ACCOUNT_OVERRIDE_VARS
+
+    def test_the_drop_list_is_not_part_of_the_unconditional_scrub(self) -> None:
+        assert not (
+            env_module.ACCOUNT_OVERRIDE_VARS & env_module.SCRUBBED_INHERITED_VARS
+        )
+
+    def test_a_dropped_name_is_matched_case_insensitively(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Windows environment names are case-insensitive; POSIX ones are not.
+        # Same rule as the nesting/presentation markers above.
+        monkeypatch.setenv("anthropic_api_key", "sk-lower")
+        routed = env_module.spawn_child_env(
+            {"CLAUDE_CONFIG_DIR": "/profiles/13"},
+            drop=env_module.ACCOUNT_OVERRIDE_VARS,
+        )
+        assert not [k for k in routed if k.lower() == "anthropic_api_key"]
+
+    def test_the_psmux_creation_seam_passes_both_through(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `new-session` is the one spawn that fixes a pane's environment, and it
+        # reaches the seam through psmux.child_env -- so the overlay has to
+        # survive that hop as well.
+        from magent import psmux
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-inherited")
+        monkeypatch.setenv("CLAUDE_CODE_CHILD_SESSION", "1")
+        child = psmux.child_env(
+            {"CLAUDE_CONFIG_DIR": "/profiles/13"},
+            drop=env_module.ACCOUNT_OVERRIDE_VARS,
+        )
+        assert child["CLAUDE_CONFIG_DIR"] == "/profiles/13"
+        assert "ANTHROPIC_API_KEY" not in child
+        # ...and the three unconditional families still go.
+        assert "CLAUDE_CODE_CHILD_SESSION" not in child
+
+    def test_an_unrouted_window_carries_no_overlay_at_all(self) -> None:
+        from magent.psmux import PsmuxWindowOpts
+
+        window = PsmuxWindowOpts(window_name="alpha", cwd="/tmp", command="claude")
+        assert window.env is None
+        assert window.drop_env == frozenset()
+
+
 def _clean_human_shell(monkeypatch: pytest.MonkeyPatch) -> None:
     """A human's shell: no agent-harness marker anywhere in the environment."""
     for key in list(os.environ):
@@ -570,6 +687,40 @@ class TestSession0Policy:
         monkeypatch.setenv("MAGENT_SESSION0_POLICY", "maybe")
         with pytest.raises(ValidationError):
             MagentEnv(_env_file=None)
+
+
+class TestAccountRoutingKillSwitch:
+    """MAGENT_ACCOUNT_ROUTING -- the fourth member of the same test-isolation
+    law as MAGENT_HOTKEY_SUPERVISOR / MAGENT_UPLOAD_SUPERVISOR /
+    MAGENT_PSMUX_BOOST, and it is in that family for the sharpest version of
+    psmux_boost's reason: routing is the one feature that shells out to a tool
+    holding the user's real account credentials (`ccswap`, resolved off PATH),
+    and no HOME redirect contains a binary on PATH."""
+
+    def test_it_is_on_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # On, because the feature is already off one level down:
+        # settings.accounts.enabled is false, so a config that never opts in
+        # never routes and this variable changes nothing for it.
+        _clear_magent_env(monkeypatch)
+        assert MagentEnv(_env_file=None).account_routing is True
+
+    @pytest.mark.parametrize("value", ["0", "false", "False"])
+    def test_the_opt_out_parses(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        _clear_magent_env(monkeypatch)
+        monkeypatch.setenv("MAGENT_ACCOUNT_ROUTING", value)
+        assert MagentEnv(_env_file=None).account_routing is False
+
+    def test_the_suite_pins_it_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # conftest's autouse fixture is what actually holds the line, and it is
+        # asserted through the env schema rather than by reading the file: a
+        # pin that stopped being applied must fail HERE, in the tier every
+        # other tier inherits. (The cache is cleared first because get_env's
+        # singleton may predate this test's environment.)
+        monkeypatch.setattr(env_module, "_cached_env", None)
+        assert os.environ["MAGENT_ACCOUNT_ROUTING"] == "0"
+        assert env_module.get_env().account_routing is False
 
 
 class TestIsSshLogin:

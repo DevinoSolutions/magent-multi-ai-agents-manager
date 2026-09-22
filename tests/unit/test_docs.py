@@ -148,11 +148,11 @@ class TestEveryRowNamesARealCommand:
 
 
 # Settings keys that are user-keyed MAPS: their members are named by the user
-# (a tool name), so each is documented as one row whose prose carries the inner
-# shape, and recursing would demand a row per member. A new open map belongs
-# here deliberately -- until it is added the pin fails naming its members,
-# which is the loud version of the same decision.
-_OPEN_MAPS = frozenset({"tools"})
+# (a tool name, a ccswap account id), so each is documented as one row whose
+# prose carries the inner shape, and recursing would demand a row per member.
+# A new open map belongs here deliberately -- until it is added the pin fails
+# naming its members, which is the loud version of the same decision.
+_OPEN_MAPS = frozenset({"tools", "accounts.perAccount"})
 
 
 def _emitted_settings_keys() -> list[str]:

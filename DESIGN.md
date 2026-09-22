@@ -296,6 +296,17 @@ laziness.
   the looping attach-and-return picker (`_run_sessions_picker`). Named
   `session_picker`, not `sessions`, to avoid confusion with the top-level
   `magent.sessions` package (recorded at extraction time).
+- **`account_cmd.py`** — the `account` group: the account table, `plan` (the
+  launch path's dry run), `pin`/`unpin` (the only writer, and it writes the
+  config through `config_io`'s raw-dict seam, never a running session) and
+  `refresh`. A shell over the `accounts` + `routing` leaves: it owns the tables,
+  the five refusals and the exit codes (0/2/3), and decides no placement of its
+  own. `policy_for` is its one outward-facing function — the single translation
+  of `settings.accounts` into the planner's `routing.Policy` (the planner takes
+  plain values on purpose, so somebody has to map the schema onto it, and that
+  somebody is whoever read the config) — and `doctor`'s `account-routing` check
+  reads through it too, so the table, the plan and the health check can never
+  disagree about whether routing is on.
 - **`status.py`** — `_render_status` (shared by the `status` command and the
   menu's `_menu_status`) plus the `down` command. Owns the daemon-health
   probes: `_health_check` (HTTP GET `/health` — proves the upload server is
@@ -1784,6 +1795,206 @@ supervised-pane and `--no-mux` `wt` spawns in `cli/attach.py`. Pins:
 `tests/unit/test_platform_contract.py::
 TestAttachClientKeepsNestingMarkersButNotALeakedNoColor`, and
 `tests/unit/test_attach.py::TestAttachPanesLoseOnlyALeakedColourOverride`.
+
+### The pin is config, the assignment is not, and both are read-only here (2026-09-21)
+
+`magent account` is four surfaces over the account router, and the shape of the
+command is an argument about where each kind of knowledge belongs.
+
+A **pin** — "this project always runs on account 13" — is user intent. It is
+typed by a human, it should be git-visible and hand-editable, and it must
+survive a magent that knows nothing about it, so it lives in the config as
+`projects[i].account` and is written through the round-tripping raw-dict seam
+(`cli/config_io._load_raw_config`/`_save_raw_config`), which preserves every key
+magent does not model. An **assignment** — "the planner put this project on 15
+because 13 was at 91%" — is machine state derived from a live reading. It lives
+in `~/.magent/account-map.json`. Keeping them apart is not tidiness: if a
+computed assignment were written back into the config, a later `--go` could not
+tell which entries it was allowed to move, and `load_config` would have become a
+writer, which is an audited defect this repo does not reintroduce. `magent
+account` shows them in one table and labels each row `pin` or `map` for the same
+reason.
+
+**`plan` is `--go`'s dry run, not a second opinion.** It builds the same
+snapshot, applies the same refusals and calls the same `routing.plan`. A preview
+that can disagree with the real thing is worse than no preview, so there is one
+function and no parallel implementation — the property `routing.py`'s purity
+exists to make checkable. The same reasoning is why `policy_for` ANDs
+`settings.accounts.enabled` with the `MAGENT_ACCOUNT_ROUTING` kill switch rather
+than leaving the variable to the launch path: a preview that ignored it would
+show routed rows for a fleet about to come up unrouted. Because there are two
+gates and they need different actions, `routing_off_reason()` names whichever
+one is actually holding routing off — pointing someone at a config key while an
+environment variable is the cause sends them to edit a correct file.
+
+**Five refusals, and every one of them still launches the fleet.** ccswap older
+than `MIN_CCSWAP_VERSION`, a required ccswap setting not in effect, a non-empty
+`duplicateAccountWarnings`, a snapshot error, or no eligible account. The first
+three invalidate the whole *snapshot* rather than any one account (duplicates
+most sharply: the same login present in more than one slot makes it ambiguous
+whose quota a reading describes, so placing work on those numbers places it by
+somebody else's — it is emphatically **not** about two different logins sharing
+an organization, which is an ordinary setup ccswap deliberately does not report,
+and wording that blurred the two would send people hunting a non-problem), so
+they are handed to the planner as an ERROR snapshot and every row comes back
+`unrouted-no-data` out of the closed vocabulary. No new reason code, no second
+code path, and routing can never be the reason a bring-up fails. Each refusal
+prints the exact `ccswap config set ...` that clears it and magent never runs
+it: the `wt-keys` posture, where the user's own configuration always wins and
+magent warns and skips.
+
+**Two measured facts drive the user-facing wording.** Switching the *active
+slot* (the ccswap TUI, `ccswap switch`, autoswitch) rewrites
+`~/.claude/.credentials.json` and logs out every session that is not routed —
+which is why `autoswitch.enabled true` is a refusal rather than a warning, and
+why the README says so beside the feature. And a mutating `ccswap` command typed
+*inside* a routed pane refuses, because the pane exports `CLAUDE_CONFIG_DIR`.
+That reads like a bug and is the safety property working: it is what stops a
+stray `ccswap switch` in one window moving the active login out from under sixty
+sessions. Both are documented as expected behaviour, not worked around.
+
+The settings half has a **third** state that is neither "right" nor "wrong", and
+it gets its own wording: a required setting this build never *asked* about.
+`accounts.read_settings` answers for the keys it knows, so a key added to the
+contract after a magent shipped is simply absent from the report — and absence
+there reads as "verified" when it means "not verified". `doctor` names those
+explicitly (`_WANTED_CCSWAP_SETTINGS`, today `profiles.persistent`,
+`autoswitch.enabled` and `autoswitch.warmupFiveHour`), because an unverified
+`warmupFiveHour` spends exactly the headroom the planner just budgeted, silently.
+It is carried on every verdict including the OK one, since a gap in what the
+check PROVED is not something to hide behind a louder finding.
+
+`doctor`'s `account-routing` check is WARN-at-worst on the `wt-keys` precedent —
+every condition it reports degrades to "launches unrouted", which is today's
+behaviour, so none of it may move an exit code CI and `magent status` read. It
+is skipped entirely while routing is off (the default), so it costs an ordinary
+machine no subprocess at all. What it does report on the OK path is the
+early-warning surface for the hazard this feature lives with: ccswap's
+store-to-profile write-back is skipped while a live session pid exists, and a
+resident routed fleet IS a permanently live pid on every account it uses, so a
+slot drifting toward `invalid_grant` shows up as `eligible: false` with ccswap's
+own reason before it costs a re-login.
+
+One test-isolation law came out of writing this and is now autouse in
+`tests/conftest.py`: **no test resolves the real `ccswap` binary**
+(`_no_real_ccswap`). It is in the same family as `MAGENT_PSMUX_BOOST=0` and for
+the sharpest version of that reason — ccswap owns the user's account
+credentials, the installed build's `list` performs a credential-adoption pass
+that writes to its store, and no HOME redirect contains a binary on PATH. It is
+not theoretical: one test here that simply forgot the fake spawned the real
+ccswap three times. The redirected home is what kept that harmless, which is
+luck rather than design.
+
+Deferred deliberately, with the vocabulary already in place: `magent account
+move` (it recreates a live session under a different `CLAUDE_CONFIG_DIR`, so it
+needs the launch path's per-window env overlay) and the status-left account
+brand.
+### The account is environment, not a command line (2026-09-21)
+
+A routed pane runs as a particular Claude account because it starts with
+`CLAUDE_CONFIG_DIR=<that account's ccswap profile>` and for no other reason. The
+obvious alternative was a command prefix (`ccswap run <n> claude …`), and it is
+ruled out by how a pane is started, not by taste: the agent command is **typed
+into the pane by `send-keys`**, so magent never sees its exit code and could
+never verify that the prefix took. `new-session`'s environment, by contrast, is
+fixed exactly once, by a call magent makes itself. (`ccswap run` also strips
+`ANTHROPIC_BASE_URL` and is mutually exclusive with other tooling, but the
+unverifiability is the reason that would have been enough on its own.) The same
+fact makes a "move this project to another account" a session **recreate** and
+never a mutation — there is no second moment at which a pane's environment can
+be set.
+
+So the overlay is **per window**, not per wave: `PsmuxWindowOpts.env` /
+`TerminalLaunchOpts.env` carry it, `psmux.child_env(overlay, drop=…)` passes it
+to `env.spawn_child_env`, and one bring-up places different projects on
+different accounts. Both fields default to empty, which is why an unrouted
+window's environment is byte-for-byte what it has always been.
+
+The credential drop (`env.ACCOUNT_OVERRIDE_VARS` —
+`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_BASE_URL`) is
+**conditional on routing**, and that asymmetry is the same one
+`attach_client_env` above is built on. An ambient `ANTHROPIC_API_KEY` silently
+outranks the account the overlay just chose and bills the API instead of the
+subscription whose headroom the planner budgeted; `ANTHROPIC_BASE_URL` disables
+tool deferral outright (measured: a hard 400 on 200k-context models). But those
+names are USER CONFIGURATION — `_AGENT_SESSION_VARS`' own comment is the
+precedent — so stripping them from an unrouted spawn would log somebody out of a
+feature they never enabled. The strip travels with the overlay and never alone.
+
+**Four independent gates, five named refusals, and routing can never be why a
+bring-up fails.** The phase is `launch._route_projects`, between
+`_select_projects` and `_launch_projects` because both things a routed window
+needs — the overlay and the config dir its session probe answers from — must
+exist before any command is built. It runs only when `settings.accounts.enabled`
+is true, `MAGENT_ACCOUNT_ROUTING` has not killed it, ccswap is at least
+`accounts.MIN_CCSWAP_VERSION`, and ccswap's own required settings are in effect;
+the five refusals above then apply unchanged, each launching the fleet unrouted.
+The whole phase sits under ONE budget (`ROUTE_BUDGET_S`); expiring it launches
+the fleet unrouted rather than late. `psmux.bring_up` (the `magent up`/attach
+path) calls the same function, so the two paths cannot drift.
+
+The two ENABLE gates are asked through `routing.policy_for` and named by
+`routing.routing_off_reason`, the same pair `magent account` and `doctor` use —
+the mapping lives in `routing.py` and not in either caller because a src module
+may not import the `cli` package (LS-A-001), and a second copy of "is routing
+on" is exactly how a dry run starts disagreeing with a launch. A bring-up whose
+CONFIG never asked for routing says nothing (off is the default, and a line
+about it on every launch would be the loudest thing in the output for the least
+reason); one whose config DID ask and was overruled by the kill switch prints
+that reason, because a fleet silently coming up unrouted looks identical to one
+that routed.
+
+`REQUIRED_SETTINGS` is three and each is read by its DOTTED name — a bare
+`warmupFiveHour` is not a key ccswap knows, and a reader spelling it that way
+would report the gate as unaskable forever rather than ever passing it. They are
+exactly ccswap's strict-boolean keys, so every answer is a real true/false.
+Both `autoswitch` keys are required off for the same reason in two flavours: a
+second process acting on the same accounts makes magent's placement a guess.
+`enabled` moves the active account underneath a running fleet; `warmupFiveHour`
+starts five-hour windows on cold accounts — including the ones just planned onto
+— so the utilization the plan was built from is being spent behind it. The
+warm-up ships off, so an untouched ccswap is never told to change it. Neither is
+flipped by magent: the refusal names the setting and the `ccswap config set` that
+fixes it, because the user's own configuration wins (the `wt-keys` posture).
+
+**magent stays READ-ONLY toward ccswap**, and this phase is where that was
+tested. The `CLAUDE_CONFIG_DIR` seam only launches a profile that holds a usable
+grant, so a bring-up that found an un-hydrated one had an obvious repair
+available: `ccswap profile hydrate`. It is not taken. ccswap's store holds the
+user's live credentials, its write-back is skipped while any session pid exists,
+and a bring-up — when a routed fleet is about to become a permanently live pid on
+every account — is the worst possible moment to write into it. The alternative
+costs nothing that matters: with `profiles.persistent` on, one `ccswap profile
+hydrate --all` keeps profiles hydrated, so this is a setup step the user takes
+once. So `profileHydrated: false` is honoured as the verdict it is —
+`routing._blocker` refuses the account, its projects are re-planned onto other
+eligible accounts (or launch unrouted), and `_hydration_hints` prints the one
+command that brings it back. An account silently sitting out looks exactly like
+an account that does not exist, which is why the hint is not optional even
+though the mutation is. The closed verb list is pinned twice: at the seam
+(`test_accounts.py::test_magent_never_runs_a_mutating_verb`) and at the phase
+(`test_launch_routing.py::TestTheBringUpNeverWritesIntoCcswap`).
+
+Two consequences are surfaced rather than hidden. A routed project with no
+transcript in its account's store starts a fresh conversation (the probe is
+config-dir-aware, so the command is correct for that store) and the launch table
+says `[fresh]` beside `[a<id>]`. And the *assignment* lives in
+`~/.magent/account-map.json`, never in the config: the pin is the user's intent
+and belongs in a file they hand-edit, while a guess derived from live
+utilization must not be indistinguishable from it — nor turn a config load into
+a write.
+
+The one assumption this design rests on is measured, not inferred: the psmux
+**server** is a grandchild the `new-session` client forks, and Windows does not
+inherit a priority class across that boundary (the reason `boost_priority` is a
+sweep). `tests/e2e/test_fleet_real.py::
+TestTheAccountCrossesThePsmuxServerBoundary` proves the ENVIRONMENT does: the
+stand-in agent records its own `CLAUDE_CONFIG_DIR` into the JSON log the tier
+already treats as ground truth, on all three OSes, plus a Windows leg driving
+the real `launch_psmux_session`. If it had come back empty the fallback was
+`new-session -e VAR=value` (tmux ≥3.2) at the same call site. Unit pins:
+`tests/unit/test_launch_routing.py`, `tests/unit/test_env_schema.py::
+TestTheRoutedOverlay`.
 
 ## 3. Known debt
 
