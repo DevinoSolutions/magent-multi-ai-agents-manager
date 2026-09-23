@@ -1249,6 +1249,50 @@ class TestHotkeyCmdSshHost:
         assert seen == [("http://h:8033", None)]
 
 
+class TestHotkeyCmdServerDefault:
+    """A bare `magent hotkey` posts to the config's `uploadPort`, not a
+    literal 8033 -- the port every other surface (serve, status, doctor)
+    watches. Same defect class as serve's old `--port` default."""
+
+    def _patch(self, monkeypatch):
+        return TestHotkeyCmdSshHost()._patch(monkeypatch)
+
+    @staticmethod
+    def _config(path, port):
+        path.write_text(
+            json.dumps(
+                {"version": 3, "projects": [], "settings": {"uploadPort": port}}
+            ),
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def test_default_server_uses_the_configs_upload_port(
+        self, runner, monkeypatch, tmp_path
+    ):
+        seen = self._patch(monkeypatch)
+        cfg = self._config(tmp_path / "magent.config.json", 9123)
+        result = runner.invoke(cli.main, ["--config", cfg, "hotkey"])
+        assert result.exit_code == 0, result.output
+        assert seen == [("http://localhost:9123", None)]
+
+    def test_explicit_server_still_wins(self, runner, monkeypatch, tmp_path):
+        seen = self._patch(monkeypatch)
+        cfg = self._config(tmp_path / "magent.config.json", 9123)
+        result = runner.invoke(
+            cli.main, ["--config", cfg, "hotkey", "-s", "http://h:7000"]
+        )
+        assert result.exit_code == 0, result.output
+        assert seen == [("http://h:7000", None)]
+
+    def test_no_config_falls_back_to_8033(self, runner, monkeypatch, tmp_path):
+        seen = self._patch(monkeypatch)
+        missing = str(tmp_path / "nope.json")
+        result = runner.invoke(cli.main, ["--config", missing, "hotkey"])
+        assert result.exit_code == 0, result.output
+        assert seen == [("http://localhost:8033", None)]
+
+
 class TestMaybeStartHotkeySshHost:
     """The spawned listener's argv carries --ssh-host only when there is one."""
 

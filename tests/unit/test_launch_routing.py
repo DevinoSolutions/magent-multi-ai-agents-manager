@@ -447,6 +447,29 @@ class TestTheOverlayReachesTheWindow:
         # snapshot it just decided not to trust.
         assert accounts.read_map()["proj0"].account == "99"
 
+    def test_the_go_checklist_routes_only_the_checked_projects(
+        self, tmp_path, monkeypatch, ccswap, fake_sleep
+    ):
+        # `--go`'s checklist narrows in `_select_projects`, BEFORE this phase,
+        # so routing plans (and balances) only the projects about to launch.
+        # An unchecked project's earlier placement is not this launch's to
+        # decide: it stays in the map exactly as it was, and one never placed
+        # gains no entry.
+        accounts.write_map({"proj0": accounts.MapEntry(account="99")})
+        cfg = _cfg(tmp_path, 3)
+        _enable_routing(cfg)
+        fp = FakePlatform(supports_psmux=True)
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+
+        assert run_magent(cfg, RunOpts(only=frozenset({"proj1"}))) == 0
+
+        assert [w.window_name for w in fp.launched_psmux] == ["proj1"]
+        assert fp.launched_psmux[0].env
+        placed = accounts.read_map()
+        assert placed["proj1"].account == "13"
+        assert placed["proj0"].account == "99"
+        assert "proj2" not in placed
+
 
 class TestTheBringUpNeverWritesIntoCcswap:
     """magent is read-only toward the tool holding the user's credentials.

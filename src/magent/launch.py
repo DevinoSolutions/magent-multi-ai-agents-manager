@@ -853,6 +853,10 @@ class RunOpts:
     # `retile_all` it is dropped from the tiling set entirely (see
     # `_retile_targets`) rather than waited on and reported "not found".
     tile_only: bool = False
+    # The project names the user checked in `cli/checklist.py`, or None for
+    # "every enabled project" -- which is what a skipped checklist (no terminal,
+    # or `--all`) means, and what this phase has always done.
+    only: frozenset[str] | None = None
 
 
 @dataclass
@@ -992,9 +996,14 @@ def _prepare_grid(
 
 
 def _select_projects(config: MagentConfig, opts: RunOpts) -> list[ProjectConfig] | None:
-    """Enabled projects, optionally narrowed to opts.group. Returns None
-    (caller exits 0) when a named group matches nothing (after printing the
-    same 'No projects in group' message it does today)."""
+    """Enabled projects, optionally narrowed to opts.group and then to the
+    names in opts.only. Returns None (caller exits 0) when a named group matches
+    nothing (after printing the same 'No projects in group' message it does
+    today), or when the checked set matches no project at all.
+
+    Group first, then the checklist: the checklist was shown over the group's
+    projects, so narrowing the other way round could only ever widen it back.
+    """
     projects = [p for p in config.projects if p.enabled]
     if opts.group:
         projects = [
@@ -1008,6 +1017,12 @@ def _select_projects(config: MagentConfig, opts: RunOpts) -> list[ProjectConfig]
             )
             return None
         click.echo(f"Group '{opts.group}': {len(projects)} project(s)")
+    if opts.only is not None:
+        projects = [
+            p for p in projects if (p.title or get_leaf_name(p.path)) in opts.only
+        ]
+        if not projects:
+            return None
     return projects
 
 

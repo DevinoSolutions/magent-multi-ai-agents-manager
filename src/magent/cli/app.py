@@ -11,6 +11,7 @@ from pathlib import Path
 
 import click
 
+from magent.cli.checklist import ABORT_MESSAGE, choose_projects
 from magent.cli.config_io import _load_config_or_exit
 from magent.cli.ui import _open_in_editor
 from magent.init_config import write_config
@@ -21,6 +22,13 @@ from magent.paths import find_config
 @click.option("--go", is_flag=True, help="Skip interactive menu, launch + tile")
 @click.option("--retile-all", is_flag=True, help="Re-tile every matching window")
 @click.option("--dry-run", is_flag=True, hidden=True)
+@click.option(
+    "-a",
+    "--all",
+    "launch_all",
+    is_flag=True,
+    help="Launch every enabled project -- skip the project checklist",
+)
 @click.option("-g", "--group", default=None, help="Launch only projects in this group")
 @click.option("--init", "do_init", is_flag=True, help="Re-scan and regenerate config")
 @click.option(
@@ -64,6 +72,7 @@ def main(
     go: bool,
     retile_all: bool,
     dry_run: bool,
+    launch_all: bool,
     group: str | None,
     do_init: bool,
     base_dir: str | None,
@@ -201,6 +210,18 @@ def main(
             group = group_choice if isinstance(group_choice, str) else None
             break
 
+    # Which projects to launch. Off a terminal, or with `--all`, there is no
+    # prompt and no narrowing -- `--go` in a script stays byte-for-byte what it
+    # was. A pure re-tile launches nothing, so it is never asked either.
+    tile_only = retile_all and not go
+    only: frozenset[str] | None = None
+    if not launch_all and not tile_only:
+        choice = choose_projects(cfg, group=group)
+        if choice.aborted:
+            click.echo(ABORT_MESSAGE)
+            return
+        only = choice.only
+
     from magent.launch import (  # heavy subsystem: in-body per policy
         RunOpts,
         run_magent,
@@ -220,10 +241,11 @@ def main(
         cfg,
         RunOpts(
             retile_all=retile_all or go,
-            tile_only=retile_all and not go,
+            tile_only=tile_only,
             dry_run=dry_run,
             group=group,
             config_path=str(config_file),
+            only=only,
         ),
     )
     if rc:
