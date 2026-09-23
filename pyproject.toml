@@ -95,7 +95,7 @@ Changelog = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/b
 # Cap the backend so artifacts stay Metadata-Version 2.4 end-to-end; lift the
 # cap once a Dependabot bump of pypa/gh-action-pypi-publish ships packaging
 # >= 26.3 in its runtime.txt.
-requires = ["hatchling<1.32"]
+requires = ["hatchling<1.33"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
