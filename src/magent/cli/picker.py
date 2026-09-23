@@ -339,11 +339,15 @@ def _stdin_is_console() -> bool:
 
 
 def raw_mode_available() -> bool:
-    """True when a real terminal is on stdin AND this OS's raw-read module
-    exists. Everything else -- pipes, NUL, ``CliRunner``, cron -- keeps the
-    line-based prompt it has always had."""
+    """True when a real terminal is on stdin AND on stdout AND this OS's
+    raw-read module exists. Everything else -- pipes, NUL, ``CliRunner``,
+    cron, ``magent --go > log.txt`` -- keeps the line-based prompt it has
+    always had. stdout matters as much as stdin: with it captured, the list
+    paints into a pipe nobody reads while the loop waits on a console key
+    (measured: a pytest parent that owned a console hung every child
+    ``--go --dry-run`` it captured)."""
     try:
-        if not sys.stdin.isatty():
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
             return False
     except (OSError, ValueError):
         return False
