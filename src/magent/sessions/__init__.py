@@ -18,18 +18,24 @@ from magent.sessions.codex import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
 
 @dataclass(frozen=True)
 class AgentTool:
     """Per-tool capabilities of a CLI agent (claude, codex, ...)."""
 
-    session_ids: Callable[[str, int], list[str | None]] | None = None
+    # (project_dir, count, config_dir) -> that directory's resumable session
+    # ids, newest first. `config_dir` names WHICH STORE answers for the project
+    # (claude's CLAUDE_CONFIG_DIR); None means the tool's default store, which
+    # is what every unrouted project passes. A tool whose store is not
+    # account-scoped accepts and ignores it -- see `sessions/codex.py`.
+    session_ids: Callable[[str, int, Path | None], list[str | None]] | None = None
     resume_command: Callable[[str, str | None], str] | None = None
-    # (base_cmd, project_dir) -> the command to run when that directory has NO
-    # prior session for this tool to resume, or None to run base_cmd unchanged.
-    # See `build_start_command`.
-    fresh_command: Callable[[str, str], str | None] | None = None
+    # (base_cmd, project_dir, config_dir) -> the command to run when that
+    # directory has NO prior session for this tool to resume in that store, or
+    # None to run base_cmd unchanged. See `build_start_command`.
+    fresh_command: Callable[[str, str, Path | None], str | None] | None = None
     happy: bool = False  # can be wrapped with `happy` for mobile access
 
     @property
@@ -60,7 +66,13 @@ def build_resume_command(tool: str, base_cmd: str, session_id: str | None) -> st
     return base_cmd
 
 
-def build_start_command(tool: str, base_cmd: str, project_dir: str | None) -> str:
+def build_start_command(
+    tool: str,
+    base_cmd: str,
+    project_dir: str | None,
+    *,
+    config_dir: Path | None = None,
+) -> str:
     """``base_cmd``, with its implicit "resume the latest conversation" flag
     dropped when ``project_dir`` has nothing to resume.
 
@@ -84,13 +96,20 @@ def build_start_command(tool: str, base_cmd: str, project_dir: str | None) -> st
     ``project_dir`` must be a directory on the machine that will RUN the
     command: pass None for a remote project rather than deciding it from this
     machine's session store.
+
+    ``config_dir`` names WHICH of that tool's stores the probe must answer
+    from -- the config directory the pane will run under. None is the tool's
+    default store and reads exactly the files it always read; a routed pane
+    passes its account's profile, because that is the store its transcripts
+    will land in. Keyword-only: this is a property of the environment the
+    command runs in, never a fourth thing to confuse with the command itself.
     """
     caps = AGENT_TOOLS.get(tool)
     if not base_cmd or not project_dir or not caps or not caps.fresh_command:
         return base_cmd
     log = get_logger("launch")
     try:
-        fresh = caps.fresh_command(base_cmd, project_dir)
+        fresh = caps.fresh_command(base_cmd, project_dir, config_dir)
     except OSError:
         # A probe that cannot read the session store proves nothing about
         # whether a session exists. Keep the configured command and say so.
@@ -202,15 +221,42 @@ def build_code_open_command(
 FLASH_MSG_MAX = 120
 
 
-def build_flash_url(server_url: str, project: str, message: str) -> str:
+# What a flash asks the status bar to LOOK like. Two values only: this is a
+# one-line bar saying whether the thing you pressed worked, not a palette.
+# It travels with EVERY message rather than only with failures, because psmux's
+# ``message-style`` is a global option on that socket -- set it once for a red
+# failure and every later message inherits red until something sets it back. A
+# green "cannot reach magent serve" is worse than no colour at all.
+FLASH_TINT_OK = "ok"
+FLASH_TINT_ERR = "err"
+
+
+def build_flash_url(
+    server_url: str,
+    project: str,
+    message: str,
+    duration_ms: int | None = None,
+    tint: str | None = None,
+) -> str:
     """URL that flashes ``message`` in the ``magent:<project>`` status line.
 
-    The F2 handler's only channel for on-screen feedback: hotkey.py runs in a
-    hidden background process with no terminal, so a failure it cannot report
-    through the upload server is invisible to the user. Pure string math, so
-    the shape stays testable on every OS (hotkey.py is win32-import-only).
+    The Alt+V/F2 handler's only channel for on-screen feedback: hotkey.py runs
+    in a hidden background process with no terminal, so a failure it cannot
+    report through the upload server is invisible to the user. Pure string math,
+    so the shape stays testable on every OS (hotkey.py is win32-import-only).
+
+    ``duration_ms`` is for a message that is a PHASE rather than a result: an
+    "uploading..." that expires while the upload is still running leaves a blank
+    bar, which reads exactly like the silence this whole channel exists to end.
+    Omitted, the server picks its own default. ``tint`` is FLASH_TINT_OK /
+    FLASH_TINT_ERR -- see their note on why it rides along on every message.
     """
-    return (
+    url = (
         f"{server_url.rstrip('/')}/api/flash"
         f"?project={quote(project)}&msg={quote(message[:FLASH_MSG_MAX])}"
     )
+    if duration_ms:
+        url = f"{url}&ms={int(duration_ms)}"
+    if tint:
+        url = f"{url}&tint={quote(tint)}"
+    return url

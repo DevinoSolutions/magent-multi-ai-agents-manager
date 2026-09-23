@@ -198,6 +198,9 @@ def captured_run_opts(monkeypatch):
         (["--retile-all"], True),
         # Combined with --go the launch phase is explicitly asked for.
         (["--go", "--retile-all"], False),
+        # A bare --go tiles EVERYTHING after launching: tiling only the new
+        # windows slotted them from index 0 with the rest of the fleet
+        # ignored, so a top-up --go needed a manual retile afterwards.
         (["--go"], False),
     ],
     ids=["retile-all", "go-retile-all", "go"],
@@ -210,7 +213,9 @@ def test_tile_only_wiring(runner, tmp_config, captured_run_opts, flags, tile_onl
     assert result.exit_code == 0
     assert len(captured_run_opts) == 1
     assert captured_run_opts[0].tile_only is tile_only
-    assert captured_run_opts[0].retile_all is ("--retile-all" in flags)
+    # Every launch-or-retile gesture now carries retile_all: --retile-all by
+    # definition, --go because it launches and then tiles the whole fleet.
+    assert captured_run_opts[0].retile_all is True
 
 
 def test_up_json(runner, tmp_config, monkeypatch):

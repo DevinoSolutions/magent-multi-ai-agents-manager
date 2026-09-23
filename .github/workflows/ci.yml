@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
       # Pinned CLI instead of gitleaks-action: the action hard-requires a
@@ -44,8 +44,8 @@ jobs:
         python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[dev]"
@@ -57,8 +57,8 @@ jobs:
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v5.4.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v5.4.2
         with:
           enable-cache: true
       - run: uv lock --check
@@ -74,8 +74,8 @@ jobs:
         os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
@@ -93,24 +93,12 @@ jobs:
           MDTEST_WT_COLD: "1"
         run: pytest tests/platform/test_wt_cold_start.py -v -m wt_cold
       # Pinned psmux so the real psmux tier (lifecycle + full attach chain)
-      # actually runs instead of skipping on the binary check. Release zip
-      # pinned by version + sha256 (gitleaks pattern) rather than choco: the
-      # community feed 504s often enough to fail unrelated runs. Installed to
+      # actually runs instead of skipping on the binary check. Installed to
       # %LOCALAPPDATA%\psmux (the product's own find_psmux() fallback dir) and
-      # added to PATH like a normal user install.
+      # added to PATH like a normal user install. The version + sha256 pin lives
+      # in the action, which the end-to-end Windows leg shares.
       - name: Install psmux (pinned)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $url = "https://github.com/psmux/psmux/releases/download/v3.3.6/psmux-v3.3.6-windows-x64.zip"
-          $sha = "a56a890ea0829567818b9a368f16dcbd39c087f27328573df17c10dd39618947"
-          Invoke-WebRequest -Uri $url -OutFile psmux.zip
-          $actual = (Get-FileHash psmux.zip -Algorithm SHA256).Hash.ToLower()
-          if ($actual -ne $sha) { throw "psmux.zip sha256 mismatch: $actual" }
-          $dest = Join-Path $env:LOCALAPPDATA "psmux"
-          Expand-Archive psmux.zip -DestinationPath $dest -Force
-          Add-Content $env:GITHUB_PATH $dest
-          & (Join-Path $dest "psmux.exe") -V
+        uses: ./.github/actions/install-psmux
       - run: pytest tests/platform/ -v -m platform
       # Real-input tier: global SendInput chord + machine clipboard. CI-only
       # by design (MDTEST_INTERACTION=1 is set nowhere else); a dev box run
@@ -130,8 +118,8 @@ jobs:
         os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
@@ -140,6 +128,22 @@ jobs:
       # xterm hosts the Linux real-SSH remote-launch leg (test_ssh_real.py)
       - name: Install terminal emulators
         uses: ./.github/actions/install-terminals
+      # A REAL multiplexer for the fleet tier (tests/e2e/test_fleet_real.py):
+      # real psmux on Windows, real tmux shimmed in as psmux on POSIX. These
+      # steps are what make that tier's "missing multiplexer FAILS on CI" rule
+      # honest -- it must never be silently skippable here.
+      - name: Install psmux (pinned)
+        uses: ./.github/actions/install-psmux
+      - name: Ensure tmux (the POSIX psmux stand-in)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Ensure tmux (the POSIX psmux stand-in)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        # `brew install` on an already-present formula can exit non-zero, and
+        # the runner image may well ship tmux -- ask before installing.
+        run: brew list tmux || brew install tmux
       - name: Run e2e tests
         # needs_tailscale is excluded here exactly like needs_ssh: it runs only
         # in the dedicated `tailnet` job, which joins a live Tailscale node.
@@ -164,8 +168,8 @@ jobs:
         os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
       # pytest orchestrates the tier (build wheel -> pristine venv -> real entry
@@ -190,8 +194,8 @@ jobs:
     timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev,browser]"
@@ -216,8 +220,8 @@ jobs:
     timeout-minutes: 30
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
@@ -261,8 +265,8 @@ jobs:
     timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"

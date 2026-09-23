@@ -4,6 +4,13 @@ callback reaches both via an in-body import (cycle-break, E6.md S2.1), and
 _show_menu reaches the config editor the same way: this module imports
 config_editor at its own top level (menu -> config_editor -> app, no back
 edge -- config_editor never imports menu).
+
+Row selection is NOT this module's own: both lists here (the menu itself and
+its group submenu) go through `cli/picker.py`, the same component the session
+switcher uses, so "type a name and the list narrows" cannot mean two different
+things in two places. On a real terminal the picker reads raw keys; off one
+(`CliRunner`, a pipe, a script) each list falls back to the exact
+`click.prompt` it has always used -- see `tests/unit/test_menu.py`.
 """
 
 from __future__ import annotations
@@ -13,63 +20,151 @@ from pathlib import Path
 
 import click
 
+from magent.cli import picker
 from magent.cli.config_editor import _config_menu
 from magent.cli.ui import _banner, _divider, _menu_item, _open_in_editor
 from magent.paths import _config_path
 from magent.style import style
 
+# Single-key answers the menu owns. Typing one of these is a COMMAND, never a
+# search: `q` stays Quit on a fleet that also has a project called
+# `queue-worker`. Row numbers need no entry here -- an all-digit query is a row
+# address by construction.
+_MENU_COMMANDS = frozenset("usatdeq")
+
+_MENU_PROMPT_DEFAULT = "1"
+
+
+def _menu_header() -> None:
+    _banner()
+    _divider()
+    click.echo()
+
+
+def _menu_rows(groups: list[str]) -> list[picker.PickerItem]:
+    """The menu's rows, in display order. `extra` (not the label) carries the
+    dim trailing text, so an unhighlighted row renders through `ui._menu_item`
+    byte-for-byte as it always has."""
+    rows = [
+        picker.PickerItem(
+            "1", "Launch & tile new windows", extra=style("  (default)", dim=True)
+        ),
+        picker.PickerItem("2", "Re-tile all open windows"),
+    ]
+    if groups:
+        rows.append(
+            picker.PickerItem(
+                "3",
+                "Launch a group",
+                extra=style(f"  {' | '.join(groups)}", dim=True),
+                # Typing a group name finds this row: the ranked text is the
+                # label PLUS the group names the dim tail is showing.
+                haystack="Launch a group " + " ".join(groups),
+            )
+        )
+    rows += [
+        picker.PickerItem(
+            "u",
+            "Bring up sessions in background",
+            extra=style("  (no windows)", dim=True),
+            gap_before=True,
+        ),
+        picker.PickerItem(
+            "s",
+            "Open session switcher",
+            extra=style("  (one window, switch inside)", dim=True),
+        ),
+        picker.PickerItem(
+            "a",
+            "Attach to a remote host",
+            extra=style("  (SSH to another PC)", dim=True),
+        ),
+        picker.PickerItem(
+            "t",
+            "Status",
+            extra=style("  (what's running)", dim=True),
+            gap_before=True,
+        ),
+        picker.PickerItem("d", "Shut down sessions", key_fg="yellow"),
+        picker.PickerItem("e", "Edit config", key_fg="yellow", gap_before=True),
+        picker.PickerItem("q", "Quit", key_fg="red"),
+    ]
+    return rows
+
+
+def _read_menu_choice(rows: list[picker.PickerItem]) -> str:
+    """Paint the menu and return the answer, lowercased -- a row key when the
+    user picked a highlighted row, otherwise whatever they typed."""
+    if picker.raw_mode_available():
+        result = picker.pick(
+            rows,
+            _menu_header,
+            commands=_MENU_COMMANDS,
+            prompt=f"  {style('>', fg='cyan', bold=True)} ",
+        )
+        # Esc at the top level means "I'm done here", which is Quit.
+        if result.kind == picker.CANCEL:
+            return "q"
+        return result.value.strip().lower()
+    picker.show(rows, _menu_header)
+    return (
+        click.prompt(
+            f"  {style('>', fg='cyan', bold=True)}",
+            default=_MENU_PROMPT_DEFAULT,
+            show_default=False,
+            prompt_suffix=" ",
+        )
+        .strip()
+        .lower()
+    )
+
+
+def _group_header() -> None:
+    _banner()
+    click.echo(f"  {style('Launch a group', bold=True)}")
+    _divider()
+    click.echo()
+
+
+def _pick_group(groups: list[str]) -> str | None:
+    """The group submenu. Returns the chosen group, or None to fall back to the
+    main menu (having reported an invalid pick, but saying nothing about a
+    deliberate escape)."""
+    rows = [picker.PickerItem(str(i), g) for i, g in enumerate(groups, 1)]
+    if picker.raw_mode_available():
+        result = picker.pick(
+            rows,
+            _group_header,
+            prompt=f"  {style('group', fg='cyan')} ",
+        )
+        if result.kind == picker.CANCEL:
+            return None
+        typed = result.value.strip()
+    else:
+        click.echo()
+        for row in rows:
+            _menu_item(row.key, row.label)
+        click.echo()
+        typed = click.prompt(
+            f"  {style('group', fg='cyan')}",
+            default="1",
+            show_default=False,
+            prompt_suffix=" ",
+        ).strip()
+    try:
+        idx = int(typed) - 1
+    except ValueError:
+        idx = -1
+    if 0 <= idx < len(groups):
+        return groups[idx]
+    click.echo(f"\n  {style('x', fg='red')} Invalid choice.\n")
+    return None
+
 
 def _show_menu(groups: list[str], config_file: Path | None = None) -> dict[str, object]:
     config_changed = False
     while True:
-        click.clear()
-        _banner()
-        _divider()
-        click.echo()
-        _menu_item(
-            "1", "Launch & tile new windows", extra=style("  (default)", dim=True)
-        )
-        _menu_item("2", "Re-tile all open windows")
-        if groups:
-            group_list = style(f"  {' | '.join(groups)}", dim=True)
-            _menu_item("3", "Launch a group" + group_list)
-        click.echo()
-        _menu_item(
-            "u",
-            "Bring up sessions in background",
-            key_fg="cyan",
-            extra=style("  (no windows)", dim=True),
-        )
-        _menu_item(
-            "s",
-            "Open session switcher",
-            key_fg="cyan",
-            extra=style("  (one window, switch inside)", dim=True),
-        )
-        _menu_item(
-            "a",
-            "Attach to a remote host",
-            key_fg="cyan",
-            extra=style("  (SSH to another PC)", dim=True),
-        )
-        click.echo()
-        _menu_item("t", "Status", extra=style("  (what's running)", dim=True))
-        _menu_item("d", "Shut down sessions", key_fg="yellow")
-        click.echo()
-        _menu_item("e", "Edit config", key_fg="yellow")
-        _menu_item("q", "Quit", key_fg="red")
-        click.echo()
-
-        choice = (
-            click.prompt(
-                f"  {style('>', fg='cyan', bold=True)}",
-                default="1",
-                show_default=False,
-                prompt_suffix=" ",
-            )
-            .strip()
-            .lower()
-        )
+        choice = _read_menu_choice(_menu_rows(groups))
 
         if choice == "1":
             return {
@@ -96,28 +191,14 @@ def _show_menu(groups: list[str], config_file: Path | None = None) -> dict[str, 
         if choice == "d":
             return {"action": "down", "reload": config_changed}
         if choice == "3" and groups:
-            click.echo()
-            for i, g in enumerate(groups, 1):
-                _menu_item(str(i), g)
-            click.echo()
-            idx_str = click.prompt(
-                f"  {style('group', fg='cyan')}",
-                default="1",
-                show_default=False,
-                prompt_suffix=" ",
-            ).strip()
-            try:
-                idx = int(idx_str) - 1
-                if 0 <= idx < len(groups):
-                    return {
-                        "action": "run",
-                        "retile_all": False,
-                        "group": groups[idx],
-                        "reload": config_changed,
-                    }
-            except ValueError:
-                pass
-            click.echo(f"\n  {style('x', fg='red')} Invalid choice.\n")
+            picked = _pick_group(groups)
+            if picked is not None:
+                return {
+                    "action": "run",
+                    "retile_all": False,
+                    "group": picked,
+                    "reload": config_changed,
+                }
         elif choice == "e":
             if config_file and config_file.exists():
                 _config_menu(config_file)

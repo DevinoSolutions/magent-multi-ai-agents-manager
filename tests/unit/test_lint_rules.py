@@ -1,4 +1,4 @@
-"""Unit tests for scripts/lint_rules.py — the MD001-MD005 custom lint layer.
+"""Unit tests for scripts/lint_rules.py — the MD001-MD006 custom lint layer.
 
 Each rule is proven with a violating snippet (fires) and a conforming snippet
 (silent), plus scope checks (which path prefixes each rule applies to). The
@@ -193,3 +193,47 @@ def test_md005_allows_leaf_and_sibling_cli_imports_at_toplevel():
 def test_md005_does_not_apply_outside_cli():
     # A subsystem importing another subsystem at top level is allowed (upload_server does).
     assert _codes("src/magent/upload_server.py", "from magent.launch import x\n") == []
+
+
+# ---- MD006: every `wt` argv must lock the title ------------------------------
+
+_WT_BARE = 'subprocess.Popen(["wt", "-w", "new", "--title", t, "--", "cmd"])\n'
+_WT_LOCKED = (
+    'subprocess.Popen(["wt", "-w", "new", "--title", t,'
+    ' "--suppressApplicationTitle", "--", "cmd"])\n'
+)
+
+
+def test_md006_flags_a_wt_argv_without_the_title_lock():
+    assert _codes("src/magent/platform/windows.py", _WT_BARE) == ["MD006"]
+
+
+def test_md006_accepts_a_wt_argv_with_the_title_lock():
+    assert _codes("src/magent/platform/windows.py", _WT_LOCKED) == []
+
+
+def test_md006_applies_to_the_cli_package_too():
+    # cli/attach.py spawns its own wt windows; it is not exempt.
+    assert _codes("src/magent/cli/attach.py", _WT_BARE) == ["MD006"]
+
+
+def test_md006_flags_the_exe_spelling_and_is_case_insensitive():
+    assert _codes("src/magent/x.py", 'a = ["WT.exe", "-w", "new"]\n') == ["MD006"]
+
+
+def test_md006_ignores_argv_for_other_executables():
+    assert _codes("src/magent/x.py", 'a = ["ssh", "-t", "host", "cmd"]\n') == []
+
+
+def test_md006_ignores_wt_that_is_not_the_first_element():
+    # A bare string "wt" elsewhere in a list is a value, not an exec name.
+    assert _codes("src/magent/x.py", 'a = ["echo", "wt"]\n') == []
+
+
+def test_md006_covers_tuple_argv_shape():
+    assert _codes("src/magent/x.py", 'a = ("wt", "-w", "new")\n') == ["MD006"]
+
+
+def test_md006_does_not_apply_outside_src():
+    # tests build fake wt argv lines on purpose (test_ssh_real pins one).
+    assert _codes("tests/unit/test_x.py", _WT_BARE) == []

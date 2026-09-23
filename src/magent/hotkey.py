@@ -21,21 +21,34 @@ import ctypes.wintypes
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import threading
 import time
+import zlib
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.error import URLError
-from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import urlopen
 
-from magent.log import HEARTBEAT_INTERVAL, get_logger, write_heartbeat
+from magent.altv import (
+    ALTV_LOG_PREFIX,
+    OUTCOME_REASONS,
+    flash_async,
+    handle_press,
+    native_enabled,
+)
+from magent.altv import report as _altv_report
+from magent.log import (
+    HEARTBEAT_INTERVAL,
+    clear_heartbeat,
+    get_logger,
+    write_heartbeat,
+)
 from magent.procs import pid_alive
 from magent.sessions import (
+    FLASH_TINT_ERR,
     build_code_open_command,
-    build_flash_url,
     folder_for_session,
 )
 from magent.titles import parse_title
@@ -122,6 +135,7 @@ VK_RBUTTON = 0x02
 _MOUSE_BUTTONS = (VK_LBUTTON, VK_RBUTTON)
 _KEY_DOWN_MASK = 0x8000
 CF_DIB = 8
+BI_RGB = 0
 BI_BITFIELDS = 3
 WH_KEYBOARD_LL = 13
 WM_KEYDOWN = 0x0100
@@ -218,11 +232,93 @@ def get_clipboard_image() -> bytes | None:
     finally:
         user32.CloseClipboard()
 
-    return _dib_to_bmp(dib_data)
+    # PNG first (typically 10-20x smaller than the raw DIB -- a 1080p
+    # screenshot is ~8 MB of BMP and a few hundred KB of PNG, and these
+    # accumulate under ~/.magent/uploads). The encoder deliberately handles
+    # only the shapes real screenshot tools put on the clipboard; anything
+    # exotic falls back to the lossless BMP wrap.
+    return _dib_to_png(dib_data) or _dib_to_bmp(dib_data)
 
 
 _DIB_HEADER_SIZES = frozenset({40, 52, 56, 108, 124})  # BITMAPINFOHEADER..V5
 _DIB_BPP = frozenset({1, 4, 8, 16, 24, 32})
+
+# The one channel layout GDI/.NET/screenshot tools actually use for
+# BI_BITFIELDS: BGRA in memory, i.e. masks R=00FF0000 G=0000FF00 B=000000FF.
+_STANDARD_BGRA_MASKS = (0x00FF0000, 0x0000FF00, 0x000000FF)
+
+
+def _png_chunk(tag: bytes, payload: bytes) -> bytes:
+    crc = zlib.crc32(tag + payload) & 0xFFFFFFFF
+    return len(payload).to_bytes(4, "big") + tag + payload + crc.to_bytes(4, "big")
+
+
+def _dib_to_png(dib: bytearray) -> bytes | None:
+    """Encode the common screenshot DIBs (uncompressed 24/32bpp) as PNG.
+
+    stdlib-only (zlib + struct): Pillow is not a dependency and must not
+    become one for a hotkey listener. Alpha is dropped on purpose -- clipboard
+    32bpp DIBs usually carry an all-zero alpha channel (the same lie
+    ``_dib_to_bmp`` forces opaque), so the honest output is RGB. Anything this
+    function does not positively recognize -- palettes, 16bpp, RLE,
+    nonstandard BI_BITFIELDS masks, truncated pixels -- returns ``None`` and
+    the caller falls back to the BMP wrap; a wrong image is worse than a big
+    one.
+    """
+    if len(dib) < 40:
+        return None
+    header_size = int.from_bytes(dib[0:4], "little")
+    width = int.from_bytes(dib[4:8], "little", signed=True)
+    height = int.from_bytes(dib[8:12], "little", signed=True)
+    bpp = int.from_bytes(dib[14:16], "little")
+    compression = int.from_bytes(dib[16:20], "little")
+    if header_size not in _DIB_HEADER_SIZES or bpp not in (24, 32):
+        return None
+    if compression not in (BI_RGB, BI_BITFIELDS):
+        return None
+    if compression == BI_BITFIELDS:
+        # A plain BITMAPINFOHEADER stores the 3 masks after the header; V4/V5
+        # embed them at the same fixed offset 40 inside the header itself.
+        if len(dib) < 52:
+            return None
+        masks = tuple(
+            int.from_bytes(dib[40 + 4 * i : 44 + 4 * i], "little") for i in range(3)
+        )
+        if masks != _STANDARD_BGRA_MASKS:
+            return None
+    if not (0 < width <= 0x7FFF) or not (0 < abs(height) <= 0x7FFF):
+        return None
+
+    px_start = header_size + (
+        12 if (compression == BI_BITFIELDS and header_size == 40) else 0
+    )
+    rows = abs(height)
+    bytes_pp = bpp // 8
+    stride = (width * bytes_pp + 3) & ~3  # DIB rows are 4-byte aligned
+    if px_start + stride * rows > len(dib):
+        return None
+
+    # Positive height = bottom-up storage; negative = top-down.
+    row_order = range(rows - 1, -1, -1) if height > 0 else range(rows)
+    raw = bytearray()
+    rgb = bytearray(width * 3)
+    for r in row_order:
+        base = px_start + r * stride
+        row = dib[base : base + width * bytes_pp]
+        # BGR(A) -> RGB via strided slice assignment (C speed, no per-pixel loop).
+        rgb[0::3] = row[2::bytes_pp]
+        rgb[1::3] = row[1::bytes_pp]
+        rgb[2::3] = row[0::bytes_pp]
+        raw.append(0)  # PNG filter type None for this scanline
+        raw += rgb
+
+    ihdr = struct.pack(">IIBBBBB", width, rows, 8, 2, 0, 0, 0)  # 8-bit RGB
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+        + _png_chunk(b"IEND", b"")
+    )
 
 
 def _dib_to_bmp(dib: bytearray) -> bytes | None:
@@ -281,51 +377,6 @@ def project_from_title(title: str) -> str | None:
     return parsed[0] if parsed is not None else None
 
 
-def upload_image(server_url: str, project: str, image_data: bytes) -> bool:
-    boundary = "----MagentUpload"
-    delim = f"--{boundary}"
-    body = (
-        (
-            f"{delim}\r\n"
-            f'Content-Disposition: form-data; name="project"\r\n'
-            f"\r\n"
-            f"{project}\r\n"
-            f"{delim}\r\n"
-            f'Content-Disposition: form-data; name="inject"\r\n'
-            f"\r\n"
-            f"1\r\n"
-            f"{delim}\r\n"
-            f'Content-Disposition: form-data; name="file"; filename="clipboard.bmp"\r\n'
-            f"Content-Type: image/bmp\r\n"
-            f"\r\n"
-        ).encode()
-        + image_data
-        + f"\r\n{delim}--\r\n".encode()
-    )
-
-    # ?project= lets the server flash "uploading" in the magent:<project> status line
-    # the moment the request lands -- before it reads the image bytes -- so the
-    # feedback shows in the same window you pasted into.
-    req = Request(
-        f"{server_url}/upload?project={quote(project)}",
-        data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        method="POST",
-    )
-    try:
-        with urlopen(req, timeout=20) as resp:
-            result = json.loads(resp.read())
-            return bool(result.get("ok", False)) if isinstance(result, dict) else False
-    except (URLError, OSError, json.JSONDecodeError) as exc:
-        # Log the specific cause (server down vs. 20s timeout vs. malformed
-        # response) -- the caller only sees the bare False, so without this the
-        # reason a paste failed is unrecoverable from the logs (P2-07).
-        get_logger("hotkey").warning(
-            "upload transport error (%s): %s", type(exc).__name__, exc
-        )
-        return False
-
-
 # --- Background-listener lifecycle -------------------------------------------
 # attach starts the Alt+V listener hidden in the background (no terminal of its
 # own), because its progress now shows in the magent: windows. A pid file lets
@@ -373,6 +424,10 @@ def stop_listener() -> bool:
     with contextlib.suppress(OSError):
         _PID_PATH.unlink()
     _clear_manifest()
+    # taskkill /F gives the listener no chance to run run_hotkey's finally, so
+    # its heartbeat file would otherwise outlive it and read as a listener that
+    # crashed rather than one that was deliberately stopped.
+    clear_heartbeat("hotkey")
     return True
 
 
@@ -446,36 +501,29 @@ def _clear_manifest() -> None:
         _MANIFEST_PATH.unlink()
 
 
-def _do_upload(server_url: str, project: str) -> None:
-    """Run upload in a thread so the hook callback returns quickly.
+def _do_upload(server_url: str, project: str, ssh_host: str | None = None) -> None:
+    """Run one press off the hook callback, on a thread.
 
-    No feedback is printed here: progress shows in the magent:<project> window's own
-    status line, driven by the upload server (see upload_server._flash).
+    The whole pipeline -- press acknowledgement, capture, upload, outcome -- is
+    ``altv.handle_press``; this module supplies only the win32 half (reading a
+    CF_DIB off the clipboard). Keeping the pipeline out of here is what lets a
+    real-serve e2e drive a press on Linux and macOS, where this module cannot
+    even be imported.
+
+    ``ssh_host`` is the local/remote fork, and it is already the listener's
+    self-description (the manifest field F2 routes on): no host means the panes
+    this listener serves run on THIS machine, where the agent shares the
+    presser's clipboard and one native Ctrl+V (``altv.native_paste``) could
+    replace the whole capture/upload/inject pipeline. That fork is OPT-IN via
+    ``MAGENT_ALTV_NATIVE=1`` -- Claude Code ignores an injected 0x16 (see
+    ``altv.native_enabled``), so the default stays the upload path.
     """
-    log = get_logger("hotkey")
-    try:
-        image_data = get_clipboard_image()
-        if image_data:
-            ok = upload_image(server_url, project, image_data)
-            log.info("upload project=%s ok=%s", project, ok)
-    except Exception:
-        log.exception("upload project=%s failed", project)
-
-
-def _flash_status(server_url: str, project: str, message: str) -> None:
-    """Best-effort: show ``message`` in the magent:<project> status line.
-
-    The listener runs hidden with no terminal, so without this every F2 outcome
-    is invisible on screen -- the user sees a key that does nothing while the
-    real reason sits in hotkey.log. The whole call is swallowed on purpose:
-    feedback must never be able to break the action it reports on, and the log
-    line beside each call site stays the durable record.
-    """
-    with (
-        contextlib.suppress(Exception),
-        urlopen(build_flash_url(server_url, project, message), timeout=2),
-    ):
-        pass
+    handle_press(
+        server_url,
+        project,
+        get_clipboard_image,
+        native=ssh_host is None and native_enabled(),
+    )
 
 
 def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
@@ -489,33 +537,60 @@ def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
     """
     log = get_logger("hotkey")
     try:
-        _flash_status(server_url, project, "F2: opening VS Code...")
+        flash_async(server_url, project, "F2: opening VS Code...")
         code_bin = shutil.which("code")
         if not code_bin:
             log.warning("F2: 'code' is not on PATH; cannot open project=%s", project)
-            _flash_status(server_url, project, "F2: 'code' not found on PATH")
+            flash_async(
+                server_url, project, "F2: 'code' not found on PATH", tint=FLASH_TINT_ERR
+            )
             return
         with urlopen(f"{server_url}/api/sessions", timeout=10) as resp:
             payload = json.loads(resp.read())
         folder = folder_for_session(payload, project)
         if not folder:
             log.warning("F2: no folder for project=%s in /api/sessions", project)
-            _flash_status(
+            flash_async(
                 server_url,
                 project,
                 f"F2: no folder known for {project} (host magent too old?)",
+                tint=FLASH_TINT_ERR,
             )
             return
         # code is code.cmd on Windows; shutil.which resolves the .cmd and
         # Popen on that resolved path runs it without a shell.
-        subprocess.Popen(build_code_open_command(folder, ssh_host, code_bin))
+        #
+        # `env=`: same reason as the platform backends' launch_vscode. This
+        # listener is a long-lived descendant of whatever shell started magent,
+        # so it carries that shell's agent-session markers for days; the editor
+        # it opens must not hand them to its integrated terminal.
+        # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+        from magent.env import spawn_child_env
+
+        # CREATE_NO_WINDOW + devnull streams: this listener is console-less
+        # (serve spawns it detached), and `code.cmd` is a console-subsystem
+        # shim -- without the flag Windows allocates it a brand-new visible
+        # console that fills with VS Code's `[main ...]` logs and sits there
+        # for as long as the editor runs. Same incident family as
+        # psmux._SPAWN_FLAGS; this module is win32-only, so the stdlib
+        # constant is always present.
+        subprocess.Popen(
+            build_code_open_command(folder, ssh_host, code_bin),
+            env=spawn_child_env(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
         log.info(
             "F2: opened project=%s folder=%s ssh_host=%s", project, folder, ssh_host
         )
-        _flash_status(server_url, project, f"F2: VS Code -> {folder}")
+        flash_async(server_url, project, f"F2: VS Code -> {folder}")
     except Exception:
         log.exception("F2: open project=%s failed", project)
-        _flash_status(server_url, project, "F2: failed - see hotkey.log")
+        flash_async(
+            server_url, project, "F2: failed - see hotkey.log", tint=FLASH_TINT_ERR
+        )
 
 
 # --- Focus-driven geometry reclaim -------------------------------------------
@@ -690,13 +765,37 @@ def _hook_decide(
         project = project_from_title(title)
 
         if project is None:
+            # A pass-through, not a failure: Alt+V outside a magent: window is
+            # the other app's chord. Recorded at DEBUG (with the title, which is
+            # the whole diagnosis when a user swears they WERE focused on one)
+            # -- at INFO this would log every Alt+V the user ever presses.
+            get_logger("hotkey").debug(
+                "%s outcome=not-a-magent-window title=%r",
+                ALTV_LOG_PREFIX,
+                title,
+            )
             return int(user32.CallNextHookEx(None, nCode, wParam, lParam))
 
         if not clipboard_has_image():
+            # Pass the chord through (the pane may want a plain Alt+V), but say
+            # why nothing was uploaded. Pressing it in the right window and
+            # getting silence is the exact complaint this exists to answer.
+            # Threaded because the report does a socket round-trip and this is
+            # a system-wide keyboard hook.
+            threading.Thread(
+                target=_altv_report,
+                args=(
+                    server_url,
+                    project,
+                    "no-image",
+                    OUTCOME_REASONS["no-image"],
+                ),
+                daemon=True,
+            ).start()
             return int(user32.CallNextHookEx(None, nCode, wParam, lParam))
 
         threading.Thread(
-            target=_do_upload, args=(server_url, project), daemon=True
+            target=_do_upload, args=(server_url, project, ssh_host), daemon=True
         ).start()
         return 1
 

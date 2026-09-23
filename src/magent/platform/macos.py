@@ -169,6 +169,45 @@ class MacOSPlatform(Platform):
         subprocess.run(["osascript", "-e", script], timeout=10, check=False)
 
     def launch_terminal(self, opts: TerminalLaunchOpts) -> None:
+        """Open one project window, titled with magent's grammar.
+
+        Title ownership (the same concern as the Windows
+        ``--suppressApplicationTitle`` flag and the Linux backend's per-emulator
+        locks): every branch below already uses the stickiest channel the app
+        offers, and none of the three can be made airtight from the outside.
+
+        * kitty -- ``--title`` permanently fixes the OS window title (documented
+          kitty behavior). This one IS a lock.
+        * iTerm -- ``set name of session`` is the explicit session name, which
+          iTerm prefers over the app-supplied title; but the displayed title is
+          composed from the profile's Title Components, so a profile that
+          includes the app title can still show one. HONEST GAP, no per-launch
+          lever.
+        * Terminal.app -- ``custom title`` is the sticky channel (an app OSC
+          title cannot clear it), but the profile's Window settings decide
+          whether the process name is appended alongside it. HONEST GAP for the
+          exact-string match tiling wants.
+
+        macOS also has no attention backend (``supports_attention_signals()`` is
+        False), so unlike Windows there is no reassertion pass to repair a
+        stomped title. Tracked in DESIGN.md's known-debt ledger.
+
+        Environment ownership splits the same three ways, and for the same
+        reason -- how much of the child does this Popen actually own?
+
+        * kitty -- spawned directly, so it takes ``env.spawn_child_env()`` and
+          the window really does start without the launching shell's agent
+          session markers or colour overrides.
+        * iTerm / Terminal.app -- HONEST GAP. The Popen here spawns
+          ``osascript``; the tab is created by an already-running,
+          launchd-started app whose environment no caller can reach, so an
+          ``env=`` on this Popen would look like a fix and be a no-op. Passing
+          it anyway would be worse than not passing it, so it is left off
+          deliberately and named here instead.
+        """
+        # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+        from magent.env import spawn_child_env
+
         if opts.ssh_host:
             remote_dir = opts.ssh_remote_dir or opts.cwd
             inner = f"cd {remote_dir} && {opts.command}"
@@ -190,7 +229,7 @@ class MacOSPlatform(Platform):
                 "-c",
                 cmd,
             ]
-            subprocess.Popen(args)
+            subprocess.Popen(args, env=spawn_child_env())
         elif self._has_app("iTerm"):
             script = f"""
             tell application "iTerm"
@@ -211,11 +250,16 @@ class MacOSPlatform(Platform):
             subprocess.Popen(["osascript", "-e", script])
 
     def launch_vscode(self, opts: VSCodeLaunchOpts) -> None:
+        # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+        from magent.env import spawn_child_env
+
         args = [opts.command]
         if opts.ssh_host:
             args.extend(["--remote", f"ssh-remote+{opts.ssh_host}"])
         args.append(opts.dir)
-        subprocess.Popen(args)
+        # An IDE window is an agent host too -- its integrated terminal is where
+        # a user runs `claude`, and it inherits the editor's environment.
+        subprocess.Popen(args, env=spawn_child_env())
 
     @staticmethod
     def _has_app(name: str) -> bool:

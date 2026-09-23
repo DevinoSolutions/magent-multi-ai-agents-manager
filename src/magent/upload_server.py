@@ -18,12 +18,14 @@ from typing import TYPE_CHECKING, ClassVar
 from urllib.parse import parse_qs, urlparse
 
 if TYPE_CHECKING:
+    import logging
     from collections.abc import Callable
 
 from magent import psmux, tailnet
 from magent.icons import render_icon
+from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import get_logger
-from magent.sessions import FLASH_MSG_MAX
+from magent.sessions import FLASH_MSG_MAX, FLASH_TINT_ERR, FLASH_TINT_OK
 
 
 def _pid_path(port: int) -> Path:
@@ -92,10 +94,11 @@ _DRAIN_CAP_BYTES = MAX_UPLOAD_BYTES
 _DRAIN_CHUNK_BYTES = 64 * 1024
 _DRAIN_TIMEOUT_S = 0.5
 
-# In-session upload feedback: a paste's progress shows in the SAME magent:<project>
-# window it landed in, via the psmux (tmux) status line -- never drawn into the
-# agent pane. tmux 3.3 renders these UTF-8 glyphs intact.
-_FB_UP = "↑"  # up arrow   -- uploading
+# In-session upload feedback for the MOBILE page: a paste's progress shows in
+# the SAME magent:<project> window it landed in, via the psmux (tmux) status
+# line -- never drawn into the agent pane. tmux 3.3 renders these UTF-8 glyphs
+# intact. An Alt+V paste narrates itself instead (see altv.handle_press and the
+# `flagged` note in _handle_post): one bar, one voice.
 _FB_OK = "✓"  # check mark -- uploaded
 _FB_NO = "✗"  # ballot x   -- failed
 
@@ -108,23 +111,27 @@ _FB_NO = "✗"  # ballot x   -- failed
 _MSG_GREEN = "bg=green,fg=black,bold"
 _MSG_RED = "bg=red,fg=white,bold"
 
-# How long each status-line flash lingers (ms). "uploading" is given a generous
-# ceiling so it stays put until the result overwrites it; if something stalls
-# without raising, it still clears on its own.
-_FLASH_UP_MS = 20000
+# What a caller-supplied ``tint=`` maps to. An unknown value leaves the style
+# alone rather than failing the flash -- the message matters more than its
+# colour.
+_FLASH_TINTS = {FLASH_TINT_OK: _MSG_GREEN, FLASH_TINT_ERR: _MSG_RED}
+
+# How long each status-line flash lingers (ms).
 _FLASH_OK_MS = 2500
 _FLASH_NO_MS = 3000
 
-# /api/flash: how long a caller-supplied message lingers. Long enough to read a
-# whole sentence, short enough that a stale one clears itself. The Alt+V/F2
-# listener is the only caller today -- it runs hidden with no terminal of its
-# own, so this endpoint is its ONLY way to say anything on screen.
+# /api/flash: how long a caller-supplied message lingers by default. Long enough
+# to read a whole sentence, short enough that a stale one clears itself. The
+# Alt+V/F2 listener is the only caller today -- it runs hidden with no terminal
+# of its own, so this endpoint is its ONLY way to say anything on screen.
 _FLASH_MSG_MS = 4000
 
-# Per-project count of pastes currently in flight, so several at once read as
-# "uploading (2)" / "uploaded (1 more)" instead of stomping each other.
-_inflight: dict[str, int] = {}
-_inflight_lock = threading.Lock()
+# ...and the bounds on what a caller may ask for instead. A PHASE message
+# ("uploading...") must outlive the operation it describes or the bar goes
+# blank mid-press; the ceiling keeps a bad or hostile value from parking a
+# message on the bar for the rest of the day.
+_FLASH_MSG_MS_MIN = 500
+_FLASH_MSG_MS_MAX = 60000
 
 # Guards UploadHandler.cached_sessions / sessions_ts: UploadHandler is
 # instantiated per-request by ThreadingHTTPServer, so refresh must be
@@ -132,21 +139,15 @@ _inflight_lock = threading.Lock()
 _sessions_lock = threading.Lock()
 
 
-def _inflight_inc(project: str) -> int:
-    with _inflight_lock:
-        n = _inflight.get(project, 0) + 1
-        _inflight[project] = n
-        return n
-
-
-def _inflight_dec(project: str) -> int:
-    with _inflight_lock:
-        n = max(0, _inflight.get(project, 1) - 1)
-        if n:
-            _inflight[project] = n
-        else:
-            _inflight.pop(project, None)
-        return n
+def _flash_duration(raw: str) -> int:
+    """Clamp a caller-supplied ``ms=`` to the allowed window. Anything absent or
+    unparseable takes the default rather than failing the flash: a malformed
+    duration must never be the reason a message does not reach the screen."""
+    try:
+        wanted = int(raw)
+    except (TypeError, ValueError):
+        return _FLASH_MSG_MS
+    return max(_FLASH_MSG_MS_MIN, min(_FLASH_MSG_MS_MAX, wanted))
 
 
 def _flash(
@@ -181,18 +182,41 @@ body{font-family:-apple-system,system-ui,sans-serif;background:#1e1e2e;color:#cd
 .head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
 .head h1{font-size:.85rem;color:#a6e3a1;font-weight:700;letter-spacing:.5px}
 .head span{color:#45475a;font-size:.7rem}
-.pills{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+.pills{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
 .pill{background:#313244;border:1.5px solid #45475a;border-radius:20px;
   padding:6px 14px;font-size:.8rem;color:#bac2de;cursor:pointer;
   transition:all .12s;white-space:nowrap;-webkit-user-select:none;user-select:none}
 .pill:active{transform:scale(.96)}
 .pill.on{border-color:#89b4fa;background:#1e3a5f;color:#89b4fa;font-weight:600}
+/* Filtered out by the typeahead. Hidden, never removed: the pill keeps its
+   listeners and its config position, so clearing the query restores the list
+   exactly as the config wrote it. */
+.pill.off{display:none}
+/* The keyboard highlight. A ring rather than a recolour, so it composes with
+   `.on` instead of fighting it -- the highlighted pill and the SELECTED pill
+   are different questions and a phone user needs both answers at once. */
+.pill.hi{box-shadow:0 0 0 2px #f9e2af}
+#proj-filter{width:100%;padding:9px 12px;margin-bottom:8px;font-family:inherit;
+  font-size:.85rem;color:#cdd6f4;background:#181825;border:1.5px solid #45475a;
+  border-radius:8px}
+#proj-filter:focus{outline:none;border-color:#89b4fa}
+#proj-filter::placeholder{color:#585b70}
+.nomatch{display:none;color:#f9e2af;font-size:.78rem;padding:2px 0 6px}
+.nomatch.show{display:block}
+/* The selected project, always on screen -- the filter can hide the pill that
+   carries the `.on` state, and "which session am I about to send to" must not
+   be a question the query can erase. */
+.chosen{font-size:.75rem;color:#585b70;margin-bottom:10px}
+.chosen.on{color:#89b4fa;font-weight:600}
 .drop{border:1.5px dashed #45475a;border-radius:10px;padding:18px 12px;
   text-align:center;color:#585b70;font-size:.8rem;position:relative;
   transition:all .15s;margin-bottom:8px}
 .drop.ready{border-color:#89b4fa;color:#89b4fa;border-style:solid}
 .drop.busy{border-color:#f9e2af;color:#f9e2af}
 .drop.ok{border-color:#a6e3a1;color:#a6e3a1}
+/* Paste still pending: the healthy tint, but unfinished. Green says the file
+   is safe (it is, on disk); the dashed edge says psmux has not answered yet. */
+.drop.pend{border-style:dashed}
 .drop.err{border-color:#f38ba8;color:#f38ba8}
 .drop input{position:absolute;inset:0;opacity:0;cursor:pointer;font-size:0}
 .paste{display:none;margin-bottom:8px;border:1.5px solid #45475a;border-radius:10px;
@@ -232,10 +256,15 @@ body{font-family:-apple-system,system-ui,sans-serif;background:#1e1e2e;color:#cd
 <body>
 <div class="head">
   <h1>magent</h1>
-  <span>tap project &rsaquo; tap file or Ctrl+V &rsaquo; done</span>
+  <span>tap or type a project &rsaquo; tap file or Ctrl+V &rsaquo; done</span>
 </div>
 
+<input type="text" id="proj-filter" placeholder="type to filter projects"
+  autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+  enterkeyhint="go" aria-label="filter projects">
 <div class="pills" id="pills">PROJECTS_PLACEHOLDER</div>
+<p class="nomatch" id="proj-nomatch">no project matches</p>
+<div class="chosen" id="proj-chosen">no project selected</div>
 
 <div class="drop" id="drop">
   <span id="drop-label">select a project first</span>
@@ -270,10 +299,36 @@ const label = document.getElementById('drop-label');
 const input = document.getElementById('file');
 const toast = document.getElementById('toast');
 
+// The upload reply carries THREE paste states, not two (DESIGN.md "The upload
+// reply is not hostage to the paste"):
+//
+//   injected:true                    -> it is in the agent's pane;
+//   inject_pending:true              -> the FILE IS ON DISK and psmux has not
+//                                       answered yet -- the reply is early,
+//                                       not wrong;
+//   neither                          -> no paste happened (psmux refused it,
+//                                       or there is no psmux at all).
+//
+// Only `ok:false` is a failed upload. Reading `injected` alone, as this page
+// used to, collapses the middle state into the last one and shows a
+// failure-looking result about a screenshot that is safely stored and about to
+// paste -- exactly the lie the status line was fixed for. The pending wording
+// mirrors altv.OUTCOME_REASONS['inject-pending'] (a unit test pins the two
+// together) so the phone and the status bar say the same thing, and it keeps
+// the healthy tint for the same reason the bar does: red reads as "your
+// screenshot is gone".
+const PEND_LABEL = 'saved - paste still pending';
+const PEND_NOTE = ' saved - psmux is slow, paste still pending';
+function isPending(d) { return !!(d && !d.injected && d.inject_pending); }
+
+const chosen = document.getElementById('proj-chosen');
+
 pills.forEach(p => p.addEventListener('click', () => {
   pills.forEach(b => b.classList.remove('on'));
   p.classList.add('on');
   proj = p.dataset.name;
+  chosen.textContent = 'project: ' + proj;
+  chosen.className = 'chosen on';
   input.disabled = false;
   drop.className = 'drop ready';
   label.textContent = 'tap to select file';
@@ -281,12 +336,112 @@ pills.forEach(p => p.addEventListener('click', () => {
   toast.className = 'toast';
 }));
 
+// --- type-to-filter project picker ---------------------------------------
+//
+// This page is used from a phone, so TAP stays the primary gesture: every pill
+// is still a tap target and nothing below requires the keyboard. The text box
+// is the second way in, for a fleet with more sessions than fit a thumb's
+// scroll -- type a few letters, the list narrows, Enter takes the best match.
+//
+// Ranking mirrors the CLI picker's, so the same query picks the same project
+// on both surfaces: case-insensitive, and scored by HOW a name matched rather
+// than by how much of it did --
+//
+//   prefix          "api" -> apiserver
+//   word boundary   "api" -> web-api          (a separator precedes the hit)
+//   substring       "api" -> rapidly
+//   subsequence     "api" -> alpha-pipeline   (a, p, i in order, not adjacent)
+//
+// Within one tier the order is the CONFIG's: the sort is stable and the pills
+// start in config order, so a tie never reshuffles a list the user has already
+// learned the shape of.
+const T_PREFIX = 0, T_WORD = 1, T_SUB = 2, T_SUBSEQ = 3, T_NONE = 4;
+
+function matchTier(name, query) {
+  const n = String(name).toLowerCase(), q = query.toLowerCase();
+  if (!q) return T_PREFIX;              // empty query: everything, config order
+  if (n.startsWith(q)) return T_PREFIX;
+  for (let i = 1; i < n.length; i++) {
+    if (!/[a-z0-9]/.test(n[i - 1]) && n.startsWith(q, i)) return T_WORD;
+  }
+  if (n.includes(q)) return T_SUB;
+  let k = 0;
+  for (const ch of n) {
+    if (ch === q[k] && ++k === q.length) return T_SUBSEQ;
+  }
+  return T_NONE;
+}
+
+const filterBox = document.getElementById('proj-filter');
+const pillWrap = document.getElementById('pills');
+const nomatch = document.getElementById('proj-nomatch');
+const allPills = [...pills];
+let shown = allPills.slice();
+let hi = -1;
+
+function setHighlight(idx) {
+  hi = idx;
+  allPills.forEach(p => p.classList.remove('hi'));
+  if (hi >= 0 && shown[hi]) {
+    shown[hi].classList.add('hi');
+    shown[hi].scrollIntoView({block: 'nearest'});
+  }
+}
+
+function renderFilter() {
+  const q = filterBox.value.trim();
+  const ranked = allPills
+    .map((p, i) => ({p: p, i: i, t: matchTier(p.dataset.name, q)}))
+    .filter(x => x.t !== T_NONE);
+  ranked.sort((a, b) => a.t - b.t || a.i - b.i);
+  shown = ranked.map(x => x.p);
+  allPills.forEach(p => p.classList.add('off'));
+  // Re-append in rank order: a hidden pill's position no longer matters, and
+  // moving a node keeps its listeners, so the tap path is untouched.
+  shown.forEach(p => { p.classList.remove('off'); pillWrap.appendChild(p); });
+  nomatch.classList.toggle('show', shown.length === 0);
+  setHighlight(shown.length ? 0 : -1);
+}
+
+filterBox.addEventListener('input', renderFilter);
+filterBox.addEventListener('keydown', e => {
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    if (!shown.length) return;
+    e.preventDefault();
+    const step = e.key === 'ArrowDown' ? 1 : -1;
+    setHighlight(hi < 0 ? (step > 0 ? 0 : shown.length - 1)
+                        : (hi + step + shown.length) % shown.length);
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    // Selection goes through the pill's own click, so keyboard and thumb
+    // reach the identical code path -- there is one way to pick a project.
+    if (hi >= 0 && shown[hi]) shown[hi].click();
+  } else if (e.key === 'Escape') {
+    filterBox.value = '';
+    renderFilter();
+  }
+});
+// A tap picks whatever it landed on; the highlight follows so Enter after a
+// tap can never mean a different project than the one on screen.
+allPills.forEach(p => p.addEventListener('click', () => {
+  const at = shown.indexOf(p);
+  if (at >= 0) setHighlight(at);
+}));
+
+if (allPills.length) {
+  renderFilter();
+} else {
+  // No sessions: the list says so already, and an input that can only ever
+  // answer "no match" is noise.
+  filterBox.style.display = 'none';
+}
+
 // Deep link: ?project=<name> (e.g. from a notification) pre-selects that
 // project's pill on open, so a tap lands you straight on the right session.
 (function () {
   const want = new URLSearchParams(location.search).get('project');
   if (!want) return;
-  const pill = [...pills].find(p => p.dataset.name === want);
+  const pill = allPills.find(p => p.dataset.name === want);
   if (pill) { pill.click(); pill.scrollIntoView({block: 'center'}); }
 })();
 
@@ -305,10 +460,12 @@ input.addEventListener('change', async () => {
     const r = await fetch('/upload', {method:'POST', body:form});
     const d = await r.json();
     if (d.ok) {
-      drop.className = 'drop ok';
-      label.textContent = d.injected ? 'pasted into ' + proj : file.name;
-      toast.textContent = file.name + ' sent';
-      toast.className = 'toast ok';
+      const pending = isPending(d);
+      drop.className = pending ? 'drop ok pend' : 'drop ok';
+      label.textContent = d.injected ? 'pasted into ' + proj
+        : pending ? PEND_LABEL : file.name;
+      toast.textContent = file.name + (pending ? PEND_NOTE : ' sent');
+      toast.className = pending ? 'toast ok pend' : 'toast ok';
     } else {
       drop.className = 'drop err';
       label.textContent = d.error || 'failed';
@@ -435,11 +592,13 @@ psend.addEventListener('click', () => {
     try { d = JSON.parse(xhr.responseText); } catch (e) {}
     if (xhr.status === 200 && d.ok) {
       pfill.style.width = '100%';
-      psend.className = 'ok';
-      psend.textContent = (d.injected ? 'Pasted into ' + proj : 'Sent') + ' ✓';
-      toast.textContent = staged.name
-        + (d.injected ? ' pasted into ' + proj : ' sent');
-      toast.className = 'toast ok';
+      const pending = isPending(d);
+      psend.className = pending ? 'ok pend' : 'ok';
+      psend.textContent = pending ? 'Saved, pasting...'
+        : (d.injected ? 'Pasted into ' + proj : 'Sent') + ' ✓';
+      toast.textContent = staged.name + (pending ? PEND_NOTE
+        : (d.injected ? ' pasted into ' + proj : ' sent'));
+      toast.className = pending ? 'toast ok pend' : 'toast ok';
       setTimeout(clearStage, 2500);
     } else {
       pasteFail(d.error || 'upload failed');
@@ -677,6 +836,71 @@ def _mobileconfig(host: str) -> bytes:
 """.encode()
 
 
+# How long the HTTP response will wait for the paste before answering anyway.
+#
+# The file is already on disk by the time this wait starts, so everything past
+# it is a courtesy: waiting a beat lets the overwhelmingly common fast paste be
+# reported as the plain `injected: true` it is, and the bound is what stops a
+# stalled multiplexer from turning a successful upload into a client timeout.
+# Must stay comfortably under `altv.UPLOAD_HTTP_TIMEOUT_S` (a test pins that) --
+# the whole defect being fixed here is a server that outlived its client's
+# patience and left the user reading "upload failed" about a file that landed.
+INJECT_GRACE_S = 3.0
+
+# The whole life of one paste attempt, wherever it finishes. Deliberately ONE
+# attempt: a `send-keys` that is merely slow is still in flight, and a retry on
+# top of it pastes the same image twice into the agent's prompt. Past this the
+# worker gives up and says so in upload.log, so a paste can never arrive
+# minutes later on top of whatever the user did in the meantime.
+INJECT_TIMEOUT_S = 60.0
+
+
+def _inject_paste(project: str, dest: Path) -> tuple[bool, bool]:
+    """Paste ``dest`` into ``project``'s pane. Returns ``(injected, pending)``.
+
+    The paste runs on its own thread and the caller waits only ``INJECT_GRACE_S``
+    for it, because an HTTP handler must not be hostage to a multiplexer: this
+    call used to be inline and unbounded, and a control command that stalled for
+    74 s answered a listener that had given up at 20 s -- so a screenshot that
+    was safely on disk, and that psmux eventually pasted, was reported to the
+    user as "upload failed".
+
+    The two flags are exhaustive and honest: ``(True, False)`` pasted,
+    ``(False, True)`` still trying (the reply is early, not wrong), and
+    ``(False, False)`` a real refusal the caller may name as one. Nothing is
+    retried and nothing is re-sent -- see ``INJECT_TIMEOUT_S``.
+    """
+    log = get_logger("upload")
+    done = threading.Event()
+    outcome: list[bool] = []
+
+    def _run() -> None:
+        started = time.monotonic()
+        try:
+            pasted = psmux.send_keys(
+                project, str(dest), target=project, timeout=INJECT_TIMEOUT_S
+            )
+            outcome.append(pasted)
+        finally:
+            done.set()
+            elapsed = time.monotonic() - started
+            if elapsed >= INJECT_GRACE_S:
+                # The reply already said `inject_pending`; this line is the only
+                # place that late verdict is recorded, so it is a WARNING and it
+                # carries the wait it cost.
+                log.warning(
+                    "inject project=%s finished late after %.1fs pasted=%s",
+                    project,
+                    elapsed,
+                    outcome[-1] if outcome else False,
+                )
+
+    threading.Thread(target=_run, name="magent-upload-inject", daemon=True).start()
+    if done.wait(INJECT_GRACE_S):
+        return (bool(outcome and outcome[0]), False)
+    return (False, True)
+
+
 def _parse_multipart(
     handler: BaseHTTPRequestHandler,
 ) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
@@ -819,7 +1043,24 @@ class UploadHandler(BaseHTTPRequestHandler):
                     {"ok": False, "error": "project and msg are required"}, 400
                 )
             else:
-                _flash(None, flash_project, message[:FLASH_MSG_MAX], _FLASH_MSG_MS)
+                clamped = message[:FLASH_MSG_MAX]
+                # One INFO line per served flash. The caller is a hidden
+                # process narrating into a status bar that keeps no history, so
+                # without this "the status isn't showing" is unanswerable after
+                # the fact: this says which phase messages arrived, and when.
+                get_logger("upload").info(
+                    "flash project=%s msg=%r", flash_project, clamped
+                )
+                _flash(
+                    None,
+                    flash_project,
+                    clamped,
+                    _flash_duration(query.get("ms", [""])[0]),
+                    style=_FLASH_TINTS.get(query.get("tint", [""])[0]),
+                )
+                # Answered only once psmux has the message, which is what paces
+                # a caller flashing a SEQUENCE: it waits for each reply before
+                # sending the next, so the phases cannot arrive out of order.
                 self._json_response({"ok": True})
         elif path == "/install.mobileconfig":
             # Built per-request: the Web Clip URL must match the host:port the
@@ -903,26 +1144,29 @@ class UploadHandler(BaseHTTPRequestHandler):
         # psmux socket id (P3-01), so we validate against `session` ids.
         valid_sessions = {_sid(s) for s in self._sessions()}
 
-        # The Alt+V listener passes ?project= so we can flash "uploading" the
-        # instant the request lands -- before the image bytes are even read off
-        # the socket -- right in that project's magent: window. (The mobile web UI
-        # doesn't, so it skips straight to the result flash below.)
+        # ?project= marks an upload that already HAS a narrator: the Alt+V
+        # listener flashed "Alt+V: capturing..." before it touched the clipboard
+        # and will flash the specific outcome the moment this reply lands. The
+        # status line is one line, so a second voice on it can only race the
+        # first -- and the loser is whichever message the user needed. The
+        # server therefore stays silent for flagged uploads and speaks only for
+        # the mobile page, whose sender is looking at a phone, not at the bar.
+        #
+        # That silence extends to the DEFERRED paste verdict (`inject_pending`),
+        # deliberately. The tempting fix -- flash "pasted" once the worker
+        # finishes -- reintroduces the second writer under the exact condition
+        # this code path exists for: the listener's own closing message is still
+        # queued behind a slow status line when the worker lands, so the two
+        # would race and the bar could show "pasted" and then "paste pending".
+        # The late verdict goes to upload.log instead, and to the pane, where
+        # the pasted path is its own proof.
         flagged = parse_qs(parsed.query).get("project", [""])[0]
         flagged = flagged if flagged in valid_sessions else ""
-        if flagged:
-            n = _inflight_inc(flagged)
-            tail = f" ({n})" if n > 1 else ""
-            _flash(
-                None,
-                flagged,
-                f"magent  {_FB_UP} uploading image{tail}",
-                _FLASH_UP_MS,
-                style=_MSG_GREEN,
-            )
 
         ok = False
         project = flagged
         injected = False
+        inject_pending = False
         byte_count = 0
         suffix = ""
         try:
@@ -967,7 +1211,7 @@ class UploadHandler(BaseHTTPRequestHandler):
             dest.write_bytes(data)
 
             if inject and psmux.find_psmux():
-                injected = psmux.send_keys(project, str(dest), target=project)
+                injected, inject_pending = _inject_paste(project, dest)
             elif inject:
                 log.warning(
                     "upload project=%s requested inject but psmux is unavailable",
@@ -980,30 +1224,34 @@ class UploadHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "path": str(dest),
                     "injected": injected,
+                    # Three states, not two: pasted, definitely not pasted, and
+                    # "still trying". A client that cannot tell the last two
+                    # apart has to call a slow paste a failed upload.
+                    "inject_pending": inject_pending,
                 }
             )
         finally:
             # INFO outcome line -- project + byte-count + injected + suffix only,
             # NEVER the original filename (personal data; F-hygiene).
             log.info(
-                "upload project=%s ok=%s bytes=%d injected=%s suffix=%s",
+                "upload project=%s ok=%s bytes=%d injected=%s pending=%s suffix=%s",
                 project,
                 ok,
                 byte_count,
                 injected,
+                inject_pending,
                 suffix,
             )
-            # Confirm in the same magent: status line -- for both the listener (paired
-            # with the early "uploading" flash) and mobile uploads.
-            remaining = _inflight_dec(flagged) if flagged else 0
+            # Confirm in the same magent: status line -- for MOBILE uploads only.
+            # A flagged (Alt+V) upload reports its own, more specific outcome;
+            # see the `flagged` note above.
             done = project if project in valid_sessions else flagged
-            if done:
-                more = f"  ({remaining} more)" if remaining else ""
+            if done and not flagged:
                 if ok:
                     _flash(
                         None,
                         done,
-                        f"magent  {_FB_OK} image uploaded{more}",
+                        f"magent  {_FB_OK} image uploaded",
                         _FLASH_OK_MS,
                         style=_MSG_GREEN,
                     )
@@ -1011,7 +1259,7 @@ class UploadHandler(BaseHTTPRequestHandler):
                     _flash(
                         None,
                         done,
-                        f"magent  {_FB_NO} upload failed{more}",
+                        f"magent  {_FB_NO} upload failed",
                         _FLASH_NO_MS,
                         style=_MSG_RED,
                     )
@@ -1120,6 +1368,164 @@ def _bind_addresses(host: str | None) -> list[str]:
     return addrs
 
 
+# --- Alt+V listener supervision ----------------------------------------------
+# The listener used to be a ONE-SHOT spawn: whichever `magent --go` or `magent
+# attach` ran last started it, and after that nothing ever looked again. A
+# reboot, a crash, or a pip upgrade left Alt+V silently dead until the user
+# happened to run attach again -- observed live: a listener last started 8 days
+# and one reboot earlier, with the upload server still running and `status`
+# reporting the whole thing as a benign default.
+#
+# serve is the right owner. It is the long-lived process the Alt+V chain already
+# posts into, so "serve is up" and "Alt+V works" become one fact rather than two
+# independent ones. The listener is deliberately NOT killed when serve stops:
+# `down --all` already stops both (server first, listener second, so this
+# supervisor is gone before the listener is), and a user restarting serve should
+# not lose their hotkey in between.
+HOTKEY_SUPERVISE_INTERVAL_S = 30.0
+
+
+def local_url(bound_addrs: list[str], port: int) -> str:
+    """The URL a process on THIS machine should use to reach this server.
+
+    Loopback whenever it is reachable -- including under an explicit
+    `--host 0.0.0.0`, which binds it -- so the listener never depends on
+    Tailscale being up. Only a bind that deliberately excluded loopback
+    (`serve --host <tailscale-ip>`) falls back to the address actually bound.
+    """
+    if "127.0.0.1" in bound_addrs or "0.0.0.0" in bound_addrs:
+        return f"http://127.0.0.1:{port}"
+    return f"http://{bound_addrs[0]}:{port}"
+
+
+def supervision_enabled() -> bool:
+    """Whether MAGENT_HOTKEY_SUPERVISOR permits serve to own the listener.
+
+    Public because ``status``/``doctor`` must ask the same question the
+    supervisor answers: a running server only implies a running listener if
+    serve was actually allowed to supervise one. Reporting a DEAD listener to
+    somebody who turned supervision off would be inventing a promise nobody
+    made.
+
+    A daemon must never die of a bad environment variable it does not use, and
+    every other MAGENT_* consumer has already failed loudly at CLI entry by the
+    time serve is running -- so an env that has gone bad underneath a detached
+    process degrades to the default (supervise) with a log line, exactly as
+    ``log._configured_level`` does for MAGENT_LOG_LEVEL.
+    """
+    from pydantic import ValidationError
+
+    from magent.env import get_env
+
+    try:
+        return get_env().hotkey_supervisor
+    except ValidationError:
+        get_logger("hotkey").warning(
+            "supervisor: environment did not validate; supervising anyway"
+        )
+        return True
+
+
+def _supervise_hotkey(
+    server_url: str,
+    stop_event: threading.Event,
+    interval: float = HOTKEY_SUPERVISE_INTERVAL_S,
+) -> None:
+    """Keep an Alt+V listener alive for as long as this server runs.
+
+    Runs on a daemon thread off ``run_server``. Every failure mode is a log line
+    and another try next interval -- supervision must never be able to take down
+    the server it rides on, which is the thing actually serving uploads.
+
+    The lock is what stops two serve daemons (different ports, same machine)
+    from racing each other into two listeners; it is deliberately NOT taken by
+    the launch/attach spawn paths, so an interactive `magent attach` re-aiming
+    the listener can never be blocked by a background supervisor.
+    """
+    from magent.platform import get_platform  # in-body: the OS backends are heavy
+
+    if not get_platform().supports_hotkey():
+        return
+    log = get_logger("hotkey")
+    if not supervision_enabled():
+        log.info("supervisor: disabled by MAGENT_HOTKEY_SUPERVISOR")
+        return
+    # heavy subsystem: in-body per policy. launch owns the spawn recipe; this
+    # module must not import the cli package (LS-A-001).
+    from magent.launch import ensure_hotkey_listener
+
+    while True:
+        try:
+            with exclusive_lock("hotkey-supervisor"):
+                if ensure_hotkey_listener(server_url) is None:
+                    log.warning(
+                        "supervisor: no Alt+V listener came up for %s; retrying in %ss",
+                        server_url,
+                        interval,
+                    )
+        except LockHeld:
+            log.debug("supervisor: another server is supervising the listener")
+        except Exception:
+            log.exception("supervisor: Alt+V listener check failed")
+        if stop_event.wait(interval):
+            return
+
+
+# --- psmux priority supervision ----------------------------------------------
+# The third owner of ``psmux.boost_priority``, and on a real fleet the one that
+# matters most: the launch path boosts what it just created, the attention
+# daemon boosts on every poll -- but the attention daemon is frequently NOT
+# running, while `magent serve` effectively always is (it is what every upload
+# and every Alt+V press goes through, and `attention -d` revives it). A psmux
+# server created by `magent attach`, by `up`, or by hand hours after the last
+# bring-up would otherwise never be swept at all.
+#
+# Its own thread rather than a branch inside _supervise_hotkey, for one reason:
+# that supervisor returns early on `MAGENT_HOTKEY_SUPERVISOR=0`, and somebody
+# who owns their listener's lifetime has said nothing whatsoever about process
+# priority. Same cadence, separate gate.
+PSMUX_BOOST_INTERVAL_S = 30.0
+
+
+def _supervise_psmux_priority(
+    stop_event: threading.Event, interval: float = PSMUX_BOOST_INTERVAL_S
+) -> None:
+    """Keep the psmux fleet at above-normal priority for as long as serve runs.
+
+    Runs on a daemon thread off ``run_server``. Idempotent and cheap (one
+    Toolhelp snapshot plus an OpenProcess per psmux pid), so re-running it every
+    interval costs milliseconds and is what makes a session created between two
+    sweeps get boosted at all. Every failure is a log line and another try next
+    interval -- this must never be able to take down the server it rides on.
+    """
+    if sys.platform != "win32":
+        return  # priority classes are a Windows concept; nothing to sweep
+    log = get_logger("launch")
+    while True:
+        try:
+            psmux.boost_priority()
+        except Exception:
+            log.exception("psmux boost: priority sweep failed")
+        if stop_event.wait(interval):
+            return
+
+
+def _serve_bind(server: ThreadingHTTPServer, log: logging.Logger) -> None:
+    """``serve_forever`` for a SECONDARY bind, on its own daemon thread.
+
+    Only the primary bind's loop can propagate to the CLI shell; a crash in the
+    second one (the Tailscale address) would otherwise print a thread traceback
+    to a console the daemon does not have and take that address down in total
+    silence, with the loopback bind still answering /health. It is logged at
+    exception level -- loud in the logfile, and captured by Sentry -- and not
+    re-raised, because the server that is still serving must keep serving.
+    """
+    try:
+        server.serve_forever()
+    except Exception:
+        log.exception("upload server: bind %s stopped serving", server.server_address)
+
+
 def run_server(
     port: int = 8080, config_path: str | None = None, host: str | None = None
 ) -> None:
@@ -1135,7 +1541,14 @@ def run_server(
         except OSError as e:
             log.warning("upload server: cannot bind %s:%d (%s)", addr, port, e)
     if not servers:
-        raise RuntimeError(f"upload server: no bindable address on port {port}")
+        # The one startup failure that is fatal rather than degraded. ERROR
+        # level (not just the exception that follows) because a detached serve
+        # has no console for the traceback to reach, and because ERROR is what
+        # Sentry's logging integration captures -- see the crash-visibility
+        # note on the serve loop below.
+        detail = f"upload server: no bindable address on port {port}"
+        log.error("%s", detail)
+        raise RuntimeError(detail)
 
     UploadHandler.port = port
     UploadHandler.pid = os.getpid()
@@ -1149,14 +1562,51 @@ def run_server(
     pid_file.write_text(str(os.getpid()))
 
     for s in servers[1:]:
-        threading.Thread(target=s.serve_forever, daemon=True).start()
+        threading.Thread(target=_serve_bind, args=(s, log), daemon=True).start()
+
+    # Alt+V is only as alive as its listener, and nothing else in the product
+    # ever re-checks it. Daemon thread: it must not hold the process open, and
+    # a serve that is going down has nothing left to supervise anyway.
+    hotkey_stop = threading.Event()
+    threading.Thread(
+        target=_supervise_hotkey,
+        args=(local_url(bound_addrs, port), hotkey_stop),
+        daemon=True,
+    ).start()
+
+    # ...and the typing latency of every pane is only as good as the priority of
+    # the psmux processes carrying it. Same reasoning, same thread shape: serve
+    # is the process that is always there, so it is the one that keeps sweeping.
+    boost_stop = threading.Event()
+    threading.Thread(
+        target=_supervise_psmux_priority, args=(boost_stop,), daemon=True
+    ).start()
+
+    # Why this is not a bare `try/finally` any more: serve died silently twice
+    # in one day and left NOTHING behind -- no traceback (a detached process has
+    # no console), no log line, only a pid file whose process was gone. The
+    # `finally` logged the same "stopped" for a Ctrl+C and for a crash, so even
+    # the log could not tell an operator which had happened. Every exit now
+    # names its reason, and a crash is logged at exception level -- which is
+    # also what hands it to Sentry (errors-only, logging integration at ERROR).
+    # Nothing is swallowed: both handlers re-raise.
+    reason = "loop returned"
     try:
         servers[0].serve_forever()
+    except KeyboardInterrupt:
+        reason = "keyboard interrupt"
+        raise
+    except Exception:
+        reason = "crashed"
+        log.exception("upload server crashed on port %d", port)
+        raise
     finally:
+        hotkey_stop.set()
+        boost_stop.set()
         for s in servers[1:]:
             s.shutdown()  # called from a different thread than its serve_forever -> safe
         for s in servers:
             s.server_close()  # servers[0] exited via KeyboardInterrupt; just closes the socket
         with contextlib.suppress(OSError):
             pid_file.unlink()
-        log.info("stopped")
+        log.info("stopped: %s", reason)

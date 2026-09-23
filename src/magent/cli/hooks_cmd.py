@@ -89,7 +89,7 @@ def _repair_entries(entries: list[object], cmd: str) -> bool:
                 continue
             c = h.get("command")
             if isinstance(c, str) and _MARKER in c and "\\" in c:
-                h["command"] = cmd  # ty: ignore[invalid-assignment]  # reason: known ty 0.0.59 isinstance-dict narrowing gap
+                h["command"] = cmd
                 changed = True
     return changed
 
@@ -121,14 +121,14 @@ def hooks_install_cmd(settings_file: Path | None) -> None:
         raise SystemExit(1) from exc
 
     hooks_raw = data.get("hooks")
-    hooks: dict[str, object] = hooks_raw if isinstance(hooks_raw, dict) else {}  # ty: ignore[invalid-assignment]  # reason: known ty 0.0.59 isinstance-dict narrowing gap
+    hooks: dict[str, object] = hooks_raw if isinstance(hooks_raw, dict) else {}
     data["hooks"] = hooks
     cmd = _hook_command()
     added: list[str] = []
     repaired: list[str] = []
     for event in _EVENTS:
         entries_raw = hooks.get(event)
-        entries: list[object] = entries_raw if isinstance(entries_raw, list) else []  # ty: ignore[invalid-assignment]  # reason: known ty 0.0.59 isinstance-list narrowing gap
+        entries: list[object] = entries_raw if isinstance(entries_raw, list) else []
         hooks[event] = entries
         if _event_wired(entries):
             if _repair_entries(entries, cmd):

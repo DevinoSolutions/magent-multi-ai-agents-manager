@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import getpass
 import re
+import sys
 from pathlib import Path
 
 import click
@@ -18,7 +19,72 @@ from magent.cli.background import (
     _tailnet_host,
 )
 from magent.cli.ui import _banner, _divider, _force_utf8_console, _print_qr
+from magent.config import load_config
+from magent.paths import find_config
 from magent.style import style
+
+# The port the upload server bound before it read the config at all -- and
+# therefore the only honest answer when there is no config to read. Same
+# literal the parser falls back to for a missing `uploadPort`
+# (config._parse_settings / Settings.upload_port).
+_FALLBACK_UPLOAD_PORT = 8033
+
+
+def _configured_upload_port(config_path: str | None) -> int:
+    """``settings.uploadPort`` of the config this invocation would use, or
+    ``_FALLBACK_UPLOAD_PORT`` when there is no readable config.
+
+    Deliberately NOT ``config_io._load_config_or_exit``: ``serve`` has always
+    started with no config at all (``run_server`` only forwards the path to the
+    per-project lookup), so a missing or invalid config has to stay a fallback
+    here rather than become a hard exit -- teaching serve to read the config
+    must not make it start failing where it used to work. Same tolerant read as
+    ``doctor._check_config``.
+    """
+    config_file = find_config(config_path)
+    if not config_file.exists():
+        return _FALLBACK_UPLOAD_PORT
+    try:
+        # ConfigError <: ValueError (bad JSON, wrong-typed field);
+        # FileNotFoundError <: OSError covers a config that vanished/unreadable
+        # between the exists() check and the read.
+        return load_config(str(config_file)).settings.upload_port
+    except (ValueError, OSError):
+        return _FALLBACK_UPLOAD_PORT
+
+
+def _handoff_ensure(port: int, config_path: str | None) -> bool:
+    """Hand `serve -p <port> --ensure` to the desktop, or refuse, per policy.
+
+    Returns True when this invocation is DONE -- the desktop copy ran (and this
+    process is about to exit with its code), or the policy refused. False means
+    "carry on here", which is every ordinary local `--ensure`.
+    """
+    from magent.launch import (  # heavy subsystem: in-body per policy
+        SESSION0_SERVE_REFUSAL,
+        SESSION0_SERVE_TIMEOUT_S,
+        relay_handoff,
+        session0_disposition,
+        session0_refusal,
+    )
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    plat = get_platform()
+    disposition = session0_disposition(plat)
+    if disposition == "run":
+        return False
+    if disposition == "refuse":
+        reason = session0_refusal(plat, SESSION0_SERVE_REFUSAL)
+        click.echo(f"  {style('x', fg='red')} {reason}", err=True)
+        sys.exit(1)
+    argv = [sys.executable, "-m", "magent"]
+    if config_path:
+        argv.extend(["--config", str(config_path)])
+    argv.extend(["serve", "-p", str(port), "--ensure"])
+    rc = relay_handoff(plat, argv, timeout_s=SESSION0_SERVE_TIMEOUT_S)
+    if rc != 0:
+        sys.exit(rc)
+    return True
 
 
 @main.command("termius")
@@ -87,7 +153,13 @@ Host magent
 
 
 @main.command("serve")
-@click.option("--port", "-p", default=8033, help="Port to listen on")
+@click.option(
+    "--port",
+    "-p",
+    default=None,
+    type=int,
+    help="Port to listen on (default: the config's upload_port)",
+)
 @click.option(
     "--host",
     default=None,
@@ -101,7 +173,9 @@ Host magent
     help="Start the server detached if it isn't already running, then exit (used by attach).",
 )
 @click.pass_context
-def serve_cmd(ctx: click.Context, port: int, host: str | None, ensure: bool) -> None:
+def serve_cmd(
+    ctx: click.Context, port: int | None, host: str | None, ensure: bool
+) -> None:
     """Start upload server for mobile image transfer.
 
     Opens a web page on your phone (via Tailscale) where you pick a project,
@@ -113,11 +187,27 @@ def serve_cmd(ctx: click.Context, port: int, host: str | None, ensure: bool) -> 
     )
 
     config_path = ctx.obj.get("config_path")
+    # No `-p` means "the port this machine's config says", not a hard-coded
+    # 8033: `status`/`up`/`down` all watch `settings.uploadPort`, so a serve
+    # that ignored it bound a port nothing else was looking at and every other
+    # surface reported the upload server dead. An explicit `-p` still wins.
+    if port is None:
+        port = _configured_upload_port(config_path)
     if ensure:
         # Non-blocking: ensure a survivor server exists on this port, then return.
         # attach calls this over SSH so the host always has a server for Alt+V,
         # regardless of the uploadServer config flag or whether anything was
         # just brought up.
+        #
+        # ...and that ssh call is a logon-Session-0 process on Windows, so the
+        # detached server it spawns is one too: it binds 127.0.0.1 in a session
+        # the desktop cannot reach, and the desktop's own Alt+V then talks to a
+        # server that can see none of its sessions (observed -- the Session-0
+        # serve had taken 8034). A plain foreground `magent serve` is left
+        # alone: that one is a command somebody is watching, wherever they ran
+        # it, and it is `--ensure` that plants a survivor.
+        if _handoff_ensure(port, config_path):
+            return
         _maybe_start_upload_server(port, config_path)
         click.echo(f"upload server ensured on port {port}")
         return
@@ -156,7 +246,7 @@ def serve_cmd(ctx: click.Context, port: int, host: str | None, ensure: bool) -> 
     "-p",
     default=None,
     type=int,
-    help="Upload server port (default: running server, else 8033).",
+    help="Upload server port (default: running server, else the config's upload_port).",
 )
 @click.option(
     "--host",
@@ -173,7 +263,12 @@ def mobile_cmd(ctx: click.Context, port: int | None, host: str | None) -> None:
     """
     _force_utf8_console()
     if port is None:
-        port = _running_upload_port() or 8033
+        # A live server's real port first (that URL is the one that works right
+        # now), then what the config asks for, then the historical default --
+        # never a hard-coded 8033 while the config says otherwise.
+        port = _running_upload_port() or _configured_upload_port(
+            ctx.obj.get("config_path")
+        )
     if not host:
         host = _tailnet_host()
     url = f"http://{host}:{port}/"

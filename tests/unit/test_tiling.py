@@ -27,6 +27,7 @@ from magent.tiling import (
     RETRY_SECS_EXACT,
     Placement,
     find_in_snapshot,
+    magent_window_names,
     place_windows,
     window_open,
 )
@@ -358,3 +359,29 @@ class TestFindInSnapshot:
             assert window_open(self._SNAP, key) is (
                 find_in_snapshot(self._SNAP, key) is not None
             )
+
+
+class TestMagentWindowNames:
+    """Discovery: which magent-owned windows are on screen at all. The seam
+    `--retile-all` uses to find windows no local config accounts for (a
+    `magent attach` pane onto a remote host's session)."""
+
+    def test_only_magent_grammar_titles_and_badge_proof(self):
+        snap = {
+            "magent:[!] api": 7,
+            "magent:web": 8,
+            "api": 9,  # bare title -- some other app, or prefix-off magent
+            "Some Editor - api": 10,
+        }
+        assert magent_window_names(snap) == ["api", "web"]
+
+    def test_snapshot_order_is_preserved_and_names_deduped(self):
+        # Two windows can render the same name under different badges; the
+        # tiling set must carry it once.
+        assert magent_window_names(["magent:b", "magent:[x] a", "magent:a", "x"]) == [
+            "b",
+            "a",
+        ]
+
+    def test_empty_snapshot(self):
+        assert magent_window_names([]) == []

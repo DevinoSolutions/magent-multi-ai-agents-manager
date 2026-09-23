@@ -203,15 +203,28 @@ def magent_windows_by_name(plat: Platform) -> dict[str, object]:
 
 
 class BadgeRenderer:
-    """Keeps every magent: window's title badge in sync with its session state.
+    """Keeps every magent: window's title badge in sync with its session state,
+    and repairs a title some program inside the window rewrote away.
 
     Only rewrites when the desired title differs, so a quiet tick makes zero
     Win32 calls. Windows whose parsed name matches no session (e.g. "proj-2"
     secondary windows) are left alone — unless this renderer badged them
     earlier, in which case the badge is restored to a clean title when the
-    session leaves the store (P6-06). Known limitation (DESIGN.md): shells that
-    rewrite their own titles may overwrite the badge — flash is the primary
-    signal, the badge is ambient state."""
+    session leaves the store (P6-06).
+
+    Title reassertion: the spawn-side lock (``--suppressApplicationTitle``, and
+    the per-emulator POSIX equivalents) is the primary defense, but it is not
+    universal — some emulators have no such lever, a window can be adopted from
+    a spawn magent did not make, and the flag is a Windows Terminal feature
+    rather than a guarantee. A title rewritten out of the ``magent:`` grammar is
+    catastrophic rather than cosmetic: ``parse_title`` stops recognizing it, so
+    the window disappears from tiling's ``magent-name`` resolution, attach's
+    already-open dedupe, corpse pairing, the Alt+V hotkey — and from this
+    renderer, which used to skip it forever. So each handle resolved to a magent
+    window is remembered by HANDLE (identity that survives a title rewrite), and
+    a remembered handle whose title stops parsing is retitled back. This rides
+    the snapshot pass that already runs every tick: no new poller, and still
+    zero writes on a quiet tick."""
 
     def __init__(self, plat: Platform) -> None:
         self._plat = plat
@@ -219,6 +232,20 @@ class BadgeRenderer:
         # frozen glyph both when a session leaves the store mid-run and when
         # the daemon stops (inverse-transience — P6-06).
         self._badged: dict[object, str] = {}
+        # Every handle we have seen carrying a magent: title, {handle: name} —
+        # the title-independent identity the reassertion pass needs.
+        self._known: dict[object, str] = {}
+
+    def _forget_closed(self, live: set[object]) -> None:
+        """Drop bookkeeping for handles no longer in the window list.
+
+        Bounds both maps to the live window set (they would otherwise grow for
+        the daemon's whole lifetime), and — the reason it must happen every tick
+        — bounds the window in which the OS could recycle a closed window's
+        handle onto an unrelated one and have us retitle a stranger."""
+        for tracker in (self._known, self._badged):
+            for handle in [h for h in tracker if h not in live]:
+                del tracker[handle]
 
     def render(self, views: list[SessionView], transitions: list[Transition]) -> None:
         # views are most-urgent-first; setdefault keeps the FIRST (most urgent)
@@ -232,11 +259,25 @@ class BadgeRenderer:
             desired.setdefault(v.name, v.state)
         # Materialize first: the ABC doesn't promise a fresh dict, and
         # retitling mid-iteration would mutate a live snapshot under us.
-        for title, handle in list(self._plat.snapshot_windows().items()):
+        snap = list(self._plat.snapshot_windows().items())
+        self._forget_closed({handle for _title, handle in snap})
+        for title, handle in snap:
             parsed = parse_title(title)
-            if parsed is None:
-                continue
-            name = parsed[0]
+            if parsed is not None:
+                name = parsed[0]
+                self._known[handle] = name
+            else:
+                # Not magent's grammar. Repair it only if we have watched this
+                # exact handle carry a magent: title AND its session is still
+                # live: those two together are what make "the program in the
+                # pane renamed our window" the overwhelmingly likelier reading
+                # than "this is somebody else's window". Anything weaker would
+                # risk stamping a magent: title onto a stranger — which would
+                # then get TILED, a far worse failure than a lost badge.
+                known = self._known.get(handle)
+                if known is None or known not in desired:
+                    continue
+                name = known
             if name not in desired:
                 # Session gone but we badged this window earlier: restore the
                 # clean title instead of freezing a stale glyph (P6-06).

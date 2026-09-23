@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
+import socket
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import click
 
@@ -22,6 +22,7 @@ from magent.platform import (
     VSCodeLaunchOpts,
     get_platform,
 )
+from magent.procs import pid_alive, spawn_unjobbed
 from magent.sessions import (
     AGENT_TOOLS,
     build_resume_command,
@@ -30,35 +31,168 @@ from magent.sessions import (
     is_ide_tool,
 )
 from magent.style import style
-from magent.tiling import Placement, place_windows
+from magent.tiling import Placement, magent_window_names, place_windows
 from magent.titles import generate_titles, get_leaf_name, make_title, parse_title
 
 if TYPE_CHECKING:
+    import subprocess
     from collections.abc import Callable
 
     from magent.config import MagentConfig, ProjectConfig
+    from magent.env import MagentEnv
 
 
 def spawn_detached(args: list[str], extra_flags: int = 0) -> subprocess.Popen[bytes]:
     """Popen a process that outlives both this process and a launching SSH session.
 
-    On Windows, OpenSSH puts the command's children in a job object marked
-    kill-on-close, so when the SSH session ends the children are terminated.
-    ``DETACHED_PROCESS`` only detaches the console -- it does not escape the job.
-    ``CREATE_BREAKAWAY_FROM_JOB`` does, but CreateProcess fails outright if the
-    parent job forbids breakaway, so fall back to a plain detached spawn (the
-    normal case when launched from an interactive console, not under a job).
+    Two independent halves, and only one of them lives here now. The CONSOLE
+    half is this function's own: ``DETACHED_PROCESS | CREATE_NO_WINDOW`` gives
+    the child no console to be killed with and no window to flash. The JOB half
+    -- escaping the kill-on-close job object Windows OpenSSH wraps every SSH
+    session in -- is ``procs.spawn_unjobbed``, shared with the psmux
+    session-creation spawn in ``platform/windows.py`` so the recipe that decides
+    whether work survives a disconnect exists exactly once.
     """
     if sys.platform != "win32":
-        return subprocess.Popen(args)
+        return spawn_unjobbed(args)
     CREATE_NO_WINDOW = 0x08000000
     DETACHED_PROCESS = 0x00000008
-    CREATE_BREAKAWAY_FROM_JOB = 0x01000000
-    base = CREATE_NO_WINDOW | DETACHED_PROCESS | extra_flags
-    try:
-        return subprocess.Popen(args, creationflags=base | CREATE_BREAKAWAY_FROM_JOB)
-    except OSError:
-        return subprocess.Popen(args, creationflags=base)
+    return spawn_unjobbed(
+        args, creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS | extra_flags
+    )
+
+
+# --- Session-0 desktop hand-off ----------------------------------------------
+# The incident, in one paragraph: a laptop ran `magent attach <desktop>`, the
+# host reported sessions down, and attach ran `magent up` on the host over ssh.
+# Windows OpenSSH is a SERVICE, so that bring-up -- and everything it created --
+# was born in logon Session 0: 82 psmux servers and 42 agents on a desktop
+# nobody can see. The desktop's own magent called them stopped, every later
+# bring-up logged "session never came up after respawn" (psmux's registry under
+# ~/.psmux is shared, so `new-session` for a held name just exits 1), tiling
+# logged "window not found", and the Session-0 `serve` had taken 127.0.0.1:8034
+# out from under the desktop's Alt+V. Clearing it needed an elevated kill of
+# 1172 processes.
+#
+# Every wording below is shared so the host's answer reads identically whether
+# it is printed locally or relayed up an ssh pipe by `magent attach`.
+SESSION0_HANDOFF_LINE = (
+    "hand-off: this magent runs in a non-interactive logon session (Session 0);"
+    " re-running on the desktop..."
+)
+SESSION0_REFUSAL = (
+    "refusing to start psmux sessions from a non-interactive logon session "
+    "(Session 0 / ssh): they would be invisible to this host's desktop and "
+    "block the same names. Run 'magent up' on the host's own desktop, or set "
+    "MAGENT_SESSION0_POLICY=allow for a headless host."
+)
+SESSION0_SERVE_REFUSAL = (
+    "refusing to start the upload server from a non-interactive logon session "
+    "(Session 0 / ssh): it would take the loopback port this host's desktop "
+    "needs for Alt+V. Run 'magent serve' on the host's own desktop, or set "
+    "MAGENT_SESSION0_POLICY=allow for a headless host."
+)
+# The same refusal with a different cause, and worth its own sentence: the
+# policy DID ask for a hand-off and there is simply nowhere to hand off TO.
+# Telling that user to "run it on the desktop" would be advice they cannot
+# take, and telling them to set a policy they already set would be noise.
+SESSION0_NO_DESKTOP = (
+    "no user is logged on at this host's desktop, so there is nowhere to hand "
+    "the work to (and a session started here would be invisible to that "
+    "desktop when someone does log in). Log in at the console and retry, or "
+    "set MAGENT_SESSION0_POLICY=allow for a headless host."
+)
+# The hand-off inherits the budget of the command it replaces: a bring-up is a
+# cold-start storm (attach allows 900s over ssh for the same work), while
+# `serve --ensure` returns the moment a detached server answers.
+SESSION0_UP_TIMEOUT_S = 900.0
+SESSION0_SERVE_TIMEOUT_S = 60.0
+
+
+def session0_disposition(plat: Platform) -> Literal["run", "handoff", "refuse"]:
+    """What a session-creating command should do on THIS machine.
+
+    ONE decision, in one place, for every caller -- the command shells that can
+    hand off, and the psmux choke point that can only refuse. A second copy of
+    this policy is how one of them ends up creating a Session-0 fleet again.
+
+    An interactive logon session is always "run", before the policy is even
+    read: a normal desktop launch must not be able to change behaviour because
+    of an environment variable somebody set for a headless host. Off Windows
+    every platform reports interactive, so nothing changes there at all.
+    """
+    from magent.env import get_env  # heavy subsystem: in-body per policy
+
+    if plat.logon_session_is_interactive():
+        return "run"
+    policy = get_env().session0_policy
+    if policy == "allow":
+        return "run"
+    if policy == "refuse":
+        return "refuse"
+    return "handoff" if plat.supports_desktop_handoff() else "refuse"
+
+
+def session0_refusal(plat: Platform, base: str = SESSION0_REFUSAL) -> str:
+    """The refusal wording that fits THIS machine.
+
+    Two different situations wear the same disposition. Usually the policy said
+    no. But when the policy asked for a hand-off and the platform reports no
+    mechanism, the cause on Windows is specifically that nobody is logged on at
+    the console -- and a user who is told to "run it on the desktop" when there
+    is no desktop has been given advice they cannot take.
+    """
+    from magent.env import get_env  # heavy subsystem: in-body per policy
+
+    if get_env().session0_policy == "handoff" and not plat.supports_desktop_handoff():
+        return SESSION0_NO_DESKTOP
+    return base
+
+
+def session0_note() -> str | None:
+    """The one-line reason session creation is blocked here, or None.
+
+    What the "N session(s) failed to come up" printers add so a casualty list
+    carries its cause. A user staring at 40 failed names must not have to find
+    launch.log to learn that nothing was even attempted.
+    """
+    plat = get_platform()
+    if session0_disposition(plat) == "run":
+        return None
+    return session0_refusal(plat)
+
+
+def relay_handoff(plat: Platform, argv: list[str], *, timeout_s: float) -> int:
+    """Run ``argv`` on the desktop, relay its output verbatim, return its code.
+
+    Verbatim and unindented on purpose: the command being handed off is the
+    same command the user asked for, so its output IS this command's output.
+    `magent attach` indents the whole remote stream by two spaces on the
+    laptop, which is where the nesting belongs.
+    """
+    click.echo(SESSION0_HANDOFF_LINE)
+    result = plat.run_on_desktop(argv, timeout_s=timeout_s)
+    if result.stdout.strip():
+        click.echo(result.stdout.rstrip())
+    if result.stderr.strip():
+        click.echo(result.stderr.rstrip(), err=True)
+    if result.timed_out:
+        click.echo(
+            f"  {style('x', fg='red')} hand-off timed out after "
+            f"{timeout_s:.0f}s -- the desktop copy may still be running "
+            f"(see ~/.magent/logs/launch.log on this host). {result.detail}",
+            err=True,
+        )
+        return 1
+    if result.rc is None:
+        click.echo(
+            f"  {style('x', fg='red')} hand-off could not run on the desktop: "
+            f"{result.detail} "
+            "(see ~/.magent/logs/launch.log on this host)",
+            err=True,
+        )
+        return 1
+    return result.rc
 
 
 def hotkey_restart_reason(
@@ -150,6 +284,252 @@ def start_hotkey_listener(server_url: str, ssh_host: str | None = None) -> int |
     return None
 
 
+def supervised_hotkey_target(
+    manifest: dict[str, str | None] | None, default_url: str
+) -> tuple[str, str | None]:
+    """The ``(server_url, ssh_host)`` a SUPERVISED restart must use.
+
+    Pure so it is testable off Windows, like ``hotkey_restart_reason``.
+
+    The distinction this encodes is the whole reason ``ensure_hotkey_listener``
+    exists as a separate entry point. The launch and attach paths KNOW which
+    target the listener should serve and deliberately re-aim it when that
+    changes -- that is what ``hotkey_restart_reason``'s "target change" branches
+    are for. A supervisor knows no such thing: ``magent attach`` aims the
+    listener at a REMOTE host so F2 opens projects over VS Code Remote-SSH, and
+    a supervisor that re-aimed it at its own loopback URL every interval would
+    fight attach forever, silently breaking F2 on every remote fleet. So a
+    listener that is already running keeps whatever target it was wired to; the
+    supervisor's default is only ever used for a listener that is not there.
+
+    A missing/unreadable manifest yields the default: that listener is getting
+    restarted anyway ("no manifest" is a restart reason), and the default is
+    the only target we can honestly claim to know.
+    """
+    if manifest is None:
+        return default_url, None
+    return manifest.get("server_url") or default_url, manifest.get("ssh_host")
+
+
+def ensure_hotkey_listener(default_url: str) -> int | None:
+    """Make sure SOME Alt+V listener is running; never re-aim a healthy one.
+
+    The supervision entry point (``upload_server``'s serve loop calls this on an
+    interval), as opposed to ``start_hotkey_listener``, which is the *wiring*
+    entry point the launch and attach paths use. See
+    ``supervised_hotkey_target`` for why the two must differ.
+
+    Idempotent by construction -- it delegates to ``start_hotkey_listener``, so
+    a healthy current listener is a pid-file read plus a manifest read and no
+    spawn, and the "never two listeners" property is exactly the one that
+    function already had.
+
+    Windows-only, like everything hotkey: the caller owns the
+    ``supports_hotkey()`` gate that keeps the import below reachable.
+    """
+    from magent.hotkey import (  # ImportError off-Windows (hotkey.py guards); must stay lazy
+        listener_manifest,
+        listener_pid,
+    )
+
+    if listener_pid() is None:
+        return start_hotkey_listener(default_url, None)
+    url, ssh_host = supervised_hotkey_target(listener_manifest(), default_url)
+    return start_hotkey_listener(url, ssh_host)
+
+
+# --- Upload-server supervision ------------------------------------------------
+# The same doctrine as the Alt+V listener above, one process up. `magent serve`
+# is what every mobile upload and every Alt+V press goes through, and nothing in
+# the product ever re-checked that it was still there: attach panes redial,
+# sessions get revived, the listener is supervised -- serve alone had no
+# supervisor and left no trace when it died. It died silently twice in one day
+# (a machine-wide ConPTY wedge, then an unexplained disappearance over three
+# hours), and both times the first symptom was an Alt+V press doing nothing.
+#
+# serve cannot supervise itself: a supervisor that only ran while serve ran
+# would supervise nothing the moment serve died. The attention daemon is the
+# other long-lived process, it already polls on an interval, and it is the one
+# users leave running -- so it is the owner.
+#
+# All of this lives here, next to spawn_detached and ensure_hotkey_listener,
+# rather than in cli/background.py where the spawn recipe started: launch.py
+# must not import the cli package (cli/__init__ imports every command module, so
+# a reverse import cycles -- LS-A-001), and a supervisor in a src module cannot
+# reach a recipe that lives in one. cli/background._maybe_start_upload_server is
+# now a thin delegation to ensure_upload_server for exactly that reason.
+
+UPLOAD_RESPAWN_COOLDOWN_S = 60.0
+
+
+def _probe_upload_port(port: int) -> bool:
+    """True when something accepts a TCP connection on loopback ``port``.
+
+    The same question ``cli/background._probe_port`` and ``status`` ask, with
+    the same 0.3s budget: a refused loopback connect answers instantly, and a
+    probe that could block would freeze the loop it rides on.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.settimeout(0.3)
+    try:
+        probe.connect(("127.0.0.1", port))
+    except OSError:
+        return False
+    else:
+        return True
+    finally:
+        probe.close()
+
+
+def upload_server_argv(port: int, config_path: str | None) -> list[str]:
+    """The argv of a detached ``magent serve`` on ``port``.
+
+    One builder for both spawn sites (the bring-up ensure and the supervisor),
+    so the revived server can never drift from the one the launch path starts --
+    same interpreter, same ``--config``, same port.
+    """
+    args = [sys.executable, "-m", "magent"]
+    if config_path:
+        args += ["--config", config_path]
+    return [*args, "serve", "-p", str(port)]
+
+
+def ensure_upload_server(port: int, config_path: str | None = None) -> bool:
+    """Start the upload server detached unless something already answers on
+    ``port``. Returns True when a spawn was actually issued.
+
+    Detached because it must outlive the SSH bring-up command that spawns it --
+    see ``spawn_detached``.
+    """
+    if _probe_upload_port(port):
+        return False
+    spawn_detached(upload_server_argv(port, config_path))
+    return True
+
+
+def _validated_env() -> MagentEnv | None:
+    """The env singleton, or None if it no longer validates.
+
+    A daemon must never die of an environment variable it does not use, and by
+    the time the attention loop is running every other MAGENT_* consumer has
+    already failed loudly at CLI entry -- so an env that goes bad underneath a
+    detached process degrades to the defaults with a log line, exactly as
+    ``upload_server.supervision_enabled`` and ``log._configured_level`` do.
+    """
+    from pydantic import ValidationError
+
+    from magent.env import get_env
+
+    try:
+        return get_env()
+    except ValidationError:
+        get_logger("attention").warning(
+            "upload supervisor: environment did not validate; using defaults"
+        )
+        return None
+
+
+def upload_supervision_enabled() -> bool:
+    """Whether MAGENT_UPLOAD_SUPERVISOR permits the attention daemon to keep
+    ``magent serve`` alive. Public because ``status`` must ask the same question
+    the supervisor answers before it offers the daemon as a repair."""
+    env = _validated_env()
+    return True if env is None else env.upload_supervisor
+
+
+def upload_respawn_cooldown_s() -> float:
+    """The configured minimum seconds between two respawn attempts."""
+    env = _validated_env()
+    configured = None if env is None else env.upload_respawn_cooldown_s
+    if configured is None:
+        return UPLOAD_RESPAWN_COOLDOWN_S
+    return max(0.0, configured)
+
+
+class UploadServerSupervisor:
+    """Revives a dead ``magent serve``, at most once per cooldown.
+
+    ``tick`` is called once per attention poll, so DETECTION latency is the poll
+    interval while the RESPAWN RATE is bounded by ``cooldown_s``. The split is
+    the whole design: a serve that dies at 03:00 must not wait out a long timer
+    before anyone notices, and a serve that crashes on startup must not be
+    respawned in a tight loop. Looking is free; spawning is not.
+
+    Liveness is the loopback TCP probe. The recorded pid is read too, but only
+    for the log line, and deliberately so: ``run_server`` writes its pid file
+    AFTER the bind, so the pid can never be the earlier signal, and a pid number
+    the OS later recycles onto an unrelated process would blind the watchdog
+    permanently. What the pid does buy is a truthful diagnosis in the log --
+    "recorded pid 8123 is gone" (the observed failure) reads very differently
+    from "pid 8123 is alive but not answering", which is a wedge, not a death.
+
+    A spawn that fails outright (``spawn_detached`` raising) propagates to the
+    caller, which logs it and ticks again next poll -- see
+    ``cli/attention_cmd._upload_watchdog``. The handling lives there, at the
+    boundary with the loop that must survive, rather than here: a supervisor
+    that could take down the daemon it rides on would be trading one silent
+    death for another.
+    """
+
+    def __init__(
+        self,
+        port: int,
+        config_path: str | None = None,
+        *,
+        cooldown_s: float | None = None,
+        now: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._port = port
+        self._config_path = config_path
+        self._cooldown = (
+            upload_respawn_cooldown_s() if cooldown_s is None else cooldown_s
+        )
+        self._now = now
+        self._last_spawn: float | None = None
+
+    @property
+    def cooldown_s(self) -> float:
+        """The resolved cooldown — read by the daemon's startup log line so the
+        value in force is visible without re-deriving it from the env."""
+        return self._cooldown
+
+    def _pid_note(self) -> str:
+        """How the recorded pid contradicts (or corroborates) the dead port."""
+        from magent.upload_server import (  # in-body: upload_server imports launch back, and only one direction may be a module-level import
+            server_pid,
+        )
+
+        pid = server_pid(self._port)
+        if pid is None:
+            return "no pid file"
+        return f"recorded pid {pid} is {'alive' if pid_alive(pid) else 'gone'}"
+
+    def tick(self) -> bool:
+        """One liveness check. True when a respawn was issued."""
+        if _probe_upload_port(self._port):
+            return False
+        log = get_logger("attention")
+        now = self._now()
+        if self._last_spawn is not None and (now - self._last_spawn) < self._cooldown:
+            log.debug(
+                "upload supervisor: port %d still dead, within the %.0fs cooldown",
+                self._port,
+                self._cooldown,
+            )
+            return False
+        self._last_spawn = now
+        # ASCII only: this line goes to a rotating logfile that gets read back
+        # through whatever the host console's code page happens to be.
+        log.warning(
+            "upload supervisor: nothing answering on port %d (%s); starting a new "
+            "magent serve",
+            self._port,
+            self._pid_note(),
+        )
+        spawn_detached(upload_server_argv(self._port, self._config_path))
+        return True
+
+
 @dataclass
 class RunOpts:
     retile_all: bool = False
@@ -157,10 +537,15 @@ class RunOpts:
     group: str | None = None
     config_path: str = ""
     # Tile what is already open and launch nothing: the dispatchers still build
-    # the full target list (so retile_all can place every open window) but skip
-    # every spawn -- no IDE, no terminal, no psmux collection. A window the user
-    # closed must stay closed; it simply reports "not found" during tiling.
+    # the full target list but skip every spawn -- no IDE, no terminal, no
+    # psmux collection. A window the user closed must stay closed, and under
+    # `retile_all` it is dropped from the tiling set entirely (see
+    # `_retile_targets`) rather than waited on and reported "not found".
     tile_only: bool = False
+    # The project names the user checked in `cli/checklist.py`, or None for
+    # "every enabled project" -- which is what a skipped checklist (no terminal,
+    # or `--all`) means, and what this phase has always done.
+    only: frozenset[str] | None = None
 
 
 @dataclass
@@ -187,10 +572,18 @@ def _expand_base_dir(base_dir: str) -> str:
     return os.path.expandvars(os.path.expanduser(base_dir)).replace("/", os.sep)
 
 
-def _get_session_ids(tool: str, project_dir: str, count: int) -> list[str | None]:
+def _get_session_ids(
+    tool: str, project_dir: str, count: int, config_dir: Path | None = None
+) -> list[str | None]:
+    """``project_dir``'s resumable session ids for ``tool``, newest first.
+
+    ``config_dir`` names which of that tool's stores answers for the project --
+    None is its default store, i.e. today's answer for every project no account
+    was chosen for. See ``sessions.build_start_command``.
+    """
     caps = AGENT_TOOLS.get(tool)
     if caps and caps.session_ids:
-        return caps.session_ids(project_dir, count)
+        return caps.session_ids(project_dir, count, config_dir)
     return [None] * count
 
 
@@ -247,7 +640,10 @@ def run_magent(config: MagentConfig, opts: RunOpts) -> int:
 
     _start_psmux_and_upload(plat, config, opts, result)
 
-    _tile_targets(plat, opts, slots, result.targets)
+    targets = (
+        _retile_targets(config, opts, result) if opts.retile_all else result.targets
+    )
+    _tile_targets(plat, opts, slots, targets)
 
     return 0
 
@@ -281,9 +677,14 @@ def _prepare_grid(
 
 
 def _select_projects(config: MagentConfig, opts: RunOpts) -> list[ProjectConfig] | None:
-    """Enabled projects, optionally narrowed to opts.group. Returns None
-    (caller exits 0) when a named group matches nothing (after printing the
-    same 'No projects in group' message it does today)."""
+    """Enabled projects, optionally narrowed to opts.group and then to the
+    names in opts.only. Returns None (caller exits 0) when a named group matches
+    nothing (after printing the same 'No projects in group' message it does
+    today), or when the checked set matches no project at all.
+
+    Group first, then the checklist: the checklist was shown over the group's
+    projects, so narrowing the other way round could only ever widen it back.
+    """
     projects = [p for p in config.projects if p.enabled]
     if opts.group:
         projects = [
@@ -297,6 +698,12 @@ def _select_projects(config: MagentConfig, opts: RunOpts) -> list[ProjectConfig]
             )
             return None
         click.echo(f"Group '{opts.group}': {len(projects)} project(s)")
+    if opts.only is not None:
+        projects = [
+            p for p in projects if (p.title or get_leaf_name(p.path)) in opts.only
+        ]
+        if not projects:
+            return None
     return projects
 
 
@@ -307,6 +714,62 @@ class _LaunchResult:
     targets: list[_Target]
     psmux_windows: list[PsmuxWindowOpts]
     psmux_colors: dict[str, str | None]
+    # Window titles as the launch phase saw them -- the same snapshot its
+    # already-running probe used. `_retile_targets` reads it to find
+    # magent-owned windows that no configured project accounts for.
+    open_titles: tuple[str, ...] = ()
+
+
+def _discovered_targets(
+    open_titles: tuple[str, ...], targets: list[_Target], prefix: bool
+) -> list[_Target]:
+    """magent-owned windows on screen that no configured project accounts for.
+
+    These are `magent attach` panes: real magent windows whose names are the
+    REMOTE host's session names, so they never appear in this machine's config
+    and were invisible to `--retile-all` until now. They are never `is_new`
+    (they are open by definition and nothing here launches them), so a plain
+    `--go` still ignores them -- only a retile picks them up.
+
+    Discovery is only possible with ``settings.windowTitlePrefix`` ON. With it
+    off, magent's own titles are bare project names (``titles.make_title``
+    with ``prefix=False``), indistinguishable from any other application's
+    window, so there is nothing to key on and this returns nothing rather than
+    guess.
+    """
+    if not prefix:
+        return []
+    known = {t.key for t in targets if t.mode == "magent-name"}
+    return [
+        _Target(name=name, key=name, mode="magent-name", is_new=False)
+        for name in magent_window_names(open_titles)
+        if name not in known
+    ]
+
+
+def _retile_targets(
+    config: MagentConfig, opts: RunOpts, result: _LaunchResult
+) -> list[_Target]:
+    """The window set a `--retile-all` places: only what is on screen.
+
+    Configured targets come first (config order), then the discovered extras
+    in snapshot order, so slot assignment is deterministic. Under
+    ``tile_only`` -- a retile that launches nothing -- a configured window
+    that is not open right now is dropped: it can never appear, so enqueueing
+    it would only buy `place_windows` a poll deadline and the user a red "not
+    found" line. ``--go --retile-all`` keeps every configured target (the
+    launch phase is bringing the missing ones up) and still gains the extras,
+    which is the "then tile everything" half of its documented meaning.
+    """
+    base = (
+        [t for t in result.targets if not t.is_new]
+        if opts.tile_only
+        else result.targets
+    )
+    extras = _discovered_targets(
+        result.open_titles, result.targets, config.settings.window_title_prefix
+    )
+    return [*base, *extras]
 
 
 def _launch_projects(
@@ -379,7 +842,10 @@ def _launch_projects(
         )
 
     return _LaunchResult(
-        targets=targets, psmux_windows=psmux_windows, psmux_colors=_psmux_colors
+        targets=targets,
+        psmux_windows=psmux_windows,
+        psmux_colors=_psmux_colors,
+        open_titles=tuple(win_snapshot),
     )
 
 
@@ -524,7 +990,16 @@ def _dispatch_cli_agent_project(
             cmd = _wrap_happy(win_tool, cmd)
 
         proj_psmux = use_psmux and not is_remote
-        running = is_running(win_title, match_mode)
+        # A psmux window's REAL title carries the sanitized session name --
+        # that is what `attach_psmux` titles it with (spaces/dots/colons
+        # become "-", see `psmux.session_name`). The already-running probe and
+        # the tiling target must key on that same string: probing with the raw
+        # title meant a project named "GitHub Advertisment" respawned a fresh
+        # window on every --go and its tile pass hunted a title that never
+        # exists ("x ... not found"). Non-psmux windows are titled with the
+        # raw title, so they keep keying on it.
+        tile_key = _psmux_session_name(win_title) if proj_psmux else win_title
+        running = is_running(tile_key, match_mode)
         # Window-level dedupe, the same three-way rule the attach path uses:
         # an already-OPEN window is never collected, because every collected
         # window gets an `attach_psmux` -- which spawns a BRAND-NEW terminal
@@ -536,15 +1011,14 @@ def _dispatch_cli_agent_project(
         if proj_psmux and not running and not opts.dry_run and not opts.tile_only:
             resolved_dir = _resolve_path(proj.path, base_dir)
             if resolved_dir:
-                wname = _psmux_session_name(win_title)
                 psmux_windows.append(
                     PsmuxWindowOpts(
-                        window_name=wname,
+                        window_name=tile_key,
                         cwd=resolved_dir,
                         command=cmd,
                     )
                 )
-                psmux_colors[wname] = proj.color
+                psmux_colors[tile_key] = proj.color
         if not running and not opts.dry_run and not opts.tile_only and not proj_psmux:
             if is_remote:
                 resolved_dir = proj.remote_path or proj.path
@@ -577,7 +1051,7 @@ def _dispatch_cli_agent_project(
         if not running:
             new_count += 1
         targets.append(
-            _Target(name=win_title, key=win_title, mode=match_mode, is_new=not running)
+            _Target(name=tile_key, key=tile_key, mode=match_mode, is_new=not running)
         )
         _log_project(
             win_title, win_tool, running, proj.host, happy=use_happy, psmux=proj_psmux
@@ -612,12 +1086,29 @@ def _start_psmux_and_upload(
                 f" session(s) failed to come up: {style(', '.join(failed), fg='red')}"
                 f" {style('(see ~/.magent/logs/launch.log)', dim=True)}"
             )
+            # `--go` never hands off (it is a local, interactive command by
+            # definition), so reaching here in Session 0 means the choke point
+            # refused -- and a casualty list with no cause is what sent a user
+            # hunting through launch.log last time.
+            note = session0_note()
+            if note:
+                click.echo(f"  {style(note, dim=True)}")
         for pw in psmux_windows:
             plat.attach_psmux(
                 pw.window_name,
                 make_title(pw.window_name, prefix=config.settings.window_title_prefix),
                 psmux_colors.get(pw.window_name),
             )
+        # The fleet that was just created IS the interactive path -- every
+        # keystroke in every pane crosses one of these processes. Sweeping here
+        # (rather than flagging the spawn) is the only thing that can work: the
+        # psmux SERVER is a grandchild forked by the one-shot client, and a
+        # Windows priority class is not inherited across that. Failure is never
+        # this path's problem -- the sessions are up either way.
+        try:
+            psmux.boost_priority()
+        except OSError as exc:
+            get_logger("launch").warning("psmux boost: priority sweep failed (%s)", exc)
         click.echo(
             f"\n  {style('#', fg='yellow')} psmux: {style(str(len(psmux_windows)), fg='yellow', bold=True)} sessions"
             f" {style('(synced with mobile)', dim=True)}"
@@ -665,11 +1156,22 @@ def _tile_targets(
 ) -> None:
     """Place (or, under dry_run, preview) each target into a slot. Delegates
     the resolve-and-move-with-retry logic to magent.tiling.place_windows
-    (R13/E9's shared helper) -- no lookup/retry loop is re-implemented here."""
+    (R13/E9's shared helper) -- no lookup/retry loop is re-implemented here.
+
+    Under ``retile_all`` the caller has already narrowed `targets` to the
+    windows that are actually on screen (`_retile_targets`), so everything
+    here gets placed."""
     to_place = targets if opts.retile_all else [t for t in targets if t.is_new]
 
     if not to_place:
-        click.echo(f"\n  {style('+', fg='green')} All windows already positioned.")
+        # A retile with an empty set means nothing is open -- saying "already
+        # positioned" would claim windows exist that don't.
+        note = (
+            "No open magent windows to tile."
+            if opts.retile_all
+            else "All windows already positioned."
+        )
+        click.echo(f"\n  {style('+', fg='green')} {note}")
         return
 
     mode_label = (
@@ -812,8 +1314,13 @@ def decorate_psmux_sessions_async(
     return psmux.decorate_sessions_async(names, code_hint=code_hint)
 
 
-def kill_psmux(names: list[str]) -> list[str]:
-    """Delegate to ``psmux.kill_servers``."""
-    from magent.psmux import kill_servers
+def stop_psmux(names: list[str]) -> tuple[list[str], list[str]]:
+    """Delegate to ``psmux.stop_sessions``. Returns ``(stopped, still_running)``.
 
-    return kill_servers(names)
+    Replaces the old ``kill_psmux`` (a pass-through to the attempt-only
+    ``kill_servers``): a shutdown command has to be able to tell the user what
+    it PROVED it stopped, and what it could not.
+    """
+    from magent.psmux import stop_sessions
+
+    return stop_sessions(names)

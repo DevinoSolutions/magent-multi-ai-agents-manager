@@ -34,7 +34,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.e2e._pty import Pty
+from tests.e2e._pty import Budget, Pty
 
 pytestmark = [pytest.mark.e2e, pytest.mark.pty]
 
@@ -61,6 +61,23 @@ def _child_env(home: Path) -> dict[str, str]:
     env["HOMEDRIVE"] = drive
     env["HOMEPATH"] = tail or "\\"
     env["HOME"] = home_s
+    # The Alt+V listener installs a SYSTEM-WIDE keyboard hook, and a real
+    # `serve` now supervises one into existence. Redirecting HOME does not
+    # contain a global hook, so tests that start a real server opt out
+    # rather than install one on the machine running them.
+    env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
+    # ...and `attention -d` now supervises `magent serve` the same way, so a
+    # test daemon would otherwise start a REAL upload server on this machine.
+    env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
+    # ...and the psmux priority sweep reaches processes by IMAGE NAME, which
+    # no HOME redirect contains: a test-spawned serve/daemon must never
+    # re-prioritise the developer's real psmux fleet.
+    env["MAGENT_PSMUX_BOOST"] = "0"
+    # ...and the Session-0 hand-off must never fire from a test: a runner
+    # (or an ssh-driven leg) is legitimately non-interactive, and the
+    # default policy would create a REAL scheduled task on somebody's
+    # desktop. "allow" is today's behaviour, everywhere.
+    env["MAGENT_SESSION0_POLICY"] = "allow"
     env["APPDATA"] = home_s
     env["LOCALAPPDATA"] = home_s
     env["XDG_CONFIG_HOME"] = home_s
@@ -73,11 +90,19 @@ def _child_env(home: Path) -> dict[str, str]:
     return env
 
 
+# One wall-clock allowance per menu run, clamping every stage inside it. Each
+# test here is a handful of `expect`s at the driver's 30s default, which sum to
+# a worst case nobody picked; the total is picked. A local `python -m magent`
+# that has not painted its menu in a minute and a half is broken, not slow.
+MENU_BUDGET_S = 90.0
+
+
 def _spawn(env: dict[str, str], cwd: Path, *args: str) -> Pty:
     return Pty(
         [sys.executable, "-m", "magent", *args],
         env=env,
         cwd=str(cwd),
+        budget=Budget(MENU_BUDGET_S),
     )
 
 

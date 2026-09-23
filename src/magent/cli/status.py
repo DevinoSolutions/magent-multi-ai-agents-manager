@@ -39,12 +39,26 @@ from magent.cli.ui import (
 from magent.log import heartbeat_age, heartbeat_fresh
 from magent.paths import find_config
 from magent.procs import pid_alive
+from magent.psmux import session0_message, session0_server_pids
 from magent.style import style
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from magent.config import MagentConfig
+
+
+# The one repair instruction for a dead/stale Alt+V listener, shared by
+# `status` and `doctor`'s hotkey check so the two can never drift into telling
+# the user different things. `down --all` stops the server first and the
+# listener second, and the fresh server supervises a fresh listener back up.
+LISTENER_REPAIR_HINT = "magent down --all, then magent serve (or magent attach)"
+
+# Offered only when the upload server is DEAD and nothing is watching it: the
+# attention daemon is the upload server's supervisor, so with it off a dead
+# server stays dead until a human notices -- which is precisely the failure
+# that supervision exists to end.
+UPLOAD_WATCHDOG_HINT = "magent attention -d  (it revives a dead upload server)"
 
 
 def _health_check(port: int) -> bool:
@@ -72,8 +86,30 @@ def _upload_state(port: int) -> str:
     return "off"
 
 
-def _listener_state() -> str:
-    """ "on" (heartbeat fresh) / "stale" (pid alive, heartbeat expired) / "off"."""
+def _listener_state(upload_state: str) -> str:
+    """Liveness of the Alt+V listener, judged against whether one is EXPECTED.
+
+    Four states, and the distinction between the last two is the point:
+
+    * "on"    -- pid alive, heartbeat fresh.
+    * "stale" -- pid alive, heartbeat expired (the message loop is wedged).
+    * "dead"  -- no listener, on a hotkey-capable platform, while the upload
+      server is SERVING and allowed to supervise one. The upload server owns
+      the listener (``upload_server._supervise_hotkey``), so a healthy server
+      with no listener is a real fault: Alt+V does nothing, and until this
+      state existed that was reported as a benign "off  (starts with `magent
+      attach`)" with exit 0 -- the observability hole this closes.
+    * "off"   -- nobody promised a listener: a platform without hotkey support,
+      no upload server running, or supervision turned off.
+
+    ``upload_state`` comes from ``_upload_state`` rather than being re-probed
+    here, so one status pass makes one health request. Only a genuinely
+    *serving* server ("on") implies a listener -- when the server itself is
+    "dead" its own line already says so, and a second red line for the
+    downstream symptom would be noise. And only a server *permitted* to
+    supervise implies one: reporting DEAD to somebody who set
+    MAGENT_HOTKEY_SUPERVISOR=0 would invent a promise nobody made.
+    """
     from magent.platform import get_platform  # heavy subsystem: in-body per policy
 
     if not get_platform().supports_hotkey():
@@ -84,8 +120,28 @@ def _listener_state() -> str:
 
     pid = listener_pid()
     if not pid:
-        return "off"
+        return "dead" if upload_state == "on" and _supervised() else "off"
     return "on" if heartbeat_fresh("hotkey") else "stale"
+
+
+def _supervised() -> bool:
+    """Is `serve` allowed to keep an Alt+V listener alive? (the one owner of
+    that question is ``upload_server``; this is only the in-body import)."""
+    from magent.upload_server import (
+        supervision_enabled,  # heavy subsystem: in-body per policy
+    )
+
+    return supervision_enabled()
+
+
+def _upload_supervised() -> bool:
+    """Is `attention -d` allowed to keep the upload server alive? (the one owner
+    of that question is ``launch``; this is only the in-body import)."""
+    from magent.launch import (
+        upload_supervision_enabled,  # heavy subsystem: in-body per policy
+    )
+
+    return upload_supervision_enabled()
 
 
 def _attention_state() -> str:
@@ -135,7 +191,9 @@ def _agents_attention_rollup(cfg: MagentConfig) -> None:
 
 
 def _psmux_sessions(
-    up: list[dict[str, object]], projects: list[dict[str, object]]
+    up: list[dict[str, object]],
+    projects: list[dict[str, object]],
+    staleness: dict[str, float],
 ) -> list[dict[str, object]]:
     """One row per LIVE psmux session: ``{name, app, idle, state}``.
 
@@ -146,8 +204,11 @@ def _psmux_sessions(
     live session, and those go out as a single unbounded fan-out
     (``psmux.pane_current_commands``), so 40 sessions stay ~one psmux
     round-trip. Agent states come from the same store the picker reads, so the
-    two surfaces can never disagree. Pure data: the shell decides how to print
-    it and what to exit with.
+    two surfaces can never disagree -- which is why ``staleness`` is a required
+    argument and not a default: the same config windows the `agents` array ages
+    with (``_agents_snapshot`` -> ``engine_from_config``) must age this column,
+    or the two halves of one report contradict each other about one record.
+    Pure data: the shell decides how to print it and what to exit with.
     """
     from magent import psmux as psmux_mod  # heavy subsystem: in-body per policy
     from magent.cli.session_picker import _session_cwds, _session_states
@@ -158,7 +219,7 @@ def _psmux_sessions(
     binary = psmux_mod.find_psmux() or ""
     apps = psmux_mod.pane_current_commands(sids, psmux=binary or None)
     resolved = {psmux_mod.socket_id(p): _as_str(p.get("resolved")) for p in projects}
-    states = _session_states(_session_cwds(binary, sids, resolved))
+    states = _session_states(_session_cwds(binary, sids, resolved), staleness)
     rows: list[dict[str, object]] = []
     for sid in sids:
         app = apps.get(sid, "")
@@ -197,9 +258,10 @@ def _print_session_row(idx: int, row: dict[str, object]) -> None:
 
 
 def _gather_status(cfg: MagentConfig) -> dict[str, str]:
+    upload = _upload_state(cfg.settings.upload_port)
     return {
-        "upload_server": _upload_state(cfg.settings.upload_port),
-        "listener": _listener_state(),
+        "upload_server": upload,
+        "listener": _listener_state(upload),
         "attention": _attention_state(),
     }
 
@@ -207,7 +269,7 @@ def _gather_status(cfg: MagentConfig) -> dict[str, str]:
 def _is_degraded(status: dict[str, str]) -> bool:
     return (
         status["upload_server"] == "dead"
-        or status["listener"] == "stale"
+        or status["listener"] in ("stale", "dead")
         or status["attention"] in ("stale", "crashed")
     )
 
@@ -228,11 +290,15 @@ def _render_status(config_file: Path) -> StatusReport:
     """Prints the status report; reports whether any daemon is degraded
     (dead/stale) plus the live psmux sessions it listed, in display order.
     Never exits -- shared with the menu's _menu_status."""
+    from magent.cli.attention_cmd import staleness_from_config
     from magent.launch import psmux_status  # heavy subsystem: in-body per policy
 
     cfg = _load_config_or_exit(config_file)
     up, down, projects = psmux_status(cfg)
-    rows = {_as_str(r.get("name")): r for r in _psmux_sessions(up, projects)}
+    rows = {
+        _as_str(r.get("name")): r
+        for r in _psmux_sessions(up, projects, staleness_from_config(cfg))
+    }
     listed: list[dict[str, object]] = []
 
     _banner()
@@ -281,15 +347,50 @@ def _render_status(config_file: Path) -> StatusReport:
     click.echo(
         f"  {style('Upload server', bold=True)}   {upload_labels[status['upload_server']]}"
     )
+    if (
+        status["upload_server"] == "dead"
+        and status["attention"] == "off"
+        and cfg.settings.upload_server
+        and _upload_supervised()
+    ):
+        # Same doctrine as the listener's Repair line: a red line the user
+        # cannot act on is half an answer. The attention daemon is what watches
+        # the upload server -- with it off, nothing will bring this one back.
+        # Suggested only when it WOULD supervise: offering the daemon to
+        # somebody who set MAGENT_UPLOAD_SUPERVISOR=0, or whose config has no
+        # upload server at all, would be advice that does nothing.
+        click.echo(
+            f"  {style('Repair:', dim=True)} {style(UPLOAD_WATCHDOG_HINT, bold=True)}"
+        )
 
     listener_labels = {
         "on": style("ON", fg="green", bold=True),
         "stale": style("STALE  (heartbeat expired)", fg="red", bold=True),
-        "off": style("off  (starts with `magent attach`)", dim=True),
+        "dead": style(
+            "DEAD  (upload server is up but no listener — Alt+V does nothing)",
+            fg="red",
+            bold=True,
+        ),
+        # Two ways to be off, and they have different truths behind them:
+        # normally the upload server would start one, but not if the user took
+        # ownership with MAGENT_HOTKEY_SUPERVISOR=0.
+        "off": style(
+            "off  (starts with the upload server)"
+            if _supervised()
+            else "off  (supervision disabled by MAGENT_HOTKEY_SUPERVISOR)",
+            dim=True,
+        ),
     }
     click.echo(
         f"  {style('Alt+V listener', bold=True)}   {listener_labels[status['listener']]}"
     )
+    if status["listener"] in ("dead", "stale"):
+        # A red line the user cannot act on is only half an answer. The repair
+        # is the same either way: the upload server is what supervises the
+        # listener, so restarting it re-establishes one within the interval.
+        click.echo(
+            f"  {style('Repair:', dim=True)} {style(LISTENER_REPAIR_HINT, bold=True)}"
+        )
 
     attention_labels = {
         "on": style("ON", fg="green", bold=True),
@@ -302,6 +403,17 @@ def _render_status(config_file: Path) -> StatusReport:
     )
 
     _agents_attention_rollup(cfg)
+
+    # stderr, and deliberately NOT part of the degraded verdict: these servers
+    # are nothing this magent started or can stop, so they must not change the
+    # 0/1/3 exit contract -- but they ARE the reason a name refuses to come up,
+    # and this is the surface the user is already looking at when that happens.
+    session0 = session0_server_pids()
+    if session0:
+        click.echo(
+            f"  {style('!', fg='yellow')} {session0_message(len(session0))}",
+            err=True,
+        )
 
     return StatusReport(_is_degraded(status), listed)
 
@@ -321,6 +433,7 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
         sys.exit(1)
 
     if as_json:
+        from magent.cli.attention_cmd import staleness_from_config
         from magent.launch import (
             psmux_status,  # heavy subsystem: in-body per policy
         )
@@ -335,7 +448,14 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
         # change to its shape or to the 0/1/3 exit contract -- a dead psmux
         # session is a "not running" row, not a degraded daemon.
         up, _down, projects = psmux_status(cfg)
-        payload["psmux_sessions"] = _psmux_sessions(up, projects)
+        payload["psmux_sessions"] = _psmux_sessions(
+            up, projects, staleness_from_config(cfg)
+        )
+        # Additive too, and for the same reason the human line is on stderr and
+        # not in the verdict: a count of psmux servers stranded in logon
+        # Session 0 is a fact about the machine, not about magent's daemons, so
+        # it changes neither the envelope's shape nor the exit contract.
+        payload["psmux_session0"] = len(session0_server_pids())
         click.echo(json.dumps(payload))
         sys.exit(3 if _is_degraded(status) else 0)
 
@@ -365,6 +485,37 @@ def _down_host(explicit: str | None, local_targets: list[str]) -> str | None:
     return _read_last_host()
 
 
+def _report_shutdown(stopped: list[str], still: list[str]) -> None:
+    """Say what was PROVED stopped, and say the survivors loudly.
+
+    The old line was ``Stopped {len(targets)} session(s)`` off the list the
+    command had *tried* -- printed verbatim on a machine where 11 of the 46 it
+    claimed were still alive and attachable. A shutdown report that cannot be
+    wrong about the world is not a report.
+    """
+    if stopped:
+        click.echo(
+            f"  {style('+', fg='green')} Stopped {style(str(len(stopped)), fg='green', bold=True)}"
+            f" session(s): {style(', '.join(stopped), dim=True)}"
+        )
+    elif not still:
+        click.echo(f"  {style('-', dim=True)} No running sessions to stop.")
+    if still:
+        click.echo(
+            f"  {style('x', fg='red')} {style(str(len(still)), fg='red', bold=True)}"
+            f" session(s) would NOT stop: {style(', '.join(still), fg='red')}"
+            f" {style('(two kill attempts each -- see ~/.magent/logs/launch.log)', dim=True)}"
+        )
+
+
+def _select_targets(pool: list[str], names: tuple[str, ...]) -> list[str]:
+    """``names`` filtered out of ``pool`` (case-insensitively), or all of it."""
+    if not names:
+        return list(pool)
+    wanted = {n.lower() for n in names}
+    return [n for n in pool if n.lower() in wanted]
+
+
 @main.command("down")
 @click.argument("names", nargs=-1)
 @click.option("-g", "--group", default=None, help="Only sessions in this group")
@@ -372,7 +523,8 @@ def _down_host(explicit: str | None, local_targets: list[str]) -> str | None:
     "--all",
     "do_all",
     is_flag=True,
-    help="Stop every session, the upload server, and the Alt+V listener",
+    help="Stop EVERY psmux session (killing the agent running in each), plus"
+    " the upload server and the Alt+V listener",
 )
 @click.option("--server", "stop_srv", is_flag=True, help="Also stop the upload server")
 @click.option(
@@ -390,25 +542,42 @@ def down_cmd(
     stop_srv: bool,
     host: str | None,
 ) -> None:
-    """Shut down running psmux sessions (and optionally the upload server)."""
+    """Shut down psmux sessions (and optionally the upload server).
+
+    Stops every configured session in scope -- not just the ones a liveness
+    probe happens to see -- then re-probes and reports only what it PROVED
+    stopped, naming any survivor.
+    """
     config_file = find_config(ctx.obj.get("config_path"))
     cfg = _load_config_or_exit(config_file)
 
     from magent.launch import (  # heavy subsystem: in-body per policy
-        kill_psmux,
         psmux_status,
+        stop_psmux,
     )
 
-    up, _, _ = psmux_status(cfg, group=group)
-    # Kill keys off the psmux socket id (P3-01); `status` shows the same ids.
-    up_names = [_as_str(u.get("session")) or _as_str(u.get("name")) for u in up]
-    if names:
-        wanted = {n.lower() for n in names}
-        targets = [n for n in up_names if n.lower() in wanted]
-    else:
-        targets = up_names
+    up, _, projects = psmux_status(cfg, group=group)
+    # Two lists, on purpose. Kill keys off the psmux socket id (P3-01); `status`
+    # shows the same ids.
+    #
+    # `targets` (what gets killed) is CONFIGURED, not live: `--all` promises to
+    # stop every psmux session and used to deliver "stop whatever one un-retried
+    # has-session fan-out called up", so a session the probe missed was neither
+    # stopped nor mentioned -- the reported "these stay always" survivors.
+    # kill-server against a socket with no server is a harmless no-op, so
+    # over-targeting costs nothing and under-targeting costs the whole feature.
+    #
+    # `live` (what decides local-vs-remote) stays live: on an attach CLIENT
+    # nothing is RUNNING locally, and that -- not "config lists no projects" --
+    # is what makes `down --all` act on the remembered host.
+    live = _select_targets(
+        [_as_str(u.get("session")) or _as_str(u.get("name")) for u in up], names
+    )
+    targets = _select_targets(
+        [_as_str(p.get("session")) or _as_str(p.get("name")) for p in projects], names
+    )
 
-    remote = _down_host(host, targets)
+    remote = _down_host(host, live)
     remote_rc = 0
     if remote:
         from magent.cli.attach import (
@@ -417,13 +586,9 @@ def down_cmd(
 
         remote_rc = _remote_down(remote, names, group, do_all, stop_srv)
     elif targets:
-        kill_psmux(targets)
-        click.echo(
-            f"  {style('+', fg='green')} Stopped {style(str(len(targets)), fg='green', bold=True)}"
-            f" session(s): {style(', '.join(targets), dim=True)}"
-        )
+        _report_shutdown(*stop_psmux(targets))
     else:
-        click.echo(f"  {style('-', dim=True)} No matching running sessions.")
+        click.echo(f"  {style('-', dim=True)} No matching sessions in config.")
 
     if do_all or stop_srv:
         from magent.upload_server import (
@@ -608,6 +773,14 @@ def _menu_up(config_file: Path) -> None:
                 f" session(s) failed to come up: {style(', '.join(failed), fg='red')}"
                 f" {style('(see ~/.magent/logs/launch.log)', dim=True)}"
             )
+            # The menu is a local, interactive surface and never hands off, so
+            # a Session-0 refusal from the choke point is the one cause it can
+            # name here (see launch.session0_note).
+            from magent.launch import session0_note
+
+            note = session0_note()
+            if note:
+                click.echo(f"  {style(note, dim=True)}")
         if cfg.settings.upload_server:
             _maybe_start_upload_server(cfg.settings.upload_port, str(config_file))
     click.echo()
@@ -616,8 +789,8 @@ def _menu_up(config_file: Path) -> None:
 
 def _menu_down(config_file: Path) -> None:
     from magent.launch import (  # heavy subsystem: in-body per policy
-        kill_psmux,
         psmux_status,
+        stop_psmux,
     )
 
     cfg = _load_config_or_exit(config_file)
@@ -672,10 +845,10 @@ def _menu_down(config_file: Path) -> None:
                 click.echo(f"  {style('?', fg='yellow')} cancelled.")
                 return
             targets = buckets[sel]
-        kill_psmux(targets)
-        click.echo(
-            f"  {style('+', fg='green')} Stopped {style(str(len(targets)), fg='green', bold=True)} session(s)."
-        )
+        # Same verified report the `down` command gives: the menu used to
+        # print the length of the list it had tried, which is the half of
+        # NF-S3-001 that survived pass-2 (the server line was fixed then).
+        _report_shutdown(*stop_psmux(targets))
         if also_server:
             from magent.upload_server import (
                 stop_server,  # heavy subsystem: in-body per policy

@@ -26,6 +26,8 @@ from magent.style import style
 from magent.titles import get_leaf_name
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from magent import attention
     from magent.config import AttentionSettings, MagentConfig
     from magent.platform import Platform
@@ -109,6 +111,27 @@ def name_pairs_from_config(cfg: MagentConfig) -> list[tuple[str, str]]:
     return pairs
 
 
+def staleness_from_config(cfg: MagentConfig) -> dict[str, float]:
+    """``settings.attention``'s staleness keys as the ``{state: seconds}`` window
+    map every state-aging surface takes.
+
+    The ONE translation, and deliberately not inlined into the engine builder
+    below: the engine is not the only reader. ``session_picker._session_states``
+    ages the per-session rows behind `magent sessions` AND `status`'s
+    psmux-session table, and it used to import ``attention.STALENESS_S``
+    directly — so a widened window was honored by the daemon, `watch` and
+    `status --json`'s agents array while those two surfaces silently kept the
+    module defaults. The cli module owns the config translation and hands its
+    consumers plain values."""
+    from magent import agent_state  # heavy subsystem: in-body per policy
+
+    att = cfg.settings.attention
+    return {
+        agent_state.WORKING: att.staleness_working_s,
+        agent_state.NEEDS_INPUT: att.staleness_needs_input_s,
+    }
+
+
 def engine_from_config(cfg: MagentConfig) -> attention.AttentionEngine:
     """Build an AttentionEngine whose staleness/debounce come from
     ``settings.attention`` — so `status`/`watch` age states with the SAME
@@ -116,17 +139,12 @@ def engine_from_config(cfg: MagentConfig) -> attention.AttentionEngine:
     is derived from the enabled projects. Daemon-only concerns (renderers, ntfy
     topic) stay at the daemon call site; this helper covers the config-derived
     kwargs common to all three surfaces."""
-    from magent import agent_state, attention  # heavy subsystem: in-body per policy
+    from magent import attention  # heavy subsystem: in-body per policy
 
-    att = cfg.settings.attention
-    staleness = {
-        agent_state.WORKING: att.staleness_working_s,
-        agent_state.NEEDS_INPUT: att.staleness_needs_input_s,
-    }
     return attention.AttentionEngine(
         attention.name_map_from_projects(name_pairs_from_config(cfg)),
-        staleness=staleness,
-        debounce_s=att.debounce_s,
+        staleness=staleness_from_config(cfg),
+        debounce_s=cfg.settings.attention.debounce_s,
     )
 
 
@@ -172,6 +190,103 @@ def _plan_renderers(
                 "(see .env.example)"
             )
     return renderers, warnings
+
+
+def _psmux_boost_tick() -> Callable[[], None]:
+    """The per-tick psmux priority sweep (see ``psmux.boost_priority``).
+
+    Unconditional -- no config gate and no second env gate -- because the sweep
+    has exactly one gate of its own (``MAGENT_PSMUX_BOOST``, read inside
+    ``boost_priority`` so every owner asks the same question) and is a no-op
+    off Windows and on an already-boosted fleet. A daemon that ticked for hours
+    while the fleet it watches typed slowly is precisely the gap this closes,
+    and unlike the upload server there is nothing here to spawn, so there is
+    nothing a user could be surprised by beyond the boost itself.
+    """
+    from magent.log import get_logger  # heavy subsystem: in-body per policy
+
+    # psmux is a leaf, not a heavy subsystem -- in-body only to keep this
+    # module's top-level import list matching its siblings' shape.
+    from magent.psmux import boost_priority
+
+    log = get_logger("attention")
+
+    def _tick() -> None:
+        try:
+            boost_priority()
+        except Exception:
+            # Same doctrine as the upload watchdog below: supervision must
+            # never take down the loop that is supposed to survive to look again.
+            log.exception("psmux boost: priority sweep failed")
+
+    return _tick
+
+
+def _upload_watchdog(
+    cfg: MagentConfig, config_path: str | None
+) -> Callable[[list[attention.SessionView]], None] | None:
+    """The per-tick hook that keeps ``magent serve`` alive, or None when this
+    daemon must not supervise one.
+
+    Two gates, and they answer different questions. ``settings.uploadServer`` is
+    the config's own "does this machine run an upload server" switch: a user who
+    turned it off is not second-guessed, and nothing is resurrected on a machine
+    that never had one. ``MAGENT_UPLOAD_SUPERVISOR`` is the runtime opt-out for
+    somebody who runs serve under their own supervisor -- and the reason every
+    test fixture that starts a real ``attention -d`` can be sure it will not
+    quietly spawn a real server on the runner.
+
+    Riding the poll tick rather than a second timer is deliberate: the daemon
+    already wakes on an interval, the probe is one refused loopback connect, and
+    the RESPAWN rate is bounded by the supervisor's cooldown rather than by how
+    often it looks (see ``launch.UploadServerSupervisor``).
+    """
+    from magent.launch import (  # heavy subsystem: in-body per policy
+        UploadServerSupervisor,
+        upload_supervision_enabled,
+    )
+    from magent.log import get_logger  # heavy subsystem: in-body per policy
+
+    log = get_logger("attention")
+    if not cfg.settings.upload_server:
+        log.info("upload supervisor: off (settings.uploadServer is false)")
+        return None
+    if not upload_supervision_enabled():
+        log.info("upload supervisor: disabled by MAGENT_UPLOAD_SUPERVISOR")
+        return None
+    supervisor = UploadServerSupervisor(cfg.settings.upload_port, config_path)
+    log.info(
+        "upload supervisor: watching port %d (respawn cooldown %.0fs)",
+        cfg.settings.upload_port,
+        supervisor.cooldown_s,
+    )
+
+    def _tick(_views: list[attention.SessionView]) -> None:
+        try:
+            supervisor.tick()
+        except Exception:
+            # Supervision must never be able to kill the daemon it rides on --
+            # the whole point is that something survives to look again.
+            log.exception("upload supervisor: check failed")
+
+    return _tick
+
+
+def _daemon_tick(
+    cfg: MagentConfig, config_path: str | None
+) -> Callable[[list[attention.SessionView]], None]:
+    """Everything the daemon does per poll besides rendering: the psmux
+    priority sweep (always) and the upload-server watchdog (when this daemon
+    owns one). One hook, because ``run_attention_loop`` takes one."""
+    boost = _psmux_boost_tick()
+    watchdog = _upload_watchdog(cfg, config_path)
+
+    def _tick(views: list[attention.SessionView]) -> None:
+        boost()
+        if watchdog is not None:
+            watchdog(views)
+
+    return _tick
 
 
 def _setup_from_config(
@@ -335,6 +450,7 @@ def attention_cmd(
             renderers,
             poll_interval=poll_s,
             max_ticks=ticks,
+            on_tick=_daemon_tick(cfg, str(config_path) if config_path else None),
         )
     except KeyboardInterrupt:
         click.echo(f"\n  {style('Stopped.', dim=True)}")

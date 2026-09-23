@@ -53,6 +53,85 @@ class MagentEnv(BaseSettings):
     sentry_dsn: HttpUrl | None = None
     ntfy_topic: HttpUrl | None = None
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] | None = None
+    # Whether `magent serve` keeps the Alt+V listener alive (see
+    # upload_server._supervise_hotkey). On by default -- a serve daemon with no
+    # listener means Alt+V silently does nothing, which is the failure this
+    # supervision exists to end.
+    #
+    # The opt-out is not decoration. The listener installs a SYSTEM-WIDE
+    # low-level keyboard hook, so any test that starts a real `magent serve` on
+    # Windows would otherwise install one on the developer's own desktop -- the
+    # e2e/soak/dist serve fixtures set this to 0 for exactly that reason (the
+    # same posture as the opt-in `MDTEST_INTERACTION` tier). It doubles as the
+    # escape hatch for a user who wants to own the listener's lifetime.
+    hotkey_supervisor: bool = True
+    # Whether `magent attention -d` keeps `magent serve` alive (see
+    # launch.UploadServerSupervisor). On by default -- serve is the one
+    # long-lived process nothing watched, and it died silently twice in one day
+    # with the first symptom being an Alt+V press that did nothing.
+    #
+    # The opt-out exists for the same class of reason as hotkey_supervisor: an
+    # attention daemon that quietly starts a REAL upload server is not something
+    # a test (or a user who runs serve under their own supervisor -- nssm, a
+    # systemd unit, a terminal they watch) can be surprised by. Every test
+    # fixture that starts a real `attention -d` sets this to 0 unless the
+    # supervisor itself is what is under test.
+    upload_supervisor: bool = True
+    # Minimum seconds between two respawn ATTEMPTS by that supervisor
+    # (default: launch.UPLOAD_RESPAWN_COOLDOWN_S). The knob exists because the
+    # cooldown is the only thing standing between a serve that crashes on
+    # startup and a respawn loop, so its value has to be observable and
+    # settable -- the e2e tier drives a real revive twice and would otherwise
+    # have to sit out the production default to prove the second one.
+    upload_respawn_cooldown_s: float | None = None
+    # Whether magent raises every live psmux process to ABOVE_NORMAL priority
+    # (see psmux.boost_priority). On by default -- psmux processes are the
+    # keystroke path for every agent pane, they are I/O-bound (blocked on a
+    # pipe, not competing for CPU), and they get no foreground-window boost
+    # because they own no window.
+    #
+    # The opt-out is the third member of the same test-isolation law as
+    # hotkey_supervisor and upload_supervisor, and for the sharpest reason of
+    # the three: the sweep is the ONE thing in this product that reaches
+    # processes it did not spawn and that no HOME redirect can contain. A test
+    # that starts a real `serve` or `attention -d` on a developer's box would
+    # otherwise re-prioritise that box's entire live fleet. tests/conftest.py
+    # pins it to 0 for every tier, exactly as it does upload_supervisor.
+    psmux_boost: bool = True
+    # Should a LOCAL Alt+V press paste natively instead of uploading?
+    # (default: 0 / off -- OPT-IN.) When the listener is wired to THIS machine
+    # (its manifest carries no ssh host), the agent process already shares the
+    # user's clipboard, so the press could just deliver one Ctrl+V (0x16) into
+    # the pane and let the agent read the image itself. Off by default because
+    # the flagship agent cannot hear it: Claude Code on Windows reacts only to
+    # a PHYSICAL Ctrl+V and ignores the 0x16 a psmux `send-keys` writes into
+    # the pane (verified live 2026-08-31 -- the same injected byte pastes in a
+    # PSReadLine pane and does nothing in a Claude pane), so the default-on
+    # fork made Alt+V silently dead. Set to 1 only if your pane's agent
+    # demonstrably pastes on an injected 0x16. A remote-wired listener
+    # (`magent attach`) is untouched by this flag either way: the viewer's
+    # clipboard is not the host's, so the upload path is the only correct one
+    # there, and the phone page never involved Alt+V at all.
+    altv_native: bool = False
+    # What a session-creating magent does when it finds itself in a
+    # NON-INTERACTIVE logon session -- on Windows, the Session 0 every process
+    # an sshd service spawns is born into (see procs.current_session_id).
+    #
+    #   handoff (default) -- re-run the same command on the logged-on desktop
+    #     via Task Scheduler, relay its output, exit with its code. The sessions
+    #     land where the user can see, tile and attach to them.
+    #   allow -- run it right here. The honest setting for a headless Windows
+    #     host that is ONLY ever reached over ssh: there is no desktop to hand
+    #     off to, and Session 0 is where its fleet belongs.
+    #   refuse -- do nothing and say why. For a machine where a Session-0 fleet
+    #     is always a mistake and a silent hand-off would hide it.
+    #
+    # Not a bool because "run it anyway" and "re-run it somewhere visible" are
+    # genuinely different answers, and the wrong default for either machine is
+    # an invisible fleet: the incident this exists for left 82 psmux servers and
+    # 42 agents alive in Session 0, unkillable from the desktop and holding
+    # every session name the user's own bring-up wanted.
+    session0_policy: Literal["handoff", "allow", "refuse"] = "handoff"
 
     @model_validator(mode="after")
     def _no_unknown_magent_vars(self) -> MagentEnv:
@@ -77,7 +156,7 @@ def get_env() -> MagentEnv:
     """Return the validated env singleton (instantiated on first call)."""
     global _cached_env  # noqa: PLW0603  # reason: module-level cache singleton pattern
     if _cached_env is None:
-        _cached_env = MagentEnv(_env_file=ENV_FILE)  # ty: ignore[unknown-argument]  # reason: _env_file is pydantic-settings' documented per-call dotenv override; ty can't see BaseSettings' synthesized __init__
+        _cached_env = MagentEnv(_env_file=ENV_FILE)
     return _cached_env
 
 
@@ -126,6 +205,31 @@ def editor_command() -> str:
     return os.environ.get("EDITOR", "xdg-open")
 
 
+# The variables OpenSSH exports into every login it serves. SSH_CONNECTION and
+# SSH_CLIENT carry the socket's addresses; SSH_TTY names the pty when one was
+# allocated (so a `-T`/BatchMode command run -- exactly how `magent attach`
+# drives a host -- has the first two and not the third). Any one of them being
+# set and non-empty is the login; all three empty is a local shell.
+_SSH_LOGIN_VARS = ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")
+
+
+def is_ssh_login() -> bool:
+    """True when this process descends from an incoming SSH login.
+
+    Host-infrastructure, not app config: sshd sets these, nobody configures
+    them. It lives here because ``env.py`` is the only module allowed to read
+    ``os.environ`` at all.
+
+    On Windows this is the second, independent signal for the same fact as
+    ``procs.current_session_id() == 0``: OpenSSH is a service there, so an ssh
+    login IS a Session-0 process. Two signals rather than one because the
+    session id can be unknowable (the ctypes probe may fail) while the
+    environment cannot, and because an ssh login with a desktop is not a case
+    Windows actually produces.
+    """
+    return any(os.environ.get(name) for name in _SSH_LOGIN_VARS)
+
+
 # The tmux-side "you are inside a session" markers, by exact name: tmux sets
 # TMUX (socket,pid,session of the CLIENT) and TMUX_PANE, and those two alone are
 # what its nested-session guard reads. NOT a prefix match -- see _MUX_KEEP_SUFFIX.
@@ -154,13 +258,106 @@ def _is_mux_nesting_marker(key: str) -> bool:
     return upper in _MUX_NESTING_VARS or upper.startswith(_MUX_NESTING_PREFIX)
 
 
-def psmux_child_env() -> dict[str, str]:
-    """The process environment with the psmux/tmux nesting markers removed.
+# The AGENT-HARNESS session markers, by exact name. Same doctrine as
+# _MUX_NESTING_VARS above, one level up: a magent pane hosts somebody else's
+# agent, and an agent that inherits ANOTHER agent's session identity is a child
+# session of a process it has never met.
+#
+# Measured incident (v3.12.1 era): `magent up` was run from a shell inside a
+# Claude Code session, so all 45 psmux sessions were created with the launching
+# session's markers. Every `claude` in them printed
+#
+#     Transcript saving is off -- inherited CLAUDE_CODE_CHILD_SESSION marker
+#
+# and STOPPED WRITING TRANSCRIPTS for a day, which silently breaks
+# `claude --continue` -- the resume that magent's whole session model is built
+# on. Upstream sees the same class of damage from the same block:
+# anthropics/claude-code#26190 has nested `claude -p` hanging forever purely
+# because CLAUDECODE/CLAUDE_CODE_ENTRYPOINT were inherited.
+#
+# WHY AN EXACT LIST AND NOT THE WHOLE `CLAUDE_CODE_*` NAMESPACE -- the real
+# tradeoff, deliberately taken: that namespace is overwhelmingly USER
+# CONFIGURATION, not session state. It holds credentials such as
+# CLAUDE_CODE_OAUTH_TOKEN, provider selection such as CLAUDE_CODE_USE_BEDROCK
+# and CLAUDE_CODE_USE_VERTEX, and accessibility settings such as
+# CLAUDE_AX_SCREEN_READER -- machine-wide things a user sets on purpose. A
+# blanket prefix strip would log the agent out, silently move it off Bedrock, or
+# turn off a screen reader, which is a worse failure than the one being fixed.
+# This repo has already paid for a blanket prefix strip once: _MUX_KEEP_SUFFIX
+# exists because stripping every `TMUX*` took TMUX_TMPDIR with it and made every
+# session probe dead. So the cost of THIS choice is named too: a future Claude
+# Code release could add an identity marker that is not on this list, and it
+# would leak until someone adds it here. That failure is loud (the agent itself
+# prints the inherited-marker warning) and the fix is one line; logging every
+# agent out is neither.
+#
+# The tuning vars observed alongside these in the incident
+# (CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING, CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS,
+# CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY, CLAUDE_CODE_NO_FLICKER) SURVIVE for
+# exactly that reason: they are indistinguishable from a machine-wide user
+# preference, and none of them changes who the child thinks it is.
+_AGENT_SESSION_VARS = frozenset(
+    {
+        "CLAUDECODE",  # "1" in every subprocess Claude Code spawns
+        "CLAUDE_PID",  # the LAUNCHING session's pid
+        "CLAUDE_CODE_CHILD_SESSION",  # the transcript-persistence gate
+        "CLAUDE_CODE_SESSION_ID",  # the launching session's uuid
+        "CLAUDE_CODE_ENTRYPOINT",  # how the PARENT was started (cli/sdk/...)
+    }
+)
+# TODO(codex): Codex CLI has no documented inherited session-identity marker --
+# its shell_environment_policy sanitizes the child env from the other side, and
+# CODEX_HOME/CODEX_API_KEY are configuration, not session state. Add names here
+# if one is ever identified; do not guess at them.
 
-    magent's sessions are SIBLINGS by construction -- one session per socket,
-    never a session inside a session -- but a magent command run from inside a
-    magent psmux window inherits that window's ``PSMUX_SESSION``/``TMUX``, and
-    the psmux binary then refuses the child with::
+# The PRESENTATION overrides. Not session identity -- an opinion about ONE
+# process's stdout that has no business outliving the process that formed it.
+#
+# Second live incident, same mechanism, same day: the harness shell that ran
+# `magent up` carried NO_COLOR=1, so all 35 sessions it created rendered
+# monochrome ("the texts are all white" over SSH) while the 10 created from a
+# normal interactive shell had color.
+#
+# All four go, symmetrically, and the symmetry is the point: whatever the
+# launching shell decided about ITS OWN output, it is the wrong authority for an
+# interactive agent pane whose rendering the terminal chain (wt / ssh / psmux /
+# ConPTY) is there to negotiate. Stripping NO_COLOR while keeping FORCE_COLOR
+# would just be a different shell's opinion winning. A user who genuinely wants
+# colorless panes sets it in the shell profile that the pane's own shell sources
+# -- which is the authority that survives this strip, and the one that should.
+#
+# TERM is deliberately NOT touched in either direction. Nothing here removes it,
+# and nothing here invents one: psmux/tmux sets the pane's own TERM from
+# `default-terminal`, and the POSIX emulators set it for the shell they spawn,
+# so a launcher with no TERM at all never gets to decide the pane's.
+_PRESENTATION_VARS = frozenset(
+    {"NO_COLOR", "FORCE_COLOR", "CLICOLOR", "CLICOLOR_FORCE"}
+)
+
+# The one scrub list, public so tests can pin it by name rather than re-typing
+# it (a test that restates the list can drift from the list).
+SCRUBBED_INHERITED_VARS = _AGENT_SESSION_VARS | _PRESENTATION_VARS
+
+
+def _is_inherited_marker(key: str) -> bool:
+    """True for env vars that belong to the LAUNCHING process, not the child."""
+    return key.upper() in SCRUBBED_INHERITED_VARS
+
+
+def spawn_child_env() -> dict[str, str]:
+    """The process environment with every inherited-identity marker removed.
+
+    THE one seam for "what environment does a magent-spawned pane start with?".
+    Three families go, and each has its own block comment above: the psmux/tmux
+    nesting markers, the agent-harness session markers, and the presentation
+    overrides. Every spawn that can end up hosting an agent routes through here
+    -- psmux ``new-session`` (via ``psmux.child_env``), the launch-path terminal
+    spawns, and the IDE launches -- so the list lives in exactly one place.
+
+    On the psmux/tmux half: magent's sessions are SIBLINGS by construction --
+    one session per socket, never a session inside a session -- but a magent
+    command run from inside a magent psmux window inherits that window's
+    ``PSMUX_SESSION``/``TMUX``, and the psmux binary then refuses the child::
 
         psmux: sessions should be nested with care, unset PSMUX_SESSION to force
 
@@ -182,15 +379,73 @@ def psmux_child_env() -> dict[str, str]:
     ``TMUX_TMPDIR``, and a blanket ``TMUX*`` strip made the upload page render
     an empty project list.
 
-    Used for CREATION/CONTROL/PROBE children only. A user-facing ``attach``
-    client is a different question (attaching from inside a pane really IS
-    nesting, and psmux's guard is right to fire there), so those call sites
-    keep the inherited environment on purpose.
+    Used for CREATION children only. A user-facing ``attach`` client is a
+    different question (attaching from inside a pane really IS nesting, and
+    psmux's guard is right to fire there) -- see ``attach_client_env``, the
+    narrower seam it uses instead -- and psmux's CONTROL/PROBE commands are
+    measurably indifferent to all of this, so those call sites keep the
+    inherited environment on purpose.
     """
     return {
         key: value
         for key, value in os.environ.items()
-        if not _is_mux_nesting_marker(key)
+        if not _is_mux_nesting_marker(key) and not _is_inherited_marker(key)
+    }
+
+
+def _has_agent_session_marker() -> bool:
+    """True when this process was spawned by an agent harness's tool shell."""
+    return any(key.upper() in _AGENT_SESSION_VARS for key in os.environ)
+
+
+def attach_client_env() -> dict[str, str] | None:
+    """The environment for a local ATTACH window: colour leak removed, nothing else.
+
+    THE one seam for "what environment does a user-facing attach client start
+    with?" -- ``WindowsPlatform.attach_psmux`` and the two local ``wt`` spawns
+    in ``cli/attach.py`` (supervised remote panes, ``--no-mux`` ssh panes).
+    ``None`` means "spawn with the plain inherited environment", so a caller
+    writes ``env=attach_client_env()`` unconditionally and the no-op case costs
+    nothing.
+
+    The incident (2026-09-13): ``magent --go`` run from a Claude Code tool
+    shell, which sets ``NO_COLOR=1`` (and ``CLAUDECODE=1``) in every subprocess
+    it spawns. The created sessions were fine -- they go through
+    ``spawn_child_env`` -- but all 57 ATTACH windows inherited ``NO_COLOR`` and
+    rendered monochrome around perfectly colourful agents. The psmux client
+    honours ``NO_COLOR`` (the string is in the binary), and for an attach window
+    the psmux client IS the renderer, so its environment decides what the human
+    sees. This is the 2026-08-18 leak one layer up.
+
+    Why this is not just ``spawn_child_env``, in two parts:
+
+    * The presentation strip is CONDITIONAL here. For a created session the
+      launching shell's ``NO_COLOR`` is always the wrong authority, because the
+      pane's own shell sources the profile that should win. For an attach client
+      there is no such second chance: the inherited environment is the only
+      environment the renderer will ever have, so a human who deliberately
+      exports ``NO_COLOR`` in their shell must keep colourless attach windows.
+      An agent-harness session marker is what tells the two apart -- the harness
+      set ``NO_COLOR`` for ITS OWN tool output, never for the human's windows,
+      so its presence is proof the override was inherited rather than chosen.
+      No marker, no strip, byte-for-byte the historical behaviour.
+    * The nesting markers SURVIVE, marker or not. Attaching from inside a pane
+      really is nesting and psmux's own guard is the right authority on it --
+      the exception ``attach_psmux`` has always documented, unchanged.
+
+    The harness's session markers themselves also survive: they are identity for
+    a CREATED agent, and an attach client creates no agent. ``TERM`` is never
+    touched, here as everywhere. And there is deliberately no knob: a
+    ``MAGENT_*`` opt-out would ask the user to configure their way out of a bug
+    they did not cause, when the marker already answers the only question that
+    matters.
+    """
+    if not _has_agent_session_marker():
+        return None
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() not in _PRESENTATION_VARS
     }
 
 

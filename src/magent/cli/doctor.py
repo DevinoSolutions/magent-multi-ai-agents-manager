@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 import click
 
-from magent import log, tailnet
+from magent import log, psmux, tailnet
 from magent.cli.app import main
 from magent.paths import find_config
 from magent.style import style
@@ -105,8 +105,10 @@ def _check_terminal() -> CheckResult:
         if not wt:
             return (
                 FAIL,
-                "Windows Terminal (wt) not on PATH — nothing can launch. "
-                f"Install: {WT_INSTALL_HINT}",
+                (
+                    "Windows Terminal (wt) not on PATH — nothing can launch. "
+                    f"Install: {WT_INSTALL_HINT}"
+                ),
             )
         if get_platform().supports_psmux() and not psmux:
             return (WARN, "psmux not found — `up`/`attach` sessions unavailable")
@@ -116,6 +118,94 @@ def _check_terminal() -> CheckResult:
     if not found:
         return (WARN, "no known terminal emulator on PATH")
     return (OK, f"terminal: {found[0]}")
+
+
+# The three facts an operator needs at 2am, in the order they need them. ASCII
+# only: this lands in a psmux status line and in bug reports pasted anywhere.
+WEDGE_REPAIR_HINT = (
+    "The sessions behind it are FROZEN, not dead -- do NOT restart them, do "
+    "NOT reboot; both destroy live agents that would otherwise come back.\n"
+    "Recovery: find the conhost.exe processes whose parent chain reaches a dead "
+    "pid or a psmux.exe, and kill ONLY those (measured: 14 of 874 conhosts).\n"
+    "psmux answers again immediately after that (a hung new-session went to "
+    "892 ms) and every session returns intact."
+)
+
+
+def _resident_psmux() -> str:
+    """`` (N psmux.exe resident)``, or nothing at all.
+
+    Enrichment only, and strictly optional: the count corroborates the wedge
+    (the incident left psmux.exe processes that ignored ``taskkill /F``) but the
+    repair does not depend on it, so an unknown count says nothing rather than
+    guessing zero. ``count_processes`` is a Toolhelp snapshot -- single-digit
+    milliseconds, no subprocess -- and answers None off Windows, so this can
+    never add measurable time to a doctor run.
+    """
+    from magent.procs import count_processes
+
+    found = count_processes("psmux.exe")
+    return f" ({found} psmux.exe resident)" if found else ""
+
+
+def _check_psmux_wedge() -> CheckResult:
+    """Is the psmux CONTROL PLANE answering, or is the machine wedged?
+
+    The failure this exists to name took hours to diagnose live: every psmux
+    command -- has-session, list-sessions, new-session -- hung forever from any
+    console, while ConPTY itself was healthy (a raw pywinpty spawn was
+    instant). The whole fleet looked dead. It was not: after the wedge was
+    cleared every session probed alive, so the expensive mistake available at
+    that moment was mass-restarting 40 live agents.
+
+    One bounded probe, and it is deliberately not a liveness sweep -- see
+    ``psmux.probe_control_plane``.
+    """
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    if not get_platform().supports_psmux():
+        return (OK, "psmux not used on this OS (Windows-only feature)")
+    if not psmux.find_psmux():
+        return (OK, "skipped -- psmux not installed (see the terminal check)")
+
+    probe = psmux.probe_control_plane()
+    if probe.timed_out:
+        return (
+            FAIL,
+            (
+                f"psmux answered nothing in {probe.elapsed_s:.0f}s"
+                f"{_resident_psmux()}: the control plane is WEDGED machine-wide.\n"
+                f"{WEDGE_REPAIR_HINT}"
+            ),
+        )
+    if not probe.responsive:
+        return (WARN, "psmux is installed but would not run (see the terminal check)")
+    return (OK, f"psmux control plane responded in {probe.elapsed_s:.2f}s")
+
+
+def _check_psmux_session0() -> CheckResult:
+    """Is anything of ours stranded in the logon session nobody can see?
+
+    A psmux server in Session 0 is worse than a dead one: it answers
+    ``has-session`` for its own socket (the registry under ``~/.psmux`` is
+    shared across sessions), so it HOLDS the name while being invisible to the
+    desktop's windows, unattachable from it, and — since Windows OpenSSH hands
+    admins a full token — usually above the desktop user's integrity level too.
+    That is the whole shape of the incident: every desktop bring-up logged
+    "session never came up after respawn" for names a Session-0 server owned.
+
+    WARN, never FAIL: magent did not start these (the hand-off exists so it
+    never will again) and cannot stop them, so this must not start failing a
+    doctor run on a machine whose only problem is that somebody once ssh'd in.
+    """
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    if not get_platform().supports_psmux():
+        return (OK, "psmux not used on this OS (Windows-only feature)")
+    stranded = psmux.session0_server_pids()
+    if not stranded:
+        return (OK, "no psmux server runs in logon Session 0")
+    return (WARN, psmux.session0_message(len(stranded)))
 
 
 def _check_monitors() -> CheckResult:
@@ -163,12 +253,103 @@ def _monitor_lines(monitors: list[dict[str, object]]) -> list[str]:
     return lines
 
 
-def _check_hotkey() -> CheckResult:
+def _check_hotkey(cfg: MagentConfig | None) -> CheckResult:
+    """Is Alt+V actually working, not merely available.
+
+    The old version answered "does this OS support the hotkey", which is true on
+    every Windows box whether or not a listener has run since the last reboot --
+    so a machine where Alt+V had been dead for days passed this check. It now
+    reports the real listener liveness, through the same state machine `status`
+    renders (``cli.status._listener_state``) so the two surfaces can never
+    disagree about whether Alt+V works.
+    """
     from magent.platform import get_platform  # heavy subsystem: in-body per policy
 
-    if get_platform().supports_hotkey():
-        return (OK, "Alt+V clipboard-upload hotkey available")
-    return (OK, "hotkey not supported on this OS (Windows-only feature)")
+    if not get_platform().supports_hotkey():
+        return (OK, "hotkey not supported on this OS (Windows-only feature)")
+
+    from magent.cli.status import (
+        LISTENER_REPAIR_HINT,
+        _listener_state,
+        _upload_state,
+    )
+
+    port = cfg.settings.upload_port if cfg else 8033
+    state = _listener_state(_upload_state(port))
+    if state == "on":
+        return (OK, "Alt+V listener running (heartbeat fresh)")
+    if state == "dead":
+        return (
+            FAIL,
+            (
+                "upload server is running but no Alt+V listener — pasting an image "
+                f"into a magent: window does nothing. Repair: {LISTENER_REPAIR_HINT}"
+            ),
+        )
+    if state == "stale":
+        return (
+            FAIL,
+            (
+                "Alt+V listener process is alive but its heartbeat expired — its "
+                "message loop is wedged and key presses are being dropped. "
+                f"Repair: {LISTENER_REPAIR_HINT}"
+            ),
+        )
+    from magent.upload_server import (
+        supervision_enabled,  # heavy subsystem: in-body per policy
+    )
+
+    if not supervision_enabled():
+        return (OK, "Alt+V listener off — supervision disabled (you own its lifetime)")
+    return (OK, "Alt+V listener off — it starts with the upload server")
+
+
+def _check_wt_keys() -> CheckResult:
+    """Do Ctrl+Backspace and Shift+Enter survive psmux?
+
+    Never a FAIL, deliberately: a missing binding costs the user a word-delete
+    and a soft newline, not a working fleet, and doctor's exit code is what CI
+    and `magent status` read. Everything here is WARN-at-worst so the finding
+    is loud without turning an ergonomic gap into a red machine.
+    """
+    from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+    if not get_platform().supports_wt_keybindings():
+        return (OK, "Windows Terminal keys not applicable on this OS (Windows-only)")
+
+    from magent import wt_keys
+    from magent.cli.terminal_cmd import REPAIR_HINT
+
+    path = wt_keys.find_settings()
+    if path is None:
+        return (OK, "Windows Terminal settings.json not found -- nothing to configure")
+    try:
+        doc = wt_keys.load_settings(path)
+    except (wt_keys.SettingsParseError, OSError) as exc:
+        return (
+            WARN,
+            (
+                f"cannot read {path}: {exc} -- run `{REPAIR_HINT}` for the snippet "
+                "to paste by hand"
+            ),
+        )
+    states = wt_keys.states(doc)
+    conflicts = [s.keys for s in states if s.state == wt_keys.CONFLICT]
+    missing = [s.keys for s in states if s.state == wt_keys.MISSING]
+    if not conflicts and not missing:
+        return (OK, "Ctrl+Backspace and Shift+Enter survive psmux")
+    parts = []
+    if missing:
+        parts.append(f"not bound: {', '.join(missing)}")
+    if conflicts:
+        parts.append(f"bound to something else: {', '.join(conflicts)}")
+    return (
+        WARN,
+        (
+            f"{'; '.join(parts)} -- psmux eats the modifier, so these do nothing "
+            f"in a pane. Repair: {REPAIR_HINT}"
+        ),
+    )
 
 
 def _writable(d: Path) -> bool:
@@ -220,9 +401,11 @@ def _check_sentry() -> CheckResult:
     if not sdk_installed():
         return (
             WARN,
-            "MAGENT_SENTRY_DSN is set but sentry-sdk is missing — error "
-            "reporting is OFF. sentry-sdk ships with magent, so this "
-            f"install looks broken. Repair: {SENTRY_INSTALL_HINT}",
+            (
+                "MAGENT_SENTRY_DSN is set but sentry-sdk is missing — error "
+                "reporting is OFF. sentry-sdk ships with magent, so this "
+                f"install looks broken. Repair: {SENTRY_INSTALL_HINT}"
+            ),
         )
     return (OK, "error reporting active (DSN set, sentry-sdk installed)")
 
@@ -260,8 +443,11 @@ def _run_checks(config_file: Path) -> list[dict[str, str]]:
         ("env", _check_env),
         ("agent tools", lambda: _check_agent_tools(cfg)),
         ("terminal", _check_terminal),
+        ("psmux wedge", _check_psmux_wedge),
+        ("psmux-session0", _check_psmux_session0),
         ("monitors", _check_monitors),
-        ("hotkey", _check_hotkey),
+        ("hotkey", lambda: _check_hotkey(cfg)),
+        ("wt-keys", _check_wt_keys),
         ("logs dir", _check_logs_dir),
         ("state dir", _check_state_dir),
         ("sentry", _check_sentry),
@@ -317,10 +503,17 @@ def doctor_cmd(ctx: click.Context, as_json: bool) -> None:
     click.echo()
     for r in results:
         mark, color = _MARKS[r["status"]]
+        dim = r["status"] == OK
+        # A detail may be several lines (a repair runbook, not a sentence);
+        # continuation lines are indented under the first so the checklist
+        # column survives.
+        first, *rest = r["detail"].split("\n")
         click.echo(
             f"  {style(mark, fg=color, bold=True)} {r['name']:<12} "
-            f"{style(r['detail'], dim=(r['status'] == OK))}"
+            f"{style(first, dim=dim)}"
         )
+        for line in rest:
+            click.echo(f"    {' ' * 12} {style(line, dim=dim)}")
     for line in _monitor_lines(monitors):
         click.echo(f"      {style(line, dim=True)}")
     click.echo()

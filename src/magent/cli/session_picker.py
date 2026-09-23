@@ -1,6 +1,14 @@
 """The psmux session picker: live-session listing (`sessions_cmd`) and the
 looping attach-and-return picker (`_run_sessions_picker`). Named
 session_picker (not "sessions") to avoid confusion with magent.sessions.
+
+Liveness is NOT decided here: the sweep is `psmux.live_sessions`, the one
+enumeration `status`/`down`/the upload server also use. This module used to
+carry the product's only retrying probe, which made the picker the one surface
+that could see a flapping session -- and `magent down` the one that skipped it.
+Per-session cwds still come from config rather than a psmux probe per paint,
+direct-name attach resolves from config (no sweep dependency), and a failed
+attach is surfaced + retried instead of being wiped by the redraw.
 """
 
 from __future__ import annotations
@@ -18,12 +26,17 @@ import click
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+from magent.cli import picker
 from magent.cli.app import main
 from magent.cli.background import _running_upload_port, _tailnet_host
 from magent.cli.config_io import _load_config_or_exit
-from magent.cli.ui import _banner, _divider, _menu_item
+from magent.cli.ui import _banner, _divider
 from magent.paths import find_config
 from magent.style import style
+
+# The one answer that is a command rather than a search here, so a session
+# literally named `queue` can never shadow "go back".
+_PICKER_COMMANDS = frozenset({"q"})
 
 
 def _session_cwds(
@@ -67,20 +80,32 @@ def _status_label(state: str | None, age_s: float | None = None) -> str:
     }.get(state, "")
 
 
-def _session_states(cwds: dict[str, str]) -> dict[str, tuple[str | None, float | None]]:
+def _session_states(
+    cwds: dict[str, str], staleness: dict[str, float] | None = None
+) -> dict[str, tuple[str | None, float | None]]:
     """Map each session to its ``(state, age_s)`` from the agent-state store,
     which agents populate via their own lifecycle events (Claude Code hooks,
     Codex notify, ...) -- ground truth, not terminal scraping. A staleness guard
     keeps a session killed mid-turn from showing 'working...' forever.
+
+    ``staleness`` is the ``{state: seconds}`` window map, built once by the
+    caller from config (``attention_cmd.staleness_from_config``) -- passed in
+    rather than read here because this function had the module default
+    hardcoded, which made `magent sessions` and `status`'s psmux-session table
+    the only surfaces that ignored ``settings.attention.stalenessWorkingS``.
+    ``None`` keeps ``attention.STALENESS_S`` reachable as the documented
+    no-config fallback: a caller without a config degrades to the shipped
+    windows, never to a crash or a blank state column.
 
     Split out of ``_session_statuses`` so ``magent status`` can report the same
     ground truth as *data* (its ``--json`` session rows) instead of re-deriving
     it from a styled label."""
     from magent import agent_state  # heavy subsystem: in-body per policy
     from magent.attention import (
-        STALENESS_S as stale,  # heavy subsystem: in-body per policy
+        STALENESS_S,  # heavy subsystem: in-body per policy
     )
 
+    stale = STALENESS_S if staleness is None else staleness
     out: dict[str, tuple[str | None, float | None]] = {}
     for sock, cwd in cwds.items():
         rec = agent_state.state_for(cwd) if cwd else None
@@ -99,11 +124,13 @@ def _session_states(cwds: dict[str, str]) -> dict[str, tuple[str | None, float |
     return out
 
 
-def _session_statuses(cwds: dict[str, str]) -> dict[str, str]:
+def _session_statuses(
+    cwds: dict[str, str], staleness: dict[str, float] | None = None
+) -> dict[str, str]:
     """The picker's display face of ``_session_states``: one styled label each."""
     return {
         sock: _status_label(state, age_s)
-        for sock, (state, age_s) in _session_states(cwds).items()
+        for sock, (state, age_s) in _session_states(cwds, staleness).items()
     }
 
 
@@ -135,41 +162,6 @@ def _set_picker_attached(name: str | None) -> None:
             _PICKER_ATTACHED_FILE.unlink()
     except OSError:
         pass
-
-
-def _live_sessions(psmux_bin: str, candidates: list[str]) -> list[str]:
-    """Liveness sweep as an unbounded process fan-out, one retry for the misses.
-
-    Every probe is spawned before any is waited on -- the shape
-    ``psmux.psmux_status`` already uses -- so the sweep costs roughly one psmux
-    round-trip instead of ceil(n/16) of them; the earlier ThreadPool(16) sweep
-    over ``has_session`` (which blocks a worker per call) took ~1s at 40
-    sessions. The retry stays: under the load of many running agents individual
-    probes flap, and a dropped probe silently hides a live session."""
-
-    def _probe(names: list[str]) -> list[bool]:
-        procs = [
-            subprocess.Popen(
-                # `-t <n>` for the same reason `psmux.has_session` passes it:
-                # a bare has-session exits 0 for a socket with no server, so
-                # this sweep listed dead sessions as live. (Plain inherited
-                # env: a probe is not a session-creating command, so psmux's
-                # nesting guard has nothing to say about it.)
-                [psmux_bin, "-L", n, "has-session", "-t", n],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            for n in names
-        ]
-        return [p.wait() == 0 for p in procs]
-
-    flags = dict(zip(candidates, _probe(candidates), strict=True))
-    missing = [n for n in candidates if not flags[n]]
-    if missing:
-        for n, ok in zip(missing, _probe(missing), strict=True):
-            if ok:
-                flags[n] = True
-    return [n for n in candidates if flags[n]]
 
 
 def _reset_terminal() -> None:
@@ -214,6 +206,64 @@ def _attach_session(psmux_bin: str, target: str, reset: Callable[[], None]) -> N
     time.sleep(2)
 
 
+def _session_rows(
+    sessions: list[str], statuses: dict[str, str]
+) -> list[picker.PickerItem]:
+    """The picker's rows: one per live session, then Back.
+
+    A row's key is its PRINTED number, so filtering the list never renumbers
+    what you can see -- and the caller's index math is the same one it has
+    always run on a typed digit.
+    """
+    rows = []
+    for i, sess in enumerate(sessions, 1):
+        status = statuses.get(sess, "")
+        extra = (" " * max(2, 26 - len(sess)) + status) if status else ""
+        rows.append(picker.PickerItem(str(i), sess, extra=extra))
+    rows.append(picker.PickerItem("q", "Back", key_fg="yellow", gap_before=True))
+    return rows
+
+
+def _read_choice(rows: list[picker.PickerItem], upload_url: str | None) -> str | None:
+    """Paint the session list and return the answer, lowercased. None means the
+    user escaped out, which is the same as choosing Back."""
+
+    def _header() -> None:
+        _banner()
+        click.echo(
+            f"  {style('psmux sessions', bold=True)}  {style('(synced with desktop)', dim=True)}"
+        )
+        _divider()
+        click.echo()
+        if upload_url:
+            click.echo(
+                f"  {style('WebApp To Upload Images', bold=True)}  {style(upload_url, fg='cyan', bold=True)}"
+            )
+            click.echo()
+
+    if picker.raw_mode_available():
+        result = picker.pick(
+            rows,
+            _header,
+            commands=_PICKER_COMMANDS,
+            prompt=f"  {style('attach to', fg='cyan')} ",
+        )
+        if result.kind == picker.CANCEL:
+            return None
+        return result.value.strip().lower()
+    picker.show(rows, _header)
+    return (
+        click.prompt(
+            f"  {style('attach to', fg='cyan')}",
+            default="1",
+            show_default=False,
+            prompt_suffix=" ",
+        )
+        .strip()
+        .lower()
+    )
+
+
 def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
     """Looping psmux session picker: list live sessions, attach to a choice, repeat.
 
@@ -223,6 +273,10 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
     straight to the requested project."""
 
     from magent import psmux as psmux_mod  # heavy subsystem: in-body per policy
+
+    # sibling module: the one config -> staleness-window translation, shared with
+    # the attention daemon / watch / status so no surface ages states differently.
+    from magent.cli.attention_cmd import staleness_from_config
 
     psmux_bin = psmux_mod.find_psmux()
     if not psmux_bin:
@@ -236,6 +290,9 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
     # resolved path rides along: it is the cwd magent created the session with,
     # which is what the agent-state lookup keys on.
     cfg = _load_config_or_exit(config_file)
+    # Read once here rather than per paint: the windows cannot change under a
+    # running picker, and every redraw must age states the same way.
+    staleness = staleness_from_config(cfg)
     candidates: list[str] = []
     resolved: dict[str, str] = {}
     for proj in psmux_mod.eligible_projects(cfg):
@@ -260,8 +317,12 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
 
     while True:
         # Fresh sweep every redraw: sessions created or killed while the
-        # picker was attached elsewhere show up without restarting it.
-        sessions = _live_sessions(psmux_bin, candidates)
+        # picker was attached elsewhere show up without restarting it. The
+        # sweep is `psmux.live_sessions` -- the SAME call `status` and `down`
+        # make, so the picker can no longer be the only surface that sees a
+        # session (this module used to own the only retrying probe in the
+        # product, which is why `down` skipped what the picker was showing).
+        sessions = psmux_mod.live_sessions(candidates, psmux=psmux_bin)
         if not sessions:
             click.echo(f"  {style('x', fg='red')} No active psmux sessions.")
             click.echo(
@@ -276,39 +337,11 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
             _attach(focus)
             continue
 
-        click.clear()
-        _banner()
-        click.echo(
-            f"  {style('psmux sessions', bold=True)}  {style('(synced with desktop)', dim=True)}"
+        statuses = _session_statuses(
+            _session_cwds(psmux_bin, sessions, resolved), staleness
         )
-        _divider()
-        click.echo()
-        if upload_url:
-            click.echo(
-                f"  {style('WebApp To Upload Images', bold=True)}  {style(upload_url, fg='cyan', bold=True)}"
-            )
-            click.echo()
-        statuses = _session_statuses(_session_cwds(psmux_bin, sessions, resolved))
-        for i, sess in enumerate(sessions, 1):
-            status = statuses.get(sess, "")
-            extra = (" " * max(2, 26 - len(sess)) + status) if status else ""
-            _menu_item(str(i), sess, extra=extra)
-        click.echo()
-        _menu_item("q", "Back", key_fg="yellow")
-        click.echo()
-
-        choice = (
-            click.prompt(
-                f"  {style('attach to', fg='cyan')}",
-                default="1",
-                show_default=False,
-                prompt_suffix=" ",
-            )
-            .strip()
-            .lower()
-        )
-
-        if choice == "q":
+        choice = _read_choice(_session_rows(sessions, statuses), upload_url)
+        if choice is None or choice == "q":
             return
 
         target = None
@@ -329,8 +362,65 @@ def _run_sessions_picker(config_file: Path, name: str | None = None) -> None:
 
 @main.command("sessions")
 @click.argument("name", required=False)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Print live sessions as JSON (name, cwd, model, effort, state) and exit.",
+)
 @click.pass_context
-def sessions_cmd(ctx: click.Context, name: str | None) -> None:
+def sessions_cmd(ctx: click.Context, name: str | None, as_json: bool) -> None:
     """List psmux sessions or attach to one. Usage: magent sessions [name]"""
     config_file = find_config(ctx.obj.get("config_path"))
+    if as_json:
+        _emit_sessions_json(ctx.obj.get("config_path"))
+        return
     _run_sessions_picker(config_file, name)
+
+
+def _emit_sessions_json(config_path: str | None) -> None:
+    """Print each configured session with its live state, one JSON array.
+
+    Only stdout carries the JSON: this reads config with the raw
+    ``config_sessions`` loader (no `load_config` version warning), and the
+    per-session pane reads fan out on a small pool so a big fleet stays quick.
+    """
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+
+    from magent import fleet, psmux  # heavy subsystem: in-body per policy
+
+    dicts = psmux.config_sessions(config_path)
+    names = [psmux.socket_id(d) for d in dicts]
+    resolved = {psmux.socket_id(d): str(d.get("resolved") or "") for d in dicts}
+    binary = psmux.find_psmux()
+    live = set(psmux.live_sessions(names, psmux=binary)) if binary and names else set()
+
+    def _row(name: str) -> dict[str, object]:
+        if name not in live:
+            return {
+                "name": name,
+                "cwd": resolved.get(name, ""),
+                "live": False,
+                "state": "dead",
+                "model": None,
+                "effort": None,
+            }
+        st = fleet.read_state(name, psmux_bin=binary)
+        return {
+            "name": name,
+            "cwd": resolved.get(name, ""),
+            "live": True,
+            "state": st["state"],
+            "model": st["model"],
+            "effort": st["effort"],
+        }
+
+    live_names = [n for n in names if n in live]
+    read: dict[str, dict[str, object]] = {}
+    if live_names:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for name, row in zip(live_names, pool.map(_row, live_names), strict=True):
+                read[name] = row
+    rows = [read[n] if n in read else _row(n) for n in names]
+    click.echo(json.dumps(rows, indent=2))

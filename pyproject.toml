@@ -1,6 +1,6 @@
 [project]
 name = "magent-multi-ai-agents-manager"
-version = "3.11.1"
+version = "3.19.0"
 description = "Launch each project's AI coding agent in its own terminal, auto-tiled across every monitor"
 readme = "README.md"
 license = "AGPL-3.0"
@@ -60,7 +60,7 @@ qr = ["qrcode>=7"]
 # pexpect drives the POSIX real-PTY menu tests; pywinpty (win32-only wheels)
 # drives the same tests over a real ConPTY on Windows — hence the platform
 # marker so `pip install -e ".[dev]"` still resolves on macOS/Linux.
-dev = ["pytest>=7.0", "pexpect>=4.8", "pywinpty>=2.0; sys_platform == 'win32'", "ruff>=0.15", "pytest-cov>=5.0", "ty==0.0.59", "vulture>=2.14"]
+dev = ["pytest>=7.0", "pexpect>=4.8", "pywinpty>=2.0; sys_platform == 'win32'", "ruff>=0.15", "pytest-cov>=5.0", "ty==0.0.80", "vulture>=2.14"]
 # Kept out of `dev` on purpose: Playwright + its browser download are heavy and
 # only the dedicated browser-upload CI job needs them, so the OS x Py unit matrix
 # and the quality gate stay lean. Never a runtime dep (the dist import-sweep
@@ -80,7 +80,7 @@ magent-state-hook = "magent.state_hook:main"
 magent-attach-client = "magent.attach_client:main"
 
 [project.urls]
-Homepage = "https://magent.io"
+Homepage = "https://magent.now"
 Documentation = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager#readme"
 Repository = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager"
 Issues = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/issues"
@@ -117,6 +117,7 @@ markers = [
     "needs_tailscale: e2e tests that require a live Tailscale node (CI-only, gated on MDTEST_TAILSCALE=1; skipped locally)",
     "node_contract: run the REAL published agent-state writer under real node and check magent's reader against it (needs node/npm + npm registry; skips cleanly otherwise)",
     "soak: long-run daemon stability tests (serve + attention -d under sustained churn for tens of minutes; CI-only, gated on MDTEST_SOAK=1)",
+    "real_home: opt OUT of the autouse HOME redirect -- the test legitimately needs the machine's own home (CI-only tiers that seed the real ~/, e.g. the ssh flagship). Never use on a test that can run on a dev box.",
 ]
 
 [tool.ruff]

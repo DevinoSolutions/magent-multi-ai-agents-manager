@@ -143,8 +143,29 @@ def _health_ok(host: str, port: int) -> bool:
 
 def _child_env() -> dict[str, str]:
     """Child env with no MAGENT_* leakage; PATH kept so the child's own
-    ``tailnet.ip4()`` still resolves the real ``tailscale`` binary."""
-    return {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
+    ``tailnet.ip4()`` still resolves the real ``tailscale`` binary.
+
+    Serve's Alt+V listener supervision is off: this tier is about bind
+    addresses, and a real listener installs a system-wide keyboard hook. (This
+    job is ubuntu-only, where ``supports_hotkey()`` is False and the supervisor
+    would return anyway -- set explicitly so the isolation does not silently
+    depend on which OS the job happens to run on.)
+    """
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MAGENT_")}
+    env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
+    # ...and `attention -d` now supervises `magent serve` the same way, so a
+    # test daemon would otherwise start a REAL upload server on this machine.
+    env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
+    # ...and the psmux priority sweep reaches processes by IMAGE NAME, which
+    # no HOME redirect contains: a test-spawned serve/daemon must never
+    # re-prioritise the developer's real psmux fleet.
+    env["MAGENT_PSMUX_BOOST"] = "0"
+    # ...and the Session-0 hand-off must never fire from a test: a runner
+    # (or an ssh-driven leg) is legitimately non-interactive, and the
+    # default policy would create a REAL scheduled task on somebody's
+    # desktop. "allow" is today's behaviour, everywhere.
+    env["MAGENT_SESSION0_POLICY"] = "allow"
+    return env
 
 
 # ---------------------------------------------------------------------------

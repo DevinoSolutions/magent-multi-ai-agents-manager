@@ -123,4 +123,11 @@ class TestLaunchDryRun:
             text=True,
         )
         assert result.returncode == 0
-        assert "All windows already positioned" in result.stdout
+        # --go now ends in a retile-all pass: with no projects configured and
+        # no magent windows on screen (CI) the empty-set note prints; on a dev
+        # box with a live fleet the discovered windows are previewed instead
+        # (dry-run, nothing moves). Both are the graceful-empty-config proof.
+        assert (
+            "No open magent windows to tile." in result.stdout
+            or "retile all" in result.stdout
+        )

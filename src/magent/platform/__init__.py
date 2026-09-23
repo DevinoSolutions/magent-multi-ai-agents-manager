@@ -45,6 +45,28 @@ WT_NOT_FOUND_MESSAGE = (
 )
 
 
+@dataclass(frozen=True)
+class HandoffResult:
+    """What came back from running a command on the logged-on desktop.
+
+    Frozen because it is a REPORT: the caller relays it to a user and exits
+    with it, and a value anyone downstream can edit is a report that can lie.
+
+    ``rc`` is the command's own exit code, or None when the command never ran
+    (no Task Scheduler, the task refused to start, ...). ``timed_out`` is the
+    third case: it started, we stopped waiting, and it may still be running --
+    which is why it is a separate flag rather than a fabricated exit code.
+    ``detail`` names the phase that failed and, on failure, where the scratch
+    directory was left, so a bug report can be read without a repro.
+    """
+
+    rc: int | None
+    stdout: str = ""
+    stderr: str = ""
+    timed_out: bool = False
+    detail: str = ""
+
+
 class TerminalNotFoundError(RuntimeError):
     """The OS terminal emulator magent shells out to for project windows is
     not installed / not on PATH. Its message is user-facing and actionable (an
@@ -97,8 +119,42 @@ class Platform(ABC):
         """True if this platform can run the Alt+V clipboard-image listener."""
         return False
 
+    def logon_session_is_interactive(self) -> bool:
+        """True when a window this process opens lands on a desktop somebody
+        can see.
+
+        The ABC answers True, and every non-Windows platform keeps that answer:
+        POSIX has no logon-session isolation, and running tmux over ssh is the
+        ordinary way to work there. Only ``WindowsPlatform`` overrides it, for
+        the one case that is genuinely different -- Session 0, where OpenSSH (a
+        service) puts everything it spawns.
+        """
+        return True
+
+    def supports_desktop_handoff(self) -> bool:
+        """True if this platform can re-run a command on the logged-on desktop
+        (see ``run_on_desktop``). Default False: nothing else has a mechanism,
+        and a platform that cannot hand off must REFUSE rather than pretend."""
+        return False
+
+    def run_on_desktop(self, argv: list[str], *, timeout_s: float) -> HandoffResult:
+        """Run ``argv`` in the logged-on user's own logon session and report.
+
+        Blocking: the caller is a command that was asked to do this work and is
+        now having it done elsewhere, so it waits and relays the result as its
+        own. Never raises -- every failure comes back as a ``HandoffResult``
+        with ``rc=None`` and a ``detail``, because the caller's job is to
+        explain a failure and it must not be handed a traceback instead.
+        """
+        raise NotImplementedError("desktop hand-off is only supported on Windows")
+
     def supports_attention_signals(self) -> bool:
         """True if this platform can badge titles / flash / focus windows."""
+        return False
+
+    def supports_wt_keybindings(self) -> bool:
+        """True if this platform has a Windows Terminal settings.json whose
+        ``sendInput`` keybindings magent can install (see ``magent.wt_keys``)."""
         return False
 
     def set_window_title(self, handle: object, title: str) -> bool:

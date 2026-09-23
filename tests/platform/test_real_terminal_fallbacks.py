@@ -645,6 +645,23 @@ def _win_child_env(home: Path, shim_dir: Path, base_path: str) -> dict[str, str]
     env["PATH"] = str(shim_dir) + os.pathsep + base_path
     home_s = str(home)
     env["HOME"] = home_s
+    # The Alt+V listener installs a SYSTEM-WIDE keyboard hook, and a real
+    # `serve` now supervises one into existence. Redirecting HOME does not
+    # contain a global hook, so tests that start a real server opt out
+    # rather than install one on the machine running them.
+    env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
+    # ...and `attention -d` now supervises `magent serve` the same way, so a
+    # test daemon would otherwise start a REAL upload server on this machine.
+    env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
+    # ...and the psmux priority sweep reaches processes by IMAGE NAME, which
+    # no HOME redirect contains: a test-spawned serve/daemon must never
+    # re-prioritise the developer's real psmux fleet.
+    env["MAGENT_PSMUX_BOOST"] = "0"
+    # ...and the Session-0 hand-off must never fire from a test: a runner
+    # (or an ssh-driven leg) is legitimately non-interactive, and the
+    # default policy would create a REAL scheduled task on somebody's
+    # desktop. "allow" is today's behaviour, everywhere.
+    env["MAGENT_SESSION0_POLICY"] = "allow"
     drive, tail = os.path.splitdrive(home_s)
     env["USERPROFILE"] = home_s
     env["HOMEDRIVE"] = drive

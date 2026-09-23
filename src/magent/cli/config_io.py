@@ -86,12 +86,12 @@ def _validate_config_text(text: str) -> str | None:
 def _as_dict(value: object) -> dict[str, object]:
     """View an unknown config value as a string-keyed dict (empty if it is not
     one). Returns the value itself when it is a dict, so in-place edits persist."""
-    return value if isinstance(value, dict) else {}  # ty: ignore[invalid-return-type]  # reason: isinstance narrows; ty 0.0.56 invariance gap
+    return value if isinstance(value, dict) else {}
 
 
 def _as_list(value: object) -> list[object]:
     """View an unknown config value as a list (empty if it is not one)."""
-    return value if isinstance(value, list) else []  # ty: ignore[invalid-return-type]  # reason: isinstance narrows; ty 0.0.56 invariance gap
+    return value if isinstance(value, list) else []
 
 
 def _as_str(value: object, default: str = "") -> str:
@@ -106,7 +106,7 @@ def _as_int(value: object, default: int) -> int:
 def _project_dicts(data: dict[str, object]) -> list[dict[str, object]]:
     """The config's project entries, keeping only well-formed dict entries.
     Element identity is preserved, so mutating an entry in place persists."""
-    return [p for p in _as_list(data.get("projects")) if isinstance(p, dict)]  # ty: ignore[invalid-return-type]  # reason: isinstance narrows; ty 0.0.56 invariance gap
+    return [p for p in _as_list(data.get("projects")) if isinstance(p, dict)]
 
 
 def _sub(d: dict[str, object], key: str) -> dict[str, object]:
@@ -115,7 +115,7 @@ def _sub(d: dict[str, object], key: str) -> dict[str, object]:
     mutations to it persist."""
     value = d.get(key)
     if isinstance(value, dict):
-        return value  # ty: ignore[invalid-return-type]  # reason: isinstance guard; ty 0.0.56 invariance gap
+        return value
     fresh: dict[str, object] = {}
     d[key] = fresh
     return fresh
@@ -126,7 +126,7 @@ def _sublist(d: dict[str, object], key: str) -> list[object]:
     The returned list is stored back in ``d``, so append/pop persist."""
     value = d.get(key)
     if isinstance(value, list):
-        return value  # ty: ignore[invalid-return-type]  # reason: isinstance guard; ty 0.0.56 invariance gap
+        return value
     fresh: list[object] = []
     d[key] = fresh
     return fresh

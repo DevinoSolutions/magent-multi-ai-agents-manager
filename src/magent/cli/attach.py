@@ -55,7 +55,7 @@ if TYPE_CHECKING:
 
 def _as_session_list(raw: list[object]) -> list[dict[str, object]]:
     """Narrow a JSON list of unknown objects to a list of string-keyed dicts."""
-    return [item for item in raw if isinstance(item, dict)]  # ty: ignore[invalid-return-type]  # reason: isinstance(item, dict) narrows; ty 0.0.56 invariance gap
+    return [item for item in raw if isinstance(item, dict)]
 
 
 def _default_attach_host() -> str | None:
@@ -788,6 +788,9 @@ def _spawn_windows(
             f" {style('pip install -U magent-multi-ai-agents-manager', bold=True)}"
             f"{style('.', dim=True)}"
         )
+    # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+    from magent.env import attach_client_env
+
     titles: list[str] = []
     for sid in sids:
         title = make_title(sid)
@@ -799,6 +802,10 @@ def _spawn_windows(
             titles.append(title)
             continue
         click.echo(f"  {style('o', fg='cyan')} {title}")
+        # `env=`: an attach pane is a RENDERER, not an agent host -- everything
+        # survives (nesting markers included) except a colour override an agent
+        # harness leaked into us, which would paint this pane monochrome. None
+        # when no harness marker is present, i.e. plain inheritance.
         subprocess.Popen(
             [
                 "wt",
@@ -809,7 +816,8 @@ def _spawn_windows(
                 "--suppressApplicationTitle",
                 "--",
                 *_pane_command(target, sid, supervisor),
-            ]
+            ],
+            env=attach_client_env(),
         )
         titles.append(title)
         time.sleep(stagger)
@@ -939,9 +947,15 @@ def _close_attach_windows(names: Sequence[str]) -> int:
     return len(_close_windows(plat, snap, list(names) or _open_attach_sids(snap)))
 
 
-# `magent down` on the host is a handful of psmux kills plus a couple of pid
-# stops -- fast, but it runs after an SSH handshake on a possibly-loaded box.
-_REMOTE_DOWN_TIMEOUT_S = 60
+# `magent down` on the host is a psmux kill fan-out plus a verify pass plus a
+# couple of pid stops, after an SSH handshake, on a possibly-loaded box. The
+# old 60s budget was measured against a handful of sessions and became a
+# TRUNCATION mechanism at scale: 46 sockets could outrun it, ssh was killed
+# mid-shutdown, and what survived was exactly the part of the config the
+# shutdown had not reached yet -- the reported "the tail always stays" tail.
+# Sized like `_BRING_UP_TIMEOUT_S`: generous enough that only a genuinely
+# unreachable host hits it.
+_REMOTE_DOWN_TIMEOUT_S = 300
 
 
 def _remote_down_command(
@@ -1024,9 +1038,19 @@ def _bring_up_and_requery(
         f"  {style('o', fg='cyan')} starting sessions on host "
         f"{style('(a large bring-up can take several minutes)', dim=True)}..."
     )
-    rc, _, err = _ssh_capture(
+    rc, out, err = _ssh_capture(
         target, f"magent up{grp_suffix}", timeout=_BRING_UP_TIMEOUT_S
     )
+    # The host's stdout used to be thrown away, and that is how a laptop user
+    # watched a bring-up "succeed" while the host printed "N session(s) failed
+    # to come up" into a pipe nobody read. Everything the host says about its
+    # own bring-up belongs on this screen -- including, now, the Session-0
+    # hand-off line, which is the only notice the user gets that the sessions
+    # were created somewhere other than where the command ran. Indented two
+    # spaces because it is nested output: it is the HOST talking, not us.
+    for line in out.splitlines():
+        if line.strip():
+            click.echo(f"  {line.rstrip()}")
     if rc != 0:
         click.echo(
             f"  {style('!', fg='yellow')} bring-up exited {rc}: {style(err.strip()[:200], dim=True)}"
@@ -1041,7 +1065,7 @@ def _bring_up_and_requery(
         new = _ssh_json(target, f"magent up --json{grp_suffix}", timeout=60)
         if new:
             raw_up = new.get("up")
-            cur = _as_session_list(raw_up) if isinstance(raw_up, list) else []  # ty: ignore[invalid-argument-type]  # reason: isinstance(raw_up, list) proves list; ty 0.0.56 invariance gap
+            cur = _as_session_list(raw_up) if isinstance(raw_up, list) else []
             if len(cur) >= len(best):
                 best = cur
             # Everything asked for is up: the bring-up is complete, so there is
@@ -1131,8 +1155,8 @@ def _attach_flow(
 
     raw_up = status.get("up")
     raw_down = status.get("down")
-    up = _as_session_list(raw_up) if isinstance(raw_up, list) else []  # ty: ignore[invalid-argument-type]  # reason: isinstance guard; ty 0.0.56 invariance gap
-    down = _as_session_list(raw_down) if isinstance(raw_down, list) else []  # ty: ignore[invalid-argument-type]  # reason: isinstance guard; ty 0.0.56 invariance gap
+    up = _as_session_list(raw_up) if isinstance(raw_up, list) else []
+    down = _as_session_list(raw_down) if isinstance(raw_down, list) else []
     port = status.get("upload_port", 8033)
 
     if down and yes:
@@ -1288,6 +1312,9 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
     sids = [_as_str(p.get("session")) or _as_str(p.get("name")) for p in projects]
     open_already = _already_open(sids)
 
+    # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+    from magent.env import attach_client_env
+
     titles: list[str] = []
     for sid, p in zip(sids, projects, strict=True):
         title = make_title(sid)
@@ -1300,6 +1327,8 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
         # NF-S3-004: fall back to the registry default, never a drifting literal.
         cmd = _as_str(p.get("cmd")) or DEFAULT_TOOLS["claude"]
         click.echo(f"  {style('o', fg='cyan')} {title}")
+        # Same seam as the supervised panes above: strip only a harness-leaked
+        # colour override, keep everything else, `None` for a human's shell.
         subprocess.Popen(
             [
                 "wt",
@@ -1313,7 +1342,8 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
                 "-t",
                 target,
                 f"cd {remote_dir} && {cmd}",
-            ]
+            ],
+            env=attach_client_env(),
         )
         titles.append(title)
         time.sleep(_SPAWN_STAGGER_S)
@@ -1326,6 +1356,35 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
         f"\n  {style('Done.', fg='green', bold=True)} "
         f"{style('(no-mux mode: Alt+V image paste is not available)', dim=True)}"
     )
+
+
+def _up_handoff_argv(ctx: click.Context) -> list[str]:
+    """The `magent up` the desktop copy must re-run, rebuilt from click.
+
+    From ``ctx.params``, never ``sys.argv``: the command may have been reached
+    through any spelling of its options (``-g``/``--group``), and the group-level
+    ``--config`` sits in ``ctx.obj``, not in this command's argv at all. It IS
+    carried across: ``find_config`` walks up from the working directory, so a
+    hand-off that dropped it could bring up a different config's projects than
+    the one the user pointed at.
+
+    ``sys.executable -m magent`` rather than a bare ``magent``: the desktop copy
+    must be THIS install, not whatever a differently-ordered desktop PATH
+    resolves -- and a console-script shim may not even be on a scheduled task's
+    PATH.
+    """
+    argv = [sys.executable, "-m", "magent"]
+    config_path = ctx.obj.get("config_path")
+    if config_path:
+        argv.extend(["--config", str(config_path)])
+    argv.append("up")
+    if ctx.params.get("group"):
+        argv.extend(["-g", str(ctx.params["group"])])
+    if ctx.params.get("do_all"):
+        argv.append("--all")
+    if ctx.params.get("revive"):
+        argv.append("--revive")
+    return argv
 
 
 @main.command("up")
@@ -1360,12 +1419,41 @@ def up_cmd(
     cfg = _load_config_or_exit(config_file, as_json=as_json)
 
     from magent.launch import (  # heavy subsystem: in-body per policy
+        SESSION0_UP_TIMEOUT_S,
         bring_up_psmux,
         decorate_psmux_sessions,
         decorate_psmux_sessions_async,
         psmux_status,
+        relay_handoff,
         revive_psmux,
+        session0_disposition,
+        session0_note,
+        session0_refusal,
     )
+
+    # This is the command `magent attach` runs on the host over ssh, and on
+    # Windows an ssh login is logon Session 0 -- so without this gate a remote
+    # attach creates a whole fleet on a desktop nobody can see (the incident in
+    # launch.py's SESSION0_* block). Before any work, and only on the
+    # session-CREATING path: `--json` never brings anything up, and it is the
+    # status read attach polls repeatedly, so refusing it would break the very
+    # flow this gate exists to repair.
+    if not as_json:
+        from magent.platform import (  # heavy subsystem: in-body per policy
+            get_platform,
+        )
+
+        plat = get_platform()
+        disposition = session0_disposition(plat)
+        if disposition == "refuse":
+            click.echo(f"  {style('x', fg='red')} {session0_refusal(plat)}", err=True)
+            sys.exit(1)
+        if disposition == "handoff":
+            sys.exit(
+                relay_handoff(
+                    plat, _up_handoff_argv(ctx), timeout_s=SESSION0_UP_TIMEOUT_S
+                )
+            )
 
     up, down, projects = psmux_status(cfg, group=group)
     # Only sessions that were ALREADY up are revive candidates: one created
@@ -1474,6 +1562,12 @@ def up_cmd(
                 f" session(s) failed to come up: {style(', '.join(failed), fg='red')}"
                 f" {style('(see ~/.magent/logs/launch.log on the host)', dim=True)}"
             )
+            # Only ever set when the choke point refused -- the hand-off and
+            # refusal above have already returned on every other Session-0
+            # path -- so this is the "policy said no" case wearing its reason.
+            note = session0_note()
+            if note:
+                click.echo(f"  {style(note, dim=True)}")
 
     # Unconditional on the interactive path: a session that is up but parked at
     # a bare shell is exactly what this command is asked to fix, and there is
