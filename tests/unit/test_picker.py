@@ -14,6 +14,8 @@ the real-PTY tier covers that.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 
 import pytest
 
@@ -371,7 +373,28 @@ class TestRawModeGate:
 
     def test_a_real_tty_with_the_os_module_present_is_raw(self, monkeypatch):
         monkeypatch.setattr(picker.sys.stdin, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr(picker, "_stdin_is_console", lambda: True)
         assert picker.raw_mode_available() is True
+
+    def test_a_tty_that_is_not_a_console_is_never_raw(self, monkeypatch):
+        monkeypatch.setattr(picker.sys.stdin, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr(picker, "_stdin_is_console", lambda: False)
+        assert picker.raw_mode_available() is False
+
+    def test_a_null_device_stdin_is_never_raw(self):
+        """Windows' ``isatty()`` says True for NUL; the raw loop would then
+        block forever on ``getwch`` (v3.19.0 hung every Windows CI ``--go``).
+        A REAL child with ``stdin=DEVNULL`` -- the exact CI/scheduler shape."""
+        probe = "from magent.cli import picker; print(picker.raw_mode_available())"
+        r = subprocess.run(
+            [sys.executable, "-c", probe],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        )
+        assert r.stdout.strip() == "False"
 
 
 class TestPainting:
