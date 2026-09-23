@@ -2,7 +2,7 @@
   "name": "@magent/cli",
   "version": "0.0.1",
   "description": "Placeholder — the official Magent CLI. Coming soon.",
-  "license": "MIT",
+  "license": "AGPL-3.0",
   "homepage": "https://magent.now",
   "main": "index.js",
   "repository": {
