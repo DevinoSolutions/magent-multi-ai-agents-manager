@@ -5,6 +5,28 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.19.1] - 2026-09-23
+
+### Fixed
+
+- **`magent --go` no longer hangs when it is not run from a real terminal.**
+  3.19.0's project checklist decided whether to ask by checking
+  `isatty()` on stdin, and on Windows that answers yes for the `NUL` device
+  and for a console inherited by a process whose output is being captured. So
+  `magent --go < NUL`, a scheduled task, `magent --go > log.txt`, and a script
+  capturing `--go` would draw the checklist where nobody could see it, then
+  wait forever for a key. The checklist now appears only when stdin is a real
+  console (`GetConsoleMode` on Windows) **and** stdout is a terminal.
+  Everywhere else `--go` launches every enabled project, as it did before
+  3.19.0.
+
+- **`magent hotkey` sends to the configured upload port.** Run by hand without
+  `--server`, it posted Alt+V uploads to `http://localhost:8033` even when the
+  config's `uploadPort` said otherwise. It now defaults to this config's
+  `uploadPort` (8033 only when there is no readable config); an explicit
+  `--server` still wins. Listeners magent starts itself always passed
+  `--server` and were never affected.
+
 ## [3.19.0] - 2026-09-22
 
 ### Added
@@ -1326,6 +1348,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.19.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.0...v3.19.1
 [3.19.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.18.1...v3.19.0
 [3.18.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.18.0...v3.18.1
 [3.18.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.17.0...v3.18.0

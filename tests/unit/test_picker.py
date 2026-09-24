@@ -14,6 +14,8 @@ the real-PTY tier covers that.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 
 import pytest
 
@@ -369,9 +371,64 @@ class TestRawModeGate:
         monkeypatch.setattr(picker.sys, "stdin", _Broken())
         assert picker.raw_mode_available() is False
 
+    def _ttys(self, monkeypatch, *, stdin=True, stdout=True, console=True):
+        monkeypatch.setattr(picker.sys.stdin, "isatty", lambda: stdin, raising=False)
+        monkeypatch.setattr(picker.sys.stdout, "isatty", lambda: stdout, raising=False)
+        monkeypatch.setattr(picker, "_stdin_is_console", lambda: console)
+
     def test_a_real_tty_with_the_os_module_present_is_raw(self, monkeypatch):
-        monkeypatch.setattr(picker.sys.stdin, "isatty", lambda: True, raising=False)
+        self._ttys(monkeypatch)
         assert picker.raw_mode_available() is True
+
+    def test_a_tty_that_is_not_a_console_is_never_raw(self, monkeypatch):
+        self._ttys(monkeypatch, console=False)
+        assert picker.raw_mode_available() is False
+
+    def test_a_captured_stdout_is_never_raw(self, monkeypatch):
+        self._ttys(monkeypatch, stdout=False)
+        assert picker.raw_mode_available() is False
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="CREATE_NEW_CONSOLE")
+    def test_a_console_owning_parent_capturing_a_child_is_never_raw(self, tmp_path):
+        """The Windows e2e shape that hung v3.19.0's ``--go``: the PARENT owns
+        a console (so the child inherits a real console stdin that passes
+        ``GetConsoleMode``) but captures the child's stdout."""
+        out = tmp_path / "out.txt"
+        parent = tmp_path / "parent.py"
+        probe = "from magent.cli import picker; print(picker.raw_mode_available())"
+        parent.write_text(
+            "import subprocess, sys\n"
+            f"r = subprocess.run([sys.executable, '-c', {probe!r}],"
+            " capture_output=True, text=True, timeout=60)\n"
+            f"open({str(out)!r}, 'w').write(r.stdout + r.stderr)\n",
+            encoding="utf-8",
+        )
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0  # SW_HIDE: a real console, never a visible window
+        subprocess.run(
+            [sys.executable, str(parent)],
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
+            startupinfo=si,
+            timeout=90,
+            check=True,
+        )
+        assert out.read_text(encoding="utf-8").strip() == "False"
+
+    def test_a_null_device_stdin_is_never_raw(self):
+        """Windows' ``isatty()`` says True for NUL; the raw loop would then
+        block forever on ``getwch`` (v3.19.0 hung every Windows CI ``--go``).
+        A REAL child with ``stdin=DEVNULL`` -- the exact CI/scheduler shape."""
+        probe = "from magent.cli import picker; print(picker.raw_mode_available())"
+        r = subprocess.run(
+            [sys.executable, "-c", probe],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        )
+        assert r.stdout.strip() == "False"
 
 
 class TestPainting:

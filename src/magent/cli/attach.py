@@ -32,6 +32,7 @@ from magent.cli.config_io import (
     _load_config_or_exit,
     _project_dicts,
 )
+from magent.cli.mobile import _configured_upload_port
 from magent.cli.ui import _banner, _divider, _print_session_overview
 from magent.config import DEFAULT_TOOLS
 from magent.grid import compute_grid
@@ -1639,7 +1640,10 @@ def attach_cmd(
 
 @main.command("hotkey")
 @click.option(
-    "--server", "-s", default="http://localhost:8033", help="Upload server URL"
+    "--server",
+    "-s",
+    default=None,
+    help="Upload server URL (default: this config's uploadPort on localhost, else 8033)",
 )
 @click.option(
     "--ssh-host",
@@ -1647,7 +1651,7 @@ def attach_cmd(
     help="SSH target whose projects F2 opens over VS Code Remote-SSH",
 )
 @click.pass_context
-def hotkey_cmd(ctx: click.Context, server: str, ssh_host: str | None) -> None:
+def hotkey_cmd(ctx: click.Context, server: str | None, ssh_host: str | None) -> None:
     """Listen for Alt+V to upload clipboard images to psmux sessions.
 
     Only activates when a 'magent:' titled window is focused. Otherwise
@@ -1673,6 +1677,12 @@ def hotkey_cmd(ctx: click.Context, server: str, ssh_host: str | None) -> None:
             f"  {style('Stop it first with', dim=True)} {style('magent down --all', bold=True)}{style('.', dim=True)}"
         )
         return
+
+    if server is None:
+        # The port serve/status/doctor watch, never a literal 8033 while the
+        # config says otherwise.
+        port = _configured_upload_port(ctx.obj.get("config_path"))
+        server = f"http://localhost:{port}"
 
     _banner()
     click.echo(
