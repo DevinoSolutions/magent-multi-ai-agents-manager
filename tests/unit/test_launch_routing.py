@@ -748,3 +748,64 @@ class TestAnAbortedGoChecklistPlansNothing:
         assert ccswap.calls()
         assert accounts.read_map()["proj0"].account == "13"
         assert [w.window_name for w in fp.launched_psmux] == ["proj0"]
+
+
+class TestUpRoutesOnlyWhatItBringsUp:
+    """`magent up -g X` / `up` with `only` plans the sessions it creates.
+
+    The same narrowing `--go`'s checklist gets from `_select_projects`: a
+    project this bring-up is not creating is not this bring-up's to place. Its
+    earlier placement stays in the map exactly as it was -- which matters most
+    for a session ALREADY RUNNING on that account, whose entry a fresh plan
+    could otherwise move while the pane itself stays put -- and a project never
+    placed gains no entry.
+    """
+
+    def _up(self, cfg, monkeypatch, **kwargs):
+        from magent import psmux
+
+        fp = FakePlatform(supports_psmux=True)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+        psmux.bring_up(cfg, **kwargs)
+        return fp
+
+    def test_only_plans_just_the_named_sessions(
+        self, tmp_path, monkeypatch, ccswap, fake_sleep
+    ):
+        accounts.write_map({"proj0": accounts.MapEntry(account="99")})
+        cfg = _cfg(tmp_path, 3)
+        _enable_routing(cfg)
+
+        fp = self._up(cfg, monkeypatch, only=["proj1"])
+
+        assert [w.window_name for w in fp.launched_psmux] == ["proj1"]
+        assert fp.launched_psmux[0].env
+        placed = accounts.read_map()
+        assert placed["proj1"].account == "13"
+        assert placed["proj0"].account == "99"
+        assert "proj2" not in placed
+
+    def test_a_group_plans_just_its_members(
+        self, tmp_path, monkeypatch, ccswap, fake_sleep
+    ):
+        cfg = _cfg(tmp_path, 3)
+        cfg.projects[0].group = "web"
+        cfg.projects[1].group = "web"
+        cfg.projects[2].group = "infra"
+        _enable_routing(cfg)
+
+        fp = self._up(cfg, monkeypatch, group="WEB")
+
+        assert [w.window_name for w in fp.launched_psmux] == ["proj0", "proj1"]
+        assert set(accounts.read_map()) == {"proj0", "proj1"}
+
+    def test_a_plain_up_still_plans_the_whole_fleet(
+        self, tmp_path, monkeypatch, ccswap, fake_sleep
+    ):
+        cfg = _cfg(tmp_path, 3)
+        _enable_routing(cfg)
+
+        fp = self._up(cfg, monkeypatch)
+
+        assert len(fp.launched_psmux) == 3
+        assert set(accounts.read_map()) == {"proj0", "proj1", "proj2"}

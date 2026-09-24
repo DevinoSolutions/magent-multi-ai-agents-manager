@@ -1455,12 +1455,23 @@ def bring_up(
     its own account's store, and the overlay goes onto each window, so the pane
     starts under it. Two callers, one decision -- a second copy of the policy
     is how one of these paths quietly stops routing.
+
+    Routing sees the SAME narrowing creation does (``group``, then ``only``),
+    the way ``--go``'s checklist narrows before the phase: a project this
+    bring-up is not creating -- one already running, most sharply -- keeps its
+    map entry untouched rather than being re-planned for a pane nobody started.
     """
-    from magent.launch import _route_projects
+    from magent.launch import _route_projects, routing_session_id
     from magent.platform import get_platform
 
     plat = get_platform()
-    routes = _route_projects(config, config.projects)
+    in_scope = [
+        p
+        for p in config.projects
+        if (not group or (p.group or "").lower() == group.lower())
+        and (only is None or routing_session_id(p) in only)
+    ]
+    routes = _route_projects(config, in_scope)
     windows: list[PsmuxWindowOpts] = []
     for p in eligible_projects(config, group, config_dirs=routes.config_dirs()):
         if only is not None and _field_str(p, "session") not in only:

@@ -1932,7 +1932,9 @@ the five refusals above then apply unchanged, each launching the fleet unrouted.
 A dry run and a tile-only retile launch nothing, so they skip the phase entirely.
 The whole phase sits under ONE budget (`ROUTE_BUDGET_S`); expiring it launches
 the fleet unrouted rather than late. `psmux.bring_up` (the `magent up`/attach
-path) calls the same function, so the two paths cannot drift.
+path) calls the same function, so the two paths cannot drift -- on the same
+`group`/`only`-narrowed list it creates, as `--go` routes only what its checklist
+kept.
 
 The two ENABLE gates are asked through `routing.policy_for` and named by
 `routing.routing_off_reason`, the same pair `magent account` and `doctor` use —
