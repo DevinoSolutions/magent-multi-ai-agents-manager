@@ -28,8 +28,16 @@ REAL_HOME = Path.home()
 REAL_MAGENT_DIR = REAL_HOME / ".magent"
 # The product state directories under that home -- NOT the home itself, because
 # on Windows the pytest tmp root lives at %LOCALAPPDATA%\Temp, i.e. inside it.
-# These are the trees a leaking test actually damages.
-_REAL_STATE_ROOTS = (REAL_MAGENT_DIR, REAL_HOME / ".claude")
+# These are the trees a leaking test actually damages. ~/.claude-swap-backup is
+# the ccswap store: it holds the user's real account CREDENTIALS, magent never
+# reads or writes inside it, and listing it here makes guard A flag any magent
+# module attribute that ever points into it -- automatically, for code nobody
+# has written yet.
+_REAL_STATE_ROOTS = (
+    REAL_MAGENT_DIR,
+    REAL_HOME / ".claude",
+    REAL_HOME / ".claude-swap-backup",
+)
 
 # Tests under this directory keep the machine's own home. tests/platform is the
 # CI-only tier that drives REAL windows, monitors and psmux against the session
@@ -74,6 +82,7 @@ _IMPORT_BOUND_PATHS = (
     ("magent.upload_server", "_PICKER_ATTACHED_FILE", "picker-attached"),
     ("magent.upload_server", "_UPLOAD_DIR", "uploads"),
     ("magent.psmux", "DECOR_STAMP", "decor.stamp"),
+    ("magent.accounts", "ACCOUNT_MAP_PATH", "account-map.json"),
     # win32-only module (it raises ImportError elsewhere by design), so this
     # entry is skipped rather than imported off-Windows.
     ("magent.hotkey", "_PID_PATH", "hotkey.pid"),
@@ -183,9 +192,46 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     # machine the suite runs on. Tests that are ABOUT the hand-off set the
     # policy explicitly.
     monkeypatch.setenv("MAGENT_SESSION0_POLICY", "allow")
+    # ...and a fourth, which is psmux_boost's reason at its sharpest. Account
+    # routing is the ONE thing in this product that shells out to a tool holding
+    # the user's real account CREDENTIALS -- `ccswap`, resolved off PATH -- and
+    # no HOME redirect contains a binary on PATH. Off for every tier. It is
+    # belt-and-braces over two other gates (settings.accounts.enabled is false
+    # by default, and every test fakes the `find_ccswap` seam), which is exactly
+    # the point: neither of those is something a test yet unwritten can be
+    # trusted to remember.
+    monkeypatch.setenv("MAGENT_ACCOUNT_ROUTING", "0")
     log.reset_logging()
     yield
     log.reset_logging()
+
+
+# Not tidiness: the installed ccswap's `list` runs a credential ADOPTION pass
+# that WRITES to the user's real store, so a test that forgets its fake can
+# mutate live credentials. Pinned by EFFECT (and by why MAGENT_ACCOUNT_ROUTING=0
+# does not cover it) in
+# tests/unit/test_home_isolation.py::TestNoTestResolvesTheRealCcswap.
+@pytest.fixture(autouse=True)
+def _no_real_ccswap(monkeypatch):
+    """No test resolves the REAL ``ccswap`` binary. A test that installed no
+    fake sees "not installed", which is a shape every caller already handles.
+
+    In the same family as the three env opt-outs above, and for the sharpest
+    version of their reason: ccswap owns the user's account CREDENTIALS, the
+    installed build's ``list`` performs a credential-adoption pass that WRITES
+    to its store, and **no HOME redirect contains a binary on PATH**. Measured,
+    not theoretical: while `magent account` was being written, one test that
+    simply forgot the fake spawned the real ccswap three times (`list`,
+    ``config get``, ``--version``) -- it answered out of the redirected tmp home,
+    so nothing was damaged, and that was luck rather than design.
+
+    Patched on the MODULE attribute, so ``accounts.read_accounts`` and friends
+    see it while ``tests/unit/test_accounts.py``'s by-value import of
+    ``find_ccswap`` (the test that proves PATH resolution itself) still gets the
+    real resolver. A test that wants a fake monkeypatches the same attribute
+    afterwards and wins, as it does today.
+    """
+    monkeypatch.setattr("magent.accounts.find_ccswap", lambda: None)
 
 
 # --- The tripwire -------------------------------------------------------------

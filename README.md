@@ -347,6 +347,85 @@ case-insensitively and refuse a name that is not live.
 > not stop it. Use the `--compact` flag, or set `MSYS_NO_PATHCONV=1` for that
 > command.
 
+### Per-project Claude accounts
+
+If you keep several Claude subscriptions in `ccswap`, magent can put each project
+on a *different* account instead of everything sharing one login and one rate
+limit. **It ships off.** Nothing routes until you turn it on:
+
+```jsonc
+// magent.config.json
+"settings": {
+  "accounts": { "enabled": true }   // softThreshold 85, hardThreshold 95
+}
+```
+
+```bash
+magent account              # the table: every account, its 5h/7d/fable usage, projects on it
+magent account plan         # which account each project WOULD get, and why. Changes nothing.
+magent account plan --json  # the same, machine-readable
+magent account pin web 13   # this project always runs on account 13
+magent account unpin web    # let the planner place it again
+magent account refresh      # ask ccswap for fresher usage numbers
+```
+
+Two ideas are worth knowing, because everything else follows from them:
+
+- **A pin is yours; an assignment is magent's.** `magent account pin` writes
+  `account` on that project in your config — user intent, git-visible,
+  hand-editable, and honoured even when the account is over its limit (magent
+  says so rather than quietly re-routing). What magent *works out* for the rest
+  is machine state and lives in `~/.magent/account-map.json`, so a pin and a
+  guess can never be confused on disk.
+- **Routing can never be the reason a launch fails.** ccswap missing, too old, a
+  required ccswap setting not in effect, the same login sitting in two ccswap
+  slots, no usable account — every one of those prints a named reason and
+  launches the fleet unrouted, exactly as it does today. `magent account`/`plan`
+  show each refusal with the exact `ccswap config set ...` that clears it; magent
+  never flips one for you.
+
+A project's work also has a **class**, and that is what decides which usage cap
+it is budgeted against. `modelClass` on a project is how you say it outright:
+
+```jsonc
+{ "path": "web", "modelClass": "fable" }
+```
+
+`fable` means this project's work counts against a model-scoped weekly window of
+its own *as well as* the account's 5-hour and 7-day ones; `standard` means only
+those two — which is exactly what lets an account with its Fable cap spent keep
+hosting Opus/Sonnet work instead of sitting idle. Leave the key out and magent
+infers the class: what it last observed running in that pane, otherwise
+`standard`. It guesses that way on purpose — guessing standard only spends 7-day
+headroom that was going to waste, while guessing fable can block an agent
+outright. A value that is neither is ignored with a warning, never an error.
+
+Three ccswap settings have to be right before anything routes:
+`profiles.persistent true`, `autoswitch.enabled false` and
+`autoswitch.warmupFiveHour false` — the last two because a global switch or a
+warm-up pass moves the active login and spends headroom magent just budgeted.
+`magent doctor` reports all three under `account-routing`, as a warning at worst
+(it can never fail a doctor run), and says so explicitly if your magent is too
+old to have checked one of them. `magent sessions --json` carries each session's
+`account` — `null` when it is unrouted.
+
+If a routed fleet ever misbehaves, `MAGENT_ACCOUNT_ROUTING=0` is the kill switch:
+one variable, no config edit, every pane back on the default login. `magent
+account` and `magent account plan` honour it too, and name it as the reason
+rather than pointing you at a config key that is already correct.
+
+> **Expected, not a bug:** a *mutating* ccswap command typed inside a routed
+> agent pane refuses, because the pane exports `CLAUDE_CONFIG_DIR`. That is the
+> safety property working — it is what stops a stray `ccswap switch 19` in one
+> window moving the active login out from under every other session. Reads still
+> work. Change placement with `magent account pin` instead.
+>
+> And the reason that matters: switching the *active slot* (the ccswap TUI,
+> `ccswap switch`, or autoswitch) rewrites `~/.claude/.credentials.json`, which
+> **logs out every session that is not routed**. Routed panes are unaffected;
+> anything still on the default login is not. With `autoswitch.enabled true`
+> magent refuses to route at all, for the same reason.
+
 ### Typing through psmux
 
 Two keys stop working the moment your agent runs inside a psmux pane:
