@@ -680,3 +680,71 @@ class TestALaunchThatLaunchesNothingPlansNothing:
         assert ccswap.calls() == []
         assert not accounts.ACCOUNT_MAP_PATH.exists()
         assert fp.launched_psmux == []
+
+
+class TestAnAbortedGoChecklistPlansNothing:
+    """Esc on `--go`'s checklist launches nothing, so it must route nothing.
+
+    Correct today only by code shape: `cli/app.py` returns on the abort before
+    it even imports `launch`. Pinned at the CLI because that shape is exactly
+    what a refactor moving the routing phase earlier -- to show accounts in the
+    checklist, say -- would quietly break, and the cost would be ccswap spawned
+    (and its store written) for a launch the user just cancelled.
+    """
+
+    def _cli(self, runner, tmp_path, tmp_config, monkeypatch, result):
+        from magent.cli import checklist
+        from magent.cli.app import main
+
+        monkeypatch.setattr(checklist.picker, "raw_mode_available", lambda: True)
+        monkeypatch.setattr(checklist, "run", lambda _state: result)
+        fp = FakePlatform(supports_psmux=True)
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+        project_dir = tmp_path / "proj0"
+        project_dir.mkdir()
+        cfgpath = tmp_config(
+            {
+                "projects": [{"path": str(project_dir), "title": "proj0"}],
+                "settings": {"psmux": True, "accounts": {"enabled": True}},
+            }
+        )
+        return runner.invoke(main, ["--config", cfgpath, "--go"]), fp
+
+    def test_an_abort_spawns_no_ccswap_and_writes_no_map(
+        self, runner, tmp_path, tmp_config, monkeypatch, ccswap, fake_sleep
+    ):
+        from magent.cli import checklist
+
+        result, fp = self._cli(
+            runner,
+            tmp_path,
+            tmp_config,
+            monkeypatch,
+            checklist.ChecklistResult(checklist.ABORT),
+        )
+
+        assert result.exit_code == 0, result.output
+        assert checklist.ABORT_MESSAGE in result.stdout
+        assert ccswap.calls() == []
+        assert not accounts.ACCOUNT_MAP_PATH.exists()
+        assert fp.launched_psmux == []
+
+    def test_the_same_config_launched_does_route(
+        self, runner, tmp_path, tmp_config, monkeypatch, ccswap, fake_sleep
+    ):
+        # The control: without it the abort test passes just as well against a
+        # config whose routing never switched on at all.
+        from magent.cli import checklist
+
+        result, fp = self._cli(
+            runner,
+            tmp_path,
+            tmp_config,
+            monkeypatch,
+            checklist.ChecklistResult(checklist.LAUNCH, ("proj0",)),
+        )
+
+        assert result.exit_code == 0, result.output
+        assert ccswap.calls()
+        assert accounts.read_map()["proj0"].account == "13"
+        assert [w.window_name for w in fp.launched_psmux] == ["proj0"]
