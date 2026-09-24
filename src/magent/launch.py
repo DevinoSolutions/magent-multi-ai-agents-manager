@@ -939,7 +939,17 @@ def run_magent(config: MagentConfig, opts: RunOpts) -> int:
     # environment overlay and the config dir its session probe answers from --
     # have to exist before any window's command is built. Empty (and silent)
     # whenever routing is off, which is the default.
-    routes = _route_projects(config, projects)
+    #
+    # Skipped outright when nothing will be launched. A dry run and a tile-only
+    # retile start no pane, so there is no placement to decide -- and deciding
+    # one anyway spawns ccswap (whose `list` WRITES into its credential store)
+    # and rewrites the account map for panes that never existed.
+    # `magent account plan` is the preview that means to do that.
+    routes = (
+        RoutePlan()
+        if opts.dry_run or opts.tile_only
+        else _route_projects(config, projects)
+    )
     for note in routes.notes:
         click.echo(f"  {style('!', fg='yellow')} {style(note, dim=True)}")
 

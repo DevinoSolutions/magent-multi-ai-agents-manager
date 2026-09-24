@@ -641,3 +641,42 @@ class TestTheSessionProbeReadsTheRoutedStore:
 
         assert "[fresh]" not in out
         assert "[a" not in out
+
+
+class TestALaunchThatLaunchesNothingPlansNothing:
+    """A dry run and a tile-only retile create no pane, so they route none.
+
+    Planning is not free here: it spawns ccswap five times, and the installed
+    ccswap's `list` performs a credential-adoption WRITE into its own store.
+    A preview that writes into the tool holding the user's credentials -- and
+    rewrites `account-map.json` for panes it never started -- is the opposite
+    of what either mode promises.
+    """
+
+    def test_a_dry_run_spawns_no_ccswap_and_writes_no_map(
+        self, tmp_path, monkeypatch, ccswap, fake_sleep
+    ):
+        cfg = _cfg(tmp_path, 2)
+        _enable_routing(cfg)
+        fp = FakePlatform(supports_psmux=True)
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+
+        assert run_magent(cfg, RunOpts(dry_run=True)) == 0
+
+        assert ccswap.calls() == []
+        assert not accounts.ACCOUNT_MAP_PATH.exists()
+        assert fp.launched_psmux == []
+
+    def test_a_tile_only_retile_spawns_no_ccswap_and_writes_no_map(
+        self, tmp_path, monkeypatch, ccswap, fake_sleep
+    ):
+        cfg = _cfg(tmp_path, 2)
+        _enable_routing(cfg)
+        fp = FakePlatform(supports_psmux=True)
+        monkeypatch.setattr("magent.launch.get_platform", lambda: fp)
+
+        assert run_magent(cfg, RunOpts(retile_all=True, tile_only=True)) == 0
+
+        assert ccswap.calls() == []
+        assert not accounts.ACCOUNT_MAP_PATH.exists()
+        assert fp.launched_psmux == []

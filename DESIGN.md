@@ -1929,6 +1929,7 @@ exist before any command is built. It runs only when `settings.accounts.enabled`
 is true, `MAGENT_ACCOUNT_ROUTING` has not killed it, ccswap is at least
 `accounts.MIN_CCSWAP_VERSION`, and ccswap's own required settings are in effect;
 the five refusals above then apply unchanged, each launching the fleet unrouted.
+A dry run and a tile-only retile launch nothing, so they skip the phase entirely.
 The whole phase sits under ONE budget (`ROUTE_BUDGET_S`); expiring it launches
 the fleet unrouted rather than late. `psmux.bring_up` (the `magent up`/attach
 path) calls the same function, so the two paths cannot drift.
