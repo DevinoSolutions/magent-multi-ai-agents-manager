@@ -1,6 +1,6 @@
 [project]
 name = "magent-multi-ai-agents-manager"
-version = "3.19.0"
+version = "3.19.1"
 description = "Launch each project's AI coding agent in its own terminal, auto-tiled across every monitor"
 readme = "README.md"
 license = "AGPL-3.0"
@@ -60,7 +60,7 @@ qr = ["qrcode>=7"]
 # pexpect drives the POSIX real-PTY menu tests; pywinpty (win32-only wheels)
 # drives the same tests over a real ConPTY on Windows — hence the platform
 # marker so `pip install -e ".[dev]"` still resolves on macOS/Linux.
-dev = ["pytest>=7.0", "pexpect>=4.8", "pywinpty>=2.0; sys_platform == 'win32'", "ruff>=0.15", "pytest-cov>=5.0", "ty==0.0.80", "vulture>=2.14"]
+dev = ["pytest>=7.0", "pexpect>=4.8", "pywinpty>=2.0; sys_platform == 'win32'", "ruff>=0.15", "pytest-cov>=5.0", "ty==0.0.82", "vulture>=2.14"]
 # Kept out of `dev` on purpose: Playwright + its browser download are heavy and
 # only the dedicated browser-upload CI job needs them, so the OS x Py unit matrix
 # and the quality gate stay lean. Never a runtime dep (the dist import-sweep
@@ -95,7 +95,7 @@ Changelog = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/b
 # Cap the backend so artifacts stay Metadata-Version 2.4 end-to-end; lift the
 # cap once a Dependabot bump of pypa/gh-action-pypi-publish ships packaging
 # >= 26.3 in its runtime.txt.
-requires = ["hatchling<1.32"]
+requires = ["hatchling<1.33"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
