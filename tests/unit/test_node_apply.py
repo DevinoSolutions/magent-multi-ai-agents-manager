@@ -6,6 +6,7 @@ never found)."""
 from __future__ import annotations
 
 import ast
+import errno
 import io
 import json
 import os
@@ -1747,6 +1748,128 @@ class TestOneStoreHoldsEveryStepsMemory:
         store = self._check(box)
         assert store["shipped"] == first["shipped"]
         assert store["digests"]["settings"] == first["digests"]["settings"]
+
+
+class _HungUp(io.TextIOBase):
+    """A stdout whose reader went away once the first row was through: the
+    PC gave up (PROVISION_TIMEOUT_S) and its ssh closed the pipe. ``where``
+    is the call that hits the dead pipe first -- the write, or the flush of a
+    buffered write."""
+
+    def __init__(self, error: OSError, where: str) -> None:
+        self.error = error
+        self.where = where
+        self.rows: list[str] = []
+        self.pending: list[str] = []
+        self.attempts = 0
+        self.dead = False
+
+    def write(self, text: str) -> int:
+        self.attempts += 1
+        if self.dead and self.where == "write":
+            raise self.error
+        self.pending.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        if self.dead and self.where == "flush":
+            raise self.error
+        self.rows.extend(self.pending)
+        self.pending.clear()
+        self.dead = bool(self.rows)
+
+
+_EPIPE = [
+    BrokenPipeError(errno.EPIPE, "Broken pipe"),
+    OSError(errno.EPIPE, "Broken pipe"),
+]
+
+
+class TestAPcThatHangsUpDoesNotStopTheApply:
+    # cq-F12 I1: the PC gives up, its ssh dies, and the next row's write hits
+    # EPIPE. Every step after it must still land -- the store included -- so
+    # "may have run to completion" is true and a retry only skips.
+
+    SCOPE = TestOneStoreHoldsEveryStepsMemory.SCOPE
+
+    def _landed(self, box: Box) -> None:
+        assert (box.home / node_apply.STATE_HOOK_MARKER).read_text(
+            encoding="utf-8"
+        ) == HOOK_TEXT
+        settings = _json(_settings(box))
+        assert settings["env"] == {"X": "x"}
+        assert settings["permissions"]["additionalDirectories"] == ["/srv/d"]
+        assert set(_json(_claude_json(box))["mcpServers"]) == set(TWO_SERVERS)
+        assert set(_json(_credentials(box))["mcpOAuth"]) == {A, B}
+        store = _json(_store(box))
+        assert {"state_hook", "settings", "mcp", "mcp_oauth"} <= set(store["digests"])
+        assert store["shipped"]["settings"]["additionalDirectories"] == ["/srv/d"]
+
+    @pytest.mark.parametrize("where", ["write", "flush"])
+    @pytest.mark.parametrize("error", _EPIPE, ids=["BrokenPipeError", "OSError"])
+    def test_every_later_step_still_writes_its_file(
+        self, box, tmp_path, monkeypatch, error, where
+    ):
+        work = _work(tmp_path, self.SCOPE)
+        pipe = _HungUp(error, where)
+        monkeypatch.setattr(sys, "stdout", pipe)
+        assert box.apply(work) == 0
+        (row,) = pipe.rows
+        assert row.split("\t")[1] == "gh"
+        # The one row that met the dead pipe is the last one tried: the rest
+        # are dropped, not each retried into it.
+        assert pipe.attempts == 2
+        self._landed(box)
+
+    @pytest.mark.parametrize("error", _EPIPE, ids=["BrokenPipeError", "OSError"])
+    def test_a_step_that_fails_after_the_hang_up_still_decides_the_exit(
+        self, box, tmp_path, monkeypatch, error
+    ):
+        def boom(ctx: node_apply.Ctx) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(
+            node_apply,
+            "STEPS",
+            (*node_apply.STEPS[:2], ("boom", boom), *node_apply.STEPS[2:]),
+        )
+        work = _work(tmp_path, self.SCOPE)
+        monkeypatch.setattr(sys, "stdout", _HungUp(error, "write"))
+        assert box.apply(work) == 1
+        self._landed(box)
+
+    def test_a_real_closed_pipe_leaves_the_exit_code_to_the_steps(self, box, tmp_path):
+        # Python flushes stdout once more at exit; into a dead pipe that
+        # flush alone would turn a clean apply's 0 into 120.
+        work = _work(tmp_path, self.SCOPE)
+        code = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "from magent.node_scripts import node_apply\n"
+            "sys.stdin.readline()\n"
+            "sys.exit(node_apply.run(work=Path(sys.argv[1]), home=Path(sys.argv[2]),"
+            " path=sys.argv[3], token='', force=False))\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code, str(work), str(box.home), box.path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert proc.stdin is not None and proc.stdout is not None
+        assert proc.stderr is not None
+        # The PC hangs up before the first row is written.
+        proc.stdout.close()
+        proc.stdin.write(b"go\n")
+        proc.stdin.close()
+        try:
+            rc = proc.wait(timeout=120)
+        finally:
+            proc.kill()
+        err = proc.stderr.read().decode("utf-8", "replace")
+        proc.stderr.close()
+        assert (rc, err) == (0, "")
+        self._landed(box)
 
 
 class TestAFailedOAuthStepKeepsItsMemory:

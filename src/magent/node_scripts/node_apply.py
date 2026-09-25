@@ -88,6 +88,29 @@ class Ctx:
     # What each step shipped last time, so what this PC no longer ships can
     # be taken back.
     shipped: dict[str, object] = field(default_factory=dict)
+    # Set once the PC stopped reading (it gave up and its ssh closed the
+    # pipe): later rows are dropped, and every step still runs.
+    quiet: bool = False
+
+
+def _say(line: str) -> bool:
+    """Writes one report line; False when nobody reads it any more. Then
+    stdout's descriptor is pointed at the null device, so neither a later
+    write nor Python's own flush at exit can hit the dead pipe -- that flush
+    alone would turn an exit code of 0 into 120."""
+    try:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+    except OSError:
+        # A stream with no descriptor has nothing for Python to flush at exit.
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            null = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(null, sys.stdout.fileno())
+            finally:
+                os.close(null)
+        return False
+    return True
 
 
 def _row(ctx: Ctx, status: str, item: str, detail: str = "") -> None:
@@ -99,8 +122,8 @@ def _row(ctx: Ctx, status: str, item: str, detail: str = "") -> None:
     if ctx.token:
         detail = detail.replace(ctx.token, _MASK)
     ctx.rows.append(status)
-    sys.stdout.write(f"{status}\t{item}\t{' '.join(detail.split())}\n")
-    sys.stdout.flush()
+    if not ctx.quiet:
+        ctx.quiet = not _say(f"{status}\t{item}\t{' '.join(detail.split())}\n")
 
 
 def _digest(ctx: Ctx, item: str) -> str:
@@ -904,10 +927,11 @@ STEPS: tuple[tuple[str, Callable[[Ctx], None]], ...] = (
 def run(*, work: Path, home: Path, path: str, token: str, force: bool) -> int:
     """Apply the payload unpacked in ``work`` to ``home``. 1 when any step
     failed, else 0. The store is saved even when a step raised; a store that
-    cannot be saved is its own ``fail`` row."""
+    cannot be saved is its own ``fail`` row. A PC that stops reading
+    mid-apply loses the rows after that, never the steps."""
     manifest = _load(work / "manifest.json")
     if not isinstance(manifest, dict) or manifest.get("version") != MANIFEST_VERSION:
-        sys.stdout.write(
+        _say(
             "fail\tmanifest\tthe payload has no manifest of version "
             f"{MANIFEST_VERSION}\n"
         )
