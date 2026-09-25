@@ -28,7 +28,7 @@ import shutil
 import subprocess
 from typing import TYPE_CHECKING
 
-from magent import node_scripts
+from magent import node_scripts, psmux
 from magent.attach_client import SSH_MISSING_RC, TMUX_SOCKET
 from magent.log import get_logger
 from magent.nodes import LoadSample, LocalGitState
@@ -343,6 +343,100 @@ def has_session(node: Node, sid: str) -> bool | None:
     if result.returncode == 1:
         return False
     return None
+
+
+def tmux_argv(*args: str) -> list[str]:
+    """``tmux -L magent <args>``: the one node server (DECISION-3)."""
+    return [MUX, "-L", SOCKET, *args]
+
+
+def list_sessions(node: Node) -> list[str] | None:
+    """Every session on ``node``'s magent server. ``[]`` when tmux said there
+    are none (exit 1: no server). None when the PROBE failed (unreachable, no
+    tmux, a timeout): "I could not look" is never "nothing is running"."""
+    try:
+        result = run(
+            node,
+            tmux_argv("list-sessions", "-F", "#{session_name}"),
+            timeout_s=PROBE_TIMEOUT_S,
+            check=False,
+        )
+    except RemoteError:
+        return None
+    if result.returncode == 1:
+        return []
+    if result.returncode != 0:
+        return None
+    return [
+        line for line in result.stdout.decode("utf-8", "replace").splitlines() if line
+    ]
+
+
+def kill_session(node: Node, sid: str) -> bool | None:
+    """Kill ``sid`` on ``node``: True killed, False it was not there, None the
+    call failed and the session may still be running."""
+    try:
+        result = run(
+            node,
+            tmux_argv("kill-session", "-t", f"={sid}"),
+            timeout_s=PROBE_TIMEOUT_S,
+            check=False,
+        )
+    except RemoteError:
+        return None
+    return {0: True, 1: False}.get(result.returncode)
+
+
+def decoration_args(sid: str, nick: str, code_hint: bool) -> list[list[str]]:
+    """The ten decoration commands of a node session: the SAME vocabulary as
+    ``psmux.decoration_argv`` (status hints, the F1/F2 bindings, the window
+    name rule), with the brand naming the node. One server hosts every node
+    session, so the per-session options are scoped with ``-t =sid`` (and the
+    window ones with ``=sid:``) rather than ``-g``, where psmux's
+    server-per-session model allows a global."""
+    hints, hints_len = psmux.status_hints(code_hint)
+    brand, brand_len = psmux.status_left(nick)
+    target, window = f"={sid}", f"={sid}:"
+    fmt = psmux.WINDOW_STATUS_FORMAT
+    return [
+        tmux_argv("bind", "-n", "F1", "detach-client"),
+        tmux_argv("set", "-t", target, "status-right", hints),
+        tmux_argv("set", "-t", target, "status-right-length", hints_len),
+        tmux_argv("set", "-t", target, "status-left", brand),
+        tmux_argv("set", "-t", target, "status-left-length", brand_len),
+        psmux.f2_binding_argv(tmux_argv(), code_hint),
+        tmux_argv("rename-window", "-t", window, psmux.window_display_name(sid)),
+        tmux_argv("setw", "-t", window, "automatic-rename", "off"),
+        tmux_argv("setw", "-t", window, "window-status-format", fmt),
+        tmux_argv("setw", "-t", window, "window-status-current-format", fmt),
+    ]
+
+
+def decoration_script(sid: str, nick: str, code_hint: bool) -> str:
+    """``decoration_args`` as a bash script, one line per command, each allowed
+    to fail: a cosmetic option must never fail the bring-up it rides."""
+    return "".join(
+        shlex.join(argv) + " || true\n"
+        for argv in decoration_args(sid, nick, code_hint)
+    )
+
+
+def decorate(node: Node, sid: str, nick: str) -> bool:
+    """(Re)apply the decoration to a session already running on ``node``, in
+    one connection. ``code_hint`` is THIS machine's answer: F2 is caught by the
+    listener on this PC, not by anything on the node."""
+    script = decoration_script(sid, nick, psmux.code_on_path())
+    try:
+        result = run(
+            node,
+            ["bash", "-s"],
+            timeout_s=SCRIPT_TIMEOUT_S,
+            input_bytes=script.encode("utf-8"),
+            check=False,
+        )
+    except RemoteError:
+        return False
+    return result.returncode == 0
 
 
 def _finite(value: object) -> float:

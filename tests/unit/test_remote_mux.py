@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from magent import attach_client, log, node_scripts, remote_mux
+from magent import attach_client, log, node_scripts, psmux, remote_mux
 from magent.attach_client import SSH_CONNECTION_OPTS
 from magent.nodes import LoadSample, Node
 from magent.remote_mux import RemoteError
@@ -988,3 +988,107 @@ class TestTheLocalTreeIsReadNotChanged:
         assert exc.value.rc is None
         assert exc.value.stderr_tail == "git not found on PATH"
         assert exc.value.command_redacted[0] == "git"
+
+
+def _wrapped(argv: list[str]) -> str:
+    return "bash -c " + shlex.quote(shlex.join(argv))
+
+
+class TestTheNodesSessionList:
+    def test_the_names_come_back_one_per_line(self, fake_ssh):
+        fake_ssh.set_reply("list-sessions", stdout="api\nweb\n")
+        assert remote_mux.list_sessions(NODE) == ["api", "web"]
+        assert fake_ssh.calls()[0].argv[-1] == _wrapped(
+            ["tmux", "-L", "magent", "list-sessions", "-F", "#{session_name}"]
+        )
+
+    def test_tmuxs_own_no_is_an_empty_list(self, fake_ssh):
+        fake_ssh.set_reply("list-sessions", stderr="no server running", rc=1)
+        assert remote_mux.list_sessions(NODE) == []
+
+    def test_an_unreachable_node_is_none_not_empty(self, fake_ssh):
+        fake_ssh.set_reply("list-sessions", rc=255)
+        assert remote_mux.list_sessions(NODE) is None
+
+    def test_no_ssh_client_is_none(self):
+        assert remote_mux.list_sessions(NODE) is None
+
+
+class TestKillingANodeSession:
+    def test_a_killed_session_is_true_and_targets_the_exact_name(self, fake_ssh):
+        assert remote_mux.kill_session(NODE, "api") is True
+        assert fake_ssh.calls()[0].argv[-1] == _wrapped(
+            ["tmux", "-L", "magent", "kill-session", "-t", "=api"]
+        )
+
+    def test_a_session_that_was_not_there_is_false(self, fake_ssh):
+        fake_ssh.set_reply("kill-session", rc=1)
+        assert remote_mux.kill_session(NODE, "api") is False
+
+    def test_an_unreachable_node_is_none(self, fake_ssh):
+        fake_ssh.set_reply("kill-session", rc=255)
+        assert remote_mux.kill_session(NODE, "api") is None
+
+
+class TestANodeSessionIsDecoratedLikeALocalOne:
+    @pytest.mark.parametrize("code_hint", [True, False])
+    def test_the_same_ten_commands_scoped_to_the_session(self, code_hint):
+        node = remote_mux.decoration_args("api", "second", code_hint)
+        local = psmux.decoration_argv("api", "psmux", code_hint)
+        assert len(node) == len(local) == 10
+        assert all(a[:3] == ["tmux", "-L", "magent"] for a in node)
+        # Server-wide key bindings are identical after the prefix.
+        assert node[0][3:] == local[0][3:]
+        assert node[5][3:] == local[5][3:]
+        brand, brand_len = psmux.status_left("second")
+        hints, hints_len = psmux.status_hints(code_hint)
+        assert node[1][3:] == ["set", "-t", "=api", "status-right", hints]
+        assert node[2][3:] == ["set", "-t", "=api", "status-right-length", hints_len]
+        assert node[3][3:] == ["set", "-t", "=api", "status-left", brand]
+        assert node[4][3:] == ["set", "-t", "=api", "status-left-length", brand_len]
+        assert node[6][3:] == [
+            "rename-window",
+            "-t",
+            "=api:",
+            psmux.window_display_name("api"),
+        ]
+        assert node[7][3:] == ["setw", "-t", "=api:", "automatic-rename", "off"]
+        assert node[8][3:] == ["setw", "-t", "=api:", "window-status-format", "#W"]
+        assert node[9][3:] == [
+            "setw",
+            "-t",
+            "=api:",
+            "window-status-current-format",
+            "#W",
+        ]
+
+    def test_status_left_is_the_node_brand_and_its_length(self):
+        # R-D5.
+        args = remote_mux.decoration_args("api", "second", False)
+        text, cells = psmux.status_brand("second")
+        assert args[3][-1] == text
+        assert int(args[4][-1]) == int(cells) + 2
+
+    def test_the_script_is_one_tolerant_line_per_command(self):
+        script = remote_mux.decoration_script("api", "second", True)
+        lines = script.splitlines()
+        assert len(lines) == 10
+        for line, argv in zip(
+            lines, remote_mux.decoration_args("api", "second", True), strict=True
+        ):
+            assert line.endswith(" || true")
+            assert shlex.split(line.removesuffix(" || true")) == argv
+
+    def test_decorate_sends_the_script_on_stdin(self, fake_ssh, monkeypatch):
+        monkeypatch.setattr(psmux, "code_on_path", lambda: False)
+        assert remote_mux.decorate(NODE, "api", "second") is True
+        call = fake_ssh.calls()[0]
+        assert call.argv[-1] == _wrapped(["bash", "-s"])
+        assert (
+            call.stdin == remote_mux.decoration_script("api", "second", False).encode()
+        )
+
+    def test_an_unreachable_node_is_false(self, fake_ssh, monkeypatch):
+        monkeypatch.setattr(psmux, "code_on_path", lambda: False)
+        fake_ssh.set_reply("bash -s", rc=255)
+        assert remote_mux.decorate(NODE, "api", "second") is False
