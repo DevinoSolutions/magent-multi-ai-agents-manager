@@ -652,10 +652,30 @@ GH_TOKEN_ARGV = ("auth", "token", "--hostname", "github.com")
 # non-ASCII, a space or a stray one-word line never ships.
 _GH_TOKEN_RE = re.compile(r"[A-Za-z0-9_]{20,255}")
 _GH_NOT_A_TOKEN = "gh auth token printed something that is not a token"
+# A token-shaped run in gh's own words (stderr, a status entry's error) is
+# replaced before those words are kept: they reach hints, rows and logs.
+_GH_TOKENISH_RE = re.compile(r"(gh[opsur]_|github_pat_)[A-Za-z0-9_]+")
+_GH_DETAIL_MAX = 200
+# gh's tokenSource when the token is an environment variable's: a re-login
+# cannot replace it.
+GH_ENV_TOKEN_SOURCES = frozenset(
+    {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
+)
 
 GhUnavailableReason = Literal[
-    "missing", "too-old", "not-logged-in", "unverified", "timeout", "failed"
+    "missing",
+    "too-old",
+    "not-logged-in",
+    "unverified",
+    "rejected",
+    "timeout",
+    "failed",
 ]
+
+
+def _gh_detail(text: str) -> str:
+    """gh's own words, safe to keep: token shapes scrubbed, then capped."""
+    return _GH_TOKENISH_RE.sub("<redacted>", text.strip())[:_GH_DETAIL_MAX]
 
 
 @dataclass(frozen=True)
@@ -664,15 +684,21 @@ class GhUnavailable:
     prints the repair that fits (``hint``) instead of one generic
     "gh auth login".
 
-    ``unverified`` is an active login gh could not check (offline, or
-    github.com unreachable); ``login`` names it. ``gh auth token`` reads the
-    stored token without the network, so that login's token is still readable
-    and may still ship. ``failed`` is anything else; ``detail`` is gh's last
-    stderr line -- never its stdout, which for a token read is the token."""
+    ``unverified`` is an active login gh could not check -- its state is
+    ``timeout``, or ``error`` for any reason but a refused token (a DNS
+    failure, github.com unreachable); ``login`` names it. ``gh auth token``
+    reads the stored token without the network, so that login's token is
+    still readable and may still ship. ``rejected`` is github.com refusing
+    the token (HTTP 401, "Bad credentials": revoked or invalid): a rejected
+    token NEVER ships, and ``token_source`` says whether a re-login can fix
+    it. ``failed`` is anything else. ``detail`` is gh's own words (its last
+    stderr line, or a status entry's ``error``), token shapes scrubbed and
+    capped -- never its stdout, which for a token read is the token."""
 
     reason: GhUnavailableReason
     login: str | None = None
     detail: str = ""
+    token_source: str = ""
 
     @property
     def hint(self) -> str:
@@ -686,10 +712,18 @@ class GhUnavailable:
             return "gh is not logged in on this PC: gh auth login"
         if self.reason == "unverified":
             who = f" ({self.login})" if self.login else ""
+            said = f" -- gh said: {self.detail}" if self.detail else ""
             return (
                 f"this PC's gh could not verify its github.com login{who}: "
-                "check this PC's network, then retry"
+                f"check this PC's network, then retry{said}"
             )
+        if self.reason == "rejected":
+            if self.token_source in GH_ENV_TOKEN_SOURCES:
+                return (
+                    "github.com rejected this PC's gh token: the "
+                    f"${self.token_source} in this PC's environment is invalid"
+                )
+            return "github.com rejected this PC's gh login: gh auth login -h github.com"
         if self.reason == "timeout":
             return f"this PC's gh did not answer within {GH_TIMEOUT_S:g}s: retry"
         return "this PC's gh failed" + (f": {self.detail}" if self.detail else "")
@@ -726,7 +760,7 @@ def _gh_call(
             return GhUnavailable("missing")
         if e.stderr_tail.startswith("timed out after "):  # _spawn's own words
             return GhUnavailable("timeout")
-        return GhUnavailable("failed", detail=e.stderr_tail[:200])
+        return GhUnavailable("failed", detail=_gh_detail(e.stderr_tail))
 
 
 def _gh(
@@ -741,7 +775,7 @@ def _gh(
 def _gh_refusal(result: subprocess.CompletedProcess[bytes]) -> GhUnavailable:
     """A gh call that exited non-zero, named from its stderr."""
     err = result.stderr.decode("utf-8", "replace").strip().splitlines()
-    detail = err[-1].strip()[:200] if err else f"exited {result.returncode}"
+    detail = _gh_detail(err[-1]) if err else f"exited {result.returncode}"
     said = "\n".join(err).lower()
     if "unknown flag" in said:
         return GhUnavailable("too-old", detail=detail)
@@ -782,17 +816,31 @@ def local_gh_account() -> GhAccount | GhUnavailable:
             continue
         raw_login = entry.get("login")
         login = raw_login if isinstance(raw_login, str) and raw_login else None
-        if entry.get("state") != "success":
-            return GhUnavailable("unverified", login=login)
+        raw_source = entry.get("tokenSource")
+        source = raw_source if isinstance(raw_source, str) else ""
+        state = entry.get("state")
+        if state != "success":
+            raw_error = entry.get("error")
+            detail = _gh_detail(raw_error if isinstance(raw_error, str) else "")
+            # gh says "timeout" only for a net timeout; "error" covers every
+            # other failure, a refused token among them.
+            refused = state == "error" and (
+                "HTTP 401" in detail or "bad credentials" in detail.lower()
+            )
+            return GhUnavailable(
+                "rejected" if refused else "unverified",
+                login=login,
+                detail=detail,
+                token_source=source,
+            )
         if login is None:
             return GhUnavailable("failed", detail="gh auth status named no login")
         raw_scopes = entry.get("scopes")
         scopes = raw_scopes if isinstance(raw_scopes, str) else ""
-        source = entry.get("tokenSource")
         return GhAccount(
             login=login,
             scopes=frozenset(s.strip() for s in scopes.split(",") if s.strip()),
-            token_source=source if isinstance(source, str) else "",
+            token_source=source,
         )
     return GhUnavailable("not-logged-in")
 

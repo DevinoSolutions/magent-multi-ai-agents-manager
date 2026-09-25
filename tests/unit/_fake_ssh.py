@@ -201,29 +201,32 @@ def gh_auth_status(
     login: str | None,
     scopes: str = "",
     *,
-    accounts: Sequence[tuple[str, bool, str]] = (),
+    accounts: Sequence[tuple[str, bool, str] | tuple[str, bool, str, str]] = (),
     token_source: str = "keyring",
 ) -> str:
     """The stdout of ``gh auth status --json hosts`` (gh 2.88) -- the reply a
     fake ``gh`` gives.
 
-    ``accounts`` are ``(login, active, state)`` entries, listed FIRST and in
-    order; ``login``, when not None, is then appended as the active,
-    verified (``state: success``) account -- so the common case stays
+    ``accounts`` are ``(login, active, state[, error])`` entries, listed
+    FIRST and in order; ``login``, when not None, is then appended as the
+    active, verified (``state: success``) account -- so the common case stays
     ``gh_auth_status("amin", "repo")`` and a test can still put the active
     one anywhere but first. ``state`` is gh's own vocabulary: ``success``,
-    ``error``, ``timeout``. No entries at all is gh's not-logged-in shape
-    under ``--json``: ``{"hosts": {}}``, exit 0."""
+    ``error``, ``timeout``; ``error`` is gh's own words for a failed check
+    (``HTTP 401: Bad credentials ...``, a DNS failure), empty by default. No
+    entries at all is gh's not-logged-in shape under ``--json``:
+    ``{"hosts": {}}``, exit 0."""
     rows = [*accounts, *([(login, True, "success")] if login is not None else [])]
     entries = [
         {
-            "active": active,
+            "active": row[1],
+            "error": row[3] if len(row) == 4 else "",
             "host": "github.com",
-            "login": name,
+            "login": row[0],
             "scopes": scopes,
-            "state": state,
+            "state": row[2],
             "tokenSource": token_source,
         }
-        for name, active, state in rows
+        for row in rows
     ]
     return json.dumps({"hosts": {"github.com": entries} if entries else {}})

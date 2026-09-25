@@ -1660,18 +1660,131 @@ class TestThisPcsGh:
         assert isinstance(account, remote_mux.GhAccount)
         assert account.token_source == "GH_TOKEN"
 
-    @pytest.mark.parametrize("state", ["error", "timeout"])
-    def test_an_active_login_gh_could_not_check_is_unverified(self, fake_gh, state):
+    @pytest.mark.parametrize(
+        ("state", "error"),
+        [
+            ("timeout", "timeout trying to log in to github.com account b"),
+            ("error", "dial tcp: lookup api.github.com: no such host"),
+        ],
+    )
+    def test_an_active_login_gh_could_not_reach_github_is_unverified(
+        self, fake_gh, state, error
+    ):
         fake_gh.set_reply(
             "auth status",
             stdout=gh_auth_status(
-                None, accounts=[("a", False, "success"), ("b", True, state)]
+                None, accounts=[("a", False, "success"), ("b", True, state, error)]
             ),
         )
         account = remote_mux.local_gh_account()
-        assert account == GhUnavailable("unverified", login="b")
+        assert isinstance(account, GhUnavailable)
+        assert (account.reason, account.login, account.detail) == (
+            "unverified",
+            "b",
+            error,
+        )
         assert "network" in account.hint
+        assert account.hint.endswith(error)  # gh's own words
         assert "gh auth login" not in account.hint
+
+    def test_a_token_github_refused_is_rejected_not_offline(self, fake_gh):
+        # gh's state "error" also covers HTTP 401: a revoked or invalid token
+        # is not a network problem, and a rejected token never ships.
+        error = "HTTP 401: Bad credentials (https://api.github.com/)"
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(None, accounts=[("b", True, "error", error)]),
+        )
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, GhUnavailable)
+        assert (account.reason, account.login, account.detail) == (
+            "rejected",
+            "b",
+            error,
+        )
+        assert account.hint.endswith("gh auth login -h github.com")
+        assert "network" not in account.hint
+
+    @pytest.mark.parametrize(
+        "var",
+        ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"],
+    )
+    def test_a_rejected_token_from_the_environment_names_the_variable(
+        self, fake_gh, var
+    ):
+        # A re-login cannot replace a token the environment supplies.
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(
+                None,
+                accounts=[("b", True, "error", "HTTP 401: Bad credentials")],
+                token_source=var,
+            ),
+        )
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, GhUnavailable)
+        assert account.reason == "rejected"
+        assert f"the ${var} in this PC's environment is invalid" in account.hint
+        assert "gh auth login" not in account.hint
+
+    def test_gh_s_error_text_is_capped_and_token_shapes_are_scrubbed(self, fake_gh):
+        error = (
+            "HTTP 500: echo gho_SECRETSECRETSECRET123 github_pat_ABC_def9 " + "x" * 300
+        )
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(None, accounts=[("b", True, "error", error)]),
+        )
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, GhUnavailable)
+        assert "gho_SECRET" not in account.detail
+        assert "github_pat_" not in account.detail
+        assert account.detail.startswith("HTTP 500: echo <redacted> <redacted> x")
+        assert len(account.detail) == 200
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {"active": True, "state": "success", "login": ""},
+            {"active": True, "state": "success"},
+        ],
+    )
+    def test_an_active_verified_entry_with_no_login_is_a_failure(self, fake_gh, entry):
+        fake_gh.set_reply(
+            "auth status", stdout=json.dumps({"hosts": {"github.com": [entry]}})
+        )
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, GhUnavailable)
+        assert account.reason == "failed"
+
+    def test_a_gh_path_that_no_longer_exists_is_missing(self, tmp_path, monkeypatch):
+        gone = str(tmp_path / "nowhere" / "gh")
+        monkeypatch.setattr(remote_mux, "find_gh", lambda: gone)
+        assert remote_mux.local_gh_account() == GhUnavailable("missing")
+
+    def test_a_spawn_failure_s_words_are_scrubbed(self, fake_gh, monkeypatch):
+        def refuse(*_args, **_kwargs):
+            raise RemoteError(None, f"access denied near {TOKEN}", ("gh",))
+
+        monkeypatch.setattr(remote_mux, "_spawn", refuse)
+        token = remote_mux.local_gh_token()
+        assert token == GhUnavailable("failed", detail="access denied near <redacted>")
+
+    def test_a_refusal_s_words_are_scrubbed(self, fake_gh):
+        fake_gh.set_reply("auth token", stderr=f"bad token {TOKEN}\n", rc=1)
+        token = remote_mux.local_gh_token()
+        assert token == GhUnavailable("failed", detail="bad token <redacted>")
+
+    def test_the_did_gh_run_wrapper_hands_back_the_result_or_none(self, fake_gh):
+        fake_gh.set_reply("api user", stdout="amin\n", rc=3)
+        result = remote_mux._gh(["api", "user"])
+        assert result is not None
+        assert (result.returncode, result.stdout) == (3, b"amin\n")
+        (call,) = fake_gh.calls()
+        assert call.argv == ["api", "user"]
+
+    def test_the_did_gh_run_wrapper_is_none_without_gh(self):
+        assert remote_mux._gh(["api", "user"]) is None
 
     def test_offline_the_token_is_still_read(self, fake_gh):
         # gh auth token reads the stored token without the network: an
@@ -1681,7 +1794,9 @@ class TestThisPcsGh:
             stdout=gh_auth_status(None, accounts=[("b", True, "timeout")]),
         )
         fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
-        assert remote_mux.local_gh_account() == GhUnavailable("unverified", login="b")
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, GhUnavailable)
+        assert (account.reason, account.login) == ("unverified", "b")
         assert remote_mux.local_gh_token() == TOKEN
 
     def test_no_github_login_is_not_logged_in(self, fake_gh):
@@ -1779,10 +1894,25 @@ class TestThisPcsGh:
             "failed", detail="gh auth token printed something that is not a token"
         )
 
-    def test_the_token_never_reaches_the_log(self, fake_gh, caplog):
-        fake_gh.set_reply("auth token", stdout=TOKEN + "\n", rc=1)
-        remote_mux.local_gh_token()
+    @pytest.mark.parametrize(
+        ("stdout", "stderr", "rc"),
+        [
+            (TOKEN + "\n", "", 0),  # the good read
+            ("﻿" + TOKEN + "\n", "", 0),  # not a token
+            (TOKEN + "\n", f"boom {TOKEN}\n", 1),  # a failed read
+        ],
+    )
+    def test_the_token_never_reaches_the_log(self, fake_gh, caplog, stdout, stderr, rc):
+        # get_logger sets each logger's level on first use: fetch it first,
+        # then open it to DEBUG so nothing is filtered before caplog sees it.
+        remote_mux.get_logger("nodes")
+        caplog.set_level("DEBUG", logger="magent")
+        caplog.set_level("DEBUG", logger="magent.nodes")
+        fake_gh.set_reply("auth token", stdout=stdout, stderr=stderr, rc=rc)
+        result = remote_mux.local_gh_token()
         assert TOKEN not in caplog.text
+        if rc != 0:
+            assert TOKEN not in repr(result)
 
 
 HOOK_TEXT = "#!/usr/bin/env bash\necho hook\n"
