@@ -9,7 +9,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import MISSING
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -680,6 +680,12 @@ class TestPushSet:
         assert list(shipped) == sorted(set(shipped), key=str)
 
 
+def _secret_under(entry: str) -> str:
+    """A file a ``_NEVER_PUSHED`` entry covers: the entry itself, or a file
+    inside it when it names a directory (a trailing '/')."""
+    return f"{entry}secret" if entry.endswith("/") else entry
+
+
 class TestPushExtras:
     def test_an_extra_file_ships(self, repo):
         (repo / "apps" / "web" / "gcp-sa.json").write_text("{}", encoding="utf-8")
@@ -728,6 +734,56 @@ class TestPushExtras:
         assert nodes.push_warnings(home, [".ssh/id_ed25519"], home=home) == (
             "push: .ssh/id_ed25519 is never pushed (credentials); skipped",
         )
+
+    def test_the_usual_credential_files_are_on_the_list(self):
+        assert set(nodes._NEVER_PUSHED) >= {
+            ".ssh/",
+            ".claude-swap-backup/",
+            ".claude/.credentials.json",
+            ".aws/credentials",
+            ".netrc",
+            ".gnupg/",
+            ".config/gh/hosts.yml",
+            ".docker/config.json",
+            ".kube/config",
+        }
+
+    @pytest.mark.parametrize("entry", nodes._NEVER_PUSHED)
+    def test_every_credential_store_is_refused(self, tmp_path, entry):
+        # Parametrized over the list itself: a future entry is covered here.
+        home = tmp_path / "home"
+        rel = _secret_under(entry)
+        (home / rel).parent.mkdir(parents=True, exist_ok=True)
+        (home / rel).write_text("SECRET", encoding="utf-8")
+        assert nodes.push_set(home, [], home=home, extras=[rel]) == ()
+        assert nodes.push_warnings(home, [rel], home=home) == (
+            f"push: {rel} is never pushed (credentials); skipped",
+        )
+
+    @pytest.mark.parametrize("entry", nodes._NEVER_PUSHED)
+    def test_a_case_variant_of_a_credential_store_is_refused(self, tmp_path, entry):
+        # Refused on EVERY OS: on a case-insensitive filesystem (APFS, NTFS)
+        # the variant IS the store; on a case-sensitive one refusing is cheap.
+        home = tmp_path / "home"
+        rel = _secret_under(entry).swapcase()
+        (home / rel).parent.mkdir(parents=True, exist_ok=True)
+        (home / rel).write_text("SECRET", encoding="utf-8")
+        assert nodes.push_set(home, [], home=home, extras=[rel]) == ()
+        assert nodes.push_warnings(home, [rel], home=home) == (
+            f"push: {rel} is never pushed (credentials); skipped",
+        )
+
+    def test_the_credential_match_ignores_case_even_for_posix_paths(self):
+        # WindowsPath already compares case-insensitively; PosixPath does not,
+        # and macOS's APFS is case-insensitive under a PosixPath.
+        forbidden = [
+            (PurePosixPath("/h/.ssh"), True),
+            (PurePosixPath("/h/.netrc"), False),
+        ]
+        assert nodes._is_forbidden(PurePosixPath("/h/.SSH/id_ed25519"), forbidden)
+        assert nodes._is_forbidden(PurePosixPath("/h/.NetRC"), forbidden)
+        assert not nodes._is_forbidden(PurePosixPath("/h/.sshx/id"), forbidden)
+        assert not nodes._is_forbidden(PurePosixPath("/h/.netrc.d/x"), forbidden)
 
     def test_an_extra_directory_is_a_warning(self, repo):
         assert nodes.push_warnings(repo, ["apps"], home=Path.home()) == (

@@ -18,7 +18,7 @@ import re
 import tempfile
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
 from magent.config import NODE_AUTO, NODE_CLOUD
@@ -137,8 +137,21 @@ class NodeMapEntry:
 # can never be pushed over the clone's copy.
 _PUSH_FIXED = (".claude/settings.local.json", "CLAUDE.local.md", ".mcp.json")
 # Never pushed, whatever `push` says (spec §8 "Not transferred, ever"): this
-# PC's keys, ccswap's account backups, the Claude login itself.
-_NEVER_PUSHED = (".ssh", ".claude-swap-backup", ".claude/.credentials.json")
+# PC's keys, ccswap's account backups, the Claude login itself, and the usual
+# credential files of other tools -- refusing one is cheap. Home-relative; a
+# trailing '/' names a directory (everything under it), anything else one
+# file. Matched case-insensitively on every OS (`_is_forbidden`).
+_NEVER_PUSHED = (
+    ".ssh/",
+    ".claude-swap-backup/",
+    ".claude/.credentials.json",
+    ".aws/credentials",
+    ".netrc",
+    ".gnupg/",
+    ".config/gh/hosts.yml",
+    ".docker/config.json",
+    ".kube/config",
+)
 
 
 def encoded_project_dir(path: str) -> str:
@@ -377,16 +390,36 @@ def _inside_a_repo(project_dir: Path, states: Sequence[LocalGitState]) -> bool:
         return True
 
 
-def _forbidden_roots(home: Path) -> list[Path]:
-    return [(home / p).resolve() for p in _NEVER_PUSHED]
+def _forbidden_roots(home: Path) -> list[tuple[PurePath, bool]]:
+    """Each ``_NEVER_PUSHED`` entry under ``home``, resolved (a store that is
+    itself a symlink is judged where it lands), paired with "is a directory"."""
+    return [
+        ((home / entry.rstrip("/")).resolve(), entry.endswith("/"))
+        for entry in _NEVER_PUSHED
+    ]
 
 
-def _is_forbidden(target: Path, forbidden: Sequence[Path]) -> bool:
-    """``target`` (already resolved) is, or lies under, a credential store."""
-    return any(target.is_relative_to(f) for f in forbidden)
+def _folded(path: PurePath) -> tuple[str, ...]:
+    return tuple(part.casefold() for part in path.parts)
 
 
-def _shippable_git_hit(path: Path, forbidden: Sequence[Path]) -> bool:
+def _is_forbidden(target: PurePath, forbidden: Sequence[tuple[PurePath, bool]]) -> bool:
+    """``target`` (already resolved) is a credential file, or lies under a
+    credential directory. Casefolded on EVERY OS: a PosixPath compares
+    case-sensitively, but APFS does not, so ``.SSH/id_ed25519`` IS the key
+    there. On a case-sensitive filesystem the refusal is merely cautious --
+    the fail-safe direction."""
+    parts = _folded(target)
+    for store, is_dir in forbidden:
+        store_parts = _folded(store)
+        if parts == store_parts or (
+            is_dir and parts[: len(store_parts)] == store_parts
+        ):
+            return True
+    return False
+
+
+def _shippable_git_hit(path: Path, forbidden: Sequence[tuple[PurePath, bool]]) -> bool:
     """A path git's listing reported is a snapshot claim: it ships only if it is
     a regular file now, and -- resolved, symlinks followed -- not a credential
     store's."""
