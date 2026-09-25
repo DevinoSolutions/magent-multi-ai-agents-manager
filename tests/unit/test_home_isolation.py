@@ -23,8 +23,10 @@ import pytest
 
 from magent import attach_client, env, lockfile, remote_mux
 
-# By value, at import -- before any fixture runs: conftest's _no_real_ssh
-# patches the MODULE attribute, so this name is still the real PATH resolver.
+# By value, at import -- before any fixture runs: conftest's _no_real_ssh and
+# _no_real_gh patch the MODULE attributes, so these names are still the real
+# PATH resolvers.
+from magent.remote_mux import find_gh as real_find_gh
 from magent.remote_mux import find_ssh as real_find_ssh
 from tests.conftest import (
     PLAYWRIGHT_BROWSERS_PATH,
@@ -267,3 +269,25 @@ class TestTheRepoBuilderLocatesItsRepoByPath:
         assert snapshot() == before
         assert (victim / "README.md").read_text(encoding="utf-8") == "victim\n"
         assert git(clone, "log", "-1", "--format=%s") == "init"
+
+
+class TestNoTestResolvesTheRealGh:
+    """The real ``gh`` holds the developer's GitHub token, and ``node setup``
+    registers an ssh key to their account with it; no HOME redirect contains
+    a binary on PATH."""
+
+    def test_gh_is_unresolvable_by_default(self, tmp_path, monkeypatch):
+        # Plant a gh the REAL resolver would find: on a box with no gh on
+        # PATH, "find_gh() is None" passes with the guard deleted.
+        if sys.platform == "win32":
+            (tmp_path / "gh.cmd").write_text("@echo off\r\n", encoding="utf-8")
+        else:
+            (tmp_path / "gh").write_text("#!/bin/sh\n", encoding="utf-8")
+            (tmp_path / "gh").chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        real_find_gh.cache_clear()
+        try:
+            assert real_find_gh() is not None  # the plant is findable: teeth
+            assert remote_mux.find_gh() is None
+        finally:
+            real_find_gh.cache_clear()

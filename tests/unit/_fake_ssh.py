@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
 _RECORDER = """\
@@ -196,22 +197,33 @@ def make_fake_ssh(tmp_path: Path, *, name: str = "ssh") -> FakeSsh:
     return FakeSsh(path=str(launcher), base=base)
 
 
-def gh_auth_status(login: str, scopes: str) -> str:
-    """The stdout of ``gh auth status --json hosts`` (gh 2.88) for one active,
-    logged-in github.com account -- the reply a fake ``gh`` gives."""
-    return json.dumps(
+def gh_auth_status(
+    login: str | None,
+    scopes: str = "",
+    *,
+    accounts: Sequence[tuple[str, bool, str]] = (),
+    token_source: str = "keyring",
+) -> str:
+    """The stdout of ``gh auth status --json hosts`` (gh 2.88) -- the reply a
+    fake ``gh`` gives.
+
+    ``accounts`` are ``(login, active, state)`` entries, listed FIRST and in
+    order; ``login``, when not None, is then appended as the active,
+    verified (``state: success``) account -- so the common case stays
+    ``gh_auth_status("amin", "repo")`` and a test can still put the active
+    one anywhere but first. ``state`` is gh's own vocabulary: ``success``,
+    ``error``, ``timeout``. No entries at all is gh's not-logged-in shape
+    under ``--json``: ``{"hosts": {}}``, exit 0."""
+    rows = [*accounts, *([(login, True, "success")] if login is not None else [])]
+    entries = [
         {
-            "hosts": {
-                "github.com": [
-                    {
-                        "active": True,
-                        "host": "github.com",
-                        "login": login,
-                        "scopes": scopes,
-                        "state": "success",
-                        "tokenSource": "keyring",
-                    }
-                ]
-            }
+            "active": active,
+            "host": "github.com",
+            "login": name,
+            "scopes": scopes,
+            "state": state,
+            "tokenSource": token_source,
         }
-    )
+        for name, active, state in rows
+    ]
+    return json.dumps({"hosts": {"github.com": entries} if entries else {}})

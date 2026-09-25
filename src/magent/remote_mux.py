@@ -42,7 +42,7 @@ import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from magent import node_scripts, nodes, psmux
 
@@ -630,6 +630,69 @@ def _report_of(
 
 
 GH_TIMEOUT_S = 20.0
+# `gh auth status --json` arrived in gh 2.81.0 (cli/cli#11544); `--active`
+# (2.57.0, cli/cli#9520) and `--hostname` are older. A gh without any of them
+# exits 1 with "unknown flag".
+GH_MIN_VERSION = "2.81.0"
+# The active github.com account only: --hostname keeps an unreachable GHES
+# host from spending the budget. Under --json gh ALWAYS exits 0 and blanks the
+# token field (cli/cli status.go), so a non-zero exit is gh itself failing.
+GH_STATUS_ARGV = (
+    "auth",
+    "status",
+    "--active",
+    "--hostname",
+    "github.com",
+    "--json",
+    "hosts",
+)
+GH_TOKEN_ARGV = ("auth", "token", "--hostname", "github.com")
+# GitHub's token alphabet. No prefix check -- GHES, legacy 40-hex and
+# GH_TOKEN-supplied tokens must pass -- but a BOM, a control character,
+# non-ASCII, a space or a stray one-word line never ships.
+_GH_TOKEN_RE = re.compile(r"[A-Za-z0-9_]{20,255}")
+_GH_NOT_A_TOKEN = "gh auth token printed something that is not a token"
+
+GhUnavailableReason = Literal[
+    "missing", "too-old", "not-logged-in", "unverified", "timeout", "failed"
+]
+
+
+@dataclass(frozen=True)
+class GhUnavailable:
+    """Why this PC's gh gave no account (or no token), named so a caller
+    prints the repair that fits (``hint``) instead of one generic
+    "gh auth login".
+
+    ``unverified`` is an active login gh could not check (offline, or
+    github.com unreachable); ``login`` names it. ``gh auth token`` reads the
+    stored token without the network, so that login's token is still readable
+    and may still ship. ``failed`` is anything else; ``detail`` is gh's last
+    stderr line -- never its stdout, which for a token read is the token."""
+
+    reason: GhUnavailableReason
+    login: str | None = None
+    detail: str = ""
+
+    @property
+    def hint(self) -> str:
+        if self.reason == "missing":
+            return "gh is not installed on this PC: https://cli.github.com"
+        if self.reason == "too-old":
+            return (
+                f"this PC's gh is too old (gh >= {GH_MIN_VERSION} required): upgrade gh"
+            )
+        if self.reason == "not-logged-in":
+            return "gh is not logged in on this PC: gh auth login"
+        if self.reason == "unverified":
+            who = f" ({self.login})" if self.login else ""
+            return (
+                f"this PC's gh could not verify its github.com login{who}: "
+                "check this PC's network, then retry"
+            )
+        if self.reason == "timeout":
+            return f"this PC's gh did not answer within {GH_TIMEOUT_S:g}s: retry"
+        return "this PC's gh failed" + (f": {self.detail}" if self.detail else "")
 
 
 @functools.lru_cache(maxsize=1)
@@ -639,14 +702,16 @@ def find_gh() -> str | None:
     return shutil.which("gh")
 
 
-def _gh(
-    args: list[str], *, input_bytes: bytes | None = None
-) -> subprocess.CompletedProcess[bytes] | None:
-    """One bounded local ``gh`` call; None when gh is missing or could not
-    run. Only argv is ever logged -- a token read's stdout never is."""
+def _gh_call(
+    args: Sequence[str], *, input_bytes: bytes | None = None
+) -> subprocess.CompletedProcess[bytes] | GhUnavailable:
+    """One bounded local ``gh`` call, or why it never finished: ``missing``
+    (no gh, or it vanished before the spawn), ``timeout``, or ``failed`` (any
+    other spawn error). Only argv is ever logged -- a token read's stdout
+    never is."""
     exe = find_gh()
     if exe is None:
-        return None
+        return GhUnavailable("missing")
     try:
         return _spawn(
             [exe, *args],
@@ -656,55 +721,95 @@ def _gh(
             shown=_redacted(["gh", *args], input_bytes),
             label="local gh",
         )
-    except RemoteError:
-        return None
+    except RemoteError as e:
+        if e.rc == SSH_MISSING_RC:
+            return GhUnavailable("missing")
+        if e.stderr_tail.startswith("timed out after "):  # _spawn's own words
+            return GhUnavailable("timeout")
+        return GhUnavailable("failed", detail=e.stderr_tail[:200])
+
+
+def _gh(
+    args: list[str], *, input_bytes: bytes | None = None
+) -> subprocess.CompletedProcess[bytes] | None:
+    """``_gh_call`` for a caller that only asks "did gh run": None for every
+    ``GhUnavailable``. Its exit code is the caller's to judge."""
+    result = _gh_call(args, input_bytes=input_bytes)
+    return None if isinstance(result, GhUnavailable) else result
+
+
+def _gh_refusal(result: subprocess.CompletedProcess[bytes]) -> GhUnavailable:
+    """A gh call that exited non-zero, named from its stderr."""
+    err = result.stderr.decode("utf-8", "replace").strip().splitlines()
+    detail = err[-1].strip()[:200] if err else f"exited {result.returncode}"
+    said = "\n".join(err).lower()
+    if "unknown flag" in said:
+        return GhUnavailable("too-old", detail=detail)
+    # "not logged into any GitHub hosts" / "no oauth token found for ..."
+    if "not logged in" in said or "no oauth token" in said:
+        return GhUnavailable("not-logged-in", detail=detail)
+    return GhUnavailable("failed", detail=detail)
 
 
 @dataclass(frozen=True)
 class GhAccount:
+    """The active, verified github.com login of this PC's gh.
+    ``token_source`` is gh's own ``tokenSource`` (``keyring``,
+    ``oauth_token``, ``GH_TOKEN``, ...): a token from the environment is not
+    one ``gh auth refresh`` can change."""
+
     login: str
     scopes: frozenset[str]
+    token_source: str
 
 
-def local_gh_account() -> GhAccount | None:
-    """The active, logged-in github.com account of this PC's gh, or None."""
-    result = _gh(["auth", "status", "--json", "hosts"])
-    if result is None or result.returncode != 0:
-        return None
+def local_gh_account() -> GhAccount | GhUnavailable:
+    """The active github.com account of this PC's gh, or why there is none
+    (``GhUnavailable``). Only an absent login is ``not-logged-in``."""
+    result = _gh_call(GH_STATUS_ARGV)
+    if isinstance(result, GhUnavailable):
+        return result
+    if result.returncode != 0:
+        return _gh_refusal(result)
     try:
         data = json.loads(result.stdout)
     except ValueError:
-        return None
+        return GhUnavailable("failed", detail="gh auth status printed no JSON")
     hosts = data.get("hosts") if isinstance(data, dict) else None
     entries = hosts.get("github.com") if isinstance(hosts, dict) else None
     for entry in entries if isinstance(entries, list) else []:
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or entry.get("active") is not True:
             continue
-        login = entry.get("login")
-        if (
-            entry.get("active") is True
-            and entry.get("state") == "success"
-            and isinstance(login, str)
-            and login
-        ):
-            raw = entry.get("scopes")
-            scopes = raw if isinstance(raw, str) else ""
-            return GhAccount(
-                login=login,
-                scopes=frozenset(s.strip() for s in scopes.split(",") if s.strip()),
-            )
-    return None
+        raw_login = entry.get("login")
+        login = raw_login if isinstance(raw_login, str) and raw_login else None
+        if entry.get("state") != "success":
+            return GhUnavailable("unverified", login=login)
+        if login is None:
+            return GhUnavailable("failed", detail="gh auth status named no login")
+        raw_scopes = entry.get("scopes")
+        scopes = raw_scopes if isinstance(raw_scopes, str) else ""
+        source = entry.get("tokenSource")
+        return GhAccount(
+            login=login,
+            scopes=frozenset(s.strip() for s in scopes.split(",") if s.strip()),
+            token_source=source if isinstance(source, str) else "",
+        )
+    return GhUnavailable("not-logged-in")
 
 
-def local_gh_token() -> str | None:
-    """This PC's github.com token, or None. It leaves this process only on a
-    node call's stdin (``build_payload``) -- never argv, never a log."""
-    result = _gh(["auth", "token", "--hostname", "github.com"])
-    if result is None or result.returncode != 0:
-        return None
-    token = result.stdout.decode("utf-8", "replace").strip()
-    if not token or any(ch.isspace() for ch in token):
-        return None
+def local_gh_token() -> str | GhUnavailable:
+    """This PC's github.com token, or why there is none. It leaves this
+    process only on a node call's stdin (``build_payload``) -- never argv,
+    never a log, never a ``GhUnavailable``. A non-zero exit ships nothing,
+    whatever stdout held; so does anything but one token on one line."""
+    result = _gh_call(GH_TOKEN_ARGV)
+    if isinstance(result, GhUnavailable):
+        return result
+    if result.returncode != 0:
+        return _gh_refusal(result)
+    token = result.stdout.decode("utf-8", "replace").rstrip("\r\n")
+    if _GH_TOKEN_RE.fullmatch(token) is None:
+        return GhUnavailable("failed", detail=_GH_NOT_A_TOKEN)
     return token
 
 
@@ -851,11 +956,15 @@ def provision(
     # a plain program name is never offered to the probe, and only this drops it.
     user_scope = without_missing_programs(user_scope, found=found, unprobed=unprobed)
     account = local_gh_account()
-    token = local_gh_token() if account is not None else None
-    login = account.login if account is not None and token else None
+    login: str | None = None
+    token: str | None = None
+    if isinstance(account, GhAccount):
+        read = local_gh_token()
+        if isinstance(read, str):
+            login, token = account.login, read
     payload = build_payload(
         user_scope,
-        gh_token=token if login else None,
+        gh_token=token,
         gh_login=login,
         state_hook=node_scripts.script("state_hook"),
     )
@@ -931,10 +1040,15 @@ def register_ssh_key(pubkey: str, *, title: str) -> ScriptLine:
     key), once: a key already on the account is a skip. One ``github-key``
     row; never raises. The key is public, but it rides stdin anyway."""
     account = local_gh_account()
-    if account is None:
-        return ScriptLine(
-            "fail", "github-key", "gh is not logged in on this PC: gh auth login"
+    if isinstance(account, GhUnavailable):
+        # No gh at all keeps the one wording `node setup` has always printed
+        # (and pins); every other reason names its own repair.
+        detail = (
+            "gh is not logged in on this PC: gh auth login"
+            if account.reason == "missing"
+            else account.hint
         )
+        return ScriptLine("fail", "github-key", detail)
     if not account.scopes:
         # gh prints no scopes for a token it did not mint (GH_TOKEN, a
         # fine-grained PAT); `gh auth refresh` cannot widen those.
