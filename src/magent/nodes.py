@@ -17,10 +17,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from magent.config import NODE_AUTO, NODE_CLOUD
 from magent.sessions.claude import encode_claude_project_path
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+    from magent.config import MagentConfig, ProjectConfig
 
 # Everything node-shaped on this PC: the placement map, per-node snapshots and
 # load history, pulled transcripts. Import-bound, so it is registered in
@@ -190,3 +193,51 @@ def write_node_map(entries: Mapping[str, NodeMapEntry]) -> None:
         with contextlib.suppress(OSError):
             tmp.unlink()
         raise
+
+
+def resolve(
+    config: MagentConfig,
+    proj: ProjectConfig,
+    *,
+    local_user: str,
+    placed: str | None = None,
+) -> Node:
+    """The node ``proj`` runs on, fully resolved. Raises NodeConfigError.
+
+    ``placed`` is the nick placement chose for a ``"node": "auto"`` project; a
+    pinned project ignores it. ``local_user`` is ``env.local_username()``,
+    passed in so this stays pure. D4: a node with no ``user`` runs as the local
+    user, lowercased (Unix login names are), and that fallback may never be
+    root -- running sessions as root has to be written down.
+    """
+    if proj.node is None:
+        raise NodeConfigError(f"{proj.path}: not a node project")
+    if proj.node == NODE_CLOUD:
+        raise NodeConfigError(
+            f'{proj.path}: "node": "cloud" runs on the cloud backend, not a pool '
+            "machine; it has no Node to resolve"
+        )
+    nick = placed if proj.node == NODE_AUTO else proj.node
+    if nick is None:
+        raise NodeConfigError(
+            f'{proj.path}: "node": "auto" needs a placement before it can resolve'
+        )
+    pool = config.settings.nodes
+    entry = pool.get(nick)
+    if entry is None:
+        known = ", ".join(sorted(pool)) or "none"
+        raise NodeConfigError(
+            f"{proj.path}: node {nick!r} is not in settings.nodes (known: {known})"
+        )
+    user = entry.user if entry.user is not None else local_user.lower()
+    if not user:
+        raise NodeConfigError(
+            f"settings.nodes.{nick}.user is not set and the local username is "
+            "unknown; set it explicitly"
+        )
+    if entry.user is None and user == "root":
+        raise NodeConfigError(
+            f"settings.nodes.{nick}: magent is running as root and would run "
+            'sessions as root on the node; write "user": "root" to mean it (D4)'
+        )
+    return Node(nick=nick, host=entry.host, user=user, root=entry.root)

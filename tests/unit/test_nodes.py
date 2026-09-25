@@ -11,10 +11,12 @@ from pathlib import Path
 import pytest
 
 from magent import nodes
+from magent.config import MagentConfig, NodeConfig, ProjectConfig, Settings
 from magent.nodes import (
     LoadSample,
     LocalGitState,
     Node,
+    NodeConfigError,
     NodeMapEntry,
     Recipe,
     RepoSpec,
@@ -235,3 +237,96 @@ class TestTheNodeMap:
         # suppression comment is needed (DECISION-26 iv).
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(ENTRY, field, "x")
+
+
+POOL = MagentConfig(
+    projects=[],
+    settings=Settings(
+        nodes={
+            "second": NodeConfig(nick="second", host="devino-second", user="amin"),
+            "third": NodeConfig(nick="third", host="devino-third"),
+        }
+    ),
+)
+
+
+class TestResolve:
+    def test_a_pinned_project_resolves_to_its_node(self):
+        node = nodes.resolve(
+            POOL, ProjectConfig(path="api", node="second"), local_user="whoever"
+        )
+        assert node == Node(
+            nick="second", host="devino-second", user="amin", root="~/magent"
+        )
+
+    def test_no_configured_user_means_the_local_one_lowercased(self):
+        node = nodes.resolve(
+            POOL, ProjectConfig(path="api", node="third"), local_user="Amin"
+        )
+        assert node.user == "amin"
+
+    def test_auto_resolves_to_the_placed_node(self):
+        node = nodes.resolve(
+            POOL,
+            ProjectConfig(path="api", node="auto"),
+            local_user="amin",
+            placed="third",
+        )
+        assert node.nick == "third"
+
+    def test_a_pinned_project_ignores_a_placement(self):
+        node = nodes.resolve(
+            POOL,
+            ProjectConfig(path="api", node="second"),
+            local_user="amin",
+            placed="third",
+        )
+        assert node.nick == "second"
+
+    def test_auto_without_a_placement_is_refused(self):
+        with pytest.raises(NodeConfigError, match="placement"):
+            nodes.resolve(
+                POOL, ProjectConfig(path="api", node="auto"), local_user="amin"
+            )
+
+    def test_a_cloud_project_is_refused_clearly_not_a_key_error(self):
+        # The cloud backend (DECISION-8, Task J) resolves its own projects; a
+        # caller that hands one to the node resolver gets a named refusal.
+        with pytest.raises(NodeConfigError, match="cloud backend"):
+            nodes.resolve(
+                POOL, ProjectConfig(path="api", node="cloud"), local_user="amin"
+            )
+
+    def test_a_project_without_a_node_is_refused(self):
+        with pytest.raises(NodeConfigError, match="not a node project"):
+            nodes.resolve(POOL, ProjectConfig(path="api"), local_user="amin")
+
+    def test_a_nick_missing_from_the_pool_is_refused_naming_it(self):
+        with pytest.raises(NodeConfigError, match=r"'fourth'.*second, third"):
+            nodes.resolve(
+                POOL, ProjectConfig(path="api", node="fourth"), local_user="amin"
+            )
+
+    def test_an_implicit_root_user_is_refused(self):
+        with pytest.raises(NodeConfigError, match="D4"):
+            nodes.resolve(
+                POOL, ProjectConfig(path="api", node="third"), local_user="root"
+            )
+
+    def test_an_explicit_root_user_is_honoured(self):
+        pool = MagentConfig(
+            projects=[],
+            settings=Settings(
+                nodes={
+                    "fifth": NodeConfig(nick="fifth", host="devino-fifth", user="root")
+                }
+            ),
+        )
+        node = nodes.resolve(
+            pool, ProjectConfig(path="api", node="fifth"), local_user="amin"
+        )
+        assert node.user == "root"
+
+    def test_no_user_anywhere_is_refused(self):
+        with pytest.raises(NodeConfigError, match=r"settings\.nodes\.third\.user"):
+            nodes.resolve(POOL, ProjectConfig(path="api", node="third"), local_user="")
