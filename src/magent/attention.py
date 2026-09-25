@@ -51,6 +51,9 @@ _URGENCY: dict[str, int] = {
 
 DEBOUNCE_S = 300.0
 
+# The node-store failure source for the listing itself (a root's is its path).
+_LISTING = "<listing>"
+
 
 @dataclass
 class SessionView:
@@ -105,7 +108,9 @@ class AttentionEngine:
         self._last_node_records: list[
             tuple[str, str, str, list[dict[str, object]]]
         ] = []
-        self._node_store_failing = False
+        # Every node-store failure source in a streak: a root's path, or
+        # _LISTING for the listing itself.
+        self._failing_sources: set[str] = set()
 
     def poll(self) -> list[SessionView]:
         """Read the store -- and every ``extra_stores`` store: node sessions'
@@ -136,12 +141,17 @@ class AttentionEngine:
         that raises (no roots to go on) holds every root's last good records.
         They are records, not views, so ``poll`` re-views them at the current
         clock and a held needs-input decays to idle exactly like a fresh one.
-        A root the listing no longer names is dropped."""
-        failures: list[str] = []
+        A root the listing no longer names is dropped. Each root is read
+        STRICT: the tolerant read would call an unreadable mirror an empty
+        store, and that node's rows would vanish for the tick instead."""
+        failures: dict[str, str] = {}
         try:
             roots = list(list_roots())
         except (OSError, ValueError) as exc:
-            failures.append(f"listing node stores: {exc}")
+            failures[_LISTING] = f"listing node stores: {exc}"
+            # No roots were read, so a root already failing stays failing.
+            for source in self._failing_sources - {_LISTING}:
+                failures[source] = ""
             held = self._last_node_records
         else:
             previous = {
@@ -151,29 +161,28 @@ class AttentionEngine:
             for label, key, root_path in roots:
                 root = str(root_path)
                 try:
-                    records = agent_state.read_store(root_path)
+                    records = agent_state.read_store(root_path, strict=True)
                 except (OSError, ValueError) as exc:
-                    failures.append(f"{root}: {exc}")
+                    failures[root] = f"{root}: {exc}"
                     records = previous.get(root, [])
                 held.append((label, key, root, records))
         self._last_node_records = held
         self._note_node_store_health(failures)
         return held
 
-    def _note_node_store_health(self, failures: list[str]) -> None:
-        """One WARNING when a failure streak opens -- naming every root that
-        failed on that tick -- and one INFO when a tick reads clean again.
-        The streak is fleet-wide ("any root failed"), not per root, so a
-        store stuck down doesn't spam the log every tick."""
-        if failures:
-            if not self._node_store_failing:
-                get_logger("attention").warning(
-                    "node stores unavailable this tick (%s)", "; ".join(failures)
-                )
-                self._node_store_failing = True
-        elif self._node_store_failing:
+    def _note_node_store_health(self, failures: dict[str, str]) -> None:
+        """One WARNING per failure SOURCE (a root, or the listing) when it
+        starts failing -- naming only the newly failing ones -- and one INFO
+        when no source fails any more. A store stuck down doesn't spam the
+        log every tick, and a second root going down later is still named."""
+        new = [failures[s] for s in failures if s not in self._failing_sources]
+        if new:
+            get_logger("attention").warning(
+                "node stores unavailable this tick (%s)", "; ".join(new)
+            )
+        elif self._failing_sources and not failures:
             get_logger("attention").info("node stores readable again")
-            self._node_store_failing = False
+        self._failing_sources = set(failures)
 
     def _view(
         self,

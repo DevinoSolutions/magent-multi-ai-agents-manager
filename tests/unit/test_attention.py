@@ -1105,7 +1105,7 @@ class TestNodeStores:
         root = tmp_path / "second-api"
         root.mkdir(parents=True)
 
-        def _read_store(r: object) -> list[dict[str, object]]:
+        def _read_store(r: object, *, strict: bool = False) -> list[dict[str, object]]:
             if r == root:
                 raise ValueError("bad record")
             return []
@@ -1169,10 +1169,12 @@ class TestNodeStores:
         real_read_store = agent_state.read_store
         broken = {"on": False}
 
-        def _read_store(root: object) -> list[dict[str, object]]:
+        def _read_store(
+            root: object, *, strict: bool = False
+        ) -> list[dict[str, object]]:
             if broken["on"] and root == bad:
                 raise OSError("third unreachable")
-            return real_read_store(root)
+            return real_read_store(root, strict=strict)
 
         monkeypatch.setattr(agent_state, "read_store", _read_store)
         # The failing root is listed FIRST, so a whole-loop abort would also
@@ -1215,6 +1217,172 @@ class TestNodeStores:
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         infos = [r for r in caplog.records if r.levelno == logging.INFO]
         assert (len(warnings), len(infos)) == (2, 1)
+
+    def test_a_node_root_that_became_a_file_holds_its_last_records_and_warns_once(
+        self, state_dir, tmp_path, caplog
+    ):
+        # Real filesystem, no fakes: the root that read fine on tick 1 is a
+        # FILE on ticks 2 and 3. The tolerant read would call that an empty
+        # store and the node's rows would vanish for the tick.
+        import logging
+        import shutil
+
+        store = tmp_path / "second-api"
+        self._write(
+            store,
+            "k.json",
+            state="needs-input",
+            ts=990.0,
+            cwd="/home/amin/magent/api",
+            session_id="s",
+        )
+        engine = AttentionEngine(
+            now=lambda: 1000.0, extra_stores=lambda: [("api", "@second", store)]
+        )
+        engine.poll()
+
+        shutil.rmtree(store)
+        store.write_text("not a directory", encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger="magent.attention"):
+            tick2 = engine.poll()
+            tick3 = engine.poll()
+
+        held = [("api", "@second:/home/amin/magent/api", agent_state.NEEDS_INPUT)]
+        assert [(v.name, v.cwd, v.state) for v in tick2] == held
+        assert [(v.name, v.cwd, v.state) for v in tick3] == held
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert str(store) in warnings[0].getMessage()
+
+    def test_a_node_root_that_disappears_reads_empty_without_a_hold_or_warning(
+        self, state_dir, tmp_path, caplog
+    ):
+        import logging
+        import shutil
+
+        store = tmp_path / "second-api"
+        self._write(
+            store, "k.json", state="working", ts=990.0, cwd="/w/api", session_id="s"
+        )
+        engine = AttentionEngine(
+            now=lambda: 1000.0, extra_stores=lambda: [("api", "@second", store)]
+        )
+        assert len(engine.poll()) == 1
+
+        shutil.rmtree(store)
+        with caplog.at_level(logging.WARNING, logger="magent.attention"):
+            assert engine.poll() == []
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    def test_a_torn_file_beside_a_good_one_reads_the_good_one_fresh(
+        self, state_dir, tmp_path, caplog
+    ):
+        import logging
+
+        store = tmp_path / "second-api"
+        self._write(
+            store, "a.json", state="working", ts=990.0, cwd="/w/api", session_id="s"
+        )
+        engine = AttentionEngine(
+            now=lambda: 1000.0, extra_stores=lambda: [("api", "@second", store)]
+        )
+        engine.poll()
+
+        self._write(
+            store, "a.json", state="done", ts=995.0, cwd="/w/api", session_id="s"
+        )
+        (store / "b.json").write_text("{torn", encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger="magent.attention"):
+            views = engine.poll()
+
+        assert [(v.cwd, v.state) for v in views] == [
+            ("@second:/w/api", agent_state.DONE)
+        ]
+        # The torn FILE is named by the store's own once-per-file warning; the
+        # engine itself reports no unavailable store.
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any("unavailable" in m for m in messages)
+
+    def test_a_second_root_failing_later_warns_again_naming_only_itself(
+        self, state_dir, tmp_path, caplog, monkeypatch
+    ):
+        import logging
+
+        a, b = tmp_path / "second-api", tmp_path / "third-web"
+        a.mkdir()
+        b.mkdir()
+        failing: set[object] = set()
+
+        def _read_store(
+            root: object, *, strict: bool = False
+        ) -> list[dict[str, object]]:
+            if root in failing:
+                raise OSError(f"{root} unreachable")
+            return []
+
+        monkeypatch.setattr(agent_state, "read_store", _read_store)
+        engine = AttentionEngine(
+            now=lambda: 1000.0,
+            extra_stores=lambda: [("api", "@second", a), ("web", "@third", b)],
+        )
+        with caplog.at_level(logging.INFO, logger="magent.attention"):
+            engine.poll()
+            failing.add(a)
+            engine.poll()
+            failing.add(b)
+            engine.poll()
+            engine.poll()
+            failing.clear()
+            engine.poll()
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        infos = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert len(warnings) == 2
+        assert str(a) in warnings[0]
+        assert str(b) in warnings[1]
+        assert str(a) not in warnings[1]
+        assert len(infos) == 1
+
+    def test_a_root_still_failing_across_a_listing_outage_is_not_named_again(
+        self, state_dir, tmp_path, caplog, monkeypatch
+    ):
+        # A failing listing reads no root, so it cannot say a failing root
+        # recovered: that root's streak carries through, no second warning.
+        import logging
+
+        a = tmp_path / "second-api"
+        a.mkdir()
+
+        def _read_store(
+            root: object, *, strict: bool = False
+        ) -> list[dict[str, object]]:
+            if root == a:
+                raise OSError(f"{root} unreachable")
+            return []
+
+        listing_up = iter([True, False, True])
+
+        def _stores() -> list[tuple[str, str, object]]:
+            if not next(listing_up):
+                raise OSError("nodes unreachable")
+            return [("api", "@second", a)]
+
+        monkeypatch.setattr(agent_state, "read_store", _read_store)
+        engine = AttentionEngine(now=lambda: 1000.0, extra_stores=_stores)
+        with caplog.at_level(logging.INFO, logger="magent.attention"):
+            engine.poll()
+            engine.poll()
+            engine.poll()
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 2
+        assert str(a) in warnings[0]
+        assert "nodes unreachable" in warnings[1]
+        assert [r for r in caplog.records if r.levelno == logging.INFO] == []
 
     def test_healthy_ticks_after_a_recovery_log_nothing_more(
         self, state_dir, tmp_path, caplog
