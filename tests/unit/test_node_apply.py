@@ -1421,6 +1421,51 @@ def _mid_merge(
     monkeypatch.setattr(node_apply, "_load", load)
 
 
+def _sneak(monkeypatch: pytest.MonkeyPatch, path: Path, how: str) -> str:
+    """Right after node_apply's first read of ``path``, rewrite it so that
+    ONLY one part of its (ino, size, mtime) stamp differs from before the
+    read: ``how`` is "ino", "size" or "mtime". The rewrite refreshes A to the
+    returned token, the node's claude writing mid-merge."""
+    token = "SNEAK-" + how
+    padded = path.read_bytes() + b" " * 64
+    path.write_bytes(padded)
+    real = node_apply._load
+    done: list[bool] = []
+
+    def load(read: Path) -> object:
+        if read != path or done:
+            return real(read)
+        before = read.stat()
+        value = real(read)
+        done.append(True)
+        creds = json.loads(padded)
+        creds["mcpOAuth"][A]["accessToken"] = token
+        text = json.dumps(creds).encode("utf-8")
+        length = len(padded) + (10 if how == "size" else 0)
+        assert len(text) <= length
+        data = text + b" " * (length - len(text))
+        if how == "ino":
+            spare = read.with_name(read.name + ".sneak")
+            spare.write_bytes(data)
+            os.replace(spare, read)
+        else:
+            with read.open("r+b") as fh:
+                fh.write(data)
+                fh.truncate()
+        mtime = before.st_mtime_ns + (10**9 if how == "mtime" else 0)
+        os.utime(read, ns=(before.st_atime_ns, mtime))
+        after = read.stat()
+        assert (
+            after.st_ino != before.st_ino,
+            after.st_size != before.st_size,
+            after.st_mtime_ns != before.st_mtime_ns,
+        ) == (how == "ino", how == "size", how == "mtime")
+        return value
+
+    monkeypatch.setattr(node_apply, "_load", load)
+    return token
+
+
 def _refreshed(token: str) -> dict[str, object]:
     """The node's credentials after its claude refreshed A to ``token``."""
     return {
@@ -1497,6 +1542,17 @@ class TestAMergeNeverLosesAConcurrentWrite:
         assert _json(_credentials(box))["claudeAiOauth"] == {
             "accessToken": "NODE-LOGIN"
         }
+
+    @pytest.mark.parametrize("how", ["ino", "size", "mtime"])
+    def test_any_one_part_of_the_stamp_changing_is_seen(
+        self, box, tmp_path, monkeypatch, how
+    ):
+        # Each part of the stamp catches a write the other two miss.
+        box.apply(_work(tmp_path, _two()))
+        token = _sneak(monkeypatch, _credentials(box), how)
+        assert box.apply(_work(tmp_path, _two(b="PC-B2"), name="w2")) == 0
+        assert _node_token(box, A) == token
+        assert _node_token(box, B) == "PC-B2"
 
     def test_a_claude_json_rewritten_mid_merge_keeps_both_writes(
         self, box, tmp_path, monkeypatch
