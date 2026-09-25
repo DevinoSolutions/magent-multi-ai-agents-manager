@@ -2363,18 +2363,19 @@ class TestTodaysAttachShapesArePinned:
         )
 
     def test_the_supervised_pane_command_is_byte_identical(self):
-        from magent.cli import attach as attach_mod
+        from magent import attach_client
 
         assert (
-            attach_mod._pane_command("user@host", "api", _FAKE_SUPERVISOR)
+            attach_client.pane_command("user@host", "api", _FAKE_SUPERVISOR)
             == _SUPERVISED_WT_ARGV[_PANE:]
         )
 
     def test_the_bare_ssh_pane_command_is_byte_identical(self):
-        from magent.cli import attach as attach_mod
+        from magent import attach_client
 
         assert (
-            attach_mod._pane_command("user@host", "api", None) == _BARE_WT_ARGV[_PANE:]
+            attach_client.pane_command("user@host", "api", None)
+            == _BARE_WT_ARGV[_PANE:]
         )
 
     def test_the_supervised_wt_argv_is_byte_identical(self, monkeypatch):
@@ -2411,6 +2412,70 @@ class TestTmuxAttachMarkers:
 
         with pytest.raises(ValueError, match="screen"):
             attach_mod._attach_markers("api", "screen")
+
+
+class TestTmuxPaneCommand:
+    """What a node pane runs: the same supervisor (or bare ssh), pointed at
+    the tmux attach, and told which multiplexer to probe after a drop."""
+
+    _TMUX_REMOTE = "tmux -L magent attach -t '=api'"
+
+    def test_a_supervised_node_pane_tells_the_supervisor_its_multiplexer(self):
+        # `--mux` goes LAST, after `--remote`: a psmux pane's argv carries no
+        # --mux at all, so it stays byte-identical to what shipped.
+        from magent import attach_client
+
+        assert attach_client.pane_command(
+            "amin@devino-second",
+            "api",
+            _FAKE_SUPERVISOR,
+            mux="tmux",
+            remote=self._TMUX_REMOTE,
+        ) == [
+            _FAKE_SUPERVISOR,
+            "--target",
+            "amin@devino-second",
+            "--session",
+            "api",
+            "--remote",
+            self._TMUX_REMOTE,
+            "--mux",
+            "tmux",
+        ]
+
+    def test_a_bare_node_pane_is_the_same_ssh_with_the_tmux_command(self):
+        from magent import attach_client
+
+        assert attach_client.pane_command(
+            "amin@devino-second", "api", None, mux="tmux", remote=self._TMUX_REMOTE
+        ) == [
+            "ssh",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=4",
+            "-o",
+            "ConnectTimeout=20",
+            "-t",
+            "amin@devino-second",
+            self._TMUX_REMOTE,
+        ]
+
+    def test_the_remote_defaults_to_the_multiplexers_attach_command(self):
+        from magent import attach_client
+
+        argv = attach_client.pane_command("u@h", "api", _FAKE_SUPERVISOR, mux="tmux")
+        assert argv[-4:] == ["--remote", self._TMUX_REMOTE, "--mux", "tmux"]
+
+    def test_an_unknown_multiplexer_never_builds_a_pane(self):
+        # Even with an explicit remote: the supervisor would reject `--mux
+        # screen` at startup, leaving a window that dies on arrival.
+        from magent import attach_client
+
+        with pytest.raises(ValueError, match="screen"):
+            attach_client.pane_command(
+                "u@h", "api", _FAKE_SUPERVISOR, mux="screen", remote="anything"
+            )
 
 
 class TestClientProcessNames:

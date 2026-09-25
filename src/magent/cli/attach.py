@@ -22,9 +22,8 @@ import click
 from magent.attach_client import (
     CLIENT_EXE_NAME,
     MUXES,
-    SSH_CONNECTION_OPTS,
     TMUX_SOCKET,
-    remote_attach_command,
+    pane_command,
 )
 from magent.cli.app import main
 from magent.cli.background import _maybe_start_hotkey, _maybe_start_upload_server
@@ -766,26 +765,6 @@ def _attach_client_exe() -> str | None:
     return shutil.which(CLIENT_EXE_NAME)
 
 
-def _pane_command(target: str, sid: str, supervisor: str | None) -> list[str]:
-    """What one attach pane runs: the reconnect supervisor, or bare ssh.
-
-    Both spellings drive the SAME ssh options and the SAME remote command
-    (``attach_client`` owns both), so the only difference between them is who
-    is left standing when the connection drops: with the supervisor the pane
-    reconnects itself, without it the pane becomes a corpse for the next
-    ``magent attach`` to sweep.
-
-    The supervisor form passes ``--remote`` explicitly rather than letting the
-    supervisor derive it: that argument is what puts the ``-L <sid> attach``
-    marker into the supervisor's own command line, which is how
-    ``_dead_sids`` can tell a pane mid-reconnect from a dead one.
-    """
-    remote = remote_attach_command(sid)
-    if supervisor is None:
-        return ["ssh", *SSH_CONNECTION_OPTS, "-t", target, remote]
-    return [supervisor, "--target", target, "--session", sid, "--remote", remote]
-
-
 def _spawn_windows(
     target: str,
     sids: Sequence[str],
@@ -842,7 +821,7 @@ def _spawn_windows(
                 title,
                 "--suppressApplicationTitle",
                 "--",
-                *_pane_command(target, sid, supervisor),
+                *pane_command(target, sid, supervisor),
             ],
             env=attach_client_env(),
         )

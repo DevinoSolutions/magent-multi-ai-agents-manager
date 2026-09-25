@@ -431,6 +431,53 @@ def _probe_session(target: str, session: str, mux: str = "psmux") -> str:
     return SESSION_GONE
 
 
+def pane_command(
+    target: str,
+    sid: str,
+    supervisor: str | None,
+    *,
+    mux: str = "psmux",
+    remote: str | None = None,
+) -> list[str]:
+    """What one attach pane runs: this supervisor, or bare ssh.
+
+    Both spellings drive the SAME ssh options and the SAME remote command
+    (this module owns both), so the only difference between them is who is
+    left standing when the connection drops: with the supervisor the pane
+    reconnects itself, without it the pane becomes a corpse for the next
+    ``magent attach`` to sweep.
+
+    The supervisor form passes ``--remote`` explicitly rather than letting the
+    supervisor derive it: that argument is what puts the attach marker into the
+    supervisor's own command line, which is how ``cli/attach.py::_dead_sids``
+    can tell a pane mid-reconnect from a dead one (see CORPSE COHERENCE above).
+
+    ``--mux`` is appended only for a non-default multiplexer, and LAST, so a
+    psmux pane's argv is byte-for-byte what it always was; the supervisor needs
+    it to ask the right multiplexer whether the session survived a drop.
+
+    An unknown ``mux`` raises ``ValueError`` here, before any window exists:
+    even with an explicit ``remote`` the supervisor would refuse ``--mux`` at
+    startup, and the pane would die on arrival.
+    """
+    _check_mux(mux)
+    if remote is None:
+        remote = remote_attach_command(sid, mux)
+    if supervisor is None:
+        return ssh_argv(target, remote)
+    mux_args = [] if mux == "psmux" else ["--mux", mux]
+    return [
+        supervisor,
+        "--target",
+        target,
+        "--session",
+        sid,
+        "--remote",
+        remote,
+        *mux_args,
+    ]
+
+
 def verdict(rc: int, probe: str | None = None) -> str:
     """What one ssh exit means for the pane.
 
