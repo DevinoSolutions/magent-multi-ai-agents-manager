@@ -11,7 +11,14 @@ from pathlib import Path
 import pytest
 
 from magent import nodes
-from magent.config import MagentConfig, NodeConfig, ProjectConfig, Settings
+from magent.config import (
+    SCHEMA_VERSION,
+    MagentConfig,
+    NodeConfig,
+    ProjectConfig,
+    Settings,
+    load_config,
+)
 from magent.nodes import (
     LoadSample,
     LocalGitState,
@@ -20,6 +27,7 @@ from magent.nodes import (
     NodeMapEntry,
     Recipe,
     RepoSpec,
+    node_for_nick,
 )
 from tests.conftest import REAL_MAGENT_DIR
 
@@ -330,3 +338,43 @@ class TestResolve:
     def test_no_user_anywhere_is_refused(self):
         with pytest.raises(NodeConfigError, match=r"settings\.nodes\.third\.user"):
             nodes.resolve(POOL, ProjectConfig(path="api", node="third"), local_user="")
+
+
+def _pool_config(tmp_config, nodes):
+    return load_config(
+        tmp_config(
+            {"version": SCHEMA_VERSION, "settings": {"nodes": nodes}, "projects": []}
+        )
+    )
+
+
+class TestANickResolvesLikeAProject:
+    def test_a_nick_with_a_user_resolves_to_that_user(self, tmp_config):
+        cfg = _pool_config(
+            tmp_config, {"second": {"host": "devino-second", "user": "amin"}}
+        )
+        assert node_for_nick(cfg, "second", local_user="Someone") == Node(
+            nick="second", host="devino-second", user="amin", root="~/magent"
+        )
+
+    def test_a_nick_without_a_user_runs_as_the_local_user_lowercased(self, tmp_config):
+        cfg = _pool_config(tmp_config, {"second": {"host": "devino-second"}})
+        assert node_for_nick(cfg, "second", local_user="Amin").user == "amin"
+
+    def test_an_unknown_nick_names_the_pool(self, tmp_config):
+        cfg = _pool_config(tmp_config, {"second": {"host": "devino-second"}})
+        with pytest.raises(
+            NodeConfigError,
+            match=r"^node 'fifth' is not in settings\.nodes \(known: second\)$",
+        ):
+            node_for_nick(cfg, "fifth", local_user="amin")
+
+    def test_the_label_prefixes_the_error(self, tmp_config):
+        cfg = _pool_config(tmp_config, {})
+        with pytest.raises(NodeConfigError, match=r"^api: node 'fifth' .*known: none"):
+            node_for_nick(cfg, "fifth", local_user="amin", label="api")
+
+    def test_an_implicit_root_is_still_refused(self, tmp_config):
+        cfg = _pool_config(tmp_config, {"second": {"host": "devino-second"}})
+        with pytest.raises(NodeConfigError, match=r"\(D4\)"):
+            node_for_nick(cfg, "second", local_user="root")

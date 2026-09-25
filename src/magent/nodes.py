@@ -195,6 +195,34 @@ def write_node_map(entries: Mapping[str, NodeMapEntry]) -> None:
         raise
 
 
+def node_for_nick(
+    config: MagentConfig, nick: str, *, local_user: str, label: str | None = None
+) -> Node:
+    """The pool node ``nick``, fully resolved -- the D4 user rule in its one
+    home. ``label`` (a project path) prefixes an error so a project's message
+    reads exactly as it always has. Raises NodeConfigError."""
+    prefix = f"{label}: " if label is not None else ""
+    pool = config.settings.nodes
+    entry = pool.get(nick)
+    if entry is None:
+        known = ", ".join(sorted(pool)) or "none"
+        raise NodeConfigError(
+            f"{prefix}node {nick!r} is not in settings.nodes (known: {known})"
+        )
+    user = entry.user if entry.user is not None else local_user.lower()
+    if not user:
+        raise NodeConfigError(
+            f"settings.nodes.{nick}.user is not set and the local username is "
+            "unknown; set it explicitly"
+        )
+    if entry.user is None and user == "root":
+        raise NodeConfigError(
+            f"settings.nodes.{nick}: magent is running as root and would run "
+            'sessions as root on the node; write "user": "root" to mean it (D4)'
+        )
+    return Node(nick=nick, host=entry.host, user=user, root=entry.root)
+
+
 def resolve(
     config: MagentConfig,
     proj: ProjectConfig,
@@ -222,22 +250,4 @@ def resolve(
         raise NodeConfigError(
             f'{proj.path}: "node": "auto" needs a placement before it can resolve'
         )
-    pool = config.settings.nodes
-    entry = pool.get(nick)
-    if entry is None:
-        known = ", ".join(sorted(pool)) or "none"
-        raise NodeConfigError(
-            f"{proj.path}: node {nick!r} is not in settings.nodes (known: {known})"
-        )
-    user = entry.user if entry.user is not None else local_user.lower()
-    if not user:
-        raise NodeConfigError(
-            f"settings.nodes.{nick}.user is not set and the local username is "
-            "unknown; set it explicitly"
-        )
-    if entry.user is None and user == "root":
-        raise NodeConfigError(
-            f"settings.nodes.{nick}: magent is running as root and would run "
-            'sessions as root on the node; write "user": "root" to mean it (D4)'
-        )
-    return Node(nick=nick, host=entry.host, user=user, root=entry.root)
+    return node_for_nick(config, nick, local_user=local_user, label=proj.path)
