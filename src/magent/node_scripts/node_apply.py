@@ -29,6 +29,8 @@ import argparse
 import contextlib
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -183,6 +185,82 @@ def _last(text: str) -> str:
     return lines[-1][:200] if lines else "no output"
 
 
+# A drive-letter path (C:\ or C:/) or a .exe names a program only the PC runs.
+_WINDOWS_PATH = re.compile(r"^[A-Za-z]:[\\/]")
+# VAR=value words ahead of a command are its environment, not its program.
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _why_not(ctx: Ctx, command: str) -> str | None:
+    """Why this node cannot run ``command``'s program, or None when it can:
+    ``command -v`` on the first word after any VAR=value words, over the
+    node's PATH."""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return "its command cannot be parsed"
+    while words and _ASSIGNMENT.match(words[0]):
+        words = words[1:]
+    if not words:
+        return "its command is empty"
+    first = words[0]
+    raw = command.strip().lstrip("\"'")
+    if (
+        _WINDOWS_PATH.match(raw)
+        or _WINDOWS_PATH.match(first)
+        or first.lower().endswith(".exe")
+    ):
+        return f"{first} is a Windows program"
+    program = os.path.expanduser(os.path.expandvars(first))
+    if "/" in program:
+        if Path(program).is_file() and os.access(program, os.X_OK):
+            return None
+        return f"{first} is not on this node"
+    return None if _which(ctx, program) else f"{program} is not on this node"
+
+
+def _keep_hook(ctx: Ctx, event: str, hook: object) -> bool:
+    if not isinstance(hook, dict):
+        return False
+    command = hook.get("command")
+    if hook.get("type") != "command" or not isinstance(command, str):
+        return True
+    if STATE_HOOK_MARKER in command:
+        return False
+    why = _why_not(ctx, command)
+    if why is None:
+        return True
+    _row(ctx, "drop", f"hook:{event}", why)
+    return False
+
+
+def _hooks(ctx: Ctx, pc_hooks: object) -> dict[str, list[object]]:
+    """The node's hooks, rebuilt from this PC's: runnable command hooks and
+    every non-command hook kept, then the manifest's state-hook entries
+    appended to their events."""
+    rebuilt: dict[str, list[object]] = {}
+    events = pc_hooks if isinstance(pc_hooks, dict) else {}
+    for event, entries in events.items():
+        kept_entries: list[object] = []
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            hooks = entry.get("hooks")
+            kept = [
+                hook
+                for hook in (hooks if isinstance(hooks, list) else [])
+                if _keep_hook(ctx, str(event), hook)
+            ]
+            if kept:
+                kept_entries.append({**entry, "hooks": kept})
+        if kept_entries:
+            rebuilt[str(event)] = kept_entries
+    extra = ctx.manifest.get("hook_entries")
+    for event, entry in (extra if isinstance(extra, dict) else {}).items():
+        rebuilt.setdefault(str(event), []).append(entry)
+    return rebuilt
+
+
 def _step_gh(ctx: Ctx) -> None:
     """Share this PC's GitHub login: the node's gh logs in with the token
     (stdin, never argv) and becomes git's credential helper."""
@@ -250,11 +328,52 @@ def _step_state_hook(ctx: Ctx) -> None:
     _remember(ctx, "state_hook", want, mark)
 
 
+def _step_settings(ctx: Ctx) -> None:
+    """This PC's settings.json over the node's: the PC's keys win, the node's
+    others stay, hooks are rebuilt (``_hooks``), and a statusLine the node
+    cannot run falls back to the node's own."""
+    path = ctx.home / ".claude" / "settings.json"
+    node = _load(path)
+    if not isinstance(node, dict):
+        _row(
+            ctx,
+            "fail",
+            "settings",
+            "~/.claude/settings.json on this node is not a JSON object; "
+            "fix or remove it",
+        )
+        return
+    want = _digest(ctx, "settings") + ":" + _digest(ctx, "state_hook")
+    wired = STATE_HOOK_MARKER in json.dumps(node.get("hooks"))
+    if _unchanged(ctx, "settings", want) and wired:
+        _row(ctx, "skip", "settings", "unchanged since the last provision")
+        return
+    loaded = _load(ctx.work / "settings.json")
+    shipped = loaded if isinstance(loaded, dict) else {}
+    mark = len(ctx.rows)
+    merged = dict(node)
+    merged.update((key, value) for key, value in shipped.items() if key != "hooks")
+    merged["hooks"] = _hooks(ctx, shipped.get("hooks"))
+    line = shipped.get("statusLine")
+    if isinstance(line, dict) and line.get("type") == "command":
+        why = _why_not(ctx, str(line.get("command", "")))
+        if why is not None:
+            _row(ctx, "drop", "statusLine", why)
+            if "statusLine" in node:
+                merged["statusLine"] = node["statusLine"]
+            else:
+                del merged["statusLine"]
+    _write(path, merged)
+    _row(ctx, "did", "settings", f"{len(shipped)} key(s) from this PC; hooks rebuilt")
+    _remember(ctx, "settings", want, mark)
+
+
 # In order: the settings wire hooks to the installed script, and the MCP OAuth
 # entries follow the servers the node ends up with.
 STEPS: tuple[tuple[str, Callable[[Ctx], None]], ...] = (
     ("gh", _step_gh),
     ("state_hook", _step_state_hook),
+    ("settings", _step_settings),
 )
 
 

@@ -11,7 +11,7 @@ import json
 import os
 import sys
 import tarfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -307,3 +307,160 @@ class TestTheRun:
         assert node_apply.main(["--work", str(work), "--path", box.path]) == 0
         (login,) = [c for c in gh.calls() if c.argv[:2] == ["auth", "login"]]
         assert login.stdin == (TOKEN + "\n").encode()
+
+
+def _settings(box: Box) -> Path:
+    return box.home / ".claude" / "settings.json"
+
+
+def _put(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def _pc_settings(settings: dict[str, object]) -> UserScope:
+    return replace(EMPTY, settings=settings)
+
+
+def _stop_hook(command: str) -> dict[str, object]:
+    return {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": command}]}]}}
+
+
+def _commands(settings: object, event: str) -> list[str]:
+    assert isinstance(settings, dict)
+    return [
+        hook["command"]
+        for entry in settings["hooks"].get(event, [])
+        for hook in entry["hooks"]
+        if "command" in hook
+    ]
+
+
+class TestTheSettings:
+    def test_the_pcs_keys_win_and_the_nodes_other_keys_stay(self, box, tmp_path):
+        _put(_settings(box), {"theme": "dark", "model": "sonnet"})
+        box.apply(_work(tmp_path, _pc_settings({"model": "opus"})))
+        merged = _json(_settings(box))
+        assert merged["theme"] == "dark"
+        assert merged["model"] == "opus"
+
+    def test_the_state_hook_is_wired_into_every_event(self, box, tmp_path):
+        box.apply(_work(tmp_path))
+        merged = _json(_settings(box))
+        assert set(merged["hooks"]) == set(remote_mux.HOOK_EVENTS)
+        for event in remote_mux.HOOK_EVENTS:
+            assert _commands(merged, event) == [remote_mux.NODE_STATE_HOOK_COMMAND]
+
+    def test_a_hook_whose_program_is_on_the_node_is_kept(self, box, tmp_path):
+        box.add("notify")
+        box.apply(_work(tmp_path, _pc_settings(_stop_hook("notify --done"))))
+        assert _commands(_json(_settings(box)), "Stop") == [
+            "notify --done",
+            remote_mux.NODE_STATE_HOOK_COMMAND,
+        ]
+
+    def test_leading_assignments_are_not_the_program(self, box, tmp_path):
+        box.add("notify")
+        box.apply(_work(tmp_path, _pc_settings(_stop_hook("LEVEL=2 notify"))))
+        assert "LEVEL=2 notify" in _commands(_json(_settings(box)), "Stop")
+
+    def test_a_hook_whose_program_is_missing_is_dropped_with_its_reason(
+        self, box, tmp_path, capsys
+    ):
+        box.apply(_work(tmp_path, _pc_settings(_stop_hook("node notify.mjs"))))
+        assert remote_mux.ScriptLine(
+            "drop", "hook:Stop", "node is not on this node"
+        ) in _lines(capsys)
+        assert _commands(_json(_settings(box)), "Stop") == [
+            remote_mux.NODE_STATE_HOOK_COMMAND
+        ]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "C:/Users/x/Scripts/tool.EXE --go",
+            '"C:\\Program Files\\t\\run.bat" --go',
+            "tool.exe --go",
+        ],
+    )
+    def test_a_windows_program_is_dropped(self, box, tmp_path, capsys, command):
+        box.apply(_work(tmp_path, _pc_settings(_stop_hook(command))))
+        (line,) = [line for line in _lines(capsys) if line.item == "hook:Stop"]
+        assert line.status == "drop"
+        assert "is a Windows program" in line.detail
+
+    def test_a_hook_that_is_not_a_command_is_kept(self, box, tmp_path):
+        prompt = {"type": "prompt", "prompt": "check the tests ran"}
+        box.apply(
+            _work(tmp_path, _pc_settings({"hooks": {"Stop": [{"hooks": [prompt]}]}}))
+        )
+        stop = _json(_settings(box))["hooks"]["Stop"]
+        assert stop[0] == {"hooks": [prompt]}
+
+    def test_the_nodes_own_hooks_are_replaced_by_the_pcs(self, box, tmp_path):
+        box.add("old-thing")
+        _put(_settings(box), _stop_hook("old-thing"))
+        box.apply(_work(tmp_path))
+        assert "old-thing" not in _settings(box).read_text(encoding="utf-8")
+
+    def test_a_drop_is_remembered_so_the_next_run_skips(self, box, tmp_path, capsys):
+        work = _work(tmp_path, _pc_settings(_stop_hook("node notify.mjs")))
+        box.apply(work)
+        capsys.readouterr()
+        box.apply(work)
+        assert _status(_lines(capsys), "settings") == "skip"
+
+    def test_an_unrunnable_status_line_falls_back_to_the_nodes_own(
+        self, box, tmp_path, capsys
+    ):
+        own = {"type": "command", "command": "bash ~/.claude/line.sh"}
+        _put(_settings(box), {"statusLine": own})
+        pc = {"statusLine": {"type": "command", "command": "C:/tools/line.exe"}}
+        box.apply(_work(tmp_path, _pc_settings(pc)))
+        assert _json(_settings(box))["statusLine"] == own
+        assert _status(_lines(capsys), "statusLine") == "drop"
+
+    def test_an_unrunnable_status_line_with_no_fallback_is_removed(self, box, tmp_path):
+        pc = {"statusLine": {"type": "command", "command": "C:/tools/line.exe"}}
+        box.apply(_work(tmp_path, _pc_settings(pc)))
+        assert "statusLine" not in _json(_settings(box))
+
+    def test_a_node_settings_file_that_is_not_json_fails_and_is_left_alone(
+        self, box, tmp_path, capsys
+    ):
+        _settings(box).parent.mkdir(parents=True)
+        _settings(box).write_text("{oops", encoding="utf-8")
+        assert box.apply(_work(tmp_path)) == 1
+        assert _status(_lines(capsys), "settings") == "fail"
+        assert _settings(box).read_text(encoding="utf-8") == "{oops"
+
+    def test_unchanged_settings_are_skipped(self, box, tmp_path, capsys):
+        work = _work(tmp_path, _pc_settings({"model": "opus"}))
+        box.apply(work)
+        capsys.readouterr()
+        box.apply(work)
+        assert _status(_lines(capsys), "settings") == "skip"
+
+    def test_wiring_removed_on_the_node_is_put_back(self, box, tmp_path, capsys):
+        work = _work(tmp_path, _pc_settings({"model": "opus"}))
+        box.apply(work)
+        _put(_settings(box), {"model": "opus"})
+        capsys.readouterr()
+        box.apply(work)
+        assert _status(_lines(capsys), "settings") == "did"
+        assert _commands(_json(_settings(box)), "Stop") == [
+            remote_mux.NODE_STATE_HOOK_COMMAND
+        ]
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX file modes")
+    def test_the_settings_file_ends_owner_only_whatever_its_old_mode(
+        self, box, tmp_path
+    ):
+        _put(_settings(box), {"theme": "dark"})
+        _settings(box).chmod(0o644)
+        old = os.umask(0o022)
+        try:
+            box.apply(_work(tmp_path, _pc_settings({"model": "opus"})))
+        finally:
+            os.umask(old)
+        assert _settings(box).stat().st_mode & 0o777 == 0o600
