@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import MISSING
@@ -630,6 +631,47 @@ class TestPushSet:
             workspace, [_state(workspace / "api", ())], home=Path.home()
         )
         assert shipped == (workspace / ".env", workspace / "CLAUDE.local.md")
+
+    def test_a_project_reached_through_a_link_never_ships_a_tracked_file(
+        self, repo, tmp_path
+    ):
+        # The project's configured path is a symlink/junction to the repo: the
+        # repo is still its workspace, so the root listing (which cannot tell
+        # tracked from ignored) must not run.
+        link = tmp_path / "sendly-link"
+        try:
+            os.symlink(repo, link, target_is_directory=True)
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        shipped = nodes.push_set(link, [_real_state(repo)], home=Path.home())
+        assert not [p for p in shipped if p.name == ".env.example"]
+
+    def test_a_monorepo_subdirectory_project_never_ships_a_tracked_file(self, repo):
+        web = repo / "apps" / "web"
+        (web / ".env.example").write_text("WEB=\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(repo), "add", "-f", "apps/web/.env.example"],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        shipped = nodes.push_set(web, [_real_state(repo)], home=Path.home())
+        assert not [p for p in shipped if p.name == ".env.example"]
+
+    def test_a_git_hit_that_is_not_a_file_never_ships(self, tmp_path):
+        # The listing is a snapshot: the file may be gone, or be a directory.
+        (tmp_path / ".env.d").mkdir()
+        shipped = nodes.push_set(
+            tmp_path, [_state(tmp_path, (".env", ".env.d"))], home=Path.home()
+        )
+        assert shipped == ()
+
+    def test_a_git_hit_under_a_credential_store_never_ships(self, tmp_path):
+        # A dotfiles repo that IS the home dir: git's listing is no exemption.
+        home = tmp_path / "home"
+        (home / ".ssh").mkdir(parents=True)
+        (home / ".ssh" / ".env").write_text("K=1\n", encoding="utf-8")
+        assert nodes.push_set(home, [_state(home, (".ssh/.env",))], home=home) == ()
 
     def test_the_answer_is_sorted_and_unique(self, repo):
         shipped = nodes.push_set(

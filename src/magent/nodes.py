@@ -362,6 +362,40 @@ def _workspace_root_files(project_dir: Path) -> list[Path]:
     return found
 
 
+def _inside_a_repo(project_dir: Path, states: Sequence[LocalGitState]) -> bool:
+    """Is ``project_dir`` one of ``states``' repos, or inside one? Judged on
+    RESOLVED paths: a project configured as a junction/symlink to its repo, or
+    as a monorepo subdirectory, is still inside it -- and the root listing,
+    which cannot tell a tracked ``.env.example`` from an ignored ``.env``,
+    must not run there. A path that will not resolve counts as inside: the
+    fail-safe direction ships less."""
+    try:
+        root = project_dir.resolve()
+        return any(root.is_relative_to(state.path.resolve()) for state in states)
+    # RuntimeError: a symlink loop before Python 3.13; OSError from 3.13 on.
+    except (OSError, RuntimeError):
+        return True
+
+
+def _forbidden_roots(home: Path) -> list[Path]:
+    return [(home / p).resolve() for p in _NEVER_PUSHED]
+
+
+def _is_forbidden(target: Path, forbidden: Sequence[Path]) -> bool:
+    """``target`` (already resolved) is, or lies under, a credential store."""
+    return any(target.is_relative_to(f) for f in forbidden)
+
+
+def _shippable_git_hit(path: Path, forbidden: Sequence[Path]) -> bool:
+    """A path git's listing reported is a snapshot claim: it ships only if it is
+    a regular file now, and -- resolved, symlinks followed -- not a credential
+    store's."""
+    try:
+        return path.is_file() and not _is_forbidden(path.resolve(), forbidden)
+    except (OSError, RuntimeError):
+        return False
+
+
 def _classify_extras(
     project_dir: Path, extras: Sequence[str], *, home: Path
 ) -> tuple[list[Path], list[str]]:
@@ -370,12 +404,12 @@ def _classify_extras(
     # Both sides resolved: a symlink inside the project that points out of it
     # is outside, and so is a project reached through a symlinked parent.
     root = project_dir.resolve()
-    forbidden = [(home / p).resolve() for p in _NEVER_PUSHED]
+    forbidden = _forbidden_roots(home)
     for extra in extras:
         target = (project_dir / extra).resolve()
         if not target.is_relative_to(root):
             warnings.append(f"push: {extra} is outside the project; skipped")
-        elif any(target.is_relative_to(f) for f in forbidden):
+        elif _is_forbidden(target, forbidden):
             warnings.append(f"push: {extra} is never pushed (credentials); skipped")
         elif target.is_dir():
             warnings.append(f"push: {extra} is a directory; list its files; skipped")
@@ -400,12 +434,19 @@ def push_set(
     ``.mcp.json``. A workspace root's own copies. Then ``extras`` (a project's
     ``push``). Tracked files never ship, ignored directories are never
     descended, nothing under ``home``'s credential stores ever ships, and an
-    extra must resolve (symlinks followed) inside ``project_dir``. Sorted,
-    unique, absolute."""
+    extra must resolve (symlinks followed) inside ``project_dir``. A git hit
+    ships only while it is a regular file. The workspace-root listing runs only
+    when ``project_dir`` -- resolved -- is inside none of ``states``' repos
+    (``_inside_a_repo``). Sorted, unique, absolute."""
+    forbidden = _forbidden_roots(home)
     found: list[Path] = []
     for state in states:
-        found += _from_git_listing(state.path, state.ignored)
-    if all(state.path != project_dir for state in states):
+        found += [
+            hit
+            for hit in _from_git_listing(state.path, state.ignored)
+            if _shippable_git_hit(hit, forbidden)
+        ]
+    if not _inside_a_repo(project_dir, states):
         found += _workspace_root_files(project_dir)
     found += _classify_extras(project_dir, extras, home=home)[0]
     return tuple(sorted(set(found), key=str))
