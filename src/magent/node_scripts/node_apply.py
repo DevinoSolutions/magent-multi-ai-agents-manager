@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import hashlib
 import json
 import os
@@ -60,6 +61,13 @@ _MASK = "[gh-token]"
 _GH_TOKEN_VARS = frozenset(
     {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
 )
+# Steps that keep their own store entry: ``run`` never drops it when they
+# fail. mcp_oauth's is the per-entry memory that keeps a node's refreshed
+# token from being undone; forgetting it makes every entry "new" next time.
+_OWNS_STORE = frozenset({"mcp_oauth"})
+# How many times a merge into a file the node's claude also writes is redone
+# when that file changed under it, before the step gives up.
+MERGE_TRIES = 3
 
 
 @dataclass
@@ -142,7 +150,9 @@ def _mkdirs(path: Path) -> None:
         directory.chmod(0o700)
 
 
-def _install(path: Path, data: bytes, mode: int) -> None:
+def _install(
+    path: Path, data: bytes, mode: int, *, still: Callable[[], bool] | None = None
+) -> bool:
     """Write ``data`` to ``path`` atomically -- a reader (a hook Claude Code
     fires mid-apply, a concurrent ``claude``) sees the old file or the new
     one, never half of either.
@@ -153,7 +163,11 @@ def _install(path: Path, data: bytes, mode: int) -> None:
     the open descriptor (never left to the umask), the bytes are fsync'd
     before the rename, and ``os.replace`` swaps the name -- a symlink at
     ``path`` is replaced, never followed. Any failure removes the temp and
-    re-raises, so nothing is left behind."""
+    re-raises, so nothing is left behind.
+
+    ``still``, when given, is asked right before the replace; False means
+    ``path`` changed since the caller read it, and the temp is removed
+    instead -- False is returned and ``path`` is untouched."""
     _mkdirs(path.parent)
     fd, name = tempfile.mkstemp(
         dir=str(path.parent), prefix="." + path.name + ".", suffix=".magent-tmp"
@@ -170,17 +184,99 @@ def _install(path: Path, data: bytes, mode: int) -> None:
             # Windows before Python 3.13, where only the in-process tests
             # run: the node is Linux and always takes the fchmod above.
             tmp.chmod(mode)
+        if still is not None and not still():
+            tmp.unlink()
+            return False
         os.replace(name, str(path))
     except BaseException:
         with contextlib.suppress(OSError):
             tmp.unlink()
         raise
+    return True
 
 
-def _write(path: Path, value: object) -> None:
-    """``value`` as JSON, owner-only (0600) and atomic."""
-    text = json.dumps(value, indent=2, ensure_ascii=False) + "\n"
-    _install(path, text.encode("utf-8"), 0o600)
+def _write(
+    path: Path, value: object, *, still: Callable[[], bool] | None = None
+) -> bool:
+    """``value`` as JSON, owner-only (0600) and atomic (``_install``, whose
+    ``still`` this passes on). ASCII-escaped: a node file may hold a lone
+    surrogate ("\\ud83d") that json reads but UTF-8 cannot encode."""
+    text = json.dumps(value, indent=2) + "\n"
+    return _install(path, text.encode("utf-8"), 0o600, still=still)
+
+
+def _stamp(path: Path) -> tuple[int, int, int] | None:
+    """What says ``path`` was rewritten since it was read; None when absent."""
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _same(path: Path, stamp: tuple[int, int, int] | None) -> bool:
+    return _stamp(path) == stamp
+
+
+def _target(ctx: Ctx, item: str, path: Path, shown: str) -> Path | None:
+    """The file a write to ``path`` lands in: ``path`` itself, or -- for a
+    symlink (a dotfiles-managed file) -- what it points at, so the link
+    survives and its target ends 0600. A link to nothing is left alone and
+    named in a ``fail`` row (None): writing would create a file the user
+    never made, somewhere they may not expect."""
+    if not path.is_symlink():
+        return path
+    real = path.resolve()
+    if real.exists():
+        return real
+    _row(
+        ctx,
+        "fail",
+        item,
+        f"{shown} is a symlink to {real}, which does not exist; fix or remove it",
+    )
+    return None
+
+
+def _merge_into(
+    ctx: Ctx,
+    item: str,
+    path: Path,
+    shown: str,
+    change: Callable[[dict[str, object]], dict[str, object] | None],
+) -> str:
+    """Merge into a JSON object file the node's claude also writes: read it,
+    ``change`` it (None: nothing to write), and replace it only if it is
+    still what was read -- a write that landed in between is merged again,
+    never overwritten. "did", "skip", or "fail" (its row printed here) when
+    the file is not an object, is a link to nothing, or kept changing."""
+    target = _target(ctx, item, path, shown)
+    if target is None:
+        return "fail"
+    for _ in range(MERGE_TRIES):
+        seen = _stamp(target)
+        node = _load(target)
+        if not isinstance(node, dict):
+            _row(
+                ctx,
+                "fail",
+                item,
+                f"{shown} on this node is not a JSON object; fix or remove it",
+            )
+            return "fail"
+        new = change(node)
+        if new is None:
+            return "skip"
+        if _write(target, new, still=functools.partial(_same, target, seen)):
+            return "did"
+    _row(
+        ctx,
+        "fail",
+        item,
+        f"{shown} kept changing while this apply merged into it "
+        f"({MERGE_TRIES} tries); the next provision tries again",
+    )
+    return "fail"
 
 
 def _which(ctx: Ctx, program: str) -> str | None:
@@ -494,7 +590,16 @@ def _step_settings(ctx: Ctx) -> None:
     """This PC's settings.json over the node's: the PC's keys win, the node's
     others stay (``_merged``), hooks are rebuilt (``_hooks``), and a
     statusLine the node cannot run falls back to the node's own."""
-    path = ctx.home / ".claude" / "settings.json"
+    # Through a symlink (a dotfiles-managed settings.json), not over it
+    # (``_target``).
+    path = _target(
+        ctx,
+        "settings",
+        ctx.home / ".claude" / "settings.json",
+        "~/.claude/settings.json",
+    )
+    if path is None:
+        return
     node = _load(path)
     if not isinstance(node, dict):
         _row(
@@ -536,9 +641,7 @@ def _step_settings(ctx: Ctx) -> None:
                 merged["statusLine"] = node["statusLine"]
             else:
                 del merged["statusLine"]
-    # Through a symlink (a dotfiles-managed settings.json), not over it: the
-    # link survives and its target ends 0600.
-    _write(path.resolve(), merged)
+    _write(path, merged)
     _row(ctx, "did", "settings", f"{len(shipped)} key(s) from this PC; hooks rebuilt")
     _remember(ctx, "settings", want, mark)
 
@@ -549,36 +652,34 @@ def _step_mcp(ctx: Ctx) -> None:
     Every other key of that file is the node's and stays. It is rewritten
     0600 and atomically (``_write``): an entry may carry a relay bearer
     header, and a ``claude`` starting mid-apply reads the old file or the
-    new one."""
+    new one. The node's claude rewrites this file as it runs, so the merge
+    is ``_merge_into``'s: a write of its that lands mid-apply is kept."""
     loaded = _load(ctx.work / "mcp_servers.json")
     servers = loaded if isinstance(loaded, dict) else {}
     if not servers:
         _row(ctx, "skip", "mcp", "this PC has no user MCP servers to share")
         return
-    path = ctx.home / ".claude.json"
-    node = _load(path)
-    if not isinstance(node, dict):
-        _row(
-            ctx,
-            "fail",
-            "mcp",
-            "~/.claude.json on this node is not a JSON object; fix or remove it",
-        )
-        return
-    have_raw = node.get("mcpServers")
-    have = have_raw if isinstance(have_raw, dict) else {}
     want = _digest(ctx, "mcp")
-    present = all(have.get(name) == spec for name, spec in servers.items())
-    if _unchanged(ctx, "mcp", want) and present:
-        _row(ctx, "skip", "mcp", f"{len(servers)} server(s) unchanged")
-        return
+
+    def change(node: dict[str, object]) -> dict[str, object] | None:
+        have_raw = node.get("mcpServers")
+        have = have_raw if isinstance(have_raw, dict) else {}
+        present = all(have.get(name) == spec for name, spec in servers.items())
+        if _unchanged(ctx, "mcp", want) and present:
+            return None
+        merged = dict(have)
+        merged.update(servers)
+        return {**node, "mcpServers": merged}
+
     mark = len(ctx.rows)
-    merged = dict(have)
-    merged.update(servers)
-    node["mcpServers"] = merged
-    _write(path, node)
-    _row(ctx, "did", "mcp", f"{len(servers)} server(s): {', '.join(sorted(servers))}")
-    _remember(ctx, "mcp", want, mark)
+    done = _merge_into(ctx, "mcp", ctx.home / ".claude.json", "~/.claude.json", change)
+    if done == "skip":
+        _row(ctx, "skip", "mcp", f"{len(servers)} server(s) unchanged")
+    elif done == "did":
+        _row(
+            ctx, "did", "mcp", f"{len(servers)} server(s): {', '.join(sorted(servers))}"
+        )
+        _remember(ctx, "mcp", want, mark)
 
 
 def _canonical(value: object) -> str:
@@ -614,59 +715,77 @@ def _step_mcp_oauth(ctx: Ctx) -> None:
     single-holder hazard) -- whatever else changed, and under ``--force`` too.
     The accepted residual: an entry the PC itself re-issued is applied over a
     node refresh, since the PC is the authority for what it re-issued. The
-    store holds shas only, never a token."""
+    store holds shas only, never a token.
+
+    That memory is this step's own (``_OWNS_STORE``): it is updated only
+    after the file is written or found already right, and nothing else
+    drops it -- a failed step forgetting it would make every entry "new"
+    next time. An entry the node already holds exactly is never rewritten,
+    and the merge is ``_merge_into``'s, so a refresh the node's claude
+    writes mid-apply is kept."""
     loaded = _load(ctx.work / "mcp_oauth.json")
     entries = loaded if isinstance(loaded, dict) else {}
     claude_json = _load(ctx.home / ".claude.json")
-    servers = claude_json.get("mcpServers") if isinstance(claude_json, dict) else None
+    if not isinstance(claude_json, dict):
+        _row(
+            ctx,
+            "warn",
+            "mcp_oauth",
+            "~/.claude.json on this node cannot be read, so its server list is "
+            "unknown; this PC's MCP OAuth entries wait for the next provision",
+        )
+        return
+    servers = claude_json.get("mcpServers")
     names = set(servers) if isinstance(servers, dict) else set()
     kept = {
         key: entry
         for key, entry in entries.items()
-        if isinstance(entry, dict) and entry.get("serverName") in names
+        if isinstance(entry, dict)
+        and isinstance(entry.get("serverName"), str)
+        and entry["serverName"] in names
     }
     if not kept:
         _row(ctx, "skip", "mcp_oauth", "no MCP OAuth entry for a server this node has")
         return
-    path = ctx.home / ".claude" / ".credentials.json"
-    creds = _load(path)
-    if not isinstance(creds, dict):
-        _row(
-            ctx,
-            "fail",
-            "mcp_oauth",
-            "~/.claude/.credentials.json on this node is not a JSON object; "
-            "fix or remove it",
-        )
-        return
-    have_raw = creds.get("mcpOAuth")
-    have = have_raw if isinstance(have_raw, dict) else {}
     shas = {
         key: hashlib.sha256(_canonical(entry).encode("utf-8")).hexdigest()
         for key, entry in kept.items()
     }
     remembered = _entry_shas(ctx.store.get("mcp_oauth"))
-    due = {
-        key: entry
-        for key, entry in kept.items()
-        if remembered.get(key) != shas[key] or key not in have
-    }
     # Entries this PC stopped shipping stay remembered: a server that leaves
     # the PC and comes back with the same entry is not "new", so its PC copy
     # does not land on a token the node refreshed meanwhile. The cost -- the
     # store keeps a sha for every entry ever shipped -- is accepted.
     want = _canonical({**remembered, **shas})
-    if not due:
+    written: list[int] = []
+
+    def change(creds: dict[str, object]) -> dict[str, object] | None:
+        have_raw = creds.get("mcpOAuth")
+        have = have_raw if isinstance(have_raw, dict) else {}
+        due = {
+            key: entry
+            for key, entry in kept.items()
+            if have.get(key) != entry
+            and (remembered.get(key) != shas[key] or key not in have)
+        }
+        written[:] = [len(due)]
+        if not due:
+            return None
+        return {**creds, "mcpOAuth": {**have, **due}}
+
+    done = _merge_into(
+        ctx,
+        "mcp_oauth",
+        ctx.home / ".claude" / ".credentials.json",
+        "~/.claude/.credentials.json",
+        change,
+    )
+    if done == "skip":
         _row(ctx, "skip", "mcp_oauth", f"{len(kept)} entry(ies) unchanged on this PC")
+    elif done == "did":
+        _row(ctx, "did", "mcp_oauth", f"{written[0]} of {len(kept)} entry(ies)")
+    if done != "fail":
         ctx.store["mcp_oauth"] = want
-        return
-    mark = len(ctx.rows)
-    merged = dict(have)
-    merged.update(due)
-    creds["mcpOAuth"] = merged
-    _write(path, creds)
-    _row(ctx, "did", "mcp_oauth", f"{len(due)} of {len(kept)} entry(ies)")
-    _remember(ctx, "mcp_oauth", want, mark)
 
 
 # In order: the settings wire hooks to the installed script, and the MCP OAuth
@@ -709,7 +828,8 @@ def run(*, work: Path, home: Path, path: str, token: str, force: bool) -> int:
                 step(ctx)
             except Exception as exc:  # noqa: BLE001  # reason: one step's bug, of any type, must fail only that step's row -- the steps after it still run, and the row still goes through _row's token mask
                 _row(ctx, "fail", name, f"{type(exc).__name__}: {exc}")
-                ctx.store.pop(name, None)
+                if name not in _OWNS_STORE:
+                    ctx.store.pop(name, None)
     finally:
         try:
             _write(store_path, {"version": 1, "digests": ctx.store})

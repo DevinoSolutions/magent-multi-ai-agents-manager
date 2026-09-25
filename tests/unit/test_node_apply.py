@@ -787,8 +787,8 @@ class TestTheMcpServers:
         box.apply(_work(tmp_path, replace(EMPTY, mcp_servers={"chrome": RELAY})))
         assert _claude_json(box).stat().st_mode & 0o777 == 0o600
         assert _json(_claude_json(box))["mcpServers"]["chrome"] == RELAY
-        # Every temp name _install has used ends ".magent-tmp" (F8's mkstemp
-        # name is "..claude.json.<rand>.magent-tmp"), so match on the suffix.
+        # Match any name ending .magent-tmp: every temp name _install has
+        # used ends that way, whatever comes before it.
         assert not list(box.home.glob("*.magent-tmp"))
 
 
@@ -1325,3 +1325,306 @@ class TestTheMerge:
         assert _json(real)["model"] == "opus"
         assert _json(real)["theme"] == "dark"
         assert real.stat().st_mode & 0o777 == 0o600
+
+
+def _mid_merge(
+    monkeypatch: pytest.MonkeyPatch, path: Path, writes: list[object]
+) -> None:
+    """Each time node_apply reads ``path``, the next value in ``writes`` lands
+    on it right after the read -- the node's claude writing the file while
+    this apply is merging into it."""
+    real = node_apply._load
+    pending = list(writes)
+
+    def load(read: Path) -> object:
+        value = real(read)
+        if read == path and pending:
+            _put(path, pending.pop(0))
+        return value
+
+    monkeypatch.setattr(node_apply, "_load", load)
+
+
+def _refreshed(token: str) -> dict[str, object]:
+    """The node's credentials after its claude refreshed A to ``token``."""
+    return {
+        "claudeAiOauth": {"accessToken": "NODE-LOGIN"},
+        "mcpOAuth": {
+            A: {"serverName": "docs", "accessToken": token},
+            B: {"serverName": "wiki", "accessToken": "PC-B"},
+        },
+    }
+
+
+class TestAFailedOAuthStepKeepsItsMemory:
+    # I1: the per-entry shas are what keep a node refresh from being undone.
+    # A failed step that dropped them would make every entry "new" next time.
+
+    def test_a_failed_credentials_write_does_not_forget_the_entries(
+        self, box, tmp_path, monkeypatch, capsys
+    ):
+        box.apply(_work(tmp_path, _two()))
+        _refresh_on_node(box, A, "NODE-REFRESHED-A")
+        capsys.readouterr()
+        real = node_apply._write
+        failed: list[Path] = []
+
+        def write_once_failing(path: Path, value: object, **kw: object) -> object:
+            if path.name == ".credentials.json" and not failed:
+                failed.append(path)
+                raise OSError("disk full")
+            return real(path, value, **kw)
+
+        monkeypatch.setattr(node_apply, "_write", write_once_failing)
+        work = _work(tmp_path, _two(b="PC-B2"), name="w2")
+        assert box.apply(work) == 1
+        assert _status(_lines(capsys), "mcp_oauth") == "fail"
+        box.apply(work)
+        assert _node_token(box, A) == "NODE-REFRESHED-A"
+        assert _node_token(box, B) == "PC-B2"
+
+
+class TestAMergeNeverLosesAConcurrentWrite:
+    # I3: the node's claude rewrites these files while it runs. A merge that
+    # read the file, then wrote over a newer one, would drop what claude wrote.
+
+    def test_a_token_refreshed_mid_merge_survives_and_the_merge_lands(
+        self, box, tmp_path, monkeypatch, capsys
+    ):
+        box.apply(_work(tmp_path, _two()))
+        capsys.readouterr()
+        _mid_merge(monkeypatch, _credentials(box), [_refreshed("RT1")])
+        assert box.apply(_work(tmp_path, _two(b="PC-B2"), name="w2")) == 0
+        assert _status(_lines(capsys), "mcp_oauth") == "did"
+        assert _node_token(box, A) == "RT1"
+        assert _node_token(box, B) == "PC-B2"
+        assert _json(_credentials(box))["claudeAiOauth"] == {
+            "accessToken": "NODE-LOGIN"
+        }
+
+    def test_a_claude_json_rewritten_mid_merge_keeps_both_writes(
+        self, box, tmp_path, monkeypatch
+    ):
+        _put(_claude_json(box), {"projects": {}})
+        _mid_merge(monkeypatch, _claude_json(box), [{"projects": {"/new": {}}}])
+        assert (
+            box.apply(_work(tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS}))) == 0
+        )
+        node = _json(_claude_json(box))
+        assert node["projects"] == {"/new": {}}
+        assert node["mcpServers"] == {"docs": DOCS}
+
+    def test_a_file_that_keeps_changing_fails_the_step_and_keeps_the_store(
+        self, box, tmp_path, monkeypatch, capsys
+    ):
+        box.apply(_work(tmp_path, _two()))
+        before = _stored(box)
+        capsys.readouterr()
+        writes = [_refreshed("RT" + "1" * n) for n in (1, 2, 3)]
+        _mid_merge(monkeypatch, _credentials(box), writes)
+        assert box.apply(_work(tmp_path, _two(b="PC-B2"), name="w2")) == 1
+        (line,) = [line for line in _lines(capsys) if line.item == "mcp_oauth"]
+        assert line.status == "fail"
+        assert "kept changing" in line.detail
+        assert _json(_credentials(box)) == writes[-1]
+        assert _stored(box) == before
+
+    def test_an_entry_the_node_already_holds_is_not_rewritten(
+        self, box, tmp_path, capsys
+    ):
+        work = _work(tmp_path, _two())
+        box.apply(work)
+        store_path = box.home / ".magent" / "provision.json"
+        store = _json(store_path)
+        store["digests"]["mcp_oauth"] = ""  # nothing remembered per entry
+        _put(store_path, store)
+        stamp = _credentials(box).stat()
+        capsys.readouterr()
+        box.apply(work)
+        assert _status(_lines(capsys), "mcp_oauth") == "skip"
+        after = _credentials(box).stat()
+        assert (after.st_ino, after.st_mtime_ns) == (stamp.st_ino, stamp.st_mtime_ns)
+        assert set(json.loads(_stored(box))) == {A, B}
+
+
+class TestTheMcpFilesSurviveOddContent:
+    def test_a_lone_surrogate_in_the_node_claude_json_survives(self, box, tmp_path):
+        # M1: json reads "\ud83d" into a str that UTF-8 cannot encode; the
+        # write must escape it, not fail on it.
+        _claude_json(box).write_text('{"projects": {"x": "\\ud83d"}}', encoding="utf-8")
+        assert (
+            box.apply(_work(tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS}))) == 0
+        )
+        node = _json(_claude_json(box))
+        assert node["projects"] == {"x": "\ud83d"}
+        assert node["mcpServers"] == {"docs": DOCS}
+
+    def test_a_server_name_that_is_not_a_string_is_skipped(self, box, tmp_path):
+        # M4: a list is not even hashable, so it must never reach a set lookup.
+        scope = replace(
+            _two(),
+            mcp_oauth={
+                A: {"serverName": "docs", "accessToken": "PC-A"},
+                "odd|0": {"serverName": ["docs"], "accessToken": "x"},
+            },
+        )
+        assert box.apply(_work(tmp_path, scope)) == 0
+        assert set(_json(_credentials(box))["mcpOAuth"]) == {A}
+
+    def test_an_unreadable_claude_json_is_named_not_read_as_no_entries(
+        self, box, tmp_path, capsys
+    ):
+        # M5
+        _claude_json(box).write_text("{oops", encoding="utf-8")
+        box.apply(_work(tmp_path, _two()))
+        (line,) = [line for line in _lines(capsys) if line.item == "mcp_oauth"]
+        assert line.status == "warn"
+        assert "~/.claude.json" in line.detail
+        assert "server list" in line.detail
+        assert "no MCP OAuth entry" not in line.detail
+        assert not _credentials(box).exists()
+
+    def test_a_claude_json_that_is_a_list_fails_and_is_left_alone(
+        self, box, tmp_path, capsys
+    ):
+        _claude_json(box).write_text("[]", encoding="utf-8")
+        assert (
+            box.apply(_work(tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS}))) == 1
+        )
+        assert _status(_lines(capsys), "mcp") == "fail"
+        assert _claude_json(box).read_text(encoding="utf-8") == "[]"
+
+    def test_mcp_servers_that_is_not_an_object_is_replaced(self, box, tmp_path, capsys):
+        _put(_claude_json(box), {"mcpServers": "junk"})
+        box.apply(_work(tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS})))
+        assert _status(_lines(capsys), "mcp") == "did"
+        assert _json(_claude_json(box))["mcpServers"] == {"docs": DOCS}
+
+    def test_force_rewrites_unchanged_servers(self, box, tmp_path, capsys):
+        work = _work(tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS}))
+        box.apply(work)
+        capsys.readouterr()
+        box.apply(work, force=True)
+        assert _status(_lines(capsys), "mcp") == "did"
+
+    def test_an_entry_shipped_with_its_keys_reordered_is_unchanged(
+        self, box, tmp_path, capsys
+    ):
+        box.apply(_work(tmp_path, _two()))
+        _refresh_on_node(box, A, "NODE-REFRESHED-A")
+        work = _work(tmp_path, _two(), name="w2")
+        (work / "mcp_oauth.json").write_text(
+            json.dumps(
+                {
+                    B: {"serverName": "wiki", "accessToken": "PC-B"},
+                    A: {"accessToken": "PC-A", "serverName": "docs"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        capsys.readouterr()
+        box.apply(work)
+        assert _status(_lines(capsys), "mcp_oauth") == "skip"
+        assert _node_token(box, A) == "NODE-REFRESHED-A"
+
+    def test_a_null_entry_beside_a_real_one_is_ignored(self, box, tmp_path):
+        work = _work(tmp_path, _two())
+        (work / "mcp_oauth.json").write_text(
+            json.dumps({A: {"serverName": "docs", "accessToken": "PC-A"}, B: None}),
+            encoding="utf-8",
+        )
+        assert box.apply(work) == 0
+        assert set(_json(_credentials(box))["mcpOAuth"]) == {A}
+
+    def test_a_credentials_file_that_is_a_list_fails_and_is_left_alone(
+        self, box, tmp_path, capsys
+    ):
+        _credentials(box).parent.mkdir(parents=True)
+        _credentials(box).write_text("[]", encoding="utf-8")
+        assert box.apply(_work(tmp_path, _two())) == 1
+        assert _status(_lines(capsys), "mcp_oauth") == "fail"
+        assert _credentials(box).read_text(encoding="utf-8") == "[]"
+
+    def test_mcp_oauth_that_is_not_an_object_is_replaced_and_the_login_kept(
+        self, box, tmp_path, capsys
+    ):
+        login = {"accessToken": "NODE-LOGIN"}
+        _put(_credentials(box), {"claudeAiOauth": login, "mcpOAuth": 5})
+        box.apply(_work(tmp_path, _two()))
+        assert _status(_lines(capsys), "mcp_oauth") == "did"
+        creds = _json(_credentials(box))
+        assert set(creds["mcpOAuth"]) == {A, B}
+        assert creds["claudeAiOauth"] == login
+
+    def test_a_failed_replace_of_claude_json_leaves_no_temp(
+        self, box, tmp_path, monkeypatch, capsys
+    ):
+        # M3: the temp is removed on the way out of a failed write.
+        real = os.replace
+
+        def refuse(src: object, dst: object) -> None:
+            if str(dst).endswith(".claude.json"):
+                raise OSError("replace refused")
+            real(src, dst)
+
+        monkeypatch.setattr(os, "replace", refuse)
+        assert (
+            box.apply(_work(tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS}))) == 1
+        )
+        assert _status(_lines(capsys), "mcp") == "fail"
+        assert not list(box.home.rglob("*.magent-tmp"))
+
+
+@pytest.mark.skipif(not POSIX, reason="POSIX symlinks and file modes")
+class TestASymlinkedMcpFileIsWrittenThroughItsLink:
+    # M2: the rule settings.json follows (F9) -- through an existing link, so
+    # it survives and its target ends 0600; a link to nothing is left alone.
+
+    @pytest.mark.parametrize("which", ["claude_json", "credentials"])
+    def test_the_link_survives_and_its_target_is_merged_owner_only(
+        self, box, tmp_path, which
+    ):
+        link = _claude_json(box) if which == "claude_json" else _credentials(box)
+        real = tmp_path / "dotfiles" / link.name
+        _put(real, {"keep": 1})
+        real.chmod(0o644)
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(real)
+        assert box.apply(_work(tmp_path, _two())) == 0
+        assert link.is_symlink()
+        merged = _json(real)
+        assert merged["keep"] == 1
+        key = "mcpServers" if which == "claude_json" else "mcpOAuth"
+        assert key in merged
+        assert real.stat().st_mode & 0o777 == 0o600
+
+    @pytest.mark.parametrize(
+        ("which", "item"), [("claude_json", "mcp"), ("credentials", "mcp_oauth")]
+    )
+    def test_a_link_to_nothing_is_left_alone_and_named(
+        self, box, tmp_path, capsys, which, item
+    ):
+        if which == "credentials":
+            _put(_claude_json(box), {"mcpServers": TWO_SERVERS})
+        link = _claude_json(box) if which == "claude_json" else _credentials(box)
+        gone = tmp_path / "dotfiles" / link.name
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(gone)
+        assert box.apply(_work(tmp_path, _two())) == 1
+        (line,) = [line for line in _lines(capsys) if line.item == item]
+        assert line.status == "fail"
+        assert str(gone) in line.detail
+        assert link.is_symlink()
+        assert not gone.exists()
+
+    def test_a_settings_link_to_nothing_is_left_alone_and_named(
+        self, box, tmp_path, capsys
+    ):
+        gone = tmp_path / "dotfiles" / "settings.json"
+        _settings(box).parent.mkdir(parents=True)
+        _settings(box).symlink_to(gone)
+        assert box.apply(_work(tmp_path, _pc_settings({"model": "opus"}))) == 1
+        (line,) = [line for line in _lines(capsys) if line.item == "settings"]
+        assert line.status == "fail"
+        assert str(gone) in line.detail
+        assert not gone.exists()
