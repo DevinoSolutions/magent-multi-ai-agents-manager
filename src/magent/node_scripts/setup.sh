@@ -5,6 +5,9 @@
 # after the sentinel is this PC's ssh public key, one line.
 # Idempotent: every step prints ok/did/skip/fail rows, and a second run prints
 # only skip rows plus one `key` row per user (that user's node GitHub key).
+# Root does only what needs root -- packages, the account, the docker group.
+# Everything under a user's home is written AS that user (the user phase), so
+# a path the user controls can never aim a root write somewhere else.
 set -euo pipefail
 # @include lib.sh
 # @include tmux_floor.sh
@@ -13,13 +16,23 @@ PACKAGES=(tmux git curl python3 ca-certificates)
 USER_RE='^[a-z_][a-z0-9_-]{0,31}$'
 KEY_RE='^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+={0,3}( [^[:cntrl:]]*)?$'
 GH_KEYRING=/etc/apt/keyrings/githubcli-archive-keyring.gpg
+GH_LIST=/etc/apt/sources.list.d/github-cli.list
+
+# main runs every step as `step || rc=1`, which switches set -e off inside it:
+# so each step chains its own writes and reports its own fail row.
 
 say() { printf '%s\t%s\t%s\n' "$1" "$2" "${3:-}"; }
+
+# Installed means dpkg's "ii": `dpkg -s` also succeeds for a package removed
+# with its config files left behind (state "rc").
+installed() {
+  [ "$(dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null)" = "ii " ]
+}
 
 step_packages() {
   local p out missing=()
   for p in "${PACKAGES[@]}"; do
-    dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p")
+    installed "$p" || missing+=("$p")
   done
   if [ "${#missing[@]}" -eq 0 ]; then
     say skip packages "${PACKAGES[*]}"
@@ -71,17 +84,24 @@ step_gh() {
     say skip gh "$(gh --version 2>/dev/null | head -n1)"
     return 0
   fi
-  # gh's official apt repository (cli/cli docs/install_linux.md).
-  if out=$( { mkdir -p -m 755 /etc/apt/keyrings &&
+  # gh's official apt repository (cli/cli docs/install_linux.md). One that
+  # cannot be read is taken out again: a dead source would fail every later
+  # `apt-get update` on this node, the owner's as well as magent's.
+  if ! out=$( { mkdir -p -m 755 /etc/apt/keyrings &&
       curl -fsSL -o "$GH_KEYRING" https://cli.github.com/packages/githubcli-archive-keyring.gpg &&
       chmod go+r "$GH_KEYRING" &&
+      arch=$(dpkg --print-architecture) &&
       printf 'deb [arch=%s signed-by=%s] https://cli.github.com/packages stable main\n' \
-        "$(dpkg --print-architecture)" "$GH_KEYRING" > /etc/apt/sources.list.d/github-cli.list &&
-      DEBIAN_FRONTEND=noninteractive apt-get update -qq &&
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gh; } 2>&1 ); then
+        "$arch" "$GH_KEYRING" > "$GH_LIST" &&
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq; } 2>&1 ); then
+    rm -f -- "$GH_LIST" "$GH_KEYRING"
+    say fail gh "could not add gh's apt repository: ${out##*$'\n'}"
+    return 1
+  fi
+  if out=$(DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gh 2>&1); then
     say did gh "installed $(gh --version 2>/dev/null | head -n1)"
   else
-    say fail gh "could not install gh: ${out##*$'\n'}"
+    say fail gh "apt-get could not install gh: ${out##*$'\n'}"
     return 1
   fi
 }
@@ -98,28 +118,6 @@ step_user() {
     say fail "user:$u" "useradd: ${out##*$'\n'}"
     return 1
   fi
-}
-
-step_authorized() {
-  local u=$1 key=$2 home blob ak
-  if ! home=$(getent passwd "$u" | cut -d: -f6) || [ -z "$home" ]; then
-    say fail "authorized_keys:$u" "no home directory for $u"
-    return 1
-  fi
-  ak="$home/.ssh/authorized_keys"
-  blob=$(printf '%s\n' "$key" | awk '{print $2}')
-  if [ -f "$ak" ] && awk -v b="$blob" 'index($0, b) {f = 1} END {exit !f}' "$ak"; then
-    say skip "authorized_keys:$u" "this PC's key is already authorized"
-    return 0
-  fi
-  mkdir -p "$home/.ssh"
-  chmod 700 "$home/.ssh"
-  # A last line without its newline would glue the new key onto it.
-  if [ -s "$ak" ] && [ -n "$(tail -c1 "$ak")" ]; then printf '\n' >> "$ak"; fi
-  printf '%s\n' "$key" >> "$ak"
-  chmod 600 "$ak"
-  chown -R "$u:" "$home/.ssh"
-  say did "authorized_keys:$u" "this PC's key authorized"
 }
 
 step_docker() {
@@ -143,52 +141,136 @@ step_docker() {
   fi
 }
 
-# Runs AS the user, in a login shell, through runuser: it sees only the
-# functions shipped to it with `declare -f`.
-user_phase() {
-  local u=$1 out rc=0
-  export PATH="$HOME/.local/bin:$PATH"
+# The user phase runs AS the user, in a bash login shell, through runuser: it
+# sees only the functions shipped to it with `declare -f`, and no set -e.
+# A symlinked ~/.ssh or authorized_keys is refused, not followed: magent does
+# not write through a link it did not make. (`test -h`, not its `-L` alias:
+# B's socket pin reads the word after every `-L` in a script as a socket.)
+user_authorized() {
+  local u=$1 key=$2 ssh="$HOME/.ssh" ak="$HOME/.ssh/authorized_keys" rest t b
+  if [ -h "$ssh" ] || [ -h "$ak" ]; then
+    say fail "authorized_keys:$u" "~/.ssh or ~/.ssh/authorized_keys is a symlink; magent does not write through it"
+    return 1
+  fi
+  t=${key%% *}
+  rest=${key#* }
+  b=${rest%% *}
+  # Authorized = a line that is not a comment carries this key's type and blob
+  # as two adjacent whole fields (after any options).
+  if [ -f "$ak" ] && awk -v t="$t" -v b="$b" '
+      /^[[:space:]]*(#|$)/ {next}
+      {for (i = 1; i < NF; i++) if ($i == t && $(i + 1) == b) {found = 1; exit}}
+      END {exit !found}' "$ak" 2>/dev/null; then
+    say skip "authorized_keys:$u" "this PC's key is already authorized"
+    return 0
+  fi
+  # A last line without its newline would glue the new key onto it.
+  if ! { mkdir -p "$ssh" && chmod 700 "$ssh" &&
+      { [ ! -s "$ak" ] || [ -z "$(tail -c1 "$ak")" ] || printf '\n' >> "$ak"; } &&
+      printf '%s\n' "$key" >> "$ak" && chmod 600 "$ak"; } 2>/dev/null; then
+    say fail "authorized_keys:$u" "could not write ~/.ssh/authorized_keys"
+    return 1
+  fi
+  say did "authorized_keys:$u" "this PC's key authorized"
+}
+
+user_claude() {
+  local u=$1 out tmp
   if command -v claude >/dev/null 2>&1; then
     say skip "claude:$u" "$(claude --version 2>/dev/null | head -n1)"
-  else
-    out=$( { curl -fsSL https://claude.ai/install.sh | bash; } 2>&1 ) || true
-    if command -v claude >/dev/null 2>&1; then
-      say did "claude:$u" "$(claude --version 2>/dev/null | head -n1)"
-    else
-      say fail "claude:$u" "the Claude installer did not put claude on PATH: ${out##*$'\n'}"
-      rc=1
-    fi
+    return 0
   fi
-  if [ -f "$HOME/.ssh/id_ed25519.pub" ]; then
-    say skip "node-key:$u" "id_ed25519 already in ~/.ssh"
+  # Downloaded whole, then run: `curl | bash` hands bash half a script when
+  # the connection drops mid-transfer. The installer keeps its usual umask.
+  if ! tmp=$(mktemp 2>/dev/null); then
+    say fail "claude:$u" "mktemp failed: nowhere to download the Claude installer"
+    return 1
+  fi
+  out=$( { curl -fsSL -o "$tmp" https://claude.ai/install.sh &&
+      (umask 022 && bash "$tmp"); } 2>&1 ) || true
+  rm -f -- "$tmp"
+  if command -v claude >/dev/null 2>&1; then
+    say did "claude:$u" "$(claude --version 2>/dev/null | head -n1)"
   else
-    mkdir -p -m 700 "$HOME/.ssh"
-    if out=$(ssh-keygen -q -t ed25519 -N "" -C "magent@$(hostname)" -f "$HOME/.ssh/id_ed25519" 2>&1); then
-      say did "node-key:$u" "id_ed25519 generated in ~/.ssh (the private key never leaves this node)"
-    else
-      say fail "node-key:$u" "ssh-keygen: ${out##*$'\n'}"
+    say fail "claude:$u" "the Claude installer did not put claude on PATH: ${out##*$'\n'}"
+    return 1
+  fi
+}
+
+# Never a second node key over the first: GitHub may already hold it. A lost
+# .pub is derived again from the private key.
+user_node_key() {
+  local u=$1 out pub ssh="$HOME/.ssh" id="$HOME/.ssh/id_ed25519"
+  if [ -h "$ssh" ]; then
+    say fail "node-key:$u" "~/.ssh is a symlink; magent does not write through it"
+    return 1
+  fi
+  if [ -f "$id.pub" ]; then
+    say skip "node-key:$u" "id_ed25519 already in ~/.ssh"
+  elif [ -f "$id" ]; then
+    if ! out=$(ssh-keygen -y -P "" -f "$id" 2>&1 > "$id.pub"); then
+      rm -f -- "$id.pub"
+      say fail "node-key:$u" "ssh-keygen -y: ${out##*$'\n'}"
       return 1
     fi
+    say did "node-key:$u" "id_ed25519.pub derived again from the private key in ~/.ssh"
+  elif out=$( { mkdir -p -m 700 "$ssh" &&
+      ssh-keygen -q -t ed25519 -N "" -C "magent@$(hostname)" -f "$id"; } 2>&1 ); then
+    say did "node-key:$u" "id_ed25519 generated in ~/.ssh (the private key never leaves this node)"
+  else
+    say fail "node-key:$u" "ssh-keygen: ${out##*$'\n'}"
+    return 1
   fi
-  say key "$u" "$(cat "$HOME/.ssh/id_ed25519.pub")"
+  if ! pub=$(cat "$id.pub" 2>/dev/null) || [ -z "$pub" ]; then
+    say fail "node-key:$u" "no readable ~/.ssh/id_ed25519.pub"
+    return 1
+  fi
+  say key "$u" "$pub"
+}
+
+user_phase() {
+  local u=$1 key=$2 rc=0
+  umask 077
+  export PATH="$HOME/.local/bin:$PATH"
+  user_authorized "$u" "$key" || rc=1
+  user_claude "$u" || rc=1
+  user_node_key "$u" || rc=1
   return "$rc"
 }
 
+# --shell: the phase is bash functions, whatever the account's login shell is.
 run_user_phase() {
-  local u=$1
-  runuser --login --command="$(declare -f say user_phase); user_phase $(printf '%q' "$u")" "$u"
+  local u=$1 key=$2
+  runuser --login --shell=/bin/bash \
+    --command="$(declare -f say user_phase user_authorized user_claude user_node_key); user_phase $(printf '%q %q' "$u" "$key")" \
+    "$u"
 }
 
 main() {
-  local u key rc=0
+  local u key entry uid uid_min rc=0
   if [ "$#" -eq 0 ]; then
     say fail setup "no user named: magent node setup <nick> --user <name>"
     return 2
   fi
+  uid_min=$(awk '/^UID_MIN[[:space:]]/ {print $2; exit}' /etc/login.defs 2>/dev/null) || uid_min=""
+  [[ $uid_min =~ ^[0-9]+$ ]] || uid_min=1000
+  # Every name is checked before anything changes: a node user is a person's
+  # own account -- never root, never an existing system account.
   for u in "$@"; do
     if ! [[ $u =~ $USER_RE ]]; then
-      say fail setup "not a valid Unix user name: $u"
+      say fail setup "not a valid Unix user name: $(printf '%q' "$u")"
       return 2
+    fi
+    if [ "$u" = root ]; then
+      say fail setup "root is not a node user: name a person's own account"
+      return 2
+    fi
+    if entry=$(getent passwd "$u" 2>/dev/null); then
+      uid=$(printf '%s\n' "$entry" | cut -d: -f3)
+      if ! [[ $uid =~ ^[0-9]+$ ]] || ((10#$uid < 10#$uid_min)); then
+        say fail setup "$u is a system account (uid $uid, UID_MIN $uid_min): name a person's own account"
+        return 2
+      fi
     fi
   done
   key=$(magent_payload)
@@ -208,9 +290,8 @@ main() {
   step_gh || rc=1
   for u in "$@"; do
     step_user "$u" || { rc=1; continue; }
-    step_authorized "$u" "$key" || rc=1
     step_docker "$u" || rc=1
-    run_user_phase "$u" || rc=1
+    run_user_phase "$u" "$key" || rc=1
   done
   return "$rc"
 }

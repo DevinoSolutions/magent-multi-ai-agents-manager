@@ -1,8 +1,9 @@
 # shellcheck shell=bash
 # Include-only (`# @include tmux_floor.sh`): the oldest tmux a node may run
 # (DECISION-22). setup.sh refuses anything older and doctor.sh fails it, with
-# the SAME predicate as D's bring_up.sh `need_tmux` (the first N.N anywhere
-# in `tmux -V`), so a node that passes setup is never one bring_up refuses.
+# a predicate the same as or stricter than D's bring_up.sh `need_tmux` (the
+# first N.N on the first line of `tmux -V`), so a node that passes setup is
+# never one bring_up refuses.
 MAGENT_TMUX_MIN_MAJOR=3
 MAGENT_TMUX_MIN_MINOR=2
 
