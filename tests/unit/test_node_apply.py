@@ -1663,18 +1663,23 @@ class TestTheMcpFilesSurviveOddContent:
     def test_an_entry_shipped_with_its_keys_reordered_is_unchanged(
         self, box, tmp_path, capsys
     ):
-        box.apply(_work(tmp_path, _two()))
+        first = _work(tmp_path, _two())
+        raw = (first / "mcp_oauth.json").read_text(encoding="utf-8")
+        # The payload ships each entry's keys sorted ...
+        assert raw.index("accessToken") < raw.index("serverName")
+        box.apply(first)
         _refresh_on_node(box, A, "NODE-REFRESHED-A")
         work = _work(tmp_path, _two(), name="w2")
-        (work / "mcp_oauth.json").write_text(
-            json.dumps(
-                {
-                    B: {"serverName": "wiki", "accessToken": "PC-B"},
-                    A: {"accessToken": "PC-A", "serverName": "docs"},
-                }
-            ),
-            encoding="utf-8",
+        text = json.dumps(
+            {
+                B: {"serverName": "wiki", "accessToken": "PC-B"},
+                A: {"serverName": "docs", "accessToken": "PC-A"},
+            }
         )
+        # ... so this one, the same entry in the other order, differs as text.
+        entry = text[text.index(A) :]
+        assert entry.index("serverName") < entry.index("accessToken")
+        (work / "mcp_oauth.json").write_text(text, encoding="utf-8")
         capsys.readouterr()
         box.apply(work)
         assert _status(_lines(capsys), "mcp_oauth") == "skip"
