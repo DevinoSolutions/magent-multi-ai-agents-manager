@@ -1307,6 +1307,33 @@ class TestOneConnectionBringsAProjectUp:
         with pytest.raises(RemoteError, match="not a bring-up result"):
             remote_mux.bring_up(NODE, _recipe(tmp_path))
 
+    def test_a_home_refusal_names_the_probe_that_ran(self, fake_ssh, tmp_path):
+        # RemoteError's law: command_redacted is what RAN, as _run_shown says it.
+        fake_ssh.set_reply("printenv HOME", stdout="\n")
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(NODE, _recipe(tmp_path))
+        assert info.value.command_redacted == (
+            "ssh",
+            *remote_mux.SSH_BATCH_OPTS,
+            NODE.target,
+            _wrapped(["printenv", "HOME"]),
+        )
+
+    def test_an_unreadable_result_names_the_script_run_that_ran(
+        self, node_home, tmp_path
+    ):
+        node_home.set_reply("bash -s --", stdout="hello\n")
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(NODE, _recipe(tmp_path))
+        call = node_home.calls()[1]
+        assert info.value.command_redacted == (
+            "ssh",
+            *remote_mux.SSH_BATCH_OPTS,
+            NODE.target,
+            _script_run("up"),
+            f"<stdin: {len(call.stdin)} bytes>",
+        )
+
     def test_a_nul_in_a_command_is_refused(self, node_home, tmp_path):
         with pytest.raises(ValueError, match="NUL"):
             remote_mux.bring_up(NODE, _recipe(tmp_path, command="claude\0x"))

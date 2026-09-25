@@ -777,13 +777,14 @@ def _payload(recipe: Recipe, *, header: bytes, decorate: str, memory: bool) -> b
 def _remote_home(node: Node) -> str:
     """The node user's ``$HOME``. The PC expands ``~`` itself and computes the
     Claude project name from the absolute path, so it must be absolute."""
-    result = run(node, ["printenv", "HOME"], timeout_s=PROBE_TIMEOUT_S)
+    probe = ["printenv", "HOME"]
+    result = run(node, probe, timeout_s=PROBE_TIMEOUT_S)
     home = result.stdout.decode("utf-8", "replace").strip()
     if not home.startswith("/"):
         raise RemoteError(
             result.returncode,
             f"unusable $HOME on the node: {home!r}",
-            ("printenv", "HOME"),
+            _run_shown(node, probe, None),
         )
     return home
 
@@ -811,7 +812,9 @@ def _deliver(
     result = run_script(
         node, "bring_up", args, timeout_s=BRING_UP_TIMEOUT_S, stdin=payload
     )
-    return _parse_result(result, ("bring_up", *args))
+    # What RAN, as run() itself would name it (the ``sample`` precedent).
+    shown = _run_shown(node, *_script_call("bring_up", args, payload))
+    return _parse_result(result, shown)
 
 
 def bring_up(
