@@ -1631,6 +1631,53 @@ def _refreshed(token: str) -> dict[str, object]:
     }
 
 
+class TestOneStoreHoldsEveryStepsMemory:
+    # settings keeps what it shipped (F9), mcp and mcp_oauth their digests and
+    # per-entry shas (F10): one store, and no writer may drop another's keys.
+
+    SCOPE = replace(
+        _two(), settings={"env": {"X": "x"}, "permissions": {"allow": ["Bash(ls)"]}}
+    )
+
+    def _check(self, box: Box) -> dict[str, object]:
+        store = _json(_store(box))
+        assert set(store) == {"version", "digests", "shipped", "later"}
+        assert store["version"] == 1
+        assert store["later"] == {"k": 1}
+        assert {"settings", "mcp", "mcp_oauth"} <= set(store["digests"])
+        assert set(json.loads(store["digests"]["mcp_oauth"])) == {A, B}
+        record = store["shipped"]["settings"]
+        assert (record["env"], record["allow"]) == (["X"], ["Bash(ls)"])
+        return store
+
+    def test_a_run_where_every_step_writes_keeps_every_key(self, box, tmp_path, capsys):
+        _put(_store(box), {"version": 1, "digests": {}, "later": {"k": 1}})
+        assert box.apply(_work(tmp_path, self.SCOPE)) == 0
+        lines = _lines(capsys)
+        for item in ("settings", "mcp", "mcp_oauth"):
+            assert _status(lines, item) == "did"
+        self._check(box)
+
+    def test_a_run_where_only_mcp_oauth_writes_keeps_every_key(
+        self, box, tmp_path, capsys
+    ):
+        _put(_store(box), {"version": 1, "digests": {}, "later": {"k": 1}})
+        box.apply(_work(tmp_path, self.SCOPE))
+        first = self._check(box)
+        capsys.readouterr()
+        again = replace(self.SCOPE, mcp_oauth=_two(b="PC-B2").mcp_oauth)
+        assert box.apply(_work(tmp_path, again, name="w2")) == 0
+        lines = _lines(capsys)
+        assert [_status(lines, item) for item in ("settings", "mcp", "mcp_oauth")] == [
+            "skip",
+            "skip",
+            "did",
+        ]
+        store = self._check(box)
+        assert store["shipped"] == first["shipped"]
+        assert store["digests"]["settings"] == first["digests"]["settings"]
+
+
 class TestAFailedOAuthStepKeepsItsMemory:
     # I1: the per-entry shas are what keep a node refresh from being undone.
     # A failed step that dropped them would make every entry "new" next time.

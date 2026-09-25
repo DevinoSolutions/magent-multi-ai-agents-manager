@@ -928,10 +928,13 @@ def run(*, work: Path, home: Path, path: str, token: str, force: bool) -> int:
                 if name not in _OWNS_STORE:
                     ctx.store.pop(name, None)
     finally:
+        # Keys this apply does not know (another magent build sharing this
+        # node user wrote them) are carried through, never dropped.
+        kept = stored if isinstance(stored, dict) else {}
         try:
             _write(
                 store_path,
-                {"version": 1, "digests": ctx.store, "shipped": ctx.shipped},
+                {**kept, "version": 1, "digests": ctx.store, "shipped": ctx.shipped},
             )
         except OSError as exc:
             _row(ctx, "fail", "store", f"~/{STORE.as_posix()}: {exc}")
