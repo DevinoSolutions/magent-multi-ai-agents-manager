@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import atexit
 import dataclasses
+import inspect
 import json
+import logging
 import math
 import os
 import re
@@ -272,6 +274,110 @@ class TestRun:
         assert "ghp_FAKETOKEN" not in str(exc.value)
         assert exc.value.command_redacted[-1] == "<stdin: 13 bytes>"
         assert exc.value.command_redacted[0] == "ssh"
+
+
+@pytest.fixture
+def spawned(monkeypatch):
+    """Every Popen remote_mux makes, kept so a test can ask if it is dead.
+    Wraps whatever Popen is in place (conftest's guard included)."""
+    procs: list[subprocess.Popen[bytes]] = []
+    inner = remote_mux.subprocess.Popen
+
+    def _record(*a, **k):
+        proc = inner(*a, **k)
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(remote_mux.subprocess, "Popen", _record)
+    return procs
+
+
+# Small enough that a test's reply is quick to write, big enough to span many
+# pipe reads.
+CAP = 256 * 1024
+
+
+class TestTheReplyIsBoundedInMemory:
+    def test_every_entry_point_defaults_to_the_module_cap(self):
+        for fn in (remote_mux._spawn, remote_mux.run, remote_mux.run_script):
+            param = inspect.signature(fn).parameters["max_stdout_bytes"]
+            assert param.kind is inspect.Parameter.KEYWORD_ONLY, fn.__name__
+            assert param.default == remote_mux.MAX_REPLY_BYTES, fn.__name__
+        assert remote_mux.MAX_REPLY_BYTES == 64 * 1024 * 1024
+
+    def test_a_pull_reply_may_exceed_its_member_total(self):
+        # Header, meta line, tar headers and padding, and the trailer ride on
+        # top of the members' bytes.
+        assert remote_mux.PULL_MAX_REPLY_BYTES > remote_mux.PULL_MAX_TOTAL_BYTES
+
+    def test_a_reply_over_the_cap_is_a_remote_error_and_the_child_dies(
+        self, fake_ssh, spawned, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        fake_ssh.set_reply("big", stdout="x" * (CAP + 1))
+        started = time.monotonic()
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["big"], timeout_s=30, max_stdout_bytes=CAP)
+        assert time.monotonic() - started < 10
+        assert exc.value.rc is None
+        assert exc.value.stderr_tail == f"reply exceeded {CAP} bytes"
+        assert exc.value.command_redacted[0] == "ssh"
+        (proc,) = spawned
+        assert proc.poll() is not None
+        (line,) = [r.getMessage() for r in caplog.records if r.name == "magent.nodes"]
+        assert line.startswith(f"node call reply exceeded {CAP} bytes: ssh ")
+
+    def test_a_quiet_call_over_the_cap_logs_nothing(self, fake_ssh, caplog):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        fake_ssh.set_reply("big", stdout="x" * (CAP + 1))
+        with pytest.raises(RemoteError, match="reply exceeded"):
+            remote_mux.run(
+                NODE, ["big"], timeout_s=30, max_stdout_bytes=CAP, quiet=True
+            )
+        assert [r for r in caplog.records if r.name == "magent.nodes"] == []
+
+    def test_a_reply_exactly_at_the_cap_is_returned_intact(self, fake_ssh):
+        body = "".join(chr(ord("a") + i % 26) for i in range(CAP))
+        fake_ssh.set_reply("exact", stdout=body)
+        result = remote_mux.run(NODE, ["exact"], timeout_s=30, max_stdout_bytes=CAP)
+        assert result.returncode == 0
+        assert result.stdout == body.encode("ascii")
+
+    def test_a_child_that_never_exits_is_cut_off_by_the_cap_not_the_timeout(
+        self, fake_ssh, spawned
+    ):
+        fake_ssh.set_mode("flood")
+        started = time.monotonic()
+        with pytest.raises(RemoteError, match=f"reply exceeded {CAP} bytes") as exc:
+            remote_mux.run(NODE, ["flood"], timeout_s=60, max_stdout_bytes=CAP)
+        assert time.monotonic() - started < 15
+        assert exc.value.rc is None
+        (proc,) = spawned
+        assert proc.poll() is not None
+
+    def test_a_large_stdin_and_a_cap_sized_reply_do_not_deadlock(self, fake_ssh):
+        payload = bytes(range(256)) * (4 * 1024 * 1024 // 256)
+        body = "y" * CAP
+        fake_ssh.set_reply("echo", stdout=body)
+        started = time.monotonic()
+        result = remote_mux.run(
+            NODE,
+            ["echo"],
+            timeout_s=30,
+            input_bytes=payload,
+            max_stdout_bytes=CAP,
+        )
+        assert time.monotonic() - started < 15
+        assert result.stdout == body.encode("ascii")
+        (call,) = fake_ssh.calls()
+        assert call.stdin == payload
+
+    def test_run_script_hands_its_cap_to_run(self, fake_ssh):
+        fake_ssh.set_reply("bash -s", stdout="x" * (CAP + 1))
+        with pytest.raises(RemoteError, match=f"reply exceeded {CAP} bytes"):
+            remote_mux.run_script(
+                NODE, "sample", [], timeout_s=30, max_stdout_bytes=CAP
+            )
 
 
 class TestTheScriptsShip:

@@ -23,23 +23,31 @@ file, a heartbeat thread, and a heartbeat left behind as the crash marker.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from magent import nodes, remote_mux
+from magent.attach_client import SSH_TRANSPORT_RC
 from magent.config import NODE_CLOUD, load_config
+from magent.env import local_username
 from magent.lockfile import LockHeld, exclusive_lock
-from magent.log import clear_heartbeat, get_logger
+from magent.log import clear_heartbeat, get_logger, run_heartbeat, write_heartbeat
 from magent.procs import pid_alive
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Collection, Iterator, Mapping
+    from concurrent.futures import Future
 
     from magent.config import MagentConfig
+    from magent.nodes import LoadSample, Node, NodeMapEntry
 
 # The daemon's ONE name, and the only "node-sync" literal in src/ (DECISION-17,
 # DECISION-26 i; a source test pins that). The heartbeat (log.run_heartbeat /
@@ -63,6 +71,8 @@ UNREACHABLE = "unreachable"  # ssh transport failure (255) or no answer in time
 FAILED = "failed"  # the node answered, and the answer was not a pull
 MISCONFIGURED = "misconfigured"  # the nick does not resolve (D4, no user)
 LOCKED = "locked"  # another pull holds this node right now
+# The UNREACHABLE detail for a node whose pull outlived the tick's wait.
+PULL_STILL_RUNNING = "previous pull still running"
 
 
 def daemon_running() -> bool:
@@ -190,6 +200,17 @@ def tick_interval_s(config: MagentConfig) -> float:
     return float(max(1, min(sync.pull_interval_s, sync.sample_interval_s)))
 
 
+def tick_wait_s(config: MagentConfig) -> float:
+    """How long the daemon's tick waits for its pulls: half a tick interval.
+
+    A pull still running after that is reported UNREACHABLE
+    (``PULL_STILL_RUNNING``) and its node is not dialled again until it ends;
+    every other node keeps its cadence. Two of a healthy node's pulls are then
+    at most 1.5 tick intervals apart, inside ``nodes.sessions_stale``'s two
+    pull intervals (a tick interval is never longer than a pull interval)."""
+    return tick_interval_s(config) / 2
+
+
 # (project, nick, sid) entries state_stores has already warned about.
 _UNPULLABLE_WARNED: set[tuple[str, str, str]] = set()
 
@@ -311,3 +332,455 @@ class ConfigWatch:
                 e,
             )
         return self._config
+
+
+@dataclass(frozen=True)
+class Mark:
+    """One session's ``pull.json`` entry: the node-clock watermark and the real
+    path it was taken for (a different path is a different transcript dir)."""
+
+    since: float
+    realpath: str | None
+
+
+def _read_marks(nick: str) -> dict[str, Mark]:
+    try:
+        raw = json.loads(nodes.pull_marks_path(nick).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Mark] = {}
+    for sid, value in raw.items():
+        if not isinstance(sid, str) or not isinstance(value, dict):
+            continue
+        since, real = value.get("since"), value.get("realpath")
+        if isinstance(since, bool) or not isinstance(since, (int, float)):
+            continue
+        out[sid] = Mark(
+            since=float(since), realpath=real if isinstance(real, str) else None
+        )
+    return out
+
+
+def _spec_for(entry: NodeMapEntry, mark: Mark | None) -> remote_mux.SidPull:
+    real = mark.realpath if mark is not None else None
+    return remote_mux.SidPull(
+        roots=(entry.remote_root,),
+        project_dir=nodes.encoded_project_dir(real) if real else None,
+        since=mark.since if mark is not None else 0.0,
+    )
+
+
+def _write_marks(nick: str, marks: Mapping[str, Mark]) -> None:
+    nodes.write_json_atomic(
+        nodes.pull_marks_path(nick),
+        {
+            sid: {"since": m.since, "realpath": m.realpath}
+            for sid, m in sorted(marks.items())
+        },
+    )
+
+
+def _next_mark(
+    spec: remote_mux.SidPull, old: Mark | None, snap: remote_mux.NodeSnapshot, sid: str
+) -> Mark:
+    """Where this session's next pull starts:
+    - the node did not report it, or one of its files failed to store: stay
+      put (a failed file is asked for again next tick);
+    - its transcripts were never requested under the current real path (a
+      first sight, a moved directory): from zero;
+    - otherwise: from the node's own clock at scan time, minus the overlap."""
+    real = snap.realpaths.get(sid)
+    if real is None or sid in snap.failed_sids:
+        return old if old is not None else Mark(since=0.0, realpath=real)
+    if spec.project_dir is None or old is None or old.realpath != real:
+        return Mark(since=0.0, realpath=real)
+    return Mark(since=snap.now - remote_mux.WATERMARK_OVERLAP_S, realpath=real)
+
+
+def _prune_state(nick: str, sid: str, keep: Collection[str]) -> None:
+    """Drop mirrored records the node no longer has (SessionEnd cleared it)."""
+    folder = nodes.state_dir(nick, sid)
+    try:
+        present = list(folder.glob("*.json"))
+    except OSError:
+        return
+    for path in present:
+        if path.name not in keep:
+            with contextlib.suppress(OSError):
+                path.unlink()
+
+
+def _append_sample(nick: str, sample: LoadSample, *, at: float, history_h: int) -> None:
+    """Append one row (ts on this PC's clock, like every reader's "now") and
+    drop rows older than the history window, in one atomic rewrite."""
+    path = nodes.load_path(nick)
+    cutoff = at - history_h * 3600
+    rows: list[str] = []
+    with contextlib.suppress(OSError, ValueError):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                ts = json.loads(line).get("ts")
+            except (ValueError, AttributeError):
+                continue
+            if (
+                isinstance(ts, (int, float))
+                and not isinstance(ts, bool)
+                and ts >= cutoff
+            ):
+                rows.append(line)
+    rows.append(json.dumps({**asdict(sample), "ts": at}))
+    nodes.write_text_atomic(path, "\n".join(rows) + "\n")
+
+
+def _last_line(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def _classify(e: remote_mux.RemoteError) -> tuple[str, str]:
+    detail = _last_line(e.stderr_tail) or f"rc={e.rc}"
+    if e.rc is None or e.rc == SSH_TRANSPORT_RC:
+        return UNREACHABLE, detail
+    return FAILED, detail
+
+
+def _pull_node(
+    node: Node, sids: Mapping[str, remote_mux.SidPull]
+) -> remote_mux.NodeSnapshot:
+    # PULL_TIMEOUT_S is read at call time so a test can shorten it.
+    return remote_mux.pull_node(node, sids, timeout_s=remote_mux.PULL_TIMEOUT_S)
+
+
+class NodeSyncer:
+    """One tick = one pull per pool node, in parallel. ``pull`` is the seam
+    (default: ``remote_mux.pull_node``); ``now`` is this PC's clock, which
+    stamps ``sessions.json`` and ``load.jsonl``."""
+
+    def __init__(
+        self,
+        config: MagentConfig,
+        *,
+        pull: Callable[
+            [Node, Mapping[str, remote_mux.SidPull]], remote_mux.NodeSnapshot
+        ]
+        | None = None,
+        now: Callable[[], float] = time.time,
+        local_user: str | None = None,
+        lock_wait_s: float = 0.0,
+    ) -> None:
+        self._config = config
+        self._pull = pull if pull is not None else _pull_node
+        self._now = now
+        self._local_user = local_user
+        self._lock_wait_s = lock_wait_s
+        self._warned: set[tuple[str, str]] = set()
+        self._last: dict[str, str] = {}
+        self._last_sample: dict[str, float] = {}
+        # ONE pool for the syncer's life, and at most ONE pull in flight per
+        # node across ticks: a hung node holds one worker, never the tick.
+        self._executor: ThreadPoolExecutor | None = None
+        self._workers = 0
+        self._inflight: dict[str, Future[tuple[str, str]]] = {}
+
+    def reconfigure(self, config: MagentConfig) -> None:
+        self._config = config
+
+    def close(self) -> None:
+        """Stop the pool without waiting: a pull still running ends on its own
+        (bounded by ``remote_mux.PULL_TIMEOUT_S``); queued ones are cancelled."""
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
+        self._inflight.clear()
+
+    def _pool(self, size: int) -> ThreadPoolExecutor:
+        """The pool, rebuilt when a new pool size changes its worker count. The
+        old one is shut down without waiting or cancelling: its running pulls
+        finish and are still collected through ``_inflight``."""
+        workers = min(8, size)
+        if self._executor is None or workers != self._workers:
+            if self._executor is not None:
+                self._executor.shutdown(wait=False)
+            self._executor = ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix=HEARTBEAT_NAME
+            )
+            self._workers = workers
+        return self._executor
+
+    def tick(self, *, wait_s: float | None = None) -> dict[str, tuple[str, str]]:
+        """Pull every pool node once; ``{nick: (outcome, detail)}``. Every
+        node is dialled -- one with no placed session still reports its
+        liveness and load. Nothing a node answers raises out of here.
+
+        ``wait_s`` bounds how long the tick waits for its pulls (None: until
+        each has ended). A node whose pull is still running then reads
+        UNREACHABLE (``PULL_STILL_RUNNING``) and is not dialled again until
+        that pull ends; its result is collected by the first tick after."""
+        by_nick: dict[str, dict[str, NodeMapEntry]] = {}
+        for entry in nodes.read_node_map().values():
+            by_nick.setdefault(entry.nick, {})[entry.sid] = entry
+        user = self._local_user if self._local_user is not None else local_username()
+        # ONE read of the config per tick: a reconfigure mid-tick cannot mix
+        # two pools into one tick's submissions and results.
+        config = self._config
+        pool = sorted(config.settings.nodes)
+        for gone in set(self._inflight) - set(pool):
+            del self._inflight[gone]
+        # A node that left the pool is forgotten, so one re-added while still
+        # down is warned about again rather than read as the old state.
+        for gone in set(self._last) - set(pool):
+            del self._last[gone]
+        if not pool:
+            return {}
+        ex = self._pool(len(pool))
+        for nick in pool:
+            prev = self._inflight.get(nick)
+            if prev is not None and not prev.done():
+                continue
+            if prev is not None and not prev.cancelled():
+                # A laggard that ended between ticks: its outcome is news.
+                self._note(nick, *prev.result())
+            self._inflight[nick] = ex.submit(
+                self._sync_node, nick, by_nick.get(nick, {}), user
+            )
+        wait([self._inflight[nick] for nick in pool], timeout=wait_s)
+        results: dict[str, tuple[str, str]] = {}
+        for nick in pool:
+            future = self._inflight[nick]
+            if not future.done():
+                results[nick] = (UNREACHABLE, PULL_STILL_RUNNING)
+                continue
+            del self._inflight[nick]
+            results[nick] = future.result()
+        for nick, (outcome, detail) in results.items():
+            self._note(nick, outcome, detail)
+        return results
+
+    def _sync_node(
+        self, nick: str, entries: Mapping[str, NodeMapEntry], local_user: str
+    ) -> tuple[str, str]:
+        """One node's pull, reduced to an outcome. Every failure a node (or its
+        config) can produce stops here; anything else is a bug and propagates."""
+        try:
+            node = nodes.node_for_nick(self._config, nick, local_user=local_user)
+            with node_lock(nick, wait_s=self._lock_wait_s):
+                self._pull_and_store(node, entries)
+        except nodes.NodeConfigError as e:
+            return MISCONFIGURED, str(e)
+        except LockHeld:
+            return LOCKED, "another pull holds this node"
+        except remote_mux.RemoteError as e:
+            return _classify(e)
+        except OSError as e:
+            return FAILED, str(e)
+        return OK, ""
+
+    def _note(self, nick: str, outcome: str, detail: str) -> None:
+        """One log line per state CHANGE: a node down for a day is one warning
+        and one "reachable again", not 2,880 lines. A locked tick is no state
+        (the other pull is doing the work) and is never logged."""
+        if outcome == LOCKED:
+            return
+        prev = self._last.get(nick)
+        self._last[nick] = outcome
+        if outcome == prev:
+            return
+        log = get_logger(LOG_NAME)
+        if outcome == OK:
+            if prev is not None:
+                log.info("node %s: reachable again", nick)
+            return
+        log.warning("node %s: %s (%s)", nick, outcome, detail)
+
+    def _warn_once(self, nick: str, sid: str) -> None:
+        if (nick, sid) in self._warned:
+            return
+        self._warned.add((nick, sid))
+        get_logger(LOG_NAME).warning(
+            "node %s: session %r cannot be mirrored on this PC; skipping it", nick, sid
+        )
+
+    def _pull_and_store(self, node: Node, entries: Mapping[str, NodeMapEntry]) -> None:
+        marks = _read_marks(node.nick)
+        specs: dict[str, remote_mux.SidPull] = {}
+        for sid, entry in sorted(entries.items()):
+            if not remote_mux.pullable_sid(sid) or not entry.remote_root:
+                self._warn_once(node.nick, sid)
+                continue
+            specs[sid] = _spec_for(entry, marks.get(sid))
+        snap = self._pull(node, specs)
+        self._store(node.nick, specs, marks, snap, at=self._now())
+
+    def _store(
+        self,
+        nick: str,
+        specs: Mapping[str, remote_mux.SidPull],
+        marks: Mapping[str, Mark],
+        snap: remote_mux.NodeSnapshot,
+        *,
+        at: float,
+    ) -> None:
+        """Everything a successful pull leaves behind. ``sessions.json`` first:
+        it is the liveness readers look at."""
+        nodes.write_json_atomic(
+            nodes.sessions_path(nick), {"ts": at, "sessions": list(snap.sessions)}
+        )
+        new_marks: dict[str, Mark] = {}
+        for sid, spec in specs.items():
+            new_marks[sid] = _next_mark(spec, marks.get(sid), snap, sid)
+            if sid in snap.state_files and sid not in snap.failed_sids:
+                _prune_state(nick, sid, snap.state_files[sid])
+        _write_marks(nick, new_marks)
+        sync = self._config.settings.node_sync
+        last = self._last_sample.get(nick)
+        if snap.sample is not None and (
+            last is None or at - last >= sync.sample_interval_s
+        ):
+            _append_sample(nick, snap.sample, at=at, history_h=sync.history_h)
+            self._last_sample[nick] = at
+
+
+def run_once(
+    config: MagentConfig,
+    *,
+    pull: Callable[[Node, Mapping[str, remote_mux.SidPull]], remote_mux.NodeSnapshot]
+    | None = None,
+) -> dict[str, tuple[str, str]]:
+    """One tick under the daemon's lock (``magent node sync --once``). LockHeld
+    when the daemon is running -- its own next tick is the answer. The tick
+    waits for every pull: a one-shot has no next tick to collect a laggard."""
+    with exclusive_lock(LOCK_NAME):
+        syncer = NodeSyncer(config, pull=pull)
+        try:
+            return syncer.tick()
+        finally:
+            syncer.close()
+
+
+def run_sync_loop(
+    config: MagentConfig,
+    *,
+    max_ticks: int | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    reload: Callable[[], MagentConfig | None] | None = None,
+    pull: Callable[[Node, Mapping[str, remote_mux.SidPull]], remote_mux.NodeSnapshot]
+    | None = None,
+) -> int:
+    """The daemon body (``magent node sync``, detached by serve). Returns 0.
+
+    - Another daemon holding ``node-sync``: exit quietly.
+    - Otherwise: pid file + heartbeat thread, then tick every
+      ``tick_interval_s``, re-reading the config through ``reload`` (None
+      keeps the current one) until no project runs on a node. Each tick waits
+      at most ``tick_wait_s`` for its pulls, so one hung node never holds the
+      others back.
+    - A clean exit (or Ctrl+C) clears the heartbeat; a crash is logged at
+      exception level and leaves the heartbeat as its marker, as
+      ``attention -d`` does. Either way the pull pool is shut down without
+      joining a pull that is still running."""
+    log = get_logger(LOG_NAME)
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(exclusive_lock(LOCK_NAME))
+        except LockHeld:
+            log.info("node sync: another daemon holds the lock; exiting")
+            return 0
+        _write_pid()
+        write_heartbeat(HEARTBEAT_NAME)
+        stop_hb = threading.Event()
+        hb_thread = threading.Thread(
+            target=run_heartbeat, args=(HEARTBEAT_NAME, stop_hb), daemon=True
+        )
+        hb_thread.start()
+        syncer = NodeSyncer(config, pull=pull)
+        ticks = 0
+        clean = False
+        log.info("node sync: starting (%d node(s))", len(config.settings.nodes))
+        try:
+            while wanted(config):
+                syncer.tick(wait_s=tick_wait_s(config))
+                ticks += 1
+                if max_ticks is not None and ticks >= max_ticks:
+                    break
+                sleep(tick_interval_s(config))
+                if reload is not None:
+                    fresh = reload()
+                    if fresh is not None:
+                        config = fresh
+                        syncer.reconfigure(config)
+            clean = True
+        except KeyboardInterrupt:
+            clean = True
+        except Exception:
+            log.exception("node sync daemon crashed")
+            raise
+        finally:
+            syncer.close()
+            # Join before touching the file, so no late pulse re-creates it.
+            stop_hb.set()
+            hb_thread.join(timeout=5)
+            if clean:
+                clear_heartbeat(HEARTBEAT_NAME)
+            _clear_pid()
+        log.info("node sync: stopped after %d tick(s)", ticks)
+    return 0
+
+
+def _pull_sid(
+    node: Node, entry: NodeMapEntry, mark: Mark | None
+) -> tuple[Mark, list[Path], bool]:
+    """One pull of one session: its next mark, the files that landed, and
+    whether a second pull is needed because the transcript dir only became
+    known with this answer."""
+    spec = _spec_for(entry, mark)
+    snap = _pull_node(node, {entry.sid: spec})
+    new = _next_mark(spec, mark, snap, entry.sid)
+    if entry.sid in snap.state_files and entry.sid not in snap.failed_sids:
+        _prune_state(node.nick, entry.sid, snap.state_files[entry.sid])
+    again = new.realpath is not None and spec.project_dir != nodes.encoded_project_dir(
+        new.realpath
+    )
+    return new, list(snap.files), again
+
+
+def final_pull(
+    config: MagentConfig,
+    name: str,
+    *,
+    wait_s: float = remote_mux.PULL_TIMEOUT_S,
+    local_user: str | None = None,
+) -> remote_mux.PullResult | None:
+    """Pull project ``name``'s node session once more -- ``down`` calls this
+    before it kills the session, so the last turn is home. None when the
+    project was never placed. Waits up to ``wait_s`` for a daemon tick that
+    holds the node, then raises LockHeld; NodeConfigError and RemoteError
+    also go to the caller, which decides what "could not pull" means.
+
+    An entry the daemon's tick would skip (a sid this PC cannot store, an
+    empty remote root) is refused as RemoteError(0) before any ssh, so the
+    caller never sees parse_pull's ValueError."""
+    entry = nodes.read_node_map().get(name)
+    if entry is None:
+        return None
+    user = local_user if local_user is not None else local_username()
+    node = nodes.node_for_nick(config, entry.nick, local_user=user)
+    refusal = None
+    if not remote_mux.pullable_sid(entry.sid):
+        refusal = f"not a pullable session name: {entry.sid!r}"
+    elif not entry.remote_root:
+        refusal = f"session {entry.sid!r} has an empty remote_root in the node map"
+    if refusal is not None:
+        raise remote_mux.refused_pull(
+            node, {entry.sid: _spec_for(entry, None)}, refusal
+        )
+    with node_lock(entry.nick, wait_s=wait_s):
+        marks = _read_marks(entry.nick)
+        mark, files, again = _pull_sid(node, entry, marks.get(entry.sid))
+        if again:
+            mark, more, _ = _pull_sid(node, entry, mark)
+            files += more
+        marks[entry.sid] = mark
+        _write_marks(entry.nick, marks)
+    return remote_mux.PullResult(files=tuple(files), since=mark.since)
