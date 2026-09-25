@@ -9,6 +9,7 @@ import pytest
 
 from magent.config import (
     SCHEMA_VERSION,
+    ConfigError,
     NodeConfig,
     NodeSyncConfig,
     Settings,
@@ -176,3 +177,87 @@ class TestNodeProjectsParse:
         assert proj.push == ["a"]
         assert _parse_project({"path": "api", "push": ".env"}).push is None
         assert _parse_project({"path": "api", "push": []}).push is None
+
+
+class TestThePoolIsValidated:
+    def test_a_nick_longer_than_six_is_refused(self, tmp_config):
+        with pytest.raises(ConfigError, match=r"settings\.nodes\.seventh: .*1-6"):
+            load_config(_cfg(tmp_config, nodes={"seventh": {"host": "h"}}))
+
+    def test_a_non_ascii_nick_is_refused(self, tmp_config):
+        with pytest.raises(ConfigError, match="1-6 characters"):
+            load_config(_cfg(tmp_config, nodes={"sé": {"host": "h"}}))
+
+    @pytest.mark.parametrize("nick", ["Second", "a_b", "a.b", ""])
+    def test_a_nick_outside_the_charset_is_refused(self, tmp_config, nick):
+        with pytest.raises(ConfigError, match="1-6 characters"):
+            load_config(_cfg(tmp_config, nodes={nick: {"host": "h"}}))
+
+    def test_a_six_character_nick_is_accepted(self, tmp_config):
+        cfg = load_config(_cfg(tmp_config, nodes={"fifth-": {"host": "h"}}))
+        assert "fifth-" in cfg.settings.nodes
+
+    def test_auto_is_reserved(self, tmp_config):
+        with pytest.raises(ConfigError, match="'auto' is reserved"):
+            load_config(_cfg(tmp_config, nodes={"auto": {"host": "h"}}))
+
+    def test_cloud_is_reserved(self, tmp_config):
+        # The built-in cloud backend (DECISION-8) owns the nick; a pool entry
+        # of that name would silently shadow it.
+        with pytest.raises(ConfigError, match="'cloud' is reserved"):
+            load_config(_cfg(tmp_config, nodes={"cloud": {"host": "h"}}))
+
+    def test_a_node_without_a_host_is_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError, match=r"settings\.nodes\.second must have a 'host' field"
+        ):
+            load_config(_cfg(tmp_config, nodes={"second": {"user": "amin"}}))
+
+    def test_a_non_string_host_is_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError, match=r"settings\.nodes\.second\.host must be a string"
+        ):
+            load_config(_cfg(tmp_config, nodes={"second": {"host": 22}}))
+
+    def test_a_node_that_is_not_an_object_is_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError, match=r"settings\.nodes\.second must be an object"
+        ):
+            load_config(_cfg(tmp_config, nodes={"second": "devino-second"}))
+
+    def test_a_nodes_block_that_is_not_an_object_is_refused(self, tmp_config):
+        with pytest.raises(ConfigError, match=r"settings\.nodes must be an object"):
+            load_config(_cfg(tmp_config, nodes=["second"]))
+
+    def test_running_as_root_loads_but_warns(self, tmp_config, capsys):
+        cfg = load_config(
+            _cfg(tmp_config, nodes={"second": {"host": "h", "user": "root"}})
+        )
+        assert cfg.settings.nodes["second"].user == "root"
+        assert "nodes.second: running sessions as root; prefer a per-person user" in (
+            capsys.readouterr().err
+        )
+
+    def test_an_unknown_key_under_a_node_warns(self, tmp_config, capsys):
+        load_config(_cfg(tmp_config, nodes={"second": {"host": "h", "port": 22}}))
+        assert "unknown config key: settings.nodes.second.port" in (
+            capsys.readouterr().err
+        )
+
+    def test_an_unknown_sync_key_warns(self, tmp_config, capsys):
+        load_config(_cfg(tmp_config, node_sync={"pushIntervalS": 5}))
+        assert "unknown config key: settings.nodeSync.pushIntervalS" in (
+            capsys.readouterr().err
+        )
+
+    def test_a_non_integer_sync_timing_is_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError, match=r"settings\.nodeSync\.historyH must be an integer"
+        ):
+            load_config(_cfg(tmp_config, node_sync={"historyH": "24"}))
+
+    def test_a_sync_timing_below_one_is_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError, match=r"settings\.nodeSync\.pullIntervalS must be at least 1"
+        ):
+            load_config(_cfg(tmp_config, node_sync={"pullIntervalS": 0}))
