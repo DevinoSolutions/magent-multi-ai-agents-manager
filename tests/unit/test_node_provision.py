@@ -1898,6 +1898,45 @@ class TestDoctorShUnderRealBash:
         (row,) = [line for line in report.lines if line.item == "github-key"]
         assert row.status == "fail"
         assert "Permission denied (publickey)." in row.detail
+        # A refused key is the one github-key failure setup repairs.
+        assert row.detail.endswith("-- run: magent node setup")
+
+    def test_a_github_transport_failure_quotes_ssh_and_blames_no_key(self, tmp_path):
+        # DNS, a firewall, a reset: the key was never tried, so neither the
+        # "refused" wording nor the setup hint may appear.
+        last = "ssh: Could not resolve hostname github.com: Temporary failure in name resolution"
+        _, env = _doctor_box(tmp_path, github=last)
+        (row,) = [
+            ln for ln in _report(_run_doctor(env)).lines if ln.item == "github-key"
+        ]
+        assert row.status == "fail"
+        assert last in row.detail
+        assert "refused" not in row.detail
+        assert "magent node setup" not in row.detail
+
+    def test_a_node_without_ssh_says_so(self, tmp_path):
+        tools = tuple(t for t in NODE_TOOLS if t != "ssh")
+        _, env = _doctor_box(tmp_path, tools=tools)
+        (row,) = [
+            ln for ln in _report(_run_doctor(env)).lines if ln.item == "github-key"
+        ]
+        assert row.status == "fail"
+        assert row.detail == "ssh is not on PATH -- install openssh-client on this node"
+
+    def test_only_a_leading_tilde_slash_means_home(self, tmp_path):
+        # `~bob/x` is not this user's home: it is never pasted onto $HOME
+        # (which made it <home>bob/x). Nothing by that name exists here, so
+        # it is measured at its nearest existing parent, `.`.
+        fakes, env = _doctor_box(tmp_path)
+        _run_doctor(env, root="~bob/x")
+        (call,) = fakes["df"].calls()
+        assert call.argv == ["-Pk", "."]
+
+    def test_a_bare_tilde_is_home(self, tmp_path):
+        fakes, env = _doctor_box(tmp_path)
+        _run_doctor(env, root="~")
+        (call,) = fakes["df"].calls()
+        assert call.argv == ["-Pk", str(tmp_path / "node")]
 
     @pytest.mark.parametrize(
         ("avail_kb", "status"),

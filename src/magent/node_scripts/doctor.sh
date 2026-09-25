@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# magent node doctor: read-only health rows for this node user.
+# magent node doctor: health rows for this node user, read-only apart from
+# known_hosts TOFU (check_github_key).
 # Fed over stdin by remote_mux.doctor
 # (`bash -s -- <socket> --root R --target T`); reads no payload. lib.sh takes
 # the socket (required, no default) into MAGENT_SOCKET.
@@ -77,16 +78,28 @@ check_claude_login() {
 }
 
 check_github_key() {
-  local out rc
+  local out rc last
+  if ! command -v ssh >/dev/null 2>&1; then
+    say fail github-key "ssh is not on PATH -- install openssh-client on this node"
+    return
+  fi
+  # Deliberate TOFU, the one write this doctor makes: accept-new records
+  # github.com's host key in ~/.ssh/known_hosts on first contact, exactly as
+  # the node's first git clone would. A CHANGED key is still refused.
   out=$(bounded "$GITHUB_PROBE_S" ssh -T -o BatchMode=yes -o ConnectTimeout=10 \
     -o StrictHostKeyChecking=accept-new git@github.com 2>&1)
   rc=$?
+  last=${out##*$'\n'}
   if timed_out "$rc"; then
     say fail github-key "ssh to github.com timed out after ${GITHUB_PROBE_S}s"
   elif [[ $out =~ Hi\ ([^!]+)! ]]; then
     say ok github-key "authenticates as ${BASH_REMATCH[1]}"
+  elif [[ $out == *"Permission denied (publickey)"* ]]; then
+    # The one failure setup repairs: it registers this user's key.
+    say fail github-key "GitHub refused this node's key ($last) -- run: magent node setup"
   else
-    say fail github-key "GitHub refused this node's key (${out##*$'\n'}) -- run: magent node setup"
+    # The key was never tried (DNS, a firewall, a reset): no key to blame.
+    say fail github-key "could not reach GitHub over ssh (${last:-no output})"
   fi
 }
 
@@ -102,7 +115,12 @@ check_locale() {
 
 check_disk() {
   local root=$1 dir out rc avail
-  dir=${root/#\~/$HOME}
+  # Only `~` and `~/...` are this user's home; `~bob/x` is not pasted onto it.
+  case $root in
+    \~) dir=$HOME ;;
+    \~/*) dir=$HOME/${root#\~/} ;;
+    *) dir=$root ;;
+  esac
   while [ ! -d "$dir" ] && [ "$dir" != / ] && [ "$dir" != . ]; do
     dir=$(dirname "$dir")
   done
