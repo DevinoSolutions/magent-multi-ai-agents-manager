@@ -89,9 +89,8 @@ def _row(ctx: Ctx, status: str, item: str, detail: str = "") -> None:
     """One status<TAB>item<TAB>detail line; the detail is flattened onto it,
     and the gh token is masked out of it -- the backstop. The row itself is
     never cut, so a repair hint after a tool's output always survives: only
-    the tool's fragment is cut, by ``_last``, and a caller that hands
-    ``_last`` output which may hold the token masks it FIRST (``_step_gh``),
-    so no cut can split the token before the mask sees it."""
+    the tool's fragment is cut, by ``_last``, which masks the token itself
+    before it cuts -- so no cut can split the token before a mask sees it."""
     if ctx.token:
         detail = detail.replace(ctx.token, _MASK)
     ctx.rows.append(status)
@@ -320,11 +319,19 @@ def _tool(
     )
 
 
-def _last(text: str) -> str:
+def _last(ctx: Ctx, text: str) -> str:
     """A tool's last output line, cut to 200 characters -- the tool's fragment
-    of a row, never the row. Output that may hold the gh token must be masked
-    BEFORE it comes here, or the cut could leave a prefix ``_row`` can't
-    recognize."""
+    of a row, never the row.
+
+    The gh token is masked out of ``text`` FIRST, whatever tool wrote it: once
+    ``gh auth setup-git`` has run, gh is git's credential helper, so any git
+    child a later step starts (``claude plugin marketplace add`` cloning a
+    private repo) can hold the token too. Masking before the cut means a
+    token straddling char 200 can never leave a prefix ``_row``'s backstop
+    would not recognize. An empty token masks nothing (``str.replace`` with
+    an empty needle would insert the mask between every character)."""
+    if ctx.token:
+        text = text.replace(ctx.token, _MASK)
     lines = text.strip().splitlines()
     return lines[-1][:200] if lines else "no output"
 
@@ -510,15 +517,12 @@ def _step_gh(ctx: Ctx) -> None:
         ctx.token + "\n",
         env=env,
     )
-    # gh is the only child ever given the token: its output is masked before
-    # _last cuts it.
     if done.returncode != 0:
         _row(
             ctx,
             "fail",
             "gh",
-            "gh auth login refused the token: "
-            f"{_last(done.stderr.replace(ctx.token, _MASK))}",
+            f"gh auth login refused the token: {_last(ctx, done.stderr)}",
         )
     else:
         helper = _tool([gh, "auth", "setup-git"], env=env)
@@ -528,7 +532,7 @@ def _step_gh(ctx: Ctx) -> None:
                 "warn",
                 "gh",
                 f"logged in as {login}, but gh auth setup-git failed: "
-                f"{_last(helper.stderr.replace(ctx.token, _MASK))}",
+                f"{_last(ctx, helper.stderr)}",
             )
         else:
             _row(ctx, "did", "gh", f"logged in as {login}")

@@ -106,6 +106,18 @@ def _json(path: Path) -> object:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _ctx(tmp_path: Path, token: str) -> node_apply.Ctx:
+    """A bare Ctx, for calling a helper directly."""
+    return node_apply.Ctx(
+        work=tmp_path, home=tmp_path, path="", token=token, force=False, manifest={}
+    )
+
+
+def _no_token_prefix(text: str) -> bool:
+    """No prefix of TOKEN in ``text``, down to its 4-char "gho_" type tag."""
+    return not any(TOKEN[:n] in text for n in range(4, len(TOKEN) + 1))
+
+
 class TestTheApplierIsShippable:
     def test_it_parses_as_python_3_8(self):
         ast.parse(node_scripts.source("node_apply.py"), feature_version=(3, 8))
@@ -340,33 +352,56 @@ class TestNothingLeaksAndEveryModeIsExplicit:
         (line,) = [
             line for line in remote_mux.parse_report(out).lines if line.item == "gh"
         ]
-        # No prefix of the token, down to its 4-char "gho_" type tag.
-        assert not any(TOKEN[:n] in line.detail for n in range(4, len(TOKEN) + 1))
+        assert _no_token_prefix(line.detail)
+
+    def test_a_token_straddling_the_cut_in_setup_git_output_is_masked_whole(
+        self, box, tmp_path, capsys
+    ):
+        # The login went through; `gh auth setup-git` then fails and echoes
+        # the token across _last's cut. Its row is a warn, masked the same.
+        gh = box.add("gh")
+        prefix = "x" * (200 - len(TOKEN) // 2)
+        gh.set_reply("auth setup-git", stderr=f"{prefix}{TOKEN}\n", rc=1)
+        assert box.apply(_work(tmp_path, login="amin"), token=TOKEN) == 0
+        out = capsys.readouterr().out
+        assert TOKEN[:12] not in out
+        (line,) = [
+            line for line in remote_mux.parse_report(out).lines if line.item == "gh"
+        ]
+        assert line.status == "warn"
+        assert "setup-git failed" in line.detail
+        assert _no_token_prefix(line.detail)
+
+    def test_last_masks_before_it_cuts_whatever_tool_wrote_it(self, tmp_path):
+        # Any child may echo the token once gh is git's credential helper, so
+        # _last itself masks -- it is not a convention each caller remembers.
+        lead = "x" * (200 - len(TOKEN) // 2)
+        fragment = node_apply._last(
+            _ctx(tmp_path, TOKEN), "first line\n" + lead + TOKEN + "\n"
+        )
+        assert _no_token_prefix(fragment)
+        assert fragment == lead + "[gh-token]"
+        # An empty token masks nothing: no mask between the characters.
+        plain = "a" * 150 + " done"
+        assert node_apply._last(_ctx(tmp_path, ""), plain + "\n") == plain
 
     def test_a_long_tool_output_never_cuts_the_repair_hint_after_it(
         self, tmp_path, capsys
     ):
         # Later steps print `<what failed> (<tool output>); run on the node:
         # <repair>`: only the tool's fragment is cut (by _last), never the row.
-        ctx = node_apply.Ctx(
-            work=tmp_path,
-            home=tmp_path,
-            path="",
-            token=TOKEN,
-            force=False,
-            manifest={},
-        )
+        ctx = _ctx(tmp_path, TOKEN)
         stderr = "error: " + "y" * 400 + "\n"
         hint = "run on the node: claude plugin install demo@market"
         node_apply._row(
             ctx,
             "fail",
             "plugin",
-            f"install refused ({node_apply._last(stderr)}); {hint}",
+            f"install refused ({node_apply._last(ctx, stderr)}); {hint}",
         )
         (line,) = _lines(capsys)
         assert line.detail.endswith(hint)
-        assert len(node_apply._last(stderr)) == 200
+        assert len(node_apply._last(ctx, stderr)) == 200
 
 
 class TestEveryWriteIsAtomicAndLeavesNoTemp:
