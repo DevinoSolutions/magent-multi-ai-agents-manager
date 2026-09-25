@@ -553,7 +553,9 @@ class TestTheMcpServers:
         box.apply(_work(tmp_path, replace(EMPTY, mcp_servers={"chrome": RELAY})))
         assert _claude_json(box).stat().st_mode & 0o777 == 0o600
         assert _json(_claude_json(box))["mcpServers"]["chrome"] == RELAY
-        assert not list(box.home.glob(".claude.json.magent-tmp*"))
+        # Every temp name _install has used ends ".magent-tmp" (F8's mkstemp
+        # name is "..claude.json.<rand>.magent-tmp"), so match on the suffix.
+        assert not list(box.home.glob("*.magent-tmp"))
 
 
 def _oauth(access: str = "PC-TOKEN") -> dict[str, object]:
