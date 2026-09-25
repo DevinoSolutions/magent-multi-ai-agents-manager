@@ -472,15 +472,17 @@ def _attach_markers(sid: str, mux: str = "psmux") -> tuple[str, ...]:
     into a corpse. They also cover the supervisor argv on any platform whose
     process table re-quotes arguments.
 
-    A node pane (``mux="tmux"``) attaches on ONE shared socket, so the sid moves
-    from the socket slot to the ``-t`` slot, in tmux's exact-match form:
+    A node pane (``mux="tmux"``) attaches on ONE shared socket, so the sid
+    moves from the socket slot to the ``-t`` slot, in tmux's exact-match form:
     ``-L magent attach -t =<sid>``, quoted the same three ways. magent spawns
     the single-quoted one (``-t '=<sid>'``, see ``remote_attach_command``), and
     its closing quote ends the name, so ``api``'s marker is NOT found inside a
     live ``api2`` pane's command line. Only the bare variant could overlap that
     way (``-t =api`` inside ``-t =api2``), and an overlap can only ever make a
     dead window look ALIVE (left open), never the reverse: the conservative
-    direction ``_corpses`` is built around.
+    direction ``_corpses`` is built around. One cross-multiplexer overlap
+    exists too -- the psmux marker for a sid named ``magent`` is a prefix of
+    every tmux marker -- and it points the same conservative way.
     """
     if mux == "psmux":
         return (

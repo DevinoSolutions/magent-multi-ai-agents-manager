@@ -70,15 +70,17 @@ decides a pane is dead by scanning live process command lines for
 ``-L <sid> attach`` (``_attach_markers``) among ``_CLIENT_PROCESS_NAMES``.
 For a node pane the marker is the tmux spelling instead,
 ``-L magent attach -t '=<sid>'`` (``_attach_markers(sid, "tmux")``); each
-multiplexer's marker matches its own ``remote_attach_command`` and nothing
-else. During a backoff sleep there is no ssh process at all, so this
-supervisor is what has to carry the marker -- and it does, for free, because
-``_spawn_windows`` hands us the remote command it would otherwise have given
-ssh, as our own ``--remote`` argument. The marker therefore appears verbatim in
-this process's command line. Do NOT "simplify" that by rebuilding the remote
-command from ``--session`` and dropping the argument: the pane would read as a
-corpse the moment it started backing off, and the next ``magent attach`` would
-close a window that was busy healing itself.
+multiplexer's marker matches its own ``remote_attach_command`` and no other
+session's command, with one conservative exception: a psmux session named
+``magent`` shares its marker's text with the node socket, so a live node pane
+keeps it looking alive. During a backoff sleep there is no ssh process at all,
+so this supervisor is what has to carry the marker -- and it does, for free,
+because ``_spawn_windows`` hands us the remote command it would otherwise have
+given ssh, as our own ``--remote`` argument. The marker therefore appears
+verbatim in this process's command line. Do NOT "simplify" that by rebuilding
+the remote command from ``--session`` and dropping the argument: the pane would
+read as a corpse the moment it started backing off, and the next
+``magent attach`` would close a window that was busy healing itself.
 """
 
 from __future__ import annotations
