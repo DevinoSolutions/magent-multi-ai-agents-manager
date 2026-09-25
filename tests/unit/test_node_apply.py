@@ -1776,3 +1776,21 @@ class TestASymlinkedMcpFileIsWrittenThroughItsLink:
         assert str(gone) in line.detail
         assert link.is_symlink()
         assert not gone.exists()
+
+    def test_a_dangling_claude_json_is_named_by_mcp_oauth_too(
+        self, box, tmp_path, capsys
+    ):
+        # Read as "no file", it would print a misleading "no MCP OAuth entry
+        # for a server this node has".
+        gone = tmp_path / "dotfiles" / ".claude.json"
+        _claude_json(box).symlink_to(gone)
+        box.apply(_work(tmp_path, _two()))
+        (line,) = [line for line in _lines(capsys) if line.item == "mcp_oauth"]
+        assert (line.status, line.detail) == (
+            "warn",
+            (
+                f"~/.claude.json is a dangling link to {gone}; left alone, "
+                "fix or remove it"
+            ),
+        )
+        assert not _credentials(box).exists()

@@ -733,7 +733,14 @@ def _step_mcp_oauth(ctx: Ctx) -> None:
     writes mid-apply is kept."""
     loaded = _load(ctx.work / "mcp_oauth.json")
     entries = loaded if isinstance(loaded, dict) else {}
-    claude_json = _load(ctx.home / ".claude.json")
+    # A dangling link reads as "no file": named instead, never read as a
+    # node with no servers.
+    listed = _target(
+        ctx, "mcp_oauth", ctx.home / ".claude.json", "~/.claude.json", "warn"
+    )
+    if listed is None:
+        return
+    claude_json = _load(listed)
     if not isinstance(claude_json, dict):
         _row(
             ctx,
