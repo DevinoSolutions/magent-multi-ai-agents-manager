@@ -543,7 +543,7 @@ class NodeSyncer:
                 # A laggard that ended between ticks: its outcome is news.
                 self._note(nick, *prev.result())
             self._inflight[nick] = ex.submit(
-                self._sync_node, nick, by_nick.get(nick, {}), user
+                self._sync_node, nick, by_nick.get(nick, {}), user, config
             )
         wait([self._inflight[nick] for nick in pool], timeout=wait_s)
         results: dict[str, tuple[str, str]] = {}
@@ -559,14 +559,21 @@ class NodeSyncer:
         return results
 
     def _sync_node(
-        self, nick: str, entries: Mapping[str, NodeMapEntry], local_user: str
+        self,
+        nick: str,
+        entries: Mapping[str, NodeMapEntry],
+        local_user: str,
+        config: MagentConfig,
     ) -> tuple[str, str]:
         """One node's pull, reduced to an outcome. Every failure a node (or its
-        config) can produce stops here; anything else is a bug and propagates."""
+        config) can produce stops here; anything else is a bug and propagates.
+
+        ``config`` is the one its tick read: a worker never reads
+        ``self._config``, so a reconfigure while a pull runs cannot reach it."""
         try:
-            node = nodes.node_for_nick(self._config, nick, local_user=local_user)
+            node = nodes.node_for_nick(config, nick, local_user=local_user)
             with node_lock(nick, wait_s=self._lock_wait_s):
-                self._pull_and_store(node, entries)
+                self._pull_and_store(node, entries, config)
         except nodes.NodeConfigError as e:
             return MISCONFIGURED, str(e)
         except LockHeld:
@@ -602,7 +609,9 @@ class NodeSyncer:
             "node %s: session %r cannot be mirrored on this PC; skipping it", nick, sid
         )
 
-    def _pull_and_store(self, node: Node, entries: Mapping[str, NodeMapEntry]) -> None:
+    def _pull_and_store(
+        self, node: Node, entries: Mapping[str, NodeMapEntry], config: MagentConfig
+    ) -> None:
         marks = _read_marks(node.nick)
         specs: dict[str, remote_mux.SidPull] = {}
         for sid, entry in sorted(entries.items()):
@@ -611,7 +620,7 @@ class NodeSyncer:
                 continue
             specs[sid] = _spec_for(entry, marks.get(sid))
         snap = self._pull(node, specs)
-        self._store(node.nick, specs, marks, snap, at=self._now())
+        self._store(node.nick, specs, marks, snap, at=self._now(), config=config)
 
     def _store(
         self,
@@ -621,6 +630,7 @@ class NodeSyncer:
         snap: remote_mux.NodeSnapshot,
         *,
         at: float,
+        config: MagentConfig,
     ) -> None:
         """Everything a successful pull leaves behind. ``sessions.json`` first:
         it is the liveness readers look at."""
@@ -633,7 +643,7 @@ class NodeSyncer:
             if sid in snap.state_files and sid not in snap.failed_sids:
                 _prune_state(nick, sid, snap.state_files[sid])
         _write_marks(nick, new_marks)
-        sync = self._config.settings.node_sync
+        sync = config.settings.node_sync
         last = self._last_sample.get(nick)
         if snap.sample is not None and (
             last is None or at - last >= sync.sample_interval_s

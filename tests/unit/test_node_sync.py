@@ -1399,6 +1399,69 @@ class TestAHungNodeDoesNotHoldTheTick:
             if "reachable again" in r.getMessage()
         ] == ["node second: reachable again"]
 
+    def test_a_laggard_stores_under_the_config_its_tick_started_with(
+        self, placed, executors
+    ):
+        """A reconfigure while a pull is running must not reach that pull: it
+        was dialled under the old pool and is stored under the old settings
+        (here the history window, which decides what load.jsonl keeps)."""
+        entered = threading.Event()
+        release = threading.Event()
+        hosts: list[str] = []
+
+        def pull(node, _sids):
+            hosts.append(node.host)
+            if node.nick == "second":
+                entered.set()
+                assert release.wait(30), "the test never released the hung pull"
+            return _snapshot(sample=nodes.LoadSample(**SAMPLE))
+
+        old_row = json.dumps({**SAMPLE, "ts": 1000.0 - 2 * 3600})
+        nodes.write_text_atomic(nodes.load_path("second"), old_row + "\n")
+        moved = {"second": NodeConfig(nick="second", host="devino-moved", user="amin")}
+        syncer = node_sync.NodeSyncer(
+            _config(history_h=24), pull=pull, now=lambda: 1000.0
+        )
+        try:
+            syncer.tick(wait_s=0.2)
+            assert entered.wait(10)
+            syncer.reconfigure(_config(pool=moved, history_h=1))
+        finally:
+            release.set()
+            _drain(executors)
+        rows = [
+            json.loads(x)["ts"]
+            for x in nodes.load_path("second").read_text(encoding="utf-8").splitlines()
+        ]
+        assert "devino-moved" not in hosts
+        assert rows == [1000.0 - 2 * 3600, 1000.0]  # the old 24 h window kept it
+
+    def test_a_laggard_that_raises_surfaces_on_the_next_tick(self, placed, executors):
+        """A pull that raises after its tick stopped waiting is re-raised by
+        the tick that collects it -- the loop then crashes, as for any
+        escaping exception. Today's behaviour, pinned anyway: once E11's
+        catch-all in _sync_node lands, a raising PULL becomes a FAILED
+        outcome, and only an error outside _sync_node takes this path."""
+        release = threading.Event()
+
+        def pull(node, _sids):
+            if node.nick == "second":
+                assert release.wait(30), "the test never released the hung pull"
+                raise ValueError("late")
+            return _snapshot()
+
+        syncer = node_sync.NodeSyncer(_config(), pull=pull)
+        try:
+            first = syncer.tick(wait_s=0.2)
+            release.set()
+            with pytest.raises(ValueError, match="late"):
+                syncer.tick(wait_s=10)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+        assert first["second"] == (node_sync.UNREACHABLE, node_sync.PULL_STILL_RUNNING)
+
     def test_a_smaller_pool_gets_a_new_executor(self, placed, executors):
         syncer = node_sync.NodeSyncer(_config(), pull=_recording_pull([]))
         try:
