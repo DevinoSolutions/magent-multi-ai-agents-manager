@@ -52,9 +52,6 @@ TOOL_TIMEOUT_S = 120
 _CLEAN = frozenset({"ok", "did", "skip", "drop"})
 # What a detail shows in place of the gh token, should a tool ever echo it.
 _MASK = "[gh-token]"
-# A row's detail is cut to this many characters -- AFTER the token is masked,
-# so a token straddling the cut can never print a prefix of itself.
-_DETAIL_MAX = 200
 # gh prefers any of these over the login it is told to store, and
 # `gh auth login --with-token` refuses while one is set: never hand them on.
 _GH_TOKEN_VARS = frozenset(
@@ -78,14 +75,16 @@ class Ctx:
 
 
 def _row(ctx: Ctx, status: str, item: str, detail: str = "") -> None:
-    """One status<TAB>item<TAB>detail line. The detail is masked (the gh
-    token), then flattened onto the line, then cut to ``_DETAIL_MAX`` -- in
-    that order, so no cut can split the token before the mask sees it."""
+    """One status<TAB>item<TAB>detail line; the detail is flattened onto it,
+    and the gh token is masked out of it -- the backstop. The row itself is
+    never cut, so a repair hint after a tool's output always survives: only
+    the tool's fragment is cut, by ``_last``, and a caller that hands
+    ``_last`` output which may hold the token masks it FIRST (``_step_gh``),
+    so no cut can split the token before the mask sees it."""
     if ctx.token:
         detail = detail.replace(ctx.token, _MASK)
-    detail = " ".join(detail.split())[:_DETAIL_MAX]
     ctx.rows.append(status)
-    sys.stdout.write(f"{status}\t{item}\t{detail}\n")
+    sys.stdout.write(f"{status}\t{item}\t{' '.join(detail.split())}\n")
     sys.stdout.flush()
 
 
@@ -220,9 +219,12 @@ def _tool(
 
 
 def _last(text: str) -> str:
-    """The whole last line: ``_row`` masks the token and only then cuts."""
+    """A tool's last output line, cut to 200 characters -- the tool's fragment
+    of a row, never the row. Output that may hold the gh token must be masked
+    BEFORE it comes here, or the cut could leave a prefix ``_row`` can't
+    recognize."""
     lines = text.strip().splitlines()
-    return lines[-1] if lines else "no output"
+    return lines[-1][:200] if lines else "no output"
 
 
 def _step_gh(ctx: Ctx) -> None:
@@ -261,12 +263,15 @@ def _step_gh(ctx: Ctx) -> None:
         ctx.token + "\n",
         env=env,
     )
+    # gh is the only child ever given the token: its output is masked before
+    # _last cuts it.
     if done.returncode != 0:
         _row(
             ctx,
             "fail",
             "gh",
-            f"gh auth login refused the token: {_last(done.stderr)}",
+            "gh auth login refused the token: "
+            f"{_last(done.stderr.replace(ctx.token, _MASK))}",
         )
     else:
         helper = _tool([gh, "auth", "setup-git"], env=env)
@@ -276,7 +281,7 @@ def _step_gh(ctx: Ctx) -> None:
                 "warn",
                 "gh",
                 f"logged in as {login}, but gh auth setup-git failed: "
-                f"{_last(helper.stderr)}",
+                f"{_last(helper.stderr.replace(ctx.token, _MASK))}",
             )
         else:
             _row(ctx, "did", "gh", f"logged in as {login}")

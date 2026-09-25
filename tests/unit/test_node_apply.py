@@ -329,8 +329,8 @@ class TestNothingLeaksAndEveryModeIsExplicit:
     def test_a_token_straddling_the_detail_cut_is_masked_whole(
         self, box, tmp_path, capsys
     ):
-        # The token starts before the 200-char cut and ends after it: masking
-        # AFTER the cut would print its first half.
+        # The token starts before _last's 200-char cut and ends after it:
+        # masking AFTER the cut would print its first half.
         gh = box.add("gh")
         prefix = "x" * (200 - len(TOKEN) // 2)
         gh.set_reply("auth login", stderr=f"{prefix}{TOKEN}\n", rc=1)
@@ -340,7 +340,33 @@ class TestNothingLeaksAndEveryModeIsExplicit:
         (line,) = [
             line for line in remote_mux.parse_report(out).lines if line.item == "gh"
         ]
-        assert len(line.detail) <= 200
+        # No prefix of the token, down to its 4-char "gho_" type tag.
+        assert not any(TOKEN[:n] in line.detail for n in range(4, len(TOKEN) + 1))
+
+    def test_a_long_tool_output_never_cuts_the_repair_hint_after_it(
+        self, tmp_path, capsys
+    ):
+        # Later steps print `<what failed> (<tool output>); run on the node:
+        # <repair>`: only the tool's fragment is cut (by _last), never the row.
+        ctx = node_apply.Ctx(
+            work=tmp_path,
+            home=tmp_path,
+            path="",
+            token=TOKEN,
+            force=False,
+            manifest={},
+        )
+        stderr = "error: " + "y" * 400 + "\n"
+        hint = "run on the node: claude plugin install demo@market"
+        node_apply._row(
+            ctx,
+            "fail",
+            "plugin",
+            f"install refused ({node_apply._last(stderr)}); {hint}",
+        )
+        (line,) = _lines(capsys)
+        assert line.detail.endswith(hint)
+        assert len(node_apply._last(stderr)) == 200
 
 
 class TestEveryWriteIsAtomicAndLeavesNoTemp:
