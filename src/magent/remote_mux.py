@@ -631,6 +631,11 @@ margin over ``PULL_MAX_TOTAL_BYTES`` is for what pull.sh cannot count: bytes
 a node user's shell rc file prints before the script runs."""
 PULL_COPY_CHUNK_BYTES = 1024 * 1024
 """A member is streamed to disk in chunks of this size, never read whole."""
+PULL_TEMP_PREFIX = "."
+PULL_TEMP_SUFFIX = ".part"
+"""The ONE shape of a pulled file's in-flight temp: ``_write_file`` hands this
+pair to mkstemp and ``_pull_temp`` recognises it, so the writer and the tar
+filter that must never ship a stranded temp cannot drift apart."""
 # The newest mtime believed: ~36,800 years of Unix time, far past any real
 # clock yet inside every platform's time_t, so os.utime cannot overflow. A
 # member outside [0, _MAX_MTIME] (or NaN, or inf) is stored without its mtime.
@@ -818,7 +823,9 @@ def _write_file(path: Path, reader: IO[bytes], mtime: float | None) -> None:
     on every tick. The ``.part`` suffix stays (the tar walker skips it); the
     temp is unlinked on any failure, so none is ever left behind."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, part = tempfile.mkstemp(dir=path.parent, prefix=".", suffix=".part")
+    fd, part = tempfile.mkstemp(
+        dir=path.parent, prefix=PULL_TEMP_PREFIX, suffix=PULL_TEMP_SUFFIX
+    )
     try:
         with open(fd, "wb") as out:
             shutil.copyfileobj(reader, out, length=PULL_COPY_CHUNK_BYTES)
@@ -1230,10 +1237,11 @@ def _raise(err: OSError) -> None:
 
 
 def _pull_temp(name: str) -> bool:
-    """The pull writer's in-flight temp: ``mkstemp(prefix=".", suffix=".part")``
-    beside its target (E8), stranded only by a kill mid-write. That exact
-    shape, and nothing wider: a real ``notes.part`` is the user's file."""
-    return name.startswith(".") and name.endswith(".part")
+    """The pull writer's in-flight temp: mkstemp with ``PULL_TEMP_PREFIX`` and
+    ``PULL_TEMP_SUFFIX`` beside its target (E8), stranded only by a kill
+    mid-write. That exact shape, case included (mkstemp never writes upper
+    case), and nothing wider: a real ``notes.part`` is the user's file."""
+    return name.startswith(PULL_TEMP_PREFIX) and name.endswith(PULL_TEMP_SUFFIX)
 
 
 def _same_path(a: str, b: str) -> bool:

@@ -925,8 +925,42 @@ class TestTheTarCarriesOnlyTheConversation:
             "memory/MEMORY.md",
         ]
 
-    @pytest.mark.parametrize("name", ["notes.part", ".part-of-it.md", ".hidden.jsonl"])
+    def test_a_temp_the_real_pull_writer_strands_is_never_sent(
+        self, tmp_path, monkeypatch
+    ):
+        # cq-G9: the name comes from the REAL writer, not a literal, so the
+        # writer and the tar filter cannot drift apart again. A failed replace
+        # with the cleanup unlink suppressed is what a SIGKILL mid-pull leaves.
+        source = _pulled(tmp_path)
+        before = {p.name for p in source.iterdir()}
+
+        def _refuse(src, dst):
+            raise OSError("the pull was killed here")
+
+        with monkeypatch.context() as m:
+            m.setattr(remote_mux.os, "replace", _refuse)
+            m.setattr(remote_mux.os, "unlink", lambda path: None)
+            with pytest.raises(OSError, match="killed here"):
+                remote_mux._write_file(
+                    source / f"{OLDER_SESSION_ID}.jsonl", io.BytesIO(b'{"half'), None
+                )
+
+        stranded = [p for p in source.iterdir() if p.name not in before]
+        assert len(stranded) == 1, stranded
+        assert stranded[0].read_bytes() == b'{"half'
+        assert remote_mux._pull_temp(stranded[0].name)
+        assert stranded[0].name not in "\n".join(self._names(source))
+        assert self._names(source) == [
+            f"{SESSION_ID}.jsonl",
+            "memory",
+            "memory/MEMORY.md",
+        ]
+
+    @pytest.mark.parametrize(
+        "name", ["notes.part", ".part-of-it.md", ".hidden.jsonl", ".x.PART"]
+    )
     def test_a_name_that_is_not_the_temp_shape_travels(self, tmp_path, name):
+        # .x.PART: mkstemp never writes upper case, so that is the user's data.
         source = _pulled(tmp_path)
         (source / name).write_text("real\n", encoding="utf-8")
 
