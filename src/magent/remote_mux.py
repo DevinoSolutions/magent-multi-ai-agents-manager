@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING
 from magent import node_scripts
 from magent.attach_client import SSH_MISSING_RC, TMUX_SOCKET
 from magent.log import get_logger
-from magent.nodes import LoadSample
+from magent.nodes import LoadSample, LocalGitState
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -194,7 +194,7 @@ def _spawn(
     label: str,
 ) -> subprocess.CompletedProcess[bytes]:
     """One bounded child -- the shared body of ``run`` and the local git reads
-    (``ignored_paths``). ``shown`` is what an error and a log line may say
+    (``ignored_paths``, ``git_state``). ``shown`` is what an error and a log line may say
     about the command; ``label`` opens every log line, naming who spawned it."""
     try:
         proc = subprocess.Popen(
@@ -449,3 +449,89 @@ def ignored_paths(repo: Path, *, timeout_s: float, label: str) -> tuple[str, ...
             raise RemoteError(None, "git not found on PATH", shown) from e.__cause__
         raise
     return tuple(p for p in result.stdout.decode("utf-8", "replace").split("\0") if p)
+
+
+# A local git read is a local process, but it can still hang (a credential
+# prompt, a network filesystem); bounded like every other child.
+GIT_TIMEOUT_S = 30.0
+
+
+def _git(
+    path: Path, *args: str, check: bool = True
+) -> subprocess.CompletedProcess[bytes]:
+    """One bounded, read-only ``git -C <path> <args>``. A missing ``git`` is
+    RemoteError rc None ("git not found on PATH"), as in ``ignored_paths``:
+    ``_spawn`` alone would call it the missing ssh client (rc 127)."""
+    argv = ["git", "-C", str(path), *args]
+    shown = tuple(argv)
+    try:
+        return _spawn(
+            argv,
+            timeout_s=GIT_TIMEOUT_S,
+            input_bytes=None,
+            check=check,
+            shown=shown,
+            label="git state read",
+        )
+    except RemoteError as e:
+        if isinstance(e.__cause__, FileNotFoundError):
+            raise RemoteError(None, "git not found on PATH", shown) from e.__cause__
+        raise
+
+
+def _out(result: subprocess.CompletedProcess[bytes]) -> str:
+    return result.stdout.decode("utf-8", "replace").strip()
+
+
+def repo_paths(project_dir: Path) -> list[Path]:
+    """The git repos a node project is made of: the project itself when it is
+    a repo, else each DIRECT child that is one (a workspace of repos), in name
+    order. Empty when there is none -- which the caller refuses, because a
+    node clones the project from its origin."""
+    if (project_dir / ".git").exists():
+        return [project_dir]
+    if not project_dir.is_dir():
+        return []
+    return sorted(
+        child
+        for child in project_dir.iterdir()
+        if child.is_dir() and (child / ".git").exists()
+    )
+
+
+def git_state(path: Path) -> LocalGitState:
+    """What D7 needs to know about the LOCAL repo at ``path``, read-only.
+
+    ``url`` is origin's, "" when there is no origin. ``detached`` when HEAD
+    names no branch (``branch`` is then ""). A repo with no commits yet is
+    not detached: HEAD still names its unborn branch. ``dirty`` counts
+    untracked files too -- origin never saw them, so the node would not have
+    them. ``unpushed`` is "HEAD has commits origin's copy of this branch
+    lacks", and a branch origin has never seen counts. Raises RemoteError
+    when ``path`` is not a repo or git itself fails."""
+    _git(path, "rev-parse", "--git-dir")
+    origin = _git(path, "remote", "get-url", "origin", check=False)
+    url = _out(origin) if origin.returncode == 0 else ""
+    head = _git(path, "symbolic-ref", "-q", "--short", "HEAD", check=False)
+    detached = head.returncode != 0
+    branch = "" if detached else _out(head)
+    dirty = bool(_out(_git(path, "status", "--porcelain")))
+    unpushed = False
+    if url and not detached:
+        ahead = _git(
+            path,
+            "rev-list",
+            "--count",
+            f"refs/remotes/origin/{branch}..HEAD",
+            check=False,
+        )
+        unpushed = ahead.returncode != 0 or _out(ahead) != "0"
+    return LocalGitState(
+        path=path,
+        url=url,
+        branch=branch,
+        dirty=dirty,
+        unpushed=unpushed,
+        detached=detached,
+        ignored=ignored_paths(path, timeout_s=PROBE_TIMEOUT_S, label="git state read"),
+    )

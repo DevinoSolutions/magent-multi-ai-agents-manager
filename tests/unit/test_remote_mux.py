@@ -27,6 +27,7 @@ from magent.remote_mux import RemoteError
 # this name still holds the real resolver for the one test that proves it.
 from magent.remote_mux import find_ssh as real_find_ssh
 from tests.unit._fake_ssh import make_fake_ssh
+from tests.unit._git_repos import commit, git, make_origin_and_clone, needs_git
 
 NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
 
@@ -840,3 +841,150 @@ class TestSample:
         )
         script_len = len(node_scripts.script("sample").encode("utf-8"))
         assert shown[-1] == f"<stdin: {script_len} bytes>"
+
+
+class TestWhichReposMakeTheProject:
+    def test_a_repo_project_is_itself(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        assert remote_mux.repo_paths(tmp_path) == [tmp_path]
+
+    def test_a_workspace_is_its_child_repos_in_name_order(self, tmp_path):
+        for name in ("web", "api", "notes"):
+            (tmp_path / name).mkdir()
+        (tmp_path / "web" / ".git").mkdir()
+        (tmp_path / "api" / ".git").mkdir()
+        assert remote_mux.repo_paths(tmp_path) == [tmp_path / "api", tmp_path / "web"]
+
+    def test_a_folder_with_no_repo_is_empty(self, tmp_path):
+        (tmp_path / "notes").mkdir()
+        assert remote_mux.repo_paths(tmp_path) == []
+
+    def test_a_missing_folder_is_empty(self, tmp_path):
+        assert remote_mux.repo_paths(tmp_path / "gone") == []
+
+
+@needs_git
+class TestTheLocalTreeIsReadNotChanged:
+    """D7's inputs, read from REAL git. The fixture builds the repos; the
+    product only reads them."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_git(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        # A repo search must stop at tmp_path, whatever encloses it.
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+
+    def test_a_clean_pushed_clone(self, tmp_path):
+        origin, clone = make_origin_and_clone(tmp_path)
+        state = remote_mux.git_state(clone)
+        assert Path(state.url).resolve() == origin.resolve()
+        assert (state.branch, state.dirty, state.unpushed, state.detached) == (
+            "main",
+            False,
+            False,
+            False,
+        )
+
+    def test_an_uncommitted_edit_is_dirty(self, tmp_path):
+        _, clone = make_origin_and_clone(tmp_path)
+        (clone / "README.md").write_text("changed\n", encoding="utf-8")
+        state = remote_mux.git_state(clone)
+        assert state.dirty
+        assert not state.unpushed
+
+    def test_an_untracked_file_is_dirty_too(self, tmp_path):
+        # It would not be on the node either: origin never saw it.
+        _, clone = make_origin_and_clone(tmp_path)
+        (clone / "notes.txt").write_text("x\n", encoding="utf-8")
+        assert remote_mux.git_state(clone).dirty
+
+    def test_a_local_commit_is_unpushed(self, tmp_path):
+        _, clone = make_origin_and_clone(tmp_path)
+        commit(clone, name="b.txt", text="b\n", message="second")
+        state = remote_mux.git_state(clone)
+        assert state.unpushed
+        assert not state.dirty
+
+    def test_a_branch_that_was_never_pushed_is_unpushed(self, tmp_path):
+        _, clone = make_origin_and_clone(tmp_path)
+        git(clone, "switch", "-q", "-c", "feat/x")
+        state = remote_mux.git_state(clone)
+        assert (state.branch, state.unpushed) == ("feat/x", True)
+
+    def test_a_detached_head_has_no_branch(self, tmp_path):
+        _, clone = make_origin_and_clone(tmp_path)
+        git(clone, "checkout", "-q", "--detach")
+        state = remote_mux.git_state(clone)
+        assert (state.detached, state.branch, state.unpushed) == (True, "", False)
+
+    def test_a_repo_without_origin_has_an_empty_url(self, tmp_path):
+        repo = tmp_path / "solo"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        commit(repo)
+        state = remote_mux.git_state(repo)
+        assert (state.url, state.unpushed) == ("", False)
+
+    def test_a_repo_with_no_commits_reads_without_error(self, tmp_path):
+        # An unborn branch still NAMES a branch: HEAD is a symbolic ref to a
+        # ref that does not exist yet. Not detached, and with no origin there
+        # is nothing to be ahead of.
+        repo = tmp_path / "empty"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        state = remote_mux.git_state(repo)
+        assert (
+            state.url,
+            state.branch,
+            state.detached,
+            state.unpushed,
+            state.dirty,
+        ) == (
+            "",
+            "main",
+            False,
+            False,
+            False,
+        )
+
+    def test_the_ignored_listing_rides_along(self, tmp_path):
+        _, clone = make_origin_and_clone(tmp_path)
+        (clone / ".gitignore").write_text(".env\n", encoding="utf-8")
+        git(clone, "add", ".gitignore")
+        git(clone, "commit", "-q", "--no-verify", "-m", "ignore")
+        (clone / ".env").write_text("K=v\n", encoding="utf-8")
+        assert ".env" in remote_mux.git_state(clone).ignored
+
+    def test_reading_the_state_changes_nothing(self, tmp_path):
+        _, clone = make_origin_and_clone(tmp_path)
+        (clone / "README.md").write_text("changed\n", encoding="utf-8")
+
+        def snapshot() -> tuple[str, str, str]:
+            return (
+                git(clone, "status", "--porcelain", "--branch"),
+                git(clone, "for-each-ref"),
+                git(clone, "stash", "list"),
+            )
+
+        before = snapshot()
+        remote_mux.git_state(clone)
+        assert snapshot() == before
+
+    def test_a_folder_that_is_not_a_repo_is_a_remote_error(self, tmp_path):
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        with pytest.raises(RemoteError):
+            remote_mux.git_state(plain)
+
+    def test_a_missing_git_is_named_not_mistaken_for_ssh(self, tmp_path, monkeypatch):
+        # _spawn reads a FileNotFoundError as the missing ssh CLIENT (rc 127);
+        # a local git read that never ran says so instead, like ignored_paths.
+        def no_such_program(*_args, **_kwargs):
+            raise FileNotFoundError(2, "No such file or directory")
+
+        monkeypatch.setattr(remote_mux.subprocess, "Popen", no_such_program)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.git_state(tmp_path)
+        assert exc.value.rc is None
+        assert exc.value.stderr_tail == "git not found on PATH"
+        assert exc.value.command_redacted[0] == "git"
