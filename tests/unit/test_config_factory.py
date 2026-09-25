@@ -6,17 +6,20 @@ from pathlib import Path
 import pytest
 
 from magent.config import (
+    _MIGRATIONS,
     DEFAULT_TOOLS,
     SCHEMA_VERSION,
     ConfigError,
     LayoutConfig,
     Settings,
     _migrate_2_to_3,
+    _migrate_3_to_4,
     _parse_settings,
     default_config,
     layout_to_dict,
     load_config,
     migrate_config_file,
+    migrate_raw,
     settings_to_dict,
 )
 from magent.discover import projects_to_config
@@ -224,3 +227,40 @@ class TestExampleConfigMatchesFactory:
         assert cfg.version == SCHEMA_VERSION
         assert len(cfg.projects) == len(example["projects"])
         assert capsys.readouterr().err == ""
+
+
+class TestMigrateToFour:
+    """v4 adds the node pool (settings.nodes / nodeSync) and a project's
+    node / push. Every new key is optional -- absent means "no nodes" -- so the
+    step only stamps the version."""
+
+    def test_the_schema_is_four(self):
+        assert SCHEMA_VERSION == 4
+
+    def test_every_version_below_the_schema_has_a_step(self):
+        assert sorted(_MIGRATIONS) == list(range(SCHEMA_VERSION))
+
+    def test_three_to_four_only_stamps(self):
+        raw = {"version": 3, "settings": {"psmux": True}, "projects": [{"path": "a"}]}
+        assert _migrate_3_to_4(raw) == {**raw, "version": 4}
+
+    def test_the_step_never_mutates_its_input(self):
+        raw = {"version": 3, "projects": []}
+        _migrate_3_to_4(raw)
+        assert raw["version"] == 3
+
+    def test_a_v3_config_reaches_four_with_its_projects_intact(self):
+        projects = [{"path": "a", "windows": [{"name": "x"}]}]
+        raw = migrate_raw({"version": 3, "projects": projects})
+        assert raw["version"] == 4
+        assert raw["projects"] == projects
+
+    def test_an_unversioned_config_reaches_four(self):
+        assert migrate_raw({"projects": []})["version"] == 4
+
+    def test_migrating_a_v3_file_stamps_four_on_disk(self, tmp_config):
+        path = tmp_config(
+            {"version": 3, "projects": [{"path": "api", "color": "#123456"}]}
+        )
+        assert migrate_config_file(path) is True
+        assert json.loads(Path(path).read_text(encoding="utf-8"))["version"] == 4

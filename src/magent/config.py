@@ -25,7 +25,7 @@ import click
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 DEFAULT_TOOLS: dict[str, str] = {
     "claude": "claude --continue",
@@ -802,10 +802,20 @@ def _migrate_2_to_3(raw: dict[str, object]) -> dict[str, object]:
     return raw
 
 
+def _migrate_3_to_4(raw: dict[str, object]) -> dict[str, object]:
+    """v4 adds the node pool (``settings.nodes``/``nodeSync``) and a project's
+    ``node``/``push``. All optional, absent means "no nodes" -- so the
+    migration only stamps the version."""
+    raw = dict(raw)
+    raw["version"] = 4
+    return raw
+
+
 _MIGRATIONS: dict[int, Callable[[dict[str, object]], dict[str, object]]] = {
     0: _migrate_0_to_1,
     1: _migrate_1_to_2,
     2: _migrate_2_to_3,
+    3: _migrate_3_to_4,
 }
 
 
