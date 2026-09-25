@@ -1095,28 +1095,232 @@ class TestTheSkills:
         assert (deploy / "SKILL.md").stat().st_mode & 0o777 == 0o600
         assert (deploy / "run.sh").stat().st_mode & 0o777 == 0o700
 
+    def test_one_deleted_file_of_several_is_put_back(self, box, tmp_path, capsys):
+        work = _work(tmp_path, replace(EMPTY, skills=(SKILL, RUNNER)))
+        box.apply(work)
+        (_skills(box) / "deploy" / "run.sh").unlink()
+        capsys.readouterr()
+        box.apply(work)
+        assert _status(_lines(capsys), "skills") == "did"
+        assert (_skills(box) / "deploy" / "run.sh").read_bytes() == RUNNER.data
+
+    def test_a_skill_file_removed_on_the_pc_stays_on_the_node(self, box, tmp_path):
+        # One way, like settings: nothing on the node is ever deleted.
+        box.apply(_work(tmp_path, replace(EMPTY, skills=(SKILL, RUNNER)), name="a"))
+        box.apply(_work(tmp_path, replace(EMPTY, skills=(SKILL,)), name="b"))
+        assert (_skills(box) / "deploy" / "run.sh").read_bytes() == RUNNER.data
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX symlinks")
+    def test_a_skill_directory_that_is_a_link_is_left_alone(
+        self, box, tmp_path, capsys
+    ):
+        # A write through it would land outside ~/.claude/skills.
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        other = SkillFile(path="other/SKILL.md", data=b"# other\n", executable=False)
+        _skills(box).mkdir(parents=True)
+        (_skills(box) / "deploy").symlink_to(elsewhere)
+        work = _work(tmp_path, replace(EMPTY, skills=(SKILL, RUNNER, other)))
+        assert box.apply(work) == 0
+        lines = _lines(capsys)
+        (line,) = [line for line in lines if line.item == "skill:deploy"]
+        assert line.status == "warn"
+        assert line.detail == "~/.claude/skills/deploy is a link; left alone"
+        assert list(elsewhere.iterdir()) == []
+        assert (_skills(box) / "other" / "SKILL.md").read_bytes() == other.data
+        (line,) = [line for line in lines if line.item == "skills"]
+        assert (line.status, line.detail) == (
+            "did",
+            "1 file(s) under ~/.claude/skills",
+        )
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX symlinks")
+    def test_a_link_deeper_in_a_skill_is_left_alone(self, box, tmp_path, capsys):
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        deep = SkillFile(path="deploy/lib/x.sh", data=b"x\n", executable=False)
+        (_skills(box) / "deploy").mkdir(parents=True)
+        (_skills(box) / "deploy" / "lib").symlink_to(elsewhere)
+        box.apply(_work(tmp_path, replace(EMPTY, skills=(SKILL, deep))))
+        lines = _lines(capsys)
+        assert _status(lines, "skill:deploy") == "warn"
+        assert "~/.claude/skills/deploy/lib is a link" in " ".join(
+            line.detail for line in lines
+        )
+        assert list(elsewhere.iterdir()) == []
+        # The whole skill is left alone, not just the files under the link;
+        # with nothing written there is no did row.
+        assert not (_skills(box) / "deploy" / "SKILL.md").exists()
+        assert not [line for line in lines if line.item == "skills"]
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX symlinks")
+    def test_a_link_made_after_a_clean_run_is_refused_not_skipped(
+        self, box, tmp_path, capsys
+    ):
+        # The files still read as present through the link; the digest is
+        # unchanged. The link is found anyway.
+        work = _work(tmp_path, replace(EMPTY, skills=(SKILL,)))
+        box.apply(work)
+        elsewhere = tmp_path / "elsewhere"
+        (_skills(box) / "deploy").rename(elsewhere)
+        (_skills(box) / "deploy").symlink_to(elsewhere)
+        capsys.readouterr()
+        box.apply(work)
+        assert _status(_lines(capsys), "skill:deploy") == "warn"
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX symlinks")
+    def test_a_skills_dir_that_is_a_link_is_left_alone(self, box, tmp_path, capsys):
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (box.home / ".claude").mkdir()
+        _skills(box).symlink_to(elsewhere)
+        work = _work(tmp_path, replace(EMPTY, skills=(SKILL, RUNNER)))
+        assert box.apply(work) == 0
+        lines = _lines(capsys)
+        (line,) = [line for line in lines if line.item == "skills"]
+        assert line.status == "warn"
+        assert line.detail == "~/.claude/skills is a link; left alone"
+        assert not [line for line in lines if line.item.startswith("skill:")]
+        assert list(elsewhere.iterdir()) == []
+        # A warned step is not remembered: the next run looks again.
+        capsys.readouterr()
+        box.apply(work)
+        assert _status(_lines(capsys), "skills") == "warn"
+
 
 def _claude(
-    box: Box, *, installed: tuple[str, ...] = (), markets: tuple[str, ...] = ("mkt",)
+    box: Box,
+    *,
+    installed: tuple[str, ...] = (),
+    markets: tuple[str, ...] = ("mkt",),
+    scope: str | None = "user",
+    sources: dict[str, dict[str, str]] | None = None,
 ) -> FakeSsh:
     """A fake claude that answers the two --json listings (fact 1's shapes);
-    every other call -- install, marketplace add -- exits 0."""
+    every other call -- install, marketplace add -- exits 0. ``scope`` None
+    lists the installed plugins with no scope key; ``sources`` adds fields
+    (``repo``/``url``) to a marketplace's entry."""
     claude = box.add("claude")
-    claude.set_reply(
-        "plugin list",
-        stdout=json.dumps(
-            [{"id": pid, "enabled": True, "scope": "user"} for pid in installed]
-        ),
-    )
+    plugins = [{"id": pid, "enabled": True} for pid in installed]
+    if scope is not None:
+        for plugin in plugins:
+            plugin["scope"] = scope
+    claude.set_reply("plugin list", stdout=json.dumps(plugins))
     claude.set_reply(
         "marketplace list",
-        stdout=json.dumps([{"name": name, "source": "github"} for name in markets]),
+        stdout=json.dumps(
+            [
+                {"name": name, "source": "github", **(sources or {}).get(name, {})}
+                for name in markets
+            ]
+        ),
     )
     return claude
 
 
 def _installs(claude: FakeSsh) -> list[list[str]]:
     return [c.argv for c in claude.calls() if c.argv[:2] == ["plugin", "install"]]
+
+
+def _adds(claude: FakeSsh) -> list[list[str]]:
+    return [
+        c.argv for c in claude.calls() if c.argv[:3] == ["plugin", "marketplace", "add"]
+    ]
+
+
+def _edit_manifest(work: Path, **changes: object) -> None:
+    """Rewrite keys of the unpacked manifest -- a shape build_payload never
+    writes, as a hand-edited or future payload might carry."""
+    manifest = _json(work / "manifest.json")
+    assert isinstance(manifest, dict)
+    manifest.update(changes)
+    (work / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+# Each secret-bearing source, and what a row shows of it. The node's claude
+# gets the whole URL; a row never gets the userinfo or the query.
+SECRET_SOURCES = [
+    (SECRET_URL, "https://***@git.example.com/mkt.git"),
+    (
+        "https://amin:ghp_DECOY0123@x@git.example.com/mkt.git",
+        "https://***@git.example.com/mkt.git",
+    ),
+    (
+        "https://git.example.com/mkt.git?token=ghp_DECOY0123",
+        "https://git.example.com/mkt.git?***",
+    ),
+    (
+        "https://amin:ghp_DECOY0123@git.example.com/mkt.git?token=ghp_DECOY0123",
+        "https://***@git.example.com/mkt.git?***",
+    ),
+    ("https://git.example.com?token=ghp_DECOY0123@x", "https://git.example.com?***"),
+]
+PASSWORD = "ghp_DECOY0123"
+
+
+class TestTheUrlSecretMask:
+    """``_unauth``: what a row never shows of a URL, and what it leaves be."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # git's own wording for a scheme-less (scp-style) remote.
+            "fatal: could not read from amin:ghp_DECOY0123@git.example.com:o/m.git",
+            "remote: amin:ghp_DECOY0123@git.example.com/o/m.git not found",
+            "cloning amin:ghp_DECOY0123@git.example.com",
+        ],
+    )
+    def test_a_schemeless_userinfo_is_masked(self, text):
+        masked = node_apply._unauth(text)
+        assert PASSWORD not in masked
+        assert "***@git.example.com" in masked
+
+    @pytest.mark.parametrize(
+        ("text", "shown"),
+        [
+            ("https://example.com?mail=a@b.com", "https://example.com?***"),
+            ("https://example.com:8443?next=u@x.org", "https://example.com:8443?***"),
+        ],
+    )
+    def test_a_pathless_url_keeps_its_host(self, text, shown):
+        assert node_apply._unauth(text) == shown
+
+    @pytest.mark.parametrize(("source", "shown"), SECRET_SOURCES)
+    def test_a_url_loses_its_userinfo_and_query(self, source, shown):
+        assert node_apply._unauth(f"add {source} failed") == f"add {shown} failed"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "git@github.com:o/r.git",
+            "npx -y @scope/pkg@1.2",
+            "/@scope/pkg",
+            "/tree/v1@2",
+            "see /p?mail=a@b.com",
+            "claude plugin install p@mkt",
+            # A "user:pw@host" shape mid-path is not a credential ...
+            "https://example.com/a:b@c.d/x",
+            # ... nor is one with no host after the "@" (a git reflog ref).
+            "pathspec 'main:README@{1}' did not match",
+        ],
+    )
+    def test_what_holds_no_url_secret_is_left_byte_identical(self, text):
+        assert node_apply._unauth(text) == text
+
+    @pytest.mark.parametrize("shift", range(31))
+    @pytest.mark.parametrize("token_first", [True, False])
+    def test_no_cut_leaves_a_prefix_of_either_secret(
+        self, tmp_path, capsys, shift, token_first
+    ):
+        # _last cuts at 200: here `shift` chars into the second secret, after
+        # the first one whole. Both are masked before the cut, in either order.
+        first, second = (TOKEN, SECRET_URL) if token_first else (SECRET_URL, TOKEN)
+        line = "x" * (200 - len(first) - 1 - shift) + f"{first} {second}\n"
+        ctx = _ctx(tmp_path, TOKEN)
+        node_apply._row(ctx, "warn", "marketplace:mkt", node_apply._last(ctx, line))
+        out = capsys.readouterr().out
+        assert _no_token_prefix(out)
+        assert PASSWORD[:6] not in out
 
 
 class TestThePlugins:
@@ -1156,25 +1360,31 @@ class TestThePlugins:
         assert _status(_lines(capsys), "plugin:p@mkt") == "warn"
         assert _installs(claude) == []
 
-    def test_an_added_marketplace_prints_its_url_without_the_userinfo(
-        self, box, tmp_path, capsys
+    @pytest.mark.parametrize(("source", "shown"), SECRET_SOURCES)
+    def test_an_added_marketplace_prints_its_url_without_the_secret(
+        self, box, tmp_path, capsys, source, shown
     ):
         claude = _claude(box, markets=())
-        box.apply(_work(tmp_path, replace(PLUGGED, marketplaces={"mkt": SECRET_URL})))
+        box.apply(_work(tmp_path, replace(PLUGGED, marketplaces={"mkt": source})))
         # The node gets the whole URL: marketplace add needs it.
-        assert ["plugin", "marketplace", "add", SECRET_URL] in [
-            c.argv for c in claude.calls()
+        assert _adds(claude) == [["plugin", "marketplace", "add", source]]
+        out = capsys.readouterr()
+        assert "ghp_DECOY0123" not in out.out + out.err
+        (line,) = [
+            line
+            for line in remote_mux.parse_report(out.out).lines
+            if line.item == "marketplace:mkt"
         ]
-        (line,) = [line for line in _lines(capsys) if line.item == "marketplace:mkt"]
         assert line.status == "did"
-        assert line.detail == "https://***@git.example.com/mkt.git"
+        assert line.detail == shown
 
-    def test_a_failed_marketplace_add_prints_no_userinfo_even_from_stderr(
-        self, box, tmp_path, capsys
+    @pytest.mark.parametrize(("source", "shown"), SECRET_SOURCES)
+    def test_a_failed_marketplace_add_prints_no_secret_even_from_stderr(
+        self, box, tmp_path, capsys, source, shown
     ):
         claude = _claude(box, markets=())
-        claude.set_reply("marketplace add", stderr=f"cannot clone {SECRET_URL}\n", rc=1)
-        box.apply(_work(tmp_path, replace(PLUGGED, marketplaces={"mkt": SECRET_URL})))
+        claude.set_reply("marketplace add", stderr=f"cannot clone {source}\n", rc=1)
+        box.apply(_work(tmp_path, replace(PLUGGED, marketplaces={"mkt": source})))
         out = capsys.readouterr()
         assert "ghp_DECOY0123" not in out.out + out.err
         (line,) = [
@@ -1183,8 +1393,173 @@ class TestThePlugins:
             if line.item == "marketplace:mkt"
         ]
         assert line.status == "warn"
-        assert "cannot clone https://***@git.example.com/mkt.git" in line.detail
+        assert f"cannot clone {shown}" in line.detail
         assert _installs(claude) == []
+
+    def test_a_plugin_id_is_never_taken_for_userinfo(self, box, tmp_path, capsys):
+        # The masks want a "//" before the "@": a plugin id has none.
+        claude = _claude(box)
+        claude.set_reply("plugin install", stderr="p@mkt is not in mkt\n", rc=1)
+        box.apply(_work(tmp_path, PLUGGED))
+        (line,) = [line for line in _lines(capsys) if line.item == "plugin:p@mkt"]
+        assert line.detail == (
+            "install refused (p@mkt is not in mkt); run on the node: "
+            "claude plugin install p@mkt"
+        )
+
+    def test_a_refused_install_prints_no_secret_from_stderr(
+        self, box, tmp_path, capsys
+    ):
+        # gh is git's credential helper by now: a clone can echo the token.
+        claude = _claude(box)
+        claude.set_reply(
+            "plugin install", stderr=f"cannot fetch {SECRET_URL} as {TOKEN}\n", rc=1
+        )
+        box.apply(_work(tmp_path, PLUGGED), token=TOKEN)
+        out = capsys.readouterr()
+        assert "ghp_DECOY0123" not in out.out + out.err
+        assert TOKEN not in out.out + out.err
+        assert (
+            "cannot fetch https://***@git.example.com/mkt.git as [gh-token]" in out.out
+        )
+
+    def test_only_a_tools_last_line_reaches_the_row(self, box, tmp_path, capsys):
+        claude = _claude(box)
+        claude.set_reply(
+            "plugin install", stderr="resolving p@mkt\nplugin not found\n", rc=1
+        )
+        box.apply(_work(tmp_path, PLUGGED))
+        (line,) = [line for line in _lines(capsys) if line.item == "plugin:p@mkt"]
+        assert "(plugin not found)" in line.detail
+        assert "resolving" not in line.detail
+
+    def test_a_marketplace_that_cannot_be_added_is_tried_once_per_run(
+        self, box, tmp_path, capsys
+    ):
+        # Each of its plugins still gets its own row, naming its own command.
+        pids = ("a@mkt", "b@mkt", "c@mkt")
+        claude = _claude(box, markets=())
+        claude.set_reply("marketplace add", stderr="cannot clone\n", rc=1)
+        assert box.apply(_work(tmp_path, replace(PLUGGED, plugins=pids))) == 0
+        lines = _lines(capsys)
+        assert len(_adds(claude)) == 1
+        assert [line.status for line in lines if line.item == "marketplace:mkt"] == [
+            "warn"
+        ]
+        for pid in pids:
+            (line,) = [line for line in lines if line.item == "plugin:" + pid]
+            assert line.status == "warn"
+            assert line.detail == (
+                "marketplace mkt could not be added; add it, then run: "
+                f"claude plugin install {pid}"
+            )
+        assert _installs(claude) == []
+
+    def test_one_add_serves_every_plugin_of_a_marketplace(self, box, tmp_path):
+        claude = _claude(box, markets=())
+        box.apply(_work(tmp_path, replace(PLUGGED, plugins=("a@mkt", "b@mkt"))))
+        assert _adds(claude) == [["plugin", "marketplace", "add", "owner/mkt"]]
+        assert len(_installs(claude)) == 2
+
+    def test_a_known_marketplace_is_never_added(self, box, tmp_path):
+        claude = _claude(box)
+        box.apply(_work(tmp_path, PLUGGED))
+        assert _adds(claude) == []
+        assert len(_installs(claude)) == 1
+
+    @pytest.mark.parametrize("key", ["repo", "url"])
+    def test_a_known_marketplace_pointing_elsewhere_is_left_alone(
+        self, box, tmp_path, capsys, key
+    ):
+        # Re-adding it would swap what every plugin of it resolves against on
+        # the node; the plugins still install from what the node has.
+        claude = _claude(box, sources={"mkt": {key: SECRET_URL}})
+        assert box.apply(_work(tmp_path, PLUGGED)) == 0
+        out = capsys.readouterr()
+        assert "ghp_DECOY0123" not in out.out + out.err
+        lines = remote_mux.parse_report(out.out).lines
+        (line,) = [line for line in lines if line.item == "marketplace:mkt"]
+        assert line.status == "warn"
+        assert line.detail == (
+            "on this node points at https://***@git.example.com/mkt.git, "
+            "not owner/mkt; left alone"
+        )
+        assert _adds(claude) == []
+        assert len(_installs(claude)) == 1
+
+    def test_a_known_marketplace_at_the_same_source_prints_no_row(
+        self, box, tmp_path, capsys
+    ):
+        _claude(box, sources={"mkt": {"repo": "owner/mkt"}})
+        box.apply(_work(tmp_path, PLUGGED))
+        assert not [line for line in _lines(capsys) if line.item == "marketplace:mkt"]
+
+    @pytest.mark.parametrize(
+        "plugin", [{"scope": "project"}, {"scope": "local"}, {"scope": 7}]
+    )
+    def test_a_plugin_installed_for_a_project_is_installed_for_the_user(
+        self, box, tmp_path, capsys, plugin
+    ):
+        claude = box.add("claude")
+        claude.set_reply("plugin list", stdout=json.dumps([{"id": "p@mkt", **plugin}]))
+        claude.set_reply("marketplace list", stdout='[{"name": "mkt"}]')
+        box.apply(_work(tmp_path, PLUGGED))
+        assert _status(_lines(capsys), "plugin:p@mkt") == "did"
+        assert len(_installs(claude)) == 1
+
+    def test_an_installed_plugin_with_no_scope_is_taken_as_the_users(
+        self, box, tmp_path, capsys
+    ):
+        claude = _claude(box, installed=("p@mkt",), scope=None)
+        box.apply(_work(tmp_path, PLUGGED))
+        assert _status(_lines(capsys), "plugin:p@mkt") == "skip"
+        assert _installs(claude) == []
+
+    def test_a_source_no_process_can_take_is_one_warning(self, box, tmp_path, capsys):
+        # A NUL makes subprocess raise ValueError before any child exists.
+        claude = _claude(box, markets=())
+        work = _work(tmp_path, replace(PLUGGED, marketplaces={"mkt": "owner/m\0kt"}))
+        assert box.apply(work) == 0
+        lines = _lines(capsys)
+        assert _status(lines, "marketplace:mkt") == "warn"
+        assert _status(lines, "plugin:p@mkt") == "warn"
+        assert _adds(claude) == []
+        assert _installs(claude) == []
+
+    def test_a_source_that_is_not_text_is_a_warning_and_no_add(
+        self, box, tmp_path, capsys
+    ):
+        claude = _claude(box, markets=())
+        work = _work(tmp_path, PLUGGED)
+        _edit_manifest(work, marketplaces={"mkt": {"repo": "owner/mkt"}})
+        assert box.apply(work) == 0
+        (line,) = [line for line in _lines(capsys) if line.item == "plugin:p@mkt"]
+        assert line.status == "warn"
+        assert "has no remote source on this PC" in line.detail
+        assert claude.calls() and _adds(claude) == []
+
+    def test_a_plugin_id_with_no_marketplace_is_ignored(self, box, tmp_path, capsys):
+        claude = _claude(box)
+        work = _work(tmp_path, PLUGGED)
+        _edit_manifest(work, plugins=["bare", "p@mkt"])
+        assert box.apply(work) == 0
+        assert _status(_lines(capsys), "plugin:p@mkt") == "did"
+        assert _installs(claude) == [["plugin", "install", "p@mkt", "--scope", "user"]]
+
+    @pytest.mark.parametrize("step", ["marketplace add", "plugin install"])
+    def test_a_timed_out_tool_is_a_warning_and_nothing_follows_it(
+        self, box, tmp_path, capsys, step
+    ):
+        claude = _claude(box, markets=())
+        claude.set_reply(step, stderr="timed out after 120s\n", rc=124)
+        assert box.apply(_work(tmp_path, PLUGGED)) == 0
+        lines = _lines(capsys)
+        item = "marketplace:mkt" if step == "marketplace add" else "plugin:p@mkt"
+        assert _status(lines, item) == "warn"
+        assert "timed out after 120s" in " ".join(line.detail for line in lines)
+        # The step's last call is the one that timed out.
+        assert step in " ".join(claude.calls()[-1].argv)
+        assert len(_installs(claude)) == (1 if step == "plugin install" else 0)
 
     def test_userinfo_straddling_the_fragment_cut_is_masked_before_it(
         self, box, tmp_path, capsys
@@ -1231,22 +1606,34 @@ class TestThePlugins:
         assert _status(_lines(capsys), "plugins") == "skip"
         assert len(claude.calls()) == asked
 
+    @pytest.mark.parametrize("broken", ["plugin list", "plugin marketplace list"])
     @pytest.mark.parametrize(
-        ("stdout", "rc"), [("", 1), ("not json", 0), ('{"id": "p@mkt"}', 0)]
+        ("stdout", "rc"),
+        [("", 1), ("[]", 1), ("not json", 0), ('{"id": "p@mkt"}', 0)],
     )
     def test_a_listing_claude_cannot_answer_fails_and_installs_nothing(
-        self, box, tmp_path, capsys, stdout, rc
+        self, box, tmp_path, capsys, broken, stdout, rc
     ):
         # Without the listing, every plugin would look missing and be
-        # reinstalled; the step stops and says where to look instead.
+        # reinstalled; the step stops and names the listing to run instead.
         claude = box.add("claude")
-        claude.set_reply("plugin list", stdout=stdout, rc=rc)
+        claude.set_reply(broken, stdout=stdout, rc=rc)
+        claude.set_reply("plugin list", stdout="[]")
         claude.set_reply("marketplace list", stdout='[{"name": "mkt"}]')
         assert box.apply(_work(tmp_path, PLUGGED)) == 1
         (line,) = [line for line in _lines(capsys) if line.item == "plugins"]
         assert line.status == "fail"
-        assert "claude plugin list --json" in line.detail
+        assert f"claude {broken} --json did not answer" in line.detail
         assert _installs(claude) == []
+
+    def test_unchanged_plugins_need_no_claude_on_the_node(self, box, tmp_path, capsys):
+        _claude(box)
+        work = _work(tmp_path, PLUGGED)
+        box.apply(work)
+        del box.fakes["claude"]
+        capsys.readouterr()
+        assert box.apply(work) == 0
+        assert _status(_lines(capsys), "plugins") == "skip"
 
     def test_no_plugins_on_this_pc_is_a_skip_even_without_claude(
         self, box, tmp_path, capsys

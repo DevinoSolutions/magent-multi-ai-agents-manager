@@ -61,13 +61,26 @@ _MASK = "[gh-token]"
 _GH_TOKEN_VARS = frozenset(
     {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
 )
-# The user:password@ of a URL. A git marketplace source may carry a
-# credential there: the node's claude gets the whole URL, a row never does.
-_USERINFO = re.compile(r"(?<=//)[^/@\s]+@")
+# A git marketplace source may carry a credential in a URL's query or its
+# user:password, and git echoes a scheme-less remote's user:password@host
+# too. The node's claude gets the whole URL; a row gets none of them. Applied
+# in this order by ``_unauth``:
+# - the query of a "//" URL (so a "@" in it is gone before the userinfo mask);
+_QUERY = re.compile(r"(?<=//)([^\s?#]*)\?[^\s#]*")
+# - a "//" URL's userinfo, up to the LAST "@" before "/", "?" or "#" -- a
+#   password may hold an "@" (git's own parse, a memrchr);
+_AUTH = re.compile(r"(?<=//)[^\s/?#]*@")
+# - a scheme-less user:password@host. It wants the ":" before the "@" and a
+#   host after it, so git@github.com:o/r.git, @scope/pkg@1.2 and a plugin id
+#   such as p@mkt are left alone.
+_BARE = re.compile(r"(?<![\w.%+:/@-])[\w.%+-]+:[^\s/?#]*@(?=[\w.-]+[:/\s]|[\w.-]+$)")
 
 
 def _unauth(text: str) -> str:
-    return _USERINFO.sub("***@", text)
+    """``text`` with every URL's query and userinfo masked."""
+    text = _QUERY.sub(r"\1?***", text)
+    text = _AUTH.sub("***@", text)
+    return _BARE.sub("***@", text)
 
 
 @dataclass
@@ -87,8 +100,8 @@ class Ctx:
 
 def _row(ctx: Ctx, status: str, item: str, detail: str = "") -> None:
     """One status<TAB>item<TAB>detail line; the detail is flattened onto it,
-    and the gh token and any URL's userinfo are masked out of it -- the
-    backstop. The row itself is never cut, so a repair hint after a tool's
+    and the gh token and any URL's userinfo and query are masked out of it --
+    the backstop. The row itself is never cut, so a repair hint after a tool's
     output always survives: only the tool's fragment is cut, by ``_last``,
     which masks both itself before it cuts -- so no cut can split a secret
     before a mask sees it."""
@@ -220,7 +233,8 @@ def _tool(
         return subprocess.CompletedProcess(
             argv, 124, "", f"timed out after {TOOL_TIMEOUT_S}s"
         )
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError: an argument no process can take (a NUL in it).
         return subprocess.CompletedProcess(argv, 127, "", str(exc))
     return subprocess.CompletedProcess(
         argv,
@@ -241,8 +255,8 @@ def _last(ctx: Ctx, text: str) -> str:
     token straddling char 200 can never leave a prefix ``_row``'s backstop
     would not recognize. An empty token masks nothing (``str.replace`` with
     an empty needle would insert the mask between every character). A URL's
-    userinfo is masked before the cut for the same reason: a cut that drops
-    its "@" leaves nothing ``_USERINFO`` matches."""
+    userinfo and query are masked before the cut for the same reason: a cut
+    that drops the "@" or the "?" leaves nothing ``_unauth`` matches."""
     if ctx.token:
         text = text.replace(ctx.token, _MASK)
     lines = _unauth(text).strip().splitlines()
@@ -562,33 +576,80 @@ def _step_mcp_oauth(ctx: Ctx) -> None:
     _remember(ctx, "mcp_oauth", want, mark)
 
 
+def _link_on_the_way(dest_root: Path, dest: Path) -> Path | None:
+    """The first directory below ``dest_root`` on the way to ``dest`` that
+    is a symlink, or None."""
+    probe = dest_root
+    for part in dest.relative_to(dest_root).parts[:-1]:
+        probe = probe / part
+        if probe.is_symlink():
+            return probe
+    return None
+
+
 def _step_skills(ctx: Ctx) -> None:
     """This PC's ~/.claude/skills files onto the node's, exec bit kept. One
     way, like settings: a skill removed on the PC stays here. Each file goes
-    through ``_install``, so a symlink where a skill lands is replaced, never
-    written through."""
+    through ``_install``, so a symlink where a skill FILE lands is replaced,
+    never written through. A symlinked DIRECTORY is refused instead -- a
+    write below it would land outside ~/.claude/skills: ~/.claude/skills
+    itself a link leaves the whole step alone, and a link anywhere inside a
+    skill leaves that whole skill alone. Either is a warn naming the link."""
     root = ctx.work / "skills"
     files = sorted(p for p in root.rglob("*") if p.is_file()) if root.is_dir() else []
     if not files:
         _row(ctx, "skip", "skills", "this PC has no skills to share")
         return
     dest_root = ctx.home / ".claude" / "skills"
-    targets = [(src, dest_root / src.relative_to(root)) for src in files]
     want = _digest(ctx, "skills")
-    if _unchanged(ctx, "skills", want) and all(dest.is_file() for _, dest in targets):
+    mark = len(ctx.rows)
+    if dest_root.is_symlink():
+        _row(ctx, "warn", "skills", "~/.claude/skills is a link; left alone")
+        _remember(ctx, "skills", want, mark)
+        return
+    by_skill: dict[str, list[tuple[Path, Path]]] = {}
+    for src in files:
+        rel = src.relative_to(root)
+        by_skill.setdefault(rel.parts[0], []).append((src, dest_root / rel))
+    refused: dict[str, Path] = {}
+    for name, pairs in by_skill.items():
+        for _, dest in pairs:
+            link = _link_on_the_way(dest_root, dest)
+            if link is not None:
+                refused[name] = link
+                break
+    targets = [
+        pair
+        for name, pairs in by_skill.items()
+        if name not in refused
+        for pair in pairs
+    ]
+    if (
+        not refused
+        and _unchanged(ctx, "skills", want)
+        and all(dest.is_file() for _, dest in targets)
+    ):
         _row(ctx, "skip", "skills", f"{len(files)} file(s) unchanged")
         return
-    mark = len(ctx.rows)
+    for name, link in refused.items():
+        shown = link.relative_to(dest_root).as_posix()
+        _row(
+            ctx,
+            "warn",
+            "skill:" + name,
+            f"~/.claude/skills/{shown} is a link; left alone",
+        )
     for src, dest in targets:
         mode = 0o700 if src.stat().st_mode & stat.S_IXUSR else 0o600
         _install(dest, src.read_bytes(), mode)
-    _row(ctx, "did", "skills", f"{len(files)} file(s) under ~/.claude/skills")
+    if targets:
+        _row(ctx, "did", "skills", f"{len(targets)} file(s) under ~/.claude/skills")
     _remember(ctx, "skills", want, mark)
 
 
-def _listed(argv: list[str], key: str) -> set[str] | None:
-    """``key`` of every object a ``claude ... --json`` listing prints, or
-    None when the command failed or printed no JSON list."""
+def _listing(argv: list[str]) -> list[dict[str, object]] | None:
+    """Every object a ``claude ... --json`` listing prints, or None when the
+    command failed or printed no JSON list."""
     done = _tool(argv)
     if done.returncode != 0:
         return None
@@ -598,11 +659,32 @@ def _listed(argv: list[str], key: str) -> set[str] | None:
         return None
     if not isinstance(items, list):
         return None
-    return {
-        item[key]
-        for item in items
-        if isinstance(item, dict) and isinstance(item.get(key), str)
-    }
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _user_plugins(items: list[dict[str, object]]) -> set[str]:
+    """The ids installed at user scope. A project- or local-scope install
+    serves one directory, not every session: that plugin is still missing.
+    An entry with no scope is taken as the user's."""
+    found: set[str] = set()
+    for item in items:
+        pid = item.get("id")
+        if isinstance(pid, str) and item.get("scope") in (None, "user"):
+            found.add(pid)
+    return found
+
+
+def _node_markets(items: list[dict[str, object]]) -> dict[str, str | None]:
+    """Each marketplace the node knows, by name, with the repo or URL it was
+    added from (None when the listing names neither)."""
+    found: dict[str, str | None] = {}
+    for item in items:
+        name, repo, url = item.get("name"), item.get("repo"), item.get("url")
+        if isinstance(name, str):
+            found[name] = (
+                repo if isinstance(repo, str) else url if isinstance(url, str) else None
+            )
+    return found
 
 
 def _plugin(
@@ -610,17 +692,20 @@ def _plugin(
     claude: str,
     pid: str,
     installed: set[str],
-    markets: set[str],
+    markets: dict[str, str | None],
     sources: dict[str, object],
+    refused: set[str],
 ) -> None:
     """One plugin: skip it, or add its marketplace and install it. Every
-    refusal is a warn naming what to run on the node."""
+    refusal is a warn naming what to run on the node. A marketplace whose add
+    failed is in ``refused`` and never tried again this run: its failure is
+    one warn, and each of its plugins one more naming its own command."""
     item = "plugin:" + pid
     if pid in installed:
         _row(ctx, "skip", item, "installed")
         return
     market = pid.rsplit("@", 1)[1]
-    if market not in markets:
+    if market not in markets and market not in refused:
         source = sources.get(market)
         if not isinstance(source, str):
             _row(
@@ -640,9 +725,19 @@ def _plugin(
                 f"claude plugin marketplace add {source} failed: "
                 f"{_last(ctx, added.stderr)}",
             )
-            return
-        markets.add(market)
-        _row(ctx, "did", "marketplace:" + market, source)
+            refused.add(market)
+        else:
+            markets[market] = source
+            _row(ctx, "did", "marketplace:" + market, source)
+    if market in refused:
+        _row(
+            ctx,
+            "warn",
+            item,
+            f"marketplace {market} could not be added; add it, then run: "
+            f"claude plugin install {pid}",
+        )
+        return
     done = _tool([claude, "plugin", "install", pid, "--scope", "user"])
     if done.returncode != 0:
         _row(
@@ -701,21 +796,42 @@ def _step_plugins(ctx: Ctx) -> None:
             "claude is not installed on this node -- run: magent node setup",
         )
         return
-    installed = _listed([claude, "plugin", "list", "--json"], "id")
-    markets = _listed([claude, "plugin", "marketplace", "list", "--json"], "name")
-    if installed is None or markets is None:
-        _row(
-            ctx,
-            "fail",
-            "plugins",
-            "claude plugin list --json did not answer; run it on the node to see why",
-        )
-        return
+    listings: list[list[dict[str, object]]] = []
+    for argv in (
+        [claude, "plugin", "list", "--json"],
+        [claude, "plugin", "marketplace", "list", "--json"],
+    ):
+        items = _listing(argv)
+        if items is None:
+            _row(
+                ctx,
+                "fail",
+                "plugins",
+                f"claude {' '.join(argv[1:])} did not answer; run it on the node "
+                "to see why",
+            )
+            return
+        listings.append(items)
+    installed = _user_plugins(listings[0])
+    markets = _node_markets(listings[1])
     raw_sources = ctx.manifest.get("marketplaces")
     sources = raw_sources if isinstance(raw_sources, dict) else {}
     mark = len(ctx.rows)
+    for market in sorted({pid.rsplit("@", 1)[1] for pid in plugins}):
+        # Re-adding a marketplace the node knows by this name would swap what
+        # every plugin of it resolves against there: say so, and leave it.
+        here, there = markets.get(market), sources.get(market)
+        if isinstance(here, str) and isinstance(there, str) and here != there:
+            _row(
+                ctx,
+                "warn",
+                "marketplace:" + market,
+                f"on this node points at {_unauth(here)}, not {_unauth(there)}; "
+                "left alone",
+            )
+    refused: set[str] = set()
     for pid in plugins:
-        _plugin(ctx, claude, pid, installed, markets, sources)
+        _plugin(ctx, claude, pid, installed, markets, sources, refused)
     _remember(ctx, "plugins", want, mark)
 
 
