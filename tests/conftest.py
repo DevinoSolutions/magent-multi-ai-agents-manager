@@ -74,6 +74,8 @@ _IMPORT_BOUND_PATHS = (
     ("magent.upload_server", "_PICKER_ATTACHED_FILE", "picker-attached"),
     ("magent.upload_server", "_UPLOAD_DIR", "uploads"),
     ("magent.psmux", "DECOR_STAMP", "decor.stamp"),
+    ("magent.nodes", "NODES_DIR", "nodes"),
+    ("magent.nodes", "NODE_MAP_PATH", "nodes/node-map.json"),
     # win32-only module (it raises ImportError elsewhere by design), so this
     # entry is skipped rather than imported off-Windows.
     ("magent.hotkey", "_PID_PATH", "hotkey.pid"),
