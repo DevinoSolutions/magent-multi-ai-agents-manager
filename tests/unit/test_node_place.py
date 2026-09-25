@@ -288,3 +288,60 @@ class TestTheHardMemoryFloor:
         )
 
         assert (placement.nick, placement.reason) == ("second", "kept")
+
+
+class TestStickiness:
+    def test_a_placed_project_stays_on_its_node_even_when_another_is_quieter(
+        self, tmp_path
+    ):
+        placement = nodes.place(
+            pool("second", "third"),
+            _samples(tmp_path, second="quiet", third="bursty"),
+            now=NOW,
+            map_entry="third",
+        )
+
+        assert (placement.nick, placement.reason, placement.note) == (
+            "third",
+            "kept",
+            None,
+        )
+
+    def test_a_kept_placement_needs_no_samples_at_all(self):
+        placement = nodes.place(pool("second"), {}, now=NOW, map_entry="second")
+
+        assert (placement.nick, placement.reason) == ("second", "kept")
+
+    def test_a_project_whose_node_left_the_config_is_re_placed_and_says_why(
+        self, tmp_path
+    ):
+        placement = nodes.place(
+            pool("second", "third"),
+            _samples(tmp_path, second="quiet", third="bursty"),
+            now=NOW,
+            map_entry="fourth",
+        )
+
+        assert (placement.nick, placement.reason) == ("second", "re-placed")
+        assert placement.note == (
+            "'fourth' is no longer in settings.nodes; re-placed on 'second'"
+        )
+
+    def test_a_vanished_node_with_nothing_to_score_names_the_vanished_node(self):
+        placement = nodes.place(pool("second"), {}, now=NOW, map_entry="fourth")
+
+        assert (placement.nick, placement.reason) == (None, "no-data")
+        assert placement.note == "'fourth' is no longer in settings.nodes"
+
+    def test_projects_placed_earlier_in_the_same_pass_count_as_my_sessions(
+        self, tmp_path
+    ):
+        placement = nodes.place(
+            pool("second", "third"),
+            _samples(tmp_path, second="quiet", third="quiet"),
+            now=NOW,
+            map_entry=None,
+            placed={"second": 1},
+        )
+
+        assert placement.nick == "third"  # second 0.50 vs third 0.45
