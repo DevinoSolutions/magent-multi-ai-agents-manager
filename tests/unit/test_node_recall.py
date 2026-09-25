@@ -2124,7 +2124,7 @@ def moving(monkeypatch, api_repo):
     return events, state
 
 
-def _recall_to(runner, cfg: str, nick: str):
+def _invoke_recall_to(runner, cfg: str, nick: str):
     return runner.invoke(
         cli.main, ["--config", cfg, "node", "recall", "api", "--to", nick]
     )
@@ -2144,7 +2144,7 @@ class TestRecallTo:
     ):
         events, state = moving
 
-        result = _recall_to(runner, placed_api, "third")
+        result = _invoke_recall_to(runner, placed_api, "third")
 
         cfg = pool("second", "third")
         proj = ProjectConfig(path=str(state.path), title="api", node="third")
@@ -2163,7 +2163,7 @@ class TestRecallTo:
     ):
         # Forward correction (plan G :4015): install_transcripts returns an
         # InstalledTranscripts; the line names its .landed, never the object.
-        result = _recall_to(runner, placed_api, "third")
+        result = _invoke_recall_to(runner, placed_api, "third")
 
         assert f"installed the conversation on @third in {_landed()}" in result.stdout
         assert "InstalledTranscripts(" not in result.stdout
@@ -2180,7 +2180,7 @@ class TestRecallTo:
             lambda node, remote_root, source, *, timeout_s: installed,
         )
 
-        result = _recall_to(runner, placed_api, "third")
+        result = _invoke_recall_to(runner, placed_api, "third")
 
         assert result.exit_code == 0
         assert installed.note  # the property the recall prints, not a copy of it
@@ -2189,14 +2189,17 @@ class TestRecallTo:
     def test_an_install_that_kept_nothing_prints_no_note(
         self, runner, placed_api, node_answers, moving
     ):
-        result = _recall_to(runner, placed_api, "third")
+        result = _invoke_recall_to(runner, placed_api, "third")
 
+        # The install really ran (else an early refusal would pass the absence).
+        assert result.exit_code == 0
+        assert f"installed the conversation on @third in {_landed()}" in result.stdout
         assert "kept the node's" not in result.stdout
 
     def test_the_old_placement_is_cleared_before_the_bring_up_records_the_new_one(
         self, runner, placed_api, node_answers, moving
     ):
-        _recall_to(runner, placed_api, "third")
+        _invoke_recall_to(runner, placed_api, "third")
 
         assert "api" not in nodes.read_node_map()
 
@@ -2212,7 +2215,7 @@ class TestRecallTo:
 
         monkeypatch.setattr(remote_mux, "install_transcripts", _refuse)
 
-        result = _recall_to(runner, placed_api, "third")
+        result = _invoke_recall_to(runner, placed_api, "third")
 
         assert result.exit_code == 3
         assert nodes.read_node_map()["api"].nick == "second"
@@ -2230,7 +2233,7 @@ class TestRecallTo:
             ),
         )
 
-        result = _recall_to(runner, placed_api, "third")
+        result = _invoke_recall_to(runner, placed_api, "third")
 
         assert result.exit_code == 3
         assert "local tree is dirty" in result.stderr
@@ -2246,7 +2249,7 @@ class TestRecallTo:
 
         monkeypatch.setattr(nodes, "update_node_map", _held)
 
-        result = _recall_to(runner, placed_api, "third")
+        result = _invoke_recall_to(runner, placed_api, "third")
 
         assert result.exit_code == 1
         assert "could not clear api's placement" in result.stderr
@@ -2255,17 +2258,23 @@ class TestRecallTo:
     def test_an_unknown_node_exits_2_before_anything_is_touched(
         self, runner, placed_api, node_answers, moving
     ):
-        result = _recall_to(runner, placed_api, "ninth")
+        result = _invoke_recall_to(runner, placed_api, "ninth")
 
         assert result.exit_code == 2
+        # Forward correction (plan G :4165-4168 assumed T14 already had --to):
+        # click's "No such option" exits 2 and touches nothing too, so the
+        # refusal is pinned by its own words (plan :4182).
+        assert "no node named 'ninth'" in result.stderr
         assert node_answers == []
 
     def test_the_node_it_is_already_on_exits_2(
         self, runner, placed_api, node_answers, moving
     ):
-        result = _recall_to(runner, placed_api, "second")
+        result = _invoke_recall_to(runner, placed_api, "second")
 
         assert result.exit_code == 2
+        # Same forward correction: the refusal's own words (plan :4184).
+        assert "already on @second" in result.stderr
         assert node_answers == []
 
     def test_a_pinned_project_is_moved_by_editing_the_config_not_by_recall(
@@ -2279,7 +2288,7 @@ class TestRecallTo:
             )
         )
 
-        result = _recall_to(runner, cfg, "third")
+        result = _invoke_recall_to(runner, cfg, "third")
 
         assert result.exit_code == 2
         assert 'change its "node"' in result.stderr
@@ -2299,7 +2308,7 @@ class TestRecallTo:
             )
         )
 
-        result = _recall_to(runner, cfg, "third")
+        result = _invoke_recall_to(runner, cfg, "third")
 
         assert result.exit_code == 2
         assert "'../escaped'" in result.stderr

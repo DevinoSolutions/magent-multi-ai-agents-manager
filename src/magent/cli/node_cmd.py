@@ -46,7 +46,8 @@ if TYPE_CHECKING:
 #   (:3444-3449). Needs node_recipe, node_git_states, push_files. When it
 #   lands:
 #   - `_tail` (:3398-3399) already landed with recall (T14); do not re-add it;
-#   - add `import dataclasses` (push_cmd calls `dataclasses.replace`);
+#   - add `import dataclasses` (push_cmd, and recall --to's `_destination`
+#     and `_recall_to`, call `dataclasses.replace`);
 #   - `RemoteError` stays under TYPE_CHECKING (already there, for `_tail`);
 #   - `_current_nick` and `push_cmd` import `nodes` in-body like every other
 #     function here -- the plan's code reads a module-level `nodes`.
@@ -54,11 +55,16 @@ if TYPE_CHECKING:
 #   :3853-3874 (remote_mux.kill_session and its three outcomes); on None it
 #   prints `_kill_hint(source.target, held.sid)`, never the plan's raw
 #   f-string (spec-G14 P1). Needs kill_session.
-# - recall --to (Task 15): the option (:3934) and its usage rule, the two
-#   `to_local` guards (:3960-3962, :3969-3970), `_destination` and
-#   `_recall_to` (:4173-4249) wired in at :4252-4266, and the recall docs row's
-#   "(--to <nick> | --local)" wording in cli/docs.py. Needs node_recipe,
-#   node_git_states, bring_up_node_project, NodeBringUpOutcome.
+# - recall --to (Task 15): the option (:3934) and its usage rule; the two
+#   `to_local` guards -- `_local_dir` only for --local (:3960-3962), and
+#   `_recall_local` back under `if local_dir is not None:` with `_recall_to`
+#   as its `elif` (:3969-3970, :4252-4266); `_destination` and `_recall_to`
+#   (:4173-4249, which need `import dataclasses`, above); the recall docs
+#   row's "(--to <nick> | --local)" wording in cli/docs.py; and regenerate the
+#   help snapshots in tests/unit/test_cli_structure.py -- the ("node",
+#   "recall") entry and, if the docstring changes, the ("node",) group's
+#   short help. Needs node_recipe, node_git_states, bring_up_node_project,
+#   NodeBringUpOutcome.
 # - `Path` is a RUNTIME import (recall builds paths at run time); keep it out
 #   of TYPE_CHECKING when D's imports are merged.
 # Exit criterion: after D merges,
