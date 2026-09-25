@@ -2746,13 +2746,16 @@ DOCTOR_ITEMS = (
 )
 
 
-# The four probes doctor.sh bounds with `timeout`, as (fake, argv match). A
-# hung one sleeps past every bound, and past the whole call's before the fix.
+# Probes doctor.sh bounds with `timeout`, as (fake, argv match): the four that
+# can stall, plus two of the five version reads. A hung one sleeps past every
+# bound, and past the whole call's before the fix.
 HUNG_PROBES = {
     "tmux": ("tmux", "list-sessions"),
     "claude": ("claude", "auth status"),
     "ssh": ("ssh", "git@github.com"),
     "df": ("df", "-Pk"),
+    "tmux-version": ("tmux", "-V"),
+    "git-version": ("git", "--version"),
 }
 HANG_S = 30.0
 
@@ -3126,6 +3129,8 @@ class TestDoctorShUnderRealBash:
             ),
             ("ssh", "github-key", "fail", 12, "ssh to github.com timed out after 12s"),
             ("df", "disk", "warn", 4, "df did not answer in 4s under ~/magent"),
+            ("tmux-version", "tmux", "fail", 4, "tmux -V timed out after 4s"),
+            ("git-version", "git", "fail", 4, "git --version timed out after 4s"),
         ],
     )
     def test_a_hung_probe_is_its_own_row_inside_the_budget(
@@ -3160,23 +3165,31 @@ class TestDoctorShUnderRealBash:
 
 
 def test_doctor_inlines_the_tmux_floor():
-    # One predicate for setup, doctor and (by DECISION-22) bring_up's floor.
-    assert "magent_tmux_verdict()" in node_scripts.script("doctor")
+    # One predicate for setup, doctor and (by DECISION-22) bring_up's floor:
+    # doctor reads `tmux -V` under its own bound and grades it with the floor's.
+    text = node_scripts.script("doctor")
+    assert "magent_tmux_grade()" in text
+    assert 'verdict=$(magent_tmux_grade "$out")' in text
 
 
 def test_the_probe_bounds_fit_inside_the_doctor_call():
     # Every bounded probe hanging at once, each killed after its grace, still
     # leaves the report time to come back over ssh (connect included).
     text = node_scripts.script("doctor")
-    bounds = dict(re.findall(r"^([A-Z]+_PROBE_S)=(\d+)$", text, re.MULTILINE))
+    bounds = dict(re.findall(r"^([A-Z]+_PROBE_S)=(\d+)\b", text, re.MULTILINE))
     assert set(bounds) == {
         "CLAUDE_PROBE_S",
         "GITHUB_PROBE_S",
         "TMUX_PROBE_S",
         "DF_PROBE_S",
+        "VERSION_PROBE_S",
     }
     (grace,) = re.findall(r"^PROBE_KILL_S=(\d+)\b", text, re.MULTILINE)
-    worst = sum(int(b) + int(grace) for b in bounds.values())
+    # VERSION_PROBE_S bounds every `<tool> --version` in main plus `tmux -V`.
+    tools = re.findall(r"^  check_tool \S+ (?:fail|warn) ", text, re.MULTILINE)
+    assert len(tools) == 4
+    uses = dict.fromkeys(bounds, 1) | {"VERSION_PROBE_S": len(tools) + 1}
+    worst = sum(uses[name] * (int(b) + int(grace)) for name, b in bounds.items())
     assert worst + remote_mux.CONNECT_TIMEOUT_S < remote_mux.DOCTOR_TIMEOUT_S
 
 

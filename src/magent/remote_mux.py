@@ -723,10 +723,10 @@ def setup_node(
     return _report_of(result, "setup", root, args=names, stdin=key)
 
 
-# doctor.sh bounds each probe that can stall (claude 8s, github 12s, tmux 4s,
-# df 4s, each plus a 2s kill grace): 36s if all four hang at once, plus the
-# ssh connect and the unbounded version probes. 30s could not hold that.
-DOCTOR_TIMEOUT_S = 60.0
+# doctor.sh bounds every probe (claude 8s, github 12s, tmux 4s, df 4s, and
+# 4s for each of its five version reads, each plus a 2s kill grace): 66s if
+# all of them hang at once, plus the ssh connect. 60s could not hold that.
+DOCTOR_TIMEOUT_S = 90.0
 
 
 def doctor(node: Node, *, timeout_s: float) -> ProvisionReport:

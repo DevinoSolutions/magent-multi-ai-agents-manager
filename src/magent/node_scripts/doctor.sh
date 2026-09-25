@@ -15,11 +15,12 @@ GIB_KB=1048576  # df -Pk reports KiB
 # A probe that can stall -- a token refresh, a DNS lookup, a wedged tmux
 # server, a hung mount -- runs under its OWN time limit, so one stuck probe
 # is one row, never the whole report lost to remote_mux.DOCTOR_TIMEOUT_S
-# (which covers all four hanging at once; pinned by test).
+# (which covers every one of them hanging at once; pinned by test).
 CLAUDE_PROBE_S=8
 GITHUB_PROBE_S=12
 TMUX_PROBE_S=4
 DF_PROBE_S=4
+VERSION_PROBE_S=4  # each `<tool> --version`, and `tmux -V`
 PROBE_KILL_S=2  # a probe that ignores TERM gets KILL this much later
 
 say() { printf '%s\t%s\t%s\n' "$1" "$2" "${3:-}"; }
@@ -35,26 +36,43 @@ bounded() {
 timed_out() { [ "$1" -eq 124 ] || [ "$1" -eq 137 ]; }
 
 # check_tool <name> <status when missing> <version argv...>
+# A version read that hangs gets the same status as a missing tool.
 check_tool() {
-  local name=$1 missing=$2
+  local name=$1 missing=$2 out rc
   shift 2
-  if command -v "$name" >/dev/null 2>&1; then
-    say ok "$name" "$("$@" 2>&1 | head -n1)"
-  else
+  if ! command -v "$name" >/dev/null 2>&1; then
     say "$missing" "$name" "$name is not on PATH -- run: magent node setup"
+    return
+  fi
+  out=$(bounded "$VERSION_PROBE_S" "$@" 2>&1)
+  rc=$?
+  if timed_out "$rc"; then
+    say "$missing" "$name" "$* timed out after ${VERSION_PROBE_S}s"
+  else
+    say ok "$name" "${out%%$'\n'*}"
   fi
 }
 
 # tmux is on PATH AND at bring_up.sh's floor (DECISION-22): an old tmux is a
 # fail, because the first bring-up would refuse it with rc 4.
 check_tmux() {
-  local verdict version floor
-  verdict=$(magent_tmux_verdict)
+  local out rc verdict version floor
+  if ! command -v tmux >/dev/null 2>&1; then
+    say fail tmux "tmux is not on PATH -- run: magent node setup"
+    return
+  fi
+  out=$(bounded "$VERSION_PROBE_S" tmux -V 2>/dev/null)
+  rc=$?
+  if timed_out "$rc"; then
+    say fail tmux "tmux -V timed out after ${VERSION_PROBE_S}s"
+    return
+  fi
+  [ "$rc" -eq 0 ] || out=""
+  verdict=$(magent_tmux_grade "$out")
   version=${verdict#*$'\t'}
   floor=$(magent_tmux_floor)
   case ${verdict%%$'\t'*} in
     ok) say ok tmux "$version" ;;
-    missing) say fail tmux "tmux is not on PATH -- run: magent node setup" ;;
     unread) say fail tmux "cannot read the tmux version ($version); magent needs tmux $floor or newer" ;;
     *) say fail tmux "$version is too old; magent needs tmux $floor or newer -- upgrade tmux on this node" ;;
   esac
