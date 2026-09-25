@@ -849,12 +849,20 @@ def _session_root(remote_root: str) -> str:
     check on its own expanded value never sees it (plan G Task 9's forward
     correction). Anything else -- a relative path, a leading ``-`` read as an
     option, another user's ``~user`` -- raises NodeConfigError before a
-    connection is opened."""
-    if remote_root == "~" or remote_root.startswith(("~/", "/")):
-        return remote_root
-    raise NodeConfigError(
-        f"session root {remote_root!r} is not ~, ~/... or an absolute path on the node"
-    )
+    connection is opened. So does a ``..`` segment (it walks out of the root
+    it names) and any C0/DEL/C1 control character (a newline or TAB splits
+    the node's report rows; ESC drives the terminal the root is echoed on).
+    A trailing ``/`` is fine."""
+    if not (remote_root == "~" or remote_root.startswith(("~/", "/"))):
+        raise NodeConfigError(
+            f"session root {remote_root!r} is not ~, ~/... or an absolute path "
+            "on the node"
+        )
+    if ".." in remote_root.split("/"):
+        raise NodeConfigError(f"session root {remote_root!r} has a '..' segment")
+    if any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in remote_root):
+        raise NodeConfigError(f"session root {remote_root!r} holds a control character")
+    return remote_root
 
 
 def _stdout_text(done: subprocess.CompletedProcess[bytes]) -> str:

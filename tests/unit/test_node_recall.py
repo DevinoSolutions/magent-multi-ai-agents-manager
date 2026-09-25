@@ -283,6 +283,65 @@ class TestRepoStatusScript:
 
         assert out == "~/magent/gone\t\t\tmissing\t-1\n"
 
+    def test_a_status_git_cannot_read_is_unknown_not_clean(
+        self, monkeypatch, home, tmp_path
+    ):
+        repo = self._clone(home, tmp_path, "api")
+        head = git(repo, "rev-parse", "HEAD")
+        (repo / ".git" / "index").write_bytes(b"DIRC-this-is-not-an-index")
+
+        out = _as_the_node(
+            _node_call(monkeypatch, "repo_status", ["~/magent/api"]), home
+        )
+
+        assert out == f"~/magent/api\t{head}\tmain\tunknown\t0\n"
+        (status,) = nodes.parse_repo_status(out)
+        assert status.dirty is None
+
+    def test_reading_the_status_never_rewrites_the_index(
+        self, monkeypatch, home, tmp_path
+    ):
+        repo = self._clone(home, tmp_path, "api")
+        # A tracked file whose stat no longer matches the index: a plain
+        # `git status` refreshes (rewrites) the index to record the new stat.
+        stamp = (repo / "README.md").stat().st_mtime + 120
+        os.utime(repo / "README.md", (stamp, stamp))
+        index = repo / ".git" / "index"
+        before = (index.read_bytes(), index.stat().st_mtime_ns)
+
+        _as_the_node(_node_call(monkeypatch, "repo_status", ["~/magent/api"]), home)
+
+        assert (index.read_bytes(), index.stat().st_mtime_ns) == before
+
+    def test_a_repo_with_no_upstream_has_an_unknown_count(
+        self, monkeypatch, home, tmp_path
+    ):
+        repo = home / "magent" / "api"
+        git(tmp_path, "init", "-b", "main", str(repo))
+        (repo / "a.txt").write_text("a\n", encoding="utf-8")
+        git(repo, "add", "a.txt")
+        git(repo, "commit", "-m", "local")
+
+        out = _as_the_node(
+            _node_call(monkeypatch, "repo_status", ["~/magent/api"]), home
+        )
+
+        assert out.endswith("\tmain\tfalse\t-1\n")
+        (status,) = nodes.parse_repo_status(out)
+        assert status.unpushed is None
+
+    def test_a_hidden_child_of_a_workspace_is_not_a_repo_of_it(
+        self, monkeypatch, home, tmp_path
+    ):
+        self._clone(home, tmp_path, "ws/a")
+        self._clone(home, tmp_path, "ws/.hidden")
+
+        out = _as_the_node(
+            _node_call(monkeypatch, "repo_status", ["~/magent/ws"]), home
+        )
+
+        assert [line.split("\t")[0] for line in out.splitlines()] == ["~/magent/ws/a"]
+
 
 def _pulled(tmp_path: Path) -> Path:
     source = tmp_path / "pulled"
@@ -456,7 +515,30 @@ class TestASessionRootIsCheckedBeforeItReachesTheNode:
     ssh-side program could read as an option, another user's ``~user``) is
     refused before a connection is opened."""
 
-    @pytest.mark.parametrize("root", ["magent/x", "-x", "~user/x", ""])
+    @pytest.mark.parametrize(
+        "root",
+        [
+            "magent/x",
+            "-x",
+            "~user/x",
+            "~other",
+            "",
+            # a ".." segment walks out of the root it names
+            "~/..",
+            "~/magent/../../etc",
+            "/srv/magent/..",
+            "/..",
+            # control characters: a newline or TAB splits the node's report
+            # rows, ESC and C1 drive the terminal the root is echoed on
+            "~/magent/a\nb",
+            "~/magent/a\tb",
+            "~/magent/a\rb",
+            "~/magent/\x1b[2Jx",
+            "/srv/a\x7fb",
+            "/srv/a\x9bb",
+            "/srv/a\x00b",
+        ],
+    )
     @pytest.mark.parametrize(
         "call",
         [
@@ -476,7 +558,19 @@ class TestASessionRootIsCheckedBeforeItReachesTheNode:
 
         assert fake_ssh.calls() == []
 
-    @pytest.mark.parametrize("root", ["~", "~/magent/api", "/srv/magent/api"])
+    @pytest.mark.parametrize(
+        "root",
+        [
+            "~",
+            "~/",
+            "~/magent/api",
+            "~/magent/api/",
+            "/srv/magent/api",
+            "/srv/magent/api/",
+            "~/magent/..hidden/x",
+            "~/magent/a..b",
+        ],
+    )
     def test_home_and_absolute_roots_are_sent_as_given(self, monkeypatch, root):
         seen: list[list[str]] = []
 
