@@ -700,6 +700,12 @@ def register_ssh_key(pubkey: str, *, title: str) -> ScriptLine:
         err = added.stderr.decode("utf-8", "replace").strip().splitlines()
         detail = err[-1][:200] if err else f"exited {added.returncode}"
         return ScriptLine("fail", "github-key", f"gh ssh-key add failed: {detail}")
+    # gh de-duplicates too, and says so on stderr with exit 0: when our own
+    # listing failed, that is the only word that the key was already there.
+    if "already exists" in added.stderr.decode("utf-8", "replace"):
+        return ScriptLine(
+            "skip", "github-key", f"already registered to {account.login}"
+        )
     return ScriptLine(
         "did", "github-key", f"registered to {account.login} as {title!r}"
     )

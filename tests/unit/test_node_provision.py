@@ -1442,3 +1442,16 @@ class TestRegisterSshKey:
         assert row.detail.endswith(
             "HTTP 422: key is already in use (https://api.github.com/user/keys)"
         )
+
+    def test_gh_finding_the_key_itself_is_a_skip_not_a_did(self, fake_gh):
+        # gh ssh-key add de-duplicates on its own (one unpaginated user/keys
+        # page) and exits 0; when magent's own listing failed, that exit 0 is
+        # the only word that the key was already there.
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("user/keys", stderr="HTTP 502\n", rc=1)
+        fake_gh.set_reply(
+            "ssh-key add",
+            stderr="✓ Public key already exists on your account\n",
+        )
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine("skip", "github-key", "already registered to amin")
