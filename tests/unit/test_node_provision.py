@@ -1514,9 +1514,11 @@ class TestProvision:
         bounds: list[tuple[str, float]] = []
         real = remote_mux.run_script
 
+        # The bound is recorded, not enforced: the fake ssh's own start can
+        # take longer than 5s on a loaded Windows box.
         def spy(node, name, args, **kwargs):
             bounds.append((name, kwargs["timeout_s"]))
-            return real(node, name, args, **kwargs)
+            return real(node, name, args, **{**kwargs, "timeout_s": 60.0})
 
         monkeypatch.setattr(remote_mux, "run_script", spy)
         spec = {"type": "stdio", "command": "npx"}
