@@ -19,12 +19,13 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import threading
 import time
 
 import pytest
 
-from magent import launch, nodes, remote_mux
+from magent import launch, log, nodes, remote_mux
 from magent.config import (
     NODE_AUTO,
     NODE_CLOUD,
@@ -834,7 +835,7 @@ class TestTheLaunchPhase:
         assert [p.node for p in placed.projects] == ["second", "second"]
         assert placed.placements["api"].reason == "kept"
 
-    def test_a_dry_run_note_names_the_nodes_that_would_be_read_live(
+    def test_a_no_live_pass_note_names_the_nodes_that_would_be_read_live(
         self, remote_samples
     ):
         config = pool("second", "third", projects=[_auto("api")])
@@ -845,10 +846,24 @@ class TestTheLaunchPhase:
 
         assert placed.notes == [
             (
-                "api: not launched -- dry run: second, third would take a live"
-                ' reading at launch; pin a node with "node": "<nick>"'
+                "api: not launched -- no live reading taken: second, third would"
+                ' take a live reading at launch; pin a node with "node": "<nick>"'
             )
         ]
+
+    def test_the_sampler_warms_the_nodes_logger_before_any_worker_runs(
+        self, remote_samples
+    ):
+        # get_logger is check-then-set: the warm-up must configure
+        # "magent.nodes" on the calling thread, before the closure can run
+        # anywhere. conftest's log.reset_logging() hands every test an
+        # unconfigured logger; the first assert proves this one starts there.
+        logger = logging.getLogger("magent.nodes")
+        assert not getattr(logger, log._CONFIGURED_ATTR, False)
+
+        launch._live_sampler(pool("second"))
+
+        assert getattr(logger, log._CONFIGURED_ATTR, False) is True
 
     def test_a_failed_live_reading_is_not_fatal_and_is_named(
         self, remote_samples, monkeypatch
@@ -958,3 +973,26 @@ class TestRunMagentPlacesBeforeItLaunches:
             launch.run_magent(config, opts)
 
         assert remote_samples == live_reads
+
+    @pytest.mark.parametrize(
+        "opts",
+        [
+            pytest.param(RunOpts(dry_run=True), id="dry-run"),
+            pytest.param(RunOpts(tile_only=True), id="tile-only"),
+        ],
+    )
+    def test_a_pass_without_live_readings_says_so_not_dry_run(
+        self, fake_platform, monkeypatch, capsys, remote_samples, opts
+    ):
+        monkeypatch.setattr(launch, "_launch_projects", _stop_before_launch)
+        config = pool("second", "third", projects=[_auto("api")])
+
+        with pytest.raises(_StopBeforeLaunch):
+            launch.run_magent(config, opts)
+
+        out = capsys.readouterr().out
+        assert (
+            "api: not launched -- no live reading taken: second, third would take"
+            " a live reading at launch"
+        ) in out
+        assert "dry run: second" not in out

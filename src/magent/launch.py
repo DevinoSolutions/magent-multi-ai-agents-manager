@@ -867,14 +867,15 @@ def _unplaced_reason(samples: dict[str, list[LoadSample]], *, live: bool) -> str
     """Why no node could be scored, named per cause. ``samples`` is
     ``placement_samples``' output, where a node ends up with no sample only
     when its window was empty and either no live reading was allowed (a dry
-    run) or the live reading failed -- a thin node always gets one."""
+    run or a tile-only pass -- the wording fits both) or the live reading
+    failed -- a thin node always gets one."""
     from magent import nodes
 
     blank = ", ".join(nick for nick, window in samples.items() if not window)
     if not blank:
         return nodes.PLACE_REASONS["no-data"]
     if not live:
-        return f"dry run: {blank} would take a live reading at launch"
+        return f"no live reading taken: {blank} would take a live reading at launch"
     return f"live reading failed for {blank} (see ~/.magent/logs/launch.log)"
 
 
