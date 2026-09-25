@@ -11,13 +11,15 @@ from __future__ import annotations
 
 import sys
 import time
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, NoReturn
 
 import click
 
 from magent import env, log, nodes
 from magent.cli.app import main
 from magent.cli.config_io import _load_config_or_exit
+from magent.config import NODE_AUTO, is_cloud, runs_on_node
+from magent.fleet import resolve_session
 from magent.lockfile import LockHeld
 from magent.paths import find_config
 from magent.style import style
@@ -25,7 +27,8 @@ from magent.style import style
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from magent.config import MagentConfig
+    from magent.config import MagentConfig, ProjectConfig
+    from magent.nodes import Placement
 
 # How long `node sync -d` waits for the detached child to record its pid.
 _START_POLLS = 20
@@ -203,3 +206,149 @@ def sync_cmd(
         max_ticks=ticks,
         reload=node_sync.ConfigWatch(config_file, cfg, stamp=stamp).current,
     )
+
+
+# Exit codes: 2 = nothing to act on (unknown project, not a node project, not
+# placed, bad destination), 3 = a node did not answer or refused.
+_EXIT_USAGE = 2
+_EXIT_UNREACHABLE = 3
+
+
+def _fail(text: str, code: int) -> NoReturn:
+    click.echo(f"  {style('x', fg='red')} {text}", err=True)
+    sys.exit(code)
+
+
+def _note(text: str) -> None:
+    click.echo(f"  {style('!', fg='yellow')} {text}")
+
+
+def _ok(text: str) -> None:
+    click.echo(f"  {style('+', fg='green')} {text}")
+
+
+def _node_project_or_exit(cfg: MagentConfig, query: str) -> ProjectConfig:
+    """The configured node or cloud project ``query`` names (exact, then a
+    unique substring, then a unique prefix -- the fleet commands' rule), or
+    exit 2. A cloud project is returned too: plan, push and recall each route
+    it explicitly, right after the name (DECISION-15; J11m's branches sit
+    there)."""
+    names = [nodes.project_name(p) for p in cfg.projects]
+    hit = resolve_session(query, names)
+    if hit is None:
+        _fail(f"no configured project matches {query!r}", _EXIT_USAGE)
+    proj = cfg.projects[names.index(hit)]
+    if not (runs_on_node(proj) or is_cloud(proj)):
+        _fail(f'{hit} has no "node" set -- it runs on this machine', _EXIT_USAGE)
+    return proj
+
+
+def _plan_heading(name: str, proj: ProjectConfig, placement: Placement | None) -> str:
+    if proj.node != NODE_AUTO:
+        return f"  {style(name, bold=True)}  pinned -> @{proj.node}"
+    if placement is None or placement.nick is None:
+        return (
+            f"  {style(name, bold=True)}  auto -> nowhere"
+            f" ({nodes.PLACE_REASONS['no-data']})"
+        )
+    return (
+        f"  {style(name, bold=True)}  auto -> @{placement.nick}"
+        f"  {style('(' + nodes.PLACE_REASONS[placement.reason] + ')', dim=True)}"
+    )
+
+
+def _print_scores(placement: Placement) -> None:
+    headers = [
+        "nick",
+        "samples",
+        "p75",
+        "spike",
+        "mem",
+        "my sessions",
+        "score",
+        "chosen",
+    ]
+    rows = [
+        [
+            s.nick,
+            f"{s.samples} live" if s.live else str(s.samples),
+            f"{s.p75:.2f}",
+            f"{s.spike:.2f}",
+            f"{s.mem:.2f}",
+            str(s.my_sessions),
+            f"{s.score:.2f}",
+            "*" if s.nick == placement.nick else ("floor" if s.below_floor else ""),
+        ]
+        for s in placement.scores
+    ]
+    widths = [max(len(r[i]) for r in [headers, *rows]) for i in range(len(headers))]
+    widths[-1] = 0
+    click.echo("  " + style(_table_row(headers, widths), dim=True))
+    for row in rows:
+        click.echo("  " + _table_row(row, widths))
+    if any(s.below_floor for s in placement.scores):
+        floor = f"{nodes.MEM_HARD_FLOOR:.0%}"
+        click.echo(
+            "  "
+            + style(
+                f"floor = under {floor} free memory; skipped while another node"
+                " is above it",
+                dim=True,
+            )
+        )
+
+
+# D-MERGE: `_local_dir` and `_print_push_set` (plan G :3137-3147, :3192-3210)
+# and their call at the end of plan_cmd's loop (:3257) need D's
+# launch.node_git_states; they land with D's merge, and
+# test_plan_lists_the_push_set_relative_to_the_project switches on with it.
+
+
+@node_group.command("plan")
+@click.argument("project", required=False)
+@click.option("--all", "all_projects", is_flag=True, help="Every enabled node project.")
+@click.pass_context
+def plan_cmd(ctx: click.Context, project: str | None, all_projects: bool) -> None:
+    """Show where a node project would run and what it would ship. Writes nothing.
+
+    The same placement a launch makes -- the node-map, the load history and,
+    for a node with too few recent samples, one live reading -- but nothing
+    is recorded and nothing is started.
+    """
+    from magent import launch  # heavy subsystem: in-body per policy
+
+    if (project is None) == (not all_projects):
+        raise click.UsageError("name one project, or pass --all")
+    cfg = _load_config_or_exit(find_config(ctx.obj.get("config_path")))
+    if project is not None:
+        chosen = [_node_project_or_exit(cfg, project)]
+    else:
+        # DECISION-15/26 ix: a cloud project is pin-only and has no node to
+        # plan, so --all takes node projects only.
+        chosen = [p for p in cfg.projects if p.enabled and runs_on_node(p)]
+        if not chosen:
+            click.echo(f'  {style("-", dim=True)} no enabled project has "node" set')
+            return
+    placed = launch.place_node_projects(cfg, chosen)
+    click.echo(
+        f"\n  {style('magent node plan', bold=True)}"
+        f" {style('(a dry run -- nothing is changed)', dim=True)}"
+    )
+    for note in placed.notes:
+        _note(note)
+    for proj in chosen:
+        name = nodes.project_name(proj)
+        click.echo()
+        if is_cloud(proj):
+            # Named on request, never placed: what a cloud session ships is
+            # plan J's `node push`.
+            click.echo(
+                f"  {style(name, bold=True)}  cloud -- pinned;"
+                " there is no node to place it on"
+            )
+            continue
+        placement = placed.placements.get(name)
+        click.echo(_plan_heading(name, proj, placement))
+        if placement is not None and placement.scores:
+            _print_scores(placement)
+        # D-MERGE: _print_push_set(cfg, proj) goes here (plan G :3257).

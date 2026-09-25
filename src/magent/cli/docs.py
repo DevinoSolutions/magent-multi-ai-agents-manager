@@ -480,6 +480,14 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "still runs)."
         ),
     ),
+    (
+        "magent node plan <project|--all>",
+        (
+            "Show where a project would be placed (the load-history score per "
+            "node for `auto`) and which non-git files would be shipped. Writes "
+            "nothing."
+        ),
+    ),
     ("magent config show", "Display current config."),
     ("magent config layout <cols> <rows>", "Set window grid."),
     ("magent config base-dir <path>", "Set projects folder."),
