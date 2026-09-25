@@ -458,6 +458,9 @@ class NodeSyncer:
                 for nick in pool
             }
             results = {nick: f.result() for nick, f in futures.items()}
+        # A node removed from the pool starts fresh if it comes back: its old
+        # state would otherwise swallow the warning for a node still down.
+        self._last = {n: s for n, s in self._last.items() if n in pool}
         for nick, (outcome, detail) in results.items():
             self._note(nick, outcome, detail)
         return results

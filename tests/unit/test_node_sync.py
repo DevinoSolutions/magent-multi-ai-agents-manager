@@ -1073,6 +1073,13 @@ class TestABugInOneNodeFailsItAlone:
         assert record.getMessage() == "node second: failed (internal error: KeyError)"
         assert record.exc_info is not None
         assert record.exc_info[0] is KeyError
+        # The outcome names the type only; the exception's own words ride on
+        # the record's traceback (and so into Sentry), not into tick's result.
+        assert (
+            logging.Formatter()
+            .formatException(record.exc_info)
+            .endswith("KeyError: 'sid'")
+        )
         assert _node_warnings(caplog, "second") == []
 
     def test_a_plain_failure_turning_into_a_bug_is_still_reported(self, placed, caplog):
@@ -1150,12 +1157,12 @@ class TestWhatCountsAsUnreachable:
 
     def test_a_node_cannot_write_terminal_escapes_into_the_log(self, placed, caplog):
         _capture_nodes_log(caplog)
-        tail = "first\n\x1b]0;pwned\x07\x1b[2Jboom\tend\x9b"
+        tail = "first\n\x1b]0;pwned\x07\x1b[2Jboom\x7f\tend\x9b"
         err = remote_mux.RemoteError(1, tail, ("ssh",))
         results = node_sync.NodeSyncer(
             _config(), pull=_pull_raising({"second": err})
         ).tick()
-        assert results["second"] == (node_sync.FAILED, "?]0;pwned??[2Jboom\tend?")
+        assert results["second"] == (node_sync.FAILED, "?]0;pwned??[2Jboom?\tend?")
         (line,) = _node_warnings(caplog, "second")
         assert not re.search(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]", line)
 
@@ -1216,3 +1223,71 @@ class TestAnEmptyRemoteRoot:
                 "node map; skipping it"
             )
         ]
+
+
+class TestARemovedNodeIsForgotten:
+    def test_a_node_removed_and_re_added_while_down_is_warned_again(
+        self, placed, caplog
+    ):
+        _capture_nodes_log(caplog)
+        down = remote_mux.RemoteError(255, REFUSED, ("ssh",))
+        syncer = node_sync.NodeSyncer(_config(), pull=_pull_raising({"second": down}))
+        syncer.tick()
+        syncer.reconfigure(_config(pool={"third": POOL["third"]}))
+        syncer.tick()
+        syncer.reconfigure(_config())
+        syncer.tick()
+        assert (
+            _node_warnings(caplog, "second")
+            == [f"node second: unreachable ({REFUSED.strip()})"] * 2
+        )
+
+
+# 200k nested arrays: json.loads raises RecursionError, not ValueError.
+_TOO_DEEP = "[" * 200_000
+
+
+class TestJsonNestedTooDeeply:
+    def test_a_node_whose_pull_metadata_nests_too_deeply_has_failed(
+        self, placed, caplog
+    ):
+        """Node-controlled input: a bad answer (FAILED at WARNING), never an
+        internal error at ERROR."""
+        _capture_nodes_log(caplog)
+        reply = (
+            remote_mux.PULL_HEADER
+            + _TOO_DEEP.encode("ascii")
+            + b"\n"
+            + remote_mux.PULL_TRAILER
+            + b"0\n"
+        )
+
+        def pull(node, sids):
+            return remote_mux.parse_pull(
+                reply, dest=nodes.node_dir(node.nick), sids=frozenset(sids)
+            )
+
+        results = node_sync.NodeSyncer(_config(), pull=pull).tick()
+        assert results["second"][0] == node_sync.FAILED
+        assert results["second"][1].startswith("unreadable pull metadata")
+        assert _node_errors(caplog) == []
+
+    def test_a_node_map_nested_too_deeply_does_not_stop_the_tick(self, placed):
+        nodes.NODE_MAP_PATH.write_text(_TOO_DEEP, encoding="utf-8")
+        asked: list[set[str]] = []
+
+        def pull(node, sids):
+            asked.append(set(sids))
+            return _snap()
+
+        results = node_sync.NodeSyncer(_config(), pull=pull).tick()
+        assert results == {"second": (node_sync.OK, ""), "third": (node_sync.OK, "")}
+        assert asked == [set(), set()]
+
+    def test_the_strict_reader_calls_it_a_bad_file(self, placed):
+        """ValueError, the one type every strict caller catches for a bad map
+        (state_stores' attention engine holds its last records on it)."""
+        nodes.NODE_MAP_PATH.write_text(_TOO_DEEP, encoding="utf-8")
+        with pytest.raises(ValueError, match="nested too deeply"):
+            nodes.load_node_map_strict()
+        assert nodes.read_node_map() == {}

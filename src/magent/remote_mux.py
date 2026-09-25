@@ -935,7 +935,9 @@ def parse_pull(stdout: bytes, *, dest: Path, sids: Collection[str]) -> NodeSnaps
     meta_line, _, archive = framed.partition(b"\n")
     try:
         meta = json.loads(meta_line.decode("utf-8"))
-    except ValueError as e:
+    # RecursionError: json.loads' answer to deep nesting (200k '[' fit well
+    # inside the reply cap). The node's bad answer, not a bug on this PC.
+    except (ValueError, RecursionError) as e:
         raise _pull_error(f"unreadable pull metadata: {e}") from e
     if not isinstance(meta, dict):
         raise _pull_error("pull metadata is not an object")
