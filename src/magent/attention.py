@@ -30,7 +30,8 @@ from magent.log import get_logger
 from magent.titles import make_title, parse_title
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
+    from pathlib import Path
 
     from magent.platform import Platform
 
@@ -90,45 +91,71 @@ class AttentionEngine:
         now: Callable[[], float] = time.time,
         staleness: dict[str, float] | None = None,
         debounce_s: float = DEBOUNCE_S,
+        extra_stores: Callable[[], Iterable[tuple[str, str, Path]]] | None = None,
     ) -> None:
         self._name_by_cwd = dict(name_by_cwd or {})
         self._now = now
         self._staleness = staleness if staleness is not None else dict(STALENESS_S)
         self._debounce_s = debounce_s
+        self._extra_stores = extra_stores
         self._last_state: dict[str, str] = {}
         self._last_fired: dict[tuple[str, str], float] = {}
 
     def poll(self) -> list[SessionView]:
-        """Read the store and return the current views, most-urgent first."""
+        """Read the store -- and every ``extra_stores`` store: node sessions'
+        mirrored states -- and return the current views, most-urgent first."""
         now = self._now()
         views: list[SessionView] = []
         for rec in agent_state.all_states():
-            raw_state = rec.get("state")
-            raw_cwd = rec.get("cwd")
-            if not isinstance(raw_state, str) or not isinstance(raw_cwd, str):
-                continue
-            ts_raw = rec.get("ts", 0)
-            ts = (
-                float(ts_raw)
-                if isinstance(ts_raw, (int, float)) and not isinstance(ts_raw, bool)
-                else 0.0
-            )
-            age = max(0.0, now - ts)
-            state = raw_state
-            stale_after = self._staleness.get(state)
-            if stale_after is not None and age > stale_after:
-                state = agent_state.IDLE
-            views.append(
-                SessionView(
-                    name=self._name_by_cwd.get(raw_cwd, _leaf(raw_cwd)),
-                    cwd=raw_cwd,
-                    state=state,
-                    ts=ts,
-                    age_s=age,
-                )
-            )
+            view = self._view(rec, now)
+            if view is not None:
+                views.append(view)
+        if self._extra_stores is not None:
+            for label, key, root in self._extra_stores():
+                for rec in agent_state.read_store(root):
+                    view = self._view(rec, now, label=label, key=key)
+                    if view is not None:
+                        views.append(view)
         views.sort(key=lambda v: (_URGENCY.get(v.state, 99), -v.ts))
         return views
+
+    def _view(
+        self,
+        rec: dict[str, object],
+        now: float,
+        *,
+        label: str | None = None,
+        key: str | None = None,
+    ) -> SessionView | None:
+        """One record as a view, or None when it is unusable. A node record
+        (``key`` set, ``@<nick>``) is named by its project (``label``) and its
+        cwd becomes ``<key>:<cwd>``: two nodes can hold the same directory, and
+        transitions and debounce are keyed by cwd. Its ts is the node's clock."""
+        raw_state = rec.get("state")
+        raw_cwd = rec.get("cwd")
+        if not isinstance(raw_state, str) or not isinstance(raw_cwd, str):
+            return None
+        ts_raw = rec.get("ts", 0)
+        ts = (
+            float(ts_raw)
+            if isinstance(ts_raw, (int, float)) and not isinstance(ts_raw, bool)
+            else 0.0
+        )
+        age = max(0.0, now - ts)
+        state = raw_state
+        stale_after = self._staleness.get(state)
+        if stale_after is not None and age > stale_after:
+            state = agent_state.IDLE
+        if key is None:
+            name = self._name_by_cwd.get(raw_cwd, _leaf(raw_cwd))
+            return SessionView(name=name, cwd=raw_cwd, state=state, ts=ts, age_s=age)
+        return SessionView(
+            name=label if label is not None else _leaf(raw_cwd),
+            cwd=f"{key}:{raw_cwd}",
+            state=state,
+            ts=ts,
+            age_s=age,
+        )
 
     def transitions(self, views: list[SessionView]) -> list[Transition]:
         """Diff ``views`` against the previous poll; report entered states.

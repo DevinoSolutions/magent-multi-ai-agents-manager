@@ -903,3 +903,76 @@ class TestRunAttentionLoop:
 
         assert rendered == [1]  # the recorder ran despite the toast fault
         assert "toast failed" in caplog.text
+
+
+class TestNodeStores:
+    @staticmethod
+    def _write(store, name, **rec) -> None:
+        store.mkdir(parents=True, exist_ok=True)
+        (store / name).write_text(json.dumps(rec), encoding="utf-8")
+
+    def test_a_node_record_is_named_by_its_project_and_keyed_by_its_node(
+        self, state_dir, tmp_path
+    ):
+        store = tmp_path / "second-api"
+        self._write(
+            store,
+            "k.json",
+            state="needs-input",
+            ts=990.0,
+            cwd="/home/amin/magent/api",
+            session_id="s",
+        )
+        engine = AttentionEngine(
+            now=lambda: 1000.0, extra_stores=lambda: [("api", "@second", store)]
+        )
+        assert [(v.name, v.cwd, v.state) for v in engine.poll()] == [
+            ("api", "@second:/home/amin/magent/api", "needs-input")
+        ]
+
+    def test_one_directory_on_two_nodes_is_two_sessions(self, state_dir, tmp_path):
+        a, b = tmp_path / "a", tmp_path / "b"
+        self._write(
+            a,
+            "k.json",
+            state="done",
+            ts=990.0,
+            cwd="/home/amin/magent/api",
+            session_id="s",
+        )
+        self._write(
+            b,
+            "k.json",
+            state="done",
+            ts=990.0,
+            cwd="/home/amin/magent/api",
+            session_id="t",
+        )
+        engine = AttentionEngine(
+            now=lambda: 1000.0,
+            extra_stores=lambda: [("api", "@second", a), ("api2", "@third", b)],
+        )
+        views = engine.poll()
+        assert sorted(v.cwd for v in views) == [
+            "@second:/home/amin/magent/api",
+            "@third:/home/amin/magent/api",
+        ]
+        assert len(engine.transitions(views)) == 2
+
+    def test_a_missing_node_store_is_just_empty(self, state_dir, tmp_path):
+        engine = AttentionEngine(
+            extra_stores=lambda: [("api", "@second", tmp_path / "nope")]
+        )
+        assert engine.poll() == []
+
+    def test_this_pcs_own_records_read_exactly_as_before(self, state_dir, tmp_path):
+        self._write(
+            state_dir,
+            "k.json",
+            state="working",
+            ts=990.0,
+            cwd="/w/local",
+            session_id="s",
+        )
+        engine = AttentionEngine(now=lambda: 1000.0, extra_stores=list)
+        assert [(v.name, v.cwd) for v in engine.poll()] == [("local", "/w/local")]

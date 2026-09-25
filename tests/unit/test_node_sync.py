@@ -8,14 +8,16 @@ is 0 for every test that does not set it back.
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
 import pytest
 
-from magent import node_sync, nodes
+from magent import agent_state, node_sync, nodes
 from magent.config import (
     SCHEMA_VERSION,
     MagentConfig,
@@ -296,3 +298,47 @@ class TestTheDaemonHasOneName:
         assert name == node_sync.LOCK_NAME
         assert f"{name}-supervisor" == node_sync.SUPERVISOR_LOCK_NAME
         assert node_sync._PID_PATH.name == f"{name}.pid"
+
+
+class TestAttentionSeesNodeSessions:
+    @pytest.fixture
+    def local_store(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(agent_state, "STATE_DIR", tmp_path / "local-state")
+        monkeypatch.setattr(agent_state, "_swept_this_process", True)
+
+    def test_a_node_sessions_state_reaches_the_engine_under_its_project(
+        self, placed, local_store
+    ):
+        from magent.cli.attention_cmd import engine_from_config
+
+        store = nodes.state_dir("second", "api")
+        store.mkdir(parents=True)
+        record = {
+            "state": "needs-input",
+            "ts": time.time(),
+            "cwd": "/home/amin/magent/api",
+            "session_id": "s",
+        }
+        (store / "k.json").write_text(json.dumps(record), encoding="utf-8")
+        views = engine_from_config(_config()).poll()
+        assert [(v.name, v.cwd, v.state) for v in views] == [
+            ("api", "@second:/home/amin/magent/api", "needs-input")
+        ]
+
+    def test_without_a_node_project_the_engine_reads_only_this_pc(
+        self, placed, local_store
+    ):
+        from magent.cli.attention_cmd import engine_from_config
+
+        store = nodes.state_dir("second", "api")
+        store.mkdir(parents=True)
+        (store / "k.json").write_text(
+            json.dumps(
+                {"state": "done", "ts": time.time(), "cwd": "/x", "session_id": "s"}
+            ),
+            encoding="utf-8",
+        )
+        assert (
+            engine_from_config(_config(projects=[ProjectConfig(path="api")])).poll()
+            == []
+        )
