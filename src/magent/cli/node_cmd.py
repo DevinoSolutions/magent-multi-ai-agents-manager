@@ -231,8 +231,10 @@ def sync_cmd(
     )
 
 
-# Exit codes: 2 = nothing to act on (unknown project, not a node project, not
-# placed, bad destination), 3 = a node did not answer or refused.
+# Exit codes: 2 = nothing to act on (unknown project, not a node project, a
+# recall of a project the node-map does not place, bad destination), 3 = a node
+# did not answer or refused. A plan that places a project nowhere is an
+# answer, not a failure: it exits 0.
 _EXIT_USAGE = 2
 _EXIT_UNREACHABLE = 3
 
@@ -297,6 +299,9 @@ def _print_scores(placement: Placement) -> None:
         "score",
         "chosen",
     ]
+    # The floor only skips a node while another is above it; when every node
+    # is under it, place() falls back to all of them and nothing was skipped.
+    floor_applied = any(not s.below_floor for s in placement.scores)
     rows = [
         [
             s.nick,
@@ -306,7 +311,9 @@ def _print_scores(placement: Placement) -> None:
             f"{s.mem:.2f}",
             str(s.my_sessions),
             f"{s.score:.2f}",
-            "*" if s.nick == placement.nick else ("floor" if s.below_floor else ""),
+            "*"
+            if s.nick == placement.nick
+            else ("floor" if floor_applied and s.below_floor else ""),
         ]
         for s in placement.scores
     ]
@@ -315,7 +322,7 @@ def _print_scores(placement: Placement) -> None:
     click.echo("  " + style(_table_row(headers, widths), dim=True))
     for row in rows:
         click.echo("  " + _table_row(row, widths))
-    if any(s.below_floor for s in placement.scores):
+    if floor_applied and any(s.below_floor for s in placement.scores):
         floor = f"{nodes.MEM_HARD_FLOOR:.0%}"
         click.echo(
             "  "

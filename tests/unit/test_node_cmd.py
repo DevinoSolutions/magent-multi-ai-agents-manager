@@ -336,7 +336,10 @@ class TestNodePlan:
 
         rows = _score_rows(result.stdout, "second", "third")
         assert result.exit_code == 0
+        assert "(a dry run -- nothing is changed)" in result.stdout
         assert "auto -> @second" in result.stdout
+        # Rows follow settings.nodes order (place() keeps it), not the score.
+        assert result.stdout.index("  second ") < result.stdout.index("  third ")
         assert rows["second"] == [
             "second",
             "31",
@@ -418,6 +421,84 @@ class TestNodePlan:
 
         assert "auto -> @third" in result.stdout
         assert nodes.PLACE_REASONS["kept"] in result.stdout
+        # A kept project samples nothing, so there is no score table at all.
+        assert "score" not in result.stdout
+
+    def test_plan_marks_no_floor_when_every_node_is_under_it(
+        self, runner, tmp_config, api_dir, no_states
+    ):
+        seed_history("second", "starved", now=time.time() + 30)
+        seed_history("third", "starved", now=time.time() + 30)
+        cfg = tmp_config(config_json(("second", "third"), [_project(api_dir, "auto")]))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "plan", "api"])
+
+        rows = _score_rows(result.stdout, "second", "third")
+        assert rows["second"][-1] == "*"
+        # place() fell back to every node: third lost the tie-break, not the
+        # floor, so it carries no chosen/floor cell at all.
+        assert len(rows["third"]) == 7
+        assert "floor =" not in result.stdout
+
+    def test_plan_says_nowhere_and_prints_the_notes_when_nothing_can_be_scored(
+        self, runner, tmp_config, api_dir, no_states, monkeypatch
+    ):
+        monkeypatch.setattr(remote_mux, "sample", lambda node: None)
+        nodes.update_node_map("api", entry("third"))
+        cfg = tmp_config(config_json(("second",), [_project(api_dir, "auto")]))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "plan", "api"])
+
+        assert result.exit_code == 0
+        assert (
+            f"api  auto -> nowhere ({nodes.PLACE_REASONS['no-data']})" in result.stdout
+        )
+        assert "'third' is no longer in settings.nodes" in result.stdout
+
+    def test_plan_for_an_unknown_project_exits_2(self, runner, tmp_config, api_dir):
+        cfg = tmp_config(config_json(("second",), [_project(api_dir, "auto")]))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "plan", "nope"])
+
+        assert result.exit_code == 2
+        assert "no configured project matches 'nope'" in result.stderr
+        assert "magent node plan" not in result.stdout
+
+    def test_plan_refuses_a_project_and_all_together(self, runner, tmp_config, api_dir):
+        cfg = tmp_config(config_json(("second",), [_project(api_dir, "auto")]))
+
+        result = runner.invoke(
+            cli.main, ["--config", cfg, "node", "plan", "api", "--all"]
+        )
+
+        assert result.exit_code == 2
+        assert "name one project, or pass --all" in result.stderr
+
+    def test_plan_all_skips_a_disabled_project(
+        self, runner, tmp_config, tmp_path, no_states
+    ):
+        seed_history("second", "quiet", now=time.time() + 30)
+        for name in ("api", "web"):
+            (tmp_path / name).mkdir()
+        web = {**_project(tmp_path / "web", "auto", "web"), "enabled": False}
+        cfg = tmp_config(
+            config_json(("second",), [_project(tmp_path / "api", "auto", "api"), web])
+        )
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "plan", "--all"])
+
+        assert "api  auto -> @second" in result.stdout
+        assert "web" not in result.stdout
+
+    def test_plan_all_with_no_node_project_says_so(self, runner, tmp_config, api_dir):
+        cfg = tmp_config(
+            config_json(("second",), [{"path": str(api_dir), "title": "api"}])
+        )
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "plan", "--all"])
+
+        assert result.exit_code == 0
+        assert 'no enabled project has "node" set' in result.stdout
 
     # D-MERGE: plan G :3000-3012 -- the push set needs D's node_git_states.
     @pytest.mark.skipif(_NO_D_GIT_STATES, reason=_D_GIT_STATES_REASON)
@@ -505,6 +586,7 @@ class TestNodePlan:
 
         assert result.exit_code == 0
         assert "api  cloud -- pinned" in result.stdout
+        assert "->" not in result.stdout
         assert sampled == []
 
     def test_plan_all_leaves_cloud_projects_to_plan_j(
