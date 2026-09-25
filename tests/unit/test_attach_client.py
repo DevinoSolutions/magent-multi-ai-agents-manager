@@ -220,7 +220,7 @@ def _drive(monkeypatch, codes, *, durations=None, probes=None, tty=False, **kwar
         code = remaining.pop(0)
         return code if isinstance(code, attach_client.Dial) else _dial(code)
 
-    def fake_probe(_target, _session):
+    def fake_probe(_target, _session, **_kwargs):
         return answers.pop(0) if answers else attach_client.SESSION_ALIVE
 
     monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/usr/bin/ssh")
@@ -896,7 +896,7 @@ class TestMain:
     def test_it_forwards_the_parsed_options_to_the_loop(self, monkeypatch):
         seen: dict[str, object] = {}
 
-        def spy(target, remote, session, *, reconnect):
+        def spy(target, remote, session, *, reconnect, **_rest):
             seen.update(
                 target=target, remote=remote, session=session, reconnect=reconnect
             )
@@ -932,3 +932,87 @@ class TestRemoteCommandContract:
 
         cmd = attach_client.remote_attach_command("api")
         assert any(m in cmd for m in attach_mod._attach_markers("api"))
+
+
+class TestTodaysPsmuxShapesArePinned:
+    """Characterization, written green BEFORE ``--mux`` exists: every string and
+    argv a psmux pane depends on, exactly as shipped. The node work adds a
+    second multiplexer BESIDE these; a diff here means it changed the first."""
+
+    def test_the_remote_command_is_byte_identical(self):
+        assert (
+            attach_client.remote_attach_command("api")
+            == "psmux -L api attach || magent sessions api"
+        )
+
+    def test_the_probe_argv_is_byte_identical(self):
+        assert attach_client.session_probe_argv("me@box", "api") == [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "me@box",
+            "psmux -L api has-session -t api",
+        ]
+
+    def test_the_probe_runs_exactly_that_argv_with_no_console_attached(
+        self, monkeypatch
+    ):
+        seen: dict[str, object] = {}
+
+        def fake_run(argv, **kwargs):
+            seen.update(argv=list(argv), **kwargs)
+            return _Completed(0)
+
+        monkeypatch.setattr(attach_client.subprocess, "run", fake_run)
+        attach_client._probe_session("me@box", "api")
+        assert seen == {
+            "argv": attach_client.session_probe_argv("me@box", "api"),
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "stdin": subprocess.DEVNULL,
+            "timeout": attach_client.SESSION_PROBE_TIMEOUT_S,
+            "check": False,
+        }
+
+    def test_the_interactive_argv_is_byte_identical(self):
+        assert attach_client.ssh_argv("me@box", "psmux -L api attach") == [
+            "ssh",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=4",
+            "-o",
+            "ConnectTimeout=20",
+            "-t",
+            "me@box",
+            "psmux -L api attach",
+        ]
+
+    def test_supervise_probes_the_target_and_session_it_was_given(self, monkeypatch):
+        asked: list[tuple[str, str]] = []
+
+        def fake_probe(target, session, **_kwargs):
+            asked.append((target, session))
+            return attach_client.SESSION_ALIVE
+
+        # Same isolation as `_drive`; only the probe fake differs (it records).
+        monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/usr/bin/ssh")
+        monkeypatch.setattr(attach_client, "_run_ssh", lambda *_a, **_k: _dial(0))
+        monkeypatch.setattr(attach_client, "_probe_session", fake_probe)
+        monkeypatch.setattr(attach_client, "_stdout_is_tty", lambda: False)
+        monkeypatch.setattr(attach_client, "_term_width", lambda: 100)
+        monkeypatch.setattr(attach_client.time, "monotonic", lambda: 0.0)
+        monkeypatch.setattr(attach_client.time, "sleep", lambda _s: None)
+        rc = attach_client.supervise("user@host", "psmux -L api attach", "api")
+        assert (rc, asked) == (0, [("user@host", "api")])
+
+    def test_a_bare_invocation_parses_to_todays_defaults(self):
+        opts = attach_client.parse_args(["--target", "me@box", "--session", "api"])
+        assert (opts.target, opts.session, opts.remote, opts.reconnect) == (
+            "me@box",
+            "api",
+            "psmux -L api attach || magent sessions api",
+            True,
+        )
