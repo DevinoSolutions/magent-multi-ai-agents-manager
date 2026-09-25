@@ -627,6 +627,30 @@ class TestTheSparseRule:
                 pool("second"), now=NOW, live_sample=broken, nodes_dir=tmp_path
             )
 
+    def test_a_raising_probe_still_waits_for_its_sibling_probes(self, tmp_path):
+        # A probe left running after the raise would outlive the placement pass
+        # that asked for it -- an ssh child nothing is waiting on any more.
+        # "second" raises only once "third" is RUNNING: a probe still queued
+        # when the raise lands is cancelled by executor.map and never runs.
+        started = threading.Event()
+        finished = threading.Event()
+
+        def mixed(nick: str) -> LoadSample | None:
+            if nick == "second":
+                assert started.wait(timeout=2)
+                raise TypeError(nick)
+            started.set()
+            time.sleep(0.2)
+            finished.set()
+            return _sample()
+
+        with pytest.raises(TypeError):
+            nodes.placement_samples(
+                pool("second", "third"), now=NOW, live_sample=mixed, nodes_dir=tmp_path
+            )
+
+        assert finished.is_set()
+
     def test_the_sparse_nodes_are_probed_at_once_not_one_after_another(self, tmp_path):
         # Each probe waits for the other two: called one after another, the first
         # one's barrier times out and BrokenBarrierError propagates.
