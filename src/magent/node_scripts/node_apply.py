@@ -376,7 +376,8 @@ def _last(ctx: Ctx, text: str) -> str:
 # and keeping a PC path the node cannot run is the worse failure:
 # - an scp-style single-letter host (``scp a:/x .``) reads as a drive letter;
 # - a //host/path word (``cat //etc/hosts``, ``git -C //srv/repo``,
-#   ``--base=//cdn.example.com/lib``) cannot be told from a //nas/share.
+#   ``--base=//cdn.example.com/lib``) cannot be told from a //nas/share,
+#   nor can a POSIX path spelled with a leading // (``//usr/local/bin/x``).
 _WINDOWS_PATH = re.compile(
     r"(^|[\s\"'=(])(?:[A-Za-z]:[\\/]|\\\\[^\\/\s\"']+\\[^\\\s]|//[^/\s\"']+/[^/\s])"
 )
