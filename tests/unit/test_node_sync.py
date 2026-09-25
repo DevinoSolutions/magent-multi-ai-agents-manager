@@ -1487,3 +1487,36 @@ class TestTheFinalPull:
         with pytest.raises(remote_mux.RemoteError) as info:
             node_sync.final_pull(_config(), "api")
         assert info.value.rc == 255
+
+    def test_a_session_name_this_pc_cannot_store_is_refused_before_any_ssh(
+        self, placed, fake_ssh
+    ):
+        nodes.write_node_map({"api": _entry("second", "CON")})
+        with pytest.raises(remote_mux.RemoteError) as info:
+            node_sync.final_pull(_config(), "api")
+        assert info.value.rc == 0
+        assert info.value.stderr_tail == "not a pullable session name: 'CON'"
+        assert fake_ssh.calls() == []
+
+    def test_a_session_without_a_remote_root_is_refused_before_any_ssh(
+        self, placed, fake_ssh
+    ):
+        entry = _entry("second", "api")
+        nodes.write_node_map(
+            {
+                "api": NodeMapEntry(
+                    nick=entry.nick,
+                    sid=entry.sid,
+                    placed_ts=entry.placed_ts,
+                    attached_existing=entry.attached_existing,
+                    remote_root="",
+                )
+            }
+        )
+        with pytest.raises(remote_mux.RemoteError) as info:
+            node_sync.final_pull(_config(), "api")
+        assert info.value.rc == 0
+        assert info.value.stderr_tail == (
+            "session 'api' cannot be mirrored on this PC: it has no remote root"
+        )
+        assert fake_ssh.calls() == []
