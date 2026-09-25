@@ -717,6 +717,42 @@ class TestTheInstallNeverOverwritesTheNodesWork:
         )
         assert self._leftovers(home) == []
 
+    def test_a_symlinked_target_file_is_kept_and_what_it_names_is_untouched(
+        self, monkeypatch, home, tmp_path
+    ):
+        # cq-G9 S7: mv onto a symlink would replace the link, and a write
+        # through it would reach whatever it names. Neither happens.
+        elsewhere = tmp_path / "elsewhere.jsonl"
+        elsewhere.write_bytes(b"not the conversation\n")
+        dest = self._dest(home)
+        dest.mkdir(parents=True)
+        (dest / f"{SESSION_ID}.jsonl").symlink_to(elsewhere)
+
+        done = _node_run(self._call(monkeypatch, tmp_path), home)
+
+        assert done.returncode == 0, done.stderr
+        assert elsewhere.read_bytes() == b"not the conversation\n"
+        assert (dest / f"{SESSION_ID}.jsonl").is_symlink()
+        assert os.readlink(dest / f"{SESSION_ID}.jsonl") == str(elsewhere)
+        assert f"KEPT\t{SESSION_ID}.jsonl\n".encode() in done.stdout
+
+    def test_the_landed_path_is_the_last_line_after_the_kept_lines(
+        self, monkeypatch, home, tmp_path
+    ):
+        # cq-G9 P22: KEPT lines come first, the landed path is printed last,
+        # and that last line is what the result calls landed.
+        self._seed(home, _PULLED_JSONL + '{"more": "the node kept working"}\n')
+
+        done = _node_run(self._call(monkeypatch, tmp_path), home)
+
+        assert done.returncode == 0, done.stderr
+        lines = done.stdout.decode().splitlines()
+        assert lines[0] == f"KEPT\t{SESSION_ID}.jsonl"
+        assert lines[-1] == str(Path(os.path.realpath(self._dest(home))))
+        result = remote_mux._installed(done.stdout.decode())
+        assert result.landed == lines[-1]
+        assert result.kept == (f"{SESSION_ID}.jsonl",)
+
     def test_a_symlinked_directory_inside_it_is_refused_before_anything_lands(
         self, monkeypatch, home, tmp_path
     ):

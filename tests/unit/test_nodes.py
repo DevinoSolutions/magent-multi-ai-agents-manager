@@ -244,6 +244,21 @@ class TestTheNodeMap:
         assert nodes.read_node_map() == {"api": ENTRY}
         assert nodes.load_node_map_strict() == {"api": ENTRY}
 
+    @pytest.mark.parametrize("attached", [1, 0, "yes", "false", None, [], {}], ids=repr)
+    def test_an_attached_flag_that_is_not_a_bool_drops_the_entry(
+        self, node_map, attached
+    ):
+        # cq-G9 P13: bool is the one shape; 1 or "yes" is corruption, not a
+        # truthy guess, and a missing flag is no entry at all.
+        bad = json.dumps({**dataclasses.asdict(ENTRY), "attached_existing": attached})
+        node_map.parent.mkdir(parents=True)
+        node_map.write_text(
+            f'{{"api": {_entry_text("1727200000.0")}, "db": {bad}}}',
+            encoding="utf-8",
+        )
+        assert nodes.read_node_map() == {"api": ENTRY}
+        assert nodes.load_node_map_strict() == {"api": ENTRY}
+
     def test_a_hand_written_v1_file_reads_back(self, node_map):
         # Every other read test builds its input from asdict(ENTRY), which
         # moves with the dataclass. This is the first release's file, frozen.
