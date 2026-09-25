@@ -480,6 +480,14 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "still runs)."
         ),
     ),
+    (
+        "magent node doctor [<nick>]",
+        (
+            "Check a node: tmux/git/claude/gh on PATH, the Claude login, the "
+            "node's GitHub key, locale, free disk, and the sync daemon's heartbeat "
+            "and snapshot age."
+        ),
+    ),
     ("magent config show", "Display current config."),
     ("magent config layout <cols> <rows>", "Set window grid."),
     ("magent config base-dir <path>", "Set projects folder."),

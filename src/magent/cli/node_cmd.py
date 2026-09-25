@@ -1,26 +1,36 @@
 """`magent node`: run projects on a pool of Linux machines over ssh.
 
-This module starts with `node sync`, the daemon that mirrors the pool onto
-this PC; the other subcommands arrive with their own sub-plans. Exit codes and
-lines live here, the work in magent.node_sync (imported in-body: the
-registration hub imports every command module, and `magent --help` must not
-pay for ssh and tar).
+This module holds `node sync`, the daemon that mirrors the pool onto this PC,
+and `node doctor`; the other subcommands arrive with their own sub-plans. Exit
+codes and lines live here, the work in magent.node_sync, magent.nodes and
+magent.remote_mux (imported in-body: the registration hub imports every
+command module, and `magent --help` must not pay for ssh and tar).
 """
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import sys
 import time
-from typing import Literal
+from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING, Literal, NoReturn
 
 import click
 
-from magent import log
+from magent import env, log
 from magent.cli.app import main
 from magent.cli.config_io import _load_config_or_exit
 from magent.lockfile import LockHeld
 from magent.paths import find_config
 from magent.style import style
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from magent.config import MagentConfig
+    from magent.nodes import Node
+    from magent.remote_mux import RemoteError, ScriptLine
 
 # How long `node sync -d` waits for the detached child to record its pid.
 _START_POLLS = 20
@@ -153,3 +163,184 @@ def sync_cmd(
         max_ticks=ticks,
         reload=node_sync.ConfigWatch(config_file, cfg, stamp=stamp).current,
     )
+
+
+# One mark per row status, shared by node setup and node doctor.
+_ROW_MARKS: dict[str, tuple[str, str]] = {
+    "ok": ("+", "green"),
+    "did": ("+", "cyan"),
+    "skip": ("-", "white"),
+    "drop": ("-", "yellow"),
+    "warn": ("!", "yellow"),
+    "fail": ("x", "red"),
+    "key": ("*", "cyan"),
+}
+
+
+def _refuse(message: str, *, as_json: bool = False) -> NoReturn:
+    """A request magent cannot act on (unknown nick, bad argument): exit 2,
+    before anything reaches a node."""
+    if as_json:
+        click.echo(json.dumps({"ok": False, "error": message}))
+    else:
+        click.echo(f"Error: {message}", err=True)
+    sys.exit(2)
+
+
+def _unreachable(node: Node, exc: RemoteError) -> ScriptLine:
+    """ssh's own failure as a row: the target and ssh's last stderr line."""
+    # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
+    from magent.remote_mux import ScriptLine
+
+    tail = exc.stderr_tail.strip().splitlines()
+    why = tail[-1] if tail else f"rc={exc.rc}"
+    return ScriptLine("fail", "reach", f"cannot reach {node.target}: {why}")
+
+
+def _print_rows(lines: Sequence[ScriptLine]) -> None:
+    width = max((len(line.item) for line in lines), default=0)
+    for line in lines:
+        mark, color = _ROW_MARKS.get(line.status, ("?", "white"))
+        quiet = line.status in ("ok", "skip")
+        click.echo(
+            f"    {style(mark, fg=color, bold=True)} {line.item:<{width}}  "
+            f"{style(line.detail, dim=quiet)}"
+        )
+
+
+def sync_lines(cfg: MagentConfig, nick: str, *, now: float) -> list[ScriptLine]:
+    """This PC's half of a node's health: is the sync daemon alive, and how old
+    is the sessions snapshot it last pulled from ``nick``. Reads only."""
+    # heavy subsystem: in-body per policy (ssh/tar; --help never pays)
+    from magent import node_sync, nodes
+    from magent.remote_mux import ScriptLine
+
+    lines: list[ScriptLine] = []
+    state = _daemon_state()
+    if state == "ok":
+        lines.append(ScriptLine("ok", "sync-daemon", "running"))
+    elif state == "stale":
+        lines.append(
+            ScriptLine(
+                "warn", "sync-daemon", "its heartbeat is stale -- see: magent status"
+            )
+        )
+    elif node_sync.wanted(cfg):
+        # The daemon's own "anything to sync?", so this row can never ask for
+        # a daemon that serve would not start.
+        lines.append(
+            ScriptLine(
+                "warn",
+                "sync-daemon",
+                "not running -- magent serve starts it while a project runs on a node",
+            )
+        )
+    else:
+        lines.append(ScriptLine("skip", "sync-daemon", "no project runs on a node"))
+    # E's reader and E's staleness rule; F does not parse sessions.json itself.
+    snap = nodes.read_sessions(nick)
+    interval = cfg.settings.node_sync.pull_interval_s
+    limit = 2 * interval
+    age = 0.0 if snap is None else max(0.0, now - snap.ts)
+    if snap is None:
+        lines.append(
+            ScriptLine("skip", "snapshot", "no sessions snapshot from this node yet")
+        )
+    elif not nodes.sessions_stale(snap, pull_interval_s=interval, now=now):
+        lines.append(ScriptLine("ok", "snapshot", f"pulled {age:.0f}s ago"))
+    else:
+        lines.append(
+            ScriptLine(
+                "warn",
+                "snapshot",
+                (
+                    f"pulled {age:.0f}s ago, older than 2 x pullIntervalS ({limit}s): "
+                    "its sessions read stale"
+                ),
+            )
+        )
+    return lines
+
+
+def node_checks(cfg: MagentConfig, nick: str, *, now: float) -> list[ScriptLine]:
+    """Every health row for ``nick``: the node's own (doctor.sh, one ssh call),
+    then this PC's sync rows. An unreachable node is one ``fail reach`` row;
+    nothing here raises. Read-only: it never provisions (DECISION-24 wires
+    provisioning into ``node setup`` and the bring-up, not the doctor)."""
+    # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
+    from magent import nodes, remote_mux
+    from magent.remote_mux import ScriptLine
+
+    try:
+        node = nodes.node_for_nick(cfg, nick, local_user=env.local_username())
+    except nodes.NodeConfigError as exc:
+        return [ScriptLine("fail", "config", str(exc))]
+    try:
+        remote = list(
+            remote_mux.doctor(node, timeout_s=remote_mux.DOCTOR_TIMEOUT_S).lines
+        )
+    except remote_mux.RemoteError as exc:
+        remote = [_unreachable(node, exc)]
+    return [*remote, *sync_lines(cfg, nick, now=now)]
+
+
+def doctor_report(cfg: MagentConfig, nicks: list[str]) -> dict[str, list[ScriptLine]]:
+    """``node_checks`` for each nick, concurrently -- one ssh each, so N nodes
+    cost one DOCTOR_TIMEOUT_S -- keyed in the order given."""
+    if not nicks:
+        return {}
+    now = time.time()
+    with ThreadPoolExecutor(max_workers=len(nicks)) as pool:
+        results = list(pool.map(lambda n: node_checks(cfg, n, now=now), nicks))
+    return dict(zip(nicks, results, strict=True))
+
+
+@node_group.command("doctor")
+@click.argument("nick", required=False)
+@click.option("--json", "as_json", is_flag=True, help="Print the rows as JSON")
+@click.pass_context
+def node_doctor_cmd(ctx: click.Context, nick: str | None, as_json: bool) -> None:
+    """Check a node, or every node: tools, the Claude login, the node's GitHub
+    key, locale, disk, and this PC's sync daemon and snapshot.
+
+    Exit 0 when nothing failed (warnings allowed), 1 when a check failed,
+    2 when NICK is not in settings.nodes.
+    """
+    from magent import nodes  # heavy subsystem: in-body per policy
+
+    cfg = _load_config_or_exit(find_config(ctx.obj.get("config_path")), as_json=as_json)
+    if nick is not None:
+        try:
+            nodes.node_for_nick(cfg, nick, local_user=env.local_username())
+        except nodes.NodeConfigError as exc:
+            _refuse(str(exc), as_json=as_json)
+    nicks = [nick] if nick is not None else list(cfg.settings.nodes)
+    report = doctor_report(cfg, nicks)
+    failures = sum(
+        1 for lines in report.values() for line in lines if line.status == "fail"
+    )
+    if as_json:
+        body = {
+            n: [dataclasses.asdict(line) for line in lines]
+            for n, lines in report.items()
+        }
+        click.echo(json.dumps({"ok": True, "failures": failures, "nodes": body}))
+        sys.exit(1 if failures else 0)
+    if not nicks:
+        click.echo(
+            f"  {style('-', dim=True)} no nodes configured -- add one under"
+            " settings.nodes, then run: magent node setup <nick>"
+        )
+        return
+    click.echo(f"  {style('magent node doctor', bold=True)}")
+    for n, lines in report.items():
+        click.echo()
+        click.echo(
+            f"  {style(n, bold=True)}  {style(cfg.settings.nodes[n].host, dim=True)}"
+        )
+        _print_rows(lines)
+    click.echo()
+    if failures:
+        click.echo(f"  {style(f'{failures} check(s) failed.', fg='red', bold=True)}")
+        sys.exit(1)
+    click.echo(f"  {style('No failures.', fg='green', bold=True)}")
