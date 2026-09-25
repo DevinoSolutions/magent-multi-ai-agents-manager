@@ -14,7 +14,7 @@ local git reads a bring-up needs. Every function returns data or raises
 - ``BatchMode=yes`` everywhere: a password prompt nobody can answer is a hang.
 
 A leaf: never imports ``magent.cli`` (LS-A-001); its magent imports are the
-leaves ``attach_client`` and ``log``.
+leaves ``attach_client``, ``log`` and ``node_scripts``.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import shutil
 import subprocess
 from typing import TYPE_CHECKING
 
+from magent import node_scripts
 from magent.attach_client import SSH_MISSING_RC, TMUX_SOCKET
 from magent.log import get_logger
 
@@ -45,6 +46,13 @@ SOCKET = TMUX_SOCKET
 PROBE_TIMEOUT_S = 10.0
 SCRIPT_TIMEOUT_S = 120.0
 BRING_UP_TIMEOUT_S = 600.0
+
+# The line separating a shipped script from its payload on stdin. bash -s reads
+# a script from a pipe one byte at a time, so a script whose last line is
+# `main "$@"; exit $?` hands the REST of stdin to main -- which skips to this
+# line and reads the payload (JSON, a tarball) after it. Never a temp file on
+# the node, never an argument.
+PAYLOAD_SENTINEL = "__MAGENT_PAYLOAD__"
 
 # remote_mux's OWN option set -- not attach_client.SSH_CONNECTION_OPTS, which is
 # scoped to the interactive attach pane and allows a 20s connect, i.e. longer
@@ -233,4 +241,43 @@ def run(
         input_bytes=input_bytes,
         check=check,
         shown=shown,
+    )
+
+
+def _script_argv(args: list[str]) -> list[str]:
+    """The remote argv of every script run: the socket is ALWAYS ``$1``
+    (DECISION-26 ii) -- ``lib.sh`` reads and shifts it -- then the caller's
+    own args."""
+    return ["bash", "-s", "--", SOCKET, *args]
+
+
+def _frame_script(text: str, payload: bytes | None) -> bytes:
+    body = text.encode("utf-8")
+    if payload is None:
+        return body
+    return body + b"\n" + PAYLOAD_SENTINEL.encode("ascii") + b"\n" + payload
+
+
+def run_script(
+    node: Node,
+    script: str,
+    args: list[str],
+    *,
+    timeout_s: float,
+    stdin: bytes | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run the packaged ``node_scripts/<script>.sh`` on ``node`` as
+    ``bash -s -- <SOCKET> <args>``: the script on stdin, then -- when
+    ``stdin`` is given -- the sentinel line and that payload. The socket is
+    added here, on every call; ``args`` never carry it. Secrets belong in
+    ``stdin``; ``args`` are argv, visible to the node's process table and to
+    logs. ValueError for a script in ``node_scripts.NON_ENTRY_SCRIPTS`` --
+    it would read the socket as its own first argument."""
+    if f"{script}.sh" in node_scripts.NON_ENTRY_SCRIPTS:
+        raise ValueError(f"{script}.sh is not a run_script entry point")
+    return run(
+        node,
+        _script_argv(args),
+        timeout_s=timeout_s,
+        input_bytes=_frame_script(node_scripts.script(script), stdin),
     )
