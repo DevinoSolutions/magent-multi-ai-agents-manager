@@ -830,6 +830,8 @@ class TestAnExitCodeWithoutARowStillFails:
             _completed(2, b"did\tgh\tx\n", b"noise\npython3: not found\n"),
             "provision",
             NODE,
+            args=[],
+            stdin=b"",
         )
         assert report.lines[-1] == ScriptLine(
             "fail", "provision", "exited 2: python3: not found"
@@ -837,7 +839,7 @@ class TestAnExitCodeWithoutARowStillFails:
 
     def test_a_non_zero_exit_that_reported_its_failure_adds_nothing(self):
         report = remote_mux._report_of(
-            _completed(1, b"fail\tgh\tno gh\n"), "provision", NODE
+            _completed(1, b"fail\tgh\tno gh\n"), "provision", NODE, args=[], stdin=b""
         )
         assert report.lines == (ScriptLine("fail", "gh", "no gh"),)
 
@@ -849,12 +851,22 @@ class TestAnExitCodeWithoutARowStillFails:
                 ),
                 "provision",
                 NODE,
+                args=["--force"],
+                stdin=b"PAYLOAD-DECOY",
             )
         assert info.value.rc == 255
         assert "refused" in info.value.stderr_tail
         # The program, never this PC's path to it -- and no client lookup,
         # which would turn the transport failure into "ssh not installed".
+        # The rest is exactly what run() would name for the same call.
+        argv_remote, framed = remote_mux._script_call(
+            "provision", ["--force"], b"PAYLOAD-DECOY"
+        )
+        assert info.value.command_redacted == remote_mux._run_shown(
+            NODE, argv_remote, framed
+        )
         assert info.value.command_redacted[0] == "ssh"
+        assert "PAYLOAD-DECOY" not in str(info.value)
 
 
 TOKEN = "gho_FAKE0123456789abcdefTOKEN"
@@ -1168,6 +1180,45 @@ class TestProvision:
             remote_mux.provision(
                 NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
             )
+
+    def test_a_transport_failure_names_the_call_that_ran_force_and_all(
+        self, fake_ssh, fake_gh
+    ):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
+        fake_ssh.set_reply("bash -s", stderr="ssh: connect to host: No route\n", rc=255)
+        with pytest.raises(RemoteError) as info:
+            remote_mux.provision(
+                NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S, force=True
+            )
+        (call,) = fake_ssh.calls()
+        shown = info.value.command_redacted
+        assert shown[:-1] == ("ssh", *call.argv)
+        assert shown[-2] == _remote("bash", "-s", "--", remote_mux.SOCKET, "--force")
+        assert shown[-1] == f"<stdin: {len(call.stdin)} bytes>"
+        assert TOKEN not in str(info.value)
+
+    def test_a_probe_transport_failure_names_the_programs_it_asked_about(
+        self, fake_ssh
+    ):
+        fake_ssh.set_reply(
+            f"{remote_mux.SOCKET} npx",
+            stderr="ssh: connect to host: No route\n",
+            rc=255,
+        )
+        spec = {"type": "stdio", "command": "npx", "env": {"K": "ENV-DECOY"}}
+        with pytest.raises(RemoteError) as info:
+            remote_mux.provision(
+                NODE,
+                _scope(mcp_servers={"x": spec}),
+                timeout_s=remote_mux.PROVISION_TIMEOUT_S,
+            )
+        (call,) = fake_ssh.calls()  # the probe alone: no apply after it
+        shown = info.value.command_redacted
+        assert shown[:-1] == ("ssh", *call.argv)
+        assert shown[-2] == _remote("bash", "-s", "--", remote_mux.SOCKET, "npx")
+        assert shown[-1] == f"<stdin: {len(call.stdin)} bytes>"
+        assert "ENV-DECOY" not in str(info.value)
 
     def test_the_timeout_is_mandatory(self):
         with pytest.raises(TypeError):

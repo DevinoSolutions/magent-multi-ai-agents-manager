@@ -421,20 +421,27 @@ def parse_report(text: str) -> ProvisionReport:
 
 
 def _report_of(
-    result: subprocess.CompletedProcess[bytes], script: str, node: Node
+    result: subprocess.CompletedProcess[bytes],
+    script: str,
+    node: Node,
+    *,
+    args: Sequence[str],
+    stdin: bytes | None,
 ) -> ProvisionReport:
     """A finished script's rows. Exit 255 is ssh's own failure, not the
     script's, and raises; any other non-zero exit with no ``fail`` row gets
     one, so a script that died mid-step can never read as a success.
 
-    The error names the command the way ``run`` does (``_run_shown``): the
-    program, not this PC's path to it, and no client lookup -- a lookup here
-    could turn a transport failure into "ssh not installed"."""
+    ``args`` and ``stdin`` are the ones the ``run_script`` call was given, so
+    the error names exactly what ran (``--force``, the probed programs) the
+    way ``run`` does (``_run_shown`` over ``_script_call``): the program, not
+    this PC's path to it, stdin by its length alone, and no client lookup --
+    a lookup here could turn a transport failure into "ssh not installed"."""
     if result.returncode == SSH_TRANSPORT_RC:
         raise RemoteError(
             SSH_TRANSPORT_RC,
             _tail(result.stderr),
-            _run_shown(node, _script_argv([]), None),
+            _run_shown(node, *_script_call(script, args, stdin)),
         )
     report = parse_report(result.stdout.decode("utf-8", "replace"))
     if result.returncode != 0 and not report.failed:
@@ -603,7 +610,7 @@ def node_programs(
     if not wanted:
         return frozenset()
     result = run_script(node, "programs", wanted, timeout_s=timeout_s, check=False)
-    report = _report_of(result, "programs", node)
+    report = _report_of(result, "programs", node, args=wanted, stdin=None)
     return frozenset(
         line.item
         for line in report.lines
@@ -639,15 +646,11 @@ def provision(
         gh_login=login,
         state_hook=node_scripts.script("state_hook"),
     )
+    args = ["--force"] if force else []
     result = run_script(
-        node,
-        "provision",
-        ["--force"] if force else [],
-        timeout_s=timeout_s,
-        stdin=payload,
-        check=False,
+        node, "provision", args, timeout_s=timeout_s, stdin=payload, check=False
     )
-    report = _report_of(result, "provision", node)
+    report = _report_of(result, "provision", node, args=args, stdin=payload)
     notes = tuple(ScriptLine("skip", "scope", note) for note in user_scope.notes)
     shipped = tuple(
         ScriptLine("ok", "scope", f"mcp {name}: shipped")
