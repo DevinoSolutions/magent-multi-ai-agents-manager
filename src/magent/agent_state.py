@@ -177,7 +177,11 @@ def _warn_bad_record(path: Path, why: str) -> None:
     from magent.log import get_logger
 
     get_logger("attention").warning(
-        "skipping unusable agent-state record %s: %s", path.name, why
+        # The FULL path: a bad local record and a bad node-mirror record for
+        # the same cwd hash share a file name and must stay distinguishable.
+        "skipping unusable agent-state record %s: %s",
+        path,
+        why,
     )
 
 
@@ -186,11 +190,21 @@ def read_store(root: Path) -> list[dict[str, object]]:
     session's mirror under ``~/.magent/nodes``. Corrupt and non-object files
     are skipped and named once (``_warn_bad_record``). Never sweeps: a mirror
     is the node's to age, and a record deleted here would come back on the
-    next pull. A missing directory is an empty store."""
+    next pull. A missing or unreadable directory is an empty store (unreadable
+    is logged once). Records are unfiltered (no TTL) and ordered by filename,
+    not by ts."""
     records: list[dict[str, object]] = []
     try:
         paths = sorted(root.glob("*.json"))
-    except OSError:
+    except OSError as exc:
+        key = str(root)
+        if key not in _warned_files:
+            _warned_files.add(key)
+            from magent.log import get_logger  # lazy: see _warn_bad_record
+
+            get_logger("attention").warning(
+                "agent-state: %s is unreadable (%s)", root, exc
+            )
         return records
     for p in paths:
         try:

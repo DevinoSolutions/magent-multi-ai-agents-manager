@@ -15,6 +15,8 @@ after a deliberate schema change:
 from __future__ import annotations
 
 import json
+import logging
+import pathlib
 import time
 
 import pytest
@@ -182,37 +184,113 @@ class TestAllStates:
         assert agent_state.state_for("/a", max_age=7200) is not None
 
 
+def _mirror(tmp_path):
+    """A node mirror laid out like ``~/.magent/nodes/<nick>/state``. The
+    autouse fixture makes ``STATE_DIR`` == ``tmp_path``, so this directory is
+    deliberately NOT the local store: a ``read_store`` that ignored ``root``
+    and read ``STATE_DIR`` would return the wrong records here."""
+    mirror = tmp_path / "nodes" / "box" / "state"
+    mirror.mkdir(parents=True)
+    return mirror
+
+
+def _put(root, name, rec):
+    path = root / name
+    path.write_text(json.dumps(rec), encoding="utf-8")
+    return path
+
+
 class TestReadStore:
     def test_any_directory_reads_as_a_store(self, tmp_path):
+        mirror = _mirror(tmp_path)
         rec = {
             "state": "done",
             "ts": 1.0,
             "cwd": "/home/amin/magent/api",
             "session_id": "s",
         }
-        (tmp_path / "a.json").write_text(json.dumps(rec), encoding="utf-8")
-        assert agent_state.read_store(tmp_path) == [rec]
+        _put(mirror, "a.json", rec)
+        assert agent_state.read_store(mirror) == [rec]
+
+    def test_a_mirror_and_the_local_store_never_mix(self, tmp_path):
+        """The cross-check: each store answers with its own records only."""
+        mirror = _mirror(tmp_path)
+        agent_state.write_state("/home/amin/local", "working", "local-sid")
+        remote = {
+            "state": "needs-input",
+            "ts": time.time(),
+            "cwd": "/home/amin/remote",
+            "session_id": "node-sid",
+        }
+        _put(mirror, "r.json", remote)
+        assert agent_state.read_store(mirror) == [remote]
+        assert [r["session_id"] for r in agent_state.all_states()] == ["local-sid"]
 
     def test_a_missing_directory_is_an_empty_store(self, tmp_path):
-        assert agent_state.read_store(tmp_path / "nope") == []
+        # The local store beside it is NOT empty, so reading the wrong
+        # directory cannot pass as "empty".
+        agent_state.write_state("/home/amin/local", "working", "local-sid")
+        assert agent_state.read_store(tmp_path / "nodes" / "gone" / "state") == []
 
-    def test_unusable_files_are_skipped(self, tmp_path):
-        (tmp_path / "a.json").write_text("{torn", encoding="utf-8")
-        (tmp_path / "b.json").write_text("[1, 2]", encoding="utf-8")
-        (tmp_path / "c.tmp").write_text("{}", encoding="utf-8")
-        assert agent_state.read_store(tmp_path) == []
-
-    def test_reading_a_store_never_sweeps_but_all_states_still_does(
-        self, tmp_path, monkeypatch
+    def test_an_unreadable_directory_is_an_empty_store_logged_once(
+        self, tmp_path, monkeypatch, caplog
     ):
+        mirror = _mirror(tmp_path)
+        real_glob = pathlib.Path.glob
+
+        def glob(self, pattern):
+            if self == mirror:
+                raise PermissionError("denied")
+            return real_glob(self, pattern)
+
+        monkeypatch.setattr(pathlib.Path, "glob", glob)
+        with caplog.at_level(logging.WARNING, logger="magent.attention"):
+            assert agent_state.read_store(mirror) == []
+            assert agent_state.read_store(mirror) == []
+        named = [r for r in caplog.records if str(mirror) in r.getMessage()]
+        assert len(named) == 1
+        assert "unreadable" in named[0].getMessage()
+
+    def test_unusable_files_are_skipped(self, tmp_path, caplog):
+        mirror = _mirror(tmp_path)
+        (mirror / "a.json").write_text("{torn", encoding="utf-8")
+        (mirror / "b.json").write_text("[1, 2]", encoding="utf-8")
+        (mirror / "c.tmp").write_text("{}", encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger="magent.attention"):
+            assert agent_state.read_store(mirror) == []
+        # The warning names the MIRROR's file, not a bare file name that a
+        # local record with the same cwd hash would share.
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(str(mirror / "a.json") in m for m in messages)
+        assert any(str(mirror / "b.json") in m for m in messages)
+
+    def test_reading_a_store_never_sweeps_but_all_states_still_does(self, tmp_path):
         """A node mirror is the node's to age: a record swept here would come
-        straight back on the next pull. This PC's own store keeps its sweep."""
-        monkeypatch.setattr(agent_state, "STATE_DIR", tmp_path)
-        monkeypatch.setattr(agent_state, "_swept_this_process", False)
-        ancient = {"state": "done", "ts": 1.0, "cwd": "/w/old", "session_id": None}
-        path = agent_state._path_for("/w/old")
-        path.write_text(json.dumps(ancient), encoding="utf-8")
-        assert agent_state.read_store(tmp_path) == [ancient]
-        assert path.exists()
+        straight back on the next pull. This PC's own store keeps its sweep,
+        and that sweep never reaches into a mirror."""
+        mirror = _mirror(tmp_path)
+        remote_ancient = {
+            "state": "done",
+            "ts": 1.0,
+            "cwd": "/w/remote-old",
+            "session_id": "node-sid",
+        }
+        remote_path = _put(mirror, "r.json", remote_ancient)
+        local_ancient = {
+            "state": "done",
+            "ts": 1.0,
+            "cwd": "/w/old",
+            "session_id": None,
+        }
+        local_path = agent_state._path_for("/w/old")
+        local_path.write_text(json.dumps(local_ancient), encoding="utf-8")
+
+        assert agent_state.read_store(mirror) == [remote_ancient]
+        assert remote_path.exists()
+        assert agent_state.read_store(agent_state.STATE_DIR) == [local_ancient]
+        assert local_path.exists()
+
         assert agent_state.all_states() == []
-        assert not path.exists()
+        assert not local_path.exists()
+        assert remote_path.exists()
+        assert agent_state.read_store(mirror) == [remote_ancient]
