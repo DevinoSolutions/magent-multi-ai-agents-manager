@@ -1795,6 +1795,30 @@ class TestOneStoreHoldsEveryStepsMemory:
         assert store["shipped"] == first["shipped"]
         assert store["digests"]["settings"] == first["digests"]["settings"]
 
+    def test_a_step_whose_last_attempt_failed_is_forgotten(
+        self, box, tmp_path, monkeypatch
+    ):
+        # A forced re-run that fails must drop the old digest, or the next
+        # plain run skips a step whose last attempt failed.
+        work = _work(tmp_path, _pc_settings({"env": {"X": "x"}}))
+        assert box.apply(work) == 0
+        write = node_apply._write
+
+        def fail_settings(path: Path, value: object, **kw: object) -> object:
+            if path.name == "settings.json":
+                raise OSError("disk full")
+            return write(path, value, **kw)
+
+        monkeypatch.setattr(node_apply, "_write", fail_settings)
+        assert box.apply(work, force=True) == 1
+        assert "settings" not in _json(_store(box))["digests"]
+
+    def test_this_builds_store_version_wins_over_a_carried_one(self, box, tmp_path):
+        _put(_store(box), {"version": 99, "digests": {}, "later": 1})
+        box.apply(_work(tmp_path))
+        store = _json(_store(box))
+        assert (store["version"], store["later"]) == (1, 1)
+
 
 class _HungUp(io.TextIOBase):
     """A stdout whose reader went away once the first row was through: the
@@ -1834,8 +1858,9 @@ _DEAD_PIPE = pytest.mark.parametrize(
         BrokenPipeError(errno.EPIPE, "Broken pipe"),
         OSError(errno.EPIPE, "Broken pipe"),
         OSError(errno.EINVAL, "Invalid argument"),
+        OSError(errno.EIO, "Input/output error"),
     ],
-    ids=["BrokenPipeError", "OSError-EPIPE", "OSError-EINVAL"],
+    ids=["BrokenPipeError", "OSError-EPIPE", "OSError-EINVAL", "OSError-EIO"],
 )
 
 
@@ -1890,6 +1915,44 @@ class TestAPcThatHangsUpDoesNotStopTheApply:
         work = _work(tmp_path, self.SCOPE)
         monkeypatch.setattr(sys, "stdout", _HungUp(error, "write"))
         assert box.apply(work) == 1
+        self._landed(box)
+
+    def test_a_real_descriptor_is_pointed_at_the_null_device_and_nothing_leaks(
+        self, box, tmp_path, monkeypatch, capsys
+    ):
+        # A pipe of the test's own, never fd 1: its reader is gone before the
+        # first row. What the failed flush left buffered must drain into the
+        # null device, the way Python's flush at exit does.
+        work = _work(tmp_path, self.SCOPE)
+        read, write = os.pipe()
+        os.close(read)
+        stream = open(write, "w", encoding="utf-8")  # noqa: SIM115  # reason: closed in the finally below, after the post-apply flush it exists to test
+        opened: list[int] = []
+        closed: list[int] = []
+        real_open, real_close = os.open, os.close
+
+        def spy_open(path: str, flags: int, *args: object) -> int:
+            fd = real_open(path, flags, *args)
+            if path == os.devnull:
+                opened.append(fd)
+            return fd
+
+        def spy_close(fd: int) -> None:
+            closed.append(fd)
+            real_close(fd)
+
+        monkeypatch.setattr(os, "open", spy_open)
+        monkeypatch.setattr(os, "close", spy_close)
+        monkeypatch.setattr(sys, "stdout", stream)
+        try:
+            assert box.apply(work) == 0
+            stream.write("after the hang-up\n")
+            stream.flush()
+        finally:
+            stream.close()
+        (null,) = opened
+        assert null in closed
+        assert capsys.readouterr().err == ""
         self._landed(box)
 
     def test_a_real_closed_pipe_leaves_the_exit_code_to_the_steps(self, box, tmp_path):
