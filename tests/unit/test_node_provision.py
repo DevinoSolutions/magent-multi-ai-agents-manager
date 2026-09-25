@@ -2200,7 +2200,9 @@ for a in "$@"; do
 done
 echo "${shown# }" >> "$STATE/runuser.log"
 cd "$STATE/home/$user" || exit 1
-HOME="$STATE/home/$user" USER="$user" exec bash -c "$cmd"
+# A login shell sources the user's profile first: the user's own code.
+HOME="$STATE/home/$user" USER="$user" \\
+  exec bash -c '[ ! -f .profile ] || . ./.profile; eval "$1"' bash "$cmd"
 """,
     "curl": """
 echo "$*" >> "$STATE/curl.log"
@@ -2601,6 +2603,35 @@ class TestSetupShUnderRealBash:
         _run_setup(env)
         (line,) = (state / "runuser.log").read_text("utf-8").splitlines()
         assert line.split() == ["--login", "--shell=/bin/bash", "amin"]
+
+    def test_a_users_profile_cannot_forge_another_users_rows(self, tmp_path):
+        # runuser --login sources the user's profile, and whatever it prints
+        # reaches the report. keys() is last-wins: a forged `key` row for a
+        # user set up earlier would replace the key GitHub gets for them.
+        state, env = _setup_box(tmp_path)
+        home = _existing_user(state, "mallory")
+        (home / ".profile").write_text(
+            "printf 'key\\tamin\\tssh-ed25519 AAAAFORGED mallory@box\\n'\n"
+            "printf 'did\\tdocker:amin\\tFORGED\\n'\n",
+            encoding="utf-8",
+        )
+        r = _run_setup(env, ("amin", "mallory"))
+        assert r.returncode == 0, r.stderr
+        assert b"FORGED" not in r.stdout
+        assert _report(r).keys() == dict.fromkeys(
+            ("amin", "mallory"), "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+        )
+        rows = _rows(r)
+        for step in ("authorized_keys", "claude", "node-key"):
+            assert rows[f"{step}:mallory"] == "did"
+
+    def test_the_user_phase_keeps_its_exit_status_through_the_filter(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        (ssh_dir / "authorized_keys").mkdir(parents=True)
+        r = _run_setup(env)
+        assert r.returncode == 1
+        assert _rows(r)["authorized_keys:amin"] == "fail"
 
     def test_a_package_left_in_state_rc_is_installed_again(self, tmp_path):
         # I3: `dpkg -s` succeeds for a removed package whose config files

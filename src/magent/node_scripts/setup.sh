@@ -248,11 +248,20 @@ user_phase() {
 }
 
 # --shell: the phase is bash functions, whatever the account's login shell is.
+# The login shell sources the user's profile first, and what it prints lands
+# here too: only this user's own rows get through (`*:<user>`, or the `key`
+# row for <user>). keys() is last-wins, so a forged `key` row would otherwise
+# replace the key GitHub gets for another user.
 run_user_phase() {
   local u=$1 key=$2
+  local -a st
   runuser --login --shell=/bin/bash \
     --command="$(declare -f say user_phase user_authorized user_claude user_node_key); user_phase $(printf '%q %q' "$u" "$key")" \
-    "$u"
+    "$u" |
+    awk -F'\t' -v u="$u" '$1 == "key" ? $2 == u : substr($2, length($2) - length(u)) == ":" u'
+  st=("${PIPESTATUS[@]}")
+  ((st[1] == 0)) || return 1
+  return "${st[0]}"
 }
 
 main() {
