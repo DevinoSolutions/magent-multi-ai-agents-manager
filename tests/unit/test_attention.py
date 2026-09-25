@@ -1122,3 +1122,118 @@ class TestNodeStores:
         assert len(warnings) == 1
         assert str(root) in warnings[0].getMessage()
         assert "bad record" in warnings[0].getMessage()
+
+    def test_a_held_over_record_ages_like_a_fresh_one(self, state_dir, tmp_path):
+        # A failing tick serves the last good RECORDS re-viewed at the current
+        # clock, not last tick's frozen views: a needs-input row past its
+        # staleness window must decay to idle and its age must keep growing.
+        store = tmp_path / "second-api"
+        self._write(
+            store,
+            "k.json",
+            state="needs-input",
+            ts=990.0,
+            cwd="/home/amin/magent/api",
+            session_id="s",
+        )
+        calls = {"n": 0}
+
+        def _stores() -> list[tuple[str, str, object]]:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return [("api", "@second", store)]
+            raise OSError("nodes unreachable")
+
+        clock = FakeClock(1000.0)
+        engine = AttentionEngine(now=clock, extra_stores=_stores)
+
+        (fresh,) = engine.poll()
+        assert (fresh.state, fresh.age_s) == ("needs-input", 10.0)
+
+        clock.t = 990.0 + attention.STALENESS_S[agent_state.NEEDS_INPUT] + 50.0
+        (held,) = engine.poll()
+        assert held.cwd == "@second:/home/amin/magent/api"
+        assert held.state == agent_state.IDLE
+        assert held.age_s == clock.t - 990.0
+
+    def test_one_failing_root_holds_only_itself_and_the_rest_read_fresh(
+        self, state_dir, tmp_path, monkeypatch
+    ):
+        bad, good = tmp_path / "third-web", tmp_path / "second-api"
+        self._write(
+            bad, "k.json", state="needs-input", ts=990.0, cwd="/w/web", session_id="b"
+        )
+        self._write(
+            good, "k.json", state="working", ts=990.0, cwd="/w/api", session_id="g"
+        )
+        real_read_store = agent_state.read_store
+        broken = {"on": False}
+
+        def _read_store(root: object) -> list[dict[str, object]]:
+            if broken["on"] and root == bad:
+                raise OSError("third unreachable")
+            return real_read_store(root)
+
+        monkeypatch.setattr(agent_state, "read_store", _read_store)
+        # The failing root is listed FIRST, so a whole-loop abort would also
+        # leave the healthy root after it unread.
+        engine = AttentionEngine(
+            now=lambda: 1000.0,
+            extra_stores=lambda: [("web", "@third", bad), ("api", "@second", good)],
+        )
+        engine.poll()
+
+        self._write(
+            good, "k.json", state="done", ts=995.0, cwd="/w/api", session_id="g"
+        )
+        broken["on"] = True
+        views = {v.cwd: v.state for v in engine.poll()}
+
+        assert views == {
+            "@second:/w/api": agent_state.DONE,  # read fresh this tick
+            "@third:/w/web": agent_state.NEEDS_INPUT,  # its last good record, held
+        }
+
+    def test_a_new_failure_after_a_recovery_warns_again(
+        self, state_dir, tmp_path, caplog
+    ):
+        import logging
+
+        outcomes = iter([False, True, False])
+
+        def _stores() -> list[tuple[str, str, object]]:
+            if not next(outcomes):
+                raise OSError("nodes unreachable")
+            return []
+
+        engine = AttentionEngine(now=lambda: 1000.0, extra_stores=_stores)
+        with caplog.at_level(logging.INFO, logger="magent.attention"):
+            engine.poll()
+            engine.poll()
+            engine.poll()
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        infos = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert (len(warnings), len(infos)) == (2, 1)
+
+    def test_healthy_ticks_after_a_recovery_log_nothing_more(
+        self, state_dir, tmp_path, caplog
+    ):
+        import logging
+
+        outcomes = iter([False, True, True])
+
+        def _stores() -> list[tuple[str, str, object]]:
+            if not next(outcomes):
+                raise OSError("nodes unreachable")
+            return []
+
+        engine = AttentionEngine(now=lambda: 1000.0, extra_stores=_stores)
+        with caplog.at_level(logging.INFO, logger="magent.attention"):
+            engine.poll()
+            engine.poll()
+            engine.poll()
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        infos = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert (len(warnings), len(infos)) == (1, 1)

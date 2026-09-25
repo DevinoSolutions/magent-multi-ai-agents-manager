@@ -100,7 +100,11 @@ class AttentionEngine:
         self._extra_stores = extra_stores
         self._last_state: dict[str, str] = {}
         self._last_fired: dict[tuple[str, str], float] = {}
-        self._last_node_views: list[SessionView] = []
+        # The last good RAW records per node root, as (label, key, root,
+        # records): a failing tick re-views them at the current clock.
+        self._last_node_records: list[
+            tuple[str, str, str, list[dict[str, object]]]
+        ] = []
         self._node_store_failing = False
 
     def poll(self) -> list[SessionView]:
@@ -113,37 +117,63 @@ class AttentionEngine:
             if view is not None:
                 views.append(view)
         if self._extra_stores is not None:
-            where = "listing node stores"
-            try:
-                node_views: list[SessionView] = []
-                for label, key, root in self._extra_stores():
-                    where = str(root)
-                    for rec in agent_state.read_store(root):
-                        view = self._view(rec, now, label=label, key=key)
-                        if view is not None:
-                            node_views.append(view)
-            except (OSError, ValueError) as exc:
-                # A node store going unreadable (the callable itself, or a
-                # store it names) must never take the whole daemon down with
-                # it -- this tick falls back to the LAST tick's node views
-                # (they age out on their own via staleness) instead of
-                # dropping them, and the next tick tries again. Only the
-                # first failure of a streak is logged, so a store stuck
-                # down doesn't spam the log every tick.
-                if not self._node_store_failing:
-                    get_logger("attention").warning(
-                        "node stores unavailable this tick (%s): %s", where, exc
-                    )
-                    self._node_store_failing = True
-                views.extend(self._last_node_views)
-            else:
-                if self._node_store_failing:
-                    get_logger("attention").info("node stores readable again")
-                    self._node_store_failing = False
-                self._last_node_views = node_views
-                views.extend(node_views)
+            for label, key, _root, records in self._read_node_stores(
+                self._extra_stores
+            ):
+                for rec in records:
+                    view = self._view(rec, now, label=label, key=key)
+                    if view is not None:
+                        views.append(view)
         views.sort(key=lambda v: (_URGENCY.get(v.state, 99), -v.ts))
         return views
+
+    def _read_node_stores(
+        self, list_roots: Callable[[], Iterable[tuple[str, str, Path]]]
+    ) -> list[tuple[str, str, str, list[dict[str, object]]]]:
+        """This tick's node records, root by root. An unreadable node store
+        must never take the daemon down: a root that raises contributes its
+        LAST GOOD records while every other root is read fresh, and a listing
+        that raises (no roots to go on) holds every root's last good records.
+        They are records, not views, so ``poll`` re-views them at the current
+        clock and a held needs-input decays to idle exactly like a fresh one.
+        A root the listing no longer names is dropped."""
+        failures: list[str] = []
+        try:
+            roots = list(list_roots())
+        except (OSError, ValueError) as exc:
+            failures.append(f"listing node stores: {exc}")
+            held = self._last_node_records
+        else:
+            previous = {
+                root: records for _l, _k, root, records in self._last_node_records
+            }
+            held = []
+            for label, key, root_path in roots:
+                root = str(root_path)
+                try:
+                    records = agent_state.read_store(root_path)
+                except (OSError, ValueError) as exc:
+                    failures.append(f"{root}: {exc}")
+                    records = previous.get(root, [])
+                held.append((label, key, root, records))
+        self._last_node_records = held
+        self._note_node_store_health(failures)
+        return held
+
+    def _note_node_store_health(self, failures: list[str]) -> None:
+        """One WARNING when a failure streak opens -- naming every root that
+        failed on that tick -- and one INFO when a tick reads clean again.
+        The streak is fleet-wide ("any root failed"), not per root, so a
+        store stuck down doesn't spam the log every tick."""
+        if failures:
+            if not self._node_store_failing:
+                get_logger("attention").warning(
+                    "node stores unavailable this tick (%s)", "; ".join(failures)
+                )
+                self._node_store_failing = True
+        elif self._node_store_failing:
+            get_logger("attention").info("node stores readable again")
+            self._node_store_failing = False
 
     def _view(
         self,
