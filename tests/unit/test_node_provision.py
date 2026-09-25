@@ -7,7 +7,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import shlex
+import shutil
 import subprocess
+import sys
 import tarfile
 from typing import TYPE_CHECKING
 
@@ -17,7 +21,7 @@ from magent import cli, node_scripts, nodes, remote_mux
 from magent.cli import hooks_cmd
 from magent.nodes import Node, UserScope
 from magent.remote_mux import RemoteError, ScriptLine
-from tests.unit._fake_ssh import gh_auth_status
+from tests.unit._fake_ssh import FakeSsh, gh_auth_status, make_fake_ssh
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -1020,3 +1024,348 @@ class TestThePayload:
         holders = [name for name, blob in data.items() if bearer.encode() in blob]
         assert holders == ["mcp_servers.json"]
         assert infos["mcp_servers.json"].mode == 0o600
+
+
+# The node scripts run under the pool's bash, on Linux. macOS ships bash 3.2
+# and bsdtar, which no node runs; Windows has no node bash at all. Not a
+# marker: the gate runs --strict-markers.
+POSIX_BASH = pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("bash") is None,
+    reason="node scripts run under the pool's bash (Linux)",
+)
+BASH = shutil.which("bash") or "bash"
+SENTINEL_LINE = b"\n" + remote_mux.PAYLOAD_SENTINEL.encode("ascii") + b"\n"
+PROVISION_TOOLS = ("bash", "cat", "mktemp", "rm", "tar", "gzip")
+
+
+def _sent(call) -> bytes:
+    """What followed the sentinel on a script call's stdin: the payload."""
+    return call.stdin.partition(SENTINEL_LINE)[2]
+
+
+def _remote(*argv: str) -> str:
+    """The one remote string run() hands ssh for ``argv`` (DECISION-9)."""
+    return "bash -c " + shlex.quote(shlex.join(argv))
+
+
+def _bash_argv(*args: str, socket: str | None = remote_mux.SOCKET) -> list[str]:
+    """A node script's local bash argv, exactly as run_script shapes it: the
+    socket FIRST (lib.sh reads and shifts it, DECISION-26 ii), then the
+    script's own arguments. ``socket=None`` leaves it out, to prove the
+    script refuses to run without one."""
+    return [BASH, "-s", "--", *([socket] if socket is not None else []), *args]
+
+
+class TestProvision:
+    def test_the_token_rides_stdin_after_the_sentinel_and_never_argv(
+        self, fake_ssh, fake_gh
+    ):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
+        remote_mux.provision(NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S)
+        (call,) = fake_ssh.calls()
+        assert TOKEN not in " ".join(call.argv)
+        assert call.argv[-1] == _remote("bash", "-s", "--", remote_mux.SOCKET)
+        assert call.stdin.startswith(node_scripts.script("provision").encode("utf-8"))
+        assert _sent(call).split(b"\n", 1)[0] == TOKEN.encode("ascii")
+
+    def test_no_gh_login_on_this_pc_ships_an_empty_token_line(self, fake_ssh):
+        remote_mux.provision(NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S)
+        (call,) = fake_ssh.calls()
+        assert _sent(call).startswith(b"\n")
+
+    def test_a_token_whose_account_gh_cannot_name_is_not_even_read(
+        self, fake_ssh, fake_gh
+    ):
+        fake_gh.set_reply("auth status", stdout="not json")
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
+        remote_mux.provision(NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S)
+        (call,) = fake_ssh.calls()
+        assert TOKEN.encode("ascii") not in call.stdin
+        assert all(c.argv[:2] != ["auth", "token"] for c in fake_gh.calls())
+
+    def test_force_is_the_scripts_one_argument(self, fake_ssh):
+        remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S, force=True
+        )
+        (call,) = fake_ssh.calls()
+        assert call.argv[-1] == _remote(
+            "bash", "-s", "--", remote_mux.SOCKET, "--force"
+        )
+
+    def test_the_verdicts_lead_the_report_one_line_per_server(self, fake_ssh):
+        fake_ssh.set_reply(
+            "bash -s", stdout="did\tstate_hook\t~/.magent/bin/state-hook.sh\n"
+        )
+        note = "mcp github: not shipped -- its command is a path on this PC"
+        report = remote_mux.provision(
+            NODE,
+            _scope(
+                mcp_servers={"docs": {"type": "http", "url": "https://d.example/mcp"}},
+                notes=(note,),
+            ),
+            timeout_s=remote_mux.PROVISION_TIMEOUT_S,
+        )
+        assert report.lines == (
+            ScriptLine("skip", "scope", note),
+            ScriptLine("ok", "scope", "mcp docs: shipped"),
+            ScriptLine("did", "state_hook", "~/.magent/bin/state-hook.sh"),
+        )
+
+    def test_a_stdio_candidate_the_node_resolves_ships(self, fake_ssh):
+        fake_ssh.set_reply(f"{remote_mux.SOCKET} npx", stdout="ok\tnpx\t/usr/bin/npx\n")
+        spec = {
+            "type": "stdio",
+            "command": "npx",
+            "args": ["-y", "x"],
+            "env": {"K": "ENV-DECOY"},
+        }
+        report = remote_mux.provision(
+            NODE,
+            _scope(mcp_servers={"x": spec}),
+            timeout_s=remote_mux.PROVISION_TIMEOUT_S,
+        )
+        probe, apply = fake_ssh.calls()
+        assert probe.argv[-1] == _remote("bash", "-s", "--", remote_mux.SOCKET, "npx")
+        assert probe.stdin.startswith(node_scripts.script("programs").encode("utf-8"))
+        assert b"ENV-DECOY" not in probe.stdin
+        _, _, data = _unpack(_sent(apply))
+        assert json.loads(data["mcp_servers.json"]) == {"x": spec}
+        assert ScriptLine("ok", "scope", "mcp x: shipped") in report.lines
+
+    def test_a_stdio_candidate_the_node_lacks_never_sends_its_env(self, fake_ssh):
+        fake_ssh.set_reply(f"{remote_mux.SOCKET} npx", stdout="skip\tnpx\tnot found\n")
+        spec = {"type": "stdio", "command": "npx", "env": {"K": "ENV-DECOY"}}
+        report = remote_mux.provision(
+            NODE,
+            _scope(mcp_servers={"x": spec}),
+            timeout_s=remote_mux.PROVISION_TIMEOUT_S,
+        )
+        probe, apply = fake_ssh.calls()
+        assert b"ENV-DECOY" not in probe.stdin
+        _, _, data = _unpack(_sent(apply))
+        assert json.loads(data["mcp_servers.json"]) == {}
+        assert all(b"ENV-DECOY" not in blob for blob in data.values())
+        assert (
+            ScriptLine(
+                "skip",
+                "scope",
+                "mcp x: not shipped -- `npx` is not on the node (command -v)",
+            )
+            in report.lines
+        )
+
+    def test_a_failed_step_comes_back_as_rows_not_an_exception(self, fake_ssh):
+        fake_ssh.set_reply("bash -s", stdout="fail\tgh\tgh is not installed\n", rc=1)
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        assert report.failed
+
+    def test_an_unreachable_node_raises(self, fake_ssh):
+        fake_ssh.set_reply("bash -s", stderr="ssh: connect to host: No route\n", rc=255)
+        with pytest.raises(RemoteError):
+            remote_mux.provision(
+                NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+            )
+
+    def test_the_timeout_is_mandatory(self):
+        with pytest.raises(TypeError):
+            remote_mux.provision(NODE, _scope())
+
+    def test_a_failed_call_names_stdin_by_its_length_never_the_token(
+        self, fake_ssh, fake_gh, caplog
+    ):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
+        fake_ssh.set_mode("timeout")
+        with pytest.raises(RemoteError) as info:
+            remote_mux.provision(NODE, _scope(), timeout_s=1.0)
+        assert info.value.rc is None
+        assert info.value.command_redacted[-1].startswith("<stdin: ")
+        assert TOKEN not in str(info.value)
+        assert "timed out" in caplog.text
+        assert TOKEN not in caplog.text
+
+
+def _sysbin(
+    tmp_path: Path,
+    tools: tuple[str, ...],
+    *,
+    python: bool = True,
+    name: str = "sysbin",
+) -> Path:
+    """A PATH directory holding ONLY ``tools`` (symlinks to this runner's), and
+    ``python3`` as this interpreter. A CI image ships gh, and a dev node may
+    have claude: neither can be found through it."""
+    sysbin = tmp_path / name
+    sysbin.mkdir(exist_ok=True)
+    for tool in tools:
+        link = sysbin / tool
+        if not link.exists():
+            found = shutil.which(tool)
+            assert found is not None, f"{tool} is not on this runner"
+            link.symlink_to(found)
+    if python and not (sysbin / "python3").exists():
+        (sysbin / "python3").symlink_to(sys.executable)
+    return sysbin
+
+
+def _node_payload(scope: UserScope | None = None, *, token: str | None = None) -> bytes:
+    return remote_mux.build_payload(
+        scope if scope is not None else _scope(),
+        gh_token=token,
+        gh_login="amin" if token else None,
+        state_hook=HOOK_TEXT,
+    )
+
+
+def _run_provision(
+    tmp_path: Path,
+    payload: bytes,
+    *,
+    fakes: tuple[FakeSsh, ...] = (),
+    args: tuple[str, ...] = (),
+    python: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    """provision.sh under real bash, exactly as ssh would feed it, for a node
+    whose home is tmp_path/node."""
+    (tmp_path / "node").mkdir(exist_ok=True)
+    (tmp_path / "tmp").mkdir(exist_ok=True)
+    sysbin = _sysbin(
+        tmp_path, PROVISION_TOOLS, python=python, name="sysbin" if python else "nopy"
+    )
+    return subprocess.run(
+        _bash_argv(*args),
+        input=remote_mux._frame_script(node_scripts.script("provision"), payload),
+        capture_output=True,
+        env={
+            "HOME": str(tmp_path / "node"),
+            "PATH": os.pathsep.join([*(str(f.base) for f in fakes), str(sysbin)]),
+            "TMPDIR": str(tmp_path / "tmp"),
+        },
+        timeout=120,
+        check=False,
+    )
+
+
+def _rows(result: subprocess.CompletedProcess[bytes]) -> dict[str, str]:
+    report = remote_mux.parse_report(result.stdout.decode("utf-8"))
+    return {line.item: line.status for line in report.lines}
+
+
+@POSIX_BASH
+class TestProvisionShUnderRealBash:
+    def test_an_empty_pc_provisions_with_no_tool_on_the_node(self, tmp_path):
+        # R-F1: no gh login, no gh and no claude on the node -- rc 0, and the
+        # state hook is the one thing installed.
+        r = _run_provision(tmp_path, _node_payload())
+        assert r.returncode == 0, r.stderr
+        assert _rows(r) == {
+            "gh": "warn",
+            "state_hook": "did",
+            "settings": "did",
+            "mcp": "skip",
+            "mcp_oauth": "skip",
+            "plugins": "skip",
+            "skills": "skip",
+        }
+        hook = tmp_path / "node" / ".magent" / "bin" / "state-hook.sh"
+        assert hook.read_text(encoding="utf-8") == HOOK_TEXT
+
+    def test_the_scope_lands_in_the_nodes_home(self, tmp_path):
+        gh = make_fake_ssh(tmp_path, name="gh")
+        scope = _scope(
+            settings={"model": "opus"},
+            mcp_servers={"docs": {"type": "http", "url": "https://docs.example/mcp"}},
+            skills=(nodes.SkillFile(path="s/run.sh", data=b"#!x\n", executable=True),),
+        )
+        r = _run_provision(tmp_path, _node_payload(scope, token=TOKEN), fakes=(gh,))
+        assert r.returncode == 0, r.stderr
+        home = tmp_path / "node"
+        settings = json.loads((home / ".claude" / "settings.json").read_text("utf-8"))
+        assert settings["model"] == "opus"
+        claude_json = json.loads((home / ".claude.json").read_text("utf-8"))
+        assert "docs" in claude_json["mcpServers"]
+        assert (
+            home / ".claude" / "skills" / "s" / "run.sh"
+        ).stat().st_mode & 0o777 == 0o700
+
+    def test_the_token_reaches_gh_on_stdin_and_no_argv(self, tmp_path):
+        gh = make_fake_ssh(tmp_path, name="gh")
+        _run_provision(tmp_path, _node_payload(token=TOKEN), fakes=(gh,))
+        calls = gh.calls()
+        assert all(TOKEN not in " ".join(c.argv) for c in calls)
+        (login,) = [c for c in calls if c.argv[:2] == ["auth", "login"]]
+        assert login.stdin == (TOKEN + "\n").encode("ascii")
+
+    def test_the_token_is_in_no_output_and_no_file_on_the_node(self, tmp_path):
+        gh = make_fake_ssh(tmp_path, name="gh")
+        r = _run_provision(tmp_path, _node_payload(token=TOKEN), fakes=(gh,))
+        assert r.returncode == 0, r.stderr
+        assert TOKEN.encode("ascii") not in r.stdout + r.stderr
+        written = [p for p in (tmp_path / "node").rglob("*") if p.is_file()]
+        assert written  # the state hook and settings, at least
+        assert all(TOKEN.encode("ascii") not in p.read_bytes() for p in written)
+
+    def test_a_second_run_only_skips(self, tmp_path):
+        gh = make_fake_ssh(tmp_path, name="gh")
+        gh.set_reply("api user", stdout="amin\n")
+        payload = _node_payload(_scope(settings={"model": "opus"}), token=TOKEN)
+        _run_provision(tmp_path, payload, fakes=(gh,))
+        r = _run_provision(tmp_path, payload, fakes=(gh,))
+        assert r.returncode == 0, r.stderr
+        assert set(_rows(r).values()) == {"skip"}
+
+    def test_force_reaches_the_applier(self, tmp_path):
+        payload = _node_payload()
+        _run_provision(tmp_path, payload)
+        r = _run_provision(tmp_path, payload, args=("--force",))
+        assert _rows(r)["state_hook"] == "did"
+
+    def test_the_private_work_dir_is_gone_afterwards(self, tmp_path):
+        _run_provision(tmp_path, _node_payload())
+        assert list((tmp_path / "tmp").iterdir()) == []
+
+    def test_no_python3_is_one_fail_row_naming_the_repair(self, tmp_path):
+        r = _run_provision(tmp_path, _node_payload(), python=False)
+        assert r.returncode == 1
+        assert remote_mux.parse_report(r.stdout.decode("utf-8")).lines == (
+            ScriptLine(
+                "fail",
+                "python3",
+                "python3 is not installed on this node -- run: magent node setup",
+            ),
+        )
+
+    def test_an_unknown_argument_is_refused(self, tmp_path):
+        r = _run_provision(tmp_path, _node_payload(), args=("--bogus",))
+        assert r.returncode == 2
+        assert _rows(r) == {"provision": "fail"}
+
+
+@POSIX_BASH
+class TestProgramsShUnderRealBash:
+    def test_it_names_what_the_node_resolves_and_what_it_lacks(self, tmp_path):
+        sysbin = _sysbin(tmp_path, ("bash",), python=False, name="progbin")
+        local_bin = tmp_path / "node" / ".local" / "bin"
+        local_bin.mkdir(parents=True)
+        uvx = local_bin / "uvx"
+        uvx.write_text("#!/bin/sh\n", encoding="utf-8")
+        uvx.chmod(0o755)
+        r = subprocess.run(
+            _bash_argv("uvx", "bash", "no-such-program"),
+            input=remote_mux._frame_script(node_scripts.script("programs"), None),
+            capture_output=True,
+            env={"HOME": str(tmp_path / "node"), "PATH": str(sysbin)},
+            timeout=60,
+            check=False,
+        )
+        assert r.returncode == 0, r.stderr
+        lines = remote_mux.parse_report(r.stdout.decode("utf-8")).lines
+        assert [(line.status, line.item) for line in lines] == [
+            ("ok", "uvx"),
+            ("ok", "bash"),
+            ("skip", "no-such-program"),
+        ]
+        assert lines[0].detail == str(uvx)

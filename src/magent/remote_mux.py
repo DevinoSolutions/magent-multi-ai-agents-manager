@@ -39,10 +39,10 @@ from typing import TYPE_CHECKING
 from magent import node_scripts
 from magent.attach_client import SSH_MISSING_RC, SSH_TRANSPORT_RC, TMUX_SOCKET
 from magent.log import get_logger
-from magent.nodes import LoadSample
+from magent.nodes import LoadSample, stdio_programs, without_missing_programs
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Mapping, Sequence
+    from collections.abc import Collection, Iterable, Mapping, Sequence
     from pathlib import Path
     from typing import IO
 
@@ -584,6 +584,76 @@ def build_payload(
             info.uname = info.gname = ""
             tar.addfile(info, io.BytesIO(data))
     return (gh_token or "").encode("utf-8") + b"\n" + raw.getvalue()
+
+
+# A provision applies the whole user scope (plugins install, marketplaces
+# clone); the program probe ahead of it is one `command -v` per name.
+PROVISION_TIMEOUT_S = 300.0
+PROGRAMS_TIMEOUT_S = 30.0
+
+
+def node_programs(
+    node: Node, programs: Iterable[str], *, timeout_s: float
+) -> frozenset[str]:
+    """The subset of ``programs`` the node resolves (``command -v``, with
+    ~/.local/bin first, as provision.sh runs). Only program NAMES cross --
+    never a server's env or args. Raises RemoteError when the node is
+    unreachable."""
+    wanted = sorted(set(programs))
+    if not wanted:
+        return frozenset()
+    result = run_script(node, "programs", wanted, timeout_s=timeout_s, check=False)
+    report = _report_of(result, "programs", node)
+    return frozenset(
+        line.item
+        for line in report.lines
+        if line.status == "ok" and line.item in wanted
+    )
+
+
+def provision(
+    node: Node, user_scope: UserScope, *, timeout_s: float, force: bool = False
+) -> ProvisionReport:
+    """Lay ``user_scope`` onto ``node`` in ONE apply call: provision.sh unpacks
+    the payload and node_apply applies it. This PC's gh token is shared only
+    when gh names the account it belongs to, and it rides stdin. ``force``
+    re-applies unchanged items (``magent node setup`` sends it).
+
+    A stdio MCP candidate ships only if the node resolves its program: when
+    there is one, a ``programs.sh`` probe comes first, and what the node lacks
+    is dropped BEFORE the payload exists, so its env never leaves this PC.
+    The report opens with one verdict line per server: the scope's notes as
+    ``skip`` rows (what stayed behind, and why), then ``ok`` per shipped one."""
+    programs = stdio_programs(user_scope)
+    if programs:
+        found = node_programs(
+            node, programs.values(), timeout_s=min(timeout_s, PROGRAMS_TIMEOUT_S)
+        )
+        user_scope = without_missing_programs(user_scope, found=found)
+    account = local_gh_account()
+    token = local_gh_token() if account is not None else None
+    login = account.login if account is not None and token else None
+    payload = build_payload(
+        user_scope,
+        gh_token=token if login else None,
+        gh_login=login,
+        state_hook=node_scripts.script("state_hook"),
+    )
+    result = run_script(
+        node,
+        "provision",
+        ["--force"] if force else [],
+        timeout_s=timeout_s,
+        stdin=payload,
+        check=False,
+    )
+    report = _report_of(result, "provision", node)
+    notes = tuple(ScriptLine("skip", "scope", note) for note in user_scope.notes)
+    shipped = tuple(
+        ScriptLine("ok", "scope", f"mcp {name}: shipped")
+        for name in sorted(user_scope.mcp_servers)
+    )
+    return ProvisionReport((*notes, *shipped, *report.lines))
 
 
 def has_session(node: Node, sid: str) -> bool | None:
