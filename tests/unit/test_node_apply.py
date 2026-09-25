@@ -1712,7 +1712,7 @@ class TestThePlugins:
     @pytest.mark.parametrize("broken", ["plugin list", "plugin marketplace list"])
     @pytest.mark.parametrize(
         ("stdout", "rc"),
-        [("", 1), ("[]", 1), ("not json", 0), ('{"id": "p@mkt"}', 0)],
+        [("", 1), ("[]", 1), ("[]", 2), ("not json", 0), ('{"id": "p@mkt"}', 0)],
     )
     def test_a_listing_claude_cannot_answer_fails_and_installs_nothing(
         self, box, tmp_path, capsys, broken, stdout, rc
