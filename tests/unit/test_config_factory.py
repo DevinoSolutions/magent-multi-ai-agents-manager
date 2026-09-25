@@ -229,31 +229,63 @@ class TestExampleConfigMatchesFactory:
         assert capsys.readouterr().err == ""
 
 
-class TestMigrateToFour:
-    """v4 adds the node pool (settings.nodes / nodeSync) and a project's
-    node / push. Every new key is optional -- absent means "no nodes" -- so the
-    step only stamps the version."""
-
-    def test_the_schema_is_four(self):
-        assert SCHEMA_VERSION == 4
+class TestMigrations:
+    """Invariants of the migration chain itself, true at every schema version."""
 
     def test_every_version_below_the_schema_has_a_step(self):
         assert sorted(_MIGRATIONS) == list(range(SCHEMA_VERSION))
 
+
+class TestMigrateToFour:
+    """v4 adds the node pool (settings.nodes / nodeSync) and a project's
+    node / push. Every new key is optional -- absent means "no nodes" -- so the
+    step only stamps the version.
+
+    Expected values are literals, never derived from the input: a shallow
+    copy shares nested objects, so an expectation built from ``raw`` would
+    move in lockstep with a step that mutated them."""
+
+    def test_the_schema_is_four(self):
+        assert SCHEMA_VERSION == 4
+
     def test_three_to_four_only_stamps(self):
         raw = {"version": 3, "settings": {"psmux": True}, "projects": [{"path": "a"}]}
-        assert _migrate_3_to_4(raw) == {**raw, "version": 4}
+        assert _migrate_3_to_4(raw) == {
+            "version": 4,
+            "settings": {"psmux": True},
+            "projects": [{"path": "a"}],
+        }
 
     def test_the_step_never_mutates_its_input(self):
-        raw = {"version": 3, "projects": []}
+        raw = {"version": 3, "settings": {"psmux": True}, "projects": [{"path": "a"}]}
         _migrate_3_to_4(raw)
-        assert raw["version"] == 3
+        assert raw == {
+            "version": 3,
+            "settings": {"psmux": True},
+            "projects": [{"path": "a"}],
+        }
 
     def test_a_v3_config_reaches_four_with_its_projects_intact(self):
-        projects = [{"path": "a", "windows": [{"name": "x"}]}]
-        raw = migrate_raw({"version": 3, "projects": projects})
-        assert raw["version"] == 4
-        assert raw["projects"] == projects
+        raw = migrate_raw(
+            {"version": 3, "projects": [{"path": "a", "windows": [{"name": "x"}]}]}
+        )
+        assert raw == {
+            "version": 4,
+            "projects": [{"path": "a", "windows": [{"name": "x"}]}],
+        }
+
+    def test_a_v3_file_loads_warns_and_is_left_alone(self, tmp_config, capsys):
+        # The user-visible effect of this bump: an existing v3 config still
+        # loads, says it is behind, and is never rewritten by a load.
+        path = tmp_config({"version": 3, "projects": [{"path": "api"}]})
+        before = Path(path).read_bytes()
+        cfg = load_config(path)
+        assert cfg.projects[0].path == "api"
+        assert (
+            "Warning: config schema v3 < v4; run: magent config migrate"
+            in capsys.readouterr().err
+        )
+        assert Path(path).read_bytes() == before
 
     def test_an_unversioned_config_reaches_four(self):
         assert migrate_raw({"projects": []})["version"] == 4
