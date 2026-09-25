@@ -106,6 +106,30 @@ def _link_dir(link: Path, target: Path) -> None:
         link.symlink_to(target, target_is_directory=True)
 
 
+# ssh(1)'s flags that take a value: that value (glued on, or the next token)
+# is never read as more flags.
+_SSH_VALUE_FLAGS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
+
+
+def _ssh_flags(options: list[str]) -> str:
+    """Every flag letter in ``options`` (ssh's arguments before the target),
+    clusters (``-qt``) unpacked and option values skipped."""
+    flags: list[str] = []
+    values_next = False
+    for token in options:
+        if values_next:
+            values_next = False
+            continue
+        if not token.startswith("-") or token.startswith("--"):
+            continue
+        for i, letter in enumerate(token[1:], start=1):
+            flags.append(letter)
+            if letter in _SSH_VALUE_FLAGS:
+                values_next = i == len(token) - 1
+                break
+    return "".join(flags)
+
+
 def _link_file(link: Path, target: Path) -> None:
     """A file symlink; Windows allows one only with Developer Mode or the
     privilege, so there the test skips when it cannot make one."""
@@ -1379,13 +1403,26 @@ class TestProvision:
 
     # node_apply survives a PC that hangs up by going quiet on a dead stdout
     # (F10). A SIGHUP would still kill it mid-step, and sshd sends one only
-    # to a pty session -- so provisioning must never ask for one.
+    # to a pty session -- so provisioning must never ask for one, in any
+    # spelling: -t, -tt, a cluster (-qt), or RequestTTY via -o in any form.
     def test_provisioning_never_asks_for_a_tty(self, fake_ssh):
         remote_mux.provision(NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S)
         (call,) = fake_ssh.calls()
-        options = call.argv[: call.argv.index(NODE.target)]
-        assert not {"-t", "-tt"} & set(options)
-        assert not any(o.lower().startswith("requesttty") for o in options)
+        assert "t" not in _ssh_flags(call.argv[: call.argv.index(NODE.target)])
+        assert not any("requesttty" in token.lower() for token in call.argv)
+
+    @pytest.mark.parametrize(
+        ("options", "flags"),
+        [
+            (["-t"], "t"),
+            (["-qt"], "qt"),
+            (["-o", "BatchMode=yes", "-tt"], "ott"),
+            (["-oStrictHostKeyChecking=yes", "-i", "/home/t/key"], "oi"),
+            (["-p22t"], "p"),  # a value glued on: its t is not a flag
+        ],
+    )
+    def test_the_flag_reader_the_tty_pin_uses(self, options, flags):
+        assert _ssh_flags(options) == flags
 
     def test_the_verdicts_lead_the_report_one_line_per_server(self, fake_ssh):
         fake_ssh.set_reply(
