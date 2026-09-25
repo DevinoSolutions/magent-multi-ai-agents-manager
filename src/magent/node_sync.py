@@ -29,7 +29,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -42,10 +42,10 @@ from magent.log import clear_heartbeat, get_logger
 from magent.procs import pid_alive
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping
+    from collections.abc import Callable, Collection, Iterator, Mapping
 
     from magent.config import MagentConfig
-    from magent.nodes import Node, NodeMapEntry
+    from magent.nodes import LoadSample, Node, NodeMapEntry
 
 # The daemon's ONE name, and the only "node-sync" literal in src/ (DECISION-17,
 # DECISION-26 i; a source test pins that). The heartbeat (log.run_heartbeat /
@@ -357,6 +357,68 @@ def _spec_for(entry: NodeMapEntry, mark: Mark | None) -> remote_mux.SidPull:
     )
 
 
+def _write_marks(nick: str, marks: Mapping[str, Mark]) -> None:
+    nodes.write_json_atomic(
+        nodes.pull_marks_path(nick),
+        {
+            sid: {"since": m.since, "realpath": m.realpath}
+            for sid, m in sorted(marks.items())
+        },
+    )
+
+
+def _next_mark(
+    spec: remote_mux.SidPull, old: Mark | None, snap: remote_mux.NodeSnapshot, sid: str
+) -> Mark:
+    """Where this session's next pull starts:
+    - the node did not report it, or one of its files failed to store: stay
+      put (a failed file is asked for again next tick);
+    - its transcripts were never requested under the current real path (a
+      first sight, a moved directory): from zero;
+    - otherwise: from the node's own clock at scan time, minus the overlap."""
+    real = snap.realpaths.get(sid)
+    if real is None or sid in snap.failed_sids:
+        return old if old is not None else Mark(since=0.0, realpath=real)
+    if spec.project_dir is None or old is None or old.realpath != real:
+        return Mark(since=0.0, realpath=real)
+    return Mark(since=snap.now - remote_mux.WATERMARK_OVERLAP_S, realpath=real)
+
+
+def _prune_state(nick: str, sid: str, keep: Collection[str]) -> None:
+    """Drop mirrored records the node no longer has (SessionEnd cleared it)."""
+    folder = nodes.state_dir(nick, sid)
+    try:
+        present = list(folder.glob("*.json"))
+    except OSError:
+        return
+    for path in present:
+        if path.name not in keep:
+            with contextlib.suppress(OSError):
+                path.unlink()
+
+
+def _append_sample(nick: str, sample: LoadSample, *, at: float, history_h: int) -> None:
+    """Append one row (ts on this PC's clock, like every reader's "now") and
+    drop rows older than the history window, in one atomic rewrite."""
+    path = nodes.load_path(nick)
+    cutoff = at - history_h * 3600
+    rows: list[str] = []
+    with contextlib.suppress(OSError, ValueError):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                ts = json.loads(line).get("ts")
+            except (ValueError, AttributeError):
+                continue
+            if (
+                isinstance(ts, (int, float))
+                and not isinstance(ts, bool)
+                and ts >= cutoff
+            ):
+                rows.append(line)
+    rows.append(json.dumps({**asdict(sample), "ts": at}))
+    nodes.write_text_atomic(path, "\n".join(rows) + "\n")
+
+
 def _last_line(text: str) -> str:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return lines[-1] if lines else ""
@@ -400,6 +462,7 @@ class NodeSyncer:
         self._lock_wait_s = lock_wait_s
         self._warned: set[tuple[str, str]] = set()
         self._last: dict[str, str] = {}
+        self._last_sample: dict[str, float] = {}
 
     def reconfigure(self, config: MagentConfig) -> None:
         self._config = config
@@ -480,9 +543,32 @@ class NodeSyncer:
                 continue
             specs[sid] = _spec_for(entry, marks.get(sid))
         snap = self._pull(node, specs)
-        self._store(node.nick, snap, at=self._now())
+        self._store(node.nick, specs, marks, snap, at=self._now())
 
-    def _store(self, nick: str, snap: remote_mux.NodeSnapshot, *, at: float) -> None:
+    def _store(
+        self,
+        nick: str,
+        specs: Mapping[str, remote_mux.SidPull],
+        marks: Mapping[str, Mark],
+        snap: remote_mux.NodeSnapshot,
+        *,
+        at: float,
+    ) -> None:
+        """Everything a successful pull leaves behind. ``sessions.json`` first:
+        it is the liveness readers look at."""
         nodes.write_json_atomic(
             nodes.sessions_path(nick), {"ts": at, "sessions": list(snap.sessions)}
         )
+        new_marks: dict[str, Mark] = {}
+        for sid, spec in specs.items():
+            new_marks[sid] = _next_mark(spec, marks.get(sid), snap, sid)
+            if sid in snap.state_files and sid not in snap.failed_sids:
+                _prune_state(nick, sid, snap.state_files[sid])
+        _write_marks(nick, new_marks)
+        sync = self._config.settings.node_sync
+        last = self._last_sample.get(nick)
+        if snap.sample is not None and (
+            last is None or at - last >= sync.sample_interval_s
+        ):
+            _append_sample(nick, snap.sample, at=at, history_h=sync.history_h)
+            self._last_sample[nick] = at

@@ -33,8 +33,8 @@ from magent.config import (
 from magent.env import get_env
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import get_logger, heartbeat_age, write_heartbeat
-from magent.nodes import NodeMapEntry
-from tests.unit._pull_reply import pull_meta, pull_reply
+from magent.nodes import NodeMapEntry, encoded_project_dir
+from tests.unit._pull_reply import SAMPLE, pull_meta, pull_reply
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -1011,3 +1011,153 @@ class TestANodeFailsAlone:
         assert results["third"] == (node_sync.OK, "")
         assert _calls_to(fake_ssh, "devino-second") == []
         assert _node_warnings(caplog, "second") == []
+
+
+def _second_only(**sync) -> MagentConfig:
+    return _config(
+        pool={"second": POOL["second"]},
+        projects=[ProjectConfig(path="api", node="second")],
+        **sync,
+    )
+
+
+def _marks() -> dict[str, object]:
+    return json.loads(nodes.pull_marks_path("second").read_text(encoding="utf-8"))
+
+
+def _snapshot(**over) -> remote_mux.NodeSnapshot:
+    fields: dict[str, object] = {
+        "now": 9000.0,
+        "sessions": (),
+        "sample": None,
+        "realpaths": {},
+        "state_files": {},
+        "files": (),
+        "failed_sids": frozenset(),
+    }
+    fields.update(over)
+    return remote_mux.NodeSnapshot(**fields)
+
+
+class TestTheWatermark:
+    def test_the_watermark_walks_from_zero_to_the_nodes_clock(self, placed, fake_ssh):
+        _answer(
+            fake_ssh,
+            "devino-second",
+            meta=pull_meta(realpaths={"api": "/home/amin/magent/api"}),
+        )
+        syncer = node_sync.NodeSyncer(_second_only())
+        syncer.tick()
+        assert _marks() == {"api": {"since": 0.0, "realpath": "/home/amin/magent/api"}}
+        syncer.tick()
+        assert _payload(fake_ssh.calls()[-1])["sids"]["api"] == {
+            "roots": ["~/magent/api"],
+            "project_dir": encoded_project_dir("/home/amin/magent/api"),
+            "since": 0.0,
+        }
+        assert _marks() == {
+            "api": {"since": 4999.0, "realpath": "/home/amin/magent/api"}
+        }
+        syncer.tick()
+        assert _payload(fake_ssh.calls()[-1])["sids"]["api"]["since"] == 4999.0
+
+    def test_a_moved_directory_starts_its_transcripts_over(self, placed, fake_ssh):
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"),
+            {"api": {"since": 4999.0, "realpath": "/old"}},
+        )
+        _answer(
+            fake_ssh,
+            "devino-second",
+            meta=pull_meta(realpaths={"api": "/home/amin/magent/api"}),
+        )
+        node_sync.NodeSyncer(_second_only()).tick()
+        assert _marks() == {"api": {"since": 0.0, "realpath": "/home/amin/magent/api"}}
+
+    def test_a_session_whose_files_could_not_be_stored_keeps_its_watermark_and_its_state(
+        self, placed
+    ):
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"), {"api": {"since": 10.0, "realpath": "/r"}}
+        )
+        state = nodes.state_dir("second", "api")
+        state.mkdir(parents=True)
+        (state / "gone.json").write_text("{}", encoding="utf-8")
+
+        def pull(_node, _sids):
+            return _snapshot(
+                realpaths={"api": "/r"},
+                state_files={"api": ()},
+                failed_sids=frozenset({"api"}),
+            )
+
+        node_sync.NodeSyncer(_second_only(), pull=pull).tick()
+        assert _marks() == {"api": {"since": 10.0, "realpath": "/r"}}
+        assert (state / "gone.json").exists()
+
+    def test_marks_are_dropped_for_sessions_no_longer_placed(self, placed, fake_ssh):
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"), {"gone": {"since": 5.0, "realpath": "/g"}}
+        )
+        _answer(fake_ssh, "devino-second")
+        node_sync.NodeSyncer(_second_only()).tick()
+        assert set(_marks()) == {"api"}
+
+
+class TestTheMirror:
+    def test_state_records_mirror_the_node_and_vanish_with_it(self, placed, fake_ssh):
+        state = nodes.state_dir("second", "api")
+        syncer = node_sync.NodeSyncer(_second_only())
+        _answer(
+            fake_ssh,
+            "devino-second",
+            meta=pull_meta(state_files={"api": ["k1.json", "k2.json"]}),
+            files={
+                "api/state/k1.json": '{"state": "working"}',
+                "api/state/k2.json": '{"state": "done"}',
+            },
+        )
+        syncer.tick()
+        assert sorted(p.name for p in state.iterdir()) == ["k1.json", "k2.json"]
+        _forget_replies(fake_ssh)
+        _answer(
+            fake_ssh, "devino-second", meta=pull_meta(state_files={"api": ["k2.json"]})
+        )
+        syncer.tick()
+        assert sorted(p.name for p in state.iterdir()) == ["k2.json"]
+
+    def test_transcripts_land_where_recall_reads_them(self, placed, fake_ssh):
+        _answer(
+            fake_ssh,
+            "devino-second",
+            files={
+                "api/transcripts/0f.jsonl": "{}\n",
+                "api/transcripts/0f/subagents/agent-1.jsonl": "{}\n",
+            },
+        )
+        node_sync.NodeSyncer(_second_only()).tick()
+        folder = nodes.transcripts_dir("second", "api")
+        assert (folder / "0f.jsonl").read_text(encoding="utf-8") == "{}\n"
+        assert (folder / "0f" / "subagents" / "agent-1.jsonl").exists()
+
+    def test_load_samples_are_kept_at_the_sample_interval_for_the_history_window(
+        self, placed, fake_ssh
+    ):
+        _answer(fake_ssh, "devino-second")
+        clock = iter([1000.0, 1030.0, 1070.0, 4650.0])
+        syncer = node_sync.NodeSyncer(
+            _second_only(sample_interval_s=60, history_h=1), now=lambda: next(clock)
+        )
+        for _ in range(3):
+            syncer.tick()
+        rows = [
+            json.loads(x)
+            for x in nodes.load_path("second").read_text(encoding="utf-8").splitlines()
+        ]
+        assert [r["ts"] for r in rows] == [1000.0, 1070.0]
+        syncer.tick()
+        rows = [
+            json.loads(x)
+            for x in nodes.load_path("second").read_text(encoding="utf-8").splitlines()
+        ]
+        assert rows == [{**SAMPLE, "ts": 1070.0}, {**SAMPLE, "ts": 4650.0}]
