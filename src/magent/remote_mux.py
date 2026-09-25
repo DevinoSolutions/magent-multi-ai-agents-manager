@@ -31,6 +31,7 @@ import shutil
 import stat
 import subprocess
 import tarfile
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -706,6 +707,17 @@ class BringUpResult:
 _HEADER_MAGIC = "MAGENT1"
 
 
+def _has_control(text: str) -> bool:
+    """Any control character (C0, DEL, C1): a newline, a tab, an ESC."""
+    return any(unicodedata.category(ch) == "Cc" for ch in text)
+
+
+def _clean_absolute(value: str) -> bool:
+    """``value`` is a node path magent can hand on: absolute (so it cannot
+    start with ``-``) and free of any control character."""
+    return value.startswith("/") and not _has_control(value)
+
+
 def _node_path(path: str, home: str) -> str:
     """``path`` expanded against the node's ``home`` and checked where it
     first enters a remote command: an absolute POSIX path, so it can neither
@@ -748,6 +760,11 @@ def _header(
     start, fresh = _start_argvs(recipe, resume_id)
     tokens = [_HEADER_MAGIC, "1" if allow_dirty else "0", str(len(recipe.repos))]
     for repo in recipe.repos:
+        # git on the node would take `--upload-pack=...` as an option. The
+        # script also passes `--` before them; this is the PC-side half.
+        for value, what in ((repo.url, "url"), (repo.branch, "branch")):
+            if value.startswith("-"):
+                raise ValueError(f"repo {what} {value!r} would read as an option")
         tokens += [repo.url, repo.branch, _node_path(repo.remote_dir, home)]
     tokens += [str(len(start)), *start, str(len(fresh)), *fresh]
     if any("\0" in token for token in tokens):
@@ -932,8 +949,11 @@ def _remote_home(node: Node) -> str:
     Claude project name from the absolute path, so it must be absolute."""
     probe = ["printenv", "HOME"]
     result = run(node, probe, timeout_s=PROBE_TIMEOUT_S)
-    home = result.stdout.decode("utf-8", "replace").strip()
-    if not home.startswith("/"):
+    # printenv's one trailing newline is framing; anything else is the
+    # answer. A second line (a login banner) or any other control character
+    # is refused, never trimmed away: the value becomes argv and a path.
+    home = result.stdout.decode("utf-8", "replace").removesuffix("\n")
+    if not home.startswith("/") or _has_control(home):
         raise RemoteError(
             result.returncode,
             f"unusable $HOME on the node: {home!r}",
@@ -1002,7 +1022,7 @@ def bring_up(
             if isinstance(commits, dict)
             else {}
         ),
-        cwd=cwd if isinstance(cwd, str) and cwd else root,
+        cwd=cwd if isinstance(cwd, str) and _clean_absolute(cwd) else root,
         shipped=tuple(str(s) for s in shipped) if isinstance(shipped, list) else (),
     )
 
