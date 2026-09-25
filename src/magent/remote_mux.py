@@ -37,7 +37,12 @@ from typing import TYPE_CHECKING
 from magent import node_scripts
 from magent.attach_client import SSH_MISSING_RC, TMUX_SOCKET
 from magent.log import get_logger
-from magent.nodes import LoadSample, RepoStatus, parse_repo_status
+from magent.nodes import (
+    LoadSample,
+    RepoStatus,
+    encoded_project_dir,
+    parse_repo_status,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Mapping, Sequence
@@ -846,3 +851,38 @@ def repo_status(node: Node, remote_root: str, *, timeout_s: float) -> list[RepoS
     ``repo_status.sh``). RemoteError when the node does not answer."""
     done = run_script(node, "repo_status", [remote_root], timeout_s=timeout_s)
     return parse_repo_status(_stdout_text(done))
+
+
+# A recall ships a whole conversation directory; the spec's script default.
+INSTALL_TIMEOUT_S = 120.0
+
+
+def _tar_dir(source: Path) -> bytes:
+    """An uncompressed tar of ``source``'s CONTENTS (paths relative to it)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for path in sorted(source.rglob("*")):
+            tar.add(path, arcname=path.relative_to(source).as_posix(), recursive=False)
+    return buf.getvalue()
+
+
+def node_realpath(node: Node, path: str, *, timeout_s: float) -> str:
+    """The physical path ``path`` names on ``node`` (``~`` expanded, symlinks
+    resolved) -- the string Claude Code there keys its project dir by."""
+    done = run_script(node, "node_realpath", [path], timeout_s=timeout_s)
+    return _stdout_text(done).strip()
+
+
+def install_transcripts(
+    node: Node, remote_root: str, source: Path, *, timeout_s: float
+) -> str:
+    """Put a pulled Claude project directory where a session started in
+    ``remote_root`` on ``node`` will look for it (recall --to, spec §12 step
+    4). The name is encoded HERE, by the one encoder, from the node's own
+    physical path; the node only extracts. Returns the directory it landed
+    in. RemoteError when the node refuses or does not answer."""
+    name = encoded_project_dir(node_realpath(node, remote_root, timeout_s=timeout_s))
+    done = run_script(
+        node, "install_transcripts", [name], timeout_s=timeout_s, stdin=_tar_dir(source)
+    )
+    return _stdout_text(done).strip()

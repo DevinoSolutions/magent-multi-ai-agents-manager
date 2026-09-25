@@ -11,10 +11,12 @@ of a transcript IS its session id; subagent logs (agent-*.jsonl, anything under
 
 from __future__ import annotations
 
+import io
 import os
 import subprocess
 import sys
-from typing import TYPE_CHECKING
+import tarfile
+from pathlib import Path
 
 import pytest
 
@@ -26,9 +28,6 @@ from tests.unit._node_fixtures import (
     git,
     write_transcript,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 class TestTheEncodedDirIsClaudeCodesOwnRule:
@@ -283,3 +282,168 @@ class TestRepoStatusScript:
         )
 
         assert out == "~/magent/gone\t\t\tmissing\t-1\n"
+
+
+def _pulled(tmp_path: Path) -> Path:
+    source = tmp_path / "pulled"
+    (source / "memory").mkdir(parents=True)
+    (source / f"{SESSION_ID}.jsonl").write_text(
+        '{"sessionId": "x"}\n', encoding="utf-8"
+    )
+    (source / "memory" / "MEMORY.md").write_text("- remember\n", encoding="utf-8")
+    return source
+
+
+class TestInstallTranscripts:
+    @pytest.fixture
+    def scripts(self, monkeypatch):
+        seen: list[tuple[str, list[str], bytes]] = []
+
+        def _run_script(node, script, args, *, timeout_s, stdin=None, **_k):
+            seen.append((script, args, stdin or b""))
+            if script == "node_realpath":
+                return subprocess.CompletedProcess(
+                    [], 0, b"/home/amin/magent/my_api\n", b""
+                )
+            return subprocess.CompletedProcess(
+                [], 0, b"/home/amin/.claude/projects/-home-amin-magent-my-api\n", b""
+            )
+
+        monkeypatch.setattr(remote_mux, "run_script", _run_script)
+        return seen
+
+    def test_magent_encodes_the_nodes_real_path_and_the_node_only_receives_the_name(
+        self, scripts, tmp_path
+    ):
+        landed = remote_mux.install_transcripts(
+            _NODE, "~/magent/my_api", _pulled(tmp_path), timeout_s=5
+        )
+
+        assert [(s, a) for s, a, _ in scripts] == [
+            ("node_realpath", ["~/magent/my_api"]),
+            (
+                "install_transcripts",
+                [nodes.encoded_project_dir("/home/amin/magent/my_api")],
+            ),
+        ]
+        assert landed == "/home/amin/.claude/projects/-home-amin-magent-my-api"
+
+    def test_the_conversation_travels_as_a_tar_of_the_directory_contents(
+        self, scripts, tmp_path
+    ):
+        remote_mux.install_transcripts(
+            _NODE, "~/magent/api", _pulled(tmp_path), timeout_s=5
+        )
+
+        with tarfile.open(fileobj=io.BytesIO(scripts[1][2])) as tar:
+            names = sorted(tar.getnames())
+        assert names == [f"{SESSION_ID}.jsonl", "memory", "memory/MEMORY.md"]
+
+    def test_an_unanswered_realpath_installs_nothing(self, monkeypatch, tmp_path):
+        calls: list[str] = []
+
+        def _run_script(node, script, args, *, timeout_s, stdin=None, **_k):
+            calls.append(script)
+            raise remote_mux.RemoteError(
+                255, "Connection refused", ("ssh", "devino-second")
+            )
+
+        monkeypatch.setattr(remote_mux, "run_script", _run_script)
+
+        with pytest.raises(remote_mux.RemoteError):
+            remote_mux.install_transcripts(
+                _NODE, "~/magent/api", _pulled(tmp_path), timeout_s=5
+            )
+        assert calls == ["node_realpath"]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="node scripts run under a Linux node's bash"
+)
+class TestTheInstallScriptsOnANode:
+    def test_realpath_expands_the_tilde_and_resolves_symlinks(
+        self, monkeypatch, tmp_path
+    ):
+        home = tmp_path / "nodehome"
+        (home / "real").mkdir(parents=True)
+        (home / "magent").symlink_to(home / "real")
+
+        out = _as_the_node(
+            _node_call(monkeypatch, "node_realpath", ["~/magent/api"]), home
+        )
+
+        assert out.strip() == os.path.realpath(home / "real" / "api")
+
+    def test_realpath_resolves_a_root_that_is_not_cloned_yet(
+        self, monkeypatch, tmp_path
+    ):
+        home = tmp_path / "nodehome"
+        home.mkdir()
+
+        out = _as_the_node(
+            _node_call(monkeypatch, "node_realpath", ["~/magent/api"]), home
+        )
+
+        assert out.strip() == os.path.join(os.path.realpath(home), "magent", "api")
+
+    def _install(self, monkeypatch, tmp_path: Path, home: Path, name: str) -> str:
+        call = _node_call(
+            monkeypatch,
+            "install_transcripts",
+            [name],
+            remote_mux._tar_dir(_pulled(tmp_path)),
+        )
+        return _as_the_node(call, home).strip()
+
+    def test_the_conversation_lands_under_the_given_name(self, monkeypatch, tmp_path):
+        home = tmp_path / "nodehome"
+        home.mkdir()
+
+        landed = self._install(monkeypatch, tmp_path, home, "-home-amin-magent-api")
+
+        expected = (
+            Path(os.path.realpath(home))
+            / ".claude"
+            / "projects"
+            / "-home-amin-magent-api"
+        )
+        assert Path(landed) == expected
+        assert (expected / f"{SESSION_ID}.jsonl").read_text(
+            encoding="utf-8"
+        ) == '{"sessionId": "x"}\n'
+        assert (expected / "memory" / "MEMORY.md").exists()
+
+    def test_it_never_deletes_what_is_already_there(self, monkeypatch, tmp_path):
+        home = tmp_path / "nodehome"
+        existing = home / ".claude" / "projects" / "-home-amin-magent-api"
+        existing.mkdir(parents=True)
+        (existing / "older.jsonl").write_text("{}\n", encoding="utf-8")
+
+        self._install(monkeypatch, tmp_path, home, "-home-amin-magent-api")
+
+        assert (existing / "older.jsonl").exists()
+
+    @pytest.mark.parametrize("name", ["", "..", "a/b", "-home-../x"])
+    def test_a_name_outside_the_encoders_alphabet_is_refused(
+        self, monkeypatch, tmp_path, name
+    ):
+        home = tmp_path / "nodehome"
+        home.mkdir()
+        argv, stdin = _node_call(
+            monkeypatch,
+            "install_transcripts",
+            [name],
+            remote_mux._tar_dir(_pulled(tmp_path)),
+        )
+
+        done = subprocess.run(
+            argv,
+            input=stdin,
+            env={**os.environ, "HOME": str(home)},
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+
+        assert done.returncode == 2
+        assert not (home / ".claude").exists()
