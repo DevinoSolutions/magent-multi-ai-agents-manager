@@ -901,11 +901,32 @@ class TestArgumentParsing:
         )
         assert (opts.mux, opts.remote) == ("tmux", "tmux -L magent attach -t '=api'")
 
-    def test_an_unknown_mux_is_rejected_by_the_parser(self):
-        with pytest.raises(SystemExit):
+    def test_an_unknown_mux_is_rejected_by_the_parser(self, capsys):
+        with pytest.raises(SystemExit) as exc:
             attach_client.parse_args(
                 ["--target", "me@box", "--session", "api", "--mux", "screen"]
             )
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "--mux" in err
+        assert "invalid choice" in err
+
+    def test_an_explicit_remote_wins_under_tmux_too(self):
+        # Corpse coherence needs an explicit --remote to survive verbatim for a
+        # node pane: a later task spawns those with both --mux and --remote.
+        opts = attach_client.parse_args(
+            [
+                "--target",
+                "me@box",
+                "--session",
+                "api",
+                "--mux",
+                "tmux",
+                "--remote",
+                "custom",
+            ]
+        )
+        assert (opts.remote, opts.mux) == ("custom", "tmux")
 
 
 class TestMain:
