@@ -853,6 +853,16 @@ class TestPullNode:
         assert info.value.command_redacted[-1].startswith("<stdin: ")
         assert _node_logs(caplog) == []
 
+    def test_a_node_that_does_not_answer_in_time_raises_with_no_returncode(
+        self, fake_ssh, tmp_path
+    ):
+        # The docstring's "a timeout (None)", pinned at this level and not
+        # only one down at run(quiet=True).
+        fake_ssh.set_mode("timeout")
+        with pytest.raises(RemoteError) as info:
+            remote_mux.pull_node(NODE, {}, dest=tmp_path, timeout_s=0.5)
+        assert info.value.rc is None
+
     def test_the_reply_held_in_ram_is_capped_at_the_pull_bound(
         self, fake_ssh, tmp_path, monkeypatch
     ):

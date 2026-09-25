@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Literal, NoReturn
 
 import click
 
-from magent import env, log, nodes
+from magent import env, log
 from magent.cli.app import main
 from magent.cli.config_io import _load_config_or_exit
 from magent.config import NODE_AUTO, is_cloud, runs_on_node
@@ -53,21 +53,42 @@ def _table_row(cells: list[str], widths: list[int]) -> str:
     )
 
 
+# What the user column shows for a node whose login cannot be resolved (an
+# explicit empty "user", or a local name that is not a node login).
+_NO_LOGIN = "? (set user)"
+
+
+def _node_login(cfg: MagentConfig, nick: str, local_user: str) -> str:
+    """The login sessions on ``nick`` run as -- read from the D4 rule's one
+    home, never re-derived here."""
+    from magent import nodes  # heavy subsystem: in-body per policy
+
+    try:
+        return nodes.node_for_nick(cfg, nick, local_user=local_user).user
+    except nodes.NodeConfigError:
+        return _NO_LOGIN
+
+
 def _node_rows(cfg: MagentConfig, *, now: float) -> list[list[str]]:
+    from magent import nodes  # heavy subsystem: in-body per policy
+
     daemon = _daemon_state()
     local_user = env.local_username()
+    # The same windows placement reads; None: a table never samples live.
+    windows, _ = nodes.placement_samples(cfg, now=now, live_sample=None)
     rows: list[list[str]] = []
     for nick, conf in cfg.settings.nodes.items():
-        window = nodes.in_window(nodes.read_load_history(nick), now=now)
+        window = windows.get(nick, [])
         score = nodes.score_node(nick, window)
         load, mem, mine = "no data", "-", "-"
         if score is not None:
             load = f"{score.p75:.2f} ({score.samples})"
+            mine = str(score.my_sessions)
             latest = max(window, key=lambda s: s.ts)
-            mine = str(latest.my_sessions)
             if latest.mem_total_mb > 0:
                 mem = f"{latest.mem_avail_mb / latest.mem_total_mb:.0%} free"
-        rows.append([nick, conf.host, conf.user or local_user, load, mem, mine, daemon])
+        login = _node_login(cfg, nick, local_user)
+        rows.append([nick, conf.host, login, load, mem, mine, daemon])
     return rows
 
 
@@ -235,6 +256,8 @@ def _node_project_or_exit(cfg: MagentConfig, query: str) -> ProjectConfig:
     exit 2. A cloud project is returned too: plan, push and recall each route
     it explicitly, right after the name (DECISION-15; J11m's branches sit
     there)."""
+    from magent import nodes  # heavy subsystem: in-body per policy
+
     names = [nodes.project_name(p) for p in cfg.projects]
     hit = resolve_session(query, names)
     if hit is None:
@@ -246,6 +269,8 @@ def _node_project_or_exit(cfg: MagentConfig, query: str) -> ProjectConfig:
 
 
 def _plan_heading(name: str, proj: ProjectConfig, placement: Placement | None) -> str:
+    from magent import nodes  # heavy subsystem: in-body per policy
+
     if proj.node != NODE_AUTO:
         return f"  {style(name, bold=True)}  pinned -> @{proj.node}"
     if placement is None or placement.nick is None:
@@ -260,6 +285,8 @@ def _plan_heading(name: str, proj: ProjectConfig, placement: Placement | None) -
 
 
 def _print_scores(placement: Placement) -> None:
+    from magent import nodes  # heavy subsystem: in-body per policy
+
     headers = [
         "nick",
         "samples",
@@ -330,7 +357,7 @@ def plan_cmd(ctx: click.Context, project: str | None, all_projects: bool) -> Non
     for a node with too few recent samples, one live reading -- but nothing
     is recorded and nothing is started.
     """
-    from magent import launch  # heavy subsystem: in-body per policy
+    from magent import launch, nodes  # heavy subsystem: in-body per policy
 
     if (project is None) == (not all_projects):
         raise click.UsageError("name one project, or pass --all")
@@ -387,6 +414,8 @@ def _tail(exc: RemoteError) -> str:
 
 
 def _source_node(cfg: MagentConfig, held: NodeMapEntry) -> Node | None:
+    from magent import nodes  # heavy subsystem: in-body per policy
+
     try:
         return nodes.node_for_nick(cfg, held.nick, local_user=env.local_username())
     except nodes.NodeConfigError as exc:
@@ -402,7 +431,11 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
     daemon's tick holds -- so it never races a running daemon (DECISION-26
     xi). False when the node is gone. A daemon that keeps the node past the
     wait stops the recall here, before anything is stopped or cleared."""
-    from magent import node_sync, remote_mux  # heavy subsystem: in-body per policy
+    from magent import (  # heavy subsystem: in-body per policy
+        node_sync,
+        nodes,
+        remote_mux,
+    )
 
     try:
         node_sync.final_pull(cfg, name, local_user=env.local_username())
@@ -452,7 +485,7 @@ def _repo_line(status: RepoStatus) -> str:
 def _report_repos(source: Node | None, held: NodeMapEntry) -> None:
     """Step 2: the node's commit per repo and whether its tree was dirty --
     live when the node answers (and recorded), else the last record."""
-    from magent import remote_mux  # heavy subsystem: in-body per policy
+    from magent import nodes, remote_mux  # heavy subsystem: in-body per policy
 
     record = None
     if source is not None:
@@ -523,6 +556,8 @@ def _clear_placement(name: str, held: NodeMapEntry) -> None:
     process keeps past its wait (``LockHeld``, an OSError -- DECISION-13) or a
     failed write is a printed failure, never a traceback. By then the session
     is already stopped, so a re-run only redoes the install and the clear."""
+    from magent import nodes  # heavy subsystem: in-body per policy
+
     try:
         nodes.update_node_map(name, None)
     except OSError as exc:
@@ -542,6 +577,8 @@ def _recall_local(
     """Steps 4-5 for ``--local``: install into THIS machine's Claude dir for
     the local folder, clear the placement, print the resume -- never launch
     it, because the user picks the terminal."""
+    from magent import nodes  # heavy subsystem: in-body per policy
+
     dest = (
         Path.home() / ".claude" / "projects" / nodes.encoded_project_dir(str(local_dir))
     )
@@ -612,6 +649,8 @@ def recall_cmd(ctx: click.Context, project: str, to_local: bool) -> None:
     Claude looks, and clears the placement. A node that does not answer is
     reported, never fatal: what was already pulled is used.
     """
+    from magent import nodes  # heavy subsystem: in-body per policy
+
     if not to_local:
         raise click.UsageError("pass --local")
     cfg = _load_config_or_exit(find_config(ctx.obj.get("config_path")))

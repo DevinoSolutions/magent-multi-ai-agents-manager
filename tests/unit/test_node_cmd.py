@@ -53,6 +53,32 @@ def _row(stdout: str, nick: str) -> str:
     return next(line for line in stdout.splitlines() if line.strip().startswith(nick))
 
 
+def _write_load(nick: str, rows: list[tuple[float, int, int, int]]) -> None:
+    """load.jsonl rows ``(ts, mem_total_mb, mem_avail_mb, my_sessions)``, in
+    the given (file) order."""
+    path = nodes.load_path(nick)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "ts": ts,
+                    "nproc": 4,
+                    "load1": 1.0,
+                    "load5": 1.0,
+                    "load15": 1.0,
+                    "mem_total_mb": total,
+                    "mem_avail_mb": avail,
+                    "my_sessions": mine,
+                }
+            )
+            + "\n"
+            for ts, total, avail, mine in rows
+        ),
+        encoding="utf-8",
+    )
+
+
 class TestTheNodeTable:
     def test_each_node_gets_a_row_in_config_order_with_its_30_minute_load(
         self, runner, tmp_config
@@ -74,40 +100,107 @@ class TestTheNodeTable:
 
     def test_memory_and_sessions_come_from_the_newest_sample(self, runner, tmp_config):
         # Levels, not rates: the row shows the NEWEST reading even when it is
-        # neither first nor last in the file.
+        # neither first nor last in the file -- and memory as FREE (4000 of
+        # 16000 is 25% free, 75% used).
         now = time.time()
-        rows = [
-            (now - 600, 16000, 8000, 1),
-            (now - 30, 16000, 4000, 3),
-            (now - 1200, 16000, 12000, 2),
-        ]
-        path = nodes.load_path("second")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            "".join(
-                json.dumps(
-                    {
-                        "ts": ts,
-                        "nproc": 4,
-                        "load1": 1.0,
-                        "load5": 1.0,
-                        "load15": 1.0,
-                        "mem_total_mb": total,
-                        "mem_avail_mb": avail,
-                        "my_sessions": mine,
-                    }
-                )
-                + "\n"
-                for ts, total, avail, mine in rows
-            ),
-            encoding="utf-8",
+        _write_load(
+            "second",
+            [
+                (now - 600, 16000, 12000, 5),
+                (now - 60, 16000, 4000, 2),
+                (now - 1200, 16000, 14000, 7),
+            ],
         )
         cfg = tmp_config(config_json(("second",), []))
 
         result = runner.invoke(cli.main, ["--config", cfg, "node"])
 
         cells = _row(result.stdout, "second").split()
-        assert cells[5:8] == ["25%", "free", "3"]
+        assert cells[5:8] == ["25%", "free", "2"]
+
+    def test_a_sample_without_a_memory_total_shows_no_memory(self, runner, tmp_config):
+        _write_load("second", [(time.time() - 60, 0, 0, 1)])
+        cfg = tmp_config(config_json(("second",), []))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node"])
+
+        assert result.exit_code == 0
+        assert _row(result.stdout, "second").split()[5] == "-"
+
+    def test_the_columns_line_up_under_their_headers(self, runner, tmp_config):
+        seed_history("second", "quiet", now=time.time() + 30)
+        body = config_json(("second", "t"), [])
+        body["settings"]["nodes"]["t"]["host"] = "a-much-longer-host.example.com"
+        cfg = tmp_config(body)
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node"])
+
+        header = _row(result.stdout, "nick")
+        rows = [_row(result.stdout, "second"), _row(result.stdout, "t ")]
+        for column in ("host", "user", "load p75 30m", "mem", "my sessions", "daemon"):
+            start = header.index(column)
+            for line in [header, *rows]:
+                assert line[start - 2 : start] == "  ", (column, line)
+                assert line[start] != " ", (column, line)
+
+    def test_a_node_without_a_user_shows_the_login_sessions_run_as(
+        self, runner, tmp_config, monkeypatch
+    ):
+        # The D4 rule's one home is nodes.node_for_nick: the LOWERCASED local
+        # login, never the raw environment value.
+        monkeypatch.setenv("USERNAME", "Amin")
+        monkeypatch.setenv("USER", "Amin")
+        body = config_json(("second",), [])
+        del body["settings"]["nodes"]["second"]["user"]
+        cfg = tmp_config(body)
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node"])
+
+        cfg_typed = cli.config_io._load_config_or_exit(Path(cfg))
+        expected = nodes.node_for_nick(cfg_typed, "second", local_user="Amin").user
+        assert expected == "amin"
+        assert _row(result.stdout, "second").split()[2] == expected
+
+    @pytest.mark.parametrize(
+        "local",
+        [
+            "Amin Dhouib",  # not a node login once lowercased
+            "root",  # D4: running as root never silently means root on a node
+        ],
+        ids=["unusable-local-login", "local-root"],
+    )
+    def test_a_login_the_rule_refuses_is_marked_not_guessed(
+        self, runner, tmp_config, monkeypatch, local
+    ):
+        monkeypatch.setenv("USERNAME", local)
+        monkeypatch.setenv("USER", local)
+        body = config_json(("second",), [])
+        del body["settings"]["nodes"]["second"]["user"]
+        cfg = tmp_config(body)
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node"])
+
+        assert result.exit_code == 0
+        row = _row(result.stdout, "second")
+        assert "? (set user)" in row
+        assert local.lower() not in row.split()
+
+    def test_an_explicit_empty_user_never_reaches_the_table(
+        self, runner, tmp_config, monkeypatch
+    ):
+        # The config refuses it at load (exit 1), so the table can never show
+        # the local login for a node whose sessions could not run at all.
+        monkeypatch.setenv("USERNAME", "amin")
+        monkeypatch.setenv("USER", "amin")
+        body = config_json(("second",), [])
+        body["settings"]["nodes"]["second"]["user"] = ""
+        cfg = tmp_config(body)
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node"])
+
+        assert result.exit_code == 1
+        assert "settings.nodes.second.user must not be empty" in result.stderr
+        assert "second" not in result.stdout
 
     def test_a_node_without_samples_says_no_data(self, runner, tmp_config):
         cfg = tmp_config(config_json(("second",), []))
@@ -138,6 +231,7 @@ class TestTheNodeTable:
 
         assert result.exit_code == 0
         assert "settings.nodes" in result.stdout
+        assert "load p75" not in result.stdout
 
     def test_the_table_writes_nothing(self, runner, tmp_config):
         seed_history("second", "quiet", now=time.time() + 30)
@@ -168,9 +262,31 @@ class TestNodeCmdKeepsTheHelpPathLight:
         assert not top & {
             "remote_mux",
             "node_sync",
+            "nodes",
             "magent.remote_mux",
             "magent.node_sync",
+            "magent.nodes",
         }
+
+    def test_importing_the_cli_does_not_load_nodes(self):
+        """magent.nodes pulls in the sessions registry (~11 ms); `magent --help`
+        must not pay for it. A fresh interpreter, since this one has it."""
+        import subprocess
+        import sys
+
+        probe = (
+            "import sys, magent.cli; "
+            "print(sorted(m for m in ('magent.nodes', 'magent.remote_mux',"
+            " 'magent.node_sync') if m in sys.modules))"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        ).stdout
+        assert out.strip() == "[]"
 
 
 @pytest.fixture

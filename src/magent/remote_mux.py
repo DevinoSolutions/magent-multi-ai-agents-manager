@@ -1073,7 +1073,10 @@ def pull_node(
     RemoteError on a transport failure (255), a timeout (None), a reply over
     ``PULL_MAX_REPLY_BYTES`` (None too -- pull.sh keeps its
     own reply under ``PULL_MAX_TOTAL_BYTES``, so this means a node that did
-    not), a node without python3 (3), or a reply that is not a pull (0)."""
+    not), a node without python3 (3), or a reply that is not a pull (0).
+    ValueError, after the ssh, when ``sids`` names a session that is not
+    ``pullable_sid`` (``parse_pull`` refuses it: the caller's bug, not the
+    node's)."""
     argv, input_bytes = _pull_call(sids)
     result = run(
         node,
