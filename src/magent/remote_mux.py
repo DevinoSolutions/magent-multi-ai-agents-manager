@@ -65,6 +65,40 @@ BRING_UP_TIMEOUT_S = 600.0
 # the node, never an argument.
 PAYLOAD_SENTINEL = "__MAGENT_PAYLOAD__"
 
+# The Claude Code lifecycle events the node's state hook is wired into: the
+# same six `magent hooks install` wires on this PC. A src module may not import
+# the cli package (LS-A-001), so this is a copy -- drift-pinned against
+# cli/hooks_cmd._EVENTS by tests/unit/test_node_provision.py.
+HOOK_EVENTS = (
+    "UserPromptSubmit",
+    "PostToolUse",
+    "Stop",
+    "Notification",
+    "SessionStart",
+    "SessionEnd",
+)
+# The node-side hook command. provision.sh installs node_scripts/state_hook.sh
+# at this path; Claude Code runs hook commands through bash, so $HOME expands.
+NODE_STATE_HOOK_COMMAND = '"$HOME/.magent/bin/state-hook.sh" --source claude'
+
+
+def state_hook_entries(
+    command: str = NODE_STATE_HOOK_COMMAND,
+) -> dict[str, dict[str, object]]:
+    """One settings.json hook entry per event, in exactly the shape `magent
+    hooks install` writes (pinned by test) -- PostToolUse alone carries the
+    ``"*"`` matcher."""
+    entries: dict[str, dict[str, object]] = {}
+    for event in HOOK_EVENTS:
+        entry: dict[str, object] = {
+            "hooks": [{"type": "command", "command": command, "timeout": 10}]
+        }
+        if event == "PostToolUse":
+            entry = {"matcher": "*", **entry}
+        entries[event] = entry
+    return entries
+
+
 # remote_mux's OWN option set -- not attach_client.SSH_CONNECTION_OPTS, which is
 # scoped to the interactive attach pane and allows a 20s connect, i.e. longer
 # than a whole probe here. A connect bound strictly under PROBE_TIMEOUT_S lets a
