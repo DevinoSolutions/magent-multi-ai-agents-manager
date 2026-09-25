@@ -831,6 +831,65 @@ class TestPushExtras:
             "push: apps is a directory; list its files; skipped",
         )
 
+    def test_an_extra_that_will_not_resolve_is_a_warning_not_a_crash(
+        self, tmp_path, monkeypatch
+    ):
+        # A symlink loop raises on resolve (RuntimeError before 3.13, OSError
+        # after on some OSes); faked here so every OS and Python sees it.
+        (tmp_path / "ok.json").write_text("{}", encoding="utf-8")
+        real_resolve = Path.resolve
+
+        def resolve(self, strict=False):
+            if self.name == "loop.json":
+                raise OSError(62, "Too many levels of symbolic links", str(self))
+            return real_resolve(self, strict=strict)
+
+        monkeypatch.setattr(Path, "resolve", resolve)
+        extras = ["loop.json", "ok.json"]
+        assert nodes.push_warnings(tmp_path, extras, home=Path.home()) == (
+            "push: loop.json cannot be resolved; skipped",
+        )
+        assert nodes.push_set(tmp_path, [], home=Path.home(), extras=extras) == (
+            tmp_path / "ok.json",
+        )
+
+    def test_a_symlinked_extra_that_leaves_through_the_link_ships_inside(
+        self, repo, tmp_path
+    ):
+        # The project is a link to the repo and the extra is written through
+        # the repo's real name: lexically it is outside the project, resolved
+        # it is inside, so it ships at its place under the project's own path.
+        (repo / "sa.json").write_text("{}", encoding="utf-8")
+        link = tmp_path / "sendly-link"
+        try:
+            os.symlink(repo, link, target_is_directory=True)
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        shipped = nodes.push_set(
+            link, [_real_state(repo)], home=Path.home(), extras=["../sendly/sa.json"]
+        )
+        assert link / "sa.json" in shipped
+        assert repo / "sa.json" not in shipped
+
+    def test_a_linked_project_ships_one_file_once_under_its_own_name(
+        self, repo, tmp_path
+    ):
+        # git lists repo/.env; the extra names link/.env. One file, one push,
+        # under the path the project is configured at.
+        link = tmp_path / "sendly-link"
+        try:
+            os.symlink(repo, link, target_is_directory=True)
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        shipped = nodes.push_set(
+            link, [_real_state(repo)], home=Path.home(), extras=[".env"]
+        )
+        assert link / ".env" in shipped
+        assert repo / ".env" not in shipped
+        assert [p for p in shipped if p.resolve() == (repo / ".env").resolve()] == [
+            link / ".env"
+        ]
+
 
 class TestRecipeFor:
     def test_a_repo_project_is_one_repo_at_the_node_root(self, repo):
@@ -953,6 +1012,56 @@ class TestRecipeFor:
             project_dir=link,
         )
         assert [r.remote_dir for r in recipe.repos] == [recipe.remote_root]
+
+    def test_a_project_inside_a_larger_repo_is_refused_as_such(self, tmp_path):
+        # A monorepo subdirectory: push_set stays safe for it, but a node
+        # clones whole repos, so the refusal names what is actually wrong.
+        web = tmp_path / "mono" / "apps" / "web"
+        web.mkdir(parents=True)
+        with pytest.raises(
+            NodeConfigError, match="the project is inside a larger repo"
+        ) as err:
+            nodes.recipe_for(
+                ProjectConfig(path=str(web), node="second"),
+                NODE,
+                [_state(tmp_path / "mono", ())],
+                home=Path.home(),
+                project_dir=web,
+            )
+        assert str(tmp_path / "mono") in str(err.value)
+
+    def test_a_path_that_will_not_resolve_is_a_config_error(
+        self, tmp_path, monkeypatch
+    ):
+        def loop(self, strict=False):
+            raise OSError(62, "Too many levels of symbolic links", str(self))
+
+        with monkeypatch.context() as patched:
+            patched.setattr(Path, "resolve", loop)
+            with pytest.raises(NodeConfigError, match="cannot be resolved") as err:
+                nodes.recipe_for(
+                    ProjectConfig(path=str(tmp_path), node="second"),
+                    NODE,
+                    [_state(tmp_path, ())],
+                    home=Path.home(),
+                    project_dir=tmp_path,
+                )
+        assert "Too many levels of symbolic links" in str(err.value)
+
+    def test_a_nul_in_the_project_path_is_a_config_error_naming_it(self, tmp_path):
+        # Path.resolve may or may not reject the NUL (it varies by OS and
+        # Python); either way the answer is a NodeConfigError naming the path,
+        # never a bare "scandir: embedded null character".
+        bad = Path(str(tmp_path / "ws") + "\0x")
+        with pytest.raises(NodeConfigError) as err:
+            nodes.recipe_for(
+                ProjectConfig(path=str(bad), node="second"),
+                NODE,
+                [_state(bad / "api", ())],
+                home=Path.home(),
+                project_dir=bad,
+            )
+        assert str(bad) in str(err.value)
 
     def test_a_project_with_no_repo_is_refused(self, tmp_path):
         # Nothing to clone means nothing to run: an empty recipe is a caller

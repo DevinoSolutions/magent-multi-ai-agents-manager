@@ -593,9 +593,14 @@ class TestRunScript:
 
 @pytest.fixture
 def sentry_events(monkeypatch):
-    """magent's REAL ``init_sentry`` over the real sentry-sdk, with the one
-    difference that events land in this list instead of on the network. The
-    global client is torn down afterwards, so no other test inherits it."""
+    """magent's REAL ``init_sentry`` over the real sentry-sdk, with three
+    things changed, each isolating one thing: the in-memory ``_Capture``
+    transport keeps events off the network (they land in this list);
+    ``default_integrations=False`` keeps the SDK's process-global patches out
+    of the rest of the run; and ``atexit.register`` is stubbed so no flush hook
+    outlives the test. The global client is torn down afterwards, so no other
+    test inherits it. Nothing else is isolated: init_sentry's own integrations
+    load for real."""
     sentry_sdk = pytest.importorskip("sentry_sdk")
     transport_mod = pytest.importorskip("sentry_sdk.transport")
     events: list[dict[str, object]] = []
@@ -617,8 +622,9 @@ def sentry_events(monkeypatch):
         "init",
         lambda **kw: real_init(**kw, transport=_Capture(), default_integrations=False),
     )
-    # Neither init_sentry's flush nor the SDK's own atexit hook may outlive
-    # this test.
+    # The transport and integrations above do not cover exit: init_sentry
+    # registers a flush and the SDK its own atexit hook, and neither may
+    # outlive this test.
     monkeypatch.setattr(atexit, "register", lambda *_a, **_k: None)
     try:
         yield events
