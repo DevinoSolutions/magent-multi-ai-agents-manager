@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -340,7 +341,12 @@ def _read_marks(nick: str) -> dict[str, Mark]:
         if not isinstance(sid, str) or not isinstance(value, dict):
             continue
         since, real = value.get("since"), value.get("realpath")
-        if isinstance(since, bool) or not isinstance(since, (int, float)):
+        if (
+            isinstance(since, bool)
+            or not isinstance(since, (int, float))
+            # Python's json reads NaN and Infinity; neither is a watermark.
+            or not math.isfinite(since)
+        ):
             continue
         out[sid] = Mark(
             since=float(since), realpath=real if isinstance(real, str) else None
@@ -375,13 +381,26 @@ def _next_mark(
       put (a failed file is asked for again next tick);
     - its transcripts were never requested under the current real path (a
       first sight, a moved directory): from zero;
-    - otherwise: from the node's own clock at scan time, minus the overlap."""
+    - otherwise: from the node's own clock at scan time, minus the overlap
+      (``_since_after``)."""
     real = snap.realpaths.get(sid)
     if real is None or sid in snap.failed_sids:
         return old if old is not None else Mark(since=0.0, realpath=real)
     if spec.project_dir is None or old is None or old.realpath != real:
         return Mark(since=0.0, realpath=real)
-    return Mark(since=snap.now - remote_mux.WATERMARK_OVERLAP_S, realpath=real)
+    return Mark(since=_since_after(old.since, snap.now), realpath=real)
+
+
+def _since_after(old_since: float, node_now: float) -> float:
+    """The next watermark from the node's scan clock, minus the overlap. A
+    node clock that jumped forward and came back leaves ``old_since`` in its
+    future, and files stamped before it would never be asked for again: a
+    watermark that would move BACKWARDS starts the transcripts over from 0.0.
+
+    After the E8 x E14 merge, ``_next_mark`` delegates to
+    ``remote_mux.next_since`` and this reset belongs inside it."""
+    since = node_now - remote_mux.WATERMARK_OVERLAP_S
+    return 0.0 if since < old_since else since
 
 
 def _prune_state(nick: str, sid: str, keep: Collection[str]) -> None:
@@ -415,7 +434,7 @@ def _append_sample(nick: str, sample: LoadSample, *, at: float, history_h: int) 
                 and ts >= cutoff
             ):
                 rows.append(line)
-    rows.append(json.dumps({**asdict(sample), "ts": at}))
+    rows.append(json.dumps({**asdict(sample), "ts": at}, allow_nan=False))
     nodes.write_text_atomic(path, "\n".join(rows) + "\n")
 
 
@@ -564,11 +583,23 @@ class NodeSyncer:
             new_marks[sid] = _next_mark(spec, marks.get(sid), snap, sid)
             if sid in snap.state_files and sid not in snap.failed_sids:
                 _prune_state(nick, sid, snap.state_files[sid])
+        # No fsync, by choice: the node is the source of truth, and a mark
+        # lost with this PC's disk only means recall pulls from 0.0.
         _write_marks(nick, new_marks)
         sync = self._config.settings.node_sync
         last = self._last_sample.get(nick)
-        if snap.sample is not None and (
-            last is None or at - last >= sync.sample_interval_s
+        # ``at < last``: this PC's clock stepped back. Waiting for it to pass
+        # ``last`` again would starve the history for as long as the step.
+        if snap.sample is None or (
+            last is not None and last <= at < last + sync.sample_interval_s
         ):
+            return
+        # Throttled even when the row cannot be kept, so a broken load file
+        # is one warning per sample interval, not one per tick.
+        self._last_sample[nick] = at
+        try:
             _append_sample(nick, snap.sample, at=at, history_h=sync.history_h)
-            self._last_sample[nick] = at
+        except (OSError, ValueError) as e:
+            # The pull landed -- sessions.json and the marks are written -- so
+            # a load row that cannot be kept is not a failed tick.
+            get_logger(LOG_NAME).warning("node %s: load sample not kept (%s)", nick, e)

@@ -1268,3 +1268,76 @@ class TestMarkAndPruneScope:
         for nick in ("second", "third"):
             rows = nodes.load_path(nick).read_text(encoding="utf-8").splitlines()
             assert [json.loads(r)["ts"] for r in rows] == [1000.0]
+
+
+class TestHostileClocksAndValues:
+    def test_a_nan_or_infinite_mark_reads_as_absent(self, placed):
+        path = nodes.pull_marks_path("second")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '{"api": {"since": NaN, "realpath": "/r"},'
+            ' "db": {"since": Infinity, "realpath": "/r"},'
+            ' "ok": {"since": 5.0, "realpath": "/r"}}',
+            encoding="utf-8",
+        )
+        assert node_sync._read_marks("second") == {
+            "ok": node_sync.Mark(since=5.0, realpath="/r")
+        }
+
+    def test_a_node_clock_that_went_back_past_the_mark_starts_over(self, placed):
+        """A node clock that jumped forward left a mark in its future. When
+        the clock comes back, files stamped before that mark would never be
+        asked for again: the transcripts start over from zero instead."""
+        _seed_marks(api=(4999.0, "/r"))
+
+        def pull(_node, _sids):
+            return _snapshot(now=3000.0, realpaths={"api": "/r"})
+
+        node_sync.NodeSyncer(_second_only(), pull=pull).tick()
+        assert _marks() == {"api": {"since": 0.0, "realpath": "/r"}}
+
+    def test_a_pc_clock_that_steps_back_does_not_starve_samples(self, placed):
+        clock = iter([1000.0, 900.0])
+
+        def pull(_node, _sids):
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        syncer = node_sync.NodeSyncer(
+            _second_only(sample_interval_s=60), pull=pull, now=lambda: next(clock)
+        )
+        syncer.tick()
+        syncer.tick()
+        rows = nodes.load_path("second").read_text(encoding="utf-8").splitlines()
+        assert [json.loads(r)["ts"] for r in rows] == [1000.0, 900.0]
+
+    def test_a_sample_that_is_not_json_is_logged_and_the_pull_still_counts(
+        self, placed, caplog
+    ):
+        _capture_nodes_log(caplog)
+
+        def pull(_node, _sids):
+            return _snapshot(
+                realpaths={"api": "/r"},
+                sample=LoadSample(**{**SAMPLE, "load1": float("nan")}),
+            )
+
+        results = node_sync.NodeSyncer(_second_only(), pull=pull).tick()
+        assert results["second"] == (node_sync.OK, "")
+        assert not nodes.load_path("second").exists()
+        assert set(_marks()) == {"api"}
+        assert [m for m in _warnings(caplog) if "load sample" in m]
+
+    def test_a_load_file_that_cannot_be_written_does_not_fail_the_tick(
+        self, placed, caplog
+    ):
+        _capture_nodes_log(caplog)
+        nodes.load_path("second").mkdir(parents=True)
+
+        def pull(_node, _sids):
+            return _snapshot(realpaths={"api": "/r"}, sample=LoadSample(**SAMPLE))
+
+        results = node_sync.NodeSyncer(_second_only(), pull=pull).tick()
+        assert results["second"] == (node_sync.OK, "")
+        assert _marks() == {"api": {"since": 0.0, "realpath": "/r"}}
+        assert nodes.read_sessions("second") is not None
+        assert [m for m in _warnings(caplog) if "node second: load sample" in m]
