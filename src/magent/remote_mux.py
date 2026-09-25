@@ -14,13 +14,15 @@ local git reads a bring-up needs. Every function returns data or raises
 - ``BatchMode=yes`` everywhere: a password prompt nobody can answer is a hang.
 
 A leaf: never imports ``magent.cli`` (LS-A-001); its magent imports are the
-leaves ``attach_client``, ``log`` and ``node_scripts``.
+leaves ``attach_client``, ``log``, ``node_scripts`` and ``nodes``.
 """
 
 from __future__ import annotations
 
 import contextlib
 import functools
+import json
+import math
 import shlex
 import shutil
 import subprocess
@@ -29,6 +31,7 @@ from typing import TYPE_CHECKING
 from magent import node_scripts
 from magent.attach_client import SSH_MISSING_RC, TMUX_SOCKET
 from magent.log import get_logger
+from magent.nodes import LoadSample
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -281,3 +284,65 @@ def run_script(
         timeout_s=timeout_s,
         input_bytes=_frame_script(node_scripts.script(script), stdin),
     )
+
+
+def has_session(node: Node, sid: str) -> bool | None:
+    """Is ``sid`` alive on ``node``? True/False only when tmux itself answered:
+    exit 0 is a live session, exit 1 is tmux's own "no" (no such session, or
+    no server at all). Anything else -- ssh's 255, a missing tmux, a timeout --
+    is None: the PROBE failed, which says nothing about the session. The target
+    is ``=sid`` because tmux otherwise prefix-matches, and ``api`` would answer
+    for ``api-2``."""
+    try:
+        result = run(
+            node,
+            [MUX, "-L", SOCKET, "has-session", "-t", f"={sid}"],
+            timeout_s=PROBE_TIMEOUT_S,
+            check=False,
+        )
+    except RemoteError:
+        return None
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    return None
+
+
+def _finite(value: object) -> float:
+    """``value`` as a float, or ValueError when it is NaN or infinite."""
+    if not isinstance(value, (int, float, str)):
+        raise TypeError(f"not a number: {value!r}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"non-finite reading: {number}")
+    return number
+
+
+def sample(node: Node) -> LoadSample:
+    """One load reading from ``node`` (``sample.sh``). RemoteError when the node
+    can't be reached, or answers something that is not a sample. A non-finite
+    number is not a sample either: json accepts NaN, the snapshot writer does
+    not."""
+    result = run_script(node, "sample", [], timeout_s=PROBE_TIMEOUT_S)
+    try:
+        raw = json.loads(result.stdout.decode("utf-8", "replace"))
+        reading = LoadSample(
+            ts=_finite(raw["ts"]),
+            nproc=int(raw["nproc"]),
+            load1=_finite(raw["load1"]),
+            load5=_finite(raw["load5"]),
+            load15=_finite(raw["load15"]),
+            mem_total_mb=int(raw["mem_total_mb"]),
+            mem_avail_mb=int(raw["mem_avail_mb"]),
+            my_sessions=int(raw["my_sessions"]),
+        )
+    except (ValueError, KeyError, TypeError) as e:
+        # Named the way run() names it: the program, not this PC's path to
+        # it, and stdin by its length.
+        shown = _redacted(
+            ["ssh", *_ssh_tail(node, _script_argv([]), tty=False)],
+            _frame_script(node_scripts.script("sample"), None),
+        )
+        raise RemoteError(result.returncode, f"not a load sample: {e}", shown) from e
+    return reading
