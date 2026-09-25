@@ -280,6 +280,12 @@ main() {
         say fail setup "$u is a system account (uid $uid, UID_MIN $uid_min): name a person's own account"
         return 2
       fi
+      # The kernel's overflow id (nobody/nfsnobody), not a person. Accounts
+      # above UID_MAX are otherwise allowed: LDAP users can live there.
+      if ((10#$uid == 65534)); then
+        say fail setup "$u is the overflow account (uid 65534): name a person's own account"
+        return 2
+      fi
     fi
   done
   key=$(magent_payload)

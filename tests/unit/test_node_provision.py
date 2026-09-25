@@ -1792,6 +1792,19 @@ class TestSetupShUnderRealBash:
         assert "openssh-client" in row.detail
         assert set(_report(r).keys()) == set()
 
+    @pytest.mark.parametrize("user", ["nobody", "nfsnobody"])
+    def test_the_overflow_account_is_refused(self, tmp_path, user):
+        # uid 65534 is the kernel's overflow id, not a person -- whatever UID_MAX
+        # says about the accounts above it.
+        state, env = _setup_box(tmp_path)
+        _existing_user(state, user, uid=65534)
+        r = _run_setup(env, ("amin", user))
+        assert r.returncode == 2
+        assert _rows(r) == {"setup": "fail"}
+        assert b"65534" in r.stdout
+        assert sorted(p.name for p in (state / "users").iterdir()) == [user]
+        assert not (state / "apt.log").exists()
+
     def test_the_user_phase_runs_in_bash_whatever_the_login_shell(self, tmp_path):
         state, env = _setup_box(tmp_path)
         _run_setup(env)
