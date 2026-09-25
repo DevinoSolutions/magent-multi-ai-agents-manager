@@ -1160,7 +1160,13 @@ class TestTheMirror:
             json.loads(x)
             for x in nodes.load_path("second").read_text(encoding="utf-8").splitlines()
         ]
-        assert rows == [{**SAMPLE, "ts": 1070.0}, {**SAMPLE, "ts": 4650.0}]
+        # 1000 is past the 1 h window at 4650 but inside its slack (360 s):
+        # still an append. The trim itself: TestTheLoadFileIsAppendedTo.
+        assert rows == [
+            {**SAMPLE, "ts": 1000.0},
+            {**SAMPLE, "ts": 1070.0},
+            {**SAMPLE, "ts": 4650.0},
+        ]
 
 
 def _seed_marks(nick: str = "second", **marks: tuple[float, str]) -> bytes:
@@ -1341,3 +1347,86 @@ class TestHostileClocksAndValues:
         assert _marks() == {"api": {"since": 0.0, "realpath": "/r"}}
         assert nodes.read_sessions("second") is not None
         assert [m for m in _warnings(caplog) if "node second: load sample" in m]
+
+
+WINDOW_S = 3600.0  # history_h=1
+SLACK_S = 360.0  # max(10% of the window, the 60 s sample interval)
+
+
+def _load_ts(nick: str = "second") -> list[float]:
+    out: list[float] = []
+    for line in nodes.load_path(nick).read_text(encoding="utf-8").splitlines():
+        out.append(json.loads(line)["ts"])
+    return out
+
+
+@pytest.fixture
+def rewrites(monkeypatch) -> list[Path]:
+    """Every atomic rewrite of a load.jsonl (pull.json and sessions.json go
+    through the same writer and are not counted)."""
+    seen: list[Path] = []
+    real = nodes.write_text_atomic
+
+    def spy(path: Path, text: str) -> None:
+        if path.name == "load.jsonl":
+            seen.append(path)
+        real(path, text)
+
+    monkeypatch.setattr(nodes, "write_text_atomic", spy)
+    return seen
+
+
+def _sample_at(at: float) -> None:
+    node_sync._append_sample(
+        "second", LoadSample(**SAMPLE), at=at, history_h=1, interval_s=60
+    )
+
+
+class TestTheLoadFileIsAppendedTo:
+    def test_rows_are_appended_without_a_rewrite_inside_the_slack(
+        self, placed, rewrites
+    ):
+        for at in (1000.0, 1060.0, 1000.0 + WINDOW_S + SLACK_S):
+            _sample_at(at)
+        assert _load_ts() == [1000.0, 1060.0, 1000.0 + WINDOW_S + SLACK_S]
+        assert rewrites == []
+
+    def test_a_trim_happens_past_the_slack_and_keeps_only_the_window(
+        self, placed, rewrites
+    ):
+        for at in (1000.0, 1060.0, 4650.0):
+            _sample_at(at)
+        at = 1000.0 + WINDOW_S + SLACK_S + 1
+        _sample_at(at)
+        assert len(rewrites) == 1
+        assert _load_ts() == [4650.0, at]
+        assert min(_load_ts()) >= at - WINDOW_S
+
+    def test_a_long_run_stays_bounded_and_rarely_rewrites(self, placed, rewrites):
+        samples = 600  # ten hours at one sample a minute
+        for i in range(samples):
+            at = 1000.0 + 60 * i
+            _sample_at(at)
+            rows = _load_ts()
+            assert rows[-1] == at
+            assert at - rows[0] <= WINDOW_S + SLACK_S
+        assert 0 < len(rewrites) <= samples // 5
+
+    def test_an_unreadable_first_line_is_trimmed_away(self, placed, rewrites):
+        path = nodes.load_path("second")
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"\xff not json\n")
+        _sample_at(1000.0)
+        assert len(rewrites) == 1
+        assert _load_ts() == [1000.0]
+
+    def test_a_torn_last_row_does_not_swallow_the_next_one(self, placed):
+        path = nodes.load_path("second")
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps({**SAMPLE, "ts": 900.0}) + '\n{"ts": 95', encoding="utf-8"
+        )
+        _sample_at(1000.0)
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert lines[1] == '{"ts": 95'
+        assert json.loads(lines[2])["ts"] == 1000.0

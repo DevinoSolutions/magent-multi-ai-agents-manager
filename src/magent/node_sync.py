@@ -416,26 +416,65 @@ def _prune_state(nick: str, sid: str, keep: Collection[str]) -> None:
                 path.unlink()
 
 
-def _append_sample(nick: str, sample: LoadSample, *, at: float, history_h: int) -> None:
-    """Append one row (ts on this PC's clock, like every reader's "now") and
-    drop rows older than the history window, in one atomic rewrite."""
+def _row_ts(line: str) -> float | None:
+    """A load.jsonl row's ts, or None for a line that is not a row."""
+    try:
+        row = json.loads(line)
+    except (ValueError, RecursionError):
+        return None
+    ts = row.get("ts") if isinstance(row, dict) else None
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    return float(ts) if math.isfinite(ts) else None
+
+
+def _needs_trim(path: Path, before: float) -> bool:
+    """Is the file's first row older than ``before``? An unreadable first
+    line counts as old: only a trim clears it, and it would otherwise hold
+    the file untrimmed forever. A missing or empty file needs none."""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            first = fh.readline()
+    except FileNotFoundError:
+        return False
+    if not first.strip():
+        return False
+    ts = _row_ts(first)
+    return ts is None or ts < before
+
+
+def _append_sample(
+    nick: str, sample: LoadSample, *, at: float, history_h: int, interval_s: int
+) -> None:
+    """Add one row (ts on this PC's clock, like every reader's "now").
+
+    A sample is an APPEND. The file is rewritten -- one atomic trim down to
+    the history window -- only once its first row is older than the window
+    by a slack (the larger of 10% of the window and one sample interval), so
+    a trim happens every few samples, not on every one, and the file never
+    holds more than the window plus that slack. Readers skip lines that are
+    not rows, and an append after a torn last row starts a line of its own."""
     path = nodes.load_path(nick)
-    cutoff = at - history_h * 3600
-    rows: list[str] = []
-    with contextlib.suppress(OSError, ValueError):
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                ts = json.loads(line).get("ts")
-            except (ValueError, AttributeError):
-                continue
-            if (
-                isinstance(ts, (int, float))
-                and not isinstance(ts, bool)
-                and ts >= cutoff
-            ):
-                rows.append(line)
-    rows.append(json.dumps({**asdict(sample), "ts": at}, allow_nan=False))
-    nodes.write_text_atomic(path, "\n".join(rows) + "\n")
+    row = json.dumps({**asdict(sample), "ts": at}, allow_nan=False)
+    window = history_h * 3600
+    cutoff = at - window
+    slack = max(window * 0.1, interval_s)
+    if _needs_trim(path, cutoff - slack):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        rows = [
+            line
+            for line in text.splitlines()
+            if (ts := _row_ts(line)) is not None and ts >= cutoff
+        ]
+        nodes.write_text_atomic(path, "\n".join([*rows, row]) + "\n")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as fh:
+        torn = False
+        if fh.seek(0, os.SEEK_END) > 0:
+            fh.seek(-1, os.SEEK_END)
+            torn = fh.read(1) != b"\n"
+        fh.write((b"\n" if torn else b"") + row.encode("utf-8") + b"\n")
 
 
 def _last_line(text: str) -> str:
@@ -598,7 +637,13 @@ class NodeSyncer:
         # is one warning per sample interval, not one per tick.
         self._last_sample[nick] = at
         try:
-            _append_sample(nick, snap.sample, at=at, history_h=sync.history_h)
+            _append_sample(
+                nick,
+                snap.sample,
+                at=at,
+                history_h=sync.history_h,
+                interval_s=sync.sample_interval_s,
+            )
         except (OSError, ValueError) as e:
             # The pull landed -- sessions.json and the marks are written -- so
             # a load row that cannot be kept is not a failed tick.
