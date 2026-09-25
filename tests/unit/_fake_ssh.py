@@ -42,6 +42,9 @@ stem = str(time.time_ns()) + "-" + str(os.getpid())
 (calldir / (stem + ".stdin")).write_bytes(data)
 (calldir / (stem + ".json")).write_text(
     json.dumps({
+        # The launcher's own path, as the parent spawned it: argv[0] proper,
+        # which sys.argv cannot show (it holds this recorder's path).
+        "program": os.environ.get("FAKE_SSH_SELF", ""),
         "argv": args,
         "stdin_sha256": hashlib.sha256(data).hexdigest(),
         "stdin_len": len(data),
@@ -72,9 +75,11 @@ sys.exit(0)
 
 @dataclass(frozen=True)
 class FakeCall:
-    """One recorded invocation: its argv (without the program name) and the
+    """One recorded invocation: the launcher path it was spawned as
+    (``program``, i.e. argv[0]), its argv without the program name, and the
     exact bytes it read from stdin."""
 
+    program: str
     argv: list[str]
     stdin: bytes
 
@@ -111,13 +116,17 @@ class FakeSsh:
         records = sorted(
             calldir.glob("*.json"), key=lambda p: int(p.name.split("-")[0])
         )
-        return [
-            FakeCall(
-                argv=json.loads(p.read_text(encoding="utf-8"))["argv"],
-                stdin=p.with_suffix(".stdin").read_bytes(),
+        out = []
+        for p in records:
+            record = json.loads(p.read_text(encoding="utf-8"))
+            out.append(
+                FakeCall(
+                    program=record["program"],
+                    argv=record["argv"],
+                    stdin=p.with_suffix(".stdin").read_bytes(),
+                )
             )
-            for p in records
-        ]
+        return out
 
 
 def make_fake_ssh(tmp_path: Path, *, name: str = "ssh") -> FakeSsh:
@@ -125,15 +134,21 @@ def make_fake_ssh(tmp_path: Path, *, name: str = "ssh") -> FakeSsh:
     base.mkdir(parents=True, exist_ok=True)
     recorder = base / "recorder.py"
     recorder.write_text(_RECORDER.replace("<<BASE>>", str(base)), encoding="utf-8")
+    # Each launcher hands the recorder its OWN path (%~f0 / $0) so a call
+    # records the argv[0] it was actually spawned as.
     if sys.platform == "win32":
         launcher = base / f"{name}.cmd"
         launcher.write_text(
-            f'@echo off\r\n"{sys.executable}" "{recorder}" %*\r\n', encoding="utf-8"
+            '@echo off\r\nset "FAKE_SSH_SELF=%~f0"\r\n'
+            f'"{sys.executable}" "{recorder}" %*\r\n',
+            encoding="utf-8",
         )
     else:
         launcher = base / name
         launcher.write_text(
-            f'#!/bin/sh\nexec "{sys.executable}" "{recorder}" "$@"\n', encoding="utf-8"
+            '#!/bin/sh\nFAKE_SSH_SELF="$0"\nexport FAKE_SSH_SELF\n'
+            f'exec "{sys.executable}" "{recorder}" "$@"\n',
+            encoding="utf-8",
         )
         launcher.chmod(0o755)
     return FakeSsh(path=str(launcher), base=base)

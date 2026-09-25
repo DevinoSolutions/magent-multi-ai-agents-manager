@@ -31,24 +31,38 @@ class TestTheSocketHasOneOwner:
         assert remote_mux.SOCKET == "magent"
 
 
+LS = ["tmux", "-L", remote_mux.SOCKET, "ls"]
+
+
 class TestSshArgv:
-    def test_a_batch_command_carries_the_shared_options_then_batch_mode(self):
-        assert remote_mux.ssh_argv(NODE, "tmux -L magent ls") == [
-            "ssh",
+    def test_a_batch_command_carries_the_shared_options_then_batch_mode(self, fake_ssh):
+        assert remote_mux.ssh_argv(NODE, LS) == [
+            fake_ssh.path,
             *SSH_CONNECTION_OPTS,
             "-o",
             "BatchMode=yes",
-            "amin@devino-second",
-            "tmux -L magent ls",
+            NODE.target,
+            "bash -c " + shlex.quote(shlex.join(LS)),
         ]
 
-    def test_a_tty_is_requested_only_when_asked(self):
-        assert "-t" not in remote_mux.ssh_argv(NODE, "x")
-        argv = remote_mux.ssh_argv(NODE, "x", tty=True)
+    def test_argv0_is_the_client_find_ssh_resolved_never_a_bare_ssh(self, fake_ssh):
+        # A bare "ssh" spawned by any caller would resolve the REAL client off
+        # PATH, past the conftest guard that only patches find_ssh.
+        assert remote_mux.ssh_argv(NODE, LS)[0] == fake_ssh.path
+
+    def test_no_client_is_rc_127(self):
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.ssh_argv(NODE, LS)
+        assert exc.value.rc == 127
+        assert exc.value.command_redacted[0] == "ssh"
+
+    def test_a_tty_is_requested_only_when_asked(self, fake_ssh):
+        assert "-t" not in remote_mux.ssh_argv(NODE, ["x"])
+        argv = remote_mux.ssh_argv(NODE, ["x"], tty=True)
         assert argv[argv.index("amin@devino-second") - 1] == "-t"
 
-    def test_batch_mode_can_be_left_off(self):
-        assert "BatchMode=yes" not in remote_mux.ssh_argv(NODE, "x", batch=False)
+    def test_batch_mode_can_be_left_off(self, fake_ssh):
+        assert "BatchMode=yes" not in remote_mux.ssh_argv(NODE, ["x"], batch=False)
 
 
 class TestRemoteError:
@@ -111,27 +125,45 @@ class TestRun:
     def test_the_remote_command_is_one_bash_c_argument(self, fake_ssh):
         # DECISION-9: ONE remote string, and bash -- not the node user's login
         # shell -- parses the argv inside it.
+        sock = remote_mux.SOCKET
         remote_mux.run(
             NODE,
-            ["tmux", "-L", "magent", "new-session", "-c", "/home/amin/my repo"],
+            ["tmux", "-L", sock, "new-session", "-c", "/home/amin/my repo"],
             timeout_s=30,
         )
         (call,) = fake_ssh.calls()
         assert call.argv[-1].startswith("bash -c ")
         assert call.argv[-1] == "bash -c " + shlex.quote(
-            "tmux -L magent new-session -c '/home/amin/my repo'"
+            f"tmux -L {sock} new-session -c '/home/amin/my repo'"
         )
         assert call.argv[-2] == "amin@devino-second"
         assert "BatchMode=yes" in call.argv
 
+    def test_the_spawned_program_is_the_client_find_ssh_resolved(self, fake_ssh):
+        # The fake records the path it was SPAWNED as -- proof the process
+        # that ran is the one the guard seam chose, not a PATH lookup.
+        remote_mux.run(NODE, ["true"], timeout_s=30)
+        (call,) = fake_ssh.calls()
+        assert Path(call.program).samefile(fake_ssh.path)
+
+    def test_a_client_that_vanished_before_the_spawn_is_rc_127(
+        self, tmp_path, monkeypatch
+    ):
+        gone = str(tmp_path / "no-such-ssh.exe")
+        monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: gone)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["true"], timeout_s=5)
+        assert exc.value.rc == 127
+
     def test_an_exact_tmux_target_reaches_bash_quoted(self, fake_ssh):
         # zsh would expand a bare `=api` as a command lookup; inside the
         # single-quoted bash -c payload the login shell never sees it bare.
+        sock = remote_mux.SOCKET
         remote_mux.run(
-            NODE, ["tmux", "-L", "magent", "kill-session", "-t", "=api"], timeout_s=30
+            NODE, ["tmux", "-L", sock, "kill-session", "-t", "=api"], timeout_s=30
         )
         (call,) = fake_ssh.calls()
-        assert call.argv[-1] == "bash -c 'tmux -L magent kill-session -t =api'"
+        assert call.argv[-1] == f"bash -c 'tmux -L {sock} kill-session -t =api'"
 
     def test_it_returns_the_completed_process(self, fake_ssh):
         fake_ssh.set_reply("uptime", stdout="up 3 days\n")

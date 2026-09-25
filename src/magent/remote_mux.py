@@ -27,6 +27,8 @@ from magent.attach_client import SSH_CONNECTION_OPTS, SSH_MISSING_RC, TMUX_SOCKE
 from magent.log import get_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from magent.nodes import Node
 
 # tmux, not psmux: nodes are Linux. One server per node user (`-L magent`,
@@ -76,25 +78,47 @@ def find_ssh() -> str | None:
     return shutil.which("ssh")
 
 
-def ssh_argv(
-    node: Node, remote_cmd: str, *, tty: bool = False, batch: bool = True
-) -> list[str]:
-    """``ssh`` argv for one command on ``node``. The option list is
-    ``attach_client``'s -- the one owner of how magent dials a host."""
-    argv = ["ssh", *SSH_CONNECTION_OPTS]
-    if batch:
-        argv += ["-o", "BatchMode=yes"]
-    if tty:
-        argv.append("-t")
-    return [*argv, node.target, remote_cmd]
-
-
-def _remote_string(argv: list[str]) -> str:
+def _remote_string(argv: Sequence[str]) -> str:
     """The ONE remote command string (DECISION-9): sshd hands it to the node
     user's LOGIN shell, which may be zsh/fish -- so the argv is shlex-joined
     and handed to bash as a single quoted ``-c`` payload, and only bash ever
     parses it."""
     return "bash -c " + shlex.quote(shlex.join(argv))
+
+
+def _ssh_tail(
+    node: Node, remote_argv: Sequence[str], *, tty: bool, batch: bool
+) -> list[str]:
+    """Everything after argv[0]: options, target, the one remote string."""
+    tail = list(SSH_CONNECTION_OPTS)
+    if batch:
+        tail += ["-o", "BatchMode=yes"]
+    if tty:
+        tail.append("-t")
+    return [*tail, node.target, _remote_string(remote_argv)]
+
+
+def _client(shown: tuple[str, ...]) -> str:
+    """The client ``find_ssh`` resolves NOW -- looked up as this module's
+    attribute at call time, so the conftest guard and ``fake_ssh`` both hold --
+    or RemoteError rc 127. The only way an ssh argv gets its argv[0]."""
+    exe = find_ssh()
+    if exe is None:
+        raise RemoteError(SSH_MISSING_RC, "ssh client not found on PATH", shown)
+    return exe
+
+
+def ssh_argv(
+    node: Node, remote_argv: Sequence[str], *, tty: bool = False, batch: bool = True
+) -> list[str]:
+    """``ssh`` argv running ``remote_argv`` on ``node`` as ONE ``bash -c``
+    remote string. argv[0] is the client ``find_ssh`` resolved, never a bare
+    ``"ssh"`` -- an argv built here and spawned elsewhere must not reach a
+    client the guard never saw. Raises RemoteError rc 127 when there is none.
+    The option list is ``attach_client``'s -- the one owner of how magent
+    dials a host."""
+    tail = _ssh_tail(node, remote_argv, tty=tty, batch=batch)
+    return [_client(("ssh", *tail)), *tail]
 
 
 def _tail(stderr: bytes) -> str:
@@ -126,6 +150,10 @@ def _spawn(
             stderr=subprocess.PIPE,
             creationflags=_SPAWN_FLAGS,
         )
+    except FileNotFoundError as e:
+        # The client vanished between find_ssh and the spawn (or its cached
+        # path went stale): the same "not installed" as no client at all.
+        raise RemoteError(SSH_MISSING_RC, str(e), shown) from e
     except OSError as e:
         raise RemoteError(None, str(e), shown) from e
     try:
@@ -152,7 +180,7 @@ def _spawn(
 
 def run(
     node: Node,
-    argv_remote: list[str],
+    argv_remote: Sequence[str],
     *,
     timeout_s: float,
     input_bytes: bytes | None = None,
@@ -163,13 +191,11 @@ def run(
     missing client (rc 127), a timeout (rc None), or -- with ``check`` -- a
     non-zero exit. With ``check=False`` every exit code comes back for the
     caller to classify."""
-    argv = ssh_argv(node, _remote_string(argv_remote))
-    shown = _redacted(argv, input_bytes)
-    exe = find_ssh()
-    if exe is None:
-        raise RemoteError(SSH_MISSING_RC, "ssh client not found on PATH", shown)
+    tail = _ssh_tail(node, argv_remote, tty=False, batch=True)
+    # Errors and log lines name the program, not this PC's path to it.
+    shown = _redacted(["ssh", *tail], input_bytes)
     return _spawn(
-        [exe, *argv[1:]],
+        [_client(shown), *tail],
         timeout_s=timeout_s,
         input_bytes=input_bytes,
         check=check,
