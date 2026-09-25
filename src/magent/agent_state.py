@@ -181,17 +181,15 @@ def _warn_bad_record(path: Path, why: str) -> None:
     )
 
 
-def all_states() -> list[dict[str, object]]:
-    """Every readable state record in the store. Corrupt or non-object files
-    are skipped — a half-written or vandalized record must never take the
-    attention loop down with it — but each offending file is named in one
-    WARNING per process (P6-09) so a regressed external writer is visible.
-    Reading also opportunistically ages out long-dead records (P6-04, see
-    ``maybe_sweep_stale``)."""
-    maybe_sweep_stale()
+def read_store(root: Path) -> list[dict[str, object]]:
+    """Every readable record in the store at ``root`` -- this PC's, or a node
+    session's mirror under ``~/.magent/nodes``. Corrupt and non-object files
+    are skipped and named once (``_warn_bad_record``). Never sweeps: a mirror
+    is the node's to age, and a record deleted here would come back on the
+    next pull. A missing directory is an empty store."""
     records: list[dict[str, object]] = []
     try:
-        paths = sorted(STATE_DIR.glob("*.json"))
+        paths = sorted(root.glob("*.json"))
     except OSError:
         return records
     for p in paths:
@@ -205,3 +203,14 @@ def all_states() -> list[dict[str, object]]:
         else:
             _warn_bad_record(p, "not a JSON object")
     return records
+
+
+def all_states() -> list[dict[str, object]]:
+    """Every readable state record in the store. Corrupt or non-object files
+    are skipped — a half-written or vandalized record must never take the
+    attention loop down with it — but each offending file is named in one
+    WARNING per process (P6-09) so a regressed external writer is visible.
+    Reading also opportunistically ages out long-dead records (P6-04, see
+    ``maybe_sweep_stale``)."""
+    maybe_sweep_stale()
+    return read_store(STATE_DIR)

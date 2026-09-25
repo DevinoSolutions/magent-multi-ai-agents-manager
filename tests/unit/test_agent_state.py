@@ -180,3 +180,39 @@ class TestAllStates:
         p.write_text(json.dumps(d), encoding="utf-8")
         assert agent_state.state_for("/a", max_age=60) is None
         assert agent_state.state_for("/a", max_age=7200) is not None
+
+
+class TestReadStore:
+    def test_any_directory_reads_as_a_store(self, tmp_path):
+        rec = {
+            "state": "done",
+            "ts": 1.0,
+            "cwd": "/home/amin/magent/api",
+            "session_id": "s",
+        }
+        (tmp_path / "a.json").write_text(json.dumps(rec), encoding="utf-8")
+        assert agent_state.read_store(tmp_path) == [rec]
+
+    def test_a_missing_directory_is_an_empty_store(self, tmp_path):
+        assert agent_state.read_store(tmp_path / "nope") == []
+
+    def test_unusable_files_are_skipped(self, tmp_path):
+        (tmp_path / "a.json").write_text("{torn", encoding="utf-8")
+        (tmp_path / "b.json").write_text("[1, 2]", encoding="utf-8")
+        (tmp_path / "c.tmp").write_text("{}", encoding="utf-8")
+        assert agent_state.read_store(tmp_path) == []
+
+    def test_reading_a_store_never_sweeps_but_all_states_still_does(
+        self, tmp_path, monkeypatch
+    ):
+        """A node mirror is the node's to age: a record swept here would come
+        straight back on the next pull. This PC's own store keeps its sweep."""
+        monkeypatch.setattr(agent_state, "STATE_DIR", tmp_path)
+        monkeypatch.setattr(agent_state, "_swept_this_process", False)
+        ancient = {"state": "done", "ts": 1.0, "cwd": "/w/old", "session_id": None}
+        path = agent_state._path_for("/w/old")
+        path.write_text(json.dumps(ancient), encoding="utf-8")
+        assert agent_state.read_store(tmp_path) == [ancient]
+        assert path.exists()
+        assert agent_state.all_states() == []
+        assert not path.exists()
