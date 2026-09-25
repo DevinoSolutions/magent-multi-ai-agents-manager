@@ -169,6 +169,40 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
             "the sweep deletes it."
         ),
     ),
+    (
+        "nodes",
+        "object",
+        "`{}`",
+        (
+            'Pool machines a project can run on, keyed by nick: `{"second": {"host": '
+            '"devino-second", "user": "amin", "root": "~/magent"}}`. A nick is 1-6 '
+            "characters of `a-z`, `0-9` and `-` (it is drawn in the status bar); "
+            "`auto` and `cloud` are reserved. `user` defaults to your local username at use time; "
+            "`root` is where project clones live on the node."
+        ),
+    ),
+    (
+        "nodeSync.pullIntervalS",
+        "int",
+        "`30`",
+        (
+            "Seconds between the sync daemon's pulls of node transcripts and agent "
+            "state. Every pull is one ssh connection per node, so a shorter interval "
+            "costs connections, not just freshness."
+        ),
+    ),
+    (
+        "nodeSync.sampleIntervalS",
+        "int",
+        "`60`",
+        'Seconds between node load samples; `"node": "auto"` placement reads this history.',
+    ),
+    (
+        "nodeSync.historyH",
+        "int",
+        "`24`",
+        "Hours of load history kept per node for placement.",
+    ),
 ]
 
 

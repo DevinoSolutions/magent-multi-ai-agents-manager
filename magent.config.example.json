@@ -29,6 +29,12 @@
       "debounceS": 300.0,
       "stateTtlDays": 14
     },
+    "nodes": {},
+    "nodeSync": {
+      "pullIntervalS": 30,
+      "sampleIntervalS": 60,
+      "historyH": 24
+    },
     "tools": {
       "claude": "claude --continue",
       "codex": "codex",

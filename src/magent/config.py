@@ -79,6 +79,31 @@ class AttentionSettings:
     state_ttl_days: int = 14
 
 
+@dataclass(frozen=True)
+class NodeConfig:
+    """One pool machine under ``settings.nodes``, keyed by its nick.
+
+    ``nick`` is the dict key: 1-6 characters of ``[a-z0-9-]``, because it is
+    drawn into the cell-counted status bar as ``@<nick>`` (spec §9). ``user``
+    None means "my local username", resolved at use time by ``nodes.resolve``
+    and never persisted.
+    """
+
+    nick: str
+    host: str
+    user: str | None = None
+    root: str = "~/magent"
+
+
+@dataclass(frozen=True)
+class NodeSyncConfig:
+    """Timing for the node sync daemon (``magent node sync -d``)."""
+
+    pull_interval_s: int = 30
+    sample_interval_s: int = 60
+    history_h: int = 24
+
+
 @dataclass
 class Settings:
     default_tool: str = "claude"
@@ -91,6 +116,8 @@ class Settings:
     window_title_prefix: bool = True
     ssh: SSHConfig = field(default_factory=SSHConfig)
     attention: AttentionSettings = field(default_factory=AttentionSettings)
+    nodes: dict[str, NodeConfig] = field(default_factory=dict)
+    node_sync: NodeSyncConfig = field(default_factory=NodeSyncConfig)
     tools: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_TOOLS))
 
 
@@ -238,6 +265,34 @@ def _parse_attention(raw: dict[str, object]) -> AttentionSettings:
     )
 
 
+def _parse_nodes(raw: dict[str, object]) -> dict[str, NodeConfig]:
+    """``settings.nodes`` -> {nick: NodeConfig}. The lenient typed view: an
+    entry that is not an object, or has no string ``host``, is skipped here --
+    load_config's validation is what refuses a malformed pool loudly."""
+    nodes: dict[str, NodeConfig] = {}
+    for nick, value in _obj(raw, "nodes").items():
+        if not isinstance(value, dict):
+            continue
+        host = _str_or_none(value, "host")
+        if host is None:
+            continue
+        nodes[nick] = NodeConfig(
+            nick=nick,
+            host=host,
+            user=_str_or_none(value, "user"),
+            root=_str(value, "root", "~/magent"),
+        )
+    return nodes
+
+
+def _parse_node_sync(raw: dict[str, object]) -> NodeSyncConfig:
+    return NodeSyncConfig(
+        pull_interval_s=_int(raw, "pullIntervalS", 30),
+        sample_interval_s=_int(raw, "sampleIntervalS", 60),
+        history_h=_int(raw, "historyH", 24),
+    )
+
+
 def _parse_settings(raw: dict[str, object] | None) -> Settings:
     if not raw:
         return Settings()
@@ -252,12 +307,24 @@ def _parse_settings(raw: dict[str, object] | None) -> Settings:
         window_title_prefix=_bool(raw, "windowTitlePrefix", True),
         ssh=_parse_ssh(_obj(raw, "ssh")),
         attention=_parse_attention(_obj(raw, "attention")),
+        nodes=_parse_nodes(raw),
+        node_sync=_parse_node_sync(_obj(raw, "nodeSync")),
         tools=_tools(raw, DEFAULT_TOOLS),
     )
 
 
 def layout_to_dict(layout: LayoutConfig) -> dict[str, int]:
     return {"columns": layout.columns, "rows": layout.rows}
+
+
+def _node_to_dict(node: NodeConfig) -> dict[str, str]:
+    # `user` is written only when the user wrote it: the fallback (the local
+    # username) is resolved at use time and must never be baked into a file.
+    out = {"host": node.host}
+    if node.user is not None:
+        out["user"] = node.user
+    out["root"] = node.root
+    return out
 
 
 def settings_to_dict(settings: Settings) -> dict[str, object]:
@@ -285,6 +352,12 @@ def settings_to_dict(settings: Settings) -> dict[str, object]:
             "stalenessNeedsInputS": settings.attention.staleness_needs_input_s,
             "debounceS": settings.attention.debounce_s,
             "stateTtlDays": settings.attention.state_ttl_days,
+        },
+        "nodes": {nick: _node_to_dict(node) for nick, node in settings.nodes.items()},
+        "nodeSync": {
+            "pullIntervalS": settings.node_sync.pull_interval_s,
+            "sampleIntervalS": settings.node_sync.sample_interval_s,
+            "historyH": settings.node_sync.history_h,
         },
         "tools": dict(settings.tools),
     }
@@ -403,6 +476,8 @@ _ALLOWED_SETTINGS_KEYS = {
     "windowTitlePrefix",
     "ssh",
     "attention",
+    "nodes",
+    "nodeSync",
     "tools",
 }
 _ALLOWED_SSH_KEYS = {"shell"}
