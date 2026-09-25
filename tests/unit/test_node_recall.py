@@ -717,13 +717,49 @@ class TestTheInstallNeverOverwritesTheNodesWork:
         )
         assert self._leftovers(home) == []
 
-    def test_a_symlinked_target_file_is_kept_and_what_it_names_is_untouched(
+    def test_a_node_file_three_levels_above_a_payload_file_is_kept_not_an_error(
         self, monkeypatch, home, tmp_path
     ):
+        # cq-G9 U3: every ancestor is checked, not just the parent. With the
+        # node FILE sub and the payload's sub/agents/deeper/a.jsonl, the dir
+        # sub/agents/deeper has a missing parent and a file grandparent.
+        source = _pulled(tmp_path)
+        deeper = source / "sub" / "agents" / "deeper"
+        deeper.mkdir(parents=True)
+        (deeper / "a.jsonl").write_text("{}\n", encoding="utf-8")
+        dest = self._dest(home)
+        dest.mkdir(parents=True)
+        (dest / "sub").write_bytes(b"the node's own file\n")
+
+        done = _node_run(
+            self._call(monkeypatch, tmp_path, remote_mux._tar_dir(source)), home
+        )
+
+        assert done.returncode == 0, done.stderr
+        assert (dest / "sub").read_bytes() == b"the node's own file\n"
+        lines = done.stdout.decode().splitlines()
+        assert sorted(line for line in lines if line.startswith("KEPT\t")) == [
+            "KEPT\tsub",
+            "KEPT\tsub/agents/deeper/a.jsonl",
+        ]
+        assert lines[-1] == str(Path(os.path.realpath(dest)))
+        assert (dest / f"{SESSION_ID}.jsonl").read_text(encoding="utf-8") == (
+            _PULLED_JSONL
+        )
+        assert self._leftovers(home) == []
+
+    @pytest.mark.parametrize("names", ["an-empty-file", "nothing"])
+    def test_a_symlinked_target_file_is_kept_and_what_it_names_is_untouched(
+        self, monkeypatch, home, tmp_path, names
+    ):
         # cq-G9 S7: mv onto a symlink would replace the link, and a write
-        # through it would reach whatever it names. Neither happens.
+        # through it would reach whatever it names. Neither happens. The link
+        # names an EMPTY file (a byte prefix of anything, so the content rules
+        # alone would replace it) or nothing at all (so "not on the node yet"
+        # alone would move in): only the symlink test can say KEPT here.
         elsewhere = tmp_path / "elsewhere.jsonl"
-        elsewhere.write_bytes(b"not the conversation\n")
+        if names == "an-empty-file":
+            elsewhere.write_bytes(b"")
         dest = self._dest(home)
         dest.mkdir(parents=True)
         (dest / f"{SESSION_ID}.jsonl").symlink_to(elsewhere)
@@ -731,8 +767,11 @@ class TestTheInstallNeverOverwritesTheNodesWork:
         done = _node_run(self._call(monkeypatch, tmp_path), home)
 
         assert done.returncode == 0, done.stderr
-        assert elsewhere.read_bytes() == b"not the conversation\n"
         assert (dest / f"{SESSION_ID}.jsonl").is_symlink()
+        if names == "an-empty-file":
+            assert elsewhere.read_bytes() == b""
+        else:
+            assert not elsewhere.exists()
         assert os.readlink(dest / f"{SESSION_ID}.jsonl") == str(elsewhere)
         assert f"KEPT\t{SESSION_ID}.jsonl\n".encode() in done.stdout
 
