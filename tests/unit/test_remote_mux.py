@@ -1353,8 +1353,8 @@ class TestTheBringUpStaysInsideItsFolders:
         outside.write_text("not yours\n", encoding="utf-8")
         with pytest.raises(ValueError, match="outside"):
             remote_mux.bring_up(NODE, _recipe(tmp_path, push_files=(outside,)))
-        # The home probe only; the script never ran.
-        assert len(node_home.calls()) == 1
+        # Every file is vetted and read before any ssh.
+        assert node_home.calls() == []
 
     def test_a_symlink_that_leaves_the_project_is_refused(self, node_home, tmp_path):
         # A string check on the config entry cannot see this: the link sits
@@ -1370,7 +1370,7 @@ class TestTheBringUpStaysInsideItsFolders:
             pytest.skip("this account cannot create symlinks")
         with pytest.raises(ValueError, match="outside"):
             remote_mux.bring_up(NODE, dataclasses.replace(recipe, push_files=(link,)))
-        assert len(node_home.calls()) == 1
+        assert node_home.calls() == []
 
     @pytest.mark.parametrize(
         ("rel", "name"),
@@ -1412,6 +1412,161 @@ class TestTheBringUpStaysInsideItsFolders:
         with pytest.raises(NodeConfigError, match="absolute"):
             remote_mux.push_files(NODE, _recipe(tmp_path, remote_root="-rf"))
         assert len(node_home.calls()) == 1
+
+
+def _in_thread(fn, *, timeout_s: float = 20.0) -> BaseException | None:
+    """Run ``fn`` on a daemon thread and return what it raised (None for a
+    clean return). A call still running after ``timeout_s`` FAILS the test
+    rather than hanging it: the FIFO pins prove "refused", not "blocked"."""
+    import threading
+
+    outcome: list[BaseException | None] = []
+
+    def body() -> None:
+        try:
+            fn()
+        except BaseException as e:  # noqa: BLE001 # reason: handed back to the test verbatim
+            outcome.append(e)
+        else:
+            outcome.append(None)
+
+    worker = threading.Thread(target=body, daemon=True)
+    worker.start()
+    worker.join(timeout_s)
+    assert not worker.is_alive(), f"still running after {timeout_s}s -- it blocked"
+    return outcome[0]
+
+
+needs_fifo = pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs")
+
+
+class TestAPushFileIsReadAsVetted:
+    """What ships is the regular file that was vetted, read through the path
+    it resolved to, bounded in size -- and every refusal lands before any
+    ssh."""
+
+    def test_the_resolved_path_is_the_one_opened(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        recipe = _recipe(tmp_path)
+        assert recipe.local_root is not None
+        real = recipe.local_root / "real.env"
+        real.write_bytes(b"REAL=1\n")
+        link = recipe.local_root / "linked.env"
+        _link_or_skip(link, real)
+        opened: list[str] = []
+        real_open = os.open
+
+        def spy(path, flags, *args):
+            opened.append(os.fspath(path))
+            return real_open(path, flags, *args)
+
+        monkeypatch.setattr(remote_mux.os, "open", spy)
+        _answers(node_home)
+        remote_mux.bring_up(NODE, dataclasses.replace(recipe, push_files=(link,)))
+        # The in-project link keeps its OWN name on the node (lexical)...
+        members = _members(node_home.calls()[1].stdin)
+        assert members["project/linked.env"] == b"REAL=1\n"
+        assert "project/real.env" not in members
+        # ...and the bytes come from the path the containment check resolved.
+        assert os.path.realpath(real) in opened
+        assert os.fspath(link) not in opened
+
+    def test_a_folder_is_not_a_push_file(self, node_home, tmp_path):
+        recipe = _recipe(tmp_path)
+        assert recipe.local_root is not None
+        folder = recipe.local_root / "config"
+        folder.mkdir()
+        with pytest.raises(ValueError, match="not a regular file"):
+            remote_mux.bring_up(NODE, dataclasses.replace(recipe, push_files=(folder,)))
+        assert node_home.calls() == []
+
+    @needs_fifo
+    def test_a_fifo_push_file_is_refused_not_read(self, node_home, tmp_path):
+        recipe = _recipe(tmp_path)
+        assert recipe.local_root is not None
+        fifo = recipe.local_root / "pipe.env"
+        os.mkfifo(fifo)
+        raised = _in_thread(
+            lambda: remote_mux.bring_up(
+                NODE, dataclasses.replace(recipe, push_files=(fifo,))
+            )
+        )
+        assert isinstance(raised, ValueError)
+        assert "not a regular file" in str(raised)
+        assert node_home.calls() == []
+
+    @needs_fifo
+    def test_a_fifo_in_memory_is_skipped_not_read(self, node_home, tmp_path):
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        os.mkfifo(recipe.memory_dir / "pipe.md")
+        _answers(node_home)
+        assert _in_thread(lambda: remote_mux.bring_up(NODE, recipe)) is None
+        members = _members(node_home.calls()[1].stdin)
+        assert "memory/pipe.md" not in members
+        assert "memory/MEMORY.md" in members
+        assert "pipe.md" in _nodes_log()
+
+    def test_an_oversize_push_file_is_refused_unopened(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(remote_mux, "PUSH_FILE_MAX_BYTES", 4)
+
+        def never(*_args):
+            raise AssertionError("an oversize file was opened")
+
+        monkeypatch.setattr(remote_mux.os, "open", never)
+        with pytest.raises(ValueError, match="15 bytes") as info:
+            remote_mux.bring_up(NODE, _recipe(tmp_path))
+        assert ".env" in str(info.value)
+        assert node_home.calls() == []
+
+    def test_a_push_set_over_the_payload_cap_is_refused(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        recipe = _recipe(tmp_path)
+        assert recipe.local_root is not None
+        second = recipe.local_root / ".env.local"
+        second.write_bytes(b"SECRET=hunter3\n")
+        monkeypatch.setattr(remote_mux, "PAYLOAD_MAX_BYTES", 20)
+        with pytest.raises(ValueError, match="20") as info:
+            remote_mux.bring_up(
+                NODE,
+                dataclasses.replace(recipe, push_files=(*recipe.push_files, second)),
+            )
+        assert ".env.local" in str(info.value)
+        assert node_home.calls() == []
+
+    def test_an_oversize_memory_file_is_skipped_not_fatal(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        (recipe.memory_dir / "huge.md").write_bytes(b"x" * 100)
+        monkeypatch.setattr(remote_mux, "PUSH_FILE_MAX_BYTES", 16)
+        _answers(node_home)
+        remote_mux.bring_up(NODE, recipe)
+        members = _members(node_home.calls()[1].stdin)
+        assert "memory/huge.md" not in members
+        assert members["memory/MEMORY.md"] == b"- remember\n"
+        assert "huge.md" in _nodes_log()
+
+    def test_memory_past_the_payload_cap_is_skipped_not_fatal(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        # .env is 15 bytes; MEMORY.md's 11 would take the payload to 26.
+        monkeypatch.setattr(remote_mux, "PAYLOAD_MAX_BYTES", 20)
+        _answers(node_home)
+        remote_mux.bring_up(NODE, _recipe(tmp_path))
+        members = _members(node_home.calls()[1].stdin)
+        assert members["project/.env"] == b"SECRET=hunter2\n"
+        assert "memory/MEMORY.md" not in members
+        assert "MEMORY.md" in _nodes_log()
+
+    def test_the_caps(self):
+        assert remote_mux.PUSH_FILE_MAX_BYTES == 16 * 1024 * 1024
+        assert remote_mux.PAYLOAD_MAX_BYTES == 64 * 1024 * 1024
 
 
 def _link_or_skip(link: Path, target: Path, *, directory: bool = False) -> None:
