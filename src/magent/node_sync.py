@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from magent import nodes
+from magent import nodes, remote_mux
 from magent.config import NODE_CLOUD, load_config
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import clear_heartbeat, get_logger
@@ -190,6 +190,10 @@ def tick_interval_s(config: MagentConfig) -> float:
     return float(max(1, min(sync.pull_interval_s, sync.sample_interval_s)))
 
 
+# (project, nick, sid) entries state_stores has already warned about.
+_UNPULLABLE_WARNED: set[tuple[str, str, str]] = set()
+
+
 def state_stores() -> list[tuple[str, str, Path]]:
     """``(project, "@<nick>", mirrored state dir)`` for every placed node
     session -- ``attention.AttentionEngine(extra_stores=...)``'s input. The
@@ -201,12 +205,30 @@ def state_stores() -> list[tuple[str, str, Path]]:
     retries RAISES (``ValueError`` / ``OSError``). A tolerant ``{}`` here would
     be a successful listing with zero roots, and the attention engine would
     drop every node row for that tick; the error lets it hold each root's last
-    records and warn instead."""
-    # TODO(E7): skip sids that fail remote_mux.pullable_sid
-    return [
-        (project, f"@{e.nick}", nodes.state_dir(e.nick, e.sid))
-        for project, e in sorted(nodes.load_node_map_strict().items())
-    ]
+    records and warn instead.
+
+    An entry whose sid fails ``remote_mux.pullable_sid`` is skipped:
+    ``state_dir`` joins a sid verbatim, so ``/etc`` would name a store outside
+    the nodes dir. The daemon's tick refuses the same sids, so no mirror
+    exists for one anyway. Warned once per entry per process -- this runs on
+    every attention tick."""
+    stores: list[tuple[str, str, Path]] = []
+    for project, e in sorted(nodes.load_node_map_strict().items()):
+        if not remote_mux.pullable_sid(e.sid):
+            if (project, e.nick, e.sid) not in _UNPULLABLE_WARNED:
+                _UNPULLABLE_WARNED.add((project, e.nick, e.sid))
+                get_logger(LOG_NAME).warning(
+                    (
+                        "node sync: not reading %s's state: its session name %r "
+                        "on %s is not a directory name on this PC"
+                    ),
+                    project,
+                    e.sid,
+                    e.nick,
+                )
+            continue
+        stores.append((project, f"@{e.nick}", nodes.state_dir(e.nick, e.sid)))
+    return stores
 
 
 @contextlib.contextmanager

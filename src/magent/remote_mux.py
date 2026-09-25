@@ -21,11 +21,18 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import io
 import json
 import math
+import os
+import re
 import shlex
 import shutil
 import subprocess
+import tarfile
+import threading
+import zlib
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from magent import node_scripts
@@ -34,7 +41,7 @@ from magent.log import get_logger
 from magent.nodes import LoadSample
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Mapping, Sequence
     from pathlib import Path
 
     from magent.nodes import Node
@@ -192,10 +199,13 @@ def _spawn(
     check: bool,
     shown: tuple[str, ...],
     label: str,
+    quiet: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
     """One bounded child -- the shared body of ``run`` and the local git reads
     (``ignored_paths``). ``shown`` is what an error and a log line may say
-    about the command; ``label`` opens every log line, naming who spawned it."""
+    about the command; ``label`` opens every log line, naming who spawned it.
+    ``quiet`` drops all three of those log lines; the RemoteError is raised
+    exactly the same."""
     try:
         proc = subprocess.Popen(
             argv,
@@ -212,9 +222,10 @@ def _spawn(
         # log line names the program only.
         rc = SSH_MISSING_RC if isinstance(e, FileNotFoundError) else None
         reason = e.strerror or str(e)
-        get_logger("nodes").warning(
-            "%s could not start (%s): %s", label, reason, shlex.join(shown)
-        )
+        if not quiet:
+            get_logger("nodes").warning(
+                "%s could not start (%s): %s", label, reason, shlex.join(shown)
+            )
         raise RemoteError(rc, reason, shown) from e
     try:
         out, err = proc.communicate(input=input_bytes, timeout=timeout_s)
@@ -226,14 +237,16 @@ def _spawn(
         # timeout defect psmux.probe_control_plane documents.
         with contextlib.suppress(subprocess.TimeoutExpired, OSError):
             proc.wait(timeout=_REAP_TIMEOUT_S)
-        get_logger("nodes").warning(
-            "%s timed out after %.1fs: %s", label, timeout_s, shlex.join(shown)
-        )
+        if not quiet:
+            get_logger("nodes").warning(
+                "%s timed out after %.1fs: %s", label, timeout_s, shlex.join(shown)
+            )
         raise RemoteError(None, f"timed out after {timeout_s:g}s", shown) from None
     if check and proc.returncode != 0:
-        get_logger("nodes").warning(
-            "%s failed (rc=%s): %s", label, proc.returncode, shlex.join(shown)
-        )
+        if not quiet:
+            get_logger("nodes").warning(
+                "%s failed (rc=%s): %s", label, proc.returncode, shlex.join(shown)
+            )
         raise RemoteError(proc.returncode, _tail(err), shown)
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
@@ -245,13 +258,17 @@ def run(
     timeout_s: float,
     input_bytes: bytes | None = None,
     check: bool = True,
+    quiet: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run ``argv_remote`` on ``node`` over ssh, as ONE ``bash -c`` remote
     string (``_remote_string``). Raises RemoteError on a spawn failure, a
     missing client (rc 127), a timeout (rc None), or -- with ``check`` -- a
     non-zero exit. With ``check=False`` every exit code comes back for the
     caller to classify. The returned ``CompletedProcess.args`` is the real
-    argv, this PC's client path included: a caller must not log it."""
+    argv, this PC's client path included: a caller must not log it.
+    ``quiet`` drops the per-call log line, for a caller that reports the
+    outcome itself (the sync daemon logs once per state change, not once per
+    tick)."""
     tail = _ssh_tail(node, argv_remote, tty=False)
     shown = _run_shown(node, argv_remote, input_bytes)
     return _spawn(
@@ -261,6 +278,7 @@ def run(
         check=check,
         shown=shown,
         label="node call",
+        quiet=quiet,
     )
 
 
@@ -377,6 +395,27 @@ def _integral(value: object) -> int:
     return int(value)
 
 
+def _load_sample(raw: object) -> LoadSample:
+    """``magent_sample``'s JSON object as a LoadSample -- the ONE parse, shared
+    by ``sample()`` and ``parse_pull``. KeyError, TypeError, ValueError or
+    OverflowError when it is not one: a JSON list or string is a TypeError,
+    and every field goes through ``_finite``/``_integral``, whose refusals
+    (non-number, bool, string, NaN, infinity, fractional count, an integer too
+    large for a float) are those exceptions."""
+    if not isinstance(raw, dict):
+        raise TypeError(f"expected an object, got {type(raw).__name__}")
+    return LoadSample(
+        ts=_finite(raw["ts"]),
+        nproc=_integral(raw["nproc"]),
+        load1=_finite(raw["load1"]),
+        load5=_finite(raw["load5"]),
+        load15=_finite(raw["load15"]),
+        mem_total_mb=_integral(raw["mem_total_mb"]),
+        mem_avail_mb=_integral(raw["mem_avail_mb"]),
+        my_sessions=_integral(raw["my_sessions"]),
+    )
+
+
 def sample(node: Node) -> LoadSample:
     """One load reading from ``node`` (``sample.sh``). RemoteError when the node
     can't be reached, or answers something that is not a sample -- rc 0 on
@@ -386,17 +425,7 @@ def sample(node: Node) -> LoadSample:
     number is not a sample either."""
     result = run_script(node, "sample", [], timeout_s=PROBE_TIMEOUT_S)
     try:
-        raw = json.loads(result.stdout.decode("utf-8", "replace"))
-        reading = LoadSample(
-            ts=_finite(raw["ts"]),
-            nproc=_integral(raw["nproc"]),
-            load1=_finite(raw["load1"]),
-            load5=_finite(raw["load5"]),
-            load15=_finite(raw["load15"]),
-            mem_total_mb=_integral(raw["mem_total_mb"]),
-            mem_avail_mb=_integral(raw["mem_avail_mb"]),
-            my_sessions=_integral(raw["my_sessions"]),
-        )
+        reading = _load_sample(json.loads(result.stdout.decode("utf-8", "replace")))
     # OverflowError is an ArithmeticError, not a ValueError: float() of a
     # 401-digit integer overflows. (`1e400` parses to inf, a ValueError from
     # _finite/_integral.)
@@ -408,6 +437,233 @@ def sample(node: Node) -> LoadSample:
             shown,
         ) from e
     return reading
+
+
+# --- The pull (node_sync's one ssh per node per tick) -------------------------
+# How long one pull may take: one connection streaming every changed file of
+# every session on the node. `pull` waits this long per phase.
+PULL_TIMEOUT_S = 120.0
+# The first line of every pull.sh reply. Anything before it (a banner some rc
+# file printed) is ignored; a reply without it is not a pull.
+PULL_HEADER = b"MAGENT-PULL/1\n"
+# The next watermark is the NODE's clock when its scan began, minus this: a
+# file written in the same second as the scan is asked for again, never lost.
+WATERMARK_OVERLAP_S = 1.0
+_PULL_KINDS = frozenset({"transcripts", "state"})
+# A session directory sits beside these per-node files; no sid may take a name.
+_RESERVED_NAMES = frozenset(
+    {"sessions.json", "load.jsonl", "pull.json", "node-map.json"}
+)
+# Every path part must be a legal file name on THIS PC, which may be Windows.
+_UNSAFE_CHARS = re.compile(r'[\x00-\x1f<>:"/\\|?*]')
+_DEVICE_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+)
+
+
+@dataclass(frozen=True)
+class SidPull:
+    """What a pull asks a node for, per session:
+    - ``roots``: the session's cwd as the node map records it (``~`` unexpanded;
+      pull.sh expands it);
+    - ``project_dir``: the finished ``~/.claude/projects`` name for that cwd.
+      It is None until the node has reported its real path once, because nodes
+      never encode (DECISION-11f);
+    - ``since``: the node-clock watermark that a file must be newer than."""
+
+    roots: tuple[str, ...]
+    project_dir: str | None
+    since: float
+
+
+@dataclass(frozen=True)
+class NodeSnapshot:
+    """One pull.sh reply, parsed, with its files stored:
+    - ``now``: the node's clock when its scan began (the next watermark);
+    - ``files``: what landed on this PC;
+    - ``failed_sids``: sessions with a file that could not be stored. Their
+      watermark must not move."""
+
+    now: float
+    sessions: tuple[str, ...]
+    sample: LoadSample | None
+    realpaths: Mapping[str, str]
+    state_files: Mapping[str, tuple[str, ...]]
+    files: tuple[Path, ...]
+    failed_sids: frozenset[str]
+
+
+def _pull_error(message: str) -> RemoteError:
+    # rc 0: the node answered, and the answer was not a pull.
+    return RemoteError(0, message, ("pull.sh",))
+
+
+def _safe_part(part: str) -> bool:
+    return (
+        part not in ("", ".", "..")
+        and _UNSAFE_CHARS.search(part) is None
+        and not part.endswith((".", " "))
+        and part.split(".", 1)[0].upper() not in _DEVICE_NAMES
+    )
+
+
+def pullable_sid(sid: str) -> bool:
+    """Can ``sid`` name a directory under ``~/.magent/nodes/<nick>/`` here?"""
+    return _safe_part(sid) and sid not in _RESERVED_NAMES
+
+
+def _str_dict(raw: object) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def _names_dict(raw: object) -> dict[str, tuple[str, ...]]:
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        k: tuple(
+            n for n in v if isinstance(n, str) and n.endswith(".json") and _safe_part(n)
+        )
+        for k, v in raw.items()
+        if isinstance(k, str) and isinstance(v, list)
+    }
+
+
+def _member_parts(
+    member: tarfile.TarInfo, sids: frozenset[str]
+) -> tuple[str, ...] | None:
+    """``<sid>/transcripts/<any depth>`` or ``<sid>/state/<name>.json`` for a
+    requested sid, every part a legal name here, regular files only -- or None."""
+    if not member.isfile():
+        return None
+    parts = tuple(member.name.split("/"))
+    if len(parts) < 3 or parts[0] not in sids or parts[1] not in _PULL_KINDS:
+        return None
+    if parts[1] == "state" and (len(parts) != 3 or not parts[2].endswith(".json")):
+        return None
+    if not all(_safe_part(p) for p in parts):
+        return None
+    return parts
+
+
+def _write_file(path: Path, data: bytes, mtime: float) -> None:
+    """Store one pulled file whole (sibling ``.part`` + ``os.replace``) with the
+    node's mtime, so a reader never sees half a transcript."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    part = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.part")
+    try:
+        part.write_bytes(data)
+        os.utime(part, (mtime, mtime))
+        os.replace(part, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            part.unlink()
+        raise
+
+
+def _extract(
+    body: bytes, *, dest: Path, sids: frozenset[str]
+) -> tuple[tuple[Path, ...], frozenset[str]]:
+    if not body:
+        return (), frozenset()
+    log = get_logger("nodes")
+    files: list[Path] = []
+    failed: set[str] = set()
+    skipped = 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(body), mode="r:*") as tar:
+            for member in tar:
+                parts = _member_parts(member, sids)
+                if parts is None:
+                    skipped += 1
+                    continue
+                if parts[0] in failed:
+                    continue
+                reader = tar.extractfile(member)
+                if reader is None:
+                    skipped += 1
+                    continue
+                target = dest.joinpath(*parts)
+                try:
+                    _write_file(target, reader.read(), float(member.mtime))
+                except OSError as e:
+                    failed.add(parts[0])
+                    log.warning("node pull: cannot store %s: %s", "/".join(parts), e)
+                    continue
+                files.append(target)
+    except (tarfile.TarError, EOFError, zlib.error, OSError) as e:
+        raise _pull_error(f"unreadable pull archive: {e}") from e
+    if skipped:
+        log.warning(
+            "node pull: skipped %d archive member(s) outside the requested sessions",
+            skipped,
+        )
+    return tuple(files), frozenset(failed)
+
+
+def parse_pull(stdout: bytes, *, dest: Path, sids: Collection[str]) -> NodeSnapshot:
+    """Parse a pull.sh reply and store its files under ``dest`` (a node's
+    mirror dir). Only the requested ``sids`` are believed: their metadata, and
+    archive members shaped ``<sid>/transcripts/...`` or ``<sid>/state/<x>.json``
+    whose every part is a legal name here. Everything else is dropped with one
+    warning. RemoteError (rc 0) when the reply is not a pull at all.
+
+    A member lands at ``dest/<its own archive path>`` -- nothing here maps a
+    path back to a project directory."""
+    _, sep, rest = stdout.partition(PULL_HEADER)
+    if not sep:
+        raise _pull_error("no MAGENT-PULL header in the reply")
+    meta_line, _, body = rest.partition(b"\n")
+    try:
+        meta = json.loads(meta_line.decode("utf-8"))
+    except ValueError as e:
+        raise _pull_error(f"unreadable pull metadata: {e}") from e
+    if not isinstance(meta, dict):
+        raise _pull_error("pull metadata is not an object")
+    now = meta.get("now")
+    # json.loads accepts NaN and Infinity. A non-finite clock would become a
+    # NaN watermark, which write_json_atomic refuses with ValueError.
+    if (
+        isinstance(now, bool)
+        or not isinstance(now, (int, float))
+        or not math.isfinite(now)
+    ):
+        raise _pull_error("pull metadata has no clock")
+    wanted = frozenset(sids)
+    raw_sessions = meta.get("sessions")
+    # A non-string entry is corruption, never a name to skip: dropping it would
+    # write a snapshot without that session, and D would read it as dead.
+    if not isinstance(raw_sessions, list) or not all(
+        isinstance(s, str) for s in raw_sessions
+    ):
+        raise _pull_error("pull metadata's sessions is not a list of names")
+    sessions = tuple(s for s in raw_sessions if s)
+    try:
+        reading: LoadSample | None = _load_sample(meta.get("sample"))
+    except (ValueError, KeyError, TypeError, OverflowError):
+        reading = None
+    files, failed = _extract(body, dest=dest, sids=wanted)
+    return NodeSnapshot(
+        now=float(now),
+        sessions=sessions,
+        sample=reading,
+        realpaths={
+            k: v for k, v in _str_dict(meta.get("realpaths")).items() if k in wanted
+        },
+        state_files={
+            k: v for k, v in _names_dict(meta.get("state_files")).items() if k in wanted
+        },
+        files=files,
+        failed_sids=failed,
+    )
 
 
 def ignored_paths(repo: Path, *, timeout_s: float, label: str) -> tuple[str, ...]:

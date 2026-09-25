@@ -205,6 +205,25 @@ class TestStateStores:
         with pytest.raises(ValueError):
             node_sync.state_stores()
 
+    @pytest.mark.parametrize("bad", ["/etc", "../x"])
+    def test_a_sid_that_is_no_directory_name_here_is_skipped_and_named(
+        self, placed, caplog, monkeypatch, bad
+    ):
+        """state_dir joins a sid VERBATIM, so ``/etc`` would read a store
+        outside the nodes dir. Warned once, however many ticks ask again."""
+        monkeypatch.setattr(node_sync, "_UNPULLABLE_WARNED", set())
+        _capture_nodes_log(caplog)
+        nodes.write_node_map(
+            {"api": _entry("second", "api"), "evil": _entry("second", bad)}
+        )
+        assert node_sync.state_stores() == [
+            ("api", "@second", nodes.state_dir("second", "api")),
+        ]
+        node_sync.state_stores()
+        (warning,) = _warnings(caplog)
+        assert repr(bad) in warning
+        assert "evil" in warning
+
 
 class TestTheNodeLock:
     def test_a_held_node_is_waited_for_then_refused(self):
