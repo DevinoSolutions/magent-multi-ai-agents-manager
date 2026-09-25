@@ -114,8 +114,11 @@ def handle(payload):
         write_state(cwd, EVENT_STATES[event], sid)
 
 
+# Bytes, decoded as UTF-8 explicitly: under a C/POSIX locale (a bare node over
+# ssh) Python 3.6 decodes text stdin as ASCII, and a non-ASCII cwd would then
+# fail the key's UTF-8 encode and silently cost the session its record.
 try:
-    data = json.loads(sys.stdin.read() or "{}")
+    data = json.loads(sys.stdin.buffer.read().decode("utf-8") or "{}")
     if isinstance(data, dict):
         handle(data)
 except Exception:
@@ -124,9 +127,11 @@ MAGENT_STATE_HOOK_PY
 
 main() {
   local source=claude prev="" arg
+  # The first --source wins, as in state_hook.main.
   for arg in "$@"; do
     if [ "$prev" = "--source" ]; then
       source=$arg
+      break
     fi
     prev=$arg
   done
@@ -141,4 +146,4 @@ main() {
   return 0
 }
 
-main "$@"; exit $?
+main "$@"
