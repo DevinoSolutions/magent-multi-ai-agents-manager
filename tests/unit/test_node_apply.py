@@ -1779,10 +1779,18 @@ class _HungUp(io.TextIOBase):
         self.dead = bool(self.rows)
 
 
-_EPIPE = [
-    BrokenPipeError(errno.EPIPE, "Broken pipe"),
-    OSError(errno.EPIPE, "Broken pipe"),
-]
+# What a write into a dead pipe raises. OSError(EPIPE) is built as a
+# BrokenPipeError by OSError itself; Windows raises a plain OSError(EINVAL),
+# so catching BrokenPipeError alone would miss the Windows pipe.
+_DEAD_PIPE = pytest.mark.parametrize(
+    "error",
+    [
+        BrokenPipeError(errno.EPIPE, "Broken pipe"),
+        OSError(errno.EPIPE, "Broken pipe"),
+        OSError(errno.EINVAL, "Invalid argument"),
+    ],
+    ids=["BrokenPipeError", "OSError-EPIPE", "OSError-EINVAL"],
+)
 
 
 class TestAPcThatHangsUpDoesNotStopTheApply:
@@ -1806,7 +1814,7 @@ class TestAPcThatHangsUpDoesNotStopTheApply:
         assert store["shipped"]["settings"]["additionalDirectories"] == ["/srv/d"]
 
     @pytest.mark.parametrize("where", ["write", "flush"])
-    @pytest.mark.parametrize("error", _EPIPE, ids=["BrokenPipeError", "OSError"])
+    @_DEAD_PIPE
     def test_every_later_step_still_writes_its_file(
         self, box, tmp_path, monkeypatch, error, where
     ):
@@ -1821,7 +1829,7 @@ class TestAPcThatHangsUpDoesNotStopTheApply:
         assert pipe.attempts == 2
         self._landed(box)
 
-    @pytest.mark.parametrize("error", _EPIPE, ids=["BrokenPipeError", "OSError"])
+    @_DEAD_PIPE
     def test_a_step_that_fails_after_the_hang_up_still_decides_the_exit(
         self, box, tmp_path, monkeypatch, error
     ):
