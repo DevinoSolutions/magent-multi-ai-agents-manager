@@ -1810,11 +1810,24 @@ class TestWhatTheNodeCanRun:
             ": noop",
             "pushd .claude && x",
             "popd",
+            # A // or \\ that is a regex, a comment, an operator or an
+            # escape -- not a UNC share (no host, separator and share).
+            "awk '//{print}' f",
+            "sed -e '//d' f",
+            'grep "\\\\d+" f',
+            "printf '\\\\n'",
+            "jq -r '.a //\"b\"'",
+            "jq -r '.dir //\"/tmp/x\"' f",
+            "printf '\\\\\"x\\n'",
+            "node -e '//c\\nrun()'",
+            'python3 -c "print(7 //2)"',
         ],
     )
     def test_a_command_bash_would_run_or_that_cannot_be_judged_is_kept(
         self, box, tmp_path, capsys, command
     ):
+        for name in ("awk", "sed", "grep", "printf", "jq", "node", "python3"):
+            box.add(name)
         box.apply(_work(tmp_path, _pc_settings(_stop_hook(command))))
         assert _drops(_lines(capsys), "hook:Stop") == []
         assert command in _commands(_json(_settings(box)), "Stop")
