@@ -729,8 +729,12 @@ class TestTheSessionsSnapshot:
         assert nodes.sessions_stale(snap, pull_interval_s=30, now=160.5)
         assert nodes.sessions_stale(None, pull_interval_s=30, now=0.0)
 
-    def test_a_snapshot_from_the_future_reads_fresh_and_never_raises(self):
-        # A backwards wall-clock jump: the age goes negative, which is fresh.
+    def test_a_snapshot_from_the_future_reads_stale(self):
+        # A backwards wall-clock jump: ts is ahead of now by more than two
+        # intervals, and that reads stale too -- never fresh forever.
         snap = nodes.NodeSessions(ts=1_000.0, sessions=("api",))
-        assert not nodes.sessions_stale(snap, pull_interval_s=30, now=10.0)
-        assert nodes.sessions_stale(snap, pull_interval_s=30, now=1_060.5)
+        assert nodes.sessions_stale(snap, pull_interval_s=30, now=10.0)
+
+    def test_a_future_ts_inside_the_window_still_reads_fresh(self):
+        snap = nodes.NodeSessions(ts=100.0, sessions=("api",))
+        assert not nodes.sessions_stale(snap, pull_interval_s=30, now=130.0)

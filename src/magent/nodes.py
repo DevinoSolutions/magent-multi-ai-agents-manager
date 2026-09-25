@@ -458,8 +458,7 @@ def read_sessions(nick: str, *, nodes_dir: Path | None = None) -> NodeSessions |
 def sessions_stale(
     snap: NodeSessions | None, *, pull_interval_s: float, now: float
 ) -> bool:
-    """Spec §7: a snapshot older than two pull intervals reads ``stale``.
-    If the wall clock jumps backwards, a snapshot whose ``ts`` is now in the
-    future gives a negative age and reads FRESH (until ``now`` passes
-    ``ts + 2 * pull_interval_s``); the function never raises on it."""
-    return snap is None or now - snap.ts > 2 * pull_interval_s
+    """Spec §7: a snapshot more than two pull intervals older OR newer than
+    ``now`` reads ``stale``; a wall clock that jumped backwards therefore
+    reads stale for at most one tick, never fresh forever."""
+    return snap is None or abs(now - snap.ts) > 2 * pull_interval_s
