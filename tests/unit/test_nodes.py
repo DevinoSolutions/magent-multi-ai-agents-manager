@@ -14,7 +14,13 @@ from pathlib import Path, PurePosixPath
 import pytest
 
 from magent import nodes, psmux, remote_mux
-from magent.config import MagentConfig, NodeConfig, ProjectConfig, Settings
+from magent.config import (
+    DEFAULT_TOOLS,
+    MagentConfig,
+    NodeConfig,
+    ProjectConfig,
+    Settings,
+)
 from magent.nodes import (
     LoadSample,
     LocalGitState,
@@ -24,6 +30,7 @@ from magent.nodes import (
     Recipe,
     RepoSpec,
 )
+from magent.sessions import IDE_TOOLS, is_ide_tool
 from tests.conftest import REAL_MAGENT_DIR
 
 NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
@@ -985,6 +992,12 @@ class TestRecipeFor:
             project_dir=repo,
         )
         assert recipe.push_files == nodes.push_set(repo, [state], home=Path.home())
+        # Every push ships to the same place under remote_root that it had
+        # under local_root: a consumer takes relative_to(local_root) of each.
+        assert recipe.local_root == repo.resolve()
+        assert recipe.push_files
+        for pushed in recipe.push_files:
+            pushed.relative_to(recipe.local_root)
 
     def test_push_warnings_ride_along(self, repo):
         recipe = nodes.recipe_for(
@@ -1032,14 +1045,68 @@ class TestRecipeFor:
             os.symlink(repo, link, target_is_directory=True)
         except OSError:
             pytest.skip("this platform/user cannot create symlinks")
+        # The extra names link/.env while git lists repo/.env: both forms must
+        # come out under ONE root, or a relpath consumer would write the other
+        # outside remote_root on the node.
         recipe = nodes.recipe_for(
-            ProjectConfig(path=str(link), node="second"),
+            ProjectConfig(path=str(link), node="second", push=[".env"]),
             NODE,
             [_real_state(repo)],
             home=Path.home(),
             project_dir=link,
         )
         assert [r.remote_dir for r in recipe.repos] == [recipe.remote_root]
+        assert recipe.local_root == repo.resolve()
+        assert recipe.push_files
+        for pushed in recipe.push_files:
+            pushed.relative_to(recipe.local_root)
+        assert recipe.local_root / ".env" in recipe.push_files
+
+    def test_a_repo_listed_through_a_link_ships_under_the_resolved_root(
+        self, repo, tmp_path
+    ):
+        # The mirror: the project is configured at the repo itself, but git's
+        # state names it through a link -- its hits still land under local_root.
+        link = tmp_path / "sendly-link"
+        try:
+            os.symlink(repo, link, target_is_directory=True)
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second"),
+            NODE,
+            [_real_state(link)],
+            home=Path.home(),
+            project_dir=repo,
+        )
+        assert recipe.local_root == repo.resolve()
+        assert recipe.push_files
+        for pushed in recipe.push_files:
+            pushed.relative_to(recipe.local_root)
+
+    def test_a_push_that_would_land_outside_the_node_folder_is_refused(self, tmp_path):
+        # A git hit named through a linked repo, inside a directory that
+        # itself links out of the project: no spelling of it is under
+        # local_root, so the recipe refuses rather than ship it elsewhere.
+        project = tmp_path / "proj"
+        project.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / ".env").write_text("K=1\n", encoding="utf-8")
+        via = tmp_path / "via"
+        try:
+            os.symlink(project, via, target_is_directory=True)
+            os.symlink(outside, project / "sub", target_is_directory=True)
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        with pytest.raises(NodeConfigError, match="outside the project"):
+            nodes.recipe_for(
+                ProjectConfig(path=str(project), node="second"),
+                NODE,
+                [_state(via, ("sub/.env",))],
+                home=tmp_path / "home",
+                project_dir=project,
+            )
 
     def test_a_project_inside_a_larger_repo_is_refused_as_such(self, tmp_path):
         # A monorepo subdirectory: push_set stays safe for it, but a node
@@ -1348,6 +1415,20 @@ class TestWhichProjectsRunOnANode:
         b = ProjectConfig(path="C:/a/web", node="second", group="home")
         assert nodes.node_projects(_pool_config(a, b), group="work") == [a]
 
+    def test_an_ide_default_tool_keeps_a_toolless_project_home(self):
+        ide = sorted(IDE_TOOLS)[0]
+        config = _pool_config(ProjectConfig(path="C:/a/api", node="second"))
+        config.settings.default_tool = ide
+        assert is_ide_tool(ide)
+        assert nodes.node_projects(config) == []
+
+    def test_an_agent_default_tool_sends_a_toolless_project_to_its_node(self):
+        agent = next(t for t in DEFAULT_TOOLS if not is_ide_tool(t))
+        proj = ProjectConfig(path="C:/a/api", node="second")
+        config = _pool_config(proj)
+        config.settings.default_tool = agent
+        assert nodes.node_projects(config) == [proj]
+
     def test_a_second_entry_with_the_same_session_id_is_dropped(self):
         a = ProjectConfig(path="C:/a/api", node="second")
         dup = ProjectConfig(path="C:/b/api", node="third")
@@ -1374,6 +1455,25 @@ class TestWhereTheProjectLandsOnTheNode:
             ):
                 nodes.remote_root_for(D_NODE, root)
 
+    @pytest.mark.parametrize("leaf", ["..", "api.", "api ", "a\x1fb", "a\x7fb"])
+    def test_a_leaf_that_is_not_a_folder_name_is_refused_and_named(self, leaf):
+        # ".." would climb to the node user's HOME; Windows opens "api." and
+        # "api " as "api", so the local and remote names would diverge; a
+        # control character has no business in a remote path. Refused, never
+        # rewritten.
+        project_dir = Path("C:/src") / leaf
+        assert project_dir.name == leaf
+        with pytest.raises(NodeConfigError, match="cannot name a node folder") as err:
+            nodes.remote_root_for(D_NODE, project_dir)
+        assert repr(leaf) in str(err.value)
+
+    def test_a_dot_leaf_is_refused(self):
+        # pathlib collapses a "." part, so a "." leaf reaches here only as
+        # Path(".") itself -- a folder with no name, refused like a drive root.
+        assert Path(".").name == ""
+        with pytest.raises(NodeConfigError):
+            nodes.remote_root_for(D_NODE, Path("."))
+
     @pytest.mark.parametrize(
         ("path", "expected"),
         [
@@ -1384,6 +1484,19 @@ class TestWhereTheProjectLandsOnTheNode:
     )
     def test_a_tilde_expands_against_the_nodes_home(self, path, expected):
         assert nodes.absolute_remote(path, "/home/amin") == expected
+
+    @pytest.mark.parametrize(
+        ("path", "home", "expected"),
+        [
+            ("~", "/home/amin/", "/home/amin"),
+            ("~/x", "/home/amin/", "/home/amin/x"),
+            ("~", "/", "/"),
+            ("~/x", "/", "/x"),
+        ],
+    )
+    def test_a_trailing_slash_on_home_gives_one_spelling(self, path, home, expected):
+        # "~" and "~/x" must encode to keys under the same home spelling.
+        assert nodes.absolute_remote(path, home) == expected
 
     def test_recipe_for_carries_the_local_root_and_the_folder_name_rule(self, tmp_path):
         project_dir = tmp_path / "api-service"
@@ -1396,7 +1509,7 @@ class TestWhereTheProjectLandsOnTheNode:
             home=tmp_path / "home",
             project_dir=project_dir,
         )
-        assert recipe.local_root == project_dir
+        assert recipe.local_root == project_dir.resolve()
         assert recipe.remote_root == "~/magent/api-service"
         assert recipe.sid == "API"
         # C1's other three fields are launch.node_recipe's to fill.
@@ -1416,12 +1529,27 @@ def _recipe_at(project: str, remote_root: str) -> Recipe:
 
 class TestTwoProjectsNeverShareANodeFolder:
     """Two local folders with the same leaf name (``C:/a/api``, ``C:/b/api``)
-    would both land at ``<root>/api`` -- one clone overwriting the other."""
+    would both land at ``<root>/api`` -- one clone overwriting the other. The
+    leaf is unique across the whole fleet: ``auto`` placement may later put any
+    two projects on one node."""
 
-    def test_distinct_remote_roots_pass(self):
+    def test_different_leaves_under_one_root_pass(self):
         nodes.assert_distinct_remote_roots(
             [_recipe_at("api", "~/magent/api"), _recipe_at("web", "~/magent/web")]
         )
+
+    def test_one_leaf_under_different_roots_is_refused(self):
+        recipes = [
+            _recipe_at("api", "~/magent/api"),
+            _recipe_at("api-b", "/srv/work/api"),
+        ]
+        with pytest.raises(NodeConfigError) as caught:
+            nodes.assert_distinct_remote_roots(recipes)
+        text = str(caught.value)
+        assert "'api'" in text
+        assert "'api-b'" in text
+        assert "~/magent/api" in text
+        assert "/srv/work/api" in text
 
     def test_no_recipes_pass(self):
         nodes.assert_distinct_remote_roots([])
@@ -1470,6 +1598,20 @@ class TestTheRefusalNamesTheFix:
         assert text is not None
         assert "git push -u origin feat/x" in text
         assert "--allow-dirty" in text
+
+    def test_a_whitespace_only_origin_is_no_origin(self, tmp_path):
+        text = nodes.refusal_for(_git_state(tmp_path, url="  \t"), allow_dirty=True)
+        assert text is not None
+        assert "no 'origin' remote" in text
+
+    def test_an_empty_branch_is_refused_as_detached_not_as_a_blank_push(self, tmp_path):
+        # "git push -u origin , or pass" names no fix at all.
+        state = _git_state(tmp_path, unpushed=True, branch="")
+        for allow_dirty in (False, True):
+            text = nodes.refusal_for(state, allow_dirty=allow_dirty)
+            assert text is not None
+            assert "git switch <branch>" in text
+            assert "git push" not in text
 
     def test_allow_dirty_lets_dirty_and_unpushed_through(self, tmp_path):
         state = _git_state(tmp_path, dirty=True, unpushed=True)

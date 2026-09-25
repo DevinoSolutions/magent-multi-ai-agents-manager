@@ -105,8 +105,10 @@ class Recipe:
     warnings: tuple[str, ...] = ()
     # PR-D (C1): what the node backend needs beyond the §3 tuple. Defaulted, so
     # every construction that predates it still compiles. recipe_for sets
-    # local_root (push_files ship relative to it); launch.node_recipe fills the
-    # command fields from settings.tools, which this pure module never reads.
+    # local_root: the project dir RESOLVED, and every push_files entry is
+    # `relative_to` it (that relative path is where it lands under
+    # remote_root). launch.node_recipe fills the command fields from
+    # settings.tools, which this pure module never reads.
     local_root: Path | None = None
     tool: str = ""
     command: str = ""
@@ -545,6 +547,25 @@ def _one_per_file(found: Sequence[Path], project_dir: Path) -> tuple[Path, ...]:
     return tuple(sorted(kept.values(), key=str))
 
 
+def _under_root(path: Path, root: Path, project_dir: Path) -> Path:
+    """A push entry re-spelled under the RESOLVED project ``root``, so the
+    Recipe can promise ``path.relative_to(local_root)``. One lexically under
+    the configured ``project_dir`` (an extra or a workspace-root file named
+    through a link) keeps its tail -- its own name -- and swaps the prefix,
+    which resolves to ``root``. One already under ``root`` is kept. Otherwise
+    (a git hit listed under a repo reached through a link) its directory is
+    resolved, as ``_one_per_file`` keys it. A file under none of these would
+    land outside the node folder: a NodeConfigError, never a push."""
+    if path.is_relative_to(project_dir):
+        return root / path.relative_to(project_dir)
+    if path.is_relative_to(root):
+        return path
+    parent = _try_resolve(path.parent)
+    if parent is not None and parent.is_relative_to(root):
+        return parent / path.name
+    raise NodeConfigError(f"{path}: would ship from outside the project {root}")
+
+
 def _push(
     project_dir: Path,
     states: Sequence[LocalGitState],
@@ -703,43 +724,72 @@ def node_projects(
     return out
 
 
+def _not_a_folder_name(name: str) -> bool:
+    """``name`` cannot be the node folder: ``.``/``..`` (``..`` climbs to the
+    node user's HOME), a control character, or a trailing dot or space --
+    Windows opens ``api.`` as ``api``, so the local and remote names would
+    diverge."""
+    return (
+        name in {".", ".."}
+        or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name)
+        or name.endswith((".", " "))
+    )
+
+
 def remote_root_for(node: Node, project_dir: Path) -> str:
     """Where ``project_dir`` lives on ``node``: the node's root plus the local
-    folder's NAME (never its path). ``~`` stays unexpanded; see
-    ``absolute_remote``. A folder with no name -- a drive root such as ``C:\\``
-    or ``/`` -- is refused: it would land AT the node's root, among every other
-    project's folder."""
-    if not project_dir.name:
+    folder's NAME (never its path). A folder with no name -- a drive root such
+    as ``C:\\`` or ``/`` -- is refused: it would land AT the node's root, among
+    every other project's folder. So is a name that is not a folder name
+    (``_not_a_folder_name``): refused, never rewritten.
+
+    The result is UNQUOTED and may start with ``~``, which stays unexpanded. A
+    placement caller must run it through ``absolute_remote()`` BEFORE any
+    ``shlex.quote`` -- a quoted ``~`` is never expanded by the node's shell."""
+    name = project_dir.name
+    if not name:
         raise NodeConfigError(f"{project_dir}: a drive root cannot be a node project")
-    return f"{node.root.rstrip('/')}/{project_dir.name}"
+    if _not_a_folder_name(name):
+        raise NodeConfigError(f"{project_dir}: {name!r} cannot name a node folder")
+    return f"{node.root.rstrip('/')}/{name}"
 
 
 def assert_distinct_remote_roots(recipes: Sequence[Recipe]) -> None:
-    """Raise NodeConfigError if two of ``recipes`` land in one node folder.
+    """Raise NodeConfigError if two of ``recipes`` share a node folder NAME.
 
     ``remote_root_for`` keys on the local folder's leaf name, so ``C:/a/api``
     and ``C:/b/api`` both become ``<root>/api`` -- one clone would overwrite
-    the other. Names BOTH projects and the shared folder. Pure; the caller is
-    placement (a later PR-D task), which checks a batch before any bring-up."""
+    the other. Uniqueness is on the LEAF (the last ``/`` segment of
+    ``remote_root``) across the whole fleet, not on the full path: ``auto``
+    placement may later co-locate any two projects on one node, and two
+    projects with one leaf under different roots would then collide. So
+    placement calls this ONCE over ALL recipes, never per node, before any
+    bring-up. Names BOTH projects and both folders. Pure."""
     held: dict[str, Recipe] = {}
     for recipe in recipes:
-        first = held.setdefault(recipe.remote_root, recipe)
+        leaf = recipe.remote_root.rstrip("/").rsplit("/", 1)[-1]
+        first = held.setdefault(leaf, recipe)
         if first is not recipe:
             raise NodeConfigError(
                 f"projects {first.project!r} and {recipe.project!r} would share "
-                f"the node folder {recipe.remote_root}; a node folder is named "
-                "after the local folder, so rename one of them"
+                f"the node folder name {leaf!r} ({first.remote_root}, "
+                f"{recipe.remote_root}); a node folder is named after the local "
+                "folder and any two projects may land on one node, so rename "
+                "one of them"
             )
 
 
 def absolute_remote(path: str, home: str) -> str:
     """``path`` with a leading ``~`` expanded against the node's ``home`` (what
     ``printenv HOME`` said there). The node's shell would expand it too, but a
-    path that crosses as an argument or into JSON must already be absolute."""
+    path that crosses as an argument or into JSON must already be absolute.
+    ``home``'s trailing slashes are dropped once, so ``~`` and ``~/x`` spell
+    the home alike (``/`` stays ``/``)."""
+    base = home.rstrip("/")
     if path == "~":
-        return home
+        return base or "/"
     if path.startswith("~/"):
-        return f"{home.rstrip('/')}/{path[2:]}"
+        return f"{base}/{path[2:]}"
     return path
 
 
@@ -747,13 +797,15 @@ def refusal_for(state: LocalGitState, *, allow_dirty: bool = False) -> str | Non
     """Why ``state``'s repo cannot be reproduced on a node, naming the fix; or
     None. D7: magent never runs the fix. ``allow_dirty`` accepts a dirty or
     unpushed tree (the node gets origin's copy); it cannot conjure an origin
-    or a branch, so those two are refused regardless."""
-    if not state.url:
+    or a branch, so those two are refused regardless. A whitespace-only url is
+    no origin; an empty branch is refused as a detached HEAD (there is no
+    branch to push or check out)."""
+    if not state.url.strip():
         return (
             f"{state.path}: no 'origin' remote; the node clones from origin -- "
             "add one and push"
         )
-    if state.detached:
+    if state.detached or not state.branch:
         return (
             f"{state.path}: HEAD is detached; the node checks out a branch -- "
             "run git switch <branch> first"
@@ -832,8 +884,11 @@ def recipe_for(
             f"{project_dir}: has no git repo; a node project is one repo, "
             "or a folder of repos"
         )
-    push_files, push_warned = _push(
+    found, push_warned = _push(
         project_dir, states, home=home, extras=tuple(proj.push or ())
+    )
+    push_files = tuple(
+        sorted((_under_root(p, root, project_dir) for p in found), key=str)
     )
     memory = (
         home / ".claude" / "projects" / encoded_project_dir(str(project_dir)) / "memory"
@@ -846,5 +901,5 @@ def recipe_for(
         memory_dir=memory if memory.is_dir() else None,
         remote_root=remote_root,
         warnings=(*repo_warnings, *push_warned),
-        local_root=project_dir,
+        local_root=root,
     )
