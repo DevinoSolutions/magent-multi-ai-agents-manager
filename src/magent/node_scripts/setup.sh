@@ -12,7 +12,9 @@ set -euo pipefail
 # @include lib.sh
 # @include tmux_floor.sh
 
-PACKAGES=(tmux git curl python3 ca-certificates)
+# openssh-client: the user phase runs ssh-keygen, and a minimal image may not
+# ship it.
+PACKAGES=(tmux git curl python3 ca-certificates openssh-client)
 USER_RE='^[a-z_][a-z0-9_-]{0,31}$'
 KEY_RE='^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+={0,3}( [^[:cntrl:]]*)?$'
 GH_KEYRING=/etc/apt/keyrings/githubcli-archive-keyring.gpg
@@ -210,6 +212,9 @@ user_node_key() {
   fi
   if [ -f "$id.pub" ]; then
     say skip "node-key:$u" "id_ed25519 already in ~/.ssh"
+  elif ! command -v ssh-keygen >/dev/null 2>&1; then
+    say fail "node-key:$u" "ssh-keygen is not installed (Debian/Ubuntu package openssh-client)"
+    return 1
   elif [ -f "$id" ]; then
     if ! out=$(ssh-keygen -y -P "" -f "$id" 2>&1 > "$id.pub"); then
       rm -f -- "$id.pub"

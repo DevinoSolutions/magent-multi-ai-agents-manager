@@ -1372,6 +1372,8 @@ class TestProgramsShUnderRealBash:
 
 
 PC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKEPCKEY me@pc"
+# setup.sh's PACKAGES, in its order.
+NODE_PACKAGES = ("tmux", "git", "curl", "python3", "ca-certificates", "openssh-client")
 SETUP_TOOLS = (
     "bash",
     "cat",
@@ -1489,8 +1491,11 @@ case "$1" in -V) cat "$STATE/tmux-V" 2>/dev/null || echo "tmux 3.4" ;; *) exit 1
 }
 
 
-def _setup_box(tmp_path: Path, *, docker: bool = True) -> tuple[Path, dict[str, str]]:
-    """A fake root's system under tmp_path/state, and the env setup.sh runs in."""
+def _setup_box(
+    tmp_path: Path, *, docker: bool = True, without: tuple[str, ...] = ()
+) -> tuple[Path, dict[str, str]]:
+    """A fake root's system under tmp_path/state, and the env setup.sh runs in.
+    ``without`` names shims left out: that program is not installed."""
     state = tmp_path / "state"
     for sub in ("pkgs", "users", "uids", "home", "groups", "root", "tmp"):
         (state / sub).mkdir(parents=True, exist_ok=True)
@@ -1500,6 +1505,8 @@ def _setup_box(tmp_path: Path, *, docker: bool = True) -> tuple[Path, dict[str, 
     shims = tmp_path / "shims"
     shims.mkdir(exist_ok=True)
     for name, body in _SHIMS.items():
+        if name in without:
+            continue
         shim = shims / name
         shim.write_text(
             f"#!{BASH}\nSTATE={shlex.quote(str(state))}\n{body}",
@@ -1757,6 +1764,34 @@ class TestSetupShUnderRealBash:
         assert sorted(p.name for p in (state / "users").iterdir()) == users_before
         assert not (state / "apt.log").exists()
 
+    @pytest.mark.parametrize("status", [None, "rc "])
+    def test_openssh_client_is_installed_like_every_other_package(
+        self, tmp_path, status
+    ):
+        # setup runs ssh-keygen; a minimal image may ship without it.
+        state, env = _setup_box(tmp_path)
+        for pkg in NODE_PACKAGES:
+            (state / "pkgs" / pkg).write_text("ii ", encoding="utf-8")
+        if status is None:
+            (state / "pkgs" / "openssh-client").unlink()
+        else:
+            (state / "pkgs" / "openssh-client").write_text(status, encoding="utf-8")
+        r = _run_setup(env)
+        assert _rows(r)["packages"] == "did"
+        assert (state / "apt.log").read_text("utf-8").splitlines()[-1] == (
+            "install -y -qq openssh-client"
+        )
+
+    def test_a_missing_ssh_keygen_is_a_named_fail_row(self, tmp_path):
+        _, env = _setup_box(tmp_path, without=("ssh-keygen",))
+        r = _run_setup(env)
+        assert r.returncode == 1
+        (row,) = [line for line in _report(r).lines if line.item == "node-key:amin"]
+        assert row.status == "fail"
+        assert "ssh-keygen" in row.detail
+        assert "openssh-client" in row.detail
+        assert set(_report(r).keys()) == set()
+
     def test_the_user_phase_runs_in_bash_whatever_the_login_shell(self, tmp_path):
         state, env = _setup_box(tmp_path)
         _run_setup(env)
@@ -1767,7 +1802,7 @@ class TestSetupShUnderRealBash:
         # I3: `dpkg -s` succeeds for a removed package whose config files
         # remain; only dpkg's "ii" is installed.
         state, env = _setup_box(tmp_path)
-        for pkg in ("tmux", "git", "curl", "python3", "ca-certificates"):
+        for pkg in NODE_PACKAGES:
             (state / "pkgs" / pkg).write_text("ii ", encoding="utf-8")
         (state / "pkgs" / "tmux").write_text("rc ", encoding="utf-8")
         r = _run_setup(env)
