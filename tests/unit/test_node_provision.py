@@ -327,9 +327,7 @@ class TestUserScopeSettingsAndMcp:
                 "accessToken": "mcp-docs-token",
             }
         }
-        assert scope.notes == (
-            "mcpOAuth: 1 entry for servers not in mcpServers left out",
-        )
+        assert scope.notes == ("mcpOAuth: 1 entry for servers not shipped left out",)
 
     def test_the_claude_login_never_enters_the_scope(self, tmp_path):
         home = _pc_home(
@@ -341,6 +339,7 @@ class TestUserScopeSettingsAndMcp:
 
 LOCAL = "PC-local: its url is a loopback or link-local address"
 PC_PATH = "its command is a path on this PC"
+NOT_A_NAME = "its command is not a plain program name"
 
 
 class TestHowEachServerIsClassified:
@@ -388,6 +387,42 @@ class TestHowEachServerIsClassified:
             ({"type": "http"}, "an http server with no url"),
             ({"type": "http", "url": "not a url"}, "its url has no host"),
             ("npx", "not an object"),
+            # Loopback spelled the ways a resolver still accepts (inet_aton
+            # forms, a root-dot FQDN, an IPv4-mapped IPv6 address).
+            ({"type": "http", "url": "http://localhost./mcp"}, LOCAL),
+            ({"type": "http", "url": "http://127.1:9100/mcp"}, LOCAL),
+            ({"type": "http", "url": "http://0x7f000001/mcp"}, LOCAL),
+            ({"type": "http", "url": "http://2130706433/mcp"}, LOCAL),
+            ({"type": "http", "url": "http://0/mcp"}, LOCAL),
+            ({"type": "http", "url": "http://[::ffff:127.0.0.1]/mcp"}, LOCAL),
+            ({"type": "http", "url": "https://dead.beef.example/mcp"}, None),
+            # A PC path anywhere in a word, in cwd, or behind whitespace/quotes.
+            (
+                {
+                    "type": "stdio",
+                    "command": "node",
+                    "args": ["--require=C:\\x\\h.js", "s.js"],
+                },
+                PC_PATH,
+            ),
+            (
+                {
+                    "type": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "x"],
+                    "cwd": "C:\\Users\\me\\proj",
+                },
+                PC_PATH,
+            ),
+            ({"type": "stdio", "command": "node", "args": [" C:\\x.js"]}, PC_PATH),
+            ({"type": "stdio", "command": '"C:/Program Files/x.exe"'}, PC_PATH),
+            (
+                {"type": "stdio", "command": "npx", "args": ["https://x.example/a"]},
+                None,
+            ),
+            # The node's `command -v` gets the first word: it must be a name.
+            ({"type": "stdio", "command": "npx;id"}, NOT_A_NAME),
+            ({"type": "stdio", "command": "$(id)"}, NOT_A_NAME),
         ],
     )
     def test_the_reason_a_server_stays_behind(self, spec, reason):
@@ -431,6 +466,18 @@ class TestDroppingWhatTheNodeLacks:
         scope = _scope(mcp_servers={"x": {"type": "stdio", "command": "npx"}})
         assert nodes.without_missing_programs(scope, found=frozenset({"npx"})) == scope
 
+    def test_a_command_that_is_not_a_program_name_is_never_probed_and_never_ships(
+        self,
+    ):
+        # A scope a wrapper (plan K) built without user_scope's filter.
+        scope = _scope(
+            mcp_servers={"x": {"type": "stdio", "command": "npx;id", "env": {"K": "S"}}}
+        )
+        assert nodes.stdio_programs(scope) == {}
+        kept = nodes.without_missing_programs(scope, found=frozenset({"npx;id"}))
+        assert kept.mcp_servers == {}
+        assert kept.notes == (f"mcp x: not shipped -- {NOT_A_NAME}",)
+
 
 # One decoy per credential shape the Claude login can take (D5): an API key, an
 # OAuth access token, an OAuth refresh token. Every test below plants them
@@ -438,6 +485,19 @@ class TestDroppingWhatTheNodeLacks:
 API_DECOY = "sk-ant-api03-DECOY-API"
 OAT_DECOY = "sk-ant-oat01-DECOY-OAT"
 ORT_DECOY = "sk-ant-ort01-DECOY-ORT"
+# Every settings.env / MCP env name that never ships: the Anthropic credential
+# variables, plus the switches and tokens of a non-Anthropic backend.
+BACKEND_ENV = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_VERTEX",
+)
 
 
 class TestTheClaudeLoginNeverShipsUnderAnyName:
@@ -471,6 +531,50 @@ class TestTheClaudeLoginNeverShipsUnderAnyName:
             "settings.env.ANTHROPIC_CUSTOM_HEADERS: never shipped",
             "settings.env.CLAUDE_CODE_OAUTH_TOKEN: never shipped",
         )
+
+    def test_the_deny_lists_are_exactly_these(self):
+        assert frozenset(BACKEND_ENV) == nodes.NEVER_SHIPPED_ENV
+        assert nodes.NEVER_SHIPPED_SETTINGS == (
+            "apiKeyHelper",
+            "awsAuthRefresh",
+            "awsCredentialExport",
+        )
+
+    def test_a_non_anthropic_backend_never_overrides_the_nodes_login(self, tmp_path):
+        # Bedrock/Vertex/Foundry switches and their tokens hold no sk-ant value,
+        # so only the name rule can keep them here (spec §7, D5).
+        home = _pc_home(
+            tmp_path,
+            settings={
+                "awsAuthRefresh": "aws sso login",
+                "awsCredentialExport": "~/bin/creds.sh",
+                "env": dict.fromkeys(BACKEND_ENV, "x") | {"KEEP": "1"},
+            },
+        )
+        scope = nodes.user_scope(home)
+        assert scope.settings == {"env": {"KEEP": "1"}}
+        assert scope.notes == (
+            "settings.awsAuthRefresh: never shipped",
+            "settings.awsCredentialExport: never shipped",
+            *(f"settings.env.{name}: never shipped" for name in sorted(BACKEND_ENV)),
+        )
+
+    @pytest.mark.parametrize("name", BACKEND_ENV)
+    def test_an_mcp_server_carrying_a_named_credential_in_its_env_stays_behind(
+        self, name
+    ):
+        spec = {"type": "stdio", "command": "npx", "env": {name: "gateway-token"}}
+        assert nodes.mcp_skip_reason(spec) == "it holds a Claude credential"
+
+    def test_a_named_credential_in_a_pc_bound_servers_env_keeps_the_transport_reason(
+        self,
+    ):
+        spec = {
+            "type": "stdio",
+            "command": "C:\\x\\srv.exe",
+            "env": {"ANTHROPIC_AUTH_TOKEN": "gateway-token"},
+        }
+        assert nodes.mcp_skip_reason(spec) == PC_PATH
 
     def test_an_env_name_holding_the_marker_is_never_echoed(self, tmp_path):
         # A decoy NAME with a benign value: the value rule reads keys too, so
@@ -599,7 +703,7 @@ class TestTheClaudeLoginNeverShipsUnderAnyName:
         }
         assert scope.notes == (
             "mcp llm: not shipped -- it holds a Claude credential",
-            "mcpOAuth: 1 entry for servers not in mcpServers left out",
+            "mcpOAuth: 1 entry for servers not shipped left out",
         )
         assert "DECOY" not in repr(scope)
 
@@ -636,6 +740,15 @@ class TestTheClaudeLoginNeverShipsUnderAnyName:
                     "OTHER": ORT_DECOY,
                 },
                 "permissions": {"allow": [f"Bash(curl -H {API_DECOY})"]},
+                "statusLine": {"type": "command", "command": f"s {ORT_DECOY}"},
+                "hooks": {
+                    "Stop": [
+                        {"hooks": [{"type": "command", "command": f"h {OAT_DECOY}"}]}
+                    ],
+                    f"Ev{API_DECOY}": [
+                        {"hooks": [{"type": "command", "command": "x"}]}
+                    ],
+                },
             },
             claude_json={
                 "oauthAccount": {"accessToken": OAT_DECOY},
@@ -648,17 +761,65 @@ class TestTheClaudeLoginNeverShipsUnderAnyName:
                         "headers": {"k": OAT_DECOY},
                     },
                     "b": {"type": "stdio", "command": "uvx", "env": {"T": ORT_DECOY}},
+                    "c": {"type": "http", "url": f"https://c.example/?k={API_DECOY}"},
+                    "d": {"type": "stdio", "command": "npx", "args": [OAT_DECOY]},
+                    f"srv-{ORT_DECOY}": {"type": "http", "url": "https://n.example"},
+                    "clean": {"type": "http", "url": "https://clean.example"},
                 },
                 "projects": {"C:/x": {"mcpServers": {"p": {"env": {"K": API_DECOY}}}}},
             },
             credentials={
                 "claudeAiOauth": CLAUDE_OAUTH_DECOY,
-                "mcpOAuth": {"a|0": {"serverName": "a", "accessToken": OAT_DECOY}},
+                "mcpOAuth": {
+                    "a|0": {"serverName": "a", "accessToken": OAT_DECOY},
+                    f"clean|{OAT_DECOY}": {"serverName": "clean", "accessToken": "ok"},
+                },
             },
         )
         scope = nodes.user_scope(home)
+        # Not vacuous: the one clean server still ships.
+        assert scope.mcp_servers == {
+            "clean": {"type": "http", "url": "https://clean.example"}
+        }
+        assert scope.mcp_oauth == {}
         assert "DECOY" not in repr(scope)
         assert "sk-ant-" not in repr(scope)
+        assert "sk-ant-" not in "\n".join(scope.notes)
+        assert (
+            "mcp (a name holding one): not shipped -- it holds a Claude credential"
+            in (scope.notes)
+        )
+        assert "mcpOAuth clean: holds a Claude credential, never shipped" in (
+            scope.notes
+        )
+
+    def test_an_oauth_entry_for_another_url_stays_behind(self, tmp_path):
+        # Same server name, a different issuer's url: a stale token, never shipped.
+        home = _pc_home(
+            tmp_path,
+            claude_json={
+                "mcpServers": {
+                    "docs": {"type": "http", "url": "https://docs.example/mcp"}
+                }
+            },
+            credentials={
+                "mcpOAuth": {
+                    "docs|0": {
+                        "serverName": "docs",
+                        "serverUrl": "https://old.example/mcp",
+                    },
+                    "docs|1": {
+                        "serverName": "docs",
+                        "serverUrl": "https://docs.example/mcp",
+                    },
+                }
+            },
+        )
+        scope = nodes.user_scope(home)
+        assert scope.mcp_oauth == {
+            "docs|1": {"serverName": "docs", "serverUrl": "https://docs.example/mcp"}
+        }
+        assert scope.notes == ("mcpOAuth docs: issued for another url, left out",)
 
 
 class TestAMalformedPcFileIsANoteNotACrash:
@@ -691,9 +852,54 @@ class TestAMalformedPcFileIsANoteNotACrash:
         )
         scope = nodes.user_scope(home)
         assert scope.mcp_oauth == {}
-        assert scope.notes == (
-            "mcpOAuth: 1 entry for servers not in mcpServers left out",
+        assert scope.notes == ("mcpOAuth: 1 entry for servers not shipped left out",)
+
+    def test_a_bom_written_by_a_windows_tool_is_read_through(self, tmp_path):
+        home = _pc_home(tmp_path)
+        (home / ".claude").mkdir()
+        (home / ".claude" / "settings.json").write_bytes(
+            b'\xef\xbb\xbf{"model": "opus"}'
         )
+        scope = nodes.user_scope(home)
+        assert scope.settings == {"model": "opus"}
+        assert scope.notes == ()
+
+    @pytest.mark.parametrize("depth", [65, 500, 100_000])
+    def test_a_file_nested_too_deep_is_refused_before_it_is_walked(
+        self, tmp_path, depth
+    ):
+        home = _pc_home(tmp_path)
+        (home / ".claude").mkdir()
+        (home / ".claude" / "settings.json").write_text(
+            '{"a":' * depth + "1" + "}" * depth, encoding="utf-8"
+        )
+        scope = nodes.user_scope(home)
+        assert scope.settings == {}
+        assert scope.notes == ("settings.json: nested deeper than 64 levels, skipped",)
+
+    def test_nesting_at_the_limit_still_ships(self, tmp_path):
+        home = _pc_home(tmp_path)
+        (home / ".claude").mkdir()
+        (home / ".claude" / "settings.json").write_text(
+            '{"a":' * 63 + "[1]" + "}" * 63, encoding="utf-8"
+        )
+        scope = nodes.user_scope(home)
+        assert scope.notes == ()
+        assert "a" in scope.settings
+
+    def test_an_unreadable_file_without_an_os_message(self, tmp_path, monkeypatch):
+        home = _pc_home(tmp_path, settings={"model": "opus"})
+        real = type(home).read_text
+
+        def read_text(self: Path, *args: object, **kwargs: object) -> str:
+            if self.name == "settings.json":
+                raise OSError
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(type(home), "read_text", read_text)
+        scope = nodes.user_scope(home)
+        assert scope.settings == {}
+        assert scope.notes == ("settings.json: unreadable (OSError), skipped",)
 
 
 class TestUserScopePluginsAndSkills:

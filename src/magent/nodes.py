@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import socket
 import stat
 import tempfile
 import threading
@@ -146,20 +147,28 @@ class LoadSample:
 
 
 # What provisioning never copies to a node, whatever this PC's settings say
-# (spec §8, D5): a key or token in settings.env would log the node in AS this
-# PC (ANTHROPIC_CUSTOM_HEADERS can carry an auth header), and apiKeyHelper
-# names a local credential program. Exact names: every other ANTHROPIC_* /
-# CLAUDE_* entry (a base URL, a model) is user configuration and ships -- the
-# value rule below still catches any of them that holds a credential.
+# (spec §7-8, D5). By exact name, in settings.env AND in every MCP server's env:
+# a key or token would log the node in AS this PC (ANTHROPIC_CUSTOM_HEADERS can
+# carry an auth header), and a non-Anthropic backend's switch or token
+# (Bedrock, Vertex, Foundry) would override the node user's own login. Every
+# other ANTHROPIC_* / CLAUDE_* entry (a base URL, a model) is user
+# configuration and ships -- the value rule below still catches any of them
+# that holds a credential.
 NEVER_SHIPPED_ENV = frozenset(
     {
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_CUSTOM_HEADERS",
+        "ANTHROPIC_FOUNDRY_API_KEY",
+        "AWS_BEARER_TOKEN_BEDROCK",
         "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CODE_USE_VERTEX",
     }
 )
-NEVER_SHIPPED_SETTINGS = ("apiKeyHelper",)
+# Settings that name a local credential program.
+NEVER_SHIPPED_SETTINGS = ("apiKeyHelper", "awsAuthRefresh", "awsCredentialExport")
 # A Claude credential matched by VALUE, wherever it sits (sk-ant-api...,
 # sk-ant-oat..., sk-ant-ort..., sk-ant-admin...): the name rules above cannot
 # see one pasted under another name -- a hook command, an MCP server's env or
@@ -177,6 +186,10 @@ SKILLS_EXCLUDED_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv"
 # -- a folder or a single file, linked or not -- is read from inside one.
 # Defence in depth, not containment: a link anywhere else still ships.
 SECRET_HOME_DIRS = (".ssh", ".gnupg", ".aws", ".config/gh", ".kube", ".docker")
+# A PC file nested deeper than this is refused whole, before anything walks it
+# (deepcopy and the credential scan recurse; a hostile or corrupt file must
+# not crash provisioning). Claude Code's own files are a handful of levels.
+MAX_JSON_DEPTH = 64
 
 
 @dataclass(frozen=True)
@@ -239,25 +252,53 @@ class UserScope:
 def _read_object(path: Path, label: str, notes: list[str]) -> dict[str, object]:
     """``path`` as a JSON object; {} when absent. Unreadable or malformed is a
     note, never an exception -- provisioning must not die on a PC file."""
+    too_deep = f"{label}: nested deeper than {MAX_JSON_DEPTH} levels, skipped"
     try:
-        text = path.read_text(encoding="utf-8")
+        # utf-8-sig: a Windows tool may have written a BOM.
+        text = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return {}
     except OSError as e:
-        notes.append(f"{label}: unreadable ({e.strerror}), skipped")
+        reason = e.strerror or type(e).__name__
+        notes.append(f"{label}: unreadable ({reason}), skipped")
         return {}
     except UnicodeDecodeError:
         notes.append(f"{label}: not valid UTF-8, skipped")
         return {}
     try:
         raw = json.loads(text)
+    except RecursionError:
+        notes.append(too_deep)
+        return {}
     except ValueError:
         notes.append(f"{label}: not valid JSON, skipped")
+        return {}
+    if _nests_deeper_than(raw, MAX_JSON_DEPTH):
+        notes.append(too_deep)
         return {}
     if not isinstance(raw, dict):
         notes.append(f"{label}: not a JSON object, skipped")
         return {}
     return raw
+
+
+def _nests_deeper_than(value: object, limit: int) -> bool:
+    """True when ``value`` nests objects/arrays more than ``limit`` levels deep.
+    An explicit stack, so the check itself cannot overflow."""
+    stack: list[tuple[object, int]] = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        children: list[object]
+        if isinstance(item, dict):
+            children = list(item.values())
+        elif isinstance(item, list):
+            children = list(item)
+        else:
+            continue
+        if depth > limit:
+            return True
+        stack.extend((child, depth + 1) for child in children)
+    return False
 
 
 def _is_local_state_hook(hook: object) -> bool:
@@ -370,21 +411,45 @@ def _shippable_settings(raw: dict[str, object], notes: list[str]) -> dict[str, o
     return settings
 
 
+# A host a resolver may still read as an IPv4 address in inet_aton's short
+# forms (127.1, 0x7f000001, 2130706433, 0). Checked before calling it, so a
+# plain DNS name never reaches inet_aton.
+_INET_ATON_SHAPE = re.compile(r"[0-9a-fx.]+")
+
+
 def _is_pc_local_host(host: str) -> bool:
     """Loopback, unspecified or link-local: an address that names THIS PC (or
-    its own link), never the node's view of it."""
+    its own link), never the node's view of it -- however it is spelled (a
+    root-dot FQDN, an inet_aton short form, an IPv4-mapped IPv6 address)."""
+    host = host.lower()
+    if host.endswith("."):
+        host = host[:-1]
     if host == "localhost" or host.endswith(".localhost"):
         return True
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
-        return False
+        if not _INET_ATON_SHAPE.fullmatch(host):
+            return False
+        try:
+            address = ipaddress.IPv4Address(socket.inet_aton(host))
+        except OSError:
+            return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
     return address.is_loopback or address.is_unspecified or address.is_link_local
 
 
-# A Windows drive path (C:\ or C:/) or a UNC path. Such a command or argument
-# names a file on this PC; it is never guessed down to a basename.
-_PC_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+# A Windows drive path (C:\ or C:/) or a UNC path, at the start of a word or
+# after a separator (--require=C:\x, a quote, a space). Such a command,
+# argument or cwd names a file on this PC; it is never guessed down to a
+# basename.
+_PC_PATH = re.compile(r"(?:^|[=\s,;\"'])(?:[A-Za-z]:[\\/]|\\\\)")
+# What the node's `command -v` may be asked about: a plain program name or
+# path, nothing a shell would read as syntax.
+_PLAIN_PROGRAM = re.compile(r"[A-Za-z0-9._+/-]+")
+_NOT_A_PROGRAM = "its command is not a plain program name"
 
 
 def _kind(spec: dict[str, object]) -> str:
@@ -412,9 +477,18 @@ def mcp_skip_reason(spec: object) -> str | None:
     That check runs LAST, so a server the transport rules already hold back
     keeps its transport reason -- the relay (plan K) keys on it."""
     reason = _transport_skip_reason(spec)
-    if reason is None and _holds_claude_credential(spec):
+    if reason is None and (
+        _holds_claude_credential(spec) or _env_names_a_credential(spec)
+    ):
         return "it holds a Claude credential"
     return reason
+
+
+def _env_names_a_credential(spec: object) -> bool:
+    """True when an MCP server's ``env`` sets a NEVER_SHIPPED_ENV name -- a
+    gateway token or a backend switch holds no sk-ant value to match."""
+    env = spec.get("env") if isinstance(spec, dict) else None
+    return isinstance(env, dict) and any(k in NEVER_SHIPPED_ENV for k in env)
 
 
 def _transport_skip_reason(spec: object) -> str | None:
@@ -427,11 +501,16 @@ def _transport_skip_reason(spec: object) -> str | None:
         if not isinstance(command, str) or not command.strip():
             return "a stdio server with no command"
         args = spec.get("args")
-        words = [command.strip()]
+        cwd = spec.get("cwd")
+        words = [command]
         if isinstance(args, list):
             words += [a for a in args if isinstance(a, str)]
-        if any(_PC_PATH.match(word) for word in words):
+        if isinstance(cwd, str):
+            words.append(cwd)
+        if any(_PC_PATH.search(word.strip().lstrip("\"'")) for word in words):
             return "its command is a path on this PC"
+        if not _PLAIN_PROGRAM.fullmatch(command.split()[0]):
+            return _NOT_A_PROGRAM
         return None
     url = spec.get("url")
     if not isinstance(url, str) or not url:
@@ -447,15 +526,26 @@ def _transport_skip_reason(spec: object) -> str | None:
     return None
 
 
+def _program(spec: object) -> str | None:
+    """A stdio server's program -- the first word of its ``command`` -- or
+    None for anything that is not a stdio server with a command."""
+    if isinstance(spec, dict) and _kind(spec) == "stdio":
+        command = spec.get("command")
+        if isinstance(command, str) and command.split():
+            return command.split()[0]
+    return None
+
+
 def stdio_programs(scope: UserScope) -> dict[str, str]:
     """{server name: program} for every stdio server left in ``scope`` -- the
-    first word of its ``command``, which the node must resolve."""
+    first word of its ``command``, which the node must resolve. A word that is
+    not a plain program name is never offered to the node's ``command -v``;
+    ``without_missing_programs`` drops that server instead."""
     programs: dict[str, str] = {}
     for name, spec in scope.mcp_servers.items():
-        if isinstance(spec, dict) and _kind(spec) == "stdio":
-            command = spec.get("command")
-            if isinstance(command, str) and command.split():
-                programs[name] = command.split()[0]
+        program = _program(spec)
+        if program is not None and _PLAIN_PROGRAM.fullmatch(program):
+            programs[name] = program
     return programs
 
 
@@ -463,38 +553,43 @@ def without_missing_programs(
     scope: UserScope, *, found: frozenset[str], unprobed: bool = False
 ) -> UserScope:
     """``scope`` minus every stdio server whose program is not in ``found``
-    (what the node's ``command -v`` resolved), with its mcpOAuth entries and a
-    note per server. Runs BEFORE the payload is built, so a dropped server's
-    ``env`` never leaves this PC. ``unprobed``: the probe failed, so the note
-    says the program is unconfirmed -- never that the node lacks it."""
-    missing = {
-        name: program
-        for name, program in stdio_programs(scope).items()
-        if program not in found
-    }
-    if not missing:
+    (what the node's ``command -v`` resolved) or is not a plain program name,
+    with its mcpOAuth entries and a note per server. Runs BEFORE the payload is
+    built, so a dropped server's ``env`` never leaves this PC. ``unprobed``: the
+    probe failed, so the note says the program is unconfirmed -- never that
+    the node lacks it."""
+    dropped: dict[str, str] = {}
+    for name, spec in scope.mcp_servers.items():
+        program = _program(spec)
+        if program is None:
+            continue
+        if not _PLAIN_PROGRAM.fullmatch(program):
+            dropped[name] = _NOT_A_PROGRAM
+        elif program not in found:
+            dropped[name] = (
+                f"the node's program probe failed, so `{program}` is unconfirmed"
+                if unprobed
+                else f"`{program}` is not on the node (command -v)"
+            )
+    if not dropped:
         return scope
     return replace(
         scope,
-        mcp_servers={n: s for n, s in scope.mcp_servers.items() if n not in missing},
+        mcp_servers={n: s for n, s in scope.mcp_servers.items() if n not in dropped},
         mcp_oauth={
             k: e
             for k, e in scope.mcp_oauth.items()
-            if not (isinstance(e, dict) and e.get("serverName") in missing)
+            if not (
+                isinstance(e, dict)
+                and isinstance(e.get("serverName"), str)
+                and e.get("serverName") in dropped
+            )
         },
         notes=(
             *scope.notes,
             *(
-                (
-                    f"mcp {name}: not shipped -- the node's program probe failed, "
-                    f"so `{program}` is unconfirmed"
-                )
-                if unprobed
-                else (
-                    f"mcp {name}: not shipped -- `{program}` is not on the node "
-                    "(command -v)"
-                )
-                for name, program in sorted(missing.items())
+                f"mcp {_named(name)}: not shipped -- {reason}"
+                for name, reason in sorted(dropped.items())
             ),
         ),
     )
@@ -522,27 +617,40 @@ def _mcp_servers(claude_json: dict[str, object], notes: list[str]) -> dict[str, 
 def _mcp_oauth(
     credentials: dict[str, object], servers: dict[str, object], notes: list[str]
 ) -> dict[str, object]:
-    """The ``mcpOAuth`` entries of servers that ship. ``claudeAiOauth`` -- the
-    Claude login, single-holder (D5) -- is never read, and an entry that holds
-    a Claude credential stays behind with a note."""
+    """The ``mcpOAuth`` entries of servers that ship, joined on ``serverName``
+    AND ``serverUrl`` (absent, or equal to the shipped server's url -- a token
+    another issuer granted under the same name is stale). ``claudeAiOauth``,
+    the Claude login (single-holder, D5), is read with the file but never
+    copied, and an entry that holds a Claude credential stays behind."""
     raw = credentials.get("mcpOAuth")
     if not isinstance(raw, dict):
         return {}
     kept: dict[str, object] = {}
-    held = 0
+    noted = 0
     for key, entry in raw.items():
-        server = entry.get("serverName") if isinstance(entry, dict) else None
-        if not isinstance(server, str) or server not in servers:
+        if not isinstance(entry, dict):
+            continue
+        server = entry.get("serverName")
+        spec = servers.get(server) if isinstance(server, str) else None
+        if spec is None:
             continue
         if _holds_claude_credential(key) or _holds_claude_credential(entry):
-            held += 1
-            notes.append(f"mcpOAuth {server}: holds a Claude credential, never shipped")
+            noted += 1
+            notes.append(
+                f"mcpOAuth {_named(server)}: holds a Claude credential, never shipped"
+            )
+            continue
+        issued_for = entry.get("serverUrl")
+        shipped_url = spec.get("url") if isinstance(spec, dict) else None
+        if issued_for is not None and issued_for != shipped_url:
+            noted += 1
+            notes.append(f"mcpOAuth {_named(server)}: issued for another url, left out")
             continue
         kept[key] = entry
-    left = len(raw) - len(kept) - held
+    left = len(raw) - len(kept) - noted
     if left:
         noun = "entry" if left == 1 else "entries"
-        notes.append(f"mcpOAuth: {left} {noun} for servers not in mcpServers left out")
+        notes.append(f"mcpOAuth: {left} {noun} for servers not shipped left out")
     return kept
 
 
