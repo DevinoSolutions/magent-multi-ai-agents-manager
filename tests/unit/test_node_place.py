@@ -25,7 +25,14 @@ import time
 import pytest
 
 from magent import launch, nodes, remote_mux
-from magent.config import NODE_AUTO, NODE_CLOUD, ProjectConfig
+from magent.config import (
+    NODE_AUTO,
+    NODE_CLOUD,
+    MagentConfig,
+    NodeConfig,
+    ProjectConfig,
+    Settings,
+)
 from magent.launch import RunOpts
 from magent.nodes import LoadSample
 from tests.unit._node_fixtures import NOW, entry, pool, seed_history
@@ -814,9 +821,86 @@ class TestTheLaunchPhase:
             "api: 'fourth' is no longer in settings.nodes; re-placed on 'second'"
         ]
 
+    def test_a_kept_placement_does_not_count_toward_the_spread(self, remote_samples):
+        # api's session already runs on second and shows in its my_sessions:
+        # counting it in the pass's spread too would push web off an equal node.
+        nodes.update_node_map("api", entry("second"))
+        seed_history("second", "quiet")
+        seed_history("third", "quiet")
+        config = pool("second", "third", projects=[_auto("api"), _auto("web")])
+
+        placed = launch.place_node_projects(config, config.projects, now=NOW)
+
+        assert [p.node for p in placed.projects] == ["second", "second"]
+        assert placed.placements["api"].reason == "kept"
+
+    def test_a_dry_run_note_names_the_nodes_that_would_be_read_live(
+        self, remote_samples
+    ):
+        config = pool("second", "third", projects=[_auto("api")])
+
+        placed = launch.place_node_projects(
+            config, config.projects, live=False, now=NOW
+        )
+
+        assert placed.notes == [
+            (
+                "api: not launched -- dry run: second, third would take a live"
+                ' reading at launch; pin a node with "node": "<nick>"'
+            )
+        ]
+
+    def test_a_failed_live_reading_is_not_fatal_and_is_named(
+        self, remote_samples, monkeypatch
+    ):
+        def _unreachable(node):
+            raise remote_mux.RemoteError(255, "x", ("ssh",))
+
+        monkeypatch.setattr(remote_mux, "sample", _unreachable)
+        seed_history("third", "sparse")
+        config = pool("third", projects=[_auto("api")])
+
+        placed = launch.place_node_projects(config, config.projects, now=NOW)
+
+        assert placed.projects == []
+        assert placed.notes == [
+            (
+                "api: not launched -- live reading failed for third"
+                " (see ~/.magent/logs/launch.log);"
+                ' pin a node with "node": "<nick>"'
+            )
+        ]
+
+    def test_a_node_that_cannot_be_resolved_is_not_fatal(
+        self, remote_samples, monkeypatch
+    ):
+        # settings.nodes.third.user is unset and magent runs as root: D4 refuses
+        # to derive a login, so node_for_nick raises before any dial.
+        monkeypatch.setattr("magent.env.local_username", lambda: "root")
+        seed_history("third", "sparse")
+        config = MagentConfig(
+            projects=[_auto("api")],
+            settings=Settings(
+                nodes={"third": NodeConfig(nick="third", host="devino-third")}
+            ),
+        )
+
+        placed = launch.place_node_projects(config, config.projects, now=NOW)
+
+        assert remote_samples == []
+        assert placed.projects == []
+        assert any(
+            "live reading failed for third" in n and '"node": "<nick>"' in n
+            for n in placed.notes
+        )
+
 
 class _StopBeforeLaunch(Exception):
     pass
+
+
+def _stop_before_launch(*_a):
+    raise _StopBeforeLaunch
 
 
 class TestRunMagentPlacesBeforeItLaunches:
@@ -853,3 +937,24 @@ class TestRunMagentPlacesBeforeItLaunches:
             launch.run_magent(config, RunOpts(dry_run=True))
 
         assert '"node": "<nick>"' in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        ("opts", "live_reads"),
+        [
+            pytest.param(RunOpts(dry_run=True), [], id="dry-run-reads-nothing"),
+            pytest.param(RunOpts(tile_only=True), [], id="tile-only-reads-nothing"),
+            pytest.param(RunOpts(), ["third"], id="a-real-launch-reads-the-thin-node"),
+        ],
+    )
+    def test_only_a_real_launch_takes_a_live_reading(
+        self, fake_platform, monkeypatch, remote_samples, opts, live_reads
+    ):
+        seed_history("second", "quiet", now=time.time() + 30)
+        seed_history("third", "sparse", now=time.time() + 30)
+        monkeypatch.setattr(launch, "_launch_projects", _stop_before_launch)
+        config = pool("second", "third", projects=[_auto("api")])
+
+        with pytest.raises(_StopBeforeLaunch):
+            launch.run_magent(config, opts)
+
+        assert remote_samples == live_reads
