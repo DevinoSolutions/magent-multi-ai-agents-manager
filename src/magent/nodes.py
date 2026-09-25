@@ -152,6 +152,11 @@ LOCAL_STATE_HOOK_MARKERS = ("magent-state-hook", "magent.state_hook")
 # syncs its own. The rest are tool droppings, never part of a skill.
 SKILLS_EXCLUDED_TOP = frozenset({"synced"})
 SKILLS_EXCLUDED_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv"})
+# Folders under the PC's home that hold keys and logins: ssh, gpg, AWS, gh,
+# kubectl, docker. No skill lives in one, so nothing the skills walk reaches
+# -- a folder or a single file, linked or not -- is read from inside one.
+# Defence in depth, not containment: a link anywhere else still ships.
+SECRET_HOME_DIRS = (".ssh", ".gnupg", ".aws", ".config/gh", ".kube", ".docker")
 
 
 @dataclass(frozen=True)
@@ -587,19 +592,46 @@ def _marketplaces(
 _CREDENTIAL_BYTES = CLAUDE_CREDENTIAL_MARKER.encode("ascii")
 
 
-def _above(parent: str, child: str) -> bool:
-    """``parent`` is a strict ancestor of ``child`` (both absolute; never
-    equal). Paths on different Windows drives share no ancestor."""
+def _real(path: str | Path) -> str:
+    """``path`` with every link resolved, in the case the OS compares by."""
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _within(parent: str, child: str) -> bool:
+    """``child`` is ``parent`` or below it (both absolute), compared by path
+    component -- ``C:\\Users\\amind2`` is not inside ``C:\\Users\\amind`` --
+    and by case where the OS ignores it. Paths on different Windows drives
+    share nothing."""
     parent, child = os.path.normcase(parent), os.path.normcase(child)
-    if parent == child:
-        return False
     try:
         return os.path.commonpath([parent, child]) == parent
     except ValueError:
         return False
 
 
-def _skills(root: Path, notes: list[str]) -> tuple[SkillFile, ...]:
+def _above(parent: str, child: str) -> bool:
+    """``parent`` is a strict ancestor of ``child`` (see ``_within``)."""
+    return os.path.normcase(parent) != os.path.normcase(child) and _within(
+        parent, child
+    )
+
+
+def _in_secret_dir(
+    rel_path: str, target: str, secrets: Sequence[str], notes: list[str]
+) -> bool:
+    """``target`` (resolved) is inside one of ``secrets``: noted, WARNING
+    logged, and True so the caller skips it."""
+    if not any(_within(s, target) for s in secrets):
+        return False
+    name = _named(rel_path)
+    notes.append(f"skills/{name}: resolves into a secrets folder, not followed")
+    _log.warning(
+        "skills/%s resolves to %s, a secrets folder: not followed", name, target
+    )
+    return True
+
+
+def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     """Every file under ``~/.claude/skills``, symlinks followed once, sorted by
     path. A file is executable if its mode says so OR it starts with ``#!`` --
     a Windows PC has no exec bit to read. A file whose bytes (or path) hold a
@@ -608,18 +640,28 @@ def _skills(root: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     purpose: a link in ``skills`` is one the user made (a repo checked out
     elsewhere is the main case), so it is not contained to the root.
 
-    The one link never followed points ABOVE the skills folder -- at
-    ``~/.claude``, at ``~``, at ``/``: that is no skill, it is the walk
-    reading the whole home (``~/.ssh`` included). It is pruned with a note
-    and a WARNING naming it; so is a skills folder that is itself such a
-    link. One real directory linked under two names ships once, under the
-    name the sorted, depth-first walk reaches first."""
+    Two kinds of target are never followed, each pruned with a note and a
+    WARNING naming the link. A folder ABOVE the skills folder -- ``~/.claude``,
+    ``~``, ``/`` -- is no skill: it is the walk reading the whole home. And
+    nothing inside one of ``home``'s ``SECRET_HOME_DIRS`` is read, folder or
+    single file, however it was reached. Both sides of every comparison are
+    resolved first, so a ``~/.ssh`` that is itself a junction elsewhere
+    (OneDrive setups) is still recognised. A skills folder that is itself
+    such a link ships nothing.
+
+    That is defence in depth, NOT containment: a link to any other folder
+    (``~/private-notes``) ships what it holds, deliberately -- the user put
+    it there. One real directory linked under two names ships once, under
+    the name the sorted, depth-first walk reaches first."""
     if not root.is_dir():
         return ()
-    anchors = (os.path.abspath(root), os.path.realpath(root))
-    if _above(anchors[1], anchors[0]):
-        notes.append("skills: links to a folder above itself, not followed")
-        _log.warning("%s links to %s, above itself: not followed", root, anchors[1])
+    # The unresolved root counts too: with ~/.claude a junction elsewhere, a
+    # link to ~ is above the path the user sees, not the resolved one.
+    anchors = (os.path.normcase(os.path.abspath(root)), _real(root))
+    secrets = tuple(_real(home / d) for d in SECRET_HOME_DIRS)
+    if _above(anchors[1], anchors[0]) or any(_within(s, anchors[1]) for s in secrets):
+        notes.append("skills: links to a folder it must not read, not followed")
+        _log.warning("%s links to %s: not followed", root, anchors[1])
         return ()
     if any((root / top).exists() for top in SKILLS_EXCLUDED_TOP):
         notes.append("skills/synced: claude.ai-managed copies, not shipped")
@@ -639,7 +681,7 @@ def _skills(root: Path, notes: list[str]) -> tuple[SkillFile, ...]:
                 rel == Path() and d in SKILLS_EXCLUDED_TOP
             ):
                 continue
-            target = os.path.realpath(here / d)
+            target = _real(here / d)
             if any(_above(target, anchor) for anchor in anchors):
                 name = _named((rel / d).as_posix())
                 notes.append(
@@ -652,11 +694,15 @@ def _skills(root: Path, notes: list[str]) -> tuple[SkillFile, ...]:
                     target,
                 )
                 continue
+            if _in_secret_dir((rel / d).as_posix(), target, secrets, notes):
+                continue
             kept.append(d)
         dirnames[:] = kept
         for name in sorted(filenames):
             path = here / name
             rel_path = (rel / name).as_posix()
+            if _in_secret_dir(rel_path, _real(path), secrets, notes):
+                continue
             try:
                 data = path.read_bytes()
                 mode = path.stat().st_mode
@@ -708,7 +754,7 @@ def user_scope(home: Path) -> UserScope:
         mcp_oauth=oauth,
         plugins=plugins,
         marketplaces=_marketplaces(plugins, raw_settings, known, notes),
-        skills=_skills(claude / "skills", notes),
+        skills=_skills(claude / "skills", home, notes),
         notes=tuple(notes),
     )
 

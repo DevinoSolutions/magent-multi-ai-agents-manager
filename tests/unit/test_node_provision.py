@@ -106,6 +106,17 @@ def _link_dir(link: Path, target: Path) -> None:
         link.symlink_to(target, target_is_directory=True)
 
 
+def _link_file(link: Path, target: Path) -> None:
+    """A file symlink; Windows allows one only with Developer Mode or the
+    privilege, so there the test skips when it cannot make one."""
+    try:
+        link.symlink_to(target)
+    except OSError as e:
+        if sys.platform != "win32":
+            raise
+        pytest.skip(f"no file symlink here ({e.strerror})")
+
+
 class TestUserScopeSettingsAndMcp:
     def test_an_empty_home_ships_nothing(self, tmp_path):
         assert nodes.user_scope(_pc_home(tmp_path)) == _scope()
@@ -813,8 +824,23 @@ class TestUserScopePluginsAndSkills:
         assert nodes._above(tmp_path.anchor, skills)
         assert nodes._above(str(tmp_path / "pc"), skills)
         assert not nodes._above(skills, skills)
-        assert not nodes._above(str(tmp_path / "pc2"), skills)
         assert not nodes._above(skills + os.sep + "x", skills)
+
+    # By path component, never by string prefix.
+    def test_a_sibling_sharing_a_name_prefix_is_not_an_ancestor(self, tmp_path):
+        inside = str(tmp_path / "amind2" / ".claude" / "skills")
+        assert not nodes._above(str(tmp_path / "amind"), inside)
+        assert not nodes._within(str(tmp_path / "amind"), inside)
+        assert nodes._within(str(tmp_path / "amind2"), inside)
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="drive letters are Windows'")
+    def test_drive_letter_case_is_ignored_and_another_drive_shares_nothing(self):
+        assert nodes._above("c:\\Users\\Amin", "C:\\users\\amin\\.claude\\skills")
+        assert nodes._within("C:\\Users\\amin\\.SSH", "c:\\users\\AMIN\\.ssh\\id")
+        assert not nodes._above("c:\\users\\amin", "C:\\Users\\Amin")  # the same
+        # commonpath raises ValueError across drives: that is "no ancestor".
+        assert not nodes._above("D:\\", "C:\\Users\\amin\\.claude\\skills")
+        assert not nodes._within("D:\\Users\\amin", "C:\\Users\\amin")
 
     def test_a_skills_folder_that_is_itself_a_link_above_ships_nothing(
         self, tmp_path, caplog
@@ -827,8 +853,100 @@ class TestUserScopePluginsAndSkills:
         caplog.set_level("WARNING")
         scope = nodes.user_scope(home)
         assert scope.skills == ()
-        assert scope.notes == ("skills: links to a folder above itself, not followed",)
-        assert "above itself" in caplog.text
+        assert scope.notes == (
+            "skills: links to a folder it must not read, not followed",
+        )
+        assert "not followed" in caplog.text
+
+    # Defence in depth beside the ancestor rule: nothing inside a well-known
+    # secrets folder under the scope's home is read, a folder or one file.
+    @pytest.mark.parametrize(
+        "secret", [*nodes.SECRET_HOME_DIRS, ".aws/sso"], ids=lambda s: s
+    )
+    def test_a_link_into_a_secrets_folder_is_pruned_with_a_warning(
+        self, tmp_path, caplog, secret
+    ):
+        home = _pc_home(tmp_path)
+        skills = home / ".claude" / "skills"
+        (skills / "deploy").mkdir(parents=True)
+        (skills / "deploy" / "SKILL.md").write_bytes(b"# deploy\n")
+        (home / secret).mkdir(parents=True)
+        (home / secret / "key").write_bytes(b"TOPSECRET\n")
+        _link_dir(skills / "x", home / secret)
+        caplog.set_level("WARNING")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["deploy/SKILL.md"]
+        assert scope.notes == (
+            "skills/x: resolves into a secrets folder, not followed",
+        )
+        assert "skills/x resolves to" in caplog.text
+
+    # os.walk lists a file symlink under filenames, so a folder-only prune
+    # would read the key. Needs a file symlink: Developer Mode on Windows.
+    def test_a_linked_key_file_is_pruned_with_a_warning(self, tmp_path, caplog):
+        home = _pc_home(tmp_path)
+        skill = home / ".claude" / "skills" / "x"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_bytes(b"# x\n")
+        (home / ".ssh").mkdir()
+        (home / ".ssh" / "id_ed25519").write_bytes(b"TOPSECRET-ssh\n")
+        _link_file(skill / "key", home / ".ssh" / "id_ed25519")
+        caplog.set_level("WARNING")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["x/SKILL.md"]
+        assert scope.notes == (
+            "skills/x/key: resolves into a secrets folder, not followed",
+        )
+        assert "skills/x/key resolves to" in caplog.text
+
+    # Both sides are resolved: a ~/.ssh that is itself a junction elsewhere
+    # (OneDrive setups) still names the folder a skills link lands in.
+    def test_a_secrets_folder_that_is_itself_a_link_is_still_recognised(self, tmp_path):
+        home = _pc_home(tmp_path)
+        skills = home / ".claude" / "skills"
+        skills.mkdir(parents=True)
+        keys = tmp_path / "synced" / "keys"
+        keys.mkdir(parents=True)
+        (keys / "id_ed25519").write_bytes(b"TOPSECRET-ssh\n")
+        _link_dir(home / ".ssh", keys)
+        _link_dir(skills / "x", keys)
+        scope = nodes.user_scope(home)
+        assert scope.skills == ()
+        assert scope.notes == (
+            "skills/x: resolves into a secrets folder, not followed",
+        )
+
+    # The check runs on every folder the walk reaches, not only on links: a
+    # link to ~/.config ships its tools' files and never ~/.config/gh.
+    def test_a_link_to_a_folder_holding_a_secrets_folder_skips_only_that(
+        self, tmp_path
+    ):
+        home = _pc_home(tmp_path)
+        skills = home / ".claude" / "skills"
+        skills.mkdir(parents=True)
+        (home / ".config" / "tool").mkdir(parents=True)
+        (home / ".config" / "tool" / "a.md").write_bytes(b"a\n")
+        (home / ".config" / "gh").mkdir()
+        (home / ".config" / "gh" / "hosts.yml").write_bytes(b"TOPSECRET-gh\n")
+        _link_dir(skills / "cfg", home / ".config")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["cfg/tool/a.md"]
+        assert scope.notes == (
+            "skills/cfg/gh: resolves into a secrets folder, not followed",
+        )
+
+    # The boundary, so nobody reads the rules above as containment: a link to
+    # any other folder ships what it holds (ruling A -- the user made it).
+    def test_a_link_to_another_private_folder_still_ships(self, tmp_path):
+        home = _pc_home(tmp_path)
+        skills = home / ".claude" / "skills"
+        skills.mkdir(parents=True)
+        (home / "private-notes").mkdir()
+        (home / "private-notes" / "n.md").write_bytes(b"mine\n")
+        _link_dir(skills / "notes", home / "private-notes")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["notes/n.md"]
+        assert scope.notes == ()
 
     def test_one_real_folder_under_two_names_ships_once_under_the_first(self, tmp_path):
         home = _pc_home(tmp_path)
@@ -1258,6 +1376,16 @@ class TestProvision:
         assert call.argv[-1] == _remote(
             "bash", "-s", "--", remote_mux.SOCKET, "--force"
         )
+
+    # node_apply survives a PC that hangs up by going quiet on a dead stdout
+    # (F10). A SIGHUP would still kill it mid-step, and sshd sends one only
+    # to a pty session -- so provisioning must never ask for one.
+    def test_provisioning_never_asks_for_a_tty(self, fake_ssh):
+        remote_mux.provision(NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S)
+        (call,) = fake_ssh.calls()
+        options = call.argv[: call.argv.index(NODE.target)]
+        assert not {"-t", "-tt"} & set(options)
+        assert not any(o.lower().startswith("requesttty") for o in options)
 
     def test_the_verdicts_lead_the_report_one_line_per_server(self, fake_ssh):
         fake_ssh.set_reply(
