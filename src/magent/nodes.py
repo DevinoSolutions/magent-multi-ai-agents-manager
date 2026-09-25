@@ -28,7 +28,7 @@ from magent.sessions.claude import encode_claude_project_path
 from magent.titles import get_leaf_name
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
     from magent.config import MagentConfig, ProjectConfig
 
@@ -871,4 +871,135 @@ def recipe_for(
         memory_dir=memory if memory.is_dir() else None,
         remote_root=remote_root,
         warnings=(*repo_warnings, *push_warned),
+    )
+
+
+# --- placement for "node": "auto" (spec §11) -----------------------------------
+
+# The auto sentinel is config.NODE_AUTO (B, DECISION-10/22); nodes has no copy.
+# "cloud" is never a candidate: config refuses a pool entry named "cloud", so
+# `place`, which only walks settings.nodes, cannot reach it.
+PLACEMENT_WINDOW_S = 30 * 60
+MIN_WINDOW_SAMPLES = 5
+SPIKE_WEIGHT = 0.5
+SPIKE_RATIO = 1.5
+MEM_WEIGHT = 0.5
+MEM_FLOOR = 0.15
+# DECISION-11: under 10 % free (newest sample) a node is not eligible at all
+# while any other node is above it -- the soft MEM term alone is at most 0.075.
+MEM_HARD_FLOOR = 0.10
+SESSION_WEIGHT = 0.05
+
+
+@dataclass(frozen=True)
+class NodeScore:
+    """One node's §11 score and the terms it is made of (``node plan`` prints
+    every one of them). ``live`` marks a score taken from a live sample;
+    ``below_floor`` a node under ``MEM_HARD_FLOOR`` free memory."""
+
+    nick: str
+    samples: int
+    p75: float
+    spike: float
+    mem: float
+    my_sessions: int
+    score: float
+    live: bool = False
+    below_floor: bool = False
+
+
+def _load_sample(line: str) -> LoadSample | None:
+    try:
+        row = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(row, dict):
+        return None
+    try:
+        sample = LoadSample(
+            ts=float(row["ts"]),
+            nproc=int(row["nproc"]),
+            load1=float(row["load1"]),
+            load5=float(row["load5"]),
+            load15=float(row["load15"]),
+            mem_total_mb=int(row["mem_total_mb"]),
+            mem_avail_mb=int(row["mem_avail_mb"]),
+            my_sessions=int(row["my_sessions"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    return sample
+
+
+def parse_load_lines(lines: Iterable[str]) -> list[LoadSample]:
+    """LoadSamples out of ``load.jsonl`` lines. A malformed line is skipped:
+    the daemon appends while a reader reads, so a torn last line is normal."""
+    return [s for s in (_load_sample(line) for line in lines) if s is not None]
+
+
+def read_load_history(nick: str, *, nodes_dir: Path | None = None) -> list[LoadSample]:
+    """Every sample the daemon kept for ``nick`` (``<nick>/load.jsonl``), or
+    [] when it never sampled that node."""
+    path = load_path(nick, nodes_dir=nodes_dir)  # E's (DECISION-19): one layout owner
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return parse_load_lines(text.splitlines())
+
+
+def in_window(samples: Iterable[LoadSample], *, now: float) -> list[LoadSample]:
+    """The samples placement may use: the last ``PLACEMENT_WINDOW_S``. No
+    upper bound, so a node whose clock runs ahead is not thrown away."""
+    start = now - PLACEMENT_WINDOW_S
+    return [s for s in samples if s.ts >= start]
+
+
+def _p75(values: Sequence[float]) -> float:
+    """75th percentile, linear between the closest ranks (what
+    ``statistics.quantiles(method="inclusive")`` returns -- written out because
+    that needs two points and one live sample is a legitimate window)."""
+    ordered = sorted(values)
+    pos = 0.75 * (len(ordered) - 1)
+    low = int(pos)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (pos - low)
+
+
+def score_node(
+    nick: str,
+    window: Sequence[LoadSample],
+    *,
+    extra_sessions: int = 0,
+    live: bool = False,
+) -> NodeScore | None:
+    """Spec §11 over one node's window; None when there is nothing to score.
+
+    Load is per core, so a 32-core box at load 8 reads as quiet. Memory and my
+    session count come from the NEWEST sample: they are levels, not rates.
+    ``extra_sessions`` counts projects this same pass already put here.
+    """
+    if not window:
+        return None
+    usage = [s.load1 / max(s.nproc, 1) for s in window]
+    p75 = _p75(usage)
+    spike = SPIKE_WEIGHT * max(0.0, max(usage) - SPIKE_RATIO * p75)
+    latest = max(window, key=lambda s: s.ts)
+    mem = 0.0
+    below_floor = False
+    if latest.mem_total_mb > 0:
+        free = latest.mem_avail_mb / latest.mem_total_mb
+        mem = MEM_WEIGHT * max(0.0, MEM_FLOOR - free)
+        below_floor = free < MEM_HARD_FLOOR
+    mine = latest.my_sessions + extra_sessions
+    return NodeScore(
+        nick=nick,
+        samples=len(window),
+        p75=p75,
+        spike=spike,
+        mem=mem,
+        my_sessions=mine,
+        score=p75 + spike + mem + SESSION_WEIGHT * mine,
+        live=live,
+        below_floor=below_floor,
     )
