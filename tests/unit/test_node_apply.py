@@ -411,6 +411,17 @@ class TestTheSettings:
             ("node bin\\helper.exe", "bin\\helper.exe is a Windows program"),
             # A drive path opening a subshell group.
             ('sh -c "(C:/tools/run.sh)"', "C:/tools/run.sh is a Windows path"),
+            # A UNC share, either slash, as the program or an argument.
+            (
+                "\\\\nas\\projects\\hook.sh --go",
+                "\\\\nas\\projects\\hook.sh is a Windows path",
+            ),
+            ("//nas/projects/hook.sh --go", "//nas/projects/hook.sh is a Windows path"),
+            (
+                'node "\\\\nas\\share\\notify.mjs" --done',
+                "\\\\nas\\share\\notify.mjs is a Windows path",
+            ),
+            ("node //nas/share/notify.mjs", "//nas/share/notify.mjs is a Windows path"),
         ],
     )
     def test_a_windows_program_is_dropped(self, box, tmp_path, capsys, command, detail):
@@ -1018,12 +1029,15 @@ class TestTheAdditionalDirectories:
             "/srv/shared",
         ]
 
+    @pytest.mark.parametrize(
+        "windows", ["D:/code", "\\\\nas\\projects", "//nas/projects"]
+    )
     def test_a_windows_path_is_dropped_when_the_node_has_none(
-        self, box, tmp_path, capsys
+        self, box, tmp_path, capsys, windows
     ):
-        pc = {"permissions": {"additionalDirectories": ["D:/code", "/srv/shared"]}}
+        pc = {"permissions": {"additionalDirectories": [windows, "/srv/shared"]}}
         box.apply(_work(tmp_path, _pc_settings(pc)))
-        assert _drops(_lines(capsys), self.DIRS) == ["D:/code is a Windows path"]
+        assert _drops(_lines(capsys), self.DIRS) == [f"{windows} is a Windows path"]
         assert _json(_settings(box))["permissions"]["additionalDirectories"] == [
             "/srv/shared"
         ]

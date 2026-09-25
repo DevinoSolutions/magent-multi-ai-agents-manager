@@ -9,10 +9,11 @@ stdin. Every step prints status<TAB>item<TAB>detail rows
 last run that finished it cleanly -- the store is ~/.magent/provision.json.
 A step that warned or failed is not recorded, so the next provision looks
 again. The store also keeps what the settings step last shipped (env keys,
-permission rules), so what this PC stops shipping is taken back from the
-node; a lost or damaged store takes nothing back. A deliberate drop (a hook
-whose program this node lacks) is a clean result: the same payload on the same node drops it again, and ``--force``
-(what ``magent node setup`` sends) re-looks after a tool is installed.
+permission rules, extra directories), so what this PC stops shipping is
+taken back from the node; a lost or damaged store takes nothing back. A
+deliberate drop (a hook whose program this node lacks) is a clean result:
+the same payload on the same node drops it again, and ``--force`` (what
+``magent node setup`` sends) re-looks after a tool is installed.
 
 provision.sh calls ``main`` through ``python3 -c``: a src module may not
 raise SystemExit (lint MD001), so ``main`` returns the exit code.
@@ -192,13 +193,14 @@ def _last(text: str) -> str:
     return lines[-1][:200] if lines else "no output"
 
 
-# A drive-letter path (C:\ or C:/) starting ANY word -- the program or an
-# argument (node "C:\...\notify.mjs") -- names a file only the PC has.
-# Anchored on the left, so a URL's "s://" or "e:///" is never one.
+# A drive-letter path (C:\ or C:/) or a UNC share (\\nas\x or //nas/x)
+# starting ANY word -- the program or an argument (node "C:\...\notify.mjs")
+# -- names a file only the PC has. Anchored on the left, so a URL's "s://"
+# or "e:///" is never one.
 # Accepted false positive: an scp-style single-letter host (``scp a:/x .``)
 # reads as a drive letter and drops the hook -- such a hook is vanishingly
 # rare, and keeping a PC path the node cannot run is the worse failure.
-_WINDOWS_PATH = re.compile(r"(^|[\s\"'=(])[A-Za-z]:[\\/]")
+_WINDOWS_PATH = re.compile(r"(^|[\s\"'=(])(?:[A-Za-z]:[\\/]|\\\\[^\\\s]|//[^/\s])")
 # Where an unquoted word ends, in the raw command text.
 _WORD_END = re.compile(r"[\s\"';&|)]")
 # Any word ending .exe names a program only the PC runs.
