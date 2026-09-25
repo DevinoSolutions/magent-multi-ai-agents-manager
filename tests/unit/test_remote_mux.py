@@ -338,12 +338,26 @@ class TestTheScriptsShip:
     def test_an_include_is_one_level_deep(self, monkeypatch):
         files = {"a": "x\n# @include b.sh\ny\n", "b": "# @include c.sh\n"}
         monkeypatch.setattr(node_scripts, "_read", files.__getitem__)
-        with pytest.raises(ValueError, match="nested"):
+        with pytest.raises(ValueError, match="nested") as exc:
             node_scripts.script("a")
+        # The message names the file whose include nests.
+        assert "b.sh" in str(exc.value)
+
+    @pytest.mark.parametrize("second", ["b.sh", "b"])
+    def test_a_file_included_twice_is_refused(self, monkeypatch, second):
+        # lib.sh's top level shifts $1 off: a second copy would shift again,
+        # and MAGENT_SOCKET would silently become the caller's first argument.
+        files = {"a": f"# @include b.sh\nx\n# @include {second}\n", "b": "y\n"}
+        monkeypatch.setattr(node_scripts, "_read", files.__getitem__)
+        with pytest.raises(ValueError, match="more than once") as exc:
+            node_scripts.script("a")
+        assert "a.sh" in str(exc.value)
+        assert "b.sh" in str(exc.value)
 
     def test_no_packaged_script_carries_a_carriage_return(self):
         # bash on the node reads `\r` as part of every command. .gitattributes
-        # pins *.sh to LF; this catches a checkout that ignored it.
+        # pins *.sh to LF; this catches a checkout that ignored it. BYTES:
+        # read_text() translates CRLF to LF, so a text read could never fail.
         scripts = [
             p
             for p in resources.files("magent.node_scripts").iterdir()
@@ -351,7 +365,16 @@ class TestTheScriptsShip:
         ]
         assert scripts
         for script in scripts:
-            assert "\r" not in script.read_text(encoding="utf-8"), script.name
+            assert b"\r" not in script.read_bytes(), script.name
+
+    def test_the_payload_sentinel_has_one_spelling(self):
+        # lib.sh's magent_payload compares against a literal; remote_mux frames
+        # with PAYLOAD_SENTINEL. A drift would make every payload vanish.
+        lib = node_scripts.script("lib")
+        body = re.search(r"^magent_payload\(\) \{\n(.*?)^\}", lib, re.M | re.S)
+        assert body is not None
+        assert f'[ "$line" = {remote_mux.PAYLOAD_SENTINEL} ]' in body.group(1)
+        assert set(re.findall(r"__MAGENT_\w*?__", lib)) == {remote_mux.PAYLOAD_SENTINEL}
 
     @pytest.mark.skipif(
         not Path("/proc/loadavg").exists() or shutil.which("bash") is None,
@@ -427,6 +450,14 @@ class TestRunScript:
             + b'{"k": 1}'
         )
 
+    def test_the_wire_carries_no_carriage_return(self, fake_ssh):
+        # What ssh actually READ, script and payload framing both: bash on the
+        # node would take a `\r` as part of every command.
+        remote_mux.run_script(NODE, "sample", [], timeout_s=30, stdin=b'{"k": 1}')
+        (call,) = fake_ssh.calls()
+        assert call.stdin
+        assert b"\r" not in call.stdin
+
     def test_a_secret_never_reaches_argv_the_error_or_the_log(self, fake_ssh):
         token = "ghp_FAKE0123456789TOKEN"
         fake_ssh.set_reply("bash -s", stderr="provision failed\n", rc=1)
@@ -479,6 +510,53 @@ class TestRunScript:
             check=False,
         )
         assert r.stdout == b"line1\nline2"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or shutil.which("bash") is None,
+        reason="needs a POSIX bash",
+    )
+    @pytest.mark.parametrize(
+        "tail",
+        [b"", b"\nno sentinel here\n", b"\n__MAGENT_PAYLOAD__"],
+        ids=["nothing-after-the-script", "no-sentinel", "sentinel-without-newline"],
+    )
+    def test_a_missing_sentinel_fails_loudly(self, tail):
+        # Without the sentinel line the payload is not "empty", it is missing:
+        # magent_payload must say so instead of handing main nothing, rc 0.
+        body = (
+            node_scripts.script("lib")
+            + "main() { magent_payload; }\n"
+            + 'main "$@"; exit $?\n'
+        )
+        r = subprocess.run(
+            ["bash", "-s", "--", remote_mux.SOCKET],
+            input=remote_mux._frame_script(body, None) + tail,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        assert r.returncode != 0
+        assert r.stdout == b""
+        assert remote_mux.PAYLOAD_SENTINEL.encode("ascii") in r.stderr
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or shutil.which("bash") is None,
+        reason="needs a POSIX bash",
+    )
+    def test_an_empty_payload_after_the_sentinel_is_still_a_payload(self):
+        body = (
+            node_scripts.script("lib")
+            + "main() { magent_payload; }\n"
+            + 'main "$@"; exit $?\n'
+        )
+        r = subprocess.run(
+            ["bash", "-s", "--", remote_mux.SOCKET],
+            input=remote_mux._frame_script(body, b""),
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        assert (r.returncode, r.stdout) == (0, b"")
 
 
 class TestHasSession:

@@ -12,12 +12,24 @@ MAGENT_SOCKET="${1:?magent: the tmux socket name is a required first argument}"
 shift
 
 # Skip stdin up to the __MAGENT_PAYLOAD__ line (remote_mux.PAYLOAD_SENTINEL),
-# then copy the payload to stdout. Call it at most once per script.
+# then copy the payload to stdout. Call it at most once per script, and BEFORE
+# any command that may read stdin -- the payload is the rest of the script's
+# own stdin, and a background `cat` started first was shown to eat it -- or
+# give such a child `</dev/null`. No sentinel line (or one without its
+# newline) returns 1, loudly: a MISSING payload is not an empty one, and under
+# `set -e` the script dies instead of carrying on with nothing.
 magent_payload() {
-  local line
+  local line found=0
   while IFS= read -r line; do
-    [ "$line" = __MAGENT_PAYLOAD__ ] && break
+    if [ "$line" = __MAGENT_PAYLOAD__ ]; then
+      found=1
+      break
+    fi
   done
+  if [ "$found" -ne 1 ]; then
+    echo "magent: no __MAGENT_PAYLOAD__ line on stdin" >&2
+    return 1
+  fi
   cat
 }
 
@@ -29,6 +41,12 @@ magent_sample() {
   read -r load1 load5 load15 _rest < /proc/loadavg
   mem_total_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
   mem_avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+  # bash reads an empty variable as 0 in $(( )): without this a kernel that
+  # lacks the field would report a node with no memory free, not a failure.
+  if [ -z "$mem_avail_kb" ]; then
+    echo "magent: MemAvailable missing from /proc/meminfo" >&2
+    return 1
+  fi
   # No tmux server yet (or no tmux at all) is zero sessions, not a failure.
   sessions=$(tmux -L "$MAGENT_SOCKET" list-sessions 2>/dev/null | wc -l | tr -d ' ' || true)
   ts=$(date +%s)
