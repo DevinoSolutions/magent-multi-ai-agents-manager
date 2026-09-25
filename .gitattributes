@@ -6,3 +6,5 @@
 *.md   text eol=lf
 *.json text eol=lf
 LICENSE text eol=lf
+# Node scripts run under bash on Linux, where a CR is part of every command.
+*.sh text eol=lf

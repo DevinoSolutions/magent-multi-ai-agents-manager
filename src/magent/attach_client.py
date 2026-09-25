@@ -139,6 +139,11 @@ SSH_CONNECTION_OPTS = (
 SSH_TRANSPORT_RC = 255
 SSH_MISSING_RC = 127
 
+# The tmux server every node session lives on (`tmux -L magent`, spec D10).
+# ONE owner: the pane's remote attach command uses it and remote_mux re-exports
+# it for every probe, so the two can never name different servers.
+TMUX_SOCKET = "magent"
+
 # Backoff: 2s doubling, capped. The cap is what makes "retry forever" safe --
 # a host that is down for eight hours costs at most one handshake every 30s,
 # which no sshd notices, while a blip is healed in about two seconds.
