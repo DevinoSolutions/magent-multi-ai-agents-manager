@@ -5,7 +5,7 @@ repos, files to push, the auto-memory dir), and where node data lives on this
 PC (``~/.magent/nodes/``). Everything that touches a node or runs git is
 ``remote_mux``. A leaf: never imports magent.cli, never spawns a process. Its
 only I/O is files under ``NODES_DIR`` (the node map and the per-node
-mirror) and local stat()s.
+mirror), local stat()s, and a WARNING in the ``nodes`` log.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
 from magent.config import NODE_AUTO, NODE_CLOUD
+from magent.log import get_logger
 from magent.psmux import session_name
 from magent.sessions.claude import encode_claude_project_path
 from magent.titles import get_leaf_name
@@ -36,6 +37,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
     from magent.config import MagentConfig, ProjectConfig
+
+_log = get_logger("nodes")
 
 # Everything node-shaped on this PC: the placement map, per-node snapshots and
 # load history, pulled transcripts. Import-bound, so it is registered in
@@ -584,6 +587,18 @@ def _marketplaces(
 _CREDENTIAL_BYTES = CLAUDE_CREDENTIAL_MARKER.encode("ascii")
 
 
+def _above(parent: str, child: str) -> bool:
+    """``parent`` is a strict ancestor of ``child`` (both absolute; never
+    equal). Paths on different Windows drives share no ancestor."""
+    parent, child = os.path.normcase(parent), os.path.normcase(child)
+    if parent == child:
+        return False
+    try:
+        return os.path.commonpath([parent, child]) == parent
+    except ValueError:
+        return False
+
+
 def _skills(root: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     """Every file under ``~/.claude/skills``, symlinks followed once, sorted by
     path. A file is executable if its mode says so OR it starts with ``#!`` --
@@ -591,8 +606,20 @@ def _skills(root: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     Claude credential stays behind; its note names the path, never the
     content. A Windows junction is followed exactly like a symlink, on
     purpose: a link in ``skills`` is one the user made (a repo checked out
-    elsewhere is the main case), so it is not contained to the root."""
+    elsewhere is the main case), so it is not contained to the root.
+
+    The one link never followed points ABOVE the skills folder -- at
+    ``~/.claude``, at ``~``, at ``/``: that is no skill, it is the walk
+    reading the whole home (``~/.ssh`` included). It is pruned with a note
+    and a WARNING naming it; so is a skills folder that is itself such a
+    link. One real directory linked under two names ships once, under the
+    name the sorted, depth-first walk reaches first."""
     if not root.is_dir():
+        return ()
+    anchors = (os.path.abspath(root), os.path.realpath(root))
+    if _above(anchors[1], anchors[0]):
+        notes.append("skills: links to a folder above itself, not followed")
+        _log.warning("%s links to %s, above itself: not followed", root, anchors[1])
         return ()
     if any((root / top).exists() for top in SKILLS_EXCLUDED_TOP):
         notes.append("skills/synced: claude.ai-managed copies, not shipped")
@@ -606,12 +633,27 @@ def _skills(root: Path, notes: list[str]) -> tuple[SkillFile, ...]:
             continue
         seen.add(real)
         rel = here.relative_to(root)
-        dirnames[:] = sorted(
-            d
-            for d in dirnames
-            if d not in SKILLS_EXCLUDED_DIRS
-            and not (rel == Path() and d in SKILLS_EXCLUDED_TOP)
-        )
+        kept: list[str] = []
+        for d in sorted(dirnames):
+            if d in SKILLS_EXCLUDED_DIRS or (
+                rel == Path() and d in SKILLS_EXCLUDED_TOP
+            ):
+                continue
+            target = os.path.realpath(here / d)
+            if any(_above(target, anchor) for anchor in anchors):
+                name = _named((rel / d).as_posix())
+                notes.append(
+                    f"skills/{name}: links to a folder above the skills folder, "
+                    "not followed"
+                )
+                _log.warning(
+                    "skills/%s links to %s, above the skills folder: not followed",
+                    name,
+                    target,
+                )
+                continue
+            kept.append(d)
+        dirnames[:] = kept
         for name in sorted(filenames):
             path = here / name
             rel_path = (rel / name).as_posix()

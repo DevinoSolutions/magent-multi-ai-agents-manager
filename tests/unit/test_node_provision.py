@@ -95,6 +95,17 @@ def _scope(**overrides: object) -> UserScope:
     return UserScope(**fields)
 
 
+def _link_dir(link: Path, target: Path) -> None:
+    """A directory link the way a user makes one here: a junction on Windows
+    (no privilege needed), a symlink elsewhere."""
+    if sys.platform == "win32":
+        import _winapi  # win32-only: imported where it exists
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
 class TestUserScopeSettingsAndMcp:
     def test_an_empty_home_ships_nothing(self, tmp_path):
         assert nodes.user_scope(_pc_home(tmp_path)) == _scope()
@@ -760,6 +771,75 @@ class TestUserScopePluginsAndSkills:
         assert [f.path for f in nodes.user_scope(home).skills] == [
             "deploy/SKILL.md",
             "deploy/sub/notes.md",
+        ]
+
+    # The one link NOT followed: one aimed above the skills folder. Followed,
+    # it reads the whole home -- ~/.ssh and every other ~/.claude file -- and
+    # the seen guard only stops it at the skills folder itself. A junction on
+    # win32, a symlink on POSIX (_link_dir). "~/.." stands in for "/": every
+    # target here is bounded, so a regressed prune fails in a second instead
+    # of walking the real disk; the root itself is pinned on _above below.
+    @pytest.mark.parametrize("above", ["~", "~/.claude", "~/.."])
+    def test_a_link_above_the_skills_folder_is_pruned_with_a_warning(
+        self, tmp_path, caplog, above
+    ):
+        home = _pc_home(tmp_path)
+        skills = home / ".claude" / "skills"
+        (skills / "deploy").mkdir(parents=True)
+        (skills / "deploy" / "SKILL.md").write_bytes(b"# deploy\n")
+        (home / ".ssh").mkdir()
+        (home / ".ssh" / "id_ed25519").write_bytes(b"TOPSECRET-ssh\n")
+        (home / ".claude" / "private").mkdir()
+        (home / ".claude" / "private" / "notes.md").write_bytes(b"TOPSECRET-claude\n")
+        (tmp_path / "beside").mkdir()
+        (tmp_path / "beside" / "secret.txt").write_bytes(b"TOPSECRET-beside\n")
+        target = {
+            "~": home,
+            "~/.claude": home / ".claude",
+            "~/..": tmp_path,
+        }[above]
+        _link_dir(skills / "x", target)
+        caplog.set_level("WARNING")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["deploy/SKILL.md"]
+        assert all(b"TOPSECRET" not in f.data for f in scope.skills)
+        assert scope.notes == (
+            "skills/x: links to a folder above the skills folder, not followed",
+        )
+        assert "skills/x links to" in caplog.text
+
+    def test_the_filesystem_root_is_above_every_skills_folder(self, tmp_path):
+        skills = str(tmp_path / "pc" / ".claude" / "skills")
+        assert nodes._above(tmp_path.anchor, skills)
+        assert nodes._above(str(tmp_path / "pc"), skills)
+        assert not nodes._above(skills, skills)
+        assert not nodes._above(str(tmp_path / "pc2"), skills)
+        assert not nodes._above(skills + os.sep + "x", skills)
+
+    def test_a_skills_folder_that_is_itself_a_link_above_ships_nothing(
+        self, tmp_path, caplog
+    ):
+        home = _pc_home(tmp_path)
+        (home / ".claude").mkdir()
+        (home / ".ssh").mkdir()
+        (home / ".ssh" / "id_ed25519").write_bytes(b"TOPSECRET-ssh\n")
+        _link_dir(home / ".claude" / "skills", home)
+        caplog.set_level("WARNING")
+        scope = nodes.user_scope(home)
+        assert scope.skills == ()
+        assert scope.notes == ("skills: links to a folder above itself, not followed",)
+        assert "above itself" in caplog.text
+
+    def test_one_real_folder_under_two_names_ships_once_under_the_first(self, tmp_path):
+        home = _pc_home(tmp_path)
+        skills = home / ".claude" / "skills"
+        skills.mkdir(parents=True)
+        repo = self._repo_outside(tmp_path)
+        _link_dir(skills / "b-second", repo)
+        _link_dir(skills / "a-first", repo)
+        assert [f.path for f in nodes.user_scope(home).skills] == [
+            "a-first/SKILL.md",
+            "a-first/run.sh",
         ]
 
     # Skill files ship as raw bytes and nothing else scans them: the value rule
