@@ -344,7 +344,9 @@ class Mark:
 def _read_marks(nick: str) -> dict[str, Mark]:
     try:
         raw = json.loads(nodes.pull_marks_path(nick).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    # RecursionError: json.loads' answer to deep nesting -- a corrupt file like
+    # any other, never an internal error (which logs at ERROR, to Sentry).
+    except (OSError, ValueError, RecursionError):
         return {}
     if not isinstance(raw, dict):
         return {}

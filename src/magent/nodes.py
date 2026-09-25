@@ -471,7 +471,8 @@ def read_sessions(nick: str, *, nodes_dir: Path | None = None) -> NodeSessions |
         raw = json.loads(
             sessions_path(nick, nodes_dir=nodes_dir).read_text(encoding="utf-8")
         )
-    except (OSError, ValueError):
+    # RecursionError: json.loads' answer to deep nesting, a corrupt file too.
+    except (OSError, ValueError, RecursionError):
         return None
     if not isinstance(raw, dict):
         return None

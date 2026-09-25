@@ -1291,3 +1291,35 @@ class TestJsonNestedTooDeeply:
         with pytest.raises(ValueError, match="nested too deeply"):
             nodes.load_node_map_strict()
         assert nodes.read_node_map() == {}
+
+    def test_a_watermark_file_nested_too_deeply_is_no_watermark(self, placed):
+        path = nodes.pull_marks_path("second")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_TOO_DEEP, encoding="utf-8")
+        assert node_sync._read_marks("second") == {}
+
+    def test_a_sessions_file_nested_too_deeply_is_no_snapshot(self, placed):
+        path = nodes.sessions_path("second")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_TOO_DEEP, encoding="utf-8")
+        assert nodes.read_sessions("second") is None
+
+    def test_a_node_whose_watermark_file_nests_too_deeply_still_pulls(
+        self, placed, caplog
+    ):
+        """A corrupt local file, not a bug: the node pulls from the beginning,
+        and nothing is logged at ERROR (which would be a Sentry event)."""
+        _capture_nodes_log(caplog)
+        path = nodes.pull_marks_path("second")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_TOO_DEEP, encoding="utf-8")
+        asked: dict[str, dict[str, remote_mux.SidPull]] = {}
+
+        def pull(node, sids):
+            asked[node.nick] = dict(sids)
+            return _snap()
+
+        results = node_sync.NodeSyncer(_config(), pull=pull).tick()
+        assert results["second"] == (node_sync.OK, "")
+        assert asked["second"]["api"].since == 0.0
+        assert _node_errors(caplog) == []
