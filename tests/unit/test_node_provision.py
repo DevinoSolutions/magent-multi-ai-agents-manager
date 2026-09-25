@@ -1745,6 +1745,7 @@ def _doctor_box(
     avail_kb: int = 50 * GIB_KB,
     tmux_version: str = "tmux 3.4",
     hang: str | None = None,
+    hang_ignores_term: bool = False,
 ) -> tuple[dict[str, FakeSsh], dict[str, str]]:
     """A node user's home and a PATH of fakes answering like a healthy node,
     except where a keyword says otherwise. ``hang`` names one bounded probe
@@ -1753,7 +1754,7 @@ def _doctor_box(
     if hang is not None:
         # Registered first: the first matching reply wins.
         name, match = HUNG_PROBES[hang]
-        fakes[name].set_reply(match, hang_s=HANG_S)
+        fakes[name].set_reply(match, hang_s=HANG_S, ignore_term=hang_ignores_term)
     replies = {
         "tmux": [
             ("-V", tmux_version + "\n"),
@@ -2112,6 +2113,21 @@ class TestDoctorShUnderRealBash:
         assert _rows(r) == {**dict.fromkeys(DOCTOR_ITEMS, "ok"), item: status}
         (row,) = [ln for ln in _report(r).lines if ln.item == item]
         assert row.detail == detail
+
+    def test_a_probe_deaf_to_term_is_killed_after_its_grace(self, tmp_path):
+        # timeout's TERM is ignored, so only `-k`'s KILL ends it (rc 137):
+        # that must read as a timed-out row too, not as a tmux answer.
+        _, env = _doctor_box(tmp_path, hang="tmux", hang_ignores_term=True)
+        start = time.monotonic()
+        r = _run_doctor(env)
+        elapsed = time.monotonic() - start
+        assert r.returncode == 0, r.stderr
+        assert elapsed < 4 + 2 + 5  # the bound, the kill grace, slack
+        (row,) = [ln for ln in _report(r).lines if ln.item == "sessions"]
+        assert (row.status, row.detail) == (
+            "warn",
+            f"tmux server on socket {remote_mux.SOCKET} did not answer in 4s",
+        )
 
 
 def test_doctor_inlines_the_tmux_floor():
