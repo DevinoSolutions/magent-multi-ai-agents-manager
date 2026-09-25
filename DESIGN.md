@@ -227,14 +227,16 @@ None of these imports any other `magent` module (`style.py` imports
   comment at the import. Imports only `log` and `titles` from `magent`.
 - **`attach_client.py`** — the reconnecting ssh supervisor that runs inside
   every `magent attach` pane, shipped as its own `magent-attach-client`
-  console script (see Key Decisions). Imports `magent.style` only; `argparse`
+  console script (see Key Decisions). Imports `magent.style` and `magent.titles`
+  (plus `magent.env` in-body, for `spawn_attach_window`); `argparse`
   is imported in-body because `cli/attach.py` imports this module at the top
-  level (for `SSH_KEEPALIVE_OPTS` / `remote_attach_command` / the client exe
-  name) and the registration hub would otherwise put argparse on `magent
-  --help`'s critical path. It owns the two strings `cli/attach.py`'s corpse
-  detection is coupled to — the ssh keepalive options and the remote attach
-  command — so the marker `_attach_markers` scans for and the command a pane
-  actually runs cannot drift apart.
+  level (for `spawn_attach_window` / `client_exe` / the multiplexer constants /
+  the client exe name) and the registration hub would otherwise put argparse
+  on `magent --help`'s critical path. It owns the two strings `cli/attach.py`'s
+  corpse detection is coupled to — the ssh connection options
+  (`SSH_CONNECTION_OPTS`) and the remote attach command — so the marker
+  `_attach_markers` scans for and the command a pane actually runs cannot
+  drift apart.
 
 ### `cli/` command modules
 
@@ -1813,15 +1815,16 @@ which predates win32-input-mode and may pass the CR through unencoded.
 
 **Attach-pane reconnect is only reachable from a Windows client (2026-08-09):**
 `attach_client.py` itself is OS-agnostic (stdlib + click; the `Popen` in
-`_run_ssh` inherits the console on POSIX exactly as it does on Windows) and its unit tier
-runs everywhere, but the only code that spawns it is `cli/attach.py::
-_spawn_windows`, which opens `wt` windows. There is no macOS/Linux client
-window-spawn path for remote attach to wire it into — a pre-existing gap this
-change neither widens nor closes. A future POSIX attach client should call
-`_pane_command` as-is. Related and narrower: the corpse scan recognizes the
-supervisor by its Windows executable name (`magent-attach-client.exe`), which
-is fine because `process_cmdlines` is Windows-only today; a POSIX process scan
-would need the extensionless name added.
+`_run_ssh` inherits the console on POSIX exactly as it does on Windows) and its
+unit tier runs everywhere, but the only code that spawns it is
+`attach_client.py::spawn_attach_window`, which opens `wt` windows. There is no
+macOS/Linux client window-spawn path for remote attach to wire it into — a
+pre-existing gap this change neither widens nor closes. A future POSIX attach
+client should call `attach_client.pane_command` as-is. Related and narrower:
+the corpse scan recognizes the supervisor by its Windows executable name
+(`magent-attach-client.exe`), which is fine because `process_cmdlines` is
+Windows-only today; a POSIX process scan would need the extensionless name
+added.
 
 **Title badges are ambient state, not guaranteed state (2026-07-07, narrowed
 2026-08-15):** the attention daemon's `BadgeRenderer` rewrites window titles via
