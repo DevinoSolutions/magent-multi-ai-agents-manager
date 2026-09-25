@@ -953,3 +953,86 @@ class TestRecipeFor:
             project_dir=link,
         )
         assert [r.remote_dir for r in recipe.repos] == [recipe.remote_root]
+
+    def test_a_project_with_no_repo_is_refused(self, tmp_path):
+        # Nothing to clone means nothing to run: an empty recipe is a caller
+        # bug, not a bring-up that silently starts in an empty folder.
+        with pytest.raises(NodeConfigError, match="has no git repo") as err:
+            nodes.recipe_for(
+                ProjectConfig(path=str(tmp_path), node="second"),
+                NODE,
+                [],
+                home=Path.home(),
+                project_dir=tmp_path,
+            )
+        assert str(tmp_path) in str(err.value)
+
+    def test_a_repo_listed_twice_is_cloned_once(self, tmp_path):
+        state = _state(tmp_path, ())
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(tmp_path), node="second"),
+            NODE,
+            [state, state],
+            home=Path.home(),
+            project_dir=tmp_path,
+        )
+        assert [r.remote_dir for r in recipe.repos] == [recipe.remote_root]
+
+    @pytest.mark.parametrize(
+        ("url", "stripped"),
+        [
+            (
+                "https://user:ghp_SECRET@github.com/org/repo.git",
+                "https://github.com/org/repo.git",
+            ),
+            (
+                "https://ghp_SECRET@github.com:8443/org/repo.git",
+                "https://github.com:8443/org/repo.git",
+            ),
+            (
+                "HTTP://x-access-token:ghp_SECRET@github.com/org/repo.git",
+                "http://github.com/org/repo.git",
+            ),
+        ],
+    )
+    def test_credentials_in_an_http_origin_never_reach_the_recipe(
+        self, tmp_path, url, stripped
+    ):
+        # The node's .git/config, the Recipe's repr and every log line would
+        # otherwise carry this PC's token.
+        state = dataclasses.replace(_state(tmp_path, ()), url=url)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(tmp_path), node="second"),
+            NODE,
+            [state],
+            home=Path.home(),
+            project_dir=tmp_path,
+        )
+        assert recipe.repos[0].url == stripped
+        assert "ghp_SECRET" not in repr(recipe)
+        assert recipe.warnings == (
+            (
+                f"repo {recipe.remote_root}: origin URL carried credentials; "
+                "stripped -- the node authenticates with its own gh token"
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "git@github.com:org/repo.git",
+            "ssh://git@github.com/org/repo.git",
+            "https://github.com/org/repo.git",
+        ],
+    )
+    def test_a_login_in_an_ssh_origin_is_not_a_credential(self, tmp_path, url):
+        state = dataclasses.replace(_state(tmp_path, ()), url=url)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(tmp_path), node="second"),
+            NODE,
+            [state],
+            home=Path.home(),
+            project_dir=tmp_path,
+        )
+        assert recipe.repos[0].url == url
+        assert recipe.warnings == ()

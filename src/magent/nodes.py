@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit, urlunsplit
 
 from magent.config import NODE_AUTO, NODE_CLOUD
 from magent.psmux import session_name
@@ -519,6 +520,18 @@ def _resolved(path: Path) -> Path:
         raise NodeConfigError(f"{path}: cannot be resolved ({exc})") from exc
 
 
+def _without_credentials(url: str) -> str:
+    """``url`` with any userinfo dropped when it is http(s): there a userinfo is
+    a token (``https://user:ghp_...@host``) and would land in the node's
+    ``.git/config``, the Recipe's repr and every log line. Every other scheme,
+    and scp-like ``git@host:org/repo``, is left alone -- ``git@`` is an ssh
+    login, not a secret."""
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or "@" not in parts.netloc:
+        return url
+    return urlunsplit(parts._replace(netloc=parts.netloc.rpartition("@")[2]))
+
+
 def recipe_for(
     proj: ProjectConfig,
     node: Node,
@@ -543,8 +556,13 @@ def recipe_for(
     remote_root = f"{node.root.rstrip('/')}/{project_dir.name}"
     root = _resolved(project_dir)
     repos: list[RepoSpec] = []
+    repo_warnings: list[str] = []
+    seen: set[Path] = set()
     for state in states:
         repo = _resolved(state.path)
+        if repo in seen:
+            continue
+        seen.add(repo)
         if repo == root:
             remote_dir = remote_root
         elif repo.parent == root:
@@ -554,8 +572,17 @@ def recipe_for(
                 f"{state.path} is neither the project nor a direct child of it; "
                 "a node project is one repo, or a folder of repos"
             )
-        repos.append(
-            RepoSpec(url=state.url, branch=state.branch, remote_dir=remote_dir)
+        url = _without_credentials(state.url)
+        if url != state.url:
+            repo_warnings.append(
+                f"repo {remote_dir}: origin URL carried credentials; stripped "
+                "-- the node authenticates with its own gh token"
+            )
+        repos.append(RepoSpec(url=url, branch=state.branch, remote_dir=remote_dir))
+    if not repos:
+        raise NodeConfigError(
+            f"{project_dir}: has no git repo; a node project is one repo, "
+            "or a folder of repos"
         )
     extras = tuple(proj.push or ())
     memory = (
@@ -568,5 +595,5 @@ def recipe_for(
         push_files=push_set(project_dir, states, home=home, extras=extras),
         memory_dir=memory if memory.is_dir() else None,
         remote_root=remote_root,
-        warnings=push_warnings(project_dir, extras, home=home),
+        warnings=(*repo_warnings, *push_warnings(project_dir, extras, home=home)),
     )
