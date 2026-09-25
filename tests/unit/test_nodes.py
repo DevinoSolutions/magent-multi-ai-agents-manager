@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import json
+import os
 from dataclasses import MISSING
 from pathlib import Path
 
@@ -651,11 +652,40 @@ class TestAtomicWrites:
         assert all(p.suffix == ".tmp" and not p.name.endswith(".json") for p in seen)
         assert seen[0] != seen[1]
 
-    def test_a_non_finite_number_is_refused_before_anything_is_written(self, tmp_path):
+    def test_a_failing_fdopen_closes_the_descriptor_and_leaves_no_temp(
+        self, tmp_path, monkeypatch
+    ):
+        # Between mkstemp and fdopen the raw fd is ours alone: if fdopen raises
+        # it must be closed here, or it leaks (and on Windows the open handle
+        # would also make the temp's unlink fail, leaving the temp behind).
+        made: list[int] = []
+        real_mkstemp = nodes.tempfile.mkstemp
+
+        def recording_mkstemp(*args, **kwargs):
+            fd, name = real_mkstemp(*args, **kwargs)
+            made.append(fd)
+            return fd, name
+
+        def broken_fdopen(*_args, **_kwargs):
+            raise MemoryError("no buffer")
+
+        monkeypatch.setattr(nodes.tempfile, "mkstemp", recording_mkstemp)
+        monkeypatch.setattr(nodes.os, "fdopen", broken_fdopen)
         target = tmp_path / "b.json"
-        with pytest.raises(ValueError, match="JSON compliant"):
-            nodes.write_json_atomic(target, {"ts": float("nan")})
+        with pytest.raises(MemoryError, match="no buffer"):
+            nodes.write_text_atomic(target, "new\n")
+        assert len(made) == 1
+        with pytest.raises(OSError):
+            os.fstat(made[0])
         assert list(tmp_path.iterdir()) == []
+
+    def test_a_non_finite_number_is_refused_before_anything_is_written(self, tmp_path):
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        with pytest.raises(ValueError, match="JSON compliant"):
+            nodes.write_json_atomic(sub / "b.json", {"ts": float("nan")})
+        # Not only the target: no temp file either, in the dir it would use.
+        assert list(sub.iterdir()) == []
 
 
 class TestTheSessionsSnapshot:
@@ -679,6 +709,9 @@ class TestTheSessionsSnapshot:
             # A non-finite ts would make sessions_stale() answer "fresh" forever.
             '{"ts": NaN, "sessions": []}',
             '{"ts": Infinity, "sessions": []}',
+            # Any non-string entry is corruption, not a name to skip.
+            '{"ts": 1, "sessions": ["a", 3, null]}',
+            '{"ts": 1, "sessions": ["a", ["b"]]}',
         ],
     )
     def test_an_unusable_snapshot_reads_as_none(self, tmp_path, text):
@@ -695,3 +728,9 @@ class TestTheSessionsSnapshot:
         assert not nodes.sessions_stale(snap, pull_interval_s=30, now=160.0)
         assert nodes.sessions_stale(snap, pull_interval_s=30, now=160.5)
         assert nodes.sessions_stale(None, pull_interval_s=30, now=0.0)
+
+    def test_a_snapshot_from_the_future_reads_fresh_and_never_raises(self):
+        # A backwards wall-clock jump: the age goes negative, which is fresh.
+        snap = nodes.NodeSessions(ts=1_000.0, sessions=("api",))
+        assert not nodes.sessions_stale(snap, pull_interval_s=30, now=10.0)
+        assert nodes.sessions_stale(snap, pull_interval_s=30, now=1_060.5)

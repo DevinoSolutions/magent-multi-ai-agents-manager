@@ -358,12 +358,18 @@ def node_dir(nick: str, *, nodes_dir: Path | None = None) -> Path:
 
 def transcripts_dir(nick: str, sid: str, *, nodes_dir: Path | None = None) -> Path:
     """Where the daemon mirrors a node session's Claude project directory:
-    its CONTENTS (``<uuid>.jsonl``, ``<uuid>/subagents/``, ``memory/``)."""
+    its CONTENTS (``<uuid>.jsonl``, ``<uuid>/subagents/``, ``memory/``).
+    ``sid`` is joined VERBATIM: ``psmux.session_name`` keeps ``/`` and ``\\``,
+    so a node-map sid like ``/etc`` would resolve outside the node dir --
+    callers (the attention reader, recall) pass it through
+    ``remote_mux.pullable_sid`` first."""
     return node_dir(nick, nodes_dir=nodes_dir) / sid / "transcripts"
 
 
 def state_dir(nick: str, sid: str, *, nodes_dir: Path | None = None) -> Path:
-    """Where the daemon mirrors a node session's agent-state records."""
+    """Where the daemon mirrors a node session's agent-state records.
+    ``sid`` is joined VERBATIM, exactly as in ``transcripts_dir``: callers
+    pass a node-map sid through ``remote_mux.pullable_sid`` first."""
     return node_dir(nick, nodes_dir=nodes_dir) / sid / "state"
 
 
@@ -392,7 +398,14 @@ def write_text_atomic(path: Path, text: str) -> None:
     )
     tmp = Path(tmp_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        try:
+            fh = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            # fdopen never took ownership: close the raw fd here, or it leaks
+            # (and on Windows an open handle also blocks the unlink below).
+            os.close(fd)
+            raise
+        with fh:
             fh.write(text)
         os.replace(tmp, path)
     except BaseException:
@@ -420,7 +433,9 @@ class NodeSessions:
 
 def read_sessions(nick: str, *, nodes_dir: Path | None = None) -> NodeSessions | None:
     """``<nick>/sessions.json``, or None when it is missing or not a snapshot.
-    A non-finite ``ts`` is not a snapshot: it would read as fresh forever."""
+    A non-finite ``ts`` is not a snapshot: it would read as fresh forever.
+    Neither is a ``sessions`` list holding any non-string: that is corruption,
+    and silently dropping the odd entry would report a live session dead."""
     try:
         raw = json.loads(
             sessions_path(nick, nodes_dir=nodes_dir).read_text(encoding="utf-8")
@@ -435,13 +450,16 @@ def read_sessions(nick: str, *, nodes_dir: Path | None = None) -> NodeSessions |
         return None
     if not math.isfinite(ts) or not isinstance(names, list):
         return None
-    return NodeSessions(
-        ts=float(ts), sessions=tuple(n for n in names if isinstance(n, str))
-    )
+    if not all(isinstance(n, str) for n in names):
+        return None
+    return NodeSessions(ts=float(ts), sessions=tuple(names))
 
 
 def sessions_stale(
     snap: NodeSessions | None, *, pull_interval_s: float, now: float
 ) -> bool:
-    """Spec §7: a snapshot older than two pull intervals reads ``stale``."""
+    """Spec §7: a snapshot older than two pull intervals reads ``stale``.
+    If the wall clock jumps backwards, a snapshot whose ``ts`` is now in the
+    future gives a negative age and reads FRESH (until ``now`` passes
+    ``ts + 2 * pull_interval_s``); the function never raises on it."""
     return snap is None or now - snap.ts > 2 * pull_interval_s
