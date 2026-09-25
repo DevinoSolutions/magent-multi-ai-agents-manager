@@ -913,6 +913,7 @@ class TestTheMcpOAuth:
             )
         )
         assert _credentials(box).stat().st_mode & 0o777 == 0o600
+        assert not list(_credentials(box).parent.glob("*.magent-tmp"))
 
 
 A = "docs|0123456789abcdef"
@@ -963,6 +964,21 @@ class TestTheMcpOAuthIsTrackedPerEntry:
         assert _status(_lines(capsys), "mcp_oauth") == "did"
         assert _node_token(box, A) == "NODE-REFRESHED-A"
         assert _node_token(box, B) == "PC-B2"
+
+    def test_the_newest_sha_is_remembered_not_the_older_one(
+        self, box, tmp_path, capsys
+    ):
+        # The PC's current sha wins over the remembered one in the store: were
+        # it the other way round, a re-issued entry would stay "changed" and
+        # land on the node's refresh at every provision.
+        box.apply(_work(tmp_path, _two()))
+        w2 = _work(tmp_path, _two(a="PC-A2"), name="w2")
+        box.apply(w2)
+        _refresh_on_node(box, A, "NODE-REFRESHED-A")
+        capsys.readouterr()
+        box.apply(w2)
+        assert _status(_lines(capsys), "mcp_oauth") == "skip"
+        assert _node_token(box, A) == "NODE-REFRESHED-A"
 
     def test_an_entry_the_pc_reissued_is_applied_over_the_nodes(self, box, tmp_path):
         # The accepted residual: the PC is the authority for an entry it
@@ -1616,23 +1632,25 @@ class TestTheMcpFilesSurviveOddContent:
         assert set(creds["mcpOAuth"]) == {A, B}
         assert creds["claudeAiOauth"] == login
 
-    def test_a_failed_replace_of_claude_json_leaves_no_temp(
-        self, box, tmp_path, monkeypatch, capsys
+    @pytest.mark.parametrize(
+        ("name", "item"), [(".claude.json", "mcp"), (".credentials.json", "mcp_oauth")]
+    )
+    def test_a_failed_replace_leaves_no_temp(
+        self, box, tmp_path, monkeypatch, capsys, name, item
     ):
         # M3: the temp is removed on the way out of a failed write.
         real = os.replace
 
         def refuse(src: object, dst: object) -> None:
-            if str(dst).endswith(".claude.json"):
+            if str(dst).endswith(name):
                 raise OSError("replace refused")
             real(src, dst)
 
         monkeypatch.setattr(os, "replace", refuse)
-        assert (
-            box.apply(_work(tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS}))) == 1
-        )
-        assert _status(_lines(capsys), "mcp") == "fail"
+        assert box.apply(_work(tmp_path, _two())) == 1
+        assert _status(_lines(capsys), item) == "fail"
         assert not list(box.home.rglob("*.magent-tmp"))
+        assert not list(_credentials(box).parent.glob("*.magent-tmp"))
 
 
 @pytest.mark.skipif(not POSIX, reason="POSIX symlinks and file modes")
