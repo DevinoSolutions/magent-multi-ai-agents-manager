@@ -2621,6 +2621,38 @@ class TestAPcThatHangsUpDoesNotStopTheApply:
         assert box.apply(work) == 1
         self._landed(box)
 
+    @pytest.mark.parametrize("where", ["write", "flush"])
+    def test_what_meets_the_pipe_either_side_of_the_hang_up_is_masked(
+        self, box, tmp_path, monkeypatch, where
+    ):
+        # The mask runs before the say: the row that got through, and the row
+        # that met the dead pipe (left pending by a failed flush), both carry
+        # the masked detail, never the token or a URL's password.
+        def leak(name: str) -> tuple[str, object]:
+            def step(ctx: node_apply.Ctx) -> None:
+                node_apply._row(
+                    ctx, "warn", name, f"{TOKEN} https://amin:{PASSWORD}@h/x?t=q"
+                )
+
+            return (name, step)
+
+        monkeypatch.setattr(
+            node_apply, "STEPS", (leak("one"), leak("two"), *node_apply.STEPS)
+        )
+        pipe = _HungUp(BrokenPipeError(errno.EPIPE, "Broken pipe"), where)
+        monkeypatch.setattr(sys, "stdout", pipe)
+        box.apply(_work(tmp_path, self.SCOPE), token=TOKEN)
+        met = pipe.rows + pipe.pending
+        assert [row.split("\t")[1] for row in met] == (
+            ["one"] if where == "write" else ["one", "two"]
+        )
+        for row in met:
+            assert TOKEN not in row and PASSWORD not in row
+            assert row.split("\t")[2] == f"{node_apply._MASK} https://***@h/x?***\n"
+        # IOBase closes -- and so flushes -- the double when it is collected;
+        # a still-dead flush would raise there, outside any test.
+        pipe.where = "closed"
+
     def test_a_real_descriptor_is_pointed_at_the_null_device_and_nothing_leaks(
         self, box, tmp_path, monkeypatch, capsys
     ):
