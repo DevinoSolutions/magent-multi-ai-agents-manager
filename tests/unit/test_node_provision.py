@@ -1910,9 +1910,9 @@ class TestThisPcsGh:
         caplog.set_level("DEBUG", logger="magent.nodes")
         fake_gh.set_reply("auth token", stdout=stdout, stderr=stderr, rc=rc)
         result = remote_mux.local_gh_token()
-        assert TOKEN not in caplog.text
         if rc != 0:
             assert TOKEN not in repr(result)
+        assert TOKEN not in caplog.text
 
 
 HOOK_TEXT = "#!/usr/bin/env bash\necho hook\n"
