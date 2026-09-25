@@ -441,27 +441,49 @@ ORT_DECOY = "sk-ant-ort01-DECOY-ORT"
 
 
 class TestTheClaudeLoginNeverShipsUnderAnyName:
-    """The key-name rules (NEVER_SHIPPED_*) cannot see a Claude credential
-    pasted under another name. It is matched by VALUE wherever it sits, and
-    every ANTHROPIC_* entry in settings.env stays behind by name."""
+    """The key-name rule (NEVER_SHIPPED_ENV: exact names) cannot see a Claude
+    credential pasted under another name, so it is also matched by VALUE
+    wherever it sits. Every other ANTHROPIC_* / CLAUDE_* env entry is user
+    configuration and ships by name."""
 
-    def test_every_anthropic_env_entry_stays_behind(self, tmp_path):
+    def test_only_the_named_credential_env_entries_stay_behind(self, tmp_path):
         home = _pc_home(
             tmp_path,
             settings={
                 "env": {
                     "ANTHROPIC_BASE_URL": "https://gateway.example",
+                    "ANTHROPIC_MODEL": "opus",
+                    "CLAUDE_CODE_OAUTH_TOKEN": "t",
                     "ANTHROPIC_CUSTOM_HEADERS": "Authorization: Bearer x",
                     "KEEP": "1",
                 }
             },
         )
         scope = nodes.user_scope(home)
+        assert scope.settings == {
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://gateway.example",
+                "ANTHROPIC_MODEL": "opus",
+                "KEEP": "1",
+            }
+        }
+        assert scope.notes == (
+            "settings.env.ANTHROPIC_CUSTOM_HEADERS: never shipped",
+            "settings.env.CLAUDE_CODE_OAUTH_TOKEN: never shipped",
+        )
+
+    def test_an_env_name_holding_the_marker_is_never_echoed(self, tmp_path):
+        # A decoy NAME with a benign value: the value rule reads keys too, so
+        # the entry stays behind -- and no note ever spells the name out.
+        home = _pc_home(
+            tmp_path, settings={"env": {"ANTHROPIC_sk-ant-abc": "1", "KEEP": "1"}}
+        )
+        scope = nodes.user_scope(home)
         assert scope.settings == {"env": {"KEEP": "1"}}
         assert scope.notes == (
-            "settings.env.ANTHROPIC_BASE_URL: never shipped",
-            "settings.env.ANTHROPIC_CUSTOM_HEADERS: never shipped",
+            "settings.env.(a name holding one): holds a Claude credential, never shipped",
         )
+        assert "sk-ant-" not in "\n".join(scope.notes)
 
     def test_a_credential_value_in_settings_goes_wherever_it_sits(self, tmp_path):
         home = _pc_home(
@@ -520,6 +542,32 @@ class TestTheClaudeLoginNeverShipsUnderAnyName:
     )
     def test_an_mcp_server_holding_one_stays_behind(self, spec):
         assert nodes.mcp_skip_reason(spec) == "it holds a Claude credential"
+
+    @pytest.mark.parametrize(
+        ("spec", "reason"),
+        [
+            (
+                {
+                    "type": "http",
+                    "url": "http://127.0.0.1:9100/mcp",
+                    "headers": {"x-api-key": API_DECOY},
+                },
+                LOCAL,
+            ),
+            (
+                {
+                    "type": "stdio",
+                    "command": "C:\\x\\srv.exe",
+                    "env": {"ANTHROPIC_API_KEY": API_DECOY},
+                },
+                PC_PATH,
+            ),
+        ],
+    )
+    def test_the_transport_reason_wins_over_the_credential_one(self, spec, reason):
+        # The credential check runs LAST: plan K's relay keys on the loopback
+        # reason, and the server stays on this PC either way.
+        assert nodes.mcp_skip_reason(spec) == reason
 
     def test_that_server_and_its_oauth_never_enter_the_scope(self, tmp_path):
         home = _pc_home(

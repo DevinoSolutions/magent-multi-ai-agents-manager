@@ -147,17 +147,19 @@ class LoadSample:
 
 # What provisioning never copies to a node, whatever this PC's settings say
 # (spec §8, D5): a key or token in settings.env would log the node in AS this
-# PC, and apiKeyHelper names a local credential program.
-NEVER_SHIPPED_ENV = (
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
+# PC (ANTHROPIC_CUSTOM_HEADERS can carry an auth header), and apiKeyHelper
+# names a local credential program. Exact names: every other ANTHROPIC_* /
+# CLAUDE_* entry (a base URL, a model) is user configuration and ships -- the
+# value rule below still catches any of them that holds a credential.
+NEVER_SHIPPED_ENV = frozenset(
+    {
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_CUSTOM_HEADERS",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    }
 )
 NEVER_SHIPPED_SETTINGS = ("apiKeyHelper",)
-# Every settings.env entry under this prefix stays behind too, named or not: a
-# base URL or custom headers aim the node's login at this PC's gateway, and
-# the next ANTHROPIC_* credential variable must not need a code change.
-NEVER_SHIPPED_ENV_PREFIX = "ANTHROPIC_"
 # A Claude credential matched by VALUE, wherever it sits (sk-ant-api...,
 # sk-ant-oat..., sk-ant-ort..., sk-ant-admin...): the name rules above cannot
 # see one pasted under another name -- a hook command, an MCP server's env or
@@ -326,16 +328,8 @@ def _shippable_settings(raw: dict[str, object], notes: list[str]) -> dict[str, o
             notes.append(f"settings.{key}: never shipped")
     env = settings.get("env")
     if isinstance(env, dict):
-        named = sorted(
-            key
-            for key in env
-            if isinstance(key, str)
-            and (
-                key in NEVER_SHIPPED_ENV
-                or key.upper().startswith(NEVER_SHIPPED_ENV_PREFIX)
-            )
-        )
-        for key in named:
+        # A note names a constant from the list, never a key read from the file.
+        for key in sorted(k for k in NEVER_SHIPPED_ENV if k in env):
             del env[key]
             notes.append(f"settings.env.{key}: never shipped")
         held = [
@@ -413,12 +407,20 @@ def mcp_skip_reason(spec: object) -> str | None:
     The MCP relay (plan K, DECISION-16) re-adds chosen PC-bound servers as
     http entries after this filter. A reason never quotes a url or an env
     value -- either can hold a key.
-    Whatever its transport, a server that holds a Claude credential anywhere
-    (an env value, a header, an arg, its url) never ships (D5)."""
+    A server the transport rules would ship still stays behind when it holds a
+    Claude credential anywhere (an env value, a header, an arg, its url; D5).
+    That check runs LAST, so a server the transport rules already hold back
+    keeps its transport reason -- the relay (plan K) keys on it."""
+    reason = _transport_skip_reason(spec)
+    if reason is None and _holds_claude_credential(spec):
+        return "it holds a Claude credential"
+    return reason
+
+
+def _transport_skip_reason(spec: object) -> str | None:
+    """``mcp_skip_reason`` before the credential check: the transport rules."""
     if not isinstance(spec, dict):
         return "not an object"
-    if _holds_claude_credential(spec):
-        return "it holds a Claude credential"
     kind = _kind(spec)
     if kind == "stdio":
         command = spec.get("command")
