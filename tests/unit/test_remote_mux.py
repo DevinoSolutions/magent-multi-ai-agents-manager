@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import dataclasses
 import json
 import math
@@ -201,8 +202,14 @@ class TestRun:
         with pytest.raises(RemoteError):
             remote_mux.run(NODE, ["true"], timeout_s=5)
         logged = (log.LOG_DIR / "nodes.log").read_text(encoding="utf-8")
-        assert "WARNING" in logged
-        assert NODE.target in logged
+        (line,) = [
+            ln
+            for ln in logged.splitlines()
+            if "WARNING" in ln and "could not start" in ln
+        ]
+        assert NODE.target in line
+        # Only discriminates on POSIX: Windows' CreateProcess OSErrors never
+        # carry the filename, so a Windows-only green proves nothing here.
         assert gone not in logged
 
     def test_an_exact_tmux_target_reaches_bash_quoted(self, fake_ssh):
@@ -277,7 +284,12 @@ class TestTheScriptsShip:
 
     def test_an_unknown_script_is_a_file_not_found(self):
         with pytest.raises(FileNotFoundError):
-            node_scripts.script("no-such-script")
+            node_scripts.script("no_such_script")
+
+    @pytest.mark.parametrize("name", ["./lib", "sample/../lib", "../x", "", "a-b"])
+    def test_the_loader_takes_only_a_plain_script_name(self, name):
+        with pytest.raises(ValueError, match="is not a script name"):
+            node_scripts.script(name)
 
     def test_an_include_line_is_replaced_by_that_file(self):
         # One script travels over stdin, so shared functions are inlined at
@@ -476,7 +488,11 @@ class TestRunScript:
             assert token.encode("utf-8") in call.stdin
         assert token not in str(exc.value)
         assert token not in " ".join(exc.value.command_redacted)
-        for logfile in log.LOG_DIR.glob("*.log*"):
+        # The failure WAS logged: an empty sweep below would pass vacuously.
+        assert (log.LOG_DIR / "nodes.log").exists()
+        logfiles = list(log.LOG_DIR.glob("*.log*"))
+        assert logfiles
+        for logfile in logfiles:
             assert token not in logfile.read_text(encoding="utf-8", errors="replace")
 
     def test_the_timeout_is_mandatory_here_too(self):
@@ -487,6 +503,22 @@ class TestRunScript:
     def test_a_non_entry_script_is_refused_before_any_ssh(self, fake_ssh, name):
         with pytest.raises(ValueError, match="not a run_script entry point"):
             remote_mux.run_script(NODE, name.removesuffix(".sh"), [], timeout_s=30)
+        assert fake_ssh.calls() == []
+
+    def test_an_unknown_script_is_refused_before_any_ssh(self, fake_ssh):
+        with pytest.raises(FileNotFoundError):
+            remote_mux.run_script(NODE, "no_such_script", [], timeout_s=30)
+        assert fake_ssh.calls() == []
+
+    @pytest.mark.parametrize("name", ["./lib", "sample/../lib", "lib.sh", "Sample"])
+    def test_a_name_that_is_not_a_script_name_is_refused_before_any_ssh(
+        self, fake_ssh, name
+    ):
+        # "./lib" and "sample/../lib" both LOADED lib.sh and slipped past the
+        # name-based non-entry check; the loader validates the name itself,
+        # so it cannot reach outside the package either.
+        with pytest.raises(ValueError, match="is not a script name"):
+            remote_mux.run_script(NODE, name, [], timeout_s=30)
         assert fake_ssh.calls() == []
 
     @pytest.mark.skipif(
@@ -557,6 +589,75 @@ class TestRunScript:
             check=False,
         )
         assert (r.returncode, r.stdout) == (0, b"")
+
+
+@pytest.fixture
+def sentry_events(monkeypatch):
+    """magent's REAL ``init_sentry`` over the real sentry-sdk, with the one
+    difference that events land in this list instead of on the network. The
+    global client is torn down afterwards, so no other test inherits it."""
+    sentry_sdk = pytest.importorskip("sentry_sdk")
+    transport_mod = pytest.importorskip("sentry_sdk.transport")
+    events: list[dict[str, object]] = []
+
+    class _Capture(transport_mod.Transport):
+        def capture_envelope(self, envelope):
+            event = envelope.get_event()
+            if event is not None:
+                events.append(event)
+
+    real_init = sentry_sdk.init
+    # default_integrations=False: the stdlib one patches subprocess.Popen for
+    # the rest of the process (and cannot patch conftest's guarded Popen at
+    # all); excepthook/argv/modules are process-global too. Frame locals are
+    # the CLIENT's doing (its exception serializer), not an integration's, so
+    # the reproduction stands; init_sentry's own integrations still load.
+    monkeypatch.setattr(
+        sentry_sdk,
+        "init",
+        lambda **kw: real_init(**kw, transport=_Capture(), default_integrations=False),
+    )
+    # Neither init_sentry's flush nor the SDK's own atexit hook may outlive
+    # this test.
+    monkeypatch.setattr(atexit, "register", lambda *_a, **_k: None)
+    try:
+        yield events
+    finally:
+        sentry_sdk.get_client().close()
+        sentry_sdk.get_global_scope().set_client(None)
+        assert not sentry_sdk.get_client().is_active()
+
+
+class TestASecretNeverReachesSentry:
+    def test_a_failed_run_scripts_event_carries_no_payload(
+        self, tmp_path, monkeypatch, sentry_events
+    ):
+        # The reviewer's reproduction: sentry-sdk 2.x ships frame locals by
+        # default and scrubs by key NAME, so `stdin`/`input_bytes` -- holding
+        # the payload -- rode along in the RemoteError's event verbatim.
+        from magent.sentry import init_sentry
+
+        init_sentry("https://example@o0.ingest.sentry.io/0")
+        token = "ghp_SECRET123"
+        gone = str(tmp_path / "no-such-ssh.exe")
+        monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: gone)
+        import sentry_sdk
+
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run_script(
+                NODE,
+                "sample",
+                [],
+                timeout_s=5,
+                stdin=json.dumps({"gh": token}).encode("utf-8"),
+            )
+        sentry_sdk.capture_exception(exc.value)
+        (event,) = sentry_events
+        dumped = json.dumps(event, default=str)
+        # The traceback WAS captured -- the frames are there, only their
+        # locals are not -- so the absence below is not vacuous.
+        assert "run_script" in dumped
+        assert token not in dumped
 
 
 class TestHasSession:

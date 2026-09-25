@@ -92,8 +92,14 @@ _SPAWN_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 class RemoteError(RuntimeError):
     """A node call that failed: ``rc``, the last lines of its stderr, and the
-    argv it ran with stdin reduced to its length. Never file contents, never a
-    token.
+    argv it ran with stdin reduced to its length.
+
+    What magent authors is clean: ``command_redacted`` is argv only, and stdin
+    -- where secrets travel -- appears as its length alone. ``stderr_tail`` is
+    NOT magent's to clean: it is the node's own words, verbatim. So a script
+    must never echo its payload or run under xtrace (``set -x``), and must
+    hand secrets to tools by stdin or a credential helper, never a URL (git
+    prints a token-bearing remote URL in "fatal: unable to access").
 
     ``rc`` None means the call never finished, and that covers two opposite
     cases. After a spawn failure the command never ran. After a timeout the
@@ -256,7 +262,7 @@ def run(
     )
 
 
-def _script_argv(args: list[str]) -> list[str]:
+def _script_argv(args: Sequence[str]) -> list[str]:
     """The remote argv of every script run: the socket is ALWAYS ``$1``
     (DECISION-26 ii) -- ``lib.sh`` reads and shifts it -- then the caller's
     own args."""
@@ -264,6 +270,11 @@ def _script_argv(args: list[str]) -> list[str]:
 
 
 def _frame_script(text: str, payload: bytes | None) -> bytes:
+    """The stdin of one script run. No payload: the script text alone. With
+    one: ``<text>\\n<PAYLOAD_SENTINEL>\\n<payload>``. The leading ``\\n``
+    guards a script text without a final newline, whose last line would
+    otherwise swallow the sentinel; when the text does end in one, the result
+    is a harmless blank line before the sentinel."""
     body = text.encode("utf-8")
     if payload is None:
         return body
@@ -271,7 +282,7 @@ def _frame_script(text: str, payload: bytes | None) -> bytes:
 
 
 def _script_call(
-    script: str, args: list[str], stdin: bytes | None
+    script: str, args: Sequence[str], stdin: bytes | None
 ) -> tuple[list[str], bytes]:
     """The remote argv and the stdin bytes of one ``run_script`` call -- built
     here once, so an error raised after the call (``sample``) names exactly
@@ -282,7 +293,7 @@ def _script_call(
 def run_script(
     node: Node,
     script: str,
-    args: list[str],
+    args: Sequence[str],
     *,
     timeout_s: float,
     stdin: bytes | None = None,
@@ -292,8 +303,13 @@ def run_script(
     ``stdin`` is given -- the sentinel line and that payload. The socket is
     added here, on every call; ``args`` never carry it. Secrets belong in
     ``stdin``; ``args`` are argv, visible to the node's process table and to
-    logs. ValueError for a script in ``node_scripts.NON_ENTRY_SCRIPTS`` --
-    it would read the socket as its own first argument."""
+    logs. A failure's ``stderr_tail`` is the script's own words (see
+    ``RemoteError``): a script must never echo its payload.
+
+    Refused before any ssh: ValueError for a script in
+    ``node_scripts.NON_ENTRY_SCRIPTS`` (it would read the socket as its own
+    first argument) or for a name that is not a plain script name
+    (``./lib``); FileNotFoundError for an unknown script."""
     if f"{script}.sh" in node_scripts.NON_ENTRY_SCRIPTS:
         raise ValueError(f"{script}.sh is not a run_script entry point")
     argv_remote, framed = _script_call(script, args, stdin)
