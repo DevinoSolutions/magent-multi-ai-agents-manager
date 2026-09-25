@@ -8,8 +8,10 @@ stdin. Every step prints status<TAB>item<TAB>detail rows
 (remote_mux.parse_report) and is skipped when its content digest matches the
 last run that finished it cleanly -- the store is ~/.magent/provision.json.
 A step that warned or failed is not recorded, so the next provision looks
-again. A deliberate drop (a hook whose program this node lacks) is a clean
-result: the same payload on the same node drops it again, and ``--force``
+again. The store also keeps what the settings step last shipped (env keys,
+permission rules), so what this PC stops shipping is taken back from the
+node; a lost or damaged store takes nothing back. A deliberate drop (a hook
+whose program this node lacks) is a clean result: the same payload on the same node drops it again, and ``--force``
 (what ``magent node setup`` sends) re-looks after a tool is installed.
 
 provision.sh calls ``main`` through ``python3 -c``: a src module may not
@@ -68,6 +70,9 @@ class Ctx:
     manifest: dict[str, object]
     store: dict[str, object] = field(default_factory=dict)
     rows: list[str] = field(default_factory=list)
+    # What each step shipped last time, so what this PC no longer ships can
+    # be taken back.
+    shipped: dict[str, object] = field(default_factory=dict)
 
 
 def _row(ctx: Ctx, status: str, item: str, detail: str = "") -> None:
@@ -421,32 +426,72 @@ def _union(first: list[object], second: list[object]) -> list[object]:
     return out
 
 
-def _merged(node: dict[str, object], shipped: dict[str, object]) -> dict[str, object]:
-    """The node's settings with this PC's keys over them (``hooks`` aside):
-    ``env`` and ``permissions`` merge key by key, the PC winning a shared key,
-    and the permission rule lists are unions."""
+def _was_shipped(record: object) -> list[object]:
+    """One list of what the PC shipped last time -- nothing when the record is
+    missing or damaged, so a lost store never takes a thing back."""
+    return record if isinstance(record, list) else []
+
+
+def _deep(
+    key: str,
+    old: dict[str, object],
+    value: dict[str, object],
+    before: dict[str, object],
+) -> dict[str, object]:
+    """The node's ``key`` map merged with this PC's: the PC wins a shared
+    key, the permission rule lists are unions, and what the PC shipped
+    ``before`` but no longer ships is taken back: everything it shipped last
+    time leaves the node's side, and what it still ships is laid back on."""
+    if key == "env":
+        gone = _was_shipped(before.get("env"))
+        both = {name: text for name, text in old.items() if name not in gone}
+        both.update(value)
+        return both
+    both = {**old, **value}
+    for rule in _RULE_LISTS:
+        mine = value.get(rule, [])
+        theirs = old.get(rule)
+        if isinstance(mine, list) and isinstance(theirs, list):
+            gone = _was_shipped(before.get(rule))
+            both[rule] = _union(mine, [item for item in theirs if item not in gone])
+    return both
+
+
+def _merged(
+    node: dict[str, object], shipped: dict[str, object], before: dict[str, object]
+) -> dict[str, object]:
+    """The node's settings with this PC's keys over them (``hooks`` aside);
+    ``env`` and ``permissions`` merge key by key (``_deep``) -- also when the
+    PC ships neither, so what it shipped ``before`` still leaves."""
     merged = dict(node)
     for key, value in shipped.items():
-        if key == "hooks":
-            continue
+        if key != "hooks" and key not in _DEEP_KEYS:
+            merged[key] = value
+    for key in _DEEP_KEYS:
         old = node.get(key)
-        if key in _DEEP_KEYS and isinstance(old, dict) and isinstance(value, dict):
-            both = {**old, **value}
-            if key == "permissions":
-                for rule in _RULE_LISTS:
-                    mine = value.get(rule)
-                    theirs = old.get(rule)
-                    if isinstance(mine, list) and isinstance(theirs, list):
-                        both[rule] = _union(mine, theirs)
-            merged[key] = both
-        else:
+        value = shipped.get(key, {})
+        if isinstance(old, dict) and isinstance(value, dict):
+            merged[key] = _deep(key, old, value, before)
+        elif key in shipped:
             merged[key] = value
     return merged
 
 
+def _record(shipped: dict[str, object]) -> dict[str, object]:
+    """What this PC's settings ship that ``_deep`` takes back when they stop:
+    the env keys and the permission rules."""
+    env = shipped.get("env")
+    perms = shipped.get("permissions")
+    record: dict[str, object] = {"env": list(env) if isinstance(env, dict) else []}
+    for rule in _RULE_LISTS:
+        rules = perms.get(rule) if isinstance(perms, dict) else None
+        record[rule] = rules if isinstance(rules, list) else []
+    return record
+
+
 def _step_settings(ctx: Ctx) -> None:
     """This PC's settings.json over the node's: the PC's keys win, the node's
-    others stay (``_merged``), hooks are rebuilt (``_hooks``), and a
+    others stay unless this PC shipped them before (``_merged``), hooks are rebuilt (``_hooks``), and a
     statusLine the node cannot run falls back to the node's own."""
     path = ctx.home / ".claude" / "settings.json"
     if path.is_symlink() and not path.exists():
@@ -489,7 +534,8 @@ def _step_settings(ctx: Ctx) -> None:
             f"~/{STATE_HOOK_MARKER} is not installed, so magent's state hook "
             "is not wired; the next provision wires it",
         )
-    merged = _merged(node, shipped)
+    before = ctx.shipped.get("settings")
+    merged = _merged(node, shipped, before if isinstance(before, dict) else {})
     merged["hooks"] = _hooks(ctx, shipped.get("hooks"), wire=wire)
     line = shipped.get("statusLine")
     if isinstance(line, dict) and line.get("type") == "command":
@@ -503,6 +549,7 @@ def _step_settings(ctx: Ctx) -> None:
     # Through a symlink (a dotfiles-managed settings.json), not over it: the
     # link survives and its target ends 0600.
     _write(path.resolve(), merged)
+    ctx.shipped["settings"] = _record(shipped)
     _row(ctx, "did", "settings", f"{len(shipped)} key(s) from this PC; hooks rebuilt")
     _remember(ctx, "settings", want, mark)
 
@@ -529,6 +576,7 @@ def run(*, work: Path, home: Path, path: str, token: str, force: bool) -> int:
     store_path = home / STORE
     stored = _load(store_path)
     digests = stored.get("digests") if isinstance(stored, dict) else None
+    shipped = stored.get("shipped") if isinstance(stored, dict) else None
     ctx = Ctx(
         work=work,
         home=home,
@@ -537,6 +585,7 @@ def run(*, work: Path, home: Path, path: str, token: str, force: bool) -> int:
         force=force,
         manifest=manifest,
         store=dict(digests) if isinstance(digests, dict) else {},
+        shipped=dict(shipped) if isinstance(shipped, dict) else {},
     )
     try:
         for name, step in STEPS:
@@ -546,7 +595,10 @@ def run(*, work: Path, home: Path, path: str, token: str, force: bool) -> int:
                 _row(ctx, "fail", name, f"{type(exc).__name__}: {exc}")
                 ctx.store.pop(name, None)
     finally:
-        _write(store_path, {"version": 1, "digests": ctx.store})
+        _write(
+            store_path,
+            {"version": 1, "digests": ctx.store, "shipped": ctx.shipped},
+        )
     return 1 if "fail" in ctx.rows else 0
 
 

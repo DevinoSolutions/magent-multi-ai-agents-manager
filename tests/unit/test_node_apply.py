@@ -842,3 +842,94 @@ class TestTheMerge:
         assert _settings(box).is_symlink()
         assert os.readlink(_settings(box)) == str(gone)
         assert not gone.parent.exists()
+
+
+def _store(box: Box) -> Path:
+    return box.home / ".magent" / "provision.json"
+
+
+class TestWhatThePcStopsShippingLeavesTheNode:
+    """The PC is the source of truth for what it shipped: a rule or env key it
+    shipped last time and ships no more is revoked; the node's own stay."""
+
+    @pytest.mark.parametrize("rule", ["allow", "deny", "ask"])
+    @pytest.mark.parametrize(
+        "then",
+        [{"permissions": {"allow": [], "deny": [], "ask": []}}, {}],
+        ids=["emptied", "absent"],
+    )
+    def test_a_rule_the_pc_no_longer_ships_is_removed(self, box, tmp_path, rule, then):
+        _put(_settings(box), {"permissions": {rule: ["Read(node-only)"]}})
+        first = {"permissions": {rule: ["Bash(rm:*)"]}}
+        box.apply(_work(tmp_path, _pc_settings(first)))
+        assert _json(_settings(box))["permissions"][rule] == [
+            "Bash(rm:*)",
+            "Read(node-only)",
+        ]
+        box.apply(_work(tmp_path, _pc_settings(then), name="work2"))
+        assert _json(_settings(box))["permissions"][rule] == ["Read(node-only)"]
+
+    @pytest.mark.parametrize(
+        "then", [{"env": {"KEEP": "y"}}, {}], ids=["narrowed", "absent"]
+    )
+    def test_an_env_key_the_pc_no_longer_ships_is_removed(self, box, tmp_path, then):
+        _put(_settings(box), {"env": {"NODE_ONLY": "1"}})
+        first = {"env": {"FROM_PC": "x", "KEEP": "y"}}
+        box.apply(_work(tmp_path, _pc_settings(first)))
+        assert _json(_settings(box))["env"] == {
+            "NODE_ONLY": "1",
+            "FROM_PC": "x",
+            "KEEP": "y",
+        }
+        box.apply(_work(tmp_path, _pc_settings(then), name="work2"))
+        assert _json(_settings(box))["env"] == {"NODE_ONLY": "1", **then.get("env", {})}
+
+    def test_a_skipped_run_keeps_what_was_shipped(self, box, tmp_path, capsys):
+        # Unchanged runs in between must not forget the record the next
+        # change revokes against.
+        first = _pc_settings({"permissions": {"allow": ["Bash(rm:*)"]}})
+        box.apply(_work(tmp_path, first))
+        capsys.readouterr()
+        box.apply(_work(tmp_path, first, name="work2"))
+        assert _status(_lines(capsys), "settings") == "skip"
+        box.apply(_work(tmp_path, _pc_settings({}), name="work3"))
+        assert _json(_settings(box))["permissions"]["allow"] == []
+
+    @pytest.mark.parametrize(
+        "damage",
+        [
+            None,
+            "{oops",
+            {"version": 1, "digests": {}, "shipped": ["settings"]},
+            {"version": 1, "digests": {}, "shipped": {"settings": ["env", "allow"]}},
+            {
+                "version": 1,
+                "digests": {},
+                "shipped": {"settings": {"allow": "Bash(rm:*)", "env": "X"}},
+            },
+            {
+                "version": 1,
+                "digests": {},
+                "shipped": {"settings": {"allow": {"Bash(rm:*)": 1}, "env": {"X": 1}}},
+            },
+        ],
+        ids=["missing", "not-json", "not-a-map", "not-a-record", "strings", "maps"],
+    )
+    def test_a_lost_or_damaged_record_removes_nothing(
+        self, box, tmp_path, capsys, damage
+    ):
+        # Fail safe: with nothing trustworthy remembered, nothing is taken
+        # back -- and the apply still succeeds.
+        first = {"env": {"X": "x"}, "permissions": {"allow": ["Bash(rm:*)"]}}
+        box.apply(_work(tmp_path, _pc_settings(first)))
+        capsys.readouterr()
+        if damage is None:
+            _store(box).unlink()
+        else:
+            text = damage if isinstance(damage, str) else json.dumps(damage)
+            _store(box).write_text(text, encoding="utf-8")
+        assert box.apply(_work(tmp_path, _pc_settings({}), name="work2")) == 0
+        assert _status(_lines(capsys), "settings") == "did"
+        node = _json(_settings(box))
+        assert node["env"] == {"X": "x"}
+        assert node["permissions"]["allow"] == ["Bash(rm:*)"]
