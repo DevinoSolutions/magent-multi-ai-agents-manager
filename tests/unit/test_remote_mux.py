@@ -1593,11 +1593,14 @@ case $cmd in
         -e) env="${env:+$env }$2"; shift 2 ;;
         -s) name=$2; shift 2 ;;
         -c) cwd=$2; shift 2 ;;
+        --) shift; break ;;
         *) break ;;
       esac
     done
     if [ -n "${FAKE_TMUX_FAIL_NEW:-}" ]; then echo "fake: refused" >&2; exit 1; fi
     if [ -f "$state/sessions/$name" ]; then echo "duplicate session: $name" >&2; exit 1; fi
+    # Exit 0, but the session is gone before anyone looks (a command that dies).
+    if [ -n "${FAKE_TMUX_DIE_AFTER_NEW:-}" ]; then exit 0; fi
     mkdir -p "$state/sessions"
     umask > "$state/umask"
     { echo "cwd=$cwd"; echo "env=$env"; echo "cmd=$*"; } > "$state/sessions/$name"
@@ -1624,6 +1627,19 @@ class TestTheScriptLiterals:
         # DECISION-26 viii / spec section 6: sshd hands a non-login command
         # no locale, and the agent's UI draws box and prompt glyphs.
         assert "mux new-session -d -e LANG=C.UTF-8 " in node_scripts.script("bring_up")
+
+    def test_every_session_probe_is_an_exact_name_match(self):
+        # tmux prefix-matches a bare name: `api` would answer for `api-2`.
+        text = node_scripts.script("bring_up")
+        assert text.count('mux has-session -t "=$sid"') == 2
+        assert not re.search(r'-t "\$sid"', text)
+
+    def test_the_agent_command_follows_an_end_of_options(self):
+        # An argv whose first word starts with "-" is the command, not an option.
+        assert (
+            'mux new-session -d -e LANG=C.UTF-8 -s "$sid" -c "$root" -- "${cmd[@]}"'
+            in node_scripts.script("bring_up")
+        )
 
     def test_nothing_is_extracted_before_the_umask_is_tightened(self):
         # The payload carries secrets: no moment where a file of it is
@@ -1658,6 +1674,14 @@ def _raw_payload(
                 tar.addfile(member)
             else:
                 remote_mux._add_bytes(tar, *member)
+    return buf.getvalue()
+
+
+def _tar_of(*members: tuple[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        for member in members:
+            remote_mux._add_bytes(tar, *member)
     return buf.getvalue()
 
 
@@ -1947,13 +1971,99 @@ class TestBringUpShOnARealShell:
         with pytest.raises(RemoteError) as info:
             remote_mux.bring_up(rig["node"], rig["recipe"])
         assert info.value.rc == 4
-        assert "3.2" in info.value.stderr_tail
+        assert "magent: tmux 3.1c is too old; magent needs tmux 3.2 or newer" in (
+            info.value.stderr_tail
+        )
 
     def test_a_session_that_will_not_start_is_exit_4(self, rig, monkeypatch):
         monkeypatch.setenv("FAKE_TMUX_FAIL_NEW", "1")
         with pytest.raises(RemoteError) as info:
             remote_mux.bring_up(rig["node"], rig["recipe"])
         assert info.value.rc == 4
+        assert "magent: tmux could not start session api" in info.value.stderr_tail
+
+    def test_a_session_that_exits_as_soon_as_it_starts_is_exit_4(
+        self, rig, monkeypatch
+    ):
+        monkeypatch.setenv("FAKE_TMUX_DIE_AFTER_NEW", "1")
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert info.value.rc == 4
+        assert "magent: session api exited as soon as it started" in (
+            info.value.stderr_tail
+        )
+
+    def test_the_work_folder_is_gone_after_a_success_and_after_a_refusal(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # The unpacked payload holds secrets; the EXIT trap removes it on
+        # every path out, `die` included.
+        work = tmp_path / "script-tmp"
+        work.mkdir()
+        monkeypatch.setenv("TMPDIR", str(work))
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert list(work.iterdir()) == []
+        (rig["state"] / "sessions" / "api").unlink()
+        monkeypatch.setenv("FAKE_TMUX_FAIL_NEW", "1")
+        with pytest.raises(RemoteError):
+            remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert list(work.iterdir()) == []
+
+    def test_a_control_character_in_a_result_field_still_parses(self, rig):
+        # The result is ONE JSON line: every C0 character is escaped.
+        root = rig["root"].with_name("api\x01\x1b")
+        root.mkdir(parents=True)
+        result = remote_mux.run_script(
+            rig["node"],
+            "bring_up",
+            ["push", "api", str(root), nodes.encoded_project_dir(str(rig["root"]))],
+            timeout_s=30,
+            stdin=_raw_payload(("project/.env", b"K=V\n")),
+        )
+        assert json.loads(result.stdout.decode().splitlines()[-1])["cwd"] == str(root)
+
+    @pytest.mark.parametrize(
+        ("mode", "root", "stdin", "said"),
+        [
+            pytest.param("pull", "ok", "push", "unknown mode: pull", id="mode"),
+            pytest.param(
+                "push", "rel", "push", "the project root must be absolute", id="root"
+            ),
+            pytest.param(
+                "push", "ok", "nohdr", "payload has no header", id="no-header"
+            ),
+            pytest.param(
+                "push", "ok", "magic", "unknown payload header: MAGENT9", id="magic"
+            ),
+            pytest.param("push", "ok", "short", "truncated payload header", id="short"),
+            pytest.param(
+                "push", "ok", "count", "bad count in payload header", id="count"
+            ),
+            pytest.param("up", "ok", "push", "no command to start", id="no-command"),
+        ],
+    )
+    def test_each_bad_input_is_exit_2_in_the_scripts_own_words(
+        self, rig, mode, root, stdin, said
+    ):
+        rig["root"].mkdir(parents=True)
+        where = str(rig["root"]) if root == "ok" else "node/api"
+        payload = {
+            "push": _raw_payload(),
+            "nohdr": _tar_of(("decorate", b"")),
+            "magic": _raw_payload(header=_header_of("MAGENT9", "1", "0", "0", "0")),
+            "short": _raw_payload(header=b"MAGENT1\0"),
+            "count": _raw_payload(header=_header_of("MAGENT1", "1", "x", "0", "0")),
+        }[stdin]
+        with pytest.raises(RemoteError) as info:
+            remote_mux.run_script(
+                rig["node"],
+                "bring_up",
+                [mode, "api", where, nodes.encoded_project_dir(str(rig["root"]))],
+                timeout_s=30,
+                stdin=payload,
+            )
+        assert info.value.rc == 2
+        assert f"magent: {said}" in info.value.stderr_tail
 
     def test_the_decoration_brands_the_node(self, rig):
         remote_mux.bring_up(rig["node"], rig["recipe"])
@@ -1971,9 +2081,10 @@ class TestBringUpShOnARealShell:
                 "bring_up",
                 ["up", "api", str(rig["root"]), "../evil"],
                 timeout_s=30,
-                stdin=b"",
+                stdin=_raw_payload(),
             )
         assert info.value.rc == 2
+        assert "magent: bad encoded project name: ../evil" in info.value.stderr_tail
 
     def test_a_dash_led_encoded_name_seeds_resumes_and_ships(self, rig):
         # Every encoded name starts with "-" (/home/x is -home-x): nothing
@@ -2023,6 +2134,11 @@ class TestBringUpShOnARealShell:
                 stdin=_raw_payload(header=header),
             )
         assert info.value.rc == 2
+        assert {
+            "url": "a repo url may not start with -",
+            "branch": "a branch may not start with -",
+            "dir": "a repo folder must be absolute: -api",
+        }[field] in info.value.stderr_tail
         assert not marker.exists()
         assert not rig["root"].exists()
         assert not (rig["state"] / "sessions" / "api").exists()
@@ -2031,6 +2147,9 @@ class TestBringUpShOnARealShell:
         with pytest.raises(RemoteError) as info:
             remote_mux.push_files(rig["node"], rig["recipe"])
         assert info.value.rc == 5
+        assert "is not on this node yet; bring the project up first" in (
+            info.value.stderr_tail
+        )
 
     def test_pushing_into_a_running_project_rewrites_the_files(self, rig):
         remote_mux.bring_up(rig["node"], rig["recipe"])
@@ -2055,6 +2174,7 @@ class TestBringUpShOnARealShell:
         with pytest.raises(RemoteError) as info:
             self._push_raw(rig, _raw_payload((name, b"x\n")))
         assert info.value.rc == 2
+        assert "would land outside its folder" in info.value.stderr_tail
         assert _tree(rig["root"]) == []
         assert _tree(rig["outside"]) == []
 

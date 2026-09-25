@@ -32,13 +32,19 @@ decorate() {
   bash "$1" || echo "magent: status-line decoration failed (the session is up)" >&2
 }
 
+# Every C0 control character is escaped (\u00XX), so the result line always
+# parses whatever a path holds.
 json_str() {
-  local s=$1
+  local s=$1 c ch esc
   s=${s//\\/\\\\}
   s=${s//\"/\\\"}
-  s=${s//$'\t'/\\t}
-  s=${s//$'\n'/\\n}
-  s=${s//$'\r'/\\r}
+  if [[ $s == *[[:cntrl:]]* ]]; then
+    for ((c = 1; c < 32; c++)); do
+      printf -v ch "\\$(printf %03o "$c")"
+      printf -v esc '\\u%04x' "$c"
+      s=${s//"$ch"/$esc}
+    done
+  fi
   printf '"%s"' "$s"
 }
 
@@ -287,7 +293,7 @@ main() {
   fi
   # sshd hands a non-login command no locale; the agent's UI needs UTF-8
   # (DECISION-26 viii). `new-session -e` is tmux >= 3.2, checked above.
-  mux new-session -d -e LANG=C.UTF-8 -s "$sid" -c "$root" "${cmd[@]}" || die 4 "tmux could not start session $sid"
+  mux new-session -d -e LANG=C.UTF-8 -s "$sid" -c "$root" -- "${cmd[@]}" || die 4 "tmux could not start session $sid"
   decorate "$unpacked/decorate"
   mux has-session -t "=$sid" 2>/dev/null || die 4 "session $sid exited as soon as it started"
   emit false
