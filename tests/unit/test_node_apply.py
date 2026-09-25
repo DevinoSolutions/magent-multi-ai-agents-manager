@@ -1186,6 +1186,18 @@ class TestThePlugins:
         assert "cannot clone https://***@git.example.com/mkt.git" in line.detail
         assert _installs(claude) == []
 
+    def test_userinfo_straddling_the_fragment_cut_is_masked_before_it(
+        self, box, tmp_path, capsys
+    ):
+        # _last cuts a tool's line at 200 chars. Cut first and the "@" is
+        # gone, so no userinfo pattern matches what is left of the secret.
+        pad = "x" * (200 - len(" https://amin:ghp_DE"))
+        claude = _claude(box, markets=())
+        claude.set_reply("marketplace add", stderr=f"{pad} {SECRET_URL}\n", rc=1)
+        box.apply(_work(tmp_path, replace(PLUGGED, marketplaces={"mkt": SECRET_URL})))
+        out = capsys.readouterr()
+        assert "ghp_DE" not in out.out + out.err
+
     def test_a_refused_install_names_the_repair_and_is_tried_again(
         self, box, tmp_path, capsys
     ):

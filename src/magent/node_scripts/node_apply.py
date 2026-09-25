@@ -61,6 +61,13 @@ _MASK = "[gh-token]"
 _GH_TOKEN_VARS = frozenset(
     {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
 )
+# The user:password@ of a URL. A git marketplace source may carry a
+# credential there: the node's claude gets the whole URL, a row never does.
+_USERINFO = re.compile(r"(?<=//)[^/@\s]+@")
+
+
+def _unauth(text: str) -> str:
+    return _USERINFO.sub("***@", text)
 
 
 @dataclass
@@ -80,12 +87,14 @@ class Ctx:
 
 def _row(ctx: Ctx, status: str, item: str, detail: str = "") -> None:
     """One status<TAB>item<TAB>detail line; the detail is flattened onto it,
-    and the gh token is masked out of it -- the backstop. The row itself is
-    never cut, so a repair hint after a tool's output always survives: only
-    the tool's fragment is cut, by ``_last``, which masks the token itself
-    before it cuts -- so no cut can split the token before a mask sees it."""
+    and the gh token and any URL's userinfo are masked out of it -- the
+    backstop. The row itself is never cut, so a repair hint after a tool's
+    output always survives: only the tool's fragment is cut, by ``_last``,
+    which masks both itself before it cuts -- so no cut can split a secret
+    before a mask sees it."""
     if ctx.token:
         detail = detail.replace(ctx.token, _MASK)
+    detail = _unauth(detail)
     ctx.rows.append(status)
     sys.stdout.write(f"{status}\t{item}\t{' '.join(detail.split())}\n")
     sys.stdout.flush()
@@ -231,10 +240,12 @@ def _last(ctx: Ctx, text: str) -> str:
     private repo) can hold the token too. Masking before the cut means a
     token straddling char 200 can never leave a prefix ``_row``'s backstop
     would not recognize. An empty token masks nothing (``str.replace`` with
-    an empty needle would insert the mask between every character)."""
+    an empty needle would insert the mask between every character). A URL's
+    userinfo is masked before the cut for the same reason: a cut that drops
+    its "@" leaves nothing ``_USERINFO`` matches."""
     if ctx.token:
         text = text.replace(ctx.token, _MASK)
-    lines = text.strip().splitlines()
+    lines = _unauth(text).strip().splitlines()
     return lines[-1][:200] if lines else "no output"
 
 
@@ -594,15 +605,6 @@ def _listed(argv: list[str], key: str) -> set[str] | None:
     }
 
 
-# The user:password@ of a URL. A git marketplace source may carry a
-# credential there: the node's claude gets the whole URL, a row never does.
-_USERINFO = re.compile(r"(?<=//)[^/@\s]+@")
-
-
-def _unauth(text: str) -> str:
-    return _USERINFO.sub("***@", text)
-
-
 def _plugin(
     ctx: Ctx,
     claude: str,
@@ -635,24 +637,20 @@ def _plugin(
                 ctx,
                 "warn",
                 "marketplace:" + market,
-                _unauth(
-                    f"claude plugin marketplace add {source} failed: "
-                    f"{_last(ctx, added.stderr)}"
-                ),
+                f"claude plugin marketplace add {source} failed: "
+                f"{_last(ctx, added.stderr)}",
             )
             return
         markets.add(market)
-        _row(ctx, "did", "marketplace:" + market, _unauth(source))
+        _row(ctx, "did", "marketplace:" + market, source)
     done = _tool([claude, "plugin", "install", pid, "--scope", "user"])
     if done.returncode != 0:
         _row(
             ctx,
             "warn",
             item,
-            _unauth(
-                f"install refused ({_last(ctx, done.stderr)}); run on the node: "
-                f"claude plugin install {pid}"
-            ),
+            f"install refused ({_last(ctx, done.stderr)}); run on the node: "
+            f"claude plugin install {pid}",
         )
     else:
         _row(ctx, "did", item, "installed at user scope")
