@@ -12,12 +12,10 @@ import pytest
 
 from magent import nodes
 from magent.config import (
-    SCHEMA_VERSION,
     MagentConfig,
     NodeConfig,
     ProjectConfig,
     Settings,
-    load_config,
 )
 from magent.nodes import (
     LoadSample,
@@ -340,44 +338,50 @@ class TestResolve:
             nodes.resolve(POOL, ProjectConfig(path="api", node="third"), local_user="")
 
 
-def _pool_config(tmp_config, nodes):
-    return load_config(
-        tmp_config(
-            {"version": SCHEMA_VERSION, "settings": {"nodes": nodes}, "projects": []}
-        )
-    )
-
-
 class TestANickResolvesLikeAProject:
-    def test_a_nick_with_a_user_resolves_to_that_user(self, tmp_config):
-        cfg = _pool_config(
-            tmp_config, {"second": {"host": "devino-second", "user": "amin"}}
-        )
-        assert node_for_nick(cfg, "second", local_user="Someone") == Node(
-            nick="second", host="devino-second", user="amin", root="~/magent"
-        )
+    # What a nick shares with a project is pinned through resolve() in
+    # TestResolve; this class pins only what differs when there is no project.
 
-    def test_a_nick_without_a_user_runs_as_the_local_user_lowercased(self, tmp_config):
-        cfg = _pool_config(tmp_config, {"second": {"host": "devino-second"}})
-        assert node_for_nick(cfg, "second", local_user="Amin").user == "amin"
-
-    def test_an_unknown_nick_names_the_pool(self, tmp_config):
-        cfg = _pool_config(tmp_config, {"second": {"host": "devino-second"}})
+    def test_an_unknown_nick_names_the_pool(self):
         with pytest.raises(
             NodeConfigError,
-            match=r"^node 'fifth' is not in settings\.nodes \(known: second\)$",
+            match=r"^node 'fifth' is not in settings\.nodes \(known: second, third\)$",
         ):
-            node_for_nick(cfg, "fifth", local_user="amin")
+            node_for_nick(POOL, "fifth", local_user="amin")
 
-    def test_the_label_prefixes_the_error(self, tmp_config):
-        cfg = _pool_config(tmp_config, {})
-        with pytest.raises(NodeConfigError, match=r"^api: node 'fifth' .*known: none"):
-            node_for_nick(cfg, "fifth", local_user="amin", label="api")
+    @pytest.mark.parametrize("nick", ["auto", "cloud"])
+    def test_a_placement_word_as_a_nick_is_just_an_unknown_nick(self, nick):
+        # Config validation keeps the reserved words out of the pool, so the
+        # ordinary refusal is the true one; no special case is wanted.
+        with pytest.raises(
+            NodeConfigError,
+            match=rf"^node '{nick}' is not in settings\.nodes \(known: second, third\)$",
+        ):
+            node_for_nick(POOL, nick, local_user="amin")
 
-    def test_an_implicit_root_is_still_refused(self, tmp_config):
-        cfg = _pool_config(tmp_config, {"second": {"host": "devino-second"}})
-        with pytest.raises(NodeConfigError, match=r"\(D4\)"):
-            node_for_nick(cfg, "second", local_user="root")
+    def test_the_label_prefixes_the_unknown_nick_error(self):
+        with pytest.raises(
+            NodeConfigError,
+            match=r"^api: node 'fifth' is not in settings\.nodes \(known: second, third\)$",
+        ):
+            node_for_nick(POOL, "fifth", local_user="amin", label="api")
+
+    def test_an_empty_label_is_no_label(self):
+        with pytest.raises(NodeConfigError, match=r"^node 'fifth' "):
+            node_for_nick(POOL, "fifth", local_user="amin", label="")
+
+    @pytest.mark.parametrize(
+        ("local_user", "expected"),
+        [
+            ("", r"^settings\.nodes\.third\.user is not set"),
+            ("root", r"^settings\.nodes\.third: magent is running as root"),
+        ],
+    )
+    def test_the_label_never_prefixes_a_settings_error(self, local_user, expected):
+        # These name settings.nodes.<nick>, the thing to fix; the project that
+        # led there is not part of the fix.
+        with pytest.raises(NodeConfigError, match=expected):
+            node_for_nick(POOL, "third", local_user=local_user, label="api")
 
 
 class TestTheMirrorLayout:

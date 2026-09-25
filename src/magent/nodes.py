@@ -202,9 +202,15 @@ def node_for_nick(
     config: MagentConfig, nick: str, *, local_user: str, label: str | None = None
 ) -> Node:
     """The pool node ``nick``, fully resolved -- the D4 user rule in its one
-    home. ``label`` (a project path) prefixes an error so a project's message
-    reads exactly as it always has. Raises NodeConfigError."""
-    prefix = f"{label}: " if label is not None else ""
+    home. Raises NodeConfigError.
+
+    ``label`` (a project path) prefixes the unknown-nick error only: it is the
+    one that is about the caller's reference. The other two name
+    ``settings.nodes.<nick>``, the thing to fix. A nick read from the node map
+    may have left ``settings.nodes`` since it was written; such a caller must
+    catch NodeConfigError and re-place, never surface it.
+    """
+    prefix = f"{label}: " if label else ""
     pool = config.settings.nodes
     entry = pool.get(nick)
     if entry is None:
