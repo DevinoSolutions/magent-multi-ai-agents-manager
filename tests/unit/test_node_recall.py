@@ -683,6 +683,40 @@ class TestTheInstallNeverOverwritesTheNodesWork:
             _PULLED_JSONL
         )
 
+    def test_a_file_where_the_payload_has_a_nested_directory_is_kept_not_an_error(
+        self, monkeypatch, home, tmp_path
+    ):
+        # cq-G9 minor 3: the node has a FILE <sid> where the payload has the
+        # directory <sid>/subagents. mkdir -p under a file used to fail with
+        # "Not a directory" and set -e made that rc 1.
+        source = _pulled(tmp_path)
+        nested = source / SESSION_ID / "subagents"
+        nested.mkdir(parents=True)
+        (nested / "agent-a1.jsonl").write_text("{}\n", encoding="utf-8")
+        dest = self._dest(home)
+        dest.mkdir(parents=True)
+        (dest / SESSION_ID).write_bytes(b"the node's own file\n")
+
+        done = _node_run(
+            self._call(monkeypatch, tmp_path, remote_mux._tar_dir(source)), home
+        )
+
+        assert done.returncode == 0, done.stderr
+        assert (dest / SESSION_ID).read_bytes() == b"the node's own file\n"
+        lines = done.stdout.decode().splitlines()
+        assert sorted(line for line in lines if line.startswith("KEPT\t")) == [
+            f"KEPT\t{SESSION_ID}",
+            f"KEPT\t{SESSION_ID}/subagents/agent-a1.jsonl",
+        ]
+        assert lines[-1] == str(Path(os.path.realpath(dest)))
+        assert (dest / f"{SESSION_ID}.jsonl").read_text(encoding="utf-8") == (
+            _PULLED_JSONL
+        )
+        assert (dest / "memory" / "MEMORY.md").read_text(encoding="utf-8") == (
+            "- remember\n"
+        )
+        assert self._leftovers(home) == []
+
     def test_a_symlinked_directory_inside_it_is_refused_before_anything_lands(
         self, monkeypatch, home, tmp_path
     ):

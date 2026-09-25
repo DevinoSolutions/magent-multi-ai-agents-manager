@@ -14,6 +14,8 @@
 #   - anything else (the node's copy is longer or has diverged: the node kept
 #     working) -> the NODE's copy is kept, and "KEPT<TAB><relative path>" is
 #     printed so magent can say so
+# A node FILE where the payload has a directory is KEPT (reported once), and
+# every payload file beneath it is KEPT too; the rest still lands, exit 0.
 # Nothing is ever deleted. Everything created is private (umask 077; tar never
 # restores the payload's owner or modes).
 #
@@ -40,6 +42,20 @@ is_prefix() {
   have=$(($(wc -c <"$1")))
   want=$(($(wc -c <"$2")))
   [ "$have" -lt "$want" ] && head -c "$have" "$2" | cmp -s - "$1"
+}
+
+# Is some ancestor of relative path $2 (not $2 itself) a non-directory under
+# $1? find lists a directory before its children, so that ancestor has
+# already been reported KEPT, and mkdir -p beneath it would fail.
+under_a_file() {
+  local up="$2"
+  while [ "${up%/*}" != "$up" ]; do
+    up="${up%/*}"
+    if [ -e "$1/$up" ] && [ ! -d "$1/$up" ]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 main() {
@@ -77,7 +93,9 @@ main() {
   mkdir -p "$dest"
   while IFS= read -r -d '' src; do
     rel="${src#"$tmp"/}"
-    if [ -e "$dest/$rel" ] && [ ! -d "$dest/$rel" ]; then
+    if under_a_file "$dest" "$rel"; then
+      :  # its ancestor was KEPT already; the files under it are KEPT below
+    elif [ -e "$dest/$rel" ] && [ ! -d "$dest/$rel" ]; then
       printf 'KEPT\t%s\n' "$rel"  # a file where the payload has a directory
     else
       mkdir -p "$dest/$rel"
