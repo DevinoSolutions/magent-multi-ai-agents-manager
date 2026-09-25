@@ -529,6 +529,9 @@ class TestWhatTheNodeCanRun:
             ". ~/.profile",
             "LEVEL=2 exec x",
             "${TOOLS}/notify --done",
+            ": noop",
+            "pushd .claude && x",
+            "popd",
         ],
     )
     def test_a_command_bash_would_run_or_that_cannot_be_judged_is_kept(
@@ -606,6 +609,16 @@ class TestWhatTheNodeCanRun:
         box.add("notify")
         box.apply(_work(tmp_path, _pc_settings(_stop_hook(command))))
         assert _drops(_lines(capsys), "hook:Stop") == dropped
+
+    @pytest.mark.parametrize("home", ["$HOME", "${HOME}"])
+    def test_a_missing_program_under_home_is_dropped(self, box, tmp_path, capsys, home):
+        # Either spelling is expanded, so the word is judged -- not kept as
+        # a runtime variable.
+        command = f"{home}/bin/missing --x"
+        box.apply(_work(tmp_path, _pc_settings(_stop_hook(command))))
+        assert _drops(_lines(capsys), "hook:Stop") == [
+            f"{home}/bin/missing is not on this node"
+        ]
 
     def test_a_missing_absolute_program_is_dropped(self, box, tmp_path, capsys):
         missing = "/nonexistent-magent-test/bin/tool"
@@ -696,10 +709,9 @@ class TestTheHooksAreRebuilt:
         entry = {"hooks": ["junk", _command_hook("notify")]}
         box.apply(_work(tmp_path, _pc_settings({"hooks": {"Stop": [entry]}})))
         assert _drops(_lines(capsys), "hook:Stop") == ["it is not a hook object"]
-        assert _commands(_json(_settings(box)), "Stop") == [
-            "notify",
-            remote_mux.NODE_STATE_HOOK_COMMAND,
-        ]
+        stop = _json(_settings(box))["hooks"]["Stop"]
+        assert stop[0] == {"hooks": [_command_hook("notify")]}
+        assert "junk" not in _settings(box).read_text(encoding="utf-8")
 
     def test_an_entry_keeps_only_its_runnable_hooks(self, box, tmp_path):
         box.add("notify")
@@ -772,7 +784,8 @@ class TestTheMerge:
             {
                 "permissions": {
                     "allow": ["Bash(ls)", "Read"],
-                    "deny": ["WebFetch"],
+                    "deny": ["WebFetch", "Bash(sudo:*)"],
+                    "ask": ["Write"],
                     "defaultMode": "plan",
                 }
             },
@@ -780,6 +793,7 @@ class TestTheMerge:
         pc = {
             "permissions": {
                 "allow": ["Read", "Edit", "Read"],
+                "deny": ["Bash(sudo:*)", "Bash(curl:*)"],
                 "ask": ["Bash(rm:*)"],
                 "defaultMode": "acceptEdits",
             }
@@ -787,14 +801,17 @@ class TestTheMerge:
         box.apply(_work(tmp_path, _pc_settings(pc)))
         assert _json(_settings(box))["permissions"] == {
             "allow": ["Read", "Edit", "Bash(ls)"],
-            "deny": ["WebFetch"],
-            "ask": ["Bash(rm:*)"],
+            "deny": ["Bash(sudo:*)", "Bash(curl:*)", "WebFetch"],
+            "ask": ["Bash(rm:*)", "Write"],
             "defaultMode": "acceptEdits",
         }
 
-    def test_an_empty_settings_file_is_an_empty_object(self, box, tmp_path, capsys):
+    @pytest.mark.parametrize("text", [b"", b" \n\t\n"])
+    def test_an_empty_settings_file_is_an_empty_object(
+        self, box, tmp_path, capsys, text
+    ):
         _settings(box).parent.mkdir(parents=True)
-        _settings(box).write_bytes(b"")
+        _settings(box).write_bytes(text)
         box.apply(_work(tmp_path, _pc_settings({"model": "opus"})))
         assert _status(_lines(capsys), "settings") == "did"
         assert _json(_settings(box))["model"] == "opus"

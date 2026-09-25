@@ -190,6 +190,9 @@ def _last(text: str) -> str:
 # A drive-letter path (C:\ or C:/) starting ANY word -- the program or an
 # argument (node "C:\...\notify.mjs") -- names a file only the PC has.
 # Anchored on the left, so a URL's "s://" or "e:///" is never one.
+# Accepted false positive: an scp-style single-letter host (``scp a:/x .``)
+# reads as a drive letter and drops the hook -- such a hook is vanishingly
+# rare, and keeping a PC path the node cannot run is the worse failure.
 _WINDOWS_PATH = re.compile(r"(^|[\s\"'=(])[A-Za-z]:[\\/]")
 # Where an unquoted word ends, in the raw command text.
 _WORD_END = re.compile(r"[\s\"';&|)]")
@@ -203,7 +206,10 @@ _OPERATOR = re.compile(r"[;&|)]")
 # every node has it).
 _SHELL_WORDS = frozenset(
     {
+        ":",
         "cd",
+        "pushd",
+        "popd",
         "source",
         ".",
         "export",
