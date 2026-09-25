@@ -726,3 +726,48 @@ def run_sync_loop(
             _clear_pid()
         log.info("node sync: stopped after %d tick(s)", ticks)
     return 0
+
+
+def _pull_sid(
+    node: Node, entry: NodeMapEntry, mark: Mark | None
+) -> tuple[Mark, list[Path], bool]:
+    """One pull of one session: its next mark, the files that landed, and
+    whether a second pull is needed because the transcript dir only became
+    known with this answer."""
+    spec = _spec_for(entry, mark)
+    snap = _pull_node(node, {entry.sid: spec})
+    new = _next_mark(spec, mark, snap, entry.sid)
+    if entry.sid in snap.state_files and entry.sid not in snap.failed_sids:
+        _prune_state(node.nick, entry.sid, snap.state_files[entry.sid])
+    again = new.realpath is not None and spec.project_dir != nodes.encoded_project_dir(
+        new.realpath
+    )
+    return new, list(snap.files), again
+
+
+def final_pull(
+    config: MagentConfig,
+    name: str,
+    *,
+    wait_s: float = remote_mux.PULL_TIMEOUT_S,
+    local_user: str | None = None,
+) -> remote_mux.PullResult | None:
+    """Pull project ``name``'s node session once more -- ``down`` calls this
+    before it kills the session, so the last turn is home. None when the
+    project was never placed. Waits up to ``wait_s`` for a daemon tick that
+    holds the node, then raises LockHeld; NodeConfigError and RemoteError
+    also go to the caller, which decides what "could not pull" means."""
+    entry = nodes.read_node_map().get(name)
+    if entry is None:
+        return None
+    user = local_user if local_user is not None else local_username()
+    node = nodes.node_for_nick(config, entry.nick, local_user=user)
+    with node_lock(entry.nick, wait_s=wait_s):
+        marks = _read_marks(entry.nick)
+        mark, files, again = _pull_sid(node, entry, marks.get(entry.sid))
+        if again:
+            mark, more, _ = _pull_sid(node, entry, mark)
+            files += more
+        marks[entry.sid] = mark
+        _write_marks(entry.nick, marks)
+    return remote_mux.PullResult(files=tuple(files), since=mark.since)

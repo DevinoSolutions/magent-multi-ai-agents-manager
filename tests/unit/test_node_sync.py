@@ -1430,3 +1430,60 @@ class TestAHungNodeDoesNotHoldTheTick:
         assert rc == 0
         assert elapsed < 10
         assert shutdowns == [[(False, True)]]
+
+
+class TestTheFinalPull:
+    def test_a_first_final_pull_learns_the_directory_then_pulls_its_transcripts(
+        self, placed, fake_ssh
+    ):
+        _answer(
+            fake_ssh,
+            "devino-second",
+            meta=pull_meta(realpaths={"api": "/home/amin/magent/api"}),
+            files={"api/transcripts/abc.jsonl": "x\n"},
+        )
+        result = node_sync.final_pull(_config(), "api")
+        assert result is not None
+        assert len(_calls_to(fake_ssh, "devino-second")) == 2
+        assert nodes.transcripts_dir("second", "api") / "abc.jsonl" in result.files
+        assert result.since == 4999.0
+        assert _marks() == {
+            "api": {"since": 4999.0, "realpath": "/home/amin/magent/api"}
+        }
+
+    def test_a_final_pull_with_a_known_directory_is_one_call(self, placed, fake_ssh):
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"),
+            {"api": {"since": 10.0, "realpath": "/home/amin/magent/api"}},
+        )
+        _answer(
+            fake_ssh,
+            "devino-second",
+            meta=pull_meta(realpaths={"api": "/home/amin/magent/api"}),
+        )
+        node_sync.final_pull(_config(), "api")
+        (call,) = _calls_to(fake_ssh, "devino-second")
+        assert _payload(call)["sids"]["api"]["since"] == 10.0
+
+    def test_a_project_that_was_never_placed_has_nothing_to_pull(
+        self, placed, fake_ssh
+    ):
+        assert node_sync.final_pull(_config(), "nowhere") is None
+        assert fake_ssh.calls() == []
+
+    def test_a_final_pull_waits_for_the_daemons_tick_then_gives_up(
+        self, placed, fake_ssh
+    ):
+        started = time.monotonic()
+        with exclusive_lock("node-pull-second"), pytest.raises(LockHeld):
+            node_sync.final_pull(_config(), "api", wait_s=0.5)
+        assert time.monotonic() - started >= 0.4
+        assert fake_ssh.calls() == []
+
+    def test_an_unreachable_node_raises_for_the_caller_to_report(
+        self, placed, fake_ssh
+    ):
+        _answer(fake_ssh, "devino-second", rc=255, stderr=REFUSED)
+        with pytest.raises(remote_mux.RemoteError) as info:
+            node_sync.final_pull(_config(), "api")
+        assert info.value.rc == 255
