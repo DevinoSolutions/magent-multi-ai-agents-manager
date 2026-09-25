@@ -1526,6 +1526,18 @@ class TestProvision:
         assert bounds == [("programs", probe), ("provision", given)]
         assert bounds[0][1] <= remote_mux.PROGRAMS_TIMEOUT_S
 
+    # Every name answered is not enough: a probe that exited non-zero failed,
+    # whatever it printed before it did.
+    def test_a_probe_that_answers_every_name_but_exits_non_zero_failed(self, fake_ssh):
+        fake_ssh.set_reply(
+            f"{remote_mux.SOCKET} npx", stdout="ok\tnpx\t/usr/bin/npx\n", rc=1
+        )
+        with pytest.raises(remote_mux.ProgramsProbeFailed) as caught:
+            remote_mux.node_programs(
+                NODE, ["npx"], timeout_s=remote_mux.PROGRAMS_TIMEOUT_S
+            )
+        assert caught.value.lines == (ScriptLine("fail", "programs", "exited 1"),)
+
     def test_a_failed_step_comes_back_as_rows_not_an_exception(self, fake_ssh):
         fake_ssh.set_reply("bash -s", stdout="fail\tgh\tgh is not installed\n", rc=1)
         report = remote_mux.provision(
