@@ -106,9 +106,9 @@ update_repo() {
     if [ "$allow" != 1 ] && [ -n "$(git -C "$dir" status --porcelain --untracked-files=no)" ]; then
       die 3 "$dir has uncommitted changes on the node; commit or discard them there, or pass --allow-dirty"
     fi
-    git -C "$dir" fetch -q origin "$branch" || die 5 "git fetch failed in $dir"
+    git -C "$dir" fetch -q origin -- "$branch" || die 5 "git fetch failed in $dir"
     if git -C "$dir" rev-parse -q --verify "refs/heads/$branch" >/dev/null; then
-      git -C "$dir" checkout -q "$branch" || die 5 "git checkout $branch failed in $dir"
+      git -C "$dir" checkout -q "$branch" -- || die 5 "git checkout $branch failed in $dir"
       git -C "$dir" merge -q --ff-only "origin/$branch" ||
         die 5 "$dir: $branch on the node has diverged from origin; reconcile it there"
     else
@@ -116,8 +116,8 @@ update_repo() {
         die 5 "git checkout $branch failed in $dir"
     fi
   else
-    mkdir -p "$(dirname "$dir")" || die 5 "cannot create the parent of $dir"
-    git clone -q --branch "$branch" "$url" "$dir" || die 5 "git clone of $url failed"
+    mkdir -p -- "$(dirname -- "$dir")" || die 5 "cannot create the parent of $dir"
+    git clone -q --branch "$branch" -- "$url" "$dir" || die 5 "git clone of $url failed"
   fi
   commits[$dir]=$(git -C "$dir" rev-parse HEAD) || die 5 "no HEAD in $dir"
 }
@@ -138,11 +138,11 @@ copy_tree() {
     target=$(realpath -m -- "$dest/$rel") || die 5 "cannot resolve $dest/$rel"
     [[ $target == "$base"/* ]] || die 5 "$dest/$rel resolves outside $dest ($target); not writing through a link"
     [ ! -d "$target" ] || die 5 "$dest/$rel is a folder on the node"
-    mkdir -p "$(dirname "$target")" || die 5 "cannot create a folder for $rel"
-    cp "$src/$rel" "$target" || die 5 "cannot write $dest/$rel"
-    chmod 600 "$target" || die 5 "cannot chmod $dest/$rel"
+    mkdir -p -- "$(dirname -- "$target")" || die 5 "cannot create a folder for $rel"
+    cp -- "$src/$rel" "$target" || die 5 "cannot write $dest/$rel"
+    chmod 600 -- "$target" || die 5 "cannot chmod $dest/$rel"
     copied+=("$rel")
-  done < <(cd "$src" && find . -type f -print0 | sort -z)
+  done < <(cd -- "$src" && find . -type f -print0 | sort -z)
   umask "$mask"
 }
 
@@ -157,7 +157,7 @@ seed_memory() {
   local src=$1 dest=$2
   [ -d "$src" ] || return 0
   if [ -e "$dest" ] || [ -h "$dest" ]; then return 0; fi
-  (umask 077 && mkdir -p "$dest") || die 5 "cannot create $dest"
+  (umask 077 && mkdir -p -- "$dest") || die 5 "cannot create $dest"
   copy_tree "$src" "$dest"
 }
 
@@ -180,7 +180,7 @@ main() {
   work=$(mktemp -d) || die 5 "mktemp failed"
   trap 'rm -rf -- "$work"' EXIT
   unpacked=$work/unpacked
-  mkdir "$unpacked" || die 5 "mkdir failed"
+  mkdir -- "$unpacked" || die 5 "mkdir failed"
   magent_payload >"$work/payload.tar" || die 2 "unreadable payload"
   check_payload "$work/payload.tar"
   tar -x --no-same-owner --no-same-permissions -f "$work/payload.tar" -C "$unpacked" ||
@@ -197,6 +197,11 @@ main() {
     next_token url
     next_token branch
     next_token dir
+    # A token git could read as an option (--upload-pack=...) is refused
+    # here, before any git runs; the calls below also end their options.
+    [[ $url != -* ]] || die 2 "a repo url may not start with -: $url"
+    [[ $branch != -* ]] || die 2 "a branch may not start with -: $branch"
+    [[ $dir == /* ]] || die 2 "a repo folder must be absolute: $dir"
     urls+=("$url")
     branches+=("$branch")
     dirs+=("$dir")
@@ -224,7 +229,7 @@ main() {
   for ((i = 0; i < nrepos; i++)); do
     update_repo "${urls[i]}" "${branches[i]}" "${dirs[i]}"
   done
-  mkdir -p "$root" || die 5 "cannot create $root"
+  mkdir -p -- "$root" || die 5 "cannot create $root"
   ship_files "$unpacked/project" "$root"
   seed_memory "$unpacked/memory" "$HOME/.claude/projects/$enc/memory"
 
