@@ -233,7 +233,7 @@ class TestTheNodeLock:
         clock = iter([0.0, 0.1, 0.3, 0.6])
         with (
             exclusive_lock("node-pull-second"),
-            pytest.raises(LockHeld),
+            pytest.raises(node_sync.NodeLockHeld),
             node_sync.node_lock(
                 "second", wait_s=0.5, sleep=naps.append, now=lambda: next(clock)
             ),
@@ -246,10 +246,13 @@ class TestTheNodeLock:
             raise AssertionError("slept")
 
         with (
-            pytest.raises(LockHeld, match="inner"),
+            pytest.raises(LockHeld, match="inner") as exc,
             node_sync.node_lock("second", sleep=never),
         ):
             raise LockHeld("inner")
+        # Only a refused ACQUIRE is the node's own lock: the body's LockHeld
+        # is some other lock, and the syncer must not read it as contention.
+        assert not isinstance(exc.value, node_sync.NodeLockHeld)
         with node_sync.node_lock("second"):
             pass
 
@@ -1011,3 +1014,205 @@ class TestANodeFailsAlone:
         assert results["third"] == (node_sync.OK, "")
         assert _calls_to(fake_ssh, "devino-second") == []
         assert _node_warnings(caplog, "second") == []
+
+
+def _snap() -> remote_mux.NodeSnapshot:
+    return remote_mux.NodeSnapshot(
+        now=1.0,
+        sessions=(),
+        sample=None,
+        realpaths={},
+        state_files={},
+        files=(),
+        failed_sids=frozenset(),
+    )
+
+
+def _pull_raising(raises: dict[str, BaseException]):
+    """The ``pull=`` seam: raise ``raises[nick]`` for that node (read at call
+    time, so a test can change it between ticks), else an empty snapshot."""
+
+    def pull(node, sids):
+        exc = raises.get(node.nick)
+        if exc is not None:
+            raise exc
+        return _snap()
+
+    return pull
+
+
+def _node_errors(caplog) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.name == "magent.nodes" and r.levelno == logging.ERROR
+    ]
+
+
+class TestABugInOneNodeFailsItAlone:
+    def test_a_bug_in_one_nodes_pull_fails_that_node_and_the_tick_goes_on(self, placed):
+        syncer = node_sync.NodeSyncer(
+            _config(), pull=_pull_raising({"second": KeyError("sid")})
+        )
+        assert syncer.tick() == {
+            "second": (node_sync.FAILED, "internal error: KeyError"),
+            "third": (node_sync.OK, ""),
+        }
+        assert nodes.read_sessions("third") is not None
+
+    def test_a_bug_is_one_error_with_its_traceback_per_state_change(
+        self, placed, caplog
+    ):
+        _capture_nodes_log(caplog)
+        syncer = node_sync.NodeSyncer(
+            _config(), pull=_pull_raising({"second": KeyError("sid")})
+        )
+        syncer.tick()
+        syncer.tick()
+        (record,) = _node_errors(caplog)
+        assert record.getMessage() == "node second: failed (internal error: KeyError)"
+        assert record.exc_info is not None
+        assert record.exc_info[0] is KeyError
+        assert _node_warnings(caplog, "second") == []
+
+    def test_a_plain_failure_turning_into_a_bug_is_still_reported(self, placed, caplog):
+        _capture_nodes_log(caplog)
+        raises: dict[str, BaseException] = {
+            "second": remote_mux.RemoteError(0, "no MAGENT-PULL header", ("ssh",))
+        }
+        syncer = node_sync.NodeSyncer(_config(), pull=_pull_raising(raises))
+        syncer.tick()
+        raises["second"] = TypeError("bad")
+        syncer.tick()
+        assert _node_warnings(caplog, "second") == [
+            "node second: failed (no MAGENT-PULL header)"
+        ]
+        (record,) = _node_errors(caplog)
+        assert record.getMessage() == "node second: failed (internal error: TypeError)"
+
+    def test_a_lock_held_inside_the_pull_is_a_bug_not_contention(self, placed):
+        results = node_sync.NodeSyncer(
+            _config(), pull=_pull_raising({"second": LockHeld("some other lock")})
+        ).tick()
+        assert results["second"] == (node_sync.FAILED, "internal error: LockHeld")
+
+    def test_an_os_error_fails_that_node_alone(self, placed):
+        results = node_sync.NodeSyncer(
+            _config(), pull=_pull_raising({"second": PermissionError("denied")})
+        ).tick()
+        assert results == {
+            "second": (node_sync.FAILED, "denied"),
+            "third": (node_sync.OK, ""),
+        }
+
+    def test_a_node_back_from_a_failure_is_ok_again_not_reachable_again(
+        self, placed, caplog
+    ):
+        _capture_nodes_log(caplog)
+        raises: dict[str, BaseException] = {
+            "second": remote_mux.RemoteError(0, "no MAGENT-PULL header", ("ssh",))
+        }
+        syncer = node_sync.NodeSyncer(_config(), pull=_pull_raising(raises))
+        syncer.tick()
+        raises.clear()
+        syncer.tick()
+        messages = [r.getMessage() for r in caplog.records]
+        assert "node second: ok again (was failed)" in messages
+        assert not [m for m in messages if "reachable again" in m]
+
+
+class TestWhatCountsAsUnreachable:
+    @pytest.mark.parametrize(
+        ("err", "outcome"),
+        [
+            (
+                remote_mux.RemoteError(255, "Connection refused", ("ssh",)),
+                "unreachable",
+            ),
+            (
+                remote_mux.RemoteError(
+                    None, "timed out after 1s", ("ssh",), timed_out=True
+                ),
+                "unreachable",
+            ),
+            # Both rc None, neither a silent node: an over-cap reply is a node
+            # that answered too much, a spawn failure never left this PC.
+            (
+                remote_mux.RemoteError(None, "reply exceeded 5 bytes", ("ssh",)),
+                "failed",
+            ),
+            (remote_mux.RemoteError(None, "Permission denied", ("ssh",)), "failed"),
+            (remote_mux.RemoteError(1, "boom", ("ssh",)), "failed"),
+        ],
+    )
+    def test_only_a_transport_failure_or_a_timeout_is_unreachable(self, err, outcome):
+        assert node_sync._classify(err)[0] == outcome
+
+    def test_a_node_cannot_write_terminal_escapes_into_the_log(self, placed, caplog):
+        _capture_nodes_log(caplog)
+        tail = "first\n\x1b]0;pwned\x07\x1b[2Jboom\tend\x9b"
+        err = remote_mux.RemoteError(1, tail, ("ssh",))
+        results = node_sync.NodeSyncer(
+            _config(), pull=_pull_raising({"second": err})
+        ).tick()
+        assert results["second"] == (node_sync.FAILED, "?]0;pwned??[2Jboom\tend?")
+        (line,) = _node_warnings(caplog, "second")
+        assert not re.search(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]", line)
+
+
+class TestABadWatermarkIsNoWatermark:
+    @pytest.mark.parametrize(
+        "since",
+        [
+            pytest.param("1" + "0" * 309, id="309-digit-int"),
+            pytest.param("NaN", id="nan"),
+            pytest.param("Infinity", id="inf"),
+            pytest.param("-Infinity", id="-inf"),
+        ],
+    )
+    def test_a_since_that_is_not_a_finite_time_is_absent(self, placed, since):
+        path = nodes.pull_marks_path("second")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Raw text: json.loads accepts each of these, and none is a time.
+        # float() of the 309-digit int raises OverflowError, not ValueError.
+        bad = '{"since": ' + since + ', "realpath": "/home/amin/magent/api"}'
+        path.write_text(
+            '{"api": ' + bad + ', "ok": {"since": 5, "realpath": null}}',
+            encoding="utf-8",
+        )
+        assert node_sync._read_marks("second") == {
+            "ok": node_sync.Mark(since=5.0, realpath=None)
+        }
+
+
+class TestAnEmptyRemoteRoot:
+    def test_a_session_with_no_remote_root_is_skipped_naming_the_field(
+        self, placed, caplog
+    ):
+        _capture_nodes_log(caplog)
+        nodes.write_node_map(
+            {
+                "api": NodeMapEntry(
+                    nick="second",
+                    sid="api",
+                    placed_ts=1.0,
+                    attached_existing=False,
+                    remote_root="",
+                )
+            }
+        )
+        asked: list[set[str]] = []
+
+        def pull(node, sids):
+            asked.append(set(sids))
+            return _snap()
+
+        results = node_sync.NodeSyncer(_config(), pull=pull).tick()
+        assert results["second"] == (node_sync.OK, "")
+        assert asked == [set(), set()]
+        assert _node_warnings(caplog, "second") == [
+            (
+                "node second: session 'api' has an empty remote_root in the "
+                "node map; skipping it"
+            )
+        ]

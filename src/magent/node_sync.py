@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -66,9 +68,14 @@ _PID_PATH = Path.home() / ".magent" / f"{HEARTBEAT_NAME}.pid"
 # One tick's outcome per node.
 OK = "ok"
 UNREACHABLE = "unreachable"  # ssh transport failure (255) or no answer in time
-FAILED = "failed"  # the node answered, and the answer was not a pull
+# Everything else: a bad answer, a local error (an ssh that will not start, an
+# over-cap reply, a disk write), or a bug ("internal error: <type>").
+FAILED = "failed"
 MISCONFIGURED = "misconfigured"  # the nick does not resolve (D4, no user)
 LOCKED = "locked"  # another pull holds this node right now
+# Not an outcome (tick reports it as FAILED): the state _note keeps for a node
+# whose pull raised something unexpected, so its ERROR is logged once.
+_INTERNAL_ERROR = "internal error"
 
 
 def daemon_running() -> bool:
@@ -237,6 +244,12 @@ def state_stores() -> list[tuple[str, str, Path]]:
     return stores
 
 
+class NodeLockHeld(LockHeld):
+    """``node_lock`` could not take ``node-pull-<nick>``: another pull of the
+    same node holds it. Its own type so a caller can tell this contention from
+    a LockHeld raised INSIDE the lock's body, which is some other lock."""
+
+
 @contextlib.contextmanager
 def node_lock(
     nick: str,
@@ -246,18 +259,18 @@ def node_lock(
     now: Callable[[], float] = time.monotonic,
 ) -> Iterator[None]:
     """Hold ``node-pull-<nick>`` for one pull, retrying every
-    ``NODE_LOCK_RETRY_S`` for up to ``wait_s``. LockHeld when it stays taken.
-    Only ACQUIRING is retried: a LockHeld raised inside the body propagates as
-    itself."""
+    ``NODE_LOCK_RETRY_S`` for up to ``wait_s``. NodeLockHeld when it stays
+    taken. Only ACQUIRING is retried: a LockHeld raised inside the body
+    propagates as itself, never as NodeLockHeld."""
     deadline = now() + wait_s
     with contextlib.ExitStack() as stack:
         while True:
             try:
                 stack.enter_context(exclusive_lock(NODE_LOCK_PREFIX + nick))
                 break
-            except LockHeld:
+            except LockHeld as e:
                 if now() >= deadline:
-                    raise
+                    raise NodeLockHeld(*e.args) from e
                 sleep(NODE_LOCK_RETRY_S)
         yield
 
@@ -342,9 +355,16 @@ def _read_marks(nick: str) -> dict[str, Mark]:
         since, real = value.get("since"), value.get("realpath")
         if isinstance(since, bool) or not isinstance(since, (int, float)):
             continue
-        out[sid] = Mark(
-            since=float(since), realpath=real if isinstance(real, str) else None
-        )
+        # json.loads accepts NaN/Infinity and arbitrarily long integers; neither
+        # is a time, and float() of a 309+-digit int raises OverflowError. A bad
+        # mark is no mark: that session is pulled from the beginning.
+        try:
+            since_f = float(since)
+        except OverflowError:
+            continue
+        if not math.isfinite(since_f):
+            continue
+        out[sid] = Mark(since=since_f, realpath=real if isinstance(real, str) else None)
     return out
 
 
@@ -357,14 +377,24 @@ def _spec_for(entry: NodeMapEntry, mark: Mark | None) -> remote_mux.SidPull:
     )
 
 
+# C0 and C1 control characters and DEL, minus tab: a node's stderr is its own
+# words, and an ESC sequence in it must not reach a terminal tailing the log.
+_CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]")
+
+
 def _last_line(text: str) -> str:
+    """The last non-blank line of a node's stderr, with every control
+    character but tab shown as ``?``."""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return lines[-1] if lines else ""
+    return _CONTROL.sub("?", lines[-1]) if lines else ""
 
 
 def _classify(e: remote_mux.RemoteError) -> tuple[str, str]:
+    """UNREACHABLE only when the node could not be reached (ssh's transport rc
+    255) or never answered (``timed_out``). Every other rc-None error -- a
+    reply over the cap, a local ssh that would not start -- is FAILED."""
     detail = _last_line(e.stderr_tail) or f"rc={e.rc}"
-    if e.rc is None or e.rc == SSH_TRANSPORT_RC:
+    if e.timed_out or e.rc == SSH_TRANSPORT_RC:
         return UNREACHABLE, detail
     return FAILED, detail
 
@@ -399,7 +429,12 @@ class NodeSyncer:
         self._local_user = local_user
         self._lock_wait_s = lock_wait_s
         self._warned: set[tuple[str, str]] = set()
+        # The last noted state per nick: an outcome, or _INTERNAL_ERROR.
         self._last: dict[str, str] = {}
+        # A node's unexpected exception, from its worker thread to _note. One
+        # key per nick, and one worker per nick at a time, so no two threads
+        # write the same key.
+        self._errors: dict[str, Exception] = {}
 
     def reconfigure(self, config: MagentConfig) -> None:
         self._config = config
@@ -430,53 +465,81 @@ class NodeSyncer:
     def _sync_node(
         self, nick: str, entries: Mapping[str, NodeMapEntry], local_user: str
     ) -> tuple[str, str]:
-        """One node's pull, reduced to an outcome. Every failure a node (or its
-        config) can produce stops here; anything else is a bug and propagates."""
+        """One node's pull, reduced to an outcome. Nothing raises out of here:
+        what a node (or its config) can do has its own outcome, and anything
+        else is a bug in this PC's code, which fails THIS node alone as
+        ``internal error: <type>`` and hands the exception to ``_note``."""
+        self._errors.pop(nick, None)
         try:
             node = nodes.node_for_nick(self._config, nick, local_user=local_user)
             with node_lock(nick, wait_s=self._lock_wait_s):
                 self._pull_and_store(node, entries)
         except nodes.NodeConfigError as e:
             return MISCONFIGURED, str(e)
-        except LockHeld:
+        except NodeLockHeld:
             return LOCKED, "another pull holds this node"
+        except LockHeld as e:
+            # Raised inside the node lock, so not the node's own lock: nothing
+            # the pull does takes one, which makes it a bug, not contention.
+            return self._internal_error(nick, e)
         except remote_mux.RemoteError as e:
             return _classify(e)
         except OSError as e:
             return FAILED, str(e)
+        except Exception as e:  # noqa: BLE001  # reason: one node's bug must not stop the other nodes' pulls or crash-loop the daemon; _note logs it with its traceback once per state change
+            return self._internal_error(nick, e)
         return OK, ""
+
+    def _internal_error(self, nick: str, e: Exception) -> tuple[str, str]:
+        self._errors[nick] = e
+        return FAILED, f"internal error: {type(e).__name__}"
 
     def _note(self, nick: str, outcome: str, detail: str) -> None:
         """One log line per state CHANGE: a node down for a day is one warning
         and one "reachable again", not 2,880 lines. A locked tick is no state
-        (the other pull is doing the work) and is never logged."""
+        (the other pull is doing the work) and is never logged.
+
+        An internal error is a state of its own, logged at ERROR with its
+        traceback (so Sentry gets one event per change, never one per tick)."""
         if outcome == LOCKED:
             return
+        error = self._errors.pop(nick, None)
+        state = _INTERNAL_ERROR if error is not None else outcome
         prev = self._last.get(nick)
-        self._last[nick] = outcome
-        if outcome == prev:
+        self._last[nick] = state
+        if state == prev:
             return
         log = get_logger(LOG_NAME)
+        if error is not None:
+            log.error("node %s: %s (%s)", nick, outcome, detail, exc_info=error)
+            return
         if outcome == OK:
-            if prev is not None:
+            if prev == UNREACHABLE:
                 log.info("node %s: reachable again", nick)
+            elif prev is not None:
+                log.info("node %s: ok again (was %s)", nick, prev)
             return
         log.warning("node %s: %s (%s)", nick, outcome, detail)
 
-    def _warn_once(self, nick: str, sid: str) -> None:
+    def _warn_once(self, nick: str, sid: str, why: str) -> None:
         if (nick, sid) in self._warned:
             return
         self._warned.add((nick, sid))
         get_logger(LOG_NAME).warning(
-            "node %s: session %r cannot be mirrored on this PC; skipping it", nick, sid
+            "node %s: session %r %s; skipping it", nick, sid, why
         )
 
     def _pull_and_store(self, node: Node, entries: Mapping[str, NodeMapEntry]) -> None:
         marks = _read_marks(node.nick)
         specs: dict[str, remote_mux.SidPull] = {}
         for sid, entry in sorted(entries.items()):
-            if not remote_mux.pullable_sid(sid) or not entry.remote_root:
-                self._warn_once(node.nick, sid)
+            if not remote_mux.pullable_sid(sid):
+                self._warn_once(node.nick, sid, "cannot be mirrored on this PC")
+                continue
+            if not entry.remote_root:
+                self._warn_once(
+                    node.nick, sid, "has an empty remote_root in the node map"
+                )
                 continue
             specs[sid] = _spec_for(entry, marks.get(sid))
         snap = self._pull(node, specs)
