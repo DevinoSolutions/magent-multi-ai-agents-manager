@@ -2351,6 +2351,27 @@ class TestTodaysAttachShapesArePinned:
         assert kwargs == {"env": attach_client_env()}
 
 
+class TestTmuxAttachMarkers:
+    """A node pane attaches on ONE shared socket, so its sid sits in the `-t`
+    slot (exact form, `=<sid>`) instead of the socket slot -- quoted the same
+    three ways."""
+
+    def test_a_tmux_pane_is_marked_on_the_one_magent_socket(self):
+        from magent.cli import attach as attach_mod
+
+        assert attach_mod._attach_markers("api", "tmux") == (
+            "-L magent attach -t =api",
+            '-L magent attach -t "=api"',
+            "-L magent attach -t '=api'",
+        )
+
+    def test_an_unknown_multiplexer_has_no_markers_to_guess(self):
+        from magent.cli import attach as attach_mod
+
+        with pytest.raises(ValueError, match="screen"):
+            attach_mod._attach_markers("api", "screen")
+
+
 class TestClientProcessNames:
     """The scan's name list, pinned once so the five 'exactly one scan of
     exactly these' assertions elsewhere can reference it."""

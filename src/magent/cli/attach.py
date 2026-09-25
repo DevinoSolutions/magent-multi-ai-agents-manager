@@ -22,6 +22,7 @@ import click
 from magent.attach_client import (
     CLIENT_EXE_NAME,
     SSH_CONNECTION_OPTS,
+    TMUX_SOCKET,
     remote_attach_command,
 )
 from magent.cli.app import main
@@ -445,7 +446,7 @@ def _echo_already_open(title: str) -> None:
 _CLIENT_PROCESS_NAMES = ["ssh.exe", "psmux.exe", f"{CLIENT_EXE_NAME}.exe"]
 
 
-def _attach_markers(sid: str) -> tuple[str, ...]:
+def _attach_markers(sid: str, mux: str = "psmux") -> tuple[str, ...]:
     """Every spelling of "this process is attached to ``sid``" magent can spawn.
 
     The binary NAME is deliberately not part of the marker. The remote path
@@ -470,12 +471,27 @@ def _attach_markers(sid: str) -> tuple[str, ...]:
     chose to quote, so a quoting change cannot silently turn every live window
     into a corpse. They also cover the supervisor argv on any platform whose
     process table re-quotes arguments.
+
+    A node pane (``mux="tmux"``) attaches on ONE shared socket, so the sid moves
+    from the socket slot to the ``-t`` slot, in tmux's exact-match form:
+    ``-L magent attach -t =<sid>``, quoted the same three ways. magent spawns
+    the single-quoted one (``-t '=<sid>'``, see ``remote_attach_command``), and
+    its closing quote ends the name, so ``api``'s marker is NOT found inside a
+    live ``api2`` pane's command line. Only the bare variant could overlap that
+    way (``-t =api`` inside ``-t =api2``), and an overlap can only ever make a
+    dead window look ALIVE (left open), never the reverse: the conservative
+    direction ``_corpses`` is built around.
     """
-    return (
-        f"-L {sid} attach",
-        f'-L "{sid}" attach',
-        f"-L '{sid}' attach",
-    )
+    if mux == "psmux":
+        return (
+            f"-L {sid} attach",
+            f'-L "{sid}" attach',
+            f"-L '{sid}' attach",
+        )
+    if mux == "tmux":
+        head = f"-L {TMUX_SOCKET} attach -t"
+        return (f"{head} ={sid}", f'{head} "={sid}"', f"{head} '={sid}'")
+    raise ValueError(f"unknown multiplexer {mux!r}")
 
 
 def _corpses(open_sids: set[str], live_cmdlines: list[str]) -> set[str]:

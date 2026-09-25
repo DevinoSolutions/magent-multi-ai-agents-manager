@@ -68,8 +68,11 @@ meant to send.
 CORPSE COHERENCE -- read this before changing the argv. ``cli/attach.py``
 decides a pane is dead by scanning live process command lines for
 ``-L <sid> attach`` (``_attach_markers``) among ``_CLIENT_PROCESS_NAMES``.
-During a backoff sleep there is no ssh process at all, so this supervisor is
-what has to carry the marker -- and it does, for free, because
+For a node pane the marker is the tmux spelling instead,
+``-L magent attach -t '=<sid>'`` (``_attach_markers(sid, "tmux")``); each
+multiplexer's marker matches its own ``remote_attach_command`` and nothing
+else. During a backoff sleep there is no ssh process at all, so this
+supervisor is what has to carry the marker -- and it does, for free, because
 ``_spawn_windows`` hands us the remote command it would otherwise have given
 ssh, as our own ``--remote`` argument. The marker therefore appears verbatim in
 this process's command line. Do NOT "simplify" that by rebuilding the remote

@@ -997,6 +997,15 @@ class TestRemoteCommandContract:
         cmd = attach_client.remote_attach_command("api")
         assert any(m in cmd for m in attach_mod._attach_markers("api"))
 
+    @pytest.mark.parametrize("mux", attach_client.MUXES)
+    def test_every_multiplexers_command_is_recognised_by_its_own_markers(self, mux):
+        # A node pane mid-backoff is kept alive by exactly this match, same as a
+        # psmux one -- the two halves still live in different modules.
+        from magent.cli import attach as attach_mod
+
+        cmd = attach_client.remote_attach_command("api", mux)
+        assert any(m in cmd for m in attach_mod._attach_markers("api", mux))
+
 
 class TestTodaysPsmuxShapesArePinned:
     """Characterization, written green BEFORE ``--mux`` exists: every string and
