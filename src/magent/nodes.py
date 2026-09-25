@@ -431,11 +431,14 @@ def stdio_programs(scope: UserScope) -> dict[str, str]:
     return programs
 
 
-def without_missing_programs(scope: UserScope, *, found: frozenset[str]) -> UserScope:
+def without_missing_programs(
+    scope: UserScope, *, found: frozenset[str], unprobed: bool = False
+) -> UserScope:
     """``scope`` minus every stdio server whose program is not in ``found``
     (what the node's ``command -v`` resolved), with its mcpOAuth entries and a
     note per server. Runs BEFORE the payload is built, so a dropped server's
-    ``env`` never leaves this PC."""
+    ``env`` never leaves this PC. ``unprobed``: the probe failed, so the note
+    says the program is unconfirmed -- never that the node lacks it."""
     missing = {
         name: program
         for name, program in stdio_programs(scope).items()
@@ -454,7 +457,15 @@ def without_missing_programs(scope: UserScope, *, found: frozenset[str]) -> User
         notes=(
             *scope.notes,
             *(
-                f"mcp {name}: not shipped -- `{program}` is not on the node (command -v)"
+                (
+                    f"mcp {name}: not shipped -- the node's program probe failed, "
+                    f"so `{program}` is unconfirmed"
+                )
+                if unprobed
+                else (
+                    f"mcp {name}: not shipped -- `{program}` is not on the node "
+                    "(command -v)"
+                )
                 for name, program in sorted(missing.items())
             ),
         ),

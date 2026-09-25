@@ -1242,6 +1242,81 @@ class TestProvision:
             )
             in report.lines
         )
+        # The verdicts come from the scope AFTER the probe (M22).
+        assert ScriptLine("ok", "scope", "mcp x: shipped") not in report.lines
+
+    # M3: a probe that died (a node whose shell profile breaks `set -u`) is not
+    # a node that lacks the program. The candidate still stays behind -- the
+    # probe proved nothing -- but the report fails, naming the probe.
+    def test_a_failed_probe_fails_the_report_and_claims_nothing_about_the_node(
+        self, fake_ssh
+    ):
+        fake_ssh.set_reply(
+            f"{remote_mux.SOCKET} npx", stderr="bash: HOME: unbound variable\n", rc=1
+        )
+        spec = {"type": "stdio", "command": "npx", "env": {"K": "ENV-DECOY"}}
+        report = remote_mux.provision(
+            NODE,
+            _scope(mcp_servers={"x": spec}),
+            timeout_s=remote_mux.PROVISION_TIMEOUT_S,
+        )
+        _, apply = fake_ssh.calls()  # the rest of the scope still applies
+        _, _, data = _unpack(_sent(apply))
+        assert json.loads(data["mcp_servers.json"]) == {}
+        assert all(b"ENV-DECOY" not in blob for blob in data.values())
+        assert report.failed
+        assert (
+            ScriptLine("fail", "programs", "exited 1: bash: HOME: unbound variable")
+            in report.lines
+        )
+        assert (
+            ScriptLine(
+                "skip",
+                "scope",
+                "mcp x: not shipped -- the node's program probe failed, "
+                "so `npx` is unconfirmed",
+            )
+            in report.lines
+        )
+        assert not any("not on the node" in line.detail for line in report.lines)
+
+    def test_a_probe_that_skips_a_name_it_was_asked_is_a_failed_probe(self, fake_ssh):
+        fake_ssh.set_reply(
+            f"{remote_mux.SOCKET} npx uvx", stdout="ok\tnpx\t/usr/bin/npx\n"
+        )
+        with pytest.raises(remote_mux.ProgramsProbeFailed) as info:
+            remote_mux.node_programs(
+                NODE, ["uvx", "npx"], timeout_s=remote_mux.PROGRAMS_TIMEOUT_S
+            )
+        assert info.value.lines == (
+            ScriptLine("fail", "programs", "no answer for uvx"),
+        )
+
+    # M29 / M19: the apply's bound, and the probe's -- capped by its own
+    # constant, never the provision's 300s, and never above the caller's.
+    def test_the_provision_timeout_is_five_minutes(self):
+        assert remote_mux.PROVISION_TIMEOUT_S == 300.0
+
+    @pytest.mark.parametrize(
+        ("given", "probe"),
+        [(remote_mux.PROVISION_TIMEOUT_S, remote_mux.PROGRAMS_TIMEOUT_S), (5.0, 5.0)],
+    )
+    def test_the_probe_is_bounded_by_its_own_cap(
+        self, fake_ssh, monkeypatch, given, probe
+    ):
+        fake_ssh.set_reply(f"{remote_mux.SOCKET} npx", stdout="ok\tnpx\t/usr/bin/npx\n")
+        bounds: list[tuple[str, float]] = []
+        real = remote_mux.run_script
+
+        def spy(node, name, args, **kwargs):
+            bounds.append((name, kwargs["timeout_s"]))
+            return real(node, name, args, **kwargs)
+
+        monkeypatch.setattr(remote_mux, "run_script", spy)
+        spec = {"type": "stdio", "command": "npx"}
+        remote_mux.provision(NODE, _scope(mcp_servers={"x": spec}), timeout_s=given)
+        assert bounds == [("programs", probe), ("provision", given)]
+        assert bounds[0][1] <= remote_mux.PROGRAMS_TIMEOUT_S
 
     def test_a_failed_step_comes_back_as_rows_not_an_exception(self, fake_ssh):
         fake_ssh.set_reply("bash -s", stdout="fail\tgh\tgh is not installed\n", rc=1)
@@ -1354,22 +1429,31 @@ def _run_provision(
     fakes: tuple[FakeSsh, ...] = (),
     args: tuple[str, ...] = (),
     python: bool = True,
+    sysbin: Path | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """provision.sh under real bash, exactly as ssh would feed it, for a node
-    whose home is tmp_path/node."""
+    whose home is tmp_path/node -- which is also the cwd, as over ssh.
+    ``env`` adds to (or overrides) the three variables set here."""
     (tmp_path / "node").mkdir(exist_ok=True)
     (tmp_path / "tmp").mkdir(exist_ok=True)
-    sysbin = _sysbin(
-        tmp_path, PROVISION_TOOLS, python=python, name="sysbin" if python else "nopy"
-    )
+    if sysbin is None:
+        sysbin = _sysbin(
+            tmp_path,
+            PROVISION_TOOLS,
+            python=python,
+            name="sysbin" if python else "nopy",
+        )
     return subprocess.run(
         _bash_argv(*args),
         input=remote_mux._frame_script(node_scripts.script("provision"), payload),
         capture_output=True,
+        cwd=tmp_path / "node",
         env={
             "HOME": str(tmp_path / "node"),
             "PATH": os.pathsep.join([*(str(f.base) for f in fakes), str(sysbin)]),
             "TMPDIR": str(tmp_path / "tmp"),
+            **(env or {}),
         },
         timeout=120,
         check=False,
@@ -1470,6 +1554,65 @@ class TestProvisionShUnderRealBash:
         assert r.returncode == 2
         assert _rows(r) == {"provision": "fail"}
 
+    def test_anything_after_force_is_refused_too(self, tmp_path):
+        r = _run_provision(tmp_path, _node_payload(), args=("--force", "--bogus"))
+        assert r.returncode == 2
+        assert _rows(r) == {"provision": "fail"}
+        assert not (tmp_path / "node" / ".magent").exists()
+
+    def test_a_python3_older_than_3_8_is_one_fail_row_naming_the_repair(self, tmp_path):
+        sysbin = _sysbin(tmp_path, PROVISION_TOOLS, python=False, name="oldpy")
+        old = sysbin / "python3"
+        old.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        old.chmod(0o755)
+        r = _run_provision(tmp_path, _node_payload(), sysbin=sysbin)
+        assert r.returncode == 1
+        assert remote_mux.parse_report(r.stdout.decode("utf-8")).lines == (
+            ScriptLine(
+                "fail",
+                "python3",
+                "python3 on this node is older than 3.8 -- run: magent node setup",
+            ),
+        )
+
+    # M1: the shim expands the token (the read, the \r strip, the printf). A
+    # trace switched on from OUTSIDE the script -- SHELLOPTS in the ssh
+    # environment, a BASH_ENV file -- would print it to stderr, which
+    # _report_of tails into a fail row.
+    def test_a_trace_switched_on_from_outside_never_prints_the_token(self, tmp_path):
+        gh = make_fake_ssh(tmp_path, name="gh")
+        traced = tmp_path / "bash_env"
+        traced.write_text("set -x\n", encoding="utf-8")
+        r = _run_provision(
+            tmp_path,
+            _node_payload(token=TOKEN),
+            fakes=(gh,),
+            env={"SHELLOPTS": "xtrace", "BASH_ENV": str(traced)},
+        )
+        assert r.returncode == 0, r.stderr
+        assert b"+ set" in r.stderr  # the trace really was on
+        assert TOKEN.encode("ascii") not in r.stdout + r.stderr
+
+    # M4: under `python3 -c` sys.path[0] is the cwd, and over ssh the cwd is
+    # $HOME: a ~/json.py would be imported in place of the stdlib's.
+    def test_a_py_file_in_the_nodes_home_shadows_nothing(self, tmp_path):
+        home = tmp_path / "node"
+        home.mkdir()
+        (home / "json.py").write_text("raise SystemExit(7)\n", encoding="utf-8")
+        r = _run_provision(tmp_path, _node_payload())
+        assert r.returncode == 0, r.stderr
+        assert _rows(r)["settings"] == "did"
+        assert _rows(r)["state_hook"] == "did"
+
+    # A TMPDIR that starts with "-" makes a work dir that does too: as a
+    # separate argv word after --work it read as an option (argparse, rc 2).
+    def test_a_work_dir_starting_with_a_dash_is_still_a_value(self, tmp_path):
+        (tmp_path / "node" / "-t").mkdir(parents=True)
+        r = _run_provision(tmp_path, _node_payload(), env={"TMPDIR": "-t"})
+        assert r.returncode == 0, r.stderr
+        assert _rows(r)["state_hook"] == "did"
+        assert list((tmp_path / "node" / "-t").iterdir()) == []
+
 
 @POSIX_BASH
 class TestProgramsShUnderRealBash:
@@ -1496,3 +1639,41 @@ class TestProgramsShUnderRealBash:
             ("skip", "no-such-program"),
         ]
         assert lines[0].detail == str(uvx)
+
+    # M2: `command -v` answers for a builtin, a keyword and a function too --
+    # including this script's own main -- none of which a server can exec. A
+    # relative path resolves against a cwd the server will not share.
+    def test_a_builtin_keyword_function_or_relative_path_is_no_program(self, tmp_path):
+        sysbin = _sysbin(tmp_path, ("bash",), python=False, name="progbin")
+        (tmp_path / "node").mkdir()
+        x = tmp_path / "node" / "x"
+        x.write_text("#!/bin/sh\n", encoding="utf-8")
+        x.chmod(0o755)
+        names = ("main", "cd", "if", "[[", "./x")
+        r = subprocess.run(
+            _bash_argv(*names),
+            input=remote_mux._frame_script(node_scripts.script("programs"), None),
+            capture_output=True,
+            cwd=tmp_path / "node",
+            env={"HOME": str(tmp_path / "node"), "PATH": str(sysbin)},
+            timeout=60,
+            check=False,
+        )
+        assert r.returncode == 0, r.stderr
+        lines = remote_mux.parse_report(r.stdout.decode("utf-8")).lines
+        assert [(line.status, line.item) for line in lines] == [
+            ("skip", name) for name in names
+        ]
+
+
+class TestProvisionShText:
+    def test_the_cleanup_trap_is_set_before_the_work_dir_exists(self):
+        text = node_scripts.script("provision")
+        assert text.index("trap cleanup EXIT") < text.index("WORK=$(mktemp -d)")
+
+    def test_tracing_is_off_before_the_library_or_the_token(self):
+        for name in ("provision", "programs"):
+            lines = node_scripts._read(name).splitlines()
+            at = lines.index("set -euo pipefail")
+            assert lines[at + 1 : at + 4].count("set +o xtrace") == 1, name
+            assert lines.index("set +o xtrace") < lines.index("# @include lib.sh")
