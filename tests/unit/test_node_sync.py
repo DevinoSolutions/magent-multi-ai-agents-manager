@@ -33,7 +33,7 @@ from magent.config import (
 from magent.env import get_env
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import get_logger, heartbeat_age, write_heartbeat
-from magent.nodes import NodeMapEntry, encoded_project_dir
+from magent.nodes import LoadSample, NodeMapEntry, encoded_project_dir
 from tests.unit._pull_reply import SAMPLE, pull_meta, pull_reply
 
 if TYPE_CHECKING:
@@ -1161,3 +1161,110 @@ class TestTheMirror:
             for x in nodes.load_path("second").read_text(encoding="utf-8").splitlines()
         ]
         assert rows == [{**SAMPLE, "ts": 1070.0}, {**SAMPLE, "ts": 4650.0}]
+
+
+def _seed_marks(nick: str = "second", **marks: tuple[float, str]) -> bytes:
+    path = nodes.pull_marks_path(nick)
+    nodes.write_json_atomic(
+        path, {sid: {"since": s, "realpath": r} for sid, (s, r) in marks.items()}
+    )
+    return path.read_bytes()
+
+
+def _two_on_second() -> MagentConfig:
+    nodes.write_node_map({"api": _entry("second", "api"), "db": _entry("second", "db")})
+    return _config(
+        pool={"second": POOL["second"]},
+        projects=[
+            ProjectConfig(path="api", node="second"),
+            ProjectConfig(path="db", node="second"),
+        ],
+    )
+
+
+class TestMarksMoveOnlyAfterAPull:
+    """pull.json is written AFTER a pull lands, never before: a mark advanced
+    optimistically and then left behind by a failed pull would skip files."""
+
+    def test_an_unreachable_node_leaves_the_marks_byte_identical(
+        self, placed, fake_ssh
+    ):
+        before = _seed_marks(api=(10.0, "/home/amin/magent/api"))
+        _answer(fake_ssh, "devino-second", rc=255, stderr=REFUSED)
+        results = node_sync.NodeSyncer(_second_only()).tick()
+        assert results["second"][0] == node_sync.UNREACHABLE
+        assert nodes.pull_marks_path("second").read_bytes() == before
+
+    def test_a_reply_cut_off_before_its_trailer_leaves_the_marks_byte_identical(
+        self, placed, fake_ssh
+    ):
+        before = _seed_marks(api=(10.0, "/home/amin/magent/api"))
+        reply = pull_reply(
+            pull_meta(realpaths={"api": "/home/amin/magent/api"}),
+            {"api/transcripts/a.jsonl": "x\n"},
+        )
+        cut = reply[: reply.rindex(remote_mux.PULL_TRAILER.decode("ascii"))]
+        fake_ssh.set_reply("devino-second", stdout=cut)
+        results = node_sync.NodeSyncer(_second_only()).tick()
+        assert results["second"][0] == node_sync.FAILED
+        assert nodes.pull_marks_path("second").read_bytes() == before
+
+
+class TestMarkAndPruneScope:
+    def test_a_failed_session_keeps_its_mark_while_its_neighbour_advances(self, placed):
+        _seed_marks(api=(10.0, "/ra"), db=(20.0, "/rd"))
+
+        def pull(_node, _sids):
+            return _snapshot(
+                now=9000.0,
+                realpaths={"api": "/ra", "db": "/rd"},
+                failed_sids=frozenset({"api"}),
+            )
+
+        node_sync.NodeSyncer(_two_on_second(), pull=pull).tick()
+        assert _marks() == {
+            "api": {"since": 10.0, "realpath": "/ra"},
+            "db": {"since": 8999.0, "realpath": "/rd"},
+        }
+
+    def test_pruning_one_session_touches_no_other_nodes_mirror_and_no_local_record(
+        self, placed, tmp_path, monkeypatch
+    ):
+        local = tmp_path / "local-state"
+        monkeypatch.setattr(agent_state, "STATE_DIR", local)
+        local.mkdir()
+        (local / "x.json").write_text("{}", encoding="utf-8")
+        other = nodes.state_dir("third", "api")
+        other.mkdir(parents=True)
+        (other / "x.json").write_text("{}", encoding="utf-8")
+        mine = nodes.state_dir("second", "api")
+        mine.mkdir(parents=True)
+        (mine / "x.json").write_text("{}", encoding="utf-8")
+
+        def pull(_node, _sids):
+            return _snapshot(realpaths={"api": "/r"}, state_files={"api": ()})
+
+        node_sync.NodeSyncer(_second_only(), pull=pull).tick()
+        assert not (mine / "x.json").exists()
+        assert (other / "x.json").exists()
+        assert (local / "x.json").exists()
+
+    def test_two_nodes_sampled_in_one_tick_each_get_their_row(self, placed):
+        """The throttle is per node. Third's pull waits until second's row is
+        on disk (plus a beat for the throttle's bookkeeping), so second has
+        always stored first: a throttle shared across nodes would then drop
+        third's row every time, not only when the threads happen to race."""
+
+        def pull(node, _sids):
+            if node.nick == "third":
+                deadline = time.monotonic() + 10
+                while not nodes.load_path("second").exists():
+                    assert time.monotonic() < deadline, "second never stored"
+                    time.sleep(0.01)
+                time.sleep(0.2)
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        node_sync.NodeSyncer(_config(), pull=pull, now=lambda: 1000.0).tick()
+        for nick in ("second", "third"):
+            rows = nodes.load_path(nick).read_text(encoding="utf-8").splitlines()
+            assert [json.loads(r)["ts"] for r in rows] == [1000.0]
