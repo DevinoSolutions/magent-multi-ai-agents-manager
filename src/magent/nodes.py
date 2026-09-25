@@ -1247,41 +1247,81 @@ class NodeScore:
     below_floor: bool = False
 
 
-def _load_sample(line: str) -> LoadSample | None:
-    try:
-        row = json.loads(line)
-    except ValueError:
-        return None
-    if not isinstance(row, dict):
-        return None
-    try:
-        sample = LoadSample(
-            ts=float(row["ts"]),
-            nproc=int(row["nproc"]),
-            load1=float(row["load1"]),
-            load5=float(row["load5"]),
-            load15=float(row["load15"]),
-            mem_total_mb=int(row["mem_total_mb"]),
-            mem_avail_mb=int(row["mem_avail_mb"]),
-            my_sessions=int(row["my_sessions"]),
-        )
-    except (KeyError, TypeError, ValueError):
-        return None
-    return sample
+def _finite(value: object) -> float:
+    """``value`` as a float. Three refusals:
+
+    - TypeError for a non-number. A bool and a numeric string both count:
+      json's ``true`` is a Python bool (an int subclass), and ``sample.sh``
+      prints bare numbers, so ``"1.5"`` is not a reading. The isinstance
+      guard is also what narrows ``object`` for ty.
+    - ValueError for NaN or an infinity: json accepts them, the snapshot
+      writer does not.
+    - OverflowError for an int too large for a float (json has no bound on
+      an integer's digits)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"not a number: {value!r}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"non-finite reading: {number}")
+    return number
+
+
+def _integral(value: object) -> int:
+    """``value`` as an int, as strict as ``_finite``: TypeError for a
+    non-number (a bool and a str included), ValueError for a float that is
+    not finite or not whole (``16.9``). A whole float (``16.0``) is taken."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"not a number: {value!r}")
+    if isinstance(value, int):
+        return value
+    if not math.isfinite(value) or not value.is_integer():
+        raise ValueError(f"not a whole reading: {value}")
+    return int(value)
+
+
+def _load_sample(raw: object) -> LoadSample:
+    """``magent_sample``'s JSON object as a LoadSample -- the ONE parse, shared
+    by ``remote_mux.sample()``, ``remote_mux.parse_pull`` and
+    ``read_load_history``. KeyError, TypeError, ValueError or OverflowError
+    when it is not one: a JSON list or string is a TypeError, and every field
+    goes through ``_finite``/``_integral``, whose refusals (non-number, bool,
+    string, NaN, infinity, fractional count, an integer too large for a
+    float) are those exceptions."""
+    if not isinstance(raw, dict):
+        raise TypeError(f"expected an object, got {type(raw).__name__}")
+    return LoadSample(
+        ts=_finite(raw["ts"]),
+        nproc=_integral(raw["nproc"]),
+        load1=_finite(raw["load1"]),
+        load5=_finite(raw["load5"]),
+        load15=_finite(raw["load15"]),
+        mem_total_mb=_integral(raw["mem_total_mb"]),
+        mem_avail_mb=_integral(raw["mem_avail_mb"]),
+        my_sessions=_integral(raw["my_sessions"]),
+    )
 
 
 def parse_load_lines(lines: Iterable[str]) -> list[LoadSample]:
-    """LoadSamples out of ``load.jsonl`` lines. A malformed line is skipped:
-    the daemon appends while a reader reads, so a torn last line is normal."""
-    return [s for s in (_load_sample(line) for line in lines) if s is not None]
+    """LoadSamples out of ``load.jsonl`` lines, through the one strict parse.
+    A line it refuses is skipped, never fatal: the daemon appends while a
+    reader reads, so a torn last line is normal, and one bad reading must not
+    take the whole placement pass down with it."""
+    samples: list[LoadSample] = []
+    for line in lines:
+        try:
+            samples.append(_load_sample(json.loads(line)))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    return samples
 
 
 def read_load_history(nick: str, *, nodes_dir: Path | None = None) -> list[LoadSample]:
     """Every sample the daemon kept for ``nick`` (``<nick>/load.jsonl``), or
-    [] when it never sampled that node."""
+    [] when it never sampled that node. A byte that is not UTF-8 is replaced,
+    so its line fails the parse and is skipped like any other bad line."""
     path = load_path(nick, nodes_dir=nodes_dir)  # E's (DECISION-19): one layout owner
     try:
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
     return parse_load_lines(text.splitlines())
@@ -1289,7 +1329,10 @@ def read_load_history(nick: str, *, nodes_dir: Path | None = None) -> list[LoadS
 
 def in_window(samples: Iterable[LoadSample], *, now: float) -> list[LoadSample]:
     """The samples placement may use: the last ``PLACEMENT_WINDOW_S``. No
-    upper bound, so a node whose clock runs ahead is not thrown away."""
+    upper bound: every ts is stamped on THIS PC's clock (node_sync), so a
+    sample past ``now`` is only ever a few seconds ahead of the caller's own
+    reading of the clock (tests seed at ``time.time() + 30`` for that
+    reason), never a node's clock drifting."""
     start = now - PLACEMENT_WINDOW_S
     return [s for s in samples if s.ts >= start]
 
@@ -1314,23 +1357,31 @@ def score_node(
 ) -> NodeScore | None:
     """Spec §11 over one node's window; None when there is nothing to score.
 
-    Load is per core, so a 32-core box at load 8 reads as quiet. Memory and my
-    session count come from the NEWEST sample: they are levels, not rates.
-    ``extra_sessions`` counts projects this same pass already put here.
+    Load is per core (``load1``, spec §11's ``u``), so a 32-core box at load 8
+    reads as quiet. Memory and my session count come from the NEWEST sample:
+    they are levels, not rates. Two samples sharing the newest ts resolve to
+    the worse one (less free memory, then more of my sessions), so the score
+    never depends on the order they were read in. ``extra_sessions`` counts
+    projects this same pass already put here.
+
+    A negative reading is clamped to zero -- load per core, the free-memory
+    fraction and my session count alike -- so a broken sampler can make a
+    node look idle at best, never better than idle, and never win placement
+    on an impossible number.
     """
     if not window:
         return None
-    usage = [s.load1 / max(s.nproc, 1) for s in window]
+    usage = [max(0.0, s.load1 / max(s.nproc, 1)) for s in window]
     p75 = _p75(usage)
     spike = SPIKE_WEIGHT * max(0.0, max(usage) - SPIKE_RATIO * p75)
-    latest = max(window, key=lambda s: s.ts)
+    latest = max(window, key=lambda s: (s.ts, -s.mem_avail_mb, s.my_sessions))
     mem = 0.0
     below_floor = False
     if latest.mem_total_mb > 0:
-        free = latest.mem_avail_mb / latest.mem_total_mb
+        free = max(0.0, latest.mem_avail_mb / latest.mem_total_mb)
         mem = MEM_WEIGHT * max(0.0, MEM_FLOOR - free)
         below_floor = free < MEM_HARD_FLOOR
-    mine = latest.my_sessions + extra_sessions
+    mine = max(0, latest.my_sessions) + extra_sessions
     return NodeScore(
         nick=nick,
         samples=len(window),

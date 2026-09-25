@@ -42,16 +42,38 @@ def _sample(
     avail: int = 8000,
     mine: int = 0,
 ) -> LoadSample:
+    # load5/load15 deliberately differ from load1: spec §11's u is load1 per
+    # core, and a score reading either of the others must not pass unnoticed.
     return LoadSample(
         ts=ts,
         nproc=nproc,
         load1=load1,
-        load5=load1,
-        load15=load1,
+        load5=load1 * 3,
+        load15=load1 * 3,
         mem_total_mb=total,
         mem_avail_mb=avail,
         my_sessions=mine,
     )
+
+
+# One load.jsonl row the parser takes; each bad row below differs in ONE field.
+_GOOD_ROW = (
+    '{"ts":1790000000.0,"nproc":4,"load1":1.6,"load5":1.6,"load15":1.6,'
+    '"mem_total_mb":16000,"mem_avail_mb":8000,"my_sessions":1}'
+)
+_BAD_ROWS = {
+    "infinity": _GOOD_ROW.replace('"nproc":4', '"nproc":Infinity'),
+    "overflow-to-inf": _GOOD_ROW.replace(
+        '"mem_total_mb":16000', '"mem_total_mb":1e400'
+    ),
+    "int-too-big-for-a-float": _GOOD_ROW.replace(
+        '"ts":1790000000.0', '"ts":' + "9" * 401
+    ),
+    "nan": _GOOD_ROW.replace('"load1":1.6', '"load1":NaN'),
+    "numeric-string": _GOOD_ROW.replace('"load1":1.6', '"load1":"1.5"'),
+    "bool": _GOOD_ROW.replace('"nproc":4', '"nproc":true'),
+    "fractional-count": _GOOD_ROW.replace('"nproc":4', '"nproc":4.9'),
+}
 
 
 class TestTheLoadHistory:
@@ -77,6 +99,32 @@ class TestTheLoadHistory:
             )
 
         assert len(nodes.read_load_history("n", nodes_dir=tmp_path)) == 36
+
+    def test_a_line_that_is_not_utf8_is_skipped_not_fatal(self, tmp_path):
+        path = nodes.load_path("n", nodes_dir=tmp_path)
+        path.parent.mkdir(parents=True)
+        good = _GOOD_ROW.encode("utf-8")
+        path.write_bytes(good + b"\n\xff\xfe garbage\n" + good + b"\n")
+
+        assert len(nodes.read_load_history("n", nodes_dir=tmp_path)) == 2
+
+    @pytest.mark.parametrize("bad", list(_BAD_ROWS.values()), ids=list(_BAD_ROWS))
+    def test_a_row_the_strict_parse_refuses_is_skipped_not_fatal(self, tmp_path, bad):
+        path = nodes.load_path("n", nodes_dir=tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_text(f"{_GOOD_ROW}\n{bad}\n{_GOOD_ROW}\n", encoding="utf-8")
+
+        history = nodes.read_load_history("n", nodes_dir=tmp_path)
+
+        assert len(history) == 2
+        assert all(s.nproc == 4 and s.load1 == 1.6 for s in history)
+
+    def test_the_history_reader_and_the_pull_path_share_one_parse(self):
+        from magent import remote_mux
+
+        assert remote_mux._load_sample is nodes._load_sample
+        assert remote_mux._finite is nodes._finite
+        assert remote_mux._integral is nodes._integral
 
     def test_a_node_the_daemon_never_sampled_has_no_history(self, tmp_path):
         assert nodes.read_load_history("never", nodes_dir=tmp_path) == []
@@ -142,6 +190,50 @@ class TestEachTermOfTheScore:
 
         assert score.my_sessions == 3
         assert score.score == pytest.approx(0.15)
+
+    def test_the_load_term_reads_load1_not_load5_or_load15(self):
+        sample = LoadSample(
+            ts=NOW,
+            nproc=4,
+            load1=1.0,
+            load5=8.0,
+            load15=12.0,
+            mem_total_mb=16000,
+            mem_avail_mb=8000,
+            my_sessions=0,
+        )
+
+        assert nodes.score_node("n", [sample]).p75 == pytest.approx(0.25)
+
+    def test_a_negative_load_reading_counts_as_idle_never_below_it(self):
+        score = nodes.score_node("n", [_sample(load1=-4.0)])
+
+        assert score.p75 == 0.0
+        assert score.score == 0.0
+
+    def test_a_negative_free_memory_reading_counts_as_none_free(self):
+        score = nodes.score_node("n", [_sample(load1=0.0, avail=-160000)])
+
+        assert score.mem == pytest.approx(0.075)  # 0.5 * 0.15, never more
+        assert score.below_floor is True
+
+    def test_a_negative_session_count_counts_as_none(self):
+        score = nodes.score_node("n", [_sample(load1=0.0, mine=-5)], extra_sessions=1)
+
+        assert score.my_sessions == 1
+        assert score.score == pytest.approx(0.05)
+
+    def test_two_newest_samples_sharing_a_ts_read_as_the_worse_one(self):
+        window = [
+            _sample(NOW, avail=8000, mine=0),
+            _sample(NOW, avail=160, mine=2),
+        ]
+
+        for ordered in (window, window[::-1]):
+            score = nodes.score_node("n", ordered)
+            assert score.mem == pytest.approx(0.07)
+            assert score.below_floor is True
+            assert score.my_sessions == 2
 
     def test_a_node_reporting_zero_cores_counts_as_one(self):
         assert nodes.score_node(
