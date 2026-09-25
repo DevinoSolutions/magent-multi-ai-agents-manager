@@ -18,6 +18,7 @@ from magent.platform import (
     VSCodeLaunchOpts,
 )
 from magent.titles import get_leaf_name
+from tests.unit._fake_ssh import make_fake_ssh
 
 # --- Real-home isolation ------------------------------------------------------
 # Captured at conftest IMPORT time, i.e. before any fixture has had the chance
@@ -211,6 +212,15 @@ def _no_real_ssh(monkeypatch):
     ``needs_ssh`` node tier re-points it at the real client deliberately.
     """
     monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: None)
+
+
+@pytest.fixture
+def fake_ssh(tmp_path, monkeypatch):
+    """A real on-disk fake ``ssh`` wired in as remote_mux's client (THE fake:
+    tests/unit/_fake_ssh.py)."""
+    fake = make_fake_ssh(tmp_path)
+    monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: fake.path)
+    return fake
 
 
 # --- The tripwire -------------------------------------------------------------

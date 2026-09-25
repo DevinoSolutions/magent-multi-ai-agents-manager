@@ -22,6 +22,10 @@ from pathlib import Path
 import pytest
 
 from magent import lockfile, remote_mux
+
+# By value, at import -- before any fixture runs: conftest's _no_real_ssh
+# patches the MODULE attribute, so this name is still the real PATH resolver.
+from magent.remote_mux import find_ssh as real_find_ssh
 from tests.conftest import (
     PLAYWRIGHT_BROWSERS_PATH,
     REAL_HOME,
@@ -186,5 +190,18 @@ class TestNoTestResolvesTheRealSsh:
     """A node call reaches a real machine on the network under the developer's
     own keys, and no HOME redirect contains a binary on PATH."""
 
-    def test_the_client_is_unresolvable_by_default(self):
-        assert remote_mux.find_ssh() is None
+    def test_the_client_is_unresolvable_by_default(self, tmp_path, monkeypatch):
+        # Plant a client the REAL resolver would find: on a box with no ssh on
+        # PATH, "find_ssh() is None" passes with the guard deleted (measured).
+        if sys.platform == "win32":
+            (tmp_path / "ssh.cmd").write_text("@echo off\r\n", encoding="utf-8")
+        else:
+            (tmp_path / "ssh").write_text("#!/bin/sh\n", encoding="utf-8")
+            (tmp_path / "ssh").chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        real_find_ssh.cache_clear()
+        try:
+            assert real_find_ssh() is not None  # the plant is findable: teeth
+            assert remote_mux.find_ssh() is None
+        finally:
+            real_find_ssh.cache_clear()

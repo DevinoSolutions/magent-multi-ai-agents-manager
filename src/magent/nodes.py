@@ -15,7 +15,9 @@ import dataclasses
 import json
 import math
 import os
+import re
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -34,9 +36,10 @@ if TYPE_CHECKING:
 NODES_DIR = Path.home() / ".magent" / "nodes"
 # Which node each project was placed on: {project: NodeMapEntry fields}.
 # Machine state, like account-map.json -- the pin (`"node": "second"`) is
-# config; where `"auto"` landed is not. Read through read_node_map; written
-# only through PR-D's update_node_map (cross-process lock), which sits on
-# write_node_map -- never a direct write_node_map call from a feature.
+# config; where `"auto"` landed is not. Read through read_node_map (best
+# effort) or load_node_map_strict (before a write); written only through PR-D's
+# update_node_map (cross-process lock), which sits on write_node_map -- never a
+# direct write_node_map call from a feature.
 NODE_MAP_PATH = NODES_DIR / "node-map.json"
 
 
@@ -149,53 +152,115 @@ def _map_entry(raw: object) -> NodeMapEntry | None:
         return None
     if not isinstance(attached, bool):
         return None
+    # json.loads accepts NaN/Infinity and arbitrarily long integers; neither is
+    # a time. float() of a 309+-digit int raises instead of saturating.
+    try:
+        placed_ts = float(ts)
+    except OverflowError:
+        return None
+    if not math.isfinite(placed_ts):
+        return None
     return NodeMapEntry(
         nick=nick,
         sid=sid,
-        placed_ts=float(ts),
+        placed_ts=placed_ts,
         attached_existing=attached,
         remote_root=root,
     )
 
 
-def read_node_map() -> dict[str, NodeMapEntry]:
-    """``node-map.json`` keyed by project name. A missing file, a torn write,
-    or anything that is not a JSON object reads as ``{}``, and a malformed
-    entry is dropped alone -- the map is a record of where things landed, and
-    a bad one must never stop a launch."""
-    try:
-        raw = json.loads(NODE_MAP_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+# A reader racing write_node_map's os.replace on Windows gets PermissionError
+# for the instant the rename holds the file. Measured: one writer + one reader
+# thread read a FULL 200-entry map as unreadable 15 times. Retry briefly rather
+# than report "no placements".
+_BUSY_RETRIES = 5
+_BUSY_SLEEP_S = 0.02
+
+
+def load_node_map_strict() -> dict[str, NodeMapEntry]:
+    """``node-map.json`` keyed by project name, or an error -- never a guess.
+
+    ``{}`` means exactly one thing here: the file does not exist. A file that
+    is momentarily locked (``PermissionError``: the Windows reader racing an
+    ``os.replace``) is retried ``_BUSY_RETRIES`` times ``_BUSY_SLEEP_S`` apart,
+    then re-raised; any other ``OSError``, and a torn or non-object file
+    (``ValueError``), propagate. A malformed ENTRY is still dropped alone.
+
+    PR-D's ``update_node_map`` MUST read through this for its
+    read-modify-write: an unreadable map read as ``{}`` and written back would
+    erase every placement. Code that only needs a best-effort answer calls
+    ``read_node_map``."""
+    for attempt in range(_BUSY_RETRIES + 1):
+        try:
+            text = NODE_MAP_PATH.read_text(encoding="utf-8")
+            break
+        except FileNotFoundError:
+            return {}
+        except PermissionError:
+            if attempt == _BUSY_RETRIES:
+                raise
+            time.sleep(_BUSY_SLEEP_S)
+    raw = json.loads(text)
     if not isinstance(raw, dict):
-        return {}
+        raise ValueError(f"{NODE_MAP_PATH}: not a JSON object")  # noqa: TRY004  # reason: a non-object file is corrupt DATA, the same family as the JSONDecodeError (a ValueError) a torn file raises; callers catch one type for every bad file
     out: dict[str, NodeMapEntry] = {}
     for project, value in raw.items():
         entry = _map_entry(value)
+        # A key out of json.loads is always str: this isinstance narrows the
+        # type for ty, it does not tolerate anything.
         if isinstance(project, str) and entry is not None:
             out[project] = entry
     return out
 
 
+def read_node_map() -> dict[str, NodeMapEntry]:
+    """``node-map.json`` keyed by project name, tolerantly: whatever
+    ``load_node_map_strict`` raises -- a map still busy after its retries, a
+    torn write, a file that is not a JSON object -- reads as ``{}``. The map is
+    a record of where things landed, and a bad one must never stop a launch.
+    Never write back what this returns; see ``load_node_map_strict``."""
+    try:
+        return load_node_map_strict()
+    except (OSError, ValueError):
+        return {}
+
+
 def write_node_map(entries: Mapping[str, NodeMapEntry]) -> None:
     """Replace ``node-map.json`` with ``entries`` atomically: a sibling temp
-    file, then one ``os.replace`` (atomic only within a filesystem, hence the
-    sibling -- the ``config_io._save_raw_config_atomic`` idiom). A failed write
-    leaves the previous map untouched and no temp file behind.
+    file unique to this call (``tempfile.mkstemp``), then one ``os.replace``
+    (atomic only within a filesystem, hence the sibling -- the
+    ``config_io._save_raw_config_atomic`` idiom). A failed write leaves the
+    previous map untouched and no temp file behind.
 
     The PRIMITIVE: atomic, but not serialized against another process's
     read-modify-write. Callers go through PR-D's ``update_node_map``, which
-    holds the cross-process lock around read + this write (DECISION-13)."""
-    NODE_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = NODE_MAP_PATH.with_name(f"{NODE_MAP_PATH.name}.{os.getpid()}.tmp")
+    holds the cross-process lock around ``load_node_map_strict`` + this write
+    (DECISION-13)."""
     payload = {project: dataclasses.asdict(e) for project, e in sorted(entries.items())}
+    # allow_nan=False: a non-finite placed_ts would otherwise go to disk as a
+    # bare NaN/Infinity literal, which is not JSON.
+    text = json.dumps(payload, indent=2, allow_nan=False) + "\n"
+    NODE_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Not a pid-derived name: threads share a pid, and a shared temp name made
+    # 229 of 300 writes from two writer threads fail.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=NODE_MAP_PATH.parent, prefix=NODE_MAP_PATH.name + ".", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
     try:
-        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
         os.replace(tmp, NODE_MAP_PATH)
     except BaseException:
         with contextlib.suppress(OSError):
             tmp.unlink()
         raise
+
+
+# A portable Unix login (useradd's default NAME_REGEX, minus the trailing-$
+# machine-account form). Checked only on the DERIVED user: an explicit
+# settings.nodes.<nick>.user is the operator's word.
+_NODE_LOGIN = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 
 
 def node_for_nick(
@@ -216,13 +281,19 @@ def node_for_nick(
     if entry is None:
         known = ", ".join(sorted(pool)) or "none"
         raise NodeConfigError(
-            f"{prefix}node {nick!r} is not in settings.nodes (known: {known})"
+            f"{prefix}node {nick!r} is not in settings.nodes; known nodes: {known}"
         )
     user = entry.user if entry.user is not None else local_user.lower()
     if not user:
         raise NodeConfigError(
             f"settings.nodes.{nick}.user is not set and the local username is "
             "unknown; set it explicitly"
+        )
+    if entry.user is None and not _NODE_LOGIN.fullmatch(user):
+        raise NodeConfigError(
+            f"settings.nodes.{nick}.user is not set and the local username "
+            f"{local_user!r} is not a node login ({user!r} does not match "
+            f"{_NODE_LOGIN.pattern}); set it explicitly"
         )
     if entry.user is None and user == "root":
         raise NodeConfigError(
@@ -243,9 +314,11 @@ def resolve(
 
     ``placed`` is the nick placement chose for a ``"node": "auto"`` project; a
     pinned project ignores it. ``local_user`` is ``env.local_username()``,
-    passed in so this stays pure. D4: a node with no ``user`` runs as the local
-    user, lowercased (Unix login names are), and that fallback may never be
-    root -- running sessions as root has to be written down.
+    passed in so this stays pure. A node with no ``user`` runs as the local
+    user, lowercased to match the per-person node account convention (D4). That
+    derived name must be a login ssh can use (a Windows ``USERNAME`` such as
+    ``"Amin Dhouib"`` is not), and it may never be root -- running sessions as
+    root has to be written down.
     """
     if proj.node is None:
         raise NodeConfigError(f"{proj.path}: not a node project")
@@ -258,6 +331,13 @@ def resolve(
     if nick is None:
         raise NodeConfigError(
             f'{proj.path}: "node": "auto" needs a placement before it can resolve'
+        )
+    pool = config.settings.nodes
+    if proj.node == NODE_AUTO and nick not in pool:
+        known = ", ".join(sorted(pool)) or "none"
+        raise NodeConfigError(
+            f"{proj.path}: placement chose {nick!r}, which is no longer in "
+            f"settings.nodes; re-place (known nodes: {known})"
         )
     return node_for_nick(config, nick, local_user=local_user, label=proj.path)
 

@@ -12,18 +12,26 @@ local git reads a bring-up needs. Every function returns data or raises
 - secrets travel on stdin only -- never argv, never a log line;
   ``RemoteError.command_redacted`` names stdin by its length alone;
 - ``BatchMode=yes`` everywhere: a password prompt nobody can answer is a hang.
+
+A leaf: never imports ``magent.cli`` (LS-A-001); its magent imports are the
+leaves ``attach_client`` and ``log``.
 """
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import shlex
 import shutil
+import subprocess
 from typing import TYPE_CHECKING
 
-from magent.attach_client import SSH_CONNECTION_OPTS, TMUX_SOCKET
+from magent.attach_client import SSH_MISSING_RC, TMUX_SOCKET
+from magent.log import get_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from magent.nodes import Node
 
 # tmux, not psmux: nodes are Linux. One server per node user (`-L magent`,
@@ -37,6 +45,36 @@ SOCKET = TMUX_SOCKET
 PROBE_TIMEOUT_S = 10.0
 SCRIPT_TIMEOUT_S = 120.0
 BRING_UP_TIMEOUT_S = 600.0
+
+# remote_mux's OWN option set -- not attach_client.SSH_CONNECTION_OPTS, which is
+# scoped to the interactive attach pane and allows a 20s connect, i.e. longer
+# than a whole probe here. A connect bound strictly under PROBE_TIMEOUT_S lets a
+# dead node surface as ssh's own exit 255 (unreachable) before the subprocess
+# bound turns it into rc None (hung): the distinction RemoteError carries.
+# ServerAlive: a link that dies mid-bring-up (600s bound) fails in ~45s.
+# ssh honours the FIRST value of a repeated -o, so these lead the argv and a
+# caller appending its own -o cannot override them.
+CONNECT_TIMEOUT_S = 5
+SSH_BATCH_OPTS = (
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    f"ConnectTimeout={CONNECT_TIMEOUT_S}",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=3",
+)
+
+# How much of a failed command's stderr an error carries: enough for the
+# cause, never a whole log.
+_STDERR_TAIL_LINES = 20
+# How long a killed child gets to be reaped. The process is already dead; the
+# only thing that can still take time is a pipe magent stopped caring about.
+_REAP_TIMEOUT_S = 1.0
+# No console window per ssh on Windows. Read off the module rather than
+# hand-defined so this file needs no `sys.platform` branch (accounts.py idiom).
+_SPAWN_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 class RemoteError(RuntimeError):
@@ -63,14 +101,121 @@ def find_ssh() -> str | None:
     return shutil.which("ssh")
 
 
-def ssh_argv(
-    node: Node, remote_cmd: str, *, tty: bool = False, batch: bool = True
-) -> list[str]:
-    """``ssh`` argv for one command on ``node``. The option list is
-    ``attach_client``'s -- the one owner of how magent dials a host."""
-    argv = ["ssh", *SSH_CONNECTION_OPTS]
-    if batch:
-        argv += ["-o", "BatchMode=yes"]
+def _remote_string(argv: Sequence[str]) -> str:
+    """The ONE remote command string (DECISION-9): sshd hands it to the node
+    user's LOGIN shell, which may be zsh/fish -- so the argv is shlex-joined
+    and handed to bash as a single quoted ``-c`` payload, and only bash ever
+    parses it."""
+    return "bash -c " + shlex.quote(shlex.join(argv))
+
+
+def _ssh_tail(node: Node, remote_argv: Sequence[str], *, tty: bool) -> list[str]:
+    """Everything after argv[0]: options, target, the one remote string."""
+    tail = list(SSH_BATCH_OPTS)
     if tty:
-        argv.append("-t")
-    return [*argv, node.target, remote_cmd]
+        tail.append("-t")
+    return [*tail, node.target, _remote_string(remote_argv)]
+
+
+def _client(shown: tuple[str, ...]) -> str:
+    """The client ``find_ssh`` resolves NOW -- looked up as this module's
+    attribute at call time, so the conftest guard and ``fake_ssh`` both hold --
+    or RemoteError rc 127. The only way an ssh argv gets its argv[0]."""
+    exe = find_ssh()
+    if exe is None:
+        raise RemoteError(SSH_MISSING_RC, "ssh client not found on PATH", shown)
+    return exe
+
+
+def ssh_argv(node: Node, remote_argv: Sequence[str], *, tty: bool = False) -> list[str]:
+    """``ssh`` argv running ``remote_argv`` on ``node`` as ONE ``bash -c``
+    remote string. argv[0] is the client ``find_ssh`` resolved, never a bare
+    ``"ssh"`` -- an argv built here and spawned elsewhere must not reach a
+    client the guard never saw. Raises RemoteError rc 127 when there is none.
+    The options are ``SSH_BATCH_OPTS``, this module's own set for
+    non-interactive node calls; the interactive attach pane dials with
+    ``attach_client``'s."""
+    tail = _ssh_tail(node, remote_argv, tty=tty)
+    return [_client(("ssh", *tail)), *tail]
+
+
+def _tail(stderr: bytes) -> str:
+    lines = stderr.decode("utf-8", "replace").splitlines()
+    return "\n".join(lines[-_STDERR_TAIL_LINES:])
+
+
+def _redacted(argv: list[str], input_bytes: bytes | None) -> tuple[str, ...]:
+    if input_bytes is None:
+        return tuple(argv)
+    return (*argv, f"<stdin: {len(input_bytes)} bytes>")
+
+
+def _spawn(
+    argv: list[str],
+    *,
+    timeout_s: float,
+    input_bytes: bytes | None,
+    check: bool,
+    shown: tuple[str, ...],
+) -> subprocess.CompletedProcess[bytes]:
+    """One bounded child -- the shared body of ``run`` and the local git reads.
+    ``shown`` is what an error and a log line may say about the command."""
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=_SPAWN_FLAGS,
+        )
+    except FileNotFoundError as e:
+        # The client vanished between find_ssh and the spawn (or its cached
+        # path went stale): the same "not installed" as no client at all.
+        raise RemoteError(SSH_MISSING_RC, str(e), shown) from e
+    except OSError as e:
+        raise RemoteError(None, str(e), shown) from e
+    try:
+        out, err = proc.communicate(input=input_bytes, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        # Reap the direct child only, bounded. A second communicate() would
+        # wait for every pipe's write end, and the interpreter behind a
+        # .cmd/sh shim is a GRANDCHILD still holding one -- the 90s-for-a-5s
+        # timeout defect accounts._run and psmux.probe_control_plane hit.
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            proc.wait(timeout=_REAP_TIMEOUT_S)
+        get_logger("nodes").warning(
+            "node call timed out after %.1fs: %s", timeout_s, shlex.join(shown)
+        )
+        raise RemoteError(None, f"timed out after {timeout_s:g}s", shown) from None
+    if check and proc.returncode != 0:
+        get_logger("nodes").warning(
+            "node call failed (rc=%s): %s", proc.returncode, shlex.join(shown)
+        )
+        raise RemoteError(proc.returncode, _tail(err), shown)
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def run(
+    node: Node,
+    argv_remote: Sequence[str],
+    *,
+    timeout_s: float,
+    input_bytes: bytes | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run ``argv_remote`` on ``node`` over ssh, as ONE ``bash -c`` remote
+    string (``_remote_string``). Raises RemoteError on a spawn failure, a
+    missing client (rc 127), a timeout (rc None), or -- with ``check`` -- a
+    non-zero exit. With ``check=False`` every exit code comes back for the
+    caller to classify."""
+    tail = _ssh_tail(node, argv_remote, tty=False)
+    # Errors and log lines name the program, not this PC's path to it.
+    shown = _redacted(["ssh", *tail], input_bytes)
+    return _spawn(
+        [_client(shown), *tail],
+        timeout_s=timeout_s,
+        input_bytes=input_bytes,
+        check=check,
+        shown=shown,
+    )
