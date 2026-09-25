@@ -20,14 +20,24 @@ from pathlib import Path, PureWindowsPath
 
 import pytest
 
-from magent import nodes, remote_mux
+from magent import cli, node_sync, nodes, remote_mux
+from magent.lockfile import LockHeld
 from tests.unit._node_fixtures import (
     NOW,
     OLDER_SESSION_ID,
     SESSION_ID,
+    config_json,
+    entry,
     git,
     write_transcript,
 )
+
+# D-MERGE: D's remote_mux.kill_session (DECISION-26 x) is not on this branch.
+# The recall tests that need it are written and skipped on this flag, so D's
+# merge switches them on -- and they fail until the kill branch of
+# node_cmd._stop_session lands (plan G :3853-3874).
+_NO_D_KILL = not hasattr(remote_mux, "kill_session")
+_D_KILL_REASON = "D-MERGE: needs D's remote_mux.kill_session (plan G :3853-3874)"
 
 
 class TestTheEncodedDirIsClaudeCodesOwnRule:
@@ -1508,3 +1518,462 @@ class TestTheRepoRecordFileIsCheckedOnTheWayInAndOut:
         assert nodes.write_repo_record("second", "../../../escaped", record) is False
         assert nodes.read_repo_record("second", "../../../escaped") is None
         assert not list(tmp_path.rglob("repos.json"))
+
+
+# --- magent node recall --local (plan G Task 14) --------------------------------
+
+
+@pytest.fixture
+def api_repo(tmp_path) -> Path:
+    """The local checkout a node project points at: a real (tmp) git repo.
+
+    D-MERGE: plan G Task 8 (:1865-1872) appends this same fixture; keep one."""
+    repo = tmp_path / "api"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    return repo
+
+
+@pytest.fixture
+def placed_api(api_repo, tmp_config):
+    """api is auto-placed on @second, with a pulled conversation and memory."""
+    nodes.update_node_map("api", entry("second"))
+    write_transcript("second", "api", SESSION_ID, mtime=NOW)
+    memory = nodes.transcripts_dir("second", "api") / "memory"
+    memory.mkdir()
+    (memory / "MEMORY.md").write_text("- remember\n", encoding="utf-8")
+    return tmp_config(
+        config_json(
+            ("second", "third"),
+            [{"path": str(api_repo), "title": "api", "node": "auto"}],
+        )
+    )
+
+
+@pytest.fixture
+def node_answers(monkeypatch):
+    """A reachable @second: records each remote step in order."""
+    events: list[tuple[object, ...]] = []
+    monkeypatch.setattr("magent.env.local_username", lambda: "amin")
+
+    def _final_pull(config, name, *, wait_s=None, local_user=None):
+        events.append(("pull", name, local_user))
+
+    def _bare_pull(*args, **kwargs):
+        # DECISION-26 xi: a recall pulls through node_sync's lock, never beside it.
+        raise AssertionError("recall called remote_mux.pull directly")
+
+    monkeypatch.setattr(node_sync, "final_pull", _final_pull)
+    monkeypatch.setattr(remote_mux, "pull", _bare_pull)
+
+    def _status(node, root, *, timeout_s):
+        events.append(("repo_status", node.nick, root))
+        return [nodes.RepoStatus(root, "b" * 40, "main", False, 0)]
+
+    def _kill(node, sid):
+        events.append(("kill", node.nick, sid))
+        return True  # D's contract: True killed, False not there, None unknown
+
+    monkeypatch.setattr(remote_mux, "repo_status", _status)
+    # D-MERGE: drop raising=False once D's remote_mux.kill_session is merged.
+    monkeypatch.setattr(remote_mux, "kill_session", _kill, raising=False)
+    return events
+
+
+@pytest.fixture(params=[255, None], ids=["refused", "timed-out"])
+def node_is_gone(monkeypatch, request):
+    """An unreachable @second: ssh's own failure (255) or a timeout (rc None)."""
+
+    def _gone(*args, **kwargs):
+        raise remote_mux.RemoteError(
+            request.param,
+            "ssh: connect to host devino-second: No route to host",
+            ("ssh", "devino-second"),
+        )
+
+    monkeypatch.setattr("magent.env.local_username", lambda: "amin")
+    monkeypatch.setattr(node_sync, "final_pull", _gone)
+    monkeypatch.setattr(remote_mux, "repo_status", _gone)
+    # kill_session never raises (D); an unreachable node is never asked anyway.
+    # D-MERGE: drop raising=False once D's remote_mux.kill_session is merged.
+    monkeypatch.setattr(
+        remote_mux, "kill_session", lambda node, sid: None, raising=False
+    )
+
+
+def _claude_dir(path: Path) -> Path:
+    return (
+        Path.home()
+        / ".claude"
+        / "projects"
+        / nodes.encoded_project_dir(str(path.resolve()))
+    )
+
+
+def _recall_has_to() -> bool:
+    """Whether `node recall` has grown Task 15's --to (it needs D)."""
+    recall = cli.main.commands["node"].commands["recall"]
+    return any(p.name == "to_nick" for p in recall.params)
+
+
+def _recall(runner, cfg: str, *args: str):
+    return runner.invoke(cli.main, ["--config", cfg, "node", "recall", "api", *args])
+
+
+class TestRecallLocal:
+    @pytest.mark.skipif(_NO_D_KILL, reason=_D_KILL_REASON)
+    def test_the_steps_run_in_order_pull_report_stop(
+        self, runner, placed_api, node_answers
+    ):
+        _recall(runner, placed_api, "--local")
+
+        assert [e[0] for e in node_answers] == ["pull", "repo_status", "kill"]
+
+    # D-MERGE: delete this pin with the kill branch -- it holds only while
+    # D's kill_session is absent: the session is named, never "stopped".
+    @pytest.mark.skipif(not _NO_D_KILL, reason="D's kill_session is merged")
+    def test_before_d_a_reachable_session_is_named_with_its_stop_command(
+        self, runner, placed_api, node_answers
+    ):
+        result = _recall(runner, placed_api, "--local")
+
+        assert [e[0] for e in node_answers] == ["pull", "repo_status"]
+        assert f"tmux -L {remote_mux.SOCKET} kill-session -t '=api'" in result.stdout
+        assert "stopped api" not in result.stdout
+
+    def test_the_last_pull_goes_through_node_syncs_lock(
+        self, runner, placed_api, node_answers
+    ):
+        result = _recall(runner, placed_api, "--local")
+
+        # node_sync.final_pull holds the daemon's per-node lock; the fixture
+        # makes a bare remote_mux.pull fail the recall (DECISION-26 xi).
+        assert result.exit_code == 0
+        assert node_answers[0] == ("pull", "api", "amin")
+
+    def test_a_daemon_holding_the_node_stops_the_recall_before_anything_is_touched(
+        self, runner, placed_api, node_answers, monkeypatch
+    ):
+        def _held(*args, **kwargs):
+            raise LockHeld("node-sync lock is held by another process")
+
+        monkeypatch.setattr(node_sync, "final_pull", _held)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 3
+        assert "run the recall again" in result.stderr
+        assert node_answers == []
+        assert nodes.read_node_map()["api"].nick == "second"
+
+    def test_a_map_lock_that_stays_held_is_a_printed_failure_not_a_traceback(
+        self, runner, placed_api, node_answers, monkeypatch
+    ):
+        # DECISION-13: the map writer waits 10 s on ~/.magent/node-map.lock,
+        # then raises LockHeld (an OSError).
+        def _held(project, entry, **_k):
+            raise LockHeld("node-map lock is held by another process")
+
+        monkeypatch.setattr(nodes, "update_node_map", _held)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 1
+        assert "could not clear api's placement" in result.stderr
+        assert "run the recall again" in result.stderr
+        assert "Traceback" not in result.output
+        assert "is home" not in result.stdout
+
+    @pytest.mark.skipif(_NO_D_KILL, reason=_D_KILL_REASON)
+    def test_stopped_is_said_only_when_the_kill_landed(
+        self, runner, placed_api, node_answers
+    ):
+        result = _recall(runner, placed_api, "--local")
+
+        assert "stopped api on @second" in result.stdout
+
+    @pytest.mark.skipif(_NO_D_KILL, reason=_D_KILL_REASON)
+    def test_a_session_that_was_already_gone_is_not_called_stopped(
+        self, runner, placed_api, node_answers, monkeypatch
+    ):
+        monkeypatch.setattr(remote_mux, "kill_session", lambda node, sid: False)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert "no such session" in result.stdout
+        assert "stopped api" not in result.stdout
+
+    @pytest.mark.skipif(_NO_D_KILL, reason=_D_KILL_REASON)
+    def test_an_unconfirmed_kill_prints_the_quoted_command_that_stops_it(
+        self, runner, placed_api, node_answers, monkeypatch
+    ):
+        monkeypatch.setattr(remote_mux, "kill_session", lambda node, sid: None)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert "unreachable" in result.stdout
+        # The whole remote command in double quotes, the target in single
+        # ones: zsh on either end would read a bare =api as a command lookup.
+        assert (
+            f"\"tmux -L {remote_mux.SOCKET} kill-session -t '=api'\"" in result.stdout
+        )
+        assert "stopped api" not in result.stdout
+
+    def test_the_conversation_and_memory_land_in_claudes_dir_for_the_local_path(
+        self, runner, placed_api, node_answers, api_repo
+    ):
+        _recall(runner, placed_api, "--local")
+
+        dest = _claude_dir(api_repo)
+        assert (dest / f"{SESSION_ID}.jsonl").exists()
+        assert (dest / "memory" / "MEMORY.md").read_text(
+            encoding="utf-8"
+        ) == "- remember\n"
+
+    def test_what_is_already_in_the_local_claude_dir_is_kept(
+        self, runner, placed_api, node_answers, api_repo
+    ):
+        dest = _claude_dir(api_repo)
+        dest.mkdir(parents=True)
+        (dest / "local.jsonl").write_text("{}\n", encoding="utf-8")
+
+        result = _recall(runner, placed_api, "--local")
+
+        # Kept AND merged into: a copy that refused the existing dir (or
+        # replaced it) would fail one half of this.
+        assert result.exit_code == 0
+        assert (dest / "local.jsonl").exists()
+        assert (dest / f"{SESSION_ID}.jsonl").exists()
+
+    def test_the_exact_resume_command_is_printed_after_a_git_pull(
+        self, runner, placed_api, node_answers, api_repo
+    ):
+        result = _recall(runner, placed_api, "--local")
+
+        lines = [line.strip() for line in result.stdout.splitlines()]
+        pull = lines.index(f'git -C "{api_repo.resolve()}" pull')
+        assert (
+            lines[pull + 1]
+            == f'cd "{api_repo.resolve()}" && claude --resume {SESSION_ID}'
+        )
+
+    def test_it_says_how_to_resume_by_hand_if_claude_refuses_the_session(
+        self, runner, placed_api, node_answers
+    ):
+        result = _recall(runner, placed_api, "--local")
+
+        assert "resume by hand" in result.stdout
+
+    def test_the_placement_is_cleared(self, runner, placed_api, node_answers):
+        _recall(runner, placed_api, "--local")
+
+        assert "api" not in nodes.read_node_map()
+
+    def test_the_nodes_commit_and_clean_tree_are_reported_and_recorded(
+        self, runner, placed_api, node_answers
+    ):
+        result = _recall(runner, placed_api, "--local")
+
+        assert "bbbbbbbbbbbb on main  clean" in result.stdout
+        assert nodes.read_repo_record("second", "api").source == "recall"
+
+    def test_uncommitted_work_on_the_node_is_called_out(
+        self, runner, placed_api, node_answers, monkeypatch
+    ):
+        monkeypatch.setattr(
+            remote_mux,
+            "repo_status",
+            lambda node, root, *, timeout_s: [
+                nodes.RepoStatus(root, "b" * 40, "main", True, 2)
+            ],
+        )
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert "UNCOMMITTED CHANGES, 2 unpushed commit(s)" in result.stdout
+        assert "not pushed" in result.stdout
+
+    def test_a_node_that_does_not_answer_is_recalled_from_what_was_pulled(
+        self, runner, placed_api, node_is_gone, api_repo
+    ):
+        nodes.write_repo_record(
+            "second",
+            "api",
+            nodes.RepoRecord(
+                ts=NOW,
+                source="bring-up",
+                repos=(nodes.RepoStatus("api", "a" * 40, "", False, None),),
+            ),
+        )
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 0
+        assert "did not answer" in result.stdout
+        assert "last known (bring-up" in result.stdout
+        assert "aaaaaaaaaaaa" in result.stdout
+        assert "kill-session -t '=api'" in result.stdout
+        assert (_claude_dir(api_repo) / f"{SESSION_ID}.jsonl").exists()
+        assert "api" not in nodes.read_node_map()
+
+    def test_a_timed_out_pull_is_not_followed_by_more_live_reads(
+        self, runner, placed_api, node_answers, monkeypatch
+    ):
+        def _timeout(*args, **kwargs):
+            raise remote_mux.RemoteError(None, "", ("ssh", "devino-second"))
+
+        monkeypatch.setattr(node_sync, "final_pull", _timeout)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert node_answers == []  # neither repo_status nor kill_session was tried
+        assert "did not answer (timed out)" in result.stdout
+
+    def test_no_answer_and_no_record_says_the_commit_is_unknown(
+        self, runner, placed_api, node_is_gone
+    ):
+        result = _recall(runner, placed_api, "--local")
+
+        assert "no commit was ever recorded" in result.stdout
+
+    def test_nothing_pulled_prints_a_fresh_start_not_a_resume(
+        self, runner, api_repo, tmp_config, node_answers
+    ):
+        nodes.update_node_map("api", entry("second"))
+        cfg = tmp_config(
+            config_json(
+                ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
+            )
+        )
+
+        result = _recall(runner, cfg, "--local")
+
+        assert f'cd "{api_repo.resolve()}" && claude\n' in result.stdout
+        assert "--resume" not in result.stdout
+
+    def test_a_project_that_is_not_placed_exits_2(
+        self, runner, api_repo, tmp_config, node_answers
+    ):
+        cfg = tmp_config(
+            config_json(
+                ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
+            )
+        )
+
+        result = _recall(runner, cfg, "--local")
+
+        assert result.exit_code == 2
+        assert node_answers == []
+
+    @pytest.mark.parametrize(
+        "flags",
+        [
+            [],
+            # D-MERGE: --to arrives with plan G Task 15 (D's bring-up); until
+            # then this case would pass on "No such option", not on the rule.
+            pytest.param(
+                ["--local", "--to", "third"],
+                marks=pytest.mark.skipif(
+                    not _recall_has_to(),
+                    reason="D-MERGE: --to lands with plan G Task 15",
+                ),
+            ),
+        ],
+    )
+    def test_exactly_one_destination_is_required(
+        self, runner, placed_api, node_answers, flags
+    ):
+        result = _recall(runner, placed_api, *flags)
+
+        assert result.exit_code == 2
+        assert node_answers == []
+
+    def test_a_cloud_project_is_refused_before_anything_is_touched(
+        self, runner, api_repo, tmp_config, node_answers
+    ):
+        cfg = tmp_config(
+            config_json(
+                ("second",), [{"path": str(api_repo), "title": "api", "node": "cloud"}]
+            )
+        )
+
+        result = _recall(runner, cfg, "--local")
+
+        assert result.exit_code == 2
+        assert "runs in the cloud" in result.stderr
+        assert node_answers == []
+
+    def test_a_project_that_does_not_run_claude_is_refused(
+        self, runner, api_repo, tmp_config, node_answers
+    ):
+        nodes.update_node_map("api", entry("second"))
+        cfg = tmp_config(
+            config_json(
+                ("second",),
+                [
+                    {
+                        "path": str(api_repo),
+                        "title": "api",
+                        "node": "auto",
+                        "tool": "codex",
+                    },
+                ],
+            )
+        )
+
+        result = _recall(runner, cfg, "--local")
+
+        assert result.exit_code == 2
+        assert node_answers == []
+
+
+class TestRecallReadsTheNodeMapAsUntrusted:
+    """Plan G Task 14's forward correction: nothing between the node map and
+    the disk checks a sid, so recall checks it before any path is built."""
+
+    @pytest.mark.parametrize("sid", ["../escaped", "/etc", "a/b", "..", "con"])
+    def test_a_sid_this_pc_cannot_store_is_refused_by_name_before_anything(
+        self, runner, api_repo, tmp_config, node_answers, sid
+    ):
+        nodes.update_node_map("api", entry("second", sid))
+        cfg = tmp_config(
+            config_json(
+                ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
+            )
+        )
+
+        result = _recall(runner, cfg, "--local")
+
+        assert result.exit_code == 2
+        assert repr(sid) in result.stderr
+        assert node_answers == []
+        assert nodes.read_node_map()["api"].sid == sid
+        assert not _claude_dir(api_repo).exists()
+
+    def test_a_remote_root_the_seam_refuses_is_a_note_not_a_traceback(
+        self, runner, api_repo, tmp_config, monkeypatch
+    ):
+        # repo_status raises NodeConfigError, before any dial, for a root it
+        # will not send (G Task 9) -- the map's remote_root is untrusted too.
+        def _refused(node, root, *, timeout_s):
+            raise nodes.NodeConfigError(f"session root {root!r} is not absolute")
+
+        monkeypatch.setattr("magent.env.local_username", lambda: "amin")
+        monkeypatch.setattr(node_sync, "final_pull", lambda *a, **k: None)
+        monkeypatch.setattr(remote_mux, "repo_status", _refused)
+        monkeypatch.setattr(
+            remote_mux, "kill_session", lambda node, sid: None, raising=False
+        )
+        nodes.update_node_map("api", entry("second"))
+        cfg = tmp_config(
+            config_json(
+                ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
+            )
+        )
+
+        result = _recall(runner, cfg, "--local")
+
+        assert result.exit_code == 0
+        assert "Traceback" not in result.output
+        assert "could not read the repos on @second" in result.stdout
+        assert "api" not in nodes.read_node_map()

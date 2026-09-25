@@ -488,6 +488,16 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "nothing."
         ),
     ),
+    # D-MERGE: plan G Task 14's row reads "(--to <nick> | --local)" and names
+    # the move to another node; restore it when Task 15's --to lands with D.
+    (
+        "magent node recall <project> --local",
+        (
+            "Bring a node session home: `--local` prints the `claude --resume` "
+            "to run after a `git pull`. Pulls once more first; a node that does "
+            "not answer is reported, not fatal."
+        ),
+    ),
     ("magent config show", "Display current config."),
     ("magent config layout <cols> <rows>", "Set window grid."),
     ("magent config base-dir <path>", "Set projects folder."),

@@ -9,8 +9,11 @@ pay for ssh and tar).
 
 from __future__ import annotations
 
+import shutil
 import sys
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn
 
 import click
@@ -25,10 +28,9 @@ from magent.paths import find_config
 from magent.style import style
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from magent.config import MagentConfig, ProjectConfig
-    from magent.nodes import Placement
+    from magent.nodes import Node, NodeMapEntry, Placement, RepoStatus
+    from magent.remote_mux import RemoteError
 
 # How long `node sync -d` waits for the detached child to record its pid.
 _START_POLLS = 20
@@ -298,10 +300,23 @@ def _print_scores(placement: Placement) -> None:
         )
 
 
-# D-MERGE: `_local_dir` and `_print_push_set` (plan G :3137-3147, :3192-3210)
-# and their call at the end of plan_cmd's loop (:3257) need D's
-# launch.node_git_states; they land with D's merge, and
-# test_plan_lists_the_push_set_relative_to_the_project switches on with it.
+def _local_dir(cfg: MagentConfig, proj: ProjectConfig) -> Path | None:
+    """The project's folder on THIS machine, fully resolved (the exact string
+    Claude will see as its cwd after a ``cd`` to it), or None when missing."""
+    from magent.launch import (  # heavy subsystem: in-body per policy
+        _expand_base_dir,
+        _resolve_path,
+    )
+
+    base_dir = _expand_base_dir(cfg.base_dir) if cfg.base_dir else None
+    resolved = _resolve_path(proj.path, base_dir)
+    return Path(resolved).resolve() if resolved else None
+
+
+# D-MERGE: `_print_push_set` (plan G :3192-3210) and its call at the end of
+# plan_cmd's loop (:3257) need D's launch.node_git_states; they land with D's
+# merge, and test_plan_lists_the_push_set_relative_to_the_project switches on
+# with it.
 
 
 @node_group.command("plan")
@@ -359,3 +374,277 @@ def plan_cmd(ctx: click.Context, project: str | None, all_projects: bool) -> Non
 # and delivery -- launch.node_recipe, launch.node_git_states and
 # remote_mux.push_files -- so the whole command lands with D's merge.
 # tests/unit/test_node_cmd.py::TestNodePush is written and switches on then.
+
+
+# repo_status on a node that answers: a quick read, never a fetch.
+RECALL_TIMEOUT_S = 60.0
+
+
+def _tail(exc: RemoteError) -> str:
+    return exc.stderr_tail.strip() or (
+        "timed out" if exc.rc is None else f"exit {exc.rc}"
+    )
+
+
+def _source_node(cfg: MagentConfig, held: NodeMapEntry) -> Node | None:
+    try:
+        return nodes.node_for_nick(cfg, held.nick, local_user=env.local_username())
+    except nodes.NodeConfigError as exc:
+        _note(
+            f"@{held.nick} cannot be reached from this config ({exc});"
+            " using what was already pulled"
+        )
+        return None
+
+
+def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
+    """Step 1: one last pull, through node_sync's per-node lock -- the lock the
+    daemon's tick holds -- so it never races a running daemon (DECISION-26
+    xi). False when the node is gone. A daemon that keeps the node past the
+    wait stops the recall here, before anything is stopped or cleared."""
+    from magent import node_sync, remote_mux  # heavy subsystem: in-body per policy
+
+    try:
+        node_sync.final_pull(cfg, name, local_user=env.local_username())
+    except LockHeld:
+        _fail(
+            f"the node-sync daemon is still pulling from @{held.nick}; nothing was"
+            " stopped or cleared -- run the recall again",
+            _EXIT_UNREACHABLE,
+        )
+    except nodes.NodeConfigError as exc:
+        _note(
+            f"@{held.nick} cannot be pulled from ({exc});"
+            " going on with what was already pulled"
+        )
+        return False
+    except remote_mux.RemoteError as exc:
+        _note(
+            f"@{held.nick} did not answer ({_tail(exc)});"
+            " going on with what was already pulled"
+        )
+        # ssh's own failure (255) or a timeout (rc None, DECISION-19) means the
+        # node is unreachable: no more live reads that would only wait again.
+        return exc.rc not in (255, None)
+    _ok(f"pulled {held.sid} from @{held.nick} one last time")
+    return True
+
+
+def _when(ts: float) -> str:
+    return (
+        datetime.fromtimestamp(ts, tz=timezone.utc)
+        .astimezone()
+        .strftime("%Y-%m-%d %H:%M")
+    )
+
+
+def _repo_line(status: RepoStatus) -> str:
+    if not status.head:
+        return f"{status.remote_dir}  no repo found"
+    state = {True: "UNCOMMITTED CHANGES", False: "clean", None: "dirty unknown"}[
+        status.dirty
+    ]
+    ahead = f", {status.unpushed} unpushed commit(s)" if status.unpushed else ""
+    branch = f" on {status.branch}" if status.branch else ""
+    return f"{status.remote_dir}  {status.head[:12]}{branch}  {state}{ahead}"
+
+
+def _report_repos(source: Node | None, held: NodeMapEntry) -> None:
+    """Step 2: the node's commit per repo and whether its tree was dirty --
+    live when the node answers (and recorded), else the last record."""
+    from magent import remote_mux  # heavy subsystem: in-body per policy
+
+    record = None
+    if source is not None:
+        try:
+            repos = remote_mux.repo_status(
+                source, held.remote_root, timeout_s=RECALL_TIMEOUT_S
+            )
+        except remote_mux.RemoteError as exc:
+            _note(f"could not read the repos on @{held.nick} ({_tail(exc)})")
+        except nodes.NodeConfigError as exc:
+            # The map's remote_root is untrusted too: repo_status refuses a
+            # root it will not send, before any dial (plan G Task 9).
+            _note(f"could not read the repos on @{held.nick} ({exc})")
+        else:
+            record = nodes.RepoRecord(
+                ts=time.time(), source="recall", repos=tuple(repos)
+            )
+            nodes.write_repo_record(held.nick, held.sid, record)
+            click.echo(f"  repos on @{held.nick}, now:")
+    if record is None:
+        record = nodes.read_repo_record(held.nick, held.sid)
+        if record is None:
+            _note(
+                f"no commit was ever recorded for {held.sid} on @{held.nick} --"
+                " check the node before relying on `git pull`"
+            )
+            return
+        click.echo(
+            f"  repos on @{held.nick}, last known"
+            f" ({record.source}, {_when(record.ts)}):"
+        )
+    for status in record.repos:
+        click.echo(f"    {_repo_line(status)}")
+    if any(s.dirty or s.unpushed for s in record.repos):
+        _note(
+            f"@{held.nick} holds work that is not pushed; it stays on the node"
+            " until it is committed and pushed there"
+        )
+
+
+def _stop_session(source: Node | None, held: NodeMapEntry) -> None:
+    """Step 3, best effort: a session that cannot be stopped is named, with
+    the exact command that stops it."""
+    from magent import remote_mux  # heavy subsystem: in-body per policy
+
+    # DECISION-26 iii: the printed target is quoted -- zsh reads a bare =sid
+    # as a command lookup -- and the ssh form quotes the whole remote command.
+    kill = f"tmux -L {remote_mux.SOCKET} kill-session -t '={held.sid}'"
+    if source is None:
+        _note(
+            f"{held.sid} may still be running on @{held.nick};"
+            f" stop it there with: {kill}"
+        )
+        return
+    # D-MERGE: plan G :3865-3874 replaces this line with D's
+    # remote_mux.kill_session(source, held.sid) and its three outcomes --
+    # "stopped" only on True, "no such session" on False, the quoted ssh
+    # command on None (DECISION-26 x). Until D lands nothing can stop the
+    # session from here, so it is named with the command that does.
+    _note(
+        f"{held.sid} is still running on @{held.nick};"
+        f' stop it with: ssh {source.target} "{kill}"'
+    )
+
+
+def _clear_placement(name: str, held: NodeMapEntry) -> None:
+    """Drop ``name`` from the node map through D's one writer. A lock another
+    process keeps past its wait (``LockHeld``, an OSError -- DECISION-13) or a
+    failed write is a printed failure, never a traceback. By then the session
+    is already stopped, so a re-run only redoes the install and the clear."""
+    try:
+        nodes.update_node_map(name, None)
+    except OSError as exc:
+        _fail(
+            f"could not clear {name}'s placement on @{held.nick} ({exc});"
+            " run the recall again",
+            1,
+        )
+
+
+def _recall_local(
+    held: NodeMapEntry,
+    name: str,
+    local_dir: Path,
+    resume_id: str | None,
+) -> None:
+    """Steps 4-5 for ``--local``: install into THIS machine's Claude dir for
+    the local folder, clear the placement, print the resume -- never launch
+    it, because the user picks the terminal."""
+    dest = (
+        Path.home() / ".claude" / "projects" / nodes.encoded_project_dir(str(local_dir))
+    )
+    pulled = nodes.transcripts_dir(held.nick, held.sid)
+    if pulled.is_dir():
+        try:
+            shutil.copytree(pulled, dest, dirs_exist_ok=True)
+        except OSError as exc:
+            _fail(
+                f"could not install the conversation into {dest} ({exc});"
+                f" {name} stays placed on @{held.nick} -- run the recall again",
+                1,
+            )
+        _ok(f"installed the conversation into {dest}")
+    else:
+        _note(
+            f"nothing was ever pulled from @{held.nick} for {held.sid};"
+            " there is no conversation to install"
+        )
+    _clear_placement(name, held)
+    click.echo(
+        f"\n  {style(name, bold=True)} is home."
+        " Once the node's commits are pushed, run:"
+    )
+    click.echo(f'    git -C "{local_dir}" pull')
+    if resume_id is None:
+        click.echo(f'    cd "{local_dir}" && claude')
+        return
+    click.echo(f'    cd "{local_dir}" && claude --resume {resume_id}')
+    click.echo(
+        style(
+            f"  If claude says it cannot find that conversation, it is on disk at"
+            f" {dest / (resume_id + '.jsonl')}; resume by hand: run `claude --resume`"
+            f" in {local_dir} and pick it from the list.",
+            dim=True,
+        )
+    )
+
+
+# D-MERGE: plan G :3934 adds `--to NICK` (Task 15) and the usage rule becomes
+# "pass exactly one of --to <nick> or --local". --to ships the session through
+# D's recipe builder and bring-up, so until D lands a recall can only go home.
+@node_group.command("recall")
+@click.argument("project")
+@click.option(
+    "--local",
+    "to_local",
+    is_flag=True,
+    help="Bring the session home and print the command that resumes it.",
+)
+@click.pass_context
+def recall_cmd(ctx: click.Context, project: str, to_local: bool) -> None:
+    """Bring a node session home and print the command that resumes it.
+
+    Pulls once more, reports the node's last commit per repo, stops the
+    session, installs its conversation and memory where this machine's
+    Claude looks, and clears the placement. A node that does not answer is
+    reported, never fatal: what was already pulled is used.
+    """
+    if not to_local:
+        raise click.UsageError("pass --local")
+    cfg = _load_config_or_exit(find_config(ctx.obj.get("config_path")))
+    proj = _node_project_or_exit(cfg, project)
+    name = nodes.project_name(proj)
+    if is_cloud(proj):
+        # DECISION-15: a cloud session has no node session to recall. J11m
+        # replaces this refusal with its teleport branch (_recall_cloud).
+        _fail(f"{name} runs in the cloud; recall moves node sessions", _EXIT_USAGE)
+    tool = proj.tool or cfg.settings.default_tool
+    if tool != "claude":
+        _fail(
+            f"recall moves Claude Code conversations; {name} runs {tool!r}",
+            _EXIT_USAGE,
+        )
+    held = nodes.read_node_map().get(name)
+    if held is None:
+        _fail(
+            f"{name} is not placed on a node -- there is nothing to recall",
+            _EXIT_USAGE,
+        )
+    # Forward correction (plan G :3973-3976): the map is untrusted and nothing
+    # between it and the disk checks a sid, so it is checked here, before any
+    # path under ~/.magent/nodes or ~/.claude is built from it.
+    if not nodes.pullable_sid(held.sid):
+        _fail(
+            f"the node map names {name}'s session {held.sid!r}, which this"
+            " machine cannot store; nothing was touched",
+            _EXIT_USAGE,
+        )
+    local_dir = _local_dir(cfg, proj)
+    if local_dir is None:
+        _fail(
+            f"{proj.path} does not exist on this machine -- clone it first,"
+            " then recall",
+            _EXIT_USAGE,
+        )
+    click.echo(
+        f"\n  {style(f'magent node recall {name}', bold=True)}"
+        f" {style(f'(from @{held.nick})', dim=True)}"
+    )
+    source = _source_node(cfg, held)
+    reachable = source is not None and _final_pull(cfg, name, held)
+    _report_repos(source if reachable else None, held)
+    _stop_session(source if reachable else None, held)
+    resume_id = nodes.latest_transcript_id(held.nick, held.sid)
+    _recall_local(held, name, local_dir, resume_id)
