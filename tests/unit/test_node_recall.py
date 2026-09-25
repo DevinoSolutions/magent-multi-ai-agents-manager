@@ -20,8 +20,10 @@ from pathlib import Path, PureWindowsPath
 
 import pytest
 
-from magent import cli, node_sync, nodes, remote_mux
+from magent import cli, launch, node_sync, nodes, remote_mux
+from magent.config import ProjectConfig
 from magent.lockfile import LockHeld
+from magent.nodes import LocalGitState
 from tests.unit._node_fixtures import (
     NOW,
     OLDER_SESSION_ID,
@@ -29,6 +31,7 @@ from tests.unit._node_fixtures import (
     config_json,
     entry,
     git,
+    pool,
     write_transcript,
 )
 
@@ -38,6 +41,23 @@ from tests.unit._node_fixtures import (
 # node_cmd._stop_session lands (plan G :3853-3874).
 _NO_D_KILL = not hasattr(remote_mux, "kill_session")
 _D_KILL_REASON = "D-MERGE: needs D's remote_mux.kill_session (plan G :3853-3874)"
+
+# D-MERGE: `recall --to` (plan G Task 15, :4173-4266) moves a session through
+# D's recipe builder and bring-up. TestRecallTo is written and skipped on this
+# flag; D's merge switches it on and it fails until _destination/_recall_to
+# and the --to option land.
+_NO_D_MOVE = not all(
+    (
+        hasattr(launch, "node_recipe"),
+        hasattr(launch, "node_git_states"),
+        hasattr(launch, "bring_up_node_project"),
+        hasattr(launch, "NodeBringUpOutcome"),
+    )
+)
+_D_MOVE_REASON = (
+    "D-MERGE: needs D's launch.node_recipe, node_git_states,"
+    " bring_up_node_project and NodeBringUpOutcome (plan G :4173-4266)"
+)
 
 
 class TestTheEncodedDirIsClaudeCodesOwnRule:
@@ -1977,3 +1997,215 @@ class TestRecallReadsTheNodeMapAsUntrusted:
         assert "Traceback" not in result.output
         assert "could not read the repos on @second" in result.stdout
         assert "api" not in nodes.read_node_map()
+
+
+# --- magent node recall --to (plan G Task 15) ----------------------------------
+
+
+def _landed() -> str:
+    encoded = nodes.encoded_project_dir("/home/amin/magent/api")
+    return f"/home/amin/.claude/projects/{encoded}"
+
+
+@pytest.fixture
+def moving(monkeypatch, api_repo):
+    """recall --to's two outward calls after the source steps, recorded."""
+    events: list[tuple[object, ...]] = []
+    state = LocalGitState(
+        path=api_repo,
+        url="git@github.com:amin/api.git",
+        branch="main",
+        dirty=False,
+        unpushed=False,
+        detached=False,
+    )
+    monkeypatch.setattr(launch, "node_git_states", lambda config, proj: [state])
+
+    def _install(node, remote_root, source, *, timeout_s):
+        events.append(("install", node.nick, remote_root, source))
+        return remote_mux.InstalledTranscripts(landed=_landed())
+
+    def _bring_up(config, proj, *, resume_id=None, **_k):
+        # **_k: D's allow_dirty=/window= (DECISION-22).
+        events.append(("bring_up", proj.node, resume_id))
+        return launch.NodeBringUpOutcome(ok=True, sid="api", node=proj.node)
+
+    monkeypatch.setattr(remote_mux, "install_transcripts", _install)
+    monkeypatch.setattr(launch, "bring_up_node_project", _bring_up)
+    return events, state
+
+
+def _recall_to(runner, cfg: str, nick: str):
+    return runner.invoke(
+        cli.main, ["--config", cfg, "node", "recall", "api", "--to", nick]
+    )
+
+
+@pytest.mark.skipif(_NO_D_MOVE, reason=_D_MOVE_REASON)
+class TestRecallTo:
+    def test_the_conversation_is_installed_on_the_new_node_then_resumed_there(
+        self, runner, placed_api, node_answers, moving
+    ):
+        events, state = moving
+
+        result = _recall_to(runner, placed_api, "third")
+
+        cfg = pool("second", "third")
+        proj = ProjectConfig(path=str(state.path), title="api", node="third")
+        remote_root = launch.node_recipe(
+            cfg, proj, nodes.node_for_nick(cfg, "third", local_user="amin"), [state]
+        ).remote_root
+        assert result.exit_code == 0
+        assert events == [
+            ("install", "third", remote_root, nodes.transcripts_dir("second", "api")),
+            ("bring_up", "third", SESSION_ID),
+        ]
+        assert "api runs on @third, resuming" in result.stdout
+
+    def test_the_install_reports_where_the_conversation_landed(
+        self, runner, placed_api, node_answers, moving
+    ):
+        # Forward correction (plan G :4015): install_transcripts returns an
+        # InstalledTranscripts; the line names its .landed, never the object.
+        result = _recall_to(runner, placed_api, "third")
+
+        assert f"installed the conversation on @third in {_landed()}" in result.stdout
+        assert "InstalledTranscripts(" not in result.stdout
+
+    def test_a_kept_files_note_from_the_install_is_shown(
+        self, runner, placed_api, node_answers, moving, monkeypatch
+    ):
+        installed = remote_mux.InstalledTranscripts(
+            landed=_landed(), kept=(f"{SESSION_ID}.jsonl", "memory/MEMORY.md")
+        )
+        monkeypatch.setattr(
+            remote_mux,
+            "install_transcripts",
+            lambda node, remote_root, source, *, timeout_s: installed,
+        )
+
+        result = _recall_to(runner, placed_api, "third")
+
+        assert result.exit_code == 0
+        assert installed.note  # the property the recall prints, not a copy of it
+        assert installed.note in result.stdout
+
+    def test_an_install_that_kept_nothing_prints_no_note(
+        self, runner, placed_api, node_answers, moving
+    ):
+        result = _recall_to(runner, placed_api, "third")
+
+        assert "kept the node's" not in result.stdout
+
+    def test_the_old_placement_is_cleared_before_the_bring_up_records_the_new_one(
+        self, runner, placed_api, node_answers, moving
+    ):
+        _recall_to(runner, placed_api, "third")
+
+        assert "api" not in nodes.read_node_map()
+
+    def test_a_node_that_refuses_the_install_keeps_the_old_placement(
+        self, runner, placed_api, node_answers, moving, monkeypatch
+    ):
+        events, _ = moving
+
+        def _refuse(node, remote_root, source, *, timeout_s):
+            raise remote_mux.RemoteError(
+                255, "Connection refused", ("ssh", "devino-third")
+            )
+
+        monkeypatch.setattr(remote_mux, "install_transcripts", _refuse)
+
+        result = _recall_to(runner, placed_api, "third")
+
+        assert result.exit_code == 3
+        assert nodes.read_node_map()["api"].nick == "second"
+        assert "magent up api" in result.stderr
+        assert [e for e in events if e[0] == "bring_up"] == []
+
+    def test_a_failed_bring_up_exits_3_saying_the_conversation_is_installed(
+        self, runner, placed_api, node_answers, moving, monkeypatch
+    ):
+        monkeypatch.setattr(
+            launch,
+            "bring_up_node_project",
+            lambda config, proj, *, resume_id=None, **_k: launch.NodeBringUpOutcome(
+                ok=False, sid="api", node=proj.node, error="local tree is dirty"
+            ),
+        )
+
+        result = _recall_to(runner, placed_api, "third")
+
+        assert result.exit_code == 3
+        assert "local tree is dirty" in result.stderr
+        assert "installed there" in result.stderr
+
+    def test_a_held_map_lock_stops_the_move_before_the_bring_up(
+        self, runner, placed_api, node_answers, moving, monkeypatch
+    ):
+        events, _ = moving
+
+        def _held(project, entry, **_k):
+            raise LockHeld("node-map lock is held by another process")
+
+        monkeypatch.setattr(nodes, "update_node_map", _held)
+
+        result = _recall_to(runner, placed_api, "third")
+
+        assert result.exit_code == 1
+        assert "could not clear api's placement" in result.stderr
+        assert [e for e in events if e[0] == "bring_up"] == []
+
+    def test_an_unknown_node_exits_2_before_anything_is_touched(
+        self, runner, placed_api, node_answers, moving
+    ):
+        result = _recall_to(runner, placed_api, "ninth")
+
+        assert result.exit_code == 2
+        assert node_answers == []
+
+    def test_the_node_it_is_already_on_exits_2(
+        self, runner, placed_api, node_answers, moving
+    ):
+        result = _recall_to(runner, placed_api, "second")
+
+        assert result.exit_code == 2
+        assert node_answers == []
+
+    def test_a_pinned_project_is_moved_by_editing_the_config_not_by_recall(
+        self, runner, api_repo, tmp_config, node_answers, moving
+    ):
+        nodes.update_node_map("api", entry("second"))
+        cfg = tmp_config(
+            config_json(
+                ("second", "third"),
+                [{"path": str(api_repo), "title": "api", "node": "second"}],
+            )
+        )
+
+        result = _recall_to(runner, cfg, "third")
+
+        assert result.exit_code == 2
+        assert 'change its "node"' in result.stderr
+        assert node_answers == []
+
+    def test_a_sid_this_pc_cannot_store_is_refused_before_the_move(
+        self, runner, api_repo, tmp_config, node_answers, moving
+    ):
+        # Plan G :3976: --to ships transcripts_dir(held.nick, held.sid), so
+        # Task 14's sid check covers it too.
+        events, _ = moving
+        nodes.update_node_map("api", entry("second", "../escaped"))
+        cfg = tmp_config(
+            config_json(
+                ("second", "third"),
+                [{"path": str(api_repo), "title": "api", "node": "auto"}],
+            )
+        )
+
+        result = _recall_to(runner, cfg, "third")
+
+        assert result.exit_code == 2
+        assert "'../escaped'" in result.stderr
+        assert node_answers == []
+        assert events == []

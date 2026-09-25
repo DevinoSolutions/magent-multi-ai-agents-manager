@@ -581,9 +581,20 @@ def _recall_local(
     )
 
 
-# D-MERGE: plan G :3934 adds `--to NICK` (Task 15) and the usage rule becomes
-# "pass exactly one of --to <nick> or --local". --to ships the session through
-# D's recipe builder and bring-up, so until D lands a recall can only go home.
+# D-MERGE: `recall --to NICK` (plan G Task 15) moves the session through D's
+# recipe builder and bring-up, so until D lands a recall can only go home.
+# With D it lands as:
+# - the option at :3934, and the usage rule "pass exactly one of --to <nick>
+#   or --local";
+# - `_destination` and `_recall_to` (:4173-4249), `_destination` called
+#   before the heading and `_recall_to` as the `elif` after `_recall_local`
+#   (:4252-4266);
+# - `_local_dir` required only for --local (:3960-3962), as the plan has it;
+# - per the forward correction at :4015, `_recall_to` reads
+#   `InstalledTranscripts.landed` for the directory it names and prints
+#   `.note` (the kept-items line) when it is non-empty -- never the object;
+# - the sid check below already covers --to (:3976).
+# tests/unit/test_node_recall.py::TestRecallTo is written and switches on then.
 @node_group.command("recall")
 @click.argument("project")
 @click.option(
