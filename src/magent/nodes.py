@@ -185,6 +185,10 @@ PC_ENDPOINT_ENV = frozenset(
         "ANTHROPIC_VERTEX_BASE_URL",
         "HTTPS_PROXY",
         "HTTP_PROXY",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
         "all_proxy",
         "http_proxy",
         "https_proxy",
@@ -449,7 +453,7 @@ def _endpoint_skip_reason(value: object) -> str | None:
     if "://" not in text:
         text = "//" + text
     try:
-        host = urllib.parse.urlsplit(text).hostname
+        host = _url_host(text)
     except ValueError:  # an unbalanced IPv6 bracket, say
         return no_host
     if not host:
@@ -457,6 +461,22 @@ def _endpoint_skip_reason(value: object) -> str | None:
     if _is_pc_local_host(host):
         return "points at this PC"
     return None
+
+
+# Schemes a WHATWG url parser (Node's URL -- claude's) treats as "special":
+# there a "\" is a "/", so the host ends at it. "" covers a scheme-less proxy
+# value (host:port), which such a client reads as http.
+_WHATWG_SPECIAL_SCHEMES = frozenset({"", "http", "https", "ws", "wss"})
+
+
+def _url_host(url: str) -> str | None:
+    """``url``'s host as claude's url parser reads it, not as urlsplit alone
+    would: ``http://127.0.0.1\\@remote.example`` connects to 127.0.0.1, where
+    urlsplit reads userinfo ``127.0.0.1\\`` and host remote.example. Raises
+    ValueError for a url urlsplit cannot parse."""
+    if urllib.parse.urlsplit(url).scheme in _WHATWG_SPECIAL_SCHEMES:
+        url = url.replace("\\", "/")
+    return urllib.parse.urlsplit(url).hostname
 
 
 # A host a resolver may still read as an IPv4 address in inet_aton's short
@@ -470,9 +490,15 @@ def _is_pc_local_host(host: str) -> bool:
     its own link), never the node's view of it -- however it is spelled (a
     root-dot FQDN, an inet_aton short form, an IPv4-mapped IPv6 address, a
     percent-encoded or full-width spelling a client decodes before it
-    resolves)."""
+    resolves, a character IDNA maps to nothing)."""
     host = unicodedata.normalize("NFKC", urllib.parse.unquote(host))
-    host = host.replace("。", ".").lower().rstrip(".")
+    host = host.replace("。", ".")
+    # IDNA drops a soft hyphen or zero-width space the way a client's own
+    # domain-to-ASCII step does. A host it refuses (an empty label, say) is
+    # checked as it is.
+    with contextlib.suppress(UnicodeError):
+        host = host.encode("idna").decode("ascii")
+    host = host.lower().rstrip(".")
     if host == "localhost" or host.endswith(".localhost"):
         return True
     address: ipaddress.IPv4Address | ipaddress.IPv6Address
@@ -569,7 +595,7 @@ def _transport_skip_reason(spec: object) -> str | None:
     if not isinstance(url, str) or not url:
         return f"an {kind} server with no url"
     try:
-        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+        host = (_url_host(url) or "").lower()
     except ValueError:  # an unbalanced IPv6 bracket, say
         return "its url does not parse"
     if not host:

@@ -348,6 +348,11 @@ def _fullwidth(text: str) -> str:
     return "".join(chr(ord(c) + 0xFEE0) for c in text)
 
 
+# Invisible characters IDNA maps to nothing (nameprep table B.1).
+SHY = chr(0xAD)  # soft hyphen
+ZWSP = chr(0x200B)  # zero-width space
+
+
 class TestHowEachServerIsClassified:
     """DECISION-12 + the transport rule: a remote http/sse server ships; an
     http server on loopback/link-local is PC-local; a stdio server whose
@@ -452,6 +457,14 @@ class TestHowEachServerIsClassified:
                 {"type": "http", "url": "http://127" + chr(0x3002) + "0.0.1/mcp"},
                 LOCAL,
             ),
+            # WHATWG (Node) reads "\" as "/" in a special-scheme url: this host
+            # is 127.0.0.1 to the client, remote.example to a naive urlsplit.
+            ({"type": "http", "url": r"http://127.0.0.1\@remote.example/mcp"}, LOCAL),
+            # Characters IDNA maps to nothing: a soft hyphen, a zero-width space.
+            ({"type": "http", "url": f"http://loc{SHY}alhost/mcp"}, LOCAL),
+            ({"type": "http", "url": f"http://lo{ZWSP}calhost/mcp"}, LOCAL),
+            ({"type": "http", "url": f"http://127.0.0.1{SHY}/mcp"}, LOCAL),
+            ({"type": "http", "url": "http://localhost../mcp"}, LOCAL),
         ],
     )
     def test_the_reason_a_server_stays_behind(self, spec, reason):
@@ -886,6 +899,10 @@ ENDPOINT_ENV = (
     "ANTHROPIC_VERTEX_BASE_URL",
     "HTTPS_PROXY",
     "HTTP_PROXY",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
     "all_proxy",
     "http_proxy",
     "https_proxy",
@@ -906,6 +923,11 @@ class TestAnEndpointThatPointsAtThisPcNeverShips:
             "http://%31%32%37.0.0.1:3456",
             f"http://{_fullwidth('localhost')}:3456",
             "127.0.0.1:8080",
+            "  127.0.0.1:3456",
+            "http://localhost..:3456",
+            r"http://127.0.0.1\@remote.example",
+            r"127.0.0.1\@remote.example:3128",
+            f"https://loc{SHY}alhost:3456",
         ],
     )
     def test_a_local_endpoint_stays_behind_with_a_note(self, tmp_path, name, value):
