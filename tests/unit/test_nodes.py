@@ -1017,6 +1017,34 @@ class TestPushExtras:
             "push: .ssh/id_ed25519 is never pushed (credentials); skipped",
         )
 
+    def test_a_store_that_will_not_resolve_under_a_linked_home_is_refused(
+        self, tmp_path, monkeypatch
+    ):
+        # home is reached through a directory symlink and ~/.ssh alone fails to
+        # resolve: judged lexically under the LINK, the key (which resolves
+        # under the real home) would not match. The stores sit under the
+        # resolved home, so it still does -- fail toward shipping less.
+        real_home = tmp_path / "real-home"
+        (real_home / ".ssh").mkdir(parents=True)
+        (real_home / ".ssh" / "id_rsa").write_text("KEY", encoding="utf-8")
+        home = tmp_path / "home-link"
+        try:
+            os.symlink(real_home, home, target_is_directory=True)
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        real_resolve = Path.resolve
+
+        def resolve(self, strict=False):
+            if self.name == ".ssh":
+                raise OSError(62, "Too many levels of symbolic links", str(self))
+            return real_resolve(self, strict=strict)
+
+        monkeypatch.setattr(Path, "resolve", resolve)
+        assert nodes.push_set(home, [], home=home, extras=[".ssh/id_rsa"]) == ()
+        assert nodes.push_warnings(home, [".ssh/id_rsa"], home=home) == (
+            "push: .ssh/id_rsa is never pushed (credentials); skipped",
+        )
+
     def test_the_usual_credential_files_are_on_the_list(self):
         assert set(nodes._NEVER_PUSHED) >= {
             ".ssh/",
@@ -1071,6 +1099,65 @@ class TestPushExtras:
         assert nodes.push_warnings(repo, ["apps"], home=Path.home()) == (
             "push: apps is a directory; list its files; skipped",
         )
+
+    def test_an_extra_that_will_not_resolve_is_a_warning_not_a_crash(
+        self, tmp_path, monkeypatch
+    ):
+        # A symlink loop raises on resolve (RuntimeError before 3.13, OSError
+        # after on some OSes); faked here so every OS and Python sees it.
+        (tmp_path / "ok.json").write_text("{}", encoding="utf-8")
+        real_resolve = Path.resolve
+
+        def resolve(self, strict=False):
+            if self.name == "loop.json":
+                raise OSError(62, "Too many levels of symbolic links", str(self))
+            return real_resolve(self, strict=strict)
+
+        monkeypatch.setattr(Path, "resolve", resolve)
+        extras = ["loop.json", "ok.json"]
+        assert nodes.push_warnings(tmp_path, extras, home=Path.home()) == (
+            "push: loop.json cannot be resolved; skipped",
+        )
+        assert nodes.push_set(tmp_path, [], home=Path.home(), extras=extras) == (
+            tmp_path / "ok.json",
+        )
+
+    def test_a_symlinked_extra_that_leaves_through_the_link_ships_inside(
+        self, repo, tmp_path
+    ):
+        # The project is a link to the repo and the extra is written through
+        # the repo's real name: lexically it is outside the project, resolved
+        # it is inside, so it ships at its place under the project's own path.
+        (repo / "sa.json").write_text("{}", encoding="utf-8")
+        link = tmp_path / "sendly-link"
+        try:
+            os.symlink(repo, link, target_is_directory=True)
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        shipped = nodes.push_set(
+            link, [_real_state(repo)], home=Path.home(), extras=["../sendly/sa.json"]
+        )
+        assert link / "sa.json" in shipped
+        assert repo / "sa.json" not in shipped
+
+    def test_a_linked_project_ships_one_file_once_under_its_own_name(
+        self, repo, tmp_path
+    ):
+        # git lists repo/.env; the extra names link/.env. One file, one push,
+        # under the path the project is configured at.
+        link = tmp_path / "sendly-link"
+        try:
+            os.symlink(repo, link, target_is_directory=True)
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        shipped = nodes.push_set(
+            link, [_real_state(repo)], home=Path.home(), extras=[".env"]
+        )
+        assert link / ".env" in shipped
+        assert repo / ".env" not in shipped
+        assert [p for p in shipped if p.resolve() == (repo / ".env").resolve()] == [
+            link / ".env"
+        ]
 
 
 class TestRecipeFor:
@@ -1194,3 +1281,241 @@ class TestRecipeFor:
             project_dir=link,
         )
         assert [r.remote_dir for r in recipe.repos] == [recipe.remote_root]
+
+    def test_a_project_inside_a_larger_repo_is_refused_as_such(self, tmp_path):
+        # A monorepo subdirectory: push_set stays safe for it, but a node
+        # clones whole repos, so the refusal names what is actually wrong.
+        web = tmp_path / "mono" / "apps" / "web"
+        web.mkdir(parents=True)
+        with pytest.raises(
+            NodeConfigError, match="the project is inside a larger repo"
+        ) as err:
+            nodes.recipe_for(
+                ProjectConfig(path=str(web), node="second"),
+                NODE,
+                [_state(tmp_path / "mono", ())],
+                home=Path.home(),
+                project_dir=web,
+            )
+        assert str(tmp_path / "mono") in str(err.value)
+
+    def test_a_path_that_will_not_resolve_is_a_config_error(
+        self, tmp_path, monkeypatch
+    ):
+        raised: list[OSError] = []
+
+        def loop(self, strict=False):
+            raised.append(OSError(62, "Too many levels of symbolic links", str(self)))
+            raise raised[-1]
+
+        with monkeypatch.context() as patched:
+            patched.setattr(Path, "resolve", loop)
+            with pytest.raises(NodeConfigError, match="cannot be resolved") as err:
+                nodes.recipe_for(
+                    ProjectConfig(path=str(tmp_path), node="second"),
+                    NODE,
+                    [_state(tmp_path, ())],
+                    home=Path.home(),
+                    project_dir=tmp_path,
+                )
+        assert "Too many levels of symbolic links" in str(err.value)
+        # Chained, not re-worded: the traceback still shows the OS's own error.
+        assert err.value.__cause__ is raised[0]
+
+    def test_a_nul_in_the_project_path_is_a_config_error_naming_it(self, tmp_path):
+        # Path.resolve may or may not reject the NUL (it varies by OS and
+        # Python); either way the answer is a NodeConfigError naming the path,
+        # never a bare "scandir: embedded null character".
+        bad = Path(str(tmp_path / "ws") + "\0x")
+        with pytest.raises(NodeConfigError) as err:
+            nodes.recipe_for(
+                ProjectConfig(path=str(bad), node="second"),
+                NODE,
+                [_state(bad / "api", ())],
+                home=Path.home(),
+                project_dir=bad,
+            )
+        assert str(bad) in str(err.value)
+
+    def test_a_project_with_no_repo_is_refused(self, tmp_path):
+        # Nothing to clone means nothing to run: an empty recipe is a caller
+        # bug, not a bring-up that silently starts in an empty folder.
+        with pytest.raises(NodeConfigError, match="has no git repo") as err:
+            nodes.recipe_for(
+                ProjectConfig(path=str(tmp_path), node="second"),
+                NODE,
+                [],
+                home=Path.home(),
+                project_dir=tmp_path,
+            )
+        assert str(tmp_path) in str(err.value)
+
+    def test_a_repo_listed_twice_is_cloned_once(self, tmp_path):
+        state = _state(tmp_path, ())
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(tmp_path), node="second"),
+            NODE,
+            [state, state],
+            home=Path.home(),
+            project_dir=tmp_path,
+        )
+        assert [r.remote_dir for r in recipe.repos] == [recipe.remote_root]
+
+    @pytest.mark.parametrize(
+        ("url", "stripped"),
+        [
+            (
+                "https://user:ghp_SECRET@github.com/org/repo.git",
+                "https://github.com/org/repo.git",
+            ),
+            (
+                "https://ghp_SECRET@github.com:8443/org/repo.git",
+                "https://github.com:8443/org/repo.git",
+            ),
+            (
+                "HTTP://x-access-token:ghp_SECRET@github.com/org/repo.git",
+                "http://github.com/org/repo.git",
+            ),
+            # Not an http(s) allow-list: every scheme but ssh loses the WHOLE
+            # userinfo, because a token-only login IS the credential there.
+            (
+                "git+https://user:ghp_SECRET@github.com/org/repo.git",
+                "git+https://github.com/org/repo.git",
+            ),
+            (
+                "git://ghp_SECRET@github.com/org/repo.git",
+                "git://github.com/org/repo.git",
+            ),
+            (
+                "https://user:ghp_SECRET@[2001:db8::1]:8443/org/repo.git",
+                "https://[2001:db8::1]:8443/org/repo.git",
+            ),
+            # ssh-family keeps the login and drops only the password.
+            (
+                "ssh://user:ghp_SECRET@github.com/org/repo.git",
+                "ssh://user@github.com/org/repo.git",
+            ),
+            (
+                "GIT+SSH://git:ghp_SECRET@[2001:db8::1]:22/org/repo.git",
+                "git+ssh://git@[2001:db8::1]:22/org/repo.git",
+            ),
+            (
+                "ssh+git://git:ghp_SECRET@github.com/org/repo.git",
+                "ssh+git://git@github.com/org/repo.git",
+            ),
+        ],
+    )
+    def test_credentials_in_an_origin_never_reach_the_recipe(
+        self, tmp_path, url, stripped
+    ):
+        # The node's .git/config, the Recipe's repr and every log line would
+        # otherwise carry this PC's token.
+        state = dataclasses.replace(_state(tmp_path, ()), url=url)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(tmp_path), node="second"),
+            NODE,
+            [state],
+            home=Path.home(),
+            project_dir=tmp_path,
+        )
+        assert recipe.repos[0].url == stripped
+        assert "ghp_SECRET" not in repr(recipe)
+        assert recipe.warnings == (
+            (
+                f"repo {recipe.remote_root}: origin URL carried credentials; "
+                "stripped -- the node authenticates with its own gh token"
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        ("url", "stripped"),
+        [
+            # git's remote-helper form `<transport>::<address>`: the address is
+            # stripped by the same rules, the transport is re-attached as-is.
+            (
+                "https::https://u:SECRET@host/r.git",
+                "https::https://host/r.git",
+            ),
+            (
+                "HTTPS::HTTPS://u:SECRET@host/r.git",
+                "HTTPS::https://host/r.git",
+            ),
+            # Every layer of a stacked prefix is peeled, none is guessed at.
+            (
+                "https::https::https://u:SECRET@host/r.git",
+                "https::https::https://host/r.git",
+            ),
+            # An empty ssh login with a password: the whole userinfo goes.
+            (
+                "ssh://:SECRET@host/r.git",
+                "ssh://host/r.git",
+            ),
+        ],
+    )
+    def test_a_credential_behind_a_transport_or_an_empty_login_is_stripped(
+        self, tmp_path, url, stripped
+    ):
+        state = dataclasses.replace(_state(tmp_path, ()), url=url)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(tmp_path), node="second"),
+            NODE,
+            [state],
+            home=Path.home(),
+            project_dir=tmp_path,
+        )
+        assert recipe.repos[0].url == stripped
+        assert "SECRET" not in repr(recipe)
+        assert recipe.warnings == (
+            (
+                f"repo {recipe.remote_root}: origin URL carried credentials; "
+                "stripped -- the node authenticates with its own gh token"
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # The ext transport's address is a command, not a URL.
+            "ext::ssh -i key git@host r.git",
+            "https::https://host/r.git",
+            # An empty userinfo carries nothing: no rewrite, no warning.
+            "https://@host/r.git",
+            "https://:@host/r.git",
+            "ssh://git:@host/r.git",
+        ],
+    )
+    def test_an_origin_with_nothing_to_strip_is_left_byte_for_byte(self, tmp_path, url):
+        state = dataclasses.replace(_state(tmp_path, ()), url=url)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(tmp_path), node="second"),
+            NODE,
+            [state],
+            home=Path.home(),
+            project_dir=tmp_path,
+        )
+        assert recipe.repos[0].url == url
+        assert recipe.warnings == ()
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "git@github.com:org/repo.git",
+            "ssh://git@github.com/org/repo.git",
+            "git+ssh://git@[2001:db8::1]:22/org/repo.git",
+            "https://github.com/org/repo.git",
+            "git://github.com/org/repo.git",
+            # An '@' past the authority is a path character, not a login.
+            "https://github.com/org/repo@v1.git",
+        ],
+    )
+    def test_a_login_in_an_ssh_origin_is_not_a_credential(self, tmp_path, url):
+        state = dataclasses.replace(_state(tmp_path, ()), url=url)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(tmp_path), node="second"),
+            NODE,
+            [state],
+            home=Path.home(),
+            project_dir=tmp_path,
+        )
+        assert recipe.repos[0].url == url
+        assert recipe.warnings == ()

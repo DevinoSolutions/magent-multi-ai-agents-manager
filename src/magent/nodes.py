@@ -510,10 +510,39 @@ def _from_git_listing(repo: Path, ignored: tuple[str, ...]) -> list[Path]:
     return found
 
 
+# What Path.resolve raises when a path cannot be resolved: a symlink loop
+# (RuntimeError before Python 3.13, OSError from 3.13 on), an OS error, or a
+# name the OS rejects (ValueError: an embedded NUL). The one list; both
+# resolve helpers catch exactly this.
+_RESOLVE_ERRORS = (OSError, RuntimeError, ValueError)
+
+
+def _try_resolve(path: Path) -> Path | None:
+    """``path`` resolved (symlinks followed), or None when it cannot be
+    (``_RESOLVE_ERRORS``). Each caller states its own policy for None."""
+    try:
+        return path.resolve()
+    except _RESOLVE_ERRORS:
+        return None
+
+
+def _resolved(path: Path) -> Path:
+    """``path`` resolved, or a NodeConfigError naming it, chained to the OS's
+    own error: a recipe cannot place a repo it cannot locate."""
+    try:
+        return path.resolve()
+    except _RESOLVE_ERRORS as exc:
+        raise NodeConfigError(f"{path}: cannot be resolved ({exc})") from exc
+
+
 def _workspace_root_files(project_dir: Path) -> list[Path]:
     # A workspace root is not a repo, so git lists nothing there -- its own env
     # files and local Claude settings would otherwise never leave this PC.
-    found = [p for p in project_dir.iterdir() if p.is_file() and _is_env_file(p.name)]
+    try:
+        entries = list(project_dir.iterdir())
+    except (OSError, ValueError) as exc:
+        raise NodeConfigError(f"{project_dir}: cannot be listed ({exc})") from exc
+    found = [p for p in entries if p.is_file() and _is_env_file(p.name)]
     found += [project_dir / f for f in _PUSH_FIXED if (project_dir / f).is_file()]
     return found
 
@@ -523,23 +552,27 @@ def _inside_a_repo(project_dir: Path, states: Sequence[LocalGitState]) -> bool:
     RESOLVED paths: a project configured as a junction/symlink to its repo, or
     as a monorepo subdirectory, is still inside it -- and the root listing,
     which cannot tell a tracked ``.env.example`` from an ignored ``.env``,
-    must not run there. A path that will not resolve counts as inside: the
-    fail-safe direction ships less."""
-    try:
-        root = project_dir.resolve()
-        return any(root.is_relative_to(state.path.resolve()) for state in states)
-    # RuntimeError: a symlink loop before Python 3.13; OSError from 3.13 on.
-    except (OSError, RuntimeError):
+    must not run there. (``recipe_for`` refuses a project inside a larger repo;
+    ``push_set`` stays safe for one regardless.) A path that will not resolve
+    counts as inside: the fail-safe direction ships less."""
+    root = _try_resolve(project_dir)
+    repos = [_try_resolve(state.path) for state in states]
+    if root is None or None in repos:
         return True
+    return any(repo is not None and root.is_relative_to(repo) for repo in repos)
 
 
 def _forbidden_roots(home: Path) -> list[tuple[PurePath, bool]]:
     """Each ``_NEVER_PUSHED`` entry under ``home``, resolved (a store that is
-    itself a symlink is judged where it lands), paired with "is a directory"."""
-    return [
-        ((home / entry.rstrip("/")).resolve(), entry.endswith("/"))
-        for entry in _NEVER_PUSHED
+    itself a symlink is judged where it lands), paired with "is a directory".
+    A store that will not resolve is judged at its own lexical place -- under
+    the RESOLVED home, so a home reached through a symlink still matches the
+    resolved targets ``_is_forbidden`` is handed (fail toward shipping less)."""
+    base = _try_resolve(home) or home
+    stores = [
+        (base / entry.rstrip("/"), entry.endswith("/")) for entry in _NEVER_PUSHED
     ]
+    return [(_try_resolve(store) or store, is_dir) for store, is_dir in stores]
 
 
 def _folded(path: PurePath) -> tuple[str, ...]:
@@ -566,24 +599,31 @@ def _shippable_git_hit(path: Path, forbidden: Sequence[tuple[PurePath, bool]]) -
     """A path git's listing reported is a snapshot claim: it ships only if it is
     a regular file now, and -- resolved, symlinks followed -- not a credential
     store's."""
-    try:
-        return path.is_file() and not _is_forbidden(path.resolve(), forbidden)
-    except (OSError, RuntimeError):
-        return False
+    target = _try_resolve(path)
+    # os.path.isfile never raises (a stat error is "not a file" on every
+    # Python), which Path.is_file only guarantees from 3.13 on.
+    return (
+        target is not None
+        and os.path.isfile(target)
+        and not _is_forbidden(target, forbidden)
+    )
 
 
 def _classify_extras(
-    project_dir: Path, extras: Sequence[str], *, home: Path
+    project_dir: Path,
+    extras: Sequence[str],
+    forbidden: Sequence[tuple[PurePath, bool]],
 ) -> tuple[list[Path], list[str]]:
     shipped: list[Path] = []
     warnings: list[str] = []
     # Both sides resolved: a symlink inside the project that points out of it
     # is outside, and so is a project reached through a symlinked parent.
-    root = project_dir.resolve()
-    forbidden = _forbidden_roots(home)
+    root = _resolved(project_dir)
     for extra in extras:
-        target = (project_dir / extra).resolve()
-        if not target.is_relative_to(root):
+        target = _try_resolve(project_dir / extra)
+        if target is None:
+            warnings.append(f"push: {extra} cannot be resolved; skipped")
+        elif not target.is_relative_to(root):
             warnings.append(f"push: {extra} is outside the project; skipped")
         elif _is_forbidden(target, forbidden):
             warnings.append(f"push: {extra} is never pushed (credentials); skipped")
@@ -604,9 +644,60 @@ def _named_path(project_dir: Path, extra: str, target: Path, root: Path) -> Path
     directory, which POSIX resolves differently from the lexical collapse)
     the validated target's own place."""
     named = Path(os.path.normpath(project_dir / extra))
-    if named.is_relative_to(project_dir) and named.resolve() == target:
+    if named.is_relative_to(project_dir) and _try_resolve(named) == target:
         return named
     return project_dir / target.relative_to(root)
+
+
+def _one_per_file(found: Sequence[Path], project_dir: Path) -> tuple[Path, ...]:
+    """``found`` with each file once, sorted. A file is its NAME in its resolved
+    directory: a linked project reaches ``repo/.env`` through git's listing and
+    ``link/.env`` through an extra, and that is one push, kept under the path
+    lexically inside ``project_dir``.
+
+    Two names for one target both ship only when the link is a FILE symlink
+    (``a.json -> b.json``: two names in one directory, and the node needs
+    both). Through a DIRECTORY symlink (``cfg -> shared``) an extra's
+    ``cfg/.env`` and git's ``shared/.env`` share a resolved directory and a
+    name, so they collapse to one entry.
+
+    On Windows ``WindowsPath`` equality is case-insensitive, so ``.ENV`` and
+    ``.env`` dedupe there. ``PosixPath`` equality is not: two genuinely
+    different files on a case-sensitive filesystem rightly both ship, but one
+    file reached under two casings on a case-insensitive one (macOS APFS)
+    double-ships (pre-existing, deliberately not fixed here)."""
+    kept: dict[Path, Path] = {}
+    for path in found:
+        key = (_try_resolve(path.parent) or path.parent) / path.name
+        held = kept.get(key)
+        if held is None or (
+            path.is_relative_to(project_dir) and not held.is_relative_to(project_dir)
+        ):
+            kept[key] = path
+    return tuple(sorted(kept.values(), key=str))
+
+
+def _push(
+    project_dir: Path,
+    states: Sequence[LocalGitState],
+    *,
+    home: Path,
+    extras: Sequence[str],
+) -> tuple[tuple[Path, ...], tuple[str, ...]]:
+    """``push_set`` and ``push_warnings`` in one pass: each extra resolved once,
+    the credential stores resolved once."""
+    forbidden = _forbidden_roots(home)
+    found: list[Path] = []
+    for state in states:
+        found += [
+            hit
+            for hit in _from_git_listing(state.path, state.ignored)
+            if _shippable_git_hit(hit, forbidden)
+        ]
+    if not _inside_a_repo(project_dir, states):
+        found += _workspace_root_files(project_dir)
+    shipped, warnings = _classify_extras(project_dir, extras, forbidden)
+    return _one_per_file([*found, *shipped], project_dir), tuple(warnings)
 
 
 def push_set(
@@ -626,38 +717,85 @@ def push_set(
     extra must resolve (symlinks followed) inside ``project_dir``. A git hit
     ships only while it is a regular file. The workspace-root listing runs only
     when ``project_dir`` -- resolved -- is inside none of ``states``' repos
-    (``_inside_a_repo``). Sorted, unique, absolute."""
-    forbidden = _forbidden_roots(home)
-    found: list[Path] = []
-    for state in states:
-        found += [
-            hit
-            for hit in _from_git_listing(state.path, state.ignored)
-            if _shippable_git_hit(hit, forbidden)
-        ]
-    if not _inside_a_repo(project_dir, states):
-        found += _workspace_root_files(project_dir)
-    found += _classify_extras(project_dir, extras, home=home)[0]
-    return tuple(sorted(set(found), key=str))
+    (``_inside_a_repo``). Sorted, one entry per file (``_one_per_file``),
+    absolute."""
+    return _push(project_dir, states, home=home, extras=extras)[0]
 
 
 def push_warnings(
     project_dir: Path, extras: Sequence[str], *, home: Path
 ) -> tuple[str, ...]:
     """Why an entry in a project's ``push`` will not ship -- missing, outside
-    the project, a directory, or a credential store. Warnings, never errors
-    (spec §8)."""
-    return tuple(_classify_extras(project_dir, extras, home=home)[1])
+    the project, a directory, a credential store, or a path that will not
+    resolve. Warnings, never errors (spec §8)."""
+    return tuple(_classify_extras(project_dir, extras, _forbidden_roots(home))[1])
 
 
-def _resolved(path: Path) -> Path:
-    """``path`` resolved, or a NodeConfigError naming it: a recipe cannot place
-    a repo it cannot locate."""
-    try:
-        return path.resolve()
-    # RuntimeError: a symlink loop before Python 3.13; OSError from 3.13 on.
-    except (OSError, RuntimeError) as exc:
-        raise NodeConfigError(f"{path}: cannot be resolved ({exc})") from exc
+# A URL with a scheme (RFC 3986's scheme grammar, so `git+https` counts), split
+# into scheme, authority (up to the first '/', '?' or '#') and the rest.
+_SCHEME_URL = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)://([^/?#]*)(.*)", re.DOTALL)
+# git's remote-helper form `<transport>::<address>` (same scheme grammar as
+# git's is_urlschemechar), split into the transport and the address.
+_TRANSPORT_URL = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)::(.*)", re.DOTALL)
+# Schemes whose login is an ssh user (`git@`), not a secret.
+_SSH_SCHEMES = frozenset({"ssh", "git+ssh", "ssh+git"})
+
+
+def _without_credentials(url: str) -> tuple[str, bool]:
+    """``url`` without the credentials its userinfo carries, and whether any
+    were stripped. They would otherwise land in the node's ``.git/config``,
+    the Recipe's repr and every log line.
+
+    A ``<transport>::<address>`` URL (git's remote-helper form, e.g.
+    ``https::https://u:pw@h``) is peeled layer by layer -- a stacked prefix
+    included -- and its address judged by the rules below; every transport
+    prefix is re-attached byte-for-byte. An address that is no URL (``ext::``
+    carries a command) therefore passes through untouched.
+
+    Only a ``scheme://`` URL is inspected; scp-like ``git@host:org/repo`` and
+    anything schemeless pass through byte-for-byte, as does a URL whose
+    authority has no '@'. The userinfo is everything before the authority's
+    LAST '@' (an IPv6 ``[...]`` host holds none). An ssh-family scheme keeps
+    its login and loses only the password (``ssh://user:pw@h`` ->
+    ``ssh://user@h``; ``ssh://git@h`` is untouched; an empty login goes with
+    its password, ``ssh://:pw@h`` -> ``ssh://h``). Every other scheme loses
+    the WHOLE userinfo: a token-only login (``https://ghp_...@h``) is the
+    credential. A userinfo holding nothing but ':' (or an ssh password that
+    is empty) is no credential: the URL is left byte-for-byte and not
+    reported as stripped. A stripped URL's scheme is lowercased."""
+    prefix = ""
+    address = url
+    while _SCHEME_URL.fullmatch(address) is None:
+        transport = _TRANSPORT_URL.fullmatch(address)
+        if transport is None:
+            return url, False
+        prefix += f"{transport.group(1)}::"
+        address = transport.group(2)
+    stripped = _without_userinfo_secret(address)
+    if stripped is None:
+        return url, False
+    return f"{prefix}{stripped}", True
+
+
+def _without_userinfo_secret(url: str) -> str | None:
+    """A ``scheme://`` ``url`` with its credential removed (the rules of
+    ``_without_credentials``), or None when it carries no credential."""
+    match = _SCHEME_URL.fullmatch(url)
+    if match is None:
+        return None
+    scheme, authority, rest = match.groups()
+    userinfo, at, host = authority.rpartition("@")
+    if not at or not userinfo.replace(":", ""):
+        return None
+    scheme = scheme.lower()
+    if scheme in _SSH_SCHEMES:
+        login, _colon, password = userinfo.partition(":")
+        if not password:
+            return None
+        if not login:
+            return f"{scheme}://{host}{rest}"
+        return f"{scheme}://{login}@{host}{rest}"
+    return f"{scheme}://{host}{rest}"
 
 
 def recipe_for(
@@ -684,21 +822,44 @@ def recipe_for(
     remote_root = f"{node.root.rstrip('/')}/{project_dir.name}"
     root = _resolved(project_dir)
     repos: list[RepoSpec] = []
+    repo_warnings: list[str] = []
+    seen: set[Path] = set()
     for state in states:
         repo = _resolved(state.path)
+        if repo in seen:
+            continue
+        seen.add(repo)
         if repo == root:
             remote_dir = remote_root
         elif repo.parent == root:
             remote_dir = f"{remote_root}/{state.path.name}"
+        elif root.is_relative_to(repo):
+            # A monorepo subdirectory: push_set is safe for it, but a node
+            # clones whole repos -- the project cannot be placed on its own.
+            raise NodeConfigError(
+                f"{state.path}: the project is inside a larger repo; a node "
+                "project is one repo, or a folder of repos"
+            )
         else:
             raise NodeConfigError(
                 f"{state.path} is neither the project nor a direct child of it; "
                 "a node project is one repo, or a folder of repos"
             )
-        repos.append(
-            RepoSpec(url=state.url, branch=state.branch, remote_dir=remote_dir)
+        url, stripped = _without_credentials(state.url)
+        if stripped:
+            repo_warnings.append(
+                f"repo {remote_dir}: origin URL carried credentials; stripped "
+                "-- the node authenticates with its own gh token"
+            )
+        repos.append(RepoSpec(url=url, branch=state.branch, remote_dir=remote_dir))
+    if not repos:
+        raise NodeConfigError(
+            f"{project_dir}: has no git repo; a node project is one repo, "
+            "or a folder of repos"
         )
-    extras = tuple(proj.push or ())
+    push_files, push_warned = _push(
+        project_dir, states, home=home, extras=tuple(proj.push or ())
+    )
     memory = (
         home / ".claude" / "projects" / encoded_project_dir(str(project_dir)) / "memory"
     )
@@ -706,8 +867,8 @@ def recipe_for(
         project=project,
         sid=session_name(project),
         repos=tuple(repos),
-        push_files=push_set(project_dir, states, home=home, extras=extras),
+        push_files=push_files,
         memory_dir=memory if memory.is_dir() else None,
         remote_root=remote_root,
-        warnings=push_warnings(project_dir, extras, home=home),
+        warnings=(*repo_warnings, *push_warned),
     )
