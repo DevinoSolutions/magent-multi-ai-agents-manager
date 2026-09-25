@@ -1615,17 +1615,22 @@ def _lstat_lies(
 ) -> None:
     """``os.lstat(path)`` answers ``like``'s stat (default: ``path``'s own,
     through any link) with ``changes`` -- the file as it looked BEFORE a swap,
-    so each pin reaches the one guard that runs after the lstat. Compared by
-    abspath, never realpath: posixpath.realpath calls os.lstat itself."""
+    so each pin reaches the one guard that runs after the lstat. A call is
+    matched by abspath, never realpath (posixpath.realpath calls os.lstat
+    itself), against both names ``path`` goes by: its own, and the resolved
+    one a caller may have vetted it under."""
     real_lstat = os.lstat
-    want = os.path.normcase(os.path.realpath(path))
+    want = {
+        os.path.normcase(os.path.abspath(path)),
+        os.path.normcase(os.path.realpath(path)),
+    }
     base = os.stat(like if like is not None else path)
     lie = os.stat_result(
         [changes.get(name, getattr(base, name)) for name in _STAT_FIELDS]
     )
 
     def fake(p, *args, **kwargs):
-        if os.path.normcase(os.path.abspath(os.fspath(p))) == want:
+        if os.path.normcase(os.path.abspath(os.fspath(p))) in want:
             return lie
         return real_lstat(p, *args, **kwargs)
 
@@ -1678,11 +1683,23 @@ class TestTheReadSurvivesASwap:
         assert node_home.calls() == []
 
     @pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="POSIX O_NOFOLLOW")
-    def test_a_link_the_lstat_called_regular_is_never_followed(
+    def test_a_link_the_lstat_called_regular_is_not_opened(self, tmp_path, monkeypatch):
+        # The read itself: whatever vetted the path, the open never follows a
+        # final-component link, even one the lstat reported as the file.
+        secret = tmp_path / "id_ed25519"
+        secret.write_bytes(b"TOPSECRET\n")
+        link = tmp_path / "leak.md"
+        _link_or_skip(link, secret)
+        _lstat_lies(monkeypatch, link, like=secret)
+        with pytest.raises(OSError):
+            remote_mux._read_regular(link, cap=100, what="memory file leak.md")
+
+    def test_a_memory_link_the_lstat_called_regular_never_ships(
         self, node_home, tmp_path, monkeypatch
     ):
-        # Every check before the open trusts the lying lstat (is_symlink,
-        # realpath); only O_NOFOLLOW stands between the link and the secret.
+        # is_symlink trusts the lying lstat; what stops the link is the
+        # memory walk's realpath containment (Windows, where there is no
+        # O_NOFOLLOW) or the open (POSIX) -- never nothing.
         recipe = _recipe(tmp_path)
         assert recipe.memory_dir is not None
         secret = tmp_path / "id_ed25519"
@@ -1884,7 +1901,9 @@ class TestMemoryNeverFollowsALink:
         assert not any(n.startswith("memory/keys") for n in members)
         assert members["memory/MEMORY.md"] == b"- remember\n"
         assert b"TOPSECRET" not in stdin
-        assert "keys" in _nodes_log()
+        # Pruned at the folder: the walk never even lists what is behind it.
+        assert f"memory link {recipe.memory_dir / 'keys'} skipped" in _nodes_log()
+        assert "outside memory" not in _nodes_log()
 
     @needs_junctions
     def test_a_memory_folder_that_is_a_junction_ships_no_memory(
@@ -1899,6 +1918,32 @@ class TestMemoryNeverFollowsALink:
         assert not any(n.startswith("memory/") for n in _members(stdin))
         assert b"TOPSECRET" not in stdin
         assert "joined-memory" in _nodes_log()
+
+    def test_a_folder_swapped_for_a_link_mid_walk_never_ships(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        # The walk listed `notes` as a plain folder; by the time its files
+        # are checked it is a link to ~/.ssh. Every per-FILE check passes
+        # (the file is regular and no link itself) -- only resolving the file
+        # against the resolved memory folder catches the parent swap.
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        keys = tmp_path / "dot-ssh"
+        keys.mkdir()
+        (keys / "id_ed25519").write_bytes(b"TOPSECRET\n")
+        notes = recipe.memory_dir / "notes"
+        _link_or_skip(notes, keys, directory=True)
+        real_walk = os.walk
+
+        def walk(top, *args, **kwargs):
+            yield from real_walk(top, *args, **kwargs)
+            yield os.fspath(notes), [], ["id_ed25519"]
+
+        monkeypatch.setattr(remote_mux.os, "walk", walk)
+        stdin = self._bring_up(node_home, recipe)
+        assert not any(n.startswith("memory/notes") for n in _members(stdin))
+        assert b"TOPSECRET" not in stdin
+        assert "outside memory" in _nodes_log()
 
     def test_memory_under_a_linked_parent_still_ships(self, node_home, tmp_path):
         # A dotfiles setup links ~/.claude itself; the memory folder INSIDE it
