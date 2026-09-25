@@ -112,14 +112,17 @@ def _remember(ctx: Ctx, step: str, want: str, mark: int) -> None:
 
 
 def _load(path: Path) -> object:
-    """A JSON file's value: {} when the file does not exist, None when it
-    cannot be read (a directory there, no permission) or is not JSON."""
+    """A JSON file's value: {} when the file does not exist or is empty
+    (a 0-byte settings.json), None when it cannot be read (a directory
+    there, no permission) or is not JSON."""
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {}
     except OSError:
         return None
+    if not text.strip():
+        return {}
     try:
         return json.loads(text)
     except ValueError:
@@ -230,16 +233,81 @@ def _last(text: str) -> str:
     return lines[-1][:200] if lines else "no output"
 
 
-# A drive-letter path (C:\ or C:/) or a .exe names a program only the PC runs.
-_WINDOWS_PATH = re.compile(r"^[A-Za-z]:[\\/]")
+# A drive-letter path (C:\ or C:/) starting ANY word -- the program or an
+# argument (node "C:\...\notify.mjs") -- names a file only the PC has.
+_WINDOWS_PATH = re.compile(r"(^|[\s\"'=])[A-Za-z]:[\\/]")
+# Where an unquoted word ends, in the raw command text.
+_WORD_END = re.compile(r"[\s\"';&|]")
+# Any word ending .exe names a program only the PC runs.
+_EXE = re.compile(r"(?:^|[\s\"'=])([^\s\"'=;&|]*\.exe)(?=$|[\s\"';&|)])", re.I)
 # VAR=value words ahead of a command are its environment, not its program.
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# A shell operator glued to the first word (``x;``, ``x&&y``, ``(x)``) ends it.
+_OPERATOR = re.compile(r"[;&|)]")
+# Run by bash itself, so no PATH lookup applies (``env`` is a program, but
+# every node has it).
+_SHELL_WORDS = frozenset(
+    {
+        "cd",
+        "source",
+        ".",
+        "export",
+        "if",
+        "[",
+        "[[",
+        "test",
+        "exit",
+        "true",
+        "false",
+        "eval",
+        "exec",
+        "set",
+        "unset",
+        "command",
+        "env",
+        "for",
+        "while",
+        "case",
+    }
+)
+# A program under the node user's home: ~/x, $HOME/x, ${HOME}/x.
+_HOME = re.compile(r"^(?:~|\$HOME|\$\{HOME\})(?=/|$)")
+# What bash expands only at run time; a word still holding one after the
+# home is expanded cannot be judged here.
+_RUNTIME = re.compile(r"[$`]")
+
+
+def _windows(raw: str) -> str | None:
+    """Why ``raw`` needs the PC, named by its offending word as written (not
+    as shlex re-reads it: shlex eats the backslashes of C:\\x)."""
+    found = _WINDOWS_PATH.search(raw)
+    if found is not None:
+        start = found.end(1)
+        quote = found.group(1)
+        if quote in ("'", '"'):
+            end = raw.find(quote, start)
+        else:
+            stop = _WORD_END.search(raw, start)
+            end = stop.start() if stop is not None else -1
+        word = raw[start:] if end < 0 else raw[start:end]
+        return f"{word} is a Windows path"
+    exe = _EXE.search(raw)
+    if exe is not None:
+        return f"{exe.group(1)} is a Windows program"
+    return None
 
 
 def _why_not(ctx: Ctx, command: str) -> str | None:
-    """Why this node cannot run ``command``'s program, or None when it can:
-    ``command -v`` on the first word after any VAR=value words, over the
-    node's PATH."""
+    """Why this node cannot run ``command``, or None when it can -- or when
+    whether it can is only known at run time. It errs toward keeping: a
+    Windows path anywhere drops it, and otherwise only the first word after
+    any VAR=value words is judged, the way ``command -v`` would on the node
+    (a shell builtin runs; ~ and $HOME are this node's home; a relative path
+    or a runtime $VAR cannot be judged, so it is kept; a bare name is looked
+    up on the node's PATH)."""
+    windows = _windows(command)
+    if windows is not None:
+        return windows
     try:
         words = shlex.split(command)
     except ValueError:
@@ -248,24 +316,28 @@ def _why_not(ctx: Ctx, command: str) -> str | None:
         words = words[1:]
     if not words:
         return "its command is empty"
-    first = words[0]
-    raw = command.strip().lstrip("\"'")
-    if (
-        _WINDOWS_PATH.match(raw)
-        or _WINDOWS_PATH.match(first)
-        or first.lower().endswith(".exe")
-    ):
-        return f"{first} is a Windows program"
-    program = os.path.expanduser(os.path.expandvars(first))
+    first = _OPERATOR.split(words[0].lstrip("({"), 1)[0]
+    if not first or first in _SHELL_WORDS:
+        return None
+    home = _HOME.match(first)
+    program = str(ctx.home) + first[home.end() :] if home else first
+    if _RUNTIME.search(program):
+        return None
+    if home or program.startswith("/"):
+        target = Path(program)
+        if not target.is_file():
+            return f"{first} is not on this node"
+        if not os.access(str(target), os.X_OK):
+            return f"{first} is not executable on this node"
+        return None
     if "/" in program:
-        if Path(program).is_file() and os.access(program, os.X_OK):
-            return None
-        return f"{first} is not on this node"
+        return None
     return None if _which(ctx, program) else f"{program} is not on this node"
 
 
 def _keep_hook(ctx: Ctx, event: str, hook: object) -> bool:
     if not isinstance(hook, dict):
+        _row(ctx, "drop", f"hook:{event}", "it is not a hook object")
         return False
     command = hook.get("command")
     if hook.get("type") != "command" or not isinstance(command, str):
@@ -279,10 +351,10 @@ def _keep_hook(ctx: Ctx, event: str, hook: object) -> bool:
     return False
 
 
-def _hooks(ctx: Ctx, pc_hooks: object) -> dict[str, list[object]]:
+def _hooks(ctx: Ctx, pc_hooks: object, *, wire: bool) -> dict[str, list[object]]:
     """The node's hooks, rebuilt from this PC's: runnable command hooks and
-    every non-command hook kept, then the manifest's state-hook entries
-    appended to their events."""
+    every non-command hook kept, then -- when ``wire`` -- the manifest's
+    state-hook entries appended to their events."""
     rebuilt: dict[str, list[object]] = {}
     events = pc_hooks if isinstance(pc_hooks, dict) else {}
     for event, entries in events.items():
@@ -300,7 +372,7 @@ def _hooks(ctx: Ctx, pc_hooks: object) -> dict[str, list[object]]:
                 kept_entries.append({**entry, "hooks": kept})
         if kept_entries:
             rebuilt[str(event)] = kept_entries
-    extra = ctx.manifest.get("hook_entries")
+    extra = ctx.manifest.get("hook_entries") if wire else None
     for event, entry in (extra if isinstance(extra, dict) else {}).items():
         rebuilt.setdefault(str(event), []).append(entry)
     return rebuilt
@@ -380,10 +452,48 @@ def _step_state_hook(ctx: Ctx) -> None:
     _remember(ctx, "state_hook", want, mark)
 
 
+# Merged one level deeper than "the PC's key wins", so a node-only env var or
+# permission rule survives a provision.
+_DEEP_KEYS = ("env", "permissions")
+# Permission rule lists: an order-preserving union, the PC's rules first.
+_RULE_LISTS = ("allow", "deny", "ask")
+
+
+def _union(first: list[object], second: list[object]) -> list[object]:
+    out: list[object] = []
+    for item in first + second:
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def _merged(node: dict[str, object], shipped: dict[str, object]) -> dict[str, object]:
+    """The node's settings with this PC's keys over them (``hooks`` aside):
+    ``env`` and ``permissions`` merge key by key, the PC winning a shared key,
+    and the permission rule lists are unions."""
+    merged = dict(node)
+    for key, value in shipped.items():
+        if key == "hooks":
+            continue
+        old = node.get(key)
+        if key in _DEEP_KEYS and isinstance(old, dict) and isinstance(value, dict):
+            both = {**old, **value}
+            if key == "permissions":
+                for rule in _RULE_LISTS:
+                    mine = value.get(rule)
+                    theirs = old.get(rule)
+                    if isinstance(mine, list) and isinstance(theirs, list):
+                        both[rule] = _union(mine, theirs)
+            merged[key] = both
+        else:
+            merged[key] = value
+    return merged
+
+
 def _step_settings(ctx: Ctx) -> None:
     """This PC's settings.json over the node's: the PC's keys win, the node's
-    others stay, hooks are rebuilt (``_hooks``), and a statusLine the node
-    cannot run falls back to the node's own."""
+    others stay (``_merged``), hooks are rebuilt (``_hooks``), and a
+    statusLine the node cannot run falls back to the node's own."""
     path = ctx.home / ".claude" / "settings.json"
     node = _load(path)
     if not isinstance(node, dict):
@@ -403,9 +513,20 @@ def _step_settings(ctx: Ctx) -> None:
     loaded = _load(ctx.work / "settings.json")
     shipped = loaded if isinstance(loaded, dict) else {}
     mark = len(ctx.rows)
-    merged = dict(node)
-    merged.update((key, value) for key, value in shipped.items() if key != "hooks")
-    merged["hooks"] = _hooks(ctx, shipped.get("hooks"))
+    # A hook entry naming a script that is not there would fail on every
+    # event; unwired, the warning leaves the step unremembered, so the next
+    # provision wires it.
+    wire = (ctx.home / STATE_HOOK_MARKER).is_file()
+    if not wire:
+        _row(
+            ctx,
+            "warn",
+            "hooks",
+            f"~/{STATE_HOOK_MARKER} is not installed, so magent's state hook "
+            "is not wired; the next provision wires it",
+        )
+    merged = _merged(node, shipped)
+    merged["hooks"] = _hooks(ctx, shipped.get("hooks"), wire=wire)
     line = shipped.get("statusLine")
     if isinstance(line, dict) and line.get("type") == "command":
         why = _why_not(ctx, str(line.get("command", "")))
@@ -415,7 +536,9 @@ def _step_settings(ctx: Ctx) -> None:
                 merged["statusLine"] = node["statusLine"]
             else:
                 del merged["statusLine"]
-    _write(path, merged)
+    # Through a symlink (a dotfiles-managed settings.json), not over it: the
+    # link survives and its target ends 0600.
+    _write(path.resolve(), merged)
     _row(ctx, "did", "settings", f"{len(shipped)} key(s) from this PC; hooks rebuilt")
     _remember(ctx, "settings", want, mark)
 
