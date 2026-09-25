@@ -442,6 +442,85 @@ def _report_of(
     return report
 
 
+GH_TIMEOUT_S = 20.0
+
+
+@functools.lru_cache(maxsize=1)
+def find_gh() -> str | None:
+    """This PC's ``gh``. Only provisioning uses it: to share the PC's GitHub
+    login with a node and to register a node's key."""
+    return shutil.which("gh")
+
+
+def _gh(
+    args: list[str], *, input_bytes: bytes | None = None
+) -> subprocess.CompletedProcess[bytes] | None:
+    """One bounded local ``gh`` call; None when gh is missing or could not
+    run. Only argv is ever logged -- a token read's stdout never is."""
+    exe = find_gh()
+    if exe is None:
+        return None
+    try:
+        return _spawn(
+            [exe, *args],
+            timeout_s=GH_TIMEOUT_S,
+            input_bytes=input_bytes,
+            check=False,
+            shown=("gh", *args),
+            label="local gh",
+        )
+    except RemoteError:
+        return None
+
+
+@dataclass(frozen=True)
+class GhAccount:
+    login: str
+    scopes: frozenset[str]
+
+
+def local_gh_account() -> GhAccount | None:
+    """The active, logged-in github.com account of this PC's gh, or None."""
+    result = _gh(["auth", "status", "--json", "hosts"])
+    if result is None or result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        return None
+    hosts = data.get("hosts") if isinstance(data, dict) else None
+    entries = hosts.get("github.com") if isinstance(hosts, dict) else None
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        login = entry.get("login")
+        if (
+            entry.get("active") is True
+            and entry.get("state") == "success"
+            and isinstance(login, str)
+            and login
+        ):
+            raw = entry.get("scopes")
+            scopes = raw if isinstance(raw, str) else ""
+            return GhAccount(
+                login=login,
+                scopes=frozenset(s.strip() for s in scopes.split(",") if s.strip()),
+            )
+    return None
+
+
+def local_gh_token() -> str | None:
+    """This PC's github.com token, or None. It leaves this process only on a
+    node call's stdin (``build_payload``) -- never argv, never a log."""
+    result = _gh(["auth", "token", "--hostname", "github.com"])
+    if result is None or result.returncode != 0:
+        return None
+    token = result.stdout.decode("utf-8", "replace").strip()
+    if not token or any(ch.isspace() for ch in token):
+        return None
+    return token
+
+
 def has_session(node: Node, sid: str) -> bool | None:
     """Is ``sid`` alive on ``node``? Exit 0 is True, a live session. Exit 1 is
     False, meant as tmux's own "no" (no such session, or no server at all) --

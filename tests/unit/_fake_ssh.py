@@ -157,3 +157,24 @@ def make_fake_ssh(tmp_path: Path, *, name: str = "ssh") -> FakeSsh:
         )
         launcher.chmod(0o755)
     return FakeSsh(path=str(launcher), base=base)
+
+
+def gh_auth_status(login: str, scopes: str) -> str:
+    """The stdout of ``gh auth status --json hosts`` (gh 2.88) for one active,
+    logged-in github.com account -- the reply a fake ``gh`` gives."""
+    return json.dumps(
+        {
+            "hosts": {
+                "github.com": [
+                    {
+                        "active": True,
+                        "host": "github.com",
+                        "login": login,
+                        "scopes": scopes,
+                        "state": "success",
+                        "tokenSource": "keyring",
+                    }
+                ]
+            }
+        }
+    )

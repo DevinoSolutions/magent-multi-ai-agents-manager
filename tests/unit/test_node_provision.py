@@ -15,6 +15,7 @@ from magent import cli, nodes, remote_mux
 from magent.cli import hooks_cmd
 from magent.nodes import Node, UserScope
 from magent.remote_mux import RemoteError, ScriptLine
+from tests.unit._fake_ssh import gh_auth_status
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -848,3 +849,62 @@ class TestAnExitCodeWithoutARowStillFails:
         # The program, never this PC's path to it -- and no client lookup,
         # which would turn the transport failure into "ssh not installed".
         assert info.value.command_redacted[0] == "ssh"
+
+
+TOKEN = "gho_FAKE0123456789abcdefTOKEN"
+
+
+class TestThisPcsGh:
+    def test_no_gh_is_no_account_and_no_token(self):
+        # The autouse _no_real_gh guard: nothing resolved, nothing spawned.
+        assert remote_mux.local_gh_account() is None
+        assert remote_mux.local_gh_token() is None
+
+    def test_the_active_logged_in_account_is_read(self, fake_gh):
+        fake_gh.set_reply(
+            "auth status", stdout=gh_auth_status("amin", "repo, admin:public_key")
+        )
+        assert remote_mux.local_gh_account() == remote_mux.GhAccount(
+            login="amin", scopes=frozenset({"repo", "admin:public_key"})
+        )
+        (call,) = fake_gh.calls()
+        assert call.argv == ["auth", "status", "--json", "hosts"]
+
+    def test_an_inactive_or_failed_account_is_no_account(self, fake_gh):
+        fake_gh.set_reply(
+            "auth status",
+            stdout=json.dumps(
+                {
+                    "hosts": {
+                        "github.com": [
+                            {"active": False, "state": "success", "login": "a"},
+                            {"active": True, "state": "error", "login": "b"},
+                        ]
+                    }
+                }
+            ),
+        )
+        assert remote_mux.local_gh_account() is None
+
+    def test_unparseable_status_is_no_account(self, fake_gh):
+        fake_gh.set_reply("auth status", stdout="not json")
+        assert remote_mux.local_gh_account() is None
+
+    def test_the_token_comes_from_gh_auth_token(self, fake_gh):
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
+        assert remote_mux.local_gh_token() == TOKEN
+        (call,) = fake_gh.calls()
+        assert call.argv == ["auth", "token", "--hostname", "github.com"]
+
+    def test_a_failed_token_read_is_no_token(self, fake_gh):
+        fake_gh.set_reply("auth token", stderr="no oauth token", rc=1)
+        assert remote_mux.local_gh_token() is None
+
+    def test_a_token_with_whitespace_inside_is_refused(self, fake_gh):
+        fake_gh.set_reply("auth token", stdout="two words\n")
+        assert remote_mux.local_gh_token() is None
+
+    def test_the_token_never_reaches_the_log(self, fake_gh, caplog):
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n", rc=1)
+        remote_mux.local_gh_token()
+        assert TOKEN not in caplog.text

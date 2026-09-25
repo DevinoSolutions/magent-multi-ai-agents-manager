@@ -215,12 +215,29 @@ def _no_real_ssh(monkeypatch):
     monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: None)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_gh(monkeypatch):
+    """No test resolves the REAL ``gh``: it holds the developer's GitHub token,
+    and ``node setup`` registers an ssh key to their account with it. Same
+    device as ``_no_real_ssh``; the ``fake_gh`` fixture wins over it."""
+    monkeypatch.setattr("magent.remote_mux.find_gh", lambda: None)
+
+
 @pytest.fixture
 def fake_ssh(tmp_path, monkeypatch):
     """A real on-disk fake ``ssh`` wired in as remote_mux's client (THE fake:
     tests/unit/_fake_ssh.py)."""
     fake = make_fake_ssh(tmp_path)
     monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: fake.path)
+    return fake
+
+
+@pytest.fixture
+def fake_gh(tmp_path, monkeypatch):
+    """A fake ``gh`` (the one fake, tests/unit/_fake_ssh.py, under another
+    name) wired in as remote_mux's local gh."""
+    fake = make_fake_ssh(tmp_path, name="gh")
+    monkeypatch.setattr("magent.remote_mux.find_gh", lambda: fake.path)
     return fake
 
 
