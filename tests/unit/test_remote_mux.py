@@ -298,12 +298,15 @@ def spawned(monkeypatch):
 # pipe reads.
 CAP = 256 * 1024
 
-# A child that leaves a GRANDCHILD holding its stderr open (inherited, 30s
-# sleep; its pid goes to argv[1]), says one line on stderr, then floods stdout.
+# A child that leaves a GRANDCHILD holding its stderr open (inherited; its pid
+# goes to argv[1]), says one line on stderr, then floods stdout. The 90s sleep
+# outlives every bound the call has (timeout_s=60 + two 1s reaps), so the
+# teardown's kill-by-pid always hits the live grandchild, never a pid Windows
+# reused. Not longer: an unbounded-join mutant waits out the whole sleep.
 _HELD_STDERR_CHILD = """\
 import subprocess, sys
 grandchild = subprocess.Popen(
-    [sys.executable, "-c", "import time; time.sleep(30)"],
+    [sys.executable, "-c", "import time; time.sleep(90)"],
     stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
     stderr=None,
@@ -408,7 +411,7 @@ class TestTheReplyIsBoundedInMemory:
     def test_the_stderr_wait_after_the_cap_is_bounded_by_the_reap(self, tmp_path):
         # A grandchild still holds stderr, so it never ends: the over-cap path
         # must give up after the reap bound and raise without the tail, not
-        # wait out the grandchild's 30s.
+        # wait out the grandchild's 90s.
         pidfile = tmp_path / "grandchild.pid"
         started = time.monotonic()
         try:
