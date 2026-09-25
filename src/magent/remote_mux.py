@@ -577,8 +577,9 @@ def sample(node: Node) -> LoadSample:
         reading = _load_sample(json.loads(result.stdout.decode("utf-8", "replace")))
     # OverflowError is an ArithmeticError, not a ValueError: float() of a
     # 401-digit integer overflows. (`1e400` parses to inf, a ValueError from
-    # _finite/_integral.)
-    except (ValueError, KeyError, TypeError, OverflowError) as e:
+    # _finite/_integral.) RecursionError is json.loads' answer to deep nesting,
+    # which fits easily inside the reply cap: the node's bad answer too.
+    except (ValueError, KeyError, TypeError, OverflowError, RecursionError) as e:
         shown = _run_shown(node, *_script_call("sample", [], None))
         raise RemoteError(
             result.returncode,

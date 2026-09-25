@@ -879,6 +879,15 @@ class TestSample:
         # rc 0: the node answered; the answer was malformed.
         assert exc.value.rc == 0
 
+    def test_a_reply_nested_too_deeply_is_a_remote_error_not_a_crash(self, fake_ssh):
+        # json.loads answers deep nesting with RecursionError, not ValueError;
+        # 200k '[' is far inside the reply cap and still the node's bad answer.
+        fake_ssh.set_reply("bash -s", stdout="[" * 200_000)
+        with pytest.raises(RemoteError, match="not a load sample") as exc:
+            remote_mux.sample(NODE)
+        assert exc.value.rc == 0
+        assert isinstance(exc.value.__cause__, RecursionError)
+
     def test_the_head_of_what_came_back_is_bounded(self, fake_ssh):
         fake_ssh.set_reply("bash -s", stdout="x" * 5000)
         with pytest.raises(RemoteError, match="not a load sample") as exc:
