@@ -25,7 +25,7 @@ from magent.config import NODE_AUTO, NODE_CLOUD
 from magent.sessions.claude import encode_claude_project_path
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     from magent.config import MagentConfig, ProjectConfig
 
@@ -129,6 +129,16 @@ class NodeMapEntry:
     placed_ts: float
     attached_existing: bool
     remote_root: str
+
+
+# What ships besides git (spec §8, D3): a session can't start without its
+# secrets and its local Claude settings, and none of them are in the clone.
+# Matched against git's OWN ignored listing, so a tracked file (`.env.example`)
+# can never be pushed over the clone's copy.
+_PUSH_FIXED = (".claude/settings.local.json", "CLAUDE.local.md", ".mcp.json")
+# Never pushed, whatever `push` says (spec §8 "Not transferred, ever"): this
+# PC's keys, ccswap's account backups, the Claude login itself.
+_NEVER_PUSHED = (".ssh", ".claude-swap-backup", ".claude/.credentials.json")
 
 
 def encoded_project_dir(path: str) -> str:
@@ -321,3 +331,90 @@ def resolve(
             'sessions as root on the node; write "user": "root" to mean it (D4)'
         )
     return Node(nick=nick, host=entry.host, user=user, root=entry.root)
+
+
+def _is_env_file(name: str) -> bool:
+    return name == ".env" or name.startswith(".env.")
+
+
+def _from_git_listing(repo: Path, ignored: tuple[str, ...]) -> list[Path]:
+    found: list[Path] = []
+    for entry in ignored:
+        if entry.endswith("/"):
+            # A wholly ignored directory is never descended (node_modules is
+            # not a push); only a fixed path that lives inside it can ship.
+            found += [
+                repo / fixed
+                for fixed in _PUSH_FIXED
+                if fixed.startswith(entry) and (repo / fixed).is_file()
+            ]
+        elif _is_env_file(entry.rsplit("/", 1)[-1]) or entry in _PUSH_FIXED:
+            # git emits '/' on every OS, like the _PUSH_FIXED literals.
+            found.append(repo / entry)
+    return found
+
+
+def _workspace_root_files(project_dir: Path) -> list[Path]:
+    # A workspace root is not a repo, so git lists nothing there -- its own env
+    # files and local Claude settings would otherwise never leave this PC.
+    found = [p for p in project_dir.iterdir() if p.is_file() and _is_env_file(p.name)]
+    found += [project_dir / f for f in _PUSH_FIXED if (project_dir / f).is_file()]
+    return found
+
+
+def _classify_extras(
+    project_dir: Path, extras: Sequence[str], *, home: Path
+) -> tuple[list[Path], list[str]]:
+    shipped: list[Path] = []
+    warnings: list[str] = []
+    # Both sides resolved: a symlink inside the project that points out of it
+    # is outside, and so is a project reached through a symlinked parent.
+    root = project_dir.resolve()
+    forbidden = [(home / p).resolve() for p in _NEVER_PUSHED]
+    for extra in extras:
+        target = (project_dir / extra).resolve()
+        if not target.is_relative_to(root):
+            warnings.append(f"push: {extra} is outside the project; skipped")
+        elif any(target.is_relative_to(f) for f in forbidden):
+            warnings.append(f"push: {extra} is never pushed (credentials); skipped")
+        elif target.is_dir():
+            warnings.append(f"push: {extra} is a directory; list its files; skipped")
+        elif not target.is_file():
+            warnings.append(f"push: {extra} does not exist; skipped")
+        else:
+            shipped.append(project_dir / target.relative_to(root))
+    return shipped, warnings
+
+
+def push_set(
+    project_dir: Path,
+    states: Sequence[LocalGitState],
+    *,
+    home: Path,
+    extras: Sequence[str] = (),
+) -> tuple[Path, ...]:
+    """The local files a bring-up ships beside the clone (spec §8).
+
+    Per repo, from git's ignored listing: ``.env``/``.env.*`` at any depth,
+    ``.claude/settings.local.json``, ``CLAUDE.local.md``, an ignored
+    ``.mcp.json``. A workspace root's own copies. Then ``extras`` (a project's
+    ``push``). Tracked files never ship, ignored directories are never
+    descended, nothing under ``home``'s credential stores ever ships, and an
+    extra must resolve (symlinks followed) inside ``project_dir``. Sorted,
+    unique, absolute."""
+    found: list[Path] = []
+    for state in states:
+        found += _from_git_listing(state.path, state.ignored)
+    if all(state.path != project_dir for state in states):
+        found += _workspace_root_files(project_dir)
+    found += _classify_extras(project_dir, extras, home=home)[0]
+    return tuple(sorted(set(found), key=str))
+
+
+def push_warnings(
+    project_dir: Path, extras: Sequence[str], *, home: Path
+) -> tuple[str, ...]:
+    """Why an entry in a project's ``push`` will not ship -- missing, outside
+    the project, a directory, or a credential store. Warnings, never errors
+    (spec §8)."""
+    return tuple(_classify_extras(project_dir, extras, home=home)[1])

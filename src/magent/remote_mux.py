@@ -35,6 +35,7 @@ from magent.nodes import LoadSample
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from pathlib import Path
 
     from magent.nodes import Node
 
@@ -177,8 +178,8 @@ def _spawn(
     shown: tuple[str, ...],
 ) -> subprocess.CompletedProcess[bytes]:
     """One bounded child -- the shared body of ``run`` and the local git reads
-    (a later task). ``shown`` is what an error and a log line may say about
-    the command."""
+    (``ignored_paths``). ``shown`` is what an error and a log line may say
+    about the command."""
     try:
         proc = subprocess.Popen(
             argv,
@@ -346,3 +347,36 @@ def sample(node: Node) -> LoadSample:
         )
         raise RemoteError(result.returncode, f"not a load sample: {e}", shown) from e
     return reading
+
+
+def ignored_paths(repo: Path, *, timeout_s: float) -> tuple[str, ...]:
+    """What git ignores in the LOCAL ``repo``: ``git ls-files --others --ignored
+    --exclude-standard --directory -z`` -- repo-relative, '/'-separated, and a
+    wholly ignored directory as ONE ``dir/`` entry (``node_modules`` is one
+    line, not a hundred thousand). Read-only. The raw material for
+    ``nodes.push_set``; ``git_state`` carries it as ``LocalGitState.ignored``.
+
+    A missing ``git`` is RemoteError rc None ("git not found on PATH"): the
+    command never ran. ``_spawn`` reads a FileNotFoundError as the missing ssh
+    client (rc 127), which is not what happened here."""
+    argv = [
+        "git",
+        "-C",
+        str(repo),
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+        "-z",
+    ]
+    shown = tuple(argv)
+    try:
+        result = _spawn(
+            argv, timeout_s=timeout_s, input_bytes=None, check=True, shown=shown
+        )
+    except RemoteError as e:
+        if isinstance(e.__cause__, FileNotFoundError):
+            raise RemoteError(None, "git not found on PATH", shown) from e.__cause__
+        raise
+    return tuple(p for p in result.stdout.decode("utf-8", "replace").split("\0") if p)
