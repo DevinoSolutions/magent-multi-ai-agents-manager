@@ -1430,3 +1430,37 @@ class TestTheLoadFileIsAppendedTo:
         lines = path.read_text(encoding="utf-8").splitlines()
         assert lines[1] == '{"ts": 95'
         assert json.loads(lines[2])["ts"] == 1000.0
+
+
+class TestATornLoadRowAcrossTicks:
+    def test_a_tick_after_a_torn_row_appends_intact_and_the_trim_drops_the_fragment(
+        self, placed
+    ):
+        """A crash mid-append leaves a partial last line. The next tick's row
+        must start its own line, and the trim pass must skip the fragment."""
+        torn = '{"ts": 95'
+        path = nodes.load_path("second")
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps({**SAMPLE, "ts": 900.0}) + "\n" + torn, encoding="utf-8"
+        )
+        clock = iter([1000.0, 5000.0])
+
+        def pull(_node, _sids):
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        syncer = node_sync.NodeSyncer(
+            _second_only(sample_interval_s=60, history_h=1),
+            pull=pull,
+            now=lambda: next(clock),
+        )
+        syncer.tick()
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert [ln for ln in lines if ln == torn] == [torn]
+        assert [json.loads(ln) for ln in lines if ln != torn] == [
+            {**SAMPLE, "ts": 900.0},
+            {**SAMPLE, "ts": 1000.0},
+        ]
+        syncer.tick()  # 900 is now past the window + slack: a trim
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert [json.loads(ln) for ln in lines] == [{**SAMPLE, "ts": 5000.0}]
