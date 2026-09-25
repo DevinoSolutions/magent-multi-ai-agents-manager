@@ -658,6 +658,8 @@ def provision(
 
 # Either scope lets gh add an ssh key; admin: is what `gh auth refresh` grants.
 SSH_KEY_SCOPES = frozenset({"admin:public_key", "write:public_key"})
+# ssh-ed25519/ssh-rsa, ecdsa-sha2-*, sk-ssh-ed25519@openssh.com/sk-ecdsa-*.
+SSH_KEY_TYPE_PREFIXES = ("ssh-", "ecdsa-", "sk-")
 
 
 def register_ssh_key(pubkey: str, *, title: str) -> ScriptLine:
@@ -678,8 +680,10 @@ def register_ssh_key(pubkey: str, *, title: str) -> ScriptLine:
                 "gh auth refresh -h github.com -s admin:public_key"
             ),
         )
+    # A public key line opens with its type; anything else (a PEM private key
+    # pasted by mistake) never leaves this PC.
     parts = pubkey.split()
-    if len(parts) < 2:
+    if len(parts) < 2 or not parts[0].startswith(SSH_KEY_TYPE_PREFIXES):
         return ScriptLine("fail", "github-key", "not an ssh public key line")
     listed = _gh(["api", "--paginate", "user/keys", "--jq", ".[].key"])
     if (

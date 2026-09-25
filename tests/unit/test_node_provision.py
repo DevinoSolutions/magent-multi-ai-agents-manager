@@ -1471,6 +1471,15 @@ class TestRegisterSshKey:
         assert row == ScriptLine("fail", "github-key", "not an ssh public key line")
         assert [c.argv[:2] for c in fake_gh.calls()] == [["auth", "status"]]
 
+    def test_a_private_key_never_leaves_this_pc(self, fake_gh):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        row = remote_mux.register_ssh_key(
+            "-----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNzaC1rZXktdjEAAAAA", title=TITLE
+        )
+        assert row == ScriptLine("fail", "github-key", "not an ssh public key line")
+        assert _adds(fake_gh) == []
+        assert all(c.stdin == b"" for c in fake_gh.calls())
+
     def test_an_add_that_cannot_run_fails(self, fake_gh, monkeypatch):
         fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
         real_gh = remote_mux._gh
