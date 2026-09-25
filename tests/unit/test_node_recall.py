@@ -665,6 +665,24 @@ class TestTheInstallNeverOverwritesTheNodesWork:
         assert done.returncode == 4
         assert list(elsewhere.iterdir()) == []
 
+    def test_a_file_where_the_payload_has_a_directory_is_kept_with_its_contents(
+        self, monkeypatch, home, tmp_path
+    ):
+        dest = self._dest(home)
+        dest.mkdir(parents=True)
+        (dest / "memory").write_text("the node's own file\n", encoding="utf-8")
+
+        done = _node_run(self._call(monkeypatch, tmp_path), home)
+
+        assert done.returncode == 0, done.stderr
+        assert (dest / "memory").read_text(encoding="utf-8") == "the node's own file\n"
+        result = remote_mux._installed(done.stdout.decode())
+        assert sorted(result.kept) == ["memory", "memory/MEMORY.md"]
+        assert "2 item(s)" in result.note
+        assert (dest / f"{SESSION_ID}.jsonl").read_text(encoding="utf-8") == (
+            _PULLED_JSONL
+        )
+
     def test_a_symlinked_directory_inside_it_is_refused_before_anything_lands(
         self, monkeypatch, home, tmp_path
     ):
@@ -762,8 +780,22 @@ class TestTheInstallResultAndRefusals:
 
         assert result.landed == "/home/amin/.claude/projects/-home-amin-magent-api"
         assert result.kept == ("memory/MEMORY.md", f"{SESSION_ID}.jsonl")
-        assert "2 file(s)" in result.note
+        assert "2 item(s)" in result.note
         assert "memory/MEMORY.md" in result.note
+
+    def test_a_kept_directory_is_an_item_not_a_file(self):
+        # spec-G9's probe: the node has a FILE named memory where the payload
+        # has a directory, so the directory and everything under it are kept.
+        result = remote_mux._installed(
+            "KEPT\tmemory\nKEPT\tmemory/a.md\nKEPT\ts.jsonl\n/home/amin/.claude/projects/x\n"
+        )
+
+        assert result.kept == ("memory", "memory/a.md", "s.jsonl")
+        assert result.note == (
+            "kept the node's newer/diverged copy of 3 item(s): "
+            "memory, memory/a.md, s.jsonl"
+        )
+        assert "file(s)" not in result.note
 
     def test_nothing_kept_has_no_note(self, monkeypatch, tmp_path):
         self._fake(monkeypatch, stdout=b"/home/amin/.claude/projects/x\n")

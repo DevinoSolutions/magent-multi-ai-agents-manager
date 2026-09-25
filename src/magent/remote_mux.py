@@ -904,20 +904,23 @@ def node_realpath(node: Node, path: str, *, timeout_s: float) -> str:
 
 @dataclass(frozen=True)
 class InstalledTranscripts:
-    """Where a recall's conversation landed on a node, and the files the node
-    already had a newer or diverged copy of -- those were KEPT, not
-    overwritten (``install_transcripts.sh``). Informational, not a failure."""
+    """Where a recall's conversation landed on a node, and the items (files,
+    or a directory where the node has a file) the node already had its own
+    newer or diverged copy of -- those were KEPT, not overwritten
+    (``install_transcripts.sh``). Informational, not a failure."""
 
     landed: str
     kept: tuple[str, ...] = ()
 
     @property
     def note(self) -> str:
-        """One line naming the kept files, or "" when there are none."""
+        """One line naming what was kept, or "" when nothing was. An item, not
+        a file: a directory is KEPT too when the node has a file of that name
+        where the payload has a directory."""
         if not self.kept:
             return ""
         return (
-            f"kept the node's newer/diverged copy of {len(self.kept)} file(s): "
+            f"kept the node's newer/diverged copy of {len(self.kept)} item(s): "
             + ", ".join(self.kept)
         )
 
