@@ -482,8 +482,9 @@ def _attach_markers(sid: str, mux: str = "psmux") -> tuple[str, ...]:
     way (``-t =api`` inside ``-t =api2``), and an overlap can only ever make a
     dead window look ALIVE (left open), never the reverse: the conservative
     direction ``_corpses`` is built around. One cross-multiplexer overlap
-    exists too -- the psmux marker for a sid named ``magent`` is a prefix of
-    every tmux marker -- and it points the same conservative way.
+    exists too -- the psmux marker for a sid named ``magent`` (any case:
+    matching is case-insensitive) is a prefix of every tmux marker -- and it
+    points the same conservative way.
     """
     if mux == "psmux":
         return (

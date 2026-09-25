@@ -8,6 +8,7 @@ from typing import ClassVar
 import pytest
 
 from magent import cli
+from magent.attach_client import remote_attach_command
 from magent.config import SCHEMA_VERSION, MagentConfig, ProjectConfig, Settings
 from magent.launch import eligible_psmux_projects
 from tests.conftest import FakePlatform
@@ -1443,7 +1444,7 @@ class TestCorpseDecision:
                 "--session",
                 "api",
                 "--remote",
-                "tmux -L magent attach -t '=api'",
+                remote_attach_command("api", "tmux"),
                 "--mux",
                 "tmux",
             ]
@@ -1460,14 +1461,16 @@ class TestCorpseDecision:
         cmd = "ssh -t amin@devino-second tmux -L magent attach -t '=api2'"
         assert self._corpses(["api"], [cmd]) == {"api"}
 
-    def test_a_psmux_session_named_magent_is_kept_alive_by_any_node_pane(self):
+    @pytest.mark.parametrize("sid", ["magent", "Magent"])
+    def test_a_psmux_session_named_magent_is_kept_alive_by_any_node_pane(self, sid):
         # The one cross-multiplexer overlap: the psmux marker for a sid named
         # `magent` is `-L magent attach`, a prefix of EVERY tmux marker. So a
         # dead psmux `magent:magent` window is never swept while any node pane
         # is live. That is the conservative direction (never a false close),
         # and `magent` is a realistic project name -- this repo is one.
+        # Matching is case-insensitive, so `Magent` is rescued the same way.
         cmd = "ssh -t amin@devino-second tmux -L magent attach -t '=api'"
-        assert self._corpses(["magent"], [cmd]) == set()
+        assert self._corpses([sid], [cmd]) == set()
 
 
 class TestRepairCorpses:

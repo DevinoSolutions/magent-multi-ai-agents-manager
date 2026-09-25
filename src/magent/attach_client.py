@@ -72,8 +72,8 @@ For a node pane the marker is the tmux spelling instead,
 ``-L magent attach -t '=<sid>'`` (``_attach_markers(sid, "tmux")``); each
 multiplexer's marker matches its own ``remote_attach_command`` and no other
 session's command, with one conservative exception: a psmux session named
-``magent`` shares its marker's text with the node socket, so a live node pane
-keeps it looking alive. During a backoff sleep there is no ssh process at all,
+``magent`` (any case: matching is case-insensitive) shares its marker's text
+with the node socket, so a live node pane keeps it looking alive. During a backoff sleep there is no ssh process at all,
 so this supervisor is what has to carry the marker -- and it does, for free,
 because ``_spawn_windows`` hands us the remote command it would otherwise have
 given ssh, as our own ``--remote`` argument. The marker therefore appears
