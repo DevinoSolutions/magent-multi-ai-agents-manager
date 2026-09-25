@@ -35,6 +35,7 @@ from magent.nodes import LoadSample
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from pathlib import Path
 
     from magent.nodes import Node
 
@@ -91,8 +92,14 @@ _SPAWN_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 class RemoteError(RuntimeError):
     """A node call that failed: ``rc``, the last lines of its stderr, and the
-    argv it ran with stdin reduced to its length. Never file contents, never a
-    token.
+    argv it ran with stdin reduced to its length.
+
+    What magent authors is clean: ``command_redacted`` is argv only, and stdin
+    -- where secrets travel -- appears as its length alone. ``stderr_tail`` is
+    NOT magent's to clean: it is the node's own words, verbatim. So a script
+    must never echo its payload or run under xtrace (``set -x``), and must
+    hand secrets to tools by stdin or a credential helper, never a URL (git
+    prints a token-bearing remote URL in "fatal: unable to access").
 
     ``rc`` None means the call never finished, and that covers two opposite
     cases. After a spawn failure the command never ran. After a timeout the
@@ -168,6 +175,15 @@ def _redacted(argv: list[str], input_bytes: bytes | None) -> tuple[str, ...]:
     return (*argv, f"<stdin: {len(input_bytes)} bytes>")
 
 
+def _run_shown(
+    node: Node, argv_remote: Sequence[str], input_bytes: bytes | None
+) -> tuple[str, ...]:
+    """What an error and a log line may say about ``run(node, argv_remote,
+    input_bytes=...)``: the program, not this PC's path to it; the one
+    ``bash -c`` remote string; stdin by its length alone."""
+    return _redacted(["ssh", *_ssh_tail(node, argv_remote, tty=False)], input_bytes)
+
+
 def _spawn(
     argv: list[str],
     *,
@@ -175,10 +191,11 @@ def _spawn(
     input_bytes: bytes | None,
     check: bool,
     shown: tuple[str, ...],
+    label: str,
 ) -> subprocess.CompletedProcess[bytes]:
     """One bounded child -- the shared body of ``run`` and the local git reads
-    (a later task). ``shown`` is what an error and a log line may say about
-    the command."""
+    (``ignored_paths``). ``shown`` is what an error and a log line may say
+    about the command; ``label`` opens every log line, naming who spawned it."""
     try:
         proc = subprocess.Popen(
             argv,
@@ -196,7 +213,7 @@ def _spawn(
         rc = SSH_MISSING_RC if isinstance(e, FileNotFoundError) else None
         reason = e.strerror or str(e)
         get_logger("nodes").warning(
-            "node call could not start (%s): %s", reason, shlex.join(shown)
+            "%s could not start (%s): %s", label, reason, shlex.join(shown)
         )
         raise RemoteError(rc, reason, shown) from e
     try:
@@ -210,12 +227,12 @@ def _spawn(
         with contextlib.suppress(subprocess.TimeoutExpired, OSError):
             proc.wait(timeout=_REAP_TIMEOUT_S)
         get_logger("nodes").warning(
-            "node call timed out after %.1fs: %s", timeout_s, shlex.join(shown)
+            "%s timed out after %.1fs: %s", label, timeout_s, shlex.join(shown)
         )
         raise RemoteError(None, f"timed out after {timeout_s:g}s", shown) from None
     if check and proc.returncode != 0:
         get_logger("nodes").warning(
-            "node call failed (rc=%s): %s", proc.returncode, shlex.join(shown)
+            "%s failed (rc=%s): %s", label, proc.returncode, shlex.join(shown)
         )
         raise RemoteError(proc.returncode, _tail(err), shown)
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
@@ -236,18 +253,18 @@ def run(
     caller to classify. The returned ``CompletedProcess.args`` is the real
     argv, this PC's client path included: a caller must not log it."""
     tail = _ssh_tail(node, argv_remote, tty=False)
-    # Errors and log lines name the program, not this PC's path to it.
-    shown = _redacted(["ssh", *tail], input_bytes)
+    shown = _run_shown(node, argv_remote, input_bytes)
     return _spawn(
         [_client(shown), *tail],
         timeout_s=timeout_s,
         input_bytes=input_bytes,
         check=check,
         shown=shown,
+        label="node call",
     )
 
 
-def _script_argv(args: list[str]) -> list[str]:
+def _script_argv(args: Sequence[str]) -> list[str]:
     """The remote argv of every script run: the socket is ALWAYS ``$1``
     (DECISION-26 ii) -- ``lib.sh`` reads and shifts it -- then the caller's
     own args."""
@@ -255,16 +272,30 @@ def _script_argv(args: list[str]) -> list[str]:
 
 
 def _frame_script(text: str, payload: bytes | None) -> bytes:
+    """The stdin of one script run. No payload: the script text alone. With
+    one: ``<text>\\n<PAYLOAD_SENTINEL>\\n<payload>``. The leading ``\\n``
+    guards a script text without a final newline, whose last line would
+    otherwise swallow the sentinel; when the text does end in one, the result
+    is a harmless blank line before the sentinel."""
     body = text.encode("utf-8")
     if payload is None:
         return body
     return body + b"\n" + PAYLOAD_SENTINEL.encode("ascii") + b"\n" + payload
 
 
+def _script_call(
+    script: str, args: Sequence[str], stdin: bytes | None
+) -> tuple[list[str], bytes]:
+    """The remote argv and the stdin bytes of one ``run_script`` call -- built
+    here once, so an error raised after the call (``sample``) names exactly
+    what ran."""
+    return _script_argv(args), _frame_script(node_scripts.script(script), stdin)
+
+
 def run_script(
     node: Node,
     script: str,
-    args: list[str],
+    args: Sequence[str],
     *,
     timeout_s: float,
     stdin: bytes | None = None,
@@ -274,25 +305,30 @@ def run_script(
     ``stdin`` is given -- the sentinel line and that payload. The socket is
     added here, on every call; ``args`` never carry it. Secrets belong in
     ``stdin``; ``args`` are argv, visible to the node's process table and to
-    logs. ValueError for a script in ``node_scripts.NON_ENTRY_SCRIPTS`` --
-    it would read the socket as its own first argument."""
+    logs. A failure's ``stderr_tail`` is the script's own words (see
+    ``RemoteError``): a script must never echo its payload.
+
+    Refused before any ssh: ValueError for a script in
+    ``node_scripts.NON_ENTRY_SCRIPTS`` (it would read the socket as its own
+    first argument) or for a name that is not a plain script name
+    (``./lib``); FileNotFoundError for an unknown script."""
     if f"{script}.sh" in node_scripts.NON_ENTRY_SCRIPTS:
         raise ValueError(f"{script}.sh is not a run_script entry point")
-    return run(
-        node,
-        _script_argv(args),
-        timeout_s=timeout_s,
-        input_bytes=_frame_script(node_scripts.script(script), stdin),
-    )
+    argv_remote, framed = _script_call(script, args, stdin)
+    return run(node, argv_remote, timeout_s=timeout_s, input_bytes=framed)
 
 
 def has_session(node: Node, sid: str) -> bool | None:
-    """Is ``sid`` alive on ``node``? True/False only when tmux itself answered:
-    exit 0 is a live session, exit 1 is tmux's own "no" (no such session, or
-    no server at all). Anything else -- ssh's 255, a missing tmux, a timeout --
-    is None: the PROBE failed, which says nothing about the session. The target
-    is ``=sid`` because tmux otherwise prefix-matches, and ``api`` would answer
-    for ``api-2``."""
+    """Is ``sid`` alive on ``node``? Exit 0 is True, a live session. Exit 1 is
+    False, meant as tmux's own "no" (no such session, or no server at all) --
+    but ANY exit 1 in the chain reads the same: a ``nologin`` shell, a
+    ForceCommand, tmux's "error connecting to socket (Permission denied)", a
+    client/server version mismatch. So False means "no session named ``sid``
+    was found by whatever answered exit 1", and a caller that respawns on False
+    must be prepared for that. Anything else -- ssh's 255, a missing tmux, a
+    timeout -- is None: the PROBE failed, which says nothing about the session.
+    The target is ``=sid`` because tmux otherwise prefix-matches, and ``api``
+    would answer for ``api-2``."""
     try:
         result = run(
             node,
@@ -310,8 +346,17 @@ def has_session(node: Node, sid: str) -> bool | None:
 
 
 def _finite(value: object) -> float:
-    """``value`` as a float, or ValueError when it is NaN or infinite."""
-    if not isinstance(value, (int, float, str)):
+    """``value`` as a float. Three refusals:
+
+    - TypeError for a non-number. A bool and a numeric string both count:
+      json's ``true`` is a Python bool (an int subclass), and ``sample.sh``
+      prints bare numbers, so ``"1.5"`` is not a reading. The isinstance
+      guard is also what narrows ``object`` for ty.
+    - ValueError for NaN or an infinity: json accepts them, the snapshot
+      writer does not.
+    - OverflowError for an int too large for a float (json has no bound on
+      an integer's digits)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"not a number: {value!r}")
     number = float(value)
     if not math.isfinite(number):
@@ -319,30 +364,88 @@ def _finite(value: object) -> float:
     return number
 
 
+def _integral(value: object) -> int:
+    """``value`` as an int, as strict as ``_finite``: TypeError for a
+    non-number (a bool and a str included), ValueError for a float that is
+    not finite or not whole (``16.9``). A whole float (``16.0``) is taken."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"not a number: {value!r}")
+    if isinstance(value, int):
+        return value
+    if not math.isfinite(value) or not value.is_integer():
+        raise ValueError(f"not a whole reading: {value}")
+    return int(value)
+
+
 def sample(node: Node) -> LoadSample:
     """One load reading from ``node`` (``sample.sh``). RemoteError when the node
-    can't be reached, or answers something that is not a sample. A non-finite
-    number is not a sample either: json accepts NaN, the snapshot writer does
-    not."""
+    can't be reached, or answers something that is not a sample -- rc 0 on
+    that error: the node answered; the answer was malformed. Its message
+    carries a bounded head of what came back (a ``.bashrc`` banner on stdout
+    is the likely cause). A non-finite, fractional-count, bool or string
+    number is not a sample either."""
     result = run_script(node, "sample", [], timeout_s=PROBE_TIMEOUT_S)
     try:
         raw = json.loads(result.stdout.decode("utf-8", "replace"))
         reading = LoadSample(
             ts=_finite(raw["ts"]),
-            nproc=int(raw["nproc"]),
+            nproc=_integral(raw["nproc"]),
             load1=_finite(raw["load1"]),
             load5=_finite(raw["load5"]),
             load15=_finite(raw["load15"]),
-            mem_total_mb=int(raw["mem_total_mb"]),
-            mem_avail_mb=int(raw["mem_avail_mb"]),
-            my_sessions=int(raw["my_sessions"]),
+            mem_total_mb=_integral(raw["mem_total_mb"]),
+            mem_avail_mb=_integral(raw["mem_avail_mb"]),
+            my_sessions=_integral(raw["my_sessions"]),
         )
-    except (ValueError, KeyError, TypeError) as e:
-        # Named the way run() names it: the program, not this PC's path to
-        # it, and stdin by its length.
-        shown = _redacted(
-            ["ssh", *_ssh_tail(node, _script_argv([]), tty=False)],
-            _frame_script(node_scripts.script("sample"), None),
-        )
-        raise RemoteError(result.returncode, f"not a load sample: {e}", shown) from e
+    # OverflowError is an ArithmeticError, not a ValueError: float() of a
+    # 401-digit integer overflows. (`1e400` parses to inf, a ValueError from
+    # _finite/_integral.)
+    except (ValueError, KeyError, TypeError, OverflowError) as e:
+        shown = _run_shown(node, *_script_call("sample", [], None))
+        raise RemoteError(
+            result.returncode,
+            f"not a load sample: {e}; got {result.stdout[:200]!r}",
+            shown,
+        ) from e
     return reading
+
+
+def ignored_paths(repo: Path, *, timeout_s: float, label: str) -> tuple[str, ...]:
+    """What git ignores in the LOCAL ``repo``: ``git ls-files --others --ignored
+    --exclude-standard --directory -z`` -- repo-relative, '/'-separated, and a
+    wholly ignored directory as ONE ``dir/`` entry (``node_modules`` is one
+    line, not a hundred thousand). Read-only. The raw material for
+    ``nodes.push_set``; ``git_state`` carries it as ``LocalGitState.ignored``.
+    ``label`` names the caller in the log line a failure writes.
+
+    A ``repo`` that is not a git repository is ``RemoteError(rc=128, <git's
+    stderr tail>)`` -- git's own "fatal: not a git repository" exit. A missing
+    ``git`` is RemoteError rc None ("git not found on PATH"): the command never
+    ran. ``_spawn`` reads a FileNotFoundError as the missing ssh client (rc
+    127), which is not what happened here."""
+    argv = [
+        "git",
+        "-C",
+        str(repo),
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+        "-z",
+    ]
+    shown = tuple(argv)
+    try:
+        result = _spawn(
+            argv,
+            timeout_s=timeout_s,
+            input_bytes=None,
+            check=True,
+            shown=shown,
+            label=label,
+        )
+    except RemoteError as e:
+        if isinstance(e.__cause__, FileNotFoundError):
+            raise RemoteError(None, "git not found on PATH", shown) from e.__cause__
+        raise
+    return tuple(p for p in result.stdout.decode("utf-8", "replace").split("\0") if p)

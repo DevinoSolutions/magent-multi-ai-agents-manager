@@ -6,12 +6,14 @@ import dataclasses
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
 from dataclasses import MISSING
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
-from magent import nodes
+from magent import nodes, psmux, remote_mux
 from magent.config import (
     MagentConfig,
     NodeConfig,
@@ -738,3 +740,457 @@ class TestTheSessionsSnapshot:
     def test_a_future_ts_inside_the_window_still_reads_fresh(self):
         snap = nodes.NodeSessions(ts=100.0, sessions=("api",))
         assert not nodes.sessions_stale(snap, pull_interval_s=30, now=130.0)
+
+
+@pytest.fixture
+def repo(tmp_path, monkeypatch):
+    """A real git repo in tmp: this fixture writes it (init/add); the code
+    under test only READS it. The home is already redirected (no ~/.gitconfig,
+    no global excludes); NOSYSTEM keeps the machine's system gitconfig out too."""
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    root = tmp_path / "sendly"
+    root.mkdir()
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(root), *args], check=True, capture_output=True, timeout=30
+        )
+
+    files = {
+        ".gitignore": ".env*\nnode_modules/\n.claude/settings.local.json\nCLAUDE.local.md\n",
+        ".env": "API_KEY=1\n",
+        ".env.example": "API_KEY=\n",
+        "apps/web/page.tsx": "export {}\n",
+        "apps/web/.env.local": "WEB=1\n",
+        ".claude/settings.json": "{}\n",
+        ".claude/settings.local.json": "{}\n",
+        "CLAUDE.local.md": "notes\n",
+        "node_modules/left-pad/.env": "INSIDE=1\n",
+        "node_modules/left-pad/index.js": "\n",
+        "notes.txt": "untracked, not ignored\n",
+        # An untracked directory holding ONLY an ignored file: git may list the
+        # directory rather than the file (TestGitsIgnoredListing pins which).
+        "config/.env": "CFG=1\n",
+    }
+    git("init", "-q")
+    for rel, text in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    git("add", ".gitignore", "apps/web/page.tsx", ".claude/settings.json")
+    # Tracked although `.env*` matches it: a tracked file is the clone's, never a push.
+    git("add", "-f", ".env.example")
+    return root
+
+
+def _state(path: Path, ignored: tuple[str, ...]) -> LocalGitState:
+    return LocalGitState(
+        path=path,
+        url="git@github.com:amin/sendly.git",
+        branch="main",
+        dirty=False,
+        unpushed=False,
+        detached=False,
+        ignored=ignored,
+    )
+
+
+def _real_state(repo: Path) -> LocalGitState:
+    return _state(repo, remote_mux.ignored_paths(repo, timeout_s=30, label="test"))
+
+
+class TestGitsIgnoredListing:
+    def test_a_wholly_ignored_directory_is_one_entry(self, repo):
+        listing = remote_mux.ignored_paths(repo, timeout_s=30, label="test")
+        assert "node_modules/" in listing
+        assert [p for p in listing if p.startswith("node_modules/")] == [
+            "node_modules/"
+        ]
+
+    def test_tracked_and_merely_untracked_files_are_not_listed(self, repo):
+        listing = remote_mux.ignored_paths(repo, timeout_s=30, label="test")
+        assert ".env.example" not in listing
+        assert "notes.txt" not in listing
+
+    def test_an_untracked_dir_of_only_ignored_files_is_descended(self, repo):
+        # git 2.52 lists BOTH `config/` and `config/.env`. The file line is what
+        # push_set ships from; if a git ever drops it, this goes red first.
+        listing = remote_mux.ignored_paths(repo, timeout_s=30, label="test")
+        assert "config/.env" in listing
+
+    def test_a_non_repo_is_git_rc_128_and_the_log_names_the_caller(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # The ceiling keeps git from finding an enclosing repo above tmp.
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        with (
+            caplog.at_level("WARNING", logger="magent.nodes"),
+            pytest.raises(remote_mux.RemoteError) as err,
+        ):
+            remote_mux.ignored_paths(tmp_path, timeout_s=30, label="push-set read")
+        assert err.value.rc == 128
+        assert "not a git repository" in err.value.stderr_tail
+        assert "push-set read failed (rc=128)" in caplog.text
+
+    def test_a_missing_git_is_named_as_git_not_as_the_node_client(
+        self, tmp_path, monkeypatch
+    ):
+        # _spawn maps a FileNotFoundError to the ssh client's rc and wording;
+        # a LOCAL git read must say git. find_ssh plays no part here.
+        empty = tmp_path / "empty-path"
+        empty.mkdir()
+        monkeypatch.setenv("PATH", str(empty))
+        with pytest.raises(remote_mux.RemoteError) as err:
+            remote_mux.ignored_paths(tmp_path, timeout_s=30, label="test")
+        assert err.value.rc is None
+        assert err.value.stderr_tail == "git not found on PATH"
+        assert err.value.command_redacted[0] == "git"
+
+
+class TestPushSet:
+    def test_gitignored_env_files_ship_at_any_depth(self, repo):
+        shipped = nodes.push_set(repo, [_real_state(repo)], home=Path.home())
+        assert repo / ".env" in shipped
+        assert repo / "apps" / "web" / ".env.local" in shipped
+
+    def test_an_env_file_in_a_dir_of_only_ignored_files_ships(self, repo):
+        shipped = nodes.push_set(repo, [_real_state(repo)], home=Path.home())
+        assert repo / "config" / ".env" in shipped
+
+    def test_the_local_claude_files_ship(self, repo):
+        shipped = nodes.push_set(repo, [_real_state(repo)], home=Path.home())
+        assert repo / ".claude" / "settings.local.json" in shipped
+        assert repo / "CLAUDE.local.md" in shipped
+
+    def test_a_tracked_env_example_never_ships(self, repo):
+        shipped = nodes.push_set(repo, [_real_state(repo)], home=Path.home())
+        assert repo / ".env.example" not in shipped
+
+    def test_nothing_under_an_ignored_directory_ships(self, repo):
+        shipped = nodes.push_set(repo, [_real_state(repo)], home=Path.home())
+        assert not [p for p in shipped if p.is_relative_to(repo / "node_modules")]
+
+    def test_an_untracked_file_git_does_not_ignore_stays_home(self, repo):
+        shipped = nodes.push_set(repo, [_real_state(repo)], home=Path.home())
+        assert repo / "notes.txt" not in shipped
+
+    def test_a_wholly_ignored_claude_dir_still_ships_its_local_settings(self, tmp_path):
+        (tmp_path / ".claude").mkdir()
+        (tmp_path / ".claude" / "settings.local.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        (tmp_path / ".claude" / "other.json").write_text("{}", encoding="utf-8")
+        shipped = nodes.push_set(
+            tmp_path, [_state(tmp_path, (".claude/",))], home=Path.home()
+        )
+        assert shipped == (tmp_path / ".claude" / "settings.local.json",)
+
+    def test_a_workspace_roots_own_local_files_ship(self, tmp_path):
+        workspace = tmp_path / "ws"
+        (workspace / "api").mkdir(parents=True)
+        (workspace / ".env").write_text("X=1\n", encoding="utf-8")
+        (workspace / "CLAUDE.local.md").write_text("n\n", encoding="utf-8")
+        (workspace / "README.md").write_text("r\n", encoding="utf-8")
+        shipped = nodes.push_set(
+            workspace, [_state(workspace / "api", ())], home=Path.home()
+        )
+        assert shipped == (workspace / ".env", workspace / "CLAUDE.local.md")
+
+    def test_a_project_reached_through_a_link_never_ships_a_tracked_file(
+        self, repo, tmp_path
+    ):
+        # The project's configured path is a symlink/junction to the repo: the
+        # repo is still its workspace, so the root listing (which cannot tell
+        # tracked from ignored) must not run.
+        link = tmp_path / "sendly-link"
+        try:
+            os.symlink(repo, link, target_is_directory=True)
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        shipped = nodes.push_set(link, [_real_state(repo)], home=Path.home())
+        assert not [p for p in shipped if p.name == ".env.example"]
+
+    def test_a_monorepo_subdirectory_project_never_ships_a_tracked_file(self, repo):
+        web = repo / "apps" / "web"
+        (web / ".env.example").write_text("WEB=\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(repo), "add", "-f", "apps/web/.env.example"],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        shipped = nodes.push_set(web, [_real_state(repo)], home=Path.home())
+        assert not [p for p in shipped if p.name == ".env.example"]
+
+    def test_a_git_hit_that_is_not_a_file_never_ships(self, tmp_path):
+        # The listing is a snapshot: the file may be gone, or be a directory.
+        (tmp_path / ".env.d").mkdir()
+        shipped = nodes.push_set(
+            tmp_path, [_state(tmp_path, (".env", ".env.d"))], home=Path.home()
+        )
+        assert shipped == ()
+
+    def test_a_git_hit_under_a_credential_store_never_ships(self, tmp_path):
+        # A dotfiles repo that IS the home dir: git's listing is no exemption.
+        home = tmp_path / "home"
+        (home / ".ssh").mkdir(parents=True)
+        (home / ".ssh" / ".env").write_text("K=1\n", encoding="utf-8")
+        assert nodes.push_set(home, [_state(home, (".ssh/.env",))], home=home) == ()
+
+    def test_the_answer_is_sorted_and_unique(self, repo):
+        shipped = nodes.push_set(
+            repo, [_real_state(repo)], home=Path.home(), extras=[".env"]
+        )
+        assert list(shipped) == sorted(set(shipped), key=str)
+
+
+def _secret_under(entry: str) -> str:
+    """A file a ``_NEVER_PUSHED`` entry covers: the entry itself, or a file
+    inside it when it names a directory (a trailing '/')."""
+    return f"{entry}secret" if entry.endswith("/") else entry
+
+
+class TestPushExtras:
+    def test_an_extra_file_ships(self, repo):
+        (repo / "apps" / "web" / "gcp-sa.json").write_text("{}", encoding="utf-8")
+        shipped = nodes.push_set(
+            repo, [_real_state(repo)], home=Path.home(), extras=["apps/web/gcp-sa.json"]
+        )
+        assert repo / "apps" / "web" / "gcp-sa.json" in shipped
+
+    def test_a_missing_extra_is_a_warning_not_an_error(self, repo):
+        assert nodes.push_warnings(repo, ["nope.json"], home=Path.home()) == (
+            "push: nope.json does not exist; skipped",
+        )
+        assert repo / "nope.json" not in nodes.push_set(
+            repo, [], home=Path.home(), extras=["nope.json"]
+        )
+
+    def test_an_extra_outside_the_project_is_refused(self, repo, tmp_path):
+        (tmp_path / "outside.txt").write_text("x", encoding="utf-8")
+        assert nodes.push_warnings(repo, ["../outside.txt"], home=Path.home()) == (
+            "push: ../outside.txt is outside the project; skipped",
+        )
+
+    def test_a_symlink_that_leaves_the_project_is_refused(self, repo, tmp_path):
+        # Containment is judged after BOTH sides are resolved: a link inside
+        # the project that points out of it is still outside.
+        outside = tmp_path / "outside.txt"
+        outside.write_text("x", encoding="utf-8")
+        link = repo / "linked.txt"
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        assert nodes.push_warnings(repo, ["linked.txt"], home=Path.home()) == (
+            "push: linked.txt is outside the project; skipped",
+        )
+        shipped = nodes.push_set(repo, [], home=Path.home(), extras=["linked.txt"])
+        assert link not in shipped
+        assert outside not in shipped
+
+    def test_a_symlinked_extra_ships_under_the_name_the_user_wrote(self, repo):
+        # The node recreates the path it is handed: the link's name is what the
+        # project reads, not wherever the link happens to point on this PC.
+        (repo / "real-sa.json").write_text("{}", encoding="utf-8")
+        link = repo / "gcp-sa.json"
+        try:
+            link.symlink_to(repo / "real-sa.json")
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        shipped = nodes.push_set(
+            repo, [_real_state(repo)], home=Path.home(), extras=["./gcp-sa.json"]
+        )
+        assert link in shipped
+        assert repo / "real-sa.json" not in shipped
+
+    def test_the_users_ssh_keys_are_never_pushed(self, tmp_path):
+        # A project that IS the home dir (a dotfiles repo) still cannot ship them.
+        home = tmp_path / "home"
+        (home / ".ssh").mkdir(parents=True)
+        (home / ".ssh" / "id_ed25519").write_text("KEY", encoding="utf-8")
+        assert nodes.push_set(home, [], home=home, extras=[".ssh/id_ed25519"]) == ()
+        assert nodes.push_warnings(home, [".ssh/id_ed25519"], home=home) == (
+            "push: .ssh/id_ed25519 is never pushed (credentials); skipped",
+        )
+
+    def test_the_usual_credential_files_are_on_the_list(self):
+        assert set(nodes._NEVER_PUSHED) >= {
+            ".ssh/",
+            ".claude-swap-backup/",
+            ".claude/.credentials.json",
+            ".aws/credentials",
+            ".netrc",
+            ".gnupg/",
+            ".config/gh/hosts.yml",
+            ".docker/config.json",
+            ".kube/config",
+        }
+
+    @pytest.mark.parametrize("entry", nodes._NEVER_PUSHED)
+    def test_every_credential_store_is_refused(self, tmp_path, entry):
+        # Parametrized over the list itself: a future entry is covered here.
+        home = tmp_path / "home"
+        rel = _secret_under(entry)
+        (home / rel).parent.mkdir(parents=True, exist_ok=True)
+        (home / rel).write_text("SECRET", encoding="utf-8")
+        assert nodes.push_set(home, [], home=home, extras=[rel]) == ()
+        assert nodes.push_warnings(home, [rel], home=home) == (
+            f"push: {rel} is never pushed (credentials); skipped",
+        )
+
+    @pytest.mark.parametrize("entry", nodes._NEVER_PUSHED)
+    def test_a_case_variant_of_a_credential_store_is_refused(self, tmp_path, entry):
+        # Refused on EVERY OS: on a case-insensitive filesystem (APFS, NTFS)
+        # the variant IS the store; on a case-sensitive one refusing is cheap.
+        home = tmp_path / "home"
+        rel = _secret_under(entry).swapcase()
+        (home / rel).parent.mkdir(parents=True, exist_ok=True)
+        (home / rel).write_text("SECRET", encoding="utf-8")
+        assert nodes.push_set(home, [], home=home, extras=[rel]) == ()
+        assert nodes.push_warnings(home, [rel], home=home) == (
+            f"push: {rel} is never pushed (credentials); skipped",
+        )
+
+    def test_the_credential_match_ignores_case_even_for_posix_paths(self):
+        # WindowsPath already compares case-insensitively; PosixPath does not,
+        # and macOS's APFS is case-insensitive under a PosixPath.
+        forbidden = [
+            (PurePosixPath("/h/.ssh"), True),
+            (PurePosixPath("/h/.netrc"), False),
+        ]
+        assert nodes._is_forbidden(PurePosixPath("/h/.SSH/id_ed25519"), forbidden)
+        assert nodes._is_forbidden(PurePosixPath("/h/.NetRC"), forbidden)
+        assert not nodes._is_forbidden(PurePosixPath("/h/.sshx/id"), forbidden)
+        assert not nodes._is_forbidden(PurePosixPath("/h/.netrc.d/x"), forbidden)
+
+    def test_an_extra_directory_is_a_warning(self, repo):
+        assert nodes.push_warnings(repo, ["apps"], home=Path.home()) == (
+            "push: apps is a directory; list its files; skipped",
+        )
+
+
+class TestRecipeFor:
+    def test_a_repo_project_is_one_repo_at_the_node_root(self, repo):
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second"),
+            NODE,
+            [_real_state(repo)],
+            home=Path.home(),
+            project_dir=repo,
+        )
+        assert (recipe.project, recipe.sid) == ("sendly", "sendly")
+        assert recipe.remote_root == "~/magent/sendly"
+        assert recipe.repos == (
+            RepoSpec(
+                url="git@github.com:amin/sendly.git",
+                branch="main",
+                remote_dir="~/magent/sendly",
+            ),
+        )
+
+    def test_the_sid_is_psmuxs_session_name_of_the_title(self, tmp_path):
+        proj = ProjectConfig(path=str(tmp_path), node="second", title="Sendly v2.0")
+        recipe = nodes.recipe_for(
+            proj, NODE, [_state(tmp_path, ())], home=Path.home(), project_dir=tmp_path
+        )
+        assert recipe.project == "Sendly v2.0"
+        assert recipe.sid == psmux.session_name("Sendly v2.0") == "Sendly-v2-0"
+
+    def test_a_workspace_puts_each_child_repo_under_it(self, tmp_path):
+        workspace = tmp_path / "ws"
+        (workspace / "api").mkdir(parents=True)
+        (workspace / "web").mkdir()
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(workspace), node="second"),
+            NODE,
+            [_state(workspace / "api", ()), _state(workspace / "web", ())],
+            home=Path.home(),
+            project_dir=workspace,
+        )
+        assert recipe.remote_root == "~/magent/ws"
+        assert [r.remote_dir for r in recipe.repos] == [
+            "~/magent/ws/api",
+            "~/magent/ws/web",
+        ]
+
+    def test_a_repo_outside_the_project_is_refused(self, tmp_path):
+        with pytest.raises(
+            NodeConfigError, match="neither the project nor a direct child"
+        ):
+            nodes.recipe_for(
+                ProjectConfig(path=str(tmp_path / "ws"), node="second"),
+                NODE,
+                [_state(tmp_path / "elsewhere" / "api", ())],
+                home=Path.home(),
+                project_dir=tmp_path / "ws",
+            )
+
+    def test_the_push_set_rides_along(self, repo):
+        state = _real_state(repo)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second"),
+            NODE,
+            [state],
+            home=Path.home(),
+            project_dir=repo,
+        )
+        assert recipe.push_files == nodes.push_set(repo, [state], home=Path.home())
+
+    def test_push_warnings_ride_along(self, repo):
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second", push=["missing.json"]),
+            NODE,
+            [_real_state(repo)],
+            home=Path.home(),
+            project_dir=repo,
+        )
+        assert recipe.warnings == ("push: missing.json does not exist; skipped",)
+
+    def test_the_memory_dir_is_found_under_the_encoded_local_path(self, repo):
+        memory = (
+            Path.home()
+            / ".claude"
+            / "projects"
+            / nodes.encoded_project_dir(str(repo))
+            / "memory"
+        )
+        memory.mkdir(parents=True)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second"),
+            NODE,
+            [_real_state(repo)],
+            home=Path.home(),
+            project_dir=repo,
+        )
+        assert recipe.memory_dir == memory
+
+    def test_no_memory_dir_is_none(self, repo):
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second"),
+            NODE,
+            [_real_state(repo)],
+            home=Path.home(),
+            project_dir=repo,
+        )
+        assert recipe.memory_dir is None
+
+    def test_a_project_reached_through_a_link_is_still_its_repo(self, repo, tmp_path):
+        # The configured path is a symlink/junction to the repo: compared on
+        # resolved paths, the repo IS the project, not "outside" it.
+        link = tmp_path / "sendly-link"
+        try:
+            os.symlink(repo, link, target_is_directory=True)
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(link), node="second"),
+            NODE,
+            [_real_state(repo)],
+            home=Path.home(),
+            project_dir=link,
+        )
+        assert [r.remote_dir for r in recipe.repos] == [recipe.remote_root]

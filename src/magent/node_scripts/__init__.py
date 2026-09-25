@@ -24,9 +24,13 @@ socket; every tmux call is ``tmux -L "$MAGENT_SOCKET"``.
 
 from __future__ import annotations
 
+import re
 from importlib import resources
 
 _INCLUDE = "# @include "
+# A script name as the loader accepts it: no path separator, no dot, no
+# suffix, lower case (a case-insensitive filesystem would load `Sample`).
+_NAME = re.compile(r"[a-z][a-z0-9_]*")
 
 # Packaged scripts that are NOT run_script entry points: they never receive the
 # socket as $1 and never include lib.sh, and run_script refuses them. Every
@@ -43,7 +47,18 @@ NON_ENTRY_SCRIPTS: frozenset[str] = frozenset(
 )
 
 
+def _check_name(name: str) -> None:
+    """ValueError unless ``name`` is a plain script name (no path, no suffix,
+    lower case): the only shape the loader may resolve inside the package."""
+    if not _NAME.fullmatch(name):
+        raise ValueError(f"{name!r} is not a script name")
+
+
 def _read(name: str) -> str:
+    """The packaged text of ``<name>.sh``. ``read_text``'s newline
+    translation IS the LF guarantee for ``script()`` output -- a CRLF checkout
+    still ships LF on the wire -- so never "optimize" it to
+    ``read_bytes().decode()``."""
     return (
         resources.files("magent.node_scripts")
         .joinpath(f"{name}.sh")
@@ -54,13 +69,29 @@ def _read(name: str) -> str:
 def script(name: str) -> str:
     """The text of ``node_scripts/<name>.sh`` with every ``# @include`` line
     expanded. FileNotFoundError for an unknown name (or include); ValueError
-    for a nested include."""
+    for a nested include, and for a file included twice (lib.sh's top level
+    shifts ``$1``: a second copy would shift again, and ``MAGENT_SOCKET``
+    would silently become the caller's first argument). An include line is
+    recognized only at column 0 as the whole line, and it is expanded even
+    inside a heredoc -- so never write one there.
+
+    ``name`` (and every include target) must be a plain script name,
+    ``[a-z][a-z0-9_]*``, or ValueError: ``./lib`` and ``sample/../lib`` both
+    loaded lib.sh past ``run_script``'s name-based non-entry refusal, and a
+    path could reach outside the package altogether."""
+    _check_name(name)
     out: list[str] = []
+    seen: set[str] = set()
     for line in _read(name).splitlines(keepends=True):
         if not line.startswith(_INCLUDE):
             out.append(line)
             continue
-        included = _read(line[len(_INCLUDE) :].strip().removesuffix(".sh"))
+        target = line[len(_INCLUDE) :].strip().removesuffix(".sh")
+        _check_name(target)
+        if target in seen:
+            raise ValueError(f"{name}.sh: {target}.sh is included more than once")
+        seen.add(target)
+        included = _read(target)
         if any(inner.startswith(_INCLUDE) for inner in included.splitlines()):
             raise ValueError(f"{name}.sh: nested # @include in {line.strip()!r}")
         out.append(included if included.endswith("\n") else included + "\n")

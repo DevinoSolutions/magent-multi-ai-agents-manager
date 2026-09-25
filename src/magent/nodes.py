@@ -19,14 +19,16 @@ import re
 import tempfile
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
 from magent.config import NODE_AUTO, NODE_CLOUD
+from magent.psmux import session_name
 from magent.sessions.claude import encode_claude_project_path
+from magent.titles import get_leaf_name
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     from magent.config import MagentConfig, ProjectConfig
 
@@ -130,6 +132,29 @@ class NodeMapEntry:
     placed_ts: float
     attached_existing: bool
     remote_root: str
+
+
+# What ships besides git (spec §8, D3): a session can't start without its
+# secrets and its local Claude settings, and none of them are in the clone.
+# Matched against git's OWN ignored listing, so a tracked file (`.env.example`)
+# can never be pushed over the clone's copy.
+_PUSH_FIXED = (".claude/settings.local.json", "CLAUDE.local.md", ".mcp.json")
+# Never pushed, whatever `push` says (spec §8 "Not transferred, ever"): this
+# PC's keys, ccswap's account backups, the Claude login itself, and the usual
+# credential files of other tools -- refusing one is cheap. Home-relative; a
+# trailing '/' names a directory (everything under it), anything else one
+# file. Matched case-insensitively on every OS (`_is_forbidden`).
+_NEVER_PUSHED = (
+    ".ssh/",
+    ".claude-swap-backup/",
+    ".claude/.credentials.json",
+    ".aws/credentials",
+    ".netrc",
+    ".gnupg/",
+    ".config/gh/hosts.yml",
+    ".docker/config.json",
+    ".kube/config",
+)
 
 
 def encoded_project_dir(path: str) -> str:
@@ -462,3 +487,227 @@ def sessions_stale(
     ``now`` reads ``stale``; a wall clock that jumped backwards therefore
     reads stale for at most one tick, never fresh forever."""
     return snap is None or abs(now - snap.ts) > 2 * pull_interval_s
+
+
+def _is_env_file(name: str) -> bool:
+    return name == ".env" or name.startswith(".env.")
+
+
+def _from_git_listing(repo: Path, ignored: tuple[str, ...]) -> list[Path]:
+    found: list[Path] = []
+    for entry in ignored:
+        if entry.endswith("/"):
+            # A wholly ignored directory is never descended (node_modules is
+            # not a push); only a fixed path that lives inside it can ship.
+            found += [
+                repo / fixed
+                for fixed in _PUSH_FIXED
+                if fixed.startswith(entry) and (repo / fixed).is_file()
+            ]
+        elif _is_env_file(entry.rsplit("/", 1)[-1]) or entry in _PUSH_FIXED:
+            # git emits '/' on every OS, like the _PUSH_FIXED literals.
+            found.append(repo / entry)
+    return found
+
+
+def _workspace_root_files(project_dir: Path) -> list[Path]:
+    # A workspace root is not a repo, so git lists nothing there -- its own env
+    # files and local Claude settings would otherwise never leave this PC.
+    found = [p for p in project_dir.iterdir() if p.is_file() and _is_env_file(p.name)]
+    found += [project_dir / f for f in _PUSH_FIXED if (project_dir / f).is_file()]
+    return found
+
+
+def _inside_a_repo(project_dir: Path, states: Sequence[LocalGitState]) -> bool:
+    """Is ``project_dir`` one of ``states``' repos, or inside one? Judged on
+    RESOLVED paths: a project configured as a junction/symlink to its repo, or
+    as a monorepo subdirectory, is still inside it -- and the root listing,
+    which cannot tell a tracked ``.env.example`` from an ignored ``.env``,
+    must not run there. A path that will not resolve counts as inside: the
+    fail-safe direction ships less."""
+    try:
+        root = project_dir.resolve()
+        return any(root.is_relative_to(state.path.resolve()) for state in states)
+    # RuntimeError: a symlink loop before Python 3.13; OSError from 3.13 on.
+    except (OSError, RuntimeError):
+        return True
+
+
+def _forbidden_roots(home: Path) -> list[tuple[PurePath, bool]]:
+    """Each ``_NEVER_PUSHED`` entry under ``home``, resolved (a store that is
+    itself a symlink is judged where it lands), paired with "is a directory"."""
+    return [
+        ((home / entry.rstrip("/")).resolve(), entry.endswith("/"))
+        for entry in _NEVER_PUSHED
+    ]
+
+
+def _folded(path: PurePath) -> tuple[str, ...]:
+    return tuple(part.casefold() for part in path.parts)
+
+
+def _is_forbidden(target: PurePath, forbidden: Sequence[tuple[PurePath, bool]]) -> bool:
+    """``target`` (already resolved) is a credential file, or lies under a
+    credential directory. Casefolded on EVERY OS: a PosixPath compares
+    case-sensitively, but APFS does not, so ``.SSH/id_ed25519`` IS the key
+    there. On a case-sensitive filesystem the refusal is merely cautious --
+    the fail-safe direction."""
+    parts = _folded(target)
+    for store, is_dir in forbidden:
+        store_parts = _folded(store)
+        if parts == store_parts or (
+            is_dir and parts[: len(store_parts)] == store_parts
+        ):
+            return True
+    return False
+
+
+def _shippable_git_hit(path: Path, forbidden: Sequence[tuple[PurePath, bool]]) -> bool:
+    """A path git's listing reported is a snapshot claim: it ships only if it is
+    a regular file now, and -- resolved, symlinks followed -- not a credential
+    store's."""
+    try:
+        return path.is_file() and not _is_forbidden(path.resolve(), forbidden)
+    except (OSError, RuntimeError):
+        return False
+
+
+def _classify_extras(
+    project_dir: Path, extras: Sequence[str], *, home: Path
+) -> tuple[list[Path], list[str]]:
+    shipped: list[Path] = []
+    warnings: list[str] = []
+    # Both sides resolved: a symlink inside the project that points out of it
+    # is outside, and so is a project reached through a symlinked parent.
+    root = project_dir.resolve()
+    forbidden = _forbidden_roots(home)
+    for extra in extras:
+        target = (project_dir / extra).resolve()
+        if not target.is_relative_to(root):
+            warnings.append(f"push: {extra} is outside the project; skipped")
+        elif _is_forbidden(target, forbidden):
+            warnings.append(f"push: {extra} is never pushed (credentials); skipped")
+        elif target.is_dir():
+            warnings.append(f"push: {extra} is a directory; list its files; skipped")
+        elif not target.is_file():
+            warnings.append(f"push: {extra} does not exist; skipped")
+        else:
+            shipped.append(_named_path(project_dir, extra, target, root))
+    return shipped, warnings
+
+
+def _named_path(project_dir: Path, extra: str, target: Path, root: Path) -> Path:
+    """Where a validated extra ships: the path the user WROTE, normalized
+    (``./a//b`` is ``a/b``), so a symlink ships under its own name rather than
+    its target's. Only when that name still lands on ``target`` and lies
+    lexically inside ``project_dir``; otherwise (a ``..`` through a symlinked
+    directory, which POSIX resolves differently from the lexical collapse)
+    the validated target's own place."""
+    named = Path(os.path.normpath(project_dir / extra))
+    if named.is_relative_to(project_dir) and named.resolve() == target:
+        return named
+    return project_dir / target.relative_to(root)
+
+
+def push_set(
+    project_dir: Path,
+    states: Sequence[LocalGitState],
+    *,
+    home: Path,
+    extras: Sequence[str] = (),
+) -> tuple[Path, ...]:
+    """The local files a bring-up ships beside the clone (spec §8).
+
+    Per repo, from git's ignored listing: ``.env``/``.env.*`` at any depth,
+    ``.claude/settings.local.json``, ``CLAUDE.local.md``, an ignored
+    ``.mcp.json``. A workspace root's own copies. Then ``extras`` (a project's
+    ``push``). Tracked files never ship, ignored directories are never
+    descended, nothing under ``home``'s credential stores ever ships, and an
+    extra must resolve (symlinks followed) inside ``project_dir``. A git hit
+    ships only while it is a regular file. The workspace-root listing runs only
+    when ``project_dir`` -- resolved -- is inside none of ``states``' repos
+    (``_inside_a_repo``). Sorted, unique, absolute."""
+    forbidden = _forbidden_roots(home)
+    found: list[Path] = []
+    for state in states:
+        found += [
+            hit
+            for hit in _from_git_listing(state.path, state.ignored)
+            if _shippable_git_hit(hit, forbidden)
+        ]
+    if not _inside_a_repo(project_dir, states):
+        found += _workspace_root_files(project_dir)
+    found += _classify_extras(project_dir, extras, home=home)[0]
+    return tuple(sorted(set(found), key=str))
+
+
+def push_warnings(
+    project_dir: Path, extras: Sequence[str], *, home: Path
+) -> tuple[str, ...]:
+    """Why an entry in a project's ``push`` will not ship -- missing, outside
+    the project, a directory, or a credential store. Warnings, never errors
+    (spec §8)."""
+    return tuple(_classify_extras(project_dir, extras, home=home)[1])
+
+
+def _resolved(path: Path) -> Path:
+    """``path`` resolved, or a NodeConfigError naming it: a recipe cannot place
+    a repo it cannot locate."""
+    try:
+        return path.resolve()
+    # RuntimeError: a symlink loop before Python 3.13; OSError from 3.13 on.
+    except (OSError, RuntimeError) as exc:
+        raise NodeConfigError(f"{path}: cannot be resolved ({exc})") from exc
+
+
+def recipe_for(
+    proj: ProjectConfig,
+    node: Node,
+    states: Sequence[LocalGitState],
+    *,
+    home: Path,
+    project_dir: Path,
+) -> Recipe:
+    """Everything a bring-up of ``proj`` on ``node`` needs (spec §7c).
+
+    ``project_dir`` is the resolved LOCAL project directory (a config path may
+    be baseDir-relative, so the caller resolves it). The node mirrors its NAME,
+    not its path: a repo project lands at ``<root>/<name>``, a workspace's
+    child repos at ``<root>/<name>/<child>``. Remote paths keep the root's
+    ``~`` unexpanded -- the node's shell owns that expansion, and bring_up.sh
+    reports the absolute paths back. The sid is ``psmux.session_name`` of the
+    same label every local session uses, so a node session and its window
+    share one name. Repo placement is judged on RESOLVED paths, like
+    ``push_set``: a project configured as a junction/symlink to its repo is
+    still that repo; a path that will not resolve is a NodeConfigError."""
+    project = proj.title or get_leaf_name(proj.path)
+    remote_root = f"{node.root.rstrip('/')}/{project_dir.name}"
+    root = _resolved(project_dir)
+    repos: list[RepoSpec] = []
+    for state in states:
+        repo = _resolved(state.path)
+        if repo == root:
+            remote_dir = remote_root
+        elif repo.parent == root:
+            remote_dir = f"{remote_root}/{state.path.name}"
+        else:
+            raise NodeConfigError(
+                f"{state.path} is neither the project nor a direct child of it; "
+                "a node project is one repo, or a folder of repos"
+            )
+        repos.append(
+            RepoSpec(url=state.url, branch=state.branch, remote_dir=remote_dir)
+        )
+    extras = tuple(proj.push or ())
+    memory = (
+        home / ".claude" / "projects" / encoded_project_dir(str(project_dir)) / "memory"
+    )
+    return Recipe(
+        project=project,
+        sid=session_name(project),
+        repos=tuple(repos),
+        push_files=push_set(project_dir, states, home=home, extras=extras),
+        memory_dir=memory if memory.is_dir() else None,
+        remote_root=remote_root,
+        warnings=push_warnings(project_dir, extras, home=home),
+    )
