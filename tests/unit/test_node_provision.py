@@ -2206,6 +2206,7 @@ HOME="$STATE/home/$user" USER="$user" \\
 """,
     "curl": """
 echo "$*" >> "$STATE/curl.log"
+if [ -e "$STATE/curl-fail" ]; then echo "curl: (6) Could not resolve host" >&2; exit 6; fi
 out=/dev/stdout; prev=""
 for a in "$@"; do [ "$prev" = -o ] && out=$a; prev=$a; done
 case "$*" in *https://claude.ai/install.sh*) ;; *) exit 22 ;; esac
@@ -2222,6 +2223,7 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 if [ -n "$y" ]; then
+  if [ -e "$STATE/keygen-y-fail" ]; then echo "Load key \\"$f\\": invalid format" >&2; exit 255; fi
   printf 'ssh-ed25519 AAAAFAKENODEKEY %s\\n' "$(cut -d' ' -f4- "$f")"
   exit 0
 fi
@@ -2723,6 +2725,61 @@ class TestSetupShUnderRealBash:
         assert _report(r).keys() == {
             "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
         }
+
+    # -- mutation killers (cq-F13) --------------------------------------------
+
+    def test_a_failed_installer_download_fails_claude_and_keeps_the_key(self, tmp_path):
+        # T28
+        state, env = _setup_box(tmp_path)
+        (state / "curl-fail").touch()
+        r = _run_setup(env)
+        assert r.returncode == 1
+        assert _rows(r)["claude:amin"] == "fail"
+        assert _report(r).keys() == {
+            "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+        }
+        assert list((state / "tmp").iterdir()) == []
+
+    def test_an_open_ssh_dir_and_key_file_are_made_private(self, tmp_path):
+        # T14/T15: the umask alone makes a NEW dir and file private; these
+        # already exist with open modes.
+        state, env = _setup_box(tmp_path)
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir()
+        ssh_dir.chmod(0o755)
+        authorized = ssh_dir / "authorized_keys"
+        authorized.write_text("ssh-ed25519 AAAAOTHER other@box\n", encoding="utf-8")
+        authorized.chmod(0o644)
+        r = _run_setup(env)
+        assert _rows(r)["authorized_keys:amin"] == "did"
+        assert ssh_dir.stat().st_mode & 0o777 == 0o700
+        assert authorized.stat().st_mode & 0o777 == 0o600
+
+    def test_a_bare_key_line_without_a_comment_is_already_authorized(self, tmp_path):
+        # T12
+        state, env = _setup_box(tmp_path)
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        authorized = ssh_dir / "authorized_keys"
+        bare = " ".join(PC_KEY.split()[:2]) + "\n"
+        authorized.write_text(bare, encoding="utf-8")
+        r = _run_setup(env)
+        assert _rows(r)["authorized_keys:amin"] == "skip"
+        assert authorized.read_text("utf-8") == bare
+
+    def test_an_unreadable_private_key_leaves_no_pub(self, tmp_path):
+        # T22: `> id.pub` creates the file before ssh-keygen -y runs; a
+        # failed derivation must not leave it behind, empty.
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        ssh_dir = state / "home" / "amin" / ".ssh"
+        (ssh_dir / "id_ed25519.pub").unlink()
+        (state / "keygen-y-fail").touch()
+        r = _run_setup(env)
+        assert r.returncode == 1
+        assert _rows(r)["node-key:amin"] == "fail"
+        assert not (ssh_dir / "id_ed25519.pub").exists()
+        assert set(_report(r).keys()) == set()
 
     def test_a_leading_zero_minor_is_decimal(self, tmp_path):
         # `3.08` would be an octal error in a bare (( )) -- the floor reads
