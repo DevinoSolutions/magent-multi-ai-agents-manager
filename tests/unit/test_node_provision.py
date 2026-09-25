@@ -3173,23 +3173,33 @@ def test_doctor_inlines_the_tmux_floor():
 
 
 def test_the_probe_bounds_fit_inside_the_doctor_call():
-    # Every bounded probe hanging at once, each killed after its grace, still
-    # leaves the report time to come back over ssh (connect included).
+    # Every bounded call hanging at once, each killed after its grace, still
+    # leaves the report time to come back over ssh (connect included). Counted
+    # per call, not per constant: VERSION_PROBE_S bounds five reads, and
+    # check_tool's one call site runs once per tool.
     text = node_scripts.script("doctor")
-    bounds = dict(re.findall(r"^([A-Z]+_PROBE_S)=(\d+)\b", text, re.MULTILINE))
-    assert set(bounds) == {
-        "CLAUDE_PROBE_S",
-        "GITHUB_PROBE_S",
-        "TMUX_PROBE_S",
-        "DF_PROBE_S",
-        "VERSION_PROBE_S",
+    code = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    bounds = {
+        name: int(value)
+        for name, value in re.findall(r"^([A-Z]+_PROBE_S)=(\d+)\b", text, re.MULTILINE)
     }
-    (grace,) = re.findall(r"^PROBE_KILL_S=(\d+)\b", text, re.MULTILINE)
-    # VERSION_PROBE_S bounds every `<tool> --version` in main plus `tmux -V`.
+    (grace,) = (
+        int(g) for g in re.findall(r"^PROBE_KILL_S=(\d+)\b", text, re.MULTILINE)
+    )
+    # No inline limit anywhere: `timeout` runs only inside bounded(), and
+    # every bounded call names one of the constants.
+    assert re.findall(r"\btimeout (.*)", code) == ['-k "$PROBE_KILL_S" "$seconds" "$@"']
+    sites = re.findall(r"\bbounded (\S+)", code)
+    assert all(re.fullmatch(r'"\$[A-Z]+_PROBE_S"', site) for site in sites), sites
+    uses = [site.strip('"$') for site in sites]
     tools = re.findall(r"^  check_tool \S+ (?:fail|warn) ", text, re.MULTILINE)
     assert len(tools) == 4
-    uses = dict.fromkeys(bounds, 1) | {"VERSION_PROBE_S": len(tools) + 1}
-    worst = sum(uses[name] * (int(b) + int(grace)) for name, b in bounds.items())
+    assert code.count('bounded "$VERSION_PROBE_S" "$@"') == 1  # check_tool's
+    uses += ["VERSION_PROBE_S"] * (len(tools) - 1)
+    assert set(uses) == set(bounds)
+    worst = sum(bounds[name] + grace for name in uses)
     assert worst + remote_mux.CONNECT_TIMEOUT_S < remote_mux.DOCTOR_TIMEOUT_S
 
 
