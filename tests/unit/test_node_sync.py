@@ -31,7 +31,7 @@ from magent.config import (
 )
 from magent.env import get_env
 from magent.lockfile import LockHeld, exclusive_lock
-from magent.log import heartbeat_age, write_heartbeat
+from magent.log import get_logger, heartbeat_age, write_heartbeat
 from magent.nodes import NodeMapEntry
 
 if TYPE_CHECKING:
@@ -385,6 +385,14 @@ def _record_pid(pid: int) -> None:
     node_sync._PID_PATH.write_text(str(pid))
 
 
+def _capture_nodes_log(caplog: pytest.LogCaptureFixture) -> None:
+    """Capture the nodes log at DEBUG. get_logger sets the configured level on
+    FIRST use, which would undo caplog's level if it ran afterwards, so the
+    logger is configured before caplog lowers it."""
+    get_logger(node_sync.LOG_NAME)
+    caplog.set_level(logging.DEBUG, logger=f"magent.{node_sync.LOG_NAME}")
+
+
 def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
 
@@ -481,7 +489,7 @@ class TestEnsureNodeSync:
         """After a crash or a reboot the pid file survives and Windows hands
         the number to an unrelated process. The lock is free, so there is no
         daemon: spawn one, and do not call the stranger a wedged daemon."""
-        caplog.set_level(logging.DEBUG, logger="magent.nodes")
+        _capture_nodes_log(caplog)
         _record_pid(unrelated.pid)
         assert launch.ensure_node_sync(_config(), "cfg.json") is True
         assert spawned == [launch.node_sync_argv("cfg.json")]
@@ -490,17 +498,20 @@ class TestEnsureNodeSync:
     def test_a_live_daemon_is_never_re_aimed_and_says_nothing(
         self, sync_on, spawned, daemon_lock, caplog
     ):
-        caplog.set_level(logging.DEBUG, logger="magent.nodes")
+        """The probe's LockHeld is the answer "a daemon is alive", caught
+        inside ensure_node_sync: it never escapes to the supervisor, which
+        would blame it on another server."""
+        _capture_nodes_log(caplog)
         _record_pid(os.getpid())
         write_heartbeat(node_sync.HEARTBEAT_NAME)
-        assert launch.ensure_node_sync(_config(), "other.json") is False
+        assert launch.ensure_node_sync(_config(), "other.json") is True
         assert spawned == []
         assert _warnings(caplog) == []
 
     def test_a_live_daemon_with_a_stale_heartbeat_is_reported_not_replaced(
         self, sync_on, spawned, daemon_lock, caplog
     ):
-        caplog.set_level(logging.DEBUG, logger="magent.nodes")
+        _capture_nodes_log(caplog)
         _record_pid(os.getpid())
         assert launch.ensure_node_sync(_config()) is False
         assert spawned == []
@@ -511,7 +522,7 @@ class TestEnsureNodeSync:
     def test_a_wedge_is_reported_once_and_its_recovery_once(
         self, sync_on, spawned, daemon_lock, caplog
     ):
-        caplog.set_level(logging.DEBUG, logger="magent.nodes")
+        _capture_nodes_log(caplog)
         _record_pid(os.getpid())
         launch.ensure_node_sync(_config())
         launch.ensure_node_sync(_config())
@@ -524,20 +535,48 @@ class TestEnsureNodeSync:
         assert spawned == []
 
 
-class TestServeSupervisesTheDaemon:
-    def test_the_supervisor_stands_down_when_the_env_says_no(self, monkeypatch):
-        from magent import upload_server
+def _run_supervisor(
+    config_path: str | None, stop: threading.Event, *, interval: float = 0.0
+) -> None:
+    """Run serve's node sync supervisor on its own thread, bounded: a loop
+    that never reaches its stop fails the test instead of hanging it."""
+    from magent import upload_server
 
+    thread = threading.Thread(
+        target=upload_server._supervise_node_sync,
+        args=(config_path, stop),
+        kwargs={"interval": interval},
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=10)
+    alive = thread.is_alive()
+    stop.set()  # release a runaway loop before failing
+    assert not alive, "the supervisor loop never stopped"
+
+
+def _one_tick() -> threading.Event:
+    """A stop that is already set: the loop runs exactly one iteration."""
+    stop = threading.Event()
+    stop.set()
+    return stop
+
+
+class TestServeSupervisesTheDaemon:
+    def test_the_supervisor_stands_down_when_the_env_says_no(
+        self, tmp_config, monkeypatch
+    ):
+        monkeypatch.setenv("MAGENT_NODE_SYNC", "0")
+        monkeypatch.setattr("magent.env._cached_env", None)
+        path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
         monkeypatch.setattr(
             launch, "ensure_node_sync", lambda *a, **k: pytest.fail("ensured")
         )
-        upload_server._supervise_node_sync(None, threading.Event(), interval=999)
+        _run_supervisor(path, threading.Event(), interval=999)
 
     def test_the_supervisor_ensures_the_daemon_with_serves_config(
         self, sync_on, tmp_config, monkeypatch
     ):
-        from magent import upload_server
-
         path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
         stop = threading.Event()
         seen: list[str | None] = []
@@ -548,14 +587,12 @@ class TestServeSupervisesTheDaemon:
             return False
 
         monkeypatch.setattr(launch, "ensure_node_sync", ensure)
-        upload_server._supervise_node_sync(path, stop, interval=0)
+        _run_supervisor(path, stop)
         assert seen == [path]
 
     def test_the_config_is_read_once_until_it_changes(
         self, sync_on, tmp_config, monkeypatch
     ):
-        from magent import upload_server
-
         path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
         stop = threading.Event()
         loads: list[str] = []
@@ -572,9 +609,55 @@ class TestServeSupervisesTheDaemon:
             return False
 
         monkeypatch.setattr(launch, "ensure_node_sync", ensure)
-        upload_server._supervise_node_sync(path, stop, interval=0)
+        _run_supervisor(path, stop)
         assert len(seen) == 2
         assert len(loads) == 1
+
+    def test_a_lock_held_inside_the_ensure_is_not_blamed_on_another_server(
+        self, sync_on, tmp_config, monkeypatch, caplog
+    ):
+        """Only the SUPERVISOR lock means another serve is supervising. Any
+        other LockHeld is a failed check and is logged as one."""
+        _capture_nodes_log(caplog)
+        path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
+
+        def ensure(_config, _config_path=None):
+            raise LockHeld("some other lock is held by another process")
+
+        monkeypatch.setattr(launch, "ensure_node_sync", ensure)
+        _run_supervisor(path, _one_tick())
+        messages = [r.getMessage() for r in caplog.records]
+        assert "node sync supervisor: check failed" in messages
+        assert not any("another server" in m for m in messages)
+
+    def test_another_supervisor_is_still_named_as_such(
+        self, sync_on, tmp_config, monkeypatch, caplog
+    ):
+        _capture_nodes_log(caplog)
+        path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
+        monkeypatch.setattr(
+            launch, "ensure_node_sync", lambda *a, **k: pytest.fail("ensured")
+        )
+        with exclusive_lock(node_sync.SUPERVISOR_LOCK_NAME):
+            _run_supervisor(path, _one_tick())
+        assert any("another server" in r.getMessage() for r in caplog.records)
+
+    def test_a_config_lookup_that_raises_is_logged_and_survived(
+        self, sync_on, monkeypatch, caplog
+    ):
+        """serve's cwd deleted and no --config: Path.cwd() raises on POSIX.
+        That is one failed tick, logged, not a thread that dies in silence."""
+        _capture_nodes_log(caplog)
+
+        def gone(_path=None):
+            raise FileNotFoundError("the working directory is gone")
+
+        monkeypatch.setattr("magent.paths.find_config", gone)
+        _run_supervisor(None, _one_tick())
+        assert any(
+            r.getMessage() == "node sync supervisor: check failed"
+            for r in caplog.records
+        )
 
     def test_serve_starts_the_node_sync_supervisor(self, monkeypatch):
         from magent import upload_server

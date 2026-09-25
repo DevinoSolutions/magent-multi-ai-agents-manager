@@ -1541,15 +1541,27 @@ def _supervise_node_sync(
     if not node_sync_env_enabled():
         log.info("node sync supervisor: disabled by MAGENT_NODE_SYNC")
         return
-    watch = ConfigWatch(find_config(config_path))
+    watch: ConfigWatch | None = None
     while True:
         try:
+            # Inside the try: with serve's cwd deleted and no --config,
+            # find_config raises, and that is one failed tick, not a dead thread.
+            if watch is None:
+                watch = ConfigWatch(find_config(config_path))
             config = watch.current()
             if config is not None:
-                with exclusive_lock(SUPERVISOR_LOCK_NAME):
-                    ensure_node_sync(config, config_path)
-        except LockHeld:
-            log.debug("node sync supervisor: another server is supervising the daemon")
+                with contextlib.ExitStack() as held:
+                    # ONLY this lock means another serve is supervising; a
+                    # LockHeld from anywhere else is a failed check below.
+                    try:
+                        held.enter_context(exclusive_lock(SUPERVISOR_LOCK_NAME))
+                    except LockHeld:
+                        log.debug(
+                            "node sync supervisor: another server is supervising "
+                            "the daemon"
+                        )
+                    else:
+                        ensure_node_sync(config, config_path)
         except Exception:
             log.exception("node sync supervisor: check failed")
         if stop_event.wait(interval):
