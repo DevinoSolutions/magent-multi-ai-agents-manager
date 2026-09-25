@@ -2,8 +2,9 @@
 
 What a node IS (``Node``), what running a project there NEEDS (``Recipe``:
 repos, files to push, the auto-memory dir), and where node data lives on this
-PC (``~/.magent/nodes/``). No subprocess, ever: everything that touches a node
-or runs git is ``remote_mux``. This module decides; it never does.
+PC (``~/.magent/nodes/``). Everything that touches a node or runs git is
+``remote_mux``. A leaf: never imports magent.cli, never spawns a process. Its
+only I/O is the node-map file and local stat()s.
 """
 
 from __future__ import annotations
@@ -71,8 +72,8 @@ class RepoSpec:
 
 @dataclass(frozen=True)
 class Recipe:
-    """Everything needed to run one project somewhere else (spec §3). The node
-    backend consumes it; any future backend consumes the same tuple."""
+    """Everything needed to run one project somewhere else (master plan §3). The
+    node backend consumes it; any future backend consumes the same Recipe."""
 
     project: str
     sid: str
@@ -98,7 +99,8 @@ class LoadSample:
 
 
 def encoded_project_dir(path: str) -> str:
-    """The ``~/.claude/projects/<name>`` for a session whose cwd is ``path`` --
-    on this PC or on a node; the rule is the CLI's, not the OS's. Delegates to
-    the one encoder, never a second copy."""
+    """The directory NAME under ~/.claude/projects/ for a session whose cwd is
+    the absolute path ``path``, on this PC or on a node. A ``~``-relative path
+    names the wrong directory; expand it first. The rule is the CLI's, not the
+    OS's: this delegates to the one encoder, never a second copy."""
     return encode_claude_project_path(path)

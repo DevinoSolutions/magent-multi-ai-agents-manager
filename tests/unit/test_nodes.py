@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import dataclasses
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from magent import nodes
 from magent.nodes import LoadSample, LocalGitState, Node, Recipe, RepoSpec
-from magent.sessions.claude import encode_claude_project_path
 from tests.conftest import REAL_MAGENT_DIR
 
 NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
@@ -82,21 +83,36 @@ class TestTheDataShapes:
 
 class TestTheNodeStoreLayout:
     def test_the_store_lives_under_magent_nodes(self):
-        # Path.home() is the test's redirected home; this holds only because
-        # tests/conftest.py registers both constants as import-bound.
-        # Operand order: ruff SIM300 reads the UPPERCASE attribute as a constant
-        # and would flag `nodes.NODES_DIR == ...` as a Yoda condition.
-        assert Path.home() / ".magent" / "nodes" == nodes.NODES_DIR
-        assert nodes.NODE_MAP_PATH == nodes.NODES_DIR / "node-map.json"
+        # In this process tests/conftest.py has monkeypatched both constants
+        # (they are import-bound), so reading them here would pin the patch.
+        # A fresh child imports the PRODUCT's own binding; it inherits the
+        # redirected home (no explicit env=), so Path.home() there is tmp.
+        out = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from magent import nodes; print(nodes.NODES_DIR); print(nodes.NODE_MAP_PATH)",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.splitlines()
+        assert out == [
+            str(Path.home() / ".magent" / "nodes"),
+            str(Path.home() / ".magent" / "nodes" / "node-map.json"),
+        ]
 
-    def test_no_test_can_reach_the_real_store(self):
-        assert not nodes.NODE_MAP_PATH.is_relative_to(REAL_MAGENT_DIR)
+    @pytest.mark.parametrize("name", ["NODES_DIR", "NODE_MAP_PATH"])
+    def test_no_test_can_reach_the_real_store(self, name):
+        assert not getattr(nodes, name).is_relative_to(REAL_MAGENT_DIR)
 
 
 class TestEncodedProjectDir:
-    def test_it_is_claude_codes_own_encoding(self):
-        path = r"C:\Users\amind\AppData\Local\Temp\capture_cc"
-        assert nodes.encoded_project_dir(path) == encode_claude_project_path(path)
+    def test_it_delegates_to_the_one_encoder(self, monkeypatch):
+        # An inlined copy of the encoder would still match it on any input;
+        # only a patched encoder proves the wrapper calls through.
+        monkeypatch.setattr(nodes, "encode_claude_project_path", lambda p: "sentinel")
+        assert nodes.encoded_project_dir("/anything") == "sentinel"
 
     def test_a_node_side_path_encodes_by_the_same_rule(self):
         assert (
