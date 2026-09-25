@@ -604,7 +604,11 @@ class TestSample:
             "bool-reading",
         ],
     )
-    def test_a_malformed_number_is_not_a_load_sample(self, fake_ssh, field):
+    def test_a_malformed_number_is_not_a_load_sample(self, monkeypatch, field):
+        # This is a parsing test, not a transport test: no fake ssh is
+        # spawned. run_script is stubbed to hand sample() the malformed
+        # stdout directly, so the OverflowError/ValueError/TypeError catch
+        # inside sample() is exercised without a subprocess round trip.
         good = {
             "ts": "1727200000",
             "nproc": "16",
@@ -617,7 +621,14 @@ class TestSample:
         }
         key = field.split(":", 1)[0].strip('"')
         body = ", ".join(field if k == key else f'"{k}": {v}' for k, v in good.items())
-        fake_ssh.set_reply("bash -s", stdout="{" + body + "}\n")
+        stdout = ("{" + body + "}\n").encode("utf-8")
+
+        def fake_run_script(
+            node: Node, script: str, args: list[str], *, timeout_s: float, stdin=None
+        ) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.CompletedProcess([], 0, stdout, b"")
+
+        monkeypatch.setattr(remote_mux, "run_script", fake_run_script)
         with pytest.raises(RemoteError, match="not a load sample"):
             remote_mux.sample(NODE)
 
