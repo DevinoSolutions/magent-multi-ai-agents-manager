@@ -270,7 +270,7 @@ def _parse_nodes(raw: dict[str, object]) -> dict[str, NodeConfig]:
     entry that is not an object, or has no string ``host``, is skipped here --
     load_config's validation is what refuses a malformed pool loudly."""
     nodes: dict[str, NodeConfig] = {}
-    for nick, value in _obj(raw, "nodes").items():
+    for nick, value in raw.items():
         if not isinstance(value, dict):
             continue
         host = _str_or_none(value, "host")
@@ -307,7 +307,7 @@ def _parse_settings(raw: dict[str, object] | None) -> Settings:
         window_title_prefix=_bool(raw, "windowTitlePrefix", True),
         ssh=_parse_ssh(_obj(raw, "ssh")),
         attention=_parse_attention(_obj(raw, "attention")),
-        nodes=_parse_nodes(raw),
+        nodes=_parse_nodes(_obj(raw, "nodes")),
         node_sync=_parse_node_sync(_obj(raw, "nodeSync")),
         tools=_tools(raw, DEFAULT_TOOLS),
     )
@@ -353,7 +353,7 @@ def settings_to_dict(settings: Settings) -> dict[str, object]:
             "debounceS": settings.attention.debounce_s,
             "stateTtlDays": settings.attention.state_ttl_days,
         },
-        "nodes": {nick: _node_to_dict(node) for nick, node in settings.nodes.items()},
+        "nodes": {node.nick: _node_to_dict(node) for node in settings.nodes.values()},
         "nodeSync": {
             "pullIntervalS": settings.node_sync.pull_interval_s,
             "sampleIntervalS": settings.node_sync.sample_interval_s,

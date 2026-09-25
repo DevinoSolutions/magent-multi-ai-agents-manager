@@ -175,7 +175,7 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
         "`{}`",
         (
             'Pool machines a project can run on, keyed by nick: `{"second": {"host": '
-            '"devino-second", "user": "amin", "root": "~/magent"}}`. A nick is 1-6 '
+            '"build-box", "user": "alice", "root": "~/magent"}}`. A nick is 1-6 '
             "characters of `a-z`, `0-9` and `-` (it is drawn in the status bar); "
             "`auto` and `cloud` are reserved. `user` defaults to your local username at use time; "
             "`root` is where project clones live on the node."

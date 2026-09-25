@@ -86,6 +86,22 @@ class TestTheNodePoolParses:
         with pytest.raises(dataclasses.FrozenInstanceError):
             NodeSyncConfig().history_h = 1  # type: ignore[misc]  # reason: asserting immutability
 
+    def test_the_typed_view_skips_what_validation_will_refuse(self):
+        # Lenient on purpose: load_config's validation is the loud gate, this
+        # is only the typed view, and it must never raise on a shape the
+        # validator has not seen yet.
+        settings = _parse_settings(
+            {
+                "nodes": {
+                    "a": "str",
+                    "b": {"user": "u"},
+                    "c": {"host": 22},
+                    "d": {"host": "h"},
+                }
+            }
+        )
+        assert list(settings.nodes) == ["d"]
+
 
 class TestTheNodePoolSerializes:
     def test_the_factory_emits_an_empty_pool_and_the_sync_defaults(self):
