@@ -1334,6 +1334,32 @@ class TestTheUrlSecretMask:
     @pytest.mark.parametrize(
         ("text", "shown"),
         [
+            # What follows the host is not part of the test: a quote, a
+            # bracket, a comma or a ";" after it still masks the password.
+            (
+                f"fatal: repository 'amin:{PASSWORD}@git.example.com' not found",
+                "fatal: repository '***@git.example.com' not found",
+            ),
+            (f'remote "amin:{PASSWORD}@h.com"', 'remote "***@h.com"'),
+            (f"(amin:{PASSWORD}@h.com)", "(***@h.com)"),
+            (
+                f"hosts amin:{PASSWORD}@a.example.com, b",
+                "hosts ***@a.example.com, b",
+            ),
+            (f"url=amin:{PASSWORD}@h.com;", "url=***@h.com;"),
+            # ... nor does a ":" before the user: a path's own colon.
+            (
+                f"clone of /srv/x:amin:{PASSWORD}@host/r failed",
+                "clone of /srv/x:***@host/r failed",
+            ),
+        ],
+    )
+    def test_a_schemeless_userinfo_before_any_punctuation_is_masked(self, text, shown):
+        assert node_apply._unauth(text) == shown
+
+    @pytest.mark.parametrize(
+        ("text", "shown"),
+        [
             ("https://example.com?mail=a@b.com", "https://example.com?***"),
             ("https://example.com:8443?next=u@x.org", "https://example.com:8443?***"),
         ],
@@ -1451,6 +1477,27 @@ class TestThePlugins:
         assert line.status == "warn"
         assert f"cannot clone {shown}" in line.detail
         assert _installs(claude) == []
+
+    def test_a_failed_add_whose_stderr_quotes_a_schemeless_remote_prints_no_password(
+        self, box, tmp_path, capsys
+    ):
+        # git names the remote without its scheme, in quotes.
+        claude = _claude(box, markets=())
+        claude.set_reply(
+            "marketplace add",
+            stderr=f"fatal: repository 'amin:{PASSWORD}@git.example.com' not found\n",
+            rc=1,
+        )
+        box.apply(_work(tmp_path, replace(PLUGGED, marketplaces={"mkt": SECRET_URL})))
+        out = capsys.readouterr()
+        assert PASSWORD not in out.out + out.err
+        (line,) = [
+            line
+            for line in remote_mux.parse_report(out.out).lines
+            if line.item == "marketplace:mkt"
+        ]
+        assert line.status == "warn"
+        assert "repository '***@git.example.com' not found" in line.detail
 
     def test_a_plugin_id_is_never_taken_for_userinfo(self, box, tmp_path, capsys):
         # The masks want a "//" before the "@": a plugin id has none.
@@ -1665,7 +1712,7 @@ class TestThePlugins:
     @pytest.mark.parametrize("broken", ["plugin list", "plugin marketplace list"])
     @pytest.mark.parametrize(
         ("stdout", "rc"),
-        [("", 1), ("[]", 1), ("not json", 0), ('{"id": "p@mkt"}', 0)],
+        [("", 1), ("[]", 1), ("[]", 2), ("not json", 0), ('{"id": "p@mkt"}', 0)],
     )
     def test_a_listing_claude_cannot_answer_fails_and_installs_nothing(
         self, box, tmp_path, capsys, broken, stdout, rc
@@ -1810,11 +1857,24 @@ class TestWhatTheNodeCanRun:
             ": noop",
             "pushd .claude && x",
             "popd",
+            # A // or \\ that is a regex, a comment, an operator or an
+            # escape -- not a UNC share (no host, separator and share).
+            "awk '//{print}' f",
+            "sed -e '//d' f",
+            'grep "\\\\d+" f',
+            "printf '\\\\n'",
+            "jq -r '.a //\"b\"'",
+            "jq -r '.dir //\"/tmp/x\"' f",
+            "printf '\\\\\"x\\n'",
+            "node -e '//c\\nrun()'",
+            'python3 -c "print(7 //2)"',
         ],
     )
     def test_a_command_bash_would_run_or_that_cannot_be_judged_is_kept(
         self, box, tmp_path, capsys, command
     ):
+        for name in ("awk", "sed", "grep", "printf", "jq", "node", "python3"):
+            box.add(name)
         box.apply(_work(tmp_path, _pc_settings(_stop_hook(command))))
         assert _drops(_lines(capsys), "hook:Stop") == []
         assert command in _commands(_json(_settings(box)), "Stop")
@@ -2552,6 +2612,13 @@ class _HungUp(io.TextIOBase):
         self.pending.clear()
         self.dead = bool(self.rows)
 
+    def close(self) -> None:
+        # IOBase closes -- and so flushes -- the double when it is collected,
+        # after the test, a failed one included: a still-dead flush would
+        # raise there, outside any test.
+        self.where = "closed"
+        super().close()
+
 
 # What a write into a dead pipe raises. OSError(EPIPE) is built as a
 # BrokenPipeError by OSError itself; Windows raises a plain OSError(EINVAL),
@@ -2649,9 +2716,6 @@ class TestAPcThatHangsUpDoesNotStopTheApply:
         for row in met:
             assert TOKEN not in row and PASSWORD not in row
             assert row.split("\t")[2] == f"{node_apply._MASK} https://***@h/x?***\n"
-        # IOBase closes -- and so flushes -- the double when it is collected;
-        # a still-dead flush would raise there, outside any test.
-        pipe.where = "closed"
 
     def test_a_real_descriptor_is_pointed_at_the_null_device_and_nothing_leaks(
         self, box, tmp_path, monkeypatch, capsys

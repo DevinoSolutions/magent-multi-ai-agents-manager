@@ -75,9 +75,11 @@ _QUERY = re.compile(r"(?<=//)([^\s?#]*)\?[^\s#]*")
 #   password may hold an "@" (git's own parse, a memrchr);
 _AUTH = re.compile(r"(?<=//)[^\s/?#]*@")
 # - a scheme-less user:password@host. It wants the ":" before the "@" and a
-#   host after it, so git@github.com:o/r.git, @scope/pkg@1.2 and a plugin id
-#   such as p@mkt are left alone.
-_BARE = re.compile(r"(?<![\w.%+:/@-])[\w.%+-]+:[^\s/?#]*@(?=[\w.-]+[:/\s]|[\w.-]+$)")
+#   host's first character after it, so git@github.com:o/r.git, @scope/pkg@1.2
+#   and a plugin id such as p@mkt are left alone. What follows the host is not
+#   asked about: git quotes a remote, and a bracket, "," or ";" may end it. A
+#   ":" may come before the user -- a path's own, as in /srv/x:user:pw@host.
+_BARE = re.compile(r"(?<![\w.%+/@-])[\w.%+-]+:[^\s/?#]*@(?=[\w.-])")
 
 
 def _unauth(text: str) -> str:
@@ -398,11 +400,17 @@ def _last(ctx: Ctx, text: str) -> str:
 # A drive-letter path (C:\ or C:/) or a UNC share (\\nas\x or //nas/x)
 # starting ANY word -- the program or an argument (node "C:\...\notify.mjs")
 # -- names a file only the PC has. Anchored on the left, so a URL's "s://"
-# or "e:///" is never one.
-# Accepted false positive: an scp-style single-letter host (``scp a:/x .``)
-# reads as a drive letter and drops the hook -- such a hook is vanishingly
-# rare, and keeping a PC path the node cannot run is the worse failure.
-_WINDOWS_PATH = re.compile(r"(^|[\s\"'=(])(?:[A-Za-z]:[\\/]|\\\\[^\\\s]|//[^/\s])")
+# or "e:///" is never one. A share needs a host, a separator and a share
+# name, so a bare // or \\ (awk '//{print}', grep "\\d+", 7 //2) is not one.
+# Accepted false positives, each dropping a hook the node could run -- rare,
+# and keeping a PC path the node cannot run is the worse failure:
+# - an scp-style single-letter host (``scp a:/x .``) reads as a drive letter;
+# - a //host/path word (``cat //etc/hosts``, ``git -C //srv/repo``,
+#   ``--base=//cdn.example.com/lib``) cannot be told from a //nas/share,
+#   nor can a POSIX path spelled with a leading // (``//usr/local/bin/x``).
+_WINDOWS_PATH = re.compile(
+    r"(^|[\s\"'=(])(?:[A-Za-z]:[\\/]|\\\\[^\\/\s\"']+\\[^\\\s]|//[^/\s\"']+/[^/\s])"
+)
 # Where an unquoted word ends, in the raw command text.
 _WORD_END = re.compile(r"[\s\"';&|)]")
 # Any word ending .exe names a program only the PC runs.
