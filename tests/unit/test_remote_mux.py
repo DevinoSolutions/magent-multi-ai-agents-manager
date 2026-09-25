@@ -1248,7 +1248,16 @@ def _script_run(mode: str) -> str:
 
 
 @pytest.fixture
-def node_home(fake_ssh, monkeypatch):
+def patient_probe(monkeypatch):
+    """The HOME probe's budget in these tests only. The fake ssh is a Python
+    shim; on a loaded Windows box its start alone has overrun the product's
+    10s (a green test failing as "timed out"). What a probe timeout DOES is
+    pinned elsewhere with its own override."""
+    monkeypatch.setattr(remote_mux, "PROBE_TIMEOUT_S", 60.0)
+
+
+@pytest.fixture
+def node_home(fake_ssh, monkeypatch, patient_probe):
     monkeypatch.setattr(psmux, "code_on_path", lambda: False)
     fake_ssh.set_reply("printenv HOME", stdout="/home/amin\n")
     return fake_ssh
@@ -1355,7 +1364,7 @@ class TestOneConnectionBringsAProjectUp:
         assert remote_mux.bring_up(NODE, _recipe(tmp_path)).attached_existing is True
 
     def test_a_home_that_is_not_absolute_stops_before_the_script(
-        self, fake_ssh, tmp_path
+        self, fake_ssh, patient_probe, tmp_path
     ):
         fake_ssh.set_reply("printenv HOME", stdout="\n")
         with pytest.raises(RemoteError, match="HOME"):
@@ -1383,6 +1392,50 @@ class TestOneConnectionBringsAProjectUp:
         with pytest.raises(RemoteError, match="not a bring-up result"):
             remote_mux.bring_up(NODE, _recipe(tmp_path))
 
+    def test_a_home_refusal_names_the_probe_that_ran(
+        self, fake_ssh, patient_probe, tmp_path
+    ):
+        # RemoteError's law: command_redacted is what RAN, as _run_shown says it.
+        fake_ssh.set_reply("printenv HOME", stdout="\n")
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(NODE, _recipe(tmp_path))
+        assert info.value.command_redacted == (
+            "ssh",
+            *remote_mux.SSH_BATCH_OPTS,
+            NODE.target,
+            _wrapped(["printenv", "HOME"]),
+        )
+
+    def test_an_unreadable_result_names_the_script_run_that_ran(
+        self, node_home, tmp_path
+    ):
+        node_home.set_reply("bash -s --", stdout="hello\n")
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(NODE, _recipe(tmp_path))
+        call = node_home.calls()[1]
+        assert info.value.command_redacted == (
+            "ssh",
+            *remote_mux.SSH_BATCH_OPTS,
+            NODE.target,
+            _script_run("up"),
+            f"<stdin: {len(call.stdin)} bytes>",
+        )
+
+    def test_a_delivered_payload_is_framed_once(self, node_home, tmp_path, monkeypatch):
+        # The frame is a copy of the payload (up to 64 MiB): the run builds
+        # it, and a SUCCESS never builds a second one just to name it.
+        framed: list[str] = []
+        real = remote_mux._script_call
+
+        def spy(script, args, stdin):
+            framed.append(script)
+            return real(script, args, stdin)
+
+        monkeypatch.setattr(remote_mux, "_script_call", spy)
+        _answers(node_home)
+        remote_mux.bring_up(NODE, _recipe(tmp_path))
+        assert framed == ["bring_up"]
+
     def test_a_nul_in_a_command_is_refused(self, node_home, tmp_path):
         with pytest.raises(ValueError, match="NUL"):
             remote_mux.bring_up(NODE, _recipe(tmp_path, command="claude\0x"))
@@ -1402,8 +1455,8 @@ class TestTheBringUpStaysInsideItsFolders:
         outside.write_text("not yours\n", encoding="utf-8")
         with pytest.raises(ValueError, match="outside"):
             remote_mux.bring_up(NODE, _recipe(tmp_path, push_files=(outside,)))
-        # The home probe only; the script never ran.
-        assert len(node_home.calls()) == 1
+        # Every file is vetted and read before any ssh.
+        assert node_home.calls() == []
 
     def test_a_symlink_that_leaves_the_project_is_refused(self, node_home, tmp_path):
         # A string check on the config entry cannot see this: the link sits
@@ -1419,7 +1472,7 @@ class TestTheBringUpStaysInsideItsFolders:
             pytest.skip("this account cannot create symlinks")
         with pytest.raises(ValueError, match="outside"):
             remote_mux.bring_up(NODE, dataclasses.replace(recipe, push_files=(link,)))
-        assert len(node_home.calls()) == 1
+        assert node_home.calls() == []
 
     @pytest.mark.parametrize(
         ("rel", "name"),
@@ -1468,6 +1521,524 @@ class TestTheBringUpStaysInsideItsFolders:
         with pytest.raises(NodeConfigError, match="absolute"):
             remote_mux.push_files(NODE, _recipe(tmp_path, remote_root="-rf"))
         assert len(node_home.calls()) == 1
+
+
+def _in_thread(fn, *, timeout_s: float = 20.0) -> BaseException | None:
+    """Run ``fn`` on a daemon thread and return what it raised (None for a
+    clean return). A call still running after ``timeout_s`` FAILS the test
+    rather than hanging it: the FIFO pins prove "refused", not "blocked"."""
+    import threading
+
+    outcome: list[BaseException | None] = []
+
+    def body() -> None:
+        try:
+            fn()
+        except BaseException as e:  # noqa: BLE001 # reason: handed back to the test verbatim
+            outcome.append(e)
+        else:
+            outcome.append(None)
+
+    worker = threading.Thread(target=body, daemon=True)
+    worker.start()
+    worker.join(timeout_s)
+    assert not worker.is_alive(), f"still running after {timeout_s}s -- it blocked"
+    return outcome[0]
+
+
+needs_fifo = pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs")
+
+
+class TestAPushFileIsReadAsVetted:
+    """What ships is the regular file that was vetted, read through the path
+    it resolved to, bounded in size -- and every refusal lands before any
+    ssh."""
+
+    def test_the_resolved_path_is_the_one_opened(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        recipe = _recipe(tmp_path)
+        assert recipe.local_root is not None
+        real = recipe.local_root / "real.env"
+        real.write_bytes(b"REAL=1\n")
+        link = recipe.local_root / "linked.env"
+        _link_or_skip(link, real)
+        opened: list[str] = []
+        real_open = os.open
+
+        def spy(path, flags, *args):
+            opened.append(os.fspath(path))
+            return real_open(path, flags, *args)
+
+        monkeypatch.setattr(remote_mux.os, "open", spy)
+        _answers(node_home)
+        remote_mux.bring_up(NODE, dataclasses.replace(recipe, push_files=(link,)))
+        # The in-project link keeps its OWN name on the node (lexical)...
+        members = _members(node_home.calls()[1].stdin)
+        assert members["project/linked.env"] == b"REAL=1\n"
+        assert "project/real.env" not in members
+        # ...and the bytes come from the path the containment check resolved.
+        assert os.path.realpath(real) in opened
+        assert os.fspath(link) not in opened
+
+    def test_a_folder_is_not_a_push_file(self, node_home, tmp_path):
+        recipe = _recipe(tmp_path)
+        assert recipe.local_root is not None
+        folder = recipe.local_root / "config"
+        folder.mkdir()
+        with pytest.raises(ValueError, match="not a regular file"):
+            remote_mux.bring_up(NODE, dataclasses.replace(recipe, push_files=(folder,)))
+        assert node_home.calls() == []
+
+    @needs_fifo
+    def test_a_fifo_push_file_is_refused_not_read(self, node_home, tmp_path):
+        recipe = _recipe(tmp_path)
+        assert recipe.local_root is not None
+        fifo = recipe.local_root / "pipe.env"
+        os.mkfifo(fifo)
+        raised = _in_thread(
+            lambda: remote_mux.bring_up(
+                NODE, dataclasses.replace(recipe, push_files=(fifo,))
+            )
+        )
+        assert isinstance(raised, ValueError)
+        assert "not a regular file" in str(raised)
+        assert node_home.calls() == []
+
+    @needs_fifo
+    def test_a_fifo_in_memory_is_skipped_not_read(self, node_home, tmp_path):
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        os.mkfifo(recipe.memory_dir / "pipe.md")
+        _answers(node_home)
+        assert _in_thread(lambda: remote_mux.bring_up(NODE, recipe)) is None
+        members = _members(node_home.calls()[1].stdin)
+        assert "memory/pipe.md" not in members
+        assert "memory/MEMORY.md" in members
+        assert "pipe.md" in _nodes_log()
+
+    def test_an_oversize_push_file_is_refused_unopened(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(remote_mux, "PUSH_FILE_MAX_BYTES", 4)
+
+        def never(*_args):
+            raise AssertionError("an oversize file was opened")
+
+        monkeypatch.setattr(remote_mux.os, "open", never)
+        with pytest.raises(ValueError, match="15 bytes") as info:
+            remote_mux.bring_up(NODE, _recipe(tmp_path))
+        assert ".env" in str(info.value)
+        assert node_home.calls() == []
+
+    def test_a_push_set_over_the_payload_cap_is_refused(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        recipe = _recipe(tmp_path)
+        assert recipe.local_root is not None
+        second = recipe.local_root / ".env.local"
+        second.write_bytes(b"SECRET=hunter3\n")
+        monkeypatch.setattr(remote_mux, "PAYLOAD_MAX_BYTES", 20)
+        with pytest.raises(ValueError, match="20") as info:
+            remote_mux.bring_up(
+                NODE,
+                dataclasses.replace(recipe, push_files=(*recipe.push_files, second)),
+            )
+        assert ".env.local" in str(info.value)
+        assert node_home.calls() == []
+
+    def test_an_oversize_memory_file_is_skipped_not_fatal(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        (recipe.memory_dir / "huge.md").write_bytes(b"x" * 100)
+        monkeypatch.setattr(remote_mux, "PUSH_FILE_MAX_BYTES", 16)
+        _answers(node_home)
+        remote_mux.bring_up(NODE, recipe)
+        members = _members(node_home.calls()[1].stdin)
+        assert "memory/huge.md" not in members
+        assert members["memory/MEMORY.md"] == b"- remember\n"
+        assert "huge.md" in _nodes_log()
+
+    def test_memory_past_the_payload_cap_is_skipped_not_fatal(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        # .env is 15 bytes; MEMORY.md's 11 would take the payload to 26.
+        monkeypatch.setattr(remote_mux, "PAYLOAD_MAX_BYTES", 20)
+        _answers(node_home)
+        remote_mux.bring_up(NODE, _recipe(tmp_path))
+        members = _members(node_home.calls()[1].stdin)
+        assert members["project/.env"] == b"SECRET=hunter2\n"
+        assert "memory/MEMORY.md" not in members
+        assert "MEMORY.md" in _nodes_log()
+
+    def test_the_caps(self):
+        assert remote_mux.PUSH_FILE_MAX_BYTES == 16 * 1024 * 1024
+        assert remote_mux.PAYLOAD_MAX_BYTES == 64 * 1024 * 1024
+
+
+_STAT_FIELDS = (
+    "st_mode",
+    "st_ino",
+    "st_dev",
+    "st_nlink",
+    "st_uid",
+    "st_gid",
+    "st_size",
+    "st_atime",
+    "st_mtime",
+    "st_ctime",
+)
+
+
+def _lstat_lies(
+    monkeypatch, path: Path, *, like: Path | None = None, **changes: int
+) -> None:
+    """``os.lstat(path)`` answers ``like``'s stat (default: ``path``'s own,
+    through any link) with ``changes`` -- the file as it looked BEFORE a swap,
+    so each pin reaches the one guard that runs after the lstat. A call is
+    matched by abspath, never realpath (posixpath.realpath calls os.lstat
+    itself), against both names ``path`` goes by: its own, and the resolved
+    one a caller may have vetted it under."""
+    real_lstat = os.lstat
+    want = {
+        os.path.normcase(os.path.abspath(path)),
+        os.path.normcase(os.path.realpath(path)),
+    }
+    base = os.stat(like if like is not None else path)
+    lie = os.stat_result(
+        [changes.get(name, getattr(base, name)) for name in _STAT_FIELDS]
+    )
+
+    def fake(p, *args, **kwargs):
+        if os.path.normcase(os.path.abspath(os.fspath(p))) in want:
+            return lie
+        return real_lstat(p, *args, **kwargs)
+
+    monkeypatch.setattr(remote_mux.os, "lstat", fake)
+
+
+class TestTheReadSurvivesASwap:
+    """Each guard AFTER the lstat, pinned by an lstat that lies -- the file as
+    it was vetted, before something was swapped in under the same name."""
+
+    @needs_fifo
+    def test_a_fifo_the_lstat_called_regular_is_refused_not_read(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        recipe = _recipe(tmp_path)
+        assert recipe.local_root is not None
+        fifo = recipe.local_root / "pipe.env"
+        os.mkfifo(fifo)
+        _lstat_lies(monkeypatch, fifo, st_mode=stat.S_IFREG | 0o600, st_size=1)
+        # O_NONBLOCK keeps the open from waiting for a writer; fstat refuses.
+        raised = _in_thread(
+            lambda: remote_mux.bring_up(
+                NODE, dataclasses.replace(recipe, push_files=(fifo,))
+            )
+        )
+        assert isinstance(raised, ValueError)
+        assert "not a regular file" in str(raised)
+        assert node_home.calls() == []
+
+    def test_a_file_that_grew_after_the_lstat_is_refused(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        recipe = _recipe(tmp_path)  # .env is 15 bytes
+        monkeypatch.setattr(remote_mux, "PUSH_FILE_MAX_BYTES", 8)
+        _lstat_lies(monkeypatch, recipe.push_files[0], st_size=4)
+        with pytest.raises(ValueError, match="grew past the cap of 8") as info:
+            remote_mux.bring_up(NODE, recipe)
+        assert ".env" in str(info.value)
+        assert node_home.calls() == []
+
+    def test_a_file_swapped_between_lstat_and_open_is_refused(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        recipe = _recipe(tmp_path)
+        env = recipe.push_files[0]
+        _lstat_lies(monkeypatch, env, st_ino=os.stat(env).st_ino + 1)
+        with pytest.raises(ValueError, match="changed") as info:
+            remote_mux.bring_up(NODE, recipe)
+        assert ".env" in str(info.value)
+        assert node_home.calls() == []
+
+    @pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="POSIX O_NOFOLLOW")
+    def test_a_link_the_lstat_called_regular_is_not_opened(self, tmp_path, monkeypatch):
+        # The read itself: whatever vetted the path, the open never follows a
+        # final-component link, even one the lstat reported as the file.
+        secret = tmp_path / "id_ed25519"
+        secret.write_bytes(b"TOPSECRET\n")
+        link = tmp_path / "leak.md"
+        _link_or_skip(link, secret)
+        _lstat_lies(monkeypatch, link, like=secret)
+        with pytest.raises(OSError):
+            remote_mux._read_regular(link, cap=100, what="memory file leak.md")
+
+    def test_a_memory_link_the_lstat_called_regular_never_ships(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        # is_symlink trusts the lying lstat; what stops the link is the
+        # memory walk's realpath containment (Windows, where there is no
+        # O_NOFOLLOW) or the open (POSIX) -- never nothing.
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        secret = tmp_path / "id_ed25519"
+        secret.write_bytes(b"TOPSECRET\n")
+        leak = recipe.memory_dir / "leak.md"
+        _link_or_skip(leak, secret)
+        _lstat_lies(monkeypatch, leak, like=secret)
+        _answers(node_home)
+        remote_mux.bring_up(NODE, recipe)
+        stdin = node_home.calls()[1].stdin
+        assert "memory/leak.md" not in _members(stdin)
+        assert b"TOPSECRET" not in stdin
+        assert "leak.md" in _nodes_log()
+
+
+class TestWhatTheNodeAnswersIsVetted:
+    """The node's words -- its $HOME, the result's cwd -- are data, and the
+    local repo's url/branch are argv on the node: none may carry a control
+    character or pose as an option."""
+
+    @pytest.mark.parametrize(
+        "answer", ["/home/amin\nWelcome!\n", "/home/a\tmin\n", "/home/amin\r\n"]
+    )
+    def test_a_home_with_a_control_character_is_refused(
+        self, fake_ssh, patient_probe, tmp_path, answer
+    ):
+        fake_ssh.set_reply("printenv HOME", stdout=answer)
+        with pytest.raises(RemoteError, match="HOME") as info:
+            remote_mux.bring_up(NODE, _recipe(tmp_path))
+        assert info.value.command_redacted == (
+            "ssh",
+            *remote_mux.SSH_BATCH_OPTS,
+            NODE.target,
+            _wrapped(["printenv", "HOME"]),
+        )
+        assert len(fake_ssh.calls()) == 1
+
+    @pytest.mark.parametrize(
+        "cwd", ["magent/api", "-rf", "/home/amin/x\ny", "/home/amin/\x1b[2Jx", 7]
+    )
+    def test_a_result_cwd_that_is_not_a_clean_absolute_path_is_the_root(
+        self, node_home, tmp_path, cwd
+    ):
+        _answers(node_home, {**_RESULT, "cwd": cwd})
+        assert remote_mux.bring_up(NODE, _recipe(tmp_path)).cwd == _ROOT
+
+    def test_a_clean_absolute_cwd_is_taken(self, node_home, tmp_path):
+        _answers(node_home, {**_RESULT, "cwd": "/srv/api"})
+        assert remote_mux.bring_up(NODE, _recipe(tmp_path)).cwd == "/srv/api"
+
+    @pytest.mark.parametrize(
+        ("url", "branch"),
+        [("--upload-pack=touch /tmp/x", "main"), ("git@github.com:me/api.git", "-b")],
+    )
+    def test_a_url_or_branch_that_poses_as_an_option_is_refused(
+        self, node_home, tmp_path, url, branch
+    ):
+        repo = RepoSpec(url=url, branch=branch, remote_dir="~/magent/api")
+        with pytest.raises(ValueError, match="option"):
+            remote_mux.bring_up(NODE, _recipe(tmp_path, repos=(repo,)))
+        # The HOME probe only: the script never ran.
+        assert len(node_home.calls()) == 1
+
+
+class TestThePayloadAndResultShapes:
+    """Pins for the shapes a mutation run found unpinned (cq-D7 m6)."""
+
+    def test_every_member_is_0600_with_a_zero_mtime(self, node_home, tmp_path):
+        _answers(node_home)
+        remote_mux.bring_up(NODE, _recipe(tmp_path))
+        payload = node_home.calls()[1].stdin.split(_SENTINEL, 1)[1]
+        with tarfile.open(fileobj=io.BytesIO(payload)) as tar:
+            infos = tar.getmembers()
+        assert infos
+        assert {(m.mode, m.mtime) for m in infos} == {(0o600, 0)}
+
+    def test_memory_keeps_its_subfolders_in_name_order(self, node_home, tmp_path):
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        (recipe.memory_dir / "sub").mkdir()
+        (recipe.memory_dir / "sub" / "c.md").write_bytes(b"c\n")
+        (recipe.memory_dir / "b.md").write_bytes(b"b\n")
+        (recipe.memory_dir / "a.md").write_bytes(b"a\n")
+        _answers(node_home)
+        remote_mux.bring_up(NODE, recipe)
+        members = _members(node_home.calls()[1].stdin)
+        assert [n for n in members if n.startswith("memory/")] == [
+            "memory/MEMORY.md",
+            "memory/a.md",
+            "memory/b.md",
+            "memory/sub/c.md",
+        ]
+        assert members["memory/sub/c.md"] == b"c\n"
+
+    def test_attached_existing_is_true_only_for_json_true(self, node_home, tmp_path):
+        _answers(node_home, {**_RESULT, "attached_existing": "false"})
+        assert remote_mux.bring_up(NODE, _recipe(tmp_path)).attached_existing is False
+
+    def test_a_result_without_a_cwd_is_the_root(self, node_home, tmp_path):
+        _answers(node_home, {k: v for k, v in _RESULT.items() if k != "cwd"})
+        assert remote_mux.bring_up(NODE, _recipe(tmp_path)).cwd == _ROOT
+
+    def test_commits_that_are_not_an_object_are_empty(self, node_home, tmp_path):
+        _answers(node_home, {**_RESULT, "commits": [_ROOT, "0123abcd"]})
+        assert remote_mux.bring_up(NODE, _recipe(tmp_path)).commits == {}
+
+    def test_push_mode_sends_allow_dirty(self, node_home, tmp_path):
+        # A push never touches git, so the node's dirty check must not stop it.
+        _answers(node_home)
+        remote_mux.push_files(NODE, _recipe(tmp_path))
+        assert _tokens(_members(node_home.calls()[1].stdin))[1] == "1"
+
+
+def _link_or_skip(link: Path, target: Path, *, directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError:
+        pytest.skip("this account cannot create symlinks")
+
+
+needs_junctions = pytest.mark.skipif(
+    sys.platform != "win32", reason="NTFS junctions are Windows-only"
+)
+
+
+def _junction(link: Path, target: Path) -> None:
+    """A directory junction at ``link`` -> ``target``: no admin needed, which
+    is exactly why it is the link to guard against."""
+    import _winapi  # reason: Windows-only stdlib; the tests using it skip elsewhere
+
+    _winapi.CreateJunction(str(target), str(link))
+    assert not link.is_symlink()  # the premise: pathlib does not see it
+
+
+def _nodes_log() -> str:
+    path = log.LOG_DIR / "nodes.log"
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+class TestMemoryNeverFollowsALink:
+    """A bring-up never fails because of memory, and never ships what a link
+    in the memory folder points at: the folder is Claude's, a link in it can
+    name ~/.ssh."""
+
+    def _bring_up(self, node_home, recipe: Recipe) -> bytes:
+        _answers(node_home)
+        remote_mux.bring_up(NODE, recipe)
+        return node_home.calls()[1].stdin
+
+    def test_a_file_link_inside_memory_is_skipped(self, node_home, tmp_path):
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        secret = tmp_path / "id_ed25519"
+        secret.write_bytes(b"TOPSECRET\n")
+        _link_or_skip(recipe.memory_dir / "leak.md", secret)
+        stdin = self._bring_up(node_home, recipe)
+        members = _members(stdin)
+        assert "memory/leak.md" not in members
+        assert members["memory/MEMORY.md"] == b"- remember\n"
+        assert b"TOPSECRET" not in stdin
+        assert "leak.md" in _nodes_log()
+
+    def test_a_folder_link_inside_memory_is_skipped(self, node_home, tmp_path):
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        keys = tmp_path / "dot-ssh"
+        keys.mkdir()
+        (keys / "id_ed25519").write_bytes(b"TOPSECRET\n")
+        _link_or_skip(recipe.memory_dir / "keys", keys, directory=True)
+        stdin = self._bring_up(node_home, recipe)
+        assert not any(n.startswith("memory/keys") for n in _members(stdin))
+        assert b"TOPSECRET" not in stdin
+        assert "keys" in _nodes_log()
+
+    def test_a_memory_folder_that_is_a_link_ships_no_memory(self, node_home, tmp_path):
+        keys = tmp_path / "dot-ssh"
+        keys.mkdir()
+        (keys / "id_ed25519").write_bytes(b"TOPSECRET\n")
+        linked = tmp_path / "linked-memory"
+        _link_or_skip(linked, keys, directory=True)
+        stdin = self._bring_up(node_home, _recipe(tmp_path, memory_dir=linked))
+        assert not any(n.startswith("memory/") for n in _members(stdin))
+        assert b"TOPSECRET" not in stdin
+        assert "linked-memory" in _nodes_log()
+
+    # A junction is the link a STANDARD Windows user can make (no admin, no
+    # developer mode), and Path.is_symlink() is False for one while os.walk
+    # descends into it -- so the symlink pins above do not cover it.
+    @needs_junctions
+    def test_a_junction_inside_memory_is_skipped(self, node_home, tmp_path):
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        keys = tmp_path / "dot-ssh"
+        keys.mkdir()
+        (keys / "id_ed25519").write_bytes(b"TOPSECRET\n")
+        _junction(recipe.memory_dir / "keys", keys)
+        stdin = self._bring_up(node_home, recipe)
+        members = _members(stdin)
+        assert not any(n.startswith("memory/keys") for n in members)
+        assert members["memory/MEMORY.md"] == b"- remember\n"
+        assert b"TOPSECRET" not in stdin
+        # Pruned at the folder: the walk never even lists what is behind it.
+        assert f"memory link {recipe.memory_dir / 'keys'} skipped" in _nodes_log()
+        assert "outside memory" not in _nodes_log()
+
+    @needs_junctions
+    def test_a_memory_folder_that_is_a_junction_ships_no_memory(
+        self, node_home, tmp_path
+    ):
+        keys = tmp_path / "dot-ssh"
+        keys.mkdir()
+        (keys / "id_ed25519").write_bytes(b"TOPSECRET\n")
+        joined = tmp_path / "joined-memory"
+        _junction(joined, keys)
+        stdin = self._bring_up(node_home, _recipe(tmp_path, memory_dir=joined))
+        assert not any(n.startswith("memory/") for n in _members(stdin))
+        assert b"TOPSECRET" not in stdin
+        assert "joined-memory" in _nodes_log()
+
+    def test_a_folder_swapped_for_a_link_mid_walk_never_ships(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        # The walk listed `notes` as a plain folder; by the time its files
+        # are checked it is a link to ~/.ssh. Every per-FILE check passes
+        # (the file is regular and no link itself) -- only resolving the file
+        # against the resolved memory folder catches the parent swap.
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        keys = tmp_path / "dot-ssh"
+        keys.mkdir()
+        (keys / "id_ed25519").write_bytes(b"TOPSECRET\n")
+        notes = recipe.memory_dir / "notes"
+        _link_or_skip(notes, keys, directory=True)
+        real_walk = os.walk
+
+        def walk(top, *args, **kwargs):
+            yield from real_walk(top, *args, **kwargs)
+            yield os.fspath(notes), [], ["id_ed25519"]
+
+        monkeypatch.setattr(remote_mux.os, "walk", walk)
+        stdin = self._bring_up(node_home, recipe)
+        assert not any(n.startswith("memory/notes") for n in _members(stdin))
+        assert b"TOPSECRET" not in stdin
+        assert "outside memory" in _nodes_log()
+
+    def test_memory_under_a_linked_parent_still_ships(self, node_home, tmp_path):
+        # A dotfiles setup links ~/.claude itself; the memory folder INSIDE it
+        # is a plain folder and must still ship.
+        dotfiles = tmp_path / "dotfiles"
+        (dotfiles / "memory").mkdir(parents=True)
+        (dotfiles / "memory" / "MEMORY.md").write_bytes(b"- dotfiles\n")
+        claude = tmp_path / "claude"
+        _link_or_skip(claude, dotfiles, directory=True)
+        stdin = self._bring_up(
+            node_home, _recipe(tmp_path, memory_dir=claude / "memory")
+        )
+        assert _members(stdin)["memory/MEMORY.md"] == b"- dotfiles\n"
 
 
 class TestPushingFilesToARunningProject:

@@ -28,8 +28,10 @@ import math
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import tarfile
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -705,6 +707,17 @@ class BringUpResult:
 _HEADER_MAGIC = "MAGENT1"
 
 
+def _has_control(text: str) -> bool:
+    """Any control character (C0, DEL, C1): a newline, a tab, an ESC."""
+    return any(unicodedata.category(ch) == "Cc" for ch in text)
+
+
+def _clean_absolute(value: str) -> bool:
+    """``value`` is a node path magent can hand on: absolute (so it cannot
+    start with ``-``) and free of any control character."""
+    return value.startswith("/") and not _has_control(value)
+
+
 def _node_path(path: str, home: str) -> str:
     """``path`` expanded against the node's ``home`` and checked where it
     first enters a remote command: an absolute POSIX path, so it can neither
@@ -747,6 +760,11 @@ def _header(
     start, fresh = _start_argvs(recipe, resume_id)
     tokens = [_HEADER_MAGIC, "1" if allow_dirty else "0", str(len(recipe.repos))]
     for repo in recipe.repos:
+        # git on the node would take `--upload-pack=...` as an option. The
+        # script also passes `--` before them; this is the PC-side half.
+        for value, what in ((repo.url, "url"), (repo.branch, "branch")):
+            if value.startswith("-"):
+                raise ValueError(f"repo {what} {value!r} would read as an option")
         tokens += [repo.url, repo.branch, _node_path(repo.remote_dir, home)]
     tokens += [str(len(start)), *start, str(len(fresh)), *fresh]
     if any("\0" in token for token in tokens):
@@ -771,12 +789,19 @@ def _archive_name(rel: str) -> str:
     return name
 
 
-def _push_name(path: Path, local_root: Path) -> str:
-    """The member name of push file ``path``: its place relative to
-    ``local_root``, lexically -- a link keeps the name it has here. ValueError
-    when ``path`` RESOLVES outside ``local_root``: B's config check on the
-    entry is a string check, and a symlink inside the project can point at
-    ``~/.ssh``."""
+def _push_name(path: Path, local_root: Path) -> tuple[str, Path]:
+    """``(member name, real path)`` of push file ``path``. The name is its
+    place relative to ``local_root``, lexically -- a link keeps the name it
+    has here. The real path is what ``_read_regular`` must open: the file
+    that was vetted, not whatever ``path`` names by the time it is read.
+    ValueError when ``path`` RESOLVES outside ``local_root``: B's config check
+    on the entry is a string check, and a symlink inside the project can
+    point at ``~/.ssh``.
+
+    Two refusals here are belt-and-braces, and a mutant that drops either
+    survives (equivalent): ``real == real_root`` (the root is a folder, which
+    ``_read_regular`` refuses anyway) and the lexical ``relative_to``'s own
+    message (it raises ValueError either way)."""
     real, real_root = Path(os.path.realpath(path)), Path(os.path.realpath(local_root))
     if real == real_root or not real.is_relative_to(real_root):
         raise ValueError(f"push file {path} resolves outside the project {local_root}")
@@ -784,7 +809,95 @@ def _push_name(path: Path, local_root: Path) -> str:
         rel = path.relative_to(local_root)
     except ValueError as e:
         raise ValueError(f"push file {path} is outside the project {local_root}") from e
-    return _archive_name(str(rel))
+    return _archive_name(str(rel)), real
+
+
+# The size bounds of what one bring-up ships (the node reads the payload from
+# stdin into tar; nothing here is streamed). A push file over its cap, or a
+# push set over the payload's, is refused before any ssh. Memory is skipped,
+# never refused. PAYLOAD_MAX_BYTES bounds the shipped FILE bytes; the tar's
+# own framing and the header ride on top.
+PUSH_FILE_MAX_BYTES = 16 * 1024 * 1024
+PAYLOAD_MAX_BYTES = 64 * 1024 * 1024
+
+# How a vetted file is opened: never through a final-component link, never
+# blocking on a FIFO. Read off the module, so Windows (which has neither
+# flag, and wants O_BINARY) needs no `sys.platform` branch.
+_READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_BINARY", 0)
+)
+
+
+def _read_regular(path: Path, *, cap: int, what: str) -> bytes:
+    """The bytes of ``path``, which must be a REGULAR file of at most ``cap``
+    bytes, or ValueError naming ``what``. Checked three times, because each
+    check alone has a hole: ``lstat`` before opening (a FIFO or a device is
+    never opened, an oversize file never read), ``fstat`` on what was opened
+    (the path may have been swapped in between), and a read of at most
+    ``cap + 1`` bytes (the file may have grown). ``fstat`` must also name the
+    SAME file the ``lstat`` sized -- ``(st_dev, st_ino)`` -- or a regular file
+    swapped in under the name would be read on the old one's vetting. OSError
+    when it cannot be opened -- ``O_NOFOLLOW`` makes a final-component link
+    swapped in after the ``lstat`` one of those."""
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError(f"{what} is not a regular file")
+    if before.st_size > cap:
+        raise ValueError(f"{what} is {before.st_size} bytes; the cap is {cap}")
+    fd = os.open(path, _READ_FLAGS)
+    with os.fdopen(fd, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError(f"{what} is not a regular file")
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise ValueError(f"{what} changed between its check and its open")
+        data = handle.read(cap + 1)
+    if len(data) > cap:
+        raise ValueError(f"{what} grew past the cap of {cap} bytes")
+    return data
+
+
+def _files(recipe: Recipe, *, memory: bool) -> list[tuple[str, bytes]]:
+    """The payload's file members, vetted and READ -- before any ssh, so every
+    refusal costs no connection. ``project/<rel>``: the push set, each file
+    contained in the project and bounded (ValueError otherwise, naming it);
+    ``memory/<rel>`` for a bring-up: Claude's memory, where anything that
+    fails a check is skipped and logged instead (a bring-up never fails
+    because of memory)."""
+    if recipe.push_files and recipe.local_root is None:
+        raise ValueError("a recipe with push files needs its local_root")
+    root = recipe.local_root
+    vetted = (
+        [(*_push_name(p, root), p) for p in recipe.push_files]
+        if root is not None
+        else []
+    )
+    out: list[tuple[str, bytes]] = []
+    total = 0
+    for name, real, path in vetted:
+        data = _read_regular(real, cap=PUSH_FILE_MAX_BYTES, what=f"push file {path}")
+        total += len(data)
+        if total > PAYLOAD_MAX_BYTES:
+            raise ValueError(
+                f"the push set passes the payload cap of {PAYLOAD_MAX_BYTES} "
+                f"bytes at push file {path}"
+            )
+        out.append((f"project/{name}", data))
+    if memory and recipe.memory_dir is not None:
+        logger = get_logger("nodes")
+        for rel, path in _memory_files(recipe.memory_dir):
+            cap = min(PUSH_FILE_MAX_BYTES, PAYLOAD_MAX_BYTES - total)
+            try:
+                data = _read_regular(path, cap=cap, what=f"memory file {path}")
+            except (ValueError, OSError) as e:
+                logger.warning("memory file %s skipped: %s", path, e)
+                continue
+            total += len(data)
+            out.append((f"memory/{rel}", data))
+    return out
 
 
 def _add_bytes(tar: tarfile.TarFile, name: str, data: bytes) -> None:
@@ -795,61 +908,96 @@ def _add_bytes(tar: tarfile.TarFile, name: str, data: bytes) -> None:
     tar.addfile(info, io.BytesIO(data))
 
 
-def _payload(recipe: Recipe, *, header: bytes, decorate: str, memory: bool) -> bytes:
-    """ONE uncompressed PAX tar: ``header``, ``decorate``, ``project/<rel>``
-    (the push set, relative to the local project root) and, for a bring-up,
-    ``memory/<rel>``. Bytes stay bytes -- a secret file is never re-encoded.
-    Every name is checked before a byte is read."""
-    if recipe.push_files and recipe.local_root is None:
-        raise ValueError("a recipe with push files needs its local_root")
-    root = recipe.local_root
-    pushed = (
-        [(_push_name(p, root), p) for p in recipe.push_files]
-        if root is not None
-        else []
-    )
+def _payload(*, header: bytes, decorate: str, files: list[tuple[str, bytes]]) -> bytes:
+    """ONE uncompressed PAX tar: ``header``, ``decorate``, then ``files``
+    (``_files``' members, in its order). Bytes stay bytes -- a secret file is
+    never re-encoded."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
         _add_bytes(tar, "header", header)
         _add_bytes(tar, "decorate", decorate.encode("utf-8"))
-        for name, path in pushed:
-            _add_bytes(tar, f"project/{name}", path.read_bytes())
-        if memory and recipe.memory_dir is not None:
-            for path in sorted(recipe.memory_dir.rglob("*")):
-                if path.is_file():
-                    rel = _archive_name(str(path.relative_to(recipe.memory_dir)))
-                    _add_bytes(tar, f"memory/{rel}", path.read_bytes())
+        for name, data in files:
+            _add_bytes(tar, name, data)
     return buf.getvalue()
+
+
+def _memory_files(memory_dir: Path) -> list[tuple[str, Path]]:
+    """``(member name, path)`` for every REGULAR file under ``memory_dir``, in
+    name order. A link is never followed -- not a file link, not a folder
+    link, and not ``memory_dir`` itself being one: the folder is Claude's,
+    and a link in it can name ``~/.ssh``. What is skipped is logged, never
+    raised: a bring-up never fails because of memory.
+
+    "A link" is decided by ``realpath``, not ``is_symlink``: a Windows
+    junction -- which any standard user can make -- is not a symlink to
+    pathlib, and ``os.walk(followlinks=False)`` descends into one. An entry is
+    kept only when resolving it changes nothing but its parent's own
+    resolution, so a link ABOVE ``memory_dir`` (a dotfiles ``~/.claude``)
+    still ships, and every file must resolve inside the resolved folder."""
+    logger = get_logger("nodes")
+    real_mem = Path(os.path.realpath(memory_dir))
+    if real_mem != Path(os.path.realpath(memory_dir.parent)) / memory_dir.name:
+        logger.warning("memory folder %s is a link; no memory shipped", memory_dir)
+        return []
+    found: list[tuple[str, Path]] = []
+    for dirpath, dirnames, filenames in os.walk(memory_dir):
+        base = Path(dirpath)
+        real_base = Path(os.path.realpath(base))
+        kept: list[str] = []
+        for name in dirnames:
+            if Path(os.path.realpath(base / name)) == real_base / name:
+                kept.append(name)
+            else:
+                logger.warning("memory link %s skipped", base / name)
+        dirnames[:] = kept  # os.walk descends only into what is left
+        for name in filenames:
+            path = base / name
+            if path.is_symlink() or not path.is_file():
+                logger.warning("memory entry %s is not a regular file; skipped", path)
+                continue
+            if not Path(os.path.realpath(path)).is_relative_to(real_mem):
+                logger.warning("memory entry %s resolves outside memory; skipped", path)
+                continue
+            try:
+                rel = _archive_name(str(path.relative_to(memory_dir)))
+            except ValueError:
+                logger.warning("memory file %s cannot be named on the node", path)
+                continue
+            found.append((rel, path))
+    return sorted(found)
 
 
 def _remote_home(node: Node) -> str:
     """The node user's ``$HOME``. The PC expands ``~`` itself and computes the
     Claude project name from the absolute path, so it must be absolute."""
-    result = run(node, ["printenv", "HOME"], timeout_s=PROBE_TIMEOUT_S)
-    home = result.stdout.decode("utf-8", "replace").strip()
-    if not home.startswith("/"):
+    probe = ["printenv", "HOME"]
+    result = run(node, probe, timeout_s=PROBE_TIMEOUT_S)
+    # printenv's one trailing newline is framing; anything else is the
+    # answer. A second line (a login banner) or any other control character
+    # is refused, never trimmed away: the value becomes argv and a path.
+    home = result.stdout.decode("utf-8", "replace").removesuffix("\n")
+    if not home.startswith("/") or _has_control(home):
         raise RemoteError(
             result.returncode,
             f"unusable $HOME on the node: {home!r}",
-            ("printenv", "HOME"),
+            _run_shown(node, probe, None),
         )
     return home
 
 
 def _parse_result(
-    result: subprocess.CompletedProcess[bytes], shown: tuple[str, ...]
-) -> dict[str, object]:
-    """bring_up.sh's last non-empty stdout line, a JSON object. Anything else
-    is a RemoteError: a result that cannot be read is not a success."""
+    result: subprocess.CompletedProcess[bytes],
+) -> dict[str, object] | None:
+    """bring_up.sh's last non-empty stdout line as a JSON object, or None
+    when it is not one -- which the caller raises: a result that cannot be
+    read is not a success."""
     text = result.stdout.decode("utf-8", "replace")
     lines = [line for line in text.splitlines() if line.strip()]
     try:
         parsed = json.loads(lines[-1]) if lines else None
     except ValueError:
-        parsed = None
-    if not isinstance(parsed, dict):
-        raise RemoteError(result.returncode, "not a bring-up result", shown)
-    return parsed
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _deliver(
@@ -859,7 +1007,13 @@ def _deliver(
     result = run_script(
         node, "bring_up", args, timeout_s=BRING_UP_TIMEOUT_S, stdin=payload
     )
-    return _parse_result(result, ("bring_up", *args))
+    parsed = _parse_result(result)
+    if parsed is None:
+        # What RAN, as run() itself would name it (the ``sample`` precedent).
+        # Built on this path only: the frame is a copy of the whole payload.
+        shown = _run_shown(node, *_script_call("bring_up", args, payload))
+        raise RemoteError(result.returncode, "not a bring-up result", shown)
+    return parsed
 
 
 def bring_up(
@@ -877,12 +1031,13 @@ def bring_up(
     dirty node tree without ``allow_dirty``, 4 tmux, 5 git or a write);
     ValueError for a recipe that cannot be framed (NodeConfigError for a node
     folder that is not absolute); OSError for a push file that cannot be
-    read."""
+    read. Every push-file refusal lands before any ssh."""
+    files = _files(recipe, memory=True)
     home = _remote_home(node)
     root = _node_path(recipe.remote_root, home)
     header = _header(recipe, allow_dirty=allow_dirty, home=home, resume_id=resume_id)
     decorate_text = decoration_script(recipe.sid, node.nick, psmux.code_on_path())
-    payload = _payload(recipe, header=header, decorate=decorate_text, memory=True)
+    payload = _payload(header=header, decorate=decorate_text, files=files)
     raw = _deliver(node, "up", recipe, root, payload)
     commits, cwd, shipped = raw.get("commits"), raw.get("cwd"), raw.get("shipped")
     return BringUpResult(
@@ -893,7 +1048,7 @@ def bring_up(
             if isinstance(commits, dict)
             else {}
         ),
-        cwd=cwd if isinstance(cwd, str) and cwd else root,
+        cwd=cwd if isinstance(cwd, str) and _clean_absolute(cwd) else root,
         shipped=tuple(str(s) for s in shipped) if isinstance(shipped, list) else (),
     )
 
@@ -903,10 +1058,11 @@ def push_files(node: Node, recipe: Recipe) -> list[str]:
     git, no session, no memory). Returns the project-relative paths written.
     Raises RemoteError -- exit 5 when the folder is not there yet -- and the
     same ValueError/OSError refusals as ``bring_up``."""
+    files = _files(recipe, memory=False)
     home = _remote_home(node)
     root = _node_path(recipe.remote_root, home)
     header = _header(recipe, allow_dirty=True, home=home, resume_id=None)
-    payload = _payload(recipe, header=header, decorate="", memory=False)
+    payload = _payload(header=header, decorate="", files=files)
     raw = _deliver(node, "push", recipe, root, payload)
     shipped = raw.get("shipped")
     return [str(s) for s in shipped] if isinstance(shipped, list) else []
