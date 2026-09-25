@@ -1776,6 +1776,21 @@ def _run_doctor(
     )
 
 
+def _doctor_raw(
+    env: dict[str, str], *args: str, payload: bytes | None = None
+) -> subprocess.CompletedProcess[bytes]:
+    """doctor.sh with exactly ``args`` after the socket (``_run_doctor`` always
+    passes a well-formed --root/--target), and an optional trailing payload."""
+    return subprocess.run(
+        _bash_argv(*args),
+        input=remote_mux._frame_script(node_scripts.script("doctor"), payload),
+        capture_output=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+
+
 @POSIX_BASH
 class TestDoctorShUnderRealBash:
     def test_a_healthy_node_is_all_ok(self, tmp_path):
@@ -1907,6 +1922,104 @@ class TestDoctorShUnderRealBash:
             "sessions": "ok",
         }
 
+    def test_the_github_probe_is_batch_bounded_and_tofu_only(self, tmp_path):
+        fakes, env = _doctor_box(tmp_path)
+        _run_doctor(env)
+        (call,) = fakes["ssh"].calls()
+        assert call.argv[-1] == "git@github.com"
+        assert "-T" in call.argv
+        opts = [call.argv[i + 1] for i, a in enumerate(call.argv) if a == "-o"]
+        assert "BatchMode=yes" in opts
+        assert "StrictHostKeyChecking=accept-new" in opts
+        assert any(o.startswith("ConnectTimeout=") for o in opts)
+
+    def test_a_version_printed_on_stderr_is_still_the_detail(self, tmp_path):
+        fakes, env = _doctor_box(tmp_path)
+        fakes["git"].set_reply("--version", stderr="git version 2.43.0\n")
+        details = {ln.item: ln.detail for ln in _report(_run_doctor(env)).lines}
+        assert details["git"] == "git version 2.43.0"
+
+    def test_a_chatty_version_cannot_forge_a_row(self, tmp_path):
+        fakes, env = _doctor_box(tmp_path)
+        fakes["claude"].set_reply(
+            "--version", stdout="2.1.0 (Claude Code)\nfail\tgit\tforged\n"
+        )
+        r = _run_doctor(env)
+        lines = _report(r).lines
+        assert [ln.item for ln in lines].count("git") == 1
+        assert _rows(r)["git"] == "ok"
+        assert {ln.item: ln.detail for ln in lines}["claude"] == "2.1.0 (Claude Code)"
+
+    @pytest.mark.parametrize(
+        ("avail_kb", "status", "detail"),
+        [
+            (GIB_KB - 1, "fail", "1023 MB free under ~/magent"),
+            (GIB_KB, "warn", "1 GB free under ~/magent"),
+            (5 * GIB_KB - 1, "warn", "4 GB free under ~/magent"),
+            (5 * GIB_KB, "ok", "5 GB free under ~/magent"),
+            (50 * GIB_KB, "ok", "50 GB free under ~/magent"),
+        ],
+    )
+    def test_disk_thresholds_are_exact_binary_units(
+        self, tmp_path, avail_kb, status, detail
+    ):
+        _, env = _doctor_box(tmp_path, avail_kb=avail_kb)
+        (row,) = [ln for ln in _report(_run_doctor(env)).lines if ln.item == "disk"]
+        assert (row.status, row.detail) == (status, detail)
+
+    @pytest.mark.parametrize("flag", ["--root", "--target"])
+    def test_a_flag_without_its_value_is_one_row_and_rc0(self, tmp_path, flag):
+        fakes, env = _doctor_box(tmp_path)
+        r = _doctor_raw(env, flag)
+        assert r.returncode == 0, r.stderr
+        assert _rows(r) == {"doctor": "fail"}
+        assert all(f.calls() == [] for f in fakes.values())
+
+    def test_an_unknown_argument_is_one_row_and_rc0(self, tmp_path):
+        fakes, env = _doctor_box(tmp_path)
+        r = _doctor_raw(env, "--bogus")
+        assert r.returncode == 0, r.stderr
+        assert _rows(r) == {"doctor": "fail"}
+        assert all(f.calls() == [] for f in fakes.values())
+
+    def test_claude_in_local_bin_is_found(self, tmp_path):
+        # The native installer puts claude in ~/.local/bin, which a
+        # non-interactive ssh PATH does not carry.
+        tools = tuple(t for t in NODE_TOOLS if t != "claude")
+        _, env = _doctor_box(tmp_path, tools=tools)
+        (tmp_path / "lb").mkdir()
+        claude = make_fake_ssh(tmp_path / "lb", name="claude")
+        claude.set_reply("auth status", stdout='{"loggedIn": true}\n')
+        local_bin = tmp_path / "node" / ".local" / "bin"
+        local_bin.parent.mkdir(parents=True, exist_ok=True)
+        local_bin.symlink_to(claude.base)
+        rows = _rows(_run_doctor(env))
+        assert (rows["claude"], rows["claude-login"]) == ("ok", "ok")
+
+    def test_the_github_row_carries_ssh_last_line_only(self, tmp_path):
+        _, env = _doctor_box(
+            tmp_path,
+            github=(
+                "Warning: Permanently added 'github.com' (ED25519) to the list"
+                " of known hosts.\ngit@github.com: Permission denied (publickey)."
+            ),
+        )
+        (row,) = [
+            ln for ln in _report(_run_doctor(env)).lines if ln.item == "github-key"
+        ]
+        assert row.status == "fail"
+        assert "Permission denied (publickey)." in row.detail
+        assert "Warning" not in row.detail
+
+    def test_no_probe_reads_the_script_stream(self, tmp_path):
+        # `exec </dev/null`: bash reads the script from stdin, so a probe that
+        # inherited it would swallow whatever follows.
+        fakes, env = _doctor_box(tmp_path)
+        _doctor_raw(
+            env, "--root", "~/magent", "--target", "t", payload=b"TRAILING-BYTES\n"
+        )
+        assert all(c.stdin == b"" for f in fakes.values() for c in f.calls())
+
 
 def test_doctor_inlines_the_tmux_floor():
     # One predicate for setup, doctor and (by DECISION-22) bring_up's floor.
@@ -2014,3 +2127,42 @@ class TestDoctorCall:
         )
         with pytest.raises(RemoteError):
             remote_mux.doctor(NODE, timeout_s=remote_mux.DOCTOR_TIMEOUT_S)
+
+    def test_a_script_that_died_keeps_its_rows_and_gains_a_fail(self, fake_ssh):
+        fake_ssh.set_reply(
+            "bash -s",
+            stdout="ok\ttmux\ttmux 3.4\n",
+            stderr="main: line 190: HOME: unbound variable\n",
+            rc=1,
+        )
+        report = remote_mux.doctor(NODE, timeout_s=remote_mux.DOCTOR_TIMEOUT_S)
+        assert [(ln.status, ln.item) for ln in report.lines] == [
+            ("ok", "tmux"),
+            ("fail", "doctor"),
+        ]
+        assert (
+            report.lines[-1].detail
+            == "exited 1: main: line 190: HOME: unbound variable"
+        )
+
+    def test_the_callers_timeout_bounds_the_call_and_stdin_is_redacted(self, fake_ssh):
+        fake_ssh.set_mode("timeout")
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.doctor(NODE, timeout_s=0.5)
+        assert exc.value.rc is None
+        shown = exc.value.command_redacted
+        assert shown[0] == "ssh"
+        assert shown[-1].startswith("<stdin: ")
+        assert shown[-1].endswith(" bytes>")
+        assert "--root" in shown[-2]
+
+    def test_an_unreachable_node_names_its_own_target(self, fake_ssh):
+        fake_ssh.set_reply(
+            "bash -s", stderr="ssh: connect to host x: No route\n", rc=255
+        )
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.doctor(NODE, timeout_s=remote_mux.DOCTOR_TIMEOUT_S)
+        assert exc.value.rc == 255
+        assert exc.value.command_redacted[0] == "ssh"
+        assert NODE.target in exc.value.command_redacted
+        assert "No route" in exc.value.stderr_tail
