@@ -1917,3 +1917,50 @@ class TestSetupNode:
             remote_mux.setup_node(
                 NODE, ["amin"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
             )
+
+    def test_a_failed_step_still_returns_every_row_and_key(self, fake_ssh):
+        # P1: rc 1 is setup.sh reporting a failed step, not a lost call.
+        fake_ssh.set_reply(
+            "bash -s",
+            stdout=(
+                "did\tuser:amin\tcreated\n"
+                "fail\tclaude:amin\tthe Claude installer did not put claude on PATH\n"
+                "key\tamin\tssh-ed25519 AAAAN magent@devino-second\n"
+            ),
+            rc=1,
+        )
+        report = remote_mux.setup_node(
+            NODE, ["amin"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+        )
+        assert report.failed
+        assert report.keys() == {"amin": "ssh-ed25519 AAAAN magent@devino-second"}
+        assert ScriptLine("did", "user:amin", "created") in report.lines
+
+    def test_an_unreachable_root_login_names_root(self, fake_ssh):
+        # P2: the error says who magent tried to be.
+        fake_ssh.set_reply(
+            "bash -s", stderr="root@devino-second: Permission denied\n", rc=255
+        )
+        with pytest.raises(RemoteError) as info:
+            remote_mux.setup_node(
+                NODE, ["amin"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+            )
+        assert "root@devino-second" in info.value.command_redacted
+
+    def test_the_default_timeout_grows_with_the_users(self, monkeypatch):
+        # M5: every user is a login, an installer and a key.
+        seen: list[float] = []
+
+        def spy(
+            *_args: object, timeout_s: float, **_kwargs: object
+        ) -> subprocess.CompletedProcess[bytes]:
+            seen.append(timeout_s)
+            return subprocess.CompletedProcess(["ssh"], 0, b"", b"")
+
+        monkeypatch.setattr(remote_mux, "run_script", spy)
+        remote_mux.setup_node(NODE, ["amin", "bob"], PC_KEY)
+        remote_mux.setup_node(NODE, ["amin"], PC_KEY, timeout_s=5.0)
+        assert seen == [
+            remote_mux.SETUP_TIMEOUT_S + 2 * remote_mux.SETUP_PER_USER_S,
+            5.0,
+        ]
