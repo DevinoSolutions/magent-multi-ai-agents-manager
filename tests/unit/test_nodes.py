@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -10,7 +11,14 @@ from pathlib import Path
 import pytest
 
 from magent import nodes
-from magent.nodes import LoadSample, LocalGitState, Node, Recipe, RepoSpec
+from magent.nodes import (
+    LoadSample,
+    LocalGitState,
+    Node,
+    NodeMapEntry,
+    Recipe,
+    RepoSpec,
+)
 from tests.conftest import REAL_MAGENT_DIR
 
 NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
@@ -119,3 +127,111 @@ class TestEncodedProjectDir:
             nodes.encoded_project_dir("/home/amin/magent/sendly")
             == "-home-amin-magent-sendly"
         )
+
+
+ENTRY = NodeMapEntry(
+    nick="second",
+    sid="api",
+    placed_ts=1727200000.0,
+    attached_existing=False,
+    remote_root="/home/amin/magent/api",
+)
+
+
+@pytest.fixture
+def node_map(tmp_path, monkeypatch):
+    path = tmp_path / "nodes" / "node-map.json"
+    monkeypatch.setattr(nodes, "NODE_MAP_PATH", path)
+    return path
+
+
+class TestTheNodeMap:
+    def test_what_is_written_reads_back(self, node_map):
+        other = dataclasses.replace(
+            ENTRY, nick="third", sid="web", attached_existing=True
+        )
+        nodes.write_node_map({"api": ENTRY, "web": other})
+        assert nodes.read_node_map() == {"api": ENTRY, "web": other}
+
+    def test_the_file_is_keyed_by_project_name(self, node_map):
+        # The on-disk shape D writes and E/G read -- pinned, not implied.
+        nodes.write_node_map({"api": ENTRY})
+        assert json.loads(node_map.read_text(encoding="utf-8")) == {
+            "api": {
+                "nick": "second",
+                "sid": "api",
+                "placed_ts": 1727200000.0,
+                "attached_existing": False,
+                "remote_root": "/home/amin/magent/api",
+            }
+        }
+
+    def test_a_missing_file_is_an_empty_map(self, node_map):
+        assert not node_map.exists()
+        assert nodes.read_node_map() == {}
+
+    def test_a_torn_file_is_an_empty_map(self, node_map):
+        node_map.parent.mkdir(parents=True)
+        node_map.write_text('{"api": {"nick": "sec', encoding="utf-8")
+        assert nodes.read_node_map() == {}
+
+    @pytest.mark.parametrize("text", ["[1, 2]", '"api"', "null", ""])
+    def test_a_file_that_is_not_an_object_is_an_empty_map(self, node_map, text):
+        node_map.parent.mkdir(parents=True)
+        node_map.write_text(text, encoding="utf-8")
+        assert nodes.read_node_map() == {}
+
+    def test_a_malformed_entry_is_dropped_alone(self, node_map):
+        node_map.parent.mkdir(parents=True)
+        good = dataclasses.asdict(ENTRY)
+        node_map.write_text(
+            json.dumps(
+                {
+                    "api": good,
+                    "web": {"nick": "third"},
+                    "db": {**good, "placed_ts": True},
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert nodes.read_node_map() == {"api": ENTRY}
+
+    def test_an_unknown_field_is_ignored(self, node_map):
+        # A newer magent may add a (defaulted) field; an older reader keeps working.
+        node_map.parent.mkdir(parents=True)
+        node_map.write_text(
+            json.dumps({"api": {**dataclasses.asdict(ENTRY), "future": 1}}),
+            encoding="utf-8",
+        )
+        assert nodes.read_node_map() == {"api": ENTRY}
+
+    def test_a_write_replaces_the_whole_map(self, node_map):
+        nodes.write_node_map({"api": ENTRY})
+        nodes.write_node_map({"web": dataclasses.replace(ENTRY, sid="web")})
+        assert set(nodes.read_node_map()) == {"web"}
+
+    def test_a_write_leaves_no_temp_file(self, node_map):
+        nodes.write_node_map({"api": ENTRY})
+        assert [p.name for p in node_map.parent.iterdir()] == ["node-map.json"]
+
+    def test_a_failed_write_keeps_the_old_map(self, node_map, monkeypatch):
+        nodes.write_node_map({"api": ENTRY})
+
+        def refuse(src, dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(nodes.os, "replace", refuse)
+        with pytest.raises(OSError, match="disk full"):
+            nodes.write_node_map({"web": ENTRY})
+        # read_node_map never calls os.replace, so the patch doesn't blind it.
+        assert nodes.read_node_map() == {"api": ENTRY}
+        assert [p.name for p in node_map.parent.iterdir()] == ["node-map.json"]
+
+    @pytest.mark.parametrize(
+        "field", [f.name for f in dataclasses.fields(NodeMapEntry)]
+    )
+    def test_every_field_is_frozen(self, field):
+        # setattr with a parametrized name: no literal attribute, so no
+        # suppression comment is needed (DECISION-26 iv).
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(ENTRY, field, "x")
