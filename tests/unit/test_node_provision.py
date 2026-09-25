@@ -1374,6 +1374,11 @@ class TestProgramsShUnderRealBash:
 NODE_KEY = "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
 TITLE = "magent amin@devino-second"
 KEY_SCOPES = "admin:public_key, repo"
+# What gh prints for a key GitHub refuses (here: on another account): two lines.
+REFUSED_ADD_STDERR = (
+    "HTTP 422: Validation Failed (https://api.github.com/user/keys)\n"
+    "key is already in use\n"
+)
 
 
 def _adds(gh: FakeSsh) -> list[FakeCall]:
@@ -1432,15 +1437,61 @@ class TestRegisterSshKey:
 
     def test_a_refused_add_fails_with_ghs_own_words(self, fake_gh):
         fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
-        fake_gh.set_reply(
-            "ssh-key add",
-            stderr="HTTP 422: key is already in use (https://api.github.com/user/keys)\n",
-            rc=1,
-        )
+        fake_gh.set_reply("ssh-key add", stderr=REFUSED_ADD_STDERR, rc=1)
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         assert row.status == "fail"
-        assert row.detail.endswith(
-            "HTTP 422: key is already in use (https://api.github.com/user/keys)"
+        assert row.detail.endswith("key is already in use")
+
+    def test_another_key_of_the_same_type_is_not_a_match(self, fake_gh):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply(
+            "user/keys",
+            stdout="ssh-ed25519 AAAAOTHER\nssh-ed25519 AAAAFAKENODEKEYLONGER\n",
+        )
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row.status == "did"
+        assert len(_adds(fake_gh)) == 1
+
+    def test_the_listing_asks_for_every_page(self, fake_gh):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        (listing,) = [c for c in fake_gh.calls() if "user/keys" in c.argv]
+        assert listing.argv == ["api", "--paginate", "user/keys", "--jq", ".[].key"]
+
+    def test_a_failed_listing_is_not_evidence_and_the_add_is_still_tried(self, fake_gh):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("user/keys", stdout="ssh-ed25519 AAAAFAKENODEKEY\n", rc=1)
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert len(_adds(fake_gh)) == 1
+        assert row.status == "did"
+
+    def test_a_malformed_key_is_refused_before_gh_is_asked_for_keys(self, fake_gh):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        row = remote_mux.register_ssh_key("ssh-ed25519", title=TITLE)
+        assert row == ScriptLine("fail", "github-key", "not an ssh public key line")
+        assert [c.argv[:2] for c in fake_gh.calls()] == [["auth", "status"]]
+
+    def test_an_add_that_cannot_run_fails(self, fake_gh, monkeypatch):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        real_gh = remote_mux._gh
+
+        def gh_without_add(
+            args: list[str], *, input_bytes: bytes | None = None
+        ) -> subprocess.CompletedProcess[bytes] | None:
+            if args[:2] == ["ssh-key", "add"]:
+                return None
+            return real_gh(args, input_bytes=input_bytes)
+
+        monkeypatch.setattr(remote_mux, "_gh", gh_without_add)
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine("fail", "github-key", "gh could not run on this PC")
+
+    def test_a_multi_line_refusal_keeps_the_last_line(self, fake_gh):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("ssh-key add", stderr=REFUSED_ADD_STDERR, rc=1)
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine(
+            "fail", "github-key", "gh ssh-key add failed: key is already in use"
         )
 
     def test_gh_finding_the_key_itself_is_a_skip_not_a_did(self, fake_gh):
