@@ -1056,20 +1056,17 @@ def pull(
     node (DECISION-11f). Up to 2 x ``timeout_s`` in all. The watermark only
     moves when every file was stored; a file the node skipped as over the cap
     does not hold it (``NodeSnapshot.skipped``)."""
+    roots = tuple(remote_dirs)
+    # One spec for the refusal and the first call: a refusal names exactly
+    # the pull it would have sent.
+    first_spec = SidPull(roots=roots, project_dir=None, since=since_epoch)
     # Before any ssh: parse_pull refuses the same name with ValueError, which
     # would mean THIS caller's bug, not the node's.
-    roots = tuple(remote_dirs)
     if not pullable_sid(sid):
         raise refused_pull(
-            node,
-            {sid: SidPull(roots=roots, project_dir=None, since=since_epoch)},
-            f"not a pullable session name: {sid!r}",
+            node, {sid: first_spec}, f"not a pullable session name: {sid!r}"
         )
-    first = pull_node(
-        node,
-        {sid: SidPull(roots=roots, project_dir=None, since=since_epoch)},
-        timeout_s=timeout_s,
-    )
+    first = pull_node(node, {sid: first_spec}, timeout_s=timeout_s)
     real = first.realpaths.get(sid)
     if real is None:
         return PullResult(files=first.files, since=since_epoch)

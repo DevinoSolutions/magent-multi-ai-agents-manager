@@ -1433,6 +1433,14 @@ class TestAHungNodeDoesNotHoldTheTick:
         assert shutdowns == [[(False, True)]]
 
 
+def _pull_shown(sid: str, root: str) -> tuple[str, ...]:
+    """The shown form of the first pull final_pull would send for ``sid``
+    on second (as local user amin) -- what a refusal must name exactly."""
+    node = nodes.node_for_nick(_config(), "second", local_user="amin")
+    spec = remote_mux.SidPull(roots=(root,), project_dir=None, since=0.0)
+    return remote_mux._run_shown(node, *remote_mux._pull_call({sid: spec}))
+
+
 class TestTheFinalPull:
     def test_a_first_final_pull_learns_the_directory_then_pulls_its_transcripts(
         self, placed, fake_ssh
@@ -1495,9 +1503,10 @@ class TestTheFinalPull:
     ):
         nodes.write_node_map({"api": _entry("second", sid)})
         with pytest.raises(remote_mux.RemoteError) as info:
-            node_sync.final_pull(_config(), "api")
+            node_sync.final_pull(_config(), "api", local_user="amin")
         assert info.value.rc == 0
         assert info.value.stderr_tail == f"not a pullable session name: {sid!r}"
+        assert info.value.command_redacted == _pull_shown(sid, f"~/magent/{sid}")
         assert info.value.command_redacted[0] == "ssh"
         assert "amin@devino-second" in info.value.command_redacted
         assert info.value.command_redacted[-1].startswith("<stdin: ")
@@ -1519,11 +1528,12 @@ class TestTheFinalPull:
             }
         )
         with pytest.raises(remote_mux.RemoteError) as info:
-            node_sync.final_pull(_config(), "api")
+            node_sync.final_pull(_config(), "api", local_user="amin")
         assert info.value.rc == 0
         assert info.value.stderr_tail == (
             "session 'api' has an empty remote_root in the node map"
         )
+        assert info.value.command_redacted == _pull_shown("api", "")
         assert info.value.command_redacted[0] == "ssh"
         assert fake_ssh.calls() == []
 
