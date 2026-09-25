@@ -466,6 +466,9 @@ class TestHowEachServerIsClassified:
             ({"type": "http", "url": f"http://127.0.0.1{SHY}/mcp"}, LOCAL),
             ({"type": "http", "url": "http://localhost../mcp"}, LOCAL),
             ({"type": "http", "url": f"http://loc{SHY}alhost../mcp"}, LOCAL),
+            # A mapped-to-nothing character hiding a trailing dot from rstrip.
+            ({"type": "http", "url": f"http://localhost.{SHY}:1/"}, LOCAL),
+            ({"type": "http", "url": f"http://127.0.0.1.{ZWSP}:1/"}, LOCAL),
         ],
     )
     def test_the_reason_a_server_stays_behind(self, spec, reason):
@@ -930,6 +933,7 @@ class TestAnEndpointThatPointsAtThisPcNeverShips:
             r"127.0.0.1\@remote.example:3128",
             f"https://loc{SHY}alhost:3456",
             r"ws://127.0.0.1\@remote.example",
+            r"wss://127.0.0.1\@remote.example",
             # Not a special scheme: "\" is no separator, so the host is what
             # follows the "@" -- here this PC.
             r"socks5://remote.example\@127.0.0.1",
