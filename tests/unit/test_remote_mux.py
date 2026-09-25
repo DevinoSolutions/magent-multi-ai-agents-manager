@@ -865,6 +865,21 @@ class TestWhichReposMakeTheProject:
     def test_a_missing_folder_is_empty(self, tmp_path):
         assert remote_mux.repo_paths(tmp_path / "gone") == []
 
+    def test_an_unreadable_folder_is_a_remote_error_naming_it(
+        self, tmp_path, monkeypatch
+    ):
+        # Every failure this module reports is a RemoteError; a bare
+        # PermissionError would escape callers that catch only that.
+        def denied(self):
+            raise PermissionError(13, "Permission denied", str(self))
+
+        monkeypatch.setattr(Path, "iterdir", denied)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.repo_paths(tmp_path)
+        assert exc.value.rc is None
+        assert "Permission denied" in exc.value.stderr_tail
+        assert str(tmp_path) in str(exc.value)
+
 
 @needs_git
 class TestTheLocalTreeIsReadNotChanged:
@@ -881,12 +896,13 @@ class TestTheLocalTreeIsReadNotChanged:
         origin, clone = make_origin_and_clone(tmp_path)
         state = remote_mux.git_state(clone)
         assert Path(state.url).resolve() == origin.resolve()
-        assert (state.branch, state.dirty, state.unpushed, state.detached) == (
-            "main",
-            False,
-            False,
-            False,
-        )
+        assert (
+            state.branch,
+            state.dirty,
+            state.unpushed,
+            state.detached,
+            state.no_commits,
+        ) == ("main", False, False, False, False)
 
     def test_an_uncommitted_edit_is_dirty(self, tmp_path):
         _, clone = make_origin_and_clone(tmp_path)
@@ -942,13 +958,21 @@ class TestTheLocalTreeIsReadNotChanged:
             state.detached,
             state.unpushed,
             state.dirty,
-        ) == (
-            "",
-            "main",
-            False,
-            False,
-            False,
-        )
+            state.no_commits,
+        ) == ("", "main", False, False, False, True)
+
+    def test_an_empty_clone_has_no_commits_and_counts_as_unpushed(self, tmp_path):
+        # rev-list against a HEAD that does not exist fails; that stays
+        # "unpushed" (never a pass), and no_commits tells D7 why, so the
+        # refusal does not name a push that cannot work ("src refspec main
+        # does not match any").
+        origin = tmp_path / "empty-origin.git"
+        git(tmp_path, "init", "-q", "--bare", str(origin))
+        clone = tmp_path / "empty"
+        git(tmp_path, "clone", "-q", str(origin), str(clone))
+        state = remote_mux.git_state(clone)
+        assert state.url
+        assert (state.branch, state.no_commits, state.unpushed) == ("main", True, True)
 
     def test_the_ignored_listing_rides_along(self, tmp_path):
         _, clone = make_origin_and_clone(tmp_path)
@@ -972,6 +996,57 @@ class TestTheLocalTreeIsReadNotChanged:
         before = snapshot()
         remote_mux.git_state(clone)
         assert snapshot() == before
+
+    def test_the_read_rewrites_no_index(self, tmp_path):
+        # A plain `git status` refreshes the stat cache: it takes index.lock
+        # and rewrites .git/index (measured) -- a live agent's own git call in
+        # that repo then fails "index.lock: File exists".
+        _, clone = make_origin_and_clone(tmp_path)
+        readme = clone / "README.md"
+        later = readme.stat().st_mtime + 120
+        os.utime(readme, (later, later))  # same bytes, stale stat: a refresh
+        index = clone / ".git" / "index"
+        before = (index.read_bytes(), index.stat().st_mtime_ns)
+        state = remote_mux.git_state(clone)
+        assert not state.dirty
+        assert (index.read_bytes(), index.stat().st_mtime_ns) == before
+        assert not (clone / ".git" / "index.lock").exists()
+
+    def test_a_user_hiding_untracked_files_does_not_hide_them_here(self, tmp_path):
+        # status.showUntrackedFiles=no empties `status --porcelain`; the file
+        # would still be missing on the node.
+        _, clone = make_origin_and_clone(tmp_path)
+        git(clone, "config", "status.showUntrackedFiles", "no")
+        (clone / "notes.txt").write_text("x\n", encoding="utf-8")
+        assert git(clone, "status", "--porcelain") == ""  # the config bites
+        assert remote_mux.git_state(clone).dirty
+
+    def test_a_hook_env_cannot_aim_the_read_at_another_repo(
+        self, tmp_path, monkeypatch
+    ):
+        # A git hook exports GIT_DIR (absolute, in a worktree); the launch
+        # path can run under one. The read locates its repo by -C alone.
+        origin, clone = make_origin_and_clone(tmp_path)
+        (clone / ".gitignore").write_text(".env\n", encoding="utf-8")
+        git(clone, "add", ".gitignore")
+        git(clone, "commit", "-q", "--no-verify", "-m", "ignore")
+        git(clone, "push", "-q")
+        (clone / ".env").write_text("K=v\n", encoding="utf-8")
+        other = tmp_path / "other"
+        other.mkdir()
+        git(other, "init", "-q")
+        git(other, "switch", "-q", "-c", "elsewhere")
+        commit(other, name="other.txt", text="o\n", message="other")
+        (other / "stray.txt").write_text("s\n", encoding="utf-8")
+        other_index = (other / ".git" / "index").read_bytes()
+        monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+        monkeypatch.setenv("GIT_WORK_TREE", str(other))
+        monkeypatch.setenv("GIT_INDEX_FILE", str(other / ".git" / "index"))
+        state = remote_mux.git_state(clone)
+        assert Path(state.url).resolve() == origin.resolve()
+        assert (state.branch, state.dirty, state.unpushed) == ("main", False, False)
+        assert ".env" in state.ignored
+        assert (other / ".git" / "index").read_bytes() == other_index
 
     def test_a_folder_that_is_not_a_repo_is_a_remote_error(self, tmp_path):
         plain = tmp_path / "plain"
@@ -1400,3 +1475,87 @@ class TestPushingFilesToARunningProject:
     def test_a_push_result_without_a_list_ships_nothing(self, node_home, tmp_path):
         _answers(node_home, {"sid": "api"})
         assert remote_mux.push_files(NODE, _recipe(tmp_path)) == []
+
+
+def _fake_git_popen(monkeypatch, *, hang: bool = False) -> list:
+    """Every local git child, recorded without running git: argv, env and the
+    timeout ``communicate`` was given. Answers a clean, pushed ``main``."""
+    spawned: list = []
+    replies = {
+        "remote": b"git@github.com:me/api.git\n",
+        "symbolic-ref": b"main\n",
+        "rev-list": b"0\n",
+    }
+
+    class FakeProc:
+        def __init__(self, argv, **kwargs):
+            self.argv = argv
+            self.env = kwargs.get("env")
+            self.returncode = 0
+            self.timeout = None
+            self.killed = False
+            spawned.append(self)
+
+        def communicate(self, *_args, timeout=None, **_kwargs):
+            self.timeout = timeout
+            if hang:
+                raise subprocess.TimeoutExpired(self.argv, timeout)
+            return replies.get(self.argv[4], b""), b""
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(remote_mux.subprocess, "Popen", FakeProc)
+    return spawned
+
+
+class TestEveryLocalGitReadIsBoundedScrubbedAndLockFree:
+    """The argv, env and timeout of every git child ``git_state`` spawns,
+    pinned without running git."""
+
+    def test_each_read_takes_no_optional_lock_and_the_one_bound(
+        self, tmp_path, monkeypatch
+    ):
+        spawned = _fake_git_popen(monkeypatch)
+        remote_mux.git_state(tmp_path)
+        verbs = [proc.argv[4] for proc in spawned]
+        assert {"rev-parse", "status", "rev-list", "ls-files"} <= set(verbs)
+        for proc in spawned:
+            assert proc.argv[:4] == ["git", "-C", str(tmp_path), "--no-optional-locks"]
+            # ignored_paths included: it walks the same tree status does.
+            assert proc.timeout == remote_mux.GIT_TIMEOUT_S
+
+    def test_status_counts_every_untracked_file_and_submodule(
+        self, tmp_path, monkeypatch
+    ):
+        spawned = _fake_git_popen(monkeypatch)
+        remote_mux.git_state(tmp_path)
+        (status,) = [p.argv for p in spawned if p.argv[4] == "status"]
+        assert "--untracked-files=normal" in status
+        assert "--ignore-submodules=none" in status
+
+    def test_no_child_inherits_a_repo_locating_var(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GIT_DIR", str(tmp_path / "elsewhere" / ".git"))
+        monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "elsewhere"))
+        spawned = _fake_git_popen(monkeypatch)
+        remote_mux.git_state(tmp_path)
+        for proc in spawned:
+            assert proc.env is not None
+            assert "GIT_DIR" not in proc.env
+            assert "GIT_WORK_TREE" not in proc.env
+            assert proc.env["PATH"] == os.environ["PATH"]
+
+    def test_a_hung_read_is_killed_at_the_bound_and_names_the_timeout(
+        self, tmp_path, monkeypatch
+    ):
+        spawned = _fake_git_popen(monkeypatch, hang=True)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.git_state(tmp_path)
+        (proc,) = spawned
+        assert proc.timeout == remote_mux.GIT_TIMEOUT_S
+        assert proc.killed
+        assert exc.value.rc is None
+        assert "timed out" in exc.value.stderr_tail

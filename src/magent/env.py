@@ -469,6 +469,50 @@ def attach_client_env() -> dict[str, str] | None:
     }
 
 
+# Git's repo-LOCATING variables: exactly what `git rev-parse --local-env-vars`
+# prints (git 2.52; pinned against the installed git by test_env_schema.py).
+# A git hook exports GIT_DIR -- an ABSOLUTE path inside a worktree -- and every
+# git child of that hook inherits it. A local read aimed by ``-C <path>`` must
+# not be silently answered by the repo the hook was fired in instead.
+GIT_LOCAL_ENV_VARS = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+)
+
+
+def git_child_env() -> dict[str, str]:
+    """The process environment minus ``GIT_LOCAL_ENV_VARS``: THE seam for a
+    local git child that names its repo with ``-C``.
+
+    The incident this closes: magent's launch path (and its test suite, via
+    the husky pre-push gate) can run inside a git hook or an agent's tool
+    shell. With the hook's GIT_DIR inherited, ``git -C <project> status``
+    reads the HOOK's repo, and a test fixture's ``git init --bare`` rewrote a
+    real repo's shared config to ``core.bare=true``. Everything else --
+    PATH, HOME, GIT_CEILING_DIRECTORIES, the user's config -- survives: those
+    bound or configure a search, they do not aim one. (GIT_CONFIG_KEY_<n> /
+    GIT_CONFIG_VALUE_<n> are inert once GIT_CONFIG_COUNT is gone.) Matched on
+    the upper-cased name, as Windows env keys are case-insensitive."""
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() not in GIT_LOCAL_ENV_VARS
+    }
+
+
 def config_base() -> Path:
     """The platform-appropriate config base directory."""
     if sys.platform == "win32":

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -640,3 +642,41 @@ class TestLocalUsername:
         monkeypatch.delenv("USERNAME", raising=False)
         monkeypatch.delenv("USER", raising=False)
         assert env_module.local_username() == ""
+
+
+class TestGitChildEnv:
+    """`git_child_env` -- a local git read locates its repo by ``-C``, never by
+    an inherited GIT_DIR (a git hook exports one; in a worktree it is absolute)."""
+
+    @pytest.mark.parametrize("name", env_module.GIT_LOCAL_ENV_VARS)
+    def test_every_repo_locating_var_is_dropped(
+        self, monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        monkeypatch.setenv(name, "/elsewhere/.git")
+        assert name not in env_module.git_child_env()
+
+    def test_everything_else_survives(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # GIT_CEILING_DIRECTORIES bounds a search, it does not aim one; PATH is
+        # how git is found at all.
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", "/tmp/ceiling")
+        monkeypatch.setenv("GIT_DIR", "/elsewhere/.git")
+        child = env_module.git_child_env()
+        assert child["GIT_CEILING_DIRECTORIES"] == "/tmp/ceiling"
+        assert child["PATH"] == os.environ["PATH"]
+        assert child == {k: v for k, v in os.environ.items() if k != "GIT_DIR"}
+
+    def test_the_list_is_the_one_git_itself_publishes(self, tmp_path: Path) -> None:
+        # A newer git that adds a repo-locating variable turns this red, not a
+        # silently misdirected read.
+        if shutil.which("git") is None:
+            pytest.skip("git is not installed")
+        published = subprocess.run(
+            ["git", "rev-parse", "--local-env-vars"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        ).stdout.split()
+        assert published
+        assert set(published) <= set(env_module.GIT_LOCAL_ENV_VARS)

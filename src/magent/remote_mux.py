@@ -14,8 +14,8 @@ local git reads a bring-up needs. Every function returns data or raises
 - ``BatchMode=yes`` everywhere: a password prompt nobody can answer is a hang.
 
 A leaf: never imports ``magent.cli`` (LS-A-001); its magent imports are the
-leaves ``attach_client``, ``log``, ``node_scripts``, ``nodes``, ``psmux`` and
-``sessions``.
+leaves ``attach_client``, ``env``, ``log``, ``node_scripts``, ``nodes``,
+``psmux`` and ``sessions``.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 
 from magent import node_scripts, psmux
 from magent.attach_client import SSH_MISSING_RC, TMUX_SOCKET
+from magent.env import git_child_env
 from magent.log import get_logger
 from magent.nodes import (
     LoadSample,
@@ -47,7 +48,7 @@ from magent.nodes import (
 from magent.sessions import build_resume_command
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from magent.nodes import Node, Recipe
 
@@ -204,10 +205,13 @@ def _spawn(
     check: bool,
     shown: tuple[str, ...],
     label: str,
+    env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """One bounded child -- the shared body of ``run`` and the local git reads
     (``ignored_paths``, ``git_state``). ``shown`` is what an error and a log line may say
-    about the command; ``label`` opens every log line, naming who spawned it."""
+    about the command; ``label`` opens every log line, naming who spawned it.
+    ``env`` None is the plain inherited environment (every ssh call); only
+    the local git reads pass one (``_local_git``)."""
     try:
         proc = subprocess.Popen(
             argv,
@@ -215,6 +219,7 @@ def _spawn(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             creationflags=_SPAWN_FLAGS,
+            env=env,
         )
     except OSError as e:
         # A FileNotFoundError is the client vanishing between find_ssh and the
@@ -516,73 +521,82 @@ def sample(node: Node) -> LoadSample:
     return reading
 
 
-def ignored_paths(repo: Path, *, timeout_s: float, label: str) -> tuple[str, ...]:
-    """What git ignores in the LOCAL ``repo``: ``git ls-files --others --ignored
-    --exclude-standard --directory -z`` -- repo-relative, '/'-separated, and a
-    wholly ignored directory as ONE ``dir/`` entry (``node_modules`` is one
-    line, not a hundred thousand). Read-only. The raw material for
-    ``nodes.push_set``; ``git_state`` carries it as ``LocalGitState.ignored``.
-    ``label`` names the caller in the log line a failure writes.
-
-    A ``repo`` that is not a git repository is ``RemoteError(rc=128, <git's
-    stderr tail>)`` -- git's own "fatal: not a git repository" exit. A missing
-    ``git`` is RemoteError rc None ("git not found on PATH"): the command never
-    ran. ``_spawn`` reads a FileNotFoundError as the missing ssh client (rc
-    127), which is not what happened here."""
-    argv = [
-        "git",
-        "-C",
-        str(repo),
-        "ls-files",
-        "--others",
-        "--ignored",
-        "--exclude-standard",
-        "--directory",
-        "-z",
-    ]
-    shown = tuple(argv)
-    try:
-        result = _spawn(
-            argv,
-            timeout_s=timeout_s,
-            input_bytes=None,
-            check=True,
-            shown=shown,
-            label=label,
-        )
-    except RemoteError as e:
-        if isinstance(e.__cause__, FileNotFoundError):
-            raise RemoteError(None, "git not found on PATH", shown) from e.__cause__
-        raise
-    return tuple(p for p in result.stdout.decode("utf-8", "replace").split("\0") if p)
-
-
 # A local git read is a local process, but it can still hang (a credential
 # prompt, a network filesystem); bounded like every other child.
 GIT_TIMEOUT_S = 30.0
 
 
-def _git(
-    path: Path, *args: str, check: bool = True
+def _local_git(
+    path: Path, args: Sequence[str], *, timeout_s: float, check: bool, label: str
 ) -> subprocess.CompletedProcess[bytes]:
-    """One bounded, read-only ``git -C <path> <args>``. A missing ``git`` is
-    RemoteError rc None ("git not found on PATH"), as in ``ignored_paths``:
-    ``_spawn`` alone would call it the missing ssh client (rc 127)."""
-    argv = ["git", "-C", str(path), *args]
+    """One bounded, READ-ONLY ``git -C <path> --no-optional-locks <args>`` --
+    the shared body of ``ignored_paths`` and every ``git_state`` read. Three
+    things make it safe to aim at a repo an agent is working in right now:
+
+    - ``--no-optional-locks`` (a global option, so before the subcommand):
+      ``git status`` otherwise refreshes the stat cache under ``index.lock``
+      and rewrites ``.git/index`` (measured), and the agent's own git call
+      then fails "index.lock: File exists";
+    - ``env.git_child_env()``: an inherited GIT_DIR / GIT_WORK_TREE -- a git
+      hook exports them, absolute in a worktree -- would answer for another
+      repo than the one ``-C`` names;
+    - a missing ``git`` is RemoteError rc None ("git not found on PATH"):
+      ``_spawn`` alone would call it the missing ssh client (rc 127)."""
+    argv = ["git", "-C", str(path), "--no-optional-locks", *args]
     shown = tuple(argv)
     try:
         return _spawn(
             argv,
-            timeout_s=GIT_TIMEOUT_S,
+            timeout_s=timeout_s,
             input_bytes=None,
             check=check,
             shown=shown,
-            label="git state read",
+            label=label,
+            env=git_child_env(),
         )
     except RemoteError as e:
         if isinstance(e.__cause__, FileNotFoundError):
             raise RemoteError(None, "git not found on PATH", shown) from e.__cause__
         raise
+
+
+def ignored_paths(repo: Path, *, timeout_s: float, label: str) -> tuple[str, ...]:
+    """What git ignores in the LOCAL ``repo``: ``git ls-files --others --ignored
+    --exclude-standard --directory -z`` -- repo-relative, '/'-separated, and a
+    wholly ignored directory as ONE ``dir/`` entry (``node_modules`` is one
+    line, not a hundred thousand). Read-only (``_local_git``). The raw material
+    for ``nodes.push_set``; ``git_state`` carries it as
+    ``LocalGitState.ignored``. ``label`` names the caller in the log line a
+    failure writes.
+
+    A ``repo`` that is not a git repository is ``RemoteError(rc=128, <git's
+    stderr tail>)`` -- git's own "fatal: not a git repository" exit. A missing
+    ``git`` is RemoteError rc None ("git not found on PATH"): the command never
+    ran."""
+    result = _local_git(
+        repo,
+        [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ],
+        timeout_s=timeout_s,
+        check=True,
+        label=label,
+    )
+    return tuple(p for p in result.stdout.decode("utf-8", "replace").split("\0") if p)
+
+
+def _git(
+    path: Path, *args: str, check: bool = True
+) -> subprocess.CompletedProcess[bytes]:
+    """One ``git_state`` read (``_local_git``), bounded by ``GIT_TIMEOUT_S``."""
+    return _local_git(
+        path, args, timeout_s=GIT_TIMEOUT_S, check=check, label="git state read"
+    )
 
 
 def _out(result: subprocess.CompletedProcess[bytes]) -> str:
@@ -593,45 +607,74 @@ def repo_paths(project_dir: Path) -> list[Path]:
     """The git repos a node project is made of: the project itself when it is
     a repo, else each DIRECT child that is one (a workspace of repos), in name
     order. Empty when there is none -- which the caller refuses, because a
-    node clones the project from its origin."""
-    if (project_dir / ".git").exists():
-        return [project_dir]
-    if not project_dir.is_dir():
-        return []
-    return sorted(
-        child
-        for child in project_dir.iterdir()
-        if child.is_dir() and (child / ".git").exists()
-    )
+    node clones the project from its origin. A folder that cannot be read (a
+    permission, a vanished network drive) is RemoteError rc None naming it,
+    like every other failure this module reports."""
+    try:
+        if (project_dir / ".git").exists():
+            return [project_dir]
+        if not project_dir.is_dir():
+            return []
+        return sorted(
+            child
+            for child in project_dir.iterdir()
+            if child.is_dir() and (child / ".git").exists()
+        )
+    except OSError as e:
+        reason = f"cannot read {project_dir}: {e.strerror or e}"
+        get_logger("nodes").warning("repo lookup failed: %s", reason)
+        raise RemoteError(None, reason, ("repo_paths", str(project_dir))) from e
 
 
 def git_state(path: Path) -> LocalGitState:
-    """What D7 needs to know about the LOCAL repo at ``path``, read-only.
+    """What D7 needs to know about the LOCAL repo at ``path``, read-only: every
+    read goes through ``_local_git`` (no optional lock, no inherited GIT_DIR).
 
-    ``url`` is origin's, "" when there is no origin. ``detached`` when HEAD
-    names no branch (``branch`` is then ""). A repo with no commits yet is
-    not detached: HEAD still names its unborn branch. ``dirty`` counts
-    untracked files too -- origin never saw them, so the node would not have
-    them. ``unpushed`` is "HEAD has commits origin's copy of this branch
-    lacks", and a branch origin has never seen counts. Raises RemoteError
-    when ``path`` is not a repo or git itself fails."""
+    - ``url`` is origin's, "" when there is no origin.
+    - ``detached`` when HEAD names no branch (``branch`` is then "").
+    - ``no_commits`` when HEAD is unborn: a repo with no commits yet names its
+      branch (not detached) but has nothing to push -- D7 says "make a first
+      commit" instead of a ``git push`` that would fail.
+    - ``dirty`` counts untracked files too -- origin never saw them, so the
+      node would not have them -- whatever the user's
+      ``status.showUntrackedFiles`` or submodule-ignore config says.
+    - ``unpushed`` is "HEAD has commits origin's copy of this branch lacks";
+      a branch origin has never seen counts, and so does an unborn HEAD (never
+      a pass). The comparison is against ``refs/remotes/origin/<branch>``, not
+      ``@{u}``: the node fetches by branch NAME from origin, whatever this
+      branch tracks. It is only as fresh as the last fetch here -- the
+      read-only rule forbids a fetch or an ``ls-remote``.
+
+    Raises RemoteError when ``path`` is not a repo or git itself fails."""
     _git(path, "rev-parse", "--git-dir")
     origin = _git(path, "remote", "get-url", "origin", check=False)
     url = _out(origin) if origin.returncode == 0 else ""
     head = _git(path, "symbolic-ref", "-q", "--short", "HEAD", check=False)
     detached = head.returncode != 0
     branch = "" if detached else _out(head)
-    dirty = bool(_out(_git(path, "status", "--porcelain")))
+    verify = _git(path, "rev-parse", "-q", "--verify", "HEAD", check=False)
+    no_commits = verify.returncode != 0
+    status = _git(
+        path,
+        "status",
+        "--porcelain",
+        "--untracked-files=normal",
+        "--ignore-submodules=none",
+    )
+    dirty = bool(_out(status))
     unpushed = False
     if url and not detached:
-        ahead = _git(
-            path,
-            "rev-list",
-            "--count",
-            f"refs/remotes/origin/{branch}..HEAD",
-            check=False,
-        )
-        unpushed = ahead.returncode != 0 or _out(ahead) != "0"
+        if no_commits:
+            unpushed = True
+        else:
+            ahead = _git(
+                path,
+                "rev-list",
+                "--count",
+                f"refs/remotes/origin/{branch}..HEAD",
+                check=False,
+            )
+            unpushed = ahead.returncode != 0 or _out(ahead) != "0"
     return LocalGitState(
         path=path,
         url=url,
@@ -639,7 +682,8 @@ def git_state(path: Path) -> LocalGitState:
         dirty=dirty,
         unpushed=unpushed,
         detached=detached,
-        ignored=ignored_paths(path, timeout_s=PROBE_TIMEOUT_S, label="git state read"),
+        ignored=ignored_paths(path, timeout_s=GIT_TIMEOUT_S, label="git state read"),
+        no_commits=no_commits,
     )
 
 
