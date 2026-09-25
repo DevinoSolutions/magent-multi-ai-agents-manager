@@ -11,9 +11,12 @@ secrets must travel. Each call is its OWN pair of files
 lines on CI. The base directory is baked into the recorder as a literal, so no
 environment plumbing is needed.
 
-Known limit of the ``.cmd`` launcher on Windows: cmd.exe re-reads ``%*``, so
-an argument mixing a single quote with ``&``/``|`` can be split. remote_mux
-ships scripts over stdin, so no test needs such an argument.
+Known limit of the ``.cmd`` launcher on Windows: ``cmd /c`` percent-expands
+the line, so an argument containing a DEFINED ``%NAME%`` (``%PATH%``) is
+recorded with that variable's value pasted in -- rc 0, a silently wrong
+record. An undefined name is left alone, so ``date +%s`` is safe; a single
+quote mixed with ``&``/``|``/``>`` round-trips fine. Exact-argv fidelity for
+such an argument would need an .exe launcher rather than a .cmd.
 """
 
 from __future__ import annotations
@@ -54,8 +57,10 @@ stem = str(time.time_ns()) + "-" + str(os.getpid())
 
 mode = (BASE / "mode.txt").read_text(encoding="utf-8").strip() if (BASE / "mode.txt").exists() else "ok"
 if mode == "timeout":
-    # Outlive any test's bound without writing a byte.
-    time.sleep(30)
+    # Outlive any test's bound without writing a byte. Short on purpose: on
+    # Windows kill() reaps cmd.exe, and this python lives out the sleep as an
+    # orphan.
+    time.sleep(5)
     sys.exit(0)
 
 line = " ".join(args)
@@ -106,7 +111,7 @@ class FakeSsh:
         replies_path.write_text(json.dumps(replies), encoding="utf-8")
 
     def set_mode(self, mode: str) -> None:
-        """``"timeout"``: every call hangs silently for 30s."""
+        """``"timeout"``: every call hangs silently for 5s."""
         (self.base / "mode.txt").write_text(mode, encoding="utf-8")
 
     def calls(self) -> list[FakeCall]:

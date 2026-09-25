@@ -52,8 +52,8 @@ BRING_UP_TIMEOUT_S = 600.0
 # dead node surface as ssh's own exit 255 (unreachable) before the subprocess
 # bound turns it into rc None (hung): the distinction RemoteError carries.
 # ServerAlive: a link that dies mid-bring-up (600s bound) fails in ~45s.
-# ssh honours the FIRST value of a repeated -o, so these lead the argv and a
-# caller appending its own -o cannot override them.
+# ssh honours the FIRST value of a repeated -o and a command-line -o beats
+# ~/.ssh/config, so a node user's config cannot turn BatchMode off.
 CONNECT_TIMEOUT_S = 5
 SSH_BATCH_OPTS = (
     "-o",
@@ -72,15 +72,22 @@ _STDERR_TAIL_LINES = 20
 # How long a killed child gets to be reaped. The process is already dead; the
 # only thing that can still take time is a pipe magent stopped caring about.
 _REAP_TIMEOUT_S = 1.0
-# No console window per ssh on Windows. Read off the module rather than
-# hand-defined so this file needs no `sys.platform` branch (accounts.py idiom).
+# No console window per ssh on Windows -- the flag psmux._SPAWN_FLAGS carries
+# for every psmux control spawn. Read off the module rather than hand-defined,
+# so this file needs no `sys.platform` branch.
 _SPAWN_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 class RemoteError(RuntimeError):
-    """A node call that failed: ``rc`` (None when it never finished -- a spawn
-    failure or a timeout), the last lines of its stderr, and the argv it ran
-    with stdin reduced to its length. Never file contents, never a token."""
+    """A node call that failed: ``rc``, the last lines of its stderr, and the
+    argv it ran with stdin reduced to its length. Never file contents, never a
+    token.
+
+    ``rc`` None means the call never finished, and that covers two opposite
+    cases. After a spawn failure the command never ran. After a timeout the
+    OUTCOME IS UNKNOWN: killing the local ssh does not stop a non-tty remote
+    command, so it may have run to completion (a killed send may have landed).
+    A caller must therefore never retry a mutation blindly on rc None."""
 
     def __init__(
         self, rc: int | None, stderr_tail: str, command_redacted: tuple[str, ...]
@@ -158,8 +165,9 @@ def _spawn(
     check: bool,
     shown: tuple[str, ...],
 ) -> subprocess.CompletedProcess[bytes]:
-    """One bounded child -- the shared body of ``run`` and the local git reads.
-    ``shown`` is what an error and a log line may say about the command."""
+    """One bounded child -- the shared body of ``run`` and the local git reads
+    (a later task). ``shown`` is what an error and a log line may say about
+    the command."""
     try:
         proc = subprocess.Popen(
             argv,
@@ -168,12 +176,18 @@ def _spawn(
             stderr=subprocess.PIPE,
             creationflags=_SPAWN_FLAGS,
         )
-    except FileNotFoundError as e:
-        # The client vanished between find_ssh and the spawn (or its cached
-        # path went stale): the same "not installed" as no client at all.
-        raise RemoteError(SSH_MISSING_RC, str(e), shown) from e
     except OSError as e:
-        raise RemoteError(None, str(e), shown) from e
+        # A FileNotFoundError is the client vanishing between find_ssh and the
+        # spawn (or its cached path going stale): the same "not installed" as
+        # no client at all. strerror, not str(e): CPython's POSIX
+        # _execute_child puts the client's path in str(e), and an error or a
+        # log line names the program only.
+        rc = SSH_MISSING_RC if isinstance(e, FileNotFoundError) else None
+        reason = e.strerror or str(e)
+        get_logger("nodes").warning(
+            "node call could not start (%s): %s", reason, shlex.join(shown)
+        )
+        raise RemoteError(rc, reason, shown) from e
     try:
         out, err = proc.communicate(input=input_bytes, timeout=timeout_s)
     except subprocess.TimeoutExpired:
@@ -181,7 +195,7 @@ def _spawn(
         # Reap the direct child only, bounded. A second communicate() would
         # wait for every pipe's write end, and the interpreter behind a
         # .cmd/sh shim is a GRANDCHILD still holding one -- the 90s-for-a-5s
-        # timeout defect accounts._run and psmux.probe_control_plane hit.
+        # timeout defect psmux.probe_control_plane documents.
         with contextlib.suppress(subprocess.TimeoutExpired, OSError):
             proc.wait(timeout=_REAP_TIMEOUT_S)
         get_logger("nodes").warning(
@@ -208,7 +222,8 @@ def run(
     string (``_remote_string``). Raises RemoteError on a spawn failure, a
     missing client (rc 127), a timeout (rc None), or -- with ``check`` -- a
     non-zero exit. With ``check=False`` every exit code comes back for the
-    caller to classify."""
+    caller to classify. The returned ``CompletedProcess.args`` is the real
+    argv, this PC's client path included: a caller must not log it."""
     tail = _ssh_tail(node, argv_remote, tty=False)
     # Errors and log lines name the program, not this PC's path to it.
     shown = _redacted(["ssh", *tail], input_bytes)

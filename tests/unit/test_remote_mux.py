@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from magent import attach_client, node_scripts, remote_mux
+from magent import attach_client, log, node_scripts, remote_mux
 from magent.attach_client import SSH_CONNECTION_OPTS
 from magent.nodes import LoadSample, Node
 from magent.remote_mux import RemoteError
@@ -63,10 +63,15 @@ class TestSshArgv:
         assert int(opt.split("=", 1)[1]) < remote_mux.PROBE_TIMEOUT_S
 
     def test_the_interactive_attach_set_is_not_reused(self, fake_ssh):
-        # attach_client's set is scoped to the attach pane (ConnectTimeout=20).
+        # attach_client's set is scoped to the attach pane, whose connect
+        # bound is longer than a whole probe here.
+        attach_bounds = [
+            opt for opt in SSH_CONNECTION_OPTS if opt.startswith("ConnectTimeout=")
+        ]
+        assert attach_bounds
         argv = remote_mux.ssh_argv(NODE, LS)
-        assert "ConnectTimeout=20" not in argv
-        assert SSH_CONNECTION_OPTS != remote_mux.SSH_BATCH_OPTS
+        for opt in attach_bounds:
+            assert opt not in argv
 
     def test_argv0_is_the_client_find_ssh_resolved_never_a_bare_ssh(self, fake_ssh):
         # A bare "ssh" spawned by any caller would resolve the REAL client off
@@ -174,6 +179,30 @@ class TestRun:
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["true"], timeout_s=5)
         assert exc.value.rc == 127
+
+    def test_a_spawn_failure_never_names_this_pcs_client_path(
+        self, tmp_path, monkeypatch
+    ):
+        # CPython's POSIX _execute_child puts the executable path in str(e);
+        # an error or a log line names the program, never where it lives.
+        gone = str(tmp_path / "no-such-ssh.exe")
+        monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: gone)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["true"], timeout_s=5)
+        assert gone not in str(exc.value)
+        assert gone not in exc.value.stderr_tail
+
+    def test_a_spawn_failure_is_logged_like_any_other_failure(
+        self, tmp_path, monkeypatch
+    ):
+        gone = str(tmp_path / "no-such-ssh.exe")
+        monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: gone)
+        with pytest.raises(RemoteError):
+            remote_mux.run(NODE, ["true"], timeout_s=5)
+        logged = (log.LOG_DIR / "nodes.log").read_text(encoding="utf-8")
+        assert "WARNING" in logged
+        assert NODE.target in logged
+        assert gone not in logged
 
     def test_an_exact_tmux_target_reaches_bash_quoted(self, fake_ssh):
         # zsh would expand a bare `=api` as a command lookup; inside the
