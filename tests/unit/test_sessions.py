@@ -777,3 +777,12 @@ class TestRemoteSshCanKeepTheUser:
             "code",
             "/f",
         ]
+
+    def test_an_empty_user_is_not_kept(self):
+        # `@h` names no user; `ssh-remote+@h` would be an empty-user authority.
+        assert build_code_open_command("/f", "@h", "code", keep_user=True) == [
+            "code",
+            "--remote",
+            "ssh-remote+h",
+            "/f",
+        ]

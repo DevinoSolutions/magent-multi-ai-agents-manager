@@ -231,13 +231,16 @@ def build_code_open_command(
 
     ``keep_user`` keeps a ``user@`` in the authority -- a pool node's user is
     resolved by magent and may not exist in the ssh config (the nodes
-    feature). A target with no hostname still opens locally either way.
+    feature). A target with no hostname still opens locally either way, and
+    one with an empty user (``@host``) keeps only the hostname.
     """
     args = [code_bin]
     if ssh_host:
-        hostname = ssh_host.split("@", 1)[1] if "@" in ssh_host else ssh_host
+        user, at, host_part = ssh_host.partition("@")
+        hostname = host_part if at else ssh_host
         if hostname:
-            authority = ssh_host if keep_user else hostname
+            # An empty user (`@host`) would build `ssh-remote+@host`.
+            authority = ssh_host if keep_user and user else hostname
             args.extend(["--remote", f"ssh-remote+{authority}"])
     args.append(folder)
     return args
