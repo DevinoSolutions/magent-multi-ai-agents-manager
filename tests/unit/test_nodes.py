@@ -8,6 +8,8 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import threading
 from dataclasses import MISSING
 from pathlib import Path, PurePosixPath
 
@@ -21,6 +23,7 @@ from magent.config import (
     ProjectConfig,
     Settings,
 )
+from magent.lockfile import LockHeld
 from magent.nodes import (
     LoadSample,
     LocalGitState,
@@ -197,6 +200,8 @@ class TestTheNodeMap:
                 "placed_ts": 1727200000.0,
                 "attached_existing": False,
                 "remote_root": "/home/amin/magent/api",
+                "target": "",
+                "cwd": "",
             }
         }
 
@@ -369,6 +374,268 @@ class TestTheStrictRead:
         with pytest.raises(OSError, match="I/O error"):
             nodes.load_node_map_strict()
         assert (busy.reads, sleeps) == (1, [])
+
+
+class TestTheMapRecordsHowToReachASession:
+    def test_target_and_cwd_round_trip(self, node_map):
+        entry = dataclasses.replace(
+            ENTRY, target="amin@devino-second", cwd="/home/amin/magent/api"
+        )
+        nodes.write_node_map({"api": entry})
+        assert nodes.read_node_map() == {"api": entry}
+
+    def test_an_entry_written_before_pr_d_reads_with_empty_target_and_cwd(
+        self, node_map
+    ):
+        node_map.parent.mkdir(parents=True)
+        old = {
+            k: v
+            for k, v in dataclasses.asdict(ENTRY).items()
+            if k not in ("target", "cwd")
+        }
+        node_map.write_text(json.dumps({"api": old}), encoding="utf-8")
+        assert nodes.read_node_map()["api"].target == ""
+        assert nodes.read_node_map()["api"].cwd == ""
+
+    def test_a_non_string_target_reads_as_empty_not_as_a_dropped_entry(self, node_map):
+        node_map.parent.mkdir(parents=True)
+        raw = {**dataclasses.asdict(ENTRY), "target": 7, "cwd": ["x"]}
+        node_map.write_text(json.dumps({"api": raw}), encoding="utf-8")
+        assert nodes.read_node_map()["api"].target == ""
+        assert nodes.read_node_map()["api"].cwd == ""
+
+    def test_an_update_changes_one_project_and_keeps_the_rest(self, node_map):
+        nodes.write_node_map({"web": dataclasses.replace(ENTRY, sid="web")})
+        assert set(nodes.update_node_map("api", ENTRY)) == {"api", "web"}
+        assert set(nodes.read_node_map()) == {"api", "web"}
+
+    def test_an_update_with_none_removes_that_project(self, node_map):
+        nodes.write_node_map(
+            {"api": ENTRY, "web": dataclasses.replace(ENTRY, sid="web")}
+        )
+        nodes.update_node_map("api", None)
+        assert set(nodes.read_node_map()) == {"web"}
+
+    def test_removing_an_absent_project_writes_nothing(self, node_map):
+        assert nodes.update_node_map("api", None) == {}
+        assert not node_map.exists()
+
+    def test_sixteen_concurrent_updates_all_land(self, node_map):
+        # PR-D's bring-ups finish on a thread pool; the whole-map writer alone
+        # would let two finishing together erase each other.
+        threads = [
+            threading.Thread(
+                target=nodes.update_node_map,
+                args=(f"p{i}", dataclasses.replace(ENTRY, sid=f"p{i}")),
+            )
+            for i in range(16)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert set(nodes.read_node_map()) == {f"p{i}" for i in range(16)}
+
+
+class TestTheMapWriterNeverGuesses:
+    """The four ways B's landed map changed the writer (plan D, Task 3's
+    forward correction): read strictly, a persistent blocking sidecar, a
+    retried replace, and a sweep of what a killed writer stranded."""
+
+    def test_a_torn_map_is_refused_not_overwritten(self, node_map):
+        # read_node_map would call this {} and the write would erase every
+        # placement; the strict read raises and the file stays as it was.
+        node_map.parent.mkdir(parents=True)
+        torn = '{"api": {"nick": "sec'
+        node_map.write_text(torn, encoding="utf-8")
+        with pytest.raises(ValueError):
+            nodes.update_node_map("web", ENTRY)
+        assert node_map.read_text(encoding="utf-8") == torn
+
+    def test_a_replace_a_reader_blocks_is_retried(self, node_map, monkeypatch):
+        # Windows: a reader holding node-map.json makes os.replace fail with
+        # PermissionError for as long as it holds the file.
+        real_replace = os.replace
+        refusals = [PermissionError(13, "held by a reader")] * 3
+        sleeps: list[float] = []
+
+        def flaky(src, dst):
+            if refusals:
+                raise refusals.pop()
+            real_replace(src, dst)
+
+        monkeypatch.setattr(nodes.os, "replace", flaky)
+        monkeypatch.setattr(nodes.time, "sleep", sleeps.append)
+        assert nodes.update_node_map("api", ENTRY) == {"api": ENTRY}
+        assert nodes.read_node_map() == {"api": ENTRY}
+        assert sleeps == [nodes._REPLACE_SLEEP_S] * 3
+        assert [p.name for p in node_map.parent.iterdir()] == ["node-map.json"]
+
+    def test_a_replace_that_stays_refused_raises_and_keeps_the_old_map(
+        self, node_map, monkeypatch
+    ):
+        nodes.write_node_map({"api": ENTRY})
+        attempts: list[str] = []
+
+        def refuse(src, dst):
+            attempts.append(src)
+            raise PermissionError(13, "held by a reader")
+
+        monkeypatch.setattr(nodes.os, "replace", refuse)
+        monkeypatch.setattr(nodes.time, "sleep", lambda s: None)
+        with pytest.raises(PermissionError):
+            nodes.update_node_map("web", ENTRY)
+        assert len(attempts) == nodes._REPLACE_RETRIES + 1
+        assert nodes.read_node_map() == {"api": ENTRY}
+        assert [p.name for p in node_map.parent.iterdir()] == ["node-map.json"]
+
+    def test_any_other_replace_error_is_not_retried(self, node_map, monkeypatch):
+        attempts: list[str] = []
+
+        def refuse(src, dst):
+            attempts.append(src)
+            raise OSError(28, "disk full")
+
+        monkeypatch.setattr(nodes.os, "replace", refuse)
+        with pytest.raises(OSError, match="disk full"):
+            nodes.update_node_map("api", ENTRY)
+        assert len(attempts) == 1
+
+    def test_a_temp_file_a_killed_writer_stranded_is_swept(self, node_map):
+        node_map.parent.mkdir(parents=True)
+        (node_map.parent / "node-map.json.k1ll3d.tmp").write_text("{", encoding="utf-8")
+        unrelated = node_map.parent / "notes.tmp"
+        unrelated.write_text("mine", encoding="utf-8")
+        nodes.update_node_map("api", ENTRY)
+        assert sorted(p.name for p in node_map.parent.iterdir()) == [
+            "node-map.json",
+            "notes.tmp",
+        ]
+
+    def test_the_sidecar_is_under_the_redirected_home_and_outlives_the_writer(
+        self, node_map
+    ):
+        # exclusive_lock unlinks its file on exit, so a waiter could lock a
+        # file the holder was about to delete. The map's sidecar never goes.
+        nodes.update_node_map("api", ENTRY)
+        assert nodes.map_lock_path() == Path.home() / ".magent" / "node-map.lock"
+        assert nodes.map_lock_path().exists()
+        with nodes.map_lock():
+            assert nodes.map_lock_path().exists()
+        assert nodes.map_lock_path().exists()
+
+    def test_a_writer_behind_a_holder_in_this_process_says_so(self, node_map):
+        with nodes.map_lock(), pytest.raises(LockHeld):
+            nodes.update_node_map("api", ENTRY, wait_s=0.2)
+        assert not node_map.exists()
+
+
+# A second process writing the map: its own interpreter, so its own threading
+# lock. It inherits conftest's redirected HOME (so the same sidecar lock), and
+# the map path comes in argv.
+_MAP_WRITER = """
+import dataclasses, sys
+from pathlib import Path
+from magent import nodes
+
+nodes.NODE_MAP_PATH = Path(sys.argv[1])
+prefix, count = sys.argv[2], int(sys.argv[3])
+base = nodes.NodeMapEntry(
+    nick="second", sid="x", placed_ts=0.0, attached_existing=False, remote_root="~/magent/x"
+)
+for i in range(count):
+    nodes.update_node_map(f"{prefix}{i}", dataclasses.replace(base, sid=f"{prefix}{i}"))
+"""
+
+# Holds the map's sidecar lock -- the same map_lock every writer takes -- until
+# its stdin closes.
+_MAP_HOLDER = """
+import sys
+from magent import nodes
+
+with nodes.map_lock():
+    print("held", flush=True)
+    sys.stdin.read()
+"""
+
+
+class TestTheMapWriterIsSerializedAcrossProcesses:
+    """DECISION-13: `up`, `down`, G's placement and recall are separate
+    processes, and a threading lock cannot see another process. The writer
+    holds the ~/.magent/node-map.lock sidecar around read + write. That path
+    is resolved per call, not at import, so under conftest's HOME redirect it
+    lands in tmp for this process and for the children alike."""
+
+    def test_a_writer_waits_for_another_process_holding_the_map_lock(self, node_map):
+        holder = subprocess.Popen(
+            [sys.executable, "-c", _MAP_HOLDER],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        assert holder.stdin is not None
+        assert holder.stdout is not None
+        try:
+            assert holder.stdout.readline().strip() == "held"
+            with pytest.raises(LockHeld):
+                nodes.update_node_map("api", ENTRY, wait_s=0.3)
+            assert not node_map.exists()
+        finally:
+            holder.stdin.close()
+            holder.wait(timeout=30)
+        assert nodes.update_node_map("api", ENTRY) == {"api": ENTRY}
+        assert nodes.read_node_map() == {"api": ENTRY}
+
+    def test_two_processes_writing_disjoint_projects_lose_nothing(self, node_map):
+        writers = [
+            subprocess.Popen(
+                [sys.executable, "-c", _MAP_WRITER, str(node_map), prefix, "25"]
+            )
+            for prefix in ("a", "b")
+        ]
+        assert [w.wait(timeout=120) for w in writers] == [0, 0]
+        assert set(nodes.read_node_map()) == {
+            f"{p}{i}" for p in "ab" for i in range(25)
+        }
+
+
+class TestF2FindsANodeFolder:
+    def _entries(self) -> dict[str, NodeMapEntry]:
+        return {
+            "API": dataclasses.replace(
+                ENTRY,
+                sid="API",
+                target="amin@devino-second",
+                cwd="/home/amin/magent/api",
+            )
+        }
+
+    def test_a_project_name_finds_its_target_and_folder(self):
+        assert nodes.open_target("API", self._entries()) == (
+            "amin@devino-second",
+            "/home/amin/magent/api",
+        )
+
+    def test_a_session_id_finds_it_too(self):
+        entries = {"My App": dataclasses.replace(self._entries()["API"], sid="My-App")}
+        assert nodes.open_target("My-App", entries) is not None
+
+    def test_without_a_cwd_the_remote_root_is_the_folder(self):
+        entries = {"API": dataclasses.replace(self._entries()["API"], cwd="")}
+        assert nodes.open_target("API", entries) == (
+            "amin@devino-second",
+            ENTRY.remote_root,
+        )
+
+    def test_a_project_no_node_holds_is_none(self):
+        assert nodes.open_target("other", self._entries()) is None
+
+    def test_a_cloud_placement_is_none(self):
+        entries = {"API": dataclasses.replace(self._entries()["API"], nick="cloud")}
+        assert nodes.open_target("API", entries) is None
+
+    def test_an_entry_from_before_pr_d_has_no_target_and_is_none(self):
+        assert nodes.open_target("api", {"api": ENTRY}) is None
 
 
 def _pool(entries: dict[str, NodeConfig] | None = None) -> MagentConfig:
