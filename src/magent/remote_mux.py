@@ -14,20 +14,24 @@ local git reads a bring-up needs. Every function returns data or raises
 - ``BatchMode=yes`` everywhere: a password prompt nobody can answer is a hang.
 
 A leaf: never imports ``magent.cli`` (LS-A-001); its magent imports are the
-leaves ``attach_client`` and ``log``.
+leaves ``attach_client``, ``log``, ``node_scripts`` and ``nodes``.
 """
 
 from __future__ import annotations
 
 import contextlib
 import functools
+import json
+import math
 import shlex
 import shutil
 import subprocess
 from typing import TYPE_CHECKING
 
+from magent import node_scripts
 from magent.attach_client import SSH_MISSING_RC, TMUX_SOCKET
 from magent.log import get_logger
+from magent.nodes import LoadSample
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -46,14 +50,21 @@ PROBE_TIMEOUT_S = 10.0
 SCRIPT_TIMEOUT_S = 120.0
 BRING_UP_TIMEOUT_S = 600.0
 
+# The line separating a shipped script from its payload on stdin. bash -s reads
+# a script from a pipe one byte at a time, so a script whose last line is
+# `main "$@"; exit $?` hands the REST of stdin to main -- which skips to this
+# line and reads the payload (JSON, a tarball) after it. Never a temp file on
+# the node, never an argument.
+PAYLOAD_SENTINEL = "__MAGENT_PAYLOAD__"
+
 # remote_mux's OWN option set -- not attach_client.SSH_CONNECTION_OPTS, which is
 # scoped to the interactive attach pane and allows a 20s connect, i.e. longer
 # than a whole probe here. A connect bound strictly under PROBE_TIMEOUT_S lets a
 # dead node surface as ssh's own exit 255 (unreachable) before the subprocess
 # bound turns it into rc None (hung): the distinction RemoteError carries.
 # ServerAlive: a link that dies mid-bring-up (600s bound) fails in ~45s.
-# ssh honours the FIRST value of a repeated -o, so these lead the argv and a
-# caller appending its own -o cannot override them.
+# ssh honours the FIRST value of a repeated -o and a command-line -o beats
+# ~/.ssh/config, so a node user's config cannot turn BatchMode off.
 CONNECT_TIMEOUT_S = 5
 SSH_BATCH_OPTS = (
     "-o",
@@ -72,15 +83,22 @@ _STDERR_TAIL_LINES = 20
 # How long a killed child gets to be reaped. The process is already dead; the
 # only thing that can still take time is a pipe magent stopped caring about.
 _REAP_TIMEOUT_S = 1.0
-# No console window per ssh on Windows. Read off the module rather than
-# hand-defined so this file needs no `sys.platform` branch (accounts.py idiom).
+# No console window per ssh on Windows -- the flag psmux._SPAWN_FLAGS carries
+# for every psmux control spawn. Read off the module rather than hand-defined,
+# so this file needs no `sys.platform` branch.
 _SPAWN_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 class RemoteError(RuntimeError):
-    """A node call that failed: ``rc`` (None when it never finished -- a spawn
-    failure or a timeout), the last lines of its stderr, and the argv it ran
-    with stdin reduced to its length. Never file contents, never a token."""
+    """A node call that failed: ``rc``, the last lines of its stderr, and the
+    argv it ran with stdin reduced to its length. Never file contents, never a
+    token.
+
+    ``rc`` None means the call never finished, and that covers two opposite
+    cases. After a spawn failure the command never ran. After a timeout the
+    OUTCOME IS UNKNOWN: killing the local ssh does not stop a non-tty remote
+    command, so it may have run to completion (a killed send may have landed).
+    A caller must therefore never retry a mutation blindly on rc None."""
 
     def __init__(
         self, rc: int | None, stderr_tail: str, command_redacted: tuple[str, ...]
@@ -158,8 +176,9 @@ def _spawn(
     check: bool,
     shown: tuple[str, ...],
 ) -> subprocess.CompletedProcess[bytes]:
-    """One bounded child -- the shared body of ``run`` and the local git reads.
-    ``shown`` is what an error and a log line may say about the command."""
+    """One bounded child -- the shared body of ``run`` and the local git reads
+    (a later task). ``shown`` is what an error and a log line may say about
+    the command."""
     try:
         proc = subprocess.Popen(
             argv,
@@ -168,12 +187,18 @@ def _spawn(
             stderr=subprocess.PIPE,
             creationflags=_SPAWN_FLAGS,
         )
-    except FileNotFoundError as e:
-        # The client vanished between find_ssh and the spawn (or its cached
-        # path went stale): the same "not installed" as no client at all.
-        raise RemoteError(SSH_MISSING_RC, str(e), shown) from e
     except OSError as e:
-        raise RemoteError(None, str(e), shown) from e
+        # A FileNotFoundError is the client vanishing between find_ssh and the
+        # spawn (or its cached path going stale): the same "not installed" as
+        # no client at all. strerror, not str(e): CPython's POSIX
+        # _execute_child puts the client's path in str(e), and an error or a
+        # log line names the program only.
+        rc = SSH_MISSING_RC if isinstance(e, FileNotFoundError) else None
+        reason = e.strerror or str(e)
+        get_logger("nodes").warning(
+            "node call could not start (%s): %s", reason, shlex.join(shown)
+        )
+        raise RemoteError(rc, reason, shown) from e
     try:
         out, err = proc.communicate(input=input_bytes, timeout=timeout_s)
     except subprocess.TimeoutExpired:
@@ -181,7 +206,7 @@ def _spawn(
         # Reap the direct child only, bounded. A second communicate() would
         # wait for every pipe's write end, and the interpreter behind a
         # .cmd/sh shim is a GRANDCHILD still holding one -- the 90s-for-a-5s
-        # timeout defect accounts._run and psmux.probe_control_plane hit.
+        # timeout defect psmux.probe_control_plane documents.
         with contextlib.suppress(subprocess.TimeoutExpired, OSError):
             proc.wait(timeout=_REAP_TIMEOUT_S)
         get_logger("nodes").warning(
@@ -208,7 +233,8 @@ def run(
     string (``_remote_string``). Raises RemoteError on a spawn failure, a
     missing client (rc 127), a timeout (rc None), or -- with ``check`` -- a
     non-zero exit. With ``check=False`` every exit code comes back for the
-    caller to classify."""
+    caller to classify. The returned ``CompletedProcess.args`` is the real
+    argv, this PC's client path included: a caller must not log it."""
     tail = _ssh_tail(node, argv_remote, tty=False)
     # Errors and log lines name the program, not this PC's path to it.
     shown = _redacted(["ssh", *tail], input_bytes)
@@ -219,3 +245,104 @@ def run(
         check=check,
         shown=shown,
     )
+
+
+def _script_argv(args: list[str]) -> list[str]:
+    """The remote argv of every script run: the socket is ALWAYS ``$1``
+    (DECISION-26 ii) -- ``lib.sh`` reads and shifts it -- then the caller's
+    own args."""
+    return ["bash", "-s", "--", SOCKET, *args]
+
+
+def _frame_script(text: str, payload: bytes | None) -> bytes:
+    body = text.encode("utf-8")
+    if payload is None:
+        return body
+    return body + b"\n" + PAYLOAD_SENTINEL.encode("ascii") + b"\n" + payload
+
+
+def run_script(
+    node: Node,
+    script: str,
+    args: list[str],
+    *,
+    timeout_s: float,
+    stdin: bytes | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run the packaged ``node_scripts/<script>.sh`` on ``node`` as
+    ``bash -s -- <SOCKET> <args>``: the script on stdin, then -- when
+    ``stdin`` is given -- the sentinel line and that payload. The socket is
+    added here, on every call; ``args`` never carry it. Secrets belong in
+    ``stdin``; ``args`` are argv, visible to the node's process table and to
+    logs. ValueError for a script in ``node_scripts.NON_ENTRY_SCRIPTS`` --
+    it would read the socket as its own first argument."""
+    if f"{script}.sh" in node_scripts.NON_ENTRY_SCRIPTS:
+        raise ValueError(f"{script}.sh is not a run_script entry point")
+    return run(
+        node,
+        _script_argv(args),
+        timeout_s=timeout_s,
+        input_bytes=_frame_script(node_scripts.script(script), stdin),
+    )
+
+
+def has_session(node: Node, sid: str) -> bool | None:
+    """Is ``sid`` alive on ``node``? True/False only when tmux itself answered:
+    exit 0 is a live session, exit 1 is tmux's own "no" (no such session, or
+    no server at all). Anything else -- ssh's 255, a missing tmux, a timeout --
+    is None: the PROBE failed, which says nothing about the session. The target
+    is ``=sid`` because tmux otherwise prefix-matches, and ``api`` would answer
+    for ``api-2``."""
+    try:
+        result = run(
+            node,
+            [MUX, "-L", SOCKET, "has-session", "-t", f"={sid}"],
+            timeout_s=PROBE_TIMEOUT_S,
+            check=False,
+        )
+    except RemoteError:
+        return None
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    return None
+
+
+def _finite(value: object) -> float:
+    """``value`` as a float, or ValueError when it is NaN or infinite."""
+    if not isinstance(value, (int, float, str)):
+        raise TypeError(f"not a number: {value!r}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"non-finite reading: {number}")
+    return number
+
+
+def sample(node: Node) -> LoadSample:
+    """One load reading from ``node`` (``sample.sh``). RemoteError when the node
+    can't be reached, or answers something that is not a sample. A non-finite
+    number is not a sample either: json accepts NaN, the snapshot writer does
+    not."""
+    result = run_script(node, "sample", [], timeout_s=PROBE_TIMEOUT_S)
+    try:
+        raw = json.loads(result.stdout.decode("utf-8", "replace"))
+        reading = LoadSample(
+            ts=_finite(raw["ts"]),
+            nproc=int(raw["nproc"]),
+            load1=_finite(raw["load1"]),
+            load5=_finite(raw["load5"]),
+            load15=_finite(raw["load15"]),
+            mem_total_mb=int(raw["mem_total_mb"]),
+            mem_avail_mb=int(raw["mem_avail_mb"]),
+            my_sessions=int(raw["my_sessions"]),
+        )
+    except (ValueError, KeyError, TypeError) as e:
+        # Named the way run() names it: the program, not this PC's path to
+        # it, and stdin by its length.
+        shown = _redacted(
+            ["ssh", *_ssh_tail(node, _script_argv([]), tty=False)],
+            _frame_script(node_scripts.script("sample"), None),
+        )
+        raise RemoteError(result.returncode, f"not a load sample: {e}", shown) from e
+    return reading

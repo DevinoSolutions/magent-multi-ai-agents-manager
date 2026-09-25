@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from magent import attach_client, node_scripts, remote_mux
+from magent import attach_client, log, node_scripts, remote_mux
 from magent.attach_client import SSH_CONNECTION_OPTS
 from magent.nodes import LoadSample, Node
 from magent.remote_mux import RemoteError
@@ -63,10 +63,15 @@ class TestSshArgv:
         assert int(opt.split("=", 1)[1]) < remote_mux.PROBE_TIMEOUT_S
 
     def test_the_interactive_attach_set_is_not_reused(self, fake_ssh):
-        # attach_client's set is scoped to the attach pane (ConnectTimeout=20).
+        # attach_client's set is scoped to the attach pane, whose connect
+        # bound is longer than a whole probe here.
+        attach_bounds = [
+            opt for opt in SSH_CONNECTION_OPTS if opt.startswith("ConnectTimeout=")
+        ]
+        assert attach_bounds
         argv = remote_mux.ssh_argv(NODE, LS)
-        assert "ConnectTimeout=20" not in argv
-        assert SSH_CONNECTION_OPTS != remote_mux.SSH_BATCH_OPTS
+        for opt in attach_bounds:
+            assert opt not in argv
 
     def test_argv0_is_the_client_find_ssh_resolved_never_a_bare_ssh(self, fake_ssh):
         # A bare "ssh" spawned by any caller would resolve the REAL client off
@@ -174,6 +179,30 @@ class TestRun:
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["true"], timeout_s=5)
         assert exc.value.rc == 127
+
+    def test_a_spawn_failure_never_names_this_pcs_client_path(
+        self, tmp_path, monkeypatch
+    ):
+        # CPython's POSIX _execute_child puts the executable path in str(e);
+        # an error or a log line names the program, never where it lives.
+        gone = str(tmp_path / "no-such-ssh.exe")
+        monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: gone)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["true"], timeout_s=5)
+        assert gone not in str(exc.value)
+        assert gone not in exc.value.stderr_tail
+
+    def test_a_spawn_failure_is_logged_like_any_other_failure(
+        self, tmp_path, monkeypatch
+    ):
+        gone = str(tmp_path / "no-such-ssh.exe")
+        monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: gone)
+        with pytest.raises(RemoteError):
+            remote_mux.run(NODE, ["true"], timeout_s=5)
+        logged = (log.LOG_DIR / "nodes.log").read_text(encoding="utf-8")
+        assert "WARNING" in logged
+        assert NODE.target in logged
+        assert gone not in logged
 
     def test_an_exact_tmux_target_reaches_bash_quoted(self, fake_ssh):
         # zsh would expand a bare `=api` as a command lookup; inside the
@@ -368,3 +397,170 @@ class TestTheScriptsShip:
         assert r.returncode != 0
         assert b"tmux socket" in r.stderr
         assert tmux.calls() == []
+
+
+class TestRunScript:
+    def test_the_script_rides_stdin_to_bash_s(self, fake_ssh):
+        remote_mux.run_script(NODE, "sample", ["--x", "a b"], timeout_s=30)
+        (call,) = fake_ssh.calls()
+        # Through run(), so inside the DECISION-9 bash -c wrapper too; the
+        # socket is $1, before the caller's args (DECISION-26 ii).
+        assert call.argv[-1] == "bash -c " + shlex.quote(
+            shlex.join(["bash", "-s", "--", remote_mux.SOCKET, "--x", "a b"])
+        )
+        assert call.stdin == node_scripts.script("sample").encode("utf-8")
+
+    def test_the_socket_is_passed_even_with_no_args(self, fake_ssh):
+        remote_mux.run_script(NODE, "sample", [], timeout_s=30)
+        (call,) = fake_ssh.calls()
+        assert call.argv[-1] == "bash -c " + shlex.quote(
+            shlex.join(["bash", "-s", "--", remote_mux.SOCKET])
+        )
+
+    def test_a_payload_follows_the_sentinel_line(self, fake_ssh):
+        remote_mux.run_script(NODE, "sample", [], timeout_s=30, stdin=b'{"k": 1}')
+        (call,) = fake_ssh.calls()
+        assert call.stdin == (
+            node_scripts.script("sample").encode("utf-8")
+            + b"\n__MAGENT_PAYLOAD__\n"
+            + b'{"k": 1}'
+        )
+
+    def test_a_secret_never_reaches_argv_the_error_or_the_log(self, fake_ssh):
+        token = "ghp_FAKE0123456789TOKEN"
+        fake_ssh.set_reply("bash -s", stderr="provision failed\n", rc=1)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run_script(
+                NODE,
+                "sample",
+                ["--user", "amin"],
+                timeout_s=30,
+                stdin=json.dumps({"gh": token}).encode("utf-8"),
+            )
+        calls = fake_ssh.calls()
+        assert calls
+        for call in calls:
+            assert token not in " ".join(call.argv)
+            assert token.encode("utf-8") in call.stdin
+        assert token not in str(exc.value)
+        assert token not in " ".join(exc.value.command_redacted)
+        for logfile in log.LOG_DIR.glob("*.log*"):
+            assert token not in logfile.read_text(encoding="utf-8", errors="replace")
+
+    def test_the_timeout_is_mandatory_here_too(self):
+        with pytest.raises(TypeError):
+            remote_mux.run_script(NODE, "sample", [])
+
+    @pytest.mark.parametrize("name", sorted(node_scripts.NON_ENTRY_SCRIPTS))
+    def test_a_non_entry_script_is_refused_before_any_ssh(self, fake_ssh, name):
+        with pytest.raises(ValueError, match="not a run_script entry point"):
+            remote_mux.run_script(NODE, name.removesuffix(".sh"), [], timeout_s=30)
+        assert fake_ssh.calls() == []
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or shutil.which("bash") is None,
+        reason="needs a POSIX bash",
+    )
+    def test_real_bash_hands_the_payload_to_the_script(self):
+        # The wire assumption the whole protocol rests on: bash -s reads the
+        # script from a pipe byte by byte, so `main` gets the rest of stdin --
+        # and lib.sh's magent_payload finds the sentinel in it.
+        body = (
+            node_scripts.script("lib")
+            + "main() { magent_payload; }\n"
+            + 'main "$@"; exit $?\n'
+        )
+        r = subprocess.run(
+            ["bash", "-s", "--", remote_mux.SOCKET],
+            input=remote_mux._frame_script(body, b"line1\nline2"),
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        assert r.stdout == b"line1\nline2"
+
+
+class TestHasSession:
+    def test_the_probe_is_an_exact_match_on_the_magent_socket(self, fake_ssh):
+        remote_mux.has_session(NODE, "api")
+        (call,) = fake_ssh.calls()
+        # `=api` (DECISION-4): tmux PREFIX-matches a bare `-t api` against
+        # `api-2`. Inside the DECISION-9 bash -c wrapper.
+        assert call.argv[-1] == "bash -c 'tmux -L magent has-session -t =api'"
+
+    @pytest.mark.parametrize(
+        ("rc", "answer"), [(0, True), (1, False), (255, None), (127, None), (2, None)]
+    )
+    def test_only_tmuxs_own_no_is_false(self, fake_ssh, rc, answer):
+        fake_ssh.set_reply("has-session", rc=rc)
+        assert remote_mux.has_session(NODE, "api") is answer
+
+    def test_a_hung_node_is_unknown_not_dead(self, fake_ssh, monkeypatch):
+        fake_ssh.set_mode("timeout")
+        monkeypatch.setattr(remote_mux, "PROBE_TIMEOUT_S", 1.0)
+        assert remote_mux.has_session(NODE, "api") is None
+
+    def test_no_ssh_client_is_unknown(self):
+        assert remote_mux.has_session(NODE, "api") is None
+
+
+class TestSample:
+    def test_the_node_answers_one_load_sample(self, fake_ssh):
+        fake_ssh.set_reply(
+            "bash -s",
+            stdout=(
+                '{"ts": 1727200000, "nproc": 16, "load1": 0.5, "load5": 1.25, '
+                '"load15": 2.0, "mem_total_mb": 64000, "mem_avail_mb": 48000, '
+                '"my_sessions": 3}\n'
+            ),
+        )
+        assert remote_mux.sample(NODE) == LoadSample(
+            ts=1727200000.0,
+            nproc=16,
+            load1=0.5,
+            load5=1.25,
+            load15=2.0,
+            mem_total_mb=64000,
+            mem_avail_mb=48000,
+            my_sessions=3,
+        )
+        (call,) = fake_ssh.calls()
+        assert call.stdin == node_scripts.script("sample").encode("utf-8")
+
+    def test_garbage_is_a_remote_error_not_a_crash(self, fake_ssh):
+        fake_ssh.set_reply("bash -s", stdout="bash: awk: command not found\n")
+        with pytest.raises(RemoteError, match="not a load sample"):
+            remote_mux.sample(NODE)
+
+    def test_an_unreachable_node_is_a_remote_error(self, fake_ssh):
+        fake_ssh.set_reply("bash -s", stderr="ssh: connect: refused\n", rc=255)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.sample(NODE)
+        assert exc.value.rc == 255
+
+    @pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+    def test_a_non_finite_reading_is_not_a_load_sample(self, fake_ssh, bad):
+        fake_ssh.set_reply(
+            "bash -s",
+            stdout=(
+                f'{{"ts": 1727200000, "nproc": 16, "load1": {bad}, "load5": 1.25, '
+                f'"load15": 2.0, "mem_total_mb": 64000, "mem_avail_mb": 48000, '
+                f'"my_sessions": 3}}\n'
+            ),
+        )
+        with pytest.raises(RemoteError, match="not a load sample"):
+            remote_mux.sample(NODE)
+
+    def test_the_errors_command_is_the_script_call_redacted(self, fake_ssh):
+        # Named the way run() names it: `ssh`, not this PC's client path; the
+        # one bash -c remote string (not its characters); stdin by length.
+        fake_ssh.set_reply("bash -s", stdout="[]\n")
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.sample(NODE)
+        shown = exc.value.command_redacted
+        assert shown[0] == "ssh"
+        assert shown[-2] == "bash -c " + shlex.quote(
+            shlex.join(["bash", "-s", "--", remote_mux.SOCKET])
+        )
+        script_len = len(node_scripts.script("sample").encode("utf-8"))
+        assert shown[-1] == f"<stdin: {script_len} bytes>"
