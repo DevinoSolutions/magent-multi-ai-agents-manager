@@ -8,13 +8,23 @@ import io
 import json
 import logging
 import os
+import shlex
+import shutil
+import subprocess
+import sys
 import tarfile
 
 import pytest
 
-from magent import remote_mux
-from magent.nodes import LoadSample, Node
-from magent.remote_mux import PULL_HEADER, PULL_TRAILER, RemoteError, parse_pull
+from magent import node_scripts, nodes, remote_mux
+from magent.nodes import LoadSample, Node, encoded_project_dir
+from magent.remote_mux import (
+    PULL_HEADER,
+    PULL_TRAILER,
+    RemoteError,
+    SidPull,
+    parse_pull,
+)
 from tests.unit._pull_reply import (
     MTIME,
     SAMPLE,
@@ -232,6 +242,39 @@ class TestParsePull:
             m.startswith("node pull: cannot store api/transcripts/a.jsonl")
             for m in _node_logs(caplog)
         )
+
+
+class TestWhatTheNodeSkipped:
+    """pull.sh skips a file over ``max_member_bytes`` ON THE NODE and names it
+    under ``skipped``: that session does not fail, so its watermark moves. A
+    file permanently over the cap would otherwise fail the session every tick
+    and freeze its watermark forever."""
+
+    def test_a_skipped_file_is_reported_and_its_session_does_not_fail(self, tmp_path):
+        meta = pull_meta(
+            skipped={
+                "api": ["api/transcripts/big.jsonl"],
+                "web": ["web/transcripts/w.jsonl"],
+            }
+        )
+        snap = _parse(pull_reply(meta), tmp_path / "second")
+        assert snap.skipped == {"api": ("api/transcripts/big.jsonl",)}
+        assert snap.failed_sids == frozenset()
+
+    @pytest.mark.parametrize(
+        ("raw", "seen"),
+        [
+            ("missing", {}),
+            ("api", {}),
+            (["api"], {}),
+            ({"api": "big.jsonl"}, {}),
+            ({"api": ["a.jsonl", 3, None]}, {"api": ("a.jsonl",)}),
+            ({3: ["a.jsonl"]}, {}),
+        ],
+    )
+    def test_a_malformed_skipped_list_is_ignored(self, tmp_path, raw, seen):
+        meta = pull_meta() if raw == "missing" else pull_meta(skipped=raw)
+        assert _parse(pull_reply(meta), tmp_path / "second").skipped == seen
 
 
 def _two_member_reply() -> tuple[bytes, int]:
@@ -569,3 +612,308 @@ class TestQuietCalls:
         with pytest.raises(RemoteError):
             remote_mux.run(NODE, ["false"], timeout_s=30)
         assert len(_node_logs(caplog)) == 1
+
+
+def _payload(call) -> dict[str, object]:
+    return json.loads(call.stdin.rsplit(b"\n__MAGENT_PAYLOAD__\n", 1)[1])
+
+
+def _sid_payload(call, sid: str) -> dict[str, object]:
+    sids = _payload(call)["sids"]
+    assert isinstance(sids, dict)
+    return sids[sid]
+
+
+class TestPullNode:
+    def test_one_ssh_carries_the_script_and_the_request(self, fake_ssh, tmp_path):
+        fake_ssh.set_reply(
+            "devino-second", stdout=pull_reply(pull_meta(sessions=["api"]))
+        )
+        snap = remote_mux.pull_node(
+            NODE,
+            {"api": SidPull(roots=("~/magent/api",), project_dir=None, since=0.0)},
+            dest=tmp_path / "second",
+        )
+        (call,) = fake_ssh.calls()
+        assert call.argv[-2:] == [
+            "amin@devino-second",
+            "bash -c " + shlex.quote(f"bash -s -- {remote_mux.SOCKET}"),
+        ]
+        script, _ = call.stdin.rsplit(b"\n__MAGENT_PAYLOAD__\n", 1)
+        assert script == node_scripts.script("pull").encode("utf-8")
+        assert _payload(call) == {
+            "sids": {
+                "api": {"roots": ["~/magent/api"], "project_dir": None, "since": 0.0}
+            },
+            "max_member_bytes": remote_mux.PULL_MAX_MEMBER_BYTES,
+        }
+        assert snap.sessions == ("api",)
+
+    def test_an_unreachable_node_raises_255_and_logs_nothing(
+        self, fake_ssh, tmp_path, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        fake_ssh.set_reply(
+            "devino-second",
+            stderr="ssh: connect to host devino-second port 22: Connection refused\n",
+            rc=255,
+        )
+        with pytest.raises(RemoteError) as info:
+            remote_mux.pull_node(NODE, {}, dest=tmp_path)
+        assert info.value.rc == 255
+        assert "Connection refused" in info.value.stderr_tail
+        assert info.value.command_redacted[-1].startswith("<stdin: ")
+        assert _node_logs(caplog) == []
+
+    def test_the_reply_held_in_ram_is_capped_at_the_pull_bound(
+        self, fake_ssh, tmp_path, monkeypatch
+    ):
+        # PULL_MAX_REPLY_BYTES, not run's 64 MiB default: a pull may carry up
+        # to PULL_MAX_TOTAL_BYTES of files, and nothing past that is held.
+        monkeypatch.setattr(remote_mux, "PULL_MAX_REPLY_BYTES", 1024)
+        fake_ssh.set_mode("flood")
+        with pytest.raises(RemoteError, match="reply exceeded 1024 bytes") as info:
+            remote_mux.pull_node(NODE, {}, dest=tmp_path)
+        assert info.value.rc is None
+
+
+class TestPull:
+    """The master §3 interface G's recall calls: pull(node, sid, remote_dirs, since_epoch)."""
+
+    def test_a_first_pull_learns_the_real_path_then_asks_for_its_transcripts(
+        self, fake_ssh, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path)
+        meta = pull_meta(realpaths={"api": "/home/amin/magent/api"})
+        fake_ssh.set_reply(
+            "devino-second",
+            stdout=pull_reply(meta, {"api/transcripts/abc.jsonl": "x\n"}),
+        )
+        result = remote_mux.pull(NODE, "api", ["~/magent/api"], 0.0)
+        first, second = fake_ssh.calls()
+        assert _sid_payload(first, "api")["project_dir"] is None
+        assert _sid_payload(second, "api") == {
+            "roots": ["~/magent/api"],
+            "project_dir": encoded_project_dir("/home/amin/magent/api"),
+            "since": 0.0,
+        }
+        assert result.since == 5000.0 - remote_mux.WATERMARK_OVERLAP_S
+        # Both phases shipped the same file; it is listed once.
+        assert result.files == (
+            tmp_path / "second" / "api" / "transcripts" / "abc.jsonl",
+        )
+
+    def test_a_session_the_node_did_not_report_keeps_the_callers_watermark(
+        self, fake_ssh, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path)
+        fake_ssh.set_reply("devino-second", stdout=pull_reply(pull_meta()))
+        result = remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert len(fake_ssh.calls()) == 1
+        assert result == remote_mux.PullResult(files=(), since=42.0)
+
+    def test_a_session_name_that_cannot_be_a_directory_here_is_refused(self, fake_ssh):
+        with pytest.raises(RemoteError, match="not a pullable session name"):
+            remote_mux.pull(NODE, "CON", ["~/x"], 0.0)
+        assert fake_ssh.calls() == []
+
+    def test_a_file_that_could_not_be_stored_holds_the_watermark(
+        self, fake_ssh, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path)
+        (tmp_path / "second").mkdir()
+        (tmp_path / "second" / "api").write_text("not a directory", encoding="utf-8")
+        meta = pull_meta(realpaths={"api": "/home/amin/magent/api"})
+        fake_ssh.set_reply(
+            "devino-second",
+            stdout=pull_reply(meta, {"api/transcripts/abc.jsonl": "x\n"}),
+        )
+        result = remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert result == remote_mux.PullResult(files=(), since=42.0)
+
+    def test_a_file_the_node_skipped_does_not_hold_the_watermark(
+        self, fake_ssh, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path)
+        meta = pull_meta(
+            realpaths={"api": "/home/amin/magent/api"},
+            skipped={"api": ["api/transcripts/huge.jsonl"]},
+        )
+        fake_ssh.set_reply("devino-second", stdout=pull_reply(meta))
+        result = remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert result.since == 5000.0 - remote_mux.WATERMARK_OVERLAP_S
+
+
+class TestTheScriptOwnsNoSocket:
+    """DECISION-3 / DECISION-26 ii, B's convention: run_script sends the socket
+    as $1, lib.sh reads it into $MAGENT_SOCKET (no default) and shifts it off.
+    B's Task 12 pins every packaged script's `-L`; these pin pull's own use."""
+
+    def test_pull_reads_the_socket_from_the_library(self):
+        # The raw file for the include line: script() has already expanded it.
+        raw = node_scripts._read("pull")
+        assert raw.index("\n# @include lib.sh\n") > raw.index("\nset -euo pipefail\n")
+        text = node_scripts.script("pull")
+        assert 'MAGENT_SOCKET="${1:?' in text  # lib.sh, inlined
+        assert 'tmux -L "$MAGENT_SOCKET" list-sessions' in text
+        assert "local socket" not in text
+        assert f"-L {remote_mux.SOCKET}" not in text
+
+    def test_the_state_hook_is_run_as_a_file_so_it_takes_no_socket(self):
+        """state_hook.sh is Claude Code's hook (`state-hook.sh --source claude`),
+        never a run_script call: lib.sh would read `--source` as the socket, and
+        a bare call would fail the turn. It includes no library and runs no tmux."""
+        text = node_scripts.script("state_hook")
+        assert "# @include" not in text
+        assert "MAGENT_SOCKET" not in text
+        assert "tmux" not in text
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux"
+    or shutil.which("bash") is None
+    or shutil.which("python3") is None,
+    reason="pull.sh samples /proc: it runs for real on the Linux legs",
+)
+class TestPullShOnARealBash:
+    def _run(self, tmp_path, payload, *, path_env=None, socket=remote_mux.SOCKET):
+        bash = shutil.which("bash")
+        assert bash is not None
+        fakebin = tmp_path / "fakebin"
+        fakebin.mkdir(exist_ok=True)
+        tmux = fakebin / "tmux"
+        tmux.write_text("#!/bin/sh\nprintf 'api\\nweb\\n'\n", encoding="utf-8")
+        tmux.chmod(0o755)
+        env = {
+            **os.environ,
+            "HOME": str(tmp_path / "node"),
+            "PATH": (
+                path_env
+                if path_env is not None
+                else f"{fakebin}{os.pathsep}{os.environ['PATH']}"
+            ),
+        }
+        stdin = remote_mux._frame_script(
+            node_scripts.script("pull"), json.dumps(payload).encode("utf-8")
+        )
+        argv = [bash, "-s", "--"] + ([] if socket is None else [socket])
+        return subprocess.run(
+            argv, input=stdin, env=env, capture_output=True, timeout=60, check=False
+        )
+
+    def _project(self, tmp_path):
+        """The node's ~/magent/api and its ~/.claude/projects dir: (real, pdir, proj)."""
+        home = tmp_path / "node"
+        root = home / "magent" / "api"
+        root.mkdir(parents=True)
+        real = os.path.realpath(root)
+        pdir = encoded_project_dir(real)
+        proj = home / ".claude" / "projects" / pdir
+        proj.mkdir(parents=True)
+        return real, pdir, proj
+
+    def test_the_script_ships_only_the_placed_sessions_new_files(self, tmp_path):
+        real, pdir, proj = self._project(tmp_path)
+        (proj / "abc" / "subagents").mkdir(parents=True)
+        (proj / "abc.jsonl").write_text("new\n", encoding="utf-8")
+        (proj / "abc" / "subagents" / "agent-1.jsonl").write_text(
+            "sub\n", encoding="utf-8"
+        )
+        old = proj / "old.jsonl"
+        old.write_text("old\n", encoding="utf-8")
+        os.utime(old, (1000, 1000))
+        state = tmp_path / "node" / ".magent" / "state"
+        state.mkdir(parents=True)
+        (state / "k1.json").write_text(
+            json.dumps({"state": "working", "ts": 1, "cwd": real}), encoding="utf-8"
+        )
+        (state / "k2.json").write_text(
+            json.dumps({"state": "done", "ts": 1, "cwd": "/elsewhere"}),
+            encoding="utf-8",
+        )
+        payload = {
+            "sids": {
+                "api": {"roots": ["~/magent/api"], "project_dir": pdir, "since": 2000.0}
+            }
+        }
+        done = self._run(tmp_path, payload)
+        assert done.returncode == 0, done.stderr.decode()
+        # The trailer is the LAST bytes and counts every member tar wrote.
+        assert done.stdout.endswith(PULL_TRAILER + b"3\n")
+        snap = parse_pull(done.stdout, dest=tmp_path / "pc", sids=frozenset({"api"}))
+        assert snap.sessions == ("api", "web")
+        assert snap.realpaths == {"api": real}
+        assert snap.state_files == {"api": ("k1.json",)}
+        assert snap.sample is not None
+        assert snap.sample.my_sessions == 2
+        assert snap.skipped == {}
+        assert _stored(tmp_path / "pc") == [
+            "api/state/k1.json",
+            "api/transcripts/abc.jsonl",
+            "api/transcripts/abc/subagents/agent-1.jsonl",
+        ]
+
+    def test_nothing_new_is_a_zero_trailer(self, tmp_path):
+        _, pdir, _ = self._project(tmp_path)
+        payload = {
+            "sids": {
+                "api": {"roots": ["~/magent/api"], "project_dir": pdir, "since": 0.0}
+            }
+        }
+        done = self._run(tmp_path, payload)
+        assert done.returncode == 0, done.stderr.decode()
+        assert done.stdout.endswith(PULL_TRAILER + b"0\n")
+        snap = parse_pull(done.stdout, dest=tmp_path / "pc", sids=frozenset({"api"}))
+        assert snap.files == ()
+
+    def test_a_file_over_the_cap_is_skipped_on_the_node_and_named(self, tmp_path):
+        _, pdir, proj = self._project(tmp_path)
+        (proj / "big.jsonl").write_text("0123456789", encoding="utf-8")
+        (proj / "small.jsonl").write_text("ok", encoding="utf-8")
+        payload = {
+            "sids": {
+                "api": {"roots": ["~/magent/api"], "project_dir": pdir, "since": 0.0}
+            },
+            "max_member_bytes": 5,
+        }
+        done = self._run(tmp_path, payload)
+        assert done.returncode == 0, done.stderr.decode()
+        assert done.stdout.endswith(PULL_TRAILER + b"1\n")
+        snap = parse_pull(done.stdout, dest=tmp_path / "pc", sids=frozenset({"api"}))
+        assert snap.skipped == {"api": ("api/transcripts/big.jsonl",)}
+        assert snap.failed_sids == frozenset()
+        assert _stored(tmp_path / "pc") == ["api/transcripts/small.jsonl"]
+
+    def test_a_project_dir_that_is_not_a_finished_name_is_never_read(self, tmp_path):
+        (tmp_path / "node" / ".claude" / "projects").mkdir(parents=True)
+        (tmp_path / "node" / ".ssh").mkdir()
+        (tmp_path / "node" / ".ssh" / "id_ed25519").write_text(
+            "secret", encoding="utf-8"
+        )
+        payload = {
+            "sids": {
+                "api": {
+                    "roots": ["~/magent/api"],
+                    "project_dir": "../../.ssh",
+                    "since": 0.0,
+                }
+            }
+        }
+        done = self._run(tmp_path, payload)
+        assert done.returncode == 0, done.stderr.decode()
+        snap = parse_pull(done.stdout, dest=tmp_path / "pc", sids=frozenset({"api"}))
+        assert snap.files == ()
+
+    def test_a_node_without_python3_exits_3_and_says_why(self, tmp_path):
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        done = self._run(tmp_path, {"sids": {}}, path_env=str(empty))
+        assert done.returncode == 3
+        assert b"python3" in done.stderr
+
+    def test_no_socket_argument_fails_loudly_before_any_output(self, tmp_path):
+        done = self._run(tmp_path, {"sids": {}}, socket=None)
+        assert done.returncode != 0
+        # lib.sh's message
+        assert b"tmux socket name is a required first argument" in done.stderr
+        assert b"MAGENT-PULL" not in done.stdout

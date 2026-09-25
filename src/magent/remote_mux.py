@@ -34,13 +34,13 @@ import tarfile
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from magent import node_scripts
 from magent.attach_client import SSH_MISSING_RC, TMUX_SOCKET
 from magent.log import get_logger
-from magent.nodes import LoadSample
+from magent.nodes import LoadSample, encoded_project_dir, node_dir
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Mapping, Sequence
@@ -591,19 +591,22 @@ members as ASCII digits, and ``\\n``. tarfile reads a cut or garbage header
 past the first as end-of-archive, so without it a reply cut after member 1
 parses as a SUCCESS holding one file -- and since ``now`` becomes the next
 watermark, the lost members are never asked for again. The count is every
-member tar wrote (pull.sh hands tar an explicit file list with
-``--no-recursion``, so it is that list's length). pull.sh must emit
-``tar ... ; printf 'MAGENT-PULL-END %d\\n' "$count"`` -- the printf ONLY after
-tar exits 0, so a tar that failed leaves the reply without a trailer."""
+member pull.sh's tar writer added. pull.sh writes the line ONLY after that
+writer closed without error: an exception mid-archive exits non-zero with no
+trailer, so the reply reads as truncated."""
 PULL_MAX_MEMBER_BYTES = 64 * 1024 * 1024
-"""A member declaring more than this is not stored (its session fails, so its
-watermark holds). A transcript is the largest file a pull carries."""
+"""The largest file a pull ships. ``pull_node`` sends it to pull.sh as
+``max_member_bytes``, and the node leaves a bigger file out and names it under
+``skipped`` (``NodeSnapshot.skipped``) -- not a failure, or a file that stays
+over the cap would fail its session every tick and freeze its watermark
+forever. Defense in depth: a member that still declares more is not stored
+here, and its session fails. A transcript is the largest file a pull carries."""
 PULL_MAX_TOTAL_BYTES = 512 * 1024 * 1024
 """The most one reply may ask this PC to write, summed over the members it
 would store; more is RemoteError before anything is written."""
 PULL_MAX_REPLY_BYTES = PULL_MAX_TOTAL_BYTES + 4 * 1024 * 1024
-"""The most stdout one pull may hold in RAM: ``pull`` (plan E Task 8) passes it
-as ``max_stdout_bytes``. Over ``PULL_MAX_TOTAL_BYTES`` because the header, the
+"""The most stdout one pull may hold in RAM: ``pull_node`` passes it as
+``max_stdout_bytes``. Over ``PULL_MAX_TOTAL_BYTES`` because the header, the
 metadata line, tar's per-member headers and padding, and the trailer all ride
 on top of the members' own bytes."""
 PULL_COPY_CHUNK_BYTES = 1024 * 1024
@@ -660,7 +663,11 @@ class NodeSnapshot:
     - ``now``: the node's clock when its scan began (the next watermark);
     - ``files``: what landed on this PC;
     - ``failed_sids``: sessions with a file that could not be stored. Their
-      watermark must not move."""
+      watermark must not move;
+    - ``skipped``: per session, the archive names pull.sh left out because
+      they were over ``PULL_MAX_MEMBER_BYTES`` on the node. NOT a failure:
+      a file that stays over the cap would otherwise fail its session on
+      every tick and freeze its watermark forever. The caller reports them."""
 
     now: float
     sessions: tuple[str, ...]
@@ -669,6 +676,7 @@ class NodeSnapshot:
     state_files: Mapping[str, tuple[str, ...]]
     files: tuple[Path, ...]
     failed_sids: frozenset[str]
+    skipped: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 def _pull_error(message: str) -> RemoteError:
@@ -709,6 +717,20 @@ def _names_dict(raw: object) -> dict[str, tuple[str, ...]]:
         for k, v in raw.items()
         if isinstance(k, str) and isinstance(v, list)
     }
+
+
+def _skipped_dict(raw: object) -> dict[str, tuple[str, ...]]:
+    """pull.sh's ``skipped`` map: ``{sid: [archive name, ...]}``. Only its
+    strings are kept; anything else there is ignored, never an error -- the
+    names are the node's report, read to be logged, never a path to open."""
+    if not isinstance(raw, dict):
+        return {}
+    kept = {
+        k: tuple(n for n in v if isinstance(n, str))
+        for k, v in raw.items()
+        if isinstance(k, str) and isinstance(v, list)
+    }
+    return {k: names for k, names in kept.items() if names}
 
 
 def _member_parts(
@@ -938,7 +960,116 @@ def parse_pull(stdout: bytes, *, dest: Path, sids: Collection[str]) -> NodeSnaps
         },
         files=files,
         failed_sids=failed,
+        skipped={
+            k: v for k, v in _skipped_dict(meta.get("skipped")).items() if k in wanted
+        },
     )
+
+
+def pull_node(
+    node: Node,
+    sids: Mapping[str, SidPull],
+    *,
+    dest: Path | None = None,
+    timeout_s: float = PULL_TIMEOUT_S,
+) -> NodeSnapshot:
+    """ONE ssh to ``node`` running pull.sh for ``sids`` (possibly none: the
+    call still returns liveness and load), with the files stored under
+    ``dest`` (default: the node's mirror dir). Quiet: the caller reports.
+    RemoteError on a transport failure (255), a timeout or a reply over
+    ``PULL_MAX_REPLY_BYTES`` (None), a node without python3 (3), or a reply
+    that is not a pull (0)."""
+    payload = {
+        "sids": {
+            sid: {
+                "roots": list(s.roots),
+                "project_dir": s.project_dir,
+                "since": s.since,
+            }
+            for sid, s in sids.items()
+        },
+        # The node skips a bigger file and names it under `skipped`, so a file
+        # that stays over the cap never fails its session (NodeSnapshot.skipped).
+        "max_member_bytes": PULL_MAX_MEMBER_BYTES,
+    }
+    argv, input_bytes = _script_call(
+        "pull", [], json.dumps(payload).encode("utf-8")
+    )  # `bash -s -- <SOCKET>`: the socket is always $1
+    result = run(
+        node,
+        argv,
+        timeout_s=timeout_s,
+        input_bytes=input_bytes,
+        check=False,
+        quiet=True,
+        max_stdout_bytes=PULL_MAX_REPLY_BYTES,
+    )
+    if result.returncode != 0:
+        raise RemoteError(
+            result.returncode,
+            _tail(result.stderr),
+            _run_shown(node, argv, input_bytes),
+        )
+    return parse_pull(
+        result.stdout,
+        dest=dest if dest is not None else node_dir(node.nick),
+        sids=frozenset(sids),
+    )
+
+
+@dataclass(frozen=True)
+class PullResult:
+    """``pull``'s answer (master §3): the files that landed, and the watermark
+    to pass as ``since_epoch`` next time."""
+
+    files: tuple[Path, ...]
+    since: float
+
+
+def pull(
+    node: Node,
+    sid: str,
+    remote_dirs: Sequence[str],
+    since_epoch: float,
+    *,
+    timeout_s: float = PULL_TIMEOUT_S,
+) -> PullResult:
+    """Pull one session's transcripts and state newer than ``since_epoch``
+    into the node's mirror (master §3; G's recall calls it with 0.0).
+
+    Two calls when the transcript dir is not known yet: the first learns the
+    session's real path on the node, the second asks for
+    ``~/.claude/projects/<encoded real path>`` -- the PC encodes, never the
+    node (DECISION-11f). Up to 2 x ``timeout_s`` in all. The watermark only
+    moves when every file was stored; a file the node skipped as over the cap
+    does not hold it (``NodeSnapshot.skipped``)."""
+    # Before any ssh: parse_pull refuses the same name with ValueError, which
+    # would mean THIS caller's bug, not the node's.
+    if not pullable_sid(sid):
+        raise _pull_error(f"not a pullable session name: {sid!r}")
+    roots = tuple(remote_dirs)
+    first = pull_node(
+        node,
+        {sid: SidPull(roots=roots, project_dir=None, since=since_epoch)},
+        timeout_s=timeout_s,
+    )
+    real = first.realpaths.get(sid)
+    if real is None:
+        return PullResult(files=first.files, since=since_epoch)
+    snap = pull_node(
+        node,
+        {
+            sid: SidPull(
+                roots=roots, project_dir=encoded_project_dir(real), since=since_epoch
+            )
+        },
+        timeout_s=timeout_s,
+    )
+    failed = sid in first.failed_sids or sid in snap.failed_sids
+    since = since_epoch if failed else snap.now - WATERMARK_OVERLAP_S
+    # Both calls ship the session's state records: each path is listed once.
+    files = tuple(dict.fromkeys(first.files + snap.files))
+    return PullResult(files=files, since=since)
 
 
 def ignored_paths(repo: Path, *, timeout_s: float, label: str) -> tuple[str, ...]:
