@@ -671,6 +671,17 @@ def register_ssh_key(pubkey: str, *, title: str) -> ScriptLine:
         return ScriptLine(
             "fail", "github-key", "gh is not logged in on this PC: gh auth login"
         )
+    if not account.scopes:
+        # gh prints no scopes for a token it did not mint (GH_TOKEN, a
+        # fine-grained PAT); `gh auth refresh` cannot widen those.
+        return ScriptLine(
+            "fail",
+            "github-key",
+            (
+                "gh reports no token scopes (a GH_TOKEN/fine-grained token?): "
+                "use a classic token with admin:public_key, or gh auth login"
+            ),
+        )
     if not account.scopes & SSH_KEY_SCOPES:
         return ScriptLine(
             "fail",

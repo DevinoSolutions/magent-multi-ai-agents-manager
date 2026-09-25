@@ -1401,6 +1401,19 @@ class TestRegisterSshKey:
         assert row.detail.endswith("gh auth refresh -h github.com -s admin:public_key")
         assert _adds(fake_gh) == []
 
+    def test_a_login_with_no_reported_scopes_names_a_classic_token(self, fake_gh):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", ""))
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine(
+            "fail",
+            "github-key",
+            (
+                "gh reports no token scopes (a GH_TOKEN/fine-grained token?): "
+                "use a classic token with admin:public_key, or gh auth login"
+            ),
+        )
+        assert _adds(fake_gh) == []
+
     def test_a_key_already_on_the_account_is_a_skip(self, fake_gh):
         fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
         fake_gh.set_reply(
