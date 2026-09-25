@@ -23,7 +23,7 @@ from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
 from magent.config import NODE_AUTO, NODE_CLOUD, runs_on_node
-from magent.lockfile import LockHeld, lock_path, persistent_lock
+from magent.lockfile import LockHeld, persistent_lock
 from magent.psmux import session_name
 from magent.sessions import is_ide_tool
 from magent.sessions.claude import encode_claude_project_path
@@ -252,7 +252,12 @@ def load_node_map_strict() -> dict[str, NodeMapEntry]:
             if attempt == _BUSY_RETRIES:
                 raise
             time.sleep(_BUSY_SLEEP_S)
-    raw = json.loads(text)
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as exc:
+        # Name the file, as the non-object branch does: "Expecting value: line
+        # 1 column 1" alone does not say WHICH file is refusing every write.
+        raise ValueError(f"{NODE_MAP_PATH}: {exc}") from exc
     if not isinstance(raw, dict):
         raise ValueError(f"{NODE_MAP_PATH}: not a JSON object")  # noqa: TRY004  # reason: a non-object file is corrupt DATA, the same family as the JSONDecodeError (a ValueError) a torn file raises; callers catch one type for every bad file
     out: dict[str, NodeMapEntry] = {}
@@ -304,6 +309,11 @@ def write_node_map(entries: Mapping[str, NodeMapEntry]) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
+            # On disk BEFORE the rename: a crash between an unsynced write and
+            # the replace can leave a zero-length node-map.json, which the
+            # strict reader (rightly) refuses forever after.
+            fh.flush()
+            os.fsync(fh.fileno())
         _replace_retrying(tmp, NODE_MAP_PATH)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -344,13 +354,6 @@ MAP_LOCK_WAIT_S = 10.0
 # Threads of ONE process queue here first, so a fan-out's writers wait on a
 # cheap lock instead of polling the file lock against each other.
 _MAP_LOCK = threading.Lock()
-
-
-def map_lock_path() -> Path:
-    """``~/.magent/node-map.lock``, resolved per call from the home directory
-    (the derivation ``NODES_DIR`` uses) -- never bound at import, so a
-    redirected HOME moves it for this process and its children alike."""
-    return lock_path(MAP_LOCK_NAME)
 
 
 @contextlib.contextmanager
@@ -412,13 +415,16 @@ def open_target(
     """``(ssh target, folder)`` for opening ``project`` -- a window's name, so
     either a project name or its session id -- in an editor over Remote-SSH.
     None for a project no node holds, a cloud placement (it has no ssh
-    target), or an entry written before targets were recorded."""
+    target), or an entry with no recorded target or absolute folder -- the
+    caller falls through to /api/sessions. Never ``remote_root`` as the
+    folder: it keeps its ``~`` (DECISION-11) and a Remote-SSH folder URI
+    does not expand one."""
     entry = entries.get(project) or next(
         (e for e in entries.values() if e.sid == project), None
     )
-    if entry is None or entry.nick == NODE_CLOUD or not entry.target:
+    if entry is None or entry.nick == NODE_CLOUD or not entry.target or not entry.cwd:
         return None
-    return entry.target, entry.cwd or entry.remote_root
+    return entry.target, entry.cwd
 
 
 # A portable Unix login (useradd's default NAME_REGEX, minus the trailing-$
