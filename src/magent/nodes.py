@@ -24,6 +24,7 @@ import stat
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePath
@@ -151,9 +152,10 @@ class LoadSample:
 # a key or token would log the node in AS this PC (ANTHROPIC_CUSTOM_HEADERS can
 # carry an auth header), and a non-Anthropic backend's switch or token
 # (Bedrock, Vertex, Foundry) would override the node user's own login. Every
-# other ANTHROPIC_* / CLAUDE_* entry (a base URL, a model) is user
-# configuration and ships -- the value rule below still catches any of them
-# that holds a credential.
+# other ANTHROPIC_* / CLAUDE_* entry (a model, a REMOTE base URL -- see
+# PC_ENDPOINT_ENV for one that points at this PC) is user configuration and
+# ships -- the value rule below still catches any of them that holds a
+# credential.
 NEVER_SHIPPED_ENV = frozenset(
     {
         "ANTHROPIC_API_KEY",
@@ -169,6 +171,25 @@ NEVER_SHIPPED_ENV = frozenset(
 )
 # Settings that name a local credential program.
 NEVER_SHIPPED_SETTINGS = ("apiKeyHelper", "awsAuthRefresh", "awsCredentialExport")
+# settings.env entries that name an endpoint claude sends its requests (and so
+# the node user's own bearer) through. A remote one ships as configured; one
+# that points at this PC (a claude-code-router / LiteLLM on 127.0.0.1) would
+# name the NODE's own port there, which any co-tenant can bind -- it stays
+# behind, as does a value naming no host this can check.
+PC_ENDPOINT_ENV = frozenset(
+    {
+        "ALL_PROXY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_BEDROCK_BASE_URL",
+        "ANTHROPIC_FOUNDRY_BASE_URL",
+        "ANTHROPIC_VERTEX_BASE_URL",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+    }
+)
 # A Claude credential matched by VALUE, wherever it sits (sk-ant-api...,
 # sk-ant-oat..., sk-ant-ort..., sk-ant-admin...): the name rules above cannot
 # see one pasted under another name -- a hook command, an MCP server's env or
@@ -373,6 +394,11 @@ def _shippable_settings(raw: dict[str, object], notes: list[str]) -> dict[str, o
         for key in sorted(k for k in NEVER_SHIPPED_ENV if k in env):
             del env[key]
             notes.append(f"settings.env.{key}: never shipped")
+        for key in sorted(k for k in PC_ENDPOINT_ENV if k in env):
+            reason = _endpoint_skip_reason(env[key])
+            if reason is not None:
+                del env[key]
+                notes.append(f"settings.env.{_named(key)}: {reason}, never shipped")
         held = [
             k
             for k, v in env.items()
@@ -411,6 +437,28 @@ def _shippable_settings(raw: dict[str, object], notes: list[str]) -> dict[str, o
     return settings
 
 
+def _endpoint_skip_reason(value: object) -> str | None:
+    """Why a PC_ENDPOINT_ENV value stays behind, or None when it names a
+    remote host. A scheme-less value (``host:port``, the usual proxy form) is
+    read as a netloc. The reason never quotes the value -- a url can carry
+    userinfo."""
+    no_host = "not a url with a host"
+    if not isinstance(value, str):
+        return no_host
+    text = value.strip()
+    if "://" not in text:
+        text = "//" + text
+    try:
+        host = urllib.parse.urlsplit(text).hostname
+    except ValueError:  # an unbalanced IPv6 bracket, say
+        return no_host
+    if not host:
+        return no_host
+    if _is_pc_local_host(host):
+        return "points at this PC"
+    return None
+
+
 # A host a resolver may still read as an IPv4 address in inet_aton's short
 # forms (127.1, 0x7f000001, 2130706433, 0). Checked before calling it, so a
 # plain DNS name never reaches inet_aton.
@@ -420,10 +468,11 @@ _INET_ATON_SHAPE = re.compile(r"[0-9a-fx.]+")
 def _is_pc_local_host(host: str) -> bool:
     """Loopback, unspecified or link-local: an address that names THIS PC (or
     its own link), never the node's view of it -- however it is spelled (a
-    root-dot FQDN, an inet_aton short form, an IPv4-mapped IPv6 address)."""
-    host = host.lower()
-    if host.endswith("."):
-        host = host[:-1]
+    root-dot FQDN, an inet_aton short form, an IPv4-mapped IPv6 address, a
+    percent-encoded or full-width spelling a client decodes before it
+    resolves)."""
+    host = unicodedata.normalize("NFKC", urllib.parse.unquote(host))
+    host = host.replace("。", ".").lower().rstrip(".")
     if host == "localhost" or host.endswith(".localhost"):
         return True
     address: ipaddress.IPv4Address | ipaddress.IPv6Address
@@ -446,9 +495,13 @@ def _is_pc_local_host(host: str) -> bool:
 # argument or cwd names a file on this PC; it is never guessed down to a
 # basename.
 _PC_PATH = re.compile(r"(?:^|[=\s,;\"'])(?:[A-Za-z]:[\\/]|\\\\)")
-# What the node's `command -v` may be asked about: a plain program name or
-# path, nothing a shell would read as syntax.
-_PLAIN_PROGRAM = re.compile(r"[A-Za-z0-9._+/-]+")
+# What the node's `command -v` may be asked about: a plain program name (not
+# option syntax, not a bare run of dots -- `.` is a shell builtin) or an
+# absolute POSIX path. Never shell syntax, and never a relative path with a
+# `/`, which the node would resolve against the wrong directory.
+_PLAIN_PROGRAM = re.compile(
+    r"(?!\.+\Z)[A-Za-z0-9._+][A-Za-z0-9._+-]*|(?:/[A-Za-z0-9._+-]+)+"
+)
 _NOT_A_PROGRAM = "its command is not a plain program name"
 
 
@@ -626,7 +679,9 @@ def _mcp_oauth(
     if not isinstance(raw, dict):
         return {}
     kept: dict[str, object] = {}
-    noted = 0
+    # One note per (server, reason), counted: several stale tokens for one
+    # server are one fact, not a list of identical lines.
+    held: dict[str, int] = {}
     for key, entry in raw.items():
         if not isinstance(entry, dict):
             continue
@@ -635,19 +690,20 @@ def _mcp_oauth(
         if spec is None:
             continue
         if _holds_claude_credential(key) or _holds_claude_credential(entry):
-            noted += 1
-            notes.append(
+            note = (
                 f"mcpOAuth {_named(server)}: holds a Claude credential, never shipped"
             )
+            held[note] = held.get(note, 0) + 1
             continue
         issued_for = entry.get("serverUrl")
         shipped_url = spec.get("url") if isinstance(spec, dict) else None
         if issued_for is not None and issued_for != shipped_url:
-            noted += 1
-            notes.append(f"mcpOAuth {_named(server)}: issued for another url, left out")
+            note = f"mcpOAuth {_named(server)}: issued for another url, left out"
+            held[note] = held.get(note, 0) + 1
             continue
         kept[key] = entry
-    left = len(raw) - len(kept) - noted
+    notes.extend(n if c == 1 else f"{n} ({c} entries)" for n, c in held.items())
+    left = len(raw) - len(kept) - sum(held.values())
     if left:
         noun = "entry" if left == 1 else "entries"
         notes.append(f"mcpOAuth: {left} {noun} for servers not shipped left out")

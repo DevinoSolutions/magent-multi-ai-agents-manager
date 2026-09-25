@@ -342,6 +342,12 @@ PC_PATH = "its command is a path on this PC"
 NOT_A_NAME = "its command is not a plain program name"
 
 
+def _fullwidth(text: str) -> str:
+    """``text`` in full-width forms (U+FF01..U+FF5E): a spelling NFKC folds
+    back to ASCII. Built, not typed, so no ambiguous literal sits in source."""
+    return "".join(chr(ord(c) + 0xFEE0) for c in text)
+
+
 class TestHowEachServerIsClassified:
     """DECISION-12 + the transport rule: a remote http/sse server ships; an
     http server on loopback/link-local is PC-local; a stdio server whose
@@ -423,6 +429,29 @@ class TestHowEachServerIsClassified:
             # The node's `command -v` gets the first word: it must be a name.
             ({"type": "stdio", "command": "npx;id"}, NOT_A_NAME),
             ({"type": "stdio", "command": "$(id)"}, NOT_A_NAME),
+            # Option syntax, a relative path (resolved against the wrong cwd on
+            # the node) and a bare dot (a shell builtin to `command -v`).
+            ({"type": "stdio", "command": "--help"}, NOT_A_NAME),
+            ({"type": "stdio", "command": "./run.sh"}, NOT_A_NAME),
+            ({"type": "stdio", "command": "bin/tool"}, NOT_A_NAME),
+            ({"type": "stdio", "command": "."}, NOT_A_NAME),
+            # An absolute POSIX path is the node's to resolve (command -v).
+            ({"type": "stdio", "command": "/usr/bin/node"}, None),
+            # Loopback behind percent-encoding or full-width characters.
+            ({"type": "http", "url": "http://%31%32%37.0.0.1:3456/mcp"}, LOCAL),
+            (
+                {"type": "http", "url": f"http://{_fullwidth('localhost')}/mcp"},
+                LOCAL,
+            ),
+            (
+                {"type": "http", "url": f"http://{_fullwidth('127')}.0.0.1/mcp"},
+                LOCAL,
+            ),
+            # The ideographic full stop, which IDNA reads as a dot.
+            (
+                {"type": "http", "url": "http://127" + chr(0x3002) + "0.0.1/mcp"},
+                LOCAL,
+            ),
         ],
     )
     def test_the_reason_a_server_stays_behind(self, spec, reason):
@@ -820,6 +849,101 @@ class TestTheClaudeLoginNeverShipsUnderAnyName:
             "docs|1": {"serverName": "docs", "serverUrl": "https://docs.example/mcp"}
         }
         assert scope.notes == ("mcpOAuth docs: issued for another url, left out",)
+
+    def test_several_stale_entries_for_one_server_are_one_note(self, tmp_path):
+        home = _pc_home(
+            tmp_path,
+            claude_json={
+                "mcpServers": {
+                    "docs": {"type": "http", "url": "https://docs.example/mcp"}
+                }
+            },
+            credentials={
+                "mcpOAuth": {
+                    f"docs|{i}": {
+                        "serverName": "docs",
+                        "serverUrl": f"https://old{i}.example/mcp",
+                    }
+                    for i in range(2)
+                }
+            },
+        )
+        scope = nodes.user_scope(home)
+        assert scope.mcp_oauth == {}
+        assert scope.notes == (
+            "mcpOAuth docs: issued for another url, left out (2 entries)",
+        )
+
+
+# settings.env entries naming an endpoint: shipped as configured when remote,
+# held back when they point at this PC (on the node, 127.0.0.1 is the NODE --
+# claude would send the node user's own bearer to whoever binds that port).
+ENDPOINT_ENV = (
+    "ALL_PROXY",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+)
+
+
+class TestAnEndpointThatPointsAtThisPcNeverShips:
+    def test_the_endpoint_names_are_exactly_these(self):
+        assert frozenset(ENDPOINT_ENV) == nodes.PC_ENDPOINT_ENV
+
+    @pytest.mark.parametrize("name", ENDPOINT_ENV)
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "http://127.0.0.1:3456",
+            "http://localhost.:3456",
+            "http://127.1:3456",
+            "http://%31%32%37.0.0.1:3456",
+            f"http://{_fullwidth('localhost')}:3456",
+            "127.0.0.1:8080",
+        ],
+    )
+    def test_a_local_endpoint_stays_behind_with_a_note(self, tmp_path, name, value):
+        home = _pc_home(tmp_path, settings={"env": {name: value, "KEEP": "1"}})
+        scope = nodes.user_scope(home)
+        assert scope.settings == {"env": {"KEEP": "1"}}
+        assert scope.notes == (
+            f"settings.env.{name}: points at this PC, never shipped",
+        )
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "https://gateway.example/v1",
+            "http://10.0.0.5:4000",
+            "proxy.corp.example:3128",
+        ],
+    )
+    def test_a_remote_endpoint_ships(self, tmp_path, value):
+        home = _pc_home(tmp_path, settings={"env": {"ANTHROPIC_BASE_URL": value}})
+        scope = nodes.user_scope(home)
+        assert scope.settings == {"env": {"ANTHROPIC_BASE_URL": value}}
+        assert scope.notes == ()
+
+    @pytest.mark.parametrize("value", ["http://[::1", "http://", "", 3456, None])
+    def test_an_endpoint_that_names_no_host_stays_behind(self, tmp_path, value):
+        home = _pc_home(tmp_path, settings={"env": {"HTTPS_PROXY": value}})
+        scope = nodes.user_scope(home)
+        assert scope.settings == {"env": {}}
+        assert scope.notes == (
+            "settings.env.HTTPS_PROXY: not a url with a host, never shipped",
+        )
+
+    def test_an_unrelated_local_url_is_the_users_own_business(self, tmp_path):
+        # Only the endpoint names are checked; any other env entry ships.
+        env = {"MY_APP_URL": "http://127.0.0.1:8000"}
+        home = _pc_home(tmp_path, settings={"env": env})
+        assert nodes.user_scope(home).settings == {"env": env}
 
 
 class TestAMalformedPcFileIsANoteNotACrash:
