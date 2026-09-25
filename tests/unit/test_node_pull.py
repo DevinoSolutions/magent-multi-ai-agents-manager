@@ -1261,6 +1261,59 @@ class TestPullShOnARealBash:
         assert snap.files == ()
         assert snap.truncated == {"api": ("api/transcripts/a.jsonl",)}
 
+    def test_a_name_that_is_not_utf8_ships_beside_the_rest(self, tmp_path):
+        # os.walk hands such a name over surrogate-escaped. The budget once
+        # encoded it strictly: UnicodeEncodeError, exit 1, and every session
+        # on the node failed every tick, since pull_node always sends a cap.
+        _, pdir, proj = self._project(tmp_path)
+        (proj / "good.jsonl").write_text("ok", encoding="utf-8")
+        with open(os.fsencode(proj) + b"/bad\xff\xfe.jsonl", "wb") as fh:
+            fh.write(b"bad")
+        snap = self._pull(tmp_path, pdir, total=10_000_000)
+        bad = "api/transcripts/" + os.fsdecode(b"bad\xff\xfe.jsonl")
+        assert _stored(tmp_path / "pc") == sorted([bad, "api/transcripts/good.jsonl"])
+        assert (tmp_path / "pc" / bad).read_bytes() == b"bad"
+        assert snap.truncated == {}
+
+    def test_long_non_ascii_names_near_the_cap_never_overrun_it(self, tmp_path):
+        # Each name is past ustar's 100 bytes and not ASCII, so tar adds a
+        # PAX header per member: ~1 kB the budget must count, 15 times over
+        # -- more than the slack the stream's own padding leaves.
+        _, pdir, proj = self._project(tmp_path)
+        for i in range(15):
+            path = proj / f"{i:02d}-{'é' * 100}.jsonl"
+            path.write_bytes(b"x" * 1000)
+            os.utime(path, (1000 + i, 1000 + i))
+        full = self._run(
+            tmp_path,
+            {
+                "sids": {
+                    "api": {"roots": ["~/magent/api"], "project_dir": pdir, "since": 0}
+                }
+            },
+        )
+        assert full.returncode == 0, full.stderr.decode()
+        shipped_any = False
+        for step in range(30):
+            cap = len(full.stdout) - 97 * step
+            snap = self._pull(tmp_path, pdir, total=cap, dest=f"pc{step}")
+            shipped_any = shipped_any or bool(snap.files)
+        assert shipped_any
+
+    def test_the_names_left_out_are_reserved_before_anything_ships(self, tmp_path):
+        # 400 long names: their `truncated` listing alone is ~90 kB of the
+        # metadata line, which is written before the archive. Without the
+        # up-front reserve the members fill the budget and the listing
+        # pushes the reply past the cap.
+        _, pdir, proj = self._project(tmp_path)
+        for i in range(400):
+            path = proj / f"{i:03d}-{'n' * 190}.jsonl"
+            path.write_bytes(b"x" * 100)
+            os.utime(path, (1000 + i, 1000 + i))
+        snap = self._pull(tmp_path, pdir, total=150_000)
+        assert snap.files
+        assert len(snap.truncated["api"]) > 300
+
     def test_a_fifo_a_link_or_a_huge_file_in_the_state_store_is_never_read(
         self, tmp_path
     ):

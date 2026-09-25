@@ -229,7 +229,13 @@ def padded(n):
 def member_cost(arcname, size):
     # Its header, its bytes padded to a block, and room for the PAX header
     # tar adds for a long or non-ASCII name. Never less than tar writes.
-    return BLOCK + padded(size) + BLOCK + padded(len(arcname.encode("utf-8")) + 64)
+    # The name's bytes as tar writes them: os.walk surrogate-escapes a name
+    # that is not UTF-8, and a strict encode here would raise and fail the
+    # whole node's pull. The PAX records' worst case is N + 62 bytes for an
+    # N-byte name: path (N + 12), hdrcharset=BINARY for such a name (21), and
+    # an mtime past ustar's range (up to 29); 128 covers it.
+    name = arcname.encode("utf-8", "surrogateescape")
+    return BLOCK + padded(size) + BLOCK + padded(len(name) + 128)
 
 
 def listed_cost(text):
