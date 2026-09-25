@@ -73,6 +73,15 @@ _BAD_ROWS = {
     "numeric-string": _GOOD_ROW.replace('"load1":1.6', '"load1":"1.5"'),
     "bool": _GOOD_ROW.replace('"nproc":4', '"nproc":true'),
     "fractional-count": _GOOD_ROW.replace('"nproc":4', '"nproc":4.9'),
+    # A count too big for a float parses as a Python int; the reader must
+    # refuse it, or score_node's float arithmetic crashes on it later.
+    "count-overflow-nproc": _GOOD_ROW.replace('"nproc":4', '"nproc":' + "9" * 401),
+    "count-overflow-mem-avail": _GOOD_ROW.replace(
+        '"mem_avail_mb":8000', '"mem_avail_mb":' + "9" * 401
+    ),
+    "count-overflow-my-sessions": _GOOD_ROW.replace(
+        '"my_sessions":1', '"my_sessions":' + "9" * 401
+    ),
 }
 
 
@@ -123,8 +132,6 @@ class TestTheLoadHistory:
         from magent import remote_mux
 
         assert remote_mux._load_sample is nodes._load_sample
-        assert remote_mux._finite is nodes._finite
-        assert remote_mux._integral is nodes._integral
 
     def test_a_node_the_daemon_never_sampled_has_no_history(self, tmp_path):
         assert nodes.read_load_history("never", nodes_dir=tmp_path) == []
@@ -234,6 +241,17 @@ class TestEachTermOfTheScore:
             assert score.mem == pytest.approx(0.07)
             assert score.below_floor is True
             assert score.my_sessions == 2
+
+    def test_a_tie_on_ts_and_memory_reads_the_sample_with_more_sessions(self):
+        window = [
+            _sample(NOW, load1=0.0, avail=8000, mine=0),
+            _sample(NOW, load1=0.0, avail=8000, mine=3),
+        ]
+
+        for ordered in (window, window[::-1]):
+            score = nodes.score_node("n", ordered)
+            assert score.my_sessions == 3
+            assert score.score == pytest.approx(0.15)
 
     def test_a_node_reporting_zero_cores_counts_as_one(self):
         assert nodes.score_node(

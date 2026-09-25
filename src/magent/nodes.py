@@ -1269,10 +1269,17 @@ def _finite(value: object) -> float:
 def _integral(value: object) -> int:
     """``value`` as an int, as strict as ``_finite``: TypeError for a
     non-number (a bool and a str included), ValueError for a float that is
-    not finite or not whole (``16.9``). A whole float (``16.0``) is taken."""
+    not finite or not whole (``16.9``), OverflowError for an int too large
+    for a float. A whole float (``16.0``) is taken.
+
+    The overflow bound is the scorer's: every count ends up in float
+    arithmetic (load per core, the free-memory fraction), so a count json
+    parsed as a 401-digit int is refused HERE, where every caller already
+    catches OverflowError, rather than crashing ``score_node`` later."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"not a number: {value!r}")
     if isinstance(value, int):
+        float(value)  # OverflowError past a float's range; the value stays exact
         return value
     if not math.isfinite(value) or not value.is_integer():
         raise ValueError(f"not a whole reading: {value}")

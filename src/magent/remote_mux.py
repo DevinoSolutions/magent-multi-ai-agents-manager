@@ -46,8 +46,7 @@ from magent.log import get_logger
 
 # pullable_sid is re-exported: its one owner is nodes.py (a leaf that must not
 # reach into this seam), and callers keep saying remote_mux.pullable_sid. The
-# load-sample parse is the same: one parse, owned by the leaf, re-imported here
-# so the pull path keeps its names.
+# one load-sample parse is the leaf's too; sample() and parse_pull call it.
 from magent.nodes import (
     LoadSample,
     NodeConfigError,
@@ -59,8 +58,6 @@ from magent.nodes import (
     parse_repo_status,
     pullable_sid,
 )
-from magent.nodes import _finite as _finite
-from magent.nodes import _integral as _integral
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Mapping, Sequence
@@ -530,7 +527,7 @@ def sample(node: Node) -> LoadSample:
         reading = _load_sample(json.loads(result.stdout.decode("utf-8", "replace")))
     # OverflowError is an ArithmeticError, not a ValueError: float() of a
     # 401-digit integer overflows. (`1e400` parses to inf, a ValueError from
-    # _finite/_integral.)
+    # nodes._finite/_integral.)
     except (ValueError, KeyError, TypeError, OverflowError) as e:
         shown = _run_shown(node, *_script_call("sample", [], None))
         raise RemoteError(
