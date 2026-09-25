@@ -767,11 +767,41 @@ def _payload(recipe: Recipe, *, header: bytes, decorate: str, memory: bool) -> b
         for name, path in pushed:
             _add_bytes(tar, f"project/{name}", path.read_bytes())
         if memory and recipe.memory_dir is not None:
-            for path in sorted(recipe.memory_dir.rglob("*")):
-                if path.is_file():
-                    rel = _archive_name(str(path.relative_to(recipe.memory_dir)))
-                    _add_bytes(tar, f"memory/{rel}", path.read_bytes())
+            for rel, path in _memory_files(recipe.memory_dir):
+                _add_bytes(tar, f"memory/{rel}", path.read_bytes())
     return buf.getvalue()
+
+
+def _memory_files(memory_dir: Path) -> list[tuple[str, Path]]:
+    """``(member name, path)`` for every REGULAR file under ``memory_dir``, in
+    name order. A link is never followed -- not a file link, not a folder
+    link, and not ``memory_dir`` itself being one: the folder is Claude's,
+    and a link in it can name ``~/.ssh``. What is skipped is logged, never
+    raised: a bring-up never fails because of memory."""
+    logger = get_logger("nodes")
+    if memory_dir.is_symlink():
+        logger.warning("memory folder %s is a link; no memory shipped", memory_dir)
+        return []
+    found: list[tuple[str, Path]] = []
+    # os.walk never descends into a linked folder (followlinks=False); each
+    # one is named so the skip is visible.
+    for dirpath, dirnames, filenames in os.walk(memory_dir):
+        base = Path(dirpath)
+        for name in dirnames:
+            if (base / name).is_symlink():
+                logger.warning("memory link %s skipped", base / name)
+        for name in filenames:
+            path = base / name
+            if path.is_symlink() or not path.is_file():
+                logger.warning("memory entry %s is not a regular file; skipped", path)
+                continue
+            try:
+                rel = _archive_name(str(path.relative_to(memory_dir)))
+            except ValueError:
+                logger.warning("memory file %s cannot be named on the node", path)
+                continue
+            found.append((rel, path))
+    return sorted(found)
 
 
 def _remote_home(node: Node) -> str:

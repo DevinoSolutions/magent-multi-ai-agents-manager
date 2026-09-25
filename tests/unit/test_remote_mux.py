@@ -1414,6 +1414,65 @@ class TestTheBringUpStaysInsideItsFolders:
         assert len(node_home.calls()) == 1
 
 
+def _link_or_skip(link: Path, target: Path, *, directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError:
+        pytest.skip("this account cannot create symlinks")
+
+
+def _nodes_log() -> str:
+    path = log.LOG_DIR / "nodes.log"
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+class TestMemoryNeverFollowsALink:
+    """A bring-up never fails because of memory, and never ships what a link
+    in the memory folder points at: the folder is Claude's, a link in it can
+    name ~/.ssh."""
+
+    def _bring_up(self, node_home, recipe: Recipe) -> bytes:
+        _answers(node_home)
+        remote_mux.bring_up(NODE, recipe)
+        return node_home.calls()[1].stdin
+
+    def test_a_file_link_inside_memory_is_skipped(self, node_home, tmp_path):
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        secret = tmp_path / "id_ed25519"
+        secret.write_bytes(b"TOPSECRET\n")
+        _link_or_skip(recipe.memory_dir / "leak.md", secret)
+        stdin = self._bring_up(node_home, recipe)
+        members = _members(stdin)
+        assert "memory/leak.md" not in members
+        assert members["memory/MEMORY.md"] == b"- remember\n"
+        assert b"TOPSECRET" not in stdin
+        assert "leak.md" in _nodes_log()
+
+    def test_a_folder_link_inside_memory_is_skipped(self, node_home, tmp_path):
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        keys = tmp_path / "dot-ssh"
+        keys.mkdir()
+        (keys / "id_ed25519").write_bytes(b"TOPSECRET\n")
+        _link_or_skip(recipe.memory_dir / "keys", keys, directory=True)
+        stdin = self._bring_up(node_home, recipe)
+        assert not any(n.startswith("memory/keys") for n in _members(stdin))
+        assert b"TOPSECRET" not in stdin
+        assert "keys" in _nodes_log()
+
+    def test_a_memory_folder_that_is_a_link_ships_no_memory(self, node_home, tmp_path):
+        keys = tmp_path / "dot-ssh"
+        keys.mkdir()
+        (keys / "id_ed25519").write_bytes(b"TOPSECRET\n")
+        linked = tmp_path / "linked-memory"
+        _link_or_skip(linked, keys, directory=True)
+        stdin = self._bring_up(node_home, _recipe(tmp_path, memory_dir=linked))
+        assert not any(n.startswith("memory/") for n in _members(stdin))
+        assert b"TOPSECRET" not in stdin
+        assert "linked-memory" in _nodes_log()
+
+
 class TestPushingFilesToARunningProject:
     def test_push_mode_ships_the_files_and_no_memory(self, node_home, tmp_path):
         _answers(node_home, {**_RESULT, "shipped": [".env"]})
