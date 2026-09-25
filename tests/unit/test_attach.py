@@ -2291,7 +2291,8 @@ class TestSpawnWindows:
 
 
 # The two wt argv lines `magent attach` spawns for session "api" on
-# "user@host", byte for byte, as shipped before the node work. Shared by the
+# "user@host" (supervised and bare), byte for byte, as shipped before the node
+# work, plus the node's supervised tmux line below them. Shared by the
 # characterization pins below and by the spawn_attach_window tests after them,
 # so "the lift changed nothing" is one comparison against one literal.
 _SUPERVISED_WT_ARGV = [
@@ -2329,8 +2330,6 @@ _BARE_WT_ARGV = [
     "user@host",
     "psmux -L api attach || magent sessions api",
 ]
-# Where the pane command starts inside a wt argv: after `--`.
-_PANE = _SUPERVISED_WT_ARGV.index("--") + 1
 # The node analogue of _SUPERVISED_WT_ARGV: the whole wt line a tmux pane for
 # session "api" on "amin@devino-second" opens, hand-written byte for byte
 # rather than derived, so a drift in the exact-target attach form, the `--mux`
@@ -2353,6 +2352,14 @@ _SUPERVISED_TMUX_WT_ARGV = [
     "--mux",
     "tmux",
 ]
+# Where the pane command starts inside a wt argv: after `--`. Computed from one
+# literal but it holds for every wt literal here, because they all share one
+# `wt -w new --title magent:api --suppressApplicationTitle --` prefix.
+_PANE = _SUPERVISED_WT_ARGV.index("--") + 1
+# The remote command a node pane for session "api" runs: tmux on the shared
+# `-L magent` socket, exact-target form. Spelled out once more INSIDE
+# _SUPERVISED_TMUX_WT_ARGV above, per the one-copy-per-whole-line-literal rule.
+_TMUX_REMOTE = "tmux -L magent attach -t '=api'"
 
 
 class TestTodaysAttachShapesArePinned:
@@ -2442,8 +2449,6 @@ class TestTmuxPaneCommand:
     """What a node pane runs: the same supervisor (or bare ssh), pointed at
     the tmux attach, and told which multiplexer to probe after a drop."""
 
-    _TMUX_REMOTE = "tmux -L magent attach -t '=api'"
-
     def test_a_supervised_node_pane_tells_the_supervisor_its_multiplexer(self):
         # `--mux` goes LAST, after `--remote`: a psmux pane's argv carries no
         # --mux at all, so it stays byte-identical to what shipped.
@@ -2455,7 +2460,7 @@ class TestTmuxPaneCommand:
                 "api",
                 _FAKE_SUPERVISOR,
                 mux="tmux",
-                remote=self._TMUX_REMOTE,
+                remote=_TMUX_REMOTE,
             )
             == _SUPERVISED_TMUX_WT_ARGV[_PANE:]
         )
@@ -2467,14 +2472,14 @@ class TestTmuxPaneCommand:
         from magent import attach_client
 
         assert attach_client.pane_command(
-            "amin@devino-second", "api", None, mux="tmux", remote=self._TMUX_REMOTE
-        ) == [*_BARE_WT_ARGV[_PANE:-2], "amin@devino-second", self._TMUX_REMOTE]
+            "amin@devino-second", "api", None, mux="tmux", remote=_TMUX_REMOTE
+        ) == [*_BARE_WT_ARGV[_PANE:-2], "amin@devino-second", _TMUX_REMOTE]
 
     def test_the_remote_defaults_to_the_multiplexers_attach_command(self):
         from magent import attach_client
 
         argv = attach_client.pane_command("u@h", "api", _FAKE_SUPERVISOR, mux="tmux")
-        assert argv[-4:] == ["--remote", self._TMUX_REMOTE, "--mux", "tmux"]
+        assert argv[-4:] == ["--remote", _TMUX_REMOTE, "--mux", "tmux"]
 
     def test_a_tmux_pane_round_trips_through_the_corpse_scan_and_the_parser(self):
         # The pane's argv is read back by two parties: the corpse scan (which
@@ -2570,7 +2575,7 @@ class TestSpawnAttachWindow:
         assert argv == [
             *_BARE_WT_ARGV[:-2],
             "amin@devino-second",
-            "tmux -L magent attach -t '=api'",
+            _TMUX_REMOTE,
         ]
 
     def test_an_explicit_remote_reaches_the_pane_verbatim(self, monkeypatch):
