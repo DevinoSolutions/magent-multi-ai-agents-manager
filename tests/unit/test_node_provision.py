@@ -688,6 +688,82 @@ class TestUserScopePluginsAndSkills:
         assert [f.path for f in scope.skills] == ["mine/SKILL.md"]
         assert scope.notes == ("skills/synced: claude.ai-managed copies, not shipped",)
 
+    # A link in ~/.claude/skills is one the user made -- a repo checked out
+    # elsewhere is the main case -- so the walk FOLLOWS it out of the root, a
+    # Windows junction exactly like a symlink. Deliberately not containment
+    # (nodes._skills says so). The tool dirs under the linked-in repo still
+    # stay behind: they are pruned by name at every level.
+    @staticmethod
+    def _repo_outside(tmp_path: Path) -> Path:
+        repo = tmp_path / "elsewhere" / "deploy-skill"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".git" / "config").write_bytes(b"[core]\n")
+        (repo / "node_modules" / "dep").mkdir(parents=True)
+        (repo / "node_modules" / "dep" / "i.js").write_bytes(b"")
+        (repo / "SKILL.md").write_bytes(b"# deploy\n")
+        (repo / "run.sh").write_bytes(b"#!/usr/bin/env bash\necho hi\n")
+        return repo
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows'")
+    def test_a_junction_to_a_folder_outside_skills_ships_its_files(self, tmp_path):
+        import _winapi  # win32-only: imported where it exists
+
+        home = _pc_home(tmp_path)
+        skills = home / ".claude" / "skills"
+        skills.mkdir(parents=True)
+        repo = self._repo_outside(tmp_path)
+        _winapi.CreateJunction(str(repo), str(skills / "deploy"))
+        assert not (skills / "deploy").is_symlink()  # a junction, not a symlink
+        assert [f.path for f in nodes.user_scope(home).skills] == [
+            "deploy/SKILL.md",
+            "deploy/run.sh",
+        ]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the POSIX twin")
+    def test_a_symlink_to_a_folder_outside_skills_ships_its_files(self, tmp_path):
+        home = _pc_home(tmp_path)
+        skills = home / ".claude" / "skills"
+        skills.mkdir(parents=True)
+        repo = self._repo_outside(tmp_path)
+        (skills / "deploy").symlink_to(repo, target_is_directory=True)
+        assert [f.path for f in nodes.user_scope(home).skills] == [
+            "deploy/SKILL.md",
+            "deploy/run.sh",
+        ]
+
+    # The walk follows links, so a link back at an ancestor is a cycle, and
+    # the realpath ``seen`` guard is the only thing that ends it. On Windows
+    # that holds only if realpath sees through a junction -- asserted first,
+    # so a failure says which half broke.
+    @pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows'")
+    def test_a_junction_cycle_ends_at_the_realpath_guard(self, tmp_path):
+        import _winapi  # win32-only: imported where it exists
+
+        home = _pc_home(tmp_path)
+        skill = home / ".claude" / "skills" / "deploy"
+        (skill / "sub").mkdir(parents=True)
+        (skill / "SKILL.md").write_bytes(b"# deploy\n")
+        (skill / "sub" / "notes.md").write_bytes(b"notes\n")
+        _winapi.CreateJunction(str(skill), str(skill / "sub" / "back"))
+        assert os.path.realpath(skill / "sub" / "back") == os.path.realpath(skill)
+        assert [f.path for f in nodes.user_scope(home).skills] == [
+            "deploy/SKILL.md",
+            "deploy/sub/notes.md",
+        ]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the POSIX twin")
+    def test_a_symlink_cycle_ends_at_the_realpath_guard(self, tmp_path):
+        home = _pc_home(tmp_path)
+        skill = home / ".claude" / "skills" / "deploy"
+        (skill / "sub").mkdir(parents=True)
+        (skill / "SKILL.md").write_bytes(b"# deploy\n")
+        (skill / "sub" / "notes.md").write_bytes(b"notes\n")
+        (skill / "sub" / "back").symlink_to(skill, target_is_directory=True)
+        assert [f.path for f in nodes.user_scope(home).skills] == [
+            "deploy/SKILL.md",
+            "deploy/sub/notes.md",
+        ]
+
     # Skill files ship as raw bytes and nothing else scans them: the value rule
     # (CLAUDE_CREDENTIAL_MARKER) reaches them too, and plugin ids and
     # marketplace sources, so a hard-coded key cannot ride any of them out.

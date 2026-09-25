@@ -578,7 +578,9 @@ def _skills(root: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     path. A file is executable if its mode says so OR it starts with ``#!`` --
     a Windows PC has no exec bit to read. A file whose bytes (or path) hold a
     Claude credential stays behind; its note names the path, never the
-    content."""
+    content. A Windows junction is followed exactly like a symlink, on
+    purpose: a link in ``skills`` is one the user made (a repo checked out
+    elsewhere is the main case), so it is not contained to the root."""
     if not root.is_dir():
         return ()
     if any((root / top).exists() for top in SKILLS_EXCLUDED_TOP):
