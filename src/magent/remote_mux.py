@@ -789,9 +789,11 @@ def _read_regular(path: Path, *, cap: int, what: str) -> bytes:
     check alone has a hole: ``lstat`` before opening (a FIFO or a device is
     never opened, an oversize file never read), ``fstat`` on what was opened
     (the path may have been swapped in between), and a read of at most
-    ``cap + 1`` bytes (the file may have grown). OSError when it cannot be
-    opened -- ``O_NOFOLLOW`` makes a final-component link swapped in after the
-    ``lstat`` one of those."""
+    ``cap + 1`` bytes (the file may have grown). ``fstat`` must also name the
+    SAME file the ``lstat`` sized -- ``(st_dev, st_ino)`` -- or a regular file
+    swapped in under the name would be read on the old one's vetting. OSError
+    when it cannot be opened -- ``O_NOFOLLOW`` makes a final-component link
+    swapped in after the ``lstat`` one of those."""
     before = os.lstat(path)
     if not stat.S_ISREG(before.st_mode):
         raise ValueError(f"{what} is not a regular file")
@@ -799,8 +801,11 @@ def _read_regular(path: Path, *, cap: int, what: str) -> bytes:
         raise ValueError(f"{what} is {before.st_size} bytes; the cap is {cap}")
     fd = os.open(path, _READ_FLAGS)
     with os.fdopen(fd, "rb") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode):
             raise ValueError(f"{what} is not a regular file")
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise ValueError(f"{what} changed between its check and its open")
         data = handle.read(cap + 1)
     if len(data) > cap:
         raise ValueError(f"{what} grew past the cap of {cap} bytes")

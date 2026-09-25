@@ -11,6 +11,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -1567,6 +1568,108 @@ class TestAPushFileIsReadAsVetted:
     def test_the_caps(self):
         assert remote_mux.PUSH_FILE_MAX_BYTES == 16 * 1024 * 1024
         assert remote_mux.PAYLOAD_MAX_BYTES == 64 * 1024 * 1024
+
+
+_STAT_FIELDS = (
+    "st_mode",
+    "st_ino",
+    "st_dev",
+    "st_nlink",
+    "st_uid",
+    "st_gid",
+    "st_size",
+    "st_atime",
+    "st_mtime",
+    "st_ctime",
+)
+
+
+def _lstat_lies(
+    monkeypatch, path: Path, *, like: Path | None = None, **changes: int
+) -> None:
+    """``os.lstat(path)`` answers ``like``'s stat (default: ``path``'s own,
+    through any link) with ``changes`` -- the file as it looked BEFORE a swap,
+    so each pin reaches the one guard that runs after the lstat. Compared by
+    abspath, never realpath: posixpath.realpath calls os.lstat itself."""
+    real_lstat = os.lstat
+    want = os.path.normcase(os.path.realpath(path))
+    base = os.stat(like if like is not None else path)
+    lie = os.stat_result(
+        [changes.get(name, getattr(base, name)) for name in _STAT_FIELDS]
+    )
+
+    def fake(p, *args, **kwargs):
+        if os.path.normcase(os.path.abspath(os.fspath(p))) == want:
+            return lie
+        return real_lstat(p, *args, **kwargs)
+
+    monkeypatch.setattr(remote_mux.os, "lstat", fake)
+
+
+class TestTheReadSurvivesASwap:
+    """Each guard AFTER the lstat, pinned by an lstat that lies -- the file as
+    it was vetted, before something was swapped in under the same name."""
+
+    @needs_fifo
+    def test_a_fifo_the_lstat_called_regular_is_refused_not_read(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        recipe = _recipe(tmp_path)
+        assert recipe.local_root is not None
+        fifo = recipe.local_root / "pipe.env"
+        os.mkfifo(fifo)
+        _lstat_lies(monkeypatch, fifo, st_mode=stat.S_IFREG | 0o600, st_size=1)
+        # O_NONBLOCK keeps the open from waiting for a writer; fstat refuses.
+        raised = _in_thread(
+            lambda: remote_mux.bring_up(
+                NODE, dataclasses.replace(recipe, push_files=(fifo,))
+            )
+        )
+        assert isinstance(raised, ValueError)
+        assert "not a regular file" in str(raised)
+        assert node_home.calls() == []
+
+    def test_a_file_that_grew_after_the_lstat_is_refused(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        recipe = _recipe(tmp_path)  # .env is 15 bytes
+        monkeypatch.setattr(remote_mux, "PUSH_FILE_MAX_BYTES", 8)
+        _lstat_lies(monkeypatch, recipe.push_files[0], st_size=4)
+        with pytest.raises(ValueError, match="grew past the cap of 8") as info:
+            remote_mux.bring_up(NODE, recipe)
+        assert ".env" in str(info.value)
+        assert node_home.calls() == []
+
+    def test_a_file_swapped_between_lstat_and_open_is_refused(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        recipe = _recipe(tmp_path)
+        env = recipe.push_files[0]
+        _lstat_lies(monkeypatch, env, st_ino=os.stat(env).st_ino + 1)
+        with pytest.raises(ValueError, match="changed") as info:
+            remote_mux.bring_up(NODE, recipe)
+        assert ".env" in str(info.value)
+        assert node_home.calls() == []
+
+    @pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="POSIX O_NOFOLLOW")
+    def test_a_link_the_lstat_called_regular_is_never_followed(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        # Every check before the open trusts the lying lstat (is_symlink,
+        # realpath); only O_NOFOLLOW stands between the link and the secret.
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        secret = tmp_path / "id_ed25519"
+        secret.write_bytes(b"TOPSECRET\n")
+        leak = recipe.memory_dir / "leak.md"
+        _link_or_skip(leak, secret)
+        _lstat_lies(monkeypatch, leak, like=secret)
+        _answers(node_home)
+        remote_mux.bring_up(NODE, recipe)
+        stdin = node_home.calls()[1].stdin
+        assert "memory/leak.md" not in _members(stdin)
+        assert b"TOPSECRET" not in stdin
+        assert "leak.md" in _nodes_log()
 
 
 class TestWhatTheNodeAnswersIsVetted:
