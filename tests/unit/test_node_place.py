@@ -350,6 +350,22 @@ class TestPlace:
 
         assert [s.nick for s in placement.scores] == ["third", "second"]
 
+    def test_scores_equal_up_to_float_noise_tie_by_config_order(self):
+        # 0.1 + 0.05 * 4 sums to 0.30000000000000004; 0.05 + 0.05 * 5 to 0.3.
+        samples = {
+            "third": [_sample(nproc=2, load1=0.2, avail=8000, mine=4)],
+            "second": [_sample(nproc=2, load1=0.1, avail=8000, mine=5)],
+        }
+
+        placement = nodes.place(
+            pool("third", "second"), samples, now=NOW, map_entry=None
+        )
+
+        scores = {s.nick: s.score for s in placement.scores}
+        assert scores["third"] != scores["second"]  # the noise is real
+        assert scores["third"] == pytest.approx(scores["second"])
+        assert placement.nick == "third"
+
     def test_every_placement_reason_has_a_sentence(self):
         assert set(nodes.PLACE_REASONS) == {"kept", "re-placed", "placed", "no-data"}
         assert all(nodes.PLACE_REASONS.values())

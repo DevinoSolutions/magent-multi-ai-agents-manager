@@ -1470,6 +1470,8 @@ def place(
         return Placement(None, "no-data", scored, vanished)
     order = {nick: index for index, nick in enumerate(nicks)}
     candidates = [s for s in scored if not s.below_floor] or list(scored)
+    # round(..., 9): scores equal up to float noise from summing the terms tie
+    # exactly, so config order decides, not the last bit.
     best = min(candidates, key=lambda s: (round(s.score, 9), order[s.nick]))
     if vanished is None:
         return Placement(best.nick, "placed", scored)
