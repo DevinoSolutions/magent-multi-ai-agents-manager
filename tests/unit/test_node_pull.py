@@ -676,6 +676,49 @@ class TestWhatLandsAndHow:
         assert dst == str(final)
         # The tmp file is a sibling of its target: inside dest, same volume.
         assert os.path.dirname(src) == str(final.parent)
+        # ...and its name never grows with the target's (see the NAME_MAX pin).
+        tmp = os.path.basename(src)
+        assert tmp.startswith(".")
+        assert tmp.endswith(".part")
+        assert "a.jsonl" not in tmp
+
+    def test_a_failed_write_leaves_no_part_behind(self, tmp_path, monkeypatch):
+        synced: list[int] = []
+
+        def _eio(fd):
+            synced.append(fd)
+            raise OSError(5, "Input/output error")
+
+        # Only _write_file fsyncs in magent, so this reaches nothing else.
+        monkeypatch.setattr(remote_mux.os, "fsync", _eio)
+        dest = tmp_path / "second"
+        reply = pull_bytes(pull_meta(), [member("api/transcripts/a.jsonl", b"data")])
+        snap = parse_pull(reply, dest=dest, sids=frozenset({"api"}))
+        assert synced
+        assert snap.failed_sids == frozenset({"api"})
+        assert snap.files == ()
+        # rglob sees dot-files: no half-written ".<random>.part" either.
+        assert _stored(dest) == []
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="MAX_PATH, not NAME_MAX, bounds a Windows path"
+    )
+    def test_a_node_filename_near_name_max_is_stored(self, tmp_path):
+        # The temp was once "<name>.<pid>.<thread ident>.part", ~29 bytes over
+        # the name: a 240-byte node filename failed ENAMETOOLONG, the whole sid
+        # failed, and its held watermark failed it again on every tick.
+        name = "n" * 234 + ".jsonl"
+        assert len(name.encode()) == 240
+        reply = pull_bytes(
+            pull_meta(),
+            [member(f"api/transcripts/{name}", b"long")],
+            fmt=tarfile.PAX_FORMAT,  # past ustar's 100 bytes, as pull.sh writes it
+        )
+        dest = tmp_path / "second"
+        snap = parse_pull(reply, dest=dest, sids=frozenset({"api"}))
+        assert snap.failed_sids == frozenset()
+        assert _stored(dest) == [f"api/transcripts/{name}"]
+        assert (dest / "api" / "transcripts" / name).read_bytes() == b"long"
 
 
 class TestTheRequestedSidsAreChecked:
@@ -1274,6 +1317,22 @@ class TestPullShOnARealBash:
         assert _stored(tmp_path / "pc") == sorted([bad, "api/transcripts/good.jsonl"])
         assert (tmp_path / "pc" / bad).read_bytes() == b"bad"
         assert snap.truncated == {}
+
+    def test_a_240_byte_node_filename_lands_on_the_pc(self, tmp_path):
+        # Legal on the node (NAME_MAX is 255), so it must land on the PC too:
+        # a temp name derived from it once ran past NAME_MAX, and the sid's
+        # held watermark re-failed it on every tick.
+        _, pdir, proj = self._project(tmp_path)
+        name = "n" * 234 + ".jsonl"
+        assert len(name.encode()) == 240
+        (proj / name).write_bytes(b"long")
+        (proj / "short.jsonl").write_bytes(b"short")
+        snap = self._pull(tmp_path, pdir, total=10_000_000)
+        assert snap.failed_sids == frozenset()
+        assert _stored(tmp_path / "pc") == sorted(
+            [f"api/transcripts/{name}", "api/transcripts/short.jsonl"]
+        )
+        assert (tmp_path / "pc" / "api" / "transcripts" / name).read_bytes() == b"long"
 
     def test_long_non_ascii_names_near_the_cap_never_overrun_it(self, tmp_path):
         # Each name is past ustar's 100 bytes and not ASCII, so tar adds a

@@ -31,6 +31,7 @@ import shlex
 import shutil
 import subprocess
 import tarfile
+import tempfile
 import threading
 import time
 from collections import deque
@@ -832,20 +833,28 @@ def _usable_mtime(value: object) -> float | None:
 
 
 def _write_file(path: Path, reader: IO[bytes], mtime: float | None) -> None:
-    """Store one pulled file whole (sibling ``.part`` + ``os.replace``) with the
-    node's mtime when it has a usable one, so a reader never sees half a
-    transcript. Streamed in ``PULL_COPY_CHUNK_BYTES`` chunks, never whole."""
+    """Store one pulled file whole (sibling ``.part`` + fsync + ``os.replace``)
+    with the node's mtime when it has a usable one, so a reader never sees half
+    a transcript. Streamed in ``PULL_COPY_CHUNK_BYTES`` chunks, never whole.
+
+    The temp name is ``mkstemp``'s short ``.<random>.part``, never derived from
+    the target's name: a name-derived temp outgrows NAME_MAX on a node filename
+    the target itself fits in, and that failure would hold the sid's watermark
+    on every tick. The ``.part`` suffix stays (the tar walker skips it); the
+    temp is unlinked on any failure, so none is ever left behind."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    part = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.part")
+    fd, part = tempfile.mkstemp(dir=path.parent, prefix=".", suffix=".part")
     try:
-        with part.open("wb") as out:
+        with open(fd, "wb") as out:
             shutil.copyfileobj(reader, out, length=PULL_COPY_CHUNK_BYTES)
+            out.flush()
+            os.fsync(out.fileno())
         if mtime is not None:
             os.utime(part, (mtime, mtime))
         os.replace(part, path)
     except BaseException:
         with contextlib.suppress(OSError):
-            part.unlink()
+            os.unlink(part)
         raise
 
 
