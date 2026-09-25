@@ -2444,28 +2444,35 @@ class TestTmuxPaneCommand:
         ]
 
     def test_a_bare_node_pane_is_the_same_ssh_with_the_tmux_command(self):
+        # Derived from the ONE hand-written bare literal: `[_PANE:-2]` is ssh,
+        # its options and `-t` (the target and the remote are the last two), so
+        # an SSH_CONNECTION_OPTS change stays a one-literal edit.
         from magent import attach_client
 
         assert attach_client.pane_command(
             "amin@devino-second", "api", None, mux="tmux", remote=self._TMUX_REMOTE
-        ) == [
-            "ssh",
-            "-o",
-            "ServerAliveInterval=15",
-            "-o",
-            "ServerAliveCountMax=4",
-            "-o",
-            "ConnectTimeout=20",
-            "-t",
-            "amin@devino-second",
-            self._TMUX_REMOTE,
-        ]
+        ) == [*_BARE_WT_ARGV[_PANE:-2], "amin@devino-second", self._TMUX_REMOTE]
 
     def test_the_remote_defaults_to_the_multiplexers_attach_command(self):
         from magent import attach_client
 
         argv = attach_client.pane_command("u@h", "api", _FAKE_SUPERVISOR, mux="tmux")
         assert argv[-4:] == ["--remote", self._TMUX_REMOTE, "--mux", "tmux"]
+
+    def test_a_tmux_pane_round_trips_through_the_corpse_scan_and_the_parser(self):
+        # The pane's argv is read back by two parties: the corpse scan (which
+        # must find THIS multiplexer's marker and not the other's) and the
+        # supervisor's own parser (which must recover the same remote + mux).
+        from magent import attach_client
+        from magent.cli import attach as attach_mod
+
+        argv = attach_client.pane_command("u@h", "api", _FAKE_SUPERVISOR, mux="tmux")
+        cmdline = " ".join(argv)
+        assert any(m in cmdline for m in attach_mod._attach_markers("api", "tmux"))
+        assert not any(m in cmdline for m in attach_mod._attach_markers("api", "psmux"))
+        opts = attach_client.parse_args(argv[1:])
+        assert opts.remote == argv[argv.index("--remote") + 1]
+        assert opts.mux == "tmux"
 
     def test_an_unknown_multiplexer_never_builds_a_pane(self):
         # Even with an explicit remote: the supervisor would reject `--mux

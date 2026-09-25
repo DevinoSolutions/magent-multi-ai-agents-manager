@@ -451,6 +451,10 @@ def pane_command(
     supervisor derive it: that argument is what puts the attach marker into the
     supervisor's own command line, which is how ``cli/attach.py::_dead_sids``
     can tell a pane mid-reconnect from a dead one (see CORPSE COHERENCE above).
+    An explicit ``remote`` must be ``remote_attach_command(sid, mux)``'s
+    spelling (or contain its marker): ``_attach_markers(sid, mux)`` is what the
+    corpse scan looks for, and a remote for the other multiplexer makes a live
+    pane read as dead.
 
     ``--mux`` is appended only for a non-default multiplexer, and LAST, so a
     psmux pane's argv is byte-for-byte what it always was; the supervisor needs
