@@ -464,9 +464,9 @@ def _attach_markers(sid: str, mux: str = "psmux") -> tuple[str, ...]:
     command it would have given ssh as the supervisor's ``--remote`` argument,
     so the same marker string appears in the supervisor's own command line --
     including while it is between connections and no ssh process exists at
-    all. The one rule that
-    keeps this honest is stated at ``attach_client.remote_attach_command``: the
-    remote command has exactly one spelling, and these markers match it.
+    all. The one rule that keeps this honest is stated at
+    ``attach_client.remote_attach_command``: the remote command has exactly one
+    spelling, and these markers match it.
 
     The quoted variants cover a session id that a shell (or a future call site)
     chose to quote, so a quoting change cannot silently turn every live window
@@ -787,18 +787,20 @@ def _spawn_windows(
 
     titles: list[str] = []
     for sid in sids:
-        title = make_title(sid)
         if sid in open_already:
             # Still tiled with everything else -- an already-open window belongs
             # in the grid; it just must not be opened a second time, and costs
             # no stagger since no SSH handshake follows.
+            title = make_title(sid)
             _echo_already_open(title)
             titles.append(title)
             continue
-        click.echo(f"  {style('o', fg='cyan')} {title}")
         # No `remote=`: the leaf derives the attach command from `mux`, so the
         # multiplexer is named once and cannot disagree with its own marker.
-        spawn_attach_window(target, sid, mux="psmux", reconnect=reconnect)
+        # The title tiled below is the one the window was opened with, not a
+        # second make_title that could disagree with it.
+        title = spawn_attach_window(target, sid, mux="psmux", reconnect=reconnect)
+        click.echo(f"  {style('o', fg='cyan')} {title}")
         titles.append(title)
         time.sleep(stagger)
     return titles

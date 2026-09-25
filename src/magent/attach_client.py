@@ -36,7 +36,9 @@ WHY ITS OWN CONSOLE SCRIPT rather than a ``magent`` subcommand: the same reason
 attach starts 40 of these, and booting the click CLI in each -- the
 registration hub imports every command module, then a config load follows -- is
 exactly the cost that once made a big attach take minutes. Imports here are
-stdlib plus ``click`` (already a base dependency, and only for echo/styling).
+stdlib plus ``click`` (already a base dependency, and only for echo/styling),
+``magent.style`` and ``magent.titles`` at top level; ``magent.env`` in-body, on
+the spawn path only.
 
 WHAT AN OUTAGE LOOKS LIKE. Loudly, once: a pane on flaky wi-fi used to print
 three lines per attempt -- ours announcing the drop, ours announcing the
@@ -507,7 +509,7 @@ def spawn_attach_window(
     mux: str,
     remote: str | None = None,
     reconnect: bool = True,
-) -> int:
+) -> str:
     """Open ONE Windows Terminal window attached to ``sid`` on ``target``.
 
     The single wt spawn behind every remote attach pane -- ``magent attach``'s
@@ -528,9 +530,12 @@ def spawn_attach_window(
     missing from PATH degrades to that same bare pane SILENTLY: a batch caller
     says so once for the whole batch, not once per window.
 
-    Returns the pid of the ``wt`` launcher. wt hands the window to the running
-    Terminal and exits, so this identifies the spawn, not the window -- windows
-    are found by title, everywhere in magent.
+    Returns the window title it used. Windows are found by title everywhere in
+    magent (tiling, attach dedupe, the corpse sweep), so a caller that tracks
+    the window takes this return value rather than building its own title --
+    one ``make_title`` call per window, never two that could disagree. The
+    ``wt`` launcher's pid is not returned: wt hands the window to the running
+    Terminal and exits, so it identifies nothing a caller could use.
     """
     # Built BEFORE anything is spawned: an unknown `mux` raises here, so a
     # window that would die on arrival is never opened.
@@ -544,20 +549,21 @@ def spawn_attach_window(
     # survives (nesting markers included) except a colour override an agent
     # harness leaked into us, which would paint this pane monochrome. None
     # when no harness marker is present, i.e. plain inheritance.
-    proc = subprocess.Popen(
+    title = make_title(sid)
+    subprocess.Popen(
         [
             "wt",
             "-w",
             "new",
             "--title",
-            make_title(sid),
+            title,
             "--suppressApplicationTitle",
             "--",
             *pane,
         ],
         env=attach_client_env(),
     )
-    return proc.pid
+    return title
 
 
 def verdict(rc: int, probe: str | None = None) -> str:
