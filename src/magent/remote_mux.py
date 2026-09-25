@@ -39,6 +39,7 @@ from magent.attach_client import SSH_MISSING_RC, TMUX_SOCKET
 from magent.log import get_logger
 from magent.nodes import (
     LoadSample,
+    NodeConfigError,
     RepoStatus,
     encoded_project_dir,
     parse_repo_status,
@@ -842,14 +843,31 @@ def ignored_paths(repo: Path, *, timeout_s: float, label: str) -> tuple[str, ...
     return tuple(p for p in result.stdout.decode("utf-8", "replace").split("\0") if p)
 
 
+def _session_root(remote_root: str) -> str:
+    """``remote_root`` as it may be sent to a node script: ``~``, ``~/...`` or
+    absolute. G sends the root UNEXPANDED (the script expands ``~``), so D's
+    check on its own expanded value never sees it (plan G Task 9's forward
+    correction). Anything else -- a relative path, a leading ``-`` read as an
+    option, another user's ``~user`` -- raises NodeConfigError before a
+    connection is opened."""
+    if remote_root == "~" or remote_root.startswith(("~/", "/")):
+        return remote_root
+    raise NodeConfigError(
+        f"session root {remote_root!r} is not ~, ~/... or an absolute path on the node"
+    )
+
+
 def _stdout_text(done: subprocess.CompletedProcess[bytes]) -> str:
     return done.stdout.decode("utf-8", "replace")
 
 
 def repo_status(node: Node, remote_root: str, *, timeout_s: float) -> list[RepoStatus]:
     """Each repo under a node session's cwd, as it is right now (read-only,
-    ``repo_status.sh``). RemoteError when the node does not answer."""
-    done = run_script(node, "repo_status", [remote_root], timeout_s=timeout_s)
+    ``repo_status.sh``). RemoteError when the node does not answer;
+    NodeConfigError, before any dial, for a root ``_session_root`` refuses."""
+    done = run_script(
+        node, "repo_status", [_session_root(remote_root)], timeout_s=timeout_s
+    )
     return parse_repo_status(_stdout_text(done))
 
 
@@ -868,8 +886,9 @@ def _tar_dir(source: Path) -> bytes:
 
 def node_realpath(node: Node, path: str, *, timeout_s: float) -> str:
     """The physical path ``path`` names on ``node`` (``~`` expanded, symlinks
-    resolved) -- the string Claude Code there keys its project dir by."""
-    done = run_script(node, "node_realpath", [path], timeout_s=timeout_s)
+    resolved) -- the string Claude Code there keys its project dir by.
+    NodeConfigError, before any dial, for a path ``_session_root`` refuses."""
+    done = run_script(node, "node_realpath", [_session_root(path)], timeout_s=timeout_s)
     return _stdout_text(done).strip()
 
 
@@ -880,7 +899,8 @@ def install_transcripts(
     ``remote_root`` on ``node`` will look for it (recall --to, spec §12 step
     4). The name is encoded HERE, by the one encoder, from the node's own
     physical path; the node only extracts. Returns the directory it landed
-    in. RemoteError when the node refuses or does not answer."""
+    in. RemoteError when the node refuses or does not answer; NodeConfigError,
+    before any dial, for a root ``_session_root`` refuses."""
     name = encoded_project_dir(node_realpath(node, remote_root, timeout_s=timeout_s))
     done = run_script(
         node, "install_transcripts", [name], timeout_s=timeout_s, stdin=_tar_dir(source)

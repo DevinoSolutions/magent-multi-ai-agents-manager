@@ -447,3 +447,46 @@ class TestTheInstallScriptsOnANode:
 
         assert done.returncode == 2
         assert not (home / ".claude").exists()
+
+
+class TestASessionRootIsCheckedBeforeItReachesTheNode:
+    """Plan G Task 9's forward correction: the root G sends is NOT D's expanded
+    ``_deliver`` value, so D's ``_node_path`` never sees it. It must be ``~``,
+    ``~/...`` or absolute; anything else (a relative path, a leading ``-`` an
+    ssh-side program could read as an option, another user's ``~user``) is
+    refused before a connection is opened."""
+
+    @pytest.mark.parametrize("root", ["magent/x", "-x", "~user/x", ""])
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda root, pulled: remote_mux.repo_status(_NODE, root, timeout_s=5),
+            lambda root, pulled: remote_mux.node_realpath(_NODE, root, timeout_s=5),
+            lambda root, pulled: remote_mux.install_transcripts(
+                _NODE, root, pulled, timeout_s=5
+            ),
+        ],
+        ids=["repo_status", "node_realpath", "install_transcripts"],
+    )
+    def test_a_root_that_is_not_home_relative_or_absolute_never_dials(
+        self, fake_ssh, tmp_path, call, root
+    ):
+        with pytest.raises(nodes.NodeConfigError):
+            call(root, _pulled(tmp_path))
+
+        assert fake_ssh.calls() == []
+
+    @pytest.mark.parametrize("root", ["~", "~/magent/api", "/srv/magent/api"])
+    def test_home_and_absolute_roots_are_sent_as_given(self, monkeypatch, root):
+        seen: list[list[str]] = []
+
+        def _run_script(node, script, args, *, timeout_s, stdin=None, **_k):
+            seen.append(args)
+            return subprocess.CompletedProcess([], 0, b"", b"")
+
+        monkeypatch.setattr(remote_mux, "run_script", _run_script)
+
+        remote_mux.repo_status(_NODE, root, timeout_s=5)
+        remote_mux.node_realpath(_NODE, root, timeout_s=5)
+
+        assert seen == [[root], [root]]
