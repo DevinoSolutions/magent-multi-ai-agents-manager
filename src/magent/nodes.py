@@ -14,6 +14,7 @@ import dataclasses
 import json
 import math
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass
@@ -255,6 +256,12 @@ def write_node_map(entries: Mapping[str, NodeMapEntry]) -> None:
         raise
 
 
+# A portable Unix login (useradd's default NAME_REGEX, minus the trailing-$
+# machine-account form). Checked only on the DERIVED user: an explicit
+# settings.nodes.<nick>.user is the operator's word.
+_NODE_LOGIN = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+
+
 def resolve(
     config: MagentConfig,
     proj: ProjectConfig,
@@ -266,9 +273,11 @@ def resolve(
 
     ``placed`` is the nick placement chose for a ``"node": "auto"`` project; a
     pinned project ignores it. ``local_user`` is ``env.local_username()``,
-    passed in so this stays pure. D4: a node with no ``user`` runs as the local
-    user, lowercased (Unix login names are), and that fallback may never be
-    root -- running sessions as root has to be written down.
+    passed in so this stays pure. A node with no ``user`` runs as the local
+    user, lowercased to match the per-person node account convention (D4). That
+    derived name must be a login ssh can use (a Windows ``USERNAME`` such as
+    ``"Amin Dhouib"`` is not), and it may never be root -- running sessions as
+    root has to be written down.
     """
     if proj.node is None:
         raise NodeConfigError(f"{proj.path}: not a node project")
@@ -286,14 +295,25 @@ def resolve(
     entry = pool.get(nick)
     if entry is None:
         known = ", ".join(sorted(pool)) or "none"
+        if proj.node == NODE_AUTO:
+            raise NodeConfigError(
+                f"{proj.path}: placement chose {nick!r}, which is no longer in "
+                f"settings.nodes; re-place (known nodes: {known})"
+            )
         raise NodeConfigError(
-            f"{proj.path}: node {nick!r} is not in settings.nodes (known: {known})"
+            f"{proj.path}: node {nick!r} is not in settings.nodes; known nodes: {known}"
         )
     user = entry.user if entry.user is not None else local_user.lower()
     if not user:
         raise NodeConfigError(
             f"settings.nodes.{nick}.user is not set and the local username is "
             "unknown; set it explicitly"
+        )
+    if entry.user is None and not _NODE_LOGIN.fullmatch(user):
+        raise NodeConfigError(
+            f"settings.nodes.{nick}.user is not set and the local username "
+            f"{local_user!r} is not a node login ({user!r} does not match "
+            f"{_NODE_LOGIN.pattern}); set it explicitly"
         )
     if entry.user is None and user == "root":
         raise NodeConfigError(

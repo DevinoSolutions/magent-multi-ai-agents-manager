@@ -361,21 +361,22 @@ class TestTheStrictRead:
         assert (busy.reads, sleeps) == (1, [])
 
 
-POOL = MagentConfig(
-    projects=[],
-    settings=Settings(
-        nodes={
+def _pool(entries: dict[str, NodeConfig] | None = None) -> MagentConfig:
+    """A fresh pool per call: MagentConfig and Settings are plain (mutable)
+    dataclasses, so one shared module-level config could carry a test's edit
+    into the next. Default: ``second`` (explicit user) and ``third`` (none)."""
+    if entries is None:
+        entries = {
             "second": NodeConfig(nick="second", host="devino-second", user="amin"),
             "third": NodeConfig(nick="third", host="devino-third"),
         }
-    ),
-)
+    return MagentConfig(projects=[], settings=Settings(nodes=entries))
 
 
 class TestResolve:
     def test_a_pinned_project_resolves_to_its_node(self):
         node = nodes.resolve(
-            POOL, ProjectConfig(path="api", node="second"), local_user="whoever"
+            _pool(), ProjectConfig(path="api", node="second"), local_user="whoever"
         )
         assert node == Node(
             nick="second", host="devino-second", user="amin", root="~/magent"
@@ -383,13 +384,13 @@ class TestResolve:
 
     def test_no_configured_user_means_the_local_one_lowercased(self):
         node = nodes.resolve(
-            POOL, ProjectConfig(path="api", node="third"), local_user="Amin"
+            _pool(), ProjectConfig(path="api", node="third"), local_user="Amin"
         )
         assert node.user == "amin"
 
     def test_auto_resolves_to_the_placed_node(self):
         node = nodes.resolve(
-            POOL,
+            _pool(),
             ProjectConfig(path="api", node="auto"),
             local_user="amin",
             placed="third",
@@ -398,7 +399,7 @@ class TestResolve:
 
     def test_a_pinned_project_ignores_a_placement(self):
         node = nodes.resolve(
-            POOL,
+            _pool(),
             ProjectConfig(path="api", node="second"),
             local_user="amin",
             placed="third",
@@ -408,7 +409,7 @@ class TestResolve:
     def test_auto_without_a_placement_is_refused(self):
         with pytest.raises(NodeConfigError, match="placement"):
             nodes.resolve(
-                POOL, ProjectConfig(path="api", node="auto"), local_user="amin"
+                _pool(), ProjectConfig(path="api", node="auto"), local_user="amin"
             )
 
     def test_a_cloud_project_is_refused_clearly_not_a_key_error(self):
@@ -416,33 +417,74 @@ class TestResolve:
         # caller that hands one to the node resolver gets a named refusal.
         with pytest.raises(NodeConfigError, match="cloud backend"):
             nodes.resolve(
-                POOL, ProjectConfig(path="api", node="cloud"), local_user="amin"
+                _pool(), ProjectConfig(path="api", node="cloud"), local_user="amin"
             )
 
     def test_a_project_without_a_node_is_refused(self):
         with pytest.raises(NodeConfigError, match="not a node project"):
-            nodes.resolve(POOL, ProjectConfig(path="api"), local_user="amin")
+            nodes.resolve(_pool(), ProjectConfig(path="api"), local_user="amin")
 
     def test_a_nick_missing_from_the_pool_is_refused_naming_it(self):
-        with pytest.raises(NodeConfigError, match=r"'fourth'.*second, third"):
+        with pytest.raises(
+            NodeConfigError, match=r"node 'fourth'.*; known nodes: second, third$"
+        ):
             nodes.resolve(
-                POOL, ProjectConfig(path="api", node="fourth"), local_user="amin"
+                _pool(), ProjectConfig(path="api", node="fourth"), local_user="amin"
             )
 
-    def test_an_implicit_root_user_is_refused(self):
+    def test_a_stale_placement_is_refused_saying_it_was_a_placement(self):
+        # The pool shrank after placement chose a node: the fix is to re-place,
+        # not to edit the project's pin (it has none).
+        with pytest.raises(
+            NodeConfigError,
+            match=r"placement chose 'fourth', which is no longer in settings\.nodes;"
+            r" re-place \(known nodes: second, third\)",
+        ):
+            nodes.resolve(
+                _pool(),
+                ProjectConfig(path="api", node="auto"),
+                local_user="amin",
+                placed="fourth",
+            )
+
+    def test_an_empty_pool_says_there_are_no_known_nodes(self):
+        with pytest.raises(NodeConfigError, match="known nodes: none"):
+            nodes.resolve(
+                _pool({}), ProjectConfig(path="api", node="second"), local_user="amin"
+            )
+
+    @pytest.mark.parametrize("local_user", ["root", "ROOT"])
+    def test_an_implicit_root_user_is_refused(self, local_user):
+        # Lowercasing happens BEFORE the D4 check, so "ROOT" cannot slip past.
         with pytest.raises(NodeConfigError, match="D4"):
             nodes.resolve(
-                POOL, ProjectConfig(path="api", node="third"), local_user="root"
+                _pool(), ProjectConfig(path="api", node="third"), local_user=local_user
             )
 
+    @pytest.mark.parametrize(
+        ("local_user", "derived"),
+        [("Amin Dhouib", "amin dhouib"), (" ", " "), ("1amin", "1amin")],
+    )
+    def test_a_derived_user_ssh_cannot_log_in_as_is_refused(self, local_user, derived):
+        # A Windows USERNAME may hold a space; whitespace passes `if not user`.
+        with pytest.raises(NodeConfigError) as err:
+            nodes.resolve(
+                _pool(), ProjectConfig(path="api", node="third"), local_user=local_user
+            )
+        assert "settings.nodes.third.user" in str(err.value)
+        assert repr(local_user) in str(err.value)
+        assert repr(derived) in str(err.value)
+
+    def test_an_explicit_user_is_not_second_guessed(self):
+        pool = _pool({"sixth": NodeConfig(nick="sixth", host="h", user="Svc.Account")})
+        node = nodes.resolve(
+            pool, ProjectConfig(path="api", node="sixth"), local_user="Amin Dhouib"
+        )
+        assert node.user == "Svc.Account"
+
     def test_an_explicit_root_user_is_honoured(self):
-        pool = MagentConfig(
-            projects=[],
-            settings=Settings(
-                nodes={
-                    "fifth": NodeConfig(nick="fifth", host="devino-fifth", user="root")
-                }
-            ),
+        pool = _pool(
+            {"fifth": NodeConfig(nick="fifth", host="devino-fifth", user="root")}
         )
         node = nodes.resolve(
             pool, ProjectConfig(path="api", node="fifth"), local_user="amin"
@@ -451,4 +493,6 @@ class TestResolve:
 
     def test_no_user_anywhere_is_refused(self):
         with pytest.raises(NodeConfigError, match=r"settings\.nodes\.third\.user"):
-            nodes.resolve(POOL, ProjectConfig(path="api", node="third"), local_user="")
+            nodes.resolve(
+                _pool(), ProjectConfig(path="api", node="third"), local_user=""
+            )
