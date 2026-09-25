@@ -13,29 +13,34 @@ from pathlib import Path
 
 import pytest
 
-from magent import cli, launch, log, node_sync, nodes, remote_mux
-from tests.unit._node_fixtures import config_json, entry, git, seed_history
+from magent import cli, log, node_sync, nodes, remote_mux
+from tests.unit._node_fixtures import (
+    D_ATTRS,
+    before_d,
+    config_json,
+    entry,
+    git,
+    needs_d,
+    seed_history,
+)
 
-# D-MERGE: D's launch.node_git_states (plan D :2919) is not on this branch yet.
-# Every test that needs it is written and skipped on this flag, so D's merge
-# switches them on by itself -- and they fail until the deferred code lands.
-_NO_D_GIT_STATES = not hasattr(launch, "node_git_states")
-_D_GIT_STATES_REASON = (
-    "D-MERGE: needs D's launch.node_git_states (plan G :3192-3210, :3257)"
-)
-# D-MERGE: `node push` (plan G Task 13, :3390-3449) is D's recipe and delivery
-# end to end: launch.node_recipe, launch.node_git_states, remote_mux.push_files.
-_NO_D_PUSH = not all(
-    (
-        hasattr(launch, "node_recipe"),
-        hasattr(launch, "node_git_states"),
-        hasattr(remote_mux, "push_files"),
-    )
-)
-_D_PUSH_REASON = (
-    "D-MERGE: needs D's launch.node_recipe, launch.node_git_states and"
-    " remote_mux.push_files (plan G :3390-3449)"
-)
+# D-MERGE: tests that wait on sub-plan D are gated through _node_fixtures'
+# one D_ATTRS list (needs_d); D's merge switches them on by itself, and they
+# fail until the deferred code named in node_cmd.py's D-MERGE index lands.
+
+
+class TestTheOneDGate:
+    def test_a_name_outside_the_one_list_is_refused_not_silently_skipped(self):
+        # A typo (or a D rename) would otherwise keep a test skipped forever.
+        with pytest.raises(KeyError, match="D_ATTRS"):
+            needs_d("kill_sessions", plan=":1")
+        with pytest.raises(KeyError, match="D_ATTRS"):
+            before_d("kill_sessions")
+
+    def test_every_gate_says_d_merge_so_the_exit_criterion_sees_it(self):
+        for name in D_ATTRS:
+            for mark in (needs_d(name, plan=":1"), before_d(name)):
+                assert mark.kwargs["reason"].startswith("D-MERGE: ")
 
 
 def _nodes_tree() -> dict[str, bytes]:
@@ -501,7 +506,7 @@ class TestNodePlan:
         assert 'no enabled project has "node" set' in result.stdout
 
     # D-MERGE: plan G :3000-3012 -- the push set needs D's node_git_states.
-    @pytest.mark.skipif(_NO_D_GIT_STATES, reason=_D_GIT_STATES_REASON)
+    @needs_d("node_git_states", plan=":3192-3210, :3257")
     def test_plan_lists_the_push_set_relative_to_the_project(
         self, runner, tmp_config, api_dir, no_states, monkeypatch
     ):
@@ -619,7 +624,7 @@ class TestNodePlan:
 
 
 # D-MERGE: plan G Task 13 (:3298-3380) -- written now, switched on by D's merge.
-@pytest.mark.skipif(_NO_D_PUSH, reason=_D_PUSH_REASON)
+@needs_d("node_recipe", "node_git_states", "push_files", plan=":3390-3449")
 @pytest.mark.usefixtures("_node_user")
 class TestNodePush:
     @pytest.fixture

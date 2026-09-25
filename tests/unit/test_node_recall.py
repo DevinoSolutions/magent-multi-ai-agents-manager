@@ -30,35 +30,28 @@ from tests.unit._node_fixtures import (
     NOW,
     OLDER_SESSION_ID,
     SESSION_ID,
+    before_d,
     config_json,
     entry,
     git,
+    needs_d,
     pool,
     write_transcript,
 )
 
-# D-MERGE: D's remote_mux.kill_session (DECISION-26 x) is not on this branch.
-# The recall tests that need it are written and skipped on this flag, so D's
-# merge switches them on -- and they fail until the kill branch of
-# node_cmd._stop_session lands (plan G :3853-3874).
-_NO_D_KILL = not hasattr(remote_mux, "kill_session")
-_D_KILL_REASON = "D-MERGE: needs D's remote_mux.kill_session (plan G :3853-3874)"
-
-# D-MERGE: `recall --to` (plan G Task 15, :4173-4266) moves a session through
-# D's recipe builder and bring-up. TestRecallTo is written and skipped on this
-# flag; D's merge switches it on and it fails until _destination/_recall_to
-# and the --to option land.
-_NO_D_MOVE = not all(
-    (
-        hasattr(launch, "node_recipe"),
-        hasattr(launch, "node_git_states"),
-        hasattr(launch, "bring_up_node_project"),
-        hasattr(launch, "NodeBringUpOutcome"),
-    )
-)
-_D_MOVE_REASON = (
-    "D-MERGE: needs D's launch.node_recipe, node_git_states,"
-    " bring_up_node_project and NodeBringUpOutcome (plan G :4173-4266)"
+# D-MERGE: recall's kill branch (D's remote_mux.kill_session, DECISION-26 x;
+# plan G :3853-3874) and `recall --to` (D's recipe builder and bring-up; plan G
+# Task 15, :4173-4266) are gated through _node_fixtures' one D_ATTRS list:
+# needs_d switches the written tests on with D's merge, and they fail until
+# the deferred code lands; before_d retires the pre-D pins.
+_NEEDS_D_KILL = needs_d("kill_session", plan=":3853-3874")
+_BEFORE_D_KILL = before_d("kill_session")
+_NEEDS_D_MOVE = needs_d(
+    "node_recipe",
+    "node_git_states",
+    "bring_up_node_project",
+    "NodeBringUpOutcome",
+    plan=":4173-4266",
 )
 
 
@@ -1643,7 +1636,7 @@ def _recall(runner, cfg: str, *args: str):
 
 
 class TestRecallLocal:
-    @pytest.mark.skipif(_NO_D_KILL, reason=_D_KILL_REASON)
+    @_NEEDS_D_KILL
     def test_the_steps_run_in_order_pull_report_stop(
         self, runner, placed_api, node_answers
     ):
@@ -1653,7 +1646,7 @@ class TestRecallLocal:
 
     # D-MERGE: delete this pin with the kill branch -- it holds only while
     # D's kill_session is absent: the session is named, never "stopped".
-    @pytest.mark.skipif(not _NO_D_KILL, reason="D's kill_session is merged")
+    @_BEFORE_D_KILL
     def test_before_d_a_reachable_session_is_named_with_its_stop_command(
         self, runner, placed_api, node_answers
     ):
@@ -1712,7 +1705,7 @@ class TestRecallLocal:
         assert "Traceback" not in result.output
         assert "is home" not in result.stdout
 
-    @pytest.mark.skipif(_NO_D_KILL, reason=_D_KILL_REASON)
+    @_NEEDS_D_KILL
     def test_stopped_is_said_only_when_the_kill_landed(
         self, runner, placed_api, node_answers
     ):
@@ -1720,7 +1713,7 @@ class TestRecallLocal:
 
         assert "stopped api on @second" in result.stdout
 
-    @pytest.mark.skipif(_NO_D_KILL, reason=_D_KILL_REASON)
+    @_NEEDS_D_KILL
     def test_a_session_that_was_already_gone_is_not_called_stopped(
         self, runner, placed_api, node_answers, monkeypatch
     ):
@@ -1731,7 +1724,7 @@ class TestRecallLocal:
         assert "no such session" in result.stdout
         assert "stopped api" not in result.stdout
 
-    @pytest.mark.skipif(_NO_D_KILL, reason=_D_KILL_REASON)
+    @_NEEDS_D_KILL
     def test_an_unconfirmed_kill_prints_the_quoted_command_that_stops_it(
         self, runner, placed_api, node_answers, monkeypatch
     ):
@@ -2075,7 +2068,7 @@ class TestTheStopCommandIsSafeToPaste:
 
     # D-MERGE: with D the reachable branch prints this only when kill_session
     # returns None; the fixture's kill answers True, so this pin goes then.
-    @pytest.mark.skipif(not _NO_D_KILL, reason="D's kill_session is merged")
+    @_BEFORE_D_KILL
     @pytest.mark.parametrize("sid", _UNQUOTABLE_SIDS)
     def test_before_d_a_reachable_node_gets_the_two_step_command(
         self, runner, api_repo, tmp_config, node_answers, sid
@@ -2137,8 +2130,15 @@ def _recall_to(runner, cfg: str, nick: str):
     )
 
 
-@pytest.mark.skipif(_NO_D_MOVE, reason=_D_MOVE_REASON)
+@_NEEDS_D_MOVE
 class TestRecallTo:
+    @pytest.fixture(autouse=True)
+    def _the_option_has_landed(self):
+        # D-MERGE: once D's attributes exist this class runs; without Task
+        # 15's --to, three of its refusals would pass on click's "No such
+        # option" exit 2. Every test here fails loudly until the option lands.
+        assert _recall_has_to(), "recall --to has not landed (plan G :3934)"
+
     def test_the_conversation_is_installed_on_the_new_node_then_resumed_there(
         self, runner, placed_api, node_answers, moving
     ):

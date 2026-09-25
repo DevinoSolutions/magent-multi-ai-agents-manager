@@ -14,7 +14,9 @@ import os
 import subprocess
 from pathlib import Path
 
-from magent import nodes
+import pytest
+
+from magent import launch, nodes, remote_mux
 from magent.config import (
     SCHEMA_VERSION,
     MagentConfig,
@@ -22,6 +24,55 @@ from magent.config import (
     ProjectConfig,
     Settings,
 )
+
+# D-MERGE: THE one list of sub-plan D attributes that G's deferred code needs
+# (the index at the top of src/magent/cli/node_cmd.py says what lands with
+# each). Every G test that waits on D is gated through needs_d / before_d
+# below -- never a hand-rolled hasattr -- so D's merge flips them all at once.
+# Exit criterion: after D merges,
+#   uv run pytest tests/unit/test_node_cmd.py tests/unit/test_node_recall.py -rs
+# shows no skip reason containing "D-MERGE", and
+#   git grep -n D-MERGE -- src tests
+# comes back empty (this list and its two helpers go with the last of them).
+D_ATTRS: dict[str, object] = {
+    "node_recipe": launch,
+    "node_git_states": launch,
+    "bring_up_node_project": launch,
+    "NodeBringUpOutcome": launch,
+    "push_files": remote_mux,
+    "kill_session": remote_mux,
+}
+D_LANDED: frozenset[str] = frozenset(
+    name for name, module in D_ATTRS.items() if hasattr(module, name)
+)
+
+
+def _known(names: tuple[str, ...]) -> None:
+    unknown = sorted(set(names) - D_ATTRS.keys())
+    if unknown:
+        raise KeyError(f"not in D_ATTRS: {unknown} -- add them to the one list")
+
+
+def needs_d(*names: str, plan: str) -> pytest.MarkDecorator:
+    """Skip until every one of ``names`` (all in D_ATTRS) is on this branch;
+    ``plan`` is the plan-G line range of the code that lands with them."""
+    _known(names)
+    return pytest.mark.skipif(
+        not D_LANDED.issuperset(names),
+        reason=f"D-MERGE: needs D's {', '.join(names)} (plan G {plan})",
+    )
+
+
+def before_d(*names: str) -> pytest.MarkDecorator:
+    """A pre-D pin: it runs only while one of ``names`` is missing. Once they
+    all land it skips with a D-MERGE reason, so the exit criterion above
+    catches a pin nobody deleted."""
+    _known(names)
+    return pytest.mark.skipif(
+        D_LANDED.issuperset(names),
+        reason=f"D-MERGE: pre-D pin -- delete it now that {', '.join(names)} landed",
+    )
+
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "node_load"
 # The instant the committed fixtures were written relative to: the newest

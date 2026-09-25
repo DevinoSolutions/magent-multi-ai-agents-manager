@@ -33,6 +33,40 @@ if TYPE_CHECKING:
     from magent.nodes import Node, NodeMapEntry, Placement, RepoStatus
     from magent.remote_mux import RemoteError
 
+# D-MERGE: index -- everything plan G defers to sub-plan D's merge, in one
+# place (the local D-MERGE notes below mark each insertion point). The tests
+# that wait on D are gated through ONE list, tests/unit/_node_fixtures.py's
+# D_ATTRS: launch.node_recipe, launch.node_git_states,
+# launch.bring_up_node_project, launch.NodeBringUpOutcome,
+# remote_mux.push_files, remote_mux.kill_session.
+# - plan (Task 12): `_print_push_set` (plan G :3192-3210) and its call at the
+#   end of plan_cmd's loop (:3257). Needs node_git_states.
+# - push (Task 13): `_current_nick` and `push_cmd` (:3390-3440) and the docs
+#   row "magent node push <project>" after plan's row in cli/docs.py
+#   (:3444-3449). Needs node_recipe, node_git_states, push_files. When it
+#   lands:
+#   - `_tail` (:3398-3399) already landed with recall (T14); do not re-add it;
+#   - add `import dataclasses` (push_cmd calls `dataclasses.replace`);
+#   - `RemoteError` stays under TYPE_CHECKING (already there, for `_tail`);
+#   - `_current_nick` and `push_cmd` import `nodes` in-body like every other
+#     function here -- the plan's code reads a module-level `nodes`.
+# - recall's kill (Task 14): `_stop_session`'s reachable branch becomes
+#   :3853-3874 (remote_mux.kill_session and its three outcomes); on None it
+#   prints `_kill_hint(source.target, held.sid)`, never the plan's raw
+#   f-string (spec-G14 P1). Needs kill_session.
+# - recall --to (Task 15): the option (:3934) and its usage rule, the two
+#   `to_local` guards (:3960-3962, :3969-3970), `_destination` and
+#   `_recall_to` (:4173-4249) wired in at :4252-4266, and the recall docs row's
+#   "(--to <nick> | --local)" wording in cli/docs.py. Needs node_recipe,
+#   node_git_states, bring_up_node_project, NodeBringUpOutcome.
+# - `Path` is a RUNTIME import (recall builds paths at run time); keep it out
+#   of TYPE_CHECKING when D's imports are merged.
+# Exit criterion: after D merges,
+#   uv run pytest tests/unit/test_node_cmd.py tests/unit/test_node_recall.py -rs
+# shows no skip reason containing "D-MERGE", and
+#   git grep -n D-MERGE -- src tests
+# comes back empty.
+
 # How long `node sync -d` waits for the detached child to record its pid.
 _START_POLLS = 20
 _START_POLL_S = 0.1
