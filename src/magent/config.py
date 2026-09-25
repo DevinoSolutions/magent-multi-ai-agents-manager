@@ -597,6 +597,43 @@ def _check_node_pool(settings_raw: dict[str, object]) -> None:
             raise ConfigError(f"{label} must be at least 1")
 
 
+def _check_push(raw: dict[str, object], label: str) -> None:
+    _require_type(raw, "push", list, label)
+    value = raw.get("push")
+    if isinstance(value, list) and not all(isinstance(item, str) for item in value):
+        raise ConfigError(f"{label} must be an array of strings")
+
+
+def _check_node_projects(
+    projects: list[ProjectConfig], nodes: dict[str, NodeConfig]
+) -> None:
+    """The project half of spec §4: a node project needs a pool, names a node
+    in it (or asks for placement), and is not also an ssh-host project. The
+    cloud backend is built in, so ``"cloud"`` needs no pool at all; its
+    ``push`` is allowed and its transport is the cloud backend's concern."""
+    for i, proj in enumerate(projects):
+        if proj.node is None:
+            continue
+        if proj.host is not None:
+            raise ConfigError(
+                f"projects[{i}]: 'node' and 'host' are exclusive -- a node "
+                "project runs on a pool machine, a host project on an ssh host"
+            )
+        if proj.node == NODE_CLOUD:
+            continue
+        if not nodes:
+            raise ConfigError(
+                f"projects[{i}].node is {proj.node!r} but settings.nodes is "
+                "empty; add the machine under settings.nodes"
+            )
+        if proj.node != NODE_AUTO and proj.node not in nodes:
+            known = ", ".join(sorted(nodes))
+            raise ConfigError(
+                f"projects[{i}].node is {proj.node!r}, which is not a configured "
+                f'node; known nodes: {known} (or "auto", "cloud")'
+            )
+
+
 def load_config(path: str) -> MagentConfig:
     config_path = Path(path)
     if not config_path.exists():
@@ -640,14 +677,18 @@ def load_config(path: str) -> MagentConfig:
                         _ALLOWED_WINDOW_KEYS,
                         f"projects[{i}].windows[{j}]",
                     )
+        _require_type(p_obj, "node", str, f"projects[{i}].node")
+        _check_push(p_obj, f"projects[{i}].push")
         projects.append(_parse_project(p_obj))
     _backfill_colors(projects)
+    settings = _parse_settings(settings_raw)
+    _check_node_projects(projects, settings.nodes)
 
     return MagentConfig(
         projects=projects,
         base_dir=_str_or_none(raw, "baseDir"),
         layout=layout,
-        settings=_parse_settings(settings_raw),
+        settings=settings,
         version=version,
     )
 

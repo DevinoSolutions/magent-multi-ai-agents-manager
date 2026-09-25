@@ -302,3 +302,104 @@ class TestThePoolIsValidated:
             ConfigError, match=r"settings\.nodeSync\.pullIntervalS must be at least 1"
         ):
             load_config(_cfg(tmp_config, node_sync={"pullIntervalS": value}))
+
+
+_TWO = {"second": {"host": "devino-second"}, "third": {"host": "devino-third"}}
+
+
+class TestNodeProjectsAreValidated:
+    def test_node_and_host_together_are_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError, match=r"projects\[0\]: 'node' and 'host' are exclusive"
+        ):
+            load_config(
+                _cfg(
+                    tmp_config,
+                    nodes=_TWO,
+                    projects=[{"path": "api", "node": "second", "host": "box"}],
+                )
+            )
+
+    def test_an_unknown_nick_is_refused_naming_the_pool(self, tmp_config):
+        with pytest.raises(ConfigError, match="known nodes: second, third"):
+            load_config(
+                _cfg(
+                    tmp_config, nodes=_TWO, projects=[{"path": "api", "node": "fourth"}]
+                )
+            )
+
+    def test_auto_is_accepted_with_a_pool(self, tmp_config):
+        cfg = load_config(
+            _cfg(tmp_config, nodes=_TWO, projects=[{"path": "api", "node": "auto"}])
+        )
+        assert cfg.projects[0].node == "auto"
+
+    def test_a_node_project_with_an_empty_pool_is_refused(self, tmp_config):
+        with pytest.raises(ConfigError, match=r"settings\.nodes is empty"):
+            load_config(_cfg(tmp_config, projects=[{"path": "api", "node": "second"}]))
+
+    def test_auto_with_an_empty_pool_is_refused_too(self, tmp_config):
+        with pytest.raises(ConfigError, match=r"settings\.nodes is empty"):
+            load_config(_cfg(tmp_config, projects=[{"path": "api", "node": "auto"}]))
+
+    def test_a_non_string_node_is_refused(self, tmp_config):
+        with pytest.raises(ConfigError, match=r"projects\[0\]\.node must be a string"):
+            load_config(
+                _cfg(tmp_config, nodes=_TWO, projects=[{"path": "api", "node": 2}])
+            )
+
+    def test_push_that_is_not_an_array_is_refused(self, tmp_config):
+        with pytest.raises(ConfigError, match=r"projects\[0\]\.push must be an array"):
+            load_config(
+                _cfg(tmp_config, nodes=_TWO, projects=[{"path": "api", "push": ".env"}])
+            )
+
+    def test_push_with_a_non_string_entry_is_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError, match=r"projects\[0\]\.push must be an array of strings"
+        ):
+            load_config(
+                _cfg(
+                    tmp_config, nodes=_TWO, projects=[{"path": "api", "push": ["a", 3]}]
+                )
+            )
+
+    def test_cloud_needs_no_pool_at_all(self, tmp_config):
+        cfg = load_config(_cfg(tmp_config, projects=[{"path": "api", "node": "cloud"}]))
+        assert cfg.projects[0].node == "cloud"
+
+    def test_cloud_needs_no_pool_entry_beside_a_pool(self, tmp_config):
+        cfg = load_config(
+            _cfg(tmp_config, nodes=_TWO, projects=[{"path": "api", "node": "cloud"}])
+        )
+        assert cfg.projects[0].node == "cloud"
+
+    def test_push_is_allowed_on_a_cloud_project(self, tmp_config):
+        cfg = load_config(
+            _cfg(
+                tmp_config,
+                projects=[{"path": "api", "node": "cloud", "push": ["gcp-sa.json"]}],
+            )
+        )
+        assert cfg.projects[0].push == ["gcp-sa.json"]
+
+    def test_cloud_and_host_together_are_still_refused(self, tmp_config):
+        with pytest.raises(ConfigError, match="'node' and 'host' are exclusive"):
+            load_config(
+                _cfg(
+                    tmp_config,
+                    projects=[{"path": "api", "node": "cloud", "host": "box"}],
+                )
+            )
+
+    def test_the_unknown_nick_error_names_both_reserved_nicks(self, tmp_config):
+        with pytest.raises(ConfigError, match=r'\(or "auto", "cloud"\)'):
+            load_config(
+                _cfg(
+                    tmp_config, nodes=_TWO, projects=[{"path": "api", "node": "fourth"}]
+                )
+            )
+
+    def test_a_pool_nobody_uses_is_fine(self, tmp_config):
+        cfg = load_config(_cfg(tmp_config, nodes=_TWO, projects=[{"path": "api"}]))
+        assert cfg.projects[0].node is None
