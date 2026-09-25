@@ -218,31 +218,52 @@ def node_lock(
         yield
 
 
-class ConfigWatch:
-    """The config file, reloaded only when its mtime changes, keeping the last
-    good one through a broken edit. A long-running reader (the daemon, serve's
-    supervisor) must pick up a new pool without printing the config's load
-    warnings on every tick."""
+def config_stamp(path: Path) -> tuple[int, int] | None:
+    """``(st_mtime_ns, st_size)`` of ``path``, or None when it cannot be read.
+    The size catches a rewrite that lands inside one mtime tick."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
 
-    def __init__(self, path: Path, config: MagentConfig | None = None) -> None:
+
+class ConfigWatch:
+    """The config file, reloaded only when its stamp (``config_stamp``: mtime
+    and size) changes, keeping the last good one through a broken edit. A
+    long-running reader (the daemon, serve's supervisor) must pick up a new
+    pool without printing the config's load warnings on every tick.
+
+    A file that fails to load is tried ONCE per stamp: the last good config
+    stays in force and the broken file is not retried until it changes again.
+
+    A caller that already loaded the config passes it as ``config`` together
+    with the ``stamp`` it read BEFORE that load, so an edit made between the
+    load and this constructor is still picked up. Without ``stamp`` the file
+    is stamped here, which misses such an edit. Without ``config`` the watch
+    stats and loads the file itself on the first ``current()``."""
+
+    def __init__(
+        self,
+        path: Path,
+        config: MagentConfig | None = None,
+        *,
+        stamp: tuple[int, int] | None = None,
+    ) -> None:
         self._path = path
         self._config = config
-        self._mtime = self._stat() if config is not None else None
-
-    def _stat(self) -> float | None:
-        try:
-            return self._path.stat().st_mtime
-        except OSError:
-            return None
+        self._stamp: tuple[int, int] | None = None
+        if config is not None:
+            self._stamp = stamp if stamp is not None else config_stamp(path)
 
     def current(self) -> MagentConfig | None:
-        mtime = self._stat()
-        if mtime is None:
+        stamp = config_stamp(self._path)
+        if stamp is None:
             get_logger(LOG_NAME).debug("node sync: no config at %s", self._path)
             return self._config
-        if mtime == self._mtime:
+        if stamp == self._stamp:
             return self._config
-        self._mtime = mtime
+        self._stamp = stamp
         try:
             self._config = load_config(str(self._path))
         except (ValueError, OSError) as e:

@@ -8,6 +8,7 @@ is 0 for every test that does not set it back.
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import os
 import re
@@ -216,6 +217,10 @@ class TestTheNodeLock:
             pass
 
 
+# An edit that is visibly different from tmp_config's empty project list.
+_ONE_PROJECT = json.dumps({"version": SCHEMA_VERSION, "projects": [{"path": "api"}]})
+
+
 class TestConfigWatch:
     def test_the_config_is_reloaded_only_when_the_file_changes(
         self, tmp_config, monkeypatch
@@ -250,6 +255,32 @@ class TestConfigWatch:
 
     def test_a_missing_file_with_nothing_loaded_is_none(self, tmp_path):
         assert node_sync.ConfigWatch(tmp_path / "nope.json").current() is None
+
+    def test_an_edit_between_the_callers_load_and_the_watch_is_seen(self, tmp_config):
+        """The caller stamps the file BEFORE it loads; a watch that stamped at
+        construction would take an edit made in between for the loaded one."""
+        path = Path(tmp_config({"version": SCHEMA_VERSION, "projects": []}))
+        stamp = node_sync.config_stamp(path)
+        loaded = node_sync.load_config(str(path))
+        path.write_text(_ONE_PROJECT, encoding="utf-8")
+        watch = node_sync.ConfigWatch(path, loaded, stamp=stamp)
+        fresh = watch.current()
+        assert fresh is not loaded
+        assert fresh is not None
+        assert [p.path for p in fresh.projects] == ["api"]
+
+    def test_a_rewrite_with_the_same_mtime_but_a_new_size_is_seen(self, tmp_config):
+        path = Path(tmp_config({"version": SCHEMA_VERSION, "projects": []}))
+        watch = node_sync.ConfigWatch(path)
+        first = watch.current()
+        before = path.stat()
+        path.write_text(_ONE_PROJECT, encoding="utf-8")
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        assert path.stat().st_mtime_ns == before.st_mtime_ns
+        fresh = watch.current()
+        assert fresh is not first
+        assert fresh is not None
+        assert [p.path for p in fresh.projects] == ["api"]
 
 
 class TestTheDaemonsPidFile:
