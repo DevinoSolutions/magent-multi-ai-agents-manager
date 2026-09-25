@@ -6,6 +6,7 @@ bash on POSIX; the pool is Linux)."""
 from __future__ import annotations
 
 import json
+import shlex
 
 from magent import cli, remote_mux
 from magent.cli import hooks_cmd
@@ -17,7 +18,10 @@ class TestTheNodeStateHookIsWiredLikeThisPcs:
 
     def test_each_entry_has_the_shape_hooks_install_writes(self, runner, tmp_path):
         settings = tmp_path / "settings.json"
-        runner.invoke(cli.main, ["hooks", "install", "--settings-file", str(settings)])
+        result = runner.invoke(
+            cli.main, ["hooks", "install", "--settings-file", str(settings)]
+        )
+        assert result.exit_code == 0, result.output
         written = json.loads(settings.read_text(encoding="utf-8"))["hooks"]
         command = hooks_cmd._hook_command()
         assert {
@@ -27,3 +31,9 @@ class TestTheNodeStateHookIsWiredLikeThisPcs:
     def test_the_node_command_runs_the_installed_script_from_home(self):
         (hook,) = remote_mux.state_hook_entries()["Stop"]["hooks"]
         assert hook["command"] == '"$HOME/.magent/bin/state-hook.sh" --source claude'
+
+    def test_the_node_command_takes_the_same_arguments(self):
+        assert (
+            shlex.split(remote_mux.NODE_STATE_HOOK_COMMAND)[1:]
+            == shlex.split(hooks_cmd._hook_command())[1:]
+        )

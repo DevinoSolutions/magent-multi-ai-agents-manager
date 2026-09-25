@@ -78,7 +78,8 @@ HOOK_EVENTS = (
     "SessionEnd",
 )
 # The node-side hook command. provision.sh installs node_scripts/state_hook.sh
-# at this path; Claude Code runs hook commands through bash, so $HOME expands.
+# at this path; Claude Code runs hook commands through a POSIX shell, so $HOME
+# expands.
 NODE_STATE_HOOK_COMMAND = '"$HOME/.magent/bin/state-hook.sh" --source claude'
 
 
