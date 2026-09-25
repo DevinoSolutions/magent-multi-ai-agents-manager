@@ -758,24 +758,23 @@ def final_pull(
     holds the node, then raises LockHeld; NodeConfigError and RemoteError
     also go to the caller, which decides what "could not pull" means.
 
-    An entry the daemon's tick would skip (a sid this PC cannot store, no
-    remote root) is refused as RemoteError(0) before any ssh, so the caller
-    never sees parse_pull's ValueError."""
+    An entry the daemon's tick would skip (a sid this PC cannot store, an
+    empty remote root) is refused as RemoteError(0) before any ssh, so the
+    caller never sees parse_pull's ValueError."""
     entry = nodes.read_node_map().get(name)
     if entry is None:
         return None
-    if not remote_mux.pullable_sid(entry.sid):
-        raise remote_mux.RemoteError(
-            0, f"not a pullable session name: {entry.sid!r}", ("pull.sh",)
-        )
-    if not entry.remote_root:
-        raise remote_mux.RemoteError(
-            0,
-            f"session {entry.sid!r} cannot be mirrored on this PC: it has no remote root",
-            ("pull.sh",),
-        )
     user = local_user if local_user is not None else local_username()
     node = nodes.node_for_nick(config, entry.nick, local_user=user)
+    refusal = None
+    if not remote_mux.pullable_sid(entry.sid):
+        refusal = f"not a pullable session name: {entry.sid!r}"
+    elif not entry.remote_root:
+        refusal = f"session {entry.sid!r} has an empty remote_root in the node map"
+    if refusal is not None:
+        raise remote_mux.refused_pull(
+            node, {entry.sid: _spec_for(entry, None)}, refusal
+        )
     with node_lock(entry.nick, wait_s=wait_s):
         marks = _read_marks(entry.nick)
         mark, files, again = _pull_sid(node, entry, marks.get(entry.sid))

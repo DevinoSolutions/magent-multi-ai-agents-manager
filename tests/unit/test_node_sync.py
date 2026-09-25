@@ -1488,17 +1488,20 @@ class TestTheFinalPull:
             node_sync.final_pull(_config(), "api")
         assert info.value.rc == 255
 
-    def test_a_session_name_this_pc_cannot_store_is_refused_before_any_ssh(
-        self, placed, fake_ssh
+    @pytest.mark.parametrize("sid", ["a\nb", "../x", "", "CON"])
+    def test_a_session_name_this_pc_cannot_pull_is_refused_before_any_ssh(
+        self, placed, fake_ssh, sid
     ):
-        nodes.write_node_map({"api": _entry("second", "CON")})
+        nodes.write_node_map({"api": _entry("second", sid)})
         with pytest.raises(remote_mux.RemoteError) as info:
             node_sync.final_pull(_config(), "api")
         assert info.value.rc == 0
-        assert info.value.stderr_tail == "not a pullable session name: 'CON'"
+        assert info.value.stderr_tail == f"not a pullable session name: {sid!r}"
+        assert info.value.command_redacted[0] == "ssh"
+        assert "amin@devino-second" in info.value.command_redacted
         assert fake_ssh.calls() == []
 
-    def test_a_session_without_a_remote_root_is_refused_before_any_ssh(
+    def test_a_session_with_an_empty_remote_root_is_refused_before_any_ssh(
         self, placed, fake_ssh
     ):
         entry = _entry("second", "api")
@@ -1517,6 +1520,15 @@ class TestTheFinalPull:
             node_sync.final_pull(_config(), "api")
         assert info.value.rc == 0
         assert info.value.stderr_tail == (
-            "session 'api' cannot be mirrored on this PC: it has no remote root"
+            "session 'api' has an empty remote_root in the node map"
         )
+        assert info.value.command_redacted[0] == "ssh"
         assert fake_ssh.calls() == []
+
+    def test_a_good_session_name_still_pulls(self, placed, fake_ssh):
+        nodes.write_node_map({"api": _entry("second", "api-2")})
+        _answer(fake_ssh, "devino-second")
+        result = node_sync.final_pull(_config(), "api")
+        assert result is not None
+        (call,) = _calls_to(fake_ssh, "devino-second")
+        assert set(_payload(call)["sids"]) == {"api-2"}
