@@ -18,7 +18,7 @@ import pytest
 
 from magent import node_scripts, remote_mux
 from magent.node_scripts import node_apply
-from magent.nodes import UserScope
+from magent.nodes import SkillFile, UserScope
 from tests.unit._fake_ssh import FakeSsh, make_fake_ssh
 
 if TYPE_CHECKING:
@@ -751,3 +751,294 @@ class TestTheMcpOAuthIsTrackedPerEntry:
         box.apply(work)
         assert _node_token(box, A) == "PC-A"
         assert set(json.loads(_stored(box))) == {A, B}
+
+
+SKILL = SkillFile(path="deploy/SKILL.md", data=b"# deploy\n", executable=False)
+RUNNER = SkillFile(
+    path="deploy/run.sh", data=b"#!/usr/bin/env bash\necho hi\n", executable=True
+)
+PLUGGED = replace(EMPTY, plugins=("p@mkt",), marketplaces={"mkt": "owner/mkt"})
+# A git marketplace source can carry a credential in its userinfo.
+SECRET_URL = "https://amin:ghp_DECOY0123@git.example.com/mkt.git"
+
+
+def _skills(box: Box) -> Path:
+    return box.home / ".claude" / "skills"
+
+
+class TestTheSkills:
+    def test_skills_land_in_the_nodes_skills_dir_with_their_exec_bit(
+        self, box, tmp_path
+    ):
+        box.apply(_work(tmp_path, replace(EMPTY, skills=(SKILL, RUNNER))))
+        assert (_skills(box) / "deploy" / "SKILL.md").read_bytes() == SKILL.data
+        assert (_skills(box) / "deploy" / "run.sh").read_bytes() == RUNNER.data
+        if POSIX:
+            assert (_skills(box) / "deploy" / "run.sh").stat().st_mode & 0o777 == 0o700
+            assert (
+                _skills(box) / "deploy" / "SKILL.md"
+            ).stat().st_mode & 0o777 == 0o600
+
+    def test_no_skills_on_this_pc_is_a_skip(self, box, tmp_path, capsys):
+        box.apply(_work(tmp_path))
+        assert _status(_lines(capsys), "skills") == "skip"
+        assert not _skills(box).exists()
+
+    def test_unchanged_skills_are_skipped(self, box, tmp_path, capsys):
+        work = _work(tmp_path, replace(EMPTY, skills=(SKILL,)))
+        box.apply(work)
+        capsys.readouterr()
+        box.apply(work)
+        assert _status(_lines(capsys), "skills") == "skip"
+
+    def test_a_deleted_skill_file_is_put_back(self, box, tmp_path, capsys):
+        work = _work(tmp_path, replace(EMPTY, skills=(SKILL,)))
+        box.apply(work)
+        (_skills(box) / "deploy" / "SKILL.md").unlink()
+        capsys.readouterr()
+        box.apply(work)
+        assert _status(_lines(capsys), "skills") == "did"
+        assert (_skills(box) / "deploy" / "SKILL.md").read_bytes() == SKILL.data
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX file modes and symlinks")
+    def test_a_skill_file_is_installed_never_written_through(self, box, tmp_path):
+        # Every write goes through _install: a fresh temp file, its mode set
+        # explicitly, renamed over the target. A symlink where a skill lands
+        # is replaced, never followed, and an old 0644 file ends 0700/0600.
+        outside = tmp_path / "outside.md"
+        outside.write_bytes(b"not yours\n")
+        deploy = _skills(box) / "deploy"
+        deploy.mkdir(parents=True)
+        (deploy / "SKILL.md").symlink_to(outside)
+        (deploy / "run.sh").write_bytes(b"old\n")
+        (deploy / "run.sh").chmod(0o644)
+        box.apply(_work(tmp_path, replace(EMPTY, skills=(SKILL, RUNNER))))
+        assert outside.read_bytes() == b"not yours\n"
+        assert not (deploy / "SKILL.md").is_symlink()
+        assert (deploy / "SKILL.md").read_bytes() == SKILL.data
+        assert (deploy / "SKILL.md").stat().st_mode & 0o777 == 0o600
+        assert (deploy / "run.sh").stat().st_mode & 0o777 == 0o700
+
+
+def _claude(
+    box: Box, *, installed: tuple[str, ...] = (), markets: tuple[str, ...] = ("mkt",)
+) -> FakeSsh:
+    """A fake claude that answers the two --json listings (fact 1's shapes);
+    every other call -- install, marketplace add -- exits 0."""
+    claude = box.add("claude")
+    claude.set_reply(
+        "plugin list",
+        stdout=json.dumps(
+            [{"id": pid, "enabled": True, "scope": "user"} for pid in installed]
+        ),
+    )
+    claude.set_reply(
+        "marketplace list",
+        stdout=json.dumps([{"name": name, "source": "github"} for name in markets]),
+    )
+    return claude
+
+
+def _installs(claude: FakeSsh) -> list[list[str]]:
+    return [c.argv for c in claude.calls() if c.argv[:2] == ["plugin", "install"]]
+
+
+class TestThePlugins:
+    def test_a_missing_plugin_is_installed_at_user_scope_and_never_with_yes(
+        self, box, tmp_path, capsys
+    ):
+        claude = _claude(box)
+        assert box.apply(_work(tmp_path, PLUGGED)) == 0
+        assert _installs(claude) == [["plugin", "install", "p@mkt", "--scope", "user"]]
+        assert not any(
+            flag in c.argv for c in claude.calls() for flag in ("-y", "--yes")
+        )
+        assert _status(_lines(capsys), "plugin:p@mkt") == "did"
+
+    def test_an_installed_plugin_is_skipped(self, box, tmp_path, capsys):
+        claude = _claude(box, installed=("p@mkt",))
+        box.apply(_work(tmp_path, PLUGGED))
+        assert _status(_lines(capsys), "plugin:p@mkt") == "skip"
+        assert _installs(claude) == []
+
+    def test_an_unknown_marketplace_is_added_before_the_install(
+        self, box, tmp_path, capsys
+    ):
+        claude = _claude(box, markets=())
+        box.apply(_work(tmp_path, PLUGGED))
+        argvs = [c.argv for c in claude.calls()]
+        add = argvs.index(["plugin", "marketplace", "add", "owner/mkt"])
+        install = argvs.index(["plugin", "install", "p@mkt", "--scope", "user"])
+        assert add < install
+        assert _status(_lines(capsys), "marketplace:mkt") == "did"
+
+    def test_a_marketplace_with_no_source_is_a_warning_and_nothing_installs(
+        self, box, tmp_path, capsys
+    ):
+        claude = _claude(box, markets=())
+        assert box.apply(_work(tmp_path, replace(PLUGGED, marketplaces={}))) == 0
+        assert _status(_lines(capsys), "plugin:p@mkt") == "warn"
+        assert _installs(claude) == []
+
+    def test_an_added_marketplace_prints_its_url_without_the_userinfo(
+        self, box, tmp_path, capsys
+    ):
+        claude = _claude(box, markets=())
+        box.apply(_work(tmp_path, replace(PLUGGED, marketplaces={"mkt": SECRET_URL})))
+        # The node gets the whole URL: marketplace add needs it.
+        assert ["plugin", "marketplace", "add", SECRET_URL] in [
+            c.argv for c in claude.calls()
+        ]
+        (line,) = [line for line in _lines(capsys) if line.item == "marketplace:mkt"]
+        assert line.status == "did"
+        assert line.detail == "https://***@git.example.com/mkt.git"
+
+    def test_a_failed_marketplace_add_prints_no_userinfo_even_from_stderr(
+        self, box, tmp_path, capsys
+    ):
+        claude = _claude(box, markets=())
+        claude.set_reply("marketplace add", stderr=f"cannot clone {SECRET_URL}\n", rc=1)
+        box.apply(_work(tmp_path, replace(PLUGGED, marketplaces={"mkt": SECRET_URL})))
+        out = capsys.readouterr()
+        assert "ghp_DECOY0123" not in out.out + out.err
+        (line,) = [
+            line
+            for line in remote_mux.parse_report(out.out).lines
+            if line.item == "marketplace:mkt"
+        ]
+        assert line.status == "warn"
+        assert "cannot clone https://***@git.example.com/mkt.git" in line.detail
+        assert _installs(claude) == []
+
+    def test_a_refused_install_names_the_repair_and_is_tried_again(
+        self, box, tmp_path, capsys
+    ):
+        claude = _claude(box)
+        claude.set_reply("plugin install", stderr="plugin not found\n", rc=1)
+        work = _work(tmp_path, PLUGGED)
+        assert box.apply(work) == 0
+        (line,) = [line for line in _lines(capsys) if line.item == "plugin:p@mkt"]
+        assert line.status == "warn"
+        assert "claude plugin install p@mkt" in line.detail
+        box.apply(work)
+        assert len(_installs(claude)) == 2
+
+    def test_no_claude_on_the_node_fails_and_names_the_repair(
+        self, box, tmp_path, capsys
+    ):
+        assert box.apply(_work(tmp_path, PLUGGED)) == 1
+        (line,) = [line for line in _lines(capsys) if line.item == "plugins"]
+        assert line.status == "fail"
+        assert "magent node setup" in line.detail
+
+    def test_unchanged_plugins_are_skipped_without_asking_claude(
+        self, box, tmp_path, capsys
+    ):
+        claude = _claude(box)
+        work = _work(tmp_path, PLUGGED)
+        box.apply(work)
+        asked = len(claude.calls())
+        capsys.readouterr()
+        box.apply(work)
+        assert _status(_lines(capsys), "plugins") == "skip"
+        assert len(claude.calls()) == asked
+
+    @pytest.mark.parametrize(
+        ("stdout", "rc"), [("", 1), ("not json", 0), ('{"id": "p@mkt"}', 0)]
+    )
+    def test_a_listing_claude_cannot_answer_fails_and_installs_nothing(
+        self, box, tmp_path, capsys, stdout, rc
+    ):
+        # Without the listing, every plugin would look missing and be
+        # reinstalled; the step stops and says where to look instead.
+        claude = box.add("claude")
+        claude.set_reply("plugin list", stdout=stdout, rc=rc)
+        claude.set_reply("marketplace list", stdout='[{"name": "mkt"}]')
+        assert box.apply(_work(tmp_path, PLUGGED)) == 1
+        (line,) = [line for line in _lines(capsys) if line.item == "plugins"]
+        assert line.status == "fail"
+        assert "claude plugin list --json" in line.detail
+        assert _installs(claude) == []
+
+    def test_no_plugins_on_this_pc_is_a_skip_even_without_claude(
+        self, box, tmp_path, capsys
+    ):
+        assert box.apply(_work(tmp_path)) == 0
+        assert _status(_lines(capsys), "plugins") == "skip"
+
+    def test_a_synced_plugin_is_never_installed_but_its_entry_still_ships(
+        self, box, tmp_path, capsys
+    ):
+        # DECISION-18: a `@synced` plugin lives on claude.ai and no
+        # marketplace serves it. The guard reads the manifest's plugin list,
+        # not the settings, so it holds even if the user flips J's `false`.
+        # There is no claude on this node: a run that tried to install
+        # would fail on "magent node setup".
+        synced = "magent-cloud@synced"
+        scope = replace(
+            EMPTY, settings={"enabledPlugins": {synced: False}}, plugins=(synced,)
+        )
+        assert box.apply(_work(tmp_path, scope)) == 0
+        lines = _lines(capsys)
+        assert _status(lines, "plugin:" + synced) == "skip"
+        assert _status(lines, "plugins") == "skip"
+        shipped = json.loads(_settings(box).read_text(encoding="utf-8"))
+        assert shipped["enabledPlugins"] == {synced: False}
+
+
+def _everything() -> UserScope:
+    return UserScope(
+        settings={"model": "opus"},
+        mcp_servers={"docs": DOCS},
+        mcp_oauth=_oauth(),
+        plugins=("p@mkt",),
+        marketplaces={"mkt": "owner/mkt"},
+        skills=(SKILL, RUNNER),
+    )
+
+
+def _stocked(box: Box) -> None:
+    """A node with gh (logged in as amin once asked) and claude on its PATH."""
+    box.add("gh").set_reply("api user", stdout="amin\n")
+    _claude(box)
+
+
+STEP_ITEMS = {"gh", "state_hook", "settings", "mcp", "mcp_oauth", "plugins", "skills"}
+
+
+class TestAppliedTwice:
+    def test_a_second_run_prints_only_skip_rows(self, box, tmp_path, capsys):
+        _stocked(box)
+        work = _work(tmp_path, _everything(), login="amin")
+        assert box.apply(work, token=TOKEN) == 0
+        capsys.readouterr()
+        assert box.apply(work, token=TOKEN) == 0
+        lines = _lines(capsys)
+        assert {line.status for line in lines} == {"skip"}
+        assert {line.item for line in lines} == STEP_ITEMS
+
+    def test_force_redoes_every_step_but_mcp_oauth(self, box, tmp_path, capsys):
+        # F10 decision 2: a node-refreshed token is never overwritten by force.
+        _stocked(box)
+        work = _work(tmp_path, _everything(), login="amin")
+        box.apply(work, token=TOKEN)
+        capsys.readouterr()
+        assert box.apply(work, token=TOKEN, force=True) == 0
+        lines = _lines(capsys)
+        assert {line.item for line in lines if line.status == "skip"} == {"mcp_oauth"}
+        assert {"plugin:p@mkt", "skills", "mcp_oauth"} <= {line.item for line in lines}
+
+    def test_an_empty_pc_needs_no_tool_on_the_node(self, box, tmp_path, capsys):
+        # R-F1: no gh login to share and no claude on the node; only the
+        # state hook (and the settings that wire it) land, and the run is a
+        # success.
+        assert box.apply(_work(tmp_path)) == 0
+        assert {line.item: line.status for line in _lines(capsys)} == {
+            "gh": "warn",
+            "state_hook": "did",
+            "settings": "did",
+            "mcp": "skip",
+            "mcp_oauth": "skip",
+            "plugins": "skip",
+            "skills": "skip",
+        }

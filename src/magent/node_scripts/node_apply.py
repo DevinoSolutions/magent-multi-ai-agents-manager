@@ -33,6 +33,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -491,6 +492,176 @@ def _step_mcp_oauth(ctx: Ctx) -> None:
     _remember(ctx, "mcp_oauth", want, mark)
 
 
+def _step_skills(ctx: Ctx) -> None:
+    """This PC's ~/.claude/skills files onto the node's, exec bit kept. One
+    way, like settings: a skill removed on the PC stays here. Each file goes
+    through ``_install``, so a symlink where a skill lands is replaced, never
+    written through."""
+    root = ctx.work / "skills"
+    files = sorted(p for p in root.rglob("*") if p.is_file()) if root.is_dir() else []
+    if not files:
+        _row(ctx, "skip", "skills", "this PC has no skills to share")
+        return
+    dest_root = ctx.home / ".claude" / "skills"
+    targets = [(src, dest_root / src.relative_to(root)) for src in files]
+    want = _digest(ctx, "skills")
+    if _unchanged(ctx, "skills", want) and all(dest.is_file() for _, dest in targets):
+        _row(ctx, "skip", "skills", f"{len(files)} file(s) unchanged")
+        return
+    mark = len(ctx.rows)
+    for src, dest in targets:
+        mode = 0o700 if src.stat().st_mode & stat.S_IXUSR else 0o600
+        _install(dest, src.read_bytes(), mode)
+    _row(ctx, "did", "skills", f"{len(files)} file(s) under ~/.claude/skills")
+    _remember(ctx, "skills", want, mark)
+
+
+def _listed(argv: list[str], key: str) -> set[str] | None:
+    """``key`` of every object a ``claude ... --json`` listing prints, or
+    None when the command failed or printed no JSON list."""
+    done = _tool(argv)
+    if done.returncode != 0:
+        return None
+    try:
+        items = json.loads(done.stdout)
+    except ValueError:
+        return None
+    if not isinstance(items, list):
+        return None
+    return {
+        item[key]
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get(key), str)
+    }
+
+
+# The user:password@ of a URL. A git marketplace source may carry a
+# credential there: the node's claude gets the whole URL, a row never does.
+_USERINFO = re.compile(r"(?<=//)[^/@\s]+@")
+
+
+def _unauth(text: str) -> str:
+    return _USERINFO.sub("***@", text)
+
+
+def _plugin(
+    ctx: Ctx,
+    claude: str,
+    pid: str,
+    installed: set[str],
+    markets: set[str],
+    sources: dict[str, object],
+) -> None:
+    """One plugin: skip it, or add its marketplace and install it. Every
+    refusal is a warn naming what to run on the node."""
+    item = "plugin:" + pid
+    if pid in installed:
+        _row(ctx, "skip", item, "installed")
+        return
+    market = pid.rsplit("@", 1)[1]
+    if market not in markets:
+        source = sources.get(market)
+        if not isinstance(source, str):
+            _row(
+                ctx,
+                "warn",
+                item,
+                f"marketplace {market} has no remote source on this PC; add it on "
+                f"the node, then run: claude plugin install {pid}",
+            )
+            return
+        added = _tool([claude, "plugin", "marketplace", "add", source])
+        if added.returncode != 0:
+            _row(
+                ctx,
+                "warn",
+                "marketplace:" + market,
+                _unauth(
+                    f"claude plugin marketplace add {source} failed: "
+                    f"{_last(added.stderr)}"
+                ),
+            )
+            return
+        markets.add(market)
+        _row(ctx, "did", "marketplace:" + market, _unauth(source))
+    done = _tool([claude, "plugin", "install", pid, "--scope", "user"])
+    if done.returncode != 0:
+        _row(
+            ctx,
+            "warn",
+            item,
+            _unauth(
+                f"install refused ({_last(done.stderr)}); run on the node: "
+                f"claude plugin install {pid}"
+            ),
+        )
+    else:
+        _row(ctx, "did", item, "installed at user scope")
+
+
+# A plugin uploaded to claude.ai carries this marketplace name. No
+# marketplace serves it, so there is nothing to install; its enabledPlugins
+# entry still travels with settings.json (DECISION-18).
+SYNCED_MARKETPLACE = "synced"
+
+
+def _step_plugins(ctx: Ctx) -> None:
+    """Install this PC's enabled plugins the node lacks, at user scope. Never
+    ``-y``: it would auto-accept the commands a marketplace declares."""
+    raw = ctx.manifest.get("plugins")
+    listed = (
+        [p for p in raw if isinstance(p, str) and "@" in p]
+        if isinstance(raw, list)
+        else []
+    )
+    plugins = [p for p in listed if p.rsplit("@", 1)[1] != SYNCED_MARKETPLACE]
+    for pid in listed:
+        if pid not in plugins:
+            _row(
+                ctx,
+                "skip",
+                "plugin:" + pid,
+                "uploaded to claude.ai, not installable from a marketplace",
+            )
+    if not plugins:
+        _row(ctx, "skip", "plugins", "this PC has no marketplace plugins to install")
+        return
+    want = _digest(ctx, "plugins")
+    if _unchanged(ctx, "plugins", want):
+        _row(
+            ctx,
+            "skip",
+            "plugins",
+            f"{len(plugins)} plugin(s) unchanged since the last provision",
+        )
+        return
+    claude = _which(ctx, "claude")
+    if claude is None:
+        _row(
+            ctx,
+            "fail",
+            "plugins",
+            "claude is not installed on this node -- run: magent node setup",
+        )
+        return
+    installed = _listed([claude, "plugin", "list", "--json"], "id")
+    markets = _listed([claude, "plugin", "marketplace", "list", "--json"], "name")
+    if installed is None or markets is None:
+        _row(
+            ctx,
+            "fail",
+            "plugins",
+            "claude plugin list --json did not answer; run it on the node to see why",
+        )
+        return
+    raw_sources = ctx.manifest.get("marketplaces")
+    sources = raw_sources if isinstance(raw_sources, dict) else {}
+    mark = len(ctx.rows)
+    for pid in plugins:
+        _plugin(ctx, claude, pid, installed, markets, sources)
+    _remember(ctx, "plugins", want, mark)
+
+
 # In order: the settings wire hooks to the installed script, and the MCP OAuth
 # entries follow the servers the node ends up with.
 STEPS: tuple[tuple[str, Callable[[Ctx], None]], ...] = (
@@ -499,6 +670,8 @@ STEPS: tuple[tuple[str, Callable[[Ctx], None]], ...] = (
     ("settings", _step_settings),
     ("mcp", _step_mcp),
     ("mcp_oauth", _step_mcp_oauth),
+    ("plugins", _step_plugins),
+    ("skills", _step_skills),
 )
 
 
