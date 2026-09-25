@@ -1084,10 +1084,14 @@ class TestRecipeFor:
         for pushed in recipe.push_files:
             pushed.relative_to(recipe.local_root)
 
-    def test_a_push_that_would_land_outside_the_node_folder_is_refused(self, tmp_path):
-        # A git hit named through a linked repo, inside a directory that
-        # itself links out of the project: no spelling of it is under
-        # local_root, so the recipe refuses rather than ship it elsewhere.
+    @pytest.mark.parametrize("listed_through_a_link", [False, True])
+    def test_a_git_hit_through_a_link_out_of_the_project_is_skipped(
+        self, tmp_path, listed_through_a_link
+    ):
+        # git DESCENDS a junction/directory link (measured: Git for Windows
+        # 2.52 lists `sub/.env` when `sub` is a junction out of the project).
+        # The hit is held to the extras' rule: resolved outside, it is a
+        # warning, never a push -- with the repo named directly or via a link.
         project = tmp_path / "proj"
         project.mkdir()
         outside = tmp_path / "outside"
@@ -1095,18 +1099,77 @@ class TestRecipeFor:
         (outside / ".env").write_text("K=1\n", encoding="utf-8")
         via = tmp_path / "via"
         try:
-            os.symlink(project, via, target_is_directory=True)
             os.symlink(outside, project / "sub", target_is_directory=True)
+            if listed_through_a_link:
+                os.symlink(project, via, target_is_directory=True)
         except OSError:
             pytest.skip("this platform/user cannot create symlinks")
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(project), node="second"),
+            NODE,
+            [_state(via if listed_through_a_link else project, ("sub/.env",))],
+            home=tmp_path / "home",
+            project_dir=project,
+        )
+        assert recipe.push_files == ()
+        assert recipe.warnings == ("push: sub/.env is outside the project; skipped",)
+
+    def test_a_push_that_would_land_outside_the_node_folder_is_refused(self, tmp_path):
+        # _push drops every outside target first, so this guard should never
+        # fire through recipe_for -- but it stays a refusal, never a push.
+        project = tmp_path / "proj"
         with pytest.raises(NodeConfigError, match="outside the project"):
-            nodes.recipe_for(
-                ProjectConfig(path=str(project), node="second"),
-                NODE,
-                [_state(via, ("sub/.env",))],
-                home=tmp_path / "home",
-                project_dir=project,
-            )
+            nodes._under_root(tmp_path / "elsewhere" / ".env", project, project)
+
+    @staticmethod
+    def _linked_conf(repo: Path, tmp_path: Path) -> Path:
+        """``repo/conf-link -> repo/conf`` (a directory link INSIDE the repo)
+        holding ``.env``, and the project reached as ``api-link -> repo``."""
+        (repo / "conf").mkdir()
+        (repo / "conf" / ".env").write_text("CONF=1\n", encoding="utf-8")
+        api = tmp_path / "api-link"
+        try:
+            os.symlink(repo / "conf", repo / "conf-link", target_is_directory=True)
+            os.symlink(repo, api, target_is_directory=True)
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        return api
+
+    def test_an_extra_through_an_inner_link_keeps_its_name_via_an_outer_link(
+        self, repo, tmp_path
+    ):
+        # The extra is lexically under the configured (linked) project_dir:
+        # it ships under the name the user wrote, not its target's `conf/.env`.
+        api = self._linked_conf(repo, tmp_path)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(api), node="second", push=["conf-link/.env"]),
+            NODE,
+            [_state(repo, ())],
+            home=Path.home(),
+            project_dir=api,
+        )
+        assert recipe.warnings == ()
+        assert [p.relative_to(recipe.local_root) for p in recipe.push_files] == [
+            Path("conf-link/.env")
+        ]
+
+    def test_a_git_hit_through_an_inner_link_keeps_its_name_via_an_outer_link(
+        self, repo, tmp_path
+    ):
+        # git lists the hit under the RESOLVED repo, lexically under local_root
+        # but not under the linked project_dir: it keeps git's spelling.
+        api = self._linked_conf(repo, tmp_path)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(api), node="second"),
+            NODE,
+            [_state(repo.resolve(), ("conf-link/.env",))],
+            home=Path.home(),
+            project_dir=api,
+        )
+        assert recipe.warnings == ()
+        assert [p.relative_to(recipe.local_root) for p in recipe.push_files] == [
+            Path("conf-link/.env")
+        ]
 
     def test_a_project_inside_a_larger_repo_is_refused_as_such(self, tmp_path):
         # A monorepo subdirectory: push_set stays safe for it, but a node

@@ -465,18 +465,28 @@ def _is_forbidden(target: PurePath, forbidden: Sequence[tuple[PurePath, bool]]) 
     return False
 
 
-def _shippable_git_hit(path: Path, forbidden: Sequence[tuple[PurePath, bool]]) -> bool:
-    """A path git's listing reported is a snapshot claim: it ships only if it is
-    a regular file now, and -- resolved, symlinks followed -- not a credential
-    store's."""
+def _shippable_git_target(
+    path: Path, forbidden: Sequence[tuple[PurePath, bool]]
+) -> Path | None:
+    """A path git's listing reported is a snapshot claim: its resolved target
+    (symlinks followed) when it is a regular file now and not a credential
+    store's, else None."""
     target = _try_resolve(path)
     # os.path.isfile never raises (a stat error is "not a file" on every
     # Python), which Path.is_file only guarantees from 3.13 on.
-    return (
-        target is not None
-        and os.path.isfile(target)
-        and not _is_forbidden(target, forbidden)
-    )
+    if target is None or not os.path.isfile(target) or _is_forbidden(target, forbidden):
+        return None
+    return target
+
+
+def _listed_name(hit: Path, repo: Path, root: Path) -> str:
+    """How a warning names a git hit: as git listed it, under its repo's place
+    in the project (``api/cfg/.env`` in a workspace), or absolute when the repo
+    is not under the project."""
+    base = _try_resolve(repo)
+    if base is not None and base.is_relative_to(root):
+        return (base.relative_to(root) / hit.relative_to(repo)).as_posix()
+    return str(hit)
 
 
 def _classify_extras(
@@ -555,7 +565,9 @@ def _under_root(path: Path, root: Path, project_dir: Path) -> Path:
     which resolves to ``root``. One already under ``root`` is kept. Otherwise
     (a git hit listed under a repo reached through a link) its directory is
     resolved, as ``_one_per_file`` keys it. A file under none of these would
-    land outside the node folder: a NodeConfigError, never a push."""
+    land outside the node folder: a NodeConfigError, never a push. ``_push``
+    already drops every entry whose target resolves outside ``root``, so this
+    is a guard that should never fire."""
     if path.is_relative_to(project_dir):
         return root / path.relative_to(project_dir)
     if path.is_relative_to(root):
@@ -576,16 +588,26 @@ def _push(
     """``push_set`` and ``push_warnings`` in one pass: each extra resolved once,
     the credential stores resolved once."""
     forbidden = _forbidden_roots(home)
+    root = _resolved(project_dir)
     found: list[Path] = []
+    warnings: list[str] = []
     for state in states:
-        found += [
-            hit
-            for hit in _from_git_listing(state.path, state.ignored)
-            if _shippable_git_hit(hit, forbidden)
-        ]
+        for hit in _from_git_listing(state.path, state.ignored):
+            target = _shippable_git_target(hit, forbidden)
+            if target is None:
+                continue
+            # git DESCENDS a junction/directory link (Git for Windows lists
+            # `cfg/.env` when `cfg` is a junction out of the project), so a
+            # hit is held to the same rule as an extra: resolved, inside.
+            if not target.is_relative_to(root):
+                name = _listed_name(hit, state.path, root)
+                warnings.append(f"push: {name} is outside the project; skipped")
+                continue
+            found.append(hit)
     if not _inside_a_repo(project_dir, states):
         found += _workspace_root_files(project_dir)
-    shipped, warnings = _classify_extras(project_dir, extras, forbidden)
+    shipped, extra_warnings = _classify_extras(project_dir, extras, forbidden)
+    warnings += extra_warnings
     return _one_per_file([*found, *shipped], project_dir), tuple(warnings)
 
 
@@ -604,7 +626,9 @@ def push_set(
     ``push``). Tracked files never ship, ignored directories are never
     descended, nothing under ``home``'s credential stores ever ships, and an
     extra must resolve (symlinks followed) inside ``project_dir``. A git hit
-    ships only while it is a regular file. The workspace-root listing runs only
+    ships only while it is a regular file, and -- like an extra -- only when it
+    resolves inside ``project_dir`` (git descends a junction or directory link
+    that leads out of the project). The workspace-root listing runs only
     when ``project_dir`` -- resolved -- is inside none of ``states``' repos
     (``_inside_a_repo``). Sorted, one entry per file (``_one_per_file``),
     absolute."""
