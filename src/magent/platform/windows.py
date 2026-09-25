@@ -559,6 +559,9 @@ class WindowsPlatform(Platform):
     def supports_wt_keybindings(self) -> bool:
         return True
 
+    def supports_attach_windows(self) -> bool:
+        return True
+
     def set_window_title(self, handle: object, title: str) -> bool:
         return bool(user32.SetWindowTextW(handle, title))
 

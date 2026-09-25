@@ -108,6 +108,11 @@ class TestWindowsCapabilities:
 
         assert WindowsPlatform().supports_window_nudge() is True
 
+    def test_supports_attach_windows_true(self):
+        from magent.platform.windows import WindowsPlatform
+
+        assert WindowsPlatform().supports_attach_windows() is True
+
 
 @pytest.mark.skipif(
     sys.platform != "win32", reason="WindowsPlatform binds windll at import"
@@ -985,3 +990,17 @@ class TestAttachClientKeepsNestingMarkersButNotALeakedNoColor:
                 monkeypatch.delenv(key, raising=False)
         monkeypatch.setenv("NO_COLOR", "1")
         assert self._env(monkeypatch) is None
+
+
+@pytest.mark.parametrize("platform_cls", _DEFAULT_BACKENDS)
+def test_default_supports_attach_windows_false(platform_cls):
+    # A node project's window is a wt window (attach_client); a POSIX desktop
+    # has no launcher for it yet, so --go must not try.
+    assert platform_cls().supports_attach_windows() is False
+
+
+def test_the_fake_platform_reports_what_it_was_given():
+    from tests.conftest import FakePlatform
+
+    assert FakePlatform().supports_attach_windows() is False
+    assert FakePlatform(supports_attach_windows=True).supports_attach_windows() is True

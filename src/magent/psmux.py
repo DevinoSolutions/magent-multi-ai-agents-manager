@@ -1334,8 +1334,8 @@ def eligible_projects(
     """Projects that map to a persistent psmux session.
 
     A project is eligible when it is enabled, runs a CLI agent (not an IDE),
-    and is local (no ``host``). When ``group`` is given, only projects tagged
-    with that group (case-insensitive) are returned.
+    and is local (no ``host``, no pool ``node``). When ``group`` is given,
+    only projects tagged with that group (case-insensitive) are returned.
 
     The ``cmd`` each entry carries is fresh-start aware: a project directory
     with no stored session for its tool gets the configured command WITHOUT its
@@ -1354,6 +1354,7 @@ def eligible_projects(
     mapping, and the default None, both mean the tool's own default store,
     which is byte-for-byte today's probe for every project.
     """
+    from magent.config import runs_on_node
     from magent.launch import _expand_base_dir, _resolve_path
     from magent.sessions import build_start_command, is_ide_tool
     from magent.titles import get_leaf_name
@@ -1373,6 +1374,11 @@ def eligible_projects(
         if is_ide_tool(tool):
             continue
         if proj.host:
+            continue
+        # A pool-node project runs on that node's tmux, never in a local psmux
+        # session (PR-D). A cloud project is a local pane and stays eligible
+        # (DECISION-15).
+        if runs_on_node(proj):
             continue
         leaf = proj.title or get_leaf_name(proj.path)
         sid = session_name(leaf)
@@ -1730,6 +1736,9 @@ def config_sessions(config_path: str | None) -> list[dict[str, object]]:
             continue
         tool = p.get("tool", default_tool)
         if isinstance(tool, str) and is_ide_tool(tool):
+            continue
+        # Raw dict: same rule as eligible_projects' node skip (DECISION-15).
+        if p.get("node") not in (None, "cloud"):
             continue
         proj_name = p.get("title") or Path(p["path"]).name
         out.append(

@@ -157,6 +157,13 @@ class Platform(ABC):
         ``sendInput`` keybindings magent can install (see ``magent.wt_keys``)."""
         return False
 
+    def supports_attach_windows(self) -> bool:
+        """True if this platform can open a remote attach window
+        (``attach_client.spawn_attach_window`` -- a Windows Terminal window
+        running the reconnecting ssh supervisor). Gates the window a node
+        project's ``--go`` bring-up opens."""
+        return False
+
     def set_window_title(self, handle: object, title: str) -> bool:
         """Rewrite a window's title in place. False = unsupported or failed."""
         return False

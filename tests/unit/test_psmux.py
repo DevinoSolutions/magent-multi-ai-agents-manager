@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import logging
 import os
 import re
@@ -2220,3 +2221,41 @@ class TestEveryOneShotSpawnHidesItsConsole:
             assert psmux._SPAWN_FLAGS == subprocess.CREATE_NO_WINDOW
         else:
             assert psmux._SPAWN_FLAGS == 0
+
+
+class TestANodeProjectIsNotALocalSession:
+    """A project pinned to a pool node runs THERE; every local psmux path
+    (bring-up, status, revive, the upload server's session list) skips it.
+    Cloud projects are not pool projects and stay local (DECISION-15)."""
+
+    def _config(self, tmp_path):
+        for name in ("api", "web", "sky", "auto"):
+            (tmp_path / name).mkdir()
+        return MagentConfig(
+            projects=[
+                ProjectConfig(path=str(tmp_path / "api")),
+                ProjectConfig(path=str(tmp_path / "web"), node="second"),
+                ProjectConfig(path=str(tmp_path / "sky"), node="cloud"),
+                ProjectConfig(path=str(tmp_path / "auto"), node="auto"),
+            ]
+        )
+
+    def test_eligible_projects_skips_pinned_and_auto_node_projects(self, tmp_path):
+        names = [p["name"] for p in psmux.eligible_projects(self._config(tmp_path))]
+        assert names == ["api", "sky"]
+
+    def test_config_sessions_skips_them_too(self, tmp_path):
+        cfg = tmp_path / "magent.config.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "projects": [
+                        {"path": str(tmp_path / "api")},
+                        {"path": str(tmp_path / "web"), "node": "second"},
+                        {"path": str(tmp_path / "sky"), "node": "cloud"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert [s["name"] for s in psmux.config_sessions(str(cfg))] == ["api", "sky"]
