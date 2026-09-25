@@ -967,6 +967,23 @@ class TestTheTarCarriesOnlyTheConversation:
             "memory/MEMORY.md",
         ]
 
+    def test_a_symlinked_source_dir_is_refused_and_never_dials(
+        self, fake_ssh, tmp_path
+    ):
+        real = _pulled(tmp_path)
+        link = tmp_path / "linked-pulled"
+        try:
+            link.symlink_to(real, target_is_directory=True)
+        except OSError:
+            pytest.skip("this account cannot create symlinks")
+
+        with pytest.raises(remote_mux.RemoteError) as caught:
+            remote_mux.install_transcripts(_NODE, "~/magent/api", link, timeout_s=5)
+
+        assert caught.value.rc is None
+        assert "link" in caught.value.stderr_tail
+        assert fake_ssh.calls() == []
+
     def test_an_unreadable_source_is_a_clean_error_and_never_dials(
         self, fake_ssh, tmp_path
     ):
@@ -977,6 +994,66 @@ class TestTheTarCarriesOnlyTheConversation:
 
         assert caught.value.rc is None
         assert fake_ssh.calls() == []
+
+
+def _junction(link: Path, target: Path) -> None:
+    """An NTFS junction at ``link`` naming ``target``: no admin needed, and
+    neither ``is_symlink()`` nor ``os.walk(followlinks=False)`` sees it."""
+    import _winapi  # win32-only module: imported in the win32-only helper
+
+    _winapi.CreateJunction(str(target), str(link))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="junctions are an NTFS thing")
+class TestAJunctionNeverCarriesTheTarOutOfTheTree:
+    """cq-D7 on D7: a junction is not a symlink to Python, and os.walk
+    descends it, so a junction inside the pulled tree (or the tree itself
+    being one) would ship whatever it names -- a .ssh folder, say."""
+
+    @pytest.fixture
+    def secret(self, tmp_path) -> Path:
+        outside = tmp_path / "dot-ssh"
+        outside.mkdir()
+        (outside / "id_rsa").write_text("the private key\n", encoding="utf-8")
+        return outside
+
+    def test_a_junction_inside_the_tree_is_not_descended(
+        self, tmp_path, secret, caplog
+    ):
+        source = _pulled(tmp_path)
+        link = source / "memory" / "notes"
+        _junction(link, secret)
+        try:
+            with caplog.at_level("WARNING", logger="magent.nodes"):
+                payload = remote_mux._tar_dir(source)
+        finally:
+            os.rmdir(link)  # the junction only; the target stays
+
+        with tarfile.open(fileobj=io.BytesIO(payload)) as tar:
+            names = sorted(tar.getnames())
+        assert names == [f"{SESSION_ID}.jsonl", "memory", "memory/MEMORY.md"]
+        assert b"the private key" not in payload
+        assert any("notes" in r.getMessage() for r in caplog.records)
+
+    def test_a_source_that_is_itself_a_junction_is_refused_and_never_dials(
+        self, fake_ssh, tmp_path, secret, caplog
+    ):
+        link = tmp_path / "pulled-junction"
+        _junction(link, secret)
+        try:
+            with (
+                caplog.at_level("WARNING", logger="magent.nodes"),
+                pytest.raises(remote_mux.RemoteError) as caught,
+            ):
+                remote_mux.install_transcripts(_NODE, "~/magent/api", link, timeout_s=5)
+        finally:
+            os.rmdir(link)
+
+        assert caught.value.rc is None
+        assert "link" in caught.value.stderr_tail
+        assert fake_ssh.calls() == []
+        assert any("pulled-junction" in r.getMessage() for r in caplog.records)
+        assert (secret / "id_rsa").exists()
 
 
 class TestASessionRootIsCheckedBeforeItReachesTheNode:

@@ -868,23 +868,78 @@ def _pull_temp(name: str) -> bool:
     return name.startswith(".") and name.endswith(".part")
 
 
+def _same_path(a: str, b: str) -> bool:
+    return os.path.normcase(a) == os.path.normcase(b)
+
+
+def _is_its_own_place(path: str, real_parent: str) -> bool:
+    """Does ``path`` physically sit where its name says -- inside
+    ``real_parent`` (already resolved) -- rather than being a symlink or a
+    Windows junction to somewhere else? A junction (``mklink /J``, no admin
+    needed) is not ``is_symlink()`` and ``os.walk`` descends it, but
+    ``realpath`` resolves it; that is the only test that sees both."""
+    return _same_path(
+        os.path.realpath(path), os.path.join(real_parent, os.path.basename(path))
+    )
+
+
+def _within(path: str, real_root: str) -> bool:
+    """Is ``path``'s real location ``real_root`` (resolved, normcased) or
+    under it? A different drive is never under it."""
+    real = os.path.normcase(os.path.realpath(path))
+    try:
+        return os.path.commonpath([real, real_root]) == real_root
+    except ValueError:
+        return False
+
+
 def _tar_dir(source: Path) -> bytes:
     """An uncompressed tar of ``source``'s CONTENTS (paths relative to it).
     Only regular files and directories travel: a symlink could name anything
-    on this PC, and a ``.<rand>.part`` file is a pull temp (``_pull_temp``). Symlinked
-    directories are not descended. A source that cannot be read raises
-    RemoteError with rc None (nothing ran on a node)."""
+    on this PC, and a ``.<rand>.part`` file is a pull temp (``_pull_temp``).
+    Nothing reached through a link travels either: a source dir that is itself
+    a symlink or junction is refused, a linked directory inside it is not
+    descended (logged), and a file whose real path leaves the source is
+    skipped. A source that cannot be read, or is a link, raises RemoteError
+    with rc None (nothing ran on a node)."""
     buf = io.BytesIO()
+    log = get_logger("nodes")
     try:
+        if not _is_its_own_place(str(source), os.path.realpath(source.parent)):
+            log.warning(
+                "_tar_dir: %s is a link (symlink or junction); not sent", source
+            )
+            raise RemoteError(
+                None,
+                f"the pulled transcripts dir {source} is a link (symlink or "
+                "junction) to somewhere else; nothing was sent",
+                ("tar", str(source)),
+            )
+        root = os.path.normcase(os.path.realpath(source))
         entries = []
         for dirpath, dirnames, filenames in os.walk(source, onerror=_raise):
+            real_base = os.path.realpath(dirpath)
+            inside = []
+            for name in dirnames:
+                if _is_its_own_place(os.path.join(dirpath, name), real_base):
+                    inside.append(name)
+                else:
+                    log.warning(
+                        "_tar_dir: %s is a link (symlink or junction); not descended",
+                        os.path.join(dirpath, name),
+                    )
+            dirnames[:] = inside
             base = source / os.path.relpath(dirpath, source)
             entries.extend(base / name for name in (*dirnames, *filenames))
         with tarfile.open(fileobj=buf, mode="w") as tar:
             for path in sorted(entries):
                 if path.is_symlink():
                     continue
-                if path.is_dir() or (path.is_file() and not _pull_temp(path.name)):
+                if path.is_dir() or (
+                    path.is_file()
+                    and not _pull_temp(path.name)
+                    and _within(str(path), root)
+                ):
                     arcname = path.relative_to(source).as_posix()
                     tar.add(path, arcname=arcname, recursive=False)
     except OSError as err:
