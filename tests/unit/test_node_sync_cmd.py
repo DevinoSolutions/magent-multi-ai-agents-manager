@@ -1,0 +1,274 @@
+"""`magent node sync`: the shell over node_sync -- exit codes and lines, no logic."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
+
+import pytest
+
+from magent import cli, log, node_sync, nodes
+from magent.cli import node_cmd
+from magent.config import SCHEMA_VERSION
+from magent.env import get_env
+from magent.lockfile import exclusive_lock
+from magent.nodes import NodeMapEntry
+from tests.unit._pull_reply import pull_meta, pull_reply
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+
+@pytest.fixture
+def pool_config(tmp_path, tmp_config, monkeypatch):
+    root = tmp_path / "nodes"
+    monkeypatch.setattr(nodes, "NODES_DIR", root)
+    monkeypatch.setattr(nodes, "NODE_MAP_PATH", root / "node-map.json")
+    nodes.write_node_map(
+        {
+            "api": NodeMapEntry("second", "api", 1.0, False, "~/magent/api"),
+            "web": NodeMapEntry("third", "web", 1.0, False, "~/magent/web"),
+        }
+    )
+    return tmp_config(
+        {
+            "version": SCHEMA_VERSION,
+            "settings": {
+                "nodes": {
+                    "second": {"host": "devino-second", "user": "amin"},
+                    "third": {"host": "devino-third", "user": "amin"},
+                }
+            },
+            "projects": [
+                {"path": "api", "node": "second"},
+                {"path": "web", "node": "third"},
+            ],
+        }
+    )
+
+
+@pytest.fixture
+def daemon_lock() -> Iterator[None]:
+    """The daemon's lock, held by this test: a daemon is alive
+    (``node_sync.daemon_running`` asks the lock, never the pid file)."""
+    with exclusive_lock(node_sync.LOCK_NAME):
+        yield
+
+
+@pytest.fixture
+def stranger() -> Iterator[subprocess.Popen[bytes]]:
+    """A live process that is NOT the daemon -- what a recycled pid names."""
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        yield child
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+
+
+def _record_pid(pid: int) -> None:
+    node_sync._PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+    node_sync._PID_PATH.write_text(str(pid))
+
+
+def _pid_is_mine() -> None:
+    _record_pid(os.getpid())
+
+
+class TestNodeSync:
+    def test_once_reports_every_node_and_fails_when_one_is_down(
+        self, runner, pool_config, fake_ssh
+    ):
+        fake_ssh.set_reply("devino-second", stdout=pull_reply(pull_meta()))
+        fake_ssh.set_reply(
+            "devino-third",
+            stderr="ssh: connect to host devino-third port 22: Connection refused\n",
+            rc=255,
+        )
+        result = runner.invoke(
+            cli.main, ["--config", pool_config, "node", "sync", "--once"]
+        )
+        assert result.exit_code == 1, result.output
+        assert "@second  ok" in result.stdout
+        assert (
+            "@third  unreachable  ssh: connect to host devino-third port 22: "
+            "Connection refused"
+        ) in result.stdout
+
+    def test_once_while_the_daemon_runs_defers_to_its_tick(
+        self, runner, pool_config, fake_ssh, daemon_lock
+    ):
+        result = runner.invoke(
+            cli.main, ["--config", pool_config, "node", "sync", "--once"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "its own next tick is this one" in result.stdout
+        assert fake_ssh.calls() == []
+
+    def test_nothing_to_sync_is_said_and_is_not_an_error(self, runner, tmp_config):
+        path = tmp_config({"version": SCHEMA_VERSION, "projects": [{"path": "api"}]})
+        result = runner.invoke(cli.main, ["--config", path, "node", "sync", "--once"])
+        assert result.exit_code == 0
+        assert "Nothing to sync: no project runs on a node." in result.stdout
+
+    def test_stop_when_nothing_runs(self, runner):
+        result = runner.invoke(cli.main, ["node", "sync", "--stop"])
+        assert result.exit_code == 0
+        assert "Node sync daemon was not running." in result.stdout
+
+    def test_the_daemon_flag_spawns_the_foreground_loop_detached(
+        self, runner, pool_config, monkeypatch
+    ):
+        spawned: list[list[str]] = []
+
+        def spawn(argv: list[str]) -> None:
+            spawned.append(argv)
+            _pid_is_mine()
+
+        monkeypatch.setattr("magent.launch.spawn_detached", spawn)
+        result = runner.invoke(
+            cli.main, ["--config", pool_config, "node", "sync", "-d"]
+        )
+        assert result.exit_code == 0, result.output
+        assert spawned == [
+            [sys.executable, "-m", "magent", "--config", pool_config, "node", "sync"]
+        ]
+        assert f"(pid {os.getpid()})" in result.stdout
+
+    def test_a_daemon_that_never_starts_is_a_failure(
+        self, runner, pool_config, monkeypatch
+    ):
+        monkeypatch.setattr("magent.launch.spawn_detached", lambda argv: None)
+        monkeypatch.setattr(node_cmd, "time", SimpleNamespace(sleep=lambda _s: None))
+        result = runner.invoke(
+            cli.main, ["--config", pool_config, "node", "sync", "-d"]
+        )
+        assert result.exit_code == 1
+        assert "node sync daemon failed to start" in result.stdout
+
+    def test_a_running_daemon_is_reported_not_doubled(
+        self, runner, pool_config, monkeypatch, daemon_lock
+    ):
+        _pid_is_mine()
+        monkeypatch.setattr(
+            "magent.launch.spawn_detached", lambda argv: pytest.fail("spawned")
+        )
+        result = runner.invoke(
+            cli.main, ["--config", pool_config, "node", "sync", "-d"]
+        )
+        assert result.exit_code == 0
+        assert "Node sync daemon already running" in result.stdout
+        assert f"(pid {os.getpid()})" in result.stdout
+
+    def test_a_recycled_pid_is_no_daemon_and_is_never_reported_as_ours(
+        self, runner, pool_config, monkeypatch, stranger
+    ):
+        """After a crash or a reboot the pid file survives and the number is
+        handed to an unrelated process. The lock is free, so there is no
+        daemon: spawn one, and report the pid the NEW daemon writes -- never
+        the stranger still named by the leftover file."""
+        _record_pid(stranger.pid)
+        spawned: list[list[str]] = []
+        naps: list[float] = []
+
+        def spawn(argv: list[str]) -> None:
+            spawned.append(argv)
+
+        def nap(s: float) -> None:
+            # The child takes a moment to write its pid file: the first poll
+            # still reads the leftover, and must not take it for the daemon.
+            naps.append(s)
+            if len(naps) == 2:
+                _pid_is_mine()
+
+        monkeypatch.setattr("magent.launch.spawn_detached", spawn)
+        monkeypatch.setattr(node_cmd, "time", SimpleNamespace(sleep=nap))
+        result = runner.invoke(
+            cli.main, ["--config", pool_config, "node", "sync", "-d"]
+        )
+        assert result.exit_code == 0, result.output
+        assert len(spawned) == 1
+        assert f"(pid {os.getpid()})" in result.stdout
+        assert f"(pid {stranger.pid})" not in result.stdout
+
+    def test_a_bare_node_command_exits_0(self, runner, pool_config):
+        """The group is invoke_without_command: G's node table fills the bare
+        `magent node` later, without touching the declaration."""
+        result = runner.invoke(cli.main, ["--config", pool_config, "node"])
+        assert result.exit_code == 0, result.output
+
+
+class TestTheEnvGatesOnlyTheSupervisor:
+    """MAGENT_NODE_SYNC=0 (pinned for every test by conftest) stops `serve`
+    from spawning the daemon. A sync that a person -- or an e2e test -- asks
+    for by name runs anyway."""
+
+    def test_the_suite_runs_with_supervision_off(self, monkeypatch):
+        monkeypatch.setattr("magent.env._cached_env", None)
+        assert get_env().node_sync is False
+
+    def test_an_explicit_once_still_pulls(self, runner, pool_config, fake_ssh):
+        _both_answer(fake_ssh)
+        result = runner.invoke(
+            cli.main, ["--config", pool_config, "node", "sync", "--once"]
+        )
+        assert result.exit_code == 0, result.output
+        assert _hosts_dialled(fake_ssh) == ["amin@devino-second", "amin@devino-third"]
+
+    def test_an_explicit_daemon_flag_still_spawns(
+        self, runner, pool_config, monkeypatch
+    ):
+        spawned: list[list[str]] = []
+
+        def spawn(argv: list[str]) -> None:
+            spawned.append(argv)
+            _pid_is_mine()
+
+        monkeypatch.setattr("magent.launch.spawn_detached", spawn)
+        result = runner.invoke(
+            cli.main, ["--config", pool_config, "node", "sync", "-d"]
+        )
+        assert result.exit_code == 0, result.output
+        assert len(spawned) == 1
+
+    def test_the_foreground_loop_still_runs(self, runner, pool_config, fake_ssh):
+        _both_answer(fake_ssh)
+        result = runner.invoke(
+            cli.main, ["--config", pool_config, "node", "sync", "--ticks", "1"]
+        )
+        assert result.exit_code == 0, result.output
+        assert _hosts_dialled(fake_ssh) == ["amin@devino-second", "amin@devino-third"]
+
+
+def _both_answer(fake_ssh) -> None:
+    fake_ssh.set_reply("devino-second", stdout=pull_reply(pull_meta()))
+    fake_ssh.set_reply("devino-third", stdout=pull_reply(pull_meta()))
+
+
+def _hosts_dialled(fake_ssh) -> list[str]:
+    # A first pull may add a realpath round trip, so count hosts, not calls.
+    return sorted({c.argv[-2] for c in fake_ssh.calls()})
+
+
+class TestDaemonState:
+    def test_the_heartbeat_age_decides_stopped_ok_or_stale(self, monkeypatch):
+        """node_cmd._daemon_state, the one reader of the daemon's heartbeat
+        (DECISION-17), over a frozen clock. log.heartbeat_age reads time.time()
+        through log's own `time`, so only that module's clock is frozen."""
+        clock = SimpleNamespace(time=lambda: 1000.0)
+        monkeypatch.setattr(log, "time", clock)
+        assert node_cmd._daemon_state() == "stopped"  # never written
+
+        log.write_heartbeat(node_sync.HEARTBEAT_NAME)
+        path = log.HEARTBEAT_DIR / f"{node_sync.HEARTBEAT_NAME}.heartbeat"
+        os.utime(path, (1000.0, 1000.0))
+        clock.time = lambda: 1000.0 + log.HEARTBEAT_MAX_AGE
+        assert node_cmd._daemon_state() == "ok"
+        clock.time = lambda: 1000.5 + log.HEARTBEAT_MAX_AGE
+        assert node_cmd._daemon_state() == "stale"  # a crash leaves it behind
+
+        log.clear_heartbeat(node_sync.HEARTBEAT_NAME)
+        assert node_cmd._daemon_state() == "stopped"  # a clean exit clears it

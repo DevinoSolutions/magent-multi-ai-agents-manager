@@ -1028,20 +1028,8 @@ def parse_pull(stdout: bytes, *, dest: Path, sids: Collection[str]) -> NodeSnaps
     )
 
 
-def pull_node(
-    node: Node,
-    sids: Mapping[str, SidPull],
-    *,
-    dest: Path | None = None,
-    timeout_s: float = PULL_TIMEOUT_S,
-) -> NodeSnapshot:
-    """ONE ssh to ``node`` running pull.sh for ``sids`` (possibly none: the
-    call still returns liveness and load), with the files stored under
-    ``dest`` (default: the node's mirror dir). Quiet: the caller reports.
-    RemoteError on a transport failure (255), a timeout (None), a reply over
-    ``PULL_MAX_REPLY_BYTES`` (None too -- pull.sh keeps its
-    own reply under ``PULL_MAX_TOTAL_BYTES``, so this means a node that did
-    not), a node without python3 (3), or a reply that is not a pull (0)."""
+def _pull_call(sids: Mapping[str, SidPull]) -> tuple[list[str], bytes]:
+    """The remote argv and stdin of one pull.sh call for ``sids``."""
     payload = {
         "sids": {
             sid: {
@@ -1059,9 +1047,34 @@ def pull_node(
         # several ticks instead of failing every one (NodeSnapshot.resume).
         "max_total_bytes": PULL_MAX_TOTAL_BYTES,
     }
-    argv, input_bytes = _script_call(
+    return _script_call(
         "pull", [], json.dumps(payload).encode("utf-8")
     )  # `bash -s -- <SOCKET>`: the socket is always $1
+
+
+def refused_pull(node: Node, sids: Mapping[str, SidPull], message: str) -> RemoteError:
+    """A pull of ``sids`` refused on this PC before any ssh: rc 0, and the
+    command it would have run, shown the way every node error shows one
+    (``_run_shown``)."""
+    argv, input_bytes = _pull_call(sids)
+    return RemoteError(0, message, _run_shown(node, argv, input_bytes))
+
+
+def pull_node(
+    node: Node,
+    sids: Mapping[str, SidPull],
+    *,
+    dest: Path | None = None,
+    timeout_s: float = PULL_TIMEOUT_S,
+) -> NodeSnapshot:
+    """ONE ssh to ``node`` running pull.sh for ``sids`` (possibly none: the
+    call still returns liveness and load), with the files stored under
+    ``dest`` (default: the node's mirror dir). Quiet: the caller reports.
+    RemoteError on a transport failure (255), a timeout (None), a reply over
+    ``PULL_MAX_REPLY_BYTES`` (None too -- pull.sh keeps its
+    own reply under ``PULL_MAX_TOTAL_BYTES``, so this means a node that did
+    not), a node without python3 (3), or a reply that is not a pull (0)."""
+    argv, input_bytes = _pull_call(sids)
     result = run(
         node,
         argv,
