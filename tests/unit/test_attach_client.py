@@ -1095,3 +1095,57 @@ class TestTheTmuxMultiplexer:
     def test_an_unknown_multiplexer_is_never_probed(self):
         with pytest.raises(ValueError, match="screen"):
             attach_client.session_probe_argv("me@box", "api", mux="screen")
+
+    def _asked(self, monkeypatch, **kwargs):
+        """Drive one clean exit through supervise; return which mux was probed."""
+        asked: list[str] = []
+
+        def fake_probe(_target, _session, mux="psmux"):
+            asked.append(mux)
+            return attach_client.SESSION_ALIVE
+
+        monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/usr/bin/ssh")
+        monkeypatch.setattr(attach_client, "_run_ssh", lambda *_a, **_k: _dial(0))
+        monkeypatch.setattr(attach_client, "_probe_session", fake_probe)
+        monkeypatch.setattr(attach_client, "_stdout_is_tty", lambda: False)
+        monkeypatch.setattr(attach_client, "_term_width", lambda: 100)
+        monkeypatch.setattr(attach_client.time, "monotonic", lambda: 0.0)
+        monkeypatch.setattr(attach_client.time, "sleep", lambda _s: None)
+        rc = attach_client.supervise("user@host", "remote", "api", **kwargs)
+        assert rc == 0
+        return asked
+
+    def test_a_tmux_pane_asks_tmux_whether_its_session_survived(self, monkeypatch):
+        # Asking psmux on a Linux node would answer "command not found" for a
+        # perfectly live session, and the pane would never read a detach.
+        assert self._asked(monkeypatch, mux="tmux") == ["tmux"]
+
+    def test_a_psmux_pane_still_asks_psmux(self, monkeypatch):
+        assert self._asked(monkeypatch) == ["psmux"]
+
+    def test_a_node_pane_that_gives_up_names_magent_up_as_the_repair(
+        self, monkeypatch, capsys
+    ):
+        # `magent attach` knows nothing about nodes; a node session is brought
+        # back from this PC by `magent up`, a top-up that recreates only the
+        # missing sessions. The psmux wording is pinned by TestSupervise's
+        # test_a_session_that_stays_gone_stops_instead_of_hammering_sshd.
+        rc, _calls, _sleeps = _drive(
+            monkeypatch,
+            [0] * attach_client.SESSION_MISSING_MAX,
+            probes=[attach_client.SESSION_GONE] * attach_client.SESSION_MISSING_MAX,
+            mux="tmux",
+        )
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "Run magent up to bring it back." in out
+        assert "magent attach" not in out
+
+    def test_a_failed_no_reconnect_node_pane_names_magent_up_too(
+        self, monkeypatch, capsys
+    ):
+        rc, _calls, _sleeps = _drive(monkeypatch, [1], reconnect=False, mux="tmux")
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "Run magent up to bring it back." in out
+        assert "magent attach" not in out

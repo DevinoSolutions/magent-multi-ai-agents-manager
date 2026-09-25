@@ -905,12 +905,32 @@ def _wait(
     )
 
 
-def supervise(target: str, remote: str, session: str, *, reconnect: bool = True) -> int:
+def _repair_command(mux: str) -> str:
+    """The command a stopped pane tells the user to run to bring its session
+    back. A psmux session lives on a magent host, whose bring-up ``magent
+    attach`` re-runs; a node (tmux) session is brought up from this PC by
+    ``magent up`` -- a top-up that recreates only the missing sessions, so it
+    needs no name -- and ``magent attach`` knows nothing about nodes."""
+    return "magent up" if mux == "tmux" else "magent attach"
+
+
+def supervise(
+    target: str,
+    remote: str,
+    session: str,
+    *,
+    reconnect: bool = True,
+    mux: str = "psmux",
+) -> int:
     """Run the attach connection, reconnecting until told to stop.
 
     Returns the exit code the pane should carry. ``reconnect=False`` reproduces
     the historical bare-ssh behavior exactly (one connection, whatever code it
     exits with) for ``magent attach --no-reconnect``.
+
+    ``mux`` decides what the post-disconnect probe asks the host (psmux on a
+    magent host, tmux on a node) and which repair a stopped pane names; the
+    connection itself is the same ssh.
     """
     if shutil.which("ssh") is None:
         _echo(f"  {style('x', fg='red')} ssh is not on PATH -- cannot attach.")
@@ -964,7 +984,7 @@ def supervise(target: str, remote: str, session: str, *, reconnect: bool = True)
             probe = (
                 None
                 if not reconnect or rc == SSH_TRANSPORT_RC
-                else _probe_session(target, session)
+                else _probe_session(target, session, mux=mux)
             )
             outcome = verdict(rc, probe)
             if outcome == DETACHED:
@@ -982,7 +1002,7 @@ def supervise(target: str, remote: str, session: str, *, reconnect: bool = True)
                 _dump(detail)
                 _echo(
                     f"  {style('The session may be gone on the host. Run', dim=True)}"
-                    f" {style('magent attach', bold=True)}"
+                    f" {style(_repair_command(mux), bold=True)}"
                     f" {style('to bring it back.', dim=True)}"
                 )
                 return rc
@@ -1005,7 +1025,7 @@ def supervise(target: str, remote: str, session: str, *, reconnect: bool = True)
                     _dump(detail)
                     _echo(
                         f"  {style('Run', dim=True)}"
-                        f" {style('magent attach', bold=True)}"
+                        f" {style(_repair_command(mux), bold=True)}"
                         f" {style('to bring it back.', dim=True)}"
                     )
                     # rc is untrustworthy here by construction (a Windows host
