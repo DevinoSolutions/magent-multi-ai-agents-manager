@@ -2,22 +2,29 @@
 
 from __future__ import annotations
 
+import dataclasses
+import json
+import os
+import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
+from importlib import resources
 from pathlib import Path
 
 import pytest
 
-from magent import attach_client, remote_mux
+from magent import attach_client, node_scripts, remote_mux
 from magent.attach_client import SSH_CONNECTION_OPTS
-from magent.nodes import Node
+from magent.nodes import LoadSample, Node
 from magent.remote_mux import RemoteError
 
 # By value, at import: conftest's _no_real_ssh patches the MODULE attribute, so
 # this name still holds the real resolver for the one test that proves it.
 from magent.remote_mux import find_ssh as real_find_ssh
+from tests.unit._fake_ssh import make_fake_ssh
 
 NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
 
@@ -228,3 +235,136 @@ class TestRun:
         assert "ghp_FAKETOKEN" not in str(exc.value)
         assert exc.value.command_redacted[-1] == "<stdin: 13 bytes>"
         assert exc.value.command_redacted[0] == "ssh"
+
+
+class TestTheScriptsShip:
+    def test_a_script_loads_by_name(self):
+        text = node_scripts.script("sample")
+        assert text.startswith("#!/usr/bin/env bash\n")
+        # The run_script contract: the LAST line hands the rest of stdin
+        # (the sentinel + payload) to main instead of executing it.
+        assert text.rstrip("\n").splitlines()[-1] == 'main "$@"; exit $?'
+
+    def test_an_unknown_script_is_a_file_not_found(self):
+        with pytest.raises(FileNotFoundError):
+            node_scripts.script("no-such-script")
+
+    def test_an_include_line_is_replaced_by_that_file(self):
+        # One script travels over stdin, so shared functions are inlined at
+        # load time -- the node never sources a file.
+        text = node_scripts.script("sample")
+        assert "# @include" not in text
+        assert "magent_sample()" in text
+        assert "magent_payload()" in text
+
+    def test_the_library_never_calls_main(self):
+        # lib.sh is include-only: a `main` call in it would run before the
+        # including script's own main.
+        lib = node_scripts.script("lib")
+        assert 'main "$@"' not in lib
+        assert "# @include" not in lib
+
+    def test_the_library_takes_the_socket_as_a_required_first_argument(self):
+        lib = node_scripts.script("lib")
+        assert 'MAGENT_SOCKET="${1:?' in lib
+        assert "\nshift\n" in lib
+
+    def test_every_script_includes_the_library(self):
+        # The socket convention lives in lib.sh; an ENTRY script without it
+        # would read the socket as its own first argument. Non-entry scripts
+        # (sourced libraries, files run by something other than run_script)
+        # are listed, with reasons, in node_scripts.NON_ENTRY_SCRIPTS.
+        names = [
+            p.name.removesuffix(".sh")
+            for p in resources.files("magent.node_scripts").iterdir()
+            if p.name.endswith(".sh") and p.name not in node_scripts.NON_ENTRY_SCRIPTS
+        ]
+        assert names
+        for name in names:
+            assert "\n# @include lib.sh\n" in node_scripts._read(name), name
+
+    def test_every_non_entry_script_exists(self):
+        # A stale name in the set would silently exempt nothing -- or a
+        # future file that happens to reuse it.
+        shipped = {
+            p.name
+            for p in resources.files("magent.node_scripts").iterdir()
+            if p.name.endswith(".sh")
+        }
+        assert "lib.sh" in node_scripts.NON_ENTRY_SCRIPTS
+        assert shipped >= node_scripts.NON_ENTRY_SCRIPTS
+
+    def test_no_script_names_the_socket_itself(self):
+        # DECISION-3/26 ii: the socket's one owner is attach_client.TMUX_SOCKET
+        # (remote_mux.SOCKET); a script only ever says "$MAGENT_SOCKET". Every
+        # file is scanned, non-entry scripts included.
+        for p in resources.files("magent.node_scripts").iterdir():
+            if not p.name.endswith(".sh"):
+                continue
+            text = p.read_text(encoding="utf-8")
+            assert set(re.findall(r"-L\s+(\S+)", text)) <= {'"$MAGENT_SOCKET"'}, p.name
+            assert f"-L {remote_mux.SOCKET}" not in text, p.name
+
+    def test_an_include_is_one_level_deep(self, monkeypatch):
+        files = {"a": "x\n# @include b.sh\ny\n", "b": "# @include c.sh\n"}
+        monkeypatch.setattr(node_scripts, "_read", files.__getitem__)
+        with pytest.raises(ValueError, match="nested"):
+            node_scripts.script("a")
+
+    def test_no_packaged_script_carries_a_carriage_return(self):
+        # bash on the node reads `\r` as part of every command. .gitattributes
+        # pins *.sh to LF; this catches a checkout that ignored it.
+        scripts = [
+            p
+            for p in resources.files("magent.node_scripts").iterdir()
+            if p.name.endswith(".sh")
+        ]
+        assert scripts
+        for script in scripts:
+            assert "\r" not in script.read_text(encoding="utf-8"), script.name
+
+    @pytest.mark.skipif(
+        not Path("/proc/loadavg").exists() or shutil.which("bash") is None,
+        reason="sample.sh reads Linux /proc (the pool is Linux)",
+    )
+    def test_sample_prints_one_load_sample_under_real_bash(self, tmp_path):
+        # A fake tmux on PATH: the real one is never resolved from a test.
+        tmux = make_fake_ssh(tmp_path, name="tmux")
+        tmux.set_reply("list-sessions", stdout="api: 1 windows\nweb: 1 windows\n")
+        env = {**os.environ, "PATH": f"{tmux.base}{os.pathsep}{os.environ['PATH']}"}
+        r = subprocess.run(
+            # A socket that is NOT remote_mux.SOCKET: proves it is read, not baked in.
+            ["bash", "-s", "--", "mgtest"],
+            input=node_scripts.script("sample").encode("utf-8"),
+            capture_output=True,
+            timeout=30,
+            env=env,
+            check=False,
+        )
+        assert r.returncode == 0, r.stderr
+        sample = json.loads(r.stdout)
+        assert set(sample) == {f.name for f in dataclasses.fields(LoadSample)}
+        assert sample["my_sessions"] == 2
+        assert sample["nproc"] >= 1
+        assert sample["mem_total_mb"] > 0
+        (call,) = tmux.calls()
+        assert "-L mgtest list-sessions" in " ".join(call.argv)
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or shutil.which("bash") is None,
+        reason="needs a POSIX bash",
+    )
+    def test_a_script_without_the_socket_fails_loudly(self, tmp_path):
+        tmux = make_fake_ssh(tmp_path, name="tmux")
+        env = {**os.environ, "PATH": f"{tmux.base}{os.pathsep}{os.environ['PATH']}"}
+        r = subprocess.run(
+            ["bash", "-s", "--"],
+            input=node_scripts.script("sample").encode("utf-8"),
+            capture_output=True,
+            timeout=30,
+            env=env,
+            check=False,
+        )
+        assert r.returncode != 0
+        assert b"tmux socket" in r.stderr
+        assert tmux.calls() == []
