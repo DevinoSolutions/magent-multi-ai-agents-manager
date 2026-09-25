@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from magent import lockfile, remote_mux
+from magent import env, lockfile, remote_mux
 
 # By value, at import -- before any fixture runs: conftest's _no_real_ssh
 # patches the MODULE attribute, so this name is still the real PATH resolver.
@@ -35,6 +35,7 @@ from tests.conftest import (
     _playwright_browsers_path,
     _tripwire_disabled,
 )
+from tests.unit._git_repos import commit, git, make_origin_and_clone, needs_git
 
 # The per-test guards are a dev-machine device: CI homes are disposable and
 # some CI-only tiers write them on purpose, so the tripwire stands down there
@@ -205,3 +206,57 @@ class TestNoTestResolvesTheRealSsh:
             assert remote_mux.find_ssh() is None
         finally:
             real_find_ssh.cache_clear()
+
+
+@pytest.fixture(scope="class")
+def _hook_env_before_the_scrub(tmp_path_factory):
+    """Every repo-locating variable, set the way a git hook sets them -- at
+    CLASS scope, so it is in place before any function-scoped autouse fixture
+    runs, exactly like an env inherited from a pre-push hook. It names a path
+    and runs nothing: no git call may happen here, before the scrub."""
+    aimed = tmp_path_factory.mktemp("hook-victim") / ".git"
+    with pytest.MonkeyPatch.context() as mp:
+        for name in env.GIT_LOCAL_ENV_VARS:
+            mp.setenv(name, str(aimed))
+        yield aimed
+
+
+@pytest.mark.usefixtures("_hook_env_before_the_scrub")
+class TestAHookEnvNeverReachesATest:
+    """The husky pre-push runs the full gate, pytest included, with the hook's
+    GIT_DIR exported -- absolute in a worktree. A fixture's `git init --bare`
+    under that env rewrote the REAL repo's shared config to core.bare=true and
+    committed onto its checked-out branch (measured)."""
+
+    def test_the_conftest_scrub_removed_every_repo_locating_var(self):
+        leaked = [name for name in env.GIT_LOCAL_ENV_VARS if name in os.environ]
+        assert leaked == []
+
+
+@needs_git
+class TestTheRepoBuilderLocatesItsRepoByPath:
+    def test_a_hook_env_set_mid_test_cannot_aim_the_builder_elsewhere(
+        self, tmp_path, monkeypatch
+    ):
+        # The builder scrubs its OWN children too: a test (or a class-scoped
+        # fixture that runs before the conftest scrub) must not be able to
+        # hand it a GIT_DIR.
+        victim = tmp_path / "victim"
+        victim.mkdir()
+        git(victim, "init", "-q")
+        commit(victim, text="victim\n", message="victim")
+        watched = ["HEAD", "config", "index", "refs/heads/main"]
+
+        def snapshot() -> dict[str, bytes]:
+            return {rel: (victim / ".git" / rel).read_bytes() for rel in watched}
+
+        before = snapshot()
+        monkeypatch.setenv("GIT_DIR", str(victim / ".git"))
+        monkeypatch.setenv("GIT_WORK_TREE", str(victim))
+        monkeypatch.setenv("GIT_INDEX_FILE", str(victim / ".git" / "index"))
+        work = tmp_path / "work"
+        work.mkdir()
+        _, clone = make_origin_and_clone(work)
+        assert snapshot() == before
+        assert (victim / "README.md").read_text(encoding="utf-8") == "victim\n"
+        assert git(clone, "log", "-1", "--format=%s") == "init"

@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from magent.env import git_child_env
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -32,12 +34,16 @@ GIT_ID = [
 
 
 def git(repo: Path, *args: str) -> str:
+    # git_child_env: this WRITES, so it must never follow an inherited GIT_DIR
+    # to another repo. conftest scrubs the process env for every test, but a
+    # class-scoped fixture runs before that scrub and a test can set one.
     result = subprocess.run(
         ["git", *GIT_ID, "-C", str(repo), *args],
         capture_output=True,
         text=True,
         check=True,
         timeout=30,
+        env=git_child_env(),
     )
     return result.stdout.strip()
 

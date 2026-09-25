@@ -73,6 +73,10 @@ class LocalGitState:
     --directory`` verbatim -- repo-relative, '/'-separated, a wholly ignored
     directory as one ``dir/`` entry. It is the raw material ``push_set`` picks
     from, carried here so this module never runs git itself.
+
+    ``no_commits`` is an unborn HEAD: the branch is named but holds nothing
+    yet, so there is nothing to push and nothing for the node to check out.
+    Defaulted so every construction that predates it keeps compiling.
     """
 
     path: Path
@@ -82,6 +86,7 @@ class LocalGitState:
     unpushed: bool
     detached: bool
     ignored: tuple[str, ...] = ()
+    no_commits: bool = False
 
 
 @dataclass(frozen=True)
@@ -920,10 +925,12 @@ def absolute_remote(path: str, home: str) -> str:
 def refusal_for(state: LocalGitState, *, allow_dirty: bool = False) -> str | None:
     """Why ``state``'s repo cannot be reproduced on a node, naming the fix; or
     None. D7: magent never runs the fix. ``allow_dirty`` accepts a dirty or
-    unpushed tree (the node gets origin's copy); it cannot conjure an origin
-    or a branch, so those two are refused regardless. A whitespace-only url is
-    no origin; an empty branch is refused as a detached HEAD (there is no
-    branch to push or check out)."""
+    unpushed tree (the node gets origin's copy); it cannot conjure an origin,
+    a branch or a first commit, so those three are refused regardless. A
+    whitespace-only url is no origin; an empty branch is refused as a detached
+    HEAD (there is no branch to push or check out); a branch with no commits
+    never names ``git push``, which would fail ("src refspec does not match
+    any")."""
     if not state.url.strip():
         return (
             f"{state.path}: no 'origin' remote; the node clones from origin -- "
@@ -933,6 +940,11 @@ def refusal_for(state: LocalGitState, *, allow_dirty: bool = False) -> str | Non
         return (
             f"{state.path}: HEAD is detached; the node checks out a branch -- "
             "run git switch <branch> first"
+        )
+    if state.no_commits:
+        return (
+            f"{state.path}: branch {state.branch} has no commits yet; the node "
+            "checks out a branch from origin -- make a first commit and push"
         )
     if allow_dirty:
         return None

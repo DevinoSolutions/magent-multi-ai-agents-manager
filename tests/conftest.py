@@ -192,6 +192,24 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_inherited_git_repo_env(monkeypatch):
+    """No test inherits a variable that AIMS git at a repo (every name in
+    ``env.GIT_LOCAL_ENV_VARS``, i.e. ``git rev-parse --local-env-vars``).
+
+    Same family as the HOME redirect, and not theoretical: the husky pre-push
+    hook runs the full gate, pytest included, with the hook's GIT_DIR exported
+    -- an ABSOLUTE path when pushing from a worktree, which is how this
+    project works. Under it a fixture's ``git init --bare`` rewrote the real
+    repo's shared config to ``core.bare=true``, its commit landed on the real
+    checked-out branch, and its ``push -u origin main`` went to the real
+    origin (reproduced against a scratch victim). Deleting them here covers
+    every fixture's git child and every product git read under test at once.
+    """
+    for name in env.GIT_LOCAL_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_ssh(monkeypatch):
     """No test resolves the REAL ``ssh`` client. A test that installed no fake
     sees "not installed" (``remote_mux.run`` raises RemoteError rc 127), a

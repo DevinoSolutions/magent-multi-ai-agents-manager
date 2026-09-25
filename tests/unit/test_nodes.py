@@ -1637,6 +1637,7 @@ def _git_state(
     dirty: bool = False,
     unpushed: bool = False,
     detached: bool = False,
+    no_commits: bool = False,
 ) -> LocalGitState:
     # Not B's `_state(path, ignored)` -- that helper already exists in this file.
     return LocalGitState(
@@ -1646,6 +1647,7 @@ def _git_state(
         dirty=dirty,
         unpushed=unpushed,
         detached=detached,
+        no_commits=no_commits,
     )
 
 
@@ -1879,6 +1881,19 @@ class TestTheRefusalNamesTheFix:
             assert text is not None
             assert "git switch <branch>" in text
             assert "git push" not in text
+
+    def test_no_commits_is_refused_without_naming_a_push_that_cannot_work(
+        self, tmp_path
+    ):
+        # An unborn branch has nothing to push ("src refspec main does not
+        # match any") and nothing for the node to check out, so allow_dirty
+        # cannot let it through either.
+        state = _git_state(tmp_path, unpushed=True, no_commits=True)
+        for allow_dirty in (False, True):
+            text = nodes.refusal_for(state, allow_dirty=allow_dirty)
+            assert text is not None
+            assert "no commits yet" in text
+            assert "git push -u" not in text
 
     def test_allow_dirty_lets_dirty_and_unpushed_through(self, tmp_path):
         state = _git_state(tmp_path, dirty=True, unpushed=True)
