@@ -33,6 +33,28 @@ _PROJECT_FIELD_DOCS: list[tuple[str, str, str, str]] = [
         "none",
         'List of window objects `{"name", "tool", "command"}` with per-window tool/command overrides. Legacy `int` / `["name1", "name2"]` forms still parse (normalized by `magent config migrate`).',
     ),
+    (
+        "node",
+        "string",
+        "none",
+        (
+            "Run this project's session on a pool machine: a nick from "
+            '`settings.nodes`, `"auto"` to place it by load history, or `"cloud"` '
+            "for a Claude cloud session (needs no pool entry). A node holds a git "
+            "clone at your current branch. Exclusive with `host`."
+        ),
+    ),
+    (
+        "push",
+        "list",
+        "none",
+        (
+            "Extra files (relative to the project) shipped to the node at bring-up, "
+            "on top of the auto-detected gitignored `.env*`, "
+            "`.claude/settings.local.json`, `CLAUDE.local.md` and `.mcp.json`. A "
+            "missing file is a warning, not an error."
+        ),
+    ),
 ]
 
 

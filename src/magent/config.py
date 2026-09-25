@@ -142,6 +142,8 @@ class ProjectConfig:
     host: str | None = None
     remote_path: str | None = None
     windows: list[WindowConfig] | None = None
+    node: str | None = None
+    push: list[str] | None = None
 
 
 @dataclass
@@ -187,6 +189,13 @@ def _str(raw: dict[str, object], key: str, default: str) -> str:
 def _str_or_none(raw: dict[str, object], key: str) -> str | None:
     value = raw.get(key)
     return value if isinstance(value, str) else None
+
+
+def _str_list_or_none(raw: dict[str, object], key: str) -> list[str] | None:
+    value = raw.get(key)
+    if not isinstance(value, list):
+        return None
+    return [item for item in value if isinstance(item, str)]
 
 
 def _int(raw: dict[str, object], key: str, default: int) -> int:
@@ -392,6 +401,8 @@ def _parse_project(raw: dict[str, object]) -> ProjectConfig:
         host=_str_or_none(raw, "host"),
         remote_path=_str_or_none(raw, "remotePath"),
         windows=_windows(raw),
+        node=_str_or_none(raw, "node"),
+        push=_str_list_or_none(raw, "push"),
     )
 
 
@@ -504,6 +515,8 @@ _ALLOWED_PROJECT_KEYS = {
     "host",
     "remotePath",
     "windows",
+    "node",
+    "push",
 }
 _ALLOWED_WINDOW_KEYS = {"name", "tool", "command"}
 

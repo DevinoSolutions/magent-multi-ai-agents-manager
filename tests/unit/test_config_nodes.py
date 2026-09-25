@@ -129,3 +129,40 @@ class TestTheNodePoolSerializes:
             node_sync=NodeSyncConfig(pull_interval_s=15),
         )
         assert _parse_settings(settings_to_dict(settings)) == settings
+
+
+_POOL = {"second": {"host": "devino-second", "user": "amin"}}
+
+
+class TestNodeProjectsParse:
+    def test_a_project_names_its_node(self, tmp_config):
+        cfg = load_config(
+            _cfg(tmp_config, nodes=_POOL, projects=[{"path": "api", "node": "second"}])
+        )
+        assert cfg.projects[0].node == "second"
+
+    def test_push_lists_extra_files(self, tmp_config):
+        cfg = load_config(
+            _cfg(
+                tmp_config,
+                nodes=_POOL,
+                projects=[
+                    {"path": "api", "node": "second", "push": ["apps/web/gcp-sa.json"]}
+                ],
+            )
+        )
+        assert cfg.projects[0].push == ["apps/web/gcp-sa.json"]
+
+    def test_a_plain_project_has_neither(self, tmp_config):
+        cfg = load_config(_cfg(tmp_config, projects=[{"path": "api"}]))
+        assert (cfg.projects[0].node, cfg.projects[0].push) == (None, None)
+
+    def test_node_and_push_are_not_unknown_keys(self, tmp_config, capsys):
+        load_config(
+            _cfg(
+                tmp_config,
+                nodes=_POOL,
+                projects=[{"path": "api", "node": "second", "push": ["x"]}],
+            )
+        )
+        assert "unknown config key" not in capsys.readouterr().err
