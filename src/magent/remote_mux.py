@@ -858,8 +858,14 @@ def _session_root(remote_root: str) -> str:
             f"session root {remote_root!r} is not ~, ~/... or an absolute path "
             "on the node"
         )
-    if ".." in remote_root.split("/"):
+    parts = remote_root.split("/")
+    # Per component, not a substring: "~/a..b" is a fine directory name.
+    if ".." in parts:
         raise NodeConfigError(f"session root {remote_root!r} has a '..' segment")
+    if remote_root.startswith("/") and all(p in ("", ".") for p in parts):
+        raise NodeConfigError(
+            f"session root {remote_root!r} is the node's whole filesystem"
+        )
     if any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in remote_root):
         raise NodeConfigError(f"session root {remote_root!r} holds a control character")
     return remote_root
@@ -887,10 +893,17 @@ def _raise(err: OSError) -> None:
     raise err
 
 
+def _pull_temp(name: str) -> bool:
+    """The pull writer's in-flight temp: ``mkstemp(prefix=".", suffix=".part")``
+    beside its target (E8), stranded only by a kill mid-write. That exact
+    shape, and nothing wider: a real ``notes.part`` is the user's file."""
+    return name.startswith(".") and name.endswith(".part")
+
+
 def _tar_dir(source: Path) -> bytes:
     """An uncompressed tar of ``source``'s CONTENTS (paths relative to it).
     Only regular files and directories travel: a symlink could name anything
-    on this PC, and a ``*.part`` file is a pull still in flight. Symlinked
+    on this PC, and a ``.<rand>.part`` file is a pull temp (``_pull_temp``). Symlinked
     directories are not descended. A source that cannot be read raises
     RemoteError with rc None (nothing ran on a node)."""
     buf = io.BytesIO()
@@ -903,9 +916,7 @@ def _tar_dir(source: Path) -> bytes:
             for path in sorted(entries):
                 if path.is_symlink():
                     continue
-                if path.is_dir() or (
-                    path.is_file() and not path.name.endswith(".part")
-                ):
+                if path.is_dir() or (path.is_file() and not _pull_temp(path.name)):
                     arcname = path.relative_to(source).as_posix()
                     tar.add(path, arcname=arcname, recursive=False)
     except OSError as err:

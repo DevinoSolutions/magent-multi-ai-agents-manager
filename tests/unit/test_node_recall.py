@@ -694,6 +694,39 @@ class TestTheInstallNeverOverwritesTheNodesWork:
         )
 
 
+class TestAnAbsoluteRootIsInstalledThroughTheEncoder:
+    def test_an_absolute_root_travels_through_realpath_and_the_encoder(
+        self, monkeypatch, tmp_path
+    ):
+        seen: list[tuple[str, list[str]]] = []
+
+        def _run_script(node, script, args, *, timeout_s, stdin=None, **_k):
+            seen.append((script, args))
+            if script == "node_realpath":
+                return subprocess.CompletedProcess(
+                    [], 0, b"/data/srv/magent/api\n", b""
+                )
+            return subprocess.CompletedProcess(
+                [], 0, b"/home/amin/.claude/projects/-data-srv-magent-api\n", b""
+            )
+
+        monkeypatch.setattr(remote_mux, "run_script", _run_script)
+
+        result = remote_mux.install_transcripts(
+            _NODE, "/srv/magent/api", _pulled(tmp_path), timeout_s=5
+        )
+
+        assert seen == [
+            ("node_realpath", ["/srv/magent/api"]),
+            (
+                "install_transcripts",
+                [nodes.encoded_project_dir("/data/srv/magent/api")],
+            ),
+        ]
+        assert seen[1][1] == ["-data-srv-magent-api"]
+        assert result.landed == "/home/amin/.claude/projects/-data-srv-magent-api"
+
+
 class TestTheInstallResultAndRefusals:
     def _fake(self, monkeypatch, *, stdout: bytes = b"", rc: int = 0) -> list[str]:
         calls: list[str] = []
@@ -777,9 +810,33 @@ class TestTheTarCarriesOnlyTheConversation:
         with tarfile.open(fileobj=io.BytesIO(remote_mux._tar_dir(source))) as tar:
             return sorted(tar.getnames())
 
-    def test_a_part_file_still_being_pulled_is_not_sent(self, tmp_path):
+    def test_a_stray_pull_temp_is_not_sent(self, tmp_path):
+        # E8's pull writer (544f011) names its temp mkstemp(prefix=".",
+        # suffix=".part") beside the target; a SIGKILL mid-write strands one.
         source = _pulled(tmp_path)
-        (source / "next.jsonl.part").write_text("{", encoding="utf-8")
+        (source / ".abc.part").write_text("{", encoding="utf-8")
+        (source / "memory" / ".x7Qz_1.part").write_text("- half", encoding="utf-8")
+
+        assert self._names(source) == [
+            f"{SESSION_ID}.jsonl",
+            "memory",
+            "memory/MEMORY.md",
+        ]
+
+    @pytest.mark.parametrize("name", ["notes.part", ".part-of-it.md", ".hidden.jsonl"])
+    def test_a_name_that_is_not_the_temp_shape_travels(self, tmp_path, name):
+        source = _pulled(tmp_path)
+        (source / name).write_text("real\n", encoding="utf-8")
+
+        assert name in self._names(source)
+
+    def test_a_stray_temp_and_a_symlink_are_both_left_behind(self, tmp_path):
+        source = _pulled(tmp_path)
+        (source / ".abc.part").write_text("{", encoding="utf-8")
+        try:
+            (source / "link.jsonl").symlink_to(source / f"{SESSION_ID}.jsonl")
+        except OSError:
+            pytest.skip("this account cannot create symlinks")
 
         assert self._names(source) == [
             f"{SESSION_ID}.jsonl",
@@ -836,7 +893,12 @@ class TestASessionRootIsCheckedBeforeItReachesTheNode:
             "~other",
             "",
             # a ".." segment walks out of the root it names
+            # "/" itself is the whole filesystem, never a session root
+            "/",
+            "//",
+            "/.",
             "~/..",
+            "/srv/../x",
             "~/magent/../../etc",
             "/srv/magent/..",
             "/..",
@@ -849,6 +911,8 @@ class TestASessionRootIsCheckedBeforeItReachesTheNode:
             "/srv/a\x7fb",
             "/srv/a\x9bb",
             "/srv/a\x00b",
+            # a NUL would otherwise reach Popen as a bare "embedded null byte"
+            "/a\x00b",
         ],
     )
     @pytest.mark.parametrize(
@@ -881,6 +945,7 @@ class TestASessionRootIsCheckedBeforeItReachesTheNode:
             "/srv/magent/api/",
             "~/magent/..hidden/x",
             "~/magent/a..b",
+            "~/a..b",
         ],
     )
     def test_home_and_absolute_roots_are_sent_as_given(self, monkeypatch, root):
