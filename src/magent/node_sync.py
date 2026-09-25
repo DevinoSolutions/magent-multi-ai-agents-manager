@@ -730,37 +730,44 @@ def run_sync_loop(
 
 def _pull_sid(
     node: Node, entry: NodeMapEntry, mark: Mark | None
-) -> tuple[Mark, list[Path], bool]:
-    """One pull of one session: its next mark, the files that landed, and
-    whether a second pull is needed because the transcript dir only became
-    known with this answer."""
+) -> tuple[Mark, remote_mux.SidPull, remote_mux.NodeSnapshot]:
+    """One pull of one session: its next mark, what was asked, and the
+    answer. State records are pruned only when every file was stored."""
     spec = _spec_for(entry, mark)
     snap = _pull_node(node, {entry.sid: spec})
     new = _next_mark(spec, mark, snap, entry.sid)
     if entry.sid in snap.state_files and entry.sid not in snap.failed_sids:
         _prune_state(node.nick, entry.sid, snap.state_files[entry.sid])
-    again = new.realpath is not None and spec.project_dir != nodes.encoded_project_dir(
-        new.realpath
-    )
-    return new, list(snap.files), again
+    return new, spec, snap
+
+
+# How long final_pull waits for the node lock by default. A daemon tick holds
+# it for one whole pull: up to PULL_TIMEOUT_S, the 1 s reap of a killed ssh,
+# then the store -- the 2 s covers the last two.
+FINAL_PULL_WAIT_S = remote_mux.PULL_TIMEOUT_S + 2.0
 
 
 def final_pull(
     config: MagentConfig,
     name: str,
     *,
-    wait_s: float = remote_mux.PULL_TIMEOUT_S,
+    wait_s: float = FINAL_PULL_WAIT_S,
     local_user: str | None = None,
 ) -> remote_mux.PullResult | None:
     """Pull project ``name``'s node session once more -- ``down`` calls this
     before it kills the session, so the last turn is home. None when the
     project was never placed. Waits up to ``wait_s`` for a daemon tick that
-    holds the node, then raises LockHeld; NodeConfigError and RemoteError
-    also go to the caller, which decides what "could not pull" means.
+    holds the node, then raises LockHeld; NodeConfigError, RemoteError and
+    OSError (writing ``pull.json``) also go to the caller, which decides what
+    "could not pull" means.
 
     An entry the daemon's tick would skip (a sid this PC cannot store, an
     empty remote root) is refused as RemoteError(0) before any ssh, so the
-    caller never sees parse_pull's ValueError."""
+    caller never sees parse_pull's ValueError. A pull that could not store
+    every file is RemoteError(0) too: returning would tell ``down`` the last
+    turn is home when it is not. A node that reports no real path for the
+    session's root (a deleted project) returns normally with a warning -- no
+    later pull could do better."""
     entry = nodes.read_node_map().get(name)
     if entry is None:
         return None
@@ -777,10 +784,29 @@ def final_pull(
         )
     with node_lock(entry.nick, wait_s=wait_s):
         marks = _read_marks(entry.nick)
-        mark, files, again = _pull_sid(node, entry, marks.get(entry.sid))
-        if again:
-            mark, more, _ = _pull_sid(node, entry, mark)
-            files += more
+        mark, spec, snap = _pull_sid(node, entry, marks.get(entry.sid))
+        snaps = [snap]
+        if mark.realpath is not None and spec.project_dir != (
+            nodes.encoded_project_dir(mark.realpath)
+        ):
+            # The transcript dir only became known with this answer.
+            mark, spec, snap = _pull_sid(node, entry, mark)
+            snaps.append(snap)
         marks[entry.sid] = mark
         _write_marks(entry.nick, marks)
-    return remote_mux.PullResult(files=tuple(files), since=mark.since)
+    if any(entry.sid in s.failed_sids for s in snaps):
+        raise remote_mux.RemoteError(
+            0, f"could not store every pulled file of {entry.sid!r}", ("pull.sh",)
+        )
+    if spec.project_dir is None:
+        get_logger(LOG_NAME).warning(
+            (
+                "node %s: final pull of %r: the node reported no real path for "
+                "its root, so its transcripts were not requested"
+            ),
+            entry.nick,
+            entry.sid,
+        )
+    # Both calls ship the session's state records: each path is listed once.
+    files = tuple(dict.fromkeys(f for s in snaps for f in s.files))
+    return remote_mux.PullResult(files=files, since=mark.since)

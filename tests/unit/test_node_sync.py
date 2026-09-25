@@ -8,6 +8,7 @@ is 0 for every test that does not set it back.
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import logging
 import os
@@ -1499,6 +1500,7 @@ class TestTheFinalPull:
         assert info.value.stderr_tail == f"not a pullable session name: {sid!r}"
         assert info.value.command_redacted[0] == "ssh"
         assert "amin@devino-second" in info.value.command_redacted
+        assert info.value.command_redacted[-1].startswith("<stdin: ")
         assert fake_ssh.calls() == []
 
     def test_a_session_with_an_empty_remote_root_is_refused_before_any_ssh(
@@ -1532,3 +1534,141 @@ class TestTheFinalPull:
         assert result is not None
         (call,) = _calls_to(fake_ssh, "devino-second")
         assert set(_payload(call)["sids"]) == {"api-2"}
+
+
+def _scripted_pull(monkeypatch, *snaps: remote_mux.NodeSnapshot) -> list[dict]:
+    """final_pull's pulls answered in order by ``snaps``; returns what each
+    call asked for."""
+    asked: list[dict] = []
+    replies = iter(snaps)
+
+    def pull(_node, sids):
+        asked.append(dict(sids))
+        return next(replies)
+
+    monkeypatch.setattr(node_sync, "_pull_node", pull)
+    return asked
+
+
+_REAL = "/home/amin/magent/api"
+
+
+class TestAFinalPullThatDidNotFinish:
+    def test_a_file_that_could_not_be_stored_raises(self, placed, fake_ssh):
+        (nodes.transcripts_dir("second", "api") / "abc.jsonl").mkdir(parents=True)
+        _answer(
+            fake_ssh,
+            "devino-second",
+            meta=pull_meta(realpaths={"api": _REAL}),
+            files={"api/transcripts/abc.jsonl": "x\n"},
+        )
+        with pytest.raises(remote_mux.RemoteError) as info:
+            node_sync.final_pull(_config(), "api")
+        assert info.value.rc == 0
+        assert info.value.stderr_tail == "could not store every pulled file of 'api'"
+        assert info.value.command_redacted == ("pull.sh",)
+
+    def test_a_store_failure_on_the_second_call_raises_too(self, placed, monkeypatch):
+        _scripted_pull(
+            monkeypatch,
+            _snapshot(realpaths={"api": _REAL}),
+            _snapshot(realpaths={"api": _REAL}, failed_sids=frozenset({"api"})),
+        )
+        with pytest.raises(remote_mux.RemoteError, match="could not store"):
+            node_sync.final_pull(_config(), "api")
+
+    def test_a_root_the_node_cannot_resolve_is_logged_and_the_pull_returns(
+        self, placed, monkeypatch, caplog
+    ):
+        _capture_nodes_log(caplog)
+        asked = _scripted_pull(monkeypatch, _snapshot())
+        result = node_sync.final_pull(_config(), "api")
+        assert result == remote_mux.PullResult(files=(), since=0.0)
+        assert len(asked) == 1
+        assert _node_warnings(caplog, "second") == [
+            (
+                "node second: final pull of 'api': the node reported no real "
+                "path for its root, so its transcripts were not requested"
+            )
+        ]
+
+    def test_state_records_are_pruned_after_a_stored_pull(self, placed, monkeypatch):
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"), {"api": {"since": 10.0, "realpath": "/r"}}
+        )
+        gone = nodes.state_dir("second", "api") / "gone.json"
+        gone.parent.mkdir(parents=True)
+        gone.write_text("{}", encoding="utf-8")
+        _scripted_pull(
+            monkeypatch, _snapshot(realpaths={"api": "/r"}, state_files={"api": ()})
+        )
+        node_sync.final_pull(_config(), "api")
+        assert not gone.exists()
+
+    def test_state_records_are_kept_when_the_pull_failed(self, placed, monkeypatch):
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"), {"api": {"since": 10.0, "realpath": "/r"}}
+        )
+        gone = nodes.state_dir("second", "api") / "gone.json"
+        gone.parent.mkdir(parents=True)
+        gone.write_text("{}", encoding="utf-8")
+        _scripted_pull(
+            monkeypatch,
+            _snapshot(
+                realpaths={"api": "/r"},
+                state_files={"api": ()},
+                failed_sids=frozenset({"api"}),
+            ),
+        )
+        with pytest.raises(remote_mux.RemoteError):
+            node_sync.final_pull(_config(), "api")
+        assert gone.exists()
+
+
+class TestWhatAFinalPullLeavesBehind:
+    def test_another_sessions_mark_survives(self, placed, monkeypatch):
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"),
+            {
+                "api": {"since": 10.0, "realpath": "/r"},
+                "other": {"since": 7.0, "realpath": "/o"},
+            },
+        )
+        _scripted_pull(monkeypatch, _snapshot(realpaths={"api": "/r"}))
+        node_sync.final_pull(_config(), "api")
+        assert _marks()["other"] == {"since": 7.0, "realpath": "/o"}
+
+    def test_the_second_call_asks_for_the_learned_directory_and_its_files_count(
+        self, placed, monkeypatch
+    ):
+        a, b = Path("a.jsonl"), Path("b.jsonl")
+        asked = _scripted_pull(
+            monkeypatch,
+            _snapshot(realpaths={"api": _REAL}, files=(a,)),
+            _snapshot(realpaths={"api": _REAL}, files=(a, b)),
+        )
+        result = node_sync.final_pull(_config(), "api")
+        assert asked[1]["api"].project_dir == encoded_project_dir(_REAL)
+        assert asked[1]["api"].since == 0.0
+        # Both calls ship the session's state records: each path is listed once.
+        assert result == remote_mux.PullResult(files=(a, b), since=8999.0)
+
+    def test_by_default_it_outwaits_a_daemon_pull_holding_the_node(
+        self, placed, monkeypatch
+    ):
+        """The daemon holds the node lock for one whole pull: up to
+        PULL_TIMEOUT_S, the reap, then the store."""
+        waits: list[float] = []
+
+        @contextlib.contextmanager
+        def lock(_nick, *, wait_s):
+            waits.append(wait_s)
+            yield
+
+        monkeypatch.setattr(node_sync, "node_lock", lock)
+        _scripted_pull(monkeypatch, _snapshot(realpaths={"api": "/r"}))
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"), {"api": {"since": 1.0, "realpath": "/r"}}
+        )
+        node_sync.final_pull(_config(), "api")
+        assert waits == [remote_mux.PULL_TIMEOUT_S + 2.0]
