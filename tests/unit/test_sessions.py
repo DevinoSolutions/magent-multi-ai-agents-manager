@@ -726,13 +726,21 @@ class TestAFreshFormNeedsNoStore:
         monkeypatch.setattr("magent.sessions.claude.has_claude_session", boom)
         assert fresh_start_command("claude", "claude --continue") == "claude"
 
-    def test_codex_has_no_fresh_form(self):
-        assert fresh_start_command("codex", "codex resume --last") is None
+    def test_codex_drops_resume_last_without_reading_its_store(self, monkeypatch):
+        def boom(*_a: object, **_k: object) -> list[str | None]:
+            raise AssertionError("fresh_form must not probe codex's session store")
+
+        monkeypatch.setattr("magent.sessions.codex.get_codex_session_ids", boom)
+        assert fresh_start_command("codex", "codex resume --last") == "codex"
+
+    @pytest.mark.parametrize("cmd", ["codex", "codex resume uuid-1"])
+    def test_a_codex_command_with_no_implicit_resume_has_no_fresh_form(self, cmd):
+        assert fresh_start_command("codex", cmd) is None
 
     def test_an_unknown_tool_has_none(self):
         assert fresh_start_command("aider", "aider --continue") is None
 
-    def test_the_local_start_command_still_probes(self, monkeypatch):
+    def test_the_local_fresh_command_still_probes(self, monkeypatch):
         # The refactor keeps build_start_command's verdict: a session here
         # keeps --continue.
         monkeypatch.setattr(
@@ -761,4 +769,11 @@ class TestRemoteSshCanKeepTheUser:
             "--remote",
             "ssh-remote+amin@devino-second",
             "/home/amin/magent/api",
+        ]
+
+    def test_a_user_only_target_still_opens_locally_when_keeping_the_user(self):
+        # `amin@` names no host; `ssh-remote+amin@` would be a broken URI.
+        assert build_code_open_command("/f", "amin@", "code", keep_user=True) == [
+            "code",
+            "/f",
         ]

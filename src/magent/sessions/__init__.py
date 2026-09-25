@@ -14,6 +14,7 @@ from magent.sessions.claude import (
 from magent.sessions.codex import (
     build_codex_resume,
     codex_fresh_command,
+    codex_fresh_form,
     get_codex_session_ids,
 )
 
@@ -35,13 +36,15 @@ class AgentTool:
     resume_command: Callable[[str, str | None], str] | None = None
     # (base_cmd, project_dir, config_dir) -> the command to run when that
     # directory has NO prior session for this tool to resume in that store, or
-    # None to run base_cmd unchanged. See `build_start_command`.
+    # None to run base_cmd unchanged. See `build_start_command`. Equals
+    # `fresh_form` plus a probe of the local session store.
     fresh_command: Callable[[str, str, Path | None], str | None] | None = None
-    # base_cmd -> the command with its implicit resume dropped, WITHOUT asking
-    # any store whether there is something to resume, or None when base_cmd
-    # needs no rewrite. For a session whose store is elsewhere (a pool node:
-    # PR-D ships both forms and the node picks). None for a tool with no
-    # implicit resume.
+    # base_cmd -> the command with its implicit resume dropped (claude's
+    # `--continue`, codex's `resume --last`), WITHOUT asking any store whether
+    # there is something to resume; None when base_cmd carries no implicit
+    # resume to drop. For a session whose store is elsewhere (a pool node: the
+    # nodes feature ships both forms and the node picks). Unset for a tool that
+    # has no implicit-resume form at all.
     fresh_form: Callable[[str], str | None] | None = None
     happy: bool = False  # can be wrapped with `happy` for mobile access
 
@@ -62,6 +65,7 @@ AGENT_TOOLS: dict[str, AgentTool] = {
         session_ids=get_codex_session_ids,
         resume_command=build_codex_resume,
         fresh_command=codex_fresh_command,
+        fresh_form=codex_fresh_form,
         happy=True,
     ),
 }
@@ -143,7 +147,10 @@ def build_start_command(
 
 def fresh_start_command(tool: str, base_cmd: str) -> str | None:
     """``tool``'s fresh form of ``base_cmd`` (see ``AgentTool.fresh_form``), or
-    None. Unlike ``build_start_command`` this never probes a store."""
+    None. Unlike ``build_start_command`` this never probes a store.
+
+    None means base_cmd carries no implicit resume to drop; the caller ships
+    base_cmd alone."""
     caps = AGENT_TOOLS.get(tool)
     if caps is None or caps.fresh_form is None:
         return None
@@ -223,17 +230,15 @@ def build_code_open_command(
     ``user@`` with no host degrades to a local open rather than a broken URI.
 
     ``keep_user`` keeps a ``user@`` in the authority -- a pool node's user is
-    resolved by magent and may not exist in the ssh config (PR-D).
+    resolved by magent and may not exist in the ssh config (the nodes
+    feature). A target with no hostname still opens locally either way.
     """
     args = [code_bin]
     if ssh_host:
-        host = (
-            ssh_host
-            if keep_user
-            else (ssh_host.split("@", 1)[1] if "@" in ssh_host else ssh_host)
-        )
-        if host:
-            args.extend(["--remote", f"ssh-remote+{host}"])
+        hostname = ssh_host.split("@", 1)[1] if "@" in ssh_host else ssh_host
+        if hostname:
+            authority = ssh_host if keep_user else hostname
+            args.extend(["--remote", f"ssh-remote+{authority}"])
     args.append(folder)
     return args
 
