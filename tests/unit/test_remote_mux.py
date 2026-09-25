@@ -320,7 +320,7 @@ class TestTheReplyIsBoundedInMemory:
             remote_mux.run(NODE, ["big"], timeout_s=30, max_stdout_bytes=CAP)
         assert time.monotonic() - started < 10
         assert exc.value.rc is None
-        assert exc.value.stderr_tail == f"reply exceeded {CAP} bytes"
+        assert exc.value.stderr_tail.splitlines()[0] == f"reply exceeded {CAP} bytes"
         assert exc.value.command_redacted[0] == "ssh"
         (proc,) = spawned
         assert proc.poll() is not None
@@ -371,6 +371,38 @@ class TestTheReplyIsBoundedInMemory:
         assert result.stdout == body.encode("ascii")
         (call,) = fake_ssh.calls()
         assert call.stdin == payload
+
+    def test_the_over_cap_error_keeps_what_the_child_said_on_stderr(self, fake_ssh):
+        # The likely cause of a flood is the child's last words before it.
+        fake_ssh.set_reply("flood", stderr="boom: disk full\n")
+        fake_ssh.set_mode("flood")
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["flood"], timeout_s=60, max_stdout_bytes=CAP)
+        lines = exc.value.stderr_tail.splitlines()
+        assert lines[0] == f"reply exceeded {CAP} bytes"
+        assert "boom: disk full" in lines[1:]
+
+    def test_the_drain_drops_what_it_held_once_over_the_cap(self):
+        # Two writes, so the first cap's worth is HELD before the byte that
+        # tips it over arrives: a drain that kept its chunks would hand
+        # them back.
+        cap = 1024
+        r, w = os.pipe()
+        drain = remote_mux._Drain(os.fdopen(r, "rb"), cap, tail=False)
+        drain.start()
+        try:
+            os.write(w, b"a" * cap)
+            deadline = time.monotonic() + 5
+            while drain._held < cap and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert drain._held == cap
+            os.write(w, b"b")
+        finally:
+            os.close(w)
+        drain.join(5)
+        assert not drain.is_alive()
+        assert drain.over
+        assert drain.data() == b""
 
     def test_run_script_hands_its_cap_to_run(self, fake_ssh):
         fake_ssh.set_reply("bash -s", stdout="x" * (CAP + 1))

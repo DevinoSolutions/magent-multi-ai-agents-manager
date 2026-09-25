@@ -365,7 +365,12 @@ def _spawn(
                 max_stdout_bytes,
                 shlex.join(shown),
             )
-        raise RemoteError(None, f"reply exceeded {max_stdout_bytes} bytes", shown)
+        reason = f"reply exceeded {max_stdout_bytes} bytes"
+        # What the child said before it flooded is the likely cause. Only if
+        # stderr ends within the reap bound: a grandchild may still hold it.
+        err.join(_REAP_TIMEOUT_S)
+        said = "" if err.is_alive() else _tail(err.data())
+        raise RemoteError(None, f"{reason}\n{said}" if said else reason, shown)
     stderr = err.data()
     if check and proc.returncode != 0:
         if not quiet:
