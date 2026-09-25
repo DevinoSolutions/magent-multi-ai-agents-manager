@@ -1459,6 +1459,26 @@ class TestAFailedOAuthStepKeepsItsMemory:
         assert _node_token(box, A) == "NODE-REFRESHED-A"
         assert _node_token(box, B) == "PC-B2"
 
+    def test_a_failure_naming_the_token_is_masked_in_the_row(
+        self, box, tmp_path, monkeypatch, capsys
+    ):
+        # mcp and mcp_oauth run no child; the text only reaches their rows
+        # through a failure, which still goes through _row's mask.
+        _put(_claude_json(box), {"mcpServers": TWO_SERVERS})
+
+        def write(path: Path, value: object, **kw: object) -> object:
+            raise OSError(f"cannot write {path.name} for {TOKEN}")
+
+        monkeypatch.setattr(node_apply, "_write", write)
+        assert box.apply(_work(tmp_path, _two()), token=TOKEN) == 1
+        out = capsys.readouterr().out
+        assert TOKEN not in out
+        lines = list(remote_mux.parse_report(out).lines)
+        for item in ("mcp", "mcp_oauth"):
+            (line,) = [line for line in lines if line.item == item]
+            assert line.status == "fail"
+            assert "[gh-token]" in line.detail
+
 
 class TestAMergeNeverLosesAConcurrentWrite:
     # I3: the node's claude rewrites these files while it runs. A merge that
