@@ -1580,6 +1580,7 @@ class TestAMergeNeverLosesAConcurrentWrite:
         assert "kept changing" in line.detail
         assert _json(_credentials(box)) == writes[-1]
         assert _stored(box) == before
+        assert not list(_credentials(box).parent.glob("*.magent-tmp"))
 
     def test_an_entry_the_node_already_holds_is_not_rewritten(
         self, box, tmp_path, capsys
