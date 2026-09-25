@@ -183,6 +183,12 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     # machine the suite runs on. Tests that are ABOUT the hand-off set the
     # policy explicitly.
     monkeypatch.setenv("MAGENT_SESSION0_POLICY", "allow")
+    # ...and a fourth, with the longest reach of all: `magent serve` keeps the
+    # node sync daemon alive, and that daemon ssh-es into every machine in
+    # settings.nodes with the developer's own keys, every pull interval. A test
+    # that starts a real serve would dial real machines. Off for every tier; the
+    # tests that are ABOUT the supervisor set it back to "1".
+    monkeypatch.setenv("MAGENT_NODE_SYNC", "0")
     log.reset_logging()
     yield
     log.reset_logging()
