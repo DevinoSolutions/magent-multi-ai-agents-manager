@@ -679,6 +679,24 @@ def setup_node(
     return _report_of(result, "setup", root)
 
 
+DOCTOR_TIMEOUT_S = 30.0
+
+
+def doctor(node: Node, *, timeout_s: float) -> ProvisionReport:
+    """doctor.sh's rows for ``node``. The script is read-only and exits 0
+    whatever it finds; ssh's own failure (255) raises, and an unreachable
+    node is the caller's row to print. The tmux socket is not an argument
+    here: run_script passes ``SOCKET`` first on every call (DECISION-26 ii)."""
+    result = run_script(
+        node,
+        "doctor",
+        ["--root", node.root, "--target", node.target],
+        timeout_s=timeout_s,
+        check=False,
+    )
+    return _report_of(result, "doctor", node)
+
+
 def has_session(node: Node, sid: str) -> bool | None:
     """Is ``sid`` alive on ``node``? Exit 0 is True, a live session. Exit 1 is
     False, meant as tmux's own "no" (no such session, or no server at all) --

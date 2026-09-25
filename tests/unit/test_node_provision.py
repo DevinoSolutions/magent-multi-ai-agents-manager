@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -1695,3 +1696,321 @@ class TestSetupNode:
             remote_mux.setup_node(
                 NODE, ["amin"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
             )
+
+
+DOCTOR_TOOLS = ("bash", "awk", "dirname", "head", "wc")
+NODE_TOOLS = ("tmux", "git", "claude", "python3", "gh", "ssh", "locale", "df")
+GIB_KB = 1024 * 1024
+HI = "Hi amin! You've successfully authenticated, but GitHub does not provide shell access."
+DOCTOR_ITEMS = (
+    "tmux",
+    "git",
+    "claude",
+    "python3",
+    "gh",
+    "claude-login",
+    "github-key",
+    "locale",
+    "disk",
+    "sessions",
+)
+
+
+def _df(avail_kb: int) -> str:
+    return (
+        "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+        f"/dev/sda1 104857600 1048576 {avail_kb} 2% /\n"
+    )
+
+
+def _doctor_box(
+    tmp_path: Path,
+    *,
+    tools: tuple[str, ...] = NODE_TOOLS,
+    logged_in: bool = True,
+    github: str = HI,
+    charmap: str = "UTF-8",
+    avail_kb: int = 50 * GIB_KB,
+    tmux_version: str = "tmux 3.4",
+) -> tuple[dict[str, FakeSsh], dict[str, str]]:
+    """A node user's home and a PATH of fakes answering like a healthy node,
+    except where a keyword says otherwise."""
+    fakes = {name: make_fake_ssh(tmp_path, name=name) for name in tools}
+    replies = {
+        "tmux": [
+            ("-V", tmux_version + "\n"),
+            ("list-sessions", "a: 1 windows\nb: 1 windows\n"),
+        ],
+        "claude": [("auth status", json.dumps({"loggedIn": logged_in}) + "\n")],
+        "locale": [("charmap", charmap + "\n")],
+        "df": [("-Pk", _df(avail_kb))],
+    }
+    for name, fake in fakes.items():
+        for match, stdout in replies.get(name, []):
+            fake.set_reply(match, stdout=stdout)
+    if "ssh" in fakes:
+        fakes["ssh"].set_reply("git@github.com", stderr=github + "\n", rc=1)
+    (tmp_path / "node" / "magent").mkdir(parents=True, exist_ok=True)
+    sysbin = _sysbin(tmp_path, DOCTOR_TOOLS, python=False, name="doctorbin")
+    env = {
+        "HOME": str(tmp_path / "node"),
+        "PATH": os.pathsep.join([*(str(f.base) for f in fakes.values()), str(sysbin)]),
+    }
+    return fakes, env
+
+
+def _run_doctor(
+    env: dict[str, str],
+    root: str = "~/magent",
+    *,
+    socket: str | None = remote_mux.SOCKET,
+) -> subprocess.CompletedProcess[bytes]:
+    args = ["--root", root, "--target", "amin@devino-second"]
+    return subprocess.run(
+        _bash_argv(*args, socket=socket),
+        input=remote_mux._frame_script(node_scripts.script("doctor"), None),
+        capture_output=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+
+
+@POSIX_BASH
+class TestDoctorShUnderRealBash:
+    def test_a_healthy_node_is_all_ok(self, tmp_path):
+        _, env = _doctor_box(tmp_path)
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        assert _rows(r) == dict.fromkeys(DOCTOR_ITEMS, "ok")
+        details = {line.item: line.detail for line in _report(r).lines}
+        assert details["github-key"] == "authenticates as amin"
+        assert details["sessions"] == f"2 on tmux socket {remote_mux.SOCKET}"
+        assert details["tmux"] == "tmux 3.4"
+
+    def test_the_socket_argument_names_the_tmux_server_probed(self, tmp_path):
+        # Not remote_mux.SOCKET: proves the socket is read, never baked in.
+        fakes, env = _doctor_box(tmp_path)
+        r = _run_doctor(env, socket="mgtest")
+        assert r.returncode == 0, r.stderr
+        assert ["-L", "mgtest", "list-sessions"] in [
+            c.argv for c in fakes["tmux"].calls()
+        ]
+        details = {line.item: line.detail for line in _report(r).lines}
+        assert details["sessions"] == "2 on tmux socket mgtest"
+
+    def test_no_socket_fails_loudly_before_any_probe(self, tmp_path):
+        # lib.sh's ${1:?}: no default server is ever guessed. It sees an EMPTY
+        # argv only (as B's own pin runs it): with arguments present it cannot
+        # tell a missing socket from a misplaced one -- see the next test.
+        fakes, env = _doctor_box(tmp_path)
+        r = subprocess.run(
+            _bash_argv(socket=None),
+            input=remote_mux._frame_script(node_scripts.script("doctor"), None),
+            capture_output=True,
+            env=env,
+            timeout=60,
+            check=False,
+        )
+        assert r.returncode != 0
+        assert b"the tmux socket name is a required first argument" in r.stderr
+        assert r.stdout == b""
+        assert all(f.calls() == [] for f in fakes.values())
+
+    def test_arguments_without_the_socket_still_probe_nothing(self, tmp_path):
+        # `--root` is taken as the socket and shifted off, so main sees a
+        # stray `~/magent`: a fail row, and not one probe on a guessed server.
+        fakes, env = _doctor_box(tmp_path)
+        r = _run_doctor(env, socket=None)
+        assert _rows(r) == {"doctor": "fail"}
+        assert all(f.calls() == [] for f in fakes.values())
+
+    @pytest.mark.parametrize(
+        ("version", "status"),
+        [
+            ("tmux 3.0a", "fail"),  # Ubuntu 20.04's: bring_up.sh refuses it
+            ("tmux 3.2a", "ok"),
+            ("tmux next-3.5", "ok"),
+            ("tmux master", "fail"),
+        ],
+    )
+    def test_tmux_is_held_to_the_bring_up_floor(self, tmp_path, version, status):
+        _, env = _doctor_box(tmp_path, tmux_version=version)
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        (row,) = [line for line in _report(r).lines if line.item == "tmux"]
+        assert row.status == status
+        assert version in row.detail
+        if status == "fail":
+            assert "3.2 or newer" in row.detail
+
+    def test_a_missing_tool_fails_but_a_missing_gh_only_warns(self, tmp_path):
+        tools = tuple(t for t in NODE_TOOLS if t not in ("git", "gh"))
+        _, env = _doctor_box(tmp_path, tools=tools)
+        rows = _rows(_run_doctor(env))
+        assert (rows["git"], rows["gh"]) == ("fail", "warn")
+
+    def test_a_node_not_logged_in_names_the_one_command_that_fixes_it(self, tmp_path):
+        _, env = _doctor_box(tmp_path, logged_in=False)
+        report = _report(_run_doctor(env))
+        (row,) = [line for line in report.lines if line.item == "claude-login"]
+        assert row.status == "fail"
+        assert row.detail.endswith("run once: ssh amin@devino-second claude")
+
+    def test_a_refused_github_key_fails(self, tmp_path):
+        _, env = _doctor_box(
+            tmp_path, github="git@github.com: Permission denied (publickey)."
+        )
+        report = _report(_run_doctor(env))
+        (row,) = [line for line in report.lines if line.item == "github-key"]
+        assert row.status == "fail"
+        assert "Permission denied (publickey)." in row.detail
+
+    @pytest.mark.parametrize(
+        ("avail_kb", "status"),
+        [(512 * 1024, "fail"), (2 * GIB_KB, "warn"), (50 * GIB_KB, "ok")],
+    )
+    def test_free_disk_under_the_root_is_graded(self, tmp_path, avail_kb, status):
+        _, env = _doctor_box(tmp_path, avail_kb=avail_kb)
+        assert _rows(_run_doctor(env))["disk"] == status
+
+    def test_a_locale_that_is_not_utf8_warns(self, tmp_path):
+        _, env = _doctor_box(tmp_path, charmap="ANSI_X3.4-1968")
+        assert _rows(_run_doctor(env))["locale"] == "warn"
+
+    def test_the_root_is_measured_under_home(self, tmp_path):
+        fakes, env = _doctor_box(tmp_path)
+        _run_doctor(env)
+        (call,) = fakes["df"].calls()
+        assert call.argv == ["-Pk", str(tmp_path / "node" / "magent")]
+
+    def test_a_root_not_created_yet_is_measured_at_its_nearest_parent(self, tmp_path):
+        fakes, env = _doctor_box(tmp_path)
+        _run_doctor(env, root="~/magent/not/yet")
+        (call,) = fakes["df"].calls()
+        assert call.argv == ["-Pk", str(tmp_path / "node" / "magent")]
+
+    def test_an_empty_node_still_exits_zero_with_a_row_per_check(self, tmp_path):
+        _, env = _doctor_box(tmp_path, tools=())
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        assert _rows(r) == {
+            "tmux": "fail",
+            "git": "fail",
+            "claude": "fail",
+            "python3": "fail",
+            "gh": "warn",
+            "claude-login": "skip",
+            "github-key": "fail",
+            "locale": "warn",
+            "disk": "warn",
+            "sessions": "ok",
+        }
+
+
+def test_doctor_inlines_the_tmux_floor():
+    # One predicate for setup, doctor and (by DECISION-22) bring_up's floor.
+    assert "magent_tmux_verdict()" in node_scripts.script("doctor")
+
+
+class TestTheSocketIsAnArgumentNeverADefault:
+    def test_doctor_counts_the_socket_lib_sh_read(self):
+        # DECISION-26 ii, pinned as D pins bring_up.sh: run_script passes
+        # remote_mux.SOCKET as $1, lib.sh reads it, and doctor never names it.
+        text = node_scripts.script("doctor")
+        assert 'tmux -L "$MAGENT_SOCKET" list-sessions' in text
+        assert f"-L {remote_mux.SOCKET}" not in text
+        assert "--socket" not in text
+
+    @pytest.mark.parametrize(
+        "name", ["provision", "programs", "setup", "doctor", "tmux_floor"]
+    )
+    def test_no_f_script_defaults_the_socket(self, name):
+        # B's all-scripts pin checks every -L; this one also catches a default
+        # parked in a variable (`socket=magent`, `${1:-magent}`).
+        text = node_scripts._read(name)
+        assert not re.search(r"socket=['\"]?magent\b", text), name
+        assert not re.search(
+            rf"(=|:-|:=)['\"]?{re.escape(remote_mux.SOCKET)}\b", text
+        ), name
+
+    def test_the_doctor_call_never_passes_the_socket_itself(self, fake_ssh):
+        # run_script adds it, once, first; a second copy would be read as --root.
+        remote_mux.doctor(NODE, timeout_s=remote_mux.DOCTOR_TIMEOUT_S)
+        (call,) = fake_ssh.calls()
+        # Count argv WORDS: the default root `~/magent` contains the socket
+        # name as a substring, so a string count would read it twice.
+        (inner,) = shlex.split(call.argv[-1])[2:]
+        assert shlex.split(inner).count(remote_mux.SOCKET) == 1
+
+
+@POSIX_BASH
+@pytest.mark.parametrize(
+    "name", ["provision", "programs", "setup", "doctor", "tmux_floor"]
+)
+def test_every_node_script_parses(name):
+    r = subprocess.run(
+        [BASH, "-n"],
+        input=node_scripts.script(name).encode("utf-8"),
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+
+
+@pytest.mark.skipif(
+    shutil.which("shellcheck") is None, reason="shellcheck is not installed"
+)
+@pytest.mark.parametrize(
+    "name", ["provision", "programs", "setup", "doctor", "tmux_floor"]
+)
+def test_every_node_script_passes_shellcheck(name):
+    # Spec §16: shellcheck runs where it is installed (CI's ubuntu image has it).
+    r = subprocess.run(
+        [
+            shutil.which("shellcheck") or "shellcheck",
+            "--shell=bash",
+            "--severity=warning",
+            "-",
+        ],
+        input=node_scripts.script(name).encode("utf-8"),
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert r.returncode == 0, r.stdout.decode("utf-8", "replace")
+
+
+class TestDoctorCall:
+    def test_the_socket_first_then_the_root_and_target_and_no_payload(self, fake_ssh):
+        remote_mux.doctor(NODE, timeout_s=remote_mux.DOCTOR_TIMEOUT_S)
+        (call,) = fake_ssh.calls()
+        assert call.argv[-1] == _remote(
+            "bash",
+            "-s",
+            "--",
+            remote_mux.SOCKET,
+            "--root",
+            "~/magent",
+            "--target",
+            "amin@devino-second",
+        )
+        assert SENTINEL_LINE not in call.stdin
+
+    def test_the_rows_come_back(self, fake_ssh):
+        fake_ssh.set_reply(
+            "bash -s", stdout="ok\ttmux\ttmux 3.4\nwarn\tlocale\tPOSIX\n"
+        )
+        report = remote_mux.doctor(NODE, timeout_s=remote_mux.DOCTOR_TIMEOUT_S)
+        assert [(line.status, line.item) for line in report.lines] == [
+            ("ok", "tmux"),
+            ("warn", "locale"),
+        ]
+
+    def test_an_unreachable_node_raises(self, fake_ssh):
+        fake_ssh.set_reply(
+            "bash -s", stderr="ssh: connect to host devino-second: No route\n", rc=255
+        )
+        with pytest.raises(RemoteError):
+            remote_mux.doctor(NODE, timeout_s=remote_mux.DOCTOR_TIMEOUT_S)
