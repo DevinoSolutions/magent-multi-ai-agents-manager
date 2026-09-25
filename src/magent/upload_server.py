@@ -1560,6 +1560,8 @@ def _supervise_node_sync(
                             "node sync supervisor: another server is supervising "
                             "the daemon"
                         )
+                    # else, not a `continue` in the except: that would skip
+                    # stop_event.wait(interval) below and spin the thread.
                     else:
                         ensure_node_sync(config, config_path)
         except Exception:

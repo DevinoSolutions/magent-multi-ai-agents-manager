@@ -194,6 +194,17 @@ class TestStateStores:
             ("web", "@third", nodes.state_dir("third", "web")),
         ]
 
+    def test_no_map_file_is_no_stores(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        assert node_sync.state_stores() == []
+
+    def test_a_torn_map_is_an_error_not_an_empty_listing(self, placed):
+        """An empty listing would make the attention engine drop every node
+        row for the tick; the error lets it hold the last records instead."""
+        nodes.NODE_MAP_PATH.write_text("{", encoding="utf-8")
+        with pytest.raises(ValueError):
+            node_sync.state_stores()
+
 
 class TestTheNodeLock:
     def test_a_held_node_is_waited_for_then_refused(self):
@@ -500,11 +511,12 @@ class TestEnsureNodeSync:
     ):
         """The probe's LockHeld is the answer "a daemon is alive", caught
         inside ensure_node_sync: it never escapes to the supervisor, which
-        would blame it on another server."""
+        would blame it on another server. A healthy daemon is False: the
+        answer reports a spawn, like ensure_upload_server's."""
         _capture_nodes_log(caplog)
         _record_pid(os.getpid())
         write_heartbeat(node_sync.HEARTBEAT_NAME)
-        assert launch.ensure_node_sync(_config(), "other.json") is True
+        assert launch.ensure_node_sync(_config(), "other.json") is False
         assert spawned == []
         assert _warnings(caplog) == []
 
@@ -539,7 +551,10 @@ def _run_supervisor(
     config_path: str | None, stop: threading.Event, *, interval: float = 0.0
 ) -> None:
     """Run serve's node sync supervisor on its own thread, bounded: a loop
-    that never reaches its stop fails the test instead of hanging it."""
+    that never reaches its stop fails the test instead of hanging it. A loop
+    that never reaches its wait cannot be released by ``stop.set()``; the
+    daemon thread then outlives the monkeypatch teardown, which only happens
+    after the test has already failed."""
     from magent import upload_server
 
     thread = threading.Thread(

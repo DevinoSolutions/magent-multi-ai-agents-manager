@@ -194,11 +194,18 @@ def state_stores() -> list[tuple[str, str, Path]]:
     """``(project, "@<nick>", mirrored state dir)`` for every placed node
     session -- ``attention.AttentionEngine(extra_stores=...)``'s input. The
     project (the node map's key) is the name its window carries; the
-    ``@<nick>`` key keeps two nodes' identical directories apart."""
+    ``@<nick>`` key keeps two nodes' identical directories apart.
+
+    Read STRICTLY (``nodes.load_node_map_strict``): a missing map is no
+    placements and yields ``[]``, but a torn map or one still busy after its
+    retries RAISES (``ValueError`` / ``OSError``). A tolerant ``{}`` here would
+    be a successful listing with zero roots, and the attention engine would
+    drop every node row for that tick; the error lets it hold each root's last
+    records and warn instead."""
     # TODO(E7): skip sids that fail remote_mux.pullable_sid
     return [
         (project, f"@{e.nick}", nodes.state_dir(e.nick, e.sid))
-        for project, e in sorted(nodes.read_node_map().items())
+        for project, e in sorted(nodes.load_node_map_strict().items())
     ]
 
 

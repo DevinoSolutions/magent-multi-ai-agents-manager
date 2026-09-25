@@ -493,8 +493,9 @@ _node_sync_report = _NodeSyncReport()
 
 def ensure_node_sync(config: MagentConfig, config_path: str | None = None) -> bool:
     """Start the node sync daemon detached unless it is gated off or already
-    running. True when a daemon is running or a spawn was just issued; False
-    when a gate is off or the running daemon is wedged.
+    running. True ONLY when a spawn was actually issued (the
+    ``ensure_upload_server`` contract); False when a gate is off, when a
+    healthy daemon is already running, and when the running one is wedged.
 
     "Running" is the daemon's LOCK (``node_sync.daemon_running``), never its pid
     file: after a crash or a reboot the pid file survives, the number is
@@ -521,7 +522,7 @@ def ensure_node_sync(config: MagentConfig, config_path: str | None = None) -> bo
         if _node_sync_report.wedged:
             _node_sync_report.wedged = False
             log.info("node sync: the daemon's heartbeat is fresh again")
-        return True
+        return False
     if not _node_sync_report.wedged:
         _node_sync_report.wedged = True
         log.warning(
