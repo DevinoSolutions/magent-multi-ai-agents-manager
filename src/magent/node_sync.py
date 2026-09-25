@@ -399,6 +399,7 @@ class NodeSyncer:
         self._local_user = local_user
         self._lock_wait_s = lock_wait_s
         self._warned: set[tuple[str, str]] = set()
+        self._last: dict[str, str] = {}
 
     def reconfigure(self, config: MagentConfig) -> None:
         self._config = config
@@ -421,17 +422,46 @@ class NodeSyncer:
                 nick: ex.submit(self._sync_node, nick, by_nick.get(nick, {}), user)
                 for nick in pool
             }
-            return {nick: f.result() for nick, f in futures.items()}
+            results = {nick: f.result() for nick, f in futures.items()}
+        for nick, (outcome, detail) in results.items():
+            self._note(nick, outcome, detail)
+        return results
 
     def _sync_node(
         self, nick: str, entries: Mapping[str, NodeMapEntry], local_user: str
     ) -> tuple[str, str]:
+        """One node's pull, reduced to an outcome. Every failure a node (or its
+        config) can produce stops here; anything else is a bug and propagates."""
         try:
             node = nodes.node_for_nick(self._config, nick, local_user=local_user)
-            self._pull_and_store(node, entries)
+            with node_lock(nick, wait_s=self._lock_wait_s):
+                self._pull_and_store(node, entries)
+        except nodes.NodeConfigError as e:
+            return MISCONFIGURED, str(e)
+        except LockHeld:
+            return LOCKED, "another pull holds this node"
         except remote_mux.RemoteError as e:
             return _classify(e)
+        except OSError as e:
+            return FAILED, str(e)
         return OK, ""
+
+    def _note(self, nick: str, outcome: str, detail: str) -> None:
+        """One log line per state CHANGE: a node down for a day is one warning
+        and one "reachable again", not 2,880 lines. A locked tick is no state
+        (the other pull is doing the work) and is never logged."""
+        if outcome == LOCKED:
+            return
+        prev = self._last.get(nick)
+        self._last[nick] = outcome
+        if outcome == prev:
+            return
+        log = get_logger(LOG_NAME)
+        if outcome == OK:
+            if prev is not None:
+                log.info("node %s: reachable again", nick)
+            return
+        log.warning("node %s: %s (%s)", nick, outcome, detail)
 
     def _warn_once(self, nick: str, sid: str) -> None:
         if (nick, sid) in self._warned:

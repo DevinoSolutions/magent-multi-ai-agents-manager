@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from magent import agent_state, launch, node_sync, nodes
+from magent import agent_state, launch, node_sync, nodes, remote_mux
 from magent.config import (
     SCHEMA_VERSION,
     MagentConfig,
@@ -892,3 +892,122 @@ class TestOneTick:
         results = node_sync.NodeSyncer(_config()).tick()
         assert results["second"] == (node_sync.UNREACHABLE, REFUSED.strip())
         assert results["third"] == (node_sync.OK, "")
+
+
+def _node_warnings(caplog, nick: str) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "magent.nodes"
+        and r.levelno == logging.WARNING
+        and f"node {nick}:" in r.getMessage()
+    ]
+
+
+class TestANodeFailsAlone:
+    def test_an_unreachable_node_keeps_its_snapshot_while_the_other_advances(
+        self, placed, fake_ssh
+    ):
+        clock = iter([100.0, 100.0, 200.0, 200.0])
+        syncer = node_sync.NodeSyncer(_config(), now=lambda: next(clock))
+        _answer(fake_ssh, "devino-second")
+        _answer(fake_ssh, "devino-third")
+        syncer.tick()
+        _forget_replies(fake_ssh)
+        _answer(fake_ssh, "devino-second", rc=255, stderr=REFUSED)
+        _answer(fake_ssh, "devino-third")
+        results = syncer.tick()
+        assert results["second"][0] == node_sync.UNREACHABLE
+        assert nodes.read_sessions("second").ts == 100.0
+        assert nodes.read_sessions("third").ts == 200.0
+
+    def test_a_node_that_stays_down_is_logged_once_and_once_again_when_it_returns(
+        self, placed, fake_ssh, caplog
+    ):
+        _capture_nodes_log(caplog)
+        syncer = node_sync.NodeSyncer(_config())
+        _answer(fake_ssh, "devino-second", rc=255, stderr=REFUSED)
+        _answer(fake_ssh, "devino-third")
+        for _ in range(3):
+            syncer.tick()
+        _forget_replies(fake_ssh)
+        _answer(fake_ssh, "devino-second")
+        _answer(fake_ssh, "devino-third")
+        syncer.tick()
+        assert _node_warnings(caplog, "second") == [
+            f"node second: unreachable ({REFUSED.strip()})"
+        ]
+        assert [
+            r.getMessage()
+            for r in caplog.records
+            if "reachable again" in r.getMessage()
+        ] == ["node second: reachable again"]
+        assert not [r for r in caplog.records if r.getMessage().startswith("node call")]
+        assert _node_warnings(caplog, "third") == []
+
+    def test_a_hung_node_counts_as_unreachable_and_warns_once(
+        self, placed, fake_ssh, caplog, monkeypatch
+    ):
+        _capture_nodes_log(caplog)
+        monkeypatch.setattr(remote_mux, "PULL_TIMEOUT_S", 1.0)
+        cfg = _config(
+            pool={"second": POOL["second"]},
+            projects=[ProjectConfig(path="api", node="second")],
+        )
+        fake_ssh.set_mode("timeout")
+        syncer = node_sync.NodeSyncer(cfg)
+        assert syncer.tick() == {
+            "second": (node_sync.UNREACHABLE, "timed out after 1s")
+        }
+        syncer.tick()
+        assert _node_warnings(caplog, "second") == [
+            "node second: unreachable (timed out after 1s)"
+        ]
+        assert not [
+            r
+            for r in caplog.records
+            if r.getMessage().startswith("node call timed out")
+        ]
+
+    def test_a_node_that_answers_garbage_fails_alone(self, placed, fake_ssh):
+        fake_ssh.set_reply("devino-second", stdout="hello\n")
+        _answer(fake_ssh, "devino-third")
+        results = node_sync.NodeSyncer(_config()).tick()
+        assert results["second"] == (
+            node_sync.FAILED,
+            "no MAGENT-PULL header in the reply",
+        )
+        assert results["third"] == (node_sync.OK, "")
+
+    def test_a_missing_ssh_client_fails_every_node_without_raising(self, placed):
+        results = node_sync.NodeSyncer(_config()).tick()
+        assert results == {
+            "second": (node_sync.FAILED, "ssh client not found on PATH"),
+            "third": (node_sync.FAILED, "ssh client not found on PATH"),
+        }
+
+    def test_a_node_that_would_run_as_root_is_misconfigured_and_never_dialled(
+        self, placed, fake_ssh
+    ):
+        pool = {
+            "second": NodeConfig(nick="second", host="devino-second"),
+            "third": POOL["third"],
+        }
+        _answer(fake_ssh, "devino-third")
+        results = node_sync.NodeSyncer(_config(pool=pool), local_user="root").tick()
+        assert results["second"][0] == node_sync.MISCONFIGURED
+        assert "(D4)" in results["second"][1]
+        assert _calls_to(fake_ssh, "devino-second") == []
+
+    def test_a_node_being_pulled_elsewhere_is_skipped_silently(
+        self, placed, fake_ssh, caplog
+    ):
+        _capture_nodes_log(caplog)
+        _answer(fake_ssh, "devino-second")
+        _answer(fake_ssh, "devino-third")
+        with exclusive_lock("node-pull-second"):
+            results = node_sync.NodeSyncer(_config()).tick()
+        assert results["second"][0] == node_sync.LOCKED
+        assert results["third"] == (node_sync.OK, "")
+        assert _calls_to(fake_ssh, "devino-second") == []
+        assert _node_warnings(caplog, "second") == []
