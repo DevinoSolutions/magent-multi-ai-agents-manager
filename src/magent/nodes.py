@@ -255,10 +255,13 @@ class UserScope:
 
     def digests(self) -> dict[str, str]:
         """One content hash per shipped item; node_apply skips an item whose
-        hash matches its last successful run. Notes are not content."""
+        hash matches its last successful run. Notes are not content. The
+        skills digest is order-independent (sorted by path): the tarball
+        sorts its members, so the same files must hash the same however the
+        caller listed them."""
         skills = "".join(
             f"{f.path}\0{int(f.executable)}\0{hashlib.sha256(f.data).hexdigest()}\n"
-            for f in self.skills
+            for f in sorted(self.skills, key=lambda f: f.path)
         )
         return {
             "settings": _digest(self.settings),

@@ -874,6 +874,29 @@ def _canonical(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+# The characters a gh token may carry to be framed as the payload's first
+# line: gh's own token alphabet, nothing that could end the line early or be
+# read as the tarball's first byte. The same rule lands in F6's
+# local_gh_token (feat/nodes-F6 b50f6ad); the integrator unifies the two onto
+# one constant.
+GH_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]{20,255}")
+
+
+def _check_skill_path(path: str) -> None:
+    """ValueError unless ``path`` is a relative '/'-separated name that stays
+    under ``skills/`` once it is a tar member: not empty, not absolute, no
+    backslash or NUL, no empty, "." or ".." segment. Names the path, never
+    the file's bytes."""
+    if (
+        not path
+        or path.startswith("/")
+        or "\\" in path
+        or "\0" in path
+        or any(seg in {"", ".", ".."} for seg in path.split("/"))
+    ):
+        raise ValueError(f"skill file path {path!r} cannot be a payload member")
+
+
 def build_payload(
     scope: UserScope,
     *,
@@ -883,7 +906,19 @@ def build_payload(
 ) -> bytes:
     """What follows the sentinel on provision.sh's stdin: the gh token (or an
     empty line) and a gzip tar of the user scope + manifest. Deterministic --
-    identical input, identical bytes. The token is in the first line ONLY."""
+    identical input, identical bytes. The token is in the first line ONLY.
+
+    It owns its framing: ValueError for a token outside
+    ``GH_TOKEN_PATTERN``, for a token without a login, and for a skill path
+    that could name a member outside ``skills/``. No message quotes the
+    token."""
+    if gh_token:
+        if not GH_TOKEN_PATTERN.fullmatch(gh_token):
+            raise ValueError("gh token has characters the payload cannot frame")
+        if gh_login is None:
+            raise ValueError("gh token without a gh login: pass both or neither")
+    for f in scope.skills:
+        _check_skill_path(f.path)
     entries = state_hook_entries()
     digests = scope.digests()
     digests["gh"] = _sha(f"{gh_login}\n{gh_token}") if gh_token else ""
@@ -891,6 +926,11 @@ def build_payload(
     manifest = {
         "version": PAYLOAD_VERSION,
         "digests": digests,
+        # DEFERRED (13c7ef5's "applier" digest, tri-F ruling 2): the hash of
+        # node_apply.py itself, so a magent upgrade that changes the merge
+        # logic invalidates what the node recorded. Not ported: node_apply
+        # reads no such field, and an unread digest pins nothing. It lands
+        # with a node_apply consumer (e.g. clear the store on a change).
         "gh_login": gh_login if gh_token else None,
         "plugins": list(scope.plugins),
         "marketplaces": scope.marketplaces,

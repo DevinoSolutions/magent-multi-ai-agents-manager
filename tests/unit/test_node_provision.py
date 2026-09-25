@@ -1979,6 +1979,8 @@ class TestThePayload:
         assert data["node_apply.py"].decode("utf-8") == node_scripts.source(
             "node_apply.py"
         )
+        # The node's python3 runs it; a CRLF checkout must still ship LF.
+        assert b"\r" not in data["node_apply.py"]
 
     def test_the_manifest_carries_the_digests_and_what_to_install(self):
         scope = _scope(plugins=("p@mkt",), marketplaces={"mkt": "owner/mkt"})
@@ -2023,6 +2025,88 @@ class TestThePayload:
         holders = [name for name, blob in data.items() if bearer.encode() in blob]
         assert holders == ["mcp_servers.json"]
         assert infos["mcp_servers.json"].mode == 0o600
+
+
+def _two_skills(*, reverse: bool = False) -> UserScope:
+    skills = (
+        nodes.SkillFile(path="a/run.sh", data=b"#!run", executable=True),
+        nodes.SkillFile(path="b/SKILL.md", data=b"# skill", executable=False),
+    )
+    return _scope(skills=skills[::-1] if reverse else skills)
+
+
+class TestThePayloadIsDeterministic:
+    def test_the_gzip_header_carries_no_name_and_no_time(self):
+        _, _, body = _payload().partition(b"\n")
+        assert body[:2] == b"\x1f\x8b"
+        assert body[3] == 0  # FLG: no FNAME, no FEXTRA, no FCOMMENT
+        assert body[4:8] == b"\0\0\0\0"  # MTIME
+
+    def test_every_member_is_a_plain_file_stamped_zero_in_name_order(self):
+        _, infos, _ = _unpack(_payload(_two_skills()))
+        names = list(infos)
+        assert names == sorted(names)
+        for name, info in infos.items():
+            assert info.isreg(), name
+            assert (info.mtime, info.uid, info.gid, info.uname, info.gname) == (
+                0,
+                0,
+                0,
+                "",
+                "",
+            ), name
+            expected = 0o700 if name in {"state-hook.sh", "skills/a/run.sh"} else 0o600
+            assert info.mode == expected, name
+
+    def test_the_skill_order_given_does_not_change_the_bytes(self):
+        forward = _payload(_two_skills())
+        backward = _payload(_two_skills(reverse=True))
+        _, _, before = _unpack(forward)
+        _, _, after = _unpack(backward)
+        assert before["manifest.json"] == after["manifest.json"]
+        assert forward == backward
+
+
+class TestThePayloadOwnsItsFraming:
+    @pytest.mark.parametrize(
+        "token",
+        [
+            TOKEN + "\n__MAGENT_PAYLOAD__",
+            TOKEN + " x",
+            TOKEN + "\0",
+            "gho-" + "a" * 30,
+            "short_token",
+            "a" * 256,
+        ],
+    )
+    def test_a_token_the_first_line_cannot_carry_is_refused(self, token):
+        with pytest.raises(ValueError, match="cannot frame") as exc:
+            _payload(token=token)
+        assert token not in str(exc.value)
+        assert TOKEN not in str(exc.value)
+
+    def test_the_longest_and_shortest_token_still_frame(self):
+        for token in ("a" * 20, "b" * 255):
+            head, _, _ = _unpack(_payload(token=token))
+            assert head == token
+
+    def test_a_token_without_a_login_is_refused(self):
+        with pytest.raises(ValueError, match="both or neither") as exc:
+            _payload(token=TOKEN, login=None)
+        assert TOKEN not in str(exc.value)
+
+    @pytest.mark.parametrize(
+        "path", ["../../.bashrc", "/etc/x", "a/./b", "a//b", "a\\b", "", "a\0b", "a/"]
+    )
+    def test_a_skill_path_that_escapes_skills_is_refused(self, path):
+        secret = b"SKILL-BYTES-DECOY"
+        scope = _scope(
+            skills=(nodes.SkillFile(path=path, data=secret, executable=False),)
+        )
+        with pytest.raises(ValueError, match="cannot be a payload member") as exc:
+            _payload(scope)
+        assert repr(path) in str(exc.value)
+        assert secret.decode() not in str(exc.value)
 
 
 # The node scripts run under the pool's bash, on Linux. macOS ships bash 3.2
