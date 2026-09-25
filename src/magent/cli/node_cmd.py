@@ -11,16 +11,21 @@ from __future__ import annotations
 
 import sys
 import time
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import click
 
-from magent import log
+from magent import env, log, nodes
 from magent.cli.app import main
 from magent.cli.config_io import _load_config_or_exit
 from magent.lockfile import LockHeld
 from magent.paths import find_config
 from magent.style import style
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from magent.config import MagentConfig
 
 # How long `node sync -d` waits for the detached child to record its pid.
 _START_POLLS = 20
@@ -32,9 +37,54 @@ _START_POLL_S = 0.1
 def node_group(ctx: click.Context) -> None:
     """Run projects on a pool of Linux machines over ssh."""
     if ctx.invoked_subcommand is None:
-        # A bare `magent node` has nothing to show yet: the node table (load,
-        # sessions, sync state) arrives with sub-plan G and fills this branch.
+        _print_node_table(find_config(ctx.obj.get("config_path")))
+
+
+def _table_row(cells: list[str], widths: list[int]) -> str:
+    """Left-aligned cells; a width of 0 leaves the last column unpadded."""
+    return "  " + "  ".join(
+        cell.ljust(width) if width else cell
+        for cell, width in zip(cells, widths, strict=True)
+    )
+
+
+def _node_rows(cfg: MagentConfig, *, now: float) -> list[list[str]]:
+    daemon = _daemon_state()
+    local_user = env.local_username()
+    rows: list[list[str]] = []
+    for nick, conf in cfg.settings.nodes.items():
+        window = nodes.in_window(nodes.read_load_history(nick), now=now)
+        score = nodes.score_node(nick, window)
+        load, mem, mine = "no data", "-", "-"
+        if score is not None:
+            load = f"{score.p75:.2f} ({score.samples})"
+            latest = max(window, key=lambda s: s.ts)
+            mine = str(latest.my_sessions)
+            if latest.mem_total_mb > 0:
+                mem = f"{latest.mem_avail_mb / latest.mem_total_mb:.0%} free"
+        rows.append([nick, conf.host, conf.user or local_user, load, mem, mine, daemon])
+    return rows
+
+
+def _print_node_table(config_file: Path) -> None:
+    """``magent node``: the pool at a glance -- the same history placement
+    reads (load p75 over 30 minutes), newest memory and session count, and
+    whether the sync daemon that feeds it is alive. Reads only."""
+    cfg = _load_config_or_exit(config_file)
+    if not cfg.settings.nodes:
+        click.echo(
+            f"  {style('-', dim=True)} no nodes configured -- add one under"
+            " settings.nodes, then run: magent node setup <nick>"
+        )
         return
+    headers = ["nick", "host", "user", "load p75 30m", "mem", "my sessions", "daemon"]
+    rows = _node_rows(cfg, now=time.time())
+    widths = [max(len(r[i]) for r in [headers, *rows]) for i in range(len(headers))]
+    widths[-1] = 0
+    click.echo()
+    click.echo(style(_table_row(headers, widths), bold=True))
+    for row in rows:
+        click.echo(_table_row(row, widths))
 
 
 def _daemon_state() -> Literal["ok", "stale", "stopped"]:
