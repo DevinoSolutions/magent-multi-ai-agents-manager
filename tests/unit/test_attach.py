@@ -2332,6 +2332,28 @@ _BARE_WT_ARGV = [
 ]
 # Where the pane command starts inside a wt argv: after `--`.
 _PANE = _SUPERVISED_WT_ARGV.index("--") + 1
+# The node analogue of _SUPERVISED_WT_ARGV: the whole wt line a tmux pane for
+# session "api" on "amin@devino-second" opens, hand-written byte for byte
+# rather than derived, so a drift in the exact-target attach form, the `--mux`
+# position or the title lock is a diff against one literal.
+_SUPERVISED_TMUX_WT_ARGV = [
+    "wt",
+    "-w",
+    "new",
+    "--title",
+    "magent:api",
+    "--suppressApplicationTitle",
+    "--",
+    _FAKE_SUPERVISOR,
+    "--target",
+    "amin@devino-second",
+    "--session",
+    "api",
+    "--remote",
+    "tmux -L magent attach -t '=api'",
+    "--mux",
+    "tmux",
+]
 
 
 class TestTodaysAttachShapesArePinned:
@@ -2426,23 +2448,16 @@ class TestTmuxPaneCommand:
         # --mux at all, so it stays byte-identical to what shipped.
         from magent import attach_client
 
-        assert attach_client.pane_command(
-            "amin@devino-second",
-            "api",
-            _FAKE_SUPERVISOR,
-            mux="tmux",
-            remote=self._TMUX_REMOTE,
-        ) == [
-            _FAKE_SUPERVISOR,
-            "--target",
-            "amin@devino-second",
-            "--session",
-            "api",
-            "--remote",
-            self._TMUX_REMOTE,
-            "--mux",
-            "tmux",
-        ]
+        assert (
+            attach_client.pane_command(
+                "amin@devino-second",
+                "api",
+                _FAKE_SUPERVISOR,
+                mux="tmux",
+                remote=self._TMUX_REMOTE,
+            )
+            == _SUPERVISED_TMUX_WT_ARGV[_PANE:]
+        )
 
     def test_a_bare_node_pane_is_the_same_ssh_with_the_tmux_command(self):
         # Derived from the ONE hand-written bare literal: `[_PANE:-2]` is ssh,
@@ -2536,23 +2551,22 @@ class TestSpawnAttachWindow:
         self, monkeypatch
     ):
         _pid, argv = self._spawn(monkeypatch, "amin@devino-second", "api", mux="tmux")
+        assert argv == _SUPERVISED_TMUX_WT_ARGV
+
+    def test_a_node_window_without_reconnect_is_the_bare_ssh_tmux_pane(
+        self, monkeypatch
+    ):
+        # The wt prefix and ssh options come from the ONE hand-written bare
+        # literal (an SSH_CONNECTION_OPTS change stays a one-literal edit);
+        # only the target and the tmux attach are node-specific. No `--mux`:
+        # there is no supervisor to tell.
+        _pid, argv = self._spawn(
+            monkeypatch, "amin@devino-second", "api", mux="tmux", reconnect=False
+        )
         assert argv == [
-            "wt",
-            "-w",
-            "new",
-            "--title",
-            "magent:api",
-            "--suppressApplicationTitle",
-            "--",
-            _FAKE_SUPERVISOR,
-            "--target",
+            *_BARE_WT_ARGV[:-2],
             "amin@devino-second",
-            "--session",
-            "api",
-            "--remote",
             "tmux -L magent attach -t '=api'",
-            "--mux",
-            "tmux",
         ]
 
     def test_an_explicit_remote_reaches_the_pane_verbatim(self, monkeypatch):
