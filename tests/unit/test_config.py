@@ -429,3 +429,23 @@ class TestGenerateConfig:
         assert len(config["projects"]) == 2
         assert config["layout"]["columns"] == 2
         assert config["settings"]["defaultTool"] == "claude"
+
+
+class TestTheOneNodeSkipPredicate:
+    """DECISION-15/22: cloud projects are LOCAL panes, so "runs on a node"
+    is never a bare truthiness test on ``node``."""
+
+    @pytest.mark.parametrize(
+        ("node", "cloud", "on_node"),
+        [
+            (None, False, False),
+            ("cloud", True, False),
+            ("second", False, True),
+            ("auto", False, True),
+        ],
+    )
+    def test_is_cloud_and_runs_on_node(self, node, cloud, on_node):
+        from magent.config import ProjectConfig, is_cloud, runs_on_node
+
+        proj = ProjectConfig(path="C:/a/api", node=node)
+        assert (is_cloud(proj), runs_on_node(proj)) == (cloud, on_node)

@@ -1278,3 +1278,199 @@ class TestRecipeFor:
         )
         assert recipe.repos[0].url == url
         assert recipe.warnings == ()
+
+
+D_NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
+
+
+def _pool_config(*projects: ProjectConfig) -> MagentConfig:
+    return MagentConfig(
+        projects=list(projects),
+        settings=Settings(
+            nodes={
+                "second": NodeConfig(nick="second", host="devino-second", user="amin"),
+                "third": NodeConfig(nick="third", host="devino-third", user="amin"),
+            }
+        ),
+    )
+
+
+def _git_state(
+    path: Path,
+    *,
+    url: str = "git@github.com:me/api.git",
+    branch: str = "main",
+    dirty: bool = False,
+    unpushed: bool = False,
+    detached: bool = False,
+) -> LocalGitState:
+    # Not B's `_state(path, ignored)` -- that helper already exists in this file.
+    return LocalGitState(
+        path=path,
+        url=url,
+        branch=branch,
+        dirty=dirty,
+        unpushed=unpushed,
+        detached=detached,
+    )
+
+
+class TestANodeProjectIsNamedLikeALocalOne:
+    def test_the_title_wins_over_the_folder(self):
+        proj = ProjectConfig(path="C:/src/api-service", title="API", node="second")
+        assert nodes.project_name(proj) == "API"
+
+    def test_without_a_title_the_folder_leaf_names_it(self):
+        proj = ProjectConfig(path="C:/src/api-service", node="second")
+        assert nodes.project_name(proj) == "api-service"
+
+    def test_the_session_id_is_the_local_sanitizer_applied_to_that_name(self):
+        proj = ProjectConfig(path="C:/src/x", title="My App.v2", node="second")
+        assert nodes.node_sid(proj) == "My-App-v2"
+
+
+class TestWhichProjectsRunOnANode:
+    def test_only_enabled_non_ide_projects_pinned_to_a_pool_node_or_auto(self):
+        keep = ProjectConfig(path="C:/a/api", node="second")
+        auto = ProjectConfig(path="C:/a/web", node="auto")
+        config = _pool_config(
+            keep,
+            ProjectConfig(path="C:/a/local"),
+            ProjectConfig(path="C:/a/cloudy", node="cloud"),
+            ProjectConfig(path="C:/a/off", node="second", enabled=False),
+            ProjectConfig(path="C:/a/ide", node="second", tool="code"),
+            auto,
+        )
+        assert nodes.node_projects(config) == [keep, auto]
+
+    def test_a_group_filter_is_case_insensitive(self):
+        a = ProjectConfig(path="C:/a/api", node="second", group="Work")
+        b = ProjectConfig(path="C:/a/web", node="second", group="home")
+        assert nodes.node_projects(_pool_config(a, b), group="work") == [a]
+
+    def test_a_second_entry_with_the_same_session_id_is_dropped(self):
+        a = ProjectConfig(path="C:/a/api", node="second")
+        dup = ProjectConfig(path="C:/b/api", node="third")
+        assert nodes.node_projects(_pool_config(a, dup)) == [a]
+
+
+class TestWhereTheProjectLandsOnTheNode:
+    def test_the_remote_folder_is_the_root_plus_the_local_folder_name(self):
+        assert nodes.remote_root_for(D_NODE, Path("C:/src/api")) == "~/magent/api"
+
+    def test_a_trailing_slash_on_the_root_does_not_double(self):
+        node = dataclasses.replace(D_NODE, root="~/magent/")
+        assert nodes.remote_root_for(node, Path("C:/src/api")) == "~/magent/api"
+
+    def test_a_drive_root_is_refused_not_placed_at_the_node_root(self, tmp_path):
+        # A nameless folder would land AT the node's root, beside every other
+        # project -- never a project directory of its own. The anchor is this
+        # OS's own root (``C:\`` here, ``/`` on POSIX): on POSIX ``Path("C:/")``
+        # is a relative folder NAMED ``C:``, not a root.
+        for root in (Path("/"), Path(tmp_path.anchor)):
+            assert root.name == ""
+            with pytest.raises(
+                NodeConfigError, match="a drive root cannot be a node project"
+            ):
+                nodes.remote_root_for(D_NODE, root)
+
+    @pytest.mark.parametrize(
+        ("path", "expected"),
+        [
+            ("~", "/home/amin"),
+            ("~/magent/api", "/home/amin/magent/api"),
+            ("/srv/work/api", "/srv/work/api"),
+        ],
+    )
+    def test_a_tilde_expands_against_the_nodes_home(self, path, expected):
+        assert nodes.absolute_remote(path, "/home/amin") == expected
+
+    def test_recipe_for_carries_the_local_root_and_the_folder_name_rule(self, tmp_path):
+        project_dir = tmp_path / "api-service"
+        project_dir.mkdir()
+        proj = ProjectConfig(path=str(project_dir), title="API", node="second")
+        recipe = nodes.recipe_for(
+            proj,
+            D_NODE,
+            [_git_state(project_dir)],
+            home=tmp_path / "home",
+            project_dir=project_dir,
+        )
+        assert recipe.local_root == project_dir
+        assert recipe.remote_root == "~/magent/api-service"
+        assert recipe.sid == "API"
+        # C1's other three fields are launch.node_recipe's to fill.
+        assert (recipe.tool, recipe.command, recipe.fresh_command) == ("", "", None)
+
+
+def _recipe_at(project: str, remote_root: str) -> Recipe:
+    return Recipe(
+        project=project,
+        sid=psmux.session_name(project),
+        repos=(),
+        push_files=(),
+        memory_dir=None,
+        remote_root=remote_root,
+    )
+
+
+class TestTwoProjectsNeverShareANodeFolder:
+    """Two local folders with the same leaf name (``C:/a/api``, ``C:/b/api``)
+    would both land at ``<root>/api`` -- one clone overwriting the other."""
+
+    def test_distinct_remote_roots_pass(self):
+        nodes.assert_distinct_remote_roots(
+            [_recipe_at("api", "~/magent/api"), _recipe_at("web", "~/magent/web")]
+        )
+
+    def test_no_recipes_pass(self):
+        nodes.assert_distinct_remote_roots([])
+
+    def test_a_shared_remote_root_names_both_projects_and_the_folder(self):
+        recipes = [
+            _recipe_at("API", "~/magent/api"),
+            _recipe_at("web", "~/magent/web"),
+            _recipe_at("api-b", "~/magent/api"),
+        ]
+        with pytest.raises(NodeConfigError) as caught:
+            nodes.assert_distinct_remote_roots(recipes)
+        text = str(caught.value)
+        assert "'API'" in text
+        assert "'api-b'" in text
+        assert "~/magent/api" in text
+
+
+class TestTheRefusalNamesTheFix:
+    """D7: a tree the node could not reproduce is refused, and the text says
+    exactly what to run. magent never runs it for the user."""
+
+    def test_a_clean_pushed_tree_is_not_refused(self, tmp_path):
+        assert nodes.refusal_for(_git_state(tmp_path)) is None
+
+    def test_no_origin_is_refused_even_with_allow_dirty(self, tmp_path):
+        text = nodes.refusal_for(_git_state(tmp_path, url=""), allow_dirty=True)
+        assert text is not None
+        assert "no 'origin' remote" in text
+
+    def test_a_detached_head_is_refused_even_with_allow_dirty(self, tmp_path):
+        text = nodes.refusal_for(
+            _git_state(tmp_path, detached=True, branch=""), allow_dirty=True
+        )
+        assert text is not None
+        assert "git switch <branch>" in text
+
+    def test_a_dirty_tree_names_allow_dirty(self, tmp_path):
+        text = nodes.refusal_for(_git_state(tmp_path, dirty=True))
+        assert text is not None
+        assert "dirty" in text
+        assert "--allow-dirty" in text
+
+    def test_unpushed_commits_name_the_exact_push(self, tmp_path):
+        text = nodes.refusal_for(_git_state(tmp_path, unpushed=True, branch="feat/x"))
+        assert text is not None
+        assert "git push -u origin feat/x" in text
+        assert "--allow-dirty" in text
+
+    def test_allow_dirty_lets_dirty_and_unpushed_through(self, tmp_path):
+        state = _git_state(tmp_path, dirty=True, unpushed=True)
+        assert nodes.refusal_for(state, allow_dirty=True) is None

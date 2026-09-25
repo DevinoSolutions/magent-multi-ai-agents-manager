@@ -21,8 +21,9 @@ from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
-from magent.config import NODE_AUTO, NODE_CLOUD
+from magent.config import NODE_AUTO, NODE_CLOUD, runs_on_node
 from magent.psmux import session_name
+from magent.sessions import is_ide_tool
 from magent.sessions.claude import encode_claude_project_path
 from magent.titles import get_leaf_name
 
@@ -102,6 +103,14 @@ class Recipe:
     memory_dir: Path | None
     remote_root: str
     warnings: tuple[str, ...] = ()
+    # PR-D (C1): what the node backend needs beyond the §3 tuple. Defaulted, so
+    # every construction that predates it still compiles. recipe_for sets
+    # local_root (push_files ship relative to it); launch.node_recipe fills the
+    # command fields from settings.tools, which this pure module never reads.
+    local_root: Path | None = None
+    tool: str = ""
+    command: str = ""
+    fresh_command: str | None = None
 
 
 @dataclass(frozen=True)
@@ -657,6 +666,113 @@ def _without_userinfo_secret(url: str) -> str | None:
     return f"{scheme}://{host}{rest}"
 
 
+def project_name(proj: ProjectConfig) -> str:
+    """The name a project goes by: its title, else its folder's leaf name. The
+    node map's key, and -- sanitized -- its session id. One function, so the
+    map, the sid and ``recipe_for`` can never disagree about a project."""
+    return proj.title or get_leaf_name(proj.path)
+
+
+def node_sid(proj: ProjectConfig) -> str:
+    """The tmux session id of ``proj`` on its node: the same sanitizer every
+    local session uses, so a node session and its window share one name."""
+    return session_name(project_name(proj))
+
+
+def node_projects(
+    config: MagentConfig, group: str | None = None
+) -> list[ProjectConfig]:
+    """The enabled projects that run on a pool node (pinned or ``auto``), in
+    config order, one per session id. Cloud projects are not pool projects, and
+    an IDE project stays on this PC (there is no agent to host). The group
+    filter matches ``psmux.eligible_projects``': case-insensitive."""
+    out: list[ProjectConfig] = []
+    seen: set[str] = set()
+    for proj in config.projects:
+        if not proj.enabled or not runs_on_node(proj):
+            continue
+        if group and (not proj.group or proj.group.lower() != group.lower()):
+            continue
+        if is_ide_tool(proj.tool or config.settings.default_tool):
+            continue
+        sid = node_sid(proj)
+        if sid in seen:
+            continue
+        seen.add(sid)
+        out.append(proj)
+    return out
+
+
+def remote_root_for(node: Node, project_dir: Path) -> str:
+    """Where ``project_dir`` lives on ``node``: the node's root plus the local
+    folder's NAME (never its path). ``~`` stays unexpanded; see
+    ``absolute_remote``. A folder with no name -- a drive root such as ``C:\\``
+    or ``/`` -- is refused: it would land AT the node's root, among every other
+    project's folder."""
+    if not project_dir.name:
+        raise NodeConfigError(f"{project_dir}: a drive root cannot be a node project")
+    return f"{node.root.rstrip('/')}/{project_dir.name}"
+
+
+def assert_distinct_remote_roots(recipes: Sequence[Recipe]) -> None:
+    """Raise NodeConfigError if two of ``recipes`` land in one node folder.
+
+    ``remote_root_for`` keys on the local folder's leaf name, so ``C:/a/api``
+    and ``C:/b/api`` both become ``<root>/api`` -- one clone would overwrite
+    the other. Names BOTH projects and the shared folder. Pure; the caller is
+    placement (a later PR-D task), which checks a batch before any bring-up."""
+    held: dict[str, Recipe] = {}
+    for recipe in recipes:
+        first = held.setdefault(recipe.remote_root, recipe)
+        if first is not recipe:
+            raise NodeConfigError(
+                f"projects {first.project!r} and {recipe.project!r} would share "
+                f"the node folder {recipe.remote_root}; a node folder is named "
+                "after the local folder, so rename one of them"
+            )
+
+
+def absolute_remote(path: str, home: str) -> str:
+    """``path`` with a leading ``~`` expanded against the node's ``home`` (what
+    ``printenv HOME`` said there). The node's shell would expand it too, but a
+    path that crosses as an argument or into JSON must already be absolute."""
+    if path == "~":
+        return home
+    if path.startswith("~/"):
+        return f"{home.rstrip('/')}/{path[2:]}"
+    return path
+
+
+def refusal_for(state: LocalGitState, *, allow_dirty: bool = False) -> str | None:
+    """Why ``state``'s repo cannot be reproduced on a node, naming the fix; or
+    None. D7: magent never runs the fix. ``allow_dirty`` accepts a dirty or
+    unpushed tree (the node gets origin's copy); it cannot conjure an origin
+    or a branch, so those two are refused regardless."""
+    if not state.url:
+        return (
+            f"{state.path}: no 'origin' remote; the node clones from origin -- "
+            "add one and push"
+        )
+    if state.detached:
+        return (
+            f"{state.path}: HEAD is detached; the node checks out a branch -- "
+            "run git switch <branch> first"
+        )
+    if allow_dirty:
+        return None
+    if state.dirty:
+        return (
+            f"{state.path}: uncommitted changes (dirty tree) would not be on the "
+            "node; commit and push them, or pass --allow-dirty"
+        )
+    if state.unpushed:
+        return (
+            f"{state.path}: branch {state.branch} has commits not on origin; run "
+            f"git push -u origin {state.branch}, or pass --allow-dirty"
+        )
+    return None
+
+
 def recipe_for(
     proj: ProjectConfig,
     node: Node,
@@ -677,8 +793,8 @@ def recipe_for(
     share one name. Repo placement is judged on RESOLVED paths, like
     ``push_set``: a project configured as a junction/symlink to its repo is
     still that repo; a path that will not resolve is a NodeConfigError."""
-    project = proj.title or get_leaf_name(proj.path)
-    remote_root = f"{node.root.rstrip('/')}/{project_dir.name}"
+    project = project_name(proj)
+    remote_root = remote_root_for(node, project_dir)
     root = _resolved(project_dir)
     repos: list[RepoSpec] = []
     repo_warnings: list[str] = []
@@ -730,4 +846,5 @@ def recipe_for(
         memory_dir=memory if memory.is_dir() else None,
         remote_root=remote_root,
         warnings=(*repo_warnings, *push_warned),
+        local_root=project_dir,
     )
