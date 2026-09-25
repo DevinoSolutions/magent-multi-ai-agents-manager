@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 from typing import TYPE_CHECKING
 
 import pytest
@@ -1698,7 +1699,7 @@ class TestSetupNode:
             )
 
 
-DOCTOR_TOOLS = ("bash", "awk", "dirname", "head", "wc")
+DOCTOR_TOOLS = ("bash", "awk", "dirname", "head", "wc", "timeout")
 NODE_TOOLS = ("tmux", "git", "claude", "python3", "gh", "ssh", "locale", "df")
 GIB_KB = 1024 * 1024
 HI = "Hi amin! You've successfully authenticated, but GitHub does not provide shell access."
@@ -1714,6 +1715,17 @@ DOCTOR_ITEMS = (
     "disk",
     "sessions",
 )
+
+
+# The four probes doctor.sh bounds with `timeout`, as (fake, argv match). A
+# hung one sleeps past every bound, and past the whole call's before the fix.
+HUNG_PROBES = {
+    "tmux": ("tmux", "list-sessions"),
+    "claude": ("claude", "auth status"),
+    "ssh": ("ssh", "git@github.com"),
+    "df": ("df", "-Pk"),
+}
+HANG_S = 30.0
 
 
 def _df(avail_kb: int) -> str:
@@ -1732,10 +1744,16 @@ def _doctor_box(
     charmap: str = "UTF-8",
     avail_kb: int = 50 * GIB_KB,
     tmux_version: str = "tmux 3.4",
+    hang: str | None = None,
 ) -> tuple[dict[str, FakeSsh], dict[str, str]]:
     """A node user's home and a PATH of fakes answering like a healthy node,
-    except where a keyword says otherwise."""
+    except where a keyword says otherwise. ``hang`` names one bounded probe
+    (a ``HUNG_PROBES`` key) whose call never answers."""
     fakes = {name: make_fake_ssh(tmp_path, name=name) for name in tools}
+    if hang is not None:
+        # Registered first: the first matching reply wins.
+        name, match = HUNG_PROBES[hang]
+        fakes[name].set_reply(match, hang_s=HANG_S)
     replies = {
         "tmux": [
             ("-V", tmux_version + "\n"),
@@ -2020,10 +2038,62 @@ class TestDoctorShUnderRealBash:
         )
         assert all(c.stdin == b"" for f in fakes.values() for c in f.calls())
 
+    @pytest.mark.parametrize(
+        ("hang", "item", "status", "bound_s", "detail"),
+        [
+            (
+                "tmux",
+                "sessions",
+                "warn",
+                4,
+                f"tmux server on socket {remote_mux.SOCKET} did not answer in 4s",
+            ),
+            (
+                "claude",
+                "claude-login",
+                "warn",
+                8,
+                "claude auth status did not answer in 8s",
+            ),
+            ("ssh", "github-key", "fail", 12, "ssh to github.com timed out after 12s"),
+            ("df", "disk", "warn", 4, "df did not answer in 4s under ~/magent"),
+        ],
+    )
+    def test_a_hung_probe_is_its_own_row_inside_the_budget(
+        self, tmp_path, hang, item, status, bound_s, detail
+    ):
+        # One stuck probe must not cost the whole report: its own `timeout`
+        # ends it, it becomes its own row, and every other check still runs.
+        _, env = _doctor_box(tmp_path, hang=hang)
+        start = time.monotonic()
+        r = _run_doctor(env)
+        elapsed = time.monotonic() - start
+        assert r.returncode == 0, r.stderr
+        assert elapsed < bound_s + 2 + 5  # the bound, the kill grace, slack
+        assert _rows(r) == {**dict.fromkeys(DOCTOR_ITEMS, "ok"), item: status}
+        (row,) = [ln for ln in _report(r).lines if ln.item == item]
+        assert row.detail == detail
+
 
 def test_doctor_inlines_the_tmux_floor():
     # One predicate for setup, doctor and (by DECISION-22) bring_up's floor.
     assert "magent_tmux_verdict()" in node_scripts.script("doctor")
+
+
+def test_the_probe_bounds_fit_inside_the_doctor_call():
+    # Every bounded probe hanging at once, each killed after its grace, still
+    # leaves the report time to come back over ssh (connect included).
+    text = node_scripts.script("doctor")
+    bounds = dict(re.findall(r"^([A-Z]+_PROBE_S)=(\d+)$", text, re.MULTILINE))
+    assert set(bounds) == {
+        "CLAUDE_PROBE_S",
+        "GITHUB_PROBE_S",
+        "TMUX_PROBE_S",
+        "DF_PROBE_S",
+    }
+    (grace,) = re.findall(r"^PROBE_KILL_S=(\d+)\b", text, re.MULTILINE)
+    worst = sum(int(b) + int(grace) for b in bounds.values())
+    assert worst + remote_mux.CONNECT_TIMEOUT_S < remote_mux.DOCTOR_TIMEOUT_S
 
 
 class TestTheSocketIsAnArgumentNeverADefault:

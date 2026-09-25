@@ -11,7 +11,27 @@ set -uo pipefail
 
 GIB_KB=1048576  # df -Pk reports KiB
 
+# A probe that can stall -- a token refresh, a DNS lookup, a wedged tmux
+# server, a hung mount -- runs under its OWN time limit, so one stuck probe
+# is one row, never the whole report lost to remote_mux.DOCTOR_TIMEOUT_S
+# (which covers all four hanging at once; pinned by test).
+CLAUDE_PROBE_S=8
+GITHUB_PROBE_S=12
+TMUX_PROBE_S=4
+DF_PROBE_S=4
+PROBE_KILL_S=2  # a probe that ignores TERM gets KILL this much later
+
 say() { printf '%s\t%s\t%s\n' "$1" "$2" "${3:-}"; }
+
+# bounded <seconds> <argv...>: argv under its own time limit.
+bounded() {
+  local seconds=$1
+  shift
+  timeout -k "$PROBE_KILL_S" "$seconds" "$@"
+}
+
+# timed_out <rc>: did a bounded probe run out of time (TERM 124, KILL 137)?
+timed_out() { [ "$1" -eq 124 ] || [ "$1" -eq 137 ]; }
 
 # check_tool <name> <status when missing> <version argv...>
 check_tool() {
@@ -40,13 +60,16 @@ check_tmux() {
 }
 
 check_claude_login() {
-  local target=$1 out
+  local target=$1 out rc
   if ! command -v claude >/dev/null 2>&1; then
     say skip claude-login "claude is not installed"
     return
   fi
-  out=$(claude auth status --json 2>/dev/null) || true
-  if [[ $out =~ \"loggedIn\"[[:space:]]*:[[:space:]]*true ]]; then
+  out=$(bounded "$CLAUDE_PROBE_S" claude auth status --json 2>/dev/null)
+  rc=$?
+  if timed_out "$rc"; then
+    say warn claude-login "claude auth status did not answer in ${CLAUDE_PROBE_S}s"
+  elif [[ $out =~ \"loggedIn\"[[:space:]]*:[[:space:]]*true ]]; then
     say ok claude-login "logged in"
   else
     say fail claude-login "Claude Code is not logged in here -- run once: ssh $target claude"
@@ -54,10 +77,13 @@ check_claude_login() {
 }
 
 check_github_key() {
-  local out
-  out=$(ssh -T -o BatchMode=yes -o ConnectTimeout=10 \
-    -o StrictHostKeyChecking=accept-new git@github.com 2>&1) || true
-  if [[ $out =~ Hi\ ([^!]+)! ]]; then
+  local out rc
+  out=$(bounded "$GITHUB_PROBE_S" ssh -T -o BatchMode=yes -o ConnectTimeout=10 \
+    -o StrictHostKeyChecking=accept-new git@github.com 2>&1)
+  rc=$?
+  if timed_out "$rc"; then
+    say fail github-key "ssh to github.com timed out after ${GITHUB_PROBE_S}s"
+  elif [[ $out =~ Hi\ ([^!]+)! ]]; then
     say ok github-key "authenticates as ${BASH_REMATCH[1]}"
   else
     say fail github-key "GitHub refused this node's key (${out##*$'\n'}) -- run: magent node setup"
@@ -75,12 +101,18 @@ check_locale() {
 }
 
 check_disk() {
-  local root=$1 dir avail
+  local root=$1 dir out rc avail
   dir=${root/#\~/$HOME}
   while [ ! -d "$dir" ] && [ "$dir" != / ] && [ "$dir" != . ]; do
     dir=$(dirname "$dir")
   done
-  avail=$(df -Pk "$dir" 2>/dev/null | awk 'NR == 2 {print $4}') || avail=""
+  out=$(bounded "$DF_PROBE_S" df -Pk "$dir" 2>/dev/null)
+  rc=$?
+  if timed_out "$rc"; then
+    say warn disk "df did not answer in ${DF_PROBE_S}s under $root"
+    return
+  fi
+  avail=$(printf '%s\n' "$out" | awk 'NR == 2 {print $4}')
   if ! [[ $avail =~ ^[0-9]+$ ]]; then
     say warn disk "could not read the free space under $root"
   elif [ "$avail" -lt "$GIB_KB" ]; then
@@ -93,8 +125,15 @@ check_disk() {
 }
 
 check_sessions() {
-  local n
-  n=$(tmux -L "$MAGENT_SOCKET" list-sessions 2>/dev/null | wc -l) || n=0
+  local out rc n=0
+  out=$(bounded "$TMUX_PROBE_S" tmux -L "$MAGENT_SOCKET" list-sessions 2>/dev/null)
+  rc=$?
+  if timed_out "$rc"; then
+    say warn sessions "tmux server on socket $MAGENT_SOCKET did not answer in ${TMUX_PROBE_S}s"
+    return
+  fi
+  # No server yet (tmux exits 1, silent) is zero sessions, not a failure.
+  [ -n "$out" ] && n=$(printf '%s\n' "$out" | wc -l)
   say ok sessions "$((n)) on tmux socket $MAGENT_SOCKET"
 }
 
