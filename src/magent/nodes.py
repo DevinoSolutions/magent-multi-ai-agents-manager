@@ -1408,3 +1408,32 @@ def placement_samples(
         samples[nick] = [replace(reading, ts=now)]
         sampled.add(nick)
     return samples, frozenset(sampled)
+
+
+# --- resume (spec §12) ----------------------------------------------------------
+
+# A top-level conversation's file is named by its session id (a UUID); the
+# subagent logs beside it are ``agent-<hex>.jsonl`` and are not resumable.
+_SESSION_STEM = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+
+def latest_transcript_id(
+    nick: str, sid: str, *, nodes_dir: Path | None = None
+) -> str | None:
+    """The newest pulled conversation's id, or None when nothing was pulled.
+
+    The file stem IS the session id (verified: every record's ``sessionId``
+    equals it). Newest by mtime -- tar keeps the node's mtimes -- and by name
+    on a tie, so the answer never depends on directory order.
+    """
+    folder = transcripts_dir(nick, sid, nodes_dir=nodes_dir)
+    try:
+        candidates = [p for p in folder.glob("*.jsonl") if _SESSION_STEM.match(p.stem)]
+        newest = max(
+            candidates, key=lambda p: (p.stat().st_mtime, p.name), default=None
+        )
+    except OSError:
+        return None
+    return None if newest is None else newest.stem

@@ -14,6 +14,12 @@ from __future__ import annotations
 import pytest
 
 from magent import nodes
+from tests.unit._node_fixtures import (
+    NOW,
+    OLDER_SESSION_ID,
+    SESSION_ID,
+    write_transcript,
+)
 
 
 class TestTheEncodedDirIsClaudeCodesOwnRule:
@@ -64,3 +70,33 @@ class TestTheEncodedDirIsClaudeCodesOwnRule:
         path = "/" + "b" * 300
 
         assert nodes.encoded_project_dir(path) == "-" + "b" * 199 + "-km8bov"
+
+
+class TestTheResumeId:
+    def test_the_resume_id_is_the_stem_of_the_newest_transcript(self):
+        write_transcript("second", "api", OLDER_SESSION_ID, mtime=NOW - 600)
+        write_transcript("second", "api", SESSION_ID, mtime=NOW)
+
+        assert nodes.latest_transcript_id("second", "api") == SESSION_ID
+
+    def test_subagent_logs_and_memory_are_never_a_resume_id(self):
+        write_transcript("second", "api", SESSION_ID, mtime=NOW - 600)
+        folder = nodes.transcripts_dir("second", "api")
+        (folder / "agent-a1b2c3.jsonl").write_text("{}\n", encoding="utf-8")
+        nested = folder / SESSION_ID / "subagents"
+        nested.mkdir(parents=True)
+        (nested / f"{OLDER_SESSION_ID}.jsonl").write_text("{}\n", encoding="utf-8")
+        (folder / "memory").mkdir()
+        (folder / "memory" / "MEMORY.md").write_text("- a\n", encoding="utf-8")
+
+        assert nodes.latest_transcript_id("second", "api") == SESSION_ID
+
+    def test_equal_mtimes_break_the_tie_by_name(self):
+        write_transcript("second", "api", OLDER_SESSION_ID, mtime=NOW)
+        write_transcript("second", "api", SESSION_ID, mtime=NOW)
+
+        # "5f.." > "0a..": the name decides when the mtimes agree.
+        assert nodes.latest_transcript_id("second", "api") == SESSION_ID
+
+    def test_nothing_pulled_means_no_resume_id(self):
+        assert nodes.latest_transcript_id("second", "api") is None
