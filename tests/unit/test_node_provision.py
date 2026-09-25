@@ -1949,11 +1949,9 @@ class TestProvisionShUnderRealBash:
     # I1: when PROVISION_TIMEOUT_S fires, this PC kills its ssh and the node's
     # stdout pipe closes under a still-running apply. That apply must finish
     # the scope -- not die at its next row -- and still clean up after itself.
-    @pytest.mark.xfail(
-        strict=True,
-        reason="I1: node_apply stops at its first row after EPIPE until F10's "
-        "_row fix arrives with the settled F11 tip",
-    )
+    # Only the rows are lost (a reader treats a missing row as unknown); the
+    # exit code is the steps' own. A SIGHUP is the other killer, and only a
+    # pty session gets one: TestProvision pins that provisioning asks for none.
     def test_an_apply_whose_stdout_closes_mid_run_still_lands_the_scope(self, tmp_path):
         _slow_gh(tmp_path / "slowgh", 3)  # login + setup-git: ~6s to row one
         spawn = _provision_spawn(tmp_path)
@@ -1981,6 +1979,10 @@ class TestProvisionShUnderRealBash:
             time.sleep(1.5)
             proc.stdout.close()  # what a killed ssh leaves the node with
             proc.wait(timeout=60)
+        stderr = (tmp_path / "stderr").read_bytes()
+        assert proc.returncode == 0, stderr
+        assert b"Traceback" not in stderr
+        assert TOKEN.encode("ascii") not in stderr
         home = tmp_path / "node"
         settings = json.loads((home / ".claude" / "settings.json").read_text("utf-8"))
         assert settings["model"] == "opus"
