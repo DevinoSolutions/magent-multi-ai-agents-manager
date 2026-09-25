@@ -873,23 +873,37 @@ def _memory_files(memory_dir: Path) -> list[tuple[str, Path]]:
     name order. A link is never followed -- not a file link, not a folder
     link, and not ``memory_dir`` itself being one: the folder is Claude's,
     and a link in it can name ``~/.ssh``. What is skipped is logged, never
-    raised: a bring-up never fails because of memory."""
+    raised: a bring-up never fails because of memory.
+
+    "A link" is decided by ``realpath``, not ``is_symlink``: a Windows
+    junction -- which any standard user can make -- is not a symlink to
+    pathlib, and ``os.walk(followlinks=False)`` descends into one. An entry is
+    kept only when resolving it changes nothing but its parent's own
+    resolution, so a link ABOVE ``memory_dir`` (a dotfiles ``~/.claude``)
+    still ships, and every file must resolve inside the resolved folder."""
     logger = get_logger("nodes")
-    if memory_dir.is_symlink():
+    real_mem = Path(os.path.realpath(memory_dir))
+    if real_mem != Path(os.path.realpath(memory_dir.parent)) / memory_dir.name:
         logger.warning("memory folder %s is a link; no memory shipped", memory_dir)
         return []
     found: list[tuple[str, Path]] = []
-    # os.walk never descends into a linked folder (followlinks=False); each
-    # one is named so the skip is visible.
     for dirpath, dirnames, filenames in os.walk(memory_dir):
         base = Path(dirpath)
+        real_base = Path(os.path.realpath(base))
+        kept: list[str] = []
         for name in dirnames:
-            if (base / name).is_symlink():
+            if Path(os.path.realpath(base / name)) == real_base / name:
+                kept.append(name)
+            else:
                 logger.warning("memory link %s skipped", base / name)
+        dirnames[:] = kept  # os.walk descends only into what is left
         for name in filenames:
             path = base / name
             if path.is_symlink() or not path.is_file():
                 logger.warning("memory entry %s is not a regular file; skipped", path)
+                continue
+            if not Path(os.path.realpath(path)).is_relative_to(real_mem):
+                logger.warning("memory entry %s resolves outside memory; skipped", path)
                 continue
             try:
                 rel = _archive_name(str(path.relative_to(memory_dir)))

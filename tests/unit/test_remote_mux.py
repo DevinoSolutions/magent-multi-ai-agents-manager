@@ -1674,6 +1674,20 @@ def _link_or_skip(link: Path, target: Path, *, directory: bool = False) -> None:
         pytest.skip("this account cannot create symlinks")
 
 
+needs_junctions = pytest.mark.skipif(
+    sys.platform != "win32", reason="NTFS junctions are Windows-only"
+)
+
+
+def _junction(link: Path, target: Path) -> None:
+    """A directory junction at ``link`` -> ``target``: no admin needed, which
+    is exactly why it is the link to guard against."""
+    import _winapi  # reason: Windows-only stdlib; the tests using it skip elsewhere
+
+    _winapi.CreateJunction(str(target), str(link))
+    assert not link.is_symlink()  # the premise: pathlib does not see it
+
+
 def _nodes_log() -> str:
     path = log.LOG_DIR / "nodes.log"
     return path.read_text(encoding="utf-8") if path.exists() else ""
@@ -1724,6 +1738,51 @@ class TestMemoryNeverFollowsALink:
         assert not any(n.startswith("memory/") for n in _members(stdin))
         assert b"TOPSECRET" not in stdin
         assert "linked-memory" in _nodes_log()
+
+    # A junction is the link a STANDARD Windows user can make (no admin, no
+    # developer mode), and Path.is_symlink() is False for one while os.walk
+    # descends into it -- so the symlink pins above do not cover it.
+    @needs_junctions
+    def test_a_junction_inside_memory_is_skipped(self, node_home, tmp_path):
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        keys = tmp_path / "dot-ssh"
+        keys.mkdir()
+        (keys / "id_ed25519").write_bytes(b"TOPSECRET\n")
+        _junction(recipe.memory_dir / "keys", keys)
+        stdin = self._bring_up(node_home, recipe)
+        members = _members(stdin)
+        assert not any(n.startswith("memory/keys") for n in members)
+        assert members["memory/MEMORY.md"] == b"- remember\n"
+        assert b"TOPSECRET" not in stdin
+        assert "keys" in _nodes_log()
+
+    @needs_junctions
+    def test_a_memory_folder_that_is_a_junction_ships_no_memory(
+        self, node_home, tmp_path
+    ):
+        keys = tmp_path / "dot-ssh"
+        keys.mkdir()
+        (keys / "id_ed25519").write_bytes(b"TOPSECRET\n")
+        joined = tmp_path / "joined-memory"
+        _junction(joined, keys)
+        stdin = self._bring_up(node_home, _recipe(tmp_path, memory_dir=joined))
+        assert not any(n.startswith("memory/") for n in _members(stdin))
+        assert b"TOPSECRET" not in stdin
+        assert "joined-memory" in _nodes_log()
+
+    def test_memory_under_a_linked_parent_still_ships(self, node_home, tmp_path):
+        # A dotfiles setup links ~/.claude itself; the memory folder INSIDE it
+        # is a plain folder and must still ship.
+        dotfiles = tmp_path / "dotfiles"
+        (dotfiles / "memory").mkdir(parents=True)
+        (dotfiles / "memory" / "MEMORY.md").write_bytes(b"- dotfiles\n")
+        claude = tmp_path / "claude"
+        _link_or_skip(claude, dotfiles, directory=True)
+        stdin = self._bring_up(
+            node_home, _recipe(tmp_path, memory_dir=claude / "memory")
+        )
+        assert _members(stdin)["memory/MEMORY.md"] == b"- dotfiles\n"
 
 
 class TestPushingFilesToARunningProject:
