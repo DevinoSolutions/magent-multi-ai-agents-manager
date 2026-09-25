@@ -385,7 +385,8 @@ class TestInstallTranscripts:
                 [nodes.encoded_project_dir("/home/amin/magent/my_api")],
             ),
         ]
-        assert landed == "/home/amin/.claude/projects/-home-amin-magent-my-api"
+        assert landed.landed == "/home/amin/.claude/projects/-home-amin-magent-my-api"
+        assert landed.kept == ()
 
     def test_the_conversation_travels_as_a_tar_of_the_directory_contents(
         self, scripts, tmp_path
@@ -506,6 +507,317 @@ class TestTheInstallScriptsOnANode:
 
         assert done.returncode == 2
         assert not (home / ".claude").exists()
+
+
+_PULLED_JSONL = '{"sessionId": "x"}\n'
+_ENCODED = "-home-amin-magent-api"
+
+
+def _node_run(
+    call: tuple[list[str], bytes], home: Path, *, umask: int = 0o022
+) -> subprocess.CompletedProcess[bytes]:
+    """``_as_the_node`` without check=True, under a chosen umask (the child
+    inherits it), for the tests that pin an exit code."""
+    argv, stdin = call
+    old = os.umask(umask)
+    try:
+        return subprocess.run(
+            argv,
+            input=stdin,
+            env={**os.environ, "HOME": str(home)},
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+    finally:
+        os.umask(old)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="node scripts run under a Linux node's bash"
+)
+class TestTheInstallNeverOverwritesTheNodesWork:
+    """cq-G9 I1/I2/M5/M8: the payload is extracted into a private temp dir
+    first, and only a file the node does not have, or holds a strict prefix
+    of, is moved into place. Anything else is the node's and is KEPT."""
+
+    @pytest.fixture
+    def home(self, tmp_path) -> Path:
+        home = tmp_path / "nodehome"
+        home.mkdir()
+        return home
+
+    def _dest(self, home: Path) -> Path:
+        return home / ".claude" / "projects" / _ENCODED
+
+    def _seed(self, home: Path, text: str) -> Path:
+        dest = self._dest(home)
+        dest.mkdir(parents=True, exist_ok=True)
+        target = dest / f"{SESSION_ID}.jsonl"
+        target.write_text(text, encoding="utf-8")
+        return target
+
+    def _call(self, monkeypatch, tmp_path, payload: bytes | None = b"<pulled>"):
+        if payload == b"<pulled>":
+            payload = remote_mux._tar_dir(_pulled(tmp_path))
+        return _node_call(monkeypatch, "install_transcripts", [_ENCODED], payload)
+
+    def _leftovers(self, home: Path) -> list[str]:
+        projects = home / ".claude" / "projects"
+        return sorted(p.name for p in projects.glob(".magent-install.*"))
+
+    def test_a_longer_node_copy_is_kept_and_reported(self, monkeypatch, home, tmp_path):
+        longer = _PULLED_JSONL + '{"more": "the node kept working"}\n'
+        target = self._seed(home, longer)
+
+        done = _node_run(self._call(monkeypatch, tmp_path), home)
+
+        assert done.returncode == 0, done.stderr
+        assert target.read_text(encoding="utf-8") == longer
+        assert f"KEPT\t{SESSION_ID}.jsonl\n".encode() in done.stdout
+        assert (self._dest(home) / "memory" / "MEMORY.md").exists()
+
+    def test_a_diverged_node_copy_of_the_same_size_is_kept(
+        self, monkeypatch, home, tmp_path
+    ):
+        diverged = _PULLED_JSONL.replace("x", "y")
+        target = self._seed(home, diverged)
+
+        done = _node_run(self._call(monkeypatch, tmp_path), home)
+
+        assert target.read_text(encoding="utf-8") == diverged
+        assert f"KEPT\t{SESSION_ID}.jsonl\n".encode() in done.stdout
+
+    def test_a_node_copy_that_is_a_prefix_is_replaced(
+        self, monkeypatch, home, tmp_path
+    ):
+        target = self._seed(home, _PULLED_JSONL[:7])
+
+        done = _node_run(self._call(monkeypatch, tmp_path), home)
+
+        assert done.returncode == 0, done.stderr
+        assert target.read_text(encoding="utf-8") == _PULLED_JSONL
+        assert b"KEPT" not in done.stdout
+
+    def test_an_identical_node_copy_is_left_alone(self, monkeypatch, home, tmp_path):
+        target = self._seed(home, _PULLED_JSONL)
+        before = target.stat()
+
+        done = _node_run(self._call(monkeypatch, tmp_path), home)
+
+        after = target.stat()
+        assert done.returncode == 0, done.stderr
+        assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+        assert b"KEPT" not in done.stdout
+
+    def test_a_truncated_payload_changes_nothing(self, monkeypatch, home, tmp_path):
+        target = self._seed(home, _PULLED_JSONL[:7])
+        whole = remote_mux._tar_dir(_pulled(tmp_path))
+
+        done = _node_run(self._call(monkeypatch, tmp_path, whole[: 512 + 10]), home)
+
+        assert done.returncode == 3
+        assert target.read_text(encoding="utf-8") == _PULLED_JSONL[:7]
+        assert self._leftovers(home) == []
+
+    def test_a_missing_payload_changes_nothing(self, monkeypatch, home, tmp_path):
+        target = self._seed(home, _PULLED_JSONL[:7])
+
+        done = _node_run(self._call(monkeypatch, tmp_path, None), home)
+
+        assert done.returncode == 3
+        assert target.read_text(encoding="utf-8") == _PULLED_JSONL[:7]
+        assert self._leftovers(home) == []
+
+    def test_no_temp_dir_is_left_after_a_good_install(
+        self, monkeypatch, home, tmp_path
+    ):
+        done = _node_run(self._call(monkeypatch, tmp_path), home)
+
+        assert done.returncode == 0, done.stderr
+        assert self._leftovers(home) == []
+
+    def test_what_lands_is_private_even_under_umask_022(
+        self, monkeypatch, home, tmp_path
+    ):
+        done = _node_run(self._call(monkeypatch, tmp_path), home, umask=0o022)
+
+        assert done.returncode == 0, done.stderr
+        dest = self._dest(home)
+        for d in (
+            home / ".claude",
+            home / ".claude" / "projects",
+            dest,
+            dest / "memory",
+        ):
+            assert oct(d.stat().st_mode & 0o777) == "0o700", d
+        for f in (dest / f"{SESSION_ID}.jsonl", dest / "memory" / "MEMORY.md"):
+            assert oct(f.stat().st_mode & 0o777) == "0o600", f
+
+    def test_a_symlinked_project_dir_is_refused(self, monkeypatch, home, tmp_path):
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (home / ".claude" / "projects").mkdir(parents=True)
+        self._dest(home).symlink_to(elsewhere)
+
+        done = _node_run(self._call(monkeypatch, tmp_path), home)
+
+        assert done.returncode == 4
+        assert list(elsewhere.iterdir()) == []
+
+    def test_a_symlinked_directory_inside_it_is_refused_before_anything_lands(
+        self, monkeypatch, home, tmp_path
+    ):
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        self._dest(home).mkdir(parents=True)
+        (self._dest(home) / "memory").symlink_to(elsewhere)
+
+        done = _node_run(self._call(monkeypatch, tmp_path), home)
+
+        assert done.returncode == 4
+        assert list(elsewhere.iterdir()) == []
+        assert not (self._dest(home) / f"{SESSION_ID}.jsonl").exists()
+
+    def test_the_landed_path_is_physical(self, monkeypatch, tmp_path):
+        real = tmp_path / "realhome"
+        real.mkdir()
+        home = tmp_path / "linkhome"
+        home.symlink_to(real)
+
+        done = _node_run(self._call(monkeypatch, tmp_path), home)
+
+        assert done.returncode == 0, done.stderr
+        landed = done.stdout.decode().splitlines()[-1]
+        assert landed == str(
+            Path(os.path.realpath(real)) / ".claude" / "projects" / _ENCODED
+        )
+
+
+class TestTheInstallResultAndRefusals:
+    def _fake(self, monkeypatch, *, stdout: bytes = b"", rc: int = 0) -> list[str]:
+        calls: list[str] = []
+
+        def _run_script(node, script, args, *, timeout_s, stdin=None, **_k):
+            calls.append(script)
+            if script == "node_realpath":
+                return subprocess.CompletedProcess(
+                    [], 0, b"/home/amin/magent/api\n", b""
+                )
+            if rc:
+                raise remote_mux.RemoteError(
+                    rc, "node said no", ("ssh", "devino-second")
+                )
+            return subprocess.CompletedProcess([], 0, stdout, b"")
+
+        monkeypatch.setattr(remote_mux, "run_script", _run_script)
+        return calls
+
+    def test_kept_files_are_named_in_the_result(self, monkeypatch, tmp_path):
+        self._fake(
+            monkeypatch,
+            stdout=(
+                b"KEPT\tmemory/MEMORY.md\nKEPT\t"
+                + SESSION_ID.encode()
+                + b".jsonl\n/home/amin/.claude/projects/-home-amin-magent-api\n"
+            ),
+        )
+
+        result = remote_mux.install_transcripts(
+            _NODE, "~/magent/api", _pulled(tmp_path), timeout_s=5
+        )
+
+        assert result.landed == "/home/amin/.claude/projects/-home-amin-magent-api"
+        assert result.kept == ("memory/MEMORY.md", f"{SESSION_ID}.jsonl")
+        assert "2 file(s)" in result.note
+        assert "memory/MEMORY.md" in result.note
+
+    def test_nothing_kept_has_no_note(self, monkeypatch, tmp_path):
+        self._fake(monkeypatch, stdout=b"/home/amin/.claude/projects/x\n")
+
+        result = remote_mux.install_transcripts(
+            _NODE, "~/magent/api", _pulled(tmp_path), timeout_s=5
+        )
+
+        assert (result.landed, result.kept, result.note) == (
+            "/home/amin/.claude/projects/x",
+            (),
+            "",
+        )
+
+    @pytest.mark.parametrize(
+        ("rc", "words"),
+        [(2, "alphabet"), (3, "payload"), (4, "symlink")],
+    )
+    def test_each_refusal_is_named(self, monkeypatch, tmp_path, rc, words):
+        self._fake(monkeypatch, rc=rc)
+
+        with pytest.raises(remote_mux.RemoteError) as caught:
+            remote_mux.install_transcripts(
+                _NODE, "~/magent/api", _pulled(tmp_path), timeout_s=5
+            )
+
+        assert caught.value.rc == rc
+        assert words in str(caught.value)
+        assert "node said no" in caught.value.stderr_tail
+
+    def test_any_other_failure_passes_through_unchanged(self, monkeypatch, tmp_path):
+        self._fake(monkeypatch, rc=1)
+
+        with pytest.raises(remote_mux.RemoteError) as caught:
+            remote_mux.install_transcripts(
+                _NODE, "~/magent/api", _pulled(tmp_path), timeout_s=5
+            )
+
+        assert caught.value.stderr_tail == "node said no"
+
+
+class TestTheTarCarriesOnlyTheConversation:
+    def _names(self, source: Path) -> list[str]:
+        with tarfile.open(fileobj=io.BytesIO(remote_mux._tar_dir(source))) as tar:
+            return sorted(tar.getnames())
+
+    def test_a_part_file_still_being_pulled_is_not_sent(self, tmp_path):
+        source = _pulled(tmp_path)
+        (source / "next.jsonl.part").write_text("{", encoding="utf-8")
+
+        assert self._names(source) == [
+            f"{SESSION_ID}.jsonl",
+            "memory",
+            "memory/MEMORY.md",
+        ]
+
+    def test_only_regular_files_and_directories_travel(self, tmp_path):
+        source = _pulled(tmp_path)
+        outside = tmp_path / "secret"
+        outside.mkdir()
+        (outside / "id_rsa").write_text("key\n", encoding="utf-8")
+        try:
+            (source / "link.jsonl").symlink_to(outside / "id_rsa")
+            (source / "linkdir").symlink_to(outside, target_is_directory=True)
+        except OSError:
+            pytest.skip("this account cannot create symlinks")
+
+        with tarfile.open(fileobj=io.BytesIO(remote_mux._tar_dir(source))) as tar:
+            members = tar.getmembers()
+
+        assert all(m.isfile() or m.isdir() for m in members)
+        assert sorted(m.name for m in members) == [
+            f"{SESSION_ID}.jsonl",
+            "memory",
+            "memory/MEMORY.md",
+        ]
+
+    def test_an_unreadable_source_is_a_clean_error_and_never_dials(
+        self, fake_ssh, tmp_path
+    ):
+        with pytest.raises(remote_mux.RemoteError) as caught:
+            remote_mux.install_transcripts(
+                _NODE, "~/magent/api", tmp_path / "never-pulled", timeout_s=5
+            )
+
+        assert caught.value.rc is None
+        assert fake_ssh.calls() == []
 
 
 class TestASessionRootIsCheckedBeforeItReachesTheNode:

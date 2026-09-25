@@ -883,12 +883,35 @@ def repo_status(node: Node, remote_root: str, *, timeout_s: float) -> list[RepoS
 INSTALL_TIMEOUT_S = 120.0
 
 
+def _raise(err: OSError) -> None:
+    raise err
+
+
 def _tar_dir(source: Path) -> bytes:
-    """An uncompressed tar of ``source``'s CONTENTS (paths relative to it)."""
+    """An uncompressed tar of ``source``'s CONTENTS (paths relative to it).
+    Only regular files and directories travel: a symlink could name anything
+    on this PC, and a ``*.part`` file is a pull still in flight. Symlinked
+    directories are not descended. A source that cannot be read raises
+    RemoteError with rc None (nothing ran on a node)."""
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tar:
-        for path in sorted(source.rglob("*")):
-            tar.add(path, arcname=path.relative_to(source).as_posix(), recursive=False)
+    try:
+        entries = []
+        for dirpath, dirnames, filenames in os.walk(source, onerror=_raise):
+            base = source / os.path.relpath(dirpath, source)
+            entries.extend(base / name for name in (*dirnames, *filenames))
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            for path in sorted(entries):
+                if path.is_symlink():
+                    continue
+                if path.is_dir() or (
+                    path.is_file() and not path.name.endswith(".part")
+                ):
+                    arcname = path.relative_to(source).as_posix()
+                    tar.add(path, arcname=arcname, recursive=False)
+    except OSError as err:
+        raise RemoteError(
+            None, f"could not read the pulled transcripts: {err}", ("tar", str(source))
+        ) from err
     return buf.getvalue()
 
 
@@ -900,17 +923,70 @@ def node_realpath(node: Node, path: str, *, timeout_s: float) -> str:
     return _stdout_text(done).strip()
 
 
+@dataclass(frozen=True)
+class InstalledTranscripts:
+    """Where a recall's conversation landed on a node, and the files the node
+    already had a newer or diverged copy of -- those were KEPT, not
+    overwritten (``install_transcripts.sh``). Informational, not a failure."""
+
+    landed: str
+    kept: tuple[str, ...] = ()
+
+    @property
+    def note(self) -> str:
+        """One line naming the kept files, or "" when there are none."""
+        if not self.kept:
+            return ""
+        return (
+            f"kept the node's newer/diverged copy of {len(self.kept)} file(s): "
+            + ", ".join(self.kept)
+        )
+
+
+# install_transcripts.sh's own refusals, by exit code. Any other failure (ssh's
+# 255, a timeout, a command that died under `set -e`) passes through as is.
+INSTALL_REFUSALS = {
+    2: "the encoded project dir name is outside the encoder's alphabet",
+    3: "the transcript payload arrived missing or broken; nothing was installed",
+    4: "the node's project dir is a symlink; nothing was installed through it",
+}
+
+
+def _installed(text: str) -> InstalledTranscripts:
+    kept: list[str] = []
+    landed = ""
+    for line in text.splitlines():
+        if line.startswith("KEPT\t"):
+            kept.append(line.removeprefix("KEPT\t"))
+        elif line.strip():
+            landed = line.strip()
+    return InstalledTranscripts(landed=landed, kept=tuple(kept))
+
+
 def install_transcripts(
     node: Node, remote_root: str, source: Path, *, timeout_s: float
-) -> str:
+) -> InstalledTranscripts:
     """Put a pulled Claude project directory where a session started in
     ``remote_root`` on ``node`` will look for it (recall --to, spec §12 step
     4). The name is encoded HERE, by the one encoder, from the node's own
-    physical path; the node only extracts. Returns the directory it landed
-    in. RemoteError when the node refuses or does not answer; NodeConfigError,
-    before any dial, for a root ``_session_root`` refuses."""
+    physical path; the node only places files, never overwriting work it has
+    that this PC lacks. Returns where it landed and what the node KEPT.
+    NodeConfigError (a root ``_session_root`` refuses) and RemoteError rc None
+    (``source`` cannot be read) both come before any dial; RemoteError when
+    the node refuses -- its reason named from ``INSTALL_REFUSALS`` -- or does
+    not answer."""
+    _session_root(remote_root)
+    payload = _tar_dir(source)
     name = encoded_project_dir(node_realpath(node, remote_root, timeout_s=timeout_s))
-    done = run_script(
-        node, "install_transcripts", [name], timeout_s=timeout_s, stdin=_tar_dir(source)
-    )
-    return _stdout_text(done).strip()
+    try:
+        done = run_script(
+            node, "install_transcripts", [name], timeout_s=timeout_s, stdin=payload
+        )
+    except RemoteError as err:
+        reason = INSTALL_REFUSALS.get(err.rc) if err.rc is not None else None
+        if reason is None:
+            raise
+        raise RemoteError(
+            err.rc, f"{reason}\n{err.stderr_tail}".rstrip(), err.command_redacted
+        ) from err
+    return _installed(_stdout_text(done))
