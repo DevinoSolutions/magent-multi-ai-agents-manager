@@ -490,3 +490,198 @@ class TestASessionRootIsCheckedBeforeItReachesTheNode:
         remote_mux.node_realpath(_NODE, root, timeout_s=5)
 
         assert seen == [[root], [root]]
+
+
+def _status_line(*fields: str) -> str:
+    return "\t".join(fields) + "\n"
+
+
+def _raw_record(body: str) -> None:
+    path = nodes.repo_record_path("second", "api")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+
+
+_ROW = '{"remote_dir": "~/magent/api", "head": "HEAD", "branch": "main", "dirty": false, "unpushed": 0}'
+
+
+class TestTheRepoStatusParserTrustsNothingTheNodeSays:
+    @pytest.mark.parametrize(
+        "count", ["\u00b2", "9" * 4000, "1234567890", "-1", "+3", " 3", "\uff13", ""]
+    )
+    def test_a_count_that_is_not_a_small_ascii_number_is_unknown(self, count):
+        (status,) = nodes.parse_repo_status(
+            _status_line("~/magent/api", "b" * 40, "main", "false", count)
+        )
+
+        assert status.unpushed is None
+
+    def test_a_five_thousand_digit_count_never_raises_or_counts(self):
+        # int() of >4300 digits raises ValueError on 3.11+; the parser must
+        # neither raise nor produce a count (the row is over the field bound).
+        statuses = nodes.parse_repo_status(
+            _status_line("~/magent/api", "b" * 40, "main", "false", "9" * 5000)
+        )
+
+        assert all(s.unpushed is None for s in statuses)
+
+    def test_a_nine_digit_count_is_kept(self):
+        (status,) = nodes.parse_repo_status(
+            _status_line("~/magent/api", "b" * 40, "main", "false", "999999999")
+        )
+
+        assert status.unpushed == 999_999_999
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "~/magent/api\t" + "b" * 40 + "\tmain\tfalse\n",
+            "~/magent/api\t" + "b" * 40 + "\tmain\tfalse\t0\textra\n",
+        ],
+        ids=["four-fields", "six-fields"],
+    )
+    def test_a_row_with_the_wrong_field_count_is_dropped(self, line):
+        assert nodes.parse_repo_status(line) == []
+
+    def test_the_number_of_rows_is_bounded(self):
+        text = _status_line("~/magent/api", "b" * 40, "main", "false", "0") * (
+            nodes.REPO_STATUS_MAX_LINES + 50
+        )
+
+        assert len(nodes.parse_repo_status(text)) == nodes.REPO_STATUS_MAX_LINES
+
+    def test_an_overlong_field_drops_its_row(self):
+        long_dir = "~/" + "d" * nodes.REPO_STATUS_MAX_FIELD
+        text = _status_line(long_dir, "b" * 40, "main", "false", "0") + _status_line(
+            "~/magent/api", "c" * 40, "main", "false", "0"
+        )
+
+        assert [s.head for s in nodes.parse_repo_status(text)] == ["c" * 40]
+
+    def test_control_characters_never_reach_a_status(self):
+        text = _status_line(
+            "~/magent/a\x1b[31mpi\x85",
+            "b" * 39 + "\x07b",
+            "ma\x9bin\x7f\r",
+            "false",
+            "0",
+        )
+
+        assert nodes.parse_repo_status(text) == [
+            nodes.RepoStatus("~/magent/a[31mpi", "b" * 40, "main", False, 0)
+        ]
+
+    def test_an_unknown_dirty_token_is_unknown(self):
+        (status,) = nodes.parse_repo_status(
+            _status_line("~/magent/api", "b" * 40, "main", "unknown", "0")
+        )
+
+        assert status.dirty is None
+
+
+class TestTheRepoRecordFileIsCheckedOnTheWayInAndOut:
+    @pytest.mark.parametrize(
+        "ts", ["true", "NaN", "Infinity", "-Infinity", "1" + "0" * 400, '"1"', "null"]
+    )
+    def test_a_timestamp_that_is_not_a_finite_number_reads_as_none(self, ts):
+        _raw_record(f'{{"ts": {ts}, "source": "recall", "repos": []}}')
+
+        assert nodes.read_repo_record("second", "api") is None
+
+    def test_an_integer_timestamp_reads_back_as_a_float(self):
+        _raw_record('{"ts": 5, "source": "recall", "repos": []}')
+
+        record = nodes.read_repo_record("second", "api")
+
+        assert record is not None
+        assert type(record.ts) is float
+        assert record.ts == 5.0
+
+    def test_a_body_that_is_not_an_object_reads_as_none(self):
+        _raw_record("[]")
+
+        assert nodes.read_repo_record("second", "api") is None
+
+    def test_a_source_that_is_not_a_string_reads_as_none(self):
+        _raw_record('{"ts": 5, "source": 3, "repos": []}')
+
+        assert nodes.read_repo_record("second", "api") is None
+
+    @pytest.mark.parametrize(
+        ("dirty", "unpushed"), [('"yes"', "true"), ("1", "1.5"), ("null", '"2"')]
+    )
+    def test_unrecognised_dirty_and_unpushed_values_read_as_unknown(
+        self, dirty, unpushed
+    ):
+        row = _ROW.replace('"dirty": false', f'"dirty": {dirty}').replace(
+            '"unpushed": 0', f'"unpushed": {unpushed}'
+        )
+        _raw_record(f'{{"ts": 5, "source": "recall", "repos": [{row}]}}')
+
+        record = nodes.read_repo_record("second", "api")
+
+        assert record is not None
+        assert record.repos == (
+            nodes.RepoStatus("~/magent/api", "HEAD", "main", None, None),
+        )
+
+    def test_a_malformed_row_is_dropped_and_the_rest_kept(self):
+        bad = _ROW.replace('"remote_dir": "~/magent/api"', '"remote_dir": 1')
+        _raw_record(
+            f'{{"ts": 5, "source": "recall", "repos": ["junk", {_ROW}, {bad}]}}'
+        )
+
+        record = nodes.read_repo_record("second", "api")
+
+        assert record is not None
+        assert record.repos == (
+            nodes.RepoStatus("~/magent/api", "HEAD", "main", False, 0),
+        )
+
+    def test_a_failed_replace_returns_false_and_leaves_no_temp_file(self, monkeypatch):
+        def _refuse(src, dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr("os.replace", _refuse)
+
+        written = nodes.write_repo_record(
+            "second", "api", nodes.RepoRecord(ts=NOW, source="recall", repos=())
+        )
+
+        assert written is False
+        folder = nodes.repo_record_path("second", "api").parent
+        assert list(folder.iterdir()) == []
+
+    def test_a_failed_write_keeps_the_previous_record(self, monkeypatch):
+        first = nodes.RepoRecord(ts=NOW, source="bring-up", repos=())
+        assert nodes.write_repo_record("second", "api", first) is True
+
+        def _refuse(src, dst):
+            raise OSError("disk full")
+
+        second = nodes.RepoRecord(ts=NOW + 1, source="recall", repos=())
+        # A scoped patch: monkeypatch.undo() would also undo conftest's
+        # home redirect, which shares this fixture.
+        with monkeypatch.context() as scoped:
+            scoped.setattr("os.replace", _refuse)
+            assert nodes.write_repo_record("second", "api", second) is False
+
+        assert nodes.read_repo_record("second", "api") == first
+
+    def test_a_non_finite_timestamp_is_never_written(self):
+        record = nodes.RepoRecord(ts=float("nan"), source="recall", repos=())
+
+        assert nodes.write_repo_record("second", "api", record) is False
+        assert not nodes.repo_record_path("second", "api").exists()
+
+    @pytest.mark.parametrize("sid", ["../../../escaped", "", ".", "..", "a/b", "a\b"])
+    def test_an_unsafe_sid_names_no_record_path(self, sid):
+        with pytest.raises(nodes.NodeConfigError):
+            nodes.repo_record_path("second", sid)
+
+    def test_an_unsafe_sid_is_neither_written_nor_read(self, tmp_path):
+        record = nodes.RepoRecord(ts=NOW, source="recall", repos=())
+
+        assert nodes.write_repo_record("second", "../../../escaped", record) is False
+        assert nodes.read_repo_record("second", "../../../escaped") is None
+        assert not list(tmp_path.rglob("repos.json"))

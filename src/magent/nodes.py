@@ -184,6 +184,20 @@ def encoded_project_dir(path: str) -> str:
     return encode_claude_project_path(path)
 
 
+def _epoch(value: object) -> float | None:
+    """A timestamp read back from JSON, as a finite float, or None. bool is an
+    int subclass (`"ts": true` is corruption, not 1.0); json.loads accepts
+    NaN/Infinity and arbitrarily long integers, and neither is a time --
+    float() of a 309+-digit int raises instead of saturating."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        out = float(value)
+    except OverflowError:
+        return None
+    return out if math.isfinite(out) else None
+
+
 def _map_entry(raw: object) -> NodeMapEntry | None:
     if not isinstance(raw, dict):
         return None
@@ -191,18 +205,8 @@ def _map_entry(raw: object) -> NodeMapEntry | None:
     ts, attached = raw.get("placed_ts"), raw.get("attached_existing")
     if not (isinstance(nick, str) and isinstance(sid, str) and isinstance(root, str)):
         return None
-    # bool is an int subclass: `"placed_ts": true` is corruption, not 1.0.
-    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
-        return None
-    if not isinstance(attached, bool):
-        return None
-    # json.loads accepts NaN/Infinity and arbitrarily long integers; neither is
-    # a time. float() of a 309+-digit int raises instead of saturating.
-    try:
-        placed_ts = float(ts)
-    except OverflowError:
-        return None
-    if not math.isfinite(placed_ts):
+    placed_ts = _epoch(ts)
+    if placed_ts is None or not isinstance(attached, bool):
         return None
     target, cwd = raw.get("target", ""), raw.get("cwd", "")
     return NodeMapEntry(
@@ -1466,42 +1470,79 @@ class RepoRecord:
     repos: tuple[RepoStatus, ...]
 
 
+# repo_status.sh's stdout is the node's words, so it is bounded here: a session
+# root is one repo or a workspace of a handful, and no field needs more than a
+# path's length. A line past either bound is dropped, never truncated.
+REPO_STATUS_MAX_LINES = 256
+REPO_STATUS_MAX_FIELD = 4096
+# An unpushed count wider than this is not a count git produced for a repo.
+_COUNT_MAX_DIGITS = 9
+# C0, DEL and C1: nothing a node reports may drive the terminal it is shown on.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _count(text: str) -> int | None:
+    # str.isdigit() is true for U+00B2 SUPERSCRIPT TWO (which int() refuses)
+    # and for full-width digits, and int() of thousands of digits is slow and
+    # raises on 3.11+: every one of those reads as unknown.
+    if text.isascii() and text.isdigit() and len(text) <= _COUNT_MAX_DIGITS:
+        return int(text)
+    return None
+
+
 def parse_repo_status(text: str) -> list[RepoStatus]:
-    """``repo_status.sh``'s lines; anything not five tab-separated fields is
-    not a status line and is dropped."""
+    """``repo_status.sh``'s lines. A line that is not five tab-separated
+    fields, or has a field longer than ``REPO_STATUS_MAX_FIELD``, is not a
+    status line and is dropped; at most ``REPO_STATUS_MAX_LINES`` lines are
+    read. Control characters are stripped from every field. A ``dirty`` token
+    other than ``true``/``false`` (``unknown``, ``missing``) and a count that
+    is not a small ASCII number both mean unknown (None)."""
     out: list[RepoStatus] = []
-    for line in text.splitlines():
-        fields = line.split("	")
-        if len(fields) != 5:
+    for line in text.split("\n")[:REPO_STATUS_MAX_LINES]:
+        fields = line.split("\t")
+        if len(fields) != 5 or any(len(f) > REPO_STATUS_MAX_FIELD for f in fields):
             continue
-        remote_dir, head, branch, dirty, unpushed = fields
-        count = int(unpushed) if unpushed.isdigit() else None
+        remote_dir, head, branch, dirty, unpushed = (
+            _CONTROL_CHARS.sub("", f) for f in fields
+        )
         state = {"true": True, "false": False}.get(dirty)
-        out.append(RepoStatus(remote_dir, head, branch, state, count))
+        out.append(RepoStatus(remote_dir, head, branch, state, _count(unpushed)))
     return out
 
 
 def repo_record_path(nick: str, sid: str, *, nodes_dir: Path | None = None) -> Path:
+    """``<nick>/<sid>/repos.json``. An unsafe ``sid`` raises NodeConfigError
+    here rather than trusting every caller to have run ``pullable_sid``: the
+    sid comes from the node map, and ``../../x`` must never name a file
+    outside the node's own directory."""
+    # remote_mux imports this module at its top; in-body breaks the cycle.
+    from magent.remote_mux import pullable_sid
+
+    if not pullable_sid(sid):
+        raise NodeConfigError(f"not a safe session id for a repo record: {sid!r}")
     return node_dir(nick, nodes_dir=nodes_dir) / sid / "repos.json"  # E's layout owner
 
 
 def write_repo_record(
     nick: str, sid: str, record: RepoRecord, *, nodes_dir: Path | None = None
 ) -> bool:
-    """Atomic like the node-map writer; False (and a log line) on OSError."""
-    target = repo_record_path(nick, sid, nodes_dir=nodes_dir)
+    """Replace ``<nick>/<sid>/repos.json`` through ``write_json_atomic`` (a
+    unique temp file, one replace, no temp left behind). False, with a log
+    line, when nothing was written: an OSError, a non-finite ``ts``
+    (ValueError, since NaN is not JSON), or an unsafe ``sid``
+    (NodeConfigError, also a ValueError). A failed write keeps the old
+    record."""
     body = {
         "ts": record.ts,
         "source": record.source,
         "repos": [dataclasses.asdict(r) for r in record.repos],
     }
-    tmp = target.with_name(target.name + ".tmp")
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(body, indent=2), encoding="utf-8")
-        tmp.replace(target)
-    except OSError:
-        get_logger("launch").warning("could not write %s", target, exc_info=True)
+        write_json_atomic(repo_record_path(nick, sid, nodes_dir=nodes_dir), body)
+    except (OSError, ValueError):
+        get_logger("nodes").warning(
+            "could not write the repo record for %s/%r", nick, sid, exc_info=True
+        )
         return False
     return True
 
@@ -1531,7 +1572,10 @@ def _repo_status(row: object) -> RepoStatus | None:
 def read_repo_record(
     nick: str, sid: str, *, nodes_dir: Path | None = None
 ) -> RepoRecord | None:
-    """The stored record, or None when there is none or it is unreadable."""
+    """The stored record, or None when there is none, it is unreadable, its
+    ``ts`` is not a finite number (the node map's rule, ``_epoch``), or the
+    ``sid`` is unsafe (NodeConfigError is a ValueError). A malformed row is
+    dropped on its own."""
     try:
         body = json.loads(
             repo_record_path(nick, sid, nodes_dir=nodes_dir).read_text(encoding="utf-8")
@@ -1540,12 +1584,8 @@ def read_repo_record(
         return None
     if not isinstance(body, dict):
         return None
-    ts, source, rows = body.get("ts"), body.get("source"), body.get("repos")
-    if (
-        not isinstance(ts, int | float)
-        or not isinstance(source, str)
-        or not isinstance(rows, list)
-    ):
+    ts, source, rows = _epoch(body.get("ts")), body.get("source"), body.get("repos")
+    if ts is None or not isinstance(source, str) or not isinstance(rows, list):
         return None
     repos = tuple(s for s in (_repo_status(r) for r in rows) if s is not None)
-    return RepoRecord(ts=float(ts), source=source, repos=repos)
+    return RepoRecord(ts=ts, source=source, repos=repos)
