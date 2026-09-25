@@ -1621,7 +1621,12 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
         self._map(monkeypatch, tmp_path)
         spawned = self._patch(monkeypatch)
 
-        def no_server(*_a, **_k):
+        # Recorded as well as raised: the handler's broad `except` swallows the
+        # raise, so a caught-and-ignored round trip would otherwise pass.
+        round_trips: list[object] = []
+
+        def no_server(*a, **_k):
+            round_trips.append(a)
             raise AssertionError("a node project needs no /api/sessions round trip")
 
         monkeypatch.setattr(hotkey, "urlopen", no_server)
@@ -1635,6 +1640,7 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
             ]
         ]
         assert self.flashed[-1] == "F2: VS Code -> /home/amin/magent/api"
+        assert round_trips == []
 
     def test_a_cloud_placement_falls_through_to_the_server(self, monkeypatch, tmp_path):
         from magent import hotkey
