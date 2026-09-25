@@ -6,8 +6,11 @@ Unix, ``fcntl.flock``.  The lock is advisory (same as flock), which is fine:
 callers are cooperating magent processes, not adversaries.
 
 The file is created if absent.  The lock is released (and the file closed) on
-context-manager exit; deletion is best-effort — on Windows a concurrent opener
-may hold the path, so an OSError on unlink is swallowed.
+context-manager exit.  Only the HOLDER deletes the file, best-effort (on Windows
+a concurrent opener may hold the path, so an OSError on unlink is swallowed).  A
+contender that failed to acquire never deletes it: on POSIX the holder's flock
+lives on that inode, and unlinking it would let the next contender create a
+fresh file and "acquire" it while the holder still runs.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ def exclusive_lock(name: str) -> Generator[None]:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     fh = open(lock_path, "w", encoding="utf-8")  # noqa: SIM115  # reason: the fd must stay open for the lock duration; a with-block would release too early
+    acquired = False
     try:
         if sys.platform == "win32":
             import msvcrt
@@ -50,8 +54,10 @@ def exclusive_lock(name: str) -> Generator[None]:
                 fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as exc:
                 raise LockHeld(f"{name} lock is held by another process") from exc
+        acquired = True
         yield
     finally:
         fh.close()
-        with contextlib.suppress(OSError):
-            lock_path.unlink()
+        if acquired:
+            with contextlib.suppress(OSError):
+                lock_path.unlink()
