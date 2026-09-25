@@ -1830,6 +1830,118 @@ class TestBringUpShOnARealShell:
         remote_mux.bring_up(rig["node"], rig["recipe"], allow_dirty=True)
         assert (rig["root"] / "README.md").read_bytes() == b"edited on the node\n"
 
+    def _up_then_stop(self, rig) -> Path:
+        # A first bring-up, then the session gone: the next one reaches git.
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        (rig["state"] / "sessions" / "api").unlink()
+        return rig["root"]
+
+    def _origin_moves_on(self, rig) -> None:
+        commit(rig["clone"], name="o.txt", text="o\n", message="on origin")
+        git(rig["clone"], "push", "-q", "origin", "main")
+
+    @pytest.mark.parametrize("allow_dirty", [False, True])
+    def test_a_node_commit_no_branch_holds_is_exit_3_naming_it(self, rig, allow_dirty):
+        # Checking out the branch would orphan it: never, --allow-dirty or not.
+        root = self._up_then_stop(rig)
+        git(root, "checkout", "-q", "--detach")
+        commit(root, name="n.txt", text="n\n", message="node only")
+        mine = git(root, "rev-parse", "HEAD")
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(rig["node"], rig["recipe"], allow_dirty=allow_dirty)
+        assert info.value.rc == 3
+        assert git(root, "rev-parse", "--short", "HEAD") in info.value.stderr_tail
+        assert "detached" in info.value.stderr_tail
+        assert git(root, "rev-parse", "HEAD") == mine
+
+    def test_a_detached_head_a_branch_holds_is_brought_back_to_the_branch(self, rig):
+        root = self._up_then_stop(rig)
+        git(root, "checkout", "-q", "--detach")
+        self._origin_moves_on(rig)
+        result = remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert git(root, "symbolic-ref", "--short", "HEAD") == "main"
+        assert result.commits == {str(root): git(rig["clone"], "rev-parse", "HEAD")}
+
+    def test_a_node_on_another_branch_is_switched_and_says_so(self, rig, monkeypatch):
+        root = self._up_then_stop(rig)
+        git(root, "checkout", "-q", "-b", "side")
+        seen: list[bytes] = []
+        real = remote_mux.run_script
+
+        def spy(*args, **kwargs):
+            result = real(*args, **kwargs)
+            seen.append(result.stderr)
+            return result
+
+        monkeypatch.setattr(remote_mux, "run_script", spy)
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert git(root, "symbolic-ref", "--short", "HEAD") == "main"
+        assert f"magent: {root} was on side; switching it to main" in seen[-1].decode()
+
+    def test_a_node_commit_that_diverged_from_origin_is_exit_5_and_kept(self, rig):
+        root = self._up_then_stop(rig)
+        commit(root, name="n.txt", text="n\n", message="node only")
+        mine = git(root, "rev-parse", "HEAD")
+        self._origin_moves_on(rig)
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert info.value.rc == 5
+        assert "could not fast-forward (local changes or divergence)" in (
+            info.value.stderr_tail
+        )
+        assert git(root, "rev-parse", "HEAD") == mine
+
+    def test_a_divergence_refusal_leaves_the_tree_on_its_own_branch(self, rig):
+        root = self._up_then_stop(rig)
+        commit(root, name="n.txt", text="n\n", message="node only")
+        git(root, "checkout", "-q", "-b", "side")
+        self._origin_moves_on(rig)
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert info.value.rc == 5
+        assert git(root, "symbolic-ref", "--short", "HEAD") == "side"
+
+    def test_a_git_status_that_fails_is_exit_5_naming_it(self, rig):
+        # Not "clean": an unreadable tree is never waved through as unchanged.
+        root = self._up_then_stop(rig)
+        (root / ".git" / "HEAD").write_bytes(b"garbage\n")
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert info.value.rc == 5
+        assert f"magent: git status failed in {root}" in info.value.stderr_tail
+
+    def test_a_url_with_credentials_never_reaches_a_message(self, rig, monkeypatch):
+        monkeypatch.setenv("GIT_TERMINAL_PROMPT", "0")
+        url = "https://someone:sekret@127.0.0.1:1/x.git"
+        root = str(rig["root"])
+        header = _header_of(
+            "MAGENT1",
+            "0",
+            "1",
+            url,
+            "main",
+            root,
+            "3",
+            "bash",
+            "-lc",
+            "exec claude",
+            "0",
+        )
+        with pytest.raises(RemoteError) as info:
+            remote_mux.run_script(
+                rig["node"],
+                "bring_up",
+                ["up", "api", root, nodes.encoded_project_dir(root)],
+                timeout_s=30,
+                stdin=_raw_payload(header=header),
+            )
+        assert info.value.rc == 5
+        assert (
+            "magent: git clone of https://***@127.0.0.1:1/x.git failed"
+            in info.value.stderr_tail
+        )
+        assert "sekret" not in info.value.stderr_tail
+
     def test_a_tmux_older_than_3_2_is_exit_4(self, rig, monkeypatch):
         monkeypatch.setenv("FAKE_TMUX_VERSION", "tmux 3.1c")
         with pytest.raises(RemoteError) as info:

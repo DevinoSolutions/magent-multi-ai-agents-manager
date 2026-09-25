@@ -100,24 +100,48 @@ need_tmux() {
   fi
 }
 
+# A url may carry user:token@; no message ever shows it.
+redact_url() {
+  local u=$1
+  if [[ $u =~ ^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@(.*)$ ]]; then
+    u="${BASH_REMATCH[1]}***@${BASH_REMATCH[2]}"
+  fi
+  printf '%s' "$u"
+}
+
 update_repo() {
-  local url=$1 branch=$2 dir=$3
+  local url=$1 branch=$2 dir=$3 st refs head current
+  local stuck="$dir: could not fast-forward (local changes or divergence): $branch to origin/$branch; reconcile it on the node"
   if [ -d "$dir/.git" ]; then
-    if [ "$allow" != 1 ] && [ -n "$(git -C "$dir" status --porcelain --untracked-files=no)" ]; then
-      die 3 "$dir has uncommitted changes on the node; commit or discard them there, or pass --allow-dirty"
+    if [ "$allow" != 1 ]; then
+      st=$(git -C "$dir" status --porcelain --untracked-files=no) || die 5 "git status failed in $dir"
+      [ -z "$st" ] || die 3 "$dir has uncommitted changes on the node; commit or discard them there, or pass --allow-dirty"
     fi
     git -C "$dir" fetch -q origin -- "$branch" || die 5 "git fetch failed in $dir"
+    # Commits on a detached HEAD that no ref holds would be orphaned by the
+    # checkout below: refused whatever --allow-dirty says, losing commits is
+    # never allowed. A HEAD some ref holds is simply brought back.
+    if ! current=$(git -C "$dir" symbolic-ref -q --short HEAD); then
+      refs=$(git -C "$dir" for-each-ref --contains HEAD) || die 5 "git for-each-ref failed in $dir"
+      if [ -z "$refs" ]; then
+        head=$(git -C "$dir" rev-parse --short HEAD) || die 5 "no HEAD in $dir"
+        die 3 "$dir is on a detached HEAD at $head, a commit no branch holds; put it on a branch there (git branch <name> $head) first"
+      fi
+    elif [ "$current" != "$branch" ]; then
+      echo "magent: $dir was on $current; switching it to $branch" >&2
+    fi
     if git -C "$dir" rev-parse -q --verify "refs/heads/$branch" >/dev/null; then
+      # Before the checkout: a refusal leaves the tree on its own branch.
+      git -C "$dir" merge-base --is-ancestor "refs/heads/$branch" "refs/remotes/origin/$branch" || die 5 "$stuck"
       git -C "$dir" checkout -q "$branch" -- || die 5 "git checkout $branch failed in $dir"
-      git -C "$dir" merge -q --ff-only "origin/$branch" ||
-        die 5 "$dir: $branch on the node has diverged from origin; reconcile it there"
+      git -C "$dir" merge -q --ff-only "origin/$branch" || die 5 "$stuck"
     else
       git -C "$dir" checkout -q -b "$branch" --track "origin/$branch" ||
         die 5 "git checkout $branch failed in $dir"
     fi
   else
     mkdir -p -- "$(dirname -- "$dir")" || die 5 "cannot create the parent of $dir"
-    git clone -q --branch "$branch" -- "$url" "$dir" || die 5 "git clone of $url failed"
+    git clone -q --branch "$branch" -- "$url" "$dir" || die 5 "git clone of $(redact_url "$url") failed"
   fi
   commits[$dir]=$(git -C "$dir" rev-parse HEAD) || die 5 "no HEAD in $dir"
 }
@@ -220,7 +244,7 @@ main() {
     next_token dir
     # A token git could read as an option (--upload-pack=...) is refused
     # here, before any git runs; the calls below also end their options.
-    [[ $url != -* ]] || die 2 "a repo url may not start with -: $url"
+    [[ $url != -* ]] || die 2 "a repo url may not start with -: $(redact_url "$url")"
     [[ $branch != -* ]] || die 2 "a branch may not start with -: $branch"
     [[ $dir == /* ]] || die 2 "a repo folder must be absolute: $dir"
     urls+=("$url")
