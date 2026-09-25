@@ -41,11 +41,11 @@ if TYPE_CHECKING:
 
     from magent.config import MagentConfig
 
-# The daemon's ONE name, and the only "node-sync" literal in src/ (a source
-# test pins that). The heartbeat (log.run_heartbeat / log.heartbeat_age), the
-# daemon lock, the pid file, the tick's thread names and serve's supervisor
-# lock all derive from it. Every reader imports it from here --
-# node_cmd._daemon_state, launch.ensure_node_sync.
+# The daemon's ONE name, and the only "node-sync" literal in src/ (DECISION-17,
+# DECISION-26 i; a source test pins that). The heartbeat (log.run_heartbeat /
+# log.heartbeat_age), the daemon lock, the pid file, the tick's thread names and
+# serve's supervisor lock all derive from it. Every reader imports it from here
+# -- node_cmd._daemon_state, launch.ensure_node_sync.
 HEARTBEAT_NAME = "node-sync"
 LOCK_NAME = HEARTBEAT_NAME
 SUPERVISOR_LOCK_NAME = f"{HEARTBEAT_NAME}-supervisor"
@@ -53,6 +53,8 @@ LOG_NAME = "nodes"
 # Held around every pull of one node, so `down`'s final pull and the daemon's
 # tick never write the same mirror at once.
 NODE_LOCK_PREFIX = "node-pull-"
+# How often node_lock retries a held node lock while it waits.
+NODE_LOCK_RETRY_S = 0.2
 _PID_PATH = Path.home() / ".magent" / f"{HEARTBEAT_NAME}.pid"
 
 # One tick's outcome per node.
@@ -168,10 +170,16 @@ def stop_daemon(
 
 
 def wanted(config: MagentConfig) -> bool:
-    """Is there anything to sync: a pool, and a project pinned or placed on it?
-    A ``"cloud"`` project has no pool node and is not the daemon's."""
+    """Is there anything to sync: a pool, and an enabled project pinned or
+    placed on it? A ``"cloud"`` project has no pool node and is not the
+    daemon's.
+
+    This reads the config only and ignores the node map, so removing (or
+    disabling) the last node project stops the sync even for sessions still
+    live on a node. Deliberate (YAGNI); revisit if it bites."""
     return bool(config.settings.nodes) and any(
-        p.node is not None and p.node != NODE_CLOUD for p in config.projects
+        p.enabled and p.node is not None and p.node != NODE_CLOUD
+        for p in config.projects
     )
 
 
@@ -202,9 +210,10 @@ def node_lock(
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.monotonic,
 ) -> Iterator[None]:
-    """Hold ``node-pull-<nick>`` for one pull, retrying every 0.2s for up to
-    ``wait_s``. LockHeld when it stays taken. Only ACQUIRING is retried: a
-    LockHeld raised inside the body propagates as itself."""
+    """Hold ``node-pull-<nick>`` for one pull, retrying every
+    ``NODE_LOCK_RETRY_S`` for up to ``wait_s``. LockHeld when it stays taken.
+    Only ACQUIRING is retried: a LockHeld raised inside the body propagates as
+    itself."""
     deadline = now() + wait_s
     with contextlib.ExitStack() as stack:
         while True:
@@ -214,7 +223,7 @@ def node_lock(
             except LockHeld:
                 if now() >= deadline:
                     raise
-                sleep(0.2)
+                sleep(NODE_LOCK_RETRY_S)
         yield
 
 

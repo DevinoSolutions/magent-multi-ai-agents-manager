@@ -132,8 +132,8 @@ class MagentEnv(BaseSettings):
     # 42 agents alive in Session 0, unkillable from the desktop and holding
     # every session name the user's own bring-up wanted.
     session0_policy: Literal["handoff", "allow", "refuse"] = "handoff"
-    # Should `magent serve` keep the node sync daemon (`magent node sync -d`)
-    # alive? (default: 1 / on.) The daemon pulls every node session's
+    # Should `magent serve` keep the node sync daemon (a detached
+    # `magent node sync`) alive? (default: 1 / on.) The daemon pulls every node session's
     # transcripts and agent state home each settings.nodeSync.pullIntervalS,
     # which is what makes a session on a pool machine durable and resumable
     # anywhere; it is only ever started when some project has `node` set. Set

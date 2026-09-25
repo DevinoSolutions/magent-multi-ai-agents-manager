@@ -407,7 +407,9 @@ def ensure_upload_server(port: int, config_path: str | None = None) -> bool:
     return True
 
 
-def _validated_env() -> MagentEnv | None:
+def _validated_env(
+    label: str = "upload supervisor", log_name: str = "attention"
+) -> MagentEnv | None:
     """The env singleton, or None if it no longer validates.
 
     A daemon must never die of an environment variable it does not use, and by
@@ -415,6 +417,8 @@ def _validated_env() -> MagentEnv | None:
     already failed loudly at CLI entry -- so an env that goes bad underneath a
     detached process degrades to the defaults with a log line, exactly as
     ``upload_server.supervision_enabled`` and ``log._configured_level`` do.
+    ``label`` names the asking supervisor and ``log_name`` is its log, so the
+    line lands where that supervisor's reader looks.
     """
     from pydantic import ValidationError
 
@@ -423,8 +427,8 @@ def _validated_env() -> MagentEnv | None:
     try:
         return get_env()
     except ValidationError:
-        get_logger("attention").warning(
-            "upload supervisor: environment did not validate; using defaults"
+        get_logger(log_name).warning(
+            "%s: environment did not validate; using defaults", label
         )
         return None
 
@@ -449,8 +453,13 @@ def upload_supervision_enabled() -> bool:
 
 
 def node_sync_env_enabled() -> bool:
-    """Whether MAGENT_NODE_SYNC permits serve to keep the node sync daemon alive."""
-    env = _validated_env()
+    """Whether MAGENT_NODE_SYNC permits serve to keep the node sync daemon alive.
+    Fail-open on an env that no longer validates, like every supervisor: the
+    config gate (``node_sync.wanted``) still has to pass."""
+    # in-body: keeps launch's import list the launch path's
+    from magent.node_sync import LOG_NAME
+
+    env = _validated_env("node sync supervisor", LOG_NAME)
     return True if env is None else env.node_sync
 
 

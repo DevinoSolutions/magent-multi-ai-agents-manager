@@ -166,6 +166,11 @@ class TestWhenTheDaemonIsWanted:
     def test_an_empty_pool_does_not(self):
         assert not node_sync.wanted(_config(pool={}))
 
+    def test_a_disabled_node_project_alone_does_not(self):
+        assert not node_sync.wanted(
+            _config(projects=[ProjectConfig(path="api", node="second", enabled=False)])
+        )
+
     def test_a_cloud_project_alone_does_not(self):
         assert not node_sync.wanted(
             _config(projects=[ProjectConfig(path="api", node="cloud")])
@@ -202,7 +207,7 @@ class TestTheNodeLock:
             ),
         ):
             pass
-        assert naps == [0.2, 0.2]
+        assert naps == [node_sync.NODE_LOCK_RETRY_S] * 2
 
     def test_an_error_inside_the_lock_is_not_mistaken_for_contention(self):
         def never(_s: float) -> None:
@@ -334,9 +339,9 @@ class TestTheDaemonsPidFile:
 
 class TestTheImportLaw:
     def test_node_sync_never_imports_cli_launch_or_upload_server(self):
-        """node_sync is a leaf. launch and upload_server import IT (the
-        supervisor), and cli imports everything; walking the whole tree
-        catches an in-body import too."""
+        """Spec §5 / DECISION-19: node_sync is a leaf. launch and upload_server
+        import IT (the supervisor), and cli imports everything; walking the whole
+        tree catches an in-body import too."""
         tree = ast.parse(Path(node_sync.__file__).read_text(encoding="utf-8"))
         names = [
             a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names
@@ -356,9 +361,9 @@ class TestTheImportLaw:
 
 class TestTheDaemonHasOneName:
     def test_the_literal_occurs_exactly_once_in_src(self):
-        """HEARTBEAT_NAME is the only "node-sync" string literal in src/.
-        Docstrings and f-string pieces are other constants, so only a real
-        second copy of the name trips this."""
+        """DECISION-17 / DECISION-26 i: HEARTBEAT_NAME is the only "node-sync"
+        string literal in src/. Docstrings and f-string pieces are other
+        constants, so only a real second copy of the name trips this."""
         src = Path(node_sync.__file__).parent
         hits = [
             f"{path.relative_to(src).as_posix()}:{n.lineno}"
@@ -437,6 +442,25 @@ class TestEnsureNodeSync:
             "node",
             "sync",
         ]
+
+    def test_an_env_that_goes_bad_is_reported_as_the_node_sync_supervisors(
+        self, monkeypatch, caplog
+    ):
+        """Fail-open like every supervisor (the config gate still applies), and
+        the log line names THIS supervisor in THIS subsystem's log."""
+        from pydantic import ValidationError
+
+        def _bad():
+            raise ValidationError.from_exception_data("MagentEnv", [])
+
+        monkeypatch.setattr("magent.env.get_env", _bad)
+        caplog.set_level(logging.DEBUG)
+        assert launch.node_sync_env_enabled() is True
+        (record,) = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert record.name == "magent.nodes"
+        assert record.getMessage().startswith(
+            "node sync supervisor: environment did not validate"
+        )
 
     def test_nothing_is_spawned_when_the_env_says_no(self, spawned):
         assert launch.ensure_node_sync(_config(), "cfg.json") is False
