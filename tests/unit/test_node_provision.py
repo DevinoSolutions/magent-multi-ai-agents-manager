@@ -1830,7 +1830,13 @@ class TestProvisionShUnderRealBash:
     def test_a_python3_older_than_3_8_is_one_fail_row_naming_the_repair(self, tmp_path):
         sysbin = _sysbin(tmp_path, PROVISION_TOOLS, python=False, name="oldpy")
         old = sysbin / "python3"
-        old.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        # Old only where it matters: it fails the version check and runs
+        # anything else, so a gate that stops asking lets the apply run on.
+        old.write_text(
+            '#!/bin/sh\ncase "$*" in *"version_info >= (3, 8)"*) exit 1 ;; esac\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
         old.chmod(0o755)
         r = _run_provision(tmp_path, _node_payload(), sysbin=sysbin)
         assert r.returncode == 1
