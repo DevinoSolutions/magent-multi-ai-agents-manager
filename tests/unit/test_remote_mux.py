@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import dataclasses
 import inspect
 import json
@@ -12,6 +13,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -296,6 +298,26 @@ def spawned(monkeypatch):
 # pipe reads.
 CAP = 256 * 1024
 
+# A child that leaves a GRANDCHILD holding its stderr open (inherited, 30s
+# sleep; its pid goes to argv[1]), says one line on stderr, then floods stdout.
+_HELD_STDERR_CHILD = """\
+import subprocess, sys
+grandchild = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(30)"],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=None,
+)
+with open(sys.argv[1], "w") as f:
+    f.write(str(grandchild.pid))
+sys.stderr.write("boom: disk full\\n")
+sys.stderr.flush()
+block = b"x" * 65536
+while True:
+    sys.stdout.buffer.write(block)
+    sys.stdout.flush()
+"""
+
 
 class TestTheReplyIsBoundedInMemory:
     def test_every_entry_point_defaults_to_the_module_cap(self):
@@ -318,7 +340,8 @@ class TestTheReplyIsBoundedInMemory:
         started = time.monotonic()
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["big"], timeout_s=30, max_stdout_bytes=CAP)
-        assert time.monotonic() - started < 10
+        # Under the 30s timeout, with room for a loaded box (a spawn: 8-10s).
+        assert time.monotonic() - started < 25
         assert exc.value.rc is None
         assert exc.value.stderr_tail.splitlines()[0] == f"reply exceeded {CAP} bytes"
         assert exc.value.command_redacted[0] == "ssh"
@@ -381,6 +404,31 @@ class TestTheReplyIsBoundedInMemory:
         lines = exc.value.stderr_tail.splitlines()
         assert lines[0] == f"reply exceeded {CAP} bytes"
         assert "boom: disk full" in lines[1:]
+
+    def test_the_stderr_wait_after_the_cap_is_bounded_by_the_reap(self, tmp_path):
+        # A grandchild still holds stderr, so it never ends: the over-cap path
+        # must give up after the reap bound and raise without the tail, not
+        # wait out the grandchild's 30s.
+        pidfile = tmp_path / "grandchild.pid"
+        started = time.monotonic()
+        try:
+            with pytest.raises(RemoteError) as exc:
+                remote_mux._spawn(
+                    [sys.executable, "-c", _HELD_STDERR_CHILD, str(pidfile)],
+                    timeout_s=60,
+                    input_bytes=None,
+                    check=True,
+                    shown=("child",),
+                    label="test child",
+                    quiet=True,
+                    max_stdout_bytes=CAP,
+                )
+            elapsed = time.monotonic() - started
+        finally:
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(pidfile.read_text(encoding="utf-8")), signal.SIGTERM)
+        assert exc.value.stderr_tail == f"reply exceeded {CAP} bytes"
+        assert elapsed < 20
 
     def test_the_drain_drops_what_it_held_once_over_the_cap(self):
         # Two writes, so the first cap's worth is HELD before the byte that
