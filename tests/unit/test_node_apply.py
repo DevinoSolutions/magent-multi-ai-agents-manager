@@ -12,7 +12,7 @@ import os
 import sys
 import tarfile
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
@@ -20,9 +20,6 @@ from magent import node_scripts, remote_mux
 from magent.node_scripts import node_apply
 from magent.nodes import UserScope
 from tests.unit._fake_ssh import FakeSsh, make_fake_ssh
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 TOKEN = "gho_FAKE0123456789abcdefTOKEN"
 HOOK_TEXT = "#!/usr/bin/env bash\necho hook\n"
@@ -39,6 +36,7 @@ def _work(
     *,
     login: str | None = None,
     name: str = "work",
+    hook: str = HOOK_TEXT,
 ) -> Path:
     """build_payload's real archive, unpacked the way provision.sh's tar
     does. ``login`` set = a PC with a gh login (the token is TOKEN)."""
@@ -46,7 +44,7 @@ def _work(
         scope,
         gh_token=TOKEN if login else None,
         gh_login=login,
-        state_hook=HOOK_TEXT,
+        state_hook=hook,
     )
     work = root / name
     with tarfile.open(
@@ -242,11 +240,16 @@ class TestNothingLeaksAndEveryModeIsExplicit:
 
     @pytest.mark.skipif(not POSIX, reason="POSIX file modes")
     def test_modes_hold_under_a_hostile_umask(self, box, tmp_path):
+        # The payload is unpacked first: under this umask a non-root test
+        # could not write its own files.
+        work = _work(tmp_path)
         old = os.umask(0o277)  # would strip the owner's write bit
         try:
-            box.apply(_work(tmp_path))
+            box.apply(work)
         finally:
             os.umask(old)
+        assert _settings(box).stat().st_mode & 0o777 == 0o600
+        assert _settings(box).parent.stat().st_mode & 0o777 == 0o700
         store = box.home / ".magent" / "provision.json"
         assert store.stat().st_mode & 0o777 == 0o600
         assert (box.home / ".magent").stat().st_mode & 0o777 == 0o700
@@ -376,18 +379,44 @@ class TestTheSettings:
         ]
 
     @pytest.mark.parametrize(
-        "command",
+        ("command", "detail"),
         [
-            "C:/Users/x/Scripts/tool.EXE --go",
-            '"C:\\Program Files\\t\\run.bat" --go',
-            "tool.exe --go",
+            (
+                "C:/Users/x/Scripts/tool.EXE --go",
+                "C:/Users/x/Scripts/tool.EXE is a Windows path",
+            ),
+            (
+                '"C:\\Program Files\\t\\run.bat" --go',
+                "C:\\Program Files\\t\\run.bat is a Windows path",
+            ),
+            ("C:\\Users\\x\\tool.bat --go", "C:\\Users\\x\\tool.bat is a Windows path"),
+            ("tool.exe --go", "tool.exe is a Windows program"),
+            ("TOOL.EXE --go", "TOOL.EXE is a Windows program"),
+            # A Windows path in an ARGUMENT: the program (node) is on the node,
+            # the file it would run is not.
+            (
+                (
+                    'node "C:\\ProgramData\\nvm\\v24\\node_modules\\x\\notify.mjs"'
+                    " --source claude"
+                ),
+                (
+                    "C:\\ProgramData\\nvm\\v24\\node_modules\\x\\notify.mjs"
+                    " is a Windows path"
+                ),
+            ),
+            (
+                "node --config=C:\\cfg\\hook.json run",
+                "C:\\cfg\\hook.json is a Windows path",
+            ),
+            ("node bin\\helper.exe", "bin\\helper.exe is a Windows program"),
         ],
     )
-    def test_a_windows_program_is_dropped(self, box, tmp_path, capsys, command):
+    def test_a_windows_program_is_dropped(self, box, tmp_path, capsys, command, detail):
+        box.add("node")
+        box.add("tool")
         box.apply(_work(tmp_path, _pc_settings(_stop_hook(command))))
         (line,) = [line for line in _lines(capsys) if line.item == "hook:Stop"]
-        assert line.status == "drop"
-        assert "is a Windows program" in line.detail
+        assert line == remote_mux.ScriptLine("drop", "hook:Stop", detail)
 
     def test_a_hook_that_is_not_a_command_is_kept(self, box, tmp_path):
         prompt = {"type": "prompt", "prompt": "check the tests ran"}
@@ -464,3 +493,310 @@ class TestTheSettings:
         finally:
             os.umask(old)
         assert _settings(box).stat().st_mode & 0o777 == 0o600
+
+
+def _command_hook(command: str) -> dict[str, object]:
+    return {"type": "command", "command": command}
+
+
+def _drops(lines: list[remote_mux.ScriptLine], item: str) -> list[str]:
+    return [line.detail for line in lines if line.item == item]
+
+
+def _executable(path: Path, mode: int = 0o755) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n", encoding="utf-8")
+    path.chmod(mode)
+    return path
+
+
+class TestWhatTheNodeCanRun:
+    """The hook filter errs toward KEEPING what bash on the node would run:
+    it drops only what it can prove the node lacks."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'cd "$CLAUDE_PROJECT_DIR" && npm test',
+            "source ~/.bashrc; x",
+            '"$CLAUDE_PROJECT_DIR"/.claude/hooks/check.sh',
+            "./scripts/hook.sh",
+            "scripts/hook.sh --fast",
+            "[ -f .ready ] && x",
+            "test -f .ready",
+            ". ~/.profile",
+            "LEVEL=2 exec x",
+            "${TOOLS}/notify --done",
+        ],
+    )
+    def test_a_command_bash_would_run_or_that_cannot_be_judged_is_kept(
+        self, box, tmp_path, capsys, command
+    ):
+        box.apply(_work(tmp_path, _pc_settings(_stop_hook(command))))
+        assert _drops(_lines(capsys), "hook:Stop") == []
+        assert command in _commands(_json(_settings(box)), "Stop")
+
+    def test_a_home_path_is_resolved_under_the_nodes_home(self, box, tmp_path):
+        _executable(box.home / "bin" / "tool")
+        _executable(box.home / "bin" / "other")
+        box.apply(
+            _work(
+                tmp_path,
+                _pc_settings(
+                    {
+                        "hooks": {
+                            "Stop": [
+                                {
+                                    "hooks": [
+                                        _command_hook("~/bin/tool --x"),
+                                        _command_hook('"$HOME/bin/other"'),
+                                        _command_hook("${HOME}/bin/tool"),
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                ),
+            )
+        )
+        assert _commands(_json(_settings(box)), "Stop") == [
+            "~/bin/tool --x",
+            '"$HOME/bin/other"',
+            "${HOME}/bin/tool",
+            remote_mux.NODE_STATE_HOOK_COMMAND,
+        ]
+
+    def test_the_process_home_is_not_the_nodes_home(self, box, tmp_path, capsys):
+        # conftest points the process HOME at a different tmp dir: a tool
+        # there must not make ~/bin/elsewhere runnable on this node.
+        assert Path.home() != box.home
+        _executable(Path.home() / "bin" / "elsewhere")
+        box.apply(_work(tmp_path, _pc_settings(_stop_hook("~/bin/elsewhere"))))
+        assert _drops(_lines(capsys), "hook:Stop") == [
+            "~/bin/elsewhere is not on this node"
+        ]
+
+    @pytest.mark.parametrize(
+        ("command", "dropped"),
+        [
+            ("notify; missing-tool", []),
+            ("notify&&missing-tool", []),
+            ("(notify --x)", []),
+            ("{ notify; }", []),
+            ("`which notify` --x", []),
+            ("missing-tool; notify", ["missing-tool is not on this node"]),
+            ("(missing-tool)", ["missing-tool is not on this node"]),
+        ],
+    )
+    def test_only_the_first_word_up_to_an_operator_is_the_program(
+        self, box, tmp_path, capsys, command, dropped
+    ):
+        box.add("notify")
+        box.apply(_work(tmp_path, _pc_settings(_stop_hook(command))))
+        assert _drops(_lines(capsys), "hook:Stop") == dropped
+
+    def test_a_missing_absolute_program_is_dropped(self, box, tmp_path, capsys):
+        missing = "/nonexistent-magent-test/bin/tool"
+        box.apply(_work(tmp_path, _pc_settings(_stop_hook(f"{missing} --x"))))
+        assert _drops(_lines(capsys), "hook:Stop") == [f"{missing} is not on this node"]
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX absolute paths and X_OK")
+    def test_an_absolute_program_is_kept_only_when_executable(
+        self, box, tmp_path, capsys
+    ):
+        good = _executable(tmp_path / "bin" / "good")
+        flat = _executable(tmp_path / "bin" / "flat", mode=0o644)
+        (tmp_path / "bin" / "dir").mkdir()
+        entry = {
+            "hooks": [
+                _command_hook(f"{good} --x"),
+                _command_hook(str(flat)),
+                _command_hook(str(tmp_path / "bin" / "dir")),
+            ]
+        }
+        box.apply(_work(tmp_path, _pc_settings({"hooks": {"Stop": [entry]}})))
+        assert _drops(_lines(capsys), "hook:Stop") == [
+            f"{flat} is not executable on this node",
+            f"{tmp_path / 'bin' / 'dir'} is not on this node",
+        ]
+        assert _commands(_json(_settings(box)), "Stop") == [
+            f"{good} --x",
+            remote_mux.NODE_STATE_HOOK_COMMAND,
+        ]
+
+    @pytest.mark.parametrize(
+        ("command", "detail"),
+        [
+            ('notify "oops', "its command cannot be parsed"),
+            ("   ", "its command is empty"),
+            ("LEVEL=2", "its command is empty"),
+        ],
+    )
+    def test_an_unparseable_or_empty_command_is_dropped_with_a_row(
+        self, box, tmp_path, capsys, command, detail
+    ):
+        box.add("notify")
+        box.apply(_work(tmp_path, _pc_settings(_stop_hook(command))))
+        assert _drops(_lines(capsys), "hook:Stop") == [detail]
+
+    def test_a_status_line_running_a_windows_file_is_dropped(
+        self, box, tmp_path, capsys
+    ):
+        box.add("node")
+        pc = {
+            "statusLine": {
+                "type": "command",
+                "command": 'node "C:/Users/someone/.claude/statusline.mjs"',
+            }
+        }
+        box.apply(_work(tmp_path, _pc_settings(pc)))
+        assert _drops(_lines(capsys), "statusLine") == [
+            "C:/Users/someone/.claude/statusline.mjs is a Windows path"
+        ]
+        assert "statusLine" not in _json(_settings(box))
+
+    def test_a_status_line_that_is_not_a_command_is_left_alone(
+        self, box, tmp_path, capsys
+    ):
+        line = {"type": "static", "command": "C:/tools/line.exe"}
+        box.apply(_work(tmp_path, _pc_settings({"statusLine": line})))
+        assert _drops(_lines(capsys), "statusLine") == []
+        assert _json(_settings(box))["statusLine"] == line
+
+
+class TestTheHooksAreRebuilt:
+    def test_a_pc_hook_carrying_the_marker_is_not_shipped(self, box, tmp_path, capsys):
+        box.apply(
+            _work(
+                tmp_path,
+                _pc_settings(_stop_hook(remote_mux.NODE_STATE_HOOK_COMMAND)),
+            )
+        )
+        assert _drops(_lines(capsys), "hook:Stop") == []
+        assert _commands(_json(_settings(box)), "Stop") == [
+            remote_mux.NODE_STATE_HOOK_COMMAND
+        ]
+
+    def test_a_hook_that_is_not_an_object_is_dropped_with_a_row(
+        self, box, tmp_path, capsys
+    ):
+        box.add("notify")
+        entry = {"hooks": ["junk", _command_hook("notify")]}
+        box.apply(_work(tmp_path, _pc_settings({"hooks": {"Stop": [entry]}})))
+        assert _drops(_lines(capsys), "hook:Stop") == ["it is not a hook object"]
+        assert _commands(_json(_settings(box)), "Stop") == [
+            "notify",
+            remote_mux.NODE_STATE_HOOK_COMMAND,
+        ]
+
+    def test_an_entry_keeps_only_its_runnable_hooks(self, box, tmp_path):
+        box.add("notify")
+        entry = {
+            "matcher": "*",
+            "hooks": [_command_hook("notify"), _command_hook("missing-tool")],
+        }
+        box.apply(_work(tmp_path, _pc_settings({"hooks": {"Stop": [entry]}})))
+        stop = _json(_settings(box))["hooks"]["Stop"]
+        assert stop[0] == {"matcher": "*", "hooks": [_command_hook("notify")]}
+
+    def test_no_empty_entry_or_event_is_written(self, box, tmp_path):
+        box.add("notify")
+        hooks = {
+            "PreToolUse": [
+                {"matcher": "Bash", "hooks": [_command_hook("missing-tool")]},
+                {"matcher": "Edit", "hooks": [_command_hook("notify")]},
+            ],
+            "PreCompact": [{"hooks": [_command_hook("missing-tool")]}],
+        }
+        box.apply(_work(tmp_path, _pc_settings({"hooks": hooks})))
+        merged = _json(_settings(box))["hooks"]
+        assert merged["PreToolUse"] == [
+            {"matcher": "Edit", "hooks": [_command_hook("notify")]}
+        ]
+        assert "PreCompact" not in merged
+
+    def test_a_new_state_hook_rewires_the_settings(self, box, tmp_path, capsys):
+        scope = _pc_settings({"model": "opus"})
+        box.apply(_work(tmp_path, scope, name="one"))
+        capsys.readouterr()
+        box.apply(_work(tmp_path, scope, name="two", hook=HOOK_TEXT + "# v2\n"))
+        assert _status(_lines(capsys), "settings") == "did"
+
+    def test_no_state_hook_on_disk_means_no_wiring_and_a_warning(
+        self, box, tmp_path, capsys, monkeypatch
+    ):
+        steps = node_apply.STEPS
+        monkeypatch.setattr(
+            node_apply, "STEPS", (("settings", node_apply._step_settings),)
+        )
+        work = _work(tmp_path, _pc_settings({"model": "opus"}))
+        box.apply(work)
+        (warn,) = [line for line in _lines(capsys) if line.item == "hooks"]
+        assert warn.status == "warn"
+        text = _settings(box).read_text(encoding="utf-8")
+        assert node_apply.STATE_HOOK_MARKER not in text
+        monkeypatch.setattr(node_apply, "STEPS", steps)
+        box.apply(work)
+        assert _status(_lines(capsys), "settings") == "did"
+        assert _commands(_json(_settings(box)), "Stop") == [
+            remote_mux.NODE_STATE_HOOK_COMMAND
+        ]
+
+
+class TestTheMerge:
+    def test_env_is_merged_key_by_key_and_the_pc_wins(self, box, tmp_path):
+        _put(_settings(box), {"env": {"NODE_ONLY": "1", "SHARED": "node"}})
+        pc = {"env": {"SHARED": "pc", "PC_ONLY": "2"}}
+        box.apply(_work(tmp_path, _pc_settings(pc)))
+        assert _json(_settings(box))["env"] == {
+            "NODE_ONLY": "1",
+            "SHARED": "pc",
+            "PC_ONLY": "2",
+        }
+
+    def test_permission_rules_are_a_union_and_other_keys_the_pcs(self, box, tmp_path):
+        _put(
+            _settings(box),
+            {
+                "permissions": {
+                    "allow": ["Bash(ls)", "Read"],
+                    "deny": ["WebFetch"],
+                    "defaultMode": "plan",
+                }
+            },
+        )
+        pc = {
+            "permissions": {
+                "allow": ["Read", "Edit", "Read"],
+                "ask": ["Bash(rm:*)"],
+                "defaultMode": "acceptEdits",
+            }
+        }
+        box.apply(_work(tmp_path, _pc_settings(pc)))
+        assert _json(_settings(box))["permissions"] == {
+            "allow": ["Read", "Edit", "Bash(ls)"],
+            "deny": ["WebFetch"],
+            "ask": ["Bash(rm:*)"],
+            "defaultMode": "acceptEdits",
+        }
+
+    def test_an_empty_settings_file_is_an_empty_object(self, box, tmp_path, capsys):
+        _settings(box).parent.mkdir(parents=True)
+        _settings(box).write_bytes(b"")
+        box.apply(_work(tmp_path, _pc_settings({"model": "opus"})))
+        assert _status(_lines(capsys), "settings") == "did"
+        assert _json(_settings(box))["model"] == "opus"
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX symlinks and file modes")
+    def test_a_symlinked_settings_file_is_written_through_its_link(self, box, tmp_path):
+        real = tmp_path / "dotfiles" / "settings.json"
+        _put(real, {"theme": "dark"})
+        real.chmod(0o644)
+        _settings(box).parent.mkdir(parents=True)
+        _settings(box).symlink_to(real)
+        box.apply(_work(tmp_path, _pc_settings({"model": "opus"})))
+        assert _settings(box).is_symlink()
+        assert _json(real) == _json(_settings(box))
+        assert _json(real)["model"] == "opus"
+        assert _json(real)["theme"] == "dark"
+        assert real.stat().st_mode & 0o777 == 0o600
