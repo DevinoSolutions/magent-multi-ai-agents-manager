@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import pytest
+
 from magent.sessions import (
     FLASH_MSG_MAX,
     build_code_open_command,
@@ -11,6 +13,7 @@ from magent.sessions import (
     build_start_command,
     folder_for_session,
 )
+from magent.sessions import claude as claude_sessions
 from magent.sessions.claude import (
     claude_fresh_command,
     default_config_dir,
@@ -19,6 +22,7 @@ from magent.sessions.claude import (
     has_claude_session,
 )
 from magent.sessions.codex import codex_fresh_command, get_codex_session_ids
+from tests.conftest import REAL_HOME
 
 
 class TestEncodeClaudeProjectPath:
@@ -35,9 +39,20 @@ class TestEncodeClaudeProjectPath:
         result = encode_claude_project_path("/home/user/code/my-project")
         assert result == "-home-user-code-my-project"
 
-    def test_preserves_dots_and_dashes(self):
-        result = encode_claude_project_path("my-project.v2")
-        assert result == "my-project.v2"
+    def test_dots_become_dashes(self):
+        # Claude Code replaces EVERY non-alphanumeric character; the old rule
+        # kept '.', named the wrong directory, and made the fresh-start probe
+        # drop --continue for every dotted project.
+        assert encode_claude_project_path("my-project.v2") == "my-project-v2"
+
+    def test_underscores_become_dashes(self):
+        assert (
+            encode_claude_project_path(r"C:\Users\amind\AppData\Local\Temp\capture_cc")
+            == "C--Users-amind-AppData-Local-Temp-capture-cc"
+        )
+
+    def test_a_dot_directory_becomes_a_double_dash(self):
+        assert encode_claude_project_path("/home/amin/.claude") == "-home-amin--claude"
 
     def test_spaces_become_dashes(self):
         result = encode_claude_project_path("my project")
@@ -46,6 +61,63 @@ class TestEncodeClaudeProjectPath:
     def test_consecutive_special_chars_not_collapsed(self):
         result = encode_claude_project_path("a&&b")
         assert result == "a--b"
+
+
+class TestTheEncoderIsClaudeCodesOwnRule:
+    """Vectors read off claude.exe's own encoder:
+    ``replace(/[^a-zA-Z0-9]/g, "-")`` over UTF-16 code units, the drive
+    letter's case kept, and a name over 200 units cut to 200 + "-" +
+    base36(|Java String.hashCode of the ORIGINAL path|)."""
+
+    @pytest.mark.parametrize(
+        ("path", "expected"),
+        [
+            (
+                r"C:\p\stealth-chrome-devtools-mcp\.claude\worktrees\agent-a0ed696fa523ab8f6",
+                "C--p-stealth-chrome-devtools-mcp--claude-worktrees-agent-a0ed696fa523ab8f6",
+            ),
+            (
+                r"c:\Users\amind\OneDrive\Desktop\Projects\INTERNAL\devino-landing-page",
+                "c--Users-amind-OneDrive-Desktop-Projects-INTERNAL-devino-landing-page",
+            ),
+            ("/home/amin/magent/my_repo.v2", "-home-amin-magent-my-repo-v2"),
+        ],
+    )
+    def test_every_ascii_character_outside_letters_and_digits_becomes_a_dash(
+        self, path, expected
+    ):
+        assert encode_claude_project_path(path) == expected
+
+    def test_a_non_ascii_character_costs_one_dash_per_utf16_unit(self):
+        # é is one UTF-16 unit (one dash); the emoji is a surrogate pair (two).
+        # A code-point regex gives 3 trailing dashes here, a byte regex 6.
+        assert (
+            encode_claude_project_path("/home/amin/café \U0001f600")
+            == "-home-amin-caf----"
+        )
+
+    def test_a_name_over_200_units_is_cut_and_suffixed_with_the_paths_hash(self):
+        # A 250-'a' name: cut to 200 units, then the hash suffix of the whole path.
+        encoded = encode_claude_project_path("/home/amin/magent/" + "a" * 250)
+        assert encoded == "-home-amin-magent-" + "a" * 182 + "-d43su2"
+        assert len(encoded) == 207
+
+    def test_a_name_of_exactly_200_units_is_left_whole(self):
+        assert encode_claude_project_path("/" + "b" * 199) == "-" + "b" * 199
+
+    def test_the_cut_suffix_uses_the_hash_of_the_whole_original_path(self):
+        assert (
+            encode_claude_project_path("/" + "b" * 300) == "-" + "b" * 199 + "-km8bov"
+        )
+
+    def test_the_hash_is_javas_string_hash_code(self):
+        assert claude_sessions._java_string_hash("hello") == 99162322
+
+    def test_the_most_negative_hash_still_encodes_as_a_positive_number(self):
+        # "polygenelubricants".hashCode() is Integer.MIN_VALUE in Java: abs()
+        # must happen on the Python int, never wrap back to negative.
+        assert claude_sessions._java_string_hash("polygenelubricants") == -(2**31)
+        assert claude_sessions._base36(2**31) == "zik0zk"
 
 
 class TestGetClaudeSessionIds:
@@ -559,3 +631,73 @@ class TestBuildFlashUrl:
     def test_long_messages_are_clamped_to_the_shared_budget(self):
         url = build_flash_url("http://h:8033", "caly", "z" * (FLASH_MSG_MAX + 50))
         assert self._query(url)["msg"] == ["z" * FLASH_MSG_MAX]
+
+
+def _first_cwd(transcript: Path) -> str | None:
+    with transcript.open(encoding="utf-8", errors="replace") as f:
+        for _, line in zip(range(50), f, strict=False):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict) and isinstance(record.get("cwd"), str):
+                return record["cwd"]
+    return None
+
+
+def _real_project_dirs(limit: int = 400) -> list[tuple[Path, str]]:
+    """(directory, recorded cwd) for the real ~/.claude/projects -- READ ONLY.
+    Empty where there is no store (CI)."""
+    store = REAL_HOME / ".claude" / "projects"
+    if not store.is_dir():
+        return []
+    out: list[tuple[Path, str]] = []
+    for directory in sorted(store.iterdir())[:limit]:
+        if not directory.is_dir():
+            continue
+        for transcript in sorted(directory.glob("*.jsonl"))[:1]:
+            cwd = _first_cwd(transcript)
+            if cwd:
+                out.append((directory, cwd))
+    return out
+
+
+class TestTheEncoderMatchesClaudeCodesOwnStore:
+    """The encoder is only right if it names the directory the CLI actually
+    wrote. These read the REAL store, read-only, and skip where there is none.
+
+    The evidence behind the rule (2026-09-24, one developer machine): of 297
+    ~/.claude/projects dirs with a recorded cwd, 295 are named exactly
+    re.sub("[^A-Za-z0-9]", "-", cwd) (drive-letter case aside), and all 83
+    cwds containing '_' were encoded '-'. The old rule, [^a-zA-Z0-9._-], kept
+    '.' and '_' and so named the wrong directory for every such project. The
+    2 misses were sessions that cd'd into a worktree mid-run -- the new cwd is
+    recorded in a transcript filed under the old directory -- so a few misses
+    are tolerated here, never a systematic one."""
+
+    def test_this_checkouts_entry_is_named_by_the_encoder(self):
+        repo = str(Path(__file__).resolve().parents[2])
+        entry = next(
+            (
+                d
+                for d, cwd in _real_project_dirs()
+                if os.path.normcase(cwd) == os.path.normcase(repo)
+            ),
+            None,
+        )
+        if entry is None:
+            pytest.skip("no Claude Code session has run in this checkout")
+        assert encode_claude_project_path(repo).lower() == entry.name.lower()
+
+    def test_dotted_and_underscored_projects_match_the_store(self):
+        pairs = [
+            (d, cwd) for d, cwd in _real_project_dirs() if "." in cwd or "_" in cwd
+        ]
+        if not pairs:
+            pytest.skip("no dotted or underscored project in the real store")
+        wrong = [
+            (d.name, cwd)
+            for d, cwd in pairs
+            if encode_claude_project_path(cwd).lower() != d.name.lower()
+        ]
+        assert len(wrong) <= max(1, len(pairs) // 10), wrong[:5]
