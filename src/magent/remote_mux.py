@@ -667,7 +667,11 @@ class NodeSnapshot:
     - ``skipped``: per session, the archive names pull.sh left out because
       they were over ``PULL_MAX_MEMBER_BYTES`` on the node. NOT a failure:
       a file that stays over the cap would otherwise fail its session on
-      every tick and freeze its watermark forever. The caller reports them."""
+      every tick and freeze its watermark forever. The caller reports them;
+    - ``unreadable``: the same shape, for files (or transcript directories)
+      the node user could not read -- any errno but ENOENT. Not a failure
+      either, for the same reason: a file that stays unreadable would freeze
+      the watermark. Named rather than dropped in silence."""
 
     now: float
     sessions: tuple[str, ...]
@@ -677,6 +681,7 @@ class NodeSnapshot:
     files: tuple[Path, ...]
     failed_sids: frozenset[str]
     skipped: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    unreadable: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 def _pull_error(message: str) -> RemoteError:
@@ -719,10 +724,11 @@ def _names_dict(raw: object) -> dict[str, tuple[str, ...]]:
     }
 
 
-def _skipped_dict(raw: object) -> dict[str, tuple[str, ...]]:
-    """pull.sh's ``skipped`` map: ``{sid: [archive name, ...]}``. Only its
-    strings are kept; anything else there is ignored, never an error -- the
-    names are the node's report, read to be logged, never a path to open."""
+def _report_dict(raw: object) -> dict[str, tuple[str, ...]]:
+    """pull.sh's ``skipped`` and ``unreadable`` maps: ``{sid: [archive name,
+    ...]}``. Only its strings are kept; anything else there is ignored, never
+    an error -- the names are the node's report, read to be logged, never a
+    path to open."""
     if not isinstance(raw, dict):
         return {}
     kept = {
@@ -961,7 +967,10 @@ def parse_pull(stdout: bytes, *, dest: Path, sids: Collection[str]) -> NodeSnaps
         files=files,
         failed_sids=failed,
         skipped={
-            k: v for k, v in _skipped_dict(meta.get("skipped")).items() if k in wanted
+            k: v for k, v in _report_dict(meta.get("skipped")).items() if k in wanted
+        },
+        unreadable={
+            k: v for k, v in _report_dict(meta.get("unreadable")).items() if k in wanted
         },
     )
 
@@ -1037,12 +1046,15 @@ def pull(
     """Pull one session's transcripts and state newer than ``since_epoch``
     into the node's mirror (master §3; G's recall calls it with 0.0).
 
-    Two calls when the transcript dir is not known yet: the first learns the
-    session's real path on the node, the second asks for
-    ``~/.claude/projects/<encoded real path>`` -- the PC encodes, never the
-    node (DECISION-11f). Up to 2 x ``timeout_s`` in all. The watermark only
-    moves when every file was stored; a file the node skipped as over the cap
-    does not hold it (``NodeSnapshot.skipped``)."""
+    Stateless, so two calls whenever the node reports the session's real
+    path: the first asks for its state records alone and learns that path,
+    the second asks again with ``~/.claude/projects/<encoded real path>`` --
+    the PC encodes, never the node (DECISION-11f). One call when it reports
+    none. Up to 2 x ``timeout_s`` in all; a RemoteError from either call
+    propagates. The watermark only moves when neither call failed to store a
+    file; a file the node skipped as over the cap or could not read does not
+    hold it (``NodeSnapshot.skipped``/``unreadable``, which ``PullResult``
+    does not carry)."""
     # Before any ssh: parse_pull refuses the same name with ValueError, which
     # would mean THIS caller's bug, not the node's.
     if not pullable_sid(sid):

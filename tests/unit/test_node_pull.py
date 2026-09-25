@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+from pathlib import Path
 
 import pytest
 
@@ -275,6 +276,40 @@ class TestWhatTheNodeSkipped:
     def test_a_malformed_skipped_list_is_ignored(self, tmp_path, raw, seen):
         meta = pull_meta() if raw == "missing" else pull_meta(skipped=raw)
         assert _parse(pull_reply(meta), tmp_path / "second").skipped == seen
+
+
+class TestWhatTheNodeCouldNotRead:
+    """pull.sh names a file it could not read (any errno but ENOENT) under
+    ``unreadable``, the same shape as ``skipped``: reported, never silent,
+    and not a failure -- a file that stays unreadable would freeze the
+    watermark."""
+
+    def test_an_unreadable_file_is_reported_and_its_session_does_not_fail(
+        self, tmp_path
+    ):
+        meta = pull_meta(
+            unreadable={
+                "api": ["api/transcripts/locked.jsonl"],
+                "web": ["web/transcripts/w.jsonl"],
+            }
+        )
+        snap = _parse(pull_reply(meta), tmp_path / "second")
+        assert snap.unreadable == {"api": ("api/transcripts/locked.jsonl",)}
+        assert snap.skipped == {}
+        assert snap.failed_sids == frozenset()
+
+    @pytest.mark.parametrize(
+        ("raw", "seen"),
+        [
+            ("missing", {}),
+            ("api", {}),
+            ({"api": "a.jsonl"}, {}),
+            ({"api": ["a.jsonl", 3]}, {"api": ("a.jsonl",)}),
+        ],
+    )
+    def test_a_malformed_unreadable_list_is_ignored(self, tmp_path, raw, seen):
+        meta = pull_meta() if raw == "missing" else pull_meta(unreadable=raw)
+        assert _parse(pull_reply(meta), tmp_path / "second").unreadable == seen
 
 
 def _two_member_reply() -> tuple[bytes, int]:
@@ -744,6 +779,91 @@ class TestPull:
         assert result.since == 5000.0 - remote_mux.WATERMARK_OVERLAP_S
 
 
+REAL = "/home/amin/magent/api"
+
+
+def _snap(
+    now: float, *, files=(), failed=(), realpath: str | None = REAL
+) -> remote_mux.NodeSnapshot:
+    return remote_mux.NodeSnapshot(
+        now=now,
+        sessions=("api",),
+        sample=None,
+        realpaths={} if realpath is None else {"api": realpath},
+        state_files={},
+        files=tuple(files),
+        failed_sids=frozenset(failed),
+    )
+
+
+class TestTheWatermarkRuleIsPerCall:
+    """``pull``'s two calls answered separately (a scripted ``pull_node``, no
+    ssh): a failure in EITHER call holds the watermark, and a call that
+    raises ends ``pull`` with no result. One reply answering both calls
+    could not tell the two failure branches apart."""
+
+    @pytest.fixture
+    def script(self, monkeypatch):
+        """Queue what each pull_node call answers (a NodeSnapshot, or an
+        exception to raise); returns the SidPull each call was asked for."""
+        answers: list[remote_mux.NodeSnapshot | Exception] = []
+        asked: list[SidPull] = []
+
+        def fake(node, sids, *, dest=None, timeout_s=remote_mux.PULL_TIMEOUT_S):
+            assert node == NODE
+            (spec,) = sids.values()
+            asked.append(spec)
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        monkeypatch.setattr(remote_mux, "pull_node", fake)
+
+        def load(*queued):
+            answers.extend(queued)
+            return asked
+
+        return load
+
+    def test_both_calls_clean_moves_to_the_second_calls_clock(self, script):
+        a, b = Path("a"), Path("b")
+        asked = script(_snap(100.0, files=[a]), _snap(200.0, files=[b, a]))
+        result = remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert result == remote_mux.PullResult(
+            files=(a, b), since=200.0 - remote_mux.WATERMARK_OVERLAP_S
+        )
+        assert [s.project_dir for s in asked] == [None, encoded_project_dir(REAL)]
+
+    def test_a_failure_in_the_first_call_alone_holds_the_watermark(self, script):
+        script(_snap(100.0, failed=["api"]), _snap(200.0))
+        result = remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert result.since == 42.0
+
+    def test_a_failure_in_the_second_call_alone_holds_the_watermark(self, script):
+        # The transcripts arrive in call 2: advancing past one that failed to
+        # store would lose it for good.
+        script(_snap(100.0), _snap(200.0, failed=["api"]))
+        result = remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert result.since == 42.0
+
+    def test_a_second_call_that_raises_propagates_with_no_result(self, script):
+        boom = RemoteError(None, "timed out after 120s", ("ssh",))
+        asked = script(_snap(100.0), boom)
+        with pytest.raises(RemoteError) as info:
+            remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert info.value is boom
+        assert len(asked) == 2
+
+    def test_a_first_call_that_raises_makes_no_second(self, script):
+        boom = RemoteError(255, "Connection refused", ("ssh",))
+        asked = script(boom)
+        with pytest.raises(RemoteError) as info:
+            remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert info.value is boom
+        assert len(asked) == 1
+
+
 class TestTheScriptOwnsNoSocket:
     """DECISION-3 / DECISION-26 ii, B's convention: run_script sends the socket
     as $1, lib.sh reads it into $MAGENT_SOCKET (no default) and shifts it off.
@@ -770,13 +890,29 @@ class TestTheScriptOwnsNoSocket:
 
 
 @pytest.mark.skipif(
-    sys.platform != "linux"
-    or shutil.which("bash") is None
-    or shutil.which("python3") is None,
+    sys.platform != "linux",
     reason="pull.sh samples /proc: it runs for real on the Linux legs",
 )
 class TestPullShOnARealBash:
-    def _run(self, tmp_path, payload, *, path_env=None, socket=remote_mux.SOCKET):
+    @pytest.fixture(autouse=True)
+    def _needs_bash_and_python3(self):
+        """A Linux CI runner without bash or python3 is a provisioning bug,
+        so there it FAILS (the fleet tier's posture); a dev box skips."""
+        missing = [t for t in ("bash", "python3") if shutil.which(t) is None]
+        if missing and os.environ.get("GITHUB_ACTIONS") == "true":
+            pytest.fail(f"Linux CI runner without {', '.join(missing)}")
+        if missing:
+            pytest.skip(f"needs {', '.join(missing)}")
+
+    def _run(
+        self,
+        tmp_path,
+        payload,
+        *,
+        path_env=None,
+        socket=remote_mux.SOCKET,
+        timeout=60,
+    ):
         bash = shutil.which("bash")
         assert bash is not None
         fakebin = tmp_path / "fakebin"
@@ -798,7 +934,12 @@ class TestPullShOnARealBash:
         )
         argv = [bash, "-s", "--"] + ([] if socket is None else [socket])
         return subprocess.run(
-            argv, input=stdin, env=env, capture_output=True, timeout=60, check=False
+            argv,
+            input=stdin,
+            env=env,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
         )
 
     def _project(self, tmp_path):
@@ -917,3 +1058,79 @@ class TestPullShOnARealBash:
         # lib.sh's message
         assert b"tmux socket name is a required first argument" in done.stderr
         assert b"MAGENT-PULL" not in done.stdout
+
+    def _pull(self, tmp_path, pdir, *, timeout=60):
+        """Run pull.sh for api (since 0) and parse its reply into tmp/pc."""
+        payload = {
+            "sids": {
+                "api": {"roots": ["~/magent/api"], "project_dir": pdir, "since": 0.0}
+            }
+        }
+        done = self._run(tmp_path, payload, timeout=timeout)
+        assert done.returncode == 0, done.stderr.decode()
+        return parse_pull(done.stdout, dest=tmp_path / "pc", sids=frozenset({"api"}))
+
+    def test_a_fifo_a_link_or_a_huge_file_in_the_state_store_is_never_read(
+        self, tmp_path
+    ):
+        # Before the fix the FIFO blocked json.load until the pull timed out,
+        # and the /dev/zero link was read without end.
+        real, pdir, _ = self._project(tmp_path)
+        state = tmp_path / "node" / ".magent" / "state"
+        state.mkdir(parents=True)
+        os.mkfifo(state / "fifo.json")
+        (state / "zero.json").symlink_to("/dev/zero")
+        (state / "huge.json").write_text(
+            json.dumps({"cwd": real, "pad": "x" * 70_000}), encoding="utf-8"
+        )
+        (state / "ok.json").write_text(
+            json.dumps({"state": "working", "ts": 1, "cwd": real}), encoding="utf-8"
+        )
+        snap = self._pull(tmp_path, pdir, timeout=20)
+        assert snap.state_files == {"api": ("ok.json",)}
+        assert _stored(tmp_path / "pc") == ["api/state/ok.json"]
+
+    def test_only_regular_transcript_files_ship(self, tmp_path):
+        _, pdir, proj = self._project(tmp_path)
+        secret = tmp_path / "node" / "secret"
+        secret.write_text("secret", encoding="utf-8")
+        (proj / "a.jsonl").write_text("a", encoding="utf-8")
+        (proj / "link.jsonl").symlink_to(secret)
+        os.mkfifo(proj / "pipe.jsonl")
+        snap = self._pull(tmp_path, pdir, timeout=20)
+        assert _stored(tmp_path / "pc") == ["api/transcripts/a.jsonl"]
+        assert snap.unreadable == {}
+
+    def test_a_symlinked_project_dir_is_never_followed(self, tmp_path):
+        _, pdir, proj = self._project(tmp_path)
+        proj.rmdir()
+        keys = tmp_path / "node" / ".ssh"
+        keys.mkdir()
+        (keys / "id_ed25519").write_text("secret", encoding="utf-8")
+        proj.symlink_to(keys, target_is_directory=True)
+        snap = self._pull(tmp_path, pdir)
+        assert snap.files == ()
+        assert _stored(tmp_path / "pc") == []
+
+    def test_a_file_or_dir_this_user_cannot_read_is_named_unreadable(self, tmp_path):
+        if os.geteuid() == 0:
+            pytest.skip("root reads a mode-0 file: no EACCES to provoke")
+        _, pdir, proj = self._project(tmp_path)
+        (proj / "ok.jsonl").write_text("ok", encoding="utf-8")
+        locked = proj / "locked.jsonl"
+        locked.write_text("no", encoding="utf-8")
+        sub = proj / "sub"
+        sub.mkdir()
+        (sub / "x.jsonl").write_text("no", encoding="utf-8")
+        locked.chmod(0)
+        sub.chmod(0)
+        try:
+            snap = self._pull(tmp_path, pdir)
+        finally:
+            sub.chmod(0o700)
+            locked.chmod(0o600)
+        assert snap.unreadable == {
+            "api": ("api/transcripts/locked.jsonl", "api/transcripts/sub")
+        }
+        assert snap.failed_sids == frozenset()
+        assert _stored(tmp_path / "pc") == ["api/transcripts/ok.jsonl"]
