@@ -13,7 +13,8 @@ import shutil
 import subprocess
 import sys
 import tarfile
-from typing import TYPE_CHECKING
+import time
+from pathlib import Path
 
 import pytest
 
@@ -22,9 +23,6 @@ from magent.cli import hooks_cmd
 from magent.nodes import Node, UserScope
 from magent.remote_mux import RemoteError, ScriptLine
 from tests.unit._fake_ssh import FakeSsh, gh_auth_status, make_fake_ssh
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 class TestTheNodeStateHookIsWiredLikeThisPcs:
@@ -1375,6 +1373,16 @@ class TestProvision:
         with pytest.raises(TypeError):
             remote_mux.provision(NODE, _scope())
 
+    # M24: the node's hook is the packaged state_hook.sh, byte for byte -- not
+    # a copy that could drift from what `node_scripts` ships.
+    def test_the_state_hook_shipped_is_the_packaged_script(self, fake_ssh):
+        remote_mux.provision(NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S)
+        (call,) = fake_ssh.calls()
+        _, _, data = _unpack(_sent(call))
+        assert data["state-hook.sh"] == node_scripts.script("state_hook").encode(
+            "utf-8"
+        )
+
     def test_a_failed_call_names_stdin_by_its_length_never_the_token(
         self, fake_ssh, fake_gh, caplog
     ):
@@ -1422,6 +1430,39 @@ def _node_payload(scope: UserScope | None = None, *, token: str | None = None) -
     )
 
 
+def _provision_spawn(
+    tmp_path: Path,
+    *,
+    fakes: tuple[FakeSsh, ...] = (),
+    args: tuple[str, ...] = (),
+    python: bool = True,
+    sysbin: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> dict[str, object]:
+    """The subprocess keywords that run provision.sh under real bash, exactly
+    as ssh would, for a node whose home is tmp_path/node -- which is also the
+    cwd, as over ssh. ``env`` adds to (or overrides) the three set here."""
+    (tmp_path / "node").mkdir(exist_ok=True)
+    (tmp_path / "tmp").mkdir(exist_ok=True)
+    if sysbin is None:
+        sysbin = _sysbin(
+            tmp_path,
+            PROVISION_TOOLS,
+            python=python,
+            name="sysbin" if python else "nopy",
+        )
+    return {
+        "args": _bash_argv(*args),
+        "cwd": tmp_path / "node",
+        "env": {
+            "HOME": str(tmp_path / "node"),
+            "PATH": os.pathsep.join([*(str(f.base) for f in fakes), str(sysbin)]),
+            "TMPDIR": str(tmp_path / "tmp"),
+            **(env or {}),
+        },
+    }
+
+
 def _run_provision(
     tmp_path: Path,
     payload: bytes,
@@ -1432,32 +1473,48 @@ def _run_provision(
     sysbin: Path | None = None,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    """provision.sh under real bash, exactly as ssh would feed it, for a node
-    whose home is tmp_path/node -- which is also the cwd, as over ssh.
-    ``env`` adds to (or overrides) the three variables set here."""
-    (tmp_path / "node").mkdir(exist_ok=True)
-    (tmp_path / "tmp").mkdir(exist_ok=True)
-    if sysbin is None:
-        sysbin = _sysbin(
-            tmp_path,
-            PROVISION_TOOLS,
-            python=python,
-            name="sysbin" if python else "nopy",
-        )
+    """provision.sh fed ``payload``, to completion (``_provision_spawn``)."""
+    spawn = _provision_spawn(
+        tmp_path, fakes=fakes, args=args, python=python, sysbin=sysbin, env=env
+    )
     return subprocess.run(
-        _bash_argv(*args),
+        **spawn,
         input=remote_mux._frame_script(node_scripts.script("provision"), payload),
         capture_output=True,
-        cwd=tmp_path / "node",
-        env={
-            "HOME": str(tmp_path / "node"),
-            "PATH": os.pathsep.join([*(str(f.base) for f in fakes), str(sysbin)]),
-            "TMPDIR": str(tmp_path / "tmp"),
-            **(env or {}),
-        },
         timeout=120,
         check=False,
     )
+
+
+def _slow_gh(where: Path, seconds: float) -> Path:
+    """A ``gh`` in ``where`` that drains stdin, touches ``where/gh-started``,
+    then sleeps ``seconds`` and exits 0 -- every call, whatever the verb.
+    Its tools by absolute path: the PATH under test holds only what a
+    provision needs, and a ``sleep`` it cannot find exits 127 at once."""
+    where.mkdir(parents=True, exist_ok=True)
+    cat, sleep = shutil.which("cat"), shutil.which("sleep")
+    assert cat is not None
+    assert sleep is not None
+    gh = where / "gh"
+    gh.write_text(
+        f'#!/bin/sh\n"{cat}" >/dev/null\n: > "{where}/gh-started"\n'
+        f'exec "{sleep}" {seconds}\n',
+        encoding="utf-8",
+    )
+    gh.chmod(0o755)
+    return where / "gh-started"
+
+
+def _proc_blobs(name: str) -> dict[str, bytes]:
+    """/proc/<pid>/<name> for every process this user may read."""
+    blobs: dict[str, bytes] = {}
+    for proc in Path("/proc").iterdir():
+        if proc.name.isdigit():
+            try:
+                blobs[proc.name] = (proc / name).read_bytes()
+            except OSError:
+                continue
+    return blobs
 
 
 def _rows(result: subprocess.CompletedProcess[bytes]) -> dict[str, str]:
@@ -1612,6 +1669,118 @@ class TestProvisionShUnderRealBash:
         assert r.returncode == 0, r.stderr
         assert _rows(r)["state_hook"] == "did"
         assert list((tmp_path / "node" / "-t").iterdir()) == []
+
+    # M4 (survivor): gh installed by `magent node setup` lives in ~/.local/bin,
+    # which a non-login ssh PATH lacks -- provision.sh puts it first.
+    def test_a_gh_only_in_the_nodes_local_bin_is_found(self, tmp_path):
+        gh = make_fake_ssh(tmp_path, name="gh")
+        local_bin = tmp_path / "node" / ".local" / "bin"
+        local_bin.mkdir(parents=True)
+        shutil.copy2(gh.path, local_bin / "gh")
+        r = _run_provision(tmp_path, _node_payload(token=TOKEN))
+        assert r.returncode == 0, r.stderr
+        assert _rows(r)["gh"] == "did"
+        assert any(c.argv[:2] == ["auth", "login"] for c in gh.calls())
+
+    # M9 (survivor): a payload cut short in transit is one fail row, and the
+    # private work dir it half-filled is gone.
+    def test_a_truncated_payload_is_a_fail_row_and_leaves_nothing(self, tmp_path):
+        payload = _node_payload()
+        r = _run_provision(tmp_path, payload[: len(payload) // 2])
+        assert r.returncode == 1
+        assert _rows(r) == {"payload": "fail"}
+        assert list((tmp_path / "tmp").iterdir()) == []
+        assert not (tmp_path / "node" / ".magent").exists()
+
+    # M24 (survivor): what lands at the hook path is the packaged script.
+    def test_the_installed_state_hook_is_the_packaged_script(self, tmp_path):
+        hook_text = node_scripts.script("state_hook")
+        payload = remote_mux.build_payload(
+            _scope(), gh_token=None, gh_login=None, state_hook=hook_text
+        )
+        r = _run_provision(tmp_path, payload)
+        assert r.returncode == 0, r.stderr
+        hook = tmp_path / "node" / ".magent" / "bin" / "state-hook.sh"
+        assert hook.read_bytes() == hook_text.encode("utf-8")
+
+    # M5 (survivor): while node_apply is mid-step (gh logging in), no process
+    # on the box carries the token in its environment or its argv -- it is on
+    # one pipe, and nowhere else.
+    def test_mid_apply_no_process_holds_the_token_in_env_or_argv(self, tmp_path):
+        started = _slow_gh(tmp_path / "slowgh", 3)
+        spawn = _provision_spawn(tmp_path)
+        env = spawn["env"]
+        assert isinstance(env, dict)
+        env["PATH"] = f"{tmp_path / 'slowgh'}{os.pathsep}{env['PATH']}"
+        framed = tmp_path / "framed"
+        framed.write_bytes(
+            remote_mux._frame_script(
+                node_scripts.script("provision"), _node_payload(token=TOKEN)
+            )
+        )
+        with (
+            framed.open("rb") as stdin,
+            subprocess.Popen(
+                **spawn, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            ) as proc,
+        ):
+            deadline = time.monotonic() + 30
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert started.exists(), "gh never ran"
+            environs = _proc_blobs("environ")
+            cmdlines = _proc_blobs("cmdline")
+            out, err = proc.communicate(timeout=60)
+        assert any(b"node_apply" in c for c in cmdlines.values())  # it was seen
+        secret = TOKEN.encode("ascii")
+        assert [pid for pid, blob in environs.items() if secret in blob] == []
+        assert [pid for pid, blob in cmdlines.items() if secret in blob] == []
+        assert proc.returncode == 0, err
+        assert secret not in out + err
+
+    # I1: when PROVISION_TIMEOUT_S fires, this PC kills its ssh and the node's
+    # stdout pipe closes under a still-running apply. That apply must finish
+    # the scope -- not die at its next row -- and still clean up after itself.
+    @pytest.mark.xfail(
+        strict=True,
+        reason="I1: node_apply stops at its first row after EPIPE until F10's "
+        "_row fix arrives with the settled F11 tip",
+    )
+    def test_an_apply_whose_stdout_closes_mid_run_still_lands_the_scope(self, tmp_path):
+        _slow_gh(tmp_path / "slowgh", 3)  # login + setup-git: ~6s to row one
+        spawn = _provision_spawn(tmp_path)
+        env = spawn["env"]
+        assert isinstance(env, dict)
+        env["PATH"] = f"{tmp_path / 'slowgh'}{os.pathsep}{env['PATH']}"
+        scope = _scope(
+            settings={"model": "opus"},
+            mcp_servers={"docs": {"type": "http", "url": "https://docs.example/mcp"}},
+        )
+        framed = tmp_path / "framed"
+        framed.write_bytes(
+            remote_mux._frame_script(
+                node_scripts.script("provision"), _node_payload(scope, token=TOKEN)
+            )
+        )
+        with (
+            framed.open("rb") as stdin,
+            (tmp_path / "stderr").open("wb") as err,
+            subprocess.Popen(
+                **spawn, stdin=stdin, stdout=subprocess.PIPE, stderr=err
+            ) as proc,
+        ):
+            assert proc.stdout is not None
+            time.sleep(1.5)
+            proc.stdout.close()  # what a killed ssh leaves the node with
+            proc.wait(timeout=60)
+        home = tmp_path / "node"
+        settings = json.loads((home / ".claude" / "settings.json").read_text("utf-8"))
+        assert settings["model"] == "opus"
+        claude_json = json.loads((home / ".claude.json").read_text("utf-8"))
+        assert "docs" in claude_json["mcpServers"]
+        hook = home / ".magent" / "bin" / "state-hook.sh"
+        assert hook.read_text(encoding="utf-8") == HOOK_TEXT
+        assert list((tmp_path / "tmp").iterdir()) == []
 
 
 @POSIX_BASH
