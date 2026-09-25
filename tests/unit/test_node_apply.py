@@ -553,7 +553,9 @@ class TestTheMcpServers:
         box.apply(_work(tmp_path, replace(EMPTY, mcp_servers={"chrome": RELAY})))
         assert _claude_json(box).stat().st_mode & 0o777 == 0o600
         assert _json(_claude_json(box))["mcpServers"]["chrome"] == RELAY
-        assert not list(box.home.glob(".claude.json.magent-tmp*"))
+        # Every temp name _install has used ends ".magent-tmp" (F8's mkstemp
+        # name is "..claude.json.<rand>.magent-tmp"), so match on the suffix.
+        assert not list(box.home.glob("*.magent-tmp"))
 
 
 def _oauth(access: str = "PC-TOKEN") -> dict[str, object]:
@@ -715,6 +717,37 @@ class TestTheMcpOAuthIsTrackedPerEntry:
         capsys.readouterr()
         box.apply(work)
         assert _status(_lines(capsys), "mcp_oauth") == "skip"
+
+    def test_an_entry_back_on_the_pc_unchanged_keeps_the_nodes_refresh(
+        self, box, tmp_path, capsys
+    ):
+        # The server leaves this PC (so its entry stops shipping) and comes
+        # back with the same entry: the node refreshed it meanwhile, and the
+        # PC's copy is still the older one.
+        box.apply(_work(tmp_path, _two()))
+        _refresh_on_node(box, A, "NODE-REFRESHED-A")
+        without_a = replace(
+            _two(),
+            mcp_servers={"wiki": TWO_SERVERS["wiki"]},
+            mcp_oauth={B: _two().mcp_oauth[B]},
+        )
+        box.apply(_work(tmp_path, without_a, name="w2"))
+        capsys.readouterr()
+        box.apply(_work(tmp_path, _two(), name="w3"))
+        assert _status(_lines(capsys), "mcp_oauth") == "skip"
+        assert _node_token(box, A) == "NODE-REFRESHED-A"
+
+    def test_an_entry_back_on_the_pc_changed_is_applied(self, box, tmp_path):
+        box.apply(_work(tmp_path, _two()))
+        _refresh_on_node(box, A, "NODE-REFRESHED-A")
+        without_a = replace(
+            _two(),
+            mcp_servers={"wiki": TWO_SERVERS["wiki"]},
+            mcp_oauth={B: _two().mcp_oauth[B]},
+        )
+        box.apply(_work(tmp_path, without_a, name="w2"))
+        box.apply(_work(tmp_path, _two(a="PC-A2"), name="w3"))
+        assert _node_token(box, A) == "PC-A2"
 
     def test_force_does_not_undo_a_node_refresh(self, box, tmp_path):
         work = _work(tmp_path, _two())
