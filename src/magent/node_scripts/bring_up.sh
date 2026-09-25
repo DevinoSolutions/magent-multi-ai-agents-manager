@@ -122,27 +122,48 @@ update_repo() {
   commits[$dir]=$(git -C "$dir" rev-parse HEAD) || die 5 "no HEAD in $dir"
 }
 
+# `capture VAR cmd...`: VAR = cmd's stdout minus the ONE newline realpath,
+# dirname and mktemp end it with. A bare $(...) strips EVERY trailing newline,
+# and a path may end in one -- `.env<LF>` would be resolved as `.env`.
+capture() {
+  local out
+  out=$("${@:2}" && printf x) || return 1
+  printf -v "$1" '%s' "${out%?x}"
+}
+
 # Copy every file under $1 into the EXISTING folder $2, mode 600, and set
-# `copied` to their relative names. Each destination is resolved first, so a
-# link already on the node (a folder or a file pointing out of $2) is refused,
-# never written through; one that stays inside $2 is followed.
+# `copied` to their relative names. Every name is checked before anything is
+# written. Each destination is resolved first, so a link already on the node
+# (a folder or a file pointing out of $2) is refused, never written through;
+# one that stays inside $2 is followed. A file is written to a fresh 0600 temp
+# beside its target and renamed over it: an old 0644 file is replaced, never
+# rewritten in place under a reader that holds it open. Folders created on the
+# way are 0700 (umask 077) -- intended containment, not an accident.
 copy_tree() {
-  local src=$1 dest=$2 base rel target mask
+  local src=$1 dest=$2 base rel target dir tmp mask
+  local -a rels=()
   copied=()
   [ -d "$src" ] || return 0
-  base=$(realpath -e -- "$dest") || die 5 "cannot resolve $dest"
-  mask=$(umask)
-  umask 077
   while IFS= read -r -d '' rel; do
     rel=${rel#./}
-    target=$(realpath -m -- "$dest/$rel") || die 5 "cannot resolve $dest/$rel"
+    [[ $rel != *[[:cntrl:]]* ]] || die 2 "payload member $(printf %q "$rel") has a control character in its name"
+    rels+=("$rel")
+  done < <(cd -- "$src" && find . -type f -print0 | sort -z)
+  capture base realpath -e -- "$dest" || die 5 "cannot resolve $dest"
+  mask=$(umask)
+  umask 077
+  for rel in "${rels[@]}"; do
+    capture target realpath -m -- "$dest/$rel" || die 5 "cannot resolve $dest/$rel"
     [[ $target == "$base"/* ]] || die 5 "$dest/$rel resolves outside $dest ($target); not writing through a link"
     [ ! -d "$target" ] || die 5 "$dest/$rel is a folder on the node"
-    mkdir -p -- "$(dirname -- "$target")" || die 5 "cannot create a folder for $rel"
-    cp -- "$src/$rel" "$target" || die 5 "cannot write $dest/$rel"
-    chmod 600 -- "$target" || die 5 "cannot chmod $dest/$rel"
+    capture dir dirname -- "$target" || die 5 "cannot resolve $dest/$rel"
+    mkdir -p -- "$dir" || die 5 "cannot create a folder for $rel"
+    capture tmp mktemp -- "$dir/.magent-ship.XXXXXX" || die 5 "cannot write $dest/$rel"
+    # mktemp creates it 0600 whatever the umask; cp into it keeps that mode.
+    cp -- "$src/$rel" "$tmp" || { rm -f -- "$tmp"; die 5 "cannot write $dest/$rel"; }
+    mv -f -- "$tmp" "$target" || { rm -f -- "$tmp"; die 5 "cannot write $dest/$rel"; }
     copied+=("$rel")
-  done < <(cd -- "$src" && find . -type f -print0 | sort -z)
+  done
   umask "$mask"
 }
 

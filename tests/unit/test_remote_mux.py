@@ -1441,6 +1441,13 @@ class TestTheBringUpStaysInsideItsFolders:
         with pytest.raises(ValueError):
             remote_mux._archive_name(rel)
 
+    @pytest.mark.parametrize("rel", [".env\n", "a\nb/.env", "a\x1bb", "tab\there"])
+    def test_an_archive_name_with_a_control_character_is_refused(self, rel):
+        # The node's shell strips trailing newlines in $(...): `.env\n` would
+        # be resolved as `.env`, beside whatever link the node has there.
+        with pytest.raises(ValueError, match="control character"):
+            remote_mux._archive_name(rel)
+
     @pytest.mark.parametrize("root", ["magent/api", "-oProxyCommand=x/api"])
     def test_a_node_root_that_is_not_absolute_is_refused_before_the_script(
         self, node_home, tmp_path, root
@@ -1979,6 +1986,57 @@ class TestBringUpShOnARealShell:
             self._push_raw(rig, _raw_payload(("project/.env", b"K=V\n")))
         assert info.value.rc == 5
         assert secret.read_bytes() == b"mine\n"
+
+    def test_a_member_name_ending_in_a_newline_is_exit_2_and_never_written_through(
+        self, rig
+    ):
+        # $(realpath ...) strips the trailing newline: `project/.env\n` would
+        # resolve as `$root/.env` and the copy would follow the node's link.
+        root = rig["root"]
+        root.mkdir(parents=True)
+        secret = rig["outside"] / "secret"
+        secret.write_bytes(b"mine\n")
+        (root / ".env").symlink_to(secret)
+        with pytest.raises(RemoteError) as info:
+            self._push_raw(
+                rig,
+                _raw_payload(("project/a.txt", b"a\n"), ("project/.env\n", b"K=V\n")),
+            )
+        assert info.value.rc == 2
+        assert "control character" in info.value.stderr_tail
+        assert secret.read_bytes() == b"mine\n"
+        # Refused before anything was written, the good member included.
+        assert _tree(root) == [".env"]
+
+    def test_a_folder_whose_name_ends_in_a_newline_is_resolved_as_itself(self, rig):
+        # The containment base goes through the same newline-safe capture: a
+        # bare $(realpath) would resolve `api\n` as `api` and refuse the push.
+        root = rig["root"].with_name("api\n")
+        root.mkdir(parents=True)
+        result = remote_mux.run_script(
+            rig["node"],
+            "bring_up",
+            ["push", "api", str(root), nodes.encoded_project_dir(str(rig["root"]))],
+            timeout_s=30,
+            stdin=_raw_payload(("project/.env", b"K=V\n")),
+        )
+        assert json.loads(result.stdout)["shipped"] == [".env"]
+        assert (root / ".env").read_bytes() == b"K=V\n"
+        assert not rig["root"].exists()
+
+    def test_a_push_leaves_every_shipped_file_owner_only(self, rig):
+        # A file already on the node at 0644 is REPLACED by a 0600 one, never
+        # rewritten in place (a reader holding it open never sees the secret).
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        env = rig["root"] / ".env"
+        env.chmod(0o644)
+        before = env.stat().st_ino
+        remote_mux.push_files(rig["node"], rig["recipe"])
+        assert stat.S_IMODE(env.stat().st_mode) == 0o600
+        assert env.stat().st_ino != before
+        assert [
+            p.name for p in rig["root"].iterdir() if p.name.startswith(".magent")
+        ] == []
 
     def test_a_link_that_stays_inside_the_folder_is_written_through(self, rig):
         root = rig["root"]

@@ -760,10 +760,14 @@ def _archive_name(rel: str) -> str:
     file name with a literal backslash in it. Mapping ``\\`` is also what
     makes a POSIX file literally named ``a\\..\\..\\x`` climb, so the mapped
     name is refused (ValueError) when it is absolute or has an empty, ``.``
-    or ``..`` segment."""
+    or ``..`` segment. A control character is refused too: the node's shell
+    strips a trailing newline in ``$(...)``, so ``.env\\n`` would resolve as
+    ``.env`` (the node refuses it as well)."""
     name = rel.replace("\\", "/")
     if any(part in ("", ".", "..") for part in name.split("/")):
         raise ValueError(f"{rel!r} cannot name a file inside the project")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
+        raise ValueError(f"{rel!r} has a control character in its name")
     return name
 
 
