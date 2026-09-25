@@ -9,6 +9,7 @@ pay for ssh and tar).
 
 from __future__ import annotations
 
+import re
 import shutil
 import sys
 import time
@@ -406,7 +407,8 @@ def plan_cmd(ctx: click.Context, project: str | None, all_projects: bool) -> Non
 # D-MERGE: `magent node push` (plan G Task 13: push_cmd and _current_nick at
 # :3390-3440, its docs row at :3444-3449) re-ships through D's recipe builder
 # and delivery -- launch.node_recipe, launch.node_git_states and
-# remote_mux.push_files -- so the whole command lands with D's merge.
+# remote_mux.push_files -- so the whole command lands with D's merge. `_tail`
+# (:3398-3399) already landed with recall (T14); do not re-add it.
 # tests/unit/test_node_cmd.py::TestNodePush is written and switches on then.
 
 
@@ -533,28 +535,50 @@ def _report_repos(source: Node | None, held: NodeMapEntry) -> None:
         )
 
 
+# A sid the ssh one-liner can carry inside its double quotes untouched.
+_PLAIN_SID = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def _kill_hint(target: str | None, sid: str) -> str:
+    """How to stop ``sid`` by hand: the tmux command to run on the node, or,
+    given the node's ssh ``target``, how to run it from here.
+
+    DECISION-26 iii: the target is single-quoted -- zsh reads a bare =sid as
+    a command lookup. ``pullable_sid`` lets ``'``, ``$``, a backtick and ``!``
+    through (a title like "Amin's site"), so the quoting is real rather than
+    pasted: a ``'`` is closed, escaped and reopened. Inside the ssh line's
+    double quotes the LOCAL shell would still expand ``$(...)``, a backtick or
+    ``!``, so only a plain sid gets the plan's one-liner; any other gets two
+    steps, with nothing double-quoted."""
+    from magent import remote_mux  # heavy subsystem: in-body per policy
+
+    quoted = "'" + ("=" + sid).replace("'", "'\\''") + "'"
+    kill = f"tmux -L {remote_mux.SOCKET} kill-session -t {quoted}"
+    if target is None:
+        return f"stop it there with: {kill}"
+    if _PLAIN_SID.fullmatch(sid):
+        return f'stop it with: ssh {target} "{kill}"'
+    return f"stop it there -- ssh {target}, then run on the node: {kill}"
+
+
 def _stop_session(source: Node | None, held: NodeMapEntry) -> None:
     """Step 3, best effort: a session that cannot be stopped is named, with
     the exact command that stops it."""
-    from magent import remote_mux  # heavy subsystem: in-body per policy
-
-    # DECISION-26 iii: the printed target is quoted -- zsh reads a bare =sid
-    # as a command lookup -- and the ssh form quotes the whole remote command.
-    kill = f"tmux -L {remote_mux.SOCKET} kill-session -t '={held.sid}'"
     if source is None:
         _note(
             f"{held.sid} may still be running on @{held.nick};"
-            f" stop it there with: {kill}"
+            f" {_kill_hint(None, held.sid)}"
         )
         return
     # D-MERGE: plan G :3865-3874 replaces this line with D's
     # remote_mux.kill_session(source, held.sid) and its three outcomes --
-    # "stopped" only on True, "no such session" on False, the quoted ssh
-    # command on None (DECISION-26 x). Until D lands nothing can stop the
-    # session from here, so it is named with the command that does.
+    # "stopped" only on True, "no such session" on False, and on None the
+    # command from _kill_hint(source.target, held.sid), never the plan's raw
+    # f-string (spec-G14 P1). Until D lands nothing can stop the session from
+    # here, so it is named with the command that does.
     _note(
-        f"{held.sid} is still running on @{held.nick};"
-        f' stop it with: ssh {source.target} "{kill}"'
+        f"{held.sid} may still be running on @{held.nick};"
+        f" {_kill_hint(source.target, held.sid)}"
     )
 
 
@@ -633,7 +657,11 @@ def _recall_local(
 # - `_destination` and `_recall_to` (:4173-4249), `_destination` called
 #   before the heading and `_recall_to` as the `elif` after `_recall_local`
 #   (:4252-4266);
-# - `_local_dir` required only for --local (:3960-3962), as the plan has it;
+# - the two `to_local` guards come back with it: `local_dir = _local_dir(cfg,
+#   proj) if to_local else None` with its refusal (:3960-3962), and `if
+#   local_dir is not None: _recall_local(...)` (:3969-3970). Today
+#   `_local_dir` runs unconditionally, so without them a --to recall of a
+#   project with no local clone would wrongly exit 2;
 # - per the forward correction at :4015, `_recall_to` reads
 #   `InstalledTranscripts.landed` for the directory it names and prints
 #   `.note` (the kept-items line) when it is non-empty -- never the object;

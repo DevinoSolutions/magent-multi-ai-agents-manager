@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import os
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -21,6 +22,7 @@ from pathlib import Path, PureWindowsPath
 import pytest
 
 from magent import cli, launch, node_sync, nodes, remote_mux
+from magent.cli import node_cmd
 from magent.config import ProjectConfig
 from magent.lockfile import LockHeld
 from magent.nodes import LocalGitState
@@ -1658,8 +1660,14 @@ class TestRecallLocal:
         result = _recall(runner, placed_api, "--local")
 
         assert [e[0] for e in node_answers] == ["pull", "repo_status"]
-        assert f"tmux -L {remote_mux.SOCKET} kill-session -t '=api'" in result.stdout
+        assert (
+            "stop it with: ssh amin@devino-second"
+            f" \"tmux -L {remote_mux.SOCKET} kill-session -t '=api'\"" in result.stdout
+        )
         assert "stopped api" not in result.stdout
+        # Nobody checked, so it is never asserted to be running either.
+        assert "api may still be running on @second" in result.stdout
+        assert "is still running" not in result.stdout
 
     def test_the_last_pull_goes_through_node_syncs_lock(
         self, runner, placed_api, node_answers
@@ -1997,6 +2005,94 @@ class TestRecallReadsTheNodeMapAsUntrusted:
         assert "Traceback" not in result.output
         assert "could not read the repos on @second" in result.stdout
         assert "api" not in nodes.read_node_map()
+
+
+# pullable_sid lets ', $, ` and ! through -- psmux.session_name turns a title
+# like "Amin's site" into Amin's-site -- so the printed stop command must never
+# paste a sid raw inside a shell's quotes (spec-G14 P1).
+_UNQUOTABLE_SIDS = ["it's", "a$(id)b", "a`id`b", "a!b"]
+
+
+def _single_quoted(text: str) -> str:
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
+def _kill_command(text: str) -> str:
+    """The tmux command in ``text``, from ``tmux -L`` to the end of its line."""
+    line = next(line for line in text.splitlines() if "kill-session" in line)
+    return line[line.index("tmux -L") :]
+
+
+def _kill_argv(sid: str) -> list[str]:
+    return ["tmux", "-L", remote_mux.SOCKET, "kill-session", "-t", "=" + sid]
+
+
+class TestTheStopCommandIsSafeToPaste:
+    @pytest.mark.parametrize("sid", _UNQUOTABLE_SIDS)
+    def test_the_node_side_command_single_quotes_the_whole_target(self, sid):
+        kill = _kill_command(node_cmd._kill_hint(None, sid))
+
+        assert kill == (
+            f"tmux -L {remote_mux.SOCKET} kill-session -t {_single_quoted('=' + sid)}"
+        )
+        assert shlex.split(kill) == _kill_argv(sid)
+
+    @pytest.mark.parametrize("sid", _UNQUOTABLE_SIDS)
+    def test_such_a_sid_is_never_put_inside_an_ssh_one_liner(self, sid):
+        hint = node_cmd._kill_hint("amin@devino-second", sid)
+
+        # Inside the ssh line's double quotes, the LOCAL shell would run $(id)
+        # or `id` and a ' would leave the remote quote open: two steps instead.
+        assert '"' not in hint
+        assert "ssh amin@devino-second" in hint
+        assert shlex.split(_kill_command(hint)) == _kill_argv(sid)
+
+    def test_a_plain_sid_keeps_the_plans_exact_lines(self):
+        kill = f"tmux -L {remote_mux.SOCKET} kill-session -t '=api'"
+
+        assert node_cmd._kill_hint(None, "api") == f"stop it there with: {kill}"
+        assert (
+            node_cmd._kill_hint("amin@devino-second", "api")
+            == f'stop it with: ssh amin@devino-second "{kill}"'
+        )
+
+    @pytest.mark.parametrize("sid", _UNQUOTABLE_SIDS)
+    def test_an_unreachable_node_prints_the_quoted_command(
+        self, runner, api_repo, tmp_config, node_is_gone, sid
+    ):
+        nodes.update_node_map("api", entry("second", sid))
+        cfg = tmp_config(
+            config_json(
+                ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
+            )
+        )
+
+        result = _recall(runner, cfg, "--local")
+
+        assert result.exit_code == 0
+        assert f"{sid} may still be running on @second" in result.stdout
+        assert shlex.split(_kill_command(result.stdout)) == _kill_argv(sid)
+
+    # D-MERGE: with D the reachable branch prints this only when kill_session
+    # returns None; the fixture's kill answers True, so this pin goes then.
+    @pytest.mark.skipif(not _NO_D_KILL, reason="D's kill_session is merged")
+    @pytest.mark.parametrize("sid", _UNQUOTABLE_SIDS)
+    def test_before_d_a_reachable_node_gets_the_two_step_command(
+        self, runner, api_repo, tmp_config, node_answers, sid
+    ):
+        nodes.update_node_map("api", entry("second", sid))
+        cfg = tmp_config(
+            config_json(
+                ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
+            )
+        )
+
+        result = _recall(runner, cfg, "--local")
+
+        assert result.exit_code == 0
+        assert ' "tmux' not in result.stdout
+        assert "ssh amin@devino-second, then run on the node" in result.stdout
+        assert shlex.split(_kill_command(result.stdout)) == _kill_argv(sid)
 
 
 # --- magent node recall --to (plan G Task 15) ----------------------------------
