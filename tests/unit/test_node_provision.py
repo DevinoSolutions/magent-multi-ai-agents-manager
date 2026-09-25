@@ -2771,6 +2771,7 @@ def _doctor_box(
     tmp_path: Path,
     *,
     tools: tuple[str, ...] = NODE_TOOLS,
+    base_tools: tuple[str, ...] = DOCTOR_TOOLS,
     logged_in: bool = True,
     github: str = HI,
     charmap: str = "UTF-8",
@@ -2806,7 +2807,7 @@ def _doctor_box(
     if "ssh" in fakes:
         fakes["ssh"].set_reply("git@github.com", stderr=github + "\n", rc=1)
     (tmp_path / "node" / "magent").mkdir(parents=True, exist_ok=True)
-    sysbin = _sysbin(tmp_path, DOCTOR_TOOLS, python=False, name="doctorbin")
+    sysbin = _sysbin(tmp_path, base_tools, python=False, name="doctorbin")
     env = {
         "HOME": str(tmp_path / "node"),
         "PATH": os.pathsep.join([*(str(f.base) for f in fakes.values()), str(sysbin)]),
@@ -2977,6 +2978,22 @@ class TestDoctorShUnderRealBash:
             "ok",
             f"0 on tmux socket {remote_mux.SOCKET}",
         )
+
+    def test_a_node_without_timeout_says_so_and_probes_nothing(self, tmp_path):
+        # Every probe runs under coreutils' `timeout`: without it each would
+        # exit 127 and read as its own wrong finding ("not logged in").
+        base = tuple(t for t in DOCTOR_TOOLS if t != "timeout")
+        fakes, env = _doctor_box(tmp_path, base_tools=base)
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        assert _report(r).lines == (
+            ScriptLine(
+                "fail",
+                "doctor",
+                "timeout is not on PATH -- every probe runs under it; install coreutils on this node",
+            ),
+        )
+        assert not [c for f in fakes.values() for c in f.calls()]
 
     def test_a_node_without_ssh_says_so(self, tmp_path):
         tools = tuple(t for t in NODE_TOOLS if t != "ssh")
@@ -3219,9 +3236,10 @@ def test_the_probe_bounds_fit_inside_the_doctor_call():
     (grace,) = (
         int(g) for g in re.findall(r"^PROBE_KILL_S=(\d+)\b", text, re.MULTILINE)
     )
-    # No inline limit anywhere: `timeout` runs only inside bounded(), and
-    # every bounded call names one of the constants.
-    assert re.findall(r"\btimeout (.*)", code) == ['-k "$PROBE_KILL_S" "$seconds" "$@"']
+    # No inline limit anywhere: `timeout` runs (in command position) only
+    # inside bounded(), and every bounded call names one of the constants.
+    runs = re.findall(r"(?:^|[;&|(])\s*timeout\b(.*)", code, re.MULTILINE)
+    assert runs == [' -k "$PROBE_KILL_S" "$seconds" "$@"']
     sites = re.findall(r"\bbounded (\S+)", code)
     assert all(re.fullmatch(r'"\$[A-Z]+_PROBE_S"', site) for site in sites), sites
     uses = [site.strip('"$') for site in sites]

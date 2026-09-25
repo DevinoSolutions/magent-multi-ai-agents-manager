@@ -196,6 +196,12 @@ main() {
   done
   exec </dev/null
   export PATH="$HOME/.local/bin:$PATH"
+  # Every probe runs under timeout(1): without it each would exit 127 and
+  # read as its own wrong finding, so the one real cause is the only row.
+  if ! command -v timeout >/dev/null 2>&1; then
+    say fail doctor "timeout is not on PATH -- every probe runs under it; install coreutils on this node"
+    return 0
+  fi
   check_tmux
   check_tool git fail git --version
   check_tool claude fail claude --version
