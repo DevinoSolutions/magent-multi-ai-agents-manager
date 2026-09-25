@@ -25,10 +25,10 @@ def _cfg(projects, **settings):
 _SCANNED_NAMES = ["ssh.exe", "psmux.exe", "magent-attach-client.exe"]
 
 # A stand-in for the resolved magent-attach-client binary. Tests monkeypatch
-# _attach_client_exe with this rather than letting shutil.which decide: the
-# console script IS installed in the venv the suite runs from, so a test that
-# trusted PATH would silently exercise a different pane command depending on
-# how the developer invoked pytest.
+# attach_client.client_exe with this rather than letting shutil.which decide:
+# the console script IS installed in the venv the suite runs from, so a test
+# that trusted PATH would silently exercise a different pane command depending
+# on how the developer invoked pytest.
 _FAKE_SUPERVISOR = r"C:\venv\Scripts\magent-attach-client.EXE"
 
 
@@ -39,12 +39,13 @@ def _supervisor_on_path(monkeypatch):
     Without this the answer depends on how the suite was invoked (the console
     script exists inside the project venv, so `uv run pytest` resolves it and a
     bare `pytest` from another interpreter may not) -- and the resolution
-    decides which command every attach pane is spawned with. Tests about the
-    NOT-on-PATH fallback override this locally.
+    decides which command every attach pane is spawned with. One seam covers
+    both readers: `_spawn_windows`' batch warning and `spawn_attach_window`.
+    Tests about the NOT-on-PATH fallback override this locally.
     """
-    from magent.cli import attach as attach_mod
+    from magent import attach_client
 
-    monkeypatch.setattr(attach_mod, "_attach_client_exe", lambda: _FAKE_SUPERVISOR)
+    monkeypatch.setattr(attach_client, "client_exe", lambda: _FAKE_SUPERVISOR)
 
 
 class _FakeProc:
@@ -2268,9 +2269,9 @@ class TestSpawnWindows:
         # A stale editable install, or a PATH exposing `magent` without its
         # siblings. Forty windows that fail to start would be far worse than
         # forty windows with the old behavior plus one honest warning.
-        from magent.cli import attach as attach_mod
+        from magent import attach_client
 
-        monkeypatch.setattr(attach_mod, "_attach_client_exe", lambda: None)
+        monkeypatch.setattr(attach_client, "client_exe", lambda: None)
         spawns, _sleeps, _titles = self._spawn(monkeypatch, ["api", "web"], [], 0.0)
         out = capsys.readouterr().out
         assert "magent-attach-client" in out
@@ -2283,9 +2284,9 @@ class TestSpawnWindows:
     def test_no_reconnect_never_warns_about_a_binary_it_does_not_want(
         self, monkeypatch, capsys
     ):
-        from magent.cli import attach as attach_mod
+        from magent import attach_client
 
-        monkeypatch.setattr(attach_mod, "_attach_client_exe", lambda: None)
+        monkeypatch.setattr(attach_client, "client_exe", lambda: None)
         self._spawn(monkeypatch, ["api"], [], 0.0, reconnect=False)
         assert "not on PATH" not in capsys.readouterr().out
 
@@ -2483,6 +2484,127 @@ class TestTmuxPaneCommand:
             attach_client.pane_command(
                 "u@h", "api", _FAKE_SUPERVISOR, mux="screen", remote="anything"
             )
+
+
+class TestSpawnAttachWindow:
+    """The one wt spawn every remote attach pane goes through -- `magent
+    attach`'s loop and a node bring-up -- so the title lock, the pane command
+    and the corpse marker cannot drift between them."""
+
+    def _spawn(self, monkeypatch, *args, **kwargs):
+        from magent import attach_client
+
+        calls: list[list[str]] = []
+
+        def fake_popen(argv, **_k):
+            calls.append(list(argv))
+            return _FakeProc()
+
+        monkeypatch.setattr(attach_client.subprocess, "Popen", fake_popen)
+        pid = attach_client.spawn_attach_window(*args, **kwargs)
+        assert len(calls) == 1
+        return pid, calls[0]
+
+    def test_it_returns_the_spawned_process_id(self, monkeypatch):
+        pid, _argv = self._spawn(monkeypatch, "user@host", "api", mux="psmux")
+        assert pid == _FakeProc.pid
+
+    def test_a_psmux_window_is_byte_identical_to_the_attach_loops(self, monkeypatch):
+        # No `remote`: it is derived from `mux`, so a caller states the
+        # multiplexer exactly once and cannot pair it with the other's command.
+        _pid, argv = self._spawn(monkeypatch, "user@host", "api", mux="psmux")
+        assert argv == _SUPERVISED_WT_ARGV
+
+    def test_no_reconnect_opens_the_bare_ssh_pane(self, monkeypatch):
+        _pid, argv = self._spawn(
+            monkeypatch, "user@host", "api", mux="psmux", reconnect=False
+        )
+        assert argv == _BARE_WT_ARGV
+
+    def test_a_supervisor_off_path_degrades_to_the_bare_pane_silently(
+        self, monkeypatch, capsys
+    ):
+        # The batch caller warns once; the per-window spawn never does.
+        from magent import attach_client
+
+        monkeypatch.setattr(attach_client, "client_exe", lambda: None)
+        _pid, argv = self._spawn(monkeypatch, "user@host", "api", mux="psmux")
+        assert argv == _BARE_WT_ARGV
+        assert capsys.readouterr().out == ""
+
+    def test_a_node_window_is_a_supervised_tmux_pane_under_the_title_lock(
+        self, monkeypatch
+    ):
+        _pid, argv = self._spawn(monkeypatch, "amin@devino-second", "api", mux="tmux")
+        assert argv == [
+            "wt",
+            "-w",
+            "new",
+            "--title",
+            "magent:api",
+            "--suppressApplicationTitle",
+            "--",
+            _FAKE_SUPERVISOR,
+            "--target",
+            "amin@devino-second",
+            "--session",
+            "api",
+            "--remote",
+            "tmux -L magent attach -t '=api'",
+            "--mux",
+            "tmux",
+        ]
+
+    def test_an_explicit_remote_reaches_the_pane_verbatim(self, monkeypatch):
+        _pid, argv = self._spawn(
+            monkeypatch,
+            "user@host",
+            "api",
+            mux="psmux",
+            remote=remote_attach_command("api", "psmux"),
+        )
+        assert argv == _SUPERVISED_WT_ARGV
+
+    def test_a_node_windows_supervisor_carries_its_own_corpse_marker(self, monkeypatch):
+        # COHERENCE PIN for tmux, same as TestSpawnWindows' psmux one: during a
+        # backoff the supervisor is the only process left for this window.
+        from magent.cli import attach as attach_mod
+
+        _pid, argv = self._spawn(monkeypatch, "amin@devino-second", "api", mux="tmux")
+        assert attach_mod._corpses({"api"}, [subprocess.list2cmdline(argv)]) == set()
+
+    def test_an_unknown_multiplexer_never_opens_a_window(self, monkeypatch):
+        from magent import attach_client
+
+        spawned: list[object] = []
+        monkeypatch.setattr(
+            attach_client.subprocess, "Popen", lambda *a, **k: spawned.append(a)
+        )
+        with pytest.raises(ValueError, match="screen"):
+            attach_client.spawn_attach_window(
+                "user@host", "api", mux="screen", remote="anything"
+            )
+        assert spawned == []
+
+    def test_the_attach_loop_opens_every_window_through_it(self, monkeypatch):
+        from magent.cli import attach as attach_mod
+
+        opened: list[tuple[str, str, dict[str, object]]] = []
+
+        def spy(target, sid, **kwargs):
+            opened.append((target, sid, kwargs))
+            return 4242
+
+        monkeypatch.setattr(attach_mod, "spawn_attach_window", spy)
+        monkeypatch.setattr(attach_mod.time, "sleep", lambda _s: None)
+        attach_mod._spawn_windows(
+            "user@host", ["api", "web"], {"web"}, 0.0, reconnect=False
+        )
+        # No `remote=`: the loop names the multiplexer once and lets the leaf
+        # derive the matching attach command.
+        assert opened == [
+            ("user@host", "api", {"mux": "psmux", "reconnect": False}),
+        ]
 
 
 class TestClientProcessNames:

@@ -9,7 +9,6 @@ from __future__ import annotations
 import contextlib
 import getpass
 import json
-import shutil
 import subprocess
 import sys
 import time
@@ -19,11 +18,12 @@ from typing import TYPE_CHECKING
 
 import click
 
+from magent import attach_client
 from magent.attach_client import (
     CLIENT_EXE_NAME,
     MUXES,
     TMUX_SOCKET,
-    pane_command,
+    spawn_attach_window,
 )
 from magent.cli.app import main
 from magent.cli.background import _maybe_start_hotkey, _maybe_start_upload_server
@@ -460,10 +460,11 @@ def _attach_markers(sid: str, mux: str = "psmux") -> tuple[str, ...]:
     processes, so ``-L <sid> attach`` is signal enough on its own.
 
     Not naming the binary is also what let the reconnect supervisor join the
-    scan for free: ``_spawn_windows`` passes the remote command it would have
-    given ssh as the supervisor's ``--remote`` argument, so the same marker
-    string appears in the supervisor's own command line -- including while it
-    is between connections and no ssh process exists at all. The one rule that
+    scan for free: ``attach_client.spawn_attach_window`` passes the remote
+    command it would have given ssh as the supervisor's ``--remote`` argument,
+    so the same marker string appears in the supervisor's own command line --
+    including while it is between connections and no ssh process exists at
+    all. The one rule that
     keeps this honest is stated at ``attach_client.remote_attach_command``: the
     remote command has exactly one spelling, and these markers match it.
 
@@ -753,18 +754,6 @@ def _annotate_dead_windows(up: Sequence[dict[str, object]]) -> None:
         )
 
 
-def _attach_client_exe() -> str | None:
-    """The local ``magent-attach-client`` binary, or None if it is not on PATH.
-
-    Never assumed present: an editable checkout that predates the console
-    script, a PATH that exposes ``magent`` from somewhere its siblings are not,
-    or a partially-upgraded install all reach here. The caller degrades to a
-    bare ssh pane (today's historical behavior) and says so once, rather than
-    spawning forty windows that fail to start.
-    """
-    return shutil.which(CLIENT_EXE_NAME)
-
-
 def _spawn_windows(
     target: str,
     sids: Sequence[str],
@@ -777,14 +766,15 @@ def _spawn_windows(
 
     Split out of ``_attach_flow`` so the post-tiling verification pass can call
     it a second time for the windows that died at the SSH handshake -- the
-    retry needs the same spawn, only staggered further apart. Both the initial
-    and the retry batch therefore get the same pane command from here.
+    retry needs the same spawn, only staggered further apart. Every window,
+    initial or retry, comes from ``attach_client.spawn_attach_window``.
 
     ``reconnect=False`` (``magent attach --no-reconnect``) reproduces the
     historical bare-ssh pane exactly.
     """
-    supervisor = _attach_client_exe() if reconnect else None
-    if reconnect and supervisor is None:
+    # Through the module, not a bound name: the same seam spawn_attach_window
+    # reads, so a test (or a stale install) can't make the two disagree.
+    if reconnect and attach_client.client_exe() is None:
         click.echo(
             f"  {style('!', fg='yellow')} {style(CLIENT_EXE_NAME, bold=True)}"
             f" {style('is not on PATH -- panes will not auto-reconnect.', fg='yellow')}"
@@ -794,8 +784,6 @@ def _spawn_windows(
             f" {style('pip install -U magent-multi-ai-agents-manager', bold=True)}"
             f"{style('.', dim=True)}"
         )
-    # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
-    from magent.env import attach_client_env
 
     titles: list[str] = []
     for sid in sids:
@@ -808,23 +796,9 @@ def _spawn_windows(
             titles.append(title)
             continue
         click.echo(f"  {style('o', fg='cyan')} {title}")
-        # `env=`: an attach pane is a RENDERER, not an agent host -- everything
-        # survives (nesting markers included) except a colour override an agent
-        # harness leaked into us, which would paint this pane monochrome. None
-        # when no harness marker is present, i.e. plain inheritance.
-        subprocess.Popen(
-            [
-                "wt",
-                "-w",
-                "new",
-                "--title",
-                title,
-                "--suppressApplicationTitle",
-                "--",
-                *pane_command(target, sid, supervisor),
-            ],
-            env=attach_client_env(),
-        )
+        # No `remote=`: the leaf derives the attach command from `mux`, so the
+        # multiplexer is named once and cannot disagree with its own marker.
+        spawn_attach_window(target, sid, mux="psmux", reconnect=reconnect)
         titles.append(title)
         time.sleep(stagger)
     return titles

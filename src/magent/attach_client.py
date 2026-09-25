@@ -67,20 +67,25 @@ meant to send.
 
 CORPSE COHERENCE -- read this before changing the argv. ``cli/attach.py``
 decides a pane is dead by scanning live process command lines for
-``-L <sid> attach`` (``_attach_markers``) among ``_CLIENT_PROCESS_NAMES``.
-For a node pane the marker is the tmux spelling instead,
+``-L <sid> attach`` (``_attach_markers``) among ``_CLIENT_PROCESS_NAMES``. For
+a node pane the marker is the tmux spelling instead,
 ``-L magent attach -t '=<sid>'`` (``_attach_markers(sid, "tmux")``); each
 multiplexer's marker matches its own ``remote_attach_command`` and no other
 session's command, with one conservative exception: a psmux session named
 ``magent`` (any case: matching is case-insensitive) shares its marker's text
-with the node socket, so a live node pane keeps it looking alive. During a backoff sleep there is no ssh process at all,
-so this supervisor is what has to carry the marker -- and it does, for free,
-because ``_spawn_windows`` hands us the remote command it would otherwise have
-given ssh, as our own ``--remote`` argument. The marker therefore appears
-verbatim in this process's command line. Do NOT "simplify" that by rebuilding
-the remote command from ``--session`` and dropping the argument: the pane would
-read as a corpse the moment it started backing off, and the next
-``magent attach`` would close a window that was busy healing itself.
+with the node socket, so a live node pane keeps it looking alive. During a
+backoff sleep there is no ssh process at all, so this supervisor is what has
+to carry the marker -- and it does, for free, because ``spawn_attach_window``
+(below) hands us the remote command it would otherwise have given ssh, as our
+own ``--remote`` argument. The marker therefore appears verbatim in this
+process's command line -- ``-L <sid> attach`` for a psmux pane,
+``-L magent attach -t '=<sid>'`` for a node's tmux one. That is also why an
+explicit remote must be ``remote_attach_command(sid, mux)``'s spelling (or
+contain its marker): a remote for the other multiplexer makes a live pane read
+as dead. Do NOT "simplify" any of this by rebuilding the remote command from
+``--session`` and dropping the argument: the pane would read as a corpse the
+moment it started backing off, and the next ``magent attach`` would close a
+window that was busy healing itself.
 """
 
 from __future__ import annotations
@@ -95,6 +100,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import click
 
 from magent.style import style
+from magent.titles import make_title
 
 if TYPE_CHECKING:
     from typing import IO
@@ -480,6 +486,78 @@ def pane_command(
         remote,
         *mux_args,
     ]
+
+
+def client_exe() -> str | None:
+    """Where this supervisor's console script resolves on PATH, or None.
+
+    The one lookup every attach-window spawn and ``magent attach``'s
+    once-per-batch "not on PATH" warning share, so a single seam decides both.
+    Never assumed present: an editable checkout that predates the console
+    script, a PATH that exposes ``magent`` from somewhere its siblings are not,
+    or a partially-upgraded install all reach here.
+    """
+    return shutil.which(CLIENT_EXE_NAME)
+
+
+def spawn_attach_window(
+    target: str,
+    sid: str,
+    *,
+    mux: str,
+    remote: str | None = None,
+    reconnect: bool = True,
+) -> int:
+    """Open ONE Windows Terminal window attached to ``sid`` on ``target``.
+
+    The single wt spawn behind every remote attach pane -- ``magent attach``'s
+    per-session loop (``cli/attach.py::_spawn_windows``) and a node project's
+    bring-up both come through here, so the ``magent:<sid>`` title, its lock
+    against the program inside the tab (``--suppressApplicationTitle``, MD006),
+    the pane command and the corpse marker that command carries cannot drift
+    apart. It lives in this leaf, not in ``cli/``, because the node bring-up
+    callers are src modules, which never import the cli package (LS-A-001).
+
+    ``remote`` is the command the pane runs on the far side. Leave it out:
+    ``pane_command`` derives ``remote_attach_command(sid, mux)`` from ``mux``,
+    so the caller names the multiplexer exactly once. An explicit one is passed
+    through verbatim and carries ``pane_command``'s contract -- it must contain
+    ``_attach_markers(sid, mux)``'s marker, or a live pane reads as dead.
+
+    ``reconnect=False`` reproduces the historical bare-ssh pane. A supervisor
+    missing from PATH degrades to that same bare pane SILENTLY: a batch caller
+    says so once for the whole batch, not once per window.
+
+    Returns the pid of the ``wt`` launcher. wt hands the window to the running
+    Terminal and exits, so this identifies the spawn, not the window -- windows
+    are found by title, everywhere in magent.
+    """
+    # Built BEFORE anything is spawned: an unknown `mux` raises here, so a
+    # window that would die on arrival is never opened.
+    pane = pane_command(
+        target, sid, client_exe() if reconnect else None, mux=mux, remote=remote
+    )
+    # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+    from magent.env import attach_client_env
+
+    # `env=`: an attach pane is a RENDERER, not an agent host -- everything
+    # survives (nesting markers included) except a colour override an agent
+    # harness leaked into us, which would paint this pane monochrome. None
+    # when no harness marker is present, i.e. plain inheritance.
+    proc = subprocess.Popen(
+        [
+            "wt",
+            "-w",
+            "new",
+            "--title",
+            make_title(sid),
+            "--suppressApplicationTitle",
+            "--",
+            *pane,
+        ],
+        env=attach_client_env(),
+    )
+    return proc.pid
 
 
 def verdict(rc: int, probe: str | None = None) -> str:
