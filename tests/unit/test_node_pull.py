@@ -3,16 +3,25 @@ one ssh a pull costs."""
 
 from __future__ import annotations
 
-import io
+import gzip
 import logging
+import os
 import tarfile
 
 import pytest
 
 from magent import remote_mux
 from magent.nodes import LoadSample, Node
-from magent.remote_mux import PULL_HEADER, RemoteError, parse_pull
-from tests.unit._pull_reply import MTIME, SAMPLE, pull_meta, pull_reply
+from magent.remote_mux import PULL_HEADER, PULL_TRAILER, RemoteError, parse_pull
+from tests.unit._pull_reply import (
+    MTIME,
+    SAMPLE,
+    archive_start,
+    member,
+    pull_bytes,
+    pull_meta,
+    pull_reply,
+)
 
 NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
 
@@ -85,6 +94,9 @@ class TestParsePull:
             "api/state/deeper/k.json",
             "api/state/k.txt",
             "api/transcripts/CON.jsonl",
+            "api/transcripts/CON .jsonl",
+            "api/transcripts/CONIN$",
+            "api/transcripts/COM¹.jsonl",
             "api/transcripts/a:b.jsonl",
             "api/transcripts/trailing.",
             "api/x",
@@ -94,20 +106,21 @@ class TestParsePull:
         # Its own root, not tmp_path: the isolated HOME's node log lives there.
         # Three `..` from <root>/second/api/transcripts is still <root>.
         root = tmp_path / "mirror"
-        snap = _parse(pull_reply(pull_meta(), {name: "x"}), root / "second")
+        snap = parse_pull(
+            pull_bytes(pull_meta(), [member(name)]),
+            dest=root / "second",
+            sids=frozenset({"api"}),
+        )
         assert snap.files == ()
         assert _stored(root) == []
 
     def test_a_link_in_the_archive_is_never_followed(self, tmp_path):
-        out = io.BytesIO()
-        out.write(PULL_HEADER + b'{"now": 1.0, "sessions": []}\n')
-        with tarfile.open(fileobj=out, mode="w", format=tarfile.USTAR_FORMAT) as tar:
-            link = tarfile.TarInfo("api/transcripts/link.jsonl")
-            link.type = tarfile.SYMTYPE
-            link.linkname = "/etc/passwd"
-            tar.addfile(link)
+        link = tarfile.TarInfo("api/transcripts/link.jsonl")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "/etc/passwd"
+        reply = pull_bytes(pull_meta(), [(link, b"")])
         root = tmp_path / "mirror"
-        snap = parse_pull(out.getvalue(), dest=root / "second", sids=frozenset({"api"}))
+        snap = parse_pull(reply, dest=root / "second", sids=frozenset({"api"}))
         assert snap.files == ()
         assert _stored(root) == []
 
@@ -174,6 +187,8 @@ class TestParsePull:
             PULL_HEADER
             + b'{"now": 1.0, "sessions": []}\n'
             + b"this is not a tar archive"
+            + PULL_TRAILER
+            + b"1\n"
         )
         with pytest.raises(RemoteError, match="unreadable pull archive"):
             parse_pull(reply, dest=tmp_path, sids=frozenset({"api"}))
@@ -196,6 +211,231 @@ class TestParsePull:
         )
 
 
+def _two_member_reply() -> tuple[bytes, int]:
+    """A reply holding api/transcripts/a.jsonl then b.jsonl (1 byte each),
+    and the offset where the second member's header block starts."""
+    reply = pull_bytes(
+        pull_meta(sessions=["api"]),
+        [member("api/transcripts/a.jsonl"), member("api/transcripts/b.jsonl")],
+    )
+    # USTAR: a 512-byte header, then the data padded to 512.
+    return reply, archive_start(reply) + 1024
+
+
+class TestATruncatedReplyIsNeverSuccess:
+    def test_a_reply_cut_after_the_first_member_is_an_error(self, tmp_path):
+        reply, second = _two_member_reply()
+        dest = tmp_path / "second"
+        with pytest.raises(RemoteError, match="reply truncated") as info:
+            parse_pull(reply[:second], dest=dest, sids=frozenset({"api"}))
+        assert info.value.rc == 0
+        assert _stored(dest) == []
+
+    def test_garbage_where_the_second_header_belongs_is_an_error(self, tmp_path):
+        reply, second = _two_member_reply()
+        broken = reply[:second] + b"\xff" * 512 + reply[second + 512 :]
+        dest = tmp_path / "second"
+        with pytest.raises(RemoteError, match=r"expected 2 .*saw 1"):
+            parse_pull(broken, dest=dest, sids=frozenset({"api"}))
+        assert _stored(dest) == []
+
+    @pytest.mark.parametrize("claimed", [1, 3])
+    def test_a_trailer_count_off_by_one_is_an_error(self, tmp_path, claimed):
+        reply = pull_bytes(
+            pull_meta(),
+            [member("api/transcripts/a.jsonl"), member("api/transcripts/b.jsonl")],
+            count=claimed,
+        )
+        with pytest.raises(RemoteError, match=f"expected {claimed} .*saw 2"):
+            parse_pull(reply, dest=tmp_path / "second", sids=frozenset({"api"}))
+
+    def test_a_trailer_whose_count_matches_parses(self, tmp_path):
+        reply, _ = _two_member_reply()
+        dest = tmp_path / "second"
+        snap = parse_pull(reply, dest=dest, sids=frozenset({"api"}))
+        assert _stored(dest) == ["api/transcripts/a.jsonl", "api/transcripts/b.jsonl"]
+        assert snap.failed_sids == frozenset()
+
+    def test_a_reply_with_no_trailer_at_all_is_truncated(self, tmp_path):
+        reply = PULL_HEADER + b'{"now": 1.0, "sessions": []}\n'
+        with pytest.raises(RemoteError, match="reply truncated"):
+            parse_pull(reply, dest=tmp_path, sids=frozenset({"api"}))
+
+    def test_anything_after_the_trailer_line_means_it_was_not_the_last(self, tmp_path):
+        reply = pull_reply(pull_meta()).encode("ascii") + b"logout\n"
+        with pytest.raises(RemoteError, match="reply truncated"):
+            parse_pull(reply, dest=tmp_path, sids=frozenset({"api"}))
+
+    def test_the_trailer_text_inside_a_file_is_not_the_trailer(self, tmp_path):
+        text = PULL_TRAILER + b"1\n"
+        reply = pull_bytes(pull_meta(), [member("api/transcripts/a.jsonl", text)])
+        dest = tmp_path / "second"
+        parse_pull(reply, dest=dest, sids=frozenset({"api"}))
+        assert (dest / "api" / "transcripts" / "a.jsonl").read_bytes() == text
+
+
+class TestABadMtimeNeverEscapes:
+    @pytest.mark.parametrize("mtime", ["nan", "1e400", "-5"])
+    def test_a_pax_mtime_that_is_not_a_time_stores_the_file_without_it(
+        self, tmp_path, caplog, mtime
+    ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        reply = pull_bytes(
+            pull_meta(),
+            [member("api/transcripts/a.jsonl", b"data", pax={"mtime": mtime})],
+            fmt=tarfile.PAX_FORMAT,
+        )
+        dest = tmp_path / "second"
+        snap = parse_pull(reply, dest=dest, sids=frozenset({"api"}))
+        landed = dest / "api" / "transcripts" / "a.jsonl"
+        assert landed.read_bytes() == b"data"
+        assert snap.files == (landed,)
+        assert snap.failed_sids == frozenset()
+        assert [m for m in _node_logs(caplog) if "mtime" in m] == [
+            (
+                "node pull: api/transcripts/a.jsonl has an unusable mtime; "
+                "stored without it"
+            )
+        ]
+
+    def test_a_gnu_base256_mtime_past_any_clock_stores_the_file_without_it(
+        self, tmp_path
+    ):
+        reply = pull_bytes(
+            pull_meta(),
+            [member("api/transcripts/a.jsonl", b"data", mtime=10**20)],
+            fmt=tarfile.GNU_FORMAT,
+        )
+        dest = tmp_path / "second"
+        snap = parse_pull(reply, dest=dest, sids=frozenset({"api"}))
+        assert snap.files == (dest / "api" / "transcripts" / "a.jsonl",)
+        assert snap.failed_sids == frozenset()
+
+
+class TestTheArchiveIsBounded:
+    def test_a_compressed_archive_is_not_a_pull(self, tmp_path):
+        reply = pull_bytes(
+            pull_meta(), [member("api/transcripts/a.jsonl")], compression="gz"
+        )
+        assert gzip.decompress(reply[archive_start(reply) :].split(PULL_TRAILER)[0])
+        with pytest.raises(RemoteError, match="unreadable pull archive"):
+            parse_pull(reply, dest=tmp_path / "second", sids=frozenset({"api"}))
+        assert _stored(tmp_path / "second") == []
+
+    def test_a_member_over_the_size_cap_is_skipped_and_fails_its_session(
+        self, tmp_path, caplog, monkeypatch
+    ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        monkeypatch.setattr(remote_mux, "PULL_MAX_MEMBER_BYTES", 4)
+        reply = pull_bytes(
+            pull_meta(),
+            [
+                member("api/transcripts/big.jsonl", b"0123456789"),
+                member("api/transcripts/small.jsonl", b"ok"),
+                member("web/transcripts/w.jsonl", b"fine"),
+            ],
+        )
+        dest = tmp_path / "second"
+        snap = parse_pull(reply, dest=dest, sids=frozenset({"api", "web"}))
+        assert snap.failed_sids == frozenset({"api"})
+        assert _stored(dest) == [
+            "api/transcripts/small.jsonl",
+            "web/transcripts/w.jsonl",
+        ]
+        assert [m for m in _node_logs(caplog) if "cap" in m] == [
+            (
+                "node pull: api/transcripts/big.jsonl declares 10 bytes, over the "
+                "4-byte cap; not stored"
+            )
+        ]
+
+    def test_an_archive_over_the_total_cap_is_not_a_pull(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(remote_mux, "PULL_MAX_TOTAL_BYTES", 5)
+        reply = pull_bytes(
+            pull_meta(),
+            [
+                member("api/transcripts/a.jsonl", b"abc"),
+                member("api/transcripts/b.jsonl", b"def"),
+            ],
+        )
+        dest = tmp_path / "second"
+        with pytest.raises(RemoteError, match="over the 5-byte cap"):
+            parse_pull(reply, dest=dest, sids=frozenset({"api"}))
+        assert _stored(dest) == []
+
+    def test_a_large_member_is_streamed_not_read_whole(self, tmp_path, monkeypatch):
+        chunks: list[int] = []
+        real = remote_mux.shutil.copyfileobj
+
+        def _spy(src, dst, length=0):
+            chunks.append(length)
+            real(src, dst, length)
+
+        monkeypatch.setattr(remote_mux.shutil, "copyfileobj", _spy)
+        reply = pull_bytes(pull_meta(), [member("api/transcripts/a.jsonl", b"z" * 9)])
+        parse_pull(reply, dest=tmp_path / "second", sids=frozenset({"api"}))
+        assert chunks == [remote_mux.PULL_COPY_CHUNK_BYTES]
+
+
+class TestWhatLandsAndHow:
+    def test_a_duplicate_path_keeps_the_newer_file_listed_once(self, tmp_path):
+        reply = pull_bytes(
+            pull_meta(),
+            [
+                member("api/transcripts/a.jsonl", b"new", mtime=5000),
+                member("api/transcripts/a.jsonl", b"old", mtime=4000),
+            ],
+        )
+        dest = tmp_path / "second"
+        snap = parse_pull(reply, dest=dest, sids=frozenset({"api"}))
+        landed = dest / "api" / "transcripts" / "a.jsonl"
+        assert snap.files == (landed,)
+        assert landed.read_bytes() == b"new"
+        assert landed.stat().st_mtime == 5000
+
+    @pytest.mark.parametrize("other", ["api2", "API", "ap"])
+    def test_only_the_exact_requested_sid_is_believed(self, tmp_path, other):
+        reply = pull_bytes(pull_meta(), [member(f"{other}/transcripts/a.jsonl")])
+        root = tmp_path / "mirror"
+        snap = parse_pull(reply, dest=root / "second", sids=frozenset({"api"}))
+        assert snap.files == ()
+        assert _stored(root) == []
+
+    def test_a_failed_replace_leaves_nothing_behind(self, tmp_path, monkeypatch):
+        dest = tmp_path / "second"
+        seen: list[tuple[str, str]] = []
+        real = os.replace
+
+        def _refuse(src, dst, *a, **k):
+            if not str(src).endswith(".part"):
+                return real(src, dst, *a, **k)
+            seen.append((str(src), str(dst)))
+            raise OSError(13, "Access is denied")
+
+        monkeypatch.setattr(remote_mux.os, "replace", _refuse)
+        reply = pull_bytes(pull_meta(), [member("api/transcripts/a.jsonl")])
+        snap = parse_pull(reply, dest=dest, sids=frozenset({"api"}))
+        assert snap.failed_sids == frozenset({"api"})
+        assert snap.files == ()
+        assert _stored(dest) == []
+        [(src, dst)] = seen
+        final = dest / "api" / "transcripts" / "a.jsonl"
+        assert dst == str(final)
+        # The tmp file is a sibling of its target: inside dest, same volume.
+        assert os.path.dirname(src) == str(final.parent)
+
+
+class TestTheRequestedSidsAreChecked:
+    @pytest.mark.parametrize(
+        ("sids", "named"), [({"sessions.json"}, "sessions.json"), ({"..", "api"}, "..")]
+    )
+    def test_an_unpullable_sid_is_a_caller_bug(self, tmp_path, sids, named):
+        reply = pull_reply(pull_meta()).encode("ascii")
+        # ValueError, not RemoteError (a RuntimeError): the node did nothing wrong.
+        with pytest.raises(ValueError, match=repr(named).replace(".", r"\.")):
+            parse_pull(reply, dest=tmp_path, sids=frozenset(sids))
+
+
 class TestWhichSessionsCanBeMirrored:
     @pytest.mark.parametrize(
         ("sid", "ok"),
@@ -205,6 +445,15 @@ class TestWhichSessionsCanBeMirrored:
             ("sessions.json", False),
             ("pull.json", False),
             ("CON", False),
+            # ntpath's reserved set on 3.13: the stem before the first dot,
+            # trailing spaces dropped; CONIN$/CONOUT$; superscript COM/LPT.
+            ("CON .jsonl", False),
+            ("COM¹", False),
+            ("lpt³.txt", False),
+            ("CONIN$", False),
+            ("conout$", False),
+            ("CONSOLE", True),
+            ("COM0", True),
             ("a:b", False),
             ("..", False),
             ("", False),

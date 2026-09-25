@@ -31,7 +31,6 @@ import shutil
 import subprocess
 import tarfile
 import threading
-import zlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -43,6 +42,7 @@ from magent.nodes import LoadSample
 if TYPE_CHECKING:
     from collections.abc import Collection, Mapping, Sequence
     from pathlib import Path
+    from typing import IO
 
     from magent.nodes import Node
 
@@ -443,9 +443,35 @@ def sample(node: Node) -> LoadSample:
 # How long one pull may take: one connection streaming every changed file of
 # every session on the node. `pull` waits this long per phase.
 PULL_TIMEOUT_S = 120.0
+# The wire format of one pull.sh reply, in order:
+#   PULL_HEADER, one JSON metadata line, a PLAIN (uncompressed) tar archive,
+#   then the trailer line `PULL_TRAILER <member count>\n`, last.
 # The first line of every pull.sh reply. Anything before it (a banner some rc
 # file printed) is ignored; a reply without it is not a pull.
 PULL_HEADER = b"MAGENT-PULL/1\n"
+PULL_TRAILER = b"MAGENT-PULL-END "
+"""The last line of every pull.sh reply: this prefix, the number of archive
+members as ASCII digits, and ``\\n``. tarfile reads a cut or garbage header
+past the first as end-of-archive, so without it a reply cut after member 1
+parses as a SUCCESS holding one file -- and since ``now`` becomes the next
+watermark, the lost members are never asked for again. The count is every
+member tar wrote (pull.sh hands tar an explicit file list with
+``--no-recursion``, so it is that list's length). pull.sh must emit
+``tar ... ; printf 'MAGENT-PULL-END %d\\n' "$count"`` -- the printf ONLY after
+tar exits 0, so a tar that failed leaves the reply without a trailer."""
+PULL_MAX_MEMBER_BYTES = 64 * 1024 * 1024
+"""A member declaring more than this is not stored (its session fails, so its
+watermark holds). A transcript is the largest file a pull carries."""
+PULL_MAX_TOTAL_BYTES = 512 * 1024 * 1024
+"""The most one reply may ask this PC to write, summed over the members it
+would store; more is RemoteError before anything is written."""
+PULL_COPY_CHUNK_BYTES = 1024 * 1024
+"""A member is streamed to disk in chunks of this size, never read whole."""
+# The newest mtime believed: ~36,800 years of Unix time, far past any real
+# clock yet inside every platform's time_t, so os.utime cannot overflow. A
+# member outside [0, _MAX_MTIME] (or NaN, or inf) is stored without its mtime.
+_MAX_MTIME = 2**40
+_TRAILER_COUNT = re.compile(rb"([0-9]{1,9})\n")
 # The next watermark is the NODE's clock when its scan began, minus this: a
 # file written in the same second as the scan is asked for again, never lost.
 WATERMARK_OVERLAP_S = 1.0
@@ -456,14 +482,18 @@ _RESERVED_NAMES = frozenset(
 )
 # Every path part must be a legal file name on THIS PC, which may be Windows.
 _UNSAFE_CHARS = re.compile(r'[\x00-\x1f<>:"/\\|?*]')
+# ntpath's reserved set on 3.13 (ntpath.isreserved is 3.13+, so it is copied):
+# the superscript digits count as COM/LPT numbers too.
 _DEVICE_NAMES = frozenset(
     {
         "CON",
         "PRN",
         "AUX",
         "NUL",
-        *(f"COM{i}" for i in range(1, 10)),
-        *(f"LPT{i}" for i in range(1, 10)),
+        "CONIN$",
+        "CONOUT$",
+        *(f"COM{c}" for c in "123456789¹²³"),
+        *(f"LPT{c}" for c in "123456789¹²³"),
     }
 )
 
@@ -506,11 +536,14 @@ def _pull_error(message: str) -> RemoteError:
 
 
 def _safe_part(part: str) -> bool:
+    # A part ending in "." or " " is refused outright (Windows drops them), so
+    # the device check needs only ntpath's: the stem before the FIRST dot,
+    # trailing spaces dropped -- "CON .jsonl" opens the console.
     return (
         part not in ("", ".", "..")
         and _UNSAFE_CHARS.search(part) is None
         and not part.endswith((".", " "))
-        and part.split(".", 1)[0].upper() not in _DEVICE_NAMES
+        and part.split(".", 1)[0].rstrip(" ").upper() not in _DEVICE_NAMES
     )
 
 
@@ -554,14 +587,32 @@ def _member_parts(
     return parts
 
 
-def _write_file(path: Path, data: bytes, mtime: float) -> None:
+def _usable_mtime(value: object) -> float | None:
+    """A member's mtime as ``os.utime`` can take it, or None. A PAX header
+    can say ``nan`` (ValueError from utime) or ``1e400``, and GNU base-256
+    can say ``10**20`` (OverflowError): the node's word, never a crash here."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    if not math.isfinite(number) or not 0 <= number <= _MAX_MTIME:
+        return None
+    return number
+
+
+def _write_file(path: Path, reader: IO[bytes], mtime: float | None) -> None:
     """Store one pulled file whole (sibling ``.part`` + ``os.replace``) with the
-    node's mtime, so a reader never sees half a transcript."""
+    node's mtime when it has a usable one, so a reader never sees half a
+    transcript. Streamed in ``PULL_COPY_CHUNK_BYTES`` chunks, never whole."""
     path.parent.mkdir(parents=True, exist_ok=True)
     part = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.part")
     try:
-        part.write_bytes(data)
-        os.utime(part, (mtime, mtime))
+        with part.open("wb") as out:
+            shutil.copyfileobj(reader, out, length=PULL_COPY_CHUNK_BYTES)
+        if mtime is not None:
+            os.utime(part, (mtime, mtime))
         os.replace(part, path)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -569,44 +620,115 @@ def _write_file(path: Path, data: bytes, mtime: float) -> None:
         raise
 
 
-def _extract(
-    body: bytes, *, dest: Path, sids: frozenset[str]
-) -> tuple[tuple[Path, ...], frozenset[str]]:
-    if not body:
-        return (), frozenset()
+def _newness(member: tarfile.TarInfo) -> float:
+    mtime = _usable_mtime(member.mtime)
+    return -1.0 if mtime is None else mtime
+
+
+def _select(
+    members: Sequence[tarfile.TarInfo], sids: frozenset[str]
+) -> tuple[dict[tuple[str, ...], tarfile.TarInfo], frozenset[str]]:
+    """What to store: one member per path -- the newer mtime wins a duplicate,
+    a tie goes to the later one, as tar itself would leave it -- and the sids
+    that hold a member over ``PULL_MAX_MEMBER_BYTES`` (never read). Nothing is
+    read here; only headers are looked at."""
     log = get_logger("nodes")
-    files: list[Path] = []
-    failed: set[str] = set()
+    chosen: dict[tuple[str, ...], tarfile.TarInfo] = {}
+    oversized: set[str] = set()
     skipped = 0
-    try:
-        with tarfile.open(fileobj=io.BytesIO(body), mode="r:*") as tar:
-            for member in tar:
-                parts = _member_parts(member, sids)
-                if parts is None:
-                    skipped += 1
-                    continue
-                if parts[0] in failed:
-                    continue
-                reader = tar.extractfile(member)
-                if reader is None:
-                    skipped += 1
-                    continue
-                target = dest.joinpath(*parts)
-                try:
-                    _write_file(target, reader.read(), float(member.mtime))
-                except OSError as e:
-                    failed.add(parts[0])
-                    log.warning("node pull: cannot store %s: %s", "/".join(parts), e)
-                    continue
-                files.append(target)
-    except (tarfile.TarError, EOFError, zlib.error, OSError) as e:
-        raise _pull_error(f"unreadable pull archive: {e}") from e
+    for member in members:
+        parts = _member_parts(member, sids)
+        if parts is None:
+            skipped += 1
+            continue
+        if member.size > PULL_MAX_MEMBER_BYTES:
+            oversized.add(parts[0])
+            log.warning(
+                "node pull: %s declares %d bytes, over the %d-byte cap; not stored",
+                "/".join(parts),
+                member.size,
+                PULL_MAX_MEMBER_BYTES,
+            )
+            continue
+        held = chosen.get(parts)
+        if held is None or _newness(member) >= _newness(held):
+            chosen[parts] = member
     if skipped:
         log.warning(
             "node pull: skipped %d archive member(s) outside the requested sessions",
             skipped,
         )
-    return tuple(files), frozenset(failed)
+    return chosen, frozenset(oversized)
+
+
+def _extract(
+    archive: bytes, count: int, *, dest: Path, sids: frozenset[str]
+) -> tuple[tuple[Path, ...], frozenset[str]]:
+    """Check the archive against its trailer's ``count`` and its size caps,
+    THEN store what was asked for -- a damaged or oversized archive writes
+    nothing. A session with a file that cannot be stored fails alone."""
+    if not archive:
+        if count:
+            raise _pull_error(
+                f"pull archive damaged: expected {count} member(s), saw 0"
+            )
+        return (), frozenset()
+    log = get_logger("nodes")
+    files: list[Path] = []
+    failed: set[str] = set()
+    try:
+        # "r:" -- a plain tar only. pull.sh never compresses (ssh can), and a
+        # compressed archive would decompress past every cap below.
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
+            members = tar.getmembers()
+            if len(members) != count:
+                raise _pull_error(
+                    f"pull archive damaged: expected {count} member(s), "
+                    f"saw {len(members)}"
+                )
+            chosen, oversized = _select(members, sids)
+            total = sum(m.size for m in chosen.values())
+            if total > PULL_MAX_TOTAL_BYTES:
+                raise _pull_error(
+                    f"pull archive holds {total} bytes, "
+                    f"over the {PULL_MAX_TOTAL_BYTES}-byte cap"
+                )
+            for parts, member in chosen.items():
+                if parts[0] in failed:
+                    continue
+                reader = tar.extractfile(member)
+                if reader is None:  # _member_parts admits regular files only
+                    continue
+                name = "/".join(parts)
+                mtime = _usable_mtime(member.mtime)
+                if mtime is None:
+                    log.warning(
+                        "node pull: %s has an unusable mtime; stored without it", name
+                    )
+                target = dest.joinpath(*parts)
+                try:
+                    _write_file(target, reader, mtime)
+                except OSError as e:
+                    failed.add(parts[0])
+                    log.warning("node pull: cannot store %s: %s", name, e)
+                    continue
+                files.append(target)
+    # ValueError/OverflowError: a header field this module did not foresee
+    # still ends as a pull error, never an escape past the RemoteError contract.
+    except (tarfile.TarError, EOFError, OSError, ValueError, OverflowError) as e:
+        raise _pull_error(f"unreadable pull archive: {e}") from e
+    return tuple(files), frozenset(failed | oversized)
+
+
+def _split_trailer(rest: bytes) -> tuple[bytes, int]:
+    """``rest`` (everything after the header) without its trailer line, and
+    the member count that line claims. The trailer is the LAST line, so it is
+    looked for from the end: a file holding the same text sits before it."""
+    at = rest.rfind(PULL_TRAILER)
+    found = _TRAILER_COUNT.fullmatch(rest, at + len(PULL_TRAILER)) if at >= 0 else None
+    if found is None:
+        raise _pull_error("reply truncated: no MAGENT-PULL-END line at its end")
+    return rest[:at], int(found.group(1))
 
 
 def parse_pull(stdout: bytes, *, dest: Path, sids: Collection[str]) -> NodeSnapshot:
@@ -614,14 +736,23 @@ def parse_pull(stdout: bytes, *, dest: Path, sids: Collection[str]) -> NodeSnaps
     mirror dir). Only the requested ``sids`` are believed: their metadata, and
     archive members shaped ``<sid>/transcripts/...`` or ``<sid>/state/<x>.json``
     whose every part is a legal name here. Everything else is dropped with one
-    warning. RemoteError (rc 0) when the reply is not a pull at all.
+    warning. RemoteError (rc 0) when the reply is not a pull at all -- no
+    header, no ``PULL_TRAILER`` last line (truncated), a member count that
+    disagrees with the trailer, a compressed or unreadable archive, or one
+    over ``PULL_MAX_TOTAL_BYTES``. ValueError when a requested sid is not
+    ``pullable_sid``: that is the caller's bug, not the node's.
 
     A member lands at ``dest/<its own archive path>`` -- nothing here maps a
     path back to a project directory."""
+    wanted = frozenset(sids)
+    bad = next((s for s in sorted(wanted) if not pullable_sid(s)), None)
+    if bad is not None:
+        raise ValueError(f"not a pullable session name: {bad!r}")
     _, sep, rest = stdout.partition(PULL_HEADER)
     if not sep:
         raise _pull_error("no MAGENT-PULL header in the reply")
-    meta_line, _, body = rest.partition(b"\n")
+    framed, count = _split_trailer(rest)
+    meta_line, _, archive = framed.partition(b"\n")
     try:
         meta = json.loads(meta_line.decode("utf-8"))
     except ValueError as e:
@@ -637,7 +768,6 @@ def parse_pull(stdout: bytes, *, dest: Path, sids: Collection[str]) -> NodeSnaps
         or not math.isfinite(now)
     ):
         raise _pull_error("pull metadata has no clock")
-    wanted = frozenset(sids)
     raw_sessions = meta.get("sessions")
     # A non-string entry is corruption, never a name to skip: dropping it would
     # write a snapshot without that session, and D would read it as dead.
@@ -650,7 +780,7 @@ def parse_pull(stdout: bytes, *, dest: Path, sids: Collection[str]) -> NodeSnaps
         reading: LoadSample | None = _load_sample(meta.get("sample"))
     except (ValueError, KeyError, TypeError, OverflowError):
         reading = None
-    files, failed = _extract(body, dest=dest, sids=wanted)
+    files, failed = _extract(archive, count, dest=dest, sids=wanted)
     return NodeSnapshot(
         now=float(now),
         sessions=sessions,
