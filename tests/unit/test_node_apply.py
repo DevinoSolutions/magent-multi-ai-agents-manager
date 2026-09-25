@@ -1105,6 +1105,9 @@ class TestWhatTheNodeCanRun:
             ". ~/.profile",
             "LEVEL=2 exec x",
             "${TOOLS}/notify --done",
+            ": noop",
+            "pushd .claude && x",
+            "popd",
         ],
     )
     def test_a_command_bash_would_run_or_that_cannot_be_judged_is_kept(
@@ -1182,6 +1185,16 @@ class TestWhatTheNodeCanRun:
         box.add("notify")
         box.apply(_work(tmp_path, _pc_settings(_stop_hook(command))))
         assert _drops(_lines(capsys), "hook:Stop") == dropped
+
+    @pytest.mark.parametrize("home", ["$HOME", "${HOME}"])
+    def test_a_missing_program_under_home_is_dropped(self, box, tmp_path, capsys, home):
+        # Either spelling is expanded, so the word is judged -- not kept as
+        # a runtime variable.
+        command = f"{home}/bin/missing --x"
+        box.apply(_work(tmp_path, _pc_settings(_stop_hook(command))))
+        assert _drops(_lines(capsys), "hook:Stop") == [
+            f"{home}/bin/missing is not on this node"
+        ]
 
     def test_a_missing_absolute_program_is_dropped(self, box, tmp_path, capsys):
         missing = "/nonexistent-magent-test/bin/tool"
@@ -1272,10 +1285,9 @@ class TestTheHooksAreRebuilt:
         entry = {"hooks": ["junk", _command_hook("notify")]}
         box.apply(_work(tmp_path, _pc_settings({"hooks": {"Stop": [entry]}})))
         assert _drops(_lines(capsys), "hook:Stop") == ["it is not a hook object"]
-        assert _commands(_json(_settings(box)), "Stop") == [
-            "notify",
-            remote_mux.NODE_STATE_HOOK_COMMAND,
-        ]
+        stop = _json(_settings(box))["hooks"]["Stop"]
+        assert stop[0] == {"hooks": [_command_hook("notify")]}
+        assert "junk" not in _settings(box).read_text(encoding="utf-8")
 
     def test_an_entry_keeps_only_its_runnable_hooks(self, box, tmp_path):
         box.add("notify")
@@ -1348,7 +1360,8 @@ class TestTheMerge:
             {
                 "permissions": {
                     "allow": ["Bash(ls)", "Read"],
-                    "deny": ["WebFetch"],
+                    "deny": ["WebFetch", "Bash(sudo:*)"],
+                    "ask": ["Write"],
                     "defaultMode": "plan",
                 }
             },
@@ -1356,6 +1369,7 @@ class TestTheMerge:
         pc = {
             "permissions": {
                 "allow": ["Read", "Edit", "Read"],
+                "deny": ["Bash(sudo:*)", "Bash(curl:*)"],
                 "ask": ["Bash(rm:*)"],
                 "defaultMode": "acceptEdits",
             }
@@ -1363,14 +1377,17 @@ class TestTheMerge:
         box.apply(_work(tmp_path, _pc_settings(pc)))
         assert _json(_settings(box))["permissions"] == {
             "allow": ["Read", "Edit", "Bash(ls)"],
-            "deny": ["WebFetch"],
-            "ask": ["Bash(rm:*)"],
+            "deny": ["Bash(sudo:*)", "Bash(curl:*)", "WebFetch"],
+            "ask": ["Bash(rm:*)", "Write"],
             "defaultMode": "acceptEdits",
         }
 
-    def test_an_empty_settings_file_is_an_empty_object(self, box, tmp_path, capsys):
+    @pytest.mark.parametrize("text", [b"", b" \n\t\n"])
+    def test_an_empty_settings_file_is_an_empty_object(
+        self, box, tmp_path, capsys, text
+    ):
         _settings(box).parent.mkdir(parents=True)
-        _settings(box).write_bytes(b"")
+        _settings(box).write_bytes(text)
         box.apply(_work(tmp_path, _pc_settings({"model": "opus"})))
         assert _status(_lines(capsys), "settings") == "did"
         assert _json(_settings(box))["model"] == "opus"
@@ -1401,6 +1418,143 @@ class TestTheMerge:
         assert _settings(box).is_symlink()
         assert os.readlink(_settings(box)) == str(gone)
         assert not gone.parent.exists()
+
+
+def _store(box: Box) -> Path:
+    return box.home / ".magent" / "provision.json"
+
+
+class TestWhatThePcStopsShippingLeavesTheNode:
+    """The PC is the source of truth for what it shipped: a rule or env key it
+    shipped last time and ships no more is revoked; the node's own stay."""
+
+    @pytest.mark.parametrize("rule", ["allow", "deny", "ask"])
+    @pytest.mark.parametrize(
+        "then",
+        [{"permissions": {"allow": [], "deny": [], "ask": []}}, {}],
+        ids=["emptied", "absent"],
+    )
+    def test_a_rule_the_pc_no_longer_ships_is_removed(self, box, tmp_path, rule, then):
+        _put(_settings(box), {"permissions": {rule: ["Read(node-only)"]}})
+        first = {"permissions": {rule: ["Bash(rm:*)"]}}
+        box.apply(_work(tmp_path, _pc_settings(first)))
+        assert _json(_settings(box))["permissions"][rule] == [
+            "Bash(rm:*)",
+            "Read(node-only)",
+        ]
+        box.apply(_work(tmp_path, _pc_settings(then), name="work2"))
+        assert _json(_settings(box))["permissions"][rule] == ["Read(node-only)"]
+
+    @pytest.mark.parametrize(
+        "then", [{"env": {"KEEP": "y"}}, {}], ids=["narrowed", "absent"]
+    )
+    def test_an_env_key_the_pc_no_longer_ships_is_removed(self, box, tmp_path, then):
+        _put(_settings(box), {"env": {"NODE_ONLY": "1"}})
+        first = {"env": {"FROM_PC": "x", "KEEP": "y"}}
+        box.apply(_work(tmp_path, _pc_settings(first)))
+        assert _json(_settings(box))["env"] == {
+            "NODE_ONLY": "1",
+            "FROM_PC": "x",
+            "KEEP": "y",
+        }
+        box.apply(_work(tmp_path, _pc_settings(then), name="work2"))
+        assert _json(_settings(box))["env"] == {"NODE_ONLY": "1", **then.get("env", {})}
+
+    def test_a_skipped_run_keeps_what_was_shipped(self, box, tmp_path, capsys):
+        # Unchanged runs in between must not forget the record the next
+        # change revokes against.
+        first = _pc_settings({"permissions": {"allow": ["Bash(rm:*)"]}})
+        box.apply(_work(tmp_path, first))
+        capsys.readouterr()
+        box.apply(_work(tmp_path, first, name="work2"))
+        assert _status(_lines(capsys), "settings") == "skip"
+        box.apply(_work(tmp_path, _pc_settings({}), name="work3"))
+        assert _json(_settings(box))["permissions"]["allow"] == []
+
+    @pytest.mark.parametrize(
+        "damage",
+        [
+            None,
+            "{oops",
+            {"version": 1, "digests": {}, "shipped": ["settings"]},
+            {"version": 1, "digests": {}, "shipped": {"settings": ["env", "allow"]}},
+            {
+                "version": 1,
+                "digests": {},
+                "shipped": {"settings": {"allow": "Bash(rm:*)", "env": "X"}},
+            },
+            {
+                "version": 1,
+                "digests": {},
+                "shipped": {"settings": {"allow": {"Bash(rm:*)": 1}, "env": {"X": 1}}},
+            },
+        ],
+        ids=["missing", "not-json", "not-a-map", "not-a-record", "strings", "maps"],
+    )
+    def test_a_lost_or_damaged_record_removes_nothing(
+        self, box, tmp_path, capsys, damage
+    ):
+        # Fail safe: with nothing trustworthy remembered, nothing is taken
+        # back -- and the apply still succeeds.
+        first = {"env": {"X": "x"}, "permissions": {"allow": ["Bash(rm:*)"]}}
+        box.apply(_work(tmp_path, _pc_settings(first)))
+        capsys.readouterr()
+        if damage is None:
+            _store(box).unlink()
+        else:
+            text = damage if isinstance(damage, str) else json.dumps(damage)
+            _store(box).write_text(text, encoding="utf-8")
+        assert box.apply(_work(tmp_path, _pc_settings({}), name="work2")) == 0
+        assert _status(_lines(capsys), "settings") == "did"
+        node = _json(_settings(box))
+        assert node["env"] == {"X": "x"}
+        assert node["permissions"]["allow"] == ["Bash(rm:*)"]
+
+
+class TestTheAdditionalDirectories:
+    """A node-first union of the node's and this PC's directories; a PC
+    directory that is a Windows path names nothing on the node and is dropped
+    with a row naming it."""
+
+    DIRS = "permissions.additionalDirectories"
+
+    def test_a_node_first_union_without_the_pcs_windows_paths(
+        self, box, tmp_path, capsys
+    ):
+        _put(_settings(box), {"permissions": {"additionalDirectories": ["/srv/data"]}})
+        pc = {"permissions": {"additionalDirectories": ["C:\\work", "/srv/shared"]}}
+        box.apply(_work(tmp_path, _pc_settings(pc)))
+        assert _drops(_lines(capsys), self.DIRS) == ["C:\\work is a Windows path"]
+        assert _json(_settings(box))["permissions"]["additionalDirectories"] == [
+            "/srv/data",
+            "/srv/shared",
+        ]
+
+    def test_the_union_is_deduped(self, box, tmp_path):
+        _put(
+            _settings(box),
+            {"permissions": {"additionalDirectories": ["/srv/data", "/srv/data"]}},
+        )
+        pc = {
+            "permissions": {
+                "additionalDirectories": ["/srv/shared", "/srv/data", "/srv/shared"]
+            }
+        }
+        box.apply(_work(tmp_path, _pc_settings(pc)))
+        assert _json(_settings(box))["permissions"]["additionalDirectories"] == [
+            "/srv/data",
+            "/srv/shared",
+        ]
+
+    def test_a_windows_path_is_dropped_when_the_node_has_none(
+        self, box, tmp_path, capsys
+    ):
+        pc = {"permissions": {"additionalDirectories": ["D:/code", "/srv/shared"]}}
+        box.apply(_work(tmp_path, _pc_settings(pc)))
+        assert _drops(_lines(capsys), self.DIRS) == ["D:/code is a Windows path"]
+        assert _json(_settings(box))["permissions"]["additionalDirectories"] == [
+            "/srv/shared"
+        ]
 
 
 def _mid_merge(
