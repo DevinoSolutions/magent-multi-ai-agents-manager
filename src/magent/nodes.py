@@ -11,14 +11,18 @@ mirror) and local stat()s.
 from __future__ import annotations
 
 import contextlib
+import copy
 import dataclasses
+import hashlib
+import ipaddress
 import json
 import math
 import os
 import re
 import tempfile
 import time
-from dataclasses import dataclass
+import urllib.parse
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
@@ -28,7 +32,7 @@ from magent.sessions.claude import encode_claude_project_path
 from magent.titles import get_leaf_name
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from magent.config import MagentConfig, ProjectConfig
 
@@ -117,6 +121,417 @@ class LoadSample:
     mem_total_mb: int
     mem_avail_mb: int
     my_sessions: int
+
+
+# What provisioning never copies to a node, whatever this PC's settings say
+# (spec §8, D5): a key or token in settings.env would log the node in AS this
+# PC, and apiKeyHelper names a local credential program.
+NEVER_SHIPPED_ENV = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+NEVER_SHIPPED_SETTINGS = ("apiKeyHelper",)
+# Every settings.env entry under this prefix stays behind too, named or not: a
+# base URL or custom headers aim the node's login at this PC's gateway, and
+# the next ANTHROPIC_* credential variable must not need a code change.
+NEVER_SHIPPED_ENV_PREFIX = "ANTHROPIC_"
+# A Claude credential matched by VALUE, wherever it sits (sk-ant-api...,
+# sk-ant-oat..., sk-ant-ort..., sk-ant-admin...): the name rules above cannot
+# see one pasted under another name -- a hook command, an MCP server's env or
+# header, an mcpOAuth entry. What holds one never ships; a note says where.
+CLAUDE_CREDENTIAL_MARKER = "sk-ant-"
+# This PC's own state-hook wiring (`magent hooks install`: an exe path or the
+# module form). The node gets its own hook, state_hook.sh, instead.
+LOCAL_STATE_HOOK_MARKERS = ("magent-state-hook", "magent.state_hook")
+# ~/.claude/skills/synced holds claude.ai-managed copies; a node's claude
+# syncs its own. The rest are tool droppings, never part of a skill.
+SKILLS_EXCLUDED_TOP = frozenset({"synced"})
+SKILLS_EXCLUDED_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv"})
+
+
+@dataclass(frozen=True)
+class SkillFile:
+    """One file under ~/.claude/skills: its '/'-separated relative path, its
+    bytes, and whether it must stay executable on the node."""
+
+    path: str
+    data: bytes
+    executable: bool
+
+
+def _digest(value: object) -> str:
+    """sha256 of ``value``'s canonical JSON; "" for an empty item, which
+    node_apply reads as "nothing to ship"."""
+    if not value:
+        return ""
+    canonical = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class UserScope:
+    """This PC's Claude Code user scope, as far as it ships to a node (spec
+    §8). Built by ``user_scope`` from local files only; ``notes`` say what was
+    left behind and why (never a value)."""
+
+    settings: dict[str, object]
+    mcp_servers: dict[str, object]
+    mcp_oauth: dict[str, object]
+    plugins: tuple[str, ...]
+    marketplaces: dict[str, str]
+    skills: tuple[SkillFile, ...]
+    notes: tuple[str, ...] = ()
+
+    def digests(self) -> dict[str, str]:
+        """One content hash per shipped item; node_apply skips an item whose
+        hash matches its last successful run. Notes are not content."""
+        skills = "".join(
+            f"{f.path}\0{int(f.executable)}\0{hashlib.sha256(f.data).hexdigest()}\n"
+            for f in self.skills
+        )
+        return {
+            "settings": _digest(self.settings),
+            "mcp": _digest(self.mcp_servers),
+            "mcp_oauth": _digest(self.mcp_oauth),
+            "plugins": _digest(
+                {"plugins": list(self.plugins), "marketplaces": self.marketplaces}
+                if self.plugins
+                else {}
+            ),
+            "skills": hashlib.sha256(skills.encode("utf-8")).hexdigest()
+            if skills
+            else "",
+        }
+
+
+def _read_object(path: Path, label: str, notes: list[str]) -> dict[str, object]:
+    """``path`` as a JSON object; {} when absent. Unreadable or malformed is a
+    note, never an exception -- provisioning must not die on a PC file."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        notes.append(f"{label}: unreadable ({e.strerror}), skipped")
+        return {}
+    except UnicodeDecodeError:
+        notes.append(f"{label}: not valid UTF-8, skipped")
+        return {}
+    try:
+        raw = json.loads(text)
+    except ValueError:
+        notes.append(f"{label}: not valid JSON, skipped")
+        return {}
+    if not isinstance(raw, dict):
+        notes.append(f"{label}: not a JSON object, skipped")
+        return {}
+    return raw
+
+
+def _is_local_state_hook(hook: object) -> bool:
+    if not isinstance(hook, dict):
+        return False
+    command = hook.get("command")
+    return isinstance(command, str) and any(
+        marker in command for marker in LOCAL_STATE_HOOK_MARKERS
+    )
+
+
+def _holds_claude_credential(value: object) -> bool:
+    """True when ``value``, or any key or value nested in it, carries a Claude
+    credential (``CLAUDE_CREDENTIAL_MARKER``)."""
+    if isinstance(value, str):
+        return CLAUDE_CREDENTIAL_MARKER in value
+    if isinstance(value, dict):
+        return any(
+            _holds_claude_credential(k) or _holds_claude_credential(v)
+            for k, v in value.items()
+        )
+    if isinstance(value, list):
+        return any(_holds_claude_credential(v) for v in value)
+    return False
+
+
+def _named(key: object) -> str:
+    """``key`` for a note -- unless the key itself holds a credential, which a
+    note must never echo."""
+    return "(a name holding one)" if _holds_claude_credential(key) else str(key)
+
+
+def _hooks_without(hooks: object, unwanted: Callable[[object], bool]) -> object:
+    """``settings.hooks`` minus every hook ``unwanted`` picks; an entry or event
+    left empty disappears. A shape this does not know is kept verbatim."""
+    if not isinstance(hooks, dict):
+        return hooks
+    kept: dict[str, object] = {}
+    for event, entries in hooks.items():
+        if not isinstance(entries, list):
+            kept[event] = entries
+            continue
+        new_entries: list[object] = []
+        for entry in entries:
+            inner = entry.get("hooks") if isinstance(entry, dict) else None
+            if not isinstance(entry, dict) or not isinstance(inner, list):
+                new_entries.append(entry)
+                continue
+            rest = [h for h in inner if not unwanted(h)]
+            if rest:
+                new_entries.append({**entry, "hooks": rest})
+        if new_entries:
+            kept[event] = new_entries
+    return kept
+
+
+def _without_local_state_hook(hooks: object) -> object:
+    """``settings.hooks`` minus this PC's state-hook wiring; an entry or event
+    left empty disappears."""
+    return _hooks_without(hooks, _is_local_state_hook)
+
+
+def _shippable_settings(raw: dict[str, object], notes: list[str]) -> dict[str, object]:
+    settings = copy.deepcopy(raw)
+    for key in NEVER_SHIPPED_SETTINGS:
+        if key in settings:
+            del settings[key]
+            notes.append(f"settings.{key}: never shipped")
+    env = settings.get("env")
+    if isinstance(env, dict):
+        named = sorted(
+            key
+            for key in env
+            if isinstance(key, str)
+            and (
+                key in NEVER_SHIPPED_ENV
+                or key.upper().startswith(NEVER_SHIPPED_ENV_PREFIX)
+            )
+        )
+        for key in named:
+            del env[key]
+            notes.append(f"settings.env.{key}: never shipped")
+        held = [
+            k
+            for k, v in env.items()
+            if _holds_claude_credential(k) or _holds_claude_credential(v)
+        ]
+        for key in held:
+            del env[key]
+            notes.append(
+                f"settings.env.{_named(key)}: holds a Claude credential, never shipped"
+            )
+    if "hooks" in settings:
+        hooks = _without_local_state_hook(settings["hooks"])
+        if isinstance(hooks, dict):
+            for event, entries in hooks.items():
+                if _holds_claude_credential(entries):
+                    notes.append(
+                        f"settings.hooks.{_named(event)}: a hook holding a Claude"
+                        " credential, never shipped"
+                    )
+            hooks = _hooks_without(hooks, _holds_claude_credential)
+        if hooks:
+            settings["hooks"] = hooks
+        else:
+            del settings["hooks"]
+    # The catch-all: whatever still holds a credential (a statusLine command, a
+    # permission rule, a hook shape _hooks_without keeps verbatim) goes whole.
+    for key in [
+        k
+        for k, v in settings.items()
+        if _holds_claude_credential(k) or _holds_claude_credential(v)
+    ]:
+        del settings[key]
+        notes.append(
+            f"settings.{_named(key)}: holds a Claude credential, never shipped"
+        )
+    return settings
+
+
+def _is_pc_local_host(host: str) -> bool:
+    """Loopback, unspecified or link-local: an address that names THIS PC (or
+    its own link), never the node's view of it."""
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_unspecified or address.is_link_local
+
+
+# A Windows drive path (C:\ or C:/) or a UNC path. Such a command or argument
+# names a file on this PC; it is never guessed down to a basename.
+_PC_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+
+
+def _kind(spec: dict[str, object]) -> str:
+    kind = spec.get("type")
+    if isinstance(kind, str) and kind:
+        return kind
+    return "stdio" if "command" in spec else "http"
+
+
+def mcp_skip_reason(spec: object) -> str | None:
+    """Why a user MCP server does NOT ship to a node, or None when it may
+    (DECISION-12 + the transport rule):
+    - http/sse with a remote url ships as it is;
+    - http/sse on a loopback or link-local address is PC-local;
+    - stdio whose command or any arg is a Windows path is PC-bound;
+    - any other stdio server is a CANDIDATE (None): provision ships it only if
+      the node resolves its program (``stdio_programs`` +
+      ``without_missing_programs``), so its ``env`` never leaves this PC for a
+      node that could not run it.
+    The MCP relay (plan K, DECISION-16) re-adds chosen PC-bound servers as
+    http entries after this filter. A reason never quotes a url or an env
+    value -- either can hold a key.
+    Whatever its transport, a server that holds a Claude credential anywhere
+    (an env value, a header, an arg, its url) never ships (D5)."""
+    if not isinstance(spec, dict):
+        return "not an object"
+    if _holds_claude_credential(spec):
+        return "it holds a Claude credential"
+    kind = _kind(spec)
+    if kind == "stdio":
+        command = spec.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return "a stdio server with no command"
+        args = spec.get("args")
+        words = [command.strip()]
+        if isinstance(args, list):
+            words += [a for a in args if isinstance(a, str)]
+        if any(_PC_PATH.match(word) for word in words):
+            return "its command is a path on this PC"
+        return None
+    url = spec.get("url")
+    if not isinstance(url, str) or not url:
+        return f"an {kind} server with no url"
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:  # an unbalanced IPv6 bracket, say
+        return "its url does not parse"
+    if not host:
+        return "its url has no host"
+    if _is_pc_local_host(host):
+        return "PC-local: its url is a loopback or link-local address"
+    return None
+
+
+def stdio_programs(scope: UserScope) -> dict[str, str]:
+    """{server name: program} for every stdio server left in ``scope`` -- the
+    first word of its ``command``, which the node must resolve."""
+    programs: dict[str, str] = {}
+    for name, spec in scope.mcp_servers.items():
+        if isinstance(spec, dict) and _kind(spec) == "stdio":
+            command = spec.get("command")
+            if isinstance(command, str) and command.split():
+                programs[name] = command.split()[0]
+    return programs
+
+
+def without_missing_programs(scope: UserScope, *, found: frozenset[str]) -> UserScope:
+    """``scope`` minus every stdio server whose program is not in ``found``
+    (what the node's ``command -v`` resolved), with its mcpOAuth entries and a
+    note per server. Runs BEFORE the payload is built, so a dropped server's
+    ``env`` never leaves this PC."""
+    missing = {
+        name: program
+        for name, program in stdio_programs(scope).items()
+        if program not in found
+    }
+    if not missing:
+        return scope
+    return replace(
+        scope,
+        mcp_servers={n: s for n, s in scope.mcp_servers.items() if n not in missing},
+        mcp_oauth={
+            k: e
+            for k, e in scope.mcp_oauth.items()
+            if not (isinstance(e, dict) and e.get("serverName") in missing)
+        },
+        notes=(
+            *scope.notes,
+            *(
+                f"mcp {name}: not shipped -- `{program}` is not on the node (command -v)"
+                for name, program in sorted(missing.items())
+            ),
+        ),
+    )
+
+
+def _mcp_servers(claude_json: dict[str, object], notes: list[str]) -> dict[str, object]:
+    """The user-scope MCP servers (``~/.claude.json`` → ``mcpServers``) that
+    ship. Project scope (``projects.*``) and the rest of that file stay
+    behind; every server left out gets a note naming why."""
+    servers = claude_json.get("mcpServers")
+    if not isinstance(servers, dict):
+        return {}
+    shipped: dict[str, object] = {}
+    for name, spec in servers.items():
+        reason = mcp_skip_reason(spec)
+        if reason is None and _holds_claude_credential(name):
+            reason = "it holds a Claude credential"
+        if reason is None:
+            shipped[name] = spec
+        else:
+            notes.append(f"mcp {_named(name)}: not shipped -- {reason}")
+    return shipped
+
+
+def _mcp_oauth(
+    credentials: dict[str, object], servers: dict[str, object], notes: list[str]
+) -> dict[str, object]:
+    """The ``mcpOAuth`` entries of servers that ship. ``claudeAiOauth`` -- the
+    Claude login, single-holder (D5) -- is never read, and an entry that holds
+    a Claude credential stays behind with a note."""
+    raw = credentials.get("mcpOAuth")
+    if not isinstance(raw, dict):
+        return {}
+    kept: dict[str, object] = {}
+    held = 0
+    for key, entry in raw.items():
+        server = entry.get("serverName") if isinstance(entry, dict) else None
+        if not isinstance(server, str) or server not in servers:
+            continue
+        if _holds_claude_credential(key) or _holds_claude_credential(entry):
+            held += 1
+            notes.append(f"mcpOAuth {server}: holds a Claude credential, never shipped")
+            continue
+        kept[key] = entry
+    left = len(raw) - len(kept) - held
+    if left:
+        noun = "entry" if left == 1 else "entries"
+        notes.append(f"mcpOAuth: {left} {noun} for servers not in mcpServers left out")
+    return kept
+
+
+def user_scope(home: Path) -> UserScope:
+    """What provisioning ships from the PC whose home is ``home`` (spec §8).
+    Reads ONLY ``~/.claude/settings.json``, ``~/.claude.json`` (mcpServers),
+    ``~/.claude/.credentials.json`` (mcpOAuth), the plugin marketplace list and
+    ``~/.claude/skills`` -- and runs nothing."""
+    notes: list[str] = []
+    claude = home / ".claude"
+    raw_settings = _read_object(claude / "settings.json", "settings.json", notes)
+    settings = _shippable_settings(raw_settings, notes)
+    servers = _mcp_servers(
+        _read_object(home / ".claude.json", ".claude.json", notes), notes
+    )
+    oauth = _mcp_oauth(
+        _read_object(claude / ".credentials.json", ".credentials.json", notes),
+        servers,
+        notes,
+    )
+    return UserScope(
+        settings=settings,
+        mcp_servers=servers,
+        mcp_oauth=oauth,
+        plugins=(),
+        marketplaces={},
+        skills=(),
+        notes=tuple(notes),
+    )
 
 
 @dataclass(frozen=True)
