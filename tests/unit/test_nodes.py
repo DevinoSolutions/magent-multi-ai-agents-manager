@@ -378,3 +378,117 @@ class TestANickResolvesLikeAProject:
         cfg = _pool_config(tmp_config, {"second": {"host": "devino-second"}})
         with pytest.raises(NodeConfigError, match=r"\(D4\)"):
             node_for_nick(cfg, "second", local_user="root")
+
+
+class TestTheMirrorLayout:
+    def test_every_path_hangs_off_the_nodes_dir(self, tmp_path):
+        assert nodes.node_dir("second", nodes_dir=tmp_path) == tmp_path / "second"
+        assert nodes.transcripts_dir("second", "api", nodes_dir=tmp_path) == (
+            tmp_path / "second" / "api" / "transcripts"
+        )
+        assert nodes.state_dir("second", "api", nodes_dir=tmp_path) == (
+            tmp_path / "second" / "api" / "state"
+        )
+        assert (
+            nodes.sessions_path("second", nodes_dir=tmp_path)
+            == tmp_path / "second" / "sessions.json"
+        )
+        assert (
+            nodes.load_path("second", nodes_dir=tmp_path)
+            == tmp_path / "second" / "load.jsonl"
+        )
+        assert (
+            nodes.pull_marks_path("second", nodes_dir=tmp_path)
+            == tmp_path / "second" / "pull.json"
+        )
+
+    def test_the_default_root_is_read_at_call_time(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path)
+        assert nodes.state_dir("second", "api") == tmp_path / "second" / "api" / "state"
+
+
+class TestAtomicWrites:
+    def test_a_write_lands_whole_with_no_temp_left(self, tmp_path):
+        target = tmp_path / "a" / "b.json"
+        nodes.write_json_atomic(target, {"x": 1})
+        assert json.loads(target.read_text(encoding="utf-8")) == {"x": 1}
+        assert [p.name for p in target.parent.iterdir()] == ["b.json"]
+
+    def test_a_failed_write_keeps_the_old_file_and_no_temp(self, tmp_path, monkeypatch):
+        target = tmp_path / "b.json"
+        nodes.write_text_atomic(target, "old\n")
+
+        def refuse(_src, _dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(nodes.os, "replace", refuse)
+        with pytest.raises(OSError, match="disk full"):
+            nodes.write_text_atomic(target, "new\n")
+        assert target.read_text(encoding="utf-8") == "old\n"
+        assert [p.name for p in tmp_path.iterdir()] == ["b.json"]
+
+    def test_the_temp_file_is_never_a_json_a_reader_could_glob(
+        self, tmp_path, monkeypatch
+    ):
+        # Readers glob `*.json` in a mirror dir; a half-written temp must never
+        # match. It is a sibling (os.replace is atomic only within one fs).
+        seen: list[Path] = []
+        real_replace = nodes.os.replace
+
+        def spy(src, dst):
+            seen.append(Path(src))
+            real_replace(src, dst)
+
+        monkeypatch.setattr(nodes.os, "replace", spy)
+        target = tmp_path / "b.json"
+        nodes.write_json_atomic(target, {"x": 1})
+        nodes.write_json_atomic(target, {"x": 2})
+        assert len(seen) == 2
+        assert all(p.parent == tmp_path for p in seen)
+        assert all(p.suffix == ".tmp" and not p.name.endswith(".json") for p in seen)
+        assert seen[0] != seen[1]
+
+    def test_a_non_finite_number_is_refused_before_anything_is_written(self, tmp_path):
+        target = tmp_path / "b.json"
+        with pytest.raises(ValueError, match="JSON compliant"):
+            nodes.write_json_atomic(target, {"ts": float("nan")})
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestTheSessionsSnapshot:
+    def test_a_written_snapshot_reads_back(self, tmp_path):
+        nodes.write_json_atomic(
+            nodes.sessions_path("second", nodes_dir=tmp_path),
+            {"ts": 5.0, "sessions": ["api", "web"]},
+        )
+        assert nodes.read_sessions("second", nodes_dir=tmp_path) == nodes.NodeSessions(
+            ts=5.0, sessions=("api", "web")
+        )
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "{torn",
+            "[]",
+            '{"ts": true, "sessions": []}',
+            '{"ts": 1, "sessions": "api"}',
+            # A non-finite ts would make sessions_stale() answer "fresh" forever.
+            '{"ts": NaN, "sessions": []}',
+            '{"ts": Infinity, "sessions": []}',
+        ],
+    )
+    def test_an_unusable_snapshot_reads_as_none(self, tmp_path, text):
+        path = nodes.sessions_path("second", nodes_dir=tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_text(text, encoding="utf-8")
+        assert nodes.read_sessions("second", nodes_dir=tmp_path) is None
+
+    def test_a_missing_snapshot_reads_as_none(self, tmp_path):
+        assert nodes.read_sessions("second", nodes_dir=tmp_path) is None
+
+    def test_a_snapshot_is_stale_after_two_pull_intervals(self):
+        snap = nodes.NodeSessions(ts=100.0, sessions=())
+        assert not nodes.sessions_stale(snap, pull_interval_s=30, now=160.0)
+        assert nodes.sessions_stale(snap, pull_interval_s=30, now=160.5)
+        assert nodes.sessions_stale(None, pull_interval_s=30, now=0.0)
