@@ -6,13 +6,15 @@ bash on POSIX; the pool is Linux)."""
 from __future__ import annotations
 
 import json
+import subprocess
 from typing import TYPE_CHECKING
 
 import pytest
 
 from magent import cli, nodes, remote_mux
 from magent.cli import hooks_cmd
-from magent.nodes import UserScope
+from magent.nodes import Node, UserScope
+from magent.remote_mux import RemoteError, ScriptLine
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -771,3 +773,78 @@ class TestUserScopeDigests:
 
     def test_notes_are_not_content(self):
         assert _scope(notes=("x",)).digests() == _scope().digests()
+
+
+NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
+
+
+class TestAScriptAnswersInRows:
+    def test_a_row_is_status_item_detail(self):
+        assert remote_mux.parse_report("did\tsettings\tmerged 3 keys\n").lines == (
+            ScriptLine("did", "settings", "merged 3 keys"),
+        )
+
+    def test_a_tab_inside_the_detail_is_kept(self):
+        (line,) = remote_mux.parse_report("warn\tplugins\ta\tb\n").lines
+        assert line.detail == "a\tb"
+
+    def test_a_row_without_a_detail_has_an_empty_one(self):
+        (line,) = remote_mux.parse_report("skip\tskills\n").lines
+        assert line == ScriptLine("skip", "skills", "")
+
+    def test_tool_chatter_and_carriage_returns_are_ignored(self):
+        text = "Reading package lists...\r\nok\ttmux\ttmux 3.4\r\nbogus\tx\ty\n\n"
+        assert remote_mux.parse_report(text).lines == (
+            ScriptLine("ok", "tmux", "tmux 3.4"),
+        )
+
+    def test_a_fail_row_fails_the_report(self):
+        assert remote_mux.parse_report("did\ta\t\nfail\tb\tno\n").failed
+
+    def test_did_and_drop_are_changes_and_skip_is_not(self):
+        assert remote_mux.parse_report("drop\tmcp\tx\n").changed
+        assert not remote_mux.parse_report("skip\tmcp\tx\n").changed
+
+    def test_key_rows_are_data(self):
+        report = remote_mux.parse_report(
+            "did\tnode-key:amin\t\nkey\tamin\tssh-ed25519 AAAA magent@devino-second\n"
+        )
+        assert report.keys() == {"amin": "ssh-ed25519 AAAA magent@devino-second"}
+        assert not report.failed
+
+
+def _completed(rc: int, stdout: bytes = b"", stderr: bytes = b""):
+    return subprocess.CompletedProcess(["ssh"], rc, stdout, stderr)
+
+
+class TestAnExitCodeWithoutARowStillFails:
+    def test_a_silent_non_zero_exit_becomes_a_fail_row(self):
+        report = remote_mux._report_of(
+            _completed(2, b"did\tgh\tx\n", b"noise\npython3: not found\n"),
+            "provision",
+            NODE,
+        )
+        assert report.lines[-1] == ScriptLine(
+            "fail", "provision", "exited 2: python3: not found"
+        )
+
+    def test_a_non_zero_exit_that_reported_its_failure_adds_nothing(self):
+        report = remote_mux._report_of(
+            _completed(1, b"fail\tgh\tno gh\n"), "provision", NODE
+        )
+        assert report.lines == (ScriptLine("fail", "gh", "no gh"),)
+
+    def test_exit_255_is_the_transport_not_the_script(self):
+        with pytest.raises(RemoteError) as info:
+            remote_mux._report_of(
+                _completed(
+                    255, stderr=b"ssh: connect to host devino-second: refused\n"
+                ),
+                "provision",
+                NODE,
+            )
+        assert info.value.rc == 255
+        assert "refused" in info.value.stderr_tail
+        # The program, never this PC's path to it -- and no client lookup,
+        # which would turn the transport failure into "ssh not installed".
+        assert info.value.command_redacted[0] == "ssh"

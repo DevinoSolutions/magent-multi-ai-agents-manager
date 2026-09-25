@@ -840,3 +840,12 @@ class TestSample:
         )
         script_len = len(node_scripts.script("sample").encode("utf-8"))
         assert shown[-1] == f"<stdin: {script_len} bytes>"
+
+
+class TestRunScriptCanHandBackAFailure:
+    def test_check_false_returns_the_exit_code(self, fake_ssh):
+        fake_ssh.set_reply("bash -s", stdout="fail\tx\ty\n", rc=1)
+        r = remote_mux.run_script(
+            NODE, "sample", [], timeout_s=remote_mux.SCRIPT_TIMEOUT_S, check=False
+        )
+        assert (r.returncode, r.stdout) == (1, b"fail\tx\ty\n")

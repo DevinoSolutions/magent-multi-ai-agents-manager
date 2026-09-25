@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from magent import node_scripts
-from magent.attach_client import SSH_MISSING_RC, TMUX_SOCKET
+from magent.attach_client import SSH_MISSING_RC, SSH_TRANSPORT_RC, TMUX_SOCKET
 from magent.log import get_logger
 from magent.nodes import LoadSample
 
@@ -351,6 +351,7 @@ def run_script(
     *,
     timeout_s: float,
     stdin: bytes | None = None,
+    check: bool = True,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run the packaged ``node_scripts/<script>.sh`` on ``node`` as
     ``bash -s -- <SOCKET> <args>``: the script on stdin, then -- when
@@ -358,7 +359,9 @@ def run_script(
     added here, on every call; ``args`` never carry it. Secrets belong in
     ``stdin``; ``args`` are argv, visible to the node's process table and to
     logs. A failure's ``stderr_tail`` is the script's own words (see
-    ``RemoteError``): a script must never echo its payload.
+    ``RemoteError``): a script must never echo its payload. ``check=False``
+    hands a non-zero exit back instead of raising: a script that reports its
+    own failures in rows exits 1 and still has rows to read.
 
     Refused before any ssh: ValueError for a script in
     ``node_scripts.NON_ENTRY_SCRIPTS`` (it would read the socket as its own
@@ -367,7 +370,76 @@ def run_script(
     if f"{script}.sh" in node_scripts.NON_ENTRY_SCRIPTS:
         raise ValueError(f"{script}.sh is not a run_script entry point")
     argv_remote, framed = _script_call(script, args, stdin)
-    return run(node, argv_remote, timeout_s=timeout_s, input_bytes=framed)
+    return run(node, argv_remote, timeout_s=timeout_s, input_bytes=framed, check=check)
+
+
+# The row vocabulary every provisioning script prints: status<TAB>item<TAB>
+# detail, one per line. Any other stdout line is a tool's chatter, ignored.
+REPORT_STATUSES = frozenset({"ok", "did", "skip", "drop", "warn", "fail", "key"})
+
+
+@dataclass(frozen=True)
+class ScriptLine:
+    status: str
+    item: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class ProvisionReport:
+    """What a node script said, row by row, in order."""
+
+    lines: tuple[ScriptLine, ...]
+
+    @property
+    def failed(self) -> bool:
+        return any(line.status == "fail" for line in self.lines)
+
+    @property
+    def changed(self) -> bool:
+        return any(line.status in ("did", "drop") for line in self.lines)
+
+    def keys(self) -> dict[str, str]:
+        """``key`` rows (setup.sh): Unix user -> that user's node public key."""
+        return {line.item: line.detail for line in self.lines if line.status == "key"}
+
+
+def parse_report(text: str) -> ProvisionReport:
+    """The rows in ``text``, in order. A line is a row when it splits on its
+    first two tabs into a known status and a non-empty item; the detail keeps
+    any further tabs. Everything else is a tool's chatter and is dropped."""
+    lines: list[ScriptLine] = []
+    for raw in text.splitlines():
+        parts = raw.rstrip("\r").split("\t", 2)
+        if len(parts) >= 2 and parts[0] in REPORT_STATUSES and parts[1]:
+            lines.append(
+                ScriptLine(parts[0], parts[1], parts[2] if len(parts) == 3 else "")
+            )
+    return ProvisionReport(tuple(lines))
+
+
+def _report_of(
+    result: subprocess.CompletedProcess[bytes], script: str, node: Node
+) -> ProvisionReport:
+    """A finished script's rows. Exit 255 is ssh's own failure, not the
+    script's, and raises; any other non-zero exit with no ``fail`` row gets
+    one, so a script that died mid-step can never read as a success.
+
+    The error names the command the way ``run`` does (``_run_shown``): the
+    program, not this PC's path to it, and no client lookup -- a lookup here
+    could turn a transport failure into "ssh not installed"."""
+    if result.returncode == SSH_TRANSPORT_RC:
+        raise RemoteError(
+            SSH_TRANSPORT_RC,
+            _tail(result.stderr),
+            _run_shown(node, _script_argv([]), None),
+        )
+    report = parse_report(result.stdout.decode("utf-8", "replace"))
+    if result.returncode != 0 and not report.failed:
+        err = result.stderr.decode("utf-8", "replace").strip().splitlines()
+        detail = f"exited {result.returncode}" + (f": {err[-1][:200]}" if err else "")
+        report = ProvisionReport((*report.lines, ScriptLine("fail", script, detail)))
+    return report
 
 
 def has_session(node: Node, sid: str) -> bool | None:
