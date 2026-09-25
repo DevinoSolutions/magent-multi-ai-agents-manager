@@ -190,6 +190,23 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     log.reset_logging()
 
 
+@pytest.fixture(autouse=True)
+def _no_real_ssh(monkeypatch):
+    """No test resolves the REAL ``ssh`` client. A test that installed no fake
+    sees "not installed" (``remote_mux.run`` raises RemoteError rc 127), a
+    shape every caller already handles.
+
+    Same family as ``MAGENT_PSMUX_BOOST=0``, for its sharpest reason: a node
+    call dials a real machine on the network under the developer's own keys,
+    and no HOME redirect contains a binary on PATH. Patched on the MODULE
+    attribute, so ``test_remote_mux.py``'s by-value import of ``find_ssh`` (the
+    test that proves PATH resolution) still gets the real resolver; the
+    ``fake_ssh`` fixture patches the same attribute afterwards and wins. The
+    ``needs_ssh`` node tier re-points it at the real client deliberately.
+    """
+    monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: None)
+
+
 # --- The tripwire -------------------------------------------------------------
 # The redirect above is the fix; this is the alarm that keeps it fixed, because
 # the failure mode is silent BY CONSTRUCTION: a test that forgets the redirect

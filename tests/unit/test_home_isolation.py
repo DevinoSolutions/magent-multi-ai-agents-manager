@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from magent import lockfile
+from magent import lockfile, remote_mux
 from tests.conftest import (
     PLAYWRIGHT_BROWSERS_PATH,
     REAL_HOME,
@@ -180,3 +180,11 @@ class TestEnvInspection:
     def test_an_inherited_env_is_clean(self):
         # env=None means "inherit os.environ", which the redirect already owns.
         assert _env_points_at_real_home(None) is None
+
+
+class TestNoTestResolvesTheRealSsh:
+    """A node call reaches a real machine on the network under the developer's
+    own keys, and no HOME redirect contains a binary on PATH."""
+
+    def test_the_client_is_unresolvable_by_default(self):
+        assert remote_mux.find_ssh() is None
