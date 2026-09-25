@@ -4,6 +4,8 @@ one ssh a pull costs."""
 from __future__ import annotations
 
 import gzip
+import io
+import json
 import logging
 import os
 import tarfile
@@ -40,6 +42,27 @@ def _stored(root) -> list[str]:
 
 def _node_logs(caplog) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.name == "magent.nodes"]
+
+
+def _gnu_sparse_header(name: str, *, stored: int, real_size: int) -> bytes:
+    """One GNU sparse (type ``S``) header block, built by hand: tarfile cannot
+    write one. ``stored`` bytes follow it on the wire; the one sparse-map
+    entry puts them at the very end of a ``real_size``-byte file."""
+    info = tarfile.TarInfo(name)
+    info.size = stored
+    info.mode = 0o600
+    block = bytearray(info.tobuf(format=tarfile.GNU_FORMAT))
+    assert len(block) == 512
+    block[156:157] = tarfile.GNUTYPE_SPARSE
+    # The old-GNU sparse map: 4 x (offset, numbytes), 12 octal digits each.
+    block[386:398] = tarfile.itn(real_size - stored, 12, tarfile.GNU_FORMAT)
+    block[398:410] = tarfile.itn(stored, 12, tarfile.GNU_FORMAT)
+    block[482:483] = b"\0"  # isextended: no extension blocks follow
+    block[483:495] = tarfile.itn(real_size, 12, tarfile.GNU_FORMAT)
+    block[148:156] = b" " * 8
+    chksum = tarfile.calc_chksums(bytes(block))[0]
+    block[148:156] = b"%06o\0 " % chksum
+    return bytes(block)
 
 
 class TestParsePull:
@@ -249,6 +272,15 @@ class TestATruncatedReplyIsNeverSuccess:
         with pytest.raises(RemoteError, match=f"expected {claimed} .*saw 2"):
             parse_pull(reply, dest=tmp_path / "second", sids=frozenset({"api"}))
 
+    def test_a_meta_only_reply_whose_trailer_claims_members_is_an_error(self, tmp_path):
+        # No archive at all: the trailer's count is the only word on it.
+        reply = pull_bytes(pull_meta(), [], count=2)
+        dest = tmp_path / "second"
+        with pytest.raises(RemoteError, match=r"expected 2 .*saw 0") as info:
+            parse_pull(reply, dest=dest, sids=frozenset({"api"}))
+        assert info.value.rc == 0
+        assert _stored(dest) == []
+
     def test_a_trailer_whose_count_matches_parses(self, tmp_path):
         reply, _ = _two_member_reply()
         dest = tmp_path / "second"
@@ -362,6 +394,40 @@ class TestTheArchiveIsBounded:
         with pytest.raises(RemoteError, match="over the 5-byte cap"):
             parse_pull(reply, dest=dest, sids=frozenset({"api"}))
         assert _stored(dest) == []
+
+    def test_a_gnu_sparse_member_is_never_ours(self, tmp_path, caplog):
+        # tarfile calls a type-S member isfile(), and its REAL size comes from
+        # the header, not the bytes sent: a few hundred bytes on the wire
+        # would write a file this big.
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        real_size = 3 * 1024 * 1024
+        header = _gnu_sparse_header(
+            "api/transcripts/sparse.jsonl", stored=1, real_size=real_size
+        )
+        archive = header + b"z".ljust(512, b"\0") + b"\0" * 1024
+        reply = (
+            PULL_HEADER
+            + json.dumps(pull_meta(sessions=["api"])).encode("ascii")
+            + b"\n"
+            + archive
+            + PULL_TRAILER
+            + b"1\n"
+        )
+        # The header really does claim the multi-MiB file.
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
+            (claimed,) = tar.getmembers()
+        assert claimed.issparse()
+        assert claimed.isfile()
+        assert claimed.size == real_size
+        root = tmp_path / "mirror"
+        snap = parse_pull(reply, dest=root / "second", sids=frozenset({"api"}))
+        assert snap.files == ()
+        assert snap.failed_sids == frozenset()
+        assert snap.sessions == ("api",)
+        assert _stored(root) == []
+        assert _node_logs(caplog) == [
+            "node pull: skipped 1 archive member(s) outside the requested sessions"
+        ]
 
     def test_a_large_member_is_streamed_not_read_whole(self, tmp_path, monkeypatch):
         chunks: list[int] = []

@@ -8,7 +8,8 @@ local git reads a bring-up needs. Every function returns data or raises
   -- never an f-string shell, and never parsed by the node user's LOGIN shell
   (zsh expands a bare ``=word``, which is every exact tmux target ``=<sid>``);
 - every call is bounded: ``timeout_s`` is a required keyword, so a call that
-  forgot it is a TypeError, never a hang;
+  forgot it is a TypeError, never a hang -- and the stdout it may hold in RAM
+  is capped too (``max_stdout_bytes``, default ``MAX_REPLY_BYTES``);
 - secrets travel on stdin only -- never argv, never a log line;
   ``RemoteError.command_redacted`` names stdin by its length alone;
 - ``BatchMode=yes`` everywhere: a password prompt nobody can answer is a hang.
@@ -31,6 +32,8 @@ import shutil
 import subprocess
 import tarfile
 import threading
+import time
+from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -85,6 +88,18 @@ SSH_BATCH_OPTS = (
     "ServerAliveCountMax=3",
 )
 
+# The most stdout one call may hold in RAM (``max_stdout_bytes``'s default):
+# past it the child is killed and the call is RemoteError, so a node streaming
+# gigabytes inside its time bound is an error, never a MemoryError. 64 MiB
+# dwarfs every control and bring-up reply, and holds ``ignored_paths``' local
+# `git ls-files` output for a very large repo. A pull passes its own cap.
+MAX_REPLY_BYTES = 64 * 1024 * 1024
+# How much of a child's stderr is held: only its tail is ever read, so older
+# bytes are dropped as new ones arrive. Drained whole all the same -- a child
+# blocked on a full stderr pipe would hang.
+_STDERR_KEEP_BYTES = 1024 * 1024
+# One read from a child's pipe.
+_READ_CHUNK_BYTES = 64 * 1024
 # How much of a failed command's stderr an error carries: enough for the
 # cause, never a whole log.
 _STDERR_TAIL_LINES = 20
@@ -191,6 +206,99 @@ def _run_shown(
     return _redacted(["ssh", *_ssh_tail(node, argv_remote, tty=False)], input_bytes)
 
 
+class _Drain(threading.Thread):
+    """One of a child's output pipes, read to its end on a daemon thread,
+    holding at most ``cap`` bytes.
+
+    Head mode (stdout): the first byte past the cap ends the read, drops all
+    it held, sets ``over`` and closes the pipe -- so a writer still filling it
+    fails instead of blocking forever. Tail mode (stderr): the oldest bytes are
+    dropped instead, and the read runs to the end. Only this thread closes the
+    pipe, so no close ever races a read. ``over`` and ``data`` are read once
+    the thread has finished."""
+
+    def __init__(self, pipe: IO[bytes] | None, cap: int, *, tail: bool) -> None:
+        super().__init__(daemon=True)
+        self._pipe = pipe
+        self._cap = cap
+        self._tail = tail
+        self._chunks: deque[bytes] = deque()
+        self._held = 0
+        self.over = False
+
+    def run(self) -> None:
+        if self._pipe is None:
+            return
+        try:
+            # A broken pipe ends the stream the way EOF does.
+            with contextlib.suppress(OSError):
+                self._read(self._pipe.fileno())
+        finally:
+            with contextlib.suppress(OSError):
+                self._pipe.close()
+
+    def _read(self, fd: int) -> None:
+        # os.read, not the buffered object: it returns what is there now, so
+        # a trickle is seen as it arrives.
+        while chunk := os.read(fd, _READ_CHUNK_BYTES):
+            if not self._tail and self._held + len(chunk) > self._cap:
+                self.over = True
+                self._chunks.clear()
+                self._held = 0
+                return
+            self._chunks.append(chunk)
+            self._held += len(chunk)
+            while self._tail and self._held - len(self._chunks[0]) >= self._cap:
+                self._held -= len(self._chunks.popleft())
+
+    def data(self) -> bytes:
+        held = b"".join(self._chunks)
+        self._chunks.clear()
+        return held[-self._cap :] if self._tail else held
+
+
+def _feed(pipe: IO[bytes], data: bytes) -> None:
+    """Write ``data`` to a child's stdin and close it -- on its own thread, so
+    a child that writes before it reads cannot deadlock the call. A child that
+    exits without reading it all is no error here; its exit status says what
+    happened (a broken pipe, or EINVAL on Windows, is swallowed)."""
+    try:
+        with contextlib.suppress(OSError):
+            pipe.write(data)
+    finally:
+        with contextlib.suppress(OSError):
+            pipe.close()
+
+
+def _kill(proc: subprocess.Popen[bytes]) -> None:
+    proc.kill()
+    # Reap the direct child only, bounded. Waiting on the pipes -- the drain
+    # threads, or a communicate() -- would wait for every write end, and the
+    # interpreter behind a .cmd/sh shim is a GRANDCHILD still holding one --
+    # the 90s-for-a-5s timeout defect psmux.probe_control_plane documents.
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+        proc.wait(timeout=_REAP_TIMEOUT_S)
+
+
+def _finish(
+    proc: subprocess.Popen[bytes], out: _Drain, err: _Drain, timeout_s: float
+) -> bool:
+    """Wait, within ``timeout_s``, for stdout to end (EOF or over its cap),
+    then stderr, then the exit. False if the bound ran out first."""
+    deadline = time.monotonic() + timeout_s
+    out.join(timeout_s)
+    if out.over:
+        return True
+    err.join(max(0.0, deadline - time.monotonic()))
+    if out.is_alive() or err.is_alive():
+        return False
+    try:
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
 def _spawn(
     argv: list[str],
     *,
@@ -200,12 +308,18 @@ def _spawn(
     shown: tuple[str, ...],
     label: str,
     quiet: bool = False,
+    max_stdout_bytes: int = MAX_REPLY_BYTES,
 ) -> subprocess.CompletedProcess[bytes]:
     """One bounded child -- the shared body of ``run`` and the local git reads
     (``ignored_paths``). ``shown`` is what an error and a log line may say
     about the command; ``label`` opens every log line, naming who spawned it.
-    ``quiet`` drops all three of those log lines; the RemoteError is raised
-    exactly the same."""
+    ``quiet`` drops every one of those log lines; the RemoteError is raised
+    exactly the same.
+
+    Bounded in time AND in memory: stdout is read as it arrives, and a child
+    whose stdout passes ``max_stdout_bytes`` is killed and raised as
+    RemoteError rc None ("reply exceeded N bytes") -- nothing past the cap is
+    held. stderr is drained too, keeping only its last ``_STDERR_KEEP_BYTES``."""
     try:
         proc = subprocess.Popen(
             argv,
@@ -227,28 +341,39 @@ def _spawn(
                 "%s could not start (%s): %s", label, reason, shlex.join(shown)
             )
         raise RemoteError(rc, reason, shown) from e
-    try:
-        out, err = proc.communicate(input=input_bytes, timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        # Reap the direct child only, bounded. A second communicate() would
-        # wait for every pipe's write end, and the interpreter behind a
-        # .cmd/sh shim is a GRANDCHILD still holding one -- the 90s-for-a-5s
-        # timeout defect psmux.probe_control_plane documents.
-        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
-            proc.wait(timeout=_REAP_TIMEOUT_S)
+    if input_bytes is not None and proc.stdin is not None:
+        threading.Thread(
+            target=_feed, args=(proc.stdin, input_bytes), daemon=True
+        ).start()
+    out = _Drain(proc.stdout, max_stdout_bytes, tail=False)
+    err = _Drain(proc.stderr, _STDERR_KEEP_BYTES, tail=True)
+    out.start()
+    err.start()
+    if not _finish(proc, out, err, timeout_s):
+        _kill(proc)
         if not quiet:
             get_logger("nodes").warning(
                 "%s timed out after %.1fs: %s", label, timeout_s, shlex.join(shown)
             )
-        raise RemoteError(None, f"timed out after {timeout_s:g}s", shown) from None
+        raise RemoteError(None, f"timed out after {timeout_s:g}s", shown)
+    if out.over:
+        _kill(proc)
+        if not quiet:
+            get_logger("nodes").warning(
+                "%s reply exceeded %d bytes: %s",
+                label,
+                max_stdout_bytes,
+                shlex.join(shown),
+            )
+        raise RemoteError(None, f"reply exceeded {max_stdout_bytes} bytes", shown)
+    stderr = err.data()
     if check and proc.returncode != 0:
         if not quiet:
             get_logger("nodes").warning(
                 "%s failed (rc=%s): %s", label, proc.returncode, shlex.join(shown)
             )
-        raise RemoteError(proc.returncode, _tail(err), shown)
-    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+        raise RemoteError(proc.returncode, _tail(stderr), shown)
+    return subprocess.CompletedProcess(argv, proc.returncode, out.data(), stderr)
 
 
 def run(
@@ -259,11 +384,13 @@ def run(
     input_bytes: bytes | None = None,
     check: bool = True,
     quiet: bool = False,
+    max_stdout_bytes: int = MAX_REPLY_BYTES,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run ``argv_remote`` on ``node`` over ssh, as ONE ``bash -c`` remote
     string (``_remote_string``). Raises RemoteError on a spawn failure, a
-    missing client (rc 127), a timeout (rc None), or -- with ``check`` -- a
-    non-zero exit. With ``check=False`` every exit code comes back for the
+    missing client (rc 127), a timeout (rc None), a reply over
+    ``max_stdout_bytes`` (rc None; the child is killed), or -- with ``check``
+    -- a non-zero exit. With ``check=False`` every exit code comes back for the
     caller to classify. The returned ``CompletedProcess.args`` is the real
     argv, this PC's client path included: a caller must not log it.
     ``quiet`` drops the per-call log line, for a caller that reports the
@@ -279,6 +406,7 @@ def run(
         shown=shown,
         label="node call",
         quiet=quiet,
+        max_stdout_bytes=max_stdout_bytes,
     )
 
 
@@ -317,6 +445,7 @@ def run_script(
     *,
     timeout_s: float,
     stdin: bytes | None = None,
+    max_stdout_bytes: int = MAX_REPLY_BYTES,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run the packaged ``node_scripts/<script>.sh`` on ``node`` as
     ``bash -s -- <SOCKET> <args>``: the script on stdin, then -- when
@@ -325,6 +454,7 @@ def run_script(
     ``stdin``; ``args`` are argv, visible to the node's process table and to
     logs. A failure's ``stderr_tail`` is the script's own words (see
     ``RemoteError``): a script must never echo its payload.
+    ``max_stdout_bytes`` goes to ``run`` as is.
 
     Refused before any ssh: ValueError for a script in
     ``node_scripts.NON_ENTRY_SCRIPTS`` (it would read the socket as its own
@@ -333,7 +463,13 @@ def run_script(
     if f"{script}.sh" in node_scripts.NON_ENTRY_SCRIPTS:
         raise ValueError(f"{script}.sh is not a run_script entry point")
     argv_remote, framed = _script_call(script, args, stdin)
-    return run(node, argv_remote, timeout_s=timeout_s, input_bytes=framed)
+    return run(
+        node,
+        argv_remote,
+        timeout_s=timeout_s,
+        input_bytes=framed,
+        max_stdout_bytes=max_stdout_bytes,
+    )
 
 
 def has_session(node: Node, sid: str) -> bool | None:
@@ -465,6 +601,11 @@ watermark holds). A transcript is the largest file a pull carries."""
 PULL_MAX_TOTAL_BYTES = 512 * 1024 * 1024
 """The most one reply may ask this PC to write, summed over the members it
 would store; more is RemoteError before anything is written."""
+PULL_MAX_REPLY_BYTES = PULL_MAX_TOTAL_BYTES + 4 * 1024 * 1024
+"""The most stdout one pull may hold in RAM: ``pull`` (plan E Task 8) passes it
+as ``max_stdout_bytes``. Over ``PULL_MAX_TOTAL_BYTES`` because the header, the
+metadata line, tar's per-member headers and padding, and the trailer all ride
+on top of the members' own bytes."""
 PULL_COPY_CHUNK_BYTES = 1024 * 1024
 """A member is streamed to disk in chunks of this size, never read whole."""
 # The newest mtime believed: ~36,800 years of Unix time, far past any real
@@ -576,6 +717,10 @@ def _member_parts(
     """``<sid>/transcripts/<any depth>`` or ``<sid>/state/<name>.json`` for a
     requested sid, every part a legal name here, regular files only -- or None."""
     if not member.isfile():
+        return None
+    # tarfile calls a GNU sparse member a file, and its size is whatever the
+    # header claims. pull.sh never passes `-S`, so a sparse member is never ours.
+    if member.issparse():
         return None
     parts = tuple(member.name.split("/"))
     if len(parts) < 3 or parts[0] not in sids or parts[1] not in _PULL_KINDS:

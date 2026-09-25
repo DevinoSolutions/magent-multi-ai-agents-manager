@@ -62,6 +62,17 @@ if mode == "timeout":
     # orphan.
     time.sleep(5)
     sys.exit(0)
+if mode == "flood":
+    # Stream stdout forever and never exit on its own. Ends only when the
+    # reader closes the pipe (the write fails) -- on Windows kill() reaps
+    # cmd.exe, and this python is the orphan still holding the pipe.
+    block = b"x" * 65536
+    try:
+        while True:
+            sys.stdout.buffer.write(block)
+            sys.stdout.flush()
+    except (OSError, ValueError):
+        sys.exit(0)
 
 line = " ".join(args)
 replies = json.loads((BASE / "replies.json").read_text(encoding="utf-8")) if (BASE / "replies.json").exists() else []
@@ -111,7 +122,8 @@ class FakeSsh:
         replies_path.write_text(json.dumps(replies), encoding="utf-8")
 
     def set_mode(self, mode: str) -> None:
-        """``"timeout"``: every call hangs silently for 5s."""
+        """``"timeout"``: every call hangs silently for 5s. ``"flood"``: every
+        call streams stdout without end and never exits on its own."""
         (self.base / "mode.txt").write_text(mode, encoding="utf-8")
 
     def calls(self) -> list[FakeCall]:
