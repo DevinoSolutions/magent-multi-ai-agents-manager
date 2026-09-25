@@ -1187,6 +1187,75 @@ class TestRecipeFor:
         )
 
     @pytest.mark.parametrize(
+        ("url", "stripped"),
+        [
+            # git's remote-helper form `<transport>::<address>`: the address is
+            # stripped by the same rules, the transport is re-attached as-is.
+            (
+                "https::https://u:SECRET@host/r.git",
+                "https::https://host/r.git",
+            ),
+            (
+                "HTTPS::HTTPS://u:SECRET@host/r.git",
+                "HTTPS::https://host/r.git",
+            ),
+            # Every layer of a stacked prefix is peeled, none is guessed at.
+            (
+                "https::https::https://u:SECRET@host/r.git",
+                "https::https::https://host/r.git",
+            ),
+            # An empty ssh login with a password: the whole userinfo goes.
+            (
+                "ssh://:SECRET@host/r.git",
+                "ssh://host/r.git",
+            ),
+        ],
+    )
+    def test_a_credential_behind_a_transport_or_an_empty_login_is_stripped(
+        self, tmp_path, url, stripped
+    ):
+        state = dataclasses.replace(_state(tmp_path, ()), url=url)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(tmp_path), node="second"),
+            NODE,
+            [state],
+            home=Path.home(),
+            project_dir=tmp_path,
+        )
+        assert recipe.repos[0].url == stripped
+        assert "SECRET" not in repr(recipe)
+        assert recipe.warnings == (
+            (
+                f"repo {recipe.remote_root}: origin URL carried credentials; "
+                "stripped -- the node authenticates with its own gh token"
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # The ext transport's address is a command, not a URL.
+            "ext::ssh -i key git@host r.git",
+            "https::https://host/r.git",
+            # An empty userinfo carries nothing: no rewrite, no warning.
+            "https://@host/r.git",
+            "https://:@host/r.git",
+            "ssh://git:@host/r.git",
+        ],
+    )
+    def test_an_origin_with_nothing_to_strip_is_left_byte_for_byte(self, tmp_path, url):
+        state = dataclasses.replace(_state(tmp_path, ()), url=url)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(tmp_path), node="second"),
+            NODE,
+            [state],
+            home=Path.home(),
+            project_dir=tmp_path,
+        )
+        assert recipe.repos[0].url == url
+        assert recipe.warnings == ()
+
+    @pytest.mark.parametrize(
         "url",
         [
             "git@github.com:org/repo.git",

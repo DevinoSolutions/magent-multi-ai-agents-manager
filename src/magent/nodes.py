@@ -593,6 +593,9 @@ def push_warnings(
 # A URL with a scheme (RFC 3986's scheme grammar, so `git+https` counts), split
 # into scheme, authority (up to the first '/', '?' or '#') and the rest.
 _SCHEME_URL = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)://([^/?#]*)(.*)", re.DOTALL)
+# git's remote-helper form `<transport>::<address>` (same scheme grammar as
+# git's is_urlschemechar), split into the transport and the address.
+_TRANSPORT_URL = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)::(.*)", re.DOTALL)
 # Schemes whose login is an ssh user (`git@`), not a secret.
 _SSH_SCHEMES = frozenset({"ssh", "git+ssh", "ssh+git"})
 
@@ -602,28 +605,56 @@ def _without_credentials(url: str) -> tuple[str, bool]:
     were stripped. They would otherwise land in the node's ``.git/config``,
     the Recipe's repr and every log line.
 
+    A ``<transport>::<address>`` URL (git's remote-helper form, e.g.
+    ``https::https://u:pw@h``) is peeled layer by layer -- a stacked prefix
+    included -- and its address judged by the rules below; every transport
+    prefix is re-attached byte-for-byte. An address that is no URL (``ext::``
+    carries a command) therefore passes through untouched.
+
     Only a ``scheme://`` URL is inspected; scp-like ``git@host:org/repo`` and
     anything schemeless pass through byte-for-byte, as does a URL whose
     authority has no '@'. The userinfo is everything before the authority's
     LAST '@' (an IPv6 ``[...]`` host holds none). An ssh-family scheme keeps
     its login and loses only the password (``ssh://user:pw@h`` ->
-    ``ssh://user@h``; ``ssh://git@h`` is untouched). Every other scheme loses
+    ``ssh://user@h``; ``ssh://git@h`` is untouched; an empty login goes with
+    its password, ``ssh://:pw@h`` -> ``ssh://h``). Every other scheme loses
     the WHOLE userinfo: a token-only login (``https://ghp_...@h``) is the
-    credential. A stripped URL's scheme is lowercased."""
+    credential. A userinfo holding nothing but ':' (or an ssh password that
+    is empty) is no credential: the URL is left byte-for-byte and not
+    reported as stripped. A stripped URL's scheme is lowercased."""
+    prefix = ""
+    address = url
+    while _SCHEME_URL.fullmatch(address) is None:
+        transport = _TRANSPORT_URL.fullmatch(address)
+        if transport is None:
+            return url, False
+        prefix += f"{transport.group(1)}::"
+        address = transport.group(2)
+    stripped = _without_userinfo_secret(address)
+    if stripped is None:
+        return url, False
+    return f"{prefix}{stripped}", True
+
+
+def _without_userinfo_secret(url: str) -> str | None:
+    """A ``scheme://`` ``url`` with its credential removed (the rules of
+    ``_without_credentials``), or None when it carries no credential."""
     match = _SCHEME_URL.fullmatch(url)
     if match is None:
-        return url, False
+        return None
     scheme, authority, rest = match.groups()
     userinfo, at, host = authority.rpartition("@")
-    if not at:
-        return url, False
+    if not at or not userinfo.replace(":", ""):
+        return None
     scheme = scheme.lower()
     if scheme in _SSH_SCHEMES:
-        login, colon, _password = userinfo.partition(":")
-        if not colon:
-            return url, False
-        return f"{scheme}://{login}@{host}{rest}", True
-    return f"{scheme}://{host}{rest}", True
+        login, _colon, password = userinfo.partition(":")
+        if not password:
+            return None
+        if not login:
+            return f"{scheme}://{host}{rest}"
+        return f"{scheme}://{login}@{host}{rest}"
+    return f"{scheme}://{host}{rest}"
 
 
 def recipe_for(
