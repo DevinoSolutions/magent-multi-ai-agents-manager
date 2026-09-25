@@ -21,7 +21,7 @@ import pytest
 
 from magent import nodes
 from magent.nodes import LoadSample
-from tests.unit._node_fixtures import NOW, seed_history
+from tests.unit._node_fixtures import NOW, pool, seed_history
 
 
 def _window(nick: str, fixture: str, tmp_path) -> list[LoadSample]:
@@ -157,3 +157,134 @@ class TestEachTermOfTheScore:
         score = nodes.score_node("n", _window("n", fixture, tmp_path))
 
         assert score.score == pytest.approx(expected)
+
+
+def _samples(tmp_path, **fixtures: str) -> dict[str, list[LoadSample]]:
+    out: dict[str, list[LoadSample]] = {}
+    for nick, fixture in fixtures.items():
+        seed_history(nick, fixture, nodes_dir=tmp_path)
+        out[nick] = nodes.read_load_history(nick, nodes_dir=tmp_path)
+    return out
+
+
+class TestPlace:
+    def test_a_steady_box_beats_a_bursty_one_whose_p75_is_lower(self, tmp_path):
+        placement = nodes.place(
+            pool("second", "third"),
+            _samples(tmp_path, second="bursty", third="quiet"),
+            now=NOW,
+            map_entry=None,
+        )
+
+        scores = {s.nick: s for s in placement.scores}
+        assert scores["second"].p75 < scores["third"].p75
+        assert (placement.nick, placement.reason) == ("third", "placed")
+
+    def test_a_memory_starved_box_loses_to_an_otherwise_identical_one(self, tmp_path):
+        placement = nodes.place(
+            pool("second", "third"),
+            _samples(tmp_path, second="starved", third="quiet"),
+            now=NOW,
+            map_entry=None,
+        )
+
+        assert placement.nick == "third"
+
+    def test_equal_scores_go_to_the_node_listed_first_in_config(self, tmp_path):
+        placement = nodes.place(
+            pool("second", "third"),
+            _samples(tmp_path, second="quiet", third="quiet"),
+            now=NOW,
+            map_entry=None,
+        )
+
+        assert placement.nick == "second"
+
+    def test_config_order_not_name_order_breaks_the_tie(self, tmp_path):
+        placement = nodes.place(
+            pool("third", "second"),
+            _samples(tmp_path, second="quiet", third="quiet"),
+            now=NOW,
+            map_entry=None,
+        )
+
+        assert placement.nick == "third"
+
+    def test_a_node_without_samples_is_left_out_rather_than_scored_idle(self, tmp_path):
+        placement = nodes.place(
+            pool("second", "third"),
+            _samples(tmp_path, third="bursty"),
+            now=NOW,
+            map_entry=None,
+        )
+
+        assert placement.nick == "third"
+        assert [s.nick for s in placement.scores] == ["third"]
+
+    def test_no_scoreable_node_places_nothing(self):
+        placement = nodes.place(pool("second"), {}, now=NOW, map_entry=None)
+
+        assert (placement.nick, placement.reason) == (None, "no-data")
+
+    def test_scores_come_back_in_config_order(self, tmp_path):
+        placement = nodes.place(
+            pool("third", "second"),
+            _samples(tmp_path, second="quiet", third="bursty"),
+            now=NOW,
+            map_entry=None,
+        )
+
+        assert [s.nick for s in placement.scores] == ["third", "second"]
+
+    def test_every_placement_reason_has_a_sentence(self):
+        assert set(nodes.PLACE_REASONS) == {"kept", "re-placed", "placed", "no-data"}
+        assert all(nodes.PLACE_REASONS.values())
+
+
+class TestTheHardMemoryFloor:
+    def test_a_box_under_10_percent_free_loses_even_with_the_lower_score(
+        self, tmp_path
+    ):
+        placement = nodes.place(
+            pool("second", "third"),
+            _samples(tmp_path, second="starved", third="bursty"),
+            now=NOW,
+            map_entry=None,
+        )
+
+        scores = {s.nick: s for s in placement.scores}
+        assert scores["second"].score < scores["third"].score  # 0.52 < 1.0625
+        assert (placement.nick, placement.reason) == ("third", "placed")
+
+    def test_when_every_box_is_under_the_floor_the_score_decides(self, tmp_path):
+        samples = _samples(tmp_path, second="starved")
+        samples["third"] = [_sample(load1=4.0, avail=800)]  # 5 % free, u = 1.0: 1.05
+
+        placement = nodes.place(
+            pool("third", "second"), samples, now=NOW, map_entry=None
+        )
+
+        assert all(s.below_floor for s in placement.scores)
+        assert (
+            placement.nick == "second"
+        )  # 0.52 beats 1.05 although "third" is listed first
+
+    def test_a_box_with_an_unknown_memory_total_stays_eligible(self, tmp_path):
+        samples = _samples(tmp_path, second="starved")
+        samples["third"] = [_sample(load1=4.0, total=0, avail=0)]
+
+        placement = nodes.place(
+            pool("second", "third"), samples, now=NOW, map_entry=None
+        )
+
+        assert placement.nick == "third"
+
+    def test_the_floor_never_moves_a_kept_placement(self, tmp_path):
+        placement = nodes.place(
+            pool("second", "third"),
+            _samples(tmp_path, second="starved", third="quiet"),
+            now=NOW,
+            map_entry="second",
+        )
+
+        assert (placement.nick, placement.reason) == ("second", "kept")

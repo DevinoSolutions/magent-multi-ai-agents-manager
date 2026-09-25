@@ -1003,3 +1003,79 @@ def score_node(
         live=live,
         below_floor=below_floor,
     )
+
+
+# Why a placement came out the way it did -- a closed vocabulary, printed by
+# `magent node plan` and the launch notes.
+PLACE_REASONS: dict[str, str] = {
+    "kept": "already placed there (node-map.json)",
+    "re-placed": "its node left settings.nodes; placed again by load",
+    "placed": "lowest load score over the last 30 minutes",
+    "no-data": "no node has load samples to score",
+}
+
+
+@dataclass(frozen=True)
+class Placement:
+    """Where an ``auto`` project goes, why, and every score behind it.
+    ``nick`` is None only for ``no-data``. ``note`` is a line to print."""
+
+    nick: str | None
+    reason: str
+    scores: tuple[NodeScore, ...] = ()
+    note: str | None = None
+
+
+def place(
+    config: MagentConfig,
+    samples: Mapping[str, Sequence[LoadSample]],
+    *,
+    now: float,
+    map_entry: str | None,
+    placed: Mapping[str, int] | None = None,
+    live: frozenset[str] = frozenset(),
+) -> Placement:
+    """Spec §11: the lowest score over the last 30 minutes wins; ties go to
+    the node listed first in ``settings.nodes``. A node under
+    ``MEM_HARD_FLOOR`` free memory is not a candidate while any other scored
+    node is above it; when all are below, the score alone decides.
+
+    Pure: it never talks to a node (``placement_samples`` owns the one live
+    reading a sparse node gets). ``map_entry`` is the nick node-map.json already
+    holds for the project -- it wins while that nick is still configured.
+    ``placed`` counts projects this same pass already put on a node, so a batch
+    spreads instead of piling onto one box before its next sample. ``live``
+    names the nodes whose only sample is a live one.
+    """
+    nicks = list(config.settings.nodes)
+    extra = placed or {}
+    scored = tuple(
+        score
+        for nick in nicks
+        if (
+            score := score_node(
+                nick,
+                in_window(samples.get(nick, ()), now=now),
+                extra_sessions=extra.get(nick, 0),
+                live=nick in live,
+            )
+        )
+        is not None
+    )
+    if map_entry is not None and map_entry in config.settings.nodes:
+        return Placement(map_entry, "kept", scored)
+    vanished = (
+        f"{map_entry!r} is no longer in settings.nodes"
+        if map_entry is not None
+        else None
+    )
+    if not scored:
+        return Placement(None, "no-data", scored, vanished)
+    order = {nick: index for index, nick in enumerate(nicks)}
+    candidates = [s for s in scored if not s.below_floor] or list(scored)
+    best = min(candidates, key=lambda s: (round(s.score, 9), order[s.nick]))
+    if vanished is None:
+        return Placement(best.nick, "placed", scored)
+    return Placement(
+        best.nick, "re-placed", scored, f"{vanished}; re-placed on {best.nick!r}"
+    )
