@@ -1050,6 +1050,37 @@ class TestTheRepoStatusParserTrustsNothingTheNodeSays:
         assert status.dirty is None
 
 
+class TestNodesIsALeafUnderTheRemoteMuxSeam:
+    """spec-G9 GAP 2: the sid rule lives in nodes.py and remote_mux re-exports
+    it, never the reverse -- nodes.py must not reach into the seam."""
+
+    def test_the_repo_record_never_loads_remote_mux(self, tmp_path):
+        code = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "from magent import nodes\n"
+            f"d = Path({str(tmp_path)!r})\n"
+            "nodes.repo_record_path('second', 'api', nodes_dir=d)\n"
+            "nodes.read_repo_record('second', 'api', nodes_dir=d)\n"
+            "rec = nodes.RepoRecord(ts=1.0, source='recall', repos=())\n"
+            "assert nodes.write_repo_record('second', 'api', rec, nodes_dir=d)\n"
+            "print('magent.remote_mux' in sys.modules)\n"
+        )
+
+        done = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        )
+
+        assert done.stdout.strip() == "False", done.stderr
+
+    def test_remote_mux_re_exports_the_one_sid_rule(self):
+        assert remote_mux.pullable_sid is nodes.pullable_sid
+
+
 class TestTheRepoRecordFileIsCheckedOnTheWayInAndOut:
     @pytest.mark.parametrize(
         "ts", ["true", "NaN", "Infinity", "-Infinity", "1" + "0" * 400, '"1"', "null"]

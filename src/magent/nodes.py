@@ -516,6 +516,44 @@ def resolve(
 # Every path reads NODES_DIR at CALL time (never a second import-bound Path),
 # so the test-isolation redirect of NODES_DIR covers all of them.
 
+# A session directory sits beside these per-node files; no sid may take a name.
+_RESERVED_NAMES = frozenset(
+    {"sessions.json", "load.jsonl", "pull.json", "node-map.json"}
+)
+# Every path part must be a legal file name on THIS PC, which may be Windows.
+_UNSAFE_CHARS = re.compile(r'[\x00-\x1f<>:"/\\|?*]')
+# ntpath's reserved set on 3.13 (ntpath.isreserved is 3.13+, so it is copied):
+# the superscript digits count as COM/LPT numbers too.
+_DEVICE_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CONIN$",
+        "CONOUT$",
+        *(f"COM{c}" for c in "123456789¹²³"),
+        *(f"LPT{c}" for c in "123456789¹²³"),
+    }
+)
+
+
+def _safe_part(part: str) -> bool:
+    # A part ending in "." or " " is refused outright (Windows drops them), so
+    # the device check needs only ntpath's: the stem before the FIRST dot,
+    # trailing spaces dropped -- "CON .jsonl" opens the console.
+    return (
+        part not in ("", ".", "..")
+        and _UNSAFE_CHARS.search(part) is None
+        and not part.endswith((".", " "))
+        and part.split(".", 1)[0].rstrip(" ").upper() not in _DEVICE_NAMES
+    )
+
+
+def pullable_sid(sid: str) -> bool:
+    """Can ``sid`` name a directory under ``~/.magent/nodes/<nick>/`` here?"""
+    return _safe_part(sid) and sid not in _RESERVED_NAMES
+
 
 def node_dir(nick: str, *, nodes_dir: Path | None = None) -> Path:
     return (nodes_dir if nodes_dir is not None else NODES_DIR) / nick
@@ -527,14 +565,14 @@ def transcripts_dir(nick: str, sid: str, *, nodes_dir: Path | None = None) -> Pa
     ``sid`` is joined VERBATIM: ``psmux.session_name`` keeps ``/`` and ``\\``,
     so a node-map sid like ``/etc`` would resolve outside the node dir --
     callers (the attention reader, recall) pass it through
-    ``remote_mux.pullable_sid`` first."""
+    ``pullable_sid`` first."""
     return node_dir(nick, nodes_dir=nodes_dir) / sid / "transcripts"
 
 
 def state_dir(nick: str, sid: str, *, nodes_dir: Path | None = None) -> Path:
     """Where the daemon mirrors a node session's agent-state records.
     ``sid`` is joined VERBATIM, exactly as in ``transcripts_dir``: callers
-    pass a node-map sid through ``remote_mux.pullable_sid`` first."""
+    pass a node-map sid through ``pullable_sid`` first."""
     return node_dir(nick, nodes_dir=nodes_dir) / sid / "state"
 
 
@@ -1515,9 +1553,6 @@ def repo_record_path(nick: str, sid: str, *, nodes_dir: Path | None = None) -> P
     here rather than trusting every caller to have run ``pullable_sid``: the
     sid comes from the node map, and ``../../x`` must never name a file
     outside the node's own directory."""
-    # remote_mux imports this module at its top; in-body breaks the cycle.
-    from magent.remote_mux import pullable_sid
-
     if not pullable_sid(sid):
         raise NodeConfigError(f"not a safe session id for a repo record: {sid!r}")
     return node_dir(nick, nodes_dir=nodes_dir) / sid / "repos.json"  # E's layout owner

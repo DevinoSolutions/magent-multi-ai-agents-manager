@@ -37,12 +37,17 @@ from typing import TYPE_CHECKING
 from magent import node_scripts
 from magent.attach_client import SSH_MISSING_RC, TMUX_SOCKET
 from magent.log import get_logger
+
+# pullable_sid is re-exported: its one owner is nodes.py (a leaf that must not
+# reach into this seam), and callers keep saying remote_mux.pullable_sid.
 from magent.nodes import (
     LoadSample,
     NodeConfigError,
     RepoStatus,
+    _safe_part,
     encoded_project_dir,
     parse_repo_status,
+    pullable_sid,
 )
 
 if TYPE_CHECKING:
@@ -482,26 +487,6 @@ _TRAILER_COUNT = re.compile(rb"([0-9]{1,9})\n")
 # file written in the same second as the scan is asked for again, never lost.
 WATERMARK_OVERLAP_S = 1.0
 _PULL_KINDS = frozenset({"transcripts", "state"})
-# A session directory sits beside these per-node files; no sid may take a name.
-_RESERVED_NAMES = frozenset(
-    {"sessions.json", "load.jsonl", "pull.json", "node-map.json"}
-)
-# Every path part must be a legal file name on THIS PC, which may be Windows.
-_UNSAFE_CHARS = re.compile(r'[\x00-\x1f<>:"/\\|?*]')
-# ntpath's reserved set on 3.13 (ntpath.isreserved is 3.13+, so it is copied):
-# the superscript digits count as COM/LPT numbers too.
-_DEVICE_NAMES = frozenset(
-    {
-        "CON",
-        "PRN",
-        "AUX",
-        "NUL",
-        "CONIN$",
-        "CONOUT$",
-        *(f"COM{c}" for c in "123456789¹²³"),
-        *(f"LPT{c}" for c in "123456789¹²³"),
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -539,23 +524,6 @@ class NodeSnapshot:
 def _pull_error(message: str) -> RemoteError:
     # rc 0: the node answered, and the answer was not a pull.
     return RemoteError(0, message, ("pull.sh",))
-
-
-def _safe_part(part: str) -> bool:
-    # A part ending in "." or " " is refused outright (Windows drops them), so
-    # the device check needs only ntpath's: the stem before the FIRST dot,
-    # trailing spaces dropped -- "CON .jsonl" opens the console.
-    return (
-        part not in ("", ".", "..")
-        and _UNSAFE_CHARS.search(part) is None
-        and not part.endswith((".", " "))
-        and part.split(".", 1)[0].rstrip(" ").upper() not in _DEVICE_NAMES
-    )
-
-
-def pullable_sid(sid: str) -> bool:
-    """Can ``sid`` name a directory under ``~/.magent/nodes/<nick>/`` here?"""
-    return _safe_part(sid) and sid not in _RESERVED_NAMES
 
 
 def _str_dict(raw: object) -> dict[str, str]:
