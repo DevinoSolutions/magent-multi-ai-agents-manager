@@ -20,7 +20,7 @@ import pytest
 from magent import cli, node_scripts, nodes, remote_mux
 from magent.cli import hooks_cmd
 from magent.nodes import Node, UserScope
-from magent.remote_mux import RemoteError, ScriptLine
+from magent.remote_mux import ProvisionReport, RemoteError, ScriptLine
 from tests.unit._fake_ssh import FakeSsh, gh_auth_status, make_fake_ssh
 
 if TYPE_CHECKING:
@@ -1369,3 +1369,329 @@ class TestProgramsShUnderRealBash:
             ("skip", "no-such-program"),
         ]
         assert lines[0].detail == str(uvx)
+
+
+PC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKEPCKEY me@pc"
+SETUP_TOOLS = (
+    "bash",
+    "cat",
+    "cut",
+    "awk",
+    "mkdir",
+    "chmod",
+    "head",
+    "tail",
+    "rm",
+    "touch",
+    "tr",
+)
+
+# Each shim is `#!<bash>` + `STATE=<dir>` + its body. The state directory is
+# the whole fake system: uid, installed packages, users and their homes, the
+# docker group, and logs of what apt-get and curl were asked.
+_SHIMS = {
+    "id": """
+case "$1" in -u) cat "$STATE/uid" ;; *) echo "uid=$(cat "$STATE/uid")" ;; esac
+""",
+    "dpkg": """
+case "$1" in
+  -s) [ -e "$STATE/pkgs/$2" ] ;;
+  --print-architecture) echo amd64 ;;
+  *) exit 1 ;;
+esac
+""",
+    "apt-get": """
+echo "$*" >> "$STATE/apt.log"
+if [ -e "$STATE/apt-fail" ]; then echo "E: Unable to locate package" >&2; exit 100; fi
+if [ "$1" = install ]; then
+  for a in "$@"; do case "$a" in install|-*) ;; *) touch "$STATE/pkgs/$a" ;; esac; done
+fi
+exit 0
+""",
+    "getent": """
+case "$1" in
+  passwd)
+    [ -e "$STATE/users/$2" ] || exit 2
+    echo "$2:x:1000:1000::$STATE/home/$2:/bin/bash" ;;
+  group)
+    { [ "$2" = docker ] && [ -e "$STATE/groups/docker" ]; } || exit 2
+    echo "docker:x:999:$(awk 'NR>1{printf ","} {printf "%s", $0}' "$STATE/groups/docker")" ;;
+  *) exit 2 ;;
+esac
+""",
+    "useradd": """
+for u; do :; done
+mkdir -p "$STATE/home/$u" && touch "$STATE/users/$u"
+""",
+    "usermod": """
+for u; do :; done
+echo "$u" >> "$STATE/groups/docker"
+""",
+    "chown": "exit 0\n",
+    "runuser": """
+cmd=""; user=""
+for a in "$@"; do
+  case "$a" in --login|-l) ;; --command=*) cmd=${a#--command=} ;; *) user=$a ;; esac
+done
+cd "$STATE/home/$user" || exit 1
+HOME="$STATE/home/$user" USER="$user" exec bash -c "$cmd"
+""",
+    "curl": """
+echo "$*" >> "$STATE/curl.log"
+case "$*" in *https://claude.ai/install.sh*) ;; *) exit 22 ;; esac
+cat <<'EOF'
+mkdir -p "$HOME/.local/bin"
+printf '#!/bin/sh\\necho "2.1.280 (Claude Code)"\\n' > "$HOME/.local/bin/claude"
+chmod +x "$HOME/.local/bin/claude"
+EOF
+""",
+    "ssh-keygen": """
+f=""; c=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in -f) f=$2; shift ;; -C) c=$2; shift ;; esac
+  shift
+done
+printf 'FAKE PRIVATE KEY\\n' > "$f"
+printf 'ssh-ed25519 AAAAFAKENODEKEY %s\\n' "$c" > "$f.pub"
+""",
+    "hostname": "echo devino-second\n",
+    "gh": 'echo "gh version 2.88.1 (2026-09-01)"\n',
+    "tmux": """
+case "$1" in -V) cat "$STATE/tmux-V" 2>/dev/null || echo "tmux 3.4" ;; *) exit 1 ;; esac
+""",
+}
+
+
+def _setup_box(tmp_path: Path, *, docker: bool = True) -> tuple[Path, dict[str, str]]:
+    """A fake root's system under tmp_path/state, and the env setup.sh runs in."""
+    state = tmp_path / "state"
+    for sub in ("pkgs", "users", "home", "groups", "root"):
+        (state / sub).mkdir(parents=True, exist_ok=True)
+    (state / "uid").write_text("0\n", encoding="utf-8")
+    if docker:
+        (state / "groups" / "docker").touch()
+    shims = tmp_path / "shims"
+    shims.mkdir(exist_ok=True)
+    for name, body in _SHIMS.items():
+        shim = shims / name
+        shim.write_text(
+            f"#!{BASH}\nSTATE={shlex.quote(str(state))}\n{body}",
+            encoding="utf-8",
+            newline="\n",
+        )
+        shim.chmod(0o755)
+    sysbin = _sysbin(tmp_path, SETUP_TOOLS, python=False, name="setupbin")
+    env = {
+        "HOME": str(state / "root"),
+        "PATH": os.pathsep.join([str(shims), str(sysbin)]),
+        "TMPDIR": str(tmp_path),
+    }
+    return state, env
+
+
+def _run_setup(
+    env: dict[str, str],
+    users: tuple[str, ...] = ("amin",),
+    payload: str = PC_KEY + "\n",
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        _bash_argv(*users),
+        input=remote_mux._frame_script(
+            node_scripts.script("setup"), payload.encode("utf-8")
+        ),
+        capture_output=True,
+        env=env,
+        timeout=120,
+        check=False,
+    )
+
+
+def _report(result: subprocess.CompletedProcess[bytes]) -> ProvisionReport:
+    return remote_mux.parse_report(result.stdout.decode("utf-8"))
+
+
+@POSIX_BASH
+class TestSetupShUnderRealBash:
+    def test_a_fresh_node_gets_everything_and_reports_each_users_key(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        r = _run_setup(env, ("amin", "bob"))
+        assert r.returncode == 0, r.stderr
+        per_user = {
+            f"{step}:{u}": "did"
+            for u in ("amin", "bob")
+            for step in ("user", "authorized_keys", "docker", "claude", "node-key")
+        }
+        assert _rows(r) == {
+            "packages": "did",
+            "tmux": "ok",
+            "gh": "skip",
+            **per_user,
+            "amin": "key",
+            "bob": "key",
+        }
+        assert _report(r).keys() == dict.fromkeys(
+            ("amin", "bob"), "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+        )
+        assert (state / "home" / "bob" / ".local" / "bin" / "claude").is_file()
+        assert "https://claude.ai/install.sh" in (state / "curl.log").read_text("utf-8")
+
+    def test_a_second_run_only_skips_and_still_reports_the_keys(self, tmp_path):
+        _, env = _setup_box(tmp_path)
+        _run_setup(env, ("amin", "bob"))
+        r = _run_setup(env, ("amin", "bob"))
+        assert r.returncode == 0, r.stderr
+        rows = _rows(r)
+        # The tmux floor is a check, not a change: it answers ok every run.
+        assert rows.pop("tmux") == "ok"
+        assert set(rows.values()) == {"skip", "key"}
+        assert set(_report(r).keys()) == {"amin", "bob"}
+
+    @pytest.mark.parametrize(
+        ("version", "status"),
+        [
+            ("tmux 3.0a", "fail"),  # Ubuntu 20.04's
+            ("tmux 3.1c", "fail"),
+            ("tmux 3.2a", "ok"),  # Ubuntu 22.04's: the floor itself
+            ("tmux 4.0", "ok"),
+            ("tmux next-3.5", "ok"),
+            ("tmux master", "fail"),  # unreadable, exactly as D's need_tmux
+        ],
+    )
+    def test_tmux_is_held_to_the_bring_up_floor(self, tmp_path, version, status):
+        state, env = _setup_box(tmp_path)
+        (state / "tmux-V").write_text(version + "\n", encoding="utf-8")
+        r = _run_setup(env)
+        assert _rows(r)["tmux"] == status
+        assert r.returncode == (0 if status == "ok" else 1)
+
+    def test_an_old_tmux_is_refused_with_its_version_and_the_floor(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        (state / "tmux-V").write_text("tmux 3.0a\n", encoding="utf-8")
+        (row,) = [
+            line for line in _report(_run_setup(env)).lines if line.item == "tmux"
+        ]
+        assert row.status == "fail"
+        assert "tmux 3.0a" in row.detail
+        assert "3.2 or newer" in row.detail
+
+    def test_the_pc_key_is_authorized_once_with_private_modes(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        _run_setup(env)
+        ssh_dir = state / "home" / "amin" / ".ssh"
+        authorized = ssh_dir / "authorized_keys"
+        assert authorized.read_text("utf-8").splitlines().count(PC_KEY) == 1
+        assert ssh_dir.stat().st_mode & 0o777 == 0o700
+        assert authorized.stat().st_mode & 0o777 == 0o600
+
+    def test_an_existing_key_file_without_a_final_newline_is_not_glued(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        authorized = state / "home" / "amin" / ".ssh" / "authorized_keys"
+        authorized.write_text("ssh-ed25519 AAAAOTHER other@box", encoding="utf-8")
+        _run_setup(env)
+        assert authorized.read_text("utf-8").splitlines() == [
+            "ssh-ed25519 AAAAOTHER other@box",
+            PC_KEY,
+        ]
+
+    def test_no_docker_group_is_a_skip(self, tmp_path):
+        _, env = _setup_box(tmp_path, docker=False)
+        assert _rows(_run_setup(env))["docker:amin"] == "skip"
+
+    def test_a_bad_user_name_is_refused_before_anything_changes(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        r = _run_setup(env, ("amin", "Bob;rm"))
+        assert r.returncode == 2
+        assert _rows(r) == {"setup": "fail"}
+        assert list((state / "users").iterdir()) == []
+        assert not (state / "apt.log").exists()
+
+    def test_not_root_is_one_fail_row(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        (state / "uid").write_text("1000\n", encoding="utf-8")
+        r = _run_setup(env)
+        assert r.returncode == 1
+        assert _rows(r) == {"setup": "fail"}
+        assert not (state / "apt.log").exists()
+
+    def test_a_private_key_payload_is_refused_and_never_echoed(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        secret = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ"
+        r = _run_setup(
+            env,
+            payload=(
+                "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+                f"{secret}\n"
+                "-----END OPENSSH PRIVATE KEY-----\n"
+            ),
+        )
+        assert r.returncode == 2
+        assert _rows(r) == {"key": "fail"}
+        assert secret.encode("ascii") not in r.stdout + r.stderr
+        assert list((state / "users").iterdir()) == []
+
+    def test_an_apt_failure_fails_its_row_and_the_users_still_get_keys(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        (state / "apt-fail").touch()
+        r = _run_setup(env)
+        assert r.returncode == 1
+        rows = _rows(r)
+        assert rows["packages"] == "fail"
+        assert rows["user:amin"] == "did"
+        assert set(_report(r).keys()) == {"amin"}
+
+
+class TestTheTmuxFloor:
+    def test_it_is_include_only(self):
+        # Like lib.sh: a `main` in it would run before the including script's.
+        floor = node_scripts.script("tmux_floor")
+        assert "main" not in floor
+        assert "magent_tmux_verdict()" in floor
+
+    def test_it_is_not_a_run_script_entry_point(self):
+        # B's convention: a sourced library never receives the socket as $1,
+        # so it is listed, and run_script refuses it before any ssh.
+        assert "tmux_floor.sh" in node_scripts.NON_ENTRY_SCRIPTS
+
+    def test_setup_inlines_it(self):
+        assert "magent_tmux_verdict()" in node_scripts.script("setup")
+
+
+class TestSetupNode:
+    def test_it_connects_as_root_for_this_one_hop(self, fake_ssh):
+        remote_mux.setup_node(
+            NODE, ["amin"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+        )
+        (call,) = fake_ssh.calls()
+        assert "root@devino-second" in call.argv
+        assert "amin@devino-second" not in call.argv
+
+    def test_the_users_are_argv_and_the_key_is_the_payload(self, fake_ssh):
+        remote_mux.setup_node(
+            NODE, ["amin", "bob"], PC_KEY + "\n\n", timeout_s=remote_mux.SETUP_TIMEOUT_S
+        )
+        (call,) = fake_ssh.calls()
+        assert call.argv[-1] == _remote(
+            "bash", "-s", "--", remote_mux.SOCKET, "amin", "bob"
+        )
+        assert _sent(call) == (PC_KEY + "\n").encode("ascii")
+
+    def test_the_node_keys_come_back_in_the_report(self, fake_ssh):
+        fake_ssh.set_reply(
+            "bash -s",
+            stdout="did\tuser:amin\tcreated\nkey\tamin\tssh-ed25519 AAAAN magent@devino-second\n",
+        )
+        report = remote_mux.setup_node(
+            NODE, ["amin"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+        )
+        assert report.keys() == {"amin": "ssh-ed25519 AAAAN magent@devino-second"}
+
+    def test_an_unreachable_root_login_raises(self, fake_ssh):
+        fake_ssh.set_reply(
+            "bash -s", stderr="root@devino-second: Permission denied\n", rc=255
+        )
+        with pytest.raises(RemoteError):
+            remote_mux.setup_node(
+                NODE, ["amin"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+            )

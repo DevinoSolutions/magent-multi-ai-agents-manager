@@ -20,6 +20,7 @@ leaves ``attach_client``, ``log``, ``node_scripts`` and ``nodes``.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import functools
 import gzip
 import hashlib
@@ -654,6 +655,28 @@ def provision(
         for name in sorted(user_scope.mcp_servers)
     )
     return ProvisionReport((*notes, *shipped, *report.lines))
+
+
+SETUP_TIMEOUT_S = 900.0
+
+
+def setup_node(
+    node: Node, users: Sequence[str], pubkey: str, *, timeout_s: float
+) -> ProvisionReport:
+    """Run setup.sh as ``root@<host>`` -- the one root hop. ``users`` are the
+    Unix users to create (argv; setup.sh validates them before it changes
+    anything), ``pubkey`` is this PC's public key (the payload). Each user's
+    node GitHub key comes back as a ``key`` row: ``report.keys()``."""
+    root = dataclasses.replace(node, user="root")
+    result = run_script(
+        root,
+        "setup",
+        list(users),
+        timeout_s=timeout_s,
+        stdin=(pubkey.strip() + "\n").encode("utf-8"),
+        check=False,
+    )
+    return _report_of(result, "setup", root)
 
 
 def has_session(node: Node, sid: str) -> bool | None:
