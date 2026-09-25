@@ -938,19 +938,18 @@ def _remote_home(node: Node) -> str:
 
 
 def _parse_result(
-    result: subprocess.CompletedProcess[bytes], shown: tuple[str, ...]
-) -> dict[str, object]:
-    """bring_up.sh's last non-empty stdout line, a JSON object. Anything else
-    is a RemoteError: a result that cannot be read is not a success."""
+    result: subprocess.CompletedProcess[bytes],
+) -> dict[str, object] | None:
+    """bring_up.sh's last non-empty stdout line as a JSON object, or None
+    when it is not one -- which the caller raises: a result that cannot be
+    read is not a success."""
     text = result.stdout.decode("utf-8", "replace")
     lines = [line for line in text.splitlines() if line.strip()]
     try:
         parsed = json.loads(lines[-1]) if lines else None
     except ValueError:
-        parsed = None
-    if not isinstance(parsed, dict):
-        raise RemoteError(result.returncode, "not a bring-up result", shown)
-    return parsed
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _deliver(
@@ -960,9 +959,13 @@ def _deliver(
     result = run_script(
         node, "bring_up", args, timeout_s=BRING_UP_TIMEOUT_S, stdin=payload
     )
-    # What RAN, as run() itself would name it (the ``sample`` precedent).
-    shown = _run_shown(node, *_script_call("bring_up", args, payload))
-    return _parse_result(result, shown)
+    parsed = _parse_result(result)
+    if parsed is None:
+        # What RAN, as run() itself would name it (the ``sample`` precedent).
+        # Built on this path only: the frame is a copy of the whole payload.
+        shown = _run_shown(node, *_script_call("bring_up", args, payload))
+        raise RemoteError(result.returncode, "not a bring-up result", shown)
+    return parsed
 
 
 def bring_up(

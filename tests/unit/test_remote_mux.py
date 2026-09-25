@@ -1173,7 +1173,16 @@ def _script_run(mode: str) -> str:
 
 
 @pytest.fixture
-def node_home(fake_ssh, monkeypatch):
+def patient_probe(monkeypatch):
+    """The HOME probe's budget in these tests only. The fake ssh is a Python
+    shim; on a loaded Windows box its start alone has overrun the product's
+    10s (a green test failing as "timed out"). What a probe timeout DOES is
+    pinned elsewhere with its own override."""
+    monkeypatch.setattr(remote_mux, "PROBE_TIMEOUT_S", 60.0)
+
+
+@pytest.fixture
+def node_home(fake_ssh, monkeypatch, patient_probe):
     monkeypatch.setattr(psmux, "code_on_path", lambda: False)
     fake_ssh.set_reply("printenv HOME", stdout="/home/amin\n")
     return fake_ssh
@@ -1280,7 +1289,7 @@ class TestOneConnectionBringsAProjectUp:
         assert remote_mux.bring_up(NODE, _recipe(tmp_path)).attached_existing is True
 
     def test_a_home_that_is_not_absolute_stops_before_the_script(
-        self, fake_ssh, tmp_path
+        self, fake_ssh, patient_probe, tmp_path
     ):
         fake_ssh.set_reply("printenv HOME", stdout="\n")
         with pytest.raises(RemoteError, match="HOME"):
@@ -1308,7 +1317,9 @@ class TestOneConnectionBringsAProjectUp:
         with pytest.raises(RemoteError, match="not a bring-up result"):
             remote_mux.bring_up(NODE, _recipe(tmp_path))
 
-    def test_a_home_refusal_names_the_probe_that_ran(self, fake_ssh, tmp_path):
+    def test_a_home_refusal_names_the_probe_that_ran(
+        self, fake_ssh, patient_probe, tmp_path
+    ):
         # RemoteError's law: command_redacted is what RAN, as _run_shown says it.
         fake_ssh.set_reply("printenv HOME", stdout="\n")
         with pytest.raises(RemoteError) as info:
@@ -1334,6 +1345,21 @@ class TestOneConnectionBringsAProjectUp:
             _script_run("up"),
             f"<stdin: {len(call.stdin)} bytes>",
         )
+
+    def test_a_delivered_payload_is_framed_once(self, node_home, tmp_path, monkeypatch):
+        # The frame is a copy of the payload (up to 64 MiB): the run builds
+        # it, and a SUCCESS never builds a second one just to name it.
+        framed: list[str] = []
+        real = remote_mux._script_call
+
+        def spy(script, args, stdin):
+            framed.append(script)
+            return real(script, args, stdin)
+
+        monkeypatch.setattr(remote_mux, "_script_call", spy)
+        _answers(node_home)
+        remote_mux.bring_up(NODE, _recipe(tmp_path))
+        assert framed == ["bring_up"]
 
     def test_a_nul_in_a_command_is_refused(self, node_home, tmp_path):
         with pytest.raises(ValueError, match="NUL"):
@@ -1681,7 +1707,7 @@ class TestWhatTheNodeAnswersIsVetted:
         "answer", ["/home/amin\nWelcome!\n", "/home/a\tmin\n", "/home/amin\r\n"]
     )
     def test_a_home_with_a_control_character_is_refused(
-        self, fake_ssh, tmp_path, answer
+        self, fake_ssh, patient_probe, tmp_path, answer
     ):
         fake_ssh.set_reply("printenv HOME", stdout=answer)
         with pytest.raises(RemoteError, match="HOME") as info:
