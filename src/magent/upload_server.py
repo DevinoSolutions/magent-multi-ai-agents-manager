@@ -1510,6 +1510,52 @@ def _supervise_psmux_priority(
             return
 
 
+# --- node sync supervision ---------------------------------------------------
+# The fourth thing serve keeps alive, for the same reason as the other three:
+# serve is the process that is always there. Its own thread and its own gate
+# (MAGENT_NODE_SYNC); the "any project runs on a node" gate is read from the
+# config file each interval -- through ConfigWatch, so only when it changed --
+# which is how a node added to a running setup gets its daemon within a minute.
+NODE_SYNC_SUPERVISE_INTERVAL_S = 60.0
+
+
+def _supervise_node_sync(
+    config_path: str | None,
+    stop_event: threading.Event,
+    interval: float = NODE_SYNC_SUPERVISE_INTERVAL_S,
+) -> None:
+    """Keep ``magent node sync`` running for as long as this server runs.
+
+    Runs on a daemon thread off ``run_server``. Every failure is a log line and
+    another try next interval. The lock stops two serve processes (different
+    ports) from both spawning a daemon in the same instant; the daemon's own
+    lock would settle it anyway, this just avoids the wasted process.
+    """
+    # heavy subsystem: in-body per policy. launch owns the spawn recipe; this
+    # module must not import the cli package (LS-A-001).
+    from magent.launch import ensure_node_sync, node_sync_env_enabled
+    from magent.node_sync import SUPERVISOR_LOCK_NAME, ConfigWatch
+    from magent.paths import find_config
+
+    log = get_logger("nodes")
+    if not node_sync_env_enabled():
+        log.info("node sync supervisor: disabled by MAGENT_NODE_SYNC")
+        return
+    watch = ConfigWatch(find_config(config_path))
+    while True:
+        try:
+            config = watch.current()
+            if config is not None:
+                with exclusive_lock(SUPERVISOR_LOCK_NAME):
+                    ensure_node_sync(config, config_path)
+        except LockHeld:
+            log.debug("node sync supervisor: another server is supervising the daemon")
+        except Exception:
+            log.exception("node sync supervisor: check failed")
+        if stop_event.wait(interval):
+            return
+
+
 def _serve_bind(server: ThreadingHTTPServer, log: logging.Logger) -> None:
     """``serve_forever`` for a SECONDARY bind, on its own daemon thread.
 
@@ -1582,6 +1628,12 @@ def run_server(
         target=_supervise_psmux_priority, args=(boost_stop,), daemon=True
     ).start()
 
+    # ...and the node mirror is only as current as the daemon pulling it.
+    node_sync_stop = threading.Event()
+    threading.Thread(
+        target=_supervise_node_sync, args=(config_path, node_sync_stop), daemon=True
+    ).start()
+
     # Why this is not a bare `try/finally` any more: serve died silently twice
     # in one day and left NOTHING behind -- no traceback (a detached process has
     # no console), no log line, only a pid file whose process was gone. The
@@ -1603,6 +1655,7 @@ def run_server(
     finally:
         hotkey_stop.set()
         boost_stop.set()
+        node_sync_stop.set()
         for s in servers[1:]:
             s.shutdown()  # called from a different thread than its serve_forever -> safe
         for s in servers:

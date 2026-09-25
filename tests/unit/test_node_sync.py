@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -363,3 +364,93 @@ class TestEnsureNodeSync:
         assert launch.ensure_node_sync(_config()) is False
         assert spawned == []
         assert any("heartbeat is stale" in r.getMessage() for r in caplog.records)
+
+
+class TestServeSupervisesTheDaemon:
+    def test_the_supervisor_stands_down_when_the_env_says_no(self, monkeypatch):
+        from magent import upload_server
+
+        monkeypatch.setattr(
+            launch, "ensure_node_sync", lambda *a, **k: pytest.fail("ensured")
+        )
+        upload_server._supervise_node_sync(None, threading.Event(), interval=999)
+
+    def test_the_supervisor_ensures_the_daemon_with_serves_config(
+        self, sync_on, tmp_config, monkeypatch
+    ):
+        from magent import upload_server
+
+        path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
+        stop = threading.Event()
+        seen: list[str | None] = []
+
+        def ensure(_config, config_path=None):
+            seen.append(config_path)
+            stop.set()
+            return False
+
+        monkeypatch.setattr(launch, "ensure_node_sync", ensure)
+        upload_server._supervise_node_sync(path, stop, interval=0)
+        assert seen == [path]
+
+    def test_the_config_is_read_once_until_it_changes(
+        self, sync_on, tmp_config, monkeypatch
+    ):
+        from magent import upload_server
+
+        path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
+        stop = threading.Event()
+        loads: list[str] = []
+        real = node_sync.load_config
+        monkeypatch.setattr(
+            node_sync, "load_config", lambda p: loads.append(p) or real(p)
+        )
+        seen: list[object] = []
+
+        def ensure(config, config_path=None):
+            seen.append(config)
+            if len(seen) == 2:
+                stop.set()
+            return False
+
+        monkeypatch.setattr(launch, "ensure_node_sync", ensure)
+        upload_server._supervise_node_sync(path, stop, interval=0)
+        assert len(seen) == 2
+        assert len(loads) == 1
+
+    def test_serve_starts_the_node_sync_supervisor(self, monkeypatch):
+        from magent import upload_server
+
+        started: list[object] = []
+        real_thread = threading.Thread
+
+        class _Recording(real_thread):
+            """Records WHAT run_server wanted to run and runs none of it."""
+
+            def __init__(self, *args, target=None, **kwargs) -> None:
+                super().__init__(*args, target=target, **kwargs)
+                self.recorded_target = target
+
+            def start(self) -> None:
+                started.append(self.recorded_target)
+
+        monkeypatch.setattr(upload_server.threading, "Thread", _Recording)
+        monkeypatch.setattr(upload_server, "_bind_addresses", lambda _h: ["127.0.0.1"])
+
+        class _FakeServer:
+            def __init__(self, addr, _handler) -> None:
+                self.server_address = addr
+
+            def serve_forever(self) -> None:
+                raise KeyboardInterrupt
+
+            def shutdown(self) -> None:
+                return None
+
+            def server_close(self) -> None:
+                return None
+
+        monkeypatch.setattr(upload_server, "_NoFqdnHTTPServer", _FakeServer)
+        with pytest.raises(KeyboardInterrupt):
+            upload_server.run_server(port=0)
+        assert upload_server._supervise_node_sync in started
