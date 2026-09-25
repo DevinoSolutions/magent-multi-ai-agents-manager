@@ -891,6 +891,22 @@ class TestArgumentParsing:
         with pytest.raises(SystemExit):
             attach_client.parse_args(args)
 
+    def test_mux_defaults_to_psmux(self):
+        opts = attach_client.parse_args(["--target", "me@box", "--session", "api"])
+        assert opts.mux == "psmux"
+
+    def test_a_tmux_pane_defaults_its_remote_to_the_tmux_attach(self):
+        opts = attach_client.parse_args(
+            ["--target", "me@box", "--session", "api", "--mux", "tmux"]
+        )
+        assert (opts.mux, opts.remote) == ("tmux", "tmux -L magent attach -t '=api'")
+
+    def test_an_unknown_mux_is_rejected_by_the_parser(self):
+        with pytest.raises(SystemExit):
+            attach_client.parse_args(
+                ["--target", "me@box", "--session", "api", "--mux", "screen"]
+            )
+
 
 class TestMain:
     def test_ctrl_c_stops_cleanly_without_a_traceback(self, monkeypatch, capsys):
@@ -921,6 +937,24 @@ class TestMain:
             "remote": attach_client.remote_attach_command("api"),
             "session": "api",
             "reconnect": False,
+        }
+
+    def test_it_forwards_the_multiplexer_to_the_loop(self, monkeypatch):
+        seen: dict[str, object] = {}
+
+        def spy(_target, remote, _session, *, reconnect, mux):
+            seen.update(remote=remote, reconnect=reconnect, mux=mux)
+            return 0
+
+        monkeypatch.setattr(attach_client, "supervise", spy)
+        rc = attach_client.main(
+            ["--target", "me@box", "--session", "api", "--mux", "tmux"]
+        )
+        assert rc == 0
+        assert seen == {
+            "remote": "tmux -L magent attach -t '=api'",
+            "reconnect": True,
+            "mux": "tmux",
         }
 
 

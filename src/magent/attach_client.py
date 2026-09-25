@@ -1072,6 +1072,9 @@ class Options(NamedTuple):
     session: str
     remote: str
     reconnect: bool
+    # Which multiplexer holds the session: picks the default remote command,
+    # what the post-disconnect probe asks, and the repair a stopped pane names.
+    mux: str
 
 
 def parse_args(args: list[str]) -> Options:
@@ -1090,7 +1093,11 @@ def parse_args(args: list[str]) -> Options:
         ),
     )
     parser.add_argument("--target", required=True, help="SSH target (user@host)")
-    parser.add_argument("--session", required=True, help="psmux session id")
+    parser.add_argument(
+        "--session",
+        required=True,
+        help="session id (a psmux socket, or a tmux session on a node)",
+    )
     parser.add_argument(
         "--remote",
         default=None,
@@ -1102,15 +1109,23 @@ def parse_args(args: list[str]) -> Options:
         action="store_false",
         help="Exit when the connection drops instead of reconnecting",
     )
+    parser.add_argument(
+        "--mux",
+        choices=MUXES,
+        default="psmux",
+        help="multiplexer holding the session: psmux (a magent host) or tmux (a node)",
+    )
     ns = parser.parse_args(args)
     session = str(ns.session)
+    mux = str(ns.mux)
     return Options(
         target=str(ns.target),
         session=session,
         # A caller that omits --remote gets the same command, but then its own
         # argv carries no attach marker -- see the corpse-coherence note.
-        remote=str(ns.remote) if ns.remote else remote_attach_command(session),
+        remote=str(ns.remote) if ns.remote else remote_attach_command(session, mux),
         reconnect=bool(ns.reconnect),
+        mux=mux,
     )
 
 
@@ -1118,7 +1133,11 @@ def main(argv: list[str] | None = None) -> int:
     opts = parse_args(sys.argv[1:] if argv is None else argv)
     try:
         return supervise(
-            opts.target, opts.remote, opts.session, reconnect=opts.reconnect
+            opts.target,
+            opts.remote,
+            opts.session,
+            reconnect=opts.reconnect,
+            mux=opts.mux,
         )
     except KeyboardInterrupt:
         # Ctrl+C during a backoff sleep is the documented way out of a pane
