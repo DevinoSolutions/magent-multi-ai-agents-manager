@@ -2367,6 +2367,20 @@ class TestOneStoreHoldsEveryStepsMemory:
         assert store["shipped"] == first["shipped"]
         assert store["digests"]["settings"] == first["digests"]["settings"]
 
+    def test_skills_and_plugins_remember_under_digests_and_add_no_key(
+        self, box, tmp_path, capsys
+    ):
+        _claude(box)
+        _put(_store(box), {"version": 1, "digests": {}, "later": {"k": 1}})
+        scope = replace(self.SCOPE, skills=(SKILL,), plugins=PLUGGED.plugins)
+        scope = replace(scope, marketplaces=PLUGGED.marketplaces)
+        assert box.apply(_work(tmp_path, scope)) == 0
+        lines = _lines(capsys)
+        assert _status(lines, "skills") == "did"
+        assert _status(lines, "plugin:p@mkt") == "did"
+        store = self._check(box)
+        assert {"skills", "plugins"} <= set(store["digests"])
+
 
 class TestAFailedOAuthStepKeepsItsMemory:
     # I1: the per-entry shas are what keep a node refresh from being undone.
