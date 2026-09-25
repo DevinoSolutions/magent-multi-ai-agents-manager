@@ -430,6 +430,12 @@ def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
 
 
+def _errors(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Every ERROR record from the nodes log, and only from it."""
+    name = f"magent.{node_sync.LOG_NAME}"
+    return [r for r in caplog.records if r.name == name and r.levelno >= logging.ERROR]
+
+
 @pytest.fixture
 def unrelated() -> Iterator[subprocess.Popen[bytes]]:
     """A live process that is NOT the daemon -- what a recycled pid names."""
@@ -1249,10 +1255,13 @@ class TestTheLoop:
             )
         assert seen == []
 
-    def test_a_crash_keeps_the_heartbeat_as_its_marker(self, placed, monkeypatch):
-        """The crash is raised by the tick itself, not by a pull: a node's
-        failure is reduced to an outcome inside _sync_node, so only a bug in
-        the loop's own machinery escapes -- and that must crash the loop."""
+    def test_a_crash_keeps_the_heartbeat_as_its_marker(
+        self, placed, monkeypatch, caplog
+    ):
+        """The crash is raised by the tick itself, not by a pull: a bug in the
+        loop's own machinery must crash the loop, logged once at ERROR with
+        its traceback, and leave the heartbeat behind as the marker."""
+        _capture_nodes_log(caplog)
 
         def broken(_self, *, wait_s=None):
             raise ValueError("boom")
@@ -1262,6 +1271,27 @@ class TestTheLoop:
             node_sync.run_sync_loop(_config(), max_ticks=1, pull=_recording_pull([]))
         assert heartbeat_age(node_sync.HEARTBEAT_NAME) is not None
         assert node_sync.daemon_pid() is None
+        (crash,) = _errors(caplog)
+        assert crash.getMessage() == "node sync daemon crashed"
+        assert crash.exc_info is not None
+
+    # Superseded by E11 (96c51f8): there a bug in one pull becomes that node's
+    # (failed, "internal error: <Type>"), and E11's test replaces this one.
+    def test_a_bug_in_a_pull_crashes_the_loop(self, placed, caplog):
+        """_sync_node reduces only NodeConfigError, LockHeld, RemoteError and
+        OSError to an outcome. Anything else raised inside a pull is a bug: it
+        propagates out of the tick and crashes the loop, heartbeat kept."""
+        _capture_nodes_log(caplog)
+
+        def broken(_node, _sids):
+            raise ValueError("boom")
+
+        with pytest.raises(ValueError, match="boom"):
+            node_sync.run_sync_loop(_config(), max_ticks=1, pull=broken)
+        assert heartbeat_age(node_sync.HEARTBEAT_NAME) is not None
+        assert node_sync.daemon_pid() is None
+        (crash,) = _errors(caplog)
+        assert crash.exc_info is not None
 
     def test_a_changed_config_is_picked_up_between_ticks(self, placed):
         seen: list[tuple[str, list[str]]] = []

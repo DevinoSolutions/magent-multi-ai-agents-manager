@@ -541,8 +541,8 @@ class NodeSyncer:
         for entry in nodes.read_node_map().values():
             by_nick.setdefault(entry.nick, {})[entry.sid] = entry
         user = self._local_user if self._local_user is not None else local_username()
-        # ONE read of the config per tick: a reconfigure mid-tick cannot mix
-        # two pools into one tick's submissions and results.
+        # Defensive: reconfigure runs between ticks on this thread; the local
+        # keeps one tick on one pool if that ever changes.
         config = self._config
         pool = sorted(config.settings.nodes)
         stale_after = 2 * config.settings.node_sync.pull_interval_s
