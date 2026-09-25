@@ -30,7 +30,8 @@ from magent.log import get_logger
 from magent.titles import make_title, parse_title
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
+    from pathlib import Path
 
     from magent.platform import Platform
 
@@ -49,6 +50,9 @@ _URGENCY: dict[str, int] = {
 }
 
 DEBOUNCE_S = 300.0
+
+# The node-store failure source for the listing itself (a root's is its path).
+_LISTING = "<listing>"
 
 
 @dataclass
@@ -90,45 +94,133 @@ class AttentionEngine:
         now: Callable[[], float] = time.time,
         staleness: dict[str, float] | None = None,
         debounce_s: float = DEBOUNCE_S,
+        extra_stores: Callable[[], Iterable[tuple[str, str, Path]]] | None = None,
     ) -> None:
         self._name_by_cwd = dict(name_by_cwd or {})
         self._now = now
         self._staleness = staleness if staleness is not None else dict(STALENESS_S)
         self._debounce_s = debounce_s
+        self._extra_stores = extra_stores
         self._last_state: dict[str, str] = {}
         self._last_fired: dict[tuple[str, str], float] = {}
+        # The last good RAW records per node root, as (label, key, root,
+        # records): a failing tick re-views them at the current clock.
+        self._last_node_records: list[
+            tuple[str, str, str, list[dict[str, object]]]
+        ] = []
+        # Every node-store failure source in a streak: a root's path, or
+        # _LISTING for the listing itself.
+        self._failing_sources: set[str] = set()
 
     def poll(self) -> list[SessionView]:
-        """Read the store and return the current views, most-urgent first."""
+        """Read the store -- and every ``extra_stores`` store: node sessions'
+        mirrored states -- and return the current views, most-urgent first."""
         now = self._now()
         views: list[SessionView] = []
         for rec in agent_state.all_states():
-            raw_state = rec.get("state")
-            raw_cwd = rec.get("cwd")
-            if not isinstance(raw_state, str) or not isinstance(raw_cwd, str):
-                continue
-            ts_raw = rec.get("ts", 0)
-            ts = (
-                float(ts_raw)
-                if isinstance(ts_raw, (int, float)) and not isinstance(ts_raw, bool)
-                else 0.0
-            )
-            age = max(0.0, now - ts)
-            state = raw_state
-            stale_after = self._staleness.get(state)
-            if stale_after is not None and age > stale_after:
-                state = agent_state.IDLE
-            views.append(
-                SessionView(
-                    name=self._name_by_cwd.get(raw_cwd, _leaf(raw_cwd)),
-                    cwd=raw_cwd,
-                    state=state,
-                    ts=ts,
-                    age_s=age,
-                )
-            )
+            view = self._view(rec, now)
+            if view is not None:
+                views.append(view)
+        if self._extra_stores is not None:
+            for label, key, _root, records in self._read_node_stores(
+                self._extra_stores
+            ):
+                for rec in records:
+                    view = self._view(rec, now, label=label, key=key)
+                    if view is not None:
+                        views.append(view)
         views.sort(key=lambda v: (_URGENCY.get(v.state, 99), -v.ts))
         return views
+
+    def _read_node_stores(
+        self, list_roots: Callable[[], Iterable[tuple[str, str, Path]]]
+    ) -> list[tuple[str, str, str, list[dict[str, object]]]]:
+        """This tick's node records, root by root. An unreadable node store
+        must never take the daemon down: a root that raises contributes its
+        LAST GOOD records while every other root is read fresh, and a listing
+        that raises (no roots to go on) holds every root's last good records.
+        They are records, not views, so ``poll`` re-views them at the current
+        clock and a held needs-input decays to idle exactly like a fresh one.
+        A root the listing no longer names is dropped. Each root is read
+        STRICT: the tolerant read would call an unreadable mirror an empty
+        store, and that node's rows would vanish for the tick instead."""
+        failures: dict[str, str] = {}
+        try:
+            roots = list(list_roots())
+        except (OSError, ValueError) as exc:
+            failures[_LISTING] = f"listing node stores: {exc}"
+            # No roots were read, so a root already failing stays failing.
+            for source in self._failing_sources - {_LISTING}:
+                failures[source] = ""
+            held = self._last_node_records
+        else:
+            previous = {
+                root: records for _l, _k, root, records in self._last_node_records
+            }
+            held = []
+            for label, key, root_path in roots:
+                root = str(root_path)
+                try:
+                    records = agent_state.read_store(root_path, strict=True)
+                except (OSError, ValueError) as exc:
+                    failures[root] = f"{root}: {exc}"
+                    records = previous.get(root, [])
+                held.append((label, key, root, records))
+        self._last_node_records = held
+        self._note_node_store_health(failures)
+        return held
+
+    def _note_node_store_health(self, failures: dict[str, str]) -> None:
+        """One WARNING per failure SOURCE (a root, or the listing) when it
+        starts failing -- naming only the newly failing ones -- and one INFO
+        when no source fails any more. A store stuck down doesn't spam the
+        log every tick, and a second root going down later is still named."""
+        new = [failures[s] for s in failures if s not in self._failing_sources]
+        if new:
+            get_logger("attention").warning(
+                "node stores unavailable this tick (%s)", "; ".join(new)
+            )
+        elif self._failing_sources and not failures:
+            get_logger("attention").info("node stores readable again")
+        self._failing_sources = set(failures)
+
+    def _view(
+        self,
+        rec: dict[str, object],
+        now: float,
+        *,
+        label: str | None = None,
+        key: str | None = None,
+    ) -> SessionView | None:
+        """One record as a view, or None when it is unusable. A node record
+        (``key`` set, ``@<nick>``) is named by its project (``label``) and its
+        cwd becomes ``<key>:<cwd>``: two nodes can hold the same directory, and
+        transitions and debounce are keyed by cwd. Its ts is the node's clock."""
+        raw_state = rec.get("state")
+        raw_cwd = rec.get("cwd")
+        if not isinstance(raw_state, str) or not isinstance(raw_cwd, str):
+            return None
+        ts_raw = rec.get("ts", 0)
+        ts = (
+            float(ts_raw)
+            if isinstance(ts_raw, (int, float)) and not isinstance(ts_raw, bool)
+            else 0.0
+        )
+        age = max(0.0, now - ts)
+        state = raw_state
+        stale_after = self._staleness.get(state)
+        if stale_after is not None and age > stale_after:
+            state = agent_state.IDLE
+        if key is None:
+            name = self._name_by_cwd.get(raw_cwd, _leaf(raw_cwd))
+            return SessionView(name=name, cwd=raw_cwd, state=state, ts=ts, age_s=age)
+        return SessionView(
+            name=label if label is not None else _leaf(raw_cwd),
+            cwd=f"{key}:{raw_cwd}",
+            state=state,
+            ts=ts,
+            age_s=age,
+        )
 
     def transitions(self, views: list[SessionView]) -> list[Transition]:
         """Diff ``views`` against the previous poll; report entered states.

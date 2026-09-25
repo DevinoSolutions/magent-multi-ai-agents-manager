@@ -251,6 +251,42 @@ class TestReadStore:
         assert len(named) == 1
         assert "unreadable" in named[0].getMessage()
 
+    def test_a_strict_read_of_a_path_that_is_not_a_directory_raises(self, tmp_path):
+        # Path.glob swallows this itself (a file globs to []), so strict must
+        # probe the directory rather than trust the glob to raise.
+        not_a_dir = tmp_path / "state"
+        not_a_dir.write_text("x", encoding="utf-8")
+        assert agent_state.read_store(not_a_dir) == []
+        with pytest.raises(NotADirectoryError):
+            agent_state.read_store(not_a_dir, strict=True)
+
+    def test_a_strict_read_reraises_a_denied_listing(self, tmp_path, monkeypatch):
+        mirror = _mirror(tmp_path)
+        real_glob = pathlib.Path.glob
+
+        def glob(self, pattern):
+            if self == mirror:
+                raise PermissionError("denied")
+            return real_glob(self, pattern)
+
+        monkeypatch.setattr(pathlib.Path, "glob", glob)
+        with pytest.raises(PermissionError):
+            agent_state.read_store(mirror, strict=True)
+
+    def test_a_strict_read_of_a_missing_directory_is_still_an_empty_store(
+        self, tmp_path
+    ):
+        # A node whose mirror has not been pulled yet is empty, not broken.
+        gone = tmp_path / "nodes" / "gone" / "state"
+        assert agent_state.read_store(gone, strict=True) == []
+
+    def test_a_strict_read_still_skips_one_torn_file(self, tmp_path):
+        mirror = _mirror(tmp_path)
+        good = {"state": "done", "ts": 1.0, "cwd": "/w/a", "session_id": "s"}
+        _put(mirror, "a.json", good)
+        (mirror / "b.json").write_text("{torn", encoding="utf-8")
+        assert agent_state.read_store(mirror, strict=True) == [good]
+
     def test_unusable_files_are_skipped(self, tmp_path, caplog):
         mirror = _mirror(tmp_path)
         (mirror / "a.json").write_text("{torn", encoding="utf-8")

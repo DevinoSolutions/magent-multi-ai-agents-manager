@@ -185,18 +185,35 @@ def _warn_bad_record(path: Path, why: str) -> None:
     )
 
 
-def read_store(root: Path) -> list[dict[str, object]]:
+def read_store(root: Path, *, strict: bool = False) -> list[dict[str, object]]:
     """Every readable record in the store at ``root`` -- this PC's, or a node
     session's mirror under ``~/.magent/nodes``. Corrupt and non-object files
     are skipped and named once (``_warn_bad_record``). Never sweeps: a mirror
     is the node's to age, and a record deleted here would come back on the
     next pull. A missing or unreadable directory is an empty store (unreadable
     is logged once). Records are unfiltered (no TTL) and ordered by filename,
-    not by ts."""
+    not by ts.
+
+    ``strict=True`` is for a caller that can do better than "empty" with a
+    broken store (the attention engine holds a node's last good records).
+    It re-raises a DIRECTORY-level ``OSError`` other than
+    ``FileNotFoundError`` -- ``NotADirectoryError``, ``PermissionError``, or
+    any other error listing ``root`` -- from an ``os.scandir`` probe or the
+    glob, and logs nothing for it. A missing directory is still ``[]`` (a
+    mirror not pulled yet is empty, not broken) and a torn or unparseable
+    FILE is still skipped (a partial pull is normal). The probe is needed
+    because ``Path.glob`` swallows these errors itself: a file globs to []."""
     records: list[dict[str, object]] = []
     try:
+        if strict:
+            with os.scandir(root):
+                pass
         paths = sorted(root.glob("*.json"))
     except OSError as exc:
+        if strict:
+            if isinstance(exc, FileNotFoundError):
+                return records
+            raise
         key = str(root)
         if key not in _warned_files:
             _warned_files.add(key)

@@ -15,12 +15,13 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
-from magent import launch, node_sync, nodes
+from magent import agent_state, launch, node_sync, nodes
 from magent.config import (
     SCHEMA_VERSION,
     MagentConfig,
@@ -729,3 +730,47 @@ class TestServeSupervisesTheDaemon:
         with pytest.raises(KeyboardInterrupt):
             upload_server.run_server(port=0)
         assert upload_server._supervise_node_sync in started
+
+
+class TestAttentionSeesNodeSessions:
+    @pytest.fixture
+    def local_store(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(agent_state, "STATE_DIR", tmp_path / "local-state")
+        monkeypatch.setattr(agent_state, "_swept_this_process", True)
+
+    def test_a_node_sessions_state_reaches_the_engine_under_its_project(
+        self, placed, local_store
+    ):
+        from magent.cli.attention_cmd import engine_from_config
+
+        store = nodes.state_dir("second", "api")
+        store.mkdir(parents=True)
+        record = {
+            "state": "needs-input",
+            "ts": time.time(),
+            "cwd": "/home/amin/magent/api",
+            "session_id": "s",
+        }
+        (store / "k.json").write_text(json.dumps(record), encoding="utf-8")
+        views = engine_from_config(_config()).poll()
+        assert [(v.name, v.cwd, v.state) for v in views] == [
+            ("api", "@second:/home/amin/magent/api", "needs-input")
+        ]
+
+    def test_without_a_node_project_the_engine_reads_only_this_pc(
+        self, placed, local_store
+    ):
+        from magent.cli.attention_cmd import engine_from_config
+
+        store = nodes.state_dir("second", "api")
+        store.mkdir(parents=True)
+        (store / "k.json").write_text(
+            json.dumps(
+                {"state": "done", "ts": time.time(), "cwd": "/x", "session_id": "s"}
+            ),
+            encoding="utf-8",
+        )
+        assert (
+            engine_from_config(_config(projects=[ProjectConfig(path="api")])).poll()
+            == []
+        )
