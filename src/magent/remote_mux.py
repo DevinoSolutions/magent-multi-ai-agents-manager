@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING
 from magent import node_scripts
 from magent.attach_client import SSH_MISSING_RC, TMUX_SOCKET
 from magent.log import get_logger
-from magent.nodes import LoadSample
+from magent.nodes import LoadSample, RepoStatus, parse_repo_status
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Mapping, Sequence
@@ -835,3 +835,14 @@ def ignored_paths(repo: Path, *, timeout_s: float, label: str) -> tuple[str, ...
             raise RemoteError(None, "git not found on PATH", shown) from e.__cause__
         raise
     return tuple(p for p in result.stdout.decode("utf-8", "replace").split("\0") if p)
+
+
+def _stdout_text(done: subprocess.CompletedProcess[bytes]) -> str:
+    return done.stdout.decode("utf-8", "replace")
+
+
+def repo_status(node: Node, remote_root: str, *, timeout_s: float) -> list[RepoStatus]:
+    """Each repo under a node session's cwd, as it is right now (read-only,
+    ``repo_status.sh``). RemoteError when the node does not answer."""
+    done = run_script(node, "repo_status", [remote_root], timeout_s=timeout_s)
+    return parse_repo_status(_stdout_text(done))

@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from magent.config import NODE_AUTO, NODE_CLOUD, runs_on_node
 from magent.lockfile import LockHeld, lock_path, persistent_lock
+from magent.log import get_logger
 from magent.psmux import session_name
 from magent.sessions import is_ide_tool
 from magent.sessions.claude import encode_claude_project_path
@@ -1437,3 +1438,114 @@ def latest_transcript_id(
     except OSError:
         return None
     return None if newest is None else newest.stem
+
+
+# --- what a node's repos looked like (spec §12 step 2) --------------------------
+
+
+@dataclass(frozen=True)
+class RepoStatus:
+    """One repo on a node at last contact. ``head == ""`` means no repo was
+    found there; ``dirty``/``unpushed`` None means unknown."""
+
+    remote_dir: str
+    head: str
+    branch: str
+    dirty: bool | None
+    unpushed: int | None
+
+
+@dataclass(frozen=True)
+class RepoRecord:
+    """The last known state of a node session's repos, and where it came from
+    (``bring-up`` or ``recall``) -- so a recall from a node that no longer
+    answers can still say which commit the work was at."""
+
+    ts: float
+    source: str
+    repos: tuple[RepoStatus, ...]
+
+
+def parse_repo_status(text: str) -> list[RepoStatus]:
+    """``repo_status.sh``'s lines; anything not five tab-separated fields is
+    not a status line and is dropped."""
+    out: list[RepoStatus] = []
+    for line in text.splitlines():
+        fields = line.split("	")
+        if len(fields) != 5:
+            continue
+        remote_dir, head, branch, dirty, unpushed = fields
+        count = int(unpushed) if unpushed.isdigit() else None
+        state = {"true": True, "false": False}.get(dirty)
+        out.append(RepoStatus(remote_dir, head, branch, state, count))
+    return out
+
+
+def repo_record_path(nick: str, sid: str, *, nodes_dir: Path | None = None) -> Path:
+    return node_dir(nick, nodes_dir=nodes_dir) / sid / "repos.json"  # E's layout owner
+
+
+def write_repo_record(
+    nick: str, sid: str, record: RepoRecord, *, nodes_dir: Path | None = None
+) -> bool:
+    """Atomic like the node-map writer; False (and a log line) on OSError."""
+    target = repo_record_path(nick, sid, nodes_dir=nodes_dir)
+    body = {
+        "ts": record.ts,
+        "source": record.source,
+        "repos": [dataclasses.asdict(r) for r in record.repos],
+    }
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(body, indent=2), encoding="utf-8")
+        tmp.replace(target)
+    except OSError:
+        get_logger("launch").warning("could not write %s", target, exc_info=True)
+        return False
+    return True
+
+
+def _repo_status(row: object) -> RepoStatus | None:
+    if not isinstance(row, dict):
+        return None
+    remote_dir, head, branch = row.get("remote_dir"), row.get("head"), row.get("branch")
+    if not (
+        isinstance(remote_dir, str)
+        and isinstance(head, str)
+        and isinstance(branch, str)
+    ):
+        return None
+    dirty, unpushed = row.get("dirty"), row.get("unpushed")
+    return RepoStatus(
+        remote_dir=remote_dir,
+        head=head,
+        branch=branch,
+        dirty=dirty if isinstance(dirty, bool) else None,
+        unpushed=unpushed
+        if isinstance(unpushed, int) and not isinstance(unpushed, bool)
+        else None,
+    )
+
+
+def read_repo_record(
+    nick: str, sid: str, *, nodes_dir: Path | None = None
+) -> RepoRecord | None:
+    """The stored record, or None when there is none or it is unreadable."""
+    try:
+        body = json.loads(
+            repo_record_path(nick, sid, nodes_dir=nodes_dir).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    ts, source, rows = body.get("ts"), body.get("source"), body.get("repos")
+    if (
+        not isinstance(ts, int | float)
+        or not isinstance(source, str)
+        or not isinstance(rows, list)
+    ):
+        return None
+    repos = tuple(s for s in (_repo_status(r) for r in rows) if s is not None)
+    return RepoRecord(ts=float(ts), source=source, repos=repos)
