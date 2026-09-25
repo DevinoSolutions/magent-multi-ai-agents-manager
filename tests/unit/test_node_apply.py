@@ -310,8 +310,9 @@ class TestNothingLeaksAndEveryModeIsExplicit:
     @pytest.mark.skipif(not POSIX, reason="POSIX file modes")
     def test_modes_hold_under_a_hostile_umask(self, box, tmp_path):
         # The payload is unpacked BEFORE the umask changes: under 0o277 the
-        # fixture's own work/ dir would be 0500 and unreadable to a non-root
-        # user (root reads it anyway, which hid this).
+        # fixture's own work/ dir would be 0500 and unwritable to a non-root
+        # user, so unpacking into it fails (root writes it anyway, which hid
+        # this).
         work = _work(tmp_path)
         old = os.umask(0o277)  # would strip the owner's write bit
         try:
