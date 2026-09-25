@@ -35,15 +35,31 @@ LS = ["tmux", "-L", remote_mux.SOCKET, "ls"]
 
 
 class TestSshArgv:
-    def test_a_batch_command_carries_the_shared_options_then_batch_mode(self, fake_ssh):
+    def test_a_command_carries_the_batch_options_then_the_target(self, fake_ssh):
         assert remote_mux.ssh_argv(NODE, LS) == [
             fake_ssh.path,
-            *SSH_CONNECTION_OPTS,
-            "-o",
-            "BatchMode=yes",
+            *remote_mux.SSH_BATCH_OPTS,
             NODE.target,
             "bash -c " + shlex.quote(shlex.join(LS)),
         ]
+
+    def test_batch_mode_is_always_on(self, fake_ssh):
+        argv = remote_mux.ssh_argv(NODE, LS, tty=True)
+        assert argv[argv.index("BatchMode=yes") - 1] == "-o"
+
+    def test_the_connect_bound_is_strictly_under_the_probe_budget(self, fake_ssh):
+        # Over it, a dead node always surfaces as the subprocess timeout (rc
+        # None, "hung") and never as ssh's own 255 ("unreachable").
+        argv = remote_mux.ssh_argv(NODE, LS)
+        (opt,) = [a for a in argv if a.startswith("ConnectTimeout=")]
+        assert argv[argv.index(opt) - 1] == "-o"
+        assert int(opt.split("=", 1)[1]) < remote_mux.PROBE_TIMEOUT_S
+
+    def test_the_interactive_attach_set_is_not_reused(self, fake_ssh):
+        # attach_client's set is scoped to the attach pane (ConnectTimeout=20).
+        argv = remote_mux.ssh_argv(NODE, LS)
+        assert "ConnectTimeout=20" not in argv
+        assert SSH_CONNECTION_OPTS != remote_mux.SSH_BATCH_OPTS
 
     def test_argv0_is_the_client_find_ssh_resolved_never_a_bare_ssh(self, fake_ssh):
         # A bare "ssh" spawned by any caller would resolve the REAL client off
@@ -59,10 +75,7 @@ class TestSshArgv:
     def test_a_tty_is_requested_only_when_asked(self, fake_ssh):
         assert "-t" not in remote_mux.ssh_argv(NODE, ["x"])
         argv = remote_mux.ssh_argv(NODE, ["x"], tty=True)
-        assert argv[argv.index("amin@devino-second") - 1] == "-t"
-
-    def test_batch_mode_can_be_left_off(self, fake_ssh):
-        assert "BatchMode=yes" not in remote_mux.ssh_argv(NODE, ["x"], batch=False)
+        assert argv[argv.index(NODE.target) - 1] == "-t"
 
 
 class TestRemoteError:
