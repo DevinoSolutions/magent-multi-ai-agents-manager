@@ -1058,3 +1058,40 @@ class TestTheTmuxMultiplexer:
             if isinstance(target, ast.Name)
         ]
         assert names.count("TMUX_SOCKET") == 1
+
+    def test_a_tmux_probe_asks_the_one_magent_socket_for_exactly_that_session(
+        self,
+    ):
+        # Same non-pty, never-prompting shape as psmux's probe; only the
+        # question differs. `=api` is exact: a live `api2` must not answer for
+        # a dead `api`, or the pane would read the death as a detach and stop.
+        # Quoted because ssh hands this string to the node user's login shell.
+        assert attach_client.session_probe_argv("me@box", "api", mux="tmux") == [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "me@box",
+            "tmux -L magent has-session -t '=api'",
+        ]
+
+    def test_a_tmux_probe_reads_its_answer_through_the_same_table(self, monkeypatch):
+        # tmux exits 1 both for "no server running" and "can't find session":
+        # either way the session is not there, and the pane keeps trying.
+        asked: list[str] = []
+
+        def fake_run(argv, **_kwargs):
+            asked.append(argv[-1])
+            return _Completed(1)
+
+        monkeypatch.setattr(attach_client.subprocess, "run", fake_run)
+        assert (
+            attach_client._probe_session("me@box", "api", mux="tmux")
+            == attach_client.SESSION_GONE
+        )
+        assert asked == ["tmux -L magent has-session -t '=api'"]
+
+    def test_an_unknown_multiplexer_is_never_probed(self):
+        with pytest.raises(ValueError, match="screen"):
+            attach_client.session_probe_argv("me@box", "api", mux="screen")

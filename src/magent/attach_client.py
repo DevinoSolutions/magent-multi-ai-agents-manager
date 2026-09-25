@@ -319,7 +319,7 @@ MIN_ROWS = 1
 # below, every session on it, named by sid -- which is what lets a phone's
 # `tmux -L magent attach` list every session in its picker. TMUX_SOCKET (the
 # one owner of that name; remote_mux re-exports it) sits beside
-# SSH_MISSING_RC -- see the skip-if-present note below.
+# SSH_MISSING_RC.
 MUXES = ("psmux", "tmux")
 
 
@@ -344,9 +344,9 @@ def remote_attach_command(sid: str, mux: str = "psmux") -> str:
     session per socket but, on a node's shared socket, able to land the pane
     in ``api2``. The target is single-quoted because this string is parsed by
     the node user's login shell, and zsh would expand a bare leading ``=`` as a
-    command lookup; quoted, every shell hands tmux ``=<sid>``. No picker fallback: a node runs no
-    magent at all, so ``|| magent sessions`` would only print "command not
-    found".
+    command lookup; quoted, every shell hands tmux ``=<sid>``. No picker
+    fallback: a node runs no magent at all, so ``|| magent sessions`` would
+    only print "command not found".
 
     Single-sourced here because ``cli/attach.py::_attach_markers`` has to
     recognize this exact spelling in a live process's command line -- the two
@@ -363,7 +363,7 @@ def ssh_argv(target: str, remote: str) -> list[str]:
     return ["ssh", *SSH_CONNECTION_OPTS, "-t", target, remote]
 
 
-def session_probe_argv(target: str, session: str) -> list[str]:
+def session_probe_argv(target: str, session: str, mux: str = "psmux") -> list[str]:
     """The one-shot, non-interactive question "is ``session`` still alive?".
 
     ``psmux``, not ``magent``: the answer must not depend on the host having a
@@ -382,20 +382,30 @@ def session_probe_argv(target: str, session: str) -> list[str]:
     "command not found" (9009 on cmd, 127 on a POSIX shell), i.e. non-zero, i.e.
     NOT ``SESSION_ALIVE`` -- so the pane keeps trying rather than closing. Only
     a positive, unambiguous rc 0 is allowed to stop a pane.
+
+    ``mux="tmux"`` asks a node's one shared ``magent`` socket, by EXACT name
+    (``=<session>``): on a shared socket a prefix match would let a live
+    ``api2`` vouch for a dead ``api``. Single-quoted for the same reason as
+    ``remote_attach_command``'s: the argv is a list, but its last element
+    reaches the node as a string the login shell parses, and zsh would expand
+    a bare ``=``. tmux exits 1 for a missing session AND
+    for a server that is not running, so both read as gone -- the same bias
+    toward "keep trying".
     """
-    return [
-        "ssh",
-        *SESSION_PROBE_OPTS,
-        target,
-        f"psmux -L {session} has-session -t {session}",
-    ]
+    _check_mux(mux)
+    if mux == "tmux":
+        question = f"tmux -L {TMUX_SOCKET} has-session -t '={session}'"
+    else:
+        question = f"psmux -L {session} has-session -t {session}"
+    return ["ssh", *SESSION_PROBE_OPTS, target, question]
 
 
-def _probe_session(target: str, session: str) -> str:
-    """Ask the host whether ``session`` is still there. Never raises."""
+def _probe_session(target: str, session: str, mux: str = "psmux") -> str:
+    """Ask the host whether ``session`` is still there. Never raises for a
+    ``mux`` the parser accepted (``--mux`` is argparse ``choices``)."""
     try:
         rc = subprocess.run(
-            session_probe_argv(target, session),
+            session_probe_argv(target, session, mux),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
