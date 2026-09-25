@@ -23,6 +23,19 @@ _NO_D_GIT_STATES = not hasattr(launch, "node_git_states")
 _D_GIT_STATES_REASON = (
     "D-MERGE: needs D's launch.node_git_states (plan G :3192-3210, :3257)"
 )
+# D-MERGE: `node push` (plan G Task 13, :3390-3449) is D's recipe and delivery
+# end to end: launch.node_recipe, launch.node_git_states, remote_mux.push_files.
+_NO_D_PUSH = not all(
+    (
+        hasattr(launch, "node_recipe"),
+        hasattr(launch, "node_git_states"),
+        hasattr(remote_mux, "push_files"),
+    )
+)
+_D_PUSH_REASON = (
+    "D-MERGE: needs D's launch.node_recipe, launch.node_git_states and"
+    " remote_mux.push_files (plan G :3390-3449)"
+)
 
 
 def _nodes_tree() -> dict[str, bytes]:
@@ -405,3 +418,91 @@ class TestNodePlan:
         result = runner.invoke(cli.main, ["--config", cfg, "node", "plan"])
 
         assert result.exit_code == 2
+
+
+# D-MERGE: plan G Task 13 (:3298-3380) -- written now, switched on by D's merge.
+@pytest.mark.skipif(_NO_D_PUSH, reason=_D_PUSH_REASON)
+@pytest.mark.usefixtures("_node_user")
+class TestNodePush:
+    @pytest.fixture
+    def shipped(self, monkeypatch):
+        calls: list[tuple[str, str]] = []
+
+        def _push_files(node, recipe):
+            calls.append((node.nick, recipe.project))
+            return [".env", "apps/web/.env.local"]
+
+        monkeypatch.setattr(remote_mux, "push_files", _push_files)
+        return calls
+
+    def test_push_ships_the_push_set_to_the_placed_node(
+        self, runner, tmp_config, api_dir, no_states, shipped
+    ):
+        nodes.update_node_map("api", entry("third"))
+        cfg = tmp_config(config_json(("second", "third"), [_project(api_dir, "auto")]))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "push", "api"])
+
+        assert result.exit_code == 0
+        assert shipped == [("third", "api")]
+        assert "shipped 2 file(s) to @third: .env, apps/web/.env.local" in result.stdout
+
+    def test_push_for_a_pinned_project_goes_to_its_pin(
+        self, runner, tmp_config, api_dir, no_states, shipped
+    ):
+        cfg = tmp_config(config_json(("second",), [_project(api_dir, "second")]))
+
+        runner.invoke(cli.main, ["--config", cfg, "node", "push", "api"])
+
+        assert shipped == [("second", "api")]
+
+    def test_push_for_an_unplaced_auto_project_exits_2(
+        self, runner, tmp_config, api_dir, no_states, shipped
+    ):
+        cfg = tmp_config(config_json(("second",), [_project(api_dir, "auto")]))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "push", "api"])
+
+        assert result.exit_code == 2
+        assert shipped == []
+        assert "magent up api" in result.stderr
+
+    def test_push_to_a_node_that_does_not_answer_exits_3_with_its_reason(
+        self, runner, tmp_config, api_dir, no_states, monkeypatch
+    ):
+        def _refuse(node, recipe):
+            raise remote_mux.RemoteError(
+                255,
+                "ssh: connect to host devino-second: Connection refused",
+                ("ssh", "devino-second"),
+            )
+
+        monkeypatch.setattr(remote_mux, "push_files", _refuse)
+        cfg = tmp_config(config_json(("second",), [_project(api_dir, "second")]))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "push", "api"])
+
+        assert result.exit_code == 3
+        assert "Connection refused" in result.stderr
+
+    def test_push_with_nothing_to_ship_says_so(
+        self, runner, tmp_config, api_dir, no_states, monkeypatch
+    ):
+        monkeypatch.setattr(remote_mux, "push_files", lambda node, recipe: [])
+        cfg = tmp_config(config_json(("second",), [_project(api_dir, "second")]))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "push", "api"])
+
+        assert result.exit_code == 0
+        assert "nothing to ship" in result.stdout
+
+    def test_push_for_a_cloud_project_is_refused_before_any_node_is_touched(
+        self, runner, tmp_config, api_dir, no_states, shipped
+    ):
+        cfg = tmp_config(config_json(("second",), [_project(api_dir, "cloud")]))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "push", "api"])
+
+        assert result.exit_code == 2
+        assert "runs in the cloud" in result.stderr
+        assert shipped == []

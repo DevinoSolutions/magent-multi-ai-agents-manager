@@ -352,3 +352,10 @@ def plan_cmd(ctx: click.Context, project: str | None, all_projects: bool) -> Non
         if placement is not None and placement.scores:
             _print_scores(placement)
         # D-MERGE: _print_push_set(cfg, proj) goes here (plan G :3257).
+
+
+# D-MERGE: `magent node push` (plan G Task 13: push_cmd and _current_nick at
+# :3390-3440, its docs row at :3444-3449) re-ships through D's recipe builder
+# and delivery -- launch.node_recipe, launch.node_git_states and
+# remote_mux.push_files -- so the whole command lands with D's merge.
+# tests/unit/test_node_cmd.py::TestNodePush is written and switches on then.
