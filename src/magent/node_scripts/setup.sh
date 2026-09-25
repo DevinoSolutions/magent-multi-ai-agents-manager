@@ -72,6 +72,7 @@ step_gh() {
     return 0
   fi
   # gh's official apt repository (cli/cli docs/install_linux.md).
+  # shellcheck disable=SC2174  # /etc/apt exists: only keyrings is created
   if out=$( { mkdir -p -m 755 /etc/apt/keyrings &&
       curl -fsSL -o "$GH_KEYRING" https://cli.github.com/packages/githubcli-archive-keyring.gpg &&
       chmod go+r "$GH_KEYRING" &&
@@ -162,6 +163,7 @@ user_phase() {
   if [ -f "$HOME/.ssh/id_ed25519.pub" ]; then
     say skip "node-key:$u" "id_ed25519 already in ~/.ssh"
   else
+    # shellcheck disable=SC2174  # $HOME exists: only .ssh is created
     mkdir -p -m 700 "$HOME/.ssh"
     if out=$(ssh-keygen -q -t ed25519 -N "" -C "magent@$(hostname)" -f "$HOME/.ssh/id_ed25519" 2>&1); then
       say did "node-key:$u" "id_ed25519 generated in ~/.ssh (the private key never leaves this node)"
