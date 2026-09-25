@@ -9,8 +9,10 @@ import ast
 import io
 import json
 import os
+import subprocess
 import sys
 import tarfile
+import threading
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
@@ -106,6 +108,18 @@ def _json(path: Path) -> object:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _ctx(tmp_path: Path, token: str) -> node_apply.Ctx:
+    """A bare Ctx, for calling a helper directly."""
+    return node_apply.Ctx(
+        work=tmp_path, home=tmp_path, path="", token=token, force=False, manifest={}
+    )
+
+
+def _no_token_prefix(text: str) -> bool:
+    """No prefix of TOKEN in ``text``, down to its 4-char "gho_" type tag."""
+    return not any(TOKEN[:n] in text for n in range(4, len(TOKEN) + 1))
+
+
 class TestTheApplierIsShippable:
     def test_it_parses_as_python_3_8(self):
         ast.parse(node_scripts.source("node_apply.py"), feature_version=(3, 8))
@@ -193,6 +207,71 @@ class TestTheGhLogin:
         assert [c.argv[:2] for c in gh.calls()].count(["auth", "login"]) == 2
 
 
+class TestAGhDigestIsKeptOnlyWhileTheLoginHolds:
+    """A clean login's digest must not outlive a run that could not keep the
+    login -- or the next run with the old payload would skip on a stale
+    digest instead of logging in."""
+
+    def _digests(self, box: Box) -> dict[str, object]:
+        store = _json(box.home / ".magent" / "provision.json")
+        assert isinstance(store, dict)
+        digests = store["digests"]
+        assert isinstance(digests, dict)
+        return digests
+
+    def _clean_login(self, box: Box, tmp_path: Path) -> FakeSsh:
+        gh = box.add("gh")
+        assert box.apply(_work(tmp_path, login="amin"), token=TOKEN) == 0
+        assert "gh" in self._digests(box)
+        return gh
+
+    def test_a_refused_token_drops_it(self, box, tmp_path):
+        gh = self._clean_login(box, tmp_path)
+        gh.set_reply("auth login", stderr="HTTP 401: Bad credentials\n", rc=1)
+        box.apply(_work(tmp_path, login="amin", name="again"), token=TOKEN)
+        assert "gh" not in self._digests(box)
+
+    def test_a_pc_that_no_longer_shares_a_login_drops_it(self, box, tmp_path):
+        self._clean_login(box, tmp_path)
+        box.apply(_work(tmp_path, name="no-login"))
+        assert "gh" not in self._digests(box)
+
+    def test_a_node_that_lost_gh_drops_it(self, box, tmp_path):
+        self._clean_login(box, tmp_path)
+        del box.fakes["gh"]
+        assert box.apply(_work(tmp_path, login="amin", name="no-gh"), token=TOKEN) == 1
+        assert "gh" not in self._digests(box)
+
+
+class TestGhRunsWithoutATokenFromTheEnvironment:
+    def test_the_token_variables_are_dropped_and_the_rest_kept(
+        self, box, tmp_path, monkeypatch
+    ):
+        # gh prefers any of these over the login it is told to store, and
+        # `auth login --with-token` refuses outright while one is set.
+        names = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN")
+        names += ("GITHUB_ENTERPRISE_TOKEN",)
+        for name in names:
+            monkeypatch.setenv(name, "env-decoy")
+        monkeypatch.setenv("F8_KEEP_ME", "kept")
+        seen: list[dict[str, str] | None] = []
+        real_run = subprocess.run
+
+        def spy(*args: object, **kwargs: object) -> object:
+            env = kwargs.get("env")
+            seen.append(dict(env) if isinstance(env, dict) else None)
+            return real_run(*args, **kwargs)
+
+        monkeypatch.setattr(node_apply.subprocess, "run", spy)
+        box.add("gh")
+        assert box.apply(_work(tmp_path, login="amin"), token=TOKEN) == 0
+        assert len(seen) == 2  # auth login, auth setup-git
+        for env in seen:
+            assert env is not None
+            assert not set(names) & set(env)
+            assert env["F8_KEEP_ME"] == "kept"
+
+
 class TestTheStateHook:
     def test_it_is_installed_owner_only_where_the_hooks_point(self, box, tmp_path):
         box.apply(_work(tmp_path))
@@ -242,9 +321,14 @@ class TestNothingLeaksAndEveryModeIsExplicit:
 
     @pytest.mark.skipif(not POSIX, reason="POSIX file modes")
     def test_modes_hold_under_a_hostile_umask(self, box, tmp_path):
+        # The payload is unpacked BEFORE the umask changes: under 0o277 the
+        # fixture's own work/ dir would be 0500 and unwritable to a non-root
+        # user, so unpacking into it fails (root writes it anyway, which hid
+        # this).
+        work = _work(tmp_path)
         old = os.umask(0o277)  # would strip the owner's write bit
         try:
-            box.apply(_work(tmp_path))
+            box.apply(work)
         finally:
             os.umask(old)
         store = box.home / ".magent" / "provision.json"
@@ -254,16 +338,175 @@ class TestNothingLeaksAndEveryModeIsExplicit:
         assert hook.stat().st_mode & 0o777 == 0o700
         assert hook.parent.stat().st_mode & 0o777 == 0o700
 
-    @pytest.mark.skipif(not POSIX, reason="POSIX file modes")
-    def test_a_stale_temp_file_does_not_lend_its_mode(self, box, tmp_path):
-        store = box.home / ".magent" / "provision.json"
-        store.parent.mkdir()
-        stale = store.with_name(store.name + ".magent-tmp")
-        stale.write_text("{}", encoding="utf-8")
-        stale.chmod(0o644)
+    def test_a_token_straddling_the_detail_cut_is_masked_whole(
+        self, box, tmp_path, capsys
+    ):
+        # The token starts before _last's 200-char cut and ends after it:
+        # masking AFTER the cut would print its first half.
+        gh = box.add("gh")
+        prefix = "x" * (200 - len(TOKEN) // 2)
+        gh.set_reply("auth login", stderr=f"{prefix}{TOKEN}\n", rc=1)
+        box.apply(_work(tmp_path, login="amin"), token=TOKEN)
+        out = capsys.readouterr().out
+        assert TOKEN[:12] not in out
+        (line,) = [
+            line for line in remote_mux.parse_report(out).lines if line.item == "gh"
+        ]
+        assert _no_token_prefix(line.detail)
+
+    def test_a_token_straddling_the_cut_in_setup_git_output_is_masked_whole(
+        self, box, tmp_path, capsys
+    ):
+        # The login went through; `gh auth setup-git` then fails and echoes
+        # the token across _last's cut. Its row is a warn, masked the same.
+        gh = box.add("gh")
+        prefix = "x" * (200 - len(TOKEN) // 2)
+        gh.set_reply("auth setup-git", stderr=f"{prefix}{TOKEN}\n", rc=1)
+        assert box.apply(_work(tmp_path, login="amin"), token=TOKEN) == 0
+        out = capsys.readouterr().out
+        assert TOKEN[:12] not in out
+        (line,) = [
+            line for line in remote_mux.parse_report(out).lines if line.item == "gh"
+        ]
+        assert line.status == "warn"
+        assert "setup-git failed" in line.detail
+        assert _no_token_prefix(line.detail)
+
+    def test_last_masks_before_it_cuts_whatever_tool_wrote_it(self, tmp_path):
+        # Any child may echo the token once gh is git's credential helper, so
+        # _last itself masks -- it is not a convention each caller remembers.
+        lead = "x" * (200 - len(TOKEN) // 2)
+        fragment = node_apply._last(
+            _ctx(tmp_path, TOKEN), "first line\n" + lead + TOKEN + "\n"
+        )
+        assert _no_token_prefix(fragment)
+        assert fragment == lead + "[gh-token]"
+        # An empty token masks nothing: no mask between the characters.
+        plain = "a" * 150 + " done"
+        assert node_apply._last(_ctx(tmp_path, ""), plain + "\n") == plain
+
+    def test_a_long_tool_output_never_cuts_the_repair_hint_after_it(
+        self, tmp_path, capsys
+    ):
+        # Later steps print `<what failed> (<tool output>); run on the node:
+        # <repair>`: only the tool's fragment is cut (by _last), never the row.
+        ctx = _ctx(tmp_path, TOKEN)
+        stderr = "error: " + "y" * 400 + "\n"
+        hint = "run on the node: claude plugin install demo@market"
+        node_apply._row(
+            ctx,
+            "fail",
+            "plugin",
+            f"install refused ({node_apply._last(ctx, stderr)}); {hint}",
+        )
+        (line,) = _lines(capsys)
+        assert line.detail.endswith(hint)
+        assert len(node_apply._last(ctx, stderr)) == 200
+
+
+class TestEveryWriteIsAtomicAndLeavesNoTemp:
+    def test_no_temp_file_remains_after_an_apply(self, box, tmp_path):
         box.apply(_work(tmp_path))
-        assert store.stat().st_mode & 0o777 == 0o600
-        assert not stale.exists()
+        assert not list(box.home.rglob("*.magent-tmp"))
+
+    def test_no_temp_file_remains_after_a_failed_replace(
+        self, box, tmp_path, monkeypatch, capsys
+    ):
+        def refuse(src: object, dst: object) -> None:
+            raise OSError("replace refused")
+
+        work = _work(tmp_path)
+        monkeypatch.setattr(os, "replace", refuse)
+        assert box.apply(work) == 1
+        assert not list(box.home.rglob("*.magent-tmp"))
+        lines = _lines(capsys)
+        assert _status(lines, "state_hook") == "fail"
+        assert _status(lines, "store") == "fail"
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX symlinks")
+    def test_a_symlink_at_the_target_is_replaced_not_followed(self, box, tmp_path):
+        victim = tmp_path / "victim"
+        victim.write_text("keep", encoding="utf-8")
+        hook = box.home / node_apply.STATE_HOOK_MARKER
+        hook.parent.mkdir(parents=True)
+        hook.symlink_to(victim)
+        box.apply(_work(tmp_path))
+        assert victim.read_text(encoding="utf-8") == "keep"
+        assert not hook.is_symlink()
+        assert hook.read_text(encoding="utf-8") == HOOK_TEXT
+
+    @pytest.mark.skipif(not POSIX, reason="the node is Linux; POSIX rename")
+    def test_two_writers_at_once_never_tear_or_collide(self, tmp_path):
+        # Two applies for one node user (desktop + laptop) share every path.
+        target = tmp_path / "store.json"
+        errors: list[OSError] = []
+        torn: list[str] = []
+        done = threading.Event()
+
+        def writer(n: int) -> None:
+            for i in range(150):
+                try:
+                    node_apply._write(target, {"n": n, "i": i, "pad": "x" * 8192})
+                except OSError as exc:
+                    errors.append(exc)
+
+        def reader() -> None:
+            while not done.is_set():
+                try:
+                    text = target.read_text(encoding="utf-8")
+                except FileNotFoundError:
+                    continue
+                try:
+                    json.loads(text)
+                except ValueError:
+                    torn.append(text[:40])
+
+        watch = threading.Thread(target=reader)
+        writers = [threading.Thread(target=writer, args=(n,)) for n in (1, 2)]
+        watch.start()
+        for thread in writers:
+            thread.start()
+        for thread in writers:
+            thread.join()
+        done.set()
+        watch.join()
+        assert errors == []
+        assert torn == []
+        assert not list(tmp_path.glob("*.magent-tmp"))
+
+
+class TestTheStoreAndTheStepLoopNeverAbort:
+    def test_an_unreadable_store_is_read_as_empty_and_a_failed_save_is_a_row(
+        self, box, tmp_path, capsys
+    ):
+        # A directory where the store belongs: reading it and replacing it
+        # both raise OSError.
+        (box.home / ".magent" / "provision.json").mkdir(parents=True)
+        assert box.apply(_work(tmp_path)) == 1
+        lines = _lines(capsys)
+        assert _status(lines, "state_hook") == "did"
+        (store,) = [line for line in lines if line.item == "store"]
+        assert store.status == "fail"
+
+    def test_a_step_bug_of_any_type_fails_alone_with_the_token_masked(
+        self, box, tmp_path, capsys, monkeypatch
+    ):
+        def bug(ctx: node_apply.Ctx) -> None:
+            raise RuntimeError(f"unexpected {ctx.token}")
+
+        monkeypatch.setattr(
+            node_apply,
+            "STEPS",
+            (("bug", bug), ("state_hook", node_apply._step_state_hook)),
+        )
+        assert box.apply(_work(tmp_path), token=TOKEN) == 1
+        out = capsys.readouterr().out
+        assert TOKEN not in out
+        lines = list(remote_mux.parse_report(out).lines)
+        assert lines[0] == remote_mux.ScriptLine(
+            "fail", "bug", "RuntimeError: unexpected [gh-token]"
+        )
+        assert _status(lines, "state_hook") == "did"
 
 
 class TestTheRun:
