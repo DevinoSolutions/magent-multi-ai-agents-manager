@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -406,12 +407,40 @@ def _step_mcp(ctx: Ctx) -> None:
     _remember(ctx, "mcp", want, mark)
 
 
+def _canonical(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _entry_shas(stored: object) -> dict[str, str]:
+    """The per-entry shas the last clean mcp_oauth run remembered. A value
+    that is not that -- the whole-map digest an older apply stored, or
+    anything unreadable -- knows no entry, so every entry counts as new once."""
+    try:
+        parsed = json.loads(stored) if isinstance(stored, str) else None
+    except ValueError:
+        parsed = None
+    if not isinstance(parsed, dict):
+        return {}
+    return {
+        key: sha
+        for key, sha in parsed.items()
+        if isinstance(key, str) and isinstance(sha, str)
+    }
+
+
 def _step_mcp_oauth(ctx: Ctx) -> None:
     """This PC's MCP OAuth entries for the servers the node has, into
     ~/.claude/.credentials.json mcpOAuth. The node's claudeAiOauth -- its own
-    Claude login -- is carried through unchanged (D5). An unchanged PC copy is
-    not re-applied: the node's claude refreshes these tokens, and the PC's
-    older copy would undo that."""
+    Claude login -- is carried through unchanged (D5).
+
+    Each entry is remembered by its own sha256, and only an entry the PC
+    changed, or one the node no longer holds, is written. The node's claude
+    refreshes these tokens, so the PC's copy of an entry it did NOT change is
+    older than the node's and would log the node out of that server (F4's
+    single-holder hazard) -- whatever else changed, and under ``--force`` too.
+    The accepted residual: an entry the PC itself re-issued is applied over a
+    node refresh, since the PC is the authority for what it re-issued. The
+    store holds shas only, never a token."""
     loaded = _load(ctx.work / "mcp_oauth.json")
     entries = loaded if isinstance(loaded, dict) else {}
     claude_json = _load(ctx.home / ".claude.json")
@@ -438,16 +467,27 @@ def _step_mcp_oauth(ctx: Ctx) -> None:
         return
     have_raw = creds.get("mcpOAuth")
     have = have_raw if isinstance(have_raw, dict) else {}
-    want = _digest(ctx, "mcp_oauth") + ":" + ",".join(sorted(kept))
-    if _unchanged(ctx, "mcp_oauth", want) and all(key in have for key in kept):
+    shas = {
+        key: hashlib.sha256(_canonical(entry).encode("utf-8")).hexdigest()
+        for key, entry in kept.items()
+    }
+    remembered = _entry_shas(ctx.store.get("mcp_oauth"))
+    due = {
+        key: entry
+        for key, entry in kept.items()
+        if remembered.get(key) != shas[key] or key not in have
+    }
+    want = _canonical(shas)
+    if not due:
         _row(ctx, "skip", "mcp_oauth", f"{len(kept)} entry(ies) unchanged on this PC")
+        ctx.store["mcp_oauth"] = want
         return
     mark = len(ctx.rows)
     merged = dict(have)
-    merged.update(kept)
+    merged.update(due)
     creds["mcpOAuth"] = merged
     _write(path, creds)
-    _row(ctx, "did", "mcp_oauth", f"{len(kept)} entry(ies)")
+    _row(ctx, "did", "mcp_oauth", f"{len(due)} of {len(kept)} entry(ies)")
     _remember(ctx, "mcp_oauth", want, mark)
 
 

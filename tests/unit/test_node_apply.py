@@ -640,3 +640,114 @@ class TestTheMcpOAuth:
             )
         )
         assert _credentials(box).stat().st_mode & 0o777 == 0o600
+
+
+A = "docs|0123456789abcdef"
+B = "wiki|fedcba9876543210"
+TWO_SERVERS = {"docs": DOCS, "wiki": {"type": "http", "url": "https://wiki.example"}}
+
+
+def _two(a: str = "PC-A", b: str = "PC-B") -> UserScope:
+    """A PC with two servers the node gets, and one OAuth entry for each."""
+    return replace(
+        EMPTY,
+        mcp_servers=TWO_SERVERS,
+        mcp_oauth={
+            A: {"serverName": "docs", "accessToken": a},
+            B: {"serverName": "wiki", "accessToken": b},
+        },
+    )
+
+
+def _refresh_on_node(box: Box, key: str, token: str) -> None:
+    """What the node's claude does: rewrite one entry's token in place."""
+    creds = _json(_credentials(box))
+    creds["mcpOAuth"][key]["accessToken"] = token
+    _put(_credentials(box), creds)
+
+
+def _node_token(box: Box, key: str) -> str:
+    return _json(_credentials(box))["mcpOAuth"][key]["accessToken"]
+
+
+def _stored(box: Box) -> object:
+    return _json(box.home / ".magent" / "provision.json")["digests"]["mcp_oauth"]
+
+
+class TestTheMcpOAuthIsTrackedPerEntry:
+    # One digest over the whole map would re-apply every entry when any ONE
+    # changed on the PC -- and the PC's claude refreshes its own tokens all the
+    # time -- putting the PC's older copy over a token the node refreshed (F4's
+    # single-holder hazard). Each entry is remembered by its own sha256.
+
+    def test_another_entry_changing_leaves_a_node_refreshed_entry_alone(
+        self, box, tmp_path, capsys
+    ):
+        box.apply(_work(tmp_path, _two()))
+        _refresh_on_node(box, A, "NODE-REFRESHED-A")
+        capsys.readouterr()
+        box.apply(_work(tmp_path, _two(b="PC-B2"), name="w2"))
+        assert _status(_lines(capsys), "mcp_oauth") == "did"
+        assert _node_token(box, A) == "NODE-REFRESHED-A"
+        assert _node_token(box, B) == "PC-B2"
+
+    def test_an_entry_the_pc_reissued_is_applied_over_the_nodes(self, box, tmp_path):
+        # The accepted residual: the PC is the authority for an entry it
+        # re-issued, so its new copy wins over the node's refresh.
+        box.apply(_work(tmp_path, _two()))
+        _refresh_on_node(box, A, "NODE-REFRESHED-A")
+        box.apply(_work(tmp_path, _two(a="PC-A2"), name="w2"))
+        assert _node_token(box, A) == "PC-A2"
+        assert _node_token(box, B) == "PC-B"
+
+    def test_an_entry_removed_on_the_node_is_put_back(self, box, tmp_path):
+        work = _work(tmp_path, _two())
+        box.apply(work)
+        creds = _json(_credentials(box))
+        del creds["mcpOAuth"][B]
+        _put(_credentials(box), creds)
+        box.apply(work)
+        assert _node_token(box, B) == "PC-B"
+
+    def test_an_unchanged_pc_map_is_skipped(self, box, tmp_path, capsys):
+        work = _work(tmp_path, _two())
+        box.apply(work)
+        capsys.readouterr()
+        box.apply(work)
+        assert _status(_lines(capsys), "mcp_oauth") == "skip"
+
+    def test_force_does_not_undo_a_node_refresh(self, box, tmp_path):
+        work = _work(tmp_path, _two())
+        box.apply(work)
+        _refresh_on_node(box, A, "NODE-REFRESHED-A")
+        box.apply(work, force=True)
+        assert _node_token(box, A) == "NODE-REFRESHED-A"
+
+    def test_the_store_holds_sorted_shas_and_no_token(self, box, tmp_path):
+        box.apply(_work(tmp_path, _two()))
+        stored = _stored(box)
+        assert isinstance(stored, str)
+        shas = json.loads(stored)
+        assert stored == json.dumps(shas, sort_keys=True, separators=(",", ":"))
+        assert set(shas) == {A, B}
+        assert all(len(sha) == 64 and int(sha, 16) >= 0 for sha in shas.values())
+        text = (box.home / ".magent" / "provision.json").read_text(encoding="utf-8")
+        for token in ("PC-A", "PC-B"):
+            assert token not in text
+
+    @pytest.mark.parametrize("old", ["0" * 64 + ":" + A + "," + B, "{not json", ""])
+    def test_an_old_or_unreadable_store_value_treats_every_entry_as_new(
+        self, box, tmp_path, old
+    ):
+        # A one-time migration from the whole-map digest: nothing is known
+        # per entry, so every entry is applied once and remembered.
+        work = _work(tmp_path, _two())
+        box.apply(work)
+        _refresh_on_node(box, A, "NODE-REFRESHED-A")
+        store_path = box.home / ".magent" / "provision.json"
+        store = _json(store_path)
+        store["digests"]["mcp_oauth"] = old
+        _put(store_path, store)
+        box.apply(work)
+        assert _node_token(box, A) == "PC-A"
+        assert set(json.loads(_stored(box))) == {A, B}
