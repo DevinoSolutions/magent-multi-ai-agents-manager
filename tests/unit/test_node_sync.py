@@ -1333,12 +1333,18 @@ class _RecordingExecutor(ThreadPoolExecutor):
         super().shutdown(wait=wait, cancel_futures=cancel_futures)
 
 
-@pytest.fixture
-def executors(monkeypatch) -> list[_RecordingExecutor]:
+@pytest.fixture(autouse=True)
+def executors(monkeypatch) -> Iterator[list[_RecordingExecutor]]:
+    """Every pull pool a syncer in this module builds is recorded, and every
+    worker is joined at teardown. The join runs BEFORE monkeypatch undoes the
+    NODES_DIR and home redirects (this fixture depends on monkeypatch, so it
+    is torn down first), so a late _store can never write into the real
+    ~/.magent -- the home-isolation law, for threads that outlive a test."""
     made: list[_RecordingExecutor] = []
     monkeypatch.setattr(_RecordingExecutor, "made", made, raising=False)
     monkeypatch.setattr(node_sync, "ThreadPoolExecutor", _RecordingExecutor)
-    return made
+    yield made
+    _drain(made)
 
 
 def _drain(executors: list[_RecordingExecutor]) -> None:
@@ -1473,6 +1479,31 @@ class TestAHungNodeDoesNotHoldTheTick:
         assert [e.max_workers for e in executors] == [2, 1]
         assert executors[0].shutdowns == [(False, False)]
         assert executors[1].shutdowns == [(False, True)]
+
+    def test_ticks_over_the_same_pool_share_one_executor(self, placed, executors):
+        syncer = node_sync.NodeSyncer(_config(), pull=_recording_pull([]))
+        try:
+            syncer.tick()
+            syncer.tick()
+        finally:
+            syncer.close()
+        assert len(executors) == 1
+
+    def test_one_shot_waits_for_every_pull(self, placed):
+        """run_once has no next tick to collect a laggard, so it joins."""
+
+        def slow(_node, _sids):
+            time.sleep(0.3)
+            return _snapshot()
+
+        assert node_sync.run_once(_config(), pull=slow) == {
+            "second": (node_sync.OK, ""),
+            "third": (node_sync.OK, ""),
+        }
+
+    def test_the_daemon_waits_half_a_tick_for_its_pulls(self):
+        cfg = _config(pull_interval_s=30, sample_interval_s=60)
+        assert node_sync.tick_wait_s(cfg) == node_sync.tick_interval_s(cfg) / 2 == 15.0
 
     def test_the_loop_shuts_its_executor_down_without_joining_a_hung_pull(
         self, placed, executors
