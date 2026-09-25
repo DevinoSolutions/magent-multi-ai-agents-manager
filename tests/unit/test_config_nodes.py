@@ -9,9 +9,11 @@ import pytest
 
 from magent.config import (
     SCHEMA_VERSION,
+    ConfigError,
     NodeConfig,
     NodeSyncConfig,
     Settings,
+    _parse_project,
     _parse_settings,
     load_config,
     settings_to_dict,
@@ -166,3 +168,238 @@ class TestNodeProjectsParse:
             )
         )
         assert "unknown config key" not in capsys.readouterr().err
+
+    def test_the_typed_view_skips_what_validation_will_refuse(self):
+        # migrate_config_file parses UNVALIDATED raw dicts through _parse_project,
+        # so the helper must never raise on a shape load_config will refuse.
+        proj = _parse_project({"path": "api", "node": 2, "push": ["a", 3]})
+        assert proj.node is None
+        assert proj.push == ["a"]
+        assert _parse_project({"path": "api", "push": ".env"}).push is None
+        assert _parse_project({"path": "api", "push": []}).push is None
+
+
+class TestThePoolIsValidated:
+    def test_a_nick_longer_than_six_is_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError, match=r"settings\.nodes: nick 'seventh' must be 1-6"
+        ):
+            load_config(_cfg(tmp_config, nodes={"seventh": {"host": "h"}}))
+
+    def test_a_non_ascii_nick_is_refused(self, tmp_config):
+        with pytest.raises(ConfigError, match="1-6 characters"):
+            load_config(_cfg(tmp_config, nodes={"sé": {"host": "h"}}))
+
+    @pytest.mark.parametrize("nick", ["Second", "a_b", "a.b", ""])
+    def test_a_nick_outside_the_charset_is_refused(self, tmp_config, nick):
+        with pytest.raises(ConfigError, match="1-6 characters"):
+            load_config(_cfg(tmp_config, nodes={nick: {"host": "h"}}))
+
+    def test_a_six_character_nick_is_accepted(self, tmp_config):
+        cfg = load_config(_cfg(tmp_config, nodes={"fifth-": {"host": "h"}}))
+        assert "fifth-" in cfg.settings.nodes
+
+    def test_auto_is_reserved(self, tmp_config):
+        with pytest.raises(ConfigError, match="'auto' is reserved"):
+            load_config(_cfg(tmp_config, nodes={"auto": {"host": "h"}}))
+
+    def test_cloud_is_reserved(self, tmp_config):
+        # The built-in cloud backend (DECISION-8) owns the nick; a pool entry
+        # of that name would silently shadow it.
+        with pytest.raises(ConfigError, match="'cloud' is reserved"):
+            load_config(_cfg(tmp_config, nodes={"cloud": {"host": "h"}}))
+
+    def test_a_node_without_a_host_is_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError, match=r"settings\.nodes\.second must have a 'host' field"
+        ):
+            load_config(_cfg(tmp_config, nodes={"second": {"user": "amin"}}))
+
+    @pytest.mark.parametrize("key", ["host", "user", "root"])
+    def test_a_non_string_field_is_refused(self, tmp_config, key):
+        node = {"host": "h", key: 5}
+        with pytest.raises(
+            ConfigError, match=rf"settings\.nodes\.second\.{key} must be a string"
+        ):
+            load_config(_cfg(tmp_config, nodes={"second": node}))
+
+    def test_an_empty_host_is_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError, match=r"settings\.nodes\.second\.host must not be empty"
+        ):
+            load_config(_cfg(tmp_config, nodes={"second": {"host": ""}}))
+
+    def test_an_empty_root_is_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError, match=r"settings\.nodes\.second\.root must not be empty"
+        ):
+            load_config(_cfg(tmp_config, nodes={"second": {"host": "h", "root": " "}}))
+
+    def test_a_host_with_a_user_is_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError,
+            match=(
+                r"settings\.nodes\.second\.host must not carry a user "
+                r"\(use settings\.nodes\.second\.user\)"
+            ),
+        ):
+            load_config(_cfg(tmp_config, nodes={"second": {"host": "root@h"}}))
+
+    def test_a_node_that_is_not_an_object_is_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError, match=r"settings\.nodes\.second must be an object"
+        ):
+            load_config(_cfg(tmp_config, nodes={"second": "devino-second"}))
+
+    def test_a_nodes_block_that_is_not_an_object_is_refused(self, tmp_config):
+        with pytest.raises(ConfigError, match=r"settings\.nodes must be an object"):
+            load_config(_cfg(tmp_config, nodes=["second"]))
+
+    def test_running_as_root_loads_but_warns(self, tmp_config, capsys):
+        cfg = load_config(
+            _cfg(tmp_config, nodes={"second": {"host": "h", "user": "root"}})
+        )
+        assert cfg.settings.nodes["second"].user == "root"
+        assert "nodes.second: running sessions as root; prefer a per-person user" in (
+            capsys.readouterr().err
+        )
+
+    def test_running_as_Root_warns_too(self, tmp_config, capsys):
+        load_config(_cfg(tmp_config, nodes={"second": {"host": "h", "user": "Root"}}))
+        assert (
+            "settings.nodes.second: running sessions as root" in capsys.readouterr().err
+        )
+
+    def test_an_unknown_key_under_a_node_warns(self, tmp_config, capsys):
+        load_config(_cfg(tmp_config, nodes={"second": {"host": "h", "port": 22}}))
+        assert "unknown config key: settings.nodes.second.port" in (
+            capsys.readouterr().err
+        )
+
+    def test_an_unknown_sync_key_warns(self, tmp_config, capsys):
+        load_config(_cfg(tmp_config, node_sync={"pushIntervalS": 5}))
+        assert "unknown config key: settings.nodeSync.pushIntervalS" in (
+            capsys.readouterr().err
+        )
+
+    def test_a_non_integer_sync_timing_is_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError, match=r"settings\.nodeSync\.historyH must be an integer"
+        ):
+            load_config(_cfg(tmp_config, node_sync={"historyH": "24"}))
+
+    def test_a_node_sync_that_is_not_an_object_is_refused(self, tmp_config):
+        with pytest.raises(ConfigError, match=r"settings\.nodeSync must be an object"):
+            load_config(_cfg(tmp_config, node_sync=[1]))
+
+    def test_a_bool_sync_timing_is_refused(self, tmp_config):
+        with pytest.raises(ConfigError, match="must be an integer, got bool"):
+            load_config(_cfg(tmp_config, node_sync={"historyH": True}))
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_a_sync_timing_below_one_is_refused(self, tmp_config, value):
+        with pytest.raises(
+            ConfigError, match=r"settings\.nodeSync\.pullIntervalS must be at least 1"
+        ):
+            load_config(_cfg(tmp_config, node_sync={"pullIntervalS": value}))
+
+
+_TWO = {"second": {"host": "devino-second"}, "third": {"host": "devino-third"}}
+
+
+class TestNodeProjectsAreValidated:
+    def test_node_and_host_together_are_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError, match=r"projects\[0\]: 'node' and 'host' are exclusive"
+        ):
+            load_config(
+                _cfg(
+                    tmp_config,
+                    nodes=_TWO,
+                    projects=[{"path": "api", "node": "second", "host": "box"}],
+                )
+            )
+
+    def test_an_unknown_nick_is_refused_naming_the_pool(self, tmp_config):
+        with pytest.raises(ConfigError, match="known nodes: second, third"):
+            load_config(
+                _cfg(
+                    tmp_config, nodes=_TWO, projects=[{"path": "api", "node": "fourth"}]
+                )
+            )
+
+    def test_auto_is_accepted_with_a_pool(self, tmp_config):
+        cfg = load_config(
+            _cfg(tmp_config, nodes=_TWO, projects=[{"path": "api", "node": "auto"}])
+        )
+        assert cfg.projects[0].node == "auto"
+
+    def test_a_node_project_with_an_empty_pool_is_refused(self, tmp_config):
+        with pytest.raises(ConfigError, match=r"settings\.nodes is empty"):
+            load_config(_cfg(tmp_config, projects=[{"path": "api", "node": "second"}]))
+
+    def test_auto_with_an_empty_pool_is_refused_too(self, tmp_config):
+        with pytest.raises(ConfigError, match=r"settings\.nodes is empty"):
+            load_config(_cfg(tmp_config, projects=[{"path": "api", "node": "auto"}]))
+
+    def test_a_non_string_node_is_refused(self, tmp_config):
+        with pytest.raises(ConfigError, match=r"projects\[0\]\.node must be a string"):
+            load_config(
+                _cfg(tmp_config, nodes=_TWO, projects=[{"path": "api", "node": 2}])
+            )
+
+    def test_push_that_is_not_an_array_is_refused(self, tmp_config):
+        with pytest.raises(ConfigError, match=r"projects\[0\]\.push must be an array"):
+            load_config(
+                _cfg(tmp_config, nodes=_TWO, projects=[{"path": "api", "push": ".env"}])
+            )
+
+    def test_push_with_a_non_string_entry_is_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError, match=r"projects\[0\]\.push must be an array of strings"
+        ):
+            load_config(
+                _cfg(
+                    tmp_config, nodes=_TWO, projects=[{"path": "api", "push": ["a", 3]}]
+                )
+            )
+
+    def test_cloud_needs_no_pool_at_all(self, tmp_config):
+        cfg = load_config(_cfg(tmp_config, projects=[{"path": "api", "node": "cloud"}]))
+        assert cfg.projects[0].node == "cloud"
+
+    def test_cloud_needs_no_pool_entry_beside_a_pool(self, tmp_config):
+        cfg = load_config(
+            _cfg(tmp_config, nodes=_TWO, projects=[{"path": "api", "node": "cloud"}])
+        )
+        assert cfg.projects[0].node == "cloud"
+
+    def test_push_is_allowed_on_a_cloud_project(self, tmp_config):
+        cfg = load_config(
+            _cfg(
+                tmp_config,
+                projects=[{"path": "api", "node": "cloud", "push": ["gcp-sa.json"]}],
+            )
+        )
+        assert cfg.projects[0].push == ["gcp-sa.json"]
+
+    def test_cloud_and_host_together_are_still_refused(self, tmp_config):
+        with pytest.raises(ConfigError, match="'node' and 'host' are exclusive"):
+            load_config(
+                _cfg(
+                    tmp_config,
+                    projects=[{"path": "api", "node": "cloud", "host": "box"}],
+                )
+            )
+
+    def test_the_unknown_nick_error_names_both_reserved_nicks(self, tmp_config):
+        with pytest.raises(ConfigError, match=r'\(or "auto", "cloud"\)'):
+            load_config(
+                _cfg(
+                    tmp_config, nodes=_TWO, projects=[{"path": "api", "node": "fourth"}]
+                )
+            )
+
+    def test_a_pool_nobody_uses_is_fine(self, tmp_config):
+        cfg = load_config(_cfg(tmp_config, nodes=_TWO, projects=[{"path": "api"}]))
+        assert cfg.projects[0].node is None

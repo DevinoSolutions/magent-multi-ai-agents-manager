@@ -15,6 +15,7 @@ from __future__ import annotations
 import colorsys
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -195,7 +196,8 @@ def _str_list_or_none(raw: dict[str, object], key: str) -> list[str] | None:
     value = raw.get(key)
     if not isinstance(value, list):
         return None
-    return [item for item in value if isinstance(item, str)]
+    out = [item for item in value if isinstance(item, str)]
+    return out or None
 
 
 def _int(raw: dict[str, object], key: str, default: int) -> int:
@@ -519,6 +521,17 @@ _ALLOWED_PROJECT_KEYS = {
     "push",
 }
 _ALLOWED_WINDOW_KEYS = {"name", "tool", "command"}
+# The two reserved nicks. `"node": "auto"` is the placement request, not a
+# machine; `"node": "cloud"` is the built-in Claude cloud backend, which needs
+# no pool entry. Neither can ever name a pool machine.
+NODE_AUTO = "auto"
+NODE_CLOUD = "cloud"
+_RESERVED_NICKS = (NODE_AUTO, NODE_CLOUD)
+# A nick is drawn into the status bar as ` magent @<nick> `, whose width is
+# cell-counted (spec §9): six ASCII characters is the budget.
+_NODE_NICK_RE = re.compile(r"[a-z0-9-]{1,6}")
+_ALLOWED_NODE_KEYS = {"host", "user", "root"}
+_ALLOWED_NODE_SYNC_KEYS = {"pullIntervalS", "sampleIntervalS", "historyH"}
 
 
 def _warn_unknown_keys(raw: dict[str, object], allowed: set[str], path: str) -> None:
@@ -536,6 +549,89 @@ def _parse_layout(raw: dict[str, object]) -> LayoutConfig:
         columns=max(1, _int(layout_raw, "columns", 2)),
         rows=max(1, _int(layout_raw, "rows", 1)),
     )
+
+
+def _check_node_pool(settings_raw: dict[str, object]) -> None:
+    """Refuse a malformed ``settings.nodes`` / ``settings.nodeSync`` (spec §4).
+
+    Loud rather than lenient: a nick that overflows the status bar, or a node
+    with no host, would otherwise surface as a broken bring-up long after the
+    config was written. Running as root is allowed but never quiet: the pool
+    is meant to run one per-person user per machine."""
+    _require_type(settings_raw, "nodes", dict, "settings.nodes")
+    _require_type(settings_raw, "nodeSync", dict, "settings.nodeSync")
+    for nick, value in _obj(settings_raw, "nodes").items():
+        label = f"settings.nodes.{nick}"
+        if not _NODE_NICK_RE.fullmatch(nick):
+            raise ConfigError(
+                f"settings.nodes: nick {nick!r} must be 1-6 characters of a-z, "
+                "0-9 and '-' (it is drawn in the status bar)"
+            )
+        if nick in _RESERVED_NICKS:
+            raise ConfigError(f"{label}: {nick!r} is reserved; pick another nick")
+        if not isinstance(value, dict):
+            raise ConfigError(f"{label} must be an object, got {type(value).__name__}")
+        if "host" not in value:
+            raise ConfigError(f"{label} must have a 'host' field")
+        for key in sorted(_ALLOWED_NODE_KEYS):
+            _require_type(value, key, str, f"{label}.{key}")
+        for key in ("host", "user", "root"):
+            v = value.get(key)
+            if isinstance(v, str) and not v.strip():
+                raise ConfigError(f"{label}.{key} must not be empty")
+        host = value.get("host")
+        if isinstance(host, str) and "@" in host:
+            raise ConfigError(f"{label}.host must not carry a user (use {label}.user)")
+        _warn_unknown_keys(value, _ALLOWED_NODE_KEYS, label)
+        if str(value.get("user", "")).lower() == "root":
+            click.echo(
+                f"Warning: {label}: running sessions as root; prefer a per-person user",
+                err=True,
+            )
+    node_sync = _obj(settings_raw, "nodeSync")
+    _warn_unknown_keys(node_sync, _ALLOWED_NODE_SYNC_KEYS, "settings.nodeSync")
+    for key in sorted(_ALLOWED_NODE_SYNC_KEYS):
+        label = f"settings.nodeSync.{key}"
+        _require_type(node_sync, key, int, label)
+        if _int(node_sync, key, 1) < 1:
+            raise ConfigError(f"{label} must be at least 1")
+
+
+def _check_push(raw: dict[str, object], label: str) -> None:
+    _require_type(raw, "push", list, label)
+    value = raw.get("push")
+    if isinstance(value, list) and not all(isinstance(item, str) for item in value):
+        raise ConfigError(f"{label} must be an array of strings")
+
+
+def _check_node_projects(
+    projects: list[ProjectConfig], nodes: dict[str, NodeConfig]
+) -> None:
+    """The project half of spec §4: a node project needs a pool, names a node
+    in it (or asks for placement), and is not also an ssh-host project. The
+    cloud backend is built in, so ``"cloud"`` needs no pool at all; its
+    ``push`` is allowed and its transport is the cloud backend's concern."""
+    for i, proj in enumerate(projects):
+        if proj.node is None:
+            continue
+        if proj.host is not None:
+            raise ConfigError(
+                f"projects[{i}]: 'node' and 'host' are exclusive -- a node "
+                "project runs on a pool machine, a host project on an ssh host"
+            )
+        if proj.node == NODE_CLOUD:
+            continue
+        if not nodes:
+            raise ConfigError(
+                f"projects[{i}].node is {proj.node!r} but settings.nodes is "
+                "empty; add the machine under settings.nodes"
+            )
+        if proj.node != NODE_AUTO and proj.node not in nodes:
+            known = ", ".join(sorted(nodes))
+            raise ConfigError(
+                f"projects[{i}].node is {proj.node!r}, which is not a configured "
+                f'node; known nodes: {known} (or "auto", "cloud")'
+            )
 
 
 def load_config(path: str) -> MagentConfig:
@@ -566,6 +662,7 @@ def load_config(path: str) -> MagentConfig:
     _warn_unknown_keys(
         _obj(settings_raw, "attention"), _ALLOWED_ATTENTION_KEYS, "settings.attention"
     )
+    _check_node_pool(settings_raw)
 
     projects: list[ProjectConfig] = []
     for i, p in enumerate(projects_raw):
@@ -580,14 +677,18 @@ def load_config(path: str) -> MagentConfig:
                         _ALLOWED_WINDOW_KEYS,
                         f"projects[{i}].windows[{j}]",
                     )
+        _require_type(p_obj, "node", str, f"projects[{i}].node")
+        _check_push(p_obj, f"projects[{i}].push")
         projects.append(_parse_project(p_obj))
     _backfill_colors(projects)
+    settings = _parse_settings(settings_raw)
+    _check_node_projects(projects, settings.nodes)
 
     return MagentConfig(
         projects=projects,
         base_dir=_str_or_none(raw, "baseDir"),
         layout=layout,
-        settings=_parse_settings(settings_raw),
+        settings=settings,
         version=version,
     )
 

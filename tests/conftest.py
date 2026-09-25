@@ -74,6 +74,8 @@ _IMPORT_BOUND_PATHS = (
     ("magent.upload_server", "_PICKER_ATTACHED_FILE", "picker-attached"),
     ("magent.upload_server", "_UPLOAD_DIR", "uploads"),
     ("magent.psmux", "DECOR_STAMP", "decor.stamp"),
+    ("magent.nodes", "NODES_DIR", "nodes"),
+    ("magent.nodes", "NODE_MAP_PATH", "nodes/node-map.json"),
     # win32-only module (it raises ImportError elsewhere by design), so this
     # entry is skipped rather than imported off-Windows.
     ("magent.hotkey", "_PID_PATH", "hotkey.pid"),
@@ -192,6 +194,23 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     log.reset_logging()
     yield
     log.reset_logging()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_ssh(monkeypatch):
+    """No test resolves the REAL ``ssh`` client. A test that installed no fake
+    sees "not installed" (``remote_mux.run`` raises RemoteError rc 127), a
+    shape every caller already handles.
+
+    Same family as ``MAGENT_PSMUX_BOOST=0``, for its sharpest reason: a node
+    call dials a real machine on the network under the developer's own keys,
+    and no HOME redirect contains a binary on PATH. Patched on the MODULE
+    attribute, so ``test_remote_mux.py``'s by-value import of ``find_ssh`` (the
+    test that proves PATH resolution) still gets the real resolver; the
+    ``fake_ssh`` fixture patches the same attribute afterwards and wins. The
+    ``needs_ssh`` node tier re-points it at the real client deliberately.
+    """
+    monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: None)
 
 
 # --- The tripwire -------------------------------------------------------------
