@@ -217,12 +217,14 @@ def _same(path: Path, stamp: tuple[int, int, int] | None) -> bool:
     return _stamp(path) == stamp
 
 
-def _target(ctx: Ctx, item: str, path: Path, shown: str) -> Path | None:
+def _target(ctx: Ctx, item: str, path: Path, shown: str, status: str) -> Path | None:
     """The file a write to ``path`` lands in: ``path`` itself, or -- for a
     symlink (a dotfiles-managed file) -- what it points at, so the link
-    survives and its target ends 0600. A link to nothing is left alone and
-    named in a ``fail`` row (None): writing would create a file the user
-    never made, somewhere they may not expect."""
+    survives and its target ends 0600. A dangling link is left alone: writing
+    through it would create its target -- and directories -- wherever it
+    points. It is named in a ``status`` row and None is returned; settings
+    warns, while a skipped MCP or token write fails, so it never reads as
+    success."""
     if not path.is_symlink():
         return path
     real = path.resolve()
@@ -230,9 +232,9 @@ def _target(ctx: Ctx, item: str, path: Path, shown: str) -> Path | None:
         return real
     _row(
         ctx,
-        "fail",
+        status,
         item,
-        f"{shown} is a symlink to {real}, which does not exist; fix or remove it",
+        f"{shown} is a dangling link to {real}; left alone, fix or remove it",
     )
     return None
 
@@ -249,7 +251,7 @@ def _merge_into(
     still what was read -- a write that landed in between is merged again,
     never overwritten. "did", "skip", or "fail" (its row printed here) when
     the file is not an object, is a link to nothing, or kept changing."""
-    target = _target(ctx, item, path, shown)
+    target = _target(ctx, item, path, shown, "fail")
     if target is None:
         return "fail"
     for _ in range(MERGE_TRIES):
@@ -338,9 +340,10 @@ def _last(ctx: Ctx, text: str) -> str:
 
 # A drive-letter path (C:\ or C:/) starting ANY word -- the program or an
 # argument (node "C:\...\notify.mjs") -- names a file only the PC has.
-_WINDOWS_PATH = re.compile(r"(^|[\s\"'=])[A-Za-z]:[\\/]")
+# Anchored on the left, so a URL's "s://" or "e:///" is never one.
+_WINDOWS_PATH = re.compile(r"(^|[\s\"'=(])[A-Za-z]:[\\/]")
 # Where an unquoted word ends, in the raw command text.
-_WORD_END = re.compile(r"[\s\"';&|]")
+_WORD_END = re.compile(r"[\s\"';&|)]")
 # Any word ending .exe names a program only the PC runs.
 _EXE = re.compile(r"(?:^|[\s\"'=])([^\s\"'=;&|]*\.exe)(?=$|[\s\"';&|)])", re.I)
 # VAR=value words ahead of a command are its environment, not its program.
@@ -594,13 +597,14 @@ def _step_settings(ctx: Ctx) -> None:
     """This PC's settings.json over the node's: the PC's keys win, the node's
     others stay (``_merged``), hooks are rebuilt (``_hooks``), and a
     statusLine the node cannot run falls back to the node's own."""
-    # Through a symlink (a dotfiles-managed settings.json), not over it
-    # (``_target``).
+    # Through a symlink (a dotfiles-managed settings.json), not over it; a
+    # dangling one is left alone with a warning (``_target``).
     path = _target(
         ctx,
         "settings",
         ctx.home / ".claude" / "settings.json",
         "~/.claude/settings.json",
+        "warn",
     )
     if path is None:
         return
