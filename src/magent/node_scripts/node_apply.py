@@ -442,9 +442,9 @@ def _deep(
 ) -> dict[str, object]:
     """The node's ``key`` map merged with this PC's: the PC wins a shared
     key, the permission rule lists are unions (the directories one node
-    first), and what the PC shipped
-    ``before`` but no longer ships is taken back: everything it shipped last
-    time leaves the node's side, and what it still ships is laid back on."""
+    first), and what the PC shipped ``before`` but no longer ships is taken
+    back: everything it shipped last time leaves the node's side, and what it
+    still ships is laid back on."""
     if key == "env":
         gone = _was_shipped(before.get("env"))
         both = {name: text for name, text in old.items() if name not in gone}
@@ -457,10 +457,13 @@ def _deep(
         if isinstance(mine, list) and isinstance(theirs, list):
             gone = _was_shipped(before.get(rule))
             both[rule] = _union(mine, [item for item in theirs if item not in gone])
-    mine = value.get(_DIRS)
+    mine = value.get(_DIRS, [])
     theirs = old.get(_DIRS)
     if isinstance(mine, list) and isinstance(theirs, list):
-        both[_DIRS] = _union(theirs, mine)
+        gone = _was_shipped(before.get(_DIRS))
+        # A directory still shipped keeps its place in the node's order.
+        kept = [item for item in theirs if item in mine or item not in gone]
+        both[_DIRS] = _union(kept, mine)
     return both
 
 
@@ -480,7 +483,6 @@ def _portable(ctx: Ctx, perms: dict[str, object]) -> dict[str, object]:
 
 
 def _merged(
-    ctx: Ctx,
     node: dict[str, object],
     shipped: dict[str, object],
     before: dict[str, object],
@@ -495,8 +497,6 @@ def _merged(
     for key in _DEEP_KEYS:
         old = node.get(key)
         value = shipped.get(key, {})
-        if key == "permissions" and isinstance(value, dict):
-            value = _portable(ctx, value)
         if isinstance(old, dict) and isinstance(value, dict):
             merged[key] = _deep(key, old, value, before)
         elif key in shipped:
@@ -506,13 +506,15 @@ def _merged(
 
 def _record(shipped: dict[str, object]) -> dict[str, object]:
     """What this PC's settings ship that ``_deep`` takes back when they stop:
-    the env keys and the permission rules."""
+    the env keys, the permission rules and the extra directories."""
     env = shipped.get("env")
     perms = shipped.get("permissions")
     record: dict[str, object] = {"env": list(env) if isinstance(env, dict) else []}
     for rule in _RULE_LISTS:
         rules = perms.get(rule) if isinstance(perms, dict) else None
         record[rule] = rules if isinstance(rules, list) else []
+    dirs = perms.get(_DIRS) if isinstance(perms, dict) else None
+    record[_DIRS] = dirs if isinstance(dirs, list) else []
     return record
 
 
@@ -549,6 +551,11 @@ def _step_settings(ctx: Ctx) -> None:
     loaded = _load(ctx.work / "settings.json")
     shipped = loaded if isinstance(loaded, dict) else {}
     mark = len(ctx.rows)
+    perms = shipped.get("permissions")
+    if isinstance(perms, dict):
+        # Filtered once, before the merge and the record, so a dropped
+        # Windows path is never remembered as shipped.
+        shipped = {**shipped, "permissions": _portable(ctx, perms)}
     # A hook entry naming a script that is not there would fail on every
     # event; unwired, the warning leaves the step unremembered, so the next
     # provision wires it.
@@ -562,7 +569,7 @@ def _step_settings(ctx: Ctx) -> None:
             "is not wired; the next provision wires it",
         )
     before = ctx.shipped.get("settings")
-    merged = _merged(ctx, node, shipped, before if isinstance(before, dict) else {})
+    merged = _merged(node, shipped, before if isinstance(before, dict) else {})
     merged["hooks"] = _hooks(ctx, shipped.get("hooks"), wire=wire)
     line = shipped.get("statusLine")
     if isinstance(line, dict) and line.get("type") == "command":

@@ -905,12 +905,24 @@ class TestWhatThePcStopsShippingLeavesTheNode:
             {
                 "version": 1,
                 "digests": {},
-                "shipped": {"settings": {"allow": "Bash(rm:*)", "env": "X"}},
+                "shipped": {
+                    "settings": {
+                        "allow": "Bash(rm:*)",
+                        "env": "X",
+                        "additionalDirectories": "/d",
+                    }
+                },
             },
             {
                 "version": 1,
                 "digests": {},
-                "shipped": {"settings": {"allow": {"Bash(rm:*)": 1}, "env": {"X": 1}}},
+                "shipped": {
+                    "settings": {
+                        "allow": {"Bash(rm:*)": 1},
+                        "env": {"X": 1},
+                        "additionalDirectories": {"/d": 1},
+                    }
+                },
             },
         ],
         ids=["missing", "not-json", "not-a-map", "not-a-record", "strings", "maps"],
@@ -920,7 +932,10 @@ class TestWhatThePcStopsShippingLeavesTheNode:
     ):
         # Fail safe: with nothing trustworthy remembered, nothing is taken
         # back -- and the apply still succeeds.
-        first = {"env": {"X": "x"}, "permissions": {"allow": ["Bash(rm:*)"]}}
+        first = {
+            "env": {"X": "x"},
+            "permissions": {"allow": ["Bash(rm:*)"], "additionalDirectories": ["/d"]},
+        }
         box.apply(_work(tmp_path, _pc_settings(first)))
         capsys.readouterr()
         if damage is None:
@@ -933,6 +948,7 @@ class TestWhatThePcStopsShippingLeavesTheNode:
         node = _json(_settings(box))
         assert node["env"] == {"X": "x"}
         assert node["permissions"]["allow"] == ["Bash(rm:*)"]
+        assert node["permissions"]["additionalDirectories"] == ["/d"]
 
 
 class TestTheAdditionalDirectories:
@@ -979,3 +995,44 @@ class TestTheAdditionalDirectories:
         assert _json(_settings(box))["permissions"]["additionalDirectories"] == [
             "/srv/shared"
         ]
+
+    def test_a_directory_the_pc_stops_shipping_leaves_the_node(self, box, tmp_path):
+        # A directory grant is a permission: gone from the PC, gone from the
+        # node. The node's own stays, and a still-shipped one keeps its place.
+        _put(_settings(box), {"permissions": {"additionalDirectories": ["/srv/node"]}})
+        first = {"permissions": {"additionalDirectories": ["/srv/d", "/srv/keep"]}}
+        box.apply(_work(tmp_path, _pc_settings(first)))
+        assert _json(_settings(box))["permissions"]["additionalDirectories"] == [
+            "/srv/node",
+            "/srv/d",
+            "/srv/keep",
+        ]
+        then = {"permissions": {"additionalDirectories": ["/srv/new", "/srv/keep"]}}
+        box.apply(_work(tmp_path, _pc_settings(then), name="work2"))
+        assert _json(_settings(box))["permissions"]["additionalDirectories"] == [
+            "/srv/node",
+            "/srv/keep",
+            "/srv/new",
+        ]
+
+    @pytest.mark.parametrize(
+        "then",
+        [{}, {"permissions": {"allow": []}}],
+        ids=["no-permissions", "no-directories"],
+    )
+    def test_every_shipped_directory_leaves_when_the_pc_ships_none(
+        self, box, tmp_path, then
+    ):
+        _put(_settings(box), {"permissions": {"additionalDirectories": ["/srv/node"]}})
+        first = {"permissions": {"additionalDirectories": ["/srv/d", "/srv/e"]}}
+        box.apply(_work(tmp_path, _pc_settings(first)))
+        box.apply(_work(tmp_path, _pc_settings(then), name="work2"))
+        assert _json(_settings(box))["permissions"]["additionalDirectories"] == [
+            "/srv/node"
+        ]
+
+    def test_a_dropped_windows_path_is_never_recorded(self, box, tmp_path):
+        pc = {"permissions": {"additionalDirectories": ["C:\\work", "/srv/shared"]}}
+        box.apply(_work(tmp_path, _pc_settings(pc)))
+        record = _json(_store(box))["shipped"]["settings"]
+        assert record["additionalDirectories"] == ["/srv/shared"]
