@@ -253,6 +253,26 @@ class TestThePoolIsValidated:
         ):
             load_config(_cfg(tmp_config, nodes={"second": {"host": host}}))
 
+    @pytest.mark.parametrize("user", ["am in", "amin ", "a\tb", " root "])
+    def test_a_user_with_whitespace_is_refused(self, tmp_config, user):
+        # The user lands in the same ssh argv as the host.
+        with pytest.raises(
+            ConfigError,
+            match=r"^settings\.nodes\.second\.user must not contain whitespace$",
+        ):
+            load_config(_cfg(tmp_config, nodes={"second": {"host": "h", "user": user}}))
+
+    @pytest.mark.parametrize("key", ["host", "user"])
+    def test_a_leading_dash_is_refused(self, tmp_config, key):
+        # ssh would parse "-oProxyCommand=..." as an option, not a destination
+        # (the class of git CVE-2017-1000117).
+        node = {"host": "h", key: "-oProxyCommand=calc"}
+        with pytest.raises(
+            ConfigError,
+            match=rf"^settings\.nodes\.second\.{key} must not start with '-'$",
+        ):
+            load_config(_cfg(tmp_config, nodes={"second": node}))
+
     def test_a_user_with_an_at_sign_is_refused(self, tmp_config):
         with pytest.raises(
             ConfigError, match=r"settings\.nodes\.second\.user must not contain '@'"
@@ -281,7 +301,7 @@ class TestThePoolIsValidated:
         with pytest.raises(ConfigError, match=r"settings\.nodes must be an object"):
             load_config(_cfg(tmp_config, nodes=["second"]))
 
-    @pytest.mark.parametrize("user", ["root", "Root", " root "])
+    @pytest.mark.parametrize("user", ["root", "Root"])
     def test_running_as_root_loads_but_warns(self, tmp_config, capsys, user):
         cfg = load_config(
             _cfg(tmp_config, nodes={"second": {"host": "h", "user": user}})
@@ -395,12 +415,13 @@ class TestNodeProjectsAreValidated:
                 )
             )
 
-    def test_an_unknown_nick_with_an_empty_pool_names_the_placements(self, tmp_config):
+    def test_an_unknown_nick_with_an_empty_pool_offers_only_cloud(self, tmp_config):
+        # "auto" is refused with an empty pool too, so the hint never offers it.
         with pytest.raises(
             ConfigError,
             match=(
                 r"^projects\[0\]\.node is 'fourth' but settings\.nodes is empty; "
-                r'add the machine under settings\.nodes \(or "auto", "cloud"\)$'
+                r'add a machine under settings\.nodes \(or "cloud"\)$'
             ),
         ):
             load_config(_cfg(tmp_config, projects=[{"path": "api", "node": "fourth"}]))
@@ -416,12 +437,13 @@ class TestNodeProjectsAreValidated:
             load_config(_cfg(tmp_config, projects=[{"path": "api", "node": "second"}]))
 
     def test_auto_with_an_empty_pool_is_refused_too(self, tmp_config):
-        # "auto" is itself a placement, so the hint does not offer it back.
+        # "auto" names no machine, so the hint says "a machine" and offers
+        # only the placement that works without a pool.
         with pytest.raises(
             ConfigError,
             match=(
                 r"^projects\[0\]\.node is 'auto' but settings\.nodes is empty; "
-                r"add the machine under settings\.nodes$"
+                r'add a machine under settings\.nodes \(or "cloud"\)$'
             ),
         ):
             load_config(_cfg(tmp_config, projects=[{"path": "api", "node": "auto"}]))
@@ -450,19 +472,57 @@ class TestNodeProjectsAreValidated:
                 )
             )
 
+    @pytest.mark.parametrize("entry", ["", " ", "\t"])
+    def test_a_blank_push_entry_is_refused_as_empty(self, tmp_config, entry):
+        with pytest.raises(ConfigError) as exc:
+            load_config(
+                _cfg(
+                    tmp_config,
+                    nodes=_TWO,
+                    projects=[{"path": "api", "node": "second", "push": ["ok", entry]}],
+                )
+            )
+        assert str(exc.value) == "projects[0].push[1] must not be empty"
+
     @pytest.mark.parametrize(
         "entry",
         [
-            "",
-            " ",
             "/etc/passwd",
             "C:\\x",
             "C:x",
+            # Windows drive-relative: the entry is read on both machines, so a
+            # colon after one letter is refused here too (accepted collateral).
+            "a:b",
             "\\x",
             "\\\\server\\share\\x",
             "../../.ssh/id_rsa",
             "a/../b",
             "a\\..\\b",
+            # Edge whitespace and control characters, at either end.
+            " /etc/passwd",
+            "/etc ",
+            "\t..",
+            ".. ",
+            "x\n/etc",
+            "a\x00b",
+            # The project root itself.
+            ".",
+            "./",
+            ".\\",
+            "./.",
+            ".//.\\",
+            # Option injection.
+            "-rf",
+            # scp's SFTP mode and remote shells expand a leading tilde.
+            "~",
+            "~/x",
+            # Writing into .git on the node is code execution the next time
+            # git runs there.
+            ".git",
+            ".git/hooks/pre-commit",
+            "a/.git/config",
+            "a\\.git\\config",
+            ".GIT/config",
         ],
     )
     def test_a_push_entry_outside_the_project_is_refused(self, tmp_config, entry):
@@ -479,7 +539,22 @@ class TestNodeProjectsAreValidated:
             f"got {entry!r}"
         )
 
-    @pytest.mark.parametrize("entry", ["config/.env", "./gcp-sa.json", "a/...b"])
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "config/.env",
+            "./gcp-sa.json",
+            "a/...b",
+            "my file.txt",
+            # '$' is legal in a filename; quoting it is the transport's job.
+            "$HOME/x",
+            "a/-rf",
+            "a/~",
+            ".gitignore",
+            ".github/workflows/ci.yml",
+            "a/.gitkeep",
+        ],
+    )
     def test_a_push_entry_inside_the_project_is_accepted(self, tmp_config, entry):
         cfg = load_config(
             _cfg(
@@ -495,7 +570,7 @@ class TestNodeProjectsAreValidated:
             _cfg(tmp_config, projects=[{"path": "api", "push": [".env"]}])
         )
         assert cfg.projects[0].push == [".env"]
-        assert "Warning: projects[0]: push has no effect without node" in (
+        assert "Warning: projects[0].push has no effect without projects[0].node" in (
             capsys.readouterr().err
         )
 
