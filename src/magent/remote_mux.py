@@ -169,6 +169,15 @@ def _redacted(argv: list[str], input_bytes: bytes | None) -> tuple[str, ...]:
     return (*argv, f"<stdin: {len(input_bytes)} bytes>")
 
 
+def _run_shown(
+    node: Node, argv_remote: Sequence[str], input_bytes: bytes | None
+) -> tuple[str, ...]:
+    """What an error and a log line may say about ``run(node, argv_remote,
+    input_bytes=...)``: the program, not this PC's path to it; the one
+    ``bash -c`` remote string; stdin by its length alone."""
+    return _redacted(["ssh", *_ssh_tail(node, argv_remote, tty=False)], input_bytes)
+
+
 def _spawn(
     argv: list[str],
     *,
@@ -237,8 +246,7 @@ def run(
     caller to classify. The returned ``CompletedProcess.args`` is the real
     argv, this PC's client path included: a caller must not log it."""
     tail = _ssh_tail(node, argv_remote, tty=False)
-    # Errors and log lines name the program, not this PC's path to it.
-    shown = _redacted(["ssh", *tail], input_bytes)
+    shown = _run_shown(node, argv_remote, input_bytes)
     return _spawn(
         [_client(shown), *tail],
         timeout_s=timeout_s,
@@ -262,6 +270,15 @@ def _frame_script(text: str, payload: bytes | None) -> bytes:
     return body + b"\n" + PAYLOAD_SENTINEL.encode("ascii") + b"\n" + payload
 
 
+def _script_call(
+    script: str, args: list[str], stdin: bytes | None
+) -> tuple[list[str], bytes]:
+    """The remote argv and the stdin bytes of one ``run_script`` call -- built
+    here once, so an error raised after the call (``sample``) names exactly
+    what ran."""
+    return _script_argv(args), _frame_script(node_scripts.script(script), stdin)
+
+
 def run_script(
     node: Node,
     script: str,
@@ -279,21 +296,21 @@ def run_script(
     it would read the socket as its own first argument."""
     if f"{script}.sh" in node_scripts.NON_ENTRY_SCRIPTS:
         raise ValueError(f"{script}.sh is not a run_script entry point")
-    return run(
-        node,
-        _script_argv(args),
-        timeout_s=timeout_s,
-        input_bytes=_frame_script(node_scripts.script(script), stdin),
-    )
+    argv_remote, framed = _script_call(script, args, stdin)
+    return run(node, argv_remote, timeout_s=timeout_s, input_bytes=framed)
 
 
 def has_session(node: Node, sid: str) -> bool | None:
-    """Is ``sid`` alive on ``node``? True/False only when tmux itself answered:
-    exit 0 is a live session, exit 1 is tmux's own "no" (no such session, or
-    no server at all). Anything else -- ssh's 255, a missing tmux, a timeout --
-    is None: the PROBE failed, which says nothing about the session. The target
-    is ``=sid`` because tmux otherwise prefix-matches, and ``api`` would answer
-    for ``api-2``."""
+    """Is ``sid`` alive on ``node``? Exit 0 is True, a live session. Exit 1 is
+    False, meant as tmux's own "no" (no such session, or no server at all) --
+    but ANY exit 1 in the chain reads the same: a ``nologin`` shell, a
+    ForceCommand, tmux's "error connecting to socket (Permission denied)", a
+    client/server version mismatch. So False means "no session named ``sid``
+    was found by whatever answered exit 1", and a caller that respawns on False
+    must be prepared for that. Anything else -- ssh's 255, a missing tmux, a
+    timeout -- is None: the PROBE failed, which says nothing about the session.
+    The target is ``=sid`` because tmux otherwise prefix-matches, and ``api``
+    would answer for ``api-2``."""
     try:
         result = run(
             node,
@@ -311,8 +328,17 @@ def has_session(node: Node, sid: str) -> bool | None:
 
 
 def _finite(value: object) -> float:
-    """``value`` as a float, or ValueError when it is NaN or infinite."""
-    if not isinstance(value, (int, float, str)):
+    """``value`` as a float. Three refusals:
+
+    - TypeError for a non-number. A bool and a numeric string both count:
+      json's ``true`` is a Python bool (an int subclass), and ``sample.sh``
+      prints bare numbers, so ``"1.5"`` is not a reading. The isinstance
+      guard is also what narrows ``object`` for ty.
+    - ValueError for NaN or an infinity: json accepts them, the snapshot
+      writer does not.
+    - OverflowError for an int too large for a float (json has no bound on
+      an integer's digits)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"not a number: {value!r}")
     number = float(value)
     if not math.isfinite(number):
@@ -320,32 +346,48 @@ def _finite(value: object) -> float:
     return number
 
 
+def _integral(value: object) -> int:
+    """``value`` as an int, as strict as ``_finite``: TypeError for a
+    non-number (a bool and a str included), ValueError for a float that is
+    not finite or not whole (``16.9``). A whole float (``16.0``) is taken."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"not a number: {value!r}")
+    if isinstance(value, int):
+        return value
+    if not math.isfinite(value) or not value.is_integer():
+        raise ValueError(f"not a whole reading: {value}")
+    return int(value)
+
+
 def sample(node: Node) -> LoadSample:
     """One load reading from ``node`` (``sample.sh``). RemoteError when the node
-    can't be reached, or answers something that is not a sample. A non-finite
-    number is not a sample either: json accepts NaN, the snapshot writer does
-    not."""
+    can't be reached, or answers something that is not a sample -- rc 0 on
+    that error: the node answered; the answer was malformed. Its message
+    carries a bounded head of what came back (a ``.bashrc`` banner on stdout
+    is the likely cause). A non-finite, fractional-count, bool or string
+    number is not a sample either."""
     result = run_script(node, "sample", [], timeout_s=PROBE_TIMEOUT_S)
     try:
         raw = json.loads(result.stdout.decode("utf-8", "replace"))
         reading = LoadSample(
             ts=_finite(raw["ts"]),
-            nproc=int(raw["nproc"]),
+            nproc=_integral(raw["nproc"]),
             load1=_finite(raw["load1"]),
             load5=_finite(raw["load5"]),
             load15=_finite(raw["load15"]),
-            mem_total_mb=int(raw["mem_total_mb"]),
-            mem_avail_mb=int(raw["mem_avail_mb"]),
-            my_sessions=int(raw["my_sessions"]),
+            mem_total_mb=_integral(raw["mem_total_mb"]),
+            mem_avail_mb=_integral(raw["mem_avail_mb"]),
+            my_sessions=_integral(raw["my_sessions"]),
         )
-    except (ValueError, KeyError, TypeError) as e:
-        # Named the way run() names it: the program, not this PC's path to
-        # it, and stdin by its length.
-        shown = _redacted(
-            ["ssh", *_ssh_tail(node, _script_argv([]), tty=False)],
-            _frame_script(node_scripts.script("sample"), None),
-        )
-        raise RemoteError(result.returncode, f"not a load sample: {e}", shown) from e
+    # OverflowError is an ArithmeticError, not a ValueError: `1e400` parses
+    # to inf, and float() of a 401-digit integer overflows.
+    except (ValueError, KeyError, TypeError, OverflowError) as e:
+        shown = _run_shown(node, *_script_call("sample", [], None))
+        raise RemoteError(
+            result.returncode,
+            f"not a load sample: {e}; got {result.stdout[:200]!r}",
+            shown,
+        ) from e
     return reading
 
 

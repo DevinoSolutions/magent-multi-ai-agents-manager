@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 import re
 import shlex
@@ -504,6 +505,37 @@ class TestHasSession:
         assert remote_mux.has_session(NODE, "api") is None
 
 
+class TestTheNumberReaders:
+    def test_finite_takes_bare_numbers(self):
+        assert remote_mux._finite(3) == 3.0
+        assert remote_mux._finite(0.5) == 0.5
+
+    @pytest.mark.parametrize("value", ["1.5", True, None, [1]])
+    def test_finite_refuses_a_non_number_with_a_type_error(self, value):
+        with pytest.raises(TypeError):
+            remote_mux._finite(value)
+
+    @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+    def test_finite_refuses_a_non_finite_reading_with_a_value_error(self, value):
+        with pytest.raises(ValueError, match="non-finite"):
+            remote_mux._finite(value)
+
+    def test_integral_takes_an_int_or_a_whole_float(self):
+        assert remote_mux._integral(16) == 16
+        assert remote_mux._integral(16.0) == 16
+        assert type(remote_mux._integral(16.0)) is int
+
+    @pytest.mark.parametrize("value", ["16", True, False, None])
+    def test_integral_refuses_a_non_number_with_a_type_error(self, value):
+        with pytest.raises(TypeError):
+            remote_mux._integral(value)
+
+    @pytest.mark.parametrize("value", [16.9, math.nan, math.inf])
+    def test_integral_refuses_a_fraction_or_a_non_finite_float(self, value):
+        with pytest.raises(ValueError, match="not a whole reading"):
+            remote_mux._integral(value)
+
+
 class TestSample:
     def test_the_node_answers_one_load_sample(self, fake_ssh):
         fake_ssh.set_reply(
@@ -529,6 +561,63 @@ class TestSample:
 
     def test_garbage_is_a_remote_error_not_a_crash(self, fake_ssh):
         fake_ssh.set_reply("bash -s", stdout="bash: awk: command not found\n")
+        with pytest.raises(RemoteError, match="not a load sample") as exc:
+            remote_mux.sample(NODE)
+        # A bounded head of what came back: the likely real cause (a .bashrc
+        # banner on stdout) is otherwise only "Extra data: line 2".
+        assert "got b'bash: awk: command not found\\n'" in exc.value.stderr_tail
+        # rc 0: the node answered; the answer was malformed.
+        assert exc.value.rc == 0
+
+    def test_the_head_of_what_came_back_is_bounded(self, fake_ssh):
+        fake_ssh.set_reply("bash -s", stdout="x" * 5000)
+        with pytest.raises(RemoteError, match="not a load sample") as exc:
+            remote_mux.sample(NODE)
+        assert "x" * 200 in exc.value.stderr_tail
+        assert "x" * 201 not in exc.value.stderr_tail
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            # 1e400 parses to inf; int(inf) is an OverflowError, which is an
+            # ArithmeticError and not a ValueError.
+            '"nproc": 1e400',
+            # A 401-digit integer: float() of it is an OverflowError too.
+            '"ts": 1' + "0" * 400,
+            # The int fields are as strict as the float ones: no fraction, no
+            # bool (json `true` is a Python bool, and bool is an int).
+            '"nproc": 16.9',
+            '"nproc": true',
+            '"my_sessions": "3"',
+            # A numeric string is not a reading either -- sample.sh prints
+            # bare numbers.
+            '"load1": "0.5"',
+            '"load1": false',
+        ],
+        ids=[
+            "int-overflow",
+            "float-overflow",
+            "fractional-count",
+            "bool-count",
+            "string-count",
+            "string-reading",
+            "bool-reading",
+        ],
+    )
+    def test_a_malformed_number_is_not_a_load_sample(self, fake_ssh, field):
+        good = {
+            "ts": "1727200000",
+            "nproc": "16",
+            "load1": "0.5",
+            "load5": "1.25",
+            "load15": "2.0",
+            "mem_total_mb": "64000",
+            "mem_avail_mb": "48000",
+            "my_sessions": "3",
+        }
+        key = field.split(":", 1)[0].strip('"')
+        body = ", ".join(field if k == key else f'"{k}": {v}' for k, v in good.items())
+        fake_ssh.set_reply("bash -s", stdout="{" + body + "}\n")
         with pytest.raises(RemoteError, match="not a load sample"):
             remote_mux.sample(NODE)
 
