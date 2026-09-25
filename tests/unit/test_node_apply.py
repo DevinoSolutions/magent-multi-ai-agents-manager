@@ -2612,6 +2612,13 @@ class _HungUp(io.TextIOBase):
         self.pending.clear()
         self.dead = bool(self.rows)
 
+    def close(self) -> None:
+        # IOBase closes -- and so flushes -- the double when it is collected,
+        # after the test, a failed one included: a still-dead flush would
+        # raise there, outside any test.
+        self.where = "closed"
+        super().close()
+
 
 # What a write into a dead pipe raises. OSError(EPIPE) is built as a
 # BrokenPipeError by OSError itself; Windows raises a plain OSError(EINVAL),
@@ -2709,9 +2716,6 @@ class TestAPcThatHangsUpDoesNotStopTheApply:
         for row in met:
             assert TOKEN not in row and PASSWORD not in row
             assert row.split("\t")[2] == f"{node_apply._MASK} https://***@h/x?***\n"
-        # IOBase closes -- and so flushes -- the double when it is collected;
-        # a still-dead flush would raise there, outside any test.
-        pipe.where = "closed"
 
     def test_a_real_descriptor_is_pointed_at_the_null_device_and_nothing_leaks(
         self, box, tmp_path, monkeypatch, capsys
