@@ -758,10 +758,12 @@ class TestSample:
     @pytest.mark.parametrize(
         "field",
         [
-            # 1e400 parses to inf; int(inf) is an OverflowError, which is an
-            # ArithmeticError and not a ValueError.
+            # 1e400 parses to inf; _integral refuses it before any int()
+            # conversion ("ValueError: not a whole reading: inf").
             '"nproc": 1e400',
-            # A 401-digit integer: float() of it is an OverflowError too.
+            # A 401-digit integer: _finite's float() of it is an OverflowError,
+            # an ArithmeticError and not a ValueError -- the only case that
+            # reaches sample()'s OverflowError catch.
             '"ts": 1' + "0" * 400,
             # The int fields are as strict as the float ones: no fraction, no
             # bool (json `true` is a Python bool, and bool is an int).
@@ -774,7 +776,7 @@ class TestSample:
             '"load1": false',
         ],
         ids=[
-            "int-overflow",
+            "infinite-count",
             "float-overflow",
             "fractional-count",
             "bool-count",

@@ -191,10 +191,11 @@ def _spawn(
     input_bytes: bytes | None,
     check: bool,
     shown: tuple[str, ...],
+    label: str,
 ) -> subprocess.CompletedProcess[bytes]:
     """One bounded child -- the shared body of ``run`` and the local git reads
     (``ignored_paths``). ``shown`` is what an error and a log line may say
-    about the command."""
+    about the command; ``label`` opens every log line, naming who spawned it."""
     try:
         proc = subprocess.Popen(
             argv,
@@ -212,7 +213,7 @@ def _spawn(
         rc = SSH_MISSING_RC if isinstance(e, FileNotFoundError) else None
         reason = e.strerror or str(e)
         get_logger("nodes").warning(
-            "node call could not start (%s): %s", reason, shlex.join(shown)
+            "%s could not start (%s): %s", label, reason, shlex.join(shown)
         )
         raise RemoteError(rc, reason, shown) from e
     try:
@@ -226,12 +227,12 @@ def _spawn(
         with contextlib.suppress(subprocess.TimeoutExpired, OSError):
             proc.wait(timeout=_REAP_TIMEOUT_S)
         get_logger("nodes").warning(
-            "node call timed out after %.1fs: %s", timeout_s, shlex.join(shown)
+            "%s timed out after %.1fs: %s", label, timeout_s, shlex.join(shown)
         )
         raise RemoteError(None, f"timed out after {timeout_s:g}s", shown) from None
     if check and proc.returncode != 0:
         get_logger("nodes").warning(
-            "node call failed (rc=%s): %s", proc.returncode, shlex.join(shown)
+            "%s failed (rc=%s): %s", label, proc.returncode, shlex.join(shown)
         )
         raise RemoteError(proc.returncode, _tail(err), shown)
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
@@ -259,6 +260,7 @@ def run(
         input_bytes=input_bytes,
         check=check,
         shown=shown,
+        label="node call",
     )
 
 
@@ -395,8 +397,9 @@ def sample(node: Node) -> LoadSample:
             mem_avail_mb=_integral(raw["mem_avail_mb"]),
             my_sessions=_integral(raw["my_sessions"]),
         )
-    # OverflowError is an ArithmeticError, not a ValueError: `1e400` parses
-    # to inf, and float() of a 401-digit integer overflows.
+    # OverflowError is an ArithmeticError, not a ValueError: float() of a
+    # 401-digit integer overflows. (`1e400` parses to inf, a ValueError from
+    # _finite/_integral.)
     except (ValueError, KeyError, TypeError, OverflowError) as e:
         shown = _run_shown(node, *_script_call("sample", [], None))
         raise RemoteError(
@@ -407,16 +410,19 @@ def sample(node: Node) -> LoadSample:
     return reading
 
 
-def ignored_paths(repo: Path, *, timeout_s: float) -> tuple[str, ...]:
+def ignored_paths(repo: Path, *, timeout_s: float, label: str) -> tuple[str, ...]:
     """What git ignores in the LOCAL ``repo``: ``git ls-files --others --ignored
     --exclude-standard --directory -z`` -- repo-relative, '/'-separated, and a
     wholly ignored directory as ONE ``dir/`` entry (``node_modules`` is one
     line, not a hundred thousand). Read-only. The raw material for
     ``nodes.push_set``; ``git_state`` carries it as ``LocalGitState.ignored``.
+    ``label`` names the caller in the log line a failure writes.
 
-    A missing ``git`` is RemoteError rc None ("git not found on PATH"): the
-    command never ran. ``_spawn`` reads a FileNotFoundError as the missing ssh
-    client (rc 127), which is not what happened here."""
+    A ``repo`` that is not a git repository is ``RemoteError(rc=128, <git's
+    stderr tail>)`` -- git's own "fatal: not a git repository" exit. A missing
+    ``git`` is RemoteError rc None ("git not found on PATH"): the command never
+    ran. ``_spawn`` reads a FileNotFoundError as the missing ssh client (rc
+    127), which is not what happened here."""
     argv = [
         "git",
         "-C",
@@ -431,7 +437,12 @@ def ignored_paths(repo: Path, *, timeout_s: float) -> tuple[str, ...]:
     shown = tuple(argv)
     try:
         result = _spawn(
-            argv, timeout_s=timeout_s, input_bytes=None, check=True, shown=shown
+            argv,
+            timeout_s=timeout_s,
+            input_bytes=None,
+            check=True,
+            shown=shown,
+            label=label,
         )
     except RemoteError as e:
         if isinstance(e.__cause__, FileNotFoundError):

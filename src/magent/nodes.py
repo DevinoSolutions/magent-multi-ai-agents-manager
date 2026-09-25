@@ -449,8 +449,21 @@ def _classify_extras(
         elif not target.is_file():
             warnings.append(f"push: {extra} does not exist; skipped")
         else:
-            shipped.append(project_dir / target.relative_to(root))
+            shipped.append(_named_path(project_dir, extra, target, root))
     return shipped, warnings
+
+
+def _named_path(project_dir: Path, extra: str, target: Path, root: Path) -> Path:
+    """Where a validated extra ships: the path the user WROTE, normalized
+    (``./a//b`` is ``a/b``), so a symlink ships under its own name rather than
+    its target's. Only when that name still lands on ``target`` and lies
+    lexically inside ``project_dir``; otherwise (a ``..`` through a symlinked
+    directory, which POSIX resolves differently from the lexical collapse)
+    the validated target's own place."""
+    named = Path(os.path.normpath(project_dir / extra))
+    if named.is_relative_to(project_dir) and named.resolve() == target:
+        return named
+    return project_dir / target.relative_to(root)
 
 
 def push_set(

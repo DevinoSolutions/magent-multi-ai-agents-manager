@@ -14,7 +14,6 @@ from pathlib import Path, PurePosixPath
 import pytest
 
 from magent import nodes, remote_mux
-from magent.attach_client import SSH_MISSING_RC
 from magent.config import MagentConfig, NodeConfig, ProjectConfig, Settings
 from magent.nodes import (
     LoadSample,
@@ -530,6 +529,9 @@ def repo(tmp_path, monkeypatch):
         "node_modules/left-pad/.env": "INSIDE=1\n",
         "node_modules/left-pad/index.js": "\n",
         "notes.txt": "untracked, not ignored\n",
+        # An untracked directory holding ONLY an ignored file: git may list the
+        # directory rather than the file (TestGitsIgnoredListing pins which).
+        "config/.env": "CFG=1\n",
     }
     git("init", "-q")
     for rel, text in files.items():
@@ -555,21 +557,42 @@ def _state(path: Path, ignored: tuple[str, ...]) -> LocalGitState:
 
 
 def _real_state(repo: Path) -> LocalGitState:
-    return _state(repo, remote_mux.ignored_paths(repo, timeout_s=30))
+    return _state(repo, remote_mux.ignored_paths(repo, timeout_s=30, label="test"))
 
 
 class TestGitsIgnoredListing:
     def test_a_wholly_ignored_directory_is_one_entry(self, repo):
-        listing = remote_mux.ignored_paths(repo, timeout_s=30)
+        listing = remote_mux.ignored_paths(repo, timeout_s=30, label="test")
         assert "node_modules/" in listing
         assert [p for p in listing if p.startswith("node_modules/")] == [
             "node_modules/"
         ]
 
     def test_tracked_and_merely_untracked_files_are_not_listed(self, repo):
-        listing = remote_mux.ignored_paths(repo, timeout_s=30)
+        listing = remote_mux.ignored_paths(repo, timeout_s=30, label="test")
         assert ".env.example" not in listing
         assert "notes.txt" not in listing
+
+    def test_an_untracked_dir_of_only_ignored_files_is_descended(self, repo):
+        # git 2.52 lists BOTH `config/` and `config/.env`. The file line is what
+        # push_set ships from; if a git ever drops it, this goes red first.
+        listing = remote_mux.ignored_paths(repo, timeout_s=30, label="test")
+        assert "config/.env" in listing
+
+    def test_a_non_repo_is_git_rc_128_and_the_log_names_the_caller(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # The ceiling keeps git from finding an enclosing repo above tmp.
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        with (
+            caplog.at_level("WARNING", logger="magent.nodes"),
+            pytest.raises(remote_mux.RemoteError) as err,
+        ):
+            remote_mux.ignored_paths(tmp_path, timeout_s=30, label="push-set read")
+        assert err.value.rc == 128
+        assert "not a git repository" in err.value.stderr_tail
+        assert "push-set read failed (rc=128)" in caplog.text
 
     def test_a_missing_git_is_named_as_git_not_as_the_node_client(
         self, tmp_path, monkeypatch
@@ -580,9 +603,8 @@ class TestGitsIgnoredListing:
         empty.mkdir()
         monkeypatch.setenv("PATH", str(empty))
         with pytest.raises(remote_mux.RemoteError) as err:
-            remote_mux.ignored_paths(tmp_path, timeout_s=30)
+            remote_mux.ignored_paths(tmp_path, timeout_s=30, label="test")
         assert err.value.rc is None
-        assert err.value.rc != SSH_MISSING_RC
         assert err.value.stderr_tail == "git not found on PATH"
         assert err.value.command_redacted[0] == "git"
 
@@ -592,6 +614,10 @@ class TestPushSet:
         shipped = nodes.push_set(repo, [_real_state(repo)], home=Path.home())
         assert repo / ".env" in shipped
         assert repo / "apps" / "web" / ".env.local" in shipped
+
+    def test_an_env_file_in_a_dir_of_only_ignored_files_ships(self, repo):
+        shipped = nodes.push_set(repo, [_real_state(repo)], home=Path.home())
+        assert repo / "config" / ".env" in shipped
 
     def test_the_local_claude_files_ship(self, repo):
         shipped = nodes.push_set(repo, [_real_state(repo)], home=Path.home())
@@ -724,6 +750,21 @@ class TestPushExtras:
         shipped = nodes.push_set(repo, [], home=Path.home(), extras=["linked.txt"])
         assert link not in shipped
         assert outside not in shipped
+
+    def test_a_symlinked_extra_ships_under_the_name_the_user_wrote(self, repo):
+        # The node recreates the path it is handed: the link's name is what the
+        # project reads, not wherever the link happens to point on this PC.
+        (repo / "real-sa.json").write_text("{}", encoding="utf-8")
+        link = repo / "gcp-sa.json"
+        try:
+            link.symlink_to(repo / "real-sa.json")
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        shipped = nodes.push_set(
+            repo, [_real_state(repo)], home=Path.home(), extras=["./gcp-sa.json"]
+        )
+        assert link in shipped
+        assert repo / "real-sa.json" not in shipped
 
     def test_the_users_ssh_keys_are_never_pushed(self, tmp_path):
         # A project that IS the home dir (a dotfiles repo) still cannot ship them.
