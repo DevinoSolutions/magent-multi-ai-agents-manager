@@ -21,7 +21,7 @@ from magent import cli, node_scripts, nodes, remote_mux
 from magent.cli import hooks_cmd
 from magent.nodes import Node, UserScope
 from magent.remote_mux import RemoteError, ScriptLine
-from tests.unit._fake_ssh import FakeSsh, gh_auth_status, make_fake_ssh
+from tests.unit._fake_ssh import FakeCall, FakeSsh, gh_auth_status, make_fake_ssh
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -1369,3 +1369,76 @@ class TestProgramsShUnderRealBash:
             ("skip", "no-such-program"),
         ]
         assert lines[0].detail == str(uvx)
+
+
+NODE_KEY = "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+TITLE = "magent amin@devino-second"
+KEY_SCOPES = "admin:public_key, repo"
+
+
+def _adds(gh: FakeSsh) -> list[FakeCall]:
+    return [c for c in gh.calls() if c.argv[:2] == ["ssh-key", "add"]]
+
+
+class TestRegisterSshKey:
+    def test_no_gh_login_on_this_pc_fails_and_names_the_login(self):
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine(
+            "fail", "github-key", "gh is not logged in on this PC: gh auth login"
+        )
+
+    def test_a_login_without_the_key_scope_names_the_refresh(self, fake_gh):
+        fake_gh.set_reply(
+            "auth status", stdout=gh_auth_status("amin", "repo, workflow")
+        )
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row.status == "fail"
+        assert row.detail.endswith("gh auth refresh -h github.com -s admin:public_key")
+        assert _adds(fake_gh) == []
+
+    def test_a_key_already_on_the_account_is_a_skip(self, fake_gh):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply(
+            "user/keys", stdout="ssh-ed25519 AAAAOTHER\nssh-ed25519 AAAAFAKENODEKEY\n"
+        )
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine("skip", "github-key", "already registered to amin")
+        assert _adds(fake_gh) == []
+
+    def test_a_new_key_is_added_on_stdin_as_an_authentication_key(self, fake_gh):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        (add,) = _adds(fake_gh)
+        assert add.argv == [
+            "ssh-key",
+            "add",
+            "-",
+            "--title",
+            TITLE,
+            "--type",
+            "authentication",
+        ]
+        assert add.stdin == (NODE_KEY + "\n").encode("ascii")
+        assert row == ScriptLine(
+            "did", "github-key", f"registered to amin as '{TITLE}'"
+        )
+
+    def test_write_public_key_is_scope_enough(self, fake_gh):
+        fake_gh.set_reply(
+            "auth status", stdout=gh_auth_status("amin", "write:public_key")
+        )
+        remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert len(_adds(fake_gh)) == 1
+
+    def test_a_refused_add_fails_with_ghs_own_words(self, fake_gh):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply(
+            "ssh-key add",
+            stderr="HTTP 422: key is already in use (https://api.github.com/user/keys)\n",
+            rc=1,
+        )
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row.status == "fail"
+        assert row.detail.endswith(
+            "HTTP 422: key is already in use (https://api.github.com/user/keys)"
+        )

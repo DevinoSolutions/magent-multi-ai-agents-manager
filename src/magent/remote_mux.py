@@ -656,6 +656,55 @@ def provision(
     return ProvisionReport((*notes, *shipped, *report.lines))
 
 
+# Either scope lets gh add an ssh key; admin: is what `gh auth refresh` grants.
+SSH_KEY_SCOPES = frozenset({"admin:public_key", "write:public_key"})
+
+
+def register_ssh_key(pubkey: str, *, title: str) -> ScriptLine:
+    """Add a node's public key to this PC's GitHub account (gh, authentication
+    key), once: a key already on the account is a skip. One ``github-key``
+    row; never raises. The key is public, but it rides stdin anyway."""
+    account = local_gh_account()
+    if account is None:
+        return ScriptLine(
+            "fail", "github-key", "gh is not logged in on this PC: gh auth login"
+        )
+    if not account.scopes & SSH_KEY_SCOPES:
+        return ScriptLine(
+            "fail",
+            "github-key",
+            (
+                f"this PC's gh login ({account.login}) cannot add ssh keys: "
+                "gh auth refresh -h github.com -s admin:public_key"
+            ),
+        )
+    parts = pubkey.split()
+    if len(parts) < 2:
+        return ScriptLine("fail", "github-key", "not an ssh public key line")
+    listed = _gh(["api", "--paginate", "user/keys", "--jq", ".[].key"])
+    if (
+        listed is not None
+        and listed.returncode == 0
+        and parts[1] in listed.stdout.decode("utf-8", "replace").split()
+    ):
+        return ScriptLine(
+            "skip", "github-key", f"already registered to {account.login}"
+        )
+    added = _gh(
+        ["ssh-key", "add", "-", "--title", title, "--type", "authentication"],
+        input_bytes=(" ".join(parts) + "\n").encode("utf-8"),
+    )
+    if added is None:
+        return ScriptLine("fail", "github-key", "gh could not run on this PC")
+    if added.returncode != 0:
+        err = added.stderr.decode("utf-8", "replace").strip().splitlines()
+        detail = err[-1][:200] if err else f"exited {added.returncode}"
+        return ScriptLine("fail", "github-key", f"gh ssh-key add failed: {detail}")
+    return ScriptLine(
+        "did", "github-key", f"registered to {account.login} as {title!r}"
+    )
+
+
 def has_session(node: Node, sid: str) -> bool | None:
     """Is ``sid`` alive on ``node``? Exit 0 is True, a live session. Exit 1 is
     False, meant as tmux's own "no" (no such session, or no server at all) --
