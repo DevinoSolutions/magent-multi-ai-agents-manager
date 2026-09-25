@@ -1149,6 +1149,88 @@ def _visible_cells(status: str) -> int:
     )
 
 
+class TestTodaysDecorationIsPinned:
+    """Characterization, written green BEFORE the brand grows a node suffix: the
+    ten decoration argvs of a LOCAL session, restated literally. The node work
+    builds the same vocabulary for tmux; a diff here means it changed psmux."""
+
+    @pytest.mark.parametrize("code_hint", [True, False])
+    def test_the_ten_argvs_are_byte_identical(self, code_hint):
+        fallback = (
+            "F2 opens VS Code only from a magent window on Windows"
+            " (hotkey listener not running in this client)"
+        )
+        f2 = (
+            ["psmux", "-L", "api", "bind", "-n", "F2", "display-message", fallback]
+            if code_hint
+            else ["psmux", "-L", "api", "unbind-key", "-n", "F2"]
+        )
+        hint = _EXPECTED_HINT if code_hint else _EXPECTED_HINT_F1_ONLY
+        assert psmux.decoration_argv("api", "psmux", code_hint) == [
+            ["psmux", "-L", "api", "bind", "-n", "F1", "detach-client"],
+            ["psmux", "-L", "api", "set", "-g", "status-right", hint],
+            [
+                "psmux",
+                "-L",
+                "api",
+                "set",
+                "-g",
+                "status-right-length",
+                "40" if code_hint else "22",
+            ],
+            [
+                "psmux",
+                "-L",
+                "api",
+                "set",
+                "-g",
+                "status-left",
+                "#[bold,fg=green] magent #[default]",
+            ],
+            ["psmux", "-L", "api", "set", "-g", "status-left-length", "10"],
+            f2,
+            ["psmux", "-L", "api", "rename-window", "-t", "api", "api"],
+            ["psmux", "-L", "api", "set", "-g", "automatic-rename", "off"],
+            ["psmux", "-L", "api", "set", "-g", "window-status-format", "#W"],
+            ["psmux", "-L", "api", "set", "-g", "window-status-current-format", "#W"],
+        ]
+
+
+_BRAND = "#[bold,fg=green] magent #[default]"
+
+
+class TestTheBrandNamesTheNode:
+    """A node session's status line says where it runs: `magent @second`.
+    A local session's brand is today's, byte for byte."""
+
+    def test_a_local_session_keeps_todays_brand(self):
+        assert psmux.status_brand(None) == (_BRAND, "8")
+
+    def test_a_node_session_says_which_node_it_runs_on(self):
+        assert psmux.status_brand("second") == (_BRAND + "@second ", "16")
+
+    @pytest.mark.parametrize("nick", [None, "second", "cloud", "a"])
+    def test_the_cell_count_is_exactly_the_visible_width(self, nick):
+        text, cells = psmux.status_brand(nick)
+        assert int(cells) == _visible_cells(text)
+
+    @pytest.mark.parametrize(
+        ("nick", "length"), [(None, "10"), ("second", "18"), ("cloud", "17")]
+    )
+    def test_status_left_is_the_brand_plus_two_cells_of_headroom(self, nick, length):
+        text, cells = psmux.status_brand(nick)
+        assert psmux.status_left(nick) == (text, length)
+        assert int(length) == int(cells) + 2
+
+    @pytest.mark.parametrize("code_hint", [True, False])
+    def test_the_f2_binding_is_the_decorations_sixth_command(self, code_hint):
+        local = psmux.decoration_argv("api", "psmux", code_hint)[5]
+        assert psmux.f2_binding_argv(["psmux", "-L", "api"], code_hint) == local
+        tmux = psmux.f2_binding_argv(["tmux", "-L", "magent"], code_hint)
+        assert tmux[:3] == ["tmux", "-L", "magent"]
+        assert tmux[3:] == local[3:]
+
+
 class TestDecorateSession:
     """The status-line hints (badged `F1`/`F2` keys with spelled-out labels),
     the product-owned `bind -n F1 detach-client`, and the product-owned
@@ -1284,7 +1366,8 @@ class TestDecorateSession:
     def test_status_left_length_fits_the_brand(self):
         # The number is only correct relative to the brand text; pin the
         # relationship, not just the two literals.
-        assert int(psmux._STATUS_BRAND_LEN) >= len(" magent ")
+        text, length = psmux.status_left(None)
+        assert int(length) >= _visible_cells(text)
 
     @pytest.mark.parametrize("code_hint", [True, False])
     def test_status_right_length_fits_the_hint(self, code_hint):

@@ -914,8 +914,11 @@ _STATUS_BRAND = "#[bold,fg=green] magent #[default]"
 # ...and the width budget has to travel with it. tmux truncates status-left at
 # `status-left-length` (default 10, but a personal conf may set it far tighter),
 # so setting the brand without the length can render it mid-word. Style
-# directives don't count toward the limit; " magent " is 8 columns.
-_STATUS_BRAND_LEN = "10"
+# directives don't count toward the limit; " magent " is 8 cells, and the
+# length carries 2 more of headroom -- the 10 every local session has always
+# been given.
+_STATUS_BRAND_CELLS = 8
+_STATUS_LEFT_HEADROOM = 2
 
 # What a raw F2 says when it actually reaches psmux. See `decoration_argv` for
 # why this can never double-fire on a Windows attach window. Pure ASCII for the
@@ -931,7 +934,7 @@ _F2_FALLBACK_MSG = (
 # `#I:#W#F`, and with one window per session (magent's invariant) the `0:`
 # index is pure noise stealing bar columns from the name. Verified live on
 # psmux 3.3.8: `set -g window-status-format "#W"` renders exactly the name.
-_WINDOW_STATUS_FORMAT = "#W"
+WINDOW_STATUS_FORMAT = "#W"
 
 # ...and the name itself is width-budgeted like every other bar element. A
 # 30-char project name eats the whole bar; longer than this renders as the
@@ -981,6 +984,37 @@ def status_hints(code_hint: bool) -> tuple[str, str]:
     return _STATUS_HINTS_F1, _STATUS_HINTS_F1_LEN
 
 
+def status_brand(nick: str | None) -> tuple[str, str]:
+    """The status-left brand and its width in cells. ``None`` is a session on
+    THIS machine: today's brand, byte for byte. A nick is a session running on
+    that pool machine (PR-D), branded ``magent @<nick>`` so a window says where
+    its agent actually is. ASCII only, same law as the hints: the cell count is
+    ``len``, and a wide glyph here would desync the bar."""
+    if nick is None:
+        return _STATUS_BRAND, str(_STATUS_BRAND_CELLS)
+    suffix = f"@{nick} "
+    return _STATUS_BRAND + suffix, str(_STATUS_BRAND_CELLS + len(suffix))
+
+
+def status_left(nick: str | None) -> tuple[str, str]:
+    """``status-left`` and ``status-left-length`` for a session: the brand and
+    its cells plus the headroom every session gets. The one place both
+    multiplexers read it from, so a psmux bar and a node's tmux bar cannot
+    budget the brand differently."""
+    brand, cells = status_brand(nick)
+    return brand, str(int(cells) + _STATUS_LEFT_HEADROOM)
+
+
+def f2_binding_argv(prefix: list[str], code_hint: bool) -> list[str]:
+    """The F2 half of a decoration, after ``prefix`` (``[psmux, "-L", name]``
+    here, ``[tmux, "-L", "magent"]`` on a node). See ``decoration_argv`` for why
+    an advertised F2 binds a fallback message and an unadvertised one is
+    unbound."""
+    if code_hint:
+        return [*prefix, "bind", "-n", "F2", "display-message", _F2_FALLBACK_MSG]
+    return [*prefix, "unbind-key", "-n", "F2"]
+
+
 def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
     """The psmux commands that brand ``name`` and advertise its window hotkeys.
 
@@ -1023,17 +1057,14 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
     key nothing advertises any more.
     """
     hints, hints_len = status_hints(code_hint)
-    f2 = (
-        [psmux, "-L", name, "bind", "-n", "F2", "display-message", _F2_FALLBACK_MSG]
-        if code_hint
-        else [psmux, "-L", name, "unbind-key", "-n", "F2"]
-    )
+    brand, brand_len = status_left(None)
+    f2 = f2_binding_argv([psmux, "-L", name], code_hint)
     return [
         [psmux, "-L", name, "bind", "-n", "F1", "detach-client"],
         [psmux, "-L", name, "set", "-g", "status-right", hints],
         [psmux, "-L", name, "set", "-g", "status-right-length", hints_len],
-        [psmux, "-L", name, "set", "-g", "status-left", _STATUS_BRAND],
-        [psmux, "-L", name, "set", "-g", "status-left-length", _STATUS_BRAND_LEN],
+        [psmux, "-L", name, "set", "-g", "status-left", brand],
+        [psmux, "-L", name, "set", "-g", "status-left-length", brand_len],
         f2,
         # The window NAME is magent's too (same doctrine as window titles):
         # psmux's automatic-rename shows the pane's current command, so the bar
@@ -1050,7 +1081,7 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
         [psmux, "-L", name, "set", "-g", "automatic-rename", "off"],
         # ...and the entry renders as the name alone: no `0:` index (one
         # window per session makes it noise), no flags suffix.
-        [psmux, "-L", name, "set", "-g", "window-status-format", _WINDOW_STATUS_FORMAT],
+        [psmux, "-L", name, "set", "-g", "window-status-format", WINDOW_STATUS_FORMAT],
         [
             psmux,
             "-L",
@@ -1058,7 +1089,7 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
             "set",
             "-g",
             "window-status-current-format",
-            _WINDOW_STATUS_FORMAT,
+            WINDOW_STATUS_FORMAT,
         ],
     ]
 
