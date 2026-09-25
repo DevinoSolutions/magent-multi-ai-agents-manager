@@ -50,6 +50,9 @@ class _FakeProc:
     """Stand-in for a subprocess.Popen handle (the attach flow waits on the
     overlapped `serve --ensure` hop, so a bare None no longer suffices)."""
 
+    # What `attach_client.spawn_attach_window` hands back: the wt launcher's pid.
+    pid = 4242
+
     def __init__(self, rc: int = 0) -> None:
         self._rc = rc
 
@@ -783,9 +786,12 @@ class TestAttachPanesLoseOnlyALeakedColourOverride:
             monkeypatch.setenv("CLAUDECODE", "1")
         monkeypatch.setenv("NO_COLOR", "1")
         envs: list[object] = []
-        monkeypatch.setattr(
-            attach_mod.subprocess, "Popen", lambda args, **k: envs.append(k.get("env"))
-        )
+
+        def fake_popen(_args, **k):
+            envs.append(k.get("env"))
+            return _FakeProc()
+
+        monkeypatch.setattr(attach_mod.subprocess, "Popen", fake_popen)
         monkeypatch.setattr(attach_mod.time, "sleep", lambda s: None)
         monkeypatch.setattr(attach_mod, "_tile_titles", lambda t: None)
         _fake_platform(monkeypatch)
@@ -2122,9 +2128,12 @@ class TestSpawnWindows:
 
         spawns: list[list[str]] = []
         sleeps: list[float] = []
-        monkeypatch.setattr(
-            attach_mod.subprocess, "Popen", lambda args, **k: spawns.append(args)
-        )
+
+        def fake_popen(args, **_k):
+            spawns.append(args)
+            return _FakeProc()
+
+        monkeypatch.setattr(attach_mod.subprocess, "Popen", fake_popen)
         monkeypatch.setattr(attach_mod.time, "sleep", sleeps.append)
         titles = attach_mod._spawn_windows(
             "user@host", sids, set(open_already), stagger, **kwargs
@@ -2238,6 +2247,108 @@ class TestSpawnWindows:
         monkeypatch.setattr(attach_mod, "_attach_client_exe", lambda: None)
         self._spawn(monkeypatch, ["api"], [], 0.0, reconnect=False)
         assert "not on PATH" not in capsys.readouterr().out
+
+
+# The two wt argv lines `magent attach` spawns for session "api" on
+# "user@host", byte for byte, as shipped before the node work. Shared by the
+# characterization pins below and by the spawn_attach_window tests after them,
+# so "the lift changed nothing" is one comparison against one literal.
+_SUPERVISED_WT_ARGV = [
+    "wt",
+    "-w",
+    "new",
+    "--title",
+    "magent:api",
+    "--suppressApplicationTitle",
+    "--",
+    _FAKE_SUPERVISOR,
+    "--target",
+    "user@host",
+    "--session",
+    "api",
+    "--remote",
+    "psmux -L api attach || magent sessions api",
+]
+_BARE_WT_ARGV = [
+    "wt",
+    "-w",
+    "new",
+    "--title",
+    "magent:api",
+    "--suppressApplicationTitle",
+    "--",
+    "ssh",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=4",
+    "-o",
+    "ConnectTimeout=20",
+    "-t",
+    "user@host",
+    "psmux -L api attach || magent sessions api",
+]
+# Where the pane command starts inside a wt argv: after `--`.
+_PANE = _SUPERVISED_WT_ARGV.index("--") + 1
+
+
+class TestTodaysAttachShapesArePinned:
+    """Characterization, green BEFORE the spawn_attach_window lift: the corpse
+    markers, both pane commands and both whole wt lines, exactly as shipped.
+    MD006's title lock is part of the pinned literal, next to "wt"."""
+
+    def _spawned(self, monkeypatch, **kwargs):
+        from magent.cli import attach as attach_mod
+
+        calls: list[tuple[list[str], dict[str, object]]] = []
+
+        def fake_popen(args, **k):
+            calls.append((list(args), k))
+            return _FakeProc()
+
+        monkeypatch.setattr(attach_mod.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(attach_mod.time, "sleep", lambda _s: None)
+        attach_mod._spawn_windows("user@host", ["api"], set(), 0.0, **kwargs)
+        assert len(calls) == 1
+        return calls[0]
+
+    def test_the_corpse_markers_are_byte_identical(self):
+        from magent.cli import attach as attach_mod
+
+        assert attach_mod._attach_markers("api") == (
+            "-L api attach",
+            '-L "api" attach',
+            "-L 'api' attach",
+        )
+
+    def test_the_supervised_pane_command_is_byte_identical(self):
+        from magent.cli import attach as attach_mod
+
+        assert (
+            attach_mod._pane_command("user@host", "api", _FAKE_SUPERVISOR)
+            == _SUPERVISED_WT_ARGV[_PANE:]
+        )
+
+    def test_the_bare_ssh_pane_command_is_byte_identical(self):
+        from magent.cli import attach as attach_mod
+
+        assert (
+            attach_mod._pane_command("user@host", "api", None) == _BARE_WT_ARGV[_PANE:]
+        )
+
+    def test_the_supervised_wt_argv_is_byte_identical(self, monkeypatch):
+        argv, _kwargs = self._spawned(monkeypatch)
+        assert argv == _SUPERVISED_WT_ARGV
+
+    def test_the_no_reconnect_wt_argv_is_byte_identical(self, monkeypatch):
+        argv, _kwargs = self._spawned(monkeypatch, reconnect=False)
+        assert argv == _BARE_WT_ARGV
+
+    def test_the_window_gets_only_the_attach_client_environment(self, monkeypatch):
+        from magent.env import attach_client_env
+
+        _argv, kwargs = self._spawned(monkeypatch)
+        assert kwargs == {"env": attach_client_env()}
 
 
 class TestClientProcessNames:

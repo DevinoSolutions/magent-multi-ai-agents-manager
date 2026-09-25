@@ -278,6 +278,9 @@ class TestConfigMenuCharacterization:
 class _FakeProc:
     """Stand-in for a subprocess.Popen handle: records that it was waited on."""
 
+    # What `attach_client.spawn_attach_window` hands back: the wt launcher's pid.
+    pid = 4242
+
     def __init__(self, rc: int = 0) -> None:
         self._rc = rc
         self.waited = False
