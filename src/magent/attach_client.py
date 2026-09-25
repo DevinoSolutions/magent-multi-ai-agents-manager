@@ -932,6 +932,9 @@ def supervise(
     magent host, tmux on a node) and which repair a stopped pane names; the
     connection itself is the same ssh.
     """
+    # Refused before any ssh is dialled: an unknown mux would otherwise only
+    # surface after the first disconnect, possibly hours in, out of the probe.
+    _check_mux(mux)
     if shutil.which("ssh") is None:
         _echo(f"  {style('x', fg='red')} ssh is not on PATH -- cannot attach.")
         return SSH_MISSING_RC

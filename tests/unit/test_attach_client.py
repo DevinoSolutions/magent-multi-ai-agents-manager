@@ -325,7 +325,16 @@ class TestSupervise:
         assert rc == 1
         out = capsys.readouterr().out
         assert "is not a session there" in out
-        assert "magent attach" in out
+        assert "Run magent attach to bring it back." in out
+
+    def test_a_failed_no_reconnect_psmux_pane_names_magent_attach(
+        self, monkeypatch, capsys
+    ):
+        # The other repair site: REMOTE_FAILED. A psmux session lives on a
+        # magent host, whose bring-up `magent attach` re-runs.
+        rc, _calls, _sleeps = _drive(monkeypatch, [1], reconnect=False)
+        assert rc == 1
+        assert "Run magent attach to bring it back." in capsys.readouterr().out
 
     def test_a_flapping_host_never_accumulates_its_way_to_a_stop(
         self, monkeypatch, capsys
@@ -1149,3 +1158,16 @@ class TestTheTmuxMultiplexer:
         out = capsys.readouterr().out
         assert "Run magent up to bring it back." in out
         assert "magent attach" not in out
+
+    def test_an_unknown_multiplexer_is_refused_before_any_ssh_is_dialled(
+        self, monkeypatch
+    ):
+        # Otherwise the ValueError would only surface out of the probe after
+        # the first disconnect, possibly hours into a live session.
+        def no_dial(*_a, **_k):
+            pytest.fail("ssh must not be dialled for an unknown mux")
+
+        monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/usr/bin/ssh")
+        monkeypatch.setattr(attach_client, "_run_ssh", no_dial)
+        with pytest.raises(ValueError, match="screen"):
+            attach_client.supervise("user@host", "remote", "api", mux="screen")
