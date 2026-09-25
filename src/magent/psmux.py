@@ -987,11 +987,14 @@ def status_hints(code_hint: bool) -> tuple[str, str]:
 def _check_brand_nick(nick: str) -> None:
     """Refuse a nick the status line cannot carry verbatim. The brand is a tmux
     FORMAT string, so a ``#`` would be expanded on every redraw (``#(cmd)`` runs
-    a command, ``#[...]`` restyles the bar), and a non-ASCII glyph breaks the
-    "cells == len" law. Config validates nicks, but the typed view is lenient
-    and not every caller's nick went through ``settings.nodes``."""
-    if not nick or not nick.isascii() or "#" in nick:
-        msg = f"status brand nick must be non-empty ASCII without '#': {nick!r}"
+    a command, ``#[...]`` restyles the bar), and a non-ASCII or non-printable
+    glyph (a raw newline, a tab, a control character) breaks the "cells ==
+    len" law. Config validates nicks, but the typed view is lenient and not
+    every caller's nick went through ``settings.nodes``."""
+    if not nick or not nick.isascii() or not nick.isprintable() or "#" in nick:
+        msg = (
+            f"status brand nick must be non-empty printable ASCII without '#': {nick!r}"
+        )
         raise ValueError(msg)
 
 
@@ -1039,15 +1042,15 @@ def f2_binding_argv(prefix: list[str], code_hint: bool) -> list[str]:
 def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
     """The psmux commands that brand ``name`` and advertise its window hotkeys.
 
-    Ten of them. The first six: magent *owns* F1 -> detach-client per session (the hint has to
-    be truthful on a machine with no personal ``bind -n F1`` in ~/.tmux.conf,
-    and owning the binding keeps the existing "back to the picker" semantics
-    rather than changing them), the status-right carries the hint text plus the
-    width budget it needs, the status-left carries the product brand plus
-    the width budget *it* needs, and the sixth is the F2 fallback below. The
-    last four own the window name and its status-bar entry (see the inline
-    comments). Each
-    half sets its text and its length together or neither: a personal conf with
+    Ten of them. The first six: magent *owns* F1 -> detach-client per session
+    (the hint has to be truthful on a machine with no personal ``bind -n F1``
+    in ~/.tmux.conf, and owning the binding keeps the existing "back to the
+    picker" semantics rather than changing them), the status-right carries
+    the hint text plus the width budget it needs, the status-left carries
+    the product brand plus the width budget *it* needs, and the sixth is the
+    F2 fallback below. The last four own the window name and its status-bar
+    entry (see the inline comments). Each half sets its text and its length
+    together or neither: a personal conf with
     a tighter ``status-*-length`` would truncate the other half mid-label. All
     are ``-L <name>``-scoped, so they land on that session's own server and
     override whatever its tmux.conf set at start-up.

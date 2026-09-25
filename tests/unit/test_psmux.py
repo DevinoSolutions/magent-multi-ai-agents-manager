@@ -1209,7 +1209,7 @@ class TestTheBrandNamesTheNode:
     def test_a_node_session_says_which_node_it_runs_on(self):
         assert psmux.status_brand("second") == (_BRAND + "@second ", "16")
 
-    @pytest.mark.parametrize("nick", [None, "second", "cloud", "a"])
+    @pytest.mark.parametrize("nick", [None, "second", "cloud", "a", "a b"])
     def test_the_cell_count_is_exactly_the_visible_width(self, nick):
         text, cells = psmux.status_brand(nick)
         assert int(cells) == _visible_cells(text)
@@ -1218,10 +1218,11 @@ class TestTheBrandNamesTheNode:
     def test_the_brand_is_pure_ascii(self, nick):
         assert psmux.status_brand(nick)[0].isascii()
 
-    @pytest.mark.parametrize("nick", ["#(x)", "é", ""])
+    @pytest.mark.parametrize("nick", ["#(x)", "é", "", "x\ny", "\t"])
     def test_a_nick_tmux_would_expand_or_mis_measure_is_refused(self, nick):
-        # `#(x)` would run `x` on every redraw, `é` breaks cells == len, and an
-        # empty nick brands the bar with a bare `@`.
+        # `#(x)` would run `x` on every redraw, `é` breaks cells == len, an
+        # empty nick brands the bar with a bare `@`, and a raw newline or tab
+        # is ASCII but not printable, so it also breaks cells == len.
         with pytest.raises(ValueError, match="status brand nick"):
             psmux.status_brand(nick)
         with pytest.raises(ValueError, match="status brand nick"):
