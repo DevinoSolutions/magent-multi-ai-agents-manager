@@ -23,23 +23,29 @@ file, a heartbeat thread, and a heartbeat left behind as the crash marker.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from magent import nodes, remote_mux
+from magent.attach_client import SSH_TRANSPORT_RC
 from magent.config import NODE_CLOUD, load_config
+from magent.env import local_username
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import clear_heartbeat, get_logger
 from magent.procs import pid_alive
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Mapping
 
     from magent.config import MagentConfig
+    from magent.nodes import Node, NodeMapEntry
 
 # The daemon's ONE name, and the only "node-sync" literal in src/ (DECISION-17,
 # DECISION-26 i; a source test pins that). The heartbeat (log.run_heartbeat /
@@ -311,3 +317,142 @@ class ConfigWatch:
                 e,
             )
         return self._config
+
+
+@dataclass(frozen=True)
+class Mark:
+    """One session's ``pull.json`` entry: the node-clock watermark and the real
+    path it was taken for (a different path is a different transcript dir)."""
+
+    since: float
+    realpath: str | None
+
+
+def _read_marks(nick: str) -> dict[str, Mark]:
+    try:
+        raw = json.loads(nodes.pull_marks_path(nick).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Mark] = {}
+    for sid, value in raw.items():
+        if not isinstance(sid, str) or not isinstance(value, dict):
+            continue
+        since, real = value.get("since"), value.get("realpath")
+        if isinstance(since, bool) or not isinstance(since, (int, float)):
+            continue
+        out[sid] = Mark(
+            since=float(since), realpath=real if isinstance(real, str) else None
+        )
+    return out
+
+
+def _spec_for(entry: NodeMapEntry, mark: Mark | None) -> remote_mux.SidPull:
+    real = mark.realpath if mark is not None else None
+    return remote_mux.SidPull(
+        roots=(entry.remote_root,),
+        project_dir=nodes.encoded_project_dir(real) if real else None,
+        since=mark.since if mark is not None else 0.0,
+    )
+
+
+def _last_line(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def _classify(e: remote_mux.RemoteError) -> tuple[str, str]:
+    detail = _last_line(e.stderr_tail) or f"rc={e.rc}"
+    if e.rc is None or e.rc == SSH_TRANSPORT_RC:
+        return UNREACHABLE, detail
+    return FAILED, detail
+
+
+def _pull_node(
+    node: Node, sids: Mapping[str, remote_mux.SidPull]
+) -> remote_mux.NodeSnapshot:
+    # PULL_TIMEOUT_S is read at call time so a test can shorten it.
+    return remote_mux.pull_node(node, sids, timeout_s=remote_mux.PULL_TIMEOUT_S)
+
+
+class NodeSyncer:
+    """One tick = one pull per pool node, in parallel. ``pull`` is the seam
+    (default: ``remote_mux.pull_node``); ``now`` is this PC's clock, which
+    stamps ``sessions.json`` and ``load.jsonl``."""
+
+    def __init__(
+        self,
+        config: MagentConfig,
+        *,
+        pull: Callable[
+            [Node, Mapping[str, remote_mux.SidPull]], remote_mux.NodeSnapshot
+        ]
+        | None = None,
+        now: Callable[[], float] = time.time,
+        local_user: str | None = None,
+        lock_wait_s: float = 0.0,
+    ) -> None:
+        self._config = config
+        self._pull = pull if pull is not None else _pull_node
+        self._now = now
+        self._local_user = local_user
+        self._lock_wait_s = lock_wait_s
+        self._warned: set[tuple[str, str]] = set()
+
+    def reconfigure(self, config: MagentConfig) -> None:
+        self._config = config
+
+    def tick(self) -> dict[str, tuple[str, str]]:
+        """Pull every pool node once; ``{nick: (outcome, detail)}``. Every
+        node is dialled -- one with no placed session still reports its
+        liveness and load. Nothing a node answers raises out of here."""
+        by_nick: dict[str, dict[str, NodeMapEntry]] = {}
+        for entry in nodes.read_node_map().values():
+            by_nick.setdefault(entry.nick, {})[entry.sid] = entry
+        user = self._local_user if self._local_user is not None else local_username()
+        pool = sorted(self._config.settings.nodes)
+        if not pool:
+            return {}
+        with ThreadPoolExecutor(
+            max_workers=min(8, len(pool)), thread_name_prefix=HEARTBEAT_NAME
+        ) as ex:
+            futures = {
+                nick: ex.submit(self._sync_node, nick, by_nick.get(nick, {}), user)
+                for nick in pool
+            }
+            return {nick: f.result() for nick, f in futures.items()}
+
+    def _sync_node(
+        self, nick: str, entries: Mapping[str, NodeMapEntry], local_user: str
+    ) -> tuple[str, str]:
+        try:
+            node = nodes.node_for_nick(self._config, nick, local_user=local_user)
+            self._pull_and_store(node, entries)
+        except remote_mux.RemoteError as e:
+            return _classify(e)
+        return OK, ""
+
+    def _warn_once(self, nick: str, sid: str) -> None:
+        if (nick, sid) in self._warned:
+            return
+        self._warned.add((nick, sid))
+        get_logger(LOG_NAME).warning(
+            "node %s: session %r cannot be mirrored on this PC; skipping it", nick, sid
+        )
+
+    def _pull_and_store(self, node: Node, entries: Mapping[str, NodeMapEntry]) -> None:
+        marks = _read_marks(node.nick)
+        specs: dict[str, remote_mux.SidPull] = {}
+        for sid, entry in sorted(entries.items()):
+            if not remote_mux.pullable_sid(sid) or not entry.remote_root:
+                self._warn_once(node.nick, sid)
+                continue
+            specs[sid] = _spec_for(entry, marks.get(sid))
+        snap = self._pull(node, specs)
+        self._store(node.nick, snap, at=self._now())
+
+    def _store(self, nick: str, snap: remote_mux.NodeSnapshot, *, at: float) -> None:
+        nodes.write_json_atomic(
+            nodes.sessions_path(nick), {"ts": at, "sessions": list(snap.sessions)}
+        )

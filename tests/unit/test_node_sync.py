@@ -34,6 +34,7 @@ from magent.env import get_env
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import get_logger, heartbeat_age, write_heartbeat
 from magent.nodes import NodeMapEntry
+from tests.unit._pull_reply import pull_meta, pull_reply
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -774,3 +775,120 @@ class TestAttentionSeesNodeSessions:
             engine_from_config(_config(projects=[ProjectConfig(path="api")])).poll()
             == []
         )
+
+
+REFUSED = "ssh: connect to host devino-second port 22: Connection refused\n"
+
+
+def _answer(
+    fake, host: str, *, meta=None, files=None, rc: int = 0, stderr: str = ""
+) -> None:
+    stdout = (
+        pull_reply(meta if meta is not None else pull_meta(), files) if rc == 0 else ""
+    )
+    fake.set_reply(host, stdout=stdout, stderr=stderr, rc=rc)
+
+
+def _forget_replies(fake) -> None:
+    (fake.base / "replies.json").unlink(missing_ok=True)
+
+
+def _payload(call) -> dict[str, object]:
+    return json.loads(call.stdin.rsplit(b"\n__MAGENT_PAYLOAD__\n", 1)[1])
+
+
+def _calls_to(fake, host: str) -> list:
+    return [c for c in fake.calls() if c.argv[-2] == f"amin@{host}"]
+
+
+class TestOneTick:
+    def test_one_tick_is_one_ssh_per_node(self, placed, fake_ssh):
+        _answer(fake_ssh, "devino-second")
+        _answer(fake_ssh, "devino-third")
+        results = node_sync.NodeSyncer(_config()).tick()
+        assert results == {"second": (node_sync.OK, ""), "third": (node_sync.OK, "")}
+        assert sorted(c.argv[-2] for c in fake_ssh.calls()) == [
+            "amin@devino-second",
+            "amin@devino-third",
+        ]
+
+    def test_a_node_with_nothing_placed_on_it_is_still_asked_for_its_load(
+        self, placed, fake_ssh
+    ):
+        nodes.write_node_map({"api": _entry("second", "api")})
+        _answer(fake_ssh, "devino-second")
+        _answer(fake_ssh, "devino-third")
+        node_sync.NodeSyncer(_config()).tick()
+        (call,) = _calls_to(fake_ssh, "devino-third")
+        assert _payload(call)["sids"] == {}
+
+    def test_the_session_list_is_mirrored_on_this_pcs_clock(self, placed, fake_ssh):
+        _answer(fake_ssh, "devino-second", meta=pull_meta(sessions=["api", "other"]))
+        _answer(fake_ssh, "devino-third")
+        node_sync.NodeSyncer(_config(), now=lambda: 777.0).tick()
+        assert nodes.read_sessions("second") == nodes.NodeSessions(
+            ts=777.0, sessions=("api", "other")
+        )
+
+    def test_each_placed_session_is_asked_for_from_the_beginning(
+        self, placed, fake_ssh
+    ):
+        _answer(fake_ssh, "devino-second")
+        _answer(fake_ssh, "devino-third")
+        node_sync.NodeSyncer(_config()).tick()
+        (call,) = _calls_to(fake_ssh, "devino-second")
+        assert _payload(call)["sids"] == {
+            "api": {"roots": ["~/magent/api"], "project_dir": None, "since": 0.0}
+        }
+
+    def test_a_mapped_session_whose_tmux_is_gone_is_still_pulled(
+        self, placed, fake_ssh
+    ):
+        """DECISION-22: a `down` whose final pull failed kills the session but
+        keeps the map entry, so a later tick fetches what is left on disk. A
+        sid missing from list-sessions is not-live, never an error."""
+        _answer(
+            fake_ssh,
+            "devino-second",
+            meta=pull_meta(sessions=[]),
+            files={"api/transcripts/abc.jsonl": "x\n"},
+        )
+        _answer(fake_ssh, "devino-third")
+        assert node_sync.NodeSyncer(_config()).tick()["second"] == (node_sync.OK, "")
+        (call,) = _calls_to(fake_ssh, "devino-second")
+        assert set(_payload(call)["sids"]) == {"api"}
+        sessions = nodes.read_sessions("second")
+        assert sessions is not None
+        assert sessions.sessions == ()
+        assert (nodes.transcripts_dir("second", "api") / "abc.jsonl").read_text() == (
+            "x\n"
+        )
+
+    def test_a_session_this_pc_cannot_store_is_skipped_with_one_warning(
+        self, placed, fake_ssh, caplog
+    ):
+        _capture_nodes_log(caplog)
+        nodes.write_node_map(
+            {"api": _entry("second", "api"), "odd": _entry("second", "CON")}
+        )
+        _answer(fake_ssh, "devino-second")
+        _answer(fake_ssh, "devino-third")
+        syncer = node_sync.NodeSyncer(_config())
+        syncer.tick()
+        syncer.tick()
+        assert all(
+            set(_payload(c)["sids"]) == {"api"}
+            for c in _calls_to(fake_ssh, "devino-second")
+        )
+        assert [
+            r.getMessage()
+            for r in caplog.records
+            if "cannot be mirrored" in r.getMessage()
+        ] == ["node second: session 'CON' cannot be mirrored on this PC; skipping it"]
+
+    def test_a_transport_failure_is_unreachable(self, placed, fake_ssh):
+        _answer(fake_ssh, "devino-second", rc=255, stderr=REFUSED)
+        _answer(fake_ssh, "devino-third")
+        results = node_sync.NodeSyncer(_config()).tick()
+        assert results["second"] == (node_sync.UNREACHABLE, REFUSED.strip())
+        assert results["third"] == (node_sync.OK, "")
