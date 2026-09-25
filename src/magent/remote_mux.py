@@ -1058,9 +1058,13 @@ def pull(
     does not hold it (``NodeSnapshot.skipped``)."""
     # Before any ssh: parse_pull refuses the same name with ValueError, which
     # would mean THIS caller's bug, not the node's.
-    if not pullable_sid(sid):
-        raise _pull_error(f"not a pullable session name: {sid!r}")
     roots = tuple(remote_dirs)
+    if not pullable_sid(sid):
+        raise refused_pull(
+            node,
+            {sid: SidPull(roots=roots, project_dir=None, since=since_epoch)},
+            f"not a pullable session name: {sid!r}",
+        )
     first = pull_node(
         node,
         {sid: SidPull(roots=roots, project_dir=None, since=since_epoch)},
