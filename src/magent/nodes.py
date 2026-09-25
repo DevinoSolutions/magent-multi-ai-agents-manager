@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import stat
 import tempfile
 import threading
 import time
@@ -1536,8 +1537,10 @@ def placement_samples(
 
 # A top-level conversation's file is named by its session id (a UUID); the
 # subagent logs beside it are ``agent-<hex>.jsonl`` and are not resumable.
+# Always ``fullmatch``: the id lands on a ``claude --resume`` line, and ``$``
+# (or ``match``) would let a trailing newline -- an Enter -- ride along.
 _SESSION_STEM = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 )
 
 
@@ -1547,18 +1550,33 @@ def latest_transcript_id(
     """The newest pulled conversation's id, or None when nothing was pulled.
 
     The file stem IS the session id (verified: every record's ``sessionId``
-    equals it). Newest by mtime -- tar keeps the node's mtimes -- and by name
-    on a tie, so the answer never depends on directory order.
+    equals it). "Newest" means most recently active ON THE NODE: tar keeps the
+    node's mtimes, so the pulled file carries them. A member stored without a
+    usable mtime gets the local pull time instead and can win -- rare, and
+    still a valid id. A tie breaks by name, so the answer never depends on
+    directory order.
+
+    Only a regular file whose stem is a whole UUID counts. Each candidate is
+    stat'ed on its own: one file vanishing mid-pull is skipped, it does not
+    blank the answer for the whole folder.
     """
     folder = transcripts_dir(nick, sid, nodes_dir=nodes_dir)
     try:
-        candidates = [p for p in folder.glob("*.jsonl") if _SESSION_STEM.match(p.stem)]
-        newest = max(
-            candidates, key=lambda p: (p.stat().st_mtime, p.name), default=None
-        )
+        paths = list(folder.glob("*.jsonl"))
     except OSError:
         return None
-    return None if newest is None else newest.stem
+    candidates: list[tuple[float, str, str]] = []
+    for path in paths:
+        if _SESSION_STEM.fullmatch(path.stem) is None:
+            continue
+        try:
+            info = path.stat()
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode):
+            candidates.append((info.st_mtime, path.name, path.stem))
+    newest = max(candidates, default=None)
+    return None if newest is None else newest[2]
 
 
 # --- what a node's repos looked like (spec §12 step 2) --------------------------
