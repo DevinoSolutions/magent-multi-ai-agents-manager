@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import dataclasses
+import io
 import json
 import math
 import os
@@ -12,20 +13,22 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 from importlib import resources
 from pathlib import Path
 
 import pytest
 
-from magent import attach_client, log, node_scripts, psmux, remote_mux
+from magent import attach_client, log, node_scripts, nodes, psmux, remote_mux
 from magent.attach_client import SSH_CONNECTION_OPTS
-from magent.nodes import LoadSample, Node
+from magent.nodes import LoadSample, Node, NodeConfigError, Recipe, RepoSpec
 from magent.remote_mux import RemoteError
 
 # By value, at import: conftest's _no_real_ssh patches the MODULE attribute, so
 # this name still holds the real resolver for the one test that proves it.
 from magent.remote_mux import find_ssh as real_find_ssh
+from magent.sessions import build_resume_command
 from tests.unit._fake_ssh import make_fake_ssh
 from tests.unit._git_repos import commit, git, make_origin_and_clone, needs_git
 
@@ -1092,3 +1095,308 @@ class TestANodeSessionIsDecoratedLikeALocalOne:
         monkeypatch.setattr(psmux, "code_on_path", lambda: False)
         fake_ssh.set_reply("bash -s", rc=255)
         assert remote_mux.decorate(NODE, "api", "second") is False
+
+
+_SENTINEL = b"\n__MAGENT_PAYLOAD__\n"
+_ROOT = "/home/amin/magent/api"
+_RESULT = {
+    "sid": "api",
+    "attached_existing": False,
+    "cwd": _ROOT,
+    "commits": {_ROOT: "0123abcd"},
+    "shipped": [".env"],
+}
+
+
+def _recipe(tmp_path: Path, **changes: object) -> Recipe:
+    root = tmp_path / "api"
+    root.mkdir(exist_ok=True)
+    # Bytes, not write_text: on Windows text mode would write CRLF, and the
+    # payload must carry a file's bytes exactly as they are on disk.
+    env = root / ".env"
+    env.write_bytes(b"SECRET=hunter2\n")
+    memory = tmp_path / "memory"
+    memory.mkdir(exist_ok=True)
+    (memory / "MEMORY.md").write_bytes(b"- remember\n")
+    base = Recipe(
+        project="api",
+        sid="api",
+        repos=(
+            RepoSpec(
+                url="git@github.com:me/api.git",
+                branch="main",
+                remote_dir="~/magent/api",
+            ),
+        ),
+        push_files=(env,),
+        memory_dir=memory,
+        remote_root="~/magent/api",
+        local_root=root,
+        tool="claude",
+        command="claude --continue",
+        fresh_command="claude",
+    )
+    return dataclasses.replace(base, **changes)
+
+
+def _members(stdin: bytes) -> dict[str, bytes]:
+    payload = stdin.split(_SENTINEL, 1)[1]
+    out: dict[str, bytes] = {}
+    with tarfile.open(fileobj=io.BytesIO(payload)) as tar:
+        for member in tar.getmembers():
+            if member.isfile():
+                handle = tar.extractfile(member)
+                assert handle is not None
+                out[member.name] = handle.read()
+    return out
+
+
+def _tokens(members: dict[str, bytes]) -> list[str]:
+    return [t.decode() for t in members["header"].split(b"\0")[:-1]]
+
+
+def _script_run(mode: str) -> str:
+    # run_script adds the socket as $1 on every call (DECISION-26 ii).
+    return _wrapped(
+        [
+            "bash",
+            "-s",
+            "--",
+            remote_mux.SOCKET,
+            mode,
+            "api",
+            _ROOT,
+            nodes.encoded_project_dir(_ROOT),
+        ]
+    )
+
+
+@pytest.fixture
+def node_home(fake_ssh, monkeypatch):
+    monkeypatch.setattr(psmux, "code_on_path", lambda: False)
+    fake_ssh.set_reply("printenv HOME", stdout="/home/amin\n")
+    return fake_ssh
+
+
+def _answers(fake, result: dict[str, object] | None = None) -> None:
+    fake.set_reply("bash -s --", stdout=json.dumps(result or _RESULT) + "\n")
+
+
+class TestOneConnectionBringsAProjectUp:
+    def test_the_node_is_asked_for_its_home_then_runs_the_script(
+        self, node_home, tmp_path
+    ):
+        _answers(node_home)
+        remote_mux.bring_up(NODE, _recipe(tmp_path))
+        first, second = node_home.calls()
+        assert first.argv[-1] == _wrapped(["printenv", "HOME"])
+        # R-D4: the folder on the node is <root>/<local folder name>.
+        assert second.argv[-1] == _script_run("up")
+        assert second.stdin.startswith(node_scripts.script("bring_up").encode())
+
+    def test_the_header_carries_repos_and_both_commands(self, node_home, tmp_path):
+        _answers(node_home)
+        remote_mux.bring_up(NODE, _recipe(tmp_path))
+        assert _tokens(_members(node_home.calls()[1].stdin)) == [
+            "MAGENT1",
+            "0",
+            "1",
+            "git@github.com:me/api.git",
+            "main",
+            _ROOT,
+            "3",
+            "bash",
+            "-lc",
+            "exec claude --continue",
+            "3",
+            "bash",
+            "-lc",
+            "exec claude",
+        ]
+
+    def test_allow_dirty_is_the_second_token(self, node_home, tmp_path):
+        _answers(node_home)
+        remote_mux.bring_up(NODE, _recipe(tmp_path), allow_dirty=True)
+        assert _tokens(_members(node_home.calls()[1].stdin))[1] == "1"
+
+    def test_a_resume_id_sends_the_resume_and_no_fresh_form(self, node_home, tmp_path):
+        _answers(node_home)
+        remote_mux.bring_up(NODE, _recipe(tmp_path), resume_id="abc")
+        tokens = _tokens(_members(node_home.calls()[1].stdin))
+        resume = build_resume_command("claude", "claude --continue", "abc")
+        assert tokens[6:] == ["3", "bash", "-lc", f"exec {resume}", "0"]
+
+    def test_no_fresh_form_is_a_zero_count(self, node_home, tmp_path):
+        _answers(node_home)
+        remote_mux.bring_up(NODE, _recipe(tmp_path, fresh_command=None))
+        assert _tokens(_members(node_home.calls()[1].stdin))[-1] == "0"
+
+    def test_secrets_and_memory_ride_stdin_never_argv(self, node_home, tmp_path):
+        _answers(node_home)
+        remote_mux.bring_up(NODE, _recipe(tmp_path))
+        call = node_home.calls()[1]
+        members = _members(call.stdin)
+        assert members["project/.env"] == b"SECRET=hunter2\n"
+        assert members["memory/MEMORY.md"] == b"- remember\n"
+        assert "hunter2" not in " ".join(call.argv)
+
+    def test_a_push_file_in_a_subfolder_ships_under_a_slash_name(
+        self, node_home, tmp_path
+    ):
+        # Never a Windows separator: `config\.env` would reach the node as ONE
+        # file name with a literal backslash in it.
+        root = tmp_path / "api"
+        (root / "config").mkdir(parents=True)
+        nested = root / "config" / ".env.local"
+        nested.write_bytes(b"K=V\n")
+        _answers(node_home)
+        remote_mux.bring_up(NODE, _recipe(tmp_path, push_files=(nested,)))
+        members = _members(node_home.calls()[1].stdin)
+        assert members["project/config/.env.local"] == b"K=V\n"
+
+    def test_the_decoration_is_the_nodes_brand(self, node_home, tmp_path):
+        _answers(node_home)
+        remote_mux.bring_up(NODE, _recipe(tmp_path))
+        members = _members(node_home.calls()[1].stdin)
+        assert members["decorate"].decode() == remote_mux.decoration_script(
+            "api", "second", False
+        )
+
+    def test_the_last_line_is_the_result(self, node_home, tmp_path):
+        node_home.set_reply(
+            "bash -s --", stdout="cloning...\n" + json.dumps(_RESULT) + "\n"
+        )
+        assert remote_mux.bring_up(NODE, _recipe(tmp_path)) == remote_mux.BringUpResult(
+            sid="api",
+            attached_existing=False,
+            commits={_ROOT: "0123abcd"},
+            cwd=_ROOT,
+            shipped=(".env",),
+        )
+
+    def test_an_attach_to_a_live_session_is_reported(self, node_home, tmp_path):
+        _answers(node_home, {**_RESULT, "attached_existing": True})
+        assert remote_mux.bring_up(NODE, _recipe(tmp_path)).attached_existing is True
+
+    def test_a_home_that_is_not_absolute_stops_before_the_script(
+        self, fake_ssh, tmp_path
+    ):
+        fake_ssh.set_reply("printenv HOME", stdout="\n")
+        with pytest.raises(RemoteError, match="HOME"):
+            remote_mux.bring_up(NODE, _recipe(tmp_path))
+        assert len(fake_ssh.calls()) == 1
+
+    def test_a_script_refusal_carries_its_exit_code_and_message(
+        self, node_home, tmp_path
+    ):
+        node_home.set_reply(
+            "bash -s --",
+            stderr=(
+                "magent: ~/magent/api has uncommitted changes on the node; "
+                "pass --allow-dirty"
+            ),
+            rc=3,
+        )
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(NODE, _recipe(tmp_path))
+        assert info.value.rc == 3
+        assert "--allow-dirty" in info.value.stderr_tail
+
+    def test_output_that_is_not_a_result_is_a_remote_error(self, node_home, tmp_path):
+        node_home.set_reply("bash -s --", stdout="hello\n")
+        with pytest.raises(RemoteError, match="not a bring-up result"):
+            remote_mux.bring_up(NODE, _recipe(tmp_path))
+
+    def test_a_nul_in_a_command_is_refused(self, node_home, tmp_path):
+        with pytest.raises(ValueError, match="NUL"):
+            remote_mux.bring_up(NODE, _recipe(tmp_path, command="claude\0x"))
+
+    def test_push_files_without_a_local_root_is_refused(self, node_home, tmp_path):
+        with pytest.raises(ValueError, match="local_root"):
+            remote_mux.bring_up(NODE, _recipe(tmp_path, local_root=None))
+
+
+class TestTheBringUpStaysInsideItsFolders:
+    """B's review forward corrections: the push copy is contained on the PC
+    side, and the node root is validated where it first enters a remote
+    command."""
+
+    def test_a_push_file_outside_the_project_is_refused(self, node_home, tmp_path):
+        outside = tmp_path / "outside.txt"
+        outside.write_text("not yours\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="outside"):
+            remote_mux.bring_up(NODE, _recipe(tmp_path, push_files=(outside,)))
+        # The home probe only; the script never ran.
+        assert len(node_home.calls()) == 1
+
+    def test_a_symlink_that_leaves_the_project_is_refused(self, node_home, tmp_path):
+        # A string check on the config entry cannot see this: the link sits
+        # inside the project and points anywhere.
+        recipe = _recipe(tmp_path)
+        assert recipe.local_root is not None
+        target = tmp_path / "id_ed25519"
+        target.write_text("PRIVATE KEY\n", encoding="utf-8")
+        link = recipe.local_root / "linked.env"
+        try:
+            link.symlink_to(target)
+        except OSError:
+            pytest.skip("this account cannot create symlinks")
+        with pytest.raises(ValueError, match="outside"):
+            remote_mux.bring_up(NODE, dataclasses.replace(recipe, push_files=(link,)))
+        assert len(node_home.calls()) == 1
+
+    @pytest.mark.parametrize(
+        ("rel", "name"),
+        [
+            (".env", ".env"),
+            ("config\\.env", "config/.env"),
+            ("config/sub/.env", "config/sub/.env"),
+        ],
+    )
+    def test_an_archive_name_uses_forward_slashes_only(self, rel, name):
+        assert remote_mux._archive_name(rel) == name
+
+    @pytest.mark.parametrize(
+        "rel", ["..\\x", "a\\..\\..\\x", "../x", "/etc/passwd", "", "a//b", "./x"]
+    )
+    def test_an_archive_name_that_can_climb_is_refused(self, rel):
+        # A POSIX file name may carry a literal backslash; once mapped to '/',
+        # `a\..\..\x` would climb out of the project on the node.
+        with pytest.raises(ValueError):
+            remote_mux._archive_name(rel)
+
+    @pytest.mark.parametrize("root", ["magent/api", "-oProxyCommand=x/api"])
+    def test_a_node_root_that_is_not_absolute_is_refused_before_the_script(
+        self, node_home, tmp_path, root
+    ):
+        with pytest.raises(NodeConfigError, match="absolute"):
+            remote_mux.bring_up(NODE, _recipe(tmp_path, remote_root=root))
+        assert len(node_home.calls()) == 1
+
+    def test_a_repo_folder_that_is_not_absolute_is_refused(self, node_home, tmp_path):
+        repo = RepoSpec(
+            url="git@github.com:me/api.git", branch="main", remote_dir="api"
+        )
+        with pytest.raises(NodeConfigError, match="absolute"):
+            remote_mux.bring_up(NODE, _recipe(tmp_path, repos=(repo,)))
+        assert len(node_home.calls()) == 1
+
+    def test_push_mode_validates_the_root_too(self, node_home, tmp_path):
+        with pytest.raises(NodeConfigError, match="absolute"):
+            remote_mux.push_files(NODE, _recipe(tmp_path, remote_root="-rf"))
+        assert len(node_home.calls()) == 1
+
+
+class TestPushingFilesToARunningProject:
+    def test_push_mode_ships_the_files_and_no_memory(self, node_home, tmp_path):
+        _answers(node_home, {**_RESULT, "shipped": [".env"]})
+        assert remote_mux.push_files(NODE, _recipe(tmp_path)) == [".env"]
+        call = node_home.calls()[1]
+        assert call.argv[-1] == _script_run("push")
+        members = _members(call.stdin)
+        assert "project/.env" in members
+        assert not any(name.startswith("memory/") for name in members)
+
+    def test_a_push_result_without_a_list_ships_nothing(self, node_home, tmp_path):
+        _answers(node_home, {"sid": "api"})
+        assert remote_mux.push_files(NODE, _recipe(tmp_path)) == []

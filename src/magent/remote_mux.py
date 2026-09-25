@@ -14,30 +14,42 @@ local git reads a bring-up needs. Every function returns data or raises
 - ``BatchMode=yes`` everywhere: a password prompt nobody can answer is a hang.
 
 A leaf: never imports ``magent.cli`` (LS-A-001); its magent imports are the
-leaves ``attach_client``, ``log``, ``node_scripts`` and ``nodes``.
+leaves ``attach_client``, ``log``, ``node_scripts``, ``nodes``, ``psmux`` and
+``sessions``.
 """
 
 from __future__ import annotations
 
 import contextlib
 import functools
+import io
 import json
 import math
+import os
 import shlex
 import shutil
 import subprocess
+import tarfile
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from magent import node_scripts, psmux
 from magent.attach_client import SSH_MISSING_RC, TMUX_SOCKET
 from magent.log import get_logger
-from magent.nodes import LoadSample, LocalGitState
+from magent.nodes import (
+    LoadSample,
+    LocalGitState,
+    NodeConfigError,
+    absolute_remote,
+    encoded_project_dir,
+)
+from magent.sessions import build_resume_command
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from pathlib import Path
 
-    from magent.nodes import Node
+    from magent.nodes import Node, Recipe
 
 # tmux, not psmux: nodes are Linux. One server per node user (`-L magent`,
 # D10). The name has one owner, attach_client, whose pane attaches to it; this
@@ -629,3 +641,224 @@ def git_state(path: Path) -> LocalGitState:
         detached=detached,
         ignored=ignored_paths(path, timeout_s=PROBE_TIMEOUT_S, label="git state read"),
     )
+
+
+@dataclass(frozen=True)
+class BringUpResult:
+    """What ``bring_up.sh`` reported. ``cwd`` is the node's ABSOLUTE project
+    folder (``Recipe.remote_root`` keeps ``~``); ``commits`` maps each repo's
+    absolute folder to the commit it now has checked out; ``shipped`` lists the
+    project-relative files written beside the clone."""
+
+    sid: str
+    attached_existing: bool
+    commits: dict[str, str] = field(default_factory=dict)
+    cwd: str = ""
+    shipped: tuple[str, ...] = ()
+
+
+# bring_up.sh's header format version; the script refuses anything else.
+_HEADER_MAGIC = "MAGENT1"
+
+
+def _node_path(path: str, home: str) -> str:
+    """``path`` expanded against the node's ``home`` and checked where it
+    first enters a remote command: an absolute POSIX path, so it can neither
+    be read relative to wherever the script happens to run nor start with
+    ``-`` and be taken for an option. The EXPANDED value is what is checked
+    -- the default root ``~/magent`` is only absolute after expansion.
+    NodeConfigError (a ValueError): the path comes from
+    ``settings.nodes.<n>.root``."""
+    expanded = absolute_remote(path, home)
+    if not expanded.startswith("/"):
+        raise NodeConfigError(
+            f"node folder {expanded!r} is not an absolute path on the node"
+        )
+    return expanded
+
+
+def _login_argv(cmd: str) -> list[str]:
+    """``cmd`` run by the node user's LOGIN bash (so ~/.profile's PATH, where
+    ``claude`` is usually installed, applies) and exec'd, so the agent IS the
+    pane's process. Empty for no command."""
+    return ["bash", "-lc", f"exec {cmd}"] if cmd else []
+
+
+def _start_argvs(recipe: Recipe, resume_id: str | None) -> tuple[list[str], list[str]]:
+    """``(start, fresh)``: the argv to run, and the one to run instead when the
+    node has no transcript for this folder. An explicit resume has no fresh
+    alternative -- the user named a session."""
+    if resume_id:
+        resume = build_resume_command(recipe.tool, recipe.command, resume_id)
+        return _login_argv(resume), []
+    return _login_argv(recipe.command), _login_argv(recipe.fresh_command or "")
+
+
+def _header(
+    recipe: Recipe, *, allow_dirty: bool, home: str, resume_id: str | None
+) -> bytes:
+    """The payload's ``header`` member: NUL-terminated tokens, read by
+    bring_up.sh with ``read -d ''``. A NUL is the one byte a token cannot
+    carry, so one is refused rather than silently splitting a token."""
+    start, fresh = _start_argvs(recipe, resume_id)
+    tokens = [_HEADER_MAGIC, "1" if allow_dirty else "0", str(len(recipe.repos))]
+    for repo in recipe.repos:
+        tokens += [repo.url, repo.branch, _node_path(repo.remote_dir, home)]
+    tokens += [str(len(start)), *start, str(len(fresh)), *fresh]
+    if any("\0" in token for token in tokens):
+        raise ValueError("a bring-up header token contains a NUL byte")
+    return b"".join(token.encode("utf-8") + b"\0" for token in tokens)
+
+
+def _archive_name(rel: str) -> str:
+    """``rel`` as a payload member name: ``/``-separated whatever the local
+    separator, so a Windows ``config\\.env`` never reaches the node as one
+    file name with a literal backslash in it. Mapping ``\\`` is also what
+    makes a POSIX file literally named ``a\\..\\..\\x`` climb, so the mapped
+    name is refused (ValueError) when it is absolute or has an empty, ``.``
+    or ``..`` segment."""
+    name = rel.replace("\\", "/")
+    if any(part in ("", ".", "..") for part in name.split("/")):
+        raise ValueError(f"{rel!r} cannot name a file inside the project")
+    return name
+
+
+def _push_name(path: Path, local_root: Path) -> str:
+    """The member name of push file ``path``: its place relative to
+    ``local_root``, lexically -- a link keeps the name it has here. ValueError
+    when ``path`` RESOLVES outside ``local_root``: B's config check on the
+    entry is a string check, and a symlink inside the project can point at
+    ``~/.ssh``."""
+    real, real_root = Path(os.path.realpath(path)), Path(os.path.realpath(local_root))
+    if real == real_root or not real.is_relative_to(real_root):
+        raise ValueError(f"push file {path} resolves outside the project {local_root}")
+    try:
+        rel = path.relative_to(local_root)
+    except ValueError as e:
+        raise ValueError(f"push file {path} is outside the project {local_root}") from e
+    return _archive_name(str(rel))
+
+
+def _add_bytes(tar: tarfile.TarFile, name: str, data: bytes) -> None:
+    info = tarfile.TarInfo(name)
+    info.size = len(data)
+    info.mode = 0o600
+    info.mtime = 0
+    tar.addfile(info, io.BytesIO(data))
+
+
+def _payload(recipe: Recipe, *, header: bytes, decorate: str, memory: bool) -> bytes:
+    """ONE uncompressed PAX tar: ``header``, ``decorate``, ``project/<rel>``
+    (the push set, relative to the local project root) and, for a bring-up,
+    ``memory/<rel>``. Bytes stay bytes -- a secret file is never re-encoded.
+    Every name is checked before a byte is read."""
+    if recipe.push_files and recipe.local_root is None:
+        raise ValueError("a recipe with push files needs its local_root")
+    root = recipe.local_root
+    pushed = (
+        [(_push_name(p, root), p) for p in recipe.push_files]
+        if root is not None
+        else []
+    )
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        _add_bytes(tar, "header", header)
+        _add_bytes(tar, "decorate", decorate.encode("utf-8"))
+        for name, path in pushed:
+            _add_bytes(tar, f"project/{name}", path.read_bytes())
+        if memory and recipe.memory_dir is not None:
+            for path in sorted(recipe.memory_dir.rglob("*")):
+                if path.is_file():
+                    rel = _archive_name(str(path.relative_to(recipe.memory_dir)))
+                    _add_bytes(tar, f"memory/{rel}", path.read_bytes())
+    return buf.getvalue()
+
+
+def _remote_home(node: Node) -> str:
+    """The node user's ``$HOME``. The PC expands ``~`` itself and computes the
+    Claude project name from the absolute path, so it must be absolute."""
+    result = run(node, ["printenv", "HOME"], timeout_s=PROBE_TIMEOUT_S)
+    home = result.stdout.decode("utf-8", "replace").strip()
+    if not home.startswith("/"):
+        raise RemoteError(
+            result.returncode,
+            f"unusable $HOME on the node: {home!r}",
+            ("printenv", "HOME"),
+        )
+    return home
+
+
+def _parse_result(
+    result: subprocess.CompletedProcess[bytes], shown: tuple[str, ...]
+) -> dict[str, object]:
+    """bring_up.sh's last non-empty stdout line, a JSON object. Anything else
+    is a RemoteError: a result that cannot be read is not a success."""
+    text = result.stdout.decode("utf-8", "replace")
+    lines = [line for line in text.splitlines() if line.strip()]
+    try:
+        parsed = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        parsed = None
+    if not isinstance(parsed, dict):
+        raise RemoteError(result.returncode, "not a bring-up result", shown)
+    return parsed
+
+
+def _deliver(
+    node: Node, mode: str, recipe: Recipe, root: str, payload: bytes
+) -> dict[str, object]:
+    args = [mode, recipe.sid, root, encoded_project_dir(root)]
+    result = run_script(
+        node, "bring_up", args, timeout_s=BRING_UP_TIMEOUT_S, stdin=payload
+    )
+    return _parse_result(result, ("bring_up", *args))
+
+
+def bring_up(
+    node: Node,
+    recipe: Recipe,
+    *,
+    allow_dirty: bool = False,
+    resume_id: str | None = None,
+) -> BringUpResult:
+    """Bring ``recipe`` up on ``node`` in one script run (after a ``$HOME``
+    probe): clone or fast-forward every repo, ship the push set and seed the
+    memory, then start the agent in tmux session ``recipe.sid`` -- or, when it
+    is already running there, attach to it and touch nothing but its
+    decoration. Raises RemoteError (bring_up.sh exit codes: 2 bad input, 3 a
+    dirty node tree without ``allow_dirty``, 4 tmux, 5 git or a write);
+    ValueError for a recipe that cannot be framed (NodeConfigError for a node
+    folder that is not absolute); OSError for a push file that cannot be
+    read."""
+    home = _remote_home(node)
+    root = _node_path(recipe.remote_root, home)
+    header = _header(recipe, allow_dirty=allow_dirty, home=home, resume_id=resume_id)
+    decorate_text = decoration_script(recipe.sid, node.nick, psmux.code_on_path())
+    payload = _payload(recipe, header=header, decorate=decorate_text, memory=True)
+    raw = _deliver(node, "up", recipe, root, payload)
+    commits, cwd, shipped = raw.get("commits"), raw.get("cwd"), raw.get("shipped")
+    return BringUpResult(
+        sid=recipe.sid,
+        attached_existing=raw.get("attached_existing") is True,
+        commits=(
+            {str(k): str(v) for k, v in commits.items()}
+            if isinstance(commits, dict)
+            else {}
+        ),
+        cwd=cwd if isinstance(cwd, str) and cwd else root,
+        shipped=tuple(str(s) for s in shipped) if isinstance(shipped, list) else (),
+    )
+
+
+def push_files(node: Node, recipe: Recipe) -> list[str]:
+    """Re-ship ``recipe``'s push set into its EXISTING folder on ``node`` (no
+    git, no session, no memory). Returns the project-relative paths written.
+    Raises RemoteError -- exit 5 when the folder is not there yet -- and the
+    same ValueError/OSError refusals as ``bring_up``."""
+    home = _remote_home(node)
+    root = _node_path(recipe.remote_root, home)
+    header = _header(recipe, allow_dirty=True, home=home, resume_id=None)
+    payload = _payload(recipe, header=header, decorate="", memory=False)
+    raw = _deliver(node, "push", recipe, root, payload)
+    shipped = raw.get("shipped")
+    return [str(s) for s in shipped] if isinstance(shipped, list) else []
