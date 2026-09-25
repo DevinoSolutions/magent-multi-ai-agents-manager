@@ -72,7 +72,7 @@ FAILED = "failed"  # the node answered, and the answer was not a pull
 MISCONFIGURED = "misconfigured"  # the nick does not resolve (D4, no user)
 LOCKED = "locked"  # another pull holds this node right now
 # The UNREACHABLE detail for a node whose pull outlived the tick's wait.
-PULL_STILL_RUNNING = "previous pull still running"
+PULL_STILL_RUNNING = "pull still running"
 
 
 def daemon_running() -> bool:
@@ -201,13 +201,17 @@ def tick_interval_s(config: MagentConfig) -> float:
 
 
 def tick_wait_s(config: MagentConfig) -> float:
-    """How long the daemon's tick waits for its pulls: half a tick interval.
+    """How long the daemon's tick waits for its pulls: half a tick interval
+    (T/2), so a tick always ends before the next one is due.
 
-    A pull still running after that is reported UNREACHABLE
-    (``PULL_STILL_RUNNING``) and its node is not dialled again until it ends;
-    every other node keeps its cadence. Two of a healthy node's pulls are then
-    at most 1.5 tick intervals apart, inside ``nodes.sessions_stale``'s two
-    pull intervals (a tick interval is never longer than a pull interval)."""
+    The loop starts ticks on a fixed cadence, T apart. A node whose pull takes
+    d < T is dialled on every tick (a pull still running at the end of the
+    wait is collected by the next tick, before that tick dials again), so
+    two of its ``sessions.json`` stamps are at most T + d < 2T apart. T is
+    never longer than a pull interval, so that is inside
+    ``nodes.sessions_stale``'s two pull intervals: one hung node never makes
+    another read stale. The hung node itself reads UNREACHABLE ("pull still
+    running after Ns") and is not dialled again until its pull ends."""
     return tick_interval_s(config) / 2
 
 
@@ -467,12 +471,14 @@ class NodeSyncer:
         ]
         | None = None,
         now: Callable[[], float] = time.time,
+        clock: Callable[[], float] = time.monotonic,
         local_user: str | None = None,
         lock_wait_s: float = 0.0,
     ) -> None:
         self._config = config
         self._pull = pull if pull is not None else _pull_node
         self._now = now
+        self._clock = clock
         self._local_user = local_user
         self._lock_wait_s = lock_wait_s
         self._warned: set[tuple[str, str]] = set()
@@ -483,6 +489,8 @@ class NodeSyncer:
         self._executor: ThreadPoolExecutor | None = None
         self._workers = 0
         self._inflight: dict[str, Future[tuple[str, str]]] = {}
+        # When each in-flight pull was submitted, on ``clock`` (monotonic).
+        self._submitted: dict[str, float] = {}
 
     def reconfigure(self, config: MagentConfig) -> None:
         self._config = config
@@ -494,11 +502,15 @@ class NodeSyncer:
             self._executor.shutdown(wait=False, cancel_futures=True)
             self._executor = None
         self._inflight.clear()
+        self._submitted.clear()
 
     def _pool(self, size: int) -> ThreadPoolExecutor:
         """The pool, rebuilt when a new pool size changes its worker count. The
         old one is shut down without waiting or cancelling: its running pulls
-        finish and are still collected through ``_inflight``."""
+        finish and are still collected through ``_inflight``.
+
+        Capped at 8 workers: with more than 8 nodes hung at once, the healthy
+        nodes' pulls queue behind them until a hung pull times out."""
         workers = min(8, size)
         if self._executor is None or workers != self._workers:
             if self._executor is not None:
@@ -516,8 +528,15 @@ class NodeSyncer:
 
         ``wait_s`` bounds how long the tick waits for its pulls (None: until
         each has ended). A node whose pull is still running then reads
-        UNREACHABLE (``PULL_STILL_RUNNING``) and is not dialled again until
-        that pull ends; its result is collected by the first tick after."""
+        UNREACHABLE ("pull still running after Ns") and is not dialled again
+        until that pull ends; its result is collected by the first tick after.
+        Until the pull is older than ``nodes.sessions_stale``'s threshold (two
+        pull intervals) it is slow, not down, and -- like LOCKED -- no news:
+        nothing is logged for it.
+
+        A node that leaves the pool keeps its running pull until that pull
+        ends. Its outcome is then dropped, but an exception it raised still
+        propagates, as any laggard's does."""
         by_nick: dict[str, dict[str, NodeMapEntry]] = {}
         for entry in nodes.read_node_map().values():
             by_nick.setdefault(entry.nick, {})[entry.sid] = entry
@@ -526,8 +545,11 @@ class NodeSyncer:
         # two pools into one tick's submissions and results.
         config = self._config
         pool = sorted(config.settings.nodes)
+        stale_after = 2 * config.settings.node_sync.pull_interval_s
         for gone in set(self._inflight) - set(pool):
-            del self._inflight[gone]
+            if self._inflight[gone].done():
+                self._submitted.pop(gone, None)
+                self._inflight.pop(gone).result()
         # A node that left the pool is forgotten, so one re-added while still
         # down is warned about again rather than read as the old state.
         for gone in set(self._last) - set(pool):
@@ -539,23 +561,30 @@ class NodeSyncer:
             prev = self._inflight.get(nick)
             if prev is not None and not prev.done():
                 continue
-            if prev is not None and not prev.cancelled():
+            if prev is not None:
                 # A laggard that ended between ticks: its outcome is news.
                 self._note(nick, *prev.result())
             self._inflight[nick] = ex.submit(
                 self._sync_node, nick, by_nick.get(nick, {}), user, config
             )
+            self._submitted[nick] = self._clock()
         wait([self._inflight[nick] for nick in pool], timeout=wait_s)
         results: dict[str, tuple[str, str]] = {}
+        slow: set[str] = set()
         for nick in pool:
             future = self._inflight[nick]
             if not future.done():
-                results[nick] = (UNREACHABLE, PULL_STILL_RUNNING)
+                age = self._clock() - self._submitted[nick]
+                results[nick] = (UNREACHABLE, f"{PULL_STILL_RUNNING} after {age:.0f}s")
+                if age <= stale_after:
+                    slow.add(nick)
                 continue
             del self._inflight[nick]
+            self._submitted.pop(nick, None)
             results[nick] = future.result()
         for nick, (outcome, detail) in results.items():
-            self._note(nick, outcome, detail)
+            if nick not in slow:
+                self._note(nick, outcome, detail)
         return results
 
     def _sync_node(
@@ -674,6 +703,7 @@ def run_sync_loop(
     *,
     max_ticks: int | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
     reload: Callable[[], MagentConfig | None] | None = None,
     pull: Callable[[Node, Mapping[str, remote_mux.SidPull]], remote_mux.NodeSnapshot]
     | None = None,
@@ -704,17 +734,20 @@ def run_sync_loop(
             target=run_heartbeat, args=(HEARTBEAT_NAME, stop_hb), daemon=True
         )
         hb_thread.start()
-        syncer = NodeSyncer(config, pull=pull)
+        syncer = NodeSyncer(config, pull=pull, clock=clock)
         ticks = 0
         clean = False
         log.info("node sync: starting (%d node(s))", len(config.settings.nodes))
         try:
             while wanted(config):
+                started = clock()
                 syncer.tick(wait_s=tick_wait_s(config))
                 ticks += 1
                 if max_ticks is not None and ticks >= max_ticks:
                     break
-                sleep(tick_interval_s(config))
+                # A fixed cadence: ticks START one interval apart, however
+                # long each one took (tick_wait_s's bound relies on it).
+                sleep(max(0.0, tick_interval_s(config) - (clock() - started)))
                 if reload is not None:
                     fresh = reload()
                     if fresh is not None:

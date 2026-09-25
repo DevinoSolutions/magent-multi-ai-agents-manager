@@ -1299,6 +1299,44 @@ class TestTheLoop:
         )
         assert len(seen) == 4
 
+    def test_the_loop_keeps_a_fixed_cadence(self, placed):
+        """The sleep is what is left of the tick interval after the tick, so a
+        slow tick does not push every later one back."""
+        clock = [0.0]
+        slept: list[float] = []
+
+        def pull(node, _sids):
+            if node.nick == "second":
+                clock[0] += 12.0
+            return _snapshot()
+
+        node_sync.run_sync_loop(
+            _config(pull_interval_s=30, sample_interval_s=60),
+            max_ticks=2,
+            sleep=slept.append,
+            clock=lambda: clock[0],
+            pull=pull,
+        )
+        assert slept == [18.0]
+
+    def test_a_tick_longer_than_the_interval_does_not_sleep(self, placed):
+        clock = [0.0]
+        slept: list[float] = []
+
+        def pull(node, _sids):
+            if node.nick == "second":
+                clock[0] += 45.0
+            return _snapshot()
+
+        node_sync.run_sync_loop(
+            _config(pull_interval_s=30, sample_interval_s=60),
+            max_ticks=2,
+            sleep=slept.append,
+            clock=lambda: clock[0],
+            pull=pull,
+        )
+        assert slept == [0.0]
+
     def test_one_tick_refuses_while_the_daemon_holds_the_lock(self, placed):
         with exclusive_lock(node_sync.LOCK_NAME), pytest.raises(LockHeld):
             node_sync.run_once(_config(), pull=_recording_pull([]))
@@ -1354,6 +1392,26 @@ def _drain(executors: list[_RecordingExecutor]) -> None:
         ThreadPoolExecutor.shutdown(e, wait=True)
 
 
+class _Clock:
+    """The syncer's monotonic clock, set by hand."""
+
+    def __init__(self) -> None:
+        self.at = 0.0
+
+    def __call__(self) -> float:
+        return self.at
+
+
+def _running(age: int) -> tuple[str, str]:
+    return (node_sync.UNREACHABLE, f"{node_sync.PULL_STILL_RUNNING} after {age}s")
+
+
+def _reachable_again(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records if "reachable again" in r.getMessage()
+    ]
+
+
 class TestAHungNodeDoesNotHoldTheTick:
     """One hung node used to hold every tick for up to PULL_TIMEOUT_S, so every
     healthy node's sessions.json aged past sessions_stale's two pull intervals.
@@ -1364,30 +1422,41 @@ class TestAHungNodeDoesNotHoldTheTick:
     ):
         release = threading.Event()
         dialled: list[str] = []
-        syncer = node_sync.NodeSyncer(_config(), pull=_blocking_pull(release, dialled))
+        clock = _Clock()
+        syncer = node_sync.NodeSyncer(
+            _config(), pull=_blocking_pull(release, dialled), clock=clock
+        )
         try:
             started = time.monotonic()
             first = syncer.tick(wait_s=0.2)
+            clock.at = 7.0
             second = syncer.tick(wait_s=0.2)
             elapsed = time.monotonic() - started
         finally:
             release.set()
             syncer.close()
             _drain(executors)
-        running = (node_sync.UNREACHABLE, node_sync.PULL_STILL_RUNNING)
-        assert first == second == {"second": running, "third": (node_sync.OK, "")}
+        ok = (node_sync.OK, "")
+        assert first == {"second": _running(0), "third": ok}
+        assert second == {"second": _running(7), "third": ok}
         assert elapsed < 10
         # The laggard is not dialled again while its pull is still running.
         assert sorted(dialled) == ["second", "third", "third"]
 
-    def test_the_laggard_reads_ok_on_the_tick_after_it_finishes(
+    def test_a_slow_pull_inside_the_stale_threshold_is_no_news(
         self, placed, caplog, executors
     ):
+        """sessions.json only reads stale past two pull intervals; a pull that
+        is merely slow until then logs nothing, either way."""
         _capture_nodes_log(caplog)
         release = threading.Event()
-        syncer = node_sync.NodeSyncer(_config(), pull=_blocking_pull(release, []))
+        clock = _Clock()
+        syncer = node_sync.NodeSyncer(
+            _config(pull_interval_s=30), pull=_blocking_pull(release, []), clock=clock
+        )
         try:
             syncer.tick(wait_s=0.2)
+            clock.at = 60.0  # == 2 * pull_interval_s: not yet past it
             syncer.tick(wait_s=0.2)
             release.set()
             after = syncer.tick(wait_s=10)
@@ -1396,14 +1465,124 @@ class TestAHungNodeDoesNotHoldTheTick:
             syncer.close()
             _drain(executors)
         assert after == {"second": (node_sync.OK, ""), "third": (node_sync.OK, "")}
+        assert _node_warnings(caplog, "second") == []
+        assert _reachable_again(caplog) == []
+
+    def test_a_pull_past_the_stale_threshold_warns_once_and_recovers_once(
+        self, placed, caplog, executors
+    ):
+        _capture_nodes_log(caplog)
+        release = threading.Event()
+        clock = _Clock()
+        syncer = node_sync.NodeSyncer(
+            _config(pull_interval_s=30), pull=_blocking_pull(release, []), clock=clock
+        )
+        try:
+            syncer.tick(wait_s=0.2)
+            clock.at = 61.0
+            syncer.tick(wait_s=0.2)
+            clock.at = 300.0
+            syncer.tick(wait_s=0.2)
+            release.set()
+            after = syncer.tick(wait_s=10)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+        assert after["second"] == (node_sync.OK, "")
         assert _node_warnings(caplog, "second") == [
-            "node second: unreachable (previous pull still running)"
+            "node second: unreachable (pull still running after 61s)"
         ]
-        assert [
-            r.getMessage()
-            for r in caplog.records
-            if "reachable again" in r.getMessage()
-        ] == ["node second: reachable again"]
+        assert _reachable_again(caplog) == ["node second: reachable again"]
+
+    def test_a_laggard_that_ends_failed_is_logged_then_recovers(
+        self, placed, caplog, executors
+    ):
+        """The laggard's own outcome is news once it ends: FAILED logs its
+        reason, and the next OK logs the recovery -- whichever tick collects
+        it (the one after the release, or the one after that)."""
+        _capture_nodes_log(caplog)
+        release = threading.Event()
+        calls: list[str] = []
+
+        def pull(node, _sids):
+            calls.append(node.nick)
+            if node.nick == "second" and calls.count("second") == 1:
+                assert release.wait(30), "the test never released the hung pull"
+                raise remote_mux.RemoteError(1, "pull.sh: broke\n", ("ssh",))
+            return _snapshot()
+
+        syncer = node_sync.NodeSyncer(_config(), pull=pull, clock=_Clock())
+        try:
+            syncer.tick(wait_s=0.2)
+            release.set()
+            syncer.tick(wait_s=10)
+            syncer.tick(wait_s=10)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+        assert _node_warnings(caplog, "second") == [
+            "node second: failed (pull.sh: broke)"
+        ]
+        assert _reachable_again(caplog) == ["node second: reachable again"]
+
+    def test_a_node_readded_while_its_old_pull_runs_is_not_dialled_twice(
+        self, placed, executors
+    ):
+        """A removed node's pull is kept until it ends, so re-adding the node
+        finds it instead of starting a second pull beside it."""
+        release = threading.Event()
+        dialled: list[str] = []
+        syncer = node_sync.NodeSyncer(
+            _config(), pull=_blocking_pull(release, dialled), clock=_Clock()
+        )
+        third_only = _config(
+            pool={"third": POOL["third"]},
+            projects=[ProjectConfig(path="web", node="third")],
+        )
+        try:
+            syncer.tick(wait_s=0.2)
+            syncer.reconfigure(third_only)
+            syncer.tick(wait_s=0.2)
+            syncer.reconfigure(_config())
+            back = syncer.tick(wait_s=0.2)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+        assert back["second"] == _running(0)
+        assert dialled.count("second") == 1
+
+    def test_a_removed_nodes_pull_that_raises_still_surfaces(self, placed, executors):
+        """No outcome is reported for a node that left the pool, but a bug in
+        its pull is not swallowed: a later tick re-raises it."""
+        release = threading.Event()
+
+        def pull(node, _sids):
+            if node.nick == "second":
+                assert release.wait(30), "the test never released the hung pull"
+                raise ValueError("orphan")
+            return _snapshot()
+
+        syncer = node_sync.NodeSyncer(_config(), pull=pull, clock=_Clock())
+        third_only = _config(
+            pool={"third": POOL["third"]},
+            projects=[ProjectConfig(path="web", node="third")],
+        )
+        try:
+            syncer.tick(wait_s=0.2)
+            syncer.reconfigure(third_only)
+            release.set()
+            deadline = time.monotonic() + 10
+            with pytest.raises(ValueError, match="orphan"):
+                while time.monotonic() < deadline:
+                    syncer.tick(wait_s=0.05)
+                    time.sleep(0.05)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
 
     def test_a_laggard_stores_under_the_config_its_tick_started_with(
         self, placed, executors
@@ -1466,7 +1645,8 @@ class TestAHungNodeDoesNotHoldTheTick:
             release.set()
             syncer.close()
             _drain(executors)
-        assert first["second"] == (node_sync.UNREACHABLE, node_sync.PULL_STILL_RUNNING)
+        assert first["second"][0] == node_sync.UNREACHABLE
+        assert first["second"][1].startswith(node_sync.PULL_STILL_RUNNING)
 
     def test_a_smaller_pool_gets_a_new_executor(self, placed, executors):
         syncer = node_sync.NodeSyncer(_config(), pull=_recording_pull([]))
