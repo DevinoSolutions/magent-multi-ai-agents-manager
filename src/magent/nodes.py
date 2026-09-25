@@ -22,7 +22,9 @@ from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
 from magent.config import NODE_AUTO, NODE_CLOUD
+from magent.psmux import session_name
 from magent.sessions.claude import encode_claude_project_path
+from magent.titles import get_leaf_name
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -505,3 +507,66 @@ def push_warnings(
     the project, a directory, or a credential store. Warnings, never errors
     (spec §8)."""
     return tuple(_classify_extras(project_dir, extras, home=home)[1])
+
+
+def _resolved(path: Path) -> Path:
+    """``path`` resolved, or a NodeConfigError naming it: a recipe cannot place
+    a repo it cannot locate."""
+    try:
+        return path.resolve()
+    # RuntimeError: a symlink loop before Python 3.13; OSError from 3.13 on.
+    except (OSError, RuntimeError) as exc:
+        raise NodeConfigError(f"{path}: cannot be resolved ({exc})") from exc
+
+
+def recipe_for(
+    proj: ProjectConfig,
+    node: Node,
+    states: Sequence[LocalGitState],
+    *,
+    home: Path,
+    project_dir: Path,
+) -> Recipe:
+    """Everything a bring-up of ``proj`` on ``node`` needs (spec §7c).
+
+    ``project_dir`` is the resolved LOCAL project directory (a config path may
+    be baseDir-relative, so the caller resolves it). The node mirrors its NAME,
+    not its path: a repo project lands at ``<root>/<name>``, a workspace's
+    child repos at ``<root>/<name>/<child>``. Remote paths keep the root's
+    ``~`` unexpanded -- the node's shell owns that expansion, and bring_up.sh
+    reports the absolute paths back. The sid is ``psmux.session_name`` of the
+    same label every local session uses, so a node session and its window
+    share one name. Repo placement is judged on RESOLVED paths, like
+    ``push_set``: a project configured as a junction/symlink to its repo is
+    still that repo; a path that will not resolve is a NodeConfigError."""
+    project = proj.title or get_leaf_name(proj.path)
+    remote_root = f"{node.root.rstrip('/')}/{project_dir.name}"
+    root = _resolved(project_dir)
+    repos: list[RepoSpec] = []
+    for state in states:
+        repo = _resolved(state.path)
+        if repo == root:
+            remote_dir = remote_root
+        elif repo.parent == root:
+            remote_dir = f"{remote_root}/{state.path.name}"
+        else:
+            raise NodeConfigError(
+                f"{state.path} is neither the project nor a direct child of it; "
+                "a node project is one repo, or a folder of repos"
+            )
+        repos.append(
+            RepoSpec(url=state.url, branch=state.branch, remote_dir=remote_dir)
+        )
+    extras = tuple(proj.push or ())
+    memory = (
+        home / ".claude" / "projects" / encoded_project_dir(str(project_dir)) / "memory"
+    )
+    return Recipe(
+        project=project,
+        sid=session_name(project),
+        repos=tuple(repos),
+        push_files=push_set(project_dir, states, home=home, extras=extras),
+        memory_dir=memory if memory.is_dir() else None,
+        remote_root=remote_root,
+        warnings=push_warnings(project_dir, extras, home=home),
+    )

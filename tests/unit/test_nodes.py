@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from magent import nodes, remote_mux
+from magent import nodes, psmux, remote_mux
 from magent.config import MagentConfig, NodeConfig, ProjectConfig, Settings
 from magent.nodes import (
     LoadSample,
@@ -830,3 +830,126 @@ class TestPushExtras:
         assert nodes.push_warnings(repo, ["apps"], home=Path.home()) == (
             "push: apps is a directory; list its files; skipped",
         )
+
+
+class TestRecipeFor:
+    def test_a_repo_project_is_one_repo_at_the_node_root(self, repo):
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second"),
+            NODE,
+            [_real_state(repo)],
+            home=Path.home(),
+            project_dir=repo,
+        )
+        assert (recipe.project, recipe.sid) == ("sendly", "sendly")
+        assert recipe.remote_root == "~/magent/sendly"
+        assert recipe.repos == (
+            RepoSpec(
+                url="git@github.com:amin/sendly.git",
+                branch="main",
+                remote_dir="~/magent/sendly",
+            ),
+        )
+
+    def test_the_sid_is_psmuxs_session_name_of_the_title(self, tmp_path):
+        proj = ProjectConfig(path=str(tmp_path), node="second", title="Sendly v2.0")
+        recipe = nodes.recipe_for(
+            proj, NODE, [_state(tmp_path, ())], home=Path.home(), project_dir=tmp_path
+        )
+        assert recipe.project == "Sendly v2.0"
+        assert recipe.sid == psmux.session_name("Sendly v2.0") == "Sendly-v2-0"
+
+    def test_a_workspace_puts_each_child_repo_under_it(self, tmp_path):
+        workspace = tmp_path / "ws"
+        (workspace / "api").mkdir(parents=True)
+        (workspace / "web").mkdir()
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(workspace), node="second"),
+            NODE,
+            [_state(workspace / "api", ()), _state(workspace / "web", ())],
+            home=Path.home(),
+            project_dir=workspace,
+        )
+        assert recipe.remote_root == "~/magent/ws"
+        assert [r.remote_dir for r in recipe.repos] == [
+            "~/magent/ws/api",
+            "~/magent/ws/web",
+        ]
+
+    def test_a_repo_outside_the_project_is_refused(self, tmp_path):
+        with pytest.raises(
+            NodeConfigError, match="neither the project nor a direct child"
+        ):
+            nodes.recipe_for(
+                ProjectConfig(path=str(tmp_path / "ws"), node="second"),
+                NODE,
+                [_state(tmp_path / "elsewhere" / "api", ())],
+                home=Path.home(),
+                project_dir=tmp_path / "ws",
+            )
+
+    def test_the_push_set_rides_along(self, repo):
+        state = _real_state(repo)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second"),
+            NODE,
+            [state],
+            home=Path.home(),
+            project_dir=repo,
+        )
+        assert recipe.push_files == nodes.push_set(repo, [state], home=Path.home())
+
+    def test_push_warnings_ride_along(self, repo):
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second", push=["missing.json"]),
+            NODE,
+            [_real_state(repo)],
+            home=Path.home(),
+            project_dir=repo,
+        )
+        assert recipe.warnings == ("push: missing.json does not exist; skipped",)
+
+    def test_the_memory_dir_is_found_under_the_encoded_local_path(self, repo):
+        memory = (
+            Path.home()
+            / ".claude"
+            / "projects"
+            / nodes.encoded_project_dir(str(repo))
+            / "memory"
+        )
+        memory.mkdir(parents=True)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second"),
+            NODE,
+            [_real_state(repo)],
+            home=Path.home(),
+            project_dir=repo,
+        )
+        assert recipe.memory_dir == memory
+
+    def test_no_memory_dir_is_none(self, repo):
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second"),
+            NODE,
+            [_real_state(repo)],
+            home=Path.home(),
+            project_dir=repo,
+        )
+        assert recipe.memory_dir is None
+
+    def test_a_project_reached_through_a_link_is_still_its_repo(self, repo, tmp_path):
+        # The configured path is a symlink/junction to the repo: compared on
+        # resolved paths, the repo IS the project, not "outside" it.
+        link = tmp_path / "sendly-link"
+        try:
+            os.symlink(repo, link, target_is_directory=True)
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(link), node="second"),
+            NODE,
+            [_real_state(repo)],
+            home=Path.home(),
+            project_dir=link,
+        )
+        assert [r.remote_dir for r in recipe.repos] == [recipe.remote_root]
