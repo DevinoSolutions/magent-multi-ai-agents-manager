@@ -1667,3 +1667,23 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
         )
         hotkey._do_open_code("http://x:8034", "caly", "me@host")
         assert spawned == [["code", "--remote", "ssh-remote+host", "/base/caly"]]
+
+    def test_a_torn_node_map_falls_through_to_the_server(self, monkeypatch, tmp_path):
+        """The map is best-effort here: an unreadable one must not cost F2 the
+        server's answer (read_node_map, never load_node_map_strict)."""
+        from magent import hotkey, nodes
+
+        torn = tmp_path / "node-map.json"
+        torn.write_text('{"api": {"nick": "sec', encoding="utf-8")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", torn)
+        spawned = self._patch(
+            monkeypatch,
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "api", "session": "api", "resolved": "/base/api"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "api", None)
+        assert spawned == [["code", "/base/api"]]
