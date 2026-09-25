@@ -113,7 +113,7 @@ def _pane(scenario: str, token: str, state: Path) -> int:
     child = [sys.executable, os.path.abspath(__file__), scenario, token, str(state)]
     attach_client.shutil.which = lambda _name: "/stand-in/ssh"
     attach_client.ssh_argv = lambda _target, _remote: list(child)
-    attach_client._probe_session = lambda _t, _s: attach_client.SESSION_ALIVE
+    attach_client._probe_session = lambda _t, _s, **_k: attach_client.SESSION_ALIVE
     if scenario == "typing":
         # A longer first backoff so the test has room to type into a pane that
         # is provably mid-outage rather than racing the redial.
