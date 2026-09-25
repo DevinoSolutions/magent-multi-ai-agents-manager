@@ -545,18 +545,31 @@ def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
                 server_url, project, "F2: 'code' not found on PATH", tint=FLASH_TINT_ERR
             )
             return
-        with urlopen(f"{server_url}/api/sessions", timeout=10) as resp:
-            payload = json.loads(resp.read())
-        folder = folder_for_session(payload, project)
-        if not folder:
-            log.warning("F2: no folder for project=%s in /api/sessions", project)
-            flash_async(
-                server_url,
-                project,
-                f"F2: no folder known for {project} (host magent too old?)",
-                tint=FLASH_TINT_ERR,
-            )
-            return
+        # A pool-node project (PR-D): its folder is on the node, and the node
+        # map says which one and where -- no server round trip. The user stays
+        # in the authority: magent resolved it and the ssh config may not know
+        # it (D4). A cloud placement has no ssh target and falls through.
+        # heavy subsystem: in-body per policy
+        from magent import nodes
+
+        hit = nodes.open_target(project, nodes.read_node_map())
+        if hit is not None:
+            ssh_host, folder = hit
+            argv = build_code_open_command(folder, ssh_host, code_bin, keep_user=True)
+        else:
+            with urlopen(f"{server_url}/api/sessions", timeout=10) as resp:
+                payload = json.loads(resp.read())
+            folder = folder_for_session(payload, project)
+            if not folder:
+                log.warning("F2: no folder for project=%s in /api/sessions", project)
+                flash_async(
+                    server_url,
+                    project,
+                    f"F2: no folder known for {project} (host magent too old?)",
+                    tint=FLASH_TINT_ERR,
+                )
+                return
+            argv = build_code_open_command(folder, ssh_host, code_bin)
         # code is code.cmd on Windows; shutil.which resolves the .cmd and
         # Popen on that resolved path runs it without a shell.
         #
@@ -575,7 +588,7 @@ def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
         # psmux._SPAWN_FLAGS; this module is win32-only, so the stdlib
         # constant is always present.
         subprocess.Popen(
-            build_code_open_command(folder, ssh_host, code_bin),
+            argv,
             env=spawn_child_env(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,

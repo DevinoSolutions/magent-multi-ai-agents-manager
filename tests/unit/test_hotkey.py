@@ -1589,3 +1589,81 @@ class TestFocusHookLifecycle:
 
         source = inspect.getsource(run_hotkey)
         assert "event_fn = WINEVENTPROC(" in source
+
+
+class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
+    """A node project's folder is on its pool machine, and the node map knows
+    where: no server round trip, and the user magent resolved stays in the
+    authority (C3)."""
+
+    def _map(self, monkeypatch, tmp_path, *, nick="second"):
+        from magent import nodes
+        from magent.nodes import NodeMapEntry
+
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        nodes.write_node_map(
+            {
+                "api": NodeMapEntry(
+                    nick=nick,
+                    sid="api",
+                    placed_ts=1.0,
+                    attached_existing=False,
+                    remote_root="~/magent/api",
+                    target="amin@devino-second",
+                    cwd="/home/amin/magent/api",
+                )
+            }
+        )
+
+    def test_a_node_project_opens_on_its_node(self, monkeypatch, tmp_path):
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path)
+        spawned = self._patch(monkeypatch)
+
+        def no_server(*_a, **_k):
+            raise AssertionError("a node project needs no /api/sessions round trip")
+
+        monkeypatch.setattr(hotkey, "urlopen", no_server)
+        hotkey._do_open_code("http://x:8034", "api", None)
+        assert spawned == [
+            [
+                "code",
+                "--remote",
+                "ssh-remote+amin@devino-second",
+                "/home/amin/magent/api",
+            ]
+        ]
+        assert self.flashed[-1] == "F2: VS Code -> /home/amin/magent/api"
+
+    def test_a_cloud_placement_falls_through_to_the_server(self, monkeypatch, tmp_path):
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path, nick="cloud")
+        spawned = self._patch(
+            monkeypatch,
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "api", "session": "api", "resolved": "/base/api"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "api", None)
+        assert spawned == [["code", "/base/api"]]
+
+    def test_a_local_project_is_byte_for_byte_todays_path(self, monkeypatch, tmp_path):
+        from magent import hotkey, nodes
+
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        spawned = self._patch(
+            monkeypatch,
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "caly", "session": "caly", "resolved": "/base/caly"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "caly", "me@host")
+        assert spawned == [["code", "--remote", "ssh-remote+host", "/base/caly"]]
