@@ -776,6 +776,34 @@ class TestPushExtras:
             "push: .ssh/id_ed25519 is never pushed (credentials); skipped",
         )
 
+    def test_a_store_that_will_not_resolve_under_a_linked_home_is_refused(
+        self, tmp_path, monkeypatch
+    ):
+        # home is reached through a directory symlink and ~/.ssh alone fails to
+        # resolve: judged lexically under the LINK, the key (which resolves
+        # under the real home) would not match. The stores sit under the
+        # resolved home, so it still does -- fail toward shipping less.
+        real_home = tmp_path / "real-home"
+        (real_home / ".ssh").mkdir(parents=True)
+        (real_home / ".ssh" / "id_rsa").write_text("KEY", encoding="utf-8")
+        home = tmp_path / "home-link"
+        try:
+            os.symlink(real_home, home, target_is_directory=True)
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        real_resolve = Path.resolve
+
+        def resolve(self, strict=False):
+            if self.name == ".ssh":
+                raise OSError(62, "Too many levels of symbolic links", str(self))
+            return real_resolve(self, strict=strict)
+
+        monkeypatch.setattr(Path, "resolve", resolve)
+        assert nodes.push_set(home, [], home=home, extras=[".ssh/id_rsa"]) == ()
+        assert nodes.push_warnings(home, [".ssh/id_rsa"], home=home) == (
+            "push: .ssh/id_rsa is never pushed (credentials); skipped",
+        )
+
     def test_the_usual_credential_files_are_on_the_list(self):
         assert set(nodes._NEVER_PUSHED) >= {
             ".ssh/",
@@ -1033,8 +1061,11 @@ class TestRecipeFor:
     def test_a_path_that_will_not_resolve_is_a_config_error(
         self, tmp_path, monkeypatch
     ):
+        raised: list[OSError] = []
+
         def loop(self, strict=False):
-            raise OSError(62, "Too many levels of symbolic links", str(self))
+            raised.append(OSError(62, "Too many levels of symbolic links", str(self)))
+            raise raised[-1]
 
         with monkeypatch.context() as patched:
             patched.setattr(Path, "resolve", loop)
@@ -1047,6 +1078,8 @@ class TestRecipeFor:
                     project_dir=tmp_path,
                 )
         assert "Too many levels of symbolic links" in str(err.value)
+        # Chained, not re-worded: the traceback still shows the OS's own error.
+        assert err.value.__cause__ is raised[0]
 
     def test_a_nul_in_the_project_path_is_a_config_error_naming_it(self, tmp_path):
         # Path.resolve may or may not reject the NUL (it varies by OS and
@@ -1102,9 +1135,36 @@ class TestRecipeFor:
                 "HTTP://x-access-token:ghp_SECRET@github.com/org/repo.git",
                 "http://github.com/org/repo.git",
             ),
+            # Not an http(s) allow-list: every scheme but ssh loses the WHOLE
+            # userinfo, because a token-only login IS the credential there.
+            (
+                "git+https://user:ghp_SECRET@github.com/org/repo.git",
+                "git+https://github.com/org/repo.git",
+            ),
+            (
+                "git://ghp_SECRET@github.com/org/repo.git",
+                "git://github.com/org/repo.git",
+            ),
+            (
+                "https://user:ghp_SECRET@[2001:db8::1]:8443/org/repo.git",
+                "https://[2001:db8::1]:8443/org/repo.git",
+            ),
+            # ssh-family keeps the login and drops only the password.
+            (
+                "ssh://user:ghp_SECRET@github.com/org/repo.git",
+                "ssh://user@github.com/org/repo.git",
+            ),
+            (
+                "GIT+SSH://git:ghp_SECRET@[2001:db8::1]:22/org/repo.git",
+                "git+ssh://git@[2001:db8::1]:22/org/repo.git",
+            ),
+            (
+                "ssh+git://git:ghp_SECRET@github.com/org/repo.git",
+                "ssh+git://git@github.com/org/repo.git",
+            ),
         ],
     )
-    def test_credentials_in_an_http_origin_never_reach_the_recipe(
+    def test_credentials_in_an_origin_never_reach_the_recipe(
         self, tmp_path, url, stripped
     ):
         # The node's .git/config, the Recipe's repr and every log line would
@@ -1131,7 +1191,11 @@ class TestRecipeFor:
         [
             "git@github.com:org/repo.git",
             "ssh://git@github.com/org/repo.git",
+            "git+ssh://git@[2001:db8::1]:22/org/repo.git",
             "https://github.com/org/repo.git",
+            "git://github.com/org/repo.git",
+            # An '@' past the authority is a path character, not a login.
+            "https://github.com/org/repo@v1.git",
         ],
     )
     def test_a_login_in_an_ssh_origin_is_not_a_credential(self, tmp_path, url):

@@ -20,7 +20,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
-from urllib.parse import urlsplit, urlunsplit
 
 from magent.config import NODE_AUTO, NODE_CLOUD
 from magent.psmux import session_name
@@ -370,28 +369,29 @@ def _from_git_listing(repo: Path, ignored: tuple[str, ...]) -> list[Path]:
     return found
 
 
-def _try_resolve(path: Path, why: list[str] | None = None) -> Path | None:
-    """``path`` resolved (symlinks followed), or None when it cannot be: a
-    symlink loop (RuntimeError before Python 3.13, OSError from 3.13 on), an
-    OS error, or a name the OS rejects (ValueError: an embedded NUL). The one
-    place a resolve failure is caught; each caller states its own policy for
-    None. ``why``, when given, receives the reason."""
+# What Path.resolve raises when a path cannot be resolved: a symlink loop
+# (RuntimeError before Python 3.13, OSError from 3.13 on), an OS error, or a
+# name the OS rejects (ValueError: an embedded NUL). The one list; both
+# resolve helpers catch exactly this.
+_RESOLVE_ERRORS = (OSError, RuntimeError, ValueError)
+
+
+def _try_resolve(path: Path) -> Path | None:
+    """``path`` resolved (symlinks followed), or None when it cannot be
+    (``_RESOLVE_ERRORS``). Each caller states its own policy for None."""
     try:
         return path.resolve()
-    except (OSError, RuntimeError, ValueError) as exc:
-        if why is not None:
-            why.append(str(exc))
+    except _RESOLVE_ERRORS:
         return None
 
 
 def _resolved(path: Path) -> Path:
-    """``path`` resolved, or a NodeConfigError naming it: a recipe cannot place
-    a repo it cannot locate."""
-    why: list[str] = []
-    resolved = _try_resolve(path, why)
-    if resolved is None:
-        raise NodeConfigError(f"{path}: cannot be resolved ({why[0]})")
-    return resolved
+    """``path`` resolved, or a NodeConfigError naming it, chained to the OS's
+    own error: a recipe cannot place a repo it cannot locate."""
+    try:
+        return path.resolve()
+    except _RESOLVE_ERRORS as exc:
+        raise NodeConfigError(f"{path}: cannot be resolved ({exc})") from exc
 
 
 def _workspace_root_files(project_dir: Path) -> list[Path]:
@@ -424,9 +424,12 @@ def _inside_a_repo(project_dir: Path, states: Sequence[LocalGitState]) -> bool:
 def _forbidden_roots(home: Path) -> list[tuple[PurePath, bool]]:
     """Each ``_NEVER_PUSHED`` entry under ``home``, resolved (a store that is
     itself a symlink is judged where it lands), paired with "is a directory".
-    A store that will not resolve is judged at its own lexical place."""
+    A store that will not resolve is judged at its own lexical place -- under
+    the RESOLVED home, so a home reached through a symlink still matches the
+    resolved targets ``_is_forbidden`` is handed (fail toward shipping less)."""
+    base = _try_resolve(home) or home
     stores = [
-        (home / entry.rstrip("/"), entry.endswith("/")) for entry in _NEVER_PUSHED
+        (base / entry.rstrip("/"), entry.endswith("/")) for entry in _NEVER_PUSHED
     ]
     return [(_try_resolve(store) or store, is_dir) for store, is_dir in stores]
 
@@ -509,8 +512,19 @@ def _one_per_file(found: Sequence[Path], project_dir: Path) -> tuple[Path, ...]:
     """``found`` with each file once, sorted. A file is its NAME in its resolved
     directory: a linked project reaches ``repo/.env`` through git's listing and
     ``link/.env`` through an extra, and that is one push, kept under the path
-    lexically inside ``project_dir``. Two names that are symlinks to one target
-    stay two files -- the node needs both names."""
+    lexically inside ``project_dir``.
+
+    Two names for one target both ship only when the link is a FILE symlink
+    (``a.json -> b.json``: two names in one directory, and the node needs
+    both). Through a DIRECTORY symlink (``cfg -> shared``) an extra's
+    ``cfg/.env`` and git's ``shared/.env`` share a resolved directory and a
+    name, so they collapse to one entry.
+
+    On Windows ``WindowsPath`` equality is case-insensitive, so ``.ENV`` and
+    ``.env`` dedupe there. ``PosixPath`` equality is not: two genuinely
+    different files on a case-sensitive filesystem rightly both ship, but one
+    file reached under two casings on a case-insensitive one (macOS APFS)
+    double-ships (pre-existing, deliberately not fixed here)."""
     kept: dict[Path, Path] = {}
     for path in found:
         key = (_try_resolve(path.parent) or path.parent) / path.name
@@ -576,16 +590,40 @@ def push_warnings(
     return tuple(_classify_extras(project_dir, extras, _forbidden_roots(home))[1])
 
 
-def _without_credentials(url: str) -> str:
-    """``url`` with any userinfo dropped when it is http(s): there a userinfo is
-    a token (``https://user:ghp_...@host``) and would land in the node's
-    ``.git/config``, the Recipe's repr and every log line. Every other scheme,
-    and scp-like ``git@host:org/repo``, is left alone -- ``git@`` is an ssh
-    login, not a secret."""
-    parts = urlsplit(url)
-    if parts.scheme not in ("http", "https") or "@" not in parts.netloc:
-        return url
-    return urlunsplit(parts._replace(netloc=parts.netloc.rpartition("@")[2]))
+# A URL with a scheme (RFC 3986's scheme grammar, so `git+https` counts), split
+# into scheme, authority (up to the first '/', '?' or '#') and the rest.
+_SCHEME_URL = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)://([^/?#]*)(.*)", re.DOTALL)
+# Schemes whose login is an ssh user (`git@`), not a secret.
+_SSH_SCHEMES = frozenset({"ssh", "git+ssh", "ssh+git"})
+
+
+def _without_credentials(url: str) -> tuple[str, bool]:
+    """``url`` without the credentials its userinfo carries, and whether any
+    were stripped. They would otherwise land in the node's ``.git/config``,
+    the Recipe's repr and every log line.
+
+    Only a ``scheme://`` URL is inspected; scp-like ``git@host:org/repo`` and
+    anything schemeless pass through byte-for-byte, as does a URL whose
+    authority has no '@'. The userinfo is everything before the authority's
+    LAST '@' (an IPv6 ``[...]`` host holds none). An ssh-family scheme keeps
+    its login and loses only the password (``ssh://user:pw@h`` ->
+    ``ssh://user@h``; ``ssh://git@h`` is untouched). Every other scheme loses
+    the WHOLE userinfo: a token-only login (``https://ghp_...@h``) is the
+    credential. A stripped URL's scheme is lowercased."""
+    match = _SCHEME_URL.fullmatch(url)
+    if match is None:
+        return url, False
+    scheme, authority, rest = match.groups()
+    userinfo, at, host = authority.rpartition("@")
+    if not at:
+        return url, False
+    scheme = scheme.lower()
+    if scheme in _SSH_SCHEMES:
+        login, colon, _password = userinfo.partition(":")
+        if not colon:
+            return url, False
+        return f"{scheme}://{login}@{host}{rest}", True
+    return f"{scheme}://{host}{rest}", True
 
 
 def recipe_for(
@@ -635,8 +673,8 @@ def recipe_for(
                 f"{state.path} is neither the project nor a direct child of it; "
                 "a node project is one repo, or a folder of repos"
             )
-        url = _without_credentials(state.url)
-        if url != state.url:
+        url, stripped = _without_credentials(state.url)
+        if stripped:
             repo_warnings.append(
                 f"repo {remote_dir}: origin URL carried credentials; stripped "
                 "-- the node authenticates with its own gh token"
