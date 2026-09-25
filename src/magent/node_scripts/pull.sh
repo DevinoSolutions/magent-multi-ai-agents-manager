@@ -3,12 +3,13 @@
 # ONE connection. Fed over stdin by remote_mux.pull_node (`bash -s -- <socket>`);
 # the payload after the __MAGENT_PAYLOAD__ line is
 #   {"sids": {sid: {"roots": [...], "project_dir": name|null, "since": epoch}},
-#    "max_member_bytes": N}
+#    "max_member_bytes": N, "max_total_bytes": N}
 # and stdout is, in order (remote_mux.parse_pull's wire format):
 #   - the MAGENT-PULL/1 header line;
 #   - one JSON metadata line: this node's clock, tmux session list, load
-#     sample, each sid's real path, state record names, `skipped` and
-#     `unreadable` (each {sid: [archive name, ...]});
+#     sample, each sid's real path, state record names, `skipped`,
+#     `unreadable` and `truncated` (each {sid: [archive name, ...]}), and
+#     `resume` ({sid: mtime});
 #   - a PLAIN (uncompressed) tar of every file newer than its sid's `since`:
 #     <sid>/transcripts/<path under ~/.claude/projects/<project_dir>/> and
 #     <sid>/state/<record>.json -- no archive at all when there is none;
@@ -21,6 +22,11 @@
 # this user cannot read (any errno but ENOENT) is named under `unreadable`
 # for the same reason. Only regular files are ever opened, never through a
 # symlink, and a symlinked project dir is not followed.
+# The whole reply stays within max_total_bytes (the PC kills a bigger one, so
+# a backlog past it would fail every tick). Files go oldest first; the first
+# that would not fit and every file after it are named under `truncated`, and
+# `resume` gives each such sid the mtime of its oldest file left out, so the
+# PC's next `since` continues from there.
 # `project_dir` arrives finished (the PC encodes; this script only checks it is
 # one name). The tmux socket is lib.sh's $MAGENT_SOCKET: run_script's required
 # $1, read and shifted off by lib.sh with no default (DECISION-3,
@@ -51,9 +57,22 @@ if not isinstance(request, dict):
 wanted = request.get("sids")
 if not isinstance(wanted, dict):
     wanted = {}
-cap = request.get("max_member_bytes")
-if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
-    cap = None  # no cap asked for: the PC's own check still holds
+
+
+def byte_cap(value):
+    # None when no cap was asked for: the PC's own checks still hold.
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+cap = byte_cap(request.get("max_member_bytes"))
+total_cap = byte_cap(request.get("max_total_bytes"))
+HEADER = b"MAGENT-PULL/1\n"
+BLOCK = 512
+# Room for the trailer line, and for what tar's close writes: two zero blocks,
+# then padding to its 10240-byte record.
+TAIL_ROOM = 64 + 2 * BLOCK + tarfile.RECORDSIZE
 
 
 def open_regular(path):
@@ -118,7 +137,7 @@ def offer(sid, arcname, path, mtime, size):
     if cap is not None and size > cap:
         skipped.setdefault(sid, []).append(arcname)
     else:
-        members.append((arcname, path, mtime))
+        members.append((mtime, arcname, sid, path, size))
 
 
 def cannot_read(sid, arcname, error):
@@ -201,15 +220,59 @@ meta = {
     "skipped": {sid: sorted(names) for sid, names in skipped.items()},
     "unreadable": {sid: sorted(names) for sid, names in unreadable.items()},
 }
+
+
+def padded(n):
+    return -(-n // BLOCK) * BLOCK
+
+
+def member_cost(arcname, size):
+    # Its header, its bytes padded to a block, and room for the PAX header
+    # tar adds for a long or non-ASCII name. Never less than tar writes.
+    return BLOCK + padded(size) + BLOCK + padded(len(arcname.encode("utf-8")) + 64)
+
+
+def listed_cost(text):
+    # One JSON string in a list or as a key, with its separator.
+    return len(json.dumps(text)) + 2
+
+
+# Oldest first, so what fits is always everything older than what did not:
+# `resume` is then a watermark that loses nothing.
+members.sort()
+shipped = members
+truncated = {}
+resume = {}
+if total_cap is not None:
+    # The metadata is written before the archive, so what it may still grow
+    # by -- every member named under `truncated`, every sid given a `resume`
+    # -- is reserved up front, as if nothing fit. A listing too long for even
+    # that is a node with millions of files; its reply is refused on the PC.
+    reserve = sum(listed_cost(m[1]) for m in members) + sum(
+        2 * listed_cost(sid) + 32 for sid in {m[2] for m in members}
+    )
+    free = total_cap - len(HEADER) - len(json.dumps(meta)) - 64 - reserve - TAIL_ROOM
+    shipped = []
+    for member in members:
+        mtime, arcname, sid, path, size = member
+        cost = member_cost(arcname, size)
+        if truncated or cost > free:
+            truncated.setdefault(sid, []).append(arcname)
+            resume.setdefault(sid, mtime)
+            continue
+        free -= cost
+        shipped.append(member)
+meta["truncated"] = {sid: sorted(names) for sid, names in truncated.items()}
+meta["resume"] = resume
 out = sys.stdout.buffer
-out.write(b"MAGENT-PULL/1\n")
+out.write(HEADER)
 out.write(json.dumps(meta).encode("utf-8") + b"\n")
 out.flush()
 count = 0
-if members:
+if shipped:
     # "w|": a plain stream, never compressed -- the PC refuses anything else.
     with tarfile.open(fileobj=out, mode="w|") as tar:
-        for arcname, path, mtime in members:
+        for mtime, arcname, sid, path, size in shipped:
             # Opened again the same safe way: the scan's check is old news.
             # Gone since the scan (ENOENT), or no longer a regular file (a
             # symlink swapped in answers ELOOP): nothing left to ship. Any
@@ -225,10 +288,11 @@ if members:
             if fh is None:
                 continue
             with fh:
-                # Bounded: a file that grew past the cap since the scan
-                # ships its first `cap` bytes, like any file growing
-                # mid-pull; the next tick names it under `skipped`.
-                data = fh.read() if cap is None else fh.read(cap)
+                # Bounded by the size the scan saw, which the member and
+                # total caps were checked against: a file that grew since
+                # ships that much, and its new mtime (after `now`) asks for
+                # the rest next tick.
+                data = fh.read(size)
             info = tarfile.TarInfo(arcname)
             info.size = len(data)
             info.mtime = int(mtime)

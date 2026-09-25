@@ -7,6 +7,7 @@ import gzip
 import io
 import json
 import logging
+import math
 import os
 import shlex
 import shutil
@@ -22,8 +23,11 @@ from magent.nodes import LoadSample, Node, encoded_project_dir
 from magent.remote_mux import (
     PULL_HEADER,
     PULL_TRAILER,
+    WATERMARK_OVERLAP_S,
     RemoteError,
+    ReplyTooLarge,
     SidPull,
+    next_since,
     parse_pull,
 )
 from tests.unit._pull_reply import (
@@ -310,6 +314,112 @@ class TestWhatTheNodeCouldNotRead:
     def test_a_malformed_unreadable_list_is_ignored(self, tmp_path, raw, seen):
         meta = pull_meta() if raw == "missing" else pull_meta(unreadable=raw)
         assert _parse(pull_reply(meta), tmp_path / "second").unreadable == seen
+
+
+class TestWhatDidNotFit:
+    """pull.sh keeps its whole reply under ``max_total_bytes`` and names what
+    did not fit under ``truncated`` (the ``skipped`` shape), with each such
+    session's ``resume`` mtime -- a valid reply, never one the PC kills."""
+
+    def test_the_rest_is_named_with_where_to_resume(self, tmp_path):
+        meta = pull_meta(
+            truncated={
+                "api": ["api/transcripts/b.jsonl"],
+                "web": ["web/transcripts/w.jsonl"],
+            },
+            resume={"api": 2000.5, "web": 7.0},
+        )
+        snap = _parse(pull_reply(meta), tmp_path / "second")
+        assert snap.truncated == {"api": ("api/transcripts/b.jsonl",)}
+        assert snap.resume == {"api": 2000.5}
+        assert snap.failed_sids == frozenset()
+
+    def test_an_older_node_reply_has_nothing_truncated(self, tmp_path):
+        snap = _parse(pull_reply(pull_meta()), tmp_path / "second")
+        assert (snap.truncated, snap.resume) == ({}, {})
+
+    @pytest.mark.parametrize(
+        ("raw", "seen"),
+        [
+            ("later", {}),
+            ({"api": "later"}, {}),
+            ({"api": True}, {}),
+            ({"api": None}, {}),
+            ({"api": 12}, {"api": 12.0}),
+            ([2000.0], {}),
+            # json.loads accepts NaN and Infinity: never a watermark.
+            ({"api": float("nan")}, {}),
+            ({"api": float("inf")}, {}),
+            ({"api": float("-inf")}, {}),
+        ],
+    )
+    def test_a_resume_that_is_not_a_time_is_dropped(self, tmp_path, raw, seen):
+        meta = pull_meta(truncated={"api": ["api/transcripts/b.jsonl"]}, resume=raw)
+        assert _parse(pull_reply(meta), tmp_path / "second").resume == seen
+
+
+def _outcome(
+    now: float = 5000.0, *, failed=(), truncated=None, resume=None, **reports
+) -> remote_mux.NodeSnapshot:
+    return remote_mux.NodeSnapshot(
+        now=now,
+        sessions=("api",),
+        sample=None,
+        realpaths={},
+        state_files={},
+        files=(),
+        failed_sids=frozenset(failed),
+        truncated=truncated or {},
+        resume=resume or {},
+        **reports,
+    )
+
+
+_TRUNCATED = {"api": ("api/transcripts/b.jsonl",)}
+
+
+class TestNextSince:
+    """The ONE watermark rule ``pull`` uses and the sync daemon can share."""
+
+    def test_a_complete_reply_moves_to_the_nodes_clock_less_the_overlap(self):
+        assert next_since(_outcome(), "api", 42.0) == 5000.0 - WATERMARK_OVERLAP_S
+
+    def test_a_file_that_could_not_be_stored_holds_it(self):
+        assert next_since(_outcome(failed=["api"]), "api", 42.0) == 42.0
+
+    def test_a_failure_holds_it_even_when_the_reply_was_also_truncated(self):
+        snap = _outcome(failed=["api"], truncated=_TRUNCATED, resume={"api": 900.0})
+        assert next_since(snap, "api", 42.0) == 42.0
+
+    def test_skipped_and_unreadable_files_do_not_hold_it(self):
+        snap = _outcome(
+            skipped={"api": ("api/transcripts/huge.jsonl",)},
+            unreadable={"api": ("api/transcripts/locked.jsonl",)},
+        )
+        assert next_since(snap, "api", 42.0) == 5000.0 - WATERMARK_OVERLAP_S
+
+    def test_a_truncated_reply_resumes_at_its_oldest_file_left_out(self):
+        # Holding 42.0 would ask for the same files, which would fit the same
+        # way, on every tick: the livelock the total cap exists to end.
+        since = next_since(
+            _outcome(truncated=_TRUNCATED, resume={"api": 900.0}), "api", 42.0
+        )
+        assert 42.0 < since < 900.0
+        # pull.sh asks `mtime > since`: the file AT the resume mtime is owed.
+        assert since == math.nextafter(900.0, -math.inf)
+
+    def test_a_resume_past_the_scan_moves_no_further_than_a_complete_reply(self):
+        # A file rewritten after the scan began has an mtime past `now`; the
+        # complete rule's value still asks for it.
+        snap = _outcome(truncated=_TRUNCATED, resume={"api": 5000.5})
+        assert next_since(snap, "api", 42.0) == 5000.0 - WATERMARK_OVERLAP_S
+
+    def test_a_truncated_reply_without_a_resume_holds_it(self):
+        assert next_since(_outcome(truncated=_TRUNCATED), "api", 42.0) == 42.0
+
+    def test_a_resume_behind_the_old_watermark_never_moves_it_back(self):
+        snap = _outcome(truncated=_TRUNCATED, resume={"api": 10.0})
+        assert next_since(snap, "api", 42.0) == 42.0
 
 
 def _two_member_reply() -> tuple[bytes, int]:
@@ -681,6 +791,7 @@ class TestPullNode:
                 "api": {"roots": ["~/magent/api"], "project_dir": None, "since": 0.0}
             },
             "max_member_bytes": remote_mux.PULL_MAX_MEMBER_BYTES,
+            "max_total_bytes": remote_mux.PULL_MAX_TOTAL_BYTES,
         }
         assert snap.sessions == ("api",)
 
@@ -707,9 +818,16 @@ class TestPullNode:
         # to PULL_MAX_TOTAL_BYTES of files, and nothing past that is held.
         monkeypatch.setattr(remote_mux, "PULL_MAX_REPLY_BYTES", 1024)
         fake_ssh.set_mode("flood")
-        with pytest.raises(RemoteError, match="reply exceeded 1024 bytes") as info:
+        with pytest.raises(ReplyTooLarge, match="reply exceeded 1024 bytes") as info:
             remote_mux.pull_node(NODE, {}, dest=tmp_path)
         assert info.value.rc is None
+        assert info.value.limit == 1024
+
+    def test_the_node_is_asked_to_stay_under_what_this_pc_will_hold(self):
+        # pull.sh keeps its whole reply under max_total_bytes; the PC's cap
+        # adds room only for what the script cannot count (an rc banner).
+        margin = remote_mux.PULL_MAX_REPLY_BYTES - remote_mux.PULL_MAX_TOTAL_BYTES
+        assert 0 < margin <= 8 * 1024 * 1024
 
 
 class TestPull:
@@ -783,8 +901,14 @@ REAL = "/home/amin/magent/api"
 
 
 def _snap(
-    now: float, *, files=(), failed=(), realpath: str | None = REAL
+    now: float,
+    *,
+    files=(),
+    failed=(),
+    realpath: str | None = REAL,
+    resume: float | None = None,
 ) -> remote_mux.NodeSnapshot:
+    """``resume`` set: the reply was truncated, oldest file left out at it."""
     return remote_mux.NodeSnapshot(
         now=now,
         sessions=("api",),
@@ -793,6 +917,8 @@ def _snap(
         state_files={},
         files=tuple(files),
         failed_sids=frozenset(failed),
+        truncated={} if resume is None else _TRUNCATED,
+        resume={} if resume is None else {"api": resume},
     )
 
 
@@ -844,6 +970,23 @@ class TestTheWatermarkRuleIsPerCall:
         # The transcripts arrive in call 2: advancing past one that failed to
         # store would lose it for good.
         script(_snap(100.0), _snap(200.0, failed=["api"]))
+        result = remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert result.since == 42.0
+
+    def test_a_truncated_second_call_resumes_where_it_stopped(self, script):
+        script(_snap(100.0), _snap(200.0, resume=150.0))
+        result = remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert result.since == math.nextafter(150.0, -math.inf)
+
+    def test_a_truncated_first_call_alone_moves_normally(self, script):
+        # Call 1 asks for state records alone; call 2 asks for everything
+        # again, so its complete reply is the one that counts.
+        script(_snap(100.0, resume=90.0), _snap(200.0))
+        result = remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert result.since == 200.0 - remote_mux.WATERMARK_OVERLAP_S
+
+    def test_a_failed_first_call_outranks_a_truncated_second(self, script):
+        script(_snap(100.0, failed=["api"]), _snap(200.0, resume=150.0))
         result = remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
         assert result.since == 42.0
 
@@ -1059,16 +1202,64 @@ class TestPullShOnARealBash:
         assert b"tmux socket name is a required first argument" in done.stderr
         assert b"MAGENT-PULL" not in done.stdout
 
-    def _pull(self, tmp_path, pdir, *, timeout=60):
-        """Run pull.sh for api (since 0) and parse its reply into tmp/pc."""
-        payload = {
+    def _pull(self, tmp_path, pdir, *, timeout=60, since=0.0, total=None, dest="pc"):
+        """Run pull.sh for api and parse its reply into tmp/<dest>."""
+        payload: dict[str, object] = {
             "sids": {
-                "api": {"roots": ["~/magent/api"], "project_dir": pdir, "since": 0.0}
+                "api": {"roots": ["~/magent/api"], "project_dir": pdir, "since": since}
             }
         }
+        if total is not None:
+            payload["max_total_bytes"] = total
         done = self._run(tmp_path, payload, timeout=timeout)
         assert done.returncode == 0, done.stderr.decode()
-        return parse_pull(done.stdout, dest=tmp_path / "pc", sids=frozenset({"api"}))
+        if total is not None:
+            assert len(done.stdout) <= total
+        return parse_pull(done.stdout, dest=tmp_path / dest, sids=frozenset({"api"}))
+
+    def test_a_backlog_past_the_total_cap_arrives_over_two_pulls(self, tmp_path):
+        # 20 kB each, ~22 kB on the wire; ~12 kB of the cap is the reply's own
+        # framing. 50 kB fits the older file alone.
+        _, pdir, proj = self._project(tmp_path)
+        for name, mtime in (("a.jsonl", 1000), ("b.jsonl", 2000)):
+            (proj / name).write_bytes(name[:1].encode("ascii") * 20_000)
+            os.utime(proj / name, (mtime, mtime))
+        first = self._pull(tmp_path, pdir, total=50_000, dest="one")
+        assert _stored(tmp_path / "one") == ["api/transcripts/a.jsonl"]
+        assert first.truncated == {"api": ("api/transcripts/b.jsonl",)}
+        assert first.resume == {"api": 2000.0}
+        assert first.failed_sids == frozenset()
+        # The next tick continues from there instead of re-asking for a.jsonl.
+        since = next_since(first, "api", 0.0)
+        second = self._pull(tmp_path, pdir, since=since, total=50_000, dest="two")
+        assert _stored(tmp_path / "two") == ["api/transcripts/b.jsonl"]
+        assert second.truncated == {}
+        assert (tmp_path / "two" / "api" / "transcripts" / "b.jsonl").read_bytes() == (
+            b"b" * 20_000
+        )
+
+    def test_many_small_files_keep_the_whole_reply_under_the_cap(self, tmp_path):
+        # Per-member tar overhead dwarfs these files: counted all the same.
+        _, pdir, proj = self._project(tmp_path)
+        names = [f"f{i:02d}.jsonl" for i in range(60)]
+        for i, name in enumerate(names):
+            (proj / name).write_text("x" * 100, encoding="utf-8")
+            os.utime(proj / name, (1000 + i, 1000 + i))
+        snap = self._pull(tmp_path, pdir, total=30_000)
+        shipped = [p.rsplit("/", 1)[1] for p in _stored(tmp_path / "pc")]
+        left = [n.rsplit("/", 1)[1] for n in snap.truncated["api"]]
+        assert shipped
+        assert left
+        # Oldest first: everything shipped is older than everything left.
+        assert shipped + left == names
+        assert snap.resume == {"api": float(1000 + len(shipped))}
+
+    def test_a_cap_too_small_for_any_file_still_answers(self, tmp_path):
+        _, pdir, proj = self._project(tmp_path)
+        (proj / "a.jsonl").write_bytes(b"a" * 20_000)
+        snap = self._pull(tmp_path, pdir, total=15_000)
+        assert snap.files == ()
+        assert snap.truncated == {"api": ("api/transcripts/a.jsonl",)}
 
     def test_a_fifo_a_link_or_a_huge_file_in_the_state_store_is_never_read(
         self, tmp_path

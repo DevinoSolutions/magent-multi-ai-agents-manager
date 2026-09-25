@@ -259,6 +259,8 @@ class TestRun:
             remote_mux.run(NODE, ["sleep"], timeout_s=1)
         assert exc.value.rc is None
         assert time.monotonic() - started < 10
+        # rc None both ways: only the type tells a timeout from an over-cap.
+        assert not isinstance(exc.value, remote_mux.ReplyTooLarge)
 
     def test_no_ssh_client_is_rc_127_without_spawning(self):
         with pytest.raises(RemoteError) as exc:
@@ -319,6 +321,10 @@ class TestTheReplyIsBoundedInMemory:
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["big"], timeout_s=30, max_stdout_bytes=CAP)
         assert time.monotonic() - started < 10
+        # A distinct type, so a caller tells "answered too much" from a
+        # timeout without matching the message -- and still a RemoteError.
+        assert type(exc.value) is remote_mux.ReplyTooLarge
+        assert exc.value.limit == CAP
         assert exc.value.rc is None
         assert exc.value.stderr_tail == f"reply exceeded {CAP} bytes"
         assert exc.value.command_redacted[0] == "ssh"
@@ -348,10 +354,11 @@ class TestTheReplyIsBoundedInMemory:
     ):
         fake_ssh.set_mode("flood")
         started = time.monotonic()
-        with pytest.raises(RemoteError, match=f"reply exceeded {CAP} bytes") as exc:
+        with pytest.raises(remote_mux.ReplyTooLarge) as exc:
             remote_mux.run(NODE, ["flood"], timeout_s=60, max_stdout_bytes=CAP)
         assert time.monotonic() - started < 15
         assert exc.value.rc is None
+        assert exc.value.limit == CAP
         (proc,) = spawned
         assert proc.poll() is not None
 
@@ -374,7 +381,7 @@ class TestTheReplyIsBoundedInMemory:
 
     def test_run_script_hands_its_cap_to_run(self, fake_ssh):
         fake_ssh.set_reply("bash -s", stdout="x" * (CAP + 1))
-        with pytest.raises(RemoteError, match=f"reply exceeded {CAP} bytes"):
+        with pytest.raises(remote_mux.ReplyTooLarge, match=f"exceeded {CAP} bytes"):
             remote_mux.run_script(
                 NODE, "sample", [], timeout_s=30, max_stdout_bytes=CAP
             )
