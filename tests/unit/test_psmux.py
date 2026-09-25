@@ -1214,6 +1214,19 @@ class TestTheBrandNamesTheNode:
         text, cells = psmux.status_brand(nick)
         assert int(cells) == _visible_cells(text)
 
+    @pytest.mark.parametrize("nick", [None, "second", "cloud", "a"])
+    def test_the_brand_is_pure_ascii(self, nick):
+        assert psmux.status_brand(nick)[0].isascii()
+
+    @pytest.mark.parametrize("nick", ["#(x)", "é", ""])
+    def test_a_nick_tmux_would_expand_or_mis_measure_is_refused(self, nick):
+        # `#(x)` would run `x` on every redraw, `é` breaks cells == len, and an
+        # empty nick brands the bar with a bare `@`.
+        with pytest.raises(ValueError, match="status brand nick"):
+            psmux.status_brand(nick)
+        with pytest.raises(ValueError, match="status brand nick"):
+            psmux.status_left(nick)
+
     @pytest.mark.parametrize(
         ("nick", "length"), [(None, "10"), ("second", "18"), ("cloud", "17")]
     )

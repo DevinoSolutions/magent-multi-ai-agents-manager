@@ -984,16 +984,37 @@ def status_hints(code_hint: bool) -> tuple[str, str]:
     return _STATUS_HINTS_F1, _STATUS_HINTS_F1_LEN
 
 
+def _check_brand_nick(nick: str) -> None:
+    """Refuse a nick the status line cannot carry verbatim. The brand is a tmux
+    FORMAT string, so a ``#`` would be expanded on every redraw (``#(cmd)`` runs
+    a command, ``#[...]`` restyles the bar), and a non-ASCII glyph breaks the
+    "cells == len" law. Config validates nicks, but the typed view is lenient
+    and not every caller's nick went through ``settings.nodes``."""
+    if not nick or not nick.isascii() or "#" in nick:
+        msg = f"status brand nick must be non-empty ASCII without '#': {nick!r}"
+        raise ValueError(msg)
+
+
+def _brand_cells(nick: str | None) -> int:
+    """The brand's visible width in cells for ``nick`` (see ``status_brand``)."""
+    if nick is None:
+        return _STATUS_BRAND_CELLS
+    _check_brand_nick(nick)
+    return _STATUS_BRAND_CELLS + len(f"@{nick} ")
+
+
 def status_brand(nick: str | None) -> tuple[str, str]:
     """The status-left brand and its width in cells. ``None`` is a session on
     THIS machine: today's brand, byte for byte. A nick is a session running on
-    that pool machine (PR-D), branded ``magent @<nick>`` so a window says where
-    its agent actually is. ASCII only, same law as the hints: the cell count is
-    ``len``, and a wide glyph here would desync the bar."""
+    that pool machine (the nodes feature), branded ``magent @<nick>`` so a
+    window says where its agent actually is. ASCII only, same law as the hints:
+    the cell count is ``len``, and a wide glyph here would desync the bar.
+
+    Raises ``ValueError`` for an empty, non-ASCII or ``#``-bearing nick."""
+    cells = _brand_cells(nick)
     if nick is None:
-        return _STATUS_BRAND, str(_STATUS_BRAND_CELLS)
-    suffix = f"@{nick} "
-    return _STATUS_BRAND + suffix, str(_STATUS_BRAND_CELLS + len(suffix))
+        return _STATUS_BRAND, str(cells)
+    return _STATUS_BRAND + f"@{nick} ", str(cells)
 
 
 def status_left(nick: str | None) -> tuple[str, str]:
@@ -1001,8 +1022,8 @@ def status_left(nick: str | None) -> tuple[str, str]:
     its cells plus the headroom every session gets. The one place both
     multiplexers read it from, so a psmux bar and a node's tmux bar cannot
     budget the brand differently."""
-    brand, cells = status_brand(nick)
-    return brand, str(int(cells) + _STATUS_LEFT_HEADROOM)
+    brand, _ = status_brand(nick)
+    return brand, str(_brand_cells(nick) + _STATUS_LEFT_HEADROOM)
 
 
 def f2_binding_argv(prefix: list[str], code_hint: bool) -> list[str]:
@@ -1018,12 +1039,14 @@ def f2_binding_argv(prefix: list[str], code_hint: bool) -> list[str]:
 def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
     """The psmux commands that brand ``name`` and advertise its window hotkeys.
 
-    Six of them: magent *owns* F1 -> detach-client per session (the hint has to
+    Ten of them. The first six: magent *owns* F1 -> detach-client per session (the hint has to
     be truthful on a machine with no personal ``bind -n F1`` in ~/.tmux.conf,
     and owning the binding keeps the existing "back to the picker" semantics
     rather than changing them), the status-right carries the hint text plus the
     width budget it needs, the status-left carries the product brand plus
-    the width budget *it* needs, and the sixth is the F2 fallback below. Each
+    the width budget *it* needs, and the sixth is the F2 fallback below. The
+    last four own the window name and its status-bar entry (see the inline
+    comments). Each
     half sets its text and its length together or neither: a personal conf with
     a tighter ``status-*-length`` would truncate the other half mid-label. All
     are ``-L <name>``-scoped, so they land on that session's own server and
