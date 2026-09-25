@@ -464,3 +464,179 @@ class TestTheSettings:
         finally:
             os.umask(old)
         assert _settings(box).stat().st_mode & 0o777 == 0o600
+
+
+DOCS = {"type": "http", "url": "https://mcp.example.com/docs"}
+RELAY = {
+    "type": "http",
+    "url": "http://100.64.0.1:7777/relay/chrome/mcp",
+    "headers": {"Authorization": "Bearer RELAY-DECOY"},
+}
+
+
+def _claude_json(box: Box) -> Path:
+    return box.home / ".claude.json"
+
+
+def _credentials(box: Box) -> Path:
+    return box.home / ".claude" / ".credentials.json"
+
+
+class TestTheMcpServers:
+    def test_the_pcs_servers_are_merged_by_name_and_the_rest_is_left_alone(
+        self, box, tmp_path
+    ):
+        mine = {"type": "http", "url": "https://mine.example.com"}
+        _put(
+            _claude_json(box),
+            {
+                "mcpServers": {"mine": mine},
+                "projects": {"/x": {}},
+                "oauthAccount": {"a": 1},
+            },
+        )
+        box.apply(_work(tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS})))
+        node = _json(_claude_json(box))
+        assert node["mcpServers"] == {"mine": mine, "docs": DOCS}
+        assert node["projects"] == {"/x": {}}
+        assert node["oauthAccount"] == {"a": 1}
+
+    def test_a_pc_server_replaces_the_nodes_of_the_same_name(self, box, tmp_path):
+        _put(
+            _claude_json(box), {"mcpServers": {"docs": {"type": "http", "url": "old"}}}
+        )
+        box.apply(_work(tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS})))
+        assert _json(_claude_json(box))["mcpServers"] == {"docs": DOCS}
+
+    def test_no_servers_on_this_pc_is_a_skip_that_writes_nothing(
+        self, box, tmp_path, capsys
+    ):
+        box.apply(_work(tmp_path))
+        assert _status(_lines(capsys), "mcp") == "skip"
+        assert not _claude_json(box).exists()
+
+    def test_unchanged_servers_are_skipped(self, box, tmp_path, capsys):
+        work = _work(tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS}))
+        box.apply(work)
+        capsys.readouterr()
+        box.apply(work)
+        assert _status(_lines(capsys), "mcp") == "skip"
+
+    def test_a_server_lost_on_the_node_is_put_back(self, box, tmp_path, capsys):
+        work = _work(tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS}))
+        box.apply(work)
+        _put(_claude_json(box), {"mcpServers": {}})
+        capsys.readouterr()
+        box.apply(work)
+        assert _status(_lines(capsys), "mcp") == "did"
+        assert _json(_claude_json(box))["mcpServers"] == {"docs": DOCS}
+
+    def test_a_node_claude_json_that_is_not_json_fails_and_is_left_alone(
+        self, box, tmp_path, capsys
+    ):
+        _claude_json(box).write_text("{oops", encoding="utf-8")
+        assert (
+            box.apply(_work(tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS}))) == 1
+        )
+        assert _status(_lines(capsys), "mcp") == "fail"
+        assert _claude_json(box).read_text(encoding="utf-8") == "{oops"
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX file modes")
+    def test_the_claude_json_is_rewritten_owner_only_and_atomically(
+        self, box, tmp_path
+    ):
+        # DECISION-16 (B1): the merged file can now carry a relay bearer header.
+        # _write goes through a 0600 tmp + os.replace, so even a node file that
+        # was 0644 comes back 0600, and no half-written file is ever visible.
+        _put(_claude_json(box), {"projects": {}})
+        _claude_json(box).chmod(0o644)
+        box.apply(_work(tmp_path, replace(EMPTY, mcp_servers={"chrome": RELAY})))
+        assert _claude_json(box).stat().st_mode & 0o777 == 0o600
+        assert _json(_claude_json(box))["mcpServers"]["chrome"] == RELAY
+        assert not list(box.home.glob(".claude.json.magent-tmp*"))
+
+
+def _oauth(access: str = "PC-TOKEN") -> dict[str, object]:
+    return {
+        "docs|0123456789abcdef": {"serverName": "docs", "accessToken": access},
+        "gone|fedcba9876543210": {"serverName": "gone", "accessToken": "x"},
+    }
+
+
+class TestTheMcpOAuth:
+    def test_only_entries_for_the_nodes_servers_are_merged(self, box, tmp_path):
+        box.apply(
+            _work(
+                tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS}, mcp_oauth=_oauth())
+            )
+        )
+        assert set(_json(_credentials(box))["mcpOAuth"]) == {"docs|0123456789abcdef"}
+
+    def test_the_claude_login_is_never_touched(self, box, tmp_path):
+        login = {"accessToken": "NODE-LOGIN", "refreshToken": "NODE-REFRESH"}
+        _put(_credentials(box), {"claudeAiOauth": login})
+        box.apply(
+            _work(
+                tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS}, mcp_oauth=_oauth())
+            )
+        )
+        creds = _json(_credentials(box))
+        assert "docs|0123456789abcdef" in creds["mcpOAuth"]
+        assert creds["claudeAiOauth"] == login
+
+    def test_a_token_the_node_refreshed_survives_an_unchanged_pc_copy(
+        self, box, tmp_path, capsys
+    ):
+        work = _work(
+            tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS}, mcp_oauth=_oauth())
+        )
+        box.apply(work)
+        creds = _json(_credentials(box))
+        creds["mcpOAuth"]["docs|0123456789abcdef"]["accessToken"] = "REFRESHED"
+        _put(_credentials(box), creds)
+        capsys.readouterr()
+        box.apply(work)
+        assert _status(_lines(capsys), "mcp_oauth") == "skip"
+        entry = _json(_credentials(box))["mcpOAuth"]["docs|0123456789abcdef"]
+        assert entry["accessToken"] == "REFRESHED"
+
+    def test_a_changed_pc_entry_is_applied(self, box, tmp_path):
+        scope = replace(EMPTY, mcp_servers={"docs": DOCS}, mcp_oauth=_oauth())
+        box.apply(_work(tmp_path, scope))
+        box.apply(_work(tmp_path, replace(scope, mcp_oauth=_oauth("NEW")), name="w2"))
+        entry = _json(_credentials(box))["mcpOAuth"]["docs|0123456789abcdef"]
+        assert entry["accessToken"] == "NEW"
+
+    def test_no_entry_for_a_server_the_node_has_is_a_skip(self, box, tmp_path, capsys):
+        box.apply(_work(tmp_path, replace(EMPTY, mcp_oauth=_oauth())))
+        assert _status(_lines(capsys), "mcp_oauth") == "skip"
+        assert not _credentials(box).exists()
+
+    def test_a_node_credentials_file_that_is_not_json_fails_and_is_left_alone(
+        self, box, tmp_path, capsys
+    ):
+        _credentials(box).parent.mkdir(parents=True)
+        _credentials(box).write_text("{oops", encoding="utf-8")
+        scope = replace(EMPTY, mcp_servers={"docs": DOCS}, mcp_oauth=_oauth())
+        assert box.apply(_work(tmp_path, scope)) == 1
+        assert _status(_lines(capsys), "mcp_oauth") == "fail"
+        assert _credentials(box).read_text(encoding="utf-8") == "{oops"
+
+    def test_no_oauth_token_or_relay_bearer_is_printed(self, box, tmp_path, capsys):
+        scope = replace(
+            EMPTY, mcp_servers={"docs": DOCS, "chrome": RELAY}, mcp_oauth=_oauth()
+        )
+        box.apply(_work(tmp_path, scope))
+        out = capsys.readouterr()
+        assert "docs|0123456789abcdef" in _credentials(box).read_text(encoding="utf-8")
+        for secret in ("PC-TOKEN", "RELAY-DECOY"):
+            assert secret not in out.out + out.err
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX file modes")
+    def test_the_credentials_file_stays_owner_only(self, box, tmp_path):
+        box.apply(
+            _work(
+                tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS}, mcp_oauth=_oauth())
+            )
+        )
+        assert _credentials(box).stat().st_mode & 0o777 == 0o600

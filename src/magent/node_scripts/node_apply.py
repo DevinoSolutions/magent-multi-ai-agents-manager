@@ -368,12 +368,97 @@ def _step_settings(ctx: Ctx) -> None:
     _remember(ctx, "settings", want, mark)
 
 
+def _step_mcp(ctx: Ctx) -> None:
+    """This PC's user MCP servers into the node's ~/.claude.json, by name.
+    The PC already left out what cannot run here (nodes.mcp_skip_reason).
+    Every other key of that file is the node's and stays. It is rewritten
+    0600 and atomically (``_write``): an entry may carry a relay bearer
+    header, and a ``claude`` starting mid-apply reads the old file or the
+    new one."""
+    loaded = _load(ctx.work / "mcp_servers.json")
+    servers = loaded if isinstance(loaded, dict) else {}
+    if not servers:
+        _row(ctx, "skip", "mcp", "this PC has no user MCP servers to share")
+        return
+    path = ctx.home / ".claude.json"
+    node = _load(path)
+    if not isinstance(node, dict):
+        _row(
+            ctx,
+            "fail",
+            "mcp",
+            "~/.claude.json on this node is not a JSON object; fix or remove it",
+        )
+        return
+    have_raw = node.get("mcpServers")
+    have = have_raw if isinstance(have_raw, dict) else {}
+    want = _digest(ctx, "mcp")
+    present = all(have.get(name) == spec for name, spec in servers.items())
+    if _unchanged(ctx, "mcp", want) and present:
+        _row(ctx, "skip", "mcp", f"{len(servers)} server(s) unchanged")
+        return
+    mark = len(ctx.rows)
+    merged = dict(have)
+    merged.update(servers)
+    node["mcpServers"] = merged
+    _write(path, node)
+    _row(ctx, "did", "mcp", f"{len(servers)} server(s): {', '.join(sorted(servers))}")
+    _remember(ctx, "mcp", want, mark)
+
+
+def _step_mcp_oauth(ctx: Ctx) -> None:
+    """This PC's MCP OAuth entries for the servers the node has, into
+    ~/.claude/.credentials.json mcpOAuth. The node's claudeAiOauth -- its own
+    Claude login -- is carried through unchanged (D5). An unchanged PC copy is
+    not re-applied: the node's claude refreshes these tokens, and the PC's
+    older copy would undo that."""
+    loaded = _load(ctx.work / "mcp_oauth.json")
+    entries = loaded if isinstance(loaded, dict) else {}
+    claude_json = _load(ctx.home / ".claude.json")
+    servers = claude_json.get("mcpServers") if isinstance(claude_json, dict) else None
+    names = set(servers) if isinstance(servers, dict) else set()
+    kept = {
+        key: entry
+        for key, entry in entries.items()
+        if isinstance(entry, dict) and entry.get("serverName") in names
+    }
+    if not kept:
+        _row(ctx, "skip", "mcp_oauth", "no MCP OAuth entry for a server this node has")
+        return
+    path = ctx.home / ".claude" / ".credentials.json"
+    creds = _load(path)
+    if not isinstance(creds, dict):
+        _row(
+            ctx,
+            "fail",
+            "mcp_oauth",
+            "~/.claude/.credentials.json on this node is not a JSON object; "
+            "fix or remove it",
+        )
+        return
+    have_raw = creds.get("mcpOAuth")
+    have = have_raw if isinstance(have_raw, dict) else {}
+    want = _digest(ctx, "mcp_oauth") + ":" + ",".join(sorted(kept))
+    if _unchanged(ctx, "mcp_oauth", want) and all(key in have for key in kept):
+        _row(ctx, "skip", "mcp_oauth", f"{len(kept)} entry(ies) unchanged on this PC")
+        return
+    mark = len(ctx.rows)
+    merged = dict(have)
+    merged.update(kept)
+    creds["mcpOAuth"] = merged
+    _write(path, creds)
+    _row(ctx, "did", "mcp_oauth", f"{len(kept)} entry(ies)")
+    _remember(ctx, "mcp_oauth", want, mark)
+
+
 # In order: the settings wire hooks to the installed script, and the MCP OAuth
 # entries follow the servers the node ends up with.
 STEPS: tuple[tuple[str, Callable[[Ctx], None]], ...] = (
     ("gh", _step_gh),
     ("state_hook", _step_state_hook),
     ("settings", _step_settings),
+    ("mcp", _step_mcp),
+    ("mcp_oauth", _step_mcp_oauth),
 )
 
 
