@@ -147,6 +147,18 @@ class ProjectConfig:
     push: list[str] | None = None
 
 
+def is_cloud(proj: ProjectConfig) -> bool:
+    """A cloud project: a LOCAL pane driving a cloud session (PR-J)."""
+    return proj.node == NODE_CLOUD
+
+
+def runs_on_node(proj: ProjectConfig) -> bool:
+    """THE node-skip predicate (DECISION-15): pinned to a pool node or
+    ``auto``. Never ``if proj.node:`` -- that would drop cloud projects,
+    which run here. Raw dicts spell it ``p.get("node") not in (None, "cloud")``."""
+    return proj.node is not None and not is_cloud(proj)
+
+
 @dataclass
 class MagentConfig:
     projects: list[ProjectConfig]
