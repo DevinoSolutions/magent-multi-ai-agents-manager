@@ -195,7 +195,8 @@ def _str_list_or_none(raw: dict[str, object], key: str) -> list[str] | None:
     value = raw.get(key)
     if not isinstance(value, list):
         return None
-    return [item for item in value if isinstance(item, str)]
+    out = [item for item in value if isinstance(item, str)]
+    return out or None
 
 
 def _int(raw: dict[str, object], key: str, default: int) -> int:

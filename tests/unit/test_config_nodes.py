@@ -12,6 +12,7 @@ from magent.config import (
     NodeConfig,
     NodeSyncConfig,
     Settings,
+    _parse_project,
     _parse_settings,
     load_config,
     settings_to_dict,
@@ -166,3 +167,12 @@ class TestNodeProjectsParse:
             )
         )
         assert "unknown config key" not in capsys.readouterr().err
+
+    def test_the_typed_view_skips_what_validation_will_refuse(self):
+        # migrate_config_file parses UNVALIDATED raw dicts through _parse_project,
+        # so the helper must never raise on a shape load_config will refuse.
+        proj = _parse_project({"path": "api", "node": 2, "push": ["a", 3]})
+        assert proj.node is None
+        assert proj.push == ["a"]
+        assert _parse_project({"path": "api", "push": ".env"}).push is None
+        assert _parse_project({"path": "api", "push": []}).push is None
