@@ -416,6 +416,8 @@ def _step_state_hook(ctx: Ctx) -> None:
 _DEEP_KEYS = ("env", "permissions")
 # Permission rule lists: an order-preserving union, the PC's rules first.
 _RULE_LISTS = ("allow", "deny", "ask")
+# Extra directories Claude Code may reach: a union too, the node's first.
+_DIRS = "additionalDirectories"
 
 
 def _union(first: list[object], second: list[object]) -> list[object]:
@@ -439,7 +441,8 @@ def _deep(
     before: dict[str, object],
 ) -> dict[str, object]:
     """The node's ``key`` map merged with this PC's: the PC wins a shared
-    key, the permission rule lists are unions, and what the PC shipped
+    key, the permission rule lists are unions (the directories one node
+    first), and what the PC shipped
     ``before`` but no longer ships is taken back: everything it shipped last
     time leaves the node's side, and what it still ships is laid back on."""
     if key == "env":
@@ -454,11 +457,33 @@ def _deep(
         if isinstance(mine, list) and isinstance(theirs, list):
             gone = _was_shipped(before.get(rule))
             both[rule] = _union(mine, [item for item in theirs if item not in gone])
+    mine = value.get(_DIRS)
+    theirs = old.get(_DIRS)
+    if isinstance(mine, list) and isinstance(theirs, list):
+        both[_DIRS] = _union(theirs, mine)
     return both
 
 
+def _portable(ctx: Ctx, perms: dict[str, object]) -> dict[str, object]:
+    """This PC's permissions without the directories that are Windows paths:
+    they name nothing on the node, so each is dropped with a row."""
+    dirs = perms.get(_DIRS)
+    if not isinstance(dirs, list):
+        return perms
+    kept: list[object] = []
+    for entry in dirs:
+        if isinstance(entry, str) and _WINDOWS_PATH.match(entry):
+            _row(ctx, "drop", f"permissions.{_DIRS}", f"{entry} is a Windows path")
+        else:
+            kept.append(entry)
+    return {**perms, _DIRS: kept}
+
+
 def _merged(
-    node: dict[str, object], shipped: dict[str, object], before: dict[str, object]
+    ctx: Ctx,
+    node: dict[str, object],
+    shipped: dict[str, object],
+    before: dict[str, object],
 ) -> dict[str, object]:
     """The node's settings with this PC's keys over them (``hooks`` aside);
     ``env`` and ``permissions`` merge key by key (``_deep``) -- also when the
@@ -470,6 +495,8 @@ def _merged(
     for key in _DEEP_KEYS:
         old = node.get(key)
         value = shipped.get(key, {})
+        if key == "permissions" and isinstance(value, dict):
+            value = _portable(ctx, value)
         if isinstance(old, dict) and isinstance(value, dict):
             merged[key] = _deep(key, old, value, before)
         elif key in shipped:
@@ -535,7 +562,7 @@ def _step_settings(ctx: Ctx) -> None:
             "is not wired; the next provision wires it",
         )
     before = ctx.shipped.get("settings")
-    merged = _merged(node, shipped, before if isinstance(before, dict) else {})
+    merged = _merged(ctx, node, shipped, before if isinstance(before, dict) else {})
     merged["hooks"] = _hooks(ctx, shipped.get("hooks"), wire=wire)
     line = shipped.get("statusLine")
     if isinstance(line, dict) and line.get("type") == "command":

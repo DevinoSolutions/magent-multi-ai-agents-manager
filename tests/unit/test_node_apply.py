@@ -933,3 +933,49 @@ class TestWhatThePcStopsShippingLeavesTheNode:
         node = _json(_settings(box))
         assert node["env"] == {"X": "x"}
         assert node["permissions"]["allow"] == ["Bash(rm:*)"]
+
+
+class TestTheAdditionalDirectories:
+    """A node-first union of the node's and this PC's directories; a PC
+    directory that is a Windows path names nothing on the node and is dropped
+    with a row naming it."""
+
+    DIRS = "permissions.additionalDirectories"
+
+    def test_a_node_first_union_without_the_pcs_windows_paths(
+        self, box, tmp_path, capsys
+    ):
+        _put(_settings(box), {"permissions": {"additionalDirectories": ["/srv/data"]}})
+        pc = {"permissions": {"additionalDirectories": ["C:\\work", "/srv/shared"]}}
+        box.apply(_work(tmp_path, _pc_settings(pc)))
+        assert _drops(_lines(capsys), self.DIRS) == ["C:\\work is a Windows path"]
+        assert _json(_settings(box))["permissions"]["additionalDirectories"] == [
+            "/srv/data",
+            "/srv/shared",
+        ]
+
+    def test_the_union_is_deduped(self, box, tmp_path):
+        _put(
+            _settings(box),
+            {"permissions": {"additionalDirectories": ["/srv/data", "/srv/data"]}},
+        )
+        pc = {
+            "permissions": {
+                "additionalDirectories": ["/srv/shared", "/srv/data", "/srv/shared"]
+            }
+        }
+        box.apply(_work(tmp_path, _pc_settings(pc)))
+        assert _json(_settings(box))["permissions"]["additionalDirectories"] == [
+            "/srv/data",
+            "/srv/shared",
+        ]
+
+    def test_a_windows_path_is_dropped_when_the_node_has_none(
+        self, box, tmp_path, capsys
+    ):
+        pc = {"permissions": {"additionalDirectories": ["D:/code", "/srv/shared"]}}
+        box.apply(_work(tmp_path, _pc_settings(pc)))
+        assert _drops(_lines(capsys), self.DIRS) == ["D:/code is a Windows path"]
+        assert _json(_settings(box))["permissions"]["additionalDirectories"] == [
+            "/srv/shared"
+        ]
