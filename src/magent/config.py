@@ -564,8 +564,8 @@ def _check_node_pool(settings_raw: dict[str, object]) -> None:
         label = f"settings.nodes.{nick}"
         if not _NODE_NICK_RE.fullmatch(nick):
             raise ConfigError(
-                f"{label}: a node nick is 1-6 characters of a-z, 0-9 and '-' "
-                "(it is drawn in the status bar)"
+                f"settings.nodes: nick {nick!r} must be 1-6 characters of a-z, "
+                "0-9 and '-' (it is drawn in the status bar)"
             )
         if nick in _RESERVED_NICKS:
             raise ConfigError(f"{label}: {nick!r} is reserved; pick another nick")
@@ -575,10 +575,17 @@ def _check_node_pool(settings_raw: dict[str, object]) -> None:
             raise ConfigError(f"{label} must have a 'host' field")
         for key in sorted(_ALLOWED_NODE_KEYS):
             _require_type(value, key, str, f"{label}.{key}")
+        for key in ("host", "user", "root"):
+            v = value.get(key)
+            if isinstance(v, str) and not v.strip():
+                raise ConfigError(f"{label}.{key} must not be empty")
+        host = value.get("host")
+        if isinstance(host, str) and "@" in host:
+            raise ConfigError(f"{label}.host must not carry a user (use {label}.user)")
         _warn_unknown_keys(value, _ALLOWED_NODE_KEYS, label)
-        if value.get("user") == "root":
+        if str(value.get("user", "")).lower() == "root":
             click.echo(
-                f"Warning: nodes.{nick}: running sessions as root; prefer a per-person user",
+                f"Warning: {label}: running sessions as root; prefer a per-person user",
                 err=True,
             )
     node_sync = _obj(settings_raw, "nodeSync")

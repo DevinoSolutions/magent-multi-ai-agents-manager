@@ -181,7 +181,9 @@ class TestNodeProjectsParse:
 
 class TestThePoolIsValidated:
     def test_a_nick_longer_than_six_is_refused(self, tmp_config):
-        with pytest.raises(ConfigError, match=r"settings\.nodes\.seventh: .*1-6"):
+        with pytest.raises(
+            ConfigError, match=r"settings\.nodes: nick 'seventh' must be 1-6"
+        ):
             load_config(_cfg(tmp_config, nodes={"seventh": {"host": "h"}}))
 
     def test_a_non_ascii_nick_is_refused(self, tmp_config):
@@ -213,11 +215,35 @@ class TestThePoolIsValidated:
         ):
             load_config(_cfg(tmp_config, nodes={"second": {"user": "amin"}}))
 
-    def test_a_non_string_host_is_refused(self, tmp_config):
+    @pytest.mark.parametrize("key", ["host", "user", "root"])
+    def test_a_non_string_field_is_refused(self, tmp_config, key):
+        node = {"host": "h", key: 5}
         with pytest.raises(
-            ConfigError, match=r"settings\.nodes\.second\.host must be a string"
+            ConfigError, match=rf"settings\.nodes\.second\.{key} must be a string"
         ):
-            load_config(_cfg(tmp_config, nodes={"second": {"host": 22}}))
+            load_config(_cfg(tmp_config, nodes={"second": node}))
+
+    def test_an_empty_host_is_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError, match=r"settings\.nodes\.second\.host must not be empty"
+        ):
+            load_config(_cfg(tmp_config, nodes={"second": {"host": ""}}))
+
+    def test_an_empty_root_is_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError, match=r"settings\.nodes\.second\.root must not be empty"
+        ):
+            load_config(_cfg(tmp_config, nodes={"second": {"host": "h", "root": " "}}))
+
+    def test_a_host_with_a_user_is_refused(self, tmp_config):
+        with pytest.raises(
+            ConfigError,
+            match=(
+                r"settings\.nodes\.second\.host must not carry a user "
+                r"\(use settings\.nodes\.second\.user\)"
+            ),
+        ):
+            load_config(_cfg(tmp_config, nodes={"second": {"host": "root@h"}}))
 
     def test_a_node_that_is_not_an_object_is_refused(self, tmp_config):
         with pytest.raises(
@@ -238,6 +264,12 @@ class TestThePoolIsValidated:
             capsys.readouterr().err
         )
 
+    def test_running_as_Root_warns_too(self, tmp_config, capsys):
+        load_config(_cfg(tmp_config, nodes={"second": {"host": "h", "user": "Root"}}))
+        assert (
+            "settings.nodes.second: running sessions as root" in capsys.readouterr().err
+        )
+
     def test_an_unknown_key_under_a_node_warns(self, tmp_config, capsys):
         load_config(_cfg(tmp_config, nodes={"second": {"host": "h", "port": 22}}))
         assert "unknown config key: settings.nodes.second.port" in (
@@ -256,8 +288,17 @@ class TestThePoolIsValidated:
         ):
             load_config(_cfg(tmp_config, node_sync={"historyH": "24"}))
 
-    def test_a_sync_timing_below_one_is_refused(self, tmp_config):
+    def test_a_node_sync_that_is_not_an_object_is_refused(self, tmp_config):
+        with pytest.raises(ConfigError, match=r"settings\.nodeSync must be an object"):
+            load_config(_cfg(tmp_config, node_sync=[1]))
+
+    def test_a_bool_sync_timing_is_refused(self, tmp_config):
+        with pytest.raises(ConfigError, match="must be an integer, got bool"):
+            load_config(_cfg(tmp_config, node_sync={"historyH": True}))
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_a_sync_timing_below_one_is_refused(self, tmp_config, value):
         with pytest.raises(
             ConfigError, match=r"settings\.nodeSync\.pullIntervalS must be at least 1"
         ):
-            load_config(_cfg(tmp_config, node_sync={"pullIntervalS": 0}))
+            load_config(_cfg(tmp_config, node_sync={"pullIntervalS": value}))
