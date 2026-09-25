@@ -1569,6 +1569,104 @@ class TestAPushFileIsReadAsVetted:
         assert remote_mux.PAYLOAD_MAX_BYTES == 64 * 1024 * 1024
 
 
+class TestWhatTheNodeAnswersIsVetted:
+    """The node's words -- its $HOME, the result's cwd -- are data, and the
+    local repo's url/branch are argv on the node: none may carry a control
+    character or pose as an option."""
+
+    @pytest.mark.parametrize(
+        "answer", ["/home/amin\nWelcome!\n", "/home/a\tmin\n", "/home/amin\r\n"]
+    )
+    def test_a_home_with_a_control_character_is_refused(
+        self, fake_ssh, tmp_path, answer
+    ):
+        fake_ssh.set_reply("printenv HOME", stdout=answer)
+        with pytest.raises(RemoteError, match="HOME") as info:
+            remote_mux.bring_up(NODE, _recipe(tmp_path))
+        assert info.value.command_redacted == (
+            "ssh",
+            *remote_mux.SSH_BATCH_OPTS,
+            NODE.target,
+            _wrapped(["printenv", "HOME"]),
+        )
+        assert len(fake_ssh.calls()) == 1
+
+    @pytest.mark.parametrize(
+        "cwd", ["magent/api", "-rf", "/home/amin/x\ny", "/home/amin/\x1b[2Jx", 7]
+    )
+    def test_a_result_cwd_that_is_not_a_clean_absolute_path_is_the_root(
+        self, node_home, tmp_path, cwd
+    ):
+        _answers(node_home, {**_RESULT, "cwd": cwd})
+        assert remote_mux.bring_up(NODE, _recipe(tmp_path)).cwd == _ROOT
+
+    def test_a_clean_absolute_cwd_is_taken(self, node_home, tmp_path):
+        _answers(node_home, {**_RESULT, "cwd": "/srv/api"})
+        assert remote_mux.bring_up(NODE, _recipe(tmp_path)).cwd == "/srv/api"
+
+    @pytest.mark.parametrize(
+        ("url", "branch"),
+        [("--upload-pack=touch /tmp/x", "main"), ("git@github.com:me/api.git", "-b")],
+    )
+    def test_a_url_or_branch_that_poses_as_an_option_is_refused(
+        self, node_home, tmp_path, url, branch
+    ):
+        repo = RepoSpec(url=url, branch=branch, remote_dir="~/magent/api")
+        with pytest.raises(ValueError, match="option"):
+            remote_mux.bring_up(NODE, _recipe(tmp_path, repos=(repo,)))
+        # The HOME probe only: the script never ran.
+        assert len(node_home.calls()) == 1
+
+
+class TestThePayloadAndResultShapes:
+    """Pins for the shapes a mutation run found unpinned (cq-D7 m6)."""
+
+    def test_every_member_is_0600_with_a_zero_mtime(self, node_home, tmp_path):
+        _answers(node_home)
+        remote_mux.bring_up(NODE, _recipe(tmp_path))
+        payload = node_home.calls()[1].stdin.split(_SENTINEL, 1)[1]
+        with tarfile.open(fileobj=io.BytesIO(payload)) as tar:
+            infos = tar.getmembers()
+        assert infos
+        assert {(m.mode, m.mtime) for m in infos} == {(0o600, 0)}
+
+    def test_memory_keeps_its_subfolders_in_name_order(self, node_home, tmp_path):
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        (recipe.memory_dir / "sub").mkdir()
+        (recipe.memory_dir / "sub" / "c.md").write_bytes(b"c\n")
+        (recipe.memory_dir / "b.md").write_bytes(b"b\n")
+        (recipe.memory_dir / "a.md").write_bytes(b"a\n")
+        _answers(node_home)
+        remote_mux.bring_up(NODE, recipe)
+        members = _members(node_home.calls()[1].stdin)
+        assert [n for n in members if n.startswith("memory/")] == [
+            "memory/MEMORY.md",
+            "memory/a.md",
+            "memory/b.md",
+            "memory/sub/c.md",
+        ]
+        assert members["memory/sub/c.md"] == b"c\n"
+
+    def test_attached_existing_is_true_only_for_json_true(self, node_home, tmp_path):
+        _answers(node_home, {**_RESULT, "attached_existing": "false"})
+        assert remote_mux.bring_up(NODE, _recipe(tmp_path)).attached_existing is False
+
+    def test_a_result_without_a_cwd_is_the_root(self, node_home, tmp_path):
+        _answers(node_home, {k: v for k, v in _RESULT.items() if k != "cwd"})
+        assert remote_mux.bring_up(NODE, _recipe(tmp_path)).cwd == _ROOT
+
+    def test_commits_that_are_not_an_object_are_empty(self, node_home, tmp_path):
+        _answers(node_home, {**_RESULT, "commits": [_ROOT, "0123abcd"]})
+        assert remote_mux.bring_up(NODE, _recipe(tmp_path)).commits == {}
+
+    def test_push_mode_sends_allow_dirty(self, node_home, tmp_path):
+        # A push never touches git, so the node's dirty check must not stop it.
+        _answers(node_home)
+        remote_mux.push_files(NODE, _recipe(tmp_path))
+        assert _tokens(_members(node_home.calls()[1].stdin))[1] == "1"
+
+
 def _link_or_skip(link: Path, target: Path, *, directory: bool = False) -> None:
     try:
         link.symlink_to(target, target_is_directory=directory)
