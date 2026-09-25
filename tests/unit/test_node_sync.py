@@ -16,7 +16,7 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -1436,6 +1436,32 @@ def _running(age: int) -> tuple[str, str]:
     return (node_sync.UNREACHABLE, f"{node_sync.PULL_STILL_RUNNING} after {age}s")
 
 
+def _wait_out_the_laggard(syncer: node_sync.NodeSyncer, nick: str) -> None:
+    """Block (bounded) until ``nick``'s in-flight pull has ended, so the next
+    tick sees a DONE previous future and takes its between-ticks branch."""
+    (_, pending) = wait([syncer._inflight[nick]], timeout=10)
+    assert not pending, f"{nick}'s released pull never ended"
+
+
+def _hang_then_raise(
+    monkeypatch: pytest.MonkeyPatch, release: threading.Event, error: Exception
+) -> None:
+    """Make _sync_node ITSELF hang for ``second`` until ``release``, then raise
+    ``error`` -- once; later calls run the real _sync_node. Raising here, not
+    from the pull, keeps the error outside any catch-all inside _sync_node."""
+    real = node_sync.NodeSyncer._sync_node
+    raised = threading.Event()
+
+    def sync_node(self, nick, entries, local_user, config):
+        if nick == "second" and not raised.is_set():
+            raised.set()
+            assert release.wait(30), "the test never released the hung pull"
+            raise error
+        return real(self, nick, entries, local_user, config)
+
+    monkeypatch.setattr(node_sync.NodeSyncer, "_sync_node", sync_node)
+
+
 def _reachable_again(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [
         r.getMessage() for r in caplog.records if "reachable again" in r.getMessage()
@@ -1529,8 +1555,9 @@ class TestAHungNodeDoesNotHoldTheTick:
         self, placed, caplog, executors
     ):
         """The laggard's own outcome is news once it ends: FAILED logs its
-        reason, and the next OK logs the recovery -- whichever tick collects
-        it (the one after the release, or the one after that)."""
+        reason, and the next OK logs the recovery. The laggard is waited out
+        BEFORE the next tick, so that tick takes the ended-between-ticks
+        branch every time rather than collecting it in its own wait."""
         _capture_nodes_log(caplog)
         release = threading.Event()
         calls: list[str] = []
@@ -1546,7 +1573,7 @@ class TestAHungNodeDoesNotHoldTheTick:
         try:
             syncer.tick(wait_s=0.2)
             release.set()
-            syncer.tick(wait_s=10)
+            _wait_out_the_laggard(syncer, "second")
             syncer.tick(wait_s=10)
         finally:
             release.set()
@@ -1584,18 +1611,18 @@ class TestAHungNodeDoesNotHoldTheTick:
         assert back["second"] == _running(0)
         assert dialled.count("second") == 1
 
-    def test_a_removed_nodes_pull_that_raises_still_surfaces(self, placed, executors):
-        """No outcome is reported for a node that left the pool, but a bug in
-        its pull is not swallowed: a later tick re-raises it."""
+    def test_a_removed_nodes_pull_that_raises_still_surfaces(
+        self, placed, executors, monkeypatch
+    ):
+        """No outcome is reported for a node that left the pool, but an error
+        its worker raised is not swallowed: the next tick re-raises it. Raised
+        from _sync_node itself, outside any catch-all inside it, so this pins
+        the gone-node re-raise however _sync_node classifies a pull."""
         release = threading.Event()
-
-        def pull(node, _sids):
-            if node.nick == "second":
-                assert release.wait(30), "the test never released the hung pull"
-                raise ValueError("orphan")
-            return _snapshot()
-
-        syncer = node_sync.NodeSyncer(_config(), pull=pull, clock=_Clock())
+        _hang_then_raise(monkeypatch, release, ValueError("orphan"))
+        syncer = node_sync.NodeSyncer(
+            _config(), pull=_recording_pull([]), clock=_Clock()
+        )
         third_only = _config(
             pool={"third": POOL["third"]},
             projects=[ProjectConfig(path="web", node="third")],
@@ -1604,11 +1631,9 @@ class TestAHungNodeDoesNotHoldTheTick:
             syncer.tick(wait_s=0.2)
             syncer.reconfigure(third_only)
             release.set()
-            deadline = time.monotonic() + 10
+            _wait_out_the_laggard(syncer, "second")
             with pytest.raises(ValueError, match="orphan"):
-                while time.monotonic() < deadline:
-                    syncer.tick(wait_s=0.05)
-                    time.sleep(0.05)
+                syncer.tick(wait_s=10)
         finally:
             release.set()
             syncer.close()
@@ -1651,24 +1676,22 @@ class TestAHungNodeDoesNotHoldTheTick:
         assert "devino-moved" not in hosts
         assert rows == [1000.0 - 2 * 3600, 1000.0]  # the old 24 h window kept it
 
-    def test_a_laggard_that_raises_surfaces_on_the_next_tick(self, placed, executors):
-        """A pull that raises after its tick stopped waiting is re-raised by
-        the tick that collects it -- the loop then crashes, as for any
-        escaping exception. Today's behaviour, pinned anyway: once E11's
-        catch-all in _sync_node lands, a raising PULL becomes a FAILED
-        outcome, and only an error outside _sync_node takes this path."""
+    def test_a_laggard_that_raises_surfaces_on_the_next_tick(
+        self, placed, executors, monkeypatch
+    ):
+        """A worker that raises after its tick stopped waiting is re-raised by
+        the next tick -- the loop then crashes, as for any escaping exception.
+        The error is raised by _sync_node itself, outside the try E11
+        (96c51f8) adds a catch-all to, so this still pins the laggard re-raise
+        after that merge. Only the FIRST call raises: the redial is healthy,
+        so only the ended laggard's own result can make this tick raise."""
         release = threading.Event()
-
-        def pull(node, _sids):
-            if node.nick == "second":
-                assert release.wait(30), "the test never released the hung pull"
-                raise ValueError("late")
-            return _snapshot()
-
-        syncer = node_sync.NodeSyncer(_config(), pull=pull)
+        _hang_then_raise(monkeypatch, release, ValueError("late"))
+        syncer = node_sync.NodeSyncer(_config(), pull=_recording_pull([]))
         try:
             first = syncer.tick(wait_s=0.2)
             release.set()
+            _wait_out_the_laggard(syncer, "second")
             with pytest.raises(ValueError, match="late"):
                 syncer.tick(wait_s=10)
         finally:
