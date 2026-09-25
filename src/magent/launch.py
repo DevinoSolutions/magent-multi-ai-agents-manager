@@ -13,7 +13,7 @@ import click
 
 from magent import tailnet
 from magent.grid import TileSlot, compute_grid
-from magent.log import get_logger
+from magent.log import get_logger, heartbeat_fresh
 from magent.platform import (
     Platform,
     PsmuxWindowOpts,
@@ -435,6 +435,68 @@ def upload_supervision_enabled() -> bool:
     the supervisor answers before it offers the daemon as a repair."""
     env = _validated_env()
     return True if env is None else env.upload_supervisor
+
+
+# --- Node sync supervision ---------------------------------------------------
+# The same doctrine one more time: `magent serve` is the process that is always
+# there, so it keeps `magent node sync` alive (upload_server._supervise_node_sync
+# -> ensure_node_sync every NODE_SYNC_SUPERVISE_INTERVAL_S). Two gates, like the
+# upload watchdog's: the config must have a node project to sync, and
+# MAGENT_NODE_SYNC must not say 0 -- the opt-out for a user who runs the daemon
+# themselves, and the test-isolation law (a real daemon dials real machines).
+# The env gates ONLY this supervised spawn: `magent node sync --once/-d` typed by
+# a person (or an e2e test) never reads it.
+
+
+def node_sync_env_enabled() -> bool:
+    """Whether MAGENT_NODE_SYNC permits serve to keep the node sync daemon alive."""
+    env = _validated_env()
+    return True if env is None else env.node_sync
+
+
+def node_sync_enabled(config: MagentConfig) -> bool:
+    """Both gates: the env allows it, and some project runs on a node."""
+    # in-body: keeps launch's import list the launch path's
+    from magent.node_sync import wanted
+
+    return node_sync_env_enabled() and wanted(config)
+
+
+def node_sync_argv(config_path: str | None) -> list[str]:
+    """The argv of a detached ``magent node sync`` (the foreground loop)."""
+    args = [sys.executable, "-m", "magent"]
+    if config_path:
+        args += ["--config", config_path]
+    return [*args, "node", "sync"]
+
+
+def ensure_node_sync(config: MagentConfig, config_path: str | None = None) -> bool:
+    """Start the node sync daemon detached unless it is gated off or already
+    running. True when a spawn was issued.
+
+    A live daemon is NEVER re-aimed or replaced: it re-reads its own config file
+    when that changes, and a second one would only lose the lock. A live pid with
+    a stale heartbeat is a wedged daemon -- reported, left for the user
+    (`magent node sync --stop`), never killed from here. The respawn rate of a
+    daemon that keeps dying is the caller's interval.
+    """
+    if not node_sync_enabled(config):
+        return False
+    from magent import node_sync  # in-body: same reason as node_sync_enabled
+
+    pid = node_sync.daemon_pid()
+    if pid is not None:
+        if not heartbeat_fresh(node_sync.HEARTBEAT_NAME):
+            get_logger("nodes").warning(
+                (
+                    "node sync: pid %d is alive but its heartbeat is stale; leaving it "
+                    "(`magent node sync --stop` to restart it)"
+                ),
+                pid,
+            )
+        return False
+    spawn_detached(node_sync_argv(config_path))
+    return True
 
 
 def upload_respawn_cooldown_s() -> float:

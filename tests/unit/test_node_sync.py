@@ -11,11 +11,12 @@ import ast
 import logging
 import os
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
-from magent import node_sync, nodes
+from magent import launch, node_sync, nodes
 from magent.config import (
     SCHEMA_VERSION,
     MagentConfig,
@@ -26,6 +27,7 @@ from magent.config import (
 )
 from magent.env import get_env
 from magent.lockfile import LockHeld, exclusive_lock
+from magent.log import write_heartbeat
 from magent.nodes import NodeMapEntry
 
 _TESTS = Path(__file__).resolve().parents[1]
@@ -296,3 +298,68 @@ class TestTheDaemonHasOneName:
         assert name == node_sync.LOCK_NAME
         assert f"{name}-supervisor" == node_sync.SUPERVISOR_LOCK_NAME
         assert node_sync._PID_PATH.name == f"{name}.pid"
+
+
+@pytest.fixture
+def sync_on(monkeypatch):
+    monkeypatch.setenv("MAGENT_NODE_SYNC", "1")
+    monkeypatch.setattr("magent.env._cached_env", None)
+
+
+@pytest.fixture
+def spawned(monkeypatch) -> list[list[str]]:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(launch, "spawn_detached", calls.append)
+    return calls
+
+
+class TestEnsureNodeSync:
+    def test_the_argv_runs_node_sync_with_the_same_config(self):
+        assert launch.node_sync_argv("C:/cfg.json") == [
+            sys.executable,
+            "-m",
+            "magent",
+            "--config",
+            "C:/cfg.json",
+            "node",
+            "sync",
+        ]
+        assert launch.node_sync_argv(None) == [
+            sys.executable,
+            "-m",
+            "magent",
+            "node",
+            "sync",
+        ]
+
+    def test_nothing_is_spawned_when_the_env_says_no(self, spawned):
+        assert launch.ensure_node_sync(_config(), "cfg.json") is False
+        assert spawned == []
+
+    def test_nothing_is_spawned_when_no_project_runs_on_a_node(self, sync_on, spawned):
+        assert (
+            launch.ensure_node_sync(_config(projects=[ProjectConfig(path="api")]))
+            is False
+        )
+        assert spawned == []
+
+    def test_a_dead_daemon_is_started_with_the_callers_config(self, sync_on, spawned):
+        assert launch.ensure_node_sync(_config(), "cfg.json") is True
+        assert spawned == [launch.node_sync_argv("cfg.json")]
+
+    def test_a_live_daemon_is_never_re_aimed(self, sync_on, spawned):
+        node_sync._PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+        node_sync._PID_PATH.write_text(str(os.getpid()))
+        write_heartbeat(node_sync.HEARTBEAT_NAME)
+        assert launch.ensure_node_sync(_config(), "other.json") is False
+        assert spawned == []
+
+    def test_a_live_daemon_with_a_stale_heartbeat_is_reported_not_replaced(
+        self, sync_on, spawned, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        node_sync._PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+        node_sync._PID_PATH.write_text(str(os.getpid()))
+        assert launch.ensure_node_sync(_config()) is False
+        assert spawned == []
+        assert any("heartbeat is stale" in r.getMessage() for r in caplog.records)
