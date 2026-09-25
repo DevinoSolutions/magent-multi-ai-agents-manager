@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -20,6 +22,8 @@ from tests.unit._pull_reply import pull_meta, pull_reply
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+    from magent.config import MagentConfig
 
 
 @pytest.fixture
@@ -199,6 +203,40 @@ class TestNodeSync:
         `magent node` later, without touching the declaration."""
         result = runner.invoke(cli.main, ["--config", pool_config, "node"])
         assert result.exit_code == 0, result.output
+
+    def test_an_edit_between_the_load_and_the_watch_is_picked_up(
+        self, runner, pool_config, monkeypatch
+    ):
+        """The loop's reload is a ConfigWatch stamped BEFORE the command loaded
+        the config. Stamped after (or at construction), an edit landing in
+        between would read as the file already loaded, and the daemon would run
+        the old pool until the next edit."""
+        real_load = node_cmd._load_config_or_exit
+
+        def load_then_edit(path):
+            cfg = real_load(path)
+            # A different size, so the stamp changes whatever the mtime tick.
+            Path(pool_config).write_text(
+                json.dumps({"version": SCHEMA_VERSION, "projects": [{"path": "api"}]}),
+                encoding="utf-8",
+            )
+            return cfg
+
+        reloaded: list[MagentConfig | None] = []
+
+        def loop(cfg, *, max_ticks=None, reload=None) -> int:
+            assert node_sync.wanted(cfg)  # the command ran on the file it loaded
+            assert reload is not None
+            reloaded.append(reload())
+            return 0
+
+        monkeypatch.setattr(node_cmd, "_load_config_or_exit", load_then_edit)
+        monkeypatch.setattr(node_sync, "run_sync_loop", loop)
+        result = runner.invoke(cli.main, ["--config", pool_config, "node", "sync"])
+        assert result.exit_code == 0, result.output
+        (fresh,) = reloaded
+        assert fresh is not None
+        assert not node_sync.wanted(fresh)  # the edit, not the loaded config
 
 
 class TestTheEnvGatesOnlyTheSupervisor:
