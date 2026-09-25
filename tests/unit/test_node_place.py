@@ -17,11 +17,15 @@ be taken.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
-from magent import nodes
+from magent import launch, nodes, remote_mux
+from magent.config import NODE_AUTO, NODE_CLOUD, ProjectConfig
+from magent.launch import RunOpts
 from magent.nodes import LoadSample
-from tests.unit._node_fixtures import NOW, pool, seed_history
+from tests.unit._node_fixtures import NOW, entry, pool, seed_history
 
 
 def _window(nick: str, fixture: str, tmp_path) -> list[LoadSample]:
@@ -446,3 +450,176 @@ class TestTheSparseRule:
         placement = nodes.place(config, samples, now=NOW, map_entry=None, live=sampled)
 
         assert [s.live for s in placement.scores] == [True]
+
+
+@pytest.fixture
+def remote_samples(monkeypatch):
+    """``remote_mux.sample`` on a stub: every live reading says u = 0.9."""
+    calls: list[str] = []
+
+    def _sample_node(node):
+        calls.append(node.nick)
+        return _sample(NOW, load1=3.6)
+
+    monkeypatch.setattr(remote_mux, "sample", _sample_node)
+    monkeypatch.setattr("magent.env.local_username", lambda: "amin")
+    return calls
+
+
+def _auto(title: str) -> ProjectConfig:
+    return ProjectConfig(path=f"/work/{title}", title=title, node=NODE_AUTO)
+
+
+class TestTheLaunchPhase:
+    def test_an_auto_project_launches_on_the_best_node(self, remote_samples):
+        seed_history("second", "quiet")
+        seed_history("third", "bursty")
+        config = pool("second", "third", projects=[_auto("api")])
+
+        placed = launch.place_node_projects(config, config.projects, now=NOW)
+
+        assert [p.node for p in placed.projects] == ["second"]
+        assert placed.placements["api"].reason == "placed"
+
+    def test_a_pinned_project_passes_through_untouched(self, remote_samples):
+        pinned = ProjectConfig(path="/work/web", title="web", node="third")
+        config = pool("second", "third", projects=[pinned])
+
+        placed = launch.place_node_projects(config, config.projects, now=NOW)
+
+        assert placed.projects[0] is pinned
+        assert placed.placements == {}
+
+    def test_a_local_project_passes_through_untouched(self, remote_samples):
+        local = ProjectConfig(path="/work/x", title="x")
+        config = pool("second", projects=[local])
+
+        assert launch.place_node_projects(
+            config, config.projects, now=NOW
+        ).projects == [local]
+
+    def test_a_cloud_project_passes_through_untouched_and_samples_nothing(
+        self, remote_samples
+    ):
+        seed_history("third", "sparse")
+        cloud = ProjectConfig(path="/work/c", title="c", node=NODE_CLOUD)
+        config = pool("second", "third", projects=[cloud])
+
+        placed = launch.place_node_projects(config, config.projects, now=NOW)
+
+        assert placed.projects == [cloud]
+        assert placed.placements == {}
+        assert remote_samples == []
+
+    def test_placement_never_writes_the_node_map(self, remote_samples):
+        seed_history("second", "quiet")
+        config = pool("second", projects=[_auto("api")])
+
+        launch.place_node_projects(config, config.projects, now=NOW)
+
+        assert not nodes.NODE_MAP_PATH.exists()
+
+    def test_a_sparse_node_costs_exactly_one_live_sample_call(self, remote_samples):
+        seed_history("second", "quiet")
+        seed_history("third", "sparse")
+        config = pool("second", "third", projects=[_auto("api")])
+
+        placed = launch.place_node_projects(config, config.projects, now=NOW)
+
+        assert remote_samples == ["third"]
+        assert placed.projects[0].node == "second"
+
+    def test_a_dry_run_never_opens_a_connection(self, remote_samples):
+        seed_history("second", "quiet")
+        seed_history("third", "sparse")
+        config = pool("second", "third", projects=[_auto("api")])
+
+        placed = launch.place_node_projects(
+            config, config.projects, live=False, now=NOW
+        )
+
+        assert remote_samples == []
+        assert placed.projects[0].node == "third"  # scored on its 3 samples
+
+    def test_a_kept_placement_samples_nothing(self, remote_samples):
+        nodes.update_node_map("api", entry("third"))
+        config = pool("second", "third", projects=[_auto("api")])
+
+        placed = launch.place_node_projects(config, config.projects, now=NOW)
+
+        assert remote_samples == []
+        assert placed.projects[0].node == "third"
+
+    def test_an_unplaceable_project_is_dropped_with_a_note_naming_the_pin(
+        self, remote_samples
+    ):
+        config = pool("second", projects=[_auto("api")])
+
+        placed = launch.place_node_projects(
+            config, config.projects, live=False, now=NOW
+        )
+
+        assert placed.projects == []
+        assert any('"node": "<nick>"' in n and "api" in n for n in placed.notes)
+
+    def test_two_auto_projects_in_one_pass_spread_across_equal_nodes(
+        self, remote_samples
+    ):
+        seed_history("second", "quiet")
+        seed_history("third", "quiet")
+        config = pool("second", "third", projects=[_auto("api"), _auto("web")])
+
+        placed = launch.place_node_projects(config, config.projects, now=NOW)
+
+        assert [p.node for p in placed.projects] == ["second", "third"]
+
+    def test_a_re_placement_is_announced(self, remote_samples):
+        nodes.update_node_map("api", entry("fourth"))
+        seed_history("second", "quiet")
+        config = pool("second", projects=[_auto("api")])
+
+        placed = launch.place_node_projects(config, config.projects, now=NOW)
+
+        assert placed.notes == [
+            "api: 'fourth' is no longer in settings.nodes; re-placed on 'second'"
+        ]
+
+
+class _StopBeforeLaunch(Exception):
+    pass
+
+
+class TestRunMagentPlacesBeforeItLaunches:
+    def test_the_dispatchers_see_the_chosen_nick_not_auto(
+        self, fake_platform, monkeypatch
+    ):
+        seed_history("second", "quiet", now=time.time() + 30)
+        seed_history("third", "bursty", now=time.time() + 30)
+        seen: list[ProjectConfig] = []
+
+        def _capture(plat, config, opts, projects, base_dir):
+            seen.extend(projects)
+            raise _StopBeforeLaunch
+
+        monkeypatch.setattr(launch, "_launch_projects", _capture)
+        config = pool("second", "third", projects=[_auto("api")])
+
+        with pytest.raises(_StopBeforeLaunch):
+            launch.run_magent(config, RunOpts(dry_run=True))
+
+        assert [p.node for p in seen] == ["second"]
+
+    def test_a_placement_note_is_printed_before_the_launch(
+        self, fake_platform, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(
+            launch,
+            "_launch_projects",
+            lambda *a: (_ for _ in ()).throw(_StopBeforeLaunch()),
+        )
+        config = pool("second", projects=[_auto("api")])
+
+        with pytest.raises(_StopBeforeLaunch):
+            launch.run_magent(config, RunOpts(dry_run=True))
+
+        assert '"node": "<nick>"' in capsys.readouterr().out

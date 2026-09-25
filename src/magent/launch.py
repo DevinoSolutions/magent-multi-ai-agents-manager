@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 import socket
@@ -40,6 +41,8 @@ if TYPE_CHECKING:
 
     from magent.config import MagentConfig, ProjectConfig
     from magent.env import MagentEnv
+    from magent.nodes import LoadSample, NodeMapEntry
+    from magent.nodes import Placement as NodePlacement
 
 
 def spawn_detached(args: list[str], extra_flags: int = 0) -> subprocess.Popen[bytes]:
@@ -722,6 +725,16 @@ def run_magent(config: MagentConfig, opts: RunOpts) -> int:
     if projects is None:
         return 0
 
+    # "node": "auto" becomes a nick here, before any dispatcher runs -- the
+    # same slot account routing takes on its branch. A dry run or a tile-only
+    # pass never opens a connection to sample a node.
+    placements = place_node_projects(
+        config, projects, live=not (opts.dry_run or opts.tile_only)
+    )
+    for note in placements.notes:
+        click.echo(f"  {style('!', fg='yellow')} {style(note, dim=True)}")
+    projects = placements.projects
+
     base_dir = config.base_dir
     if base_dir:
         base_dir = _expand_base_dir(base_dir)
@@ -803,6 +816,112 @@ def _select_projects(config: MagentConfig, opts: RunOpts) -> list[ProjectConfig]
         if not projects:
             return None
     return projects
+
+
+@dataclass(frozen=True)
+class NodePlacements:
+    """What the placement phase hands the launch phase (spec §11): the
+    projects with every ``"auto"`` replaced by a concrete nick (an unplaceable
+    one is dropped), the lines to print, and each auto project's Placement --
+    `magent node plan` renders these same objects."""
+
+    projects: list[ProjectConfig]
+    notes: list[str]
+    placements: dict[str, NodePlacement]
+
+
+def _kept(
+    config: MagentConfig, entries: dict[str, NodeMapEntry], proj: ProjectConfig
+) -> bool:
+    from magent import nodes
+
+    held = entries.get(nodes.project_name(proj))
+    return held is not None and held.nick in config.settings.nodes
+
+
+def _live_sampler(config: MagentConfig) -> Callable[[str], LoadSample | None]:
+    """The sparse rule's one live reading per node, through remote_mux. A node
+    that cannot be resolved or does not answer is left unscored, never fatal."""
+    from magent import env, nodes, remote_mux
+
+    user = env.local_username()
+    log = get_logger("launch")
+
+    def sample(nick: str) -> LoadSample | None:
+        try:
+            node = nodes.node_for_nick(config, nick, local_user=user)
+            reading = remote_mux.sample(node)
+        except (nodes.NodeConfigError, remote_mux.RemoteError) as exc:
+            log.warning("live load sample for node %s failed: %s", nick, exc)
+            return None
+        return reading
+
+    return sample
+
+
+def place_node_projects(
+    config: MagentConfig,
+    projects: list[ProjectConfig],
+    *,
+    live: bool = True,
+    now: float | None = None,
+) -> NodePlacements:
+    """Resolve every ``"node": "auto"`` project to a nick (spec §11).
+
+    Its own phase between selection and launch, so a dispatcher only ever sees
+    a concrete nick. It NEVER writes node-map.json: the bring-up records a
+    placement once it has actually happened, so a failed launch leaves nothing
+    sticky behind. Nothing is sampled when every auto project is already
+    placed on a configured node. ``live=False`` (``--dry-run``, tile-only)
+    never opens a connection: a thin node is then scored on what it has.
+    Only ``auto`` is ever placed: local, pinned and ``cloud`` projects
+    (DECISION-15; ``cloud`` is pin-only) pass through untouched.
+    """
+    from magent import nodes
+    from magent.config import NODE_AUTO
+
+    auto = [p for p in projects if p.node == NODE_AUTO]
+    if not auto:
+        return NodePlacements(list(projects), [], {})
+    when = time.time() if now is None else now
+    entries = nodes.read_node_map()
+    samples: dict[str, list[LoadSample]] = {}
+    sampled: frozenset[str] = frozenset()
+    if not all(_kept(config, entries, p) for p in auto):
+        samples, sampled = nodes.placement_samples(
+            config, now=when, live_sample=_live_sampler(config) if live else None
+        )
+    spread: dict[str, int] = {}
+    out: list[ProjectConfig] = []
+    notes: list[str] = []
+    chosen: dict[str, NodePlacement] = {}
+    for proj in projects:
+        if proj.node != NODE_AUTO:
+            out.append(proj)
+            continue
+        name = nodes.project_name(proj)
+        held = entries.get(name)
+        placement = nodes.place(
+            config,
+            samples,
+            now=when,
+            map_entry=held.nick if held else None,
+            placed=spread,
+            live=sampled,
+        )
+        chosen[name] = placement
+        if placement.note:
+            notes.append(f"{name}: {placement.note}")
+        if placement.nick is None:
+            notes.append(
+                f"{name}: not launched -- {nodes.PLACE_REASONS['no-data']};"
+                ' pin a node with "node": "<nick>"'
+            )
+            continue
+        if placement.reason != "kept":
+            spread[placement.nick] = spread.get(placement.nick, 0) + 1
+        out.append(dataclasses.replace(proj, node=placement.nick))
+    return NodePlacements(out, notes, chosen)
 
 
 @dataclass(frozen=True)
