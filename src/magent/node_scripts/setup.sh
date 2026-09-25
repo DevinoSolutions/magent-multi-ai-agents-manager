@@ -87,7 +87,7 @@ step_gh() {
   # gh's official apt repository (cli/cli docs/install_linux.md). One that
   # cannot be read is taken out again: a dead source would fail every later
   # `apt-get update` on this node, the owner's as well as magent's.
-  if ! out=$( { mkdir -p -m 755 /etc/apt/keyrings &&
+  if ! out=$( { { [ -d /etc/apt/keyrings ] || mkdir -m 755 /etc/apt/keyrings; } &&
       curl -fsSL -o "$GH_KEYRING" https://cli.github.com/packages/githubcli-archive-keyring.gpg &&
       chmod go+r "$GH_KEYRING" &&
       arch=$(dpkg --print-architecture) &&
@@ -146,10 +146,11 @@ step_docker() {
 # A symlinked ~/.ssh or authorized_keys is refused, not followed: magent does
 # not write through a link it did not make. (`test -h`, not its `-L` alias:
 # B's socket pin reads the word after every `-L` in a script as a socket.)
+# shellcheck disable=SC2317  # invoked through `declare -f` in run_user_phase
 user_authorized() {
   local u=$1 key=$2 ssh="$HOME/.ssh" ak="$HOME/.ssh/authorized_keys" rest t b
   if [ -h "$ssh" ] || [ -h "$ak" ]; then
-    say fail "authorized_keys:$u" "~/.ssh or ~/.ssh/authorized_keys is a symlink; magent does not write through it"
+    say fail "authorized_keys:$u" "$u's .ssh or its authorized_keys is a symlink; magent does not write through it"
     return 1
   fi
   t=${key%% *}
@@ -174,6 +175,7 @@ user_authorized() {
   say did "authorized_keys:$u" "this PC's key authorized"
 }
 
+# shellcheck disable=SC2317  # invoked through `declare -f` in run_user_phase
 user_claude() {
   local u=$1 out tmp
   if command -v claude >/dev/null 2>&1; then
@@ -199,10 +201,11 @@ user_claude() {
 
 # Never a second node key over the first: GitHub may already hold it. A lost
 # .pub is derived again from the private key.
+# shellcheck disable=SC2317  # invoked through `declare -f` in run_user_phase
 user_node_key() {
   local u=$1 out pub ssh="$HOME/.ssh" id="$HOME/.ssh/id_ed25519"
   if [ -h "$ssh" ]; then
-    say fail "node-key:$u" "~/.ssh is a symlink; magent does not write through it"
+    say fail "node-key:$u" "$u's .ssh is a symlink; magent does not write through it"
     return 1
   fi
   if [ -f "$id.pub" ]; then
@@ -214,7 +217,7 @@ user_node_key() {
       return 1
     fi
     say did "node-key:$u" "id_ed25519.pub derived again from the private key in ~/.ssh"
-  elif out=$( { mkdir -p -m 700 "$ssh" &&
+  elif out=$( { { [ -d "$ssh" ] || mkdir -m 700 "$ssh"; } &&
       ssh-keygen -q -t ed25519 -N "" -C "magent@$(hostname)" -f "$id"; } 2>&1 ); then
     say did "node-key:$u" "id_ed25519 generated in ~/.ssh (the private key never leaves this node)"
   else
@@ -228,6 +231,7 @@ user_node_key() {
   say key "$u" "$pub"
 }
 
+# shellcheck disable=SC2317  # invoked through `declare -f` in run_user_phase
 user_phase() {
   local u=$1 key=$2 rc=0
   umask 077
