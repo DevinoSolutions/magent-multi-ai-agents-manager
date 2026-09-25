@@ -11,6 +11,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -1559,3 +1560,372 @@ class TestEveryLocalGitReadIsBoundedScrubbedAndLockFree:
         assert proc.killed
         assert exc.value.rc is None
         assert "timed out" in exc.value.stderr_tail
+
+
+_SSH_SHIM = """#!/bin/sh
+# Stand-in ssh: run the remote command string (the LAST argument) right here.
+for last; do :; done
+exec /bin/sh -c "$last"
+"""
+
+_FAKE_TMUX = r"""#!/bin/sh
+# Stateful stand-in for `tmux -L magent`: one file per session.
+state=$FAKE_TMUX_STATE
+echo "$*" >> "$state/calls.log"
+if [ "$1" = "-V" ]; then echo "${FAKE_TMUX_VERSION:-tmux 3.4}"; exit 0; fi
+[ "$1" = "-L" ] && shift 2
+cmd=$1; shift
+case $cmd in
+  has-session)
+    [ -f "$state/sessions/${2#=}" ]; exit $? ;;
+  new-session)
+    name= cwd= env=
+    while [ $# -gt 0 ]; do
+      case $1 in
+        -d) shift ;;
+        -e) env="${env:+$env }$2"; shift 2 ;;
+        -s) name=$2; shift 2 ;;
+        -c) cwd=$2; shift 2 ;;
+        *) break ;;
+      esac
+    done
+    if [ -n "${FAKE_TMUX_FAIL_NEW:-}" ]; then echo "fake: refused" >&2; exit 1; fi
+    if [ -f "$state/sessions/$name" ]; then echo "duplicate session: $name" >&2; exit 1; fi
+    mkdir -p "$state/sessions"
+    umask > "$state/umask"
+    { echo "cwd=$cwd"; echo "env=$env"; echo "cmd=$*"; } > "$state/sessions/$name"
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+"""
+
+
+def _exe(path: Path, text: str) -> None:
+    path.write_bytes(text.encode("utf-8"))
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+class TestTheScriptLiterals:
+    def test_the_socket_is_the_argument_lib_sh_reads_never_a_literal(self):
+        # DECISION-3/26 ii: run_script passes remote_mux.SOCKET as $1, lib.sh
+        # reads it into MAGENT_SOCKET, and the script never names it.
+        text = node_scripts.script("bring_up")
+        assert 'mux() { tmux -L "$MAGENT_SOCKET" "$@"; }' in text
+        assert f"-L {remote_mux.SOCKET}" not in text
+
+    def test_the_session_is_created_with_a_utf8_locale(self):
+        # DECISION-26 viii / spec section 6: sshd hands a non-login command
+        # no locale, and the agent's UI draws box and prompt glyphs.
+        assert "mux new-session -d -e LANG=C.UTF-8 " in node_scripts.script("bring_up")
+
+    def test_nothing_is_extracted_before_the_umask_is_tightened(self):
+        # The payload carries secrets: no moment where a file of it is
+        # readable by another user on the node.
+        main = node_scripts._read("bring_up").split("\nmain() {", 1)[1]
+        assert 0 <= main.index("umask 077") < main.index("tar -x")
+
+    def test_the_archive_is_never_extracted_with_absolute_names(self):
+        text = node_scripts._read("bring_up")
+        assert not re.search(r"\btar\b[^\n]*(\s-P\b|--absolute-names)", text)
+
+
+def _push_header() -> bytes:
+    # MAGENT1, allow-dirty, no repos, no command, no fresh form.
+    return b"".join(t + b"\0" for t in (b"MAGENT1", b"1", b"0", b"0", b"0"))
+
+
+def _raw_payload(*members: tarfile.TarInfo | tuple[str, bytes]) -> bytes:
+    """A payload built by hand, past ``_payload``'s PC-side checks: what the
+    node must refuse on its own."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        remote_mux._add_bytes(tar, "header", _push_header())
+        for member in members:
+            if isinstance(member, tarfile.TarInfo):
+                tar.addfile(member)
+            else:
+                remote_mux._add_bytes(tar, *member)
+    return buf.getvalue()
+
+
+def _link(name: str, target: str, kind: bytes = tarfile.SYMTYPE) -> tarfile.TarInfo:
+    info = tarfile.TarInfo(name)
+    info.type = kind
+    info.linkname = target
+    return info
+
+
+def _tree(path: Path) -> list[str]:
+    return sorted(str(p.relative_to(path)) for p in path.rglob("*"))
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="nodes are Linux; real bash/git/tar"
+)
+@needs_git
+class TestBringUpShOnARealShell:
+    @pytest.fixture
+    def rig(self, tmp_path, monkeypatch):
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        _exe(bindir / "ssh", _SSH_SHIM)
+        _exe(bindir / "tmux", _FAKE_TMUX)
+        state = tmp_path / "tmux-state"
+        (state / "sessions").mkdir(parents=True)
+        monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}/usr/local/bin:/usr/bin:/bin")
+        monkeypatch.setenv("FAKE_TMUX_STATE", str(state))
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        monkeypatch.setattr(remote_mux, "find_ssh", lambda: str(bindir / "ssh"))
+        monkeypatch.setattr(psmux, "code_on_path", lambda: False)
+        origin, clone = make_origin_and_clone(tmp_path)
+        (clone / ".env").write_bytes(b"SECRET=hunter2\n")
+        memory = tmp_path / "local-memory"
+        memory.mkdir()
+        (memory / "MEMORY.md").write_bytes(b"- remember\n")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        node = Node(
+            nick="second", host="localhost", user="me", root=str(tmp_path / "node")
+        )
+        root = tmp_path / "node" / "api"
+        recipe = Recipe(
+            project="api",
+            sid="api",
+            repos=(RepoSpec(url=str(origin), branch="main", remote_dir=str(root)),),
+            push_files=(clone / ".env",),
+            memory_dir=memory,
+            remote_root=str(root),
+            local_root=clone,
+            tool="claude",
+            command="claude --continue",
+            fresh_command="claude",
+        )
+        return {
+            "node": node,
+            "recipe": recipe,
+            "root": root,
+            "clone": clone,
+            "state": state,
+            "outside": outside,
+            "enc": nodes.encoded_project_dir(str(root)),
+        }
+
+    def _session(self, rig, sid="api"):
+        return (rig["state"] / "sessions" / sid).read_text(encoding="utf-8")
+
+    def _log(self, rig):
+        return (rig["state"] / "calls.log").read_text(encoding="utf-8")
+
+    def _push_raw(self, rig, payload: bytes):
+        root = str(rig["root"])
+        return remote_mux.run_script(
+            rig["node"],
+            "bring_up",
+            ["push", "api", root, nodes.encoded_project_dir(root)],
+            timeout_s=30,
+            stdin=payload,
+        )
+
+    def test_a_first_bring_up_clones_ships_seeds_and_starts_fresh(self, rig):
+        root, clone = rig["root"], rig["clone"]
+        result = remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert (result.sid, result.attached_existing, result.cwd) == (
+            "api",
+            False,
+            str(root),
+        )
+        assert result.commits == {str(root): git(clone, "rev-parse", "HEAD")}
+        assert result.shipped == (".env",)
+        assert (root / "README.md").read_text(encoding="utf-8") == "hello\n"
+        env = root / ".env"
+        assert env.read_bytes() == b"SECRET=hunter2\n"
+        assert stat.S_IMODE(env.stat().st_mode) == 0o600
+        seeded = (
+            Path.home() / ".claude" / "projects" / rig["enc"] / "memory" / "MEMORY.md"
+        )
+        assert seeded.read_bytes() == b"- remember\n"
+        assert stat.S_IMODE(seeded.stat().st_mode) == 0o600
+        # No transcript on the node for this folder: the fresh form runs.
+        assert (
+            self._session(rig)
+            == f"cwd={root}\nenv=LANG=C.UTF-8\ncmd=bash -lc exec claude\n"
+        )
+
+    def test_the_session_keeps_the_users_umask(self, rig):
+        # umask 077 guards the payload's secrets; the agent (and the tmux
+        # server it may start) must not inherit it.
+        mask = os.umask(0o022)
+        os.umask(mask)
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert (rig["state"] / "umask").read_text(
+            encoding="utf-8"
+        ).strip() == f"{mask:04o}"
+
+    def test_a_transcript_on_the_node_resumes_instead(self, rig):
+        store = Path.home() / ".claude" / "projects" / rig["enc"]
+        store.mkdir(parents=True)
+        (store / "abc.jsonl").write_bytes(b"{}\n")
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert "cmd=bash -lc exec claude --continue\n" in self._session(rig)
+
+    def test_existing_memory_on_the_node_is_never_overwritten(self, rig):
+        memory = Path.home() / ".claude" / "projects" / rig["enc"] / "memory"
+        memory.mkdir(parents=True)
+        (memory / "MEMORY.md").write_bytes(b"node's own\n")
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert (memory / "MEMORY.md").read_bytes() == b"node's own\n"
+
+    def test_a_memory_folder_that_is_a_dangling_link_is_never_written_through(
+        self, rig
+    ):
+        store = Path.home() / ".claude" / "projects" / rig["enc"]
+        store.mkdir(parents=True)
+        (store / "memory").symlink_to(rig["outside"] / "mem")
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert not (rig["outside"] / "mem").exists()
+        assert (store / "memory").is_symlink()
+
+    def test_a_live_session_is_attached_and_nothing_else_is_touched(self, rig):
+        state = rig["state"]
+        (state / "sessions" / "api").write_bytes(b"cwd=/x\ncmd=old\n")
+        result = remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert result.attached_existing is True
+        assert not rig["root"].exists()
+        assert "new-session" not in self._log(rig)
+        assert "status-left-length 18" in self._log(rig)
+
+    def test_a_second_bring_up_fast_forwards_to_origin(self, rig):
+        clone, state = rig["clone"], rig["state"]
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        (state / "sessions" / "api").unlink()
+        commit(clone, name="b.txt", text="b\n", message="second")
+        git(clone, "push", "-q", "origin", "main")
+        result = remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert result.commits == {str(rig["root"]): git(clone, "rev-parse", "HEAD")}
+        assert (rig["root"] / "b.txt").exists()
+
+    def test_a_dirty_node_tree_is_exit_3_naming_allow_dirty(self, rig):
+        state = rig["state"]
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        (state / "sessions" / "api").unlink()
+        (rig["root"] / "README.md").write_bytes(b"edited on the node\n")
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert info.value.rc == 3
+        assert "--allow-dirty" in info.value.stderr_tail
+        # ...and --allow-dirty starts it anyway, leaving the edit alone.
+        remote_mux.bring_up(rig["node"], rig["recipe"], allow_dirty=True)
+        assert (rig["root"] / "README.md").read_bytes() == b"edited on the node\n"
+
+    def test_a_tmux_older_than_3_2_is_exit_4(self, rig, monkeypatch):
+        monkeypatch.setenv("FAKE_TMUX_VERSION", "tmux 3.1c")
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert info.value.rc == 4
+        assert "3.2" in info.value.stderr_tail
+
+    def test_a_session_that_will_not_start_is_exit_4(self, rig, monkeypatch):
+        monkeypatch.setenv("FAKE_TMUX_FAIL_NEW", "1")
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert info.value.rc == 4
+
+    def test_the_decoration_brands_the_node(self, rig):
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        log = self._log(rig)
+        assert (
+            "-L magent set -t =api status-left #[bold,fg=green] magent #[default]@second"
+            in log
+        )
+        assert "-L magent set -t =api status-left-length 18" in log
+
+    def test_an_encoded_name_outside_the_alphabet_is_exit_2(self, rig):
+        with pytest.raises(RemoteError) as info:
+            remote_mux.run_script(
+                rig["node"],
+                "bring_up",
+                ["up", "api", str(rig["root"]), "../evil"],
+                timeout_s=30,
+                stdin=b"",
+            )
+        assert info.value.rc == 2
+
+    def test_pushing_before_the_folder_exists_is_exit_5(self, rig):
+        with pytest.raises(RemoteError) as info:
+            remote_mux.push_files(rig["node"], rig["recipe"])
+        assert info.value.rc == 5
+
+    def test_pushing_into_a_running_project_rewrites_the_files(self, rig):
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        (rig["clone"] / ".env").write_bytes(b"SECRET=rotated\n")
+        assert remote_mux.push_files(rig["node"], rig["recipe"]) == [".env"]
+        assert (rig["root"] / ".env").read_bytes() == b"SECRET=rotated\n"
+
+    # The node-side half of containment: the payload is checked on the PC, but
+    # the node trusts no member name and no link it finds in its own folders.
+
+    @pytest.mark.parametrize(
+        "member",
+        [
+            pytest.param("/ABS", id="absolute"),
+            pytest.param("project/../../../DOTDOT", id="dotdot"),
+            pytest.param("memory/../../DOTDOT", id="memory-dotdot"),
+        ],
+    )
+    def test_a_member_name_that_can_leave_its_folder_is_exit_2(self, rig, member):
+        rig["root"].mkdir(parents=True)
+        name = str(rig["outside"]) + member if member.startswith("/") else member
+        with pytest.raises(RemoteError) as info:
+            self._push_raw(rig, _raw_payload((name, b"x\n")))
+        assert info.value.rc == 2
+        assert _tree(rig["root"]) == []
+        assert _tree(rig["outside"]) == []
+
+    @pytest.mark.parametrize(
+        "member",
+        [
+            pytest.param(("project/.env", tarfile.SYMTYPE), id="symlink"),
+            pytest.param(("memory/MEMORY.md", tarfile.SYMTYPE), id="memory-symlink"),
+            pytest.param(("project/.env", tarfile.LNKTYPE), id="hardlink"),
+        ],
+    )
+    def test_a_link_in_the_payload_is_exit_2_and_never_created(self, rig, member):
+        rig["root"].mkdir(parents=True)
+        name, kind = member
+        secret = rig["outside"] / "secret"
+        secret.write_bytes(b"mine\n")
+        with pytest.raises(RemoteError) as info:
+            self._push_raw(rig, _raw_payload(_link(name, str(secret), kind)))
+        assert info.value.rc == 2
+        assert _tree(rig["root"]) == []
+
+    def test_a_folder_on_the_node_that_links_outside_is_never_written_through(
+        self, rig
+    ):
+        root = rig["root"]
+        root.mkdir(parents=True)
+        (root / "config").symlink_to(rig["outside"])
+        with pytest.raises(RemoteError) as info:
+            self._push_raw(rig, _raw_payload(("project/config/.env", b"K=V\n")))
+        assert info.value.rc == 5
+        assert "outside" in info.value.stderr_tail
+        assert _tree(rig["outside"]) == []
+
+    def test_a_file_on_the_node_that_links_outside_is_never_written_through(self, rig):
+        root = rig["root"]
+        root.mkdir(parents=True)
+        secret = rig["outside"] / "secret"
+        secret.write_bytes(b"mine\n")
+        (root / ".env").symlink_to(secret)
+        with pytest.raises(RemoteError) as info:
+            self._push_raw(rig, _raw_payload(("project/.env", b"K=V\n")))
+        assert info.value.rc == 5
+        assert secret.read_bytes() == b"mine\n"
+
+    def test_a_link_that_stays_inside_the_folder_is_written_through(self, rig):
+        root = rig["root"]
+        (root / "real").mkdir(parents=True)
+        (root / "config").symlink_to(root / "real")
+        result = self._push_raw(rig, _raw_payload(("project/config/.env", b"K=V\n")))
+        assert json.loads(result.stdout)["shipped"] == ["config/.env"]
+        assert (root / "real" / ".env").read_bytes() == b"K=V\n"
