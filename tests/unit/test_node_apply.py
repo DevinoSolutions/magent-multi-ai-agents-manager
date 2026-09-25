@@ -409,6 +409,8 @@ class TestTheSettings:
                 "C:\\cfg\\hook.json is a Windows path",
             ),
             ("node bin\\helper.exe", "bin\\helper.exe is a Windows program"),
+            # A drive path opening a subshell group.
+            ('sh -c "(C:/tools/run.sh)"', "C:/tools/run.sh is a Windows path"),
         ],
     )
     def test_a_windows_program_is_dropped(self, box, tmp_path, capsys, command, detail):
@@ -532,6 +534,16 @@ class TestWhatTheNodeCanRun:
     def test_a_command_bash_would_run_or_that_cannot_be_judged_is_kept(
         self, box, tmp_path, capsys, command
     ):
+        box.apply(_work(tmp_path, _pc_settings(_stop_hook(command))))
+        assert _drops(_lines(capsys), "hook:Stop") == []
+        assert command in _commands(_json(_settings(box)), "Stop")
+
+    @pytest.mark.parametrize(
+        "command",
+        ["curl -d done https://ntfy.sh/topic", "curl file:///tmp/x"],
+    )
+    def test_a_url_is_not_a_windows_path(self, box, tmp_path, capsys, command):
+        box.add("curl")
         box.apply(_work(tmp_path, _pc_settings(_stop_hook(command))))
         assert _drops(_lines(capsys), "hook:Stop") == []
         assert command in _commands(_json(_settings(box)), "Stop")
@@ -800,3 +812,16 @@ class TestTheMerge:
         assert _json(real)["model"] == "opus"
         assert _json(real)["theme"] == "dark"
         assert real.stat().st_mode & 0o777 == 0o600
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX symlinks")
+    def test_a_dangling_settings_link_is_left_alone(self, box, tmp_path, capsys):
+        gone = tmp_path / "gone" / "settings.json"
+        _settings(box).parent.mkdir(parents=True)
+        _settings(box).symlink_to(gone)
+        box.apply(_work(tmp_path, _pc_settings({"model": "opus"})))
+        (line,) = [line for line in _lines(capsys) if line.item == "settings"]
+        assert line.status == "warn"
+        assert "dangling link" in line.detail
+        assert _settings(box).is_symlink()
+        assert os.readlink(_settings(box)) == str(gone)
+        assert not gone.parent.exists()

@@ -189,9 +189,10 @@ def _last(text: str) -> str:
 
 # A drive-letter path (C:\ or C:/) starting ANY word -- the program or an
 # argument (node "C:\...\notify.mjs") -- names a file only the PC has.
-_WINDOWS_PATH = re.compile(r"(^|[\s\"'=])[A-Za-z]:[\\/]")
+# Anchored on the left, so a URL's "s://" or "e:///" is never one.
+_WINDOWS_PATH = re.compile(r"(^|[\s\"'=(])[A-Za-z]:[\\/]")
 # Where an unquoted word ends, in the raw command text.
-_WORD_END = re.compile(r"[\s\"';&|]")
+_WORD_END = re.compile(r"[\s\"';&|)]")
 # Any word ending .exe names a program only the PC runs.
 _EXE = re.compile(r"(?:^|[\s\"'=])([^\s\"'=;&|]*\.exe)(?=$|[\s\"';&|)])", re.I)
 # VAR=value words ahead of a command are its environment, not its program.
@@ -442,6 +443,16 @@ def _step_settings(ctx: Ctx) -> None:
     others stay (``_merged``), hooks are rebuilt (``_hooks``), and a
     statusLine the node cannot run falls back to the node's own."""
     path = ctx.home / ".claude" / "settings.json"
+    if path.is_symlink() and not path.exists():
+        # Writing through it would create its target -- and directories --
+        # wherever the link points, outside ~/.claude.
+        _row(
+            ctx,
+            "warn",
+            "settings",
+            "~/.claude/settings.json is a dangling link; left alone",
+        )
+        return
     node = _load(path)
     if not isinstance(node, dict):
         _row(
