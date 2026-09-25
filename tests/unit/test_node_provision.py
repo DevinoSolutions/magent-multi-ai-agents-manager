@@ -5,13 +5,15 @@ bash on POSIX; the pool is Linux)."""
 
 from __future__ import annotations
 
+import io
 import json
 import subprocess
+import tarfile
 from typing import TYPE_CHECKING
 
 import pytest
 
-from magent import cli, nodes, remote_mux
+from magent import cli, node_scripts, nodes, remote_mux
 from magent.cli import hooks_cmd
 from magent.nodes import Node, UserScope
 from magent.remote_mux import RemoteError, ScriptLine
@@ -908,3 +910,113 @@ class TestThisPcsGh:
         fake_gh.set_reply("auth token", stdout=TOKEN + "\n", rc=1)
         remote_mux.local_gh_token()
         assert TOKEN not in caplog.text
+
+
+HOOK_TEXT = "#!/usr/bin/env bash\necho hook\n"
+
+
+def _unpack(payload: bytes) -> tuple[str, dict[str, tarfile.TarInfo], dict[str, bytes]]:
+    head, _, body = payload.partition(b"\n")
+    infos: dict[str, tarfile.TarInfo] = {}
+    data: dict[str, bytes] = {}
+    with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as tar:
+        for info in tar.getmembers():
+            infos[info.name] = info
+            member = tar.extractfile(info)
+            data[info.name] = member.read() if member is not None else b""
+    return head.decode("utf-8"), infos, data
+
+
+def _payload(scope=None, *, token=TOKEN, login="amin") -> bytes:
+    return remote_mux.build_payload(
+        scope if scope is not None else _scope(),
+        gh_token=token,
+        gh_login=login,
+        state_hook=HOOK_TEXT,
+    )
+
+
+class TestThePayload:
+    def test_the_token_is_the_first_line(self):
+        token, _, _ = _unpack(_payload())
+        assert token == TOKEN
+
+    def test_no_login_to_share_is_an_empty_first_line(self):
+        token, _, data = _unpack(_payload(token=None, login=None))
+        assert token == ""
+        assert json.loads(data["manifest.json"])["digests"]["gh"] == ""
+
+    def test_the_token_appears_exactly_once(self):
+        assert _payload().count(TOKEN.encode()) == 1
+
+    def test_every_item_travels_as_its_own_member(self):
+        scope = _scope(
+            settings={"model": "opus"},
+            mcp_servers={"docs": {"type": "http", "url": "u"}},
+            mcp_oauth={"docs|0": {"serverName": "docs"}},
+            skills=(nodes.SkillFile(path="s/run.sh", data=b"#!x", executable=True),),
+        )
+        _, infos, data = _unpack(_payload(scope))
+        assert sorted(infos) == [
+            "manifest.json",
+            "mcp_oauth.json",
+            "mcp_servers.json",
+            "node_apply.py",
+            "settings.json",
+            "skills/s/run.sh",
+            "state-hook.sh",
+        ]
+        assert json.loads(data["settings.json"]) == {"model": "opus"}
+        assert data["state-hook.sh"] == HOOK_TEXT.encode()
+        assert infos["state-hook.sh"].mode == 0o700
+        assert infos["skills/s/run.sh"].mode == 0o700
+
+    def test_the_applier_travels_in_the_payload(self):
+        _, _, data = _unpack(_payload())
+        assert data["node_apply.py"].decode("utf-8") == node_scripts.source(
+            "node_apply.py"
+        )
+
+    def test_the_manifest_carries_the_digests_and_what_to_install(self):
+        scope = _scope(plugins=("p@mkt",), marketplaces={"mkt": "owner/mkt"})
+        _, _, data = _unpack(_payload(scope))
+        manifest = json.loads(data["manifest.json"])
+        assert manifest["version"] == remote_mux.PAYLOAD_VERSION
+        assert set(manifest["digests"]) == {*scope.digests(), "gh", "state_hook"}
+        assert manifest["plugins"] == ["p@mkt"]
+        assert manifest["marketplaces"] == {"mkt": "owner/mkt"}
+        assert manifest["gh_login"] == "amin"
+        assert manifest["hook_entries"] == remote_mux.state_hook_entries()
+
+    def test_the_same_scope_packs_to_the_same_bytes(self):
+        assert _payload() == _payload()
+
+    def test_a_rotated_token_changes_the_gh_digest(self):
+        _, _, before = _unpack(_payload(token=TOKEN))
+        _, _, after = _unpack(_payload(token=TOKEN + "X"))
+        assert (
+            json.loads(before["manifest.json"])["digests"]["gh"]
+            != json.loads(after["manifest.json"])["digests"]["gh"]
+        )
+
+    def test_the_manifest_never_holds_the_token(self):
+        _, _, data = _unpack(_payload())
+        assert TOKEN.encode() not in data["manifest.json"]
+
+    def test_a_servers_header_token_travels_in_mcp_servers_json_alone(self):
+        # DECISION-16 (B1): K's relay entry carries a literal bearer header.
+        # mcp_servers.json (0600) must be the ONLY member that holds it.
+        bearer = "Bearer RELAY-DECOY-TOKEN"
+        scope = _scope(
+            mcp_servers={
+                "chrome": {
+                    "type": "http",
+                    "url": "http://100.64.0.1:7777/relay/chrome/mcp",
+                    "headers": {"Authorization": bearer},
+                }
+            }
+        )
+        _, infos, data = _unpack(_payload(scope))
+        holders = [name for name, blob in data.items() if bearer.encode() in blob]
+        assert holders == ["mcp_servers.json"]
+        assert infos["mcp_servers.json"].mode == 0o600

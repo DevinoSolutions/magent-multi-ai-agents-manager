@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import gzip
+import hashlib
 import io
 import json
 import math
@@ -44,7 +46,7 @@ if TYPE_CHECKING:
     from pathlib import Path
     from typing import IO
 
-    from magent.nodes import Node
+    from magent.nodes import Node, UserScope
 
 # tmux, not psmux: nodes are Linux. One server per node user (`-L magent`,
 # D10). The name has one owner, attach_client, whose pane attaches to it; this
@@ -519,6 +521,69 @@ def local_gh_token() -> str | None:
     if not token or any(ch.isspace() for ch in token):
         return None
     return token
+
+
+# node_apply refuses a manifest of another version (its MANIFEST_VERSION is
+# pinned equal to this by test).
+PAYLOAD_VERSION = 1
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _canonical(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def build_payload(
+    scope: UserScope,
+    *,
+    gh_token: str | None,
+    gh_login: str | None,
+    state_hook: str,
+) -> bytes:
+    """What follows the sentinel on provision.sh's stdin: the gh token (or an
+    empty line) and a gzip tar of the user scope + manifest. Deterministic --
+    identical input, identical bytes. The token is in the first line ONLY."""
+    entries = state_hook_entries()
+    digests = scope.digests()
+    digests["gh"] = _sha(f"{gh_login}\n{gh_token}") if gh_token else ""
+    digests["state_hook"] = _sha(state_hook + _canonical(entries))
+    manifest = {
+        "version": PAYLOAD_VERSION,
+        "digests": digests,
+        "gh_login": gh_login if gh_token else None,
+        "plugins": list(scope.plugins),
+        "marketplaces": scope.marketplaces,
+        "hook_entries": entries,
+    }
+    members: list[tuple[str, bytes, int]] = [
+        ("manifest.json", _canonical(manifest).encode("utf-8"), 0o600),
+        ("mcp_oauth.json", _canonical(scope.mcp_oauth).encode("utf-8"), 0o600),
+        ("mcp_servers.json", _canonical(scope.mcp_servers).encode("utf-8"), 0o600),
+        ("node_apply.py", node_scripts.source("node_apply.py").encode("utf-8"), 0o600),
+        ("settings.json", _canonical(scope.settings).encode("utf-8"), 0o600),
+        ("state-hook.sh", state_hook.encode("utf-8"), 0o700),
+    ]
+    members += [
+        (f"skills/{f.path}", f.data, 0o700 if f.executable else 0o600)
+        for f in scope.skills
+    ]
+    raw = io.BytesIO()
+    with (
+        gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz,
+        tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar,
+    ):
+        for name, data, mode in sorted(members):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = mode
+            info.mtime = 0
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            tar.addfile(info, io.BytesIO(data))
+    return (gh_token or "").encode("utf-8") + b"\n" + raw.getvalue()
 
 
 def has_session(node: Node, sid: str) -> bool | None:
