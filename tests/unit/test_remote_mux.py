@@ -1629,17 +1629,23 @@ class TestTheScriptLiterals:
         assert not re.search(r"\btar\b[^\n]*(\s-P\b|--absolute-names)", text)
 
 
+def _header_of(*tokens: str) -> bytes:
+    return b"".join(t.encode("utf-8") + b"\0" for t in tokens)
+
+
 def _push_header() -> bytes:
     # MAGENT1, allow-dirty, no repos, no command, no fresh form.
-    return b"".join(t + b"\0" for t in (b"MAGENT1", b"1", b"0", b"0", b"0"))
+    return _header_of("MAGENT1", "1", "0", "0", "0")
 
 
-def _raw_payload(*members: tarfile.TarInfo | tuple[str, bytes]) -> bytes:
+def _raw_payload(
+    *members: tarfile.TarInfo | tuple[str, bytes], header: bytes | None = None
+) -> bytes:
     """A payload built by hand, past ``_payload``'s PC-side checks: what the
     node must refuse on its own."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
-        remote_mux._add_bytes(tar, "header", _push_header())
+        remote_mux._add_bytes(tar, "header", header or _push_header())
         for member in members:
             if isinstance(member, tarfile.TarInfo):
                 tar.addfile(member)
@@ -1849,6 +1855,58 @@ class TestBringUpShOnARealShell:
                 stdin=b"",
             )
         assert info.value.rc == 2
+
+    def test_a_dash_led_encoded_name_seeds_resumes_and_ships(self, rig):
+        # Every encoded name starts with "-" (/home/x is -home-x): nothing
+        # that takes it, or a path built from it, may read it as an option.
+        assert rig["enc"].startswith("-")
+        store = Path.home() / ".claude" / "projects" / rig["enc"]
+        store.mkdir(parents=True)
+        (store / "abc.jsonl").write_bytes(b"{}\n")
+        result = remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert result.shipped == (".env",)
+        assert (store / "memory" / "MEMORY.md").read_bytes() == b"- remember\n"
+        assert "cmd=bash -lc exec claude --continue\n" in self._session(rig)
+
+    @pytest.mark.parametrize(
+        "field", ["url", "branch", "dir"], ids=["url", "branch", "relative-dir"]
+    )
+    def test_a_repo_token_that_could_be_an_option_is_exit_2(self, rig, field):
+        # Defense in depth: the PC refuses these too, but the node reads the
+        # header as untrusted input like every other member.
+        marker = rig["outside"] / "ran"
+        repo = {"url": str(rig["clone"]), "branch": "main", "dir": str(rig["root"])}
+        repo[field] = {
+            "url": f"--upload-pack=touch {marker}",
+            "branch": f"--upload-pack=touch {marker}",
+            "dir": "-api",
+        }[field]
+        header = _header_of(
+            "MAGENT1",
+            "0",
+            "1",
+            repo["url"],
+            repo["branch"],
+            repo["dir"],
+            "3",
+            "bash",
+            "-lc",
+            "exec claude",
+            "0",
+        )
+        root = str(rig["root"])
+        with pytest.raises(RemoteError) as info:
+            remote_mux.run_script(
+                rig["node"],
+                "bring_up",
+                ["up", "api", root, nodes.encoded_project_dir(root)],
+                timeout_s=30,
+                stdin=_raw_payload(header=header),
+            )
+        assert info.value.rc == 2
+        assert not marker.exists()
+        assert not rig["root"].exists()
+        assert not (rig["state"] / "sessions" / "api").exists()
 
     def test_pushing_before_the_folder_exists_is_exit_5(self, rig):
         with pytest.raises(RemoteError) as info:
