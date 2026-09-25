@@ -603,3 +603,40 @@ class TestIsSshLogin:
         for name in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
             monkeypatch.setenv(name, "")
         assert env_module.is_ssh_login() is False
+
+
+class TestNodeSync:
+    """MAGENT_NODE_SYNC -- may `magent serve` keep the node sync daemon alive?"""
+
+    def test_the_default_is_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _clear_magent_env(monkeypatch)
+        assert MagentEnv(_env_file=None).node_sync is True
+
+    def test_zero_turns_it_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _clear_magent_env(monkeypatch)
+        monkeypatch.setenv("MAGENT_NODE_SYNC", "0")
+        assert MagentEnv(_env_file=None).node_sync is False
+
+
+class TestLocalUsername:
+    """The login name a node falls back to when settings.nodes.<nick>.user is
+    absent. The OS sets it; nobody configures it."""
+
+    def test_the_windows_name_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("USERNAME", "amind")
+        monkeypatch.setenv("USER", "someone-else")
+        assert env_module.local_username() == "amind"
+
+    def test_the_posix_name_is_the_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("USERNAME", raising=False)
+        monkeypatch.setenv("USER", "amin")
+        assert env_module.local_username() == "amin"
+
+    def test_neither_set_is_an_empty_name_not_a_guess(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("USERNAME", raising=False)
+        monkeypatch.delenv("USER", raising=False)
+        assert env_module.local_username() == ""

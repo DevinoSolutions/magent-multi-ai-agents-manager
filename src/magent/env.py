@@ -132,6 +132,15 @@ class MagentEnv(BaseSettings):
     # 42 agents alive in Session 0, unkillable from the desktop and holding
     # every session name the user's own bring-up wanted.
     session0_policy: Literal["handoff", "allow", "refuse"] = "handoff"
+    # Should `magent serve` keep the node sync daemon (`magent node sync -d`)
+    # alive? (default: 1 / on.) The daemon pulls every node session's
+    # transcripts and agent state home each settings.nodeSync.pullIntervalS,
+    # which is what makes a session on a pool machine durable and resumable
+    # anywhere; it is only ever started when some project has `node` set. Set
+    # to 0 to run the daemon yourself. Like the two supervisors above, 0 is
+    # also a TEST-ISOLATION law: a test that starts a real serve would
+    # otherwise start a daemon that dials real machines over ssh.
+    node_sync: bool = True
 
     @model_validator(mode="after")
     def _no_unknown_magent_vars(self) -> MagentEnv:
@@ -203,6 +212,17 @@ def localappdata_dir() -> Path:
 
 def editor_command() -> str:
     return os.environ.get("EDITOR", "xdg-open")
+
+
+def local_username() -> str:
+    """The login name of the user running magent: USERNAME on Windows, USER on
+    POSIX, "" when neither is set.
+
+    Host-infrastructure, like ``is_ssh_login``: the OS sets it, nobody
+    configures it. A node's ``user`` falls back to it at use time
+    (``nodes.resolve``) and it is never written back into the config (D4).
+    """
+    return os.environ.get("USERNAME") or os.environ.get("USER") or ""
 
 
 # The variables OpenSSH exports into every login it serves. SSH_CONNECTION and
