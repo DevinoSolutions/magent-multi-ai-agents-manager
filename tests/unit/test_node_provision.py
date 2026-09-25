@@ -2267,16 +2267,27 @@ def _setup_box(
     return state, env
 
 
+# Debian's own values; a test never reads the real /etc/login.defs.
+LOGIN_DEFS = "UID_MIN 1000\nUID_MAX 60000\n"
+
+
 def _run_setup(
     env: dict[str, str],
     users: tuple[str, ...] = ("amin",),
     payload: str = PC_KEY + "\n",
+    *,
+    login_defs: str | None = LOGIN_DEFS,
 ) -> subprocess.CompletedProcess[bytes]:
+    """``login_defs`` is the fake box's /etc/login.defs; None = no such file."""
+    defs = Path(env["HOME"]).parent / "login.defs"
+    if login_defs is not None:
+        defs.write_text(login_defs, encoding="utf-8")
+    script = node_scripts.script("setup")
+    assert "/etc/login.defs" in script
+    script = script.replace("/etc/login.defs", shlex.quote(str(defs)))
     return subprocess.run(
         _bash_argv(*users),
-        input=remote_mux._frame_script(
-            node_scripts.script("setup"), payload.encode("utf-8")
-        ),
+        input=remote_mux._frame_script(script, payload.encode("utf-8")),
         capture_output=True,
         env=env,
         timeout=120,
@@ -2548,6 +2559,42 @@ class TestSetupShUnderRealBash:
         assert b"65534" in r.stdout
         assert sorted(p.name for p in (state / "users").iterdir()) == [user]
         assert not (state / "apt.log").exists()
+
+    @pytest.mark.parametrize(
+        ("login_defs", "uid"),
+        [
+            ("UID_MIN 1000\nUID_MAX 5000\n", 5001),
+            ("UID_MIN 1000\n", 60001),  # no UID_MAX: useradd's own default
+            (None, 60001),  # no login.defs at all
+            ("UID_MIN 1000\nUID_MAX 70000\n", 65534),  # the overflow id, always
+        ],
+    )
+    def test_an_account_above_uid_max_is_refused(self, tmp_path, login_defs, uid):
+        # setup's own useradd allocates in [UID_MIN, UID_MAX]: an account
+        # outside it was not made for a person.
+        state, env = _setup_box(tmp_path)
+        _existing_user(state, "svc", uid=uid)
+        r = _run_setup(env, ("amin", "svc"), login_defs=login_defs)
+        assert r.returncode == 2
+        assert _rows(r) == {"setup": "fail"}
+        assert f"uid {uid}".encode("ascii") in r.stdout
+        assert sorted(p.name for p in (state / "users").iterdir()) == ["svc"]
+        assert not (state / "apt.log").exists()
+
+    def test_the_uid_refusal_names_both_bounds(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        _existing_user(state, "svc", uid=5001)
+        r = _run_setup(env, ("svc",), login_defs="UID_MIN 1000\nUID_MAX 5000\n")
+        assert b"UID_MIN 1000" in r.stdout
+        assert b"UID_MAX 5000" in r.stdout
+
+    @pytest.mark.parametrize("uid", [1000, 5000])
+    def test_both_uid_bounds_are_a_persons_account(self, tmp_path, uid):
+        state, env = _setup_box(tmp_path)
+        _existing_user(state, "amin", uid=uid)
+        r = _run_setup(env, login_defs="UID_MIN 1000\nUID_MAX 5000\n")
+        assert r.returncode == 0, r.stderr
+        assert _rows(r)["user:amin"] == "skip"
 
     def test_the_user_phase_runs_in_bash_whatever_the_login_shell(self, tmp_path):
         state, env = _setup_box(tmp_path)

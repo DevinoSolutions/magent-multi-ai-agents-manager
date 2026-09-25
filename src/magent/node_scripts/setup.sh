@@ -256,15 +256,18 @@ run_user_phase() {
 }
 
 main() {
-  local u key entry uid uid_min rc=0
+  local u key entry uid uid_min uid_max rc=0
   if [ "$#" -eq 0 ]; then
     say fail setup "no user named: magent node setup <nick> --user <name>"
     return 2
   fi
   uid_min=$(awk '/^UID_MIN[[:space:]]/ {print $2; exit}' /etc/login.defs 2>/dev/null) || uid_min=""
   [[ $uid_min =~ ^[0-9]+$ ]] || uid_min=1000
+  uid_max=$(awk '/^UID_MAX[[:space:]]/ {print $2; exit}' /etc/login.defs 2>/dev/null) || uid_max=""
+  [[ $uid_max =~ ^[0-9]+$ ]] || uid_max=60000
   # Every name is checked before anything changes: a node user is a person's
-  # own account -- never root, never an existing system account.
+  # own account -- never root, never an existing account setup's own useradd
+  # could not have made (it allocates in [UID_MIN, UID_MAX]).
   for u in "$@"; do
     if ! [[ $u =~ $USER_RE ]]; then
       say fail setup "not a valid Unix user name: $(printf '%q' "$u")"
@@ -276,12 +279,12 @@ main() {
     fi
     if entry=$(getent passwd "$u" 2>/dev/null); then
       uid=$(printf '%s\n' "$entry" | cut -d: -f3)
-      if ! [[ $uid =~ ^[0-9]+$ ]] || ((10#$uid < 10#$uid_min)); then
-        say fail setup "$u is a system account (uid $uid, UID_MIN $uid_min): name a person's own account"
+      if ! [[ $uid =~ ^[0-9]+$ ]] || ((10#$uid < 10#$uid_min || 10#$uid > 10#$uid_max)); then
+        say fail setup "$u is not a person's account (uid $uid, outside UID_MIN $uid_min to UID_MAX $uid_max): name a person's own account"
         return 2
       fi
-      # The kernel's overflow id (nobody/nfsnobody), not a person. Accounts
-      # above UID_MAX are otherwise allowed: LDAP users can live there.
+      # The kernel's overflow id (nobody/nfsnobody), even under a login.defs
+      # whose UID_MAX reaches it.
       if ((10#$uid == 65534)); then
         say fail setup "$u is the overflow account (uid 65534): name a person's own account"
         return 2
