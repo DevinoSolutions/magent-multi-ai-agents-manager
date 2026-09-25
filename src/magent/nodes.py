@@ -19,6 +19,7 @@ import re
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
@@ -1495,16 +1496,34 @@ def placement_samples(
     sample -- three quiet samples from before someone started a build must not
     win. ``live_sample`` is the caller's seam to ``remote_mux.sample`` (this
     module never talks to a node); None -- a dry run -- scores a thin node on
-    what it has. A failed live reading leaves the node unscored.
+    what it has.
+
+    The sparse nodes are probed at once, one thread each, so a pool where
+    every node is thin (a fresh install, the sync daemon off) costs one probe
+    timeout before launch, not one per node. ``live_sample`` signals an
+    unreachable node by returning None, which leaves that node unscored; it
+    must not raise for that. Anything it does raise propagates (the caller's
+    wrapper is where a transport error becomes None). The live reading is
+    deliberately NOT appended to ``load.jsonl``: the sync daemon owns sampling
+    and that file has one writer, so a second placement pass inside the
+    window probes the node again.
     """
+    windows = {
+        nick: in_window(read_load_history(nick, nodes_dir=nodes_dir), now=now)
+        for nick in config.settings.nodes
+    }
+    sparse = [nick for nick, w in windows.items() if len(w) < MIN_WINDOW_SAMPLES]
+    readings: dict[str, LoadSample | None] = {}
+    if live_sample is not None and sparse:
+        with ThreadPoolExecutor(max_workers=len(sparse)) as executor:
+            readings = dict(zip(sparse, executor.map(live_sample, sparse), strict=True))
     samples: dict[str, list[LoadSample]] = {}
     sampled: set[str] = set()
-    for nick in config.settings.nodes:
-        window = in_window(read_load_history(nick, nodes_dir=nodes_dir), now=now)
-        if len(window) >= MIN_WINDOW_SAMPLES or live_sample is None:
+    for nick, window in windows.items():
+        if nick not in readings:
             samples[nick] = window
             continue
-        reading = live_sample(nick)
+        reading = readings[nick]
         if reading is None:
             samples[nick] = []
             continue

@@ -17,6 +17,9 @@ be taken.
 
 from __future__ import annotations
 
+import dataclasses
+import json
+import threading
 import time
 
 import pytest
@@ -576,6 +579,83 @@ class TestTheSparseRule:
         placement = nodes.place(config, samples, now=NOW, map_entry=None, live=sampled)
 
         assert [s.live for s in placement.scores] == [True]
+
+    def test_exactly_the_minimum_in_window_is_not_sparse(self, tmp_path):
+        _write_history(
+            tmp_path, "second", [NOW - i for i in range(nodes.MIN_WINDOW_SAMPLES)]
+        )
+        live = _LiveSampler(_sample())
+
+        nodes.placement_samples(
+            pool("second"), now=NOW, live_sample=live, nodes_dir=tmp_path
+        )
+
+        assert live.calls == []
+
+    def test_one_under_the_minimum_in_window_is_sparse(self, tmp_path):
+        _write_history(
+            tmp_path, "second", [NOW - i for i in range(nodes.MIN_WINDOW_SAMPLES - 1)]
+        )
+        live = _LiveSampler(_sample())
+
+        nodes.placement_samples(
+            pool("second"), now=NOW, live_sample=live, nodes_dir=tmp_path
+        )
+
+        assert live.calls == ["second"]
+
+    def test_a_sample_older_than_the_window_does_not_count_toward_the_minimum(
+        self, tmp_path
+    ):
+        stale = NOW - nodes.PLACEMENT_WINDOW_S - 1
+        recent = [NOW - i for i in range(nodes.MIN_WINDOW_SAMPLES - 1)]
+        _write_history(tmp_path, "second", [*recent, stale])
+        live = _LiveSampler(_sample())
+
+        nodes.placement_samples(
+            pool("second"), now=NOW, live_sample=live, nodes_dir=tmp_path
+        )
+
+        assert live.calls == ["second"]
+
+    def test_anything_the_sampler_raises_propagates(self, tmp_path):
+        def broken(nick: str) -> LoadSample | None:
+            raise TypeError(nick)
+
+        with pytest.raises(TypeError):
+            nodes.placement_samples(
+                pool("second"), now=NOW, live_sample=broken, nodes_dir=tmp_path
+            )
+
+    def test_the_sparse_nodes_are_probed_at_once_not_one_after_another(self, tmp_path):
+        # Each probe waits for the other two: called one after another, the first
+        # one's barrier times out and BrokenBarrierError propagates.
+        barrier = threading.Barrier(3, timeout=2)
+
+        def rendezvous(nick: str) -> LoadSample | None:
+            barrier.wait()
+            return _sample(load1={"second": 1.0, "third": 2.0, "fourth": 3.0}[nick])
+
+        samples, sampled = nodes.placement_samples(
+            pool("second", "third", "fourth"),
+            now=NOW,
+            live_sample=rendezvous,
+            nodes_dir=tmp_path,
+        )
+
+        assert list(samples) == ["second", "third", "fourth"]
+        assert [samples[n][0].load1 for n in samples] == [1.0, 2.0, 3.0]
+        assert sampled == frozenset({"second", "third", "fourth"})
+
+
+def _write_history(tmp_path, nick: str, stamps: list[float]) -> None:
+    """``<nick>/load.jsonl`` holding one default sample per timestamp."""
+    target = nodes.load_path(nick, nodes_dir=tmp_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        "".join(json.dumps(dataclasses.asdict(_sample(ts))) + "\n" for ts in stamps),
+        encoding="utf-8",
+    )
 
 
 @pytest.fixture
