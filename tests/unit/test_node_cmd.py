@@ -7,6 +7,7 @@ classes.
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -57,6 +58,43 @@ class TestTheNodeTable:
         assert [r[0] for r in rows] == ["third", "second"]
         assert rows[1][:5] == ["second", "devino-second", "amin", "0.40", "(31)"]
         assert "50%" in rows[1]
+
+    def test_memory_and_sessions_come_from_the_newest_sample(self, runner, tmp_config):
+        # Levels, not rates: the row shows the NEWEST reading even when it is
+        # neither first nor last in the file.
+        now = time.time()
+        rows = [
+            (now - 600, 16000, 8000, 1),
+            (now - 30, 16000, 4000, 3),
+            (now - 1200, 16000, 12000, 2),
+        ]
+        path = nodes.load_path("second")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "ts": ts,
+                        "nproc": 4,
+                        "load1": 1.0,
+                        "load5": 1.0,
+                        "load15": 1.0,
+                        "mem_total_mb": total,
+                        "mem_avail_mb": avail,
+                        "my_sessions": mine,
+                    }
+                )
+                + "\n"
+                for ts, total, avail, mine in rows
+            ),
+            encoding="utf-8",
+        )
+        cfg = tmp_config(config_json(("second",), []))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node"])
+
+        cells = _row(result.stdout, "second").split()
+        assert cells[5:8] == ["25%", "free", "3"]
 
     def test_a_node_without_samples_says_no_data(self, runner, tmp_config):
         cfg = tmp_config(config_json(("second",), []))
