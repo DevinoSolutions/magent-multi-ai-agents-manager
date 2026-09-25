@@ -35,6 +35,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -54,6 +55,11 @@ TOOL_TIMEOUT_S = 120
 _CLEAN = frozenset({"ok", "did", "skip", "drop"})
 # What a detail shows in place of the gh token, should a tool ever echo it.
 _MASK = "[gh-token]"
+# gh prefers any of these over the login it is told to store, and
+# `gh auth login --with-token` refuses while one is set: never hand them on.
+_GH_TOKEN_VARS = frozenset(
+    {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
+)
 
 
 @dataclass
@@ -73,7 +79,11 @@ class Ctx:
 
 def _row(ctx: Ctx, status: str, item: str, detail: str = "") -> None:
     """One status<TAB>item<TAB>detail line; the detail is flattened onto it,
-    and the gh token is masked out of it."""
+    and the gh token is masked out of it -- the backstop. The row itself is
+    never cut, so a repair hint after a tool's output always survives: only
+    the tool's fragment is cut, by ``_last``, and a caller that hands
+    ``_last`` output which may hold the token masks it FIRST (``_step_gh``),
+    so no cut can split the token before the mask sees it."""
     if ctx.token:
         detail = detail.replace(ctx.token, _MASK)
     ctx.rows.append(status)
@@ -102,12 +112,14 @@ def _remember(ctx: Ctx, step: str, want: str, mark: int) -> None:
 
 
 def _load(path: Path) -> object:
-    """A JSON file's value: {} when the file does not exist, None when it is
-    not JSON."""
+    """A JSON file's value: {} when the file does not exist, None when it
+    cannot be read (a directory there, no permission) or is not JSON."""
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {}
+    except OSError:
+        return None
     try:
         return json.loads(text)
     except ValueError:
@@ -130,18 +142,36 @@ def _mkdirs(path: Path) -> None:
 def _install(path: Path, data: bytes, mode: int) -> None:
     """Write ``data`` to ``path`` atomically -- a reader (a hook Claude Code
     fires mid-apply, a concurrent ``claude``) sees the old file or the new
-    one, never half of either. The temp file is created fresh (a stale one is
-    removed first, so neither its mode nor a symlink there carries over) and
-    its ``mode`` is set by an explicit chmod before it replaces ``path``."""
+    one, never half of either.
+
+    The temp file is ``mkstemp``'s: a fresh, uniquely named file next to
+    ``path``, so two applies for one node user (this PC and a laptop sharing
+    the user) never write through each other's temp. Its ``mode`` is set on
+    the open descriptor (never left to the umask), the bytes are fsync'd
+    before the rename, and ``os.replace`` swaps the name -- a symlink at
+    ``path`` is replaced, never followed. Any failure removes the temp and
+    re-raises, so nothing is left behind."""
     _mkdirs(path.parent)
-    tmp = path.with_name(path.name + ".magent-tmp")
-    with contextlib.suppress(FileNotFoundError):
-        tmp.unlink()
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(data)
-    tmp.chmod(mode)
-    tmp.replace(path)
+    fd, name = tempfile.mkstemp(
+        dir=str(path.parent), prefix="." + path.name + ".", suffix=".magent-tmp"
+    )
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fh.fileno(), mode)
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if not hasattr(os, "fchmod"):
+            # Windows before Python 3.13, where only the in-process tests
+            # run: the node is Linux and always takes the fchmod above.
+            tmp.chmod(mode)
+        os.replace(name, str(path))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
 
 
 def _write(path: Path, value: object) -> None:
@@ -154,11 +184,20 @@ def _which(ctx: Ctx, program: str) -> str | None:
     return shutil.which(program, path=ctx.path)
 
 
-def _tool(argv: list[str], stdin: str = "") -> subprocess.CompletedProcess[str]:
+def _gh_env() -> dict[str, str]:
+    """This process's environment minus the gh token variables."""
+    inherited = os.environ  # noqa: TID251  # reason: runs on the node under a bare python3, stdlib only -- magent.env is not installed there
+    return {k: v for k, v in inherited.items() if k not in _GH_TOKEN_VARS}
+
+
+def _tool(
+    argv: list[str], stdin: str = "", *, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     """One bounded child. stdin is always given, so a tool that reads it gets
     this text and then EOF, never the payload's pipe. It crosses as bytes, so
     the text arrives exactly as given (a text-mode pipe would write "\\r\\n"
-    for "\\n" on Windows, where the in-process tests run)."""
+    for "\\n" on Windows, where the in-process tests run). ``env`` None is
+    this process's own environment."""
     try:
         done = subprocess.run(
             argv,
@@ -166,6 +205,7 @@ def _tool(argv: list[str], stdin: str = "") -> subprocess.CompletedProcess[str]:
             capture_output=True,
             timeout=TOOL_TIMEOUT_S,
             check=False,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(
@@ -182,6 +222,10 @@ def _tool(argv: list[str], stdin: str = "") -> subprocess.CompletedProcess[str]:
 
 
 def _last(text: str) -> str:
+    """A tool's last output line, cut to 200 characters -- the tool's fragment
+    of a row, never the row. Output that may hold the gh token must be masked
+    BEFORE it comes here, or the cut could leave a prefix ``_row`` can't
+    recognize."""
     lines = text.strip().splitlines()
     return lines[-1][:200] if lines else "no output"
 
@@ -273,6 +317,7 @@ def _step_gh(ctx: Ctx) -> None:
             "gh",
             "this PC has no gh login to share; on the node run: gh auth login",
         )
+        ctx.store.pop("gh", None)
         return
     gh = _which(ctx, "gh")
     if gh is None:
@@ -282,10 +327,12 @@ def _step_gh(ctx: Ctx) -> None:
             "gh",
             "gh is not installed on this node -- run: magent node setup",
         )
+        ctx.store.pop("gh", None)
         return
     want = _digest(ctx, "gh")
+    env = _gh_env()
     if _unchanged(ctx, "gh", want):
-        who = _tool([gh, "api", "user", "--jq", ".login"])
+        who = _tool([gh, "api", "user", "--jq", ".login"], env=env)
         if who.returncode == 0 and who.stdout.strip() == login:
             _row(ctx, "skip", "gh", f"logged in as {login}")
             return
@@ -293,23 +340,27 @@ def _step_gh(ctx: Ctx) -> None:
     done = _tool(
         [gh, "auth", "login", "--hostname", "github.com", "--with-token"],
         ctx.token + "\n",
+        env=env,
     )
+    # gh is the only child ever given the token: its output is masked before
+    # _last cuts it.
     if done.returncode != 0:
         _row(
             ctx,
             "fail",
             "gh",
-            f"gh auth login refused the token: {_last(done.stderr)}",
+            "gh auth login refused the token: "
+            f"{_last(done.stderr.replace(ctx.token, _MASK))}",
         )
     else:
-        helper = _tool([gh, "auth", "setup-git"])
+        helper = _tool([gh, "auth", "setup-git"], env=env)
         if helper.returncode != 0:
             _row(
                 ctx,
                 "warn",
                 "gh",
                 f"logged in as {login}, but gh auth setup-git failed: "
-                f"{_last(helper.stderr)}",
+                f"{_last(helper.stderr.replace(ctx.token, _MASK))}",
             )
         else:
             _row(ctx, "did", "gh", f"logged in as {login}")
@@ -508,7 +559,8 @@ STEPS: tuple[tuple[str, Callable[[Ctx], None]], ...] = (
 
 def run(*, work: Path, home: Path, path: str, token: str, force: bool) -> int:
     """Apply the payload unpacked in ``work`` to ``home``. 1 when any step
-    failed, else 0. The store is saved even when a step raised."""
+    failed, else 0. The store is saved even when a step raised; a store that
+    cannot be saved is its own ``fail`` row."""
     manifest = _load(work / "manifest.json")
     if not isinstance(manifest, dict) or manifest.get("version") != MANIFEST_VERSION:
         sys.stdout.write(
@@ -532,11 +584,14 @@ def run(*, work: Path, home: Path, path: str, token: str, force: bool) -> int:
         for name, step in STEPS:
             try:
                 step(ctx)
-            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            except Exception as exc:  # noqa: BLE001  # reason: one step's bug, of any type, must fail only that step's row -- the steps after it still run, and the row still goes through _row's token mask
                 _row(ctx, "fail", name, f"{type(exc).__name__}: {exc}")
                 ctx.store.pop(name, None)
     finally:
-        _write(store_path, {"version": 1, "digests": ctx.store})
+        try:
+            _write(store_path, {"version": 1, "digests": ctx.store})
+        except OSError as exc:
+            _row(ctx, "fail", "store", f"~/{STORE.as_posix()}: {exc}")
     return 1 if "fail" in ctx.rows else 0
 
 
