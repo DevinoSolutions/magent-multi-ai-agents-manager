@@ -139,6 +139,11 @@ SSH_CONNECTION_OPTS = (
 SSH_TRANSPORT_RC = 255
 SSH_MISSING_RC = 127
 
+# The tmux server every node session lives on (`tmux -L magent`, spec D10).
+# ONE owner: the pane's remote attach command uses it and remote_mux re-exports
+# it for every probe, so the two can never name different servers.
+TMUX_SOCKET = "magent"
+
 # Backoff: 2s doubling, capped. The cap is what makes "retry forever" safe --
 # a host that is down for eight hours costs at most one handshake every 30s,
 # which no sshd notices, while a blip is healed in about two seconds.
@@ -308,7 +313,25 @@ MIN_WIDTH = 20
 MIN_ROWS = 1
 
 
-def remote_attach_command(sid: str) -> str:
+# The multiplexers an attach pane can drive. psmux is the historical default: a
+# Windows magent host, one psmux server PER SESSION, its socket named after the
+# sid. tmux is a node's (spec D10): ONE server per node user on the socket
+# below, every session on it, named by sid -- which is what lets a phone's
+# `tmux -L magent attach` list every session in its picker. TMUX_SOCKET (the
+# one owner of that name; remote_mux re-exports it) sits beside
+# SSH_MISSING_RC -- see the skip-if-present note below.
+MUXES = ("psmux", "tmux")
+
+
+def _check_mux(mux: str) -> None:
+    """Refuse a multiplexer this module cannot spell, rather than guess one."""
+    if mux not in MUXES:
+        raise ValueError(
+            f"unknown multiplexer {mux!r} (expected one of: {', '.join(MUXES)})"
+        )
+
+
+def remote_attach_command(sid: str, mux: str = "psmux") -> str:
     """The remote command an attach pane runs, for session ``sid``.
 
     Direct ``psmux attach`` first: it connects in well under a second, where
@@ -316,10 +339,22 @@ def remote_attach_command(sid: str) -> str:
     windows on a loaded host) made a big attach take many minutes. The session
     picker is only the fallback, for a session id the host no longer has.
 
+    ``mux="tmux"`` is a node pane. Its target is ``=<sid>``, tmux's EXACT
+    match: a bare ``-t api`` is a prefix match, harmless on psmux's one
+    session per socket but, on a node's shared socket, able to land the pane
+    in ``api2``. The target is single-quoted because this string is parsed by
+    the node user's login shell, and zsh would expand a bare leading ``=`` as a
+    command lookup; quoted, every shell hands tmux ``=<sid>``. No picker fallback: a node runs no
+    magent at all, so ``|| magent sessions`` would only print "command not
+    found".
+
     Single-sourced here because ``cli/attach.py::_attach_markers`` has to
     recognize this exact spelling in a live process's command line -- the two
     drifting apart would make every healthy pane read as a corpse.
     """
+    _check_mux(mux)
+    if mux == "tmux":
+        return f"tmux -L {TMUX_SOCKET} attach -t '={sid}'"
     return f"psmux -L {sid} attach || magent sessions {sid}"
 
 

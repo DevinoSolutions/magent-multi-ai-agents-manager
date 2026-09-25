@@ -1016,3 +1016,45 @@ class TestTodaysPsmuxShapesArePinned:
             "psmux -L api attach || magent sessions api",
             True,
         )
+
+
+class TestTheTmuxMultiplexer:
+    """A node pane: ONE tmux server per node user on the `magent` socket, every
+    session on it, named by sid (spec D10). Everything psmux keeps its bytes."""
+
+    def test_a_tmux_pane_attaches_on_the_one_magent_socket(self):
+        # No `|| magent sessions` fallback: a node has no magent installed, so
+        # the picker would only ever print "command not found" into the pane.
+        assert (
+            attach_client.remote_attach_command("api", mux="tmux")
+            == "tmux -L magent attach -t '=api'"
+        )
+
+    def test_psmux_is_the_default_multiplexer(self):
+        assert attach_client.remote_attach_command(
+            "api", mux="psmux"
+        ) == attach_client.remote_attach_command("api")
+
+    def test_an_unknown_multiplexer_is_refused_rather_than_guessed(self):
+        with pytest.raises(ValueError, match="screen"):
+            attach_client.remote_attach_command("api", mux="screen")
+
+    def test_the_tmux_socket_name_is_assigned_exactly_once(self):
+        # PR-B and PR-C both introduce this constant and merge in either
+        # order. A second plain assignment trips no lint (F811 is for defs and
+        # imports), so it would silently leave two places to edit -- the one
+        # owner is pinned structurally instead.
+        import ast
+        from pathlib import Path
+
+        tree = ast.parse(Path(attach_client.__file__).read_text(encoding="utf-8"))
+        names = [
+            target.id
+            for node in tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            for target in (
+                node.targets if isinstance(node, ast.Assign) else [node.target]
+            )
+            if isinstance(target, ast.Name)
+        ]
+        assert names.count("TMUX_SOCKET") == 1
