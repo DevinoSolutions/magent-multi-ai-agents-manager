@@ -1008,6 +1008,15 @@ class TestNodeStores:
     ):
         import logging
 
+        self._write(
+            state_dir,
+            "k.json",
+            state="working",
+            ts=990.0,
+            cwd="/w/local",
+            session_id="s",
+        )
+
         def _boom() -> list[tuple[str, str, object]]:
             raise ValueError("bad node map")
 
@@ -1015,7 +1024,101 @@ class TestNodeStores:
         with caplog.at_level(logging.WARNING, logger="magent.attention"):
             views = engine.poll()
 
-        assert views == []
+        assert [(v.name, v.cwd) for v in views] == [("local", "/w/local")]
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1
         assert "bad node map" in warnings[0].getMessage()
+
+    def test_a_failing_tick_keeps_the_last_ticks_node_views(self, state_dir, tmp_path):
+        store = tmp_path / "second-api"
+        self._write(
+            store,
+            "k.json",
+            state="needs-input",
+            ts=990.0,
+            cwd="/home/amin/magent/api",
+            session_id="s",
+        )
+        calls = {"n": 0}
+
+        def _stores() -> list[tuple[str, str, object]]:
+            calls["n"] += 1
+            n = calls["n"]
+            if n == 1:
+                return [("api", "@second", store)]
+            if n == 2:
+                raise OSError("nodes unreachable")
+            if n == 3:
+                return []
+            raise OSError("nodes unreachable again")
+
+        engine = AttentionEngine(now=lambda: 1000.0, extra_stores=_stores)
+
+        tick1 = engine.poll()
+        assert [(v.name, v.cwd) for v in tick1] == [
+            ("api", "@second:/home/amin/magent/api")
+        ]
+
+        tick2 = engine.poll()
+        assert [(v.name, v.cwd) for v in tick2] == [
+            ("api", "@second:/home/amin/magent/api")
+        ]
+
+        tick3 = engine.poll()
+        assert tick3 == []
+
+        tick4 = engine.poll()
+        assert tick4 == []
+
+    def test_warns_once_per_failure_streak_and_infos_once_on_recovery(
+        self, state_dir, tmp_path, caplog
+    ):
+        import logging
+
+        calls = {"n": 0}
+
+        def _stores() -> list[tuple[str, str, object]]:
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                raise OSError("nodes unreachable")
+            return []
+
+        engine = AttentionEngine(now=lambda: 1000.0, extra_stores=_stores)
+
+        with caplog.at_level(logging.INFO, logger="magent.attention"):
+            engine.poll()
+            engine.poll()
+            engine.poll()
+            engine.poll()
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        infos = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert len(warnings) == 1
+        assert len(infos) == 1
+        assert "readable again" in infos[0].getMessage()
+
+    def test_the_warning_names_the_root_that_failed_to_read(
+        self, state_dir, tmp_path, caplog, monkeypatch
+    ):
+        import logging
+
+        root = tmp_path / "second-api"
+        root.mkdir(parents=True)
+
+        def _read_store(r: object) -> list[dict[str, object]]:
+            if r == root:
+                raise ValueError("bad record")
+            return []
+
+        monkeypatch.setattr(agent_state, "read_store", _read_store)
+
+        engine = AttentionEngine(
+            now=lambda: 1000.0, extra_stores=lambda: [("api", "@second", root)]
+        )
+        with caplog.at_level(logging.WARNING, logger="magent.attention"):
+            engine.poll()
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert str(root) in warnings[0].getMessage()
+        assert "bad record" in warnings[0].getMessage()

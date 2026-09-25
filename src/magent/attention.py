@@ -100,6 +100,8 @@ class AttentionEngine:
         self._extra_stores = extra_stores
         self._last_state: dict[str, str] = {}
         self._last_fired: dict[tuple[str, str], float] = {}
+        self._last_node_views: list[SessionView] = []
+        self._node_store_failing = False
 
     def poll(self) -> list[SessionView]:
         """Read the store -- and every ``extra_stores`` store: node sessions'
@@ -111,20 +113,35 @@ class AttentionEngine:
             if view is not None:
                 views.append(view)
         if self._extra_stores is not None:
+            where = "listing node stores"
             try:
+                node_views: list[SessionView] = []
                 for label, key, root in self._extra_stores():
+                    where = str(root)
                     for rec in agent_state.read_store(root):
                         view = self._view(rec, now, label=label, key=key)
                         if view is not None:
-                            views.append(view)
+                            node_views.append(view)
             except (OSError, ValueError) as exc:
                 # A node store going unreadable (the callable itself, or a
                 # store it names) must never take the whole daemon down with
-                # it -- this tick falls back to the local views already
-                # collected above, and the next tick tries again.
-                get_logger("attention").warning(
-                    "node stores unavailable this tick: %s", exc
-                )
+                # it -- this tick falls back to the LAST tick's node views
+                # (they age out on their own via staleness) instead of
+                # dropping them, and the next tick tries again. Only the
+                # first failure of a streak is logged, so a store stuck
+                # down doesn't spam the log every tick.
+                if not self._node_store_failing:
+                    get_logger("attention").warning(
+                        "node stores unavailable this tick (%s): %s", where, exc
+                    )
+                    self._node_store_failing = True
+                views.extend(self._last_node_views)
+            else:
+                if self._node_store_failing:
+                    get_logger("attention").info("node stores readable again")
+                    self._node_store_failing = False
+                self._last_node_views = node_views
+                views.extend(node_views)
         views.sort(key=lambda v: (_URGENCY.get(v.state, 99), -v.ts))
         return views
 
