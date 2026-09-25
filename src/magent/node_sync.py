@@ -63,8 +63,31 @@ MISCONFIGURED = "misconfigured"  # the nick does not resolve (D4, no user)
 LOCKED = "locked"  # another pull holds this node right now
 
 
+def daemon_running() -> bool:
+    """Is a node sync daemon alive right now?
+
+    Answered by the daemon's lock, never by the pid file. The daemon holds
+    ``LOCK_NAME`` for its whole life and the OS releases it the instant the
+    process dies, so the lock cannot outlive its holder. A pid file can: after a
+    crash or a reboot it survives, and Windows recycles the number onto an
+    unrelated process, which ``pid_alive`` then calls the daemon. The probe
+    takes the lock and lets it go at once; only a holder removes the lock file,
+    so a probe never disturbs a running daemon's lock.
+    """
+    try:
+        with exclusive_lock(LOCK_NAME):
+            return False
+    except LockHeld:
+        return True
+
+
 def daemon_pid() -> int | None:
-    """PID of the running node sync daemon, or None. Clears a stale pid file."""
+    """The pid the pid file names, if that process is alive, else None. Clears
+    a pid file whose process is gone.
+
+    A live pid is NOT proof of a daemon -- ask ``daemon_running``. Once the
+    lock has said a daemon exists, this is its pid: the kill target and the log
+    line."""
     try:
         pid = int(_PID_PATH.read_text().strip())
     except (OSError, ValueError):
@@ -87,30 +110,61 @@ def _clear_pid() -> None:
             _PID_PATH.unlink()
 
 
-def stop_daemon() -> bool:
-    """Stop the node sync daemon. True only if a kill was issued and the
-    process is confirmed gone. A forced kill skips the daemon's own cleanup, so
-    this owns the heartbeat removal that tells 'off' from 'crashed'."""
-    pid = daemon_pid()
-    if not pid:
-        return False
+def _kill(pid: int) -> bool:
+    """Ask ``pid`` to die. True when the request was accepted."""
     if sys.platform == "win32":
         result = subprocess.run(
             ["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False
         )
-        killed = result.returncode == 0
-    else:
-        try:
-            os.kill(pid, 15)  # SIGTERM
-            killed = True
-        except OSError:
-            killed = False
-    if killed and not pid_alive(pid):
-        with contextlib.suppress(OSError):
-            _PID_PATH.unlink()
-        clear_heartbeat(HEARTBEAT_NAME)
-        return True
-    return False
+        return result.returncode == 0
+    try:
+        os.kill(pid, 15)  # SIGTERM
+    except OSError:
+        return False
+    return True
+
+
+def _clear_leftovers() -> None:
+    """Remove the pid file and the heartbeat, so ``status`` reads 'off'."""
+    with contextlib.suppress(OSError):
+        _PID_PATH.unlink()
+    clear_heartbeat(HEARTBEAT_NAME)
+
+
+# How long stop_daemon waits for a killed daemon to be gone, and how often it
+# looks. SIGTERM is asynchronous on POSIX: the pid still answers for a moment.
+STOP_SETTLE_S = 2.0
+STOP_POLL_S = 0.1
+
+
+def stop_daemon(
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+) -> bool:
+    """Stop the node sync daemon. True when no daemon is left running and
+    there was something to stop or clear; False when there was nothing at all,
+    or when the kill did not land within ``STOP_SETTLE_S``.
+
+    Only a daemon that holds the lock is killed (``daemon_running``). With the
+    lock free there is no daemon, whatever the pid file says -- its number may
+    belong to a stranger by now -- so the leftovers are cleared and nothing is
+    killed. A forced kill skips the daemon's own cleanup, so this owns the
+    heartbeat removal that tells 'off' from 'crashed'."""
+    if not daemon_running():
+        had_pid = _PID_PATH.exists()
+        _clear_leftovers()
+        return had_pid
+    pid = daemon_pid()
+    if not pid or not _kill(pid):
+        return False
+    deadline = now() + STOP_SETTLE_S
+    while pid_alive(pid):
+        if now() >= deadline:
+            return False
+        sleep(STOP_POLL_S)
+    _clear_leftovers()
+    return True
 
 
 def wanted(config: MagentConfig) -> bool:

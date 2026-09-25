@@ -11,9 +11,11 @@ import ast
 import logging
 import os
 import re
+import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -28,8 +30,11 @@ from magent.config import (
 )
 from magent.env import get_env
 from magent.lockfile import LockHeld, exclusive_lock
-from magent.log import write_heartbeat
+from magent.log import heartbeat_age, write_heartbeat
 from magent.nodes import NodeMapEntry
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 _TESTS = Path(__file__).resolve().parents[1]
 _BOOST_PIN = re.compile(r'MAGENT_PSMUX_BOOST"[^\n]*"0"')
@@ -257,6 +262,44 @@ class TestTheDaemonsPidFile:
         node_sync._PID_PATH.write_text(str(os.getpid()))
         assert node_sync.daemon_pid() == os.getpid()
 
+    def test_a_recycled_pid_is_never_killed(self, unrelated):
+        """The lock is free, so no daemon exists and the pid file names a
+        stranger: clear the leftovers, kill nothing."""
+        _record_pid(unrelated.pid)
+        write_heartbeat(node_sync.HEARTBEAT_NAME)  # a crash marker
+        assert node_sync.stop_daemon() is True
+        assert unrelated.poll() is None
+        assert not node_sync._PID_PATH.exists()
+        assert heartbeat_age(node_sync.HEARTBEAT_NAME) is None
+
+    def test_a_sigterm_is_given_time_to_land(self, daemon_lock, monkeypatch):
+        """POSIX SIGTERM is asynchronous: the pid can still answer right after
+        the kill. The stop waits for it instead of reporting a failure."""
+        answers = iter([True, True, False])
+        monkeypatch.setattr(node_sync, "pid_alive", lambda _pid: next(answers))
+        kills: list[int] = []
+        monkeypatch.setattr(node_sync, "_kill", lambda pid: kills.append(pid) or True)
+        naps: list[float] = []
+        _record_pid(424242)
+        write_heartbeat(node_sync.HEARTBEAT_NAME)
+        assert node_sync.stop_daemon(sleep=naps.append) is True
+        assert kills == [424242]
+        assert naps == [node_sync.STOP_POLL_S]
+        assert heartbeat_age(node_sync.HEARTBEAT_NAME) is None
+
+    def test_a_daemon_that_outlives_the_settle_is_not_called_stopped(
+        self, daemon_lock, monkeypatch
+    ):
+        monkeypatch.setattr(node_sync, "pid_alive", lambda _pid: True)
+        monkeypatch.setattr(node_sync, "_kill", lambda _pid: True)
+        clock = iter([0.0, 1.0, node_sync.STOP_SETTLE_S + 0.5])
+        _record_pid(424242)
+        assert (
+            node_sync.stop_daemon(sleep=lambda _s: None, now=lambda: next(clock))
+            is False
+        )
+        assert node_sync._PID_PATH.exists()
+
 
 class TestTheImportLaw:
     def test_node_sync_never_imports_cli_launch_or_upload_server(self):
@@ -301,6 +344,33 @@ class TestTheDaemonHasOneName:
         assert node_sync._PID_PATH.name == f"{name}.pid"
 
 
+def _record_pid(pid: int) -> None:
+    node_sync._PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+    node_sync._PID_PATH.write_text(str(pid))
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.fixture
+def unrelated() -> Iterator[subprocess.Popen[bytes]]:
+    """A live process that is NOT the daemon -- what a recycled pid names."""
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        yield child
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+
+
+@pytest.fixture
+def daemon_lock() -> Iterator[None]:
+    """The daemon's lock, held by this test: the daemon is alive."""
+    with exclusive_lock(node_sync.LOCK_NAME):
+        yield
+
+
 @pytest.fixture
 def sync_on(monkeypatch):
     monkeypatch.setenv("MAGENT_NODE_SYNC", "1")
@@ -315,6 +385,10 @@ def spawned(monkeypatch) -> list[list[str]]:
 
 
 class TestEnsureNodeSync:
+    @pytest.fixture(autouse=True)
+    def _no_wedge_on_record(self, monkeypatch):
+        monkeypatch.setattr(launch, "_node_sync_report", launch._NodeSyncReport())
+
     def test_the_argv_runs_node_sync_with_the_same_config(self):
         assert launch.node_sync_argv("C:/cfg.json") == [
             sys.executable,
@@ -348,22 +422,51 @@ class TestEnsureNodeSync:
         assert launch.ensure_node_sync(_config(), "cfg.json") is True
         assert spawned == [launch.node_sync_argv("cfg.json")]
 
-    def test_a_live_daemon_is_never_re_aimed(self, sync_on, spawned):
-        node_sync._PID_PATH.parent.mkdir(parents=True, exist_ok=True)
-        node_sync._PID_PATH.write_text(str(os.getpid()))
+    def test_a_recycled_pid_is_no_daemon(self, sync_on, spawned, unrelated, caplog):
+        """After a crash or a reboot the pid file survives and Windows hands
+        the number to an unrelated process. The lock is free, so there is no
+        daemon: spawn one, and do not call the stranger a wedged daemon."""
+        caplog.set_level(logging.DEBUG, logger="magent.nodes")
+        _record_pid(unrelated.pid)
+        assert launch.ensure_node_sync(_config(), "cfg.json") is True
+        assert spawned == [launch.node_sync_argv("cfg.json")]
+        assert _warnings(caplog) == []
+
+    def test_a_live_daemon_is_never_re_aimed_and_says_nothing(
+        self, sync_on, spawned, daemon_lock, caplog
+    ):
+        caplog.set_level(logging.DEBUG, logger="magent.nodes")
+        _record_pid(os.getpid())
         write_heartbeat(node_sync.HEARTBEAT_NAME)
         assert launch.ensure_node_sync(_config(), "other.json") is False
         assert spawned == []
+        assert _warnings(caplog) == []
 
     def test_a_live_daemon_with_a_stale_heartbeat_is_reported_not_replaced(
-        self, sync_on, spawned, caplog
+        self, sync_on, spawned, daemon_lock, caplog
     ):
-        caplog.set_level(logging.WARNING, logger="magent.nodes")
-        node_sync._PID_PATH.parent.mkdir(parents=True, exist_ok=True)
-        node_sync._PID_PATH.write_text(str(os.getpid()))
+        caplog.set_level(logging.DEBUG, logger="magent.nodes")
+        _record_pid(os.getpid())
         assert launch.ensure_node_sync(_config()) is False
         assert spawned == []
-        assert any("heartbeat is stale" in r.getMessage() for r in caplog.records)
+        (warning,) = _warnings(caplog)
+        assert "heartbeat is stale" in warning
+        assert str(os.getpid()) in warning
+
+    def test_a_wedge_is_reported_once_and_its_recovery_once(
+        self, sync_on, spawned, daemon_lock, caplog
+    ):
+        caplog.set_level(logging.DEBUG, logger="magent.nodes")
+        _record_pid(os.getpid())
+        launch.ensure_node_sync(_config())
+        launch.ensure_node_sync(_config())
+        assert len(_warnings(caplog)) == 1
+        write_heartbeat(node_sync.HEARTBEAT_NAME)
+        launch.ensure_node_sync(_config())
+        launch.ensure_node_sync(_config())
+        infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert len([m for m in infos if "fresh again" in m]) == 1
+        assert spawned == []
 
 
 class TestServeSupervisesTheDaemon:

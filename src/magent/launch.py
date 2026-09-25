@@ -470,33 +470,58 @@ def node_sync_argv(config_path: str | None) -> list[str]:
     return [*args, "node", "sync"]
 
 
+@dataclass
+class _NodeSyncReport:
+    """What ensure_node_sync last said about a wedged daemon: the warning
+    fires on the transition into a wedge and the recovery on the way out,
+    never once per supervisor interval."""
+
+    wedged: bool = False
+
+
+_node_sync_report = _NodeSyncReport()
+
+
 def ensure_node_sync(config: MagentConfig, config_path: str | None = None) -> bool:
     """Start the node sync daemon detached unless it is gated off or already
     running. True when a spawn was issued.
 
+    "Running" is the daemon's LOCK (``node_sync.daemon_running``), never its pid
+    file: after a crash or a reboot the pid file survives, the number is
+    recycled onto an unrelated process, and a pid check would read "alive"
+    forever -- never respawning, and pointing the user's `--stop` at a
+    stranger. The pid is read for the log line only.
+
     A live daemon is NEVER re-aimed or replaced: it re-reads its own config file
-    when that changes, and a second one would only lose the lock. A live pid with
-    a stale heartbeat is a wedged daemon -- reported, left for the user
-    (`magent node sync --stop`), never killed from here. The respawn rate of a
-    daemon that keeps dying is the caller's interval.
+    when that changes, and a second one would only lose the lock. A held lock
+    with a stale heartbeat is a wedged daemon -- reported once, left for the
+    user (`magent node sync --stop`), never killed from here. The respawn rate
+    of a daemon that keeps dying is the caller's interval.
     """
     if not node_sync_enabled(config):
         return False
     from magent import node_sync  # in-body: same reason as node_sync_enabled
 
-    pid = node_sync.daemon_pid()
-    if pid is not None:
-        if not heartbeat_fresh(node_sync.HEARTBEAT_NAME):
-            get_logger("nodes").warning(
-                (
-                    "node sync: pid %d is alive but its heartbeat is stale; leaving it "
-                    "(`magent node sync --stop` to restart it)"
-                ),
-                pid,
-            )
+    log = get_logger(node_sync.LOG_NAME)
+    if not node_sync.daemon_running():
+        _node_sync_report.wedged = False
+        spawn_detached(node_sync_argv(config_path))
+        return True
+    if heartbeat_fresh(node_sync.HEARTBEAT_NAME):
+        if _node_sync_report.wedged:
+            _node_sync_report.wedged = False
+            log.info("node sync: the daemon's heartbeat is fresh again")
         return False
-    spawn_detached(node_sync_argv(config_path))
-    return True
+    if not _node_sync_report.wedged:
+        _node_sync_report.wedged = True
+        log.warning(
+            (
+                "node sync: the daemon (pid %s) holds its lock but its heartbeat "
+                "is stale; leaving it (`magent node sync --stop` to restart it)"
+            ),
+            node_sync.daemon_pid(),
+        )
+    return False
 
 
 def upload_respawn_cooldown_s() -> float:
