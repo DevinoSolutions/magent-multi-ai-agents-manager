@@ -137,9 +137,9 @@ class MagentEnv(BaseSettings):
     # transcripts and agent state home each settings.nodeSync.pullIntervalS,
     # which is what makes a session on a pool machine durable and resumable
     # anywhere; it is only ever started when some project has `node` set. Set
-    # to 0 to run the daemon yourself. Like the two supervisors above, 0 is
-    # also a TEST-ISOLATION law: a test that starts a real serve would
-    # otherwise start a daemon that dials real machines over ssh.
+    # to 0 to run the daemon yourself. Like hotkey_supervisor, upload_supervisor
+    # and psmux_boost, 0 is also a TEST-ISOLATION law: a test that starts a real
+    # serve would otherwise start a daemon that dials real machines over ssh.
     node_sync: bool = True
 
     @model_validator(mode="after")
@@ -220,7 +220,7 @@ def local_username() -> str:
 
     Host-infrastructure, like ``is_ssh_login``: the OS sets it, nobody
     configures it. A node's ``user`` falls back to it at use time
-    (``nodes.resolve``) and it is never written back into the config (D4).
+    (``nodes.resolve``) and it is never written back into the config.
     """
     return os.environ.get("USERNAME") or os.environ.get("USER") or ""
 
