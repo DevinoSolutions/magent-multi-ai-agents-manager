@@ -17,7 +17,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING
 
 import click
@@ -25,7 +25,7 @@ import click
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 DEFAULT_TOOLS: dict[str, str] = {
     "claude": "claude --continue",
@@ -532,6 +532,11 @@ _RESERVED_NICKS = (NODE_AUTO, NODE_CLOUD)
 _NODE_NICK_RE = re.compile(r"[a-z0-9-]{1,6}")
 _ALLOWED_NODE_KEYS = {"host", "user", "root"}
 _ALLOWED_NODE_SYNC_KEYS = {"pullIntervalS", "sampleIntervalS", "historyH"}
+# The `node:` values that are placements rather than pool nicks, and the
+# subset of those that needs no pool at all. A reserved nick is not
+# automatically a placement: it only guarantees no pool entry shadows one.
+NODE_PLACEMENTS = (NODE_AUTO, NODE_CLOUD)
+_POOLLESS_PLACEMENTS = (NODE_CLOUD,)
 
 
 def _warn_unknown_keys(raw: dict[str, object], allowed: set[str], path: str) -> None:
@@ -568,22 +573,39 @@ def _check_node_pool(settings_raw: dict[str, object]) -> None:
                 "0-9 and '-' (it is drawn in the status bar)"
             )
         if nick in _RESERVED_NICKS:
-            raise ConfigError(f"{label}: {nick!r} is reserved; pick another nick")
+            raise ConfigError(
+                f"settings.nodes: nick {nick!r} is reserved; pick another nick"
+            )
         if not isinstance(value, dict):
             raise ConfigError(f"{label} must be an object, got {type(value).__name__}")
+        # Before the missing-host refusal, so a misspelt "hots" is named too.
+        _warn_unknown_keys(value, _ALLOWED_NODE_KEYS, label)
         if "host" not in value:
             raise ConfigError(f"{label} must have a 'host' field")
         for key in sorted(_ALLOWED_NODE_KEYS):
             _require_type(value, key, str, f"{label}.{key}")
-        for key in ("host", "user", "root"):
             v = value.get(key)
             if isinstance(v, str) and not v.strip():
                 raise ConfigError(f"{label}.{key} must not be empty")
+        # host and user both land in an ssh argv: a space would split the
+        # destination, an '@' in either would re-target the login, and a
+        # leading '-' would be parsed as an ssh option ("-oProxyCommand=...",
+        # the class of git CVE-2017-1000117).
         host = value.get("host")
         if isinstance(host, str) and "@" in host:
             raise ConfigError(f"{label}.host must not carry a user (use {label}.user)")
-        _warn_unknown_keys(value, _ALLOWED_NODE_KEYS, label)
-        if str(value.get("user", "")).lower() == "root":
+        if isinstance(host, str) and any(c.isspace() for c in host):
+            raise ConfigError(f"{label}.host must not contain whitespace")
+        if isinstance(host, str) and host.startswith("-"):
+            raise ConfigError(f"{label}.host must not start with '-'")
+        user = value.get("user")
+        if isinstance(user, str) and "@" in user:
+            raise ConfigError(f"{label}.user must not contain '@'")
+        if isinstance(user, str) and any(c.isspace() for c in user):
+            raise ConfigError(f"{label}.user must not contain whitespace")
+        if isinstance(user, str) and user.startswith("-"):
+            raise ConfigError(f"{label}.user must not start with '-'")
+        if isinstance(user, str) and user.lower() == "root":
             click.echo(
                 f"Warning: {label}: running sessions as root; prefer a per-person user",
                 err=True,
@@ -597,11 +619,68 @@ def _check_node_pool(settings_raw: dict[str, object]) -> None:
             raise ConfigError(f"{label} must be at least 1")
 
 
-def _check_push(raw: dict[str, object], label: str) -> None:
+def _push_entry_escapes(entry: str) -> bool:
+    """True when a ``push`` entry is not a safe relative path inside the project.
+
+    Refused before any path grammar is asked: edge whitespace or a control
+    character (the entry reaches an argv and a remote shell), a leading
+    ``-`` (read as an option) or ``~`` (scp's SFTP mode and remote shells
+    expand it; no project file starts with one), the project root itself,
+    and any ``.git`` component -- writing into ``.git/hooks`` or
+    ``.git/config`` on the node is code execution the next time git runs
+    there, and git is the truth, not the push.
+
+    Then both path grammars are asked because the entry is read on this
+    machine and on the node: ``/etc/passwd`` is absolute on POSIX, ``C:\\x``
+    and ``\\x`` only on Windows. Any ``..`` component can climb out,
+    whichever separator carries it."""
+    if not entry.strip():
+        return True
+    if entry != entry.strip() or not entry.isprintable() or entry[0] in "-~":
+        return True
+    parts = re.split(r"[/\\]", entry)
+    if all(part in ("", ".") for part in parts):
+        return True
+    # casefold: .GIT is the same directory on a case-insensitive filesystem.
+    if any(part.casefold() == ".git" for part in parts):
+        return True
+    win = PureWindowsPath(entry)
+    if PurePosixPath(entry).is_absolute() or win.drive or win.root:
+        return True
+    return ".." in parts
+
+
+def _check_push(raw: dict[str, object], i: int) -> None:
+    """``push`` names extra files copied into the project on the node, so
+    every entry must stay inside the project -- loudly, since the copy runs
+    unattended with the user's credentials.
+
+    This is the raw-phase half of the node checks: it must see the raw list
+    before ``_str_list_or_none`` silently drops a non-string entry, and it
+    needs no pool, which is why it stays separate from
+    ``_check_node_projects`` (the typed-phase half that runs once the pool
+    is parsed)."""
+    label = f"projects[{i}].push"
     _require_type(raw, "push", list, label)
     value = raw.get("push")
-    if isinstance(value, list) and not all(isinstance(item, str) for item in value):
-        raise ConfigError(f"{label} must be an array of strings")
+    if not isinstance(value, list):
+        return
+    for j, entry in enumerate(value):
+        if not isinstance(entry, str):
+            raise ConfigError(
+                f"{label}[{j}] must be a string, got {type(entry).__name__}"
+            )
+        if not entry.strip():
+            raise ConfigError(f"{label}[{j}] must not be empty")
+        if _push_entry_escapes(entry):
+            raise ConfigError(
+                f"{label}[{j}] must be a relative path inside the project, "
+                f"got {entry!r}"
+            )
+    if value and raw.get("node") is None:
+        click.echo(
+            f"Warning: {label} has no effect without projects[{i}].node", err=True
+        )
 
 
 def _check_node_projects(
@@ -611,26 +690,36 @@ def _check_node_projects(
     in it (or asks for placement), and is not also an ssh-host project. The
     cloud backend is built in, so ``"cloud"`` needs no pool at all; its
     ``push`` is allowed and its transport is the cloud backend's concern."""
+    placements = ", ".join(f'"{k}"' for k in NODE_PLACEMENTS)
+    poolless = ", ".join(f'"{k}"' for k in _POOLLESS_PLACEMENTS)
     for i, proj in enumerate(projects):
         if proj.node is None:
             continue
-        if proj.host is not None:
+        if not proj.node.strip():
+            raise ConfigError(
+                f"projects[{i}].node must not be empty (omit it to run locally)"
+            )
+        # Truthiness, not `is not None`: the product treats an empty host as
+        # local (launch.py, psmux.py), so `"host": ""` is no ssh host at all.
+        if proj.host:
             raise ConfigError(
                 f"projects[{i}]: 'node' and 'host' are exclusive -- a node "
                 "project runs on a pool machine, a host project on an ssh host"
             )
-        if proj.node == NODE_CLOUD:
+        if proj.node in _POOLLESS_PLACEMENTS:
             continue
         if not nodes:
+            # Only what works without a pool is offered: "auto" is refused
+            # here too, and it names no machine, hence "a machine".
             raise ConfigError(
                 f"projects[{i}].node is {proj.node!r} but settings.nodes is "
-                "empty; add the machine under settings.nodes"
+                f"empty; add a machine under settings.nodes (or {poolless})"
             )
-        if proj.node != NODE_AUTO and proj.node not in nodes:
-            known = ", ".join(sorted(nodes))
+        if proj.node not in NODE_PLACEMENTS and proj.node not in nodes:
+            known = ", ".join(nodes)
             raise ConfigError(
                 f"projects[{i}].node is {proj.node!r}, which is not a configured "
-                f'node; known nodes: {known} (or "auto", "cloud")'
+                f"node; known nodes: {known} (or {placements})"
             )
 
 
@@ -678,7 +767,7 @@ def load_config(path: str) -> MagentConfig:
                         f"projects[{i}].windows[{j}]",
                     )
         _require_type(p_obj, "node", str, f"projects[{i}].node")
-        _check_push(p_obj, f"projects[{i}].push")
+        _check_push(p_obj, i)
         projects.append(_parse_project(p_obj))
     _backfill_colors(projects)
     settings = _parse_settings(settings_raw)
@@ -747,10 +836,20 @@ def _migrate_2_to_3(raw: dict[str, object]) -> dict[str, object]:
     return raw
 
 
+def _migrate_3_to_4(raw: dict[str, object]) -> dict[str, object]:
+    """v4 adds the node pool (``settings.nodes``/``nodeSync``) and a project's
+    ``node``/``push``. All optional, absent means "no nodes" -- so the
+    migration only stamps the version."""
+    raw = dict(raw)
+    raw["version"] = 4
+    return raw
+
+
 _MIGRATIONS: dict[int, Callable[[dict[str, object]], dict[str, object]]] = {
     0: _migrate_0_to_1,
     1: _migrate_1_to_2,
     2: _migrate_2_to_3,
+    3: _migrate_3_to_4,
 }
 
 

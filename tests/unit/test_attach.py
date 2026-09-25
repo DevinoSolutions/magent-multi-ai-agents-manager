@@ -1261,7 +1261,11 @@ class TestHotkeyCmdServerDefault:
     def _config(path, port):
         path.write_text(
             json.dumps(
-                {"version": 3, "projects": [], "settings": {"uploadPort": port}}
+                {
+                    "version": SCHEMA_VERSION,
+                    "projects": [],
+                    "settings": {"uploadPort": port},
+                }
             ),
             encoding="utf-8",
         )
