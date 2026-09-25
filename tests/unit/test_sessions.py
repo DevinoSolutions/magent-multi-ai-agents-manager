@@ -12,6 +12,7 @@ from magent.sessions import (
     build_flash_url,
     build_start_command,
     folder_for_session,
+    fresh_start_command,
 )
 from magent.sessions import claude as claude_sessions
 from magent.sessions.claude import (
@@ -701,3 +702,63 @@ class TestTheEncoderMatchesClaudeCodesOwnStore:
             if encode_claude_project_path(cwd).lower() != d.name.lower()
         ]
         assert len(wrong) <= max(1, len(pairs) // 10), wrong[:5]
+
+
+class TestAFreshFormNeedsNoStore:
+    """On a node, whether a transcript exists is the NODE's question
+    (bring_up.sh answers it); the PC only supplies both commands."""
+
+    def test_claude_drops_continue_and_keeps_every_other_flag(self):
+        assert fresh_start_command("claude", "claude --continue --model opus") == (
+            "claude --model opus"
+        )
+
+    def test_an_explicit_resume_has_no_fresh_form(self):
+        assert fresh_start_command("claude", "claude --resume abc") is None
+
+    def test_a_command_that_never_resumes_has_no_fresh_form(self):
+        assert fresh_start_command("claude", "claude --model opus") is None
+
+    def test_the_fresh_form_never_reads_a_store(self, monkeypatch):
+        def boom(*_a: object, **_k: object) -> bool:
+            raise AssertionError("fresh_form must not probe a transcript store")
+
+        monkeypatch.setattr("magent.sessions.claude.has_claude_session", boom)
+        assert fresh_start_command("claude", "claude --continue") == "claude"
+
+    def test_codex_has_no_fresh_form(self):
+        assert fresh_start_command("codex", "codex resume --last") is None
+
+    def test_an_unknown_tool_has_none(self):
+        assert fresh_start_command("aider", "aider --continue") is None
+
+    def test_the_local_start_command_still_probes(self, monkeypatch):
+        # The refactor keeps build_start_command's verdict: a session here
+        # keeps --continue.
+        monkeypatch.setattr(
+            "magent.sessions.claude.has_claude_session", lambda *_a: True
+        )
+
+        assert claude_fresh_command("claude --continue", "/p") is None
+
+
+class TestRemoteSshCanKeepTheUser:
+    def test_by_default_the_user_is_stripped(self):
+        assert build_code_open_command("/f", "amin@devino-second", "code") == [
+            "code",
+            "--remote",
+            "ssh-remote+devino-second",
+            "/f",
+        ]
+
+    def test_a_node_keeps_the_user_magent_resolved(self):
+        # D4: the node user may exist only in magent's config, never in
+        # ~/.ssh/config, so the authority has to carry it.
+        assert build_code_open_command(
+            "/home/amin/magent/api", "amin@devino-second", "code", keep_user=True
+        ) == [
+            "code",
+            "--remote",
+            "ssh-remote+amin@devino-second",
+            "/home/amin/magent/api",
+        ]

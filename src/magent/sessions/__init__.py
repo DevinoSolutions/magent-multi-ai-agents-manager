@@ -8,6 +8,7 @@ from magent.log import get_logger
 from magent.sessions.claude import (
     build_claude_resume,
     claude_fresh_command,
+    claude_fresh_form,
     get_claude_session_ids,
 )
 from magent.sessions.codex import (
@@ -36,6 +37,12 @@ class AgentTool:
     # directory has NO prior session for this tool to resume in that store, or
     # None to run base_cmd unchanged. See `build_start_command`.
     fresh_command: Callable[[str, str, Path | None], str | None] | None = None
+    # base_cmd -> the command with its implicit resume dropped, WITHOUT asking
+    # any store whether there is something to resume, or None when base_cmd
+    # needs no rewrite. For a session whose store is elsewhere (a pool node:
+    # PR-D ships both forms and the node picks). None for a tool with no
+    # implicit resume.
+    fresh_form: Callable[[str], str | None] | None = None
     happy: bool = False  # can be wrapped with `happy` for mobile access
 
     @property
@@ -48,6 +55,7 @@ AGENT_TOOLS: dict[str, AgentTool] = {
         session_ids=get_claude_session_ids,
         resume_command=build_claude_resume,
         fresh_command=claude_fresh_command,
+        fresh_form=claude_fresh_form,
         happy=True,
     ),
     "codex": AgentTool(
@@ -133,6 +141,15 @@ def build_start_command(
     return fresh
 
 
+def fresh_start_command(tool: str, base_cmd: str) -> str | None:
+    """``tool``'s fresh form of ``base_cmd`` (see ``AgentTool.fresh_form``), or
+    None. Unlike ``build_start_command`` this never probes a store."""
+    caps = AGENT_TOOLS.get(tool)
+    if caps is None or caps.fresh_form is None:
+        return None
+    return caps.fresh_form(base_cmd)
+
+
 # --- IDE tools (REC-F4) -------------------------------------------------------
 # The IDE mirror of AGENT_TOOLS: tools launched as an IDE window instead of a
 # CLI agent in a terminal. The dict is the single source of truth — adding an
@@ -193,7 +210,7 @@ def folder_for_session(payload: object, project: str) -> str | None:
 
 
 def build_code_open_command(
-    folder: str, ssh_host: str | None, code_bin: str
+    folder: str, ssh_host: str | None, code_bin: str, *, keep_user: bool = False
 ) -> list[str]:
     """argv that opens ``folder`` in VS Code, locally or over Remote-SSH.
 
@@ -204,10 +221,17 @@ def build_code_open_command(
     resolves the login user from the machine's own ssh config (that is also
     what makes a plain ``Host`` alias work), and a target that is only a
     ``user@`` with no host degrades to a local open rather than a broken URI.
+
+    ``keep_user`` keeps a ``user@`` in the authority -- a pool node's user is
+    resolved by magent and may not exist in the ssh config (PR-D).
     """
     args = [code_bin]
     if ssh_host:
-        host = ssh_host.split("@", 1)[1] if "@" in ssh_host else ssh_host
+        host = (
+            ssh_host
+            if keep_user
+            else (ssh_host.split("@", 1)[1] if "@" in ssh_host else ssh_host)
+        )
         if host:
             args.extend(["--remote", f"ssh-remote+{host}"])
     args.append(folder)
