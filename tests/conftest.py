@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from magent import agent_state, env, log
+from magent import agent_state, env, log, node_sync
 from magent.grid import MonitorRect
 from magent.platform import (
     HandoffResult,
@@ -69,6 +69,7 @@ PLAYWRIGHT_BROWSERS_PATH = _playwright_browsers_path()
 _IMPORT_BOUND_PATHS = (
     ("magent.cli.attach", "_LAST_HOST_FILE", "last-attach-host"),
     ("magent.cli.attention_cmd", "_PID_PATH", "attention.pid"),
+    ("magent.node_sync", "_PID_PATH", f"{node_sync.HEARTBEAT_NAME}.pid"),
     ("magent.cli.session_picker", "_FOCUS_TARGET_FILE", "focus-target"),
     ("magent.cli.session_picker", "_PICKER_ATTACHED_FILE", "picker-attached"),
     ("magent.upload_server", "_FOCUS_TARGET_FILE", "focus-target"),

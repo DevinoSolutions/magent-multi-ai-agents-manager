@@ -65,6 +65,7 @@ MD002_ALLOW = {
     "src/magent/launch.py": "Windows job-object breakaway in spawn_detached",
     "src/magent/upload_server.py": "taskkill vs os.kill process termination",
     "src/magent/cli/attention_cmd.py": "taskkill vs os.kill process termination",
+    "src/magent/node_sync.py": "taskkill vs os.kill process termination (stop_daemon, the attention_cmd shape)",
     "src/magent/cli/watch.py": "non-blocking keypress polling is per-OS (msvcrt vs select)",
     "src/magent/cli/doctor.py": "terminal-emulator candidates are per-OS (wt vs POSIX list)",
     "src/magent/hotkey.py": "module is Windows-only by construction (raises off-win32)",
