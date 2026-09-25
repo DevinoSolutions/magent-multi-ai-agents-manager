@@ -75,9 +75,11 @@ _QUERY = re.compile(r"(?<=//)([^\s?#]*)\?[^\s#]*")
 #   password may hold an "@" (git's own parse, a memrchr);
 _AUTH = re.compile(r"(?<=//)[^\s/?#]*@")
 # - a scheme-less user:password@host. It wants the ":" before the "@" and a
-#   host after it, so git@github.com:o/r.git, @scope/pkg@1.2 and a plugin id
-#   such as p@mkt are left alone.
-_BARE = re.compile(r"(?<![\w.%+:/@-])[\w.%+-]+:[^\s/?#]*@(?=[\w.-]+[:/\s]|[\w.-]+$)")
+#   host's first character after it, so git@github.com:o/r.git, @scope/pkg@1.2
+#   and a plugin id such as p@mkt are left alone. What follows the host is not
+#   asked about: git quotes a remote, and a bracket, "," or ";" may end it. A
+#   ":" may come before the user -- a path's own, as in /srv/x:user:pw@host.
+_BARE = re.compile(r"(?<![\w.%+/@-])[\w.%+-]+:[^\s/?#]*@(?=[\w.-])")
 
 
 def _unauth(text: str) -> str:

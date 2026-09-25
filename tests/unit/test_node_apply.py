@@ -1334,6 +1334,32 @@ class TestTheUrlSecretMask:
     @pytest.mark.parametrize(
         ("text", "shown"),
         [
+            # What follows the host is not part of the test: a quote, a
+            # bracket, a comma or a ";" after it still masks the password.
+            (
+                f"fatal: repository 'amin:{PASSWORD}@git.example.com' not found",
+                "fatal: repository '***@git.example.com' not found",
+            ),
+            (f'remote "amin:{PASSWORD}@h.com"', 'remote "***@h.com"'),
+            (f"(amin:{PASSWORD}@h.com)", "(***@h.com)"),
+            (
+                f"hosts amin:{PASSWORD}@a.example.com, b",
+                "hosts ***@a.example.com, b",
+            ),
+            (f"url=amin:{PASSWORD}@h.com;", "url=***@h.com;"),
+            # ... nor does a ":" before the user: a path's own colon.
+            (
+                f"clone of /srv/x:amin:{PASSWORD}@host/r failed",
+                "clone of /srv/x:***@host/r failed",
+            ),
+        ],
+    )
+    def test_a_schemeless_userinfo_before_any_punctuation_is_masked(self, text, shown):
+        assert node_apply._unauth(text) == shown
+
+    @pytest.mark.parametrize(
+        ("text", "shown"),
+        [
             ("https://example.com?mail=a@b.com", "https://example.com?***"),
             ("https://example.com:8443?next=u@x.org", "https://example.com:8443?***"),
         ],
@@ -1451,6 +1477,27 @@ class TestThePlugins:
         assert line.status == "warn"
         assert f"cannot clone {shown}" in line.detail
         assert _installs(claude) == []
+
+    def test_a_failed_add_whose_stderr_quotes_a_schemeless_remote_prints_no_password(
+        self, box, tmp_path, capsys
+    ):
+        # git names the remote without its scheme, in quotes.
+        claude = _claude(box, markets=())
+        claude.set_reply(
+            "marketplace add",
+            stderr=f"fatal: repository 'amin:{PASSWORD}@git.example.com' not found\n",
+            rc=1,
+        )
+        box.apply(_work(tmp_path, replace(PLUGGED, marketplaces={"mkt": SECRET_URL})))
+        out = capsys.readouterr()
+        assert PASSWORD not in out.out + out.err
+        (line,) = [
+            line
+            for line in remote_mux.parse_report(out.out).lines
+            if line.item == "marketplace:mkt"
+        ]
+        assert line.status == "warn"
+        assert "repository '***@git.example.com' not found" in line.detail
 
     def test_a_plugin_id_is_never_taken_for_userinfo(self, box, tmp_path, capsys):
         # The masks want a "//" before the "@": a plugin id has none.
