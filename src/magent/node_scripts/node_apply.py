@@ -9,10 +9,11 @@ stdin. Every step prints status<TAB>item<TAB>detail rows
 last run that finished it cleanly -- the store is ~/.magent/provision.json.
 A step that warned or failed is not recorded, so the next provision looks
 again. The store also keeps what the settings step last shipped (env keys,
-permission rules), so what this PC stops shipping is taken back from the
-node; a lost or damaged store takes nothing back. A deliberate drop (a hook
-whose program this node lacks) is a clean result: the same payload on the same node drops it again, and ``--force``
-(what ``magent node setup`` sends) re-looks after a tool is installed.
+permission rules, extra directories), so what this PC stops shipping is
+taken back from the node; a lost or damaged store takes nothing back. A
+deliberate drop (a hook whose program this node lacks) is a clean result:
+the same payload on the same node drops it again, and ``--force`` (what
+``magent node setup`` sends) re-looks after a tool is installed.
 
 provision.sh calls ``main`` through ``python3 -c``: a src module may not
 raise SystemExit (lint MD001), so ``main`` returns the exit code.
@@ -111,6 +112,29 @@ class Ctx:
     # What each step shipped last time, so what this PC no longer ships can
     # be taken back.
     shipped: dict[str, object] = field(default_factory=dict)
+    # Set once the PC stopped reading (it gave up and its ssh closed the
+    # pipe): later rows are dropped, and every step still runs.
+    quiet: bool = False
+
+
+def _say(line: str) -> bool:
+    """Writes one report line; False when nobody reads it any more. Then
+    stdout's descriptor is pointed at the null device, so neither a later
+    write nor Python's own flush at exit can hit the dead pipe -- that flush
+    alone would turn an exit code of 0 into 120."""
+    try:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+    except OSError:
+        # A stream with no descriptor has nothing for Python to flush at exit.
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            null = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(null, sys.stdout.fileno())
+            finally:
+                os.close(null)
+        return False
+    return True
 
 
 def _row(ctx: Ctx, status: str, item: str, detail: str = "") -> None:
@@ -124,8 +148,8 @@ def _row(ctx: Ctx, status: str, item: str, detail: str = "") -> None:
         detail = detail.replace(ctx.token, _MASK)
     detail = _unauth(detail)
     ctx.rows.append(status)
-    sys.stdout.write(f"{status}\t{item}\t{' '.join(detail.split())}\n")
-    sys.stdout.flush()
+    if not ctx.quiet:
+        ctx.quiet = not _say(f"{status}\t{item}\t{' '.join(detail.split())}\n")
 
 
 def _digest(ctx: Ctx, item: str) -> str:
@@ -371,13 +395,14 @@ def _last(ctx: Ctx, text: str) -> str:
     return lines[-1][:200] if lines else "no output"
 
 
-# A drive-letter path (C:\ or C:/) starting ANY word -- the program or an
-# argument (node "C:\...\notify.mjs") -- names a file only the PC has.
-# Anchored on the left, so a URL's "s://" or "e:///" is never one.
+# A drive-letter path (C:\ or C:/) or a UNC share (\\nas\x or //nas/x)
+# starting ANY word -- the program or an argument (node "C:\...\notify.mjs")
+# -- names a file only the PC has. Anchored on the left, so a URL's "s://"
+# or "e:///" is never one.
 # Accepted false positive: an scp-style single-letter host (``scp a:/x .``)
 # reads as a drive letter and drops the hook -- such a hook is vanishingly
 # rare, and keeping a PC path the node cannot run is the worse failure.
-_WINDOWS_PATH = re.compile(r"(^|[\s\"'=(])[A-Za-z]:[\\/]")
+_WINDOWS_PATH = re.compile(r"(^|[\s\"'=(])(?:[A-Za-z]:[\\/]|\\\\[^\\\s]|//[^/\s])")
 # Where an unquoted word ends, in the raw command text.
 _WORD_END = re.compile(r"[\s\"';&|)]")
 # Any word ending .exe names a program only the PC runs.
@@ -625,9 +650,9 @@ def _deep(
 ) -> dict[str, object]:
     """The node's ``key`` map merged with this PC's: the PC wins a shared
     key, the permission rule lists are unions (the directories one node
-    first), and what the PC shipped
-    ``before`` but no longer ships is taken back: everything it shipped last
-    time leaves the node's side, and what it still ships is laid back on."""
+    first), and what the PC shipped ``before`` but no longer ships is taken
+    back: everything it shipped last time leaves the node's side, and what it
+    still ships is laid back on."""
     if key == "env":
         gone = _was_shipped(before.get("env"))
         both = {name: text for name, text in old.items() if name not in gone}
@@ -640,10 +665,13 @@ def _deep(
         if isinstance(mine, list) and isinstance(theirs, list):
             gone = _was_shipped(before.get(rule))
             both[rule] = _union(mine, [item for item in theirs if item not in gone])
-    mine = value.get(_DIRS)
+    mine = value.get(_DIRS, [])
     theirs = old.get(_DIRS)
     if isinstance(mine, list) and isinstance(theirs, list):
-        both[_DIRS] = _union(theirs, mine)
+        gone = _was_shipped(before.get(_DIRS))
+        # A directory still shipped keeps its place in the node's order.
+        kept = [item for item in theirs if item in mine or item not in gone]
+        both[_DIRS] = _union(kept, mine)
     return both
 
 
@@ -663,7 +691,6 @@ def _portable(ctx: Ctx, perms: dict[str, object]) -> dict[str, object]:
 
 
 def _merged(
-    ctx: Ctx,
     node: dict[str, object],
     shipped: dict[str, object],
     before: dict[str, object],
@@ -678,8 +705,6 @@ def _merged(
     for key in _DEEP_KEYS:
         old = node.get(key)
         value = shipped.get(key, {})
-        if key == "permissions" and isinstance(value, dict):
-            value = _portable(ctx, value)
         if isinstance(old, dict) and isinstance(value, dict):
             merged[key] = _deep(key, old, value, before)
         elif key in shipped:
@@ -689,13 +714,15 @@ def _merged(
 
 def _record(shipped: dict[str, object]) -> dict[str, object]:
     """What this PC's settings ship that ``_deep`` takes back when they stop:
-    the env keys and the permission rules."""
+    the env keys, the permission rules and the extra directories."""
     env = shipped.get("env")
     perms = shipped.get("permissions")
     record: dict[str, object] = {"env": list(env) if isinstance(env, dict) else []}
     for rule in _RULE_LISTS:
         rules = perms.get(rule) if isinstance(perms, dict) else None
         record[rule] = rules if isinstance(rules, list) else []
+    dirs = perms.get(_DIRS) if isinstance(perms, dict) else None
+    record[_DIRS] = dirs if isinstance(dirs, list) else []
     return record
 
 
@@ -732,6 +759,11 @@ def _step_settings(ctx: Ctx) -> None:
     loaded = _load(ctx.work / "settings.json")
     shipped = loaded if isinstance(loaded, dict) else {}
     mark = len(ctx.rows)
+    perms = shipped.get("permissions")
+    if isinstance(perms, dict):
+        # Filtered once, before the merge and the record, so a dropped
+        # Windows path is never remembered as shipped.
+        shipped = {**shipped, "permissions": _portable(ctx, perms)}
     # A hook entry naming a script that is not there would fail on every
     # event; unwired, the warning leaves the step unremembered, so the next
     # provision wires it.
@@ -745,7 +777,7 @@ def _step_settings(ctx: Ctx) -> None:
             "is not wired; the next provision wires it",
         )
     before = ctx.shipped.get("settings")
-    merged = _merged(ctx, node, shipped, before if isinstance(before, dict) else {})
+    merged = _merged(node, shipped, before if isinstance(before, dict) else {})
     merged["hooks"] = _hooks(ctx, shipped.get("hooks"), wire=wire)
     line = shipped.get("statusLine")
     if isinstance(line, dict) and line.get("type") == "command":
@@ -1186,10 +1218,11 @@ STEPS: tuple[tuple[str, Callable[[Ctx], None]], ...] = (
 def run(*, work: Path, home: Path, path: str, token: str, force: bool) -> int:
     """Apply the payload unpacked in ``work`` to ``home``. 1 when any step
     failed, else 0. The store is saved even when a step raised; a store that
-    cannot be saved is its own ``fail`` row."""
+    cannot be saved is its own ``fail`` row. A PC that stops reading
+    mid-apply loses the rows after that, never the steps."""
     manifest = _load(work / "manifest.json")
     if not isinstance(manifest, dict) or manifest.get("version") != MANIFEST_VERSION:
-        sys.stdout.write(
+        _say(
             "fail\tmanifest\tthe payload has no manifest of version "
             f"{MANIFEST_VERSION}\n"
         )

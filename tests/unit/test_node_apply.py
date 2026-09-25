@@ -6,6 +6,7 @@ never found)."""
 from __future__ import annotations
 
 import ast
+import errno
 import io
 import json
 import os
@@ -651,6 +652,17 @@ class TestTheSettings:
             ("node bin\\helper.exe", "bin\\helper.exe is a Windows program"),
             # A drive path opening a subshell group.
             ('sh -c "(C:/tools/run.sh)"', "C:/tools/run.sh is a Windows path"),
+            # A UNC share, either slash, as the program or an argument.
+            (
+                "\\\\nas\\projects\\hook.sh --go",
+                "\\\\nas\\projects\\hook.sh is a Windows path",
+            ),
+            ("//nas/projects/hook.sh --go", "//nas/projects/hook.sh is a Windows path"),
+            (
+                'node "\\\\nas\\share\\notify.mjs" --done',
+                "\\\\nas\\share\\notify.mjs is a Windows path",
+            ),
+            ("node //nas/share/notify.mjs", "//nas/share/notify.mjs is a Windows path"),
         ],
     )
     def test_a_windows_program_is_dropped(self, box, tmp_path, capsys, command, detail):
@@ -2034,6 +2046,14 @@ class TestTheHooksAreRebuilt:
 
 
 class TestTheMerge:
+    def test_neither_side_having_env_or_permissions_adds_none(self, box, tmp_path):
+        _put(_settings(box), {"model": "sonnet"})
+        box.apply(_work(tmp_path, _pc_settings({"model": "opus"})))
+        node = _json(_settings(box))
+        assert node["model"] == "opus"
+        assert "env" not in node
+        assert "permissions" not in node
+
     def test_env_is_merged_key_by_key_and_the_pc_wins(self, box, tmp_path):
         _put(_settings(box), {"env": {"NODE_ONLY": "1", "SHARED": "node"}})
         pc = {"env": {"SHARED": "pc", "PC_ONLY": "2"}}
@@ -2171,12 +2191,24 @@ class TestWhatThePcStopsShippingLeavesTheNode:
             {
                 "version": 1,
                 "digests": {},
-                "shipped": {"settings": {"allow": "Bash(rm:*)", "env": "X"}},
+                "shipped": {
+                    "settings": {
+                        "allow": "Bash(rm:*)",
+                        "env": "X",
+                        "additionalDirectories": "/d",
+                    }
+                },
             },
             {
                 "version": 1,
                 "digests": {},
-                "shipped": {"settings": {"allow": {"Bash(rm:*)": 1}, "env": {"X": 1}}},
+                "shipped": {
+                    "settings": {
+                        "allow": {"Bash(rm:*)": 1},
+                        "env": {"X": 1},
+                        "additionalDirectories": {"/d": 1},
+                    }
+                },
             },
         ],
         ids=["missing", "not-json", "not-a-map", "not-a-record", "strings", "maps"],
@@ -2186,7 +2218,10 @@ class TestWhatThePcStopsShippingLeavesTheNode:
     ):
         # Fail safe: with nothing trustworthy remembered, nothing is taken
         # back -- and the apply still succeeds.
-        first = {"env": {"X": "x"}, "permissions": {"allow": ["Bash(rm:*)"]}}
+        first = {
+            "env": {"X": "x"},
+            "permissions": {"allow": ["Bash(rm:*)"], "additionalDirectories": ["/d"]},
+        }
         box.apply(_work(tmp_path, _pc_settings(first)))
         capsys.readouterr()
         if damage is None:
@@ -2199,6 +2234,31 @@ class TestWhatThePcStopsShippingLeavesTheNode:
         node = _json(_settings(box))
         assert node["env"] == {"X": "x"}
         assert node["permissions"]["allow"] == ["Bash(rm:*)"]
+        assert node["permissions"]["additionalDirectories"] == ["/d"]
+
+    def test_the_record_follows_the_settings_write(
+        self, box, tmp_path, capsys, monkeypatch
+    ):
+        # Recorded only once settings.json is written: a failed write leaves
+        # the old record, so the next apply still takes the rule back.
+        box.apply(_work(tmp_path, _pc_settings({"permissions": {"allow": ["A"]}})))
+        write = node_apply._write
+        failed: list[Path] = []
+
+        def fail_settings_once(path: Path, value: object, **kw: object) -> object:
+            if path.name == "settings.json" and not failed:
+                failed.append(path)
+                raise OSError("disk full")
+            return write(path, value, **kw)
+
+        monkeypatch.setattr(node_apply, "_write", fail_settings_once)
+        capsys.readouterr()
+        assert box.apply(_work(tmp_path, _pc_settings({}), name="work2")) == 1
+        assert _status(_lines(capsys), "settings") == "fail"
+        assert _json(_settings(box))["permissions"]["allow"] == ["A"]
+        box.apply(_work(tmp_path, _pc_settings({}), name="work3"))
+        assert failed
+        assert _json(_settings(box))["permissions"]["allow"] == []
 
 
 class TestTheAdditionalDirectories:
@@ -2236,15 +2296,59 @@ class TestTheAdditionalDirectories:
             "/srv/shared",
         ]
 
+    @pytest.mark.parametrize(
+        "windows", ["D:/code", "\\\\nas\\projects", "//nas/projects"]
+    )
     def test_a_windows_path_is_dropped_when_the_node_has_none(
-        self, box, tmp_path, capsys
+        self, box, tmp_path, capsys, windows
     ):
-        pc = {"permissions": {"additionalDirectories": ["D:/code", "/srv/shared"]}}
+        pc = {"permissions": {"additionalDirectories": [windows, "/srv/shared"]}}
         box.apply(_work(tmp_path, _pc_settings(pc)))
-        assert _drops(_lines(capsys), self.DIRS) == ["D:/code is a Windows path"]
+        assert _drops(_lines(capsys), self.DIRS) == [f"{windows} is a Windows path"]
         assert _json(_settings(box))["permissions"]["additionalDirectories"] == [
             "/srv/shared"
         ]
+
+    def test_a_directory_the_pc_stops_shipping_leaves_the_node(self, box, tmp_path):
+        # A directory grant is a permission: gone from the PC, gone from the
+        # node. The node's own stays, and a still-shipped one keeps its place.
+        _put(_settings(box), {"permissions": {"additionalDirectories": ["/srv/node"]}})
+        first = {"permissions": {"additionalDirectories": ["/srv/d", "/srv/keep"]}}
+        box.apply(_work(tmp_path, _pc_settings(first)))
+        assert _json(_settings(box))["permissions"]["additionalDirectories"] == [
+            "/srv/node",
+            "/srv/d",
+            "/srv/keep",
+        ]
+        then = {"permissions": {"additionalDirectories": ["/srv/new", "/srv/keep"]}}
+        box.apply(_work(tmp_path, _pc_settings(then), name="work2"))
+        assert _json(_settings(box))["permissions"]["additionalDirectories"] == [
+            "/srv/node",
+            "/srv/keep",
+            "/srv/new",
+        ]
+
+    @pytest.mark.parametrize(
+        "then",
+        [{}, {"permissions": {"allow": []}}],
+        ids=["no-permissions", "no-directories"],
+    )
+    def test_every_shipped_directory_leaves_when_the_pc_ships_none(
+        self, box, tmp_path, then
+    ):
+        _put(_settings(box), {"permissions": {"additionalDirectories": ["/srv/node"]}})
+        first = {"permissions": {"additionalDirectories": ["/srv/d", "/srv/e"]}}
+        box.apply(_work(tmp_path, _pc_settings(first)))
+        box.apply(_work(tmp_path, _pc_settings(then), name="work2"))
+        assert _json(_settings(box))["permissions"]["additionalDirectories"] == [
+            "/srv/node"
+        ]
+
+    def test_a_dropped_windows_path_is_never_recorded(self, box, tmp_path):
+        pc = {"permissions": {"additionalDirectories": ["C:\\work", "/srv/shared"]}}
+        box.apply(_work(tmp_path, _pc_settings(pc)))
+        record = _json(_store(box))["shipped"]["settings"]
+        assert record["additionalDirectories"] == ["/srv/shared"]
 
 
 def _mid_merge(
@@ -2326,7 +2430,14 @@ class TestOneStoreHoldsEveryStepsMemory:
     # per-entry shas (F10): one store, and no writer may drop another's keys.
 
     SCOPE = replace(
-        _two(), settings={"env": {"X": "x"}, "permissions": {"allow": ["Bash(ls)"]}}
+        _two(),
+        settings={
+            "env": {"X": "x"},
+            "permissions": {
+                "allow": ["Bash(ls)"],
+                "additionalDirectories": ["/srv/d"],
+            },
+        },
     )
 
     def _check(self, box: Box) -> dict[str, object]:
@@ -2336,8 +2447,15 @@ class TestOneStoreHoldsEveryStepsMemory:
         assert store["later"] == {"k": 1}
         assert {"settings", "mcp", "mcp_oauth"} <= set(store["digests"])
         assert set(json.loads(store["digests"]["mcp_oauth"])) == {A, B}
-        record = store["shipped"]["settings"]
-        assert (record["env"], record["allow"]) == (["X"], ["Bash(ls)"])
+        assert store["shipped"] == {
+            "settings": {
+                "env": ["X"],
+                "allow": ["Bash(ls)"],
+                "deny": [],
+                "ask": [],
+                "additionalDirectories": ["/srv/d"],
+            }
+        }
         return store
 
     def test_a_run_where_every_step_writes_keeps_every_key(self, box, tmp_path, capsys):
@@ -2380,6 +2498,199 @@ class TestOneStoreHoldsEveryStepsMemory:
         assert _status(lines, "plugin:p@mkt") == "did"
         store = self._check(box)
         assert {"skills", "plugins"} <= set(store["digests"])
+
+    def test_a_step_whose_last_attempt_failed_is_forgotten(
+        self, box, tmp_path, monkeypatch
+    ):
+        # A forced re-run that fails must drop the old digest, or the next
+        # plain run skips a step whose last attempt failed.
+        work = _work(tmp_path, _pc_settings({"env": {"X": "x"}}))
+        assert box.apply(work) == 0
+        write = node_apply._write
+
+        def fail_settings(path: Path, value: object, **kw: object) -> object:
+            if path.name == "settings.json":
+                raise OSError("disk full")
+            return write(path, value, **kw)
+
+        monkeypatch.setattr(node_apply, "_write", fail_settings)
+        assert box.apply(work, force=True) == 1
+        assert "settings" not in _json(_store(box))["digests"]
+
+    def test_this_builds_store_version_wins_over_a_carried_one(self, box, tmp_path):
+        _put(_store(box), {"version": 99, "digests": {}, "later": 1})
+        box.apply(_work(tmp_path))
+        store = _json(_store(box))
+        assert (store["version"], store["later"]) == (1, 1)
+
+
+class _HungUp(io.TextIOBase):
+    """A stdout whose reader went away once the first row was through: the
+    PC gave up (PROVISION_TIMEOUT_S) and its ssh closed the pipe. ``where``
+    is the call that hits the dead pipe first -- the write, or the flush of a
+    buffered write."""
+
+    def __init__(self, error: OSError, where: str) -> None:
+        self.error = error
+        self.where = where
+        self.rows: list[str] = []
+        self.pending: list[str] = []
+        self.attempts = 0
+        self.dead = False
+
+    def write(self, text: str) -> int:
+        self.attempts += 1
+        if self.dead and self.where == "write":
+            raise self.error
+        self.pending.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        if self.dead and self.where == "flush":
+            raise self.error
+        self.rows.extend(self.pending)
+        self.pending.clear()
+        self.dead = bool(self.rows)
+
+
+# What a write into a dead pipe raises. OSError(EPIPE) is built as a
+# BrokenPipeError by OSError itself; Windows raises a plain OSError(EINVAL),
+# so catching BrokenPipeError alone would miss the Windows pipe.
+_DEAD_PIPE = pytest.mark.parametrize(
+    "error",
+    [
+        BrokenPipeError(errno.EPIPE, "Broken pipe"),
+        OSError(errno.EPIPE, "Broken pipe"),
+        OSError(errno.EINVAL, "Invalid argument"),
+        OSError(errno.EIO, "Input/output error"),
+    ],
+    ids=["BrokenPipeError", "OSError-EPIPE", "OSError-EINVAL", "OSError-EIO"],
+)
+
+
+class TestAPcThatHangsUpDoesNotStopTheApply:
+    # cq-F12 I1: the PC gives up, its ssh dies, and the next row's write hits
+    # EPIPE. Every step after it must still land -- the store included -- so
+    # "may have run to completion" is true and a retry only skips.
+
+    SCOPE = TestOneStoreHoldsEveryStepsMemory.SCOPE
+
+    def _landed(self, box: Box) -> None:
+        assert (box.home / node_apply.STATE_HOOK_MARKER).read_text(
+            encoding="utf-8"
+        ) == HOOK_TEXT
+        settings = _json(_settings(box))
+        assert settings["env"] == {"X": "x"}
+        assert settings["permissions"]["additionalDirectories"] == ["/srv/d"]
+        assert set(_json(_claude_json(box))["mcpServers"]) == set(TWO_SERVERS)
+        assert set(_json(_credentials(box))["mcpOAuth"]) == {A, B}
+        store = _json(_store(box))
+        assert {"state_hook", "settings", "mcp", "mcp_oauth"} <= set(store["digests"])
+        assert store["shipped"]["settings"]["additionalDirectories"] == ["/srv/d"]
+
+    @pytest.mark.parametrize("where", ["write", "flush"])
+    @_DEAD_PIPE
+    def test_every_later_step_still_writes_its_file(
+        self, box, tmp_path, monkeypatch, error, where
+    ):
+        work = _work(tmp_path, self.SCOPE)
+        pipe = _HungUp(error, where)
+        monkeypatch.setattr(sys, "stdout", pipe)
+        assert box.apply(work) == 0
+        (row,) = pipe.rows
+        assert row.split("\t")[1] == "gh"
+        # The one row that met the dead pipe is the last one tried: the rest
+        # are dropped, not each retried into it.
+        assert pipe.attempts == 2
+        self._landed(box)
+
+    @_DEAD_PIPE
+    def test_a_step_that_fails_after_the_hang_up_still_decides_the_exit(
+        self, box, tmp_path, monkeypatch, error
+    ):
+        def boom(ctx: node_apply.Ctx) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(
+            node_apply,
+            "STEPS",
+            (*node_apply.STEPS[:2], ("boom", boom), *node_apply.STEPS[2:]),
+        )
+        work = _work(tmp_path, self.SCOPE)
+        monkeypatch.setattr(sys, "stdout", _HungUp(error, "write"))
+        assert box.apply(work) == 1
+        self._landed(box)
+
+    def test_a_real_descriptor_is_pointed_at_the_null_device_and_nothing_leaks(
+        self, box, tmp_path, monkeypatch, capsys
+    ):
+        # A pipe of the test's own, never fd 1: its reader is gone before the
+        # first row. What the failed flush left buffered must drain into the
+        # null device, the way Python's flush at exit does.
+        work = _work(tmp_path, self.SCOPE)
+        read, write = os.pipe()
+        os.close(read)
+        stream = open(write, "w", encoding="utf-8")  # noqa: SIM115  # reason: closed in the finally below, after the post-apply flush it exists to test
+        opened: list[int] = []
+        closed: list[int] = []
+        real_open, real_close = os.open, os.close
+
+        def spy_open(path: str, flags: int, *args: object) -> int:
+            fd = real_open(path, flags, *args)
+            if path == os.devnull:
+                opened.append(fd)
+            return fd
+
+        def spy_close(fd: int) -> None:
+            closed.append(fd)
+            real_close(fd)
+
+        monkeypatch.setattr(os, "open", spy_open)
+        monkeypatch.setattr(os, "close", spy_close)
+        monkeypatch.setattr(sys, "stdout", stream)
+        try:
+            assert box.apply(work) == 0
+            stream.write("after the hang-up\n")
+            stream.flush()
+        finally:
+            stream.close()
+        (null,) = opened
+        assert null in closed
+        assert capsys.readouterr().err == ""
+        self._landed(box)
+
+    def test_a_real_closed_pipe_leaves_the_exit_code_to_the_steps(self, box, tmp_path):
+        # Python flushes stdout once more at exit; into a dead pipe that
+        # flush alone would turn a clean apply's 0 into 120.
+        work = _work(tmp_path, self.SCOPE)
+        code = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "from magent.node_scripts import node_apply\n"
+            "sys.stdin.readline()\n"
+            "sys.exit(node_apply.run(work=Path(sys.argv[1]), home=Path(sys.argv[2]),"
+            " path=sys.argv[3], token='', force=False))\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code, str(work), str(box.home), box.path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert proc.stdin is not None and proc.stdout is not None
+        assert proc.stderr is not None
+        # The PC hangs up before the first row is written.
+        proc.stdout.close()
+        proc.stdin.write(b"go\n")
+        proc.stdin.close()
+        try:
+            rc = proc.wait(timeout=120)
+        finally:
+            proc.kill()
+        err = proc.stderr.read().decode("utf-8", "replace")
+        proc.stderr.close()
+        assert (rc, err) == (0, "")
+        self._landed(box)
 
 
 class TestAFailedOAuthStepKeepsItsMemory:
