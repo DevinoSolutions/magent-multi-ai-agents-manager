@@ -21,6 +21,7 @@ import click
 
 from magent.attach_client import (
     CLIENT_EXE_NAME,
+    MUXES,
     SSH_CONNECTION_OPTS,
     TMUX_SOCKET,
     remote_attach_command,
@@ -512,6 +513,11 @@ def _corpses(open_sids: set[str], live_cmdlines: list[str]) -> set[str]:
     That conservatism is what makes the supervisor safe to add here: widening
     ``_CLIENT_PROCESS_NAMES`` can only ever make FEWER windows look dead, never
     more, so the risky direction of this decision was never widened.
+
+    Every multiplexer's markers count, for the same reason: a window is known
+    here only by its sid, and a node pane (tmux) shares the desktop with the
+    psmux ones -- the sweep judges them all. More markers can only rescue a
+    window, never condemn one.
     """
     haystack = [c.lower() for c in live_cmdlines if c]
     return {
@@ -520,7 +526,8 @@ def _corpses(open_sids: set[str], live_cmdlines: list[str]) -> set[str]:
         if not any(
             marker.lower() in cmdline
             for cmdline in haystack
-            for marker in _attach_markers(sid)
+            for mux in MUXES
+            for marker in _attach_markers(sid, mux)
         )
     }
 

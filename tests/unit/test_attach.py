@@ -1431,6 +1431,44 @@ class TestCorpseDecision:
     def test_matching_is_case_insensitive(self):
         assert self._corpses(["API"], ["PSMUX -L api ATTACH"]) == set()
 
+    def test_a_live_node_pane_is_not_a_corpse(self):
+        # `magent attach` sweeps EVERY magent: window here by sid alone; a node
+        # window (tmux on a pool machine) must not be closed as a corpse just
+        # because it is not a psmux one. This is the supervisor's real cmdline.
+        cmd = subprocess.list2cmdline(
+            [
+                _FAKE_SUPERVISOR,
+                "--target",
+                "amin@devino-second",
+                "--session",
+                "api",
+                "--remote",
+                "tmux -L magent attach -t '=api'",
+                "--mux",
+                "tmux",
+            ]
+        )
+        assert self._corpses(["api"], [cmd]) == set()
+
+    def test_another_sessions_node_pane_does_not_rescue_this_one(self):
+        cmd = "ssh -t amin@devino-second tmux -L magent attach -t '=web'"
+        assert self._corpses(["api", "web"], [cmd]) == {"api"}
+
+    def test_a_longer_node_session_name_does_not_rescue_a_shorter_one(self):
+        # The spawned target is quoted, `-t '=api2'`, and the closing quote
+        # ends the name: a live api2 pane says nothing about api.
+        cmd = "ssh -t amin@devino-second tmux -L magent attach -t '=api2'"
+        assert self._corpses(["api"], [cmd]) == {"api"}
+
+    def test_a_psmux_session_named_magent_is_kept_alive_by_any_node_pane(self):
+        # The one cross-multiplexer overlap: the psmux marker for a sid named
+        # `magent` is `-L magent attach`, a prefix of EVERY tmux marker. So a
+        # dead psmux `magent:magent` window is never swept while any node pane
+        # is live. That is the conservative direction (never a false close),
+        # and `magent` is a realistic project name -- this repo is one.
+        cmd = "ssh -t amin@devino-second tmux -L magent attach -t '=api'"
+        assert self._corpses(["magent"], [cmd]) == set()
+
 
 class TestRepairCorpses:
     """The effectful half: scan, decide, close -- every step capability-gated,
