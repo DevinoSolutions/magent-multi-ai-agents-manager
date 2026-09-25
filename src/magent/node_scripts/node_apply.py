@@ -477,7 +477,11 @@ def _step_mcp_oauth(ctx: Ctx) -> None:
         for key, entry in kept.items()
         if remembered.get(key) != shas[key] or key not in have
     }
-    want = _canonical(shas)
+    # Entries this PC stopped shipping stay remembered: a server that leaves
+    # the PC and comes back with the same entry is not "new", so its PC copy
+    # does not land on a token the node refreshed meanwhile. The cost -- the
+    # store keeps a sha for every entry ever shipped -- is accepted.
+    want = _canonical({**remembered, **shas})
     if not due:
         _row(ctx, "skip", "mcp_oauth", f"{len(kept)} entry(ies) unchanged on this PC")
         ctx.store["mcp_oauth"] = want
