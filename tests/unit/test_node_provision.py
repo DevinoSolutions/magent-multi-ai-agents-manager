@@ -1493,7 +1493,11 @@ class TestRegisterSshKey:
 
         monkeypatch.setattr(remote_mux, "_gh", gh_without_add)
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
-        assert row == ScriptLine("fail", "github-key", "gh could not run on this PC")
+        assert row == ScriptLine(
+            "fail",
+            "github-key",
+            "gh ssh-key add did not finish (spawn failure or timeout); rerun to check",
+        )
 
     def test_a_multi_line_refusal_keeps_the_last_line(self, fake_gh):
         fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))

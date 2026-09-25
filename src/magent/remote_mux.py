@@ -699,7 +699,12 @@ def register_ssh_key(pubkey: str, *, title: str) -> ScriptLine:
         input_bytes=(" ".join(parts) + "\n").encode("utf-8"),
     )
     if added is None:
-        return ScriptLine("fail", "github-key", "gh could not run on this PC")
+        # A timed-out add may still have landed (RemoteError's rc None).
+        return ScriptLine(
+            "fail",
+            "github-key",
+            "gh ssh-key add did not finish (spawn failure or timeout); rerun to check",
+        )
     if added.returncode != 0:
         err = added.stderr.decode("utf-8", "replace").strip().splitlines()
         detail = err[-1][:200] if err else f"exited {added.returncode}"
