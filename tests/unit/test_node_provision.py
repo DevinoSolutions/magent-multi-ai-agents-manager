@@ -465,6 +465,7 @@ class TestHowEachServerIsClassified:
             ({"type": "http", "url": f"http://lo{ZWSP}calhost/mcp"}, LOCAL),
             ({"type": "http", "url": f"http://127.0.0.1{SHY}/mcp"}, LOCAL),
             ({"type": "http", "url": "http://localhost../mcp"}, LOCAL),
+            ({"type": "http", "url": f"http://loc{SHY}alhost../mcp"}, LOCAL),
         ],
     )
     def test_the_reason_a_server_stays_behind(self, spec, reason):
@@ -928,6 +929,10 @@ class TestAnEndpointThatPointsAtThisPcNeverShips:
             r"http://127.0.0.1\@remote.example",
             r"127.0.0.1\@remote.example:3128",
             f"https://loc{SHY}alhost:3456",
+            r"ws://127.0.0.1\@remote.example",
+            # Not a special scheme: "\" is no separator, so the host is what
+            # follows the "@" -- here this PC.
+            r"socks5://remote.example\@127.0.0.1",
         ],
     )
     def test_a_local_endpoint_stays_behind_with_a_note(self, tmp_path, name, value):
@@ -944,6 +949,9 @@ class TestAnEndpointThatPointsAtThisPcNeverShips:
             "https://gateway.example/v1",
             "http://10.0.0.5:4000",
             "proxy.corp.example:3128",
+            # Not a special scheme: the "\" stays in the userinfo, and the
+            # host is remote.example.
+            r"socks5://127.0.0.1\@remote.example",
         ],
     )
     def test_a_remote_endpoint_ships(self, tmp_path, value):

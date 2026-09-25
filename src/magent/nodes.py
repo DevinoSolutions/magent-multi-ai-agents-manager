@@ -492,7 +492,9 @@ def _is_pc_local_host(host: str) -> bool:
     percent-encoded or full-width spelling a client decodes before it
     resolves, a character IDNA maps to nothing)."""
     host = unicodedata.normalize("NFKC", urllib.parse.unquote(host))
-    host = host.replace("。", ".")
+    # Trailing dots go first: IDNA refuses the empty label "localhost.."
+    # would leave, which would keep a soft hyphen alongside them.
+    host = host.replace("。", ".").rstrip(".")
     # IDNA drops a soft hyphen or zero-width space the way a client's own
     # domain-to-ASCII step does. A host it refuses (an empty label, say) is
     # checked as it is.
