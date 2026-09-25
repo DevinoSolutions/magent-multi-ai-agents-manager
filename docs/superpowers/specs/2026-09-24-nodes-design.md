@@ -34,9 +34,9 @@ Two remote mechanisms exist today and neither fits:
 | D7 | **Refuse a dirty or unpushed local tree** at bring-up (`--allow-dirty` overrides, and then those changes simply are not on the node). | Git is truth; invisible local edits would collide with the node's pushes. |
 | D8 | **Placement:** `node: "<nick>"` pins; `node: "auto"` picks by **load history**, not one sample, and sticks. | A bursty box someone else is using must not be piled onto because it was quiet for one second. |
 | D9 | **Reuse the attach supervisor unchanged.** The local window is `magent-attach-client` with a new `--mux tmux`. | It took a long time to get right; one module owns reconnect. |
-| D10 | **One tmux server per node user** (`tmux -L magent`), sessions named by sid. | Termius: `tmux -L magent attach` shows every session in the picker. |
+| D10 | **One tmux server per node user** (`tmux -L magent`), sessions named by sid; every `-t` target is the exact form `=<sid>` (bare `-t` is a prefix match on a shared socket). | Termius: `tmux -L magent attach` lands in the most recent session; `Ctrl+B s` is the picker over all of them. |
 | D11 | Nothing about prod boxes in code. `root@devino` is simply not in the pool. | YAGNI (user). |
-| D12 | Deferred, ledgered in DESIGN.md: Alt+V paste into node panes, `send`/`model`/`peek` for node sessions, account routing for node sessions, the `cloud` (Claude Code Web) backend. | Ship the core fast. |
+| D12 | Deferred, ledgered in DESIGN.md: Alt+V paste into node panes, `send`/`model`/`peek` for node sessions, account routing for node sessions. The `cloud` (Claude Code Web) backend was un-deferred on 2026-09-24 and is §18 (plan J): a LOCAL psmux pane running `claude --cloud "<cloudTask>"`, pin-only, recall by `--teleport`; no CLI/API sets cloud environment variables (verified), so `.env` reaches the cloud through three tiers behind one create gate: a Pro/Max API credential, an `age`-sealed tar on `refs/magent/sealed` of the project's private repo unsealed by a synced plugin hook (default), or a masked manual handoff (§18, DECISION-18). The cloud relay stays deferred (DECISION-16). | Ship the core fast. |
 
 ## 3. Vocabulary
 
@@ -100,14 +100,14 @@ tables. `.env.example` gains `MAGENT_NODE_SYNC` (§10).
 
 ## 5. Module map — what is new, what is touched, what is reused
 
-New leaves (import policy: stdlib + `log`, `env`, `paths`, `attach_client`, `psmux` constants; **never** `cli`, `launch`, `upload_server`):
+New leaves (import policy: stdlib + the existing leaves `log`, `env`, `paths`, `config`, `procs`, `lockfile`, `attach_client`, `psmux` constants — each row's "Depends on" column is the authoritative per-module list (DECISION-19); **never** `cli`, `launch`, `upload_server`, pinned by an AST test per module):
 
 | Module | One purpose | Depends on |
 |---|---|---|
 | `nodes.py` | Pure data + policy: `Node`, `Recipe`, placement scoring, node-map read/write, snapshot/history file layout under `~/.magent/nodes/`. No subprocess. | `config`, `env`, `paths`, `log` |
 | `remote_mux.py` | **The single owner of every subprocess against a node**: ssh argv, `tmux -L magent …`, git-on-node, the shipped shell scripts, tar pull. Every function returns data or raises `RemoteError`; no `sys.exit`, no printing. | `attach_client` (for `SSH_CONNECTION_OPTS`), `psmux` (status constants), `env`, `log` |
 | `node_scripts/` (package data) | `setup.sh`, `provision.sh`, `bring_up.sh`, `pull.sh`, `sample.sh`, `state_hook.sh`. Each is `bash -s -- <args>` fed over stdin by `remote_mux.run_script`. POSIX-bash, `set -euo pipefail`, no distro assumptions beyond apt for `setup.sh`. | — |
-| `node_sync.py` | The daemon loop (`run_sync_loop`): per tick, one ssh per node doing pull + sample + session list; writes snapshot files; heartbeat. Mirrors `attention.run_attention_loop`'s shape. | `nodes`, `remote_mux`, `log`, `lockfile` |
+| `node_sync.py` | The daemon loop (`run_sync_loop`): per tick, one ssh per node doing pull + sample + session list; writes snapshot files; heartbeat. Mirrors `attention.run_attention_loop`'s shape. | `nodes`, `remote_mux`, `log`, `lockfile`, plus the leaves `config` (reload), `procs` (`pid_alive`), `attach_client` (`TMUX_SOCKET`), `env` (`MAGENT_NODE_SYNC`); never `cli/`, `launch` or `upload_server` (DECISION-19) |
 | `cli/node_cmd.py` | `magent node` group: table, `setup`, `doctor`, `plan`, `push`, `recall`, `sync -d`. Exit codes and tables live here per the subsystems-return-data rule. Heavy imports in-body per policy. | `cli/app`, `cli/config_io`, `nodes`, in-body `remote_mux`/`node_sync` |
 
 Touched (minimal, each a named seam):
@@ -264,7 +264,10 @@ u(s)     = s.load1 / s.nproc
 score    = p75(u) + 0.5 * max(0, max(u) - 1.5 * p75(u))        # spike penalty: someone's bursty session
          + 0.5 * max(0, 0.15 - mem_avail_mb / mem_total_mb)   # memory pressure below 15 % free
          + 0.05 * my_sessions                                  # spread my own fleet
-pick     = lowest score; ties by config order
+floor    = a node whose latest sample has mem_avail_mb / mem_total_mb < 0.10 is INELIGIBLE
+           (a box at 5 % free memory OOM-kills the session; the soft term above caps at 0.075
+           and cannot express that) — unless every node is below the floor, then the score decides
+pick     = lowest score among eligible; ties by config order
 ```
 
 Sticky: an existing `node-map.json` entry wins unless its node is gone from config (then re-placed with a printed reason). `magent node plan` prints the table (nick, samples, p75, spike, mem, my sessions, score, chosen) without writing. Assignment never written into config (same law as `account-map.json`).
@@ -277,7 +280,7 @@ Sticky: an existing `node-map.json` entry wins unless its node is gone from conf
 4. Install transcripts + memory into the destination's `~/.claude/projects/<encoded(dest dir)>/` (`--local`: this PC's encoded local path; `--to`: the target node's encoded remote dir, pushed inside the next bring-up).
 5. Clear the map entry; `--to` then runs the normal bring-up with `resume_id = latest transcript stem`. `--local` prints the exact `cd … && claude --resume <id>` (after `git pull`) rather than launching — the user chooses the terminal.
 
-**Encoded-dir rule** (`nodes.encoded_project_dir(path)`): every character not in `[A-Za-z0-9_-]` → `-`. Pinned by a unit test that reads *this machine's real* `~/.claude/projects/` entry for the repo (skipped if absent) — the rule is Anthropic's, and the test is what makes recall trustworthy. If `claude --resume` rejects a transcript whose records carry a foreign `cwd`, recall degrades to "transcripts are on disk at <path>; resume by hand" — a message, never a crash. (Implementer verifies on this PC before shipping and records the finding in DESIGN.md.)
+**Encoded-dir rule** (`nodes.encoded_project_dir(path)`, delegating to the ONE encoder in `sessions/claude.py`): read from the Claude Code binary and confirmed against 295/297 real store entries — every UTF-16 unit not in `[A-Za-z0-9]` → `-` (so `_`, `.`, space, `&` all become `-`; an emoji becomes `--`; the drive letter keeps its case); a result longer than 200 units is cut to 200 and gets `-` + base36(|Java hashCode(original path)|) appended. Pinned by unit vectors plus a test that reads *this machine's real* `~/.claude/projects/` entry for the repo (skipped if absent) — the rule is Anthropic's, and the test is what makes recall trustworthy. (main's encoder kept `.`/`_` — a live bug that silently dropped `--continue` for such paths; fixed in PR-B's first, cherry-pickable commit.) `resume_id` = stem of the newest top-level `<uuid>.jsonl` (the `sessionId` field equals the stem); `agent-*.jsonl` and everything under `<uuid>/` are excluded. If `claude --resume` rejects a transcript whose records carry a foreign `cwd`, recall degrades to "transcripts are on disk at <path>; resume by hand" — a message, never a crash. (Implementer verifies on this PC before shipping and records the finding in DESIGN.md.)
 
 **Node reboot / dead session** while still placed: the attach supervisor gives up after `SESSION_MISSING_MAX`; `magent up` (and menu revive) recreates the session with `resume_id` from the pulled transcripts — the one place a remote project gets an explicit resume.
 
