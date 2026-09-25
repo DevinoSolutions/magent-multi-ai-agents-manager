@@ -25,7 +25,6 @@ from magent.remote_mux import (
     PULL_TRAILER,
     WATERMARK_OVERLAP_S,
     RemoteError,
-    ReplyTooLarge,
     SidPull,
     next_since,
     parse_pull,
@@ -818,10 +817,9 @@ class TestPullNode:
         # to PULL_MAX_TOTAL_BYTES of files, and nothing past that is held.
         monkeypatch.setattr(remote_mux, "PULL_MAX_REPLY_BYTES", 1024)
         fake_ssh.set_mode("flood")
-        with pytest.raises(ReplyTooLarge, match="reply exceeded 1024 bytes") as info:
+        with pytest.raises(RemoteError, match="reply exceeded 1024 bytes") as info:
             remote_mux.pull_node(NODE, {}, dest=tmp_path)
         assert info.value.rc is None
-        assert info.value.limit == 1024
 
     def test_the_node_is_asked_to_stay_under_what_this_pc_will_hold(self):
         # pull.sh keeps its whole reply under max_total_bytes; the PC's cap
@@ -1231,6 +1229,8 @@ class TestPullShOnARealBash:
         assert first.failed_sids == frozenset()
         # The next tick continues from there instead of re-asking for a.jsonl.
         since = next_since(first, "api", 0.0)
+        # a.jsonl (mtime 1000) is now under the mark; b.jsonl (2000) is not.
+        assert 1000.0 < since < 2000.0
         second = self._pull(tmp_path, pdir, since=since, total=50_000, dest="two")
         assert _stored(tmp_path / "two") == ["api/transcripts/b.jsonl"]
         assert second.truncated == {}

@@ -140,20 +140,6 @@ class RemoteError(RuntimeError):
         )
 
 
-class ReplyTooLarge(RemoteError):
-    """A reply past its ``max_stdout_bytes``: the child was killed, rc None.
-
-    A subclass, so every ``except RemoteError`` still holds, while a caller
-    that must tell "the node answered, with too much" (the connection worked)
-    from a timeout (no answer in time) can, without reading the message.
-    ``limit`` is the cap the reply passed. Like any rc None, the outcome of
-    the remote command is unknown: killing the local ssh does not stop it."""
-
-    def __init__(self, limit: int, command_redacted: tuple[str, ...]) -> None:
-        self.limit = limit
-        super().__init__(None, f"reply exceeded {limit} bytes", command_redacted)
-
-
 @functools.lru_cache(maxsize=1)
 def find_ssh() -> str | None:
     """The ssh client on PATH, or None. Cached for the process lifetime like
@@ -332,8 +318,8 @@ def _spawn(
 
     Bounded in time AND in memory: stdout is read as it arrives, and a child
     whose stdout passes ``max_stdout_bytes`` is killed and raised as
-    ``ReplyTooLarge`` (a RemoteError, rc None, "reply exceeded N bytes") --
-    nothing past the cap is held. stderr is drained too, keeping only its last ``_STDERR_KEEP_BYTES``."""
+    RemoteError rc None ("reply exceeded N bytes") -- nothing past the cap is
+    held. stderr is drained too, keeping only its last ``_STDERR_KEEP_BYTES``."""
     try:
         proc = subprocess.Popen(
             argv,
@@ -379,7 +365,7 @@ def _spawn(
                 max_stdout_bytes,
                 shlex.join(shown),
             )
-        raise ReplyTooLarge(max_stdout_bytes, shown)
+        raise RemoteError(None, f"reply exceeded {max_stdout_bytes} bytes", shown)
     stderr = err.data()
     if check and proc.returncode != 0:
         if not quiet:
@@ -403,8 +389,7 @@ def run(
     """Run ``argv_remote`` on ``node`` over ssh, as ONE ``bash -c`` remote
     string (``_remote_string``). Raises RemoteError on a spawn failure, a
     missing client (rc 127), a timeout (rc None), a reply over
-    ``max_stdout_bytes`` (``ReplyTooLarge``, rc None; the child is killed), or
-    -- with ``check``
+    ``max_stdout_bytes`` (rc None; the child is killed), or -- with ``check``
     -- a non-zero exit. With ``check=False`` every exit code comes back for the
     caller to classify. The returned ``CompletedProcess.args`` is the real
     argv, this PC's client path included: a caller must not log it.
@@ -628,7 +613,7 @@ works. Also checked here: members summing past it are RemoteError before
 anything is written."""
 PULL_MAX_REPLY_BYTES = PULL_MAX_TOTAL_BYTES + 4 * 1024 * 1024
 """THIS PC's cap on the stdout one pull may hold in RAM: ``pull_node`` passes
-it as ``max_stdout_bytes``, and a reply past it is ``ReplyTooLarge``. The
+it as ``max_stdout_bytes``, and a reply past it is RemoteError rc None. The
 margin over ``PULL_MAX_TOTAL_BYTES`` is for what pull.sh cannot count: bytes
 a node user's shell rc file prints before the script runs."""
 PULL_COPY_CHUNK_BYTES = 1024 * 1024
@@ -1063,7 +1048,7 @@ def pull_node(
     call still returns liveness and load), with the files stored under
     ``dest`` (default: the node's mirror dir). Quiet: the caller reports.
     RemoteError on a transport failure (255), a timeout (None), a reply over
-    ``PULL_MAX_REPLY_BYTES`` (``ReplyTooLarge``, None -- pull.sh keeps its
+    ``PULL_MAX_REPLY_BYTES`` (None too -- pull.sh keeps its
     own reply under ``PULL_MAX_TOTAL_BYTES``, so this means a node that did
     not), a node without python3 (3), or a reply that is not a pull (0)."""
     payload = {
