@@ -19,7 +19,7 @@ import re
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
@@ -31,7 +31,7 @@ from magent.sessions.claude import encode_claude_project_path
 from magent.titles import get_leaf_name
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
     from magent.config import MagentConfig, ProjectConfig
 
@@ -1375,3 +1375,36 @@ def place(
     return Placement(
         best.nick, "re-placed", scored, f"{vanished}; re-placed on {best.nick!r}"
     )
+
+
+def placement_samples(
+    config: MagentConfig,
+    *,
+    now: float,
+    live_sample: Callable[[str], LoadSample | None] | None,
+    nodes_dir: Path | None = None,
+) -> tuple[dict[str, list[LoadSample]], frozenset[str]]:
+    """Each configured node's window, ready for ``place``, plus which nodes
+    were read live.
+
+    Spec §11's sparse rule: a node with fewer than ``MIN_WINDOW_SAMPLES`` in
+    the window gets exactly ONE live reading, and that reading is its only
+    sample -- three quiet samples from before someone started a build must not
+    win. ``live_sample`` is the caller's seam to ``remote_mux.sample`` (this
+    module never talks to a node); None -- a dry run -- scores a thin node on
+    what it has. A failed live reading leaves the node unscored.
+    """
+    samples: dict[str, list[LoadSample]] = {}
+    sampled: set[str] = set()
+    for nick in config.settings.nodes:
+        window = in_window(read_load_history(nick, nodes_dir=nodes_dir), now=now)
+        if len(window) >= MIN_WINDOW_SAMPLES or live_sample is None:
+            samples[nick] = window
+            continue
+        reading = live_sample(nick)
+        if reading is None:
+            samples[nick] = []
+            continue
+        samples[nick] = [replace(reading, ts=now)]
+        sampled.add(nick)
+    return samples, frozenset(sampled)

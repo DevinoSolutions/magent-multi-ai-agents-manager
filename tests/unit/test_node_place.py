@@ -345,3 +345,104 @@ class TestStickiness:
         )
 
         assert placement.nick == "third"  # second 0.50 vs third 0.45
+
+
+class _LiveSampler:
+    """Stands in for ``remote_mux.sample``: records the nicks asked for."""
+
+    def __init__(self, reply: LoadSample | None) -> None:
+        self.calls: list[str] = []
+        self.reply = reply
+
+    def __call__(self, nick: str) -> LoadSample | None:
+        self.calls.append(nick)
+        return self.reply
+
+
+class TestTheSparseRule:
+    def test_a_node_with_fewer_than_5_recent_samples_gets_exactly_one_live_sample(
+        self, tmp_path
+    ):
+        seed_history("second", "quiet", nodes_dir=tmp_path)
+        seed_history("third", "sparse", nodes_dir=tmp_path)
+        live = _LiveSampler(_sample(NOW - 999, load1=3.6))
+
+        samples, sampled = nodes.placement_samples(
+            pool("second", "third"), now=NOW, live_sample=live, nodes_dir=tmp_path
+        )
+
+        assert live.calls == ["third"]
+        assert samples["third"] == [_sample(NOW, load1=3.6)]  # re-stamped to now
+        assert sampled == frozenset({"third"})
+
+    def test_a_well_sampled_pool_is_never_sampled_live(self, tmp_path):
+        seed_history("second", "quiet", nodes_dir=tmp_path)
+        seed_history("third", "bursty", nodes_dir=tmp_path)
+        live = _LiveSampler(_sample())
+
+        nodes.placement_samples(
+            pool("second", "third"), now=NOW, live_sample=live, nodes_dir=tmp_path
+        )
+
+        assert live.calls == []
+
+    def test_the_live_reading_decides_so_an_idle_looking_sparse_box_can_lose(
+        self, tmp_path
+    ):
+        seed_history("second", "quiet", nodes_dir=tmp_path)
+        seed_history("third", "sparse", nodes_dir=tmp_path)
+        config = pool("second", "third")
+        samples, sampled = nodes.placement_samples(
+            config,
+            now=NOW,
+            live_sample=_LiveSampler(_sample(load1=3.6)),
+            nodes_dir=tmp_path,
+        )
+
+        placement = nodes.place(config, samples, now=NOW, map_entry=None, live=sampled)
+
+        assert placement.nick == "second"  # third's live u = 0.9 beats its idle history
+
+    def test_without_live_sampling_a_sparse_node_is_scored_on_what_it_has(
+        self, tmp_path
+    ):
+        seed_history("second", "quiet", nodes_dir=tmp_path)
+        seed_history("third", "sparse", nodes_dir=tmp_path)
+        config = pool("second", "third")
+
+        samples, sampled = nodes.placement_samples(
+            config, now=NOW, live_sample=None, nodes_dir=tmp_path
+        )
+
+        assert len(samples["third"]) == 3
+        assert sampled == frozenset()
+        assert nodes.place(config, samples, now=NOW, map_entry=None).nick == "third"
+
+    def test_a_failed_live_sample_leaves_the_node_unscored(self, tmp_path):
+        seed_history("third", "sparse", nodes_dir=tmp_path)
+
+        samples, sampled = nodes.placement_samples(
+            pool("third"), now=NOW, live_sample=_LiveSampler(None), nodes_dir=tmp_path
+        )
+
+        assert samples["third"] == []
+        assert sampled == frozenset()
+
+    def test_a_node_with_no_history_is_sampled_live_once(self, tmp_path):
+        live = _LiveSampler(_sample())
+
+        nodes.placement_samples(
+            pool("second"), now=NOW, live_sample=live, nodes_dir=tmp_path
+        )
+
+        assert live.calls == ["second"]
+
+    def test_a_live_score_is_marked_live(self, tmp_path):
+        config = pool("second")
+        samples, sampled = nodes.placement_samples(
+            config, now=NOW, live_sample=_LiveSampler(_sample()), nodes_dir=tmp_path
+        )
+
+        placement = nodes.place(config, samples, now=NOW, map_entry=None, live=sampled)
+
+        assert [s.live for s in placement.scores] == [True]
