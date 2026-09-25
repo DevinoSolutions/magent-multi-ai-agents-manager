@@ -2776,6 +2776,9 @@ def _doctor_box(
     charmap: str = "UTF-8",
     avail_kb: int = 50 * GIB_KB,
     tmux_version: str = "tmux 3.4",
+    sessions: str = "a: 1 windows\nb: 1 windows\n",
+    sessions_stderr: str = "",
+    sessions_rc: int = 0,
     hang: str | None = None,
     hang_ignores_term: bool = False,
 ) -> tuple[dict[str, FakeSsh], dict[str, str]]:
@@ -2788,10 +2791,7 @@ def _doctor_box(
         name, match = HUNG_PROBES[hang]
         fakes[name].set_reply(match, hang_s=HANG_S, ignore_term=hang_ignores_term)
     replies = {
-        "tmux": [
-            ("-V", tmux_version + "\n"),
-            ("list-sessions", "a: 1 windows\nb: 1 windows\n"),
-        ],
+        "tmux": [("-V", tmux_version + "\n")],
         "claude": [("auth status", json.dumps({"loggedIn": logged_in}) + "\n")],
         "locale": [("charmap", charmap + "\n")],
         "df": [("-Pk", _df(avail_kb))],
@@ -2799,6 +2799,10 @@ def _doctor_box(
     for name, fake in fakes.items():
         for match, stdout in replies.get(name, []):
             fake.set_reply(match, stdout=stdout)
+    if "tmux" in fakes:
+        fakes["tmux"].set_reply(
+            "list-sessions", stdout=sessions, stderr=sessions_stderr, rc=sessions_rc
+        )
     if "ssh" in fakes:
         fakes["ssh"].set_reply("git@github.com", stderr=github + "\n", rc=1)
     (tmp_path / "node" / "magent").mkdir(parents=True, exist_ok=True)
@@ -2946,6 +2950,33 @@ class TestDoctorShUnderRealBash:
         assert last in row.detail
         assert "refused" not in row.detail
         assert "magent node setup" not in row.detail
+
+    def test_a_silent_github_failure_says_no_output(self, tmp_path):
+        # ssh exits non-zero having printed nothing: the row still says so,
+        # rather than quoting an empty last line.
+        _, env = _doctor_box(tmp_path, github="")
+        (row,) = [
+            ln for ln in _report(_run_doctor(env)).lines if ln.item == "github-key"
+        ]
+        assert (row.status, row.detail) == (
+            "fail",
+            "could not reach GitHub over ssh (no output)",
+        )
+
+    def test_no_tmux_server_is_zero_sessions(self, tmp_path):
+        # No server on the socket yet (tmux exits 1, says so on stderr) is a
+        # healthy node with nothing running, not one session.
+        _, env = _doctor_box(
+            tmp_path,
+            sessions="",
+            sessions_stderr="no server running on /tmp/tmux-1000/magent\n",
+            sessions_rc=1,
+        )
+        (row,) = [ln for ln in _report(_run_doctor(env)).lines if ln.item == "sessions"]
+        assert (row.status, row.detail) == (
+            "ok",
+            f"0 on tmux socket {remote_mux.SOCKET}",
+        )
 
     def test_a_node_without_ssh_says_so(self, tmp_path):
         tools = tuple(t for t in NODE_TOOLS if t != "ssh")
