@@ -578,3 +578,196 @@ class TestAMalformedPcFileIsANoteNotACrash:
         assert scope.notes == (
             "mcpOAuth: 1 entry for servers not in mcpServers left out",
         )
+
+
+class TestUserScopePluginsAndSkills:
+    def test_enabled_plugins_ship_sorted_and_disabled_ones_do_not(self, tmp_path):
+        home = _pc_home(
+            tmp_path,
+            settings={
+                "enabledPlugins": {
+                    "superpowers@claude-plugins-official": True,
+                    "off@mkt": False,
+                    "b@mkt": True,
+                    "not-a-plugin-id": True,
+                }
+            },
+        )
+        assert nodes.user_scope(home).plugins == (
+            "b@mkt",
+            "superpowers@claude-plugins-official",
+        )
+
+    def test_a_marketplace_source_comes_from_the_known_list(self, tmp_path):
+        home = _pc_home(
+            tmp_path,
+            settings={"enabledPlugins": {"p@mkt": True}},
+            known_marketplaces={
+                "mkt": {
+                    "source": {"source": "github", "repo": "owner/mkt"},
+                    "installLocation": "C:/x",
+                },
+                "unused": {"source": {"source": "github", "repo": "owner/unused"}},
+            },
+        )
+        assert nodes.user_scope(home).marketplaces == {"mkt": "owner/mkt"}
+
+    def test_settings_extra_marketplaces_fill_the_gaps(self, tmp_path):
+        home = _pc_home(
+            tmp_path,
+            settings={
+                "enabledPlugins": {"p@mkt": True},
+                "extraKnownMarketplaces": {
+                    "mkt": {
+                        "source": {
+                            "source": "git",
+                            "url": "https://git.example/mkt.git",
+                        }
+                    }
+                },
+            },
+        )
+        assert nodes.user_scope(home).marketplaces == {
+            "mkt": "https://git.example/mkt.git"
+        }
+
+    def test_a_local_directory_marketplace_is_a_note(self, tmp_path):
+        home = _pc_home(
+            tmp_path,
+            settings={"enabledPlugins": {"p@mkt": True}},
+            known_marketplaces={
+                "mkt": {"source": {"source": "directory", "path": "C:/dev/mkt"}}
+            },
+        )
+        scope = nodes.user_scope(home)
+        assert scope.marketplaces == {}
+        assert scope.notes == (
+            (
+                "marketplace mkt: no remote source on this PC; its plugins may not "
+                "install on a node"
+            ),
+        )
+
+    def test_skills_ship_as_relative_files_with_their_exec_bit(self, tmp_path):
+        home = _pc_home(tmp_path)
+        skill = home / ".claude" / "skills" / "deploy"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_bytes(b"# deploy\n")
+        (skill / "run.sh").write_bytes(b"#!/usr/bin/env bash\necho hi\n")
+        assert nodes.user_scope(home).skills == (
+            nodes.SkillFile(
+                path="deploy/SKILL.md", data=b"# deploy\n", executable=False
+            ),
+            nodes.SkillFile(
+                path="deploy/run.sh",
+                data=b"#!/usr/bin/env bash\necho hi\n",
+                executable=True,
+            ),
+        )
+
+    def test_managed_copies_and_tool_dirs_stay_behind(self, tmp_path):
+        home = _pc_home(tmp_path)
+        skills = home / ".claude" / "skills"
+        (skills / "synced" / "x").mkdir(parents=True)
+        (skills / "synced" / "x" / "SKILL.md").write_text("managed", encoding="utf-8")
+        (skills / "mine" / "node_modules" / "dep").mkdir(parents=True)
+        (skills / "mine" / "node_modules" / "dep" / "i.js").write_text(
+            "", encoding="utf-8"
+        )
+        (skills / "mine" / "SKILL.md").write_text("mine", encoding="utf-8")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["mine/SKILL.md"]
+        assert scope.notes == ("skills/synced: claude.ai-managed copies, not shipped",)
+
+    # Skill files ship as raw bytes and nothing else scans them: the value rule
+    # (CLAUDE_CREDENTIAL_MARKER) reaches them too, and plugin ids and
+    # marketplace sources, so a hard-coded key cannot ride any of them out.
+    def test_a_skill_file_holding_a_claude_credential_stays_behind(self, tmp_path):
+        home = _pc_home(tmp_path)
+        skill = home / ".claude" / "skills" / "deploy"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_bytes(b"# deploy\n")
+        (skill / "run.sh").write_bytes(
+            b"#!/usr/bin/env bash\nKEY=sk-ant-oat01-DECOY curl x\n"
+        )
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["deploy/SKILL.md"]
+        assert scope.notes == (
+            "skills/deploy/run.sh: holds a Claude credential, never shipped",
+        )
+        assert "DECOY" not in repr(scope)
+
+    def test_a_marketplace_source_holding_one_stays_behind(self, tmp_path):
+        home = _pc_home(
+            tmp_path,
+            settings={"enabledPlugins": {"p@mkt": True}},
+            known_marketplaces={
+                "mkt": {
+                    "source": {
+                        "source": "git",
+                        "url": f"https://x:{OAT_DECOY}@git.example/mkt.git",
+                    }
+                }
+            },
+        )
+        scope = nodes.user_scope(home)
+        assert scope.plugins == ("p@mkt",)
+        assert scope.marketplaces == {}
+        assert scope.notes == (
+            "marketplace mkt: its source holds a Claude credential, never shipped",
+        )
+        assert "DECOY" not in repr(scope)
+
+    def test_a_plugin_id_holding_one_stays_behind(self, tmp_path):
+        home = _pc_home(
+            tmp_path,
+            settings={"enabledPlugins": {f"p@{API_DECOY}": True, "q@mkt": True}},
+        )
+        scope = nodes.user_scope(home)
+        assert scope.plugins == ("q@mkt",)
+        # Task 2's settings catch-all drops enabledPlugins from the shipped
+        # settings; the plugin list itself drops only the id that holds one.
+        assert "enabledPlugins" not in scope.settings
+        assert scope.notes == (
+            "settings.enabledPlugins: holds a Claude credential, never shipped",
+            "plugin (a name holding one): holds a Claude credential, never shipped",
+            (
+                "marketplace mkt: no remote source on this PC; its plugins may not "
+                "install on a node"
+            ),
+        )
+        assert "DECOY" not in repr(scope)
+
+
+class TestUserScopeDigests:
+    def test_every_item_has_a_digest(self):
+        assert set(_scope().digests()) == {
+            "settings",
+            "mcp",
+            "mcp_oauth",
+            "plugins",
+            "skills",
+        }
+
+    def test_an_empty_item_digests_to_the_empty_string(self):
+        assert set(_scope().digests().values()) == {""}
+
+    def test_key_order_does_not_change_a_digest(self):
+        a = _scope(settings={"a": 1, "b": {"c": 2, "d": 3}}).digests()
+        b = _scope(settings={"b": {"d": 3, "c": 2}, "a": 1}).digests()
+        assert a == b
+
+    def test_one_changed_skill_byte_changes_only_the_skills_digest(self):
+        before = _scope(
+            skills=(nodes.SkillFile(path="s/SKILL.md", data=b"a", executable=False),)
+        ).digests()
+        after = _scope(
+            skills=(nodes.SkillFile(path="s/SKILL.md", data=b"b", executable=False),)
+        ).digests()
+        assert before["skills"] != after["skills"]
+        assert {k: v for k, v in before.items() if k != "skills"} == {
+            k: v for k, v in after.items() if k != "skills"
+        }
+
+    def test_notes_are_not_content(self):
+        assert _scope(notes=("x",)).digests() == _scope().digests()

@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import stat
 import tempfile
 import time
 import urllib.parse
@@ -506,6 +507,123 @@ def _mcp_oauth(
     return kept
 
 
+def _plugins(settings: dict[str, object], notes: list[str]) -> tuple[str, ...]:
+    """Enabled plugin ids (``name@marketplace``) from ``enabledPlugins``. An id
+    that holds a Claude credential stays behind with a note."""
+    enabled = settings.get("enabledPlugins")
+    if not isinstance(enabled, dict):
+        return ()
+    ids = sorted(
+        pid
+        for pid, on in enabled.items()
+        if on is True and isinstance(pid, str) and "@" in pid
+    )
+    for pid in ids:
+        if _holds_claude_credential(pid):
+            notes.append(
+                f"plugin {_named(pid)}: holds a Claude credential, never shipped"
+            )
+    return tuple(pid for pid in ids if not _holds_claude_credential(pid))
+
+
+def _marketplace_source(entry: object) -> str | None:
+    """What ``claude plugin marketplace add`` takes for a marketplace entry:
+    ``owner/repo`` for github, the URL for git/url, None for a local dir."""
+    source = entry.get("source") if isinstance(entry, dict) else None
+    if not isinstance(source, dict):
+        return None
+    kind = source.get("source")
+    key = "repo" if kind == "github" else "url" if kind in ("git", "url") else None
+    value = source.get(key) if key is not None else None
+    return value if isinstance(value, str) and value else None
+
+
+def _marketplaces(
+    plugins: tuple[str, ...],
+    settings: dict[str, object],
+    known: dict[str, object],
+    notes: list[str],
+) -> dict[str, str]:
+    """A remote source for every marketplace an enabled plugin comes from:
+    the CLI's known list first, then ``settings.extraKnownMarketplaces``. A
+    source that holds a Claude credential (a token in a git URL) stays behind
+    with a note that never quotes it."""
+    extra_raw = settings.get("extraKnownMarketplaces")
+    extra: dict[str, object] = extra_raw if isinstance(extra_raw, dict) else {}
+    found: dict[str, str] = {}
+    for name in sorted({pid.rsplit("@", 1)[1] for pid in plugins}):
+        source = _marketplace_source(known.get(name)) or _marketplace_source(
+            extra.get(name)
+        )
+        if source is None:
+            notes.append(
+                f"marketplace {name}: no remote source on this PC; its plugins "
+                "may not install on a node"
+            )
+        elif _holds_claude_credential(source):
+            notes.append(
+                f"marketplace {name}: its source holds a Claude credential, "
+                "never shipped"
+            )
+        else:
+            found[name] = source
+    return found
+
+
+_CREDENTIAL_BYTES = CLAUDE_CREDENTIAL_MARKER.encode("ascii")
+
+
+def _skills(root: Path, notes: list[str]) -> tuple[SkillFile, ...]:
+    """Every file under ``~/.claude/skills``, symlinks followed once, sorted by
+    path. A file is executable if its mode says so OR it starts with ``#!`` --
+    a Windows PC has no exec bit to read. A file whose bytes (or path) hold a
+    Claude credential stays behind; its note names the path, never the
+    content."""
+    if not root.is_dir():
+        return ()
+    if any((root / top).exists() for top in SKILLS_EXCLUDED_TOP):
+        notes.append("skills/synced: claude.ai-managed copies, not shipped")
+    files: list[SkillFile] = []
+    seen: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+        here = Path(dirpath)
+        real = os.path.realpath(here)
+        if real in seen:
+            dirnames[:] = []
+            continue
+        seen.add(real)
+        rel = here.relative_to(root)
+        dirnames[:] = sorted(
+            d
+            for d in dirnames
+            if d not in SKILLS_EXCLUDED_DIRS
+            and not (rel == Path() and d in SKILLS_EXCLUDED_TOP)
+        )
+        for name in sorted(filenames):
+            path = here / name
+            rel_path = (rel / name).as_posix()
+            try:
+                data = path.read_bytes()
+                mode = path.stat().st_mode
+            except OSError as e:
+                notes.append(f"skills/{_named(rel_path)}: unreadable ({e.strerror})")
+                continue
+            if _CREDENTIAL_BYTES in data or _holds_claude_credential(rel_path):
+                notes.append(
+                    f"skills/{_named(rel_path)}: holds a Claude credential, "
+                    "never shipped"
+                )
+                continue
+            files.append(
+                SkillFile(
+                    path=rel_path,
+                    data=data,
+                    executable=bool(mode & stat.S_IXUSR) or data.startswith(b"#!"),
+                )
+            )
+    return tuple(sorted(files, key=lambda f: f.path))
+
+
 def user_scope(home: Path) -> UserScope:
     """What provisioning ships from the PC whose home is ``home`` (spec §8).
     Reads ONLY ``~/.claude/settings.json``, ``~/.claude.json`` (mcpServers),
@@ -523,13 +641,19 @@ def user_scope(home: Path) -> UserScope:
         servers,
         notes,
     )
+    plugins = _plugins(raw_settings, notes)
+    known = _read_object(
+        claude / "plugins" / "known_marketplaces.json",
+        "plugins/known_marketplaces.json",
+        notes,
+    )
     return UserScope(
         settings=settings,
         mcp_servers=servers,
         mcp_oauth=oauth,
-        plugins=(),
-        marketplaces={},
-        skills=(),
+        plugins=plugins,
+        marketplaces=_marketplaces(plugins, raw_settings, known, notes),
+        skills=_skills(claude / "skills", notes),
         notes=tuple(notes),
     )
 
