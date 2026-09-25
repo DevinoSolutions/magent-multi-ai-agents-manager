@@ -468,7 +468,7 @@ def _gh(
             timeout_s=GH_TIMEOUT_S,
             input_bytes=input_bytes,
             check=False,
-            shown=("gh", *args),
+            shown=_redacted(["gh", *args], input_bytes),
             label="local gh",
         )
     except RemoteError:

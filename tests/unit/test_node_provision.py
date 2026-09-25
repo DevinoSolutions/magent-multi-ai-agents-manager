@@ -1499,6 +1499,16 @@ class TestRegisterSshKey:
             "gh ssh-key add did not finish (spawn failure or timeout); rerun to check",
         )
 
+    def test_a_gh_call_with_stdin_logs_it_by_length_alone(
+        self, fake_gh, monkeypatch, caplog
+    ):
+        fake_gh.set_mode("timeout")
+        monkeypatch.setattr(remote_mux, "GH_TIMEOUT_S", 0.5)
+        key = (NODE_KEY + "\n").encode("ascii")
+        assert remote_mux._gh(["ssh-key", "add", "-"], input_bytes=key) is None
+        assert "timed out" in caplog.text
+        assert f"<stdin: {len(key)} bytes>" in caplog.text
+
     def test_a_multi_line_refusal_keeps_the_last_line(self, fake_gh):
         fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
         fake_gh.set_reply("ssh-key add", stderr=REFUSED_ADD_STDERR, rc=1)
