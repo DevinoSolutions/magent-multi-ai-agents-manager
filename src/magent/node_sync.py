@@ -27,8 +27,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -38,11 +39,12 @@ from magent.attach_client import SSH_TRANSPORT_RC
 from magent.config import NODE_CLOUD, load_config
 from magent.env import local_username
 from magent.lockfile import LockHeld, exclusive_lock
-from magent.log import clear_heartbeat, get_logger
+from magent.log import clear_heartbeat, get_logger, run_heartbeat, write_heartbeat
 from magent.procs import pid_alive
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Iterator, Mapping
+    from concurrent.futures import Future
 
     from magent.config import MagentConfig
     from magent.nodes import LoadSample, Node, NodeMapEntry
@@ -69,6 +71,8 @@ UNREACHABLE = "unreachable"  # ssh transport failure (255) or no answer in time
 FAILED = "failed"  # the node answered, and the answer was not a pull
 MISCONFIGURED = "misconfigured"  # the nick does not resolve (D4, no user)
 LOCKED = "locked"  # another pull holds this node right now
+# The UNREACHABLE detail for a node whose pull outlived the tick's wait.
+PULL_STILL_RUNNING = "previous pull still running"
 
 
 def daemon_running() -> bool:
@@ -194,6 +198,17 @@ def tick_interval_s(config: MagentConfig) -> float:
     because one ssh carries both."""
     sync = config.settings.node_sync
     return float(max(1, min(sync.pull_interval_s, sync.sample_interval_s)))
+
+
+def tick_wait_s(config: MagentConfig) -> float:
+    """How long the daemon's tick waits for its pulls: half a tick interval.
+
+    A pull still running after that is reported UNREACHABLE
+    (``PULL_STILL_RUNNING``) and its node is not dialled again until it ends;
+    every other node keeps its cadence. Two of a healthy node's pulls are then
+    at most 1.5 tick intervals apart, inside ``nodes.sessions_stale``'s two
+    pull intervals (a tick interval is never longer than a pull interval)."""
+    return tick_interval_s(config) / 2
 
 
 # (project, nick, sid) entries state_stores has already warned about.
@@ -463,29 +478,82 @@ class NodeSyncer:
         self._warned: set[tuple[str, str]] = set()
         self._last: dict[str, str] = {}
         self._last_sample: dict[str, float] = {}
+        # ONE pool for the syncer's life, and at most ONE pull in flight per
+        # node across ticks: a hung node holds one worker, never the tick.
+        self._executor: ThreadPoolExecutor | None = None
+        self._workers = 0
+        self._inflight: dict[str, Future[tuple[str, str]]] = {}
 
     def reconfigure(self, config: MagentConfig) -> None:
         self._config = config
 
-    def tick(self) -> dict[str, tuple[str, str]]:
+    def close(self) -> None:
+        """Stop the pool without waiting: a pull still running ends on its own
+        (bounded by ``remote_mux.PULL_TIMEOUT_S``); queued ones are cancelled."""
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
+        self._inflight.clear()
+
+    def _pool(self, size: int) -> ThreadPoolExecutor:
+        """The pool, rebuilt when a new pool size changes its worker count. The
+        old one is shut down without waiting or cancelling: its running pulls
+        finish and are still collected through ``_inflight``."""
+        workers = min(8, size)
+        if self._executor is None or workers != self._workers:
+            if self._executor is not None:
+                self._executor.shutdown(wait=False)
+            self._executor = ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix=HEARTBEAT_NAME
+            )
+            self._workers = workers
+        return self._executor
+
+    def tick(self, *, wait_s: float | None = None) -> dict[str, tuple[str, str]]:
         """Pull every pool node once; ``{nick: (outcome, detail)}``. Every
         node is dialled -- one with no placed session still reports its
-        liveness and load. Nothing a node answers raises out of here."""
+        liveness and load. Nothing a node answers raises out of here.
+
+        ``wait_s`` bounds how long the tick waits for its pulls (None: until
+        each has ended). A node whose pull is still running then reads
+        UNREACHABLE (``PULL_STILL_RUNNING``) and is not dialled again until
+        that pull ends; its result is collected by the first tick after."""
         by_nick: dict[str, dict[str, NodeMapEntry]] = {}
         for entry in nodes.read_node_map().values():
             by_nick.setdefault(entry.nick, {})[entry.sid] = entry
         user = self._local_user if self._local_user is not None else local_username()
-        pool = sorted(self._config.settings.nodes)
+        # ONE read of the config per tick: a reconfigure mid-tick cannot mix
+        # two pools into one tick's submissions and results.
+        config = self._config
+        pool = sorted(config.settings.nodes)
+        for gone in set(self._inflight) - set(pool):
+            del self._inflight[gone]
+        # A node that left the pool is forgotten, so one re-added while still
+        # down is warned about again rather than read as the old state.
+        for gone in set(self._last) - set(pool):
+            del self._last[gone]
         if not pool:
             return {}
-        with ThreadPoolExecutor(
-            max_workers=min(8, len(pool)), thread_name_prefix=HEARTBEAT_NAME
-        ) as ex:
-            futures = {
-                nick: ex.submit(self._sync_node, nick, by_nick.get(nick, {}), user)
-                for nick in pool
-            }
-            results = {nick: f.result() for nick, f in futures.items()}
+        ex = self._pool(len(pool))
+        for nick in pool:
+            prev = self._inflight.get(nick)
+            if prev is not None and not prev.done():
+                continue
+            if prev is not None and not prev.cancelled():
+                # A laggard that ended between ticks: its outcome is news.
+                self._note(nick, *prev.result())
+            self._inflight[nick] = ex.submit(
+                self._sync_node, nick, by_nick.get(nick, {}), user
+            )
+        wait([self._inflight[nick] for nick in pool], timeout=wait_s)
+        results: dict[str, tuple[str, str]] = {}
+        for nick in pool:
+            future = self._inflight[nick]
+            if not future.done():
+                results[nick] = (UNREACHABLE, PULL_STILL_RUNNING)
+                continue
+            del self._inflight[nick]
+            results[nick] = future.result()
         for nick, (outcome, detail) in results.items():
             self._note(nick, outcome, detail)
         return results
@@ -572,3 +640,89 @@ class NodeSyncer:
         ):
             _append_sample(nick, snap.sample, at=at, history_h=sync.history_h)
             self._last_sample[nick] = at
+
+
+def run_once(
+    config: MagentConfig,
+    *,
+    pull: Callable[[Node, Mapping[str, remote_mux.SidPull]], remote_mux.NodeSnapshot]
+    | None = None,
+) -> dict[str, tuple[str, str]]:
+    """One tick under the daemon's lock (``magent node sync --once``). LockHeld
+    when the daemon is running -- its own next tick is the answer. The tick
+    waits for every pull: a one-shot has no next tick to collect a laggard."""
+    with exclusive_lock(LOCK_NAME):
+        syncer = NodeSyncer(config, pull=pull)
+        try:
+            return syncer.tick()
+        finally:
+            syncer.close()
+
+
+def run_sync_loop(
+    config: MagentConfig,
+    *,
+    max_ticks: int | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    reload: Callable[[], MagentConfig | None] | None = None,
+    pull: Callable[[Node, Mapping[str, remote_mux.SidPull]], remote_mux.NodeSnapshot]
+    | None = None,
+) -> int:
+    """The daemon body (``magent node sync``, detached by serve). Returns 0.
+
+    - Another daemon holding ``node-sync``: exit quietly.
+    - Otherwise: pid file + heartbeat thread, then tick every
+      ``tick_interval_s``, re-reading the config through ``reload`` (None
+      keeps the current one) until no project runs on a node. Each tick waits
+      at most ``tick_wait_s`` for its pulls, so one hung node never holds the
+      others back.
+    - A clean exit (or Ctrl+C) clears the heartbeat; a crash is logged at
+      exception level and leaves the heartbeat as its marker, as
+      ``attention -d`` does. Either way the pull pool is shut down without
+      joining a pull that is still running."""
+    log = get_logger(LOG_NAME)
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(exclusive_lock(LOCK_NAME))
+        except LockHeld:
+            log.info("node sync: another daemon holds the lock; exiting")
+            return 0
+        _write_pid()
+        write_heartbeat(HEARTBEAT_NAME)
+        stop_hb = threading.Event()
+        hb_thread = threading.Thread(
+            target=run_heartbeat, args=(HEARTBEAT_NAME, stop_hb), daemon=True
+        )
+        hb_thread.start()
+        syncer = NodeSyncer(config, pull=pull)
+        ticks = 0
+        clean = False
+        log.info("node sync: starting (%d node(s))", len(config.settings.nodes))
+        try:
+            while wanted(config):
+                syncer.tick(wait_s=tick_wait_s(config))
+                ticks += 1
+                if max_ticks is not None and ticks >= max_ticks:
+                    break
+                sleep(tick_interval_s(config))
+                if reload is not None:
+                    fresh = reload()
+                    if fresh is not None:
+                        config = fresh
+                        syncer.reconfigure(config)
+            clean = True
+        except KeyboardInterrupt:
+            clean = True
+        except Exception:
+            log.exception("node sync daemon crashed")
+            raise
+        finally:
+            syncer.close()
+            # Join before touching the file, so no late pulse re-creates it.
+            stop_hb.set()
+            hb_thread.join(timeout=5)
+            if clean:
+                clear_heartbeat(HEARTBEAT_NAME)
+            _clear_pid()
+        log.info("node sync: stopped after %d tick(s)", ticks)
+    return 0
