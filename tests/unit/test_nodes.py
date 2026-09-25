@@ -84,6 +84,8 @@ class TestTheNodeStoreLayout:
     def test_the_store_lives_under_magent_nodes(self):
         # Path.home() is the test's redirected home; this holds only because
         # tests/conftest.py registers both constants as import-bound.
+        # Operand order: ruff SIM300 reads the UPPERCASE attribute as a constant
+        # and would flag `nodes.NODES_DIR == ...` as a Yoda condition.
         assert Path.home() / ".magent" / "nodes" == nodes.NODES_DIR
         assert nodes.NODE_MAP_PATH == nodes.NODES_DIR / "node-map.json"
 
