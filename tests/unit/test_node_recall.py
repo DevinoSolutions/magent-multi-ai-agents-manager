@@ -16,7 +16,7 @@ import os
 import subprocess
 import sys
 import tarfile
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -1018,6 +1018,51 @@ class TestTheTarCarriesOnlyTheConversation:
         assert "link" in caught.value.stderr_tail
         assert fake_ssh.calls() == []
 
+    def test_a_path_on_another_drive_is_never_within_the_source(self, tmp_path):
+        # cq-G9 J5: on Windows commonpath raises ValueError across drives, and
+        # that means "outside", never an escaping exception. Elsewhere the
+        # name is just a relative path under the cwd, also outside.
+        root = os.path.normcase(os.path.realpath(tmp_path))
+
+        assert remote_mux._within(str(PureWindowsPath("Z:/x/y")), root) is False
+
+    def test_a_source_spelled_in_another_case_is_not_refused(self, tmp_path):
+        # cq-G9 J7: on a case-insensitive filesystem realpath answers the
+        # on-disk case, so the containment compare must be normcase'd or a
+        # correctly named source reads as a link.
+        real = tmp_path / "pc"
+        real.mkdir()
+        _pulled(real)
+        upper = real / "PULLED"
+        if not upper.is_dir():
+            pytest.skip("this filesystem is case-sensitive")
+
+        assert self._names(upper) == [
+            f"{SESSION_ID}.jsonl",
+            "memory",
+            "memory/MEMORY.md",
+        ]
+
+    def test_a_source_under_a_linked_parent_still_ships_its_subdirs(self, tmp_path):
+        # cq-G9 J9: only the source's OWN last component must not be a link. A
+        # junction (a symlink off Windows) higher up is fine, and every
+        # directory under the source is compared against its RESOLVED base.
+        target = tmp_path / "real-parent"
+        target.mkdir()
+        _pulled(target)
+        parent = tmp_path / "linked-parent"
+        if sys.platform == "win32":
+            _junction(parent, target)
+        else:
+            parent.symlink_to(target, target_is_directory=True)
+        try:
+            names = self._names(parent / "pulled")
+        finally:
+            if sys.platform == "win32":
+                os.rmdir(parent)
+
+        assert names == [f"{SESSION_ID}.jsonl", "memory", "memory/MEMORY.md"]
+
     def test_an_unreadable_source_is_a_clean_error_and_never_dials(
         self, fake_ssh, tmp_path
     ):
@@ -1068,6 +1113,30 @@ class TestAJunctionNeverCarriesTheTarOutOfTheTree:
         assert names == [f"{SESSION_ID}.jsonl", "memory", "memory/MEMORY.md"]
         assert b"the private key" not in payload
         assert any("notes" in r.getMessage() for r in caplog.records)
+
+    def test_the_per_file_check_catches_a_junction_the_prune_missed(
+        self, tmp_path, secret, monkeypatch
+    ):
+        # cq-G9 J3: the two layers are independent. With the directory prune
+        # blinded, os.walk descends the junction, and the per-file realpath
+        # containment alone must still keep the key out of the payload.
+        source = _pulled(tmp_path)
+        link = source / "memory" / "notes"
+        _junction(link, secret)
+        try:
+            with monkeypatch.context() as m:
+                m.setattr(
+                    remote_mux, "_is_its_own_place", lambda path, real_parent: True
+                )
+                payload = remote_mux._tar_dir(source)
+        finally:
+            os.rmdir(link)
+
+        with tarfile.open(fileobj=io.BytesIO(payload)) as tar:
+            names = tar.getnames()
+        assert "memory/notes/id_rsa" not in names
+        assert b"the private key" not in payload
+        assert "memory/MEMORY.md" in names
 
     def test_a_source_that_is_itself_a_junction_is_refused_and_never_dials(
         self, fake_ssh, tmp_path, secret, caplog
