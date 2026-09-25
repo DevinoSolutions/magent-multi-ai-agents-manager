@@ -111,11 +111,20 @@ class AttentionEngine:
             if view is not None:
                 views.append(view)
         if self._extra_stores is not None:
-            for label, key, root in self._extra_stores():
-                for rec in agent_state.read_store(root):
-                    view = self._view(rec, now, label=label, key=key)
-                    if view is not None:
-                        views.append(view)
+            try:
+                for label, key, root in self._extra_stores():
+                    for rec in agent_state.read_store(root):
+                        view = self._view(rec, now, label=label, key=key)
+                        if view is not None:
+                            views.append(view)
+            except (OSError, ValueError) as exc:
+                # A node store going unreadable (the callable itself, or a
+                # store it names) must never take the whole daemon down with
+                # it -- this tick falls back to the local views already
+                # collected above, and the next tick tries again.
+                get_logger("attention").warning(
+                    "node stores unavailable this tick: %s", exc
+                )
         views.sort(key=lambda v: (_URGENCY.get(v.state, 99), -v.ts))
         return views
 

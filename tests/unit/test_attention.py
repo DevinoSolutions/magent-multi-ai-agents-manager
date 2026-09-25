@@ -976,3 +976,46 @@ class TestNodeStores:
         )
         engine = AttentionEngine(now=lambda: 1000.0, extra_stores=list)
         assert [(v.name, v.cwd) for v in engine.poll()] == [("local", "/w/local")]
+
+    def test_a_failing_node_store_never_kills_the_poll(
+        self, state_dir, tmp_path, caplog
+    ):
+        import logging
+
+        self._write(
+            state_dir,
+            "k.json",
+            state="working",
+            ts=990.0,
+            cwd="/w/local",
+            session_id="s",
+        )
+
+        def _boom() -> list[tuple[str, str, object]]:
+            raise OSError("nodes unreachable")
+
+        engine = AttentionEngine(now=lambda: 1000.0, extra_stores=_boom)
+        with caplog.at_level(logging.WARNING, logger="magent.attention"):
+            views = engine.poll()
+
+        assert [(v.name, v.cwd) for v in views] == [("local", "/w/local")]
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "nodes unreachable" in warnings[0].getMessage()
+
+    def test_a_node_store_raising_valueerror_is_handled_the_same_way(
+        self, state_dir, tmp_path, caplog
+    ):
+        import logging
+
+        def _boom() -> list[tuple[str, str, object]]:
+            raise ValueError("bad node map")
+
+        engine = AttentionEngine(now=lambda: 1000.0, extra_stores=_boom)
+        with caplog.at_level(logging.WARNING, logger="magent.attention"):
+            views = engine.poll()
+
+        assert views == []
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "bad node map" in warnings[0].getMessage()
