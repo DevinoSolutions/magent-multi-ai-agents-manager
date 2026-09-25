@@ -23,7 +23,7 @@ from magent.config import (
     ProjectConfig,
     Settings,
 )
-from magent.lockfile import LockHeld
+from magent.lockfile import LockHeld, lock_path
 from magent.nodes import (
     LoadSample,
     LocalGitState,
@@ -452,6 +452,33 @@ class TestTheMapWriterNeverGuesses:
             nodes.update_node_map("web", ENTRY)
         assert node_map.read_text(encoding="utf-8") == torn
 
+    def test_an_empty_map_file_is_refused_naming_the_file(self, node_map):
+        # What a crash between an unsynced write and the replace leaves: the
+        # error must say WHICH file refuses every write from now on.
+        node_map.parent.mkdir(parents=True)
+        node_map.write_bytes(b"")
+        with pytest.raises(ValueError) as caught:
+            nodes.update_node_map("api", ENTRY)
+        assert str(node_map) in str(caught.value)
+        assert node_map.read_bytes() == b""
+
+    def test_the_temp_file_is_synced_before_the_replace(self, node_map, monkeypatch):
+        order: list[str] = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def fsync(fd):
+            order.append("fsync")
+            real_fsync(fd)
+
+        def replace(src, dst):
+            order.append("replace")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(nodes.os, "fsync", fsync)
+        monkeypatch.setattr(nodes.os, "replace", replace)
+        nodes.update_node_map("api", ENTRY)
+        assert order == ["fsync", "replace"]
+
     def test_a_replace_a_reader_blocks_is_retried(self, node_map, monkeypatch):
         # Windows: a reader holding node-map.json makes os.replace fail with
         # PermissionError for as long as it holds the file.
@@ -517,12 +544,13 @@ class TestTheMapWriterNeverGuesses:
     ):
         # exclusive_lock unlinks its file on exit, so a waiter could lock a
         # file the holder was about to delete. The map's sidecar never goes.
+        sidecar = lock_path(nodes.MAP_LOCK_NAME)
         nodes.update_node_map("api", ENTRY)
-        assert nodes.map_lock_path() == Path.home() / ".magent" / "node-map.lock"
-        assert nodes.map_lock_path().exists()
+        assert sidecar == Path.home() / ".magent" / "node-map.lock"
+        assert sidecar.exists()
         with nodes.map_lock():
-            assert nodes.map_lock_path().exists()
-        assert nodes.map_lock_path().exists()
+            assert sidecar.exists()
+        assert sidecar.exists()
 
     def test_a_writer_behind_a_holder_in_this_process_says_so(self, node_map):
         with nodes.map_lock(), pytest.raises(LockHeld):
@@ -582,18 +610,33 @@ class TestTheMapWriterIsSerializedAcrossProcesses:
             assert not node_map.exists()
         finally:
             holder.stdin.close()
-            holder.wait(timeout=30)
+            # A child that outlives the test would keep holding the lock. It
+            # exits on its own once stdin closes; kill it only if it does not.
+            try:
+                holder.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                holder.kill()
+                holder.wait(timeout=30)
         assert nodes.update_node_map("api", ENTRY) == {"api": ENTRY}
         assert nodes.read_node_map() == {"api": ENTRY}
 
     def test_two_processes_writing_disjoint_projects_lose_nothing(self, node_map):
+        # A SMOKE test: with the file lock removed it fails only ~1 run in 3.
+        # The deterministic pin is the holder test above.
         writers = [
             subprocess.Popen(
                 [sys.executable, "-c", _MAP_WRITER, str(node_map), prefix, "25"]
             )
             for prefix in ("a", "b")
         ]
-        assert [w.wait(timeout=120) for w in writers] == [0, 0]
+        try:
+            codes = [w.wait(timeout=120) for w in writers]
+        finally:
+            for w in writers:
+                if w.poll() is None:
+                    w.kill()
+                w.wait(timeout=30)
+        assert codes == [0, 0]
         assert set(nodes.read_node_map()) == {
             f"{p}{i}" for p in "ab" for i in range(25)
         }
@@ -620,12 +663,15 @@ class TestF2FindsANodeFolder:
         entries = {"My App": dataclasses.replace(self._entries()["API"], sid="My-App")}
         assert nodes.open_target("My-App", entries) is not None
 
-    def test_without_a_cwd_the_remote_root_is_the_folder(self):
-        entries = {"API": dataclasses.replace(self._entries()["API"], cwd="")}
-        assert nodes.open_target("API", entries) == (
-            "amin@devino-second",
-            ENTRY.remote_root,
-        )
+    def test_without_a_cwd_there_is_no_folder_not_the_remote_root(self):
+        # remote_root keeps its `~` (DECISION-11) and a Remote-SSH folder URI
+        # does not expand one: None, so F2 falls through to /api/sessions.
+        entries = {
+            "API": dataclasses.replace(
+                self._entries()["API"], cwd="", remote_root="~/magent/api"
+            )
+        }
+        assert nodes.open_target("API", entries) is None
 
     def test_a_project_no_node_holds_is_none(self):
         assert nodes.open_target("other", self._entries()) is None
