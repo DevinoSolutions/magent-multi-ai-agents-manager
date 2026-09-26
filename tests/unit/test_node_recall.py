@@ -14,6 +14,7 @@ from __future__ import annotations
 import io
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -2158,6 +2159,154 @@ class TestRecallReadsTheNodeMapAsUntrusted:
         assert "Traceback" not in result.output
         assert "could not read the repos on @second" in result.stdout
         assert "api" not in nodes.read_node_map()
+
+
+class TestRecallLocalFailureBranches:
+    """cq-G14 I2: the killer tests for the partial-failure branches no test
+    exercised (15 surviving mutants), landed as the review gave them.
+    K7 is adapted to I1: a node that answered with an error now stops the
+    recall instead of going on (the rest are verbatim)."""
+
+    def test_k1_a_failed_install_keeps_the_placement(
+        self, runner, placed_api, node_answers, monkeypatch
+    ):
+        def _boom(*a, **k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(shutil, "copytree", _boom)
+        result = _recall(runner, placed_api, "--local")
+        assert result.exit_code == 1
+        assert "could not install" in result.stderr
+        assert "stays placed on @second" in result.stderr
+        assert "api" in nodes.read_node_map()
+        assert "is home" not in result.stdout
+
+    def test_k2_the_resume_line_is_printed_once_right_after_the_pull(
+        self, runner, placed_api, node_answers, api_repo
+    ):
+        result = _recall(runner, placed_api, "--local")
+        lines = [line.strip() for line in result.stdout.splitlines()]
+        resume = f'cd "{api_repo.resolve()}" && claude --resume {SESSION_ID}'
+        assert lines.count(resume) == 1
+        assert (
+            lines.index(resume)
+            == lines.index(f'git -C "{api_repo.resolve()}" pull') + 1
+        )
+
+    def test_k3_a_pull_the_config_refuses_is_a_note_and_no_live_read(
+        self, runner, placed_api, node_answers, monkeypatch
+    ):
+        def _refused(*a, **k):
+            raise nodes.NodeConfigError("bad node")
+
+        monkeypatch.setattr(node_sync, "final_pull", _refused)
+        result = _recall(runner, placed_api, "--local")
+        assert result.exit_code == 0
+        assert "@second cannot be pulled from (bad node)" in result.stdout
+        assert node_answers == []
+
+    def test_k4_a_nick_the_config_no_longer_has_is_a_note(
+        self, runner, api_repo, tmp_config, node_answers
+    ):
+        nodes.update_node_map("api", entry("gone"))
+        cfg = tmp_config(
+            config_json(
+                ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
+            )
+        )
+        result = _recall(runner, cfg, "--local")
+        assert result.exit_code == 0
+        assert "@gone cannot be reached from this config" in result.stdout
+        assert node_answers == []
+
+    @pytest.mark.parametrize(("dirty", "unpushed"), [(False, 3), (True, 0)])
+    def test_k5_k6_either_kind_of_unpushed_work_is_called_out(
+        self, runner, placed_api, node_answers, monkeypatch, dirty, unpushed
+    ):
+        monkeypatch.setattr(
+            remote_mux,
+            "repo_status",
+            lambda node, root, *, timeout_s: [
+                nodes.RepoStatus(root, "b" * 40, "main", dirty, unpushed)
+            ],
+        )
+        result = _recall(runner, placed_api, "--local")
+        assert "not pushed" in result.stdout
+
+    def test_k7_a_node_that_answered_with_an_error_is_not_called_unreachable(
+        self, runner, placed_api, node_answers, monkeypatch
+    ):
+        # Adapted to I1 (team-lead's ruling): as given, this asserted the recall
+        # went on to a live repo read and printed "did not answer (tar: write
+        # error)". The node answered, so the recall now stops, retryable.
+        def _rc1(*a, **k):
+            raise remote_mux.RemoteError(1, "tar: write error", ("ssh",))
+
+        monkeypatch.setattr(node_sync, "final_pull", _rc1)
+        result = _recall(runner, placed_api, "--local")
+        assert result.exit_code == 1
+        assert node_answers == []
+        assert "did not finish (tar: write error)" in result.stderr
+        assert "did not answer" not in result.output
+
+    def test_k8_a_project_missing_on_this_machine_exits_2(
+        self, runner, tmp_path, tmp_config, node_answers
+    ):
+        nodes.update_node_map("api", entry("second"))
+        cfg = tmp_config(
+            config_json(
+                ("second",),
+                [{"path": str(tmp_path / "nope"), "title": "api", "node": "auto"}],
+            )
+        )
+        result = _recall(runner, cfg, "--local")
+        assert result.exit_code == 2
+        assert "clone it first" in result.stderr
+        assert node_answers == []
+
+    def test_k9_nothing_pulled_is_said(
+        self, runner, api_repo, tmp_config, node_answers
+    ):
+        nodes.update_node_map("api", entry("second"))
+        cfg = tmp_config(
+            config_json(
+                ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
+            )
+        )
+        result = _recall(runner, cfg, "--local")
+        assert "nothing was ever pulled from @second for api" in result.stdout
+
+    def test_k10_an_unreachable_node_gets_the_on_node_stop_command(
+        self, runner, placed_api, node_is_gone
+    ):
+        result = _recall(runner, placed_api, "--local")
+        assert "may still be running on @second" in result.stdout
+        assert "ssh amin@devino-second" not in result.stdout
+
+    def test_k11_the_default_tool_counts_for_the_claude_only_rule(
+        self, runner, api_repo, tmp_config, node_answers
+    ):
+        nodes.update_node_map("api", entry("second"))
+        body = config_json(
+            ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
+        )
+        body["settings"]["defaultTool"] = "codex"  # type: ignore[index]  # reason: config_json types the body as dict[str, object]
+        cfg = tmp_config(body)
+        result = _recall(runner, cfg, "--local")
+        assert result.exit_code == 2
+        assert "runs 'codex'" in result.stderr
+
+    def test_k12_a_plain_os_error_clearing_the_map_is_printed(
+        self, runner, placed_api, node_answers, monkeypatch
+    ):
+        def _full(project, entry, **_k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(nodes, "update_node_map", _full)
+        result = _recall(runner, placed_api, "--local")
+        assert result.exit_code == 1
+        assert "could not clear api's placement" in result.stderr
+        assert result.exception is None or isinstance(result.exception, SystemExit)
 
 
 # pullable_sid lets ', $, ` and ! through -- psmux.session_name turns a title
