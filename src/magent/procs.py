@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -380,3 +381,46 @@ def spawn_unjobbed(
             stderr=stderr,
             env=env,
         )
+
+
+# How long a launcher waits for a detached child to register its pid before it
+# calls the start a failure. The child pays a full interpreter start plus its
+# own setup first (~1-1.5s on an idle box). The old fixed 2s window was measured
+# failing on a loaded Windows desktop while the child registered at 4.7-11s: the
+# launcher reported "failed to start" over a process that was, in fact, running.
+# The poll returns the moment the pid appears, so the idle path pays nothing.
+REGISTRATION_TIMEOUT_S = 20.0
+
+
+def await_registration(
+    child: subprocess.Popen[bytes],
+    read_pid: Callable[[], int | None],
+    timeout_s: float = REGISTRATION_TIMEOUT_S,
+    *,
+    not_pid: int | None = None,
+    sleep: Callable[[float], None] | None = None,
+    clock: Callable[[], float] | None = None,
+) -> int | None:
+    """The pid a freshly spawned detached ``child`` registered, or None.
+
+    ``read_pid`` is the caller's own pid-file reader (it owns the path and the
+    stale-file cleanup); ``not_pid`` is a pid that must NOT count as the new
+    registration -- a restart whose kill did not take leaves the old pid in the
+    file. Gives up early once ``child`` has exited: a child that died before
+    registering is not coming, and waiting out the window would only delay the
+    failure. It never kills ``child`` -- one that is merely slow may be about to
+    come up, and a launcher must not take down the process it is waiting for.
+
+    ``sleep``/``clock`` are resolved at call time so a test can drive the
+    window without sleeping through it.
+    """
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    deadline = clock() + timeout_s
+    while True:
+        sleep(0.1)
+        pid = read_pid()
+        if pid and pid != not_pid:
+            return pid
+        if child.poll() is not None or clock() >= deadline:
+            return None

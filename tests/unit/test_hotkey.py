@@ -1120,8 +1120,58 @@ class TestMaybeStartHotkey:
         monkeypatch.setattr(hotkey, "listener_pid", lambda: 1234)
         monkeypatch.setattr(hotkey, "listener_manifest", lambda: None)
         monkeypatch.setattr(hotkey, "stop_listener", lambda: False)
-        monkeypatch.setattr("magent.launch.spawn_detached", lambda *a, **k: None)
+        monkeypatch.setattr(
+            "magent.launch.spawn_detached", lambda *a, **k: _StillStarting()
+        )
+        # A zero window (one poll) instead of the real 20s: the guard, not the
+        # clock, is what this test is about.
+        monkeypatch.setattr("magent.launch.HOTKEY_START_TIMEOUT_S", 0.0)
         assert cli._maybe_start_hotkey("http://x:8034") is None
+
+    def test_a_listener_that_registers_after_five_seconds_is_returned(
+        self, monkeypatch
+    ):
+        # The old 2s window returned None here -- and every caller read that as
+        # "no listener" -- while the listener came up behind it on a busy box.
+        from magent import cli, hotkey
+
+        state = {"pid": None, "polls": 0}
+        monkeypatch.setattr(hotkey, "listener_pid", lambda: state["pid"])
+        monkeypatch.setattr(
+            "magent.launch.spawn_detached", lambda *a, **k: _StillStarting()
+        )
+
+        def sleep(_s: float) -> None:
+            state["polls"] += 1
+            if state["polls"] == 50:  # 50 x 0.1s: the measured slow start
+                state["pid"] = 5678
+
+        monkeypatch.setattr("magent.procs.time.sleep", sleep)
+        assert cli._maybe_start_hotkey("http://x:8034") == 5678
+
+    def test_a_listener_that_dies_starting_is_reported_at_once(self, monkeypatch):
+        # A keyboard hook that fails to install exits the child: the launcher
+        # must say so now, not after the whole window.
+        from magent import cli, hotkey
+
+        monkeypatch.setattr(hotkey, "listener_pid", lambda: None)
+        monkeypatch.setattr(
+            "magent.launch.spawn_detached", lambda *a, **k: _StillStarting(rc=1)
+        )
+        polls: list[float] = []
+        monkeypatch.setattr("magent.procs.time.sleep", polls.append)
+        assert cli._maybe_start_hotkey("http://x:8034") is None
+        assert len(polls) == 1
+
+
+class _StillStarting:
+    """The spawned detached child: alive (``rc=None``) or already exited."""
+
+    def __init__(self, rc: int | None = None) -> None:
+        self.rc = rc
+
+    def poll(self) -> int | None:
+        return self.rc
 
 
 class TestHookStructsAndConstants:

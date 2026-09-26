@@ -1306,8 +1306,18 @@ class TestMaybeStartHotkeySshHost:
             def supports_hotkey(self) -> bool:
                 return True
 
+        class _Exited:
+            # The child is only here for its argv; an exited one ends the
+            # registration wait on its first poll.
+            def poll(self) -> int:
+                return 0
+
+        def _spawn(args: list[str]) -> _Exited:
+            spawned.append(args)
+            return _Exited()
+
         monkeypatch.setattr("magent.platform.get_platform", _FakePlat)
-        monkeypatch.setattr("magent.launch.spawn_detached", spawned.append)
+        monkeypatch.setattr("magent.launch.spawn_detached", _spawn)
 
         fake = types.ModuleType("magent.hotkey")
         fake.listener_pid = lambda: None

@@ -177,67 +177,43 @@ class TestDaemonPrereqValidation:
         assert "running" in result.output
 
 
-class _FakeChild:
-    def __init__(self, returncode: int | None = None) -> None:
-        self.returncode = returncode
+class _RunningChild:
+    """A detached child that is still starting: ``poll()`` says alive."""
 
     def poll(self) -> int | None:
-        return self.returncode
-
-
-class _FakeClock:
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def sleep(self, seconds: float) -> None:
-        self.now += seconds
-
-    def __call__(self) -> float:
-        return self.now
+        return None
 
 
 class TestTheLauncherWaitsForASlowDaemon:
     """`attention -d` exited 1 "failed to start" over a daemon that came up at
     4.7s on a loaded desktop, because it only waited 2s. The launcher's answer
-    must be about the daemon, not about how busy the machine was."""
+    must be about the daemon, not about how busy the machine was. (The window
+    itself is pinned in test_procs.py; this pins that `-d` goes through it.)"""
 
-    def test_a_daemon_that_registers_after_several_seconds_is_running(
-        self, monkeypatch, tmp_path
+    def test_a_daemon_that_registers_after_five_seconds_is_running(
+        self, runner, monkeypatch, tmp_path, tmp_config
     ):
+        fp = FakePlatform(supports_attention=True)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
         pid_file = tmp_path / "attention.pid"
         monkeypatch.setattr(attention_cmd, "_PID_PATH", pid_file)
-        clock = _FakeClock()
+        monkeypatch.setattr("magent.launch.spawn_detached", lambda _a: _RunningChild())
+        polls = {"n": 0}
 
-        def sleep(seconds: float) -> None:
-            clock.sleep(seconds)
-            if clock.now >= 5.0:  # the measured slow start, well past 2s
+        def sleep(_s: float) -> None:
+            polls["n"] += 1
+            if polls["n"] == 50:  # 50 x 0.1s: the measured slow start
                 pid_file.write_text(str(os.getpid()))
 
-        pid = attention_cmd._await_daemon(_FakeChild(), sleep=sleep, clock=clock)
+        monkeypatch.setattr("magent.procs.time.sleep", sleep)
 
-        assert pid == os.getpid()
-
-    def test_a_child_that_exits_is_not_waited_out(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(attention_cmd, "_PID_PATH", tmp_path / "attention.pid")
-        clock = _FakeClock()
-
-        pid = attention_cmd._await_daemon(
-            _FakeChild(returncode=1), sleep=clock.sleep, clock=clock
+        config_path = tmp_config({"version": 2, "projects": [{"path": "api"}]})
+        result = runner.invoke(
+            cli.main, ["--config", config_path, "attention", "--daemon"]
         )
 
-        assert pid is None
-        assert clock.now < 1.0
-
-    def test_the_wait_is_bounded(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(attention_cmd, "_PID_PATH", tmp_path / "attention.pid")
-        clock = _FakeClock()
-
-        pid = attention_cmd._await_daemon(
-            _FakeChild(), timeout_s=20.0, sleep=clock.sleep, clock=clock
-        )
-
-        assert pid is None
-        assert 20.0 <= clock.now < 20.5
+        assert result.exit_code == 0, result.output
+        assert f"(pid {os.getpid()})" in result.output
 
 
 class TestHeartbeatLifecycle:
