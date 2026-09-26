@@ -1765,13 +1765,22 @@ class TestRecallLocal:
         assert (dest / f"{SESSION_ID}.jsonl").exists()
 
     def test_the_exact_resume_command_is_printed_after_a_git_pull(
-        self, runner, placed_api, node_answers, api_repo
+        self, runner, placed_api, node_answers, api_repo, monkeypatch
     ):
+        monkeypatch.chdir(api_repo)  # a shell already on the project's drive
+
         result = _recall(runner, placed_api, "--local")
 
+        # Two lines, no `&&` (M6 ruling): Windows PowerShell 5.1 cannot parse
+        # `&&`, and each line alone works in every shell.
         lines = [line.strip() for line in result.stdout.splitlines()]
         pull = lines.index(f'git -C "{api_repo}" pull')
-        assert lines[pull + 1] == f'cd "{api_repo}" && claude --resume {SESSION_ID}'
+        assert lines[pull + 1 : pull + 3] == [
+            f'cd "{api_repo}"',
+            f"claude --resume {SESSION_ID}",
+        ]
+        assert "&&" not in result.stdout
+        assert "cd /d" not in result.stdout
 
     def test_it_says_how_to_resume_by_hand_if_claude_refuses_the_session(
         self, runner, placed_api, node_answers
@@ -1853,8 +1862,9 @@ class TestRecallLocal:
         assert "no commit was ever recorded" in result.stdout
 
     def test_nothing_pulled_prints_a_fresh_start_not_a_resume(
-        self, runner, api_repo, tmp_config, node_answers
+        self, runner, api_repo, tmp_config, node_answers, monkeypatch
     ):
+        monkeypatch.chdir(api_repo)
         nodes.update_node_map("api", entry("second"))
         cfg = tmp_config(
             config_json(
@@ -1864,8 +1874,9 @@ class TestRecallLocal:
 
         result = _recall(runner, cfg, "--local")
 
-        assert f'cd "{api_repo}" && claude\n' in result.stdout
+        assert f'    cd "{api_repo}"\n    claude\n' in result.stdout
         assert "--resume" not in result.stdout
+        assert "&&" not in result.stdout
 
     def test_a_project_that_is_not_placed_exits_2(
         self, runner, api_repo, tmp_config, node_answers
@@ -2368,8 +2379,9 @@ class TestRecallResolvesTheFolderTheWayLaunchDoes:
         _drop_dir_link(link)
 
     def test_a_linked_project_is_installed_where_launch_will_resume_it(
-        self, runner, api_repo, tmp_config, node_answers, link
+        self, runner, api_repo, tmp_config, node_answers, link, monkeypatch
     ):
+        monkeypatch.chdir(api_repo)  # same drive: no cmd.exe hint between
         nodes.update_node_map("api", entry("second"))
         write_transcript("second", "api", SESSION_ID, mtime=NOW)
         cfg = tmp_config(
@@ -2384,7 +2396,7 @@ class TestRecallResolvesTheFolderTheWayLaunchDoes:
         assert result.exit_code == 0, result.output
         assert launched_in == str(link)
         assert launch._get_session_ids("claude", launched_in, 1) == [SESSION_ID]
-        assert f'cd "{link}" && claude --resume {SESSION_ID}' in result.stdout
+        assert f'    cd "{link}"\n    claude --resume {SESSION_ID}\n' in (result.stdout)
 
     def test_the_store_is_the_one_the_claude_sessions_seam_names(
         self, runner, placed_api, node_answers, api_repo, tmp_path, monkeypatch
@@ -2439,6 +2451,56 @@ class TestRecallResolvesTheFolderTheWayLaunchDoes:
         )
 
 
+class TestTheResumeWorksInEveryShell:
+    """The M6 ruling: `cd "<dir>"` and `claude ...` on two lines, never joined
+    by `&&` (Windows PowerShell 5.1 cannot parse it), plus a cmd.exe hint when
+    the folder is on another drive -- cmd's plain `cd` changes that drive's
+    folder without switching to it, so claude would start in the old one."""
+
+    @pytest.mark.parametrize(
+        ("target", "here", "hint"),
+        [
+            ("D:/work/api", "C:/Users/amin", True),
+            ("C:/work/api", "c:/Users/amin", False),
+            # cmd cannot sit in a UNC folder at all: `cd /d` would be untrue.
+            ("//server/share/api", "C:/Users/amin", False),
+            ("D:/work/api", None, True),
+            ("/home/amin/api", "/tmp", False),
+            ("/home/amin/api", None, False),
+        ],
+        ids=[
+            "other-drive",
+            "same-drive-any-case",
+            "unc",
+            "cwd-unknown",
+            "posix",
+            "posix-cwd-unknown",
+        ],
+    )
+    def test_cmd_needs_cd_d_only_for_another_drive(self, target, here, hint):
+        # PureWindowsPath: drive letters parse the same on every OS.
+        assert (
+            node_cmd._cmd_needs_cd_d(
+                PureWindowsPath(target), None if here is None else PureWindowsPath(here)
+            )
+            is hint
+        )
+
+    def test_another_drive_gets_the_cmd_hint_between_cd_and_claude(
+        self, runner, placed_api, node_answers, api_repo, monkeypatch
+    ):
+        monkeypatch.setattr(node_cmd, "_cmd_needs_cd_d", lambda target, here: True)
+
+        result = _recall(runner, placed_api, "--local")
+
+        lines = [line.strip() for line in result.stdout.splitlines()]
+        cd = lines.index(f'cd "{api_repo}"')
+        assert lines[cd + 1 : cd + 3] == [
+            "(cmd.exe: use cd /d)",
+            f"claude --resume {SESSION_ID}",
+        ]
+
+
 class TestRecallLocalFailureBranches:
     """cq-G14 I2: the killer tests for the partial-failure branches no test
     exercised (15 surviving mutants), landed as the review gave them.
@@ -2460,13 +2522,18 @@ class TestRecallLocalFailureBranches:
         assert "is home" not in result.stdout
 
     def test_k2_the_resume_line_is_printed_once_right_after_the_pull(
-        self, runner, placed_api, node_answers, api_repo
+        self, runner, placed_api, node_answers, api_repo, monkeypatch
     ):
+        # Adapted to the M6 ruling: the resume is two lines, `cd` then
+        # `claude --resume`, each printed once, right after the pull.
+        monkeypatch.chdir(api_repo)
         result = _recall(runner, placed_api, "--local")
         lines = [line.strip() for line in result.stdout.splitlines()]
-        resume = f'cd "{api_repo}" && claude --resume {SESSION_ID}'
+        cd, resume = f'cd "{api_repo}"', f"claude --resume {SESSION_ID}"
+        assert lines.count(cd) == 1
         assert lines.count(resume) == 1
-        assert lines.index(resume) == lines.index(f'git -C "{api_repo}" pull') + 1
+        assert lines.index(cd) == lines.index(f'git -C "{api_repo}" pull') + 1
+        assert lines.index(resume) == lines.index(cd) + 1
 
     def test_k3_a_pull_the_config_refuses_is_a_note_and_no_live_read(
         self, runner, placed_api, node_answers, monkeypatch

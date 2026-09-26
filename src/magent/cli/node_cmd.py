@@ -28,6 +28,8 @@ from magent.paths import find_config
 from magent.style import style
 
 if TYPE_CHECKING:
+    from pathlib import PurePath
+
     from magent.config import MagentConfig, ProjectConfig
     from magent.nodes import Node, NodeMapEntry, Placement, RepoStatus
     from magent.remote_mux import RemoteError
@@ -693,6 +695,18 @@ def _clear_placement(name: str, held: NodeMapEntry) -> None:
         )
 
 
+def _cmd_needs_cd_d(target: PurePath, here: PurePath | None) -> bool:
+    """Whether cmd.exe's plain ``cd`` would leave the user outside ``target``:
+    it names a drive letter other than ``here``'s (cmd's ``cd`` changes that
+    drive's folder without switching drives), or ``here`` is unknown. A
+    drive-less path (POSIX) never does, and neither does a UNC path -- cmd
+    cannot sit in one at all, so ``cd /d`` would be no truer."""
+    drive = target.drive
+    if len(drive) != 2 or drive[1] != ":":
+        return False
+    return here is None or drive.lower() != here.drive.lower()
+
+
 def _recall_local(
     held: NodeMapEntry,
     name: str,
@@ -747,10 +761,21 @@ def _recall_local(
         " Once the node's commits are pushed, run:"
     )
     click.echo(f'    git -C "{local_dir}" pull')
+    # Forward correction (plan G :3919-3921, M6 ruling): the plan prints
+    # `cd "<dir>" && claude ...` on one line, which Windows PowerShell 5.1
+    # cannot parse and cmd.exe runs in the wrong folder when <dir> is on
+    # another drive. Two lines work in every shell; the hint covers cmd.
+    click.echo(f'    cd "{local_dir}"')
+    try:
+        here: Path | None = Path.cwd()
+    except OSError:  # the shell's folder is gone: the drive is unknown
+        here = None
+    if _cmd_needs_cd_d(local_dir, here):
+        click.echo(style("    (cmd.exe: use cd /d)", dim=True))
     if resume_id is None:
-        click.echo(f'    cd "{local_dir}" && claude')
+        click.echo("    claude")
         return
-    click.echo(f'    cd "{local_dir}" && claude --resume {resume_id}')
+    click.echo(f"    claude --resume {resume_id}")
     click.echo(
         style(
             f"  If claude says it cannot find that conversation, it is on disk at"
