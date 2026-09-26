@@ -926,6 +926,14 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         assert [nick for nick, _ in rig.recipes] == ["second"]
 
 
+# A pinned project's refusal when its only folder rivals are auto projects
+# an unreadable map hides.
+_FOLDER_UNKNOWN = (
+    "the node map is unreadable ({cls}), so whether 'api' on {nick} is already"
+    " in use is unknown; not brought up"
+)
+
+
 class TestAnUnreadableMapPlacesNothingByGuess:
     """A torn or busy node map is UNKNOWN, never "nothing is placed". Read as
     ``{}``, an ``auto`` project running on a node looks unplaced: the fleet
@@ -962,10 +970,11 @@ class TestAnUnreadableMapPlacesNothingByGuess:
         y_api.node = "auto"
         _record("api-y", "second", "~/magent/api")
         rig.live = True
-        unreadable_map()
+        cls = unreadable_map()
         outcomes = _batch(_config(x_api, y_api, web), only=["api-x", "web"])
         assert [(o.sid, o.ok) for o in outcomes] == [("api-x", False), ("web", True)]
-        assert "'api-x' and 'api-y' would share" in (outcomes[0].error or "")
+        # Its only rival is hidden by the map, so the map is the reason.
+        assert outcomes[0].error == _FOLDER_UNKNOWN.format(cls=cls, nick="second")
         assert [(n, r.sid) for n, r in rig.recipes] == [("second", "web")]
 
     def test_an_auto_project_is_refused_naming_the_map_and_nothing_is_dialed(
@@ -1000,7 +1009,7 @@ class TestAnUnreadableMapPlacesNothingByGuess:
             ("api-y", False),
             ("web", True),
         ]
-        assert "'api-x' and 'api-y' would share" in (outcomes[0].error or "")
+        assert outcomes[0].error == _FOLDER_UNKNOWN.format(cls=cls, nick="second")
         assert "node map is unreadable" in (outcomes[1].error or "")
         assert f"({cls})" in (outcomes[1].error or "")
         assert [(n, r.sid) for n, r in rig.recipes] == [("second", "web")]
@@ -1020,10 +1029,7 @@ class TestAnUnreadableMapPlacesNothingByGuess:
         cls = unreadable_map()
         outcomes = _batch(_config(x_api, y_api, web), only=["api-x", "web"])
         assert [(o.sid, o.ok) for o in outcomes] == [("api-x", False), ("web", True)]
-        assert outcomes[0].error == (
-            f"the node map is unreadable ({cls}), so whether 'api' on second is"
-            " already in use is unknown; not brought up"
-        )
+        assert outcomes[0].error == _FOLDER_UNKNOWN.format(cls=cls, nick="second")
         assert [(n, r.sid) for n, r in rig.recipes] == [("second", "web")]
 
     def test_a_clash_with_a_known_project_keeps_the_rename_text(
