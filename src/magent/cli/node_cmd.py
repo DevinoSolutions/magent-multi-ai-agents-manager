@@ -466,17 +466,25 @@ def _pubkey(key_file: Path | None) -> str:
     return lines[0]
 
 
+def _outcome_unknown(exc: RemoteError) -> bool:
+    """Did ``exc`` kill a call that may have run to the end? A timeout or an
+    over-cap reply: killing the local ssh does not stop the remote command.
+    setup's row wording and its root-login hint both read this ONE answer, so
+    they can never contradict each other."""
+    # D-MERGE: return exc.outcome_unknown (D17) once D lands; until then the
+    # over-cap case is known only by _spawn's own words (magent's, not the
+    # node's).
+    return exc.timed_out or exc.stderr_tail.startswith("reply exceeded ")
+
+
 def _step_failed(node: Node, exc: RemoteError, step: str) -> ScriptLine:
-    """A setup step's ssh failure as a row. A timed-out step is not
-    "unreachable": killing the local ssh does not stop the remote command, so
-    its outcome is unknown and it may still be running there. Nothing is ever
-    sent again on its own -- the user reruns setup, which is idempotent."""
+    """A setup step's ssh failure as a row. A step whose outcome is unknown is
+    not "unreachable": it may still be running there. Nothing is ever sent
+    again on its own -- the user reruns setup, which is idempotent."""
     # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
     from magent.remote_mux import ScriptLine
 
-    # D-MERGE: read exc.outcome_unknown (D17) once D lands -- a call killed
-    # for an over-cap reply is unknown too, and timed_out misses it.
-    if not exc.timed_out:
+    if not _outcome_unknown(exc):
         return _unreachable(node, exc)
     return ScriptLine(
         "fail",
@@ -549,7 +557,7 @@ def _root_hop(node: Node, names: list[str], pubkey: str) -> ProvisionReport:
         return remote_mux.setup_node(node, names, pubkey)
     except remote_mux.RemoteError as exc:
         _print_rows([_step_failed(root, exc, "setup")])
-        if not exc.timed_out:
+        if not _outcome_unknown(exc):
             click.echo(
                 "    setup logs in as root once, with this PC's ssh key: check "
                 f"that `ssh {root.target} true` works without a password prompt"
