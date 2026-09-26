@@ -1816,10 +1816,11 @@ only mover.
 passes no resume id: sub-plan D's `bring_up.sh` runs `claude --continue` over
 the node's own transcripts, or the fresh form when there are none. The PC's
 pulled copy can be one pull stale, and an explicit `--resume` has no fresh
-fallback on a node that lost the file. `claude --resume <id>` is used only where magent installed
-that conversation first: `recall --to` (with sub-plan D; installed by
-`install_transcripts.sh`, under the name magent's one encoder gives the node's
-own `realpath`; the node never encodes) and the resume `recall --local` prints.
+fallback on a node that lost the file. `claude --resume <id>` is used only
+where magent installed that conversation first: `recall --to` (with sub-plan
+D; installed by `install_transcripts.sh`, under the name magent's one encoder
+gives the node's own `realpath`; the node never encodes) and the resume
+`recall --local` prints.
 <!-- D-MERGE: drop "sub-plan D's" and "with sub-plan D;" when bring_up.sh and recall --to land. -->
 
 **Recall never races the daemon, and a pull it cannot finish stops it.** The
@@ -1885,8 +1886,8 @@ the node it was placed on until that node leaves `settings.nodes`. A node that
 grows busy keeps its sessions; moving one is a manual
 `magent node recall <project> --to <nick>` (with sub-plan D). Deliberate: a
 move stops a live session and ships its conversation, which is not something
-to do behind the user's back. If it bites, the fix is a `node plan` hint naming the better node,
-never an automatic move.
+to do behind the user's back. If it bites, the fix is a `node plan` hint
+naming the better node, never an automatic move.
 <!-- D-MERGE: drop "(with sub-plan D)" when recall --to lands (plan G Task 15). -->
 
 **Recall moves Claude Code conversations only (2026-09-24):** `magent node
@@ -1897,9 +1898,9 @@ Its sessions come home by git alone: commit and push on the node, pull here.
 **A bring-up's repo record knows the commit, not the branch (2026-09-24):**
 `repos.json` written at bring-up (sub-plan D's) carries each repo's sha from
 `bring_up.sh`, with an empty branch and an unknown unpushed count, because the
-bring-up reports only commits. A recall from a node that no longer answers therefore
-prints the last known sha without a branch. A recall from a node that answers
-records the full `repo_status.sh` report and replaces it.
+bring-up reports only commits. A recall from a node that no longer answers
+therefore prints the last known sha without a branch. A recall from a node
+that answers records the full `repo_status.sh` report and replaces it.
 <!-- D-MERGE: drop "(sub-plan D's)" when D's bring-up writes repos.json. -->
 
 **Attach-pane reconnect is only reachable from a Windows client (2026-08-09):**
