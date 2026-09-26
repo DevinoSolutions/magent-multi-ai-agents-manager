@@ -16,7 +16,7 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -1348,6 +1348,30 @@ def _drain(executors: list[_RecordingExecutor]) -> None:
         ThreadPoolExecutor.shutdown(e, wait=True)
 
 
+@pytest.fixture
+def healthy_pulls_end_first(monkeypatch) -> None:
+    """Every healthy pull has ENDED before the tick's own bounded wait starts.
+
+    ``tick(wait_s=0.2)`` is a wall-clock race for every node, not only the hung
+    one: on a loaded box (load 24-37 was seen) the healthy node's pull -- a lock
+    and a few atomic writes -- outlasted 0.2 s and read PULL_STILL_RUNNING, the
+    laggard's outcome. So before the tick's wait, this waits (bounded, 30 s)
+    for the first of its pulls to end. With ``_blocking_pull`` exactly one pull
+    is hung until the test releases it, so the first to end is the healthy one,
+    whatever the load. The tick's own wait then runs unchanged, and it still
+    has to return past the hung pull -- the property these tests pin."""
+    real_wait = node_sync.wait
+
+    def settled(fs, timeout=None):
+        fs = list(fs)
+        done, _ = real_wait(fs, timeout=30, return_when=FIRST_COMPLETED)
+        assert done, "no healthy pull ended within 30 s"
+        return real_wait(fs, timeout=timeout)
+
+    monkeypatch.setattr(node_sync, "wait", settled)
+
+
+@pytest.mark.usefixtures("healthy_pulls_end_first")
 class TestAHungNodeDoesNotHoldTheTick:
     """One hung node used to hold every tick for up to PULL_TIMEOUT_S, so every
     healthy node's sessions.json aged past sessions_stale's two pull intervals.
