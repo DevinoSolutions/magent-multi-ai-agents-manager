@@ -124,14 +124,17 @@ update_repo() {
       [ -z "$st" ] || die 3 "$dir has uncommitted changes on the node; commit or discard them there, or pass --allow-dirty"
     fi
     git -C "$dir" fetch -q origin -- "$branch" || die 5 "git fetch failed in $dir"
-    # Commits on a detached HEAD that no ref holds would be orphaned by the
-    # checkout below: refused whatever --allow-dirty says, losing commits is
-    # never allowed. A HEAD some ref holds is simply brought back.
+    # Commits on a detached HEAD that no branch or tag holds would be orphaned
+    # by the checkout below: refused whatever --allow-dirty says, losing
+    # commits is never allowed. refs/stash does not count -- a later `git
+    # stash drop` would lose the commit. A HEAD a branch or tag holds is
+    # simply brought back.
     if ! current=$(git -C "$dir" symbolic-ref -q --short HEAD); then
-      refs=$(git -C "$dir" for-each-ref --contains HEAD) || die 5 "git for-each-ref failed in $dir"
+      refs=$(git -C "$dir" for-each-ref --contains HEAD refs/heads refs/remotes refs/tags) ||
+        die 5 "git for-each-ref failed in $dir"
       if [ -z "$refs" ]; then
         head=$(git -C "$dir" rev-parse --short HEAD) || die 5 "no HEAD in $dir"
-        die 3 "$dir is on a detached HEAD at $head, a commit no branch holds; put it on a branch there (git branch <name> $head) first"
+        die 3 "$dir is on a detached HEAD at $head, a commit no branch or tag holds; put it on a branch there (git branch <name> $head) first"
       fi
     elif [ "$current" != "$branch" ]; then
       echo "magent: $dir was on $current; switching it to $branch" >&2

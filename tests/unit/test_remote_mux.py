@@ -2449,6 +2449,20 @@ class TestBringUpShOnARealShell:
         assert "detached" in info.value.stderr_tail
         assert git(root, "rev-parse", "HEAD") == mine
 
+    def test_a_node_commit_only_a_stash_holds_is_exit_3(self, rig):
+        # refs/stash is no keeper: a later `git stash drop` loses the commit.
+        root = self._up_then_stop(rig)
+        git(root, "checkout", "-q", "--detach")
+        commit(root, name="n.txt", text="n\n", message="node only")
+        mine = git(root, "rev-parse", "HEAD")
+        (root / "n.txt").write_text("stashed\n", encoding="utf-8")
+        git(root, "stash", "-q")
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(rig["node"], rig["recipe"], allow_dirty=True)
+        assert info.value.rc == 3
+        assert "a commit no branch or tag holds" in info.value.stderr_tail
+        assert git(root, "rev-parse", "HEAD") == mine
+
     def test_a_detached_head_a_branch_holds_is_brought_back_to_the_branch(self, rig):
         root = self._up_then_stop(rig)
         git(root, "checkout", "-q", "--detach")
