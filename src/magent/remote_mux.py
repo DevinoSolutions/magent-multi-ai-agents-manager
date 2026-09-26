@@ -133,7 +133,9 @@ class RemoteError(RuntimeError):
     ``timed_out`` tells the timeout apart from the other rc-None errors (a
     spawn failure, a reply over the cap): only ``_spawn``'s timeout sets it.
     It is the node that went silent, which node_sync reads as unreachable; a
-    caller must never match ``stderr_tail`` to learn it."""
+    caller must never match ``stderr_tail`` to learn it. ``over_cap`` is the
+    same for a reply past the stdout cap: ``stderr_tail``'s FIRST line is then
+    magent's own ``reply exceeded N bytes`` and the child's words follow it."""
 
     def __init__(
         self,
@@ -142,11 +144,13 @@ class RemoteError(RuntimeError):
         command_redacted: tuple[str, ...],
         *,
         timed_out: bool = False,
+        over_cap: bool = False,
     ) -> None:
         self.rc = rc
         self.stderr_tail = stderr_tail
         self.command_redacted = command_redacted
         self.timed_out = timed_out
+        self.over_cap = over_cap
         super().__init__(
             f"{shlex.join(command_redacted)} failed (rc={rc}): {stderr_tail}"
         )
@@ -384,7 +388,9 @@ def _spawn(
         # stderr ends within the reap bound: a grandchild may still hold it.
         err.join(_REAP_TIMEOUT_S)
         said = "" if err.is_alive() else _tail(err.data())
-        raise RemoteError(None, f"{reason}\n{said}" if said else reason, shown)
+        raise RemoteError(
+            None, f"{reason}\n{said}" if said else reason, shown, over_cap=True
+        )
     stderr = err.data()
     if check and proc.returncode != 0:
         if not quiet:

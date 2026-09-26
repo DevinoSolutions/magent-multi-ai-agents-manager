@@ -2903,6 +2903,31 @@ class TestWhatCountsAsUnreachable:
     def test_only_a_transport_failure_or_a_timeout_is_unreachable(self, err, outcome):
         assert node_sync._classify(err)[0] == outcome
 
+    def test_an_over_cap_reply_is_reported_by_its_cap_not_the_childs_last_words(
+        self, fake_ssh
+    ):
+        """The real over-cap error: its stderr is ``reply exceeded N bytes``
+        and then the child's own last line. The cap is why the pull failed, so
+        the log detail names it."""
+        fake_ssh.set_reply("flood", stderr="boom: disk full\n")
+        fake_ssh.set_mode("flood")
+        node = nodes.Node(nick="second", host="devino-second", user="amin", root="~")
+        with pytest.raises(remote_mux.RemoteError) as info:
+            remote_mux.run(node, ["flood"], timeout_s=60, max_stdout_bytes=1024)
+        assert info.value.stderr_tail.splitlines()[-1] == "boom: disk full"
+        assert node_sync._classify(info.value) == (
+            node_sync.FAILED,
+            "reply exceeded 1024 bytes",
+        )
+
+    def test_only_the_flag_marks_an_over_cap_reply_never_the_text(self):
+        """A node whose stderr merely STARTS with the cap's wording is not an
+        over-cap reply: the detail stays its last line."""
+        err = remote_mux.RemoteError(
+            1, "reply exceeded 5 bytes\nthe real error", ("ssh",)
+        )
+        assert node_sync._classify(err) == (node_sync.FAILED, "the real error")
+
     def test_a_node_cannot_write_terminal_escapes_into_the_log(self, placed, caplog):
         _capture_nodes_log(caplog)
         tail = "first\n\x1b]0;pwned\x07\x1b[2Jboom\x7f\tend\x9b"

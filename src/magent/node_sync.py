@@ -524,8 +524,13 @@ def _last_line(text: str) -> str:
 def _classify(e: remote_mux.RemoteError) -> tuple[str, str]:
     """UNREACHABLE only when the node could not be reached (ssh's transport rc
     255) or never answered (``timed_out``). Every other rc-None error -- a
-    reply over the cap, a local ssh that would not start -- is FAILED."""
-    detail = _last_line(e.stderr_tail) or f"rc={e.rc}"
+    reply over the cap, a local ssh that would not start -- is FAILED.
+
+    The detail is stderr's last line, except over the cap: there the child's
+    last words follow magent's ``reply exceeded N bytes``, and the cap is why
+    the pull failed, so that first line wins."""
+    text = e.stderr_tail.split("\n", 1)[0] if e.over_cap else e.stderr_tail
+    detail = _last_line(text) or f"rc={e.rc}"
     if e.timed_out or e.rc == SSH_TRANSPORT_RC:
         return UNREACHABLE, detail
     return FAILED, detail

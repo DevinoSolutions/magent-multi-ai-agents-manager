@@ -365,6 +365,7 @@ class TestTheReplyIsBoundedInMemory:
         assert time.monotonic() - started < 25
         assert exc.value.rc is None
         assert exc.value.timed_out is False
+        assert exc.value.over_cap is True
         assert exc.value.stderr_tail.splitlines()[0] == f"reply exceeded {CAP} bytes"
         assert exc.value.command_redacted[0] == "ssh"
         (proc,) = spawned
