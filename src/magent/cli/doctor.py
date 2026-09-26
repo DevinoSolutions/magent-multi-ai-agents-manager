@@ -441,12 +441,16 @@ def _check_nodes(cfg: MagentConfig | None) -> CheckResult:
     """Every configured node folded into one row -- WARN at worst: a node that
     is down or not set up yet is not this machine's environment failing. The
     per-node rows are `magent node doctor`'s; this reads the same report, so
-    with nodes configured it costs up to one remote_mux.DOCTOR_TIMEOUT_S."""
+    with nodes configured it costs up to one remote_mux.DOCTOR_TIMEOUT_S.
+
+    A node's trouble is its fail and warn rows, named by item; any other row
+    (ok, skip -- a node with nothing synced yet) is healthy."""
     if cfg is None or not cfg.settings.nodes:
         return (OK, "no nodes configured")
-    # A sibling command module, imported in-body so doctor.py's import never
+    # Sibling command modules, imported in-body so doctor.py's import never
     # depends on the registration hub's import order.
     from magent.cli import node_cmd
+    from magent.cli.fleet_cmd import _stdout_safe
 
     report = node_cmd.doctor_report(cfg, list(cfg.settings.nodes))
     troubled = [
@@ -456,7 +460,13 @@ def _check_nodes(cfg: MagentConfig | None) -> CheckResult:
     ]
     if not troubled:
         return (OK, f"{len(report)} node(s) healthy")
-    return (WARN, "; ".join(troubled) + " -- details: magent node doctor")
+    # The items are the node's words (doctor.sh prints them) and a nick is a
+    # free-form config key; a redirected Windows stdout (cp1252) may encode
+    # neither. Lose a glyph, never the command.
+    return (
+        WARN,
+        _stdout_safe("; ".join(troubled)) + " -- details: magent node doctor",
+    )
 
 
 def _run_checks(config_file: Path) -> list[dict[str, str]]:

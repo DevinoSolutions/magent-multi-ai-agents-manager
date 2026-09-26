@@ -10,6 +10,7 @@ import types
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 from magent import cli, wt_keys
 from magent import psmux as psmux_mod
@@ -808,3 +809,33 @@ class TestTheNodesRow:
             "warn",
             "second: reach -- details: magent node doctor",
         )
+
+    def test_a_node_s_unencodable_item_renders_on_a_legacy_code_page(
+        self, tmp_config, monkeypatch
+    ):
+        # The item names are the node's words (doctor.sh prints them, and
+        # _report_of's errors="replace" can put U+FFFD there), which cp1252 -- a
+        # redirected Windows stdout -- lacks: the row degrades a glyph, never
+        # the command.
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {
+                "second": [
+                    ScriptLine("fail", "claude-login\N{REPLACEMENT CHARACTER}", "")
+                ]
+            },
+        )
+        monkeypatch.setattr("magent.platform.get_platform", FakePlatform)
+        cfg = _nodes_cfg(tmp_config)
+
+        def only_the_nodes_row(_f):
+            # Computed inside invoke, while the runner's cp1252 stdout is installed.
+            status, detail = _check_nodes(cfg)
+            return [{"name": "nodes", "status": status, "detail": detail}]
+
+        monkeypatch.setattr(doctor, "_run_checks", only_the_nodes_row)
+        result = CliRunner(charset="cp1252").invoke(
+            cli.main, ["--config", tmp_config({"version": SCHEMA_VERSION}), "doctor"]
+        )
+        assert result.exception is None, repr(result.exception)
+        assert "second: claude-login? -- details: magent node doctor" in result.stdout
