@@ -779,6 +779,41 @@ class TestNodeSetup:
             b"ecdsa-sha2-nistp256 AAAAECDSAKEY me@pc\n"
         )
 
+    def test_a_key_file_saved_with_a_bom_is_read_without_it(
+        self, runner, tmp_config, fake_ssh
+    ):
+        # Windows PowerShell 5.1's `Set-Content -Encoding UTF8` writes one.
+        _pc_key(text="﻿" + PC_KEY + "\n")
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert "not one ssh public key line" not in result.output
+        payload = fake_ssh.calls()[0].stdin
+        assert payload.endswith((PC_KEY + "\n").encode("ascii"))
+        assert "﻿".encode() not in payload
+
+    def test_a_repeated_user_is_set_up_once_in_first_seen_order(
+        self, runner, tmp_config, fake_ssh, fake_gh
+    ):
+        _pc_key()
+        _node_answers(fake_ssh, users=("bob", "amin"))
+        _gh_can_add_keys(fake_gh)
+        _setup(
+            runner,
+            _pool_file(tmp_config),
+            "second",
+            *("--user", "bob", "--user", "amin", "--user", "bob"),
+        )
+        assert fake_ssh.calls()[0].argv[-1] == (
+            f"bash -c 'bash -s -- {remote_mux.SOCKET} bob amin'"
+        )
+        assert _targets(fake_ssh)[1:] == [
+            "bob@devino-second",
+            "bob@devino-second",
+            "amin@devino-second",
+            "amin@devino-second",
+        ]
+        adds = [c for c in fake_gh.calls() if c.argv[:2] == ["ssh-key", "add"]]
+        assert len(adds) == 2
+
     def test_the_root_hop_gets_the_budget_that_grows_with_the_users(
         self, runner, tmp_config, fake_ssh, monkeypatch
     ):

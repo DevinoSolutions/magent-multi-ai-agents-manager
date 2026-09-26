@@ -452,7 +452,8 @@ def _pubkey(key_file: Path | None) -> str:
                 f"no public key in {ssh_dir} -- pass one: --key <file.pub>"
             )
     try:
-        text = key_file.read_text(encoding="utf-8")
+        # -sig: a BOM (Windows PowerShell 5.1's UTF8) is not part of the key.
+        text = key_file.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError) as exc:
         raise ValueError(f"cannot read {key_file}: {type(exc).__name__}") from exc
     if "PRIVATE KEY" in text:
@@ -594,7 +595,8 @@ def node_setup_cmd(
         pubkey = _pubkey(key_file)
     except ValueError as exc:
         _refuse(str(exc))
-    names = list(users) or [node.user]
+    # A repeated --user is one user: set up, keyed and provisioned once.
+    names = list(dict.fromkeys(users)) or [node.user]
     for name in names:
         if not _USER_RE.fullmatch(name):
             _refuse(f"not a valid Unix user name: {name}")
