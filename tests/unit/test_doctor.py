@@ -23,6 +23,7 @@ from magent.cli.doctor import (
     _check_config,
     _check_hotkey,
     _check_monitors,
+    _check_nodes,
     _check_psmux_wedge,
     _check_sentry,
     _check_tailscale,
@@ -31,6 +32,7 @@ from magent.cli.doctor import (
 )
 from magent.config import SCHEMA_VERSION, load_config
 from magent.grid import MonitorRect
+from magent.remote_mux import ScriptLine
 from tests.conftest import FakePlatform
 
 
@@ -733,4 +735,76 @@ class TestDoctorCli:
             "sentry",
             "tailscale",
             "upload port",
+            "nodes",
         } == names
+
+
+def _nodes_cfg(tmp_config, nicks=("second",)):
+    return load_config(
+        tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {
+                    "nodes": {n: {"host": f"devino-{n}", "user": "amin"} for n in nicks}
+                },
+                "projects": [],
+            }
+        )
+    )
+
+
+class TestTheNodesRow:
+    def test_no_nodes_is_ok(self, tmp_config):
+        cfg = load_config(tmp_config({"version": SCHEMA_VERSION, "projects": []}))
+        assert _check_nodes(cfg) == ("ok", "no nodes configured")
+
+    def test_no_config_is_ok(self):
+        assert _check_nodes(None) == ("ok", "no nodes configured")
+
+    def test_healthy_nodes_are_ok(self, tmp_config, monkeypatch):
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {
+                n: [ScriptLine("ok", "tmux", "tmux 3.4")] for n in nicks
+            },
+        )
+        assert _check_nodes(_nodes_cfg(tmp_config, ("second", "fifth"))) == (
+            "ok",
+            "2 node(s) healthy",
+        )
+
+    @pytest.mark.parametrize("status", ["fail", "warn"])
+    def test_a_troubled_node_is_only_a_warning_naming_its_items(
+        self, tmp_config, monkeypatch, status
+    ):
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {
+                "second": [
+                    ScriptLine("ok", "tmux", ""),
+                    ScriptLine(status, "claude-login", "not logged in"),
+                ],
+                "fifth": [ScriptLine("ok", "tmux", "")],
+            },
+        )
+        assert _check_nodes(_nodes_cfg(tmp_config, ("second", "fifth"))) == (
+            "warn",
+            "second: claude-login -- details: magent node doctor",
+        )
+
+    def test_skip_rows_are_healthy_through_the_real_path(self, tmp_config, fake_ssh):
+        # No sync daemon and no snapshot: this PC's two rows are `skip`, and a
+        # node that is merely not synced yet is not a troubled one.
+        fake_ssh.set_reply("bash -s", stdout="ok\ttmux\ttmux 3.4\n")
+        assert _check_nodes(_nodes_cfg(tmp_config)) == ("ok", "1 node(s) healthy")
+
+    def test_an_unreachable_node_is_a_warning_through_the_real_path(
+        self, tmp_config, fake_ssh
+    ):
+        fake_ssh.set_reply(
+            "bash -s", stderr="ssh: connect to host devino-second: No route\n", rc=255
+        )
+        assert _check_nodes(_nodes_cfg(tmp_config)) == (
+            "warn",
+            "second: reach -- details: magent node doctor",
+        )
