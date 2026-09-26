@@ -1907,8 +1907,8 @@ def bring_up_node_project(
             sid=sid,
             node=nick,
             error=(
-                f"node {nick} is busy: a node sync pull held it past "
-                f"{remote_mux.PULL_TIMEOUT_S:.0f}s; re-run to try again"
+                f"node {nick} is busy: another magent process held its pull lock"
+                f" past {remote_mux.PULL_TIMEOUT_S:.0f}s; re-run to try again"
             ),
         )
     except (ValueError, remote_mux.RemoteError, OSError) as exc:
@@ -2090,7 +2090,7 @@ def _say_not_pulled(sid: str, reason: str, kept: str = "kept in the node map") -
 
 
 def _final_pull(
-    config: MagentConfig, key: str, sid: str, nick: str, no_pull: set[str]
+    config: MagentConfig, key: str, sid: str, nick: str, no_pull: dict[str, str]
 ) -> bool:
     """Bring map entry ``key``'s last turn home before session ``sid`` is
     killed (R-D6). False when it could not be pulled -- said on one line; the
@@ -2103,10 +2103,13 @@ def _final_pull(
     name would find nothing and read as "never placed" -- pulled.
 
     A node that did not answer a pull (``timed_out``, or ssh's own rc 255:
-    node_sync's UNREACHABLE) joins ``no_pull`` and is not pulled again in this
-    call, so ``down --all`` against a hung node costs one pull timeout, not
-    one per project on it. Its sessions are still killed. Every other failure
-    -- a reply over the cap is a node that answered -- is this session's.
+    node_sync's UNREACHABLE), and one whose pull lock another magent process
+    held past ``FINAL_PULL_WAIT_S`` (``NodeLockHeld``), joins ``no_pull`` --
+    nick to the reason its later sessions print -- and is not pulled again in
+    this call, so ``down --all`` against a hung or held node costs one wait,
+    not one per project on it. Its sessions are still killed. Every other
+    failure -- a reply over the cap is a node that answered -- is this
+    session's.
 
     The caller read ``key`` out of the map strictly, so ``final_pull``'s None
     ("never placed") is its own lenient re-read finding the map busy or torn:
@@ -2115,7 +2118,7 @@ def _final_pull(
     from magent import node_sync, remote_mux
 
     if nick in no_pull:
-        reason = f"node {nick} did not answer the pull"
+        reason = no_pull[nick]
     else:
         try:
             result = node_sync.final_pull(config, key)
@@ -2127,7 +2130,11 @@ def _final_pull(
             if isinstance(exc, remote_mux.RemoteError) and (
                 exc.timed_out or exc.rc == attach_client.SSH_TRANSPORT_RC
             ):
-                no_pull.add(nick)
+                no_pull[nick] = f"node {nick} did not answer the pull"
+            elif isinstance(exc, node_sync.NodeLockHeld):
+                no_pull[nick] = (
+                    f"node {nick}'s pull lock is held by another magent process"
+                )
             # ASCII end to end: the cause is the node's or the OS's words.
             reason = _node_error_text(exc).encode("ascii", "replace").decode("ascii")
         else:
@@ -2188,7 +2195,7 @@ def stop_node_sessions(
         entries, map_known = {}, False
     map_writable = True
     unreachable: set[str] = set()
-    no_pull: set[str] = set()
+    no_pull: dict[str, str] = {}
     stopped: list[str] = []
     still: list[str] = []
     for proj in nodes.node_projects(config):

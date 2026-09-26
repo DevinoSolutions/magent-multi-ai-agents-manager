@@ -2216,15 +2216,17 @@ class TestDownPullsTheLastTurnHomeFirst:
         [
             RemoteError(None, "reply exceeded 8 bytes", ("ssh",), over_cap=True),
             RemoteError(0, "could not store every pulled file", ("pull.sh",)),
-            node_sync.NodeLockHeld("node-pull-second lock is held by another process"),
+            OSError(28, "No space left on device"),
         ],
-        ids=["over-cap", "unstored", "locked"],
+        ids=["over-cap", "unstored", "disk"],
     )
     def test_a_node_that_answered_is_pulled_for_its_next_session(
         self, rig, tmp_path, monkeypatch, killed, error
     ):
         # Reachability reads timed_out and ssh's rc 255 only: a reply over the
-        # cap is a node that answered (outcome_unknown is for mutations).
+        # cap is a node that answered (outcome_unknown is for mutations). Of
+        # the OSErrors only NodeLockHeld is the node's; this PC failing to
+        # write a pulled file is this session's.
         a1, a2 = (
             ProjectConfig(path=str(tmp_path / n), node="second") for n in ("a1", "a2")
         )
@@ -2233,6 +2235,43 @@ class TestDownPullsTheLastTurnHomeFirst:
         pulled = self._pulls(monkeypatch, error)
         launch.stop_node_sessions(_config(a1, a2), ["a1", "a2"])
         assert pulled == ["a1", "a2"]
+
+    def test_a_node_whose_pull_lock_is_held_is_waited_on_once(
+        self, rig, tmp_path, monkeypatch, capsys, killed
+    ):
+        # Another magent process holds node-pull-second past the wait (a sync
+        # tick, a bring-up, another down): the first session pays that wait,
+        # the node's other sessions do not -- N sessions, one FINAL_PULL_WAIT_S.
+        # The real final_pull, so the wait counted is the lock's own.
+        waits: list[object] = []
+
+        @contextlib.contextmanager
+        def held(nick: str, **k: object) -> Iterator[None]:
+            waits.append(k.get("wait_s"))
+            raise node_sync.NodeLockHeld(
+                f"node-pull-{nick} lock is held by another process"
+            )
+            yield
+
+        monkeypatch.setattr(node_sync, "node_lock", held)
+        a1, a2 = (
+            ProjectConfig(path=str(tmp_path / n), node="second") for n in ("a1", "a2")
+        )
+        _hold("a1")
+        _hold("a2")
+        assert launch.stop_node_sessions(_config(a1, a2), ["a1", "a2"]) == (
+            ["a1", "a2"],
+            [],
+        )
+        assert waits == [node_sync.FINAL_PULL_WAIT_S]
+        assert killed == ["a1", "a2"]
+        assert set(nodes.read_node_map()) == {"a1", "a2"}
+        out = capsys.readouterr().out
+        assert "a1: last turn not pulled" in out
+        assert (
+            "a2: last turn not pulled (node second's pull lock is held by another"
+            " magent process)"
+        ) in out
 
     def test_a_node_that_failed_its_pull_does_not_stop_another_nodes(
         self, rig, tmp_path, monkeypatch, killed
@@ -2291,7 +2330,11 @@ class TestABringUpHoldsTheNodesSyncLock:
         monkeypatch.setattr(node_sync, "node_lock", busy)
         outcome = launch.bring_up_node_project(_config(api), api)
         assert not outcome.ok
-        assert "node second is busy" in (outcome.error or "")
+        # Not "a node sync pull": a bring-up or a down holds this lock too.
+        assert outcome.error == (
+            "node second is busy: another magent process held its pull lock past"
+            " 120s; re-run to try again"
+        )
         assert rig.recipes == []
         assert nodes.read_node_map() == {}
 
