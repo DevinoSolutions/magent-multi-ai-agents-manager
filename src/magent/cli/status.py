@@ -805,6 +805,16 @@ def down_cmd(
         else:
             click.echo(f"  {style('-', dim=True)} Attention daemon was not running.")
 
+    if do_all:
+        # heavy subsystem: in-body per policy
+        from magent import node_sync, nodes
+
+        if node_sync.stop_daemon():
+            click.echo(f"  {style('+', fg='green')} Stopped the node sync daemon.")
+        elif nodes.node_projects(cfg):
+            # A config with no node projects prints nothing new here.
+            click.echo(f"  {style('-', dim=True)} Node sync daemon was not running.")
+
     # Last, so the local daemons still stop when the host is unreachable -- but
     # never zero: a failed remote shutdown that exits 0 is the silent no-op this
     # whole path exists to remove.

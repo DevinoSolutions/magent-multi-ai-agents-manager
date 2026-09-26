@@ -1898,7 +1898,10 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         answers=None,
         last_host=None,
         real_stop=False,
+        pull=None,
+        sync_daemon=False,
     ):
+        from magent import node_sync
         from magent.cli import attach as attach_mod
 
         cfgpath = tmp_config(
@@ -1951,6 +1954,12 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         monkeypatch.setattr("magent.cli.attention_cmd.stop_daemon", lambda: False)
         if sys.platform == "win32":
             monkeypatch.setattr("magent.hotkey.stop_listener", lambda: False)
+        # The last turn comes home before each kill (Task 16): a pull that
+        # never dials unless the test says how it goes.
+        monkeypatch.setattr(
+            node_sync, "final_pull", pull or (lambda config, name, **_k: None)
+        )
+        monkeypatch.setattr(node_sync, "stop_daemon", lambda: sync_daemon)
         out = runner.invoke(cli.main, ["--config", cfgpath, "down", *argv])
         return out, killed, dialed, sent
 
@@ -2275,6 +2284,96 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         lines = self._session_lines(out)
         assert "1 session(s) would NOT stop: web" in lines
         assert "No running sessions to stop." not in lines
+
+    def test_down_all_stops_the_node_sync_daemon(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            sync_daemon=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert "Stopped the node sync daemon." in out.stdout
+
+    def test_down_all_with_node_projects_says_the_daemon_was_not_running(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert "Node sync daemon was not running." in out.stdout
+
+    def test_down_of_one_name_leaves_the_node_sync_daemon_alone(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # stop_daemon would answer True: only --all may ask it.
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["api"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            sync_daemon=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert "node sync daemon" not in out.stdout.lower()
+
+    def test_a_config_without_nodes_says_nothing_about_it(
+        self, runner, tmp_config, monkeypatch
+    ):
+        from magent import node_sync
+
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda *a, **k: None)
+        monkeypatch.setattr(node_sync, "stop_daemon", lambda: False)
+        monkeypatch.setattr("magent.cli.attention_cmd.stop_daemon", lambda: False)
+        monkeypatch.setattr("magent.upload_server.stop_server", lambda port: False)
+        if sys.platform == "win32":
+            monkeypatch.setattr("magent.hotkey.stop_listener", lambda: False)
+        result = runner.invoke(
+            cli.main, ["--config", tmp_config({"projects": []}), "down", "--all"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "node sync" not in result.stdout.lower()
+
+    def test_a_last_turn_that_did_not_come_home_is_said_and_the_kill_still_counts(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        from magent import nodes
+        from magent.remote_mux import RemoteError
+
+        self._hold("api")
+
+        def pull(config: object, name: str, **_k: object) -> None:
+            raise RemoteError(0, "magent: could not store every file", ("pull.sh",))
+
+        out, _killed, dialed, _sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["api"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            pull=pull,
+        )
+        assert out.exit_code == 0, out.output
+        assert dialed == [("second", "api")]
+        lines = self._session_lines(out)
+        assert "api: last turn not pulled (could not store every file)" in lines
+        assert "magent node sync --once" in lines
+        assert "Stopped 1 session(s): api" in lines
+        assert "api" in nodes.read_node_map()
 
 
 class TestTheShutdownReportFoldsBothHalves:

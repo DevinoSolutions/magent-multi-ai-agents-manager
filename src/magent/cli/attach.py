@@ -1552,6 +1552,7 @@ def up_cmd(
             only=None if targets is None else [*targets, *node_sids],
             group=group,
             allow_dirty=allow_dirty,
+            config_path=str(config_file),
         )
         click.echo(
             f"  {style('+', fg='green')} Brought up {style(str(len(created)), fg='green', bold=True)}"
