@@ -125,16 +125,23 @@ class TestRemoteError:
         assert RemoteError(255, "refused", ("ssh",)).timed_out is False
         assert RemoteError(None, "t", ("ssh",), timed_out=True).timed_out is True
 
-    def test_outcome_unknown_is_its_own_field_false_by_default(self):
-        # Two facts, two fields: timed_out is reachability (node_sync reads it),
-        # outcome_unknown is retry safety (a mutating call's retry reads it).
-        # Neither is derived from the other.
+    def test_outcome_unknown_is_either_kill_and_never_stored(self):
+        # Retry safety is DERIVED from the two stored facts, so three flags can
+        # never drift: a timeout and an over-cap reply both killed the local ssh
+        # mid-call, and neither kill stops a non-tty remote command.
         assert RemoteError(None, "boom", ("ssh",)).outcome_unknown is False
         assert RemoteError(1, "boom", ("ssh",)).outcome_unknown is False
-        err = RemoteError(None, "x", ("ssh",), outcome_unknown=True)
-        assert (err.outcome_unknown, err.timed_out) == (True, False)
         err = RemoteError(None, "t", ("ssh",), timed_out=True)
-        assert (err.outcome_unknown, err.timed_out) == (False, True)
+        assert (err.outcome_unknown, err.timed_out, err.over_cap) == (True, True, False)
+        err = RemoteError(None, "x", ("ssh",), over_cap=True)
+        assert (err.outcome_unknown, err.timed_out, err.over_cap) == (True, False, True)
+
+    def test_outcome_unknown_cannot_be_set_or_passed(self):
+        err = RemoteError(None, "boom", ("ssh",))
+        with pytest.raises(AttributeError):
+            err.outcome_unknown = True  # type: ignore[misc]  # reason: asserting it is read-only
+        with pytest.raises(TypeError):
+            RemoteError(None, "boom", ("ssh",), outcome_unknown=True)  # type: ignore[call-arg]  # reason: asserting it is never stored
 
     def test_it_is_a_timeout_only_when_told(self):
         # rc None alone is ambiguous (spawn failure, over-cap reply, timeout);
@@ -459,6 +466,19 @@ class TestTheReplyIsBoundedInMemory:
         assert proc.poll() is not None
         (line,) = [r.getMessage() for r in caplog.records if r.name == "magent.nodes"]
         assert line.startswith(f"node call reply exceeded {CAP} bytes: ssh ")
+
+    def test_a_real_over_cap_error_is_a_failed_node_not_an_unreachable_one(
+        self, fake_ssh
+    ):
+        # node_sync's own pin builds its RemoteError by hand; this one is what
+        # _spawn really raises, so a flag the over-cap raise grows (timed_out)
+        # cannot silently turn an over-cap pull into "unreachable".
+        from magent import node_sync
+
+        fake_ssh.set_reply("big", stdout="x" * (CAP + 1))
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["big"], timeout_s=30, max_stdout_bytes=CAP)
+        assert node_sync._classify(exc.value)[0] == node_sync.FAILED
 
     def test_a_quiet_call_over_the_cap_logs_nothing(self, fake_ssh, caplog):
         caplog.set_level(logging.WARNING, logger="magent.nodes")

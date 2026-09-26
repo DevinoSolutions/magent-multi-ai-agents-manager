@@ -148,13 +148,14 @@ class RemoteError(RuntimeError):
     run to completion (a killed send may have landed): the OUTCOME IS UNKNOWN.
     A caller must therefore never retry a mutation blindly on rc None.
 
-    Each question has its own field, and a caller must never match
+    Each question has its own answer, and a caller must never match
     ``stderr_tail`` to learn any of them:
 
-    - ``outcome_unknown``: may the remote command have run? True after a
-      timeout and after an over-cap kill. It is what any retry of a MUTATING
-      remote call must read (Plan F's provision): retry blindly only when it is
-      False.
+    - ``outcome_unknown``: may the remote command have run? A read-only
+      property, ``timed_out or over_cap`` -- derived, never stored, so it can
+      never drift from the two facts it rests on. It is what any retry of a
+      MUTATING remote call must read (Plan F's provision): retry blindly only
+      when it is False.
     - ``timed_out``: did the node go silent? Only ``_spawn``'s timeout sets it.
       It is what reachability reads (node_sync counts it as unreachable). An
       over-cap reply is a node that answered, too much, so it is False there.
@@ -171,7 +172,6 @@ class RemoteError(RuntimeError):
         command_redacted: tuple[str, ...],
         *,
         timed_out: bool = False,
-        outcome_unknown: bool = False,
         over_cap: bool = False,
     ) -> None:
         self.rc = rc
@@ -179,10 +179,17 @@ class RemoteError(RuntimeError):
         self.command_redacted = command_redacted
         self.timed_out = timed_out
         self.over_cap = over_cap
-        self.outcome_unknown = outcome_unknown
         super().__init__(
             f"{shlex.join(command_redacted)} failed (rc={rc}): {stderr_tail}"
         )
+
+    @property
+    def outcome_unknown(self) -> bool:
+        """May the remote command have run? Retry safety of a MUTATING remote
+        call (Plan F's provision) reads THIS; reachability reads ``timed_out``;
+        ``over_cap`` is the size fact. Both kills end the local ssh mid-call,
+        and neither stops a non-tty remote command."""
+        return self.timed_out or self.over_cap
 
 
 @functools.lru_cache(maxsize=1)
@@ -414,7 +421,6 @@ def _spawn(
             f"timed out after {timeout_s:g}s",
             shown,
             timed_out=True,
-            outcome_unknown=True,
         )
     if out.over:
         _kill(proc)
@@ -437,7 +443,6 @@ def _spawn(
             f"{reason}\n{said}" if said else reason,
             shown,
             over_cap=True,
-            outcome_unknown=True,
         )
     stderr = err.data()
     if check and proc.returncode != 0:
