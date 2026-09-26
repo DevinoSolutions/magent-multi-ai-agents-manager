@@ -1838,8 +1838,12 @@ on Windows the second bind succeeds (`SO_REUSEADDR`): two live servers on one
 port, a pid file naming only the later one. Now a serve the supervisor spawned
 that is still alive inside `REGISTRATION_TIMEOUT_S` counts as starting, not
 failed. Once it exits, or the window runs out, the cooldown decides alone as
-before. The supervisor never ends that child either. The double bind itself is
-upload_server's and is not changed here. Pins:
+before. The supervisor never ends that child either. At the default 60s cooldown
+this guard never engages, because the cooldown check returns first; it matters
+only for a cooldown override below the window (the e2e tier's 3s is one). It is
+not a cure either: a serve measured 28.65s to bind on a loaded desktop, past the
+window, and was doubled all the same. The structural fix is an exclusive bind
+in upload_server, which is not changed here. Pins:
 `test_launch.py::TestUploadServerSupervisor`.
 
 The detaching e2e tiers carry the other half of the lesson. A failed launch

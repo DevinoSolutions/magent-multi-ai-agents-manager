@@ -1888,8 +1888,10 @@ class TestUploadServerSupervisor:
         # cooldown expired first, and the second serve bound the SAME port
         # (SO_REUSEADDR on Windows) -- two live servers, one pid file. A child
         # that is alive inside the registration window is slow, not failed.
+        # A spare child for the spawn that must NOT happen, so a regression
+        # fails the assertion instead of exhausting the fake's iterator.
         spawned, children = self._wire_children(
-            monkeypatch, alive=[False, False, False], returncodes=[None]
+            monkeypatch, alive=[False, False, False], returncodes=[None, None]
         )
         clock = _FakeClock()
         sup = launch.UploadServerSupervisor(8099, cooldown_s=3.0, now=clock)
@@ -1900,7 +1902,7 @@ class TestUploadServerSupervisor:
         clock.t += launch.REGISTRATION_TIMEOUT_S - 3.5 - 0.1
         assert sup.tick() is False
         assert len(spawned) == 1
-        assert children[0].ended == []
+        assert all(c.ended == [] for c in children)
 
     def test_past_the_registration_window_a_live_child_no_longer_blocks(
         self, monkeypatch
@@ -1924,7 +1926,7 @@ class TestUploadServerSupervisor:
     ):
         # Any exit -- 0 included -- means nothing of ours is still starting, so
         # a crash-on-startup is retried at the cooldown rate, as before.
-        spawned, _children = self._wire_children(
+        spawned, children = self._wire_children(
             monkeypatch, alive=[False, False, False], returncodes=[0, 1]
         )
         clock = _FakeClock()
@@ -1936,6 +1938,38 @@ class TestUploadServerSupervisor:
         clock.t += 2.5
         assert sup.tick() is True
         assert len(spawned) == 2
+        assert all(c.ended == [] for c in children)
+
+    def test_a_spawn_that_raises_is_not_timed_against_the_previous_child(
+        self, monkeypatch
+    ):
+        # _last_spawn is stamped before the spawn so a raising spawn still
+        # paces; the previous child must not then stand in for the attempt
+        # that failed and hold the next one for the whole window.
+        alive_but_unbound = self._Child(None)
+        calls: list[list[str]] = []
+
+        def spawn(args):
+            calls.append(args)
+            if len(calls) == 1:
+                return alive_but_unbound
+            if len(calls) == 2:
+                raise OSError("spawn failed")
+            return self._Child(None)
+
+        monkeypatch.setattr(launch, "_probe_upload_port", lambda _p: False)
+        monkeypatch.setattr(launch, "spawn_detached", spawn)
+        clock = _FakeClock()
+        sup = launch.UploadServerSupervisor(8099, cooldown_s=3.0, now=clock)
+
+        assert sup.tick() is True
+        clock.t += launch.REGISTRATION_TIMEOUT_S  # the first child's window ends
+        with pytest.raises(OSError):
+            sup.tick()
+        clock.t += 3.5  # past the cooldown of the attempt that raised
+        assert sup.tick() is True
+        assert len(calls) == 3
+        assert alive_but_unbound.ended == []
 
     def test_a_healthy_tick_inside_the_cooldown_costs_nothing(self, monkeypatch):
         # The cooldown gate is reached only when the port is dead: a server that

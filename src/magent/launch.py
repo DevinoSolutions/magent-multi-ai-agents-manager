@@ -549,6 +549,9 @@ class UploadServerSupervisor:
             self._port,
             self._pid_note(),
         )
+        # Forget the previous child first: if this spawn raises, that child must
+        # not be timed against this attempt's stamp as though it were the new one.
+        self._child = None
         self._child = spawn_detached(upload_server_argv(self._port, self._config_path))
         return True
 
