@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import socket
 import sys
 import threading
@@ -786,7 +785,9 @@ def _launch_projects(
     windows), build the tiling target list. Pure w.r.t. tiling -- it never
     moves a window."""
     has_remote = any(p.host for p in projects)
-    if has_remote and not shutil.which("ssh"):
+    # attach_client's rule, the client the remote panes dial: Windows' own
+    # OpenSSH with nothing on PATH is not a missing client.
+    if has_remote and attach_client.find_ssh() is None:
         click.echo(
             style("  ! Remote projects configured but 'ssh' not on PATH.", fg="yellow")
         )

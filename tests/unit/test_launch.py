@@ -842,6 +842,43 @@ class TestLaunchProjects:
         assert len(fp.launched_vscode) == 1
 
 
+class TestTheRemoteSshWarningAsksTheClientRule:
+    """The "ssh not on PATH" warning asks attach_client's rule, the one the
+    remote panes dial through -- so Windows' own OpenSSH with nothing on PATH
+    is not a missing client, and nothing found anywhere still warns."""
+
+    def _launch(self):
+        fp = FakePlatform()
+        projects = [ProjectConfig(path="/srv/api", tool="claude", host="u@host")]
+        cfg = MagentConfig(
+            projects=projects,
+            settings=Settings(
+                tools={"claude": "claude --continue"}, default_tool="claude"
+            ),
+        )
+        _launch_projects(fp, cfg, RunOpts(), projects, None)
+
+    def test_the_system_client_alone_is_not_a_missing_client(
+        self, monkeypatch, capsys, fake_sleep
+    ):
+        from magent import attach_client
+
+        monkeypatch.setattr(
+            attach_client, "find_ssh", lambda: r"C:\Windows\System32\OpenSSH\ssh.exe"
+        )
+        monkeypatch.setattr("shutil.which", lambda _name: None)
+        self._launch()
+        assert "not on PATH" not in capsys.readouterr().out
+
+    def test_no_client_anywhere_still_warns(self, monkeypatch, capsys, fake_sleep):
+        from magent import attach_client
+
+        monkeypatch.setattr(attach_client, "find_ssh", lambda: None)
+        monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+        self._launch()
+        assert "'ssh' not on PATH" in capsys.readouterr().out
+
+
 class TestPrepareGrid:
     """Direct unit tests for the extracted grid phase (R4, Step 5)."""
 

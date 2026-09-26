@@ -12,6 +12,7 @@ from ctypes import POINTER, WINFUNCTYPE, byref, create_unicode_buffer, windll
 from pathlib import Path
 from typing import Literal
 
+from magent.attach_client import ssh_program
 from magent.grid import MonitorRect, Rect
 from magent.log import get_logger
 from magent.platform import (
@@ -625,7 +626,9 @@ class WindowsPlatform(Platform):
             # is a single, cleanly-quoted token. Building one `ssh ... "..."`
             # string and handing it to `cmd /k` double-nests the quotes, which
             # cmd mangles (the inner quotes leak to the remote shell).
-            args.extend(["--", "cmd", "/k", "ssh", "-t", opts.ssh_host, remote])
+            # argv[0] by attach_client's rule, so this pane dials the same
+            # client (and agent) as the attach panes and the node calls.
+            args.extend(["--", "cmd", "/k", ssh_program(), "-t", opts.ssh_host, remote])
         else:
             args.extend(["--", "cmd", "/k", opts.command])
 

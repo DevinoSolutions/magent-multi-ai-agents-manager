@@ -937,6 +937,31 @@ class TestLaunchPathSpawnsScrubTheInheritedMarkers:
         _assert_scrubbed(envs[0])
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="WindowsPlatform binds windll at import"
+)
+def test_a_windows_ssh_project_terminal_dials_the_panes_client(monkeypatch):
+    # An ssh-host terminal dials through attach_client's rule, the same client
+    # (and agent) the attach panes use -- never whatever PATH offers first.
+    from magent import attach_client
+    from magent.platform import TerminalLaunchOpts
+    from magent.platform.windows import WindowsPlatform
+
+    client = r"C:\Windows\System32\OpenSSH\ssh.exe"
+    argvs: list[list[str]] = []
+    monkeypatch.setattr(attach_client, "find_ssh", lambda: client)
+    monkeypatch.setattr(
+        "magent.platform.windows.subprocess.Popen", lambda a, **k: argvs.append(a)
+    )
+    WindowsPlatform().launch_terminal(
+        TerminalLaunchOpts(
+            title="magent:api", cwd="C:/p", command="claude", ssh_host="u@host"
+        )
+    )
+    (argv,) = argvs
+    assert argv[argv.index("/k") + 1] == client
+
+
 # --- the ATTACH client is the OTHER rule ------------------------------------
 # `attach_psmux` opens a window that RENDERS an existing session; it hosts no
 # agent and creates nothing. So it keeps the inherited environment -- nesting
