@@ -241,7 +241,13 @@ class TestPlace:
         assert [s.nick for s in placement.scores] == ["third", "second"]
 
     def test_every_placement_reason_has_a_sentence(self):
-        assert set(nodes.PLACE_REASONS) == {"kept", "re-placed", "placed", "no-data"}
+        assert set(nodes.PLACE_REASONS) == {
+            "kept",
+            "re-placed",
+            "placed",
+            "no-data",
+            "unknown",
+        }
         assert all(nodes.PLACE_REASONS.values())
 
 
@@ -641,7 +647,11 @@ class TestAnUnreadableMapPlacesNoAutoProject:
             if request.param == "torn":
                 nodes.NODE_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
                 nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
-                return "ValueError"
+                # A ValueError, named as the reader names it: JSONDecodeError
+                # here, the plain ValueError once sub-plan D's reader wraps it.
+                with pytest.raises(ValueError) as torn:
+                    nodes.load_node_map_strict()
+                return type(torn.value).__name__
 
             def busy() -> dict[str, nodes.NodeMapEntry]:
                 raise PermissionError(13, "The process cannot access the file")

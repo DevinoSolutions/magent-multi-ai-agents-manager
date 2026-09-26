@@ -1351,13 +1351,15 @@ PLACE_REASONS: dict[str, str] = {
     "re-placed": "its node left settings.nodes; placed again by load",
     "placed": "lowest load score over the last 30 minutes",
     "no-data": "no node has load samples to score",
+    "unknown": "the node map is unreadable, so where it runs is unknown",
 }
 
 
 @dataclass(frozen=True)
 class Placement:
     """Where an ``auto`` project goes, why, and every score behind it.
-    ``nick`` is None only for ``no-data``. ``note`` is a line to print."""
+    ``nick`` is None only for ``no-data`` and ``unknown`` (the map could not
+    be read). ``note`` is a line to print."""
 
     nick: str | None
     reason: str

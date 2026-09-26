@@ -337,6 +337,13 @@ def _plan_heading(name: str, proj: ProjectConfig, placement: Placement | None) -
 
     if proj.node != NODE_AUTO:
         return f"  {style(name, bold=True)}  pinned -> @{proj.node}"
+    if placement is not None and placement.reason == "unknown":
+        # D17: the map could not be read, so the node is unknown -- never a
+        # guess, and never "nowhere" (it may be running somewhere).
+        return (
+            f"  {style(name, bold=True)}  auto -> (node unknown)"
+            f"  {style('(' + nodes.PLACE_REASONS['unknown'] + ')', dim=True)}"
+        )
     if placement is None or placement.nick is None:
         return (
             f"  {style(name, bold=True)}  auto -> nowhere"

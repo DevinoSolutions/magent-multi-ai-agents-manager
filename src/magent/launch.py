@@ -859,6 +859,36 @@ def _live_sampler(config: MagentConfig) -> Callable[[str], LoadSample | None]:
     return sample
 
 
+# D-MERGE: sub-plan D (feat/nodes-Dmap d96ad4f) defines these same two helpers,
+# word for word, after `_node_map_snapshot`; keep ONE copy when D merges.
+def _node_map_for_placement() -> tuple[
+    dict[str, NodeMapEntry], OSError | ValueError | None
+]:
+    """The node map for a decision that places something: ``(entries,
+    None)``, or ``({}, the error)`` when it cannot be read -- torn, or still
+    busy after its retries. Never ``read_node_map``'s ``{}``: an unreadable
+    map is UNKNOWN, not "nothing is placed", and read as empty an ``auto``
+    project running on a node would look free to place again. A pinned
+    project needs no map to resolve, so only ``auto`` ones are refused
+    (``_map_unreadable_text``)."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    try:
+        return nodes.load_node_map_strict(), None
+    except (OSError, ValueError) as exc:
+        return {}, exc
+
+
+def _map_unreadable_text(exc: OSError | ValueError) -> str:
+    """An ``auto`` project's one-line refusal under an unreadable map. The
+    error CLASS only: the full error goes to nodes.log."""
+    return (
+        f"the node map is unreadable ({type(exc).__name__}), so where this auto"
+        " project runs is unknown; not brought up"
+    )
+
+
 def place_node_projects(
     config: MagentConfig,
     projects: list[ProjectConfig],
@@ -876,6 +906,11 @@ def place_node_projects(
     never opens a connection: a thin node is then scored on what it has.
     Only ``auto`` is ever placed: local, pinned and ``cloud`` projects
     (DECISION-15; ``cloud`` is pin-only) pass through untouched.
+
+    The map is read strictly (``_node_map_for_placement``). Unreadable, NO
+    ``auto`` project is placed: each is dropped with the map's refusal and a
+    ``"unknown"`` Placement (D17: its node is None), nothing is sampled, and
+    the rest of the fleet goes on.
     """
     from magent import nodes
     from magent.config import NODE_AUTO
@@ -883,8 +918,22 @@ def place_node_projects(
     auto = [p for p in projects if p.node == NODE_AUTO]
     if not auto:
         return NodePlacements(list(projects), [], {})
+    entries, unreadable = _node_map_for_placement()
+    if unreadable is not None:
+        # Read as {}, an auto project already running on a node would be
+        # scored onto a fresh one: a second session while the first runs.
+        get_logger("nodes").warning(
+            "auto placement skipped, node map unreadable: %s", unreadable
+        )
+        return NodePlacements(
+            [p for p in projects if p.node != NODE_AUTO],
+            [
+                f"{nodes.project_name(p)}: {_map_unreadable_text(unreadable)}"
+                for p in auto
+            ],
+            {nodes.project_name(p): nodes.Placement(None, "unknown") for p in auto},
+        )
     when = time.time() if now is None else now
-    entries = nodes.read_node_map()
     samples: dict[str, list[LoadSample]] = {}
     sampled: frozenset[str] = frozenset()
     if not all(_kept(config, entries, p) for p in auto):
