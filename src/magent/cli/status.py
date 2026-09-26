@@ -37,7 +37,7 @@ from magent.cli.ui import (
     _print_names,
     _print_session_overview,
 )
-from magent.log import heartbeat_age, heartbeat_fresh
+from magent.log import get_logger, heartbeat_age, heartbeat_fresh
 from magent.paths import find_config
 from magent.procs import pid_alive
 from magent.psmux import session0_message, session0_server_pids
@@ -658,6 +658,12 @@ def _placed_here(
     try:
         entries = nodes.load_node_map_strict()
     except (OSError, ValueError) as exc:
+        # The screen gets the class (``_echo_map_unread_hint``); the whole
+        # error goes to nodes.log HERE, as the node half's own read may find
+        # the map whole again a moment later and log nothing.
+        get_logger("nodes").warning(
+            "down: node map unreadable, placement here unknown: %s", exc
+        )
         return [], exc
     return [
         nodes.node_sid(p)
