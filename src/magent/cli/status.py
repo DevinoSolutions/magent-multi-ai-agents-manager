@@ -630,28 +630,47 @@ def _node_orphan_targets(
     )
 
 
-def _placed_here(cfg: MagentConfig, node_targets: list[str]) -> list[str]:
-    """The node targets this PC's node map says it placed. Like a live local
-    session, they are work only a LOCAL `down` can reach, so they keep the
-    shutdown off the remembered attach host. A node project that is merely
-    CONFIGURED does not: an attach client sharing the host's config would
-    otherwise never forward `down --all` to the host again.
+def _placed_here(
+    cfg: MagentConfig, node_targets: list[str]
+) -> tuple[list[str], str | None]:
+    """The node targets this PC's node map says it placed, and -- when the map
+    could not be read -- the class of what refused it. Like a live local
+    session, placed targets are work only a LOCAL `down` can reach, so they
+    keep the shutdown off the remembered attach host. A node project that is
+    merely CONFIGURED does not: an attach client sharing the host's config
+    would otherwise never forward `down --all` to the host again.
 
     ``nodes.placement_of`` is the lookup ``stop_node_sessions`` kills by, so
     "placed here" and "killed there" name the same sessions. The map is read
-    TOLERANTLY on purpose: this is a routing choice, not a report, and an
-    unreadable map routes as it did before PR-D. ``stop_node_sessions`` reads
-    it strictly and names what it could not prove."""
+    STRICTLY: read as "nothing placed", a busy or torn map forwarded `down` to
+    the attach host -- stopping the host's fleet while a node session this PC
+    placed kept running. ``down_cmd`` keeps an unreadable map's shutdown here.
+    """
     if not node_targets:
-        return []
+        return [], None
     from magent import nodes  # leaf, in-body: keeps `magent --help` off its imports
 
-    entries = nodes.read_node_map()
+    try:
+        entries = nodes.load_node_map_strict()
+    except (OSError, ValueError) as exc:
+        return [], type(exc).__name__
     return [
         nodes.node_sid(p)
         for p in nodes.node_projects(cfg)
         if nodes.node_sid(p) in node_targets and nodes.placement_of(p, entries)
-    ]
+    ], None
+
+
+def _echo_map_unread_hint(last: str, cls: str) -> None:
+    """One line when an unreadable node map is the only reason `down` stayed
+    here: it may have placed node sessions that only a local `down` reaches,
+    so the remembered attach host was not acted on. Names the map's failure
+    by class only and the command that does reach the host."""
+    click.echo(
+        f"  {style('!', fg='yellow')} "
+        f"Acted here, not on {last}: the node map could not be read ({cls})."
+        f" For the sessions on {last}: magent down --host {last}"
+    )
 
 
 def _echo_attach_host_hint(live: list[str], placed: list[str]) -> None:
@@ -747,8 +766,14 @@ def down_cmd(
     node_targets = _node_orphan_targets(cfg, group, names)
     targets += [s for s in node_targets if s not in targets]
 
-    placed = _placed_here(cfg, node_targets)
+    placed, map_unread = _placed_here(cfg, node_targets)
     remote = _down_host(host, [*live, *placed])
+    held_back: str | None = None
+    if remote and not host and map_unread is not None:
+        # The auto rule forwards only when nothing here needs a local `down`.
+        # An unreadable map cannot say that: act here, where a node session
+        # this PC placed is reachable, and name the host's command instead.
+        held_back, remote = remote, None
     remote_rc = 0
     if remote:
         from magent.cli.attach import (
@@ -767,7 +792,10 @@ def down_cmd(
         if node_targets:
             node_stopped, node_still = stop_node_sessions(cfg, node_targets)
         _report_shutdown(stopped, still, node_stopped, node_still)
-        _echo_attach_host_hint(live, placed)
+        if held_back is not None and map_unread is not None:
+            _echo_map_unread_hint(held_back, map_unread)
+        else:
+            _echo_attach_host_hint(live, placed)
     else:
         click.echo(f"  {style('-', dim=True)} No matching sessions in config.")
 
