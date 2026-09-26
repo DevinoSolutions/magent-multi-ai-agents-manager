@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from typing import TYPE_CHECKING, NamedTuple
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -59,6 +60,11 @@ LISTENER_REPAIR_HINT = "magent down --all, then magent serve (or magent attach)"
 # server stays dead until a human notices -- which is precisely the failure
 # that supervision exists to end.
 UPLOAD_WATCHDOG_HINT = "magent attention -d  (it revives a dead upload server)"
+
+# A stale node sync daemon still holds its lock, so nothing replaces it:
+# `serve` leaves a wedged one for the user (launch.ensure_node_sync says the
+# same), and starts a fresh one once it is stopped.
+NODE_SYNC_REPAIR_HINT = "magent node sync --stop  (magent serve starts a fresh one)"
 
 
 def _health_check(port: int) -> bool:
@@ -155,6 +161,25 @@ def _attention_state() -> str:
     if daemon_pid():
         return "on" if heartbeat_fresh("attention") else "stale"
     return "crashed" if heartbeat_age("attention") is not None else "off"
+
+
+def _node_sync_state(cfg: MagentConfig) -> str:
+    """The node sync daemon, judged against whether one is EXPECTED: "off" when
+    serve would not spawn one (``node_sync.wanted`` -- the same question serve
+    asks, so status expects a daemon exactly when serve starts one), else
+    ``node_cmd._daemon_state``'s "ok" / "stale" / "stopped".
+
+    Only "stale" degrades (``_is_degraded``): every node row is then frozen at
+    a pull nobody refreshes. "stopped" does not -- `serve` starts a daemon
+    within its supervise interval, with serve off the upload-server line
+    already says so, and the spec promises exit 3 for a stale daemon only.
+    """
+    from magent import node_sync  # heavy subsystem: in-body per policy
+    from magent.cli.node_cmd import _daemon_state  # DECISION-17's one reader
+
+    if not node_sync.wanted(cfg):
+        return "off"
+    return _daemon_state()
 
 
 def _agents_snapshot(cfg: MagentConfig) -> list[dict[str, object]]:
@@ -263,6 +288,7 @@ def _gather_status(cfg: MagentConfig) -> dict[str, str]:
         "upload_server": upload,
         "listener": _listener_state(upload),
         "attention": _attention_state(),
+        "node_sync": _node_sync_state(cfg),
     }
 
 
@@ -271,6 +297,7 @@ def _is_degraded(status: dict[str, str]) -> bool:
         status["upload_server"] == "dead"
         or status["listener"] in ("stale", "dead")
         or status["attention"] in ("stale", "crashed")
+        or status["node_sync"] == "stale"
     )
 
 
@@ -332,9 +359,36 @@ def _render_status(config_file: Path) -> StatusReport:
         click.echo(
             f"\n  {style(str(len(down)), fg='yellow', bold=True)} not running  {style('(' + preview + ')', dim=True)}"
         )
+    status = _gather_status(cfg)
+    # Node sessions (PR-D): read from the sync daemon's last pull, never over
+    # ssh -- a stale row is a node this PC has not heard from, not a dead one.
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    node_rows = nodes.session_rows(cfg, now=time.time())
+    # The daemon behind those rows: stale freezes every one of them, which is
+    # what makes it the one node state that degrades (_node_sync_state). Named
+    # even with no rows -- a node-pinned IDE project has none, yet serve still
+    # runs the daemon for it.
+    sync_stale = status["node_sync"] == "stale"
+    if node_rows or sync_stale:
+        click.echo(f"\n  {style('Nodes', bold=True)}")
+    tint = {"live": "green", "stale": "yellow", "dead": "red"}
+    for node_row in node_rows:
+        node = f"@{node_row['node']}" if node_row["node"] else "(not placed)"
+        state = str(node_row["state"])
+        click.echo(
+            f"    {node_row['session']}  {style(node, fg='blue')}  {style(state, fg=tint[state])}"
+        )
+    if sync_stale:
+        click.echo(
+            f"  {style('node sync daemon stale  (heartbeat expired)', fg='red', bold=True)}"
+        )
+        click.echo(
+            f"  {style('Repair:', dim=True)} {style(NODE_SYNC_REPAIR_HINT, bold=True)}"
+        )
     _divider()
 
-    status = _gather_status(cfg)
     upload_labels = {
         "on": style(f"ON  port {cfg.settings.upload_port}", fg="green", bold=True),
         "dead": style(
@@ -456,6 +510,11 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
         # Session 0 is a fact about the machine, not about magent's daemons, so
         # it changes neither the envelope's shape nor the exit contract.
         payload["psmux_session0"] = len(session0_server_pids())
+        # Additive, like psmux_sessions: a dead or stale node session is a row
+        # state, never a degraded daemon, so the exit contract is unchanged.
+        from magent import nodes  # heavy subsystem: in-body per policy
+
+        payload["node_sessions"] = nodes.session_rows(cfg, now=time.time())
         click.echo(json.dumps(payload))
         sys.exit(3 if _is_degraded(status) else 0)
 

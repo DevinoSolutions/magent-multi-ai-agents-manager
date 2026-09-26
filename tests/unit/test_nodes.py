@@ -32,6 +32,7 @@ from magent.nodes import (
     NodeMapEntry,
     Recipe,
     RepoSpec,
+    node_for_nick,
 )
 from magent.sessions import IDE_TOOLS, is_ide_tool
 from tests.conftest import REAL_MAGENT_DIR
@@ -748,8 +749,12 @@ class TestResolve:
             nodes.resolve(_pool(), ProjectConfig(path="api"), local_user="amin")
 
     def test_a_nick_missing_from_the_pool_is_refused_naming_it(self):
+        # A PINNED nick falls through to node_for_nick's unknown-nick error,
+        # prefixed with the project; only an auto placement says "re-place".
         with pytest.raises(
-            NodeConfigError, match=r"node 'fourth'.*; known nodes: second, third$"
+            NodeConfigError,
+            match=r"^api: node 'fourth' is not in settings\.nodes; "
+            r"known nodes: second, third$",
         ):
             nodes.resolve(
                 _pool(), ProjectConfig(path="api", node="fourth"), local_user="amin"
@@ -819,6 +824,241 @@ class TestResolve:
             nodes.resolve(
                 _pool(), ProjectConfig(path="api", node="third"), local_user=""
             )
+
+
+class TestANickResolvesLikeAProject:
+    # What a nick shares with a project is pinned through resolve() in
+    # TestResolve; this class pins only what differs when there is no project.
+
+    def test_an_unknown_nick_names_the_pool(self):
+        with pytest.raises(
+            NodeConfigError,
+            match=r"^node 'fifth' is not in settings\.nodes; known nodes: second, third$",
+        ):
+            node_for_nick(_pool(), "fifth", local_user="amin")
+
+    @pytest.mark.parametrize("nick", ["auto", "cloud"])
+    def test_a_placement_word_as_a_nick_is_just_an_unknown_nick(self, nick):
+        # Config validation keeps the reserved words out of the pool, so the
+        # ordinary refusal is the true one; no special case is wanted.
+        with pytest.raises(
+            NodeConfigError,
+            match=rf"^node '{nick}' is not in settings\.nodes; known nodes: second, third$",
+        ):
+            node_for_nick(_pool(), nick, local_user="amin")
+
+    def test_the_label_prefixes_the_unknown_nick_error(self):
+        with pytest.raises(
+            NodeConfigError,
+            match=r"^api: node 'fifth' is not in settings\.nodes; known nodes: second, third$",
+        ):
+            node_for_nick(_pool(), "fifth", local_user="amin", label="api")
+
+    def test_an_empty_pool_says_there_are_no_known_nodes(self):
+        with pytest.raises(
+            NodeConfigError,
+            match=r"^node 'fifth' is not in settings\.nodes; known nodes: none$",
+        ):
+            node_for_nick(_pool({}), "fifth", local_user="amin")
+
+    @pytest.mark.parametrize(
+        ("local_user", "derived"),
+        [("Amin Dhouib", "amin dhouib"), (" ", " "), ("1amin", "1amin")],
+    )
+    def test_a_derived_user_ssh_cannot_log_in_as_is_refused_by_nick(
+        self, local_user, derived
+    ):
+        # The login check lives in node_for_nick, not resolve: a caller holding
+        # only a nick (one read from the node map) gets the same refusal.
+        with pytest.raises(NodeConfigError) as err:
+            node_for_nick(_pool(), "third", local_user=local_user)
+        assert "settings.nodes.third.user" in str(err.value)
+        assert repr(local_user) in str(err.value)
+        assert repr(derived) in str(err.value)
+
+    def test_an_empty_label_is_no_label(self):
+        with pytest.raises(NodeConfigError, match=r"^node 'fifth' "):
+            node_for_nick(_pool(), "fifth", local_user="amin", label="")
+
+    @pytest.mark.parametrize(
+        ("local_user", "expected"),
+        [
+            ("", r"^settings\.nodes\.third\.user is not set"),
+            ("root", r"^settings\.nodes\.third: magent is running as root"),
+            (
+                "Amin Dhouib",
+                (
+                    r"^settings\.nodes\.third\.user is not set and the local "
+                    r"username 'Amin Dhouib' is not a node login"
+                ),
+            ),
+        ],
+    )
+    def test_the_label_never_prefixes_a_settings_error(self, local_user, expected):
+        # These name settings.nodes.<nick>, the thing to fix; the project that
+        # led there is not part of the fix.
+        with pytest.raises(NodeConfigError, match=expected):
+            node_for_nick(_pool(), "third", local_user=local_user, label="api")
+
+
+class TestTheMirrorLayout:
+    def test_every_path_hangs_off_the_nodes_dir(self, tmp_path):
+        assert nodes.node_dir("second", nodes_dir=tmp_path) == tmp_path / "second"
+        assert nodes.transcripts_dir("second", "api", nodes_dir=tmp_path) == (
+            tmp_path / "second" / "api" / "transcripts"
+        )
+        assert nodes.state_dir("second", "api", nodes_dir=tmp_path) == (
+            tmp_path / "second" / "api" / "state"
+        )
+        assert (
+            nodes.sessions_path("second", nodes_dir=tmp_path)
+            == tmp_path / "second" / "sessions.json"
+        )
+        assert (
+            nodes.load_path("second", nodes_dir=tmp_path)
+            == tmp_path / "second" / "load.jsonl"
+        )
+        assert (
+            nodes.pull_marks_path("second", nodes_dir=tmp_path)
+            == tmp_path / "second" / "pull.json"
+        )
+
+    def test_the_default_root_is_read_at_call_time(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path)
+        assert nodes.state_dir("second", "api") == tmp_path / "second" / "api" / "state"
+
+
+class TestAtomicWrites:
+    def test_a_write_lands_whole_with_no_temp_left(self, tmp_path):
+        target = tmp_path / "a" / "b.json"
+        nodes.write_json_atomic(target, {"x": 1})
+        assert json.loads(target.read_text(encoding="utf-8")) == {"x": 1}
+        assert [p.name for p in target.parent.iterdir()] == ["b.json"]
+
+    def test_a_failed_write_keeps_the_old_file_and_no_temp(self, tmp_path, monkeypatch):
+        target = tmp_path / "b.json"
+        nodes.write_text_atomic(target, "old\n")
+
+        def refuse(_src, _dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(nodes.os, "replace", refuse)
+        with pytest.raises(OSError, match="disk full"):
+            nodes.write_text_atomic(target, "new\n")
+        assert target.read_text(encoding="utf-8") == "old\n"
+        assert [p.name for p in tmp_path.iterdir()] == ["b.json"]
+
+    def test_the_temp_file_is_never_a_json_a_reader_could_glob(
+        self, tmp_path, monkeypatch
+    ):
+        # Readers glob `*.json` in a mirror dir; a half-written temp must never
+        # match. It is a sibling (os.replace is atomic only within one fs).
+        seen: list[Path] = []
+        real_replace = nodes.os.replace
+
+        def spy(src, dst):
+            seen.append(Path(src))
+            real_replace(src, dst)
+
+        monkeypatch.setattr(nodes.os, "replace", spy)
+        target = tmp_path / "b.json"
+        nodes.write_json_atomic(target, {"x": 1})
+        nodes.write_json_atomic(target, {"x": 2})
+        assert len(seen) == 2
+        assert all(p.parent == tmp_path for p in seen)
+        assert all(p.suffix == ".tmp" and not p.name.endswith(".json") for p in seen)
+        assert seen[0] != seen[1]
+
+    def test_a_failing_fdopen_closes_the_descriptor_and_leaves_no_temp(
+        self, tmp_path, monkeypatch
+    ):
+        # Between mkstemp and fdopen the raw fd is ours alone: if fdopen raises
+        # it must be closed here, or it leaks (and on Windows the open handle
+        # would also make the temp's unlink fail, leaving the temp behind).
+        made: list[int] = []
+        real_mkstemp = nodes.tempfile.mkstemp
+
+        def recording_mkstemp(*args, **kwargs):
+            fd, name = real_mkstemp(*args, **kwargs)
+            made.append(fd)
+            return fd, name
+
+        def broken_fdopen(*_args, **_kwargs):
+            raise MemoryError("no buffer")
+
+        monkeypatch.setattr(nodes.tempfile, "mkstemp", recording_mkstemp)
+        monkeypatch.setattr(nodes.os, "fdopen", broken_fdopen)
+        target = tmp_path / "b.json"
+        with pytest.raises(MemoryError, match="no buffer"):
+            nodes.write_text_atomic(target, "new\n")
+        assert len(made) == 1
+        with pytest.raises(OSError):
+            os.fstat(made[0])
+        assert list(tmp_path.iterdir()) == []
+
+    def test_a_non_finite_number_is_refused_before_anything_is_written(self, tmp_path):
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        with pytest.raises(ValueError, match="JSON compliant"):
+            nodes.write_json_atomic(sub / "b.json", {"ts": float("nan")})
+        # Not only the target: no temp file either, in the dir it would use.
+        assert list(sub.iterdir()) == []
+
+
+class TestTheSessionsSnapshot:
+    def test_a_written_snapshot_reads_back(self, tmp_path):
+        nodes.write_json_atomic(
+            nodes.sessions_path("second", nodes_dir=tmp_path),
+            {"ts": 5.0, "sessions": ["api", "web"]},
+        )
+        assert nodes.read_sessions("second", nodes_dir=tmp_path) == nodes.NodeSessions(
+            ts=5.0, sessions=("api", "web")
+        )
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "{torn",
+            "[]",
+            '{"ts": true, "sessions": []}',
+            '{"ts": 1, "sessions": "api"}',
+            # A non-finite ts would make sessions_stale() answer "fresh" forever.
+            '{"ts": NaN, "sessions": []}',
+            '{"ts": Infinity, "sessions": []}',
+            # json keeps a 309-digit ts an int; float() of it raises OverflowError.
+            pytest.param(
+                '{"ts": ' + "9" * 309 + ', "sessions": []}', id="309-digit-ts"
+            ),
+            # Any non-string entry is corruption, not a name to skip.
+            '{"ts": 1, "sessions": ["a", 3, null]}',
+            '{"ts": 1, "sessions": ["a", ["b"]]}',
+        ],
+    )
+    def test_an_unusable_snapshot_reads_as_none(self, tmp_path, text):
+        path = nodes.sessions_path("second", nodes_dir=tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_text(text, encoding="utf-8")
+        assert nodes.read_sessions("second", nodes_dir=tmp_path) is None
+
+    def test_a_missing_snapshot_reads_as_none(self, tmp_path):
+        assert nodes.read_sessions("second", nodes_dir=tmp_path) is None
+
+    def test_a_snapshot_is_stale_after_two_pull_intervals(self):
+        snap = nodes.NodeSessions(ts=100.0, sessions=())
+        assert not nodes.sessions_stale(snap, pull_interval_s=30, now=160.0)
+        assert nodes.sessions_stale(snap, pull_interval_s=30, now=160.5)
+        assert nodes.sessions_stale(None, pull_interval_s=30, now=0.0)
+
+    def test_a_snapshot_from_the_future_reads_stale(self):
+        # A backwards wall-clock jump: ts is ahead of now by more than two
+        # intervals, and that reads stale too -- never fresh forever.
+        snap = nodes.NodeSessions(ts=1_000.0, sessions=("api",))
+        assert nodes.sessions_stale(snap, pull_interval_s=30, now=10.0)
+
+    def test_a_future_ts_inside_the_window_still_reads_fresh(self):
+        snap = nodes.NodeSessions(ts=100.0, sessions=("api",))
+        assert not nodes.sessions_stale(snap, pull_interval_s=30, now=130.0)
 
 
 @pytest.fixture
@@ -2045,3 +2285,98 @@ class TestTheRefusalNamesTheFix:
     def test_allow_dirty_lets_dirty_and_unpushed_through(self, tmp_path):
         state = _git_state(tmp_path, dirty=True, unpushed=True)
         assert nodes.refusal_for(state, allow_dirty=True) is None
+
+
+class TestANodeSessionsStateComesFromTheLastPull:
+    SNAP = nodes.NodeSessions(ts=1000.0, sessions=("api",))
+
+    def test_listed_in_a_fresh_snapshot_is_live(self):
+        assert (
+            nodes.node_session_state("api", self.SNAP, pull_interval_s=30, now=1010.0)
+            == "live"
+        )
+
+    def test_missing_from_a_fresh_snapshot_is_dead(self):
+        assert (
+            nodes.node_session_state("web", self.SNAP, pull_interval_s=30, now=1010.0)
+            == "dead"
+        )
+
+    def test_an_old_snapshot_is_stale_never_dead(self):
+        # Spec §7: an unreachable node says nothing about its sessions.
+        for sid in ("api", "web"):
+            assert (
+                nodes.node_session_state(sid, self.SNAP, pull_interval_s=30, now=1061.0)
+                == "stale"
+            )
+
+    def test_no_snapshot_at_all_is_stale(self):
+        assert (
+            nodes.node_session_state("api", None, pull_interval_s=30, now=0.0)
+            == "stale"
+        )
+
+    def test_every_state_is_in_the_vocabulary(self):
+        got = {
+            nodes.node_session_state("api", self.SNAP, pull_interval_s=30, now=1010.0),
+            nodes.node_session_state("web", self.SNAP, pull_interval_s=30, now=1010.0),
+            nodes.node_session_state("api", None, pull_interval_s=30, now=0.0),
+        }
+        assert got == set(nodes.NODE_SESSION_STATES)
+
+
+class TestSessionRows:
+    def test_one_row_per_node_project_in_config_order(
+        self, node_map, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": 1000.0, "sessions": ["api"]}
+        )
+        nodes.update_node_map(
+            "web", dataclasses.replace(ENTRY, sid="web", nick="third")
+        )
+        config = _pool_config(
+            ProjectConfig(path=str(tmp_path / "api"), node="second"),
+            ProjectConfig(path=str(tmp_path / "loc")),
+            ProjectConfig(path=str(tmp_path / "web"), node="auto"),
+            ProjectConfig(path=str(tmp_path / "new"), node="auto"),
+        )
+        assert nodes.session_rows(config, now=1010.0) == [
+            {"name": "api", "session": "api", "node": "second", "state": "live"},
+            {"name": "web", "session": "web", "node": "third", "state": "stale"},
+            {"name": "new", "session": "new", "node": None, "state": "dead"},
+        ]
+
+    def test_the_mapped_sid_wins_over_the_derived_one(
+        self, node_map, tmp_path, monkeypatch
+    ):
+        # The map records the id the session was STARTED under; a later title
+        # change must not make status look for a session that never existed.
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": 1000.0, "sessions": ["api-old"]}
+        )
+        nodes.update_node_map("api", dataclasses.replace(ENTRY, sid="api-old"))
+        config = _pool_config(ProjectConfig(path=str(tmp_path / "api"), node="second"))
+        assert nodes.session_rows(config, now=1010.0) == [
+            {"name": "api", "session": "api-old", "node": "second", "state": "live"}
+        ]
+
+    def test_the_pull_interval_comes_from_the_config(
+        self, node_map, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": 1000.0, "sessions": ["api"]}
+        )
+        config = _pool_config(ProjectConfig(path=str(tmp_path / "api"), node="second"))
+        config.settings.node_sync = dataclasses.replace(
+            config.settings.node_sync, pull_interval_s=100
+        )
+        # 150s old: stale at the default 30s interval, fresh at 100s.
+        assert nodes.session_rows(config, now=1150.0)[0]["state"] == "live"
+
+    def test_no_node_project_is_no_rows(self, node_map, tmp_path):
+        config = _pool_config(ProjectConfig(path=str(tmp_path / "loc")))
+        assert nodes.session_rows(config, now=0.0) == []

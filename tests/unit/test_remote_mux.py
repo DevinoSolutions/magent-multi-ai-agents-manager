@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import dataclasses
+import inspect
 import io
 import json
 import logging
@@ -12,6 +14,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -121,6 +124,30 @@ class TestRemoteError:
         assert RemoteError(None, "boom", ("ssh",)).timed_out is False
         assert RemoteError(255, "refused", ("ssh",)).timed_out is False
         assert RemoteError(None, "t", ("ssh",), timed_out=True).timed_out is True
+
+    def test_outcome_unknown_is_either_kill_and_never_stored(self):
+        # Retry safety is DERIVED from the two stored facts, so three flags can
+        # never drift: a timeout and an over-cap reply both killed the local ssh
+        # mid-call, and neither kill stops a non-tty remote command.
+        assert RemoteError(None, "boom", ("ssh",)).outcome_unknown is False
+        assert RemoteError(1, "boom", ("ssh",)).outcome_unknown is False
+        err = RemoteError(None, "t", ("ssh",), timed_out=True)
+        assert (err.outcome_unknown, err.timed_out, err.over_cap) == (True, True, False)
+        err = RemoteError(None, "x", ("ssh",), over_cap=True)
+        assert (err.outcome_unknown, err.timed_out, err.over_cap) == (True, False, True)
+
+    def test_outcome_unknown_cannot_be_set_or_passed(self):
+        err = RemoteError(None, "boom", ("ssh",))
+        with pytest.raises(AttributeError):
+            err.outcome_unknown = True  # type: ignore[misc]  # reason: asserting it is read-only
+        with pytest.raises(TypeError):
+            RemoteError(None, "boom", ("ssh",), outcome_unknown=True)  # type: ignore[call-arg]  # reason: asserting it is never stored
+
+    def test_it_is_a_timeout_only_when_told(self):
+        # rc None alone is ambiguous (spawn failure, over-cap reply, timeout);
+        # the flag is what node_sync reads as "the node did not answer".
+        assert RemoteError(None, "", ()).timed_out is False
+        assert RemoteError(None, "", (), timed_out=True).timed_out is True
 
 
 class TestTheSshResolver:
@@ -263,6 +290,16 @@ class TestRun:
         # carry the filename, so a Windows-only green proves nothing here.
         assert gone not in logged
 
+    def test_a_spawn_failure_never_ran_so_its_outcome_is_known(
+        self, tmp_path, monkeypatch
+    ):
+        # The one rc-None case where a retry of a mutation is safe.
+        gone = str(tmp_path / "no-such-ssh.exe")
+        monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: gone)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["true"], timeout_s=5)
+        assert (exc.value.timed_out, exc.value.outcome_unknown) == (False, False)
+
     def test_an_exact_tmux_target_reaches_bash_quoted(self, fake_ssh):
         # zsh would expand a bare `=api` as a command lookup; inside the
         # single-quoted bash -c payload the login shell never sees it bare.
@@ -308,19 +345,35 @@ class TestRun:
             remote_mux.run(NODE, ["sleep"], timeout_s=1)
         assert exc.value.rc is None
         assert exc.value.timed_out is True
+        # Killing the local ssh does not stop a non-tty remote command.
+        assert exc.value.outcome_unknown is True
         assert time.monotonic() - started < 10
+
+    def test_a_client_that_cannot_be_executed_is_not_a_timeout(self, monkeypatch):
+        def denied(*_a: object, **_k: object) -> object:
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: "ssh")
+        monkeypatch.setattr(remote_mux.subprocess, "Popen", denied)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["true"], timeout_s=5, quiet=True)
+        assert (exc.value.rc, exc.value.stderr_tail) == (None, "Permission denied")
+        assert exc.value.timed_out is False
 
     def test_no_ssh_client_is_rc_127_without_spawning(self):
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["true"], timeout_s=5)
         assert exc.value.rc == 127
         assert exc.value.timed_out is False
+        # Nothing was spawned, so nothing ran: a retry is safe.
+        assert exc.value.outcome_unknown is False
 
     def test_a_failed_command_did_not_time_out(self, fake_ssh):
         fake_ssh.set_reply("false", rc=1)
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["false"], timeout_s=30)
         assert (exc.value.rc, exc.value.timed_out) == (1, False)
+        assert exc.value.outcome_unknown is False
 
     def test_stdin_travels_as_bytes_and_is_named_only_by_its_length(self, fake_ssh):
         fake_ssh.set_reply("cat", rc=1)
@@ -331,6 +384,210 @@ class TestRun:
         assert "ghp_FAKETOKEN" not in str(exc.value)
         assert exc.value.command_redacted[-1] == "<stdin: 13 bytes>"
         assert exc.value.command_redacted[0] == "ssh"
+
+
+@pytest.fixture
+def spawned(monkeypatch):
+    """Every Popen remote_mux makes, kept so a test can ask if it is dead.
+    Wraps whatever Popen is in place (conftest's guard included)."""
+    procs: list[subprocess.Popen[bytes]] = []
+    inner = remote_mux.subprocess.Popen
+
+    def _record(*a, **k):
+        proc = inner(*a, **k)
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(remote_mux.subprocess, "Popen", _record)
+    return procs
+
+
+# Small enough that a test's reply is quick to write, big enough to span many
+# pipe reads.
+CAP = 256 * 1024
+
+# A child that leaves a GRANDCHILD holding its stderr open (inherited; its pid
+# goes to argv[1]), says one line on stderr, then floods stdout. The 90s sleep
+# outlives every bound the call has (timeout_s=60 + two 1s reaps), so the
+# teardown's kill-by-pid always hits the live grandchild, never a pid Windows
+# reused. Not longer: an unbounded-join mutant waits out the whole sleep.
+_HELD_STDERR_CHILD = """\
+import subprocess, sys
+grandchild = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(90)"],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=None,
+)
+with open(sys.argv[1], "w") as f:
+    f.write(str(grandchild.pid))
+sys.stderr.write("boom: disk full\\n")
+sys.stderr.flush()
+block = b"x" * 65536
+while True:
+    sys.stdout.buffer.write(block)
+    sys.stdout.flush()
+"""
+
+
+class TestTheReplyIsBoundedInMemory:
+    def test_every_entry_point_defaults_to_the_module_cap(self):
+        for fn in (remote_mux._spawn, remote_mux.run, remote_mux.run_script):
+            param = inspect.signature(fn).parameters["max_stdout_bytes"]
+            assert param.kind is inspect.Parameter.KEYWORD_ONLY, fn.__name__
+            assert param.default == remote_mux.MAX_REPLY_BYTES, fn.__name__
+        assert remote_mux.MAX_REPLY_BYTES == 64 * 1024 * 1024
+
+    def test_a_pull_reply_may_exceed_its_member_total(self):
+        # Header, meta line, tar headers and padding, and the trailer ride on
+        # top of the members' bytes.
+        assert remote_mux.PULL_MAX_REPLY_BYTES > remote_mux.PULL_MAX_TOTAL_BYTES
+
+    def test_a_reply_over_the_cap_is_a_remote_error_and_the_child_dies(
+        self, fake_ssh, spawned, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        fake_ssh.set_reply("big", stdout="x" * (CAP + 1))
+        started = time.monotonic()
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["big"], timeout_s=30, max_stdout_bytes=CAP)
+        # Under the 30s timeout, with room for a loaded box (a spawn: 8-10s).
+        assert time.monotonic() - started < 25
+        assert exc.value.rc is None
+        # The node ANSWERED (too much), so it is not a silent node -- node_sync
+        # reads timed_out as unreachable -- but the command was killed mid-run
+        # and may still be running there: a mutation must not be retried.
+        assert exc.value.timed_out is False
+        assert exc.value.over_cap is True
+        assert exc.value.outcome_unknown is True
+        assert exc.value.stderr_tail.splitlines()[0] == f"reply exceeded {CAP} bytes"
+        assert exc.value.command_redacted[0] == "ssh"
+        (proc,) = spawned
+        assert proc.poll() is not None
+        (line,) = [r.getMessage() for r in caplog.records if r.name == "magent.nodes"]
+        assert line.startswith(f"node call reply exceeded {CAP} bytes: ssh ")
+
+    def test_a_real_over_cap_error_is_a_failed_node_not_an_unreachable_one(
+        self, fake_ssh
+    ):
+        # node_sync's own pin builds its RemoteError by hand; this one is what
+        # _spawn really raises, so a flag the over-cap raise grows (timed_out)
+        # cannot silently turn an over-cap pull into "unreachable".
+        from magent import node_sync
+
+        fake_ssh.set_reply("big", stdout="x" * (CAP + 1))
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["big"], timeout_s=30, max_stdout_bytes=CAP)
+        assert node_sync._classify(exc.value)[0] == node_sync.FAILED
+
+    def test_a_quiet_call_over_the_cap_logs_nothing(self, fake_ssh, caplog):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        fake_ssh.set_reply("big", stdout="x" * (CAP + 1))
+        with pytest.raises(RemoteError, match="reply exceeded"):
+            remote_mux.run(
+                NODE, ["big"], timeout_s=30, max_stdout_bytes=CAP, quiet=True
+            )
+        assert [r for r in caplog.records if r.name == "magent.nodes"] == []
+
+    def test_a_reply_exactly_at_the_cap_is_returned_intact(self, fake_ssh):
+        body = "".join(chr(ord("a") + i % 26) for i in range(CAP))
+        fake_ssh.set_reply("exact", stdout=body)
+        result = remote_mux.run(NODE, ["exact"], timeout_s=30, max_stdout_bytes=CAP)
+        assert result.returncode == 0
+        assert result.stdout == body.encode("ascii")
+
+    def test_a_child_that_never_exits_is_cut_off_by_the_cap_not_the_timeout(
+        self, fake_ssh, spawned
+    ):
+        fake_ssh.set_mode("flood")
+        started = time.monotonic()
+        with pytest.raises(RemoteError, match=f"reply exceeded {CAP} bytes") as exc:
+            remote_mux.run(NODE, ["flood"], timeout_s=60, max_stdout_bytes=CAP)
+        assert time.monotonic() - started < 15
+        assert exc.value.rc is None
+        (proc,) = spawned
+        assert proc.poll() is not None
+
+    def test_a_large_stdin_and_a_cap_sized_reply_do_not_deadlock(self, fake_ssh):
+        payload = bytes(range(256)) * (4 * 1024 * 1024 // 256)
+        body = "y" * CAP
+        fake_ssh.set_reply("echo", stdout=body)
+        started = time.monotonic()
+        result = remote_mux.run(
+            NODE,
+            ["echo"],
+            timeout_s=30,
+            input_bytes=payload,
+            max_stdout_bytes=CAP,
+        )
+        assert time.monotonic() - started < 15
+        assert result.stdout == body.encode("ascii")
+        (call,) = fake_ssh.calls()
+        assert call.stdin == payload
+
+    def test_the_over_cap_error_keeps_what_the_child_said_on_stderr(self, fake_ssh):
+        # The likely cause of a flood is the child's last words before it.
+        fake_ssh.set_reply("flood", stderr="boom: disk full\n")
+        fake_ssh.set_mode("flood")
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["flood"], timeout_s=60, max_stdout_bytes=CAP)
+        lines = exc.value.stderr_tail.splitlines()
+        assert lines[0] == f"reply exceeded {CAP} bytes"
+        assert "boom: disk full" in lines[1:]
+
+    def test_the_stderr_wait_after_the_cap_is_bounded_by_the_reap(self, tmp_path):
+        # A grandchild still holds stderr, so it never ends: the over-cap path
+        # must give up after the reap bound and raise without the tail, not
+        # wait out the grandchild's 90s.
+        pidfile = tmp_path / "grandchild.pid"
+        started = time.monotonic()
+        try:
+            with pytest.raises(RemoteError) as exc:
+                remote_mux._spawn(
+                    [sys.executable, "-c", _HELD_STDERR_CHILD, str(pidfile)],
+                    timeout_s=60,
+                    input_bytes=None,
+                    check=True,
+                    shown=("child",),
+                    label="test child",
+                    quiet=True,
+                    max_stdout_bytes=CAP,
+                )
+            elapsed = time.monotonic() - started
+        finally:
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(pidfile.read_text(encoding="utf-8")), signal.SIGTERM)
+        assert exc.value.stderr_tail == f"reply exceeded {CAP} bytes"
+        assert elapsed < 20
+
+    def test_the_drain_drops_what_it_held_once_over_the_cap(self):
+        # Two writes, so the first cap's worth is HELD before the byte that
+        # tips it over arrives: a drain that kept its chunks would hand
+        # them back.
+        cap = 1024
+        r, w = os.pipe()
+        drain = remote_mux._Drain(os.fdopen(r, "rb"), cap, tail=False)
+        drain.start()
+        try:
+            os.write(w, b"a" * cap)
+            deadline = time.monotonic() + 5
+            while drain._held < cap and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert drain._held == cap
+            os.write(w, b"b")
+        finally:
+            os.close(w)
+        drain.join(5)
+        assert not drain.is_alive()
+        assert drain.over
+        assert drain.data() == b""
+
+    def test_run_script_hands_its_cap_to_run(self, fake_ssh):
+        fake_ssh.set_reply("bash -s", stdout="x" * (CAP + 1))
+        with pytest.raises(RemoteError, match=f"reply exceeded {CAP} bytes"):
+            remote_mux.run_script(
+                NODE, "sample", [], timeout_s=30, max_stdout_bytes=CAP
+            )
 
 
 class TestTheScriptsShip:
@@ -812,6 +1069,15 @@ class TestSample:
         assert "got b'bash: awk: command not found\\n'" in exc.value.stderr_tail
         # rc 0: the node answered; the answer was malformed.
         assert exc.value.rc == 0
+
+    def test_a_reply_nested_too_deeply_is_a_remote_error_not_a_crash(self, fake_ssh):
+        # json.loads answers deep nesting with RecursionError, not ValueError;
+        # 200k '[' is far inside the reply cap and still the node's bad answer.
+        fake_ssh.set_reply("bash -s", stdout="[" * 200_000)
+        with pytest.raises(RemoteError, match="not a load sample") as exc:
+            remote_mux.sample(NODE)
+        assert exc.value.rc == 0
+        assert isinstance(exc.value.__cause__, RecursionError)
 
     def test_the_head_of_what_came_back_is_bounded(self, fake_ssh):
         fake_ssh.set_reply("bash -s", stdout="x" * 5000)
@@ -2112,13 +2378,21 @@ class TestPushingFilesToARunningProject:
 
 def _fake_git_popen(monkeypatch, *, hang: bool = False) -> list:
     """Every local git child, recorded without running git: argv, env and the
-    timeout ``communicate`` was given. Answers a clean, pushed ``main``."""
+    bound ``_spawn`` waited under (``_finish``'s ``timeout_s``). Answers a
+    clean, pushed ``main`` through real pipes, which ``_spawn``'s drain
+    threads read to EOF; ``hang`` makes the wait run out instead."""
     spawned: list = []
     replies = {
         "remote": b"git@github.com:me/api.git\n",
         "symbolic-ref": b"main\n",
         "rev-list": b"0\n",
     }
+
+    def _pipe(data: bytes):
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, data)
+        os.close(write_fd)
+        return os.fdopen(read_fd, "rb")
 
     class FakeProc:
         def __init__(self, argv, **kwargs):
@@ -2127,13 +2401,10 @@ def _fake_git_popen(monkeypatch, *, hang: bool = False) -> list:
             self.returncode = 0
             self.timeout = None
             self.killed = False
+            self.stdin = None
+            self.stdout = _pipe(replies.get(argv[4], b""))
+            self.stderr = _pipe(b"")
             spawned.append(self)
-
-        def communicate(self, *_args, timeout=None, **_kwargs):
-            self.timeout = timeout
-            if hang:
-                raise subprocess.TimeoutExpired(self.argv, timeout)
-            return replies.get(self.argv[4], b""), b""
 
         def kill(self):
             self.killed = True
@@ -2141,7 +2412,14 @@ def _fake_git_popen(monkeypatch, *, hang: bool = False) -> list:
         def wait(self, timeout=None):
             return 0
 
+    real_finish = remote_mux._finish
+
+    def finish(proc, out, err, timeout_s):
+        proc.timeout = timeout_s
+        return False if hang else real_finish(proc, out, err, timeout_s)
+
     monkeypatch.setattr(remote_mux.subprocess, "Popen", FakeProc)
+    monkeypatch.setattr(remote_mux, "_finish", finish)
     return spawned
 
 
@@ -2193,6 +2471,7 @@ class TestEveryLocalGitReadIsBoundedScrubbedAndLockFree:
         assert exc.value.rc is None
         assert "timed out" in exc.value.stderr_tail
         assert exc.value.timed_out is True
+        assert exc.value.outcome_unknown is True
 
 
 _SSH_SHIM = """#!/bin/sh
