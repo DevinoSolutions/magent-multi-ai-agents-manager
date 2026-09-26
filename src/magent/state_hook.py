@@ -162,3 +162,11 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(payload, dict):
                 handle_claude(payload)
     return 0
+
+
+# The module form (`python -m magent.state_hook --source claude`) is a
+# supported wiring: it survives a pip rollback that deletes the console
+# script. Without this block it imports, writes nothing and exits 0. main()
+# always returns 0, so the status needs no SystemExit (MD001 keeps those in cli/).
+if __name__ == "__main__":
+    main()
