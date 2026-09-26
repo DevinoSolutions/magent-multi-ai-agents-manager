@@ -20,6 +20,7 @@ leaves ``attach_client``, ``log``, ``node_scripts`` and ``nodes``.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import functools
 import gzip
 import hashlib
@@ -691,6 +692,35 @@ def provision(
         for name in sorted(user_scope.mcp_servers)
     )
     return ProvisionReport((*notes, *shipped, *probe_failed, *report.lines))
+
+
+SETUP_TIMEOUT_S = 900.0
+# Each user adds a login, a Claude install and a key to the one root hop.
+SETUP_PER_USER_S = 240.0
+
+
+def setup_node(
+    node: Node,
+    users: Sequence[str],
+    pubkey: str,
+    *,
+    timeout_s: float | None = None,
+) -> ProvisionReport:
+    """Run setup.sh as ``root@<host>`` -- the one root hop. ``users`` are the
+    Unix users to create (argv; setup.sh validates them before it changes
+    anything), ``pubkey`` is this PC's public key (the payload). Each user's
+    node GitHub key comes back as a ``key`` row: ``report.keys()``.
+    ``timeout_s`` defaults to ``SETUP_TIMEOUT_S`` plus ``SETUP_PER_USER_S``
+    per user."""
+    names = list(users)
+    if timeout_s is None:
+        timeout_s = SETUP_TIMEOUT_S + SETUP_PER_USER_S * len(names)
+    root = dataclasses.replace(node, user="root")
+    payload = (pubkey.strip() + "\n").encode("utf-8")
+    result = run_script(
+        root, "setup", names, timeout_s=timeout_s, stdin=payload, check=False
+    )
+    return _report_of(result, "setup", root, args=names, stdin=payload)
 
 
 def has_session(node: Node, sid: str) -> bool | None:

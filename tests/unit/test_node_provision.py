@@ -21,7 +21,7 @@ import pytest
 from magent import cli, node_scripts, nodes, remote_mux
 from magent.cli import hooks_cmd
 from magent.nodes import Node, UserScope
-from magent.remote_mux import RemoteError, ScriptLine
+from magent.remote_mux import ProvisionReport, RemoteError, ScriptLine
 from tests.unit._fake_ssh import FakeSsh, gh_auth_status, make_fake_ssh
 
 
@@ -2113,3 +2113,907 @@ class TestProvisionShText:
             at = lines.index("set -euo pipefail")
             assert lines[at + 1 : at + 4].count("set +o xtrace") == 1, name
             assert lines.index("set +o xtrace") < lines.index("# @include lib.sh")
+
+
+PC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKEPCKEY me@pc"
+# setup.sh's PACKAGES, in its order.
+NODE_PACKAGES = ("tmux", "git", "curl", "python3", "ca-certificates", "openssh-client")
+SETUP_TOOLS = (
+    "bash",
+    "cat",
+    "cut",
+    "awk",
+    "mkdir",
+    "chmod",
+    "head",
+    "tail",
+    "rm",
+    "touch",
+    "tr",
+    "mktemp",
+    "sleep",
+    "timeout",
+)
+
+# Each shim is `#!<bash>` + `STATE=<dir>` + its body. The state directory is
+# the whole fake system: uid, installed packages (each file holds its dpkg
+# status abbreviation, "ii " when empty), users with their uids and homes,
+# the docker group, and logs of what apt-get, curl, chown and runuser were
+# asked. `dpkg -s` answers for any KNOWN package, as the real one does for a
+# package removed with its config files left behind (state `rc`).
+_SHIMS = {
+    "id": """
+case "$1" in -u) cat "$STATE/uid" ;; *) echo "uid=$(cat "$STATE/uid")" ;; esac
+""",
+    "dpkg": """
+case "$1" in
+  -s) [ -e "$STATE/pkgs/$2" ] ;;
+  --print-architecture) echo amd64 ;;
+  *) exit 1 ;;
+esac
+""",
+    "dpkg-query": """
+[ "$1" = -W ] && [ "$2" = '-f=${db:Status-Abbrev}' ] || exit 2
+if ! [ -e "$STATE/pkgs/$3" ]; then
+  echo "dpkg-query: no packages found matching $3" >&2
+  exit 1
+fi
+s=$(cat "$STATE/pkgs/$3")
+printf '%s' "${s:-ii }"
+""",
+    "apt-get": """
+echo "$*" >> "$STATE/apt.log"
+if [ -e "$STATE/apt-fail" ]; then echo "E: Unable to locate package" >&2; exit 100; fi
+if [ "$1" = install ]; then
+  for a in "$@"; do case "$a" in install|-*) ;; *) printf 'ii ' > "$STATE/pkgs/$a" ;; esac; done
+fi
+exit 0
+""",
+    "getent": """
+case "$1" in
+  passwd)
+    [ -e "$STATE/users/$2" ] || exit 2
+    uid=$(cat "$STATE/uids/$2" 2>/dev/null || echo 1000)
+    echo "$2:x:$uid:$uid::$STATE/home/$2:/bin/bash" ;;
+  group)
+    { [ "$2" = docker ] && [ -e "$STATE/groups/docker" ]; } || exit 2
+    echo "docker:x:999:$(awk 'NR>1{printf ","} {printf "%s", $0}' "$STATE/groups/docker")" ;;
+  *) exit 2 ;;
+esac
+""",
+    "useradd": """
+for u; do :; done
+if [ -e "$STATE/useradd-fail" ]; then echo "useradd: cannot lock /etc/passwd" >&2; exit 1; fi
+mkdir -p "$STATE/home/$u" && touch "$STATE/users/$u"
+""",
+    "usermod": """
+for u; do :; done
+echo "$u" >> "$STATE/groups/docker"
+""",
+    "chown": 'echo "$*" >> "$STATE/chown.log"\n',
+    "runuser": """
+cmd=""; user=""; shown=""
+for a in "$@"; do
+  case "$a" in
+    --command=*) cmd=${a#--command=} ;;
+    --login|-l|--shell=*) shown="$shown $a" ;;
+    *) user=$a; shown="$shown $a" ;;
+  esac
+done
+echo "${shown# }" >> "$STATE/runuser.log"
+cd "$STATE/home/$user" || exit 1
+# A login shell sources the user's profile first: the user's own code.
+HOME="$STATE/home/$user" USER="$user" \\
+  exec bash -c '[ ! -f .profile ] || . ./.profile; eval "$1"' bash "$cmd"
+""",
+    "curl": """
+echo "$*" >> "$STATE/curl.log"
+if [ -e "$STATE/curl-fail" ]; then echo "curl: (6) Could not resolve host" >&2; exit 6; fi
+out=/dev/stdout; prev=""
+for a in "$@"; do [ "$prev" = -o ] && out=$a; prev=$a; done
+case "$*" in *https://claude.ai/install.sh*) ;; *) exit 22 ;; esac
+cat > "$out" <<'EOF'
+mkdir -p "$HOME/.local/bin"
+printf '#!/bin/sh\\n[ ! -e "$HOME/claude-hangs" ] || exec sleep 30\\necho "2.1.280 (Claude Code)"\\n' > "$HOME/.local/bin/claude"
+chmod +x "$HOME/.local/bin/claude"
+EOF
+""",
+    "ssh-keygen": """
+f=""; c=""; y=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in -f) f=$2; shift ;; -C) c=$2; shift ;; -y) y=1 ;; esac
+  shift
+done
+if [ -n "$y" ]; then
+  if [ -e "$STATE/keygen-y-fail" ]; then echo "Load key \\"$f\\": invalid format" >&2; exit 255; fi
+  printf 'ssh-ed25519 AAAAFAKENODEKEY %s\\n' "$(cut -d' ' -f4- "$f")"
+  exit 0
+fi
+if [ -e "$f" ]; then echo "$f already exists. Overwrite (y/n)?" >&2; exit 1; fi
+printf 'FAKE PRIVATE KEY %s\\n' "$c" > "$f"
+printf 'ssh-ed25519 AAAAFAKENODEKEY %s\\n' "$c" > "$f.pub"
+""",
+    "hostname": "echo devino-second\n",
+    # gh-hangs: a gh that ignores TERM too, so only timeout's KILL ends it.
+    "gh": """
+[ ! -e "$STATE/gh-hangs" ] || { trap '' TERM; sleep 30; }
+echo "gh version 2.88.1 (2026-09-01)"
+""",
+    "tmux": """
+case "$1" in -V) cat "$STATE/tmux-V" 2>/dev/null || echo "tmux 3.4" ;; *) exit 1 ;; esac
+""",
+}
+
+
+def _setup_box(
+    tmp_path: Path, *, docker: bool = True, without: tuple[str, ...] = ()
+) -> tuple[Path, dict[str, str]]:
+    """A fake root's system under tmp_path/state, and the env setup.sh runs in.
+    ``without`` names shims or tools left out: that program is not installed."""
+    state = tmp_path / "state"
+    for sub in ("pkgs", "users", "uids", "home", "groups", "root", "tmp"):
+        (state / sub).mkdir(parents=True, exist_ok=True)
+    (state / "uid").write_text("0\n", encoding="utf-8")
+    if docker:
+        (state / "groups" / "docker").touch()
+    shims = tmp_path / "shims"
+    shims.mkdir(exist_ok=True)
+    for name, body in _SHIMS.items():
+        if name in without:
+            continue
+        shim = shims / name
+        shim.write_text(
+            f"#!{BASH}\nSTATE={shlex.quote(str(state))}\n{body}",
+            encoding="utf-8",
+            newline="\n",
+        )
+        shim.chmod(0o755)
+    tools = tuple(t for t in SETUP_TOOLS if t not in without)
+    sysbin = _sysbin(tmp_path, tools, python=False, name="setupbin")
+    env = {
+        "HOME": str(state / "root"),
+        "PATH": os.pathsep.join([str(shims), str(sysbin)]),
+        "TMPDIR": str(state / "tmp"),
+    }
+    return state, env
+
+
+# Debian's own values; a test never reads the real /etc/login.defs.
+LOGIN_DEFS = "UID_MIN 1000\nUID_MAX 60000\n"
+
+
+def _run_setup(
+    env: dict[str, str],
+    users: tuple[str, ...] = ("amin",),
+    payload: str = PC_KEY + "\n",
+    *,
+    login_defs: str | None = LOGIN_DEFS,
+) -> subprocess.CompletedProcess[bytes]:
+    """``login_defs`` is the fake box's /etc/login.defs; None = no such file."""
+    defs = Path(env["HOME"]).parent / "login.defs"
+    if login_defs is not None:
+        defs.write_text(login_defs, encoding="utf-8")
+    script = node_scripts.script("setup")
+    assert "/etc/login.defs" in script
+    script = script.replace("/etc/login.defs", shlex.quote(str(defs)))
+    return subprocess.run(
+        _bash_argv(*users),
+        input=remote_mux._frame_script(script, payload.encode("utf-8")),
+        capture_output=True,
+        env=env,
+        timeout=120,
+        check=False,
+    )
+
+
+def _report(result: subprocess.CompletedProcess[bytes]) -> ProvisionReport:
+    return remote_mux.parse_report(result.stdout.decode("utf-8"))
+
+
+def _existing_user(state: Path, name: str, *, uid: int | None = None) -> Path:
+    """An account already on the fake box; its home is returned."""
+    (state / "users" / name).touch()
+    if uid is not None:
+        (state / "uids" / name).write_text(f"{uid}\n", encoding="utf-8")
+    home = state / "home" / name
+    home.mkdir(parents=True, exist_ok=True)
+    return home
+
+
+@POSIX_BASH
+class TestSetupShUnderRealBash:
+    def test_a_fresh_node_gets_everything_and_reports_each_users_key(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        r = _run_setup(env, ("amin", "bob"))
+        assert r.returncode == 0, r.stderr
+        per_user = {
+            f"{step}:{u}": "did"
+            for u in ("amin", "bob")
+            for step in ("user", "authorized_keys", "docker", "claude", "node-key")
+        }
+        assert _rows(r) == {
+            "packages": "did",
+            "tmux": "ok",
+            "gh": "skip",
+            **per_user,
+            "amin": "key",
+            "bob": "key",
+        }
+        assert _report(r).keys() == dict.fromkeys(
+            ("amin", "bob"), "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+        )
+        assert (state / "home" / "bob" / ".local" / "bin" / "claude").is_file()
+        assert "https://claude.ai/install.sh" in (state / "curl.log").read_text("utf-8")
+
+    def test_a_second_run_only_skips_and_still_reports_the_keys(self, tmp_path):
+        _, env = _setup_box(tmp_path)
+        _run_setup(env, ("amin", "bob"))
+        r = _run_setup(env, ("amin", "bob"))
+        assert r.returncode == 0, r.stderr
+        rows = _rows(r)
+        # The tmux floor is a check, not a change: it answers ok every run.
+        assert rows.pop("tmux") == "ok"
+        assert set(rows.values()) == {"skip", "key"}
+        assert set(_report(r).keys()) == {"amin", "bob"}
+
+    @pytest.mark.parametrize(
+        ("version", "status"),
+        [
+            ("tmux 3.0a", "fail"),  # Ubuntu 20.04's
+            ("tmux 3.1c", "fail"),
+            ("tmux 3.2a", "ok"),  # Ubuntu 22.04's: the floor itself
+            ("tmux 4.0", "ok"),
+            ("tmux next-3.5", "ok"),
+            ("tmux master", "fail"),  # unreadable, exactly as D's need_tmux
+        ],
+    )
+    def test_tmux_is_held_to_the_bring_up_floor(self, tmp_path, version, status):
+        state, env = _setup_box(tmp_path)
+        (state / "tmux-V").write_text(version + "\n", encoding="utf-8")
+        r = _run_setup(env)
+        assert _rows(r)["tmux"] == status
+        assert r.returncode == (0 if status == "ok" else 1)
+
+    def test_an_old_tmux_is_refused_with_its_version_and_the_floor(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        (state / "tmux-V").write_text("tmux 3.0a\n", encoding="utf-8")
+        (row,) = [
+            line for line in _report(_run_setup(env)).lines if line.item == "tmux"
+        ]
+        assert row.status == "fail"
+        assert "tmux 3.0a" in row.detail
+        assert "3.2 or newer" in row.detail
+
+    def test_the_pc_key_is_authorized_once_with_private_modes(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        _run_setup(env)
+        ssh_dir = state / "home" / "amin" / ".ssh"
+        authorized = ssh_dir / "authorized_keys"
+        assert authorized.read_text("utf-8").splitlines().count(PC_KEY) == 1
+        assert ssh_dir.stat().st_mode & 0o777 == 0o700
+        assert authorized.stat().st_mode & 0o777 == 0o600
+
+    def test_an_existing_key_file_without_a_final_newline_is_not_glued(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        authorized = state / "home" / "amin" / ".ssh" / "authorized_keys"
+        authorized.write_text("ssh-ed25519 AAAAOTHER other@box", encoding="utf-8")
+        _run_setup(env)
+        assert authorized.read_text("utf-8").splitlines() == [
+            "ssh-ed25519 AAAAOTHER other@box",
+            PC_KEY,
+        ]
+
+    def test_no_docker_group_is_a_skip(self, tmp_path):
+        _, env = _setup_box(tmp_path, docker=False)
+        assert _rows(_run_setup(env))["docker:amin"] == "skip"
+
+    def test_a_bad_user_name_is_refused_before_anything_changes(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        r = _run_setup(env, ("amin", "Bob;rm"))
+        assert r.returncode == 2
+        assert _rows(r) == {"setup": "fail"}
+        assert list((state / "users").iterdir()) == []
+        assert not (state / "apt.log").exists()
+
+    def test_not_root_is_one_fail_row(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        (state / "uid").write_text("1000\n", encoding="utf-8")
+        r = _run_setup(env)
+        assert r.returncode == 1
+        assert _rows(r) == {"setup": "fail"}
+        assert not (state / "apt.log").exists()
+
+    def test_a_private_key_payload_is_refused_and_never_echoed(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        secret = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ"
+        r = _run_setup(
+            env,
+            payload=(
+                "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+                f"{secret}\n"
+                "-----END OPENSSH PRIVATE KEY-----\n"
+            ),
+        )
+        assert r.returncode == 2
+        assert _rows(r) == {"key": "fail"}
+        assert secret.encode("ascii") not in r.stdout + r.stderr
+        assert list((state / "users").iterdir()) == []
+
+    def test_an_apt_failure_fails_its_row_and_the_users_still_get_keys(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        (state / "apt-fail").touch()
+        r = _run_setup(env)
+        assert r.returncode == 1
+        rows = _rows(r)
+        assert rows["packages"] == "fail"
+        assert rows["user:amin"] == "did"
+        assert set(_report(r).keys()) == {"amin"}
+
+    # -- review pins (cq-F13) ------------------------------------------------
+
+    def test_root_never_writes_under_a_users_home(self, tmp_path):
+        # C1: authorized_keys is written by the user phase, as the user. The
+        # root side never chowns ~/.ssh because it never created it.
+        state, env = _setup_box(tmp_path)
+        r = _run_setup(env)
+        assert r.returncode == 0, r.stderr
+        assert not (state / "chown.log").exists()
+        authorized = state / "home" / "amin" / ".ssh" / "authorized_keys"
+        assert authorized.read_text("utf-8").splitlines() == [PC_KEY]
+
+    def test_a_symlinked_authorized_keys_never_reaches_its_target(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        victim = tmp_path / "victim"
+        victim.write_bytes(b"root:x:0:0:root:/root:/bin/bash\n")
+        victim.chmod(0o644)
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        (ssh_dir / "authorized_keys").symlink_to(victim)
+        r = _run_setup(env)
+        assert victim.read_bytes() == b"root:x:0:0:root:/root:/bin/bash\n"
+        assert victim.stat().st_mode & 0o777 == 0o644
+        assert _rows(r)["authorized_keys:amin"] == "fail"
+        assert r.returncode == 1
+
+    def test_a_symlinked_ssh_dir_never_reaches_its_target(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        victim = tmp_path / "victim-dir"
+        victim.mkdir()
+        (victim / "keep").write_bytes(b"x\n")
+        victim.chmod(0o755)
+        (_existing_user(state, "amin") / ".ssh").symlink_to(victim)
+        r = _run_setup(env)
+        assert [p.name for p in victim.iterdir()] == ["keep"]
+        assert (victim / "keep").read_bytes() == b"x\n"
+        assert victim.stat().st_mode & 0o777 == 0o755
+        rows = _rows(r)
+        assert rows["authorized_keys:amin"] == "fail"
+        assert rows["node-key:amin"] == "fail"
+        assert set(_report(r).keys()) == set()
+        assert r.returncode == 1
+
+    def test_an_unwritable_authorized_keys_is_a_fail_row(self, tmp_path):
+        # I1: a failed write is `fail`, never `did` -- main's `step || rc=1`
+        # switches set -e off inside every step.
+        state, env = _setup_box(tmp_path)
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        (ssh_dir / "authorized_keys").mkdir(parents=True)
+        r = _run_setup(env)
+        assert _rows(r)["authorized_keys:amin"] == "fail"
+        assert r.returncode != 0
+
+    def test_a_key_comment_is_data_not_code(self, tmp_path):
+        # The key crosses into the user phase as one %q-quoted word.
+        state, env = _setup_box(tmp_path)
+        key = PC_KEY + " it's $(touch pwned) `touch pwned2`"
+        r = _run_setup(env, payload=key + "\n")
+        assert r.returncode == 0, r.stderr
+        authorized = state / "home" / "amin" / ".ssh" / "authorized_keys"
+        assert authorized.read_text("utf-8").splitlines() == [key]
+        assert not list(tmp_path.rglob("pwned*"))
+
+    @pytest.mark.parametrize("user", ["root", "daemon"])
+    def test_root_and_system_accounts_are_refused_before_anything_changes(
+        self, tmp_path, user
+    ):
+        # I2: an existing account below UID_MIN (and root, always) is not a
+        # person's node user; nothing is created for the valid name before it.
+        state, env = _setup_box(tmp_path)
+        if user != "root":
+            _existing_user(state, user, uid=1)
+        users_before = sorted(p.name for p in (state / "users").iterdir())
+        r = _run_setup(env, ("amin", user))
+        assert r.returncode == 2
+        assert _rows(r) == {"setup": "fail"}
+        assert sorted(p.name for p in (state / "users").iterdir()) == users_before
+        assert not (state / "apt.log").exists()
+
+    @pytest.mark.parametrize("status", [None, "rc "])
+    def test_openssh_client_is_installed_like_every_other_package(
+        self, tmp_path, status
+    ):
+        # setup runs ssh-keygen; a minimal image may ship without it.
+        state, env = _setup_box(tmp_path)
+        for pkg in NODE_PACKAGES:
+            (state / "pkgs" / pkg).write_text("ii ", encoding="utf-8")
+        if status is None:
+            (state / "pkgs" / "openssh-client").unlink()
+        else:
+            (state / "pkgs" / "openssh-client").write_text(status, encoding="utf-8")
+        r = _run_setup(env)
+        assert _rows(r)["packages"] == "did"
+        assert (state / "apt.log").read_text("utf-8").splitlines()[-1] == (
+            "install -y -qq openssh-client"
+        )
+
+    def test_a_missing_ssh_keygen_is_a_named_fail_row(self, tmp_path):
+        _, env = _setup_box(tmp_path, without=("ssh-keygen",))
+        r = _run_setup(env)
+        assert r.returncode == 1
+        (row,) = [line for line in _report(r).lines if line.item == "node-key:amin"]
+        assert row.status == "fail"
+        assert "ssh-keygen" in row.detail
+        assert "openssh-client" in row.detail
+        assert set(_report(r).keys()) == set()
+
+    @pytest.mark.parametrize("user", ["nobody", "nfsnobody"])
+    def test_the_overflow_account_is_refused(self, tmp_path, user):
+        # uid 65534 is the kernel's overflow id, not a person -- whatever UID_MAX
+        # says about the accounts above it.
+        state, env = _setup_box(tmp_path)
+        _existing_user(state, user, uid=65534)
+        r = _run_setup(env, ("amin", user))
+        assert r.returncode == 2
+        assert _rows(r) == {"setup": "fail"}
+        assert b"65534" in r.stdout
+        assert sorted(p.name for p in (state / "users").iterdir()) == [user]
+        assert not (state / "apt.log").exists()
+
+    @pytest.mark.parametrize(
+        ("login_defs", "uid"),
+        [
+            ("UID_MIN 1000\nUID_MAX 5000\n", 5001),
+            ("UID_MIN 1000\n", 60001),  # no UID_MAX: useradd's own default
+            (None, 60001),  # no login.defs at all
+            ("UID_MIN 1000\nUID_MAX 70000\n", 65534),  # the overflow id, always
+        ],
+    )
+    def test_an_account_above_uid_max_is_refused(self, tmp_path, login_defs, uid):
+        # setup's own useradd allocates in [UID_MIN, UID_MAX]: an account
+        # outside it was not made for a person.
+        state, env = _setup_box(tmp_path)
+        _existing_user(state, "svc", uid=uid)
+        r = _run_setup(env, ("amin", "svc"), login_defs=login_defs)
+        assert r.returncode == 2
+        assert _rows(r) == {"setup": "fail"}
+        assert f"uid {uid}".encode("ascii") in r.stdout
+        assert sorted(p.name for p in (state / "users").iterdir()) == ["svc"]
+        assert not (state / "apt.log").exists()
+
+    def test_the_uid_refusal_names_both_bounds(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        _existing_user(state, "svc", uid=5001)
+        r = _run_setup(env, ("svc",), login_defs="UID_MIN 1000\nUID_MAX 5000\n")
+        assert b"UID_MIN 1000" in r.stdout
+        assert b"UID_MAX 5000" in r.stdout
+
+    @pytest.mark.parametrize("uid", [1000, 5000])
+    def test_both_uid_bounds_are_a_persons_account(self, tmp_path, uid):
+        state, env = _setup_box(tmp_path)
+        _existing_user(state, "amin", uid=uid)
+        r = _run_setup(env, login_defs="UID_MIN 1000\nUID_MAX 5000\n")
+        assert r.returncode == 0, r.stderr
+        assert _rows(r)["user:amin"] == "skip"
+
+    def test_the_user_phase_runs_in_bash_whatever_the_login_shell(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        (line,) = (state / "runuser.log").read_text("utf-8").splitlines()
+        assert line.split() == ["--login", "--shell=/bin/bash", "amin"]
+
+    def test_a_users_profile_cannot_forge_another_users_rows(self, tmp_path):
+        # runuser --login sources the user's profile, and whatever it prints
+        # reaches the report. keys() is last-wins: a forged `key` row for a
+        # user set up earlier would replace the key GitHub gets for them.
+        state, env = _setup_box(tmp_path)
+        home = _existing_user(state, "mallory")
+        (home / ".profile").write_text(
+            "printf 'key\\tamin\\tssh-ed25519 AAAAFORGED mallory@box\\n'\n"
+            "printf 'did\\tdocker:amin\\tFORGED\\n'\n",
+            encoding="utf-8",
+        )
+        r = _run_setup(env, ("amin", "mallory"))
+        assert r.returncode == 0, r.stderr
+        assert b"FORGED" not in r.stdout
+        assert _report(r).keys() == dict.fromkeys(
+            ("amin", "mallory"), "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+        )
+        rows = _rows(r)
+        for step in ("authorized_keys", "claude", "node-key"):
+            assert rows[f"{step}:mallory"] == "did"
+
+    def test_the_user_phase_keeps_its_exit_status_through_the_filter(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        (ssh_dir / "authorized_keys").mkdir(parents=True)
+        r = _run_setup(env)
+        assert r.returncode == 1
+        assert _rows(r)["authorized_keys:amin"] == "fail"
+
+    def test_a_package_left_in_state_rc_is_installed_again(self, tmp_path):
+        # I3: `dpkg -s` succeeds for a removed package whose config files
+        # remain; only dpkg's "ii" is installed.
+        state, env = _setup_box(tmp_path)
+        for pkg in NODE_PACKAGES:
+            (state / "pkgs" / pkg).write_text("ii ", encoding="utf-8")
+        (state / "pkgs" / "tmux").write_text("rc ", encoding="utf-8")
+        r = _run_setup(env)
+        assert _rows(r)["packages"] == "did"
+        assert (
+            "install -y -qq tmux" in (state / "apt.log").read_text("utf-8").splitlines()
+        )
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["amin;rm", "Bob", "a" * 33, "-rf", "amin\nroot", "", "amin rm", "amin$(id)"],
+    )
+    def test_a_bad_user_name_is_one_row_and_nothing_changes(self, tmp_path, bad):
+        state, env = _setup_box(tmp_path)
+        r = _run_setup(env, ("amin", bad))
+        assert r.returncode == 2
+        assert _rows(r) == {"setup": "fail"}
+        # The name is %q-quoted: a newline in it cannot forge a second row.
+        assert len(r.stdout.splitlines()) == 1
+        assert list((state / "users").iterdir()) == []
+        assert not (state / "apt.log").exists()
+
+    def test_a_32_character_name_is_the_longest_accepted(self, tmp_path):
+        _, env = _setup_box(tmp_path)
+        r = _run_setup(env, ("a" * 32,))
+        assert r.returncode == 0, r.stderr
+        assert _rows(r)["user:" + "a" * 32] == "did"
+
+    def test_a_failed_useradd_skips_that_users_other_steps(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        (state / "useradd-fail").touch()
+        r = _run_setup(env)
+        assert r.returncode == 1
+        rows = _rows(r)
+        assert rows["user:amin"] == "fail"
+        assert not {k for k in rows if k.endswith(":amin") and k != "user:amin"}
+        assert "amin" not in rows
+
+    def test_a_commented_or_longer_key_is_not_this_pcs_key(self, tmp_path):
+        # M1: whole fields, on a line that is not a comment.
+        state, env = _setup_box(tmp_path)
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        authorized = ssh_dir / "authorized_keys"
+        blob = PC_KEY.split()[1]
+        others = ["# " + PC_KEY, f"ssh-ed25519 {blob}X longer@box"]
+        authorized.write_text("\n".join(others) + "\n", encoding="utf-8")
+        r = _run_setup(env)
+        assert _rows(r)["authorized_keys:amin"] == "did"
+        assert authorized.read_text("utf-8").splitlines() == [*others, PC_KEY]
+
+    def test_a_key_behind_options_is_already_authorized(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        (ssh_dir / "authorized_keys").write_text(
+            f'no-pty,from="10.0.0.1" {PC_KEY}\n', encoding="utf-8"
+        )
+        assert _rows(_run_setup(env))["authorized_keys:amin"] == "skip"
+
+    def test_the_installer_is_downloaded_whole_then_run(self, tmp_path):
+        # M2: never `curl | bash` (a cut connection hands bash half a
+        # script), and the download does not outlive the run.
+        state, env = _setup_box(tmp_path)
+        r = _run_setup(env)
+        assert r.returncode == 0, r.stderr
+        (call,) = (state / "curl.log").read_text("utf-8").splitlines()
+        assert " -o " in f" {call} "
+        assert list((state / "tmp").iterdir()) == []
+
+    def test_a_private_key_without_its_pub_gets_the_pub_back(self, tmp_path):
+        # M7: the node key is never regenerated (GitHub may already hold it);
+        # a lost .pub is derived again from the private key.
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        ssh_dir = state / "home" / "amin" / ".ssh"
+        private = (ssh_dir / "id_ed25519").read_bytes()
+        (ssh_dir / "id_ed25519.pub").unlink()
+        r = _run_setup(env)
+        assert r.returncode == 0, r.stderr
+        assert _rows(r)["node-key:amin"] == "did"
+        assert (ssh_dir / "id_ed25519").read_bytes() == private
+        assert _report(r).keys() == {
+            "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+        }
+
+    # -- mutation killers (cq-F13) --------------------------------------------
+
+    def test_a_failed_installer_download_fails_claude_and_keeps_the_key(self, tmp_path):
+        # T28
+        state, env = _setup_box(tmp_path)
+        (state / "curl-fail").touch()
+        r = _run_setup(env)
+        assert r.returncode == 1
+        assert _rows(r)["claude:amin"] == "fail"
+        assert _report(r).keys() == {
+            "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+        }
+        assert list((state / "tmp").iterdir()) == []
+
+    def test_an_open_ssh_dir_and_key_file_are_made_private(self, tmp_path):
+        # T14/T15: the umask alone makes a NEW dir and file private; these
+        # already exist with open modes.
+        state, env = _setup_box(tmp_path)
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir()
+        ssh_dir.chmod(0o755)
+        authorized = ssh_dir / "authorized_keys"
+        authorized.write_text("ssh-ed25519 AAAAOTHER other@box\n", encoding="utf-8")
+        authorized.chmod(0o644)
+        r = _run_setup(env)
+        assert _rows(r)["authorized_keys:amin"] == "did"
+        assert ssh_dir.stat().st_mode & 0o777 == 0o700
+        assert authorized.stat().st_mode & 0o777 == 0o600
+
+    def test_a_bare_key_line_without_a_comment_is_already_authorized(self, tmp_path):
+        # T12
+        state, env = _setup_box(tmp_path)
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        authorized = ssh_dir / "authorized_keys"
+        bare = " ".join(PC_KEY.split()[:2]) + "\n"
+        authorized.write_text(bare, encoding="utf-8")
+        r = _run_setup(env)
+        assert _rows(r)["authorized_keys:amin"] == "skip"
+        assert authorized.read_text("utf-8") == bare
+
+    def test_an_unreadable_private_key_leaves_no_pub(self, tmp_path):
+        # T22: `> id.pub` creates the file before ssh-keygen -y runs; a
+        # failed derivation must not leave it behind, empty.
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        ssh_dir = state / "home" / "amin" / ".ssh"
+        (ssh_dir / "id_ed25519.pub").unlink()
+        (state / "keygen-y-fail").touch()
+        r = _run_setup(env)
+        assert r.returncode == 1
+        assert _rows(r)["node-key:amin"] == "fail"
+        assert not (ssh_dir / "id_ed25519.pub").exists()
+        assert set(_report(r).keys()) == set()
+
+    # -- bounded version probes (impl-F14) -------------------------------------
+
+    @staticmethod
+    def _row(r: subprocess.CompletedProcess[bytes], item: str) -> tuple[str, str]:
+        (line,) = [line for line in _report(r).lines if line.item == item]
+        return line.status, line.detail
+
+    def test_a_hung_gh_is_its_own_fail_row_and_setup_goes_on(self, tmp_path):
+        # This gh ignores TERM too: timeout's KILL (137) is what ends it.
+        state, env = _setup_box(tmp_path)
+        (state / "gh-hangs").touch()
+        started = time.monotonic()
+        r = _run_setup(env)
+        assert time.monotonic() - started < 25
+        assert r.returncode == 1
+        assert self._row(r, "gh") == ("fail", "gh --version timed out after 4s")
+        assert set(_report(r).keys()) == {"amin"}
+
+    def test_a_hung_claude_is_its_own_fail_row_and_the_key_still_comes(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        (state / "home" / "amin" / "claude-hangs").touch()
+        started = time.monotonic()
+        r = _run_setup(env)
+        assert time.monotonic() - started < 25
+        assert r.returncode == 1
+        assert self._row(r, "claude:amin") == (
+            "fail",
+            "claude --version timed out after 4s",
+        )
+        assert set(_report(r).keys()) == {"amin"}
+
+    def test_a_claude_that_hangs_right_after_its_install_is_a_fail_row(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        (_existing_user(state, "amin") / "claude-hangs").touch()
+        started = time.monotonic()
+        r = _run_setup(env)
+        assert time.monotonic() - started < 25
+        assert r.returncode == 1
+        assert self._row(r, "claude:amin") == (
+            "fail",
+            "claude --version timed out after 4s",
+        )
+
+    def test_no_timeout_on_path_is_one_row_and_nothing_is_probed(self, tmp_path):
+        state, env = _setup_box(tmp_path, without=("timeout",))
+        r = _run_setup(env)
+        assert r.returncode == 1
+        assert [(line.status, line.item, line.detail) for line in _report(r).lines] == [
+            (
+                "fail",
+                "setup",
+                "timeout is not on PATH -- every probe runs under it; install coreutils on this node",
+            )
+        ]
+        assert not (state / "apt.log").exists()
+        assert list((state / "users").iterdir()) == []
+
+    # -- killers from cq-F13 rounds 3 and 4 ------------------------------------
+
+    def test_a_user_whose_name_ends_anothers_cannot_forge_its_rows(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        home = _existing_user(state, "min")
+        (home / ".profile").write_text(
+            "printf 'did\\tdocker:amin\\tFORGED\\n'\n", encoding="utf-8"
+        )
+        r = _run_setup(env, ("amin", "min"))
+        assert r.returncode == 0, r.stderr
+        assert b"FORGED" not in r.stdout
+
+    def test_a_failed_row_filter_fails_the_run(self, tmp_path):
+        _, env = _setup_box(tmp_path)
+        shims, sysbin = env["PATH"].split(os.pathsep)[:2]
+        awk = os.path.join(shims, "awk")
+        with open(awk, "w", encoding="utf-8", newline="\n") as f:
+            f.write(
+                f"#!{BASH}\n"
+                'for a; do [ "$a" != u=amin ] || { cat >/dev/null; exit 2; }; done\n'
+                f'exec {shlex.quote(os.path.join(sysbin, "awk"))} "$@"\n'
+            )
+        os.chmod(awk, 0o755)
+        r = _run_setup(env)
+        assert r.returncode == 1
+        assert _rows(r)["docker:amin"] == "did"
+
+    def test_a_two_line_version_is_its_first_line_only(self, tmp_path):
+        # The real `gh --version` prints two lines (version, then release URL).
+        _, env = _setup_box(tmp_path)
+        gh = Path(env["PATH"].split(os.pathsep)[0]) / "gh"
+        gh.write_text(
+            f"#!{BASH}\n"
+            "printf 'gh version 2.88.1 (2026-09-01)\\n"
+            "https://github.com/cli/cli/releases/tag/v2.88.1\\n'\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r = _run_setup(env)
+        assert r.returncode == 0, r.stderr
+        (row,) = [line for line in _report(r).lines if line.item == "gh"]
+        assert (row.status, row.detail) == ("skip", "gh version 2.88.1 (2026-09-01)")
+        assert b"releases/tag" not in r.stdout
+
+    def test_a_leading_zero_minor_is_decimal(self, tmp_path):
+        # `3.08` would be an octal error in a bare (( )) -- the floor reads
+        # it as 8.
+        state, env = _setup_box(tmp_path)
+        (state / "tmux-V").write_text("tmux 3.08\n", encoding="utf-8")
+        r = _run_setup(env)
+        assert _rows(r)["tmux"] == "ok"
+        assert b"value too great" not in r.stderr
+
+
+class TestTheTmuxFloor:
+    def test_it_is_include_only(self):
+        # Like lib.sh: a `main` in it would run before the including script's.
+        floor = node_scripts.script("tmux_floor")
+        assert "main" not in floor
+        assert "magent_tmux_verdict()" in floor
+
+    def test_it_is_not_a_run_script_entry_point(self):
+        # B's convention: a sourced library never receives the socket as $1,
+        # so it is listed, and run_script refuses it before any ssh.
+        assert "tmux_floor.sh" in node_scripts.NON_ENTRY_SCRIPTS
+
+    def test_setup_inlines_it(self):
+        assert "magent_tmux_verdict()" in node_scripts.script("setup")
+
+
+class TestSetupNode:
+    def test_it_connects_as_root_for_this_one_hop(self, fake_ssh):
+        remote_mux.setup_node(
+            NODE, ["amin"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+        )
+        (call,) = fake_ssh.calls()
+        assert "root@devino-second" in call.argv
+        assert "amin@devino-second" not in call.argv
+
+    def test_the_users_are_argv_and_the_key_is_the_payload(self, fake_ssh):
+        remote_mux.setup_node(
+            NODE, ["amin", "bob"], PC_KEY + "\n\n", timeout_s=remote_mux.SETUP_TIMEOUT_S
+        )
+        (call,) = fake_ssh.calls()
+        assert call.argv[-1] == _remote(
+            "bash", "-s", "--", remote_mux.SOCKET, "amin", "bob"
+        )
+        assert _sent(call) == (PC_KEY + "\n").encode("ascii")
+
+    def test_the_node_keys_come_back_in_the_report(self, fake_ssh):
+        fake_ssh.set_reply(
+            "bash -s",
+            stdout="did\tuser:amin\tcreated\nkey\tamin\tssh-ed25519 AAAAN magent@devino-second\n",
+        )
+        report = remote_mux.setup_node(
+            NODE, ["amin"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+        )
+        assert report.keys() == {"amin": "ssh-ed25519 AAAAN magent@devino-second"}
+
+    def test_an_unreachable_root_login_raises(self, fake_ssh):
+        fake_ssh.set_reply(
+            "bash -s", stderr="root@devino-second: Permission denied\n", rc=255
+        )
+        with pytest.raises(RemoteError):
+            remote_mux.setup_node(
+                NODE, ["amin"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+            )
+
+    def test_a_transport_failure_names_the_users_and_never_the_key(self, fake_ssh):
+        fake_ssh.set_reply(
+            "bash -s", stderr="root@devino-second: Permission denied\n", rc=255
+        )
+        with pytest.raises(RemoteError) as info:
+            remote_mux.setup_node(
+                NODE, ["amin", "bob"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+            )
+        (call,) = fake_ssh.calls()
+        shown = info.value.command_redacted
+        assert shown[:-1] == ("ssh", *call.argv)
+        assert shown[-2] == _remote(
+            "bash", "-s", "--", remote_mux.SOCKET, "amin", "bob"
+        )
+        assert shown[-1] == f"<stdin: {len(call.stdin)} bytes>"
+        assert PC_KEY.split()[1] not in str(info.value)
+
+    def test_a_failed_step_still_returns_every_row_and_key(self, fake_ssh):
+        # P1: rc 1 is setup.sh reporting a failed step, not a lost call.
+        fake_ssh.set_reply(
+            "bash -s",
+            stdout=(
+                "did\tuser:amin\tcreated\n"
+                "fail\tclaude:amin\tthe Claude installer did not put claude on PATH\n"
+                "key\tamin\tssh-ed25519 AAAAN magent@devino-second\n"
+            ),
+            rc=1,
+        )
+        report = remote_mux.setup_node(
+            NODE, ["amin"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+        )
+        assert report.failed
+        assert report.keys() == {"amin": "ssh-ed25519 AAAAN magent@devino-second"}
+        assert ScriptLine("did", "user:amin", "created") in report.lines
+
+    def test_an_unreachable_root_login_names_root(self, fake_ssh):
+        # P2: the error says who magent tried to be.
+        fake_ssh.set_reply(
+            "bash -s", stderr="root@devino-second: Permission denied\n", rc=255
+        )
+        with pytest.raises(RemoteError) as info:
+            remote_mux.setup_node(
+                NODE, ["amin"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+            )
+        assert "root@devino-second" in info.value.command_redacted
+
+    def test_the_default_timeout_grows_with_the_users(self, monkeypatch):
+        # M5: every user is a login, an installer and a key.
+        seen: list[float] = []
+
+        def spy(
+            *_args: object, timeout_s: float, **_kwargs: object
+        ) -> subprocess.CompletedProcess[bytes]:
+            seen.append(timeout_s)
+            return subprocess.CompletedProcess(["ssh"], 0, b"", b"")
+
+        monkeypatch.setattr(remote_mux, "run_script", spy)
+        remote_mux.setup_node(NODE, ["amin", "bob"], PC_KEY)
+        remote_mux.setup_node(NODE, ["amin"], PC_KEY, timeout_s=5.0)
+        assert seen == [
+            remote_mux.SETUP_TIMEOUT_S + 2 * remote_mux.SETUP_PER_USER_S,
+            5.0,
+        ]

@@ -43,6 +43,9 @@ NON_ENTRY_SCRIPTS: frozenset[str] = frozenset(
         # Claude Code hook, run as a file with --source claude; never through
         # run_script, so it gets no socket and includes no lib.sh.
         "state_hook.sh",
+        # Sourced by setup.sh and doctor.sh (`# @include tmux_floor.sh`): the
+        # tmux 3.2 floor (DECISION-22). Never run alone, never handed a socket.
+        "tmux_floor.sh",
     }
 )
 
