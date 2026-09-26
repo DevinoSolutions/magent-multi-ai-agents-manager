@@ -84,6 +84,13 @@ class TestCapturePane:
             text="", timed_out=False
         )
 
+    def test_no_psmux_binary_is_not_a_timeout(self, monkeypatch):
+        # No binary resolved is an answer (there is no pane to read), not an
+        # unread pane -- and nothing is spawned to find that out.
+        monkeypatch.setattr(psmux, "find_psmux", lambda: None)
+        monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: pytest.fail("spawned"))
+        assert psmux.read_pane("sess") == psmux.PaneCapture(text="", timed_out=False)
+
     def test_the_budget_is_read_at_call_time(self, monkeypatch):
         seen: dict[str, object] = {}
 
