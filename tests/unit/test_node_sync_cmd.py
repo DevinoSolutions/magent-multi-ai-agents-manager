@@ -82,10 +82,20 @@ def _pid_is_mine() -> None:
     _record_pid(os.getpid())
 
 
-def _child(*, exit_code: int | None = None, pid: int = 4242) -> SimpleNamespace:
+def _child(
+    *, exit_code: int | None = None, pid: int = 4242, signals: list[str] | None = None
+) -> SimpleNamespace:
     """What spawn_detached hands back: the detached child's Popen, alive
-    (``poll()`` is None) unless an exit code is given."""
-    return SimpleNamespace(pid=pid, poll=lambda: exit_code)
+    (``poll()`` is None) unless an exit code is given. Any kill/terminate
+    lands in ``signals`` -- a slow child must never be killed for it."""
+    sent = signals if signals is not None else []
+    return SimpleNamespace(
+        pid=pid,
+        poll=lambda: exit_code,
+        kill=lambda: sent.append("kill"),
+        terminate=lambda: sent.append("terminate"),
+        send_signal=lambda sig: sent.append(f"signal {sig}"),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -222,8 +232,10 @@ class TestNodeSync:
         """A child that died never becomes the daemon: say so on the next
         poll, not after the whole start budget."""
         slept: list[float] = []
+        signals: list[str] = []
         monkeypatch.setattr(
-            "magent.launch.spawn_detached", lambda argv: _child(exit_code=1)
+            "magent.launch.spawn_detached",
+            lambda argv: _child(exit_code=1, signals=signals),
         )
         monkeypatch.setattr(node_cmd, "time", SimpleNamespace(sleep=slept.append))
         result = runner.invoke(
@@ -233,6 +245,7 @@ class TestNodeSync:
         assert "node sync daemon failed to start" in result.stdout
         assert "~/.magent/logs/nodes.log" in result.stdout  # where to look next
         assert len(slept) <= 2
+        assert signals == []
 
     def test_a_child_still_alive_at_the_deadline_is_not_a_failure(
         self, runner, pool_config, monkeypatch
@@ -241,15 +254,21 @@ class TestNodeSync:
         60 ms after the poll gave up). Alive but not yet holding the lock is
         "still starting", never a failure the daemon then contradicts."""
         slept: list[float] = []
-        monkeypatch.setattr("magent.launch.spawn_detached", lambda argv: _child())
+        signals: list[str] = []
+        monkeypatch.setattr(
+            "magent.launch.spawn_detached", lambda argv: _child(signals=signals)
+        )
         monkeypatch.setattr(node_cmd, "time", SimpleNamespace(sleep=slept.append))
         result = runner.invoke(
             cli.main, ["--config", pool_config, "node", "sync", "-d"]
         )
         assert result.exit_code == 0, result.output
         assert "failed to start" not in result.stdout
-        assert "still starting (pid 4242)" in result.stdout
+        assert (
+            "still starting (pid 4242) -- see ~/.magent/logs/nodes.log"
+        ) in result.stdout
         assert len(slept) == node_cmd._START_POLLS  # waited out the budget first
+        assert signals == []  # a slow child is not a failed one: never killed
 
     @pytest.mark.parametrize("seconds", [6.0, 9.0])
     def test_a_child_slow_to_start_is_waited_for(
@@ -340,6 +359,23 @@ class TestNodeSync:
         )
         assert result.exit_code == 2, result.output
         assert "cannot be combined with -d" in result.output
+
+    def test_the_foreground_run_without_ticks_is_unbounded(
+        self, runner, pool_config, monkeypatch
+    ):
+        """The foreground run is also the detached daemon's body: a bound
+        slipped in here (``ticks or 1``) would make the daemon exit quietly
+        after one tick. The autouse guard cannot see that -- this can."""
+        seen: list[int | None] = []
+
+        def loop(cfg, *, max_ticks=None, reload=None) -> int:
+            seen.append(max_ticks)
+            return 0
+
+        monkeypatch.setattr(node_sync, "run_sync_loop", loop)
+        result = runner.invoke(cli.main, ["--config", pool_config, "node", "sync"])
+        assert result.exit_code == 0, result.output
+        assert seen == [None]
 
     def test_a_bare_node_command_exits_0(self, runner, pool_config):
         """The group is invoke_without_command: G's node table fills the bare
