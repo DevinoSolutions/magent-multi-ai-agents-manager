@@ -4054,10 +4054,23 @@ class TestProvisionNode:
     def test_the_timeout_is_mandatory(self, fake_ssh, tmp_path):
         # fake_ssh: were the timeout ever given a default, the call must go
         # through and fail "DID NOT RAISE", not stop at the refused real ssh.
-        with pytest.raises(TypeError):
+        with pytest.raises(TypeError, match="timeout_s"):
             remote_mux.provision_node(
                 NODE, MagentConfig(projects=[]), home=_pc_home(tmp_path)
             )
+
+    def test_the_callers_timeout_reaches_provision(self, monkeypatch, tmp_path):
+        seen: list[float] = []
+
+        def provision(node, user_scope, *, timeout_s, force=False):
+            seen.append(timeout_s)
+            return remote_mux.ProvisionReport(())
+
+        monkeypatch.setattr(remote_mux, "provision", provision)
+        remote_mux.provision_node(
+            NODE, MagentConfig(projects=[]), home=_pc_home(tmp_path), timeout_s=123.0
+        )
+        assert seen == [123.0]
 
     def test_src_builds_a_user_scope_in_exactly_one_place(self):
         # DECISION-24. Plan K deletes this pin and adds its own when it swaps

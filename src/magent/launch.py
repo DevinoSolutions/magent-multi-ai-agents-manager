@@ -1471,10 +1471,12 @@ _PROVISIONED: set[str] = set()
 
 def _provision_once(node: Node, config: MagentConfig) -> None:
     """Make ``node`` able to run a project, at most once per process. Runs
-    ``remote_mux.provision_node`` (DECISION-24) and records the node only once
-    that call returns: an unreachable node raises ``RemoteError``, and the
-    next project on it retries. ``config`` is here from day one so K needs no
-    signature change.
+    ``remote_mux.provision_node`` (DECISION-24) and records the node once that
+    call returns. A ``RemoteError`` is logged and re-raised, failing this
+    project: an unreachable node is left unrecorded so the next project on it
+    retries, but a timed-out one is recorded, because its outcome is unknown
+    and a retry would start a second applier beside the first.
+    ``config`` is here from day one so K needs no signature change.
     Called under the node's lock, after every refusal -- a refused project
     never provisions anything, and ``--dry-run`` never calls it."""
     if node.nick in _PROVISIONED:
@@ -1482,18 +1484,33 @@ def _provision_once(node: Node, config: MagentConfig) -> None:
     # heavy subsystem: in-body per policy (remote_mux: ssh + tar)
     from magent import remote_mux
 
-    report = remote_mux.provision_node(
-        node, config, home=Path.home(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
-    )
-    # Recorded only after a provision that reached the node: an unreachable
-    # node raises above and the next project on it tries again.
+    log = get_logger("nodes")
+    try:
+        report = remote_mux.provision_node(
+            node, config, home=Path.home(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+    except remote_mux.RemoteError as exc:
+        # D-MERGE: switch to exc.outcome_unknown (RemoteError property, D17)
+        # once D lands -- a kill after an oversize reply is unknown too.
+        if exc.timed_out:
+            # A killed ssh does not stop the apply on the node (RemoteError):
+            # this run never provisions the node again.
+            _PROVISIONED.add(node.nick)
+            log.warning(
+                "provision @%s: outcome unknown (%s); not retrying this run",
+                node.nick,
+                exc,
+            )
+        else:
+            log.warning(
+                "provision @%s: failed (%s); the next project retries", node.nick, exc
+            )
+        raise
     _PROVISIONED.add(node.nick)
     for line in report.lines:
         if line.status == "fail":
             # A fail row never blocks the session (F3); node doctor shows it.
-            get_logger("nodes").warning(
-                "provision %s: %s: %s", node.nick, line.item, line.detail
-            )
+            log.warning("provision %s: %s: %s", node.nick, line.item, line.detail)
 
 
 def _node_project_dir(config: MagentConfig, proj: ProjectConfig) -> Path | None:
@@ -1652,7 +1669,16 @@ def bring_up_node_project(
                 ok=False, sid=sid, node=nick, error="; ".join(refusals)
             )
         with _bring_up_lock(nick):
-            _provision_once(node, config)
+            try:
+                _provision_once(node, config)
+            except remote_mux.RemoteError as exc:
+                # _provision_once logged it; the row names the step that failed.
+                return NodeBringUpOutcome(
+                    ok=False,
+                    sid=sid,
+                    node=nick,
+                    error=f"provisioning: {_node_error_text(exc)}",
+                )
             recipe = node_recipe(config, proj, node, states)
             result = remote_mux.bring_up(
                 node, recipe, allow_dirty=allow_dirty, resume_id=resume_id
