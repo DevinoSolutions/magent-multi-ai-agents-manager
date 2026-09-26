@@ -5,11 +5,14 @@ faked at remote_mux's seam, so nothing here dials anything."""
 from __future__ import annotations
 
 import dataclasses
+import errno
 import json
+import logging
 import threading
 import time
 from collections import defaultdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from click.testing import CliRunner
@@ -19,6 +22,9 @@ from magent.config import MagentConfig, NodeConfig, ProjectConfig, Settings
 from magent.nodes import LocalGitState, NodeMapEntry
 from magent.remote_mux import BringUpResult, RemoteError
 from tests.conftest import FakePlatform
+
+if TYPE_CHECKING:
+    import os
 
 _TOOLS = {"claude": "claude --continue"}
 
@@ -502,6 +508,32 @@ class TestManyNodeProjectsAtOnce:
         # ...and all three map entries survived the concurrent writes.
         assert set(nodes.read_node_map()) == {"a1", "a2", "b1"}
 
+    def test_window_reaches_every_bring_up_in_the_batch(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # `up` never asks for windows; `--go` (Task 12) does, through here.
+        projs = _projects(tmp_path, rig, [("a1", "second"), ("b1", "third")])
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+        outcomes = launch.bring_up_node_projects(_config(*projs), window=True)
+        assert [(o.sid, o.title) for o in outcomes] == [
+            ("a1", "magent:a1"),
+            ("b1", "magent:b1"),
+        ]
+        assert sorted(sid for _, sid, _, _ in rig.windows) == ["a1", "b1"]
+
+    def test_a_fanned_out_batch_leaves_the_nodes_log_one_handler(self, rig, tmp_path):
+        # The workers make the batch's first get_logger("nodes") calls, all at
+        # once (conftest's log.reset_logging() hands every test an unconfigured
+        # logger); a stacked handler per worker would write every line 8 times.
+        logger = logging.getLogger("magent.nodes")
+        assert logger.handlers == []
+        spec = [(f"p{i}", ("second", "third")[i % 2]) for i in range(8)]
+        outcomes = _batch(_config(*_projects(tmp_path, rig, spec)))
+        assert all(o.ok for o in outcomes)
+        assert len(logger.handlers) == 1
+
 
 def _no_contact_for(monkeypatch: pytest.MonkeyPatch, rig: NodeRig, *sids: str) -> None:
     """Fail loudly on anything a bring-up does for ``sids`` past the fleet
@@ -549,6 +581,33 @@ def _twin_apis(tmp_path: Path, rig: NodeRig) -> list[ProjectConfig]:
         out.append(ProjectConfig(path=str(folder), node=nick, title=title))
     (bystander,) = _projects(tmp_path, rig, [("web", "second")])
     return [*out, bystander]
+
+
+def _record(name: str, nick: str, remote_root: str) -> None:
+    """``name`` recorded in the node map as running on ``nick`` in
+    ``remote_root`` -- the holder of that folder, as far as the map knows."""
+    nodes.update_node_map(
+        name,
+        NodeMapEntry(
+            nick=nick,
+            sid=name,
+            placed_ts=1.0,
+            attached_existing=False,
+            remote_root=remote_root,
+            target=f"amin@devino-{nick}",
+        ),
+    )
+
+
+def _attached_when_live(monkeypatch: pytest.MonkeyPatch, rig: NodeRig) -> None:
+    """The node's own answer for a session already running: bring_up.sh
+    attaches to it instead of starting one (``attached_existing``)."""
+    real = remote_mux.bring_up
+
+    def bring_up(node, recipe, **kw):
+        return dataclasses.replace(real(node, recipe, **kw), attached_existing=rig.live)
+
+    monkeypatch.setattr(remote_mux, "bring_up", bring_up)
 
 
 def _batch(config: MagentConfig, **kw: list[str]) -> list[launch.NodeBringUpOutcome]:
@@ -599,6 +658,77 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
             ("api-y", False),
         ]
 
+    def test_an_auto_project_the_map_placed_collides_like_a_pinned_one(
+        self, rig, tmp_path
+    ):
+        # The map places api-y on third, under a folder it no longer uses --
+        # a record of the very folder would make api-y its holder instead.
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        _record("api-y", "third", "~/magent/old-api")
+        outcomes = _batch(_config(x_api, y_api))
+        assert [(o.sid, o.ok, o.node) for o in outcomes] == [
+            ("api-x", False, "second"),
+            ("api-y", False, "third"),
+        ]
+        assert rig.recipes == []
+
+    def test_a_title_that_is_not_a_session_id_is_still_refused(self, rig, tmp_path):
+        # The refusal is keyed by session id, which a title only becomes once
+        # sanitized: "API X" runs as API-X.
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        x_api.title, y_api.title = "API X", "API Y"
+        outcomes = _batch(_config(x_api, y_api))
+        assert [(o.sid, o.ok) for o in outcomes] == [("API-X", False), ("API-Y", False)]
+        assert rig.recipes == []
+
+    @pytest.mark.parametrize(
+        "make",
+        [
+            lambda tmp: ProjectConfig(path=str(tmp / "gone"), node="second"),
+            lambda tmp: ProjectConfig(path=str(tmp / "web2"), node="auto"),
+        ],
+        ids=["missing-folder", "unplaced-auto"],
+    )
+    def test_a_project_the_scan_skips_does_not_hide_a_later_pair(
+        self, rig, tmp_path, make
+    ):
+        (tmp_path / "web2").mkdir()
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        outcomes = _batch(_config(make(tmp_path), x_api, y_api))
+        assert [o.ok for o in outcomes] == [False, False, False]
+        assert ["would share" in (o.error or "") for o in outcomes] == [
+            False,
+            True,
+            True,
+        ]
+        assert rig.recipes == []
+
+    def test_a_folder_the_scan_cannot_read_is_that_projects_outcome(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # One node project's folder this user may not stat (another profile, a
+        # deny ACL) must not take `up` of any other project down with it --
+        # the fleet scan reads every folder, asked for or not.
+        (good,) = _projects(tmp_path, rig, [("a1", "second")])
+        locked = tmp_path / "locked" / "z"
+        locked.mkdir(parents=True)
+        rig.states[locked] = _state(locked)
+        z = ProjectConfig(path=str(locked), node="second")
+        real_stat = Path.stat
+
+        def stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            if str(self) == str(locked):
+                raise PermissionError(errno.EACCES, "Access is denied", str(self))
+            return real_stat(self, follow_symlinks=follow_symlinks)
+
+        monkeypatch.setattr(Path, "stat", stat)
+        alone = _batch(_config(good, z), only=["a1"])
+        assert [(o.sid, o.ok) for o in alone] == [("a1", True)]
+        both = _batch(_config(good, z))
+        assert [(o.sid, o.ok) for o in both] == [("a1", True), ("z", False)]
+        assert "Access is denied" in (both[1].error or "")
+
     def test_a_collision_with_a_project_outside_the_batch_still_refuses(
         self, rig, tmp_path, monkeypatch
     ):
@@ -611,6 +741,102 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         assert "'api-y'" in (outcomes[0].error or "")
         assert rig.recipes == []
         assert nodes.read_node_map() == {}
+
+    def test_a_live_holder_keeps_attaching_and_only_the_newcomer_is_refused(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # api-x already runs in ~/magent/api; the user then adds api-y, whose
+        # folder has the same name. Only api-y's clone could overwrite
+        # anything, so only api-y is refused -- api-x attaches, and is told
+        # of the clash as a warning.
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        _record("api-x", "second", "~/magent/api")
+        rig.live = True
+        _no_contact_for(monkeypatch, rig, "api-y")
+        _attached_when_live(monkeypatch, rig)
+        outcomes = _batch(_config(x_api, y_api))
+        holder, newcomer = outcomes
+        assert (holder.sid, holder.ok, holder.attached_existing) == (
+            "api-x",
+            True,
+            True,
+        )
+        assert holder.error is None
+        assert len(holder.warnings) == 1
+        assert "'api-x' and 'api-y' would share" in holder.warnings[0]
+        assert (newcomer.sid, newcomer.ok) == ("api-y", False)
+        assert "'api-x'" in (newcomer.error or "")
+        assert [(n, r.sid, r.remote_root) for n, r in rig.recipes] == [
+            ("second", "api-x", "~/magent/api")
+        ]
+
+    def test_a_live_holder_brought_up_alone_still_attaches(
+        self, rig, tmp_path, monkeypatch
+    ):
+        projs = _twin_apis(tmp_path, rig)
+        _record("api-x", "second", "~/magent/api")
+        _attached_when_live(monkeypatch, rig)
+        rig.live = True
+        (o,) = _batch(_config(*projs), only=["api-x"])
+        assert (o.sid, o.ok, o.attached_existing) == ("api-x", True, True)
+        assert len(o.warnings) == 1
+        assert "'api-y'" in o.warnings[0]
+
+    def test_a_holder_whose_session_is_gone_is_restarted_in_its_own_folder(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # The folder is the holder's recorded placement and the newcomer is
+        # refused, so a restart there overwrites no one; it is still told.
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        _record("api-x", "second", "~/magent/api")
+        _no_contact_for(monkeypatch, rig, "api-y")
+        holder, newcomer = _batch(_config(x_api, y_api))
+        assert (holder.sid, holder.ok, holder.attached_existing) == (
+            "api-x",
+            True,
+            False,
+        )
+        assert holder.error is None
+        assert len(holder.warnings) == 1
+        assert "'api-x' and 'api-y' would share" in holder.warnings[0]
+        assert (newcomer.sid, newcomer.ok) == ("api-y", False)
+        assert "'api-x'" in (newcomer.error or "")
+        assert [(n, r.sid, r.remote_root) for n, r in rig.recipes] == [
+            ("second", "api-x", "~/magent/api")
+        ]
+        assert set(nodes.read_node_map()) == {"api-x"}
+
+    def test_a_record_on_another_node_does_not_make_a_holder(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # api-x ran in ~/magent/api on second, then was re-pinned to third,
+        # where api-y holds ~/magent/api. On third api-x is a newcomer: taking
+        # it for a holder would dial both into one folder.
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        x_api.node = "third"
+        _record("api-x", "second", "~/magent/api")
+        _record("api-y", "third", "~/magent/api")
+        _no_contact_for(monkeypatch, rig, "api-x")
+        newcomer, holder = _batch(_config(x_api, y_api))
+        assert (newcomer.sid, newcomer.ok, newcomer.node) == ("api-x", False, "third")
+        assert "'api-y'" in (newcomer.error or "")
+        assert (holder.sid, holder.ok) == ("api-y", True)
+        assert [(n, r.sid, r.remote_root) for n, r in rig.recipes] == [
+            ("third", "api-y", "~/magent/api")
+        ]
+
+    def test_a_record_of_another_folder_does_not_make_a_holder(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # api-x ran under another folder name once; that session holds
+        # nothing of ~/magent/api, so it is a newcomer to it like api-y.
+        projs = _twin_apis(tmp_path, rig)
+        _record("api-x", "second", "~/magent/old-api")
+        rig.live = True
+        _no_contact_for(monkeypatch, rig, "api-x", "api-y")
+        outcomes = _batch(_config(*projs), only=["api-x", "api-y"])
+        assert [(o.sid, o.ok) for o in outcomes] == [("api-x", False), ("api-y", False)]
+        assert rig.decorated == []
 
     def test_a_collision_entirely_outside_the_batch_blocks_nothing(self, rig, tmp_path):
         projs = _twin_apis(tmp_path, rig)
