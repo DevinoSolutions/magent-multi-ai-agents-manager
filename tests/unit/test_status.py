@@ -2317,7 +2317,7 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         busy = self._unreadable(state)
         if busy is not None:
             monkeypatch.setattr(nodes, "load_node_map_strict", busy)
-        out, _killed, dialed, sent = self._run(
+        out, killed, dialed, sent = self._run(
             runner,
             tmp_config,
             monkeypatch,
@@ -2327,6 +2327,9 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         )
         assert out.exit_code == 0, out.output
         assert sent == []
+        # "Acted here" is both halves: the local session a node project may
+        # have left on this PC, and the one on its node.
+        assert killed == [["api"]]
         assert dialed == [("second", "api")]
         hints = [ln for ln in out.output.splitlines() if "--host" in ln]
         assert len(hints) == 1, out.output

@@ -2245,6 +2245,36 @@ class TestDownPullsTheLastTurnHomeFirst:
         assert "PermissionError" in logged
         assert "The process cannot access the file" in logged
 
+    def test_an_unreadable_map_is_not_the_nodes_failure(
+        self, rig, tmp_path, monkeypatch, killed
+    ):
+        # A hung node's later sessions skip their pull; a map that could not
+        # be read once is no fact about the node, so its next session is
+        # still pulled -- and only the one that was not keeps its entry.
+        a1, a2 = (
+            ProjectConfig(path=str(tmp_path / n), node="second") for n in ("a1", "a2")
+        )
+        _hold("a1")
+        _hold("a2")
+        pulled: list[str] = []
+
+        def pull(config: object, name: str, **_k: object) -> remote_mux.PullResult:
+            pulled.append(name)
+            if name == "a1":
+                raise node_sync.NodeMapUnreadable(
+                    nodes.map_unread_text(PermissionError(13, "busy"))
+                )
+            return _PULLED
+
+        monkeypatch.setattr(node_sync, "final_pull", pull)
+        assert launch.stop_node_sessions(_config(a1, a2), ["a1", "a2"]) == (
+            ["a1", "a2"],
+            [],
+        )
+        assert pulled == ["a1", "a2"]
+        assert killed == ["a1", "a2"]
+        assert set(nodes.read_node_map()) == {"a1"}
+
     @pytest.mark.parametrize("timed_out", [True, False], ids=["silent", "rc255"])
     def test_a_node_that_did_not_answer_the_pull_is_not_pulled_again(
         self, rig, tmp_path, monkeypatch, capsys, killed, timed_out
