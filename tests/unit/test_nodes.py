@@ -1026,6 +1026,10 @@ class TestTheSessionsSnapshot:
             # A non-finite ts would make sessions_stale() answer "fresh" forever.
             '{"ts": NaN, "sessions": []}',
             '{"ts": Infinity, "sessions": []}',
+            # json keeps a 309-digit ts an int; float() of it raises OverflowError.
+            pytest.param(
+                '{"ts": ' + "9" * 309 + ', "sessions": []}', id="309-digit-ts"
+            ),
             # Any non-string entry is corruption, not a name to skip.
             '{"ts": 1, "sessions": ["a", 3, null]}',
             '{"ts": 1, "sessions": ["a", ["b"]]}',

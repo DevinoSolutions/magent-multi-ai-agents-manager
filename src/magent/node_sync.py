@@ -450,7 +450,12 @@ def _row_ts(line: str) -> float | None:
     ts = row.get("ts") if isinstance(row, dict) else None
     if isinstance(ts, bool) or not isinstance(ts, (int, float)):
         return None
-    return float(ts) if math.isfinite(ts) else None
+    # float() of a 309-digit int raises OverflowError: a bad row too.
+    try:
+        ts_f = float(ts)
+    except OverflowError:
+        return None
+    return ts_f if math.isfinite(ts_f) else None
 
 
 def _needs_trim(path: Path, before: float, at: float) -> bool:
@@ -967,7 +972,7 @@ def final_pull(
     bigger than one cap must not make every ``down`` refuse. The same
     ``wait_s`` deadline (counted from this call) bounds the resuming: a reply
     still cut when it passes is RemoteError(0), and so, at once, is a cut
-    reply that did not move the mark, so the loop can never spin. Every mark
+    reply that did not move the mark forward, so the loop can never spin. Every mark
     is written before the next call, so another final pull (or a tick)
     carries on from the last one. A node that reports no real path for the
     session's root (a deleted project) returns normally with a warning -- no
@@ -1017,11 +1022,14 @@ def final_pull(
             0, f"could not store every pulled file of {entry.sid!r}", ("pull.sh",)
         )
     if entry.sid in snap.truncated:
-        why = (
-            "without moving its mark"
-            if stuck
-            else f"and was still cut when the deadline passed ({len(snaps)} calls)"
-        )
+        # A node whose clock went back answers a mark BEHIND the one asked for.
+        behind = asked is not None and mark.since < asked.since
+        if not stuck:
+            why = f"and was still cut when the deadline passed ({len(snaps)} calls)"
+        elif behind:
+            why = "and moved its mark back"
+        else:
+            why = "without moving its mark"
         raise remote_mux.RemoteError(
             0,
             f"the reply for {entry.sid!r} reached the pull cap {why}; the rest is owed",

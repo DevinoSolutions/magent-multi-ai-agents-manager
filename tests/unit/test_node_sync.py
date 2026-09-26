@@ -1574,6 +1574,11 @@ class TestTheTrimNeverStalls:
     def test_a_blank_first_line_is_trimmed(self, placed, rewrites):
         self._run("\n", rewrites)
 
+    def test_a_first_row_whose_ts_overflows_a_float_is_trimmed(self, placed, rewrites):
+        """json.loads keeps a 309-digit ts as an int, and float() of it raises
+        OverflowError: a bad row like any other, never a failed store."""
+        self._run('{"ts": ' + "9" * 309 + "}\n", rewrites)
+
 
 class TestTheLoadSampleEdges:
     def test_the_slack_is_at_least_one_interval(self, placed, rewrites):
@@ -2582,6 +2587,28 @@ class TestAFinalPullThatDidNotFinish:
         assert _marks() == {
             "api": {"since": math.nextafter(500.0, -math.inf), "realpath": _REAL}
         }
+
+    def test_a_resume_that_moves_the_mark_back_says_so_and_stops(
+        self, placed, monkeypatch
+    ):
+        """A node whose clock went back behind the mark resets it to 0.0
+        (``remote_mux.next_since``): that stops the loop like a mark that did
+        not move, and the error says which of the two it was."""
+        _seed_marks(api=(10.0, _REAL))
+        clock_back = _snapshot(
+            now=100.0,
+            realpaths={"api": _REAL},
+            truncated={"api": ("api/transcripts/owed.jsonl",)},
+            resume={"api": 50.0},
+        )
+        asked = _scripted_pull(monkeypatch, _cut(500.0), clock_back)
+        with pytest.raises(remote_mux.RemoteError) as info:
+            node_sync.final_pull(_config(), "api", wait_s=1e9)
+        assert info.value.stderr_tail == (
+            "the reply for 'api' reached the pull cap and moved its mark back;"
+            " the rest is owed"
+        )
+        assert len(asked) == 2
 
     def test_a_reply_still_cut_at_the_deadline_raises_with_the_mark_at_its_resume(
         self, placed, monkeypatch
