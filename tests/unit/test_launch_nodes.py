@@ -333,7 +333,9 @@ class TestD7RefusesWhatTheNodeCouldNotReproduce:
         rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
         outcome = launch.bring_up_node_project(_config(api), api)
         assert (outcome.ok, outcome.attached_existing) == (True, True)
-        assert any("--allow-dirty" in w for w in outcome.warnings)
+        # The refusal alone: a readable map says nothing about the map.
+        (dirty,) = [w for w in outcome.warnings if "--allow-dirty" in w]
+        assert outcome.warnings == (dirty,)
         assert rig.decorated == [("api", "second")]
         assert rig.recipes == []
 
