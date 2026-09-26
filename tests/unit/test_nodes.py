@@ -1415,6 +1415,19 @@ class TestPushSet:
         (home / ".ssh" / ".env").write_text("K=1\n", encoding="utf-8")
         assert nodes.push_set(home, [_state(home, (".ssh/.env",))], home=home) == ()
 
+    def test_a_git_hit_in_a_credential_store_is_refused_before_it_is_looked_at(
+        self, tmp_path, monkeypatch
+    ):
+        # Refused on its resolved NAME, never stat-ed: a stat error in there
+        # would otherwise put a path inside ~/.ssh on screen.
+        home = tmp_path / "home"
+        (home / ".ssh").mkdir(parents=True)
+        (home / ".ssh" / ".env").write_text("K=1\n", encoding="utf-8")
+        deny_stat(monkeypatch, (home / ".ssh" / ".env").resolve())
+        assert nodes._push(
+            home, [_state(home, (".ssh/.env",))], home=home, extras=()
+        ) == ((), ())
+
     def test_the_answer_is_sorted_and_unique(self, repo):
         shipped = nodes.push_set(
             repo, [_real_state(repo)], home=Path.home(), extras=[".env"]
