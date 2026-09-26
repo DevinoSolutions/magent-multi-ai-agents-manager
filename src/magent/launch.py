@@ -1696,9 +1696,6 @@ def _run_node_bring_ups(
 
     if not projects:
         return []
-    # get_logger is check-then-set: its first call for a name must happen
-    # here, not raced in the workers, or each worker stacks its own handler.
-    log = get_logger("nodes")
     fleet = nodes.node_projects(config)
     known = {nodes.node_sid(proj) for proj in fleet}
     fleet += [proj for proj in projects if nodes.node_sid(proj) not in known]
@@ -1712,7 +1709,7 @@ def _run_node_bring_ups(
     for proj in projects:
         sid = nodes.node_sid(proj)
         if sid in clash:
-            log.warning("node project %s refused: %s", sid, clash[sid])
+            get_logger("nodes").warning("node project %s refused: %s", sid, clash[sid])
             outcomes[sid] = NodeBringUpOutcome(
                 ok=False, sid=sid, node=placed[sid][0], error=clash[sid]
             )

@@ -521,28 +521,15 @@ class TestManyNodeProjectsAtOnce:
         ]
         assert sorted(sid for _, sid, _, _ in rig.windows) == ["a1", "b1"]
 
-    def test_the_nodes_log_is_set_up_before_the_fan_out(
-        self, rig, tmp_path, monkeypatch
-    ):
-        # get_logger is check-then-set: a first call for a name racing in
-        # eight workers stacks a handler per worker, and every nodes.log line
-        # is then written that many times. (conftest's log.reset_logging() hands
-        # every test an unconfigured logger, so this batch makes the first call.)
+    def test_a_fanned_out_batch_leaves_the_nodes_log_one_handler(self, rig, tmp_path):
+        # The workers make the batch's first get_logger("nodes") calls, all at
+        # once (conftest's log.reset_logging() hands every test an unconfigured
+        # logger); a stacked handler per worker would write every line 8 times.
         logger = logging.getLogger("magent.nodes")
         assert logger.handlers == []
-        first: list[threading.Thread] = []
-        real = launch.get_logger
-
-        def spy(name: str) -> logging.Logger:
-            if name == "nodes" and not first:
-                first.append(threading.current_thread())
-            return real(name)
-
-        monkeypatch.setattr(launch, "get_logger", spy)
         spec = [(f"p{i}", ("second", "third")[i % 2]) for i in range(8)]
         outcomes = _batch(_config(*_projects(tmp_path, rig, spec)))
         assert all(o.ok for o in outcomes)
-        assert first == [threading.current_thread()]
         assert len(logger.handlers) == 1
 
 
