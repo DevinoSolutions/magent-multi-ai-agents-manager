@@ -1308,7 +1308,7 @@ class TestTheNodePhaseSaysWhatHappened:
         (line,) = [
             ln for ln in capsys.readouterr().out.splitlines() if "did not open" in ln
         ]
-        assert line.lstrip().startswith("! api:")
+        assert line.lstrip().startswith("! api @second: ")
         assert "nodes.log" in line
         assert "magent --go" in line
         assert line.isascii()
@@ -1342,8 +1342,51 @@ class TestTheNodePhaseSaysWhatHappened:
         projs = _projects(tmp_path, rig, [("a1", "second"), ("b1", "third")])
         launch.run_magent(_config(*projs), launch.RunOpts())
         out = capsys.readouterr().out
-        assert out.count("nodes: bringing up 2 project(s)") == 1
-        assert out.index("nodes: bringing up") < out.index("a1 @second started")
+        assert out.count("Bringing up 2 node project(s)...") == 1
+        assert out.index("Bringing up") < out.index("a1 @second started")
+        assert out.isascii()
+
+    def test_no_node_project_queued_is_no_announcement(
+        self, rig, api, no_sleep, monkeypatch, capsys
+    ):
+        plat = FakePlatform(supports_attach_windows=True)
+        plat._register_window("magent:api")
+        monkeypatch.setattr(launch, "get_platform", lambda: plat)
+        launch.run_magent(_config(api), launch.RunOpts())
+        assert "node project(s)" not in capsys.readouterr().out
+
+
+class TestADryRunReadsTheNodeMapOnce:
+    def test_one_read_for_the_whole_run(
+        self, rig, tmp_path, desk, no_sleep, monkeypatch
+    ):
+        # cq-D12 M5: the badge and the preview of every node project answer
+        # from ONE snapshot of the map, not two reads per project.
+        projs = _projects(tmp_path, rig, [("a1", "second"), ("b1", "third")])
+        reads: list[None] = []
+        real = nodes.read_node_map
+
+        def counting() -> dict[str, NodeMapEntry]:
+            reads.append(None)
+            return real()
+
+        monkeypatch.setattr(nodes, "read_node_map", counting)
+        launch.run_magent(_config(*projs), launch.RunOpts(dry_run=True))
+        assert len(reads) == 1
+
+    def test_a_run_without_node_projects_never_reads_it(
+        self, rig, tmp_path, desk, no_sleep, monkeypatch
+    ):
+        local = tmp_path / "local"
+        local.mkdir()
+
+        def forbidden() -> dict[str, NodeMapEntry]:
+            raise AssertionError("no node project: the map is not read")
+
+        monkeypatch.setattr(nodes, "read_node_map", forbidden)
+        launch.run_magent(
+            _config(ProjectConfig(path=str(local))), launch.RunOpts(dry_run=True)
+        )
 
 
 class TestTheExactFallbackIsExact:

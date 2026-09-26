@@ -822,13 +822,15 @@ def _launch_projects(
             return key in win_snapshot
         return any(key.lower() in t.lower() for t in win_snapshot)
 
+    node_map = _node_map_snapshot(config, projects)
+
     for proj in projects:
         tool = proj.tool or config.settings.default_tool
         is_remote = bool(proj.host)
 
         if runs_on_node(proj) and not is_ide_tool(tool):
             new_count += _dispatch_node_project(
-                config, opts, proj, tool, _is_running, targets, node_projects
+                config, opts, proj, tool, _is_running, targets, node_projects, node_map
             )
             continue
 
@@ -1082,6 +1084,24 @@ def _dispatch_cli_agent_project(
     return new_count
 
 
+def _node_map_snapshot(
+    config: MagentConfig, projects: list[ProjectConfig]
+) -> dict[str, NodeMapEntry]:
+    """ONE read of the node map for the whole launch loop: every node
+    project's badge and dry-run preview answer from it, so none can disagree
+    with another. A launch with no node project in it never reads the map."""
+    if not any(
+        runs_on_node(proj)
+        and not is_ide_tool(proj.tool or config.settings.default_tool)
+        for proj in projects
+    ):
+        return {}
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    return nodes.read_node_map()
+
+
 def _dispatch_node_project(
     config: MagentConfig,
     opts: RunOpts,
@@ -1090,19 +1110,21 @@ def _dispatch_node_project(
     is_running: Callable[[str, str], bool],
     targets: list[_Target],
     node_projects: list[ProjectConfig],
+    node_map: dict[str, NodeMapEntry],
 ) -> int:
     """A pool-node project: one window, titled by its session id. The
     bring-up itself runs after the local phases (``_bring_up_node_windows``);
     here it is listed, targeted for tiling and queued. The target is
     provisional until then: the bring-up re-keys it on the title the window
     actually opened under. The window is always C's ``magent:<sid>``, so the
-    already-open probe matches in ``magent-name`` mode."""
+    already-open probe matches in ``magent-name`` mode. ``node_map`` is the
+    loop's one snapshot (``_node_map_snapshot``)."""
     # heavy subsystem: in-body per policy
     from magent import nodes
 
     sid = nodes.node_sid(proj)
     running = is_running(sid, "magent-name")
-    held = nodes.read_node_map().get(nodes.project_name(proj))
+    held = node_map.get(nodes.project_name(proj))
     label = held.nick if proj.node == NODE_AUTO and held else str(proj.node)
     _log_project(nodes.project_name(proj), tool, running, None, node=label)
     targets.append(_Target(name=sid, key=sid, mode="magent-name", is_new=not running))
@@ -1186,11 +1208,12 @@ def _bring_up_node_windows(
     dropped rather than polled for and reported "not found" -- and where a
     window WAS meant to open, that is said here instead, since tiling no
     longer will."""
+    # A clone is minutes of network: say what is running before it runs. The
+    # caller only gets here with a non-empty queue, so N is never 0.
     count = len(result.node_projects)
-    # A clone is minutes of network: say what is running before it runs.
     click.echo(
-        f"\n  {style('#', fg='blue')} nodes: bringing up "
-        f"{style(str(count), fg='blue', bold=True)} project(s)..."
+        f"\n  {style('#', fg='blue')} Bringing up "
+        f"{style(str(count), fg='blue', bold=True)} node project(s)..."
     )
     _warn_node_windows_will_not_reconnect(plat)
     outcomes = _run_node_bring_ups(
@@ -1210,7 +1233,8 @@ def _bring_up_node_windows(
             # The session is up; only the window failed (the spawn's reason is
             # in nodes.log). A re-run re-queues it and attaches to the session.
             click.echo(
-                f"  {style('!', fg='yellow')} {outcome.sid}: its window did not open"
+                f"  {style('!', fg='yellow')} {outcome.sid}"
+                f" {style('@' + outcome.node, fg='blue')}: window did not open"
                 f" {style('(see ~/.magent/logs/nodes.log) -- re-run magent --go to open it', dim=True)}"
             )
     return replace(result, targets=targets)
