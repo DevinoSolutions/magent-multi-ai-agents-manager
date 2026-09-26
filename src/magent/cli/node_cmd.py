@@ -98,8 +98,10 @@ def _table_row(cells: list[str], widths: list[int]) -> str:
     )
 
 
-# What the user column shows for a node whose login cannot be resolved (an
-# explicit empty "user", or a local name that is not a node login).
+# What the user column shows when the D4 rule refuses the login a node's
+# sessions would run as: a node with no "user" whose local login is not a
+# usable node login (e.g. "Amin Dhouib") or is "root". An explicit empty
+# "user" never gets here -- config load refuses it.
 _NO_LOGIN = "? (set user)"
 
 

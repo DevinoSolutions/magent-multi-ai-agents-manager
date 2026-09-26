@@ -188,7 +188,9 @@ class TestTheNodeTable:
         assert result.exit_code == 0
         row = _row(result.stdout, "second")
         assert "? (set user)" in row
-        assert local.lower() not in row.split()
+        # A substring, not a token: "amin dhouib" holds a space, so no token
+        # of row.split() could ever equal it (cq-G11 r2).
+        assert local.lower() not in row
 
     def test_an_explicit_empty_user_never_reaches_the_table(
         self, runner, tmp_config, monkeypatch
