@@ -97,6 +97,7 @@ import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 import click
@@ -371,9 +372,53 @@ def remote_attach_command(sid: str, mux: str = "psmux") -> str:
     return f"psmux -L {sid} attach || magent sessions {sid}"
 
 
+def _system_directory() -> Path | None:
+    """Windows' system directory (``GetSystemDirectoryW``), or None off
+    Windows or when the probe fails. A seam: tests/conftest.py::_no_real_ssh
+    answers None for every test, so no test finds the real OpenSSH."""
+    if sys.platform != "win32":
+        return None
+    import ctypes  # win-only: ctypes.windll doesn't exist off Windows
+
+    buffer = ctypes.create_unicode_buffer(260)
+    try:
+        written = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, 260)
+    except OSError:
+        return None
+    return Path(buffer.value) if written else None
+
+
+def find_ssh() -> str | None:
+    """THE ssh client magent runs, or None: Windows' own
+    ``<system dir>\\OpenSSH\\ssh.exe`` when it exists, else whatever ``ssh``
+    PATH offers. One rule for every ssh magent spawns at a node -- this
+    module's pane and probe, and ``remote_mux``'s calls -- because two
+    clients on one PC share ``~/.ssh`` but NOT the agent (the Windows agent is
+    a named pipe, MSYS ssh asks ``SSH_AUTH_SOCK``): under Git Bash, PATH
+    finds MSYS ssh, and a key only the Windows agent holds would let the
+    bring-up succeed through one client and the window fail through the
+    other. System directory first, PATH only as the fallback -- the shape of
+    ``platform/windows.py::_schtasks_exe``. Not cached: a pane asks once per
+    dial, and PATH may change under a long-lived supervisor."""
+    system = _system_directory()
+    if system is not None:
+        client = system / "OpenSSH" / "ssh.exe"
+        if client.is_file():
+            return str(client)
+    return shutil.which("ssh")
+
+
+def _ssh_program() -> str:
+    """argv[0] of every ssh this module builds: the client ``find_ssh``
+    resolved, or the bare name when there is none, so the spawn's own
+    not-found stays the one missing-client path (``SSH_MISSING_RC`` in
+    ``_run_ssh``, ``PROBE_FAILED`` in the probe)."""
+    return find_ssh() or "ssh"
+
+
 def ssh_argv(target: str, remote: str) -> list[str]:
     """The interactive ssh invocation an attach pane runs."""
-    return ["ssh", *SSH_CONNECTION_OPTS, "-t", target, remote]
+    return [_ssh_program(), *SSH_CONNECTION_OPTS, "-t", target, remote]
 
 
 def session_probe_argv(target: str, session: str, mux: str = "psmux") -> list[str]:
@@ -410,7 +455,7 @@ def session_probe_argv(target: str, session: str, mux: str = "psmux") -> list[st
         question = f"tmux -L {TMUX_SOCKET} has-session -t '={session}'"
     else:
         question = f"psmux -L {session} has-session -t {session}"
-    return ["ssh", *SESSION_PROBE_OPTS, target, question]
+    return [_ssh_program(), *SESSION_PROBE_OPTS, target, question]
 
 
 def _probe_session(target: str, session: str, mux: str = "psmux") -> str:
@@ -1075,7 +1120,7 @@ def supervise(
     # Refused before any ssh is dialled: an unknown mux would otherwise only
     # surface after the first disconnect, possibly hours in, out of the probe.
     _check_mux(mux)
-    if shutil.which("ssh") is None:
+    if shutil.which(_ssh_program()) is None:
         _echo(f"  {style('x', fg='red')} ssh is not on PATH -- cannot attach.")
         return SSH_MISSING_RC
 

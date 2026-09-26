@@ -27,7 +27,6 @@ import json
 import math
 import os
 import shlex
-import shutil
 import stat
 import subprocess
 import tarfile
@@ -37,7 +36,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from magent import node_scripts, psmux
+
+# find_ssh is bound by value, not read off attach_client at call time: the
+# conftest guard answers None for attach_client.find_ssh, and this module's own
+# find_ssh is the seam every remote_mux test fakes (fake_ssh repoints it).
 from magent.attach_client import SSH_MISSING_RC, TMUX_SOCKET
+from magent.attach_client import find_ssh as _find_ssh_client
 from magent.env import git_child_env
 from magent.log import get_logger
 from magent.nodes import (
@@ -143,10 +147,16 @@ class RemoteError(RuntimeError):
 
 @functools.lru_cache(maxsize=1)
 def find_ssh() -> str | None:
-    """The ssh client on PATH, or None. Cached for the process lifetime like
-    ``psmux.find_psmux``: a test that changes PATH clears it on the way in and
-    out. Tests never see the real one (tests/conftest.py::_no_real_ssh)."""
-    return shutil.which("ssh")
+    """The ssh client, or None -- by ``attach_client.find_ssh``'s rule
+    (Windows' own OpenSSH first, PATH as the fallback), so a bring-up and the
+    attach window it opens dial through the same client and the same agent.
+    Cached for the process lifetime like ``psmux.find_psmux``, which also makes
+    the one debug line naming the client a once-per-process line; a test that
+    changes PATH clears it on the way in and out. Tests never see the real one
+    (tests/conftest.py::_no_real_ssh)."""
+    exe = _find_ssh_client()
+    get_logger("nodes").debug("ssh client for node calls: %s", exe)
+    return exe
 
 
 def _remote_string(argv: Sequence[str]) -> str:

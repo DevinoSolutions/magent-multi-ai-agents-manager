@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from magent import env, lockfile, remote_mux
+from magent import attach_client, env, lockfile, remote_mux
 
 # By value, at import -- before any fixture runs: conftest's _no_real_ssh
 # patches the MODULE attribute, so this name is still the real PATH resolver.
@@ -206,6 +206,13 @@ class TestNoTestResolvesTheRealSsh:
             assert remote_mux.find_ssh() is None
         finally:
             real_find_ssh.cache_clear()
+
+    def test_the_attach_pane_resolves_no_client_either(self):
+        # The pane's resolver is the same rule, guarded the same way: its argv
+        # keeps the bare name, and Windows' own OpenSSH is never looked up.
+        assert attach_client.find_ssh() is None
+        assert attach_client._system_directory() is None
+        assert attach_client.ssh_argv("amin@h", "true")[0] == "ssh"
 
 
 @pytest.fixture(scope="class")

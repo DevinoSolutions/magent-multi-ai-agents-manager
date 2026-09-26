@@ -222,8 +222,15 @@ def _no_real_ssh(monkeypatch):
     test that proves PATH resolution) still gets the real resolver; the
     ``fake_ssh`` fixture patches the same attribute afterwards and wins. The
     ``needs_ssh`` node tier re-points it at the real client deliberately.
+
+    The attach pane's resolver is guarded too, at both of its halves:
+    ``attach_client.find_ssh`` (so an in-process pane argv names bare ``ssh``)
+    and ``attach_client._system_directory`` (so no test reads the real
+    Windows OpenSSH, including through the by-value real resolvers).
     """
     monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: None)
+    monkeypatch.setattr("magent.attach_client.find_ssh", lambda: None)
+    monkeypatch.setattr("magent.attach_client._system_directory", lambda: None)
 
 
 @pytest.fixture

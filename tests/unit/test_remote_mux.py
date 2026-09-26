@@ -6,6 +6,7 @@ import atexit
 import dataclasses
 import io
 import json
+import logging
 import math
 import os
 import re
@@ -134,6 +135,41 @@ class TestTheSshResolver:
             assert Path(found).parent == tmp_path
         finally:
             real_find_ssh.cache_clear()
+
+    def test_it_is_the_attach_panes_rule(self, tmp_path, monkeypatch):
+        # One rule for the node calls and the attach pane: Windows' own
+        # OpenSSH over whatever PATH offers, so the bring-up and the window
+        # dial through the same client and the same agent.
+        client = tmp_path / "OpenSSH" / "ssh.exe"
+        client.parent.mkdir()
+        client.write_bytes(b"")
+        monkeypatch.setattr(attach_client, "_system_directory", lambda: tmp_path)
+        monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/msys/bin/ssh")
+        real_find_ssh.cache_clear()
+        try:
+            assert real_find_ssh() == str(client)
+        finally:
+            real_find_ssh.cache_clear()
+
+    def test_the_client_is_logged_once_at_debug(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(attach_client, "_system_directory", lambda: None)
+        monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/msys/bin/ssh")
+        # get_logger sets the level on its FIRST call; configure it first so
+        # caplog's DEBUG is the level in force, not overwritten by that call.
+        log.get_logger("nodes")
+        caplog.set_level(logging.DEBUG, logger="magent.nodes")
+        real_find_ssh.cache_clear()
+        try:
+            real_find_ssh()
+            real_find_ssh()
+        finally:
+            real_find_ssh.cache_clear()
+        said = [
+            r
+            for r in caplog.records
+            if r.name == "magent.nodes" and "/msys/bin/ssh" in r.getMessage()
+        ]
+        assert [r.levelno for r in said] == [logging.DEBUG]
 
 
 class TestTheFakeIsARealBinary:
