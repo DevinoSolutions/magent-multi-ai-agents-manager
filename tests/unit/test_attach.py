@@ -1305,11 +1305,24 @@ class TestMaybeStartHotkeySshHost:
             def supports_hotkey(self) -> bool:
                 return True
 
+        ended: list[str] = []
+
         class _Exited:
             # The child is only here for its argv; an exited one ends the
-            # registration wait on its first poll.
+            # registration wait on its first poll. Any attempt to end it is
+            # recorded, so a regression fails the assertion below rather than
+            # erroring on a missing method.
             def poll(self) -> int:
                 return 0
+
+            def kill(self) -> None:
+                ended.append("kill")
+
+            def terminate(self) -> None:
+                ended.append("terminate")
+
+            def send_signal(self, sig: int) -> None:
+                ended.append(f"signal {sig}")
 
         def _spawn(args: list[str]) -> _Exited:
             spawned.append(args)
@@ -1341,6 +1354,7 @@ class TestMaybeStartHotkeySshHost:
         )
 
         background._maybe_start_hotkey("http://h:8033", ssh_host)
+        assert ended == []  # the launcher never ends the child it spawned
         return spawned[0]
 
     def test_ssh_host_is_passed_through(self, monkeypatch):

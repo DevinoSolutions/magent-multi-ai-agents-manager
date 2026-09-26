@@ -248,7 +248,8 @@ def _serve(w):
     os.getpid(), which is what status/stop_server target. On a uv/venv Windows
     box that pid differs from the Popen pid (the venv python.exe is a trampoline
     that spawns the real interpreter as a child), so we key off the pid file, not
-    the launcher. Killed (recorded pid + launcher tree) afterwards. No
+    the launcher. Killed afterwards: the recorded pid, the launcher, and then
+    anything still carrying the cfg marker (see _procs; no tree walk). No
     grandchild: plain serve runs run_server in-process, so file-backed stdio is
     safe."""
     pidfile = w.md / f"upload_server-{w.port}.pid"
