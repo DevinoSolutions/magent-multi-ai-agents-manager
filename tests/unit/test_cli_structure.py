@@ -35,7 +35,7 @@ def _normalize_help(output: str) -> str:
 
 
 HELP_SNAPSHOTS = {
-    (): "Usage: main [OPTIONS] [COMMAND] [ARGS]...\n\n  Open every project in its own terminal and auto-tile across all monitors.\n\nOptions:\n  --go              Skip interactive menu, launch + tile\n  --retile-all      Re-tile every matching window\n  -a, --all         Launch every enabled project -- skip the project checklist\n  -g, --group TEXT  Launch only projects in this group\n  --init            Re-scan and regenerate config\n  --base-dir PATH   Folder to scan with --init\n  --config PATH     Path to config file\n  --force           With --init, overwrite existing config\n  --edit            Open config in your default editor\n  --attach-to TEXT  Attach to remote psmux sessions (host or user@host)\n  --no-mux          With --attach-to: one plain SSH window per project (no\n                    psmux/tmux)\n  --version         Show the version and exit.\n  --help            Show this message and exit.\n\nCommands:\n  attach     Attach to another machine's magent sessions over SSH.\n  attention  Ambient attention signals for your agent fleet.\n  config     View and modify your magent configuration.\n  docs       Print the full configuration reference (Markdown).\n  doctor     Diagnose the environment: config, env vars, tools, display, dirs.\n  down       Shut down psmux sessions (and optionally the upload server).\n  hooks      Wire agent lifecycle hooks that feed the session-state store.\n  hotkey     Listen for Alt+V to upload clipboard images to psmux sessions.\n  mobile     Show the phone URL + QR for the image-upload app.\n  model      Switch a session's model (and optionally effort), only while...\n  peek       Print the last LINES of a session's pane -- a read-only glance.\n  send       Deliver a prompt to one running agent by name.\n  serve      Start upload server for mobile image transfer.\n  sessions   List psmux sessions or attach to one.\n  status     Show which psmux sessions and services are currently running.\n  terminal   Keyboard fixes for the terminal your psmux sessions run in.\n  termius    Generate SSH config for Termius — one host that opens all...\n  up         Ensure a persistent psmux session per project (host side of...\n  watch      Live view of every agent session — who needs you, sorted first.\n",
+    (): "Usage: main [OPTIONS] [COMMAND] [ARGS]...\n\n  Open every project in its own terminal and auto-tile across all monitors.\n\nOptions:\n  --go              Skip interactive menu, launch + tile\n  --retile-all      Re-tile every matching window\n  -a, --all         Launch every enabled project -- skip the project checklist\n  -g, --group TEXT  Launch only projects in this group\n  --init            Re-scan and regenerate config\n  --base-dir PATH   Folder to scan with --init\n  --config PATH     Path to config file\n  --force           With --init, overwrite existing config\n  --edit            Open config in your default editor\n  --attach-to TEXT  Attach to remote psmux sessions (host or user@host)\n  --no-mux          With --attach-to: one plain SSH window per project (no\n                    psmux/tmux)\n  --version         Show the version and exit.\n  --help            Show this message and exit.\n\nCommands:\n  attach     Attach to another machine's magent sessions over SSH.\n  attention  Ambient attention signals for your agent fleet.\n  config     View and modify your magent configuration.\n  docs       Print the full configuration reference (Markdown).\n  doctor     Diagnose the environment: config, env vars, tools, display, dirs.\n  down       Shut down psmux sessions (and optionally the upload server).\n  hooks      Wire agent lifecycle hooks that feed the session-state store.\n  hotkey     Listen for Alt+V to upload clipboard images to psmux sessions.\n  mobile     Show the phone URL + QR for the image-upload app.\n  model      Switch a session's model (and optionally effort), only while...\n  node       Run projects on a pool of Linux machines over ssh.\n  peek       Print the last LINES of a session's pane -- a read-only glance.\n  send       Deliver a prompt to one running agent by name.\n  serve      Start upload server for mobile image transfer.\n  sessions   List psmux sessions or attach to one.\n  status     Show which psmux sessions and services are currently running.\n  terminal   Keyboard fixes for the terminal your psmux sessions run in.\n  termius    Generate SSH config for Termius — one host that opens all...\n  up         Ensure a persistent psmux session per project (host side of...\n  watch      Live view of every agent session — who needs you, sorted first.\n",
     (
         "attention",
     ): "Usage: main attention [OPTIONS]\n\n  Ambient attention signals for your agent fleet.\n\n  Badges every magent: window title with its session state, flashes the taskbar\n  when an agent needs input or errors, and (when enabled in config) sends a\n  Windows toast and/or an ntfy push. States come from the agent-state store that\n  Claude Code hooks / Codex notify already write.\n\nOptions:\n  -d, --daemon      Run detached\n  --stop            Stop the running daemon\n  --interval FLOAT  Seconds between polls (default: attention.pollIntervalS from\n                    config)\n  --help            Show this message and exit.\n",
@@ -156,6 +156,13 @@ HELP_SNAPSHOTS = {
         "config",
         "path",
     ): "Usage: main config path [OPTIONS]\n\n  Print the config file path.\n\nOptions:\n  --help  Show this message and exit.\n",
+    (
+        "node",
+    ): "Usage: main node [OPTIONS] COMMAND [ARGS]...\n\n  Run projects on a pool of Linux machines over ssh.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  sync  Mirror every node's sessions, load and agent state onto this PC.\n",
+    (
+        "node",
+        "sync",
+    ): "Usage: main node sync [OPTIONS]\n\n  Mirror every node's sessions, load and agent state onto this PC.\n\n  Each tick makes one ssh per node, running pull.sh: the node's tmux session\n  list, a load sample, and the transcript and state files that changed since the\n  last pull for the sessions this PC placed there. `magent serve` keeps it\n  running whenever a project has a node; run it by hand to debug.\n\nOptions:\n  -d, --daemon  Run detached\n  --once        Run one tick in the foreground, then exit\n  --stop        Stop the running daemon\n  --help        Show this message and exit.\n",
 }
 
 TOP_LEVEL_COMMANDS = [
@@ -169,6 +176,7 @@ TOP_LEVEL_COMMANDS = [
     "hotkey",
     "mobile",
     "model",
+    "node",
     "peek",
     "send",
     "serve",
@@ -180,6 +188,7 @@ TOP_LEVEL_COMMANDS = [
     "watch",
 ]
 TERMINAL_SUBCOMMANDS = ["install", "status"]
+NODE_SUBCOMMANDS = ["sync"]
 CONFIG_SUBCOMMANDS = [
     "add",
     "base-dir",
@@ -228,6 +237,10 @@ def test_registration_set_config_subcommands():
 
 def test_registration_set_terminal_subcommands():
     assert sorted(cli.main.commands["terminal"].commands) == TERMINAL_SUBCOMMANDS
+
+
+def test_registration_set_node_subcommands():
+    assert sorted(cli.main.commands["node"].commands) == NODE_SUBCOMMANDS
 
 
 def test_acyclic_imports():
