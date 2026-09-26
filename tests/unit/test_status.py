@@ -1609,10 +1609,12 @@ class TestAStaleNodeSyncDaemonDegradesStatus:
     upload-server line already says so), and without a node project nobody
     expects a daemon at all. Driven through the real heartbeat file."""
 
-    def _config(self, tmp_config, tmp_path, *, on_node=True):
+    def _config(self, tmp_config, tmp_path, *, on_node=True, tool=None):
         project = {"path": str(tmp_path), "title": "api"}
         if on_node:
             project["node"] = "second"
+        if tool:
+            project["tool"] = tool
         return tmp_config(
             {
                 "projects": [project],
@@ -1681,6 +1683,26 @@ class TestAStaleNodeSyncDaemonDegradesStatus:
         human = self._status(runner, cfgpath)
         assert human.exit_code == 0
         assert "node sync daemon stale" not in human.stdout
+
+    def test_status_expects_a_daemon_exactly_when_serve_spawns_one(
+        self, runner, tmp_config, tmp_path
+    ):
+        # A node-pinned IDE project has no node SESSION (it stays on this PC),
+        # but serve still spawns the daemon for it (node_sync.wanted) -- so a
+        # stale one is degraded, and is named even with no Nodes rows to show.
+        from magent import log
+
+        self._beat(log.HEARTBEAT_MAX_AGE + 30)
+        cfgpath = self._config(tmp_config, tmp_path, tool="code")
+        result = self._status(runner, cfgpath, "--json")
+        assert result.exit_code == 3
+        payload = json.loads(result.stdout)
+        assert (payload["node_sync"], payload["node_sessions"]) == ("stale", [])
+        human = self._status(runner, cfgpath)
+        assert human.exit_code == 3
+        assert "Nodes" in human.stdout
+        assert "node sync daemon stale" in human.stdout
+        assert status_mod.NODE_SYNC_REPAIR_HINT in human.stdout
 
     def test_a_fresh_heartbeat_is_ok_and_exits_0(self, runner, tmp_config, tmp_path):
         self._beat(1)

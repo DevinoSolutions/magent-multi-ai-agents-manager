@@ -37,7 +37,7 @@ from magent.cli.ui import (
     _print_names,
     _print_session_overview,
 )
-from magent.log import HEARTBEAT_MAX_AGE, heartbeat_age, heartbeat_fresh
+from magent.log import heartbeat_age, heartbeat_fresh
 from magent.paths import find_config
 from magent.procs import pid_alive
 from magent.psmux import session0_message, session0_server_pids
@@ -165,25 +165,21 @@ def _attention_state() -> str:
 
 def _node_sync_state(cfg: MagentConfig) -> str:
     """The node sync daemon, judged against whether one is EXPECTED: "off" when
-    no project runs on a node (nobody promised a daemon), else its heartbeat's
-    "ok" / "stale" / "stopped".
+    serve would not spawn one (``node_sync.wanted`` -- the same question serve
+    asks, so status expects a daemon exactly when serve starts one), else
+    ``node_cmd._daemon_state``'s "ok" / "stale" / "stopped".
 
     Only "stale" degrades (``_is_degraded``): every node row is then frozen at
     a pull nobody refreshes. "stopped" does not -- `serve` starts a daemon
     within its supervise interval, with serve off the upload-server line
     already says so, and the spec promises exit 3 for a stale daemon only.
     """
-    from magent import node_sync, nodes  # heavy subsystem: in-body per policy
+    from magent import node_sync  # heavy subsystem: in-body per policy
+    from magent.cli.node_cmd import _daemon_state  # DECISION-17's one reader
 
-    if not nodes.node_projects(cfg):
+    if not node_sync.wanted(cfg):
         return "off"
-    # D-MERGE: at the E-int final merge these four lines become a call to
-    # node_cmd._daemon_state(). One read, exactly as it reads (DECISION-17's
-    # one reader); cli/node_cmd.py reaches this branch with that merge.
-    age = heartbeat_age(node_sync.HEARTBEAT_NAME)
-    if age is None:
-        return "stopped"
-    return "ok" if age <= HEARTBEAT_MAX_AGE else "stale"
+    return _daemon_state()
 
 
 def _agents_snapshot(cfg: MagentConfig) -> list[dict[str, object]]:
@@ -370,24 +366,27 @@ def _render_status(config_file: Path) -> StatusReport:
     from magent import nodes
 
     node_rows = nodes.session_rows(cfg, now=time.time())
-    if node_rows:
-        tint = {"live": "green", "stale": "yellow", "dead": "red"}
+    # The daemon behind those rows: stale freezes every one of them, which is
+    # what makes it the one node state that degrades (_node_sync_state). Named
+    # even with no rows -- a node-pinned IDE project has none, yet serve still
+    # runs the daemon for it.
+    sync_stale = status["node_sync"] == "stale"
+    if node_rows or sync_stale:
         click.echo(f"\n  {style('Nodes', bold=True)}")
-        for node_row in node_rows:
-            node = f"@{node_row['node']}" if node_row["node"] else "(not placed)"
-            state = str(node_row["state"])
-            click.echo(
-                f"    {node_row['session']}  {style(node, fg='blue')}  {style(state, fg=tint[state])}"
-            )
-        # The daemon behind those rows: stale freezes every one of them, which
-        # is what makes it the one node state that degrades (_node_sync_state).
-        if status["node_sync"] == "stale":
-            click.echo(
-                f"  {style('node sync daemon stale  (heartbeat expired)', fg='red', bold=True)}"
-            )
-            click.echo(
-                f"  {style('Repair:', dim=True)} {style(NODE_SYNC_REPAIR_HINT, bold=True)}"
-            )
+    tint = {"live": "green", "stale": "yellow", "dead": "red"}
+    for node_row in node_rows:
+        node = f"@{node_row['node']}" if node_row["node"] else "(not placed)"
+        state = str(node_row["state"])
+        click.echo(
+            f"    {node_row['session']}  {style(node, fg='blue')}  {style(state, fg=tint[state])}"
+        )
+    if sync_stale:
+        click.echo(
+            f"  {style('node sync daemon stale  (heartbeat expired)', fg='red', bold=True)}"
+        )
+        click.echo(
+            f"  {style('Repair:', dim=True)} {style(NODE_SYNC_REPAIR_HINT, bold=True)}"
+        )
     _divider()
 
     upload_labels = {
