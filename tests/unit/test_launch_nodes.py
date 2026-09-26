@@ -506,6 +506,21 @@ class TestManyNodeProjectsAtOnce:
         # ...and all three map entries survived the concurrent writes.
         assert set(nodes.read_node_map()) == {"a1", "a2", "b1"}
 
+    def test_window_reaches_every_bring_up_in_the_batch(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # `up` never asks for windows; `--go` (Task 12) does, through here.
+        projs = _projects(tmp_path, rig, [("a1", "second"), ("b1", "third")])
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+        outcomes = launch.bring_up_node_projects(_config(*projs), window=True)
+        assert [(o.sid, o.title) for o in outcomes] == [
+            ("a1", "magent:a1"),
+            ("b1", "magent:b1"),
+        ]
+        assert sorted(sid for _, sid, _, _ in rig.windows) == ["a1", "b1"]
+
     def test_the_nodes_log_is_set_up_before_the_fan_out(
         self, rig, tmp_path, monkeypatch
     ):
@@ -626,6 +641,60 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
             ("api-x", False),
             ("api-y", False),
         ]
+
+    def test_an_auto_project_the_map_placed_collides_like_a_pinned_one(
+        self, rig, tmp_path
+    ):
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        nodes.update_node_map(
+            "api-y",
+            NodeMapEntry(
+                nick="third",
+                sid="api-y",
+                placed_ts=1.0,
+                attached_existing=False,
+                remote_root="~/magent/api",
+                target="amin@devino-third",
+            ),
+        )
+        outcomes = _batch(_config(x_api, y_api))
+        assert [(o.sid, o.ok, o.node) for o in outcomes] == [
+            ("api-x", False, "second"),
+            ("api-y", False, "third"),
+        ]
+        assert rig.recipes == []
+
+    def test_a_title_that_is_not_a_session_id_is_still_refused(self, rig, tmp_path):
+        # The refusal is keyed by session id, which a title only becomes once
+        # sanitized: "API X" runs as API-X.
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        x_api.title, y_api.title = "API X", "API Y"
+        outcomes = _batch(_config(x_api, y_api))
+        assert [(o.sid, o.ok) for o in outcomes] == [("API-X", False), ("API-Y", False)]
+        assert rig.recipes == []
+
+    @pytest.mark.parametrize(
+        "make",
+        [
+            lambda tmp: ProjectConfig(path=str(tmp / "gone"), node="second"),
+            lambda tmp: ProjectConfig(path=str(tmp / "web2"), node="auto"),
+        ],
+        ids=["missing-folder", "unplaced-auto"],
+    )
+    def test_a_project_the_scan_skips_does_not_hide_a_later_pair(
+        self, rig, tmp_path, make
+    ):
+        (tmp_path / "web2").mkdir()
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        outcomes = _batch(_config(make(tmp_path), x_api, y_api))
+        assert [o.ok for o in outcomes] == [False, False, False]
+        assert ["would share" in (o.error or "") for o in outcomes] == [
+            False,
+            True,
+            True,
+        ]
+        assert rig.recipes == []
 
     def test_a_folder_the_scan_cannot_read_is_that_projects_outcome(
         self, rig, tmp_path, monkeypatch
