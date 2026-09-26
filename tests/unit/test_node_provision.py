@@ -1441,6 +1441,20 @@ class TestRegisterSshKey:
             "did", "github-key", f"registered to amin as '{TITLE}'"
         )
 
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "ecdsa-sha2-nistp256 AAAAE2VjZHNh magent@n",
+            "sk-ssh-ed25519@openssh.com AAAAGnNr magent@n",
+        ],
+    )
+    def test_every_openssh_key_family_is_added(self, fake_gh, key):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        row = remote_mux.register_ssh_key(key, title=TITLE)
+        assert row.status == "did"
+        (add,) = _adds(fake_gh)
+        assert add.stdin == (key + "\n").encode("ascii")
+
     def test_write_public_key_is_scope_enough(self, fake_gh):
         fake_gh.set_reply(
             "auth status", stdout=gh_auth_status("amin", "write:public_key")
