@@ -686,11 +686,10 @@ def _from_git_listing(repo: Path, ignored: tuple[str, ...]) -> list[Path]:
         if entry.endswith("/"):
             # A wholly ignored directory is never descended (node_modules is
             # not a push); only a fixed path that lives inside it can ship.
-            found += [
-                repo / fixed
-                for fixed in _PUSH_FIXED
-                if fixed.startswith(entry) and path_is_file(repo / fixed)
-            ]
+            # Listed unlooked-at: _push judges it like any git hit (the
+            # credential stores first), so one file has one outcome however
+            # git listed it -- an unreadable one warns, a missing one is none.
+            found += [repo / fixed for fixed in _PUSH_FIXED if fixed.startswith(entry)]
         elif _is_env_file(entry.rsplit("/", 1)[-1]) or entry in _PUSH_FIXED:
             # git emits '/' on every OS, like the _PUSH_FIXED literals.
             found.append(repo / entry)

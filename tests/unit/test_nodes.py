@@ -1147,6 +1147,15 @@ def _real_state(repo: Path) -> LocalGitState:
     return _state(repo, remote_mux.ignored_paths(repo, timeout_s=30, label="test"))
 
 
+def _raised_or(work):
+    """``work()``'s answer, or the OSError it raised: a pin compares either
+    against what it expects, so "it raised" fails as a wrong answer."""
+    try:
+        return work()
+    except OSError as exc:
+        return exc
+
+
 class TestGitsIgnoredListing:
     def test_a_wholly_ignored_directory_is_one_entry(self, repo):
         listing = remote_mux.ignored_paths(repo, timeout_s=30, label="test")
@@ -1313,17 +1322,23 @@ class TestPushSet:
         )
         assert (shipped, warned) == ((), ())
 
-    def test_local_settings_that_cannot_be_read_are_an_error_not_absent(
-        self, tmp_path, monkeypatch
+    @pytest.mark.parametrize("listed", [".claude/", ".claude/settings.local.json"])
+    def test_local_settings_that_cannot_be_read_are_skipped_and_named(
+        self, tmp_path, monkeypatch, listed
     ):
+        # One file, one outcome, however git listed it (the folder, or the
+        # file): skipped like any listed file, and said so -- never absent.
         (tmp_path / ".claude").mkdir()
         settings = tmp_path / ".claude" / "settings.local.json"
         settings.write_text("{}", encoding="utf-8")
-        deny_stat(monkeypatch, settings)
-        with pytest.raises(PermissionError):
-            nodes.push_set(
-                tmp_path, [_state(tmp_path, (".claude/",))], home=Path.home()
+        deny_stat(monkeypatch, settings.resolve())
+        pushed = _raised_or(
+            lambda: nodes._push(
+                tmp_path, [_state(tmp_path, (listed,))], home=Path.home(), extras=()
             )
+        )
+        warning = "push: .claude/settings.local.json cannot be read (PermissionError)"
+        assert pushed == ((), (f"{warning}; skipped",))
 
     def test_a_wholly_ignored_claude_dir_still_ships_its_local_settings(self, tmp_path):
         (tmp_path / ".claude").mkdir()
