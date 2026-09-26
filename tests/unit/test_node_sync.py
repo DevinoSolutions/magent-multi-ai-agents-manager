@@ -17,7 +17,7 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -429,6 +429,12 @@ def _capture_nodes_log(caplog: pytest.LogCaptureFixture) -> None:
 
 def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def _errors(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Every ERROR record from the nodes log, and only from it."""
+    name = f"magent.{node_sync.LOG_NAME}"
+    return [r for r in caplog.records if r.name == name and r.levelno >= logging.ERROR]
 
 
 @pytest.fixture
@@ -1737,10 +1743,13 @@ class TestTheLoop:
             )
         assert seen == []
 
-    def test_a_crash_keeps_the_heartbeat_as_its_marker(self, placed, monkeypatch):
-        """The crash is raised by the tick itself, not by a pull: a node's
-        failure is reduced to an outcome inside _sync_node, so only a bug in
-        the loop's own machinery escapes -- and that must crash the loop."""
+    def test_a_crash_keeps_the_heartbeat_as_its_marker(
+        self, placed, monkeypatch, caplog
+    ):
+        """The crash is raised by the tick itself, not by a pull: a bug in the
+        loop's own machinery must crash the loop, logged once at ERROR with
+        its traceback, and leave the heartbeat behind as the marker."""
+        _capture_nodes_log(caplog)
 
         def broken(_self, *, wait_s=None):
             raise ValueError("boom")
@@ -1750,6 +1759,27 @@ class TestTheLoop:
             node_sync.run_sync_loop(_config(), max_ticks=1, pull=_recording_pull([]))
         assert heartbeat_age(node_sync.HEARTBEAT_NAME) is not None
         assert node_sync.daemon_pid() is None
+        (crash,) = _errors(caplog)
+        assert crash.getMessage() == "node sync daemon crashed"
+        assert crash.exc_info is not None
+
+    # Superseded by E11 (96c51f8): there a bug in one pull becomes that node's
+    # (failed, "internal error: <Type>"), and E11's test replaces this one.
+    def test_a_bug_in_a_pull_crashes_the_loop(self, placed, caplog):
+        """_sync_node reduces only NodeConfigError, LockHeld, RemoteError and
+        OSError to an outcome. Anything else raised inside a pull is a bug: it
+        propagates out of the tick and crashes the loop, heartbeat kept."""
+        _capture_nodes_log(caplog)
+
+        def broken(_node, _sids):
+            raise ValueError("boom")
+
+        with pytest.raises(ValueError, match="boom"):
+            node_sync.run_sync_loop(_config(), max_ticks=1, pull=broken)
+        assert heartbeat_age(node_sync.HEARTBEAT_NAME) is not None
+        assert node_sync.daemon_pid() is None
+        (crash,) = _errors(caplog)
+        assert crash.exc_info is not None
 
     def test_a_changed_config_is_picked_up_between_ticks(self, placed):
         seen: list[tuple[str, list[str]]] = []
@@ -1787,6 +1817,44 @@ class TestTheLoop:
         )
         assert len(seen) == 4
 
+    def test_the_loop_keeps_a_fixed_cadence(self, placed):
+        """The sleep is what is left of the tick interval after the tick, so a
+        slow tick does not push every later one back."""
+        clock = [0.0]
+        slept: list[float] = []
+
+        def pull(node, _sids):
+            if node.nick == "second":
+                clock[0] += 12.0
+            return _snapshot()
+
+        node_sync.run_sync_loop(
+            _config(pull_interval_s=30, sample_interval_s=60),
+            max_ticks=2,
+            sleep=slept.append,
+            clock=lambda: clock[0],
+            pull=pull,
+        )
+        assert slept == [18.0]
+
+    def test_a_tick_longer_than_the_interval_does_not_sleep(self, placed):
+        clock = [0.0]
+        slept: list[float] = []
+
+        def pull(node, _sids):
+            if node.nick == "second":
+                clock[0] += 45.0
+            return _snapshot()
+
+        node_sync.run_sync_loop(
+            _config(pull_interval_s=30, sample_interval_s=60),
+            max_ticks=2,
+            sleep=slept.append,
+            clock=lambda: clock[0],
+            pull=pull,
+        )
+        assert slept == [0.0]
+
     def test_one_tick_refuses_while_the_daemon_holds_the_lock(self, placed):
         with exclusive_lock(node_sync.LOCK_NAME), pytest.raises(LockHeld):
             node_sync.run_once(_config(), pull=_recording_pull([]))
@@ -1821,12 +1889,18 @@ class _RecordingExecutor(ThreadPoolExecutor):
         super().shutdown(wait=wait, cancel_futures=cancel_futures)
 
 
-@pytest.fixture
-def executors(monkeypatch) -> list[_RecordingExecutor]:
+@pytest.fixture(autouse=True)
+def executors(monkeypatch) -> Iterator[list[_RecordingExecutor]]:
+    """Every pull pool a syncer in this module builds is recorded, and every
+    worker is joined at teardown. The join runs BEFORE monkeypatch undoes the
+    NODES_DIR and home redirects (this fixture depends on monkeypatch, so it
+    is torn down first), so a late _store can never write into the real
+    ~/.magent -- the home-isolation law, for threads that outlive a test."""
     made: list[_RecordingExecutor] = []
     monkeypatch.setattr(_RecordingExecutor, "made", made, raising=False)
     monkeypatch.setattr(node_sync, "ThreadPoolExecutor", _RecordingExecutor)
-    return made
+    yield made
+    _drain(made)
 
 
 def _drain(executors: list[_RecordingExecutor]) -> None:
@@ -1834,6 +1908,52 @@ def _drain(executors: list[_RecordingExecutor]) -> None:
     still be writing the mirror after this test's path redirects are undone."""
     for e in executors:
         ThreadPoolExecutor.shutdown(e, wait=True)
+
+
+class _Clock:
+    """The syncer's monotonic clock, set by hand."""
+
+    def __init__(self) -> None:
+        self.at = 0.0
+
+    def __call__(self) -> float:
+        return self.at
+
+
+def _running(age: int) -> tuple[str, str]:
+    return (node_sync.UNREACHABLE, f"{node_sync.PULL_STILL_RUNNING} after {age}s")
+
+
+def _wait_out_the_laggard(syncer: node_sync.NodeSyncer, nick: str) -> None:
+    """Block (bounded) until ``nick``'s in-flight pull has ended, so the next
+    tick sees a DONE previous future and takes its between-ticks branch."""
+    (_, pending) = wait([syncer._inflight[nick]], timeout=10)
+    assert not pending, f"{nick}'s released pull never ended"
+
+
+def _hang_then_raise(
+    monkeypatch: pytest.MonkeyPatch, release: threading.Event, error: Exception
+) -> None:
+    """Make _sync_node ITSELF hang for ``second`` until ``release``, then raise
+    ``error`` -- once; later calls run the real _sync_node. Raising here, not
+    from the pull, keeps the error outside any catch-all inside _sync_node."""
+    real = node_sync.NodeSyncer._sync_node
+    raised = threading.Event()
+
+    def sync_node(self, nick, entries, local_user, config):
+        if nick == "second" and not raised.is_set():
+            raised.set()
+            assert release.wait(30), "the test never released the hung pull"
+            raise error
+        return real(self, nick, entries, local_user, config)
+
+    monkeypatch.setattr(node_sync.NodeSyncer, "_sync_node", sync_node)
+
+
+def _reachable_again(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records if "reachable again" in r.getMessage()
+    ]
 
 
 class TestAHungNodeDoesNotHoldTheTick:
@@ -1846,30 +1966,41 @@ class TestAHungNodeDoesNotHoldTheTick:
     ):
         release = threading.Event()
         dialled: list[str] = []
-        syncer = node_sync.NodeSyncer(_config(), pull=_blocking_pull(release, dialled))
+        clock = _Clock()
+        syncer = node_sync.NodeSyncer(
+            _config(), pull=_blocking_pull(release, dialled), clock=clock
+        )
         try:
             started = time.monotonic()
             first = syncer.tick(wait_s=0.2)
+            clock.at = 7.0
             second = syncer.tick(wait_s=0.2)
             elapsed = time.monotonic() - started
         finally:
             release.set()
             syncer.close()
             _drain(executors)
-        running = (node_sync.UNREACHABLE, node_sync.PULL_STILL_RUNNING)
-        assert first == second == {"second": running, "third": (node_sync.OK, "")}
+        ok = (node_sync.OK, "")
+        assert first == {"second": _running(0), "third": ok}
+        assert second == {"second": _running(7), "third": ok}
         assert elapsed < 10
         # The laggard is not dialled again while its pull is still running.
         assert sorted(dialled) == ["second", "third", "third"]
 
-    def test_the_laggard_reads_ok_on_the_tick_after_it_finishes(
+    def test_a_slow_pull_inside_the_stale_threshold_is_no_news(
         self, placed, caplog, executors
     ):
+        """sessions.json only reads stale past two pull intervals; a pull that
+        is merely slow until then logs nothing, either way."""
         _capture_nodes_log(caplog)
         release = threading.Event()
-        syncer = node_sync.NodeSyncer(_config(), pull=_blocking_pull(release, []))
+        clock = _Clock()
+        syncer = node_sync.NodeSyncer(
+            _config(pull_interval_s=30), pull=_blocking_pull(release, []), clock=clock
+        )
         try:
             syncer.tick(wait_s=0.2)
+            clock.at = 60.0  # == 2 * pull_interval_s: not yet past it
             syncer.tick(wait_s=0.2)
             release.set()
             after = syncer.tick(wait_s=10)
@@ -1878,14 +2009,185 @@ class TestAHungNodeDoesNotHoldTheTick:
             syncer.close()
             _drain(executors)
         assert after == {"second": (node_sync.OK, ""), "third": (node_sync.OK, "")}
+        assert _node_warnings(caplog, "second") == []
+        assert _reachable_again(caplog) == []
+
+    def test_a_pull_past_the_stale_threshold_warns_once_and_recovers_once(
+        self, placed, caplog, executors
+    ):
+        _capture_nodes_log(caplog)
+        release = threading.Event()
+        clock = _Clock()
+        syncer = node_sync.NodeSyncer(
+            _config(pull_interval_s=30), pull=_blocking_pull(release, []), clock=clock
+        )
+        try:
+            syncer.tick(wait_s=0.2)
+            clock.at = 61.0
+            syncer.tick(wait_s=0.2)
+            clock.at = 300.0
+            syncer.tick(wait_s=0.2)
+            release.set()
+            after = syncer.tick(wait_s=10)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+        assert after["second"] == (node_sync.OK, "")
         assert _node_warnings(caplog, "second") == [
-            "node second: unreachable (previous pull still running)"
+            "node second: unreachable (pull still running after 61s)"
         ]
-        assert [
-            r.getMessage()
-            for r in caplog.records
-            if "reachable again" in r.getMessage()
-        ] == ["node second: reachable again"]
+        assert _reachable_again(caplog) == ["node second: reachable again"]
+
+    def test_a_laggard_that_ends_failed_is_logged_then_recovers(
+        self, placed, caplog, executors
+    ):
+        """The laggard's own outcome is news once it ends: FAILED logs its
+        reason, and the next OK logs the recovery. The laggard is waited out
+        BEFORE the next tick, so that tick takes the ended-between-ticks
+        branch every time rather than collecting it in its own wait."""
+        _capture_nodes_log(caplog)
+        release = threading.Event()
+        calls: list[str] = []
+
+        def pull(node, _sids):
+            calls.append(node.nick)
+            if node.nick == "second" and calls.count("second") == 1:
+                assert release.wait(30), "the test never released the hung pull"
+                raise remote_mux.RemoteError(1, "pull.sh: broke\n", ("ssh",))
+            return _snapshot()
+
+        syncer = node_sync.NodeSyncer(_config(), pull=pull, clock=_Clock())
+        try:
+            syncer.tick(wait_s=0.2)
+            release.set()
+            _wait_out_the_laggard(syncer, "second")
+            syncer.tick(wait_s=10)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+        assert _node_warnings(caplog, "second") == [
+            "node second: failed (pull.sh: broke)"
+        ]
+        assert _reachable_again(caplog) == ["node second: reachable again"]
+
+    def test_a_node_readded_while_its_old_pull_runs_is_not_dialled_twice(
+        self, placed, executors
+    ):
+        """A removed node's pull is kept until it ends, so re-adding the node
+        finds it instead of starting a second pull beside it."""
+        release = threading.Event()
+        dialled: list[str] = []
+        syncer = node_sync.NodeSyncer(
+            _config(), pull=_blocking_pull(release, dialled), clock=_Clock()
+        )
+        third_only = _config(
+            pool={"third": POOL["third"]},
+            projects=[ProjectConfig(path="web", node="third")],
+        )
+        try:
+            syncer.tick(wait_s=0.2)
+            syncer.reconfigure(third_only)
+            syncer.tick(wait_s=0.2)
+            syncer.reconfigure(_config())
+            back = syncer.tick(wait_s=0.2)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+        assert back["second"] == _running(0)
+        assert dialled.count("second") == 1
+
+    def test_a_removed_nodes_pull_that_raises_still_surfaces(
+        self, placed, executors, monkeypatch
+    ):
+        """No outcome is reported for a node that left the pool, but an error
+        its worker raised is not swallowed: the next tick re-raises it. Raised
+        from _sync_node itself, outside any catch-all inside it, so this pins
+        the gone-node re-raise however _sync_node classifies a pull."""
+        release = threading.Event()
+        _hang_then_raise(monkeypatch, release, ValueError("orphan"))
+        syncer = node_sync.NodeSyncer(
+            _config(), pull=_recording_pull([]), clock=_Clock()
+        )
+        third_only = _config(
+            pool={"third": POOL["third"]},
+            projects=[ProjectConfig(path="web", node="third")],
+        )
+        try:
+            syncer.tick(wait_s=0.2)
+            syncer.reconfigure(third_only)
+            release.set()
+            _wait_out_the_laggard(syncer, "second")
+            with pytest.raises(ValueError, match="orphan"):
+                syncer.tick(wait_s=10)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+
+    def test_a_laggard_stores_under_the_config_its_tick_started_with(
+        self, placed, executors
+    ):
+        """A reconfigure while a pull is running must not reach that pull: it
+        was dialled under the old pool and is stored under the old settings
+        (here the history window, which decides what load.jsonl keeps)."""
+        entered = threading.Event()
+        release = threading.Event()
+        hosts: list[str] = []
+
+        def pull(node, _sids):
+            hosts.append(node.host)
+            if node.nick == "second":
+                entered.set()
+                assert release.wait(30), "the test never released the hung pull"
+            return _snapshot(sample=nodes.LoadSample(**SAMPLE))
+
+        old_row = json.dumps({**SAMPLE, "ts": 1000.0 - 2 * 3600})
+        nodes.write_text_atomic(nodes.load_path("second"), old_row + "\n")
+        moved = {"second": NodeConfig(nick="second", host="devino-moved", user="amin")}
+        syncer = node_sync.NodeSyncer(
+            _config(history_h=24), pull=pull, now=lambda: 1000.0
+        )
+        try:
+            syncer.tick(wait_s=0.2)
+            assert entered.wait(10)
+            syncer.reconfigure(_config(pool=moved, history_h=1))
+        finally:
+            release.set()
+            _drain(executors)
+        rows = [
+            json.loads(x)["ts"]
+            for x in nodes.load_path("second").read_text(encoding="utf-8").splitlines()
+        ]
+        assert "devino-moved" not in hosts
+        assert rows == [1000.0 - 2 * 3600, 1000.0]  # the old 24 h window kept it
+
+    def test_a_laggard_that_raises_surfaces_on_the_next_tick(
+        self, placed, executors, monkeypatch
+    ):
+        """A worker that raises after its tick stopped waiting is re-raised by
+        the next tick -- the loop then crashes, as for any escaping exception.
+        The error is raised by _sync_node itself, outside the try E11
+        (96c51f8) adds a catch-all to, so this still pins the laggard re-raise
+        after that merge. Only the FIRST call raises: the redial is healthy,
+        so only the ended laggard's own result can make this tick raise."""
+        release = threading.Event()
+        _hang_then_raise(monkeypatch, release, ValueError("late"))
+        syncer = node_sync.NodeSyncer(_config(), pull=_recording_pull([]))
+        try:
+            first = syncer.tick(wait_s=0.2)
+            release.set()
+            _wait_out_the_laggard(syncer, "second")
+            with pytest.raises(ValueError, match="late"):
+                syncer.tick(wait_s=10)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+        assert first["second"][0] == node_sync.UNREACHABLE
+        assert first["second"][1].startswith(node_sync.PULL_STILL_RUNNING)
 
     def test_a_smaller_pool_gets_a_new_executor(self, placed, executors):
         syncer = node_sync.NodeSyncer(_config(), pull=_recording_pull([]))
@@ -1898,6 +2200,31 @@ class TestAHungNodeDoesNotHoldTheTick:
         assert [e.max_workers for e in executors] == [2, 1]
         assert executors[0].shutdowns == [(False, False)]
         assert executors[1].shutdowns == [(False, True)]
+
+    def test_ticks_over_the_same_pool_share_one_executor(self, placed, executors):
+        syncer = node_sync.NodeSyncer(_config(), pull=_recording_pull([]))
+        try:
+            syncer.tick()
+            syncer.tick()
+        finally:
+            syncer.close()
+        assert len(executors) == 1
+
+    def test_one_shot_waits_for_every_pull(self, placed):
+        """run_once has no next tick to collect a laggard, so it joins."""
+
+        def slow(_node, _sids):
+            time.sleep(0.3)
+            return _snapshot()
+
+        assert node_sync.run_once(_config(), pull=slow) == {
+            "second": (node_sync.OK, ""),
+            "third": (node_sync.OK, ""),
+        }
+
+    def test_the_daemon_waits_half_a_tick_for_its_pulls(self):
+        cfg = _config(pull_interval_s=30, sample_interval_s=60)
+        assert node_sync.tick_wait_s(cfg) == node_sync.tick_interval_s(cfg) / 2 == 15.0
 
     def test_the_loop_shuts_its_executor_down_without_joining_a_hung_pull(
         self, placed, executors
