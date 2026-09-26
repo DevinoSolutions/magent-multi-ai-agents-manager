@@ -1876,13 +1876,15 @@ class TestALinkedSkillShipsAsItsContent:
             fileobj=io.BytesIO(payload.partition(b"\n")[2]), mode="r:gz"
         ) as tar:
             members = tar.getmembers()
+            # Regular members only -- not even a folder one: tar makes the
+            # folders. Checked before any is read: tarfile resolves a link
+            # member's target on extractfile.
+            assert {m.type for m in members} == {tarfile.REGTYPE}
             data: dict[str, bytes] = {}
             for m in members:
                 blob = tar.extractfile(m)
                 assert blob is not None  # a regular file has content to extract
                 data[m.name] = blob.read()
-        # Regular members only -- not even a folder one: tar makes the folders.
-        assert {m.type for m in members} == {tarfile.REGTYPE}
         assert data["skills/bar/tool.js"] == b"tool\n"
         assert data["skills/bar/tool-copy.js"] == b"tool\n"
         assert data["skills/bar/lib.md"] == b"shared\n"
@@ -1898,6 +1900,7 @@ class TestALinkedSkillShipsAsItsContent:
             fileobj=io.BytesIO(payload.partition(b"\n")[2]), mode="r:gz"
         ) as tar:
             members = [m for m in tar.getmembers() if m.name.startswith("skills/")]
+            assert all(m.isreg() for m in members)  # before extractfile follows one
             data: dict[str, bytes] = {}
             for m in members:
                 blob = tar.extractfile(m)
@@ -1909,7 +1912,6 @@ class TestALinkedSkillShipsAsItsContent:
             "skills/foo/SKILL.md",
             "skills/foo/run.sh",
         ]
-        assert all(m.isreg() for m in members)
         assert data["skills/bar/lib.md"] == b"shared\n"
         assert data["skills/foo/run.sh"] == b"#!/bin/sh\necho foo\n"
 
