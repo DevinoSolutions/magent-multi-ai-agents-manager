@@ -1283,8 +1283,9 @@ def walk_memory(
     realpath. Every file must resolve inside the resolved folder too.
 
     What is skipped is logged, never raised: a bring-up never fails because
-    of memory. A folder that cannot be listed is also handed to
-    ``unreadable``, with its error."""
+    of memory. What cannot be READ -- a folder that cannot be listed, a file
+    that cannot be stat-ed -- is also handed to ``unreadable``, with its
+    error."""
     log = get_logger("nodes")
     if memory_is_link(memory):
         log.warning("memory folder %s is a link; no memory shipped", memory)
@@ -1315,6 +1316,8 @@ def walk_memory(
             except OSError as exc:
                 # Named, not taken for "not a file" (Python 3.14's is_file).
                 log.warning("memory file %s cannot be read; skipped: %s", path, exc)
+                if unreadable is not None:
+                    unreadable(path, exc)
                 continue
             if not regular:
                 log.warning("memory entry %s is not a regular file; skipped", path)

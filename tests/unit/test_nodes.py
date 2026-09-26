@@ -1839,6 +1839,29 @@ class TestRecipeFor:
             "memory: cannot be read (PermissionError); no memory shipped",
         )
 
+    def test_a_memory_file_that_cannot_be_read_is_named_like_a_folder(
+        self, repo, monkeypatch, caplog
+    ):
+        memory = _memory_of(repo)
+        (memory / "notes").mkdir(parents=True)
+        (memory / "notes" / "denied.md").write_text("- d\n", encoding="utf-8")
+        state = _real_state(repo)
+        deny_stat(monkeypatch, memory / "notes" / "denied.md")
+        with caplog.at_level("WARNING", logger="magent.nodes"):
+            recipe = nodes.recipe_for(
+                ProjectConfig(path=str(repo), node="second"),
+                NODE,
+                [state],
+                home=Path.home(),
+                project_dir=repo,
+            )
+        assert recipe.memory_dir == memory
+        assert recipe.warnings == (
+            "memory: notes/denied.md cannot be read (PermissionError); skipped",
+        )
+        assert str(memory / "notes" / "denied.md") in caplog.text
+        assert "Permission denied" in caplog.text
+
     def test_no_memory_dir_is_none(self, repo):
         recipe = nodes.recipe_for(
             ProjectConfig(path=str(repo), node="second"),
