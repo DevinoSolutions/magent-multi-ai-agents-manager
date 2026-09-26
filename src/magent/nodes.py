@@ -892,7 +892,8 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     the login. Both sides of every comparison are resolved first, so a
     ``~/.ssh`` or ``~/.claude`` that is itself a junction elsewhere (OneDrive
     setups) is still recognised. A skills folder that is itself such a link
-    ships nothing.
+    ships nothing -- one resolving elsewhere in ~/.claude (a ``skills-v2``)
+    with a note of its own; the path is in the log only.
 
     That is defence in depth, NOT containment: a link to any other folder
     (``~/private-notes``) ships what it holds, deliberately -- the user put
@@ -916,13 +917,21 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     # ~/.claude/skills resolved where ~/.claude resolves: anywhere else in
     # ~/.claude (the transcripts, say) is no skills folder.
     own = os.path.normcase(os.path.join(fences.claude, "skills"))
-    if (
-        _above(anchors[1], anchors[0])
-        or any(_within(s, anchors[1]) for s in fences.secrets)
-        or (_within(fences.claude, anchors[1]) and anchors[1] != own)
+    if _above(anchors[1], anchors[0]) or any(
+        _within(s, anchors[1]) for s in fences.secrets
     ):
         notes.append("skills: links to a folder it must not read, not followed")
         _log.warning("%s links to %s: not followed", root, anchors[1])
+        return ()
+    if _within(fences.claude, anchors[1]) and anchors[1] != own:
+        notes.append(
+            "skills: resolves into ~/.claude outside ~/.claude/skills, not shipped"
+        )
+        _log.warning(
+            "%s resolves to %s, in ~/.claude outside ~/.claude/skills: not shipped",
+            root,
+            anchors[1],
+        )
         return ()
     if any((root / top).exists() for top in SKILLS_EXCLUDED_TOP):
         notes.append("skills/synced: claude.ai-managed copies, not shipped")

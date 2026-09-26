@@ -1634,6 +1634,7 @@ class TestTheSkillsWalkKnowsASecretWhenItSeesOne:
 
 
 CLAUDE_ELSEWHERE = "links into ~/.claude outside the skills folder, not followed"
+ROOT_IN_CLAUDE = "resolves into ~/.claude outside ~/.claude/skills, not shipped"
 
 
 # ~/.claude holds session transcripts (projects/), history and the login --
@@ -1673,9 +1674,25 @@ class TestTheSkillsWalkNeverReadsTheRestOfClaude:
         _link_dir(home / ".claude" / "skills", home / ".claude" / "projects")
         scope = nodes.user_scope(home)
         assert scope.skills == ()
-        assert scope.notes == (
-            "skills: links to a folder it must not read, not followed",
-        )
+        assert scope.notes == (f"skills: {ROOT_IN_CLAUDE}",)
+
+    # Even a sibling that holds real skills (~/.claude/skills-v2): anywhere in
+    # ~/.claude but its own skills folder is refused, and never silently. The
+    # note is our words and the why; the path is in nodes.log only.
+    def test_a_skills_folder_linked_to_a_sibling_says_why_and_logs_where(
+        self, tmp_path, caplog
+    ):
+        home = _pc_home(tmp_path)
+        _skill(home / ".claude", "skills-v2/s/SKILL.md")
+        _link_dir(home / ".claude" / "skills", home / ".claude" / "skills-v2")
+        caplog.set_level("WARNING", logger="nodes")
+        scope = nodes.user_scope(home)
+        assert scope.skills == ()
+        assert scope.notes == (f"skills: {ROOT_IN_CLAUDE}",)
+        assert "skills-v2" not in repr(scope.notes)
+        (record,) = [r for r in caplog.records if "skills-v2" in r.getMessage()]
+        assert record.levelname == "WARNING"
+        assert "outside ~/.claude/skills" in record.getMessage()
 
     # Both sides resolved: with ~/.claude a junction elsewhere (OneDrive
     # setups), the transcripts it points at are still recognised, and its own
