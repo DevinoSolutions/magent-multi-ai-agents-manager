@@ -1635,16 +1635,12 @@ def _placement_recipes(
     The recipe carries only what ``nodes.remote_root_collisions`` reads (its
     project, sid and remote_root). A project that cannot be placed yet (no
     folder here, an unplaced ``auto``, a folder with no usable name) is left
-    out: its own bring-up names that reason. An unreadable map places the
-    pinned projects anyway; each bring-up then reports the map itself."""
+    out: its own bring-up names that reason."""
     # heavy subsystem: in-body per policy
     from magent import nodes
     from magent.env import local_username
 
-    try:
-        held = nodes.read_node_map()
-    except (ValueError, OSError):
-        held = {}
+    held = nodes.read_node_map()
     out: dict[str, tuple[str, Recipe]] = {}
     for proj in projects:
         name = nodes.project_name(proj)

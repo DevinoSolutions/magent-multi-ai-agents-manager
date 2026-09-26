@@ -690,27 +690,6 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         assert reason in (outcomes[0].error or "")
         assert [nick for nick, _ in rig.recipes] == ["second"]
 
-    def test_an_unreadable_map_still_checks_the_pinned_projects(
-        self, rig, tmp_path, monkeypatch
-    ):
-        # The map only places ``auto`` projects; a pinned pair collides with or
-        # without it, so a broken map must not switch the check off. The
-        # bystander's own bring-up then reports the map.
-        projs = _twin_apis(tmp_path, rig)
-        _no_contact_for(monkeypatch, rig, "api-x", "api-y")
-
-        def broken(*_a: object, **_k: object) -> dict[str, NodeMapEntry]:
-            raise ValueError("node-map.json: not valid JSON")
-
-        monkeypatch.setattr(nodes, "read_node_map", broken)
-        outcomes = _batch(_config(*projs))
-        assert [o.ok for o in outcomes] == [False, False, False]
-        assert [
-            "would share the node folder name 'api'" in (o.error or "")
-            for o in outcomes
-        ] == [True, True, False]
-        assert "not valid JSON" in (outcomes[2].error or "")
-
 
 class TestUpBringsUpNodeProjectsToo:
     def test_local_and_node_results_are_merged_and_node_lines_printed(
