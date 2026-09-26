@@ -868,7 +868,7 @@ class TestTheRemoteSshWarningAsksTheClientRule:
         )
         monkeypatch.setattr("shutil.which", lambda _name: None)
         self._launch()
-        assert "not on PATH" not in capsys.readouterr().out
+        assert "no ssh client found" not in capsys.readouterr().out
 
     def test_no_client_anywhere_still_warns(self, monkeypatch, capsys, fake_sleep):
         from magent import attach_client
@@ -876,7 +876,10 @@ class TestTheRemoteSshWarningAsksTheClientRule:
         monkeypatch.setattr(attach_client, "find_ssh", lambda: None)
         monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
         self._launch()
-        assert "'ssh' not on PATH" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        # The rule looks past PATH (Windows' own OpenSSH first).
+        assert "Remote projects configured but no ssh client found." in out
+        assert "PATH" not in out
 
 
 class TestPrepareGrid:

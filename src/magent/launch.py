@@ -789,7 +789,9 @@ def _launch_projects(
     # OpenSSH with nothing on PATH is not a missing client.
     if has_remote and attach_client.find_ssh() is None:
         click.echo(
-            style("  ! Remote projects configured but 'ssh' not on PATH.", fg="yellow")
+            style(
+                "  ! Remote projects configured but no ssh client found.", fg="yellow"
+            )
         )
 
     targets: list[_Target] = []
