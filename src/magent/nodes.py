@@ -833,13 +833,14 @@ def _shippable_git_target(
 ) -> Path | None:
     """A path git's listing reported is a snapshot claim: its resolved target
     (symlinks followed) when it is a regular file now and not a credential
-    store's, else None."""
+    store's, else None -- gone since the listing included. Raises OSError when
+    whether it is a file cannot be told (``path_mode``): the caller skips it
+    too, but says so."""
     target = _try_resolve(path)
-    # os.path.isfile never raises (a stat error is "not a file" on every
-    # Python), which Path.is_file only guarantees from 3.13 on.
-    if target is None or not os.path.isfile(target) or _is_forbidden(target, forbidden):
+    if target is None or _is_forbidden(target, forbidden):
         return None
-    return target
+    mode = path_mode(target)
+    return target if mode is not None and stat.S_ISREG(mode) else None
 
 
 def _listed_name(hit: Path, repo: Path, root: Path) -> str:
@@ -956,7 +957,17 @@ def _push(
     warnings: list[str] = []
     for state in states:
         for hit in _from_git_listing(state.path, state.ignored):
-            target = _shippable_git_target(hit, forbidden)
+            try:
+                target = _shippable_git_target(hit, forbidden)
+            except OSError as exc:
+                # Still skipped -- a listed file is a snapshot claim -- but
+                # never silently: the class on screen, the rest in the log.
+                name = _listed_name(hit, state.path, root)
+                get_logger("nodes").warning("push file %s: %s", hit, exc)
+                warnings.append(
+                    f"push: {name} cannot be read ({type(exc).__name__}); skipped"
+                )
+                continue
             if target is None:
                 continue
             # git DESCENDS a junction/directory link (Git for Windows lists
@@ -1244,6 +1255,40 @@ def refusal_for(state: LocalGitState, *, allow_dirty: bool = False) -> str | Non
     return None
 
 
+def _memory_state(memory: Path) -> tuple[bool, tuple[str, ...]]:
+    """Whether the memory folder ``memory`` ships, and one warning per part of
+    it that cannot be read. Never raises: a bring-up never fails because of
+    memory, and nor does an unreadable folder pass for none -- each is named,
+    class only, with the path and the full error in nodes.log. The walk is the
+    payload's own (``remote_mux._memory_files``, whose onerror logs the same
+    folders); run here, its warnings reach the screen with the recipe's."""
+    log = get_logger("nodes")
+    folder_warning = "memory: cannot be read ({}); no memory shipped"
+    try:
+        if not path_is_dir(memory):
+            return False, ()
+    except OSError as exc:
+        log.warning("memory folder %s: %s", memory, exc)
+        return False, (folder_warning.format(type(exc).__name__),)
+    errors: list[OSError] = []
+    for _ in os.walk(memory, onerror=errors.append):
+        pass
+    warned: list[str] = []
+    for exc in errors:
+        log.warning("memory folder %s: %s", exc.filename, exc)
+        where = Path(exc.filename) if exc.filename else memory
+        if where == memory:
+            return False, (folder_warning.format(type(exc).__name__),)
+        # os.walk names every folder by joining onto ``memory``.
+        rel = (
+            where.relative_to(memory).as_posix()
+            if where.is_relative_to(memory)
+            else where.name
+        )
+        warned.append(f"memory: {rel} cannot be read ({type(exc).__name__}); skipped")
+    return True, tuple(warned)
+
+
 def recipe_for(
     proj: ProjectConfig,
     node: Node,
@@ -1312,17 +1357,7 @@ def recipe_for(
     memory = (
         home / ".claude" / "projects" / encoded_project_dir(str(project_dir)) / "memory"
     )
-    memory_warned: tuple[str, ...] = ()
-    try:
-        has_memory = path_is_dir(memory)
-    except OSError as exc:
-        # A bring-up never fails because of memory; nor does an unreadable
-        # folder pass for none -- it is named (class only; the log has it all).
-        get_logger("nodes").warning("memory folder %s: %s", memory, exc)
-        has_memory = False
-        memory_warned = (
-            f"memory: cannot be read ({type(exc).__name__}); no memory shipped",
-        )
+    has_memory, memory_warned = _memory_state(memory)
     return Recipe(
         project=project,
         sid=session_name(project),

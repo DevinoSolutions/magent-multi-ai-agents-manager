@@ -38,3 +38,19 @@ def deny_stat(
         return real_stat(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "stat", stat)
+
+
+def deny_scandir(monkeypatch: pytest.MonkeyPatch, *denied: Path) -> None:
+    """``os.scandir`` of each of ``denied`` raises EACCES: a folder that
+    stats but cannot be listed. ``os.walk`` looks ``scandir`` up in the os
+    module at call time on every Python 3.10-3.14, so this reaches it."""
+    names = {str(path) for path in denied}
+    real_scandir = os.scandir
+
+    def scandir(path: object = ".") -> object:
+        if isinstance(path, (str, os.PathLike)) and os.fspath(path) in names:
+            code = errno.EACCES
+            raise OSError(code, os.strerror(code), os.fspath(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)

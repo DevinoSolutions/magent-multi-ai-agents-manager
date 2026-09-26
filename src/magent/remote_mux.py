@@ -1781,7 +1781,15 @@ def _memory_files(memory_dir: Path) -> list[tuple[str, Path]]:
         logger.warning("memory folder %s is a link; no memory shipped", memory_dir)
         return []
     found: list[tuple[str, Path]] = []
-    for dirpath, dirnames, filenames in os.walk(memory_dir):
+
+    def unreadable(exc: OSError) -> None:
+        # os.walk's default is to skip a folder it cannot list in silence;
+        # recipe_for's walk puts the same folder on screen (class only).
+        logger.warning(
+            "memory folder %s cannot be read; skipped: %s", exc.filename, exc
+        )
+
+    for dirpath, dirnames, filenames in os.walk(memory_dir, onerror=unreadable):
         base = Path(dirpath)
         real_base = Path(os.path.realpath(base))
         kept: list[str] = []

@@ -35,7 +35,7 @@ from magent.remote_mux import RemoteError
 # this name still holds the real resolver for the one test that proves it.
 from magent.remote_mux import find_ssh as real_find_ssh
 from magent.sessions import build_resume_command
-from tests.unit._deny_stat import deny_stat
+from tests.unit._deny_stat import deny_scandir, deny_stat
 from tests.unit._fake_ssh import make_fake_ssh
 from tests.unit._git_repos import commit, git, make_origin_and_clone, needs_git
 
@@ -2004,6 +2004,23 @@ class TestAPushFileIsReadAsVetted:
         assert "memory/denied.md" not in members
         assert members["memory/MEMORY.md"] == b"- remember\n"
         assert "denied.md cannot be read" in _nodes_log()
+
+    def test_a_memory_subfolder_that_cannot_be_listed_is_logged_not_fatal(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        # os.walk's default onerror skips it in silence.
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        sub = recipe.memory_dir / "sub"
+        sub.mkdir()
+        (sub / "x.md").write_bytes(b"x\n")
+        deny_scandir(monkeypatch, sub)
+        _answers(node_home)
+        remote_mux.bring_up(NODE, recipe)
+        members = _members(node_home.calls()[1].stdin)
+        assert "memory/sub/x.md" not in members
+        assert members["memory/MEMORY.md"] == b"- remember\n"
+        assert "sub cannot be read" in _nodes_log()
 
     def test_an_oversize_push_file_is_refused_unopened(
         self, node_home, tmp_path, monkeypatch

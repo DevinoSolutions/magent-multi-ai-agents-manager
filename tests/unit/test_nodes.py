@@ -38,7 +38,7 @@ from magent.nodes import (
 )
 from magent.sessions import IDE_TOOLS, is_ide_tool
 from tests.conftest import REAL_MAGENT_DIR
-from tests.unit._deny_stat import deny_stat
+from tests.unit._deny_stat import deny_scandir, deny_stat
 
 NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
 
@@ -1290,6 +1290,28 @@ class TestPushSet:
         shipped = nodes.push_set(repo, [_real_state(repo)], home=Path.home())
         assert repo / "notes.txt" not in shipped
 
+    def test_a_listed_file_that_cannot_be_read_is_skipped_and_named(
+        self, repo, monkeypatch, caplog
+    ):
+        # git listed it, so it is a snapshot claim: skipped as before, but
+        # never in silence -- the class on screen, path and error in the log.
+        env = (repo / ".env").resolve()
+        state = _real_state(repo)
+        deny_stat(monkeypatch, env)
+        with caplog.at_level("WARNING", logger="magent.nodes"):
+            shipped, warned = nodes._push(repo, [state], home=Path.home(), extras=())
+        assert repo / ".env" not in shipped
+        assert repo / "apps" / "web" / ".env.local" in shipped
+        assert warned == ("push: .env cannot be read (PermissionError); skipped",)
+        assert str(env) in caplog.text
+        assert "Permission denied" in caplog.text
+
+    def test_a_listed_file_gone_since_the_listing_is_skipped_silently(self, tmp_path):
+        shipped, warned = nodes._push(
+            tmp_path, [_state(tmp_path, (".env",))], home=Path.home(), extras=()
+        )
+        assert (shipped, warned) == ((), ())
+
     def test_local_settings_that_cannot_be_read_are_an_error_not_absent(
         self, tmp_path, monkeypatch
     ):
@@ -1741,6 +1763,60 @@ class TestRecipeFor:
             ProjectConfig(path=str(repo), node="second"),
             NODE,
             [_real_state(repo)],
+            home=Path.home(),
+            project_dir=repo,
+        )
+        assert recipe.memory_dir is None
+        assert recipe.warnings == (
+            "memory: cannot be read (PermissionError); no memory shipped",
+        )
+
+    def test_a_memory_subfolder_that_cannot_be_listed_is_named_not_fatal(
+        self, repo, monkeypatch, caplog
+    ):
+        # os.walk skips a folder it cannot list without a word; the rest of
+        # memory still ships, and the skip is said (class only on screen).
+        memory = (
+            Path.home()
+            / ".claude"
+            / "projects"
+            / nodes.encoded_project_dir(str(repo))
+            / "memory"
+        )
+        (memory / "sub").mkdir(parents=True)
+        state = _real_state(repo)
+        deny_scandir(monkeypatch, memory / "sub")
+        with caplog.at_level("WARNING", logger="magent.nodes"):
+            recipe = nodes.recipe_for(
+                ProjectConfig(path=str(repo), node="second"),
+                NODE,
+                [state],
+                home=Path.home(),
+                project_dir=repo,
+            )
+        assert recipe.memory_dir == memory
+        assert recipe.warnings == (
+            "memory: sub cannot be read (PermissionError); skipped",
+        )
+        assert str(memory / "sub") in caplog.text
+
+    def test_a_memory_folder_that_cannot_be_listed_ships_none_and_says_so(
+        self, repo, monkeypatch
+    ):
+        memory = (
+            Path.home()
+            / ".claude"
+            / "projects"
+            / nodes.encoded_project_dir(str(repo))
+            / "memory"
+        )
+        memory.mkdir(parents=True)
+        state = _real_state(repo)
+        deny_scandir(monkeypatch, memory)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second"),
+            NODE,
+            [state],
             home=Path.home(),
             project_dir=repo,
         )
