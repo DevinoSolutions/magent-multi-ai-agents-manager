@@ -179,6 +179,41 @@ class TestACleanProjectComesUpOnItsNode:
         assert "api" in nodes.read_node_map()
 
 
+class TestTheWindowTitleIsTheOneTheSpawnUsed:
+    """``_open_node_window`` hands back the title C's real spawn opened the
+    window under -- the value tiling (Task 12) matches on -- and None when the
+    platform cannot open attach windows. The real ``spawn_attach_window`` runs;
+    only its ``wt`` Popen and the supervisor lookup are faked."""
+
+    _NODE = nodes.Node(
+        nick="second", host="devino-second", user="amin", root="~/magent"
+    )
+
+    def _spawned(self, monkeypatch) -> list[list[str]]:
+        argvs: list[list[str]] = []
+        monkeypatch.setattr(attach_client, "client_exe", lambda: None)
+        monkeypatch.setattr(
+            attach_client.subprocess, "Popen", lambda a, **k: argvs.append(a)
+        )
+        return argvs
+
+    def test_it_returns_the_title_the_window_opened_under(self, monkeypatch):
+        argvs = self._spawned(monkeypatch)
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+        title = launch._open_node_window(self._NODE, "api")
+        assert title == "magent:api"
+        (argv,) = argvs
+        assert argv[argv.index("--title") + 1] == title
+
+    def test_no_attach_windows_means_no_title_and_no_spawn(self, monkeypatch):
+        argvs = self._spawned(monkeypatch)
+        monkeypatch.setattr(launch, "get_platform", FakePlatform)
+        assert launch._open_node_window(self._NODE, "api") is None
+        assert argvs == []
+
+
 class TestD7RefusesWhatTheNodeCouldNotReproduce:
     def test_a_dirty_tree_names_allow_dirty_and_nothing_is_dialed(
         self, rig, api, tmp_path
