@@ -2355,8 +2355,9 @@ class TestTheLocalInstallFollowsTheTarRules:
 
 class TestAnUnreadableMapIsNotNotPlaced:
     """cq-G14 M7: recall reads the map strictly. A map still busy after the
-    reader's retries, or torn, is "could not read" and a re-run -- never the
-    untrue "not placed on a node" the tolerant reader's ``{}`` would say."""
+    reader's retries is "could not read" and a re-run; a torn one is
+    "unreadable" and its repair -- never the untrue "not placed on a node"
+    the tolerant reader's ``{}`` would say."""
 
     @pytest.mark.parametrize("damage", ["busy", "torn"])
     def test_an_unreadable_map_fails_with_run_again(
@@ -2374,7 +2375,8 @@ class TestAnUnreadableMapIsNotNotPlaced:
         result = _recall(runner, placed_api, "--local")
 
         assert result.exit_code == 1, result.output
-        assert "could not read the node map" in result.stderr
+        unreadable = "could not read the node map" if damage == "busy" else "unreadable"
+        assert unreadable in result.stderr
         assert "run the recall again" in result.stderr
         assert "not placed" not in result.output
         assert node_answers == []
@@ -3025,6 +3027,15 @@ def _node_logs(caplog) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.name == "magent.nodes"]
 
 
+def _map_fix_line(cls: str) -> str:
+    """Recall's words for a node map that is there and cannot be read: no
+    magent command rebuilds it, so the repair is named, never deletion."""
+    return (
+        f"the node map at {nodes.NODE_MAP_PATH} is unreadable ({cls});"
+        " fix or move it aside, then run the recall again"
+    )
+
+
 class TestRecallSaysUnknownNeverAbsentOrATraceback:
     """inv-unknown U3: what recall cannot read is UNKNOWN. A map unreadable at
     the clear step -- after the session was stopped and the conversation
@@ -3076,6 +3087,15 @@ class TestRecallSaysUnknownNeverAbsentOrATraceback:
         assert "Traceback" not in result.output
         assert seen["detail"] not in result.output
         assert any(seen["detail"] in m for m in _node_logs(caplog)), _node_logs(caplog)
+        if damage == "torn":
+            # A re-run alone would only meet the same torn map: name the repair.
+            assert (
+                "could not clear api's placement on @second:"
+                f" {_map_fix_line(seen['cls'])}"
+            ) in result.stderr
+        else:
+            assert "move it aside" not in result.output
+        assert "delete" not in result.output.lower()
 
     @pytest.mark.parametrize("damage", ["busy", "torn"])
     def test_an_unreadable_map_at_the_start_names_the_class_only(
@@ -3087,9 +3107,29 @@ class TestRecallSaysUnknownNeverAbsentOrATraceback:
         result = _recall(runner, placed_api, "--local")
 
         assert result.exit_code == 1, result.output
-        assert f"could not read the node map ({cls})" in result.stderr
+        assert f"({cls})" in result.stderr
         assert detail not in result.output
         assert any(detail in m for m in _node_logs(caplog)), _node_logs(caplog)
+
+    @pytest.mark.parametrize("damage", ["busy", "torn"])
+    def test_an_unreadable_map_at_the_start_names_its_repair_busy_a_rerun(
+        self, runner, placed_api, node_answers, monkeypatch, damage
+    ):
+        cls, _ = self._damage_map(damage, monkeypatch)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 1, result.output
+        if damage == "torn":
+            assert f"x {_map_fix_line(cls)}" in result.stderr
+        else:
+            # Busy past the reader's retries: another process holds it.
+            assert f"could not read the node map ({cls}); run the recall again" in (
+                result.stderr
+            )
+            assert "move it aside" not in result.output
+        assert "delete" not in result.output.lower()
+        assert node_answers == []
 
     @pytest.mark.parametrize(
         "damage", ["torn", "unopenable", "not-an-object", "not-a-record"]

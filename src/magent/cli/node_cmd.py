@@ -518,6 +518,20 @@ def _source_node(cfg: MagentConfig, held: NodeMapEntry) -> Node | None:
 _RERUN = "nothing was stopped or cleared -- run the recall again"
 
 
+def _map_unreadable_fix(exc: OSError | ValueError) -> str:
+    """The line for a node map that is there and cannot be read: a re-run
+    alone would only read it again. No magent command rewrites or rebuilds
+    node-map.json, so the repair is the user's -- fix it or move it aside,
+    never delete it: it is the only record of where each project runs. The
+    error CLASS only: the full error goes to nodes.log."""
+    from magent import nodes  # heavy subsystem: in-body per policy
+
+    return (
+        f"the node map at {nodes.NODE_MAP_PATH} is unreadable"
+        f" ({type(exc).__name__}); fix or move it aside, then run the recall again"
+    )
+
+
 def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
     """Step 1: one last pull, through node_sync's per-node lock -- the lock the
     daemon's tick holds -- so it never races a running daemon (DECISION-26
@@ -560,7 +574,7 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
         # integration: it raises NodeMapUnreadable (an OSError) for a map it
         # cannot read. This branch must keep the class-only rule for it --
         # never str(exc) on screen, the full error in nodes.log -- and, as an
-        # unreadable map, it takes the "fix or move it aside" words, not _RERUN.
+        # unreadable map, it takes _map_unreadable_fix's words, not _RERUN.
         log.get_logger("nodes").warning(
             "recall's last pull from %s failed on this PC: %s", held.nick, exc
         )
@@ -726,7 +740,9 @@ def _clear_placement(name: str, held: NodeMapEntry) -> None:
     map that is busy or torn by now (the strict read's OSError / ValueError)
     or a failed write is a printed failure, never a traceback. By then the
     session is already stopped, so a re-run only redoes the install and the
-    clear. The error CLASS only on screen: the full error goes to nodes.log."""
+    clear -- once the map can be read: a torn one (ValueError) is named with
+    its repair (``_map_unreadable_fix``). The error CLASS only on screen: the
+    full error goes to nodes.log."""
     from magent import nodes  # heavy subsystem: in-body per policy
 
     try:
@@ -735,6 +751,13 @@ def _clear_placement(name: str, held: NodeMapEntry) -> None:
         log.get_logger("nodes").warning(
             "recall could not clear %s's placement: %s", name, exc
         )
+        if isinstance(exc, ValueError):
+            _fail(
+                f"could not clear {name}'s placement on @{held.nick}:"
+                f" {_map_unreadable_fix(exc)}",
+                1,
+            )
+        # A lock or a busy map (OSError) passes: a re-run is the whole remedy.
         _fail(
             f"could not clear {name}'s placement on @{held.nick}"
             f" ({type(exc).__name__}); run the recall again",
@@ -890,12 +913,17 @@ def recall_cmd(ctx: click.Context, project: str, to_local: bool) -> None:
     try:
         held = nodes.load_node_map_strict().get(name)
     except (OSError, ValueError) as exc:
-        # The error CLASS only on screen: str(exc) carries the map's path.
+        # The error CLASS only on screen: str(exc) carries the parser's text.
         log.get_logger("nodes").warning("recall could not read the node map: %s", exc)
-        _fail(
-            f"could not read the node map ({type(exc).__name__}); run the recall again",
-            1,
-        )
+        if isinstance(exc, PermissionError):
+            # What the strict reader re-raises once its busy retries run out:
+            # another process holds the map, and a re-run is the remedy.
+            _fail(
+                f"could not read the node map ({type(exc).__name__});"
+                " run the recall again",
+                1,
+            )
+        _fail(_map_unreadable_fix(exc), 1)
     if held is None:
         _fail(
             f"{name} is not placed on a node -- there is nothing to recall",
