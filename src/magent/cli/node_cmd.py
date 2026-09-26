@@ -733,6 +733,16 @@ def _cmd_needs_cd_d(target: PurePath, here: PurePath | None) -> bool:
     return here is None or drive.lower() != here.drive.lower()
 
 
+def _shell_folder() -> Path | None:
+    """The folder the user's shell is in, or None when it cannot be read --
+    the folder was deleted under the shell. None means "drive unknown", which
+    ``_cmd_needs_cd_d`` answers with the hint rather than a guess."""
+    try:
+        return Path.cwd()
+    except OSError:
+        return None
+
+
 def _recall_local(
     held: NodeMapEntry,
     name: str,
@@ -792,11 +802,7 @@ def _recall_local(
     # cannot parse and cmd.exe runs in the wrong folder when <dir> is on
     # another drive. Two lines work in every shell; the hint covers cmd.
     click.echo(f'    cd "{local_dir}"')
-    try:
-        here: Path | None = Path.cwd()
-    except OSError:  # the shell's folder is gone: the drive is unknown
-        here = None
-    if _cmd_needs_cd_d(local_dir, here):
+    if _cmd_needs_cd_d(local_dir, _shell_folder()):
         click.echo(style("    (cmd.exe: use cd /d)", dim=True))
     if resume_id is None:
         click.echo("    claude")

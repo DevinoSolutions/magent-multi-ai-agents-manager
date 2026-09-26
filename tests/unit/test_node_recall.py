@@ -2647,6 +2647,63 @@ class TestTheResumeWorksInEveryShell:
             f"claude --resume {SESSION_ID}",
         ]
 
+    @staticmethod
+    def _recording(monkeypatch) -> list[tuple[object, object]]:
+        """``_cmd_needs_cd_d`` still answers, but every call is recorded."""
+        calls: list[tuple[object, object]] = []
+        real = node_cmd._cmd_needs_cd_d
+
+        def record(target, here):
+            calls.append((target, here))
+            return real(target, here)
+
+        monkeypatch.setattr(node_cmd, "_cmd_needs_cd_d", record)
+        return calls
+
+    def test_the_hint_compares_the_project_with_the_shells_folder(
+        self, runner, placed_api, node_answers, api_repo, monkeypatch, tmp_path
+    ):
+        # cq-G14 C2: the two folders the rule compares are the project and the
+        # folder the user's shell is in -- never the project with itself.
+        calls = self._recording(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+
+        _recall(runner, placed_api, "--local")
+
+        assert calls == [(api_repo, tmp_path)]
+
+    def test_a_shell_folder_that_is_gone_counts_as_unknown(
+        self, runner, placed_api, node_answers, api_repo, monkeypatch
+    ):
+        # cq-G14 C1: an unknown shell folder is None -- so a drive-letter
+        # project gets the hint -- never a guess.
+        calls = self._recording(monkeypatch)
+        monkeypatch.setattr(node_cmd, "_shell_folder", lambda: None)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert calls == [(api_repo, None)]
+        lines = [line.strip() for line in result.stdout.splitlines()]
+        cd = lines.index(f'cd "{api_repo}"')
+        hint = ["(cmd.exe: use cd /d)"] if api_repo.drive else []
+        assert lines[cd + 1 :][: len(hint) + 1] == [
+            *hint,
+            f"claude --resume {SESSION_ID}",
+        ]
+
+    def test_the_shell_folder_is_none_when_the_cwd_cannot_be_read(self, monkeypatch):
+        def gone() -> Path:
+            raise FileNotFoundError(2, "No such file or directory")
+
+        monkeypatch.setattr(node_cmd.Path, "cwd", staticmethod(gone))
+
+        assert node_cmd._shell_folder() is None
+
+    def test_the_shell_folder_is_the_cwd(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+
+        assert node_cmd._shell_folder() == tmp_path
+
 
 class TestRecallLocalFailureBranches:
     """cq-G14 I2: the killer tests for the partial-failure branches no test
