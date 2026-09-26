@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 from pathlib import Path
 
@@ -1156,6 +1157,228 @@ class TestAMarketplaceSourceNeverCarriesAPassword:
     def test_the_rule_is_the_git_remote_rule(self, tmp_path, url):
         refused = self._scope_for(tmp_path, url).marketplaces == {}
         assert refused == nodes._without_credentials(url)[1]
+
+
+def _skills_home(tmp_path: Path) -> tuple[Path, Path]:
+    """A PC home with ~/.ssh and ~/.aws planted, and its empty skills root."""
+    home = _pc_home(tmp_path)
+    (home / ".ssh").mkdir()
+    (home / ".ssh" / "id_ed25519").write_bytes(b"PRIVATE-KEY-DECOY")
+    (home / ".aws").mkdir()
+    (home / ".aws" / "credentials").write_bytes(b"AWS-DECOY")
+    skills = home / ".claude" / "skills"
+    skills.mkdir(parents=True)
+    return home, skills
+
+
+def _skill(root: Path, rel: str, data: bytes = b"# skill\n") -> None:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
+def _scope_or_fail_on_fifo(home: Path, fifo: Path) -> UserScope:
+    """``user_scope(home)`` on a worker thread: a walk that blocks opening
+    ``fifo`` fails the test (after unblocking it) instead of hanging it."""
+    result: list[UserScope] = []
+    worker = threading.Thread(
+        target=lambda: result.append(nodes.user_scope(home)), daemon=True
+    )
+    worker.start()
+    worker.join(timeout=10)
+    if worker.is_alive():
+        # Unblock the reader stuck in open() so the thread can end.
+        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        worker.join(timeout=5)
+        pytest.fail("the walk blocked opening a FIFO")
+    (scope,) = result
+    return scope
+
+
+class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
+    @pytest.mark.skipif(sys.platform == "win32", reason="no FIFOs on Windows")
+    def test_a_fifo_is_not_read(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/SKILL.md")
+        os.mkfifo(skills / "s" / "pipe")  # reading it would block forever
+        scope = _scope_or_fail_on_fifo(home, skills / "s" / "pipe")
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == ("skills/s/pipe: not a regular file, not shipped",)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="no FIFOs on Windows")
+    def test_a_file_swapped_for_a_fifo_after_the_stat_does_not_hang(
+        self, tmp_path, monkeypatch
+    ):
+        # The pre-read stat is made to lie (a regular file), so only the
+        # O_NONBLOCK open + fstat re-check stand between the walk and a
+        # forever-blocked open().
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/SKILL.md")
+        fifo = skills / "s" / "pipe"
+        os.mkfifo(fifo)
+        regular = skills / "s" / "SKILL.md"
+        real_stat = Path.stat
+
+        def lying_stat(self, *args, **kwargs):
+            target = regular if self == fifo else self
+            return real_stat(target, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", lying_stat)
+        scope = _scope_or_fail_on_fifo(home, fifo)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == ("skills/s/pipe: not a regular file, not shipped",)
+
+    def test_a_file_over_the_per_file_cap_is_not_read(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILL_FILE_MAX_BYTES", 4)
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/ok", b"1234")
+        _skill(skills, "s/big", b"12345")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/ok"]
+        assert scope.notes == ("skills/s/big: larger than 4 bytes, not shipped",)
+
+    def test_the_file_cap_defaults_to_8_mib_and_reads_so(self, tmp_path, monkeypatch):
+        assert nodes.SKILL_FILE_MAX_BYTES == 8 * 1024 * 1024
+        monkeypatch.setattr(nodes, "SKILL_FILE_MAX_BYTES", 2 * 1024 * 1024)
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/big", b"x" * (2 * 1024 * 1024 + 1))
+        assert nodes.user_scope(home).notes == (
+            "skills/s/big: larger than 2 MiB, not shipped",
+        )
+
+    def test_a_read_is_sized_by_the_file_not_the_cap(self, tmp_path, monkeypatch):
+        # A cap-sized read would try to allocate 1 TiB here and fail.
+        monkeypatch.setattr(nodes, "SKILL_FILE_MAX_BYTES", 1 << 40)
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/SKILL.md", b"# small\n")
+        scope = nodes.user_scope(home)
+        assert scope.skills == (
+            nodes.SkillFile(path="s/SKILL.md", data=b"# small\n", executable=False),
+        )
+        assert scope.notes == ()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="no exec bit on Windows")
+    def test_the_exec_bit_is_read_off_the_file(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/run", b"no shebang\n")
+        (skills / "s" / "run").chmod(0o755)
+        _skill(skills, "s/SKILL.md", b"# plain\n")
+        assert [(f.path, f.executable) for f in nodes.user_scope(home).skills] == [
+            ("s/SKILL.md", False),
+            ("s/run", True),
+        ]
+
+    @staticmethod
+    def _stats_say_one_byte(monkeypatch, grown: bytes) -> None:
+        """Both stats report 1 byte for the file holding ``grown``: it 'grew'
+        after them, so only reading on past the stat size sees the rest."""
+        real_path_stat = Path.stat
+        real_fstat = os.fstat
+
+        def shrink(st: os.stat_result) -> os.stat_result:
+            return os.stat_result((*st[:6], 1, *st[7:10]))
+
+        def path_stat(self, *args, **kwargs):
+            st = real_path_stat(self, *args, **kwargs)
+            return shrink(st) if self.name == "grow" else st
+
+        def fstat(fd):
+            st = real_fstat(fd)
+            return shrink(st) if st.st_size == len(grown) else st
+
+        monkeypatch.setattr(Path, "stat", path_stat)
+        monkeypatch.setattr(nodes.os, "fstat", fstat)
+
+    def test_a_file_that_grew_after_its_fstat_is_read_whole(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "SKILL_FILE_MAX_BYTES", 1 << 40)
+        monkeypatch.setattr(nodes, "_READ_CHUNK", 100)  # several chunks
+        grown = bytes(range(256)) * 3 + b"end"  # 771 bytes, a unique size
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/grow", grown)
+        self._stats_say_one_byte(monkeypatch, grown)
+        scope = nodes.user_scope(home)
+        assert scope.skills == (
+            nodes.SkillFile(path="s/grow", data=grown, executable=False),
+        )
+
+    def test_a_file_that_grew_past_the_cap_is_still_refused(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "SKILL_FILE_MAX_BYTES", 4)
+        grown = bytes(range(256)) * 3 + b"end"
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/grow", grown)
+        self._stats_say_one_byte(monkeypatch, grown)
+        scope = nodes.user_scope(home)
+        assert scope.skills == ()
+        assert scope.notes == ("skills/s/grow: larger than 4 bytes, not shipped",)
+
+    @staticmethod
+    def _count_reads(monkeypatch) -> list[int]:
+        """Every byte count a skill file's ``read`` returns. The size check
+        refuses a too-big file either way; this pins that the read itself
+        stayed bounded."""
+        counts: list[int] = []
+        real_fdopen = os.fdopen
+
+        class Counting:
+            def __init__(self, f):
+                self.f = f
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.f.close()
+
+            def fileno(self):
+                return self.f.fileno()
+
+            def read(self, n=-1):
+                data = self.f.read(n)
+                counts.append(len(data))
+                return data
+
+        monkeypatch.setattr(
+            nodes.os, "fdopen", lambda *a, **k: Counting(real_fdopen(*a, **k))
+        )
+        return counts
+
+    @pytest.mark.parametrize(
+        ("fstat_lies", "expected"),
+        [
+            (True, 102),  # 2 bytes, then one 100-byte chunk takes it past 4
+            (False, 5),  # the real fstat size is clamped to the cap: 4 + 1
+        ],
+        ids=["grew-after-both-stats", "grew-after-the-path-stat-only"],
+    )
+    def test_a_grown_file_is_read_no_further_than_the_cap(
+        self, tmp_path, monkeypatch, fstat_lies, expected
+    ):
+        monkeypatch.setattr(nodes, "SKILL_FILE_MAX_BYTES", 4)
+        monkeypatch.setattr(nodes, "_READ_CHUNK", 100)
+        grown = bytes(range(256)) * 3 + b"end"  # 771 bytes
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/grow", grown)
+        if fstat_lies:
+            self._stats_say_one_byte(monkeypatch, grown)
+        else:
+            real_path_stat = Path.stat
+
+            def path_stat(self, *args, **kwargs):
+                st = real_path_stat(self, *args, **kwargs)
+                if self.name != "grow":
+                    return st
+                return os.stat_result((*st[:6], 1, *st[7:10]))
+
+            monkeypatch.setattr(Path, "stat", path_stat)
+        counts = self._count_reads(monkeypatch)
+        scope = nodes.user_scope(home)
+        assert scope.notes == ("skills/s/grow: larger than 4 bytes, not shipped",)
+        assert sum(counts) == expected
+        assert sum(counts) <= nodes.SKILL_FILE_MAX_BYTES + nodes._READ_CHUNK + 1
 
 
 class TestUserScopeDigests:

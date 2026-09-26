@@ -175,6 +175,9 @@ SKILLS_EXCLUDED_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv"
 # -- a folder or a single file, linked or not -- is read from inside one.
 # Defence in depth, not containment: a link anywhere else still ships.
 SECRET_HOME_DIRS = (".ssh", ".gnupg", ".aws", ".config/gh", ".kube", ".docker")
+# user_scope runs on every bring-up and holds every skill byte in memory: a
+# stray asset must not be read whole.
+SKILL_FILE_MAX_BYTES = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -630,6 +633,67 @@ def _source_refusal(source: str) -> str | None:
 
 _CREDENTIAL_BYTES = CLAUDE_CREDENTIAL_MARKER.encode("ascii")
 
+# How a skill file is opened: never blocking on a FIFO swapped in after its
+# stat. Read off the module, so Windows (which has no O_NONBLOCK, and wants
+# O_BINARY) needs no `sys.platform` branch. Unlike remote_mux's push read
+# there is no O_NOFOLLOW: a linked skill file is followed on purpose.
+_SKILL_READ_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+)
+# A skill file that grew after its fstat is read on in chunks of this size.
+_READ_CHUNK = 64 * 1024
+
+
+class _NotShipped(ValueError):
+    """A skill file ``_read_skill`` will not ship; the message is the note's
+    reason (never the content)."""
+
+
+def _size(n: int) -> str:
+    mib = 1024 * 1024
+    return f"{n // mib} MiB" if n >= mib and n % mib == 0 else f"{n} bytes"
+
+
+def _check_size(size: int) -> None:
+    if size > SKILL_FILE_MAX_BYTES:
+        raise _NotShipped(f"larger than {_size(SKILL_FILE_MAX_BYTES)}, not shipped")
+
+
+def _read_skill(path: Path) -> tuple[bytes, int]:
+    """The bytes and mode of ``path``, a REGULAR file of at most
+    ``SKILL_FILE_MAX_BYTES``, or ``_NotShipped``; OSError when it cannot be
+    read. The same three checks as ``remote_mux._read_regular`` (which this
+    leaf cannot import), because each alone has a hole: a stat before opening
+    (a FIFO or a device is never opened -- reading one blocks every bring-up
+    for good -- and an oversize file never read), an ``fstat`` on what was
+    opened (it may have been swapped for a FIFO in between; the non-blocking
+    open is what lets the walk get that far), and a bounded read (it may have
+    grown). The read is sized by the ``fstat``, not the cap -- a cap-sized
+    read allocates the cap for every tiny file -- and one byte past that size
+    shows a file that grew; it is then read on, a chunk at a time, only until
+    it is past the cap."""
+    before = path.stat()
+    if not stat.S_ISREG(before.st_mode):
+        raise _NotShipped("not a regular file, not shipped")
+    _check_size(before.st_size)
+    fd = os.open(path, _SKILL_READ_FLAGS)
+    with os.fdopen(fd, "rb") as f:
+        opened = os.fstat(f.fileno())
+        if not stat.S_ISREG(opened.st_mode):
+            raise _NotShipped("not a regular file, not shipped")
+        size = min(opened.st_size, SKILL_FILE_MAX_BYTES)
+        data = f.read(size + 1)
+        if len(data) > size:
+            grown = bytearray(data)  # linear growth, one copy at the end
+            while len(grown) <= SKILL_FILE_MAX_BYTES:
+                chunk = f.read(_READ_CHUNK)
+                if not chunk:
+                    break
+                grown += chunk
+            data = bytes(grown)
+    _check_size(len(data))
+    return data, opened.st_mode
+
 
 def _real(path: str | Path) -> str:
     """``path`` with every link resolved, in the case the OS compares by."""
@@ -743,8 +807,10 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
             if _in_secret_dir(rel_path, _real(path), secrets, notes):
                 continue
             try:
-                data = path.read_bytes()
-                mode = path.stat().st_mode
+                data, mode = _read_skill(path)
+            except _NotShipped as e:
+                notes.append(f"skills/{_named(rel_path)}: {e}")
+                continue
             except OSError as e:
                 notes.append(f"skills/{_named(rel_path)}: unreadable ({e.strerror})")
                 continue
