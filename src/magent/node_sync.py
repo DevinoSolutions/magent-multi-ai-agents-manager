@@ -263,6 +263,18 @@ def state_stores() -> list[tuple[str, str, Path]]:
     return stores
 
 
+MAP_UNREAD = "the node map could not be read"
+
+
+class NodeMapUnreadable(OSError):
+    """``final_pull`` could not read the node map: busy past its retries,
+    torn, or not a JSON object. Whether the project was placed is unknown, so
+    this is never None ("never placed"). An OSError so a caller catching the
+    pull's other OSErrors catches it too; the map's own error is chained, and
+    the message names its class only -- the path and the parser's words stay
+    off the screen."""
+
+
 class NodeLockHeld(LockHeld):
     """``node_lock`` could not take ``node-pull-<nick>``: another pull of the
     same node holds it. Its own type so a caller can tell this contention from
@@ -955,7 +967,9 @@ def final_pull(
 ) -> remote_mux.PullResult | None:
     """Pull project ``name``'s node session once more -- ``down`` calls this
     before it kills the session, so the last turn is home. None when the
-    project was never placed. Waits up to ``wait_s`` for a daemon tick that
+    project was never placed: the map, read STRICTLY, has no entry for it. A
+    map that could not be read raises NodeMapUnreadable -- unknown is never
+    "never placed". Waits up to ``wait_s`` for a daemon tick that
     holds the node, then raises NodeLockHeld; NodeConfigError, RemoteError and
     OSError (writing ``pull.json``) also go to the caller, which decides what
     "could not pull" means.
@@ -976,7 +990,10 @@ def final_pull(
     carries on from the last one. A node that reports no real path for the
     session's root (a deleted project) returns normally with a warning -- no
     later pull could do better."""
-    entry = nodes.read_node_map().get(name)
+    try:
+        entry = nodes.load_node_map_strict().get(name)
+    except (OSError, ValueError) as e:
+        raise NodeMapUnreadable(f"{MAP_UNREAD} ({type(e).__name__})") from e
     if entry is None:
         return None
     user = local_user if local_user is not None else local_username()

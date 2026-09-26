@@ -2111,9 +2111,11 @@ def _final_pull(
     failure -- a reply over the cap is a node that answered -- is this
     session's.
 
-    The caller read ``key`` out of the map strictly, so ``final_pull``'s None
-    ("never placed") is its own lenient re-read finding the map busy or torn:
-    a pull that did not happen, never one that did."""
+    ``final_pull`` re-reads the map strictly: busy or torn there, it raises
+    NodeMapUnreadable, said as "the node map could not be read". Its None
+    ("never placed") after the caller read ``key`` out of the map strictly is
+    the entry vanishing between the two reads -- said the same way, as a pull
+    that did not happen, never one that did."""
     # heavy subsystem: in-body per policy (node_sync dials the node)
     from magent import node_sync, remote_mux
 
@@ -2124,7 +2126,8 @@ def _final_pull(
             result = node_sync.final_pull(config, key)
         except (OSError, ValueError, remote_mux.RemoteError) as exc:
             # OSError covers NodeLockHeld (a sync tick held the node past
-            # FINAL_PULL_WAIT_S) and a pulled file this PC could not write;
+            # FINAL_PULL_WAIT_S), NodeMapUnreadable, and a pulled file this
+            # PC could not write;
             # ValueError covers NodeConfigError. None of them may abort the down.
             get_logger("nodes").warning("down: final pull of %s failed: %s", sid, exc)
             if isinstance(exc, remote_mux.RemoteError) and (
@@ -2135,8 +2138,14 @@ def _final_pull(
                 no_pull[nick] = (
                     f"node {nick}'s pull lock is held by another magent process"
                 )
-            # ASCII end to end: the cause is the node's or the OS's words.
-            reason = _node_error_text(exc).encode("ascii", "replace").decode("ascii")
+            if isinstance(exc, node_sync.NodeMapUnreadable):
+                # The same words as the None below; the class is in the log.
+                reason = _MAP_UNREAD
+            else:
+                # ASCII end to end: the cause is the node's or the OS's words.
+                reason = (
+                    _node_error_text(exc).encode("ascii", "replace").decode("ascii")
+                )
         else:
             if result is not None:
                 return True
