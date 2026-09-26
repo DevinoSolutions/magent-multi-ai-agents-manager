@@ -926,6 +926,107 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         assert [nick for nick, _ in rig.recipes] == ["second"]
 
 
+class TestAnUnreadableMapPlacesNothingByGuess:
+    """A torn or busy node map is UNKNOWN, never "nothing is placed". Read as
+    ``{}``, an ``auto`` project running on a node looks unplaced: the fleet
+    check leaves it out, and a newcomer sharing its folder name is dialed
+    into that very folder. Every placement decision reads the map strictly;
+    unreadable, an ``auto`` project is refused naming the map, a pinned one
+    keeps its pin, and the rest of the batch comes up."""
+
+    @pytest.fixture(params=["torn", "busy"])
+    def unreadable_map(self, request, rig, monkeypatch):
+        """Make the map unreadable -- AFTER the test recorded what it holds --
+        and return the error class a reader then meets."""
+
+        def make() -> str:
+            if request.param == "torn":
+                nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+                return "ValueError"
+
+            def busy() -> dict[str, NodeMapEntry]:
+                raise PermissionError(13, "The process cannot access the file")
+
+            monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+            return "PermissionError"
+
+        return make
+
+    def test_a_newcomer_is_not_dialed_into_the_folder_an_auto_project_may_hold(
+        self, rig, tmp_path, unreadable_map
+    ):
+        # api-y (auto) runs on second in ~/magent/api. The map that says so is
+        # unreadable, so where api-y runs is unknown -- which must never read
+        # as "nowhere": api-x shares its folder name and stays refused.
+        x_api, y_api, web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        _record("api-y", "second", "~/magent/api")
+        rig.live = True
+        unreadable_map()
+        outcomes = _batch(_config(x_api, y_api, web), only=["api-x", "web"])
+        assert [(o.sid, o.ok) for o in outcomes] == [("api-x", False), ("web", True)]
+        assert "'api-x' and 'api-y' would share" in (outcomes[0].error or "")
+        assert [(n, r.sid) for n, r in rig.recipes] == [("second", "web")]
+
+    def test_an_auto_project_is_refused_naming_the_map_and_nothing_is_dialed(
+        self, rig, tmp_path, unreadable_map
+    ):
+        (web,) = _projects(tmp_path, rig, [("web", "auto")])
+        _record("web", "third", "~/magent/web")
+        rig.live = True
+        cls = unreadable_map()
+        outcome = launch.bring_up_node_project(_config(web), web)
+        assert (outcome.ok, outcome.sid, outcome.node) == (False, "web", "")
+        error = outcome.error or ""
+        assert "node map is unreadable" in error
+        assert f"({cls})" in error
+        # The error CLASS only: never the OS's or the parser's words.
+        assert "torn" not in error
+        assert "cannot access" not in error
+        assert "\n" not in error
+        assert rig.recipes == []
+        assert rig.decorated == []
+
+    def test_in_a_batch_the_auto_project_names_the_map_and_its_twin_the_clash(
+        self, rig, tmp_path, unreadable_map
+    ):
+        x_api, y_api, web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        _record("api-y", "second", "~/magent/api")
+        cls = unreadable_map()
+        outcomes = _batch(_config(x_api, y_api, web))
+        assert [(o.sid, o.ok) for o in outcomes] == [
+            ("api-x", False),
+            ("api-y", False),
+            ("web", True),
+        ]
+        assert "'api-x' and 'api-y' would share" in (outcomes[0].error or "")
+        assert "node map is unreadable" in (outcomes[1].error or "")
+        assert f"({cls})" in (outcomes[1].error or "")
+        assert [(n, r.sid) for n, r in rig.recipes] == [("second", "web")]
+
+    def test_a_pinned_project_keeps_its_pin(self, rig, api, unreadable_map):
+        _record("api", "third", "~/magent/api")
+        unreadable_map()
+        (outcome,) = _batch(_config(api))
+        assert (outcome.ok, outcome.node) == (True, "second")
+        assert [(n, r.sid) for n, r in rig.recipes] == [("second", "api")]
+
+    def test_the_local_fleet_and_the_pinned_node_projects_still_come_up(
+        self, rig, tmp_path, monkeypatch, capsys, unreadable_map
+    ):
+        pinned, auto = _projects(tmp_path, rig, [("a1", "second"), ("w1", "auto")])
+        _record("w1", "third", "~/magent/w1")
+        unreadable_map()
+        monkeypatch.setattr(
+            "magent.psmux.bring_up", lambda cfg, only, group: (["loc"], [])
+        )
+        assert launch.bring_up_psmux(_config(pinned, auto)) == (["loc", "a1"], ["w1"])
+        out = capsys.readouterr().out
+        (line,) = [ln for ln in out.splitlines() if ln.lstrip().startswith("x w1:")]
+        assert "node map is unreadable" in line
+
+
 class TestUpBringsUpNodeProjectsToo:
     def test_local_and_node_results_are_merged_and_node_lines_printed(
         self, rig, tmp_path, monkeypatch, capsys
