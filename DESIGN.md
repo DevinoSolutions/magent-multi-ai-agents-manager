@@ -1800,6 +1800,7 @@ fewer than five samples in the window gets exactly one live `sample` call,
 which is then its only sample, and none under `--dry-run` or a tile-only pass;
 a node that does not answer it is left unscored. A single reading would place
 a session on a box that happened to be idle for one second of a bursty minute.
+<!-- D-MERGE: drop "with sub-plan D," when D's `up` fan-out calls place_node_projects. -->
 
 **A placement sticks, and placing writes nothing.** A project stays on its
 node until that node leaves `settings.nodes`; only then is it re-placed, with
@@ -1809,6 +1810,7 @@ launch leaves nothing sticky behind, and `magent node plan` can render the
 very same objects while writing nothing, pinned byte-for-byte. Nothing moves a
 running session on its own; `magent node recall --to` (with sub-plan D) is the
 only mover.
+<!-- D-MERGE: drop "(sub-plan D's)" and "(with sub-plan D)" when D's bring-up writes the node map and recall --to lands. -->
 
 **The node decides what a plain re-up resumes.** A session brought up again
 passes no resume id: sub-plan D's `bring_up.sh` runs `claude --continue` over
@@ -1818,6 +1820,7 @@ fallback on a node that lost the file. `claude --resume <id>` is used only where
 that conversation first: `recall --to` (with sub-plan D; installed by
 `install_transcripts.sh`, under the name magent's one encoder gives the node's
 own `realpath`; the node never encodes) and the resume `recall --local` prints.
+<!-- D-MERGE: drop "sub-plan D's" and "with sub-plan D;" when bring_up.sh and recall --to land. -->
 
 **Recall never races the daemon, and a pull it cannot finish stops it.** The
 last pull goes through `node_sync.final_pull`, under the lock the daemon's tick
@@ -1838,6 +1841,7 @@ because zsh reads a bare `=word` as a command lookup. That command is one
 would expand `$(…)`, a backtick or `!` inside the double quotes. "Stopped" is
 printed only when sub-plan D's `remote_mux.kill_session` returned True; until
 D merges, recall cannot stop the session itself and always prints that command.
+<!-- D-MERGE: drop "sub-plan D's" and the "until D merges" clause when kill_session lands (plan G :3865-3874). -->
 
 **`--local` installs by the rules a `--to` send uses.** The local folder is
 the one a launch opens, resolved by `launch._resolve_path` and never
@@ -1883,6 +1887,7 @@ grows busy keeps its sessions; moving one is a manual
 move stops a live session and ships its conversation, which is not something
 to do behind the user's back. If it bites, the fix is a `node plan` hint naming the better node,
 never an automatic move.
+<!-- D-MERGE: drop "(with sub-plan D)" when recall --to lands (plan G Task 15). -->
 
 **Recall moves Claude Code conversations only (2026-09-24):** `magent node
 recall` refuses a project whose tool is not `claude` (exit 2). Codex has no
@@ -1895,6 +1900,7 @@ Its sessions come home by git alone: commit and push on the node, pull here.
 bring-up reports only commits. A recall from a node that no longer answers therefore
 prints the last known sha without a branch. A recall from a node that answers
 records the full `repo_status.sh` report and replaces it.
+<!-- D-MERGE: drop "(sub-plan D's)" when D's bring-up writes repos.json. -->
 
 **Attach-pane reconnect is only reachable from a Windows client (2026-08-09):**
 `attach_client.py` itself is OS-agnostic (stdlib + click; the `Popen` in
