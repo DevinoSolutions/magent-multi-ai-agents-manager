@@ -1587,6 +1587,20 @@ class TestAFinalPullThatDidNotFinish:
         with pytest.raises(remote_mux.RemoteError, match="could not store"):
             node_sync.final_pull(_config(), "api")
 
+    def test_a_store_failure_on_the_first_call_raises_after_a_clean_second(
+        self, placed, monkeypatch
+    ):
+        """Only the second call asks for transcripts, but the first one's
+        state records count too: a clean second answer does not absolve it."""
+        asked = _scripted_pull(
+            monkeypatch,
+            _snapshot(realpaths={"api": _REAL}, failed_sids=frozenset({"api"})),
+            _snapshot(realpaths={"api": _REAL}),
+        )
+        with pytest.raises(remote_mux.RemoteError, match="could not store"):
+            node_sync.final_pull(_config(), "api")
+        assert len(asked) == 2
+
     def test_a_root_the_node_cannot_resolve_is_logged_and_the_pull_returns(
         self, placed, monkeypatch, caplog
     ):
