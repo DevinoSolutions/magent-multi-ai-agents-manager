@@ -82,6 +82,12 @@ def _pid_is_mine() -> None:
     _record_pid(os.getpid())
 
 
+def _child(*, exit_code: int | None = None, pid: int = 4242) -> SimpleNamespace:
+    """What spawn_detached hands back: the detached child's Popen, alive
+    (``poll()`` is None) unless an exit code is given."""
+    return SimpleNamespace(pid=pid, poll=lambda: exit_code)
+
+
 @pytest.fixture(autouse=True)
 def _no_endless_loop(monkeypatch):
     """No test here runs the foreground loop without --ticks, so reaching it
@@ -195,9 +201,10 @@ class TestNodeSync:
     ):
         spawned: list[list[str]] = []
 
-        def spawn(argv: list[str]) -> None:
+        def spawn(argv: list[str]) -> SimpleNamespace:
             spawned.append(argv)
             _pid_is_mine()
+            return _child()
 
         monkeypatch.setattr("magent.launch.spawn_detached", spawn)
         result = runner.invoke(
@@ -209,39 +216,63 @@ class TestNodeSync:
         ]
         assert f"(pid {os.getpid()})" in result.stdout
 
-    def test_a_daemon_that_never_starts_is_a_failure(
+    def test_a_child_that_exited_is_a_failure_at_once(
         self, runner, pool_config, monkeypatch
     ):
-        monkeypatch.setattr("magent.launch.spawn_detached", lambda argv: None)
-        monkeypatch.setattr(node_cmd, "time", SimpleNamespace(sleep=lambda _s: None))
+        """A child that died never becomes the daemon: say so on the next
+        poll, not after the whole start budget."""
+        slept: list[float] = []
+        monkeypatch.setattr(
+            "magent.launch.spawn_detached", lambda argv: _child(exit_code=1)
+        )
+        monkeypatch.setattr(node_cmd, "time", SimpleNamespace(sleep=slept.append))
         result = runner.invoke(
             cli.main, ["--config", pool_config, "node", "sync", "-d"]
         )
         assert result.exit_code == 1
         assert "node sync daemon failed to start" in result.stdout
         assert "~/.magent/logs/nodes.log" in result.stdout  # where to look next
+        assert len(slept) <= 2
 
-    def test_a_child_slow_to_start_is_waited_for(
+    def test_a_child_still_alive_at_the_deadline_is_not_a_failure(
         self, runner, pool_config, monkeypatch
     ):
+        """A cold child can take longer than any budget (measured 13.1 s once,
+        60 ms after the poll gave up). Alive but not yet holding the lock is
+        "still starting", never a failure the daemon then contradicts."""
+        slept: list[float] = []
+        monkeypatch.setattr("magent.launch.spawn_detached", lambda argv: _child())
+        monkeypatch.setattr(node_cmd, "time", SimpleNamespace(sleep=slept.append))
+        result = runner.invoke(
+            cli.main, ["--config", pool_config, "node", "sync", "-d"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "failed to start" not in result.stdout
+        assert "still starting (pid 4242)" in result.stdout
+        assert len(slept) == node_cmd._START_POLLS  # waited out the budget first
+
+    @pytest.mark.parametrize("seconds", [6.0, 9.0])
+    def test_a_child_slow_to_start_is_waited_for(
+        self, runner, pool_config, monkeypatch, seconds
+    ):
         """A cold child spends seconds importing before it takes the lock and
-        writes its pid (measured 3.4-5.1 s on a loaded desktop). The poll must
-        outlast that, not declare a failure the daemon then contradicts."""
+        writes its pid (measured 2.5-9.5 s on a loaded desktop). The poll must
+        outlast that and name the daemon's own pid."""
         slept: list[float] = []
 
         def nap(s: float) -> None:
             slept.append(s)
-            if sum(slept) >= 6.0:
+            if sum(slept) >= seconds:
                 _pid_is_mine()
 
-        monkeypatch.setattr("magent.launch.spawn_detached", lambda argv: None)
+        monkeypatch.setattr("magent.launch.spawn_detached", lambda argv: _child())
         monkeypatch.setattr(node_cmd, "time", SimpleNamespace(sleep=nap))
         result = runner.invoke(
             cli.main, ["--config", pool_config, "node", "sync", "-d"]
         )
         assert result.exit_code == 0, result.output
-        assert f"(pid {os.getpid()})" in result.stdout
-        assert sum(slept) < 6.5  # still returns as soon as the pid appears
+        assert f"Node sync daemon running (pid {os.getpid()})" in result.stdout
+        assert sum(slept) < seconds + 0.5  # still returns as soon as it appears
 
     def test_a_running_daemon_is_reported_not_doubled(
         self, runner, pool_config, monkeypatch, daemon_lock
@@ -268,8 +299,9 @@ class TestNodeSync:
         spawned: list[list[str]] = []
         naps: list[float] = []
 
-        def spawn(argv: list[str]) -> None:
+        def spawn(argv: list[str]) -> SimpleNamespace:
             spawned.append(argv)
+            return _child()
 
         def nap(s: float) -> None:
             # The child takes a moment to write its pid file: the first poll
@@ -372,9 +404,10 @@ class TestTheEnvGatesOnlyTheSupervisor:
     ):
         spawned: list[list[str]] = []
 
-        def spawn(argv: list[str]) -> None:
+        def spawn(argv: list[str]) -> SimpleNamespace:
             spawned.append(argv)
             _pid_is_mine()
+            return _child()
 
         monkeypatch.setattr("magent.launch.spawn_detached", spawn)
         result = runner.invoke(

@@ -23,8 +23,9 @@ from magent.paths import find_config
 from magent.style import style
 
 # How long `node sync -d` waits for the detached child to record its pid:
-# up to ~10 s, returning as soon as it appears. A cold child spends seconds
-# importing before it takes the lock (measured 3.4-5.1 s on a loaded desktop).
+# ~10 s nominal, returning as soon as it appears or the child exits. A cold
+# child spends seconds importing before it takes the lock (measured 2.5-13 s
+# on a loaded desktop); one still alive at the deadline is "still starting".
 _START_POLLS = 100
 _START_POLL_S = 0.1
 
@@ -150,7 +151,9 @@ def sync_cmd(
         # The lock is free, so a pid the file names now is a leftover -- maybe
         # a stranger's by now -- and never the child about to be spawned.
         leftover = node_sync.daemon_pid()
-        spawn_detached(node_sync_argv(str(config_path) if config_path else None))
+        child = spawn_detached(
+            node_sync_argv(str(config_path) if config_path else None)
+        )
         for _ in range(_START_POLLS):
             time.sleep(_START_POLL_S)
             pid = node_sync.daemon_pid()
@@ -160,6 +163,17 @@ def sync_cmd(
                     f"{style(f'(pid {pid})', dim=True)}"
                 )
                 return
+            if child.poll() is not None:
+                break
+        # No budget outlasts every cold start (measured 13 s once), so a child
+        # still alive is starting, not failed. On Windows child.pid is the
+        # venv launcher, which lives exactly as long as the interpreter it ran.
+        if child.poll() is None:
+            click.echo(
+                f"  {style('-', dim=True)} Node sync daemon still starting "
+                f"{style(f'(pid {child.pid})', dim=True)}"
+            )
+            return
         click.echo(
             f"  {style('x', fg='red')} node sync daemon failed to start"
             f" {style('(see ~/.magent/logs/nodes.log)', dim=True)}"
