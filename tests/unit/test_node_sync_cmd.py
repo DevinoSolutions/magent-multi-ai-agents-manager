@@ -177,6 +177,29 @@ class TestNodeSync:
         )
         assert result.exit_code == 1
         assert "node sync daemon failed to start" in result.stdout
+        assert "~/.magent/logs/nodes.log" in result.stdout  # where to look next
+
+    def test_a_child_slow_to_start_is_waited_for(
+        self, runner, pool_config, monkeypatch
+    ):
+        """A cold child spends seconds importing before it takes the lock and
+        writes its pid (measured 3.4-5.1 s on a loaded desktop). The poll must
+        outlast that, not declare a failure the daemon then contradicts."""
+        slept: list[float] = []
+
+        def nap(s: float) -> None:
+            slept.append(s)
+            if sum(slept) >= 6.0:
+                _pid_is_mine()
+
+        monkeypatch.setattr("magent.launch.spawn_detached", lambda argv: None)
+        monkeypatch.setattr(node_cmd, "time", SimpleNamespace(sleep=nap))
+        result = runner.invoke(
+            cli.main, ["--config", pool_config, "node", "sync", "-d"]
+        )
+        assert result.exit_code == 0, result.output
+        assert f"(pid {os.getpid()})" in result.stdout
+        assert sum(slept) < 6.5  # still returns as soon as the pid appears
 
     def test_a_running_daemon_is_reported_not_doubled(
         self, runner, pool_config, monkeypatch, daemon_lock

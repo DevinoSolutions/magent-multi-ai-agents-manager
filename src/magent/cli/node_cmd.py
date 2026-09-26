@@ -22,8 +22,10 @@ from magent.lockfile import LockHeld
 from magent.paths import find_config
 from magent.style import style
 
-# How long `node sync -d` waits for the detached child to record its pid.
-_START_POLLS = 20
+# How long `node sync -d` waits for the detached child to record its pid:
+# up to ~10 s, returning as soon as it appears. A cold child spends seconds
+# importing before it takes the lock (measured 3.4-5.1 s on a loaded desktop).
+_START_POLLS = 100
 _START_POLL_S = 0.1
 
 
@@ -48,10 +50,9 @@ def _daemon_state() -> Literal["ok", "stale", "stopped"]:
     """
     from magent import node_sync  # heavy subsystem: in-body per policy
 
-    age = log.heartbeat_age(node_sync.HEARTBEAT_NAME)
-    if age is None:
+    if log.heartbeat_age(node_sync.HEARTBEAT_NAME) is None:
         return "stopped"
-    return "ok" if age <= log.HEARTBEAT_MAX_AGE else "stale"
+    return "ok" if log.heartbeat_fresh(node_sync.HEARTBEAT_NAME) else "stale"
 
 
 @node_group.command("sync")
@@ -149,7 +150,10 @@ def sync_cmd(
                     f"{style(f'(pid {pid})', dim=True)}"
                 )
                 return
-        click.echo(f"  {style('x', fg='red')} node sync daemon failed to start")
+        click.echo(
+            f"  {style('x', fg='red')} node sync daemon failed to start"
+            f" {style('(see ~/.magent/logs/nodes.log)', dim=True)}"
+        )
         sys.exit(1)
 
     # Foreground loop (also the body of the detached child).
