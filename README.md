@@ -214,6 +214,21 @@ If it *isn't* working you will be told, rather than left guessing:
 
 To own the listener's lifetime yourself, set `MAGENT_HOTKEY_SUPERVISOR=0`; `status` still reports whether one is running.
 
+## Nodes
+
+### Placement, plan, push and recall
+
+`"node": "auto"` lets magent pick the machine. It reads each node's load over the last 30 minutes, which the sync daemon samples, never a single reading, so a box used in bursts is not mistaken for an idle one. It penalizes load spikes and low free memory, skips a node under 10% free memory while another is above it, and spreads your own sessions out. A node with fewer than five recent samples gets one live reading (none under `--dry-run`); a node that does not answer it is left out. The choice then sticks: a project stays on its node until that node leaves `settings.nodes`, and the choice is kept in `~/.magent/nodes/node-map.json`, never in your config.
+
+- `magent node plan <project|--all>` shows each node's score, which one would be chosen and why, and the files that would be shipped. It changes nothing.
+- `magent node push <project>` re-ships the gitignored files (`.env*` and the rest) to the project's running session, after you edit `.env` for example.
+- `magent node recall <project> --local` brings a session home. It pulls once more, prints the node's last commit per repo and whether its tree was dirty, stops the session, installs the conversation into this PC's Claude directory under the project's local folder (resolved exactly as `--go` resolves it), and prints the `git pull`, then the `cd` into that folder and the `claude --resume <id>` to run. The copy follows no links, refuses a pulled folder that is itself a link, skips the pull's unfinished `.part` files, and names every local file the node's copy replaced.
+  - A node that does not answer at all (unreachable, or timed out) is reported, not fatal: what was already pulled is used, and the command that stops the session there is printed.
+  - A node that answers but whose last pull did not finish (it answered with an error, some files did not land, or its placement could not be read again) stops the recall before anything is stopped, installed or cleared: it exits 1, the project stays placed, and it tells you to run the recall again. A node map another process holds busy, or a torn one, exits 1 the same way; a sync daemon that keeps pulling from that node past the wait exits 3, also with nothing touched.
+- `magent node recall <project> --to <nick>` moves an `auto` session to another node and resumes the same conversation there. A pinned project moves by changing its `"node"`.
+
+A session brought up again on the same node continues its newest conversation there (`claude --continue`); only a recall picks a conversation by id.
+
 ## Usage
 
 Run `magent` with no arguments for the interactive menu:
