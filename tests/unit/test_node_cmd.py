@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
 import time
 
@@ -14,6 +15,7 @@ from magent import cli, env, log, node_sync, nodes, remote_mux
 from magent.cli import node_cmd
 from magent.config import SCHEMA_VERSION, load_config
 from magent.remote_mux import ProvisionReport, ScriptLine
+from magent.style import style
 
 HEALTHY = "ok\ttmux\ttmux 3.4\nok\tclaude-login\tlogged in\n"
 NODE_PROJECT = {"path": "api", "node": "second"}
@@ -262,6 +264,23 @@ class TestTheNodesAreCheckedConcurrently:
         _doctor(runner, _pool_file(tmp_config, ("second", "fifth")), "--json")
         assert seen == [7.5, 7.5]
 
+    def test_the_budget_reaches_the_ssh_child_itself(
+        self, runner, tmp_config, monkeypatch, fake_ssh
+    ):
+        # Through the REAL remote_mux.doctor -> run_script -> run: only the
+        # spawn is replaced (fake_ssh is the client lookup), so a layer that
+        # swapped in its own timeout fails.
+        seen: list[float] = []
+
+        def spawn(argv, *, timeout_s, **kwargs):
+            seen.append(timeout_s)
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        monkeypatch.setattr(remote_mux, "_spawn", spawn)
+        monkeypatch.setattr(remote_mux, "DOCTOR_TIMEOUT_S", 7.5)
+        _doctor(runner, _pool_file(tmp_config, ("second", "fifth")), "--json")
+        assert seen == [7.5, 7.5]
+
 
 def _rows(result) -> dict[str, dict[str, str]]:
     return {r["item"]: r for r in json.loads(result.stdout)["nodes"]["second"]}
@@ -422,6 +441,24 @@ class TestTheTextRowsAreTheContract:
         assert (
             f"    - {'snapshot'.ljust(w)}  no sessions snapshot from this node yet"
         ) in out
+
+    def test_only_the_rows_that_need_nothing_are_dimmed(
+        self, runner, tmp_config, fake_ssh
+    ):
+        # ok and skip rows recede; a warn or fail detail keeps full weight.
+        fake_ssh.set_reply(
+            "bash -s",
+            stdout="ok\ttmux\ttmux 3.4\nwarn\tlocale\tcharmap is POSIX\n",
+        )
+        result = runner.invoke(
+            cli.main,
+            ["--config", _pool_file(tmp_config), "node", "doctor"],
+            color=True,
+        )
+        dim = style("tmux 3.4", dim=True)
+        assert dim in result.stdout
+        assert style("charmap is POSIX", dim=False) in result.stdout
+        assert style("charmap is POSIX", dim=True) not in result.stdout
 
     def test_an_unknown_nick_is_on_stderr_not_stdout(
         self, runner, tmp_config, fake_ssh
