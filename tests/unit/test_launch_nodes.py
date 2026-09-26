@@ -1305,9 +1305,10 @@ class TestTheNodePhaseSaysWhatHappened:
 
         monkeypatch.setattr("magent.attach_client.spawn_attach_window", no_wt)
         launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
-        (line,) = [
-            ln for ln in capsys.readouterr().out.splitlines() if "did not open" in ln
-        ]
+        out = capsys.readouterr().out
+        lines = [ln for ln in out.splitlines() if "did not open" in ln]
+        assert len(lines) == 1, out
+        line = lines[0]
         assert line.lstrip().startswith("! api @second: ")
         assert "nodes.log" in line
         assert "magent --go" in line
