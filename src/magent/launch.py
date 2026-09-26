@@ -2052,6 +2052,103 @@ def node_session_ids(config: MagentConfig, group: str | None = None) -> list[str
     return [nodes.node_sid(proj) for proj in nodes.node_projects(config, group)]
 
 
+def stop_node_sessions(
+    config: MagentConfig, sids: list[str]
+) -> tuple[list[str], list[str]]:
+    """Kill each node session in ``sids`` ON ITS NODE: where the node map
+    placed it, else where its project is pinned. Returns ``(stopped,
+    still_running)`` like ``stop_psmux``, in config order.
+
+    A session the node confirmed killed is stopped; one that was not there is
+    neither. Either way its map entry is cleared. One whose node could not be
+    asked (unreachable, or a placement the config no longer names) is a
+    survivor, and its entry stays for the next ``down`` to find. A node that
+    failed once is not dialed again in this call: its other sessions are
+    survivors too, so ``down --all`` against a powered-off node costs one
+    probe timeout, not one per project. An ``auto`` project the map never
+    placed runs nowhere this PC knows of and is skipped.
+
+    The map is read STRICTLY: this answer becomes a report, and a torn or
+    busy map read as ``{}`` would hide every placed session behind "No
+    running sessions to stop.". Unreadable, nothing it might hold is claimed:
+    an ``auto`` project is a survivor, and a pinned one that is "not there"
+    on its pin is a survivor too -- it may run where the lost map said.
+    Likewise one unmap that fails stops the rest from queueing on the same
+    map lock; their entries stay, which the next bring-up records over.
+
+    The node half only. The LOCAL session a node project may have left here
+    (D9) is ``stop_psmux``'s, and the ``down`` shell folds the two halves
+    into one report."""
+    # heavy subsystem: in-body per policy (nodes + remote_mux: ssh)
+    from magent import nodes, remote_mux
+    from magent.config import NODE_AUTO
+    from magent.env import local_username
+
+    log = get_logger("nodes")
+    try:
+        entries = nodes.load_node_map_strict()
+        map_known = True
+    except (OSError, ValueError) as exc:
+        log.warning("down: node map unreadable, no placement is trusted: %s", exc)
+        entries, map_known = {}, False
+    map_writable = True
+    unreachable: set[str] = set()
+    stopped: list[str] = []
+    still: list[str] = []
+    for proj in nodes.node_projects(config):
+        sid = nodes.node_sid(proj)
+        if sid not in sids:
+            continue
+        key, entry = nodes.placement_of(proj, entries) or (None, None)
+        if entry is None and proj.node == NODE_AUTO:
+            if not map_known:
+                still.append(sid)
+            continue
+        try:
+            # The map wins over the pin: a project re-pinned since its
+            # bring-up still runs where it was started.
+            node = nodes.resolve(
+                config,
+                replace(proj, node=entry.nick) if entry else proj,
+                local_user=local_username(),
+            )
+        except nodes.NodeConfigError as exc:
+            log.warning("down: %s not stopped: %s", sid, exc)
+            still.append(sid)
+            continue
+        if node.nick in unreachable:
+            still.append(sid)
+            continue
+        killed = remote_mux.kill_session(node, entry.sid if entry else sid)
+        if killed is None:
+            log.warning("down: %s not stopped: node %s did not answer", sid, node.nick)
+            unreachable.add(node.nick)
+            still.append(sid)
+            continue
+        if killed:
+            stopped.append(sid)
+        elif not map_known:
+            log.warning(
+                "down: %s not stopped: not on %s, map unreadable", sid, node.nick
+            )
+            still.append(sid)
+        if key is None:
+            continue
+        if not map_writable:
+            log.warning("down: %s map entry stays: the map could not be written", sid)
+            continue
+        try:
+            # Compare-and-delete: an `up` that re-placed this project while
+            # the kill was in flight keeps its fresh entry.
+            nodes.update_node_map(key, None, expect=entry)
+        except (ValueError, OSError) as exc:
+            # The kill is proved. A stale entry is harmless: the next bring-up
+            # of this project records its placement over it.
+            log.warning("down: %s stopped, but its map entry stays: %s", sid, exc)
+            map_writable = False
+    return stopped, still
+
+
 def _echo_node_outcomes(outcomes: list[NodeBringUpOutcome]) -> None:
     for o in outcomes:
         if o.ok:

@@ -417,6 +417,29 @@ class TestTheMapRecordsHowToReachASession:
         nodes.update_node_map("api", None)
         assert set(nodes.read_node_map()) == {"web"}
 
+    def test_an_expected_entry_that_still_matches_is_removed(self, node_map):
+        nodes.write_node_map({"api": ENTRY})
+        assert nodes.update_node_map("api", None, expect=ENTRY) == {}
+        assert nodes.read_node_map() == {}
+
+    def test_an_expected_entry_replaced_meanwhile_is_left_byte_for_byte(self, node_map):
+        # `down` stopped the old placement; an `up` has since written a new one.
+        fresh = dataclasses.replace(ENTRY, nick="third")
+        nodes.write_node_map({"api": fresh})
+        before = node_map.read_bytes()
+        kept = nodes.update_node_map("api", None, expect=ENTRY)
+        assert node_map.read_bytes() == before
+        assert kept == {"api": fresh}
+
+    def test_a_newer_placement_on_the_same_node_and_sid_is_left_too(self, node_map):
+        # Same node, same sid, a later bring-up: a session `down` never stopped.
+        fresh = dataclasses.replace(ENTRY, placed_ts=ENTRY.placed_ts + 1)
+        nodes.write_node_map({"api": fresh})
+        before = node_map.read_bytes()
+        kept = nodes.update_node_map("api", None, expect=ENTRY)
+        assert node_map.read_bytes() == before
+        assert kept == {"api": fresh}
+
     def test_removing_an_absent_project_writes_nothing(self, node_map):
         assert nodes.update_node_map("api", None) == {}
         assert not node_map.exists()

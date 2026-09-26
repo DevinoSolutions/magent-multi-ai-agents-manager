@@ -392,13 +392,22 @@ def _sweep_stale_temps() -> None:
 
 
 def update_node_map(
-    project: str, entry: NodeMapEntry | None, *, wait_s: float = MAP_LOCK_WAIT_S
+    project: str,
+    entry: NodeMapEntry | None,
+    *,
+    expect: NodeMapEntry | None = None,
+    wait_s: float = MAP_LOCK_WAIT_S,
 ) -> dict[str, NodeMapEntry]:
     """Set ``project``'s entry (or remove it, with None), keeping every other
     project's, and return the map as it now stands. The ONE writer entry point
     (DECISION-13): the read and the write happen under ``map_lock``, so `up`,
     `down`, placement and recall running at once each keep the others'
     entries.
+
+    With ``expect``, the change is a compare-and-set: it applies only while
+    ``project``'s entry is still exactly ``expect``, checked under the lock.
+    `down` clearing the placement it just killed passes the entry it read, so
+    a placement a concurrent `up` recorded meanwhile survives.
 
     Reads through ``load_node_map_strict``: a torn or unreadable map raises
     (ValueError / OSError) and is left as it is, never read as ``{}`` and
@@ -407,6 +416,8 @@ def update_node_map(
     with map_lock(wait_s):
         _sweep_stale_temps()
         current = load_node_map_strict()
+        if expect is not None and current.get(project) != expect:
+            return current
         if entry is None:
             if project not in current:
                 return current
@@ -433,6 +444,21 @@ def open_target(
     if entry is None or entry.nick == NODE_CLOUD or not entry.target or not entry.cwd:
         return None
     return entry.target, entry.cwd
+
+
+def placement_of(
+    proj: ProjectConfig, entries: Mapping[str, NodeMapEntry]
+) -> tuple[str, NodeMapEntry] | None:
+    """``(map key, entry)`` recording where ``proj`` was placed, or None: by
+    its project name first, else by its session id -- a title edited since the
+    bring-up can keep its sid, and the session it names still runs. The order
+    ``open_target`` reads in. `down` asks this both to decide where to act and
+    what to kill, so the two answers cannot diverge."""
+    name = project_name(proj)
+    if name in entries:
+        return name, entries[name]
+    sid = node_sid(proj)
+    return next(((k, e) for k, e in entries.items() if e.sid == sid), None)
 
 
 # A portable Unix login (useradd's default NAME_REGEX, minus the trailing-$

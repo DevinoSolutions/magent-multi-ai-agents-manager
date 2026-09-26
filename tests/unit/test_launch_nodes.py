@@ -248,7 +248,7 @@ class TestTheOutcomeCarriesTheWindowsTitle:
         assert outcome.title == "magent:api"
 
     def test_attaching_instead_names_the_window_too(self, rig, api, tmp_path, windows):
-        _hold("second")
+        _hold("api")
         rig.live = True
         rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
         outcome = launch.bring_up_node_project(_config(api), api, window=True)
@@ -1008,15 +1008,15 @@ class TestUpBringsUpNodeProjectsToo:
         assert launch.node_session_ids(_config(a, b), group="WORK") == ["a"]
 
 
-def _hold(nick: str) -> None:
+def _hold(name: str, nick: str = "second", sid: str | None = None) -> None:
     nodes.update_node_map(
-        "api",
+        name,
         NodeMapEntry(
             nick=nick,
-            sid="api",
+            sid=sid or name,
             placed_ts=1.0,
             attached_existing=False,
-            remote_root="~/magent/api",
+            remote_root=f"~/magent/{name}",
             target=f"amin@devino-{nick}",
         ),
     )
@@ -1065,7 +1065,7 @@ class TestTheAttachInsteadPathIsNarrow:
     def test_a_session_held_on_another_node_does_not_excuse_a_dirty_tree(
         self, rig, api, tmp_path
     ):
-        _hold("third")
+        _hold("api", nick="third")
         rig.live = True
         rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
         outcome = launch.bring_up_node_project(_config(api), api)
@@ -1073,7 +1073,7 @@ class TestTheAttachInsteadPathIsNarrow:
         assert rig.decorated == []
 
     def test_a_probe_that_failed_is_not_a_live_session(self, rig, api, tmp_path):
-        _hold("second")
+        _hold("api")
         rig.live = None  # has_session's "the PROBE failed" answer
         rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
         outcome = launch.bring_up_node_project(_config(api), api)
@@ -1086,7 +1086,7 @@ class TestTheAttachInsteadPathIsNarrow:
         monkeypatch.setattr(
             launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
         )
-        _hold("second")
+        _hold("api")
         rig.live = True
         rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
         outcome = launch.bring_up_node_project(_config(api), api, window=True)
@@ -1734,3 +1734,248 @@ class TestUpCommandBringsNodeProjectsUp:
         assert "1 session(s) failed to come up: api" in result.stdout
         assert "(see ~/.magent/logs/nodes.log on the host)" in result.stdout
         assert "launch.log" not in result.stdout
+
+
+class TestStoppingNodeSessions:
+    """``down``'s node half: each node session is killed ON ITS NODE, once.
+    The local session a node project may have left here is ``stop_psmux``'s
+    (D9), never this function's."""
+
+    @pytest.fixture
+    def kills(self, monkeypatch):
+        calls: list[tuple[str, str]] = []
+        answers: dict[str, bool | None] = {}
+
+        def kill(node, sid):
+            calls.append((node.nick, sid))
+            return answers.get(sid, True)
+
+        monkeypatch.setattr(remote_mux, "kill_session", kill)
+        return calls, answers
+
+    @pytest.fixture
+    def nodes_log(self, caplog):
+        # The survivor line sends the user to nodes.log: what lands THERE.
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        return lambda: [
+            r.getMessage() for r in caplog.records if r.name == "magent.nodes"
+        ]
+
+    @pytest.fixture
+    def torn(self, rig):
+        nodes.NODE_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+
+    @pytest.fixture(params=["torn", "busy"])
+    def unreadable(self, request, rig, monkeypatch):
+        # Torn on disk, or intact but locked by another process (a Windows
+        # sharing violation reads as PermissionError): neither is "empty".
+        if request.param == "torn":
+            request.getfixturevalue("torn")
+            return
+
+        def busy() -> dict[str, nodes.NodeMapEntry]:
+            raise PermissionError(13, "The process cannot access the file")
+
+        monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+
+    def test_a_killed_session_is_stopped_and_unmapped(self, rig, api, kills):
+        _hold("api")
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert kills[0] == [("second", "api")]
+        assert nodes.read_node_map() == {}
+
+    def test_a_session_that_was_already_gone_is_neither_and_unmapped(
+        self, rig, api, kills
+    ):
+        _hold("api")
+        kills[1]["api"] = False
+        assert launch.stop_node_sessions(_config(api), ["api"]) == ([], [])
+        assert nodes.read_node_map() == {}
+
+    def test_an_unreachable_node_keeps_the_entry_and_names_the_survivor(
+        self, rig, api, kills, nodes_log
+    ):
+        _hold("api")
+        kills[1]["api"] = None
+        assert launch.stop_node_sessions(_config(api), ["api"]) == ([], ["api"])
+        assert "api" in nodes.read_node_map()
+        assert nodes_log() == ["down: api not stopped: node second did not answer"]
+
+    def test_a_pinned_project_nobody_recorded_is_still_asked_and_never_mapped(
+        self, rig, api, kills
+    ):
+        # Another PC (or a lost map) may have started it: the pin says where.
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert kills[0] == [("second", "api")]
+        assert nodes.read_node_map() == {}
+
+    def test_an_unrecorded_kill_never_takes_the_map_lock(
+        self, rig, api, kills, monkeypatch
+    ):
+        # No entry, nothing to clear: a torn or held map is never touched.
+        writes: list[str] = []
+        monkeypatch.setattr(
+            nodes, "update_node_map", lambda name, entry, **_k: writes.append(name)
+        )
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert writes == []
+
+    def test_an_auto_project_that_was_never_placed_is_skipped(
+        self, rig, tmp_path, kills
+    ):
+        proj = ProjectConfig(path=str(tmp_path / "web"), node="auto")
+        assert launch.stop_node_sessions(_config(proj), ["web"]) == ([], [])
+        assert kills[0] == []
+
+    def test_an_auto_project_is_killed_where_the_map_placed_it(
+        self, rig, tmp_path, kills
+    ):
+        proj = ProjectConfig(path=str(tmp_path / "web"), node="auto")
+        _hold("web", nick="third")
+        assert launch.stop_node_sessions(_config(proj), ["web"]) == (["web"], [])
+        assert kills[0] == [("third", "web")]
+
+    def test_the_map_wins_over_a_pin_changed_since_the_bring_up(self, rig, api, kills):
+        _hold("api", nick="third")
+        launch.stop_node_sessions(_config(api), ["api"])
+        assert kills[0] == [("third", "api")]
+
+    def test_the_recorded_sid_is_the_one_killed(self, rig, api, kills):
+        _hold("api", sid="api-2")
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert kills[0] == [("second", "api-2")]
+
+    def test_ids_outside_the_list_are_left_running(self, rig, api, tmp_path, kills):
+        other = ProjectConfig(path=str(tmp_path / "web"), node="second")
+        launch.stop_node_sessions(_config(api, other), ["web"])
+        assert kills[0] == [("second", "web")]
+
+    def test_a_node_that_failed_once_is_not_dialed_again(self, rig, tmp_path, kills):
+        # `down --all` against a powered-off node costs one probe timeout,
+        # not one per project on it; another node is still asked.
+        a1, a2, b1 = (
+            ProjectConfig(path=str(tmp_path / n), node=nick)
+            for n, nick in (("a1", "second"), ("a2", "second"), ("b1", "third"))
+        )
+        kills[1].update({"a1": None, "a2": None})
+        assert launch.stop_node_sessions(_config(a1, a2, b1), ["a1", "a2", "b1"]) == (
+            ["b1"],
+            ["a1", "a2"],
+        )
+        assert kills[0] == [("second", "a1"), ("third", "b1")]
+
+    def test_a_placement_the_config_can_no_longer_name_is_a_survivor(
+        self, rig, tmp_path, kills, nodes_log
+    ):
+        proj = ProjectConfig(path=str(tmp_path / "web"), node="auto")
+        _hold("web", nick="gone")
+        assert launch.stop_node_sessions(_config(proj), ["web"]) == ([], ["web"])
+        assert kills[0] == []
+        assert "web" in nodes.read_node_map()
+        lines = nodes_log()
+        assert len(lines) == 1, lines
+        assert lines[0].startswith("down: web not stopped: ")
+        assert "gone" in lines[0]
+
+    @pytest.mark.parametrize(
+        "exc",
+        [lockfile.LockHeld("the node map is held"), ValueError("node-map.json: torn")],
+        ids=["held", "torn"],
+    )
+    def test_a_map_that_cannot_be_rewritten_does_not_unclaim_the_kill(
+        self, rig, api, kills, monkeypatch, exc
+    ):
+        _hold("api")
+
+        def held(*_a: object, **_k: object) -> None:
+            raise exc
+
+        monkeypatch.setattr(nodes, "update_node_map", held)
+        outcome: object
+        try:
+            outcome = launch.stop_node_sessions(_config(api), ["api"])
+        except (ValueError, OSError) as escaped:  # `down` crashing after a proven kill
+            outcome = escaped
+        assert outcome == (["api"], [])
+
+    def test_one_unmap_that_fails_stops_the_rest_from_waiting_on_the_lock(
+        self, rig, tmp_path, kills, monkeypatch
+    ):
+        # A held map lock costs MAP_LOCK_WAIT_S per attempt: one, not one per
+        # placed project. Every kill still counts.
+        a1, a2 = (
+            ProjectConfig(path=str(tmp_path / n), node="second") for n in ("a1", "a2")
+        )
+        _hold("a1")
+        _hold("a2")
+        tries: list[str] = []
+
+        def held(name: str, *_a: object, **_k: object) -> None:
+            tries.append(name)
+            raise lockfile.LockHeld("the node map is held")
+
+        monkeypatch.setattr(nodes, "update_node_map", held)
+        assert launch.stop_node_sessions(_config(a1, a2), ["a1", "a2"]) == (
+            ["a1", "a2"],
+            [],
+        )
+        assert tries == ["a1"]
+
+    def test_a_retitled_project_is_found_by_its_recorded_sid(
+        self, rig, tmp_path, kills
+    ):
+        # The title changed, its session id did not: the map key is the old
+        # title, and the session it records still runs. Found, killed, unmapped.
+        proj = ProjectConfig(path=str(tmp_path / "web"), title="my web", node="auto")
+        sid = nodes.node_sid(proj)
+        _hold("my.web", nick="third", sid=sid)
+        assert launch.stop_node_sessions(_config(proj), [sid]) == ([sid], [])
+        assert kills[0] == [("third", sid)]
+        assert nodes.read_node_map() == {}
+
+    def test_a_placement_an_up_made_during_the_kill_survives_the_unmap(
+        self, rig, api, monkeypatch
+    ):
+        # `up` re-placed api on third while the kill on second was in flight:
+        # the unmap clears only the entry it stopped, never the fresh one.
+        _hold("api")
+
+        def kill_while_up_replaces(node, sid):
+            _hold("api", nick="third")
+            return True
+
+        monkeypatch.setattr(remote_mux, "kill_session", kill_while_up_replaces)
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert {k: e.nick for k, e in nodes.read_node_map().items()} == {"api": "third"}
+
+    # An unreadable map: this answer becomes a report, so the map is never
+    # read as "nothing placed" -- whatever it might hold is not claimed.
+
+    def test_with_an_unreadable_map_an_auto_project_is_a_survivor_nobody_dials(
+        self, rig, tmp_path, kills, unreadable, nodes_log
+    ):
+        proj = ProjectConfig(path=str(tmp_path / "web"), node="auto")
+        assert launch.stop_node_sessions(_config(proj), ["web"]) == ([], ["web"])
+        assert kills[0] == []
+        assert any("node map unreadable" in m for m in nodes_log())
+
+    def test_with_an_unreadable_map_a_pin_answering_not_there_is_a_survivor(
+        self, rig, api, kills, unreadable
+    ):
+        # It may run where the lost map placed it: "not on the pin" proves nothing.
+        kills[1]["api"] = False
+        assert launch.stop_node_sessions(_config(api), ["api"]) == ([], ["api"])
+        assert kills[0] == [("second", "api")]
+
+    def test_with_an_unreadable_map_a_confirmed_kill_is_stopped(
+        self, rig, api, kills, unreadable
+    ):
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+
+    def test_a_torn_map_is_never_rewritten(self, rig, api, kills, torn):
+        launch.stop_node_sessions(_config(api), ["api"])
+        assert nodes.NODE_MAP_PATH.read_text(encoding="utf-8") == "{ torn"
