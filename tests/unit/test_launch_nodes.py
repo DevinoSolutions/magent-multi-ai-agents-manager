@@ -667,7 +667,7 @@ class TestTheBringUpProvisionsFirst:
         assert [nick for nick, _ in rig.recipes] == ["second", "second"]
 
     def test_an_unreachable_node_fails_only_that_project_and_is_retried(
-        self, rig, api, fake_ssh, monkeypatch, tmp_path
+        self, rig, api, fake_ssh, monkeypatch, tmp_path, caplog
     ):
         monkeypatch.setattr(remote_mux, "provision_node", real_provision_node)
         fake_ssh.set_reply(
@@ -675,17 +675,59 @@ class TestTheBringUpProvisionsFirst:
         )
         web = _web(tmp_path, rig)
         config = _config(api, web)
-        outcome = launch.bring_up_node_project(config, api)
+        with caplog.at_level(logging.WARNING, logger="magent.nodes"):
+            outcome = launch.bring_up_node_project(config, api)
         assert not outcome.ok
-        assert "No route" in (outcome.error or "")
+        assert outcome.error == (
+            "provisioning: ssh: connect to host devino-second: No route"
+        )
         assert rig.recipes == []
         assert "second" not in launch._PROVISIONED
+        assert any(
+            message.startswith("provision @second: failed (")
+            for _, level, message in caplog.record_tuples
+            if level == logging.WARNING
+        )
         # The node answers again: the NEXT project on it provisions, rather
         # than taking the failed attempt as done.
         (fake_ssh.base / "replies.json").unlink()
         assert launch.bring_up_node_project(config, web).ok
         assert len(fake_ssh.calls()) == 2
         assert "second" in launch._PROVISIONED
+
+    def test_a_timed_out_provision_fails_that_project_and_is_never_retried(
+        self, rig, api, fake_ssh, monkeypatch, tmp_path, caplog
+    ):
+        # A timeout proves the node answered, but not what the apply did: it
+        # may still be running there, so a retry would start a second one.
+        attempts: list[str] = []
+
+        def provision_node(node, config, **kw):
+            attempts.append(node.nick)
+            return real_provision_node(node, config, **kw)
+
+        monkeypatch.setattr(remote_mux, "provision_node", provision_node)
+        monkeypatch.setattr(remote_mux, "PROVISION_TIMEOUT_S", 1.0)
+        fake_ssh.set_mode("timeout")
+        web = _web(tmp_path, rig)
+        config = _config(api, web)
+        with caplog.at_level(logging.WARNING, logger="magent.nodes"):
+            first = launch.bring_up_node_project(config, api)
+        assert not first.ok
+        assert first.error == "provisioning: timed out after 1s"
+        assert rig.recipes == []
+        assert "second" in launch._PROVISIONED
+        assert any(
+            message.startswith("provision @second: outcome unknown (")
+            and message.endswith("); not retrying this run")
+            for _, level, message in caplog.record_tuples
+            if level == logging.WARNING
+        )
+        # Counted at the seam: on Windows the fake's recorder is orphaned when
+        # a timeout kills it, so fake_ssh.calls() undercounts.
+        assert launch.bring_up_node_project(config, web).ok
+        assert attempts == ["second"]
+        assert [nick for nick, _ in rig.recipes] == ["second"]
 
     def test_a_fail_row_is_logged_and_the_session_still_comes_up(
         self, rig, api, fake_ssh, monkeypatch, caplog
