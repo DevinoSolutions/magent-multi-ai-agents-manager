@@ -2337,6 +2337,60 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         assert "magent down --host me@host" in hints[0]
         assert "node-map.json" not in out.output
 
+    @pytest.mark.parametrize(
+        ("state", "cls", "words"),
+        [
+            ("torn", "ValueError", "Expecting value"),
+            ("busy", "PermissionError", "The process cannot access the file"),
+        ],
+    )
+    def test_a_map_that_heals_at_once_still_leaves_its_whole_error_in_the_log(
+        self, runner, tmp_config, monkeypatch, tmp_path, caplog, state, cls, words
+    ):
+        # `down` could not read the map when deciding where to act; the node
+        # half's own read, a moment later, went through and so logged nothing.
+        # The screen names the class; nodes.log must still say what refused
+        # the map, path and all.
+        from magent import nodes
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        self._hold("api")
+        real = nodes.load_node_map_strict
+        reads: list[None] = []
+
+        def heals() -> dict[str, nodes.NodeMapEntry]:
+            reads.append(None)
+            if len(reads) > 1:
+                return real()
+            if state == "torn":
+                raise ValueError(f"{nodes.NODE_MAP_PATH}: {words}: line 1 column 3")
+            raise PermissionError(13, words)
+
+        monkeypatch.setattr(nodes, "load_node_map_strict", heals)
+        out, _killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        assert len(reads) > 1, "the node half never re-read the map"
+        assert dialed == [("second", "api")]
+        hints = [ln for ln in out.output.splitlines() if "--host" in ln]
+        assert len(hints) == 1, out.output
+        assert f"the node map could not be read ({cls})" in hints[0]
+        assert words not in out.output
+        assert "node-map.json" not in out.output
+        logged = [r.getMessage() for r in caplog.records if r.name == "magent.nodes"]
+        assert any(words in m for m in logged), logged
+        if state == "torn":
+            assert any(str(nodes.NODE_MAP_PATH) in m for m in logged), logged
+
     @pytest.mark.parametrize("state", ["torn", "busy"])
     def test_an_unreadable_map_leaves_an_explicit_host_in_charge(
         self, runner, tmp_config, monkeypatch, tmp_path, state
