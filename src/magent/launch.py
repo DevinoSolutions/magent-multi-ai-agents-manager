@@ -22,12 +22,7 @@ from magent.platform import (
     VSCodeLaunchOpts,
     get_platform,
 )
-from magent.procs import (
-    REGISTRATION_TIMEOUT_S,
-    await_registration,
-    pid_alive,
-    spawn_unjobbed,
-)
+from magent.procs import await_registration, pid_alive, spawn_unjobbed
 from magent.sessions import (
     AGENT_TOOLS,
     build_resume_command,
@@ -232,10 +227,6 @@ def hotkey_restart_reason(
     return None
 
 
-# Module-level (not a default argument) so a test can shrink the window.
-HOTKEY_START_TIMEOUT_S = REGISTRATION_TIMEOUT_S
-
-
 def start_hotkey_listener(server_url: str, ssh_host: str | None = None) -> int | None:
     """Start the window-hotkey (Alt+V paste / F2 open-in-VS-Code) listener
     detached, unless a listener matching this exact version and target is
@@ -284,12 +275,7 @@ def start_hotkey_listener(server_url: str, ssh_host: str | None = None) -> int |
     # wait both reports the pid and surfaces a hook failure (the child exits).
     # `not_pid=existing` guards the restart path: a kill that didn't take must
     # not read back as "the new listener came up".
-    return await_registration(
-        spawn_detached(args),
-        listener_pid,
-        HOTKEY_START_TIMEOUT_S,
-        not_pid=existing,
-    )
+    return await_registration(spawn_detached(args), listener_pid, not_pid=existing)
 
 
 def supervised_hotkey_target(
