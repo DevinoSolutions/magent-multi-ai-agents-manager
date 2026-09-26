@@ -1052,6 +1052,82 @@ class TestAnUnreadableMapPlacesNothingByGuess:
         assert "node map is unreadable" not in error
         assert rig.recipes == []
 
+    def test_two_hidden_auto_rivals_still_name_the_map(
+        self, rig, tmp_path, unreadable_map
+    ):
+        x_api, y_api, web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        w_dir = tmp_path / "w" / "api"
+        w_dir.mkdir(parents=True)
+        rig.states[w_dir] = _state(w_dir)
+        w_api = ProjectConfig(path=str(w_dir), node="auto", title="api-w")
+        _record("api-x", "second", "~/magent/api")
+        _record("api-y", "third", "~/magent/api")
+        _record("api-w", "second", "~/magent/api")
+        rig.live = True
+        cls = unreadable_map()
+        outcomes = _batch(_config(x_api, y_api, w_api, web), only=["api-x", "web"])
+        assert [(o.sid, o.ok) for o in outcomes] == [("api-x", False), ("web", True)]
+        assert outcomes[0].error == _FOLDER_UNKNOWN.format(cls=cls, nick="second")
+        assert [(n, r.sid) for n, r in rig.recipes] == [("second", "web")]
+
+    def test_the_holder_and_its_hidden_auto_twin_in_one_batch_both_name_the_map(
+        self, rig, tmp_path, unreadable_map
+    ):
+        x_api, y_api, web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        _record("api-x", "second", "~/magent/api")
+        _record("api-y", "third", "~/magent/api")
+        rig.live = True
+        cls = unreadable_map()
+        outcomes = _batch(_config(x_api, y_api, web))
+        assert [(o.sid, o.ok) for o in outcomes] == [
+            ("api-x", False),
+            ("api-y", False),
+            ("web", True),
+        ]
+        assert outcomes[0].error == _FOLDER_UNKNOWN.format(cls=cls, nick="second")
+        assert outcomes[1].error == (
+            f"the node map is unreadable ({cls}), so where this auto project runs"
+            " is unknown; not brought up"
+        )
+        assert [(n, r.sid) for n, r in rig.recipes] == [("second", "web")]
+
+    def test_two_pinned_twins_keep_the_rename_text(self, rig, tmp_path, unreadable_map):
+        # No auto project in the group: the clash is real whatever the map says.
+        x_api, y_api, web = _twin_apis(tmp_path, rig)
+        _record("api-x", "second", "~/magent/api")
+        rig.live = True
+        unreadable_map()
+        outcomes = _batch(_config(x_api, y_api, web), only=["api-x", "web"])
+        assert [(o.sid, o.ok) for o in outcomes] == [("api-x", False), ("web", True)]
+        error = outcomes[0].error or ""
+        assert "'api-x' and 'api-y' would share" in error
+        assert "rename one of them" in error
+        assert "node map is unreadable" not in error
+
+    def test_a_readable_map_keeps_the_holder_up_beside_its_auto_twin(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # The same fleet with the map readable: api-x proves it holds
+        # second:~/magent/api and attaches, told of the clash as a warning.
+        x_api, y_api, web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        _record("api-x", "second", "~/magent/api")
+        _record("api-y", "third", "~/magent/api")
+        rig.live = True
+        _attached_when_live(monkeypatch, rig)
+        outcomes = _batch(_config(x_api, y_api, web), only=["api-x", "web"])
+        holder = outcomes[0]
+        assert (holder.sid, holder.ok, holder.attached_existing) == (
+            "api-x",
+            True,
+            True,
+        )
+        (warning,) = holder.warnings
+        assert "'api-x' and 'api-y' would share" in warning
+        assert "node map is unreadable" not in warning
+
     def test_a_pinned_project_keeps_its_pin(self, rig, api, unreadable_map):
         _record("api", "third", "~/magent/api")
         unreadable_map()
