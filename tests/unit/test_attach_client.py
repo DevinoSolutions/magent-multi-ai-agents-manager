@@ -1333,3 +1333,20 @@ class TestOneSshClientForTheProbeAndThePane:
             ctypes.windll.kernel32, "GetSystemDirectoryW", lambda _buf, _n: 0
         )
         assert real_system_directory() is None
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="GetSystemDirectoryW is win32")
+    @pytest.mark.parametrize("needed", [260, 300])
+    def test_a_system_directory_too_long_for_the_buffer_reads_as_none(
+        self, monkeypatch, needed
+    ):
+        # Too small a buffer is answered with the size it NEEDS (terminator
+        # included), and what the buffer holds then is undefined -- a partial
+        # path, never one to build ssh.exe's location from.
+        import ctypes
+
+        def partial(buf, _n):
+            buf.value = r"C:\Windo"
+            return needed
+
+        monkeypatch.setattr(ctypes.windll.kernel32, "GetSystemDirectoryW", partial)
+        assert real_system_directory() is None

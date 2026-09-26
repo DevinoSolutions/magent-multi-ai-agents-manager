@@ -382,10 +382,12 @@ def _system_directory() -> Path | None:
 
     buffer = ctypes.create_unicode_buffer(260)
     try:
-        written = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, 260)
+        written = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, len(buffer))
     except OSError:
         return None
-    return Path(buffer.value) if written else None
+    # 0 is failure; len(buffer) or more is the size it NEEDED, with the buffer
+    # holding nothing to trust. Only a count that fit is a path.
+    return Path(buffer.value) if 0 < written < len(buffer) else None
 
 
 def find_ssh() -> str | None:
