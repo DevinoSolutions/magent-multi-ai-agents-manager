@@ -3069,20 +3069,26 @@ class TestRecallSaysUnknownNeverAbsentOrATraceback:
         assert detail not in result.output
         assert any(detail in m for m in _node_logs(caplog)), _node_logs(caplog)
 
-    @pytest.mark.parametrize("damage", ["torn", "unopenable", "not-an-object"])
+    @pytest.mark.parametrize(
+        "damage", ["torn", "unopenable", "not-an-object", "not-a-record"]
+    )
     def test_an_unreadable_commit_record_is_not_never_recorded(
         self, runner, placed_api, node_is_gone, caplog, damage
     ):
         caplog.set_level(logging.WARNING, logger="magent.nodes")
         path = nodes.repo_record_path("second", "api")
         path.parent.mkdir(parents=True, exist_ok=True)
+        body = {
+            "torn": '{"ts": 5, "sour',
+            "not-an-object": "[]",
+            # Valid JSON, but a ts that is not a number: not a record either.
+            "not-a-record": '{"ts": "5", "source": "recall", "repos": []}',
+        }
         if damage == "unopenable":
             path.mkdir()  # there, and it cannot be read
         else:
-            path.write_text(
-                '{"ts": 5, "sour' if damage == "torn" else "[]", encoding="utf-8"
-            )
-        if damage == "not-an-object":
+            path.write_text(body[damage], encoding="utf-8")
+        if damage in ("not-an-object", "not-a-record"):
             cls = "ValueError"
         else:
             with pytest.raises((OSError, ValueError)) as info:
