@@ -380,6 +380,7 @@ class TestJson:
             "upload_server": "on",
             "listener": "off",
             "attention": "off",
+            "node_sync": "off",
             "agents": [],
             "psmux_sessions": [],
             "psmux_session0": 0,
@@ -406,6 +407,7 @@ class TestJson:
             "upload_server": "dead",
             "listener": "off",
             "attention": "off",
+            "node_sync": "off",
             "agents": [],
             "psmux_sessions": [],
             "psmux_session0": 0,
@@ -1598,3 +1600,117 @@ class TestStatusShowsNodeSessions:
             cli.main, ["--config", tmp_config({"projects": []}), "status"]
         )
         assert "Nodes" not in result.stdout
+
+
+class TestAStaleNodeSyncDaemonDegradesStatus:
+    """Exit 3 when a project runs on a node and the sync daemon's heartbeat has
+    gone stale: every node row would then be frozen at a pull nobody refreshes.
+    A STOPPED daemon is not degraded (serve starts one; with serve off the
+    upload-server line already says so), and without a node project nobody
+    expects a daemon at all. Driven through the real heartbeat file."""
+
+    def _config(self, tmp_config, tmp_path, *, on_node=True):
+        project = {"path": str(tmp_path), "title": "api"}
+        if on_node:
+            project["node"] = "second"
+        return tmp_config(
+            {
+                "projects": [project],
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                },
+            }
+        )
+
+    def _beat(self, age_s):
+        """The daemon's heartbeat, last touched ``age_s`` seconds ago."""
+        import os
+
+        from magent import log, node_sync
+
+        log.write_heartbeat(node_sync.HEARTBEAT_NAME)
+        path = log.HEARTBEAT_DIR / f"{node_sync.HEARTBEAT_NAME}.heartbeat"
+        then = time.time() - age_s
+        os.utime(path, (then, then))
+
+    def _status(self, runner, cfgpath, *extra):
+        return runner.invoke(cli.main, ["--config", cfgpath, "status", *extra])
+
+    @pytest.fixture(autouse=True)
+    def _healthy_otherwise(self, monkeypatch, tmp_path):
+        from magent import nodes
+
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+
+    def test_stale_with_a_node_project_exits_3_and_says_so(
+        self, runner, tmp_config, tmp_path
+    ):
+        from magent import log
+
+        self._beat(log.HEARTBEAT_MAX_AGE + 30)
+        result = self._status(runner, self._config(tmp_config, tmp_path), "--json")
+        assert result.exit_code == 3
+        assert json.loads(result.stdout)["node_sync"] == "stale"
+
+    def test_the_report_names_the_stale_daemon_and_its_repair(
+        self, runner, tmp_config, tmp_path
+    ):
+        from magent import log
+
+        self._beat(log.HEARTBEAT_MAX_AGE + 30)
+        result = self._status(runner, self._config(tmp_config, tmp_path))
+        assert result.exit_code == 3
+        assert "node sync daemon stale" in result.stdout
+        assert status_mod.NODE_SYNC_REPAIR_HINT in result.stdout
+        assert "magent node sync --stop" in status_mod.NODE_SYNC_REPAIR_HINT
+
+    def test_stale_without_a_node_project_changes_nothing(
+        self, runner, tmp_config, tmp_path
+    ):
+        from magent import log
+
+        self._beat(log.HEARTBEAT_MAX_AGE + 30)
+        cfgpath = self._config(tmp_config, tmp_path, on_node=False)
+        result = self._status(runner, cfgpath, "--json")
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sync"] == "off"
+        human = self._status(runner, cfgpath)
+        assert human.exit_code == 0
+        assert "node sync daemon stale" not in human.stdout
+
+    def test_a_fresh_heartbeat_is_ok_and_exits_0(self, runner, tmp_config, tmp_path):
+        self._beat(1)
+        cfgpath = self._config(tmp_config, tmp_path)
+        result = self._status(runner, cfgpath, "--json")
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sync"] == "ok"
+        human = self._status(runner, cfgpath)
+        assert human.exit_code == 0
+        assert "node sync daemon stale" not in human.stdout
+
+    def test_a_stopped_daemon_is_not_degraded(self, runner, tmp_config, tmp_path):
+        cfgpath = self._config(tmp_config, tmp_path)
+        result = self._status(runner, cfgpath, "--json")
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sync"] == "stopped"
+        assert self._status(runner, cfgpath).exit_code == 0
+
+    def test_the_verdict_counts_node_sync_alongside_the_other_daemons(self):
+        healthy = {
+            "upload_server": "on",
+            "listener": "on",
+            "attention": "on",
+        }
+        for state, degraded in (
+            ("stale", True),
+            ("ok", False),
+            ("stopped", False),
+            ("off", False),
+        ):
+            assert (
+                status_mod._is_degraded({**healthy, "node_sync": state}) is degraded
+            ), state

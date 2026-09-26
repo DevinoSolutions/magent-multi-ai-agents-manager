@@ -37,7 +37,7 @@ from magent.cli.ui import (
     _print_names,
     _print_session_overview,
 )
-from magent.log import heartbeat_age, heartbeat_fresh
+from magent.log import HEARTBEAT_MAX_AGE, heartbeat_age, heartbeat_fresh
 from magent.paths import find_config
 from magent.procs import pid_alive
 from magent.psmux import session0_message, session0_server_pids
@@ -60,6 +60,11 @@ LISTENER_REPAIR_HINT = "magent down --all, then magent serve (or magent attach)"
 # server stays dead until a human notices -- which is precisely the failure
 # that supervision exists to end.
 UPLOAD_WATCHDOG_HINT = "magent attention -d  (it revives a dead upload server)"
+
+# A stale node sync daemon still holds its lock, so nothing replaces it:
+# `serve` leaves a wedged one for the user (launch.ensure_node_sync says the
+# same), and starts a fresh one once it is stopped.
+NODE_SYNC_REPAIR_HINT = "magent node sync --stop  (magent serve starts a fresh one)"
 
 
 def _health_check(port: int) -> bool:
@@ -156,6 +161,29 @@ def _attention_state() -> str:
     if daemon_pid():
         return "on" if heartbeat_fresh("attention") else "stale"
     return "crashed" if heartbeat_age("attention") is not None else "off"
+
+
+def _node_sync_state(cfg: MagentConfig) -> str:
+    """The node sync daemon, judged against whether one is EXPECTED: "off" when
+    no project runs on a node (nobody promised a daemon), else its heartbeat's
+    "ok" / "stale" / "stopped".
+
+    Only "stale" degrades (``_is_degraded``): every node row is then frozen at
+    a pull nobody refreshes. "stopped" does not -- `serve` starts a daemon
+    within its supervise interval, with serve off the upload-server line
+    already says so, and the spec promises exit 3 for a stale daemon only.
+    """
+    from magent import node_sync, nodes  # heavy subsystem: in-body per policy
+
+    if not nodes.node_projects(cfg):
+        return "off"
+    # One read, exactly as node_cmd._daemon_state reads it (DECISION-17's one
+    # reader). cli/node_cmd.py reaches this branch with the E-int final merge,
+    # which turns these lines into a call to it.
+    age = heartbeat_age(node_sync.HEARTBEAT_NAME)
+    if age is None:
+        return "stopped"
+    return "ok" if age <= HEARTBEAT_MAX_AGE else "stale"
 
 
 def _agents_snapshot(cfg: MagentConfig) -> list[dict[str, object]]:
@@ -264,6 +292,7 @@ def _gather_status(cfg: MagentConfig) -> dict[str, str]:
         "upload_server": upload,
         "listener": _listener_state(upload),
         "attention": _attention_state(),
+        "node_sync": _node_sync_state(cfg),
     }
 
 
@@ -272,6 +301,7 @@ def _is_degraded(status: dict[str, str]) -> bool:
         status["upload_server"] == "dead"
         or status["listener"] in ("stale", "dead")
         or status["attention"] in ("stale", "crashed")
+        or status["node_sync"] == "stale"
     )
 
 
@@ -333,6 +363,7 @@ def _render_status(config_file: Path) -> StatusReport:
         click.echo(
             f"\n  {style(str(len(down)), fg='yellow', bold=True)} not running  {style('(' + preview + ')', dim=True)}"
         )
+    status = _gather_status(cfg)
     # Node sessions (PR-D): read from the sync daemon's last pull, never over
     # ssh -- a stale row is a node this PC has not heard from, not a dead one.
     # heavy subsystem: in-body per policy
@@ -348,9 +379,17 @@ def _render_status(config_file: Path) -> StatusReport:
             click.echo(
                 f"    {node_row['session']}  {style(node, fg='blue')}  {style(state, fg=tint[state])}"
             )
+        # The daemon behind those rows: stale freezes every one of them, which
+        # is what makes it the one node state that degrades (_node_sync_state).
+        if status["node_sync"] == "stale":
+            click.echo(
+                f"  {style('node sync daemon stale  (heartbeat expired)', fg='red', bold=True)}"
+            )
+            click.echo(
+                f"  {style('Repair:', dim=True)} {style(NODE_SYNC_REPAIR_HINT, bold=True)}"
+            )
     _divider()
 
-    status = _gather_status(cfg)
     upload_labels = {
         "on": style(f"ON  port {cfg.settings.upload_port}", fg="green", bold=True),
         "dead": style(
