@@ -395,7 +395,10 @@ class TestSupervise:
         monkeypatch.setattr(attach_client.shutil, "which", lambda _n: None)
         rc = attach_client.supervise("user@host", "psmux -L api attach", "api")
         assert rc == attach_client.SSH_MISSING_RC
-        assert "ssh is not on PATH" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        # The rule looks past PATH (Windows' own OpenSSH first).
+        assert "no ssh client found -- cannot attach" in out
+        assert "PATH" not in out
 
     def test_a_missing_ssh_binary_mid_loop_does_not_traceback(self, monkeypatch):
         # _run_ssh translates FileNotFoundError into an exit code so the pane

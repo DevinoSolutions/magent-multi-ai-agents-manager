@@ -1122,7 +1122,7 @@ def supervise(
     # surface after the first disconnect, possibly hours in, out of the probe.
     _check_mux(mux)
     if shutil.which(ssh_program()) is None:
-        _echo(f"  {style('x', fg='red')} ssh is not on PATH -- cannot attach.")
+        _echo(f"  {style('x', fg='red')} no ssh client found -- cannot attach.")
         return SSH_MISSING_RC
 
     argv = ssh_argv(target, remote)
