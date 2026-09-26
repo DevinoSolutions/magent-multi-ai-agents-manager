@@ -1455,6 +1455,29 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
             ),
         )
 
+    def test_a_folders_subfolders_count_before_its_files(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_ENTRIES", 3)
+        home, skills = _skills_home(tmp_path)
+        for rel in ("s/x/f", "s/a", "s/b", "s/c"):
+            _skill(skills, rel)
+        scope = nodes.user_scope(home)
+        # s, then s/x, then s/a -- s/b is the fourth.
+        assert [f.path for f in scope.skills] == ["s/a"]
+
+    def test_an_entry_past_the_cap_is_not_even_judged(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_ENTRIES", 1)
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "a/SKILL.md")
+        _link_dir(skills / "z", home / ".ssh")  # would be a note of its own
+        scope = nodes.user_scope(home)
+        assert scope.skills == ()
+        assert scope.notes == (
+            (
+                "skills: more than 1 entries; the walk stopped there and the rest is "
+                "not shipped"
+            ),
+        )
+
     def test_the_caps_default_to_64_mib_and_20000_entries(self):
         assert nodes.SKILLS_MAX_TOTAL_BYTES == 64 * 1024 * 1024
         assert nodes.SKILLS_MAX_ENTRIES == 20000
@@ -1517,6 +1540,19 @@ class TestTheSkillsWalkKnowsASecretWhenItSeesOne:
         scope = nodes.user_scope(home)
         assert [f.path for f in scope.skills] == [f"s/{name}"]
         assert scope.notes == ()
+
+    def test_a_secret_name_linked_to_an_innocent_one_stays_behind(self, tmp_path):
+        # A key kept under any name, linked in as id_rsa: the name says it.
+        home, skills = _skills_home(tmp_path)
+        keys = tmp_path / "dev" / "keys"
+        keys.mkdir(parents=True)
+        (keys / "work.txt").write_bytes(b"PRIVATE-KEY-DECOY")
+        _skill(skills, "s/SKILL.md")
+        _link_file(skills / "s" / "id_rsa", keys / "work.txt")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == ("skills/s/id_rsa: a secret-bearing name, never shipped",)
+        assert "DECOY" not in repr(scope)
 
     def test_an_innocent_name_linked_to_a_secret_name_stays_behind(self, tmp_path):
         home, skills = _skills_home(tmp_path)
