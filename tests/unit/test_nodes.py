@@ -1324,15 +1324,16 @@ class TestPushSet:
         )
         assert shipped == (workspace / ".env", workspace / "CLAUDE.local.md")
 
-    def test_a_workspace_roots_env_file_that_cannot_be_read_is_an_error(
-        self, tmp_path, monkeypatch
+    @pytest.mark.parametrize("name", [".env", "CLAUDE.local.md"])
+    def test_a_workspace_roots_own_file_that_cannot_be_read_is_an_error(
+        self, tmp_path, monkeypatch, name
     ):
         # Not "no such file": a push that silently leaves a .env home would
         # bring the project up without its secrets.
         workspace = tmp_path / "ws"
         (workspace / "api").mkdir(parents=True)
-        (workspace / ".env").write_text("X=1\n", encoding="utf-8")
-        deny_stat(monkeypatch, workspace / ".env")
+        (workspace / name).write_text("X=1\n", encoding="utf-8")
+        deny_stat(monkeypatch, workspace / name)
         with pytest.raises(PermissionError):
             nodes.push_set(workspace, [_state(workspace / "api", ())], home=Path.home())
 
