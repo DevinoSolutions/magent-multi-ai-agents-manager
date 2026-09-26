@@ -1484,7 +1484,6 @@ def bring_up_node_project(
     allow_dirty: bool = False,
     window: bool = False,
     resume_id: str | None = None,
-    collision: str | None = None,
 ) -> NodeBringUpOutcome:
     """Bring ``proj`` up on its node. ``resume_id`` names the conversation to
     resume (only G's ``recall --to`` passes one, after shipping that
@@ -1496,12 +1495,7 @@ def bring_up_node_project(
     session is already running there, which is attached instead -- then,
     under that node's lock, provision once, build the recipe, run
     ``remote_mux.bring_up``, record the placement and open the window. Never
-    raises for a node, git or config failure: every one is an outcome.
-
-    ``collision`` is the fleet check's refusal for a project that is the
-    RECORDED holder of a folder name another project shares (X3): refused like
-    an unreproducible tree, so a session still running there is attached and
-    keeps it as a warning, and one that is gone is not restarted."""
+    raises for a node, git or config failure: every one is an outcome."""
     # heavy subsystem: in-body per policy (nodes + remote_mux: ssh/git/tar)
     from magent import nodes, remote_mux
     from magent.env import local_username
@@ -1532,8 +1526,6 @@ def bring_up_node_project(
             for state in states
             if (text := nodes.refusal_for(state, allow_dirty=allow_dirty))
         ]
-        if collision is not None:
-            refusals.append(collision)
         if refusals:
             if (
                 held is not None
@@ -1642,8 +1634,8 @@ def _placement_recipes(
     whose node folder is already known, from config and the map alone -- no
     ssh, no git. The recipe carries only what ``nodes.remote_root_collisions``
     reads (its project, sid and remote_root); ``holder`` is whether the map
-    records the project in that very folder (its bring-up checks the node and
-    the session). A project that cannot be placed yet (no
+    records the project in that very folder. A project that cannot be placed
+    yet (no
     folder here or none this user may read, an unplaced ``auto``, a folder
     with no usable name) is left out: its own bring-up names that reason."""
     # heavy subsystem: in-body per policy
@@ -1702,10 +1694,12 @@ def _run_node_bring_ups(
     folder name another project -- in this batch or not -- would share is
     refused, naming the other. Fanned out, two clones would race for one
     folder; a batch of one today and another tomorrow would overwrite it.
-    A collision among projects outside the batch refuses nothing here. The
-    one member the map already records in that folder is not refused here:
-    its bring-up gets the refusal as ``collision``, so a session of it still
-    running is attached, not reported failed because a newcomer arrived."""
+    A collision among projects outside the batch refuses nothing here. Only
+    newcomers are refused: the member the map already records in that folder
+    is brought up as usual -- attached if its session runs, restarted in its
+    own folder if not, neither overwriting anyone -- with the collision as a
+    warning, so a healthy session is never reported failed because a newcomer
+    arrived."""
     # heavy subsystem: in-body per policy
     from magent import nodes
 
@@ -1738,12 +1732,15 @@ def _run_node_bring_ups(
                     proj,
                     allow_dirty=allow_dirty,
                     window=window,
-                    collision=clash.get(nodes.node_sid(proj)),
                 )
                 for proj in go
             ]
             for proj, future in zip(go, futures, strict=True):
-                outcomes[nodes.node_sid(proj)] = future.result()
+                sid = nodes.node_sid(proj)
+                outcome = future.result()
+                if sid in clash:  # the folder's recorded holder
+                    outcome = replace(outcome, warnings=(*outcome.warnings, clash[sid]))
+                outcomes[sid] = outcome
     return [outcomes[nodes.node_sid(proj)] for proj in projects]
 
 
