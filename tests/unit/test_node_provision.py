@@ -46,11 +46,14 @@ class TestTheNodeStateHookIsWiredLikeThisPcs:
         (hook,) = remote_mux.state_hook_entries()["Stop"]["hooks"]
         assert hook["command"] == '"$HOME/.magent/bin/state-hook.sh" --source claude'
 
-    def test_the_node_command_takes_the_same_arguments(self):
-        assert (
-            shlex.split(remote_mux.NODE_STATE_HOOK_COMMAND)[1:]
-            == shlex.split(hooks_cmd._hook_command())[1:]
-        )
+    def test_the_node_command_takes_the_same_arguments(self, monkeypatch):
+        # A fixed exe path, not this host's real one: a space (so it is quoted)
+        # and an apostrophe (which shlex rejects unquoted) on every host alike.
+        exe = "/opt/o'brien tools/bin/magent-state-hook"
+        monkeypatch.setattr(hooks_cmd.shutil, "which", lambda _name: exe)
+        this_pc = shlex.split(hooks_cmd._hook_command())
+        assert this_pc[0] == exe
+        assert shlex.split(remote_mux.NODE_STATE_HOOK_COMMAND)[1:] == this_pc[1:]
 
 
 CLAUDE_OAUTH_DECOY = {
