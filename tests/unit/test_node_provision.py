@@ -2144,7 +2144,9 @@ class TestProvisionNode:
             "bash", "-s", "--", remote_mux.SOCKET, "--force"
         )
 
-    def test_the_timeout_is_mandatory(self, tmp_path):
+    def test_the_timeout_is_mandatory(self, fake_ssh, tmp_path):
+        # fake_ssh: were the timeout ever given a default, the call must go
+        # through and fail "DID NOT RAISE", not stop at the refused real ssh.
         with pytest.raises(TypeError):
             remote_mux.provision_node(
                 NODE, MagentConfig(projects=[]), home=_pc_home(tmp_path)
