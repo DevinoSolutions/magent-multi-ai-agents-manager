@@ -1605,6 +1605,11 @@ class TestAFinalPullThatDidNotFinishIsNotASuccess:
             "the pull did not finish: a file of session 'api' could not be stored"
             " on this PC"
         )
+        # cq-G14 m-R3-2: the bare reason and its cause, for a caller's remedy.
+        assert (
+            info.value.why == "a file of session 'api' could not be stored on this PC"
+        )
+        assert info.value.not_stored is True
         # The watermark held, so the next pull asks for that file again.
         assert _marks()["api"] == {"since": 10.0, "realpath": "/home/amin/magent/api"}
 
@@ -1616,7 +1621,14 @@ class TestAFinalPullThatDidNotFinishIsNotASuccess:
         with pytest.raises(node_sync.PullUnfinished) as info:
             node_sync.final_pull(_config(), "api")
         assert info.value.rc == 0
-        assert "2 file(s) did not fit in the reply" in info.value.stderr_tail
+        assert (
+            "2 file(s) did not fit in the reply and are still on the node"
+            in info.value.stderr_tail
+        )
+        assert info.value.why == (
+            "2 file(s) did not fit in the reply and are still on the node"
+        )
+        assert info.value.not_stored is False
         # cq-G14 I-R2-1: saved BEFORE the raise, and just under the first file
         # still owed -- the node's clock would put the owed files behind the
         # watermark, and no later pull would ask for them.

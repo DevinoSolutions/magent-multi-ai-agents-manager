@@ -2035,8 +2035,12 @@ class TestTheLastPullMustFinish:
         result = _recall(runner, placed_api, "--local")
 
         _stopped_before_anything(result, api_repo)
-        assert "the last pull from @second did not finish" in result.stderr
-        assert "could not be stored on this PC" in result.stderr
+        # cq-G14 m-R3-2: the reason is said once, not wrapped in itself.
+        assert (
+            "the last pull from @second did not finish: a file of session 'api'"
+            f" could not be stored on this PC; {node_cmd._RERUN}"
+        ) in result.stderr
+        assert "the pull did not finish" not in result.stderr
         assert "one last time" not in result.stdout
         assert node_answers == []  # no repo read, no kill
         # cq-G14 m2: a stop that recurs says what to fix -- here the file's
@@ -2046,6 +2050,8 @@ class TestTheLastPullMustFinish:
             f" {log.LOG_DIR / f'{node_sync.LOG_NAME}.log'}: close what holds it"
             " open, or free disk space, first."
         ) in result.stderr
+        # m-R3-2: only the remedy that applies -- another run alone won't do.
+        assert "ran out of room" not in result.stderr
 
     def test_files_the_reply_had_no_room_for_stop_the_recall(
         self, runner, placed_api, node_answers, node_replies, api_repo
@@ -2057,9 +2063,17 @@ class TestTheLastPullMustFinish:
         result = _recall(runner, placed_api, "--local")
 
         _stopped_before_anything(result, api_repo)
-        assert "1 file(s) did not fit in the reply" in result.stderr
+        # cq-G14 m-R3-2: the reason is said once, not wrapped in itself.
+        assert (
+            "the last pull from @second did not finish: 1 file(s) did not fit in"
+            f" the reply and are still on the node; {node_cmd._RERUN}"
+        ) in result.stderr
+        assert "the pull did not finish" not in result.stderr
         # cq-G14 m2: each re-run brings home more (I-R2-1's watermark).
         assert "A reply that ran out of room needs only another run." in result.stderr
+        # m-R3-2: only the remedy that applies -- nothing here to close or free.
+        assert "could not store" not in result.stderr
+        assert "free disk space" not in result.stderr
 
     def test_the_rerun_asks_again_from_the_first_owed_file_and_only_then_clears(
         self, runner, placed_api, node_answers, monkeypatch, api_repo
@@ -2179,6 +2193,42 @@ class TestTheLastPullMustFinish:
         ) in result.stdout
         assert "did not finish" not in result.output
         assert "api" not in nodes.read_node_map()
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            remote_mux.RemoteError(
+                0, "a refusal made on this PC", ("ssh", "amin@devino-second")
+            ),
+            remote_mux.RemoteError(
+                0, "no MAGENT-PULL header in the reply", ("pull.sh",)
+            ),
+        ],
+        ids=["refused-here", "not-a-pull"],
+    )
+    def test_an_rc_0_error_leaves_the_node_reachable(
+        self, runner, placed_api, node_answers, monkeypatch, api_repo, error
+    ):
+        """cq-G14 m-R3-1: only ssh's own failure (255) or a timeout proves a
+        node unreachable. One that answered with something that is not a pull
+        -- or was never dialed -- still gets the live repo read that feeds the
+        unpushed-work warning, and the one-line ssh stop command."""
+
+        def _rc0(*a, **k):
+            raise error
+
+        monkeypatch.setattr(node_sync, "final_pull", _rc0)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 0, result.output
+        assert [e[0] for e in node_answers] == ["repo_status"]
+        assert "repos on @second, now:" in result.stdout
+        assert "last known" not in result.stdout
+        assert (
+            "stop it with: ssh amin@devino-second"
+            f" \"tmux -L {remote_mux.SOCKET} kill-session -t '=api'\"" in result.stdout
+        )
 
     def test_a_failure_on_this_pc_during_the_pull_is_printed_not_a_traceback(
         self, runner, placed_api, node_answers, monkeypatch, api_repo

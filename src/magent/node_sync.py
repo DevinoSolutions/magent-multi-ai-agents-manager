@@ -736,30 +736,42 @@ class PullUnfinished(remote_mux.RemoteError):
     (``_unfinished``). rc 0 like the node's other answers, but its own type:
     rc 0 also means an answer that was not a pull and a refusal made on this
     PC before any ssh, and a caller that retries this one must not retry
-    those forever (cq-G14 m1)."""
+    those forever (cq-G14 m1).
 
-    def __init__(self, why: str) -> None:
+    ``why`` is the bare reason and ``not_stored`` its cause -- a file this PC
+    could not store (True), or files the reply had no room for (False) -- so a
+    caller can say the reason once and name only the remedy that applies
+    (cq-G14 m-R3-2): another run alone brings home what did not fit, but not a
+    file this PC keeps failing to store."""
+
+    def __init__(self, why: str, *, not_stored: bool) -> None:
         super().__init__(0, f"the pull did not finish: {why}", ("pull.sh",))
+        self.why = why
+        self.not_stored = not_stored
 
 
-def _unfinished(snap: remote_mux.NodeSnapshot, sid: str) -> str | None:
+def _unfinished(snap: remote_mux.NodeSnapshot, sid: str) -> PullUnfinished | None:
     """Why ``snap`` left part of ``sid`` on the node, or None when it did not:
     a file that could not be stored here, or files the reply had no room for
     (still owed). Files the node skipped as over the cap or could not read
     are not counted -- they would be left behind on every pull."""
     if sid in snap.failed_sids:
-        return f"a file of session {sid!r} could not be stored on this PC"
+        return PullUnfinished(
+            f"a file of session {sid!r} could not be stored on this PC",
+            not_stored=True,
+        )
     owed = snap.truncated.get(sid, ())
     if owed:
-        return (
-            f"{len(owed)} file(s) did not fit in the reply; they are still on the node"
+        return PullUnfinished(
+            f"{len(owed)} file(s) did not fit in the reply and are still on the node",
+            not_stored=False,
         )
     return None
 
 
 def _pull_sid(
     node: Node, entry: NodeMapEntry, mark: Mark | None
-) -> tuple[Mark, list[Path], bool, str | None]:
+) -> tuple[Mark, list[Path], bool, PullUnfinished | None]:
     """One pull of one session: its next mark, the files that landed, whether
     a second pull is needed because the transcript dir only became known with
     this answer, and why the pull left something on the node (``_unfinished``)."""
@@ -821,5 +833,5 @@ def final_pull(
         marks[entry.sid] = mark
         _write_marks(entry.nick, marks)
     if unfinished is not None:
-        raise PullUnfinished(unfinished)
+        raise unfinished
     return remote_mux.PullResult(files=tuple(files), since=mark.since)

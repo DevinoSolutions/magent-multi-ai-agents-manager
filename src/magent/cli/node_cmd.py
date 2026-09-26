@@ -511,7 +511,10 @@ _RERUN = "nothing was stopped or cleared -- run the recall again"
 def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
     """Step 1: one last pull, through node_sync's per-node lock -- the lock the
     daemon's tick holds -- so it never races a running daemon (DECISION-26
-    xi). False when the node is gone or cannot be pulled from.
+    xi). True when the node may still be read and named with its ssh stop
+    command; False when it did not answer (ssh's 255, a timeout) or the node
+    map or config cannot address it -- an rc-0 error proves neither
+    (cq-G14 m-R3-1).
 
     The placement is cleared after this, and a cleared placement is never
     pulled again, so a pull that can be retried stops the recall here, before
@@ -555,25 +558,33 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
         return False
     except node_sync.PullUnfinished as exc:
         # Before RemoteError, its base: it answered, and left files behind.
-        # cq-G14 m2: a stop that can recur names its way out. remote_mux logs
-        # the file it could not store (to node_sync's log); the message can't.
-        stored_log = log.LOG_DIR / f"{node_sync.LOG_NAME}.log"
+        # cq-G14 m2: a stop that can recur names its way out -- m-R3-2: the
+        # reason once, and only the way out that applies. remote_mux logs the
+        # file it could not store (to node_sync's log); the message can't.
+        if exc.not_stored:
+            stored_log = log.LOG_DIR / f"{node_sync.LOG_NAME}.log"
+            remedy = (
+                f"A file this PC could not store is named in {stored_log}:"
+                " close what holds it open, or free disk space, first."
+            )
+        else:
+            remedy = "A reply that ran out of room needs only another run."
         _fail(
-            f"the last pull from @{held.nick} did not finish ({_tail(exc)}); {_RERUN}"
-            "\n    A reply that ran out of room needs only another run."
-            f" A file this PC could not store is named in {stored_log}:"
-            " close what holds it open, or free disk space, first.",
+            f"the last pull from @{held.nick} did not finish: {exc.why}; {_RERUN}"
+            f"\n    {remedy}",
             1,
         )
     except remote_mux.RemoteError as exc:
         if exc.rc == 0:
             # Not a pull, or refused on this PC before any ssh (cq-G14 m1): no
-            # re-run clears either, so it must never block the recall.
+            # re-run clears either, so it must never block the recall. The node
+            # is not proven unreachable -- only 255 and a timeout do that -- so
+            # the live repo read and the ssh stop command still follow (m-R3-1).
             _note(
                 f"@{held.nick} cannot be pulled from ({_tail(exc)});"
                 " going on with what was already pulled"
             )
-            return False
+            return True
         if exc.rc not in (255, None):
             # It answered with an error of its own -- one that may come back on
             # every run (no python3 is rc 3), so the stop names the fix (m2).
