@@ -806,3 +806,88 @@ class TestAnUnreadableMapPlacesNoAutoProject:
         lines = [ln for ln in out.splitlines() if "api:" in ln]
         assert len(lines) == 1, out
         assert lines[0].lstrip().startswith("<red>x api: the node map is unreadable")
+
+
+class TestAnUnreadableLoadHistoryIsSaidNotSilent:
+    """A load history that exists but cannot be read is UNKNOWN, never "the
+    daemon never sampled this node". Read as ``[]``, a dry run leaves the node
+    unscored without a word, so ``node plan`` may name a node the real launch
+    would not; an undecodable file was a traceback. Placement goes on without
+    it and says so -- the error class on screen, the full error in the log."""
+
+    @pytest.fixture(params=["undecodable", "unopenable"])
+    def unreadable_history(self, request):
+        """Make ``nick``'s load.jsonl unreadable and return ``(class name,
+        str(error))`` of what reading it then raises."""
+
+        def make(nick: str) -> tuple[str, str]:
+            path = nodes.load_path(nick)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if request.param == "undecodable":
+                path.write_bytes(b"\xff\xfe not utf-8 \x80\x81\n")
+            else:
+                path.mkdir()  # a directory: it exists, and cannot be read
+            with pytest.raises((OSError, ValueError)) as info:
+                path.read_text(encoding="utf-8")
+            return type(info.value).__name__, str(info.value)
+
+        return make
+
+    def test_the_reader_raises_rather_than_answer_never_sampled(
+        self, unreadable_history
+    ):
+        unreadable_history("n")
+
+        with pytest.raises((OSError, ValueError)):
+            nodes.read_load_history("n")
+
+    def test_a_dry_run_says_the_node_went_unscored(
+        self, remote_samples, unreadable_history
+    ):
+        seed_history("second", "quiet")
+        cls, _ = unreadable_history("third")
+        config = pool("second", "third", projects=[_auto("api")])
+
+        placed = launch.place_node_projects(
+            config, config.projects, live=False, now=NOW
+        )
+
+        assert [p.node for p in placed.projects] == ["second"]
+        assert placed.notes == [
+            f"@third: its load history is unreadable ({cls}); not scored"
+        ]
+        assert remote_samples == []
+
+    def test_a_live_run_scores_it_on_one_live_reading_and_says_so(
+        self, remote_samples, unreadable_history
+    ):
+        seed_history("second", "quiet")
+        cls, _ = unreadable_history("third")
+        config = pool("second", "third", projects=[_auto("api")])
+
+        placed = launch.place_node_projects(config, config.projects, now=NOW)
+
+        assert remote_samples == ["third"]
+        assert placed.notes == [
+            (
+                f"@third: its load history is unreadable ({cls});"
+                " scored on one live reading"
+            )
+        ]
+
+    def test_the_full_error_goes_to_nodes_log_and_not_the_screen(
+        self, remote_samples, unreadable_history, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        seed_history("second", "quiet")
+        _, detail = unreadable_history("third")
+        config = pool("second", "third", projects=[_auto("api")])
+
+        placed = launch.place_node_projects(
+            config, config.projects, live=False, now=NOW
+        )
+
+        logged = [r.getMessage() for r in caplog.records if r.name == "magent.nodes"]
+        assert any(detail in m for m in logged), logged
+        assert placed.notes, "the unreadable history must still be said"
+        assert all(detail not in n for n in placed.notes)

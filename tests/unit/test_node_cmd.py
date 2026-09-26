@@ -216,6 +216,21 @@ class TestTheNodeTable:
 
         assert "no data" in result.stdout
 
+    def test_an_unreadable_history_says_unreadable_not_no_data(
+        self, runner, tmp_config
+    ):
+        # Unknown, not "never sampled": the file is there and cannot be read.
+        path = nodes.load_path("second")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\xff\xfe not utf-8 \x80\x81\n")
+        cfg = tmp_config(config_json(("second",), []))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node"])
+
+        assert result.exit_code == 0, result.output
+        assert "unreadable (UnicodeDecodeError)" in _row(result.stdout, "second")
+        assert "no data" not in result.stdout
+
     def test_the_daemon_column_reads_the_sync_heartbeat(self, runner, tmp_config):
         log.write_heartbeat(node_sync.HEARTBEAT_NAME)
         cfg = tmp_config(config_json(("second",), []))

@@ -12,6 +12,8 @@ of a transcript IS its session id; subagent logs (agent-*.jsonl, anything under
 from __future__ import annotations
 
 import io
+import json
+import logging
 import os
 import shlex
 import shutil
@@ -2989,3 +2991,104 @@ class TestRecallTo:
         assert "'../escaped'" in result.stderr
         assert node_answers == []
         assert events == []
+
+
+def _node_logs(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == "magent.nodes"]
+
+
+class TestRecallSaysUnknownNeverAbsentOrATraceback:
+    """inv-unknown U3: what recall cannot read is UNKNOWN. A map unreadable at
+    the clear step -- after the session was stopped and the conversation
+    installed -- is a printed failure naming what to run, never a traceback;
+    every unreadable-map line names the error CLASS only, the full error goes
+    to nodes.log; and a commit record that is there but cannot be read is not
+    "never recorded"."""
+
+    @staticmethod
+    def _damage_map(damage: str, monkeypatch) -> tuple[str, str]:
+        """Make the map unreadable; ``(class name, str(error))`` a reader meets."""
+        if damage == "torn":
+            nodes.NODE_MAP_PATH.write_text('{"api": {"nick": "sec', encoding="utf-8")
+            with pytest.raises(ValueError) as torn:
+                nodes.load_node_map_strict()
+            return type(torn.value).__name__, str(torn.value)
+        busy_error = PermissionError(13, "the file is in use by another process")
+
+        def _busy() -> dict[str, nodes.NodeMapEntry]:
+            raise busy_error
+
+        monkeypatch.setattr(nodes, "load_node_map_strict", _busy)
+        return "PermissionError", str(busy_error)
+
+    @pytest.mark.parametrize("damage", ["busy", "torn"])
+    def test_a_map_unreadable_at_the_clear_is_a_printed_failure(
+        self, runner, placed_api, node_answers, monkeypatch, caplog, damage
+    ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        real_update = nodes.update_node_map
+        seen: dict[str, str] = {}
+
+        def _update(project, entry, **kwargs):
+            # Readable for recall's own strict read; unreadable by the clear.
+            seen["cls"], seen["detail"] = self._damage_map(damage, monkeypatch)
+            return real_update(project, entry, **kwargs)
+
+        monkeypatch.setattr(nodes, "update_node_map", _update)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exception is None or isinstance(result.exception, SystemExit), (
+            result.output
+        )
+        assert result.exit_code == 1, result.output
+        assert "could not clear api's placement" in result.stderr
+        assert f"({seen['cls']})" in result.stderr
+        assert "run the recall again" in result.stderr
+        assert "Traceback" not in result.output
+        assert seen["detail"] not in result.output
+        assert any(seen["detail"] in m for m in _node_logs(caplog)), _node_logs(caplog)
+
+    @pytest.mark.parametrize("damage", ["busy", "torn"])
+    def test_an_unreadable_map_at_the_start_names_the_class_only(
+        self, runner, placed_api, node_answers, monkeypatch, caplog, damage
+    ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        cls, detail = self._damage_map(damage, monkeypatch)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 1, result.output
+        assert f"could not read the node map ({cls})" in result.stderr
+        assert detail not in result.output
+        assert any(detail in m for m in _node_logs(caplog)), _node_logs(caplog)
+
+    @pytest.mark.parametrize("damage", ["torn", "unopenable", "not-an-object"])
+    def test_an_unreadable_commit_record_is_not_never_recorded(
+        self, runner, placed_api, node_is_gone, caplog, damage
+    ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        path = nodes.repo_record_path("second", "api")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if damage == "unopenable":
+            path.mkdir()  # there, and it cannot be read
+        else:
+            path.write_text(
+                '{"ts": 5, "sour' if damage == "torn" else "[]", encoding="utf-8"
+            )
+        if damage == "not-an-object":
+            cls = "ValueError"
+        else:
+            with pytest.raises((OSError, ValueError)) as info:
+                json.loads(path.read_text(encoding="utf-8"))
+            cls = type(info.value).__name__
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert "no commit was ever recorded" not in result.stdout
+        assert (
+            f"the commit record for api on @second is unreadable ({cls})"
+            in result.stdout
+        )
+        assert "check the node before relying on `git pull`" in result.stdout
+        assert _node_logs(caplog), "the full error goes to nodes.log"
