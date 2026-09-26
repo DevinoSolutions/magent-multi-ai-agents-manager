@@ -27,16 +27,24 @@ import time
 
 
 def kill_pid(pid: int | None) -> None:
-    """Kill exactly one pid (its tree, on Windows) and tolerate it already being
-    gone. Never raises. Only ever called with a pid the test created."""
+    """Kill exactly one pid and tolerate it already being gone. Never raises.
+    Only ever called with a pid the test created.
+
+    No ``taskkill /T``: the tree walk follows ParentProcessId, which Windows
+    does not protect against pid reuse, so it could reach an unrelated orphan
+    whose dead parent's pid was recycled. It is not needed either -- every
+    descendant that matters (the venv launcher's child, a supervisor-spawned
+    serve) carries the test's marker and is found by the sweep itself."""
     if not pid:
         return
     if sys.platform == "win32":
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            capture_output=True,
-            check=False,
-        )
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/F"],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
         return
     try:
         os.kill(pid, signal.SIGTERM)
@@ -54,24 +62,32 @@ def kill_pid(pid: int | None) -> None:
 
 def pids_whose_argv_contains(marker: str) -> list[int]:
     """Every live process whose command line contains ``marker``, this one
-    excluded. ``marker`` must be unique to the test (a uuid-named path)."""
+    excluded. ``marker`` must be unique to the test (a uuid-named path).
+
+    Runs in teardown, so it never raises: a process listing that times out or
+    cannot start answers "nothing found" rather than replacing the assertion
+    that actually failed."""
     if sys.platform == "win32":
-        out = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                (
-                    "Get-CimInstance Win32_Process | "
-                    "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
-                ),
-            ],
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=60,
-            check=False,
-        ).stdout
+        try:
+            out = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    (
+                        "Get-CimInstance Win32_Process | "
+                        "Select-Object ProcessId,CommandLine | "
+                        "ConvertTo-Json -Compress"
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=60,
+                check=False,
+            ).stdout
+        except (subprocess.TimeoutExpired, OSError):
+            return []
         try:
             rows = json.loads(out or "[]")
         except ValueError:
@@ -84,14 +100,19 @@ def pids_whose_argv_contains(marker: str) -> list[int]:
             if isinstance(row, dict)
         ]
     else:
-        out = subprocess.run(
-            ["ps", "-eo", "pid=,args="],
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=30,
-            check=False,
-        ).stdout
+        # -ww: never truncate args, or a long tmp path would drop the marker
+        # and the sweep would silently find nothing.
+        try:
+            out = subprocess.run(
+                ["ps", "-ww", "-eo", "pid=,args="],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=30,
+                check=False,
+            ).stdout
+        except (subprocess.TimeoutExpired, OSError):
+            return []
         found = []
         for line in out.splitlines():
             head, _, args = line.strip().partition(" ")

@@ -156,11 +156,17 @@ def _read_pid(path) -> int | None:
         return None
 
 
-def _spawn_dummy() -> subprocess.Popen:
+def _spawn_dummy() -> tuple[subprocess.Popen, str]:
     """A real, live, non-serving process whose pid we can plant in a pid file to
     stage a 'live but not the server' condition (upload "dead" / attention
-    "stale")."""
-    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    "stale"). Returns it with a uuid marker carried in its argv: under a venv
+    the interpreter is a launcher with a same-argv child, and teardown ends
+    both by that marker (see _procs) rather than by a tree walk."""
+    marker = f"magent-dummy-{uuid.uuid4().hex[:10]}"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)", marker]
+    )
+    return proc, marker
 
 
 def _make_world(tmp_path, *, attention=None, projects=None):
@@ -281,6 +287,8 @@ def _serve(w):
     finally:
         _kill_pid(_read_pid(pidfile))  # the real server process
         _kill_pid(proc.pid)  # the launcher/trampoline (may already be gone)
+        # A serve that never wrote its pid file still carries the cfg marker.
+        kill_everything_carrying(str(w.cfg))
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=30)
         out_f.close()
@@ -479,7 +487,7 @@ def test_status_json_upload_dead_reports_dead_and_exits_3(tmp_path):
     # port => "off", not degraded). "dead" means a live process (or bound port)
     # that is NOT answering /health -- so plant a REAL live non-serving pid in
     # the upload pid file, leaving the port free.
-    dummy = _spawn_dummy()
+    dummy, dummy_marker = _spawn_dummy()
     try:
         w.md.mkdir(parents=True, exist_ok=True)
         (w.md / f"upload_server-{w.port}.pid").write_text(
@@ -491,6 +499,7 @@ def test_status_json_upload_dead_reports_dead_and_exits_3(tmp_path):
         assert data["upload_server"] == "dead", data
     finally:
         _kill_pid(dummy.pid)
+        kill_everything_carrying(dummy_marker)
 
 
 def test_status_json_attention_stale_reports_stale_and_exits_3(tmp_path):
@@ -498,7 +507,7 @@ def test_status_json_attention_stale_reports_stale_and_exits_3(tmp_path):
     # "stale" = a LIVE daemon pid whose heartbeat aged past HEARTBEAT_MAX_AGE
     # (30s). A killed daemon reads as "crashed", not "stale" -- so we need a real
     # live pid AND a backdated heartbeat file.
-    dummy = _spawn_dummy()
+    dummy, dummy_marker = _spawn_dummy()
     try:
         w.md.mkdir(parents=True, exist_ok=True)
         (w.md / "attention.pid").write_text(str(dummy.pid), encoding="utf-8")
@@ -511,6 +520,7 @@ def test_status_json_attention_stale_reports_stale_and_exits_3(tmp_path):
         assert data["attention"] == "stale", data
     finally:
         _kill_pid(dummy.pid)
+        kill_everything_carrying(dummy_marker)
 
 
 def test_status_json_attention_crashed_reports_crashed_and_exits_3(tmp_path):
