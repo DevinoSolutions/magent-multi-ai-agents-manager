@@ -124,12 +124,18 @@ def _node_rows(cfg: MagentConfig, *, now: float) -> list[list[str]]:
     daemon = _daemon_state()
     local_user = env.local_username()
     # The same windows placement reads; None: a table never samples live.
-    windows, _ = nodes.placement_samples(cfg, now=now, live_sample=None)
+    unreadable: dict[str, OSError | ValueError] = {}
+    windows, _ = nodes.placement_samples(
+        cfg, now=now, live_sample=None, on_unreadable=unreadable.__setitem__
+    )
     rows: list[list[str]] = []
     for nick, conf in cfg.settings.nodes.items():
         window = windows.get(nick, [])
         score = nodes.score_node(nick, window)
         load, mem, mine = "no data", "-", "-"
+        if nick in unreadable:
+            # Unknown, never "no data": the class only, the rest is in nodes.log.
+            load = f"unreadable ({type(unreadable[nick]).__name__})"
         if score is not None:
             load = f"{score.p75:.2f} ({score.samples})"
             mine = str(score.my_sessions)

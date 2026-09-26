@@ -1278,11 +1278,14 @@ def parse_load_lines(lines: Iterable[str]) -> list[LoadSample]:
 
 def read_load_history(nick: str, *, nodes_dir: Path | None = None) -> list[LoadSample]:
     """Every sample the daemon kept for ``nick`` (``<nick>/load.jsonl``), or
-    [] when it never sampled that node."""
+    [] when it never sampled that node -- the file does not exist. A file
+    that is there and cannot be read (any other OSError, or bytes that are
+    not UTF-8: UnicodeDecodeError, a ValueError) raises: that is unknown,
+    not "never sampled"."""
     path = load_path(nick, nodes_dir=nodes_dir)  # E's (DECISION-19): one layout owner
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except FileNotFoundError:
         return []
     return parse_load_lines(text.splitlines())
 
@@ -1428,6 +1431,7 @@ def placement_samples(
     now: float,
     live_sample: Callable[[str], LoadSample | None] | None,
     nodes_dir: Path | None = None,
+    on_unreadable: Callable[[str, OSError | ValueError], None] | None = None,
 ) -> tuple[dict[str, list[LoadSample]], frozenset[str]]:
     """Each configured node's window, ready for ``place``, plus which nodes
     were read live.
@@ -1438,11 +1442,25 @@ def placement_samples(
     win. ``live_sample`` is the caller's seam to ``remote_mux.sample`` (this
     module never talks to a node); None -- a dry run -- scores a thin node on
     what it has. A failed live reading leaves the node unscored.
+
+    A history that cannot be read is an empty window, so the sparse rule
+    applies to it; it is logged in full to nodes.log and handed to
+    ``on_unreadable`` so the caller can SAY so -- unknown, never read as
+    "the daemon never sampled this node".
     """
     samples: dict[str, list[LoadSample]] = {}
     sampled: set[str] = set()
     for nick in config.settings.nodes:
-        window = in_window(read_load_history(nick, nodes_dir=nodes_dir), now=now)
+        try:
+            history = read_load_history(nick, nodes_dir=nodes_dir)
+        except (OSError, ValueError) as exc:
+            get_logger("nodes").warning(
+                "load history for node %s is unreadable: %s", nick, exc
+            )
+            if on_unreadable is not None:
+                on_unreadable(nick, exc)
+            history = []
+        window = in_window(history, now=now)
         if len(window) >= MIN_WINDOW_SAMPLES or live_sample is None:
             samples[nick] = window
             continue

@@ -915,7 +915,9 @@ def place_node_projects(
     The map is read strictly (``_node_map_for_placement``). Unreadable, NO
     ``auto`` project is placed: each is dropped with the map's refusal (in
     ``refused``, a failure) and an ``"unknown"`` Placement (D17: its node is
-    None), nothing is sampled, and the rest of the fleet goes on.
+    None), nothing is sampled, and the rest of the fleet goes on. A node
+    whose load history cannot be read is placed on as if it had none (one
+    live reading, or unscored in a dry run) and named in ``notes``.
     """
     from magent import nodes
     from magent.config import NODE_AUTO
@@ -942,13 +944,22 @@ def place_node_projects(
     when = time.time() if now is None else now
     samples: dict[str, list[LoadSample]] = {}
     sampled: frozenset[str] = frozenset()
+    unreadable: dict[str, OSError | ValueError] = {}
     if not all(_kept(config, entries, p) for p in auto):
         samples, sampled = nodes.placement_samples(
-            config, now=when, live_sample=_live_sampler(config) if live else None
+            config,
+            now=when,
+            live_sample=_live_sampler(config) if live else None,
+            on_unreadable=unreadable.__setitem__,
         )
     spread: dict[str, int] = {}
     out: list[ProjectConfig] = []
-    notes: list[str] = []
+    # An unreadable history is unknown, not "never sampled": said, class only.
+    notes: list[str] = [
+        f"@{nick}: its load history is unreadable ({type(exc).__name__});"
+        + (" scored on one live reading" if nick in sampled else " not scored")
+        for nick, exc in unreadable.items()
+    ]
     chosen: dict[str, NodePlacement] = {}
     for proj in projects:
         if proj.node != NODE_AUTO:
