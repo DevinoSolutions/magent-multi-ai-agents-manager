@@ -942,6 +942,7 @@ def final_pull(
     *,
     wait_s: float = FINAL_PULL_WAIT_S,
     local_user: str | None = None,
+    now: Callable[[], float] = time.monotonic,
 ) -> remote_mux.PullResult | None:
     """Pull project ``name``'s node session once more -- ``down`` calls this
     before it kills the session, so the last turn is home. None when the
@@ -954,11 +955,18 @@ def final_pull(
     empty remote root) is refused as RemoteError(0) before any ssh, so the
     caller never sees parse_pull's ValueError. A pull that could not store
     every file is RemoteError(0) too: returning would tell ``down`` the last
-    turn is home when it is not. So is one whose reply was cut at
-    ``remote_mux.PULL_MAX_TOTAL_BYTES``; its mark is already at the resume
-    point, so another final pull (or a tick) carries on from there. A node
-    that reports no real path for the session's root (a deleted project)
-    returns normally with a warning -- no later pull could do better."""
+    turn is home when it is not.
+
+    A reply cut at ``remote_mux.PULL_MAX_TOTAL_BYTES`` is resumed from its
+    advanced mark, call after call, until one comes back whole -- a backlog
+    bigger than one cap must not make every ``down`` refuse. The same
+    ``wait_s`` deadline (counted from this call) bounds the resuming: a reply
+    still cut when it passes is RemoteError(0), and so, at once, is a cut
+    reply that did not move the mark, so the loop can never spin. Every mark
+    is written before the next call, so another final pull (or a tick)
+    carries on from the last one. A node that reports no real path for the
+    session's root (a deleted project) returns normally with a warning -- no
+    later pull could do better."""
     entry = nodes.read_node_map().get(name)
     if entry is None:
         return None
@@ -973,15 +981,29 @@ def final_pull(
         raise remote_mux.refused_pull(
             node, {entry.sid: _spec_for(entry, None)}, refusal
         )
+    deadline = now() + wait_s
     with node_lock(entry.nick, wait_s=wait_s):
         marks = _read_marks(entry.nick)
-        mark, spec, snap = _pull_sid(node, entry, marks.get(entry.sid))
+        asked = marks.get(entry.sid)
+        mark, spec, snap = _pull_sid(node, entry, asked)
         snaps = [snap]
         if mark.realpath is not None and spec.project_dir != (
             nodes.encoded_project_dir(mark.realpath)
         ):
             # The transcript dir only became known with this answer.
-            mark, spec, snap = _pull_sid(node, entry, mark)
+            asked = mark
+            mark, spec, snap = _pull_sid(node, entry, asked)
+            snaps.append(snap)
+        stuck = False
+        # Only the last call counts: each one asks again from its own mark.
+        while entry.sid in snap.truncated and entry.sid not in snap.failed_sids:
+            stuck = mark.since <= (asked.since if asked is not None else 0.0)
+            if stuck or now() >= deadline:
+                break
+            marks[entry.sid] = mark
+            _write_marks(entry.nick, marks)
+            asked = mark
+            mark, spec, snap = _pull_sid(node, entry, asked)
             snaps.append(snap)
         marks[entry.sid] = mark
         _write_marks(entry.nick, marks)
@@ -989,11 +1011,15 @@ def final_pull(
         raise remote_mux.RemoteError(
             0, f"could not store every pulled file of {entry.sid!r}", ("pull.sh",)
         )
-    # Only the last call counts: a second call asks for everything again.
-    if entry.sid in snaps[-1].truncated:
+    if entry.sid in snap.truncated:
+        why = (
+            "without moving its mark"
+            if stuck
+            else f"and was still cut when the deadline passed ({len(snaps)} calls)"
+        )
         raise remote_mux.RemoteError(
             0,
-            f"the reply for {entry.sid!r} reached the pull cap; the rest is owed",
+            f"the reply for {entry.sid!r} reached the pull cap {why}; the rest is owed",
             ("pull.sh",),
         )
     if spec.project_dir is None:

@@ -2444,18 +2444,32 @@ class TestTheFinalPull:
         assert set(_payload(call)["sids"]) == {"api-2"}
 
 
-def _scripted_pull(monkeypatch, *snaps: remote_mux.NodeSnapshot) -> list[dict]:
+def _scripted_pull(
+    monkeypatch, *snaps: remote_mux.NodeSnapshot, clock: _Clock | None = None
+) -> list[dict]:
     """final_pull's pulls answered in order by ``snaps``; returns what each
-    call asked for."""
+    call asked for. With ``clock``, each pull takes 60 s of it."""
     asked: list[dict] = []
     replies = iter(snaps)
 
     def pull(_node, sids):
         asked.append(dict(sids))
+        if clock is not None:
+            clock.at += 60.0
         return next(replies)
 
     monkeypatch.setattr(node_sync, "_pull_node", pull)
     return asked
+
+
+def _cut(resume: float, files: tuple[Path, ...] = ()) -> remote_mux.NodeSnapshot:
+    """A reply for ``api`` cut at the pull cap, owing files from ``resume``."""
+    return _snapshot(
+        realpaths={"api": _REAL},
+        files=files,
+        truncated={"api": ("api/transcripts/owed.jsonl",)},
+        resume={"api": resume},
+    )
 
 
 _REAL = "/home/amin/magent/api"
@@ -2499,29 +2513,140 @@ class TestAFinalPullThatDidNotFinish:
             node_sync.final_pull(_config(), "api")
         assert len(asked) == 2
 
-    def test_a_reply_cut_at_the_pull_cap_raises_with_the_mark_at_its_resume(
+    def test_cut_replies_are_resumed_until_one_comes_back_whole(
+        self, placed, monkeypatch, fake_ssh
+    ):
+        """A backlog bigger than one pull cap is not a refusal: each cut reply
+        is resumed from the mark it advanced, and every file of every chunk
+        is installed. Real pull.sh replies, parsed and stored for real; only
+        the reply changes between calls."""
+        _seed_marks(api=(10.0, _REAL))
+        owed = {"api": ["api/transcripts/owed.jsonl"]}
+        chunks = iter(
+            [
+                ({"truncated": owed, "resume": {"api": 500.0}}, "a"),
+                ({"truncated": owed, "resume": {"api": 800.0}}, "b"),
+                ({}, "c"),
+            ]
+        )
+        asked: list[float] = []
+        real_pull = node_sync._pull_node
+
+        def pull(node, sids):
+            meta, name = next(chunks)
+            _forget_replies(fake_ssh)
+            _answer(
+                fake_ssh,
+                "devino-second",
+                meta=pull_meta(realpaths={"api": _REAL}, **meta),
+                files={f"api/transcripts/{name}.jsonl": f"{name}\n"},
+            )
+            asked.append(sids["api"].since)
+            return real_pull(node, sids)
+
+        monkeypatch.setattr(node_sync, "_pull_node", pull)
+        result = node_sync.final_pull(_config(), "api")
+        assert asked == [
+            10.0,
+            math.nextafter(500.0, -math.inf),
+            math.nextafter(800.0, -math.inf),
+        ]
+        assert result is not None
+        assert len(result.files) == 3
+        home = nodes.transcripts_dir("second", "api")
+        for name in "abc":
+            assert (home / f"{name}.jsonl").read_text(encoding="utf-8") == f"{name}\n"
+        assert _marks() == {
+            "api": {"since": 5000.0 - remote_mux.WATERMARK_OVERLAP_S, "realpath": _REAL}
+        }
+        assert result.since == 5000.0 - remote_mux.WATERMARK_OVERLAP_S
+
+    def test_a_resume_that_stops_moving_the_mark_raises_on_that_call(
         self, placed, monkeypatch
     ):
-        """E8's truncated reply is not the last turn home: final_pull raises,
-        and the mark it leaves resumes where the reply stopped."""
+        """The first cut reply moves the mark, the second names no resume
+        point and does not: asking a third time would get the same reply, so
+        the pull is asked for exactly twice, with plenty of deadline left."""
         _seed_marks(api=(10.0, _REAL))
+        asked = _scripted_pull(
+            monkeypatch,
+            _cut(500.0),
+            _snapshot(
+                realpaths={"api": _REAL},
+                truncated={"api": ("api/transcripts/owed.jsonl",)},
+            ),
+        )
+        with pytest.raises(remote_mux.RemoteError, match="without moving its mark"):
+            node_sync.final_pull(_config(), "api", wait_s=1e9)
+        assert len(asked) == 2
+        assert _marks() == {
+            "api": {"since": math.nextafter(500.0, -math.inf), "realpath": _REAL}
+        }
+
+    def test_a_reply_still_cut_at_the_deadline_raises_with_the_mark_at_its_resume(
+        self, placed, monkeypatch
+    ):
+        """``wait_s`` bounds the resuming too: every pull here takes 60 s of
+        a 100 s budget, so the second cut reply is the last one asked for.
+        The mark it leaves resumes where that reply stopped."""
+        _seed_marks(api=(10.0, _REAL))
+        clock = _Clock()
+        asked = _scripted_pull(
+            monkeypatch, _cut(500.0), _cut(800.0), _cut(900.0), clock=clock
+        )
+        with pytest.raises(
+            remote_mux.RemoteError, match="still cut when the deadline passed"
+        ) as info:
+            node_sync.final_pull(_config(), "api", wait_s=100.0, now=clock)
+        assert info.value.rc == 0
+        assert len(asked) == 2
+        assert _marks() == {
+            "api": {"since": math.nextafter(800.0, -math.inf), "realpath": _REAL}
+        }
+
+    def test_a_resume_call_that_fails_keeps_the_mark_the_cut_reply_earned(
+        self, placed, monkeypatch
+    ):
+        """Each mark is written before the next call: a resume that dies on
+        the wire leaves the next final pull (or tick) at the first resume
+        point, not back at the mark this final pull started from."""
+        _seed_marks(api=(10.0, _REAL))
+        replies = iter([_cut(500.0)])
+
+        def pull(_node, _sids):
+            reply = next(replies, None)
+            if reply is None:
+                raise remote_mux.RemoteError(255, "Connection reset", ("ssh",))
+            return reply
+
+        monkeypatch.setattr(node_sync, "_pull_node", pull)
+        with pytest.raises(remote_mux.RemoteError, match="Connection reset"):
+            node_sync.final_pull(_config(), "api")
+        assert _marks() == {
+            "api": {"since": math.nextafter(500.0, -math.inf), "realpath": _REAL}
+        }
+
+    def test_a_cut_reply_that_does_not_move_the_mark_raises_at_once(
+        self, placed, monkeypatch
+    ):
+        """A cut reply naming no resume point leaves the mark where it was;
+        asking again would get the same reply, so final_pull raises after ONE
+        call however much of the deadline is left."""
+        before = _seed_marks(api=(10.0, _REAL))
         asked = _scripted_pull(
             monkeypatch,
             _snapshot(
                 realpaths={"api": _REAL},
                 truncated={"api": ("api/transcripts/b.jsonl",)},
-                resume={"api": 500.0},
             ),
         )
         with pytest.raises(
-            remote_mux.RemoteError, match="reached the pull cap"
+            remote_mux.RemoteError, match="without moving its mark"
         ) as info:
-            node_sync.final_pull(_config(), "api")
+            node_sync.final_pull(_config(), "api", wait_s=1e9)
         assert info.value.rc == 0
         assert len(asked) == 1
-        assert _marks() == {
-            "api": {"since": math.nextafter(500.0, -math.inf), "realpath": _REAL}
-        }
+        assert nodes.pull_marks_path("second").read_bytes() == before
 
     def test_a_cut_first_call_does_not_count_when_the_second_asks_again(
         self, placed, monkeypatch
