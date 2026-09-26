@@ -2956,6 +2956,17 @@ class TestDoctorShUnderRealBash:
         (row,) = [line for line in _report(r).lines if line.item == "tmux"]
         assert (row.status, row.detail) == ("ok", "tmux 3.4")
 
+    def test_a_failing_version_read_warns_instead_of_reading_ok(self, tmp_path):
+        # Like a failing tmux -V: what a --version that exits non-zero printed
+        # is not a working tool's version.
+        fakes, env = _doctor_box(tmp_path)
+        fakes["git"].set_reply("--version", stdout="git version 2.43.0\n", rc=2)
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        assert _rows(r) == {**dict.fromkeys(DOCTOR_ITEMS, "ok"), "git": "warn"}
+        (row,) = [line for line in _report(r).lines if line.item == "git"]
+        assert row.detail == "git --version exited 2 -- reinstall git on this node"
+
     def test_a_missing_tool_fails_but_a_missing_gh_only_warns(self, tmp_path):
         tools = tuple(t for t in NODE_TOOLS if t not in ("git", "gh"))
         _, env = _doctor_box(tmp_path, tools=tools)
