@@ -2777,6 +2777,7 @@ def _doctor_box(
     charmap: str = "UTF-8",
     avail_kb: int = 50 * GIB_KB,
     tmux_version: str = "tmux 3.4",
+    tmux_version_rc: int = 0,
     sessions: str = "a: 1 windows\nb: 1 windows\n",
     sessions_stderr: str = "",
     sessions_rc: int = 0,
@@ -2792,7 +2793,6 @@ def _doctor_box(
         name, match = HUNG_PROBES[hang]
         fakes[name].set_reply(match, hang_s=HANG_S, ignore_term=hang_ignores_term)
     replies = {
-        "tmux": [("-V", tmux_version + "\n")],
         "claude": [("auth status", json.dumps({"loggedIn": logged_in}) + "\n")],
         "locale": [("charmap", charmap + "\n")],
         "df": [("-Pk", _df(avail_kb))],
@@ -2801,6 +2801,7 @@ def _doctor_box(
         for match, stdout in replies.get(name, []):
             fake.set_reply(match, stdout=stdout)
     if "tmux" in fakes:
+        fakes["tmux"].set_reply("-V", stdout=tmux_version + "\n", rc=tmux_version_rc)
         fakes["tmux"].set_reply(
             "list-sessions", stdout=sessions, stderr=sessions_stderr, rc=sessions_rc
         )
@@ -2914,6 +2915,43 @@ class TestDoctorShUnderRealBash:
         assert version in row.detail
         if status == "fail":
             assert "3.2 or newer" in row.detail
+
+    def _tmux_row(self, env: dict[str, str]) -> ScriptLine:
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        (row,) = [line for line in _report(r).lines if line.item == "tmux"]
+        return row
+
+    def test_a_node_without_tmux_says_so(self, tmp_path):
+        # Not "cannot read the tmux version ()": a missing binary is named as
+        # missing, with the command that installs it.
+        tools = tuple(t for t in NODE_TOOLS if t != "tmux")
+        _, env = _doctor_box(tmp_path, tools=tools)
+        row = self._tmux_row(env)
+        assert (row.status, row.detail) == (
+            "fail",
+            "tmux is not on PATH -- run: magent node setup",
+        )
+
+    def test_a_failing_tmux_v_is_not_believed(self, tmp_path):
+        # A version printed by a `tmux -V` that then exits non-zero is not
+        # graded: the binary is broken, whatever it claimed to be.
+        _, env = _doctor_box(tmp_path, tmux_version="tmux 3.4", tmux_version_rc=1)
+        row = self._tmux_row(env)
+        assert (row.status, row.detail) == (
+            "fail",
+            "cannot read the tmux version (); magent needs tmux 3.2 or newer",
+        )
+
+    def test_only_the_first_line_of_tmux_v_is_the_version(self, tmp_path):
+        # A second line kept in the detail would split the row, and leave
+        # stdout carrying a line that is no row at all.
+        _, env = _doctor_box(tmp_path, tmux_version="tmux 3.4\nwarning: odd locale")
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        assert len(r.stdout.splitlines()) == len(_report(r).lines)
+        (row,) = [line for line in _report(r).lines if line.item == "tmux"]
+        assert (row.status, row.detail) == ("ok", "tmux 3.4")
 
     def test_a_missing_tool_fails_but_a_missing_gh_only_warns(self, tmp_path):
         tools = tuple(t for t in NODE_TOOLS if t not in ("git", "gh"))
