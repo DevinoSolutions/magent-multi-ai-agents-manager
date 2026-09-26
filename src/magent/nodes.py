@@ -870,6 +870,13 @@ def _skill_file(
         notes.append(
             f"skills/{_named(rel_path)}: CRLF line endings; will not run on a node"
         )
+    # The credential scan knows only Claude's keys; an env file may hold any.
+    if _is_env_file(path.name) or _is_env_file(os.path.basename(target)):
+        notes.append(
+            f"skills/{_named(rel_path)}: an env file, shipped -- make sure it "
+            "holds no secret"
+        )
+        _log.warning("skills/%s is the env file %s: shipped", _named(rel_path), target)
     return SkillFile(
         path=rel_path,
         data=data,
@@ -884,8 +891,10 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     UTF-16) or path hold a Claude credential stays behind, and so does one
     whose name, or the name its link resolves to, is a secret file's
     (``SKILLS_SECRET_FILES`` and kin: an ssh or TLS key, a git token the
-    scan cannot see); a note names the path, never the content. A Windows
-    junction is followed exactly like a symlink, on
+    scan cannot see); a note names the path, never the content. Two files
+    ship with a caution instead: a ``#!`` line ending in CR (it will not run
+    on a node) and an env file by either name (the scan cannot vouch for
+    it). A Windows junction is followed exactly like a symlink, on
     purpose: a link in ``skills`` is one the user made (a repo checked out
     elsewhere is the main case), so it is not contained to the root.
 

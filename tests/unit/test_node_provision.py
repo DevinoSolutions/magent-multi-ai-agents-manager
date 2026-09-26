@@ -1701,6 +1701,9 @@ class TestAnUnreadableSkillsFolderIsNamedNotFatal:
         )
 
 
+ENV_NOTE = "skills/{}: an env file, shipped -- make sure it holds no secret"
+
+
 # Two cautions that never stop a file: it ships verbatim, with a note in our
 # words. A `#!` line ending in CR names an interpreter ("bash\r") the node
 # cannot exec.
@@ -1732,6 +1735,53 @@ class TestASkillFileIsShippedWithACaution:
         scope = nodes.user_scope(home)
         assert [f.data for f in scope.skills] == [data]
         assert scope.notes == ()
+
+    # An env file ships -- a skill may need one -- but the credential scan
+    # only knows Claude's keys, so the user is told to look. "Env file" is the
+    # push set's rule (nodes._is_env_file), one policy.
+    def test_an_env_file_ships_with_a_note(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/.env.local", b"PORT=1\n")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/.env.local"]
+        assert scope.notes == (ENV_NOTE.format("s/.env.local"),)
+
+    @pytest.mark.parametrize("name", [".envrc", "env.txt", "x.env", ".environment"])
+    def test_only_the_push_sets_env_names_are_noted(self, tmp_path, name):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, f"s/{name}", b"PORT=1\n")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == [f"s/{name}"]
+        assert scope.notes == ()
+
+    # By either name: the one it ships under, or the one its link resolves to.
+    # The note is our words and the skills path; where the link resolves is
+    # in nodes.log only.
+    def test_a_link_to_an_env_file_is_noted_and_logged(self, tmp_path, caplog):
+        home, skills = _skills_home(tmp_path)
+        real = tmp_path / "project" / ".env"
+        real.parent.mkdir()
+        real.write_bytes(b"PORT=1\n")
+        (skills / "s").mkdir()
+        _link_file(skills / "s" / "config", real)
+        caplog.set_level("WARNING", logger="nodes")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/config"]
+        assert scope.notes == (ENV_NOTE.format("s/config"),)
+        assert "project" not in repr(scope.notes)
+        (record,) = [r for r in caplog.records if "project" in r.getMessage()]
+        assert record.getMessage().startswith("skills/s/config")
+
+    def test_an_env_named_link_to_another_file_is_noted(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        real = tmp_path / "project" / "vars.txt"
+        real.parent.mkdir()
+        real.write_bytes(b"PORT=1\n")
+        (skills / "s").mkdir()
+        _link_file(skills / "s" / ".env", real)
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/.env"]
+        assert scope.notes == (ENV_NOTE.format("s/.env"),)
 
 
 CLAUDE_ELSEWHERE = "links into ~/.claude outside the skills folder, not followed"
