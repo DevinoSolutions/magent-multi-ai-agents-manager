@@ -713,8 +713,15 @@ class TestPull:
         assert result == remote_mux.PullResult(files=(), since=42.0)
 
     def test_a_session_name_that_cannot_be_a_directory_here_is_refused(self, fake_ssh):
-        with pytest.raises(RemoteError, match="not a pullable session name"):
+        with pytest.raises(RemoteError, match="not a pullable session name") as info:
             remote_mux.pull(NODE, "CON", ["~/x"], 0.0)
+        assert info.value.rc == 0
+        # Exactly the pull it would have sent -- same spec, same shown form.
+        spec = remote_mux.SidPull(roots=("~/x",), project_dir=None, since=0.0)
+        assert info.value.command_redacted == remote_mux._run_shown(
+            NODE, *remote_mux._pull_call({"CON": spec})
+        )
+        assert info.value.command_redacted[0] == "ssh"
         assert fake_ssh.calls() == []
 
     def test_a_file_that_could_not_be_stored_holds_the_watermark(

@@ -8,6 +8,7 @@ is 0 for every test that does not set it back.
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import logging
 import os
@@ -16,12 +17,13 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
-from magent import agent_state, launch, node_sync, nodes, remote_mux
+from magent import agent_state, launch, log, node_sync, nodes, remote_mux
 from magent.config import (
     SCHEMA_VERSION,
     MagentConfig,
@@ -32,7 +34,7 @@ from magent.config import (
 )
 from magent.env import get_env
 from magent.lockfile import LockHeld, exclusive_lock
-from magent.log import get_logger, heartbeat_age, write_heartbeat
+from magent.log import get_logger, heartbeat_age, heartbeat_fresh, write_heartbeat
 from magent.nodes import LoadSample, NodeMapEntry, encoded_project_dir
 from tests.unit._pull_reply import SAMPLE, pull_meta, pull_reply
 
@@ -1012,6 +1014,36 @@ class TestANodeFailsAlone:
         assert _calls_to(fake_ssh, "devino-second") == []
         assert _node_warnings(caplog, "second") == []
 
+    def test_a_node_removed_while_down_warns_again_when_readded_still_down(
+        self, placed, caplog
+    ):
+        """A node that leaves the pool is forgotten: coming back unreachable
+        is a new state to report, not the old one continuing."""
+        _capture_nodes_log(caplog)
+
+        def pull(node, _sids):
+            if node.nick == "second":
+                raise remote_mux.RemoteError(255, REFUSED, ("ssh",))
+            return _snapshot()
+
+        third_only = _config(
+            pool={"third": POOL["third"]},
+            projects=[ProjectConfig(path="web", node="third")],
+        )
+        syncer = node_sync.NodeSyncer(_config(), pull=pull)
+        try:
+            syncer.tick()
+            syncer.reconfigure(third_only)
+            syncer.tick()
+            syncer.reconfigure(_config())
+            syncer.tick()
+        finally:
+            syncer.close()
+        assert (
+            _node_warnings(caplog, "second")
+            == [f"node second: unreachable ({REFUSED.strip()})"] * 2
+        )
+
 
 def _second_only(**sync) -> MagentConfig:
     return _config(
@@ -1648,3 +1680,506 @@ class TestTheLoadSampleEdges:
         )
         assert syncer.tick()["second"] == (node_sync.OK, "")
         assert _load_ts() == [1000.0]
+
+
+def _recording_pull(seen: list[tuple[str, list[str]]]):
+    def pull(node, sids):
+        seen.append((node.nick, sorted(sids)))
+        return _snapshot()
+
+    return pull
+
+
+class TestTheLoop:
+    def test_the_loop_beats_and_records_its_pid_while_it_runs(self, placed):
+        during: list[tuple[bool, int | None]] = []
+
+        def nap(_s: float) -> None:
+            during.append(
+                (heartbeat_fresh(node_sync.HEARTBEAT_NAME), node_sync.daemon_pid())
+            )
+
+        assert (
+            node_sync.run_sync_loop(
+                _config(), max_ticks=2, sleep=nap, pull=_recording_pull([])
+            )
+            == 0
+        )
+        assert during == [(True, os.getpid())]
+        assert heartbeat_age(node_sync.HEARTBEAT_NAME) is None
+        assert node_sync.daemon_pid() is None
+
+    def test_the_daemon_beats_at_least_every_10_seconds(self, placed, monkeypatch):
+        """Readers call a heartbeat older than 30 s stale (DECISION-17). One
+        write per pull (30 s by default) would flap between ok and stale, so the
+        beat runs on its own thread at log.HEARTBEAT_INTERVAL."""
+        beats: list[str] = []
+
+        def beat(name, stop) -> None:
+            beats.append(name)
+            stop.wait(5)
+
+        monkeypatch.setattr(node_sync, "run_heartbeat", beat)
+        node_sync.run_sync_loop(_config(), max_ticks=1, pull=_recording_pull([]))
+        assert beats == [node_sync.HEARTBEAT_NAME]
+        assert (
+            log.HEARTBEAT_INTERVAL * 3 <= log.HEARTBEAT_MAX_AGE
+        )  # >= 3 beats per max age
+
+    def test_a_second_daemon_exits_without_pulling(self, placed):
+        seen: list[tuple[str, list[str]]] = []
+        with exclusive_lock(node_sync.LOCK_NAME):
+            assert (
+                node_sync.run_sync_loop(
+                    _config(), max_ticks=1, pull=_recording_pull(seen)
+                )
+                == 0
+            )
+        assert seen == []
+
+    def test_a_crash_keeps_the_heartbeat_as_its_marker(self, placed, monkeypatch):
+        """The crash is raised by the tick itself, not by a pull: a node's
+        failure is reduced to an outcome inside _sync_node, so only a bug in
+        the loop's own machinery escapes -- and that must crash the loop."""
+
+        def broken(_self, *, wait_s=None):
+            raise ValueError("boom")
+
+        monkeypatch.setattr(node_sync.NodeSyncer, "tick", broken)
+        with pytest.raises(ValueError, match="boom"):
+            node_sync.run_sync_loop(_config(), max_ticks=1, pull=_recording_pull([]))
+        assert heartbeat_age(node_sync.HEARTBEAT_NAME) is not None
+        assert node_sync.daemon_pid() is None
+
+    def test_a_changed_config_is_picked_up_between_ticks(self, placed):
+        seen: list[tuple[str, list[str]]] = []
+        smaller = _second_only()
+        node_sync.run_sync_loop(
+            _config(),
+            max_ticks=2,
+            sleep=lambda _s: None,
+            reload=lambda: smaller,
+            pull=_recording_pull(seen),
+        )
+        assert sorted(nick for nick, _ in seen) == ["second", "second", "third"]
+
+    def test_the_loop_ends_when_no_project_runs_on_a_node(self, placed):
+        seen: list[tuple[str, list[str]]] = []
+        empty = _config(projects=[ProjectConfig(path="api")])
+        node_sync.run_sync_loop(
+            _config(),
+            max_ticks=5,
+            sleep=lambda _s: None,
+            reload=lambda: empty,
+            pull=_recording_pull(seen),
+        )
+        assert len(seen) == 2
+        assert heartbeat_age(node_sync.HEARTBEAT_NAME) is None
+
+    def test_a_reload_that_fails_keeps_the_config(self, placed):
+        seen: list[tuple[str, list[str]]] = []
+        node_sync.run_sync_loop(
+            _config(),
+            max_ticks=2,
+            sleep=lambda _s: None,
+            reload=lambda: None,
+            pull=_recording_pull(seen),
+        )
+        assert len(seen) == 4
+
+    def test_one_tick_refuses_while_the_daemon_holds_the_lock(self, placed):
+        with exclusive_lock(node_sync.LOCK_NAME), pytest.raises(LockHeld):
+            node_sync.run_once(_config(), pull=_recording_pull([]))
+
+
+def _blocking_pull(release: threading.Event, dialled: list[str]):
+    """``second`` hangs until the test sets ``release``; ``third`` answers at
+    once. The wait is bounded, so a test that forgets to release still ends."""
+
+    def pull(node, _sids):
+        dialled.append(node.nick)
+        if node.nick == "second":
+            assert release.wait(30), "the test never released the hung pull"
+        return _snapshot()
+
+    return pull
+
+
+class _RecordingExecutor(ThreadPoolExecutor):
+    """A real pool that remembers its size and every shutdown call."""
+
+    made: list[_RecordingExecutor]
+
+    def __init__(self, max_workers=None, *args, **kwargs) -> None:
+        super().__init__(max_workers, *args, **kwargs)
+        self.max_workers = max_workers
+        self.shutdowns: list[tuple[bool, bool]] = []
+        self.made.append(self)
+
+    def shutdown(self, wait=True, *, cancel_futures=False) -> None:
+        self.shutdowns.append((wait, cancel_futures))
+        super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+
+@pytest.fixture
+def executors(monkeypatch) -> list[_RecordingExecutor]:
+    made: list[_RecordingExecutor] = []
+    monkeypatch.setattr(_RecordingExecutor, "made", made, raising=False)
+    monkeypatch.setattr(node_sync, "ThreadPoolExecutor", _RecordingExecutor)
+    return made
+
+
+def _drain(executors: list[_RecordingExecutor]) -> None:
+    """Join every worker (without recording it), so a released pull cannot
+    still be writing the mirror after this test's path redirects are undone."""
+    for e in executors:
+        ThreadPoolExecutor.shutdown(e, wait=True)
+
+
+class TestAHungNodeDoesNotHoldTheTick:
+    """One hung node used to hold every tick for up to PULL_TIMEOUT_S, so every
+    healthy node's sessions.json aged past sessions_stale's two pull intervals.
+    A tick now waits a bounded time, reports the laggard, and moves on."""
+
+    def test_the_tick_returns_with_the_others_ok_and_the_laggard_still_running(
+        self, placed, executors
+    ):
+        release = threading.Event()
+        dialled: list[str] = []
+        syncer = node_sync.NodeSyncer(_config(), pull=_blocking_pull(release, dialled))
+        try:
+            started = time.monotonic()
+            first = syncer.tick(wait_s=0.2)
+            second = syncer.tick(wait_s=0.2)
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+        running = (node_sync.UNREACHABLE, node_sync.PULL_STILL_RUNNING)
+        assert first == second == {"second": running, "third": (node_sync.OK, "")}
+        assert elapsed < 10
+        # The laggard is not dialled again while its pull is still running.
+        assert sorted(dialled) == ["second", "third", "third"]
+
+    def test_the_laggard_reads_ok_on_the_tick_after_it_finishes(
+        self, placed, caplog, executors
+    ):
+        _capture_nodes_log(caplog)
+        release = threading.Event()
+        syncer = node_sync.NodeSyncer(_config(), pull=_blocking_pull(release, []))
+        try:
+            syncer.tick(wait_s=0.2)
+            syncer.tick(wait_s=0.2)
+            release.set()
+            after = syncer.tick(wait_s=10)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+        assert after == {"second": (node_sync.OK, ""), "third": (node_sync.OK, "")}
+        assert _node_warnings(caplog, "second") == [
+            "node second: unreachable (previous pull still running)"
+        ]
+        assert [
+            r.getMessage()
+            for r in caplog.records
+            if "reachable again" in r.getMessage()
+        ] == ["node second: reachable again"]
+
+    def test_a_smaller_pool_gets_a_new_executor(self, placed, executors):
+        syncer = node_sync.NodeSyncer(_config(), pull=_recording_pull([]))
+        try:
+            syncer.tick()
+            syncer.reconfigure(_second_only())
+            syncer.tick()
+        finally:
+            syncer.close()
+        assert [e.max_workers for e in executors] == [2, 1]
+        assert executors[0].shutdowns == [(False, False)]
+        assert executors[1].shutdowns == [(False, True)]
+
+    def test_the_loop_shuts_its_executor_down_without_joining_a_hung_pull(
+        self, placed, executors
+    ):
+        release = threading.Event()
+        try:
+            started = time.monotonic()
+            rc = node_sync.run_sync_loop(
+                _config(pull_interval_s=1, sample_interval_s=1),
+                max_ticks=1,
+                pull=_blocking_pull(release, []),
+            )
+            elapsed = time.monotonic() - started
+            shutdowns = [list(e.shutdowns) for e in executors]
+        finally:
+            release.set()
+            _drain(executors)
+        assert rc == 0
+        assert elapsed < 10
+        assert shutdowns == [[(False, True)]]
+
+
+def _pull_shown(sid: str, root: str) -> tuple[str, ...]:
+    """The shown form of the first pull final_pull would send for ``sid``
+    on second (as local user amin) -- what a refusal must name exactly."""
+    node = nodes.node_for_nick(_config(), "second", local_user="amin")
+    spec = remote_mux.SidPull(roots=(root,), project_dir=None, since=0.0)
+    return remote_mux._run_shown(node, *remote_mux._pull_call({sid: spec}))
+
+
+class TestTheFinalPull:
+    def test_a_first_final_pull_learns_the_directory_then_pulls_its_transcripts(
+        self, placed, fake_ssh
+    ):
+        _answer(
+            fake_ssh,
+            "devino-second",
+            meta=pull_meta(realpaths={"api": "/home/amin/magent/api"}),
+            files={"api/transcripts/abc.jsonl": "x\n"},
+        )
+        result = node_sync.final_pull(_config(), "api")
+        assert result is not None
+        assert len(_calls_to(fake_ssh, "devino-second")) == 2
+        assert nodes.transcripts_dir("second", "api") / "abc.jsonl" in result.files
+        assert result.since == 4999.0
+        assert _marks() == {
+            "api": {"since": 4999.0, "realpath": "/home/amin/magent/api"}
+        }
+
+    def test_a_final_pull_with_a_known_directory_is_one_call(self, placed, fake_ssh):
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"),
+            {"api": {"since": 10.0, "realpath": "/home/amin/magent/api"}},
+        )
+        _answer(
+            fake_ssh,
+            "devino-second",
+            meta=pull_meta(realpaths={"api": "/home/amin/magent/api"}),
+        )
+        node_sync.final_pull(_config(), "api")
+        (call,) = _calls_to(fake_ssh, "devino-second")
+        assert _payload(call)["sids"]["api"]["since"] == 10.0
+
+    def test_a_project_that_was_never_placed_has_nothing_to_pull(
+        self, placed, fake_ssh
+    ):
+        assert node_sync.final_pull(_config(), "nowhere") is None
+        assert fake_ssh.calls() == []
+
+    def test_a_final_pull_waits_for_the_daemons_tick_then_gives_up(
+        self, placed, fake_ssh
+    ):
+        started = time.monotonic()
+        with exclusive_lock("node-pull-second"), pytest.raises(LockHeld):
+            node_sync.final_pull(_config(), "api", wait_s=0.5)
+        assert time.monotonic() - started >= 0.4
+        assert fake_ssh.calls() == []
+
+    def test_an_unreachable_node_raises_for_the_caller_to_report(
+        self, placed, fake_ssh
+    ):
+        _answer(fake_ssh, "devino-second", rc=255, stderr=REFUSED)
+        with pytest.raises(remote_mux.RemoteError) as info:
+            node_sync.final_pull(_config(), "api")
+        assert info.value.rc == 255
+
+    @pytest.mark.parametrize("sid", ["a\nb", "../x", "", "CON"])
+    def test_a_session_name_this_pc_cannot_pull_is_refused_before_any_ssh(
+        self, placed, fake_ssh, sid
+    ):
+        nodes.write_node_map({"api": _entry("second", sid)})
+        with pytest.raises(remote_mux.RemoteError) as info:
+            node_sync.final_pull(_config(), "api", local_user="amin")
+        assert info.value.rc == 0
+        assert info.value.stderr_tail == f"not a pullable session name: {sid!r}"
+        assert info.value.command_redacted == _pull_shown(sid, f"~/magent/{sid}")
+        assert info.value.command_redacted[0] == "ssh"
+        assert "amin@devino-second" in info.value.command_redacted
+        assert info.value.command_redacted[-1].startswith("<stdin: ")
+        assert fake_ssh.calls() == []
+
+    def test_a_session_with_an_empty_remote_root_is_refused_before_any_ssh(
+        self, placed, fake_ssh
+    ):
+        entry = _entry("second", "api")
+        nodes.write_node_map(
+            {
+                "api": NodeMapEntry(
+                    nick=entry.nick,
+                    sid=entry.sid,
+                    placed_ts=entry.placed_ts,
+                    attached_existing=entry.attached_existing,
+                    remote_root="",
+                )
+            }
+        )
+        with pytest.raises(remote_mux.RemoteError) as info:
+            node_sync.final_pull(_config(), "api", local_user="amin")
+        assert info.value.rc == 0
+        assert info.value.stderr_tail == (
+            "session 'api' has an empty remote_root in the node map"
+        )
+        assert info.value.command_redacted == _pull_shown("api", "")
+        assert info.value.command_redacted[0] == "ssh"
+        assert fake_ssh.calls() == []
+
+    def test_a_good_session_name_still_pulls(self, placed, fake_ssh):
+        nodes.write_node_map({"api": _entry("second", "api-2")})
+        _answer(fake_ssh, "devino-second")
+        result = node_sync.final_pull(_config(), "api")
+        assert result is not None
+        (call,) = _calls_to(fake_ssh, "devino-second")
+        assert set(_payload(call)["sids"]) == {"api-2"}
+
+
+def _scripted_pull(monkeypatch, *snaps: remote_mux.NodeSnapshot) -> list[dict]:
+    """final_pull's pulls answered in order by ``snaps``; returns what each
+    call asked for."""
+    asked: list[dict] = []
+    replies = iter(snaps)
+
+    def pull(_node, sids):
+        asked.append(dict(sids))
+        return next(replies)
+
+    monkeypatch.setattr(node_sync, "_pull_node", pull)
+    return asked
+
+
+_REAL = "/home/amin/magent/api"
+
+
+class TestAFinalPullThatDidNotFinish:
+    def test_a_file_that_could_not_be_stored_raises(self, placed, fake_ssh):
+        (nodes.transcripts_dir("second", "api") / "abc.jsonl").mkdir(parents=True)
+        _answer(
+            fake_ssh,
+            "devino-second",
+            meta=pull_meta(realpaths={"api": _REAL}),
+            files={"api/transcripts/abc.jsonl": "x\n"},
+        )
+        with pytest.raises(remote_mux.RemoteError) as info:
+            node_sync.final_pull(_config(), "api")
+        assert info.value.rc == 0
+        assert info.value.stderr_tail == "could not store every pulled file of 'api'"
+        assert info.value.command_redacted == ("pull.sh",)
+
+    def test_a_store_failure_on_the_second_call_raises_too(self, placed, monkeypatch):
+        _scripted_pull(
+            monkeypatch,
+            _snapshot(realpaths={"api": _REAL}),
+            _snapshot(realpaths={"api": _REAL}, failed_sids=frozenset({"api"})),
+        )
+        with pytest.raises(remote_mux.RemoteError, match="could not store"):
+            node_sync.final_pull(_config(), "api")
+
+    def test_a_store_failure_on_the_first_call_raises_after_a_clean_second(
+        self, placed, monkeypatch
+    ):
+        """Only the second call asks for transcripts, but the first one's
+        state records count too: a clean second answer does not absolve it."""
+        asked = _scripted_pull(
+            monkeypatch,
+            _snapshot(realpaths={"api": _REAL}, failed_sids=frozenset({"api"})),
+            _snapshot(realpaths={"api": _REAL}),
+        )
+        with pytest.raises(remote_mux.RemoteError, match="could not store"):
+            node_sync.final_pull(_config(), "api")
+        assert len(asked) == 2
+
+    def test_a_root_the_node_cannot_resolve_is_logged_and_the_pull_returns(
+        self, placed, monkeypatch, caplog
+    ):
+        _capture_nodes_log(caplog)
+        asked = _scripted_pull(monkeypatch, _snapshot())
+        result = node_sync.final_pull(_config(), "api")
+        assert result == remote_mux.PullResult(files=(), since=0.0)
+        assert len(asked) == 1
+        assert _node_warnings(caplog, "second") == [
+            (
+                "node second: final pull of 'api': the node reported no real "
+                "path for its root, so its transcripts were not requested"
+            )
+        ]
+
+    def test_state_records_are_pruned_after_a_stored_pull(self, placed, monkeypatch):
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"), {"api": {"since": 10.0, "realpath": "/r"}}
+        )
+        gone = nodes.state_dir("second", "api") / "gone.json"
+        gone.parent.mkdir(parents=True)
+        gone.write_text("{}", encoding="utf-8")
+        _scripted_pull(
+            monkeypatch, _snapshot(realpaths={"api": "/r"}, state_files={"api": ()})
+        )
+        node_sync.final_pull(_config(), "api")
+        assert not gone.exists()
+
+    def test_state_records_are_kept_when_the_pull_failed(self, placed, monkeypatch):
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"), {"api": {"since": 10.0, "realpath": "/r"}}
+        )
+        gone = nodes.state_dir("second", "api") / "gone.json"
+        gone.parent.mkdir(parents=True)
+        gone.write_text("{}", encoding="utf-8")
+        _scripted_pull(
+            monkeypatch,
+            _snapshot(
+                realpaths={"api": "/r"},
+                state_files={"api": ()},
+                failed_sids=frozenset({"api"}),
+            ),
+        )
+        with pytest.raises(remote_mux.RemoteError):
+            node_sync.final_pull(_config(), "api")
+        assert gone.exists()
+
+
+class TestWhatAFinalPullLeavesBehind:
+    def test_another_sessions_mark_survives(self, placed, monkeypatch):
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"),
+            {
+                "api": {"since": 10.0, "realpath": "/r"},
+                "other": {"since": 7.0, "realpath": "/o"},
+            },
+        )
+        _scripted_pull(monkeypatch, _snapshot(realpaths={"api": "/r"}))
+        node_sync.final_pull(_config(), "api")
+        assert _marks()["other"] == {"since": 7.0, "realpath": "/o"}
+
+    def test_the_second_call_asks_for_the_learned_directory_and_its_files_count(
+        self, placed, monkeypatch
+    ):
+        a, b = Path("a.jsonl"), Path("b.jsonl")
+        asked = _scripted_pull(
+            monkeypatch,
+            _snapshot(realpaths={"api": _REAL}, files=(a,)),
+            _snapshot(realpaths={"api": _REAL}, files=(a, b)),
+        )
+        result = node_sync.final_pull(_config(), "api")
+        assert asked[1]["api"].project_dir == encoded_project_dir(_REAL)
+        assert asked[1]["api"].since == 0.0
+        # Both calls ship the session's state records: each path is listed once.
+        assert result == remote_mux.PullResult(files=(a, b), since=8999.0)
+
+    def test_by_default_it_outwaits_a_daemon_pull_holding_the_node(
+        self, placed, monkeypatch
+    ):
+        """The daemon holds the node lock for one whole pull: up to
+        PULL_TIMEOUT_S, the reap, then the store."""
+        waits: list[float] = []
+
+        @contextlib.contextmanager
+        def lock(_nick, *, wait_s):
+            waits.append(wait_s)
+            yield
+
+        monkeypatch.setattr(node_sync, "node_lock", lock)
+        _scripted_pull(monkeypatch, _snapshot(realpaths={"api": "/r"}))
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"), {"api": {"since": 1.0, "realpath": "/r"}}
+        )
+        node_sync.final_pull(_config(), "api")
+        assert waits == [remote_mux.PULL_TIMEOUT_S + 2.0]
