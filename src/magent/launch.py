@@ -2126,7 +2126,14 @@ def _final_pull(
             # FINAL_PULL_WAIT_S), NodeMapUnreadable, and a pulled file this
             # PC could not write;
             # ValueError covers NodeConfigError. None of them may abort the down.
-            get_logger("nodes").warning("down: final pull of %s failed: %s", sid, exc)
+            detail = str(exc)
+            if isinstance(exc, node_sync.NodeMapUnreadable):
+                # Its own text is class-only, for the screen; the map error it
+                # chains names the path and the parser's words: the log's.
+                detail = f"{exc}: {exc.__cause__}"
+            get_logger("nodes").warning(
+                "down: final pull of %s failed: %s", sid, detail
+            )
             if isinstance(exc, remote_mux.RemoteError) and (
                 exc.timed_out or exc.rc == attach_client.SSH_TRANSPORT_RC
             ):
@@ -2136,7 +2143,11 @@ def _final_pull(
                     f"node {nick}'s pull lock is held by another magent process"
                 )
             if isinstance(exc, node_sync.NodeMapUnreadable):
-                # The same words as the None below; the class is in the log.
+                # D-MERGE: ruling (b) -- at the D16 merge this reason becomes
+                # D16's final m4 wording plus the map error's CLASS (the
+                # cause's, which str(exc) already names), still one line; the
+                # whole error stays in the log line above. Until then, D16's
+                # pinned words as they stand at this branch's base.
                 reason = nodes.MAP_UNREAD
             else:
                 # ASCII end to end: the cause is the node's or the OS's words.

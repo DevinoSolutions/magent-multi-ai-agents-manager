@@ -714,14 +714,17 @@ class NodeSyncer:
         rather than printing nothing -- with no node dialled and no file
         written. A pull already in flight is left to the next readable tick.
 
-        One WARNING per episode, class only (the map's error names its path);
-        the ticks it stays unreadable go to DEBUG, and the tick that reads it
-        again says so once. Not ``_note``: one map, not one line per node."""
+        The answer names the map's error by class only; the log line carries
+        the whole error (the map's path, the parser's or the OS's words), for
+        whoever opens nodes.log to find what is torn. One WARNING per episode
+        and per change of class -- a new class is news; the ticks it stays
+        unreadable the same way go to DEBUG, and the tick that reads it again
+        says so once. Not ``_note``: one map, not one line per node."""
         cls = type(e).__name__
         text = nodes.map_unread_text(e)
         level = logging.DEBUG if self._map_error == cls else logging.WARNING
         self._map_error = cls
-        get_logger(LOG_NAME).log(level, "node sync: %s; pulling nothing", text)
+        get_logger(LOG_NAME).log(level, "node sync: %s; pulling nothing: %s", text, e)
         return dict.fromkeys(sorted(self._config.settings.nodes), (FAILED, text))
 
     def _sync_node(
