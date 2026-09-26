@@ -93,6 +93,8 @@ _BAD_ROWS = {
     "count-overflow-my-sessions": _GOOD_ROW.replace(
         '"my_sessions":1', '"my_sessions":' + "9" * 401
     ),
+    # json.loads raises RecursionError, not ValueError, past ~1000 levels.
+    "deep-nesting": "[" * 200_000 + "]" * 200_000,
 }
 
 

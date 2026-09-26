@@ -1319,7 +1319,9 @@ def parse_load_lines(lines: Iterable[str]) -> list[LoadSample]:
     for line in lines:
         try:
             samples.append(_load_sample(json.loads(line)))
-        except (KeyError, TypeError, ValueError, OverflowError):
+        # RecursionError: json.loads' answer to deep nesting, which is not a
+        # ValueError -- a corrupt line like any other.
+        except (KeyError, TypeError, ValueError, OverflowError, RecursionError):
             continue
     return samples
 
