@@ -155,7 +155,9 @@ class RemoteError(RuntimeError):
       property, ``timed_out or over_cap`` -- derived, never stored, so it can
       never drift from the two facts it rests on. It is what any retry of a
       MUTATING remote call must read (Plan F's provision): retry blindly only
-      when it is False.
+      when it is False. One caveat it cannot carry: rc ``SSH_TRANSPORT_RC``
+      (255) is ambiguous too -- ssh cannot tell "never connected" from
+      "dropped mid-call" -- so a mutation must be safe to re-run there as well.
     - ``timed_out``: did the node go silent? Only ``_spawn``'s timeout sets it.
       It is what reachability reads (node_sync counts it as unreachable). An
       over-cap reply is a node that answered, too much, so it is False there.
@@ -188,7 +190,8 @@ class RemoteError(RuntimeError):
         """May the remote command have run? Retry safety of a MUTATING remote
         call (Plan F's provision) reads THIS; reachability reads ``timed_out``;
         ``over_cap`` is the size fact. Both kills end the local ssh mid-call,
-        and neither stops a non-tty remote command."""
+        and neither stops a non-tty remote command. False does not cover an
+        rc 255 transport drop, which may also have run (see the class)."""
         return self.timed_out or self.over_cap
 
 

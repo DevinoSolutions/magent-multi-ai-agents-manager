@@ -2380,3 +2380,76 @@ class TestSessionRows:
     def test_no_node_project_is_no_rows(self, node_map, tmp_path):
         config = _pool_config(ProjectConfig(path=str(tmp_path / "loc")))
         assert nodes.session_rows(config, now=0.0) == []
+
+    def test_the_map_nick_wins_for_a_pinned_project_too(
+        self, node_map, tmp_path, monkeypatch
+    ):
+        # Re-pinned from third to second while its session still runs on
+        # third: the map says where it RUNS, the pin only where the next
+        # bring-up goes. second's fresh snapshot must not make it read dead.
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        for nick, listed in (("second", []), ("third", ["api"])):
+            nodes.write_json_atomic(
+                nodes.sessions_path(nick), {"ts": 1000.0, "sessions": listed}
+            )
+        nodes.update_node_map("api", dataclasses.replace(ENTRY, nick="third"))
+        config = _pool_config(ProjectConfig(path=str(tmp_path / "api"), node="second"))
+        assert nodes.session_rows(config, now=1010.0) == [
+            {"name": "api", "session": "api", "node": "third", "state": "live"}
+        ]
+
+    def test_an_empty_mapped_sid_falls_back_to_the_derived_one(
+        self, node_map, tmp_path, monkeypatch
+    ):
+        # _map_entry accepts "sid": "" -- that is no id at all, never a
+        # session named "" that the snapshot could not list.
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": 1000.0, "sessions": ["api"]}
+        )
+        nodes.update_node_map("api", dataclasses.replace(ENTRY, sid=""))
+        config = _pool_config(ProjectConfig(path=str(tmp_path / "api"), node="auto"))
+        assert nodes.session_rows(config, now=1010.0) == [
+            {"name": "api", "session": "api", "node": "second", "state": "live"}
+        ]
+
+    @pytest.mark.parametrize(
+        "damage", ["torn", "not-an-object", "busy"], ids=lambda d: d
+    )
+    def test_an_unreadable_map_reads_every_row_stale_never_dead(
+        self, node_map, tmp_path, monkeypatch, caplog, damage
+    ):
+        # The cq-D17 probe: a placed auto project and a pinned one running
+        # under a mapped sid, both LIVE by a fresh snapshot. A map this PC
+        # cannot read says nothing about either -- the tolerant {} would call
+        # the first unplaced and send the second looking for the derived sid.
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"),
+            {"ts": 1000.0, "sessions": ["api", "web-old"]},
+        )
+        nodes.update_node_map("api", ENTRY)
+        nodes.update_node_map("web", dataclasses.replace(ENTRY, sid="web-old"))
+        config = _pool_config(
+            ProjectConfig(path=str(tmp_path / "api"), node="auto"),
+            ProjectConfig(path=str(tmp_path / "web"), node="second"),
+        )
+        healthy = nodes.session_rows(config, now=1010.0)
+        assert [r["state"] for r in healthy] == ["live", "live"]
+        if damage == "torn":
+            text = node_map.read_text(encoding="utf-8")
+            node_map.write_text(text[: len(text) // 2], encoding="utf-8")
+        elif damage == "not-an-object":
+            node_map.write_text("[]", encoding="utf-8")
+        else:
+            monkeypatch.setattr(
+                nodes, "NODE_MAP_PATH", _Busy([PermissionError(13, "busy")] * 100)
+            )
+            monkeypatch.setattr(nodes.time, "sleep", lambda s: None)
+        with caplog.at_level("WARNING", logger="magent.nodes"):
+            rows = nodes.session_rows(config, now=1010.0)
+        assert rows == [
+            {"name": "api", "session": "api", "node": None, "state": "stale"},
+            {"name": "web", "session": "web", "node": "second", "state": "stale"},
+        ]
+        assert "node map unreadable" in caplog.text

@@ -5,7 +5,8 @@ repos, files to push, the auto-memory dir), and where node data lives on this
 PC (``~/.magent/nodes/``). Everything that touches a node or runs git is
 ``remote_mux``. A leaf: never imports magent.cli, never spawns a process. Its
 only I/O is files under ``NODES_DIR`` (the node map and the per-node
-mirror), the map's sidecar lock, and local stat()s.
+mirror), the map's sidecar lock, local stat()s, and nodes.log (via
+``magent.log``, itself a leaf).
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from typing import TYPE_CHECKING
 
 from magent.config import NODE_AUTO, NODE_CLOUD, runs_on_node
 from magent.lockfile import LockHeld, persistent_lock
+from magent.log import get_logger
 from magent.psmux import session_name
 from magent.sessions import is_ide_tool
 from magent.sessions.claude import encode_claude_project_path
@@ -1266,24 +1268,41 @@ def node_session_state(
 
 def session_rows(config: MagentConfig, *, now: float) -> list[dict[str, object]]:
     """One row per node project, config order: ``name``, ``session``,
-    ``node`` (the nick; None for an ``auto`` project not yet placed) and
-    ``state`` (``NODE_SESSION_STATES``). An unplaced project is ``dead``.
+    ``node`` (the nick; None for an ``auto`` project not yet placed, or whose
+    placement cannot be read) and ``state`` (``NODE_SESSION_STATES``). An
+    unplaced project is ``dead``.
     The map's recorded sid wins over the derived one: it is the id the
-    session was started under."""
-    entries = read_node_map()
+    session was started under.
+
+    The map is read STRICTLY: the tolerant reader's ``{}`` for a torn, busy or
+    non-object map would read as "nothing was ever placed" and turn a live
+    session dead. A map this PC cannot read says nothing about any row -- the
+    node AND the sid come from it -- so every row reads ``stale``, the same
+    law as an unreachable node, and the reason goes to nodes.log."""
+    try:
+        entries: dict[str, NodeMapEntry] | None = load_node_map_strict()
+    except (OSError, ValueError) as exc:
+        get_logger("nodes").warning(
+            "node map unreadable; every node session reads stale: %s", exc
+        )
+        entries = None
     interval = config.settings.node_sync.pull_interval_s
     rows: list[dict[str, object]] = []
     for proj in node_projects(config):
         name = project_name(proj)
-        entry = entries.get(name)
-        nick = entry.nick if entry else (None if proj.node == NODE_AUTO else proj.node)
-        sid = entry.sid if entry and entry.sid else node_sid(proj)
-        state = (
-            "dead"
-            if nick is None
-            else node_session_state(
-                sid, read_sessions(nick), pull_interval_s=interval, now=now
+        pinned = None if proj.node == NODE_AUTO else proj.node
+        if entries is None:
+            nick, sid, state = pinned, node_sid(proj), "stale"
+        else:
+            entry = entries.get(name)
+            nick = entry.nick if entry else pinned
+            sid = entry.sid if entry and entry.sid else node_sid(proj)
+            state = (
+                "dead"
+                if nick is None
+                else node_session_state(
+                    sid, read_sessions(nick), pull_interval_s=interval, now=now
+                )
             )
-        )
         rows.append({"name": name, "session": sid, "node": nick, "state": state})
     return rows
