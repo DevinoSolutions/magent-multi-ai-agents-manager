@@ -171,12 +171,16 @@ def sync_cmd(
         # No budget outlasts every cold start (measured 13 s once), so a child
         # still alive is starting, not failed -- and is never killed for being
         # slow. On Windows child.pid is the venv launcher, which lives exactly
-        # as long as the interpreter it ran.
+        # as long as the interpreter it ran -- hence "launcher": it is the only
+        # pid there is yet, and `--stop` will later name the daemon's own.
         # Future: share procs.await_registration (fix/serve-watchdog-e2e).
         if child.poll() is None:
             click.echo(
                 f"  {style('-', dim=True)} Node sync daemon still starting "
-                + style(f"(pid {child.pid}) -- see ~/.magent/logs/nodes.log", dim=True)
+                + style(
+                    f"(launcher pid {child.pid}) -- see ~/.magent/logs/nodes.log",
+                    dim=True,
+                )
             )
             return
         click.echo(

@@ -265,7 +265,7 @@ class TestNodeSync:
         assert result.exit_code == 0, result.output
         assert "failed to start" not in result.stdout
         assert (
-            "still starting (pid 4242) -- see ~/.magent/logs/nodes.log"
+            "still starting (launcher pid 4242) -- see ~/.magent/logs/nodes.log"
         ) in result.stdout
         assert len(slept) == node_cmd._START_POLLS  # waited out the budget first
         assert signals == []  # a slow child is not a failed one: never killed
