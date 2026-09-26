@@ -3462,23 +3462,26 @@ class TestDoctorShUnderRealBash:
         assert (row.status, row.detail) == ("ok", "tmux 3.4")
 
     @pytest.mark.parametrize(
-        ("tool", "status"),
-        [("git", "fail"), ("gh", "warn")],  # a required tool, and the optional one
+        ("tool", "status", "rc"),
+        # A required tool, and the optional one; distinct exit codes, so the
+        # row must name the one that happened.
+        [("git", "fail", 2), ("gh", "warn", 3)],
     )
     def test_a_failing_version_read_grades_like_a_missing_tool(
-        self, tmp_path, tool, status
+        self, tmp_path, tool, status, rc
     ):
         # Like a failing tmux -V: what a --version that exits non-zero printed
         # is not a working tool's version, so the tool reads as missing -- a
         # node with a broken git must not look fit to receive sessions.
         fakes, env = _doctor_box(tmp_path)
-        fakes[tool].set_reply("--version", stdout=f"{tool} version 2.43.0\n", rc=2)
+        fakes[tool].set_reply("--version", stdout=f"{tool} version 2.43.0\n", rc=rc)
         r = _run_doctor(env)
         assert r.returncode == 0, r.stderr
         assert _rows(r) == {**dict.fromkeys(DOCTOR_ITEMS, "ok"), tool: status}
         (row,) = [line for line in _report(r).lines if line.item == tool]
         assert (
-            row.detail == f"{tool} --version exited 2 -- reinstall {tool} on this node"
+            row.detail
+            == f"{tool} --version exited {rc} -- reinstall {tool} on this node"
         )
 
     def test_a_missing_tool_fails_but_a_missing_gh_only_warns(self, tmp_path):
