@@ -214,6 +214,47 @@ class TestTheWindowTitleIsTheOneTheSpawnUsed:
         assert argvs == []
 
 
+class TestTheOutcomeCarriesTheWindowsTitle:
+    """Tiling (Task 12) places node windows by the title the spawn used, so
+    the outcome hands it on -- and None whenever no window opened."""
+
+    @pytest.fixture
+    def windows(self, monkeypatch):
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+
+    def test_a_fresh_bring_up_names_the_window_it_opened(self, rig, api, windows):
+        outcome = launch.bring_up_node_project(_config(api), api, window=True)
+        assert outcome.title == "magent:api"
+
+    def test_attaching_instead_names_the_window_too(self, rig, api, tmp_path, windows):
+        _hold("second")
+        rig.live = True
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        outcome = launch.bring_up_node_project(_config(api), api, window=True)
+        assert (outcome.attached_existing, outcome.title) == (True, "magent:api")
+
+    def test_no_window_asked_is_no_title(self, rig, api, windows):
+        assert launch.bring_up_node_project(_config(api), api).title is None
+
+    def test_a_window_that_failed_to_spawn_is_no_title(
+        self, rig, api, monkeypatch, windows
+    ):
+        def no_wt(*_a: object, **_k: object) -> str:
+            raise FileNotFoundError("wt")
+
+        monkeypatch.setattr("magent.attach_client.spawn_attach_window", no_wt)
+        outcome = launch.bring_up_node_project(_config(api), api, window=True)
+        assert (outcome.ok, outcome.title) == (True, None)
+
+    def test_a_failed_bring_up_is_no_title(self, rig, api, windows):
+        rig.error = RemoteError(5, "magent: clone failed", ("bring_up",))
+        outcome = launch.bring_up_node_project(_config(api), api, window=True)
+        assert (outcome.ok, outcome.title) == (False, None)
+        assert rig.windows == []
+
+
 class TestD7RefusesWhatTheNodeCouldNotReproduce:
     def test_a_dirty_tree_names_allow_dirty_and_nothing_is_dialed(
         self, rig, api, tmp_path

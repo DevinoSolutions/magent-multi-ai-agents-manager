@@ -1342,7 +1342,8 @@ class NodeBringUpOutcome:
     """One node project's bring-up, for the shells to print. ``error`` is the
     whole user-facing reason when ``ok`` is False; ``warnings`` are true but
     non-fatal (an unshippable ``push`` entry, a refusal that was moot because
-    the session was already running)."""
+    the session was already running). ``title`` is the one the attach window
+    opened under -- what tiling places it by -- or None when none opened."""
 
     ok: bool
     sid: str
@@ -1350,6 +1351,7 @@ class NodeBringUpOutcome:
     error: str | None = None
     attached_existing: bool = False
     warnings: tuple[str, ...] = ()
+    title: str | None = None
 
 
 # One bring-up per node at a time, within this process: two sessions' first
@@ -1517,8 +1519,7 @@ def bring_up_node_project(
                 # What is uncommitted HERE does not touch a session already
                 # running there: attach to it, and keep the refusal as a warning.
                 remote_mux.decorate(node, held.sid, nick)
-                if window:
-                    _open_node_window(node, held.sid)
+                title = _open_node_window(node, held.sid) if window else None
                 log.info(
                     "node %s: %s already running; attached despite: %s",
                     nick,
@@ -1531,6 +1532,7 @@ def bring_up_node_project(
                     node=nick,
                     attached_existing=True,
                     warnings=tuple(refusals),
+                    title=title,
                 )
             log.info("node %s: refused %s: %s", nick, sid, refusals)
             return NodeBringUpOutcome(
@@ -1573,8 +1575,7 @@ def bring_up_node_project(
                     *warnings,
                     f"up on @{nick} but not recorded ({cause}); re-run magent up",
                 )
-        if window:
-            _open_node_window(node, result.sid)
+        title = _open_node_window(node, result.sid) if window else None
         log.info(
             "node %s: %s up (attached_existing=%s)",
             nick,
@@ -1587,6 +1588,7 @@ def bring_up_node_project(
             node=nick,
             attached_existing=result.attached_existing,
             warnings=warnings,
+            title=title,
         )
     except (ValueError, remote_mux.RemoteError, OSError) as exc:
         # ValueError covers NodeConfigError (its subclass) and a recipe that
