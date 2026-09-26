@@ -63,7 +63,9 @@ def deny_stat(
 
     def refusing(path: object, *args: object, **kwargs: object) -> os.stat_result:
         if isinstance(path, (str, os.PathLike)) and os.fspath(path) in names:
-            raise OSError(code, os.strerror(code), os.fspath(path), winerror)
+            error = (code, os.strerror(code), os.fspath(path))
+            # A None winerror would read "[WinError None]"; no real one does.
+            raise OSError(*error) if winerror is None else OSError(*error, winerror)
         return real_stat(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "stat", refusing)

@@ -1244,6 +1244,8 @@ class TestUnknownIsNeverAbsent:
         with pytest.raises(OSError) as exc:
             nodes.path_mode(tmp_path)
         assert exc.value.errno == code
+        # Worded as the OS words it: no "[WinError None]" a real one never has.
+        assert str(exc.value) == str(OSError(code, os.strerror(code), str(tmp_path)))
         for check in (nodes.path_exists, nodes.path_is_dir, nodes.path_is_file):
             with pytest.raises(OSError):
                 check(tmp_path)
