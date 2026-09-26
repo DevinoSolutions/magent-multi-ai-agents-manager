@@ -12,7 +12,6 @@ of a transcript IS its session id; subagent logs (agent-*.jsonl, anything under
 from __future__ import annotations
 
 import io
-import json
 import logging
 import os
 import shlex
@@ -3150,12 +3149,10 @@ class TestRecallSaysUnknownNeverAbsentOrATraceback:
             path.mkdir()  # there, and it cannot be read
         else:
             path.write_text(body[damage], encoding="utf-8")
-        if damage in ("not-an-object", "not-a-record"):
-            cls = "ValueError"
-        else:
-            with pytest.raises((OSError, ValueError)) as info:
-                json.loads(path.read_text(encoding="utf-8"))
-            cls = type(info.value).__name__
+        # What the reader itself raises: the log must carry all of it.
+        with pytest.raises((OSError, ValueError)) as info:
+            nodes.read_repo_record("second", "api")
+        cls, detail = type(info.value).__name__, str(info.value)
 
         result = _recall(runner, placed_api, "--local")
 
@@ -3165,4 +3162,5 @@ class TestRecallSaysUnknownNeverAbsentOrATraceback:
             in result.stdout
         )
         assert "check the node before relying on `git pull`" in result.stdout
-        assert _node_logs(caplog), "the full error goes to nodes.log"
+        assert detail not in result.output
+        assert any(detail in m for m in _node_logs(caplog)), _node_logs(caplog)
