@@ -688,7 +688,7 @@ def _recall_local(
     if pulled.is_dir():
         try:
             # --to's rules (cq-G14 M3): no link followed, no pull temp copied.
-            remote_mux.copy_mirror(pulled, dest)
+            replaced = remote_mux.copy_mirror(pulled, dest)
         except remote_mux.MirrorIsALink as exc:
             # No re-run fixes a linked mirror: the user must look at it.
             _fail(
@@ -700,6 +700,13 @@ def _recall_local(
                 f"could not install the conversation into {dest} ({exc});"
                 f" {name} stays placed on @{held.nick} -- run the recall again",
                 1,
+            )
+        if replaced:
+            # Said aloud, like --to's KEPT lines (cq-G14 M2): a local file the
+            # node's copy overwrote is work this PC may have had.
+            _note(
+                f"replaced {len(replaced)} file(s) already in {dest} with the"
+                f" node's copy: {', '.join(replaced)}"
             )
         _ok(f"installed the conversation into {dest}")
     else:

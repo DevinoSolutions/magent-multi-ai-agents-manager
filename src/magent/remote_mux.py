@@ -21,6 +21,7 @@ leaves ``attach_client``, ``log``, ``node_scripts`` and ``nodes``.
 from __future__ import annotations
 
 import contextlib
+import filecmp
 import functools
 import io
 import json
@@ -1361,19 +1362,30 @@ def _tar_dir(source: Path) -> bytes:
     return buf.getvalue()
 
 
-def copy_mirror(source: Path, dest: Path) -> None:
+def copy_mirror(source: Path, dest: Path) -> tuple[str, ...]:
     """Install the pulled transcripts dir ``source`` into ``dest`` on THIS PC
     by the rule ``_tar_dir`` sends it to a node by (``_mirror_members``): the
     ``recall --local`` twin of ``install_transcripts``. What ``dest`` already
-    holds is kept; a same-name file is replaced by the node's copy.
-    MirrorIsALink when ``source`` is itself a link; any other OSError
-    propagates, possibly after a partial copy that a re-run overwrites."""
+    holds is kept; a same-name file is replaced by the node's copy, and the
+    names (relative, '/'-separated, sorted) of those whose content DIFFERED
+    are returned for the caller to report. MirrorIsALink when ``source`` is
+    itself a link; any other OSError propagates, possibly after a partial copy
+    that a re-run overwrites."""
     members = set(_mirror_members(source, who="copy_mirror"))
+    replaced: list[str] = []
 
     def _not_members(folder: str, names: list[str]) -> list[str]:
         return [name for name in names if Path(folder, name) not in members]
 
-    shutil.copytree(source, dest, ignore=_not_members, dirs_exist_ok=True)
+    def _copy(src: str, dst: str) -> object:
+        if os.path.isfile(dst) and not filecmp.cmp(src, dst, shallow=False):
+            replaced.append(Path(dst).relative_to(dest).as_posix())
+        return shutil.copy2(src, dst)
+
+    shutil.copytree(
+        source, dest, ignore=_not_members, copy_function=_copy, dirs_exist_ok=True
+    )
+    return tuple(sorted(replaced))
 
 
 def node_realpath(node: Node, path: str, *, timeout_s: float) -> str:

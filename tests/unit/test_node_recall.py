@@ -2266,6 +2266,41 @@ class TestTheLocalInstallFollowsTheTarRules:
         assert "api" in nodes.read_node_map()
         assert not _claude_dir(api_repo).exists()
 
+    def test_a_local_file_the_nodes_copy_replaced_is_named(
+        self, runner, placed_api, node_answers, api_repo
+    ):
+        # cq-G14 M2: the node's copy wins a same-name file, as --to's install
+        # does -- and, as --to does, the recall says so.
+        dest = _claude_dir(api_repo)
+        (dest / "memory").mkdir(parents=True)
+        (dest / f"{SESSION_ID}.jsonl").write_text("local turns\n", encoding="utf-8")
+        (dest / "memory" / "MEMORY.md").write_text("- edited here\n", encoding="utf-8")
+        (dest / "local.jsonl").write_text("{}\n", encoding="utf-8")
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 0
+        assert (
+            f"replaced 2 file(s) already in {dest} with the node's copy:"
+            f" {SESSION_ID}.jsonl, memory/MEMORY.md"
+        ) in result.stdout
+        assert (dest / "memory" / "MEMORY.md").read_text(
+            encoding="utf-8"
+        ) == "- remember\n"
+        assert (dest / "local.jsonl").exists()
+
+    def test_a_same_content_file_is_not_called_replaced(
+        self, runner, placed_api, node_answers, api_repo
+    ):
+        dest = _claude_dir(api_repo)
+        (dest / "memory").mkdir(parents=True)
+        (dest / "memory" / "MEMORY.md").write_text("- remember\n", encoding="utf-8")
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 0
+        assert "replaced" not in result.stdout
+
     @pytest.mark.skipif(
         sys.platform == "win32",
         reason="a file symlink needs admin or developer mode on Windows",
