@@ -17,6 +17,7 @@ be taken.
 
 from __future__ import annotations
 
+import logging
 import time
 
 import pytest
@@ -641,9 +642,9 @@ class TestAnUnreadableMapPlacesNoAutoProject:
     @pytest.fixture(params=["torn", "busy"])
     def unreadable_map(self, request, monkeypatch):
         """Make the map unreadable -- AFTER the test recorded what it holds --
-        and return the error class a reader then meets."""
+        and return ``(class name, str(error))`` of what a reader then meets."""
 
-        def make() -> str:
+        def make() -> tuple[str, str]:
             if request.param == "torn":
                 nodes.NODE_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
                 nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
@@ -651,13 +652,15 @@ class TestAnUnreadableMapPlacesNoAutoProject:
                 # here, the plain ValueError once sub-plan D's reader wraps it.
                 with pytest.raises(ValueError) as torn:
                     nodes.load_node_map_strict()
-                return type(torn.value).__name__
+                return type(torn.value).__name__, str(torn.value)
+
+            busy_error = PermissionError(13, "The process cannot access the file")
 
             def busy() -> dict[str, nodes.NodeMapEntry]:
-                raise PermissionError(13, "The process cannot access the file")
+                raise busy_error
 
             monkeypatch.setattr(nodes, "load_node_map_strict", busy)
-            return "PermissionError"
+            return "PermissionError", str(busy_error)
 
         return make
 
@@ -670,7 +673,7 @@ class TestAnUnreadableMapPlacesNoAutoProject:
         seed_history("second", "quiet")
         seed_history("third", "bursty")
         config = pool("second", "third", projects=[_auto("api")])
-        cls = unreadable_map()
+        cls, _ = unreadable_map()
 
         placed = launch.place_node_projects(config, config.projects, now=NOW)
 
@@ -683,8 +686,8 @@ class TestAnUnreadableMapPlacesNoAutoProject:
             )
         ]
         assert placed.notes == []
-        # D17: the node is None, not a guess.
-        assert placed.placements["api"].nick is None
+        # D17: the node is None, not a guess -- and unknown, not "no data".
+        assert placed.placements.get("api") == nodes.Placement(None, "unknown")
         # Nothing will be placed, so no node is dialed to be scored.
         assert remote_samples == []
 
@@ -692,13 +695,31 @@ class TestAnUnreadableMapPlacesNoAutoProject:
         self, remote_samples, unreadable_map
     ):
         config = pool("second", projects=[_auto("api")])
-        unreadable_map()
+        cls, detail = unreadable_map()
 
-        (note,) = launch.place_node_projects(config, config.projects, now=NOW).refused
+        refused = launch.place_node_projects(config, config.projects, now=NOW).refused
 
-        assert "torn" not in note
-        assert "cannot access" not in note
+        assert len(refused) == 1, refused
+        note = refused[0]
+        assert f"({cls})" in note
+        # The reader's own words (the parser's, the OS's) never reach the screen.
+        assert detail not in note
         assert "\n" not in note
+
+    def test_the_full_error_goes_to_nodes_log(
+        self, remote_samples, unreadable_map, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        config = pool("second", projects=[_auto("api")])
+        _, detail = unreadable_map()
+
+        refused = launch.place_node_projects(config, config.projects, now=NOW).refused
+
+        logged = [r.getMessage() for r in caplog.records if r.name == "magent.nodes"]
+        # The screen gets the class only; the log is where the rest goes.
+        assert any(detail in m for m in logged), logged
+        assert refused, "the refusal itself must still be there"
+        assert all(detail not in line for line in refused)
 
     def test_pinned_and_local_projects_pass_through_untouched(
         self, remote_samples, unreadable_map
@@ -716,7 +737,10 @@ class TestAnUnreadableMapPlacesNoAutoProject:
         assert len(placed.projects) == 2
         assert placed.projects[0] is local
         assert placed.projects[1] is pinned
-        assert sorted(placed.placements) == ["api", "db"]
+        assert placed.placements == {
+            "api": nodes.Placement(None, "unknown"),
+            "db": nodes.Placement(None, "unknown"),
+        }
         assert [n.split(":")[0] for n in placed.refused] == ["api", "db"]
 
     def test_the_placer_writes_nothing_from_a_failed_read(
@@ -750,7 +774,7 @@ class TestAnUnreadableMapPlacesNoAutoProject:
         monkeypatch.setattr(launch, "_launch_projects", _capture)
         local = ProjectConfig(path="/work/x", title="x")
         config = pool("second", "third", projects=[local, _auto("api")])
-        cls = unreadable_map()
+        cls, _ = unreadable_map()
 
         with pytest.raises(_StopBeforeLaunch):
             launch.run_magent(config, RunOpts(dry_run=True))
@@ -778,5 +802,7 @@ class TestAnUnreadableMapPlacesNoAutoProject:
         with pytest.raises(_StopBeforeLaunch):
             launch.run_magent(config, RunOpts(dry_run=True))
 
-        (line,) = [ln for ln in capsys.readouterr().out.splitlines() if "api:" in ln]
-        assert line.lstrip().startswith("<red>x api: the node map is unreadable")
+        out = capsys.readouterr().out
+        lines = [ln for ln in out.splitlines() if "api:" in ln]
+        assert len(lines) == 1, out
+        assert lines[0].lstrip().startswith("<red>x api: the node map is unreadable")
