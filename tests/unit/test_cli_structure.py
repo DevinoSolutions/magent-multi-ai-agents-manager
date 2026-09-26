@@ -158,11 +158,15 @@ HELP_SNAPSHOTS = {
     ): "Usage: main config path [OPTIONS]\n\n  Print the config file path.\n\nOptions:\n  --help  Show this message and exit.\n",
     (
         "node",
-    ): "Usage: main node [OPTIONS] COMMAND [ARGS]...\n\n  Run projects on a pool of Linux machines over ssh.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  doctor  Check a node, or every node: tools, the Claude login, the node's...\n  sync    Mirror every node's sessions, load and agent state onto this PC.\n",
+    ): "Usage: main node [OPTIONS] COMMAND [ARGS]...\n\n  Run projects on a pool of Linux machines over ssh.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  doctor  Check a node, or every node: tools, the Claude login, the node's...\n  setup   Prepare a machine once: packages, a per-person user, your key,...\n  sync    Mirror every node's sessions, load and agent state onto this PC.\n",
     (
         "node",
         "doctor",
     ): "Usage: main node doctor [OPTIONS] [NICK]\n\n  Check a node, or every node: tools, the Claude login, the node's GitHub key,\n  locale, disk, and this PC's sync daemon and snapshot.\n\n  Exit 0 when nothing failed (warnings allowed), 1 when a check failed, 2 when\n  NICK is not in settings.nodes.\n\nOptions:\n  --json  Print the rows as JSON\n  --help  Show this message and exit.\n",
+    (
+        "node",
+        "setup",
+    ): "Usage: main node setup [OPTIONS] NICK\n\n  Prepare a machine once: packages, a per-person user, your key, Claude Code and\n  the node's own GitHub key, then the user scope and a check.\n\n  Logs in as root@<host> for this one hop. Idempotent: every step prints\n  ok/did/skip. The Claude login is NOT copied: run `ssh <user>@<host> claude`\n  once. Exit 0 when only that login is left, 1 when a step failed, 2 when\n  nothing was sent (unknown nick, bad user name, no public key).\n\nOptions:\n  --user TEXT  A Unix user to create on the node (repeatable; default: the\n               node's user).\n  --key FILE   This PC's ssh PUBLIC key to authorize (default:\n               ~/.ssh/id_ed25519.pub, then id_ecdsa, id_rsa).\n  --help       Show this message and exit.\n",
     (
         "node",
         "sync",
@@ -192,7 +196,7 @@ TOP_LEVEL_COMMANDS = [
     "watch",
 ]
 TERMINAL_SUBCOMMANDS = ["install", "status"]
-NODE_SUBCOMMANDS = ["doctor", "sync"]
+NODE_SUBCOMMANDS = ["doctor", "setup", "sync"]
 CONFIG_SUBCOMMANDS = [
     "add",
     "base-dir",

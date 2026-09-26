@@ -1,19 +1,22 @@
 """`magent node`: run projects on a pool of Linux machines over ssh.
 
 This module holds `node sync`, the daemon that mirrors the pool onto this PC,
-and `node doctor`; the other subcommands arrive with their own sub-plans. Exit
-codes and lines live here, the work in magent.node_sync, magent.nodes and
-magent.remote_mux (imported in-body: the registration hub imports every
-command module, and `magent --help` must not pay for ssh and tar).
+`node doctor` and `node setup`; the other subcommands arrive with their own
+sub-plans. Exit codes and lines live here, the work in magent.node_sync,
+magent.nodes and magent.remote_mux (imported in-body: the registration hub
+imports every command module, and `magent --help` must not pay for ssh and
+tar).
 """
 
 from __future__ import annotations
 
 import dataclasses
 import json
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn
 
 import click
@@ -31,7 +34,7 @@ if TYPE_CHECKING:
 
     from magent.config import MagentConfig
     from magent.nodes import Node
-    from magent.remote_mux import RemoteError, ScriptLine
+    from magent.remote_mux import ProvisionReport, RemoteError, ScriptLine
 
 # How long `node sync -d` waits for the detached child to record its pid.
 _START_POLLS = 20
@@ -289,7 +292,7 @@ def node_checks(cfg: MagentConfig, nick: str, *, now: float) -> list[ScriptLine]
     into one too. Read-only: it never provisions (DECISION-24 wires
     provisioning into ``node setup`` and the bring-up, not the doctor)."""
     # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
-    from magent import nodes, remote_mux
+    from magent import nodes
     from magent.remote_mux import ScriptLine
 
     try:
@@ -300,23 +303,34 @@ def node_checks(cfg: MagentConfig, nick: str, *, now: float) -> list[ScriptLine]
     # snapshot the daemon pulls meanwhile is stamped after `now` -- read later,
     # a healthy node would read as a clock that moved back.
     local = sync_lines(cfg, nick, now=now)
+    return [*_doctor_rows(node), *local]
+
+
+def _doctor_rows(node: Node) -> list[ScriptLine]:
+    """doctor.sh's rows for ``node``, one ssh call -- ``node doctor``'s and
+    ``node setup``'s alike. An unreachable node is one ``fail reach`` row, and
+    a login that printed no row at all is one ``fail doctor`` row."""
+    # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
+    from magent import remote_mux
+    from magent.remote_mux import ScriptLine
+
     try:
         remote = list(
             remote_mux.doctor(node, timeout_s=remote_mux.DOCTOR_TIMEOUT_S).lines
         )
     except remote_mux.RemoteError as exc:
-        remote = [_unreachable(node, exc)]
+        return [_unreachable(node, exc)]
     if not remote:
         # Exit 0 and not one row: a ForceCommand, a MOTD-only login -- doctor.sh
         # never ran, and silence is not health.
-        remote = [
+        return [
             ScriptLine(
                 "fail",
                 "doctor",
                 "the node printed no doctor rows -- a restricted login (ForceCommand)?",
             )
         ]
-    return [*remote, *local]
+    return remote
 
 
 def _checks_or_crash_row(
@@ -407,3 +421,229 @@ def node_doctor_cmd(ctx: click.Context, nick: str | None, as_json: bool) -> None
         click.echo(f"  {style(f'{failures} check(s) failed.', fg='red', bold=True)}")
         sys.exit(1)
     click.echo(f"  {style('No failures.', fg='green', bold=True)}")
+
+
+# The Unix user rule setup.sh enforces (its USER_RE), checked here too so a
+# typo costs no ssh. fullmatch: `$` would let a trailing newline through.
+_USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+_DEFAULT_PUBKEYS = ("id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub")
+
+
+def _pubkey(key_file: Path | None) -> str:
+    """This PC's public key line: ``key_file``, or the first default under
+    ~/.ssh. Raises ValueError with the message to print; the file's content
+    is never part of it -- a mistaken file may hold a secret."""
+    # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
+    from magent.remote_mux import SSH_KEY_TYPE_PREFIXES
+
+    if key_file is None:
+        ssh_dir = Path.home() / ".ssh"
+        key_file = next(
+            (ssh_dir / name for name in _DEFAULT_PUBKEYS if (ssh_dir / name).is_file()),
+            None,
+        )
+        if key_file is None:
+            raise ValueError(
+                f"no public key in {ssh_dir} -- pass one: --key <file.pub>"
+            )
+    try:
+        text = key_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"cannot read {key_file}: {type(exc).__name__}") from exc
+    if "PRIVATE KEY" in text:
+        raise ValueError(
+            f"{key_file} is a PRIVATE key -- pass its .pub file with --key"
+        )
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    # A key line opens with its type; setup.sh checks the same, after the hop.
+    if (
+        len(lines) != 1
+        or len(lines[0].split()) < 2
+        or not lines[0].startswith(SSH_KEY_TYPE_PREFIXES)
+    ):
+        raise ValueError(f"{key_file} is not one ssh public key line")
+    return lines[0]
+
+
+def _step_failed(node: Node, exc: RemoteError, step: str) -> ScriptLine:
+    """A setup step's ssh failure as a row. A timed-out step is not
+    "unreachable": killing the local ssh does not stop the remote command, so
+    its outcome is unknown and it may still be running there. Nothing is ever
+    sent again on its own -- the user reruns setup, which is idempotent."""
+    # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
+    from magent.remote_mux import ScriptLine
+
+    # D-MERGE: read exc.outcome_unknown (D17) once D lands -- a call killed
+    # for an over-cap reply is unknown too, and timed_out misses it.
+    if not exc.timed_out:
+        return _unreachable(node, exc)
+    return ScriptLine(
+        "fail",
+        "reach",
+        (
+            f"no answer from {node.target} ({exc.stderr_tail.strip()}) -- {step} "
+            "may still be running there: rerun magent node setup once it has "
+            "finished (every step is idempotent)"
+        ),
+    )
+
+
+def _provision_and_check(node: Node, cfg: MagentConfig) -> list[ScriptLine]:
+    """A freshly set-up user: the whole user scope (forced), then the node's
+    health rows. The scope is built by ``remote_mux.provision_node``, THE
+    provisioning body (DECISION-24) -- the same call the bring-up makes, so
+    setup and ``--go`` can never ship different scopes. A provision that did
+    not finish gets no doctor: its row already says why."""
+    # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
+    from magent import remote_mux
+
+    try:
+        rows = list(
+            remote_mux.provision_node(
+                node,
+                cfg,
+                home=Path.home(),
+                timeout_s=remote_mux.PROVISION_TIMEOUT_S,
+                force=True,
+            ).lines
+        )
+    except remote_mux.RemoteError as exc:
+        return [_step_failed(node, exc, "the provision")]
+    return rows + _doctor_rows(node)
+
+
+def _missing_keys(report: ProvisionReport, names: Sequence[str]) -> list[ScriptLine]:
+    """A ``fail`` row for each user setup.sh sent no key for, when nothing
+    else failed: exit 0 with no row for them (a ForceCommand, a MOTD-only
+    root login) means setup.sh never ran, and silence is not success."""
+    # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
+    from magent.remote_mux import ScriptLine
+
+    if report.failed:
+        return []
+    keys = report.keys()
+    return [
+        ScriptLine(
+            "fail",
+            f"node-key:{name}",
+            (
+                f"no node key came back for {name} -- setup.sh did not run to "
+                "the end (a restricted root login, ForceCommand?)"
+            ),
+        )
+        for name in names
+        if name not in keys
+    ]
+
+
+def _root_hop(node: Node, names: list[str], pubkey: str) -> ProvisionReport:
+    """setup.sh as ``root@<host>``, this once. An ssh failure prints its row
+    and exits 1: nothing after it can run without the users it creates."""
+    # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
+    from magent import remote_mux
+
+    root = dataclasses.replace(node, user="root")
+    try:
+        # setup_node's own budget grows with the users; never pass one in.
+        return remote_mux.setup_node(node, names, pubkey)
+    except remote_mux.RemoteError as exc:
+        _print_rows([_step_failed(root, exc, "setup")])
+        if not exc.timed_out:
+            click.echo(
+                "    setup logs in as root once, with this PC's ssh key: check "
+                f"that `ssh {root.target} true` works without a password prompt"
+            )
+        sys.exit(1)
+
+
+@node_group.command("setup")
+@click.argument("nick")
+@click.option(
+    "--user",
+    "users",
+    multiple=True,
+    help="A Unix user to create on the node (repeatable; default: the node's user).",
+)
+@click.option(
+    "--key",
+    "key_file",
+    type=click.Path(dir_okay=False, path_type=Path),
+    help=(
+        "This PC's ssh PUBLIC key to authorize (default: ~/.ssh/id_ed25519.pub, "
+        "then id_ecdsa, id_rsa)."
+    ),
+)
+@click.pass_context
+def node_setup_cmd(
+    ctx: click.Context, nick: str, users: tuple[str, ...], key_file: Path | None
+) -> None:
+    """Prepare a machine once: packages, a per-person user, your key, Claude
+    Code and the node's own GitHub key, then the user scope and a check.
+
+    Logs in as root@<host> for this one hop. Idempotent: every step prints
+    ok/did/skip. The Claude login is NOT copied: run `ssh <user>@<host> claude`
+    once. Exit 0 when only that login is left, 1 when a step failed, 2 when
+    nothing was sent (unknown nick, bad user name, no public key).
+    """
+    # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
+    from magent import nodes, remote_mux
+
+    cfg = _load_config_or_exit(find_config(ctx.obj.get("config_path")))
+    try:
+        node = nodes.node_for_nick(cfg, nick, local_user=env.local_username())
+        pubkey = _pubkey(key_file)
+    except ValueError as exc:
+        _refuse(str(exc))
+    names = list(users) or [node.user]
+    for name in names:
+        if not _USER_RE.fullmatch(name):
+            _refuse(f"not a valid Unix user name: {name}")
+        if name == "root":
+            _refuse("root is not a node user: name a person's own account")
+
+    click.echo(
+        f"  {style('magent node setup', bold=True)} {nick}  "
+        f"{style(f'as root@{node.host}, this once', dim=True)}"
+    )
+    report = _root_hop(node, names, pubkey)
+    # A key row is the node's public key: it goes to GitHub, not the screen.
+    rows = [line for line in report.lines if line.status != "key"]
+    rows += _missing_keys(report, names)
+    _print_rows(rows)
+
+    keys = report.keys()
+    ready = [name for name in names if name in keys]
+    github = [
+        remote_mux.register_ssh_key(keys[name], title=f"magent {name}@{node.host}")
+        for name in ready
+    ]
+    if github:
+        click.echo()
+        click.echo(f"  {style('GitHub', bold=True)}")
+        _print_rows(github)
+    rows += github
+
+    no_login: list[str] = []
+    for name in ready:
+        user_node = dataclasses.replace(node, user=name)
+        click.echo()
+        click.echo(f"  {style(user_node.target, bold=True)}")
+        checked = _provision_and_check(user_node, cfg)
+        _print_rows(checked)
+        rows += checked
+        if any(r.item == "claude-login" and r.status != "ok" for r in checked):
+            no_login.append(user_node.target)
+
+    # The Claude login is manual by design (D5): its row is the one fail that
+    # is a step still to take, not a step that broke.
+    failed = [r for r in rows if r.status == "fail" and r.item != "claude-login"]
+    click.echo()
+    for target in no_login:
+        click.echo(
+            f"  {style('!', fg='yellow', bold=True)} last step, by hand, once: "
+            f"ssh {target} claude  {style('(log in; magent never copies it)', dim=True)}"
+        )
+    if failed:
+        click.echo(f"  {style(f'{len(failed)} step(s) failed.', fg='red', bold=True)}")
+        sys.exit(1)
+    click.echo(f"  {style('Ready.', fg='green', bold=True)}")
