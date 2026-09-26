@@ -690,17 +690,22 @@ def _stop_session(source: Node | None, held: NodeMapEntry) -> None:
 
 def _clear_placement(name: str, held: NodeMapEntry) -> None:
     """Drop ``name`` from the node map through D's one writer. A lock another
-    process keeps past its wait (``LockHeld``, an OSError -- DECISION-13) or a
-    failed write is a printed failure, never a traceback. By then the session
-    is already stopped, so a re-run only redoes the install and the clear."""
+    process keeps past its wait (``LockHeld``, an OSError -- DECISION-13), a
+    map that is busy or torn by now (the strict read's OSError / ValueError)
+    or a failed write is a printed failure, never a traceback. By then the
+    session is already stopped, so a re-run only redoes the install and the
+    clear. The error CLASS only on screen: the full error goes to nodes.log."""
     from magent import nodes  # heavy subsystem: in-body per policy
 
     try:
         nodes.update_node_map(name, None)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        log.get_logger("nodes").warning(
+            "recall could not clear %s's placement: %s", name, exc
+        )
         _fail(
-            f"could not clear {name}'s placement on @{held.nick} ({exc});"
-            " run the recall again",
+            f"could not clear {name}'s placement on @{held.nick}"
+            f" ({type(exc).__name__}); run the recall again",
             1,
         )
 
@@ -853,7 +858,12 @@ def recall_cmd(ctx: click.Context, project: str, to_local: bool) -> None:
     try:
         held = nodes.load_node_map_strict().get(name)
     except (OSError, ValueError) as exc:
-        _fail(f"could not read the node map ({exc}); run the recall again", 1)
+        # The error CLASS only on screen: str(exc) carries the map's path.
+        log.get_logger("nodes").warning("recall could not read the node map: %s", exc)
+        _fail(
+            f"could not read the node map ({type(exc).__name__}); run the recall again",
+            1,
+        )
     if held is None:
         _fail(
             f"{name} is not placed on a node -- there is nothing to recall",
