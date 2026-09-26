@@ -43,11 +43,9 @@ budget: a blocked wait does not fail a test, it burns the job's
 
 from __future__ import annotations
 
-import contextlib
 import http.client
 import json
 import os
-import signal
 import socket
 import subprocess
 import sys
@@ -58,6 +56,8 @@ from typing import TYPE_CHECKING
 import pytest
 
 from magent.procs import pid_alive
+from tests.e2e._procs import kill_everything_carrying
+from tests.e2e._procs import kill_pid as _kill_pid
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -141,110 +141,6 @@ def _read_pid(path: Path) -> int | None:
         return int(path.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return None
-
-
-def _kill_pid(pid: int | None) -> None:
-    """Kill exactly one pid (its tree, on Windows) and tolerate it already being
-    gone. Never raises. Only ever called with a pid this test created."""
-    if not pid:
-        return
-    if sys.platform == "win32":
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            capture_output=True,
-            check=False,
-        )
-        return
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        return
-    for _ in range(30):
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return
-        time.sleep(0.1)
-    with contextlib.suppress(OSError):
-        os.kill(pid, signal.SIGKILL)
-
-
-def _pids_whose_argv_contains(marker: str) -> list[int]:
-    """Every live process whose command line contains ``marker``, this one
-    excluded.
-
-    ``marker`` is the test's own uuid-named config path, which every process
-    this test causes carries in its argv: the daemon (``--config <cfg>``) and
-    every server it spawns (``upload_server_argv`` forwards the same
-    ``--config``). That makes this the one enumeration that still finds them
-    when the launcher exited nonzero and no pid was ever learned -- and the
-    uuid is what keeps it from matching anything else on the machine, least of
-    all by image name.
-    """
-    if sys.platform == "win32":
-        out = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                (
-                    "Get-CimInstance Win32_Process | "
-                    "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
-                ),
-            ],
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=60,
-            check=False,
-        ).stdout
-        try:
-            rows = json.loads(out or "[]")
-        except ValueError:
-            return []
-        if isinstance(rows, dict):
-            rows = [rows]
-        found = [
-            (row.get("ProcessId"), row.get("CommandLine") or "")
-            for row in rows
-            if isinstance(row, dict)
-        ]
-    else:
-        out = subprocess.run(
-            ["ps", "-eo", "pid=,args="],
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=30,
-            check=False,
-        ).stdout
-        found = []
-        for line in out.splitlines():
-            head, _, args = line.strip().partition(" ")
-            if head.isdigit():
-                found.append((int(head), args))
-    return [
-        pid
-        for pid, argv in found
-        if isinstance(pid, int) and pid != os.getpid() and marker in argv
-    ]
-
-
-def _kill_everything_this_test_started(w: _World) -> None:
-    """Teardown's last word: kill every process carrying this test's marker.
-
-    The pid files are not enough on their own. When ``attention -d`` exits
-    nonzero the test never learns the daemon's pid, yet the daemon may still
-    come up behind it -- and, in the supervising test, spawn a server. Killing
-    the daemon first can race a spawn already in flight, so this sweeps until
-    a pass finds nothing (bounded)."""
-    for _ in range(3):
-        pids = _pids_whose_argv_contains(str(w.cfg))
-        if not pids:
-            return
-        for pid in pids:
-            _kill_pid(pid)
-        time.sleep(0.5)
 
 
 def _install_psmux_shim(shim_dir: Path) -> str:
@@ -482,7 +378,7 @@ class TestAttentionDaemonSupervisesTheUploadServer:
                 seen_servers.append(late)
             for pid in seen_servers:
                 _kill_pid(pid)
-            _kill_everything_this_test_started(w)
+            kill_everything_carrying(str(w.cfg))
 
     def test_the_opt_out_leaves_the_server_dead(self, tmp_path):
         """MAGENT_UPLOAD_SUPERVISOR=0 is a promise, not a preference: a user who
@@ -504,4 +400,4 @@ class TestAttentionDaemonSupervisesTheUploadServer:
         finally:
             _kill_pid(daemon_pid or _read_pid(w.daemon_pidfile))
             _kill_pid(_read_pid(w.server_pidfile))
-            _kill_everything_this_test_started(w)
+            kill_everything_carrying(str(w.cfg))
