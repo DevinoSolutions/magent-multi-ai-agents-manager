@@ -689,6 +689,44 @@ class TestF2FindsANodeFolder:
     def test_an_entry_from_before_pr_d_has_no_target_and_is_none(self):
         assert nodes.open_target("api", {"api": ENTRY}) is None
 
+    # A map value reaches an editor argv, so open_target vets it the way the
+    # bring-up writer did (remote_mux._clean_absolute) and falls through to
+    # /api/sessions on anything else -- a tampered or buggy map (cq-D15 m2).
+    @pytest.mark.parametrize(
+        "cwd",
+        [
+            "magent/api",  # relative: a Remote-SSH folder must be absolute
+            "~/magent/api",  # the ~ a folder URI never expands
+            r"C:\dev\api",  # a Windows path is not the node's
+            "--install-extension=evil.vsix",  # would be a VS Code flag
+            "/home/amin/magent/a\nb",
+            "/home/amin/magent/a\x00b",
+            "/home/amin/magent/a\x7fb",
+            "/home/amin/magent/a\x85b",  # C1 control
+        ],
+    )
+    def test_a_folder_that_is_not_a_clean_absolute_path_is_none(self, cwd):
+        entries = {"API": dataclasses.replace(self._entries()["API"], cwd=cwd)}
+        assert nodes.open_target("API", entries) is None
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "-oProxyCommand=calc@h",  # ssh would read an option
+            "-h",
+            "amin@",  # no host: would build a LOCAL open of a node path
+            "@",
+        ],
+    )
+    def test_a_target_that_is_an_option_or_has_no_host_is_none(self, target):
+        entries = {"API": dataclasses.replace(self._entries()["API"], target=target)}
+        assert nodes.open_target("API", entries) is None
+
+    @pytest.mark.parametrize("target", ["devino-second", "@devino-second"])
+    def test_a_target_with_a_host_and_no_user_still_opens(self, target):
+        entries = {"API": dataclasses.replace(self._entries()["API"], target=target)}
+        assert nodes.open_target("API", entries) == (target, "/home/amin/magent/api")
+
 
 def _pool(entries: dict[str, NodeConfig] | None = None) -> MagentConfig:
     """A fresh pool per call: MagentConfig and Settings are plain (mutable)

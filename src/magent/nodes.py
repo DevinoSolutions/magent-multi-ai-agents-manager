@@ -18,6 +18,7 @@ import re
 import tempfile
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
@@ -420,13 +421,26 @@ def open_target(
     target), or an entry with no recorded target or absolute folder -- the
     caller falls through to /api/sessions. Never ``remote_root`` as the
     folder: it keeps its ``~`` (DECISION-11) and a Remote-SSH folder URI
-    does not expand one."""
+    does not expand one.
+
+    Both values land in an editor argv, so a value the bring-up writer would
+    never have recorded is None too (a tampered or buggy map): a folder that
+    is not absolute or carries a control character (the writer's
+    ``remote_mux._clean_absolute`` rule; ``-`` can't lead an absolute path, so
+    no VS Code flag either), and a target that would read as an ssh option or
+    has no host after its ``@`` (a hostless authority degrades to a LOCAL
+    open of a node path)."""
     entry = entries.get(project) or next(
         (e for e in entries.values() if e.sid == project), None
     )
-    if entry is None or entry.nick == NODE_CLOUD or not entry.target or not entry.cwd:
+    if entry is None or entry.nick == NODE_CLOUD:
         return None
-    return entry.target, entry.cwd
+    target, cwd = entry.target, entry.cwd
+    if not cwd.startswith("/") or any(unicodedata.category(ch) == "Cc" for ch in cwd):
+        return None
+    if target.startswith("-") or not target.rpartition("@")[2]:
+        return None
+    return target, cwd
 
 
 # A portable Unix login (useradd's default NAME_REGEX, minus the trailing-$

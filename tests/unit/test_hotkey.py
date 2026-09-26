@@ -1823,3 +1823,23 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
         )
         hotkey._do_open_code("http://x:8034", "api", None)
         assert spawned == [["code", "/base/api"]]
+
+    def test_an_unvetted_node_folder_falls_through_to_the_server(
+        self, monkeypatch, tmp_path
+    ):
+        """A map value that is no clean absolute path never reaches the argv
+        (it would be a VS Code flag here): F2 asks the server instead."""
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path, cwd="--install-extension=evil.vsix")
+        spawned = self._patch(
+            monkeypatch,
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "api", "session": "api", "resolved": "/base/api"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "api", None)
+        assert spawned == [["code", "/base/api"]]
