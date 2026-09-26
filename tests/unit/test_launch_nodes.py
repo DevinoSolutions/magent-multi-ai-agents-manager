@@ -4,6 +4,9 @@ faked at remote_mux's seam, so nothing here dials anything."""
 
 from __future__ import annotations
 
+import threading
+import time
+from collections import defaultdict
 from pathlib import Path
 
 import pytest
@@ -385,3 +388,266 @@ class TestASessionThatCameUpButWasNotRecordedIsUp:
         )
         assert launch.bring_up_node_project(_config(api), api, window=True).ok
         assert [w[1] for w in rig.windows] == ["api"]
+
+
+def _projects(
+    tmp_path: Path, rig: NodeRig, spec: list[tuple[str, str]]
+) -> list[ProjectConfig]:
+    out = []
+    for name, nick in spec:
+        folder = tmp_path / name
+        folder.mkdir()
+        rig.states[folder] = _state(folder)
+        out.append(ProjectConfig(path=str(folder), node=nick))
+    return out
+
+
+class TestManyNodeProjectsAtOnce:
+    def test_outcomes_come_back_in_config_order(self, rig, tmp_path):
+        projs = _projects(
+            tmp_path, rig, [("a1", "second"), ("b1", "third"), ("a2", "second")]
+        )
+        outcomes = launch.bring_up_node_projects(_config(*projs))
+        assert [o.sid for o in outcomes] == ["a1", "b1", "a2"]
+
+    def test_only_is_a_list_of_session_ids(self, rig, tmp_path):
+        projs = _projects(tmp_path, rig, [("a1", "second"), ("b1", "third")])
+        outcomes = launch.bring_up_node_projects(
+            _config(*projs), only=["b1", "local-api"]
+        )
+        assert [o.sid for o in outcomes] == ["b1"]
+
+    def test_nothing_to_do_is_an_empty_list(self, rig):
+        assert launch.bring_up_node_projects(_config()) == []
+
+    def test_one_node_is_serial_and_two_nodes_are_parallel(
+        self, rig, tmp_path, monkeypatch
+    ):
+        projs = _projects(
+            tmp_path, rig, [("a1", "second"), ("a2", "second"), ("b1", "third")]
+        )
+        active: dict[str, int] = defaultdict(int)
+        peak: dict[str, int] = defaultdict(int)
+        guard = threading.Lock()
+        # a1 (second) and b1 (third) must be inside bring_up AT THE SAME TIME:
+        # a global lock would time the barrier out.
+        barrier = threading.Barrier(2, timeout=10)
+
+        def fake(node, recipe, *, allow_dirty=False, resume_id=None):
+            with guard:
+                active[node.nick] += 1
+                peak[node.nick] = max(peak[node.nick], active[node.nick])
+            try:
+                if recipe.sid in ("a1", "b1"):
+                    barrier.wait()
+                time.sleep(0.05)
+            finally:
+                with guard:
+                    active[node.nick] -= 1
+            return BringUpResult(
+                sid=recipe.sid, attached_existing=False, cwd=f"/n/{recipe.sid}"
+            )
+
+        monkeypatch.setattr(remote_mux, "bring_up", fake)
+        outcomes = launch.bring_up_node_projects(_config(*projs))
+        assert all(o.ok for o in outcomes)
+        assert peak == {"second": 1, "third": 1}
+        # ...and all three map entries survived the concurrent writes.
+        assert set(nodes.read_node_map()) == {"a1", "a2", "b1"}
+
+
+def _no_node_contact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail loudly on anything a bring-up does past the batch check: the ssh
+    calls, the local git read, provisioning."""
+
+    def forbidden(*_a: object, **_k: object) -> None:
+        raise AssertionError("a colliding batch must refuse before any bring-up")
+
+    for name in ("bring_up", "has_session", "decorate"):
+        monkeypatch.setattr(remote_mux, name, forbidden)
+    monkeypatch.setattr(launch, "node_git_states", forbidden)
+    monkeypatch.setattr(launch, "_provision_once", forbidden)
+
+
+def _twin_apis(tmp_path: Path, rig: NodeRig) -> list[ProjectConfig]:
+    """Two projects whose LOCAL folders share the leaf name ``api`` -- on two
+    different nodes, because the check is fleet-wide (auto may co-locate
+    them later) -- plus a bystander with a folder of its own."""
+    out = []
+    for parent, title, nick in (("x", "api-x", "second"), ("y", "api-y", "third")):
+        folder = tmp_path / parent / "api"
+        folder.mkdir(parents=True)
+        rig.states[folder] = _state(folder)
+        out.append(ProjectConfig(path=str(folder), node=nick, title=title))
+    (bystander,) = _projects(tmp_path, rig, [("web", "second")])
+    return [*out, bystander]
+
+
+class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
+    """X3: ``nodes.assert_distinct_remote_roots`` runs ONCE over the whole
+    batch, before the fan-out -- one clone would otherwise overwrite the
+    other's folder, and which one wins would depend on thread timing."""
+
+    def test_a_colliding_batch_refuses_before_any_ssh(self, rig, tmp_path, monkeypatch):
+        projs = _twin_apis(tmp_path, rig)
+        _no_node_contact(monkeypatch)
+        outcomes = launch.bring_up_node_projects(_config(*projs))
+        assert [(o.sid, o.ok) for o in outcomes] == [
+            ("api-x", False),
+            ("api-y", False),
+            ("web", False),
+        ]
+        for o in outcomes:
+            assert o.error is not None
+            assert "'api-x' and 'api-y' would share the node folder name 'api'" in (
+                o.error
+            )
+            assert "rename one of them" in o.error
+        assert [o.node for o in outcomes] == ["second", "third", "second"]
+        assert rig.recipes == []
+        assert nodes.read_node_map() == {}
+
+    def test_the_check_runs_once_over_every_project_in_the_batch(
+        self, rig, tmp_path, monkeypatch
+    ):
+        projs = _projects(
+            tmp_path, rig, [("a1", "second"), ("b1", "third"), ("a2", "second")]
+        )
+        calls: list[list[str]] = []
+        real = nodes.assert_distinct_remote_roots
+
+        def spy(recipes):
+            calls.append([r.remote_root for r in recipes])
+            real(recipes)
+
+        monkeypatch.setattr(nodes, "assert_distinct_remote_roots", spy)
+        outcomes = launch.bring_up_node_projects(_config(*projs))
+        assert all(o.ok for o in outcomes)
+        assert calls == [["~/magent/a1", "~/magent/b1", "~/magent/a2"]]
+
+    def test_up_prints_the_collision_and_counts_every_project_failed(
+        self, rig, tmp_path, monkeypatch, capsys
+    ):
+        projs = _twin_apis(tmp_path, rig)
+        _no_node_contact(monkeypatch)
+        monkeypatch.setattr("magent.psmux.bring_up", lambda cfg, only, group: ([], []))
+        assert launch.bring_up_psmux(_config(*projs)) == (
+            [],
+            ["api-x", "api-y", "web"],
+        )
+        out = capsys.readouterr().out
+        assert "api-x: projects 'api-x' and 'api-y' would share" in out
+
+    @pytest.mark.parametrize(
+        ("make", "reason"),
+        [
+            (
+                lambda tmp: ProjectConfig(path=str(tmp / "gone"), node="second"),
+                "not found on this PC",
+            ),
+            (
+                lambda tmp: ProjectConfig(path=str(tmp / "web2"), node="auto"),
+                "needs a placement",
+            ),
+            (
+                lambda tmp: ProjectConfig(path=tmp.anchor, node="second", title="rt"),
+                "no git repository",
+            ),
+        ],
+        ids=["missing-folder", "unplaced-auto", "drive-root"],
+    )
+    def test_a_project_the_check_cannot_place_fails_on_its_own(
+        self, rig, tmp_path, make, reason
+    ):
+        # No folder name to compare is not a collision: that project's own
+        # bring-up names its reason, and the rest of the batch goes ahead.
+        (tmp_path / "web2").mkdir()
+        (good,) = _projects(tmp_path, rig, [("a1", "second")])
+        odd = make(tmp_path)
+        outcomes = launch.bring_up_node_projects(_config(odd, good))
+        assert [o.ok for o in outcomes] == [False, True]
+        assert reason in (outcomes[0].error or "")
+        assert [nick for nick, _ in rig.recipes] == ["second"]
+
+    def test_an_unreadable_map_still_checks_the_pinned_projects(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # The map only places ``auto`` projects; a pinned pair collides with or
+        # without it, so a broken map must not switch the check off.
+        projs = _twin_apis(tmp_path, rig)
+        _no_node_contact(monkeypatch)
+
+        def broken(*_a: object, **_k: object) -> dict[str, NodeMapEntry]:
+            raise ValueError("node-map.json: not valid JSON")
+
+        monkeypatch.setattr(nodes, "read_node_map", broken)
+        outcomes = launch.bring_up_node_projects(_config(*projs))
+        assert [o.ok for o in outcomes] == [False, False, False]
+        assert all(
+            "would share the node folder name 'api'" in (o.error or "")
+            for o in outcomes
+        )
+
+
+class TestUpBringsUpNodeProjectsToo:
+    def test_local_and_node_results_are_merged_and_node_lines_printed(
+        self, rig, tmp_path, monkeypatch, capsys
+    ):
+        projs = _projects(tmp_path, rig, [("a1", "second"), ("a2", "second")])
+        rig.states[tmp_path / "a2"] = _state(tmp_path / "a2", dirty=True)
+        monkeypatch.setattr(
+            "magent.psmux.bring_up", lambda cfg, only, group: (["loc"], ["bad"])
+        )
+        created, failed = launch.bring_up_psmux(_config(*projs))
+        assert (created, failed) == (["loc", "a1"], ["bad", "a2"])
+        out = capsys.readouterr().out
+        assert "a1 @second started" in out
+        assert "a2: " in out
+        assert "--allow-dirty" in out
+
+    def test_an_attached_session_reads_attached_and_its_warnings_print(
+        self, rig, api, tmp_path, monkeypatch, capsys
+    ):
+        # D10: a refusal made moot by a live session is a warning, as is a
+        # session that came up but was not recorded -- both reach the user
+        # only through this echo.
+        nodes.update_node_map(
+            "api",
+            NodeMapEntry(
+                nick="second",
+                sid="api",
+                placed_ts=1.0,
+                attached_existing=False,
+                remote_root="~/magent/api",
+                target="amin@devino-second",
+            ),
+        )
+        rig.live = True
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        monkeypatch.setattr("magent.psmux.bring_up", lambda cfg, only, group: ([], []))
+        assert launch.bring_up_psmux(_config(api)) == (["api"], [])
+        out = capsys.readouterr().out
+        assert "api @second attached" in out
+        (warning,) = [line for line in out.splitlines() if "--allow-dirty" in line]
+        assert warning.lstrip().startswith("! ")
+
+    def test_allow_dirty_reaches_the_node_bring_up(self, rig, tmp_path, monkeypatch):
+        projs = _projects(tmp_path, rig, [("a1", "second")])
+        rig.states[tmp_path / "a1"] = _state(tmp_path / "a1", dirty=True)
+        monkeypatch.setattr("magent.psmux.bring_up", lambda cfg, only, group: ([], []))
+        assert launch.bring_up_psmux(_config(*projs), allow_dirty=True) == (["a1"], [])
+
+    def test_up_never_opens_a_window(self, rig, tmp_path, monkeypatch):
+        # `up` is the host side of attach, often run over ssh.
+        projs = _projects(tmp_path, rig, [("a1", "second")])
+        monkeypatch.setattr("magent.psmux.bring_up", lambda cfg, only, group: ([], []))
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+        launch.bring_up_psmux(_config(*projs))
+        assert rig.windows == []
+
+    def test_node_session_ids_follow_the_group_filter(self, rig, tmp_path):
+        a = ProjectConfig(path=str(tmp_path / "a"), node="second", group="work")
+        b = ProjectConfig(path=str(tmp_path / "b"), node="second")
+        assert launch.node_session_ids(_config(a, b), group="WORK") == ["a"]

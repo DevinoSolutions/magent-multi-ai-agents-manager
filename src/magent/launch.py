@@ -5,6 +5,7 @@ import socket
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -1273,12 +1274,27 @@ def psmux_status(
 
 
 def bring_up_psmux(
-    config: MagentConfig, only: list[str] | None = None, group: str | None = None
+    config: MagentConfig,
+    only: list[str] | None = None,
+    group: str | None = None,
+    *,
+    allow_dirty: bool = False,
 ) -> tuple[list[str], list[str]]:
-    """Delegate to ``psmux.bring_up``. Returns ``(created, failed)``."""
+    """Delegate to ``psmux.bring_up``, then bring the pool-node projects up
+    too (PR-D; no windows -- this is the host side of attach). Returns
+    ``(created, failed)`` over both; node outcomes are printed as they are
+    the only place their reasons appear."""
     from magent import psmux
 
-    return psmux.bring_up(config, only, group)
+    created, failed = psmux.bring_up(config, only, group)
+    outcomes = bring_up_node_projects(
+        config, only=only, group=group, allow_dirty=allow_dirty
+    )
+    _echo_node_outcomes(outcomes)
+    return (
+        [*created, *(o.sid for o in outcomes if o.ok)],
+        [*failed, *(o.sid for o in outcomes if not o.ok)],
+    )
 
 
 def revive_psmux(
@@ -1594,3 +1610,143 @@ def bring_up_node_project(
         return NodeBringUpOutcome(
             ok=False, sid=sid, node=nick, error=_node_error_text(exc)
         )
+
+
+def _placement_recipes(
+    config: MagentConfig, projects: list[ProjectConfig]
+) -> dict[str, tuple[str, Recipe]]:
+    """``{sid: (nick, recipe)}`` for every project in ``projects`` whose node
+    folder is already known, from config and the map alone -- no ssh, no git.
+    The recipe carries only what ``nodes.assert_distinct_remote_roots`` reads
+    (its project and remote_root). A project that cannot be placed yet (no
+    folder here, an unplaced ``auto``, a folder with no usable name) is left
+    out: its own bring-up names that reason. An unreadable map places the
+    pinned projects anyway; each bring-up then reports the map itself."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+    from magent.env import local_username
+
+    try:
+        held = nodes.read_node_map()
+    except (ValueError, OSError):
+        held = {}
+    out: dict[str, tuple[str, Recipe]] = {}
+    for proj in projects:
+        name = nodes.project_name(proj)
+        project_dir = _node_project_dir(config, proj)
+        if project_dir is None:
+            continue
+        entry = held.get(name)
+        try:
+            node = nodes.resolve(
+                config,
+                proj,
+                local_user=local_username(),
+                placed=entry.nick if entry else None,
+            )
+            remote_root = nodes.remote_root_for(node, project_dir)
+        except nodes.NodeConfigError:
+            continue
+        out[nodes.node_sid(proj)] = (
+            node.nick,
+            nodes.Recipe(
+                project=name,
+                sid=nodes.node_sid(proj),
+                repos=(),
+                push_files=(),
+                memory_dir=None,
+                remote_root=remote_root,
+            ),
+        )
+    return out
+
+
+def _run_node_bring_ups(
+    config: MagentConfig,
+    projects: list[ProjectConfig],
+    *,
+    allow_dirty: bool,
+    window: bool,
+) -> list[NodeBringUpOutcome]:
+    """Each project's bring-up on a thread (a clone is minutes of network,
+    not CPU); the per-node lock inside keeps one node serial. Outcomes in the
+    order given.
+
+    First, ONCE over the whole batch and before anything is dialed: two
+    projects that would share a node folder name refuse the batch (X3,
+    ``nodes.assert_distinct_remote_roots``). Fanned out, the two clones would
+    race for one folder and thread timing would pick the survivor."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    if not projects:
+        return []
+    placed = _placement_recipes(config, projects)
+    try:
+        nodes.assert_distinct_remote_roots([recipe for _, recipe in placed.values()])
+    except nodes.NodeConfigError as exc:
+        get_logger("nodes").warning("node batch refused: %s", exc)
+        return [
+            NodeBringUpOutcome(
+                ok=False,
+                sid=(sid := nodes.node_sid(proj)),
+                node=placed[sid][0] if sid in placed else "",
+                error=str(exc),
+            )
+            for proj in projects
+        ]
+    with ThreadPoolExecutor(max_workers=min(8, len(projects))) as pool:
+        futures = [
+            pool.submit(
+                bring_up_node_project,
+                config,
+                proj,
+                allow_dirty=allow_dirty,
+                window=window,
+            )
+            for proj in projects
+        ]
+        return [f.result() for f in futures]
+
+
+def bring_up_node_projects(
+    config: MagentConfig,
+    *,
+    only: list[str] | None = None,
+    group: str | None = None,
+    allow_dirty: bool = False,
+    window: bool = False,
+) -> list[NodeBringUpOutcome]:
+    """Bring up every node project in scope. ``only`` holds session ids, the
+    same currency as ``psmux.bring_up``'s -- a local id in it is ignored."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    projects = [
+        proj
+        for proj in nodes.node_projects(config, group)
+        if only is None or nodes.node_sid(proj) in only
+    ]
+    return _run_node_bring_ups(config, projects, allow_dirty=allow_dirty, window=window)
+
+
+def node_session_ids(config: MagentConfig, group: str | None = None) -> list[str]:
+    """The session ids of the node projects in scope, config order."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    return [nodes.node_sid(proj) for proj in nodes.node_projects(config, group)]
+
+
+def _echo_node_outcomes(outcomes: list[NodeBringUpOutcome]) -> None:
+    for o in outcomes:
+        if o.ok:
+            verb = "attached" if o.attached_existing else "started"
+            click.echo(
+                f"  {style('+', fg='green')} {o.sid} "
+                f"{style('@' + o.node, fg='blue')} {verb}"
+            )
+        else:
+            click.echo(f"  {style('x', fg='red')} {o.sid}: {o.error}")
+        for warning in o.warnings:
+            click.echo(f"    {style('!', fg='yellow')} {style(warning, dim=True)}")
