@@ -2131,6 +2131,8 @@ SETUP_TOOLS = (
     "touch",
     "tr",
     "mktemp",
+    "sleep",
+    "timeout",
 )
 
 # Each shim is `#!<bash>` + `STATE=<dir>` + its body. The state directory is
@@ -2212,7 +2214,7 @@ for a in "$@"; do [ "$prev" = -o ] && out=$a; prev=$a; done
 case "$*" in *https://claude.ai/install.sh*) ;; *) exit 22 ;; esac
 cat > "$out" <<'EOF'
 mkdir -p "$HOME/.local/bin"
-printf '#!/bin/sh\\necho "2.1.280 (Claude Code)"\\n' > "$HOME/.local/bin/claude"
+printf '#!/bin/sh\\n[ ! -e "$HOME/claude-hangs" ] || exec sleep 30\\necho "2.1.280 (Claude Code)"\\n' > "$HOME/.local/bin/claude"
 chmod +x "$HOME/.local/bin/claude"
 EOF
 """,
@@ -2232,7 +2234,11 @@ printf 'FAKE PRIVATE KEY %s\\n' "$c" > "$f"
 printf 'ssh-ed25519 AAAAFAKENODEKEY %s\\n' "$c" > "$f.pub"
 """,
     "hostname": "echo devino-second\n",
-    "gh": 'echo "gh version 2.88.1 (2026-09-01)"\n',
+    # gh-hangs: a gh that ignores TERM too, so only timeout's KILL ends it.
+    "gh": """
+[ ! -e "$STATE/gh-hangs" ] || { trap '' TERM; sleep 30; }
+echo "gh version 2.88.1 (2026-09-01)"
+""",
     "tmux": """
 case "$1" in -V) cat "$STATE/tmux-V" 2>/dev/null || echo "tmux 3.4" ;; *) exit 1 ;; esac
 """,
@@ -2243,7 +2249,7 @@ def _setup_box(
     tmp_path: Path, *, docker: bool = True, without: tuple[str, ...] = ()
 ) -> tuple[Path, dict[str, str]]:
     """A fake root's system under tmp_path/state, and the env setup.sh runs in.
-    ``without`` names shims left out: that program is not installed."""
+    ``without`` names shims or tools left out: that program is not installed."""
     state = tmp_path / "state"
     for sub in ("pkgs", "users", "uids", "home", "groups", "root", "tmp"):
         (state / sub).mkdir(parents=True, exist_ok=True)
@@ -2262,7 +2268,8 @@ def _setup_box(
             newline="\n",
         )
         shim.chmod(0o755)
-    sysbin = _sysbin(tmp_path, SETUP_TOOLS, python=False, name="setupbin")
+    tools = tuple(t for t in SETUP_TOOLS if t not in without)
+    sysbin = _sysbin(tmp_path, tools, python=False, name="setupbin")
     env = {
         "HOME": str(state / "root"),
         "PATH": os.pathsep.join([str(shims), str(sysbin)]),
@@ -2780,6 +2787,64 @@ class TestSetupShUnderRealBash:
         assert _rows(r)["node-key:amin"] == "fail"
         assert not (ssh_dir / "id_ed25519.pub").exists()
         assert set(_report(r).keys()) == set()
+
+    # -- bounded version probes (impl-F14) -------------------------------------
+
+    @staticmethod
+    def _row(r: subprocess.CompletedProcess[bytes], item: str) -> tuple[str, str]:
+        (line,) = [line for line in _report(r).lines if line.item == item]
+        return line.status, line.detail
+
+    def test_a_hung_gh_is_its_own_fail_row_and_setup_goes_on(self, tmp_path):
+        # This gh ignores TERM too: timeout's KILL (137) is what ends it.
+        state, env = _setup_box(tmp_path)
+        (state / "gh-hangs").touch()
+        started = time.monotonic()
+        r = _run_setup(env)
+        assert time.monotonic() - started < 25
+        assert r.returncode == 1
+        assert self._row(r, "gh") == ("fail", "gh --version timed out after 4s")
+        assert set(_report(r).keys()) == {"amin"}
+
+    def test_a_hung_claude_is_its_own_fail_row_and_the_key_still_comes(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        (state / "home" / "amin" / "claude-hangs").touch()
+        started = time.monotonic()
+        r = _run_setup(env)
+        assert time.monotonic() - started < 25
+        assert r.returncode == 1
+        assert self._row(r, "claude:amin") == (
+            "fail",
+            "claude --version timed out after 4s",
+        )
+        assert set(_report(r).keys()) == {"amin"}
+
+    def test_a_claude_that_hangs_right_after_its_install_is_a_fail_row(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        (_existing_user(state, "amin") / "claude-hangs").touch()
+        started = time.monotonic()
+        r = _run_setup(env)
+        assert time.monotonic() - started < 25
+        assert r.returncode == 1
+        assert self._row(r, "claude:amin") == (
+            "fail",
+            "claude --version timed out after 4s",
+        )
+
+    def test_no_timeout_on_path_is_one_row_and_nothing_is_probed(self, tmp_path):
+        state, env = _setup_box(tmp_path, without=("timeout",))
+        r = _run_setup(env)
+        assert r.returncode == 1
+        assert [(line.status, line.item, line.detail) for line in _report(r).lines] == [
+            (
+                "fail",
+                "setup",
+                "timeout is not on PATH -- every probe runs under it; install coreutils on this node",
+            )
+        ]
+        assert not (state / "apt.log").exists()
+        assert list((state / "users").iterdir()) == []
 
     def test_a_leading_zero_minor_is_decimal(self, tmp_path):
         # `3.08` would be an octal error in a bare (( )) -- the floor reads

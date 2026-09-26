@@ -25,6 +25,19 @@ GH_LIST=/etc/apt/sources.list.d/github-cli.list
 
 say() { printf '%s\t%s\t%s\n' "$1" "$2" "${3:-}"; }
 
+# version_row <status> <item> <tool> [<prefix>]: say <status> <item> with the
+# first line of `<tool> --version`, under timeout(1) -- a hung binary is its
+# own fail row, not a hung setup (124: TERM ended it, 137: KILL did).
+version_row() {
+  local s=4 k=2 out rc=0
+  out=$(timeout -k "$k" "$s" "$3" --version 2>/dev/null) || rc=$?
+  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+    say fail "$2" "$3 --version timed out after ${s}s"
+    return 1
+  fi
+  say "$1" "$2" "${4:-}${out%%$'\n'*}"
+}
+
 # Installed means dpkg's "ii": `dpkg -s` also succeeds for a package removed
 # with its config files left behind (state "rc").
 installed() {
@@ -83,8 +96,8 @@ step_tmux() {
 step_gh() {
   local out
   if command -v gh >/dev/null 2>&1; then
-    say skip gh "$(gh --version 2>/dev/null | head -n1)"
-    return 0
+    version_row skip gh gh
+    return
   fi
   # gh's official apt repository (cli/cli docs/install_linux.md). One that
   # cannot be read is taken out again: a dead source would fail every later
@@ -101,7 +114,7 @@ step_gh() {
     return 1
   fi
   if out=$(DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gh 2>&1); then
-    say did gh "installed $(gh --version 2>/dev/null | head -n1)"
+    version_row did gh gh "installed "
   else
     say fail gh "apt-get could not install gh: ${out##*$'\n'}"
     return 1
@@ -181,8 +194,8 @@ user_authorized() {
 user_claude() {
   local u=$1 out tmp
   if command -v claude >/dev/null 2>&1; then
-    say skip "claude:$u" "$(claude --version 2>/dev/null | head -n1)"
-    return 0
+    version_row skip "claude:$u" claude
+    return
   fi
   # Downloaded whole, then run: `curl | bash` hands bash half a script when
   # the connection drops mid-transfer. The installer keeps its usual umask.
@@ -194,7 +207,7 @@ user_claude() {
       (umask 022 && bash "$tmp"); } 2>&1 ) || true
   rm -f -- "$tmp"
   if command -v claude >/dev/null 2>&1; then
-    say did "claude:$u" "$(claude --version 2>/dev/null | head -n1)"
+    version_row did "claude:$u" claude
   else
     say fail "claude:$u" "the Claude installer did not put claude on PATH: ${out##*$'\n'}"
     return 1
@@ -256,7 +269,7 @@ run_user_phase() {
   local u=$1 key=$2
   local -a st
   runuser --login --shell=/bin/bash \
-    --command="$(declare -f say user_phase user_authorized user_claude user_node_key); user_phase $(printf '%q %q' "$u" "$key")" \
+    --command="$(declare -f say version_row user_phase user_authorized user_claude user_node_key); user_phase $(printf '%q %q' "$u" "$key")" \
     "$u" |
     awk -F'\t' -v u="$u" '$1 == "key" ? $2 == u : substr($2, length($2) - length(u)) == ":" u'
   st=("${PIPESTATUS[@]}")
@@ -310,6 +323,12 @@ main() {
   exec </dev/null
   if [ "$(id -u)" != 0 ]; then
     say fail setup "not root: magent node setup connects as root@<host> for this one hop"
+    return 1
+  fi
+  # Every version probe runs under timeout(1): without it each would exit 127
+  # and read as its own wrong finding, so the one real cause is the only row.
+  if ! command -v timeout >/dev/null 2>&1; then
+    say fail setup "timeout is not on PATH -- every probe runs under it; install coreutils on this node"
     return 1
   fi
   step_packages || rc=1
