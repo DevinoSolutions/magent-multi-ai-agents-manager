@@ -1843,3 +1843,46 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
         )
         hotkey._do_open_code("http://x:8034", "api", None)
         assert spawned == [["code", "/base/api"]]
+
+    def test_the_node_map_wins_over_an_attach_listeners_host(
+        self, monkeypatch, tmp_path
+    ):
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path)
+        spawned = self._patch(monkeypatch)
+        hotkey._do_open_code("http://x:8034", "api", "me@desktop")
+        assert spawned == [
+            [
+                "code",
+                "--remote",
+                "ssh-remote+amin@devino-second",
+                "/home/amin/magent/api",
+            ]
+        ]
+
+    def test_a_node_open_spawns_the_resolved_code_bin(self, monkeypatch, tmp_path):
+        # A bare "code" handed to CreateProcess never finds the .cmd shim.
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path)
+        shim = r"C:\VS Code\bin\code.cmd"
+        spawned = self._patch(monkeypatch, code_bin=shim)
+        hotkey._do_open_code("http://x:8034", "api", None)
+        assert [argv[0] for argv in spawned] == [shim]
+
+    def test_a_failing_node_lookup_is_reported_never_raised(self, monkeypatch):
+        from magent import hotkey, nodes
+
+        spawned = self._patch(monkeypatch)
+
+        def boom(*_a, **_k):
+            raise RuntimeError("map exploded")
+
+        monkeypatch.setattr(nodes, "read_node_map", boom)
+        try:
+            hotkey._do_open_code("http://x:8034", "api", None)
+        except RuntimeError:
+            raise AssertionError("an F2 failure escaped the handler thread") from None
+        assert spawned == []
+        assert self.flashed[-1] == "F2: failed - see hotkey.log"

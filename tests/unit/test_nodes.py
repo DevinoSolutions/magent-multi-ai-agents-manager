@@ -689,6 +689,10 @@ class TestF2FindsANodeFolder:
     def test_an_entry_from_before_pr_d_has_no_target_and_is_none(self):
         assert nodes.open_target("api", {"api": ENTRY}) is None
 
+    def test_an_entry_with_a_folder_but_no_target_is_none(self):
+        entries = {"API": dataclasses.replace(self._entries()["API"], target="")}
+        assert nodes.open_target("API", entries) is None
+
     # A map value reaches an editor argv, so open_target vets it the way the
     # bring-up writer did (remote_mux._clean_absolute) and falls through to
     # /api/sessions on anything else -- a tampered or buggy map (cq-D15 m2).
