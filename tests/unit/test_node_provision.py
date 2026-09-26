@@ -4167,6 +4167,15 @@ NO_SUCH_HOST = (
     'Get "https://api.github.com/": dial tcp: lookup api.github.com: no such host'
 )
 GH_FAILED_ROW = "not shared -- this PC's gh failed; see the nodes log"
+# gh ssh-key add behind a proxy on a PC whose keyring is also unreadable: gh
+# warns about the keyring first, then fails the POST.
+ADD_REFUSED_LAST = (
+    'Post "https://api.github.com/user/keys": proxyconnect tcp: '
+    "dial tcp 10.1.2.3:3128: connect: connection refused"
+)
+ADD_REFUSED = f"{KEYRING_FAILED}\n{ADD_REFUSED_LAST}\n"
+ADD_FAILED_ROW = "gh ssh-key add failed; see the nodes log"
+ADD_LOGGED = "github-key not registered (ssh-key add): this PC's gh gave"
 
 
 def _on_screen(lines: tuple[ScriptLine, ...]) -> str:
@@ -4235,6 +4244,47 @@ class TestGhsOwnWordsStayOffTheScreen:
             "fail", "github-key", "this PC's gh failed; see the nodes log"
         )
         assert PROXY_REFUSED in caplog.text
+
+    def test_a_failed_add_is_a_class_only_github_key_row(self, fake_gh, caplog):
+        caplog.set_level("WARNING", logger="magent.nodes")
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("ssh-key add", stderr=ADD_REFUSED, rc=1)
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine("fail", "github-key", ADD_FAILED_ROW)
+        for gh_words in ("https://", "10.1.2.3", "proxyconnect", "keyring", "dbus"):
+            assert gh_words not in row.detail
+        assert f"{ADD_LOGGED} failed: {ADD_REFUSED_LAST}" in caplog.text
+
+    def test_a_failed_add_logs_gh_s_words_scrubbed(self, fake_gh, caplog):
+        caplog.set_level("WARNING", logger="magent.nodes")
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("ssh-key add", stderr=f"HTTP 401: bad token {TOKEN}\n", rc=1)
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine("fail", "github-key", ADD_FAILED_ROW)
+        assert f"{ADD_LOGGED} failed: HTTP 401: bad token <redacted>" in caplog.text
+        assert TOKEN not in caplog.text
+
+    def test_a_failed_add_of_a_named_class_prints_its_repair(self, fake_gh, caplog):
+        # gh's words name the class; the row carries the class's repair.
+        caplog.set_level("WARNING", logger="magent.nodes")
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("ssh-key add", stderr="unknown flag: --type\n", rc=1)
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine(
+            "fail",
+            "github-key",
+            f"gh ssh-key add failed; {GhUnavailable('too-old').hint}",
+        )
+        assert "unknown flag" not in row.detail
+        assert f"{ADD_LOGGED} too-old: unknown flag: --type" in caplog.text
+
+    def test_a_failed_add_that_said_nothing_logs_its_exit(self, fake_gh, caplog):
+        caplog.set_level("WARNING", logger="magent.nodes")
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("ssh-key add", rc=3)
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine("fail", "github-key", ADD_FAILED_ROW)
+        assert f"{ADD_LOGGED} failed: exited 3" in caplog.text
 
     def test_the_repr_never_carries_gh_s_words(self):
         refusal = GhUnavailable("failed", detail=PROXY_REFUSED)
@@ -4364,12 +4414,13 @@ class TestRegisterSshKey:
         remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         assert len(_adds(fake_gh)) == 1
 
-    def test_a_refused_add_fails_with_ghs_own_words(self, fake_gh):
+    def test_a_refused_add_fails_and_logs_ghs_own_words(self, fake_gh, caplog):
+        caplog.set_level("WARNING", logger="magent.nodes")
         fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
         fake_gh.set_reply("ssh-key add", stderr=REFUSED_ADD_STDERR, rc=1)
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
-        assert row.status == "fail"
-        assert row.detail.endswith("key is already in use")
+        assert row == ScriptLine("fail", "github-key", ADD_FAILED_ROW)
+        assert "key is already in use" in caplog.text
 
     def test_another_key_of_the_same_type_is_not_a_match(self, fake_gh):
         fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
@@ -4438,13 +4489,13 @@ class TestRegisterSshKey:
         assert "timed out" in caplog.text
         assert f"<stdin: {len(key)} bytes>" in caplog.text
 
-    def test_a_multi_line_refusal_keeps_the_last_line(self, fake_gh):
+    def test_a_multi_line_refusal_logs_the_last_line(self, fake_gh, caplog):
+        caplog.set_level("WARNING", logger="magent.nodes")
         fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
         fake_gh.set_reply("ssh-key add", stderr=REFUSED_ADD_STDERR, rc=1)
-        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
-        assert row == ScriptLine(
-            "fail", "github-key", "gh ssh-key add failed: key is already in use"
-        )
+        remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert f"{ADD_LOGGED} failed: key is already in use" in caplog.text
+        assert "HTTP 422" not in caplog.text
 
     def test_gh_finding_the_key_itself_is_a_skip_not_a_did(self, fake_gh):
         # gh ssh-key add de-duplicates on its own (one unpaginated user/keys

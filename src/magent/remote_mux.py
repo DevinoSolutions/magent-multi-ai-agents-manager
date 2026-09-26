@@ -1244,9 +1244,12 @@ def register_ssh_key(pubkey: str, *, title: str) -> ScriptLine:
             "gh ssh-key add did not finish (spawn failure or timeout); rerun to check",
         )
     if added.returncode != 0:
-        err = added.stderr.decode("utf-8", "replace").strip().splitlines()
-        detail = err[-1][:200] if err else f"exited {added.returncode}"
-        return ScriptLine("fail", "github-key", f"gh ssh-key add failed: {detail}")
+        # gh's own words (a dial URL, a keyring error) go to the log; the row
+        # names the class, and the repair where the class has one.
+        refusal = _gh_refusal(added)
+        _log_gh_refusal(refusal, "github-key not registered (ssh-key add)")
+        shown = "see the nodes log" if refusal.reason == "failed" else refusal.hint
+        return ScriptLine("fail", "github-key", f"gh ssh-key add failed; {shown}")
     # gh de-duplicates too, and says so on stderr with exit 0: when our own
     # listing failed, that is the only word that the key was already there.
     if "already exists" in added.stderr.decode("utf-8", "replace"):
