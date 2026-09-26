@@ -1553,6 +1553,38 @@ class TestTheLoadSampleEdges:
         assert syncer.tick()["second"] == (node_sync.OK, "")
         assert tried == [1000.0]
 
+    def test_a_broken_load_file_warns_once_and_says_when_it_recovers(
+        self, placed, caplog
+    ):
+        """A daemon ticking on a broken load file must not warn every sample
+        (a day at one a minute is ~1,440 warnings): one on the way in, one
+        INFO on the way out, and nothing while nothing changes."""
+        _capture_nodes_log(caplog)
+        path = nodes.load_path("second")
+        path.mkdir(parents=True)
+        clock = iter(1000.0 + 60 * i for i in range(6))
+
+        def pull(_node, _sids):
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        syncer = node_sync.NodeSyncer(
+            _second_only(sample_interval_s=60), pull=pull, now=lambda: next(clock)
+        )
+        for _ in range(3):
+            assert syncer.tick()["second"] == (node_sync.OK, "")
+        assert len([m for m in _warnings(caplog) if "load sample" in m]) == 1
+        path.rmdir()
+        for _ in range(3):
+            syncer.tick()
+        kept_again = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.INFO and "load samples kept again" in r.getMessage()
+        ]
+        assert kept_again == ["node second: load samples kept again"]
+        assert len([m for m in _warnings(caplog) if "load sample" in m]) == 1
+        assert _load_ts() == [1180.0, 1240.0, 1300.0]
+
     def test_a_first_line_nested_too_deep_is_trimmed_not_raised(self, placed):
         """json.loads raises RecursionError, not ValueError, on deep nesting.
         The row reader must read that as "not a row", or the tick fails."""

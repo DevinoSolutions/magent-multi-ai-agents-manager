@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import math
 import os
 import subprocess
@@ -528,6 +529,7 @@ class NodeSyncer:
         self._warned: set[tuple[str, str]] = set()
         self._last: dict[str, str] = {}
         self._last_sample: dict[str, float] = {}
+        self._sample_failing: set[str] = set()
 
     def reconfigure(self, config: MagentConfig) -> None:
         self._config = config
@@ -641,8 +643,9 @@ class NodeSyncer:
         ):
             return
         # Throttled even when the row cannot be kept, so a broken load file
-        # is one warning per sample interval, not one per tick.
+        # is retried once per sample interval, not once per tick.
         self._last_sample[nick] = at
+        log = get_logger(LOG_NAME)
         try:
             _append_sample(
                 nick,
@@ -653,5 +656,13 @@ class NodeSyncer:
             )
         except (OSError, ValueError) as e:
             # The pull landed -- sessions.json and the marks are written -- so
-            # a load row that cannot be kept is not a failed tick.
-            get_logger(LOG_NAME).warning("node %s: load sample not kept (%s)", nick, e)
+            # a load row that cannot be kept is not a failed tick. Warned on
+            # the way in only: a file broken for a day is one warning, not
+            # one per sample; the rest go to DEBUG.
+            level = logging.DEBUG if nick in self._sample_failing else logging.WARNING
+            self._sample_failing.add(nick)
+            log.log(level, "node %s: load sample not kept (%s)", nick, e)
+            return
+        if nick in self._sample_failing:
+            self._sample_failing.discard(nick)
+            log.info("node %s: load samples kept again", nick)
