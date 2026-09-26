@@ -486,6 +486,7 @@ class _OpenCodeHarness:
         self.spawn_envs: list[object] = []
         self.spawn_kwargs: list[dict[str, object]] = []
         self.flashed: list[str] = []
+        self.flash_tints: list[object] = []
         monkeypatch.setattr(hotkey.shutil, "which", lambda _n: code_bin)
 
         def _popen(argv, **kwargs):
@@ -510,7 +511,8 @@ class _OpenCodeHarness:
             hotkey,
             "flash_async",
             lambda url, project, message, duration_ms=None, tint=None: (
-                self.flashed.append(message)
+                self.flashed.append(message),
+                self.flash_tints.append(tint),
             ),
         )
         return spawned
@@ -1596,7 +1598,9 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
     where: no server round trip, and the user magent resolved stays in the
     authority (C3)."""
 
-    def _map(self, monkeypatch, tmp_path, *, nick="second"):
+    def _map(
+        self, monkeypatch, tmp_path, *, nick="second", cwd="/home/amin/magent/api"
+    ):
         from magent import nodes
         from magent.nodes import NodeMapEntry
 
@@ -1610,7 +1614,7 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
                     attached_existing=False,
                     remote_root="~/magent/api",
                     target="amin@devino-second",
-                    cwd="/home/amin/magent/api",
+                    cwd=cwd,
                 )
             }
         )
@@ -1693,3 +1697,109 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
         )
         hotkey._do_open_code("http://x:8034", "api", None)
         assert spawned == [["code", "/base/api"]]
+
+    # --- code.cmd re-parses its command line (cq-D15 I1) ----------------------
+    # CreateProcess runs a .cmd through `cmd.exe /c`, and list2cmdline quotes
+    # only whitespace: `R&D` opens `R` and runs a stray `D`, `%USERNAME%`
+    # expands. F2 refuses such an argv -- on BOTH paths -- instead of opening
+    # the wrong folder and flashing success. Nothing is launched: `_patch`'s
+    # Popen double records the argv it would have run.
+    _SHIM = r"C:\VS Code\bin\code.cmd"
+    _REFUSED = "F2: folder name has a character code.cmd can't pass"
+
+    def _assert_refused(self, spawned):
+        from magent import hotkey
+
+        assert spawned == []
+        assert self.flashed[-1] == self._REFUSED
+        assert self.flash_tints[-1] == hotkey.FLASH_TINT_ERR
+        assert not any(m.startswith("F2: VS Code ->") for m in self.flashed)
+
+    def test_an_ampersand_node_folder_is_refused_through_code_cmd(
+        self, monkeypatch, tmp_path
+    ):
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path, cwd="/home/amin/magent/R&D")
+        spawned = self._patch(monkeypatch, code_bin=self._SHIM)
+        hotkey._do_open_code("http://x:8034", "api", None)
+        self._assert_refused(spawned)
+
+    def test_a_percent_variable_node_folder_is_refused_through_code_cmd(
+        self, monkeypatch, tmp_path
+    ):
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path, cwd="/home/amin/magent/%USERNAME%")
+        spawned = self._patch(monkeypatch, code_bin=self._SHIM)
+        hotkey._do_open_code("http://x:8034", "api", None)
+        self._assert_refused(spawned)
+
+    def test_a_local_ampersand_folder_on_the_server_path_is_refused(
+        self, monkeypatch, tmp_path
+    ):
+        from magent import hotkey, nodes
+
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        spawned = self._patch(
+            monkeypatch,
+            code_bin=self._SHIM,
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "rd", "session": "rd", "resolved": r"C:\dev\R&D"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "rd", None)
+        self._assert_refused(spawned)
+
+    @pytest.mark.parametrize("char", sorted('&|<>^%"'))
+    @pytest.mark.parametrize("shim", ["code.cmd", "CODE.CMD", "code.bat", "Code.Bat"])
+    def test_every_metacharacter_is_refused_through_any_batch_shim(
+        self, monkeypatch, tmp_path, char, shim
+    ):
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path, cwd=f"/home/amin/magent/a{char}b")
+        spawned = self._patch(monkeypatch, code_bin=rf"C:\VS Code\bin\{shim}")
+        hotkey._do_open_code("http://x:8034", "api", None)
+        self._assert_refused(spawned)
+
+    def test_a_plain_spaced_folder_still_opens_through_code_cmd(
+        self, monkeypatch, tmp_path
+    ):
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path, cwd="/home/amin/magent/my api")
+        spawned = self._patch(monkeypatch, code_bin=self._SHIM)
+        hotkey._do_open_code("http://x:8034", "api", None)
+        assert spawned == [
+            [
+                self._SHIM,
+                "--remote",
+                "ssh-remote+amin@devino-second",
+                "/home/amin/magent/my api",
+            ]
+        ]
+        assert self.flashed[-1] == "F2: VS Code -> /home/amin/magent/my api"
+
+    @pytest.mark.parametrize(
+        "code_bin", [r"C:\VS Code\Code.exe", "/usr/bin/code", "code"]
+    )
+    def test_no_batch_shim_means_no_cmd_exe_and_nothing_refused(
+        self, monkeypatch, tmp_path, code_bin
+    ):
+        from magent import hotkey
+
+        self._map(monkeypatch, tmp_path, cwd="/home/amin/magent/R&D")
+        spawned = self._patch(monkeypatch, code_bin=code_bin)
+        hotkey._do_open_code("http://x:8034", "api", None)
+        assert spawned == [
+            [
+                code_bin,
+                "--remote",
+                "ssh-remote+amin@devino-second",
+                "/home/amin/magent/R&D",
+            ]
+        ]
