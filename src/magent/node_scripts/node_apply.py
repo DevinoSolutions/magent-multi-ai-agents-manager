@@ -11,8 +11,9 @@ A step that warned or failed is not recorded, so the next provision looks
 again. The store also keeps what the settings step last shipped (env keys,
 permission rules, extra directories), so what this PC stops shipping is
 taken back from the node; a lost or damaged store takes nothing back, and
-neither does a PC file the PC could not read (the manifest's ``unread``):
-its step is a skip that writes nothing and forgets nothing. A
+neither does a PC file the PC could not read (the manifest's ``unread``) or
+a payload member that does not read as a JSON object (``_member``): its
+step is a skip that writes nothing and forgets nothing. A
 deliberate drop (a hook whose program this node lacks) is a clean result:
 the same payload on the same node drops it again, and ``--force`` (what
 ``magent node setup`` sends) re-looks after a tool is installed.
@@ -190,10 +191,31 @@ def _remember(ctx: Ctx, step: str, want: str, mark: int) -> None:
         ctx.store.pop(step, None)
 
 
+def _member(ctx: Ctx, name: str) -> dict[str, object] | str:
+    """The payload member ``name`` as a JSON object, or the class of why it
+    is not one. Strict, unlike ``_load``: the PC always ships this member,
+    so a missing, empty or torn one is a broken payload -- unknown, never
+    the {} that reads as "this PC has none"."""
+    try:
+        loaded = json.loads((ctx.work / name).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError) as e:
+        return type(e).__name__
+    return loaded if isinstance(loaded, dict) else "not a JSON object"
+
+
+def _unread_member(ctx: Ctx, step: str, name: str, why: str, left: str) -> None:
+    """The skip row for a payload member ``_member`` could not read: the
+    class on screen, and the step writes nothing and forgets nothing it
+    remembers -- the same outcome as a PC file the PC could not read
+    (``_unread_on_pc``)."""
+    _row(ctx, "skip", step, f"the payload's {name} could not be read ({why}); {left}")
+
+
 def _load(path: Path) -> object:
     """A JSON file's value: {} when the file does not exist or is empty
     (a 0-byte settings.json), None when it cannot be read (a directory
-    there, no permission) or is not JSON."""
+    there, no permission) or is not JSON. For the node's own files; a
+    payload member is read strictly (``_member``)."""
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -756,23 +778,12 @@ def _step_settings(ctx: Ctx) -> None:
     statusLine the node cannot run falls back to the node's own. Settings the
     PC could not read, or a payload without a readable settings.json, change
     nothing: merged as {}, they would take back all the PC shipped before."""
-    if _unread_on_pc(
-        ctx,
-        "settings",
-        "~/.claude/settings.json",
-        "the node's settings are left as they are",
-    ):
+    left = "the node's settings are left as they are"
+    if _unread_on_pc(ctx, "settings", "~/.claude/settings.json", left):
         return
-    source = ctx.work / "settings.json"
-    loaded = _load(source) if source.is_file() else None
-    if not isinstance(loaded, dict):
-        _row(
-            ctx,
-            "fail",
-            "settings",
-            "the payload carries no readable settings.json; the node's settings "
-            "are left as they are",
-        )
+    loaded = _member(ctx, "settings.json")
+    if isinstance(loaded, str):
+        _unread_member(ctx, "settings", "settings.json", loaded, left)
         return
     # Through a symlink (a dotfiles-managed settings.json), not over it; a
     # dangling one is left alone with a warning (``_target``).
@@ -845,12 +856,13 @@ def _step_mcp(ctx: Ctx) -> None:
     header, and a ``claude`` starting mid-apply reads the old file or the
     new one. The node's claude rewrites this file as it runs, so the merge
     is ``_merge_into``'s: a write of its that lands mid-apply is kept."""
-    if _unread_on_pc(
-        ctx, "mcp", "~/.claude.json", "the node's MCP servers are left as they are"
-    ):
+    left = "the node's MCP servers are left as they are"
+    if _unread_on_pc(ctx, "mcp", "~/.claude.json", left):
         return
-    loaded = _load(ctx.work / "mcp_servers.json")
-    servers = loaded if isinstance(loaded, dict) else {}
+    servers = _member(ctx, "mcp_servers.json")
+    if isinstance(servers, str):
+        _unread_member(ctx, "mcp", "mcp_servers.json", servers, left)
+        return
     if not servers:
         _row(ctx, "skip", "mcp", "this PC has no user MCP servers to share")
         return
@@ -922,8 +934,16 @@ def _step_mcp_oauth(ctx: Ctx) -> None:
         ctx, "mcp_oauth", "MCP OAuth entries", "the node's are left as they are"
     ):
         return
-    loaded = _load(ctx.work / "mcp_oauth.json")
-    entries = loaded if isinstance(loaded, dict) else {}
+    entries = _member(ctx, "mcp_oauth.json")
+    if isinstance(entries, str):
+        _unread_member(
+            ctx,
+            "mcp_oauth",
+            "mcp_oauth.json",
+            entries,
+            "the node's MCP OAuth entries are left as they are",
+        )
+        return
     # A dangling link reads as "no file": named instead, never read as a
     # node with no servers.
     listed = _target(
