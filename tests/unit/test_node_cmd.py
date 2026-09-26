@@ -860,6 +860,17 @@ class TestNodeSetupRefusesBeforeAnySsh:
         assert "not a valid Unix user name: Bob" in result.output
         assert fake_ssh.calls() == []
 
+    @pytest.mark.parametrize("name", ["bob$(id)", "bob\n"])
+    def test_a_valid_prefix_is_not_a_valid_name(
+        self, runner, tmp_config, fake_ssh, name
+    ):
+        # The whole name must match: a valid head does not carry the rest.
+        _pc_key()
+        result = _setup(runner, _pool_file(tmp_config), "second", "--user", name)
+        assert result.exit_code == 2
+        assert "not a valid Unix user name" in result.output
+        assert fake_ssh.calls() == []
+
     def test_root_is_refused_as_a_node_user(self, runner, tmp_config, fake_ssh):
         # setup.sh refuses it too, but only after the root hop.
         _pc_key()
