@@ -8,6 +8,7 @@ end-to-end, not mocked away.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import time
 
@@ -380,7 +381,7 @@ class TestSessionsJson:
 
         rows = json.loads(result.stdout)
         # Live and dead alike: the key is on every row, never only some.
-        assert [(r["name"], r["node"]) for r in rows] == [
+        assert [(r["name"], r.get("node", "absent")) for r in rows] == [
             ("caramel", None),
             ("upup", None),
         ]
@@ -470,6 +471,30 @@ class TestSessionsJson:
             "effort": None,
             "node": "second",
         }
+
+    def test_a_node_row_is_named_by_the_session_it_was_started_under(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # A local row's name is its session id; a node row's is the map's
+        # recorded sid, not the project title it may since have drifted from.
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        from magent import nodes
+
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+        entry = nodes.read_node_map()["api"]
+        nodes.update_node_map("api", dataclasses.replace(entry, sid="api-old"))
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": time.time(), "sessions": ["api-old"]}
+        )
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._node_config(tmp_config, tmp_path), "sessions", "--json"],
+        )
+
+        row = json.loads(result.stdout)[1]
+        assert (row["name"], row["state"]) == ("api-old", "live")
 
     def test_a_fresh_pull_without_the_session_reads_dead(
         self, runner, tmp_config, tmp_path, monkeypatch
