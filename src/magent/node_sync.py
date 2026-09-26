@@ -386,17 +386,20 @@ def _next_mark(
     spec: remote_mux.SidPull, old: Mark | None, snap: remote_mux.NodeSnapshot, sid: str
 ) -> Mark:
     """Where this session's next pull starts:
-    - the node did not report it, or one of its files failed to store: stay
-      put (a failed file is asked for again next tick);
+    - the node did not report it: stay put;
     - its transcripts were never requested under the current real path (a
       first sight, a moved directory): from zero;
-    - otherwise: from the node's own clock at scan time, minus the overlap."""
+    - otherwise: ``remote_mux.next_since`` -- the ONE watermark rule ``pull``
+      shares. A file that failed to store holds the mark; a reply cut short
+      moves it just under the first file still owed, never to the node's
+      clock, which would put the owed files behind it for good (cq-G14
+      I-R2-1; the canonical form of E8's truncated-pull rule)."""
     real = snap.realpaths.get(sid)
-    if real is None or sid in snap.failed_sids:
+    if real is None:
         return old if old is not None else Mark(since=0.0, realpath=real)
     if spec.project_dir is None or old is None or old.realpath != real:
         return Mark(since=0.0, realpath=real)
-    return Mark(since=snap.now - remote_mux.WATERMARK_OVERLAP_S, realpath=real)
+    return Mark(since=remote_mux.next_since(snap, sid, old.since), realpath=real)
 
 
 def _prune_state(nick: str, sid: str, keep: Collection[str]) -> None:

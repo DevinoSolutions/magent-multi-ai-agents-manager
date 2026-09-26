@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -1126,6 +1127,41 @@ class TestTheWatermark:
         assert _marks() == {"api": {"since": 10.0, "realpath": "/r"}}
         assert (state / "gone.json").exists()
 
+    @pytest.mark.parametrize(
+        ("resume", "held"),
+        [({"api": 50.0}, math.nextafter(50.0, -math.inf)), ({}, 10.0)],
+        ids=["resume", "no-resume"],
+    )
+    def test_a_truncated_tick_asks_again_for_the_files_it_still_owes(
+        self, placed, resume, held
+    ):
+        """cq-G14 I-R2-1: the daemon shares remote_mux.next_since's rule --
+        just under the first owed file, or held without a resume point."""
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"), {"api": {"since": 10.0, "realpath": "/r"}}
+        )
+        asked: list[float] = []
+        replies = iter(
+            [
+                _snapshot(
+                    realpaths={"api": "/r"},
+                    truncated={"api": ("api/transcripts/a.jsonl",)},
+                    resume=resume,
+                ),
+                _snapshot(realpaths={"api": "/r"}),
+            ]
+        )
+
+        def pull(_node, sids):
+            asked.append(sids["api"].since)
+            return next(replies)
+
+        syncer = node_sync.NodeSyncer(_second_only(), pull=pull)
+        syncer.tick()
+        assert _marks() == {"api": {"since": held, "realpath": "/r"}}
+        syncer.tick()
+        assert asked == [10.0, held]
+
     def test_marks_are_dropped_for_sessions_no_longer_placed(self, placed, fake_ssh):
         nodes.write_json_atomic(
             nodes.pull_marks_path("second"), {"gone": {"since": 5.0, "realpath": "/g"}}
@@ -1574,6 +1610,13 @@ class TestAFinalPullThatDidNotFinishIsNotASuccess:
             node_sync.final_pull(_config(), "api")
         assert info.value.rc == 0
         assert "2 file(s) did not fit in the reply" in info.value.stderr_tail
+        # cq-G14 I-R2-1: saved BEFORE the raise, and just under the first file
+        # still owed -- the node's clock would put the owed files behind the
+        # watermark, and no later pull would ask for them.
+        assert _marks()["api"] == {
+            "since": math.nextafter(50.0, -math.inf),
+            "realpath": "/home/amin/magent/api",
+        }
 
     def test_another_sessions_failure_is_not_this_ones(self, answers):
         answers(failed_sids=frozenset({"web"}), truncated={"web": ("w",)})

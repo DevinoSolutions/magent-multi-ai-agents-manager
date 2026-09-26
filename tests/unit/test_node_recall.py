@@ -12,6 +12,7 @@ of a transcript IS its session id; subagent logs (agent-*.jsonl, anything under
 from __future__ import annotations
 
 import io
+import math
 import os
 import shlex
 import shutil
@@ -2034,6 +2035,55 @@ class TestTheLastPullMustFinish:
 
         _stopped_before_anything(result, api_repo)
         assert "1 file(s) did not fit in the reply" in result.stderr
+
+    def test_the_rerun_asks_again_from_the_first_owed_file_and_only_then_clears(
+        self, runner, placed_api, node_answers, monkeypatch, api_repo
+    ):
+        """cq-G14 I-R2-1: "run the recall again" holds only if the rerun asks
+        for what the cut-short reply still owes -- files older than the node's
+        clock, which a watermark at that clock would never ask for again."""
+        monkeypatch.setattr(node_sync, "final_pull", _REAL_FINAL_PULL)
+        real = "/home/amin/magent/api"
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"), {"api": {"since": 10.0, "realpath": real}}
+        )
+        owed_from = NOW - 3600.0
+        base = {
+            "now": NOW,
+            "sessions": ("api",),
+            "sample": None,
+            "realpaths": {"api": real},
+            "state_files": {},
+            "files": (),
+            "failed_sids": frozenset(),
+        }
+        replies = iter(
+            [
+                remote_mux.NodeSnapshot(
+                    **base,
+                    truncated={"api": ("api/transcripts/old.jsonl",)},
+                    resume={"api": owed_from},
+                ),
+                remote_mux.NodeSnapshot(**base),
+            ]
+        )
+        asked: list[float] = []
+
+        def pull(_node, sids):
+            asked.append(sids["api"].since)
+            return next(replies)
+
+        monkeypatch.setattr(node_sync, "_pull_node", pull)
+
+        first = _recall(runner, placed_api, "--local")
+
+        _stopped_before_anything(first, api_repo)
+
+        second = _recall(runner, placed_api, "--local")
+
+        assert asked == [10.0, math.nextafter(owed_from, -math.inf)]
+        assert second.exit_code == 0, second.output
+        assert "api" not in nodes.read_node_map()
 
     def test_a_placement_the_pull_could_not_read_again_stops_the_recall(
         self, runner, placed_api, node_answers, monkeypatch, api_repo
