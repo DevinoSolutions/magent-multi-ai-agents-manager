@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import dataclasses
 import inspect
 import json
@@ -12,6 +13,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -314,6 +316,29 @@ def spawned(monkeypatch):
 # pipe reads.
 CAP = 256 * 1024
 
+# A child that leaves a GRANDCHILD holding its stderr open (inherited; its pid
+# goes to argv[1]), says one line on stderr, then floods stdout. The 90s sleep
+# outlives every bound the call has (timeout_s=60 + two 1s reaps), so the
+# teardown's kill-by-pid always hits the live grandchild, never a pid Windows
+# reused. Not longer: an unbounded-join mutant waits out the whole sleep.
+_HELD_STDERR_CHILD = """\
+import subprocess, sys
+grandchild = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(90)"],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=None,
+)
+with open(sys.argv[1], "w") as f:
+    f.write(str(grandchild.pid))
+sys.stderr.write("boom: disk full\\n")
+sys.stderr.flush()
+block = b"x" * 65536
+while True:
+    sys.stdout.buffer.write(block)
+    sys.stdout.flush()
+"""
+
 
 class TestTheReplyIsBoundedInMemory:
     def test_every_entry_point_defaults_to_the_module_cap(self):
@@ -336,10 +361,11 @@ class TestTheReplyIsBoundedInMemory:
         started = time.monotonic()
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["big"], timeout_s=30, max_stdout_bytes=CAP)
-        assert time.monotonic() - started < 10
+        # Under the 30s timeout, with room for a loaded box (a spawn: 8-10s).
+        assert time.monotonic() - started < 25
         assert exc.value.rc is None
         assert exc.value.timed_out is False
-        assert exc.value.stderr_tail == f"reply exceeded {CAP} bytes"
+        assert exc.value.stderr_tail.splitlines()[0] == f"reply exceeded {CAP} bytes"
         assert exc.value.command_redacted[0] == "ssh"
         (proc,) = spawned
         assert proc.poll() is not None
@@ -390,6 +416,63 @@ class TestTheReplyIsBoundedInMemory:
         assert result.stdout == body.encode("ascii")
         (call,) = fake_ssh.calls()
         assert call.stdin == payload
+
+    def test_the_over_cap_error_keeps_what_the_child_said_on_stderr(self, fake_ssh):
+        # The likely cause of a flood is the child's last words before it.
+        fake_ssh.set_reply("flood", stderr="boom: disk full\n")
+        fake_ssh.set_mode("flood")
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["flood"], timeout_s=60, max_stdout_bytes=CAP)
+        lines = exc.value.stderr_tail.splitlines()
+        assert lines[0] == f"reply exceeded {CAP} bytes"
+        assert "boom: disk full" in lines[1:]
+
+    def test_the_stderr_wait_after_the_cap_is_bounded_by_the_reap(self, tmp_path):
+        # A grandchild still holds stderr, so it never ends: the over-cap path
+        # must give up after the reap bound and raise without the tail, not
+        # wait out the grandchild's 90s.
+        pidfile = tmp_path / "grandchild.pid"
+        started = time.monotonic()
+        try:
+            with pytest.raises(RemoteError) as exc:
+                remote_mux._spawn(
+                    [sys.executable, "-c", _HELD_STDERR_CHILD, str(pidfile)],
+                    timeout_s=60,
+                    input_bytes=None,
+                    check=True,
+                    shown=("child",),
+                    label="test child",
+                    quiet=True,
+                    max_stdout_bytes=CAP,
+                )
+            elapsed = time.monotonic() - started
+        finally:
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(pidfile.read_text(encoding="utf-8")), signal.SIGTERM)
+        assert exc.value.stderr_tail == f"reply exceeded {CAP} bytes"
+        assert elapsed < 20
+
+    def test_the_drain_drops_what_it_held_once_over_the_cap(self):
+        # Two writes, so the first cap's worth is HELD before the byte that
+        # tips it over arrives: a drain that kept its chunks would hand
+        # them back.
+        cap = 1024
+        r, w = os.pipe()
+        drain = remote_mux._Drain(os.fdopen(r, "rb"), cap, tail=False)
+        drain.start()
+        try:
+            os.write(w, b"a" * cap)
+            deadline = time.monotonic() + 5
+            while drain._held < cap and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert drain._held == cap
+            os.write(w, b"b")
+        finally:
+            os.close(w)
+        drain.join(5)
+        assert not drain.is_alive()
+        assert drain.over
+        assert drain.data() == b""
 
     def test_run_script_hands_its_cap_to_run(self, fake_ssh):
         fake_ssh.set_reply("bash -s", stdout="x" * (CAP + 1))
