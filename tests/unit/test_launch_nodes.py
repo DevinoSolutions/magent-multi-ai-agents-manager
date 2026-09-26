@@ -1204,3 +1204,158 @@ class TestGoWarnsOnceWhenNodeWindowsCannotReconnect:
         monkeypatch.setattr(attach_client, "client_exe", lambda: None)
         launch.run_magent(_config(api), launch.RunOpts())
         assert "auto-reconnect" not in capsys.readouterr().out
+
+
+class TestADryRunPreviewsOnlyWhatTheRunWillDo:
+    """cq-D12 I1/M2: the preview is the real run's first step, so it appears
+    exactly where the real run would queue a bring-up -- never for a window
+    already open, never under a re-tile -- and it reads the map's placement."""
+
+    def test_an_open_window_is_not_previewed(
+        self, rig, api, no_sleep, monkeypatch, capsys
+    ):
+        plat = FakePlatform(supports_attach_windows=True)
+        plat._register_window("magent:api")
+        monkeypatch.setattr(launch, "get_platform", lambda: plat)
+        launch.run_magent(_config(api), launch.RunOpts(dry_run=True, retile_all=True))
+        out = capsys.readouterr().out
+        assert "would provision" not in out
+        assert "-> amin@devino-second" not in out
+
+    def test_a_retile_is_not_previewed(self, rig, api, desk, no_sleep, capsys):
+        launch.run_magent(
+            _config(api), launch.RunOpts(dry_run=True, retile_all=True, tile_only=True)
+        )
+        assert "would provision" not in capsys.readouterr().out
+
+    def test_an_auto_project_is_badged_and_previewed_on_its_placed_node(
+        self, rig, tmp_path, desk, no_sleep, capsys
+    ):
+        folder = tmp_path / "web"
+        folder.mkdir()
+        rig.states[folder] = _state(folder)
+        nodes.update_node_map(
+            "web",
+            NodeMapEntry(
+                nick="third",
+                sid="web",
+                placed_ts=0.0,
+                attached_existing=False,
+                remote_root="~/magent/web",
+                target="amin@devino-third",
+                cwd="/home/amin/magent/web",
+            ),
+        )
+        proj = ProjectConfig(path=str(folder), node="auto")
+        launch.run_magent(_config(proj), launch.RunOpts(dry_run=True))
+        out = capsys.readouterr().out
+        assert "[@third]" in out
+        assert "-> amin@devino-third:~/magent/web" in out
+        assert "would provision third" in out
+
+    def test_a_relative_path_under_base_dir_names_its_folder(
+        self, rig, tmp_path, desk, no_sleep, capsys
+    ):
+        base = tmp_path / "base"
+        (base / "svc").mkdir(parents=True)
+        proj = ProjectConfig(path="svc", node="second", title="renamed")
+        cfg = _config(proj)
+        cfg.base_dir = str(base)
+        launch.run_magent(cfg, launch.RunOpts(dry_run=True))
+        assert "-> amin@devino-second:~/magent/svc" in capsys.readouterr().out
+
+
+class TestARetileOrAnOpenWindowDialsNoNode:
+    """cq-D12 I3/M1: "tile what is open" never starts remote work, and the
+    already-open probe keys on the SANITIZED sid -- the name the window is
+    titled with -- so a spaced title cannot re-bring-up a live project."""
+
+    def test_a_tile_only_run_never_brings_a_node_project_up(
+        self, rig, api, desk, no_sleep
+    ):
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True, tile_only=True))
+        assert rig.recipes == []
+        assert rig.windows == []
+
+    def test_a_spaced_title_probes_the_sid_window(
+        self, rig, tmp_path, no_sleep, monkeypatch
+    ):
+        folder = tmp_path / "gh"
+        folder.mkdir()
+        rig.states[folder] = _state(folder)
+        proj = ProjectConfig(path=str(folder), node="second", title="GitHub Ads")
+        assert nodes.node_sid(proj) != "GitHub Ads"
+        plat = FakePlatform(supports_attach_windows=True)
+        plat._register_window("magent:" + nodes.node_sid(proj))
+        monkeypatch.setattr(launch, "get_platform", lambda: plat)
+        launch.run_magent(_config(proj), launch.RunOpts(retile_all=True))
+        assert rig.recipes == []
+
+
+class TestTheNodePhaseSaysWhatHappened:
+    """cq-D12 I2/M4: a bring-up that came up but whose window did not open is
+    named on screen (tiling's "not found" no longer says it, by design), and a
+    fan-out that can run for minutes announces itself first."""
+
+    def test_a_window_that_did_not_open_is_said_once(
+        self, rig, api, desk, no_sleep, monkeypatch, capsys
+    ):
+        def no_wt(*_a: object, **_k: object) -> str:
+            raise FileNotFoundError("wt")
+
+        monkeypatch.setattr("magent.attach_client.spawn_attach_window", no_wt)
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        (line,) = [
+            ln for ln in capsys.readouterr().out.splitlines() if "did not open" in ln
+        ]
+        assert line.lstrip().startswith("! api:")
+        assert "nodes.log" in line
+        assert "magent --go" in line
+        assert line.isascii()
+
+    def test_nothing_is_said_where_no_window_was_meant_to_open(
+        self, rig, api, no_sleep, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(launch, "get_platform", FakePlatform)
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        assert "did not open" not in capsys.readouterr().out
+
+    def test_a_refused_bring_up_is_not_said_to_be_a_missing_window(
+        self, rig, api, desk, no_sleep, tmp_path, capsys
+    ):
+        # Its own "x api: ..." line already says why; no window was ever due.
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        out = capsys.readouterr().out
+        assert "api: " in out
+        assert "did not open" not in out
+
+    def test_an_opened_window_is_not_said_missing(
+        self, rig, api, desk, no_sleep, capsys
+    ):
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        assert "did not open" not in capsys.readouterr().out
+
+    def test_the_fan_out_announces_itself_once(
+        self, rig, tmp_path, desk, no_sleep, capsys
+    ):
+        projs = _projects(tmp_path, rig, [("a1", "second"), ("b1", "third")])
+        launch.run_magent(_config(*projs), launch.RunOpts())
+        out = capsys.readouterr().out
+        assert out.count("nodes: bringing up 2 project(s)") == 1
+        assert out.index("nodes: bringing up") < out.index("a1 @second started")
+
+
+class TestTheExactFallbackIsExact:
+    def test_a_window_merely_containing_the_title_is_not_the_one_moved(
+        self, rig, api, desk, no_sleep, monkeypatch
+    ):
+        # cq-D12 M3: a decoy whose title CONTAINS the returned one is on the
+        # desk first; only the window titled exactly that is placed.
+        desk._register_window("xx api on second xx")
+        monkeypatch.setattr(
+            "magent.attach_client.spawn_attach_window",
+            _spawn_titled(desk, "api on second"),
+        )
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        assert [h for h, _r in desk.moved] == [desk._windows["api on second"]]

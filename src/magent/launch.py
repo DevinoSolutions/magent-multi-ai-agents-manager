@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 
     from magent.config import MagentConfig, ProjectConfig
     from magent.env import MagentEnv
-    from magent.nodes import LocalGitState, Node, Recipe
+    from magent.nodes import LocalGitState, Node, NodeMapEntry, Recipe
 
 
 def spawn_detached(args: list[str], extra_flags: int = 0) -> subprocess.Popen[bytes]:
@@ -1106,23 +1106,27 @@ def _dispatch_node_project(
     label = held.nick if proj.node == NODE_AUTO and held else str(proj.node)
     _log_project(nodes.project_name(proj), tool, running, None, node=label)
     targets.append(_Target(name=sid, key=sid, mode="magent-name", is_new=not running))
-    if opts.dry_run:
-        _echo_node_dry_run(config, proj)
-        return 0
+    # The skip comes BEFORE the preview: a dry run says what the real run
+    # would do, and for an open window or a re-tile that is nothing.
     if running or opts.tile_only:
+        return 0
+    if opts.dry_run:
+        _echo_node_dry_run(config, proj, held)
         return 0
     node_projects.append(proj)
     return 1
 
 
-def _echo_node_dry_run(config: MagentConfig, proj: ProjectConfig) -> None:
+def _echo_node_dry_run(
+    config: MagentConfig, proj: ProjectConfig, held: NodeMapEntry | None
+) -> None:
     """Where ``proj`` would land, from config and the map alone: no ssh, no
-    git, no write."""
+    git, no write. ``held`` is the map entry the caller already read, so the
+    badge and this preview answer from one snapshot."""
     # heavy subsystem: in-body per policy
     from magent import nodes
     from magent.env import local_username
 
-    held = nodes.read_node_map().get(nodes.project_name(proj))
     project_dir = _node_project_dir(config, proj) or Path(proj.path)
     try:
         node = nodes.resolve(
@@ -1179,13 +1183,21 @@ def _bring_up_node_windows(
     from the spawn -- never one rebuilt from the sid, so tiling cannot drift
     from the window. A project with no window coming (a failed bring-up, a
     platform without attach windows, a spawn that raised) has its target
-    dropped rather than polled for and reported "not found"."""
-    click.echo()
+    dropped rather than polled for and reported "not found" -- and where a
+    window WAS meant to open, that is said here instead, since tiling no
+    longer will."""
+    count = len(result.node_projects)
+    # A clone is minutes of network: say what is running before it runs.
+    click.echo(
+        f"\n  {style('#', fg='blue')} nodes: bringing up "
+        f"{style(str(count), fg='blue', bold=True)} project(s)..."
+    )
     _warn_node_windows_will_not_reconnect(plat)
     outcomes = _run_node_bring_ups(
         config, list(result.node_projects), allow_dirty=opts.allow_dirty, window=True
     )
     _echo_node_outcomes(outcomes)
+    windows_expected = plat.supports_attach_windows()
     by_sid = {o.sid: o for o in outcomes}
     targets: list[_Target] = []
     for target in result.targets:
@@ -1194,6 +1206,13 @@ def _bring_up_node_windows(
             targets.append(target)
         elif outcome.ok and outcome.title is not None:
             targets.append(_node_window_target(target, outcome.title))
+        elif outcome.ok and windows_expected:
+            # The session is up; only the window failed (the spawn's reason is
+            # in nodes.log). A re-run re-queues it and attaches to the session.
+            click.echo(
+                f"  {style('!', fg='yellow')} {outcome.sid}: its window did not open"
+                f" {style('(see ~/.magent/logs/nodes.log) -- re-run magent --go to open it', dim=True)}"
+            )
     return replace(result, targets=targets)
 
 
