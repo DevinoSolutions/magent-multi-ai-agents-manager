@@ -235,7 +235,7 @@ class TestTheNodeLock:
         clock = iter([0.0, 0.1, 0.3, 0.6])
         with (
             exclusive_lock("node-pull-second"),
-            pytest.raises(LockHeld),
+            pytest.raises(node_sync.NodeLockHeld),
             node_sync.node_lock(
                 "second", wait_s=0.5, sleep=naps.append, now=lambda: next(clock)
             ),
@@ -248,10 +248,13 @@ class TestTheNodeLock:
             raise AssertionError("slept")
 
         with (
-            pytest.raises(LockHeld, match="inner"),
+            pytest.raises(LockHeld, match="inner") as exc,
             node_sync.node_lock("second", sleep=never),
         ):
             raise LockHeld("inner")
+        # Only a refused ACQUIRE is the node's own lock: the body's LockHeld
+        # is some other lock, and the syncer must not read it as contention.
+        assert not isinstance(exc.value, node_sync.NodeLockHeld)
         with node_sync.node_lock("second"):
             pass
 
@@ -1763,24 +1766,6 @@ class TestTheLoop:
         assert crash.getMessage() == "node sync daemon crashed"
         assert crash.exc_info is not None
 
-    # Superseded by E11 (96c51f8): there a bug in one pull becomes that node's
-    # (failed, "internal error: <Type>"), and E11's test replaces this one.
-    def test_a_bug_in_a_pull_crashes_the_loop(self, placed, caplog):
-        """_sync_node reduces only NodeConfigError, LockHeld, RemoteError and
-        OSError to an outcome. Anything else raised inside a pull is a bug: it
-        propagates out of the tick and crashes the loop, heartbeat kept."""
-        _capture_nodes_log(caplog)
-
-        def broken(_node, _sids):
-            raise ValueError("boom")
-
-        with pytest.raises(ValueError, match="boom"):
-            node_sync.run_sync_loop(_config(), max_ticks=1, pull=broken)
-        assert heartbeat_age(node_sync.HEARTBEAT_NAME) is not None
-        assert node_sync.daemon_pid() is None
-        (crash,) = _errors(caplog)
-        assert crash.exc_info is not None
-
     def test_a_changed_config_is_picked_up_between_ticks(self, placed):
         seen: list[tuple[str, list[str]]] = []
         smaller = _second_only()
@@ -2070,7 +2055,64 @@ class TestAHungNodeDoesNotHoldTheTick:
         assert _node_warnings(caplog, "second") == [
             "node second: failed (pull.sh: broke)"
         ]
-        assert _reachable_again(caplog) == ["node second: reachable again"]
+        # E11 (96c51f8): a node back from a failure other than unreachable is
+        # "ok again (was failed)"; "reachable again" names a transport recovery.
+        assert _reachable_again(caplog) == []
+        assert "node second: ok again (was failed)" in [
+            r.getMessage() for r in caplog.records
+        ]
+
+    def test_a_stale_pull_noted_mid_error_leaves_the_error_to_its_collector(
+        self, placed, caplog, executors, monkeypatch
+    ):
+        """The E11 x E13 seam: a tick notes a pull past the stale threshold as
+        unreachable while its worker is recording an internal error. That note
+        must not take the error (it would log "unreachable" at ERROR with a
+        traceback that is not an unreachable node's); the tick that collects
+        the finished pull logs it, once, at ERROR."""
+        _capture_nodes_log(caplog)
+        recorded = threading.Event()
+        release = threading.Event()
+        real = node_sync.NodeSyncer._internal_error
+
+        def internal_error(self, nick, e):
+            out = real(self, nick, e)
+            if nick == "second":
+                recorded.set()
+                assert release.wait(30), "the test never released the worker"
+            return out
+
+        monkeypatch.setattr(node_sync.NodeSyncer, "_internal_error", internal_error)
+
+        def pull(node, _sids):
+            if node.nick == "second":
+                raise KeyError("boom")
+            return _snapshot()
+
+        clock = _Clock()
+        syncer = node_sync.NodeSyncer(
+            _config(pull_interval_s=30), pull=pull, clock=clock
+        )
+        try:
+            syncer.tick(wait_s=0.2)
+            assert recorded.wait(10), "the worker never recorded its error"
+            clock.at = 61.0  # past 2 * pull_interval_s: the running pull is news
+            stale = syncer.tick(wait_s=0.2)
+            release.set()
+            _wait_out_the_laggard(syncer, "second")
+            collected = syncer.tick(wait_s=10)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+        assert stale["second"] == _running(61)
+        assert _node_warnings(caplog, "second") == [
+            "node second: unreachable (pull still running after 61s)"
+        ]
+        assert collected["second"] == (node_sync.FAILED, "internal error: KeyError")
+        (error,) = _node_errors(caplog)
+        assert error.getMessage() == "node second: failed (internal error: KeyError)"
+        assert error.exc_info is not None
 
     def test_a_node_readded_while_its_old_pull_runs_is_not_dialled_twice(
         self, placed, executors
@@ -2510,3 +2552,312 @@ class TestWhatAFinalPullLeavesBehind:
         )
         node_sync.final_pull(_config(), "api")
         assert waits == [remote_mux.PULL_TIMEOUT_S + 2.0]
+
+
+def _snap() -> remote_mux.NodeSnapshot:
+    return remote_mux.NodeSnapshot(
+        now=1.0,
+        sessions=(),
+        sample=None,
+        realpaths={},
+        state_files={},
+        files=(),
+        failed_sids=frozenset(),
+    )
+
+
+def _pull_raising(raises: dict[str, BaseException]):
+    """The ``pull=`` seam: raise ``raises[nick]`` for that node (read at call
+    time, so a test can change it between ticks), else an empty snapshot."""
+
+    def pull(node, sids):
+        exc = raises.get(node.nick)
+        if exc is not None:
+            raise exc
+        return _snap()
+
+    return pull
+
+
+def _node_errors(caplog) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.name == "magent.nodes" and r.levelno == logging.ERROR
+    ]
+
+
+class TestABugInOneNodeFailsItAlone:
+    def test_a_bug_in_one_nodes_pull_fails_that_node_and_the_tick_goes_on(self, placed):
+        syncer = node_sync.NodeSyncer(
+            _config(), pull=_pull_raising({"second": KeyError("sid")})
+        )
+        assert syncer.tick() == {
+            "second": (node_sync.FAILED, "internal error: KeyError"),
+            "third": (node_sync.OK, ""),
+        }
+        assert nodes.read_sessions("third") is not None
+
+    def test_a_bug_is_one_error_with_its_traceback_per_state_change(
+        self, placed, caplog
+    ):
+        _capture_nodes_log(caplog)
+        syncer = node_sync.NodeSyncer(
+            _config(), pull=_pull_raising({"second": KeyError("sid")})
+        )
+        syncer.tick()
+        syncer.tick()
+        (record,) = _node_errors(caplog)
+        assert record.getMessage() == "node second: failed (internal error: KeyError)"
+        assert record.exc_info is not None
+        assert record.exc_info[0] is KeyError
+        # The outcome names the type only; the exception's own words ride on
+        # the record's traceback (and so into Sentry), not into tick's result.
+        assert (
+            logging.Formatter()
+            .formatException(record.exc_info)
+            .endswith("KeyError: 'sid'")
+        )
+        assert _node_warnings(caplog, "second") == []
+
+    def test_a_plain_failure_turning_into_a_bug_is_still_reported(self, placed, caplog):
+        _capture_nodes_log(caplog)
+        raises: dict[str, BaseException] = {
+            "second": remote_mux.RemoteError(0, "no MAGENT-PULL header", ("ssh",))
+        }
+        syncer = node_sync.NodeSyncer(_config(), pull=_pull_raising(raises))
+        syncer.tick()
+        raises["second"] = TypeError("bad")
+        syncer.tick()
+        assert _node_warnings(caplog, "second") == [
+            "node second: failed (no MAGENT-PULL header)"
+        ]
+        (record,) = _node_errors(caplog)
+        assert record.getMessage() == "node second: failed (internal error: TypeError)"
+
+    def test_a_lock_held_inside_the_pull_is_a_bug_not_contention(self, placed):
+        results = node_sync.NodeSyncer(
+            _config(), pull=_pull_raising({"second": LockHeld("some other lock")})
+        ).tick()
+        assert results["second"] == (node_sync.FAILED, "internal error: LockHeld")
+
+    def test_an_os_error_fails_that_node_alone(self, placed):
+        results = node_sync.NodeSyncer(
+            _config(), pull=_pull_raising({"second": PermissionError("denied")})
+        ).tick()
+        assert results == {
+            "second": (node_sync.FAILED, "denied"),
+            "third": (node_sync.OK, ""),
+        }
+
+    def test_a_node_back_from_a_failure_is_ok_again_not_reachable_again(
+        self, placed, caplog
+    ):
+        _capture_nodes_log(caplog)
+        raises: dict[str, BaseException] = {
+            "second": remote_mux.RemoteError(0, "no MAGENT-PULL header", ("ssh",))
+        }
+        syncer = node_sync.NodeSyncer(_config(), pull=_pull_raising(raises))
+        syncer.tick()
+        raises.clear()
+        syncer.tick()
+        messages = [r.getMessage() for r in caplog.records]
+        assert "node second: ok again (was failed)" in messages
+        assert not [m for m in messages if "reachable again" in m]
+
+
+class TestWhatCountsAsUnreachable:
+    @pytest.mark.parametrize(
+        ("err", "outcome"),
+        [
+            (
+                remote_mux.RemoteError(255, "Connection refused", ("ssh",)),
+                "unreachable",
+            ),
+            (
+                remote_mux.RemoteError(
+                    None, "timed out after 1s", ("ssh",), timed_out=True
+                ),
+                "unreachable",
+            ),
+            # Both rc None, neither a silent node: an over-cap reply is a node
+            # that answered too much, a spawn failure never left this PC.
+            (
+                remote_mux.RemoteError(None, "reply exceeded 5 bytes", ("ssh",)),
+                "failed",
+            ),
+            (remote_mux.RemoteError(None, "Permission denied", ("ssh",)), "failed"),
+            (remote_mux.RemoteError(1, "boom", ("ssh",)), "failed"),
+        ],
+    )
+    def test_only_a_transport_failure_or_a_timeout_is_unreachable(self, err, outcome):
+        assert node_sync._classify(err)[0] == outcome
+
+    def test_a_node_cannot_write_terminal_escapes_into_the_log(self, placed, caplog):
+        _capture_nodes_log(caplog)
+        tail = "first\n\x1b]0;pwned\x07\x1b[2Jboom\x7f\tend\x9b"
+        err = remote_mux.RemoteError(1, tail, ("ssh",))
+        results = node_sync.NodeSyncer(
+            _config(), pull=_pull_raising({"second": err})
+        ).tick()
+        assert results["second"] == (node_sync.FAILED, "?]0;pwned??[2Jboom?\tend?")
+        (line,) = _node_warnings(caplog, "second")
+        assert not re.search(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]", line)
+
+
+class TestABadWatermarkIsNoWatermark:
+    @pytest.mark.parametrize(
+        "since",
+        [
+            pytest.param("1" + "0" * 309, id="309-digit-int"),
+            pytest.param("NaN", id="nan"),
+            pytest.param("Infinity", id="inf"),
+            pytest.param("-Infinity", id="-inf"),
+        ],
+    )
+    def test_a_since_that_is_not_a_finite_time_is_absent(self, placed, since):
+        path = nodes.pull_marks_path("second")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Raw text: json.loads accepts each of these, and none is a time.
+        # float() of the 309-digit int raises OverflowError, not ValueError.
+        bad = '{"since": ' + since + ', "realpath": "/home/amin/magent/api"}'
+        path.write_text(
+            '{"api": ' + bad + ', "ok": {"since": 5, "realpath": null}}',
+            encoding="utf-8",
+        )
+        assert node_sync._read_marks("second") == {
+            "ok": node_sync.Mark(since=5.0, realpath=None)
+        }
+
+
+class TestAnEmptyRemoteRoot:
+    def test_a_session_with_no_remote_root_is_skipped_naming_the_field(
+        self, placed, caplog
+    ):
+        _capture_nodes_log(caplog)
+        nodes.write_node_map(
+            {
+                "api": NodeMapEntry(
+                    nick="second",
+                    sid="api",
+                    placed_ts=1.0,
+                    attached_existing=False,
+                    remote_root="",
+                )
+            }
+        )
+        asked: list[set[str]] = []
+
+        def pull(node, sids):
+            asked.append(set(sids))
+            return _snap()
+
+        results = node_sync.NodeSyncer(_config(), pull=pull).tick()
+        assert results["second"] == (node_sync.OK, "")
+        assert asked == [set(), set()]
+        assert _node_warnings(caplog, "second") == [
+            (
+                "node second: session 'api' has an empty remote_root in the "
+                "node map; skipping it"
+            )
+        ]
+
+
+class TestARemovedNodeIsForgotten:
+    def test_a_node_removed_and_re_added_while_down_is_warned_again(
+        self, placed, caplog
+    ):
+        _capture_nodes_log(caplog)
+        down = remote_mux.RemoteError(255, REFUSED, ("ssh",))
+        syncer = node_sync.NodeSyncer(_config(), pull=_pull_raising({"second": down}))
+        syncer.tick()
+        syncer.reconfigure(_config(pool={"third": POOL["third"]}))
+        syncer.tick()
+        syncer.reconfigure(_config())
+        syncer.tick()
+        assert (
+            _node_warnings(caplog, "second")
+            == [f"node second: unreachable ({REFUSED.strip()})"] * 2
+        )
+
+
+# 200k nested arrays: json.loads raises RecursionError, not ValueError.
+_TOO_DEEP = "[" * 200_000
+
+
+class TestJsonNestedTooDeeply:
+    def test_a_node_whose_pull_metadata_nests_too_deeply_has_failed(
+        self, placed, caplog
+    ):
+        """Node-controlled input: a bad answer (FAILED at WARNING), never an
+        internal error at ERROR."""
+        _capture_nodes_log(caplog)
+        reply = (
+            remote_mux.PULL_HEADER
+            + _TOO_DEEP.encode("ascii")
+            + b"\n"
+            + remote_mux.PULL_TRAILER
+            + b"0\n"
+        )
+
+        def pull(node, sids):
+            return remote_mux.parse_pull(
+                reply, dest=nodes.node_dir(node.nick), sids=frozenset(sids)
+            )
+
+        results = node_sync.NodeSyncer(_config(), pull=pull).tick()
+        assert results["second"][0] == node_sync.FAILED
+        assert results["second"][1].startswith("unreadable pull metadata")
+        assert _node_errors(caplog) == []
+
+    def test_a_node_map_nested_too_deeply_does_not_stop_the_tick(self, placed):
+        nodes.NODE_MAP_PATH.write_text(_TOO_DEEP, encoding="utf-8")
+        asked: list[set[str]] = []
+
+        def pull(node, sids):
+            asked.append(set(sids))
+            return _snap()
+
+        results = node_sync.NodeSyncer(_config(), pull=pull).tick()
+        assert results == {"second": (node_sync.OK, ""), "third": (node_sync.OK, "")}
+        assert asked == [set(), set()]
+
+    def test_the_strict_reader_calls_it_a_bad_file(self, placed):
+        """ValueError, the one type every strict caller catches for a bad map
+        (state_stores' attention engine holds its last records on it)."""
+        nodes.NODE_MAP_PATH.write_text(_TOO_DEEP, encoding="utf-8")
+        with pytest.raises(ValueError, match="nested too deeply"):
+            nodes.load_node_map_strict()
+        assert nodes.read_node_map() == {}
+
+    def test_a_watermark_file_nested_too_deeply_is_no_watermark(self, placed):
+        path = nodes.pull_marks_path("second")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_TOO_DEEP, encoding="utf-8")
+        assert node_sync._read_marks("second") == {}
+
+    def test_a_sessions_file_nested_too_deeply_is_no_snapshot(self, placed):
+        path = nodes.sessions_path("second")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_TOO_DEEP, encoding="utf-8")
+        assert nodes.read_sessions("second") is None
+
+    def test_a_node_whose_watermark_file_nests_too_deeply_still_pulls(
+        self, placed, caplog
+    ):
+        """A corrupt local file, not a bug: the node pulls from the beginning,
+        and nothing is logged at ERROR (which would be a Sentry event)."""
+        _capture_nodes_log(caplog)
+        path = nodes.pull_marks_path("second")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_TOO_DEEP, encoding="utf-8")
+        asked: dict[str, dict[str, remote_mux.SidPull]] = {}
+
+        def pull(node, sids):
+            asked[node.nick] = dict(sids)
+            return _snap()
+
+        results = node_sync.NodeSyncer(_config(), pull=pull).tick()
+        assert results["second"] == (node_sync.OK, "")
+        assert asked["second"]["api"].since == 0.0
+        assert _node_errors(caplog) == []

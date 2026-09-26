@@ -108,6 +108,12 @@ class TestRemoteError:
     def test_it_is_a_runtime_error(self):
         assert isinstance(RemoteError(None, "", ()), RuntimeError)
 
+    def test_it_is_a_timeout_only_when_told(self):
+        # rc None alone is ambiguous (spawn failure, over-cap reply, timeout);
+        # the flag is what node_sync reads as "the node did not answer".
+        assert RemoteError(None, "", ()).timed_out is False
+        assert RemoteError(None, "", (), timed_out=True).timed_out is True
+
 
 class TestTheSshResolver:
     def test_it_reads_path(self, tmp_path, monkeypatch):
@@ -258,7 +264,19 @@ class TestRun:
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["sleep"], timeout_s=1)
         assert exc.value.rc is None
+        assert exc.value.timed_out is True
         assert time.monotonic() - started < 10
+
+    def test_a_client_that_cannot_be_executed_is_not_a_timeout(self, monkeypatch):
+        def denied(*_a: object, **_k: object) -> object:
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: "ssh")
+        monkeypatch.setattr(remote_mux.subprocess, "Popen", denied)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["true"], timeout_s=5, quiet=True)
+        assert (exc.value.rc, exc.value.stderr_tail) == (None, "Permission denied")
+        assert exc.value.timed_out is False
 
     def test_no_ssh_client_is_rc_127_without_spawning(self):
         with pytest.raises(RemoteError) as exc:
@@ -320,6 +338,7 @@ class TestTheReplyIsBoundedInMemory:
             remote_mux.run(NODE, ["big"], timeout_s=30, max_stdout_bytes=CAP)
         assert time.monotonic() - started < 10
         assert exc.value.rc is None
+        assert exc.value.timed_out is False
         assert exc.value.stderr_tail == f"reply exceeded {CAP} bytes"
         assert exc.value.command_redacted[0] == "ssh"
         (proc,) = spawned
@@ -859,6 +878,15 @@ class TestSample:
         assert "got b'bash: awk: command not found\\n'" in exc.value.stderr_tail
         # rc 0: the node answered; the answer was malformed.
         assert exc.value.rc == 0
+
+    def test_a_reply_nested_too_deeply_is_a_remote_error_not_a_crash(self, fake_ssh):
+        # json.loads answers deep nesting with RecursionError, not ValueError;
+        # 200k '[' is far inside the reply cap and still the node's bad answer.
+        fake_ssh.set_reply("bash -s", stdout="[" * 200_000)
+        with pytest.raises(RemoteError, match="not a load sample") as exc:
+            remote_mux.sample(NODE)
+        assert exc.value.rc == 0
+        assert isinstance(exc.value.__cause__, RecursionError)
 
     def test_the_head_of_what_came_back_is_bounded(self, fake_ssh):
         fake_ssh.set_reply("bash -s", stdout="x" * 5000)

@@ -127,14 +127,25 @@ class RemoteError(RuntimeError):
     cases. After a spawn failure the command never ran. After a timeout the
     OUTCOME IS UNKNOWN: killing the local ssh does not stop a non-tty remote
     command, so it may have run to completion (a killed send may have landed).
-    A caller must therefore never retry a mutation blindly on rc None."""
+    A caller must therefore never retry a mutation blindly on rc None.
+
+    ``timed_out`` tells the timeout apart from the other rc-None errors (a
+    spawn failure, a reply over the cap): only ``_spawn``'s timeout sets it.
+    It is the node that went silent, which node_sync reads as unreachable; a
+    caller must never match ``stderr_tail`` to learn it."""
 
     def __init__(
-        self, rc: int | None, stderr_tail: str, command_redacted: tuple[str, ...]
+        self,
+        rc: int | None,
+        stderr_tail: str,
+        command_redacted: tuple[str, ...],
+        *,
+        timed_out: bool = False,
     ) -> None:
         self.rc = rc
         self.stderr_tail = stderr_tail
         self.command_redacted = command_redacted
+        self.timed_out = timed_out
         super().__init__(
             f"{shlex.join(command_redacted)} failed (rc={rc}): {stderr_tail}"
         )
@@ -355,7 +366,9 @@ def _spawn(
             get_logger("nodes").warning(
                 "%s timed out after %.1fs: %s", label, timeout_s, shlex.join(shown)
             )
-        raise RemoteError(None, f"timed out after {timeout_s:g}s", shown)
+        raise RemoteError(
+            None, f"timed out after {timeout_s:g}s", shown, timed_out=True
+        )
     if out.over:
         _kill(proc)
         if not quiet:
@@ -564,8 +577,9 @@ def sample(node: Node) -> LoadSample:
         reading = _load_sample(json.loads(result.stdout.decode("utf-8", "replace")))
     # OverflowError is an ArithmeticError, not a ValueError: float() of a
     # 401-digit integer overflows. (`1e400` parses to inf, a ValueError from
-    # _finite/_integral.)
-    except (ValueError, KeyError, TypeError, OverflowError) as e:
+    # _finite/_integral.) RecursionError is json.loads' answer to deep nesting,
+    # which fits easily inside the reply cap: the node's bad answer too.
+    except (ValueError, KeyError, TypeError, OverflowError, RecursionError) as e:
         shown = _run_shown(node, *_script_call("sample", [], None))
         raise RemoteError(
             result.returncode,
@@ -922,7 +936,9 @@ def parse_pull(stdout: bytes, *, dest: Path, sids: Collection[str]) -> NodeSnaps
     meta_line, _, archive = framed.partition(b"\n")
     try:
         meta = json.loads(meta_line.decode("utf-8"))
-    except ValueError as e:
+    # RecursionError: json.loads' answer to deep nesting (200k '[' fit well
+    # inside the reply cap). The node's bad answer, not a bug on this PC.
+    except (ValueError, RecursionError) as e:
         raise _pull_error(f"unreadable pull metadata: {e}") from e
     if not isinstance(meta, dict):
         raise _pull_error("pull metadata is not an object")

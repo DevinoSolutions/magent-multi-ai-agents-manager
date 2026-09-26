@@ -100,6 +100,16 @@ class TestParsePull:
             parse_pull(b"hello\n", dest=tmp_path, sids=frozenset())
         assert info.value.rc == 0
 
+    def test_metadata_nested_too_deeply_is_not_a_pull(self, tmp_path):
+        # 200k '[' is far inside the reply cap, and json.loads answers it
+        # with RecursionError, not ValueError: still the node's bad answer.
+        meta = b"[" * 200_000
+        assert len(meta) < remote_mux.PULL_MAX_REPLY_BYTES
+        reply = PULL_HEADER + meta + b"\n" + PULL_TRAILER + b"0\n"
+        with pytest.raises(RemoteError, match="unreadable pull metadata") as info:
+            parse_pull(reply, dest=tmp_path, sids=frozenset())
+        assert info.value.rc == 0
+
     def test_a_banner_before_the_header_is_ignored(self, tmp_path):
         reply = "Welcome to devino-second!\n" + pull_reply(pull_meta(sessions=["api"]))
         assert _parse(reply, tmp_path).sessions == ("api",)
