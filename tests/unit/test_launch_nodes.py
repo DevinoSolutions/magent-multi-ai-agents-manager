@@ -2477,6 +2477,33 @@ class TestABringUpKeepsTheSyncDaemonRunning:
         launch.run_magent(_config(api), launch.RunOpts())
         assert ensured == [None]
 
+    @pytest.fixture
+    def cannot_start(self, monkeypatch, caplog):
+        # The daemon's lock dir unwritable, or the spawn refused: after the
+        # sessions came up, which must still be reported.
+        def ensure(config: object, config_path: object = None) -> bool:
+            raise PermissionError(13, "Access is denied")
+
+        monkeypatch.setattr(launch, "ensure_node_sync", ensure)
+        monkeypatch.setattr("magent.psmux.bring_up", lambda cfg, only, group: ([], []))
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        return lambda: [
+            r.getMessage() for r in caplog.records if r.name == "magent.nodes"
+        ]
+
+    def test_up_survives_a_daemon_that_cannot_start(self, rig, api, cannot_start):
+        assert launch.bring_up_psmux(_config(api)) == (["api"], [])
+        assert any("node sync daemon not started" in m for m in cannot_start())
+
+    def test_go_survives_a_daemon_that_cannot_start(
+        self, rig, api, cannot_start, desk, no_sleep
+    ):
+        assert launch.run_magent(_config(api), launch.RunOpts()) == 0
+        assert any("node sync daemon not started" in m for m in cannot_start())
+
     def test_the_up_command_hands_it_the_file_it_read(
         self, rig, api, tmp_path, monkeypatch
     ):

@@ -1320,7 +1320,7 @@ def _bring_up_node_windows(
     _echo_node_outcomes(outcomes)
     if any(o.ok for o in outcomes):
         # RunOpts spells "no config file" as "".
-        ensure_node_sync(config, config_path=opts.config_path or None)
+        _keep_node_sync(config, opts.config_path or None)
     windows_expected = plat.supports_attach_windows()
     by_sid = {o.sid: o for o in outcomes}
     targets: list[_Target] = []
@@ -1574,7 +1574,7 @@ def bring_up_psmux(
     _echo_node_outcomes(outcomes)
     if any(o.ok for o in outcomes):
         # The sync daemon reads the same file this bring-up did (E).
-        ensure_node_sync(config, config_path=config_path)
+        _keep_node_sync(config, config_path)
     return (
         [*created, *(o.sid for o in outcomes if o.ok)],
         [*failed, *(o.sid for o in outcomes if not o.ok)],
@@ -2303,6 +2303,19 @@ def stop_node_sessions(
             log.warning("down: %s stopped, but its map entry stays: %s", sid, exc)
             map_writable = False
     return stopped, still
+
+
+def _keep_node_sync(config: MagentConfig, config_path: str | None) -> None:
+    """``ensure_node_sync`` after a bring-up put a node session up. Best
+    effort: the sessions are up either way, and a daemon that cannot start
+    (its lock dir, the spawn) must not cost the bring-up its report or its exit
+    code -- ``status`` shows the daemon off, and serve's supervisor retries."""
+    try:
+        ensure_node_sync(config, config_path=config_path)
+    except OSError as exc:
+        get_logger("nodes").warning(
+            "node sync daemon not started after the bring-up: %s", exc
+        )
 
 
 def _echo_node_outcomes(outcomes: list[NodeBringUpOutcome]) -> None:
