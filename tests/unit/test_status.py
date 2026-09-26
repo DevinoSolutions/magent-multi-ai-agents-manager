@@ -1943,6 +1943,28 @@ def _supervisor_refusals(monkeypatch) -> threading.Event:
     return refused
 
 
+def _tick_holding_serves_lock(monkeypatch, spawns: _FakeDaemon | None) -> None:
+    """A stand-in serve supervisor tick, on the REAL supervisor lock: it
+    holds the lock until ``down``'s ask for it is refused, starts ``spawns``
+    (a daemon that locks only after its own delay), then lets go."""
+    from magent import node_sync
+
+    ticking = threading.Event()
+    refused = _supervisor_refusals(monkeypatch)
+    supervisor = lock_path(node_sync.SUPERVISOR_LOCK_NAME)
+
+    def tick() -> None:
+        fd = _hold_lock_file(supervisor)
+        ticking.set()
+        refused.wait(10)
+        if spawns is not None:
+            spawns.start()
+        _let_go(fd)
+
+    threading.Thread(target=tick, daemon=True).start()
+    assert ticking.wait(5)
+
+
 class _FakeDaemon:
     """A node sync daemon on the REAL daemon lock, in a thread: after
     ``delay`` it takes ``node_sync.LOCK_NAME``, then writes its pid file -- the
@@ -1964,8 +1986,11 @@ class _FakeDaemon:
         self.thread: threading.Thread | None = None
 
     def start(self) -> None:
-        self.thread = threading.Thread(target=self._live, daemon=True)
-        self.thread.start()
+        # Published once started: a teardown racing a late start() must never
+        # join a thread that has not begun.
+        thread = threading.Thread(target=self._live, daemon=True)
+        thread.start()
+        self.thread = thread
 
     def _live(self) -> None:
         try:
@@ -2135,14 +2160,18 @@ class TestDownStopsNodeSessionsWhereTheyRun:
 
         monkeypatch.setattr(node_sync, "final_pull", final_pull)
         if not real_sync:
-            # One answer per stop_daemon call; the last one repeats.
+            # One answer per stop_daemon call, an exception raised; the last
+            # one repeats.
             stops = (
                 [sync_daemon] if isinstance(sync_daemon, bool) else list(sync_daemon)
             )
 
             def stop_daemon():
                 self.events.append("stop")
-                return stops.pop(0) if len(stops) > 1 else stops[0]
+                answer = stops.pop(0) if len(stops) > 1 else stops[0]
+                if isinstance(answer, BaseException):
+                    raise answer
+                return answer
 
             monkeypatch.setattr(node_sync, "stop_daemon", stop_daemon)
         self.cfgpath = cfgpath
@@ -2647,19 +2676,7 @@ class TestDownStopsNodeSessionsWhereTheyRun:
 
             threading.Thread(target=respawn, daemon=True).start()
         else:
-            ticking = threading.Event()
-            refused = _supervisor_refusals(monkeypatch)
-            supervisor = lock_path(node_sync.SUPERVISOR_LOCK_NAME)
-
-            def tick() -> None:
-                fd = _hold_lock_file(supervisor)
-                ticking.set()
-                refused.wait(10)
-                late.start()
-                _let_go(fd)
-
-            threading.Thread(target=tick, daemon=True).start()
-            assert ticking.wait(5)
+            _tick_holding_serves_lock(monkeypatch, spawns=late)
         self._hold("api")
         out, *_ = self._run(
             runner,
@@ -2687,6 +2704,69 @@ class TestDownStopsNodeSessionsWhereTheyRun:
             if why == "seen"
             else ["Node sync daemon was not running.", "Stopped the node sync daemon."]
         )
+
+    def test_with_no_node_project_a_tick_holding_serves_lock_is_still_waited_out(
+        self, runner, tmp_config, monkeypatch, tmp_path, daemons
+    ):
+        # No node project left in the config, so no stop runs ahead of the
+        # pulls: the end stop is the only one and down's hold starts there. A
+        # tick holding serve's lock then may have spawned a daemon that has not
+        # locked yet, and it is waited for all the same.
+        from magent import node_sync
+
+        late = _FakeDaemon(4302, delay=0.4)
+        daemons[late.pid] = late
+        _tick_holding_serves_lock(monkeypatch, spawns=late)
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "web")}],
+            real_stop=True,
+            real_sync=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert "Pulling the last turn" not in out.stdout
+        assert late.killed.is_set(), out.output
+        assert not node_sync.daemon_running()
+        lines = [
+            ln for ln in out.stdout.splitlines() if "node sync daemon" in ln.lower()
+        ]
+        assert [ln.split(None, 1)[1] for ln in lines] == [
+            "Stopped the node sync daemon."
+        ]
+
+    @pytest.mark.parametrize("first", [True, False], ids=["stopped", "absent"])
+    def test_an_end_stop_that_cannot_tell_is_said_after_a_first_stop_that_could(
+        self, runner, tmp_config, monkeypatch, tmp_path, first
+    ):
+        # News at the end is always said: the first stop's answer was clean,
+        # the end stop's lock would not open.
+        self._hold("api")
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            sync_daemon=(first, PermissionError(13, "Access is denied")),
+        )
+        assert out.exit_code == 0, out.output
+        assert self.events == ["stop", "pull api", "stop"]
+        lines = [
+            ln for ln in out.stdout.splitlines() if "node sync daemon" in ln.lower()
+        ]
+        assert [ln.split(None, 1)[1] for ln in lines] == [
+            "Stopped the node sync daemon."
+            if first
+            else "Node sync daemon was not running.",
+            (
+                "Could not tell whether the node sync daemon stopped"
+                " (PermissionError); see nodes.log"
+            ),
+        ]
 
     @pytest.mark.parametrize("nodes_here", [True, False], ids=["pulls", "no-pulls"])
     def test_with_no_daemon_and_a_free_lock_the_end_stop_does_not_wait(
@@ -2730,21 +2810,8 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         # serve's supervisor lock from its first stop to its last, so that
         # tick -- the REAL one, on the REAL lock -- stands down. A tick that
         # held the lock when down asked for it is waited out, never raced.
-        from magent import node_sync
-
         if held_at_start:
-            ticking = threading.Event()
-            refused = _supervisor_refusals(monkeypatch)
-            supervisor = lock_path(node_sync.SUPERVISOR_LOCK_NAME)
-
-            def brief_tick() -> None:
-                fd = _hold_lock_file(supervisor)
-                ticking.set()
-                refused.wait(10)
-                _let_go(fd)
-
-            threading.Thread(target=brief_tick, daemon=True).start()
-            assert ticking.wait(5)
+            _tick_holding_serves_lock(monkeypatch, spawns=None)
         during: list[list[list[str]]] = []
 
         def stop_server(port: int) -> bool:
@@ -2785,15 +2852,21 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         # The first stop now runs AHEAD of the pulls: a lock file Windows still
         # has pending delete (EACCES) must not take the node half of down with
         # it -- and no answer is never "not running". Once is enough to say it.
+        # The end stop's wait is the real one, shortened: it keeps looking
+        # past a probe that will not open.
         from magent import node_sync
 
         def unopenable():
             raise PermissionError(13, "Access is denied")
 
         waits: list[None] = []
+        real_wait = node_sync.await_late_daemon
+        monkeypatch.setattr(node_sync, "STOP_SETTLE_S", 0.3)
         monkeypatch.setattr(node_sync, "daemon_running", unopenable)
         monkeypatch.setattr(
-            node_sync, "await_late_daemon", lambda **_k: waits.append(None) or False
+            node_sync,
+            "await_late_daemon",
+            lambda **k: waits.append(None) or real_wait(**k),
         )
         self._hold("api")
         out, _killed, dialed, _sent = self._run(
@@ -2818,24 +2891,41 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         # Unknown is no proof of "none": the end stop waits for a late lock.
         assert waits == [None]
 
-    def test_a_supervisor_lock_held_past_the_wait_is_warned_and_the_stop_still_runs(
-        self, runner, tmp_config, monkeypatch, tmp_path, caplog
+    @pytest.mark.parametrize("how", ["held", "unopenable"])
+    def test_a_supervisor_lock_not_had_by_the_wait_is_warned_and_the_stop_still_runs(
+        self, runner, tmp_config, monkeypatch, tmp_path, caplog, how
     ):
+        # Held by a tick past the wait, or a lock file Windows will not open
+        # while it is pending delete: either way the stops run, unprotected,
+        # and nodes.log says why.
         from magent import node_sync
         from magent.log import get_logger
 
         monkeypatch.setattr(node_sync, "STOP_SETTLE_S", 0.3)
         get_logger(node_sync.LOG_NAME)
         caplog.set_level(logging.WARNING, logger=f"magent.{node_sync.LOG_NAME}")
-        holding, release = threading.Event(), threading.Event()
+        release = threading.Event()
+        if how == "held":
+            holding = threading.Event()
 
-        def hold() -> None:
-            with exclusive_lock(node_sync.SUPERVISOR_LOCK_NAME):
-                holding.set()
-                release.wait(10)
+            def hold() -> None:
+                with exclusive_lock(node_sync.SUPERVISOR_LOCK_NAME):
+                    holding.set()
+                    release.wait(10)
 
-        threading.Thread(target=hold, daemon=True).start()
-        assert holding.wait(5)
+            threading.Thread(target=hold, daemon=True).start()
+            assert holding.wait(5)
+            why = "supervisor lock stayed held"
+        else:
+            real_lock = node_sync.exclusive_lock
+
+            def unopenable(name: str):
+                if name == node_sync.SUPERVISOR_LOCK_NAME:
+                    raise PermissionError(13, "Access is denied")
+                return real_lock(name)
+
+            monkeypatch.setattr(node_sync, "exclusive_lock", unopenable)
+            why = "could not take serve's supervisor lock"
         self._hold("api")
         try:
             out, *_ = self._run(
@@ -2855,7 +2945,7 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         warned = [
             r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
         ]
-        assert any("supervisor lock stayed held" in w for w in warned), warned
+        assert any(why in w for w in warned), warned
 
     def test_down_of_one_name_leaves_the_node_sync_daemon_alone(
         self, runner, tmp_config, monkeypatch, tmp_path
