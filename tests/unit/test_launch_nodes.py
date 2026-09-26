@@ -2147,18 +2147,54 @@ class TestDownPullsTheLastTurnHomeFirst:
     def test_a_pull_that_found_no_entry_is_not_a_pull(
         self, rig, api, monkeypatch, capsys, killed
     ):
-        # `down` read the entry strictly; final_pull reads the map again,
-        # leniently, and a busy or torn map there answers None -- "never
-        # placed". That is a pull that did not happen, never one that did.
+        # `down` read the entry strictly; final_pull reads the map again and
+        # finds no entry (another process unmapped it in between), so it
+        # answers None -- "never placed". After a key `down` proved, that is
+        # a pull that did not happen, never one that did.
         _hold("api")
-        monkeypatch.setattr(nodes, "read_node_map", dict)
+        real = nodes.load_node_map_strict
+        reads: list[None] = []
+
+        def vanishing() -> dict[str, NodeMapEntry]:
+            reads.append(None)
+            return real() if len(reads) == 1 else {}
+
+        monkeypatch.setattr(nodes, "load_node_map_strict", vanishing)
         assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert len(reads) > 1, "final_pull never read the map"
         assert killed == ["api"]
-        assert "api" in nodes.load_node_map_strict()
+        assert "api" in real()
         out = capsys.readouterr().out
         assert out.count("\n") == 1, out
         assert "api: last turn not pulled (the node map could not be read)" in out
         assert "magent node sync --once" in out
+
+    def test_a_map_torn_under_the_real_final_pull_names_no_path(
+        self, rig, api, monkeypatch, capsys, killed
+    ):
+        # No fake final_pull: `down`'s own strict read went through, then the
+        # map tore before final_pull's. The line says the map could not be
+        # read -- the parser's words and the map's path stay in the log.
+        _hold("api")
+        real = nodes.load_node_map_strict
+        reads: list[None] = []
+
+        def tearing() -> dict[str, NodeMapEntry]:
+            reads.append(None)
+            if len(reads) > 1:
+                raise ValueError(f"{nodes.NODE_MAP_PATH}: Expecting value: line 1")
+            return real()
+
+        monkeypatch.setattr(nodes, "load_node_map_strict", tearing)
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert len(reads) > 1, "final_pull never read the map"
+        assert killed == ["api"]
+        assert "api" in real()
+        out = capsys.readouterr().out
+        assert out.count("\n") == 1, out
+        assert "api: last turn not pulled (the node map could not be read)" in out
+        assert "node-map.json" not in out
+        assert "Expecting value" not in out
 
     def test_a_map_busy_under_the_real_final_pull_keeps_the_entry(
         self, rig, api, monkeypatch, capsys, killed

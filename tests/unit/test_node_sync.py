@@ -2383,6 +2383,32 @@ class TestTheFinalPull:
         assert node_sync.final_pull(_config(), "nowhere") is None
         assert fake_ssh.calls() == []
 
+    @pytest.mark.parametrize(
+        ("state", "cls"), [("torn", "ValueError"), ("busy", "PermissionError")]
+    )
+    def test_an_unreadable_map_raises_and_is_never_read_as_never_placed(
+        self, placed, fake_ssh, monkeypatch, state, cls
+    ):
+        # None is "never placed". A map that could not be read says nothing
+        # about placement, so it is an error the caller must handle -- one
+        # that names the map's failure by class alone, never its path.
+        before = _seed_marks(api=(10.0, "/home/amin/magent/api"))
+        if state == "torn":
+            nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+        else:
+            # Intact on disk, but still locked after the strict read's
+            # retries (a Windows reader racing a replace).
+            def busy() -> dict[str, NodeMapEntry]:
+                raise PermissionError(13, "The process cannot access the file")
+
+            monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+        with pytest.raises(OSError) as info:
+            node_sync.final_pull(_config(), "api")
+        assert type(info.value.__cause__).__name__ == cls
+        assert str(info.value) == f"the node map could not be read ({cls})"
+        assert fake_ssh.calls() == []
+        assert nodes.pull_marks_path("second").read_bytes() == before
+
     def test_a_final_pull_waits_for_the_daemons_tick_then_gives_up(
         self, placed, fake_ssh
     ):
