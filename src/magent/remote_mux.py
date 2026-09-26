@@ -798,6 +798,23 @@ def register_ssh_key(pubkey: str, *, title: str) -> ScriptLine:
     )
 
 
+# doctor.sh bounds every probe (claude 8s, github 12s, tmux 4s, df 4s, and
+# 4s for each of its five version reads, each plus a 2s kill grace): 66s if
+# all of them hang at once, plus the ssh connect. 60s could not hold that.
+DOCTOR_TIMEOUT_S = 90.0
+
+
+def doctor(node: Node, *, timeout_s: float) -> ProvisionReport:
+    """doctor.sh's rows for ``node``. The script is read-only apart from
+    known_hosts TOFU (its github.com probe) and exits 0 whatever it finds;
+    ssh's own failure (255) raises, and an unreachable node is the caller's
+    row to print. The tmux socket is not an argument here: run_script passes
+    ``SOCKET`` first on every call (DECISION-26 ii)."""
+    args = ["--root", node.root, "--target", node.target]
+    result = run_script(node, "doctor", args, timeout_s=timeout_s, check=False)
+    return _report_of(result, "doctor", node, args=args, stdin=None)
+
+
 def has_session(node: Node, sid: str) -> bool | None:
     """Is ``sid`` alive on ``node``? Exit 0 is True, a live session. Exit 1 is
     False, meant as tmux's own "no" (no such session, or no server at all) --

@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -3000,6 +3001,23 @@ class TestSetupNode:
             )
         assert "root@devino-second" in info.value.command_redacted
 
+    def test_a_transport_failure_names_the_users_and_sizes_the_key(self, fake_ssh):
+        # M5: the rc-255 error shows the users setup was given and the key by
+        # its length alone, the way the call itself is logged.
+        fake_ssh.set_reply("bash -s", stderr="ssh: connect to host: No route\n", rc=255)
+        with pytest.raises(RemoteError) as info:
+            remote_mux.setup_node(
+                NODE, ["amin", "bob"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+            )
+        (call,) = fake_ssh.calls()
+        shown = info.value.command_redacted
+        assert shown[:-1] == ("ssh", *call.argv)
+        assert shown[-2] == _remote(
+            "bash", "-s", "--", remote_mux.SOCKET, "amin", "bob"
+        )
+        assert shown[-1] == f"<stdin: {len(call.stdin)} bytes>"
+        assert PC_KEY not in str(info.value)
+
     def test_the_default_timeout_grows_with_the_users(self, monkeypatch):
         # M5: every user is a login, an installer and a key.
         seen: list[float] = []
@@ -3204,3 +3222,777 @@ class TestRegisterSshKey:
         )
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         assert row == ScriptLine("skip", "github-key", "already registered to amin")
+
+
+DOCTOR_TOOLS = ("bash", "awk", "dirname", "head", "wc", "timeout")
+NODE_TOOLS = ("tmux", "git", "claude", "python3", "gh", "ssh", "locale", "df")
+GIB_KB = 1024 * 1024
+HI = "Hi amin! You've successfully authenticated, but GitHub does not provide shell access."
+DOCTOR_ITEMS = (
+    "tmux",
+    "git",
+    "claude",
+    "python3",
+    "gh",
+    "claude-login",
+    "github-key",
+    "locale",
+    "disk",
+    "sessions",
+)
+
+
+# Probes doctor.sh bounds with `timeout`, as (fake, argv match): the four that
+# can stall, plus three of the five version reads (a required tool's, and gh's,
+# which only warns). A hung one sleeps past every bound, and past the whole
+# call's before the fix.
+HUNG_PROBES = {
+    "tmux": ("tmux", "list-sessions"),
+    "claude": ("claude", "auth status"),
+    "ssh": ("ssh", "git@github.com"),
+    "df": ("df", "-Pk"),
+    "tmux-version": ("tmux", "-V"),
+    "git-version": ("git", "--version"),
+    "gh-version": ("gh", "--version"),
+}
+HANG_S = 30.0
+
+
+def _df(avail_kb: int) -> str:
+    return (
+        "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+        f"/dev/sda1 104857600 1048576 {avail_kb} 2% /\n"
+    )
+
+
+def _doctor_box(
+    tmp_path: Path,
+    *,
+    tools: tuple[str, ...] = NODE_TOOLS,
+    base_tools: tuple[str, ...] = DOCTOR_TOOLS,
+    logged_in: bool = True,
+    github: str = HI,
+    charmap: str = "UTF-8",
+    avail_kb: int = 50 * GIB_KB,
+    tmux_version: str = "tmux 3.4",
+    tmux_version_rc: int = 0,
+    sessions: str = "a: 1 windows\nb: 1 windows\n",
+    sessions_stderr: str = "",
+    sessions_rc: int = 0,
+    hang: str | None = None,
+    hang_ignores_term: bool = False,
+) -> tuple[dict[str, FakeSsh], dict[str, str]]:
+    """A node user's home and a PATH of fakes answering like a healthy node,
+    except where a keyword says otherwise. ``hang`` names one bounded probe
+    (a ``HUNG_PROBES`` key) whose call never answers."""
+    fakes = {name: make_fake_ssh(tmp_path, name=name) for name in tools}
+    if hang is not None:
+        # Registered first: the first matching reply wins.
+        name, match = HUNG_PROBES[hang]
+        fakes[name].set_reply(match, hang_s=HANG_S, ignore_term=hang_ignores_term)
+    replies = {
+        "claude": [("auth status", json.dumps({"loggedIn": logged_in}) + "\n")],
+        "locale": [("charmap", charmap + "\n")],
+        "df": [("-Pk", _df(avail_kb))],
+    }
+    for name, fake in fakes.items():
+        for match, stdout in replies.get(name, []):
+            fake.set_reply(match, stdout=stdout)
+    if "tmux" in fakes:
+        fakes["tmux"].set_reply("-V", stdout=tmux_version + "\n", rc=tmux_version_rc)
+        fakes["tmux"].set_reply(
+            "list-sessions", stdout=sessions, stderr=sessions_stderr, rc=sessions_rc
+        )
+    if "ssh" in fakes:
+        fakes["ssh"].set_reply("git@github.com", stderr=github + "\n", rc=1)
+    (tmp_path / "node" / "magent").mkdir(parents=True, exist_ok=True)
+    sysbin = _sysbin(tmp_path, base_tools, python=False, name="doctorbin")
+    env = {
+        "HOME": str(tmp_path / "node"),
+        "PATH": os.pathsep.join([*(str(f.base) for f in fakes.values()), str(sysbin)]),
+    }
+    return fakes, env
+
+
+def _run_doctor(
+    env: dict[str, str],
+    root: str = "~/magent",
+    *,
+    socket: str | None = remote_mux.SOCKET,
+) -> subprocess.CompletedProcess[bytes]:
+    args = ["--root", root, "--target", "amin@devino-second"]
+    return subprocess.run(
+        _bash_argv(*args, socket=socket),
+        input=remote_mux._frame_script(node_scripts.script("doctor"), None),
+        capture_output=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+
+
+def _doctor_raw(
+    env: dict[str, str], *args: str, payload: bytes | None = None
+) -> subprocess.CompletedProcess[bytes]:
+    """doctor.sh with exactly ``args`` after the socket (``_run_doctor`` always
+    passes a well-formed --root/--target), and an optional trailing payload."""
+    return subprocess.run(
+        _bash_argv(*args),
+        input=remote_mux._frame_script(node_scripts.script("doctor"), payload),
+        capture_output=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+
+
+@POSIX_BASH
+class TestDoctorShUnderRealBash:
+    def test_a_healthy_node_is_all_ok(self, tmp_path):
+        _, env = _doctor_box(tmp_path)
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        assert _rows(r) == dict.fromkeys(DOCTOR_ITEMS, "ok")
+        details = {line.item: line.detail for line in _report(r).lines}
+        assert details["github-key"] == "authenticates as amin"
+        assert details["sessions"] == f"2 on tmux socket {remote_mux.SOCKET}"
+        assert details["tmux"] == "tmux 3.4"
+
+    def test_the_socket_argument_names_the_tmux_server_probed(self, tmp_path):
+        # Not remote_mux.SOCKET: proves the socket is read, never baked in.
+        fakes, env = _doctor_box(tmp_path)
+        r = _run_doctor(env, socket="mgtest")
+        assert r.returncode == 0, r.stderr
+        assert ["-L", "mgtest", "list-sessions"] in [
+            c.argv for c in fakes["tmux"].calls()
+        ]
+        details = {line.item: line.detail for line in _report(r).lines}
+        assert details["sessions"] == "2 on tmux socket mgtest"
+
+    def test_no_socket_fails_loudly_before_any_probe(self, tmp_path):
+        # lib.sh's ${1:?}: no default server is ever guessed. It sees an EMPTY
+        # argv only (as B's own pin runs it): with arguments present it cannot
+        # tell a missing socket from a misplaced one -- see the next test.
+        fakes, env = _doctor_box(tmp_path)
+        r = subprocess.run(
+            _bash_argv(socket=None),
+            input=remote_mux._frame_script(node_scripts.script("doctor"), None),
+            capture_output=True,
+            env=env,
+            timeout=60,
+            check=False,
+        )
+        assert r.returncode != 0
+        assert b"the tmux socket name is a required first argument" in r.stderr
+        assert r.stdout == b""
+        assert all(f.calls() == [] for f in fakes.values())
+
+    def test_arguments_without_the_socket_still_probe_nothing(self, tmp_path):
+        # `--root` is taken as the socket and shifted off, so main sees a
+        # stray `~/magent`: a fail row, and not one probe on a guessed server.
+        fakes, env = _doctor_box(tmp_path)
+        r = _run_doctor(env, socket=None)
+        assert _rows(r) == {"doctor": "fail"}
+        assert all(f.calls() == [] for f in fakes.values())
+
+    @pytest.mark.parametrize(
+        ("version", "status"),
+        [
+            ("tmux 3.0a", "fail"),  # Ubuntu 20.04's: bring_up.sh refuses it
+            ("tmux 3.2a", "ok"),
+            ("tmux next-3.5", "ok"),
+            ("tmux master", "fail"),
+        ],
+    )
+    def test_tmux_is_held_to_the_bring_up_floor(self, tmp_path, version, status):
+        _, env = _doctor_box(tmp_path, tmux_version=version)
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        (row,) = [line for line in _report(r).lines if line.item == "tmux"]
+        assert row.status == status
+        assert version in row.detail
+        if status == "fail":
+            assert "3.2 or newer" in row.detail
+
+    def _tmux_row(self, env: dict[str, str]) -> ScriptLine:
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        (row,) = [line for line in _report(r).lines if line.item == "tmux"]
+        return row
+
+    def test_a_node_without_tmux_says_so(self, tmp_path):
+        # Not "cannot read the tmux version ()": a missing binary is named as
+        # missing, with the command that installs it.
+        tools = tuple(t for t in NODE_TOOLS if t != "tmux")
+        _, env = _doctor_box(tmp_path, tools=tools)
+        row = self._tmux_row(env)
+        assert (row.status, row.detail) == (
+            "fail",
+            "tmux is not on PATH -- run: magent node setup",
+        )
+
+    def test_a_failing_tmux_v_is_not_believed(self, tmp_path):
+        # A version printed by a `tmux -V` that then exits non-zero is not
+        # graded: the binary is broken, whatever it claimed to be, and the row
+        # says so rather than quoting an empty version.
+        _, env = _doctor_box(tmp_path, tmux_version="tmux 3.4", tmux_version_rc=3)
+        row = self._tmux_row(env)
+        assert (row.status, row.detail) == (
+            "fail",
+            "tmux -V exited 3 -- reinstall tmux on this node",
+        )
+
+    def test_only_the_first_line_of_tmux_v_is_the_version(self, tmp_path):
+        # A second line kept in the detail would split the row, and leave
+        # stdout carrying a line that is no row at all.
+        _, env = _doctor_box(tmp_path, tmux_version="tmux 3.4\nwarning: odd locale")
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        assert len(r.stdout.splitlines()) == len(_report(r).lines)
+        (row,) = [line for line in _report(r).lines if line.item == "tmux"]
+        assert (row.status, row.detail) == ("ok", "tmux 3.4")
+
+    def test_a_failing_version_read_warns_instead_of_reading_ok(self, tmp_path):
+        # Like a failing tmux -V: what a --version that exits non-zero printed
+        # is not a working tool's version.
+        fakes, env = _doctor_box(tmp_path)
+        fakes["git"].set_reply("--version", stdout="git version 2.43.0\n", rc=2)
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        assert _rows(r) == {**dict.fromkeys(DOCTOR_ITEMS, "ok"), "git": "warn"}
+        (row,) = [line for line in _report(r).lines if line.item == "git"]
+        assert row.detail == "git --version exited 2 -- reinstall git on this node"
+
+    def test_a_missing_tool_fails_but_a_missing_gh_only_warns(self, tmp_path):
+        tools = tuple(t for t in NODE_TOOLS if t not in ("git", "gh"))
+        _, env = _doctor_box(tmp_path, tools=tools)
+        rows = _rows(_run_doctor(env))
+        assert (rows["git"], rows["gh"]) == ("fail", "warn")
+
+    def test_a_node_not_logged_in_names_the_one_command_that_fixes_it(self, tmp_path):
+        _, env = _doctor_box(tmp_path, logged_in=False)
+        report = _report(_run_doctor(env))
+        (row,) = [line for line in report.lines if line.item == "claude-login"]
+        assert row.status == "fail"
+        assert row.detail.endswith("run once: ssh amin@devino-second claude")
+
+    def test_a_refused_github_key_fails(self, tmp_path):
+        _, env = _doctor_box(
+            tmp_path, github="git@github.com: Permission denied (publickey)."
+        )
+        report = _report(_run_doctor(env))
+        (row,) = [line for line in report.lines if line.item == "github-key"]
+        assert row.status == "fail"
+        assert "Permission denied (publickey)." in row.detail
+        # A refused key is the one github-key failure setup repairs.
+        assert row.detail.endswith("-- run: magent node setup")
+
+    def test_a_github_transport_failure_quotes_ssh_and_blames_no_key(self, tmp_path):
+        # DNS, a firewall, a reset: the key was never tried, so neither the
+        # "refused" wording nor the setup hint may appear.
+        last = "ssh: Could not resolve hostname github.com: Temporary failure in name resolution"
+        _, env = _doctor_box(tmp_path, github=last)
+        (row,) = [
+            ln for ln in _report(_run_doctor(env)).lines if ln.item == "github-key"
+        ]
+        assert row.status == "fail"
+        assert last in row.detail
+        assert "refused" not in row.detail
+        assert "magent node setup" not in row.detail
+
+    def test_a_silent_github_failure_says_no_output(self, tmp_path):
+        # ssh exits non-zero having printed nothing: the row still says so,
+        # rather than quoting an empty last line.
+        _, env = _doctor_box(tmp_path, github="")
+        (row,) = [
+            ln for ln in _report(_run_doctor(env)).lines if ln.item == "github-key"
+        ]
+        assert (row.status, row.detail) == (
+            "fail",
+            "could not reach GitHub over ssh (no output)",
+        )
+
+    def test_no_tmux_server_is_zero_sessions(self, tmp_path):
+        # No server on the socket yet (tmux exits 1, says so on stderr) is a
+        # healthy node with nothing running, not one session.
+        _, env = _doctor_box(
+            tmp_path,
+            sessions="",
+            sessions_stderr="no server running on /tmp/tmux-1000/magent\n",
+            sessions_rc=1,
+        )
+        (row,) = [ln for ln in _report(_run_doctor(env)).lines if ln.item == "sessions"]
+        assert (row.status, row.detail) == (
+            "ok",
+            f"0 on tmux socket {remote_mux.SOCKET}",
+        )
+
+    def test_a_node_without_timeout_says_so_and_probes_nothing(self, tmp_path):
+        # Every probe runs under coreutils' `timeout`: without it each would
+        # exit 127 and read as its own wrong finding ("not logged in").
+        base = tuple(t for t in DOCTOR_TOOLS if t != "timeout")
+        fakes, env = _doctor_box(tmp_path, base_tools=base)
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        assert _report(r).lines == (
+            ScriptLine(
+                "fail",
+                "doctor",
+                "timeout is not on PATH -- every probe runs under it; install coreutils on this node",
+            ),
+        )
+        assert not [c for f in fakes.values() for c in f.calls()]
+
+    def test_a_node_without_ssh_says_so(self, tmp_path):
+        tools = tuple(t for t in NODE_TOOLS if t != "ssh")
+        _, env = _doctor_box(tmp_path, tools=tools)
+        (row,) = [
+            ln for ln in _report(_run_doctor(env)).lines if ln.item == "github-key"
+        ]
+        assert row.status == "fail"
+        assert row.detail == "ssh is not on PATH -- install openssh-client on this node"
+
+    def test_only_a_leading_tilde_slash_means_home(self, tmp_path):
+        # `~bob/x` is not this user's home: it is never pasted onto $HOME
+        # (which made it <home>bob/x). Nothing by that name exists here, so
+        # it is measured at its nearest existing parent, `.`.
+        fakes, env = _doctor_box(tmp_path)
+        _run_doctor(env, root="~bob/x")
+        (call,) = fakes["df"].calls()
+        assert call.argv == ["-Pk", "."]
+
+    def test_a_bare_tilde_is_home(self, tmp_path):
+        fakes, env = _doctor_box(tmp_path)
+        _run_doctor(env, root="~")
+        (call,) = fakes["df"].calls()
+        assert call.argv == ["-Pk", str(tmp_path / "node")]
+
+    @pytest.mark.parametrize(
+        ("avail_kb", "status"),
+        [(512 * 1024, "fail"), (2 * GIB_KB, "warn"), (50 * GIB_KB, "ok")],
+    )
+    def test_free_disk_under_the_root_is_graded(self, tmp_path, avail_kb, status):
+        _, env = _doctor_box(tmp_path, avail_kb=avail_kb)
+        assert _rows(_run_doctor(env))["disk"] == status
+
+    def test_a_locale_that_is_not_utf8_warns(self, tmp_path):
+        _, env = _doctor_box(tmp_path, charmap="ANSI_X3.4-1968")
+        assert _rows(_run_doctor(env))["locale"] == "warn"
+
+    def test_the_root_is_measured_under_home(self, tmp_path):
+        fakes, env = _doctor_box(tmp_path)
+        _run_doctor(env)
+        (call,) = fakes["df"].calls()
+        assert call.argv == ["-Pk", str(tmp_path / "node" / "magent")]
+
+    def test_a_root_not_created_yet_is_measured_at_its_nearest_parent(self, tmp_path):
+        fakes, env = _doctor_box(tmp_path)
+        _run_doctor(env, root="~/magent/not/yet")
+        (call,) = fakes["df"].calls()
+        assert call.argv == ["-Pk", str(tmp_path / "node" / "magent")]
+
+    def test_an_empty_node_still_exits_zero_with_a_row_per_check(self, tmp_path):
+        _, env = _doctor_box(tmp_path, tools=())
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        assert _rows(r) == {
+            "tmux": "fail",
+            "git": "fail",
+            "claude": "fail",
+            "python3": "fail",
+            "gh": "warn",
+            "claude-login": "skip",
+            "github-key": "fail",
+            "locale": "warn",
+            "disk": "warn",
+            "sessions": "ok",
+        }
+
+    def test_the_github_probe_is_batch_bounded_and_tofu_only(self, tmp_path):
+        fakes, env = _doctor_box(tmp_path)
+        _run_doctor(env)
+        (call,) = fakes["ssh"].calls()
+        assert call.argv[-1] == "git@github.com"
+        assert "-T" in call.argv
+        opts = [call.argv[i + 1] for i, a in enumerate(call.argv) if a == "-o"]
+        assert "BatchMode=yes" in opts
+        assert "StrictHostKeyChecking=accept-new" in opts
+        assert any(o.startswith("ConnectTimeout=") for o in opts)
+
+    def test_a_version_printed_on_stderr_is_still_the_detail(self, tmp_path):
+        fakes, env = _doctor_box(tmp_path)
+        fakes["git"].set_reply("--version", stderr="git version 2.43.0\n")
+        details = {ln.item: ln.detail for ln in _report(_run_doctor(env)).lines}
+        assert details["git"] == "git version 2.43.0"
+
+    def test_a_chatty_version_cannot_forge_a_row(self, tmp_path):
+        fakes, env = _doctor_box(tmp_path)
+        fakes["claude"].set_reply(
+            "--version", stdout="2.1.0 (Claude Code)\nfail\tgit\tforged\n"
+        )
+        r = _run_doctor(env)
+        lines = _report(r).lines
+        assert [ln.item for ln in lines].count("git") == 1
+        assert _rows(r)["git"] == "ok"
+        assert {ln.item: ln.detail for ln in lines}["claude"] == "2.1.0 (Claude Code)"
+
+    @pytest.mark.parametrize(
+        ("avail_kb", "status", "detail"),
+        [
+            (GIB_KB - 1, "fail", "1023 MB free under ~/magent"),
+            (GIB_KB, "warn", "1 GB free under ~/magent"),
+            (5 * GIB_KB - 1, "warn", "4 GB free under ~/magent"),
+            (5 * GIB_KB, "ok", "5 GB free under ~/magent"),
+            (50 * GIB_KB, "ok", "50 GB free under ~/magent"),
+        ],
+    )
+    def test_disk_thresholds_are_exact_binary_units(
+        self, tmp_path, avail_kb, status, detail
+    ):
+        _, env = _doctor_box(tmp_path, avail_kb=avail_kb)
+        (row,) = [ln for ln in _report(_run_doctor(env)).lines if ln.item == "disk"]
+        assert (row.status, row.detail) == (status, detail)
+
+    @pytest.mark.parametrize("flag", ["--root", "--target"])
+    def test_a_flag_without_its_value_is_one_row_and_rc0(self, tmp_path, flag):
+        fakes, env = _doctor_box(tmp_path)
+        r = _doctor_raw(env, flag)
+        assert r.returncode == 0, r.stderr
+        assert _rows(r) == {"doctor": "fail"}
+        assert all(f.calls() == [] for f in fakes.values())
+
+    def test_an_unknown_argument_is_one_row_and_rc0(self, tmp_path):
+        fakes, env = _doctor_box(tmp_path)
+        r = _doctor_raw(env, "--bogus")
+        assert r.returncode == 0, r.stderr
+        assert _rows(r) == {"doctor": "fail"}
+        assert all(f.calls() == [] for f in fakes.values())
+
+    def test_claude_in_local_bin_is_found(self, tmp_path):
+        # The native installer puts claude in ~/.local/bin, which a
+        # non-interactive ssh PATH does not carry.
+        tools = tuple(t for t in NODE_TOOLS if t != "claude")
+        _, env = _doctor_box(tmp_path, tools=tools)
+        (tmp_path / "lb").mkdir()
+        claude = make_fake_ssh(tmp_path / "lb", name="claude")
+        claude.set_reply("auth status", stdout='{"loggedIn": true}\n')
+        local_bin = tmp_path / "node" / ".local" / "bin"
+        local_bin.parent.mkdir(parents=True, exist_ok=True)
+        local_bin.symlink_to(claude.base)
+        rows = _rows(_run_doctor(env))
+        assert (rows["claude"], rows["claude-login"]) == ("ok", "ok")
+
+    def test_the_github_row_carries_ssh_last_line_only(self, tmp_path):
+        _, env = _doctor_box(
+            tmp_path,
+            github=(
+                "Warning: Permanently added 'github.com' (ED25519) to the list"
+                " of known hosts.\ngit@github.com: Permission denied (publickey)."
+            ),
+        )
+        (row,) = [
+            ln for ln in _report(_run_doctor(env)).lines if ln.item == "github-key"
+        ]
+        assert row.status == "fail"
+        assert "Permission denied (publickey)." in row.detail
+        assert "Warning" not in row.detail
+
+    def test_no_probe_reads_the_script_stream(self, tmp_path):
+        # `exec </dev/null`: bash reads the script from stdin, so a probe that
+        # inherited it would swallow whatever follows.
+        fakes, env = _doctor_box(tmp_path)
+        _doctor_raw(
+            env, "--root", "~/magent", "--target", "t", payload=b"TRAILING-BYTES\n"
+        )
+        assert all(c.stdin == b"" for f in fakes.values() for c in f.calls())
+
+    @pytest.mark.parametrize(
+        ("hang", "item", "status", "bound_s", "detail"),
+        [
+            (
+                "tmux",
+                "sessions",
+                "warn",
+                4,
+                f"tmux server on socket {remote_mux.SOCKET} did not answer in 4s",
+            ),
+            (
+                "claude",
+                "claude-login",
+                "warn",
+                8,
+                "claude auth status did not answer in 8s",
+            ),
+            ("ssh", "github-key", "fail", 12, "ssh to github.com timed out after 12s"),
+            ("df", "disk", "warn", 4, "df did not answer in 4s under ~/magent"),
+            ("tmux-version", "tmux", "fail", 4, "tmux -V timed out after 4s"),
+            ("git-version", "git", "fail", 4, "git --version timed out after 4s"),
+            # A hung read has a missing tool's status: gh only warns.
+            ("gh-version", "gh", "warn", 4, "gh --version timed out after 4s"),
+        ],
+    )
+    def test_a_hung_probe_is_its_own_row_inside_the_budget(
+        self, tmp_path, hang, item, status, bound_s, detail
+    ):
+        # One stuck probe must not cost the whole report: its own `timeout`
+        # ends it, it becomes its own row, and every other check still runs.
+        _, env = _doctor_box(tmp_path, hang=hang)
+        start = time.monotonic()
+        r = _run_doctor(env)
+        elapsed = time.monotonic() - start
+        assert r.returncode == 0, r.stderr
+        assert elapsed < bound_s + 2 + 5  # the bound, the kill grace, slack
+        assert _rows(r) == {**dict.fromkeys(DOCTOR_ITEMS, "ok"), item: status}
+        (row,) = [ln for ln in _report(r).lines if ln.item == item]
+        assert row.detail == detail
+
+    def test_a_probe_deaf_to_term_is_killed_after_its_grace(self, tmp_path):
+        # timeout's TERM is ignored, so only `-k`'s KILL ends it (rc 137):
+        # that must read as a timed-out row too, not as a tmux answer.
+        _, env = _doctor_box(tmp_path, hang="tmux", hang_ignores_term=True)
+        start = time.monotonic()
+        r = _run_doctor(env)
+        elapsed = time.monotonic() - start
+        assert r.returncode == 0, r.stderr
+        assert elapsed < 4 + 2 + 5  # the bound, the kill grace, slack
+        (row,) = [ln for ln in _report(r).lines if ln.item == "sessions"]
+        assert (row.status, row.detail) == (
+            "warn",
+            f"tmux server on socket {remote_mux.SOCKET} did not answer in 4s",
+        )
+
+    def test_every_timeout_that_runs_is_a_named_bound_with_its_grace(self, tmp_path):
+        # The text pin reads the source; this one records what ran, so a
+        # `timeout` it cannot parse (`if timeout 99 ...`, `! timeout 99 ...`)
+        # or a new probe still has to answer to the budget.
+        _, env = _doctor_box(tmp_path)
+        real = shutil.which("timeout", path=env["PATH"])
+        assert real
+        shim, log = tmp_path / "shim", tmp_path / "timeout.log"
+        shim.mkdir()
+        (shim / "timeout").write_text(
+            f'#!/bin/sh\nprintf \'%s\\n\' "$*" >> "{log}"\nexec "{real}" "$@"\n',
+            encoding="utf-8",
+        )
+        (shim / "timeout").chmod(0o755)
+        env["PATH"] = os.pathsep.join([str(shim), env["PATH"]])
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        bounds, grace = _doctor_bounds()
+        calls = [line.split() for line in log.read_text(encoding="utf-8").splitlines()]
+        # tmux -V, four --version reads, claude auth, ssh, df, list-sessions.
+        assert len(calls) == 9, calls
+        assert all(
+            c[:2] == ["-k", str(grace)] and int(c[2]) in bounds.values() for c in calls
+        ), calls
+        worst = sum(int(c[2]) + grace for c in calls)
+        assert worst + remote_mux.CONNECT_TIMEOUT_S < remote_mux.DOCTOR_TIMEOUT_S
+
+
+def test_doctor_inlines_the_tmux_floor():
+    # One predicate for setup, doctor and (by DECISION-22) bring_up's floor:
+    # doctor reads `tmux -V` under its own bound and grades it with the floor's.
+    text = node_scripts.script("doctor")
+    assert "magent_tmux_grade()" in text
+    assert 'verdict=$(magent_tmux_grade "$out")' in text
+
+
+def _doctor_bounds() -> tuple[dict[str, int], int]:
+    """doctor.sh's ``*_PROBE_S`` constants by name, and its kill grace."""
+    text = node_scripts.script("doctor")
+    bounds = {
+        name: int(value)
+        for name, value in re.findall(r"^([A-Z]+_PROBE_S)=(\d+)\b", text, re.MULTILINE)
+    }
+    (grace,) = (
+        int(g) for g in re.findall(r"^PROBE_KILL_S=(\d+)\b", text, re.MULTILINE)
+    )
+    return bounds, grace
+
+
+def test_the_probe_bounds_fit_inside_the_doctor_call():
+    # Every bounded call hanging at once, each killed after its grace, still
+    # leaves the report time to come back over ssh (connect included). Counted
+    # per call, not per constant: VERSION_PROBE_S bounds five reads, and
+    # check_tool's one call site runs once per tool.
+    text = node_scripts.script("doctor")
+    code = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    bounds, grace = _doctor_bounds()
+    # No inline limit anywhere: `timeout` runs (in command position) only
+    # inside bounded(), and every bounded call names one of the constants.
+    runs = re.findall(r"(?:^|[;&|(])\s*timeout\b(.*)", code, re.MULTILINE)
+    assert runs == [' -k "$PROBE_KILL_S" "$seconds" "$@"']
+    sites = re.findall(r"\bbounded (\S+)", code)
+    assert all(re.fullmatch(r'"\$[A-Z]+_PROBE_S"', site) for site in sites), sites
+    uses = [site.strip('"$') for site in sites]
+    tools = re.findall(r"^  check_tool \S+ (?:fail|warn) ", text, re.MULTILINE)
+    assert len(tools) == 4
+    assert code.count('bounded "$VERSION_PROBE_S" "$@"') == 1  # check_tool's
+    uses += ["VERSION_PROBE_S"] * (len(tools) - 1)
+    assert set(uses) == set(bounds)
+    worst = sum(bounds[name] + grace for name in uses)
+    assert worst + remote_mux.CONNECT_TIMEOUT_S < remote_mux.DOCTOR_TIMEOUT_S
+
+
+class TestTheSocketIsAnArgumentNeverADefault:
+    def test_doctor_counts_the_socket_lib_sh_read(self):
+        # DECISION-26 ii, pinned as D pins bring_up.sh: run_script passes
+        # remote_mux.SOCKET as $1, lib.sh reads it, and doctor never names it.
+        text = node_scripts.script("doctor")
+        assert 'tmux -L "$MAGENT_SOCKET" list-sessions' in text
+        assert f"-L {remote_mux.SOCKET}" not in text
+        assert "--socket" not in text
+
+    @pytest.mark.parametrize(
+        "name", ["provision", "programs", "setup", "doctor", "tmux_floor"]
+    )
+    def test_no_f_script_defaults_the_socket(self, name):
+        # B's all-scripts pin checks every -L; this one also catches a default
+        # parked in a variable (`socket=magent`, `${1:-magent}`).
+        text = node_scripts._read(name)
+        assert not re.search(r"socket=['\"]?magent\b", text), name
+        assert not re.search(
+            rf"(=|:-|:=)['\"]?{re.escape(remote_mux.SOCKET)}\b", text
+        ), name
+
+    def test_the_doctor_call_never_passes_the_socket_itself(self, fake_ssh):
+        # run_script adds it, once, first; a second copy would be read as --root.
+        remote_mux.doctor(NODE, timeout_s=remote_mux.DOCTOR_TIMEOUT_S)
+        (call,) = fake_ssh.calls()
+        # Count argv WORDS: the default root `~/magent` contains the socket
+        # name as a substring, so a string count would read it twice.
+        (inner,) = shlex.split(call.argv[-1])[2:]
+        assert shlex.split(inner).count(remote_mux.SOCKET) == 1
+
+
+@POSIX_BASH
+@pytest.mark.parametrize(
+    "name", ["provision", "programs", "setup", "doctor", "tmux_floor"]
+)
+def test_every_node_script_parses(name):
+    r = subprocess.run(
+        [BASH, "-n"],
+        input=node_scripts.script(name).encode("utf-8"),
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+
+
+@pytest.mark.skipif(
+    shutil.which("shellcheck") is None, reason="shellcheck is not installed"
+)
+@pytest.mark.parametrize(
+    "name", ["provision", "programs", "setup", "doctor", "tmux_floor"]
+)
+def test_every_node_script_passes_shellcheck(name):
+    # Spec §16: shellcheck runs where it is installed (CI's ubuntu image has it).
+    r = subprocess.run(
+        [
+            shutil.which("shellcheck") or "shellcheck",
+            "--shell=bash",
+            "--severity=warning",
+            "-",
+        ],
+        input=node_scripts.script(name).encode("utf-8"),
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert r.returncode == 0, r.stdout.decode("utf-8", "replace")
+
+
+class TestDoctorCall:
+    def test_the_socket_first_then_the_root_and_target_and_no_payload(self, fake_ssh):
+        remote_mux.doctor(NODE, timeout_s=remote_mux.DOCTOR_TIMEOUT_S)
+        (call,) = fake_ssh.calls()
+        assert call.argv[-1] == _remote(
+            "bash",
+            "-s",
+            "--",
+            remote_mux.SOCKET,
+            "--root",
+            "~/magent",
+            "--target",
+            "amin@devino-second",
+        )
+        assert SENTINEL_LINE not in call.stdin
+
+    def test_the_rows_come_back(self, fake_ssh):
+        fake_ssh.set_reply(
+            "bash -s", stdout="ok\ttmux\ttmux 3.4\nwarn\tlocale\tPOSIX\n"
+        )
+        report = remote_mux.doctor(NODE, timeout_s=remote_mux.DOCTOR_TIMEOUT_S)
+        assert [(line.status, line.item) for line in report.lines] == [
+            ("ok", "tmux"),
+            ("warn", "locale"),
+        ]
+
+    def test_an_unreachable_node_raises(self, fake_ssh):
+        fake_ssh.set_reply(
+            "bash -s", stderr="ssh: connect to host devino-second: No route\n", rc=255
+        )
+        with pytest.raises(RemoteError):
+            remote_mux.doctor(NODE, timeout_s=remote_mux.DOCTOR_TIMEOUT_S)
+
+    def test_a_script_that_died_keeps_its_rows_and_gains_a_fail(self, fake_ssh):
+        fake_ssh.set_reply(
+            "bash -s",
+            stdout="ok\ttmux\ttmux 3.4\n",
+            stderr="main: line 190: HOME: unbound variable\n",
+            rc=1,
+        )
+        report = remote_mux.doctor(NODE, timeout_s=remote_mux.DOCTOR_TIMEOUT_S)
+        assert [(ln.status, ln.item) for ln in report.lines] == [
+            ("ok", "tmux"),
+            ("fail", "doctor"),
+        ]
+        assert (
+            report.lines[-1].detail
+            == "exited 1: main: line 190: HOME: unbound variable"
+        )
+
+    def test_the_callers_timeout_bounds_the_call_and_stdin_is_redacted(self, fake_ssh):
+        fake_ssh.set_mode("timeout")
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.doctor(NODE, timeout_s=0.5)
+        assert exc.value.rc is None
+        shown = exc.value.command_redacted
+        assert shown[0] == "ssh"
+        assert shown[-1].startswith("<stdin: ")
+        assert shown[-1].endswith(" bytes>")
+        assert "--root" in shown[-2]
+
+    def test_an_unreachable_node_names_its_own_target(self, fake_ssh):
+        fake_ssh.set_reply(
+            "bash -s", stderr="ssh: connect to host x: No route\n", rc=255
+        )
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.doctor(NODE, timeout_s=remote_mux.DOCTOR_TIMEOUT_S)
+        assert exc.value.rc == 255
+        assert exc.value.command_redacted[0] == "ssh"
+        assert NODE.target in exc.value.command_redacted
+        assert "No route" in exc.value.stderr_tail
+
+    def test_a_transport_failure_names_the_call_that_ran(self, fake_ssh):
+        # M5: the rc-255 error shows doctor's argv, as the timeout path does.
+        fake_ssh.set_reply("bash -s", stderr="ssh: connect to host: No route\n", rc=255)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.doctor(NODE, timeout_s=remote_mux.DOCTOR_TIMEOUT_S)
+        (call,) = fake_ssh.calls()
+        shown = exc.value.command_redacted
+        assert shown[:-1] == ("ssh", *call.argv)
+        assert shown[-2] == _remote(
+            "bash",
+            "-s",
+            "--",
+            remote_mux.SOCKET,
+            "--root",
+            NODE.root,
+            "--target",
+            NODE.target,
+        )
+        assert shown[-1] == f"<stdin: {len(call.stdin)} bytes>"
