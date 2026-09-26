@@ -2671,6 +2671,30 @@ class TestTheStopCommandIsSafeToPaste:
         assert "ssh amin@devino-second, then run on the node" in result.stdout
         assert shlex.split(_kill_command(result.stdout)) == _kill_argv(sid)
 
+    # The hostile-sid pin that outlives the pre-D one above (spec-G14 R2): the
+    # plan's own None test uses "api", for which its raw f-string and
+    # _kill_hint print the same line, so only a hostile sid catches a merge
+    # that pasted the raw f-string over _kill_hint.
+    @_NEEDS_D_KILL
+    @pytest.mark.parametrize("sid", _UNQUOTABLE_SIDS)
+    def test_an_unconfirmed_kill_of_such_a_sid_prints_the_two_step_command(
+        self, runner, api_repo, tmp_config, node_answers, monkeypatch, sid
+    ):
+        monkeypatch.setattr(remote_mux, "kill_session", lambda node, sid: None)
+        nodes.update_node_map("api", entry("second", sid))
+        cfg = tmp_config(
+            config_json(
+                ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
+            )
+        )
+
+        result = _recall(runner, cfg, "--local")
+
+        assert result.exit_code == 0
+        assert ' "tmux' not in result.stdout
+        assert "ssh amin@devino-second, then run on the node" in result.stdout
+        assert shlex.split(_kill_command(result.stdout)) == _kill_argv(sid)
+
 
 # --- magent node recall --to (plan G Task 15) ----------------------------------
 
