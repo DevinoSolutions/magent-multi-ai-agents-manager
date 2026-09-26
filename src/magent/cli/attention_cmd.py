@@ -40,6 +40,14 @@ _NOTHING_TO_DO = (
     "nothing to do: every attention renderer is disabled or unsupported here"
 )
 
+# How long `attention -d` waits for the detached child to write its pid file.
+# The child pays a full interpreter start plus config load first (~1-1.5s on
+# an idle box). The old fixed 2s window was measured failing on a loaded
+# Windows desktop while the child came up at 4.7-11s: the launcher reported
+# "failed to start" and exited 1 over a daemon that was, in fact, running.
+# The poll returns the moment the pid appears, so the idle path pays nothing.
+DAEMON_START_TIMEOUT_S = 20.0
+
 
 def daemon_pid() -> int | None:
     """PID of the running attention daemon, or None. Clears a stale pid file."""
@@ -52,6 +60,29 @@ def daemon_pid() -> int | None:
     with contextlib.suppress(OSError):
         _PID_PATH.unlink()
     return None
+
+
+def _await_daemon(
+    child: subprocess.Popen[bytes],
+    timeout_s: float = DAEMON_START_TIMEOUT_S,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> int | None:
+    """The pid the detached daemon registered, or None if it never did.
+
+    Gives up early when ``child`` has exited: a child that died before writing
+    its pid is not coming, and waiting out the window would only delay the
+    failure. The clock is a seam so the window is unit-testable without
+    sleeping through it."""
+    deadline = clock() + timeout_s
+    while True:
+        sleep(0.1)
+        pid = daemon_pid()
+        if pid:
+            return pid
+        if child.poll() is not None or clock() >= deadline:
+            return None
 
 
 def _write_pid() -> None:
@@ -381,16 +412,13 @@ def attention_cmd(
                     spawn_detached,
                 )
 
-                spawn_detached(args)
-                for _ in range(20):
-                    time.sleep(0.1)
-                    pid = daemon_pid()
-                    if pid:
-                        click.echo(
-                            f"  {style('+', fg='green')} Attention daemon running "
-                            f"{style(f'(pid {pid})', dim=True)}"
-                        )
-                        return
+                pid = _await_daemon(spawn_detached(args))
+                if pid:
+                    click.echo(
+                        f"  {style('+', fg='green')} Attention daemon running "
+                        f"{style(f'(pid {pid})', dim=True)}"
+                    )
+                    return
                 click.echo(f"  {style('x', fg='red')} attention daemon failed to start")
                 sys.exit(1)
         except LockHeld:
