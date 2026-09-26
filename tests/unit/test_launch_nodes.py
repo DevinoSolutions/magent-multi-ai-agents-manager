@@ -586,6 +586,17 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         assert [recipe.sid for _, recipe in rig.recipes] == ["web"]
         assert set(nodes.read_node_map()) == {"web"}
 
+    def test_a_refusal_keeps_its_place_in_the_batch(self, rig, tmp_path, monkeypatch):
+        # Refused before the fan-out, but reported where the batch put them.
+        x_api, y_api, web = _twin_apis(tmp_path, rig)
+        _no_contact_for(monkeypatch, rig, "api-x", "api-y")
+        outcomes = _batch(_config(web, x_api, y_api))
+        assert [(o.sid, o.ok) for o in outcomes] == [
+            ("web", True),
+            ("api-x", False),
+            ("api-y", False),
+        ]
+
     def test_a_collision_with_a_project_outside_the_batch_still_refuses(
         self, rig, tmp_path, monkeypatch
     ):
@@ -758,6 +769,24 @@ class TestUpBringsUpNodeProjectsToo:
         )
         launch.bring_up_psmux(_config(*projs))
         assert rig.windows == []
+
+    def test_only_reaches_the_node_half(self, rig, tmp_path, monkeypatch):
+        # `magent up` without --all and the menu's `u` pass the down-list: a
+        # node project outside it is never dialed, cloned or provisioned.
+        projs = _projects(tmp_path, rig, [("a1", "second"), ("b1", "third")])
+        monkeypatch.setattr("magent.psmux.bring_up", lambda cfg, only, group: ([], []))
+        assert launch.bring_up_psmux(_config(*projs), only=["b1"]) == (["b1"], [])
+        assert [recipe.sid for _, recipe in rig.recipes] == ["b1"]
+        assert launch.bring_up_psmux(_config(*projs), only=["local-x"]) == ([], [])
+        assert [recipe.sid for _, recipe in rig.recipes] == ["b1"]
+
+    def test_group_reaches_the_node_half(self, rig, tmp_path, monkeypatch):
+        # `up --group work` brings up that group's node projects and no other.
+        work, other = _projects(tmp_path, rig, [("w1", "second"), ("o1", "third")])
+        work.group = "work"
+        monkeypatch.setattr("magent.psmux.bring_up", lambda cfg, only, group: ([], []))
+        assert launch.bring_up_psmux(_config(work, other), group="WORK") == (["w1"], [])
+        assert [recipe.sid for _, recipe in rig.recipes] == ["w1"]
 
     def test_node_session_ids_follow_the_group_filter(self, rig, tmp_path):
         a = ProjectConfig(path=str(tmp_path / "a"), node="second", group="work")
