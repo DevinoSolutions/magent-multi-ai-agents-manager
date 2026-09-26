@@ -1840,7 +1840,8 @@ that is still alive inside `REGISTRATION_TIMEOUT_S` counts as starting, not
 failed. Once it exits, or the window runs out, the cooldown decides alone as
 before. The supervisor never ends that child either. At the default 60s cooldown
 this guard never engages, because the cooldown check returns first; it matters
-only for a cooldown override below the window (the e2e tier's 3s is one). It is
+only when the cooldown is shorter than a serve's startup (the e2e tier's 3s
+override is one). It is
 not a cure either: a serve measured 28.65s to bind on a loaded desktop, past the
 window, and was doubled all the same. The structural fix is an exclusive bind
 in upload_server, which is not changed here. Pins:
