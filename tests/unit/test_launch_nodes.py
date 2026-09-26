@@ -5,6 +5,7 @@ faked at remote_mux's seam, so nothing here dials anything."""
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 from pathlib import Path
 
@@ -76,6 +77,7 @@ class NodeRig:
         monkeypatch.setattr("magent.attach_client.spawn_attach_window", self._window)
         self.error: Exception | None = None
         self.provisioned: list[str] = []
+        self.provision_timeouts: list[float] = []
         monkeypatch.setattr(remote_mux, "provision_node", self._provision)
         monkeypatch.setattr(launch, "_PROVISIONED", set())
 
@@ -99,6 +101,7 @@ class NodeRig:
 
     def _provision(self, node, config, *, home, timeout_s, force=False):
         self.provisioned.append(node.nick)
+        self.provision_timeouts.append(timeout_s)
         return remote_mux.ProvisionReport(())
 
 
@@ -622,7 +625,13 @@ class TestTheBringUpProvisionsFirst:
     def test_the_node_is_provisioned_before_the_session_comes_up(
         self, rig, api, fake_ssh, monkeypatch
     ):
+        from tests.unit.test_node_provision import _sent, _unpack
+
         monkeypatch.setattr(remote_mux, "provision_node", real_provision_node)
+        # conftest points the home at tmp: the scope must be built from IT.
+        settings = Path.home() / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
         seen_at_bring_up: list[int] = []
 
         def bring_up(node, recipe, **kw):
@@ -638,7 +647,13 @@ class TestTheBringUpProvisionsFirst:
         # A bring-up provisions what changed; only `node setup` forces.
         assert "--force" not in call.argv[-1]
         assert call.stdin.startswith(node_scripts.script("provision").encode("utf-8"))
+        _, _, data = _unpack(_sent(call))
+        assert json.loads(data["settings.json"]) == {"model": "opus"}
         assert "second" in launch._PROVISIONED
+
+    def test_provisioning_gets_its_own_budget(self, rig, api):
+        assert launch.bring_up_node_project(_config(api), api).ok
+        assert rig.provision_timeouts == [remote_mux.PROVISION_TIMEOUT_S]
 
     def test_a_second_project_on_the_same_node_does_not_provision_again(
         self, rig, api, fake_ssh, monkeypatch, tmp_path
@@ -676,17 +691,33 @@ class TestTheBringUpProvisionsFirst:
         self, rig, api, fake_ssh, monkeypatch, caplog
     ):
         monkeypatch.setattr(remote_mux, "provision_node", real_provision_node)
-        fake_ssh.set_reply("bash -s", stdout="fail\tgh\tgh is not installed\n", rc=1)
-        with caplog.at_level(logging.WARNING, logger="magent.nodes"):
+        fake_ssh.set_reply(
+            "bash -s",
+            stdout=(
+                "ok\tgit\tgit 2.43\n"
+                "warn\tplugin\tmarketplace slow\n"
+                "skip\tsettings\tunchanged\n"
+                "fail\tgh\tgh is not installed\n"
+            ),
+            rc=1,
+        )
+        with caplog.at_level(logging.DEBUG, logger="magent.nodes"):
             outcome = launch.bring_up_node_project(_config(api), api)
         assert outcome.ok
         assert [nick for nick, _ in rig.recipes] == ["second"]
         assert "second" in launch._PROVISIONED
-        assert (
-            "magent.nodes",
-            logging.WARNING,
-            "provision second: gh: gh is not installed",
-        ) in caplog.record_tuples
+        # Only the fail row is news; ok/warn/skip rows are node doctor's.
+        assert [
+            (logger, level, message)
+            for logger, level, message in caplog.record_tuples
+            if message.startswith("provision second:")
+        ] == [
+            (
+                "magent.nodes",
+                logging.WARNING,
+                "provision second: gh: gh is not installed",
+            )
+        ]
 
     # D-MERGE: test_dry_run_provisions_nothing (plan F Task 12A) lands with
     # sub-plan D's Task 12: it needs D12's `desk` / `no_sleep` fixtures and its
