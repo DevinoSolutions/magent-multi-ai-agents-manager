@@ -18,6 +18,7 @@ import pytest
 
 from magent import agent_state, cli
 from magent.cli import status as status_mod
+from magent.config import SCHEMA_VERSION
 
 
 def _no_psmux(monkeypatch):
@@ -1066,6 +1067,168 @@ class TestDownStopsWhatItPromisesAndReportsWhatItProved:
         # ...but nothing is claimed.
         assert "No running sessions to stop." in out.output
         assert "Stopped" not in out.output.split("Upload server")[0]
+
+
+class TestDownStopsANodeProjectsOrphanedLocalSession:
+    """A project ran here, then gained ``"node": "second"``. From then on every
+    local psmux path skips it (it runs on the node), so its old LOCAL session
+    vanished from status, the picker and `down` -- alive and unstoppable.
+
+    `down` acting locally therefore also targets the in-scope node projects'
+    session ids. Killing a socket with no server is a no-op, and the report
+    names only what the re-probe PROVED stopped, so a node project with no
+    local session costs nothing and claims nothing.
+    """
+
+    def _run(self, runner, tmp_config, monkeypatch, argv, *, projects, live_local):
+        cfgpath = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {"nodes": {"second": {"host": "devino-second"}}},
+                "projects": projects,
+            }
+        )
+        # The REAL psmux_status -- it is the thing that hides the node project.
+        # Only the psmux binary is substituted: its lookup and its liveness probe.
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda *a, **k: "psmux")
+        monkeypatch.setattr(
+            "magent.psmux.live_sessions",
+            lambda names, *a, **k: [n for n in names if n in live_local],
+        )
+        killed: list[list[str]] = []
+
+        def fake_stop(targets):
+            killed.append(list(targets))
+            return [t for t in targets if t in live_local], []
+
+        monkeypatch.setattr("magent.launch.stop_psmux", fake_stop)
+        monkeypatch.setattr("magent.cli.attach._read_last_host", lambda: None)
+        monkeypatch.setattr("magent.upload_server.stop_server", lambda port: False)
+        monkeypatch.setattr("magent.cli.attention_cmd.stop_daemon", lambda: False)
+        if sys.platform == "win32":
+            monkeypatch.setattr("magent.hotkey.stop_listener", lambda: False)
+        out = runner.invoke(cli.main, ["--config", cfgpath, "down", *argv])
+        return out, killed
+
+    def test_down_all_stops_the_orphaned_local_session(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            live_local={"api"},
+        )
+        assert out.exit_code == 0, out.output
+        assert killed == [["api"]]
+        assert "Stopped 1 session(s): api" in out.output
+
+    def test_a_node_project_with_no_local_session_is_tried_but_never_claimed(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            live_local=set(),
+        )
+        assert out.exit_code == 0, out.output
+        assert killed == [["api"]]
+        assert "No running sessions to stop." in out.output
+        assert "Stopped" not in out.output.split("Upload server")[0]
+        assert "would NOT stop" not in out.output
+
+    def test_local_and_node_targets_go_to_one_stop_call(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        (tmp_path / "web").mkdir()
+        out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[
+                {"path": str(tmp_path / "web")},
+                {"path": str(tmp_path / "api"), "node": "second"},
+            ],
+            live_local={"web", "api"},
+        )
+        assert out.exit_code == 0, out.output
+        assert killed == [["web", "api"]]
+        assert "Stopped 2 session(s): web, api" in out.output
+
+    @pytest.mark.parametrize(("name", "expected"), [("api", "api"), ("web", "web")])
+    def test_a_named_down_selects_node_sids_like_any_other(
+        self, runner, tmp_config, monkeypatch, tmp_path, name, expected
+    ):
+        (tmp_path / "web").mkdir()
+        _out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            [name],
+            projects=[
+                {"path": str(tmp_path / "web")},
+                {"path": str(tmp_path / "api"), "node": "second"},
+            ],
+            live_local={"web", "api"},
+        )
+        assert killed == [[expected]]
+
+    def test_the_group_scope_applies_to_node_projects(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        _out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--group", "a"],
+            projects=[
+                {"path": str(tmp_path / "api"), "node": "second", "group": "a"},
+                {"path": str(tmp_path / "db"), "node": "second", "group": "b"},
+            ],
+            live_local={"api", "db"},
+        )
+        assert killed == [["api"]]
+
+    def test_a_cloud_project_is_already_a_local_target_and_not_doubled(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        (tmp_path / "sky").mkdir()
+        _out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "sky"), "node": "cloud"}],
+            live_local={"sky"},
+        )
+        assert killed == [["sky"]]
+
+    def test_forwarding_to_a_host_kills_nothing_here(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        from magent.cli import attach as attach_mod
+
+        monkeypatch.setattr(
+            attach_mod,
+            "_ssh_capture",
+            lambda target, remote_cmd, timeout=30, stdin_text=None: (0, "", ""),
+        )
+        monkeypatch.setattr(attach_mod, "_close_attach_windows", lambda names: 0)
+        _out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--host", "user@box", "--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            live_local={"api"},
+        )
+        assert killed == []
 
 
 class TestDownActsOnTheAttachHost:
