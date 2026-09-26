@@ -3253,6 +3253,33 @@ class TestDoctorShUnderRealBash:
             f"tmux server on socket {remote_mux.SOCKET} did not answer in 4s",
         )
 
+    def test_every_timeout_that_runs_is_a_named_bound_with_its_grace(self, tmp_path):
+        # The text pin reads the source; this one records what ran, so a
+        # `timeout` it cannot parse (`if timeout 99 ...`, `! timeout 99 ...`)
+        # or a new probe still has to answer to the budget.
+        _, env = _doctor_box(tmp_path)
+        real = shutil.which("timeout", path=env["PATH"])
+        assert real
+        shim, log = tmp_path / "shim", tmp_path / "timeout.log"
+        shim.mkdir()
+        (shim / "timeout").write_text(
+            f'#!/bin/sh\nprintf \'%s\\n\' "$*" >> "{log}"\nexec "{real}" "$@"\n',
+            encoding="utf-8",
+        )
+        (shim / "timeout").chmod(0o755)
+        env["PATH"] = os.pathsep.join([str(shim), env["PATH"]])
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        bounds, grace = _doctor_bounds()
+        calls = [line.split() for line in log.read_text(encoding="utf-8").splitlines()]
+        # tmux -V, four --version reads, claude auth, ssh, df, list-sessions.
+        assert len(calls) == 9, calls
+        assert all(
+            c[:2] == ["-k", str(grace)] and int(c[2]) in bounds.values() for c in calls
+        ), calls
+        worst = sum(int(c[2]) + grace for c in calls)
+        assert worst + remote_mux.CONNECT_TIMEOUT_S < remote_mux.DOCTOR_TIMEOUT_S
+
 
 def test_doctor_inlines_the_tmux_floor():
     # One predicate for setup, doctor and (by DECISION-22) bring_up's floor:
@@ -3260,6 +3287,19 @@ def test_doctor_inlines_the_tmux_floor():
     text = node_scripts.script("doctor")
     assert "magent_tmux_grade()" in text
     assert 'verdict=$(magent_tmux_grade "$out")' in text
+
+
+def _doctor_bounds() -> tuple[dict[str, int], int]:
+    """doctor.sh's ``*_PROBE_S`` constants by name, and its kill grace."""
+    text = node_scripts.script("doctor")
+    bounds = {
+        name: int(value)
+        for name, value in re.findall(r"^([A-Z]+_PROBE_S)=(\d+)\b", text, re.MULTILINE)
+    }
+    (grace,) = (
+        int(g) for g in re.findall(r"^PROBE_KILL_S=(\d+)\b", text, re.MULTILINE)
+    )
+    return bounds, grace
 
 
 def test_the_probe_bounds_fit_inside_the_doctor_call():
@@ -3271,13 +3311,7 @@ def test_the_probe_bounds_fit_inside_the_doctor_call():
     code = "\n".join(
         line for line in text.splitlines() if not line.lstrip().startswith("#")
     )
-    bounds = {
-        name: int(value)
-        for name, value in re.findall(r"^([A-Z]+_PROBE_S)=(\d+)\b", text, re.MULTILINE)
-    }
-    (grace,) = (
-        int(g) for g in re.findall(r"^PROBE_KILL_S=(\d+)\b", text, re.MULTILINE)
-    )
+    bounds, grace = _doctor_bounds()
     # No inline limit anywhere: `timeout` runs (in command position) only
     # inside bounded(), and every bounded call names one of the constants.
     runs = re.findall(r"(?:^|[;&|(])\s*timeout\b(.*)", code, re.MULTILINE)
