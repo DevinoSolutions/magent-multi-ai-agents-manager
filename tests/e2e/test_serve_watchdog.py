@@ -264,10 +264,20 @@ class _World:
             path = self.workdir / name
             if path.is_file():
                 lines.append(f"--- {name} ---\n{path.read_text(errors='replace')}")
-        log = self.md / "logs" / "attention.log"
-        if log.is_file():
-            lines.append(f"--- attention.log ---\n{log.read_text(errors='replace')}")
+        # upload.log carries each serve's "listening ... pid N" line: the only
+        # place two servers answering one port show up as two pids.
+        for name in ("attention.log", "upload.log"):
+            log = self.md / "logs" / name
+            if log.is_file():
+                lines.append(f"--- {name} ---\n{log.read_text(errors='replace')}")
         return "\n".join(lines)
+
+    def spawns(self) -> int:
+        """How many serves the watchdog has logged starting so far."""
+        log = self.md / "logs" / "attention.log"
+        if not log.is_file():
+            return 0
+        return log.read_text(errors="replace").count("starting a new magent serve")
 
 
 def _start_attention(w: _World, budget: _Budget) -> int:
@@ -360,6 +370,7 @@ class TestAttentionDaemonSupervisesTheUploadServer:
             # the supervisor is allowed to be faster than this test can look,
             # and demanding an observable gap would be asserting that the
             # repair is SLOW. What matters is the identity of who answers next.
+            spawned_before_kill = w.spawns()
             _kill_pid(first)
 
             # A DIFFERENT server takes its place.
@@ -368,6 +379,14 @@ class TestAttentionDaemonSupervisesTheUploadServer:
             assert second != first
             assert pid_alive(second)
             assert _health_ok(w.port)
+            # ...and it is a REVIVE, not a duplicate spawned beside a slow first
+            # serve before the kill. Without this, a run where the watchdog
+            # doubled the startup passed for the wrong reason (the survivor
+            # looked like the replacement) and the mirror-image run failed.
+            assert w.spawns() > spawned_before_kill, (
+                f"server {second} answered but the watchdog logged no respawn "
+                f"after the kill:\n{w.diagnostics()}"
+            )
         finally:
             # Only pids this test created: the daemon, plus every server it was
             # observed to spawn (including one that may have appeared after the
