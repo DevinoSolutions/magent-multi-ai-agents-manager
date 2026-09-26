@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from magent import attach_client, launch, nodes, remote_mux
+from magent import attach_client, launch, lockfile, nodes, remote_mux
 from magent.config import MagentConfig, NodeConfig, ProjectConfig, Settings
 from magent.nodes import LocalGitState, NodeMapEntry
 from magent.remote_mux import BringUpResult, RemoteError
@@ -347,3 +347,41 @@ class TestAFailureIsAnOutcomeNeverACrash:
         proj = ProjectConfig(path=str(folder), node="auto")
         assert launch.bring_up_node_project(_config(proj), proj).node == "third"
         assert rig.recipes[0][0] == "third"
+
+
+class TestASessionThatCameUpButWasNotRecordedIsUp:
+    """The node said yes, then the map write failed (another writer held the
+    lock past its wait, or the map was unreadable): the session IS running
+    there, so the outcome says so -- ok, with a warning naming what was lost
+    and how to repair it -- never a failure that invites a second bring-up."""
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            lockfile.LockHeld("node-map is held"),
+            ValueError("node-map.json: not valid JSON"),
+        ],
+    )
+    def test_it_is_ok_with_a_repair_warning(self, rig, api, monkeypatch, exc):
+        def no_map(*_a: object, **_k: object) -> dict[str, NodeMapEntry]:
+            raise exc
+
+        monkeypatch.setattr(nodes, "update_node_map", no_map)
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert outcome.ok is True
+        assert outcome.error is None
+        (warning,) = [w for w in outcome.warnings if "not recorded" in w]
+        assert warning.startswith("up on @second but not recorded")
+        assert "re-run magent up" in warning
+        assert warning.isascii()
+
+    def test_the_window_still_opens(self, rig, api, monkeypatch):
+        def no_map(*_a: object, **_k: object) -> dict[str, NodeMapEntry]:
+            raise lockfile.LockHeld("node-map is held")
+
+        monkeypatch.setattr(nodes, "update_node_map", no_map)
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+        assert launch.bring_up_node_project(_config(api), api, window=True).ok
+        assert [w[1] for w in rig.windows] == ["api"]

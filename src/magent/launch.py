@@ -1540,18 +1540,37 @@ def bring_up_node_project(
             result = remote_mux.bring_up(
                 node, recipe, allow_dirty=allow_dirty, resume_id=resume_id
             )
-            nodes.update_node_map(
-                name,
-                nodes.NodeMapEntry(
-                    nick=nick,
-                    sid=result.sid,
-                    placed_ts=time.time(),
-                    attached_existing=result.attached_existing,
-                    remote_root=recipe.remote_root,
-                    target=node.target,
-                    cwd=result.cwd,
-                ),
-            )
+            warnings = recipe.warnings
+            try:
+                nodes.update_node_map(
+                    name,
+                    nodes.NodeMapEntry(
+                        nick=nick,
+                        sid=result.sid,
+                        placed_ts=time.time(),
+                        attached_existing=result.attached_existing,
+                        remote_root=recipe.remote_root,
+                        target=node.target,
+                        cwd=result.cwd,
+                    ),
+                )
+            except (ValueError, OSError) as exc:
+                # The node said yes: the session IS running there. A failed
+                # record (LockHeld past its wait, an unreadable map) is not a
+                # failed bring-up -- reporting one would invite a second. A
+                # re-run attaches to the live session and records it then.
+                log.warning(
+                    "node %s: %s up but not recorded in the node map: %s",
+                    nick,
+                    result.sid,
+                    exc,
+                )
+                # ASCII end to end: the cause is the OS's or the map's words.
+                cause = str(exc).encode("ascii", "replace").decode("ascii")
+                warnings = (
+                    *warnings,
+                    f"up on @{nick} but not recorded ({cause}); re-run magent up",
+                )
         if window:
             _open_node_window(node, result.sid)
         log.info(
@@ -1565,7 +1584,7 @@ def bring_up_node_project(
             sid=sid,
             node=nick,
             attached_existing=result.attached_existing,
-            warnings=recipe.warnings,
+            warnings=warnings,
         )
     except (ValueError, remote_mux.RemoteError, OSError) as exc:
         # ValueError covers NodeConfigError (its subclass) and a recipe that
