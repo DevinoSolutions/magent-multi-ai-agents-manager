@@ -2083,6 +2083,90 @@ class TestProvision:
         assert TOKEN.encode("ascii") not in call.stdin
         assert all(c.argv[:2] != ["auth", "token"] for c in fake_gh.calls())
 
+    # F6: gh reads its stored token without the network, so a login it could
+    # not verify (offline) is still shared -- the node's own `gh auth login`
+    # checks it. A token github.com REFUSED never is.
+    def test_an_unverified_login_still_shares_its_token(self, fake_ssh, fake_gh):
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(None, accounts=[("amin", True, "timeout")]),
+        )
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        (call,) = fake_ssh.calls()
+        assert _sent(call).split(b"\n", 1)[0] == TOKEN.encode("ascii")
+        _, _, data = _unpack(_sent(call))
+        assert json.loads(data["manifest.json"])["gh_login"] == "amin"
+        assert not [line for line in report.lines if line.item == "gh"]
+
+    def test_a_rejected_login_shares_nothing_and_says_why(self, fake_ssh, fake_gh):
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(
+                None,
+                accounts=[("amin", True, "error", "HTTP 401: Bad credentials")],
+            ),
+        )
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        (call,) = fake_ssh.calls()
+        assert TOKEN.encode("ascii") not in call.stdin
+        assert _sent(call).startswith(b"\n")
+        assert all(c.argv[:2] != ["auth", "token"] for c in fake_gh.calls())
+        assert (
+            ScriptLine(
+                "warn",
+                "gh",
+                (
+                    "not shared -- github.com rejected this PC's gh login: "
+                    "gh auth login -h github.com"
+                ),
+            )
+            in report.lines
+        )
+
+    def test_a_token_read_that_fails_shares_nothing_and_says_why(
+        self, fake_ssh, fake_gh
+    ):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        fake_gh.set_reply("auth token", stdout="warning\n")
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        (call,) = fake_ssh.calls()
+        assert _sent(call).startswith(b"\n")
+        _, _, data = _unpack(_sent(call))
+        assert json.loads(data["manifest.json"])["gh_login"] is None
+        assert (
+            ScriptLine(
+                "warn",
+                "gh",
+                (
+                    "not shared -- this PC's gh failed: "
+                    "gh auth token printed something that is not a token"
+                ),
+            )
+            in report.lines
+        )
+
+    # The node's own gh row already says "no gh login to share".
+    def test_no_gh_adds_no_row_of_this_pcs_own(self, fake_ssh):
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        assert not [line for line in report.lines if line.item == "gh"]
+
+    def test_a_logged_out_gh_adds_no_row_of_this_pcs_own(self, fake_ssh, fake_gh):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status(None))
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        assert not [line for line in report.lines if line.item == "gh"]
+
     def test_force_is_the_scripts_one_argument(self, fake_ssh):
         remote_mux.provision(
             NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S, force=True
@@ -3767,6 +3851,34 @@ class TestRegisterSshKey:
         assert row == ScriptLine(
             "fail", "github-key", "gh is not logged in on this PC: gh auth login"
         )
+
+    # F6: every other reason gh gave no account names its own repair, and no
+    # key is added on an account nobody verified.
+    @pytest.mark.parametrize(
+        ("accounts", "hint"),
+        [
+            (
+                [("amin", True, "error", "HTTP 401: Bad credentials")],
+                "github.com rejected this PC's gh login: gh auth login -h github.com",
+            ),
+            (
+                [("amin", True, "timeout")],
+                (
+                    "this PC's gh could not verify its github.com login (amin): "
+                    "check this PC's network, then retry"
+                ),
+            ),
+        ],
+    )
+    def test_a_login_gh_could_not_vouch_for_names_its_repair(
+        self, fake_gh, accounts, hint
+    ):
+        fake_gh.set_reply(
+            "auth status", stdout=gh_auth_status(None, "", accounts=accounts)
+        )
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine("fail", "github-key", hint)
+        assert _adds(fake_gh) == []
 
     def test_a_login_without_the_key_scope_names_the_refresh(self, fake_gh):
         fake_gh.set_reply(

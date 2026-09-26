@@ -1003,13 +1003,7 @@ def provision(
     # Always, even with nothing to probe: a stdio server whose command is not
     # a plain program name is never offered to the probe, and only this drops it.
     user_scope = without_missing_programs(user_scope, found=found, unprobed=unprobed)
-    account = local_gh_account()
-    login: str | None = None
-    token: str | None = None
-    if isinstance(account, GhAccount):
-        read = local_gh_token()
-        if isinstance(read, str):
-            login, token = account.login, read
+    login, token, gh_rows = _gh_to_share()
     payload = build_payload(
         user_scope,
         gh_token=token,
@@ -1026,7 +1020,35 @@ def provision(
         ScriptLine("ok", "scope", f"mcp {name}: shipped")
         for name in sorted(user_scope.mcp_servers)
     )
-    return ProvisionReport((*notes, *shipped, *probe_failed, *report.lines))
+    return ProvisionReport((*notes, *shipped, *probe_failed, *gh_rows, *report.lines))
+
+
+# No gh, or no login in it: the node's own gh row already says so.
+_GH_SILENT_REASONS = frozenset({"missing", "not-logged-in"})
+
+
+def _gh_to_share() -> tuple[str | None, str | None, tuple[ScriptLine, ...]]:
+    """(login, token, rows) for ``provision``: this PC's github.com login and
+    token when both are known, else (None, None) and -- unless gh is simply
+    absent or logged out -- one ``warn`` row naming the repair. A verified
+    login ships; so does an ``unverified`` one (offline: its stored token is
+    still read), never a ``rejected`` one. A row never quotes the token."""
+    account = local_gh_account()
+    if isinstance(account, GhAccount):
+        login: str | None = account.login
+    elif account.reason == "unverified":
+        login = account.login
+    else:
+        login = None
+    refusal = account if isinstance(account, GhUnavailable) else None
+    if login is not None:
+        token = local_gh_token()
+        if isinstance(token, str):
+            return login, token, ()
+        refusal = token
+    if refusal is None or refusal.reason in _GH_SILENT_REASONS:
+        return None, None, ()
+    return None, None, (ScriptLine("warn", "gh", f"not shared -- {refusal.hint}"),)
 
 
 def provision_node(
