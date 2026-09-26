@@ -170,7 +170,7 @@ def hooks_install_cmd(settings_file: Path | None) -> None:
     if repaired:
         click.echo(
             f"  {style('+', fg='green', bold=True)} Repaired stale hook command for "
-            f"{', '.join(repaired)} {style('(pre-3.1.2 backslash path)', dim=True)}"
+            f"{', '.join(repaired)} {style('(backslash path bash cannot run)', dim=True)}"
         )
     if added or repaired:
         click.echo(
