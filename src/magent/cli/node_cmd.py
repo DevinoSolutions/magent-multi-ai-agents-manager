@@ -51,9 +51,12 @@ def _daemon_state() -> Literal["ok", "stale", "stopped"]:
     """
     from magent import node_sync  # heavy subsystem: in-body per policy
 
-    if log.heartbeat_age(node_sync.HEARTBEAT_NAME) is None:
+    # One read: a clean stop removing the file between two reads would turn
+    # "stopped" into "stale".
+    age = log.heartbeat_age(node_sync.HEARTBEAT_NAME)
+    if age is None:
         return "stopped"
-    return "ok" if log.heartbeat_fresh(node_sync.HEARTBEAT_NAME) else "stale"
+    return "ok" if age <= log.HEARTBEAT_MAX_AGE else "stale"
 
 
 @node_group.command("sync")
