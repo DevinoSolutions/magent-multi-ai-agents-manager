@@ -1100,6 +1100,11 @@ def unknown_node_remote_root(project_dir: Path) -> str:
     return _remote_root_under(UNKNOWN_NODE_ROOT, project_dir)
 
 
+def on_unknown_node(recipe: Recipe) -> bool:
+    """Whether ``recipe``'s folder came from ``unknown_node_remote_root``."""
+    return recipe.remote_root.startswith(f"{UNKNOWN_NODE_ROOT}/")
+
+
 def _remote_root_under(root: str, project_dir: Path) -> str:
     name = project_dir.name
     if not name:
@@ -1109,7 +1114,8 @@ def _remote_root_under(root: str, project_dir: Path) -> str:
     return f"{root.rstrip('/')}/{name}"
 
 
-def _folder_leaf(recipe: Recipe) -> str:
+def folder_leaf(recipe: Recipe) -> str:
+    """The node folder NAME ``recipe`` lands in: what the leaf rule keys on."""
     return recipe.remote_root.rstrip("/").rsplit("/", 1)[-1]
 
 
@@ -1129,7 +1135,7 @@ def remote_root_collisions(recipes: Sequence[Recipe]) -> list[tuple[Recipe, ...]
     Pure."""
     groups: dict[str, list[Recipe]] = {}
     for recipe in recipes:
-        group = groups.setdefault(_folder_leaf(recipe), [])
+        group = groups.setdefault(folder_leaf(recipe), [])
         if not any(member is recipe for member in group):
             group.append(recipe)
     return [tuple(group) for group in groups.values() if len(group) > 1]
@@ -1143,7 +1149,7 @@ def remote_root_collision_text(group: Sequence[Recipe]) -> str:
     folders = ", ".join(recipe.remote_root for recipe in group)
     return (
         f"projects {who} would share the node folder name "
-        f"{_folder_leaf(group[0])!r} ({folders}); a node folder is named after "
+        f"{folder_leaf(group[0])!r} ({folders}); a node folder is named after "
         "the local folder and any two projects may land on one node, so rename "
         "one of them"
     )

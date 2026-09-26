@@ -1230,6 +1230,15 @@ def _map_unreadable_text(exc: OSError | ValueError) -> str:
     )
 
 
+def _folder_unknown_text(exc: OSError | ValueError, leaf: str, nick: str) -> str:
+    """A pinned project's one-line refusal when its only folder rivals are
+    ``auto`` projects an unreadable map hides. The error CLASS only."""
+    return (
+        f"the node map is unreadable ({type(exc).__name__}), so whether '{leaf}'"
+        f" on {nick} is already in use is unknown; not brought up"
+    )
+
+
 def _dispatch_node_project(
     config: MagentConfig,
     opts: RunOpts,
@@ -2044,6 +2053,15 @@ def _run_node_bring_ups(
         text = nodes.remote_root_collision_text(group)
         for recipe in group:
             clash[recipe.sid] = text
+            if unreadable is not None and all(
+                nodes.on_unknown_node(other) for other in group if other is not recipe
+            ):
+                # Its only rivals are auto projects whose node the map would
+                # name: no rename is owed, the map is -- a holder is refused
+                # only because it cannot prove it holds the folder.
+                clash[recipe.sid] = _folder_unknown_text(
+                    unreadable, nodes.folder_leaf(recipe), placed[recipe.sid][0]
+                )
     outcomes: dict[str, NodeBringUpOutcome] = {}
     for proj in projects:
         sid = nodes.node_sid(proj)
