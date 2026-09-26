@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Literal
 import click
 
 from magent import attach_client, tailnet
+from magent.config import NODE_AUTO, runs_on_node
 from magent.grid import TileSlot, compute_grid
 from magent.log import get_logger
 from magent.platform import (
@@ -549,6 +550,9 @@ class RunOpts:
     # "every enabled project" -- which is what a skipped checklist (no terminal,
     # or `--all`) means, and what this phase has always done.
     only: frozenset[str] | None = None
+    # Node projects (PR-D): start one whose local tree is dirty or has
+    # unpushed commits anyway -- the node gets origin's copy (D7).
+    allow_dirty: bool = False
 
 
 @dataclass
@@ -642,6 +646,8 @@ def run_magent(config: MagentConfig, opts: RunOpts) -> int:
         return 2
 
     _start_psmux_and_upload(plat, config, opts, result)
+    if result.node_projects:
+        result = _bring_up_node_windows(plat, config, opts, result)
 
     targets = (
         _retile_targets(config, opts, result) if opts.retile_all else result.targets
@@ -721,6 +727,9 @@ class _LaunchResult:
     # already-running probe used. `_retile_targets` reads it to find
     # magent-owned windows that no configured project accounts for.
     open_titles: tuple[str, ...] = ()
+    # Node projects this launch owes a bring-up (PR-D): collected by the loop,
+    # brought up after the local phases, before tiling.
+    node_projects: tuple[ProjectConfig, ...] = ()
 
 
 def _discovered_targets(
@@ -798,6 +807,7 @@ def _launch_projects(
     tools = config.settings.tools
     use_psmux = config.settings.psmux and plat.supports_psmux()
     psmux_windows: list[PsmuxWindowOpts] = []
+    node_projects: list[ProjectConfig] = []
     _psmux_colors: dict[str, str | None] = {}
 
     win_snapshot = plat.snapshot_windows()
@@ -815,6 +825,12 @@ def _launch_projects(
     for proj in projects:
         tool = proj.tool or config.settings.default_tool
         is_remote = bool(proj.host)
+
+        if runs_on_node(proj) and not is_ide_tool(tool):
+            new_count += _dispatch_node_project(
+                config, opts, proj, tool, _is_running, targets, node_projects
+            )
+            continue
 
         if is_ide_tool(tool):
             new_count += _dispatch_ide_project(
@@ -851,6 +867,7 @@ def _launch_projects(
         psmux_windows=psmux_windows,
         psmux_colors=_psmux_colors,
         open_titles=tuple(win_snapshot),
+        node_projects=tuple(node_projects),
     )
 
 
@@ -1065,6 +1082,121 @@ def _dispatch_cli_agent_project(
     return new_count
 
 
+def _dispatch_node_project(
+    config: MagentConfig,
+    opts: RunOpts,
+    proj: ProjectConfig,
+    tool: str,
+    is_running: Callable[[str, str], bool],
+    targets: list[_Target],
+    node_projects: list[ProjectConfig],
+) -> int:
+    """A pool-node project: one window, titled by its session id. The
+    bring-up itself runs after the local phases (``_bring_up_node_windows``);
+    here it is listed, targeted for tiling and queued. The target is
+    provisional until then: the bring-up re-keys it on the title the window
+    actually opened under. The window is always C's ``magent:<sid>``, so the
+    already-open probe matches in ``magent-name`` mode."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    sid = nodes.node_sid(proj)
+    running = is_running(sid, "magent-name")
+    held = nodes.read_node_map().get(nodes.project_name(proj))
+    label = held.nick if proj.node == NODE_AUTO and held else str(proj.node)
+    _log_project(nodes.project_name(proj), tool, running, None, node=label)
+    targets.append(_Target(name=sid, key=sid, mode="magent-name", is_new=not running))
+    if opts.dry_run:
+        _echo_node_dry_run(config, proj)
+        return 0
+    if running or opts.tile_only:
+        return 0
+    node_projects.append(proj)
+    return 1
+
+
+def _echo_node_dry_run(config: MagentConfig, proj: ProjectConfig) -> None:
+    """Where ``proj`` would land, from config and the map alone: no ssh, no
+    git, no write."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+    from magent.env import local_username
+
+    held = nodes.read_node_map().get(nodes.project_name(proj))
+    project_dir = _node_project_dir(config, proj) or Path(proj.path)
+    try:
+        node = nodes.resolve(
+            config,
+            proj,
+            local_user=local_username(),
+            placed=held.nick if held else None,
+        )
+        # Inside the try: a folder with no usable name is refused here too,
+        # and a dry run names that reason rather than raising it.
+        folder = nodes.remote_root_for(node, project_dir)
+    except ValueError as exc:
+        click.echo(f"      {style('x', fg='red')} {exc}")
+        return
+    click.echo(style(f"      -> {node.target}:{folder}", dim=True))
+    # DECISION-24: the real run provisions first (``_provision_once``).
+    click.echo(style(f"      would provision {node.nick}", dim=True))
+
+
+def _warn_node_windows_will_not_reconnect(plat: Platform) -> None:
+    """``attach_client.spawn_attach_window`` degrades a supervisor missing
+    from PATH to a bare-ssh pane silently; the batch caller says so once.
+    Mirrors ``magent attach``'s ``_spawn_windows`` warning. Nothing to say
+    where no window can open at all."""
+    if not plat.supports_attach_windows() or attach_client.client_exe() is not None:
+        return
+    click.echo(
+        f"  {style('!', fg='yellow')} {style(attach_client.CLIENT_EXE_NAME, bold=True)}"
+        f" {style('is not on PATH -- node windows will not auto-reconnect.', fg='yellow')}"
+    )
+    click.echo(
+        f"  {style('Reinstall with', dim=True)}"
+        f" {style('pip install -U magent-multi-ai-agents-manager', bold=True)}"
+        f"{style('.', dim=True)}"
+    )
+
+
+def _node_window_target(target: _Target, title: str) -> _Target:
+    """``target`` re-keyed on the title its window really opened under. A
+    ``magent:`` title matches by parsed name, so a state badge the attention
+    daemon adds before the tile pass cannot hide it; anything else (never
+    produced today) matches exactly."""
+    parsed = parse_title(title)
+    if parsed is None:
+        return replace(target, key=title, mode="exact")
+    return replace(target, key=parsed[0], mode="magent-name")
+
+
+def _bring_up_node_windows(
+    plat: Platform, config: MagentConfig, opts: RunOpts, result: _LaunchResult
+) -> _LaunchResult:
+    """Bring the queued node projects up with their windows, then point each
+    one's tiling target at the title ``NodeBringUpOutcome.title`` carries back
+    from the spawn -- never one rebuilt from the sid, so tiling cannot drift
+    from the window. A project with no window coming (a failed bring-up, a
+    platform without attach windows, a spawn that raised) has its target
+    dropped rather than polled for and reported "not found"."""
+    click.echo()
+    _warn_node_windows_will_not_reconnect(plat)
+    outcomes = _run_node_bring_ups(
+        config, list(result.node_projects), allow_dirty=opts.allow_dirty, window=True
+    )
+    _echo_node_outcomes(outcomes)
+    by_sid = {o.sid: o for o in outcomes}
+    targets: list[_Target] = []
+    for target in result.targets:
+        outcome = by_sid.get(target.key)
+        if outcome is None:
+            targets.append(target)
+        elif outcome.ok and outcome.title is not None:
+            targets.append(_node_window_target(target, outcome.title))
+    return replace(result, targets=targets)
+
+
 def _start_psmux_and_upload(
     plat: Platform, config: MagentConfig, opts: RunOpts, result: _LaunchResult
 ) -> None:
@@ -1232,6 +1364,7 @@ def _log_project(
     host: str | None,
     happy: bool = False,
     psmux: bool = False,
+    node: str | None = None,
 ) -> None:
     if running:
         icon = style("*", fg="green")
@@ -1246,6 +1379,8 @@ def _log_project(
         extras += style(" [happy]", fg="magenta")
     if psmux:
         extras += style(" [psmux]", fg="yellow")
+    if node:
+        extras += style(f" [@{node}]", fg="blue")
     click.echo(f"  {icon} {name:<30} {label}  {tool_badge}{extras}{loc}")
 
 

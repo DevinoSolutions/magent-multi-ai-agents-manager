@@ -5,15 +5,23 @@ faked at remote_mux's seam, so nothing here dials anything."""
 from __future__ import annotations
 
 import dataclasses
+import subprocess
 import threading
 import time
 from collections import defaultdict
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
-from magent import attach_client, launch, lockfile, nodes, remote_mux
-from magent.config import MagentConfig, NodeConfig, ProjectConfig, Settings
+from magent import attach_client, cli, launch, lockfile, nodes, remote_mux
+from magent.config import (
+    SCHEMA_VERSION,
+    MagentConfig,
+    NodeConfig,
+    ProjectConfig,
+    Settings,
+)
 from magent.nodes import LocalGitState, NodeMapEntry
 from magent.remote_mux import BringUpResult, RemoteError
 from tests.conftest import FakePlatform
@@ -938,3 +946,261 @@ class TestEveryNodeFailureIsAnOutcomeButABugIsNot:
         )
         outcome = launch.bring_up_node_project(_config(api), api)
         assert outcome.error == "git clone of api failed"
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    # Same device as test_launch.py's fake_sleep: tiling's retry loop and the
+    # launch delay both sleep through the shared `time` module.
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+
+@pytest.fixture
+def desk(monkeypatch):
+    plat = FakePlatform(supports_attach_windows=True)
+    monkeypatch.setattr(launch, "get_platform", lambda: plat)
+    return plat
+
+
+class TestGoBringsNodeProjectsUp:
+    def test_a_node_project_is_listed_with_its_node_badge_and_brought_up(
+        self, rig, api, desk, no_sleep, capsys
+    ):
+        rc = launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "[@second]" in out
+        assert "api @second started" in out
+        assert rig.windows == [
+            ("amin@devino-second", "api", "tmux", "tmux -L magent attach -t '=api'")
+        ]
+        assert "api" in nodes.read_node_map()
+
+    def test_a_dirty_tree_is_refused_with_no_ssh_and_no_map_entry(
+        self, rig, api, desk, no_sleep, tmp_path, capsys
+    ):
+        # R-D2.
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        assert launch.run_magent(_config(api), launch.RunOpts()) == 0
+        out = capsys.readouterr().out
+        assert "dirty" in out
+        assert "--allow-dirty" in out
+        assert rig.recipes == []
+        assert rig.windows == []
+        assert nodes.read_node_map() == {}
+
+    def test_allow_dirty_reaches_the_bring_up(self, rig, api, desk, no_sleep, tmp_path):
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        launch.run_magent(_config(api), launch.RunOpts(allow_dirty=True))
+        assert [nick for nick, _ in rig.recipes] == ["second"]
+
+    def test_dry_run_names_the_target_folder_and_touches_nothing(
+        self, api, desk, no_sleep, tmp_path, monkeypatch, capsys
+    ):
+        # R-D3 + R-D4: <root>/<local folder name>, no ssh, no git, no map.
+        def forbidden(*_a: object, **_k: object) -> None:
+            raise AssertionError("--dry-run must not start a process or provision")
+
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        monkeypatch.setattr(subprocess, "Popen", forbidden)
+        monkeypatch.setattr(subprocess, "run", forbidden)
+        monkeypatch.setattr(launch, "_provision_once", forbidden)
+        assert launch.run_magent(_config(api), launch.RunOpts(dry_run=True)) == 0
+        out = capsys.readouterr().out
+        assert "-> amin@devino-second:~/magent/api" in out
+        # DECISION-24: what the real run would do first, said and not done.
+        assert "would provision second" in out
+        assert not (tmp_path / "node-map.json").exists()
+
+    def test_dry_run_prints_why_an_auto_project_has_no_target(
+        self, desk, no_sleep, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        proj = ProjectConfig(path=str(tmp_path), node="auto")
+        launch.run_magent(_config(proj), launch.RunOpts(dry_run=True))
+        assert "needs a placement" in capsys.readouterr().out
+
+    def test_a_window_already_open_is_not_brought_up_again(
+        self, rig, api, no_sleep, monkeypatch
+    ):
+        plat = FakePlatform(supports_attach_windows=True)
+        plat._register_window("magent:api")
+        monkeypatch.setattr(launch, "get_platform", lambda: plat)
+        launch.run_magent(_config(api), launch.RunOpts())
+        assert rig.recipes == []
+
+    def test_an_ide_project_with_a_node_stays_local(
+        self, rig, tmp_path, desk, no_sleep, capsys
+    ):
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        proj = ProjectConfig(path=str(folder), node="second", tool="code")
+        launch.run_magent(_config(proj), launch.RunOpts(dry_run=True))
+        assert "[@second]" not in capsys.readouterr().out
+        assert rig.recipes == []
+
+
+class TestTheGoFlagIsPlumbed:
+    def test_allow_dirty_reaches_run_opts(self, tmp_config, monkeypatch):
+        seen: list[launch.RunOpts] = []
+        monkeypatch.setattr(
+            launch, "run_magent", lambda cfg, opts: seen.append(opts) or 0
+        )
+        path = tmp_config({"version": SCHEMA_VERSION, "projects": [{"path": "."}]})
+        result = CliRunner().invoke(
+            cli.main, ["--config", path, "--go", "--all", "--allow-dirty"]
+        )
+        assert result.exit_code == 0, result.output
+        assert seen[0].allow_dirty is True
+
+
+def _spawn_titled(desk: FakePlatform, title: str):
+    """A ``spawn_attach_window`` stand-in whose window really appears on the
+    desk, under ``title`` -- deliberately NOT ``make_title(sid)``, so a tile
+    pass that rebuilt the title from the sid would hunt a window that does not
+    exist and print "not found"."""
+
+    def spawn(target, sid, *, mux, remote=None, reconnect=True):
+        desk._register_window(title)
+        return title
+
+    return spawn
+
+
+def _placed_names(out: str) -> list[str]:
+    return [
+        line.split()[1]
+        for line in out.splitlines()
+        if line.lstrip().startswith("+ ") and "-> screen" in line
+    ]
+
+
+class TestGoTilesNodeWindowsByTheTitleTheSpawnReturned:
+    """D12: a node window is placed by the title ``spawn_attach_window``
+    handed back through ``NodeBringUpOutcome.title``, never one rebuilt from
+    the session id -- and a project with no window coming is not waited on."""
+
+    def test_the_window_is_placed_by_the_returned_title(
+        self, rig, api, desk, no_sleep, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(
+            "magent.attach_client.spawn_attach_window",
+            _spawn_titled(desk, "magent:api-at-second"),
+        )
+        assert launch.run_magent(_config(api), launch.RunOpts(retile_all=True)) == 0
+        out = capsys.readouterr().out
+        assert "not found" not in out
+        assert _placed_names(out) == ["api"]
+        assert [h for h, _rect in desk.moved] == [desk._windows["magent:api-at-second"]]
+
+    def test_a_badged_title_still_places_it(
+        self, rig, api, desk, no_sleep, monkeypatch, capsys
+    ):
+        # The attention daemon may badge the window before the tile pass runs;
+        # matching by parsed name, like every magent window, survives that.
+        def spawn(target, sid, *, mux, remote=None, reconnect=True):
+            desk._register_window("magent:[!] api")
+            return "magent:api"
+
+        monkeypatch.setattr("magent.attach_client.spawn_attach_window", spawn)
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        assert "not found" not in capsys.readouterr().out
+        assert len(desk.moved) == 1
+
+    def test_a_title_outside_the_grammar_is_placed_by_exact_match(
+        self, rig, api, desk, no_sleep, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(
+            "magent.attach_client.spawn_attach_window",
+            _spawn_titled(desk, "api on second"),
+        )
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        assert "not found" not in capsys.readouterr().out
+        assert [h for h, _rect in desk.moved] == [desk._windows["api on second"]]
+
+    def test_a_refused_project_is_not_waited_for(
+        self, rig, api, desk, no_sleep, tmp_path, capsys
+    ):
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        assert "not found" not in capsys.readouterr().out
+        assert desk.moved == []
+
+    def test_a_window_that_failed_to_open_is_not_waited_for(
+        self, rig, api, desk, no_sleep, monkeypatch, capsys
+    ):
+        def no_wt(*_a: object, **_k: object) -> str:
+            raise FileNotFoundError("wt")
+
+        monkeypatch.setattr("magent.attach_client.spawn_attach_window", no_wt)
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        out = capsys.readouterr().out
+        assert "api @second started" in out
+        assert "not found" not in out
+
+    def test_a_platform_without_attach_windows_waits_for_none(
+        self, rig, api, no_sleep, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(launch, "get_platform", FakePlatform)
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        out = capsys.readouterr().out
+        assert "api @second started" in out
+        assert "not found" not in out
+
+    def test_the_node_window_keeps_its_config_order_slot(
+        self, rig, api, desk, no_sleep, tmp_path, monkeypatch, capsys
+    ):
+        # Config order is slot order: the rebuilt node target stays where the
+        # launch loop put it, between the two local windows.
+        before = ProjectConfig(path=str(tmp_path / "a-local"))
+        after = ProjectConfig(path=str(tmp_path / "z-local"))
+        for proj in (before, after):
+            Path(proj.path).mkdir()
+        monkeypatch.setattr(
+            "magent.attach_client.spawn_attach_window",
+            _spawn_titled(desk, "magent:api-at-second"),
+        )
+        launch.run_magent(_config(before, api, after), launch.RunOpts(retile_all=True))
+        assert _placed_names(capsys.readouterr().out) == ["a-local", "api", "z-local"]
+
+
+class TestGoWarnsOnceWhenNodeWindowsCannotReconnect:
+    """``spawn_attach_window`` degrades a missing supervisor to a bare-ssh
+    pane silently, by design: the batch caller -- ``--go``'s node phase --
+    says so once, whatever the number of windows."""
+
+    def test_one_warning_for_the_whole_batch(
+        self, rig, tmp_path, desk, no_sleep, monkeypatch, capsys
+    ):
+        projs = _projects(tmp_path, rig, [("a1", "second"), ("b1", "third")])
+        monkeypatch.setattr(attach_client, "client_exe", lambda: None)
+        launch.run_magent(_config(*projs), launch.RunOpts())
+        out = capsys.readouterr().out
+        assert out.count("will not auto-reconnect") == 1
+        assert attach_client.CLIENT_EXE_NAME in out
+        assert len(rig.windows) == 2
+
+    def test_no_warning_when_the_supervisor_is_there(
+        self, rig, api, desk, no_sleep, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(attach_client, "client_exe", lambda: "C:/x/client.exe")
+        launch.run_magent(_config(api), launch.RunOpts())
+        assert "auto-reconnect" not in capsys.readouterr().out
+
+    def test_no_warning_where_no_window_can_open(
+        self, rig, api, no_sleep, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(launch, "get_platform", FakePlatform)
+        monkeypatch.setattr(attach_client, "client_exe", lambda: None)
+        launch.run_magent(_config(api), launch.RunOpts())
+        assert "auto-reconnect" not in capsys.readouterr().out
+
+    def test_no_warning_without_a_node_bring_up(
+        self, rig, api, no_sleep, monkeypatch, capsys
+    ):
+        plat = FakePlatform(supports_attach_windows=True)
+        plat._register_window("magent:api")
+        monkeypatch.setattr(launch, "get_platform", lambda: plat)
+        monkeypatch.setattr(attach_client, "client_exe", lambda: None)
+        launch.run_magent(_config(api), launch.RunOpts())
+        assert "auto-reconnect" not in capsys.readouterr().out
