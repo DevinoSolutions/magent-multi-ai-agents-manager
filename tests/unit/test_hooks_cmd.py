@@ -45,6 +45,18 @@ def _write_module_form(settings_file, cmd=MODULE_CMD):
     return hooks
 
 
+# What every repair is: true of a pre-3.1.2 console-script path and of a
+# module-form interpreter path alike, unlike a version-specific origin.
+REPAIR_SUFFIX = "(backslash path bash cannot run)"
+
+
+def _repaired_line(output):
+    """The install report's one "Repaired ..." line (CliRunner strips styles)."""
+    lines = [ln for ln in output.splitlines() if "Repaired" in ln]
+    assert len(lines) == 1, output
+    return lines[0]
+
+
 class TestInstall:
     def test_fresh_file_wires_every_event(self, runner, tmp_path):
         settings = tmp_path / "settings.json"
@@ -101,6 +113,7 @@ class TestInstall:
         result = _install(runner, settings)
         assert result.exit_code == 0
         assert "Repaired" in result.output
+        assert _repaired_line(result.output).endswith(REPAIR_SUFFIX)
         data = json.loads(settings.read_text(encoding="utf-8"))
         cmds = [h["command"] for e in data["hooks"]["Stop"] for h in e["hooks"]]
         ours = [c for c in cmds if "magent-state-hook" in c]
@@ -207,6 +220,7 @@ class TestInstall:
         result = _install(runner, settings)
         assert result.exit_code == 0
         assert "Repaired" in result.output
+        assert _repaired_line(result.output).endswith(REPAIR_SUFFIX)
         fixed = (
             '"C:/Program Files/Python314/python.exe" -X utf8 '
             "-m magent.state_hook --source claude"
