@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import types
 from typing import ClassVar
 
 from magent import agent_state, cli, config, log
@@ -198,14 +199,19 @@ class TestTheLauncherWaitsForASlowDaemon:
         pid_file = tmp_path / "attention.pid"
         monkeypatch.setattr(attention_cmd, "_PID_PATH", pid_file)
         monkeypatch.setattr("magent.launch.spawn_detached", lambda _a: _RunningChild())
-        polls = {"n": 0}
+        # procs' own clock only, never the global time module: each 0.1s poll
+        # advances it, so the window is measured in simulated seconds.
+        clock = {"now": 0.0}
 
-        def sleep(_s: float) -> None:
-            polls["n"] += 1
-            if polls["n"] == 50:  # 50 x 0.1s: the measured slow start
+        def sleep(seconds: float) -> None:
+            clock["now"] += seconds
+            if clock["now"] >= 5.0:  # the measured slow start, well past 2s
                 pid_file.write_text(str(os.getpid()))
 
-        monkeypatch.setattr("magent.procs.time.sleep", sleep)
+        monkeypatch.setattr(
+            "magent.procs.time",
+            types.SimpleNamespace(sleep=sleep, monotonic=lambda: clock["now"]),
+        )
 
         config_path = tmp_config({"version": 2, "projects": [{"path": "api"}]})
         result = runner.invoke(

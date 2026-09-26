@@ -1135,18 +1135,14 @@ class TestMaybeStartHotkey:
         # "no listener" -- while the listener came up behind it on a busy box.
         from magent import cli, hotkey
 
-        state = {"pid": None, "polls": 0}
+        state = {"pid": None}
         monkeypatch.setattr(hotkey, "listener_pid", lambda: state["pid"])
         monkeypatch.setattr(
             "magent.launch.spawn_detached", lambda *a, **k: _StillStarting()
         )
-
-        def sleep(_s: float) -> None:
-            state["polls"] += 1
-            if state["polls"] == 50:  # 50 x 0.1s: the measured slow start
-                state["pid"] = 5678
-
-        monkeypatch.setattr("magent.procs.time.sleep", sleep)
+        clock = _FakeTime()
+        clock.at(5.0, lambda: state.update(pid=5678))  # the measured slow start
+        monkeypatch.setattr("magent.procs.time", clock)
         assert cli._maybe_start_hotkey("http://x:8034") == 5678
 
     def test_a_listener_that_dies_starting_is_reported_at_once(self, monkeypatch):
@@ -1158,10 +1154,10 @@ class TestMaybeStartHotkey:
         monkeypatch.setattr(
             "magent.launch.spawn_detached", lambda *a, **k: _StillStarting(rc=1)
         )
-        polls: list[float] = []
-        monkeypatch.setattr("magent.procs.time.sleep", polls.append)
+        clock = _FakeTime()
+        monkeypatch.setattr("magent.procs.time", clock)
         assert cli._maybe_start_hotkey("http://x:8034") is None
-        assert len(polls) == 1
+        assert clock.now < 1.0
 
 
 class _StillStarting:
@@ -1172,6 +1168,29 @@ class _StillStarting:
 
     def poll(self) -> int | None:
         return self.rc
+
+
+class _FakeTime:
+    """Stands in for ``procs.time``: ``sleep`` advances ``monotonic`` instead of
+    sleeping, and fires anything scheduled with ``at`` once its time comes.
+    Patched onto the procs module only, never onto the global time module."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self._due: list[tuple[float, object]] = []
+
+    def at(self, when: float, action) -> None:
+        self._due.append((when, action))
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        for when, action in list(self._due):
+            if self.now >= when:
+                self._due.remove((when, action))
+                action()
 
 
 class TestHookStructsAndConstants:
