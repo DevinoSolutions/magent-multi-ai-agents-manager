@@ -157,7 +157,8 @@ def send_cmd(
     then confirms the prompt left the input line.
 
     Exit codes: 0 sent, 2 session not found, 3 psmux error, 4 send not
-    confirmed (or the session never went idle).
+    confirmed (the pane could not be read back, or the session never went
+    idle).
     """
     from pathlib import Path
 
