@@ -476,7 +476,7 @@ def _gh(
             timeout_s=GH_TIMEOUT_S,
             input_bytes=input_bytes,
             check=False,
-            shown=("gh", *args),
+            shown=_redacted(["gh", *args], input_bytes),
             label="local gh",
         )
     except RemoteError:
@@ -721,6 +721,81 @@ def setup_node(
         root, "setup", names, timeout_s=timeout_s, stdin=payload, check=False
     )
     return _report_of(result, "setup", root, args=names, stdin=payload)
+
+
+# Either scope lets gh add an ssh key; admin: is what `gh auth refresh` grants.
+SSH_KEY_SCOPES = frozenset({"admin:public_key", "write:public_key"})
+# ssh-ed25519/ssh-rsa, ecdsa-sha2-*, sk-ssh-ed25519@openssh.com/sk-ecdsa-*.
+SSH_KEY_TYPE_PREFIXES = ("ssh-", "ecdsa-", "sk-")
+
+
+def register_ssh_key(pubkey: str, *, title: str) -> ScriptLine:
+    """Add a node's public key to this PC's GitHub account (gh, authentication
+    key), once: a key already on the account is a skip. One ``github-key``
+    row; never raises. The key is public, but it rides stdin anyway."""
+    account = local_gh_account()
+    if account is None:
+        return ScriptLine(
+            "fail", "github-key", "gh is not logged in on this PC: gh auth login"
+        )
+    if not account.scopes:
+        # gh prints no scopes for a token it did not mint (GH_TOKEN, a
+        # fine-grained PAT); `gh auth refresh` cannot widen those.
+        return ScriptLine(
+            "fail",
+            "github-key",
+            (
+                "gh reports no token scopes (a GH_TOKEN/fine-grained token?): "
+                "use a classic token with admin:public_key, or gh auth login"
+            ),
+        )
+    if not account.scopes & SSH_KEY_SCOPES:
+        return ScriptLine(
+            "fail",
+            "github-key",
+            (
+                f"this PC's gh login ({account.login}) cannot add ssh keys: "
+                "gh auth refresh -h github.com -s admin:public_key"
+            ),
+        )
+    # A public key line opens with its type; anything else (a PEM private key
+    # pasted by mistake) never leaves this PC.
+    parts = pubkey.split()
+    if len(parts) < 2 or not parts[0].startswith(SSH_KEY_TYPE_PREFIXES):
+        return ScriptLine("fail", "github-key", "not an ssh public key line")
+    listed = _gh(["api", "--paginate", "user/keys", "--jq", ".[].key"])
+    if (
+        listed is not None
+        and listed.returncode == 0
+        and parts[1] in listed.stdout.decode("utf-8", "replace").split()
+    ):
+        return ScriptLine(
+            "skip", "github-key", f"already registered to {account.login}"
+        )
+    added = _gh(
+        ["ssh-key", "add", "-", "--title", title, "--type", "authentication"],
+        input_bytes=(" ".join(parts) + "\n").encode("utf-8"),
+    )
+    if added is None:
+        # A timed-out add may still have landed (RemoteError's rc None).
+        return ScriptLine(
+            "fail",
+            "github-key",
+            "gh ssh-key add did not finish (spawn failure or timeout); rerun to check",
+        )
+    if added.returncode != 0:
+        err = added.stderr.decode("utf-8", "replace").strip().splitlines()
+        detail = err[-1][:200] if err else f"exited {added.returncode}"
+        return ScriptLine("fail", "github-key", f"gh ssh-key add failed: {detail}")
+    # gh de-duplicates too, and says so on stderr with exit 0: when our own
+    # listing failed, that is the only word that the key was already there.
+    if "already exists" in added.stderr.decode("utf-8", "replace"):
+        return ScriptLine(
+            "skip", "github-key", f"already registered to {account.login}"
+        )
+    return ScriptLine(
+        "did", "github-key", f"registered to {account.login} as {title!r}"
+    )
 
 
 def has_session(node: Node, sid: str) -> bool | None:
