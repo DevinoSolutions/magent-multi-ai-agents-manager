@@ -4,21 +4,49 @@ Patched at ``os.stat``, never ``Path.stat``: from 3.14 ``Path.is_dir``/
 ``is_file``/``exists`` do not call ``Path.stat`` (on Windows they skip
 ``os.stat`` too), and 3.10's ``Path.stat`` bound ``os.stat`` at import. The
 product's ``nodes.path_mode`` looks ``os.stat`` up at call time on every
-version, so this reaches it everywhere -- while a ``Path.*`` check either
-raises (3.11-3.13) or answers from its own probe (3.14): exactly the split a
-test of "unknown is never absent" must see.
+version, so this reaches it everywhere. ``deny_stat`` also gives pathlib the
+3.14 contract on every version (``py314_pathlib``): a site that went back to
+a ``Path.*`` check reads the denied path as absent everywhere -- 3.13, the
+version of the one required check, included -- so its pin fails there too.
 """
 
 from __future__ import annotations
 
 import errno
 import os
+import stat
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import Callable
 
     import pytest
+
+
+def py314_pathlib(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Python 3.14's existence contract on every version: ``Path.is_dir``/
+    ``is_file``/``exists`` and ``os.path.isdir``/``isfile``/``exists`` answer
+    False for ANY error. Each asks ``os.stat`` at call time, so it meets
+    ``deny_stat`` on every version too (3.10's Path bound ``os.stat`` at
+    import; 3.14's skip it on Windows)."""
+
+    def answers(test: Callable[[int], bool]) -> Callable[..., bool]:
+        def check(path: object, *, follow_symlinks: bool = True) -> bool:
+            try:
+                mode = os.stat(path, follow_symlinks=follow_symlinks).st_mode
+            except (OSError, ValueError):
+                return False
+            return test(mode)
+
+        return check
+
+    is_dir, is_file = answers(stat.S_ISDIR), answers(stat.S_ISREG)
+    exists = answers(lambda _mode: True)
+    for name, check in (("is_dir", is_dir), ("is_file", is_file), ("exists", exists)):
+        monkeypatch.setattr(Path, name, check)
+    for name, check in (("isdir", is_dir), ("isfile", is_file), ("exists", exists)):
+        monkeypatch.setattr(os.path, name, check)
 
 
 def deny_stat(
@@ -28,16 +56,18 @@ def deny_stat(
     winerror: int | None = None,
 ) -> None:
     """``os.stat`` of each of ``denied`` raises ``code`` (a deny ACL by
-    default); every other path stats as usual."""
+    default); every other path stats as usual. Pathlib answers by the 3.14
+    contract meanwhile (``py314_pathlib``)."""
     names = {str(path) for path in denied}
     real_stat = os.stat
 
-    def stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+    def refusing(path: object, *args: object, **kwargs: object) -> os.stat_result:
         if isinstance(path, (str, os.PathLike)) and os.fspath(path) in names:
             raise OSError(code, os.strerror(code), os.fspath(path), winerror)
         return real_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "stat", stat)
+    monkeypatch.setattr(os, "stat", refusing)
+    py314_pathlib(monkeypatch)
 
 
 def deny_scandir(monkeypatch: pytest.MonkeyPatch, *denied: Path) -> None:
