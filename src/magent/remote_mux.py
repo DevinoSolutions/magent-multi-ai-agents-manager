@@ -1300,18 +1300,19 @@ def _report_dict(raw: object) -> dict[str, tuple[str, ...]]:
 
 def _clock_dict(raw: object) -> dict[str, float]:
     """pull.sh's ``resume`` map: ``{sid: mtime}``. Only finite numbers are
-    kept -- json.loads accepts NaN and Infinity, and a session without a
-    usable one holds its watermark (``next_since``)."""
+    kept -- json.loads accepts NaN, Infinity and a 309-digit int -- and a
+    session without a usable one holds its watermark (``next_since``)."""
     if not isinstance(raw, dict):
         return {}
-    return {
-        k: float(v)
-        for k, v in raw.items()
-        if isinstance(k, str)
-        and not isinstance(v, bool)
-        and isinstance(v, (int, float))
-        and math.isfinite(v)
-    }
+    kept: dict[str, float] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str):
+            continue
+        try:
+            kept[k] = _finite(v)
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return kept
 
 
 def _member_parts(
@@ -1517,15 +1518,13 @@ def parse_pull(stdout: bytes, *, dest: Path, sids: Collection[str]) -> NodeSnaps
         raise _pull_error(f"unreadable pull metadata: {e}") from e
     if not isinstance(meta, dict):
         raise _pull_error("pull metadata is not an object")
-    now = meta.get("now")
-    # json.loads accepts NaN and Infinity. A non-finite clock would become a
-    # NaN watermark, which write_json_atomic refuses with ValueError.
-    if (
-        isinstance(now, bool)
-        or not isinstance(now, (int, float))
-        or not math.isfinite(now)
-    ):
-        raise _pull_error("pull metadata has no clock")
+    # json.loads accepts NaN and Infinity (a NaN watermark, which
+    # write_json_atomic refuses) and ints of any length (float() of a 309-digit
+    # one raises OverflowError). None of them is a clock.
+    try:
+        now = _finite(meta.get("now"))
+    except (TypeError, ValueError, OverflowError) as e:
+        raise _pull_error("pull metadata has no clock") from e
     raw_sessions = meta.get("sessions")
     # A non-string entry is corruption, never a name to skip: dropping it would
     # write a snapshot without that session, and D would read it as dead.

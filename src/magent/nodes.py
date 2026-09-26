@@ -1120,11 +1120,16 @@ def read_sessions(nick: str, *, nodes_dir: Path | None = None) -> NodeSessions |
     # bool is an int subclass: `"ts": true` is corruption, not 1.0.
     if isinstance(ts, bool) or not isinstance(ts, (int, float)):
         return None
-    if not math.isfinite(ts) or not isinstance(names, list):
+    # float() of a 309-digit int raises OverflowError: not a snapshot either.
+    try:
+        ts_f = float(ts)
+    except OverflowError:
+        return None
+    if not math.isfinite(ts_f) or not isinstance(names, list):
         return None
     if not all(isinstance(n, str) for n in names):
         return None
-    return NodeSessions(ts=float(ts), sessions=tuple(names))
+    return NodeSessions(ts=ts_f, sessions=tuple(names))
 
 
 def sessions_stale(

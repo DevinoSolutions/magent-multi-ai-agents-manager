@@ -450,7 +450,12 @@ def _row_ts(line: str) -> float | None:
     ts = row.get("ts") if isinstance(row, dict) else None
     if isinstance(ts, bool) or not isinstance(ts, (int, float)):
         return None
-    return float(ts) if math.isfinite(ts) else None
+    # float() of a 309-digit int raises OverflowError: a bad row too.
+    try:
+        ts_f = float(ts)
+    except OverflowError:
+        return None
+    return ts_f if math.isfinite(ts_f) else None
 
 
 def _needs_trim(path: Path, before: float, at: float) -> bool:
