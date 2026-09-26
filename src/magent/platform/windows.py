@@ -628,7 +628,14 @@ class WindowsPlatform(Platform):
             # cmd mangles (the inner quotes leak to the remote shell).
             # argv[0] by attach_client's rule, so this pane dials the same
             # client (and agent) as the attach panes and the node calls.
-            args.extend(["--", "cmd", "/k", ssh_program(), "-t", opts.ssh_host, remote])
+            client = ssh_program()
+            # `cmd /k` strips the first and last quote of a line that starts
+            # with one, so a client path that needs quoting (C:\Program Files)
+            # would eat the remote command's closing quote. Only the PATH
+            # fallback yields such a path, and the bare name finds it again.
+            if " " in client:
+                client = "ssh"
+            args.extend(["--", "cmd", "/k", client, "-t", opts.ssh_host, remote])
         else:
             args.extend(["--", "cmd", "/k", opts.command])
 
