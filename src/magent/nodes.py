@@ -903,7 +903,9 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     Bounded, because it runs on every bring-up: only regular files are read
     (``_read_skill``), each at most ``SKILL_FILE_MAX_BYTES`` and all of them
     at most ``SKILLS_MAX_TOTAL_BYTES``, and the walk stops after
-    ``SKILLS_MAX_ENTRIES`` listed entries."""
+    ``SKILLS_MAX_ENTRIES`` listed entries. A folder it may not list is one
+    note naming the error's class (the log has the rest), and the walk goes
+    on."""
     if not root.is_dir():
         return ()
     # The unresolved root counts too: with ~/.claude a junction elsewhere, a
@@ -938,7 +940,19 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     files: list[SkillFile] = []
     seen: set[str] = set()
     tally = _SkillsTally()
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+
+    def unreadable(exc: OSError) -> None:
+        # A folder it may not list is neither fatal nor silent: one note with
+        # the error's class only, the whole error in the log, and the walk
+        # goes on without it.
+        rel = Path(exc.filename or root).relative_to(root).as_posix()
+        name = "skills" if rel == "." else f"skills/{_named(rel)}"
+        notes.append(f"{name}: cannot be read ({type(exc).__name__}); not shipped")
+        _log.warning("%s: %s", name, exc)
+
+    for dirpath, dirnames, filenames in os.walk(
+        root, onerror=unreadable, followlinks=True
+    ):
         here = Path(dirpath)
         real = os.path.realpath(here)
         if real in seen:

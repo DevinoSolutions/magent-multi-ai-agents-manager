@@ -1633,6 +1633,74 @@ class TestTheSkillsWalkKnowsASecretWhenItSeesOne:
         assert "DECOY" not in repr(scope)
 
 
+def _deny_listing(monkeypatch: pytest.MonkeyPatch, *denied: Path) -> None:
+    """``os.scandir`` -- what ``os.walk`` lists a folder with -- refuses
+    ``denied`` the way a folder this user may not read does."""
+    real = os.scandir
+    refused = {os.path.normcase(str(p)) for p in denied}
+
+    def scandir(path: str | os.PathLike[str] = ".") -> object:
+        if os.path.normcase(os.fspath(path)) in refused:
+            raise PermissionError(13, "Permission denied DECOY-ERRNO", os.fspath(path))
+        return real(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+
+
+# An unreadable folder in the skills walk is neither fatal nor silent: one note
+# per folder, naming only the error's class; the full error is in nodes.log;
+# the rest of the walk goes on.
+class TestAnUnreadableSkillsFolderIsNamedNotFatal:
+    def test_one_note_per_folder_and_the_walk_goes_on(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        home, skills = _skills_home(tmp_path)
+        for rel in ("a/SKILL.md", "b/x/f.md", "b/y/g.md", "c/SKILL.md"):
+            _skill(skills, rel)
+        _deny_listing(monkeypatch, skills / "b" / "x", skills / "c")
+        caplog.set_level("WARNING", logger="nodes")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["a/SKILL.md", "b/y/g.md"]
+        assert scope.notes == (
+            "skills/b/x: cannot be read (PermissionError); not shipped",
+            "skills/c: cannot be read (PermissionError); not shipped",
+        )
+        assert "DECOY-ERRNO" not in repr(scope)
+        logged = [
+            r.getMessage() for r in caplog.records if "DECOY-ERRNO" in r.getMessage()
+        ]
+        assert len(logged) == 2
+        assert all(r.levelname == "WARNING" for r in caplog.records)
+
+    def test_an_unreadable_skills_folder_itself_is_one_note(
+        self, tmp_path, monkeypatch
+    ):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "a/SKILL.md")
+        _deny_listing(monkeypatch, skills)
+        scope = nodes.user_scope(home)
+        assert scope.skills == ()
+        assert scope.notes == ("skills: cannot be read (PermissionError); not shipped",)
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="a mode-0 folder: POSIX, and root reads it anyway",
+    )
+    def test_a_real_mode_0_folder(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "a/SKILL.md")
+        _skill(skills, "locked/SKILL.md")
+        (skills / "locked").chmod(0)
+        try:
+            scope = nodes.user_scope(home)
+        finally:
+            (skills / "locked").chmod(0o700)
+        assert [f.path for f in scope.skills] == ["a/SKILL.md"]
+        assert scope.notes == (
+            "skills/locked: cannot be read (PermissionError); not shipped",
+        )
+
+
 CLAUDE_ELSEWHERE = "links into ~/.claude outside the skills folder, not followed"
 ROOT_IN_CLAUDE = "resolves into ~/.claude outside ~/.claude/skills, not shipped"
 
