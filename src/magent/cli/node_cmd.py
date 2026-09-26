@@ -284,7 +284,7 @@ def sync_cmd(
 # 1 = a step failed: `node sync --once` with a node that did not sync, `node
 #     sync -d` whose daemon did not start, and recall's failures -- the node
 #     map unreadable, the last pull failing on this PC or left unfinished (a
-#     node that ANSWERED with an error is this too, cq-G14 I1, not 3), the
+#     node that ANSWERED with a nonzero rc is this too, cq-G14 I1, not 3), the
 #     placement unreadable for it, a linked mirror, the conversation not
 #     installed, the placement not cleared;
 # 2 = nothing to act on (unknown project, not a node project, a recall of a
@@ -296,7 +296,8 @@ def sync_cmd(
 #     the session up (:4247).
 # A plan that places a project nowhere is an answer, not a failure: it exits
 # 0. A node that does not answer during recall --local is a note, never an
-# exit: recall goes on with what was already pulled.
+# exit: recall goes on with what was already pulled. So is a last pull that
+# cannot be made at all (an answer that was not a pull, a refusal on this PC).
 _EXIT_USAGE = 2
 _EXIT_UNREACHABLE = 3
 
@@ -510,10 +511,12 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
     The placement is cleared after this, and a cleared placement is never
     pulled again, so a pull that can be retried stops the recall here, before
     anything is stopped or cleared (cq-G14 I1): a daemon that keeps the node
-    past the wait, a node that answered with an error or left files behind,
-    and a placement the pull could not read again. Only a node that did not
-    answer at all, or one the config cannot pull from, goes on with what was
-    already pulled -- the plan's "never fatal" rule, which no re-run helps."""
+    past the wait, a node that answered with an error (a nonzero rc) or left
+    files behind (PullUnfinished, matched by type -- m1), and a placement the
+    pull could not read again. A node that did not answer at all, one the
+    config cannot pull from, and any other rc-0 error (an answer that was not
+    a pull, a refusal made on this PC) go on with what was already pulled --
+    the plan's "never fatal" rule, which no re-run helps."""
     from magent import (  # heavy subsystem: in-body per policy
         node_sync,
         nodes,
@@ -545,9 +548,23 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
             " going on with what was already pulled"
         )
         return False
+    except node_sync.PullUnfinished as exc:
+        # Before RemoteError, its base: it answered, and left files behind.
+        _fail(
+            f"the last pull from @{held.nick} did not finish ({_tail(exc)}); {_RERUN}",
+            1,
+        )
     except remote_mux.RemoteError as exc:
+        if exc.rc == 0:
+            # Not a pull, or refused on this PC before any ssh (cq-G14 m1): no
+            # re-run clears either, so it must never block the recall.
+            _note(
+                f"@{held.nick} cannot be pulled from ({_tail(exc)});"
+                " going on with what was already pulled"
+            )
+            return False
         if exc.rc not in (255, None):
-            # It answered: an error it gave, or a pull it left unfinished.
+            # It answered with an error of its own.
             _fail(
                 f"the last pull from @{held.nick} did not finish ({_tail(exc)});"
                 f" {_RERUN}",

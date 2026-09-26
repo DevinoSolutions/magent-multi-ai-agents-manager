@@ -2115,6 +2115,40 @@ class TestTheLastPullMustFinish:
         assert "did not answer" not in result.output
         assert node_answers == []
 
+    @pytest.mark.parametrize(
+        "error",
+        [
+            remote_mux.RemoteError(
+                0, "a refusal made on this PC", ("ssh", "amin@devino-second")
+            ),
+            remote_mux.RemoteError(
+                0, "no MAGENT-PULL header in the reply", ("pull.sh",)
+            ),
+        ],
+        ids=["refused-here", "not-a-pull"],
+    )
+    def test_an_rc_0_error_that_is_not_an_unfinished_pull_is_a_note(
+        self, runner, placed_api, node_answers, monkeypatch, api_repo, error
+    ):
+        """cq-G14 m1: recall stops on PullUnfinished, not on rc 0. A refusal
+        made before any ssh is rc 0 too, and no re-run clears it -- a later
+        one added to final_pull must not block every recall of the project."""
+
+        def _rc0(*a, **k):
+            raise error
+
+        monkeypatch.setattr(node_sync, "final_pull", _rc0)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 0, result.output
+        assert (
+            f"@second cannot be pulled from ({error.stderr_tail});"
+            " going on with what was already pulled"
+        ) in result.stdout
+        assert "did not finish" not in result.output
+        assert "api" not in nodes.read_node_map()
+
     def test_a_failure_on_this_pc_during_the_pull_is_printed_not_a_traceback(
         self, runner, placed_api, node_answers, monkeypatch, api_repo
     ):

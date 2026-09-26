@@ -1531,6 +1531,7 @@ class TestTheFinalPull:
         nodes.write_node_map({"api": _entry("second", sid)})
         with pytest.raises(remote_mux.RemoteError) as info:
             node_sync.final_pull(_config(), "api")
+        assert not isinstance(info.value, node_sync.PullUnfinished)
         assert info.value.rc == 0
         assert info.value.stderr_tail == f"not a pullable session name: {sid!r}"
         assert info.value.command_redacted[0] == "ssh"
@@ -1594,10 +1595,16 @@ class TestAFinalPullThatDidNotFinishIsNotASuccess:
 
     def test_a_file_that_could_not_be_stored_here_raises(self, answers):
         answers(failed_sids=frozenset({"api"}))
-        with pytest.raises(remote_mux.RemoteError) as info:
+        # cq-G14 m1: its own type -- rc 0 also means a refusal made on this PC
+        # and an answer that was not a pull, which a caller must not confuse.
+        with pytest.raises(node_sync.PullUnfinished) as info:
             node_sync.final_pull(_config(), "api")
+        assert isinstance(info.value, remote_mux.RemoteError)
         assert info.value.rc == 0
-        assert "could not be stored on this PC" in info.value.stderr_tail
+        assert info.value.stderr_tail == (
+            "the pull did not finish: a file of session 'api' could not be stored"
+            " on this PC"
+        )
         # The watermark held, so the next pull asks for that file again.
         assert _marks()["api"] == {"since": 10.0, "realpath": "/home/amin/magent/api"}
 
@@ -1606,7 +1613,7 @@ class TestAFinalPullThatDidNotFinishIsNotASuccess:
             truncated={"api": ("api/transcripts/a.jsonl", "api/transcripts/b.jsonl")},
             resume={"api": 50.0},
         )
-        with pytest.raises(remote_mux.RemoteError) as info:
+        with pytest.raises(node_sync.PullUnfinished) as info:
             node_sync.final_pull(_config(), "api")
         assert info.value.rc == 0
         assert "2 file(s) did not fit in the reply" in info.value.stderr_tail

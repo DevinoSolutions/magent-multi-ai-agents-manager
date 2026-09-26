@@ -731,6 +731,17 @@ def run_sync_loop(
     return 0
 
 
+class PullUnfinished(remote_mux.RemoteError):
+    """A final pull the node answered but that left part of the session on it
+    (``_unfinished``). rc 0 like the node's other answers, but its own type:
+    rc 0 also means an answer that was not a pull and a refusal made on this
+    PC before any ssh, and a caller that retries this one must not retry
+    those forever (cq-G14 m1)."""
+
+    def __init__(self, why: str) -> None:
+        super().__init__(0, f"the pull did not finish: {why}", ("pull.sh",))
+
+
 def _unfinished(snap: remote_mux.NodeSnapshot, sid: str) -> str | None:
     """Why ``snap`` left part of ``sid`` on the node, or None when it did not:
     a file that could not be stored here, or files the reply had no room for
@@ -782,7 +793,8 @@ def final_pull(
 
     A pull the node answered but that left part of the session behind -- a
     file that could not be stored here, or files the reply had no room for --
-    is RemoteError(0) too, after the watermark is saved (cq-G14 I1): a caller
+    is PullUnfinished (a RemoteError, rc 0), raised after the watermark is
+    saved (cq-G14 I1, m1): a caller
     that clears the placement after this call would otherwise never pull the
     rest. What did land stays in the mirror."""
     entry = nodes.read_node_map().get(name)
@@ -809,7 +821,5 @@ def final_pull(
         marks[entry.sid] = mark
         _write_marks(entry.nick, marks)
     if unfinished is not None:
-        raise remote_mux.RemoteError(
-            0, f"the pull did not finish: {unfinished}", ("pull.sh",)
-        )
+        raise PullUnfinished(unfinished)
     return remote_mux.PullResult(files=tuple(files), since=mark.since)
