@@ -375,8 +375,11 @@ def _print_scores(placement: Placement) -> None:
 
 
 def _local_dir(cfg: MagentConfig, proj: ProjectConfig) -> Path | None:
-    """The project's folder on THIS machine, fully resolved (the exact string
-    Claude will see as its cwd after a ``cd`` to it), or None when missing."""
+    """The project's folder on THIS machine exactly as a launch resolves it
+    (``launch._resolve_path``: expanded, joined to the base dir, links NOT
+    followed), or None when missing. Never ``Path.resolve()``d (cq-G14 M4): a
+    launch cds to this string, Claude files the conversation under it, and a
+    project reached through a link must be recalled under the link's name."""
     from magent.launch import (  # heavy subsystem: in-body per policy
         _expand_base_dir,
         _resolve_path,
@@ -384,7 +387,7 @@ def _local_dir(cfg: MagentConfig, proj: ProjectConfig) -> Path | None:
 
     base_dir = _expand_base_dir(cfg.base_dir) if cfg.base_dir else None
     resolved = _resolve_path(proj.path, base_dir)
-    return Path(resolved).resolve() if resolved else None
+    return Path(resolved) if resolved else None
 
 
 # D-MERGE: `_print_push_set` (plan G :3192-3210) and its call at the end of

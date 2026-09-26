@@ -24,7 +24,7 @@ import pytest
 
 from magent import cli, launch, node_sync, nodes, remote_mux
 from magent.cli import node_cmd
-from magent.config import ProjectConfig
+from magent.config import ProjectConfig, load_config
 from magent.lockfile import LockHeld
 from magent.nodes import LocalGitState
 from tests.unit._node_fixtures import (
@@ -1619,12 +1619,7 @@ def node_is_gone(monkeypatch, request):
 
 
 def _claude_dir(path: Path) -> Path:
-    return (
-        Path.home()
-        / ".claude"
-        / "projects"
-        / nodes.encoded_project_dir(str(path.resolve()))
-    )
+    return Path.home() / ".claude" / "projects" / nodes.encoded_project_dir(str(path))
 
 
 def _recall_has_to() -> bool:
@@ -1774,11 +1769,8 @@ class TestRecallLocal:
         result = _recall(runner, placed_api, "--local")
 
         lines = [line.strip() for line in result.stdout.splitlines()]
-        pull = lines.index(f'git -C "{api_repo.resolve()}" pull')
-        assert (
-            lines[pull + 1]
-            == f'cd "{api_repo.resolve()}" && claude --resume {SESSION_ID}'
-        )
+        pull = lines.index(f'git -C "{api_repo}" pull')
+        assert lines[pull + 1] == f'cd "{api_repo}" && claude --resume {SESSION_ID}'
 
     def test_it_says_how_to_resume_by_hand_if_claude_refuses_the_session(
         self, runner, placed_api, node_answers
@@ -1871,7 +1863,7 @@ class TestRecallLocal:
 
         result = _recall(runner, cfg, "--local")
 
-        assert f'cd "{api_repo.resolve()}" && claude\n' in result.stdout
+        assert f'cd "{api_repo}" && claude\n' in result.stdout
         assert "--resume" not in result.stdout
 
     def test_a_project_that_is_not_placed_exits_2(
@@ -2319,6 +2311,74 @@ class TestTheLocalInstallFollowsTheTarRules:
         assert not (dest / "leak.jsonl").exists()
 
 
+class TestRecallResolvesTheFolderTheWayLaunchDoes:
+    """cq-G14 M4: --local installs the conversation where a launch will look
+    for it. Launch cds to ``launch._resolve_path``'s string -- never a
+    ``Path.resolve()``d one -- so a project reached through a link must land
+    under the LINK's encoded name, or the next ``claude --continue`` in that
+    pane finds nothing."""
+
+    @pytest.fixture
+    def link(self, tmp_path, api_repo):
+        link = tmp_path / "api-link"
+        _dir_link(link, api_repo)
+        yield link
+        _drop_dir_link(link)
+
+    def test_a_linked_project_is_installed_where_launch_will_resume_it(
+        self, runner, api_repo, tmp_config, node_answers, link
+    ):
+        nodes.update_node_map("api", entry("second"))
+        write_transcript("second", "api", SESSION_ID, mtime=NOW)
+        cfg = tmp_config(
+            config_json(
+                ("second",), [{"path": str(link), "title": "api", "node": "auto"}]
+            )
+        )
+
+        result = _recall(runner, cfg, "--local")
+
+        launched_in = launch._resolve_path(str(link), None)
+        assert result.exit_code == 0, result.output
+        assert launched_in == str(link)
+        assert launch._get_session_ids("claude", launched_in, 1) == [SESSION_ID]
+        assert f'cd "{link}" && claude --resume {SESSION_ID}' in result.stdout
+
+    @pytest.mark.parametrize("form", ["absolute", "relative", "home", "linked"])
+    def test_recall_and_launch_resolve_every_path_form_alike(
+        self, tmp_path, tmp_config, api_repo, link, form
+    ):
+        base_dir = None
+        if form == "absolute":
+            raw = str(api_repo)
+        elif form == "relative":
+            raw, base_dir = "api", tmp_path.as_posix()
+        elif form == "home":
+            home_repo = Path.home() / "home-api"
+            home_repo.mkdir()
+            raw = "~/home-api"
+        else:
+            raw = str(link)
+        body = config_json(("second",), [{"path": raw, "title": "api"}])
+        if base_dir is not None:
+            body["baseDir"] = base_dir
+        cfg = load_config(tmp_config(body))
+
+        launched_in = launch._resolve_path(
+            raw, launch._expand_base_dir(base_dir) if base_dir else None
+        )
+
+        local = node_cmd._local_dir(cfg, cfg.projects[0])
+        assert launched_in is not None
+        assert local == Path(launched_in)
+        # The store a launch reads is the one recall writes. (A `~` path keeps
+        # expanduser's mixed separators in launch's string; the encoder maps
+        # both separators alike, so the stores agree.)
+        assert nodes.encoded_project_dir(str(local)) == nodes.encoded_project_dir(
+            launched_in
+        )
+
+
 class TestRecallLocalFailureBranches:
     """cq-G14 I2: the killer tests for the partial-failure branches no test
     exercised (15 surviving mutants), landed as the review gave them.
@@ -2344,12 +2404,9 @@ class TestRecallLocalFailureBranches:
     ):
         result = _recall(runner, placed_api, "--local")
         lines = [line.strip() for line in result.stdout.splitlines()]
-        resume = f'cd "{api_repo.resolve()}" && claude --resume {SESSION_ID}'
+        resume = f'cd "{api_repo}" && claude --resume {SESSION_ID}'
         assert lines.count(resume) == 1
-        assert (
-            lines.index(resume)
-            == lines.index(f'git -C "{api_repo.resolve()}" pull') + 1
-        )
+        assert lines.index(resume) == lines.index(f'git -C "{api_repo}" pull') + 1
 
     def test_k3_a_pull_the_config_refuses_is_a_note_and_no_live_read(
         self, runner, placed_api, node_answers, monkeypatch
