@@ -1359,6 +1359,82 @@ class TestAnUnreadableMapPullsNothing:
         assert set(results) == {"second", "third"}
         assert {outcome for outcome, _ in results.values()} == {node_sync.FAILED}
 
+    def test_a_new_class_mid_episode_warns_again(self, placed, monkeypatch, caplog):
+        # Torn, then busy: a different refusal is news, not a repeat.
+        _capture_nodes_log(caplog)
+        syncer = node_sync.NodeSyncer(_second_only(), pull=self._pull([]))
+        _make_unreadable("torn", monkeypatch)
+        syncer.tick()
+        _make_unreadable("busy", monkeypatch)
+        syncer.tick()
+        syncer.tick()
+        assert [w.split("; ")[0] for w in _warnings(caplog)] == [
+            "node sync: the node map could not be read (ValueError)",
+            "node sync: the node map could not be read (PermissionError)",
+        ]
+
+    @pytest.mark.usefixtures("healthy_pulls_end_first")
+    def test_a_pull_in_flight_outlives_the_tick_and_the_next_readable_one_collects_it(
+        self, placed, monkeypatch, executors
+    ):
+        # Ruling (c): an unreadable tick leaves a running pull alone -- its
+        # marks untouched, never dialled a second time while it runs -- and
+        # the first readable tick after it ends collects it as any laggard.
+        release = threading.Event()
+        dialled: list[str] = []
+        clock = _Clock()
+        syncer = node_sync.NodeSyncer(
+            _config(), pull=_blocking_pull(release, dialled), clock=clock
+        )
+        before = _seed_marks(api=(10.0, "/r"))
+        real = nodes.load_node_map_strict
+        try:
+            first = syncer.tick(wait_s=0.2)
+            _make_unreadable("busy", monkeypatch)
+            unread = syncer.tick(wait_s=0.2)
+            marks_while_unread = nodes.pull_marks_path("second").read_bytes()
+            monkeypatch.setattr(nodes, "load_node_map_strict", real)
+            clock.at = 7.0
+            third = syncer.tick(wait_s=0.2)
+            release.set()
+            _wait_out_the_laggard(syncer, "second")
+            clock.at = 8.0
+            fourth = syncer.tick(wait_s=10)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+        ok = (node_sync.OK, "")
+        assert first == {"second": _running(0), "third": ok}
+        assert unread["second"][0] == node_sync.FAILED
+        assert marks_while_unread == before
+        assert third == {"second": _running(7), "third": ok}
+        assert fourth == {"second": ok, "third": ok}
+        # Once for the hung pull, once after it was collected; never between.
+        assert sorted(dialled) == ["second", "second", "third", "third", "third"]
+
+    @pytest.mark.usefixtures("healthy_pulls_end_first")
+    def test_what_a_pull_in_flight_raises_still_surfaces_after_the_tick(
+        self, placed, monkeypatch, executors
+    ):
+        release = threading.Event()
+        _hang_then_raise(monkeypatch, release, ValueError("late"))
+        syncer = node_sync.NodeSyncer(_config(), pull=self._pull([]), clock=_Clock())
+        real = nodes.load_node_map_strict
+        try:
+            syncer.tick(wait_s=0.2)
+            _make_unreadable("busy", monkeypatch)
+            syncer.tick(wait_s=0.2)
+            monkeypatch.setattr(nodes, "load_node_map_strict", real)
+            release.set()
+            _wait_out_the_laggard(syncer, "second")
+            with pytest.raises(ValueError, match="late"):
+                syncer.tick(wait_s=10)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+
 
 class TestMarkAndPruneScope:
     def test_a_failed_session_keeps_its_mark_while_its_neighbour_advances(self, placed):
