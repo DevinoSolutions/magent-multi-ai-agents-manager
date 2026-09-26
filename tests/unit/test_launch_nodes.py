@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import errno
+import json
 import logging
 import subprocess
 import threading
@@ -1629,3 +1630,107 @@ class TestTheExactFallbackIsExact:
         )
         launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
         assert [h for h, _r in desk.moved] == [desk._windows["api on second"]]
+
+
+class TestUpCommandBringsNodeProjectsUp:
+    def _config_file(
+        self, tmp_path: Path, folder: Path, group: str | None = None
+    ) -> str:
+        proj: dict[str, object] = {"path": str(folder), "node": "second"}
+        if group:
+            proj["group"] = group
+        path = tmp_path / "magent.config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "projects": [proj],
+                    "settings": {
+                        "psmux": False,
+                        "uploadServer": False,
+                        "tools": _TOOLS,
+                        "nodes": {"second": {"host": "devino-second", "user": "amin"}},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def test_a_node_only_config_with_no_psmux_comes_up(
+        self, rig, api, tmp_path, monkeypatch
+    ):
+        # R-D1: exit 0, the sid in "Brought up", the map written, no window.
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        result = CliRunner().invoke(
+            cli.main, ["--config", self._config_file(tmp_path, tmp_path / "api"), "up"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "Brought up 1 session(s): api" in result.stdout
+        assert "api" in nodes.read_node_map()
+        assert rig.windows == []
+
+    def test_allow_dirty_reaches_the_bring_up(self, rig, api, tmp_path, monkeypatch):
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        config = self._config_file(tmp_path, tmp_path / "api")
+        refused = CliRunner().invoke(cli.main, ["--config", config, "up"])
+        assert "--allow-dirty" in refused.stdout
+        allowed = CliRunner().invoke(
+            cli.main, ["--config", config, "up", "--allow-dirty"]
+        )
+        assert "Brought up 1 session(s): api" in allowed.stdout
+
+    def test_a_node_session_is_never_decorated_as_a_local_one(
+        self, rig, api, tmp_path, monkeypatch
+    ):
+        decorated: list[list[str]] = []
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions",
+            lambda names, code_hint=None: decorated.append(list(names)) or [],
+        )
+        result = CliRunner().invoke(
+            cli.main, ["--config", self._config_file(tmp_path, tmp_path / "api"), "up"]
+        )
+        # The node sid really was created -- so [] means it was filtered out,
+        # not that nothing came up to decorate.
+        assert result.exit_code == 0, result.output
+        assert "Brought up 1 session(s): api" in result.stdout
+        assert decorated == [[]]
+
+    def test_a_node_project_outside_the_group_is_out_of_scope(
+        self, rig, api, tmp_path, monkeypatch
+    ):
+        # -g scopes the node half at the shell too: a node project in another
+        # group must not turn "all already up" into an empty bring-up run.
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: ([{"name": "web", "session": "web"}], [], [{}]),
+        )
+        monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
+        monkeypatch.setattr("magent.launch.decorate_psmux_sessions", lambda *a, **k: [])
+        config = self._config_file(tmp_path, tmp_path / "api", group="backend")
+        result = CliRunner().invoke(
+            cli.main, ["--config", config, "up", "-g", "frontend"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "All 1 session(s) already up." in result.stdout
+        assert rig.recipes == []
+
+    def test_an_unreachable_node_points_at_the_nodes_log(
+        self, rig, api, tmp_path, monkeypatch
+    ):
+        # A node casualty's reason (and any traceback) is logged by the
+        # "nodes" logger, so the casualty line must send the reader there.
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        rig.error = RemoteError(
+            255, "ssh: connect to host devino-second: timed out", ("bring_up",)
+        )
+        result = CliRunner().invoke(
+            cli.main, ["--config", self._config_file(tmp_path, tmp_path / "api"), "up"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "1 session(s) failed to come up: api" in result.stdout
+        assert "(see ~/.magent/logs/nodes.log on the host)" in result.stdout
+        assert "launch.log" not in result.stdout
