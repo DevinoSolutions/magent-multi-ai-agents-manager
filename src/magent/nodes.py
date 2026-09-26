@@ -20,6 +20,7 @@ import re
 import tempfile
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
@@ -281,12 +282,14 @@ def load_node_map_strict() -> dict[str, NodeMapEntry]:
 def read_node_map() -> dict[str, NodeMapEntry]:
     """``node-map.json`` keyed by project name, tolerantly: whatever
     ``load_node_map_strict`` raises -- a map still busy after its retries, a
-    torn write, a file that is not a JSON object -- reads as ``{}``. The map is
-    a record of where things landed, and a bad one must never stop a launch.
-    Never write back what this returns; see ``load_node_map_strict``."""
+    torn write, a file that is not a JSON object, one nested too deep for
+    ``json.loads`` (``RecursionError``, which is not a ``ValueError``) -- reads
+    as ``{}``. The map is a record of where things landed, and a bad one must
+    never stop a launch or an F2 press. Never write back what this returns; see
+    ``load_node_map_strict``."""
     try:
         return load_node_map_strict()
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}
 
 
@@ -437,13 +440,26 @@ def open_target(
     target), or an entry with no recorded target or absolute folder -- the
     caller falls through to /api/sessions. Never ``remote_root`` as the
     folder: it keeps its ``~`` (DECISION-11) and a Remote-SSH folder URI
-    does not expand one."""
+    does not expand one.
+
+    Both values land in an editor argv, so a value the bring-up writer would
+    never have recorded is None too (a tampered or buggy map): a folder that
+    is not absolute or carries a control character (the writer's
+    ``remote_mux._clean_absolute`` rule; ``-`` can't lead an absolute path, so
+    no VS Code flag either), and a target that would read as an ssh option or
+    has no host after its ``@`` (a hostless authority degrades to a LOCAL
+    open of a node path)."""
     entry = entries.get(project) or next(
         (e for e in entries.values() if e.sid == project), None
     )
-    if entry is None or entry.nick == NODE_CLOUD or not entry.target or not entry.cwd:
+    if entry is None or entry.nick == NODE_CLOUD:
         return None
-    return entry.target, entry.cwd
+    target, cwd = entry.target, entry.cwd
+    if not cwd.startswith("/") or any(unicodedata.category(ch) == "Cc" for ch in cwd):
+        return None
+    if target.startswith("-") or not target.rpartition("@")[2]:
+        return None
+    return target, cwd
 
 
 def placement_of(
