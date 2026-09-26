@@ -23,7 +23,7 @@ from magent.cli.app import main
 from magent.cli.config_io import _load_config_or_exit
 from magent.lockfile import LockHeld
 from magent.paths import find_config
-from magent.style import style
+from magent.style import stdout_safe, style
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -188,13 +188,16 @@ def _refuse(message: str, *, as_json: bool = False) -> NoReturn:
 
 
 def _unreachable(node: Node, exc: RemoteError) -> ScriptLine:
-    """ssh's own failure as a row: the target and ssh's last stderr line."""
+    """ssh's own failure as a row: the target and ssh's last stderr line. rc
+    None is a timeout or an over-cap reply -- the call went out and no answer
+    came back -- so it does not claim the node could not be reached."""
     # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
     from magent.remote_mux import ScriptLine
 
     tail = exc.stderr_tail.strip().splitlines()
     why = tail[-1] if tail else f"rc={exc.rc}"
-    return ScriptLine("fail", "reach", f"cannot reach {node.target}: {why}")
+    what = "no answer from" if exc.rc is None else "cannot reach"
+    return ScriptLine("fail", "reach", f"{what} {node.target}: {why}")
 
 
 def _print_rows(lines: Sequence[ScriptLine]) -> None:
@@ -202,9 +205,11 @@ def _print_rows(lines: Sequence[ScriptLine]) -> None:
     for line in lines:
         mark, color = _ROW_MARKS.get(line.status, ("?", "white"))
         quiet = line.status in ("ok", "skip")
+        # A row's item and detail are the NODE's words (stdout_safe's reason).
         click.echo(
-            f"    {style(mark, fg=color, bold=True)} {line.item:<{width}}  "
-            f"{style(line.detail, dim=quiet)}"
+            f"    {style(mark, fg=color, bold=True)} "
+            f"{stdout_safe(line.item):<{width}}  "
+            f"{style(stdout_safe(line.detail), dim=quiet)}"
         )
 
 
@@ -289,13 +294,52 @@ def node_checks(cfg: MagentConfig, nick: str, *, now: float) -> list[ScriptLine]
         node = nodes.node_for_nick(cfg, nick, local_user=env.local_username())
     except nodes.NodeConfigError as exc:
         return [ScriptLine("fail", "config", str(exc))]
+    # This PC's rows first, at `now`: doctor.sh can take a minute, and a
+    # snapshot the daemon pulls meanwhile is stamped after `now` -- read later,
+    # a healthy node would read as a clock that moved back.
+    local = sync_lines(cfg, nick, now=now)
     try:
         remote = list(
             remote_mux.doctor(node, timeout_s=remote_mux.DOCTOR_TIMEOUT_S).lines
         )
     except remote_mux.RemoteError as exc:
         remote = [_unreachable(node, exc)]
-    return [*remote, *sync_lines(cfg, nick, now=now)]
+    if not remote:
+        # Exit 0 and not one row: a ForceCommand, a MOTD-only login -- doctor.sh
+        # never ran, and silence is not health.
+        remote = [
+            ScriptLine(
+                "fail",
+                "doctor",
+                "the node printed no doctor rows -- a restricted login (ForceCommand)?",
+            )
+        ]
+    return [*remote, *local]
+
+
+def _checks_or_crash_row(
+    cfg: MagentConfig, nick: str, *, now: float
+) -> list[ScriptLine]:
+    """``node_checks``, with a bug of any type turned into that node's one
+    ``fail doctor`` row: one node's crash must not take every other node's rows
+    down with a traceback."""
+    # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
+    from magent.remote_mux import ScriptLine
+
+    try:
+        return node_checks(cfg, nick, now=now)
+    except Exception as exc:  # noqa: BLE001  # reason: one node's bug, of any type, must fail only that node's rows -- the traceback goes to the log
+        log.get_logger("nodes").exception("node doctor: checking %s crashed", nick)
+        return [
+            ScriptLine(
+                "fail",
+                "doctor",
+                (
+                    f"the check itself crashed ({type(exc).__name__}) -- "
+                    "see ~/.magent/logs/nodes.log"
+                ),
+            )
+        ]
 
 
 def doctor_report(cfg: MagentConfig, nicks: list[str]) -> dict[str, list[ScriptLine]]:
@@ -305,7 +349,7 @@ def doctor_report(cfg: MagentConfig, nicks: list[str]) -> dict[str, list[ScriptL
         return {}
     now = time.time()
     with ThreadPoolExecutor(max_workers=len(nicks)) as pool:
-        results = list(pool.map(lambda n: node_checks(cfg, n, now=now), nicks))
+        results = list(pool.map(lambda n: _checks_or_crash_row(cfg, n, now=now), nicks))
     return dict(zip(nicks, results, strict=True))
 
 
@@ -323,7 +367,10 @@ def node_doctor_cmd(ctx: click.Context, nick: str | None, as_json: bool) -> None
     from magent import nodes  # heavy subsystem: in-body per policy
 
     cfg = _load_config_or_exit(find_config(ctx.obj.get("config_path")), as_json=as_json)
-    if nick is not None:
+    if nick is not None and nick not in cfg.settings.nodes:
+        # Only a nick outside the pool is a bad REQUEST (exit 2); a pool node
+        # whose user cannot resolve is a broken node, its `fail config` row
+        # below. node_for_nick owns the wording, and for this nick it raises.
         try:
             nodes.node_for_nick(cfg, nick, local_user=env.local_username())
         except nodes.NodeConfigError as exc:

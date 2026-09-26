@@ -8,8 +8,9 @@ import threading
 import time
 
 import pytest
+from click.testing import CliRunner
 
-from magent import cli, log, node_sync, nodes, remote_mux
+from magent import cli, env, log, node_sync, nodes, remote_mux
 from magent.cli import node_cmd
 from magent.config import SCHEMA_VERSION, load_config
 from magent.remote_mux import ProvisionReport, ScriptLine
@@ -260,3 +261,141 @@ class TestTheNodesAreCheckedConcurrently:
         monkeypatch.setattr(remote_mux, "DOCTOR_TIMEOUT_S", 7.5)
         _doctor(runner, _pool_file(tmp_config, ("second", "fifth")), "--json")
         assert seen == [7.5, 7.5]
+
+
+def _rows(result) -> dict[str, dict[str, str]]:
+    return {r["item"]: r for r in json.loads(result.stdout)["nodes"]["second"]}
+
+
+class TestThisPcsRowsAreReadBeforeTheSsh:
+    def test_a_snapshot_the_daemon_pulls_during_a_slow_doctor_is_not_clock_skew(
+        self, runner, tmp_config, monkeypatch
+    ):
+        # doctor.sh can take a minute; the daemon pulls meanwhile, so a
+        # sessions.json read AFTER it is stamped later than the doctor's `now`.
+        _snapshot("second", time.time() - 1)
+
+        def doctor(node, *, timeout_s):
+            _snapshot("second", time.time() + 30)
+            return ProvisionReport((ScriptLine("ok", "tmux", "tmux 3.4"),))
+
+        monkeypatch.setattr(remote_mux, "doctor", doctor)
+        cfg = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "amin"}},
+                    "nodeSync": {"pullIntervalS": 5},
+                },
+                "projects": [],
+            }
+        )
+        snap = _rows(_doctor(runner, cfg, "--json"))["snapshot"]
+        assert snap["status"] == "ok", snap
+
+
+class TestTheDoctorNeverReadsSilenceOrACrashAsHealth:
+    def test_a_node_that_printed_no_rows_is_not_healthy(
+        self, runner, tmp_config, fake_ssh
+    ):
+        # rc 0 and not one row: a ForceCommand login, a MOTD-only shell -- the
+        # node ran nothing the doctor can vouch for.
+        fake_ssh.set_reply("bash -s", stdout="Welcome to devino-second\n")
+        result = _doctor(runner, _pool_file(tmp_config), "--json")
+        assert result.exit_code == 1, result.output
+        first = json.loads(result.stdout)["nodes"]["second"][0]
+        assert (first["status"], first["item"]) == ("fail", "doctor")
+
+    def test_one_node_that_raises_does_not_sink_the_others(
+        self, runner, tmp_config, monkeypatch
+    ):
+        def doctor(node, *, timeout_s):
+            if node.nick == "third":
+                raise KeyError("boom")
+            return ProvisionReport((ScriptLine("ok", "tmux", node.nick),))
+
+        monkeypatch.setattr(remote_mux, "doctor", doctor)
+        cfg = _pool_file(tmp_config, ("second", "third", "fifth"))
+        result = _doctor(runner, cfg, "--json")
+        assert result.exit_code == 1, result.output
+        body = json.loads(result.stdout)["nodes"]
+        assert body["second"][0]["detail"] == "second"
+        assert body["fifth"][0]["detail"] == "fifth"
+        assert body["third"] == [
+            {
+                "status": "fail",
+                "item": "doctor",
+                "detail": (
+                    "the check itself crashed (KeyError) -- see ~/.magent/logs/nodes.log"
+                ),
+            }
+        ]
+
+    def test_a_node_that_never_answered_is_not_called_unreachable(
+        self, runner, tmp_config, monkeypatch
+    ):
+        # rc None is a timeout or an over-cap reply: ssh got through, the
+        # answer did not come back in time.
+        def doctor(node, *, timeout_s):
+            raise remote_mux.RemoteError(None, "", ("ssh", node.target))
+
+        monkeypatch.setattr(remote_mux, "doctor", doctor)
+        result = _doctor(runner, _pool_file(tmp_config))
+        assert result.exit_code == 1
+        assert "no answer from amin@devino-second: rc=None" in result.stdout
+        assert "cannot reach" not in result.stdout
+
+
+class TestALegacyCodePageStdout:
+    def test_a_node_s_undecodable_byte_does_not_crash_the_doctor(
+        self, tmp_config, monkeypatch
+    ):
+        # _report_of decodes with errors="replace": one invalid byte from the
+        # node is U+FFFD, which cp1252 (a redirected Windows stdout) lacks.
+        def doctor(node, *, timeout_s):
+            return ProvisionReport(
+                (ScriptLine("ok", "git", "git 2.43 \N{REPLACEMENT CHARACTER}"),)
+            )
+
+        monkeypatch.setattr(remote_mux, "doctor", doctor)
+        result = CliRunner(charset="cp1252").invoke(
+            cli.main, ["--config", _pool_file(tmp_config), "node", "doctor"]
+        )
+        assert result.exception is None or isinstance(result.exception, SystemExit), (
+            repr(result.exception)
+        )
+        assert "git 2.43 ?" in result.stdout
+        assert "No failures." in result.stdout
+
+
+def _userless_pool_file(tmp_config) -> str:
+    return tmp_config(
+        {
+            "version": SCHEMA_VERSION,
+            "settings": {"nodes": {"second": {"host": "devino-second"}}},
+            "projects": [],
+        }
+    )
+
+
+class TestANodeWhoseUserCannotResolve:
+    def test_without_a_nick_it_is_a_failed_config_row(
+        self, runner, tmp_config, fake_ssh, monkeypatch
+    ):
+        monkeypatch.setattr(env, "local_username", lambda: "")
+        result = _doctor(runner, _userless_pool_file(tmp_config), "--json")
+        assert result.exit_code == 1
+        row = json.loads(result.stdout)["nodes"]["second"][0]
+        assert (row["status"], row["item"]) == ("fail", "config")
+        assert fake_ssh.calls() == []
+
+    def test_naming_it_is_the_same_failed_row_not_a_refusal(
+        self, runner, tmp_config, fake_ssh, monkeypatch
+    ):
+        # The nick IS in the pool: the node is broken, the request is not.
+        monkeypatch.setattr(env, "local_username", lambda: "")
+        result = _doctor(runner, _userless_pool_file(tmp_config), "second", "--json")
+        assert result.exit_code == 1
+        row = json.loads(result.stdout)["nodes"]["second"][0]
+        assert (row["status"], row["item"]) == ("fail", "config")
+        assert fake_ssh.calls() == []
