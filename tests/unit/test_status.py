@@ -1711,8 +1711,9 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         assert out.exit_code == 0, out.output
         assert sent == []
         assert dialed == [("second", "api")]
-        (hint,) = [ln for ln in out.output.splitlines() if "--host" in ln]
-        assert "magent down --host me@host" in hint
+        hints = [ln for ln in out.output.splitlines() if "--host" in ln]
+        assert len(hints) == 1, out.output
+        assert "magent down --host me@host" in hints[0]
 
     def test_a_placement_with_no_remembered_host_prints_no_hint(
         self, runner, tmp_config, monkeypatch, tmp_path
