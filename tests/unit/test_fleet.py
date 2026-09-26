@@ -317,6 +317,15 @@ class TestAgainstARealFakePsmuxBinary:
         state = fleet.read_state("api", psmux_bin=fake.path)
         assert state == {"state": "idle", "model": "Opus 5", "effort": "max"}
 
+    def test_a_pane_slower_than_the_budget_reads_timeout_not_nopane(
+        self, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, pane=f"PS> claude\nOpus 5 {MID} max")
+        fake.set_capture_delay(1.5)
+        monkeypatch.setattr(psmux, "CAPTURE_PANE_TIMEOUT_S", 0.3)
+        state = fleet.read_state("api", psmux_bin=fake.path)
+        assert state == {"state": "timeout", "model": None, "effort": None}
+
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))

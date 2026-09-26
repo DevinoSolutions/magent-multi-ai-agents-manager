@@ -59,6 +59,45 @@ class TestCapturePane:
         )
         assert psmux.capture_pane("sess", psmux="psmux") == ""
 
+    def test_a_timeout_is_a_timeout_not_an_empty_pane(self, monkeypatch):
+        # A capture that ran out the clock says nothing about the pane: the
+        # session may be perfectly live on a loaded box. Reporting it as ""
+        # made fleet call a live agent "nopane" and `send` call an unverified
+        # prompt delivered.
+        def _slow(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+
+        monkeypatch.setattr(subprocess, "run", _slow)
+        assert psmux.read_pane("sess", psmux="psmux") == psmux.PaneCapture(
+            text="", timed_out=True
+        )
+        # The plain-text accessor keeps its "" for callers that only poll.
+        assert psmux.capture_pane("sess", psmux="psmux") == ""
+
+    def test_an_unlaunchable_psmux_is_not_a_timeout(self, monkeypatch):
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **kw: (_ for _ in ()).throw(OSError("no psmux")),
+        )
+        assert psmux.read_pane("sess", psmux="psmux") == psmux.PaneCapture(
+            text="", timed_out=False
+        )
+
+    def test_the_budget_is_read_at_call_time(self, monkeypatch):
+        seen: dict[str, object] = {}
+
+        def _run(cmd, **kw):
+            seen["timeout"] = kw["timeout"]
+            return _FakeCompleted(returncode=0, stdout="x\n")
+
+        monkeypatch.setattr(subprocess, "run", _run)
+        monkeypatch.setattr(psmux, "CAPTURE_PANE_TIMEOUT_S", 7.5)
+        assert psmux.read_pane("sess", psmux="psmux") == psmux.PaneCapture(
+            text="x\n", timed_out=False
+        )
+        assert seen["timeout"] == 7.5
+
 
 class TestPaneCwd:
     def test_targets_the_named_session_explicitly(self, monkeypatch):

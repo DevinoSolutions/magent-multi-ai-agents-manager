@@ -207,8 +207,18 @@ def send_cmd(
         sys.exit(_EXIT_PSMUX_ERROR)
 
     time.sleep(1.5)
-    pane = psmux.capture_pane(name, psmux=psmux_bin)
-    if fleet.looks_unsent(pane, body):
+    capture = psmux.read_pane(name, psmux=psmux_bin)
+    if capture.timed_out:
+        # An unread pane confirms nothing. Read as "", it passed the check
+        # below -- a prompt still sitting unsent reported "OK sent".
+        click.echo(
+            f"  {style('!', fg='yellow')} could not read {name}'s pane within "
+            f"{psmux.CAPTURE_PANE_TIMEOUT_S:g}s; delivery unconfirmed. "
+            f"check: magent peek {name}",
+            err=True,
+        )
+        sys.exit(_EXIT_NOT_CONFIRMED)
+    if fleet.looks_unsent(capture.text, body):
         click.echo(
             f"  {style('!', fg='yellow')} prompt may still be unsent in {name}; "
             f"check: magent peek {name}",
@@ -358,6 +368,13 @@ def peek_cmd(ctx: click.Context, session: str, lines: int) -> None:
 
     psmux_bin = _require_psmux()
     name = _resolve_or_exit(session, _live_names(ctx.obj.get("config_path"), psmux_bin))
-    pane = psmux.capture_pane(name, psmux=psmux_bin)
-    tail = "\n".join(pane.rstrip().splitlines()[-max(1, lines) :])
+    capture = psmux.read_pane(name, psmux=psmux_bin)
+    if capture.timed_out:
+        click.echo(
+            f"  {style('x', fg='red')} could not read {name}'s pane within "
+            f"{psmux.CAPTURE_PANE_TIMEOUT_S:g}s (psmux did not answer).",
+            err=True,
+        )
+        sys.exit(_EXIT_PSMUX_ERROR)
+    tail = "\n".join(capture.text.rstrip().splitlines()[-max(1, lines) :])
     click.echo(_stdout_safe(tail))
