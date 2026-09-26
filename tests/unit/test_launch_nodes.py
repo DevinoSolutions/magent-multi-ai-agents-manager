@@ -635,6 +635,8 @@ class TestTheBringUpProvisionsFirst:
         assert seen_at_bring_up == [1]
         (call,) = fake_ssh.calls()
         assert any("devino-second" in arg for arg in call.argv)
+        # A bring-up provisions what changed; only `node setup` forces.
+        assert "--force" not in call.argv[-1]
         assert call.stdin.startswith(node_scripts.script("provision").encode("utf-8"))
         assert "second" in launch._PROVISIONED
 
