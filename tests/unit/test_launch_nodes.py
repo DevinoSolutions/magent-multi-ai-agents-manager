@@ -4,6 +4,7 @@ faked at remote_mux's seam, so nothing here dials anything."""
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 import time
 from collections import defaultdict
@@ -217,6 +218,47 @@ class TestTheWindowTitleIsTheOneTheSpawnUsed:
         assert argvs == []
 
 
+class TestTheOutcomeCarriesTheWindowsTitle:
+    """Tiling (Task 12) places node windows by the title the spawn used, so
+    the outcome hands it on -- and None whenever no window opened."""
+
+    @pytest.fixture
+    def windows(self, monkeypatch):
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+
+    def test_a_fresh_bring_up_names_the_window_it_opened(self, rig, api, windows):
+        outcome = launch.bring_up_node_project(_config(api), api, window=True)
+        assert outcome.title == "magent:api"
+
+    def test_attaching_instead_names_the_window_too(self, rig, api, tmp_path, windows):
+        _hold("second")
+        rig.live = True
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        outcome = launch.bring_up_node_project(_config(api), api, window=True)
+        assert (outcome.attached_existing, outcome.title) == (True, "magent:api")
+
+    def test_no_window_asked_is_no_title(self, rig, api, windows):
+        assert launch.bring_up_node_project(_config(api), api).title is None
+
+    def test_a_window_that_failed_to_spawn_is_no_title(
+        self, rig, api, monkeypatch, windows
+    ):
+        def no_wt(*_a: object, **_k: object) -> str:
+            raise FileNotFoundError("wt")
+
+        monkeypatch.setattr("magent.attach_client.spawn_attach_window", no_wt)
+        outcome = launch.bring_up_node_project(_config(api), api, window=True)
+        assert (outcome.ok, outcome.title) == (True, None)
+
+    def test_a_failed_bring_up_is_no_title(self, rig, api, windows):
+        rig.error = RemoteError(5, "magent: clone failed", ("bring_up",))
+        outcome = launch.bring_up_node_project(_config(api), api, window=True)
+        assert (outcome.ok, outcome.title) == (False, None)
+        assert rig.windows == []
+
+
 class TestD7RefusesWhatTheNodeCouldNotReproduce:
     def test_a_dirty_tree_names_allow_dirty_and_nothing_is_dialed(
         self, rig, api, tmp_path
@@ -376,6 +418,9 @@ class TestASessionThatCameUpButWasNotRecordedIsUp:
         (warning,) = [w for w in outcome.warnings if "not recorded" in w]
         assert warning.startswith("up on @second but not recorded")
         assert "re-run magent up" in warning
+        # Unrecorded, a re-run has no held session to attach to, so a dirty
+        # tree would be refused: the repair says how not to be.
+        assert "clean tree or --allow-dirty" in warning
         assert warning.isascii()
 
     def test_the_window_still_opens(self, rig, api, monkeypatch):
@@ -718,3 +763,170 @@ class TestUpBringsUpNodeProjectsToo:
         a = ProjectConfig(path=str(tmp_path / "a"), node="second", group="work")
         b = ProjectConfig(path=str(tmp_path / "b"), node="second")
         assert launch.node_session_ids(_config(a, b), group="WORK") == ["a"]
+
+
+def _hold(nick: str) -> None:
+    nodes.update_node_map(
+        "api",
+        NodeMapEntry(
+            nick=nick,
+            sid="api",
+            placed_ts=1.0,
+            attached_existing=False,
+            remote_root="~/magent/api",
+            target=f"amin@devino-{nick}",
+        ),
+    )
+
+
+class TestTheNodeLockCoversTheDialNotTheWindow:
+    def test_the_bring_up_runs_under_its_nodes_lock(self, rig, api, monkeypatch):
+        held: list[bool] = []
+        real = rig._bring_up
+
+        def spy(node, recipe, **kw):
+            held.append(launch._bring_up_lock(node.nick).locked())
+            return real(node, recipe, **kw)
+
+        monkeypatch.setattr(remote_mux, "bring_up", spy)
+        assert launch.bring_up_node_project(_config(api), api).ok
+        assert held == [True]
+        assert not launch._bring_up_lock("second").locked()
+
+    def test_the_window_opens_after_the_lock_is_released(self, rig, api, monkeypatch):
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+        held: list[bool] = []
+        real = rig._window
+
+        def spy(target, sid, **kw):
+            held.append(launch._bring_up_lock("second").locked())
+            return real(target, sid, **kw)
+
+        monkeypatch.setattr("magent.attach_client.spawn_attach_window", spy)
+        assert launch.bring_up_node_project(_config(api), api, window=True).ok
+        assert held == [False]
+
+    def test_a_failed_bring_up_releases_the_lock(self, rig, api):
+        rig.error = RemoteError(5, "magent: clone failed", ("bring_up",))
+        assert not launch.bring_up_node_project(_config(api), api).ok
+        assert not launch._bring_up_lock("second").locked()
+
+    def test_one_lock_per_node(self):
+        assert launch._bring_up_lock("second") is launch._bring_up_lock("second")
+        assert launch._bring_up_lock("second") is not launch._bring_up_lock("third")
+
+
+class TestTheAttachInsteadPathIsNarrow:
+    def test_a_session_held_on_another_node_does_not_excuse_a_dirty_tree(
+        self, rig, api, tmp_path
+    ):
+        _hold("third")
+        rig.live = True
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert (outcome.ok, outcome.attached_existing) == (False, False)
+        assert rig.decorated == []
+
+    def test_a_probe_that_failed_is_not_a_live_session(self, rig, api, tmp_path):
+        _hold("second")
+        rig.live = None  # has_session's "the PROBE failed" answer
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert (outcome.ok, outcome.attached_existing) == (False, False)
+        assert rig.decorated == []
+
+    def test_attaching_instead_opens_the_window_on_the_held_session(
+        self, rig, api, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+        _hold("second")
+        rig.live = True
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        outcome = launch.bring_up_node_project(_config(api), api, window=True)
+        assert outcome.attached_existing
+        assert rig.windows == [
+            ("amin@devino-second", "api", "tmux", "tmux -L magent attach -t '=api'")
+        ]
+
+
+class TestEveryNodeFailureIsAnOutcomeButABugIsNot:
+    def test_a_map_held_past_its_wait_is_an_outcome(self, rig, api, monkeypatch):
+        def held(*_a: object, **_k: object) -> None:
+            raise lockfile.LockHeld("the node map is held by another writer")
+
+        monkeypatch.setattr(nodes, "update_node_map", held)
+        outcome = launch.bring_up_node_project(_config(api), api)
+        # The node said yes before the map write failed: the session is up,
+        # so the outcome is ok with a repair warning naming the cause (6688a69).
+        assert (outcome.ok, outcome.node, outcome.error) == (True, "second", None)
+        (warning,) = [w for w in outcome.warnings if "not recorded" in w]
+        assert "held by another writer" in warning
+        assert not launch._bring_up_lock("second").locked()
+
+    def test_an_unreadable_push_file_is_an_outcome(self, rig, api):
+        rig.error = PermissionError(13, "Permission denied")
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert outcome.ok is False
+        assert "Permission denied" in (outcome.error or "")
+
+    def test_the_recipes_warnings_reach_the_outcome(self, rig, api, monkeypatch):
+        real = launch.node_recipe
+        monkeypatch.setattr(
+            launch,
+            "node_recipe",
+            lambda *a: dataclasses.replace(real(*a), warnings=("push: .env skipped",)),
+        )
+        assert launch.bring_up_node_project(_config(api), api).warnings == (
+            "push: .env skipped",
+        )
+
+    def test_a_bug_is_not_swallowed_into_an_outcome(self, rig, api):
+        rig.error = TypeError("a real bug")
+        with pytest.raises(TypeError):
+            launch.bring_up_node_project(_config(api), api)
+
+    def test_an_unexpected_value_error_is_logged_with_its_traceback(
+        self, rig, api, caplog
+    ):
+        # A plain ValueError is an outcome (a recipe that cannot be framed) but
+        # also possibly a bug: the log keeps the traceback to tell them apart.
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        rig.error = ValueError("cannot frame the recipe")
+        assert not launch.bring_up_node_project(_config(api), api).ok
+        (record,) = [r for r in caplog.records if "failed" in r.getMessage()]
+        assert record.exc_info
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            nodes.NodeConfigError("second: unknown node"),
+            RemoteError(5, "magent: clone failed", ("bring_up",)),
+            PermissionError(13, "Permission denied"),
+        ],
+    )
+    def test_an_expected_failure_is_logged_without_one(self, rig, api, caplog, exc):
+        from magent.log import get_logger
+
+        get_logger("nodes")
+        caplog.set_level("WARNING", logger="magent.nodes")
+        rig.error = exc
+        assert not launch.bring_up_node_project(_config(api), api).ok
+        (record,) = [r for r in caplog.records if "failed" in r.getMessage()]
+        assert not record.exc_info
+
+    def test_the_nodes_last_stderr_line_is_the_reason(self, rig, api):
+        rig.error = RemoteError(
+            5,
+            "Cloning into 'api'...\nfatal: repository not found\n"
+            "magent: git clone of api failed",
+            ("bring_up",),
+        )
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert outcome.error == "git clone of api failed"
