@@ -965,19 +965,28 @@ def test_a_windows_ssh_project_terminal_dials_the_panes_client(monkeypatch):
 @pytest.mark.skipif(
     sys.platform != "win32", reason="WindowsPlatform binds windll at import"
 )
-def test_a_client_path_with_spaces_reaches_cmd_as_the_bare_name(monkeypatch):
+@pytest.mark.parametrize(
+    "client",
+    [
+        r"C:\Program Files\OpenSSH\ssh.exe",
+        r"C:\Program Files\Git\usr\bin\ssh.exe",
+        r"C:\Tools&Co\ssh.exe",
+    ],
+)
+def test_a_client_path_cmd_would_reparse_reaches_it_as_the_bare_name(
+    monkeypatch, client
+):
     # `cmd /k` strips the first and last quote of a line that starts with one,
     # so a quoted C:\Program Files\... argv[0] would eat the remote command's
-    # closing quote. Only the PATH fallback yields such a path, and the bare
-    # name resolves through that same PATH to the same client.
+    # closing quote, and an unquoted `&` would split the line in two. Only the
+    # PATH fallback yields such a path, and the bare name resolves through that
+    # same PATH to the same client.
     from magent import attach_client
     from magent.platform import TerminalLaunchOpts
     from magent.platform.windows import WindowsPlatform
 
     argvs: list[list[str]] = []
-    monkeypatch.setattr(
-        attach_client, "find_ssh", lambda: r"C:\Program Files\Git\usr\bin\ssh.exe"
-    )
+    monkeypatch.setattr(attach_client, "find_ssh", lambda: client)
     monkeypatch.setattr(
         "magent.platform.windows.subprocess.Popen", lambda a, **k: argvs.append(a)
     )

@@ -1573,7 +1573,10 @@ def bring_up_node_project(
                 cause = str(exc).encode("ascii", "replace").decode("ascii")
                 warnings = (
                     *warnings,
-                    f"up on @{nick} but not recorded ({cause}); re-run magent up",
+                    (
+                        f"up on @{nick} but not recorded ({cause}); re-run magent"
+                        " up from a clean tree or --allow-dirty"
+                    ),
                 )
         title = _open_node_window(node, result.sid) if window else None
         log.info(

@@ -4,6 +4,7 @@ faked at remote_mux's seam, so nothing here dials anything."""
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -414,6 +415,9 @@ class TestASessionThatCameUpButWasNotRecordedIsUp:
         (warning,) = [w for w in outcome.warnings if "not recorded" in w]
         assert warning.startswith("up on @second but not recorded")
         assert "re-run magent up" in warning
+        # Unrecorded, a re-run has no held session to attach to, so a dirty
+        # tree would be refused: the repair says how not to be.
+        assert "clean tree or --allow-dirty" in warning
         assert warning.isascii()
 
     def test_the_window_still_opens(self, rig, api, monkeypatch):
@@ -535,6 +539,17 @@ class TestEveryNodeFailureIsAnOutcomeButABugIsNot:
         outcome = launch.bring_up_node_project(_config(api), api)
         assert outcome.ok is False
         assert "Permission denied" in (outcome.error or "")
+
+    def test_the_recipes_warnings_reach_the_outcome(self, rig, api, monkeypatch):
+        real = launch.node_recipe
+        monkeypatch.setattr(
+            launch,
+            "node_recipe",
+            lambda *a: dataclasses.replace(real(*a), warnings=("push: .env skipped",)),
+        )
+        assert launch.bring_up_node_project(_config(api), api).warnings == (
+            "push: .env skipped",
+        )
 
     def test_a_bug_is_not_swallowed_into_an_outcome(self, rig, api):
         rig.error = TypeError("a real bug")
