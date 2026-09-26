@@ -1258,6 +1258,101 @@ class TestMarksMoveOnlyAfterAPull:
         assert nodes.pull_marks_path("second").read_bytes() == before
 
 
+def _make_unreadable(state: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Torn on disk, or intact but still locked after the strict read's
+    retries (a Windows reader racing a replace)."""
+    if state == "torn":
+        nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+        return
+
+    def busy() -> dict[str, NodeMapEntry]:
+        raise PermissionError(13, "The process cannot access the file")
+
+    monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+
+
+_UNREADABLE = pytest.mark.parametrize(
+    ("state", "cls"), [("torn", "ValueError"), ("busy", "PermissionError")]
+)
+
+
+class TestAnUnreadableMapPullsNothing:
+    """A tick behind a map it could not read knows nothing about placement.
+    Pulling every node with no session, as if the map were empty, wrote each
+    node's marks as ``{}``: the next readable tick pulled every session from
+    zero. So it pulls nothing and writes nothing, and says so once."""
+
+    @staticmethod
+    def _pull(asked: list[str]):
+        def pull(node, _sids):
+            asked.append(node.nick)
+            return _snapshot(realpaths={"api": "/r"})
+
+        return pull
+
+    def test_a_readable_map_records_marks(self, placed):
+        asked: list[str] = []
+        node_sync.NodeSyncer(_second_only(), pull=self._pull(asked)).tick()
+        assert asked == ["second"]
+        assert _marks() == {"api": {"since": 0.0, "realpath": "/r"}}
+
+    @_UNREADABLE
+    def test_the_marks_stay_byte_identical_and_no_node_is_dialled(
+        self, placed, monkeypatch, state, cls
+    ):
+        before = _seed_marks(api=(10.0, "/r"))
+        _make_unreadable(state, monkeypatch)
+        asked: list[str] = []
+        results = node_sync.NodeSyncer(_config(), pull=self._pull(asked)).tick()
+        assert asked == []
+        assert nodes.pull_marks_path("second").read_bytes() == before
+        assert not nodes.pull_marks_path("third").exists()
+        assert not nodes.sessions_path("second").exists()
+        detail = f"the node map could not be read ({cls})"
+        assert results == {
+            "second": (node_sync.FAILED, detail),
+            "third": (node_sync.FAILED, detail),
+        }
+
+    @_UNREADABLE
+    def test_one_warning_names_the_class_only_and_the_recovery_once(
+        self, placed, monkeypatch, caplog, state, cls
+    ):
+        _capture_nodes_log(caplog)
+        _seed_marks(api=(10.0, "/r"))
+        real = nodes.load_node_map_strict
+        _make_unreadable(state, monkeypatch)
+        asked: list[str] = []
+        syncer = node_sync.NodeSyncer(_second_only(), pull=self._pull(asked))
+        syncer.tick()
+        syncer.tick()
+        warnings = _warnings(caplog)
+        assert warnings == [
+            f"node sync: the node map could not be read ({cls}); pulling nothing"
+        ]
+        assert "node-map.json" not in caplog.text
+        # Readable again: one line says so, and the pull resumes from the
+        # marks the unreadable ticks left alone.
+        monkeypatch.setattr(nodes, "load_node_map_strict", real)
+        nodes.write_node_map({"api": _entry("second", "api")})
+        syncer.tick()
+        syncer.tick()
+        assert asked == ["second", "second"]
+        assert _warnings(caplog) == warnings
+        again = [
+            r.getMessage() for r in caplog.records if "reads again" in r.getMessage()
+        ]
+        assert again == ["node sync: the node map reads again"]
+
+    def test_one_shot_behind_an_unreadable_map_is_a_failure_not_a_silence(self, placed):
+        # `magent node sync --once` exits 1 on any non-OK node: an empty
+        # answer would have printed nothing and exited 0.
+        nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+        results = node_sync.run_once(_config(), pull=self._pull([]))
+        assert set(results) == {"second", "third"}
+        assert {outcome for outcome, _ in results.values()} == {node_sync.FAILED}
+
+
 class TestMarkAndPruneScope:
     def test_a_failed_session_keeps_its_mark_while_its_neighbour_advances(self, placed):
         _seed_marks(api=(10.0, "/ra"), db=(20.0, "/rd"))
@@ -3100,6 +3195,8 @@ class TestJsonNestedTooDeeply:
         assert _node_errors(caplog) == []
 
     def test_a_node_map_nested_too_deeply_does_not_stop_the_tick(self, placed):
+        # It does not raise out of the tick, and -- like any map the tick
+        # cannot read -- it is no licence to pull every node with nothing.
         nodes.NODE_MAP_PATH.write_text(_TOO_DEEP, encoding="utf-8")
         asked: list[set[str]] = []
 
@@ -3108,8 +3205,12 @@ class TestJsonNestedTooDeeply:
             return _snap()
 
         results = node_sync.NodeSyncer(_config(), pull=pull).tick()
-        assert results == {"second": (node_sync.OK, ""), "third": (node_sync.OK, "")}
-        assert asked == [set(), set()]
+        detail = "the node map could not be read (ValueError)"
+        assert results == {
+            "second": (node_sync.FAILED, detail),
+            "third": (node_sync.FAILED, detail),
+        }
+        assert asked == []
 
     def test_the_strict_reader_calls_it_a_bad_file(self, placed):
         """ValueError, the one type every strict caller catches for a bad map
