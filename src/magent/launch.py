@@ -2143,9 +2143,10 @@ def _final_pull(
                     f"node {nick}'s pull lock is held by another magent process"
                 )
             if isinstance(exc, node_sync.NodeMapUnreadable):
-                # D-MERGE: revised ruling (b) -- at the D16 merge this reason
-                # becomes nodes.map_unread_text(exc.__cause__): the shared
-                # sentence plus the MAP error's class, which is str(exc).
+                # D-MERGE: revised ruling (b) -- at the D16 merge this line
+                # becomes `reason = str(exc)`: final_pull built it with
+                # nodes.map_unread_text from the MAP error, so it is the shared
+                # sentence plus that error's class (pinned in TestTheFinalPull).
                 # Never map_unread_text(exc) (it would name NodeMapUnreadable)
                 # and never D16's m4 words: those are the None branch's only.
                 # The whole error stays in the log line above. Until the
