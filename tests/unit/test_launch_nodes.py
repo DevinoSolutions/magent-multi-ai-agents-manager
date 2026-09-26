@@ -32,6 +32,7 @@ from tests.conftest import FakePlatform
 
 if TYPE_CHECKING:
     import os
+    from collections.abc import Callable
 
 _TOOLS = {"claude": "claude --continue"}
 
@@ -641,6 +642,22 @@ def _record(name: str, nick: str, remote_root: str) -> None:
     )
 
 
+def _looked_up_on_its_pin(caplog: pytest.LogCaptureFixture) -> Callable[[], int]:
+    """With the map already unreadable: a counter of the magent.nodes records
+    carrying the WHOLE error a reader meets (its words, not only its class)
+    for the pinned project api looked up on second."""
+    from magent.log import get_logger
+
+    with pytest.raises((OSError, ValueError)) as err:
+        nodes.load_node_map_strict()
+    line = f"node second: api looked up on its pin, node map unreadable: {err.value}"
+    get_logger("nodes")  # sets the level; caplog must come after
+    caplog.set_level("WARNING", logger="magent.nodes")
+    return lambda: sum(
+        r.name == "magent.nodes" and r.getMessage() == line for r in caplog.records
+    )
+
+
 def _attached_when_live(monkeypatch: pytest.MonkeyPatch, rig: NodeRig) -> None:
     """The node's own answer for a session already running: bring_up.sh
     attaches to it instead of starting one (``attached_existing``)."""
@@ -1191,7 +1208,7 @@ class TestAnUnreadableMapPlacesNothingByGuess:
         assert clash == {"api-y": text, "api-w": text}
 
     def test_a_dirty_pinned_project_attaches_to_its_running_session(
-        self, rig, api, tmp_path, monkeypatch, unreadable_map
+        self, rig, api, tmp_path, monkeypatch, caplog, unreadable_map
     ):
         # The map cannot say it runs there, so its pin and its own session id
         # are asked: running, the uncommitted tree here does not touch it.
@@ -1204,7 +1221,8 @@ class TestAnUnreadableMapPlacesNothingByGuess:
             return True
 
         monkeypatch.setattr(remote_mux, "has_session", has_session)
-        unreadable_map()
+        cls = unreadable_map()
+        full = _looked_up_on_its_pin(caplog)
         outcome = launch.bring_up_node_project(_config(api), api)
         assert (outcome.ok, outcome.node, outcome.attached_existing) == (
             True,
@@ -1212,14 +1230,20 @@ class TestAnUnreadableMapPlacesNothingByGuess:
             True,
         )
         assert outcome.error is None
-        assert any("--allow-dirty" in w for w in outcome.warnings)
+        (dirty,) = [w for w in outcome.warnings if "--allow-dirty" in w]
+        # The map is named on screen by its class, once; nodes.log has it all.
+        assert outcome.warnings == (
+            dirty,
+            f"the node map is unreadable ({cls}); attached to api on its pin @second",
+        )
+        assert full() == 1
         assert probes == [("second", "api")]
         assert rig.decorated == [("api", "second")]
         assert rig.recipes == []
 
     @pytest.mark.parametrize("live", [False, None], ids=["not-running", "no-answer"])
     def test_a_dirty_pinned_project_not_found_running_is_refused_naming_the_map(
-        self, rig, api, tmp_path, monkeypatch, unreadable_map, live
+        self, rig, api, tmp_path, monkeypatch, caplog, unreadable_map, live
     ):
         _record("api", "second", "~/magent/api")
         rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
@@ -1231,8 +1255,11 @@ class TestAnUnreadableMapPlacesNothingByGuess:
 
         monkeypatch.setattr(remote_mux, "has_session", has_session)
         cls = unreadable_map()
+        full = _looked_up_on_its_pin(caplog)
         outcome = launch.bring_up_node_project(_config(api), api)
         assert (outcome.ok, outcome.node) == (False, "second")
+        # The screen names the class; the error it stands for is in nodes.log.
+        assert full() == 1
         error = outcome.error or ""
         assert "--allow-dirty" in error
         assert error.endswith(

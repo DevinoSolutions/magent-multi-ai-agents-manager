@@ -1852,7 +1852,14 @@ def bring_up_node_project(
         if refusals:
             if unreadable is not None:
                 # Nothing records where it runs, which is not "nowhere": ask
-                # its pin, under its own session id.
+                # its pin, under its own session id. The whole error goes to
+                # nodes.log once here; either outcome names only its class.
+                log.warning(
+                    "node %s: %s looked up on its pin, node map unreadable: %s",
+                    nick,
+                    sid,
+                    unreadable,
+                )
                 running = sid if remote_mux.has_session(node, sid) else None
             elif (
                 held is not None
@@ -1878,7 +1885,20 @@ def bring_up_node_project(
                     sid=sid,
                     node=nick,
                     attached_existing=True,
-                    warnings=tuple(refusals),
+                    warnings=(
+                        *refusals,
+                        *(
+                            (
+                                (
+                                    "the node map is unreadable"
+                                    f" ({type(unreadable).__name__}); attached to"
+                                    f" {sid} on its pin @{nick}"
+                                ),
+                            )
+                            if unreadable is not None
+                            else ()
+                        ),
+                    ),
                     title=title,
                 )
             log.info("node %s: refused %s: %s", nick, sid, refusals)
