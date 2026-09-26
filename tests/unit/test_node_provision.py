@@ -2095,6 +2095,19 @@ class TestThePayloadOwnsItsFraming:
             _payload(token=TOKEN, login=None)
         assert TOKEN not in str(exc.value)
 
+    def test_one_rule_reads_the_token_and_frames_it(self, fake_gh, monkeypatch):
+        # F6 reads, F7 frames: one constant, so what gh hands over can always
+        # be framed and nothing else is ever read.
+        monkeypatch.setattr(
+            remote_mux, "GH_TOKEN_PATTERN", re.compile(r"no_token_is_this_one")
+        )
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
+        assert remote_mux.local_gh_token() == remote_mux.GhUnavailable(
+            "failed", detail="gh auth token printed something that is not a token"
+        )
+        with pytest.raises(ValueError, match="cannot frame"):
+            _payload(token=TOKEN)
+
     @pytest.mark.parametrize(
         "path", ["../../.bashrc", "/etc/x", "a/./b", "a//b", "a\\b", "", "a\0b", "a/"]
     )

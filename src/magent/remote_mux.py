@@ -647,10 +647,13 @@ GH_STATUS_ARGV = (
     "hosts",
 )
 GH_TOKEN_ARGV = ("auth", "token", "--hostname", "github.com")
-# GitHub's token alphabet. No prefix check -- GHES, legacy 40-hex and
-# GH_TOKEN-supplied tokens must pass -- but a BOM, a control character,
-# non-ASCII, a space or a stray one-word line never ships.
-_GH_TOKEN_RE = re.compile(r"[A-Za-z0-9_]{20,255}")
+# GitHub's token alphabet: what local_gh_token accepts from gh AND what
+# build_payload will frame as the payload's first line -- one rule, so a
+# token gh hands over can always be framed. No prefix check -- GHES, legacy
+# 40-hex and GH_TOKEN-supplied tokens must pass -- but a BOM, a control
+# character, non-ASCII, a space, a newline (which would end the line early)
+# or a stray one-word line never ships.
+GH_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]{20,255}")
 _GH_NOT_A_TOKEN = "gh auth token printed something that is not a token"
 # A token-shaped run in gh's own words (stderr, a status entry's error) is
 # replaced before those words are kept: they reach hints, rows and logs.
@@ -856,7 +859,7 @@ def local_gh_token() -> str | GhUnavailable:
     if result.returncode != 0:
         return _gh_refusal(result)
     token = result.stdout.decode("utf-8", "replace").rstrip("\r\n")
-    if _GH_TOKEN_RE.fullmatch(token) is None:
+    if GH_TOKEN_PATTERN.fullmatch(token) is None:
         return GhUnavailable("failed", detail=_GH_NOT_A_TOKEN)
     return token
 
@@ -872,14 +875,6 @@ def _sha(text: str) -> str:
 
 def _canonical(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-
-
-# The characters a gh token may carry to be framed as the payload's first
-# line: gh's own token alphabet, nothing that could end the line early or be
-# read as the tarball's first byte. The same rule lands in F6's
-# local_gh_token (feat/nodes-F6 b50f6ad); the integrator unifies the two onto
-# one constant.
-GH_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]{20,255}")
 
 
 def _check_skill_path(path: str) -> None:
