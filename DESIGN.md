@@ -1785,6 +1785,76 @@ supervised-pane and `--no-mux` `wt` spawns in `cli/attach.py`. Pins:
 TestAttachClientKeepsNestingMarkersButNotALeakedNoColor`, and
 `tests/unit/test_attach.py::TestAttachPanesLoseOnlyALeakedColourOverride`.
 
+### An auto node is chosen by its load history, and a recall is explicit (2026-09-24)
+
+**Placement reads history, not a reading.** `"node": "auto"` is resolved by
+`launch.place_node_projects`, its own phase between selection and launch, so a
+dispatcher only ever sees a nick; with sub-plan D, `up` runs the same phase
+once before its fan-out so one `up` spreads like `--go`. The score is spec §11
+over the sync daemon's last 30 minutes of samples: the p75 of `load1 / nproc`,
+plus half of how far the window's peak rises above 1.5 times that p75, plus
+half of how far the newest free memory falls below 15%, plus 0.05 per session
+of ours; ties go by config order. A node under 10% free memory
+(`MEM_HARD_FLOOR`) is not a candidate while another is above it. A node with
+fewer than five samples in the window gets exactly one live `sample` call,
+which is then its only sample, and none under `--dry-run` or a tile-only pass;
+a node that does not answer it is left unscored. A single reading would place
+a session on a box that happened to be idle for one second of a bursty minute.
+<!-- D-MERGE: drop "with sub-plan D," when D's `up` fan-out calls place_node_projects. -->
+
+**A placement sticks, and placing writes nothing.** A project stays on its
+node until that node leaves `settings.nodes`; only then is it re-placed, with
+the reason printed. The placement phase never writes `node-map.json`: the
+bring-up (sub-plan D's) records it once it has actually happened, so a failed
+launch leaves nothing sticky behind, and `magent node plan` can render the
+very same objects while writing nothing, pinned byte-for-byte. Nothing moves a
+running session on its own; `magent node recall --to` (with sub-plan D) is the
+only mover.
+<!-- D-MERGE: drop "(sub-plan D's)" and "(with sub-plan D)" when D's bring-up writes the node map and recall --to lands. -->
+
+**The node decides what a plain re-up resumes.** A session brought up again
+passes no resume id: sub-plan D's `bring_up.sh` runs `claude --continue` over
+the node's own transcripts, or the fresh form when there are none. The PC's
+pulled copy can be one pull stale, and an explicit `--resume` has no fresh
+fallback on a node that lost the file. `claude --resume <id>` is used only
+where magent installed that conversation first: `recall --to` (with sub-plan
+D; installed by `install_transcripts.sh`, under the name magent's one encoder
+gives the node's own `realpath`; the node never encodes) and the resume
+`recall --local` prints.
+<!-- D-MERGE: drop "sub-plan D's" and "with sub-plan D;" when bring_up.sh and recall --to land. -->
+
+**Recall never races the daemon, and a pull it cannot finish stops it.** The
+last pull goes through `node_sync.final_pull`, under the lock the daemon's tick
+holds. The placement is cleared at the end of a recall and a cleared placement
+is never pulled again, so a pull that a re-run could still complete stops the
+recall before anything is stopped, installed or cleared: a node that answered
+with an error, a pull that left files behind, a placement the pull could not
+read again, or a node map another process holds busy or left torn all exit 1
+with the project still placed and "run the recall again"; a daemon still
+holding the node past the wait exits 3 the same way. Only a node that does not
+answer at all (ssh's own 255, or a timeout), or one this config cannot pull
+from, is reported and not fatal, because no re-run helps: the last `repos.json`
+record stands in for the live commit report, and the command that stops the
+session is printed with its target single-quoted, `kill-session -t '=<sid>'`,
+because zsh reads a bare `=word` as a command lookup. That command is one
+`ssh <target> "…"` line only for a plain sid; any other sid gets two steps
+(ssh, then run it on the node) with its `'` escaped, since the local shell
+would expand `$(…)`, a backtick or `!` inside the double quotes. "Stopped" is
+printed only when sub-plan D's `remote_mux.kill_session` returned True; until
+D merges, recall cannot stop the session itself and always prints that command.
+<!-- D-MERGE: drop "sub-plan D's" and the "until D merges" clause when kill_session lands (plan G :3865-3874). -->
+
+**`--local` installs by the rules a `--to` send uses.** The local folder is
+the one a launch opens, resolved by `launch._resolve_path` and never
+`Path.resolve()`d, because Claude files a conversation under the path the
+session was started in, link and all. The pulled mirror is copied by
+`remote_mux.copy_mirror`, which shares its membership rule with the tar that
+ships a mirror to a node: no link is followed, a mirror that is itself a link
+is refused, and a pull's `.part` temp is never copied. A local file the node's
+copy changed is named, because it may be work this PC had.
+
+<!-- R-A/R-B pending: Task 16 -->
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.
@@ -1810,6 +1880,28 @@ guarantee this test exists for is still covered on Windows by
 by cell, and the test itself runs for real on ubuntu and macOS. Worth trying
 next: pywinpty's WinPTY back end (`PtyProcess.spawn(backend=Backend.WinPTY)`),
 which predates win32-input-mode and may pass the CR through unencoded.
+
+**Auto placement never rebalances (2026-09-24):** an `auto` project stays on
+the node it was placed on until that node leaves `settings.nodes`. A node that
+grows busy keeps its sessions; moving one is a manual
+`magent node recall <project> --to <nick>` (with sub-plan D). Deliberate: a
+move stops a live session and ships its conversation, which is not something
+to do behind the user's back. If it bites, the fix is a `node plan` hint
+naming the better node, never an automatic move.
+<!-- D-MERGE: drop "(with sub-plan D)" when recall --to lands (plan G Task 15). -->
+
+**Recall moves Claude Code conversations only (2026-09-24):** `magent node
+recall` refuses a project whose tool is not `claude` (exit 2). Codex has no
+transcript layout magent pulls, and no resume-by-id form recall could print.
+Its sessions come home by git alone: commit and push on the node, pull here.
+
+**A bring-up's repo record knows the commit, not the branch (2026-09-24):**
+`repos.json` written at bring-up (sub-plan D's) carries each repo's sha from
+`bring_up.sh`, with an empty branch and an unknown unpushed count, because the
+bring-up reports only commits. A recall from a node that no longer answers
+therefore prints the last known sha without a branch. A recall from a node
+that answers records the full `repo_status.sh` report and replaces it.
+<!-- D-MERGE: drop "(sub-plan D's)" when D's bring-up writes repos.json. -->
 
 **Attach-pane reconnect is only reachable from a Windows client (2026-08-09):**
 `attach_client.py` itself is OS-agnostic (stdlib + click; the `Popen` in
