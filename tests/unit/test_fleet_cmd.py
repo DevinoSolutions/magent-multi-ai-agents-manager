@@ -495,6 +495,50 @@ class TestSessionsJson:
 
         row = json.loads(result.stdout)[1]
         assert (row["name"], row["state"]) == ("api-old", "live")
+        # The map is keyed by PROJECT, so the folder survives the sid drift.
+        assert row["cwd"] == "/home/amin/magent/api"
+
+    def test_a_node_config_that_fails_validation_answers_the_json_envelope(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # The one path where sessions --json is not an array: the typed load a
+        # node config needs. stdout must still be ONE JSON document (NF-S3-005).
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        cfg = tmp_config(
+            {
+                "projects": [
+                    {"path": str(tmp_path / "api"), "title": "api", "node": "nope"}
+                ],
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                },
+            }
+        )
+
+        result = runner.invoke(cli.main, ["--config", cfg, "sessions", "--json"])
+
+        assert result.exit_code == 1
+        # Empty stdout is the failure this pins: the error went to stderr.
+        assert result.stdout.strip().startswith("{")
+        body = json.loads(result.stdout)
+        assert isinstance(body, dict)
+        assert body["ok"] is False
+        assert isinstance(body["error"], str)
+        assert body["error"]
+        assert set(body) == {"ok", "error"}
+
+    def test_a_missing_config_is_an_empty_array(self, runner, tmp_path, monkeypatch):
+        fake = make_fake_psmux(tmp_path)
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", str(tmp_path / "missing.json"), "sessions", "--json"],
+        )
+
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == []
 
     def test_a_fresh_pull_without_the_session_reads_dead(
         self, runner, tmp_config, tmp_path, monkeypatch
