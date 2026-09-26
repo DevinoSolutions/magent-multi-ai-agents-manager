@@ -553,8 +553,18 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
         )
     except OSError as exc:
         # After LockHeld (an OSError itself): this PC's side of the pull -- the
-        # watermark file, the per-node lock file -- failed (cq-G14 M1).
-        _fail(f"could not pull from @{held.nick} ({exc}); {_RERUN}", 1)
+        # watermark file, the per-node lock file -- failed (cq-G14 M1). The
+        # error CLASS only on screen (str(exc) carries a path); the full error
+        # goes to nodes.log.
+        # D-MERGE: D's node_sync.final_pull shape (Dsync 08cfa62) wins at
+        # integration: it raises NodeMapUnreadable (an OSError) for a map it
+        # cannot read. This branch must keep the class-only rule for it --
+        # never str(exc) on screen, the full error in nodes.log -- and, as an
+        # unreadable map, it takes the "fix or move it aside" words, not _RERUN.
+        log.get_logger("nodes").warning(
+            "recall's last pull from %s failed on this PC: %s", held.nick, exc
+        )
+        _fail(f"could not pull from @{held.nick} ({type(exc).__name__}); {_RERUN}", 1)
     except nodes.NodeConfigError as exc:
         _note(
             f"@{held.nick} cannot be pulled from ({exc});"

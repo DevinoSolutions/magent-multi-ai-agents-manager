@@ -2086,10 +2086,32 @@ class TestTheLastPullMustFinish:
         result = _recall(runner, placed_api, "--local")
 
         _stopped_before_anything(result, api_repo)
-        assert "could not pull from @second" in result.stderr
-        assert "Permission denied" in result.stderr
+        assert "could not pull from @second (PermissionError)" in result.stderr
         assert result.exception is None or isinstance(result.exception, SystemExit)
         assert node_answers == []
+
+    def test_a_failure_on_this_pc_during_the_pull_names_the_class_only(
+        self, runner, placed_api, node_answers, monkeypatch, caplog
+    ):
+        # inv-unknown: the error CLASS on screen, the full error in nodes.log --
+        # str(exc) carries this PC's path.
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        error = PermissionError(13, "Permission denied", "C:/Users/me/pull.json")
+
+        def _denied(*a, **k):
+            raise error
+
+        monkeypatch.setattr(node_sync, "final_pull", _denied)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 1, result.output
+        assert "(PermissionError)" in result.stderr
+        assert "run the recall again" in result.stderr
+        assert str(error) not in result.output
+        assert "Permission denied" not in result.output
+        assert "pull.json" not in result.output
+        assert any(str(error) in m for m in _node_logs(caplog)), _node_logs(caplog)
 
     def test_a_node_that_did_not_answer_still_goes_on(
         self, runner, placed_api, node_is_gone, api_repo
