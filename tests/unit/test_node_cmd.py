@@ -399,3 +399,89 @@ class TestANodeWhoseUserCannotResolve:
         row = json.loads(result.stdout)["nodes"]["second"][0]
         assert (row["status"], row["item"]) == ("fail", "config")
         assert fake_ssh.calls() == []
+
+
+class TestTheTextRowsAreTheContract:
+    def test_each_status_has_its_mark_and_the_items_align(
+        self, runner, tmp_config, fake_ssh
+    ):
+        fake_ssh.set_reply(
+            "bash -s",
+            stdout=(
+                "ok\ttmux\ttmux 3.4\n"
+                "warn\tlocale\tcharmap is POSIX\n"
+                "fail\tgit\tgit is not on PATH\n"
+            ),
+        )
+        out = _doctor(runner, _pool_file(tmp_config)).stdout.splitlines()
+        w = len("sync-daemon")
+        assert "  second  devino-second" in out
+        assert f"    + {'tmux'.ljust(w)}  tmux 3.4" in out
+        assert f"    ! {'locale'.ljust(w)}  charmap is POSIX" in out
+        assert f"    x {'git'.ljust(w)}  git is not on PATH" in out
+        assert (
+            f"    - {'snapshot'.ljust(w)}  no sessions snapshot from this node yet"
+        ) in out
+
+    def test_an_unknown_nick_is_on_stderr_not_stdout(
+        self, runner, tmp_config, fake_ssh
+    ):
+        result = _doctor(runner, _pool_file(tmp_config), "nope")
+        assert "not in settings.nodes" in result.stderr
+        assert "not in settings.nodes" not in result.stdout
+
+
+class TestTheUnreachableRow:
+    def test_it_quotes_ssh_s_last_stderr_line(self, runner, tmp_config, fake_ssh):
+        fake_ssh.set_reply(
+            "bash -s",
+            stderr=(
+                "Warning: banner\n"
+                "ssh: connect to host devino-second port 22: Connection refused\n"
+            ),
+            rc=255,
+        )
+        result = _doctor(runner, _pool_file(tmp_config))
+        assert "cannot reach amin@devino-second: ssh: connect to host" in (
+            result.stdout
+        )
+        assert "Warning: banner" not in result.stdout
+
+    def test_a_blank_stderr_falls_back_to_the_rc(self, runner, tmp_config, fake_ssh):
+        fake_ssh.set_reply("bash -s", stderr="\n\n", rc=255)
+        result = _doctor(runner, _pool_file(tmp_config))
+        assert "cannot reach amin@devino-second: rc=255" in result.stdout
+
+
+class TestTheSnapshotRow:
+    def test_each_node_reads_its_own_snapshot(self, tmp_config):
+        _snapshot("fifth", time.time())
+        cfg = load_config(_pool_file(tmp_config, ("second", "fifth")))
+        assert node_cmd.sync_lines(cfg, "second", now=time.time())[1].status == "skip"
+        assert node_cmd.sync_lines(cfg, "fifth", now=time.time())[1].status == "ok"
+
+    def test_a_slightly_future_snapshot_reads_zero_seconds_not_negative(
+        self, tmp_config
+    ):
+        now = time.time()
+        _snapshot("second", now + 5)
+        cfg = load_config(_pool_file(tmp_config))
+        assert node_cmd.sync_lines(cfg, "second", now=now)[1].detail == (
+            "pulled 0s ago"
+        )
+
+    def test_the_future_row_names_how_far_ahead(self, tmp_config):
+        now = time.time()
+        _snapshot("second", now + 120)
+        cfg = load_config(_pool_file(tmp_config))
+        assert "stamped 120s in the future" in (
+            node_cmd.sync_lines(cfg, "second", now=now)[1].detail
+        )
+
+    def test_the_doctor_reads_a_fresh_snapshot_as_ok(
+        self, runner, tmp_config, fake_ssh
+    ):
+        fake_ssh.set_reply("bash -s", stdout="ok\ttmux\ttmux 3.4\n")
+        _snapshot("second", time.time())
+        snap = _rows(_doctor(runner, _pool_file(tmp_config), "--json"))["snapshot"]
+        assert snap["status"] == "ok", snap
