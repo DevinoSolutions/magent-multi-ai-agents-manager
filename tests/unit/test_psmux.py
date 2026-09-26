@@ -25,6 +25,7 @@ import pytest
 
 from magent import psmux
 from magent.config import MagentConfig, ProjectConfig, Settings
+from tests.unit._fake_panes import fake_panes, pane_tree
 
 
 class _FakeCompleted:
@@ -541,6 +542,166 @@ class TestReviveSessions:
         monkeypatch.setattr(psmux, "find_psmux", lambda: None)
         cfg = _cfg([ProjectConfig(path="/a/api", tool="claude")])
         assert psmux.revive_sessions(cfg) == []
+
+
+class TestReviveNeverTypesIntoALiveAgent:
+    """``#{pane_current_command}`` is the pane's FOREGROUND DESCENDANT, not the
+    pane's own process. While Claude Code runs a tool it reads ``bash`` (the
+    Bash tool's child), ``grep``, an MCP server -- or ``pwsh`` -- with
+    claude.exe alive above it. Measured live: ``status --json`` called 4 of 31
+    sessions idle with claude.exe running in every one, and revive acted on the
+    same verdict by typing ``cmd /c claude --continue`` + Enter -- which, into a
+    live agent, is a submitted prompt.
+
+    Idle now needs positive proof: the pane's own process readable, and no
+    agent anywhere under it. Driven through the real ``revive_sessions`` with
+    only the pane probes and the process snapshot substituted.
+    """
+
+    def _revive(self, monkeypatch, *, foreground, pids, snapshot):
+        sent: list[tuple[str, tuple[str, ...]]] = []
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(psmux, "has_session", lambda name, psmux=None: True)
+
+        def _fake_send(name, *keys, target=None, psmux=None):
+            sent.append((name, keys))
+            return True
+
+        monkeypatch.setattr(psmux, "send_keys", _fake_send)
+        probes = fake_panes(
+            monkeypatch, foreground=foreground, pids=pids, snapshot=snapshot
+        )
+        cfg = _cfg([ProjectConfig(path=f"/a/{n}", tool="claude") for n in foreground])
+        return psmux.revive_sessions(cfg), sent, probes
+
+    @pytest.mark.parametrize(
+        "foreground", ["bash", "pwsh", "grep", "github-mcp-server"]
+    )
+    def test_a_tool_in_the_foreground_is_not_a_dead_agent(
+        self, monkeypatch, foreground
+    ):
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": foreground},
+            pids={"api": 100},
+            snapshot=pane_tree(100, "cmd.exe", "claude.exe", f"{foreground}.exe"),
+        )
+        assert revived == []
+        assert sent == []
+
+    @pytest.mark.parametrize(
+        "chain",
+        [
+            # A human typed `claude` at the pane's prompt: depth 1, no cmd.
+            ("claude.exe", "bash.exe"),
+            # An npm-installed Claude Code runs as node, not claude.exe.
+            ("cmd.exe", "node.exe", "bash.exe"),
+            # Codex: its node shim over the native binary.
+            ("cmd.exe", "node.exe", "codex.exe", "pwsh.exe"),
+            ("cmd.exe", "codex.exe", "bash.exe"),
+        ],
+    )
+    def test_the_agent_is_found_at_any_depth_under_any_launcher(
+        self, monkeypatch, chain
+    ):
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": chain[-1].removesuffix(".exe")},
+            pids={"api": 100},
+            snapshot=pane_tree(100, *chain),
+        )
+        assert revived == []
+        assert sent == []
+
+    def test_a_pane_with_no_agent_under_it_is_still_revived(self, monkeypatch):
+        # The case revive exists for: the agent exited and the pane's pwsh is
+        # back at its prompt. A live agent in ANOTHER pane of the same snapshot
+        # is not this pane's agent.
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": "pwsh", "web": "bash"},
+            pids={"api": 100, "web": 200},
+            snapshot=[
+                *pane_tree(100),
+                *pane_tree(200, "cmd.exe", "claude.exe", "bash.exe"),
+            ],
+        )
+        assert revived == ["api"]
+        assert [name for name, _keys in sent] == ["api"]
+        assert "claude --continue" in sent[0][1][0]
+        assert sent[0][1][-1] == "Enter"
+
+    def test_a_program_in_the_foreground_is_not_idle_even_with_no_agent(
+        self, monkeypatch
+    ):
+        # The foreground reading stays a NECESSARY condition: a pane running a
+        # user's own program (no agent anywhere) is not a pane at its prompt,
+        # and typing a command into that program's stdin is no better.
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": "python"},
+            pids={"api": 100},
+            snapshot=pane_tree(100, "python.exe"),
+        )
+        assert revived == []
+        assert sent == []
+
+    def test_an_unreadable_pane_pid_is_not_idle(self, monkeypatch):
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": None},
+            snapshot=pane_tree(100),
+        )
+        assert revived == []
+        assert sent == []
+
+    def test_a_failed_process_snapshot_is_not_idle(self, monkeypatch):
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=None,
+        )
+        assert revived == []
+        assert sent == []
+
+    def test_a_pane_process_gone_from_the_snapshot_is_not_idle(self, monkeypatch):
+        # The pid was read, then the process was gone by the snapshot: nothing
+        # is known about that pane any more.
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=pane_tree(300),
+        )
+        assert revived == []
+        assert sent == []
+
+    def test_a_pane_pid_that_is_not_a_shell_is_not_idle(self, monkeypatch):
+        # A pid that names something other than the pane's shell (reused
+        # between the read and the snapshot) says nothing about the pane.
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=[("notepad.exe", 100, 4)],
+        )
+        assert revived == []
+        assert sent == []
+
+    def test_one_pid_fan_out_and_one_snapshot_serve_the_whole_round(self, monkeypatch):
+        names = ["api", "web", "docs"]
+        pids = {n: 100 * (i + 1) for i, n in enumerate(names)}
+        revived, _, probes = self._revive(
+            monkeypatch,
+            foreground=dict.fromkeys(names, "pwsh"),
+            pids=pids,
+            snapshot=[e for pid in pids.values() for e in pane_tree(pid)],
+        )
+        assert sorted(revived) == sorted(names)
+        assert len(probes.snapshots) == 1
+        assert [sorted(p) for p in probes.pid_probes] == [sorted(names)]
 
 
 class TestHasSessionTimeout:

@@ -18,6 +18,7 @@ import pytest
 
 from magent import agent_state, cli
 from magent.cli import status as status_mod
+from tests.unit._fake_panes import fake_process_side, pane_tree
 
 
 def _no_psmux(monkeypatch):
@@ -51,12 +52,26 @@ def _listener(monkeypatch, state):
     monkeypatch.setattr("magent.cli.status._listener_state", lambda upload: state)
 
 
-def _fake_psmux(monkeypatch, up, projects=None, apps=None, down=()):
+def _fake_psmux(
+    monkeypatch,
+    up,
+    projects=None,
+    apps=None,
+    down=(),
+    *,
+    pids=None,
+    trees=None,
+    snapshot_fails=False,
+):
     """Pretend psmux reports `up` live sessions whose panes run `apps`.
 
-    Never touches a real psmux server: `psmux_status` (the liveness fan-out)
-    and `pane_current_commands` (the foreground-app fan-out) are both faked, so
-    this machine's ~40 real sessions are never probed.
+    Never touches a real psmux server or the real process list: `psmux_status`
+    (the liveness fan-out), `pane_current_commands` (the foreground-app
+    fan-out), the pane-pid fan-out and the process snapshot are all faked, so
+    this machine's ~40 real sessions are never probed. Each pane is a pwsh with
+    `trees[name]` running under it -- nothing by default, so a "pwsh" app
+    really is a pane at its prompt; `pids` overrides a pane's pid (None =
+    unreadable) and `snapshot_fails` makes the snapshot fail.
     """
     monkeypatch.setattr(
         "magent.launch.psmux_status",
@@ -66,6 +81,25 @@ def _fake_psmux(monkeypatch, up, projects=None, apps=None, down=()):
     monkeypatch.setattr(
         "magent.psmux.pane_current_commands",
         lambda names, psmux=None: {n: (apps or {}).get(n, "") for n in names},
+    )
+    # The Session-0 scan reads the same (now fake) process snapshot and would
+    # ask the real OS about each fake pid's logon session -- see `_no_psmux`.
+    monkeypatch.setattr("magent.cli.status.session0_server_pids", list)
+    pane_pid = {
+        str(u.get("session") or u.get("name")): 100 * (i + 1) for i, u in enumerate(up)
+    }
+    pane_pid.update(pids or {})
+    fake_process_side(
+        monkeypatch,
+        pids=pane_pid,
+        snapshot=None
+        if snapshot_fails
+        else [
+            entry
+            for sid, pid in pane_pid.items()
+            if pid is not None
+            for entry in pane_tree(pid, *(trees or {}).get(sid, ()))
+        ],
     )
 
 
@@ -634,6 +668,93 @@ class TestPsmuxSessionSection:
         result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
 
         assert result.exit_code == 0
+
+
+class TestIdleColumnNeedsPositiveProof:
+    """The idle column is the same verdict revive acts on, so it carries the
+    same proof: psmux's foreground reading is the pane's foreground DESCENDANT,
+    and it read ``bash`` for 4 of 31 live sessions whose claude.exe was running
+    a tool. A row says idle only when the pane's own process was read and no
+    agent runs anywhere under it."""
+
+    def _rows(self, runner, tmp_config, tmp_path, monkeypatch, apps, **panes):
+        _both_off(monkeypatch)
+        up, projects = [], []
+        for sid in apps:
+            (tmp_path / sid).mkdir()
+            up.append({"name": sid, "session": sid, "group": None})
+            projects.append(
+                {"name": sid, "session": sid, "resolved": str(tmp_path / sid)}
+            )
+        _fake_psmux(monkeypatch, up, projects, apps, **panes)
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
+
+        assert result.exit_code == 0
+        return {r["name"]: r for r in json.loads(result.stdout)["psmux_sessions"]}
+
+    @pytest.mark.parametrize("app", ["bash", "pwsh"])
+    def test_a_live_agent_under_a_shell_foreground_is_not_idle(
+        self, runner, tmp_config, tmp_path, monkeypatch, app
+    ):
+        rows = self._rows(
+            runner,
+            tmp_config,
+            tmp_path,
+            monkeypatch,
+            {"api": app, "web": "pwsh"},
+            trees={"api": ("cmd.exe", "claude.exe", f"{app}.exe")},
+        )
+        assert rows["api"] == {"name": "api", "app": app, "idle": False, "state": ""}
+        # The pane next to it has no agent under it: that one IS idle.
+        assert rows["web"]["idle"] is True
+
+    def test_the_human_table_shows_the_tool_not_idle(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _both_off(monkeypatch)
+        (tmp_path / "api").mkdir()
+        _fake_psmux(
+            monkeypatch,
+            [{"name": "api", "session": "api", "group": None}],
+            [{"name": "api", "session": "api", "resolved": str(tmp_path / "api")}],
+            {"api": "bash"},
+            trees={"api": ("cmd.exe", "claude.exe", "bash.exe")},
+        )
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+
+        assert result.exit_code == 0
+        assert "idle" not in result.output
+        assert "bash" in result.output
+
+    def test_an_unreadable_pane_pid_is_not_idle(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        rows = self._rows(
+            runner,
+            tmp_config,
+            tmp_path,
+            monkeypatch,
+            {"api": "pwsh"},
+            pids={"api": None},
+        )
+        assert rows["api"]["idle"] is False
+
+    def test_a_failed_process_snapshot_is_not_idle(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        rows = self._rows(
+            runner,
+            tmp_config,
+            tmp_path,
+            monkeypatch,
+            {"api": "pwsh"},
+            snapshot_fails=True,
+        )
+        assert rows["api"]["idle"] is False
 
 
 class TestPsmuxSessionsJson:

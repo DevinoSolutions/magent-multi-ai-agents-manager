@@ -6,6 +6,7 @@ import pytest
 from magent.platform import Platform
 from magent.platform.linux import LinuxPlatform
 from magent.platform.macos import MacOSPlatform
+from tests.unit._fake_panes import fake_process_side, pane_tree
 
 
 class _Bare(Platform):
@@ -245,14 +246,23 @@ def _drive_bring_up(
     create_failures: set[str] | None = None,
     envs: list[object] | None = None,
     spawners: list[str] | None = None,
+    pane_trees: dict[str, tuple[str, ...]] | None = None,
+    pane_pids: dict[str, int | None] | None = None,
+    snapshot_fails: bool = False,
+    snapshots: list[int] | None = None,
 ):
     """Drive a real ``launch_psmux_session`` over a fully faked psmux seam.
 
     Shared by the decoration pins and the send-keys verification pins below:
     both observe the same bring-up, so a change to one can't silently drift
-    away from the other. Nothing here reads the ambient PATH or waits on real
-    time -- `code_on_path`, `subprocess.Popen`, the pane probe and
-    `time.sleep` are all replaced.
+    away from the other. Nothing here reads the ambient PATH, the machine's
+    process list, or waits on real time -- `code_on_path`, `subprocess.Popen`,
+    the pane probes, the process snapshot and `time.sleep` are all replaced.
+
+    Each pane is a pwsh at a pid of its own with `pane_trees[name]` running
+    under it (nothing by default, so a "pwsh" reading really is a pane at its
+    prompt); `pane_pids` overrides a pane's pid (None = unreadable) and
+    `snapshot_fails` makes the process snapshot fail.
     """
     from magent.platform import PsmuxWindowOpts
     from magent.platform.windows import WindowsPlatform
@@ -324,6 +334,22 @@ def _drive_bring_up(
     monkeypatch.setattr(
         "magent.platform.windows.pane_current_commands", _fake_pane_commands
     )
+    names = windows or ["api"]
+    pids: dict[str, int | None] = {n: 100 * (i + 1) for i, n in enumerate(names)}
+    pids.update(pane_pids or {})
+    trees = pane_trees or {}
+    pane_side = fake_process_side(
+        monkeypatch,
+        pids=pids,
+        snapshot=None
+        if snapshot_fails
+        else [
+            entry
+            for n, pid in pids.items()
+            if pid is not None
+            for entry in pane_tree(pid, *trees.get(n, ()))
+        ],
+    )
     # The inter-batch settle pause is real seconds; nothing here waits on
     # a real process, so it only slows the multi-batch case down.
     monkeypatch.setattr("magent.platform.windows.time.sleep", lambda _s: None)
@@ -335,10 +361,11 @@ def _drive_bring_up(
         lambda: (probes.append(1), code_hint)[1],
     )
 
-    names = windows or ["api"]
     WindowsPlatform().launch_psmux_session(
         [PsmuxWindowOpts(window_name=n, cwd=f"/a/{n}", command="claude") for n in names]
     )
+    if snapshots is not None:
+        snapshots.extend(pane_side.snapshots)
     return calls, probes
 
 
@@ -540,6 +567,44 @@ class TestWindowsSendKeysVerification:
         # same posture as psmux.agent_idle, which is False on an empty read.
         calls, _ = _drive_bring_up(monkeypatch, pane_states={"api": [""]})
         assert len(_sends_for(calls, "api")) == 1
+
+    @pytest.mark.parametrize("foreground", ["bash", "pwsh"])
+    def test_an_agent_running_a_tool_is_never_re_sent(self, monkeypatch, foreground):
+        # The foreground reading is the pane's foreground DESCENDANT: an agent
+        # that is already up and running its Bash tool (or a pwsh child) reads
+        # as a bare shell while claude.exe is alive under the pane. A re-send
+        # there types the agent command into the live agent's input box.
+        calls, _ = _drive_bring_up(
+            monkeypatch,
+            pane_states={"api": [foreground]},
+            pane_trees={"api": ("cmd.exe", "claude.exe", f"{foreground}.exe")},
+        )
+        assert len(_sends_for(calls, "api")) == 1
+
+    def test_an_unreadable_pane_pid_is_never_re_sent(self, monkeypatch):
+        calls, _ = _drive_bring_up(
+            monkeypatch, pane_states={"api": ["pwsh"]}, pane_pids={"api": None}
+        )
+        assert len(_sends_for(calls, "api")) == 1
+
+    def test_a_failed_process_snapshot_is_never_re_sent(self, monkeypatch):
+        calls, _ = _drive_bring_up(
+            monkeypatch, pane_states={"api": ["pwsh"]}, snapshot_fails=True
+        )
+        assert len(_sends_for(calls, "api")) == 1
+
+    def test_each_probe_round_takes_one_snapshot_not_one_per_pane(self, monkeypatch):
+        from magent.platform.windows import _SEND_MAX_ATTEMPTS
+
+        snapshots: list[int] = []
+        _drive_bring_up(
+            monkeypatch,
+            windows=["api", "web"],
+            pane_states={"api": ["pwsh"], "web": ["pwsh"]},
+            snapshots=snapshots,
+        )
+        # Both panes stay at their prompt, so every round probes both of them.
+        assert len(snapshots) == _SEND_MAX_ATTEMPTS
 
     def test_the_batch_is_probed_in_one_fan_out_not_per_session(self, monkeypatch):
         # One probe call carrying every pending name -- not one call per
