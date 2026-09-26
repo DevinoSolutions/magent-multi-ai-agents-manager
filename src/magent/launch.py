@@ -2029,8 +2029,14 @@ def _folder_clashes(
         text = nodes.remote_root_collision_text(group)
         for recipe in group:
             clash[recipe.sid] = text
-            if unreadable is not None and all(
-                nodes.on_unknown_node(other) for other in group if other is not recipe
+            if (
+                unreadable is not None
+                and not nodes.on_unknown_node(recipe)
+                and all(
+                    nodes.on_unknown_node(other)
+                    for other in group
+                    if other is not recipe
+                )
             ):
                 # Its only rivals are auto projects whose node the map would
                 # name: no rename is owed, the map is -- a holder is refused
