@@ -1532,6 +1532,31 @@ class TestTheSkillsWalkKnowsASecretWhenItSeesOne:
         )
         assert "DECOY" not in repr(scope)
 
+    def test_a_name_holding_the_marker_is_never_echoed_nor_read(
+        self, tmp_path, monkeypatch
+    ):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "sk-ant-api03-DECOY/SKILL.md")
+        _skill(skills, "s/sk-ant-oat01-DECOY.md")
+        _skill(skills, "s/SKILL.md")
+        counts = TestTheSkillsWalkReadsOnlyBoundedRegularFiles._count_reads(monkeypatch)
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == (
+            "skills/(a name holding one): holds a Claude credential, never shipped",
+            "skills/(a name holding one): holds a Claude credential, never shipped",
+        )
+        assert "DECOY" not in repr(scope)
+        assert counts == [len(b"# skill\n")]  # only s/SKILL.md was opened
+
+    def test_a_dangling_link_is_a_note(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _link_file(skills / "gone", tmp_path / "nowhere")
+        scope = nodes.user_scope(home)
+        assert scope.skills == ()
+        assert len(scope.notes) == 1
+        assert scope.notes[0].startswith("skills/gone: unreadable (")
+
     def test_azure_is_a_secrets_folder(self, tmp_path):
         home, skills = _skills_home(tmp_path)
         _skill(skills, "s/SKILL.md")
@@ -1644,6 +1669,34 @@ class TestUserScopeDigests:
 
     def test_notes_are_not_content(self):
         assert _scope(notes=("x",)).digests() == _scope().digests()
+
+    def test_the_digests_of_a_fixed_scope_are_pinned(self):
+        # node_apply compares these against its store: a changed recipe
+        # re-applies every item on every node, so the recipe is pinned here.
+        scope = _scope(
+            settings={"model": "opus"},
+            mcp_servers={"docs": {"type": "http", "url": "https://d.example/mcp"}},
+            mcp_oauth={"docs|0": {"serverName": "docs", "accessToken": "a"}},
+            plugins=("p@m",),
+            marketplaces={"m": "o/r"},
+            skills=(
+                nodes.SkillFile(path="s/SKILL.md", data=b"hi\n", executable=False),
+            ),
+        )
+        assert scope.digests() == {
+            "settings": "3b6166240df66a70606cf24065eb39d43048ce465a20deb9a7f65f070e0a674f",
+            "mcp": "dfa62cd94f1032a3199bf6e40bf7681d825a23078b904a69c6278d30a8e0e809",
+            "mcp_oauth": "b2b19799465ba10dd77c783cc3eacf7a11af103fe57791e1e23b068f0eef1917",
+            "plugins": "85b832210adf34d3128cac1730d9be0882d43ca2b8590b2a412ade40c8cee3d8",
+            "skills": "451484a8c8fc1af1ef8995411aaf485ef15f4aec1e192236008f33ef9e80b4d2",
+        }
+
+    def test_flipping_the_exec_bit_changes_the_skills_digest(self):
+        def digest(executable: bool) -> str:
+            skill = nodes.SkillFile(path="s/run.sh", data=b"x", executable=executable)
+            return _scope(skills=(skill,)).digests()["skills"]
+
+        assert digest(True) != digest(False)
 
 
 NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
