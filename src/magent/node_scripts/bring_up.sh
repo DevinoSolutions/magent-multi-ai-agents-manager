@@ -32,13 +32,19 @@ decorate() {
   bash "$1" || echo "magent: status-line decoration failed (the session is up)" >&2
 }
 
+# Every C0 control character is escaped (\u00XX), so the result line always
+# parses whatever a path holds.
 json_str() {
-  local s=$1
+  local s=$1 c ch esc
   s=${s//\\/\\\\}
   s=${s//\"/\\\"}
-  s=${s//$'\t'/\\t}
-  s=${s//$'\n'/\\n}
-  s=${s//$'\r'/\\r}
+  if [[ $s == *[[:cntrl:]]* ]]; then
+    for ((c = 1; c < 32; c++)); do
+      printf -v ch "\\$(printf %03o "$c")"
+      printf -v esc '\\u%04x' "$c"
+      s=${s//"$ch"/$esc}
+    done
+  fi
   printf '"%s"' "$s"
 }
 
@@ -100,49 +106,97 @@ need_tmux() {
   fi
 }
 
+# A url may carry user:token@; no message ever shows it.
+redact_url() {
+  local u=$1
+  if [[ $u =~ ^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@(.*)$ ]]; then
+    u="${BASH_REMATCH[1]}***@${BASH_REMATCH[2]}"
+  fi
+  printf '%s' "$u"
+}
+
 update_repo() {
-  local url=$1 branch=$2 dir=$3
+  local url=$1 branch=$2 dir=$3 st refs head current
+  local stuck="$dir: could not fast-forward (local changes or divergence): $branch to origin/$branch; reconcile it on the node"
   if [ -d "$dir/.git" ]; then
-    if [ "$allow" != 1 ] && [ -n "$(git -C "$dir" status --porcelain --untracked-files=no)" ]; then
-      die 3 "$dir has uncommitted changes on the node; commit or discard them there, or pass --allow-dirty"
+    if [ "$allow" != 1 ]; then
+      st=$(git -C "$dir" status --porcelain --untracked-files=no) || die 5 "git status failed in $dir"
+      [ -z "$st" ] || die 3 "$dir has uncommitted changes on the node; commit or discard them there, or pass --allow-dirty"
     fi
     git -C "$dir" fetch -q origin -- "$branch" || die 5 "git fetch failed in $dir"
+    # Commits on a detached HEAD that no branch or tag holds would be orphaned
+    # by the checkout below: refused whatever --allow-dirty says, losing
+    # commits is never allowed. refs/stash does not count -- a later `git
+    # stash drop` would lose the commit. A HEAD a branch or tag holds is
+    # simply brought back.
+    if ! current=$(git -C "$dir" symbolic-ref -q --short HEAD); then
+      refs=$(git -C "$dir" for-each-ref --contains HEAD refs/heads refs/remotes refs/tags) ||
+        die 5 "git for-each-ref failed in $dir"
+      if [ -z "$refs" ]; then
+        head=$(git -C "$dir" rev-parse --short HEAD) || die 5 "no HEAD in $dir"
+        die 3 "$dir is on a detached HEAD at $head, a commit no branch or tag holds; put it on a branch there (git branch <name> $head) first"
+      fi
+    elif [ "$current" != "$branch" ]; then
+      echo "magent: $dir was on $current; switching it to $branch" >&2
+    fi
     if git -C "$dir" rev-parse -q --verify "refs/heads/$branch" >/dev/null; then
+      # Before the checkout: a refusal leaves the tree on its own branch.
+      git -C "$dir" merge-base --is-ancestor "refs/heads/$branch" "refs/remotes/origin/$branch" || die 5 "$stuck"
       git -C "$dir" checkout -q "$branch" -- || die 5 "git checkout $branch failed in $dir"
-      git -C "$dir" merge -q --ff-only "origin/$branch" ||
-        die 5 "$dir: $branch on the node has diverged from origin; reconcile it there"
+      git -C "$dir" merge -q --ff-only "origin/$branch" || die 5 "$stuck"
     else
       git -C "$dir" checkout -q -b "$branch" --track "origin/$branch" ||
         die 5 "git checkout $branch failed in $dir"
     fi
   else
     mkdir -p -- "$(dirname -- "$dir")" || die 5 "cannot create the parent of $dir"
-    git clone -q --branch "$branch" -- "$url" "$dir" || die 5 "git clone of $url failed"
+    git clone -q --branch "$branch" -- "$url" "$dir" || die 5 "git clone of $(redact_url "$url") failed"
   fi
   commits[$dir]=$(git -C "$dir" rev-parse HEAD) || die 5 "no HEAD in $dir"
 }
 
+# `capture VAR cmd...`: VAR = cmd's stdout minus the ONE newline realpath,
+# dirname and mktemp end it with. A bare $(...) strips EVERY trailing newline,
+# and a path may end in one -- `.env<LF>` would be resolved as `.env`.
+capture() {
+  local out
+  out=$("${@:2}" && printf x) || return 1
+  printf -v "$1" '%s' "${out%?x}"
+}
+
 # Copy every file under $1 into the EXISTING folder $2, mode 600, and set
-# `copied` to their relative names. Each destination is resolved first, so a
-# link already on the node (a folder or a file pointing out of $2) is refused,
-# never written through; one that stays inside $2 is followed.
+# `copied` to their relative names. Every name is checked before anything is
+# written. Each destination is resolved first, so a link already on the node
+# (a folder or a file pointing out of $2) is refused, never written through;
+# one that stays inside $2 is followed. A file is written to a fresh 0600 temp
+# beside its target and renamed over it: an old 0644 file is replaced, never
+# rewritten in place under a reader that holds it open. Folders created on the
+# way are 0700 (umask 077) -- intended containment, not an accident.
 copy_tree() {
-  local src=$1 dest=$2 base rel target mask
+  local src=$1 dest=$2 base rel target dir tmp mask
+  local -a rels=()
   copied=()
   [ -d "$src" ] || return 0
-  base=$(realpath -e -- "$dest") || die 5 "cannot resolve $dest"
-  mask=$(umask)
-  umask 077
   while IFS= read -r -d '' rel; do
     rel=${rel#./}
-    target=$(realpath -m -- "$dest/$rel") || die 5 "cannot resolve $dest/$rel"
+    [[ $rel != *[[:cntrl:]]* ]] || die 2 "payload member $(printf %q "$rel") has a control character in its name"
+    rels+=("$rel")
+  done < <(cd -- "$src" && find . -type f -print0 | sort -z)
+  capture base realpath -e -- "$dest" || die 5 "cannot resolve $dest"
+  mask=$(umask)
+  umask 077
+  for rel in "${rels[@]}"; do
+    capture target realpath -m -- "$dest/$rel" || die 5 "cannot resolve $dest/$rel"
     [[ $target == "$base"/* ]] || die 5 "$dest/$rel resolves outside $dest ($target); not writing through a link"
     [ ! -d "$target" ] || die 5 "$dest/$rel is a folder on the node"
-    mkdir -p -- "$(dirname -- "$target")" || die 5 "cannot create a folder for $rel"
-    cp -- "$src/$rel" "$target" || die 5 "cannot write $dest/$rel"
-    chmod 600 -- "$target" || die 5 "cannot chmod $dest/$rel"
+    capture dir dirname -- "$target" || die 5 "cannot resolve $dest/$rel"
+    mkdir -p -- "$dir" || die 5 "cannot create a folder for $rel"
+    capture tmp mktemp -- "$dir/.magent-ship.XXXXXX" || die 5 "cannot write $dest/$rel"
+    # mktemp creates it 0600 whatever the umask; cp into it keeps that mode.
+    cp -- "$src/$rel" "$tmp" || { rm -f -- "$tmp"; die 5 "cannot write $dest/$rel"; }
+    mv -f -- "$tmp" "$target" || { rm -f -- "$tmp"; die 5 "cannot write $dest/$rel"; }
     copied+=("$rel")
-  done < <(cd -- "$src" && find . -type f -print0 | sort -z)
+  done
   umask "$mask"
 }
 
@@ -199,7 +253,7 @@ main() {
     next_token dir
     # A token git could read as an option (--upload-pack=...) is refused
     # here, before any git runs; the calls below also end their options.
-    [[ $url != -* ]] || die 2 "a repo url may not start with -: $url"
+    [[ $url != -* ]] || die 2 "a repo url may not start with -: $(redact_url "$url")"
     [[ $branch != -* ]] || die 2 "a branch may not start with -: $branch"
     [[ $dir == /* ]] || die 2 "a repo folder must be absolute: $dir"
     urls+=("$url")
@@ -242,7 +296,7 @@ main() {
   fi
   # sshd hands a non-login command no locale; the agent's UI needs UTF-8
   # (DECISION-26 viii). `new-session -e` is tmux >= 3.2, checked above.
-  mux new-session -d -e LANG=C.UTF-8 -s "$sid" -c "$root" "${cmd[@]}" || die 4 "tmux could not start session $sid"
+  mux new-session -d -e LANG=C.UTF-8 -s "$sid" -c "$root" -- "${cmd[@]}" || die 4 "tmux could not start session $sid"
   decorate "$unpacked/decorate"
   mux has-session -t "=$sid" 2>/dev/null || die 4 "session $sid exited as soon as it started"
   emit false

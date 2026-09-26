@@ -1299,13 +1299,16 @@ def _script_run(mode: str) -> str:
 
 
 @pytest.fixture
-def node_home(fake_ssh, monkeypatch):
-    # Wall-clock bounds sized for a real node, not for the fake ssh shim, which
-    # is a whole Python interpreter per call: under load a 10s probe expired
-    # before the shim answered (test_push_mode_ships_the_files_and_no_memory
-    # failed once that way). A test about the bounds sets its own.
+def patient_probe(monkeypatch):
+    """The HOME probe's budget in these tests only. The fake ssh is a Python
+    shim; on a loaded Windows box its start alone has overrun the product's
+    10s (a green test failing as "timed out"). What a probe timeout DOES is
+    pinned elsewhere with its own override."""
     monkeypatch.setattr(remote_mux, "PROBE_TIMEOUT_S", 60.0)
-    monkeypatch.setattr(remote_mux, "SCRIPT_TIMEOUT_S", 60.0)
+
+
+@pytest.fixture
+def node_home(fake_ssh, monkeypatch, patient_probe):
     monkeypatch.setattr(psmux, "code_on_path", lambda: False)
     fake_ssh.set_reply("printenv HOME", stdout="/home/amin\n")
     return fake_ssh
@@ -1412,7 +1415,7 @@ class TestOneConnectionBringsAProjectUp:
         assert remote_mux.bring_up(NODE, _recipe(tmp_path)).attached_existing is True
 
     def test_a_home_that_is_not_absolute_stops_before_the_script(
-        self, fake_ssh, tmp_path
+        self, fake_ssh, patient_probe, tmp_path
     ):
         fake_ssh.set_reply("printenv HOME", stdout="\n")
         with pytest.raises(RemoteError, match="HOME"):
@@ -1440,7 +1443,9 @@ class TestOneConnectionBringsAProjectUp:
         with pytest.raises(RemoteError, match="not a bring-up result"):
             remote_mux.bring_up(NODE, _recipe(tmp_path))
 
-    def test_a_home_refusal_names_the_probe_that_ran(self, fake_ssh, tmp_path):
+    def test_a_home_refusal_names_the_probe_that_ran(
+        self, fake_ssh, patient_probe, tmp_path
+    ):
         # RemoteError's law: command_redacted is what RAN, as _run_shown says it.
         fake_ssh.set_reply("printenv HOME", stdout="\n")
         with pytest.raises(RemoteError) as info:
@@ -1466,6 +1471,21 @@ class TestOneConnectionBringsAProjectUp:
             _script_run("up"),
             f"<stdin: {len(call.stdin)} bytes>",
         )
+
+    def test_a_delivered_payload_is_framed_once(self, node_home, tmp_path, monkeypatch):
+        # The frame is a copy of the payload (up to 64 MiB): the run builds
+        # it, and a SUCCESS never builds a second one just to name it.
+        framed: list[str] = []
+        real = remote_mux._script_call
+
+        def spy(script, args, stdin):
+            framed.append(script)
+            return real(script, args, stdin)
+
+        monkeypatch.setattr(remote_mux, "_script_call", spy)
+        _answers(node_home)
+        remote_mux.bring_up(NODE, _recipe(tmp_path))
+        assert framed == ["bring_up"]
 
     def test_a_nul_in_a_command_is_refused(self, node_home, tmp_path):
         with pytest.raises(ValueError, match="NUL"):
@@ -1523,6 +1543,13 @@ class TestTheBringUpStaysInsideItsFolders:
         # A POSIX file name may carry a literal backslash; once mapped to '/',
         # `a\..\..\x` would climb out of the project on the node.
         with pytest.raises(ValueError):
+            remote_mux._archive_name(rel)
+
+    @pytest.mark.parametrize("rel", [".env\n", "a\nb/.env", "a\x1bb", "tab\there"])
+    def test_an_archive_name_with_a_control_character_is_refused(self, rel):
+        # The node's shell strips trailing newlines in $(...): `.env\n` would
+        # be resolved as `.env`, beside whatever link the node has there.
+        with pytest.raises(ValueError, match="control character"):
             remote_mux._archive_name(rel)
 
     @pytest.mark.parametrize("root", ["magent/api", "-oProxyCommand=x/api"])
@@ -1702,6 +1729,125 @@ class TestAPushFileIsReadAsVetted:
         assert remote_mux.PAYLOAD_MAX_BYTES == 64 * 1024 * 1024
 
 
+_STAT_FIELDS = (
+    "st_mode",
+    "st_ino",
+    "st_dev",
+    "st_nlink",
+    "st_uid",
+    "st_gid",
+    "st_size",
+    "st_atime",
+    "st_mtime",
+    "st_ctime",
+)
+
+
+def _lstat_lies(
+    monkeypatch, path: Path, *, like: Path | None = None, **changes: int
+) -> None:
+    """``os.lstat(path)`` answers ``like``'s stat (default: ``path``'s own,
+    through any link) with ``changes`` -- the file as it looked BEFORE a swap,
+    so each pin reaches the one guard that runs after the lstat. A call is
+    matched by abspath, never realpath (posixpath.realpath calls os.lstat
+    itself), against both names ``path`` goes by: its own, and the resolved
+    one a caller may have vetted it under."""
+    real_lstat = os.lstat
+    want = {
+        os.path.normcase(os.path.abspath(path)),
+        os.path.normcase(os.path.realpath(path)),
+    }
+    base = os.stat(like if like is not None else path)
+    lie = os.stat_result(
+        [changes.get(name, getattr(base, name)) for name in _STAT_FIELDS]
+    )
+
+    def fake(p, *args, **kwargs):
+        if os.path.normcase(os.path.abspath(os.fspath(p))) in want:
+            return lie
+        return real_lstat(p, *args, **kwargs)
+
+    monkeypatch.setattr(remote_mux.os, "lstat", fake)
+
+
+class TestTheReadSurvivesASwap:
+    """Each guard AFTER the lstat, pinned by an lstat that lies -- the file as
+    it was vetted, before something was swapped in under the same name."""
+
+    @needs_fifo
+    def test_a_fifo_the_lstat_called_regular_is_refused_not_read(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        recipe = _recipe(tmp_path)
+        assert recipe.local_root is not None
+        fifo = recipe.local_root / "pipe.env"
+        os.mkfifo(fifo)
+        _lstat_lies(monkeypatch, fifo, st_mode=stat.S_IFREG | 0o600, st_size=1)
+        # O_NONBLOCK keeps the open from waiting for a writer; fstat refuses.
+        raised = _in_thread(
+            lambda: remote_mux.bring_up(
+                NODE, dataclasses.replace(recipe, push_files=(fifo,))
+            )
+        )
+        assert isinstance(raised, ValueError)
+        assert "not a regular file" in str(raised)
+        assert node_home.calls() == []
+
+    def test_a_file_that_grew_after_the_lstat_is_refused(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        recipe = _recipe(tmp_path)  # .env is 15 bytes
+        monkeypatch.setattr(remote_mux, "PUSH_FILE_MAX_BYTES", 8)
+        _lstat_lies(monkeypatch, recipe.push_files[0], st_size=4)
+        with pytest.raises(ValueError, match="grew past the cap of 8") as info:
+            remote_mux.bring_up(NODE, recipe)
+        assert ".env" in str(info.value)
+        assert node_home.calls() == []
+
+    def test_a_file_swapped_between_lstat_and_open_is_refused(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        recipe = _recipe(tmp_path)
+        env = recipe.push_files[0]
+        _lstat_lies(monkeypatch, env, st_ino=os.stat(env).st_ino + 1)
+        with pytest.raises(ValueError, match="changed") as info:
+            remote_mux.bring_up(NODE, recipe)
+        assert ".env" in str(info.value)
+        assert node_home.calls() == []
+
+    @pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="POSIX O_NOFOLLOW")
+    def test_a_link_the_lstat_called_regular_is_not_opened(self, tmp_path, monkeypatch):
+        # The read itself: whatever vetted the path, the open never follows a
+        # final-component link, even one the lstat reported as the file.
+        secret = tmp_path / "id_ed25519"
+        secret.write_bytes(b"TOPSECRET\n")
+        link = tmp_path / "leak.md"
+        _link_or_skip(link, secret)
+        _lstat_lies(monkeypatch, link, like=secret)
+        with pytest.raises(OSError):
+            remote_mux._read_regular(link, cap=100, what="memory file leak.md")
+
+    def test_a_memory_link_the_lstat_called_regular_never_ships(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        # is_symlink trusts the lying lstat; what stops the link is the
+        # memory walk's realpath containment (Windows, where there is no
+        # O_NOFOLLOW) or the open (POSIX) -- never nothing.
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        secret = tmp_path / "id_ed25519"
+        secret.write_bytes(b"TOPSECRET\n")
+        leak = recipe.memory_dir / "leak.md"
+        _link_or_skip(leak, secret)
+        _lstat_lies(monkeypatch, leak, like=secret)
+        _answers(node_home)
+        remote_mux.bring_up(NODE, recipe)
+        stdin = node_home.calls()[1].stdin
+        assert "memory/leak.md" not in _members(stdin)
+        assert b"TOPSECRET" not in stdin
+        assert "leak.md" in _nodes_log()
+
+
 class TestWhatTheNodeAnswersIsVetted:
     """The node's words -- its $HOME, the result's cwd -- are data, and the
     local repo's url/branch are argv on the node: none may carry a control
@@ -1711,7 +1857,7 @@ class TestWhatTheNodeAnswersIsVetted:
         "answer", ["/home/amin\nWelcome!\n", "/home/a\tmin\n", "/home/amin\r\n"]
     )
     def test_a_home_with_a_control_character_is_refused(
-        self, fake_ssh, tmp_path, answer
+        self, fake_ssh, patient_probe, tmp_path, answer
     ):
         fake_ssh.set_reply("printenv HOME", stdout=answer)
         with pytest.raises(RemoteError, match="HOME") as info:
@@ -1807,6 +1953,20 @@ def _link_or_skip(link: Path, target: Path, *, directory: bool = False) -> None:
         pytest.skip("this account cannot create symlinks")
 
 
+needs_junctions = pytest.mark.skipif(
+    sys.platform != "win32", reason="NTFS junctions are Windows-only"
+)
+
+
+def _junction(link: Path, target: Path) -> None:
+    """A directory junction at ``link`` -> ``target``: no admin needed, which
+    is exactly why it is the link to guard against."""
+    import _winapi  # reason: Windows-only stdlib; the tests using it skip elsewhere
+
+    _winapi.CreateJunction(str(target), str(link))
+    assert not link.is_symlink()  # the premise: pathlib does not see it
+
+
 def _nodes_log() -> str:
     path = log.LOG_DIR / "nodes.log"
     return path.read_text(encoding="utf-8") if path.exists() else ""
@@ -1857,6 +2017,79 @@ class TestMemoryNeverFollowsALink:
         assert not any(n.startswith("memory/") for n in _members(stdin))
         assert b"TOPSECRET" not in stdin
         assert "linked-memory" in _nodes_log()
+
+    # A junction is the link a STANDARD Windows user can make (no admin, no
+    # developer mode), and Path.is_symlink() is False for one while os.walk
+    # descends into it -- so the symlink pins above do not cover it.
+    @needs_junctions
+    def test_a_junction_inside_memory_is_skipped(self, node_home, tmp_path):
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        keys = tmp_path / "dot-ssh"
+        keys.mkdir()
+        (keys / "id_ed25519").write_bytes(b"TOPSECRET\n")
+        _junction(recipe.memory_dir / "keys", keys)
+        stdin = self._bring_up(node_home, recipe)
+        members = _members(stdin)
+        assert not any(n.startswith("memory/keys") for n in members)
+        assert members["memory/MEMORY.md"] == b"- remember\n"
+        assert b"TOPSECRET" not in stdin
+        # Pruned at the folder: the walk never even lists what is behind it.
+        assert f"memory link {recipe.memory_dir / 'keys'} skipped" in _nodes_log()
+        assert "outside memory" not in _nodes_log()
+
+    @needs_junctions
+    def test_a_memory_folder_that_is_a_junction_ships_no_memory(
+        self, node_home, tmp_path
+    ):
+        keys = tmp_path / "dot-ssh"
+        keys.mkdir()
+        (keys / "id_ed25519").write_bytes(b"TOPSECRET\n")
+        joined = tmp_path / "joined-memory"
+        _junction(joined, keys)
+        stdin = self._bring_up(node_home, _recipe(tmp_path, memory_dir=joined))
+        assert not any(n.startswith("memory/") for n in _members(stdin))
+        assert b"TOPSECRET" not in stdin
+        assert "joined-memory" in _nodes_log()
+
+    def test_a_folder_swapped_for_a_link_mid_walk_never_ships(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        # The walk listed `notes` as a plain folder; by the time its files
+        # are checked it is a link to ~/.ssh. Every per-FILE check passes
+        # (the file is regular and no link itself) -- only resolving the file
+        # against the resolved memory folder catches the parent swap.
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        keys = tmp_path / "dot-ssh"
+        keys.mkdir()
+        (keys / "id_ed25519").write_bytes(b"TOPSECRET\n")
+        notes = recipe.memory_dir / "notes"
+        _link_or_skip(notes, keys, directory=True)
+        real_walk = os.walk
+
+        def walk(top, *args, **kwargs):
+            yield from real_walk(top, *args, **kwargs)
+            yield os.fspath(notes), [], ["id_ed25519"]
+
+        monkeypatch.setattr(remote_mux.os, "walk", walk)
+        stdin = self._bring_up(node_home, recipe)
+        assert not any(n.startswith("memory/notes") for n in _members(stdin))
+        assert b"TOPSECRET" not in stdin
+        assert "outside memory" in _nodes_log()
+
+    def test_memory_under_a_linked_parent_still_ships(self, node_home, tmp_path):
+        # A dotfiles setup links ~/.claude itself; the memory folder INSIDE it
+        # is a plain folder and must still ship.
+        dotfiles = tmp_path / "dotfiles"
+        (dotfiles / "memory").mkdir(parents=True)
+        (dotfiles / "memory" / "MEMORY.md").write_bytes(b"- dotfiles\n")
+        claude = tmp_path / "claude"
+        _link_or_skip(claude, dotfiles, directory=True)
+        stdin = self._bring_up(
+            node_home, _recipe(tmp_path, memory_dir=claude / "memory")
+        )
+        assert _members(stdin)["memory/MEMORY.md"] == b"- dotfiles\n"
 
 
 class TestPushingFilesToARunningProject:
@@ -1983,11 +2216,14 @@ case $cmd in
         -e) env="${env:+$env }$2"; shift 2 ;;
         -s) name=$2; shift 2 ;;
         -c) cwd=$2; shift 2 ;;
+        --) shift; break ;;
         *) break ;;
       esac
     done
     if [ -n "${FAKE_TMUX_FAIL_NEW:-}" ]; then echo "fake: refused" >&2; exit 1; fi
     if [ -f "$state/sessions/$name" ]; then echo "duplicate session: $name" >&2; exit 1; fi
+    # Exit 0, but the session is gone before anyone looks (a command that dies).
+    if [ -n "${FAKE_TMUX_DIE_AFTER_NEW:-}" ]; then exit 0; fi
     mkdir -p "$state/sessions"
     umask > "$state/umask"
     { echo "cwd=$cwd"; echo "env=$env"; echo "cmd=$*"; } > "$state/sessions/$name"
@@ -2014,6 +2250,19 @@ class TestTheScriptLiterals:
         # DECISION-26 viii / spec section 6: sshd hands a non-login command
         # no locale, and the agent's UI draws box and prompt glyphs.
         assert "mux new-session -d -e LANG=C.UTF-8 " in node_scripts.script("bring_up")
+
+    def test_every_session_probe_is_an_exact_name_match(self):
+        # tmux prefix-matches a bare name: `api` would answer for `api-2`.
+        text = node_scripts.script("bring_up")
+        assert text.count('mux has-session -t "=$sid"') == 2
+        assert not re.search(r'-t "\$sid"', text)
+
+    def test_the_agent_command_follows_an_end_of_options(self):
+        # An argv whose first word starts with "-" is the command, not an option.
+        assert (
+            'mux new-session -d -e LANG=C.UTF-8 -s "$sid" -c "$root" -- "${cmd[@]}"'
+            in node_scripts.script("bring_up")
+        )
 
     def test_nothing_is_extracted_before_the_umask_is_tightened(self):
         # The payload carries secrets: no moment where a file of it is
@@ -2048,6 +2297,14 @@ def _raw_payload(
                 tar.addfile(member)
             else:
                 remote_mux._add_bytes(tar, *member)
+    return buf.getvalue()
+
+
+def _tar_of(*members: tuple[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        for member in members:
+            remote_mux._add_bytes(tar, *member)
     return buf.getvalue()
 
 
@@ -2220,18 +2477,230 @@ class TestBringUpShOnARealShell:
         remote_mux.bring_up(rig["node"], rig["recipe"], allow_dirty=True)
         assert (rig["root"] / "README.md").read_bytes() == b"edited on the node\n"
 
+    def _up_then_stop(self, rig) -> Path:
+        # A first bring-up, then the session gone: the next one reaches git.
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        (rig["state"] / "sessions" / "api").unlink()
+        return rig["root"]
+
+    def _origin_moves_on(self, rig) -> None:
+        commit(rig["clone"], name="o.txt", text="o\n", message="on origin")
+        git(rig["clone"], "push", "-q", "origin", "main")
+
+    @pytest.mark.parametrize("allow_dirty", [False, True])
+    def test_a_node_commit_no_branch_holds_is_exit_3_naming_it(self, rig, allow_dirty):
+        # Checking out the branch would orphan it: never, --allow-dirty or not.
+        root = self._up_then_stop(rig)
+        git(root, "checkout", "-q", "--detach")
+        commit(root, name="n.txt", text="n\n", message="node only")
+        mine = git(root, "rev-parse", "HEAD")
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(rig["node"], rig["recipe"], allow_dirty=allow_dirty)
+        assert info.value.rc == 3
+        assert git(root, "rev-parse", "--short", "HEAD") in info.value.stderr_tail
+        assert "detached" in info.value.stderr_tail
+        assert git(root, "rev-parse", "HEAD") == mine
+
+    def test_a_node_commit_only_a_stash_holds_is_exit_3(self, rig):
+        # refs/stash is no keeper: a later `git stash drop` loses the commit.
+        root = self._up_then_stop(rig)
+        git(root, "checkout", "-q", "--detach")
+        commit(root, name="n.txt", text="n\n", message="node only")
+        mine = git(root, "rev-parse", "HEAD")
+        (root / "n.txt").write_text("stashed\n", encoding="utf-8")
+        git(root, "stash", "-q")
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(rig["node"], rig["recipe"], allow_dirty=True)
+        assert info.value.rc == 3
+        assert "a commit no branch or tag holds" in info.value.stderr_tail
+        assert git(root, "rev-parse", "HEAD") == mine
+
+    def test_a_detached_head_a_branch_holds_is_brought_back_to_the_branch(self, rig):
+        root = self._up_then_stop(rig)
+        git(root, "checkout", "-q", "--detach")
+        self._origin_moves_on(rig)
+        result = remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert git(root, "symbolic-ref", "--short", "HEAD") == "main"
+        assert result.commits == {str(root): git(rig["clone"], "rev-parse", "HEAD")}
+
+    def test_a_node_on_another_branch_is_switched_and_says_so(self, rig, monkeypatch):
+        root = self._up_then_stop(rig)
+        git(root, "checkout", "-q", "-b", "side")
+        seen: list[bytes] = []
+        real = remote_mux.run_script
+
+        def spy(*args, **kwargs):
+            result = real(*args, **kwargs)
+            seen.append(result.stderr)
+            return result
+
+        monkeypatch.setattr(remote_mux, "run_script", spy)
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert git(root, "symbolic-ref", "--short", "HEAD") == "main"
+        assert f"magent: {root} was on side; switching it to main" in seen[-1].decode()
+
+    def test_a_node_commit_that_diverged_from_origin_is_exit_5_and_kept(self, rig):
+        root = self._up_then_stop(rig)
+        commit(root, name="n.txt", text="n\n", message="node only")
+        mine = git(root, "rev-parse", "HEAD")
+        self._origin_moves_on(rig)
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert info.value.rc == 5
+        assert "could not fast-forward (local changes or divergence)" in (
+            info.value.stderr_tail
+        )
+        assert git(root, "rev-parse", "HEAD") == mine
+
+    def test_a_divergence_refusal_leaves_the_tree_on_its_own_branch(self, rig):
+        root = self._up_then_stop(rig)
+        commit(root, name="n.txt", text="n\n", message="node only")
+        git(root, "checkout", "-q", "-b", "side")
+        self._origin_moves_on(rig)
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert info.value.rc == 5
+        assert git(root, "symbolic-ref", "--short", "HEAD") == "side"
+
+    def test_a_git_status_that_fails_is_exit_5_naming_it(self, rig):
+        # Not "clean": an unreadable tree is never waved through as unchanged.
+        root = self._up_then_stop(rig)
+        (root / ".git" / "HEAD").write_bytes(b"garbage\n")
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert info.value.rc == 5
+        assert f"magent: git status failed in {root}" in info.value.stderr_tail
+
+    def test_a_url_with_credentials_never_reaches_a_message(self, rig, monkeypatch):
+        monkeypatch.setenv("GIT_TERMINAL_PROMPT", "0")
+        url = "https://someone:sekret@127.0.0.1:1/x.git"
+        root = str(rig["root"])
+        header = _header_of(
+            "MAGENT1",
+            "0",
+            "1",
+            url,
+            "main",
+            root,
+            "3",
+            "bash",
+            "-lc",
+            "exec claude",
+            "0",
+        )
+        with pytest.raises(RemoteError) as info:
+            remote_mux.run_script(
+                rig["node"],
+                "bring_up",
+                ["up", "api", root, nodes.encoded_project_dir(root)],
+                timeout_s=30,
+                stdin=_raw_payload(header=header),
+            )
+        assert info.value.rc == 5
+        assert (
+            "magent: git clone of https://***@127.0.0.1:1/x.git failed"
+            in info.value.stderr_tail
+        )
+        assert "sekret" not in info.value.stderr_tail
+
     def test_a_tmux_older_than_3_2_is_exit_4(self, rig, monkeypatch):
         monkeypatch.setenv("FAKE_TMUX_VERSION", "tmux 3.1c")
         with pytest.raises(RemoteError) as info:
             remote_mux.bring_up(rig["node"], rig["recipe"])
         assert info.value.rc == 4
-        assert "3.2" in info.value.stderr_tail
+        assert "magent: tmux 3.1c is too old; magent needs tmux 3.2 or newer" in (
+            info.value.stderr_tail
+        )
 
     def test_a_session_that_will_not_start_is_exit_4(self, rig, monkeypatch):
         monkeypatch.setenv("FAKE_TMUX_FAIL_NEW", "1")
         with pytest.raises(RemoteError) as info:
             remote_mux.bring_up(rig["node"], rig["recipe"])
         assert info.value.rc == 4
+        assert "magent: tmux could not start session api" in info.value.stderr_tail
+
+    def test_a_session_that_exits_as_soon_as_it_starts_is_exit_4(
+        self, rig, monkeypatch
+    ):
+        monkeypatch.setenv("FAKE_TMUX_DIE_AFTER_NEW", "1")
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert info.value.rc == 4
+        assert "magent: session api exited as soon as it started" in (
+            info.value.stderr_tail
+        )
+
+    def test_the_work_folder_is_gone_after_a_success_and_after_a_refusal(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # The unpacked payload holds secrets; the EXIT trap removes it on
+        # every path out, `die` included.
+        work = tmp_path / "script-tmp"
+        work.mkdir()
+        monkeypatch.setenv("TMPDIR", str(work))
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert list(work.iterdir()) == []
+        (rig["state"] / "sessions" / "api").unlink()
+        monkeypatch.setenv("FAKE_TMUX_FAIL_NEW", "1")
+        with pytest.raises(RemoteError):
+            remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert list(work.iterdir()) == []
+
+    def test_a_control_character_in_a_result_field_still_parses(self, rig):
+        # The result is ONE JSON line: every C0 character is escaped.
+        root = rig["root"].with_name("api\x01\x1b")
+        root.mkdir(parents=True)
+        result = remote_mux.run_script(
+            rig["node"],
+            "bring_up",
+            ["push", "api", str(root), nodes.encoded_project_dir(str(rig["root"]))],
+            timeout_s=30,
+            stdin=_raw_payload(("project/.env", b"K=V\n")),
+        )
+        assert json.loads(result.stdout.decode().splitlines()[-1])["cwd"] == str(root)
+
+    @pytest.mark.parametrize(
+        ("mode", "root", "stdin", "said"),
+        [
+            pytest.param("pull", "ok", "push", "unknown mode: pull", id="mode"),
+            pytest.param(
+                "push", "rel", "push", "the project root must be absolute", id="root"
+            ),
+            pytest.param(
+                "push", "ok", "nohdr", "payload has no header", id="no-header"
+            ),
+            pytest.param(
+                "push", "ok", "magic", "unknown payload header: MAGENT9", id="magic"
+            ),
+            pytest.param("push", "ok", "short", "truncated payload header", id="short"),
+            pytest.param(
+                "push", "ok", "count", "bad count in payload header", id="count"
+            ),
+            pytest.param("up", "ok", "push", "no command to start", id="no-command"),
+        ],
+    )
+    def test_each_bad_input_is_exit_2_in_the_scripts_own_words(
+        self, rig, mode, root, stdin, said
+    ):
+        rig["root"].mkdir(parents=True)
+        where = str(rig["root"]) if root == "ok" else "node/api"
+        payload = {
+            "push": _raw_payload(),
+            "nohdr": _tar_of(("decorate", b"")),
+            "magic": _raw_payload(header=_header_of("MAGENT9", "1", "0", "0", "0")),
+            "short": _raw_payload(header=b"MAGENT1\0"),
+            "count": _raw_payload(header=_header_of("MAGENT1", "1", "x", "0", "0")),
+        }[stdin]
+        with pytest.raises(RemoteError) as info:
+            remote_mux.run_script(
+                rig["node"],
+                "bring_up",
+                [mode, "api", where, nodes.encoded_project_dir(str(rig["root"]))],
+                timeout_s=30,
+                stdin=payload,
+            )
+        assert info.value.rc == 2
+        assert f"magent: {said}" in info.value.stderr_tail
 
     def test_the_decoration_brands_the_node(self, rig):
         remote_mux.bring_up(rig["node"], rig["recipe"])
@@ -2249,9 +2718,10 @@ class TestBringUpShOnARealShell:
                 "bring_up",
                 ["up", "api", str(rig["root"]), "../evil"],
                 timeout_s=30,
-                stdin=b"",
+                stdin=_raw_payload(),
             )
         assert info.value.rc == 2
+        assert "magent: bad encoded project name: ../evil" in info.value.stderr_tail
 
     def test_a_dash_led_encoded_name_seeds_resumes_and_ships(self, rig):
         # Every encoded name starts with "-" (/home/x is -home-x): nothing
@@ -2301,6 +2771,11 @@ class TestBringUpShOnARealShell:
                 stdin=_raw_payload(header=header),
             )
         assert info.value.rc == 2
+        assert {
+            "url": "a repo url may not start with -",
+            "branch": "a branch may not start with -",
+            "dir": "a repo folder must be absolute: -api",
+        }[field] in info.value.stderr_tail
         assert not marker.exists()
         assert not rig["root"].exists()
         assert not (rig["state"] / "sessions" / "api").exists()
@@ -2309,6 +2784,9 @@ class TestBringUpShOnARealShell:
         with pytest.raises(RemoteError) as info:
             remote_mux.push_files(rig["node"], rig["recipe"])
         assert info.value.rc == 5
+        assert "is not on this node yet; bring the project up first" in (
+            info.value.stderr_tail
+        )
 
     def test_pushing_into_a_running_project_rewrites_the_files(self, rig):
         remote_mux.bring_up(rig["node"], rig["recipe"])
@@ -2333,6 +2811,7 @@ class TestBringUpShOnARealShell:
         with pytest.raises(RemoteError) as info:
             self._push_raw(rig, _raw_payload((name, b"x\n")))
         assert info.value.rc == 2
+        assert "would land outside its folder" in info.value.stderr_tail
         assert _tree(rig["root"]) == []
         assert _tree(rig["outside"]) == []
 
@@ -2376,6 +2855,85 @@ class TestBringUpShOnARealShell:
             self._push_raw(rig, _raw_payload(("project/.env", b"K=V\n")))
         assert info.value.rc == 5
         assert secret.read_bytes() == b"mine\n"
+
+    def test_a_member_name_ending_in_a_newline_is_exit_2_and_never_written_through(
+        self, rig
+    ):
+        # $(realpath ...) strips the trailing newline: `project/.env\n` would
+        # resolve as `$root/.env` and the copy would follow the node's link.
+        root = rig["root"]
+        root.mkdir(parents=True)
+        secret = rig["outside"] / "secret"
+        secret.write_bytes(b"mine\n")
+        (root / ".env").symlink_to(secret)
+        with pytest.raises(RemoteError) as info:
+            self._push_raw(
+                rig,
+                _raw_payload(("project/a.txt", b"a\n"), ("project/.env\n", b"K=V\n")),
+            )
+        assert info.value.rc == 2
+        assert "control character" in info.value.stderr_tail
+        assert secret.read_bytes() == b"mine\n"
+        # Refused before anything was written, the good member included.
+        assert _tree(root) == [".env"]
+
+    def test_a_folder_whose_name_ends_in_a_newline_is_resolved_as_itself(self, rig):
+        # The containment base goes through the same newline-safe capture: a
+        # bare $(realpath) would resolve `api\n` as `api` and refuse the push.
+        root = rig["root"].with_name("api\n")
+        root.mkdir(parents=True)
+        result = remote_mux.run_script(
+            rig["node"],
+            "bring_up",
+            ["push", "api", str(root), nodes.encoded_project_dir(str(rig["root"]))],
+            timeout_s=30,
+            stdin=_raw_payload(("project/.env", b"K=V\n")),
+        )
+        assert json.loads(result.stdout)["shipped"] == [".env"]
+        assert (root / ".env").read_bytes() == b"K=V\n"
+        assert not rig["root"].exists()
+
+    def test_a_push_leaves_every_shipped_file_owner_only(self, rig):
+        # A file already on the node at 0644 is REPLACED by a 0600 one, never
+        # rewritten in place (a reader holding it open never sees the secret).
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        env = rig["root"] / ".env"
+        env.chmod(0o644)
+        before = env.stat().st_ino
+        remote_mux.push_files(rig["node"], rig["recipe"])
+        assert stat.S_IMODE(env.stat().st_mode) == 0o600
+        assert env.stat().st_ino != before
+        assert [
+            p.name for p in rig["root"].iterdir() if p.name.startswith(".magent")
+        ] == []
+
+    def test_a_folder_created_on_the_way_is_owner_only(self, rig):
+        # umask 077 covers the folders copy_tree makes, not only the files.
+        root = rig["root"]
+        root.mkdir(parents=True)
+        self._push_raw(rig, _raw_payload(("project/sub/.env", b"K=V\n")))
+        assert stat.S_IMODE((root / "sub").stat().st_mode) == 0o700
+        assert (root / "sub" / ".env").read_bytes() == b"K=V\n"
+
+    def test_a_failed_decoration_still_starts_the_session(self, rig):
+        # The one step allowed to fail: a bare status line is not a failed
+        # bring-up.
+        root = str(rig["root"])
+        header = _header_of("MAGENT1", "1", "0", "3", "bash", "-lc", "exec claude", "0")
+        result = remote_mux.run_script(
+            rig["node"],
+            "bring_up",
+            ["up", "api", root, nodes.encoded_project_dir(root)],
+            timeout_s=30,
+            stdin=_raw_payload(("decorate", b"exit 1\n"), header=header),
+        )
+        assert result.returncode == 0
+        assert (
+            b"magent: status-line decoration failed (the session is up)"
+            in result.stderr
+        )
+        assert json.loads(result.stdout.decode().splitlines()[-1])["sid"] == "api"
+        assert "cmd=bash -lc exec claude\n" in self._session(rig)
 
     def test_a_link_that_stays_inside_the_folder_is_written_through(self, rig):
         root = rig["root"]

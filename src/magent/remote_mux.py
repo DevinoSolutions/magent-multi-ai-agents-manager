@@ -798,10 +798,14 @@ def _archive_name(rel: str) -> str:
     file name with a literal backslash in it. Mapping ``\\`` is also what
     makes a POSIX file literally named ``a\\..\\..\\x`` climb, so the mapped
     name is refused (ValueError) when it is absolute or has an empty, ``.``
-    or ``..`` segment."""
+    or ``..`` segment. A control character is refused too: the node's shell
+    strips a trailing newline in ``$(...)``, so ``.env\\n`` would resolve as
+    ``.env`` (the node refuses it as well)."""
     name = rel.replace("\\", "/")
     if any(part in ("", ".", "..") for part in name.split("/")):
         raise ValueError(f"{rel!r} cannot name a file inside the project")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
+        raise ValueError(f"{rel!r} has a control character in its name")
     return name
 
 
@@ -853,9 +857,11 @@ def _read_regular(path: Path, *, cap: int, what: str) -> bytes:
     check alone has a hole: ``lstat`` before opening (a FIFO or a device is
     never opened, an oversize file never read), ``fstat`` on what was opened
     (the path may have been swapped in between), and a read of at most
-    ``cap + 1`` bytes (the file may have grown). OSError when it cannot be
-    opened -- ``O_NOFOLLOW`` makes a final-component link swapped in after the
-    ``lstat`` one of those."""
+    ``cap + 1`` bytes (the file may have grown). ``fstat`` must also name the
+    SAME file the ``lstat`` sized -- ``(st_dev, st_ino)`` -- or a regular file
+    swapped in under the name would be read on the old one's vetting. OSError
+    when it cannot be opened -- ``O_NOFOLLOW`` makes a final-component link
+    swapped in after the ``lstat`` one of those."""
     before = os.lstat(path)
     if not stat.S_ISREG(before.st_mode):
         raise ValueError(f"{what} is not a regular file")
@@ -863,8 +869,11 @@ def _read_regular(path: Path, *, cap: int, what: str) -> bytes:
         raise ValueError(f"{what} is {before.st_size} bytes; the cap is {cap}")
     fd = os.open(path, _READ_FLAGS)
     with os.fdopen(fd, "rb") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode):
             raise ValueError(f"{what} is not a regular file")
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise ValueError(f"{what} changed between its check and its open")
         data = handle.read(cap + 1)
     if len(data) > cap:
         raise ValueError(f"{what} grew past the cap of {cap} bytes")
@@ -937,23 +946,37 @@ def _memory_files(memory_dir: Path) -> list[tuple[str, Path]]:
     name order. A link is never followed -- not a file link, not a folder
     link, and not ``memory_dir`` itself being one: the folder is Claude's,
     and a link in it can name ``~/.ssh``. What is skipped is logged, never
-    raised: a bring-up never fails because of memory."""
+    raised: a bring-up never fails because of memory.
+
+    "A link" is decided by ``realpath``, not ``is_symlink``: a Windows
+    junction -- which any standard user can make -- is not a symlink to
+    pathlib, and ``os.walk(followlinks=False)`` descends into one. An entry is
+    kept only when resolving it changes nothing but its parent's own
+    resolution, so a link ABOVE ``memory_dir`` (a dotfiles ``~/.claude``)
+    still ships, and every file must resolve inside the resolved folder."""
     logger = get_logger("nodes")
-    if memory_dir.is_symlink():
+    real_mem = Path(os.path.realpath(memory_dir))
+    if real_mem != Path(os.path.realpath(memory_dir.parent)) / memory_dir.name:
         logger.warning("memory folder %s is a link; no memory shipped", memory_dir)
         return []
     found: list[tuple[str, Path]] = []
-    # os.walk never descends into a linked folder (followlinks=False); each
-    # one is named so the skip is visible.
     for dirpath, dirnames, filenames in os.walk(memory_dir):
         base = Path(dirpath)
+        real_base = Path(os.path.realpath(base))
+        kept: list[str] = []
         for name in dirnames:
-            if (base / name).is_symlink():
+            if Path(os.path.realpath(base / name)) == real_base / name:
+                kept.append(name)
+            else:
                 logger.warning("memory link %s skipped", base / name)
+        dirnames[:] = kept  # os.walk descends only into what is left
         for name in filenames:
             path = base / name
             if path.is_symlink() or not path.is_file():
                 logger.warning("memory entry %s is not a regular file; skipped", path)
+                continue
+            if not Path(os.path.realpath(path)).is_relative_to(real_mem):
+                logger.warning("memory entry %s resolves outside memory; skipped", path)
                 continue
             try:
                 rel = _archive_name(str(path.relative_to(memory_dir)))
@@ -983,19 +1006,18 @@ def _remote_home(node: Node) -> str:
 
 
 def _parse_result(
-    result: subprocess.CompletedProcess[bytes], shown: tuple[str, ...]
-) -> dict[str, object]:
-    """bring_up.sh's last non-empty stdout line, a JSON object. Anything else
-    is a RemoteError: a result that cannot be read is not a success."""
+    result: subprocess.CompletedProcess[bytes],
+) -> dict[str, object] | None:
+    """bring_up.sh's last non-empty stdout line as a JSON object, or None
+    when it is not one -- which the caller raises: a result that cannot be
+    read is not a success."""
     text = result.stdout.decode("utf-8", "replace")
     lines = [line for line in text.splitlines() if line.strip()]
     try:
         parsed = json.loads(lines[-1]) if lines else None
     except ValueError:
-        parsed = None
-    if not isinstance(parsed, dict):
-        raise RemoteError(result.returncode, "not a bring-up result", shown)
-    return parsed
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _deliver(
@@ -1005,9 +1027,13 @@ def _deliver(
     result = run_script(
         node, "bring_up", args, timeout_s=BRING_UP_TIMEOUT_S, stdin=payload
     )
-    # What RAN, as run() itself would name it (the ``sample`` precedent).
-    shown = _run_shown(node, *_script_call("bring_up", args, payload))
-    return _parse_result(result, shown)
+    parsed = _parse_result(result)
+    if parsed is None:
+        # What RAN, as run() itself would name it (the ``sample`` precedent).
+        # Built on this path only: the frame is a copy of the whole payload.
+        shown = _run_shown(node, *_script_call("bring_up", args, payload))
+        raise RemoteError(result.returncode, "not a bring-up result", shown)
+    return parsed
 
 
 def bring_up(
