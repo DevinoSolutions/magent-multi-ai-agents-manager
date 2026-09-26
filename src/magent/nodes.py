@@ -1627,20 +1627,23 @@ def _repo_status(row: object) -> RepoStatus | None:
 def read_repo_record(
     nick: str, sid: str, *, nodes_dir: Path | None = None
 ) -> RepoRecord | None:
-    """The stored record, or None when there is none, it is unreadable, its
-    ``ts`` is not a finite number (the node map's rule, ``_epoch``), or the
-    ``sid`` is unsafe (NodeConfigError is a ValueError). A malformed row is
-    dropped on its own."""
+    """The stored record, or an error -- never a guess. None means exactly
+    one thing: there is no record file. A file that cannot be read raises
+    its OSError; one that is torn or not UTF-8, is not a record -- not an
+    object, a ``ts`` that is not a finite number (the node map's rule,
+    ``_epoch``), a bad ``source`` or ``repos`` -- or an unsafe ``sid``
+    (NodeConfigError) raises a ValueError. Unknown is never read as "no
+    record was ever written". A malformed row is dropped on its own."""
+    path = repo_record_path(nick, sid, nodes_dir=nodes_dir)
     try:
-        body = json.loads(
-            repo_record_path(nick, sid, nodes_dir=nodes_dir).read_text(encoding="utf-8")
-        )
-    except (OSError, ValueError):
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return None
+    body = json.loads(text)
     if not isinstance(body, dict):
-        return None
+        raise ValueError(f"{path}: not a JSON object")  # noqa: TRY004  # reason: corrupt DATA, the same family as a torn file's JSONDecodeError; callers catch one type for every bad file
     ts, source, rows = _epoch(body.get("ts")), body.get("source"), body.get("repos")
     if ts is None or not isinstance(source, str) or not isinstance(rows, list):
-        return None
+        raise ValueError(f"{path}: not a repo record")
     repos = tuple(s for s in (_repo_status(r) for r in rows) if s is not None)
     return RepoRecord(ts=ts, source=source, repos=repos)

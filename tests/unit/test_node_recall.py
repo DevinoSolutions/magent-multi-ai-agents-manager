@@ -213,12 +213,14 @@ class TestTheRepoRecord:
         assert nodes.write_repo_record("second", "api", record) is True
         assert nodes.read_repo_record("second", "api") == record
 
-    def test_a_torn_record_reads_as_none(self):
+    def test_a_torn_record_raises_never_reads_as_no_record(self):
+        # inv-unknown: there but unreadable is unknown, not "never recorded".
         path = nodes.repo_record_path("second", "api")
         path.parent.mkdir(parents=True)
         path.write_text('{"ts": 1, "sou', encoding="utf-8")
 
-        assert nodes.read_repo_record("second", "api") is None
+        with pytest.raises(ValueError):
+            nodes.read_repo_record("second", "api")
 
     def test_repo_status_runs_the_packaged_script_on_the_session_root(
         self, monkeypatch
@@ -1435,10 +1437,11 @@ class TestTheRepoRecordFileIsCheckedOnTheWayInAndOut:
     @pytest.mark.parametrize(
         "ts", ["true", "NaN", "Infinity", "-Infinity", "1" + "0" * 400, '"1"', "null"]
     )
-    def test_a_timestamp_that_is_not_a_finite_number_reads_as_none(self, ts):
+    def test_a_timestamp_that_is_not_a_finite_number_is_not_a_record(self, ts):
         _raw_record(f'{{"ts": {ts}, "source": "recall", "repos": []}}')
 
-        assert nodes.read_repo_record("second", "api") is None
+        with pytest.raises(ValueError):
+            nodes.read_repo_record("second", "api")
 
     def test_an_integer_timestamp_reads_back_as_a_float(self):
         _raw_record('{"ts": 5, "source": "recall", "repos": []}')
@@ -1449,15 +1452,17 @@ class TestTheRepoRecordFileIsCheckedOnTheWayInAndOut:
         assert type(record.ts) is float
         assert record.ts == 5.0
 
-    def test_a_body_that_is_not_an_object_reads_as_none(self):
+    def test_a_body_that_is_not_an_object_is_not_a_record(self):
         _raw_record("[]")
 
-        assert nodes.read_repo_record("second", "api") is None
+        with pytest.raises(ValueError):
+            nodes.read_repo_record("second", "api")
 
-    def test_a_source_that_is_not_a_string_reads_as_none(self):
+    def test_a_source_that_is_not_a_string_is_not_a_record(self):
         _raw_record('{"ts": 5, "source": 3, "repos": []}')
 
-        assert nodes.read_repo_record("second", "api") is None
+        with pytest.raises(ValueError):
+            nodes.read_repo_record("second", "api")
 
     @pytest.mark.parametrize(
         ("dirty", "unpushed"), [('"yes"', "true"), ("1", "1.5"), ("null", '"2"')]
@@ -1535,7 +1540,8 @@ class TestTheRepoRecordFileIsCheckedOnTheWayInAndOut:
         record = nodes.RepoRecord(ts=NOW, source="recall", repos=())
 
         assert nodes.write_repo_record("second", "../../../escaped", record) is False
-        assert nodes.read_repo_record("second", "../../../escaped") is None
+        with pytest.raises(nodes.NodeConfigError):
+            nodes.read_repo_record("second", "../../../escaped")
         assert not list(tmp_path.rglob("repos.json"))
 
 

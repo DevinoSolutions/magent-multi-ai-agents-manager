@@ -627,7 +627,23 @@ def _report_repos(source: Node | None, held: NodeMapEntry) -> None:
             nodes.write_repo_record(held.nick, held.sid, record)
             click.echo(f"  repos on @{held.nick}, now:")
     if record is None:
-        record = nodes.read_repo_record(held.nick, held.sid)
+        try:
+            record = nodes.read_repo_record(held.nick, held.sid)
+        except (OSError, ValueError) as exc:
+            # There, but unreadable: unknown, never "never recorded". The
+            # error CLASS only on screen; the full error goes to nodes.log.
+            log.get_logger("nodes").warning(
+                "recall could not read the repo record for %s/%s: %s",
+                held.nick,
+                held.sid,
+                exc,
+            )
+            _note(
+                f"the commit record for {held.sid} on @{held.nick} is unreadable"
+                f" ({type(exc).__name__}) -- check the node before relying on"
+                " `git pull`"
+            )
+            return
         if record is None:
             _note(
                 f"no commit was ever recorded for {held.sid} on @{held.nick} --"
