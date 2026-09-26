@@ -2360,6 +2360,55 @@ class TestProvision:
         # The verdicts come from the scope AFTER the probe (M22).
         assert ScriptLine("ok", "scope", "mcp x: shipped") not in report.lines
 
+    # F7: build_payload refuses a skill path it cannot frame. A backslash is a
+    # legal POSIX file name and a wrapper-built scope never passed the walk:
+    # that file stays behind with a note, and the rest still ships.
+    @pytest.mark.parametrize("path", ["a\\b", "../../.bashrc", "/etc/x", "a//b"])
+    def test_a_skill_path_the_payload_cannot_frame_stays_behind(self, fake_ssh, path):
+        scope = _scope(
+            skills=(
+                nodes.SkillFile(path=path, data=b"BAD-DECOY", executable=False),
+                nodes.SkillFile(path="s/SKILL.md", data=b"# ok", executable=False),
+            )
+        )
+        report = remote_mux.provision(
+            NODE, scope, timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        (apply,) = fake_ssh.calls()
+        _, _, data = _unpack(_sent(apply))
+        assert data["skills/s/SKILL.md"] == b"# ok"
+        assert all(b"BAD-DECOY" not in blob for blob in data.values())
+        assert (
+            ScriptLine(
+                "skip",
+                "scope",
+                f"skills/{path!r}: its path cannot travel to a node, not shipped",
+            )
+            in report.lines
+        )
+        assert not report.failed
+
+    def test_a_payload_refused_on_this_pc_is_a_fail_row_not_an_exception(
+        self, fake_ssh, monkeypatch
+    ):
+        # The last line of defence, reached here through a token gh could
+        # never have handed over: nothing is sent, and the bring-up goes on.
+        monkeypatch.setattr(
+            remote_mux, "_gh_to_share", lambda: ("amin", TOKEN + " x", ())
+        )
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        assert fake_ssh.calls() == []
+        assert report.lines == (
+            ScriptLine(
+                "fail",
+                "payload",
+                "not sent -- gh token has characters the payload cannot frame",
+            ),
+        )
+        assert TOKEN not in repr(report)
+
     def test_a_scope_whose_only_stdio_command_is_no_program_never_ships_it(
         self, fake_ssh
     ):

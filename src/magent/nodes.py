@@ -682,6 +682,42 @@ def without_missing_programs(
     )
 
 
+def is_payload_skill_path(path: str) -> bool:
+    """True when ``path`` is a relative '/'-separated name that stays under
+    ``skills/`` once it is a payload member: not empty, not absolute, no
+    backslash or NUL, no empty, "." or ".." segment. The one rule both
+    ``without_unframable_skills`` and the payload builder apply."""
+    return not (
+        not path
+        or path.startswith("/")
+        or "\\" in path
+        or "\0" in path
+        or any(seg in {"", ".", ".."} for seg in path.split("/"))
+    )
+
+
+def without_unframable_skills(scope: UserScope) -> UserScope:
+    """``scope`` minus every skill file whose path cannot be a payload member
+    (``is_payload_skill_path``), with a note per file. A backslash is a legal
+    POSIX file name, and a scope a wrapper (plan K) built never passed the
+    walk: one bad name leaves that file behind, never the whole provision."""
+    bad = [f for f in scope.skills if not is_payload_skill_path(f.path)]
+    if not bad:
+        return scope
+    return replace(
+        scope,
+        skills=tuple(f for f in scope.skills if is_payload_skill_path(f.path)),
+        notes=(
+            *scope.notes,
+            *(
+                f"skills/{_named(f.path)!r}: its path cannot travel to a node, "
+                "not shipped"
+                for f in bad
+            ),
+        ),
+    )
+
+
 def _mcp_servers(claude_json: dict[str, object], notes: list[str]) -> dict[str, object]:
     """The user-scope MCP servers (``~/.claude.json`` → ``mcpServers``) that
     ship. Project scope (``projects.*``) and the rest of that file stay

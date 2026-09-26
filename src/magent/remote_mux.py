@@ -59,9 +59,11 @@ from magent.nodes import (
     NodeConfigError,
     absolute_remote,
     encoded_project_dir,
+    is_payload_skill_path,
     node_dir,
     stdio_programs,
     without_missing_programs,
+    without_unframable_skills,
 )
 from magent.sessions import build_resume_command
 
@@ -878,17 +880,10 @@ def _canonical(value: object) -> str:
 
 
 def _check_skill_path(path: str) -> None:
-    """ValueError unless ``path`` is a relative '/'-separated name that stays
-    under ``skills/`` once it is a tar member: not empty, not absolute, no
-    backslash or NUL, no empty, "." or ".." segment. Names the path, never
-    the file's bytes."""
-    if (
-        not path
-        or path.startswith("/")
-        or "\\" in path
-        or "\0" in path
-        or any(seg in {"", ".", ".."} for seg in path.split("/"))
-    ):
+    """ValueError unless ``path`` stays under ``skills/`` once it is a tar
+    member (``nodes.is_payload_skill_path``). Names the path, never the
+    file's bytes."""
+    if not is_payload_skill_path(path):
         raise ValueError(f"skill file path {path!r} cannot be a payload member")
 
 
@@ -1038,19 +1033,30 @@ def provision(
     # Always, even with nothing to probe: a stdio server whose command is not
     # a plain program name is never offered to the probe, and only this drops it.
     user_scope = without_missing_programs(user_scope, found=found, unprobed=unprobed)
+    # A skill name the payload cannot frame leaves that file behind, not the
+    # whole provision.
+    user_scope = without_unframable_skills(user_scope)
     login, token, gh_rows = _gh_to_share()
-    payload = build_payload(
-        user_scope,
-        gh_token=token,
-        gh_login=login,
-        state_hook=node_scripts.script("state_hook"),
-    )
+    notes = tuple(ScriptLine("skip", "scope", note) for note in user_scope.notes)
+    try:
+        payload = build_payload(
+            user_scope,
+            gh_token=token,
+            gh_login=login,
+            state_hook=node_scripts.script("state_hook"),
+        )
+    except ValueError as exc:
+        # The last line of defence: a refused payload fails this node's
+        # provision -- a row, never an exception out of a bring-up. Its words
+        # never quote a token (build_payload owns its framing).
+        get_logger("nodes").warning("provision %s: payload refused: %s", node.nick, exc)
+        refused = ScriptLine("fail", "payload", f"not sent -- {exc}")
+        return ProvisionReport((*notes, *probe_failed, *gh_rows, refused))
     args = ["--force"] if force else []
     result = run_script(
         node, "provision", args, timeout_s=timeout_s, stdin=payload, check=False
     )
     report = _report_of(result, "provision", node, args=args, stdin=payload)
-    notes = tuple(ScriptLine("skip", "scope", note) for note in user_scope.notes)
     shipped = tuple(
         ScriptLine("ok", "scope", f"mcp {name}: shipped")
         for name in sorted(user_scope.mcp_servers)
