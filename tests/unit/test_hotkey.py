@@ -1926,3 +1926,25 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
         spawned = self._serve(monkeypatch, tmp_path, folder, code_bin)
         hotkey._do_open_code("http://x:8034", "api", "me@host")
         assert spawned == [[code_bin, "--remote", "ssh-remote+host", folder]]
+
+    def test_a_shim_path_code_cmd_would_split_is_refused_too(
+        self, monkeypatch, tmp_path
+    ):
+        # The shim's own path is on the re-joined command line too: cmd.exe
+        # splits an unquoted C:\Users\R&D\bin\code.cmd at the `&`.
+        from magent import hotkey, nodes
+
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        spawned = self._patch(
+            monkeypatch,
+            code_bin=r"C:\Users\R&D\bin\code.cmd",
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "api", "session": "api", "resolved": "/base/api"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "api", None)
+        assert spawned == []
+        assert self.flashed[-1] == self._REFUSED
