@@ -807,9 +807,15 @@ def _recall_local(
                 1,
             )
         except OSError as exc:
+            # The error CLASS only on screen (str(exc) carries a path); the
+            # full error goes to nodes.log.
+            log.get_logger("nodes").warning(
+                "recall could not install the conversation into %s: %s", dest, exc
+            )
             _fail(
-                f"could not install the conversation into {dest} ({exc});"
-                f" {name} stays placed on @{held.nick} -- run the recall again",
+                f"could not install the conversation into {dest}"
+                f" ({type(exc).__name__}); {name} stays placed on @{held.nick}"
+                " -- run the recall again",
                 1,
             )
         if replaced:

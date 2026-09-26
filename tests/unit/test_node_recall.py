@@ -3169,3 +3169,27 @@ class TestRecallSaysUnknownNeverAbsentOrATraceback:
         assert "check the node before relying on `git pull`" in result.stdout
         assert detail not in result.output
         assert any(detail in m for m in _node_logs(caplog)), _node_logs(caplog)
+
+    def test_a_failed_install_names_the_class_only(
+        self, runner, placed_api, node_answers, monkeypatch, caplog
+    ):
+        # The same rule as the last pull's: str(exc) carries a path of this PC.
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        error = PermissionError(13, "Access is denied", "C:/Users/me/held.jsonl")
+
+        def _denied(source, dest):
+            raise error
+
+        monkeypatch.setattr(remote_mux, "copy_mirror", _denied)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 1, result.output
+        assert "could not install the conversation into " in result.stderr
+        assert (
+            "(PermissionError); api stays placed on @second -- run the recall again"
+        ) in result.stderr
+        assert str(error) not in result.output
+        assert "held.jsonl" not in result.output
+        assert any(str(error) in m for m in _node_logs(caplog)), _node_logs(caplog)
+        assert "api" in nodes.read_node_map()
