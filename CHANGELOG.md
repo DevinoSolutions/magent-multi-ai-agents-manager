@@ -5,6 +5,20 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A second `magent serve` on a port that is already served now exits instead
+  of sharing it (Windows).** The server allowed address reuse, and on Windows
+  that let a second server bind a port that was already listening. Two servers
+  then shared the port in silence while the pid file named only one of them, so
+  the watchdog could stop or restart the wrong one. On Windows the server now
+  claims its port exclusively. A second serve, whether started by hand, by
+  `--ensure` or by the watchdog, exits with "port N is already in use" and
+  leaves the running server and its pid file alone. Restarting serve right away
+  still works on every OS.
+
 ## [3.19.1] - 2026-09-23
 
 ### Fixed

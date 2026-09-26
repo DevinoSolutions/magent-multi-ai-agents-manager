@@ -463,6 +463,11 @@ class UploadServerSupervisor:
     "recorded pid 8123 is gone" (the observed failure) reads very differently
     from "pid 8123 is alive but not answering", which is a wedge, not a death.
 
+    A respawn that races a server still starting is harmless: ``run_server``
+    claims its port exclusively, so the loser exits at bind with ``PortInUse``
+    and the winner keeps the port and its pid file. The worst a too-short
+    cooldown costs is one short-lived process, never two servers on one port.
+
     A spawn that fails outright (``spawn_detached`` raising) propagates to the
     caller, which logs it and ticks again next poll -- see
     ``cli/attention_cmd._upload_watchdog``. The handling lives there, at the

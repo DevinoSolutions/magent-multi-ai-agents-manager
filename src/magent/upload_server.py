@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import html
 import json
 import os
 import re
+import socket
 import socketserver
 import subprocess
 import sys
@@ -1323,6 +1325,66 @@ class UploadHandler(BaseHTTPRequestHandler):
         get_logger("upload").debug(fmt, *args)
 
 
+# --- One port, one server -------------------------------------------------------
+# ThreadingHTTPServer sets SO_REUSEADDR, and the option means two different
+# things. On POSIX it only lets a restart rebind past the previous server's
+# TIME_WAIT connections; a second LIVE listener is still refused. On Windows it
+# lets a second process bind a port that is already listening. Measured: two
+# live servers co-listening on one port, both logging "listening ... :15505",
+# the pid file naming only the later one -- so the watchdog killed or revived
+# the wrong one and /health was answered by whichever the kernel picked. So on
+# Windows the server claims the port with SO_EXCLUSIVEADDRUSE and no
+# SO_REUSEADDR: a second bind is refused, and a foreign SO_REUSEADDR socket
+# cannot steal it either. A restart still rebinds at once -- Windows never held
+# a port hostage to TIME_WAIT connections (measured with ~20 of them on the
+# port). POSIX keeps SO_REUSEADDR for exactly that restart.
+#
+# winsock2.h: SO_EXCLUSIVEADDRUSE is ((int)(~SO_REUSEADDR)), i.e. -5. Spelled
+# out rather than read off ``socket`` because that name only exists on Windows,
+# and the policy below is exercised on every OS.
+_SO_EXCLUSIVEADDRUSE = -5
+# What Windows raises for a bind refused by an exclusive holder when the two
+# binds overlap without being identical (a wildcard held, loopback asked for).
+_WSAEACCES = 10013
+
+
+def _claim_port_options(sock: socket.socket, platform: str = sys.platform) -> None:
+    """Set the bind options that make a held port refuse a second server."""
+    if platform == "win32":
+        sock.setsockopt(socket.SOL_SOCKET, _SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+
+def _port_taken(exc: OSError, platform: str = sys.platform) -> bool:
+    """Whether a bind failed because another listener holds the port.
+
+    ``errno.EADDRINUSE`` is the portable answer (on Windows it IS
+    WSAEADDRINUSE, 10048). Windows reports WSAEACCES instead when an exclusive
+    wildcard holder refuses a specific address; that code can also mean a port
+    Windows has reserved, which is why the message says "in use or reserved".
+    """
+    if exc.errno == errno.EADDRINUSE:
+        return True
+    return platform == "win32" and getattr(exc, "winerror", None) == _WSAEACCES
+
+
+class BindFailed(RuntimeError):
+    """run_server could not bind anything, so it never started serving.
+
+    Its own type so the CLI shell can report it as a sentence instead of a
+    traceback, without also swallowing a real crash of the serve loop.
+    """
+
+
+class PortInUse(BindFailed):
+    """run_server's port is held by another listener -- usually another serve.
+
+    Not a crash: a watchdog or ``--ensure`` spawn that loses a race to a server
+    still starting is SUPPOSED to end here, quickly, leaving the winner alone.
+    """
+
+
 class _NoFqdnHTTPServer(ThreadingHTTPServer):
     """ThreadingHTTPServer minus http.server's reverse-DNS ``server_bind``.
 
@@ -1336,9 +1398,15 @@ class _NoFqdnHTTPServer(ThreadingHTTPServer):
     server never uses ``server_name`` (no CGI; the ``Server:`` header comes
     from ``version_string()``), so the bind host is recorded verbatim and the
     resolver is never consulted.
+
+    It also owns its bind options (see "One port, one server" above), so the
+    stdlib's unconditional SO_REUSEADDR is switched off here.
     """
 
+    allow_reuse_address = False
+
     def server_bind(self) -> None:
+        _claim_port_options(self.socket)
         socketserver.TCPServer.server_bind(self)
         self.server_name = str(self.server_address[0])
         self.server_port = int(self.server_address[1])
@@ -1539,7 +1607,23 @@ def run_server(
             servers.append(_NoFqdnHTTPServer((addr, port), UploadHandler))
             bound_addrs.append(addr)
         except OSError as e:
-            log.warning("upload server: cannot bind %s:%d (%s)", addr, port, e)
+            if not _port_taken(e):
+                log.warning("upload server: cannot bind %s:%d (%s)", addr, port, e)
+                continue
+            # Held on ANY of our addresses means somebody else is serving this
+            # port. Serving the remainder would be two servers and one pid file
+            # again, so give back what was bound and leave the holder alone --
+            # its pid file is untouched (ours is only written after the bind).
+            for s in servers:
+                s.server_close()
+            detail = (
+                f"upload server: port {port} is already in use or reserved "
+                f"({addr}: {e}); not starting a second server"
+            )
+            # WARNING, not ERROR: a spawn that lost a race to a server still
+            # starting ends here by design, and is not a crash for Sentry.
+            log.warning("%s", detail)
+            raise PortInUse(detail) from e
     if not servers:
         # The one startup failure that is fatal rather than degraded. ERROR
         # level (not just the exception that follows) because a detached serve
@@ -1548,7 +1632,7 @@ def run_server(
         # note on the serve loop below.
         detail = f"upload server: no bindable address on port {port}"
         log.error("%s", detail)
-        raise RuntimeError(detail)
+        raise BindFailed(detail)
 
     UploadHandler.port = port
     UploadHandler.pid = os.getpid()
