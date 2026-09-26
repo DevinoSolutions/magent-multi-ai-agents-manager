@@ -2172,7 +2172,8 @@ def _final_pull(
             get_logger("nodes").warning(
                 "down: final pull of %s found no map entry for %r", sid, key
             )
-            reason = "its node map entry could not be read again"
+            # The entry the strict read found, missing from the re-read.
+            reason = "its node map entry was not found again"
     _say_not_pulled(sid, reason)
     return False
 

@@ -2241,8 +2241,7 @@ class TestDownPullsTheLastTurnHomeFirst:
         out = capsys.readouterr().out
         assert out.count("\n") == 2, out  # the announcement, then this line
         assert (
-            "api: last turn not pulled (its node map entry could not be read again)"
-            in out
+            "api: last turn not pulled (its node map entry was not found again)" in out
         )
         assert "magent node sync --once" in out
 
@@ -2271,7 +2270,7 @@ class TestDownPullsTheLastTurnHomeFirst:
         assert killed == ["api"]
         assert "api" in nodes.load_node_map_strict()
         assert (
-            "api: last turn not pulled (its node map entry could not be read again)"
+            "api: last turn not pulled (its node map entry was not found again)"
         ) in capsys.readouterr().out
 
     @pytest.mark.parametrize("timed_out", [True, False], ids=["silent", "rc255"])
