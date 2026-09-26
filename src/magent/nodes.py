@@ -4,7 +4,8 @@ What a node IS (``Node``), what running a project there NEEDS (``Recipe``:
 repos, files to push, the auto-memory dir), and where node data lives on this
 PC (``~/.magent/nodes/``). Everything that touches a node or runs git is
 ``remote_mux``. A leaf: never imports magent.cli, never spawns a process. Its
-only I/O is the node-map file, its sidecar lock, and local stat()s.
+only I/O is files under ``NODES_DIR`` (the node map and the per-node
+mirror), the map's sidecar lock, and local stat()s.
 """
 
 from __future__ import annotations
@@ -433,6 +434,46 @@ def open_target(
 _NODE_LOGIN = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 
 
+def node_for_nick(
+    config: MagentConfig, nick: str, *, local_user: str, label: str | None = None
+) -> Node:
+    """The pool node ``nick``, fully resolved -- the D4 user rule in its one
+    home. Raises NodeConfigError.
+
+    ``label`` (a project path) prefixes the unknown-nick error only: it is the
+    one that is about the caller's reference. The other two name
+    ``settings.nodes.<nick>``, the thing to fix. A nick read from the node map
+    may have left ``settings.nodes`` since it was written; such a caller must
+    catch NodeConfigError and re-place, never surface it.
+    """
+    prefix = f"{label}: " if label else ""
+    pool = config.settings.nodes
+    entry = pool.get(nick)
+    if entry is None:
+        known = ", ".join(sorted(pool)) or "none"
+        raise NodeConfigError(
+            f"{prefix}node {nick!r} is not in settings.nodes; known nodes: {known}"
+        )
+    user = entry.user if entry.user is not None else local_user.lower()
+    if not user:
+        raise NodeConfigError(
+            f"settings.nodes.{nick}.user is not set and the local username is "
+            "unknown; set it explicitly"
+        )
+    if entry.user is None and not _NODE_LOGIN.fullmatch(user):
+        raise NodeConfigError(
+            f"settings.nodes.{nick}.user is not set and the local username "
+            f"{local_user!r} is not a node login ({user!r} does not match "
+            f"{_NODE_LOGIN.pattern}); set it explicitly"
+        )
+    if entry.user is None and user == "root":
+        raise NodeConfigError(
+            f"settings.nodes.{nick}: magent is running as root and would run "
+            'sessions as root on the node; write "user": "root" to mean it (D4)'
+        )
+    return Node(nick=nick, host=entry.host, user=user, root=entry.root)
+
+
 def resolve(
     config: MagentConfig,
     proj: ProjectConfig,
@@ -463,35 +504,135 @@ def resolve(
             f'{proj.path}: "node": "auto" needs a placement before it can resolve'
         )
     pool = config.settings.nodes
-    entry = pool.get(nick)
-    if entry is None:
+    if proj.node == NODE_AUTO and nick not in pool:
         known = ", ".join(sorted(pool)) or "none"
-        if proj.node == NODE_AUTO:
-            raise NodeConfigError(
-                f"{proj.path}: placement chose {nick!r}, which is no longer in "
-                f"settings.nodes; re-place (known nodes: {known})"
-            )
         raise NodeConfigError(
-            f"{proj.path}: node {nick!r} is not in settings.nodes; known nodes: {known}"
+            f"{proj.path}: placement chose {nick!r}, which is no longer in "
+            f"settings.nodes; re-place (known nodes: {known})"
         )
-    user = entry.user if entry.user is not None else local_user.lower()
-    if not user:
-        raise NodeConfigError(
-            f"settings.nodes.{nick}.user is not set and the local username is "
-            "unknown; set it explicitly"
+    return node_for_nick(config, nick, local_user=local_user, label=proj.path)
+
+
+# --- The per-node mirror (written by node_sync, read by status/recall) -------
+#   <nick>/sessions.json        {"ts": <PC epoch>, "sessions": [...]}: liveness
+#   <nick>/load.jsonl           one LoadSample per line, ts on the PC's clock
+#   <nick>/pull.json            {sid: {"since": <node epoch>, "realpath": ...}}
+#   <nick>/<sid>/transcripts/   the node's ~/.claude/projects/<dir>/ contents
+#   <nick>/<sid>/state/         that session's ~/.magent/state records
+# Every path reads NODES_DIR at CALL time (never a second import-bound Path),
+# so the test-isolation redirect of NODES_DIR covers all of them.
+
+
+def node_dir(nick: str, *, nodes_dir: Path | None = None) -> Path:
+    return (nodes_dir if nodes_dir is not None else NODES_DIR) / nick
+
+
+def transcripts_dir(nick: str, sid: str, *, nodes_dir: Path | None = None) -> Path:
+    """Where the daemon mirrors a node session's Claude project directory:
+    its CONTENTS (``<uuid>.jsonl``, ``<uuid>/subagents/``, ``memory/``).
+    ``sid`` is joined VERBATIM: ``psmux.session_name`` keeps ``/`` and ``\\``,
+    so a node-map sid like ``/etc`` would resolve outside the node dir --
+    callers (the attention reader, recall) pass it through
+    ``remote_mux.pullable_sid`` first."""
+    return node_dir(nick, nodes_dir=nodes_dir) / sid / "transcripts"
+
+
+def state_dir(nick: str, sid: str, *, nodes_dir: Path | None = None) -> Path:
+    """Where the daemon mirrors a node session's agent-state records.
+    ``sid`` is joined VERBATIM, exactly as in ``transcripts_dir``: callers
+    pass a node-map sid through ``remote_mux.pullable_sid`` first."""
+    return node_dir(nick, nodes_dir=nodes_dir) / sid / "state"
+
+
+def sessions_path(nick: str, *, nodes_dir: Path | None = None) -> Path:
+    return node_dir(nick, nodes_dir=nodes_dir) / "sessions.json"
+
+
+def load_path(nick: str, *, nodes_dir: Path | None = None) -> Path:
+    return node_dir(nick, nodes_dir=nodes_dir) / "load.jsonl"
+
+
+def pull_marks_path(nick: str, *, nodes_dir: Path | None = None) -> Path:
+    return node_dir(nick, nodes_dir=nodes_dir) / "pull.json"
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Replace ``path`` with ``text`` in one ``os.replace`` from a sibling temp
+    file (atomic only within a filesystem, hence the sibling). The temp name
+    comes from ``tempfile.mkstemp`` -- unique across processes AND threads (the
+    daemon writes several nodes at once) -- and ends in ``.tmp``, never
+    ``.json``: readers glob ``*.json`` in a mirror dir and must never see a
+    half-written file. A failed write leaves the old file and no temp behind."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    tmp = Path(tmp_name)
+    try:
+        try:
+            fh = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            # fdopen never took ownership: close the raw fd here, or it leaks
+            # (and on Windows an open handle also blocks the unlink below).
+            os.close(fd)
+            raise
+        with fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
+def write_json_atomic(path: Path, data: object) -> None:
+    """``write_text_atomic`` of ``data`` as JSON. A NaN or infinity raises
+    ValueError before any file is touched -- ``NaN`` is not JSON, and a
+    non-finite timestamp would make every staleness check lie."""
+    write_text_atomic(path, json.dumps(data, indent=2, allow_nan=False) + "\n")
+
+
+@dataclass(frozen=True)
+class NodeSessions:
+    """A node's tmux session list as of the last successful pull (``ts`` is
+    this PC's clock). The daemon rewrites it every tick the node answers, so
+    an old ``ts`` means unreachable, never dead."""
+
+    ts: float
+    sessions: tuple[str, ...]
+
+
+def read_sessions(nick: str, *, nodes_dir: Path | None = None) -> NodeSessions | None:
+    """``<nick>/sessions.json``, or None when it is missing or not a snapshot.
+    A non-finite ``ts`` is not a snapshot: it would read as fresh forever.
+    Neither is a ``sessions`` list holding any non-string: that is corruption,
+    and silently dropping the odd entry would report a live session dead."""
+    try:
+        raw = json.loads(
+            sessions_path(nick, nodes_dir=nodes_dir).read_text(encoding="utf-8")
         )
-    if entry.user is None and not _NODE_LOGIN.fullmatch(user):
-        raise NodeConfigError(
-            f"settings.nodes.{nick}.user is not set and the local username "
-            f"{local_user!r} is not a node login ({user!r} does not match "
-            f"{_NODE_LOGIN.pattern}); set it explicitly"
-        )
-    if entry.user is None and user == "root":
-        raise NodeConfigError(
-            f"settings.nodes.{nick}: magent is running as root and would run "
-            'sessions as root on the node; write "user": "root" to mean it (D4)'
-        )
-    return Node(nick=nick, host=entry.host, user=user, root=entry.root)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    ts, names = raw.get("ts"), raw.get("sessions")
+    # bool is an int subclass: `"ts": true` is corruption, not 1.0.
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    if not math.isfinite(ts) or not isinstance(names, list):
+        return None
+    if not all(isinstance(n, str) for n in names):
+        return None
+    return NodeSessions(ts=float(ts), sessions=tuple(names))
+
+
+def sessions_stale(
+    snap: NodeSessions | None, *, pull_interval_s: float, now: float
+) -> bool:
+    """Spec §7: a snapshot more than two pull intervals older OR newer than
+    ``now`` reads ``stale``; a wall clock that jumped backwards therefore
+    reads stale for at most one tick, never fresh forever."""
+    return snap is None or abs(now - snap.ts) > 2 * pull_interval_s
 
 
 def _is_env_file(name: str) -> bool:

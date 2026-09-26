@@ -8,7 +8,8 @@ local git reads a bring-up needs. Every function returns data or raises
   -- never an f-string shell, and never parsed by the node user's LOGIN shell
   (zsh expands a bare ``=word``, which is every exact tmux target ``=<sid>``);
 - every call is bounded: ``timeout_s`` is a required keyword, so a call that
-  forgot it is a TypeError, never a hang;
+  forgot it is a TypeError, never a hang -- and the stdout it may hold in RAM
+  is capped too (``max_stdout_bytes``, default ``MAX_REPLY_BYTES``);
 - secrets travel on stdin only -- never argv, never a log line;
   ``RemoteError.command_redacted`` names stdin by its length alone;
 - ``BatchMode=yes`` everywhere: a password prompt nobody can answer is a hang.
@@ -26,11 +27,16 @@ import io
 import json
 import math
 import os
+import re
 import shlex
+import shutil
 import stat
 import subprocess
 import tarfile
+import threading
+import time
 import unicodedata
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -50,11 +56,13 @@ from magent.nodes import (
     NodeConfigError,
     absolute_remote,
     encoded_project_dir,
+    node_dir,
 )
 from magent.sessions import build_resume_command
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Collection, Mapping, Sequence
+    from typing import IO
 
     from magent.nodes import Node, Recipe
 
@@ -97,6 +105,18 @@ SSH_BATCH_OPTS = (
     "ServerAliveCountMax=3",
 )
 
+# The most stdout one call may hold in RAM (``max_stdout_bytes``'s default):
+# past it the child is killed and the call is RemoteError, so a node streaming
+# gigabytes inside its time bound is an error, never a MemoryError. 64 MiB
+# dwarfs every control and bring-up reply, and holds ``ignored_paths``' local
+# `git ls-files` output for a very large repo. A pull passes its own cap.
+MAX_REPLY_BYTES = 64 * 1024 * 1024
+# How much of a child's stderr is held: only its tail is ever read, so older
+# bytes are dropped as new ones arrive. Drained whole all the same -- a child
+# blocked on a full stderr pipe would hang.
+_STDERR_KEEP_BYTES = 1024 * 1024
+# One read from a child's pipe.
+_READ_CHUNK_BYTES = 64 * 1024
 # How much of a failed command's stderr an error carries: enough for the
 # cause, never a whole log.
 _STDERR_TAIL_LINES = 20
@@ -217,6 +237,99 @@ def _run_shown(
     return _redacted(["ssh", *_ssh_tail(node, argv_remote, tty=False)], input_bytes)
 
 
+class _Drain(threading.Thread):
+    """One of a child's output pipes, read to its end on a daemon thread,
+    holding at most ``cap`` bytes.
+
+    Head mode (stdout): the first byte past the cap ends the read, drops all
+    it held, sets ``over`` and closes the pipe -- so a writer still filling it
+    fails instead of blocking forever. Tail mode (stderr): the oldest bytes are
+    dropped instead, and the read runs to the end. Only this thread closes the
+    pipe, so no close ever races a read. ``over`` and ``data`` are read once
+    the thread has finished."""
+
+    def __init__(self, pipe: IO[bytes] | None, cap: int, *, tail: bool) -> None:
+        super().__init__(daemon=True)
+        self._pipe = pipe
+        self._cap = cap
+        self._tail = tail
+        self._chunks: deque[bytes] = deque()
+        self._held = 0
+        self.over = False
+
+    def run(self) -> None:
+        if self._pipe is None:
+            return
+        try:
+            # A broken pipe ends the stream the way EOF does.
+            with contextlib.suppress(OSError):
+                self._read(self._pipe.fileno())
+        finally:
+            with contextlib.suppress(OSError):
+                self._pipe.close()
+
+    def _read(self, fd: int) -> None:
+        # os.read, not the buffered object: it returns what is there now, so
+        # a trickle is seen as it arrives.
+        while chunk := os.read(fd, _READ_CHUNK_BYTES):
+            if not self._tail and self._held + len(chunk) > self._cap:
+                self.over = True
+                self._chunks.clear()
+                self._held = 0
+                return
+            self._chunks.append(chunk)
+            self._held += len(chunk)
+            while self._tail and self._held - len(self._chunks[0]) >= self._cap:
+                self._held -= len(self._chunks.popleft())
+
+    def data(self) -> bytes:
+        held = b"".join(self._chunks)
+        self._chunks.clear()
+        return held[-self._cap :] if self._tail else held
+
+
+def _feed(pipe: IO[bytes], data: bytes) -> None:
+    """Write ``data`` to a child's stdin and close it -- on its own thread, so
+    a child that writes before it reads cannot deadlock the call. A child that
+    exits without reading it all is no error here; its exit status says what
+    happened (a broken pipe, or EINVAL on Windows, is swallowed)."""
+    try:
+        with contextlib.suppress(OSError):
+            pipe.write(data)
+    finally:
+        with contextlib.suppress(OSError):
+            pipe.close()
+
+
+def _kill(proc: subprocess.Popen[bytes]) -> None:
+    proc.kill()
+    # Reap the direct child only, bounded. Waiting on the pipes -- the drain
+    # threads, or a communicate() -- would wait for every write end, and the
+    # interpreter behind a .cmd/sh shim is a GRANDCHILD still holding one --
+    # the 90s-for-a-5s timeout defect psmux.probe_control_plane documents.
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+        proc.wait(timeout=_REAP_TIMEOUT_S)
+
+
+def _finish(
+    proc: subprocess.Popen[bytes], out: _Drain, err: _Drain, timeout_s: float
+) -> bool:
+    """Wait, within ``timeout_s``, for stdout to end (EOF or over its cap),
+    then stderr, then the exit. False if the bound ran out first."""
+    deadline = time.monotonic() + timeout_s
+    out.join(timeout_s)
+    if out.over:
+        return True
+    err.join(max(0.0, deadline - time.monotonic()))
+    if out.is_alive() or err.is_alive():
+        return False
+    try:
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
 def _spawn(
     argv: list[str],
     *,
@@ -226,12 +339,20 @@ def _spawn(
     shown: tuple[str, ...],
     label: str,
     env: Mapping[str, str] | None = None,
+    quiet: bool = False,
+    max_stdout_bytes: int = MAX_REPLY_BYTES,
 ) -> subprocess.CompletedProcess[bytes]:
     """One bounded child -- the shared body of ``run`` and the local git reads
     (``ignored_paths``, ``git_state``). ``shown`` is what an error and a log line may say
     about the command; ``label`` opens every log line, naming who spawned it.
     ``env`` None is the plain inherited environment (every ssh call); only
-    the local git reads pass one (``_local_git``)."""
+    the local git reads pass one (``_local_git``). ``quiet`` drops every one
+    of those log lines; the RemoteError is raised exactly the same.
+
+    Bounded in time AND in memory: stdout is read as it arrives, and a child
+    whose stdout passes ``max_stdout_bytes`` is killed and raised as
+    RemoteError rc None ("reply exceeded N bytes") -- nothing past the cap is
+    held. stderr is drained too, keeping only its last ``_STDERR_KEEP_BYTES``."""
     try:
         proc = subprocess.Popen(
             argv,
@@ -249,32 +370,46 @@ def _spawn(
         # log line names the program only.
         rc = SSH_MISSING_RC if isinstance(e, FileNotFoundError) else None
         reason = e.strerror or str(e)
-        get_logger("nodes").warning(
-            "%s could not start (%s): %s", label, reason, shlex.join(shown)
-        )
+        if not quiet:
+            get_logger("nodes").warning(
+                "%s could not start (%s): %s", label, reason, shlex.join(shown)
+            )
         raise RemoteError(rc, reason, shown) from e
-    try:
-        out, err = proc.communicate(input=input_bytes, timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        # Reap the direct child only, bounded. A second communicate() would
-        # wait for every pipe's write end, and the interpreter behind a
-        # .cmd/sh shim is a GRANDCHILD still holding one -- the 90s-for-a-5s
-        # timeout defect psmux.probe_control_plane documents.
-        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
-            proc.wait(timeout=_REAP_TIMEOUT_S)
-        get_logger("nodes").warning(
-            "%s timed out after %.1fs: %s", label, timeout_s, shlex.join(shown)
-        )
+    if input_bytes is not None and proc.stdin is not None:
+        threading.Thread(
+            target=_feed, args=(proc.stdin, input_bytes), daemon=True
+        ).start()
+    out = _Drain(proc.stdout, max_stdout_bytes, tail=False)
+    err = _Drain(proc.stderr, _STDERR_KEEP_BYTES, tail=True)
+    out.start()
+    err.start()
+    if not _finish(proc, out, err, timeout_s):
+        _kill(proc)
+        if not quiet:
+            get_logger("nodes").warning(
+                "%s timed out after %.1fs: %s", label, timeout_s, shlex.join(shown)
+            )
         raise RemoteError(
             None, f"timed out after {timeout_s:g}s", shown, timed_out=True
-        ) from None
-    if check and proc.returncode != 0:
-        get_logger("nodes").warning(
-            "%s failed (rc=%s): %s", label, proc.returncode, shlex.join(shown)
         )
-        raise RemoteError(proc.returncode, _tail(err), shown)
-    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+    if out.over:
+        _kill(proc)
+        if not quiet:
+            get_logger("nodes").warning(
+                "%s reply exceeded %d bytes: %s",
+                label,
+                max_stdout_bytes,
+                shlex.join(shown),
+            )
+        raise RemoteError(None, f"reply exceeded {max_stdout_bytes} bytes", shown)
+    stderr = err.data()
+    if check and proc.returncode != 0:
+        if not quiet:
+            get_logger("nodes").warning(
+                "%s failed (rc=%s): %s", label, proc.returncode, shlex.join(shown)
+            )
+        raise RemoteError(proc.returncode, _tail(stderr), shown)
+    return subprocess.CompletedProcess(argv, proc.returncode, out.data(), stderr)
 
 
 def run(
@@ -284,13 +419,19 @@ def run(
     timeout_s: float,
     input_bytes: bytes | None = None,
     check: bool = True,
+    quiet: bool = False,
+    max_stdout_bytes: int = MAX_REPLY_BYTES,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run ``argv_remote`` on ``node`` over ssh, as ONE ``bash -c`` remote
     string (``_remote_string``). Raises RemoteError on a spawn failure, a
-    missing client (rc 127), a timeout (rc None), or -- with ``check`` -- a
-    non-zero exit. With ``check=False`` every exit code comes back for the
+    missing client (rc 127), a timeout (rc None), a reply over
+    ``max_stdout_bytes`` (rc None; the child is killed), or -- with ``check``
+    -- a non-zero exit. With ``check=False`` every exit code comes back for the
     caller to classify. The returned ``CompletedProcess.args`` is the real
-    argv, this PC's client path included: a caller must not log it."""
+    argv, this PC's client path included: a caller must not log it.
+    ``quiet`` drops the per-call log line, for a caller that reports the
+    outcome itself (the sync daemon logs once per state change, not once per
+    tick)."""
     tail = _ssh_tail(node, argv_remote, tty=False)
     shown = _run_shown(node, argv_remote, input_bytes)
     return _spawn(
@@ -300,6 +441,8 @@ def run(
         check=check,
         shown=shown,
         label="node call",
+        quiet=quiet,
+        max_stdout_bytes=max_stdout_bytes,
     )
 
 
@@ -338,6 +481,7 @@ def run_script(
     *,
     timeout_s: float,
     stdin: bytes | None = None,
+    max_stdout_bytes: int = MAX_REPLY_BYTES,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run the packaged ``node_scripts/<script>.sh`` on ``node`` as
     ``bash -s -- <SOCKET> <args>``: the script on stdin, then -- when
@@ -346,6 +490,7 @@ def run_script(
     ``stdin``; ``args`` are argv, visible to the node's process table and to
     logs. A failure's ``stderr_tail`` is the script's own words (see
     ``RemoteError``): a script must never echo its payload.
+    ``max_stdout_bytes`` goes to ``run`` as is.
 
     Refused before any ssh: ValueError for a script in
     ``node_scripts.NON_ENTRY_SCRIPTS`` (it would read the socket as its own
@@ -354,7 +499,13 @@ def run_script(
     if f"{script}.sh" in node_scripts.NON_ENTRY_SCRIPTS:
         raise ValueError(f"{script}.sh is not a run_script entry point")
     argv_remote, framed = _script_call(script, args, stdin)
-    return run(node, argv_remote, timeout_s=timeout_s, input_bytes=framed)
+    return run(
+        node,
+        argv_remote,
+        timeout_s=timeout_s,
+        input_bytes=framed,
+        max_stdout_bytes=max_stdout_bytes,
+    )
 
 
 def has_session(node: Node, sid: str) -> bool | None:
@@ -510,6 +661,27 @@ def _integral(value: object) -> int:
     return int(value)
 
 
+def _load_sample(raw: object) -> LoadSample:
+    """``magent_sample``'s JSON object as a LoadSample -- the ONE parse, shared
+    by ``sample()`` and ``parse_pull``. KeyError, TypeError, ValueError or
+    OverflowError when it is not one: a JSON list or string is a TypeError,
+    and every field goes through ``_finite``/``_integral``, whose refusals
+    (non-number, bool, string, NaN, infinity, fractional count, an integer too
+    large for a float) are those exceptions."""
+    if not isinstance(raw, dict):
+        raise TypeError(f"expected an object, got {type(raw).__name__}")
+    return LoadSample(
+        ts=_finite(raw["ts"]),
+        nproc=_integral(raw["nproc"]),
+        load1=_finite(raw["load1"]),
+        load5=_finite(raw["load5"]),
+        load15=_finite(raw["load15"]),
+        mem_total_mb=_integral(raw["mem_total_mb"]),
+        mem_avail_mb=_integral(raw["mem_avail_mb"]),
+        my_sessions=_integral(raw["my_sessions"]),
+    )
+
+
 def sample(node: Node) -> LoadSample:
     """One load reading from ``node`` (``sample.sh``). RemoteError when the node
     can't be reached, or answers something that is not a sample -- rc 0 on
@@ -519,17 +691,7 @@ def sample(node: Node) -> LoadSample:
     number is not a sample either."""
     result = run_script(node, "sample", [], timeout_s=PROBE_TIMEOUT_S)
     try:
-        raw = json.loads(result.stdout.decode("utf-8", "replace"))
-        reading = LoadSample(
-            ts=_finite(raw["ts"]),
-            nproc=_integral(raw["nproc"]),
-            load1=_finite(raw["load1"]),
-            load5=_finite(raw["load5"]),
-            load15=_finite(raw["load15"]),
-            mem_total_mb=_integral(raw["mem_total_mb"]),
-            mem_avail_mb=_integral(raw["mem_avail_mb"]),
-            my_sessions=_integral(raw["my_sessions"]),
-        )
+        reading = _load_sample(json.loads(result.stdout.decode("utf-8", "replace")))
     # OverflowError is an ArithmeticError, not a ValueError: float() of a
     # 401-digit integer overflows. (`1e400` parses to inf, a ValueError from
     # _finite/_integral.)
@@ -541,6 +703,517 @@ def sample(node: Node) -> LoadSample:
             shown,
         ) from e
     return reading
+
+
+# --- The pull (node_sync's one ssh per node per tick) -------------------------
+# How long one pull may take: one connection streaming every changed file of
+# every session on the node. `pull` waits this long per phase.
+PULL_TIMEOUT_S = 120.0
+# The wire format of one pull.sh reply, in order:
+#   PULL_HEADER, one JSON metadata line, a PLAIN (uncompressed) tar archive,
+#   then the trailer line `PULL_TRAILER <member count>\n`, last.
+# The first line of every pull.sh reply. Anything before it (a banner some rc
+# file printed) is ignored; a reply without it is not a pull.
+PULL_HEADER = b"MAGENT-PULL/1\n"
+PULL_TRAILER = b"MAGENT-PULL-END "
+"""The last line of every pull.sh reply: this prefix, the number of archive
+members as ASCII digits, and ``\\n``. tarfile reads a cut or garbage header
+past the first as end-of-archive, so without it a reply cut after member 1
+parses as a SUCCESS holding one file -- and since ``now`` becomes the next
+watermark, the lost members are never asked for again. The count is every
+member pull.sh's tar writer added. pull.sh writes the line ONLY after that
+writer closed without error: an exception mid-archive exits non-zero with no
+trailer, so the reply reads as truncated."""
+PULL_MAX_MEMBER_BYTES = 64 * 1024 * 1024
+"""The largest file a pull ships. ``pull_node`` sends it to pull.sh as
+``max_member_bytes``, and the node leaves a bigger file out and names it under
+``skipped`` (``NodeSnapshot.skipped``) -- not a failure, or a file that stays
+over the cap would fail its session every tick and freeze its watermark
+forever. Defense in depth: a member that still declares more is not stored
+here, and its session fails. A transcript is the largest file a pull carries."""
+PULL_MAX_TOTAL_BYTES = 512 * 1024 * 1024
+"""The most one reply may ask this PC to write, summed over the members it
+would store; more is RemoteError before anything is written."""
+PULL_MAX_REPLY_BYTES = PULL_MAX_TOTAL_BYTES + 4 * 1024 * 1024
+"""The most stdout one pull may hold in RAM: ``pull_node`` passes it as
+``max_stdout_bytes``. Over ``PULL_MAX_TOTAL_BYTES`` because the header, the
+metadata line, tar's per-member headers and padding, and the trailer all ride
+on top of the members' own bytes."""
+PULL_COPY_CHUNK_BYTES = 1024 * 1024
+"""A member is streamed to disk in chunks of this size, never read whole."""
+# The newest mtime believed: ~36,800 years of Unix time, far past any real
+# clock yet inside every platform's time_t, so os.utime cannot overflow. A
+# member outside [0, _MAX_MTIME] (or NaN, or inf) is stored without its mtime.
+_MAX_MTIME = 2**40
+_TRAILER_COUNT = re.compile(rb"([0-9]{1,9})\n")
+# The next watermark is the NODE's clock when its scan began, minus this: a
+# file written in the same second as the scan is asked for again, never lost.
+WATERMARK_OVERLAP_S = 1.0
+_PULL_KINDS = frozenset({"transcripts", "state"})
+# A session directory sits beside these per-node files; no sid may take a name.
+_RESERVED_NAMES = frozenset(
+    {"sessions.json", "load.jsonl", "pull.json", "node-map.json"}
+)
+# Every path part must be a legal file name on THIS PC, which may be Windows.
+_UNSAFE_CHARS = re.compile(r'[\x00-\x1f<>:"/\\|?*]')
+# ntpath's reserved set on 3.13 (ntpath.isreserved is 3.13+, so it is copied):
+# the superscript digits count as COM/LPT numbers too.
+_DEVICE_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CONIN$",
+        "CONOUT$",
+        *(f"COM{c}" for c in "123456789¹²³"),
+        *(f"LPT{c}" for c in "123456789¹²³"),
+    }
+)
+
+
+@dataclass(frozen=True)
+class SidPull:
+    """What a pull asks a node for, per session:
+    - ``roots``: the session's cwd as the node map records it (``~`` unexpanded;
+      pull.sh expands it);
+    - ``project_dir``: the finished ``~/.claude/projects`` name for that cwd.
+      It is None until the node has reported its real path once, because nodes
+      never encode (DECISION-11f);
+    - ``since``: the node-clock watermark that a file must be newer than."""
+
+    roots: tuple[str, ...]
+    project_dir: str | None
+    since: float
+
+
+@dataclass(frozen=True)
+class NodeSnapshot:
+    """One pull.sh reply, parsed, with its files stored:
+    - ``now``: the node's clock when its scan began (the next watermark);
+    - ``files``: what landed on this PC;
+    - ``failed_sids``: sessions with a file that could not be stored. Their
+      watermark must not move;
+    - ``skipped``: per session, the archive names pull.sh left out because
+      they were over ``PULL_MAX_MEMBER_BYTES`` on the node. NOT a failure:
+      a file that stays over the cap would otherwise fail its session on
+      every tick and freeze its watermark forever. The caller reports them."""
+
+    now: float
+    sessions: tuple[str, ...]
+    sample: LoadSample | None
+    realpaths: Mapping[str, str]
+    state_files: Mapping[str, tuple[str, ...]]
+    files: tuple[Path, ...]
+    failed_sids: frozenset[str]
+    skipped: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+
+
+def _pull_error(message: str) -> RemoteError:
+    # rc 0: the node answered, and the answer was not a pull.
+    return RemoteError(0, message, ("pull.sh",))
+
+
+def _safe_part(part: str) -> bool:
+    # A part ending in "." or " " is refused outright (Windows drops them), so
+    # the device check needs only ntpath's: the stem before the FIRST dot,
+    # trailing spaces dropped -- "CON .jsonl" opens the console.
+    return (
+        part not in ("", ".", "..")
+        and _UNSAFE_CHARS.search(part) is None
+        and not part.endswith((".", " "))
+        and part.split(".", 1)[0].rstrip(" ").upper() not in _DEVICE_NAMES
+    )
+
+
+def pullable_sid(sid: str) -> bool:
+    """Can ``sid`` name a directory under ``~/.magent/nodes/<nick>/`` here?"""
+    return _safe_part(sid) and sid not in _RESERVED_NAMES
+
+
+def _str_dict(raw: object) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def _names_dict(raw: object) -> dict[str, tuple[str, ...]]:
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        k: tuple(
+            n for n in v if isinstance(n, str) and n.endswith(".json") and _safe_part(n)
+        )
+        for k, v in raw.items()
+        if isinstance(k, str) and isinstance(v, list)
+    }
+
+
+def _skipped_dict(raw: object) -> dict[str, tuple[str, ...]]:
+    """pull.sh's ``skipped`` map: ``{sid: [archive name, ...]}``. Only its
+    strings are kept; anything else there is ignored, never an error -- the
+    names are the node's report, read to be logged, never a path to open."""
+    if not isinstance(raw, dict):
+        return {}
+    kept = {
+        k: tuple(n for n in v if isinstance(n, str))
+        for k, v in raw.items()
+        if isinstance(k, str) and isinstance(v, list)
+    }
+    return {k: names for k, names in kept.items() if names}
+
+
+def _member_parts(
+    member: tarfile.TarInfo, sids: frozenset[str]
+) -> tuple[str, ...] | None:
+    """``<sid>/transcripts/<any depth>`` or ``<sid>/state/<name>.json`` for a
+    requested sid, every part a legal name here, regular files only -- or None."""
+    if not member.isfile():
+        return None
+    # tarfile calls a GNU sparse member a file, and its size is whatever the
+    # header claims. pull.sh never passes `-S`, so a sparse member is never ours.
+    if member.issparse():
+        return None
+    parts = tuple(member.name.split("/"))
+    if len(parts) < 3 or parts[0] not in sids or parts[1] not in _PULL_KINDS:
+        return None
+    if parts[1] == "state" and (len(parts) != 3 or not parts[2].endswith(".json")):
+        return None
+    if not all(_safe_part(p) for p in parts):
+        return None
+    return parts
+
+
+def _usable_mtime(value: object) -> float | None:
+    """A member's mtime as ``os.utime`` can take it, or None. A PAX header
+    can say ``nan`` (ValueError from utime) or ``1e400``, and GNU base-256
+    can say ``10**20`` (OverflowError): the node's word, never a crash here."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    if not math.isfinite(number) or not 0 <= number <= _MAX_MTIME:
+        return None
+    return number
+
+
+def _write_file(path: Path, reader: IO[bytes], mtime: float | None) -> None:
+    """Store one pulled file whole (sibling ``.part`` + ``os.replace``) with the
+    node's mtime when it has a usable one, so a reader never sees half a
+    transcript. Streamed in ``PULL_COPY_CHUNK_BYTES`` chunks, never whole."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    part = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.part")
+    try:
+        with part.open("wb") as out:
+            shutil.copyfileobj(reader, out, length=PULL_COPY_CHUNK_BYTES)
+        if mtime is not None:
+            os.utime(part, (mtime, mtime))
+        os.replace(part, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            part.unlink()
+        raise
+
+
+def _newness(member: tarfile.TarInfo) -> float:
+    mtime = _usable_mtime(member.mtime)
+    return -1.0 if mtime is None else mtime
+
+
+def _select(
+    members: Sequence[tarfile.TarInfo], sids: frozenset[str]
+) -> tuple[dict[tuple[str, ...], tarfile.TarInfo], frozenset[str]]:
+    """What to store: one member per path -- the newer mtime wins a duplicate,
+    a tie goes to the later one, as tar itself would leave it -- and the sids
+    that hold a member over ``PULL_MAX_MEMBER_BYTES`` (never read). Nothing is
+    read here; only headers are looked at."""
+    log = get_logger("nodes")
+    chosen: dict[tuple[str, ...], tarfile.TarInfo] = {}
+    oversized: set[str] = set()
+    skipped = 0
+    for member in members:
+        parts = _member_parts(member, sids)
+        if parts is None:
+            skipped += 1
+            continue
+        if member.size > PULL_MAX_MEMBER_BYTES:
+            oversized.add(parts[0])
+            log.warning(
+                "node pull: %s declares %d bytes, over the %d-byte cap; not stored",
+                "/".join(parts),
+                member.size,
+                PULL_MAX_MEMBER_BYTES,
+            )
+            continue
+        held = chosen.get(parts)
+        if held is None or _newness(member) >= _newness(held):
+            chosen[parts] = member
+    if skipped:
+        log.warning(
+            "node pull: skipped %d archive member(s) outside the requested sessions",
+            skipped,
+        )
+    return chosen, frozenset(oversized)
+
+
+def _extract(
+    archive: bytes, count: int, *, dest: Path, sids: frozenset[str]
+) -> tuple[tuple[Path, ...], frozenset[str]]:
+    """Check the archive against its trailer's ``count`` and its size caps,
+    THEN store what was asked for -- a damaged or oversized archive writes
+    nothing. A session with a file that cannot be stored fails alone."""
+    if not archive:
+        if count:
+            raise _pull_error(
+                f"pull archive damaged: expected {count} member(s), saw 0"
+            )
+        return (), frozenset()
+    log = get_logger("nodes")
+    files: list[Path] = []
+    failed: set[str] = set()
+    try:
+        # "r:" -- a plain tar only. pull.sh never compresses (ssh can), and a
+        # compressed archive would decompress past every cap below.
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
+            members = tar.getmembers()
+            if len(members) != count:
+                raise _pull_error(
+                    f"pull archive damaged: expected {count} member(s), "
+                    f"saw {len(members)}"
+                )
+            chosen, oversized = _select(members, sids)
+            total = sum(m.size for m in chosen.values())
+            if total > PULL_MAX_TOTAL_BYTES:
+                raise _pull_error(
+                    f"pull archive holds {total} bytes, "
+                    f"over the {PULL_MAX_TOTAL_BYTES}-byte cap"
+                )
+            for parts, member in chosen.items():
+                if parts[0] in failed:
+                    continue
+                reader = tar.extractfile(member)
+                if reader is None:  # _member_parts admits regular files only
+                    continue
+                name = "/".join(parts)
+                mtime = _usable_mtime(member.mtime)
+                if mtime is None:
+                    log.warning(
+                        "node pull: %s has an unusable mtime; stored without it", name
+                    )
+                target = dest.joinpath(*parts)
+                try:
+                    _write_file(target, reader, mtime)
+                except OSError as e:
+                    failed.add(parts[0])
+                    log.warning("node pull: cannot store %s: %s", name, e)
+                    continue
+                files.append(target)
+    # ValueError/OverflowError: a header field this module did not foresee
+    # still ends as a pull error, never an escape past the RemoteError contract.
+    except (tarfile.TarError, EOFError, OSError, ValueError, OverflowError) as e:
+        raise _pull_error(f"unreadable pull archive: {e}") from e
+    return tuple(files), frozenset(failed | oversized)
+
+
+def _split_trailer(rest: bytes) -> tuple[bytes, int]:
+    """``rest`` (everything after the header) without its trailer line, and
+    the member count that line claims. The trailer is the LAST line, so it is
+    looked for from the end: a file holding the same text sits before it."""
+    at = rest.rfind(PULL_TRAILER)
+    found = _TRAILER_COUNT.fullmatch(rest, at + len(PULL_TRAILER)) if at >= 0 else None
+    if found is None:
+        raise _pull_error("reply truncated: no MAGENT-PULL-END line at its end")
+    return rest[:at], int(found.group(1))
+
+
+def parse_pull(stdout: bytes, *, dest: Path, sids: Collection[str]) -> NodeSnapshot:
+    """Parse a pull.sh reply and store its files under ``dest`` (a node's
+    mirror dir). Only the requested ``sids`` are believed: their metadata, and
+    archive members shaped ``<sid>/transcripts/...`` or ``<sid>/state/<x>.json``
+    whose every part is a legal name here. Everything else is dropped with one
+    warning. RemoteError (rc 0) when the reply is not a pull at all -- no
+    header, no ``PULL_TRAILER`` last line (truncated), a member count that
+    disagrees with the trailer, a compressed or unreadable archive, or one
+    over ``PULL_MAX_TOTAL_BYTES``. ValueError when a requested sid is not
+    ``pullable_sid``: that is the caller's bug, not the node's.
+
+    A member lands at ``dest/<its own archive path>`` -- nothing here maps a
+    path back to a project directory."""
+    wanted = frozenset(sids)
+    bad = next((s for s in sorted(wanted) if not pullable_sid(s)), None)
+    if bad is not None:
+        raise ValueError(f"not a pullable session name: {bad!r}")
+    _, sep, rest = stdout.partition(PULL_HEADER)
+    if not sep:
+        raise _pull_error("no MAGENT-PULL header in the reply")
+    framed, count = _split_trailer(rest)
+    meta_line, _, archive = framed.partition(b"\n")
+    try:
+        meta = json.loads(meta_line.decode("utf-8"))
+    except ValueError as e:
+        raise _pull_error(f"unreadable pull metadata: {e}") from e
+    if not isinstance(meta, dict):
+        raise _pull_error("pull metadata is not an object")
+    now = meta.get("now")
+    # json.loads accepts NaN and Infinity. A non-finite clock would become a
+    # NaN watermark, which write_json_atomic refuses with ValueError.
+    if (
+        isinstance(now, bool)
+        or not isinstance(now, (int, float))
+        or not math.isfinite(now)
+    ):
+        raise _pull_error("pull metadata has no clock")
+    raw_sessions = meta.get("sessions")
+    # A non-string entry is corruption, never a name to skip: dropping it would
+    # write a snapshot without that session, and D would read it as dead.
+    if not isinstance(raw_sessions, list) or not all(
+        isinstance(s, str) for s in raw_sessions
+    ):
+        raise _pull_error("pull metadata's sessions is not a list of names")
+    sessions = tuple(s for s in raw_sessions if s)
+    try:
+        reading: LoadSample | None = _load_sample(meta.get("sample"))
+    except (ValueError, KeyError, TypeError, OverflowError):
+        reading = None
+    files, failed = _extract(archive, count, dest=dest, sids=wanted)
+    return NodeSnapshot(
+        now=float(now),
+        sessions=sessions,
+        sample=reading,
+        realpaths={
+            k: v for k, v in _str_dict(meta.get("realpaths")).items() if k in wanted
+        },
+        state_files={
+            k: v for k, v in _names_dict(meta.get("state_files")).items() if k in wanted
+        },
+        files=files,
+        failed_sids=failed,
+        skipped={
+            k: v for k, v in _skipped_dict(meta.get("skipped")).items() if k in wanted
+        },
+    )
+
+
+def _pull_call(sids: Mapping[str, SidPull]) -> tuple[list[str], bytes]:
+    """The remote argv and stdin of one pull.sh call for ``sids``."""
+    payload = {
+        "sids": {
+            sid: {
+                "roots": list(s.roots),
+                "project_dir": s.project_dir,
+                "since": s.since,
+            }
+            for sid, s in sids.items()
+        },
+        # The node skips a bigger file and names it under `skipped`, so a file
+        # that stays over the cap never fails its session (NodeSnapshot.skipped).
+        "max_member_bytes": PULL_MAX_MEMBER_BYTES,
+    }
+    return _script_call(
+        "pull", [], json.dumps(payload).encode("utf-8")
+    )  # `bash -s -- <SOCKET>`: the socket is always $1
+
+
+def refused_pull(node: Node, sids: Mapping[str, SidPull], message: str) -> RemoteError:
+    """A pull of ``sids`` refused on this PC before any ssh: rc 0, and the
+    command it would have run, shown the way every node error shows one
+    (``_run_shown``)."""
+    argv, input_bytes = _pull_call(sids)
+    return RemoteError(0, message, _run_shown(node, argv, input_bytes))
+
+
+def pull_node(
+    node: Node,
+    sids: Mapping[str, SidPull],
+    *,
+    dest: Path | None = None,
+    timeout_s: float = PULL_TIMEOUT_S,
+) -> NodeSnapshot:
+    """ONE ssh to ``node`` running pull.sh for ``sids`` (possibly none: the
+    call still returns liveness and load), with the files stored under
+    ``dest`` (default: the node's mirror dir). Quiet: the caller reports.
+    RemoteError on a transport failure (255), a timeout or a reply over
+    ``PULL_MAX_REPLY_BYTES`` (None), a node without python3 (3), or a reply
+    that is not a pull (0)."""
+    argv, input_bytes = _pull_call(sids)
+    result = run(
+        node,
+        argv,
+        timeout_s=timeout_s,
+        input_bytes=input_bytes,
+        check=False,
+        quiet=True,
+        max_stdout_bytes=PULL_MAX_REPLY_BYTES,
+    )
+    if result.returncode != 0:
+        raise RemoteError(
+            result.returncode,
+            _tail(result.stderr),
+            _run_shown(node, argv, input_bytes),
+        )
+    return parse_pull(
+        result.stdout,
+        dest=dest if dest is not None else node_dir(node.nick),
+        sids=frozenset(sids),
+    )
+
+
+@dataclass(frozen=True)
+class PullResult:
+    """``pull``'s answer (master §3): the files that landed, and the watermark
+    to pass as ``since_epoch`` next time."""
+
+    files: tuple[Path, ...]
+    since: float
+
+
+def pull(
+    node: Node,
+    sid: str,
+    remote_dirs: Sequence[str],
+    since_epoch: float,
+    *,
+    timeout_s: float = PULL_TIMEOUT_S,
+) -> PullResult:
+    """Pull one session's transcripts and state newer than ``since_epoch``
+    into the node's mirror (master §3; G's recall calls it with 0.0).
+
+    Two calls when the transcript dir is not known yet: the first learns the
+    session's real path on the node, the second asks for
+    ``~/.claude/projects/<encoded real path>`` -- the PC encodes, never the
+    node (DECISION-11f). Up to 2 x ``timeout_s`` in all. The watermark only
+    moves when every file was stored; a file the node skipped as over the cap
+    does not hold it (``NodeSnapshot.skipped``)."""
+    roots = tuple(remote_dirs)
+    # One spec for the refusal and the first call: a refusal names exactly
+    # the pull it would have sent.
+    first_spec = SidPull(roots=roots, project_dir=None, since=since_epoch)
+    # Before any ssh: parse_pull refuses the same name with ValueError, which
+    # would mean THIS caller's bug, not the node's.
+    if not pullable_sid(sid):
+        raise refused_pull(
+            node, {sid: first_spec}, f"not a pullable session name: {sid!r}"
+        )
+    first = pull_node(node, {sid: first_spec}, timeout_s=timeout_s)
+    real = first.realpaths.get(sid)
+    if real is None:
+        return PullResult(files=first.files, since=since_epoch)
+    snap = pull_node(
+        node,
+        {
+            sid: SidPull(
+                roots=roots, project_dir=encoded_project_dir(real), since=since_epoch
+            )
+        },
+        timeout_s=timeout_s,
+    )
+    failed = sid in first.failed_sids or sid in snap.failed_sids
+    since = since_epoch if failed else snap.now - WATERMARK_OVERLAP_S
+    # Both calls ship the session's state records: each path is listed once.
+    files = tuple(dict.fromkeys(first.files + snap.files))
+    return PullResult(files=files, since=since)
 
 
 # A local git read is a local process, but it can still hang (a credential

@@ -40,6 +40,9 @@ NON_ENTRY_SCRIPTS: frozenset[str] = frozenset(
     {
         # The shared library itself: inlined by `# @include`, never run alone.
         "lib.sh",
+        # Claude Code hook, run as a file with --source claude; never through
+        # run_script, so it gets no socket and includes no lib.sh.
+        "state_hook.sh",
     }
 )
 
