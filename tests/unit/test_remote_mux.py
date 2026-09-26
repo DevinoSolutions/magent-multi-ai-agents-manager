@@ -2855,6 +2855,34 @@ class TestBringUpShOnARealShell:
             p.name for p in rig["root"].iterdir() if p.name.startswith(".magent")
         ] == []
 
+    def test_a_folder_created_on_the_way_is_owner_only(self, rig):
+        # umask 077 covers the folders copy_tree makes, not only the files.
+        root = rig["root"]
+        root.mkdir(parents=True)
+        self._push_raw(rig, _raw_payload(("project/sub/.env", b"K=V\n")))
+        assert stat.S_IMODE((root / "sub").stat().st_mode) == 0o700
+        assert (root / "sub" / ".env").read_bytes() == b"K=V\n"
+
+    def test_a_failed_decoration_still_starts_the_session(self, rig):
+        # The one step allowed to fail: a bare status line is not a failed
+        # bring-up.
+        root = str(rig["root"])
+        header = _header_of("MAGENT1", "1", "0", "3", "bash", "-lc", "exec claude", "0")
+        result = remote_mux.run_script(
+            rig["node"],
+            "bring_up",
+            ["up", "api", root, nodes.encoded_project_dir(root)],
+            timeout_s=30,
+            stdin=_raw_payload(("decorate", b"exit 1\n"), header=header),
+        )
+        assert result.returncode == 0
+        assert (
+            b"magent: status-line decoration failed (the session is up)"
+            in result.stderr
+        )
+        assert json.loads(result.stdout.decode().splitlines()[-1])["sid"] == "api"
+        assert "cmd=bash -lc exec claude\n" in self._session(rig)
+
     def test_a_link_that_stays_inside_the_folder_is_written_through(self, rig):
         root = rig["root"]
         (root / "real").mkdir(parents=True)
