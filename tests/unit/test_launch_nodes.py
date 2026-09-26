@@ -36,6 +36,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 _TOOLS = {"claude": "claude --continue"}
+# What a final pull that brought the last turn home returns: None is
+# "never placed", which `down` must not read as pulled.
+_PULLED = remote_mux.PullResult(files=(), since=0.0)
 
 
 def _config(*projects: ProjectConfig) -> MagentConfig:
@@ -1747,7 +1750,7 @@ class TestStoppingNodeSessions:
     def _pulled(self, monkeypatch):
         # Every entry's last turn comes home (Task 16): these pins are about
         # the kill and the unmap, so the pull before them always succeeds.
-        monkeypatch.setattr(node_sync, "final_pull", lambda config, name, **_k: None)
+        monkeypatch.setattr(node_sync, "final_pull", lambda config, name, **_k: _PULLED)
 
     @pytest.fixture
     def kills(self, monkeypatch):
@@ -1984,6 +1987,28 @@ class TestStoppingNodeSessions:
     ):
         assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
 
+    def test_with_an_unreadable_map_a_pinned_kill_says_its_last_turn_was_not_pulled(
+        self, rig, api, kills, unreadable, monkeypatch, capsys
+    ):
+        # The pin is known, so the kill stands. Whether the lost map placed it
+        # -- and so whether there was a last turn to pull -- is not: unknown
+        # never reads as "nothing to pull", and the map is left as it was.
+        def untouched(*_a: object, **_k: object) -> None:
+            raise AssertionError("an unreadable map was written")
+
+        monkeypatch.setattr(
+            node_sync,
+            "final_pull",
+            lambda *_a, **_k: pytest.fail("pulled without a readable entry"),
+        )
+        monkeypatch.setattr(nodes, "update_node_map", untouched)
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert kills[0] == [("second", "api")]
+        out = capsys.readouterr().out
+        assert out.count("\n") == 1, out
+        assert "api: last turn not pulled (the node map could not be read)" in out
+        assert "magent node sync --once" in out
+
     def test_a_torn_map_is_never_rewritten(self, rig, api, kills, torn):
         launch.stop_node_sessions(_config(api), ["api"])
         assert nodes.NODE_MAP_PATH.read_text(encoding="utf-8") == "{ torn"
@@ -2017,10 +2042,11 @@ class TestDownPullsTheLastTurnHomeFirst:
     def _pulls(monkeypatch, error: BaseException | None = None) -> list[str]:
         pulled: list[str] = []
 
-        def pull(config: object, name: str, **_k: object) -> None:
+        def pull(config: object, name: str, **_k: object) -> remote_mux.PullResult:
             pulled.append(name)
             if error is not None:
                 raise error
+            return _PULLED
 
         monkeypatch.setattr(node_sync, "final_pull", pull)
         return pulled
@@ -2032,8 +2058,8 @@ class TestDownPullsTheLastTurnHomeFirst:
         monkeypatch.setattr(
             node_sync,
             "final_pull",
-            lambda config, name, **_k: order.append(
-                ("pull", name, "api" in nodes.read_node_map())
+            lambda config, name, **_k: (
+                order.append(("pull", name, "api" in nodes.read_node_map())) or _PULLED
             ),
         )
         monkeypatch.setattr(
@@ -2107,20 +2133,60 @@ class TestDownPullsTheLastTurnHomeFirst:
         self, rig, tmp_path, monkeypatch, killed
     ):
         # final_pull looks the entry up by the map key. Asked by the project's
-        # CURRENT name it would find nothing, answer "never placed" -- and
-        # the entry would be unmapped as if its last turn were home.
+        # CURRENT name it would find nothing and answer "never placed", and
+        # the last turn would never come home.
         proj = ProjectConfig(path=str(tmp_path / "web"), title="my web", node="auto")
         sid = nodes.node_sid(proj)
         _hold("my.web", nick="third", sid=sid)
-
-        def pull(config: object, name: str, **_k: object) -> None:
-            if name in nodes.read_node_map():
-                raise RemoteError(0, "could not store every pulled file", ("pull.sh",))
-
-        monkeypatch.setattr(node_sync, "final_pull", pull)
+        pulled = self._pulls(monkeypatch)
         assert launch.stop_node_sessions(_config(proj), [sid]) == ([sid], [])
+        assert pulled == ["my.web"]
         assert killed == [sid]
-        assert "my.web" in nodes.read_node_map()
+        assert nodes.read_node_map() == {}
+
+    def test_a_pull_that_found_no_entry_is_not_a_pull(
+        self, rig, api, monkeypatch, capsys, killed
+    ):
+        # `down` read the entry strictly; final_pull reads the map again,
+        # leniently, and a busy or torn map there answers None -- "never
+        # placed". That is a pull that did not happen, never one that did.
+        _hold("api")
+        monkeypatch.setattr(nodes, "read_node_map", dict)
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert killed == ["api"]
+        assert "api" in nodes.load_node_map_strict()
+        out = capsys.readouterr().out
+        assert out.count("\n") == 1, out
+        assert "api: last turn not pulled (the node map could not be read)" in out
+        assert "magent node sync --once" in out
+
+    def test_a_map_busy_under_the_real_final_pull_keeps_the_entry(
+        self, rig, api, monkeypatch, capsys, killed
+    ):
+        # No fake final_pull: the real one, with the map a Windows reader
+        # finds locked (a sync tick or an `up` replacing it) after `down`'s
+        # own strict read went through.
+        _hold("api")
+        real_read = Path.read_text
+        reads: list[None] = []
+        busy = [True]
+
+        def read_text(self: Path, *a: object, **k: object) -> str:
+            if self == nodes.NODE_MAP_PATH and busy[0]:
+                reads.append(None)
+                if len(reads) > 1:
+                    raise PermissionError(13, "The process cannot access the file")
+            return real_read(self, *a, **k)
+
+        monkeypatch.setattr(Path, "read_text", read_text)
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        busy[0] = False
+        assert len(reads) > 1, "final_pull never read the map"
+        assert killed == ["api"]
+        assert "api" in nodes.load_node_map_strict()
+        assert "api: last turn not pulled (the node map could not be read)" in (
+            capsys.readouterr().out
+        )
 
     @pytest.mark.parametrize("timed_out", [True, False], ids=["silent", "rc255"])
     def test_a_node_that_did_not_answer_the_pull_is_not_pulled_again(

@@ -1956,8 +1956,9 @@ class TestDownStopsNodeSessionsWhereTheyRun:
             monkeypatch.setattr("magent.hotkey.stop_listener", lambda: False)
         # The last turn comes home before each kill (Task 16): a pull that
         # never dials unless the test says how it goes.
+        pulled = node_sync.remote_mux.PullResult(files=(), since=0.0)
         monkeypatch.setattr(
-            node_sync, "final_pull", pull or (lambda config, name, **_k: None)
+            node_sync, "final_pull", pull or (lambda config, name, **_k: pulled)
         )
         monkeypatch.setattr(node_sync, "stop_daemon", lambda: sync_daemon)
         out = runner.invoke(cli.main, ["--config", cfgpath, "down", *argv])

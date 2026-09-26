@@ -2078,6 +2078,17 @@ def node_session_ids(config: MagentConfig, group: str | None = None) -> list[str
     return [nodes.node_sid(proj) for proj in nodes.node_projects(config, group)]
 
 
+_MAP_UNREAD = "the node map could not be read"
+
+
+def _say_not_pulled(sid: str, reason: str, kept: str = "kept in the node map") -> None:
+    """The one line a session whose last turn did not come home gets."""
+    click.echo(
+        f"  {style('!', fg='yellow')} {sid}: last turn not pulled ({reason}); "
+        f"{kept} for `magent node sync --once`"
+    )
+
+
 def _final_pull(
     config: MagentConfig, key: str, sid: str, nick: str, no_pull: set[str]
 ) -> bool:
@@ -2095,7 +2106,11 @@ def _final_pull(
     node_sync's UNREACHABLE) joins ``no_pull`` and is not pulled again in this
     call, so ``down --all`` against a hung node costs one pull timeout, not
     one per project on it. Its sessions are still killed. Every other failure
-    -- a reply over the cap is a node that answered -- is this session's."""
+    -- a reply over the cap is a node that answered -- is this session's.
+
+    The caller read ``key`` out of the map strictly, so ``final_pull``'s None
+    ("never placed") is its own lenient re-read finding the map busy or torn:
+    a pull that did not happen, never one that did."""
     # heavy subsystem: in-body per policy (node_sync dials the node)
     from magent import node_sync, remote_mux
 
@@ -2103,7 +2118,7 @@ def _final_pull(
         reason = f"node {nick} did not answer the pull"
     else:
         try:
-            node_sync.final_pull(config, key)
+            result = node_sync.final_pull(config, key)
         except (OSError, ValueError, remote_mux.RemoteError) as exc:
             # OSError covers NodeLockHeld (a sync tick held the node past
             # FINAL_PULL_WAIT_S) and a pulled file this PC could not write;
@@ -2116,11 +2131,13 @@ def _final_pull(
             # ASCII end to end: the cause is the node's or the OS's words.
             reason = _node_error_text(exc).encode("ascii", "replace").decode("ascii")
         else:
-            return True
-    click.echo(
-        f"  {style('!', fg='yellow')} {sid}: last turn not pulled ({reason}); "
-        "kept in the node map for `magent node sync --once`"
-    )
+            if result is not None:
+                return True
+            get_logger("nodes").warning(
+                "down: final pull of %s found no map entry for %r", sid, key
+            )
+            reason = _MAP_UNREAD
+    _say_not_pulled(sid, reason)
     return False
 
 
@@ -2149,7 +2166,10 @@ def stop_node_sessions(
     map lock; their entries stay, which the next bring-up records over.
 
     Each placed session's last turn is pulled home first (``_final_pull``);
-    one that could not be pulled is still killed, but keeps its map entry.
+    one that could not be pulled is still killed, but keeps its map entry. A
+    pinned session behind an unreadable map is killed on its pin with no pull
+    -- there is no entry to pull from -- and says so, since the lost map may
+    have placed it.
 
     The node half only. The LOCAL session a node project may have left here
     (D9) is ``stop_psmux``'s, and the ``down`` shell folds the two halves
@@ -2195,8 +2215,11 @@ def stop_node_sessions(
         if node.nick in unreachable:
             still.append(sid)
             continue
-        # While the entry still names it; with no entry there is nothing to pull.
-        pulled = key is None or _final_pull(config, key, sid, node.nick, no_pull)
+        # While the entry still names it. No entry in a map that was read is
+        # nothing to pull; no entry in a map that was not is a pull not made.
+        pulled = key is not None and _final_pull(config, key, sid, node.nick, no_pull)
+        if key is None and not map_known:
+            _say_not_pulled(sid, _MAP_UNREAD, kept="the node map is left as it was")
         killed = remote_mux.kill_session(node, entry.sid if entry else sid)
         if killed is None:
             log.warning("down: %s not stopped: node %s did not answer", sid, node.nick)
@@ -2210,7 +2233,7 @@ def stop_node_sessions(
                 "down: %s not stopped: not on %s, map unreadable", sid, node.nick
             )
             still.append(sid)
-        if key is None or not pulled:
+        if not pulled:
             continue
         if not map_writable:
             log.warning("down: %s map entry stays: the map could not be written", sid)
