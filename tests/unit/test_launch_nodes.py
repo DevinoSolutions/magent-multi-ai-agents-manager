@@ -233,7 +233,7 @@ class TestTheOutcomeCarriesTheWindowsTitle:
         assert outcome.title == "magent:api"
 
     def test_attaching_instead_names_the_window_too(self, rig, api, tmp_path, windows):
-        _hold("second")
+        _hold("api")
         rig.live = True
         rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
         outcome = launch.bring_up_node_project(_config(api), api, window=True)
@@ -765,15 +765,15 @@ class TestUpBringsUpNodeProjectsToo:
         assert launch.node_session_ids(_config(a, b), group="WORK") == ["a"]
 
 
-def _hold(nick: str) -> None:
+def _hold(name: str, nick: str = "second", sid: str | None = None) -> None:
     nodes.update_node_map(
-        "api",
+        name,
         NodeMapEntry(
             nick=nick,
-            sid="api",
+            sid=sid or name,
             placed_ts=1.0,
             attached_existing=False,
-            remote_root="~/magent/api",
+            remote_root=f"~/magent/{name}",
             target=f"amin@devino-{nick}",
         ),
     )
@@ -822,7 +822,7 @@ class TestTheAttachInsteadPathIsNarrow:
     def test_a_session_held_on_another_node_does_not_excuse_a_dirty_tree(
         self, rig, api, tmp_path
     ):
-        _hold("third")
+        _hold("api", nick="third")
         rig.live = True
         rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
         outcome = launch.bring_up_node_project(_config(api), api)
@@ -830,7 +830,7 @@ class TestTheAttachInsteadPathIsNarrow:
         assert rig.decorated == []
 
     def test_a_probe_that_failed_is_not_a_live_session(self, rig, api, tmp_path):
-        _hold("second")
+        _hold("api")
         rig.live = None  # has_session's "the PROBE failed" answer
         rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
         outcome = launch.bring_up_node_project(_config(api), api)
@@ -843,7 +843,7 @@ class TestTheAttachInsteadPathIsNarrow:
         monkeypatch.setattr(
             launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
         )
-        _hold("second")
+        _hold("api")
         rig.live = True
         rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
         outcome = launch.bring_up_node_project(_config(api), api, window=True)
@@ -930,3 +930,115 @@ class TestEveryNodeFailureIsAnOutcomeButABugIsNot:
         )
         outcome = launch.bring_up_node_project(_config(api), api)
         assert outcome.error == "git clone of api failed"
+
+
+class TestStoppingNodeSessions:
+    """``down``'s node half: each node session is killed ON ITS NODE, once.
+    The local session a node project may have left here is ``stop_psmux``'s
+    (D9), never this function's."""
+
+    @pytest.fixture
+    def kills(self, monkeypatch):
+        calls: list[tuple[str, str]] = []
+        answers: dict[str, bool | None] = {}
+
+        def kill(node, sid):
+            calls.append((node.nick, sid))
+            return answers.get(sid, True)
+
+        monkeypatch.setattr(remote_mux, "kill_session", kill)
+        return calls, answers
+
+    def test_a_killed_session_is_stopped_and_unmapped(self, rig, api, kills):
+        _hold("api")
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert kills[0] == [("second", "api")]
+        assert nodes.read_node_map() == {}
+
+    def test_a_session_that_was_already_gone_is_neither_and_unmapped(
+        self, rig, api, kills
+    ):
+        _hold("api")
+        kills[1]["api"] = False
+        assert launch.stop_node_sessions(_config(api), ["api"]) == ([], [])
+        assert nodes.read_node_map() == {}
+
+    def test_an_unreachable_node_keeps_the_entry_and_names_the_survivor(
+        self, rig, api, kills
+    ):
+        _hold("api")
+        kills[1]["api"] = None
+        assert launch.stop_node_sessions(_config(api), ["api"]) == ([], ["api"])
+        assert "api" in nodes.read_node_map()
+
+    def test_a_pinned_project_nobody_recorded_is_still_asked_and_never_mapped(
+        self, rig, api, kills
+    ):
+        # Another PC (or a lost map) may have started it: the pin says where.
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert kills[0] == [("second", "api")]
+        assert nodes.read_node_map() == {}
+
+    def test_an_auto_project_that_was_never_placed_is_skipped(
+        self, rig, tmp_path, kills
+    ):
+        proj = ProjectConfig(path=str(tmp_path / "web"), node="auto")
+        assert launch.stop_node_sessions(_config(proj), ["web"]) == ([], [])
+        assert kills[0] == []
+
+    def test_an_auto_project_is_killed_where_the_map_placed_it(
+        self, rig, tmp_path, kills
+    ):
+        proj = ProjectConfig(path=str(tmp_path / "web"), node="auto")
+        _hold("web", nick="third")
+        assert launch.stop_node_sessions(_config(proj), ["web"]) == (["web"], [])
+        assert kills[0] == [("third", "web")]
+
+    def test_the_map_wins_over_a_pin_changed_since_the_bring_up(self, rig, api, kills):
+        _hold("api", nick="third")
+        launch.stop_node_sessions(_config(api), ["api"])
+        assert kills[0] == [("third", "api")]
+
+    def test_the_recorded_sid_is_the_one_killed(self, rig, api, kills):
+        _hold("api", sid="api-2")
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert kills[0] == [("second", "api-2")]
+
+    def test_ids_outside_the_list_are_left_running(self, rig, api, tmp_path, kills):
+        other = ProjectConfig(path=str(tmp_path / "web"), node="second")
+        launch.stop_node_sessions(_config(api, other), ["web"])
+        assert kills[0] == [("second", "web")]
+
+    def test_a_node_that_failed_once_is_not_dialed_again(self, rig, tmp_path, kills):
+        # `down --all` against a powered-off node costs one probe timeout,
+        # not one per project on it; another node is still asked.
+        a1, a2, b1 = (
+            ProjectConfig(path=str(tmp_path / n), node=nick)
+            for n, nick in (("a1", "second"), ("a2", "second"), ("b1", "third"))
+        )
+        kills[1].update({"a1": None, "a2": None})
+        assert launch.stop_node_sessions(_config(a1, a2, b1), ["a1", "a2", "b1"]) == (
+            ["b1"],
+            ["a1", "a2"],
+        )
+        assert kills[0] == [("second", "a1"), ("third", "b1")]
+
+    def test_a_placement_the_config_can_no_longer_name_is_a_survivor(
+        self, rig, tmp_path, kills
+    ):
+        proj = ProjectConfig(path=str(tmp_path / "web"), node="auto")
+        _hold("web", nick="gone")
+        assert launch.stop_node_sessions(_config(proj), ["web"]) == ([], ["web"])
+        assert kills[0] == []
+        assert "web" in nodes.read_node_map()
+
+    def test_a_map_that_cannot_be_rewritten_does_not_unclaim_the_kill(
+        self, rig, api, kills, monkeypatch
+    ):
+        _hold("api")
+
+        def held(*_a: object, **_k: object) -> None:
+            raise lockfile.LockHeld("the node map is held")
+
+        monkeypatch.setattr(nodes, "update_node_map", held)
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])

@@ -43,6 +43,7 @@ from magent.psmux import session0_message, session0_server_pids
 from magent.style import style
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
     from magent.config import MagentConfig
@@ -485,26 +486,47 @@ def _down_host(explicit: str | None, local_targets: list[str]) -> str | None:
     return _read_last_host()
 
 
-def _report_shutdown(stopped: list[str], still: list[str]) -> None:
+def _report_shutdown(
+    stopped: list[str],
+    still: list[str],
+    node_stopped: Sequence[str] = (),
+    node_still: Sequence[str] = (),
+) -> None:
     """Say what was PROVED stopped, and say the survivors loudly.
 
     The old line was ``Stopped {len(targets)} session(s)`` off the list the
     command had *tried* -- printed verbatim on a machine where 11 of the 46 it
     claimed were still alive and attachable. A shutdown report that cannot be
     wrong about the world is not a report.
+
+    ``node_stopped``/``node_still`` are a node project's other half (PR-D):
+    its session ON THE NODE, beside the local one the same id may have left
+    here (D9, in ``stopped``/``still``). Two sessions, one name, one report:
+    a name is claimed stopped only when neither half kept it running, and
+    "nothing to stop" is said only when neither half found anything.
     """
-    if stopped:
+    survivors = {*still, *node_still}
+    claimed = [
+        s for s in dict.fromkeys([*stopped, *node_stopped]) if s not in survivors
+    ]
+    if claimed:
         click.echo(
-            f"  {style('+', fg='green')} Stopped {style(str(len(stopped)), fg='green', bold=True)}"
-            f" session(s): {style(', '.join(stopped), dim=True)}"
+            f"  {style('+', fg='green')} Stopped {style(str(len(claimed)), fg='green', bold=True)}"
+            f" session(s): {style(', '.join(claimed), dim=True)}"
         )
-    elif not still:
+    elif not survivors:
         click.echo(f"  {style('-', dim=True)} No running sessions to stop.")
     if still:
         click.echo(
             f"  {style('x', fg='red')} {style(str(len(still)), fg='red', bold=True)}"
             f" session(s) would NOT stop: {style(', '.join(still), fg='red')}"
             f" {style('(two kill attempts each -- see ~/.magent/logs/launch.log)', dim=True)}"
+        )
+    if node_still:
+        click.echo(
+            f"  {style('x', fg='red')} {style(str(len(node_still)), fg='red', bold=True)}"
+            f" session(s) would NOT stop: {style(', '.join(node_still), fg='red')}"
+            f" {style('(node not reached -- see ~/.magent/logs/nodes.log)', dim=True)}"
         )
 
 
@@ -534,6 +556,44 @@ def _node_orphan_targets(
     return _select_targets(
         [nodes.node_sid(p) for p in nodes.node_projects(cfg, group)], names
     )
+
+
+def _placed_here(node_targets: list[str]) -> list[str]:
+    """The node targets this PC's node map says it placed. Like a live local
+    session, they are work only a LOCAL `down` can reach, so they keep the
+    shutdown off the remembered attach host. A node project that is merely
+    CONFIGURED does not: an attach client sharing the host's config would
+    otherwise never forward `down --all` to the host again."""
+    if not node_targets:
+        return []
+    from magent import nodes  # leaf, in-body: keeps `magent --help` off its imports
+
+    held = {entry.sid for entry in nodes.read_node_map().values()}
+    return [s for s in node_targets if s in held]
+
+
+def _echo_attach_host_hint(
+    explicit: str | None, live: list[str], placed: list[str]
+) -> None:
+    """One dim line when node sessions THIS PC placed are the only reason
+    `down` stayed local: without them it would have acted on the remembered
+    attach host, so name the command that still does."""
+    if explicit or live or not placed:
+        return
+    from magent.cli.attach import (
+        _read_last_host,  # sibling module: one last-attach-host store
+    )
+
+    last = _read_last_host()
+    if last:
+        click.echo(
+            f"  {style('-', dim=True)} "
+            + style(
+                f"Stopped here: this PC placed node sessions. For the"
+                f" sessions on {last}: magent down --host {last}",
+                dim=True,
+            )
+        )
 
 
 @main.command("down")
@@ -573,6 +633,7 @@ def down_cmd(
 
     from magent.launch import (  # heavy subsystem: in-body per policy
         psmux_status,
+        stop_node_sessions,
         stop_psmux,
     )
 
@@ -599,9 +660,11 @@ def down_cmd(
     # Only a LOCAL down reaches them: the remote branch forwards the command,
     # and the host runs this same rule against its own config. The `not in`
     # is belt-and-braces: load_config refuses a node sid shared with a local one.
-    targets += [s for s in _node_orphan_targets(cfg, group, names) if s not in targets]
+    node_targets = _node_orphan_targets(cfg, group, names)
+    targets += [s for s in node_targets if s not in targets]
 
-    remote = _down_host(host, live)
+    placed = _placed_here(node_targets)
+    remote = _down_host(host, [*live, *placed])
     remote_rc = 0
     if remote:
         from magent.cli.attach import (
@@ -610,7 +673,17 @@ def down_cmd(
 
         remote_rc = _remote_down(remote, names, group, do_all, stop_srv)
     elif targets:
-        _report_shutdown(*stop_psmux(targets))
+        # A node target is two sessions under one name (PR-D): the local one
+        # it may have left here, which `stop_psmux` kills with the rest of
+        # `targets`, and the one on its node, which only `stop_node_sessions`
+        # dials. Each has exactly one killer; the report folds both halves.
+        stopped, still = stop_psmux(targets)
+        node_stopped: list[str] = []
+        node_still: list[str] = []
+        if node_targets:
+            node_stopped, node_still = stop_node_sessions(cfg, node_targets)
+        _report_shutdown(stopped, still, node_stopped, node_still)
+        _echo_attach_host_hint(host, live, placed)
     else:
         click.echo(f"  {style('-', dim=True)} No matching sessions in config.")
 
