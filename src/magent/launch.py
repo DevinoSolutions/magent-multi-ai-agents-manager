@@ -1908,12 +1908,13 @@ def bring_up_node_project(
                     result.sid,
                     exc,
                 )
-                # ASCII end to end: the cause is the OS's or the map's words.
-                cause = str(exc).encode("ascii", "replace").decode("ascii")
+                # The class only: the error itself (the map's path, the
+                # parser's words) is in nodes.log, logged just above.
                 warnings = (
                     *warnings,
                     (
-                        f"up on @{nick} but not recorded ({cause}); re-run magent"
+                        f"up on @{nick} but not recorded ({type(exc).__name__});"
+                        " re-run magent"
                         " up from a clean tree or --allow-dirty"
                     ),
                 )

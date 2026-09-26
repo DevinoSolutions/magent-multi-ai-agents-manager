@@ -1445,10 +1445,12 @@ class TestEveryNodeFailureIsAnOutcomeButABugIsNot:
         monkeypatch.setattr(nodes, "update_node_map", held)
         outcome = launch.bring_up_node_project(_config(api), api)
         # The node said yes before the map write failed: the session is up,
-        # so the outcome is ok with a repair warning naming the cause (6688a69).
+        # so the outcome is ok with a repair warning naming the cause (6688a69)
+        # -- by its class; its words are nodes.log's.
         assert (outcome.ok, outcome.node, outcome.error) == (True, "second", None)
         (warning,) = [w for w in outcome.warnings if "not recorded" in w]
-        assert "held by another writer" in warning
+        assert "(LockHeld)" in warning
+        assert "held by another writer" not in warning
         assert not launch._bring_up_lock("second").locked()
 
     def test_an_unreadable_push_file_is_an_outcome(self, rig, api):
