@@ -189,21 +189,35 @@ class TestInstall:
         data = json.loads(settings.read_text(encoding="utf-8"))
         assert data["hooks"] == before
         assert "magent-state-hook" not in settings.read_text(encoding="utf-8")
+        again = _install(runner, settings)
+        assert "Already wired" in again.output
+        assert json.loads(settings.read_text(encoding="utf-8"))["hooks"] == before
 
     def test_reinstall_repairs_backslash_module_form(self, runner, tmp_path):
         # Recognising the module form must not let a broken one hide behind
-        # idempotence: a backslash interpreter path is repaired like the
-        # pre-3.1.2 console-script one, never skipped forever.
+        # idempotence -- but the repair fixes only what bash breaks. The module
+        # spelling exists to avoid the console script, so it stays a module
+        # command: backslashes become forward slashes, every other byte kept.
         settings = tmp_path / "settings.json"
-        stale = r"C:\Python314\python.exe -m magent.state_hook --source claude"
+        stale = (
+            r'"C:\Program Files\Python314\python.exe" -X utf8 '
+            "-m magent.state_hook --source claude"
+        )
         _write_module_form(settings, cmd=stale)
         result = _install(runner, settings)
         assert result.exit_code == 0
         assert "Repaired" in result.output
+        fixed = (
+            '"C:/Program Files/Python314/python.exe" -X utf8 '
+            "-m magent.state_hook --source claude"
+        )
         data = json.loads(settings.read_text(encoding="utf-8"))
         for event in EVENTS:
             cmds = [h["command"] for e in data["hooks"][event] for h in e["hooks"]]
-            assert len(cmds) == 1 and "\\" not in cmds[0]
+            assert cmds == [fixed]
+        again = _install(runner, settings)
+        assert "Already wired" in again.output
+        assert json.loads(settings.read_text(encoding="utf-8")) == data
 
 
 class TestStatus:
