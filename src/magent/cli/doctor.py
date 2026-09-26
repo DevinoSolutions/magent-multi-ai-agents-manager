@@ -5,9 +5,8 @@ loadable and current, does the env validate, are the agent CLIs and a
 terminal on PATH, can anything tile (monitors), are the runtime dirs
 writable, is Tailscale reachable, is the upload port sane, are the nodes
 healthy. Every check is a small function returning (status, detail) so
-each is unit-testable; the
-command is just the runner. Exit 0 = no failures (warns allowed), 1 = any
-check failed.
+each is unit-testable; the command is just the runner. Exit 0 = no
+failures (warns allowed), 1 = any check failed.
 """
 
 from __future__ import annotations

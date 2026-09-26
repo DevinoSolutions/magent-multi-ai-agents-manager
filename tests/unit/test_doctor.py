@@ -793,6 +793,47 @@ class TestTheNodesRow:
             "second: claude-login -- details: magent node doctor",
         )
 
+    def test_troubled_nodes_join_by_semicolon_their_items_by_comma(
+        self, tmp_config, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {
+                "second": [
+                    ScriptLine("fail", "claude-login", "not logged in"),
+                    ScriptLine("ok", "tmux", ""),
+                    ScriptLine("warn", "github-key", "not registered"),
+                ],
+                "third": [
+                    ScriptLine("ok", "tmux", ""),
+                    ScriptLine("skip", "snapshot", ""),
+                ],
+                "fifth": [
+                    ScriptLine("fail", "reach", "cannot reach amin@devino-fifth")
+                ],
+            },
+        )
+        cfg = _nodes_cfg(tmp_config, ("second", "third", "fifth"))
+        assert _check_nodes(cfg) == (
+            "warn",
+            "second: claude-login, github-key; fifth: reach -- details: magent node doctor",
+        )
+
+    def test_the_row_comes_right_after_upload_port(
+        self, runner, monkeypatch, tmp_config
+    ):
+        # ORDER, not just membership: the audit's row order is upload port,
+        # nodes, then mcp-relay (K12 pins its own row directly after this one).
+        monkeypatch.setattr("magent.platform.get_platform", FakePlatform)
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: False)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
+        config_path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
+
+        result = runner.invoke(cli.main, ["--config", config_path, "doctor", "--json"])
+
+        names = [c["name"] for c in json.loads(result.stdout)["checks"]]
+        assert names.index("nodes") == names.index("upload port") + 1, names
+
     def test_skip_rows_are_healthy_through_the_real_path(self, tmp_config, fake_ssh):
         # No sync daemon and no snapshot: this PC's two rows are `skip`, and a
         # node that is merely not synced yet is not a troubled one.
