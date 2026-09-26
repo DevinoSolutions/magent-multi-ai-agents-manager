@@ -51,9 +51,12 @@ if TYPE_CHECKING:
 #   - `_current_nick` and `push_cmd` import `nodes` in-body like every other
 #     function here -- the plan's code reads a module-level `nodes`.
 # - recall's kill (Task 14): `_stop_session`'s reachable branch becomes
-#   :3853-3874 (remote_mux.kill_session and its three outcomes); on None it
-#   prints `_kill_hint(source.target, held.sid)`, never the plan's raw
-#   f-string (spec-G14 P1). Needs kill_session.
+#   :3865-3874 (remote_mux.kill_session and its three outcomes) -- that
+#   branch only: keep today's docstring, `source is None` branch and
+#   `_kill_hint`, and do not paste :3853-3864 (the plan's raw `kill`
+#   f-string and the bare unreachable print). On None it prints
+#   `_kill_hint(source.target, held.sid)`, never the plan's raw f-string
+#   (spec-G14 P1). Needs kill_session.
 # - recall --to (Task 15): the option (:3934) and its usage rule; the two
 #   `to_local` guards -- `_local_dir` only for --local (:3960-3962), and
 #   `_recall_local` back under `if local_dir is not None:` with `_recall_to`
