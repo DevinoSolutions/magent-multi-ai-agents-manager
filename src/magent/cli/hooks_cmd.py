@@ -84,7 +84,10 @@ def _repair_entries(entries: list[object], cmd: str) -> bool:
     """Rewrite any wired magent-state-hook command that bash cannot run -- a
     backslash path from a pre-3.1.2 install, or a module-form one with a
     backslash interpreter path (idempotence would otherwise skip the broken
-    entry forever). Returns True when something was rewritten."""
+    entry forever). Returns True when something was rewritten.
+
+    A module-form command keeps its form: that spelling exists to avoid the
+    console script, so only the backslashes bash would eat are swapped."""
     changed = False
     for entry in entries:
         if not isinstance(entry, dict):
@@ -96,7 +99,12 @@ def _repair_entries(entries: list[object], cmd: str) -> bool:
             if not isinstance(h, dict):
                 continue
             c = h.get("command")
-            if isinstance(c, str) and _is_ours(c) and "\\" in c:
+            if not isinstance(c, str) or "\\" not in c:
+                continue
+            if _MODULE_MARKER in c:
+                h["command"] = c.replace("\\", "/")
+                changed = True
+            elif _MARKER in c:
                 h["command"] = cmd
                 changed = True
     return changed
