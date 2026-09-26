@@ -2907,14 +2907,15 @@ class TestWhatCountsAsUnreachable:
         self, fake_ssh
     ):
         """The real over-cap error: its stderr is ``reply exceeded N bytes``
-        and then the child's own last line. The cap is why the pull failed, so
-        the log detail names it."""
+        and then whatever the child said -- on Linux the killed fake's LAST
+        line is its own BrokenPipeError, exactly the noise this rule skips.
+        The cap is why the pull failed, so the log detail names it."""
         fake_ssh.set_reply("flood", stderr="boom: disk full\n")
         fake_ssh.set_mode("flood")
         node = nodes.Node(nick="second", host="devino-second", user="amin", root="~")
         with pytest.raises(remote_mux.RemoteError) as info:
             remote_mux.run(node, ["flood"], timeout_s=60, max_stdout_bytes=1024)
-        assert info.value.stderr_tail.splitlines()[-1] == "boom: disk full"
+        assert "boom: disk full" in info.value.stderr_tail.splitlines()[1:]
         assert node_sync._classify(info.value) == (
             node_sync.FAILED,
             "reply exceeded 1024 bytes",
