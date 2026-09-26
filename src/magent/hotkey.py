@@ -554,8 +554,8 @@ def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
     Threaded for the same reason as ``_do_upload``: the /api/sessions round
     trip must never block a system-wide keyboard hook. Every failure mode --
     server down, project absent from the payload, no folder on the entry, no
-    ``code`` on PATH, a folder ``code.cmd`` cannot pass -- is a log line, a status-line flash, and a no-op; the
-    listener has to outlive all of them.
+    ``code`` on PATH, a folder ``code.cmd`` cannot pass -- is a log line, a
+    status-line flash, and a no-op; the listener has to outlive all of them.
     """
     log = get_logger("hotkey")
     try:
