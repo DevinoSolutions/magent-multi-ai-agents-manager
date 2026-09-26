@@ -1380,6 +1380,85 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
         assert sum(counts) == expected
         assert sum(counts) <= nodes.SKILL_FILE_MAX_BYTES + nodes._READ_CHUNK + 1
 
+    def test_the_running_total_is_capped_with_one_note(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_TOTAL_BYTES", 5)
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/a", b"123")
+        _skill(skills, "s/b", b"123")
+        _skill(skills, "s/c", b"12")  # a later, smaller file still fits
+        _skill(skills, "s/d", b"123")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/a", "s/c"]
+        assert scope.notes == ("skills: 2 files past the 5 bytes total, not shipped",)
+
+    def test_one_file_past_the_total_reads_singular(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_TOTAL_BYTES", 3)
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/a", b"123")
+        _skill(skills, "s/b", b"1")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/a"]
+        assert scope.notes == ("skills: 1 file past the 3 bytes total, not shipped",)
+
+    def test_a_file_past_the_total_is_never_read(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_TOTAL_BYTES", 5)
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/a", b"123")
+        _skill(skills, "s/b", b"1234")
+        _skill(skills, "s/c", b"12")
+        counts = self._count_reads(monkeypatch)
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/a", "s/c"]
+        assert counts == [3, 2]  # s/b was judged by its stat, never opened
+
+    def test_a_file_that_grew_past_the_total_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_TOTAL_BYTES", 100)
+        grown = bytes(range(256)) * 3 + b"end"
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/grow", grown)
+        self._stats_say_one_byte(monkeypatch, grown)
+        scope = nodes.user_scope(home)
+        assert scope.skills == ()
+        assert scope.notes == ("skills: 1 file past the 100 bytes total, not shipped",)
+
+    def test_the_walk_stops_at_the_entry_cap(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_ENTRIES", 3)
+        home, skills = _skills_home(tmp_path)
+        for name in ("a", "b", "c", "d", "e"):
+            _skill(skills, f"s/{name}")
+        scope = nodes.user_scope(home)
+        # Entries counted: s, s/a, s/b -- the fourth stops the walk.
+        assert [f.path for f in scope.skills] == ["s/a", "s/b"]
+        assert scope.notes == (
+            (
+                "skills: more than 3 entries; the walk stopped there and the rest is "
+                "not shipped"
+            ),
+        )
+
+    def test_the_entry_cap_stops_a_linked_tree_too(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_ENTRIES", 4)
+        home, skills = _skills_home(tmp_path)
+        big = tmp_path / "big"
+        for i in range(50):
+            _skill(big, f"f{i:02}")
+        _link_dir(skills / "big", big)
+        _skill(skills, "zzz/SKILL.md")  # after the link: never reached
+        scope = nodes.user_scope(home)
+        # A folder's entries count as it is listed: big, zzz, then big/f00
+        # and big/f01 -- big/f02 is the fifth.
+        assert [f.path for f in scope.skills] == ["big/f00", "big/f01"]
+        assert scope.notes == (
+            (
+                "skills: more than 4 entries; the walk stopped there and the rest is "
+                "not shipped"
+            ),
+        )
+
+    def test_the_caps_default_to_64_mib_and_20000_entries(self):
+        assert nodes.SKILLS_MAX_TOTAL_BYTES == 64 * 1024 * 1024
+        assert nodes.SKILLS_MAX_ENTRIES == 20000
+
 
 class TestUserScopeDigests:
     def test_every_item_has_a_digest(self):

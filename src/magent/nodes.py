@@ -176,8 +176,14 @@ SKILLS_EXCLUDED_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv"
 # Defence in depth, not containment: a link anywhere else still ships.
 SECRET_HOME_DIRS = (".ssh", ".gnupg", ".aws", ".config/gh", ".kube", ".docker")
 # user_scope runs on every bring-up and holds every skill byte in memory: a
-# stray asset must not be read whole.
+# stray asset must not be read whole ...
 SKILL_FILE_MAX_BYTES = 8 * 1024 * 1024
+# ... and the total is bounded too: past it a file stays behind, counted into
+# one note (a later, smaller file may still fit).
+SKILLS_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+# A link to a huge (non-home) tree must not make every bring-up walk it: the
+# walk stops after this many directory entries, with one note.
+SKILLS_MAX_ENTRIES = 20000
 
 
 @dataclass(frozen=True)
@@ -649,19 +655,27 @@ class _NotShipped(ValueError):
     reason (never the content)."""
 
 
+class _PastTotal(_NotShipped):
+    """A skill file that does not fit what is left of
+    ``SKILLS_MAX_TOTAL_BYTES``: counted, not noted one by one."""
+
+
 def _size(n: int) -> str:
     mib = 1024 * 1024
     return f"{n // mib} MiB" if n >= mib and n % mib == 0 else f"{n} bytes"
 
 
-def _check_size(size: int) -> None:
+def _check_size(size: int, room: int) -> None:
     if size > SKILL_FILE_MAX_BYTES:
         raise _NotShipped(f"larger than {_size(SKILL_FILE_MAX_BYTES)}, not shipped")
+    if size > room:
+        raise _PastTotal
 
 
-def _read_skill(path: Path) -> tuple[bytes, int]:
+def _read_skill(path: Path, *, room: int) -> tuple[bytes, int]:
     """The bytes and mode of ``path``, a REGULAR file of at most
-    ``SKILL_FILE_MAX_BYTES``, or ``_NotShipped``; OSError when it cannot be
+    ``SKILL_FILE_MAX_BYTES`` and at most ``room`` (what the skills total has
+    left: ``_PastTotal``), or ``_NotShipped``; OSError when it cannot be
     read. The same three checks as ``remote_mux._read_regular`` (which this
     leaf cannot import), because each alone has a hole: a stat before opening
     (a FIFO or a device is never opened -- reading one blocks every bring-up
@@ -675,7 +689,7 @@ def _read_skill(path: Path) -> tuple[bytes, int]:
     before = path.stat()
     if not stat.S_ISREG(before.st_mode):
         raise _NotShipped("not a regular file, not shipped")
-    _check_size(before.st_size)
+    _check_size(before.st_size, room)
     fd = os.open(path, _SKILL_READ_FLAGS)
     with os.fdopen(fd, "rb") as f:
         opened = os.fstat(f.fileno())
@@ -691,7 +705,7 @@ def _read_skill(path: Path) -> tuple[bytes, int]:
                     break
                 grown += chunk
             data = bytes(grown)
-    _check_size(len(data))
+    _check_size(len(data), room)
     return data, opened.st_mode
 
 
@@ -734,6 +748,58 @@ def _in_secret_dir(
     return True
 
 
+@dataclass
+class _SkillsTally:
+    """What one skills walk has spent: entries listed, bytes kept, and the
+    files the total cap turned away -- counted into ONE note, since a big
+    tree past the cap would otherwise bury every other note."""
+
+    entries: int = 0
+    total: int = 0
+    past_total: int = 0
+
+
+def _skill_file(
+    path: Path,
+    rel_path: str,
+    secrets: Sequence[str],
+    tally: _SkillsTally,
+    notes: list[str],
+) -> SkillFile | None:
+    """``path`` (at ``rel_path`` under skills) as a SkillFile, or None with a
+    note (or a count in ``tally``) saying why it stays behind."""
+    if _in_secret_dir(rel_path, _real(path), secrets, notes):
+        return None
+    if _holds_claude_credential(rel_path):
+        notes.append(
+            f"skills/{_named(rel_path)}: holds a Claude credential, never shipped"
+        )
+        return None
+    try:
+        data, mode = _read_skill(path, room=SKILLS_MAX_TOTAL_BYTES - tally.total)
+    except _PastTotal:
+        # A later, smaller file may still fit.
+        tally.past_total += 1
+        return None
+    except _NotShipped as e:
+        notes.append(f"skills/{_named(rel_path)}: {e}")
+        return None
+    except OSError as e:
+        notes.append(f"skills/{_named(rel_path)}: unreadable ({e.strerror})")
+        return None
+    if _CREDENTIAL_BYTES in data:
+        notes.append(
+            f"skills/{_named(rel_path)}: holds a Claude credential, never shipped"
+        )
+        return None
+    tally.total += len(data)
+    return SkillFile(
+        path=rel_path,
+        data=data,
+        executable=bool(mode & stat.S_IXUSR) or data.startswith(b"#!"),
+    )
+
+
 def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     """Every file under ``~/.claude/skills``, symlinks followed once, sorted by
     path. A file is executable if its mode says so OR it starts with ``#!`` --
@@ -755,7 +821,12 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     That is defence in depth, NOT containment: a link to any other folder
     (``~/private-notes``) ships what it holds, deliberately -- the user put
     it there. One real directory linked under two names ships once, under
-    the name the sorted, depth-first walk reaches first."""
+    the name the sorted, depth-first walk reaches first.
+
+    Bounded, because it runs on every bring-up: only regular files are read
+    (``_read_skill``), each at most ``SKILL_FILE_MAX_BYTES`` and all of them
+    at most ``SKILLS_MAX_TOTAL_BYTES``, and the walk stops after
+    ``SKILLS_MAX_ENTRIES`` listed entries."""
     if not root.is_dir():
         return ()
     # The unresolved root counts too: with ~/.claude a junction elsewhere, a
@@ -770,6 +841,7 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
         notes.append("skills/synced: claude.ai-managed copies, not shipped")
     files: list[SkillFile] = []
     seen: set[str] = set()
+    tally = _SkillsTally()
     for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
         here = Path(dirpath)
         real = os.path.realpath(here)
@@ -778,8 +850,14 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
             continue
         seen.add(real)
         rel = here.relative_to(root)
+        # Every entry a folder lists counts, folders first, each list sorted;
+        # past the cap the rest of this folder is dropped and the walk stops.
+        room = SKILLS_MAX_ENTRIES - tally.entries
+        tally.entries += len(dirnames) + len(filenames)
+        listed_dirs = sorted(dirnames)[:room]
+        listed_files = sorted(filenames)[: max(room - len(dirnames), 0)]
         kept: list[str] = []
-        for d in sorted(dirnames):
+        for d in listed_dirs:
             if d in SKILLS_EXCLUDED_DIRS or (
                 rel == Path() and d in SKILLS_EXCLUDED_TOP
             ):
@@ -801,32 +879,23 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
                 continue
             kept.append(d)
         dirnames[:] = kept
-        for name in sorted(filenames):
-            path = here / name
+        for name in listed_files:
             rel_path = (rel / name).as_posix()
-            if _in_secret_dir(rel_path, _real(path), secrets, notes):
-                continue
-            try:
-                data, mode = _read_skill(path)
-            except _NotShipped as e:
-                notes.append(f"skills/{_named(rel_path)}: {e}")
-                continue
-            except OSError as e:
-                notes.append(f"skills/{_named(rel_path)}: unreadable ({e.strerror})")
-                continue
-            if _CREDENTIAL_BYTES in data or _holds_claude_credential(rel_path):
-                notes.append(
-                    f"skills/{_named(rel_path)}: holds a Claude credential, "
-                    "never shipped"
-                )
-                continue
-            files.append(
-                SkillFile(
-                    path=rel_path,
-                    data=data,
-                    executable=bool(mode & stat.S_IXUSR) or data.startswith(b"#!"),
-                )
+            skill = _skill_file(here / name, rel_path, secrets, tally, notes)
+            if skill is not None:
+                files.append(skill)
+        if tally.entries > SKILLS_MAX_ENTRIES:
+            notes.append(
+                f"skills: more than {SKILLS_MAX_ENTRIES} entries; the walk "
+                "stopped there and the rest is not shipped"
             )
+            break
+    if tally.past_total:
+        noun = "file" if tally.past_total == 1 else "files"
+        notes.append(
+            f"skills: {tally.past_total} {noun} past the "
+            f"{_size(SKILLS_MAX_TOTAL_BYTES)} total, not shipped"
+        )
     return tuple(sorted(files, key=lambda f: f.path))
 
 
