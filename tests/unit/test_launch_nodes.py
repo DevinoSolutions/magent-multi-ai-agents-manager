@@ -438,6 +438,41 @@ class TestASessionThatCameUpButWasNotRecordedIsUp:
         assert "clean tree or --allow-dirty" in warning
         assert warning.isascii()
 
+    @pytest.mark.parametrize(
+        ("exc", "cls"),
+        [
+            (
+                ValueError(r"C:\Users\me\.magent\nodes\node-map.json: Expecting value"),
+                "ValueError",
+            ),
+            (
+                PermissionError(13, "Access is denied", r"C:\x\node-map.json"),
+                "PermissionError",
+            ),
+            (lockfile.LockHeld("node-map is held"), "LockHeld"),
+        ],
+        ids=["torn", "busy", "held"],
+    )
+    def test_the_screen_gets_the_class_and_nodes_log_the_error(
+        self, rig, api, monkeypatch, caplog, exc, cls
+    ):
+        from magent.log import get_logger
+
+        def no_map(*_a: object, **_k: object) -> dict[str, NodeMapEntry]:
+            raise exc
+
+        monkeypatch.setattr(nodes, "update_node_map", no_map)
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        outcome = launch.bring_up_node_project(_config(api), api)
+        (warning,) = [w for w in outcome.warnings if "not recorded" in w]
+        assert warning == (
+            f"up on @second but not recorded ({cls}); re-run magent up from a"
+            " clean tree or --allow-dirty"
+        )
+        logged = [r.getMessage() for r in caplog.records if r.name == "magent.nodes"]
+        assert f"node second: api up but not recorded in the node map: {exc}" in logged
+
     def test_the_window_still_opens(self, rig, api, monkeypatch):
         def no_map(*_a: object, **_k: object) -> dict[str, NodeMapEntry]:
             raise lockfile.LockHeld("node-map is held")
@@ -1129,6 +1164,86 @@ class TestAnUnreadableMapPlacesNothingByGuess:
         (warning,) = holder.warnings
         assert "'api-x' and 'api-y' would share" in warning
         assert "node map is unreadable" not in warning
+
+    def test_only_a_known_member_is_given_the_map_reason(self):
+        # Two auto projects of unknown node sharing a folder name: neither is
+        # a member whose node is known, so neither gets the map text (whose
+        # "on <node>" would name no node) -- each keeps the X3 text.
+        def unknown(sid: str) -> tuple[str, nodes.Recipe, bool]:
+            return (
+                "",
+                nodes.Recipe(
+                    project=sid,
+                    sid=sid,
+                    repos=(),
+                    push_files=(),
+                    memory_dir=None,
+                    remote_root="(node unknown)/api",
+                ),
+                False,
+            )
+
+        placed = {"api-y": unknown("api-y"), "api-w": unknown("api-w")}
+        clash = launch._folder_clashes(placed, ValueError("torn"))
+        text = nodes.remote_root_collision_text(
+            (placed["api-y"][1], placed["api-w"][1])
+        )
+        assert clash == {"api-y": text, "api-w": text}
+
+    def test_a_dirty_pinned_project_attaches_to_its_running_session(
+        self, rig, api, tmp_path, monkeypatch, unreadable_map
+    ):
+        # The map cannot say it runs there, so its pin and its own session id
+        # are asked: running, the uncommitted tree here does not touch it.
+        _record("api", "second", "~/magent/api")
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        probes: list[tuple[str, str]] = []
+
+        def has_session(node: nodes.Node, sid: str) -> bool | None:
+            probes.append((node.nick, sid))
+            return True
+
+        monkeypatch.setattr(remote_mux, "has_session", has_session)
+        unreadable_map()
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert (outcome.ok, outcome.node, outcome.attached_existing) == (
+            True,
+            "second",
+            True,
+        )
+        assert outcome.error is None
+        assert any("--allow-dirty" in w for w in outcome.warnings)
+        assert probes == [("second", "api")]
+        assert rig.decorated == [("api", "second")]
+        assert rig.recipes == []
+
+    @pytest.mark.parametrize("live", [False, None], ids=["not-running", "no-answer"])
+    def test_a_dirty_pinned_project_not_found_running_is_refused_naming_the_map(
+        self, rig, api, tmp_path, monkeypatch, unreadable_map, live
+    ):
+        _record("api", "second", "~/magent/api")
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        probes: list[tuple[str, str]] = []
+
+        def has_session(node: nodes.Node, sid: str) -> bool | None:
+            probes.append((node.nick, sid))
+            return live
+
+        monkeypatch.setattr(remote_mux, "has_session", has_session)
+        cls = unreadable_map()
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert (outcome.ok, outcome.node) == (False, "second")
+        error = outcome.error or ""
+        assert "--allow-dirty" in error
+        assert error.endswith(
+            f"; the node map is unreadable ({cls}), and api was not found"
+            " running on @second"
+        )
+        assert "torn" not in error
+        assert "cannot access" not in error
+        assert probes == [("second", "api")]
+        assert rig.decorated == []
+        assert rig.recipes == []
 
     def test_a_pinned_project_keeps_its_pin(self, rig, api, unreadable_map):
         _record("api", "third", "~/magent/api")
