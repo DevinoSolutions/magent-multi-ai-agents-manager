@@ -9,19 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-<!-- D-MERGE: `node push`, `node recall --to` and plan's ship list land with sub-plan D (plan G Tasks 12-15); this bullet describes them in advance. -->
+<!-- D-MERGE: drop the three "(with sub-plan D)" marks below when `node push`, `node recall --to` and plan's ship list land with sub-plan D (plan G Tasks 12-15). -->
 - **magent places `auto` node projects by their load history, and `magent node
   plan`/`push`/`recall` manage them.** `"node": "auto"` picks the node with the
   lowest 30-minute load score (spikes and low memory count against a node, and
   a node under 10% free memory is skipped while another is above it) and keeps
   it there. `magent node` shows the pool; `node plan` shows where a project
-  would go and what it would ship, changing nothing; `node push` re-ships a
-  project's `.env*` files; `node recall --local` brings a session and its
-  conversation home and prints the `cd` and the `claude --resume` to run;
-  `node recall --to <nick>` moves it to another node and resumes it there. A
-  node that does not answer is only a note, but a recall whose last pull did
-  not finish stops before it changes anything (exit 1, or 3 while the sync
-  daemon holds the node), so running it again loses no work.
+  would go and (with sub-plan D) what it would ship, changing nothing; `node
+  push` (with sub-plan D) re-ships a project's `.env*` files; `node recall
+  --local` brings a session and its conversation home and prints the `cd` and
+  the `claude --resume` to run; `node recall --to <nick>` (with sub-plan D)
+  moves it to another node and resumes it there. A node that does not answer
+  is only a note, but a recall whose last pull did not finish stops before it
+  changes anything (exit 1, or 3 while the sync daemon holds the node), so
+  running it again loses no work.
 
 ## [3.19.1] - 2026-09-23
 
