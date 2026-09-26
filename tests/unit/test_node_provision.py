@@ -1206,6 +1206,27 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
         assert scope.notes == ("skills/s/pipe: not a regular file, not shipped",)
 
     @pytest.mark.skipif(sys.platform == "win32", reason="no FIFOs on Windows")
+    def test_a_fifo_is_never_even_opened(self, tmp_path, monkeypatch):
+        # Opening a device can do something of its own (a tape rewinds): the
+        # stat before the open keeps the walk from ever opening one.
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/SKILL.md")
+        fifo = skills / "s" / "pipe"
+        os.mkfifo(fifo)
+        opened: list[str] = []
+        real_open = os.open
+
+        def spy(path, *args, **kwargs):
+            opened.append(os.path.basename(path))
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(nodes.os, "open", spy)
+        scope = _scope_or_fail_on_fifo(home, fifo)
+        assert scope.notes == ("skills/s/pipe: not a regular file, not shipped",)
+        assert "SKILL.md" in opened
+        assert "pipe" not in opened
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="no FIFOs on Windows")
     def test_a_file_swapped_for_a_fifo_after_the_stat_does_not_hang(
         self, tmp_path, monkeypatch
     ):
