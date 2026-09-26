@@ -1065,10 +1065,15 @@ class TestUserScopePluginsAndSkills:
 # its URL never leaves this PC. The rule is the one a project's git remote is
 # stripped by (nodes._without_credentials): over any scheme but ssh the whole
 # userinfo is a credential -- GitHub takes a token as the user name -- over
-# ssh only a password is.
-PASSWORD_REFUSED = "marketplace mkt: its source URL carries a password, never shipped"
+# ssh only a password is. Each refusal names the fix.
+CREDENTIAL_FIX = "put the credential in git's credential helper, not the URL"
+PASSWORD_REFUSED = (
+    "marketplace mkt: its source URL carries a password, never shipped -- "
+    + CREDENTIAL_FIX
+)
 USER_REFUSED = (
-    "marketplace mkt: its source URL carries a user name (often a token), never shipped"
+    "marketplace mkt: its source URL carries a user name (often a token), never "
+    "shipped -- " + CREDENTIAL_FIX
 )
 
 

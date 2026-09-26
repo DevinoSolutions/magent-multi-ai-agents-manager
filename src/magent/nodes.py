@@ -631,19 +631,26 @@ def _marketplaces(
     return found
 
 
+_CREDENTIAL_FIX = "put the credential in git's credential helper, not the URL"
+
+
 def _source_refusal(source: str) -> str | None:
     """Why a marketplace source must not leave this PC, or None. A URL
     credential is judged by the rule a project's git remote is stripped by
     (``_without_credentials``), so the two can never disagree: over any scheme
     but ssh the WHOLE userinfo is one -- GitHub takes a token as the user
     name, ``https://ghp_...@github.com/o/m.git`` -- and over ssh only a
-    password is (``git@host:path`` and ``ssh://git@host/...`` ship)."""
+    password is (``git@host:path`` and ``ssh://git@host/...`` ship). A URL
+    credential's refusal names the fix."""
     if _holds_claude_credential(source):
         return "its source holds a Claude credential, never shipped"
     if _without_credentials(source)[1]:
-        if _userinfo_password(source):
-            return "its source URL carries a password, never shipped"
-        return "its source URL carries a user name (often a token), never shipped"
+        what = (
+            "a password"
+            if _userinfo_password(source)
+            else "a user name (often a token)"
+        )
+        return f"its source URL carries {what}, never shipped -- {_CREDENTIAL_FIX}"
     try:
         urllib.parse.urlsplit(source)
     except ValueError:  # an unbalanced IPv6 bracket, say
