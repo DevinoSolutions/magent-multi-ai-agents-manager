@@ -487,8 +487,8 @@ def _down_host(explicit: str | None, local_targets: list[str]) -> str | None:
 
 
 def _report_shutdown(
-    stopped: list[str],
-    still: list[str],
+    stopped: Sequence[str],
+    still: Sequence[str],
     node_stopped: Sequence[str] = (),
     node_still: Sequence[str] = (),
 ) -> None:
@@ -526,7 +526,7 @@ def _report_shutdown(
         click.echo(
             f"  {style('x', fg='red')} {style(str(len(node_still)), fg='red', bold=True)}"
             f" session(s) would NOT stop: {style(', '.join(node_still), fg='red')}"
-            f" {style('(node not reached -- see ~/.magent/logs/nodes.log)', dim=True)}"
+            f" {style('(not confirmed on its node -- see ~/.magent/logs/nodes.log)', dim=True)}"
         )
 
 
@@ -558,27 +558,37 @@ def _node_orphan_targets(
     )
 
 
-def _placed_here(node_targets: list[str]) -> list[str]:
+def _placed_here(cfg: MagentConfig, node_targets: list[str]) -> list[str]:
     """The node targets this PC's node map says it placed. Like a live local
     session, they are work only a LOCAL `down` can reach, so they keep the
     shutdown off the remembered attach host. A node project that is merely
     CONFIGURED does not: an attach client sharing the host's config would
-    otherwise never forward `down --all` to the host again."""
+    otherwise never forward `down --all` to the host again.
+
+    ``nodes.placement_of`` is the lookup ``stop_node_sessions`` kills by, so
+    "placed here" and "killed there" name the same sessions. The map is read
+    TOLERANTLY on purpose: this is a routing choice, not a report, and an
+    unreadable map routes as it did before PR-D. ``stop_node_sessions`` reads
+    it strictly and names what it could not prove."""
     if not node_targets:
         return []
     from magent import nodes  # leaf, in-body: keeps `magent --help` off its imports
 
-    held = {entry.sid for entry in nodes.read_node_map().values()}
-    return [s for s in node_targets if s in held]
+    entries = nodes.read_node_map()
+    return [
+        nodes.node_sid(p)
+        for p in nodes.node_projects(cfg)
+        if nodes.node_sid(p) in node_targets and nodes.placement_of(p, entries)
+    ]
 
 
-def _echo_attach_host_hint(
-    explicit: str | None, live: list[str], placed: list[str]
-) -> None:
+def _echo_attach_host_hint(live: list[str], placed: list[str]) -> None:
     """One dim line when node sessions THIS PC placed are the only reason
     `down` stayed local: without them it would have acted on the remembered
-    attach host, so name the command that still does."""
-    if explicit or live or not placed:
+    attach host, so name the command that still does. Called on the local
+    branch only (an explicit ``--host`` never gets here); ``not placed`` just
+    spares a second read of the last-host store that already said None."""
+    if live or not placed:
         return
     from magent.cli.attach import (
         _read_last_host,  # sibling module: one last-attach-host store
@@ -665,7 +675,7 @@ def down_cmd(
     node_targets = _node_orphan_targets(cfg, group, names)
     targets += [s for s in node_targets if s not in targets]
 
-    placed = _placed_here(node_targets)
+    placed = _placed_here(cfg, node_targets)
     remote = _down_host(host, [*live, *placed])
     remote_rc = 0
     if remote:
@@ -685,7 +695,7 @@ def down_cmd(
         if node_targets:
             node_stopped, node_still = stop_node_sessions(cfg, node_targets)
         _report_shutdown(stopped, still, node_stopped, node_still)
-        _echo_attach_host_hint(host, live, placed)
+        _echo_attach_host_hint(live, placed)
     else:
         click.echo(f"  {style('-', dim=True)} No matching sessions in config.")
 

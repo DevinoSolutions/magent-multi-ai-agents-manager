@@ -1778,6 +1778,14 @@ def stop_node_sessions(
     probe timeout, not one per project. An ``auto`` project the map never
     placed runs nowhere this PC knows of and is skipped.
 
+    The map is read STRICTLY: this answer becomes a report, and a torn or
+    busy map read as ``{}`` would hide every placed session behind "No
+    running sessions to stop.". Unreadable, nothing it might hold is claimed:
+    an ``auto`` project is a survivor, and a pinned one that is "not there"
+    on its pin is a survivor too -- it may run where the lost map said.
+    Likewise one unmap that fails stops the rest from queueing on the same
+    map lock; their entries stay, which the next bring-up records over.
+
     The node half only. The LOCAL session a node project may have left here
     (D9) is ``stop_psmux``'s, and the ``down`` shell folds the two halves
     into one report."""
@@ -1787,7 +1795,13 @@ def stop_node_sessions(
     from magent.env import local_username
 
     log = get_logger("nodes")
-    entries = nodes.read_node_map()
+    try:
+        entries = nodes.load_node_map_strict()
+        map_known = True
+    except (OSError, ValueError) as exc:
+        log.warning("down: node map unreadable, no placement is trusted: %s", exc)
+        entries, map_known = {}, False
+    map_writable = True
     unreachable: set[str] = set()
     stopped: list[str] = []
     still: list[str] = []
@@ -1795,9 +1809,10 @@ def stop_node_sessions(
         sid = nodes.node_sid(proj)
         if sid not in sids:
             continue
-        name = nodes.project_name(proj)
-        entry = entries.get(name)
+        key, entry = nodes.placement_of(proj, entries) or (None, None)
         if entry is None and proj.node == NODE_AUTO:
+            if not map_known:
+                still.append(sid)
             continue
         try:
             # The map wins over the pin: a project re-pinned since its
@@ -1822,14 +1837,23 @@ def stop_node_sessions(
             continue
         if killed:
             stopped.append(sid)
-        if entry is None:
+        elif not map_known:
+            log.warning(
+                "down: %s not stopped: not on %s, map unreadable", sid, node.nick
+            )
+            still.append(sid)
+        if key is None:
+            continue
+        if not map_writable:
+            log.warning("down: %s map entry stays: the map could not be written", sid)
             continue
         try:
-            nodes.update_node_map(name, None)
+            nodes.update_node_map(key, None)
         except (ValueError, OSError) as exc:
             # The kill is proved. A stale entry is harmless: the next bring-up
             # of this project records its placement over it.
             log.warning("down: %s stopped, but its map entry stays: %s", sid, exc)
+            map_writable = False
     return stopped, still
 
 

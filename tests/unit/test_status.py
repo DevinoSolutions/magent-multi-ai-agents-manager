@@ -1106,10 +1106,12 @@ class TestDownStopsANodeProjectsOrphanedLocalSession:
         # pin the LOCAL half, so the node half answers "not running there";
         # TestDownStopsNodeSessionsWhereTheyRun owns the node half.
         self.node_calls: list[list[str]] = []
-        monkeypatch.setattr(
-            "magent.launch.stop_node_sessions",
-            lambda cfg, sids: (self.node_calls.append(list(sids)), ([], []))[1],
-        )
+
+        def no_node_session(cfg, sids):
+            self.node_calls.append(list(sids))
+            return [], []
+
+        monkeypatch.setattr("magent.launch.stop_node_sessions", no_node_session)
         monkeypatch.setattr("magent.cli.attach._read_last_host", lambda: None)
         monkeypatch.setattr("magent.upload_server.stop_server", lambda port: False)
         monkeypatch.setattr("magent.cli.attention_cmd.stop_daemon", lambda: False)
@@ -1567,7 +1569,7 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         return out, killed, dialed, sent
 
     @staticmethod
-    def _hold(name, nick="second"):
+    def _hold(name, nick="second", sid=None):
         from magent import nodes
         from magent.nodes import NodeMapEntry
 
@@ -1575,7 +1577,7 @@ class TestDownStopsNodeSessionsWhereTheyRun:
             name,
             NodeMapEntry(
                 nick=nick,
-                sid=name,
+                sid=sid or name,
                 placed_ts=1.0,
                 attached_existing=False,
                 remote_root=f"~/magent/{name}",
@@ -1818,3 +1820,67 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         assert killed == []
         assert dialed == []
         assert "magent down --host" not in out.output
+
+    def test_where_down_acts_and_what_it_kills_read_one_placement(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # The map records api under a session id other than the derived one:
+        # the node half kills that one, so `down` must also count it as
+        # placed here and stay off the attach host.
+        self._hold("api", sid="api-2")
+        out, _killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        assert dialed == [("second", "api-2")]
+
+    def test_a_torn_map_is_a_survivor_line_not_nothing_to_stop(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        from magent import nodes
+
+        nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+        out, _killed, dialed, _sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "web"), "node": "auto"}],
+        )
+        assert out.exit_code == 0, out.output
+        assert dialed == []
+        lines = self._session_lines(out)
+        assert "1 session(s) would NOT stop: web" in lines
+        assert "No running sessions to stop." not in lines
+
+
+class TestTheShutdownReportFoldsBothHalves:
+    """``_report_shutdown`` directly: one name, two sessions, no line that
+    contradicts another."""
+
+    def _report(self, capsys, *halves):
+        status_mod._report_shutdown(*halves)
+        return capsys.readouterr().out
+
+    def test_a_local_survivor_is_never_claimed_by_a_node_stop(self, capsys):
+        out = self._report(capsys, [], ["api"], ["api"], [])
+        assert "Stopped" not in out
+        assert out.count("would NOT stop: api") == 1
+        assert "launch.log" in out
+
+    def test_survivors_on_both_halves_each_get_their_reason(self, capsys):
+        out = self._report(capsys, [], ["api"], [], ["api"])
+        assert out.count("would NOT stop: api") == 2
+        assert "launch.log" in out
+        assert "nodes.log" in out
+        assert "Stopped" not in out
+        assert "No running sessions" not in out
+
+    def test_no_node_half_prints_what_it_always_did(self, capsys):
+        assert self._report(capsys, ["web"], []) == ("  + Stopped 1 session(s): web\n")

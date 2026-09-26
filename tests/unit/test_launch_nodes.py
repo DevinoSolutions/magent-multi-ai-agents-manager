@@ -949,6 +949,22 @@ class TestStoppingNodeSessions:
         monkeypatch.setattr(remote_mux, "kill_session", kill)
         return calls, answers
 
+    @pytest.fixture
+    def nodes_log(self, caplog):
+        # The survivor line sends the user to nodes.log: what lands THERE.
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        return lambda: [
+            r.getMessage() for r in caplog.records if r.name == "magent.nodes"
+        ]
+
+    @pytest.fixture
+    def torn(self, rig):
+        nodes.NODE_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+
     def test_a_killed_session_is_stopped_and_unmapped(self, rig, api, kills):
         _hold("api")
         assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
@@ -964,12 +980,13 @@ class TestStoppingNodeSessions:
         assert nodes.read_node_map() == {}
 
     def test_an_unreachable_node_keeps_the_entry_and_names_the_survivor(
-        self, rig, api, kills
+        self, rig, api, kills, nodes_log
     ):
         _hold("api")
         kills[1]["api"] = None
         assert launch.stop_node_sessions(_config(api), ["api"]) == ([], ["api"])
         assert "api" in nodes.read_node_map()
+        assert nodes_log() == ["down: api not stopped: node second did not answer"]
 
     def test_a_pinned_project_nobody_recorded_is_still_asked_and_never_mapped(
         self, rig, api, kills
@@ -1035,21 +1052,95 @@ class TestStoppingNodeSessions:
         assert kills[0] == [("second", "a1"), ("third", "b1")]
 
     def test_a_placement_the_config_can_no_longer_name_is_a_survivor(
-        self, rig, tmp_path, kills
+        self, rig, tmp_path, kills, nodes_log
     ):
         proj = ProjectConfig(path=str(tmp_path / "web"), node="auto")
         _hold("web", nick="gone")
         assert launch.stop_node_sessions(_config(proj), ["web"]) == ([], ["web"])
         assert kills[0] == []
         assert "web" in nodes.read_node_map()
+        (line,) = nodes_log() or [""]
+        assert line.startswith("down: web not stopped: ")
+        assert "gone" in line
 
+    @pytest.mark.parametrize(
+        "exc",
+        [lockfile.LockHeld("the node map is held"), ValueError("node-map.json: torn")],
+        ids=["held", "torn"],
+    )
     def test_a_map_that_cannot_be_rewritten_does_not_unclaim_the_kill(
-        self, rig, api, kills, monkeypatch
+        self, rig, api, kills, monkeypatch, exc
     ):
         _hold("api")
 
         def held(*_a: object, **_k: object) -> None:
+            raise exc
+
+        monkeypatch.setattr(nodes, "update_node_map", held)
+        outcome: object
+        try:
+            outcome = launch.stop_node_sessions(_config(api), ["api"])
+        except (ValueError, OSError) as escaped:  # `down` crashing after a proven kill
+            outcome = escaped
+        assert outcome == (["api"], [])
+
+    def test_one_unmap_that_fails_stops_the_rest_from_waiting_on_the_lock(
+        self, rig, tmp_path, kills, monkeypatch
+    ):
+        # A held map lock costs MAP_LOCK_WAIT_S per attempt: one, not one per
+        # placed project. Every kill still counts.
+        a1, a2 = (
+            ProjectConfig(path=str(tmp_path / n), node="second") for n in ("a1", "a2")
+        )
+        _hold("a1")
+        _hold("a2")
+        tries: list[str] = []
+
+        def held(name: str, *_a: object, **_k: object) -> None:
+            tries.append(name)
             raise lockfile.LockHeld("the node map is held")
 
         monkeypatch.setattr(nodes, "update_node_map", held)
+        assert launch.stop_node_sessions(_config(a1, a2), ["a1", "a2"]) == (
+            ["a1", "a2"],
+            [],
+        )
+        assert tries == ["a1"]
+
+    def test_a_retitled_project_is_found_by_its_recorded_sid(
+        self, rig, tmp_path, kills
+    ):
+        # The title changed, its session id did not: the map key is the old
+        # title, and the session it records still runs. Found, killed, unmapped.
+        proj = ProjectConfig(path=str(tmp_path / "web"), title="my web", node="auto")
+        sid = nodes.node_sid(proj)
+        _hold("my.web", nick="third", sid=sid)
+        assert launch.stop_node_sessions(_config(proj), [sid]) == ([sid], [])
+        assert kills[0] == [("third", sid)]
+        assert nodes.read_node_map() == {}
+
+    # An unreadable map: this answer becomes a report, so the map is never
+    # read as "nothing placed" -- whatever it might hold is not claimed.
+
+    def test_with_a_torn_map_an_auto_project_is_a_survivor_nobody_dials(
+        self, rig, tmp_path, kills, torn, nodes_log
+    ):
+        proj = ProjectConfig(path=str(tmp_path / "web"), node="auto")
+        assert launch.stop_node_sessions(_config(proj), ["web"]) == ([], ["web"])
+        assert kills[0] == []
+        assert any("node map unreadable" in m for m in nodes_log())
+
+    def test_with_a_torn_map_a_pin_answering_not_there_is_a_survivor(
+        self, rig, api, kills, torn
+    ):
+        # It may run where the lost map placed it: "not on the pin" proves nothing.
+        kills[1]["api"] = False
+        assert launch.stop_node_sessions(_config(api), ["api"]) == ([], ["api"])
+        assert kills[0] == [("second", "api")]
+
+    def test_with_a_torn_map_a_confirmed_kill_is_stopped(self, rig, api, kills, torn):
         assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+
+    def test_a_torn_map_is_never_rewritten(self, rig, api, kills, torn):
+        launch.stop_node_sessions(_config(api), ["api"])
+        assert nodes.NODE_MAP_PATH.read_text(encoding="utf-8") == "{ torn"

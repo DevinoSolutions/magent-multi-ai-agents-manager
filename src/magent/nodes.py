@@ -427,6 +427,21 @@ def open_target(
     return entry.target, entry.cwd
 
 
+def placement_of(
+    proj: ProjectConfig, entries: Mapping[str, NodeMapEntry]
+) -> tuple[str, NodeMapEntry] | None:
+    """``(map key, entry)`` recording where ``proj`` was placed, or None: by
+    its project name first, else by its session id -- a title edited since the
+    bring-up can keep its sid, and the session it names still runs. The order
+    ``open_target`` reads in. `down` asks this both to decide where to act and
+    what to kill, so the two answers cannot diverge."""
+    name = project_name(proj)
+    if name in entries:
+        return name, entries[name]
+    sid = node_sid(proj)
+    return next(((k, e) for k, e in entries.items() if e.sid == sid), None)
+
+
 # A portable Unix login (useradd's default NAME_REGEX, minus the trailing-$
 # machine-account form). Checked only on the DERIVED user: an explicit
 # settings.nodes.<nick>.user is the operator's word.
