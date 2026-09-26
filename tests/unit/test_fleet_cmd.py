@@ -573,6 +573,50 @@ class TestSessionsJson:
             "node": None,
         }
 
+    @pytest.mark.parametrize("damage", ["torn", "busy"])
+    def test_an_unreadable_node_map_reads_stale_and_never_raises(
+        self, runner, tmp_config, tmp_path, monkeypatch, damage
+    ):
+        # Both map reads meet the damage: session_rows' strict one (every row
+        # stale, the node known only where the config pins it) and the
+        # cwd-only tolerant one (no folder). Neither may fail the listing.
+        from magent import nodes
+
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+        entry = nodes.read_node_map()["api"]
+        nodes.update_node_map("web", dataclasses.replace(entry, sid="web"))
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"),
+            {"ts": time.time(), "sessions": ["api", "web"]},
+        )
+        auto = {"path": str(tmp_path / "web"), "title": "web", "node": "auto"}
+        cfg = self._node_config(tmp_config, tmp_path, auto)
+        if damage == "torn":
+            text = nodes.NODE_MAP_PATH.read_text(encoding="utf-8")
+            nodes.NODE_MAP_PATH.write_text(text[: len(text) // 2], encoding="utf-8")
+        else:
+            monkeypatch.setattr(nodes, "NODE_MAP_PATH", _BusyMap())
+
+        result = runner.invoke(cli.main, ["--config", cfg, "sessions", "--json"])
+
+        assert result.exit_code == 0
+        stale = {"cwd": "", "live": None, "state": "stale"}
+        stale |= {"model": None, "effort": None}
+        assert json.loads(result.stdout)[1:] == [
+            {"name": "api", **stale, "node": "second"},
+            {"name": "web", **stale, "node": None},
+        ]
+
+
+class _BusyMap:
+    """A stand-in NODE_MAP_PATH that stays busy: every read is the Windows
+    PermissionError of a reader racing an os.replace, past every retry."""
+
+    def read_text(self, encoding: str) -> str:
+        raise PermissionError(13, "busy")
+
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
