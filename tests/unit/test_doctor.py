@@ -800,9 +800,9 @@ class TestTheNodesRow:
             "magent.cli.node_cmd.doctor_report",
             lambda cfg, nicks: {
                 "second": [
-                    ScriptLine("fail", "claude-login", "not logged in"),
-                    ScriptLine("ok", "tmux", ""),
                     ScriptLine("warn", "github-key", "not registered"),
+                    ScriptLine("ok", "tmux", ""),
+                    ScriptLine("fail", "claude-login", "not logged in"),
                 ],
                 "third": [
                     ScriptLine("ok", "tmux", ""),
@@ -816,8 +816,56 @@ class TestTheNodesRow:
         cfg = _nodes_cfg(tmp_config, ("second", "third", "fifth"))
         assert _check_nodes(cfg) == (
             "warn",
-            "second: claude-login, github-key; fifth: reach -- details: magent node doctor",
+            "second: github-key, claude-login; fifth: reach -- details: magent node doctor",
         )
+
+    def test_nodes_keep_the_config_order(self, tmp_config, monkeypatch):
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {n: [ScriptLine("fail", "reach", "")] for n in nicks},
+        )
+        assert _check_nodes(_nodes_cfg(tmp_config, ("second", "fifth"))) == (
+            "warn",
+            "second: reach; fifth: reach -- details: magent node doctor",
+        )
+
+    def test_a_row_neither_fail_nor_warn_is_healthy(self, tmp_config, monkeypatch):
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {
+                "second": [ScriptLine("did", "x", ""), ScriptLine("key", "y", "")]
+            },
+        )
+        assert _check_nodes(_nodes_cfg(tmp_config)) == ("ok", "1 node(s) healthy")
+
+    def test_doctor_hands_the_loaded_config_to_the_nodes_row(
+        self, runner, monkeypatch, tmp_config
+    ):
+        monkeypatch.setattr("magent.platform.get_platform", FakePlatform)
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: False)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {n: [ScriptLine("fail", "reach", "")] for n in nicks},
+        )
+        config_path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                },
+                "projects": [],
+            }
+        )
+
+        result = runner.invoke(cli.main, ["--config", config_path, "doctor", "--json"])
+
+        rows = {c["name"]: c for c in json.loads(result.stdout)["checks"]}
+        assert rows["nodes"] == {
+            "name": "nodes",
+            "status": "warn",
+            "detail": "second: reach -- details: magent node doctor",
+        }
 
     def test_the_row_comes_right_after_upload_port(
         self, runner, monkeypatch, tmp_config
