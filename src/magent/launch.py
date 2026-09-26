@@ -1589,8 +1589,16 @@ def bring_up_node_project(
     except (ValueError, remote_mux.RemoteError, OSError) as exc:
         # ValueError covers NodeConfigError (its subclass) and a recipe that
         # cannot be framed; OSError a local file that vanished mid-read, and
-        # LockHeld (the map held past its wait).
-        log.warning("node %s: bring-up of %s failed: %s", nick or "?", sid, exc)
+        # LockHeld (the map held past its wait). A plain ValueError may also be
+        # a bug wearing an outcome, so it keeps its traceback in the log.
+        log.warning(
+            "node %s: bring-up of %s failed: %s",
+            nick or "?",
+            sid,
+            exc,
+            exc_info=isinstance(exc, ValueError)
+            and not isinstance(exc, nodes.NodeConfigError),
+        )
         return NodeBringUpOutcome(
             ok=False, sid=sid, node=nick, error=_node_error_text(exc)
         )

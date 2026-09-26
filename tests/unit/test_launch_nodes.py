@@ -500,6 +500,38 @@ class TestEveryNodeFailureIsAnOutcomeButABugIsNot:
         with pytest.raises(TypeError):
             launch.bring_up_node_project(_config(api), api)
 
+    def test_an_unexpected_value_error_is_logged_with_its_traceback(
+        self, rig, api, caplog
+    ):
+        # A plain ValueError is an outcome (a recipe that cannot be framed) but
+        # also possibly a bug: the log keeps the traceback to tell them apart.
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        rig.error = ValueError("cannot frame the recipe")
+        assert not launch.bring_up_node_project(_config(api), api).ok
+        (record,) = [r for r in caplog.records if "failed" in r.getMessage()]
+        assert record.exc_info
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            nodes.NodeConfigError("second: unknown node"),
+            RemoteError(5, "magent: clone failed", ("bring_up",)),
+            PermissionError(13, "Permission denied"),
+        ],
+    )
+    def test_an_expected_failure_is_logged_without_one(self, rig, api, caplog, exc):
+        from magent.log import get_logger
+
+        get_logger("nodes")
+        caplog.set_level("WARNING", logger="magent.nodes")
+        rig.error = exc
+        assert not launch.bring_up_node_project(_config(api), api).ok
+        (record,) = [r for r in caplog.records if "failed" in r.getMessage()]
+        assert not record.exc_info
+
     def test_the_nodes_last_stderr_line_is_the_reason(self, rig, api):
         rig.error = RemoteError(
             5,
