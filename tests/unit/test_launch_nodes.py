@@ -1005,6 +1005,47 @@ class TestAnUnreadableMapPlacesNothingByGuess:
         assert f"({cls})" in (outcomes[1].error or "")
         assert [(n, r.sid) for n, r in rig.recipes] == [("second", "web")]
 
+    def test_a_holder_refused_only_for_an_unknown_auto_twin_names_the_map(
+        self, rig, tmp_path, unreadable_map
+    ):
+        # api-x holds second:~/magent/api and is live; api-y (auto) holds
+        # third:~/magent/api. Without the map api-x cannot prove it is the
+        # holder, so it stays refused -- but the reason is the map, never
+        # "rename one of them" for a fleet that is fine once it reads again.
+        x_api, y_api, web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        _record("api-x", "second", "~/magent/api")
+        _record("api-y", "third", "~/magent/api")
+        rig.live = True
+        cls = unreadable_map()
+        outcomes = _batch(_config(x_api, y_api, web), only=["api-x", "web"])
+        assert [(o.sid, o.ok) for o in outcomes] == [("api-x", False), ("web", True)]
+        assert outcomes[0].error == (
+            f"the node map is unreadable ({cls}), so whether 'api' on second is"
+            " already in use is unknown; not brought up"
+        )
+        assert [(n, r.sid) for n, r in rig.recipes] == [("second", "web")]
+
+    def test_a_clash_with_a_known_project_keeps_the_rename_text(
+        self, rig, tmp_path, unreadable_map
+    ):
+        # api-z (pinned, known) shares the leaf too: that clash is real
+        # whatever the map says, so its text is the X3 one.
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        z_dir = tmp_path / "z" / "api"
+        z_dir.mkdir(parents=True)
+        rig.states[z_dir] = _state(z_dir)
+        z_api = ProjectConfig(path=str(z_dir), node="third", title="api-z")
+        unreadable_map()
+        (outcome,) = _batch(_config(x_api, y_api, z_api), only=["api-x"])
+        assert (outcome.sid, outcome.ok) == ("api-x", False)
+        error = outcome.error or ""
+        assert "'api-x', 'api-y' and 'api-z' would share" in error
+        assert "rename one of them" in error
+        assert "node map is unreadable" not in error
+        assert rig.recipes == []
+
     def test_a_pinned_project_keeps_its_pin(self, rig, api, unreadable_map):
         _record("api", "third", "~/magent/api")
         unreadable_map()
