@@ -30,8 +30,10 @@ config is a tmp file passed with --config; the port comes from a bind-0 lease,
 never a well-known one. MAGENT_HOTKEY_SUPERVISOR=0 because the Alt+V listener
 installs a SYSTEM-WIDE keyboard hook that no HOME redirect contains -- and
 proving that the REVIVED server inherited that opt-out is itself an assertion
-here, since the daemon spawns it. Teardown kills only pids this test created,
-found through the redirected home's pid files.
+here, since the daemon spawns it. Teardown kills only processes this test
+created: the pids in the redirected home's pid files, then every process whose
+argv carries this test's uuid-named config path -- the net that still holds
+when `attention -d` exits nonzero and no pid was ever learned.
 
 Every wait is bounded and the whole test is clamped by a single wall-clock
 budget: a blocked wait does not fail a test, it burns the job's
@@ -167,6 +169,84 @@ def _kill_pid(pid: int | None) -> None:
         os.kill(pid, signal.SIGKILL)
 
 
+def _pids_whose_argv_contains(marker: str) -> list[int]:
+    """Every live process whose command line contains ``marker``, this one
+    excluded.
+
+    ``marker`` is the test's own uuid-named config path, which every process
+    this test causes carries in its argv: the daemon (``--config <cfg>``) and
+    every server it spawns (``upload_server_argv`` forwards the same
+    ``--config``). That makes this the one enumeration that still finds them
+    when the launcher exited nonzero and no pid was ever learned -- and the
+    uuid is what keeps it from matching anything else on the machine, least of
+    all by image name.
+    """
+    if sys.platform == "win32":
+        out = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    "Get-CimInstance Win32_Process | "
+                    "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=60,
+            check=False,
+        ).stdout
+        try:
+            rows = json.loads(out or "[]")
+        except ValueError:
+            return []
+        if isinstance(rows, dict):
+            rows = [rows]
+        found = [
+            (row.get("ProcessId"), row.get("CommandLine") or "")
+            for row in rows
+            if isinstance(row, dict)
+        ]
+    else:
+        out = subprocess.run(
+            ["ps", "-eo", "pid=,args="],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=30,
+            check=False,
+        ).stdout
+        found = []
+        for line in out.splitlines():
+            head, _, args = line.strip().partition(" ")
+            if head.isdigit():
+                found.append((int(head), args))
+    return [
+        pid
+        for pid, argv in found
+        if isinstance(pid, int) and pid != os.getpid() and marker in argv
+    ]
+
+
+def _kill_everything_this_test_started(w: _World) -> None:
+    """Teardown's last word: kill every process carrying this test's marker.
+
+    The pid files are not enough on their own. When ``attention -d`` exits
+    nonzero the test never learns the daemon's pid, yet the daemon may still
+    come up behind it -- and, in the supervising test, spawn a server. Killing
+    the daemon first can race a spawn already in flight, so this sweeps until
+    a pass finds nothing (bounded)."""
+    for _ in range(3):
+        pids = _pids_whose_argv_contains(str(w.cfg))
+        if not pids:
+            return
+        for pid in pids:
+            _kill_pid(pid)
+        time.sleep(0.5)
+
+
 def _install_psmux_shim(shim_dir: Path) -> str:
     """A REAL executable named ``psmux`` that does nothing, on a dir of its own.
 
@@ -200,7 +280,9 @@ class _World:
         self.proj.mkdir()
         shim_path = _install_psmux_shim(tmp_path / "shim")
         self.port = _free_port()
-        self.cfg = tmp_path / "magent.config.json"
+        # The uuid in the NAME is load-bearing: this path is in the argv of
+        # every process the test causes, so teardown can find them by it.
+        self.cfg = tmp_path / f"magent-{self.unique}.config.json"
         self.cfg.write_text(
             json.dumps(
                 {
@@ -282,7 +364,7 @@ class _World:
     def diagnostics(self) -> str:
         """Everything the redirected home knows, for a failure message."""
         lines = [f"port={self.port} home={self.home}"]
-        for name in ("att-d.err",):
+        for name in ("att-d.out", "att-d.err"):
             path = self.workdir / name
             if path.is_file():
                 lines.append(f"--- {name} ---\n{path.read_text(errors='replace')}")
@@ -295,12 +377,17 @@ class _World:
 def _start_attention(w: _World, budget: _Budget) -> int:
     """Spawn the detached ``attention -d --interval 1``; return its pid.
 
-    stdout -> DEVNULL so the detached grandchild can't SIGPIPE on a closed
-    pipe; stderr -> a file, because a launcher that refuses to start is the
-    first thing anyone debugging this test needs to read.
+    stdout and stderr -> files, never pipes, so the detached grandchild can't
+    SIGPIPE on a closed one. Both are kept because the launcher's verdict
+    ("attention daemon failed to start") goes to STDOUT: with stdout on
+    DEVNULL a failed launch showed only an incidental stderr warning.
     """
+    out_path = w.workdir / "att-d.out"
     err_path = w.workdir / "att-d.err"
-    with err_path.open("w", encoding="utf-8") as err:
+    with (
+        out_path.open("w", encoding="utf-8") as out,
+        err_path.open("w", encoding="utf-8") as err,
+    ):
         launcher = subprocess.run(
             [
                 sys.executable,
@@ -313,7 +400,7 @@ def _start_attention(w: _World, budget: _Budget) -> int:
                 "--interval",
                 "1",
             ],
-            stdout=subprocess.DEVNULL,
+            stdout=out,
             stderr=err,
             env=w.env,
             timeout=budget.allow(_DAEMON_UP_S),
@@ -389,12 +476,13 @@ class TestAttentionDaemonSupervisesTheUploadServer:
             # Only pids this test created: the daemon, plus every server it was
             # observed to spawn (including one that may have appeared after the
             # last assertion).
-            _kill_pid(daemon_pid)
+            _kill_pid(daemon_pid or _read_pid(w.daemon_pidfile))
             late = _read_pid(w.server_pidfile)
             if late is not None and late not in seen_servers:
                 seen_servers.append(late)
             for pid in seen_servers:
                 _kill_pid(pid)
+            _kill_everything_this_test_started(w)
 
     def test_the_opt_out_leaves_the_server_dead(self, tmp_path):
         """MAGENT_UPLOAD_SUPERVISOR=0 is a promise, not a preference: a user who
@@ -414,5 +502,6 @@ class TestAttentionDaemonSupervisesTheUploadServer:
             assert not _health_ok(w.port), "an opted-out daemon started a server"
             assert not w.server_pidfile.exists()
         finally:
-            _kill_pid(daemon_pid)
+            _kill_pid(daemon_pid or _read_pid(w.daemon_pidfile))
             _kill_pid(_read_pid(w.server_pidfile))
+            _kill_everything_this_test_started(w)
