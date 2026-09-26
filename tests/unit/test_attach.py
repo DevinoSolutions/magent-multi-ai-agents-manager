@@ -3108,6 +3108,33 @@ class TestUpHandsAllowDirtyToTheDesktopCopy:
         assert result.exit_code == 0
         assert seen[0][-1] == "--allow-dirty"
 
+    def test_allow_dirty_rides_once_beside_every_other_flag(
+        self, runner, tmp_config, monkeypatch
+    ):
+        seen: list[list[str]] = []
+        monkeypatch.setattr(
+            "magent.launch.session0_disposition", lambda plat: "handoff"
+        )
+        monkeypatch.setattr(
+            "magent.launch.relay_handoff",
+            lambda plat, argv, timeout_s: seen.append(argv) or 0,
+        )
+        path = tmp_config({"projects": []})
+        result = runner.invoke(
+            cli.main,
+            ["--config", path, "up", "--allow-dirty", "-g", "x", "--all", "--revive"],
+        )
+        assert result.exit_code == 0
+        (argv,) = seen
+        assert argv.count("--allow-dirty") == 1
+        assert argv[argv.index("up") + 1 :] == [
+            "-g",
+            "x",
+            "--all",
+            "--revive",
+            "--allow-dirty",
+        ]
+
     def test_a_node_project_is_not_touched_before_the_hand_off(
         self, runner, tmp_config, monkeypatch
     ):
@@ -3141,7 +3168,7 @@ class TestUpNodeProjectsBesideLiveLocalSessions:
     alone, beside no live local id -- and the created node sid is not
     decorated as a local session."""
 
-    def _patch(self, monkeypatch, down=()):
+    def _patch(self, monkeypatch, down=(), node_sids=("api",)):
         calls: list[tuple[object, object]] = []
         decorated: list[list[str]] = []
         monkeypatch.setattr(
@@ -3153,7 +3180,8 @@ class TestUpNodeProjectsBesideLiveLocalSessions:
             ),
         )
         monkeypatch.setattr(
-            "magent.launch.node_session_ids", lambda cfg, group=None: ["api"]
+            "magent.launch.node_session_ids",
+            lambda cfg, group=None: list(node_sids),
         )
         monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
         monkeypatch.setattr(
@@ -3191,6 +3219,18 @@ class TestUpNodeProjectsBesideLiveLocalSessions:
         result = runner.invoke(cli.main, ["--config", path, "up", "--all"])
         assert result.exit_code == 0, result.output
         assert calls == [(None, False)]
+
+    def test_all_with_everything_up_and_no_node_project_still_recreates(
+        self, runner, tmp_config, monkeypatch
+    ):
+        # Nothing down and nothing on a node is still not "already up" under
+        # --all: it asked for every session to be recreated.
+        calls, _ = self._patch(monkeypatch, node_sids=())
+        path = tmp_config({"projects": []})
+        result = runner.invoke(cli.main, ["--config", path, "up", "--all"])
+        assert result.exit_code == 0, result.output
+        assert calls == [(None, False)]
+        assert "already up" not in result.stdout
 
 
 class TestUpNamesTheLogThatHoldsEachCasualty:

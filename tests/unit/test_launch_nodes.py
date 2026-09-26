@@ -943,12 +943,17 @@ class TestEveryNodeFailureIsAnOutcomeButABugIsNot:
 
 
 class TestUpCommandBringsNodeProjectsUp:
-    def _config_file(self, tmp_path: Path, folder: Path) -> str:
+    def _config_file(
+        self, tmp_path: Path, folder: Path, group: str | None = None
+    ) -> str:
+        proj: dict[str, object] = {"path": str(folder), "node": "second"}
+        if group:
+            proj["group"] = group
         path = tmp_path / "magent.config.json"
         path.write_text(
             json.dumps(
                 {
-                    "projects": [{"path": str(folder), "node": "second"}],
+                    "projects": [proj],
                     "settings": {
                         "psmux": False,
                         "uploadServer": False,
@@ -994,10 +999,34 @@ class TestUpCommandBringsNodeProjectsUp:
             "magent.launch.decorate_psmux_sessions",
             lambda names, code_hint=None: decorated.append(list(names)) or [],
         )
-        CliRunner().invoke(
+        result = CliRunner().invoke(
             cli.main, ["--config", self._config_file(tmp_path, tmp_path / "api"), "up"]
         )
+        # The node sid really was created -- so [] means it was filtered out,
+        # not that nothing came up to decorate.
+        assert result.exit_code == 0, result.output
+        assert "Brought up 1 session(s): api" in result.stdout
         assert decorated == [[]]
+
+    def test_a_node_project_outside_the_group_is_out_of_scope(
+        self, rig, api, tmp_path, monkeypatch
+    ):
+        # -g scopes the node half at the shell too: a node project in another
+        # group must not turn "all already up" into an empty bring-up run.
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: ([{"name": "web", "session": "web"}], [], [{}]),
+        )
+        monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
+        monkeypatch.setattr("magent.launch.decorate_psmux_sessions", lambda *a, **k: [])
+        config = self._config_file(tmp_path, tmp_path / "api", group="backend")
+        result = CliRunner().invoke(
+            cli.main, ["--config", config, "up", "-g", "frontend"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "All 1 session(s) already up." in result.stdout
+        assert rig.recipes == []
 
     def test_an_unreachable_node_points_at_the_nodes_log(
         self, rig, api, tmp_path, monkeypatch
