@@ -959,6 +959,25 @@ class TestUpBringsUpNodeProjectsToo:
         (warning,) = [line for line in out.splitlines() if "--allow-dirty" in line]
         assert warning.lstrip().startswith("! ")
 
+    def test_an_unreadable_push_file_fails_only_its_own_project(
+        self, rig, tmp_path, monkeypatch, capsys
+    ):
+        # Raising for a push candidate that cannot be read is contained: that
+        # project's outcome is a failure, the other node project and the
+        # local fleet still come up, and nothing raises out of `up`.
+        good, locked = _projects(tmp_path, rig, [("a1", "second"), ("z", "second")])
+        secret = tmp_path / "z" / "sa.json"
+        secret.write_text("{}", encoding="utf-8")
+        locked = dataclasses.replace(locked, push=["sa.json"])
+        deny_stat(monkeypatch, secret.resolve())
+        monkeypatch.setattr(
+            "magent.psmux.bring_up", lambda cfg, only, group: (["loc"], [])
+        )
+        created, failed = launch.bring_up_psmux(_config(good, locked))
+        assert (created, failed) == (["loc", "a1"], ["z"])
+        assert [recipe.sid for _, recipe in rig.recipes] == ["a1"]
+        assert "Permission denied" in capsys.readouterr().out
+
     def test_allow_dirty_reaches_the_node_bring_up(self, rig, tmp_path, monkeypatch):
         projs = _projects(tmp_path, rig, [("a1", "second")])
         rig.states[tmp_path / "a1"] = _state(tmp_path / "a1", dirty=True)
