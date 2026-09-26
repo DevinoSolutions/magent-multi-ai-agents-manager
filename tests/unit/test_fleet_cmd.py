@@ -313,10 +313,10 @@ class TestPeek:
         # Windows stdout is cp1252. This used to raise UnicodeEncodeError out of
         # click.echo and exit 1 -- `magent peek proj > tail.txt` crashed while
         # the same command in a console worked.
-        from magent import style
+        from magent.cli import fleet_cmd
 
-        monkeypatch.setattr(style.sys, "stdout", _Stdout("cp1252"))
-        out = style.stdout_safe(f"{CARET} prompt\n  Fable 5.1 {MID} high")
+        monkeypatch.setattr(fleet_cmd.sys, "stdout", _Stdout("cp1252"))
+        out = fleet_cmd._stdout_safe(f"{CARET} prompt\n  Fable 5.1 {MID} high")
 
         # cp1252 HAS the middle dot (0xB7) and not the caret, so only the
         # genuinely unrepresentable glyph degrades.
@@ -325,12 +325,12 @@ class TestPeek:
         assert out.encode("cp1252")  # the whole point: it can now be written
 
     def test_a_utf8_stdout_keeps_every_glyph(self, monkeypatch):
-        from magent import style
+        from magent.cli import fleet_cmd
 
         pane = f"{CARET} prompt {MID} here"
-        monkeypatch.setattr(style.sys, "stdout", _Stdout("utf-8"))
+        monkeypatch.setattr(fleet_cmd.sys, "stdout", _Stdout("utf-8"))
 
-        assert style.stdout_safe(pane) == pane
+        assert fleet_cmd._stdout_safe(pane) == pane
 
 
 class TestSessionsJson:

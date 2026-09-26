@@ -21,9 +21,10 @@ import click
 from magent import env, log
 from magent.cli.app import main
 from magent.cli.config_io import _load_config_or_exit
+from magent.cli.fleet_cmd import _stdout_safe
 from magent.lockfile import LockHeld
 from magent.paths import find_config
-from magent.style import stdout_safe, style
+from magent.style import style
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -205,11 +206,11 @@ def _print_rows(lines: Sequence[ScriptLine]) -> None:
     for line in lines:
         mark, color = _ROW_MARKS.get(line.status, ("?", "white"))
         quiet = line.status in ("ok", "skip")
-        # A row's item and detail are the NODE's words (stdout_safe's reason).
+        # A row's item and detail are the NODE's words (_stdout_safe's reason).
         click.echo(
             f"    {style(mark, fg=color, bold=True)} "
-            f"{stdout_safe(line.item):<{width}}  "
-            f"{style(stdout_safe(line.detail), dim=quiet)}"
+            f"{_stdout_safe(line.item):<{width}}  "
+            f"{style(_stdout_safe(line.detail), dim=quiet)}"
         )
 
 
