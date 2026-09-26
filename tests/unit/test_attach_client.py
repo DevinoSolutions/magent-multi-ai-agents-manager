@@ -1321,3 +1321,12 @@ class TestOneSshClientForTheProbeAndThePane:
         )
         assert rc == 0
         assert [argv[0] for argv in dialled] == [client]
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="GetSystemDirectoryW is win32")
+    def test_a_failed_system_directory_probe_reads_as_none(self, monkeypatch):
+        import ctypes
+
+        monkeypatch.setattr(
+            ctypes.windll.kernel32, "GetSystemDirectoryW", lambda _buf, _n: 0
+        )
+        assert real_system_directory() is None
