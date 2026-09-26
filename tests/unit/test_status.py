@@ -2286,6 +2286,106 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         assert "1 session(s) would NOT stop: web" in lines
         assert "No running sessions to stop." not in lines
 
+    @staticmethod
+    def _unreadable(state):
+        from magent import nodes
+
+        if state == "torn":
+            nodes.NODE_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+            nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+            return None
+
+        def busy() -> dict[str, nodes.NodeMapEntry]:
+            raise PermissionError(13, "The process cannot access the file")
+
+        return busy
+
+    @pytest.mark.parametrize(
+        ("state", "cls"), [("torn", "ValueError"), ("busy", "PermissionError")]
+    )
+    def test_an_unreadable_map_never_hands_down_to_the_attach_host(
+        self, runner, tmp_config, monkeypatch, tmp_path, state, cls
+    ):
+        # Nothing psmux-live here and a remembered host: a READABLE map naming
+        # api keeps `down` local. An unreadable one proves nothing either way
+        # -- read as "nothing placed", it forwarded, stopping the host's
+        # fleet while this PC's node session kept running. Unknown acts here,
+        # and one line names the map (class only) and the host's command.
+        from magent import nodes
+
+        self._hold("api")
+        busy = self._unreadable(state)
+        if busy is not None:
+            monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+        out, _killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        assert dialed == [("second", "api")]
+        hints = [ln for ln in out.output.splitlines() if "--host" in ln]
+        assert len(hints) == 1, out.output
+        assert f"the node map could not be read ({cls})" in hints[0]
+        assert "magent down --host me@host" in hints[0]
+        assert "node-map.json" not in out.output
+
+    @pytest.mark.parametrize("state", ["torn", "busy"])
+    def test_an_unreadable_map_leaves_an_explicit_host_in_charge(
+        self, runner, tmp_config, monkeypatch, tmp_path, state
+    ):
+        from magent import nodes
+
+        self._hold("api")
+        busy = self._unreadable(state)
+        if busy is not None:
+            monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+        out, killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--host", "u@h", "--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == [("u@h", "magent down --all")]
+        assert (killed, dialed) == ([], [])
+        assert "could not be read" not in out.output
+
+    @pytest.mark.parametrize("state", ["torn", "busy"])
+    def test_an_unreadable_map_with_live_sessions_here_adds_no_line(
+        self, runner, tmp_config, monkeypatch, tmp_path, state
+    ):
+        # Local work was running: `down` stays here whatever the map says,
+        # so the map is not the reason and there is nothing new to say.
+        from magent import nodes
+
+        (tmp_path / "web").mkdir()
+        self._hold("api")
+        busy = self._unreadable(state)
+        if busy is not None:
+            monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+        out, killed, _dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[
+                {"path": str(tmp_path / "web")},
+                {"path": str(tmp_path / "api"), "node": "second"},
+            ],
+            live_local={"web"},
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        assert killed == [["web", "api"]]
+        assert "--host" not in out.output
+
     def test_down_all_stops_the_node_sync_daemon(
         self, runner, tmp_config, monkeypatch, tmp_path
     ):
