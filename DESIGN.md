@@ -1785,6 +1785,59 @@ supervised-pane and `--no-mux` `wt` spawns in `cli/attach.py`. Pins:
 TestAttachClientKeepsNestingMarkersButNotALeakedNoColor`, and
 `tests/unit/test_attach.py::TestAttachPanesLoseOnlyALeakedColourOverride`.
 
+### An idle pane is proven, not read off the foreground (2026-09-26)
+
+`magent up --revive` (and the interactive `up`, which revives without the flag)
+types `cmd /c claude --continue` + Enter into every live session whose agent
+has fallen back to a bare shell. The bring-up's send-keys verification re-sends
+the start command on the same signal, and `status` prints an `idle` column from
+it. That signal was `#{pane_current_command}` read as a shell — and psmux
+reports the pane's foreground DESCENDANT, not the pane's own process. While
+Claude Code runs a tool the reading is `bash` (its Bash tool), `pwsh`, `grep`
+or an MCP server, with claude.exe alive under the pane. Measured live on a
+31-session fleet: 4 sessions read idle while their agent was mid-turn, and
+revive would have typed a second agent's command line into each one's prompt.
+
+The rule now: a pane is idle only on POSITIVE proof, and the one place that
+decides it is `psmux.idle_sessions`. All three consumers read it —
+`revive_sessions`, `WindowsPlatform._verify_sends_landed` and
+`cli/status.py::_psmux_sessions` — and `agent_idle` is a one-session wrapper
+over it. A yes needs all three of:
+
+1. the foreground reading is a bare shell (`is_idle_command`) — kept, because
+   a pane in the user's own program is not at its prompt either, and as a
+   cheap filter: a session that fails it costs no further probe;
+2. the pane's OWN process (`#{pane_pid}`, read by `psmux.pane_pids`) was read,
+   is present in the process snapshot, and is itself a shell;
+3. nothing in that process's subtree (`procs.process_tree` over the Toolhelp
+   snapshot, which now carries parent pids) is an agent image.
+
+Everything unknown is a no: an unreadable or non-numeric pane pid, a failed
+snapshot, a pane process that is gone by snapshot time. Off Windows there is no
+snapshot, so nothing is ever idle there — revive does nothing rather than
+guess. The asymmetry is the point: a false "busy" leaves a dead pane for the
+human to restart, a false "idle" types into a live agent's input.
+
+The agent images come from the registry, not a second list: each
+`AgentTool` carries `images` (`claude`, `codex`), and
+`sessions.agent_image_names()` adds `AGENT_RUNTIME_IMAGES` (`node`, the npm
+shim either agent can run under). A snapshot carries image names, never
+command lines, so ANY node under a pane counts — the reading that errs toward
+busy. The cost is batched: one `pane_pids` fan-out (every probe spawned before
+any is read, like `pane_current_commands`) and ONE snapshot per call, paid only
+when some reading is a shell; status passes the readings it already holds for
+its table instead of probing twice.
+
+Two known edges, both measured against the code rather than the fleet. A
+parent-pid walk cannot reach an ORPHAN — an agent whose launching `cmd` was
+killed while it lived — so such a pane can still read idle; a console-process
+check would close that and is not built. And Windows never rewrites a stale
+parent pid, so a recycled pid can pull a stranger into a pane's subtree; that
+only ever errs toward busy. Pins: `tests/unit/test_psmux.py::
+TestReviveNeverTypesIntoALiveAgent`, `tests/unit/test_platform_contract.py::
+TestWindowsSendKeysVerification`, `tests/unit/test_status.py::
+TestIdleColumnNeedsPositiveProof`, `tests/unit/test_procs.py::TestProcessTree`.
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.

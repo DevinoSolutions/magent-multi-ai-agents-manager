@@ -206,10 +206,24 @@ class TestAgentIdle:
         ],
     )
     def test_classification(self, monkeypatch, foreground, idle):
-        monkeypatch.setattr(
-            psmux, "pane_current_command", lambda name, psmux=None: foreground
+        # A pane whose pwsh is readable and has nothing under it: the
+        # foreground reading is the only thing that varies.
+        fake_panes(
+            monkeypatch,
+            foreground={"sess": foreground},
+            pids={"sess": 100},
+            snapshot=pane_tree(100),
         )
         assert psmux.agent_idle("sess", psmux="psmux") is idle
+
+    def test_a_shell_reading_over_a_live_agent_is_not_idle(self, monkeypatch):
+        fake_panes(
+            monkeypatch,
+            foreground={"sess": "bash"},
+            pids={"sess": 100},
+            snapshot=pane_tree(100, "cmd.exe", "claude.exe", "bash.exe"),
+        )
+        assert psmux.agent_idle("sess", psmux="psmux") is False
 
 
 class _FakePopen:
@@ -318,8 +332,8 @@ class TestPaneCurrentCommands:
 
 
 class TestIsIdleCommand:
-    """`agent_idle` now delegates here, so a caller that already holds the
-    reading (status's session table) classifies it without a second probe."""
+    """The foreground HINT: one of `idle_sessions`' conditions, never a verdict
+    on its own (a live agent running its Bash tool reads `bash`)."""
 
     @pytest.mark.parametrize(
         ("reading", "idle"),
@@ -327,6 +341,114 @@ class TestIsIdleCommand:
     )
     def test_classification_matches_agent_idle(self, reading, idle):
         assert psmux.is_idle_command(reading) is idle
+
+
+class TestPanePids:
+    """`#{pane_pid}` is the pane's OWN process -- the root the idle proof walks
+    from -- read with the same fan-out and guards as the foreground probe."""
+
+    def _fan(self, monkeypatch, results):
+        argvs: list[list[str]] = []
+        events: list[str] = []
+
+        def _fake_popen(cmd, **kwargs):
+            argvs.append(cmd)
+            events.append(f"spawn:{cmd[2]}")
+            stdout, rc = results.get(cmd[2], ("", 0))
+            return _FakePopen(cmd[2], stdout, rc, events)
+
+        monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+        return argvs, events
+
+    def test_reads_each_sessions_own_pane_in_one_fan_out(self, monkeypatch):
+        argvs, events = self._fan(monkeypatch, {"a": ("35948 \n", 0), "b": ("7", 0)})
+        assert psmux.pane_pids(["a", "b"], psmux="psmux") == {"a": 35948, "b": 7}
+        assert events == ["spawn:a", "spawn:b", "read:a", "read:b"]
+        cmd = argvs[0]
+        assert cmd[:4] == ["psmux", "-L", "a", "display-message"]
+        assert cmd[cmd.index("-t") + 1] == "a"
+        assert cmd[-1] == "#{pane_pid}"
+
+    @pytest.mark.parametrize("raw", ["", "AMIN", "0", "-4", "12x"])
+    def test_anything_but_a_positive_pid_is_unreadable(self, monkeypatch, raw):
+        # An empty or garbled reading must never become a root to walk from:
+        # unreadable is the one answer that keeps the pane out of revive.
+        self._fan(monkeypatch, {"a": (raw, 0)})
+        assert psmux.pane_pids(["a"], psmux="psmux") == {"a": None}
+
+    def test_a_failed_probe_is_unreadable(self, monkeypatch):
+        self._fan(monkeypatch, {"a": ("35948", 1)})
+        assert psmux.pane_pids(["a"], psmux="psmux") == {"a": None}
+
+    def test_no_binary_reads_nothing(self, monkeypatch):
+        monkeypatch.setattr(psmux, "find_psmux", lambda: None)
+        assert psmux.pane_pids(["a"]) == {"a": None}
+
+
+class TestIdleSessions:
+    """The one seam every consumer reads. The consumer-level pins live in
+    TestReviveNeverTypesIntoALiveAgent (and the bring-up/status suites); these
+    pin the seam's own cost and inputs."""
+
+    def test_no_shell_reading_costs_no_pid_probe_and_no_snapshot(self, monkeypatch):
+        probes = fake_panes(
+            monkeypatch,
+            foreground={"api": "claude", "web": "cmd"},
+            pids={"api": 100, "web": 200},
+            snapshot=[*pane_tree(100), *pane_tree(200)],
+        )
+        assert psmux.idle_sessions(["api", "web"], psmux="psmux") == set()
+        assert probes.pid_probes == []
+        assert probes.snapshots == []
+
+    def test_only_the_shell_readings_are_pid_probed(self, monkeypatch):
+        probes = fake_panes(
+            monkeypatch,
+            foreground={"api": "pwsh", "web": "claude"},
+            pids={"api": 100, "web": 200},
+            snapshot=[*pane_tree(100), *pane_tree(200, "claude.exe")],
+        )
+        assert psmux.idle_sessions(["api", "web"], psmux="psmux") == {"api"}
+        assert probes.pid_probes == [["api"]]
+
+    def test_held_readings_are_not_probed_again(self, monkeypatch):
+        # status already holds every pane's foreground reading for its table.
+        fake_panes(
+            monkeypatch, foreground={}, pids={"api": 100}, snapshot=pane_tree(100)
+        )
+        monkeypatch.setattr(
+            psmux,
+            "pane_current_commands",
+            lambda names, psmux=None: pytest.fail("re-probed a held reading"),
+        )
+        assert psmux.idle_sessions(
+            ["api"], psmux="psmux", foreground={"api": "pwsh"}
+        ) == {"api"}
+
+    def test_every_registry_agent_and_its_runtime_counts(self, monkeypatch):
+        from magent.sessions import agent_image_names
+
+        agents = sorted(agent_image_names())
+        names = [f"p{i}" for i in range(len(agents))]
+        pids = {n: 100 * (i + 1) for i, n in enumerate(names)}
+        fake_panes(
+            monkeypatch,
+            foreground=dict.fromkeys(names, "bash"),
+            pids=pids,
+            snapshot=[
+                e
+                for n, image in zip(names, agents, strict=True)
+                for e in pane_tree(pids[n], f"{image.upper()}.EXE", "bash.exe")
+            ],
+        )
+        assert psmux.idle_sessions(names, psmux="psmux") == set()
+
+    def test_off_windows_nothing_is_ever_idle(self, monkeypatch):
+        # No process snapshot exists off Windows, so no proof can exist either.
+        fake_panes(
+            monkeypatch, foreground={"api": "bash"}, pids={"api": 100}, snapshot=None
+        )
+        assert psmux.idle_sessions(["api"], psmux="psmux") == set()
 
 
 def _cfg(projects, **settings):
@@ -494,7 +616,18 @@ class TestReviveSessions:
         sent: list[tuple] = []
         monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
         monkeypatch.setattr(psmux, "has_session", lambda name, psmux=None: True)
-        monkeypatch.setattr(psmux, "agent_idle", lambda name, psmux=None: name in idle)
+        # An idle pane is a pwsh with nothing under it; a busy one runs claude.
+        pids = {"api": 100, "web": 200}
+        fake_panes(
+            monkeypatch,
+            foreground={n: "pwsh" if n in idle else "claude" for n in pids},
+            pids=pids,
+            snapshot=[
+                e
+                for n, pid in pids.items()
+                for e in pane_tree(pid, *(() if n in idle else ("claude.exe",)))
+            ],
+        )
 
         def _fake_send(name, *keys, target=None, psmux=None):
             sent.append((name, keys, target))

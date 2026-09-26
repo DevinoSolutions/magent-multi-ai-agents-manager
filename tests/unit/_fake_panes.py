@@ -69,7 +69,7 @@ def fake_process_side(
         probes.snapshots.append(1)
         return snapshot
 
-    monkeypatch.setattr("magent.psmux.pane_pids", _pane_pids, raising=False)
+    monkeypatch.setattr("magent.psmux.pane_pids", _pane_pids)
     monkeypatch.setattr("magent.procs.snapshot_processes", _snapshot)
     return probes
 

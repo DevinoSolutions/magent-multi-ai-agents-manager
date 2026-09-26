@@ -331,9 +331,9 @@ def _drive_bring_up(
     monkeypatch.setattr(
         "magent.platform.windows._wait_for_panes_ready", lambda *a, **k: None
     )
-    monkeypatch.setattr(
-        "magent.platform.windows.pane_current_commands", _fake_pane_commands
-    )
+    # Patched where `psmux.idle_sessions` -- the verdict the verification reads
+    # -- looks it up.
+    monkeypatch.setattr("magent.psmux.pane_current_commands", _fake_pane_commands)
     names = windows or ["api"]
     pids: dict[str, int | None] = {n: 100 * (i + 1) for i, n in enumerate(names)}
     pids.update(pane_pids or {})

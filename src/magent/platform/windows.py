@@ -36,8 +36,7 @@ from magent.psmux import (
     child_env,
     code_on_path,
     decoration_argv,
-    is_idle_command,
-    pane_current_commands,
+    idle_sessions,
 )
 
 user32 = windll.user32
@@ -818,16 +817,19 @@ class WindowsPlatform(Platform):
     def _verify_sends_landed(psmux: str, batch: list[PsmuxWindowOpts]) -> None:
         """Re-type the agent command into any pane the send-keys never reached.
 
-        Detection is the same primitive ``revive_sessions`` uses -- a pane
-        whose ``#{pane_current_command}`` is a bare shell has no agent. The
-        probe runs immediately before each re-send and is the ONLY guard
-        against the dangerous edge: re-sending into a live agent would type
-        the command text into its input box. So anything that is not a shell
-        is left alone, and an empty/unreadable reading counts as "not a
-        casualty" -- never inject into a pane whose state we could not
-        establish (``psmux.agent_idle`` takes the same posture).
+        Detection is the same verdict ``revive_sessions`` acts on,
+        ``psmux.idle_sessions``: a pane is a casualty only when it rests at
+        its shell with no agent anywhere under it. The probe runs immediately
+        before each re-send and is the ONLY guard against the dangerous edge:
+        re-sending into a live agent would type the command text into its
+        input box -- and an agent that is already up and running its Bash tool
+        reads ``bash`` in the foreground, so the foreground reading alone
+        cannot be the guard. Anything unknown (an unreadable pane, a failed
+        process snapshot) counts as "not a casualty": never inject into a
+        pane whose state we could not establish.
 
-        Probed as one fan-out per round (``pane_current_commands``), not a
+        One verdict per round for the whole pending set (one foreground
+        fan-out, one pane-pid fan-out, one process snapshot), not a
         round-trip per session: a full batch would otherwise serialize five.
 
         Never raises. A pane that stays bare through every attempt is logged
@@ -839,12 +841,8 @@ class WindowsPlatform(Platform):
         sends = 1  # the caller already typed the command once
         while True:
             time.sleep(_SEND_VERIFY_SETTLE_S)
-            readings = pane_current_commands(list(pending), psmux=psmux)
-            pending = {
-                name: w
-                for name, w in pending.items()
-                if is_idle_command(readings.get(name, ""))
-            }
+            idle = idle_sessions(list(pending), psmux=psmux)
+            pending = {name: w for name, w in pending.items() if name in idle}
             if not pending:
                 return
             names = ", ".join(pending)

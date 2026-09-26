@@ -23,10 +23,72 @@ from magent.procs import (
     current_session_id,
     pid_alive,
     pids_by_image_name,
+    process_tree,
     raise_priority_above_normal,
     session_id_of,
+    snapshot_processes,
     spawn_unjobbed,
 )
+
+
+class TestProcessTree:
+    """The subtree walk behind "is an agent still under this pane". Pure over a
+    snapshot, so the shapes a live Toolhelp list takes are pinned here without
+    reading one; the one real-process pin below uses a child it spawned."""
+
+    SNAPSHOT = (
+        ("psmux.exe", 1, 0),
+        ("pwsh.exe", 10, 1),
+        ("cmd.exe", 11, 10),
+        ("claude.exe", 12, 11),
+        ("bash.exe", 13, 12),
+        ("pwsh.exe", 20, 1),  # a sibling pane: not ours
+        ("node.exe", 21, 20),
+    )
+
+    def test_it_walks_every_depth_under_the_root(self):
+        tree = process_tree(10, self.SNAPSHOT)
+        assert tree is not None
+        assert [pid for _image, pid, _ppid in tree] == [10, 11, 12, 13]
+
+    def test_the_root_comes_first(self):
+        # idle_sessions asks "is the pane's own process a shell" of tree[0].
+        tree = process_tree(12, self.SNAPSHOT)
+        assert tree is not None
+        assert tree[0] == ("claude.exe", 12, 11)
+
+    def test_siblings_and_ancestors_are_not_the_subtree(self):
+        tree = process_tree(20, self.SNAPSHOT)
+        assert tree is not None
+        assert {pid for _image, pid, _ppid in tree} == {20, 21}
+
+    def test_a_root_missing_from_the_snapshot_is_unknown_not_empty(self):
+        # "The pane process is gone" and "nothing runs under it" are different
+        # claims; only the second may make a pane idle.
+        assert process_tree(99, self.SNAPSHOT) is None
+
+    def test_a_parent_cycle_terminates(self):
+        # Windows recycles pids and never rewrites a parent pid, so a stale
+        # parent link can close a loop; the walk must still end.
+        cyclic = [("a.exe", 1, 2), ("b.exe", 2, 1), ("c.exe", 3, 2)]
+        tree = process_tree(1, cyclic)
+        assert tree is not None
+        assert sorted(pid for _image, pid, _ppid in tree) == [1, 2, 3]
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Toolhelp is win32-only")
+    def test_the_real_snapshot_carries_parent_pids(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            snapshot = snapshot_processes()
+            assert snapshot is not None
+            tree = process_tree(os.getpid(), snapshot)
+            assert tree is not None
+            assert child.pid in {
+                pid for _image, pid, ppid in tree if ppid == os.getpid()
+            }
+        finally:
+            child.kill()
+            child.wait()
 
 
 class TestCountProcesses:
