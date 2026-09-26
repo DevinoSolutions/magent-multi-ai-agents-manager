@@ -1891,7 +1891,14 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
     # the command at a LF (a truncated folder, then a false success flash),
     # and `!` expands under delayed expansion. Only the server path can
     # deliver these -- open_target already drops a control-bearing node cwd.
-    _ODD = ("/srv/a\nb", "/srv/a\rb", "/srv/a\tb", "/srv/a\x7fb", "/srv/a!b")
+    _ODD = (
+        "/srv/a\nb",
+        "/srv/a\rb",
+        "/srv/a\tb",
+        "/srv/a\x1fb",  # the top of C0: a `< " "` bound, not `<= "\x1e"`
+        "/srv/a\x7fb",
+        "/srv/a!b",
+    )
 
     def _serve(self, monkeypatch, tmp_path, folder, code_bin):
         from magent import nodes
