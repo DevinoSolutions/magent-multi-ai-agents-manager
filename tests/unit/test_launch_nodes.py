@@ -1195,7 +1195,7 @@ class TestAnUnreadableMapPlacesNothingByGuess:
                     repos=(),
                     push_files=(),
                     memory_dir=None,
-                    remote_root="(node unknown)/api",
+                    remote_root=f"{nodes.UNKNOWN_NODE_ROOT}/api",
                 ),
                 False,
             )
