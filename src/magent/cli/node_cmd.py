@@ -61,8 +61,10 @@ if TYPE_CHECKING:
 #   `to_local` guards -- `_local_dir` only for --local (:3960-3962), and
 #   `_recall_local` back under `if local_dir is not None:` with `_recall_to`
 #   as its `elif` (:3969-3970, :4252-4266); `_destination` and `_recall_to`
-#   (:4173-4249, which need `import dataclasses`, above); the recall docs
-#   row's "(--to <nick> | --local)" wording in cli/docs.py; and regenerate the
+#   (:4173-4249), which need `import dataclasses` (above) and add `nodes` to
+#   their in-body `from magent import launch, remote_mux` like every other
+#   function here -- the plan's code reads a module-level `nodes`; the recall
+#   docs row's "(--to <nick> | --local)" wording in cli/docs.py; regenerate the
 #   help snapshots in tests/unit/test_cli_structure.py -- the ("node",
 #   "recall") entry and, if the docstring changes, the ("node",) group's
 #   short help. Needs node_recipe, node_git_states, bring_up_node_project,
