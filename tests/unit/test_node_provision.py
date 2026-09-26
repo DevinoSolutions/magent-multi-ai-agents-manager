@@ -3461,16 +3461,25 @@ class TestDoctorShUnderRealBash:
         (row,) = [line for line in _report(r).lines if line.item == "tmux"]
         assert (row.status, row.detail) == ("ok", "tmux 3.4")
 
-    def test_a_failing_version_read_warns_instead_of_reading_ok(self, tmp_path):
+    @pytest.mark.parametrize(
+        ("tool", "status"),
+        [("git", "fail"), ("gh", "warn")],  # a required tool, and the optional one
+    )
+    def test_a_failing_version_read_grades_like_a_missing_tool(
+        self, tmp_path, tool, status
+    ):
         # Like a failing tmux -V: what a --version that exits non-zero printed
-        # is not a working tool's version.
+        # is not a working tool's version, so the tool reads as missing -- a
+        # node with a broken git must not look fit to receive sessions.
         fakes, env = _doctor_box(tmp_path)
-        fakes["git"].set_reply("--version", stdout="git version 2.43.0\n", rc=2)
+        fakes[tool].set_reply("--version", stdout=f"{tool} version 2.43.0\n", rc=2)
         r = _run_doctor(env)
         assert r.returncode == 0, r.stderr
-        assert _rows(r) == {**dict.fromkeys(DOCTOR_ITEMS, "ok"), "git": "warn"}
-        (row,) = [line for line in _report(r).lines if line.item == "git"]
-        assert row.detail == "git --version exited 2 -- reinstall git on this node"
+        assert _rows(r) == {**dict.fromkeys(DOCTOR_ITEMS, "ok"), tool: status}
+        (row,) = [line for line in _report(r).lines if line.item == tool]
+        assert (
+            row.detail == f"{tool} --version exited 2 -- reinstall {tool} on this node"
+        )
 
     def test_a_missing_tool_fails_but_a_missing_gh_only_warns(self, tmp_path):
         tools = tuple(t for t in NODE_TOOLS if t not in ("git", "gh"))

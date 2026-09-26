@@ -36,8 +36,8 @@ bounded() {
 timed_out() { [ "$1" -eq 124 ] || [ "$1" -eq 137 ]; }
 
 # check_tool <name> <status when missing> <version argv...>
-# A version read that hangs gets the same status as a missing tool; one that
-# exits non-zero warns, since what it printed is not a working tool's version.
+# A version read that hangs, or exits non-zero, gets the same status as a
+# missing tool: what a failing read printed is not a working tool's version.
 check_tool() {
   local name=$1 missing=$2 out rc
   shift 2
@@ -50,7 +50,7 @@ check_tool() {
   if timed_out "$rc"; then
     say "$missing" "$name" "$* timed out after ${VERSION_PROBE_S}s"
   elif [ "$rc" -ne 0 ]; then
-    say warn "$name" "$* exited $rc -- reinstall $name on this node"
+    say "$missing" "$name" "$* exited $rc -- reinstall $name on this node"
   else
     say ok "$name" "${out%%$'\n'*}"
   fi
