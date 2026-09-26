@@ -189,16 +189,16 @@ def _refuse(message: str, *, as_json: bool = False) -> NoReturn:
 
 
 def _unreachable(node: Node, exc: RemoteError) -> ScriptLine:
-    """ssh's own failure as a row: the target and ssh's last stderr line. rc
-    None is a timeout or an over-cap reply -- the call went out and no answer
-    came back -- so it does not claim the node could not be reached."""
+    """ssh's own failure as a row: the target and ssh's last stderr line."""
     # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
     from magent.remote_mux import ScriptLine
 
     tail = exc.stderr_tail.strip().splitlines()
     why = tail[-1] if tail else f"rc={exc.rc}"
-    what = "no answer from" if exc.rc is None else "cannot reach"
-    return ScriptLine("fail", "reach", f"{what} {node.target}: {why}")
+    # D-MERGE: once D10 merges, word a timeout off RemoteError.timed_out
+    # ("no answer from", not "cannot reach"); rc None alone also means an
+    # over-cap reply, so it is not the signal.
+    return ScriptLine("fail", "reach", f"cannot reach {node.target}: {why}")
 
 
 def _print_rows(lines: Sequence[ScriptLine]) -> None:
