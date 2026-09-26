@@ -836,6 +836,42 @@ class TestNodeSetupRefusesBeforeAnySsh:
         assert "WOULDBESECRET" not in result.output
         assert fake_ssh.calls() == []
 
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "ssh-dss AAAAB3NzaC1kc3MAAACBAFAKE me@pc",  # a type setup.sh refuses
+            "ssh-ed25519\tAAAAC3NzaC1lZDI1NTE5AAAAIFAKE me@pc",  # a tab, not a space
+            "ssh-ed25519 AAAA!notbase64 me@pc",
+        ],
+    )
+    def test_a_line_setup_sh_would_refuse_is_refused_here_first(
+        self, runner, tmp_config, fake_ssh, line
+    ):
+        # setup.sh's KEY_RE would refuse it after the root hop (exit 1);
+        # refused here, nothing is sent (exit 2).
+        _pc_key(text=line + "\n")
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert result.exit_code == 2
+        assert "is not one ssh public key line" in result.output
+        assert fake_ssh.calls() == []
+
+    def test_the_key_rule_is_setup_sh_s_key_re(self):
+        # One rule in two languages: bash's [[:cntrl:]] class is spelled out
+        # for Python, and bash anchors with ^...$ where Python fullmatches.
+        text = (
+            Path(node_cmd.__file__).parent.parent / "node_scripts" / "setup.sh"
+        ).read_text(encoding="utf-8")
+        (bash,) = [
+            line.split("=", 1)[1].strip("'")
+            for line in text.splitlines()
+            if line.startswith("KEY_RE=")
+        ]
+        assert bash == (
+            "^"
+            + node_cmd._KEY_RE.pattern.replace(r"[^\x00-\x1f\x7f]", "[^[:cntrl:]]")
+            + "$"
+        )
+
     def test_two_key_lines_are_refused(self, runner, tmp_config, fake_ssh):
         _pc_key(text=f"{PC_KEY}\n{PC_KEY}\n")
         result = _setup(runner, _pool_file(tmp_config), "second")

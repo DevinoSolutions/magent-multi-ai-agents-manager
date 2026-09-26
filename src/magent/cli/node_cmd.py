@@ -427,15 +427,20 @@ def node_doctor_cmd(ctx: click.Context, nick: str | None, as_json: bool) -> None
 # typo costs no ssh. fullmatch: `$` would let a trailing newline through.
 _USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 _DEFAULT_PUBKEYS = ("id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub")
+# setup.sh's KEY_RE, checked here too so a line it would refuse after the root
+# hop is refused before it (pinned equal by test). Its [[:cntrl:]] is spelled
+# out; fullmatch stands in for its ^...$.
+_KEY_RE = re.compile(
+    r"(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)"
+    r"|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)"
+    r" [A-Za-z0-9+/]+={0,3}( [^\x00-\x1f\x7f]*)?"
+)
 
 
 def _pubkey(key_file: Path | None) -> str:
     """This PC's public key line: ``key_file``, or the first default under
     ~/.ssh. Raises ValueError with the message to print; the file's content
     is never part of it -- a mistaken file may hold a secret."""
-    # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
-    from magent.remote_mux import SSH_KEY_TYPE_PREFIXES
-
     if key_file is None:
         ssh_dir = Path.home() / ".ssh"
         key_file = next(
@@ -455,12 +460,7 @@ def _pubkey(key_file: Path | None) -> str:
             f"{key_file} is a PRIVATE key -- pass its .pub file with --key"
         )
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    # A key line opens with its type; setup.sh checks the same, after the hop.
-    if (
-        len(lines) != 1
-        or len(lines[0].split()) < 2
-        or not lines[0].startswith(SSH_KEY_TYPE_PREFIXES)
-    ):
+    if len(lines) != 1 or not _KEY_RE.fullmatch(lines[0]):
         raise ValueError(f"{key_file} is not one ssh public key line")
     return lines[0]
 
