@@ -583,8 +583,8 @@ def node_setup_cmd(
 
     Logs in as root@<host> for this one hop. Idempotent: every step prints
     ok/did/skip. The Claude login is NOT copied: run `ssh <user>@<host> claude`
-    once. Exit 0 when only that login is left, 1 when a step failed, 2 when
-    nothing was sent (unknown nick, bad user name, no public key).
+    once. Exit 0 when nothing failed but that login, 1 when a step failed, 2
+    when nothing was sent (unknown nick, bad user name, no public key).
     """
     # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
     from magent import nodes, remote_mux

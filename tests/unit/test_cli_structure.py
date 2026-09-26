@@ -166,7 +166,7 @@ HELP_SNAPSHOTS = {
     (
         "node",
         "setup",
-    ): "Usage: main node setup [OPTIONS] NICK\n\n  Prepare a machine once: packages, a per-person user, your key, Claude Code and\n  the node's own GitHub key, then the user scope and a check.\n\n  Logs in as root@<host> for this one hop. Idempotent: every step prints\n  ok/did/skip. The Claude login is NOT copied: run `ssh <user>@<host> claude`\n  once. Exit 0 when only that login is left, 1 when a step failed, 2 when\n  nothing was sent (unknown nick, bad user name, no public key).\n\nOptions:\n  --user TEXT  A Unix user to create on the node (repeatable; default: the\n               node's user).\n  --key FILE   This PC's ssh PUBLIC key to authorize (default:\n               ~/.ssh/id_ed25519.pub, then id_ecdsa, id_rsa).\n  --help       Show this message and exit.\n",
+    ): "Usage: main node setup [OPTIONS] NICK\n\n  Prepare a machine once: packages, a per-person user, your key, Claude Code and\n  the node's own GitHub key, then the user scope and a check.\n\n  Logs in as root@<host> for this one hop. Idempotent: every step prints\n  ok/did/skip. The Claude login is NOT copied: run `ssh <user>@<host> claude`\n  once. Exit 0 when nothing failed but that login, 1 when a step failed, 2 when\n  nothing was sent (unknown nick, bad user name, no public key).\n\nOptions:\n  --user TEXT  A Unix user to create on the node (repeatable; default: the\n               node's user).\n  --key FILE   This PC's ssh PUBLIC key to authorize (default:\n               ~/.ssh/id_ed25519.pub, then id_ecdsa, id_rsa).\n  --help       Show this message and exit.\n",
     (
         "node",
         "sync",
