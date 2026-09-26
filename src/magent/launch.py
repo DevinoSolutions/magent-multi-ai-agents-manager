@@ -1742,6 +1742,26 @@ def _node_error_text(exc: Exception) -> str:
     return str(exc)
 
 
+def _node_busy_text(nick: str, waited_s: float) -> str:
+    """A node whose ``node-pull-<nick>`` another magent process (a sync tick,
+    a bring-up, a ``down``) held past ``waited_s`` -- pass the constant the
+    wait itself used, so the figure is the wait that ran out. The bring-up's
+    outcome and ``down``'s not-pulled line both say it this way."""
+    return (
+        f"node {nick} is busy: another magent process held its pull lock"
+        f" past {waited_s:.0f}s"
+    )
+
+
+def _pull_error_text(exc: Exception) -> str:
+    """``_node_error_text`` for ``down``'s not-pulled line, but an OSError is
+    its kind only: its message can name a local path (``nodes.log`` has the
+    whole error). ``strerror`` is the OS's words without the path."""
+    if isinstance(exc, OSError):
+        return exc.strerror or type(exc).__name__
+    return _node_error_text(exc)
+
+
 def _open_node_window(node: Node, sid: str) -> str | None:
     """The attach window for ``sid`` on ``node`` -- C's one wt spawn, running
     the reconnecting supervisor -- and the title it opened under (tiling
@@ -1907,8 +1927,8 @@ def bring_up_node_project(
             sid=sid,
             node=nick,
             error=(
-                f"node {nick} is busy: another magent process held its pull lock"
-                f" past {remote_mux.PULL_TIMEOUT_S:.0f}s; re-run to try again"
+                f"{_node_busy_text(nick, remote_mux.PULL_TIMEOUT_S)};"
+                " re-run to try again"
             ),
         )
     except (ValueError, remote_mux.RemoteError, OSError) as exc:
@@ -2079,13 +2099,14 @@ def node_session_ids(config: MagentConfig, group: str | None = None) -> list[str
 
 
 _MAP_UNREAD = "the node map could not be read"
+_KEPT = "kept in the node map for `magent node sync --once`"
 
 
-def _say_not_pulled(sid: str, reason: str, kept: str = "kept in the node map") -> None:
-    """The one line a session whose last turn did not come home gets."""
+def _say_not_pulled(sid: str, reason: str, then: str = _KEPT) -> None:
+    """The one line a session whose last turn did not come home gets:
+    ``reason`` is why, ``then`` what is left to fetch it with."""
     click.echo(
-        f"  {style('!', fg='yellow')} {sid}: last turn not pulled ({reason}); "
-        f"{kept} for `magent node sync --once`"
+        f"  {style('!', fg='yellow')} {sid}: last turn not pulled ({reason}); {then}"
     )
 
 
@@ -2112,8 +2133,9 @@ def _final_pull(
     session's.
 
     The caller read ``key`` out of the map strictly, so ``final_pull``'s None
-    ("never placed") is its own lenient re-read finding the map busy or torn:
-    a pull that did not happen, never one that did."""
+    ("never placed") is its own lenient re-read not finding it -- the map busy
+    or torn, or a concurrent ``down``/``up`` that moved the entry: a pull that
+    did not happen, never one that did."""
     # heavy subsystem: in-body per policy (node_sync dials the node)
     from magent import node_sync, remote_mux
 
@@ -2121,29 +2143,36 @@ def _final_pull(
         reason = no_pull[nick]
     else:
         try:
-            result = node_sync.final_pull(config, key)
+            result = node_sync.final_pull(
+                config, key, wait_s=node_sync.FINAL_PULL_WAIT_S
+            )
         except (OSError, ValueError, remote_mux.RemoteError) as exc:
-            # OSError covers NodeLockHeld (a sync tick held the node past
+            # OSError covers NodeLockHeld (another magent process -- a sync
+            # tick, a bring-up, another down -- held the node past
             # FINAL_PULL_WAIT_S) and a pulled file this PC could not write;
             # ValueError covers NodeConfigError. None of them may abort the down.
             get_logger("nodes").warning("down: final pull of %s failed: %s", sid, exc)
+            reason = _pull_error_text(exc)
             if isinstance(exc, remote_mux.RemoteError) and (
                 exc.timed_out or exc.rc == attach_client.SSH_TRANSPORT_RC
             ):
+                # The first line keeps ssh's own reason (rc 255 is also a
+                # refused key); the node's later sessions just skip.
                 no_pull[nick] = f"node {nick} did not answer the pull"
             elif isinstance(exc, node_sync.NodeLockHeld):
-                no_pull[nick] = (
-                    f"node {nick}'s pull lock is held by another magent process"
+                # Our words, not the lock's name, on every session of the node.
+                reason = no_pull[nick] = _node_busy_text(
+                    nick, node_sync.FINAL_PULL_WAIT_S
                 )
-            # ASCII end to end: the cause is the node's or the OS's words.
-            reason = _node_error_text(exc).encode("ascii", "replace").decode("ascii")
+            # ASCII end to end: the cause may be the node's or the OS's words.
+            reason = reason.encode("ascii", "replace").decode("ascii")
         else:
             if result is not None:
                 return True
             get_logger("nodes").warning(
                 "down: final pull of %s found no map entry for %r", sid, key
             )
-            reason = _MAP_UNREAD
+            reason = "its node map entry could not be read again"
     _say_not_pulled(sid, reason)
     return False
 
@@ -2238,7 +2267,14 @@ def stop_node_sessions(
         # nothing to pull; no entry in a map that was not is a pull not made.
         pulled = key is not None and _final_pull(config, key, sid, node.nick, no_pull)
         if key is None and not map_known:
-            _say_not_pulled(sid, _MAP_UNREAD, kept="the node map is left as it was")
+            _say_not_pulled(
+                sid,
+                _MAP_UNREAD,
+                then=(
+                    "if the map placed it, `magent node sync --once` fetches it"
+                    " once the map reads again"
+                ),
+            )
         killed = remote_mux.kill_session(node, entry.sid if entry else sid)
         if killed is None:
             log.warning("down: %s not stopped: node %s did not answer", sid, node.nick)
