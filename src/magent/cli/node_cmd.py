@@ -75,6 +75,15 @@ def sync_cmd(
     if do_stop:
         if node_sync.stop_daemon():
             click.echo(f"  {style('+', fg='green')} Stopped the node sync daemon.")
+        elif node_sync.daemon_running():
+            # False is also "a daemon holds the lock and outlived the stop"
+            # (pid unknown, kill refused, or not dead within the settle).
+            pid = node_sync.daemon_pid()
+            click.echo(
+                f"  {style('x', fg='red')} Could not stop the node sync daemon "
+                f"(pid {pid or 'unknown'})."
+            )
+            sys.exit(1)
         else:
             click.echo(f"  {style('-', dim=True)} Node sync daemon was not running.")
         return

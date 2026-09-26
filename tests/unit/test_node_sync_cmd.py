@@ -123,6 +123,31 @@ class TestNodeSync:
         assert result.exit_code == 0
         assert "Node sync daemon was not running." in result.stdout
 
+    def test_a_daemon_whose_pid_is_unknown_is_not_reported_as_nothing_running(
+        self, runner, daemon_lock
+    ):
+        """stop_daemon() is False both for "nothing ran" and for "a daemon
+        holds the lock and could not be stopped"; only the lock tells them
+        apart. With no pid file there is nothing to kill."""
+        result = runner.invoke(cli.main, ["node", "sync", "--stop"])
+        assert result.exit_code == 1, result.output
+        assert "was not running" not in result.stdout
+        assert "Could not stop the node sync daemon (pid unknown)." in result.stdout
+
+    def test_a_refused_kill_is_not_reported_as_nothing_running(
+        self, runner, monkeypatch, daemon_lock, stranger
+    ):
+        """A daemon started by another user or in Session 0: the kill is
+        refused (Access denied / EPERM) and the daemon is still there."""
+        _record_pid(stranger.pid)
+        monkeypatch.setattr(node_sync, "_kill", lambda pid: False)
+        result = runner.invoke(cli.main, ["node", "sync", "--stop"])
+        assert result.exit_code == 1, result.output
+        assert "was not running" not in result.stdout
+        assert f"Could not stop the node sync daemon (pid {stranger.pid})." in (
+            result.stdout
+        )
+
     def test_the_daemon_flag_spawns_the_foreground_loop_detached(
         self, runner, pool_config, monkeypatch
     ):
