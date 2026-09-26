@@ -632,9 +632,9 @@ def _node_orphan_targets(
 
 def _placed_here(
     cfg: MagentConfig, node_targets: list[str]
-) -> tuple[list[str], str | None]:
+) -> tuple[list[str], OSError | ValueError | None]:
     """The node targets this PC's node map says it placed, and -- when the map
-    could not be read -- the class of what refused it. Like a live local
+    could not be read -- what refused it. Like a live local
     session, placed targets are work only a LOCAL `down` can reach, so they
     keep the shutdown off the remembered attach host. A node project that is
     merely CONFIGURED does not: an attach client sharing the host's config
@@ -653,7 +653,7 @@ def _placed_here(
     try:
         entries = nodes.load_node_map_strict()
     except (OSError, ValueError) as exc:
-        return [], type(exc).__name__
+        return [], exc
     return [
         nodes.node_sid(p)
         for p in nodes.node_projects(cfg)
@@ -661,14 +661,16 @@ def _placed_here(
     ], None
 
 
-def _echo_map_unread_hint(last: str, cls: str) -> None:
+def _echo_map_unread_hint(last: str, exc: OSError | ValueError) -> None:
     """One line when an unreadable node map is the only reason `down` stayed
     here: it may have placed node sessions that only a local `down` reaches,
     so the remembered attach host was not acted on. Names the map's failure
     by class only and the command that does reach the host."""
+    from magent import nodes  # leaf, in-body: keeps `magent --help` off its imports
+
     click.echo(
         f"  {style('!', fg='yellow')} "
-        f"Acted here, not on {last}: the node map could not be read ({cls})."
+        f"Acted here, not on {last}: {nodes.map_unread_text(exc)}."
         f" For the sessions on {last}: magent down --host {last}"
     )
 

@@ -2078,9 +2078,6 @@ def node_session_ids(config: MagentConfig, group: str | None = None) -> list[str
     return [nodes.node_sid(proj) for proj in nodes.node_projects(config, group)]
 
 
-_MAP_UNREAD = "the node map could not be read"
-
-
 def _say_not_pulled(sid: str, reason: str, kept: str = "kept in the node map") -> None:
     """The one line a session whose last turn did not come home gets."""
     click.echo(
@@ -2117,7 +2114,7 @@ def _final_pull(
     the entry vanishing between the two reads -- said the same way, as a pull
     that did not happen, never one that did."""
     # heavy subsystem: in-body per policy (node_sync dials the node)
-    from magent import node_sync, remote_mux
+    from magent import node_sync, nodes, remote_mux
 
     if nick in no_pull:
         reason = no_pull[nick]
@@ -2140,7 +2137,7 @@ def _final_pull(
                 )
             if isinstance(exc, node_sync.NodeMapUnreadable):
                 # The same words as the None below; the class is in the log.
-                reason = _MAP_UNREAD
+                reason = nodes.MAP_UNREAD
             else:
                 # ASCII end to end: the cause is the node's or the OS's words.
                 reason = (
@@ -2152,7 +2149,7 @@ def _final_pull(
             get_logger("nodes").warning(
                 "down: final pull of %s found no map entry for %r", sid, key
             )
-            reason = _MAP_UNREAD
+            reason = nodes.MAP_UNREAD
     _say_not_pulled(sid, reason)
     return False
 
@@ -2235,7 +2232,9 @@ def stop_node_sessions(
         # nothing to pull; no entry in a map that was not is a pull not made.
         pulled = key is not None and _final_pull(config, key, sid, node.nick, no_pull)
         if key is None and not map_known:
-            _say_not_pulled(sid, _MAP_UNREAD, kept="the node map is left as it was")
+            _say_not_pulled(
+                sid, nodes.MAP_UNREAD, kept="the node map is left as it was"
+            )
         killed = remote_mux.kill_session(node, entry.sid if entry else sid)
         if killed is None:
             log.warning("down: %s not stopped: node %s did not answer", sid, node.nick)

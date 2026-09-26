@@ -263,9 +263,6 @@ def state_stores() -> list[tuple[str, str, Path]]:
     return stores
 
 
-MAP_UNREAD = "the node map could not be read"
-
-
 class NodeMapUnreadable(OSError):
     """``final_pull`` could not read the node map: busy past its retries,
     torn, or not a JSON object. Whether the project was placed is unknown, so
@@ -721,14 +718,11 @@ class NodeSyncer:
         the ticks it stays unreadable go to DEBUG, and the tick that reads it
         again says so once. Not ``_note``: one map, not one line per node."""
         cls = type(e).__name__
+        text = nodes.map_unread_text(e)
         level = logging.DEBUG if self._map_error == cls else logging.WARNING
         self._map_error = cls
-        get_logger(LOG_NAME).log(
-            level, "node sync: %s (%s); pulling nothing", MAP_UNREAD, cls
-        )
-        return dict.fromkeys(
-            sorted(self._config.settings.nodes), (FAILED, f"{MAP_UNREAD} ({cls})")
-        )
+        get_logger(LOG_NAME).log(level, "node sync: %s; pulling nothing", text)
+        return dict.fromkeys(sorted(self._config.settings.nodes), (FAILED, text))
 
     def _sync_node(
         self,
@@ -1027,7 +1021,7 @@ def final_pull(
     try:
         entry = nodes.load_node_map_strict().get(name)
     except (OSError, ValueError) as e:
-        raise NodeMapUnreadable(f"{MAP_UNREAD} ({type(e).__name__})") from e
+        raise NodeMapUnreadable(nodes.map_unread_text(e)) from e
     if entry is None:
         return None
     user = local_user if local_user is not None else local_username()
