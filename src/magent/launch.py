@@ -13,7 +13,7 @@ import click
 
 from magent import attach_client, tailnet
 from magent.grid import TileSlot, compute_grid
-from magent.log import get_logger
+from magent.log import get_logger, heartbeat_fresh
 from magent.platform import (
     Platform,
     PsmuxWindowOpts,
@@ -409,7 +409,9 @@ def ensure_upload_server(port: int, config_path: str | None = None) -> bool:
     return True
 
 
-def _validated_env() -> MagentEnv | None:
+def _validated_env(
+    label: str = "upload supervisor", log_name: str = "attention"
+) -> MagentEnv | None:
     """The env singleton, or None if it no longer validates.
 
     A daemon must never die of an environment variable it does not use, and by
@@ -417,6 +419,8 @@ def _validated_env() -> MagentEnv | None:
     already failed loudly at CLI entry -- so an env that goes bad underneath a
     detached process degrades to the defaults with a log line, exactly as
     ``upload_server.supervision_enabled`` and ``log._configured_level`` do.
+    ``label`` names the asking supervisor and ``log_name`` is its log, so the
+    line lands where that supervisor's reader looks.
     """
     from pydantic import ValidationError
 
@@ -425,8 +429,8 @@ def _validated_env() -> MagentEnv | None:
     try:
         return get_env()
     except ValidationError:
-        get_logger("attention").warning(
-            "upload supervisor: environment did not validate; using defaults"
+        get_logger(log_name).warning(
+            "%s: environment did not validate; using defaults", label
         )
         return None
 
@@ -437,6 +441,100 @@ def upload_supervision_enabled() -> bool:
     the supervisor answers before it offers the daemon as a repair."""
     env = _validated_env()
     return True if env is None else env.upload_supervisor
+
+
+# --- Node sync supervision ---------------------------------------------------
+# The same doctrine one more time: `magent serve` is the process that is always
+# there, so it keeps `magent node sync` alive (upload_server._supervise_node_sync
+# -> ensure_node_sync every NODE_SYNC_SUPERVISE_INTERVAL_S). Two gates, like the
+# upload watchdog's: the config must have a node project to sync, and
+# MAGENT_NODE_SYNC must not say 0 -- the opt-out for a user who runs the daemon
+# themselves, and the test-isolation law (a real daemon dials real machines).
+# The env gates ONLY this supervised spawn: `magent node sync --once/-d` typed by
+# a person (or an e2e test) never reads it.
+
+
+def node_sync_env_enabled() -> bool:
+    """Whether MAGENT_NODE_SYNC permits serve to keep the node sync daemon alive.
+    Fail-open on an env that no longer validates, like every supervisor: the
+    config gate (``node_sync.wanted``) still has to pass."""
+    # in-body: keeps launch's import list the launch path's
+    from magent.node_sync import LOG_NAME
+
+    env = _validated_env("node sync supervisor", LOG_NAME)
+    return True if env is None else env.node_sync
+
+
+def node_sync_enabled(config: MagentConfig) -> bool:
+    """Both gates: the env allows it, and some project runs on a node."""
+    # in-body: keeps launch's import list the launch path's
+    from magent.node_sync import wanted
+
+    return node_sync_env_enabled() and wanted(config)
+
+
+def node_sync_argv(config_path: str | None) -> list[str]:
+    """The argv of a detached ``magent node sync`` (the foreground loop)."""
+    args = [sys.executable, "-m", "magent"]
+    if config_path:
+        args += ["--config", config_path]
+    return [*args, "node", "sync"]
+
+
+@dataclass
+class _NodeSyncReport:
+    """What ensure_node_sync last said about a wedged daemon: the warning
+    fires on the transition into a wedge and the recovery on the way out,
+    never once per supervisor interval."""
+
+    wedged: bool = False
+
+
+_node_sync_report = _NodeSyncReport()
+
+
+def ensure_node_sync(config: MagentConfig, config_path: str | None = None) -> bool:
+    """Start the node sync daemon detached unless it is gated off or already
+    running. True ONLY when a spawn was actually issued (the
+    ``ensure_upload_server`` contract); False when a gate is off, when a
+    healthy daemon is already running, and when the running one is wedged.
+
+    "Running" is the daemon's LOCK (``node_sync.daemon_running``), never its pid
+    file: after a crash or a reboot the pid file survives, the number is
+    recycled onto an unrelated process, and a pid check would read "alive"
+    forever -- never respawning, and pointing the user's `--stop` at a
+    stranger. The pid is read for the log line only.
+
+    A live daemon is NEVER re-aimed or replaced: it re-reads its own config file
+    when that changes, and a second one would only lose the lock. A held lock
+    with a stale heartbeat is a wedged daemon -- reported once, left for the
+    user (`magent node sync --stop`), never killed from here. The respawn rate
+    of a daemon that keeps dying is the caller's interval.
+    """
+    if not node_sync_enabled(config):
+        return False
+    from magent import node_sync  # in-body: same reason as node_sync_enabled
+
+    log = get_logger(node_sync.LOG_NAME)
+    if not node_sync.daemon_running():
+        _node_sync_report.wedged = False
+        spawn_detached(node_sync_argv(config_path))
+        return True
+    if heartbeat_fresh(node_sync.HEARTBEAT_NAME):
+        if _node_sync_report.wedged:
+            _node_sync_report.wedged = False
+            log.info("node sync: the daemon's heartbeat is fresh again")
+        return False
+    if not _node_sync_report.wedged:
+        _node_sync_report.wedged = True
+        log.warning(
+            (
+                "node sync: the daemon (pid %s) holds its lock but its heartbeat "
+                "is stale; leaving it (`magent node sync --stop` to restart it)"
+            ),
+            node_sync.daemon_pid(),
+        )
+    return False
 
 
 def upload_respawn_cooldown_s() -> float:

@@ -2942,3 +2942,12 @@ class TestBringUpShOnARealShell:
         result = self._push_raw(rig, _raw_payload(("project/config/.env", b"K=V\n")))
         assert json.loads(result.stdout)["shipped"] == ["config/.env"]
         assert (root / "real" / ".env").read_bytes() == b"K=V\n"
+
+
+class TestRunScriptCanHandBackAFailure:
+    def test_check_false_returns_the_exit_code(self, fake_ssh):
+        fake_ssh.set_reply("bash -s", stdout="fail\tx\ty\n", rc=1)
+        r = remote_mux.run_script(
+            NODE, "sample", [], timeout_s=remote_mux.SCRIPT_TIMEOUT_S, check=False
+        )
+        assert (r.returncode, r.stdout) == (1, b"fail\tx\ty\n")

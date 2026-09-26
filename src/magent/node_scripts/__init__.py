@@ -40,6 +40,9 @@ NON_ENTRY_SCRIPTS: frozenset[str] = frozenset(
     {
         # The shared library itself: inlined by `# @include`, never run alone.
         "lib.sh",
+        # Claude Code hook, run as a file with --source claude; never through
+        # run_script, so it gets no socket and includes no lib.sh.
+        "state_hook.sh",
     }
 )
 
@@ -93,3 +96,13 @@ def script(name: str) -> str:
             raise ValueError(f"{name}.sh: nested # @include in {line.strip()!r}")
         out.append(included if included.endswith("\n") else included + "\n")
     return "".join(out)
+
+
+def source(filename: str) -> str:
+    """Any file shipped in this package, by its full name -- for a file that
+    travels inside a payload rather than as a script (``node_apply.py``)."""
+    return (
+        resources.files("magent.node_scripts")
+        .joinpath(filename)
+        .read_text(encoding="utf-8")
+    )

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from magent import agent_state, env, log
+from magent import agent_state, env, log, node_sync
 from magent.grid import MonitorRect
 from magent.platform import (
     HandoffResult,
@@ -69,6 +69,7 @@ PLAYWRIGHT_BROWSERS_PATH = _playwright_browsers_path()
 _IMPORT_BOUND_PATHS = (
     ("magent.cli.attach", "_LAST_HOST_FILE", "last-attach-host"),
     ("magent.cli.attention_cmd", "_PID_PATH", "attention.pid"),
+    ("magent.node_sync", "_PID_PATH", f"{node_sync.HEARTBEAT_NAME}.pid"),
     ("magent.cli.session_picker", "_FOCUS_TARGET_FILE", "focus-target"),
     ("magent.cli.session_picker", "_PICKER_ATTACHED_FILE", "picker-attached"),
     ("magent.upload_server", "_FOCUS_TARGET_FILE", "focus-target"),
@@ -186,6 +187,12 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     # machine the suite runs on. Tests that are ABOUT the hand-off set the
     # policy explicitly.
     monkeypatch.setenv("MAGENT_SESSION0_POLICY", "allow")
+    # ...and a fourth, with the longest reach of all: `magent serve` keeps the
+    # node sync daemon alive, and that daemon ssh-es into every machine in
+    # settings.nodes with the developer's own keys, every pull interval. A test
+    # that starts a real serve would dial real machines. Off for every tier; the
+    # tests that are ABOUT the supervisor set it back to "1".
+    monkeypatch.setenv("MAGENT_NODE_SYNC", "0")
     log.reset_logging()
     yield
     log.reset_logging()
@@ -233,12 +240,29 @@ def _no_real_ssh(monkeypatch):
     monkeypatch.setattr("magent.attach_client._system_directory", lambda: None)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_gh(monkeypatch):
+    """No test resolves the REAL ``gh``: it holds the developer's GitHub token,
+    and ``node setup`` registers an ssh key to their account with it. Same
+    device as ``_no_real_ssh``; the ``fake_gh`` fixture wins over it."""
+    monkeypatch.setattr("magent.remote_mux.find_gh", lambda: None)
+
+
 @pytest.fixture
 def fake_ssh(tmp_path, monkeypatch):
     """A real on-disk fake ``ssh`` wired in as remote_mux's client (THE fake:
     tests/unit/_fake_ssh.py)."""
     fake = make_fake_ssh(tmp_path)
     monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: fake.path)
+    return fake
+
+
+@pytest.fixture
+def fake_gh(tmp_path, monkeypatch):
+    """A fake ``gh`` (the one fake, tests/unit/_fake_ssh.py, under another
+    name) wired in as remote_mux's local gh."""
+    fake = make_fake_ssh(tmp_path, name="gh")
+    monkeypatch.setattr("magent.remote_mux.find_gh", lambda: fake.path)
     return fake
 
 

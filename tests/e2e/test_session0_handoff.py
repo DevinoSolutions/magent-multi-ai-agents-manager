@@ -114,6 +114,7 @@ def _child_env(home: Path, bin_dir: Path, **extra: str) -> dict[str, str]:
     env["MAGENT_HOTKEY_SUPERVISOR"] = "0"
     env["MAGENT_UPLOAD_SUPERVISOR"] = "0"
     env["MAGENT_PSMUX_BOOST"] = "0"
+    env["MAGENT_NODE_SYNC"] = "0"
     home.mkdir(parents=True, exist_ok=True)
     home_s = str(home)
     drive, tail = os.path.splitdrive(home_s)

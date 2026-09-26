@@ -4,35 +4,44 @@ What a node IS (``Node``), what running a project there NEEDS (``Recipe``:
 repos, files to push, the auto-memory dir), and where node data lives on this
 PC (``~/.magent/nodes/``). Everything that touches a node or runs git is
 ``remote_mux``. A leaf: never imports magent.cli, never spawns a process. Its
-only I/O is the node-map file, its sidecar lock, and local stat()s.
+only I/O is files under ``NODES_DIR`` (the node map, its sidecar lock, and
+the per-node mirror), local stat()s, and a WARNING in the ``nodes`` log.
 """
 
 from __future__ import annotations
 
 import contextlib
+import copy
 import dataclasses
+import hashlib
+import ipaddress
 import json
 import math
 import os
 import re
+import stat
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+import urllib.parse
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
 from magent.config import NODE_AUTO, NODE_CLOUD, runs_on_node
 from magent.lockfile import LockHeld, persistent_lock
+from magent.log import get_logger
 from magent.psmux import session_name
 from magent.sessions import is_ide_tool
 from magent.sessions.claude import encode_claude_project_path
 from magent.titles import get_leaf_name
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
     from magent.config import MagentConfig, ProjectConfig
+
+_log = get_logger("nodes")
 
 # Everything node-shaped on this PC: the placement map, per-node snapshots and
 # load history, pulled transcripts. Import-bound, so it is registered in
@@ -134,6 +143,638 @@ class LoadSample:
     mem_total_mb: int
     mem_avail_mb: int
     my_sessions: int
+
+
+# What provisioning never copies to a node, whatever this PC's settings say
+# (spec §8, D5): a key or token in settings.env would log the node in AS this
+# PC, and apiKeyHelper names a local credential program.
+NEVER_SHIPPED_ENV = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+NEVER_SHIPPED_SETTINGS = ("apiKeyHelper",)
+# Every settings.env entry under this prefix stays behind too, named or not: a
+# base URL or custom headers aim the node's login at this PC's gateway, and
+# the next ANTHROPIC_* credential variable must not need a code change.
+NEVER_SHIPPED_ENV_PREFIX = "ANTHROPIC_"
+# A Claude credential matched by VALUE, wherever it sits (sk-ant-api...,
+# sk-ant-oat..., sk-ant-ort..., sk-ant-admin...): the name rules above cannot
+# see one pasted under another name -- a hook command, an MCP server's env or
+# header, an mcpOAuth entry. What holds one never ships; a note says where.
+CLAUDE_CREDENTIAL_MARKER = "sk-ant-"
+# This PC's own state-hook wiring (`magent hooks install`: an exe path or the
+# module form). The node gets its own hook, state_hook.sh, instead.
+LOCAL_STATE_HOOK_MARKERS = ("magent-state-hook", "magent.state_hook")
+# ~/.claude/skills/synced holds claude.ai-managed copies; a node's claude
+# syncs its own. The rest are tool droppings, never part of a skill.
+SKILLS_EXCLUDED_TOP = frozenset({"synced"})
+SKILLS_EXCLUDED_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv"})
+# Folders under the PC's home that hold keys and logins: ssh, gpg, AWS, gh,
+# kubectl, docker. No skill lives in one, so nothing the skills walk reaches
+# -- a folder or a single file, linked or not -- is read from inside one.
+# Defence in depth, not containment: a link anywhere else still ships.
+SECRET_HOME_DIRS = (".ssh", ".gnupg", ".aws", ".config/gh", ".kube", ".docker")
+
+
+@dataclass(frozen=True)
+class SkillFile:
+    """One file under ~/.claude/skills: its '/'-separated relative path, its
+    bytes, and whether it must stay executable on the node."""
+
+    path: str
+    data: bytes
+    executable: bool
+
+
+def _digest(value: object) -> str:
+    """sha256 of ``value``'s canonical JSON; "" for an empty item, which
+    node_apply reads as "nothing to ship"."""
+    if not value:
+        return ""
+    canonical = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class UserScope:
+    """This PC's Claude Code user scope, as far as it ships to a node (spec
+    §8). Built by ``user_scope`` from local files only; ``notes`` say what was
+    left behind and why (never a value)."""
+
+    settings: dict[str, object]
+    mcp_servers: dict[str, object]
+    mcp_oauth: dict[str, object]
+    plugins: tuple[str, ...]
+    marketplaces: dict[str, str]
+    skills: tuple[SkillFile, ...]
+    notes: tuple[str, ...] = ()
+
+    def digests(self) -> dict[str, str]:
+        """One content hash per shipped item; node_apply skips an item whose
+        hash matches its last successful run. Notes are not content."""
+        skills = "".join(
+            f"{f.path}\0{int(f.executable)}\0{hashlib.sha256(f.data).hexdigest()}\n"
+            for f in self.skills
+        )
+        return {
+            "settings": _digest(self.settings),
+            "mcp": _digest(self.mcp_servers),
+            "mcp_oauth": _digest(self.mcp_oauth),
+            "plugins": _digest(
+                {"plugins": list(self.plugins), "marketplaces": self.marketplaces}
+                if self.plugins
+                else {}
+            ),
+            "skills": hashlib.sha256(skills.encode("utf-8")).hexdigest()
+            if skills
+            else "",
+        }
+
+
+def _read_object(path: Path, label: str, notes: list[str]) -> dict[str, object]:
+    """``path`` as a JSON object; {} when absent. Unreadable or malformed is a
+    note, never an exception -- provisioning must not die on a PC file."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        notes.append(f"{label}: unreadable ({e.strerror}), skipped")
+        return {}
+    except UnicodeDecodeError:
+        notes.append(f"{label}: not valid UTF-8, skipped")
+        return {}
+    try:
+        raw = json.loads(text)
+    except ValueError:
+        notes.append(f"{label}: not valid JSON, skipped")
+        return {}
+    if not isinstance(raw, dict):
+        notes.append(f"{label}: not a JSON object, skipped")
+        return {}
+    return raw
+
+
+def _is_local_state_hook(hook: object) -> bool:
+    if not isinstance(hook, dict):
+        return False
+    command = hook.get("command")
+    return isinstance(command, str) and any(
+        marker in command for marker in LOCAL_STATE_HOOK_MARKERS
+    )
+
+
+def _holds_claude_credential(value: object) -> bool:
+    """True when ``value``, or any key or value nested in it, carries a Claude
+    credential (``CLAUDE_CREDENTIAL_MARKER``)."""
+    if isinstance(value, str):
+        return CLAUDE_CREDENTIAL_MARKER in value
+    if isinstance(value, dict):
+        return any(
+            _holds_claude_credential(k) or _holds_claude_credential(v)
+            for k, v in value.items()
+        )
+    if isinstance(value, list):
+        return any(_holds_claude_credential(v) for v in value)
+    return False
+
+
+def _named(key: object) -> str:
+    """``key`` for a note -- unless the key itself holds a credential, which a
+    note must never echo."""
+    return "(a name holding one)" if _holds_claude_credential(key) else str(key)
+
+
+def _hooks_without(hooks: object, unwanted: Callable[[object], bool]) -> object:
+    """``settings.hooks`` minus every hook ``unwanted`` picks; an entry or event
+    left empty disappears. A shape this does not know is kept verbatim."""
+    if not isinstance(hooks, dict):
+        return hooks
+    kept: dict[str, object] = {}
+    for event, entries in hooks.items():
+        if not isinstance(entries, list):
+            kept[event] = entries
+            continue
+        new_entries: list[object] = []
+        for entry in entries:
+            inner = entry.get("hooks") if isinstance(entry, dict) else None
+            if not isinstance(entry, dict) or not isinstance(inner, list):
+                new_entries.append(entry)
+                continue
+            rest = [h for h in inner if not unwanted(h)]
+            if rest:
+                new_entries.append({**entry, "hooks": rest})
+        if new_entries:
+            kept[event] = new_entries
+    return kept
+
+
+def _without_local_state_hook(hooks: object) -> object:
+    """``settings.hooks`` minus this PC's state-hook wiring; an entry or event
+    left empty disappears."""
+    return _hooks_without(hooks, _is_local_state_hook)
+
+
+def _shippable_settings(raw: dict[str, object], notes: list[str]) -> dict[str, object]:
+    settings = copy.deepcopy(raw)
+    for key in NEVER_SHIPPED_SETTINGS:
+        if key in settings:
+            del settings[key]
+            notes.append(f"settings.{key}: never shipped")
+    env = settings.get("env")
+    if isinstance(env, dict):
+        named = sorted(
+            key
+            for key in env
+            if isinstance(key, str)
+            and (
+                key in NEVER_SHIPPED_ENV
+                or key.upper().startswith(NEVER_SHIPPED_ENV_PREFIX)
+            )
+        )
+        for key in named:
+            del env[key]
+            notes.append(f"settings.env.{key}: never shipped")
+        held = [
+            k
+            for k, v in env.items()
+            if _holds_claude_credential(k) or _holds_claude_credential(v)
+        ]
+        for key in held:
+            del env[key]
+            notes.append(
+                f"settings.env.{_named(key)}: holds a Claude credential, never shipped"
+            )
+    if "hooks" in settings:
+        hooks = _without_local_state_hook(settings["hooks"])
+        if isinstance(hooks, dict):
+            for event, entries in hooks.items():
+                if _holds_claude_credential(entries):
+                    notes.append(
+                        f"settings.hooks.{_named(event)}: a hook holding a Claude"
+                        " credential, never shipped"
+                    )
+            hooks = _hooks_without(hooks, _holds_claude_credential)
+        if hooks:
+            settings["hooks"] = hooks
+        else:
+            del settings["hooks"]
+    # The catch-all: whatever still holds a credential (a statusLine command, a
+    # permission rule, a hook shape _hooks_without keeps verbatim) goes whole.
+    for key in [
+        k
+        for k, v in settings.items()
+        if _holds_claude_credential(k) or _holds_claude_credential(v)
+    ]:
+        del settings[key]
+        notes.append(
+            f"settings.{_named(key)}: holds a Claude credential, never shipped"
+        )
+    return settings
+
+
+def _is_pc_local_host(host: str) -> bool:
+    """Loopback, unspecified or link-local: an address that names THIS PC (or
+    its own link), never the node's view of it."""
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_unspecified or address.is_link_local
+
+
+# A Windows drive path (C:\ or C:/) or a UNC path. Such a command or argument
+# names a file on this PC; it is never guessed down to a basename.
+_PC_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+
+
+def _kind(spec: dict[str, object]) -> str:
+    kind = spec.get("type")
+    if isinstance(kind, str) and kind:
+        return kind
+    return "stdio" if "command" in spec else "http"
+
+
+def mcp_skip_reason(spec: object) -> str | None:
+    """Why a user MCP server does NOT ship to a node, or None when it may
+    (DECISION-12 + the transport rule):
+    - http/sse with a remote url ships as it is;
+    - http/sse on a loopback or link-local address is PC-local;
+    - stdio whose command or any arg is a Windows path is PC-bound;
+    - any other stdio server is a CANDIDATE (None): provision ships it only if
+      the node resolves its program (``stdio_programs`` +
+      ``without_missing_programs``), so its ``env`` never leaves this PC for a
+      node that could not run it.
+    The MCP relay (plan K, DECISION-16) re-adds chosen PC-bound servers as
+    http entries after this filter. A reason never quotes a url or an env
+    value -- either can hold a key.
+    Whatever its transport, a server that holds a Claude credential anywhere
+    (an env value, a header, an arg, its url) never ships (D5)."""
+    if not isinstance(spec, dict):
+        return "not an object"
+    if _holds_claude_credential(spec):
+        return "it holds a Claude credential"
+    kind = _kind(spec)
+    if kind == "stdio":
+        command = spec.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return "a stdio server with no command"
+        args = spec.get("args")
+        words = [command.strip()]
+        if isinstance(args, list):
+            words += [a for a in args if isinstance(a, str)]
+        if any(_PC_PATH.match(word) for word in words):
+            return "its command is a path on this PC"
+        return None
+    url = spec.get("url")
+    if not isinstance(url, str) or not url:
+        return f"an {kind} server with no url"
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:  # an unbalanced IPv6 bracket, say
+        return "its url does not parse"
+    if not host:
+        return "its url has no host"
+    if _is_pc_local_host(host):
+        return "PC-local: its url is a loopback or link-local address"
+    return None
+
+
+def stdio_programs(scope: UserScope) -> dict[str, str]:
+    """{server name: program} for every stdio server left in ``scope`` -- the
+    first word of its ``command``, which the node must resolve."""
+    programs: dict[str, str] = {}
+    for name, spec in scope.mcp_servers.items():
+        if isinstance(spec, dict) and _kind(spec) == "stdio":
+            command = spec.get("command")
+            if isinstance(command, str) and command.split():
+                programs[name] = command.split()[0]
+    return programs
+
+
+def without_missing_programs(
+    scope: UserScope, *, found: frozenset[str], unprobed: bool = False
+) -> UserScope:
+    """``scope`` minus every stdio server whose program is not in ``found``
+    (what the node's ``command -v`` resolved), with its mcpOAuth entries and a
+    note per server. Runs BEFORE the payload is built, so a dropped server's
+    ``env`` never leaves this PC. ``unprobed``: the probe failed, so the note
+    says the program is unconfirmed -- never that the node lacks it."""
+    missing = {
+        name: program
+        for name, program in stdio_programs(scope).items()
+        if program not in found
+    }
+    if not missing:
+        return scope
+    return replace(
+        scope,
+        mcp_servers={n: s for n, s in scope.mcp_servers.items() if n not in missing},
+        mcp_oauth={
+            k: e
+            for k, e in scope.mcp_oauth.items()
+            if not (isinstance(e, dict) and e.get("serverName") in missing)
+        },
+        notes=(
+            *scope.notes,
+            *(
+                (
+                    f"mcp {name}: not shipped -- the node's program probe failed, "
+                    f"so `{program}` is unconfirmed"
+                )
+                if unprobed
+                else (
+                    f"mcp {name}: not shipped -- `{program}` is not on the node "
+                    "(command -v)"
+                )
+                for name, program in sorted(missing.items())
+            ),
+        ),
+    )
+
+
+def _mcp_servers(claude_json: dict[str, object], notes: list[str]) -> dict[str, object]:
+    """The user-scope MCP servers (``~/.claude.json`` → ``mcpServers``) that
+    ship. Project scope (``projects.*``) and the rest of that file stay
+    behind; every server left out gets a note naming why."""
+    servers = claude_json.get("mcpServers")
+    if not isinstance(servers, dict):
+        return {}
+    shipped: dict[str, object] = {}
+    for name, spec in servers.items():
+        reason = mcp_skip_reason(spec)
+        if reason is None and _holds_claude_credential(name):
+            reason = "it holds a Claude credential"
+        if reason is None:
+            shipped[name] = spec
+        else:
+            notes.append(f"mcp {_named(name)}: not shipped -- {reason}")
+    return shipped
+
+
+def _mcp_oauth(
+    credentials: dict[str, object], servers: dict[str, object], notes: list[str]
+) -> dict[str, object]:
+    """The ``mcpOAuth`` entries of servers that ship. ``claudeAiOauth`` -- the
+    Claude login, single-holder (D5) -- is never read, and an entry that holds
+    a Claude credential stays behind with a note."""
+    raw = credentials.get("mcpOAuth")
+    if not isinstance(raw, dict):
+        return {}
+    kept: dict[str, object] = {}
+    held = 0
+    for key, entry in raw.items():
+        server = entry.get("serverName") if isinstance(entry, dict) else None
+        if not isinstance(server, str) or server not in servers:
+            continue
+        if _holds_claude_credential(key) or _holds_claude_credential(entry):
+            held += 1
+            notes.append(f"mcpOAuth {server}: holds a Claude credential, never shipped")
+            continue
+        kept[key] = entry
+    left = len(raw) - len(kept) - held
+    if left:
+        noun = "entry" if left == 1 else "entries"
+        notes.append(f"mcpOAuth: {left} {noun} for servers not in mcpServers left out")
+    return kept
+
+
+def _plugins(settings: dict[str, object], notes: list[str]) -> tuple[str, ...]:
+    """Enabled plugin ids (``name@marketplace``) from ``enabledPlugins``. An id
+    that holds a Claude credential stays behind with a note."""
+    enabled = settings.get("enabledPlugins")
+    if not isinstance(enabled, dict):
+        return ()
+    ids = sorted(
+        pid
+        for pid, on in enabled.items()
+        if on is True and isinstance(pid, str) and "@" in pid
+    )
+    for pid in ids:
+        if _holds_claude_credential(pid):
+            notes.append(
+                f"plugin {_named(pid)}: holds a Claude credential, never shipped"
+            )
+    return tuple(pid for pid in ids if not _holds_claude_credential(pid))
+
+
+def _marketplace_source(entry: object) -> str | None:
+    """What ``claude plugin marketplace add`` takes for a marketplace entry:
+    ``owner/repo`` for github, the URL for git/url, None for a local dir."""
+    source = entry.get("source") if isinstance(entry, dict) else None
+    if not isinstance(source, dict):
+        return None
+    kind = source.get("source")
+    key = "repo" if kind == "github" else "url" if kind in ("git", "url") else None
+    value = source.get(key) if key is not None else None
+    return value if isinstance(value, str) and value else None
+
+
+def _marketplaces(
+    plugins: tuple[str, ...],
+    settings: dict[str, object],
+    known: dict[str, object],
+    notes: list[str],
+) -> dict[str, str]:
+    """A remote source for every marketplace an enabled plugin comes from:
+    the CLI's known list first, then ``settings.extraKnownMarketplaces``. A
+    source that holds a Claude credential (a token in a git URL) stays behind
+    with a note that never quotes it."""
+    extra_raw = settings.get("extraKnownMarketplaces")
+    extra: dict[str, object] = extra_raw if isinstance(extra_raw, dict) else {}
+    found: dict[str, str] = {}
+    for name in sorted({pid.rsplit("@", 1)[1] for pid in plugins}):
+        source = _marketplace_source(known.get(name)) or _marketplace_source(
+            extra.get(name)
+        )
+        if source is None:
+            notes.append(
+                f"marketplace {name}: no remote source on this PC; its plugins "
+                "may not install on a node"
+            )
+        elif _holds_claude_credential(source):
+            notes.append(
+                f"marketplace {name}: its source holds a Claude credential, "
+                "never shipped"
+            )
+        else:
+            found[name] = source
+    return found
+
+
+_CREDENTIAL_BYTES = CLAUDE_CREDENTIAL_MARKER.encode("ascii")
+
+
+def _real(path: str | Path) -> str:
+    """``path`` with every link resolved, in the case the OS compares by."""
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _within(parent: str, child: str) -> bool:
+    """``child`` is ``parent`` or below it (both absolute), compared by path
+    component -- ``C:\\Users\\amind2`` is not inside ``C:\\Users\\amind`` --
+    and by case where the OS ignores it. Paths on different Windows drives
+    share nothing."""
+    parent, child = os.path.normcase(parent), os.path.normcase(child)
+    try:
+        return os.path.commonpath([parent, child]) == parent
+    except ValueError:
+        return False
+
+
+def _above(parent: str, child: str) -> bool:
+    """``parent`` is a strict ancestor of ``child`` (see ``_within``)."""
+    return os.path.normcase(parent) != os.path.normcase(child) and _within(
+        parent, child
+    )
+
+
+def _in_secret_dir(
+    rel_path: str, target: str, secrets: Sequence[str], notes: list[str]
+) -> bool:
+    """``target`` (resolved) is inside one of ``secrets``: noted, WARNING
+    logged, and True so the caller skips it."""
+    if not any(_within(s, target) for s in secrets):
+        return False
+    name = _named(rel_path)
+    notes.append(f"skills/{name}: resolves into a secrets folder, not followed")
+    _log.warning(
+        "skills/%s resolves to %s, a secrets folder: not followed", name, target
+    )
+    return True
+
+
+def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
+    """Every file under ``~/.claude/skills``, symlinks followed once, sorted by
+    path. A file is executable if its mode says so OR it starts with ``#!`` --
+    a Windows PC has no exec bit to read. A file whose bytes (or path) hold a
+    Claude credential stays behind; its note names the path, never the
+    content. A Windows junction is followed exactly like a symlink, on
+    purpose: a link in ``skills`` is one the user made (a repo checked out
+    elsewhere is the main case), so it is not contained to the root.
+
+    Two kinds of target are never followed, each pruned with a note and a
+    WARNING naming the link. A folder ABOVE the skills folder -- ``~/.claude``,
+    ``~``, ``/`` -- is no skill: it is the walk reading the whole home. And
+    nothing inside one of ``home``'s ``SECRET_HOME_DIRS`` is read, folder or
+    single file, however it was reached. Both sides of every comparison are
+    resolved first, so a ``~/.ssh`` that is itself a junction elsewhere
+    (OneDrive setups) is still recognised. A skills folder that is itself
+    such a link ships nothing.
+
+    That is defence in depth, NOT containment: a link to any other folder
+    (``~/private-notes``) ships what it holds, deliberately -- the user put
+    it there. One real directory linked under two names ships once, under
+    the name the sorted, depth-first walk reaches first."""
+    if not root.is_dir():
+        return ()
+    # The unresolved root counts too: with ~/.claude a junction elsewhere, a
+    # link to ~ is above the path the user sees, not the resolved one.
+    anchors = (os.path.normcase(os.path.abspath(root)), _real(root))
+    secrets = tuple(_real(home / d) for d in SECRET_HOME_DIRS)
+    if _above(anchors[1], anchors[0]) or any(_within(s, anchors[1]) for s in secrets):
+        notes.append("skills: links to a folder it must not read, not followed")
+        _log.warning("%s links to %s: not followed", root, anchors[1])
+        return ()
+    if any((root / top).exists() for top in SKILLS_EXCLUDED_TOP):
+        notes.append("skills/synced: claude.ai-managed copies, not shipped")
+    files: list[SkillFile] = []
+    seen: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+        here = Path(dirpath)
+        real = os.path.realpath(here)
+        if real in seen:
+            dirnames[:] = []
+            continue
+        seen.add(real)
+        rel = here.relative_to(root)
+        kept: list[str] = []
+        for d in sorted(dirnames):
+            if d in SKILLS_EXCLUDED_DIRS or (
+                rel == Path() and d in SKILLS_EXCLUDED_TOP
+            ):
+                continue
+            target = _real(here / d)
+            if any(_above(target, anchor) for anchor in anchors):
+                name = _named((rel / d).as_posix())
+                notes.append(
+                    f"skills/{name}: links to a folder above the skills folder, "
+                    "not followed"
+                )
+                _log.warning(
+                    "skills/%s links to %s, above the skills folder: not followed",
+                    name,
+                    target,
+                )
+                continue
+            if _in_secret_dir((rel / d).as_posix(), target, secrets, notes):
+                continue
+            kept.append(d)
+        dirnames[:] = kept
+        for name in sorted(filenames):
+            path = here / name
+            rel_path = (rel / name).as_posix()
+            if _in_secret_dir(rel_path, _real(path), secrets, notes):
+                continue
+            try:
+                data = path.read_bytes()
+                mode = path.stat().st_mode
+            except OSError as e:
+                notes.append(f"skills/{_named(rel_path)}: unreadable ({e.strerror})")
+                continue
+            if _CREDENTIAL_BYTES in data or _holds_claude_credential(rel_path):
+                notes.append(
+                    f"skills/{_named(rel_path)}: holds a Claude credential, "
+                    "never shipped"
+                )
+                continue
+            files.append(
+                SkillFile(
+                    path=rel_path,
+                    data=data,
+                    executable=bool(mode & stat.S_IXUSR) or data.startswith(b"#!"),
+                )
+            )
+    return tuple(sorted(files, key=lambda f: f.path))
+
+
+def user_scope(home: Path) -> UserScope:
+    """What provisioning ships from the PC whose home is ``home`` (spec §8).
+    Reads ONLY ``~/.claude/settings.json``, ``~/.claude.json`` (mcpServers),
+    ``~/.claude/.credentials.json`` (mcpOAuth), the plugin marketplace list and
+    ``~/.claude/skills`` -- and runs nothing."""
+    notes: list[str] = []
+    claude = home / ".claude"
+    raw_settings = _read_object(claude / "settings.json", "settings.json", notes)
+    settings = _shippable_settings(raw_settings, notes)
+    servers = _mcp_servers(
+        _read_object(home / ".claude.json", ".claude.json", notes), notes
+    )
+    oauth = _mcp_oauth(
+        _read_object(claude / ".credentials.json", ".credentials.json", notes),
+        servers,
+        notes,
+    )
+    plugins = _plugins(raw_settings, notes)
+    known = _read_object(
+        claude / "plugins" / "known_marketplaces.json",
+        "plugins/known_marketplaces.json",
+        notes,
+    )
+    return UserScope(
+        settings=settings,
+        mcp_servers=servers,
+        mcp_oauth=oauth,
+        plugins=plugins,
+        marketplaces=_marketplaces(plugins, raw_settings, known, notes),
+        skills=_skills(claude / "skills", home, notes),
+        notes=tuple(notes),
+    )
 
 
 @dataclass(frozen=True)
@@ -433,6 +1074,46 @@ def open_target(
 _NODE_LOGIN = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 
 
+def node_for_nick(
+    config: MagentConfig, nick: str, *, local_user: str, label: str | None = None
+) -> Node:
+    """The pool node ``nick``, fully resolved -- the D4 user rule in its one
+    home. Raises NodeConfigError.
+
+    ``label`` (a project path) prefixes the unknown-nick error only: it is the
+    one that is about the caller's reference. The other two name
+    ``settings.nodes.<nick>``, the thing to fix. A nick read from the node map
+    may have left ``settings.nodes`` since it was written; such a caller must
+    catch NodeConfigError and re-place, never surface it.
+    """
+    prefix = f"{label}: " if label else ""
+    pool = config.settings.nodes
+    entry = pool.get(nick)
+    if entry is None:
+        known = ", ".join(sorted(pool)) or "none"
+        raise NodeConfigError(
+            f"{prefix}node {nick!r} is not in settings.nodes; known nodes: {known}"
+        )
+    user = entry.user if entry.user is not None else local_user.lower()
+    if not user:
+        raise NodeConfigError(
+            f"settings.nodes.{nick}.user is not set and the local username is "
+            "unknown; set it explicitly"
+        )
+    if entry.user is None and not _NODE_LOGIN.fullmatch(user):
+        raise NodeConfigError(
+            f"settings.nodes.{nick}.user is not set and the local username "
+            f"{local_user!r} is not a node login ({user!r} does not match "
+            f"{_NODE_LOGIN.pattern}); set it explicitly"
+        )
+    if entry.user is None and user == "root":
+        raise NodeConfigError(
+            f"settings.nodes.{nick}: magent is running as root and would run "
+            'sessions as root on the node; write "user": "root" to mean it (D4)'
+        )
+    return Node(nick=nick, host=entry.host, user=user, root=entry.root)
+
+
 def resolve(
     config: MagentConfig,
     proj: ProjectConfig,
@@ -463,35 +1144,135 @@ def resolve(
             f'{proj.path}: "node": "auto" needs a placement before it can resolve'
         )
     pool = config.settings.nodes
-    entry = pool.get(nick)
-    if entry is None:
+    if proj.node == NODE_AUTO and nick not in pool:
         known = ", ".join(sorted(pool)) or "none"
-        if proj.node == NODE_AUTO:
-            raise NodeConfigError(
-                f"{proj.path}: placement chose {nick!r}, which is no longer in "
-                f"settings.nodes; re-place (known nodes: {known})"
-            )
         raise NodeConfigError(
-            f"{proj.path}: node {nick!r} is not in settings.nodes; known nodes: {known}"
+            f"{proj.path}: placement chose {nick!r}, which is no longer in "
+            f"settings.nodes; re-place (known nodes: {known})"
         )
-    user = entry.user if entry.user is not None else local_user.lower()
-    if not user:
-        raise NodeConfigError(
-            f"settings.nodes.{nick}.user is not set and the local username is "
-            "unknown; set it explicitly"
+    return node_for_nick(config, nick, local_user=local_user, label=proj.path)
+
+
+# --- The per-node mirror (written by node_sync, read by status/recall) -------
+#   <nick>/sessions.json        {"ts": <PC epoch>, "sessions": [...]}: liveness
+#   <nick>/load.jsonl           one LoadSample per line, ts on the PC's clock
+#   <nick>/pull.json            {sid: {"since": <node epoch>, "realpath": ...}}
+#   <nick>/<sid>/transcripts/   the node's ~/.claude/projects/<dir>/ contents
+#   <nick>/<sid>/state/         that session's ~/.magent/state records
+# Every path reads NODES_DIR at CALL time (never a second import-bound Path),
+# so the test-isolation redirect of NODES_DIR covers all of them.
+
+
+def node_dir(nick: str, *, nodes_dir: Path | None = None) -> Path:
+    return (nodes_dir if nodes_dir is not None else NODES_DIR) / nick
+
+
+def transcripts_dir(nick: str, sid: str, *, nodes_dir: Path | None = None) -> Path:
+    """Where the daemon mirrors a node session's Claude project directory:
+    its CONTENTS (``<uuid>.jsonl``, ``<uuid>/subagents/``, ``memory/``).
+    ``sid`` is joined VERBATIM: ``psmux.session_name`` keeps ``/`` and ``\\``,
+    so a node-map sid like ``/etc`` would resolve outside the node dir --
+    callers (the attention reader, recall) pass it through
+    ``remote_mux.pullable_sid`` first."""
+    return node_dir(nick, nodes_dir=nodes_dir) / sid / "transcripts"
+
+
+def state_dir(nick: str, sid: str, *, nodes_dir: Path | None = None) -> Path:
+    """Where the daemon mirrors a node session's agent-state records.
+    ``sid`` is joined VERBATIM, exactly as in ``transcripts_dir``: callers
+    pass a node-map sid through ``remote_mux.pullable_sid`` first."""
+    return node_dir(nick, nodes_dir=nodes_dir) / sid / "state"
+
+
+def sessions_path(nick: str, *, nodes_dir: Path | None = None) -> Path:
+    return node_dir(nick, nodes_dir=nodes_dir) / "sessions.json"
+
+
+def load_path(nick: str, *, nodes_dir: Path | None = None) -> Path:
+    return node_dir(nick, nodes_dir=nodes_dir) / "load.jsonl"
+
+
+def pull_marks_path(nick: str, *, nodes_dir: Path | None = None) -> Path:
+    return node_dir(nick, nodes_dir=nodes_dir) / "pull.json"
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Replace ``path`` with ``text`` in one ``os.replace`` from a sibling temp
+    file (atomic only within a filesystem, hence the sibling). The temp name
+    comes from ``tempfile.mkstemp`` -- unique across processes AND threads (the
+    daemon writes several nodes at once) -- and ends in ``.tmp``, never
+    ``.json``: readers glob ``*.json`` in a mirror dir and must never see a
+    half-written file. A failed write leaves the old file and no temp behind."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    tmp = Path(tmp_name)
+    try:
+        try:
+            fh = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            # fdopen never took ownership: close the raw fd here, or it leaks
+            # (and on Windows an open handle also blocks the unlink below).
+            os.close(fd)
+            raise
+        with fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
+def write_json_atomic(path: Path, data: object) -> None:
+    """``write_text_atomic`` of ``data`` as JSON. A NaN or infinity raises
+    ValueError before any file is touched -- ``NaN`` is not JSON, and a
+    non-finite timestamp would make every staleness check lie."""
+    write_text_atomic(path, json.dumps(data, indent=2, allow_nan=False) + "\n")
+
+
+@dataclass(frozen=True)
+class NodeSessions:
+    """A node's tmux session list as of the last successful pull (``ts`` is
+    this PC's clock). The daemon rewrites it every tick the node answers, so
+    an old ``ts`` means unreachable, never dead."""
+
+    ts: float
+    sessions: tuple[str, ...]
+
+
+def read_sessions(nick: str, *, nodes_dir: Path | None = None) -> NodeSessions | None:
+    """``<nick>/sessions.json``, or None when it is missing or not a snapshot.
+    A non-finite ``ts`` is not a snapshot: it would read as fresh forever.
+    Neither is a ``sessions`` list holding any non-string: that is corruption,
+    and silently dropping the odd entry would report a live session dead."""
+    try:
+        raw = json.loads(
+            sessions_path(nick, nodes_dir=nodes_dir).read_text(encoding="utf-8")
         )
-    if entry.user is None and not _NODE_LOGIN.fullmatch(user):
-        raise NodeConfigError(
-            f"settings.nodes.{nick}.user is not set and the local username "
-            f"{local_user!r} is not a node login ({user!r} does not match "
-            f"{_NODE_LOGIN.pattern}); set it explicitly"
-        )
-    if entry.user is None and user == "root":
-        raise NodeConfigError(
-            f"settings.nodes.{nick}: magent is running as root and would run "
-            'sessions as root on the node; write "user": "root" to mean it (D4)'
-        )
-    return Node(nick=nick, host=entry.host, user=user, root=entry.root)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    ts, names = raw.get("ts"), raw.get("sessions")
+    # bool is an int subclass: `"ts": true` is corruption, not 1.0.
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    if not math.isfinite(ts) or not isinstance(names, list):
+        return None
+    if not all(isinstance(n, str) for n in names):
+        return None
+    return NodeSessions(ts=float(ts), sessions=tuple(names))
+
+
+def sessions_stale(
+    snap: NodeSessions | None, *, pull_interval_s: float, now: float
+) -> bool:
+    """Spec §7: a snapshot more than two pull intervals older OR newer than
+    ``now`` reads ``stale``; a wall clock that jumped backwards therefore
+    reads stale for at most one tick, never fresh forever."""
+    return snap is None or abs(now - snap.ts) > 2 * pull_interval_s
 
 
 def _is_env_file(name: str) -> bool:
