@@ -1957,10 +1957,23 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         # The last turn comes home before each kill (Task 16): a pull that
         # never dials unless the test says how it goes.
         pulled = node_sync.remote_mux.PullResult(files=(), since=0.0)
-        monkeypatch.setattr(
-            node_sync, "final_pull", pull or (lambda config, name, **_k: pulled)
-        )
-        monkeypatch.setattr(node_sync, "stop_daemon", lambda: sync_daemon)
+        pull = pull or (lambda config, name, **_k: pulled)
+        # What `down` asked of the node sync daemon and of the nodes, in order.
+        self.events: list[str] = []
+
+        def final_pull(config, name, **k):
+            self.events.append(f"pull {name}")
+            return pull(config, name, **k)
+
+        monkeypatch.setattr(node_sync, "final_pull", final_pull)
+        # One answer per stop_daemon call; the last one repeats.
+        stops = [sync_daemon] if isinstance(sync_daemon, bool) else list(sync_daemon)
+
+        def stop_daemon():
+            self.events.append("stop")
+            return stops.pop(0) if len(stops) > 1 else stops[0]
+
+        monkeypatch.setattr(node_sync, "stop_daemon", stop_daemon)
         out = runner.invoke(cli.main, ["--config", cfgpath, "down", *argv])
         return out, killed, dialed, sent
 
@@ -2336,8 +2349,103 @@ class TestDownStopsNodeSessionsWhereTheyRun:
             real_stop=True,
         )
         assert out.exit_code == 0, out.output
-        assert "Could not stop the node sync daemon (pid 4242)." in out.stdout
+        # Once: the end re-stop does not repeat what the first stop said.
+        assert out.stdout.count("Could not stop the node sync daemon (pid 4242).") == 1
         assert "Node sync daemon was not running." not in out.stdout
+
+    def test_down_all_stops_the_node_sync_daemon_before_the_first_pull(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # A sync tick mid-pull holds node-pull-<nick>, which down's own final
+        # pull would wait out: the daemon goes first, and again at the end.
+        self._hold("api")
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            sync_daemon=(True, False),
+        )
+        assert out.exit_code == 0, out.output
+        assert self.events == ["stop", "pull api", "stop"]
+        said = out.stdout.index("Stopped the node sync daemon.")
+        assert said < out.stdout.index("Pulling the last turn of 1 node session(s)")
+
+    @pytest.mark.parametrize(
+        ("answers", "said"),
+        [
+            ((True, False), ["Stopped the node sync daemon."]),
+            ((False, False), ["Node sync daemon was not running."]),
+        ],
+        ids=["stopped-once", "never-running"],
+    )
+    def test_the_end_re_stop_is_silent_when_nothing_came_back(
+        self, runner, tmp_config, monkeypatch, tmp_path, answers, said
+    ):
+        self._hold("api")
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            sync_daemon=answers,
+        )
+        assert out.exit_code == 0, out.output
+        assert self.events.count("stop") == 2
+        lines = [
+            ln for ln in out.stdout.splitlines() if "node sync daemon" in ln.lower()
+        ]
+        assert [ln.split(None, 1)[1] for ln in lines] == said
+
+    def test_the_end_re_stop_names_a_daemon_serve_restarted(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        self._hold("api")
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            sync_daemon=(True, True),
+        )
+        assert out.exit_code == 0, out.output
+        assert self.events == ["stop", "pull api", "stop"]
+        assert "Stopped the node sync daemon." in out.stdout
+        assert (
+            "Stopped the node sync daemon again (serve restarted it during the pulls)."
+            in out.stdout
+        )
+
+    def test_a_survivor_that_died_by_the_end_is_not_called_a_restart(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # The first stop could not kill it; by the end it is gone. That is the
+        # plain "Stopped" -- serve restarted nothing.
+        from magent import node_sync
+
+        running = iter([True, False])
+        monkeypatch.setattr(node_sync, "daemon_running", lambda: next(running))
+        monkeypatch.setattr(node_sync, "daemon_pid", lambda: 4242)
+        self._hold("api")
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            sync_daemon=(False, True),
+        )
+        assert out.exit_code == 0, out.output
+        assert "Could not stop the node sync daemon (pid 4242)." in out.stdout
+        assert "Stopped the node sync daemon." in out.stdout
+        assert "again" not in out.stdout
 
     def test_down_of_one_name_leaves_the_node_sync_daemon_alone(
         self, runner, tmp_config, monkeypatch, tmp_path
@@ -2354,6 +2462,7 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         )
         assert out.exit_code == 0, out.output
         assert "node sync daemon" not in out.stdout.lower()
+        assert "stop" not in self.events
 
     def test_a_config_without_nodes_says_nothing_about_it(
         self, runner, tmp_config, monkeypatch

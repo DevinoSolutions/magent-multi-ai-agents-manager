@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
+    from magent.cli.node_cmd import NodeSyncStop
     from magent.config import MagentConfig
 
 
@@ -750,6 +751,14 @@ def down_cmd(
     placed = _placed_here(cfg, node_targets)
     remote = _down_host(host, [*live, *placed])
     remote_rc = 0
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+    from magent.cli.node_cmd import restop_node_sync_and_say, stop_node_sync_and_say
+
+    # A config with no node projects never had one to mention -- unless one is
+    # running, which is always said.
+    say_sync_absent = bool(nodes.node_projects(cfg))
+    sync_first: NodeSyncStop | None = None
     if remote:
         from magent.cli.attach import (
             _remote_down,  # sibling module: every SSH invocation lives in attach
@@ -765,6 +774,13 @@ def down_cmd(
         node_stopped: list[str] = []
         node_still: list[str] = []
         if node_targets:
+            if do_all:
+                # Before the pulls: a sync tick mid-pull holds node-pull-<nick>,
+                # which down's own final pull would wait out. Killing the daemon
+                # mid-tick is safe -- the OS drops its locks, and marks and
+                # pulled files are replaced atomically. `down --all` only: a
+                # partial down leaves the daemon to the nodes it still serves.
+                sync_first = stop_node_sync_and_say(say_absent=say_sync_absent)
             node_stopped, node_still = stop_node_sessions(cfg, node_targets)
         _report_shutdown(stopped, still, node_stopped, node_still)
         _echo_attach_host_hint(live, placed)
@@ -806,12 +822,12 @@ def down_cmd(
             click.echo(f"  {style('-', dim=True)} Attention daemon was not running.")
 
     if do_all:
-        from magent import nodes  # heavy subsystem: in-body per policy
-        from magent.cli.node_cmd import stop_node_sync_and_say
-
-        # A config with no node projects never had one to mention -- unless
-        # one is running, which is always said.
-        stop_node_sync_and_say(say_absent=bool(nodes.node_projects(cfg)))
+        # Again, now that serve (whose supervisor restarts the daemon) and
+        # attention -d (whose watchdog restarts serve) are down.
+        if sync_first is None:
+            stop_node_sync_and_say(say_absent=say_sync_absent)
+        else:
+            restop_node_sync_and_say(sync_first)
 
     # Last, so the local daemons still stop when the host is unreachable -- but
     # never zero: a failed remote shutdown that exits 0 is the silent no-op this

@@ -30,32 +30,66 @@ _START_POLLS = 100
 _START_POLL_S = 0.1
 
 
-def stop_node_sync_and_say(
-    *, say_absent: bool = True
-) -> Literal["stopped", "stuck", "absent"]:
-    """Stop the node sync daemon and say what happened, in the words
-    `node sync --stop` and `down --all` share. ``stop_daemon``'s False is two
-    answers -- nothing to stop, or a daemon that outlived the kill -- and only
-    the daemon's lock tells them apart. ``say_absent=False`` keeps "was not
-    running" to itself; a daemon that is running is always said. Exit codes
-    stay the caller's."""
+NodeSyncStop = Literal["stopped", "stuck", "absent"]
+
+
+def _stop_node_sync() -> NodeSyncStop:
+    """Stop the node sync daemon and name what happened. ``stop_daemon``'s
+    False is two answers -- nothing to stop, or a daemon that outlived the
+    kill -- and only the daemon's lock tells them apart."""
     from magent import node_sync  # heavy subsystem: in-body per policy
 
     if node_sync.stop_daemon():
-        click.echo(f"  {style('+', fg='green')} Stopped the node sync daemon.")
         return "stopped"
     if node_sync.daemon_running():
         # False is also "a daemon holds the lock and outlived the stop"
         # (pid unknown, kill refused, or not dead within the settle).
-        pid = node_sync.daemon_pid()
-        click.echo(
-            f"  {style('x', fg='red')} Could not stop the node sync daemon "
-            f"(pid {pid or 'unknown'})."
-        )
         return "stuck"
-    if say_absent:
-        click.echo(f"  {style('-', dim=True)} Node sync daemon was not running.")
     return "absent"
+
+
+def _say_stuck() -> None:
+    from magent import node_sync  # heavy subsystem: in-body per policy
+
+    pid = node_sync.daemon_pid()
+    click.echo(
+        f"  {style('x', fg='red')} Could not stop the node sync daemon "
+        f"(pid {pid or 'unknown'})."
+    )
+
+
+def stop_node_sync_and_say(*, say_absent: bool = True) -> NodeSyncStop:
+    """Stop the node sync daemon and say what happened, in the words
+    `node sync --stop` and `down --all` share. ``say_absent=False`` keeps
+    "was not running" to itself; a daemon that is running is always said.
+    Exit codes stay the caller's."""
+    outcome = _stop_node_sync()
+    if outcome == "stopped":
+        click.echo(f"  {style('+', fg='green')} Stopped the node sync daemon.")
+    elif outcome == "stuck":
+        _say_stuck()
+    elif say_absent:
+        click.echo(f"  {style('-', dim=True)} Node sync daemon was not running.")
+    return outcome
+
+
+def restop_node_sync_and_say(first: NodeSyncStop) -> NodeSyncStop:
+    """``down --all``'s second stop, once serve and ``attention -d`` are down:
+    serve's supervisor can restart the daemon while the node pulls run after
+    the ``first`` stop. Says only what is news -- a daemon it stopped, or a
+    running one the first stop did not already name. Silent otherwise."""
+    outcome = _stop_node_sync()
+    if outcome == "stopped" and first == "stuck":
+        # The first stop's survivor died after all: no restart to explain.
+        click.echo(f"  {style('+', fg='green')} Stopped the node sync daemon.")
+    elif outcome == "stopped":
+        click.echo(
+            f"  {style('+', fg='green')} Stopped the node sync daemon again"
+            " (serve restarted it during the pulls)."
+        )
+    elif outcome == "stuck" and first != "stuck":
+        _say_stuck()
+    return outcome
 
 
 @main.group("node", invoke_without_command=True)
