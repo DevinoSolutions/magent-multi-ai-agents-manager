@@ -22,7 +22,12 @@ from magent.platform import (
     VSCodeLaunchOpts,
     get_platform,
 )
-from magent.procs import await_registration, pid_alive, spawn_unjobbed
+from magent.procs import (
+    REGISTRATION_TIMEOUT_S,
+    await_registration,
+    pid_alive,
+    spawn_unjobbed,
+)
 from magent.sessions import (
     AGENT_TOOLS,
     build_resume_command,
@@ -480,6 +485,7 @@ class UploadServerSupervisor:
         )
         self._now = now
         self._last_spawn: float | None = None
+        self._child: subprocess.Popen[bytes] | None = None
 
     @property
     def cooldown_s(self) -> float:
@@ -498,6 +504,21 @@ class UploadServerSupervisor:
             return "no pid file"
         return f"recorded pid {pid} is {'alive' if pid_alive(pid) else 'gone'}"
 
+    def _still_starting(self, now: float) -> bool:
+        """The serve this supervisor last spawned is alive and still inside the
+        shared registration window: slow, not failed (DESIGN.md section 2, "A
+        slow child is not a failed child"). Measured on a loaded desktop, a serve
+        took ~4.7s to bind, so a short cooldown respawned beside it -- and on
+        Windows that second bind SUCCEEDS (``SO_REUSEADDR``), leaving two live
+        servers on one port and a pid file naming only the last one. Past the
+        window, or once the child has exited, the cooldown alone decides, as it
+        always did. The child is never ended here."""
+        if self._child is None or self._last_spawn is None:
+            return False
+        if now - self._last_spawn >= REGISTRATION_TIMEOUT_S:
+            return False
+        return self._child.poll() is None
+
     def tick(self) -> bool:
         """One liveness check. True when a respawn was issued."""
         if _probe_upload_port(self._port):
@@ -511,6 +532,14 @@ class UploadServerSupervisor:
                 self._cooldown,
             )
             return False
+        if self._still_starting(now):
+            log.debug(
+                "upload supervisor: port %d not answering yet; the serve spawned "
+                "%.1fs ago is still starting",
+                self._port,
+                now - (self._last_spawn or now),
+            )
+            return False
         self._last_spawn = now
         # ASCII only: this line goes to a rotating logfile that gets read back
         # through whatever the host console's code page happens to be.
@@ -520,7 +549,7 @@ class UploadServerSupervisor:
             self._port,
             self._pid_note(),
         )
-        spawn_detached(upload_server_argv(self._port, self._config_path))
+        self._child = spawn_detached(upload_server_argv(self._port, self._config_path))
         return True
 
 

@@ -1830,6 +1830,18 @@ launch before tiling. Pins:
 - the wiring tests in `test_attention_cmd.py::TestTheLauncherWaitsForASlowDaemon`
   and `test_hotkey.py::TestMaybeStartHotkey`
 
+**The upload watchdog applies the same rule.** `launch.UploadServerSupervisor`
+respawns a dead port at the cooldown rate, and the cooldown used to be the only
+thing between a slow serve and a second one. A serve measured 4.7s to bind
+against the e2e tier's 3s cooldown, the watchdog started another beside it, and
+on Windows the second bind succeeds (`SO_REUSEADDR`): two live servers on one
+port, a pid file naming only the later one. Now a serve the supervisor spawned
+that is still alive inside `REGISTRATION_TIMEOUT_S` counts as starting, not
+failed. Once it exits, or the window runs out, the cooldown decides alone as
+before. The supervisor never ends that child either. The double bind itself is
+upload_server's and is not changed here. Pins:
+`test_launch.py::TestUploadServerSupervisor`.
+
 The detaching e2e tiers carry the other half of the lesson. A failed launch
 must not leak what it started, so the tiers find it by a uuid argv marker, not
 by learned pid (see CLAUDE.md, serve-watchdog tier).
