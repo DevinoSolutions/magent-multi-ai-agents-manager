@@ -246,6 +246,27 @@ class TestNodeSync:
         assert f"(pid {os.getpid()})" in result.stdout
         assert f"(pid {stranger.pid})" not in result.stdout
 
+    @pytest.mark.parametrize(
+        "flags",
+        [["--stop", "-d"], ["--once", "-d"], ["--ticks", "1", "-d"]],
+        ids=["stop-with-daemon", "once-with-daemon", "ticks-with-daemon"],
+    )
+    def test_contradictory_flags_are_a_usage_error(
+        self, runner, pool_config, monkeypatch, flags
+    ):
+        """Each pair asks for two different runs; doing only one of them
+        silently would leave the user guessing which."""
+        monkeypatch.setattr(node_sync, "stop_daemon", lambda: pytest.fail("stopped"))
+        monkeypatch.setattr(node_sync, "run_once", lambda cfg: pytest.fail("ran once"))
+        monkeypatch.setattr(
+            "magent.launch.spawn_detached", lambda argv: pytest.fail("spawned")
+        )
+        result = runner.invoke(
+            cli.main, ["--config", pool_config, "node", "sync", *flags]
+        )
+        assert result.exit_code == 2, result.output
+        assert "cannot be combined with -d" in result.output
+
     def test_a_bare_node_command_exits_0(self, runner, pool_config):
         """The group is invoke_without_command: G's node table fills the bare
         `magent node` later, without touching the declaration."""

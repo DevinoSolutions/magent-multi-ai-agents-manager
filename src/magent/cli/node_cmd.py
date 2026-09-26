@@ -71,6 +71,16 @@ def sync_cmd(
     the last pull for the sessions this PC placed there. `magent serve` keeps it
     running whenever a project has a node; run it by hand to debug.
     """
+    if as_daemon:
+        # Each asks for a different run; doing only one would be a silent guess.
+        for flag, given in (
+            ("--stop", do_stop),
+            ("--once", once),
+            ("--ticks", ticks is not None),
+        ):
+            if given:
+                raise click.UsageError(f"{flag} cannot be combined with -d.", ctx=ctx)
+
     from magent import node_sync  # heavy subsystem: in-body per policy
 
     if do_stop:
