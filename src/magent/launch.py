@@ -1634,8 +1634,8 @@ def _placement_recipes(
     folder is already known, from config and the map alone -- no ssh, no git.
     The recipe carries only what ``nodes.remote_root_collisions`` reads (its
     project, sid and remote_root). A project that cannot be placed yet (no
-    folder here, an unplaced ``auto``, a folder with no usable name) is left
-    out: its own bring-up names that reason."""
+    folder here or none this user may read, an unplaced ``auto``, a folder
+    with no usable name) is left out: its own bring-up names that reason."""
     # heavy subsystem: in-body per policy
     from magent import nodes
     from magent.env import local_username
@@ -1644,11 +1644,11 @@ def _placement_recipes(
     out: dict[str, tuple[str, Recipe]] = {}
     for proj in projects:
         name = nodes.project_name(proj)
-        project_dir = _node_project_dir(config, proj)
-        if project_dir is None:
-            continue
         entry = held.get(name)
         try:
+            project_dir = _node_project_dir(config, proj)
+            if project_dir is None:
+                continue
             node = nodes.resolve(
                 config,
                 proj,
@@ -1656,7 +1656,7 @@ def _placement_recipes(
                 placed=entry.nick if entry else None,
             )
             remote_root = nodes.remote_root_for(node, project_dir)
-        except nodes.NodeConfigError:
+        except (nodes.NodeConfigError, OSError):
             continue
         out[nodes.node_sid(proj)] = (
             node.nick,

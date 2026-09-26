@@ -5,10 +5,12 @@ faked at remote_mux's seam, so nothing here dials anything."""
 from __future__ import annotations
 
 import dataclasses
+import errno
 import threading
 import time
 from collections import defaultdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -17,6 +19,9 @@ from magent.config import MagentConfig, NodeConfig, ProjectConfig, Settings
 from magent.nodes import LocalGitState, NodeMapEntry
 from magent.remote_mux import BringUpResult, RemoteError
 from tests.conftest import FakePlatform
+
+if TYPE_CHECKING:
+    import os
 
 _TOOLS = {"claude": "claude --continue"}
 
@@ -596,6 +601,31 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
             ("api-x", False),
             ("api-y", False),
         ]
+
+    def test_a_folder_the_scan_cannot_read_is_that_projects_outcome(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # One node project's folder this user may not stat (another profile, a
+        # deny ACL) must not take `up` of any other project down with it --
+        # the fleet scan reads every folder, asked for or not.
+        (good,) = _projects(tmp_path, rig, [("a1", "second")])
+        locked = tmp_path / "locked" / "z"
+        locked.mkdir(parents=True)
+        rig.states[locked] = _state(locked)
+        z = ProjectConfig(path=str(locked), node="second")
+        real_stat = Path.stat
+
+        def stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            if str(self) == str(locked):
+                raise PermissionError(errno.EACCES, "Access is denied", str(self))
+            return real_stat(self, follow_symlinks=follow_symlinks)
+
+        monkeypatch.setattr(Path, "stat", stat)
+        alone = _batch(_config(good, z), only=["a1"])
+        assert [(o.sid, o.ok) for o in alone] == [("a1", True)]
+        both = _batch(_config(good, z))
+        assert [(o.sid, o.ok) for o in both] == [("a1", True), ("z", False)]
+        assert "Access is denied" in (both[1].error or "")
 
     def test_a_collision_with_a_project_outside_the_batch_still_refuses(
         self, rig, tmp_path, monkeypatch
