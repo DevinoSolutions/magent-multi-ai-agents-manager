@@ -1616,8 +1616,9 @@ class TestTheSkillsWalkKnowsASecretWhenItSeesOne:
         _link_file(skills / "gone", tmp_path / "nowhere")
         scope = nodes.user_scope(home)
         assert scope.skills == ()
-        assert len(scope.notes) == 1
-        assert scope.notes[0].startswith("skills/gone: unreadable (")
+        assert scope.notes == (
+            "skills/gone: cannot be read (FileNotFoundError); not shipped",
+        )
 
     def test_azure_is_a_secrets_folder(self, tmp_path):
         home, skills = _skills_home(tmp_path)
@@ -1647,9 +1648,23 @@ def _deny_listing(monkeypatch: pytest.MonkeyPatch, *denied: Path) -> None:
     monkeypatch.setattr(os, "scandir", scandir)
 
 
-# An unreadable folder in the skills walk is neither fatal nor silent: one note
-# per folder, naming only the error's class; the full error is in nodes.log;
-# the rest of the walk goes on.
+def _deny_opening(monkeypatch: pytest.MonkeyPatch, *denied: Path) -> None:
+    """``os.open`` -- what ``_read_skill`` opens a skill file with -- refuses
+    ``denied`` the way a file this user may not read does."""
+    real = os.open
+    refused = {os.path.normcase(str(p)) for p in denied}
+
+    def fake_open(path: str | os.PathLike[str], *args: int, **kwargs: int) -> int:
+        if os.path.normcase(os.fspath(path)) in refused:
+            raise PermissionError(13, "Permission denied DECOY-ERRNO", os.fspath(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", fake_open)
+
+
+# An unreadable folder or file in the skills walk is neither fatal nor silent:
+# one note each, naming only the error's class (never the OS's text); the full
+# error is in nodes.log; the rest of the walk goes on.
 class TestAnUnreadableSkillsFolderIsNamedNotFatal:
     def test_one_note_per_folder_and_the_walk_goes_on(
         self, tmp_path, monkeypatch, caplog
@@ -1698,6 +1713,39 @@ class TestAnUnreadableSkillsFolderIsNamedNotFatal:
         assert [f.path for f in scope.skills] == ["a/SKILL.md"]
         assert scope.notes == (
             "skills/locked: cannot be read (PermissionError); not shipped",
+        )
+
+    def test_an_unreadable_file_is_one_note_and_the_rest_ships(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        home, skills = _skills_home(tmp_path)
+        for rel in ("a/SKILL.md", "b/SKILL.md", "b/locked.md"):
+            _skill(skills, rel)
+        _deny_opening(monkeypatch, skills / "b" / "locked.md")
+        caplog.set_level("WARNING", logger="nodes")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["a/SKILL.md", "b/SKILL.md"]
+        assert scope.notes == (
+            "skills/b/locked.md: cannot be read (PermissionError); not shipped",
+        )
+        assert "DECOY-ERRNO" not in repr(scope)
+        (logged,) = [r for r in caplog.records if "DECOY-ERRNO" in r.getMessage()]
+        assert logged.levelname == "WARNING"
+        assert logged.getMessage().startswith("skills/b/locked.md: ")
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="a mode-0 file: POSIX, and root reads it anyway",
+    )
+    def test_a_real_mode_0_file(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "a/SKILL.md")
+        _skill(skills, "a/locked.md")
+        (skills / "a" / "locked.md").chmod(0)
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["a/SKILL.md"]
+        assert scope.notes == (
+            "skills/a/locked.md: cannot be read (PermissionError); not shipped",
         )
 
 
@@ -1834,8 +1882,9 @@ class TestALinkedSkillShipsAsItsContent:
         _link_file(skills / "s" / "loop", skills / "s" / "loop")
         scope = nodes.user_scope(home)
         assert [f.path for f in scope.skills] == ["s/SKILL.md"]
-        assert len(scope.notes) == 1
-        assert scope.notes[0].startswith("skills/s/loop: unreadable (")
+        (note,) = scope.notes
+        # The class differs by OS (ELOOP is a bare OSError); the words do not.
+        assert re.fullmatch(r"skills/s/loop: cannot be read \(\w+\); not shipped", note)
 
     @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs")
     def test_a_link_to_a_fifo_is_a_note_and_never_opened(self, tmp_path):

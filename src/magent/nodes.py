@@ -856,7 +856,13 @@ def _skill_file(
         notes.append(f"skills/{_named(rel_path)}: {e}")
         return None
     except OSError as e:
-        notes.append(f"skills/{_named(rel_path)}: unreadable ({e.strerror})")
+        # Same rule as an unlistable folder: the class on screen, the OS's
+        # text (and the path it may carry) in the log only.
+        notes.append(
+            f"skills/{_named(rel_path)}: cannot be read ({type(e).__name__}); "
+            "not shipped"
+        )
+        _log.warning("skills/%s: %s", _named(rel_path), e)
         return None
     if _CREDENTIAL_BYTES in data or _CREDENTIAL_BYTES_U16 in data:
         notes.append(
@@ -918,9 +924,9 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     Bounded, because it runs on every bring-up: only regular files are read
     (``_read_skill``), each at most ``SKILL_FILE_MAX_BYTES`` and all of them
     at most ``SKILLS_MAX_TOTAL_BYTES``, and the walk stops after
-    ``SKILLS_MAX_ENTRIES`` listed entries. A folder it may not list is one
-    note naming the error's class (the log has the rest), and the walk goes
-    on."""
+    ``SKILLS_MAX_ENTRIES`` listed entries. A folder it may not list, or a
+    file it may not read, is one note naming the error's class (the log has
+    the rest), and the walk goes on."""
     if not root.is_dir():
         return ()
     # The unresolved root counts too: with ~/.claude a junction elsewhere, a
