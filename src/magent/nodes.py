@@ -258,7 +258,9 @@ def _read_object(
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
-    except (OSError, ValueError) as e:  # UnicodeDecodeError is a ValueError
+    except (OSError, ValueError, RecursionError) as e:
+        # UnicodeDecodeError is a ValueError; nesting deeper than json
+        # parses is a RecursionError.
         why = type(e).__name__
         _log.warning("%s could not be read (%s): %s", path, why, e)
     else:

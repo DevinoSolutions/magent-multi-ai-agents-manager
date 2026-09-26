@@ -667,37 +667,50 @@ class TestAMalformedPcFileIsANoteNotACrash:
         )
 
 
-def _deny_read(monkeypatch: pytest.MonkeyPatch, denied: Path) -> None:
-    """``denied`` raises PermissionError when read, on every OS (a Windows
-    chmod does not stop a read)."""
+def _fail_read(
+    monkeypatch: pytest.MonkeyPatch, failing: Path, code: int, text: str
+) -> None:
+    """``failing`` raises OSError(``code``) when read, on every OS (a Windows
+    chmod does not stop a read). OSError builds the errno's subclass: EACCES
+    is a PermissionError, EIO has none and stays a plain OSError."""
     read_text = Path.read_text
 
     def guarded(self: Path, *args: object, **kwargs: object) -> str:
-        if self == denied:
-            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        if self == failing:
+            raise OSError(code, text, str(self))
         return read_text(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_text", guarded)
 
 
 # Each way a PC file that EXISTS can fail to read as a JSON object, and the
-# class -- all a screen may show of it.
+# class -- all a screen may show of it. "empty" is a 0-byte file: unknown
+# too, never the {} that takes back what the PC shipped before.
 UNREAD = [
     ("torn", "JSONDecodeError"),
     ("a-list", "not a JSON object"),
+    ("empty", "JSONDecodeError"),
     ("denied", "PermissionError"),
+    ("eio", "OSError"),
 ]
+_UNREAD_TEXT = {
+    "torn": '{"env": {"FROM_PC": "x"',
+    "a-list": '[{"env": {"FROM_PC": "x"}}]',
+    "empty": "",
+}
+_READ_ERRORS = {
+    "denied": (errno.EACCES, "Permission denied"),
+    "eio": (errno.EIO, "Input/output error"),
+}
 
 
 def _damage(monkeypatch: pytest.MonkeyPatch, path: Path, how: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if how == "torn":
-        path.write_text('{"env": {"FROM_PC": "x"', encoding="utf-8")
-    elif how == "a-list":
-        path.write_text('[{"env": {"FROM_PC": "x"}}]', encoding="utf-8")
+    if how in _UNREAD_TEXT:
+        path.write_text(_UNREAD_TEXT[how], encoding="utf-8")
     else:
         path.write_text("{}", encoding="utf-8")
-        _deny_read(monkeypatch, path)
+        _fail_read(monkeypatch, path, *_READ_ERRORS[how])
 
 
 class TestAnUnreadablePcFileIsUnknownNotEmpty:
@@ -736,11 +749,54 @@ class TestAnUnreadablePcFileIsUnknownNotEmpty:
         scope = nodes.user_scope(home)
         shown = " ".join(scope.notes)
         assert str(home) not in shown
-        for detail in ("Permission denied", "Expecting", "line 1", "list"):
+        for detail in (
+            "Permission denied",
+            "Input/output error",
+            "Expecting",
+            "line 1",
+            "list",
+        ):
             assert detail not in shown
         # ... and the log has what the screen does not.
-        detail = {"torn": "line 1", "a-list": "list", "denied": "Permission denied"}
+        detail = {
+            "torn": "line 1",
+            "a-list": "list",
+            "empty": "line 1",
+            "denied": "Permission denied",
+            "eio": "Input/output error",
+        }
         assert detail[how] in caplog.text
+
+    @pytest.mark.parametrize(("how", "why"), UNREAD)
+    def test_the_read_answers_the_class_and_never_raises(
+        self, tmp_path, monkeypatch, how, why
+    ):
+        path = tmp_path / "settings.json"
+        _damage(monkeypatch, path, how)
+        notes: list[str] = []
+        try:
+            found: object = nodes._read_object(path, "settings.json", notes)
+        except (OSError, ValueError) as e:  # a raise is this pin's FAILURE
+            found = e
+        assert found == nodes._Unread(why)
+
+    def test_a_file_nested_too_deep_to_parse_is_unread_never_raised(self, tmp_path):
+        # json raises RecursionError -- not a ValueError -- on nesting deeper
+        # than it can parse; provisioning must not die on a PC file.
+        path = tmp_path / "settings.json"
+        path.write_text("[" * 100_000, encoding="utf-8")
+        notes: list[str] = []
+        try:
+            found: object = nodes._read_object(path, "settings.json", notes)
+        except RecursionError as e:  # a raise is this pin's FAILURE
+            found = e
+        assert found == nodes._Unread("RecursionError")
+        assert notes == [
+            (
+                "settings.json: could not be read (RecursionError), so nothing "
+                "from it ships this time"
+            )
+        ]
 
     @pytest.mark.parametrize("text", ["[1]", '"x"', "null", "3"])
     def test_a_top_level_that_is_not_an_object_is_unread(self, tmp_path, text):
