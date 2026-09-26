@@ -483,6 +483,16 @@ def _twin_apis(tmp_path: Path, rig: NodeRig) -> list[ProjectConfig]:
     return [*out, bystander]
 
 
+def _batch(config: MagentConfig) -> list[launch.NodeBringUpOutcome]:
+    """``bring_up_node_projects`` with its contract as an assertion: a batch
+    never raises -- a project the check cannot place is an outcome, not a
+    crash that takes its siblings down with it."""
+    try:
+        return launch.bring_up_node_projects(config)
+    except Exception as exc:
+        raise AssertionError(f"a node batch must never raise: {exc!r}") from exc
+
+
 class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
     """X3: ``nodes.assert_distinct_remote_roots`` runs ONCE over the whole
     batch, before the fan-out -- one clone would otherwise overwrite the
@@ -564,7 +574,7 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         (tmp_path / "web2").mkdir()
         (good,) = _projects(tmp_path, rig, [("a1", "second")])
         odd = make(tmp_path)
-        outcomes = launch.bring_up_node_projects(_config(odd, good))
+        outcomes = _batch(_config(odd, good))
         assert [o.ok for o in outcomes] == [False, True]
         assert reason in (outcomes[0].error or "")
         assert [nick for nick, _ in rig.recipes] == ["second"]
@@ -581,7 +591,7 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
             raise ValueError("node-map.json: not valid JSON")
 
         monkeypatch.setattr(nodes, "read_node_map", broken)
-        outcomes = launch.bring_up_node_projects(_config(*projs))
+        outcomes = _batch(_config(*projs))
         assert [o.ok for o in outcomes] == [False, False, False]
         assert all(
             "would share the node folder name 'api'" in (o.error or "")
