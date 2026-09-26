@@ -723,9 +723,29 @@ def next_since(snap: NodeSnapshot, sid: str, since: float) -> float:
     return max(since, min(math.nextafter(stop, -math.inf), after_scan))
 
 
-def _pull_error(message: str) -> RemoteError:
-    # rc 0: the node answered, and the answer was not a pull.
-    return RemoteError(0, message, ("pull.sh",))
+class NotAPull(RemoteError):
+    """rc 0: the node answered, and the answer was not a pull this PC can read
+    -- another framing version, a truncated or damaged reply, an archive over
+    its cap -- so NOTHING of it was stored. Its own type so a caller can tell
+    it from a ``PullRefused`` (rc 0 as well): a recall must stop on this one,
+    because the node still holds whatever it could not send (cq-G14 C-R3-1).
+    Every other caller sees the same RemoteError(0) as before."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(0, message, ("pull.sh",))
+
+
+class PullRefused(RemoteError):
+    """rc 0: a pull refused on this PC before any ssh -- a session name this PC
+    cannot store, an empty remote root. Nothing was asked of the node, and no
+    re-run changes the answer."""
+
+    def __init__(self, message: str, command_redacted: tuple[str, ...]) -> None:
+        super().__init__(0, message, command_redacted)
+
+
+def _pull_error(message: str) -> NotAPull:
+    return NotAPull(message)
 
 
 def _str_dict(raw: object) -> dict[str, str]:
@@ -957,7 +977,7 @@ def parse_pull(stdout: bytes, *, dest: Path, sids: Collection[str]) -> NodeSnaps
     mirror dir). Only the requested ``sids`` are believed: their metadata, and
     archive members shaped ``<sid>/transcripts/...`` or ``<sid>/state/<x>.json``
     whose every part is a legal name here. Everything else is dropped with one
-    warning. RemoteError (rc 0) when the reply is not a pull at all -- no
+    warning. NotAPull (a RemoteError, rc 0) when the reply is not a pull at all -- no
     header, no ``PULL_TRAILER`` last line (truncated), a member count that
     disagrees with the trailer, a compressed or unreadable archive, or one
     over ``PULL_MAX_TOTAL_BYTES``. ValueError when a requested sid is not
@@ -1053,12 +1073,12 @@ def _pull_call(sids: Mapping[str, SidPull]) -> tuple[list[str], bytes]:
     )  # `bash -s -- <SOCKET>`: the socket is always $1
 
 
-def refused_pull(node: Node, sids: Mapping[str, SidPull], message: str) -> RemoteError:
+def refused_pull(node: Node, sids: Mapping[str, SidPull], message: str) -> PullRefused:
     """A pull of ``sids`` refused on this PC before any ssh: rc 0, and the
     command it would have run, shown the way every node error shows one
     (``_run_shown``)."""
     argv, input_bytes = _pull_call(sids)
-    return RemoteError(0, message, _run_shown(node, argv, input_bytes))
+    return PullRefused(message, _run_shown(node, argv, input_bytes))
 
 
 def pull_node(
@@ -1074,7 +1094,7 @@ def pull_node(
     RemoteError on a transport failure (255), a timeout (None), a reply over
     ``PULL_MAX_REPLY_BYTES`` (None too -- pull.sh keeps its
     own reply under ``PULL_MAX_TOTAL_BYTES``, so this means a node that did
-    not), a node without python3 (3), or a reply that is not a pull (0).
+    not), a node without python3 (3), or a reply that is not a pull (NotAPull, 0).
     ValueError, after the ssh, when ``sids`` names a session that is not
     ``pullable_sid`` (``parse_pull`` refuses it: the caller's bug, not the
     node's)."""
@@ -1135,7 +1155,7 @@ def pull(
     # Before any ssh: parse_pull refuses the same name with ValueError, which
     # would mean THIS caller's bug, not the node's.
     if not pullable_sid(sid):
-        raise _pull_error(f"not a pullable session name: {sid!r}")
+        raise PullRefused(f"not a pullable session name: {sid!r}", ("pull.sh",))
     roots = tuple(remote_dirs)
     first = pull_node(
         node,

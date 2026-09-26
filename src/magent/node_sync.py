@@ -800,7 +800,7 @@ def final_pull(
     also go to the caller, which decides what "could not pull" means.
 
     An entry the daemon's tick would skip (a sid this PC cannot store, an
-    empty remote root) is refused as RemoteError(0) before any ssh, so the
+    empty remote root) is refused as PullRefused (rc 0) before any ssh, so the
     caller never sees parse_pull's ValueError.
 
     A pull the node answered but that left part of the session behind -- a

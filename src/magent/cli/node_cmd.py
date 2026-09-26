@@ -513,18 +513,19 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
     daemon's tick holds -- so it never races a running daemon (DECISION-26
     xi). True when the node may still be read and named with its ssh stop
     command; False when it did not answer (ssh's 255, a timeout) or the node
-    map or config cannot address it -- an rc-0 error proves neither
-    (cq-G14 m-R3-1).
+    map or config cannot address it -- a refusal made on this PC proves
+    neither (cq-G14 m-R3-1).
 
     The placement is cleared after this, and a cleared placement is never
     pulled again, so a pull that can be retried stops the recall here, before
     anything is stopped or cleared (cq-G14 I1): a daemon that keeps the node
-    past the wait, a node that answered with an error (a nonzero rc) or left
-    files behind (PullUnfinished, matched by type -- m1), and a placement the
+    past the wait, a node that answered with an error (a nonzero rc), left
+    files behind (PullUnfinished, matched by type -- m1) or answered with
+    something that is not a pull (NotAPull -- C-R3-1), and a placement the
     pull could not read again. A node that did not answer at all, one the
-    config cannot pull from, and any other rc-0 error (an answer that was not
-    a pull, a refusal made on this PC) go on with what was already pulled --
-    the plan's "never fatal" rule, which no re-run helps."""
+    config cannot pull from, and a pull refused on this PC before any ssh
+    (PullRefused) go on with what was already pulled -- the plan's "never
+    fatal" rule, which no re-run helps."""
     from magent import (  # heavy subsystem: in-body per policy
         node_sync,
         nodes,
@@ -532,8 +533,8 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
     )
 
     if not held.remote_root:
-        # final_pull refuses this entry before any ssh with rc 0 -- the rc of a
-        # node's bad answer -- but no re-run can fix it: it is a note.
+        # final_pull refuses this entry before any ssh (PullRefused), and no
+        # re-run can fix it: it is a note.
         _note(
             f"@{held.nick} cannot be pulled from (the node map has no remote"
             f" root for {held.sid}); going on with what was already pulled"
@@ -574,18 +575,33 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
             f"\n    {remedy}",
             1,
         )
+    except remote_mux.NotAPull as exc:
+        # Before RemoteError, its base (cq-G14 C-R3-1): the node answered, but
+        # with nothing this PC can read as a pull -- another magent's framing,
+        # a damaged or over-cap reply -- so nothing of it was stored and the
+        # node still holds its newest turns. Clearing the placement now would
+        # never pull them.
+        _fail(
+            f"@{held.nick} answered, but not with a pull this PC can read"
+            f" ({_tail(exc)}); {_RERUN}\n    Bring magent on @{held.nick} to"
+            " this PC's version, then run the recall again.",
+            1,
+        )
+    except remote_mux.PullRefused as exc:
+        # Refused on this PC before any ssh (cq-G14 m1), matched by TYPE: no
+        # re-run clears it, so it must never block the recall. Nothing was
+        # dialed, so nothing proves the node unreachable either -- only 255
+        # and a timeout do -- so the live repo read and the ssh stop command
+        # still follow (m-R3-1, kept by team-lead's ruling).
+        _note(
+            f"@{held.nick} cannot be pulled from ({_tail(exc)});"
+            " going on with what was already pulled"
+        )
+        return True
     except remote_mux.RemoteError as exc:
-        if exc.rc == 0:
-            # Not a pull, or refused on this PC before any ssh (cq-G14 m1): no
-            # re-run clears either, so it must never block the recall. The node
-            # is not proven unreachable -- only 255 and a timeout do that -- so
-            # the live repo read and the ssh stop command still follow (m-R3-1).
-            _note(
-                f"@{held.nick} cannot be pulled from ({_tail(exc)});"
-                " going on with what was already pulled"
-            )
-            return True
         if exc.rc not in (255, None):
+            # Any rc 0 of no known kind lands here too: the node's answer until
+            # proven otherwise, so it keeps the placement (C-R3-1).
             # It answered with an error of its own -- one that may come back on
             # every run (no python3 is rc 3), so the stop names the fix (m2).
             _fail(

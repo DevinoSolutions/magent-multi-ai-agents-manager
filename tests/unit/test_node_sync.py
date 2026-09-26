@@ -1532,6 +1532,10 @@ class TestTheFinalPull:
         with pytest.raises(remote_mux.RemoteError) as info:
             node_sync.final_pull(_config(), "api")
         assert not isinstance(info.value, node_sync.PullUnfinished)
+        # cq-G14 C-R3-1: a refusal made here, never a node's unreadable answer
+        # -- the recall goes on after the first and stops on the second.
+        assert isinstance(info.value, remote_mux.PullRefused)
+        assert not isinstance(info.value, remote_mux.NotAPull)
         assert info.value.rc == 0
         assert info.value.stderr_tail == f"not a pullable session name: {sid!r}"
         assert info.value.command_redacted[0] == "ssh"

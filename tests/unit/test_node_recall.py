@@ -2160,68 +2160,30 @@ class TestTheLastPullMustFinish:
             " (python3, free disk space), then run the recall again."
         ) in result.stderr
 
-    @pytest.mark.parametrize(
-        "error",
-        [
-            remote_mux.RemoteError(
-                0, "a refusal made on this PC", ("ssh", "amin@devino-second")
-            ),
-            remote_mux.RemoteError(
-                0, "no MAGENT-PULL header in the reply", ("pull.sh",)
-            ),
-        ],
-        ids=["refused-here", "not-a-pull"],
-    )
-    def test_an_rc_0_error_that_is_not_an_unfinished_pull_is_a_note(
-        self, runner, placed_api, node_answers, monkeypatch, api_repo, error
+    def test_a_refusal_made_on_this_pc_is_a_note_and_the_node_is_still_read(
+        self, runner, placed_api, node_answers, monkeypatch, api_repo
     ):
-        """cq-G14 m1: recall stops on PullUnfinished, not on rc 0. A refusal
-        made before any ssh is rc 0 too, and no re-run clears it -- a later
-        one added to final_pull must not block every recall of the project."""
+        """cq-G14 m1 / C-R3-1: a pull refused on this PC before any ssh
+        (matched by TYPE, not by rc) is a note -- no re-run clears it, so it
+        must never block the recall. It proves nothing about the network, so
+        the node stays reachable (m-R3-1, kept by team-lead's ruling): the
+        live repo read is attempted and the stop command is the ssh one (P4)."""
 
-        def _rc0(*a, **k):
-            raise error
+        def _refused(*a, **k):
+            raise remote_mux.PullRefused(
+                "a refusal made on this PC", ("ssh", "amin@devino-second")
+            )
 
-        monkeypatch.setattr(node_sync, "final_pull", _rc0)
+        monkeypatch.setattr(node_sync, "final_pull", _refused)
 
         result = _recall(runner, placed_api, "--local")
 
         assert result.exit_code == 0, result.output
         assert (
-            f"@second cannot be pulled from ({error.stderr_tail});"
+            "@second cannot be pulled from (a refusal made on this PC);"
             " going on with what was already pulled"
         ) in result.stdout
         assert "did not finish" not in result.output
-        assert "api" not in nodes.read_node_map()
-
-    @pytest.mark.parametrize(
-        "error",
-        [
-            remote_mux.RemoteError(
-                0, "a refusal made on this PC", ("ssh", "amin@devino-second")
-            ),
-            remote_mux.RemoteError(
-                0, "no MAGENT-PULL header in the reply", ("pull.sh",)
-            ),
-        ],
-        ids=["refused-here", "not-a-pull"],
-    )
-    def test_an_rc_0_error_leaves_the_node_reachable(
-        self, runner, placed_api, node_answers, monkeypatch, api_repo, error
-    ):
-        """cq-G14 m-R3-1: only ssh's own failure (255) or a timeout proves a
-        node unreachable. One that answered with something that is not a pull
-        -- or was never dialed -- still gets the live repo read that feeds the
-        unpushed-work warning, and the one-line ssh stop command."""
-
-        def _rc0(*a, **k):
-            raise error
-
-        monkeypatch.setattr(node_sync, "final_pull", _rc0)
-
-        result = _recall(runner, placed_api, "--local")
-
-        assert result.exit_code == 0, result.output
         assert [e[0] for e in node_answers] == ["repo_status"]
         assert "repos on @second, now:" in result.stdout
         assert "last known" not in result.stdout
@@ -2229,6 +2191,80 @@ class TestTheLastPullMustFinish:
             "stop it with: ssh amin@devino-second"
             f" \"tmux -L {remote_mux.SOCKET} kill-session -t '=api'\"" in result.stdout
         )
+        assert "api" not in nodes.read_node_map()
+
+    def test_an_answer_that_is_not_a_pull_stops_the_recall(
+        self, runner, placed_api, node_answers, monkeypatch, api_repo
+    ):
+        """cq-G14 C-R3-1: the node answered, but with nothing this PC can read
+        as a pull (version skew, a damaged or over-cap archive). Nothing was
+        stored, and the node still holds the newest turns: clearing the
+        placement here would never pull them."""
+
+        def _not_a_pull(*a, **k):
+            raise remote_mux.NotAPull("no MAGENT-PULL header in the reply")
+
+        monkeypatch.setattr(node_sync, "final_pull", _not_a_pull)
+
+        result = _recall(runner, placed_api, "--local")
+
+        _stopped_before_anything(result, api_repo)
+        assert (
+            "@second answered, but not with a pull this PC can read"
+            f" (no MAGENT-PULL header in the reply); {node_cmd._RERUN}"
+        ) in result.stderr
+        assert (
+            "Bring magent on @second to this PC's version, then run the recall again."
+        ) in result.stderr
+        assert "cannot be pulled from" not in result.output
+        assert node_answers == []
+
+    def test_an_rc_0_error_of_no_known_kind_stops_the_recall(
+        self, runner, placed_api, node_answers, monkeypatch, api_repo
+    ):
+        # C-R3-1: only a refusal made here goes on; an rc 0 nobody typed is
+        # the node's answer until proven otherwise, so it keeps the placement.
+        def _rc0(*a, **k):
+            raise remote_mux.RemoteError(0, "something new", ("pull.sh",))
+
+        monkeypatch.setattr(node_sync, "final_pull", _rc0)
+
+        result = _recall(runner, placed_api, "--local")
+
+        _stopped_before_anything(result, api_repo)
+        assert "cannot be pulled from" not in result.output
+
+    def test_a_reply_from_another_version_stops_the_recall_end_to_end(
+        self, runner, placed_api, node_answers, monkeypatch, api_repo
+    ):
+        """C-R3-1, through the REAL final_pull, pull_node and parse_pull: only
+        the ssh call is faked, answering rc 0 with a pull.sh reply of another
+        framing version."""
+        monkeypatch.setattr(node_sync, "final_pull", _REAL_FINAL_PULL)
+        calls: list[object] = []
+
+        def _run(node, argv_remote, *, timeout_s, input_bytes=None, **_k):
+            calls.append(node.nick)
+            return subprocess.CompletedProcess(
+                argv_remote,
+                0,
+                b"MAGENT-PULL/2\n{}\n"
+                b'{"type":"user","message":"THE-LAST-TURN"}\n'
+                b"MAGENT-PULL-END 1\n",
+                b"",
+            )
+
+        monkeypatch.setattr(remote_mux, "run", _run)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert calls == ["second"]
+        _stopped_before_anything(result, api_repo)
+        assert (
+            "@second answered, but not with a pull this PC can read"
+            " (no MAGENT-PULL header in the reply)"
+        ) in result.stderr
+        assert node_answers == []
 
     def test_a_failure_on_this_pc_during_the_pull_is_printed_not_a_traceback(
         self, runner, placed_api, node_answers, monkeypatch, api_repo
