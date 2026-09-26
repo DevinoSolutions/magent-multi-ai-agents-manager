@@ -675,13 +675,11 @@ class PaneCapture:
     timed_out: bool
 
 
-def read_pane(
-    name: str, psmux: str | None = None, *, timeout: float | None = None
-) -> PaneCapture:
+def read_pane(name: str, psmux: str | None = None) -> PaneCapture:
     """Capture the active pane's visible text, telling a timeout apart.
 
-    Same guards as ``pane_cwd``: bounded (``timeout``, default
-    ``CAPTURE_PANE_TIMEOUT_S``), decode-tolerant, and never raises.
+    Same guards as ``pane_cwd``: bounded (``CAPTURE_PANE_TIMEOUT_S``),
+    decode-tolerant, and never raises.
     """
     binary = psmux or find_psmux()
     if not binary:
@@ -690,7 +688,7 @@ def read_pane(
         result = subprocess.run(
             [binary, "-L", name, "capture-pane", "-p", "-t", name],
             capture_output=True,
-            timeout=CAPTURE_PANE_TIMEOUT_S if timeout is None else timeout,
+            timeout=CAPTURE_PANE_TIMEOUT_S,
             encoding="utf-8",
             errors="replace",
             check=False,
