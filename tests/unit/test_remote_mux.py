@@ -293,11 +293,13 @@ class TestRun:
     def test_a_spawn_failure_never_ran_so_its_outcome_is_known(
         self, tmp_path, monkeypatch
     ):
-        # The one rc-None case where a retry of a mutation is safe.
+        # A client that vanished between find_ssh and the spawn: rc 127
+        # (FileNotFoundError), never ran, so a retry of a mutation is safe.
         gone = str(tmp_path / "no-such-ssh.exe")
         monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: gone)
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["true"], timeout_s=5)
+        assert exc.value.rc == 127
         assert (exc.value.timed_out, exc.value.outcome_unknown) == (False, False)
 
     def test_an_exact_tmux_target_reaches_bash_quoted(self, fake_ssh):
@@ -359,6 +361,8 @@ class TestRun:
             remote_mux.run(NODE, ["true"], timeout_s=5, quiet=True)
         assert (exc.value.rc, exc.value.stderr_tail) == (None, "Permission denied")
         assert exc.value.timed_out is False
+        # The rc-None case where nothing ran: the flags must not say it may have.
+        assert (exc.value.over_cap, exc.value.outcome_unknown) == (False, False)
 
     def test_no_ssh_client_is_rc_127_without_spawning(self):
         with pytest.raises(RemoteError) as exc:
