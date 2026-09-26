@@ -2937,12 +2937,13 @@ class TestDoctorShUnderRealBash:
 
     def test_a_failing_tmux_v_is_not_believed(self, tmp_path):
         # A version printed by a `tmux -V` that then exits non-zero is not
-        # graded: the binary is broken, whatever it claimed to be.
-        _, env = _doctor_box(tmp_path, tmux_version="tmux 3.4", tmux_version_rc=1)
+        # graded: the binary is broken, whatever it claimed to be, and the row
+        # says so rather than quoting an empty version.
+        _, env = _doctor_box(tmp_path, tmux_version="tmux 3.4", tmux_version_rc=3)
         row = self._tmux_row(env)
         assert (row.status, row.detail) == (
             "fail",
-            "cannot read the tmux version (); magent needs tmux 3.2 or newer",
+            "tmux -V exited 3 -- reinstall tmux on this node",
         )
 
     def test_only_the_first_line_of_tmux_v_is_the_version(self, tmp_path):

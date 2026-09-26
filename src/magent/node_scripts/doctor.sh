@@ -67,7 +67,11 @@ check_tmux() {
     say fail tmux "tmux -V timed out after ${VERSION_PROBE_S}s"
     return
   fi
-  [ "$rc" -eq 0 ] || out=""
+  # A version printed by a failing tmux -V is not graded: the binary is broken.
+  if [ "$rc" -ne 0 ]; then
+    say fail tmux "tmux -V exited $rc -- reinstall tmux on this node"
+    return
+  fi
   verdict=$(magent_tmux_grade "$out")
   version=${verdict#*$'\t'}
   floor=$(magent_tmux_floor)
