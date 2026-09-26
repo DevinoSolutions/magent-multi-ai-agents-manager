@@ -1754,7 +1754,7 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
         hotkey._do_open_code("http://x:8034", "rd", None)
         self._assert_refused(spawned)
 
-    @pytest.mark.parametrize("char", sorted('&|<>^%"'))
+    @pytest.mark.parametrize("char", sorted('&|<>^%"!'))
     @pytest.mark.parametrize("shim", ["code.cmd", "CODE.CMD", "code.bat", "Code.Bat"])
     def test_every_metacharacter_is_refused_through_any_batch_shim(
         self, monkeypatch, tmp_path, char, shim
@@ -1886,3 +1886,43 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
             raise AssertionError("an F2 failure escaped the handler thread") from None
         assert spawned == []
         assert self.flashed[-1] == "F2: failed - see hotkey.log"
+
+    # A remote POSIX folder may carry what no Windows name can: cmd.exe ends
+    # the command at a LF (a truncated folder, then a false success flash),
+    # and `!` expands under delayed expansion. Only the server path can
+    # deliver these -- open_target already drops a control-bearing node cwd.
+    _ODD = ("/srv/a\nb", "/srv/a\rb", "/srv/a\tb", "/srv/a\x7fb", "/srv/a!b")
+
+    def _serve(self, monkeypatch, tmp_path, folder, code_bin):
+        from magent import nodes
+
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        return self._patch(
+            monkeypatch,
+            code_bin=code_bin,
+            payload={
+                "ok": True,
+                "sessions": [{"name": "api", "session": "api", "resolved": folder}],
+            },
+        )
+
+    @pytest.mark.parametrize("folder", _ODD)
+    def test_a_control_character_or_bang_is_refused_through_code_cmd(
+        self, monkeypatch, tmp_path, folder
+    ):
+        from magent import hotkey
+
+        spawned = self._serve(monkeypatch, tmp_path, folder, self._SHIM)
+        hotkey._do_open_code("http://x:8034", "api", "me@host")
+        self._assert_refused(spawned)
+
+    @pytest.mark.parametrize("code_bin", [r"C:\VS Code\Code.exe", "/usr/bin/code"])
+    @pytest.mark.parametrize("folder", _ODD)
+    def test_a_control_character_or_bang_passes_without_cmd_exe(
+        self, monkeypatch, tmp_path, folder, code_bin
+    ):
+        from magent import hotkey
+
+        spawned = self._serve(monkeypatch, tmp_path, folder, code_bin)
+        hotkey._do_open_code("http://x:8034", "api", "me@host")
+        assert spawned == [[code_bin, "--remote", "ssh-remote+host", folder]]

@@ -529,18 +529,23 @@ def _do_upload(server_url: str, project: str, ssh_host: str | None = None) -> No
 # What cmd.exe treats as syntax on a batch file's command line. list2cmdline
 # quotes an argument only for whitespace, so `&|<>^` outside quotes split or
 # redirect the command, `%VAR%` expands even inside quotes, and `\"` is not an
-# escape to cmd.exe. A Windows folder may legitimately be named `R&D`.
-_CMD_METACHARS = frozenset('&|<>^%"')
+# escape to cmd.exe. `!` expands under delayed expansion. A Windows folder may
+# legitimately be named `R&D`; a remote POSIX one may even carry a control
+# character, and cmd.exe ends the command at a LF (_cmd_would_mangle).
+_CMD_METACHARS = frozenset('&|<>^%"!')
 
 
 def _cmd_would_mangle(argv: list[str]) -> bool:
-    """True when ``argv`` names a batch file (``code.cmd``) and any element
-    carries a cmd.exe metacharacter. There is no quoting that makes such an
+    """True when ``argv`` names a batch file (``code.cmd``) and any element --
+    the shim's own path included -- carries a cmd.exe metacharacter or a
+    control character (below 0x20, or DEL). There is no quoting that makes such an
     argv safe through ``cmd.exe /c``, so F2 refuses it; an ``.exe`` (or a
     POSIX ``code``) takes its argv verbatim and is never refused."""
     if not argv[0].lower().endswith((".cmd", ".bat")):
         return False
-    return any(ch in _CMD_METACHARS for arg in argv for ch in arg)
+    return any(
+        ch in _CMD_METACHARS or ch < " " or ch == "\x7f" for arg in argv for ch in arg
+    )
 
 
 def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
