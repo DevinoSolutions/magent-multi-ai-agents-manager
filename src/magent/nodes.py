@@ -766,6 +766,39 @@ def _in_secret_dir(
     return True
 
 
+@dataclass(frozen=True)
+class _Fences:
+    """Where the skills walk never reads, every path resolved: ``home``'s
+    ``SECRET_HOME_DIRS``, and ``claude`` (``~/.claude``) outside ``root``
+    (the skills folder)."""
+
+    secrets: tuple[str, ...]
+    claude: str
+    root: str
+
+
+def _fenced(rel_path: str, target: str, fences: _Fences, notes: list[str]) -> bool:
+    """``target`` (resolved) is behind one of ``fences``: noted, WARNING
+    logged, and True so the caller skips it. ``~/.claude`` outside the skills
+    folder holds the session transcripts (``projects/``), the history and the
+    login -- never a skill."""
+    if _in_secret_dir(rel_path, target, fences.secrets, notes):
+        return True
+    if not _within(fences.claude, target) or _within(fences.root, target):
+        return False
+    name = _named(rel_path)
+    notes.append(
+        f"skills/{name}: links into ~/.claude outside the skills folder, not followed"
+    )
+    _log.warning(
+        "skills/%s resolves to %s, in ~/.claude outside the skills folder: "
+        "not followed",
+        name,
+        target,
+    )
+    return True
+
+
 def _secret_file_name(name: str) -> bool:
     low = name.lower()
     return (
@@ -789,14 +822,14 @@ class _SkillsTally:
 def _skill_file(
     path: Path,
     rel_path: str,
-    secrets: Sequence[str],
+    fences: _Fences,
     tally: _SkillsTally,
     notes: list[str],
 ) -> SkillFile | None:
     """``path`` (at ``rel_path`` under skills) as a SkillFile, or None with a
     note (or a count in ``tally``) saying why it stays behind."""
     target = _real(path)
-    if _in_secret_dir(rel_path, target, secrets, notes):
+    if _fenced(rel_path, target, fences, notes):
         return None
     if _secret_file_name(path.name) or _secret_file_name(os.path.basename(target)):
         notes.append(f"skills/{_named(rel_path)}: a secret-bearing name, never shipped")
@@ -843,14 +876,16 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     purpose: a link in ``skills`` is one the user made (a repo checked out
     elsewhere is the main case), so it is not contained to the root.
 
-    Two kinds of target are never followed, each pruned with a note and a
+    Three kinds of target are never followed, each pruned with a note and a
     WARNING naming the link. A folder ABOVE the skills folder -- ``~/.claude``,
-    ``~``, ``/`` -- is no skill: it is the walk reading the whole home. And
-    nothing inside one of ``home``'s ``SECRET_HOME_DIRS`` is read, folder or
-    single file, however it was reached. Both sides of every comparison are
-    resolved first, so a ``~/.ssh`` that is itself a junction elsewhere
-    (OneDrive setups) is still recognised. A skills folder that is itself
-    such a link ships nothing.
+    ``~``, ``/`` -- is no skill: it is the walk reading the whole home.
+    Nothing inside one of ``home``'s ``SECRET_HOME_DIRS`` is read, folder or
+    single file, however it was reached. And nothing in ``~/.claude`` outside
+    the skills folder is read either -- the session transcripts, the history,
+    the login. Both sides of every comparison are resolved first, so a
+    ``~/.ssh`` or ``~/.claude`` that is itself a junction elsewhere (OneDrive
+    setups) is still recognised. A skills folder that is itself such a link
+    ships nothing.
 
     That is defence in depth, NOT containment: a link to any other folder
     (``~/private-notes``) ships what it holds, deliberately -- the user put
@@ -866,8 +901,19 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     # The unresolved root counts too: with ~/.claude a junction elsewhere, a
     # link to ~ is above the path the user sees, not the resolved one.
     anchors = (os.path.normcase(os.path.abspath(root)), _real(root))
-    secrets = tuple(_real(home / d) for d in SECRET_HOME_DIRS)
-    if _above(anchors[1], anchors[0]) or any(_within(s, anchors[1]) for s in secrets):
+    fences = _Fences(
+        secrets=tuple(_real(home / d) for d in SECRET_HOME_DIRS),
+        claude=_real(home / ".claude"),
+        root=anchors[1],
+    )
+    # ~/.claude/skills resolved where ~/.claude resolves: anywhere else in
+    # ~/.claude (the transcripts, say) is no skills folder.
+    own = os.path.normcase(os.path.join(fences.claude, "skills"))
+    if (
+        _above(anchors[1], anchors[0])
+        or any(_within(s, anchors[1]) for s in fences.secrets)
+        or (_within(fences.claude, anchors[1]) and anchors[1] != own)
+    ):
         notes.append("skills: links to a folder it must not read, not followed")
         _log.warning("%s links to %s: not followed", root, anchors[1])
         return ()
@@ -909,13 +955,13 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
                     target,
                 )
                 continue
-            if _in_secret_dir((rel / d).as_posix(), target, secrets, notes):
+            if _fenced((rel / d).as_posix(), target, fences, notes):
                 continue
             kept.append(d)
         dirnames[:] = kept
         for name in listed_files:
             rel_path = (rel / name).as_posix()
-            skill = _skill_file(here / name, rel_path, secrets, tally, notes)
+            skill = _skill_file(here / name, rel_path, fences, tally, notes)
             if skill is not None:
                 files.append(skill)
         if tally.entries > SKILLS_MAX_ENTRIES:

@@ -1546,6 +1546,72 @@ class TestTheSkillsWalkKnowsASecretWhenItSeesOne:
         assert "DECOY" not in repr(scope)
 
 
+CLAUDE_ELSEWHERE = "links into ~/.claude outside the skills folder, not followed"
+
+
+# ~/.claude holds session transcripts (projects/), history and the login --
+# never a skill. A link from skills into any of it is pruned, a folder or one
+# file: defence in depth beside the secrets folders (ruling A), not
+# containment -- a link anywhere else still ships.
+class TestTheSkillsWalkNeverReadsTheRestOfClaude:
+    @staticmethod
+    def _claude_home(tmp_path: Path) -> tuple[Path, Path]:
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/SKILL.md")
+        _skill(home / ".claude", "projects/p/session.jsonl", b"TRANSCRIPT-DECOY")
+        _skill(home / ".claude", "history.jsonl", b"HISTORY-DECOY")
+        return home, skills
+
+    def test_a_link_to_the_transcripts_is_pruned_with_a_warning(self, tmp_path, caplog):
+        home, skills = self._claude_home(tmp_path)
+        _link_dir(skills / "p", home / ".claude" / "projects")
+        caplog.set_level("WARNING")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == (f"skills/p: {CLAUDE_ELSEWHERE}",)
+        assert "skills/p resolves to" in caplog.text
+        assert "DECOY" not in repr(scope)
+
+    def test_a_linked_file_from_claude_is_pruned(self, tmp_path):
+        home, skills = self._claude_home(tmp_path)
+        _link_file(skills / "s" / "h.md", home / ".claude" / "history.jsonl")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == (f"skills/s/h.md: {CLAUDE_ELSEWHERE}",)
+        assert "DECOY" not in repr(scope)
+
+    def test_a_skills_folder_that_is_a_link_into_claude_ships_nothing(self, tmp_path):
+        home = _pc_home(tmp_path)
+        _skill(home / ".claude", "projects/p/session.jsonl", b"TRANSCRIPT-DECOY")
+        _link_dir(home / ".claude" / "skills", home / ".claude" / "projects")
+        scope = nodes.user_scope(home)
+        assert scope.skills == ()
+        assert scope.notes == (
+            "skills: links to a folder it must not read, not followed",
+        )
+
+    # Both sides resolved: with ~/.claude a junction elsewhere (OneDrive
+    # setups), the transcripts it points at are still recognised, and its own
+    # skills folder still ships.
+    def test_a_claude_folder_that_is_itself_a_link_is_still_recognised(self, tmp_path):
+        home = _pc_home(tmp_path)
+        real_claude = tmp_path / "synced" / "claude"
+        _skill(real_claude, "skills/s/SKILL.md")
+        _skill(real_claude, "projects/p/session.jsonl", b"TRANSCRIPT-DECOY")
+        _link_dir(home / ".claude", real_claude)
+        _link_dir(real_claude / "skills" / "p", real_claude / "projects")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == (f"skills/p: {CLAUDE_ELSEWHERE}",)
+
+    def test_a_link_within_the_skills_folder_still_ships(self, tmp_path):
+        home, skills = self._claude_home(tmp_path)
+        _link_dir(skills / "alias", skills / "s")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["alias/SKILL.md"]
+        assert scope.notes == ()
+
+
 class TestUserScopeDigests:
     def test_every_item_has_a_digest(self):
         assert set(_scope().digests()) == {
