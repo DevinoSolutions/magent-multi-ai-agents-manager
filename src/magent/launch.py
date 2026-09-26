@@ -2143,11 +2143,13 @@ def _final_pull(
                     f"node {nick}'s pull lock is held by another magent process"
                 )
             if isinstance(exc, node_sync.NodeMapUnreadable):
-                # D-MERGE: ruling (b) -- at the D16 merge this reason becomes
-                # D16's final m4 wording plus the map error's CLASS (the
-                # cause's, which str(exc) already names), still one line; the
-                # whole error stays in the log line above. Until then, D16's
-                # pinned words as they stand at this branch's base.
+                # D-MERGE: revised ruling (b) -- at the D16 merge this reason
+                # becomes nodes.map_unread_text(exc.__cause__): the shared
+                # sentence plus the MAP error's class, which is str(exc).
+                # Never map_unread_text(exc) (it would name NodeMapUnreadable)
+                # and never D16's m4 words: those are the None branch's only.
+                # The whole error stays in the log line above. Until the
+                # merge, the words this branch's base pins.
                 reason = nodes.MAP_UNREAD
             else:
                 # ASCII end to end: the cause is the node's or the OS's words.
@@ -2160,6 +2162,8 @@ def _final_pull(
             get_logger("nodes").warning(
                 "down: final pull of %s found no map entry for %r", sid, key
             )
+            # D-MERGE: D16's m4 words replace this, alone -- no class, as no
+            # exception was raised: the entry vanished between two reads.
             reason = nodes.MAP_UNREAD
     _say_not_pulled(sid, reason)
     return False
