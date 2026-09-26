@@ -1200,6 +1200,17 @@ def _scope_or_fail_on_fifo(home: Path, fifo: Path) -> UserScope:
     return scope
 
 
+def _walked(home: Path) -> UserScope:
+    """``user_scope(home)``, where an OSError out of the walk fails the test
+    by assertion: an entry it cannot read is a note, never the walk's end."""
+    try:
+        scope: UserScope | OSError = nodes.user_scope(home)
+    except OSError as e:
+        scope = e
+    assert isinstance(scope, UserScope), f"the walk stopped: {type(scope).__name__}"
+    return scope
+
+
 class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
     @pytest.mark.skipif(sys.platform == "win32", reason="no FIFOs on Windows")
     def test_a_fifo_is_not_read(self, tmp_path):
@@ -1614,7 +1625,7 @@ class TestTheSkillsWalkKnowsASecretWhenItSeesOne:
     def test_a_dangling_link_is_a_note(self, tmp_path):
         home, skills = _skills_home(tmp_path)
         _link_file(skills / "gone", tmp_path / "nowhere")
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         assert scope.skills == ()
         assert scope.notes == (
             "skills/gone: cannot be read (FileNotFoundError); not shipped",
@@ -1674,7 +1685,7 @@ class TestAnUnreadableSkillsFolderIsNamedNotFatal:
             _skill(skills, rel)
         _deny_listing(monkeypatch, skills / "b" / "x", skills / "c")
         caplog.set_level("WARNING", logger="nodes")
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         assert [f.path for f in scope.skills] == ["a/SKILL.md", "b/y/g.md"]
         assert scope.notes == (
             "skills/b/x: cannot be read (PermissionError); not shipped",
@@ -1693,7 +1704,7 @@ class TestAnUnreadableSkillsFolderIsNamedNotFatal:
         home, skills = _skills_home(tmp_path)
         _skill(skills, "a/SKILL.md")
         _deny_listing(monkeypatch, skills)
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         assert scope.skills == ()
         assert scope.notes == ("skills: cannot be read (PermissionError); not shipped",)
 
@@ -1707,7 +1718,7 @@ class TestAnUnreadableSkillsFolderIsNamedNotFatal:
         _skill(skills, "locked/SKILL.md")
         (skills / "locked").chmod(0)
         try:
-            scope = nodes.user_scope(home)
+            scope = _walked(home)
         finally:
             (skills / "locked").chmod(0o700)
         assert [f.path for f in scope.skills] == ["a/SKILL.md"]
@@ -1723,7 +1734,7 @@ class TestAnUnreadableSkillsFolderIsNamedNotFatal:
             _skill(skills, rel)
         _deny_opening(monkeypatch, skills / "b" / "locked.md")
         caplog.set_level("WARNING", logger="nodes")
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         assert [f.path for f in scope.skills] == ["a/SKILL.md", "b/SKILL.md"]
         assert scope.notes == (
             "skills/b/locked.md: cannot be read (PermissionError); not shipped",
@@ -1742,7 +1753,7 @@ class TestAnUnreadableSkillsFolderIsNamedNotFatal:
         _skill(skills, "a/SKILL.md")
         _skill(skills, "a/locked.md")
         (skills / "a" / "locked.md").chmod(0)
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         assert [f.path for f in scope.skills] == ["a/SKILL.md"]
         assert scope.notes == (
             "skills/a/locked.md: cannot be read (PermissionError); not shipped",
@@ -1926,7 +1937,7 @@ class TestALinkedSkillShipsAsItsContent:
         home, skills = _skills_home(tmp_path)
         _skill(skills, "s/SKILL.md")
         _link_file(skills / "s" / "loop", skills / "s" / "loop")
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         assert [f.path for f in scope.skills] == ["s/SKILL.md"]
         assert len(scope.notes) == 1
         # The class differs by OS (ELOOP is a bare OSError); the words do not.
