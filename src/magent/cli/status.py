@@ -546,6 +546,11 @@ def _down_host(explicit: str | None, local_targets: list[str]) -> str | None:
     nothing else, while `attach`'s own goodbye line advertises that exact
     command for stopping the sessions it just opened. On the host itself local
     sessions match, so the auto path never fires there.
+
+    ``local_targets`` counts the node sessions this PC's map placed. A map
+    that could not be read cannot say whether there are any, so ``down_cmd``
+    holds back the auto answer it gets here and acts locally (never an
+    explicit ``--host``).
     """
     if explicit:
         return explicit
@@ -770,12 +775,13 @@ def down_cmd(
 
     placed, map_unread = _placed_here(cfg, node_targets)
     remote = _down_host(host, [*live, *placed])
-    held_back: str | None = None
+    # The auto host a forward was held back from, and what refused the map.
+    held_back: tuple[str, OSError | ValueError] | None = None
     if remote and not host and map_unread is not None:
         # The auto rule forwards only when nothing here needs a local `down`.
         # An unreadable map cannot say that: act here, where a node session
         # this PC placed is reachable, and name the host's command instead.
-        held_back, remote = remote, None
+        held_back, remote = (remote, map_unread), None
     remote_rc = 0
     if remote:
         from magent.cli.attach import (
@@ -794,8 +800,8 @@ def down_cmd(
         if node_targets:
             node_stopped, node_still = stop_node_sessions(cfg, node_targets)
         _report_shutdown(stopped, still, node_stopped, node_still)
-        if held_back is not None and map_unread is not None:
-            _echo_map_unread_hint(held_back, map_unread)
+        if held_back is not None:
+            _echo_map_unread_hint(*held_back)
         else:
             _echo_attach_host_hint(live, placed)
     else:
