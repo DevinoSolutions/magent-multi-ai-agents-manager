@@ -60,7 +60,7 @@ from magent.nodes import (
     node_dir,
     path_exists,
     path_is_dir,
-    path_is_file,
+    walk_memory,
 )
 from magent.sessions import build_resume_command
 
@@ -1763,62 +1763,20 @@ def _payload(*, header: bytes, decorate: str, files: list[tuple[str, bytes]]) ->
 
 
 def _memory_files(memory_dir: Path) -> list[tuple[str, Path]]:
-    """``(member name, path)`` for every REGULAR file under ``memory_dir``, in
-    name order. A link is never followed -- not a file link, not a folder
-    link, and not ``memory_dir`` itself being one: the folder is Claude's,
-    and a link in it can name ``~/.ssh``. What is skipped is logged, never
-    raised: a bring-up never fails because of memory.
-
-    "A link" is decided by ``realpath``, not ``is_symlink``: a Windows
-    junction -- which any standard user can make -- is not a symlink to
-    pathlib, and ``os.walk(followlinks=False)`` descends into one. An entry is
-    kept only when resolving it changes nothing but its parent's own
-    resolution, so a link ABOVE ``memory_dir`` (a dotfiles ``~/.claude``)
-    still ships, and every file must resolve inside the resolved folder."""
+    """``(member name, path)`` for every file ``nodes.walk_memory`` lets ship
+    from ``memory_dir``, in name order. That walk is the recipe's too, so its
+    rules (never a link, every file inside the resolved folder, every skip
+    logged and never raised) are one rule for both. A file that cannot be
+    named on the node is skipped and logged as well."""
     logger = get_logger("nodes")
-    real_mem = Path(os.path.realpath(memory_dir))
-    if real_mem != Path(os.path.realpath(memory_dir.parent)) / memory_dir.name:
-        logger.warning("memory folder %s is a link; no memory shipped", memory_dir)
-        return []
     found: list[tuple[str, Path]] = []
-
-    def unreadable(exc: OSError) -> None:
-        # os.walk's default is to skip a folder it cannot list in silence;
-        # recipe_for's walk puts the same folder on screen (class only).
-        logger.warning(
-            "memory folder %s cannot be read; skipped: %s", exc.filename, exc
-        )
-
-    for dirpath, dirnames, filenames in os.walk(memory_dir, onerror=unreadable):
-        base = Path(dirpath)
-        real_base = Path(os.path.realpath(base))
-        kept: list[str] = []
-        for name in dirnames:
-            if Path(os.path.realpath(base / name)) == real_base / name:
-                kept.append(name)
-            else:
-                logger.warning("memory link %s skipped", base / name)
-        dirnames[:] = kept  # os.walk descends only into what is left
-        for name in filenames:
-            path = base / name
-            try:
-                regular = not path.is_symlink() and path_is_file(path)
-            except OSError as e:
-                # Named, not taken for "not a file" (Python 3.14's is_file).
-                logger.warning("memory entry %s cannot be read (%s); skipped", path, e)
-                continue
-            if not regular:
-                logger.warning("memory entry %s is not a regular file; skipped", path)
-                continue
-            if not Path(os.path.realpath(path)).is_relative_to(real_mem):
-                logger.warning("memory entry %s resolves outside memory; skipped", path)
-                continue
-            try:
-                rel = _archive_name(str(path.relative_to(memory_dir)))
-            except ValueError:
-                logger.warning("memory file %s cannot be named on the node", path)
-                continue
-            found.append((rel, path))
+    for path in walk_memory(memory_dir):
+        try:
+            rel = _archive_name(str(path.relative_to(memory_dir)))
+        except ValueError:
+            logger.warning("memory file %s cannot be named on the node", path)
+            continue
+        found.append((rel, path))
     return sorted(found)
 
 

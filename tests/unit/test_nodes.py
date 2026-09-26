@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import MISSING
 from pathlib import Path, PurePosixPath
 
@@ -2219,6 +2220,120 @@ class TestRecipeFor:
         )
         assert recipe.repos[0].url == url
         assert recipe.warnings == ()
+
+
+def _memory_of(project_dir: Path) -> Path:
+    return (
+        Path.home()
+        / ".claude"
+        / "projects"
+        / nodes.encoded_project_dir(str(project_dir))
+        / "memory"
+    )
+
+
+def _folder_link(link: Path, target: Path) -> None:
+    """A folder link at ``link`` -> ``target``: a junction on Windows -- the
+    link a standard user makes, and one ``os.walk`` descends -- else a
+    symlink."""
+    if sys.platform == "win32":
+        import _winapi  # reason: Windows-only stdlib, reached only on win32
+
+        _winapi.CreateJunction(str(target), str(link))
+        return
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("this account cannot create symlinks")
+
+
+class _Overran(Exception):
+    """Raised into a walk past its budget: not an OSError, so no onerror
+    swallows it, and a pin that fails stops the walk instead of hanging."""
+
+
+def _within(monkeypatch, seconds: float, work):
+    """``work()``, or None when it had not returned within ``seconds``: every
+    ``os.scandir`` past the budget raises ``_Overran``."""
+    deadline = time.monotonic() + seconds
+    real_scandir = os.scandir
+
+    def scandir(path: object = ".") -> object:
+        if time.monotonic() > deadline:
+            raise _Overran
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    try:
+        return work()
+    except _Overran:
+        return None
+
+
+class TestTheRecipeWalksMemoryAsThePayloadDoes:
+    """The recipe's memory warnings come from the payload's own walk: a folder
+    the payload never walks (behind a link, or memory being one) is never
+    named on screen, and a link back into memory cannot keep the walk -- which
+    runs under the node's bring-up lock -- from returning."""
+
+    def _up(self, repo: Path, state: LocalGitState) -> tuple[Recipe, list[str]]:
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second"),
+            NODE,
+            [state],
+            home=Path.home(),
+            project_dir=repo,
+        )
+        shipped = [
+            name
+            for name, _ in remote_mux._files(recipe, memory=True)
+            if name.startswith("memory/")
+        ]
+        return recipe, shipped
+
+    def test_memory_that_is_itself_a_link_is_never_walked(
+        self, repo, tmp_path, monkeypatch
+    ):
+        real = tmp_path / "real-memory"
+        (real / "sub").mkdir(parents=True)
+        (real / "MEMORY.md").write_text("- m\n", encoding="utf-8")
+        memory = _memory_of(repo)
+        memory.parent.mkdir(parents=True)
+        _folder_link(memory, real)
+        state = _real_state(repo)
+        deny_scandir(monkeypatch, memory / "sub")
+        recipe, shipped = self._up(repo, state)
+        assert (recipe.warnings, shipped) == ((), [])
+
+    def test_a_link_inside_memory_is_never_walked(self, repo, tmp_path, monkeypatch):
+        outside = tmp_path / "outside"
+        (outside / "locked").mkdir(parents=True)
+        memory = _memory_of(repo)
+        memory.mkdir(parents=True)
+        (memory / "MEMORY.md").write_text("- m\n", encoding="utf-8")
+        _folder_link(memory / "elsewhere", outside)
+        state = _real_state(repo)
+        deny_scandir(monkeypatch, memory / "elsewhere" / "locked")
+        recipe, shipped = self._up(repo, state)
+        assert (recipe.warnings, shipped) == ((), ["memory/MEMORY.md"])
+
+    @pytest.mark.parametrize("links", [("a",), ("a", "b")])
+    def test_a_link_back_into_memory_still_returns(self, repo, monkeypatch, links):
+        # Descended, one link back is a path that grows until the OS refuses
+        # it (a garbage warning); two double the folders at every level, and
+        # the walk never returns.
+        memory = _memory_of(repo)
+        memory.mkdir(parents=True)
+        (memory / "MEMORY.md").write_text("- m\n", encoding="utf-8")
+        for name in links:
+            _folder_link(memory / name, memory)
+        state = _real_state(repo)
+        start = time.monotonic()
+        walked = _within(monkeypatch, 2.0, lambda: self._up(repo, state))
+        assert walked is not None, "the memory walk did not return within 2s"
+        assert time.monotonic() - start < 2.0
+        recipe, shipped = walked
+        assert (recipe.warnings, shipped) == ((), ["memory/MEMORY.md"])
 
 
 D_NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")

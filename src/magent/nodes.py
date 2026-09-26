@@ -35,7 +35,7 @@ from magent.sessions.claude import encode_claude_project_path
 from magent.titles import get_leaf_name
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
     from magent.config import MagentConfig, ProjectConfig
 
@@ -1255,31 +1255,106 @@ def refusal_for(state: LocalGitState, *, allow_dirty: bool = False) -> str | Non
     return None
 
 
+def memory_is_link(memory: Path) -> bool:
+    """Is the memory folder ``memory`` itself a link? Decided by ``realpath``:
+    resolving it must change nothing but its parent's own resolution -- so a
+    link ABOVE it (a dotfiles ``~/.claude``) is not one, and a Windows
+    junction, which is no symlink to pathlib, is."""
+    real = Path(os.path.realpath(memory))
+    return real != Path(os.path.realpath(memory.parent)) / memory.name
+
+
+def walk_memory(
+    memory: Path, unreadable: Callable[[Path, OSError], None] | None = None
+) -> Iterator[Path]:
+    """Every REGULAR file under the memory folder ``memory`` that may ship, in
+    walk order. THE memory walk: the payload's (``remote_mux._memory_files``)
+    and the recipe's (``_memory_state``) are this one, so the recipe can only
+    ever name what the payload walks. A link is never followed -- not a file
+    link, not a folder link, and not ``memory`` itself being one (nothing is
+    walked): the folder is Claude's, and a link in it can name ``~/.ssh``.
+
+    "A link" is decided by ``realpath``, not ``is_symlink``: a Windows
+    junction -- which any standard user can make -- is not a symlink to
+    pathlib, and ``os.walk(followlinks=False)`` descends into one (a junction
+    back to ``memory`` would keep it from ever returning). A subfolder is kept
+    only when resolving it changes nothing but its parent's own resolution:
+    then it is no link and, folder by folder, lies inside ``memory``'s
+    realpath. Every file must resolve inside the resolved folder too.
+
+    What is skipped is logged, never raised: a bring-up never fails because
+    of memory. A folder that cannot be listed is also handed to
+    ``unreadable``, with its error."""
+    log = get_logger("nodes")
+    if memory_is_link(memory):
+        log.warning("memory folder %s is a link; no memory shipped", memory)
+        return
+    real_mem = Path(os.path.realpath(memory))
+
+    def cannot_list(exc: OSError) -> None:
+        # os.walk's default is to skip a folder it cannot list in silence.
+        where = Path(exc.filename) if exc.filename else memory
+        log.warning("memory folder %s cannot be read; skipped: %s", where, exc)
+        if unreadable is not None:
+            unreadable(where, exc)
+
+    for dirpath, dirnames, filenames in os.walk(memory, onerror=cannot_list):
+        base = Path(dirpath)
+        real_base = Path(os.path.realpath(base))
+        kept: list[str] = []
+        for name in dirnames:
+            if Path(os.path.realpath(base / name)) == real_base / name:
+                kept.append(name)
+            else:
+                log.warning("memory link %s skipped", base / name)
+        dirnames[:] = kept  # os.walk descends only into what is left
+        for name in filenames:
+            path = base / name
+            try:
+                regular = not path.is_symlink() and path_is_file(path)
+            except OSError as exc:
+                # Named, not taken for "not a file" (Python 3.14's is_file).
+                log.warning("memory file %s cannot be read; skipped: %s", path, exc)
+                continue
+            if not regular:
+                log.warning("memory entry %s is not a regular file; skipped", path)
+                continue
+            if not Path(os.path.realpath(path)).is_relative_to(real_mem):
+                log.warning("memory entry %s resolves outside memory; skipped", path)
+                continue
+            yield path
+
+
 def _memory_state(memory: Path) -> tuple[bool, tuple[str, ...]]:
     """Whether the memory folder ``memory`` ships, and one warning per part of
     it that cannot be read. Never raises: a bring-up never fails because of
     memory, and nor does an unreadable folder pass for none -- each is named,
-    class only, with the path and the full error in nodes.log. The walk is the
-    payload's own (``remote_mux._memory_files``, whose onerror logs the same
-    folders); run here, its warnings reach the screen with the recipe's."""
-    log = get_logger("nodes")
-    folder_warning = "memory: cannot be read ({}); no memory shipped"
+    class only, with the path and the full error in nodes.log. The walk IS
+    the payload's (``walk_memory``), so nothing the payload never walks --
+    behind a link, or ``memory`` being one -- is ever named; run here, its
+    warnings reach the screen with the recipe's."""
+
+    def none_shipped(exc: OSError) -> tuple[bool, tuple[str, ...]]:
+        return False, (
+            f"memory: cannot be read ({type(exc).__name__}); no memory shipped",
+        )
+
     try:
         if not path_is_dir(memory):
             return False, ()
     except OSError as exc:
-        log.warning("memory folder %s: %s", memory, exc)
-        return False, (folder_warning.format(type(exc).__name__),)
-    errors: list[OSError] = []
-    for _ in os.walk(memory, onerror=errors.append):
+        get_logger("nodes").warning(
+            "memory folder %s cannot be read; skipped: %s", memory, exc
+        )
+        return none_shipped(exc)
+    unread: list[tuple[Path, OSError]] = []
+    for _ in walk_memory(memory, lambda where, exc: unread.append((where, exc))):
         pass
     warned: list[str] = []
-    for exc in errors:
-        log.warning("memory folder %s: %s", exc.filename, exc)
-        where = Path(exc.filename) if exc.filename else memory
+    for where, exc in unread:
         if where == memory:
-            return False, (folder_warning.format(type(exc).__name__),)
-        # os.walk names every folder by joining onto ``memory``.
+            return none_shipped(exc)
+        # walk_memory names every folder by joining onto ``memory``.
         rel = (
             where.relative_to(memory).as_posix()
             if where.is_relative_to(memory)
