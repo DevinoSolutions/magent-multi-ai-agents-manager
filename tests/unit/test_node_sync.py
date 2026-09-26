@@ -11,6 +11,7 @@ import ast
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -1343,6 +1344,23 @@ class TestHostileClocksAndValues:
         node_sync.NodeSyncer(_second_only(), pull=pull).tick()
         assert _marks() == {"api": {"since": 0.0, "realpath": "/r"}}
 
+    def test_a_truncated_reply_moves_the_mark_to_its_resume_point(self, placed):
+        """E8's rule through the tick (remote_mux.next_since): holding the
+        mark would ask for the same files, cut the same way, every tick."""
+        _seed_marks(api=(10.0, "/r"))
+
+        def pull(_node, _sids):
+            return _snapshot(
+                realpaths={"api": "/r"},
+                truncated={"api": ("api/transcripts/b.jsonl",)},
+                resume={"api": 500.0},
+            )
+
+        node_sync.NodeSyncer(_second_only(), pull=pull).tick()
+        assert _marks() == {
+            "api": {"since": math.nextafter(500.0, -math.inf), "realpath": "/r"}
+        }
+
     def test_a_pc_clock_that_steps_back_does_not_starve_samples(self, placed):
         clock = iter([1000.0, 900.0])
 
@@ -2456,6 +2474,49 @@ class TestAFinalPullThatDidNotFinish:
         with pytest.raises(remote_mux.RemoteError, match="could not store"):
             node_sync.final_pull(_config(), "api")
         assert len(asked) == 2
+
+    def test_a_reply_cut_at_the_pull_cap_raises_with_the_mark_at_its_resume(
+        self, placed, monkeypatch
+    ):
+        """E8's truncated reply is not the last turn home: final_pull raises,
+        and the mark it leaves resumes where the reply stopped."""
+        _seed_marks(api=(10.0, _REAL))
+        asked = _scripted_pull(
+            monkeypatch,
+            _snapshot(
+                realpaths={"api": _REAL},
+                truncated={"api": ("api/transcripts/b.jsonl",)},
+                resume={"api": 500.0},
+            ),
+        )
+        with pytest.raises(
+            remote_mux.RemoteError, match="reached the pull cap"
+        ) as info:
+            node_sync.final_pull(_config(), "api")
+        assert info.value.rc == 0
+        assert len(asked) == 1
+        assert _marks() == {
+            "api": {"since": math.nextafter(500.0, -math.inf), "realpath": _REAL}
+        }
+
+    def test_a_cut_first_call_does_not_count_when_the_second_asks_again(
+        self, placed, monkeypatch
+    ):
+        """The second call asks for everything from 0.0, so only its answer
+        says whether every file is home."""
+        asked = _scripted_pull(
+            monkeypatch,
+            _snapshot(
+                realpaths={"api": _REAL},
+                truncated={"api": ("api/state/x.json",)},
+                resume={"api": 1.0},
+            ),
+            _snapshot(realpaths={"api": _REAL}),
+        )
+        result = node_sync.final_pull(_config(), "api")
+        assert len(asked) == 2
+        assert result is not None
+        assert result.since == 9000.0 - remote_mux.WATERMARK_OVERLAP_S
 
     def test_a_root_the_node_cannot_resolve_is_logged_and_the_pull_returns(
         self, placed, monkeypatch, caplog

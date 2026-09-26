@@ -417,26 +417,15 @@ def _next_mark(
       put (a failed file is asked for again next tick);
     - its transcripts were never requested under the current real path (a
       first sight, a moved directory): from zero;
-    - otherwise: from the node's own clock at scan time, minus the overlap
-      (``_since_after``)."""
+    - otherwise: ``remote_mux.next_since``, the watermark rule ``pull``
+      shares -- the node's clock at scan time minus the overlap, a truncated
+      reply's resume point, or 0.0 when the node's clock is behind the mark."""
     real = snap.realpaths.get(sid)
     if real is None or sid in snap.failed_sids:
         return old if old is not None else Mark(since=0.0, realpath=real)
     if spec.project_dir is None or old is None or old.realpath != real:
         return Mark(since=0.0, realpath=real)
-    return Mark(since=_since_after(old.since, snap.now), realpath=real)
-
-
-def _since_after(old_since: float, node_now: float) -> float:
-    """The next watermark from the node's scan clock, minus the overlap. A
-    node clock that jumped forward and came back leaves ``old_since`` in its
-    future, and files stamped before it would never be asked for again: a
-    watermark that would move BACKWARDS starts the transcripts over from 0.0.
-
-    After the E8 x E14 merge, ``_next_mark`` delegates to
-    ``remote_mux.next_since`` and this reset belongs inside it."""
-    since = node_now - remote_mux.WATERMARK_OVERLAP_S
-    return 0.0 if since < old_since else since
+    return Mark(since=remote_mux.next_since(snap, sid, old.since), realpath=real)
 
 
 def _prune_state(nick: str, sid: str, keep: Collection[str]) -> None:
@@ -965,9 +954,11 @@ def final_pull(
     empty remote root) is refused as RemoteError(0) before any ssh, so the
     caller never sees parse_pull's ValueError. A pull that could not store
     every file is RemoteError(0) too: returning would tell ``down`` the last
-    turn is home when it is not. A node that reports no real path for the
-    session's root (a deleted project) returns normally with a warning -- no
-    later pull could do better."""
+    turn is home when it is not. So is one whose reply was cut at
+    ``remote_mux.PULL_MAX_TOTAL_BYTES``; its mark is already at the resume
+    point, so another final pull (or a tick) carries on from there. A node
+    that reports no real path for the session's root (a deleted project)
+    returns normally with a warning -- no later pull could do better."""
     entry = nodes.read_node_map().get(name)
     if entry is None:
         return None
@@ -997,6 +988,13 @@ def final_pull(
     if any(entry.sid in s.failed_sids for s in snaps):
         raise remote_mux.RemoteError(
             0, f"could not store every pulled file of {entry.sid!r}", ("pull.sh",)
+        )
+    # Only the last call counts: a second call asks for everything again.
+    if entry.sid in snaps[-1].truncated:
+        raise remote_mux.RemoteError(
+            0,
+            f"the reply for {entry.sid!r} reached the pull cap; the rest is owed",
+            ("pull.sh",),
         )
     if spec.project_dir is None:
         get_logger(LOG_NAME).warning(

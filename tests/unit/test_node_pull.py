@@ -7,12 +7,14 @@ import gzip
 import io
 import json
 import logging
+import math
 import os
 import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
+from pathlib import Path
 
 import pytest
 
@@ -21,8 +23,10 @@ from magent.nodes import LoadSample, Node, encoded_project_dir
 from magent.remote_mux import (
     PULL_HEADER,
     PULL_TRAILER,
+    WATERMARK_OVERLAP_S,
     RemoteError,
     SidPull,
+    next_since,
     parse_pull,
 )
 from tests.unit._pull_reply import (
@@ -287,6 +291,160 @@ class TestWhatTheNodeSkipped:
         assert _parse(pull_reply(meta), tmp_path / "second").skipped == seen
 
 
+class TestWhatTheNodeCouldNotRead:
+    """pull.sh names a file it could not read (any errno but ENOENT) under
+    ``unreadable``, the same shape as ``skipped``: reported, never silent,
+    and not a failure -- a file that stays unreadable would freeze the
+    watermark."""
+
+    def test_an_unreadable_file_is_reported_and_its_session_does_not_fail(
+        self, tmp_path
+    ):
+        meta = pull_meta(
+            unreadable={
+                "api": ["api/transcripts/locked.jsonl"],
+                "web": ["web/transcripts/w.jsonl"],
+            }
+        )
+        snap = _parse(pull_reply(meta), tmp_path / "second")
+        assert snap.unreadable == {"api": ("api/transcripts/locked.jsonl",)}
+        assert snap.skipped == {}
+        assert snap.failed_sids == frozenset()
+
+    @pytest.mark.parametrize(
+        ("raw", "seen"),
+        [
+            ("missing", {}),
+            ("api", {}),
+            ({"api": "a.jsonl"}, {}),
+            ({"api": ["a.jsonl", 3]}, {"api": ("a.jsonl",)}),
+        ],
+    )
+    def test_a_malformed_unreadable_list_is_ignored(self, tmp_path, raw, seen):
+        meta = pull_meta() if raw == "missing" else pull_meta(unreadable=raw)
+        assert _parse(pull_reply(meta), tmp_path / "second").unreadable == seen
+
+
+class TestWhatDidNotFit:
+    """pull.sh keeps its whole reply under ``max_total_bytes`` and names what
+    did not fit under ``truncated`` (the ``skipped`` shape), with each such
+    session's ``resume`` mtime -- a valid reply, never one the PC kills."""
+
+    def test_the_rest_is_named_with_where_to_resume(self, tmp_path):
+        meta = pull_meta(
+            truncated={
+                "api": ["api/transcripts/b.jsonl"],
+                "web": ["web/transcripts/w.jsonl"],
+            },
+            resume={"api": 2000.5, "web": 7.0},
+        )
+        snap = _parse(pull_reply(meta), tmp_path / "second")
+        assert snap.truncated == {"api": ("api/transcripts/b.jsonl",)}
+        assert snap.resume == {"api": 2000.5}
+        assert snap.failed_sids == frozenset()
+
+    def test_an_older_node_reply_has_nothing_truncated(self, tmp_path):
+        snap = _parse(pull_reply(pull_meta()), tmp_path / "second")
+        assert (snap.truncated, snap.resume) == ({}, {})
+
+    @pytest.mark.parametrize(
+        ("raw", "seen"),
+        [
+            ("later", {}),
+            ({"api": "later"}, {}),
+            ({"api": True}, {}),
+            ({"api": None}, {}),
+            ({"api": 12}, {"api": 12.0}),
+            ([2000.0], {}),
+            # json.loads accepts NaN and Infinity: never a watermark.
+            ({"api": float("nan")}, {}),
+            ({"api": float("inf")}, {}),
+            ({"api": float("-inf")}, {}),
+        ],
+    )
+    def test_a_resume_that_is_not_a_time_is_dropped(self, tmp_path, raw, seen):
+        meta = pull_meta(truncated={"api": ["api/transcripts/b.jsonl"]}, resume=raw)
+        assert _parse(pull_reply(meta), tmp_path / "second").resume == seen
+
+
+def _outcome(
+    now: float = 5000.0, *, failed=(), truncated=None, resume=None, **reports
+) -> remote_mux.NodeSnapshot:
+    return remote_mux.NodeSnapshot(
+        now=now,
+        sessions=("api",),
+        sample=None,
+        realpaths={},
+        state_files={},
+        files=(),
+        failed_sids=frozenset(failed),
+        truncated=truncated or {},
+        resume=resume or {},
+        **reports,
+    )
+
+
+_TRUNCATED = {"api": ("api/transcripts/b.jsonl",)}
+
+
+class TestNextSince:
+    """The ONE watermark rule ``pull`` uses and the sync daemon can share."""
+
+    def test_a_complete_reply_moves_to_the_nodes_clock_less_the_overlap(self):
+        assert next_since(_outcome(), "api", 42.0) == 5000.0 - WATERMARK_OVERLAP_S
+
+    def test_a_file_that_could_not_be_stored_holds_it(self):
+        assert next_since(_outcome(failed=["api"]), "api", 42.0) == 42.0
+
+    def test_a_failure_holds_it_even_when_the_reply_was_also_truncated(self):
+        snap = _outcome(failed=["api"], truncated=_TRUNCATED, resume={"api": 900.0})
+        assert next_since(snap, "api", 42.0) == 42.0
+
+    def test_skipped_and_unreadable_files_do_not_hold_it(self):
+        snap = _outcome(
+            skipped={"api": ("api/transcripts/huge.jsonl",)},
+            unreadable={"api": ("api/transcripts/locked.jsonl",)},
+        )
+        assert next_since(snap, "api", 42.0) == 5000.0 - WATERMARK_OVERLAP_S
+
+    def test_a_truncated_reply_resumes_at_its_oldest_file_left_out(self):
+        # Holding 42.0 would ask for the same files, which would fit the same
+        # way, on every tick: the livelock the total cap exists to end.
+        since = next_since(
+            _outcome(truncated=_TRUNCATED, resume={"api": 900.0}), "api", 42.0
+        )
+        assert 42.0 < since < 900.0
+        # pull.sh asks `mtime > since`: the file AT the resume mtime is owed.
+        assert since == math.nextafter(900.0, -math.inf)
+
+    def test_a_resume_past_the_scan_moves_no_further_than_a_complete_reply(self):
+        # A file rewritten after the scan began has an mtime past `now`; the
+        # complete rule's value still asks for it.
+        snap = _outcome(truncated=_TRUNCATED, resume={"api": 5000.5})
+        assert next_since(snap, "api", 42.0) == 5000.0 - WATERMARK_OVERLAP_S
+
+    def test_a_truncated_reply_without_a_resume_holds_it(self):
+        assert next_since(_outcome(truncated=_TRUNCATED), "api", 42.0) == 42.0
+
+    def test_a_resume_behind_the_old_watermark_never_moves_it_back(self):
+        snap = _outcome(truncated=_TRUNCATED, resume={"api": 10.0})
+        assert next_since(snap, "api", 42.0) == 42.0
+
+    def test_a_node_clock_behind_the_watermark_starts_over(self):
+        # E12's rule, moved here by the E8 x E14 merge: files stamped before
+        # a mark left in the node's future would never be asked for again.
+        assert next_since(_outcome(now=3000.0), "api", 4999.0) == 0.0
+        snap = _outcome(3000.0, truncated=_TRUNCATED, resume={"api": 3500.0})
+        assert next_since(snap, "api", 4999.0) == 0.0
+
+    def test_a_clock_exactly_at_the_watermark_is_not_behind_it(self):
+        since = 5000.0 - WATERMARK_OVERLAP_S
+        assert next_since(_outcome(), "api", since) == since
+
+    def test_a_failure_holds_it_even_with_the_node_clock_behind(self):
+        assert next_since(_outcome(3000.0, failed=["api"]), "api", 4999.0) == 4999.0
+
+
 def _two_member_reply() -> tuple[bytes, int]:
     """A reply holding api/transcripts/a.jsonl then b.jsonl (1 byte each),
     and the offset where the second member's header block starts."""
@@ -542,6 +700,49 @@ class TestWhatLandsAndHow:
         assert dst == str(final)
         # The tmp file is a sibling of its target: inside dest, same volume.
         assert os.path.dirname(src) == str(final.parent)
+        # ...and its name never grows with the target's (see the NAME_MAX pin).
+        tmp = os.path.basename(src)
+        assert tmp.startswith(".")
+        assert tmp.endswith(".part")
+        assert "a.jsonl" not in tmp
+
+    def test_a_failed_write_leaves_no_part_behind(self, tmp_path, monkeypatch):
+        synced: list[int] = []
+
+        def _eio(fd):
+            synced.append(fd)
+            raise OSError(5, "Input/output error")
+
+        # Only _write_file fsyncs in magent, so this reaches nothing else.
+        monkeypatch.setattr(remote_mux.os, "fsync", _eio)
+        dest = tmp_path / "second"
+        reply = pull_bytes(pull_meta(), [member("api/transcripts/a.jsonl", b"data")])
+        snap = parse_pull(reply, dest=dest, sids=frozenset({"api"}))
+        assert synced
+        assert snap.failed_sids == frozenset({"api"})
+        assert snap.files == ()
+        # rglob sees dot-files: no half-written ".<random>.part" either.
+        assert _stored(dest) == []
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="MAX_PATH, not NAME_MAX, bounds a Windows path"
+    )
+    def test_a_node_filename_near_name_max_is_stored(self, tmp_path):
+        # The temp was once "<name>.<pid>.<thread ident>.part", ~29 bytes over
+        # the name: a 240-byte node filename failed ENAMETOOLONG, the whole sid
+        # failed, and its held watermark failed it again on every tick.
+        name = "n" * 234 + ".jsonl"
+        assert len(name.encode()) == 240
+        reply = pull_bytes(
+            pull_meta(),
+            [member(f"api/transcripts/{name}", b"long")],
+            fmt=tarfile.PAX_FORMAT,  # past ustar's 100 bytes, as pull.sh writes it
+        )
+        dest = tmp_path / "second"
+        snap = parse_pull(reply, dest=dest, sids=frozenset({"api"}))
+        assert snap.failed_sids == frozenset()
+        assert _stored(dest) == [f"api/transcripts/{name}"]
+        assert (dest / "api" / "transcripts" / name).read_bytes() == b"long"
 
 
 class TestTheRequestedSidsAreChecked:
@@ -656,6 +857,7 @@ class TestPullNode:
                 "api": {"roots": ["~/magent/api"], "project_dir": None, "since": 0.0}
             },
             "max_member_bytes": remote_mux.PULL_MAX_MEMBER_BYTES,
+            "max_total_bytes": remote_mux.PULL_MAX_TOTAL_BYTES,
         }
         assert snap.sessions == ("api",)
 
@@ -685,6 +887,12 @@ class TestPullNode:
         with pytest.raises(RemoteError, match="reply exceeded 1024 bytes") as info:
             remote_mux.pull_node(NODE, {}, dest=tmp_path)
         assert info.value.rc is None
+
+    def test_the_node_is_asked_to_stay_under_what_this_pc_will_hold(self):
+        # pull.sh keeps its whole reply under max_total_bytes; the PC's cap
+        # adds room only for what the script cannot count (an rc banner).
+        margin = remote_mux.PULL_MAX_REPLY_BYTES - remote_mux.PULL_MAX_TOTAL_BYTES
+        assert 0 < margin <= 8 * 1024 * 1024
 
 
 class TestPull:
@@ -761,6 +969,116 @@ class TestPull:
         assert result.since == 5000.0 - remote_mux.WATERMARK_OVERLAP_S
 
 
+REAL = "/home/amin/magent/api"
+
+
+def _snap(
+    now: float,
+    *,
+    files=(),
+    failed=(),
+    realpath: str | None = REAL,
+    resume: float | None = None,
+) -> remote_mux.NodeSnapshot:
+    """``resume`` set: the reply was truncated, oldest file left out at it."""
+    return remote_mux.NodeSnapshot(
+        now=now,
+        sessions=("api",),
+        sample=None,
+        realpaths={} if realpath is None else {"api": realpath},
+        state_files={},
+        files=tuple(files),
+        failed_sids=frozenset(failed),
+        truncated={} if resume is None else _TRUNCATED,
+        resume={} if resume is None else {"api": resume},
+    )
+
+
+class TestTheWatermarkRuleIsPerCall:
+    """``pull``'s two calls answered separately (a scripted ``pull_node``, no
+    ssh): a failure in EITHER call holds the watermark, and a call that
+    raises ends ``pull`` with no result. One reply answering both calls
+    could not tell the two failure branches apart."""
+
+    @pytest.fixture
+    def script(self, monkeypatch):
+        """Queue what each pull_node call answers (a NodeSnapshot, or an
+        exception to raise); returns the SidPull each call was asked for."""
+        answers: list[remote_mux.NodeSnapshot | Exception] = []
+        asked: list[SidPull] = []
+
+        def fake(node, sids, *, dest=None, timeout_s=remote_mux.PULL_TIMEOUT_S):
+            assert node == NODE
+            (spec,) = sids.values()
+            asked.append(spec)
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        monkeypatch.setattr(remote_mux, "pull_node", fake)
+
+        def load(*queued):
+            answers.extend(queued)
+            return asked
+
+        return load
+
+    def test_both_calls_clean_moves_to_the_second_calls_clock(self, script):
+        a, b = Path("a"), Path("b")
+        asked = script(_snap(100.0, files=[a]), _snap(200.0, files=[b, a]))
+        result = remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert result == remote_mux.PullResult(
+            files=(a, b), since=200.0 - remote_mux.WATERMARK_OVERLAP_S
+        )
+        assert [s.project_dir for s in asked] == [None, encoded_project_dir(REAL)]
+
+    def test_a_failure_in_the_first_call_alone_holds_the_watermark(self, script):
+        script(_snap(100.0, failed=["api"]), _snap(200.0))
+        result = remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert result.since == 42.0
+
+    def test_a_failure_in_the_second_call_alone_holds_the_watermark(self, script):
+        # The transcripts arrive in call 2: advancing past one that failed to
+        # store would lose it for good.
+        script(_snap(100.0), _snap(200.0, failed=["api"]))
+        result = remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert result.since == 42.0
+
+    def test_a_truncated_second_call_resumes_where_it_stopped(self, script):
+        script(_snap(100.0), _snap(200.0, resume=150.0))
+        result = remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert result.since == math.nextafter(150.0, -math.inf)
+
+    def test_a_truncated_first_call_alone_moves_normally(self, script):
+        # Call 1 asks for state records alone; call 2 asks for everything
+        # again, so its complete reply is the one that counts.
+        script(_snap(100.0, resume=90.0), _snap(200.0))
+        result = remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert result.since == 200.0 - remote_mux.WATERMARK_OVERLAP_S
+
+    def test_a_failed_first_call_outranks_a_truncated_second(self, script):
+        script(_snap(100.0, failed=["api"]), _snap(200.0, resume=150.0))
+        result = remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert result.since == 42.0
+
+    def test_a_second_call_that_raises_propagates_with_no_result(self, script):
+        boom = RemoteError(None, "timed out after 120s", ("ssh",))
+        asked = script(_snap(100.0), boom)
+        with pytest.raises(RemoteError) as info:
+            remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert info.value is boom
+        assert len(asked) == 2
+
+    def test_a_first_call_that_raises_makes_no_second(self, script):
+        boom = RemoteError(255, "Connection refused", ("ssh",))
+        asked = script(boom)
+        with pytest.raises(RemoteError) as info:
+            remote_mux.pull(NODE, "api", ["~/magent/api"], 42.0)
+        assert info.value is boom
+        assert len(asked) == 1
+
+
 class TestTheScriptOwnsNoSocket:
     """DECISION-3 / DECISION-26 ii, B's convention: run_script sends the socket
     as $1, lib.sh reads it into $MAGENT_SOCKET (no default) and shifts it off.
@@ -787,13 +1105,29 @@ class TestTheScriptOwnsNoSocket:
 
 
 @pytest.mark.skipif(
-    sys.platform != "linux"
-    or shutil.which("bash") is None
-    or shutil.which("python3") is None,
+    sys.platform != "linux",
     reason="pull.sh samples /proc: it runs for real on the Linux legs",
 )
 class TestPullShOnARealBash:
-    def _run(self, tmp_path, payload, *, path_env=None, socket=remote_mux.SOCKET):
+    @pytest.fixture(autouse=True)
+    def _needs_bash_and_python3(self):
+        """A Linux CI runner without bash or python3 is a provisioning bug,
+        so there it FAILS (the fleet tier's posture); a dev box skips."""
+        missing = [t for t in ("bash", "python3") if shutil.which(t) is None]
+        if missing and os.environ.get("GITHUB_ACTIONS") == "true":
+            pytest.fail(f"Linux CI runner without {', '.join(missing)}")
+        if missing:
+            pytest.skip(f"needs {', '.join(missing)}")
+
+    def _run(
+        self,
+        tmp_path,
+        payload,
+        *,
+        path_env=None,
+        socket=remote_mux.SOCKET,
+        timeout=60,
+    ):
         bash = shutil.which("bash")
         assert bash is not None
         fakebin = tmp_path / "fakebin"
@@ -815,7 +1149,12 @@ class TestPullShOnARealBash:
         )
         argv = [bash, "-s", "--"] + ([] if socket is None else [socket])
         return subprocess.run(
-            argv, input=stdin, env=env, capture_output=True, timeout=60, check=False
+            argv,
+            input=stdin,
+            env=env,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
         )
 
     def _project(self, tmp_path):
@@ -934,3 +1273,198 @@ class TestPullShOnARealBash:
         # lib.sh's message
         assert b"tmux socket name is a required first argument" in done.stderr
         assert b"MAGENT-PULL" not in done.stdout
+
+    def _pull(self, tmp_path, pdir, *, timeout=60, since=0.0, total=None, dest="pc"):
+        """Run pull.sh for api and parse its reply into tmp/<dest>."""
+        payload: dict[str, object] = {
+            "sids": {
+                "api": {"roots": ["~/magent/api"], "project_dir": pdir, "since": since}
+            }
+        }
+        if total is not None:
+            payload["max_total_bytes"] = total
+        done = self._run(tmp_path, payload, timeout=timeout)
+        assert done.returncode == 0, done.stderr.decode()
+        if total is not None:
+            assert len(done.stdout) <= total
+        return parse_pull(done.stdout, dest=tmp_path / dest, sids=frozenset({"api"}))
+
+    def test_a_backlog_past_the_total_cap_arrives_over_two_pulls(self, tmp_path):
+        # 20 kB each, ~22 kB on the wire; ~12 kB of the cap is the reply's own
+        # framing. 50 kB fits the older file alone.
+        _, pdir, proj = self._project(tmp_path)
+        for name, mtime in (("a.jsonl", 1000), ("b.jsonl", 2000)):
+            (proj / name).write_bytes(name[:1].encode("ascii") * 20_000)
+            os.utime(proj / name, (mtime, mtime))
+        first = self._pull(tmp_path, pdir, total=50_000, dest="one")
+        assert _stored(tmp_path / "one") == ["api/transcripts/a.jsonl"]
+        assert first.truncated == {"api": ("api/transcripts/b.jsonl",)}
+        assert first.resume == {"api": 2000.0}
+        assert first.failed_sids == frozenset()
+        # The next tick continues from there instead of re-asking for a.jsonl.
+        since = next_since(first, "api", 0.0)
+        # a.jsonl (mtime 1000) is now under the mark; b.jsonl (2000) is not.
+        assert 1000.0 < since < 2000.0
+        second = self._pull(tmp_path, pdir, since=since, total=50_000, dest="two")
+        assert _stored(tmp_path / "two") == ["api/transcripts/b.jsonl"]
+        assert second.truncated == {}
+        assert (tmp_path / "two" / "api" / "transcripts" / "b.jsonl").read_bytes() == (
+            b"b" * 20_000
+        )
+
+    def test_many_small_files_keep_the_whole_reply_under_the_cap(self, tmp_path):
+        # Per-member tar overhead dwarfs these files: counted all the same.
+        _, pdir, proj = self._project(tmp_path)
+        names = [f"f{i:02d}.jsonl" for i in range(60)]
+        for i, name in enumerate(names):
+            (proj / name).write_text("x" * 100, encoding="utf-8")
+            os.utime(proj / name, (1000 + i, 1000 + i))
+        snap = self._pull(tmp_path, pdir, total=30_000)
+        shipped = [p.rsplit("/", 1)[1] for p in _stored(tmp_path / "pc")]
+        left = [n.rsplit("/", 1)[1] for n in snap.truncated["api"]]
+        assert shipped
+        assert left
+        # Oldest first: everything shipped is older than everything left.
+        assert shipped + left == names
+        assert snap.resume == {"api": float(1000 + len(shipped))}
+
+    def test_a_cap_too_small_for_any_file_still_answers(self, tmp_path):
+        _, pdir, proj = self._project(tmp_path)
+        (proj / "a.jsonl").write_bytes(b"a" * 20_000)
+        snap = self._pull(tmp_path, pdir, total=15_000)
+        assert snap.files == ()
+        assert snap.truncated == {"api": ("api/transcripts/a.jsonl",)}
+
+    def test_a_name_that_is_not_utf8_ships_beside_the_rest(self, tmp_path):
+        # os.walk hands such a name over surrogate-escaped. The budget once
+        # encoded it strictly: UnicodeEncodeError, exit 1, and every session
+        # on the node failed every tick, since pull_node always sends a cap.
+        _, pdir, proj = self._project(tmp_path)
+        (proj / "good.jsonl").write_text("ok", encoding="utf-8")
+        with open(os.fsencode(proj) + b"/bad\xff\xfe.jsonl", "wb") as fh:
+            fh.write(b"bad")
+        snap = self._pull(tmp_path, pdir, total=10_000_000)
+        bad = "api/transcripts/" + os.fsdecode(b"bad\xff\xfe.jsonl")
+        assert _stored(tmp_path / "pc") == sorted([bad, "api/transcripts/good.jsonl"])
+        assert (tmp_path / "pc" / bad).read_bytes() == b"bad"
+        assert snap.truncated == {}
+
+    def test_a_240_byte_node_filename_lands_on_the_pc(self, tmp_path):
+        # Legal on the node (NAME_MAX is 255), so it must land on the PC too:
+        # a temp name derived from it once ran past NAME_MAX, and the sid's
+        # held watermark re-failed it on every tick.
+        _, pdir, proj = self._project(tmp_path)
+        name = "n" * 234 + ".jsonl"
+        assert len(name.encode()) == 240
+        (proj / name).write_bytes(b"long")
+        (proj / "short.jsonl").write_bytes(b"short")
+        snap = self._pull(tmp_path, pdir, total=10_000_000)
+        assert snap.failed_sids == frozenset()
+        assert _stored(tmp_path / "pc") == sorted(
+            [f"api/transcripts/{name}", "api/transcripts/short.jsonl"]
+        )
+        assert (tmp_path / "pc" / "api" / "transcripts" / name).read_bytes() == b"long"
+
+    def test_long_non_ascii_names_near_the_cap_never_overrun_it(self, tmp_path):
+        # Each name is past ustar's 100 bytes and not ASCII, so tar adds a
+        # PAX header per member: ~1 kB the budget must count, 15 times over
+        # -- more than the slack the stream's own padding leaves.
+        _, pdir, proj = self._project(tmp_path)
+        for i in range(15):
+            path = proj / f"{i:02d}-{'é' * 100}.jsonl"
+            path.write_bytes(b"x" * 1000)
+            os.utime(path, (1000 + i, 1000 + i))
+        full = self._run(
+            tmp_path,
+            {
+                "sids": {
+                    "api": {"roots": ["~/magent/api"], "project_dir": pdir, "since": 0}
+                }
+            },
+        )
+        assert full.returncode == 0, full.stderr.decode()
+        shipped_any = False
+        for step in range(30):
+            cap = len(full.stdout) - 97 * step
+            snap = self._pull(tmp_path, pdir, total=cap, dest=f"pc{step}")
+            shipped_any = shipped_any or bool(snap.files)
+        assert shipped_any
+
+    def test_the_names_left_out_are_reserved_before_anything_ships(self, tmp_path):
+        # 400 long names: their `truncated` listing alone is ~90 kB of the
+        # metadata line, which is written before the archive. Without the
+        # up-front reserve the members fill the budget and the listing
+        # pushes the reply past the cap.
+        _, pdir, proj = self._project(tmp_path)
+        for i in range(400):
+            path = proj / f"{i:03d}-{'n' * 190}.jsonl"
+            path.write_bytes(b"x" * 100)
+            os.utime(path, (1000 + i, 1000 + i))
+        snap = self._pull(tmp_path, pdir, total=150_000)
+        assert snap.files
+        assert len(snap.truncated["api"]) > 300
+
+    def test_a_fifo_a_link_or_a_huge_file_in_the_state_store_is_never_read(
+        self, tmp_path
+    ):
+        # Before the fix the FIFO blocked json.load until the pull timed out,
+        # and the /dev/zero link was read without end.
+        real, pdir, _ = self._project(tmp_path)
+        state = tmp_path / "node" / ".magent" / "state"
+        state.mkdir(parents=True)
+        os.mkfifo(state / "fifo.json")
+        (state / "zero.json").symlink_to("/dev/zero")
+        (state / "huge.json").write_text(
+            json.dumps({"cwd": real, "pad": "x" * 70_000}), encoding="utf-8"
+        )
+        (state / "ok.json").write_text(
+            json.dumps({"state": "working", "ts": 1, "cwd": real}), encoding="utf-8"
+        )
+        snap = self._pull(tmp_path, pdir, timeout=20)
+        assert snap.state_files == {"api": ("ok.json",)}
+        assert _stored(tmp_path / "pc") == ["api/state/ok.json"]
+
+    def test_only_regular_transcript_files_ship(self, tmp_path):
+        _, pdir, proj = self._project(tmp_path)
+        secret = tmp_path / "node" / "secret"
+        secret.write_text("secret", encoding="utf-8")
+        (proj / "a.jsonl").write_text("a", encoding="utf-8")
+        (proj / "link.jsonl").symlink_to(secret)
+        os.mkfifo(proj / "pipe.jsonl")
+        snap = self._pull(tmp_path, pdir, timeout=20)
+        assert _stored(tmp_path / "pc") == ["api/transcripts/a.jsonl"]
+        assert snap.unreadable == {}
+
+    def test_a_symlinked_project_dir_is_never_followed(self, tmp_path):
+        _, pdir, proj = self._project(tmp_path)
+        proj.rmdir()
+        keys = tmp_path / "node" / ".ssh"
+        keys.mkdir()
+        (keys / "id_ed25519").write_text("secret", encoding="utf-8")
+        proj.symlink_to(keys, target_is_directory=True)
+        snap = self._pull(tmp_path, pdir)
+        assert snap.files == ()
+        assert _stored(tmp_path / "pc") == []
+
+    def test_a_file_or_dir_this_user_cannot_read_is_named_unreadable(self, tmp_path):
+        if os.geteuid() == 0:
+            pytest.skip("root reads a mode-0 file: no EACCES to provoke")
+        _, pdir, proj = self._project(tmp_path)
+        (proj / "ok.jsonl").write_text("ok", encoding="utf-8")
+        locked = proj / "locked.jsonl"
+        locked.write_text("no", encoding="utf-8")
+        sub = proj / "sub"
+        sub.mkdir()
+        (sub / "x.jsonl").write_text("no", encoding="utf-8")
+        locked.chmod(0)
+        sub.chmod(0)
+        try:
+            snap = self._pull(tmp_path, pdir)
+        finally:
+            sub.chmod(0o700)
+            locked.chmod(0o600)
+        assert snap.unreadable == {
+            "api": ("api/transcripts/locked.jsonl", "api/transcripts/sub")
+        }
+        assert snap.failed_sids == frozenset()
+        assert _stored(tmp_path / "pc") == ["api/transcripts/ok.jsonl"]
