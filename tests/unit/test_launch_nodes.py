@@ -979,6 +979,17 @@ class TestStoppingNodeSessions:
         assert kills[0] == [("second", "api")]
         assert nodes.read_node_map() == {}
 
+    def test_an_unrecorded_kill_never_takes_the_map_lock(
+        self, rig, api, kills, monkeypatch
+    ):
+        # No entry, nothing to clear: a torn or held map is never touched.
+        writes: list[str] = []
+        monkeypatch.setattr(
+            nodes, "update_node_map", lambda name, entry, **_k: writes.append(name)
+        )
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert writes == []
+
     def test_an_auto_project_that_was_never_placed_is_skipped(
         self, rig, tmp_path, kills
     ):
