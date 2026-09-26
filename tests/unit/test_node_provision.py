@@ -5,6 +5,7 @@ bash on POSIX; the pool is Linux)."""
 
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import os
@@ -21,6 +22,7 @@ import pytest
 
 from magent import cli, node_scripts, nodes, remote_mux
 from magent.cli import hooks_cmd
+from magent.config import MagentConfig
 from magent.nodes import Node, UserScope
 from magent.remote_mux import ProvisionReport, RemoteError, ScriptLine
 from tests.unit._fake_ssh import FakeCall, FakeSsh, gh_auth_status, make_fake_ssh
@@ -4017,3 +4019,51 @@ class TestDoctorCall:
             NODE.target,
         )
         assert shown[-1] == f"<stdin: {len(call.stdin)} bytes>"
+
+
+class TestProvisionNode:
+    def test_it_ships_the_scope_it_builds_from_home(self, fake_ssh, tmp_path):
+        home = _pc_home(tmp_path, settings={"model": "opus"})
+        remote_mux.provision_node(
+            NODE,
+            MagentConfig(projects=[]),
+            home=home,
+            timeout_s=remote_mux.PROVISION_TIMEOUT_S,
+        )
+        (call,) = fake_ssh.calls()
+        assert call.argv[-1] == _remote("bash", "-s", "--", remote_mux.SOCKET)
+        _, _, data = _unpack(_sent(call))
+        assert json.loads(data["settings.json"]) == {"model": "opus"}
+
+    def test_force_reaches_the_script(self, fake_ssh, tmp_path):
+        remote_mux.provision_node(
+            NODE,
+            MagentConfig(projects=[]),
+            home=_pc_home(tmp_path),
+            timeout_s=remote_mux.PROVISION_TIMEOUT_S,
+            force=True,
+        )
+        (call,) = fake_ssh.calls()
+        assert call.argv[-1] == _remote(
+            "bash", "-s", "--", remote_mux.SOCKET, "--force"
+        )
+
+    def test_the_timeout_is_mandatory(self, fake_ssh, tmp_path):
+        # fake_ssh: were the timeout ever given a default, the call must go
+        # through and fail "DID NOT RAISE", not stop at the refused real ssh.
+        with pytest.raises(TypeError):
+            remote_mux.provision_node(
+                NODE, MagentConfig(projects=[]), home=_pc_home(tmp_path)
+            )
+
+    def test_src_builds_a_user_scope_in_exactly_one_place(self):
+        # DECISION-24. Plan K deletes this pin and adds its own when it swaps
+        # the line for mcp_relay.node_user_scope(config.settings, home).
+        src = Path(remote_mux.__file__).parent
+        hits = [
+            (path.relative_to(src).as_posix(), text.count("nodes.user_scope("))
+            for path in sorted(src.rglob("*.py"))
+            if "nodes.user_scope(" in (text := path.read_text(encoding="utf-8"))
+        ]
+        assert hits == [("remote_mux.py", 1)]
+        assert "nodes.user_scope(" in inspect.getsource(remote_mux.provision_node)

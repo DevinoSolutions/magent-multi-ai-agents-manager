@@ -516,6 +516,26 @@ def _select_targets(pool: list[str], names: tuple[str, ...]) -> list[str]:
     return [n for n in pool if n.lower() in wanted]
 
 
+def _node_orphan_targets(
+    cfg: MagentConfig, group: str | None, names: tuple[str, ...]
+) -> list[str]:
+    """The in-scope node projects' session ids, for a LOCAL `down` to kill.
+
+    A node project runs on its node, so ``psmux_status`` never lists it. But a
+    project that ran HERE before it gained a ``node`` left its local psmux
+    session behind, and no other surface can reach that session any more.
+    ``nodes.node_sid`` is the derivation ``eligible_projects`` uses, so the id
+    cannot drift; ``config.py`` refuses a local project sharing it, so this
+    never kills a local project's session. A socket with no server is a no-op
+    kill and the re-probe claims nothing for it.
+    """
+    from magent import nodes  # leaf, in-body: keeps `magent --help` off its imports
+
+    return _select_targets(
+        [nodes.node_sid(p) for p in nodes.node_projects(cfg, group)], names
+    )
+
+
 @main.command("down")
 @click.argument("names", nargs=-1)
 @click.option("-g", "--group", default=None, help="Only sessions in this group")
@@ -576,6 +596,10 @@ def down_cmd(
     targets = _select_targets(
         [_as_str(p.get("session")) or _as_str(p.get("name")) for p in projects], names
     )
+    # Only a LOCAL down reaches them: the remote branch forwards the command,
+    # and the host runs this same rule against its own config. The `not in`
+    # is belt-and-braces: load_config refuses a node sid shared with a local one.
+    targets += [s for s in _node_orphan_targets(cfg, group, names) if s not in targets]
 
     remote = _down_host(host, live)
     remote_rc = 0

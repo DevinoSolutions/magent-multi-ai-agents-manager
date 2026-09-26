@@ -15,7 +15,8 @@ local git reads a bring-up needs. Every function returns data or raises
 - ``BatchMode=yes`` everywhere: a password prompt nobody can answer is a hang.
 
 A leaf: never imports ``magent.cli`` (LS-A-001); its magent imports are the
-leaves ``attach_client``, ``log``, ``node_scripts`` and ``nodes``.
+leaves ``attach_client``, ``env``, ``log``, ``node_scripts``, ``nodes``,
+``psmux`` and ``sessions``.
 """
 
 from __future__ import annotations
@@ -32,31 +33,44 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tarfile
 import threading
 import time
+import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from magent import node_scripts
+from magent import node_scripts, nodes, psmux
+
+# find_ssh is bound by value, not read off attach_client at call time: the
+# conftest guard answers None for attach_client.find_ssh, and this module's own
+# find_ssh is the seam every remote_mux test fakes (fake_ssh repoints it).
 from magent.attach_client import SSH_MISSING_RC, SSH_TRANSPORT_RC, TMUX_SOCKET
+from magent.attach_client import find_ssh as _find_ssh_client
+from magent.env import git_child_env
 from magent.log import get_logger
 from magent.nodes import (
     LoadSample,
+    LocalGitState,
+    NodeConfigError,
+    absolute_remote,
     encoded_project_dir,
     node_dir,
     stdio_programs,
     without_missing_programs,
 )
+from magent.sessions import build_resume_command
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Iterable, Mapping, Sequence
-    from pathlib import Path
     from typing import IO
 
-    from magent.nodes import Node, UserScope
+    from magent.config import MagentConfig
+    from magent.nodes import Node, Recipe, UserScope
 
 # tmux, not psmux: nodes are Linux. One server per node user (`-L magent`,
 # D10). The name has one owner, attach_client, whose pane attaches to it; this
@@ -171,12 +185,20 @@ class RemoteError(RuntimeError):
     cases. After a spawn failure the command never ran. After a timeout the
     OUTCOME IS UNKNOWN: killing the local ssh does not stop a non-tty remote
     command, so it may have run to completion (a killed send may have landed).
-    A caller must therefore never retry a mutation blindly on rc None."""
+    A caller must therefore never retry a mutation blindly on rc None.
+    ``timed_out`` tells the two apart: True only on the timeout path (outcome
+    unknown), False on every other construction (a spawn failure never ran)."""
 
     def __init__(
-        self, rc: int | None, stderr_tail: str, command_redacted: tuple[str, ...]
+        self,
+        rc: int | None,
+        stderr_tail: str,
+        command_redacted: tuple[str, ...],
+        *,
+        timed_out: bool = False,
     ) -> None:
         self.rc = rc
+        self.timed_out = timed_out
         self.stderr_tail = stderr_tail
         self.command_redacted = command_redacted
         super().__init__(
@@ -186,10 +208,16 @@ class RemoteError(RuntimeError):
 
 @functools.lru_cache(maxsize=1)
 def find_ssh() -> str | None:
-    """The ssh client on PATH, or None. Cached for the process lifetime like
-    ``psmux.find_psmux``: a test that changes PATH clears it on the way in and
-    out. Tests never see the real one (tests/conftest.py::_no_real_ssh)."""
-    return shutil.which("ssh")
+    """The ssh client, or None -- by ``attach_client.find_ssh``'s rule
+    (Windows' own OpenSSH first, PATH as the fallback), so a bring-up and the
+    attach window it opens dial through the same client and the same agent.
+    Cached for the process lifetime like ``psmux.find_psmux``, which also makes
+    the one debug line naming the client a once-per-process line; a test that
+    changes PATH clears it on the way in and out. Tests never see the real one
+    (tests/conftest.py::_no_real_ssh)."""
+    exe = _find_ssh_client()
+    get_logger("nodes").debug("ssh client for node calls: %s", exe)
+    return exe
 
 
 def _remote_string(argv: Sequence[str]) -> str:
@@ -214,7 +242,7 @@ def _client(shown: tuple[str, ...]) -> str:
     or RemoteError rc 127. The only way an ssh argv gets its argv[0]."""
     exe = find_ssh()
     if exe is None:
-        raise RemoteError(SSH_MISSING_RC, "ssh client not found on PATH", shown)
+        raise RemoteError(SSH_MISSING_RC, "no ssh client found", shown)
     return exe
 
 
@@ -351,14 +379,16 @@ def _spawn(
     check: bool,
     shown: tuple[str, ...],
     label: str,
+    env: Mapping[str, str] | None = None,
     quiet: bool = False,
     max_stdout_bytes: int = MAX_REPLY_BYTES,
 ) -> subprocess.CompletedProcess[bytes]:
     """One bounded child -- the shared body of ``run`` and the local git reads
-    (``ignored_paths``). ``shown`` is what an error and a log line may say
+    (``ignored_paths``, ``git_state``). ``shown`` is what an error and a log line may say
     about the command; ``label`` opens every log line, naming who spawned it.
-    ``quiet`` drops every one of those log lines; the RemoteError is raised
-    exactly the same.
+    ``env`` None is the plain inherited environment (every ssh call); only
+    the local git reads pass one (``_local_git``). ``quiet`` drops every one
+    of those log lines; the RemoteError is raised exactly the same.
 
     Bounded in time AND in memory: stdout is read as it arrives, and a child
     whose stdout passes ``max_stdout_bytes`` is killed and raised as
@@ -371,6 +401,7 @@ def _spawn(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             creationflags=_SPAWN_FLAGS,
+            env=env,
         )
     except OSError as e:
         # A FileNotFoundError is the client vanishing between find_ssh and the
@@ -399,7 +430,9 @@ def _spawn(
             get_logger("nodes").warning(
                 "%s timed out after %.1fs: %s", label, timeout_s, shlex.join(shown)
             )
-        raise RemoteError(None, f"timed out after {timeout_s:g}s", shown)
+        raise RemoteError(
+            None, f"timed out after {timeout_s:g}s", shown, timed_out=True
+        )
     if out.over:
         _kill(proc)
         if not quiet:
@@ -838,6 +871,25 @@ def provision(
     return ProvisionReport((*notes, *shipped, *probe_failed, *report.lines))
 
 
+def provision_node(
+    node: Node,
+    config: MagentConfig,
+    *,
+    home: Path,
+    timeout_s: float,
+    force: bool = False,
+) -> ProvisionReport:
+    """THE provisioning body (DECISION-24): ``magent node setup`` and
+    ``launch._provision_once`` both call it. Builds the user scope from
+    ``home`` -- the one place src builds one; plan K swaps that line for its
+    relay seam and drops the ``del`` above it -- then hands it to
+    ``provision``, which probes the node's programs only when a stdio server
+    is in the scope. ``config`` is unread until K lands. Raises RemoteError
+    when the node is unreachable; a failed step is a ``fail`` row."""
+    del config  # plan K's relay swap reads config.settings
+    return provision(node, nodes.user_scope(home), timeout_s=timeout_s, force=force)
+
+
 SETUP_TIMEOUT_S = 900.0
 # Each user adds a login, a Claude install and a key to the one root hop.
 SETUP_PER_USER_S = 240.0
@@ -984,6 +1036,100 @@ def has_session(node: Node, sid: str) -> bool | None:
     if result.returncode == 1:
         return False
     return None
+
+
+def tmux_argv(*args: str) -> list[str]:
+    """``tmux -L magent <args>``: the one node server (DECISION-3)."""
+    return [MUX, "-L", SOCKET, *args]
+
+
+def list_sessions(node: Node) -> list[str] | None:
+    """Every session on ``node``'s magent server. ``[]`` when tmux said there
+    are none (exit 1: no server). None when the PROBE failed (unreachable, no
+    tmux, a timeout): "I could not look" is never "nothing is running"."""
+    try:
+        result = run(
+            node,
+            tmux_argv("list-sessions", "-F", "#{session_name}"),
+            timeout_s=PROBE_TIMEOUT_S,
+            check=False,
+        )
+    except RemoteError:
+        return None
+    if result.returncode == 1:
+        return []
+    if result.returncode != 0:
+        return None
+    return [
+        line for line in result.stdout.decode("utf-8", "replace").splitlines() if line
+    ]
+
+
+def kill_session(node: Node, sid: str) -> bool | None:
+    """Kill ``sid`` on ``node``: True killed, False it was not there, None the
+    call failed and the session may still be running."""
+    try:
+        result = run(
+            node,
+            tmux_argv("kill-session", "-t", f"={sid}"),
+            timeout_s=PROBE_TIMEOUT_S,
+            check=False,
+        )
+    except RemoteError:
+        return None
+    return {0: True, 1: False}.get(result.returncode)
+
+
+def decoration_args(sid: str, nick: str, code_hint: bool) -> list[list[str]]:
+    """The ten decoration commands of a node session: the SAME vocabulary as
+    ``psmux.decoration_argv`` (status hints, the F1/F2 bindings, the window
+    name rule), with the brand naming the node. One server hosts every node
+    session, so the per-session options are scoped with ``-t =sid`` (and the
+    window ones with ``=sid:``) rather than ``-g``, where psmux's
+    server-per-session model allows a global."""
+    hints, hints_len = psmux.status_hints(code_hint)
+    brand, brand_len = psmux.status_left(nick)
+    target, window = f"={sid}", f"={sid}:"
+    fmt = psmux.WINDOW_STATUS_FORMAT
+    return [
+        tmux_argv("bind", "-n", "F1", "detach-client"),
+        tmux_argv("set", "-t", target, "status-right", hints),
+        tmux_argv("set", "-t", target, "status-right-length", hints_len),
+        tmux_argv("set", "-t", target, "status-left", brand),
+        tmux_argv("set", "-t", target, "status-left-length", brand_len),
+        psmux.f2_binding_argv(tmux_argv(), code_hint),
+        tmux_argv("rename-window", "-t", window, psmux.window_display_name(sid)),
+        tmux_argv("setw", "-t", window, "automatic-rename", "off"),
+        tmux_argv("setw", "-t", window, "window-status-format", fmt),
+        tmux_argv("setw", "-t", window, "window-status-current-format", fmt),
+    ]
+
+
+def decoration_script(sid: str, nick: str, code_hint: bool) -> str:
+    """``decoration_args`` as a bash script, one line per command, each allowed
+    to fail: a cosmetic option must never fail the bring-up it rides."""
+    return "".join(
+        shlex.join(argv) + " || true\n"
+        for argv in decoration_args(sid, nick, code_hint)
+    )
+
+
+def decorate(node: Node, sid: str, nick: str) -> bool:
+    """(Re)apply the decoration to a session already running on ``node``, in
+    one connection. ``code_hint`` is THIS machine's answer: F2 is caught by the
+    listener on this PC, not by anything on the node."""
+    script = decoration_script(sid, nick, psmux.code_on_path())
+    try:
+        result = run(
+            node,
+            ["bash", "-s"],
+            timeout_s=SCRIPT_TIMEOUT_S,
+            input_bytes=script.encode("utf-8"),
+            check=False,
+        )
+    except RemoteError:
+        return False
+    return result.returncode == 0
 
 
 def _finite(value: object) -> float:
@@ -1572,42 +1718,546 @@ def pull(
     return PullResult(files=files, since=since)
 
 
-def ignored_paths(repo: Path, *, timeout_s: float, label: str) -> tuple[str, ...]:
-    """What git ignores in the LOCAL ``repo``: ``git ls-files --others --ignored
-    --exclude-standard --directory -z`` -- repo-relative, '/'-separated, and a
-    wholly ignored directory as ONE ``dir/`` entry (``node_modules`` is one
-    line, not a hundred thousand). Read-only. The raw material for
-    ``nodes.push_set``; ``git_state`` carries it as ``LocalGitState.ignored``.
-    ``label`` names the caller in the log line a failure writes.
+# A local git read is a local process, but it can still hang (a credential
+# prompt, a network filesystem); bounded like every other child.
+GIT_TIMEOUT_S = 30.0
 
-    A ``repo`` that is not a git repository is ``RemoteError(rc=128, <git's
-    stderr tail>)`` -- git's own "fatal: not a git repository" exit. A missing
-    ``git`` is RemoteError rc None ("git not found on PATH"): the command never
-    ran. ``_spawn`` reads a FileNotFoundError as the missing ssh client (rc
-    127), which is not what happened here."""
-    argv = [
-        "git",
-        "-C",
-        str(repo),
-        "ls-files",
-        "--others",
-        "--ignored",
-        "--exclude-standard",
-        "--directory",
-        "-z",
-    ]
+
+def _local_git(
+    path: Path, args: Sequence[str], *, timeout_s: float, check: bool, label: str
+) -> subprocess.CompletedProcess[bytes]:
+    """One bounded, READ-ONLY ``git -C <path> --no-optional-locks <args>`` --
+    the shared body of ``ignored_paths`` and every ``git_state`` read. Three
+    things make it safe to aim at a repo an agent is working in right now:
+
+    - ``--no-optional-locks`` (a global option, so before the subcommand):
+      ``git status`` otherwise refreshes the stat cache under ``index.lock``
+      and rewrites ``.git/index`` (measured), and the agent's own git call
+      then fails "index.lock: File exists";
+    - ``env.git_child_env()``: an inherited GIT_DIR / GIT_WORK_TREE -- a git
+      hook exports them, absolute in a worktree -- would answer for another
+      repo than the one ``-C`` names;
+    - a missing ``git`` is RemoteError rc None ("git not found on PATH"):
+      ``_spawn`` alone would call it the missing ssh client (rc 127)."""
+    argv = ["git", "-C", str(path), "--no-optional-locks", *args]
     shown = tuple(argv)
     try:
-        result = _spawn(
+        return _spawn(
             argv,
             timeout_s=timeout_s,
             input_bytes=None,
-            check=True,
+            check=check,
             shown=shown,
             label=label,
+            env=git_child_env(),
         )
     except RemoteError as e:
         if isinstance(e.__cause__, FileNotFoundError):
             raise RemoteError(None, "git not found on PATH", shown) from e.__cause__
         raise
+
+
+def ignored_paths(repo: Path, *, timeout_s: float, label: str) -> tuple[str, ...]:
+    """What git ignores in the LOCAL ``repo``: ``git ls-files --others --ignored
+    --exclude-standard --directory -z`` -- repo-relative, '/'-separated, and a
+    wholly ignored directory as ONE ``dir/`` entry (``node_modules`` is one
+    line, not a hundred thousand). Read-only (``_local_git``). The raw material
+    for ``nodes.push_set``; ``git_state`` carries it as
+    ``LocalGitState.ignored``. ``label`` names the caller in the log line a
+    failure writes.
+
+    A ``repo`` that is not a git repository is ``RemoteError(rc=128, <git's
+    stderr tail>)`` -- git's own "fatal: not a git repository" exit. A missing
+    ``git`` is RemoteError rc None ("git not found on PATH"): the command never
+    ran."""
+    result = _local_git(
+        repo,
+        [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ],
+        timeout_s=timeout_s,
+        check=True,
+        label=label,
+    )
     return tuple(p for p in result.stdout.decode("utf-8", "replace").split("\0") if p)
+
+
+def _git(
+    path: Path, *args: str, check: bool = True
+) -> subprocess.CompletedProcess[bytes]:
+    """One ``git_state`` read (``_local_git``), bounded by ``GIT_TIMEOUT_S``."""
+    return _local_git(
+        path, args, timeout_s=GIT_TIMEOUT_S, check=check, label="git state read"
+    )
+
+
+def _out(result: subprocess.CompletedProcess[bytes]) -> str:
+    return result.stdout.decode("utf-8", "replace").strip()
+
+
+def repo_paths(project_dir: Path) -> list[Path]:
+    """The git repos a node project is made of: the project itself when it is
+    a repo, else each DIRECT child that is one (a workspace of repos), in name
+    order. Empty when there is none -- which the caller refuses, because a
+    node clones the project from its origin. A folder that cannot be read (a
+    permission, a vanished network drive) is RemoteError rc None naming it,
+    like every other failure this module reports."""
+    try:
+        if (project_dir / ".git").exists():
+            return [project_dir]
+        if not project_dir.is_dir():
+            return []
+        return sorted(
+            child
+            for child in project_dir.iterdir()
+            if child.is_dir() and (child / ".git").exists()
+        )
+    except OSError as e:
+        reason = f"cannot read {project_dir}: {e.strerror or e}"
+        get_logger("nodes").warning("repo lookup failed: %s", reason)
+        raise RemoteError(None, reason, ("repo_paths", str(project_dir))) from e
+
+
+def git_state(path: Path) -> LocalGitState:
+    """What D7 needs to know about the LOCAL repo at ``path``, read-only: every
+    read goes through ``_local_git`` (no optional lock, no inherited GIT_DIR).
+
+    - ``url`` is origin's, "" when there is no origin.
+    - ``detached`` when HEAD names no branch (``branch`` is then "").
+    - ``no_commits`` when HEAD is unborn: a repo with no commits yet names its
+      branch (not detached) but has nothing to push -- D7 says "make a first
+      commit" instead of a ``git push`` that would fail.
+    - ``dirty`` counts untracked files too -- origin never saw them, so the
+      node would not have them -- whatever the user's
+      ``status.showUntrackedFiles`` or submodule-ignore config says.
+    - ``unpushed`` is "HEAD has commits origin's copy of this branch lacks";
+      a branch origin has never seen counts, and so does an unborn HEAD (never
+      a pass). The comparison is against ``refs/remotes/origin/<branch>``, not
+      ``@{u}``: the node fetches by branch NAME from origin, whatever this
+      branch tracks. It is only as fresh as the last fetch here -- the
+      read-only rule forbids a fetch or an ``ls-remote``.
+
+    Raises RemoteError when ``path`` is not a repo or git itself fails."""
+    _git(path, "rev-parse", "--git-dir")
+    origin = _git(path, "remote", "get-url", "origin", check=False)
+    url = _out(origin) if origin.returncode == 0 else ""
+    head = _git(path, "symbolic-ref", "-q", "--short", "HEAD", check=False)
+    detached = head.returncode != 0
+    branch = "" if detached else _out(head)
+    verify = _git(path, "rev-parse", "-q", "--verify", "HEAD", check=False)
+    no_commits = verify.returncode != 0
+    status = _git(
+        path,
+        "status",
+        "--porcelain",
+        "--untracked-files=normal",
+        "--ignore-submodules=none",
+    )
+    dirty = bool(_out(status))
+    unpushed = False
+    if url and not detached:
+        if no_commits:
+            unpushed = True
+        else:
+            ahead = _git(
+                path,
+                "rev-list",
+                "--count",
+                f"refs/remotes/origin/{branch}..HEAD",
+                check=False,
+            )
+            unpushed = ahead.returncode != 0 or _out(ahead) != "0"
+    return LocalGitState(
+        path=path,
+        url=url,
+        branch=branch,
+        dirty=dirty,
+        unpushed=unpushed,
+        detached=detached,
+        ignored=ignored_paths(path, timeout_s=GIT_TIMEOUT_S, label="git state read"),
+        no_commits=no_commits,
+    )
+
+
+@dataclass(frozen=True)
+class BringUpResult:
+    """What ``bring_up.sh`` reported. ``cwd`` is the node's ABSOLUTE project
+    folder (``Recipe.remote_root`` keeps ``~``); ``commits`` maps each repo's
+    absolute folder to the commit it now has checked out; ``shipped`` lists the
+    project-relative files written beside the clone."""
+
+    sid: str
+    attached_existing: bool
+    commits: dict[str, str] = field(default_factory=dict)
+    cwd: str = ""
+    shipped: tuple[str, ...] = ()
+
+
+# bring_up.sh's header format version; the script refuses anything else.
+_HEADER_MAGIC = "MAGENT1"
+
+
+def _has_control(text: str) -> bool:
+    """Any control character (C0, DEL, C1): a newline, a tab, an ESC."""
+    return any(unicodedata.category(ch) == "Cc" for ch in text)
+
+
+def _clean_absolute(value: str) -> bool:
+    """``value`` is a node path magent can hand on: absolute (so it cannot
+    start with ``-``) and free of any control character."""
+    return value.startswith("/") and not _has_control(value)
+
+
+def _node_path(path: str, home: str) -> str:
+    """``path`` expanded against the node's ``home`` and checked where it
+    first enters a remote command: an absolute POSIX path, so it can neither
+    be read relative to wherever the script happens to run nor start with
+    ``-`` and be taken for an option. The EXPANDED value is what is checked
+    -- the default root ``~/magent`` is only absolute after expansion.
+    NodeConfigError (a ValueError): the path comes from
+    ``settings.nodes.<n>.root``."""
+    expanded = absolute_remote(path, home)
+    if not expanded.startswith("/"):
+        raise NodeConfigError(
+            f"node folder {expanded!r} is not an absolute path on the node"
+        )
+    return expanded
+
+
+def _login_argv(cmd: str) -> list[str]:
+    """``cmd`` run by the node user's LOGIN bash (so ~/.profile's PATH, where
+    ``claude`` is usually installed, applies) and exec'd, so the agent IS the
+    pane's process. Empty for no command."""
+    return ["bash", "-lc", f"exec {cmd}"] if cmd else []
+
+
+def _start_argvs(recipe: Recipe, resume_id: str | None) -> tuple[list[str], list[str]]:
+    """``(start, fresh)``: the argv to run, and the one to run instead when the
+    node has no transcript for this folder. An explicit resume has no fresh
+    alternative -- the user named a session."""
+    if resume_id:
+        resume = build_resume_command(recipe.tool, recipe.command, resume_id)
+        return _login_argv(resume), []
+    return _login_argv(recipe.command), _login_argv(recipe.fresh_command or "")
+
+
+def _header(
+    recipe: Recipe, *, allow_dirty: bool, home: str, resume_id: str | None
+) -> bytes:
+    """The payload's ``header`` member: NUL-terminated tokens, read by
+    bring_up.sh with ``read -d ''``. A NUL is the one byte a token cannot
+    carry, so one is refused rather than silently splitting a token."""
+    start, fresh = _start_argvs(recipe, resume_id)
+    tokens = [_HEADER_MAGIC, "1" if allow_dirty else "0", str(len(recipe.repos))]
+    for repo in recipe.repos:
+        # git on the node would take `--upload-pack=...` as an option. The
+        # script also passes `--` before them; this is the PC-side half.
+        for value, what in ((repo.url, "url"), (repo.branch, "branch")):
+            if value.startswith("-"):
+                raise ValueError(f"repo {what} {value!r} would read as an option")
+        tokens += [repo.url, repo.branch, _node_path(repo.remote_dir, home)]
+    tokens += [str(len(start)), *start, str(len(fresh)), *fresh]
+    if any("\0" in token for token in tokens):
+        raise ValueError("a bring-up header token contains a NUL byte")
+    return b"".join(token.encode("utf-8") + b"\0" for token in tokens)
+
+
+def _archive_name(rel: str) -> str:
+    """``rel`` as a payload member name: ``/``-separated whatever the local
+    separator, so a Windows ``config\\.env`` never reaches the node as one
+    file name with a literal backslash in it. Mapping ``\\`` is also what
+    makes a POSIX file literally named ``a\\..\\..\\x`` climb, so the mapped
+    name is refused (ValueError) when it is absolute or has an empty, ``.``
+    or ``..`` segment. A control character is refused too: the node's shell
+    strips a trailing newline in ``$(...)``, so ``.env\\n`` would resolve as
+    ``.env`` (the node refuses it as well)."""
+    name = rel.replace("\\", "/")
+    if any(part in ("", ".", "..") for part in name.split("/")):
+        raise ValueError(f"{rel!r} cannot name a file inside the project")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
+        raise ValueError(f"{rel!r} has a control character in its name")
+    return name
+
+
+def _push_name(path: Path, local_root: Path) -> tuple[str, Path]:
+    """``(member name, real path)`` of push file ``path``. The name is its
+    place relative to ``local_root``, lexically -- a link keeps the name it
+    has here. The real path is what ``_read_regular`` must open: the file
+    that was vetted, not whatever ``path`` names by the time it is read.
+    ValueError when ``path`` RESOLVES outside ``local_root``: B's config check
+    on the entry is a string check, and a symlink inside the project can
+    point at ``~/.ssh``.
+
+    Two refusals here are belt-and-braces, and a mutant that drops either
+    survives (equivalent): ``real == real_root`` (the root is a folder, which
+    ``_read_regular`` refuses anyway) and the lexical ``relative_to``'s own
+    message (it raises ValueError either way)."""
+    real, real_root = Path(os.path.realpath(path)), Path(os.path.realpath(local_root))
+    if real == real_root or not real.is_relative_to(real_root):
+        raise ValueError(f"push file {path} resolves outside the project {local_root}")
+    try:
+        rel = path.relative_to(local_root)
+    except ValueError as e:
+        raise ValueError(f"push file {path} is outside the project {local_root}") from e
+    return _archive_name(str(rel)), real
+
+
+# The size bounds of what one bring-up ships (the node reads the payload from
+# stdin into tar; nothing here is streamed). A push file over its cap, or a
+# push set over the payload's, is refused before any ssh. Memory is skipped,
+# never refused. PAYLOAD_MAX_BYTES bounds the shipped FILE bytes; the tar's
+# own framing and the header ride on top.
+PUSH_FILE_MAX_BYTES = 16 * 1024 * 1024
+PAYLOAD_MAX_BYTES = 64 * 1024 * 1024
+
+# How a vetted file is opened: never through a final-component link, never
+# blocking on a FIFO. Read off the module, so Windows (which has neither
+# flag, and wants O_BINARY) needs no `sys.platform` branch.
+_READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_BINARY", 0)
+)
+
+
+def _read_regular(path: Path, *, cap: int, what: str) -> bytes:
+    """The bytes of ``path``, which must be a REGULAR file of at most ``cap``
+    bytes, or ValueError naming ``what``. Checked three times, because each
+    check alone has a hole: ``lstat`` before opening (a FIFO or a device is
+    never opened, an oversize file never read), ``fstat`` on what was opened
+    (the path may have been swapped in between), and a read of at most
+    ``cap + 1`` bytes (the file may have grown). ``fstat`` must also name the
+    SAME file the ``lstat`` sized -- ``(st_dev, st_ino)`` -- or a regular file
+    swapped in under the name would be read on the old one's vetting. OSError
+    when it cannot be opened -- ``O_NOFOLLOW`` makes a final-component link
+    swapped in after the ``lstat`` one of those."""
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError(f"{what} is not a regular file")
+    if before.st_size > cap:
+        raise ValueError(f"{what} is {before.st_size} bytes; the cap is {cap}")
+    fd = os.open(path, _READ_FLAGS)
+    with os.fdopen(fd, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError(f"{what} is not a regular file")
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise ValueError(f"{what} changed between its check and its open")
+        data = handle.read(cap + 1)
+    if len(data) > cap:
+        raise ValueError(f"{what} grew past the cap of {cap} bytes")
+    return data
+
+
+def _files(recipe: Recipe, *, memory: bool) -> list[tuple[str, bytes]]:
+    """The payload's file members, vetted and READ -- before any ssh, so every
+    refusal costs no connection. ``project/<rel>``: the push set, each file
+    contained in the project and bounded (ValueError otherwise, naming it);
+    ``memory/<rel>`` for a bring-up: Claude's memory, where anything that
+    fails a check is skipped and logged instead (a bring-up never fails
+    because of memory)."""
+    if recipe.push_files and recipe.local_root is None:
+        raise ValueError("a recipe with push files needs its local_root")
+    root = recipe.local_root
+    vetted = (
+        [(*_push_name(p, root), p) for p in recipe.push_files]
+        if root is not None
+        else []
+    )
+    out: list[tuple[str, bytes]] = []
+    total = 0
+    for name, real, path in vetted:
+        data = _read_regular(real, cap=PUSH_FILE_MAX_BYTES, what=f"push file {path}")
+        total += len(data)
+        if total > PAYLOAD_MAX_BYTES:
+            raise ValueError(
+                f"the push set passes the payload cap of {PAYLOAD_MAX_BYTES} "
+                f"bytes at push file {path}"
+            )
+        out.append((f"project/{name}", data))
+    if memory and recipe.memory_dir is not None:
+        logger = get_logger("nodes")
+        for rel, path in _memory_files(recipe.memory_dir):
+            cap = min(PUSH_FILE_MAX_BYTES, PAYLOAD_MAX_BYTES - total)
+            try:
+                data = _read_regular(path, cap=cap, what=f"memory file {path}")
+            except (ValueError, OSError) as e:
+                logger.warning("memory file %s skipped: %s", path, e)
+                continue
+            total += len(data)
+            out.append((f"memory/{rel}", data))
+    return out
+
+
+def _add_bytes(tar: tarfile.TarFile, name: str, data: bytes) -> None:
+    info = tarfile.TarInfo(name)
+    info.size = len(data)
+    info.mode = 0o600
+    info.mtime = 0
+    tar.addfile(info, io.BytesIO(data))
+
+
+def _payload(*, header: bytes, decorate: str, files: list[tuple[str, bytes]]) -> bytes:
+    """ONE uncompressed PAX tar: ``header``, ``decorate``, then ``files``
+    (``_files``' members, in its order). Bytes stay bytes -- a secret file is
+    never re-encoded."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        _add_bytes(tar, "header", header)
+        _add_bytes(tar, "decorate", decorate.encode("utf-8"))
+        for name, data in files:
+            _add_bytes(tar, name, data)
+    return buf.getvalue()
+
+
+def _memory_files(memory_dir: Path) -> list[tuple[str, Path]]:
+    """``(member name, path)`` for every REGULAR file under ``memory_dir``, in
+    name order. A link is never followed -- not a file link, not a folder
+    link, and not ``memory_dir`` itself being one: the folder is Claude's,
+    and a link in it can name ``~/.ssh``. What is skipped is logged, never
+    raised: a bring-up never fails because of memory.
+
+    "A link" is decided by ``realpath``, not ``is_symlink``: a Windows
+    junction -- which any standard user can make -- is not a symlink to
+    pathlib, and ``os.walk(followlinks=False)`` descends into one. An entry is
+    kept only when resolving it changes nothing but its parent's own
+    resolution, so a link ABOVE ``memory_dir`` (a dotfiles ``~/.claude``)
+    still ships, and every file must resolve inside the resolved folder."""
+    logger = get_logger("nodes")
+    real_mem = Path(os.path.realpath(memory_dir))
+    if real_mem != Path(os.path.realpath(memory_dir.parent)) / memory_dir.name:
+        logger.warning("memory folder %s is a link; no memory shipped", memory_dir)
+        return []
+    found: list[tuple[str, Path]] = []
+    for dirpath, dirnames, filenames in os.walk(memory_dir):
+        base = Path(dirpath)
+        real_base = Path(os.path.realpath(base))
+        kept: list[str] = []
+        for name in dirnames:
+            if Path(os.path.realpath(base / name)) == real_base / name:
+                kept.append(name)
+            else:
+                logger.warning("memory link %s skipped", base / name)
+        dirnames[:] = kept  # os.walk descends only into what is left
+        for name in filenames:
+            path = base / name
+            if path.is_symlink() or not path.is_file():
+                logger.warning("memory entry %s is not a regular file; skipped", path)
+                continue
+            if not Path(os.path.realpath(path)).is_relative_to(real_mem):
+                logger.warning("memory entry %s resolves outside memory; skipped", path)
+                continue
+            try:
+                rel = _archive_name(str(path.relative_to(memory_dir)))
+            except ValueError:
+                logger.warning("memory file %s cannot be named on the node", path)
+                continue
+            found.append((rel, path))
+    return sorted(found)
+
+
+def _remote_home(node: Node) -> str:
+    """The node user's ``$HOME``. The PC expands ``~`` itself and computes the
+    Claude project name from the absolute path, so it must be absolute."""
+    probe = ["printenv", "HOME"]
+    result = run(node, probe, timeout_s=PROBE_TIMEOUT_S)
+    # printenv's one trailing newline is framing; anything else is the
+    # answer. A second line (a login banner) or any other control character
+    # is refused, never trimmed away: the value becomes argv and a path.
+    home = result.stdout.decode("utf-8", "replace").removesuffix("\n")
+    if not home.startswith("/") or _has_control(home):
+        raise RemoteError(
+            result.returncode,
+            f"unusable $HOME on the node: {home!r}",
+            _run_shown(node, probe, None),
+        )
+    return home
+
+
+def _parse_result(
+    result: subprocess.CompletedProcess[bytes],
+) -> dict[str, object] | None:
+    """bring_up.sh's last non-empty stdout line as a JSON object, or None
+    when it is not one -- which the caller raises: a result that cannot be
+    read is not a success."""
+    text = result.stdout.decode("utf-8", "replace")
+    lines = [line for line in text.splitlines() if line.strip()]
+    try:
+        parsed = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _deliver(
+    node: Node, mode: str, recipe: Recipe, root: str, payload: bytes
+) -> dict[str, object]:
+    args = [mode, recipe.sid, root, encoded_project_dir(root)]
+    result = run_script(
+        node, "bring_up", args, timeout_s=BRING_UP_TIMEOUT_S, stdin=payload
+    )
+    parsed = _parse_result(result)
+    if parsed is None:
+        # What RAN, as run() itself would name it (the ``sample`` precedent).
+        # Built on this path only: the frame is a copy of the whole payload.
+        shown = _run_shown(node, *_script_call("bring_up", args, payload))
+        raise RemoteError(result.returncode, "not a bring-up result", shown)
+    return parsed
+
+
+def bring_up(
+    node: Node,
+    recipe: Recipe,
+    *,
+    allow_dirty: bool = False,
+    resume_id: str | None = None,
+) -> BringUpResult:
+    """Bring ``recipe`` up on ``node`` in one script run (after a ``$HOME``
+    probe): clone or fast-forward every repo, ship the push set and seed the
+    memory, then start the agent in tmux session ``recipe.sid`` -- or, when it
+    is already running there, attach to it and touch nothing but its
+    decoration. Raises RemoteError (bring_up.sh exit codes: 2 bad input, 3 a
+    dirty node tree without ``allow_dirty``, 4 tmux, 5 git or a write);
+    ValueError for a recipe that cannot be framed (NodeConfigError for a node
+    folder that is not absolute); OSError for a push file that cannot be
+    read. Every push-file refusal lands before any ssh."""
+    files = _files(recipe, memory=True)
+    home = _remote_home(node)
+    root = _node_path(recipe.remote_root, home)
+    header = _header(recipe, allow_dirty=allow_dirty, home=home, resume_id=resume_id)
+    decorate_text = decoration_script(recipe.sid, node.nick, psmux.code_on_path())
+    payload = _payload(header=header, decorate=decorate_text, files=files)
+    raw = _deliver(node, "up", recipe, root, payload)
+    commits, cwd, shipped = raw.get("commits"), raw.get("cwd"), raw.get("shipped")
+    return BringUpResult(
+        sid=recipe.sid,
+        attached_existing=raw.get("attached_existing") is True,
+        commits=(
+            {str(k): str(v) for k, v in commits.items()}
+            if isinstance(commits, dict)
+            else {}
+        ),
+        cwd=cwd if isinstance(cwd, str) and _clean_absolute(cwd) else root,
+        shipped=tuple(str(s) for s in shipped) if isinstance(shipped, list) else (),
+    )
+
+
+def push_files(node: Node, recipe: Recipe) -> list[str]:
+    """Re-ship ``recipe``'s push set into its EXISTING folder on ``node`` (no
+    git, no session, no memory). Returns the project-relative paths written.
+    Raises RemoteError -- exit 5 when the folder is not there yet -- and the
+    same ValueError/OSError refusals as ``bring_up``."""
+    files = _files(recipe, memory=False)
+    home = _remote_home(node)
+    root = _node_path(recipe.remote_root, home)
+    header = _header(recipe, allow_dirty=True, home=home, resume_id=None)
+    payload = _payload(header=header, decorate="", files=files)
+    raw = _deliver(node, "push", recipe, root, payload)
+    shipped = raw.get("shipped")
+    return [str(s) for s in shipped] if isinstance(shipped, list) else []

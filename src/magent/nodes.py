@@ -4,8 +4,8 @@ What a node IS (``Node``), what running a project there NEEDS (``Recipe``:
 repos, files to push, the auto-memory dir), and where node data lives on this
 PC (``~/.magent/nodes/``). Everything that touches a node or runs git is
 ``remote_mux``. A leaf: never imports magent.cli, never spawns a process. Its
-only I/O is files under ``NODES_DIR`` (the node map and the per-node
-mirror), local stat()s, and a WARNING in the ``nodes`` log.
+only I/O is files under ``NODES_DIR`` (the node map, its sidecar lock, and
+the per-node mirror), local stat()s, and a WARNING in the ``nodes`` log.
 """
 
 from __future__ import annotations
@@ -21,20 +21,23 @@ import os
 import re
 import stat
 import tempfile
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
-from magent.config import NODE_AUTO, NODE_CLOUD
+from magent.config import NODE_AUTO, NODE_CLOUD, runs_on_node
+from magent.lockfile import LockHeld, persistent_lock
 from magent.log import get_logger
 from magent.psmux import session_name
+from magent.sessions import is_ide_tool
 from magent.sessions.claude import encode_claude_project_path
 from magent.titles import get_leaf_name
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
     from magent.config import MagentConfig, ProjectConfig
 
@@ -79,6 +82,10 @@ class LocalGitState:
     --directory`` verbatim -- repo-relative, '/'-separated, a wholly ignored
     directory as one ``dir/`` entry. It is the raw material ``push_set`` picks
     from, carried here so this module never runs git itself.
+
+    ``no_commits`` is an unborn HEAD: the branch is named but holds nothing
+    yet, so there is nothing to push and nothing for the node to check out.
+    Defaulted so every construction that predates it keeps compiling.
     """
 
     path: Path
@@ -88,6 +95,7 @@ class LocalGitState:
     unpushed: bool
     detached: bool
     ignored: tuple[str, ...] = ()
+    no_commits: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,6 +119,16 @@ class Recipe:
     memory_dir: Path | None
     remote_root: str
     warnings: tuple[str, ...] = ()
+    # PR-D (C1): what the node backend needs beyond the §3 tuple. Defaulted, so
+    # every construction that predates it still compiles. recipe_for sets
+    # local_root: the project dir RESOLVED, and every push_files entry is
+    # `relative_to` it (that relative path is where it lands under
+    # remote_root). launch.node_recipe fills the command fields from
+    # settings.tools, which this pure module never reads.
+    local_root: Path | None = None
+    tool: str = ""
+    command: str = ""
+    fresh_command: str | None = None
 
 
 @dataclass(frozen=True)
@@ -772,6 +790,11 @@ class NodeMapEntry:
     placed_ts: float
     attached_existing: bool
     remote_root: str
+    # PR-D: how to reach the session again without re-resolving the config --
+    # the ssh target it was started through, and the node's ABSOLUTE folder
+    # (bring_up.sh reports it). F2 and `sessions --json` read these.
+    target: str = ""
+    cwd: str = ""
 
 
 # What ships besides git (spec §8, D3): a session can't start without its
@@ -825,12 +848,17 @@ def _map_entry(raw: object) -> NodeMapEntry | None:
         return None
     if not math.isfinite(placed_ts):
         return None
+    target, cwd = raw.get("target", ""), raw.get("cwd", "")
     return NodeMapEntry(
         nick=nick,
         sid=sid,
         placed_ts=placed_ts,
         attached_existing=attached,
         remote_root=root,
+        # Optional fields degrade to their default rather than dropping an
+        # entry that still says where a session runs.
+        target=target if isinstance(target, str) else "",
+        cwd=cwd if isinstance(cwd, str) else "",
     )
 
 
@@ -865,7 +893,12 @@ def load_node_map_strict() -> dict[str, NodeMapEntry]:
             if attempt == _BUSY_RETRIES:
                 raise
             time.sleep(_BUSY_SLEEP_S)
-    raw = json.loads(text)
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as exc:
+        # Name the file, as the non-object branch does: "Expecting value: line
+        # 1 column 1" alone does not say WHICH file is refusing every write.
+        raise ValueError(f"{NODE_MAP_PATH}: {exc}") from exc
     if not isinstance(raw, dict):
         raise ValueError(f"{NODE_MAP_PATH}: not a JSON object")  # noqa: TRY004  # reason: a non-object file is corrupt DATA, the same family as the JSONDecodeError (a ValueError) a torn file raises; callers catch one type for every bad file
     out: dict[str, NodeMapEntry] = {}
@@ -894,12 +927,14 @@ def write_node_map(entries: Mapping[str, NodeMapEntry]) -> None:
     """Replace ``node-map.json`` with ``entries`` atomically: a sibling temp
     file unique to this call (``tempfile.mkstemp``), then one ``os.replace``
     (atomic only within a filesystem, hence the sibling -- the
-    ``config_io._save_raw_config_atomic`` idiom). A failed write leaves the
-    previous map untouched and no temp file behind.
+    ``config_io._save_raw_config_atomic`` idiom). A replace a Windows reader
+    blocks (``PermissionError``) is retried ``_REPLACE_RETRIES`` times
+    ``_REPLACE_SLEEP_S`` apart. A failed write leaves the previous map
+    untouched and no temp file behind.
 
     The PRIMITIVE: atomic, but not serialized against another process's
-    read-modify-write. Callers go through PR-D's ``update_node_map``, which
-    holds the cross-process lock around ``load_node_map_strict`` + this write
+    read-modify-write. Callers go through ``update_node_map``, which holds the
+    cross-process lock around ``load_node_map_strict`` + this write
     (DECISION-13)."""
     payload = {project: dataclasses.asdict(e) for project, e in sorted(entries.items())}
     # allow_nan=False: a non-finite placed_ts would otherwise go to disk as a
@@ -915,11 +950,122 @@ def write_node_map(entries: Mapping[str, NodeMapEntry]) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
-        os.replace(tmp, NODE_MAP_PATH)
+            # On disk BEFORE the rename: a crash between an unsynced write and
+            # the replace can leave a zero-length node-map.json, which the
+            # strict reader (rightly) refuses forever after.
+            fh.flush()
+            os.fsync(fh.fileno())
+        _replace_retrying(tmp, NODE_MAP_PATH)
     except BaseException:
         with contextlib.suppress(OSError):
             tmp.unlink()
         raise
+
+
+# Readers take no lock, so on Windows one holding node-map.json makes the
+# writer's os.replace fail with PermissionError for as long as it reads --
+# the mirror of load_node_map_strict's busy retry. Bounded: ~0.5 s outlasts
+# any one read_text; a map held for good still surfaces as the error.
+_REPLACE_RETRIES = 20
+_REPLACE_SLEEP_S = 0.025
+
+
+def _replace_retrying(src: Path, dst: Path) -> None:
+    for attempt in range(_REPLACE_RETRIES + 1):
+        try:
+            os.replace(src, dst)
+        except PermissionError:
+            if attempt == _REPLACE_RETRIES:
+                raise
+            time.sleep(_REPLACE_SLEEP_S)
+        else:
+            return
+
+
+# The sidecar every map writer holds (DECISION-13): ~/.magent/node-map.lock,
+# through lockfile.persistent_lock. NOT lockfile.exclusive_lock -- that one
+# never waits and unlinks its file on exit, so a waiter could lock a file the
+# holder is about to delete and run beside it. This one waits (bounded) and
+# its file is never deleted.
+MAP_LOCK_NAME = "node-map"
+# Far longer than one read-modify-write. A writer still waiting after this is
+# stuck behind a hung process, and says so (LockHeld) rather than hanging.
+MAP_LOCK_WAIT_S = 10.0
+
+# Threads of ONE process queue here first, so a fan-out's writers wait on a
+# cheap lock instead of polling the file lock against each other.
+_MAP_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def map_lock(wait_s: float = MAP_LOCK_WAIT_S) -> Iterator[None]:
+    """Hold the node map exclusively across threads AND processes, waiting up
+    to ``wait_s`` in all for it. Raises LockHeld (an OSError) when it stays
+    taken. ``update_node_map`` is the one production holder; a test holds it
+    through here too, so both take the very same lock."""
+    deadline = time.monotonic() + wait_s
+    if not _MAP_LOCK.acquire(timeout=max(wait_s, 0.0)):
+        raise LockHeld("the node map is held by another writer in this process")
+    try:
+        remaining = max(deadline - time.monotonic(), 0.0)
+        with persistent_lock(MAP_LOCK_NAME, wait_s=remaining):
+            yield
+    finally:
+        _MAP_LOCK.release()
+
+
+def _sweep_stale_temps() -> None:
+    """Delete ``node-map.json.*.tmp`` siblings (``write_node_map``'s
+    ``mkstemp`` names). Called only under ``map_lock``: every writer holds it
+    from mkstemp to replace, so any temp still there belongs to a writer that
+    was killed mid-write."""
+    for stale in NODE_MAP_PATH.parent.glob(f"{NODE_MAP_PATH.name}.*.tmp"):
+        with contextlib.suppress(OSError):
+            stale.unlink()
+
+
+def update_node_map(
+    project: str, entry: NodeMapEntry | None, *, wait_s: float = MAP_LOCK_WAIT_S
+) -> dict[str, NodeMapEntry]:
+    """Set ``project``'s entry (or remove it, with None), keeping every other
+    project's, and return the map as it now stands. The ONE writer entry point
+    (DECISION-13): the read and the write happen under ``map_lock``, so `up`,
+    `down`, placement and recall running at once each keep the others'
+    entries.
+
+    Reads through ``load_node_map_strict``: a torn or unreadable map raises
+    (ValueError / OSError) and is left as it is, never read as ``{}`` and
+    written back over every placement. Raises LockHeld when another writer
+    holds the map for longer than ``wait_s``."""
+    with map_lock(wait_s):
+        _sweep_stale_temps()
+        current = load_node_map_strict()
+        if entry is None:
+            if project not in current:
+                return current
+            del current[project]
+        else:
+            current[project] = entry
+        write_node_map(current)
+        return current
+
+
+def open_target(
+    project: str, entries: Mapping[str, NodeMapEntry]
+) -> tuple[str, str] | None:
+    """``(ssh target, folder)`` for opening ``project`` -- a window's name, so
+    either a project name or its session id -- in an editor over Remote-SSH.
+    None for a project no node holds, a cloud placement (it has no ssh
+    target), or an entry with no recorded target or absolute folder -- the
+    caller falls through to /api/sessions. Never ``remote_root`` as the
+    folder: it keeps its ``~`` (DECISION-11) and a Remote-SSH folder URI
+    does not expand one."""
+    entry = entries.get(project) or next(
+        (e for e in entries.values() if e.sid == project), None
+    )
+    if entry is None or entry.nick == NODE_CLOUD or not entry.target or not entry.cwd:
+        return None
+    return entry.target, entry.cwd
 
 
 # A portable Unix login (useradd's default NAME_REGEX, minus the trailing-$
@@ -1235,18 +1381,28 @@ def _is_forbidden(target: PurePath, forbidden: Sequence[tuple[PurePath, bool]]) 
     return False
 
 
-def _shippable_git_hit(path: Path, forbidden: Sequence[tuple[PurePath, bool]]) -> bool:
-    """A path git's listing reported is a snapshot claim: it ships only if it is
-    a regular file now, and -- resolved, symlinks followed -- not a credential
-    store's."""
+def _shippable_git_target(
+    path: Path, forbidden: Sequence[tuple[PurePath, bool]]
+) -> Path | None:
+    """A path git's listing reported is a snapshot claim: its resolved target
+    (symlinks followed) when it is a regular file now and not a credential
+    store's, else None."""
     target = _try_resolve(path)
     # os.path.isfile never raises (a stat error is "not a file" on every
     # Python), which Path.is_file only guarantees from 3.13 on.
-    return (
-        target is not None
-        and os.path.isfile(target)
-        and not _is_forbidden(target, forbidden)
-    )
+    if target is None or not os.path.isfile(target) or _is_forbidden(target, forbidden):
+        return None
+    return target
+
+
+def _listed_name(hit: Path, repo: Path, root: Path) -> str:
+    """How a warning names a git hit: as git listed it, under its repo's place
+    in the project (``api/cfg/.env`` in a workspace), or absolute when the repo
+    is not under the project."""
+    base = _try_resolve(repo)
+    if base is not None and base.is_relative_to(root):
+        return (base.relative_to(root) / hit.relative_to(repo)).as_posix()
+    return str(hit)
 
 
 def _classify_extras(
@@ -1317,6 +1473,27 @@ def _one_per_file(found: Sequence[Path], project_dir: Path) -> tuple[Path, ...]:
     return tuple(sorted(kept.values(), key=str))
 
 
+def _under_root(path: Path, root: Path, project_dir: Path) -> Path:
+    """A push entry re-spelled under the RESOLVED project ``root``, so the
+    Recipe can promise ``path.relative_to(local_root)``. One lexically under
+    the configured ``project_dir`` (an extra or a workspace-root file named
+    through a link) keeps its tail -- its own name -- and swaps the prefix,
+    which resolves to ``root``. One already under ``root`` is kept. Otherwise
+    (a git hit listed under a repo reached through a link) its directory is
+    resolved, as ``_one_per_file`` keys it. A file under none of these would
+    land outside the node folder: a NodeConfigError, never a push. ``_push``
+    already drops every entry whose target resolves outside ``root``, so this
+    is a guard that should never fire."""
+    if path.is_relative_to(project_dir):
+        return root / path.relative_to(project_dir)
+    if path.is_relative_to(root):
+        return path
+    parent = _try_resolve(path.parent)
+    if parent is not None and parent.is_relative_to(root):
+        return parent / path.name
+    raise NodeConfigError(f"{path}: would ship from outside the project {root}")
+
+
 def _push(
     project_dir: Path,
     states: Sequence[LocalGitState],
@@ -1327,16 +1504,26 @@ def _push(
     """``push_set`` and ``push_warnings`` in one pass: each extra resolved once,
     the credential stores resolved once."""
     forbidden = _forbidden_roots(home)
+    root = _resolved(project_dir)
     found: list[Path] = []
+    warnings: list[str] = []
     for state in states:
-        found += [
-            hit
-            for hit in _from_git_listing(state.path, state.ignored)
-            if _shippable_git_hit(hit, forbidden)
-        ]
+        for hit in _from_git_listing(state.path, state.ignored):
+            target = _shippable_git_target(hit, forbidden)
+            if target is None:
+                continue
+            # git DESCENDS a junction/directory link (Git for Windows lists
+            # `cfg/.env` when `cfg` is a junction out of the project), so a
+            # hit is held to the same rule as an extra: resolved, inside.
+            if not target.is_relative_to(root):
+                name = _listed_name(hit, state.path, root)
+                warnings.append(f"push: {name} is outside the project; skipped")
+                continue
+            found.append(hit)
     if not _inside_a_repo(project_dir, states):
         found += _workspace_root_files(project_dir)
-    shipped, warnings = _classify_extras(project_dir, extras, forbidden)
+    shipped, extra_warnings = _classify_extras(project_dir, extras, forbidden)
+    warnings += extra_warnings
     return _one_per_file([*found, *shipped], project_dir), tuple(warnings)
 
 
@@ -1355,7 +1542,9 @@ def push_set(
     ``push``). Tracked files never ship, ignored directories are never
     descended, nothing under ``home``'s credential stores ever ships, and an
     extra must resolve (symlinks followed) inside ``project_dir``. A git hit
-    ships only while it is a regular file. The workspace-root listing runs only
+    ships only while it is a regular file, and -- like an extra -- only when it
+    resolves inside ``project_dir`` (git descends a junction or directory link
+    that leads out of the project). The workspace-root listing runs only
     when ``project_dir`` -- resolved -- is inside none of ``states``' repos
     (``_inside_a_repo``). Sorted, one entry per file (``_one_per_file``),
     absolute."""
@@ -1438,6 +1627,151 @@ def _without_userinfo_secret(url: str) -> str | None:
     return f"{scheme}://{host}{rest}"
 
 
+def project_name(proj: ProjectConfig) -> str:
+    """The name a project goes by: its title, else its folder's leaf name. The
+    node map's key, and -- sanitized -- its session id. One function, so the
+    map, the sid and ``recipe_for`` can never disagree about a project."""
+    return proj.title or get_leaf_name(proj.path)
+
+
+def node_sid(proj: ProjectConfig) -> str:
+    """The tmux session id of ``proj`` on its node: the same sanitizer every
+    local session uses, so a node session and its window share one name."""
+    return session_name(project_name(proj))
+
+
+def node_projects(
+    config: MagentConfig, group: str | None = None
+) -> list[ProjectConfig]:
+    """The enabled projects that run on a pool node (pinned or ``auto``), in
+    config order, one per session id. Cloud projects are not pool projects, and
+    an IDE project stays on this PC (there is no agent to host). The group
+    filter matches ``psmux.eligible_projects``': case-insensitive."""
+    out: list[ProjectConfig] = []
+    seen: set[str] = set()
+    for proj in config.projects:
+        if not proj.enabled or not runs_on_node(proj):
+            continue
+        if group and (not proj.group or proj.group.lower() != group.lower()):
+            continue
+        if is_ide_tool(proj.tool or config.settings.default_tool):
+            continue
+        sid = node_sid(proj)
+        if sid in seen:
+            continue
+        seen.add(sid)
+        out.append(proj)
+    return out
+
+
+def _not_a_folder_name(name: str) -> bool:
+    """``name`` cannot be the node folder: ``.``/``..`` (``..`` climbs to the
+    node user's HOME), a control character, or a trailing dot or space --
+    Windows opens ``api.`` as ``api``, so the local and remote names would
+    diverge."""
+    return (
+        name in {".", ".."}
+        or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name)
+        or name.endswith((".", " "))
+    )
+
+
+def remote_root_for(node: Node, project_dir: Path) -> str:
+    """Where ``project_dir`` lives on ``node``: the node's root plus the local
+    folder's NAME (never its path). A folder with no name -- a drive root such
+    as ``C:\\`` or ``/`` -- is refused: it would land AT the node's root, among
+    every other project's folder. So is a name that is not a folder name
+    (``_not_a_folder_name``): refused, never rewritten.
+
+    The result is UNQUOTED and may start with ``~``, which stays unexpanded. A
+    placement caller must run it through ``absolute_remote()`` BEFORE any
+    ``shlex.quote`` -- a quoted ``~`` is never expanded by the node's shell."""
+    name = project_dir.name
+    if not name:
+        raise NodeConfigError(f"{project_dir}: a drive root cannot be a node project")
+    if _not_a_folder_name(name):
+        raise NodeConfigError(f"{project_dir}: {name!r} cannot name a node folder")
+    return f"{node.root.rstrip('/')}/{name}"
+
+
+def assert_distinct_remote_roots(recipes: Sequence[Recipe]) -> None:
+    """Raise NodeConfigError if two of ``recipes`` share a node folder NAME.
+
+    ``remote_root_for`` keys on the local folder's leaf name, so ``C:/a/api``
+    and ``C:/b/api`` both become ``<root>/api`` -- one clone would overwrite
+    the other. Uniqueness is on the LEAF (the last ``/`` segment of
+    ``remote_root``) across the whole fleet, not on the full path: ``auto``
+    placement may later co-locate any two projects on one node, and two
+    projects with one leaf under different roots would then collide. So
+    placement calls this ONCE over ALL recipes, never per node, before any
+    bring-up. Names BOTH projects and both folders. Pure."""
+    held: dict[str, Recipe] = {}
+    for recipe in recipes:
+        leaf = recipe.remote_root.rstrip("/").rsplit("/", 1)[-1]
+        first = held.setdefault(leaf, recipe)
+        if first is not recipe:
+            raise NodeConfigError(
+                f"projects {first.project!r} and {recipe.project!r} would share "
+                f"the node folder name {leaf!r} ({first.remote_root}, "
+                f"{recipe.remote_root}); a node folder is named after the local "
+                "folder and any two projects may land on one node, so rename "
+                "one of them"
+            )
+
+
+def absolute_remote(path: str, home: str) -> str:
+    """``path`` with a leading ``~`` expanded against the node's ``home`` (what
+    ``printenv HOME`` said there). The node's shell would expand it too, but a
+    path that crosses as an argument or into JSON must already be absolute.
+    ``home``'s trailing slashes are dropped once, so ``~`` and ``~/x`` spell
+    the home alike (``/`` stays ``/``)."""
+    base = home.rstrip("/")
+    if path == "~":
+        return base or "/"
+    if path.startswith("~/"):
+        return f"{base}/{path[2:]}"
+    return path
+
+
+def refusal_for(state: LocalGitState, *, allow_dirty: bool = False) -> str | None:
+    """Why ``state``'s repo cannot be reproduced on a node, naming the fix; or
+    None. D7: magent never runs the fix. ``allow_dirty`` accepts a dirty or
+    unpushed tree (the node gets origin's copy); it cannot conjure an origin,
+    a branch or a first commit, so those three are refused regardless. A
+    whitespace-only url is no origin; an empty branch is refused as a detached
+    HEAD (there is no branch to push or check out); a branch with no commits
+    never names ``git push``, which would fail ("src refspec does not match
+    any")."""
+    if not state.url.strip():
+        return (
+            f"{state.path}: no 'origin' remote; the node clones from origin -- "
+            "add one and push"
+        )
+    if state.detached or not state.branch:
+        return (
+            f"{state.path}: HEAD is detached; the node checks out a branch -- "
+            "run git switch <branch> first"
+        )
+    if state.no_commits:
+        return (
+            f"{state.path}: branch {state.branch} has no commits yet; the node "
+            "checks out a branch from origin -- make a first commit and push"
+        )
+    if allow_dirty:
+        return None
+    if state.dirty:
+        return (
+            f"{state.path}: uncommitted changes (dirty tree) would not be on the "
+            "node; commit and push them, or pass --allow-dirty"
+        )
+    if state.unpushed:
+        return (
+            f"{state.path}: branch {state.branch} has commits not on origin; run "
+            f"git push -u origin {state.branch}, or pass --allow-dirty"
+        )
+    return None
+
+
 def recipe_for(
     proj: ProjectConfig,
     node: Node,
@@ -1458,8 +1792,8 @@ def recipe_for(
     share one name. Repo placement is judged on RESOLVED paths, like
     ``push_set``: a project configured as a junction/symlink to its repo is
     still that repo; a path that will not resolve is a NodeConfigError."""
-    project = proj.title or get_leaf_name(proj.path)
-    remote_root = f"{node.root.rstrip('/')}/{project_dir.name}"
+    project = project_name(proj)
+    remote_root = remote_root_for(node, project_dir)
     root = _resolved(project_dir)
     repos: list[RepoSpec] = []
     repo_warnings: list[str] = []
@@ -1497,8 +1831,11 @@ def recipe_for(
             f"{project_dir}: has no git repo; a node project is one repo, "
             "or a folder of repos"
         )
-    push_files, push_warned = _push(
+    found, push_warned = _push(
         project_dir, states, home=home, extras=tuple(proj.push or ())
+    )
+    push_files = tuple(
+        sorted((_under_root(p, root, project_dir) for p in found), key=str)
     )
     memory = (
         home / ".claude" / "projects" / encoded_project_dir(str(project_dir)) / "memory"
@@ -1511,4 +1848,5 @@ def recipe_for(
         memory_dir=memory if memory.is_dir() else None,
         remote_root=remote_root,
         warnings=(*repo_warnings, *push_warned),
+        local_root=root,
     )

@@ -17,11 +17,17 @@ from __future__ import annotations
 import io
 import os
 import subprocess
+import sys
 from typing import NamedTuple
 
 import pytest
 
 from magent import attach_client
+
+# By value, at import: conftest's _no_real_ssh patches the MODULE attributes,
+# so these names still hold the real resolver for the tests that prove it.
+from magent.attach_client import _system_directory as real_system_directory
+from magent.attach_client import find_ssh as real_find_ssh
 
 
 class _Completed(NamedTuple):
@@ -220,7 +226,7 @@ def _drive(monkeypatch, codes, *, durations=None, probes=None, tty=False, **kwar
         code = remaining.pop(0)
         return code if isinstance(code, attach_client.Dial) else _dial(code)
 
-    def fake_probe(_target, _session):
+    def fake_probe(_target, _session, **_kwargs):
         return answers.pop(0) if answers else attach_client.SESSION_ALIVE
 
     monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/usr/bin/ssh")
@@ -325,7 +331,16 @@ class TestSupervise:
         assert rc == 1
         out = capsys.readouterr().out
         assert "is not a session there" in out
-        assert "magent attach" in out
+        assert "Run magent attach to bring it back." in out
+
+    def test_a_failed_no_reconnect_psmux_pane_names_magent_attach(
+        self, monkeypatch, capsys
+    ):
+        # The other repair site: REMOTE_FAILED. A psmux session lives on a
+        # magent host, whose bring-up `magent attach` re-runs.
+        rc, _calls, _sleeps = _drive(monkeypatch, [1], reconnect=False)
+        assert rc == 1
+        assert "Run magent attach to bring it back." in capsys.readouterr().out
 
     def test_a_flapping_host_never_accumulates_its_way_to_a_stop(
         self, monkeypatch, capsys
@@ -380,7 +395,10 @@ class TestSupervise:
         monkeypatch.setattr(attach_client.shutil, "which", lambda _n: None)
         rc = attach_client.supervise("user@host", "psmux -L api attach", "api")
         assert rc == attach_client.SSH_MISSING_RC
-        assert "ssh is not on PATH" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        # The rule looks past PATH (Windows' own OpenSSH first).
+        assert "no ssh client found -- cannot attach" in out
+        assert "PATH" not in out
 
     def test_a_missing_ssh_binary_mid_loop_does_not_traceback(self, monkeypatch):
         # _run_ssh translates FileNotFoundError into an exit code so the pane
@@ -882,6 +900,43 @@ class TestArgumentParsing:
         with pytest.raises(SystemExit):
             attach_client.parse_args(args)
 
+    def test_mux_defaults_to_psmux(self):
+        opts = attach_client.parse_args(["--target", "me@box", "--session", "api"])
+        assert opts.mux == "psmux"
+
+    def test_a_tmux_pane_defaults_its_remote_to_the_tmux_attach(self):
+        opts = attach_client.parse_args(
+            ["--target", "me@box", "--session", "api", "--mux", "tmux"]
+        )
+        assert (opts.mux, opts.remote) == ("tmux", "tmux -L magent attach -t '=api'")
+
+    def test_an_unknown_mux_is_rejected_by_the_parser(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            attach_client.parse_args(
+                ["--target", "me@box", "--session", "api", "--mux", "screen"]
+            )
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "--mux" in err
+        assert "invalid choice" in err
+
+    def test_an_explicit_remote_wins_under_tmux_too(self):
+        # Corpse coherence needs an explicit --remote to survive verbatim for a
+        # node pane: a later task spawns those with both --mux and --remote.
+        opts = attach_client.parse_args(
+            [
+                "--target",
+                "me@box",
+                "--session",
+                "api",
+                "--mux",
+                "tmux",
+                "--remote",
+                "custom",
+            ]
+        )
+        assert (opts.remote, opts.mux) == ("custom", "tmux")
+
 
 class TestMain:
     def test_ctrl_c_stops_cleanly_without_a_traceback(self, monkeypatch, capsys):
@@ -896,7 +951,7 @@ class TestMain:
     def test_it_forwards_the_parsed_options_to_the_loop(self, monkeypatch):
         seen: dict[str, object] = {}
 
-        def spy(target, remote, session, *, reconnect):
+        def spy(target, remote, session, *, reconnect, **_rest):
             seen.update(
                 target=target, remote=remote, session=session, reconnect=reconnect
             )
@@ -912,6 +967,24 @@ class TestMain:
             "remote": attach_client.remote_attach_command("api"),
             "session": "api",
             "reconnect": False,
+        }
+
+    def test_it_forwards_the_multiplexer_to_the_loop(self, monkeypatch):
+        seen: dict[str, object] = {}
+
+        def spy(_target, remote, _session, *, reconnect, mux):
+            seen.update(remote=remote, reconnect=reconnect, mux=mux)
+            return 0
+
+        monkeypatch.setattr(attach_client, "supervise", spy)
+        rc = attach_client.main(
+            ["--target", "me@box", "--session", "api", "--mux", "tmux"]
+        )
+        assert rc == 0
+        assert seen == {
+            "remote": "tmux -L magent attach -t '=api'",
+            "reconnect": True,
+            "mux": "tmux",
         }
 
 
@@ -932,3 +1005,348 @@ class TestRemoteCommandContract:
 
         cmd = attach_client.remote_attach_command("api")
         assert any(m in cmd for m in attach_mod._attach_markers("api"))
+
+    @pytest.mark.parametrize("mux", attach_client.MUXES)
+    def test_every_multiplexers_command_is_recognised_by_its_own_markers(self, mux):
+        # A node pane mid-backoff is kept alive by exactly this match, same as a
+        # psmux one -- the two halves still live in different modules.
+        from magent.cli import attach as attach_mod
+
+        cmd = attach_client.remote_attach_command("api", mux)
+        assert any(m in cmd for m in attach_mod._attach_markers("api", mux))
+
+
+class TestTodaysPsmuxShapesArePinned:
+    """Characterization, written green BEFORE ``--mux`` exists: every string and
+    argv a psmux pane depends on, exactly as shipped. The node work adds a
+    second multiplexer BESIDE these; a diff here means it changed the first."""
+
+    def test_the_remote_command_is_byte_identical(self):
+        assert (
+            attach_client.remote_attach_command("api")
+            == "psmux -L api attach || magent sessions api"
+        )
+
+    def test_the_probe_argv_is_byte_identical(self):
+        assert attach_client.session_probe_argv("me@box", "api") == [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "me@box",
+            "psmux -L api has-session -t api",
+        ]
+
+    def test_the_probe_runs_exactly_that_argv_with_no_console_attached(
+        self, monkeypatch
+    ):
+        seen: dict[str, object] = {}
+
+        def fake_run(argv, **kwargs):
+            seen.update(argv=list(argv), **kwargs)
+            return _Completed(0)
+
+        monkeypatch.setattr(attach_client.subprocess, "run", fake_run)
+        attach_client._probe_session("me@box", "api")
+        assert seen == {
+            "argv": attach_client.session_probe_argv("me@box", "api"),
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "stdin": subprocess.DEVNULL,
+            "timeout": attach_client.SESSION_PROBE_TIMEOUT_S,
+            "check": False,
+        }
+
+    def test_the_interactive_argv_is_byte_identical(self):
+        assert attach_client.ssh_argv("me@box", "psmux -L api attach") == [
+            "ssh",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=4",
+            "-o",
+            "ConnectTimeout=20",
+            "-t",
+            "me@box",
+            "psmux -L api attach",
+        ]
+
+    def test_supervise_probes_the_target_and_session_it_was_given(self, monkeypatch):
+        asked: list[tuple[str, str]] = []
+
+        def fake_probe(target, session, **_kwargs):
+            asked.append((target, session))
+            return attach_client.SESSION_ALIVE
+
+        # Same isolation as `_drive`; only the probe fake differs (it records).
+        monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/usr/bin/ssh")
+        monkeypatch.setattr(attach_client, "_run_ssh", lambda *_a, **_k: _dial(0))
+        monkeypatch.setattr(attach_client, "_probe_session", fake_probe)
+        monkeypatch.setattr(attach_client, "_stdout_is_tty", lambda: False)
+        monkeypatch.setattr(attach_client, "_term_width", lambda: 100)
+        monkeypatch.setattr(attach_client.time, "monotonic", lambda: 0.0)
+        monkeypatch.setattr(attach_client.time, "sleep", lambda _s: None)
+        rc = attach_client.supervise("user@host", "psmux -L api attach", "api")
+        assert (rc, asked) == (0, [("user@host", "api")])
+
+    def test_a_bare_invocation_parses_to_todays_defaults(self):
+        opts = attach_client.parse_args(["--target", "me@box", "--session", "api"])
+        assert (opts.target, opts.session, opts.remote, opts.reconnect) == (
+            "me@box",
+            "api",
+            "psmux -L api attach || magent sessions api",
+            True,
+        )
+
+
+class TestTheTmuxMultiplexer:
+    """A node pane: ONE tmux server per node user on the `magent` socket, every
+    session on it, named by sid (spec D10). Everything psmux keeps its bytes."""
+
+    def test_a_tmux_pane_attaches_on_the_one_magent_socket(self):
+        # No `|| magent sessions` fallback: a node has no magent installed, so
+        # the picker would only ever print "command not found" into the pane.
+        assert (
+            attach_client.remote_attach_command("api", mux="tmux")
+            == "tmux -L magent attach -t '=api'"
+        )
+
+    def test_psmux_is_the_default_multiplexer(self):
+        assert attach_client.remote_attach_command(
+            "api", mux="psmux"
+        ) == attach_client.remote_attach_command("api")
+
+    def test_an_unknown_multiplexer_is_refused_rather_than_guessed(self):
+        with pytest.raises(ValueError, match="screen"):
+            attach_client.remote_attach_command("api", mux="screen")
+
+    def test_the_tmux_socket_name_is_assigned_exactly_once(self):
+        # PR-B and PR-C both introduce this constant and merge in either
+        # order. A second plain assignment trips no lint (F811 is for defs and
+        # imports), so it would silently leave two places to edit -- the one
+        # owner is pinned structurally instead.
+        import ast
+        from pathlib import Path
+
+        tree = ast.parse(Path(attach_client.__file__).read_text(encoding="utf-8"))
+        names = [
+            target.id
+            for node in tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            for target in (
+                node.targets if isinstance(node, ast.Assign) else [node.target]
+            )
+            if isinstance(target, ast.Name)
+        ]
+        assert names.count("TMUX_SOCKET") == 1
+
+    def test_a_tmux_probe_asks_the_one_magent_socket_for_exactly_that_session(
+        self,
+    ):
+        # Same non-pty, never-prompting shape as psmux's probe; only the
+        # question differs. `=api` is exact: a live `api2` must not answer for
+        # a dead `api`, or the pane would read the death as a detach and stop.
+        # Quoted because ssh hands this string to the node user's login shell.
+        assert attach_client.session_probe_argv("me@box", "api", mux="tmux") == [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "me@box",
+            "tmux -L magent has-session -t '=api'",
+        ]
+
+    def test_a_tmux_probe_reads_its_answer_through_the_same_table(self, monkeypatch):
+        # tmux exits 1 both for "no server running" and "can't find session":
+        # either way the session is not there, and the pane keeps trying.
+        asked: list[str] = []
+
+        def fake_run(argv, **_kwargs):
+            asked.append(argv[-1])
+            return _Completed(1)
+
+        monkeypatch.setattr(attach_client.subprocess, "run", fake_run)
+        assert (
+            attach_client._probe_session("me@box", "api", mux="tmux")
+            == attach_client.SESSION_GONE
+        )
+        assert asked == ["tmux -L magent has-session -t '=api'"]
+
+    def test_an_unknown_multiplexer_is_never_probed(self):
+        with pytest.raises(ValueError, match="screen"):
+            attach_client.session_probe_argv("me@box", "api", mux="screen")
+
+    def _asked(self, monkeypatch, **kwargs):
+        """Drive one clean exit through supervise; return which mux was probed."""
+        asked: list[str] = []
+
+        def fake_probe(_target, _session, mux="psmux"):
+            asked.append(mux)
+            return attach_client.SESSION_ALIVE
+
+        monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/usr/bin/ssh")
+        monkeypatch.setattr(attach_client, "_run_ssh", lambda *_a, **_k: _dial(0))
+        monkeypatch.setattr(attach_client, "_probe_session", fake_probe)
+        monkeypatch.setattr(attach_client, "_stdout_is_tty", lambda: False)
+        monkeypatch.setattr(attach_client, "_term_width", lambda: 100)
+        monkeypatch.setattr(attach_client.time, "monotonic", lambda: 0.0)
+        monkeypatch.setattr(attach_client.time, "sleep", lambda _s: None)
+        rc = attach_client.supervise("user@host", "remote", "api", **kwargs)
+        assert rc == 0
+        return asked
+
+    def test_a_tmux_pane_asks_tmux_whether_its_session_survived(self, monkeypatch):
+        # Asking psmux on a Linux node would answer "command not found" for a
+        # perfectly live session, and the pane would never read a detach.
+        assert self._asked(monkeypatch, mux="tmux") == ["tmux"]
+
+    def test_a_psmux_pane_still_asks_psmux(self, monkeypatch):
+        assert self._asked(monkeypatch) == ["psmux"]
+
+    def test_a_node_pane_that_gives_up_names_magent_up_as_the_repair(
+        self, monkeypatch, capsys
+    ):
+        # `magent attach` knows nothing about nodes; a node session is brought
+        # back from this PC by `magent up`, a top-up that recreates only the
+        # missing sessions. The psmux wording is pinned by TestSupervise's
+        # test_a_session_that_stays_gone_stops_instead_of_hammering_sshd.
+        rc, _calls, _sleeps = _drive(
+            monkeypatch,
+            [0] * attach_client.SESSION_MISSING_MAX,
+            probes=[attach_client.SESSION_GONE] * attach_client.SESSION_MISSING_MAX,
+            mux="tmux",
+        )
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "Run magent up to bring it back." in out
+        assert "magent attach" not in out
+
+    def test_a_failed_no_reconnect_node_pane_names_magent_up_too(
+        self, monkeypatch, capsys
+    ):
+        rc, _calls, _sleeps = _drive(monkeypatch, [1], reconnect=False, mux="tmux")
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "Run magent up to bring it back." in out
+        assert "magent attach" not in out
+
+    def test_an_unknown_multiplexer_is_refused_before_any_ssh_is_dialled(
+        self, monkeypatch
+    ):
+        # Otherwise the ValueError would only surface out of the probe after
+        # the first disconnect, possibly hours into a live session.
+        def no_dial(*_a, **_k):
+            pytest.fail("ssh must not be dialled for an unknown mux")
+
+        monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/usr/bin/ssh")
+        monkeypatch.setattr(attach_client, "_run_ssh", no_dial)
+        with pytest.raises(ValueError, match="screen"):
+            attach_client.supervise("user@host", "remote", "api", mux="screen")
+
+
+class TestOneSshClientForTheProbeAndThePane:
+    """``find_ssh`` is THE rule for which ssh client magent runs, shared with
+    ``remote_mux``: Windows' own OpenSSH first, PATH only as the fallback. Two
+    clients on one PC share ``~/.ssh`` but not the agent (the Windows agent is
+    a named pipe, MSYS ssh asks ``SSH_AUTH_SOCK``), so a bring-up that
+    succeeded through one could open a pane that fails through the other.
+    Every test here fakes the system directory -- none resolves a real ssh."""
+
+    @pytest.fixture
+    def system(self, tmp_path, monkeypatch):
+        system = tmp_path / "System32"
+        (system / "OpenSSH").mkdir(parents=True)
+        monkeypatch.setattr(attach_client, "_system_directory", lambda: system)
+        return system
+
+    def test_the_system_openssh_wins_over_path(self, system, monkeypatch):
+        (system / "OpenSSH" / "ssh.exe").write_bytes(b"")
+        monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/msys/bin/ssh")
+        assert real_find_ssh() == str(system / "OpenSSH" / "ssh.exe")
+
+    def test_path_is_the_fallback_without_a_system_openssh(self, system, monkeypatch):
+        monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/msys/bin/ssh")
+        assert real_find_ssh() == "/msys/bin/ssh"
+
+    def test_a_folder_named_ssh_exe_is_not_a_client(self, system, monkeypatch):
+        (system / "OpenSSH" / "ssh.exe").mkdir()
+        monkeypatch.setattr(attach_client.shutil, "which", lambda _n: None)
+        assert real_find_ssh() is None
+
+    def test_no_system_directory_reads_path(self, monkeypatch):
+        monkeypatch.setattr(attach_client, "_system_directory", lambda: None)
+        monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/usr/bin/ssh")
+        assert real_find_ssh() == "/usr/bin/ssh"
+
+    def test_the_system_directory_is_windows_own(self):
+        found = real_system_directory()
+        if sys.platform == "win32":
+            assert found is not None
+            assert (found / "kernel32.dll").is_file()
+        else:
+            assert found is None
+
+    def test_the_pane_and_the_probe_dial_the_resolved_client(self, monkeypatch):
+        client = r"C:\Windows\System32\OpenSSH\ssh.exe"
+        monkeypatch.setattr(attach_client, "find_ssh", lambda: client)
+        assert attach_client.ssh_argv("amin@h", "tmux attach")[0] == client
+        assert attach_client.session_probe_argv("amin@h", "api", "tmux")[0] == client
+        assert (
+            attach_client.pane_command("amin@h", "api", None, mux="tmux")[0] == client
+        )
+
+    def test_no_client_found_leaves_the_bare_name_for_the_spawn_to_report(
+        self, monkeypatch
+    ):
+        # Resolved nowhere: the spawn's own "not found" (SSH_MISSING_RC in
+        # _run_ssh, PROBE_FAILED in the probe) stays the one missing-client path.
+        monkeypatch.setattr(attach_client, "find_ssh", lambda: None)
+        assert attach_client.ssh_argv("amin@h", "tmux attach")[0] == "ssh"
+        assert attach_client.session_probe_argv("amin@h", "api", "tmux")[0] == "ssh"
+
+    def test_supervise_dials_the_system_client_with_none_on_path(self, monkeypatch):
+        client = r"C:\Windows\System32\OpenSSH\ssh.exe"
+        dialled: list[list[str]] = []
+        monkeypatch.setattr(attach_client, "find_ssh", lambda: client)
+        monkeypatch.setattr(
+            attach_client.shutil, "which", lambda name: name if name == client else None
+        )
+
+        def fake_run(argv, **_kwargs):
+            dialled.append(list(argv))
+            return _dial(0)
+
+        monkeypatch.setattr(attach_client, "_run_ssh", fake_run)
+        rc = attach_client.supervise(
+            "amin@h", "tmux attach", "api", mux="tmux", reconnect=False
+        )
+        assert rc == 0
+        assert [argv[0] for argv in dialled] == [client]
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="GetSystemDirectoryW is win32")
+    def test_a_failed_system_directory_probe_reads_as_none(self, monkeypatch):
+        import ctypes
+
+        monkeypatch.setattr(
+            ctypes.windll.kernel32, "GetSystemDirectoryW", lambda _buf, _n: 0
+        )
+        assert real_system_directory() is None
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="GetSystemDirectoryW is win32")
+    @pytest.mark.parametrize("needed", [260, 300])
+    def test_a_system_directory_too_long_for_the_buffer_reads_as_none(
+        self, monkeypatch, needed
+    ):
+        # Too small a buffer is answered with the size it NEEDS (terminator
+        # included), and what the buffer holds then is undefined -- a partial
+        # path, never one to build ssh.exe's location from.
+        import ctypes
+
+        def partial(buf, _n):
+            buf.value = r"C:\Windo"
+            return needed
+
+        monkeypatch.setattr(ctypes.windll.kernel32, "GetSystemDirectoryW", partial)
+        assert real_system_directory() is None

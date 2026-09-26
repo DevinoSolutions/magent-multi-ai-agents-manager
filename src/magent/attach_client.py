@@ -36,7 +36,9 @@ WHY ITS OWN CONSOLE SCRIPT rather than a ``magent`` subcommand: the same reason
 attach starts 40 of these, and booting the click CLI in each -- the
 registration hub imports every command module, then a config load follows -- is
 exactly the cost that once made a big attach take minutes. Imports here are
-stdlib plus ``click`` (already a base dependency, and only for echo/styling).
+stdlib plus ``click`` (already a base dependency, and only for echo/styling),
+``magent.style`` and ``magent.titles`` at top level; ``magent.env`` in-body, on
+the spawn path only.
 
 WHAT AN OUTAGE LOOKS LIKE. Loudly, once: a pane on flaky wi-fi used to print
 three lines per attempt -- ours announcing the drop, ours announcing the
@@ -67,15 +69,25 @@ meant to send.
 
 CORPSE COHERENCE -- read this before changing the argv. ``cli/attach.py``
 decides a pane is dead by scanning live process command lines for
-``-L <sid> attach`` (``_attach_markers``) among ``_CLIENT_PROCESS_NAMES``.
-During a backoff sleep there is no ssh process at all, so this supervisor is
-what has to carry the marker -- and it does, for free, because
-``_spawn_windows`` hands us the remote command it would otherwise have given
-ssh, as our own ``--remote`` argument. The marker therefore appears verbatim in
-this process's command line. Do NOT "simplify" that by rebuilding the remote
-command from ``--session`` and dropping the argument: the pane would read as a
-corpse the moment it started backing off, and the next ``magent attach`` would
-close a window that was busy healing itself.
+``-L <sid> attach`` (``_attach_markers``) among ``_CLIENT_PROCESS_NAMES``. For
+a node pane the marker is the tmux spelling instead,
+``-L magent attach -t '=<sid>'`` (``_attach_markers(sid, "tmux")``); each
+multiplexer's marker matches its own ``remote_attach_command`` and no other
+session's command, with one conservative exception: a psmux session named
+``magent`` (any case: matching is case-insensitive) shares its marker's text
+with the node socket, so a live node pane keeps it looking alive. During a
+backoff sleep there is no ssh process at all, so this supervisor is what has
+to carry the marker -- and it does, for free, because ``spawn_attach_window``
+(below) hands us the remote command it would otherwise have given ssh, as our
+own ``--remote`` argument. The marker therefore appears verbatim in this
+process's command line -- ``-L <sid> attach`` for a psmux pane,
+``-L magent attach -t '=<sid>'`` for a node's tmux one. That is also why an
+explicit remote must be ``remote_attach_command(sid, mux)``'s spelling (or
+contain its marker): a remote for the other multiplexer makes a live pane read
+as dead. Do NOT "simplify" any of this by rebuilding the remote command from
+``--session`` and dropping the argument: the pane would read as a corpse the
+moment it started backing off, and the next ``magent attach`` would close a
+window that was busy healing itself.
 """
 
 from __future__ import annotations
@@ -85,11 +97,13 @@ import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 import click
 
 from magent.style import style
+from magent.titles import make_title
 
 if TYPE_CHECKING:
     from typing import IO
@@ -313,7 +327,25 @@ MIN_WIDTH = 20
 MIN_ROWS = 1
 
 
-def remote_attach_command(sid: str) -> str:
+# The multiplexers an attach pane can drive. psmux is the historical default: a
+# Windows magent host, one psmux server PER SESSION, its socket named after the
+# sid. tmux is a node's (spec D10): ONE server per node user on the socket
+# below, every session on it, named by sid -- which is what lets a phone's
+# `tmux -L magent attach` list every session in its picker. TMUX_SOCKET (the
+# one owner of that name; remote_mux re-exports it) sits beside
+# SSH_MISSING_RC.
+MUXES = ("psmux", "tmux")
+
+
+def _check_mux(mux: str) -> None:
+    """Refuse a multiplexer this module cannot spell, rather than guess one."""
+    if mux not in MUXES:
+        raise ValueError(
+            f"unknown multiplexer {mux!r} (expected one of: {', '.join(MUXES)})"
+        )
+
+
+def remote_attach_command(sid: str, mux: str = "psmux") -> str:
     """The remote command an attach pane runs, for session ``sid``.
 
     Direct ``psmux attach`` first: it connects in well under a second, where
@@ -321,19 +353,78 @@ def remote_attach_command(sid: str) -> str:
     windows on a loaded host) made a big attach take many minutes. The session
     picker is only the fallback, for a session id the host no longer has.
 
+    ``mux="tmux"`` is a node pane. Its target is ``=<sid>``, tmux's EXACT
+    match: a bare ``-t api`` is a prefix match, harmless on psmux's one
+    session per socket but, on a node's shared socket, able to land the pane
+    in ``api2``. The target is single-quoted because this string is parsed by
+    the node user's login shell, and zsh would expand a bare leading ``=`` as a
+    command lookup; quoted, every shell hands tmux ``=<sid>``. No picker
+    fallback: a node runs no magent at all, so ``|| magent sessions`` would
+    only print "command not found".
+
     Single-sourced here because ``cli/attach.py::_attach_markers`` has to
     recognize this exact spelling in a live process's command line -- the two
     drifting apart would make every healthy pane read as a corpse.
     """
+    _check_mux(mux)
+    if mux == "tmux":
+        return f"tmux -L {TMUX_SOCKET} attach -t '={sid}'"
     return f"psmux -L {sid} attach || magent sessions {sid}"
+
+
+def _system_directory() -> Path | None:
+    """Windows' system directory (``GetSystemDirectoryW``), or None off
+    Windows or when the probe fails. A seam: tests/conftest.py::_no_real_ssh
+    answers None for every test, so no test finds the real OpenSSH."""
+    if sys.platform != "win32":
+        return None
+    import ctypes  # win-only: ctypes.windll doesn't exist off Windows
+
+    buffer = ctypes.create_unicode_buffer(260)
+    try:
+        written = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, len(buffer))
+    except OSError:
+        return None
+    # 0 is failure; len(buffer) or more is the size it NEEDED, with the buffer
+    # holding nothing to trust. Only a count that fit is a path.
+    return Path(buffer.value) if 0 < written < len(buffer) else None
+
+
+def find_ssh() -> str | None:
+    """THE ssh client magent runs, or None: Windows' own
+    ``<system dir>\\OpenSSH\\ssh.exe`` when it exists, else whatever ``ssh``
+    PATH offers. One rule for every ssh magent spawns at a node -- this
+    module's pane and probe, and ``remote_mux``'s calls -- because two
+    clients on one PC share ``~/.ssh`` but NOT the agent (the Windows agent is
+    a named pipe, MSYS ssh asks ``SSH_AUTH_SOCK``): under Git Bash, PATH
+    finds MSYS ssh, and a key only the Windows agent holds would let the
+    bring-up succeed through one client and the window fail through the
+    other. System directory first, PATH only as the fallback -- the shape of
+    ``platform/windows.py::_schtasks_exe``. Not cached: a pane asks once per
+    dial, and PATH may change under a long-lived supervisor."""
+    system = _system_directory()
+    if system is not None:
+        client = system / "OpenSSH" / "ssh.exe"
+        if client.is_file():
+            return str(client)
+    return shutil.which("ssh")
+
+
+def ssh_program() -> str:
+    """argv[0] of every host-facing ssh magent builds -- this module's pane
+    and probe, and ``cli/attach.py``'s status poll, ``serve --ensure`` hop and
+    ``--no-mux`` pane: the client ``find_ssh`` resolved, or the bare name when
+    there is none, so the spawn's own not-found stays the one missing-client
+    path (``SSH_MISSING_RC`` in ``_run_ssh``, ``PROBE_FAILED`` in the probe)."""
+    return find_ssh() or "ssh"
 
 
 def ssh_argv(target: str, remote: str) -> list[str]:
     """The interactive ssh invocation an attach pane runs."""
-    return ["ssh", *SSH_CONNECTION_OPTS, "-t", target, remote]
+    return [ssh_program(), *SSH_CONNECTION_OPTS, "-t", target, remote]
 
 
-def session_probe_argv(target: str, session: str) -> list[str]:
+def session_probe_argv(target: str, session: str, mux: str = "psmux") -> list[str]:
     """The one-shot, non-interactive question "is ``session`` still alive?".
 
     ``psmux``, not ``magent``: the answer must not depend on the host having a
@@ -352,20 +443,30 @@ def session_probe_argv(target: str, session: str) -> list[str]:
     "command not found" (9009 on cmd, 127 on a POSIX shell), i.e. non-zero, i.e.
     NOT ``SESSION_ALIVE`` -- so the pane keeps trying rather than closing. Only
     a positive, unambiguous rc 0 is allowed to stop a pane.
+
+    ``mux="tmux"`` asks a node's one shared ``magent`` socket, by EXACT name
+    (``=<session>``): on a shared socket a prefix match would let a live
+    ``api2`` vouch for a dead ``api``. Single-quoted for the same reason as
+    ``remote_attach_command``'s: the argv is a list, but its last element
+    reaches the node as a string the login shell parses, and zsh would expand
+    a bare ``=``. tmux exits 1 for a missing session AND
+    for a server that is not running, so both read as gone -- the same bias
+    toward "keep trying".
     """
-    return [
-        "ssh",
-        *SESSION_PROBE_OPTS,
-        target,
-        f"psmux -L {session} has-session -t {session}",
-    ]
+    _check_mux(mux)
+    if mux == "tmux":
+        question = f"tmux -L {TMUX_SOCKET} has-session -t '={session}'"
+    else:
+        question = f"psmux -L {session} has-session -t {session}"
+    return [ssh_program(), *SESSION_PROBE_OPTS, target, question]
 
 
-def _probe_session(target: str, session: str) -> str:
-    """Ask the host whether ``session`` is still there. Never raises."""
+def _probe_session(target: str, session: str, mux: str = "psmux") -> str:
+    """Ask the host whether ``session`` is still there. Never raises for a
+    ``mux`` the parser accepted (``--mux`` is argparse ``choices``)."""
     try:
         rc = subprocess.run(
-            session_probe_argv(target, session),
+            session_probe_argv(target, session, mux),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
@@ -384,6 +485,133 @@ def _probe_session(target: str, session: str) -> str:
         # right now, so the session's fate is simply unknown.
         return PROBE_FAILED
     return SESSION_GONE
+
+
+def pane_command(
+    target: str,
+    sid: str,
+    supervisor: str | None,
+    *,
+    mux: str = "psmux",
+    remote: str | None = None,
+) -> list[str]:
+    """What one attach pane runs: this supervisor, or bare ssh.
+
+    Both spellings drive the SAME ssh options and the SAME remote command
+    (this module owns both), so the only difference between them is who is
+    left standing when the connection drops: with the supervisor the pane
+    reconnects itself, without it the pane becomes a corpse for the next
+    ``magent attach`` to sweep.
+
+    The supervisor form passes ``--remote`` explicitly rather than letting the
+    supervisor derive it: that argument is what puts the attach marker into the
+    supervisor's own command line, which is how ``cli/attach.py::_dead_sids``
+    can tell a pane mid-reconnect from a dead one (see CORPSE COHERENCE above).
+    An explicit ``remote`` must be ``remote_attach_command(sid, mux)``'s
+    spelling (or contain its marker): ``_attach_markers(sid, mux)`` is what the
+    corpse scan looks for, and a remote for the other multiplexer makes a live
+    pane read as dead.
+
+    ``--mux`` is appended only for a non-default multiplexer, and LAST, so a
+    psmux pane's argv is byte-for-byte what it always was; the supervisor needs
+    it to ask the right multiplexer whether the session survived a drop.
+
+    An unknown ``mux`` raises ``ValueError`` here, before any window exists:
+    even with an explicit ``remote`` the supervisor would refuse ``--mux`` at
+    startup, and the pane would die on arrival.
+    """
+    _check_mux(mux)
+    if remote is None:
+        remote = remote_attach_command(sid, mux)
+    if supervisor is None:
+        return ssh_argv(target, remote)
+    mux_args = [] if mux == "psmux" else ["--mux", mux]
+    return [
+        supervisor,
+        "--target",
+        target,
+        "--session",
+        sid,
+        "--remote",
+        remote,
+        *mux_args,
+    ]
+
+
+def client_exe() -> str | None:
+    """Where this supervisor's console script resolves on PATH, or None.
+
+    The one lookup every attach-window spawn and ``magent attach``'s
+    once-per-batch "not on PATH" warning share, so a single seam decides both.
+    Never assumed present: an editable checkout that predates the console
+    script, a PATH that exposes ``magent`` from somewhere its siblings are not,
+    or a partially-upgraded install all reach here.
+    """
+    return shutil.which(CLIENT_EXE_NAME)
+
+
+def spawn_attach_window(
+    target: str,
+    sid: str,
+    *,
+    mux: str,
+    remote: str | None = None,
+    reconnect: bool = True,
+) -> str:
+    """Open ONE Windows Terminal window attached to ``sid`` on ``target``.
+
+    The single wt spawn behind every remote attach pane -- ``magent attach``'s
+    per-session loop (``cli/attach.py::_spawn_windows``) and a node project's
+    bring-up both come through here, so the ``magent:<sid>`` title, its lock
+    against the program inside the tab (``--suppressApplicationTitle``, MD006),
+    the pane command and the corpse marker that command carries cannot drift
+    apart. It lives in this leaf, not in ``cli/``, because the node bring-up
+    callers are src modules, which never import the cli package (LS-A-001).
+
+    ``remote`` is the command the pane runs on the far side. Leave it out:
+    ``pane_command`` derives ``remote_attach_command(sid, mux)`` from ``mux``,
+    so the caller names the multiplexer exactly once. An explicit one is passed
+    through verbatim and carries ``pane_command``'s contract -- it must contain
+    ``_attach_markers(sid, mux)``'s marker, or a live pane reads as dead.
+
+    ``reconnect=False`` reproduces the historical bare-ssh pane. A supervisor
+    missing from PATH degrades to that same bare pane SILENTLY: a batch caller
+    says so once for the whole batch, not once per window.
+
+    Returns the window title it used. Windows are found by title everywhere in
+    magent (tiling, attach dedupe, the corpse sweep), so a caller that tracks
+    the window takes this return value rather than building its own title --
+    one ``make_title`` call per window, never two that could disagree. The
+    ``wt`` launcher's pid is not returned: wt hands the window to the running
+    Terminal and exits, so it identifies nothing a caller could use.
+    """
+    # Built BEFORE anything is spawned: an unknown `mux` raises here, so a
+    # window that would die on arrival is never opened.
+    pane = pane_command(
+        target, sid, client_exe() if reconnect else None, mux=mux, remote=remote
+    )
+    # heavy subsystem: in-body per policy (magent.env pulls pydantic in).
+    from magent.env import attach_client_env
+
+    # `env=`: an attach pane is a RENDERER, not an agent host -- everything
+    # survives (nesting markers included) except a colour override an agent
+    # harness leaked into us, which would paint this pane monochrome. None
+    # when no harness marker is present, i.e. plain inheritance.
+    title = make_title(sid)
+    subprocess.Popen(
+        [
+            "wt",
+            "-w",
+            "new",
+            "--title",
+            title,
+            "--suppressApplicationTitle",
+            "--",
+            *pane,
+        ],
+        env=attach_client_env(),
+    )
+    return title
 
 
 def verdict(rc: int, probe: str | None = None) -> str:
@@ -865,15 +1093,38 @@ def _wait(
     )
 
 
-def supervise(target: str, remote: str, session: str, *, reconnect: bool = True) -> int:
+def _repair_command(mux: str) -> str:
+    """The command a stopped pane tells the user to run to bring its session
+    back. A psmux session lives on a magent host, whose bring-up ``magent
+    attach`` re-runs; a node (tmux) session is brought up from this PC by
+    ``magent up`` -- a top-up that recreates only the missing sessions, so it
+    needs no name -- and ``magent attach`` knows nothing about nodes."""
+    return "magent up" if mux == "tmux" else "magent attach"
+
+
+def supervise(
+    target: str,
+    remote: str,
+    session: str,
+    *,
+    reconnect: bool = True,
+    mux: str = "psmux",
+) -> int:
     """Run the attach connection, reconnecting until told to stop.
 
     Returns the exit code the pane should carry. ``reconnect=False`` reproduces
     the historical bare-ssh behavior exactly (one connection, whatever code it
     exits with) for ``magent attach --no-reconnect``.
+
+    ``mux`` decides what the post-disconnect probe asks the host (psmux on a
+    magent host, tmux on a node) and which repair a stopped pane names; the
+    connection itself is the same ssh.
     """
-    if shutil.which("ssh") is None:
-        _echo(f"  {style('x', fg='red')} ssh is not on PATH -- cannot attach.")
+    # Refused before any ssh is dialled: an unknown mux would otherwise only
+    # surface after the first disconnect, possibly hours in, out of the probe.
+    _check_mux(mux)
+    if shutil.which(ssh_program()) is None:
+        _echo(f"  {style('x', fg='red')} no ssh client found -- cannot attach.")
         return SSH_MISSING_RC
 
     argv = ssh_argv(target, remote)
@@ -924,7 +1175,7 @@ def supervise(target: str, remote: str, session: str, *, reconnect: bool = True)
             probe = (
                 None
                 if not reconnect or rc == SSH_TRANSPORT_RC
-                else _probe_session(target, session)
+                else _probe_session(target, session, mux=mux)
             )
             outcome = verdict(rc, probe)
             if outcome == DETACHED:
@@ -942,7 +1193,7 @@ def supervise(target: str, remote: str, session: str, *, reconnect: bool = True)
                 _dump(detail)
                 _echo(
                     f"  {style('The session may be gone on the host. Run', dim=True)}"
-                    f" {style('magent attach', bold=True)}"
+                    f" {style(_repair_command(mux), bold=True)}"
                     f" {style('to bring it back.', dim=True)}"
                 )
                 return rc
@@ -965,7 +1216,7 @@ def supervise(target: str, remote: str, session: str, *, reconnect: bool = True)
                     _dump(detail)
                     _echo(
                         f"  {style('Run', dim=True)}"
-                        f" {style('magent attach', bold=True)}"
+                        f" {style(_repair_command(mux), bold=True)}"
                         f" {style('to bring it back.', dim=True)}"
                     )
                     # rc is untrustworthy here by construction (a Windows host
@@ -1009,6 +1260,9 @@ class Options(NamedTuple):
     session: str
     remote: str
     reconnect: bool
+    # Which multiplexer holds the session: picks the default remote command,
+    # what the post-disconnect probe asks, and the repair a stopped pane names.
+    mux: str
 
 
 def parse_args(args: list[str]) -> Options:
@@ -1027,7 +1281,11 @@ def parse_args(args: list[str]) -> Options:
         ),
     )
     parser.add_argument("--target", required=True, help="SSH target (user@host)")
-    parser.add_argument("--session", required=True, help="psmux session id")
+    parser.add_argument(
+        "--session",
+        required=True,
+        help="session id (a psmux socket, or a tmux session on a node)",
+    )
     parser.add_argument(
         "--remote",
         default=None,
@@ -1039,15 +1297,23 @@ def parse_args(args: list[str]) -> Options:
         action="store_false",
         help="Exit when the connection drops instead of reconnecting",
     )
+    parser.add_argument(
+        "--mux",
+        choices=MUXES,
+        default="psmux",
+        help="multiplexer holding the session: psmux (a magent host) or tmux (a node)",
+    )
     ns = parser.parse_args(args)
     session = str(ns.session)
+    mux = str(ns.mux)
     return Options(
         target=str(ns.target),
         session=session,
         # A caller that omits --remote gets the same command, but then its own
         # argv carries no attach marker -- see the corpse-coherence note.
-        remote=str(ns.remote) if ns.remote else remote_attach_command(session),
+        remote=str(ns.remote) if ns.remote else remote_attach_command(session, mux),
         reconnect=bool(ns.reconnect),
+        mux=mux,
     )
 
 
@@ -1055,7 +1321,11 @@ def main(argv: list[str] | None = None) -> int:
     opts = parse_args(sys.argv[1:] if argv is None else argv)
     try:
         return supervise(
-            opts.target, opts.remote, opts.session, reconnect=opts.reconnect
+            opts.target,
+            opts.remote,
+            opts.session,
+            reconnect=opts.reconnect,
+            mux=opts.mux,
         )
     except KeyboardInterrupt:
         # Ctrl+C during a backoff sleep is the documented way out of a pane

@@ -147,6 +147,18 @@ class ProjectConfig:
     push: list[str] | None = None
 
 
+def is_cloud(proj: ProjectConfig) -> bool:
+    """A cloud project: a LOCAL pane driving a cloud session (PR-J)."""
+    return proj.node == NODE_CLOUD
+
+
+def runs_on_node(proj: ProjectConfig) -> bool:
+    """THE node-skip predicate (DECISION-15): pinned to a pool node or
+    ``auto``. Never ``if proj.node:`` -- that would drop cloud projects,
+    which run here. Raw dicts spell it ``p.get("node") not in (None, "cloud")``."""
+    return proj.node is not None and not is_cloud(proj)
+
+
 @dataclass
 class MagentConfig:
     projects: list[ProjectConfig]
@@ -723,6 +735,39 @@ def _check_node_projects(
             )
 
 
+def _check_session_names(projects: list[ProjectConfig], default_tool: str) -> None:
+    """A node project's session id is its own (PR-D).
+
+    ``magent down`` also kills a node project's session id LOCALLY -- the
+    session a project left behind here before it gained a ``node`` -- so a
+    local project sharing that id would be stopped with it, and two node
+    projects sharing one would collide on the node. Both pairs already collide
+    on the window title. Disabled projects count (enabling one later must not
+    be what breaks a loaded config); IDE projects do not (an editor window has
+    no session, and a node-pinned IDE project stays on this PC). Two LOCAL
+    projects sharing an id stay today's first-wins dedupe."""
+    # In-body: the same derivation psmux.eligible_projects and nodes.node_sid
+    # use, without making this leaf import them for every config load.
+    from magent.psmux import session_name
+    from magent.sessions import is_ide_tool
+    from magent.titles import get_leaf_name
+
+    seen: dict[str, list[int]] = {}
+    for i, proj in enumerate(projects):
+        if is_ide_tool(proj.tool or default_tool):
+            continue
+        sid = session_name(proj.title or get_leaf_name(proj.path))
+        for j in seen.get(sid, []):
+            if runs_on_node(proj) or runs_on_node(projects[j]):
+                raise ConfigError(
+                    f"projects[{j}] ({projects[j].path}) and projects[{i}] "
+                    f"({proj.path}) share the session name {sid!r}, and a node "
+                    "project's session must be its own; give one of them a "
+                    'distinct "title"'
+                )
+        seen.setdefault(sid, []).append(i)
+
+
 def load_config(path: str) -> MagentConfig:
     config_path = Path(path)
     if not config_path.exists():
@@ -772,6 +817,7 @@ def load_config(path: str) -> MagentConfig:
     _backfill_colors(projects)
     settings = _parse_settings(settings_raw)
     _check_node_projects(projects, settings.nodes)
+    _check_session_names(projects, settings.default_tool)
 
     return MagentConfig(
         projects=projects,

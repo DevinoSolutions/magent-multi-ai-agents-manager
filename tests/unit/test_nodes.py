@@ -8,6 +8,8 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import threading
 from dataclasses import MISSING
 from pathlib import Path, PurePosixPath
 
@@ -15,11 +17,13 @@ import pytest
 
 from magent import nodes, psmux, remote_mux
 from magent.config import (
+    DEFAULT_TOOLS,
     MagentConfig,
     NodeConfig,
     ProjectConfig,
     Settings,
 )
+from magent.lockfile import LockHeld, lock_path
 from magent.nodes import (
     LoadSample,
     LocalGitState,
@@ -30,6 +34,7 @@ from magent.nodes import (
     RepoSpec,
     node_for_nick,
 )
+from magent.sessions import IDE_TOOLS, is_ide_tool
 from tests.conftest import REAL_MAGENT_DIR
 
 NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
@@ -196,6 +201,8 @@ class TestTheNodeMap:
                 "placed_ts": 1727200000.0,
                 "attached_existing": False,
                 "remote_root": "/home/amin/magent/api",
+                "target": "",
+                "cwd": "",
             }
         }
 
@@ -368,6 +375,314 @@ class TestTheStrictRead:
         with pytest.raises(OSError, match="I/O error"):
             nodes.load_node_map_strict()
         assert (busy.reads, sleeps) == (1, [])
+
+
+class TestTheMapRecordsHowToReachASession:
+    def test_target_and_cwd_round_trip(self, node_map):
+        entry = dataclasses.replace(
+            ENTRY, target="amin@devino-second", cwd="/home/amin/magent/api"
+        )
+        nodes.write_node_map({"api": entry})
+        assert nodes.read_node_map() == {"api": entry}
+
+    def test_an_entry_written_before_pr_d_reads_with_empty_target_and_cwd(
+        self, node_map
+    ):
+        node_map.parent.mkdir(parents=True)
+        old = {
+            k: v
+            for k, v in dataclasses.asdict(ENTRY).items()
+            if k not in ("target", "cwd")
+        }
+        node_map.write_text(json.dumps({"api": old}), encoding="utf-8")
+        assert nodes.read_node_map()["api"].target == ""
+        assert nodes.read_node_map()["api"].cwd == ""
+
+    def test_a_non_string_target_reads_as_empty_not_as_a_dropped_entry(self, node_map):
+        node_map.parent.mkdir(parents=True)
+        raw = {**dataclasses.asdict(ENTRY), "target": 7, "cwd": ["x"]}
+        node_map.write_text(json.dumps({"api": raw}), encoding="utf-8")
+        assert nodes.read_node_map()["api"].target == ""
+        assert nodes.read_node_map()["api"].cwd == ""
+
+    def test_an_update_changes_one_project_and_keeps_the_rest(self, node_map):
+        nodes.write_node_map({"web": dataclasses.replace(ENTRY, sid="web")})
+        assert set(nodes.update_node_map("api", ENTRY)) == {"api", "web"}
+        assert set(nodes.read_node_map()) == {"api", "web"}
+
+    def test_an_update_with_none_removes_that_project(self, node_map):
+        nodes.write_node_map(
+            {"api": ENTRY, "web": dataclasses.replace(ENTRY, sid="web")}
+        )
+        nodes.update_node_map("api", None)
+        assert set(nodes.read_node_map()) == {"web"}
+
+    def test_removing_an_absent_project_writes_nothing(self, node_map):
+        assert nodes.update_node_map("api", None) == {}
+        assert not node_map.exists()
+
+    def test_sixteen_concurrent_updates_all_land(self, node_map):
+        # PR-D's bring-ups finish on a thread pool; the whole-map writer alone
+        # would let two finishing together erase each other.
+        threads = [
+            threading.Thread(
+                target=nodes.update_node_map,
+                args=(f"p{i}", dataclasses.replace(ENTRY, sid=f"p{i}")),
+            )
+            for i in range(16)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert set(nodes.read_node_map()) == {f"p{i}" for i in range(16)}
+
+
+class TestTheMapWriterNeverGuesses:
+    """The four ways B's landed map changed the writer (plan D, Task 3's
+    forward correction): read strictly, a persistent blocking sidecar, a
+    retried replace, and a sweep of what a killed writer stranded."""
+
+    def test_a_torn_map_is_refused_not_overwritten(self, node_map):
+        # read_node_map would call this {} and the write would erase every
+        # placement; the strict read raises and the file stays as it was.
+        node_map.parent.mkdir(parents=True)
+        torn = '{"api": {"nick": "sec'
+        node_map.write_text(torn, encoding="utf-8")
+        with pytest.raises(ValueError):
+            nodes.update_node_map("web", ENTRY)
+        assert node_map.read_text(encoding="utf-8") == torn
+
+    def test_an_empty_map_file_is_refused_naming_the_file(self, node_map):
+        # What a crash between an unsynced write and the replace leaves: the
+        # error must say WHICH file refuses every write from now on.
+        node_map.parent.mkdir(parents=True)
+        node_map.write_bytes(b"")
+        with pytest.raises(ValueError) as caught:
+            nodes.update_node_map("api", ENTRY)
+        assert str(node_map) in str(caught.value)
+        assert node_map.read_bytes() == b""
+
+    def test_the_temp_file_is_synced_before_the_replace(self, node_map, monkeypatch):
+        order: list[str] = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def fsync(fd):
+            order.append("fsync")
+            real_fsync(fd)
+
+        def replace(src, dst):
+            order.append("replace")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(nodes.os, "fsync", fsync)
+        monkeypatch.setattr(nodes.os, "replace", replace)
+        nodes.update_node_map("api", ENTRY)
+        assert order == ["fsync", "replace"]
+
+    def test_a_replace_a_reader_blocks_is_retried(self, node_map, monkeypatch):
+        # Windows: a reader holding node-map.json makes os.replace fail with
+        # PermissionError for as long as it holds the file.
+        real_replace = os.replace
+        refusals = [PermissionError(13, "held by a reader")] * 3
+        sleeps: list[float] = []
+
+        def flaky(src, dst):
+            if refusals:
+                raise refusals.pop()
+            real_replace(src, dst)
+
+        monkeypatch.setattr(nodes.os, "replace", flaky)
+        monkeypatch.setattr(nodes.time, "sleep", sleeps.append)
+        assert nodes.update_node_map("api", ENTRY) == {"api": ENTRY}
+        assert nodes.read_node_map() == {"api": ENTRY}
+        assert sleeps == [nodes._REPLACE_SLEEP_S] * 3
+        assert [p.name for p in node_map.parent.iterdir()] == ["node-map.json"]
+
+    def test_a_replace_that_stays_refused_raises_and_keeps_the_old_map(
+        self, node_map, monkeypatch
+    ):
+        nodes.write_node_map({"api": ENTRY})
+        attempts: list[str] = []
+
+        def refuse(src, dst):
+            attempts.append(src)
+            raise PermissionError(13, "held by a reader")
+
+        monkeypatch.setattr(nodes.os, "replace", refuse)
+        monkeypatch.setattr(nodes.time, "sleep", lambda s: None)
+        with pytest.raises(PermissionError):
+            nodes.update_node_map("web", ENTRY)
+        assert len(attempts) == nodes._REPLACE_RETRIES + 1
+        assert nodes.read_node_map() == {"api": ENTRY}
+        assert [p.name for p in node_map.parent.iterdir()] == ["node-map.json"]
+
+    def test_any_other_replace_error_is_not_retried(self, node_map, monkeypatch):
+        attempts: list[str] = []
+
+        def refuse(src, dst):
+            attempts.append(src)
+            raise OSError(28, "disk full")
+
+        monkeypatch.setattr(nodes.os, "replace", refuse)
+        with pytest.raises(OSError, match="disk full"):
+            nodes.update_node_map("api", ENTRY)
+        assert len(attempts) == 1
+
+    def test_a_temp_file_a_killed_writer_stranded_is_swept(self, node_map):
+        node_map.parent.mkdir(parents=True)
+        (node_map.parent / "node-map.json.k1ll3d.tmp").write_text("{", encoding="utf-8")
+        unrelated = node_map.parent / "notes.tmp"
+        unrelated.write_text("mine", encoding="utf-8")
+        nodes.update_node_map("api", ENTRY)
+        assert sorted(p.name for p in node_map.parent.iterdir()) == [
+            "node-map.json",
+            "notes.tmp",
+        ]
+
+    def test_the_sidecar_is_under_the_redirected_home_and_outlives_the_writer(
+        self, node_map
+    ):
+        # exclusive_lock unlinks its file on exit, so a waiter could lock a
+        # file the holder was about to delete. The map's sidecar never goes.
+        sidecar = lock_path(nodes.MAP_LOCK_NAME)
+        nodes.update_node_map("api", ENTRY)
+        assert sidecar == Path.home() / ".magent" / "node-map.lock"
+        assert sidecar.exists()
+        with nodes.map_lock():
+            assert sidecar.exists()
+        assert sidecar.exists()
+
+    def test_a_writer_behind_a_holder_in_this_process_says_so(self, node_map):
+        with nodes.map_lock(), pytest.raises(LockHeld):
+            nodes.update_node_map("api", ENTRY, wait_s=0.2)
+        assert not node_map.exists()
+
+
+# A second process writing the map: its own interpreter, so its own threading
+# lock. It inherits conftest's redirected HOME (so the same sidecar lock), and
+# the map path comes in argv.
+_MAP_WRITER = """
+import dataclasses, sys
+from pathlib import Path
+from magent import nodes
+
+nodes.NODE_MAP_PATH = Path(sys.argv[1])
+prefix, count = sys.argv[2], int(sys.argv[3])
+base = nodes.NodeMapEntry(
+    nick="second", sid="x", placed_ts=0.0, attached_existing=False, remote_root="~/magent/x"
+)
+for i in range(count):
+    nodes.update_node_map(f"{prefix}{i}", dataclasses.replace(base, sid=f"{prefix}{i}"))
+"""
+
+# Holds the map's sidecar lock -- the same map_lock every writer takes -- until
+# its stdin closes.
+_MAP_HOLDER = """
+import sys
+from magent import nodes
+
+with nodes.map_lock():
+    print("held", flush=True)
+    sys.stdin.read()
+"""
+
+
+class TestTheMapWriterIsSerializedAcrossProcesses:
+    """DECISION-13: `up`, `down`, G's placement and recall are separate
+    processes, and a threading lock cannot see another process. The writer
+    holds the ~/.magent/node-map.lock sidecar around read + write. That path
+    is resolved per call, not at import, so under conftest's HOME redirect it
+    lands in tmp for this process and for the children alike."""
+
+    def test_a_writer_waits_for_another_process_holding_the_map_lock(self, node_map):
+        holder = subprocess.Popen(
+            [sys.executable, "-c", _MAP_HOLDER],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        assert holder.stdin is not None
+        assert holder.stdout is not None
+        try:
+            assert holder.stdout.readline().strip() == "held"
+            with pytest.raises(LockHeld):
+                nodes.update_node_map("api", ENTRY, wait_s=0.3)
+            assert not node_map.exists()
+        finally:
+            holder.stdin.close()
+            # A child that outlives the test would keep holding the lock. It
+            # exits on its own once stdin closes; kill it only if it does not.
+            try:
+                holder.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                holder.kill()
+                holder.wait(timeout=30)
+        assert nodes.update_node_map("api", ENTRY) == {"api": ENTRY}
+        assert nodes.read_node_map() == {"api": ENTRY}
+
+    def test_two_processes_writing_disjoint_projects_lose_nothing(self, node_map):
+        # A SMOKE test: with the file lock removed it fails only ~1 run in 3.
+        # The deterministic pin is the holder test above.
+        writers = [
+            subprocess.Popen(
+                [sys.executable, "-c", _MAP_WRITER, str(node_map), prefix, "25"]
+            )
+            for prefix in ("a", "b")
+        ]
+        try:
+            codes = [w.wait(timeout=120) for w in writers]
+        finally:
+            for w in writers:
+                if w.poll() is None:
+                    w.kill()
+                w.wait(timeout=30)
+        assert codes == [0, 0]
+        assert set(nodes.read_node_map()) == {
+            f"{p}{i}" for p in "ab" for i in range(25)
+        }
+
+
+class TestF2FindsANodeFolder:
+    def _entries(self) -> dict[str, NodeMapEntry]:
+        return {
+            "API": dataclasses.replace(
+                ENTRY,
+                sid="API",
+                target="amin@devino-second",
+                cwd="/home/amin/magent/api",
+            )
+        }
+
+    def test_a_project_name_finds_its_target_and_folder(self):
+        assert nodes.open_target("API", self._entries()) == (
+            "amin@devino-second",
+            "/home/amin/magent/api",
+        )
+
+    def test_a_session_id_finds_it_too(self):
+        entries = {"My App": dataclasses.replace(self._entries()["API"], sid="My-App")}
+        assert nodes.open_target("My-App", entries) is not None
+
+    def test_without_a_cwd_there_is_no_folder_not_the_remote_root(self):
+        # remote_root keeps its `~` (DECISION-11) and a Remote-SSH folder URI
+        # does not expand one: None, so F2 falls through to /api/sessions.
+        entries = {
+            "API": dataclasses.replace(
+                self._entries()["API"], cwd="", remote_root="~/magent/api"
+            )
+        }
+        assert nodes.open_target("API", entries) is None
+
+    def test_a_project_no_node_holds_is_none(self):
+        assert nodes.open_target("other", self._entries()) is None
+
+    def test_a_cloud_placement_is_none(self):
+        entries = {"API": dataclasses.replace(self._entries()["API"], nick="cloud")}
+        assert nodes.open_target("API", entries) is None
+
+    def test_an_entry_from_before_pr_d_has_no_target_and_is_none(self):
+        assert nodes.open_target("api", {"api": ENTRY}) is None
 
 
 def _pool(entries: dict[str, NodeConfig] | None = None) -> MagentConfig:
@@ -1226,6 +1541,12 @@ class TestRecipeFor:
             project_dir=repo,
         )
         assert recipe.push_files == nodes.push_set(repo, [state], home=Path.home())
+        # Every push ships to the same place under remote_root that it had
+        # under local_root: a consumer takes relative_to(local_root) of each.
+        assert recipe.local_root == repo.resolve()
+        assert recipe.push_files
+        for pushed in recipe.push_files:
+            pushed.relative_to(recipe.local_root)
 
     def test_push_warnings_ride_along(self, repo):
         recipe = nodes.recipe_for(
@@ -1273,14 +1594,131 @@ class TestRecipeFor:
             os.symlink(repo, link, target_is_directory=True)
         except OSError:
             pytest.skip("this platform/user cannot create symlinks")
+        # The extra names link/.env while git lists repo/.env: both forms must
+        # come out under ONE root, or a relpath consumer would write the other
+        # outside remote_root on the node.
         recipe = nodes.recipe_for(
-            ProjectConfig(path=str(link), node="second"),
+            ProjectConfig(path=str(link), node="second", push=[".env"]),
             NODE,
             [_real_state(repo)],
             home=Path.home(),
             project_dir=link,
         )
         assert [r.remote_dir for r in recipe.repos] == [recipe.remote_root]
+        assert recipe.local_root == repo.resolve()
+        assert recipe.push_files
+        for pushed in recipe.push_files:
+            pushed.relative_to(recipe.local_root)
+        assert recipe.local_root / ".env" in recipe.push_files
+
+    def test_a_repo_listed_through_a_link_ships_under_the_resolved_root(
+        self, repo, tmp_path
+    ):
+        # The mirror: the project is configured at the repo itself, but git's
+        # state names it through a link -- its hits still land under local_root.
+        link = tmp_path / "sendly-link"
+        try:
+            os.symlink(repo, link, target_is_directory=True)
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second"),
+            NODE,
+            [_real_state(link)],
+            home=Path.home(),
+            project_dir=repo,
+        )
+        assert recipe.local_root == repo.resolve()
+        assert recipe.push_files
+        for pushed in recipe.push_files:
+            pushed.relative_to(recipe.local_root)
+
+    @pytest.mark.parametrize("listed_through_a_link", [False, True])
+    def test_a_git_hit_through_a_link_out_of_the_project_is_skipped(
+        self, tmp_path, listed_through_a_link
+    ):
+        # git DESCENDS a junction/directory link (measured: Git for Windows
+        # 2.52 lists `sub/.env` when `sub` is a junction out of the project).
+        # The hit is held to the extras' rule: resolved outside, it is a
+        # warning, never a push -- with the repo named directly or via a link.
+        project = tmp_path / "proj"
+        project.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / ".env").write_text("K=1\n", encoding="utf-8")
+        via = tmp_path / "via"
+        try:
+            os.symlink(outside, project / "sub", target_is_directory=True)
+            if listed_through_a_link:
+                os.symlink(project, via, target_is_directory=True)
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(project), node="second"),
+            NODE,
+            [_state(via if listed_through_a_link else project, ("sub/.env",))],
+            home=tmp_path / "home",
+            project_dir=project,
+        )
+        assert recipe.push_files == ()
+        assert recipe.warnings == ("push: sub/.env is outside the project; skipped",)
+
+    def test_a_push_that_would_land_outside_the_node_folder_is_refused(self, tmp_path):
+        # _push drops every outside target first, so this guard should never
+        # fire through recipe_for -- but it stays a refusal, never a push.
+        project = tmp_path / "proj"
+        with pytest.raises(NodeConfigError, match="outside the project"):
+            nodes._under_root(tmp_path / "elsewhere" / ".env", project, project)
+
+    @staticmethod
+    def _linked_conf(repo: Path, tmp_path: Path) -> Path:
+        """``repo/conf-link -> repo/conf`` (a directory link INSIDE the repo)
+        holding ``.env``, and the project reached as ``api-link -> repo``."""
+        (repo / "conf").mkdir()
+        (repo / "conf" / ".env").write_text("CONF=1\n", encoding="utf-8")
+        api = tmp_path / "api-link"
+        try:
+            os.symlink(repo / "conf", repo / "conf-link", target_is_directory=True)
+            os.symlink(repo, api, target_is_directory=True)
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+        return api
+
+    def test_an_extra_through_an_inner_link_keeps_its_name_via_an_outer_link(
+        self, repo, tmp_path
+    ):
+        # The extra is lexically under the configured (linked) project_dir:
+        # it ships under the name the user wrote, not its target's `conf/.env`.
+        api = self._linked_conf(repo, tmp_path)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(api), node="second", push=["conf-link/.env"]),
+            NODE,
+            [_state(repo, ())],
+            home=Path.home(),
+            project_dir=api,
+        )
+        assert recipe.warnings == ()
+        assert [p.relative_to(recipe.local_root) for p in recipe.push_files] == [
+            Path("conf-link/.env")
+        ]
+
+    def test_a_git_hit_through_an_inner_link_keeps_its_name_via_an_outer_link(
+        self, repo, tmp_path
+    ):
+        # git lists the hit under the RESOLVED repo, lexically under local_root
+        # but not under the linked project_dir: it keeps git's spelling.
+        api = self._linked_conf(repo, tmp_path)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(api), node="second"),
+            NODE,
+            [_state(repo.resolve(), ("conf-link/.env",))],
+            home=Path.home(),
+            project_dir=api,
+        )
+        assert recipe.warnings == ()
+        assert [p.relative_to(recipe.local_root) for p in recipe.push_files] == [
+            Path("conf-link/.env")
+        ]
 
     def test_a_project_inside_a_larger_repo_is_refused_as_such(self, tmp_path):
         # A monorepo subdirectory: push_set stays safe for it, but a node
@@ -1519,3 +1957,289 @@ class TestRecipeFor:
         )
         assert recipe.repos[0].url == url
         assert recipe.warnings == ()
+
+
+D_NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
+
+
+def _pool_config(*projects: ProjectConfig) -> MagentConfig:
+    return MagentConfig(
+        projects=list(projects),
+        settings=Settings(
+            nodes={
+                "second": NodeConfig(nick="second", host="devino-second", user="amin"),
+                "third": NodeConfig(nick="third", host="devino-third", user="amin"),
+            }
+        ),
+    )
+
+
+def _git_state(
+    path: Path,
+    *,
+    url: str = "git@github.com:me/api.git",
+    branch: str = "main",
+    dirty: bool = False,
+    unpushed: bool = False,
+    detached: bool = False,
+    no_commits: bool = False,
+) -> LocalGitState:
+    # Not B's `_state(path, ignored)` -- that helper already exists in this file.
+    return LocalGitState(
+        path=path,
+        url=url,
+        branch=branch,
+        dirty=dirty,
+        unpushed=unpushed,
+        detached=detached,
+        no_commits=no_commits,
+    )
+
+
+class TestANodeProjectIsNamedLikeALocalOne:
+    def test_the_title_wins_over_the_folder(self):
+        proj = ProjectConfig(path="C:/src/api-service", title="API", node="second")
+        assert nodes.project_name(proj) == "API"
+
+    def test_without_a_title_the_folder_leaf_names_it(self):
+        proj = ProjectConfig(path="C:/src/api-service", node="second")
+        assert nodes.project_name(proj) == "api-service"
+
+    def test_the_session_id_is_the_local_sanitizer_applied_to_that_name(self):
+        proj = ProjectConfig(path="C:/src/x", title="My App.v2", node="second")
+        assert nodes.node_sid(proj) == "My-App-v2"
+
+
+class TestWhichProjectsRunOnANode:
+    def test_only_enabled_non_ide_projects_pinned_to_a_pool_node_or_auto(self):
+        keep = ProjectConfig(path="C:/a/api", node="second")
+        auto = ProjectConfig(path="C:/a/web", node="auto")
+        config = _pool_config(
+            keep,
+            ProjectConfig(path="C:/a/local"),
+            ProjectConfig(path="C:/a/cloudy", node="cloud"),
+            ProjectConfig(path="C:/a/off", node="second", enabled=False),
+            ProjectConfig(path="C:/a/ide", node="second", tool="code"),
+            auto,
+        )
+        assert nodes.node_projects(config) == [keep, auto]
+
+    def test_a_group_filter_is_case_insensitive(self):
+        a = ProjectConfig(path="C:/a/api", node="second", group="Work")
+        b = ProjectConfig(path="C:/a/web", node="second", group="home")
+        assert nodes.node_projects(_pool_config(a, b), group="work") == [a]
+
+    def test_an_ide_default_tool_keeps_a_toolless_project_home(self):
+        ide = sorted(IDE_TOOLS)[0]
+        config = _pool_config(ProjectConfig(path="C:/a/api", node="second"))
+        config.settings.default_tool = ide
+        assert is_ide_tool(ide)
+        assert nodes.node_projects(config) == []
+
+    def test_an_agent_default_tool_sends_a_toolless_project_to_its_node(self):
+        agent = next(t for t in DEFAULT_TOOLS if not is_ide_tool(t))
+        proj = ProjectConfig(path="C:/a/api", node="second")
+        config = _pool_config(proj)
+        config.settings.default_tool = agent
+        assert nodes.node_projects(config) == [proj]
+
+    def test_a_second_entry_with_the_same_session_id_is_dropped(self):
+        a = ProjectConfig(path="C:/a/api", node="second")
+        dup = ProjectConfig(path="C:/b/api", node="third")
+        assert nodes.node_projects(_pool_config(a, dup)) == [a]
+
+
+class TestWhereTheProjectLandsOnTheNode:
+    def test_the_remote_folder_is_the_root_plus_the_local_folder_name(self):
+        assert nodes.remote_root_for(D_NODE, Path("C:/src/api")) == "~/magent/api"
+
+    def test_a_trailing_slash_on_the_root_does_not_double(self):
+        node = dataclasses.replace(D_NODE, root="~/magent/")
+        assert nodes.remote_root_for(node, Path("C:/src/api")) == "~/magent/api"
+
+    def test_a_drive_root_is_refused_not_placed_at_the_node_root(self, tmp_path):
+        # A nameless folder would land AT the node's root, beside every other
+        # project -- never a project directory of its own. The anchor is this
+        # OS's own root (``C:\`` here, ``/`` on POSIX): on POSIX ``Path("C:/")``
+        # is a relative folder NAMED ``C:``, not a root.
+        for root in (Path("/"), Path(tmp_path.anchor)):
+            assert root.name == ""
+            with pytest.raises(
+                NodeConfigError, match="a drive root cannot be a node project"
+            ):
+                nodes.remote_root_for(D_NODE, root)
+
+    @pytest.mark.parametrize("leaf", ["..", "api.", "api ", "a\x1fb", "a\x7fb"])
+    def test_a_leaf_that_is_not_a_folder_name_is_refused_and_named(self, leaf):
+        # ".." would climb to the node user's HOME; Windows opens "api." and
+        # "api " as "api", so the local and remote names would diverge; a
+        # control character has no business in a remote path. Refused, never
+        # rewritten.
+        project_dir = Path("C:/src") / leaf
+        assert project_dir.name == leaf
+        with pytest.raises(NodeConfigError, match="cannot name a node folder") as err:
+            nodes.remote_root_for(D_NODE, project_dir)
+        assert repr(leaf) in str(err.value)
+
+    def test_a_dot_leaf_is_refused(self):
+        # pathlib collapses a "." part, so a "." leaf reaches here only as
+        # Path(".") itself -- a folder with no name, refused like a drive root.
+        assert Path(".").name == ""
+        with pytest.raises(NodeConfigError):
+            nodes.remote_root_for(D_NODE, Path("."))
+
+    @pytest.mark.parametrize(
+        ("path", "expected"),
+        [
+            ("~", "/home/amin"),
+            ("~/magent/api", "/home/amin/magent/api"),
+            ("/srv/work/api", "/srv/work/api"),
+        ],
+    )
+    def test_a_tilde_expands_against_the_nodes_home(self, path, expected):
+        assert nodes.absolute_remote(path, "/home/amin") == expected
+
+    @pytest.mark.parametrize(
+        ("path", "home", "expected"),
+        [
+            ("~", "/home/amin/", "/home/amin"),
+            ("~/x", "/home/amin/", "/home/amin/x"),
+            ("~", "/", "/"),
+            ("~/x", "/", "/x"),
+        ],
+    )
+    def test_a_trailing_slash_on_home_gives_one_spelling(self, path, home, expected):
+        # "~" and "~/x" must encode to keys under the same home spelling.
+        assert nodes.absolute_remote(path, home) == expected
+
+    def test_recipe_for_carries_the_local_root_and_the_folder_name_rule(self, tmp_path):
+        project_dir = tmp_path / "api-service"
+        project_dir.mkdir()
+        proj = ProjectConfig(path=str(project_dir), title="API", node="second")
+        recipe = nodes.recipe_for(
+            proj,
+            D_NODE,
+            [_git_state(project_dir)],
+            home=tmp_path / "home",
+            project_dir=project_dir,
+        )
+        assert recipe.local_root == project_dir.resolve()
+        assert recipe.remote_root == "~/magent/api-service"
+        assert recipe.sid == "API"
+        # C1's other three fields are launch.node_recipe's to fill.
+        assert (recipe.tool, recipe.command, recipe.fresh_command) == ("", "", None)
+
+
+def _recipe_at(project: str, remote_root: str) -> Recipe:
+    return Recipe(
+        project=project,
+        sid=psmux.session_name(project),
+        repos=(),
+        push_files=(),
+        memory_dir=None,
+        remote_root=remote_root,
+    )
+
+
+class TestTwoProjectsNeverShareANodeFolder:
+    """Two local folders with the same leaf name (``C:/a/api``, ``C:/b/api``)
+    would both land at ``<root>/api`` -- one clone overwriting the other. The
+    leaf is unique across the whole fleet: ``auto`` placement may later put any
+    two projects on one node."""
+
+    def test_different_leaves_under_one_root_pass(self):
+        nodes.assert_distinct_remote_roots(
+            [_recipe_at("api", "~/magent/api"), _recipe_at("web", "~/magent/web")]
+        )
+
+    def test_one_leaf_under_different_roots_is_refused(self):
+        recipes = [
+            _recipe_at("api", "~/magent/api"),
+            _recipe_at("api-b", "/srv/work/api"),
+        ]
+        with pytest.raises(NodeConfigError) as caught:
+            nodes.assert_distinct_remote_roots(recipes)
+        text = str(caught.value)
+        assert "'api'" in text
+        assert "'api-b'" in text
+        assert "~/magent/api" in text
+        assert "/srv/work/api" in text
+
+    def test_no_recipes_pass(self):
+        nodes.assert_distinct_remote_roots([])
+
+    def test_a_shared_remote_root_names_both_projects_and_the_folder(self):
+        recipes = [
+            _recipe_at("API", "~/magent/api"),
+            _recipe_at("web", "~/magent/web"),
+            _recipe_at("api-b", "~/magent/api"),
+        ]
+        with pytest.raises(NodeConfigError) as caught:
+            nodes.assert_distinct_remote_roots(recipes)
+        text = str(caught.value)
+        assert "'API'" in text
+        assert "'api-b'" in text
+        assert "~/magent/api" in text
+
+
+class TestTheRefusalNamesTheFix:
+    """D7: a tree the node could not reproduce is refused, and the text says
+    exactly what to run. magent never runs it for the user."""
+
+    def test_a_clean_pushed_tree_is_not_refused(self, tmp_path):
+        assert nodes.refusal_for(_git_state(tmp_path)) is None
+
+    def test_no_origin_is_refused_even_with_allow_dirty(self, tmp_path):
+        text = nodes.refusal_for(_git_state(tmp_path, url=""), allow_dirty=True)
+        assert text is not None
+        assert "no 'origin' remote" in text
+
+    def test_a_detached_head_is_refused_even_with_allow_dirty(self, tmp_path):
+        text = nodes.refusal_for(
+            _git_state(tmp_path, detached=True, branch=""), allow_dirty=True
+        )
+        assert text is not None
+        assert "git switch <branch>" in text
+
+    def test_a_dirty_tree_names_allow_dirty(self, tmp_path):
+        text = nodes.refusal_for(_git_state(tmp_path, dirty=True))
+        assert text is not None
+        assert "dirty" in text
+        assert "--allow-dirty" in text
+
+    def test_unpushed_commits_name_the_exact_push(self, tmp_path):
+        text = nodes.refusal_for(_git_state(tmp_path, unpushed=True, branch="feat/x"))
+        assert text is not None
+        assert "git push -u origin feat/x" in text
+        assert "--allow-dirty" in text
+
+    def test_a_whitespace_only_origin_is_no_origin(self, tmp_path):
+        text = nodes.refusal_for(_git_state(tmp_path, url="  \t"), allow_dirty=True)
+        assert text is not None
+        assert "no 'origin' remote" in text
+
+    def test_an_empty_branch_is_refused_as_detached_not_as_a_blank_push(self, tmp_path):
+        # "git push -u origin , or pass" names no fix at all.
+        state = _git_state(tmp_path, unpushed=True, branch="")
+        for allow_dirty in (False, True):
+            text = nodes.refusal_for(state, allow_dirty=allow_dirty)
+            assert text is not None
+            assert "git switch <branch>" in text
+            assert "git push" not in text
+
+    def test_no_commits_is_refused_without_naming_a_push_that_cannot_work(
+        self, tmp_path
+    ):
+        # An unborn branch has nothing to push ("src refspec main does not
+        # match any") and nothing for the node to check out, so allow_dirty
+        # cannot let it through either.
+        state = _git_state(tmp_path, unpushed=True, no_commits=True)
+        for allow_dirty in (False, True):
+            text = nodes.refusal_for(state, allow_dirty=allow_dirty)
+            assert text is not None
+            assert "no commits yet" in text
+            assert "git push -u" not in text
+
+    def test_allow_dirty_lets_dirty_and_unpushed_through(self, tmp_path):
+        state = _git_state(tmp_path, dirty=True, unpushed=True)
+        assert nodes.refusal_for(state, allow_dirty=True) is None

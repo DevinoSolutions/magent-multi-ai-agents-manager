@@ -130,6 +130,16 @@ def has_claude_session(project_dir: str, config_dir: Path | None = None) -> bool
     return next(sess_dir.glob("*.jsonl"), None) is not None
 
 
+def claude_fresh_form(base_cmd: str) -> str | None:
+    """``base_cmd`` without its implicit-resume flag, or None when it has none
+    or names a session explicitly. No store is read: whether there is anything
+    to resume is the caller's question -- on this PC ``claude_fresh_command``
+    asks it, and on a pool node ``bring_up.sh`` asks the node's own store."""
+    if _EXPLICIT_RESUME_RE.search(base_cmd) or not _CONTINUE_RE.search(base_cmd):
+        return None
+    return _CONTINUE_RE.sub("", base_cmd).strip()
+
+
 def claude_fresh_command(
     base_cmd: str, project_dir: str, config_dir: Path | None = None
 ) -> str | None:
@@ -156,11 +166,10 @@ def claude_fresh_command(
     found to continue" at a dead shell. That is the honest answer for that
     store; surfacing it to the user is the caller's job.
     """
-    if _EXPLICIT_RESUME_RE.search(base_cmd) or not _CONTINUE_RE.search(base_cmd):
+    fresh = claude_fresh_form(base_cmd)
+    if fresh is None or has_claude_session(project_dir, config_dir):
         return None
-    if has_claude_session(project_dir, config_dir):
-        return None
-    return _CONTINUE_RE.sub("", base_cmd).strip()
+    return fresh
 
 
 def get_claude_session_ids(

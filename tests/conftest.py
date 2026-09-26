@@ -199,6 +199,24 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_inherited_git_repo_env(monkeypatch):
+    """No test inherits a variable that AIMS git at a repo (every name in
+    ``env.GIT_LOCAL_ENV_VARS``, i.e. ``git rev-parse --local-env-vars``).
+
+    Same family as the HOME redirect, and not theoretical: the husky pre-push
+    hook runs the full gate, pytest included, with the hook's GIT_DIR exported
+    -- an ABSOLUTE path when pushing from a worktree, which is how this
+    project works. Under it a fixture's ``git init --bare`` rewrote the real
+    repo's shared config to ``core.bare=true``, its commit landed on the real
+    checked-out branch, and its ``push -u origin main`` went to the real
+    origin (reproduced against a scratch victim). Deleting them here covers
+    every fixture's git child and every product git read under test at once.
+    """
+    for name in env.GIT_LOCAL_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_ssh(monkeypatch):
     """No test resolves the REAL ``ssh`` client. A test that installed no fake
     sees "not installed" (``remote_mux.run`` raises RemoteError rc 127), a
@@ -211,8 +229,15 @@ def _no_real_ssh(monkeypatch):
     test that proves PATH resolution) still gets the real resolver; the
     ``fake_ssh`` fixture patches the same attribute afterwards and wins. The
     ``needs_ssh`` node tier re-points it at the real client deliberately.
+
+    The attach pane's resolver is guarded too, at both of its halves:
+    ``attach_client.find_ssh`` (so an in-process pane argv names bare ``ssh``)
+    and ``attach_client._system_directory`` (so no test reads the real
+    Windows OpenSSH, including through the by-value real resolvers).
     """
     monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: None)
+    monkeypatch.setattr("magent.attach_client.find_ssh", lambda: None)
+    monkeypatch.setattr("magent.attach_client._system_directory", lambda: None)
 
 
 @pytest.fixture(autouse=True)
@@ -508,6 +533,7 @@ class FakePlatform(Platform):
         supports_attention: bool = False,
         supports_hotkey: bool = False,
         supports_wt_keybindings: bool = False,
+        supports_attach_windows: bool = False,
         supports_nudge: bool = False,
         nudge_error: Exception | None = None,
         supports_close: bool = False,
@@ -532,6 +558,7 @@ class FakePlatform(Platform):
         self._supports_attention = supports_attention
         self._supports_hotkey = supports_hotkey
         self._supports_wt_keybindings = supports_wt_keybindings
+        self._supports_attach_windows = supports_attach_windows
         self._supports_nudge = supports_nudge
         self._nudge_error = nudge_error
         self._supports_close = supports_close
@@ -617,6 +644,9 @@ class FakePlatform(Platform):
 
     def supports_wt_keybindings(self) -> bool:
         return self._supports_wt_keybindings
+
+    def supports_attach_windows(self) -> bool:
+        return self._supports_attach_windows
 
     def logon_session_is_interactive(self) -> bool:
         return self._interactive_session

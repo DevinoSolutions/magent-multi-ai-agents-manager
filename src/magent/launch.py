@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import os
-import shutil
 import socket
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import click
 
-from magent import tailnet
+from magent import attach_client, tailnet
 from magent.grid import TileSlot, compute_grid
 from magent.log import get_logger, heartbeat_fresh
 from magent.platform import (
@@ -27,6 +27,7 @@ from magent.sessions import (
     AGENT_TOOLS,
     build_resume_command,
     build_start_command,
+    fresh_start_command,
     ide_command,
     is_ide_tool,
 )
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
 
     from magent.config import MagentConfig, ProjectConfig
     from magent.env import MagentEnv
+    from magent.nodes import LocalGitState, Node, Recipe
 
 
 def spawn_detached(args: list[str], extra_flags: int = 0) -> subprocess.Popen[bytes]:
@@ -881,7 +883,9 @@ def _launch_projects(
     windows), build the tiling target list. Pure w.r.t. tiling -- it never
     moves a window."""
     has_remote = any(p.host for p in projects)
-    if has_remote and not shutil.which("ssh"):
+    # attach_client's rule, the client the remote panes dial: Windows' own
+    # OpenSSH with nothing on PATH is not a missing client.
+    if has_remote and attach_client.find_ssh() is None:
         click.echo(
             style("  ! Remote projects configured but 'ssh' not on PATH.", fg="yellow")
         )
@@ -1422,3 +1426,299 @@ def stop_psmux(names: list[str]) -> tuple[list[str], list[str]]:
     from magent.psmux import stop_sessions
 
     return stop_sessions(names)
+
+
+# ---------------------------------------------------------------------------
+# Pool nodes (PR-D): a project with "node" set runs in tmux on that machine.
+# Everything that dials a node is remote_mux; this block is the policy -- the
+# D7 refusals, one bring-up per node at a time, the map write, the window.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NodeBringUpOutcome:
+    """One node project's bring-up, for the shells to print. ``error`` is the
+    whole user-facing reason when ``ok`` is False; ``warnings`` are true but
+    non-fatal (an unshippable ``push`` entry, a refusal that was moot because
+    the session was already running). ``title`` is the one the attach window
+    opened under -- what tiling places it by -- or None when none opened."""
+
+    ok: bool
+    sid: str
+    node: str = ""
+    error: str | None = None
+    attached_existing: bool = False
+    warnings: tuple[str, ...] = ()
+    title: str | None = None
+
+
+# One bring-up per node at a time, within this process: two sessions' first
+# `new-session` racing to start the node's one tmux server, or two clones into
+# the same root, is not a failure anyone should have to diagnose. Different
+# nodes run in parallel. A threading.Lock does not reach a second magent
+# process; two `magent up`s at once can still race on one node.
+_BRING_UP_LOCKS: dict[str, threading.Lock] = {}
+_BRING_UP_LOCKS_GUARD = threading.Lock()
+
+
+def _bring_up_lock(nick: str) -> threading.Lock:
+    with _BRING_UP_LOCKS_GUARD:
+        return _BRING_UP_LOCKS.setdefault(nick, threading.Lock())
+
+
+_PROVISIONED: set[str] = set()
+
+
+def _provision_once(node: Node, config: MagentConfig) -> None:
+    """Make ``node`` able to run a project, at most once per process. Runs
+    ``remote_mux.provision_node`` (DECISION-24) and records the node only once
+    that call returns: an unreachable node raises ``RemoteError``, and the
+    next project on it retries. ``config`` is here from day one so K needs no
+    signature change.
+    Called under the node's lock, after every refusal -- a refused project
+    never provisions anything, and ``--dry-run`` never calls it."""
+    if node.nick in _PROVISIONED:
+        return
+    # heavy subsystem: in-body per policy (remote_mux: ssh + tar)
+    from magent import remote_mux
+
+    report = remote_mux.provision_node(
+        node, config, home=Path.home(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+    )
+    # Recorded only after a provision that reached the node: an unreachable
+    # node raises above and the next project on it tries again.
+    _PROVISIONED.add(node.nick)
+    for line in report.lines:
+        if line.status == "fail":
+            # A fail row never blocks the session (F3); node doctor shows it.
+            get_logger("nodes").warning(
+                "provision %s: %s: %s", node.nick, line.item, line.detail
+            )
+
+
+def _node_project_dir(config: MagentConfig, proj: ProjectConfig) -> Path | None:
+    base_dir = _expand_base_dir(config.base_dir) if config.base_dir else None
+    resolved = _resolve_path(proj.path, base_dir)
+    return Path(resolved) if resolved else None
+
+
+def node_git_states(config: MagentConfig, proj: ProjectConfig) -> list[LocalGitState]:
+    """The LOCAL git state of every repo ``proj`` is made of; ``[]`` when its
+    folder is missing or holds no repo. Raises RemoteError when git fails."""
+    # heavy subsystem: in-body per policy (remote_mux is the ssh + git layer)
+    from magent import remote_mux
+
+    project_dir = _node_project_dir(config, proj)
+    if project_dir is None:
+        return []
+    return [remote_mux.git_state(path) for path in remote_mux.repo_paths(project_dir)]
+
+
+def node_recipe(
+    config: MagentConfig, proj: ProjectConfig, node: Node, states: list[LocalGitState]
+) -> Recipe:
+    """``nodes.recipe_for`` plus what only the config knows: the tool, its
+    command, and the command's fresh form (C1). Raises NodeConfigError."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    project_dir = _node_project_dir(config, proj)
+    if project_dir is None:
+        raise nodes.NodeConfigError(f"{proj.path}: not found on this PC")
+    tool = proj.tool or config.settings.default_tool
+    command = config.settings.tools.get(tool)
+    if not command:
+        raise nodes.NodeConfigError(
+            f"{proj.path}: unknown tool '{tool}' (add under settings.tools)"
+        )
+    recipe = nodes.recipe_for(
+        proj, node, states, home=Path.home(), project_dir=project_dir
+    )
+    return replace(
+        recipe,
+        tool=tool,
+        command=command,
+        fresh_command=fresh_start_command(tool, command),
+    )
+
+
+def _node_error_text(exc: Exception) -> str:
+    """The one line a user sees for a failed node bring-up: a RemoteError's
+    last stderr line (bring_up.sh writes its reason there, prefixed
+    ``magent:``), anything else's message."""
+    # heavy subsystem: in-body per policy
+    from magent.remote_mux import RemoteError
+
+    if isinstance(exc, RemoteError):
+        lines = exc.stderr_tail.strip().splitlines()
+        return lines[-1].removeprefix("magent: ") if lines else f"exit {exc.rc}"
+    return str(exc)
+
+
+def _open_node_window(node: Node, sid: str) -> str | None:
+    """The attach window for ``sid`` on ``node`` -- C's one wt spawn, running
+    the reconnecting supervisor -- and the title it opened under (tiling
+    matches on that, never a rebuilt one). None when this platform has no
+    attach windows, or the spawn failed: a window that cannot open is logged,
+    never a failed bring-up, because the session is up either way."""
+    if not get_platform().supports_attach_windows():
+        return None
+    try:
+        # remote_mux.MUX, spelled here so this stays import-free; the pane's
+        # remote command is derived from it inside spawn_attach_window.
+        return attach_client.spawn_attach_window(node.target, sid, mux="tmux")
+    except OSError as exc:
+        get_logger("nodes").warning(
+            "attach window for %s on %s: %s", sid, node.nick, exc
+        )
+        return None
+
+
+def bring_up_node_project(
+    config: MagentConfig,
+    proj: ProjectConfig,
+    *,
+    allow_dirty: bool = False,
+    window: bool = False,
+    resume_id: str | None = None,
+) -> NodeBringUpOutcome:
+    """Bring ``proj`` up on its node. ``resume_id`` names the conversation to
+    resume (only G's ``recall --to`` passes one, after shipping that
+    conversation to the node -- DECISION-23); None lets the NODE pick --
+    ``--continue`` over its own transcripts for this folder, else the tool's
+    fresh form, so a fresh clone never starts a dead ``claude --continue``
+    (DECISION-11c). Then: resolve the node (the map's placement for
+    ``"auto"``), refuse a tree the node could not reproduce (D7) -- unless its
+    session is already running there, which is attached instead -- then,
+    under that node's lock, provision once, build the recipe, run
+    ``remote_mux.bring_up``, record the placement and open the window. Never
+    raises for a node, git or config failure: every one is an outcome."""
+    # heavy subsystem: in-body per policy (nodes + remote_mux: ssh/git/tar)
+    from magent import nodes, remote_mux
+    from magent.env import local_username
+
+    log = get_logger("nodes")
+    name = nodes.project_name(proj)
+    sid = nodes.node_sid(proj)
+    nick = ""
+    try:
+        held = nodes.read_node_map().get(name)
+        node = nodes.resolve(
+            config,
+            proj,
+            local_user=local_username(),
+            placed=held.nick if held else None,
+        )
+        nick = node.nick
+        if _node_project_dir(config, proj) is None:
+            raise nodes.NodeConfigError(f"{proj.path}: not found on this PC")
+        states = node_git_states(config, proj)
+        if not states:
+            raise nodes.NodeConfigError(
+                f"{proj.path}: no git repository; a node clones the project "
+                "from its origin"
+            )
+        refusals = [
+            text
+            for state in states
+            if (text := nodes.refusal_for(state, allow_dirty=allow_dirty))
+        ]
+        if refusals:
+            if (
+                held is not None
+                and held.nick == nick
+                and remote_mux.has_session(node, held.sid)
+            ):
+                # What is uncommitted HERE does not touch a session already
+                # running there: attach to it, and keep the refusal as a warning.
+                remote_mux.decorate(node, held.sid, nick)
+                title = _open_node_window(node, held.sid) if window else None
+                log.info(
+                    "node %s: %s already running; attached despite: %s",
+                    nick,
+                    held.sid,
+                    refusals,
+                )
+                return NodeBringUpOutcome(
+                    ok=True,
+                    sid=sid,
+                    node=nick,
+                    attached_existing=True,
+                    warnings=tuple(refusals),
+                    title=title,
+                )
+            log.info("node %s: refused %s: %s", nick, sid, refusals)
+            return NodeBringUpOutcome(
+                ok=False, sid=sid, node=nick, error="; ".join(refusals)
+            )
+        with _bring_up_lock(nick):
+            _provision_once(node, config)
+            recipe = node_recipe(config, proj, node, states)
+            result = remote_mux.bring_up(
+                node, recipe, allow_dirty=allow_dirty, resume_id=resume_id
+            )
+            warnings = recipe.warnings
+            try:
+                nodes.update_node_map(
+                    name,
+                    nodes.NodeMapEntry(
+                        nick=nick,
+                        sid=result.sid,
+                        placed_ts=time.time(),
+                        attached_existing=result.attached_existing,
+                        remote_root=recipe.remote_root,
+                        target=node.target,
+                        cwd=result.cwd,
+                    ),
+                )
+            except (ValueError, OSError) as exc:
+                # The node said yes: the session IS running there. A failed
+                # record (LockHeld past its wait, an unreadable map) is not a
+                # failed bring-up -- reporting one would invite a second. A
+                # re-run attaches to the live session and records it then.
+                log.warning(
+                    "node %s: %s up but not recorded in the node map: %s",
+                    nick,
+                    result.sid,
+                    exc,
+                )
+                # ASCII end to end: the cause is the OS's or the map's words.
+                cause = str(exc).encode("ascii", "replace").decode("ascii")
+                warnings = (
+                    *warnings,
+                    (
+                        f"up on @{nick} but not recorded ({cause}); re-run magent"
+                        " up from a clean tree or --allow-dirty"
+                    ),
+                )
+        title = _open_node_window(node, result.sid) if window else None
+        log.info(
+            "node %s: %s up (attached_existing=%s)",
+            nick,
+            result.sid,
+            result.attached_existing,
+        )
+        return NodeBringUpOutcome(
+            ok=True,
+            sid=sid,
+            node=nick,
+            attached_existing=result.attached_existing,
+            warnings=warnings,
+            title=title,
+        )
+    except (ValueError, remote_mux.RemoteError, OSError) as exc:
+        # ValueError covers NodeConfigError (its subclass) and a recipe that
+        # cannot be framed; OSError a local file that vanished mid-read, and
+        # LockHeld (the map held past its wait). A plain ValueError may also be
+        # a bug wearing an outcome, so it keeps its traceback in the log.
+        log.warning(
+            "node %s: bring-up of %s failed: %s",
+            nick or "?",
+            sid,
+            exc,
+            exc_info=isinstance(exc, ValueError)
+            and not isinstance(exc, nodes.NodeConfigError),
+        )
+        return NodeBringUpOutcome(
+            ok=False, sid=sid, node=nick, error=_node_error_text(exc)
+        )

@@ -16,6 +16,7 @@ from magent.sessions import (
     AgentTool,
     build_resume_command,
     build_start_command,
+    fresh_start_command,
     ide_command,
     is_ide_tool,
 )
@@ -59,6 +60,7 @@ class TestOneEditExtensionProof:
         assert minimal.session_ids is None
         assert minimal.resume_command is None
         assert minimal.fresh_command is None
+        assert minimal.fresh_form is None
         assert minimal.happy is False
         assert minimal.multi_window is False
 
@@ -81,6 +83,23 @@ class TestOneEditExtensionProof:
             build_start_command("mytool", "mytool --pickup", "/old")
             == "mytool --pickup"
         )
+
+    def test_the_fresh_form_is_one_dict_entry_too(self, monkeypatch):
+        """A tool teaches the store-free fresh form (what a pool node is
+        shipped) with one more field on its registry entry --
+        fresh_start_command needs no code change to honor it."""
+        extended = dict(
+            AGENT_TOOLS,
+            mytool=AgentTool(
+                fresh_form=lambda base: (
+                    base.replace(" --pickup", "") if " --pickup" in base else None
+                ),
+            ),
+        )
+        monkeypatch.setattr("magent.sessions.AGENT_TOOLS", extended)
+
+        assert fresh_start_command("mytool", "mytool --pickup") == "mytool"
+        assert fresh_start_command("mytool", "mytool") is None
 
     def test_a_tool_decides_for_itself_what_a_config_dir_means(self, monkeypatch):
         """The registry asks each tool WHICH store answers for a project; the

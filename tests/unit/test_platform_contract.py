@@ -108,6 +108,11 @@ class TestWindowsCapabilities:
 
         assert WindowsPlatform().supports_window_nudge() is True
 
+    def test_supports_attach_windows_true(self):
+        from magent.platform.windows import WindowsPlatform
+
+        assert WindowsPlatform().supports_attach_windows() is True
+
 
 @pytest.mark.skipif(
     sys.platform != "win32", reason="WindowsPlatform binds windll at import"
@@ -932,6 +937,68 @@ class TestLaunchPathSpawnsScrubTheInheritedMarkers:
         _assert_scrubbed(envs[0])
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="WindowsPlatform binds windll at import"
+)
+def test_a_windows_ssh_project_terminal_dials_the_panes_client(monkeypatch):
+    # An ssh-host terminal dials through attach_client's rule, the same client
+    # (and agent) the attach panes use -- never whatever PATH offers first.
+    from magent import attach_client
+    from magent.platform import TerminalLaunchOpts
+    from magent.platform.windows import WindowsPlatform
+
+    client = r"C:\Windows\System32\OpenSSH\ssh.exe"
+    argvs: list[list[str]] = []
+    monkeypatch.setattr(attach_client, "find_ssh", lambda: client)
+    monkeypatch.setattr(
+        "magent.platform.windows.subprocess.Popen", lambda a, **k: argvs.append(a)
+    )
+    WindowsPlatform().launch_terminal(
+        TerminalLaunchOpts(
+            title="magent:api", cwd="C:/p", command="claude", ssh_host="u@host"
+        )
+    )
+    (argv,) = argvs
+    assert argv[argv.index("/k") + 1] == client
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="WindowsPlatform binds windll at import"
+)
+@pytest.mark.parametrize(
+    "client",
+    [
+        r"C:\Program Files\OpenSSH\ssh.exe",
+        r"C:\Program Files\Git\usr\bin\ssh.exe",
+        r"C:\Tools&Co\ssh.exe",
+    ],
+)
+def test_a_client_path_cmd_would_reparse_reaches_it_as_the_bare_name(
+    monkeypatch, client
+):
+    # `cmd /k` strips the first and last quote of a line that starts with one,
+    # so a quoted C:\Program Files\... argv[0] would eat the remote command's
+    # closing quote, and an unquoted `&` would split the line in two. Only the
+    # PATH fallback yields such a path, and the bare name resolves through that
+    # same PATH to the same client.
+    from magent import attach_client
+    from magent.platform import TerminalLaunchOpts
+    from magent.platform.windows import WindowsPlatform
+
+    argvs: list[list[str]] = []
+    monkeypatch.setattr(attach_client, "find_ssh", lambda: client)
+    monkeypatch.setattr(
+        "magent.platform.windows.subprocess.Popen", lambda a, **k: argvs.append(a)
+    )
+    WindowsPlatform().launch_terminal(
+        TerminalLaunchOpts(
+            title="magent:api", cwd="C:/p", command="claude", ssh_host="u@host"
+        )
+    )
+    (argv,) = argvs
+    assert argv[argv.index("/k") + 1] == "ssh"
+
+
 # --- the ATTACH client is the OTHER rule ------------------------------------
 # `attach_psmux` opens a window that RENDERS an existing session; it hosts no
 # agent and creates nothing. So it keeps the inherited environment -- nesting
@@ -985,3 +1052,17 @@ class TestAttachClientKeepsNestingMarkersButNotALeakedNoColor:
                 monkeypatch.delenv(key, raising=False)
         monkeypatch.setenv("NO_COLOR", "1")
         assert self._env(monkeypatch) is None
+
+
+@pytest.mark.parametrize("platform_cls", _DEFAULT_BACKENDS)
+def test_default_supports_attach_windows_false(platform_cls):
+    # A node project's window is a wt window (attach_client); a POSIX desktop
+    # has no launcher for it yet, so --go must not try.
+    assert platform_cls().supports_attach_windows() is False
+
+
+def test_the_fake_platform_reports_what_it_was_given():
+    from tests.conftest import FakePlatform
+
+    assert FakePlatform().supports_attach_windows() is False
+    assert FakePlatform(supports_attach_windows=True).supports_attach_windows() is True

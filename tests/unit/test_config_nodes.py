@@ -353,6 +353,145 @@ class TestThePoolIsValidated:
 _TWO = {"second": {"host": "devino-second"}, "third": {"host": "devino-third"}}
 
 
+class TestANodeProjectsSessionNameIsItsOwn:
+    """`down` stops a node project's orphaned LOCAL session by its session id,
+    so no other project may share that id: a local twin would be killed with
+    it, and two node projects with one id would collide on the node. Both
+    pairs already collide on the window title. Two LOCAL projects sharing an
+    id stay today's first-wins dedupe."""
+
+    @pytest.mark.parametrize("other_node", [None, "cloud"])
+    def test_a_node_and_a_local_project_sharing_a_session_name_are_refused(
+        self, tmp_config, other_node
+    ):
+        other: dict[str, object] = {"path": "two/api"}
+        if other_node is not None:
+            other["node"] = other_node
+        with pytest.raises(
+            ConfigError,
+            match=(
+                r"^projects\[0\] \(one/api\) and projects\[1\] \(two/api\) share "
+                r"the session name 'api'.*distinct \"title\""
+            ),
+        ):
+            load_config(
+                _cfg(
+                    tmp_config,
+                    nodes=_TWO,
+                    projects=[{"path": "one/api", "node": "second"}, other],
+                )
+            )
+
+    def test_the_local_project_may_come_first(self, tmp_config):
+        with pytest.raises(ConfigError, match=r"^projects\[0\] \(two/api\) and "):
+            load_config(
+                _cfg(
+                    tmp_config,
+                    nodes=_TWO,
+                    projects=[
+                        {"path": "two/api"},
+                        {"path": "one/api", "node": "second"},
+                    ],
+                )
+            )
+
+    @pytest.mark.parametrize("second_node", ["second", "third", "auto"])
+    def test_two_node_projects_sharing_a_session_name_are_refused(
+        self, tmp_config, second_node
+    ):
+        with pytest.raises(ConfigError, match="share the session name 'api'"):
+            load_config(
+                _cfg(
+                    tmp_config,
+                    nodes=_TWO,
+                    projects=[
+                        {"path": "one/api", "node": "second"},
+                        {"path": "two/api", "node": second_node},
+                    ],
+                )
+            )
+
+    def test_the_session_name_is_compared_after_sanitizing(self, tmp_config):
+        # "my app" and "my.app" are one psmux/tmux session id: my-app.
+        with pytest.raises(ConfigError, match="share the session name 'my-app'"):
+            load_config(
+                _cfg(
+                    tmp_config,
+                    nodes=_TWO,
+                    projects=[
+                        {"path": "one/x", "title": "my app", "node": "second"},
+                        {"path": "two/y", "title": "my.app"},
+                    ],
+                )
+            )
+
+    def test_a_disabled_twin_still_collides(self, tmp_config):
+        # Enabling it later must not be what turns a loaded config invalid.
+        with pytest.raises(ConfigError, match="share the session name 'api'"):
+            load_config(
+                _cfg(
+                    tmp_config,
+                    nodes=_TWO,
+                    projects=[
+                        {"path": "one/api", "node": "second"},
+                        {"path": "two/api", "enabled": False},
+                    ],
+                )
+            )
+
+    def test_distinct_titles_are_accepted(self, tmp_config):
+        cfg = load_config(
+            _cfg(
+                tmp_config,
+                nodes=_TWO,
+                projects=[
+                    {"path": "one/api", "node": "second", "title": "api-node"},
+                    {"path": "two/api"},
+                ],
+            )
+        )
+        assert [p.path for p in cfg.projects] == ["one/api", "two/api"]
+
+    def test_two_local_projects_sharing_a_session_name_stay_accepted(self, tmp_config):
+        cfg = load_config(
+            _cfg(
+                tmp_config,
+                nodes=_TWO,
+                projects=[{"path": "one/api"}, {"path": "two/api"}],
+            )
+        )
+        assert len(cfg.projects) == 2
+
+    def test_a_cloud_and_a_local_project_sharing_a_session_name_stay_accepted(
+        self, tmp_config
+    ):
+        # A cloud project is a LOCAL pane (DECISION-15), so this pair is two
+        # local sessions: today's first-wins dedupe, not a node collision.
+        cfg = load_config(
+            _cfg(
+                tmp_config,
+                nodes=_TWO,
+                projects=[{"path": "one/api", "node": "cloud"}, {"path": "two/api"}],
+            )
+        )
+        assert len(cfg.projects) == 2
+
+    def test_an_ide_project_has_no_session_to_collide_with(self, tmp_config):
+        # An IDE project opens an editor, not a psmux/tmux session, and a
+        # node-pinned IDE project stays on this PC (nodes.node_projects).
+        cfg = load_config(
+            _cfg(
+                tmp_config,
+                nodes=_TWO,
+                projects=[
+                    {"path": "one/api", "node": "second"},
+                    {"path": "two/api", "tool": "code"},
+                ],
+            )
+        )
+        assert len(cfg.projects) == 2
+
+
 class TestNodeProjectsAreValidated:
     def test_node_and_host_together_are_refused(self, tmp_config):
         with pytest.raises(
