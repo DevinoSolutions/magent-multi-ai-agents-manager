@@ -2122,6 +2122,13 @@ class TestThePayloadOwnsItsFraming:
         assert repr(path) in str(exc.value)
         assert secret.decode() not in str(exc.value)
 
+    # A member name is UTF-8 bytes: a name with none (a lone surrogate) is
+    # refused by the one rule, before any digest tries to encode it.
+    def test_a_name_with_no_utf_8_bytes_is_no_payload_member(self):
+        assert not nodes.is_payload_skill_path("s/bad\udcff.md")
+        assert not nodes.is_payload_skill_path("\ud83d/SKILL.md")
+        assert nodes.is_payload_skill_path("s/café.md")
+
 
 # The node scripts run under the pool's bash, on Linux. macOS ships bash 3.2
 # and bsdtar, which no node runs; Windows has no node bash at all. Not a
@@ -2391,7 +2398,11 @@ class TestProvision:
     # F7: build_payload refuses a skill path it cannot frame. A backslash is a
     # legal POSIX file name and a wrapper-built scope never passed the walk:
     # that file stays behind with a note, and the rest still ships.
-    @pytest.mark.parametrize("path", ["a\\b", "../../.bashrc", "/etc/x", "a//b"])
+    # A lone surrogate is what os.walk hands back for a non-UTF-8 name on a
+    # POSIX PC: it has no UTF-8 bytes to become a member name.
+    @pytest.mark.parametrize(
+        "path", ["a\\b", "../../.bashrc", "/etc/x", "a//b", "s/bad\udcff.md"]
+    )
     def test_a_skill_path_the_payload_cannot_frame_stays_behind(self, fake_ssh, path):
         scope = _scope(
             skills=(
@@ -2416,11 +2427,43 @@ class TestProvision:
         )
         assert not report.failed
 
+    @pytest.mark.skipif(
+        sys.platform != "linux", reason="a file name that is not UTF-8 needs Linux"
+    )
+    def test_a_skill_file_named_in_no_utf_8_stays_behind_alone(
+        self, fake_ssh, tmp_path
+    ):
+        home = tmp_path / "pc"
+        skill = home / ".claude" / "skills" / "deploy"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_bytes(b"# ok")
+        bad = os.fsdecode(b"bad\xff.md")
+        (skill / bad).write_bytes(b"BAD-DECOY")
+        report = remote_mux.provision(
+            NODE, nodes.user_scope(home), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        (apply,) = fake_ssh.calls()
+        _, _, data = _unpack(_sent(apply))
+        assert data["skills/deploy/SKILL.md"] == b"# ok"
+        assert all(b"BAD-DECOY" not in blob for blob in data.values())
+        name = "deploy/" + bad
+        assert (
+            ScriptLine(
+                "skip",
+                "scope",
+                f"skills/{name!r}: its path cannot travel to a node, not shipped",
+            )
+            in report.lines
+        )
+        assert not report.failed
+
     def test_a_payload_refused_on_this_pc_is_a_fail_row_not_an_exception(
-        self, fake_ssh, monkeypatch
+        self, fake_ssh, monkeypatch, caplog
     ):
         # The last line of defence, reached here through a token gh could
         # never have handed over: nothing is sent, and the bring-up goes on.
+        # The row is our words and the class; the refusal's own is logged.
+        caplog.set_level("WARNING", logger="magent.nodes")
         monkeypatch.setattr(
             remote_mux, "_gh_to_share", lambda: ("amin", TOKEN + " x", ())
         )
@@ -2432,10 +2475,34 @@ class TestProvision:
             ScriptLine(
                 "fail",
                 "payload",
-                "not sent -- gh token has characters the payload cannot frame",
+                "not sent -- this PC refused the payload (ValueError); "
+                "see the nodes log",
             ),
         )
+        assert "gh token has characters the payload cannot frame" in caplog.text
         assert TOKEN not in repr(report)
+        assert TOKEN not in caplog.text
+
+    def test_a_payload_that_cannot_be_encoded_is_a_class_only_row(
+        self, fake_ssh, caplog
+    ):
+        # A real lone surrogate -- json reads "\ud83d" into one -- has no
+        # UTF-8 bytes to digest: the refusal's text stays off the row.
+        caplog.set_level("WARNING", logger="magent.nodes")
+        report = remote_mux.provision(
+            NODE,
+            _scope(settings={"x": "\ud83d"}),
+            timeout_s=remote_mux.PROVISION_TIMEOUT_S,
+        )
+        assert fake_ssh.calls() == []
+        (row,) = [line for line in report.lines if line.item == "payload"]
+        assert row == ScriptLine(
+            "fail",
+            "payload",
+            "not sent -- this PC refused the payload (UnicodeEncodeError); "
+            "see the nodes log",
+        )
+        assert "surrogates not allowed" in caplog.text
 
     def test_a_scope_whose_only_stdio_command_is_no_program_never_ships_it(
         self, fake_ssh

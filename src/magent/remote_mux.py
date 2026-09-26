@@ -1061,10 +1061,18 @@ def provision(
         )
     except ValueError as exc:
         # The last line of defence: a refused payload fails this node's
-        # provision -- a row, never an exception out of a bring-up. Its words
-        # never quote a token (build_payload owns its framing).
+        # provision -- a row, never an exception out of a bring-up. The row is
+        # our words and the class; the refusal's own words (which never quote
+        # a token: build_payload owns its framing) go to the log.
         get_logger("nodes").warning("provision %s: payload refused: %s", node.nick, exc)
-        refused = ScriptLine("fail", "payload", f"not sent -- {exc}")
+        refused = ScriptLine(
+            "fail",
+            "payload",
+            (
+                f"not sent -- this PC refused the payload ({type(exc).__name__}); "
+                "see the nodes log"
+            ),
+        )
         return ProvisionReport((*notes, *probe_failed, *gh_rows, refused))
     args = ["--force"] if force else []
     result = run_script(

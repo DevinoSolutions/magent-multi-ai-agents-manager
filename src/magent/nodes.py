@@ -685,15 +685,22 @@ def without_missing_programs(
 def is_payload_skill_path(path: str) -> bool:
     """True when ``path`` is a relative '/'-separated name that stays under
     ``skills/`` once it is a payload member: not empty, not absolute, no
-    backslash or NUL, no empty, "." or ".." segment. The one rule both
-    ``without_unframable_skills`` and the payload builder apply."""
-    return not (
+    backslash or NUL, no empty, "." or ".." segment, and UTF-8 bytes to be
+    named by (a non-UTF-8 name reaches here as lone surrogates). The one rule
+    both ``without_unframable_skills`` and the payload builder apply."""
+    if (
         not path
         or path.startswith("/")
         or "\\" in path
         or "\0" in path
         or any(seg in {"", ".", ".."} for seg in path.split("/"))
-    )
+    ):
+        return False
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def without_unframable_skills(scope: UserScope) -> UserScope:
