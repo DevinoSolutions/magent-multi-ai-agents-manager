@@ -30,6 +30,13 @@ _EVENTS: tuple[str, ...] = (
 # Substring that identifies our entries inside settings.json -- the console
 # script's name, present in any command string that invokes it.
 _MARKER = "magent-state-hook"
+# The same writer run as a module (`<python> -m magent.state_hook`), the
+# hand-wired spelling that survives a pip rollback deleting the console script.
+_MODULE_MARKER = "-m magent.state_hook"
+
+
+def _is_ours(text: str) -> bool:
+    return _MARKER in text or _MODULE_MARKER in text
 
 
 def _default_settings_file() -> Path:
@@ -70,13 +77,14 @@ def _load_settings(path: Path) -> dict[str, object]:
 
 
 def _event_wired(entries: object) -> bool:
-    return isinstance(entries, list) and any(_MARKER in json.dumps(e) for e in entries)
+    return isinstance(entries, list) and any(_is_ours(json.dumps(e)) for e in entries)
 
 
 def _repair_entries(entries: list[object], cmd: str) -> bool:
     """Rewrite any wired magent-state-hook command that bash cannot run -- a
-    backslash path from a pre-3.1.2 install (idempotence would otherwise skip
-    the broken entry forever). Returns True when something was rewritten."""
+    backslash path from a pre-3.1.2 install, or a module-form one with a
+    backslash interpreter path (idempotence would otherwise skip the broken
+    entry forever). Returns True when something was rewritten."""
     changed = False
     for entry in entries:
         if not isinstance(entry, dict):
@@ -88,7 +96,7 @@ def _repair_entries(entries: list[object], cmd: str) -> bool:
             if not isinstance(h, dict):
                 continue
             c = h.get("command")
-            if isinstance(c, str) and _MARKER in c and "\\" in c:
+            if isinstance(c, str) and _is_ours(c) and "\\" in c:
                 h["command"] = cmd
                 changed = True
     return changed
