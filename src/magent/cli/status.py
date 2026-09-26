@@ -375,8 +375,11 @@ def _render_status(config_file: Path) -> StatusReport:
         click.echo(f"\n  {style('Nodes', bold=True)}")
     tint = {"live": "green", "stale": "yellow", "dead": "red"}
     for node_row in node_rows:
-        node = f"@{node_row['node']}" if node_row["node"] else "(not placed)"
         state = str(node_row["state"])
+        # No node is "not placed" only when that is KNOWN (dead); a stale row
+        # without one is an auto project behind an unreadable node map.
+        unplaced = "(not placed)" if state == "dead" else "(node unknown)"
+        node = f"@{node_row['node']}" if node_row["node"] else unplaced
         click.echo(
             f"    {node_row['session']}  {style(node, fg='blue')}  {style(state, fg=tint[state])}"
         )
