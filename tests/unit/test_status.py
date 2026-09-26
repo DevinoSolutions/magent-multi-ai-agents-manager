@@ -1696,8 +1696,10 @@ class TestAStaleNodeSyncDaemonDegradesStatus:
     """Exit 3 when a project runs on a node and the sync daemon's heartbeat has
     gone stale: every node row would then be frozen at a pull nobody refreshes.
     A STOPPED daemon is not degraded (serve starts one; with serve off the
-    upload-server line already says so), and without a node project nobody
-    expects a daemon at all. Driven through the real heartbeat file."""
+    upload-server line already says so), and without a node project -- or
+    with the MAGENT_NODE_SYNC switch off -- nobody expects a daemon at all.
+    Driven through the real heartbeat file; the switch is set back on here
+    (conftest turns it off for every tier)."""
 
     def _config(self, tmp_config, tmp_path, *, on_node=True, tool=None):
         project = {"path": str(tmp_path), "title": "api"}
@@ -1728,10 +1730,17 @@ class TestAStaleNodeSyncDaemonDegradesStatus:
     def _status(self, runner, cfgpath, *extra):
         return runner.invoke(cli.main, ["--config", cfgpath, "status", *extra])
 
+    @staticmethod
+    def _switch(monkeypatch, value):
+        """MAGENT_NODE_SYNC, re-read: the env singleton is cached."""
+        monkeypatch.setenv("MAGENT_NODE_SYNC", value)
+        monkeypatch.setattr("magent.env._cached_env", None)
+
     @pytest.fixture(autouse=True)
     def _healthy_otherwise(self, monkeypatch, tmp_path):
         from magent import nodes
 
+        self._switch(monkeypatch, "1")
         _no_psmux(monkeypatch)
         _both_off(monkeypatch)
         monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
@@ -1809,7 +1818,31 @@ class TestAStaleNodeSyncDaemonDegradesStatus:
         result = self._status(runner, cfgpath, "--json")
         assert result.exit_code == 0
         assert json.loads(result.stdout)["node_sync"] == "stopped"
-        assert self._status(runner, cfgpath).exit_code == 0
+        human = self._status(runner, cfgpath)
+        assert human.exit_code == 0
+        # Named, as the JSON names it -- but never as the degraded "stale".
+        assert status_mod.NODE_SYNC_STOPPED_LINE in human.stdout
+        assert "node sync daemon stale" not in human.stdout
+        assert status_mod.NODE_SYNC_REPAIR_HINT not in human.stdout
+
+    def test_the_switch_off_means_no_daemon_is_expected(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # serve's own gate is the switch AND wanted: a heartbeat left by a
+        # daemon that died before MAGENT_NODE_SYNC=0 was set is nobody's, and
+        # "serve starts a fresh one" would be a promise serve never keeps.
+        from magent import log
+
+        self._beat(log.HEARTBEAT_MAX_AGE + 30)
+        self._switch(monkeypatch, "0")
+        cfgpath = self._config(tmp_config, tmp_path)
+        result = self._status(runner, cfgpath, "--json")
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sync"] == "off"
+        human = self._status(runner, cfgpath)
+        assert human.exit_code == 0
+        assert "node sync daemon" not in human.stdout
+        assert "serve starts a fresh one" not in human.stdout
 
     def test_the_verdict_counts_node_sync_alongside_the_other_daemons(self):
         healthy = {

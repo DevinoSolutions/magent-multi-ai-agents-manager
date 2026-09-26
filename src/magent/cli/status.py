@@ -65,6 +65,8 @@ UPLOAD_WATCHDOG_HINT = "magent attention -d  (it revives a dead upload server)"
 # `serve` leaves a wedged one for the user (launch.ensure_node_sync says the
 # same), and starts a fresh one once it is stopped.
 NODE_SYNC_REPAIR_HINT = "magent node sync --stop  (magent serve starts a fresh one)"
+# Expected (serve would spawn one) but not running: not degraded, but named.
+NODE_SYNC_STOPPED_LINE = "node sync daemon stopped  (magent serve starts one)"
 
 
 def _health_check(port: int) -> bool:
@@ -165,19 +167,22 @@ def _attention_state() -> str:
 
 def _node_sync_state(cfg: MagentConfig) -> str:
     """The node sync daemon, judged against whether one is EXPECTED: "off" when
-    serve would not spawn one (``node_sync.wanted`` -- the same question serve
-    asks, so status expects a daemon exactly when serve starts one), else
-    ``node_cmd._daemon_state``'s "ok" / "stale" / "stopped".
+    serve would not spawn one, else ``node_cmd._daemon_state``'s "ok" /
+    "stale" / "stopped". "Would serve spawn one" is serve's OWN predicate,
+    ``launch.node_sync_enabled`` -- the ``MAGENT_NODE_SYNC`` switch AND
+    ``node_sync.wanted`` -- so a leftover heartbeat under a switched-off
+    daemon is not a daemon anyone expects, and the repair hint's "serve starts
+    a fresh one" is only ever shown when serve will.
 
     Only "stale" degrades (``_is_degraded``): every node row is then frozen at
     a pull nobody refreshes. "stopped" does not -- `serve` starts a daemon
     within its supervise interval, with serve off the upload-server line
     already says so, and the spec promises exit 3 for a stale daemon only.
     """
-    from magent import node_sync  # heavy subsystem: in-body per policy
+    from magent import launch  # heavy subsystem: in-body per policy
     from magent.cli.node_cmd import _daemon_state  # DECISION-17's one reader
 
-    if not node_sync.wanted(cfg):
+    if not launch.node_sync_enabled(cfg):
         return "off"
     return _daemon_state()
 
@@ -369,9 +374,11 @@ def _render_status(config_file: Path) -> StatusReport:
     # The daemon behind those rows: stale freezes every one of them, which is
     # what makes it the one node state that degrades (_node_sync_state). Named
     # even with no rows -- a node-pinned IDE project has none, yet serve still
-    # runs the daemon for it.
+    # runs the daemon for it. A stopped one is named too (dim, not degraded):
+    # the JSON says so, and every row will drift to stale until serve starts it.
     sync_stale = status["node_sync"] == "stale"
-    if node_rows or sync_stale:
+    sync_stopped = status["node_sync"] == "stopped"
+    if node_rows or sync_stale or sync_stopped:
         click.echo(f"\n  {style('Nodes', bold=True)}")
     tint = {"live": "green", "stale": "yellow", "dead": "red"}
     for node_row in node_rows:
@@ -390,6 +397,8 @@ def _render_status(config_file: Path) -> StatusReport:
         click.echo(
             f"  {style('Repair:', dim=True)} {style(NODE_SYNC_REPAIR_HINT, bold=True)}"
         )
+    if sync_stopped:
+        click.echo(f"  {style(NODE_SYNC_STOPPED_LINE, dim=True)}")
     _divider()
 
     upload_labels = {
@@ -514,7 +523,8 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
         # it changes neither the envelope's shape nor the exit contract.
         payload["psmux_session0"] = len(session0_server_pids())
         # Additive, like psmux_sessions: a dead or stale node session is a row
-        # state, never a degraded daemon, so the exit contract is unchanged.
+        # state, never a degraded daemon; only the sync daemon's own
+        # `node_sync` field can degrade (exit 3).
         from magent import nodes  # heavy subsystem: in-body per policy
 
         payload["node_sessions"] = nodes.session_rows(cfg, now=time.time())
