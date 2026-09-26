@@ -58,6 +58,9 @@ from magent.nodes import (
     absolute_remote,
     encoded_project_dir,
     node_dir,
+    path_exists,
+    path_is_dir,
+    path_is_file,
 )
 from magent.sessions import build_resume_command
 
@@ -1449,14 +1452,16 @@ def repo_paths(project_dir: Path) -> list[Path]:
     permission, a vanished network drive) is RemoteError rc None naming it,
     like every other failure this module reports."""
     try:
-        if (project_dir / ".git").exists():
+        # nodes.path_*, not Path.*: from Python 3.14 those read an unreadable
+        # entry as absent -- a workspace would ship without that repo.
+        if path_exists(project_dir / ".git"):
             return [project_dir]
-        if not project_dir.is_dir():
+        if not path_is_dir(project_dir):
             return []
         return sorted(
             child
             for child in project_dir.iterdir()
-            if child.is_dir() and (child / ".git").exists()
+            if path_is_dir(child) and path_exists(child / ".git")
         )
     except OSError as e:
         reason = f"cannot read {project_dir}: {e.strerror or e}"
@@ -1788,7 +1793,13 @@ def _memory_files(memory_dir: Path) -> list[tuple[str, Path]]:
         dirnames[:] = kept  # os.walk descends only into what is left
         for name in filenames:
             path = base / name
-            if path.is_symlink() or not path.is_file():
+            try:
+                regular = not path.is_symlink() and path_is_file(path)
+            except OSError as e:
+                # Named, not taken for "not a file" (Python 3.14's is_file).
+                logger.warning("memory entry %s cannot be read (%s); skipped", path, e)
+                continue
+            if not regular:
                 logger.warning("memory entry %s is not a regular file; skipped", path)
                 continue
             if not Path(os.path.realpath(path)).is_relative_to(real_mem):

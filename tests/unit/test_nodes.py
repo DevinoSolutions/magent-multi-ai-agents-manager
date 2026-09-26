@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import dataclasses
+import errno
 import importlib.util
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -36,6 +38,7 @@ from magent.nodes import (
 )
 from magent.sessions import IDE_TOOLS, is_ide_tool
 from tests.conftest import REAL_MAGENT_DIR
+from tests.unit._deny_stat import deny_stat
 
 NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
 
@@ -1192,6 +1195,74 @@ class TestGitsIgnoredListing:
         assert err.value.command_redacted[0] == "git"
 
 
+class TestUnknownIsNeverAbsent:
+    """``nodes.path_mode`` answers "nothing there" only when the OS said so;
+    anything it cannot tell raises, on every Python -- 3.14's Path.is_dir/
+    is_file/exists answer False for every OSError instead."""
+
+    def test_a_folder_a_file_and_nothing(self, tmp_path):
+        (tmp_path / "f").write_text("x", encoding="utf-8")
+        mode = nodes.path_mode(tmp_path)
+        assert mode is not None
+        assert stat.S_ISDIR(mode)
+        assert nodes.path_is_dir(tmp_path)
+        assert not nodes.path_is_file(tmp_path)
+        assert nodes.path_is_file(tmp_path / "f")
+        assert not nodes.path_is_dir(tmp_path / "f")
+        assert nodes.path_mode(tmp_path / "gone") is None
+        assert not nodes.path_exists(tmp_path / "gone")
+        assert not nodes.path_is_dir(tmp_path / "gone")
+
+    def test_under_a_file_is_nothing(self, tmp_path):
+        (tmp_path / "f").write_text("x", encoding="utf-8")
+        assert nodes.path_mode(tmp_path / "f" / "x") is None
+
+    def test_a_name_the_os_cannot_hold_is_nothing(self, tmp_path):
+        assert nodes.path_mode(tmp_path / "a\0b") is None
+
+    @pytest.mark.parametrize("code", [errno.ENOENT, errno.ENOTDIR, errno.ELOOP])
+    def test_no_such_entry_is_nothing(self, tmp_path, monkeypatch, code):
+        deny_stat(monkeypatch, tmp_path, code=code)
+        assert nodes.path_mode(tmp_path) is None
+
+    @pytest.mark.parametrize(
+        "code", [errno.EACCES, errno.EPERM, errno.EIO, errno.EBADF]
+    )
+    def test_what_cannot_be_told_raises(self, tmp_path, monkeypatch, code):
+        # EBADF included: 3.10-3.13's pathlib read it as "not there".
+        deny_stat(monkeypatch, tmp_path, code=code)
+        with pytest.raises(OSError) as exc:
+            nodes.path_mode(tmp_path)
+        assert exc.value.errno == code
+        for check in (nodes.path_exists, nodes.path_is_dir, nodes.path_is_file):
+            with pytest.raises(OSError):
+                check(tmp_path)
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows error codes")
+    def test_a_drive_that_is_not_ready_raises_and_a_bad_name_is_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        # ERROR_NOT_READY is a drive with no medium, a network share gone
+        # quiet: unknown. ERROR_INVALID_NAME is a name that cannot exist.
+        deny_stat(monkeypatch, tmp_path, winerror=21)
+        with pytest.raises(OSError):
+            nodes.path_mode(tmp_path)
+        deny_stat(monkeypatch, tmp_path, winerror=123)
+        assert nodes.path_mode(tmp_path) is None
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+    def test_a_real_folder_this_user_may_not_search_raises(self, tmp_path):
+        if os.geteuid() == 0:
+            pytest.skip("root searches a mode-0 folder: no EACCES to provoke")
+        (tmp_path / "locked" / "api").mkdir(parents=True)
+        (tmp_path / "locked").chmod(0)
+        try:
+            with pytest.raises(PermissionError):
+                nodes.path_is_dir(tmp_path / "locked" / "api")
+        finally:
+            (tmp_path / "locked").chmod(0o700)
+
+
 class TestPushSet:
     def test_gitignored_env_files_ship_at_any_depth(self, repo):
         shipped = nodes.push_set(repo, [_real_state(repo)], home=Path.home())
@@ -1240,6 +1311,33 @@ class TestPushSet:
             workspace, [_state(workspace / "api", ())], home=Path.home()
         )
         assert shipped == (workspace / ".env", workspace / "CLAUDE.local.md")
+
+    def test_a_workspace_roots_env_file_that_cannot_be_read_is_an_error(
+        self, tmp_path, monkeypatch
+    ):
+        # Not "no such file": a push that silently leaves a .env home would
+        # bring the project up without its secrets.
+        workspace = tmp_path / "ws"
+        (workspace / "api").mkdir(parents=True)
+        (workspace / ".env").write_text("X=1\n", encoding="utf-8")
+        deny_stat(monkeypatch, workspace / ".env")
+        with pytest.raises(PermissionError):
+            nodes.push_set(workspace, [_state(workspace / "api", ())], home=Path.home())
+
+    def test_a_workspace_root_file_that_never_ships_is_never_read(
+        self, tmp_path, monkeypatch
+    ):
+        # Only a candidate is looked at: an unreadable README is not a push,
+        # so it cannot fail one.
+        workspace = tmp_path / "ws"
+        (workspace / "api").mkdir(parents=True)
+        (workspace / ".env").write_text("X=1\n", encoding="utf-8")
+        (workspace / "README.md").write_text("r\n", encoding="utf-8")
+        deny_stat(monkeypatch, workspace / "README.md")
+        shipped = nodes.push_set(
+            workspace, [_state(workspace / "api", ())], home=Path.home()
+        )
+        assert shipped == (workspace / ".env",)
 
     def test_a_project_reached_through_a_link_never_ships_a_tracked_file(
         self, repo, tmp_path
@@ -1437,6 +1535,15 @@ class TestPushExtras:
         assert not nodes._is_forbidden(PurePosixPath("/h/.sshx/id"), forbidden)
         assert not nodes._is_forbidden(PurePosixPath("/h/.netrc.d/x"), forbidden)
 
+    def test_an_extra_that_cannot_be_read_is_an_error_not_missing(
+        self, repo, monkeypatch
+    ):
+        # "does not exist" would be a guess: the file is there, unread.
+        (repo / "locked.json").write_text("{}", encoding="utf-8")
+        deny_stat(monkeypatch, (repo / "locked.json").resolve())
+        with pytest.raises(PermissionError):
+            nodes.push_warnings(repo, ["locked.json"], home=Path.home())
+
     def test_an_extra_directory_is_a_warning(self, repo):
         assert nodes.push_warnings(repo, ["apps"], home=Path.home()) == (
             "push: apps is a directory; list its files; skipped",
@@ -1602,6 +1709,32 @@ class TestRecipeFor:
             project_dir=repo,
         )
         assert recipe.memory_dir == memory
+
+    def test_a_memory_dir_that_cannot_be_read_is_named_not_fatal(
+        self, repo, monkeypatch
+    ):
+        # Memory never fails a bring-up, and an unreadable folder is not
+        # "no memory" either: it is shipped as none, and said so.
+        memory = (
+            Path.home()
+            / ".claude"
+            / "projects"
+            / nodes.encoded_project_dir(str(repo))
+            / "memory"
+        )
+        memory.mkdir(parents=True)
+        deny_stat(monkeypatch, memory)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second"),
+            NODE,
+            [_real_state(repo)],
+            home=Path.home(),
+            project_dir=repo,
+        )
+        assert recipe.memory_dir is None
+        assert recipe.warnings == (
+            "memory: cannot be read (PermissionError); no memory shipped",
+        )
 
     def test_no_memory_dir_is_none(self, repo):
         recipe = nodes.recipe_for(

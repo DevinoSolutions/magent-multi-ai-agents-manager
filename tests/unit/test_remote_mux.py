@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import dataclasses
+import errno
 import inspect
 import io
 import json
@@ -34,6 +35,7 @@ from magent.remote_mux import RemoteError
 # this name still holds the real resolver for the one test that proves it.
 from magent.remote_mux import find_ssh as real_find_ssh
 from magent.sessions import build_resume_command
+from tests.unit._deny_stat import deny_stat
 from tests.unit._fake_ssh import make_fake_ssh
 from tests.unit._git_repos import commit, git, make_origin_and_clone, needs_git
 
@@ -1205,6 +1207,51 @@ class TestWhichReposMakeTheProject:
         assert "Permission denied" in exc.value.stderr_tail
         assert str(tmp_path) in str(exc.value)
 
+    def test_a_workspace_repo_that_cannot_be_read_fails_it_not_left_out(
+        self, tmp_path, monkeypatch
+    ):
+        # Python 3.14's Path.exists reads an unreadable .git as "no repo":
+        # the workspace would come up without it and say nothing.
+        for name in ("api", "web"):
+            (tmp_path / name / ".git").mkdir(parents=True)
+        deny_stat(monkeypatch, tmp_path / "web" / ".git")
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.repo_paths(tmp_path)
+        assert exc.value.rc is None
+        assert "Permission denied" in exc.value.stderr_tail
+
+    def test_a_repo_whose_git_cannot_be_read_is_an_error_not_no_repo(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / ".git").mkdir()
+        deny_stat(monkeypatch, tmp_path / ".git")
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.repo_paths(tmp_path)
+        assert "Permission denied" in exc.value.stderr_tail
+
+    def test_a_drive_that_is_not_ready_is_an_error_not_empty(
+        self, tmp_path, monkeypatch
+    ):
+        # EIO (or Windows' ERROR_NOT_READY) says nothing about what is
+        # there; only "no such entry" is empty.
+        deny_stat(monkeypatch, tmp_path / ".git", code=errno.EIO, winerror=21)
+        with pytest.raises(RemoteError):
+            remote_mux.repo_paths(tmp_path)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+    def test_a_real_unsearchable_workspace_repo_fails_it(self, tmp_path):
+        if os.geteuid() == 0:
+            pytest.skip("root searches a mode-0 folder: no EACCES to provoke")
+        for name in ("api", "web"):
+            (tmp_path / name / ".git").mkdir(parents=True)
+        (tmp_path / "web").chmod(0)
+        try:
+            with pytest.raises(RemoteError) as exc:
+                remote_mux.repo_paths(tmp_path)
+        finally:
+            (tmp_path / "web").chmod(0o700)
+        assert "Permission denied" in exc.value.stderr_tail
+
 
 @needs_git
 class TestTheLocalTreeIsReadNotChanged:
@@ -1940,6 +1987,23 @@ class TestAPushFileIsReadAsVetted:
         assert "memory/pipe.md" not in members
         assert "memory/MEMORY.md" in members
         assert "pipe.md" in _nodes_log()
+
+    def test_a_memory_file_that_cannot_be_read_is_named_and_skipped(
+        self, node_home, tmp_path, monkeypatch
+    ):
+        # Not fatal (memory never fails a bring-up) and not "not a regular
+        # file" either -- which is all Python 3.14's Path.is_file would say.
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        denied = recipe.memory_dir / "denied.md"
+        denied.write_bytes(b"secret\n")
+        deny_stat(monkeypatch, denied)
+        _answers(node_home)
+        remote_mux.bring_up(NODE, recipe)
+        members = _members(node_home.calls()[1].stdin)
+        assert "memory/denied.md" not in members
+        assert members["memory/MEMORY.md"] == b"- remember\n"
+        assert "denied.md cannot be read" in _nodes_log()
 
     def test_an_oversize_push_file_is_refused_unopened(
         self, node_home, tmp_path, monkeypatch

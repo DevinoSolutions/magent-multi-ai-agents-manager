@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
 import json
 import math
 import os
 import re
+import stat
 import tempfile
 import threading
 import time
@@ -687,7 +689,7 @@ def _from_git_listing(repo: Path, ignored: tuple[str, ...]) -> list[Path]:
             found += [
                 repo / fixed
                 for fixed in _PUSH_FIXED
-                if fixed.startswith(entry) and (repo / fixed).is_file()
+                if fixed.startswith(entry) and path_is_file(repo / fixed)
             ]
         elif _is_env_file(entry.rsplit("/", 1)[-1]) or entry in _PUSH_FIXED:
             # git emits '/' on every OS, like the _PUSH_FIXED literals.
@@ -720,6 +722,52 @@ def _resolved(path: Path) -> Path:
         raise NodeConfigError(f"{path}: cannot be resolved ({exc})") from exc
 
 
+# The stat errors that mean "nothing is there": no such entry, a parent that
+# is a file, a symlink loop, or a name Windows cannot hold (ERROR_INVALID_NAME,
+# ERROR_CANT_RESOLVE_FILENAME). Every other OSError -- a folder this user may
+# not read, a drive that is not ready -- is unknown, and unknown is never
+# absent: ``path_mode`` raises it.
+_ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP})
+_ABSENT_WINERRORS = frozenset({123, 1921})
+
+
+def path_mode(path: Path) -> int | None:
+    """``path``'s ``st_mode`` (symlinks followed); None when nothing is there.
+    Raises OSError when that cannot be told. The one existence check on the
+    node path: from Python 3.14 ``Path.is_dir``/``is_file``/``exists`` answer
+    False for EVERY OSError (on Windows they no longer stat at all), where
+    3.10-3.13 raised -- an unreadable folder would read "not there" on one
+    version and fail on another. ``os.stat`` answers alike on all of them."""
+    try:
+        return os.stat(path).st_mode
+    except ValueError:
+        return None  # a name the OS cannot hold (an embedded NUL)
+    except OSError as exc:
+        if (
+            exc.errno in _ABSENT_ERRNOS
+            or getattr(exc, "winerror", None) in _ABSENT_WINERRORS
+        ):
+            return None
+        raise
+
+
+def path_exists(path: Path) -> bool:
+    """``Path.exists`` that raises when it cannot tell (``path_mode``)."""
+    return path_mode(path) is not None
+
+
+def path_is_dir(path: Path) -> bool:
+    """``Path.is_dir`` that raises when it cannot tell (``path_mode``)."""
+    mode = path_mode(path)
+    return mode is not None and stat.S_ISDIR(mode)
+
+
+def path_is_file(path: Path) -> bool:
+    """``Path.is_file`` that raises when it cannot tell (``path_mode``)."""
+    mode = path_mode(path)
+    return mode is not None and stat.S_ISREG(mode)
+
+
 def _workspace_root_files(project_dir: Path) -> list[Path]:
     # A workspace root is not a repo, so git lists nothing there -- its own env
     # files and local Claude settings would otherwise never leave this PC.
@@ -727,8 +775,8 @@ def _workspace_root_files(project_dir: Path) -> list[Path]:
         entries = list(project_dir.iterdir())
     except (OSError, ValueError) as exc:
         raise NodeConfigError(f"{project_dir}: cannot be listed ({exc})") from exc
-    found = [p for p in entries if p.is_file() and _is_env_file(p.name)]
-    found += [project_dir / f for f in _PUSH_FIXED if (project_dir / f).is_file()]
+    found = [p for p in entries if _is_env_file(p.name) and path_is_file(p)]
+    found += [project_dir / f for f in _PUSH_FIXED if path_is_file(project_dir / f)]
     return found
 
 
@@ -822,9 +870,9 @@ def _classify_extras(
             warnings.append(f"push: {extra} is outside the project; skipped")
         elif _is_forbidden(target, forbidden):
             warnings.append(f"push: {extra} is never pushed (credentials); skipped")
-        elif target.is_dir():
+        elif (mode := path_mode(target)) is not None and stat.S_ISDIR(mode):
             warnings.append(f"push: {extra} is a directory; list its files; skipped")
-        elif not target.is_file():
+        elif mode is None or not stat.S_ISREG(mode):
             warnings.append(f"push: {extra} does not exist; skipped")
         else:
             shipped.append(_named_path(project_dir, extra, target, root))
@@ -1264,14 +1312,25 @@ def recipe_for(
     memory = (
         home / ".claude" / "projects" / encoded_project_dir(str(project_dir)) / "memory"
     )
+    memory_warned: tuple[str, ...] = ()
+    try:
+        has_memory = path_is_dir(memory)
+    except OSError as exc:
+        # A bring-up never fails because of memory; nor does an unreadable
+        # folder pass for none -- it is named (class only; the log has it all).
+        get_logger("nodes").warning("memory folder %s: %s", memory, exc)
+        has_memory = False
+        memory_warned = (
+            f"memory: cannot be read ({type(exc).__name__}); no memory shipped",
+        )
     return Recipe(
         project=project,
         sid=session_name(project),
         repos=tuple(repos),
         push_files=push_files,
-        memory_dir=memory if memory.is_dir() else None,
+        memory_dir=memory if has_memory else None,
         remote_root=remote_root,
-        warnings=(*repo_warnings, *push_warned),
+        warnings=(*repo_warnings, *push_warned, *memory_warned),
         local_root=root,
     )
 
