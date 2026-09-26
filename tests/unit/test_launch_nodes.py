@@ -315,8 +315,10 @@ class TestD7RefusesWhatTheNodeCouldNotReproduce:
         assert seen == ["second"]
 
     def test_a_refused_tree_with_its_session_alive_attaches_instead(
-        self, rig, api, tmp_path
+        self, rig, api, tmp_path, caplog
     ):
+        from magent.log import get_logger
+
         # The running session is not affected by what is uncommitted HERE.
         nodes.update_node_map(
             "api",
@@ -331,11 +333,19 @@ class TestD7RefusesWhatTheNodeCouldNotReproduce:
         )
         rig.live = True
         rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
         outcome = launch.bring_up_node_project(_config(api), api)
         assert (outcome.ok, outcome.attached_existing) == (True, True)
-        # The refusal alone: a readable map says nothing about the map.
+        # The refusal alone: a readable map says nothing about the map, on
+        # screen or in nodes.log.
         (dirty,) = [w for w in outcome.warnings if "--allow-dirty" in w]
         assert outcome.warnings == (dirty,)
+        assert not [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "magent.nodes" and "looked up on its pin" in r.getMessage()
+        ]
         assert rig.decorated == [("api", "second")]
         assert rig.recipes == []
 
