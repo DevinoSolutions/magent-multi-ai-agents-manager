@@ -1729,9 +1729,9 @@ class TestAnUnreadableSkillsFolderIsNamedNotFatal:
             "skills/b/locked.md: cannot be read (PermissionError); not shipped",
         )
         assert "DECOY-ERRNO" not in repr(scope)
-        (logged,) = [r for r in caplog.records if "DECOY-ERRNO" in r.getMessage()]
-        assert logged.levelname == "WARNING"
-        assert logged.getMessage().startswith("skills/b/locked.md: ")
+        logged = [r for r in caplog.records if "DECOY-ERRNO" in r.getMessage()]
+        assert [r.levelname for r in logged] == ["WARNING"]
+        assert logged[0].getMessage().startswith("skills/b/locked.md: ")
 
     @pytest.mark.skipif(
         sys.platform == "win32" or os.geteuid() == 0,
@@ -1774,8 +1774,14 @@ class TestASkillFileIsShippedWithACaution:
             b"# notes\r\nfrom Windows\r\n",  # CRLF, but nothing runs it
             b"#!/usr/bin/env bash\necho hi\n",  # a shebang, LF
             b"echo\r\n#!/bin/sh\r\n",  # a `#!` that is not the first line
+            b"#!/bin/sh\necho hi\r\n",  # only the `#!` line names what is exec'd
         ],
-        ids=["crlf-markdown", "lf-shebang", "shebang-not-first"],
+        ids=[
+            "crlf-markdown",
+            "lf-shebang",
+            "shebang-not-first",
+            "lf-shebang-crlf-body",
+        ],
     )
     def test_no_note_when_nothing_would_exec_a_cr(self, tmp_path, data):
         home, skills = _skills_home(tmp_path)
@@ -1817,8 +1823,9 @@ class TestASkillFileIsShippedWithACaution:
         assert [f.path for f in scope.skills] == ["s/config"]
         assert scope.notes == (ENV_NOTE.format("s/config"),)
         assert "project" not in repr(scope.notes)
-        (record,) = [r for r in caplog.records if "project" in r.getMessage()]
-        assert record.getMessage().startswith("skills/s/config")
+        logged = [r.getMessage() for r in caplog.records if "project" in r.getMessage()]
+        assert len(logged) == 1
+        assert logged[0].startswith("skills/s/config")
 
     def test_an_env_named_link_to_another_file_is_noted(self, tmp_path):
         home, skills = _skills_home(tmp_path)
@@ -1921,9 +1928,11 @@ class TestALinkedSkillShipsAsItsContent:
         _link_file(skills / "s" / "loop", skills / "s" / "loop")
         scope = nodes.user_scope(home)
         assert [f.path for f in scope.skills] == ["s/SKILL.md"]
-        (note,) = scope.notes
+        assert len(scope.notes) == 1
         # The class differs by OS (ELOOP is a bare OSError); the words do not.
-        assert re.fullmatch(r"skills/s/loop: cannot be read \(\w+\); not shipped", note)
+        assert re.fullmatch(
+            r"skills/s/loop: cannot be read \(\w+\); not shipped", scope.notes[0]
+        )
 
     @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs")
     def test_a_link_to_a_fifo_is_a_note_and_never_opened(self, tmp_path):
@@ -1994,9 +2003,9 @@ class TestTheSkillsWalkNeverReadsTheRestOfClaude:
         assert scope.skills == ()
         assert scope.notes == (f"skills: {ROOT_IN_CLAUDE}",)
         assert "skills-v2" not in repr(scope.notes)
-        (record,) = [r for r in caplog.records if "skills-v2" in r.getMessage()]
-        assert record.levelname == "WARNING"
-        assert "outside ~/.claude/skills" in record.getMessage()
+        logged = [r for r in caplog.records if "skills-v2" in r.getMessage()]
+        assert [r.levelname for r in logged] == ["WARNING"]
+        assert "outside ~/.claude/skills" in logged[0].getMessage()
 
     # Both sides resolved: with ~/.claude a junction elsewhere (OneDrive
     # setups), the transcripts it points at are still recognised, and its own

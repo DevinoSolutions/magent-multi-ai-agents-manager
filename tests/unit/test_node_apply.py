@@ -559,10 +559,10 @@ ONE_SKILL = SkillFile(path="s/a.md", data=b"a", executable=False)
 def _nothing_applied(box: Box, capsys: pytest.CaptureFixture[str]) -> str:
     """The one row a refused payload prints, after checking it is the only
     one and that no step touched the home."""
-    (line,) = _lines(capsys)
-    assert (line.status, line.item) == ("fail", "payload")
+    lines = _lines(capsys)
+    assert [(line.status, line.item) for line in lines] == [("fail", "payload")]
     assert list(box.home.iterdir()) == []
-    return line.detail
+    return lines[0].detail
 
 
 # The receiver's half of the payload contract (build_payload is the sender's):
