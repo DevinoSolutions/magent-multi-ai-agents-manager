@@ -1617,8 +1617,8 @@ def _placement_recipes(
 ) -> dict[str, tuple[str, Recipe]]:
     """``{sid: (nick, recipe)}`` for every project in ``projects`` whose node
     folder is already known, from config and the map alone -- no ssh, no git.
-    The recipe carries only what ``nodes.assert_distinct_remote_roots`` reads
-    (its project and remote_root). A project that cannot be placed yet (no
+    The recipe carries only what ``nodes.remote_root_collisions`` reads (its
+    project, sid and remote_root). A project that cannot be placed yet (no
     folder here, an unplaced ``auto``, a folder with no usable name) is left
     out: its own bring-up names that reason. An unreadable map places the
     pinned projects anyway; each bring-up then reports the map itself."""
@@ -1672,41 +1672,50 @@ def _run_node_bring_ups(
     not CPU); the per-node lock inside keeps one node serial. Outcomes in the
     order given.
 
-    First, ONCE over the whole batch and before anything is dialed: two
-    projects that would share a node folder name refuse the batch (X3,
-    ``nodes.assert_distinct_remote_roots``). Fanned out, the two clones would
-    race for one folder and thread timing would pick the survivor."""
+    First, ONCE and before anything is dialed, the WHOLE fleet's node folders
+    are checked (X3, ``nodes.remote_root_collisions``): a batch project whose
+    folder name another project -- in this batch or not -- would share is
+    refused, naming the other. Fanned out, two clones would race for one
+    folder; a batch of one today and another tomorrow would overwrite it.
+    A collision among projects outside the batch refuses nothing here."""
     # heavy subsystem: in-body per policy
     from magent import nodes
 
     if not projects:
         return []
-    placed = _placement_recipes(config, projects)
-    try:
-        nodes.assert_distinct_remote_roots([recipe for _, recipe in placed.values()])
-    except nodes.NodeConfigError as exc:
-        get_logger("nodes").warning("node batch refused: %s", exc)
-        return [
-            NodeBringUpOutcome(
-                ok=False,
-                sid=(sid := nodes.node_sid(proj)),
-                node=placed[sid][0] if sid in placed else "",
-                error=str(exc),
+    fleet = nodes.node_projects(config)
+    known = {nodes.node_sid(proj) for proj in fleet}
+    fleet += [proj for proj in projects if nodes.node_sid(proj) not in known]
+    placed = _placement_recipes(config, fleet)
+    clash: dict[str, str] = {}
+    for group in nodes.remote_root_collisions([r for _, r in placed.values()]):
+        text = nodes.remote_root_collision_text(group)
+        for recipe in group:
+            clash[recipe.sid] = text
+    outcomes: dict[str, NodeBringUpOutcome] = {}
+    for proj in projects:
+        sid = nodes.node_sid(proj)
+        if sid in clash:
+            get_logger("nodes").warning("node project %s refused: %s", sid, clash[sid])
+            outcomes[sid] = NodeBringUpOutcome(
+                ok=False, sid=sid, node=placed[sid][0], error=clash[sid]
             )
-            for proj in projects
-        ]
-    with ThreadPoolExecutor(max_workers=min(8, len(projects))) as pool:
-        futures = [
-            pool.submit(
-                bring_up_node_project,
-                config,
-                proj,
-                allow_dirty=allow_dirty,
-                window=window,
-            )
-            for proj in projects
-        ]
-        return [f.result() for f in futures]
+    go = [proj for proj in projects if nodes.node_sid(proj) not in outcomes]
+    if go:
+        with ThreadPoolExecutor(max_workers=min(8, len(go))) as pool:
+            futures = [
+                pool.submit(
+                    bring_up_node_project,
+                    config,
+                    proj,
+                    allow_dirty=allow_dirty,
+                    window=window,
+                )
+                for proj in go
+            ]
+            for proj, future in zip(go, futures, strict=True):
+                outcomes[nodes.node_sid(proj)] = future.result()
+    return [outcomes[nodes.node_sid(proj)] for proj in projects]
 
 
 def bring_up_node_projects(

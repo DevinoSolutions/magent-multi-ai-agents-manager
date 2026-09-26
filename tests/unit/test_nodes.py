@@ -1945,6 +1945,44 @@ class TestTwoProjectsNeverShareANodeFolder:
         assert "'api-b'" in text
         assert "~/magent/api" in text
 
+    def test_every_colliding_group_comes_back_and_nothing_else(self):
+        # The one statement of the rule: a batch caller refuses exactly these
+        # members, so a missed group or a lone member here is a wrong refusal.
+        api, web, solo = (
+            _recipe_at("api", "~/magent/api"),
+            _recipe_at("web", "~/magent/web"),
+            _recipe_at("solo", "~/magent/solo"),
+        )
+        api_b = _recipe_at("api-b", "/srv/work/api")
+        web_b = _recipe_at("web-b", "~/magent/web/")
+        api_c = _recipe_at("api-c", "~/magent/api")
+        assert nodes.remote_root_collisions([api, web, solo, api_b, web_b, api_c]) == [
+            (api, api_b, api_c),
+            (web, web_b),
+        ]
+
+    def test_no_collision_is_an_empty_list(self):
+        api = _recipe_at("api", "~/magent/api")
+        assert nodes.remote_root_collisions([]) == []
+        assert (
+            nodes.remote_root_collisions([api, _recipe_at("web", "~/magent/web")]) == []
+        )
+        # The same recipe handed in twice is one project, not two.
+        assert nodes.remote_root_collisions([api, api]) == []
+
+    def test_a_group_of_three_is_named_whole(self):
+        recipes = [
+            _recipe_at("a", "~/magent/api"),
+            _recipe_at("b", "/srv/api"),
+            _recipe_at("c", "/opt/api"),
+        ]
+        with pytest.raises(NodeConfigError) as caught:
+            nodes.assert_distinct_remote_roots(recipes)
+        assert str(caught.value).startswith(
+            "projects 'a', 'b' and 'c' would share the node folder name 'api' "
+            "(~/magent/api, /srv/api, /opt/api)"
+        )
+
 
 class TestTheRefusalNamesTheFix:
     """D7: a tree the node could not reproduce is refused, and the text says

@@ -913,29 +913,54 @@ def remote_root_for(node: Node, project_dir: Path) -> str:
     return f"{node.root.rstrip('/')}/{name}"
 
 
-def assert_distinct_remote_roots(recipes: Sequence[Recipe]) -> None:
-    """Raise NodeConfigError if two of ``recipes`` share a node folder NAME.
+def _folder_leaf(recipe: Recipe) -> str:
+    return recipe.remote_root.rstrip("/").rsplit("/", 1)[-1]
+
+
+def remote_root_collisions(recipes: Sequence[Recipe]) -> list[tuple[Recipe, ...]]:
+    """Every group of two or more ``recipes`` that would share a node folder
+    NAME -- the one statement of that rule. Groups come in the order their
+    first member appears, members in input order; the same Recipe object
+    given twice is one member, not a collision.
 
     ``remote_root_for`` keys on the local folder's leaf name, so ``C:/a/api``
     and ``C:/b/api`` both become ``<root>/api`` -- one clone would overwrite
-    the other. Uniqueness is on the LEAF (the last ``/`` segment of
-    ``remote_root``) across the whole fleet, not on the full path: ``auto``
-    placement may later co-locate any two projects on one node, and two
-    projects with one leaf under different roots would then collide. So
-    placement calls this ONCE over ALL recipes, never per node, before any
-    bring-up. Names BOTH projects and both folders. Pure."""
-    held: dict[str, Recipe] = {}
+    the other. The key is the LEAF (the last ``/`` segment of
+    ``remote_root``) across the whole fleet, not the full path and not the
+    node: ``auto`` placement may later co-locate any two projects on one
+    node, and two projects with one leaf under different roots would then
+    collide. So a caller checks the whole fleet's recipes, never one node's.
+    Pure."""
+    groups: dict[str, list[Recipe]] = {}
     for recipe in recipes:
-        leaf = recipe.remote_root.rstrip("/").rsplit("/", 1)[-1]
-        first = held.setdefault(leaf, recipe)
-        if first is not recipe:
-            raise NodeConfigError(
-                f"projects {first.project!r} and {recipe.project!r} would share "
-                f"the node folder name {leaf!r} ({first.remote_root}, "
-                f"{recipe.remote_root}); a node folder is named after the local "
-                "folder and any two projects may land on one node, so rename "
-                "one of them"
-            )
+        group = groups.setdefault(_folder_leaf(recipe), [])
+        if not any(member is recipe for member in group):
+            group.append(recipe)
+    return [tuple(group) for group in groups.values() if len(group) > 1]
+
+
+def remote_root_collision_text(group: Sequence[Recipe]) -> str:
+    """Why ``group`` (one of ``remote_root_collisions``) cannot run: names
+    every project and every folder in it, and the fix."""
+    names = [repr(recipe.project) for recipe in group]
+    who = f"{', '.join(names[:-1])} and {names[-1]}"
+    folders = ", ".join(recipe.remote_root for recipe in group)
+    return (
+        f"projects {who} would share the node folder name "
+        f"{_folder_leaf(group[0])!r} ({folders}); a node folder is named after "
+        "the local folder and any two projects may land on one node, so rename "
+        "one of them"
+    )
+
+
+def assert_distinct_remote_roots(recipes: Sequence[Recipe]) -> None:
+    """Raise NodeConfigError, naming the whole group, for the first of
+    ``remote_root_collisions(recipes)``; do nothing when there is none. A
+    caller that must refuse only the colliding projects (a bring-up batch)
+    reads ``remote_root_collisions`` itself. Pure."""
+    collisions = remote_root_collisions(recipes)
+    if collisions:
+        raise NodeConfigError(remote_root_collision_text(collisions[0]))
 
 
 def absolute_remote(path: str, home: str) -> str:

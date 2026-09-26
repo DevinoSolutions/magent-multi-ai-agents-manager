@@ -456,22 +456,43 @@ class TestManyNodeProjectsAtOnce:
         assert set(nodes.read_node_map()) == {"a1", "a2", "b1"}
 
 
-def _no_node_contact(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fail loudly on anything a bring-up does past the batch check: the ssh
-    calls, the local git read, provisioning."""
+def _no_contact_for(monkeypatch: pytest.MonkeyPatch, rig: NodeRig, *sids: str) -> None:
+    """Fail loudly on anything a bring-up does for ``sids`` past the fleet
+    check -- the ssh calls, the local git read -- while every other project
+    still reaches the rig's fakes."""
+    refused = set(sids)
 
-    def forbidden(*_a: object, **_k: object) -> None:
-        raise AssertionError("a colliding batch must refuse before any bring-up")
+    def guard(sid: str) -> None:
+        if sid in refused:
+            raise AssertionError(f"{sid} must be refused before any bring-up")
 
-    for name in ("bring_up", "has_session", "decorate"):
-        monkeypatch.setattr(remote_mux, name, forbidden)
-    monkeypatch.setattr(launch, "node_git_states", forbidden)
-    monkeypatch.setattr(launch, "_provision_once", forbidden)
+    real_git = launch.node_git_states
+
+    def git_states(config: MagentConfig, proj: ProjectConfig) -> list[LocalGitState]:
+        guard(nodes.node_sid(proj))
+        return real_git(config, proj)
+
+    def bring_up(node, recipe, *, allow_dirty=False, resume_id=None):
+        guard(recipe.sid)
+        return rig._bring_up(node, recipe, allow_dirty=allow_dirty, resume_id=resume_id)
+
+    def has_session(node: nodes.Node, sid: str) -> bool:
+        guard(sid)
+        return rig.live
+
+    def decorate(node: nodes.Node, sid: str, nick: str) -> None:
+        guard(sid)
+        rig.decorated.append((sid, nick))
+
+    monkeypatch.setattr(launch, "node_git_states", git_states)
+    monkeypatch.setattr(remote_mux, "bring_up", bring_up)
+    monkeypatch.setattr(remote_mux, "has_session", has_session)
+    monkeypatch.setattr(remote_mux, "decorate", decorate)
 
 
 def _twin_apis(tmp_path: Path, rig: NodeRig) -> list[ProjectConfig]:
     """Two projects whose LOCAL folders share the leaf name ``api`` -- on two
-    different nodes, because the check is fleet-wide (auto may co-locate
+    different nodes, because the rule is fleet-wide (auto may co-locate
     them later) -- plus a bystander with a folder of its own."""
     out = []
     for parent, title, nick in (("x", "api-x", "second"), ("y", "api-y", "third")):
@@ -483,70 +504,89 @@ def _twin_apis(tmp_path: Path, rig: NodeRig) -> list[ProjectConfig]:
     return [*out, bystander]
 
 
-def _batch(config: MagentConfig) -> list[launch.NodeBringUpOutcome]:
+def _batch(config: MagentConfig, **kw: list[str]) -> list[launch.NodeBringUpOutcome]:
     """``bring_up_node_projects`` with its contract as an assertion: a batch
     never raises -- a project the check cannot place is an outcome, not a
     crash that takes its siblings down with it."""
     try:
-        return launch.bring_up_node_projects(config)
+        return launch.bring_up_node_projects(config, **kw)
     except Exception as exc:
         raise AssertionError(f"a node batch must never raise: {exc!r}") from exc
 
 
 class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
-    """X3: ``nodes.assert_distinct_remote_roots`` runs ONCE over the whole
-    batch, before the fan-out -- one clone would otherwise overwrite the
-    other's folder, and which one wins would depend on thread timing."""
+    """X3: before the fan-out, the batch is checked against the WHOLE fleet's
+    node folders (``nodes.remote_root_collisions``) -- one clone would
+    otherwise overwrite the other's folder, now or on a later ``up``. Only a
+    batch project in a colliding group is refused; the rest come up."""
 
-    def test_a_colliding_batch_refuses_before_any_ssh(self, rig, tmp_path, monkeypatch):
+    def test_the_colliding_members_are_refused_and_the_rest_come_up(
+        self, rig, tmp_path, monkeypatch
+    ):
         projs = _twin_apis(tmp_path, rig)
-        _no_node_contact(monkeypatch)
-        outcomes = launch.bring_up_node_projects(_config(*projs))
+        _no_contact_for(monkeypatch, rig, "api-x", "api-y")
+        outcomes = _batch(_config(*projs))
         assert [(o.sid, o.ok) for o in outcomes] == [
             ("api-x", False),
             ("api-y", False),
-            ("web", False),
+            ("web", True),
         ]
-        for o in outcomes:
+        for o in outcomes[:2]:
             assert o.error is not None
             assert "'api-x' and 'api-y' would share the node folder name 'api'" in (
                 o.error
             )
             assert "rename one of them" in o.error
         assert [o.node for o in outcomes] == ["second", "third", "second"]
+        assert [recipe.sid for _, recipe in rig.recipes] == ["web"]
+        assert set(nodes.read_node_map()) == {"web"}
+
+    def test_a_collision_with_a_project_outside_the_batch_still_refuses(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # `magent up api-x` today and `magent up api-y` tomorrow would each be
+        # a batch of one: only the fleet sees that they share a folder.
+        projs = _twin_apis(tmp_path, rig)
+        _no_contact_for(monkeypatch, rig, "api-x", "api-y")
+        outcomes = _batch(_config(*projs), only=["api-x"])
+        assert [(o.sid, o.ok) for o in outcomes] == [("api-x", False)]
+        assert "'api-y'" in (outcomes[0].error or "")
         assert rig.recipes == []
         assert nodes.read_node_map() == {}
 
-    def test_the_check_runs_once_over_every_project_in_the_batch(
+    def test_a_collision_entirely_outside_the_batch_blocks_nothing(self, rig, tmp_path):
+        projs = _twin_apis(tmp_path, rig)
+        outcomes = _batch(_config(*projs), only=["web"])
+        assert [(o.sid, o.ok, o.error) for o in outcomes] == [("web", True, None)]
+
+    def test_the_rule_is_asked_once_over_the_whole_fleet(
         self, rig, tmp_path, monkeypatch
     ):
         projs = _projects(
             tmp_path, rig, [("a1", "second"), ("b1", "third"), ("a2", "second")]
         )
         calls: list[list[str]] = []
-        real = nodes.assert_distinct_remote_roots
+        real = nodes.remote_root_collisions
 
         def spy(recipes):
             calls.append([r.remote_root for r in recipes])
-            real(recipes)
+            return real(recipes)
 
-        monkeypatch.setattr(nodes, "assert_distinct_remote_roots", spy)
-        outcomes = launch.bring_up_node_projects(_config(*projs))
-        assert all(o.ok for o in outcomes)
+        monkeypatch.setattr(nodes, "remote_root_collisions", spy)
+        outcomes = _batch(_config(*projs), only=["b1"])
+        assert [o.sid for o in outcomes] == ["b1"]
         assert calls == [["~/magent/a1", "~/magent/b1", "~/magent/a2"]]
 
-    def test_up_prints_the_collision_and_counts_every_project_failed(
+    def test_up_prints_the_collision_and_counts_only_the_pair_failed(
         self, rig, tmp_path, monkeypatch, capsys
     ):
         projs = _twin_apis(tmp_path, rig)
-        _no_node_contact(monkeypatch)
+        _no_contact_for(monkeypatch, rig, "api-x", "api-y")
         monkeypatch.setattr("magent.psmux.bring_up", lambda cfg, only, group: ([], []))
-        assert launch.bring_up_psmux(_config(*projs)) == (
-            [],
-            ["api-x", "api-y", "web"],
-        )
+        assert launch.bring_up_psmux(_config(*projs)) == (["web"], ["api-x", "api-y"])
         out = capsys.readouterr().out
         assert "api-x: projects 'api-x' and 'api-y' would share" in out
+        assert "web @second started" in out
 
     @pytest.mark.parametrize(
         ("make", "reason"),
@@ -583,9 +623,10 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         self, rig, tmp_path, monkeypatch
     ):
         # The map only places ``auto`` projects; a pinned pair collides with or
-        # without it, so a broken map must not switch the check off.
+        # without it, so a broken map must not switch the check off. The
+        # bystander's own bring-up then reports the map.
         projs = _twin_apis(tmp_path, rig)
-        _no_node_contact(monkeypatch)
+        _no_contact_for(monkeypatch, rig, "api-x", "api-y")
 
         def broken(*_a: object, **_k: object) -> dict[str, NodeMapEntry]:
             raise ValueError("node-map.json: not valid JSON")
@@ -593,10 +634,11 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         monkeypatch.setattr(nodes, "read_node_map", broken)
         outcomes = _batch(_config(*projs))
         assert [o.ok for o in outcomes] == [False, False, False]
-        assert all(
+        assert [
             "would share the node folder name 'api'" in (o.error or "")
             for o in outcomes
-        )
+        ] == [True, True, False]
+        assert "not valid JSON" in (outcomes[2].error or "")
 
 
 class TestUpBringsUpNodeProjectsToo:
