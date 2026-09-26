@@ -1514,3 +1514,59 @@ class TestTheTrimNeverStalls:
 
     def test_a_blank_first_line_is_trimmed(self, placed, rewrites):
         self._run("\n", rewrites)
+
+
+class TestTheLoadSampleEdges:
+    def test_the_slack_is_at_least_one_interval(self, placed, rewrites):
+        """With a 600 s interval the slack is 600 s, not 10% of an hour: a
+        row exactly one window plus one interval old is still inside it, so
+        the append does not rewrite the file."""
+        first, at = 1000.0, 1000.0 + WINDOW_S + 600
+        for ts in (first, at):
+            node_sync._append_sample(
+                "second", LoadSample(**SAMPLE), at=ts, history_h=1, interval_s=600
+            )
+        assert rewrites == []
+        assert _load_ts() == [first, at]
+
+    def test_a_failing_sample_is_tried_once_per_interval(self, placed, monkeypatch):
+        """The throttle is stamped before the append, so a load file that
+        cannot be written is retried per sample interval, not per tick."""
+        nodes.load_path("second").mkdir(parents=True)
+        tried: list[float] = []
+        real = node_sync._append_sample
+
+        def spy(nick, sample, **kw):
+            tried.append(kw["at"])
+            real(nick, sample, **kw)
+
+        monkeypatch.setattr(node_sync, "_append_sample", spy)
+        clock = iter([1000.0, 1010.0])
+
+        def pull(_node, _sids):
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        syncer = node_sync.NodeSyncer(
+            _second_only(sample_interval_s=60), pull=pull, now=lambda: next(clock)
+        )
+        assert syncer.tick()["second"] == (node_sync.OK, "")
+        assert syncer.tick()["second"] == (node_sync.OK, "")
+        assert tried == [1000.0]
+
+    def test_a_first_line_nested_too_deep_is_trimmed_not_raised(self, placed):
+        """json.loads raises RecursionError, not ValueError, on deep nesting.
+        The row reader must read that as "not a row", or the tick fails."""
+        path = nodes.load_path("second")
+        path.parent.mkdir(parents=True)
+        path.write_text("[" * 200_000 + "\n", encoding="utf-8")
+
+        def pull(_node, _sids):
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        syncer = node_sync.NodeSyncer(
+            _second_only(sample_interval_s=60, history_h=1),
+            pull=pull,
+            now=lambda: 1000.0,
+        )
+        assert syncer.tick()["second"] == (node_sync.OK, "")
+        assert _load_ts() == [1000.0]
