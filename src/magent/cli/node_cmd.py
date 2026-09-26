@@ -41,7 +41,10 @@ if TYPE_CHECKING:
 # launch.bring_up_node_project, launch.NodeBringUpOutcome,
 # remote_mux.push_files, remote_mux.kill_session.
 # - plan (Task 12): `_print_push_set` (plan G :3192-3210) and its call at the
-#   end of plan_cmd's loop (:3257). Needs node_git_states.
+#   end of plan_cmd's loop (:3257). Needs node_git_states. When it lands,
+#   restore the push-set wording in three places: plan_cmd's docstring first
+#   line (:3218), the ("node",) and ("node", "plan") help snapshots in
+#   tests/unit/test_cli_structure.py, and plan's row in cli/docs.py (:3268).
 # - push (Task 13): `_current_nick` and `push_cmd` (:3390-3440) and the docs
 #   row "magent node push <project>" after plan's row in cli/docs.py
 #   (:3444-3449). Needs node_recipe, node_git_states, push_files. When it
@@ -416,7 +419,9 @@ def _local_dir(cfg: MagentConfig, proj: ProjectConfig) -> Path | None:
 # D-MERGE: `_print_push_set` (plan G :3192-3210) and its call at the end of
 # plan_cmd's loop (:3257) need D's launch.node_git_states; they land with D's
 # merge, and test_plan_lists_the_push_set_relative_to_the_project switches on
-# with it.
+# with it. Until then the help does not promise the list: the docstring's
+# first line gets back plan G's "...would run and what it would ship."
+# (:3218) with it.
 
 
 @node_group.command("plan")
@@ -424,7 +429,7 @@ def _local_dir(cfg: MagentConfig, proj: ProjectConfig) -> Path | None:
 @click.option("--all", "all_projects", is_flag=True, help="Every enabled node project.")
 @click.pass_context
 def plan_cmd(ctx: click.Context, project: str | None, all_projects: bool) -> None:
-    """Show where a node project would run and what it would ship. Writes nothing.
+    """Show where a node project would run. Writes nothing.
 
     The same placement a launch makes -- the node-map, the load history and,
     for a node with too few recent samples, one live reading -- but nothing

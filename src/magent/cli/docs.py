@@ -480,12 +480,13 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "still runs)."
         ),
     ),
+    # D-MERGE: plan G's row (:3268) also names "which non-git files would be
+    # shipped"; restore it when Task 12's push-set listing lands with D.
     (
         "magent node plan <project|--all>",
         (
             "Show where a project would be placed (the load-history score per "
-            "node for `auto`) and which non-git files would be shipped. Writes "
-            "nothing."
+            "node for `auto`). Writes nothing."
         ),
     ),
     # D-MERGE: plan G Task 14's row reads "(--to <nick> | --local)" and names
