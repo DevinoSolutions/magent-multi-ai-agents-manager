@@ -1290,6 +1290,18 @@ class TestPushSet:
         shipped = nodes.push_set(repo, [_real_state(repo)], home=Path.home())
         assert repo / "notes.txt" not in shipped
 
+    def test_local_settings_that_cannot_be_read_are_an_error_not_absent(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / ".claude").mkdir()
+        settings = tmp_path / ".claude" / "settings.local.json"
+        settings.write_text("{}", encoding="utf-8")
+        deny_stat(monkeypatch, settings)
+        with pytest.raises(PermissionError):
+            nodes.push_set(
+                tmp_path, [_state(tmp_path, (".claude/",))], home=Path.home()
+            )
+
     def test_a_wholly_ignored_claude_dir_still_ships_its_local_settings(self, tmp_path):
         (tmp_path / ".claude").mkdir()
         (tmp_path / ".claude" / "settings.local.json").write_text(
