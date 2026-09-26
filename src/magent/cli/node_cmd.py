@@ -683,10 +683,14 @@ def _recall_local(
     the local folder, clear the placement, print the resume -- never launch
     it, because the user picks the terminal."""
     from magent import nodes, remote_mux  # heavy subsystem: in-body per policy
+    from magent.sessions import claude  # beside its siblings: one import site
 
-    dest = (
-        Path.home() / ".claude" / "projects" / nodes.encoded_project_dir(str(local_dir))
-    )
+    # The store a launch reads for this folder, from the one seam that names it
+    # (cq-G14 M5) -- never a second hand-built ~/.claude path.
+    # ROUTING-MERGE: a routed project's conversations live under its account's
+    # CLAUDE_CONFIG_DIR; after the routing merge pass that project's routed
+    # config dir here instead of None, or recall installs into the wrong store.
+    dest = claude._projects_dir(None, str(local_dir))
     pulled = nodes.transcripts_dir(held.nick, held.sid)
     if pulled.is_dir():
         try:

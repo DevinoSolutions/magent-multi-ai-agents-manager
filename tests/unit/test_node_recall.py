@@ -27,6 +27,7 @@ from magent.cli import node_cmd
 from magent.config import ProjectConfig, load_config
 from magent.lockfile import LockHeld
 from magent.nodes import LocalGitState
+from magent.sessions import claude as claude_sessions
 from tests.unit._node_fixtures import (
     NOW,
     OLDER_SESSION_ID,
@@ -2343,6 +2344,24 @@ class TestRecallResolvesTheFolderTheWayLaunchDoes:
         assert launched_in == str(link)
         assert launch._get_session_ids("claude", launched_in, 1) == [SESSION_ID]
         assert f'cd "{link}" && claude --resume {SESSION_ID}' in result.stdout
+
+    def test_the_store_is_the_one_the_claude_sessions_seam_names(
+        self, runner, placed_api, node_answers, api_repo, tmp_path, monkeypatch
+    ):
+        # cq-G14 M5: the store comes from sessions.claude, never a second
+        # hand-built ~/.claude path -- so when that seam answers elsewhere
+        # (an account's CLAUDE_CONFIG_DIR, after the routing merge), recall
+        # follows it.
+        store = tmp_path / "another-claude-config"
+        monkeypatch.setattr(claude_sessions, "default_config_dir", lambda: store)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 0, result.output
+        dest = store / "projects" / nodes.encoded_project_dir(str(api_repo))
+        assert (dest / f"{SESSION_ID}.jsonl").is_file()
+        assert not _claude_dir(api_repo).exists()
+        assert claude_sessions.get_claude_session_ids(str(api_repo), 1) == [SESSION_ID]
 
     @pytest.mark.parametrize("form", ["absolute", "relative", "home", "linked"])
     def test_recall_and_launch_resolve_every_path_form_alike(
