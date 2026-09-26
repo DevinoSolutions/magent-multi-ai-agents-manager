@@ -1335,9 +1335,10 @@ class UploadHandler(BaseHTTPRequestHandler):
 # watchdog killed or revived the wrong one and /health was answered by
 # whichever the kernel picked. So on Windows the server claims the port with
 # SO_EXCLUSIVEADDRUSE and no SO_REUSEADDR: a second serve -- a
-# `--host 0.0.0.0` one included -- is refused. A restart still rebinds at once -- Windows never held a port hostage
-# to TIME_WAIT connections (measured with ~20 of them on the port). POSIX keeps
-# SO_REUSEADDR for exactly that restart.
+# `--host 0.0.0.0` one included -- is refused. A restart still rebinds at
+# once -- Windows never held a port hostage to TIME_WAIT connections (measured
+# with ~20 of them on the port). POSIX keeps SO_REUSEADDR for exactly that
+# restart.
 #
 # winsock2.h: SO_EXCLUSIVEADDRUSE is ((int)(~SO_REUSEADDR)), i.e. -5. Spelled
 # out rather than read off ``socket`` because that name only exists on Windows,

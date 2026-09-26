@@ -1795,6 +1795,8 @@ class TestRunServerOnAHeldPort:
 
             assert pid_file.read_text() == "424242"
             assert "already in use" in caplog.text
+            # A held port is not a reserved one; that wording is the other path.
+            assert "reserved" not in caplog.text
             assert "listening" not in caplog.text
             # Losing a race is the designed outcome, not a crash for Sentry.
             assert not [r for r in caplog.records if r.levelname == "ERROR"]
