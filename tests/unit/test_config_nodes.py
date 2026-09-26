@@ -462,6 +462,20 @@ class TestANodeProjectsSessionNameIsItsOwn:
         )
         assert len(cfg.projects) == 2
 
+    def test_a_cloud_and_a_local_project_sharing_a_session_name_stay_accepted(
+        self, tmp_config
+    ):
+        # A cloud project is a LOCAL pane (DECISION-15), so this pair is two
+        # local sessions: today's first-wins dedupe, not a node collision.
+        cfg = load_config(
+            _cfg(
+                tmp_config,
+                nodes=_TWO,
+                projects=[{"path": "one/api", "node": "cloud"}, {"path": "two/api"}],
+            )
+        )
+        assert len(cfg.projects) == 2
+
     def test_an_ide_project_has_no_session_to_collide_with(self, tmp_config):
         # An IDE project opens an editor, not a psmux/tmux session, and a
         # node-pinned IDE project stays on this PC (nodes.node_projects).

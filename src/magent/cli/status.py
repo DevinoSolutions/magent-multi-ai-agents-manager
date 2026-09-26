@@ -597,7 +597,8 @@ def down_cmd(
         [_as_str(p.get("session")) or _as_str(p.get("name")) for p in projects], names
     )
     # Only a LOCAL down reaches them: the remote branch forwards the command,
-    # and the host runs this same rule against its own config.
+    # and the host runs this same rule against its own config. The `not in`
+    # is belt-and-braces: load_config refuses a node sid shared with a local one.
     targets += [s for s in _node_orphan_targets(cfg, group, names) if s not in targets]
 
     remote = _down_host(host, live)
