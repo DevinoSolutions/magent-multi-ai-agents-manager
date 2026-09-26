@@ -1315,7 +1315,7 @@ class TestAnUnreadableMapPullsNothing:
         }
 
     @_UNREADABLE
-    def test_one_warning_names_the_class_only_and_the_recovery_once(
+    def test_one_warning_carries_the_maps_error_and_the_recovery_once(
         self, placed, monkeypatch, caplog, state, cls
     ):
         _capture_nodes_log(caplog)
@@ -1327,10 +1327,17 @@ class TestAnUnreadableMapPullsNothing:
         syncer.tick()
         syncer.tick()
         warnings = _warnings(caplog)
-        assert warnings == [
-            f"node sync: the node map could not be read ({cls}); pulling nothing"
-        ]
-        assert "node-map.json" not in caplog.text
+        assert len(warnings) == 1, warnings
+        # Our words and the class, then the map's own error: its path and the
+        # parser's (or the OS's) words are for nodes.log -- the tick's answer,
+        # which reaches the screen, names the class only.
+        assert warnings[0].startswith(
+            f"node sync: the node map could not be read ({cls}); pulling nothing: "
+        )
+        if state == "torn":
+            assert f"{nodes.NODE_MAP_PATH}: Expecting" in warnings[0]
+        else:
+            assert "The process cannot access the file" in warnings[0]
         # Readable again: one line says so, and the pull resumes from the
         # marks the unreadable ticks left alone.
         monkeypatch.setattr(nodes, "load_node_map_strict", real)

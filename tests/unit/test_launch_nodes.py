@@ -2170,11 +2170,15 @@ class TestDownPullsTheLastTurnHomeFirst:
         assert "magent node sync --once" in out
 
     def test_a_map_torn_under_the_real_final_pull_names_no_path(
-        self, rig, api, monkeypatch, capsys, killed
+        self, rig, api, monkeypatch, capsys, caplog, killed
     ):
         # No fake final_pull: `down`'s own strict read went through, then the
         # map tore before final_pull's. The line says the map could not be
-        # read -- the parser's words and the map's path stay in the log.
+        # read -- the parser's words and the map's path go to the log.
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
         _hold("api")
         real = nodes.load_node_map_strict
         reads: list[None] = []
@@ -2195,13 +2199,23 @@ class TestDownPullsTheLastTurnHomeFirst:
         assert "api: last turn not pulled (the node map could not be read)" in out
         assert "node-map.json" not in out
         assert "Expecting value" not in out
+        (logged,) = [
+            r.getMessage()
+            for r in caplog.records
+            if "final pull of api failed" in r.getMessage()
+        ]
+        assert f"{nodes.NODE_MAP_PATH}: Expecting value" in logged
 
     def test_a_map_busy_under_the_real_final_pull_keeps_the_entry(
-        self, rig, api, monkeypatch, capsys, killed
+        self, rig, api, monkeypatch, capsys, caplog, killed
     ):
         # No fake final_pull: the real one, with the map a Windows reader
         # finds locked (a sync tick or an `up` replacing it) after `down`'s
-        # own strict read went through.
+        # own strict read went through. The OS's words go to the log only.
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
         _hold("api")
         real_read = Path.read_text
         reads: list[None] = []
@@ -2220,9 +2234,16 @@ class TestDownPullsTheLastTurnHomeFirst:
         assert len(reads) > 1, "final_pull never read the map"
         assert killed == ["api"]
         assert "api" in nodes.load_node_map_strict()
-        assert "api: last turn not pulled (the node map could not be read)" in (
-            capsys.readouterr().out
-        )
+        out = capsys.readouterr().out
+        assert "api: last turn not pulled (the node map could not be read)" in out
+        assert "cannot access" not in out
+        (logged,) = [
+            r.getMessage()
+            for r in caplog.records
+            if "final pull of api failed" in r.getMessage()
+        ]
+        assert "PermissionError" in logged
+        assert "The process cannot access the file" in logged
 
     @pytest.mark.parametrize("timed_out", [True, False], ids=["silent", "rc255"])
     def test_a_node_that_did_not_answer_the_pull_is_not_pulled_again(
