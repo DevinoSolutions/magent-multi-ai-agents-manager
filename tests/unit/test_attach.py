@@ -3001,3 +3001,93 @@ class TestUpHandsOffFromSessionZero:
 
         assert result.exit_code == 0
         assert plat.handoffs == []
+
+
+class TestHostAttachDialsTheSameClientAsItsPanes:
+    """`magent attach <host>` polls the host, ensures its upload server and
+    (under --no-mux) opens bare panes through the SAME ssh client its
+    supervised panes dial: attach_client's rule, Windows' own OpenSSH first.
+    Two clients share ``~/.ssh`` but not the agent, so a status poll that
+    succeeded through one must not front panes that fail through the other."""
+
+    _CLIENT = r"C:\Windows\System32\OpenSSH\ssh.exe"
+
+    def test_the_status_poll_dials_the_resolved_client(self, monkeypatch):
+        from magent import attach_client
+        from magent.cli import attach as attach_mod
+
+        argvs: list[list[str]] = []
+
+        def fake_run(argv, **_k):
+            argvs.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        monkeypatch.setattr(attach_client, "find_ssh", lambda: self._CLIENT)
+        monkeypatch.setattr(attach_mod.subprocess, "run", fake_run)
+        attach_mod._ssh_capture("u@host", "magent up --json")
+        assert argvs[0][0] == self._CLIENT
+
+    def test_the_status_poll_keeps_the_bare_name_when_nothing_resolves(
+        self, monkeypatch
+    ):
+        from magent.cli import attach as attach_mod
+
+        argvs: list[list[str]] = []
+
+        def fake_run(argv, **_k):
+            argvs.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        monkeypatch.setattr(attach_mod.subprocess, "run", fake_run)
+        attach_mod._ssh_capture("u@host", "magent up --json")
+        assert argvs[0][0] == "ssh"
+
+    def test_the_serve_ensure_hop_dials_the_resolved_client(self, monkeypatch):
+        from magent import attach_client
+        from magent.cli import attach as attach_mod
+
+        status = {
+            "up": [{"name": "api", "session": "api"}],
+            "down": [],
+            "projects": [{"name": "api"}],
+        }
+        monkeypatch.setattr(
+            attach_mod, "_query_status", lambda *a, **k: (status, 0, "")
+        )
+        monkeypatch.setattr(attach_mod, "_ssh_capture", lambda *a, **k: (0, "", ""))
+        hops: list[list[str]] = []
+
+        def fake_popen(args, **_k):
+            if args and args[0] != "wt":
+                hops.append(args)
+            return _FakeProc()
+
+        monkeypatch.setattr(attach_client, "find_ssh", lambda: self._CLIENT)
+        monkeypatch.setattr(attach_mod.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(attach_mod, "_tile_titles", lambda t: None)
+        monkeypatch.setattr(attach_mod, "_maybe_start_hotkey", lambda url: None)
+        monkeypatch.setattr(attach_mod.time, "sleep", lambda s: None)
+        monkeypatch.setattr(attach_mod, "_remember_last_host", lambda target: None)
+        _fake_platform(monkeypatch, {"magent:api": 1})
+
+        attach_mod._attach_flow("user@host", no_mux=False, group=None, yes=False)
+        (ensure,) = [h for h in hops if "--ensure" in h[-1]]
+        assert ensure[0] == self._CLIENT
+
+    def test_a_no_mux_pane_dials_the_resolved_client(self, monkeypatch):
+        from magent import attach_client
+        from magent.cli import attach as attach_mod
+
+        calls: list[list[str]] = []
+        monkeypatch.setattr(attach_client, "find_ssh", lambda: self._CLIENT)
+        monkeypatch.setattr(
+            attach_mod.subprocess, "Popen", lambda cmd, *a, **k: calls.append(cmd)
+        )
+        monkeypatch.setattr(attach_mod, "_tile_titles", lambda t: None)
+        monkeypatch.setattr(attach_mod.time, "sleep", lambda s: None)
+        _fake_platform(monkeypatch)
+        attach_mod._attach_nomux(
+            "u@host", {"projects": [{"path": "api", "name": "api"}]}
+        )
+        (argv,) = calls
+        assert argv[argv.index("--") + 1] == self._CLIENT

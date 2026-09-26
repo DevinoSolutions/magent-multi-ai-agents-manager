@@ -112,7 +112,7 @@ def _ssh_capture(
     try:
         r = subprocess.run(
             [
-                "ssh",
+                attach_client.ssh_program(),
                 "-o",
                 "BatchMode=yes",
                 "-o",
@@ -1215,7 +1215,7 @@ def _attach_flow(
     # instead of adding its own 2-3s afterwards.
     ensure = subprocess.Popen(
         [
-            "ssh",
+            attach_client.ssh_program(),
             "-o",
             "BatchMode=yes",
             "-o",
@@ -1320,7 +1320,7 @@ def _attach_nomux(target: str, status: dict[str, object]) -> None:
                 title,
                 "--suppressApplicationTitle",
                 "--",
-                "ssh",
+                attach_client.ssh_program(),
                 "-t",
                 target,
                 f"cd {remote_dir} && {cmd}",

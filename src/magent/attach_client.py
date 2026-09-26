@@ -408,17 +408,18 @@ def find_ssh() -> str | None:
     return shutil.which("ssh")
 
 
-def _ssh_program() -> str:
-    """argv[0] of every ssh this module builds: the client ``find_ssh``
-    resolved, or the bare name when there is none, so the spawn's own
-    not-found stays the one missing-client path (``SSH_MISSING_RC`` in
-    ``_run_ssh``, ``PROBE_FAILED`` in the probe)."""
+def ssh_program() -> str:
+    """argv[0] of every host-facing ssh magent builds -- this module's pane
+    and probe, and ``cli/attach.py``'s status poll, ``serve --ensure`` hop and
+    ``--no-mux`` pane: the client ``find_ssh`` resolved, or the bare name when
+    there is none, so the spawn's own not-found stays the one missing-client
+    path (``SSH_MISSING_RC`` in ``_run_ssh``, ``PROBE_FAILED`` in the probe)."""
     return find_ssh() or "ssh"
 
 
 def ssh_argv(target: str, remote: str) -> list[str]:
     """The interactive ssh invocation an attach pane runs."""
-    return [_ssh_program(), *SSH_CONNECTION_OPTS, "-t", target, remote]
+    return [ssh_program(), *SSH_CONNECTION_OPTS, "-t", target, remote]
 
 
 def session_probe_argv(target: str, session: str, mux: str = "psmux") -> list[str]:
@@ -455,7 +456,7 @@ def session_probe_argv(target: str, session: str, mux: str = "psmux") -> list[st
         question = f"tmux -L {TMUX_SOCKET} has-session -t '={session}'"
     else:
         question = f"psmux -L {session} has-session -t {session}"
-    return [_ssh_program(), *SESSION_PROBE_OPTS, target, question]
+    return [ssh_program(), *SESSION_PROBE_OPTS, target, question]
 
 
 def _probe_session(target: str, session: str, mux: str = "psmux") -> str:
@@ -1120,7 +1121,7 @@ def supervise(
     # Refused before any ssh is dialled: an unknown mux would otherwise only
     # surface after the first disconnect, possibly hours in, out of the probe.
     _check_mux(mux)
-    if shutil.which(_ssh_program()) is None:
+    if shutil.which(ssh_program()) is None:
         _echo(f"  {style('x', fg='red')} ssh is not on PATH -- cannot attach.")
         return SSH_MISSING_RC
 
