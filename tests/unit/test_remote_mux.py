@@ -111,6 +111,13 @@ class TestRemoteError:
     def test_it_is_a_runtime_error(self):
         assert isinstance(RemoteError(None, "", ()), RuntimeError)
 
+    def test_timed_out_is_false_unless_the_caller_says_so(self):
+        # rc None alone cannot tell "never ran" from "may have run": only the
+        # timeout path says the outcome is unknown.
+        assert RemoteError(None, "boom", ("ssh",)).timed_out is False
+        assert RemoteError(255, "refused", ("ssh",)).timed_out is False
+        assert RemoteError(None, "t", ("ssh",), timed_out=True).timed_out is True
+
 
 class TestTheSshResolver:
     def test_it_reads_path(self, tmp_path, monkeypatch):
@@ -261,12 +268,20 @@ class TestRun:
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["sleep"], timeout_s=1)
         assert exc.value.rc is None
+        assert exc.value.timed_out is True
         assert time.monotonic() - started < 10
 
     def test_no_ssh_client_is_rc_127_without_spawning(self):
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["true"], timeout_s=5)
         assert exc.value.rc == 127
+        assert exc.value.timed_out is False
+
+    def test_a_failed_command_did_not_time_out(self, fake_ssh):
+        fake_ssh.set_reply("false", rc=1)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["false"], timeout_s=30)
+        assert (exc.value.rc, exc.value.timed_out) == (1, False)
 
     def test_stdin_travels_as_bytes_and_is_named_only_by_its_length(self, fake_ssh):
         fake_ssh.set_reply("cat", rc=1)
@@ -1899,6 +1914,7 @@ class TestEveryLocalGitReadIsBoundedScrubbedAndLockFree:
         assert proc.killed
         assert exc.value.rc is None
         assert "timed out" in exc.value.stderr_tail
+        assert exc.value.timed_out is True
 
 
 _SSH_SHIM = """#!/bin/sh

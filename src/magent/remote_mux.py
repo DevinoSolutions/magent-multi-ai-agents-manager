@@ -120,12 +120,20 @@ class RemoteError(RuntimeError):
     cases. After a spawn failure the command never ran. After a timeout the
     OUTCOME IS UNKNOWN: killing the local ssh does not stop a non-tty remote
     command, so it may have run to completion (a killed send may have landed).
-    A caller must therefore never retry a mutation blindly on rc None."""
+    A caller must therefore never retry a mutation blindly on rc None.
+    ``timed_out`` tells the two apart: True only on the timeout path (outcome
+    unknown), False on every other construction (a spawn failure never ran)."""
 
     def __init__(
-        self, rc: int | None, stderr_tail: str, command_redacted: tuple[str, ...]
+        self,
+        rc: int | None,
+        stderr_tail: str,
+        command_redacted: tuple[str, ...],
+        *,
+        timed_out: bool = False,
     ) -> None:
         self.rc = rc
+        self.timed_out = timed_out
         self.stderr_tail = stderr_tail
         self.command_redacted = command_redacted
         super().__init__(
@@ -248,7 +256,9 @@ def _spawn(
         get_logger("nodes").warning(
             "%s timed out after %.1fs: %s", label, timeout_s, shlex.join(shown)
         )
-        raise RemoteError(None, f"timed out after {timeout_s:g}s", shown) from None
+        raise RemoteError(
+            None, f"timed out after {timeout_s:g}s", shown, timed_out=True
+        ) from None
     if check and proc.returncode != 0:
         get_logger("nodes").warning(
             "%s failed (rc=%s): %s", label, proc.returncode, shlex.join(shown)
