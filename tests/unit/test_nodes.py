@@ -2243,3 +2243,98 @@ class TestTheRefusalNamesTheFix:
     def test_allow_dirty_lets_dirty_and_unpushed_through(self, tmp_path):
         state = _git_state(tmp_path, dirty=True, unpushed=True)
         assert nodes.refusal_for(state, allow_dirty=True) is None
+
+
+class TestANodeSessionsStateComesFromTheLastPull:
+    SNAP = nodes.NodeSessions(ts=1000.0, sessions=("api",))
+
+    def test_listed_in_a_fresh_snapshot_is_live(self):
+        assert (
+            nodes.node_session_state("api", self.SNAP, pull_interval_s=30, now=1010.0)
+            == "live"
+        )
+
+    def test_missing_from_a_fresh_snapshot_is_dead(self):
+        assert (
+            nodes.node_session_state("web", self.SNAP, pull_interval_s=30, now=1010.0)
+            == "dead"
+        )
+
+    def test_an_old_snapshot_is_stale_never_dead(self):
+        # Spec §7: an unreachable node says nothing about its sessions.
+        for sid in ("api", "web"):
+            assert (
+                nodes.node_session_state(sid, self.SNAP, pull_interval_s=30, now=1061.0)
+                == "stale"
+            )
+
+    def test_no_snapshot_at_all_is_stale(self):
+        assert (
+            nodes.node_session_state("api", None, pull_interval_s=30, now=0.0)
+            == "stale"
+        )
+
+    def test_every_state_is_in_the_vocabulary(self):
+        got = {
+            nodes.node_session_state("api", self.SNAP, pull_interval_s=30, now=1010.0),
+            nodes.node_session_state("web", self.SNAP, pull_interval_s=30, now=1010.0),
+            nodes.node_session_state("api", None, pull_interval_s=30, now=0.0),
+        }
+        assert got == set(nodes.NODE_SESSION_STATES)
+
+
+class TestSessionRows:
+    def test_one_row_per_node_project_in_config_order(
+        self, node_map, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": 1000.0, "sessions": ["api"]}
+        )
+        nodes.update_node_map(
+            "web", dataclasses.replace(ENTRY, sid="web", nick="third")
+        )
+        config = _pool_config(
+            ProjectConfig(path=str(tmp_path / "api"), node="second"),
+            ProjectConfig(path=str(tmp_path / "loc")),
+            ProjectConfig(path=str(tmp_path / "web"), node="auto"),
+            ProjectConfig(path=str(tmp_path / "new"), node="auto"),
+        )
+        assert nodes.session_rows(config, now=1010.0) == [
+            {"name": "api", "session": "api", "node": "second", "state": "live"},
+            {"name": "web", "session": "web", "node": "third", "state": "stale"},
+            {"name": "new", "session": "new", "node": None, "state": "dead"},
+        ]
+
+    def test_the_mapped_sid_wins_over_the_derived_one(
+        self, node_map, tmp_path, monkeypatch
+    ):
+        # The map records the id the session was STARTED under; a later title
+        # change must not make status look for a session that never existed.
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": 1000.0, "sessions": ["api-old"]}
+        )
+        nodes.update_node_map("api", dataclasses.replace(ENTRY, sid="api-old"))
+        config = _pool_config(ProjectConfig(path=str(tmp_path / "api"), node="second"))
+        assert nodes.session_rows(config, now=1010.0) == [
+            {"name": "api", "session": "api-old", "node": "second", "state": "live"}
+        ]
+
+    def test_the_pull_interval_comes_from_the_config(
+        self, node_map, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": 1000.0, "sessions": ["api"]}
+        )
+        config = _pool_config(ProjectConfig(path=str(tmp_path / "api"), node="second"))
+        config.settings.node_sync = dataclasses.replace(
+            config.settings.node_sync, pull_interval_s=100
+        )
+        # 150s old: stale at the default 30s interval, fresh at 100s.
+        assert nodes.session_rows(config, now=1150.0)[0]["state"] == "live"
+
+    def test_no_node_project_is_no_rows(self, node_map, tmp_path):
+        config = _pool_config(ProjectConfig(path=str(tmp_path / "loc")))
+        assert nodes.session_rows(config, now=0.0) == []

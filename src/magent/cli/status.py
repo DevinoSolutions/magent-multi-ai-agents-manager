@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from typing import TYPE_CHECKING, NamedTuple
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -332,6 +333,21 @@ def _render_status(config_file: Path) -> StatusReport:
         click.echo(
             f"\n  {style(str(len(down)), fg='yellow', bold=True)} not running  {style('(' + preview + ')', dim=True)}"
         )
+    # Node sessions (PR-D): read from the sync daemon's last pull, never over
+    # ssh -- a stale row is a node this PC has not heard from, not a dead one.
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    node_rows = nodes.session_rows(cfg, now=time.time())
+    if node_rows:
+        tint = {"live": "green", "stale": "yellow", "dead": "red"}
+        click.echo(f"\n  {style('Nodes', bold=True)}")
+        for node_row in node_rows:
+            node = f"@{node_row['node']}" if node_row["node"] else "(not placed)"
+            state = str(node_row["state"])
+            click.echo(
+                f"    {node_row['session']}  {style(node, fg='blue')}  {style(state, fg=tint[state])}"
+            )
     _divider()
 
     status = _gather_status(cfg)
@@ -456,6 +472,11 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
         # Session 0 is a fact about the machine, not about magent's daemons, so
         # it changes neither the envelope's shape nor the exit contract.
         payload["psmux_session0"] = len(session0_server_pids())
+        # Additive, like psmux_sessions: a dead or stale node session is a row
+        # state, never a degraded daemon, so the exit contract is unchanged.
+        from magent import nodes  # heavy subsystem: in-body per policy
+
+        payload["node_sessions"] = nodes.session_rows(cfg, now=time.time())
         click.echo(json.dumps(payload))
         sys.exit(3 if _is_degraded(status) else 0)
 

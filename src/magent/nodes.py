@@ -1210,3 +1210,44 @@ def recipe_for(
         warnings=(*repo_warnings, *push_warned),
         local_root=root,
     )
+
+
+# A node session's state as this PC knows it: from the sync daemon's last
+# pull, never from a live ssh call (status must stay fast and offline-safe).
+NODE_SESSION_STATES = ("live", "stale", "dead")
+
+
+def node_session_state(
+    sid: str, snap: NodeSessions | None, *, pull_interval_s: float, now: float
+) -> str:
+    """``live`` if the last fresh pull listed ``sid``, ``dead`` if it did
+    not, ``stale`` when there is no fresh pull -- an unreachable node says
+    nothing about its sessions, so it never reads dead (spec §7)."""
+    if snap is None or sessions_stale(snap, pull_interval_s=pull_interval_s, now=now):
+        return "stale"
+    return "live" if sid in snap.sessions else "dead"
+
+
+def session_rows(config: MagentConfig, *, now: float) -> list[dict[str, object]]:
+    """One row per node project, config order: ``name``, ``session``,
+    ``node`` (the nick; None for an ``auto`` project not yet placed) and
+    ``state`` (``NODE_SESSION_STATES``). An unplaced project is ``dead``.
+    The map's recorded sid wins over the derived one: it is the id the
+    session was started under."""
+    entries = read_node_map()
+    interval = config.settings.node_sync.pull_interval_s
+    rows: list[dict[str, object]] = []
+    for proj in node_projects(config):
+        name = project_name(proj)
+        entry = entries.get(name)
+        nick = entry.nick if entry else (None if proj.node == NODE_AUTO else proj.node)
+        sid = entry.sid if entry and entry.sid else node_sid(proj)
+        state = (
+            "dead"
+            if nick is None
+            else node_session_state(
+                sid, read_sessions(nick), pull_interval_s=interval, now=now
+            )
+        )
+        rows.append({"name": name, "session": sid, "node": nick, "state": state})
+    return rows

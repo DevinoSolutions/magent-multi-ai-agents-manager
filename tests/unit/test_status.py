@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -382,6 +383,7 @@ class TestJson:
             "agents": [],
             "psmux_sessions": [],
             "psmux_session0": 0,
+            "node_sessions": [],
         }
 
     def test_degraded_emits_parseable_status_and_exit_3(
@@ -407,6 +409,7 @@ class TestJson:
             "agents": [],
             "psmux_sessions": [],
             "psmux_session0": 0,
+            "node_sessions": [],
         }
 
 
@@ -1473,3 +1476,125 @@ class TestSessionZeroServers:
         result = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
 
         assert json.loads(result.stdout)["psmux_session0"] == 3
+
+
+class TestStatusShowsNodeSessions:
+    """A node session's row comes from the sync daemon's last pull, never
+    from a live ssh call -- and a stale one is a row state, not a degraded
+    daemon, so the 0/1/3 exit contract is untouched."""
+
+    def _config(self, tmp_config, tmp_path):
+        return tmp_config(
+            {
+                "projects": [{"path": str(tmp_path), "title": "api", "node": "second"}],
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                },
+            }
+        )
+
+    def _snapshot(self, monkeypatch, tmp_path, ts):
+        from magent import nodes
+
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": ts, "sessions": ["api"]}
+        )
+
+    def test_json_carries_the_node_and_its_state(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        self._snapshot(monkeypatch, tmp_path, ts=time.time())
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._config(tmp_config, tmp_path), "status", "--json"],
+        )
+        assert json.loads(result.stdout)["node_sessions"] == [
+            {"name": "api", "session": "api", "node": "second", "state": "live"}
+        ]
+
+    def test_the_node_key_sits_right_after_psmux_session0(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        self._snapshot(monkeypatch, tmp_path, ts=time.time())
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._config(tmp_config, tmp_path), "status", "--json"],
+        )
+        keys = list(json.loads(result.stdout))
+        assert keys[keys.index("psmux_session0") + 1] == "node_sessions"
+
+    def test_an_unreachable_node_reads_stale_and_is_not_degraded(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        self._snapshot(monkeypatch, tmp_path, ts=0.0)
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._config(tmp_config, tmp_path), "status", "--json"],
+        )
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sessions"][0]["state"] == "stale"
+
+    def test_the_report_lists_them_with_their_node(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        self._snapshot(monkeypatch, tmp_path, ts=time.time())
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_config, tmp_path), "status"]
+        )
+        assert "Nodes" in result.stdout
+        assert "api" in result.stdout
+        assert "@second" in result.stdout
+        assert "live" in result.stdout
+
+    def test_a_stale_report_row_does_not_degrade_the_exit(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        self._snapshot(monkeypatch, tmp_path, ts=0.0)
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_config, tmp_path), "status"]
+        )
+        assert result.exit_code == 0
+        assert "stale" in result.stdout
+
+    def test_an_unplaced_auto_project_reads_not_placed(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        self._snapshot(monkeypatch, tmp_path, ts=time.time())
+        cfg = tmp_config(
+            {
+                "projects": [{"path": str(tmp_path), "title": "new", "node": "auto"}],
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                },
+            }
+        )
+        result = runner.invoke(cli.main, ["--config", cfg, "status"])
+        assert "(not placed)" in result.stdout
+        assert "dead" in result.stdout
+
+    def test_a_config_without_node_projects_prints_no_nodes_section(
+        self, runner, tmp_config, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        result = runner.invoke(
+            cli.main, ["--config", tmp_config({"projects": []}), "status"]
+        )
+        assert "Nodes" not in result.stdout
