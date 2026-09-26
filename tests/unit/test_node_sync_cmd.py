@@ -82,6 +82,22 @@ def _pid_is_mine() -> None:
     _record_pid(os.getpid())
 
 
+@pytest.fixture(autouse=True)
+def _no_endless_loop(monkeypatch):
+    """No test here runs the foreground loop without --ticks, so reaching it
+    unbounded is a failure in a second -- not a test that hangs CI until its
+    timeout (a flag the shell ignores falls through to exactly that loop).
+    A bounded run (--ticks) still gets the real loop."""
+    real_loop = node_sync.run_sync_loop
+
+    def bounded(cfg: object, *, max_ticks: int | None = None, **kw: object) -> int:
+        if max_ticks is None:
+            pytest.fail("fell through to the endless foreground sync loop")
+        return real_loop(cfg, max_ticks=max_ticks, **kw)
+
+    monkeypatch.setattr(node_sync, "run_sync_loop", bounded)
+
+
 class TestNodeSync:
     def test_once_reports_every_node_and_fails_when_one_is_down(
         self, runner, pool_config, fake_ssh
@@ -101,6 +117,23 @@ class TestNodeSync:
             "@third  unreachable  ssh: connect to host devino-third port 22: "
             "Connection refused"
         ) in result.stdout
+
+    def test_once_fails_when_the_first_node_fails_and_the_last_is_ok(
+        self, runner, pool_config, fake_ssh
+    ):
+        """The exit code aggregates every node, not whichever printed last."""
+        fake_ssh.set_reply(
+            "devino-second",
+            stderr="ssh: connect to host devino-second port 22: Connection refused\n",
+            rc=255,
+        )
+        fake_ssh.set_reply("devino-third", stdout=pull_reply(pull_meta()))
+        result = runner.invoke(
+            cli.main, ["--config", pool_config, "node", "sync", "--once"]
+        )
+        assert result.exit_code == 1, result.output
+        assert "@second  unreachable" in result.stdout
+        assert "@third  ok" in result.stdout
 
     def test_once_while_the_daemon_runs_defers_to_its_tick(
         self, runner, pool_config, fake_ssh, daemon_lock
@@ -122,6 +155,15 @@ class TestNodeSync:
         result = runner.invoke(cli.main, ["node", "sync", "--stop"])
         assert result.exit_code == 0
         assert "Node sync daemon was not running." in result.stdout
+
+    def test_stop_does_only_the_stop(self, runner, pool_config):
+        """--stop prints its one line and returns; it never goes on to load
+        the pool and sync (the autouse stub fails the test if it does)."""
+        result = runner.invoke(
+            cli.main, ["--config", pool_config, "node", "sync", "--stop"]
+        )
+        assert result.exit_code == 0, result.output
+        assert result.stdout == "  - Node sync daemon was not running.\n"
 
     def test_a_daemon_whose_pid_is_unknown_is_not_reported_as_nothing_running(
         self, runner, daemon_lock
@@ -358,6 +400,31 @@ def _both_answer(fake_ssh) -> None:
 def _hosts_dialled(fake_ssh) -> list[str]:
     # A first pull may add a realpath round trip, so count hosts, not calls.
     return sorted({c.argv[-2] for c in fake_ssh.calls()})
+
+
+class TestImportCost:
+    def test_node_sync_help_does_not_import_the_sync_subsystem(self):
+        """The registration hub imports this module for every `magent`
+        invocation, so node_sync (ssh, tar) and remote_mux are imported
+        in-body only. A fresh interpreter, because this one has them loaded."""
+        code = (
+            "import sys\n"
+            "from click.testing import CliRunner\n"
+            "from magent import cli\n"
+            "r = CliRunner().invoke(cli.main, ['node', 'sync', '--help'])\n"
+            "assert r.exit_code == 0, r.output\n"
+            "print(sorted(m for m in ('magent.node_sync', 'magent.remote_mux')"
+            " if m in sys.modules))\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == "[]"
 
 
 class TestDaemonState:
