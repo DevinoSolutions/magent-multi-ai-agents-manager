@@ -285,7 +285,8 @@ def sync_lines(cfg: MagentConfig, nick: str, *, now: float) -> list[ScriptLine]:
 def node_checks(cfg: MagentConfig, nick: str, *, now: float) -> list[ScriptLine]:
     """Every health row for ``nick``: the node's own (doctor.sh, one ssh call),
     then this PC's sync rows. An unreachable node is one ``fail reach`` row;
-    nothing here raises. Read-only: it never provisions (DECISION-24 wires
+    every expected failure is a row, and ``_checks_or_crash_row`` turns a bug
+    into one too. Read-only: it never provisions (DECISION-24 wires
     provisioning into ``node setup`` and the bring-up, not the doctor)."""
     # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
     from magent import nodes, remote_mux

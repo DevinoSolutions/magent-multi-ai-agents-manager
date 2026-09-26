@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import threading
@@ -364,6 +365,44 @@ class TestTheDoctorNeverReadsSilenceOrACrashAsHealth:
         assert result.exit_code == 1
         assert "cannot reach amin@devino-second: rc=None" in result.stdout
 
+    def test_the_crash_row_s_pointer_to_nodes_log_is_true(
+        self, runner, tmp_config, monkeypatch
+    ):
+        # The row says "see ~/.magent/logs/nodes.log": the traceback must be
+        # there, under the nodes logger, with the exception attached (cq-F16).
+        records: list[tuple[str, logging.LogRecord]] = []
+
+        class _Keep(logging.Handler):
+            def __init__(self, asked: str) -> None:
+                super().__init__()
+                self.asked = asked
+
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append((self.asked, record))
+
+        def get_logger(name: str) -> logging.Logger:
+            logger = logging.getLogger(f"test_node_cmd.{name}")
+            logger.handlers = [_Keep(name)]
+            logger.propagate = False
+            logger.setLevel(logging.DEBUG)
+            return logger
+
+        def doctor(node, *, timeout_s):
+            raise KeyError("boom")
+
+        monkeypatch.setattr(log, "get_logger", get_logger)
+        monkeypatch.setattr(remote_mux, "doctor", doctor)
+        result = _doctor(runner, _pool_file(tmp_config), "--json")
+        assert result.exit_code == 1, result.output
+        assert json.loads(result.stdout)["nodes"]["second"][0]["item"] == "doctor"
+        crashed = [
+            r
+            for asked, r in records
+            if asked == "nodes" and r.exc_info and r.exc_info[0] is KeyError
+        ]
+        assert crashed, [(a, r.getMessage()) for a, r in records]
+        assert "second" in crashed[0].getMessage()
+
 
 class TestALegacyCodePageStdout:
     def test_a_node_s_undecodable_byte_does_not_crash_the_doctor(
@@ -384,6 +423,24 @@ class TestALegacyCodePageStdout:
             repr(result.exception)
         )
         assert "git 2.43 ?" in result.stdout
+        assert "No failures." in result.stdout
+
+    def test_a_node_s_undecodable_byte_in_an_item_does_not_crash_the_doctor(
+        self, tmp_config, monkeypatch
+    ):
+        # The item column is the node's words too: doctor.sh prints it, and
+        # _report_of's errors="replace" can put U+FFFD there as well (cq-F16).
+        def doctor(node, *, timeout_s):
+            return ProvisionReport((ScriptLine("ok", "git�", "git 2.43"),))
+
+        monkeypatch.setattr(remote_mux, "doctor", doctor)
+        result = CliRunner(charset="cp1252").invoke(
+            cli.main, ["--config", _pool_file(tmp_config), "node", "doctor"]
+        )
+        assert result.exception is None or isinstance(result.exception, SystemExit), (
+            repr(result.exception)
+        )
+        assert "git?" in result.stdout
         assert "No failures." in result.stdout
 
 
