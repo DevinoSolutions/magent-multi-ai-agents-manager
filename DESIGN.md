@@ -1804,16 +1804,17 @@ a session on a box that happened to be idle for one second of a bursty minute.
 **A placement sticks, and placing writes nothing.** A project stays on its
 node until that node leaves `settings.nodes`; only then is it re-placed, with
 the reason printed. The placement phase never writes `node-map.json`: the
-bring-up (sub-plan D's) records it once it has actually happened, so a failed launch leaves
-nothing sticky behind, and `magent node plan` can render the very same objects
-while writing nothing, pinned byte-for-byte. Nothing moves a running session
-on its own; `magent node recall --to` (with sub-plan D) is the only mover.
+bring-up (sub-plan D's) records it once it has actually happened, so a failed
+launch leaves nothing sticky behind, and `magent node plan` can render the
+very same objects while writing nothing, pinned byte-for-byte. Nothing moves a
+running session on its own; `magent node recall --to` (with sub-plan D) is the
+only mover.
 
 **The node decides what a plain re-up resumes.** A session brought up again
-passes no resume id: sub-plan D's `bring_up.sh` runs `claude --continue` over the node's own
-transcripts, or the fresh form when there are none. The PC's pulled copy can
-be one pull stale, and an explicit `--resume` has no fresh fallback on a node
-that lost the file. `claude --resume <id>` is used only where magent installed
+passes no resume id: sub-plan D's `bring_up.sh` runs `claude --continue` over
+the node's own transcripts, or the fresh form when there are none. The PC's
+pulled copy can be one pull stale, and an explicit `--resume` has no fresh
+fallback on a node that lost the file. `claude --resume <id>` is used only where magent installed
 that conversation first: `recall --to` (with sub-plan D; installed by
 `install_transcripts.sh`, under the name magent's one encoder gives the node's
 own `realpath`; the node never encodes) and the resume `recall --local` prints.
@@ -1878,9 +1879,9 @@ which predates win32-input-mode and may pass the CR through unencoded.
 **Auto placement never rebalances (2026-09-24):** an `auto` project stays on
 the node it was placed on until that node leaves `settings.nodes`. A node that
 grows busy keeps its sessions; moving one is a manual
-`magent node recall <project> --to <nick>` (with sub-plan D). Deliberate: a move stops a live
-session and ships its conversation, which is not something to do behind the
-user's back. If it bites, the fix is a `node plan` hint naming the better node,
+`magent node recall <project> --to <nick>` (with sub-plan D). Deliberate: a
+move stops a live session and ships its conversation, which is not something
+to do behind the user's back. If it bites, the fix is a `node plan` hint naming the better node,
 never an automatic move.
 
 **Recall moves Claude Code conversations only (2026-09-24):** `magent node
@@ -1889,9 +1890,9 @@ transcript layout magent pulls, and no resume-by-id form recall could print.
 Its sessions come home by git alone: commit and push on the node, pull here.
 
 **A bring-up's repo record knows the commit, not the branch (2026-09-24):**
-`repos.json` written at bring-up (sub-plan D's) carries each repo's sha from `bring_up.sh`,
-with an empty branch and an unknown unpushed count, because the bring-up
-reports only commits. A recall from a node that no longer answers therefore
+`repos.json` written at bring-up (sub-plan D's) carries each repo's sha from
+`bring_up.sh`, with an empty branch and an unknown unpushed count, because the
+bring-up reports only commits. A recall from a node that no longer answers therefore
 prints the last known sha without a branch. A recall from a node that answers
 records the full `repo_status.sh` report and replaces it.
 
