@@ -10,6 +10,7 @@ import types
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 from magent import cli, wt_keys
 from magent import psmux as psmux_mod
@@ -23,6 +24,7 @@ from magent.cli.doctor import (
     _check_config,
     _check_hotkey,
     _check_monitors,
+    _check_nodes,
     _check_psmux_wedge,
     _check_sentry,
     _check_tailscale,
@@ -31,6 +33,7 @@ from magent.cli.doctor import (
 )
 from magent.config import SCHEMA_VERSION, load_config
 from magent.grid import MonitorRect
+from magent.remote_mux import ScriptLine
 from tests.conftest import FakePlatform
 
 
@@ -733,4 +736,200 @@ class TestDoctorCli:
             "sentry",
             "tailscale",
             "upload port",
+            "nodes",
         } == names
+
+
+def _nodes_cfg(tmp_config, nicks=("second",)):
+    return load_config(
+        tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {
+                    "nodes": {n: {"host": f"devino-{n}", "user": "amin"} for n in nicks}
+                },
+                "projects": [],
+            }
+        )
+    )
+
+
+class TestTheNodesRow:
+    def test_no_nodes_is_ok(self, tmp_config):
+        cfg = load_config(tmp_config({"version": SCHEMA_VERSION, "projects": []}))
+        assert _check_nodes(cfg) == ("ok", "no nodes configured")
+
+    def test_no_loadable_config_is_skipped_not_called_node_free(self):
+        # A missing or broken config may well configure nodes: say the row was
+        # skipped (the config row already fails), never "no nodes configured".
+        assert _check_nodes(None) == (
+            "ok",
+            "skipped -- config missing or invalid (see the config check)",
+        )
+
+    def test_healthy_nodes_are_ok(self, tmp_config, monkeypatch):
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {
+                n: [ScriptLine("ok", "tmux", "tmux 3.4")] for n in nicks
+            },
+        )
+        assert _check_nodes(_nodes_cfg(tmp_config, ("second", "fifth"))) == (
+            "ok",
+            "2 node(s) healthy",
+        )
+
+    @pytest.mark.parametrize("status", ["fail", "warn"])
+    def test_a_troubled_node_is_only_a_warning_naming_its_items(
+        self, tmp_config, monkeypatch, status
+    ):
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {
+                "second": [
+                    ScriptLine("ok", "tmux", ""),
+                    ScriptLine(status, "claude-login", "not logged in"),
+                ],
+                "fifth": [ScriptLine("ok", "tmux", "")],
+            },
+        )
+        assert _check_nodes(_nodes_cfg(tmp_config, ("second", "fifth"))) == (
+            "warn",
+            "second: claude-login -- details: magent node doctor",
+        )
+
+    def test_troubled_nodes_join_by_semicolon_their_items_by_comma(
+        self, tmp_config, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {
+                "second": [
+                    ScriptLine("warn", "github-key", "not registered"),
+                    ScriptLine("ok", "tmux", ""),
+                    ScriptLine("fail", "claude-login", "not logged in"),
+                ],
+                "third": [
+                    ScriptLine("ok", "tmux", ""),
+                    ScriptLine("skip", "snapshot", ""),
+                ],
+                "fifth": [
+                    ScriptLine("fail", "reach", "cannot reach amin@devino-fifth")
+                ],
+            },
+        )
+        cfg = _nodes_cfg(tmp_config, ("second", "third", "fifth"))
+        assert _check_nodes(cfg) == (
+            "warn",
+            "second: github-key, claude-login; fifth: reach -- details: magent node doctor",
+        )
+
+    def test_nodes_keep_the_config_order(self, tmp_config, monkeypatch):
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {n: [ScriptLine("fail", "reach", "")] for n in nicks},
+        )
+        assert _check_nodes(_nodes_cfg(tmp_config, ("second", "fifth"))) == (
+            "warn",
+            "second: reach; fifth: reach -- details: magent node doctor",
+        )
+
+    def test_a_row_neither_fail_nor_warn_is_healthy(self, tmp_config, monkeypatch):
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {
+                "second": [ScriptLine("did", "x", ""), ScriptLine("key", "y", "")]
+            },
+        )
+        assert _check_nodes(_nodes_cfg(tmp_config)) == ("ok", "1 node(s) healthy")
+
+    def test_doctor_hands_the_loaded_config_to_the_nodes_row(
+        self, runner, monkeypatch, tmp_config
+    ):
+        monkeypatch.setattr("magent.platform.get_platform", FakePlatform)
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: False)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {n: [ScriptLine("fail", "reach", "")] for n in nicks},
+        )
+        config_path = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                },
+                "projects": [],
+            }
+        )
+
+        result = runner.invoke(cli.main, ["--config", config_path, "doctor", "--json"])
+
+        rows = {c["name"]: c for c in json.loads(result.stdout)["checks"]}
+        assert rows["nodes"] == {
+            "name": "nodes",
+            "status": "warn",
+            "detail": "second: reach -- details: magent node doctor",
+        }
+
+    def test_the_row_comes_right_after_upload_port(
+        self, runner, monkeypatch, tmp_config
+    ):
+        # ORDER, not just membership: the audit's row order is upload port,
+        # nodes, then mcp-relay (K12 pins its own row directly after this one).
+        monkeypatch.setattr("magent.platform.get_platform", FakePlatform)
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: False)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
+        config_path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
+
+        result = runner.invoke(cli.main, ["--config", config_path, "doctor", "--json"])
+
+        names = [c["name"] for c in json.loads(result.stdout)["checks"]]
+        assert names.index("nodes") == names.index("upload port") + 1, names
+
+    def test_skip_rows_are_healthy_through_the_real_path(self, tmp_config, fake_ssh):
+        # No sync daemon and no snapshot: this PC's two rows are `skip`, and a
+        # node that is merely not synced yet is not a troubled one.
+        fake_ssh.set_reply("bash -s", stdout="ok\ttmux\ttmux 3.4\n")
+        assert _check_nodes(_nodes_cfg(tmp_config)) == ("ok", "1 node(s) healthy")
+
+    def test_an_unreachable_node_is_a_warning_through_the_real_path(
+        self, tmp_config, fake_ssh
+    ):
+        fake_ssh.set_reply(
+            "bash -s", stderr="ssh: connect to host devino-second: No route\n", rc=255
+        )
+        assert _check_nodes(_nodes_cfg(tmp_config)) == (
+            "warn",
+            "second: reach -- details: magent node doctor",
+        )
+
+    def test_a_node_s_unencodable_item_renders_on_a_legacy_code_page(
+        self, tmp_config, monkeypatch
+    ):
+        # The item names are the node's words (doctor.sh prints them, and
+        # _report_of's errors="replace" can put U+FFFD there), which cp1252 -- a
+        # redirected Windows stdout -- lacks: the row degrades a glyph, never
+        # the command.
+        monkeypatch.setattr(
+            "magent.cli.node_cmd.doctor_report",
+            lambda cfg, nicks: {
+                "second": [
+                    ScriptLine("fail", "claude-login\N{REPLACEMENT CHARACTER}", "")
+                ]
+            },
+        )
+        monkeypatch.setattr("magent.platform.get_platform", FakePlatform)
+        cfg = _nodes_cfg(tmp_config)
+
+        def only_the_nodes_row(_f):
+            # Computed inside invoke, while the runner's cp1252 stdout is installed.
+            status, detail = _check_nodes(cfg)
+            return [{"name": "nodes", "status": status, "detail": detail}]
+
+        monkeypatch.setattr(doctor, "_run_checks", only_the_nodes_row)
+        result = CliRunner(charset="cp1252").invoke(
+            cli.main, ["--config", tmp_config({"version": SCHEMA_VERSION}), "doctor"]
+        )
+        assert result.exception is None, repr(result.exception)
+        assert "second: claude-login? -- details: magent node doctor" in result.stdout
