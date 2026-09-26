@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from magent import agent_state, launch, node_sync, nodes
+from magent import agent_state, launch, node_sync, nodes, remote_mux
 from magent.config import (
     SCHEMA_VERSION,
     MagentConfig,
@@ -33,8 +33,8 @@ from magent.config import (
 from magent.env import get_env
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import get_logger, heartbeat_age, write_heartbeat
-from magent.nodes import NodeMapEntry
-from tests.unit._pull_reply import pull_meta, pull_reply
+from magent.nodes import LoadSample, NodeMapEntry, encoded_project_dir
+from tests.unit._pull_reply import SAMPLE, pull_meta, pull_reply
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -892,3 +892,759 @@ class TestOneTick:
         results = node_sync.NodeSyncer(_config()).tick()
         assert results["second"] == (node_sync.UNREACHABLE, REFUSED.strip())
         assert results["third"] == (node_sync.OK, "")
+
+
+def _node_warnings(caplog, nick: str) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "magent.nodes"
+        and r.levelno == logging.WARNING
+        and f"node {nick}:" in r.getMessage()
+    ]
+
+
+class TestANodeFailsAlone:
+    def test_an_unreachable_node_keeps_its_snapshot_while_the_other_advances(
+        self, placed, fake_ssh
+    ):
+        clock = iter([100.0, 100.0, 200.0, 200.0])
+        syncer = node_sync.NodeSyncer(_config(), now=lambda: next(clock))
+        _answer(fake_ssh, "devino-second")
+        _answer(fake_ssh, "devino-third")
+        syncer.tick()
+        _forget_replies(fake_ssh)
+        _answer(fake_ssh, "devino-second", rc=255, stderr=REFUSED)
+        _answer(fake_ssh, "devino-third")
+        results = syncer.tick()
+        assert results["second"][0] == node_sync.UNREACHABLE
+        assert nodes.read_sessions("second").ts == 100.0
+        assert nodes.read_sessions("third").ts == 200.0
+
+    def test_a_node_that_stays_down_is_logged_once_and_once_again_when_it_returns(
+        self, placed, fake_ssh, caplog
+    ):
+        _capture_nodes_log(caplog)
+        syncer = node_sync.NodeSyncer(_config())
+        _answer(fake_ssh, "devino-second", rc=255, stderr=REFUSED)
+        _answer(fake_ssh, "devino-third")
+        for _ in range(3):
+            syncer.tick()
+        _forget_replies(fake_ssh)
+        _answer(fake_ssh, "devino-second")
+        _answer(fake_ssh, "devino-third")
+        syncer.tick()
+        assert _node_warnings(caplog, "second") == [
+            f"node second: unreachable ({REFUSED.strip()})"
+        ]
+        assert [
+            r.getMessage()
+            for r in caplog.records
+            if "reachable again" in r.getMessage()
+        ] == ["node second: reachable again"]
+        assert not [r for r in caplog.records if r.getMessage().startswith("node call")]
+        assert _node_warnings(caplog, "third") == []
+
+    def test_a_hung_node_counts_as_unreachable_and_warns_once(
+        self, placed, fake_ssh, caplog, monkeypatch
+    ):
+        _capture_nodes_log(caplog)
+        monkeypatch.setattr(remote_mux, "PULL_TIMEOUT_S", 1.0)
+        cfg = _config(
+            pool={"second": POOL["second"]},
+            projects=[ProjectConfig(path="api", node="second")],
+        )
+        fake_ssh.set_mode("timeout")
+        syncer = node_sync.NodeSyncer(cfg)
+        assert syncer.tick() == {
+            "second": (node_sync.UNREACHABLE, "timed out after 1s")
+        }
+        syncer.tick()
+        assert _node_warnings(caplog, "second") == [
+            "node second: unreachable (timed out after 1s)"
+        ]
+        assert not [
+            r
+            for r in caplog.records
+            if r.getMessage().startswith("node call timed out")
+        ]
+
+    def test_a_node_that_answers_garbage_fails_alone(self, placed, fake_ssh):
+        fake_ssh.set_reply("devino-second", stdout="hello\n")
+        _answer(fake_ssh, "devino-third")
+        results = node_sync.NodeSyncer(_config()).tick()
+        assert results["second"] == (
+            node_sync.FAILED,
+            "no MAGENT-PULL header in the reply",
+        )
+        assert results["third"] == (node_sync.OK, "")
+
+    def test_a_missing_ssh_client_fails_every_node_without_raising(self, placed):
+        results = node_sync.NodeSyncer(_config()).tick()
+        assert results == {
+            "second": (node_sync.FAILED, "ssh client not found on PATH"),
+            "third": (node_sync.FAILED, "ssh client not found on PATH"),
+        }
+
+    def test_a_node_that_would_run_as_root_is_misconfigured_and_never_dialled(
+        self, placed, fake_ssh
+    ):
+        pool = {
+            "second": NodeConfig(nick="second", host="devino-second"),
+            "third": POOL["third"],
+        }
+        _answer(fake_ssh, "devino-third")
+        results = node_sync.NodeSyncer(_config(pool=pool), local_user="root").tick()
+        assert results["second"][0] == node_sync.MISCONFIGURED
+        assert "(D4)" in results["second"][1]
+        assert _calls_to(fake_ssh, "devino-second") == []
+
+    def test_a_node_being_pulled_elsewhere_is_skipped_silently(
+        self, placed, fake_ssh, caplog
+    ):
+        _capture_nodes_log(caplog)
+        _answer(fake_ssh, "devino-second")
+        _answer(fake_ssh, "devino-third")
+        with exclusive_lock("node-pull-second"):
+            results = node_sync.NodeSyncer(_config()).tick()
+        assert results["second"][0] == node_sync.LOCKED
+        assert results["third"] == (node_sync.OK, "")
+        assert _calls_to(fake_ssh, "devino-second") == []
+        assert _node_warnings(caplog, "second") == []
+
+
+def _second_only(**sync) -> MagentConfig:
+    return _config(
+        pool={"second": POOL["second"]},
+        projects=[ProjectConfig(path="api", node="second")],
+        **sync,
+    )
+
+
+def _marks() -> dict[str, object]:
+    return json.loads(nodes.pull_marks_path("second").read_text(encoding="utf-8"))
+
+
+def _snapshot(**over) -> remote_mux.NodeSnapshot:
+    fields: dict[str, object] = {
+        "now": 9000.0,
+        "sessions": (),
+        "sample": None,
+        "realpaths": {},
+        "state_files": {},
+        "files": (),
+        "failed_sids": frozenset(),
+    }
+    fields.update(over)
+    return remote_mux.NodeSnapshot(**fields)
+
+
+class TestTheWatermark:
+    def test_the_watermark_walks_from_zero_to_the_nodes_clock(self, placed, fake_ssh):
+        _answer(
+            fake_ssh,
+            "devino-second",
+            meta=pull_meta(realpaths={"api": "/home/amin/magent/api"}),
+        )
+        syncer = node_sync.NodeSyncer(_second_only())
+        syncer.tick()
+        assert _marks() == {"api": {"since": 0.0, "realpath": "/home/amin/magent/api"}}
+        syncer.tick()
+        assert _payload(fake_ssh.calls()[-1])["sids"]["api"] == {
+            "roots": ["~/magent/api"],
+            "project_dir": encoded_project_dir("/home/amin/magent/api"),
+            "since": 0.0,
+        }
+        assert _marks() == {
+            "api": {"since": 4999.0, "realpath": "/home/amin/magent/api"}
+        }
+        syncer.tick()
+        assert _payload(fake_ssh.calls()[-1])["sids"]["api"]["since"] == 4999.0
+
+    def test_a_moved_directory_starts_its_transcripts_over(self, placed, fake_ssh):
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"),
+            {"api": {"since": 4999.0, "realpath": "/old"}},
+        )
+        _answer(
+            fake_ssh,
+            "devino-second",
+            meta=pull_meta(realpaths={"api": "/home/amin/magent/api"}),
+        )
+        node_sync.NodeSyncer(_second_only()).tick()
+        assert _marks() == {"api": {"since": 0.0, "realpath": "/home/amin/magent/api"}}
+
+    def test_a_session_whose_files_could_not_be_stored_keeps_its_watermark_and_its_state(
+        self, placed
+    ):
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"), {"api": {"since": 10.0, "realpath": "/r"}}
+        )
+        state = nodes.state_dir("second", "api")
+        state.mkdir(parents=True)
+        (state / "gone.json").write_text("{}", encoding="utf-8")
+
+        def pull(_node, _sids):
+            return _snapshot(
+                realpaths={"api": "/r"},
+                state_files={"api": ()},
+                failed_sids=frozenset({"api"}),
+            )
+
+        node_sync.NodeSyncer(_second_only(), pull=pull).tick()
+        assert _marks() == {"api": {"since": 10.0, "realpath": "/r"}}
+        assert (state / "gone.json").exists()
+
+    def test_marks_are_dropped_for_sessions_no_longer_placed(self, placed, fake_ssh):
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"), {"gone": {"since": 5.0, "realpath": "/g"}}
+        )
+        _answer(fake_ssh, "devino-second")
+        node_sync.NodeSyncer(_second_only()).tick()
+        assert set(_marks()) == {"api"}
+
+
+class TestTheMirror:
+    def test_state_records_mirror_the_node_and_vanish_with_it(self, placed, fake_ssh):
+        state = nodes.state_dir("second", "api")
+        syncer = node_sync.NodeSyncer(_second_only())
+        _answer(
+            fake_ssh,
+            "devino-second",
+            meta=pull_meta(state_files={"api": ["k1.json", "k2.json"]}),
+            files={
+                "api/state/k1.json": '{"state": "working"}',
+                "api/state/k2.json": '{"state": "done"}',
+            },
+        )
+        syncer.tick()
+        assert sorted(p.name for p in state.iterdir()) == ["k1.json", "k2.json"]
+        _forget_replies(fake_ssh)
+        _answer(
+            fake_ssh, "devino-second", meta=pull_meta(state_files={"api": ["k2.json"]})
+        )
+        syncer.tick()
+        assert sorted(p.name for p in state.iterdir()) == ["k2.json"]
+
+    def test_transcripts_land_where_recall_reads_them(self, placed, fake_ssh):
+        _answer(
+            fake_ssh,
+            "devino-second",
+            files={
+                "api/transcripts/0f.jsonl": "{}\n",
+                "api/transcripts/0f/subagents/agent-1.jsonl": "{}\n",
+            },
+        )
+        node_sync.NodeSyncer(_second_only()).tick()
+        folder = nodes.transcripts_dir("second", "api")
+        assert (folder / "0f.jsonl").read_text(encoding="utf-8") == "{}\n"
+        assert (folder / "0f" / "subagents" / "agent-1.jsonl").exists()
+
+    def test_load_samples_are_kept_at_the_sample_interval_for_the_history_window(
+        self, placed, fake_ssh
+    ):
+        _answer(fake_ssh, "devino-second")
+        clock = iter([1000.0, 1030.0, 1070.0, 4650.0])
+        syncer = node_sync.NodeSyncer(
+            _second_only(sample_interval_s=60, history_h=1), now=lambda: next(clock)
+        )
+        for _ in range(3):
+            syncer.tick()
+        rows = [
+            json.loads(x)
+            for x in nodes.load_path("second").read_text(encoding="utf-8").splitlines()
+        ]
+        assert [r["ts"] for r in rows] == [1000.0, 1070.0]
+        syncer.tick()
+        rows = [
+            json.loads(x)
+            for x in nodes.load_path("second").read_text(encoding="utf-8").splitlines()
+        ]
+        # 1000 is past the 1 h window at 4650 but inside its slack (360 s):
+        # still an append. The trim itself: TestTheLoadFileIsAppendedTo.
+        assert rows == [
+            {**SAMPLE, "ts": 1000.0},
+            {**SAMPLE, "ts": 1070.0},
+            {**SAMPLE, "ts": 4650.0},
+        ]
+
+
+def _seed_marks(nick: str = "second", **marks: tuple[float, str]) -> bytes:
+    path = nodes.pull_marks_path(nick)
+    nodes.write_json_atomic(
+        path, {sid: {"since": s, "realpath": r} for sid, (s, r) in marks.items()}
+    )
+    return path.read_bytes()
+
+
+def _two_on_second() -> MagentConfig:
+    nodes.write_node_map({"api": _entry("second", "api"), "db": _entry("second", "db")})
+    return _config(
+        pool={"second": POOL["second"]},
+        projects=[
+            ProjectConfig(path="api", node="second"),
+            ProjectConfig(path="db", node="second"),
+        ],
+    )
+
+
+class TestMarksMoveOnlyAfterAPull:
+    """pull.json is written AFTER a pull lands, never before: a mark advanced
+    optimistically and then left behind by a failed pull would skip files."""
+
+    def test_an_unreachable_node_leaves_the_marks_byte_identical(
+        self, placed, fake_ssh
+    ):
+        before = _seed_marks(api=(10.0, "/home/amin/magent/api"))
+        _answer(fake_ssh, "devino-second", rc=255, stderr=REFUSED)
+        results = node_sync.NodeSyncer(_second_only()).tick()
+        assert results["second"][0] == node_sync.UNREACHABLE
+        assert nodes.pull_marks_path("second").read_bytes() == before
+
+    def test_a_reply_cut_off_before_its_trailer_leaves_the_marks_byte_identical(
+        self, placed, fake_ssh
+    ):
+        before = _seed_marks(api=(10.0, "/home/amin/magent/api"))
+        reply = pull_reply(
+            pull_meta(realpaths={"api": "/home/amin/magent/api"}),
+            {"api/transcripts/a.jsonl": "x\n"},
+        )
+        cut = reply[: reply.rindex(remote_mux.PULL_TRAILER.decode("ascii"))]
+        fake_ssh.set_reply("devino-second", stdout=cut)
+        results = node_sync.NodeSyncer(_second_only()).tick()
+        assert results["second"][0] == node_sync.FAILED
+        assert nodes.pull_marks_path("second").read_bytes() == before
+
+
+class TestMarkAndPruneScope:
+    def test_a_failed_session_keeps_its_mark_while_its_neighbour_advances(self, placed):
+        _seed_marks(api=(10.0, "/ra"), db=(20.0, "/rd"))
+
+        def pull(_node, _sids):
+            return _snapshot(
+                now=9000.0,
+                realpaths={"api": "/ra", "db": "/rd"},
+                failed_sids=frozenset({"api"}),
+            )
+
+        node_sync.NodeSyncer(_two_on_second(), pull=pull).tick()
+        assert _marks() == {
+            "api": {"since": 10.0, "realpath": "/ra"},
+            "db": {"since": 8999.0, "realpath": "/rd"},
+        }
+
+    def test_pruning_one_session_touches_no_other_nodes_mirror_and_no_local_record(
+        self, placed, tmp_path, monkeypatch
+    ):
+        local = tmp_path / "local-state"
+        monkeypatch.setattr(agent_state, "STATE_DIR", local)
+        local.mkdir()
+        (local / "x.json").write_text("{}", encoding="utf-8")
+        other = nodes.state_dir("third", "api")
+        other.mkdir(parents=True)
+        (other / "x.json").write_text("{}", encoding="utf-8")
+        mine = nodes.state_dir("second", "api")
+        mine.mkdir(parents=True)
+        (mine / "x.json").write_text("{}", encoding="utf-8")
+
+        def pull(_node, _sids):
+            return _snapshot(realpaths={"api": "/r"}, state_files={"api": ()})
+
+        node_sync.NodeSyncer(_second_only(), pull=pull).tick()
+        assert not (mine / "x.json").exists()
+        assert (other / "x.json").exists()
+        assert (local / "x.json").exists()
+
+    def test_two_nodes_sampled_in_one_tick_each_get_their_row(self, placed):
+        """The throttle is per node. Third's pull waits until second's row is
+        on disk (plus a beat for the throttle's bookkeeping), so second has
+        always stored first: a throttle shared across nodes would then drop
+        third's row every time, not only when the threads happen to race."""
+
+        def pull(node, _sids):
+            if node.nick == "third":
+                deadline = time.monotonic() + 10
+                while not nodes.load_path("second").exists():
+                    assert time.monotonic() < deadline, "second never stored"
+                    time.sleep(0.01)
+                time.sleep(0.2)
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        node_sync.NodeSyncer(_config(), pull=pull, now=lambda: 1000.0).tick()
+        for nick in ("second", "third"):
+            rows = nodes.load_path(nick).read_text(encoding="utf-8").splitlines()
+            assert [json.loads(r)["ts"] for r in rows] == [1000.0]
+
+
+class TestHostileClocksAndValues:
+    def test_a_nan_or_infinite_mark_reads_as_absent(self, placed):
+        path = nodes.pull_marks_path("second")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '{"api": {"since": NaN, "realpath": "/r"},'
+            ' "db": {"since": Infinity, "realpath": "/r"},'
+            ' "ok": {"since": 5.0, "realpath": "/r"}}',
+            encoding="utf-8",
+        )
+        assert node_sync._read_marks("second") == {
+            "ok": node_sync.Mark(since=5.0, realpath="/r")
+        }
+
+    def test_a_node_clock_that_went_back_past_the_mark_starts_over(self, placed):
+        """A node clock that jumped forward left a mark in its future. When
+        the clock comes back, files stamped before that mark would never be
+        asked for again: the transcripts start over from zero instead."""
+        _seed_marks(api=(4999.0, "/r"))
+
+        def pull(_node, _sids):
+            return _snapshot(now=3000.0, realpaths={"api": "/r"})
+
+        node_sync.NodeSyncer(_second_only(), pull=pull).tick()
+        assert _marks() == {"api": {"since": 0.0, "realpath": "/r"}}
+
+    def test_a_pc_clock_that_steps_back_does_not_starve_samples(self, placed):
+        clock = iter([1000.0, 900.0])
+
+        def pull(_node, _sids):
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        syncer = node_sync.NodeSyncer(
+            _second_only(sample_interval_s=60), pull=pull, now=lambda: next(clock)
+        )
+        syncer.tick()
+        syncer.tick()
+        rows = nodes.load_path("second").read_text(encoding="utf-8").splitlines()
+        # The 900 sample is kept, not starved. The 1000 row now lies in this
+        # PC's future, so the trim that sample triggers drops it
+        # (TestTheTrimNeverStalls).
+        assert [json.loads(r)["ts"] for r in rows] == [900.0]
+
+    def test_a_sample_that_is_not_json_is_logged_and_the_pull_still_counts(
+        self, placed, caplog
+    ):
+        _capture_nodes_log(caplog)
+
+        def pull(_node, _sids):
+            return _snapshot(
+                realpaths={"api": "/r"},
+                sample=LoadSample(**{**SAMPLE, "load1": float("nan")}),
+            )
+
+        results = node_sync.NodeSyncer(_second_only(), pull=pull).tick()
+        assert results["second"] == (node_sync.OK, "")
+        assert not nodes.load_path("second").exists()
+        assert set(_marks()) == {"api"}
+        assert [m for m in _warnings(caplog) if "load sample" in m]
+
+    def test_a_load_file_that_cannot_be_written_does_not_fail_the_tick(
+        self, placed, caplog
+    ):
+        _capture_nodes_log(caplog)
+        nodes.load_path("second").mkdir(parents=True)
+
+        def pull(_node, _sids):
+            return _snapshot(realpaths={"api": "/r"}, sample=LoadSample(**SAMPLE))
+
+        results = node_sync.NodeSyncer(_second_only(), pull=pull).tick()
+        assert results["second"] == (node_sync.OK, "")
+        assert _marks() == {"api": {"since": 0.0, "realpath": "/r"}}
+        assert nodes.read_sessions("second") is not None
+        assert [m for m in _warnings(caplog) if "node second: load sample" in m]
+
+
+WINDOW_S = 3600.0  # history_h=1
+SLACK_S = 360.0  # max(10% of the window, the 60 s sample interval)
+
+
+def _load_ts(nick: str = "second") -> list[float]:
+    out: list[float] = []
+    for line in nodes.load_path(nick).read_text(encoding="utf-8").splitlines():
+        out.append(json.loads(line)["ts"])
+    return out
+
+
+@pytest.fixture
+def rewrites(monkeypatch) -> list[Path]:
+    """Every atomic rewrite of a load.jsonl (pull.json and sessions.json go
+    through the same writer and are not counted)."""
+    seen: list[Path] = []
+    real = nodes.write_text_atomic
+
+    def spy(path: Path, text: str) -> None:
+        if path.name == "load.jsonl":
+            seen.append(path)
+        real(path, text)
+
+    monkeypatch.setattr(nodes, "write_text_atomic", spy)
+    return seen
+
+
+def _sample_at(at: float) -> None:
+    node_sync._append_sample(
+        "second", LoadSample(**SAMPLE), at=at, history_h=1, interval_s=60
+    )
+
+
+class TestTheLoadFileIsAppendedTo:
+    def test_rows_are_appended_without_a_rewrite_inside_the_slack(
+        self, placed, rewrites
+    ):
+        for at in (1000.0, 1060.0, 1000.0 + WINDOW_S + SLACK_S):
+            _sample_at(at)
+        assert _load_ts() == [1000.0, 1060.0, 1000.0 + WINDOW_S + SLACK_S]
+        assert rewrites == []
+
+    def test_a_trim_happens_past_the_slack_and_keeps_only_the_window(
+        self, placed, rewrites
+    ):
+        for at in (1000.0, 1060.0, 4650.0):
+            _sample_at(at)
+        at = 1000.0 + WINDOW_S + SLACK_S + 1
+        _sample_at(at)
+        assert len(rewrites) == 1
+        assert _load_ts() == [4650.0, at]
+        assert min(_load_ts()) >= at - WINDOW_S
+
+    def test_a_long_run_stays_bounded_and_rarely_rewrites(self, placed, rewrites):
+        samples = 600  # ten hours at one sample a minute
+        for i in range(samples):
+            at = 1000.0 + 60 * i
+            _sample_at(at)
+            rows = _load_ts()
+            assert rows[-1] == at
+            assert at - rows[0] <= WINDOW_S + SLACK_S
+        assert 0 < len(rewrites) <= samples // 5
+
+    def test_an_unreadable_first_line_is_trimmed_away(self, placed, rewrites):
+        path = nodes.load_path("second")
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"\xff not json\n")
+        _sample_at(1000.0)
+        assert len(rewrites) == 1
+        assert _load_ts() == [1000.0]
+
+    def test_a_torn_last_row_does_not_swallow_the_next_one(self, placed):
+        path = nodes.load_path("second")
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps({**SAMPLE, "ts": 900.0}) + '\n{"ts": 95', encoding="utf-8"
+        )
+        _sample_at(1000.0)
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert lines[1] == '{"ts": 95'
+        assert json.loads(lines[2])["ts"] == 1000.0
+
+
+class TestATornLoadRowAcrossTicks:
+    def test_a_tick_after_a_torn_row_appends_intact_and_the_trim_drops_the_fragment(
+        self, placed
+    ):
+        """A crash mid-append leaves a partial last line. The next tick's row
+        must start its own line, and the trim pass must skip the fragment."""
+        torn = '{"ts": 95'
+        path = nodes.load_path("second")
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps({**SAMPLE, "ts": 900.0}) + "\n" + torn, encoding="utf-8"
+        )
+        clock = iter([1000.0, 5000.0])
+
+        def pull(_node, _sids):
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        syncer = node_sync.NodeSyncer(
+            _second_only(sample_interval_s=60, history_h=1),
+            pull=pull,
+            now=lambda: next(clock),
+        )
+        syncer.tick()
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert [ln for ln in lines if ln == torn] == [torn]
+        assert [json.loads(ln) for ln in lines if ln != torn] == [
+            {**SAMPLE, "ts": 900.0},
+            {**SAMPLE, "ts": 1000.0},
+        ]
+        syncer.tick()  # 900 is now past the window + slack: a trim
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert [json.loads(ln) for ln in lines] == [{**SAMPLE, "ts": 5000.0}]
+
+
+def _parsed_rows(nick: str = "second") -> list[float | None]:
+    """Every line's ts, None for a line that is not a row."""
+    out: list[float | None] = []
+    for line in nodes.load_path(nick).read_text(encoding="utf-8").splitlines():
+        try:
+            out.append(float(json.loads(line)["ts"]))
+        except (ValueError, KeyError, TypeError):
+            out.append(None)
+    return out
+
+
+# The most rows the file may hold: the window plus its slack, one per minute,
+# and the row just appended.
+MAX_ROWS = int((WINDOW_S + SLACK_S) // 60) + 1
+
+
+class TestTheTrimNeverStalls:
+    """Two first-line states used to switch the trim off for good, and the
+    file then grew by one row a sample, without bound."""
+
+    def _run(self, first_line: str, rewrites: list[Path]) -> None:
+        path = nodes.load_path("second")
+        path.parent.mkdir(parents=True)
+        path.write_text(first_line, encoding="utf-8")
+        samples = 300
+        for i in range(samples):
+            _sample_at(1000.0 + 60 * i)
+        rows = _parsed_rows()
+        assert rewrites, "the trim never ran"
+        # Rare, too: a kept future row would force a rewrite every sample.
+        assert len(rewrites) <= samples // 5
+        assert None not in rows
+        assert len(rows) <= MAX_ROWS
+        now = 1000.0 + 60 * (samples - 1)
+        assert rows[-1] == now
+        assert max(rows) == now  # nothing from the future survives
+
+    def test_a_first_row_from_this_pcs_future_is_trimmed(self, placed, rewrites):
+        """This PC's clock ran ahead, then stepped back: the rows it stamped
+        then are later than now. Waiting for real time to pass them would let
+        the file grow for the whole jump."""
+        self._run(json.dumps({**SAMPLE, "ts": 1_000_000.0}) + "\n", rewrites)
+
+    def test_a_blank_first_line_is_trimmed(self, placed, rewrites):
+        self._run("\n", rewrites)
+
+
+class TestTheLoadSampleEdges:
+    def test_the_slack_is_at_least_one_interval(self, placed, rewrites):
+        """With a 600 s interval the slack is 600 s, not 10% of an hour: a
+        row exactly one window plus one interval old is still inside it, so
+        the append does not rewrite the file."""
+        first, at = 1000.0, 1000.0 + WINDOW_S + 600
+        for ts in (first, at):
+            node_sync._append_sample(
+                "second", LoadSample(**SAMPLE), at=ts, history_h=1, interval_s=600
+            )
+        assert rewrites == []
+        assert _load_ts() == [first, at]
+
+    def test_a_failing_sample_is_tried_once_per_interval(self, placed, monkeypatch):
+        """The throttle is stamped before the append, so a load file that
+        cannot be written is retried per sample interval, not per tick."""
+        nodes.load_path("second").mkdir(parents=True)
+        tried: list[float] = []
+        real = node_sync._append_sample
+
+        def spy(nick, sample, **kw):
+            tried.append(kw["at"])
+            real(nick, sample, **kw)
+
+        monkeypatch.setattr(node_sync, "_append_sample", spy)
+        clock = iter([1000.0, 1010.0])
+
+        def pull(_node, _sids):
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        syncer = node_sync.NodeSyncer(
+            _second_only(sample_interval_s=60), pull=pull, now=lambda: next(clock)
+        )
+        assert syncer.tick()["second"] == (node_sync.OK, "")
+        assert syncer.tick()["second"] == (node_sync.OK, "")
+        assert tried == [1000.0]
+
+    def test_a_broken_load_file_warns_once_and_says_when_it_recovers(
+        self, placed, caplog
+    ):
+        """A daemon ticking on a broken load file must not warn every sample
+        (a day at one a minute is ~1,440 warnings): one on the way in, one
+        INFO on the way out, and nothing while nothing changes."""
+        _capture_nodes_log(caplog)
+        path = nodes.load_path("second")
+        path.mkdir(parents=True)
+        clock = iter(1000.0 + 60 * i for i in range(6))
+
+        def pull(_node, _sids):
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        syncer = node_sync.NodeSyncer(
+            _second_only(sample_interval_s=60), pull=pull, now=lambda: next(clock)
+        )
+        for _ in range(3):
+            assert syncer.tick()["second"] == (node_sync.OK, "")
+        assert len([m for m in _warnings(caplog) if "load sample" in m]) == 1
+        path.rmdir()
+        for _ in range(3):
+            syncer.tick()
+        kept_again = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.INFO and "load samples kept again" in r.getMessage()
+        ]
+        assert kept_again == ["node second: load samples kept again"]
+        assert len([m for m in _warnings(caplog) if "load sample" in m]) == 1
+        assert _load_ts() == [1180.0, 1240.0, 1300.0]
+
+    def test_the_broken_load_file_state_is_per_node(self, placed, caplog):
+        """One node's broken load file must neither silence another node's
+        first warning nor be 'recovered' by another node's good sample."""
+        _capture_nodes_log(caplog)
+        t = [1000.0]
+
+        def pull(_node, _sids):
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        def tick() -> None:
+            results = syncer.tick()
+            assert results == dict.fromkeys(("second", "third"), (node_sync.OK, ""))
+            t[0] += 60
+
+        def said(level: int, text: str) -> list[str]:
+            return sorted(
+                r.getMessage()
+                for r in caplog.records
+                if r.levelno == level and text in r.getMessage()
+            )
+
+        syncer = node_sync.NodeSyncer(
+            _config(sample_interval_s=60), pull=pull, now=lambda: t[0]
+        )
+        nodes.load_path("second").mkdir(parents=True)
+        for _ in range(3):  # second broken, third healthy
+            tick()
+        assert [m.split(":")[0] for m in said(logging.WARNING, "load sample")] == [
+            "node second"
+        ]
+        assert said(logging.INFO, "kept again") == []
+        nodes.load_path("third").unlink()  # third breaks too, second still is
+        nodes.load_path("third").mkdir()
+        tick()
+        assert [m.split(":")[0] for m in said(logging.WARNING, "load sample")] == [
+            "node second",
+            "node third",
+        ]
+        nodes.load_path("second").rmdir()  # second repaired, third still broken
+        for _ in range(2):
+            tick()
+        assert said(logging.INFO, "kept again") == [
+            "node second: load samples kept again"
+        ]
+        assert len(said(logging.WARNING, "load sample")) == 2
+
+    def test_a_first_line_nested_too_deep_is_trimmed_not_raised(self, placed):
+        """json.loads raises RecursionError, not ValueError, on deep nesting.
+        The row reader must read that as "not a row", or the tick fails."""
+        path = nodes.load_path("second")
+        path.parent.mkdir(parents=True)
+        path.write_text("[" * 200_000 + "\n", encoding="utf-8")
+
+        def pull(_node, _sids):
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        syncer = node_sync.NodeSyncer(
+            _second_only(sample_interval_s=60, history_h=1),
+            pull=pull,
+            now=lambda: 1000.0,
+        )
+        assert syncer.tick()["second"] == (node_sync.OK, "")
+        assert _load_ts() == [1000.0]

@@ -226,7 +226,9 @@ def read_store(root: Path, *, strict: bool = False) -> list[dict[str, object]]:
     for p in paths:
         try:
             d = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
+        # RecursionError: a mirror's files are the node's, and json.loads
+        # answers deep nesting ("[" * 200_000) with it rather than ValueError.
+        except (OSError, ValueError, RecursionError) as exc:
             _warn_bad_record(p, f"unreadable ({exc})")
             continue
         if isinstance(d, dict):

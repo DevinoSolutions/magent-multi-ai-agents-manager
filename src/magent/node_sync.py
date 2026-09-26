@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
+import math
 import os
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -42,10 +44,10 @@ from magent.log import clear_heartbeat, get_logger
 from magent.procs import pid_alive
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping
+    from collections.abc import Callable, Collection, Iterator, Mapping
 
     from magent.config import MagentConfig
-    from magent.nodes import Node, NodeMapEntry
+    from magent.nodes import LoadSample, Node, NodeMapEntry
 
 # The daemon's ONE name, and the only "node-sync" literal in src/ (DECISION-17,
 # DECISION-26 i; a source test pins that). The heartbeat (log.run_heartbeat /
@@ -340,7 +342,12 @@ def _read_marks(nick: str) -> dict[str, Mark]:
         if not isinstance(sid, str) or not isinstance(value, dict):
             continue
         since, real = value.get("since"), value.get("realpath")
-        if isinstance(since, bool) or not isinstance(since, (int, float)):
+        if (
+            isinstance(since, bool)
+            or not isinstance(since, (int, float))
+            # Python's json reads NaN and Infinity; neither is a watermark.
+            or not math.isfinite(since)
+        ):
             continue
         out[sid] = Mark(
             since=float(since), realpath=real if isinstance(real, str) else None
@@ -355,6 +362,127 @@ def _spec_for(entry: NodeMapEntry, mark: Mark | None) -> remote_mux.SidPull:
         project_dir=nodes.encoded_project_dir(real) if real else None,
         since=mark.since if mark is not None else 0.0,
     )
+
+
+def _write_marks(nick: str, marks: Mapping[str, Mark]) -> None:
+    nodes.write_json_atomic(
+        nodes.pull_marks_path(nick),
+        {
+            sid: {"since": m.since, "realpath": m.realpath}
+            for sid, m in sorted(marks.items())
+        },
+    )
+
+
+def _next_mark(
+    spec: remote_mux.SidPull, old: Mark | None, snap: remote_mux.NodeSnapshot, sid: str
+) -> Mark:
+    """Where this session's next pull starts:
+    - the node did not report it, or one of its files failed to store: stay
+      put (a failed file is asked for again next tick);
+    - its transcripts were never requested under the current real path (a
+      first sight, a moved directory): from zero;
+    - otherwise: from the node's own clock at scan time, minus the overlap
+      (``_since_after``)."""
+    real = snap.realpaths.get(sid)
+    if real is None or sid in snap.failed_sids:
+        return old if old is not None else Mark(since=0.0, realpath=real)
+    if spec.project_dir is None or old is None or old.realpath != real:
+        return Mark(since=0.0, realpath=real)
+    return Mark(since=_since_after(old.since, snap.now), realpath=real)
+
+
+def _since_after(old_since: float, node_now: float) -> float:
+    """The next watermark from the node's scan clock, minus the overlap. A
+    node clock that jumped forward and came back leaves ``old_since`` in its
+    future, and files stamped before it would never be asked for again: a
+    watermark that would move BACKWARDS starts the transcripts over from 0.0.
+
+    After the E8 x E14 merge, ``_next_mark`` delegates to
+    ``remote_mux.next_since`` and this reset belongs inside it."""
+    since = node_now - remote_mux.WATERMARK_OVERLAP_S
+    return 0.0 if since < old_since else since
+
+
+def _prune_state(nick: str, sid: str, keep: Collection[str]) -> None:
+    """Drop mirrored records the node no longer has (SessionEnd cleared it)."""
+    folder = nodes.state_dir(nick, sid)
+    try:
+        present = list(folder.glob("*.json"))
+    except OSError:
+        return
+    for path in present:
+        if path.name not in keep:
+            with contextlib.suppress(OSError):
+                path.unlink()
+
+
+def _row_ts(line: str) -> float | None:
+    """A load.jsonl row's ts, or None for a line that is not a row."""
+    try:
+        row = json.loads(line)
+    except (ValueError, RecursionError):
+        return None
+    ts = row.get("ts") if isinstance(row, dict) else None
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    return float(ts) if math.isfinite(ts) else None
+
+
+def _needs_trim(path: Path, before: float, at: float) -> bool:
+    """Does the file's first line call for a trim? Only a missing or empty
+    file needs none. Each other first line that is not an in-window row --
+    one older than ``before``, one that does not parse (a blank line
+    included), or one stamped after ``at`` (this PC's clock ran ahead, then
+    stepped back) -- would otherwise stay first and switch the trim off
+    until it aged out, which for the last two is never or the length of the
+    clock jump. The file would grow by a row a sample all that time."""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            first = fh.readline()
+    except FileNotFoundError:
+        return False
+    if not first:
+        return False
+    ts = _row_ts(first)
+    return ts is None or ts < before or ts > at
+
+
+def _append_sample(
+    nick: str, sample: LoadSample, *, at: float, history_h: int, interval_s: int
+) -> None:
+    """Add one row (ts on this PC's clock, like every reader's "now").
+
+    A sample is an APPEND. The file is rewritten -- one atomic trim down to
+    the history window -- only once its first row is older than the window
+    by a slack (the larger of 10% of the window and one sample interval), so
+    a trim happens every few samples, not on every one, and the file never
+    holds more than the window plus that slack. A trim keeps only the rows
+    stamped between the window's start and now: a row from this PC's future
+    carries a clock that was wrong, and is not history. Readers skip lines
+    that are not rows, and an append after a torn last row starts a line of
+    its own."""
+    path = nodes.load_path(nick)
+    row = json.dumps({**asdict(sample), "ts": at}, allow_nan=False)
+    window = history_h * 3600
+    cutoff = at - window
+    slack = max(window * 0.1, interval_s)
+    if _needs_trim(path, cutoff - slack, at):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        rows = [
+            line
+            for line in text.splitlines()
+            if (ts := _row_ts(line)) is not None and cutoff <= ts <= at
+        ]
+        nodes.write_text_atomic(path, "\n".join([*rows, row]) + "\n")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as fh:
+        torn = False
+        if fh.seek(0, os.SEEK_END) > 0:
+            fh.seek(-1, os.SEEK_END)
+            torn = fh.read(1) != b"\n"
+        fh.write((b"\n" if torn else b"") + row.encode("utf-8") + b"\n")
 
 
 def _last_line(text: str) -> str:
@@ -399,6 +527,9 @@ class NodeSyncer:
         self._local_user = local_user
         self._lock_wait_s = lock_wait_s
         self._warned: set[tuple[str, str]] = set()
+        self._last: dict[str, str] = {}
+        self._last_sample: dict[str, float] = {}
+        self._sample_failing: set[str] = set()
 
     def reconfigure(self, config: MagentConfig) -> None:
         self._config = config
@@ -421,17 +552,46 @@ class NodeSyncer:
                 nick: ex.submit(self._sync_node, nick, by_nick.get(nick, {}), user)
                 for nick in pool
             }
-            return {nick: f.result() for nick, f in futures.items()}
+            results = {nick: f.result() for nick, f in futures.items()}
+        for nick, (outcome, detail) in results.items():
+            self._note(nick, outcome, detail)
+        return results
 
     def _sync_node(
         self, nick: str, entries: Mapping[str, NodeMapEntry], local_user: str
     ) -> tuple[str, str]:
+        """One node's pull, reduced to an outcome. Every failure a node (or its
+        config) can produce stops here; anything else is a bug and propagates."""
         try:
             node = nodes.node_for_nick(self._config, nick, local_user=local_user)
-            self._pull_and_store(node, entries)
+            with node_lock(nick, wait_s=self._lock_wait_s):
+                self._pull_and_store(node, entries)
+        except nodes.NodeConfigError as e:
+            return MISCONFIGURED, str(e)
+        except LockHeld:
+            return LOCKED, "another pull holds this node"
         except remote_mux.RemoteError as e:
             return _classify(e)
+        except OSError as e:
+            return FAILED, str(e)
         return OK, ""
+
+    def _note(self, nick: str, outcome: str, detail: str) -> None:
+        """One log line per state CHANGE: a node down for a day is one warning
+        and one "reachable again", not 2,880 lines. A locked tick is no state
+        (the other pull is doing the work) and is never logged."""
+        if outcome == LOCKED:
+            return
+        prev = self._last.get(nick)
+        self._last[nick] = outcome
+        if outcome == prev:
+            return
+        log = get_logger(LOG_NAME)
+        if outcome == OK:
+            if prev is not None:
+                log.info("node %s: reachable again", nick)
+            return
+        log.warning("node %s: %s (%s)", nick, outcome, detail)
 
     def _warn_once(self, nick: str, sid: str) -> None:
         if (nick, sid) in self._warned:
@@ -450,9 +610,59 @@ class NodeSyncer:
                 continue
             specs[sid] = _spec_for(entry, marks.get(sid))
         snap = self._pull(node, specs)
-        self._store(node.nick, snap, at=self._now())
+        self._store(node.nick, specs, marks, snap, at=self._now())
 
-    def _store(self, nick: str, snap: remote_mux.NodeSnapshot, *, at: float) -> None:
+    def _store(
+        self,
+        nick: str,
+        specs: Mapping[str, remote_mux.SidPull],
+        marks: Mapping[str, Mark],
+        snap: remote_mux.NodeSnapshot,
+        *,
+        at: float,
+    ) -> None:
+        """Everything a successful pull leaves behind. ``sessions.json`` first:
+        it is the liveness readers look at."""
         nodes.write_json_atomic(
             nodes.sessions_path(nick), {"ts": at, "sessions": list(snap.sessions)}
         )
+        new_marks: dict[str, Mark] = {}
+        for sid, spec in specs.items():
+            new_marks[sid] = _next_mark(spec, marks.get(sid), snap, sid)
+            if sid in snap.state_files and sid not in snap.failed_sids:
+                _prune_state(nick, sid, snap.state_files[sid])
+        # No fsync, by choice: the node is the source of truth, and a mark
+        # lost with this PC's disk only means recall pulls from 0.0.
+        _write_marks(nick, new_marks)
+        sync = self._config.settings.node_sync
+        last = self._last_sample.get(nick)
+        # ``at < last``: this PC's clock stepped back. Waiting for it to pass
+        # ``last`` again would starve the history for as long as the step.
+        if snap.sample is None or (
+            last is not None and last <= at < last + sync.sample_interval_s
+        ):
+            return
+        # Throttled even when the row cannot be kept, so a broken load file
+        # is retried once per sample interval, not once per tick.
+        self._last_sample[nick] = at
+        log = get_logger(LOG_NAME)
+        try:
+            _append_sample(
+                nick,
+                snap.sample,
+                at=at,
+                history_h=sync.history_h,
+                interval_s=sync.sample_interval_s,
+            )
+        except (OSError, ValueError) as e:
+            # The pull landed -- sessions.json and the marks are written -- so
+            # a load row that cannot be kept is not a failed tick. Warned on
+            # the way in only: a file broken for a day is one warning, not
+            # one per sample; the rest go to DEBUG.
+            level = logging.DEBUG if nick in self._sample_failing else logging.WARNING
+            self._sample_failing.add(nick)
+            log.log(level, "node %s: load sample not kept (%s)", nick, e)
+            return
+        if nick in self._sample_failing:
+            self._sample_failing.discard(nick)
+            log.info("node %s: load samples kept again", nick)
