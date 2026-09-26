@@ -1625,6 +1625,43 @@ class TestAFinalPullThatDidNotFinishIsNotASuccess:
             "realpath": "/home/amin/magent/api",
         }
 
+    @pytest.mark.parametrize(
+        ("first", "second"),
+        [
+            ({"failed_sids": frozenset({"api"})}, {}),
+            (
+                {},
+                {
+                    "truncated": {"api": ("api/transcripts/a.jsonl",)},
+                    "resume": {"api": 50.0},
+                },
+            ),
+        ],
+        ids=["first-call", "second-call"],
+    )
+    def test_either_call_of_a_first_sight_pull_can_leave_it_unfinished(
+        self, placed, monkeypatch, first, second
+    ):
+        """cq-G14 m3 (N3a/N3b): a directory seen for the first time takes two
+        calls, and what EITHER left behind makes the pull unfinished."""
+        real = "/home/amin/magent/api"
+        replies = iter(
+            [
+                _snapshot(sessions=("api",), realpaths={"api": real}, **first),
+                _snapshot(sessions=("api",), realpaths={"api": real}, **second),
+            ]
+        )
+        asked: list[str | None] = []
+
+        def pull(_node, sids):
+            asked.append(sids["api"].project_dir)
+            return next(replies)
+
+        monkeypatch.setattr(node_sync, "_pull_node", pull)
+        with pytest.raises(node_sync.PullUnfinished):
+            node_sync.final_pull(_config(), "api")
+        assert asked == [None, encoded_project_dir(real)]
+
     def test_another_sessions_failure_is_not_this_ones(self, answers):
         answers(failed_sids=frozenset({"web"}), truncated={"web": ("w",)})
         assert node_sync.final_pull(_config(), "api") is not None

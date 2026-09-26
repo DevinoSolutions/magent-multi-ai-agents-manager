@@ -979,6 +979,18 @@ class TestTheTarCarriesOnlyTheConversation:
         with tarfile.open(fileobj=io.BytesIO(remote_mux._tar_dir(source))) as tar:
             return sorted(tar.getnames())
 
+    def test_members_are_sent_in_sorted_order_not_walk_order(self, tmp_path):
+        # cq-G14 m3 (MM6): os.walk lists a directory's entries before it
+        # descends, so a/z.jsonl is found after a-b.jsonl on every OS; sorted
+        # by path parts, it comes first -- the same tar from every PC.
+        source = tmp_path / "pulled"
+        (source / "a").mkdir(parents=True)
+        (source / "a" / "z.jsonl").write_bytes(b"{}\n")
+        (source / "a-b.jsonl").write_bytes(b"{}\n")
+
+        with tarfile.open(fileobj=io.BytesIO(remote_mux._tar_dir(source))) as tar:
+            assert tar.getnames() == ["a", "a/z.jsonl", "a-b.jsonl"]
+
     def test_a_stray_pull_temp_is_not_sent(self, tmp_path):
         # E8's pull writer (544f011) names its temp mkstemp(prefix=".",
         # suffix=".part") beside the target; a SIGKILL mid-write strands one.
@@ -2369,6 +2381,10 @@ class TestTheLocalInstallFollowsTheTarRules:
         assert result.exit_code == 1
         assert "is a link (symlink or junction)" in result.stderr
         assert "stays placed on @second" in result.stderr
+        # cq-G14 m3 (M14b): its own branch -- no re-run fixes a linked mirror,
+        # so the generic install failure's "run the recall again" is untrue.
+        assert "nothing was installed" in result.stderr
+        assert "run the recall again" not in result.stderr
         assert "Traceback" not in result.output
         assert "api" in nodes.read_node_map()
         assert not _claude_dir(api_repo).exists()
@@ -2407,6 +2423,34 @@ class TestTheLocalInstallFollowsTheTarRules:
 
         assert result.exit_code == 0
         assert "replaced" not in result.stdout
+
+    @staticmethod
+    def _twin_trees(tmp_path: Path, node: bytes, here: bytes) -> tuple[Path, Path]:
+        """A pulled mirror and a local Claude dir, each holding ``a-b.jsonl``
+        and ``a/z.jsonl``, with the node's and this PC's bytes."""
+        source, dest = tmp_path / "pulled", tmp_path / "claude"
+        for root, body in ((source, node), (dest, here)):
+            (root / "a").mkdir(parents=True)
+            (root / "a" / "z.jsonl").write_bytes(body)
+            (root / "a-b.jsonl").write_bytes(body)
+        return source, dest
+
+    def test_the_replaced_names_are_reported_sorted(self, tmp_path):
+        # cq-G14 m3 (CM5): copytree meets "a" before "a-b.jsonl" in an NTFS
+        # listing and descends at once, so it replaces a/z.jsonl first; the
+        # report is sorted ('-' sorts before '/').
+        source, dest = self._twin_trees(tmp_path, b"node\n", b"here\n")
+
+        assert remote_mux.copy_mirror(source, dest) == ("a-b.jsonl", "a/z.jsonl")
+
+    def test_same_size_and_mtime_with_other_bytes_is_still_replaced(self, tmp_path):
+        # cq-G14 m3 (CM1): the comparison reads the bytes. copy2 keeps mtimes,
+        # so size and mtime alone can match two different files.
+        source, dest = self._twin_trees(tmp_path, b"node\n", b"here\n")
+        for root in (source, dest):
+            os.utime(root / "a-b.jsonl", (NOW, NOW))
+
+        assert "a-b.jsonl" in remote_mux.copy_mirror(source, dest)
 
     @pytest.mark.skipif(
         sys.platform == "win32",
