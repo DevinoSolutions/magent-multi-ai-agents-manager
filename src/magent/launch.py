@@ -1850,19 +1850,27 @@ def bring_up_node_project(
             if (text := nodes.refusal_for(state, allow_dirty=allow_dirty))
         ]
         if refusals:
-            if (
+            if unreadable is not None:
+                # Nothing records where it runs, which is not "nowhere": ask
+                # its pin, under its own session id.
+                running = sid if remote_mux.has_session(node, sid) else None
+            elif (
                 held is not None
                 and held.nick == nick
                 and remote_mux.has_session(node, held.sid)
             ):
+                running = held.sid
+            else:
+                running = None
+            if running is not None:
                 # What is uncommitted HERE does not touch a session already
                 # running there: attach to it, and keep the refusal as a warning.
-                remote_mux.decorate(node, held.sid, nick)
-                title = _open_node_window(node, held.sid) if window else None
+                remote_mux.decorate(node, running, nick)
+                title = _open_node_window(node, running) if window else None
                 log.info(
                     "node %s: %s already running; attached despite: %s",
                     nick,
-                    held.sid,
+                    running,
                     refusals,
                 )
                 return NodeBringUpOutcome(
@@ -1874,9 +1882,13 @@ def bring_up_node_project(
                     title=title,
                 )
             log.info("node %s: refused %s: %s", nick, sid, refusals)
-            return NodeBringUpOutcome(
-                ok=False, sid=sid, node=nick, error="; ".join(refusals)
-            )
+            error = "; ".join(refusals)
+            if unreadable is not None:
+                error += (
+                    f"; the node map is unreadable ({type(unreadable).__name__}),"
+                    f" and {sid} was not found running on @{nick}"
+                )
+            return NodeBringUpOutcome(ok=False, sid=sid, node=nick, error=error)
         with _bring_up_lock(nick):
             _provision_once(node, config)
             recipe = node_recipe(config, proj, node, states)
