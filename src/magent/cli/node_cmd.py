@@ -276,10 +276,23 @@ def sync_cmd(
     )
 
 
-# Exit codes: 2 = nothing to act on (unknown project, not a node project, a
-# recall of a project the node-map does not place, bad destination), 3 = a node
-# did not answer or refused. A plan that places a project nowhere is an
-# answer, not a failure: it exits 0.
+# Exit codes:
+# 1 = a step failed: `node sync --once` with a node that did not sync, `node
+#     sync -d` whose daemon did not start, and recall's failures -- the node
+#     map unreadable, the last pull failing on this PC or left unfinished (a
+#     node that ANSWERED with an error is this too, cq-G14 I1, not 3), the
+#     placement unreadable for it, a linked mirror, the conversation not
+#     installed, the placement not cleared;
+# 2 = nothing to act on (unknown project, not a node project, a recall of a
+#     project the node-map does not place, bad destination);
+# 3 = the node could not be acted on: today only recall's last pull finding
+#     the node-sync daemon still holding that node's lock. D-MERGE: push and
+#     recall --to add the node-side 3s -- a node that did not take the files
+#     (plan G :3432), did not take the conversation (:4231) or did not bring
+#     the session up (:4247).
+# A plan that places a project nowhere is an answer, not a failure: it exits
+# 0. A node that does not answer during recall --local is a note, never an
+# exit: recall goes on with what was already pulled.
 _EXIT_USAGE = 2
 _EXIT_UNREACHABLE = 3
 
