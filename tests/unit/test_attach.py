@@ -1297,7 +1297,6 @@ class TestMaybeStartHotkeySshHost:
     """The spawned listener's argv carries --ssh-host only when there is one."""
 
     def _args(self, monkeypatch, ssh_host):
-        import magent.launch as launch_mod
         from magent.cli import background
 
         spawned: list[list[str]] = []
@@ -1328,7 +1327,18 @@ class TestMaybeStartHotkeySshHost:
         monkeypatch.setitem(sys.modules, "magent.hotkey", fake)
         # The spawn recipe itself moved to launch.start_hotkey_listener so the
         # launch path can share it; background is now just the capability gate.
-        monkeypatch.setattr(launch_mod.time, "sleep", lambda s: None)
+        # `_Exited` ends the registration wait on its first poll; procs' own
+        # clock (never the global time module) is simulated anyway, so a wait
+        # that did not end costs no real seconds.
+        clock = {"now": 0.0}
+
+        def _sleep(seconds: float) -> None:
+            clock["now"] += seconds
+
+        monkeypatch.setattr(
+            "magent.procs.time",
+            types.SimpleNamespace(sleep=_sleep, monotonic=lambda: clock["now"]),
+        )
 
         background._maybe_start_hotkey("http://h:8033", ssh_host)
         return spawned[0]
