@@ -1197,7 +1197,37 @@ def _node_map_snapshot(
     # heavy subsystem: in-body per policy
     from magent import nodes
 
+    # Best effort on purpose: a badge and a dry-run line only DISPLAY; every
+    # placement decision reads strictly (``_node_map_for_placement``).
     return nodes.read_node_map()
+
+
+def _node_map_for_placement() -> tuple[
+    dict[str, NodeMapEntry], OSError | ValueError | None
+]:
+    """The node map for a decision that places something: ``(entries,
+    None)``, or ``({}, the error)`` when it cannot be read -- torn, or still
+    busy after its retries. Never ``read_node_map``'s ``{}``: an unreadable
+    map is UNKNOWN, not "nothing is placed", and read as empty an ``auto``
+    project running on a node would look free to place again. A pinned
+    project needs no map to resolve, so only ``auto`` ones are refused
+    (``_map_unreadable_text``)."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    try:
+        return nodes.load_node_map_strict(), None
+    except (OSError, ValueError) as exc:
+        return {}, exc
+
+
+def _map_unreadable_text(exc: OSError | ValueError) -> str:
+    """An ``auto`` project's one-line refusal under an unreadable map. The
+    error CLASS only: the full error goes to nodes.log."""
+    return (
+        f"the node map is unreadable ({type(exc).__name__}), so where this auto"
+        " project runs is unknown; not brought up"
+    )
 
 
 def _dispatch_node_project(
@@ -1780,8 +1810,16 @@ def bring_up_node_project(
     name = nodes.project_name(proj)
     sid = nodes.node_sid(proj)
     nick = ""
+    entries, unreadable = _node_map_for_placement()
+    if unreadable is not None and proj.node == NODE_AUTO:
+        log.warning("node ?: %s refused, node map unreadable: %s", sid, unreadable)
+        return NodeBringUpOutcome(
+            ok=False, sid=sid, node="", error=_map_unreadable_text(unreadable)
+        )
     try:
-        held = nodes.read_node_map().get(name)
+        # Unreadable, a pinned project goes to its pin: resolve ignores the
+        # map for it, and the node attaches to a session already running.
+        held = entries.get(name)
         node = nodes.resolve(
             config,
             proj,
@@ -1904,7 +1942,11 @@ def bring_up_node_project(
 
 
 def _placement_recipes(
-    config: MagentConfig, projects: list[ProjectConfig]
+    config: MagentConfig,
+    projects: list[ProjectConfig],
+    held: dict[str, NodeMapEntry],
+    *,
+    map_known: bool,
 ) -> dict[str, tuple[str, Recipe, bool]]:
     """``{sid: (nick, recipe, holder)}`` for every project in ``projects``
     whose node folder is already known, from config and the map alone -- no
@@ -1914,12 +1956,17 @@ def _placement_recipes(
     re-pinned elsewhere is a newcomer there. A project that cannot be placed
     yet (no folder here or none this user may read, an unplaced ``auto``, a
     folder with no usable name) is left out: its own bring-up names that
-    reason."""
+    reason.
+
+    ``held`` is the map read strictly; ``map_known`` False means it could
+    not be read. Then an ``auto`` project is not "unplaced" but UNKNOWN: it
+    may hold its folder on any node, so it stays in, under
+    ``nodes.UNKNOWN_NODE_ROOT`` and with no nick, and nobody is its folder's
+    holder."""
     # heavy subsystem: in-body per policy
     from magent import nodes
     from magent.env import local_username
 
-    held = nodes.read_node_map()
     out: dict[str, tuple[str, Recipe, bool]] = {}
     for proj in projects:
         name = nodes.project_name(proj)
@@ -1928,17 +1975,20 @@ def _placement_recipes(
             project_dir = _node_project_dir(config, proj)
             if project_dir is None:
                 continue
-            node = nodes.resolve(
-                config,
-                proj,
-                local_user=local_username(),
-                placed=entry.nick if entry else None,
-            )
-            remote_root = nodes.remote_root_for(node, project_dir)
+            if not map_known and proj.node == NODE_AUTO:
+                nick, remote_root = "", nodes.unknown_node_remote_root(project_dir)
+            else:
+                node = nodes.resolve(
+                    config,
+                    proj,
+                    local_user=local_username(),
+                    placed=entry.nick if entry else None,
+                )
+                nick, remote_root = node.nick, nodes.remote_root_for(node, project_dir)
         except (nodes.NodeConfigError, OSError):
             continue
         out[nodes.node_sid(proj)] = (
-            node.nick,
+            nick,
             nodes.Recipe(
                 project=name,
                 sid=nodes.node_sid(proj),
@@ -1948,7 +1998,7 @@ def _placement_recipes(
                 remote_root=remote_root,
             ),
             entry is not None
-            and entry.nick == node.nick
+            and entry.nick == nick
             and entry.remote_root == remote_root,
         )
     return out
@@ -1987,7 +2037,8 @@ def _run_node_bring_ups(
     fleet = nodes.node_projects(config)
     known = {nodes.node_sid(proj) for proj in fleet}
     fleet += [proj for proj in projects if nodes.node_sid(proj) not in known]
-    placed = _placement_recipes(config, fleet)
+    held, unreadable = _node_map_for_placement()
+    placed = _placement_recipes(config, fleet, held, map_known=unreadable is None)
     clash: dict[str, str] = {}
     for group in nodes.remote_root_collisions([r for _, r, _ in placed.values()]):
         text = nodes.remote_root_collision_text(group)
@@ -1996,7 +2047,16 @@ def _run_node_bring_ups(
     outcomes: dict[str, NodeBringUpOutcome] = {}
     for proj in projects:
         sid = nodes.node_sid(proj)
-        if sid in clash and not placed[sid][2]:
+        if unreadable is not None and proj.node == NODE_AUTO:
+            # Refused HERE, not left to its own bring-up: a map readable
+            # again by then would place it past the check this one failed.
+            get_logger("nodes").warning(
+                "node project %s refused, node map unreadable: %s", sid, unreadable
+            )
+            outcomes[sid] = NodeBringUpOutcome(
+                ok=False, sid=sid, node="", error=_map_unreadable_text(unreadable)
+            )
+        elif sid in clash and not placed[sid][2]:
             get_logger("nodes").warning("node project %s refused: %s", sid, clash[sid])
             outcomes[sid] = NodeBringUpOutcome(
                 ok=False, sid=sid, node=placed[sid][0], error=clash[sid]

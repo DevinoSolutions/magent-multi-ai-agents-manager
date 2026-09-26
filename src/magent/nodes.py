@@ -1085,12 +1085,28 @@ def remote_root_for(node: Node, project_dir: Path) -> str:
     The result is UNQUOTED and may start with ``~``, which stays unexpanded. A
     placement caller must run it through ``absolute_remote()`` BEFORE any
     ``shlex.quote`` -- a quoted ``~`` is never expanded by the node's shell."""
+    return _remote_root_under(node.root, project_dir)
+
+
+# The root spelled for a folder whose node nobody can tell -- an ``auto``
+# project while the map is unreadable (D17's "(node unknown)").
+UNKNOWN_NODE_ROOT = "(node unknown)"
+
+
+def unknown_node_remote_root(project_dir: Path) -> str:
+    """``remote_root_for`` when the node is UNKNOWN, not absent: the same
+    folder-name refusals, under ``UNKNOWN_NODE_ROOT``. Only for the fleet
+    folder check, which compares leaves alone -- nothing is dialed with it."""
+    return _remote_root_under(UNKNOWN_NODE_ROOT, project_dir)
+
+
+def _remote_root_under(root: str, project_dir: Path) -> str:
     name = project_dir.name
     if not name:
         raise NodeConfigError(f"{project_dir}: a drive root cannot be a node project")
     if _not_a_folder_name(name):
         raise NodeConfigError(f"{project_dir}: {name!r} cannot name a node folder")
-    return f"{node.root.rstrip('/')}/{name}"
+    return f"{root.rstrip('/')}/{name}"
 
 
 def _folder_leaf(recipe: Recipe) -> str:
