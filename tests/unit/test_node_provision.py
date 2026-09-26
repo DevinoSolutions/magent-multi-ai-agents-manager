@@ -1701,6 +1701,39 @@ class TestAnUnreadableSkillsFolderIsNamedNotFatal:
         )
 
 
+# Two cautions that never stop a file: it ships verbatim, with a note in our
+# words. A `#!` line ending in CR names an interpreter ("bash\r") the node
+# cannot exec.
+class TestASkillFileIsShippedWithACaution:
+    def test_a_crlf_shebang_ships_verbatim_with_a_note(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        data = b"#!/usr/bin/env bash\r\necho hi\r\n"
+        _skill(skills, "s/run.sh", data)
+        scope = nodes.user_scope(home)
+        assert scope.skills == (
+            nodes.SkillFile(path="s/run.sh", data=data, executable=True),
+        )
+        assert scope.notes == (
+            "skills/s/run.sh: CRLF line endings; will not run on a node",
+        )
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b"# notes\r\nfrom Windows\r\n",  # CRLF, but nothing runs it
+            b"#!/usr/bin/env bash\necho hi\n",  # a shebang, LF
+            b"echo\r\n#!/bin/sh\r\n",  # a `#!` that is not the first line
+        ],
+        ids=["crlf-markdown", "lf-shebang", "shebang-not-first"],
+    )
+    def test_no_note_when_nothing_would_exec_a_cr(self, tmp_path, data):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/f", data)
+        scope = nodes.user_scope(home)
+        assert [f.data for f in scope.skills] == [data]
+        assert scope.notes == ()
+
+
 CLAUDE_ELSEWHERE = "links into ~/.claude outside the skills folder, not followed"
 ROOT_IN_CLAUDE = "resolves into ~/.claude outside ~/.claude/skills, not shipped"
 

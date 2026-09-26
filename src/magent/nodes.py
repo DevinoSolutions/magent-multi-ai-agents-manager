@@ -864,10 +864,16 @@ def _skill_file(
         )
         return None
     tally.total += len(data)
+    shebang = data.startswith(b"#!")
+    # Shipped verbatim either way: a note, never a rewrite of the user's file.
+    if shebang and data.split(b"\n", 1)[0].endswith(b"\r"):
+        notes.append(
+            f"skills/{_named(rel_path)}: CRLF line endings; will not run on a node"
+        )
     return SkillFile(
         path=rel_path,
         data=data,
-        executable=bool(mode & stat.S_IXUSR) or data.startswith(b"#!"),
+        executable=bool(mode & stat.S_IXUSR) or shebang,
     )
 
 
