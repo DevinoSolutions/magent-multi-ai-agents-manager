@@ -623,3 +623,126 @@ class TestRunMagentPlacesBeforeItLaunches:
             launch.run_magent(config, RunOpts(dry_run=True))
 
         assert '"node": "<nick>"' in capsys.readouterr().out
+
+
+class TestAnUnreadableMapPlacesNoAutoProject:
+    """A torn or busy node map is UNKNOWN, never "nothing is placed". Read as
+    ``{}``, an ``auto`` project already running on a node looks unplaced and
+    is scored onto a fresh node: a second session while the first still
+    runs. The placer reads the map strictly; unreadable, it places no auto
+    project, a pinned or local one passes through, and it writes nothing."""
+
+    @pytest.fixture(params=["torn", "busy"])
+    def unreadable_map(self, request, monkeypatch):
+        """Make the map unreadable -- AFTER the test recorded what it holds --
+        and return the error class a reader then meets."""
+
+        def make() -> str:
+            if request.param == "torn":
+                nodes.NODE_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+                nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+                return "ValueError"
+
+            def busy() -> dict[str, nodes.NodeMapEntry]:
+                raise PermissionError(13, "The process cannot access the file")
+
+            monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+            return "PermissionError"
+
+        return make
+
+    def test_an_auto_project_already_placed_is_not_placed_again(
+        self, remote_samples, unreadable_map
+    ):
+        # api runs on third; second is the quieter node, so a guess from an
+        # empty map would put a second api session there.
+        nodes.update_node_map("api", entry("third"))
+        seed_history("second", "quiet")
+        seed_history("third", "bursty")
+        config = pool("second", "third", projects=[_auto("api")])
+        cls = unreadable_map()
+
+        placed = launch.place_node_projects(config, config.projects, now=NOW)
+
+        assert placed.projects == []
+        assert placed.notes == [
+            (
+                f"api: the node map is unreadable ({cls}), so where this auto"
+                " project runs is unknown; not brought up"
+            )
+        ]
+        # D17: the node is None, not a guess.
+        assert placed.placements["api"].nick is None
+        # Nothing will be placed, so no node is dialed to be scored.
+        assert remote_samples == []
+
+    def test_the_refusal_names_the_error_class_only(
+        self, remote_samples, unreadable_map
+    ):
+        config = pool("second", projects=[_auto("api")])
+        unreadable_map()
+
+        (note,) = launch.place_node_projects(config, config.projects, now=NOW).notes
+
+        assert "torn" not in note
+        assert "cannot access" not in note
+        assert "\n" not in note
+
+    def test_pinned_and_local_projects_pass_through_untouched(
+        self, remote_samples, unreadable_map
+    ):
+        local = ProjectConfig(path="/work/x", title="x")
+        pinned = ProjectConfig(path="/work/web", title="web", node="third")
+        seed_history("second", "quiet")
+        config = pool(
+            "second", "third", projects=[local, _auto("api"), pinned, _auto("db")]
+        )
+        unreadable_map()
+
+        placed = launch.place_node_projects(config, config.projects, now=NOW)
+
+        assert len(placed.projects) == 2
+        assert placed.projects[0] is local
+        assert placed.projects[1] is pinned
+        assert sorted(placed.placements) == ["api", "db"]
+        assert [n.split(":")[0] for n in placed.notes] == ["api", "db"]
+
+    def test_the_placer_writes_nothing_from_a_failed_read(
+        self, remote_samples, unreadable_map
+    ):
+        nodes.update_node_map("api", entry("third"))
+        seed_history("second", "quiet")
+        config = pool("second", "third", projects=[_auto("api")])
+        unreadable_map()
+        folder = nodes.NODE_MAP_PATH.parent
+        before = nodes.NODE_MAP_PATH.read_bytes()
+        listing = sorted(p.name for p in folder.iterdir())
+
+        launch.place_node_projects(config, config.projects, now=NOW)
+
+        # Not the {} a best-effort read would give, and no temp file beside it.
+        assert nodes.NODE_MAP_PATH.read_bytes() == before
+        assert sorted(p.name for p in folder.iterdir()) == listing
+
+    def test_the_local_fleet_still_launches_and_the_refusal_is_printed(
+        self, fake_platform, monkeypatch, capsys, unreadable_map
+    ):
+        nodes.update_node_map("api", entry("third"))
+        seed_history("second", "quiet", now=time.time() + 30)
+        seen: list[ProjectConfig] = []
+
+        def _capture(plat, config, opts, projects, base_dir):
+            seen.extend(projects)
+            raise _StopBeforeLaunch
+
+        monkeypatch.setattr(launch, "_launch_projects", _capture)
+        local = ProjectConfig(path="/work/x", title="x")
+        config = pool("second", "third", projects=[local, _auto("api")])
+        cls = unreadable_map()
+
+        with pytest.raises(_StopBeforeLaunch):
+            launch.run_magent(config, RunOpts(dry_run=True))
+
+        assert seen == [local]
+        out = capsys.readouterr().out
+        assert f"api: the node map is unreadable ({cls})" in out
