@@ -444,7 +444,9 @@ def _check_nodes(cfg: MagentConfig | None) -> CheckResult:
 
     A node's trouble is its fail and warn rows, named by item; any other row
     (ok, skip -- a node with nothing synced yet) is healthy."""
-    if cfg is None or not cfg.settings.nodes:
+    if cfg is None:
+        return (OK, "skipped -- config missing or invalid (see the config check)")
+    if not cfg.settings.nodes:
         return (OK, "no nodes configured")
     # Sibling command modules, imported in-body so doctor.py's import never
     # depends on the registration hub's import order.
@@ -452,16 +454,17 @@ def _check_nodes(cfg: MagentConfig | None) -> CheckResult:
     from magent.cli.fleet_cmd import _stdout_safe
 
     report = node_cmd.doctor_report(cfg, list(cfg.settings.nodes))
-    troubled = [
-        f"{nick}: {', '.join(line.item for line in lines if line.status in (FAIL, WARN))}"
-        for nick, lines in report.items()
-        if any(line.status in (FAIL, WARN) for line in lines)
-    ]
+    troubled: list[str] = []
+    for nick, lines in report.items():
+        items = [line.item for line in lines if line.status in (FAIL, WARN)]
+        if items:
+            troubled.append(f"{nick}: {', '.join(items)}")
     if not troubled:
         return (OK, f"{len(report)} node(s) healthy")
-    # The items are the node's words (doctor.sh prints them) and a nick is a
-    # free-form config key; a redirected Windows stdout (cp1252) may encode
-    # neither. Lose a glyph, never the command.
+    # The items are the node's words (doctor.sh prints them), which a redirected
+    # Windows stdout (cp1252) may not encode: lose a glyph, never the command.
+    # A nick cannot need it, nor hold a separator: load_config admits only
+    # [a-z0-9-]{1,6}.
     return (
         WARN,
         _stdout_safe("; ".join(troubled)) + " -- details: magent node doctor",

@@ -759,8 +759,13 @@ class TestTheNodesRow:
         cfg = load_config(tmp_config({"version": SCHEMA_VERSION, "projects": []}))
         assert _check_nodes(cfg) == ("ok", "no nodes configured")
 
-    def test_no_config_is_ok(self):
-        assert _check_nodes(None) == ("ok", "no nodes configured")
+    def test_no_loadable_config_is_skipped_not_called_node_free(self):
+        # A missing or broken config may well configure nodes: say the row was
+        # skipped (the config row already fails), never "no nodes configured".
+        assert _check_nodes(None) == (
+            "ok",
+            "skipped -- config missing or invalid (see the config check)",
+        )
 
     def test_healthy_nodes_are_ok(self, tmp_config, monkeypatch):
         monkeypatch.setattr(
