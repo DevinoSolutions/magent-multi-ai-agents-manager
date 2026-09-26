@@ -220,6 +220,12 @@ class TestTheNodeMap:
         node_map.write_text(text, encoding="utf-8")
         assert nodes.read_node_map() == {}
 
+    def test_a_file_json_cannot_nest_is_an_empty_map(self, node_map):
+        # json.loads raises RecursionError past ~1000 levels: not a ValueError.
+        node_map.parent.mkdir(parents=True)
+        node_map.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+        assert nodes.read_node_map() == {}
+
     @pytest.mark.parametrize(
         "bad",
         [

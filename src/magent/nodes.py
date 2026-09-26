@@ -273,12 +273,14 @@ def load_node_map_strict() -> dict[str, NodeMapEntry]:
 def read_node_map() -> dict[str, NodeMapEntry]:
     """``node-map.json`` keyed by project name, tolerantly: whatever
     ``load_node_map_strict`` raises -- a map still busy after its retries, a
-    torn write, a file that is not a JSON object -- reads as ``{}``. The map is
-    a record of where things landed, and a bad one must never stop a launch.
-    Never write back what this returns; see ``load_node_map_strict``."""
+    torn write, a file that is not a JSON object, one nested too deep for
+    ``json.loads`` (``RecursionError``, which is not a ``ValueError``) -- reads
+    as ``{}``. The map is a record of where things landed, and a bad one must
+    never stop a launch or an F2 press. Never write back what this returns; see
+    ``load_node_map_strict``."""
     try:
         return load_node_map_strict()
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}
 
 

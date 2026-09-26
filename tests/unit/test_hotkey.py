@@ -1803,3 +1803,23 @@ class TestF2OpensANodeFolderOverRemoteSsh(_OpenCodeHarness):
                 "/home/amin/magent/R&D",
             ]
         ]
+
+    def test_a_map_json_cannot_nest_still_costs_f2_nothing(self, monkeypatch, tmp_path):
+        """json.loads raises RecursionError -- not a ValueError -- past ~1000
+        levels; read_node_map must still read that as no placements."""
+        from magent import hotkey, nodes
+
+        deep = tmp_path / "node-map.json"
+        deep.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", deep)
+        spawned = self._patch(
+            monkeypatch,
+            payload={
+                "ok": True,
+                "sessions": [
+                    {"name": "api", "session": "api", "resolved": "/base/api"}
+                ],
+            },
+        )
+        hotkey._do_open_code("http://x:8034", "api", None)
+        assert spawned == [["code", "/base/api"]]
