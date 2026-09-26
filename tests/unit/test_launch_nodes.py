@@ -804,6 +804,25 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         ]
         assert set(nodes.read_node_map()) == {"api-x"}
 
+    def test_a_record_on_another_node_does_not_make_a_holder(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # api-x ran in ~/magent/api on second, then was re-pinned to third,
+        # where api-y holds ~/magent/api. On third api-x is a newcomer: taking
+        # it for a holder would dial both into one folder.
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        x_api.node = "third"
+        _record("api-x", "second", "~/magent/api")
+        _record("api-y", "third", "~/magent/api")
+        _no_contact_for(monkeypatch, rig, "api-x")
+        newcomer, holder = _batch(_config(x_api, y_api))
+        assert (newcomer.sid, newcomer.ok, newcomer.node) == ("api-x", False, "third")
+        assert "'api-y'" in (newcomer.error or "")
+        assert (holder.sid, holder.ok) == ("api-y", True)
+        assert [(n, r.sid, r.remote_root) for n, r in rig.recipes] == [
+            ("third", "api-y", "~/magent/api")
+        ]
+
     def test_a_record_of_another_folder_does_not_make_a_holder(
         self, rig, tmp_path, monkeypatch
     ):

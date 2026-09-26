@@ -1634,10 +1634,11 @@ def _placement_recipes(
     whose node folder is already known, from config and the map alone -- no
     ssh, no git. The recipe carries only what ``nodes.remote_root_collisions``
     reads (its project, sid and remote_root); ``holder`` is whether the map
-    records the project in that very folder. A project that cannot be placed
-    yet (no
-    folder here or none this user may read, an unplaced ``auto``, a folder
-    with no usable name) is left out: its own bring-up names that reason."""
+    records the project in that very folder on that very node -- a project
+    re-pinned elsewhere is a newcomer there. A project that cannot be placed
+    yet (no folder here or none this user may read, an unplaced ``auto``, a
+    folder with no usable name) is left out: its own bring-up names that
+    reason."""
     # heavy subsystem: in-body per policy
     from magent import nodes
     from magent.env import local_username
@@ -1670,7 +1671,9 @@ def _placement_recipes(
                 memory_dir=None,
                 remote_root=remote_root,
             ),
-            entry is not None and entry.remote_root == remote_root,
+            entry is not None
+            and entry.nick == node.nick
+            and entry.remote_root == remote_root,
         )
     return out
 
