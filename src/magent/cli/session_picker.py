@@ -381,9 +381,13 @@ def sessions_cmd(ctx: click.Context, name: str | None, as_json: bool) -> None:
 def _emit_sessions_json(config_path: str | None) -> None:
     """Print each configured session with its live state, one JSON array.
 
-    Only stdout carries the JSON: this reads config with the raw
+    Only stdout carries the JSON: the local rows come from the raw
     ``config_sessions`` loader (no `load_config` version warning), and the
     per-session pane reads fan out on a small pool so a big fleet stays quick.
+    A config that names a pool node also gets a typed load for the node rows
+    (see ``_node_session_rows``): its version warning goes to stderr, and a
+    config that fails validation answers the ``{"ok": false, "error": ...}``
+    envelope with exit 1 instead of an array.
     """
     import json
     from concurrent.futures import ThreadPoolExecutor
@@ -446,7 +450,11 @@ def _node_session_rows(config_path: str | None) -> list[dict[str, object]]:
     if not config_file.exists():
         return []
     raw = json.loads(config_file.read_text(encoding="utf-8"))
-    # Raw dict: same rule as config_sessions' node skip (DECISION-15).
+    # Raw dict: same rule as config_sessions' node skip (DECISION-15). A
+    # deliberate SUPERSET of nodes.node_projects (it ignores enabled, IDE tools
+    # and duplicate sids): it may trigger a typed load that lists nothing, but
+    # it can never drop a node row. Mirroring those skips here would be a third
+    # spelling of node_projects' predicate to keep in step.
     if not any(
         isinstance(p, dict) and p.get("node") not in (None, "cloud")
         for p in raw.get("projects", [])
