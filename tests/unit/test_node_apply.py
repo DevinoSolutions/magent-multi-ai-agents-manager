@@ -583,13 +583,22 @@ class TestAnOffContractPayloadIsRefusedWhole:
             fileobj=io.BytesIO(payload.partition(b"\n")[2]), mode="r:gz"
         ) as tar:
             names = tar.getnames()
-        assert {n for n in names if "/" not in n} == node_apply.PAYLOAD_FILES
+        top = {n for n in names if "/" not in n}
+        # The list is what MAY sit at the top: a sender that leaves
+        # settings.json out (its PC settings did not read) is on contract.
+        assert top <= node_apply.PAYLOAD_FILES
+        assert node_apply.PAYLOAD_FILES - top <= {"settings.json"}
         assert {n.split("/")[0] for n in names if "/" in n} == {"skills"}
 
     def test_a_real_payload_passes(self, box, tmp_path, capsys):
         work = _work(tmp_path, replace(EMPTY, skills=(ONE_SKILL,)))
         assert box.apply(work) == 0
         assert "payload" not in {line.item for line in _lines(capsys)}
+
+    def test_a_listed_file_may_be_absent(self, tmp_path):
+        work = _work(tmp_path, replace(EMPTY, skills=(ONE_SKILL,)))
+        (work / "settings.json").unlink()
+        assert node_apply._off_contract(work) is None
 
     @pytest.mark.skipif(not POSIX, reason="POSIX symlinks")
     def test_a_symlinked_skill_file_is_refused(self, box, tmp_path, capsys):
