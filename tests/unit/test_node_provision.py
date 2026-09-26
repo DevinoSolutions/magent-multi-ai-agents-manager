@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tarfile
 import time
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
@@ -24,9 +24,6 @@ from magent.cli import hooks_cmd
 from magent.nodes import Node, UserScope
 from magent.remote_mux import ProvisionReport, RemoteError, ScriptLine
 from tests.unit._fake_ssh import FakeSsh, gh_auth_status, make_fake_ssh
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 class TestTheNodeStateHookIsWiredLikeThisPcs:
@@ -97,6 +94,52 @@ def _scope(**overrides: object) -> UserScope:
     }
     fields.update(overrides)
     return UserScope(**fields)
+
+
+def _link_dir(link: Path, target: Path) -> None:
+    """A directory link the way a user makes one here: a junction on Windows
+    (no privilege needed), a symlink elsewhere."""
+    if sys.platform == "win32":
+        import _winapi  # win32-only: imported where it exists
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+# ssh(1)'s flags that take a value: that value (glued on, or the next token)
+# is never read as more flags.
+_SSH_VALUE_FLAGS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
+
+
+def _ssh_flags(options: list[str]) -> str:
+    """Every flag letter in ``options`` (ssh's arguments before the target),
+    clusters (``-qt``) unpacked and option values skipped."""
+    flags: list[str] = []
+    values_next = False
+    for token in options:
+        if values_next:
+            values_next = False
+            continue
+        if not token.startswith("-") or token.startswith("--"):
+            continue
+        for i, letter in enumerate(token[1:], start=1):
+            flags.append(letter)
+            if letter in _SSH_VALUE_FLAGS:
+                values_next = i == len(token) - 1
+                break
+    return "".join(flags)
+
+
+def _link_file(link: Path, target: Path) -> None:
+    """A file symlink; Windows allows one only with Developer Mode or the
+    privilege, so there the test skips when it cannot make one."""
+    try:
+        link.symlink_to(target)
+    except OSError as e:
+        if sys.platform != "win32":
+            raise
+        pytest.skip(f"no file symlink here ({e.strerror})")
 
 
 class TestUserScopeSettingsAndMcp:
@@ -690,6 +733,258 @@ class TestUserScopePluginsAndSkills:
         assert [f.path for f in scope.skills] == ["mine/SKILL.md"]
         assert scope.notes == ("skills/synced: claude.ai-managed copies, not shipped",)
 
+    # A link in ~/.claude/skills is one the user made -- a repo checked out
+    # elsewhere is the main case -- so the walk FOLLOWS it out of the root, a
+    # Windows junction exactly like a symlink. Deliberately not containment
+    # (nodes._skills says so). The tool dirs under the linked-in repo still
+    # stay behind: they are pruned by name at every level.
+    @staticmethod
+    def _repo_outside(tmp_path: Path) -> Path:
+        repo = tmp_path / "elsewhere" / "deploy-skill"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".git" / "config").write_bytes(b"[core]\n")
+        (repo / "node_modules" / "dep").mkdir(parents=True)
+        (repo / "node_modules" / "dep" / "i.js").write_bytes(b"")
+        (repo / "SKILL.md").write_bytes(b"# deploy\n")
+        (repo / "run.sh").write_bytes(b"#!/usr/bin/env bash\necho hi\n")
+        return repo
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows'")
+    def test_a_junction_to_a_folder_outside_skills_ships_its_files(self, tmp_path):
+        import _winapi  # win32-only: imported where it exists
+
+        home = _pc_home(tmp_path)
+        skills = home / ".claude" / "skills"
+        skills.mkdir(parents=True)
+        repo = self._repo_outside(tmp_path)
+        _winapi.CreateJunction(str(repo), str(skills / "deploy"))
+        assert not (skills / "deploy").is_symlink()  # a junction, not a symlink
+        assert [f.path for f in nodes.user_scope(home).skills] == [
+            "deploy/SKILL.md",
+            "deploy/run.sh",
+        ]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the POSIX twin")
+    def test_a_symlink_to_a_folder_outside_skills_ships_its_files(self, tmp_path):
+        home = _pc_home(tmp_path)
+        skills = home / ".claude" / "skills"
+        skills.mkdir(parents=True)
+        repo = self._repo_outside(tmp_path)
+        (skills / "deploy").symlink_to(repo, target_is_directory=True)
+        assert [f.path for f in nodes.user_scope(home).skills] == [
+            "deploy/SKILL.md",
+            "deploy/run.sh",
+        ]
+
+    # The walk follows links, so a link back at an ancestor is a cycle, and
+    # the realpath ``seen`` guard is the only thing that ends it. On Windows
+    # that holds only if realpath sees through a junction -- asserted first,
+    # so a failure says which half broke.
+    @pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows'")
+    def test_a_junction_cycle_ends_at_the_realpath_guard(self, tmp_path):
+        import _winapi  # win32-only: imported where it exists
+
+        home = _pc_home(tmp_path)
+        skill = home / ".claude" / "skills" / "deploy"
+        (skill / "sub").mkdir(parents=True)
+        (skill / "SKILL.md").write_bytes(b"# deploy\n")
+        (skill / "sub" / "notes.md").write_bytes(b"notes\n")
+        _winapi.CreateJunction(str(skill), str(skill / "sub" / "back"))
+        assert os.path.realpath(skill / "sub" / "back") == os.path.realpath(skill)
+        assert [f.path for f in nodes.user_scope(home).skills] == [
+            "deploy/SKILL.md",
+            "deploy/sub/notes.md",
+        ]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the POSIX twin")
+    def test_a_symlink_cycle_ends_at_the_realpath_guard(self, tmp_path):
+        home = _pc_home(tmp_path)
+        skill = home / ".claude" / "skills" / "deploy"
+        (skill / "sub").mkdir(parents=True)
+        (skill / "SKILL.md").write_bytes(b"# deploy\n")
+        (skill / "sub" / "notes.md").write_bytes(b"notes\n")
+        (skill / "sub" / "back").symlink_to(skill, target_is_directory=True)
+        assert [f.path for f in nodes.user_scope(home).skills] == [
+            "deploy/SKILL.md",
+            "deploy/sub/notes.md",
+        ]
+
+    # The one link NOT followed: one aimed above the skills folder. Followed,
+    # it reads the whole home -- ~/.ssh and every other ~/.claude file -- and
+    # the seen guard only stops it at the skills folder itself. A junction on
+    # win32, a symlink on POSIX (_link_dir). "~/.." stands in for "/": every
+    # target here is bounded, so a regressed prune fails in a second instead
+    # of walking the real disk; the root itself is pinned on _above below.
+    @pytest.mark.parametrize("above", ["~", "~/.claude", "~/.."])
+    def test_a_link_above_the_skills_folder_is_pruned_with_a_warning(
+        self, tmp_path, caplog, above
+    ):
+        home = _pc_home(tmp_path)
+        skills = home / ".claude" / "skills"
+        (skills / "deploy").mkdir(parents=True)
+        (skills / "deploy" / "SKILL.md").write_bytes(b"# deploy\n")
+        (home / ".ssh").mkdir()
+        (home / ".ssh" / "id_ed25519").write_bytes(b"TOPSECRET-ssh\n")
+        (home / ".claude" / "private").mkdir()
+        (home / ".claude" / "private" / "notes.md").write_bytes(b"TOPSECRET-claude\n")
+        (tmp_path / "beside").mkdir()
+        (tmp_path / "beside" / "secret.txt").write_bytes(b"TOPSECRET-beside\n")
+        target = {
+            "~": home,
+            "~/.claude": home / ".claude",
+            "~/..": tmp_path,
+        }[above]
+        _link_dir(skills / "x", target)
+        caplog.set_level("WARNING")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["deploy/SKILL.md"]
+        assert all(b"TOPSECRET" not in f.data for f in scope.skills)
+        assert scope.notes == (
+            "skills/x: links to a folder above the skills folder, not followed",
+        )
+        assert "skills/x links to" in caplog.text
+
+    def test_the_filesystem_root_is_above_every_skills_folder(self, tmp_path):
+        skills = str(tmp_path / "pc" / ".claude" / "skills")
+        assert nodes._above(tmp_path.anchor, skills)
+        assert nodes._above(str(tmp_path / "pc"), skills)
+        assert not nodes._above(skills, skills)
+        assert not nodes._above(skills + os.sep + "x", skills)
+
+    # By path component, never by string prefix.
+    def test_a_sibling_sharing_a_name_prefix_is_not_an_ancestor(self, tmp_path):
+        inside = str(tmp_path / "amind2" / ".claude" / "skills")
+        assert not nodes._above(str(tmp_path / "amind"), inside)
+        assert not nodes._within(str(tmp_path / "amind"), inside)
+        assert nodes._within(str(tmp_path / "amind2"), inside)
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="drive letters are Windows'")
+    def test_drive_letter_case_is_ignored_and_another_drive_shares_nothing(self):
+        assert nodes._above("c:\\Users\\Amin", "C:\\users\\amin\\.claude\\skills")
+        assert nodes._within("C:\\Users\\amin\\.SSH", "c:\\users\\AMIN\\.ssh\\id")
+        assert not nodes._above("c:\\users\\amin", "C:\\Users\\Amin")  # the same
+        # commonpath raises ValueError across drives: that is "no ancestor".
+        assert not nodes._above("D:\\", "C:\\Users\\amin\\.claude\\skills")
+        assert not nodes._within("D:\\Users\\amin", "C:\\Users\\amin")
+
+    def test_a_skills_folder_that_is_itself_a_link_above_ships_nothing(
+        self, tmp_path, caplog
+    ):
+        home = _pc_home(tmp_path)
+        (home / ".claude").mkdir()
+        (home / ".ssh").mkdir()
+        (home / ".ssh" / "id_ed25519").write_bytes(b"TOPSECRET-ssh\n")
+        _link_dir(home / ".claude" / "skills", home)
+        caplog.set_level("WARNING")
+        scope = nodes.user_scope(home)
+        assert scope.skills == ()
+        assert scope.notes == (
+            "skills: links to a folder it must not read, not followed",
+        )
+        assert "not followed" in caplog.text
+
+    # Defence in depth beside the ancestor rule: nothing inside a well-known
+    # secrets folder under the scope's home is read, a folder or one file.
+    @pytest.mark.parametrize(
+        "secret", [*nodes.SECRET_HOME_DIRS, ".aws/sso"], ids=lambda s: s
+    )
+    def test_a_link_into_a_secrets_folder_is_pruned_with_a_warning(
+        self, tmp_path, caplog, secret
+    ):
+        home = _pc_home(tmp_path)
+        skills = home / ".claude" / "skills"
+        (skills / "deploy").mkdir(parents=True)
+        (skills / "deploy" / "SKILL.md").write_bytes(b"# deploy\n")
+        (home / secret).mkdir(parents=True)
+        (home / secret / "key").write_bytes(b"TOPSECRET\n")
+        _link_dir(skills / "x", home / secret)
+        caplog.set_level("WARNING")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["deploy/SKILL.md"]
+        assert scope.notes == (
+            "skills/x: resolves into a secrets folder, not followed",
+        )
+        assert "skills/x resolves to" in caplog.text
+
+    # os.walk lists a file symlink under filenames, so a folder-only prune
+    # would read the key. Needs a file symlink: Developer Mode on Windows.
+    def test_a_linked_key_file_is_pruned_with_a_warning(self, tmp_path, caplog):
+        home = _pc_home(tmp_path)
+        skill = home / ".claude" / "skills" / "x"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_bytes(b"# x\n")
+        (home / ".ssh").mkdir()
+        (home / ".ssh" / "id_ed25519").write_bytes(b"TOPSECRET-ssh\n")
+        _link_file(skill / "key", home / ".ssh" / "id_ed25519")
+        caplog.set_level("WARNING")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["x/SKILL.md"]
+        assert scope.notes == (
+            "skills/x/key: resolves into a secrets folder, not followed",
+        )
+        assert "skills/x/key resolves to" in caplog.text
+
+    # Both sides are resolved: a ~/.ssh that is itself a junction elsewhere
+    # (OneDrive setups) still names the folder a skills link lands in.
+    def test_a_secrets_folder_that_is_itself_a_link_is_still_recognised(self, tmp_path):
+        home = _pc_home(tmp_path)
+        skills = home / ".claude" / "skills"
+        skills.mkdir(parents=True)
+        keys = tmp_path / "synced" / "keys"
+        keys.mkdir(parents=True)
+        (keys / "id_ed25519").write_bytes(b"TOPSECRET-ssh\n")
+        _link_dir(home / ".ssh", keys)
+        _link_dir(skills / "x", keys)
+        scope = nodes.user_scope(home)
+        assert scope.skills == ()
+        assert scope.notes == (
+            "skills/x: resolves into a secrets folder, not followed",
+        )
+
+    # The check runs on every folder the walk reaches, not only on links: a
+    # link to ~/.config ships its tools' files and never ~/.config/gh.
+    def test_a_link_to_a_folder_holding_a_secrets_folder_skips_only_that(
+        self, tmp_path
+    ):
+        home = _pc_home(tmp_path)
+        skills = home / ".claude" / "skills"
+        skills.mkdir(parents=True)
+        (home / ".config" / "tool").mkdir(parents=True)
+        (home / ".config" / "tool" / "a.md").write_bytes(b"a\n")
+        (home / ".config" / "gh").mkdir()
+        (home / ".config" / "gh" / "hosts.yml").write_bytes(b"TOPSECRET-gh\n")
+        _link_dir(skills / "cfg", home / ".config")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["cfg/tool/a.md"]
+        assert scope.notes == (
+            "skills/cfg/gh: resolves into a secrets folder, not followed",
+        )
+
+    # The boundary, so nobody reads the rules above as containment: a link to
+    # any other folder ships what it holds (ruling A -- the user made it).
+    def test_a_link_to_another_private_folder_still_ships(self, tmp_path):
+        home = _pc_home(tmp_path)
+        skills = home / ".claude" / "skills"
+        skills.mkdir(parents=True)
+        (home / "private-notes").mkdir()
+        (home / "private-notes" / "n.md").write_bytes(b"mine\n")
+        _link_dir(skills / "notes", home / "private-notes")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["notes/n.md"]
+        assert scope.notes == ()
+
+    def test_one_real_folder_under_two_names_ships_once_under_the_first(self, tmp_path):
+        home = _pc_home(tmp_path)
+        skills = home / ".claude" / "skills"
+        skills.mkdir(parents=True)
+        repo = self._repo_outside(tmp_path)
+        _link_dir(skills / "b-second", repo)
+        _link_dir(skills / "a-first", repo)
+        assert [f.path for f in nodes.user_scope(home).skills] == [
+            "a-first/SKILL.md",
+            "a-first/run.sh",
+        ]
+
     # Skill files ship as raw bytes and nothing else scans them: the value rule
     # (CLAUDE_CREDENTIAL_MARKER) reaches them too, and plugin ids and
     # marketplace sources, so a hard-coded key cannot ride any of them out.
@@ -832,6 +1127,8 @@ class TestAnExitCodeWithoutARowStillFails:
             _completed(2, b"did\tgh\tx\n", b"noise\npython3: not found\n"),
             "provision",
             NODE,
+            args=[],
+            stdin=b"",
         )
         assert report.lines[-1] == ScriptLine(
             "fail", "provision", "exited 2: python3: not found"
@@ -839,7 +1136,7 @@ class TestAnExitCodeWithoutARowStillFails:
 
     def test_a_non_zero_exit_that_reported_its_failure_adds_nothing(self):
         report = remote_mux._report_of(
-            _completed(1, b"fail\tgh\tno gh\n"), "provision", NODE
+            _completed(1, b"fail\tgh\tno gh\n"), "provision", NODE, args=[], stdin=b""
         )
         assert report.lines == (ScriptLine("fail", "gh", "no gh"),)
 
@@ -851,12 +1148,22 @@ class TestAnExitCodeWithoutARowStillFails:
                 ),
                 "provision",
                 NODE,
+                args=["--force"],
+                stdin=b"PAYLOAD-DECOY",
             )
         assert info.value.rc == 255
         assert "refused" in info.value.stderr_tail
         # The program, never this PC's path to it -- and no client lookup,
         # which would turn the transport failure into "ssh not installed".
+        # The rest is exactly what run() would name for the same call.
+        argv_remote, framed = remote_mux._script_call(
+            "provision", ["--force"], b"PAYLOAD-DECOY"
+        )
+        assert info.value.command_redacted == remote_mux._run_shown(
+            NODE, argv_remote, framed
+        )
         assert info.value.command_redacted[0] == "ssh"
+        assert "PAYLOAD-DECOY" not in str(info.value)
 
 
 TOKEN = "gho_FAKE0123456789abcdefTOKEN"
@@ -1095,6 +1402,29 @@ class TestProvision:
             "bash", "-s", "--", remote_mux.SOCKET, "--force"
         )
 
+    # node_apply survives a PC that hangs up by going quiet on a dead stdout
+    # (F10). A SIGHUP would still kill it mid-step, and sshd sends one only
+    # to a pty session -- so provisioning must never ask for one, in any
+    # spelling: -t, -tt, a cluster (-qt), or RequestTTY via -o in any form.
+    def test_provisioning_never_asks_for_a_tty(self, fake_ssh):
+        remote_mux.provision(NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S)
+        (call,) = fake_ssh.calls()
+        assert "t" not in _ssh_flags(call.argv[: call.argv.index(NODE.target)])
+        assert not any("requesttty" in token.lower() for token in call.argv)
+
+    @pytest.mark.parametrize(
+        ("options", "flags"),
+        [
+            (["-t"], "t"),
+            (["-qt"], "qt"),
+            (["-o", "BatchMode=yes", "-tt"], "ott"),
+            (["-oStrictHostKeyChecking=yes", "-i", "/home/t/key"], "oi"),
+            (["-p22t"], "p"),  # a value glued on: its t is not a flag
+        ],
+    )
+    def test_the_flag_reader_the_tty_pin_uses(self, options, flags):
+        assert _ssh_flags(options) == flags
+
     def test_the_verdicts_lead_the_report_one_line_per_server(self, fake_ssh):
         fake_ssh.set_reply(
             "bash -s", stdout="did\tstate_hook\t~/.magent/bin/state-hook.sh\n"
@@ -1156,6 +1486,95 @@ class TestProvision:
             )
             in report.lines
         )
+        # The verdicts come from the scope AFTER the probe (M22).
+        assert ScriptLine("ok", "scope", "mcp x: shipped") not in report.lines
+
+    # M3: a probe that died (a node whose shell profile breaks `set -u`) is not
+    # a node that lacks the program. The candidate still stays behind -- the
+    # probe proved nothing -- but the report fails, naming the probe.
+    def test_a_failed_probe_fails_the_report_and_claims_nothing_about_the_node(
+        self, fake_ssh
+    ):
+        fake_ssh.set_reply(
+            f"{remote_mux.SOCKET} npx", stderr="bash: HOME: unbound variable\n", rc=1
+        )
+        spec = {"type": "stdio", "command": "npx", "env": {"K": "ENV-DECOY"}}
+        report = remote_mux.provision(
+            NODE,
+            _scope(mcp_servers={"x": spec}),
+            timeout_s=remote_mux.PROVISION_TIMEOUT_S,
+        )
+        _, apply = fake_ssh.calls()  # the rest of the scope still applies
+        _, _, data = _unpack(_sent(apply))
+        assert json.loads(data["mcp_servers.json"]) == {}
+        assert all(b"ENV-DECOY" not in blob for blob in data.values())
+        assert report.failed
+        assert (
+            ScriptLine("fail", "programs", "exited 1: bash: HOME: unbound variable")
+            in report.lines
+        )
+        assert (
+            ScriptLine(
+                "skip",
+                "scope",
+                "mcp x: not shipped -- the node's program probe failed, "
+                "so `npx` is unconfirmed",
+            )
+            in report.lines
+        )
+        assert not any("not on the node" in line.detail for line in report.lines)
+
+    def test_a_probe_that_skips_a_name_it_was_asked_is_a_failed_probe(self, fake_ssh):
+        fake_ssh.set_reply(
+            f"{remote_mux.SOCKET} npx uvx", stdout="ok\tnpx\t/usr/bin/npx\n"
+        )
+        with pytest.raises(remote_mux.ProgramsProbeFailed) as info:
+            remote_mux.node_programs(
+                NODE, ["uvx", "npx"], timeout_s=remote_mux.PROGRAMS_TIMEOUT_S
+            )
+        assert info.value.lines == (
+            ScriptLine("fail", "programs", "no answer for uvx"),
+        )
+
+    # M29 / M19: the apply's bound, and the probe's -- capped by its own
+    # constant, never the provision's 300s, and never above the caller's.
+    def test_the_provision_timeout_is_five_minutes(self):
+        assert remote_mux.PROVISION_TIMEOUT_S == 300.0
+
+    @pytest.mark.parametrize(
+        ("given", "probe"),
+        [(remote_mux.PROVISION_TIMEOUT_S, remote_mux.PROGRAMS_TIMEOUT_S), (5.0, 5.0)],
+    )
+    def test_the_probe_is_bounded_by_its_own_cap(
+        self, fake_ssh, monkeypatch, given, probe
+    ):
+        fake_ssh.set_reply(f"{remote_mux.SOCKET} npx", stdout="ok\tnpx\t/usr/bin/npx\n")
+        bounds: list[tuple[str, float]] = []
+        real = remote_mux.run_script
+
+        # The bound is recorded, not enforced: the fake ssh's own start can
+        # take longer than 5s on a loaded Windows box.
+        def spy(node, name, args, **kwargs):
+            bounds.append((name, kwargs["timeout_s"]))
+            return real(node, name, args, **{**kwargs, "timeout_s": 60.0})
+
+        monkeypatch.setattr(remote_mux, "run_script", spy)
+        spec = {"type": "stdio", "command": "npx"}
+        remote_mux.provision(NODE, _scope(mcp_servers={"x": spec}), timeout_s=given)
+        assert bounds == [("programs", probe), ("provision", given)]
+        assert bounds[0][1] <= remote_mux.PROGRAMS_TIMEOUT_S
+
+    # Every name answered is not enough: a probe that exited non-zero failed,
+    # whatever it printed before it did.
+    def test_a_probe_that_answers_every_name_but_exits_non_zero_failed(self, fake_ssh):
+        fake_ssh.set_reply(
+            f"{remote_mux.SOCKET} npx", stdout="ok\tnpx\t/usr/bin/npx\n", rc=1
+        )
+        with pytest.raises(remote_mux.ProgramsProbeFailed) as caught:
+            remote_mux.node_programs(
+                NODE, ["npx"], timeout_s=remote_mux.PROGRAMS_TIMEOUT_S
+            )
+        assert caught.value.lines == (ScriptLine("fail", "programs", "exited 1"),)
 
     def test_a_failed_step_comes_back_as_rows_not_an_exception(self, fake_ssh):
         fake_ssh.set_reply("bash -s", stdout="fail\tgh\tgh is not installed\n", rc=1)
@@ -1171,9 +1590,58 @@ class TestProvision:
                 NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
             )
 
+    def test_a_transport_failure_names_the_call_that_ran_force_and_all(
+        self, fake_ssh, fake_gh
+    ):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
+        fake_ssh.set_reply("bash -s", stderr="ssh: connect to host: No route\n", rc=255)
+        with pytest.raises(RemoteError) as info:
+            remote_mux.provision(
+                NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S, force=True
+            )
+        (call,) = fake_ssh.calls()
+        shown = info.value.command_redacted
+        assert shown[:-1] == ("ssh", *call.argv)
+        assert shown[-2] == _remote("bash", "-s", "--", remote_mux.SOCKET, "--force")
+        assert shown[-1] == f"<stdin: {len(call.stdin)} bytes>"
+        assert TOKEN not in str(info.value)
+
+    def test_a_probe_transport_failure_names_the_programs_it_asked_about(
+        self, fake_ssh
+    ):
+        fake_ssh.set_reply(
+            f"{remote_mux.SOCKET} npx",
+            stderr="ssh: connect to host: No route\n",
+            rc=255,
+        )
+        spec = {"type": "stdio", "command": "npx", "env": {"K": "ENV-DECOY"}}
+        with pytest.raises(RemoteError) as info:
+            remote_mux.provision(
+                NODE,
+                _scope(mcp_servers={"x": spec}),
+                timeout_s=remote_mux.PROVISION_TIMEOUT_S,
+            )
+        (call,) = fake_ssh.calls()  # the probe alone: no apply after it
+        shown = info.value.command_redacted
+        assert shown[:-1] == ("ssh", *call.argv)
+        assert shown[-2] == _remote("bash", "-s", "--", remote_mux.SOCKET, "npx")
+        assert shown[-1] == f"<stdin: {len(call.stdin)} bytes>"
+        assert "ENV-DECOY" not in str(info.value)
+
     def test_the_timeout_is_mandatory(self):
         with pytest.raises(TypeError):
             remote_mux.provision(NODE, _scope())
+
+    # M24: the node's hook is the packaged state_hook.sh, byte for byte -- not
+    # a copy that could drift from what `node_scripts` ships.
+    def test_the_state_hook_shipped_is_the_packaged_script(self, fake_ssh):
+        remote_mux.provision(NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S)
+        (call,) = fake_ssh.calls()
+        _, _, data = _unpack(_sent(call))
+        assert data["state-hook.sh"] == node_scripts.script("state_hook").encode(
+            "utf-8"
+        )
 
     def test_a_failed_call_names_stdin_by_its_length_never_the_token(
         self, fake_ssh, fake_gh, caplog
@@ -1222,6 +1690,39 @@ def _node_payload(scope: UserScope | None = None, *, token: str | None = None) -
     )
 
 
+def _provision_spawn(
+    tmp_path: Path,
+    *,
+    fakes: tuple[FakeSsh, ...] = (),
+    args: tuple[str, ...] = (),
+    python: bool = True,
+    sysbin: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> dict[str, object]:
+    """The subprocess keywords that run provision.sh under real bash, exactly
+    as ssh would, for a node whose home is tmp_path/node -- which is also the
+    cwd, as over ssh. ``env`` adds to (or overrides) the three set here."""
+    (tmp_path / "node").mkdir(exist_ok=True)
+    (tmp_path / "tmp").mkdir(exist_ok=True)
+    if sysbin is None:
+        sysbin = _sysbin(
+            tmp_path,
+            PROVISION_TOOLS,
+            python=python,
+            name="sysbin" if python else "nopy",
+        )
+    return {
+        "args": _bash_argv(*args),
+        "cwd": tmp_path / "node",
+        "env": {
+            "HOME": str(tmp_path / "node"),
+            "PATH": os.pathsep.join([*(str(f.base) for f in fakes), str(sysbin)]),
+            "TMPDIR": str(tmp_path / "tmp"),
+            **(env or {}),
+        },
+    }
+
+
 def _run_provision(
     tmp_path: Path,
     payload: bytes,
@@ -1229,26 +1730,51 @@ def _run_provision(
     fakes: tuple[FakeSsh, ...] = (),
     args: tuple[str, ...] = (),
     python: bool = True,
+    sysbin: Path | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    """provision.sh under real bash, exactly as ssh would feed it, for a node
-    whose home is tmp_path/node."""
-    (tmp_path / "node").mkdir(exist_ok=True)
-    (tmp_path / "tmp").mkdir(exist_ok=True)
-    sysbin = _sysbin(
-        tmp_path, PROVISION_TOOLS, python=python, name="sysbin" if python else "nopy"
+    """provision.sh fed ``payload``, to completion (``_provision_spawn``)."""
+    spawn = _provision_spawn(
+        tmp_path, fakes=fakes, args=args, python=python, sysbin=sysbin, env=env
     )
     return subprocess.run(
-        _bash_argv(*args),
+        **spawn,
         input=remote_mux._frame_script(node_scripts.script("provision"), payload),
         capture_output=True,
-        env={
-            "HOME": str(tmp_path / "node"),
-            "PATH": os.pathsep.join([*(str(f.base) for f in fakes), str(sysbin)]),
-            "TMPDIR": str(tmp_path / "tmp"),
-        },
         timeout=120,
         check=False,
     )
+
+
+def _slow_gh(where: Path, seconds: float) -> Path:
+    """A ``gh`` in ``where`` that drains stdin, touches ``where/gh-started``,
+    then sleeps ``seconds`` and exits 0 -- every call, whatever the verb.
+    Its tools by absolute path: the PATH under test holds only what a
+    provision needs, and a ``sleep`` it cannot find exits 127 at once."""
+    where.mkdir(parents=True, exist_ok=True)
+    cat, sleep = shutil.which("cat"), shutil.which("sleep")
+    assert cat is not None
+    assert sleep is not None
+    gh = where / "gh"
+    gh.write_text(
+        f'#!/bin/sh\n"{cat}" >/dev/null\n: > "{where}/gh-started"\n'
+        f'exec "{sleep}" {seconds}\n',
+        encoding="utf-8",
+    )
+    gh.chmod(0o755)
+    return where / "gh-started"
+
+
+def _proc_blobs(name: str) -> dict[str, bytes]:
+    """/proc/<pid>/<name> for every process this user may read."""
+    blobs: dict[str, bytes] = {}
+    for proc in Path("/proc").iterdir():
+        if proc.name.isdigit():
+            try:
+                blobs[proc.name] = (proc / name).read_bytes()
+            except OSError:
+                continue
+    return blobs
 
 
 def _rows(result: subprocess.CompletedProcess[bytes]) -> dict[str, str]:
@@ -1345,6 +1871,185 @@ class TestProvisionShUnderRealBash:
         assert r.returncode == 2
         assert _rows(r) == {"provision": "fail"}
 
+    def test_anything_after_force_is_refused_too(self, tmp_path):
+        r = _run_provision(tmp_path, _node_payload(), args=("--force", "--bogus"))
+        assert r.returncode == 2
+        assert _rows(r) == {"provision": "fail"}
+        assert not (tmp_path / "node" / ".magent").exists()
+
+    def test_a_python3_older_than_3_8_is_one_fail_row_naming_the_repair(self, tmp_path):
+        sysbin = _sysbin(tmp_path, PROVISION_TOOLS, python=False, name="oldpy")
+        old = sysbin / "python3"
+        # Old only where it matters: it fails the version check and runs
+        # anything else, so a gate that stops asking lets the apply run on.
+        old.write_text(
+            '#!/bin/sh\ncase "$*" in *"version_info >= (3, 8)"*) exit 1 ;; esac\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        old.chmod(0o755)
+        r = _run_provision(tmp_path, _node_payload(), sysbin=sysbin)
+        assert r.returncode == 1
+        assert remote_mux.parse_report(r.stdout.decode("utf-8")).lines == (
+            ScriptLine(
+                "fail",
+                "python3",
+                "python3 on this node is older than 3.8 -- run: magent node setup",
+            ),
+        )
+
+    # M1: the shim expands the token (the read, the \r strip, the printf). A
+    # trace switched on from OUTSIDE the script -- SHELLOPTS in the ssh
+    # environment, a BASH_ENV file -- would print it to stderr, which
+    # _report_of tails into a fail row.
+    def test_a_trace_switched_on_from_outside_never_prints_the_token(self, tmp_path):
+        gh = make_fake_ssh(tmp_path, name="gh")
+        traced = tmp_path / "bash_env"
+        traced.write_text("set -x\n", encoding="utf-8")
+        r = _run_provision(
+            tmp_path,
+            _node_payload(token=TOKEN),
+            fakes=(gh,),
+            env={"SHELLOPTS": "xtrace", "BASH_ENV": str(traced)},
+        )
+        assert r.returncode == 0, r.stderr
+        assert b"+ set" in r.stderr  # the trace really was on
+        assert TOKEN.encode("ascii") not in r.stdout + r.stderr
+
+    # M4: under `python3 -c` sys.path[0] is the cwd, and over ssh the cwd is
+    # $HOME: a ~/json.py would be imported in place of the stdlib's.
+    def test_a_py_file_in_the_nodes_home_shadows_nothing(self, tmp_path):
+        home = tmp_path / "node"
+        home.mkdir()
+        (home / "json.py").write_text("raise SystemExit(7)\n", encoding="utf-8")
+        r = _run_provision(tmp_path, _node_payload())
+        assert r.returncode == 0, r.stderr
+        assert _rows(r)["settings"] == "did"
+        assert _rows(r)["state_hook"] == "did"
+
+    # A TMPDIR that starts with "-" makes a work dir that does too: as a
+    # separate argv word after --work it read as an option (argparse, rc 2).
+    def test_a_work_dir_starting_with_a_dash_is_still_a_value(self, tmp_path):
+        (tmp_path / "node" / "-t").mkdir(parents=True)
+        r = _run_provision(tmp_path, _node_payload(), env={"TMPDIR": "-t"})
+        assert r.returncode == 0, r.stderr
+        assert _rows(r)["state_hook"] == "did"
+        assert list((tmp_path / "node" / "-t").iterdir()) == []
+
+    # M4 (survivor): gh installed by `magent node setup` lives in ~/.local/bin,
+    # which a non-login ssh PATH lacks -- provision.sh puts it first.
+    def test_a_gh_only_in_the_nodes_local_bin_is_found(self, tmp_path):
+        gh = make_fake_ssh(tmp_path, name="gh")
+        local_bin = tmp_path / "node" / ".local" / "bin"
+        local_bin.mkdir(parents=True)
+        shutil.copy2(gh.path, local_bin / "gh")
+        r = _run_provision(tmp_path, _node_payload(token=TOKEN))
+        assert r.returncode == 0, r.stderr
+        assert _rows(r)["gh"] == "did"
+        assert any(c.argv[:2] == ["auth", "login"] for c in gh.calls())
+
+    # M9 (survivor): a payload cut short in transit is one fail row, and the
+    # private work dir it half-filled is gone.
+    def test_a_truncated_payload_is_a_fail_row_and_leaves_nothing(self, tmp_path):
+        payload = _node_payload()
+        r = _run_provision(tmp_path, payload[: len(payload) // 2])
+        assert r.returncode == 1
+        assert _rows(r) == {"payload": "fail"}
+        assert list((tmp_path / "tmp").iterdir()) == []
+        assert not (tmp_path / "node" / ".magent").exists()
+
+    # M24 (survivor): what lands at the hook path is the packaged script.
+    def test_the_installed_state_hook_is_the_packaged_script(self, tmp_path):
+        hook_text = node_scripts.script("state_hook")
+        payload = remote_mux.build_payload(
+            _scope(), gh_token=None, gh_login=None, state_hook=hook_text
+        )
+        r = _run_provision(tmp_path, payload)
+        assert r.returncode == 0, r.stderr
+        hook = tmp_path / "node" / ".magent" / "bin" / "state-hook.sh"
+        assert hook.read_bytes() == hook_text.encode("utf-8")
+
+    # M5 (survivor): while node_apply is mid-step (gh logging in), no process
+    # on the box carries the token in its environment or its argv -- it is on
+    # one pipe, and nowhere else.
+    def test_mid_apply_no_process_holds_the_token_in_env_or_argv(self, tmp_path):
+        started = _slow_gh(tmp_path / "slowgh", 3)
+        spawn = _provision_spawn(tmp_path)
+        env = spawn["env"]
+        assert isinstance(env, dict)
+        env["PATH"] = f"{tmp_path / 'slowgh'}{os.pathsep}{env['PATH']}"
+        framed = tmp_path / "framed"
+        framed.write_bytes(
+            remote_mux._frame_script(
+                node_scripts.script("provision"), _node_payload(token=TOKEN)
+            )
+        )
+        with (
+            framed.open("rb") as stdin,
+            subprocess.Popen(
+                **spawn, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            ) as proc,
+        ):
+            deadline = time.monotonic() + 30
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert started.exists(), "gh never ran"
+            environs = _proc_blobs("environ")
+            cmdlines = _proc_blobs("cmdline")
+            out, err = proc.communicate(timeout=60)
+        assert any(b"node_apply" in c for c in cmdlines.values())  # it was seen
+        secret = TOKEN.encode("ascii")
+        assert [pid for pid, blob in environs.items() if secret in blob] == []
+        assert [pid for pid, blob in cmdlines.items() if secret in blob] == []
+        assert proc.returncode == 0, err
+        assert secret not in out + err
+
+    # I1: when PROVISION_TIMEOUT_S fires, this PC kills its ssh and the node's
+    # stdout pipe closes under a still-running apply. That apply must finish
+    # the scope -- not die at its next row -- and still clean up after itself.
+    # Only the rows are lost (a reader treats a missing row as unknown); the
+    # exit code is the steps' own. A SIGHUP is the other killer, and only a
+    # pty session gets one: TestProvision pins that provisioning asks for none.
+    def test_an_apply_whose_stdout_closes_mid_run_still_lands_the_scope(self, tmp_path):
+        _slow_gh(tmp_path / "slowgh", 3)  # login + setup-git: ~6s to row one
+        spawn = _provision_spawn(tmp_path)
+        env = spawn["env"]
+        assert isinstance(env, dict)
+        env["PATH"] = f"{tmp_path / 'slowgh'}{os.pathsep}{env['PATH']}"
+        scope = _scope(
+            settings={"model": "opus"},
+            mcp_servers={"docs": {"type": "http", "url": "https://docs.example/mcp"}},
+        )
+        framed = tmp_path / "framed"
+        framed.write_bytes(
+            remote_mux._frame_script(
+                node_scripts.script("provision"), _node_payload(scope, token=TOKEN)
+            )
+        )
+        with (
+            framed.open("rb") as stdin,
+            (tmp_path / "stderr").open("wb") as err,
+            subprocess.Popen(
+                **spawn, stdin=stdin, stdout=subprocess.PIPE, stderr=err
+            ) as proc,
+        ):
+            assert proc.stdout is not None
+            time.sleep(1.5)
+            proc.stdout.close()  # what a killed ssh leaves the node with
+            proc.wait(timeout=60)
+        stderr = (tmp_path / "stderr").read_bytes()
+        assert proc.returncode == 0, stderr
+        assert b"Traceback" not in stderr
+        assert TOKEN.encode("ascii") not in stderr
+        home = tmp_path / "node"
+        settings = json.loads((home / ".claude" / "settings.json").read_text("utf-8"))
+        assert settings["model"] == "opus"
+        claude_json = json.loads((home / ".claude.json").read_text("utf-8"))
+        assert "docs" in claude_json["mcpServers"]
+        hook = home / ".magent" / "bin" / "state-hook.sh"
+        assert hook.read_text(encoding="utf-8") == HOOK_TEXT
+        assert list((tmp_path / "tmp").iterdir()) == []
+
 
 @POSIX_BASH
 class TestProgramsShUnderRealBash:
@@ -1371,6 +2076,44 @@ class TestProgramsShUnderRealBash:
             ("skip", "no-such-program"),
         ]
         assert lines[0].detail == str(uvx)
+
+    # M2: `command -v` answers for a builtin, a keyword and a function too --
+    # including this script's own main -- none of which a server can exec. A
+    # relative path resolves against a cwd the server will not share.
+    def test_a_builtin_keyword_function_or_relative_path_is_no_program(self, tmp_path):
+        sysbin = _sysbin(tmp_path, ("bash",), python=False, name="progbin")
+        (tmp_path / "node").mkdir()
+        x = tmp_path / "node" / "x"
+        x.write_text("#!/bin/sh\n", encoding="utf-8")
+        x.chmod(0o755)
+        names = ("main", "cd", "if", "[[", "./x")
+        r = subprocess.run(
+            _bash_argv(*names),
+            input=remote_mux._frame_script(node_scripts.script("programs"), None),
+            capture_output=True,
+            cwd=tmp_path / "node",
+            env={"HOME": str(tmp_path / "node"), "PATH": str(sysbin)},
+            timeout=60,
+            check=False,
+        )
+        assert r.returncode == 0, r.stderr
+        lines = remote_mux.parse_report(r.stdout.decode("utf-8")).lines
+        assert [(line.status, line.item) for line in lines] == [
+            ("skip", name) for name in names
+        ]
+
+
+class TestProvisionShText:
+    def test_the_cleanup_trap_is_set_before_the_work_dir_exists(self):
+        text = node_scripts.script("provision")
+        assert text.index("trap cleanup EXIT") < text.index("WORK=$(mktemp -d)")
+
+    def test_tracing_is_off_before_the_library_or_the_token(self):
+        for name in ("provision", "programs"):
+            lines = node_scripts._read(name).splitlines()
+            at = lines.index("set -euo pipefail")
+            assert lines[at + 1 : at + 4].count("set +o xtrace") == 1, name
+            assert lines.index("set +o xtrace") < lines.index("# @include lib.sh")
 
 
 PC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKEPCKEY me@pc"
@@ -1949,6 +2692,23 @@ class TestSetupNode:
             )
         assert "root@devino-second" in info.value.command_redacted
 
+    def test_a_transport_failure_names_the_users_and_sizes_the_key(self, fake_ssh):
+        # M5: the rc-255 error shows the users setup was given and the key by
+        # its length alone, the way the call itself is logged.
+        fake_ssh.set_reply("bash -s", stderr="ssh: connect to host: No route\n", rc=255)
+        with pytest.raises(RemoteError) as info:
+            remote_mux.setup_node(
+                NODE, ["amin", "bob"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+            )
+        (call,) = fake_ssh.calls()
+        shown = info.value.command_redacted
+        assert shown[:-1] == ("ssh", *call.argv)
+        assert shown[-2] == _remote(
+            "bash", "-s", "--", remote_mux.SOCKET, "amin", "bob"
+        )
+        assert shown[-1] == f"<stdin: {len(call.stdin)} bytes>"
+        assert PC_KEY not in str(info.value)
+
     def test_the_default_timeout_grows_with_the_users(self, monkeypatch):
         # M5: every user is a login, an installer and a key.
         seen: list[float] = []
@@ -1986,13 +2746,16 @@ DOCTOR_ITEMS = (
 )
 
 
-# The four probes doctor.sh bounds with `timeout`, as (fake, argv match). A
-# hung one sleeps past every bound, and past the whole call's before the fix.
+# Probes doctor.sh bounds with `timeout`, as (fake, argv match): the four that
+# can stall, plus two of the five version reads. A hung one sleeps past every
+# bound, and past the whole call's before the fix.
 HUNG_PROBES = {
     "tmux": ("tmux", "list-sessions"),
     "claude": ("claude", "auth status"),
     "ssh": ("ssh", "git@github.com"),
     "df": ("df", "-Pk"),
+    "tmux-version": ("tmux", "-V"),
+    "git-version": ("git", "--version"),
 }
 HANG_S = 30.0
 
@@ -2008,11 +2771,16 @@ def _doctor_box(
     tmp_path: Path,
     *,
     tools: tuple[str, ...] = NODE_TOOLS,
+    base_tools: tuple[str, ...] = DOCTOR_TOOLS,
     logged_in: bool = True,
     github: str = HI,
     charmap: str = "UTF-8",
     avail_kb: int = 50 * GIB_KB,
     tmux_version: str = "tmux 3.4",
+    tmux_version_rc: int = 0,
+    sessions: str = "a: 1 windows\nb: 1 windows\n",
+    sessions_stderr: str = "",
+    sessions_rc: int = 0,
     hang: str | None = None,
     hang_ignores_term: bool = False,
 ) -> tuple[dict[str, FakeSsh], dict[str, str]]:
@@ -2025,10 +2793,6 @@ def _doctor_box(
         name, match = HUNG_PROBES[hang]
         fakes[name].set_reply(match, hang_s=HANG_S, ignore_term=hang_ignores_term)
     replies = {
-        "tmux": [
-            ("-V", tmux_version + "\n"),
-            ("list-sessions", "a: 1 windows\nb: 1 windows\n"),
-        ],
         "claude": [("auth status", json.dumps({"loggedIn": logged_in}) + "\n")],
         "locale": [("charmap", charmap + "\n")],
         "df": [("-Pk", _df(avail_kb))],
@@ -2036,10 +2800,15 @@ def _doctor_box(
     for name, fake in fakes.items():
         for match, stdout in replies.get(name, []):
             fake.set_reply(match, stdout=stdout)
+    if "tmux" in fakes:
+        fakes["tmux"].set_reply("-V", stdout=tmux_version + "\n", rc=tmux_version_rc)
+        fakes["tmux"].set_reply(
+            "list-sessions", stdout=sessions, stderr=sessions_stderr, rc=sessions_rc
+        )
     if "ssh" in fakes:
         fakes["ssh"].set_reply("git@github.com", stderr=github + "\n", rc=1)
     (tmp_path / "node" / "magent").mkdir(parents=True, exist_ok=True)
-    sysbin = _sysbin(tmp_path, DOCTOR_TOOLS, python=False, name="doctorbin")
+    sysbin = _sysbin(tmp_path, base_tools, python=False, name="doctorbin")
     env = {
         "HOME": str(tmp_path / "node"),
         "PATH": os.pathsep.join([*(str(f.base) for f in fakes.values()), str(sysbin)]),
@@ -2147,6 +2916,43 @@ class TestDoctorShUnderRealBash:
         if status == "fail":
             assert "3.2 or newer" in row.detail
 
+    def _tmux_row(self, env: dict[str, str]) -> ScriptLine:
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        (row,) = [line for line in _report(r).lines if line.item == "tmux"]
+        return row
+
+    def test_a_node_without_tmux_says_so(self, tmp_path):
+        # Not "cannot read the tmux version ()": a missing binary is named as
+        # missing, with the command that installs it.
+        tools = tuple(t for t in NODE_TOOLS if t != "tmux")
+        _, env = _doctor_box(tmp_path, tools=tools)
+        row = self._tmux_row(env)
+        assert (row.status, row.detail) == (
+            "fail",
+            "tmux is not on PATH -- run: magent node setup",
+        )
+
+    def test_a_failing_tmux_v_is_not_believed(self, tmp_path):
+        # A version printed by a `tmux -V` that then exits non-zero is not
+        # graded: the binary is broken, whatever it claimed to be.
+        _, env = _doctor_box(tmp_path, tmux_version="tmux 3.4", tmux_version_rc=1)
+        row = self._tmux_row(env)
+        assert (row.status, row.detail) == (
+            "fail",
+            "cannot read the tmux version (); magent needs tmux 3.2 or newer",
+        )
+
+    def test_only_the_first_line_of_tmux_v_is_the_version(self, tmp_path):
+        # A second line kept in the detail would split the row, and leave
+        # stdout carrying a line that is no row at all.
+        _, env = _doctor_box(tmp_path, tmux_version="tmux 3.4\nwarning: odd locale")
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        assert len(r.stdout.splitlines()) == len(_report(r).lines)
+        (row,) = [line for line in _report(r).lines if line.item == "tmux"]
+        assert (row.status, row.detail) == ("ok", "tmux 3.4")
+
     def test_a_missing_tool_fails_but_a_missing_gh_only_warns(self, tmp_path):
         tools = tuple(t for t in NODE_TOOLS if t not in ("git", "gh"))
         _, env = _doctor_box(tmp_path, tools=tools)
@@ -2183,6 +2989,49 @@ class TestDoctorShUnderRealBash:
         assert last in row.detail
         assert "refused" not in row.detail
         assert "magent node setup" not in row.detail
+
+    def test_a_silent_github_failure_says_no_output(self, tmp_path):
+        # ssh exits non-zero having printed nothing: the row still says so,
+        # rather than quoting an empty last line.
+        _, env = _doctor_box(tmp_path, github="")
+        (row,) = [
+            ln for ln in _report(_run_doctor(env)).lines if ln.item == "github-key"
+        ]
+        assert (row.status, row.detail) == (
+            "fail",
+            "could not reach GitHub over ssh (no output)",
+        )
+
+    def test_no_tmux_server_is_zero_sessions(self, tmp_path):
+        # No server on the socket yet (tmux exits 1, says so on stderr) is a
+        # healthy node with nothing running, not one session.
+        _, env = _doctor_box(
+            tmp_path,
+            sessions="",
+            sessions_stderr="no server running on /tmp/tmux-1000/magent\n",
+            sessions_rc=1,
+        )
+        (row,) = [ln for ln in _report(_run_doctor(env)).lines if ln.item == "sessions"]
+        assert (row.status, row.detail) == (
+            "ok",
+            f"0 on tmux socket {remote_mux.SOCKET}",
+        )
+
+    def test_a_node_without_timeout_says_so_and_probes_nothing(self, tmp_path):
+        # Every probe runs under coreutils' `timeout`: without it each would
+        # exit 127 and read as its own wrong finding ("not logged in").
+        base = tuple(t for t in DOCTOR_TOOLS if t != "timeout")
+        fakes, env = _doctor_box(tmp_path, base_tools=base)
+        r = _run_doctor(env)
+        assert r.returncode == 0, r.stderr
+        assert _report(r).lines == (
+            ScriptLine(
+                "fail",
+                "doctor",
+                "timeout is not on PATH -- every probe runs under it; install coreutils on this node",
+            ),
+        )
+        assert not [c for f in fakes.values() for c in f.calls()]
 
     def test_a_node_without_ssh_says_so(self, tmp_path):
         tools = tuple(t for t in NODE_TOOLS if t != "ssh")
@@ -2366,6 +3215,8 @@ class TestDoctorShUnderRealBash:
             ),
             ("ssh", "github-key", "fail", 12, "ssh to github.com timed out after 12s"),
             ("df", "disk", "warn", 4, "df did not answer in 4s under ~/magent"),
+            ("tmux-version", "tmux", "fail", 4, "tmux -V timed out after 4s"),
+            ("git-version", "git", "fail", 4, "git --version timed out after 4s"),
         ],
     )
     def test_a_hung_probe_is_its_own_row_inside_the_budget(
@@ -2400,23 +3251,42 @@ class TestDoctorShUnderRealBash:
 
 
 def test_doctor_inlines_the_tmux_floor():
-    # One predicate for setup, doctor and (by DECISION-22) bring_up's floor.
-    assert "magent_tmux_verdict()" in node_scripts.script("doctor")
+    # One predicate for setup, doctor and (by DECISION-22) bring_up's floor:
+    # doctor reads `tmux -V` under its own bound and grades it with the floor's.
+    text = node_scripts.script("doctor")
+    assert "magent_tmux_grade()" in text
+    assert 'verdict=$(magent_tmux_grade "$out")' in text
 
 
 def test_the_probe_bounds_fit_inside_the_doctor_call():
-    # Every bounded probe hanging at once, each killed after its grace, still
-    # leaves the report time to come back over ssh (connect included).
+    # Every bounded call hanging at once, each killed after its grace, still
+    # leaves the report time to come back over ssh (connect included). Counted
+    # per call, not per constant: VERSION_PROBE_S bounds five reads, and
+    # check_tool's one call site runs once per tool.
     text = node_scripts.script("doctor")
-    bounds = dict(re.findall(r"^([A-Z]+_PROBE_S)=(\d+)$", text, re.MULTILINE))
-    assert set(bounds) == {
-        "CLAUDE_PROBE_S",
-        "GITHUB_PROBE_S",
-        "TMUX_PROBE_S",
-        "DF_PROBE_S",
+    code = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    bounds = {
+        name: int(value)
+        for name, value in re.findall(r"^([A-Z]+_PROBE_S)=(\d+)\b", text, re.MULTILINE)
     }
-    (grace,) = re.findall(r"^PROBE_KILL_S=(\d+)\b", text, re.MULTILINE)
-    worst = sum(int(b) + int(grace) for b in bounds.values())
+    (grace,) = (
+        int(g) for g in re.findall(r"^PROBE_KILL_S=(\d+)\b", text, re.MULTILINE)
+    )
+    # No inline limit anywhere: `timeout` runs (in command position) only
+    # inside bounded(), and every bounded call names one of the constants.
+    runs = re.findall(r"(?:^|[;&|(])\s*timeout\b(.*)", code, re.MULTILINE)
+    assert runs == [' -k "$PROBE_KILL_S" "$seconds" "$@"']
+    sites = re.findall(r"\bbounded (\S+)", code)
+    assert all(re.fullmatch(r'"\$[A-Z]+_PROBE_S"', site) for site in sites), sites
+    uses = [site.strip('"$') for site in sites]
+    tools = re.findall(r"^  check_tool \S+ (?:fail|warn) ", text, re.MULTILINE)
+    assert len(tools) == 4
+    assert code.count('bounded "$VERSION_PROBE_S" "$@"') == 1  # check_tool's
+    uses += ["VERSION_PROBE_S"] * (len(tools) - 1)
+    assert set(uses) == set(bounds)
+    worst = sum(bounds[name] + grace for name in uses)
     assert worst + remote_mux.CONNECT_TIMEOUT_S < remote_mux.DOCTOR_TIMEOUT_S
 
 
@@ -2560,3 +3430,23 @@ class TestDoctorCall:
         assert exc.value.command_redacted[0] == "ssh"
         assert NODE.target in exc.value.command_redacted
         assert "No route" in exc.value.stderr_tail
+
+    def test_a_transport_failure_names_the_call_that_ran(self, fake_ssh):
+        # M5: the rc-255 error shows doctor's argv, as the timeout path does.
+        fake_ssh.set_reply("bash -s", stderr="ssh: connect to host: No route\n", rc=255)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.doctor(NODE, timeout_s=remote_mux.DOCTOR_TIMEOUT_S)
+        (call,) = fake_ssh.calls()
+        shown = exc.value.command_redacted
+        assert shown[:-1] == ("ssh", *call.argv)
+        assert shown[-2] == _remote(
+            "bash",
+            "-s",
+            "--",
+            remote_mux.SOCKET,
+            "--root",
+            NODE.root,
+            "--target",
+            NODE.target,
+        )
+        assert shown[-1] == f"<stdin: {len(call.stdin)} bytes>"

@@ -13,13 +13,20 @@ magent_tmux_floor() {
 
 # One line, "<ok|old|unread|missing>\t<first line of tmux -V>". Never fails.
 magent_tmux_verdict() {
-  local version major minor
+  local version
   if ! command -v tmux >/dev/null 2>&1; then
     printf 'missing\t\n'
     return 0
   fi
   version=$(tmux -V 2>/dev/null) || version=""
-  version=${version%%$'\n'*}
+  magent_tmux_grade "$version"
+}
+
+# magent_tmux_grade <tmux -V output>: the verdict for a version already read
+# ("<ok|old|unread>\t<its first line>"). doctor.sh reads `tmux -V` under its
+# own time limit and grades it here, by the same predicate.
+magent_tmux_grade() {
+  local version=${1%%$'\n'*} major minor
   if ! [[ $version =~ ([0-9]+)\.([0-9]+) ]]; then
     printf 'unread\t%s\n' "$version"
     return 0
