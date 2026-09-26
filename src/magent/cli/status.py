@@ -589,8 +589,10 @@ def _echo_attach_host_hint(
         click.echo(
             f"  {style('-', dim=True)} "
             + style(
-                f"Stopped here: this PC placed node sessions. For the"
-                f" sessions on {last}: magent down --host {last}",
+                # Never "Stopped": this line follows the report whatever it
+                # said, survivors and "nothing to stop" included.
+                f"Acted here, not on {last} (this PC placed node sessions)."
+                f" For the sessions on {last}: magent down --host {last}",
                 dim=True,
             )
         )

@@ -1715,6 +1715,37 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         assert len(hints) == 1, out.output
         assert "magent down --host me@host" in hints[0]
 
+    @pytest.mark.parametrize(
+        ("answer", "report"),
+        [
+            (None, "1 session(s) would NOT stop: api"),
+            (False, "No running sessions to stop."),
+        ],
+        ids=["unreachable", "already-gone"],
+    )
+    def test_the_hint_never_claims_a_stop_the_report_did_not(
+        self, runner, tmp_config, monkeypatch, tmp_path, answer, report
+    ):
+        # The hint follows the report whatever it said: after a survivor or
+        # "nothing to stop", a hint reading "Stopped" would be the very
+        # contradiction the folded report exists to remove.
+        self._hold("api")
+        out, _killed, _dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            answers={"api": answer},
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        lines = self._session_lines(out)
+        assert report in lines
+        assert "magent down --host me@host" in lines
+        assert "Stopped" not in lines
+
     def test_a_placement_with_no_remembered_host_prints_no_hint(
         self, runner, tmp_config, monkeypatch, tmp_path
     ):
