@@ -675,12 +675,14 @@ class TestAnUnreadableMapPlacesNoAutoProject:
         placed = launch.place_node_projects(config, config.projects, now=NOW)
 
         assert placed.projects == []
-        assert placed.notes == [
+        # A failure of that project, not an advisory note.
+        assert placed.refused == [
             (
                 f"api: the node map is unreadable ({cls}), so where this auto"
                 " project runs is unknown; not brought up"
             )
         ]
+        assert placed.notes == []
         # D17: the node is None, not a guess.
         assert placed.placements["api"].nick is None
         # Nothing will be placed, so no node is dialed to be scored.
@@ -692,7 +694,7 @@ class TestAnUnreadableMapPlacesNoAutoProject:
         config = pool("second", projects=[_auto("api")])
         unreadable_map()
 
-        (note,) = launch.place_node_projects(config, config.projects, now=NOW).notes
+        (note,) = launch.place_node_projects(config, config.projects, now=NOW).refused
 
         assert "torn" not in note
         assert "cannot access" not in note
@@ -715,7 +717,7 @@ class TestAnUnreadableMapPlacesNoAutoProject:
         assert placed.projects[0] is local
         assert placed.projects[1] is pinned
         assert sorted(placed.placements) == ["api", "db"]
-        assert [n.split(":")[0] for n in placed.notes] == ["api", "db"]
+        assert [n.split(":")[0] for n in placed.refused] == ["api", "db"]
 
     def test_the_placer_writes_nothing_from_a_failed_read(
         self, remote_samples, unreadable_map
@@ -756,3 +758,25 @@ class TestAnUnreadableMapPlacesNoAutoProject:
         assert seen == [local]
         out = capsys.readouterr().out
         assert f"api: the node map is unreadable ({cls})" in out
+
+    def test_under_go_the_refusal_is_a_red_x_not_a_yellow_note(
+        self, fake_platform, monkeypatch, capsys, unreadable_map
+    ):
+        # The same red "x" as up's node failures: the project did not come up.
+        monkeypatch.setattr(
+            launch, "style", lambda text, **kw: f"<{kw.get('fg', '')}>{text}"
+        )
+        monkeypatch.setattr(
+            launch,
+            "_launch_projects",
+            lambda *a: (_ for _ in ()).throw(_StopBeforeLaunch()),
+        )
+        nodes.update_node_map("api", entry("third"))
+        config = pool("second", "third", projects=[_auto("api")])
+        unreadable_map()
+
+        with pytest.raises(_StopBeforeLaunch):
+            launch.run_magent(config, RunOpts(dry_run=True))
+
+        (line,) = [ln for ln in capsys.readouterr().out.splitlines() if "api:" in ln]
+        assert line.lstrip().startswith("<red>x api: the node map is unreadable")

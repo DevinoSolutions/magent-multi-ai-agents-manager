@@ -457,6 +457,9 @@ def plan_cmd(ctx: click.Context, project: str | None, all_projects: bool) -> Non
     )
     for note in placed.notes:
         _note(note)
+    for line in placed.refused:
+        # A launch would fail these (red x), so plan says so the same way.
+        click.echo(f"  {style('x', fg='red')} {line}")
     for proj in chosen:
         name = nodes.project_name(proj)
         click.echo()

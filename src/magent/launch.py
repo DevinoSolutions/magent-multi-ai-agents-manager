@@ -733,6 +733,8 @@ def run_magent(config: MagentConfig, opts: RunOpts) -> int:
     )
     for note in placements.notes:
         click.echo(f"  {style('!', fg='yellow')} {style(note, dim=True)}")
+    for line in placements.refused:
+        click.echo(f"  {style('x', fg='red')} {line}")
     projects = placements.projects
 
     base_dir = config.base_dir
@@ -823,11 +825,14 @@ class NodePlacements:
     """What the placement phase hands the launch phase (spec §11): the
     projects with every ``"auto"`` replaced by a concrete nick (an unplaceable
     one is dropped), the lines to print, and each auto project's Placement --
-    `magent node plan` renders these same objects."""
+    `magent node plan` renders these same objects. ``notes`` are advisories;
+    ``refused`` are failures -- an auto project not brought up because where
+    it runs is unknown -- printed as a red ``x`` like ``up``'s."""
 
     projects: list[ProjectConfig]
     notes: list[str]
     placements: dict[str, NodePlacement]
+    refused: list[str] = dataclasses.field(default_factory=list)
 
 
 def _kept(
@@ -908,8 +913,8 @@ def place_node_projects(
     (DECISION-15; ``cloud`` is pin-only) pass through untouched.
 
     The map is read strictly (``_node_map_for_placement``). Unreadable, NO
-    ``auto`` project is placed: each is dropped with the map's refusal and a
-    ``"unknown"`` Placement (D17: its node is None), nothing is sampled, and
+    ``auto`` project is placed: each is dropped with the map's refusal (in
+    ``refused``, a failure) and a ``"unknown"`` Placement (D17: its node is None), nothing is sampled, and
     the rest of the fleet goes on.
     """
     from magent import nodes
@@ -927,11 +932,12 @@ def place_node_projects(
         )
         return NodePlacements(
             [p for p in projects if p.node != NODE_AUTO],
-            [
+            [],
+            {nodes.project_name(p): nodes.Placement(None, "unknown") for p in auto},
+            refused=[
                 f"{nodes.project_name(p)}: {_map_unreadable_text(unreadable)}"
                 for p in auto
             ],
-            {nodes.project_name(p): nodes.Placement(None, "unknown") for p in auto},
         )
     when = time.time() if now is None else now
     samples: dict[str, list[LoadSample]] = {}

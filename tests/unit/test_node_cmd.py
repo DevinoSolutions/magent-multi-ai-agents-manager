@@ -486,7 +486,8 @@ class TestNodePlan:
         assert result.exit_code == 0
         assert "api  auto -> (node unknown)" in result.stdout
         assert "@second" not in result.stdout
-        assert "node map is unreadable" in result.stdout
+        # The refusal a launch would print, as the same failure line.
+        assert "x api: the node map is unreadable" in result.stdout
 
     def test_plan_for_an_unknown_project_exits_2(self, runner, tmp_config, api_dir):
         cfg = tmp_config(config_json(("second",), [_project(api_dir, "auto")]))
