@@ -2722,6 +2722,34 @@ def _rows(result: subprocess.CompletedProcess[bytes]) -> dict[str, str]:
     return {line.item: line.status for line in report.lines}
 
 
+def _with_members(payload: bytes, *extra: tarfile.TarInfo) -> bytes:
+    """``payload`` re-packed with ``extra`` appended -- members build_payload
+    itself never writes (it refuses such a path), as a hostile or broken PC
+    could send. A regular-file member carries its own name as its bytes."""
+    head, _, body = payload.partition(b"\n")
+    out = io.BytesIO()
+    with (
+        tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as old,
+        tarfile.open(fileobj=out, mode="w:gz") as new,
+    ):
+        for info in old.getmembers():
+            new.addfile(info, old.extractfile(info))
+        for info in extra:
+            data = info.name.encode("utf-8") if info.isfile() else b""
+            info.size = len(data)
+            new.addfile(info, io.BytesIO(data))
+    return head + b"\n" + out.getvalue()
+
+
+def _member(name: str, *, link: str | None = None) -> tarfile.TarInfo:
+    info = tarfile.TarInfo(name)
+    info.mode = 0o600
+    if link is not None:
+        info.type = tarfile.SYMTYPE
+        info.linkname = link
+    return info
+
+
 @POSIX_BASH
 class TestProvisionShUnderRealBash:
     def test_an_empty_pc_provisions_with_no_tool_on_the_node(self, tmp_path):
@@ -2794,6 +2822,48 @@ class TestProvisionShUnderRealBash:
     def test_the_private_work_dir_is_gone_afterwards(self, tmp_path):
         _run_provision(tmp_path, _node_payload())
         assert list((tmp_path / "tmp").iterdir()) == []
+
+    # The receiver's own guard on the skills it unpacks (tri-F ruling 5):
+    # build_payload refuses such a path, but the node cannot assume the
+    # payload was built by it.
+    def test_a_member_that_climbs_out_of_the_work_dir_is_never_unpacked(self, tmp_path):
+        # GNU tar refuses a ".." member by default and exits non-zero, so the
+        # whole payload fails before the applier runs.
+        payload = _with_members(_node_payload(), _member("skills/../../escape.txt"))
+        r = _run_provision(tmp_path, payload)
+        assert r.returncode == 1
+        assert _rows(r) == {"payload": "fail"}
+        assert not list(tmp_path.rglob("escape.txt"))
+
+    def test_a_link_member_in_skills_is_never_read_through(self, tmp_path):
+        # tar does extract a lone link member; the applier refuses it, so the
+        # node's own file is never copied into ~/.claude/skills.
+        node = tmp_path / "node"
+        node.mkdir()
+        (node / "decoy.txt").write_bytes(b"NODE-PRIVATE\n")
+        scope = _scope(
+            skills=(nodes.SkillFile(path="s/SKILL.md", data=b"# s", executable=False),)
+        )
+        payload = _with_members(
+            _node_payload(scope),
+            _member("skills/s/leak.md", link=str(node / "decoy.txt")),
+        )
+        r = _run_provision(tmp_path, payload)
+        assert r.returncode == 1
+        assert _rows(r)["skills"] == "fail"
+        assert "the payload's skills/s/leak.md is a link" in r.stdout.decode("utf-8")
+        assert not (node / ".claude" / "skills").exists()
+        assert (node / "decoy.txt").read_bytes() == b"NODE-PRIVATE\n"
+
+    def test_a_skills_root_that_is_a_link_is_never_walked(self, tmp_path):
+        private = tmp_path / "node" / "private"
+        private.mkdir(parents=True)
+        (private / "secret.md").write_bytes(b"NODE-PRIVATE\n")
+        payload = _with_members(_node_payload(), _member("skills", link=str(private)))
+        r = _run_provision(tmp_path, payload)
+        assert r.returncode == 1
+        assert _rows(r)["skills"] == "fail"
+        assert not (tmp_path / "node" / ".claude" / "skills").exists()
 
     def test_no_python3_is_one_fail_row_naming_the_repair(self, tmp_path):
         r = _run_provision(tmp_path, _node_payload(), python=False)

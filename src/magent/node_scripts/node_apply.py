@@ -962,6 +962,23 @@ def _link_on_the_way(dest_root: Path, dest: Path) -> Path | None:
     return None
 
 
+def _not_plain(root: Path) -> str | None:
+    """The payload name of the first entry under the unpacked ``skills/`` --
+    ``root`` itself included -- that is a link or anything but a folder or a
+    regular file; None when there is none. build_payload ships regular files
+    only, and provision.sh's tar refuses a member that climbs out with
+    ``..``. But tar extracts a link member as a link, and ``is_file`` would
+    read the node's own file through it into ~/.claude/skills."""
+    if root.is_symlink():
+        return "skills"
+    if not root.is_dir():
+        return None
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink() or not (path.is_dir() or path.is_file()):
+            return "skills/" + path.relative_to(root).as_posix()
+    return None
+
+
 def _step_skills(ctx: Ctx) -> None:
     """This PC's ~/.claude/skills files onto the node's, exec bit kept. One
     way, like settings: a skill removed on the PC stays here. Each file goes
@@ -969,8 +986,20 @@ def _step_skills(ctx: Ctx) -> None:
     never written through. A symlinked DIRECTORY is refused instead -- a
     write below it would land outside ~/.claude/skills: ~/.claude/skills
     itself a link leaves the whole step alone, and a link anywhere inside a
-    skill leaves that whole skill alone. Either is a warn naming the link."""
+    skill leaves that whole skill alone. Either is a warn naming the link.
+
+    The payload side is checked too (``_not_plain``): a link or special file
+    in the unpacked ``skills/`` fails the step and applies nothing."""
     root = ctx.work / "skills"
+    odd = _not_plain(root)
+    if odd is not None:
+        _row(
+            ctx,
+            "fail",
+            "skills",
+            f"the payload's {odd} is a link or special file; nothing applied",
+        )
+        return
     files = sorted(p for p in root.rglob("*") if p.is_file()) if root.is_dir() else []
     if not files:
         _row(ctx, "skip", "skills", "this PC has no skills to share")

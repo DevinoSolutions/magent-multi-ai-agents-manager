@@ -1243,6 +1243,51 @@ class TestTheSkills:
         box.apply(work)
         assert _status(_lines(capsys), "skills") == "warn"
 
+    # The PAYLOAD side (tri-F ruling 5): provision.sh's tar extracts a link
+    # member as a link, and ``is_file`` reads through it -- so a link in the
+    # unpacked skills/ would copy the node's own file into ~/.claude/skills.
+    @pytest.mark.skipif(not POSIX, reason="POSIX symlinks")
+    def test_a_link_in_the_payloads_skills_fails_and_applies_nothing(
+        self, box, tmp_path, capsys
+    ):
+        decoy = box.home / "decoy.txt"
+        decoy.write_bytes(b"NODE-PRIVATE\n")
+        work = _work(tmp_path, replace(EMPTY, skills=(SKILL, RUNNER)))
+        (work / "skills" / "deploy" / "leak.md").symlink_to(decoy)
+        assert box.apply(work) == 1
+        (line,) = [line for line in _lines(capsys) if line.item == "skills"]
+        assert (line.status, line.detail) == (
+            "fail",
+            (
+                "the payload's skills/deploy/leak.md is a link or special file; "
+                "nothing applied"
+            ),
+        )
+        assert not _skills(box).exists()
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX symlinks")
+    def test_a_payload_skills_dir_that_is_a_link_is_never_walked(
+        self, box, tmp_path, capsys
+    ):
+        private = box.home / "private"
+        private.mkdir()
+        (private / "secret.md").write_bytes(b"NODE-PRIVATE\n")
+        work = _work(tmp_path)
+        (work / "skills").symlink_to(private)
+        assert box.apply(work) == 1
+        (line,) = [line for line in _lines(capsys) if line.item == "skills"]
+        assert line.status == "fail"
+        assert line.detail.startswith("the payload's skills is a link")
+        assert not _skills(box).exists()
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs")
+    def test_a_special_file_in_the_payloads_skills_fails(self, box, tmp_path, capsys):
+        work = _work(tmp_path, replace(EMPTY, skills=(SKILL,)))
+        os.mkfifo(work / "skills" / "deploy" / "pipe")
+        assert box.apply(work) == 1
+        assert _status(_lines(capsys), "skills") == "fail"
+        assert not _skills(box).exists()
+
 
 def _claude(
     box: Box,
