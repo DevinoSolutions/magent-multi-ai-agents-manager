@@ -3051,13 +3051,17 @@ class TestRecallSaysUnknownNeverAbsentOrATraceback:
             with pytest.raises(ValueError) as torn:
                 nodes.load_node_map_strict()
             return type(torn.value).__name__, str(torn.value)
-        busy_error = PermissionError(13, "the file is in use by another process")
+        error = {
+            "busy": PermissionError(13, "the file is in use by another process"),
+            # Any other OSError: there, not busy -- a re-run meets it again.
+            "io-error": OSError(5, "Input/output error"),
+        }[damage]
 
-        def _busy() -> dict[str, nodes.NodeMapEntry]:
-            raise busy_error
+        def _unreadable() -> dict[str, nodes.NodeMapEntry]:
+            raise error
 
-        monkeypatch.setattr(nodes, "load_node_map_strict", _busy)
-        return "PermissionError", str(busy_error)
+        monkeypatch.setattr(nodes, "load_node_map_strict", _unreadable)
+        return type(error).__name__, str(error)
 
     @pytest.mark.parametrize("damage", ["busy", "torn"])
     def test_a_map_unreadable_at_the_clear_is_a_printed_failure(
@@ -3096,7 +3100,7 @@ class TestRecallSaysUnknownNeverAbsentOrATraceback:
             assert "move it aside" not in result.output
         assert "delete" not in result.output.lower()
 
-    @pytest.mark.parametrize("damage", ["busy", "torn"])
+    @pytest.mark.parametrize("damage", ["busy", "torn", "io-error"])
     def test_an_unreadable_map_at_the_start_names_the_class_only(
         self, runner, placed_api, node_answers, monkeypatch, caplog, damage
     ):
@@ -3110,7 +3114,7 @@ class TestRecallSaysUnknownNeverAbsentOrATraceback:
         assert detail not in result.output
         assert any(detail in m for m in _node_logs(caplog)), _node_logs(caplog)
 
-    @pytest.mark.parametrize("damage", ["busy", "torn"])
+    @pytest.mark.parametrize("damage", ["busy", "torn", "io-error"])
     def test_an_unreadable_map_at_the_start_names_its_repair_busy_a_rerun(
         self, runner, placed_api, node_answers, monkeypatch, damage
     ):
@@ -3119,14 +3123,15 @@ class TestRecallSaysUnknownNeverAbsentOrATraceback:
         result = _recall(runner, placed_api, "--local")
 
         assert result.exit_code == 1, result.output
-        if damage == "torn":
-            assert f"x {_map_fix_line(cls)}" in result.stderr
-        else:
+        rerun = f"could not read the node map ({cls}); run the recall again"
+        if damage == "busy":
             # Busy past the reader's retries: another process holds it.
-            assert f"could not read the node map ({cls}); run the recall again" in (
-                result.stderr
-            )
+            assert rerun in result.stderr
             assert "move it aside" not in result.output
+        else:
+            # Torn, or any OSError but busy: a re-run alone meets it again.
+            assert f"x {_map_fix_line(cls)}" in result.stderr
+            assert rerun not in result.output
         assert "delete" not in result.output.lower()
         assert node_answers == []
 
