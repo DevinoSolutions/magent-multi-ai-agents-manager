@@ -990,8 +990,8 @@ class TestANodeFailsAlone:
     def test_a_missing_ssh_client_fails_every_node_without_raising(self, placed):
         results = node_sync.NodeSyncer(_config()).tick()
         assert results == {
-            "second": (node_sync.FAILED, "ssh client not found on PATH"),
-            "third": (node_sync.FAILED, "ssh client not found on PATH"),
+            "second": (node_sync.FAILED, "no ssh client found"),
+            "third": (node_sync.FAILED, "no ssh client found"),
         }
 
     def test_a_node_that_would_run_as_root_is_misconfigured_and_never_dialled(

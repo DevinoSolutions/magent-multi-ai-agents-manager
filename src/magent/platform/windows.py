@@ -79,6 +79,10 @@ _NUDGE_SETTLE_S = 0.15
 # caller then leaves every window alone.
 _PROC_SCAN_TIMEOUT_S = 10.0
 
+# Characters that make `cmd /k` quote-strip or re-parse an argv[0]; an ssh
+# client path carrying one is handed to cmd as its bare name instead.
+_CMD_METACHARS = frozenset(' &()^%!"')
+
 # --- Session-0 desktop hand-off (see run_on_desktop) --------------------------
 # Scratch root for one per-call directory holding the launcher script and its
 # result files. Under the system temp dir rather than ~/.magent because the
@@ -628,7 +632,15 @@ class WindowsPlatform(Platform):
             # cmd mangles (the inner quotes leak to the remote shell).
             # argv[0] by attach_client's rule, so this pane dials the same
             # client (and agent) as the attach panes and the node calls.
-            args.extend(["--", "cmd", "/k", ssh_program(), "-t", opts.ssh_host, remote])
+            client = ssh_program()
+            # `cmd /k` strips the first and last quote of a line that starts
+            # with one, so a client path that needs quoting (C:\Program Files)
+            # would eat the remote command's closing quote, and one carrying
+            # `&` or `^` is re-parsed by cmd. Only the PATH fallback yields
+            # such a path, and the bare name finds it again.
+            if any(c in _CMD_METACHARS for c in client):
+                client = "ssh"
+            args.extend(["--", "cmd", "/k", client, "-t", opts.ssh_host, remote])
         else:
             args.extend(["--", "cmd", "/k", opts.command])
 

@@ -395,7 +395,10 @@ class TestSupervise:
         monkeypatch.setattr(attach_client.shutil, "which", lambda _n: None)
         rc = attach_client.supervise("user@host", "psmux -L api attach", "api")
         assert rc == attach_client.SSH_MISSING_RC
-        assert "ssh is not on PATH" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        # The rule looks past PATH (Windows' own OpenSSH first).
+        assert "no ssh client found -- cannot attach" in out
+        assert "PATH" not in out
 
     def test_a_missing_ssh_binary_mid_loop_does_not_traceback(self, monkeypatch):
         # _run_ssh translates FileNotFoundError into an exit code so the pane
@@ -1321,3 +1324,29 @@ class TestOneSshClientForTheProbeAndThePane:
         )
         assert rc == 0
         assert [argv[0] for argv in dialled] == [client]
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="GetSystemDirectoryW is win32")
+    def test_a_failed_system_directory_probe_reads_as_none(self, monkeypatch):
+        import ctypes
+
+        monkeypatch.setattr(
+            ctypes.windll.kernel32, "GetSystemDirectoryW", lambda _buf, _n: 0
+        )
+        assert real_system_directory() is None
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="GetSystemDirectoryW is win32")
+    @pytest.mark.parametrize("needed", [260, 300])
+    def test_a_system_directory_too_long_for_the_buffer_reads_as_none(
+        self, monkeypatch, needed
+    ):
+        # Too small a buffer is answered with the size it NEEDS (terminator
+        # included), and what the buffer holds then is undefined -- a partial
+        # path, never one to build ssh.exe's location from.
+        import ctypes
+
+        def partial(buf, _n):
+            buf.value = r"C:\Windo"
+            return needed
+
+        monkeypatch.setattr(ctypes.windll.kernel32, "GetSystemDirectoryW", partial)
+        assert real_system_directory() is None

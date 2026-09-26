@@ -201,7 +201,7 @@ def _client(shown: tuple[str, ...]) -> str:
     or RemoteError rc 127. The only way an ssh argv gets its argv[0]."""
     exe = find_ssh()
     if exe is None:
-        raise RemoteError(SSH_MISSING_RC, "ssh client not found on PATH", shown)
+        raise RemoteError(SSH_MISSING_RC, "no ssh client found", shown)
     return exe
 
 
