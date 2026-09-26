@@ -728,12 +728,27 @@ def run_sync_loop(
     return 0
 
 
+def _unfinished(snap: remote_mux.NodeSnapshot, sid: str) -> str | None:
+    """Why ``snap`` left part of ``sid`` on the node, or None when it did not:
+    a file that could not be stored here, or files the reply had no room for
+    (still owed). Files the node skipped as over the cap or could not read
+    are not counted -- they would be left behind on every pull."""
+    if sid in snap.failed_sids:
+        return f"a file of session {sid!r} could not be stored on this PC"
+    owed = snap.truncated.get(sid, ())
+    if owed:
+        return (
+            f"{len(owed)} file(s) did not fit in the reply; they are still on the node"
+        )
+    return None
+
+
 def _pull_sid(
     node: Node, entry: NodeMapEntry, mark: Mark | None
-) -> tuple[Mark, list[Path], bool]:
-    """One pull of one session: its next mark, the files that landed, and
-    whether a second pull is needed because the transcript dir only became
-    known with this answer."""
+) -> tuple[Mark, list[Path], bool, str | None]:
+    """One pull of one session: its next mark, the files that landed, whether
+    a second pull is needed because the transcript dir only became known with
+    this answer, and why the pull left something on the node (``_unfinished``)."""
     spec = _spec_for(entry, mark)
     snap = _pull_node(node, {entry.sid: spec})
     new = _next_mark(spec, mark, snap, entry.sid)
@@ -742,7 +757,7 @@ def _pull_sid(
     again = new.realpath is not None and spec.project_dir != nodes.encoded_project_dir(
         new.realpath
     )
-    return new, list(snap.files), again
+    return new, list(snap.files), again, _unfinished(snap, entry.sid)
 
 
 def final_pull(
@@ -760,7 +775,13 @@ def final_pull(
 
     An entry the daemon's tick would skip (a sid this PC cannot store, an
     empty remote root) is refused as RemoteError(0) before any ssh, so the
-    caller never sees parse_pull's ValueError."""
+    caller never sees parse_pull's ValueError.
+
+    A pull the node answered but that left part of the session behind -- a
+    file that could not be stored here, or files the reply had no room for --
+    is RemoteError(0) too, after the watermark is saved (cq-G14 I1): a caller
+    that clears the placement after this call would otherwise never pull the
+    rest. What did land stays in the mirror."""
     entry = nodes.read_node_map().get(name)
     if entry is None:
         return None
@@ -777,10 +798,15 @@ def final_pull(
         )
     with node_lock(entry.nick, wait_s=wait_s):
         marks = _read_marks(entry.nick)
-        mark, files, again = _pull_sid(node, entry, marks.get(entry.sid))
+        mark, files, again, unfinished = _pull_sid(node, entry, marks.get(entry.sid))
         if again:
-            mark, more, _ = _pull_sid(node, entry, mark)
+            mark, more, _, later = _pull_sid(node, entry, mark)
             files += more
+            unfinished = unfinished or later
         marks[entry.sid] = mark
         _write_marks(entry.nick, marks)
+    if unfinished is not None:
+        raise remote_mux.RemoteError(
+            0, f"the pull did not finish: {unfinished}", ("pull.sh",)
+        )
     return remote_mux.PullResult(files=tuple(files), since=mark.since)

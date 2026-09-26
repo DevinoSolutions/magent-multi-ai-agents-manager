@@ -475,23 +475,40 @@ def _source_node(cfg: MagentConfig, held: NodeMapEntry) -> Node | None:
         return None
 
 
+_RERUN = "nothing was stopped or cleared -- run the recall again"
+
+
 def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
     """Step 1: one last pull, through node_sync's per-node lock -- the lock the
     daemon's tick holds -- so it never races a running daemon (DECISION-26
-    xi). False when the node is gone. A daemon that keeps the node past the
-    wait stops the recall here, before anything is stopped or cleared."""
+    xi). False when the node is gone or cannot be pulled from.
+
+    The placement is cleared after this, and a cleared placement is never
+    pulled again, so a pull that can be retried stops the recall here, before
+    anything is stopped or cleared (cq-G14 I1): a daemon that keeps the node
+    past the wait, a node that answered with an error or left files behind,
+    and a placement the pull could not read again. Only a node that did not
+    answer at all, or one the config cannot pull from, goes on with what was
+    already pulled -- the plan's "never fatal" rule, which no re-run helps."""
     from magent import (  # heavy subsystem: in-body per policy
         node_sync,
         nodes,
         remote_mux,
     )
 
+    if not held.remote_root:
+        # final_pull refuses this entry before any ssh with rc 0 -- the rc of a
+        # node's bad answer -- but no re-run can fix it: it is a note.
+        _note(
+            f"@{held.nick} cannot be pulled from (the node map has no remote"
+            f" root for {held.sid}); going on with what was already pulled"
+        )
+        return False
     try:
-        node_sync.final_pull(cfg, name, local_user=env.local_username())
+        pulled = node_sync.final_pull(cfg, name, local_user=env.local_username())
     except LockHeld:
         _fail(
-            f"the node-sync daemon is still pulling from @{held.nick}; nothing was"
-            " stopped or cleared -- run the recall again",
+            f"the node-sync daemon is still pulling from @{held.nick}; {_RERUN}",
             _EXIT_UNREACHABLE,
         )
     except nodes.NodeConfigError as exc:
@@ -501,13 +518,24 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
         )
         return False
     except remote_mux.RemoteError as exc:
+        if exc.rc not in (255, None):
+            # It answered: an error it gave, or a pull it left unfinished.
+            _fail(
+                f"the last pull from @{held.nick} did not finish ({_tail(exc)});"
+                f" {_RERUN}",
+                1,
+            )
+        # ssh's own failure (255) or a timeout (rc None, DECISION-19) means the
+        # node is unreachable: no more live reads that would only wait again.
         _note(
             f"@{held.nick} did not answer ({_tail(exc)});"
             " going on with what was already pulled"
         )
-        # ssh's own failure (255) or a timeout (rc None, DECISION-19) means the
-        # node is unreachable: no more live reads that would only wait again.
-        return exc.rc not in (255, None)
+        return False
+    if pulled is None:
+        # final_pull re-reads the map tolerantly: a map busy past its retries
+        # (or torn, or cleared meanwhile) reads as "never placed".
+        _fail(f"could not read {name}'s placement again for the last pull; {_RERUN}", 1)
     _ok(f"pulled {held.sid} from @{held.nick} one last time")
     return True
 

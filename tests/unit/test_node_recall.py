@@ -1573,6 +1573,7 @@ def node_answers(monkeypatch):
 
     def _final_pull(config, name, *, wait_s=None, local_user=None):
         events.append(("pull", name, local_user))
+        return remote_mux.PullResult(files=(), since=NOW)
 
     def _bare_pull(*args, **kwargs):
         # DECISION-26 xi: a recall pulls through node_sync's lock, never beside it.
@@ -1948,6 +1949,161 @@ class TestRecallLocal:
         assert node_answers == []
 
 
+# node_sync.final_pull itself, not a stand-in: the node's answer is scripted
+# one level down, at its _pull_node seam.
+_REAL_FINAL_PULL = node_sync.final_pull
+
+
+def _stopped_before_anything(result, api_repo) -> None:
+    """The recall ended at the pull: printed, exit 1, placement kept, nothing
+    installed, and the user told to run it again."""
+    assert result.exit_code == 1
+    assert "nothing was stopped or cleared -- run the recall again" in result.stderr
+    assert "Traceback" not in result.output
+    assert nodes.read_node_map()["api"].nick == "second"
+    assert not _claude_dir(api_repo).exists()
+    assert "is home" not in result.stdout
+
+
+class TestTheLastPullMustFinish:
+    """cq-G14 I1: magent never clears a placement while it knows the last pull
+    is incomplete -- once cleared, nothing pulls that session again. A node
+    that does not answer cannot be helped (the plan's "never fatal" rule); one
+    that answered and failed can be retried, so the recall stops there."""
+
+    @pytest.fixture
+    def node_replies(self, node_answers, monkeypatch):
+        """The REAL final_pull, with @second answering each pull.sh call with
+        the snapshot fields given."""
+        monkeypatch.setattr(node_sync, "final_pull", _REAL_FINAL_PULL)
+
+        def load(**over):
+            snap = remote_mux.NodeSnapshot(
+                **{
+                    "now": NOW,
+                    "sessions": ("api",),
+                    "sample": None,
+                    "realpaths": {"api": "/home/amin/magent/api"},
+                    "state_files": {},
+                    "files": (),
+                    "failed_sids": frozenset(),
+                    **over,
+                }
+            )
+            monkeypatch.setattr(node_sync, "_pull_node", lambda node, sids: snap)
+
+        return load
+
+    def test_a_complete_last_pull_goes_on_to_the_install(
+        self, runner, placed_api, node_answers, node_replies, api_repo
+    ):
+        node_replies()
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 0
+        assert "pulled api from @second one last time" in result.stdout
+        assert "api" not in nodes.read_node_map()
+
+    def test_a_file_that_could_not_be_stored_stops_the_recall(
+        self, runner, placed_api, node_answers, node_replies, api_repo
+    ):
+        node_replies(failed_sids=frozenset({"api"}))
+
+        result = _recall(runner, placed_api, "--local")
+
+        _stopped_before_anything(result, api_repo)
+        assert "the last pull from @second did not finish" in result.stderr
+        assert "could not be stored on this PC" in result.stderr
+        assert "one last time" not in result.stdout
+        assert node_answers == []  # no repo read, no kill
+
+    def test_files_the_reply_had_no_room_for_stop_the_recall(
+        self, runner, placed_api, node_answers, node_replies, api_repo
+    ):
+        node_replies(
+            truncated={"api": ("api/transcripts/big.jsonl",)}, resume={"api": NOW}
+        )
+
+        result = _recall(runner, placed_api, "--local")
+
+        _stopped_before_anything(result, api_repo)
+        assert "1 file(s) did not fit in the reply" in result.stderr
+
+    def test_a_placement_the_pull_could_not_read_again_stops_the_recall(
+        self, runner, placed_api, node_answers, monkeypatch, api_repo
+    ):
+        # final_pull re-reads the map tolerantly: a busy or torn map is {} and
+        # it answers None, as for a project that was never placed.
+        monkeypatch.setattr(node_sync, "final_pull", lambda *a, **k: None)
+
+        result = _recall(runner, placed_api, "--local")
+
+        _stopped_before_anything(result, api_repo)
+        assert "could not read api's placement again" in result.stderr
+
+    def test_a_node_that_answered_with_an_error_stops_the_recall(
+        self, runner, placed_api, node_answers, monkeypatch, api_repo
+    ):
+        def _rc1(*a, **k):
+            raise remote_mux.RemoteError(1, "tar: write error", ("ssh",))
+
+        monkeypatch.setattr(node_sync, "final_pull", _rc1)
+
+        result = _recall(runner, placed_api, "--local")
+
+        _stopped_before_anything(result, api_repo)
+        assert "the last pull from @second did not finish (tar: write error)" in (
+            result.stderr
+        )
+        # It answered: never reported as a node that did not.
+        assert "did not answer" not in result.output
+        assert node_answers == []
+
+    def test_a_node_that_did_not_answer_still_goes_on(
+        self, runner, placed_api, node_is_gone, api_repo
+    ):
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 0
+        assert "@second did not answer" in result.stdout
+        assert "api" not in nodes.read_node_map()
+
+    def test_an_empty_remote_root_is_a_note_not_a_stop(
+        self, runner, api_repo, tmp_config, node_answers, monkeypatch
+    ):
+        # final_pull refuses such an entry before any ssh (rc 0, the same rc
+        # as a node's bad answer); a re-run cannot fix it, so it is the
+        # "cannot be pulled from" note, never the retry stop.
+        monkeypatch.setattr(node_sync, "final_pull", _REAL_FINAL_PULL)
+        held = entry("second")
+        nodes.update_node_map(
+            "api",
+            nodes.NodeMapEntry(
+                nick=held.nick,
+                sid=held.sid,
+                placed_ts=held.placed_ts,
+                attached_existing=held.attached_existing,
+                remote_root="",
+                target=held.target,
+            ),
+        )
+        cfg = tmp_config(
+            config_json(
+                ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
+            )
+        )
+
+        result = _recall(runner, cfg, "--local")
+
+        assert result.exit_code == 0
+        assert "@second cannot be pulled from (the node map has no remote root" in (
+            result.stdout
+        )
+        assert node_answers == []
+        assert "api" not in nodes.read_node_map()
+
+
 class TestRecallReadsTheNodeMapAsUntrusted:
     """Plan G Task 14's forward correction: nothing between the node map and
     the disk checks a sid, so recall checks it before any path is built."""
@@ -1980,7 +2136,11 @@ class TestRecallReadsTheNodeMapAsUntrusted:
             raise nodes.NodeConfigError(f"session root {root!r} is not absolute")
 
         monkeypatch.setattr("magent.env.local_username", lambda: "amin")
-        monkeypatch.setattr(node_sync, "final_pull", lambda *a, **k: None)
+        monkeypatch.setattr(
+            node_sync,
+            "final_pull",
+            lambda *a, **k: remote_mux.PullResult(files=(), since=NOW),
+        )
         monkeypatch.setattr(remote_mux, "repo_status", _refused)
         monkeypatch.setattr(
             remote_mux, "kill_session", lambda node, sid: None, raising=False

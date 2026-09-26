@@ -1532,3 +1532,49 @@ class TestTheFinalPull:
         assert result is not None
         (call,) = _calls_to(fake_ssh, "devino-second")
         assert set(_payload(call)["sids"]) == {"api-2"}
+
+
+class TestAFinalPullThatDidNotFinishIsNotASuccess:
+    """cq-G14 I1: the caller clears a placement after the last pull, and a
+    cleared placement is never pulled again -- so a pull that left something
+    behind on the node raises instead of returning as if it had finished."""
+
+    @pytest.fixture
+    def answers(self, placed, monkeypatch):
+        """The node answers every pull with the snapshot fields given; its
+        directory is already known, so each final pull is one call."""
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"),
+            {"api": {"since": 10.0, "realpath": "/home/amin/magent/api"}},
+        )
+
+        def load(**over):
+            snap = _snapshot(
+                sessions=("api",), realpaths={"api": "/home/amin/magent/api"}, **over
+            )
+            monkeypatch.setattr(node_sync, "_pull_node", lambda node, sids: snap)
+
+        return load
+
+    def test_a_file_that_could_not_be_stored_here_raises(self, answers):
+        answers(failed_sids=frozenset({"api"}))
+        with pytest.raises(remote_mux.RemoteError) as info:
+            node_sync.final_pull(_config(), "api")
+        assert info.value.rc == 0
+        assert "could not be stored on this PC" in info.value.stderr_tail
+        # The watermark held, so the next pull asks for that file again.
+        assert _marks()["api"] == {"since": 10.0, "realpath": "/home/amin/magent/api"}
+
+    def test_files_the_reply_had_no_room_for_raise_naming_how_many(self, answers):
+        answers(
+            truncated={"api": ("api/transcripts/a.jsonl", "api/transcripts/b.jsonl")},
+            resume={"api": 50.0},
+        )
+        with pytest.raises(remote_mux.RemoteError) as info:
+            node_sync.final_pull(_config(), "api")
+        assert info.value.rc == 0
+        assert "2 file(s) did not fit in the reply" in info.value.stderr_tail
+
+    def test_another_sessions_failure_is_not_this_ones(self, answers):
+        answers(failed_sids=frozenset({"web"}), truncated={"web": ("w",)})
+        assert node_sync.final_pull(_config(), "api") is not None
