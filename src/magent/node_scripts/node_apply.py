@@ -1223,64 +1223,11 @@ STEPS: tuple[tuple[str, Callable[[Ctx], None]], ...] = (
 )
 
 
-# What remote_mux.build_payload puts at the top of the archive (pinned equal to
-# it by tests/unit/test_node_apply.py); everything else lives under skills/.
-PAYLOAD_FILES = frozenset(
-    {
-        "manifest.json",
-        "mcp_oauth.json",
-        "mcp_servers.json",
-        "node_apply.py",
-        "settings.json",
-        "state-hook.sh",
-    }
-)
-
-
-def _unlisted(exc: OSError) -> None:
-    raise exc
-
-
-def _off_contract(work: Path) -> str | None:
-    """Why the payload unpacked in ``work`` is not one build_payload makes, or
-    None. provision.sh's tar keeps an absolute or ``..`` member NAME inside
-    ``work``, but writes a symbolic or hard link member as one and lays down
-    any name it is given. So: folders and plain files only, each file ONE
-    link to its data (a hard link member shares it), ``PAYLOAD_FILES`` at the
-    top and everything else under ``skills/``. Nothing is followed or opened
-    to tell -- ``lstat`` only."""
-    try:
-        for dirpath, dirnames, filenames in os.walk(str(work), onerror=_unlisted):
-            for name in sorted(dirnames + filenames):
-                path = Path(dirpath) / name
-                rel = path.relative_to(work)
-                st = os.lstat(str(path))
-                folder = stat.S_ISDIR(st.st_mode)
-                plain = stat.S_ISREG(st.st_mode) and st.st_nlink == 1
-                shown = ascii(rel.as_posix())
-                if not (folder or plain):
-                    return f"it holds a link or a special file ({shown})"
-                top = rel.parts[0]
-                if not (top == "skills" and (folder or len(rel.parts) > 1)) and not (
-                    plain and len(rel.parts) == 1 and top in PAYLOAD_FILES
-                ):
-                    return f"it holds an entry outside skills/ ({shown})"
-    except OSError as exc:
-        return f"it cannot be listed ({type(exc).__name__})"
-    return None
-
-
 def run(*, work: Path, home: Path, path: str, token: str, force: bool) -> int:
     """Apply the payload unpacked in ``work`` to ``home``. 1 when any step
-    failed, else 0. A payload build_payload could not have made
-    (``_off_contract``) is refused whole before any step reads it. The store
-    is saved even when a step raised; a store that cannot be saved is its own
-    ``fail`` row. A PC that stops reading mid-apply loses the rows after
-    that, never the steps."""
-    odd = _off_contract(work)
-    if odd is not None:
-        _say(f"fail\tpayload\tthe payload is refused: {odd}; nothing applied\n")
-        return 1
+    failed, else 0. The store is saved even when a step raised; a store that
+    cannot be saved is its own ``fail`` row. A PC that stops reading
+    mid-apply loses the rows after that, never the steps."""
     manifest = _load(work / "manifest.json")
     if not isinstance(manifest, dict) or manifest.get("version") != MANIFEST_VERSION:
         _say(
