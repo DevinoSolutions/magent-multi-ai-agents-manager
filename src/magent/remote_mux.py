@@ -837,6 +837,8 @@ def provision(
     ``skip`` rows (what stayed behind, and why), then ``ok`` per shipped one."""
     programs = stdio_programs(user_scope)
     probe_failed: tuple[ScriptLine, ...] = ()
+    found: frozenset[str] = frozenset()
+    unprobed = False
     if programs:
         try:
             found = node_programs(
@@ -844,11 +846,10 @@ def provision(
             )
         except ProgramsProbeFailed as exc:
             probe_failed = exc.lines
-            user_scope = without_missing_programs(
-                user_scope, found=frozenset(), unprobed=True
-            )
-        else:
-            user_scope = without_missing_programs(user_scope, found=found)
+            unprobed = True
+    # Always, even with nothing to probe: a stdio server whose command is not
+    # a plain program name is never offered to the probe, and only this drops it.
+    user_scope = without_missing_programs(user_scope, found=found, unprobed=unprobed)
     account = local_gh_account()
     token = local_gh_token() if account is not None else None
     login = account.login if account is not None and token else None

@@ -524,6 +524,25 @@ class TestDroppingWhatTheNodeLacks:
         assert kept.mcp_servers == {}
         assert kept.notes == (f"mcp x: not shipped -- {NOT_A_NAME}",)
 
+    def test_a_failed_probe_leaves_a_non_program_its_own_reason(self):
+        # F2's _NOT_A_PROGRAM met F12's unprobed note: a probe that died says
+        # nothing about a command that was never a program name.
+        scope = _scope(
+            mcp_servers={
+                "x": {"type": "stdio", "command": "npx"},
+                "y": {"type": "stdio", "command": "npx;id"},
+            }
+        )
+        kept = nodes.without_missing_programs(scope, found=frozenset(), unprobed=True)
+        assert kept.mcp_servers == {}
+        assert kept.notes == (
+            (
+                "mcp x: not shipped -- the node's program probe failed, "
+                "so `npx` is unconfirmed"
+            ),
+            f"mcp y: not shipped -- {NOT_A_NAME}",
+        )
+
 
 # One decoy per credential shape the Claude login can take (D5): an API key, an
 # OAuth access token, an OAuth refresh token. Every test below plants them
@@ -1913,6 +1932,26 @@ class TestProvision:
             in report.lines
         )
         # The verdicts come from the scope AFTER the probe (M22).
+        assert ScriptLine("ok", "scope", "mcp x: shipped") not in report.lines
+
+    def test_a_scope_whose_only_stdio_command_is_no_program_never_ships_it(
+        self, fake_ssh
+    ):
+        # A scope a wrapper (plan K) built without user_scope's filter: there
+        # is nothing to probe, and the server still stays behind.
+        spec = {"type": "stdio", "command": "npx;id", "env": {"K": "ENV-DECOY"}}
+        report = remote_mux.provision(
+            NODE,
+            _scope(mcp_servers={"x": spec}),
+            timeout_s=remote_mux.PROVISION_TIMEOUT_S,
+        )
+        (apply,) = fake_ssh.calls()
+        _, _, data = _unpack(_sent(apply))
+        assert json.loads(data["mcp_servers.json"]) == {}
+        assert all(b"ENV-DECOY" not in blob for blob in data.values())
+        assert ScriptLine("skip", "scope", f"mcp x: not shipped -- {NOT_A_NAME}") in (
+            report.lines
+        )
         assert ScriptLine("ok", "scope", "mcp x: shipped") not in report.lines
 
     # M3: a probe that died (a node whose shell profile breaks `set -u`) is not
