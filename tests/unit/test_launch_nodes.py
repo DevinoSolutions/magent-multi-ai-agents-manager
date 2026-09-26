@@ -998,3 +998,20 @@ class TestUpCommandBringsNodeProjectsUp:
             cli.main, ["--config", self._config_file(tmp_path, tmp_path / "api"), "up"]
         )
         assert decorated == [[]]
+
+    def test_an_unreachable_node_points_at_the_nodes_log(
+        self, rig, api, tmp_path, monkeypatch
+    ):
+        # A node casualty's reason (and any traceback) is logged by the
+        # "nodes" logger, so the casualty line must send the reader there.
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        rig.error = RemoteError(
+            255, "ssh: connect to host devino-second: timed out", ("bring_up",)
+        )
+        result = CliRunner().invoke(
+            cli.main, ["--config", self._config_file(tmp_path, tmp_path / "api"), "up"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "1 session(s) failed to come up: api" in result.stdout
+        assert "(see ~/.magent/logs/nodes.log on the host)" in result.stdout
+        assert "launch.log" not in result.stdout

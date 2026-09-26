@@ -1561,10 +1561,18 @@ def up_cmd(
         # does NOT contain have to be named -- this line is what `magent attach`
         # relays from the host, and a silent casualty there reads as success.
         if failed:
+            # A node casualty's reason is logged by the "nodes" logger, not
+            # "launch" -- point at whichever log(s) actually hold this set.
+            node_failed = [s for s in failed if s in node_sids]
+            logs: list[str] = []
+            if len(node_failed) < len(failed):
+                logs.append("~/.magent/logs/launch.log")
+            if node_failed:
+                logs.append("~/.magent/logs/nodes.log")
             click.echo(
                 f"  {style('x', fg='red')} {style(str(len(failed)), fg='red', bold=True)}"
                 f" session(s) failed to come up: {style(', '.join(failed), fg='red')}"
-                f" {style('(see ~/.magent/logs/launch.log on the host)', dim=True)}"
+                f" {style('(see ' + ' and '.join(logs) + ' on the host)', dim=True)}"
             )
             # Only ever set when the choke point refused -- the hand-off and
             # refusal above have already returned on every other Session-0

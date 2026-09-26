@@ -3191,3 +3191,41 @@ class TestUpNodeProjectsBesideLiveLocalSessions:
         result = runner.invoke(cli.main, ["--config", path, "up", "--all"])
         assert result.exit_code == 0, result.output
         assert calls == [(None, False)]
+
+
+class TestUpNamesTheLogThatHoldsEachCasualty:
+    """A local casualty is in launch.log, a node casualty in nodes.log; the
+    line names exactly the log(s) its failed sessions were written to."""
+
+    def _run(self, runner, tmp_config, monkeypatch, failed):
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: ([], [{"name": "web", "session": "web"}], [{}]),
+        )
+        monkeypatch.setattr(
+            "magent.launch.node_session_ids", lambda cfg, group=None: ["api"]
+        )
+        monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
+        monkeypatch.setattr("magent.launch.decorate_psmux_sessions", lambda *a, **k: [])
+        monkeypatch.setattr(
+            "magent.launch.bring_up_psmux", lambda *a, **k: ([], list(failed))
+        )
+        path = tmp_config({"projects": []})
+        result = runner.invoke(cli.main, ["--config", path, "up"])
+        assert result.exit_code == 0, result.output
+        return result.stdout
+
+    def test_a_local_casualty_points_at_the_launch_log(
+        self, runner, tmp_config, monkeypatch
+    ):
+        out = self._run(runner, tmp_config, monkeypatch, ["web"])
+        assert "(see ~/.magent/logs/launch.log on the host)" in out
+        assert "nodes.log" not in out
+
+    def test_a_local_and_a_node_casualty_name_both_logs(
+        self, runner, tmp_config, monkeypatch
+    ):
+        out = self._run(runner, tmp_config, monkeypatch, ["web", "api"])
+        assert (
+            "(see ~/.magent/logs/launch.log and ~/.magent/logs/nodes.log on the host)"
+        ) in out
