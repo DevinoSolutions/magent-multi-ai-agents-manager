@@ -583,8 +583,10 @@ def _marketplaces(
 ) -> dict[str, str]:
     """A remote source for every marketplace an enabled plugin comes from:
     the CLI's known list first, then ``settings.extraKnownMarketplaces``. A
-    source that holds a Claude credential (a token in a git URL) stays behind
-    with a note that never quotes it."""
+    source that holds a Claude credential (a token in a git URL) or any other
+    URL credential stays behind with a note that never quotes it: the node
+    passes the source to ``claude plugin marketplace add`` as an ARGUMENT,
+    readable by every user of a shared node."""
     extra_raw = settings.get("extraKnownMarketplaces")
     extra: dict[str, object] = extra_raw if isinstance(extra_raw, dict) else {}
     found: dict[str, str] = {}
@@ -594,17 +596,36 @@ def _marketplaces(
         )
         if source is None:
             notes.append(
-                f"marketplace {name}: no remote source on this PC; its plugins "
-                "may not install on a node"
+                f"marketplace {_named(name)}: no remote source on this PC; its "
+                "plugins may not install on a node"
             )
-        elif _holds_claude_credential(source):
-            notes.append(
-                f"marketplace {name}: its source holds a Claude credential, "
-                "never shipped"
-            )
-        else:
+            continue
+        refusal = _source_refusal(source)
+        if refusal is None:
             found[name] = source
+        else:
+            notes.append(f"marketplace {_named(name)}: {refusal}")
     return found
+
+
+def _source_refusal(source: str) -> str | None:
+    """Why a marketplace source must not leave this PC, or None. A URL
+    credential is judged by the rule a project's git remote is stripped by
+    (``_without_credentials``), so the two can never disagree: over any scheme
+    but ssh the WHOLE userinfo is one -- GitHub takes a token as the user
+    name, ``https://ghp_...@github.com/o/m.git`` -- and over ssh only a
+    password is (``git@host:path`` and ``ssh://git@host/...`` ship)."""
+    if _holds_claude_credential(source):
+        return "its source holds a Claude credential, never shipped"
+    if _without_credentials(source)[1]:
+        if _userinfo_password(source):
+            return "its source URL carries a password, never shipped"
+        return "its source URL carries a user name (often a token), never shipped"
+    try:
+        urllib.parse.urlsplit(source)
+    except ValueError:  # an unbalanced IPv6 bracket, say
+        return "its source URL does not parse, never shipped"
+    return None
 
 
 _CREDENTIAL_BYTES = CLAUDE_CREDENTIAL_MARKER.encode("ascii")
@@ -1592,18 +1613,39 @@ def _without_credentials(url: str) -> tuple[str, bool]:
     credential. A userinfo holding nothing but ':' (or an ssh password that
     is empty) is no credential: the URL is left byte-for-byte and not
     reported as stripped. A stripped URL's scheme is lowercased."""
+    peeled = _peeled(url)
+    if peeled is None:
+        return url, False
+    prefix, address = peeled
+    stripped = _without_userinfo_secret(address)
+    if stripped is None:
+        return url, False
+    return f"{prefix}{stripped}", True
+
+
+def _peeled(url: str) -> tuple[str, str] | None:
+    """``url``'s stacked ``<transport>::`` prefix and the ``scheme://``
+    address under it (see ``_without_credentials``), or None when there is no
+    such address."""
     prefix = ""
     address = url
     while _SCHEME_URL.fullmatch(address) is None:
         transport = _TRANSPORT_URL.fullmatch(address)
         if transport is None:
-            return url, False
+            return None
         prefix += f"{transport.group(1)}::"
         address = transport.group(2)
-    stripped = _without_userinfo_secret(address)
-    if stripped is None:
-        return url, False
-    return f"{prefix}{stripped}", True
+    return prefix, address
+
+
+def _userinfo_password(url: str) -> str:
+    """The password in ``url``'s userinfo (the part after its first ':'), ""
+    when it has none. Read by the rules of ``_without_credentials``."""
+    peeled = _peeled(url)
+    match = _SCHEME_URL.fullmatch(peeled[1]) if peeled is not None else None
+    if match is None:
+        return ""
+    return match.group(2).rpartition("@")[0].partition(":")[2]
 
 
 def _without_userinfo_secret(url: str) -> str | None:

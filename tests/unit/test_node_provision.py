@@ -1059,6 +1059,105 @@ class TestUserScopePluginsAndSkills:
         assert "DECOY" not in repr(scope)
 
 
+# The node passes a marketplace source to `claude plugin marketplace add` as an
+# ARGUMENT, readable in `ps` by every user of a shared node: a credential in
+# its URL never leaves this PC. The rule is the one a project's git remote is
+# stripped by (nodes._without_credentials): over any scheme but ssh the whole
+# userinfo is a credential -- GitHub takes a token as the user name -- over
+# ssh only a password is.
+PASSWORD_REFUSED = "marketplace mkt: its source URL carries a password, never shipped"
+USER_REFUSED = (
+    "marketplace mkt: its source URL carries a user name (often a token), never shipped"
+)
+
+
+class TestAMarketplaceSourceNeverCarriesAPassword:
+    def _scope_for(self, tmp_path: Path, url: str) -> UserScope:
+        return nodes.user_scope(
+            _pc_home(
+                tmp_path,
+                settings={"enabledPlugins": {"p@mkt": True}},
+                known_marketplaces={"mkt": {"source": {"source": "git", "url": url}}},
+            )
+        )
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://bob:ghp_DECOY@git.example/m.git",
+            "https://:ghp_DECOY@git.example/m.git",
+            "ssh://git:DECOY@git.example/m.git",
+            "https::https://bob:ghp_DECOY@git.example/m.git",
+        ],
+    )
+    def test_a_userinfo_password_stays_behind(self, tmp_path, url):
+        scope = self._scope_for(tmp_path, url)
+        assert scope.marketplaces == {}
+        assert scope.notes == (PASSWORD_REFUSED,)
+        assert "DECOY" not in repr(scope)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://ghp_DECOY@github.com/o/m.git",  # GitHub: token as user name
+            "https://ghp_DECOY:@github.com/o/m.git",  # an empty password
+            "http://bob_DECOY@git.example/m.git",
+            "git+https://ghp_DECOY@github.com/o/m.git",
+            "HTTPS://ghp_DECOY@github.com/o/m.git",
+            "git://ghp_DECOY@git.example/m.git",  # not ssh: the login is no ssh user
+            "https::https://ghp_DECOY@github.com/o/m.git",  # git's helper form
+            "https://ghp_DECOY@[::1/m.git",  # userinfo before a broken host
+        ],
+    )
+    def test_any_user_name_off_ssh_stays_behind(self, tmp_path, url):
+        scope = self._scope_for(tmp_path, url)
+        assert scope.marketplaces == {}
+        assert scope.notes == (USER_REFUSED,)
+        assert "DECOY" not in repr(scope)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "git@github.com:owner/m.git",
+            "ssh://git@github.com/owner/m.git",
+            "git+ssh://git@github.com/owner/m.git",
+            "https://github.com/owner/m.git",
+            "https://:@github.com/owner/m.git",  # a userinfo of only ':'
+        ],
+    )
+    def test_the_ssh_user_and_a_plain_url_ship(self, tmp_path, url):
+        scope = self._scope_for(tmp_path, url)
+        assert scope.marketplaces == {"mkt": url}
+        assert scope.notes == ()
+
+    def test_a_source_that_does_not_parse_stays_behind(self, tmp_path):
+        scope = self._scope_for(tmp_path, "https://[::1/m.git")
+        assert scope.marketplaces == {}
+        assert scope.notes == (
+            "marketplace mkt: its source URL does not parse, never shipped",
+        )
+
+    # One policy: whatever the git-remote rule would strip, the marketplace
+    # rule refuses, and nothing else.
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://u:p@h/r",
+            "https://u@h/r",
+            "ssh://u:p@h/r",
+            "ssh://u@h/r",
+            "git://u@h/r",
+            "file://u@h/r",
+            "https://h/r",
+            "u@h:r",
+            "ext::ssh -p 22 u@h",
+        ],
+    )
+    def test_the_rule_is_the_git_remote_rule(self, tmp_path, url):
+        refused = self._scope_for(tmp_path, url).marketplaces == {}
+        assert refused == nodes._without_credentials(url)[1]
+
+
 class TestUserScopeDigests:
     def test_every_item_has_a_digest(self):
         assert set(_scope().digests()) == {
