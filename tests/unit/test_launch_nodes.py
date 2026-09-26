@@ -1091,6 +1091,8 @@ class TestAnUnreadableMapPlacesNothingByGuess:
             f"the node map is unreadable ({cls}), so where this auto project runs"
             " is unknown; not brought up"
         )
+        # Its node is unknown, and the outcome never guesses one.
+        assert outcomes[1].node == ""
         assert [(n, r.sid) for n, r in rig.recipes] == [("second", "web")]
 
     def test_two_pinned_twins_keep_the_rename_text(self, rig, tmp_path, unreadable_map):

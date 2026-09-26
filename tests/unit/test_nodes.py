@@ -2108,6 +2108,14 @@ class TestWhereTheProjectLandsOnTheNode:
             nodes.remote_root_for(D_NODE, project_dir)
         assert repr(leaf) in str(err.value)
 
+    def test_an_unknown_node_folder_keeps_the_folder_name_refusals(self):
+        # The same rules as remote_root_for, under the unknown-node root.
+        assert nodes.unknown_node_remote_root(Path("C:/src/api")) == (
+            "(node unknown)/api"
+        )
+        with pytest.raises(NodeConfigError, match="cannot name a node folder"):
+            nodes.unknown_node_remote_root(Path("C:/src/api."))
+
     def test_a_dot_leaf_is_refused(self):
         # pathlib collapses a "." part, so a "." leaf reaches here only as
         # Path(".") itself -- a folder with no name, refused like a drive root.
