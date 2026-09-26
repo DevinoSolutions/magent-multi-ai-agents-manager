@@ -36,6 +36,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from magent import node_scripts
@@ -57,7 +58,6 @@ from magent.nodes import (
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Mapping, Sequence
-    from pathlib import Path
     from typing import IO
 
     from magent.nodes import Node
@@ -1285,60 +1285,95 @@ def _within(path: str, real_root: str) -> bool:
         return False
 
 
-def _tar_dir(source: Path) -> bytes:
-    """An uncompressed tar of ``source``'s CONTENTS (paths relative to it).
-    Only regular files and directories travel: a symlink could name anything
-    on this PC, and a ``.<rand>.part`` file is a pull temp (``_pull_temp``).
-    Nothing reached through a link travels either: a source dir that is itself
-    a symlink or junction is refused, a linked directory inside it is not
-    descended (logged), and a file whose real path leaves the source is
-    skipped. A source that cannot be read, or is a link, raises RemoteError
-    with rc None (nothing ran on a node)."""
-    buf = io.BytesIO()
+class MirrorIsALink(OSError):
+    """A pulled transcripts dir that is itself a symlink or junction to
+    somewhere else: nothing is taken from it."""
+
+
+def _mirror_members(source: Path, *, who: str) -> list[Path]:
+    """What may leave the pulled transcripts dir ``source``, sorted: its
+    regular files and directories -- the ONE rule for both ways a mirror
+    leaves it (``_tar_dir`` to a node, ``copy_mirror`` into this PC's Claude
+    dir). A symlink could name anything on this PC, and a ``.<rand>.part``
+    file is a pull temp (``_pull_temp``). Nothing reached through a link is a
+    member either: ``source`` itself being a symlink or junction raises
+    MirrorIsALink, a linked directory inside it is not descended (logged), and
+    a file whose real path leaves ``source`` is skipped -- two independent
+    layers. OSError when ``source`` cannot be read."""
     log = get_logger("nodes")
+    if not _is_its_own_place(str(source), os.path.realpath(source.parent)):
+        log.warning("%s: %s is a link (symlink or junction); refused", who, source)
+        raise MirrorIsALink(
+            f"the pulled transcripts dir {source} is a link (symlink or junction)"
+            " to somewhere else"
+        )
+    root = os.path.normcase(os.path.realpath(source))
+    entries = []
+    for dirpath, dirnames, filenames in os.walk(source, onerror=_raise):
+        real_base = os.path.realpath(dirpath)
+        inside = []
+        for name in dirnames:
+            if _is_its_own_place(os.path.join(dirpath, name), real_base):
+                inside.append(name)
+            else:
+                log.warning(
+                    "%s: %s is a link (symlink or junction); not descended",
+                    who,
+                    os.path.join(dirpath, name),
+                )
+        dirnames[:] = inside
+        base = source / os.path.relpath(dirpath, source)
+        entries.extend(base / name for name in (*dirnames, *filenames))
+    return [
+        path
+        for path in sorted(entries)
+        if not path.is_symlink()
+        and (
+            path.is_dir()
+            or (
+                path.is_file()
+                and not _pull_temp(path.name)
+                and _within(str(path), root)
+            )
+        )
+    ]
+
+
+def _tar_dir(source: Path) -> bytes:
+    """An uncompressed tar of ``source``'s CONTENTS (paths relative to it):
+    its ``_mirror_members``, nothing else. A source that cannot be read, or is
+    a link, raises RemoteError with rc None (nothing ran on a node)."""
+    buf = io.BytesIO()
     try:
-        if not _is_its_own_place(str(source), os.path.realpath(source.parent)):
-            log.warning(
-                "_tar_dir: %s is a link (symlink or junction); not sent", source
-            )
-            raise RemoteError(
-                None,
-                f"the pulled transcripts dir {source} is a link (symlink or "
-                "junction) to somewhere else; nothing was sent",
-                ("tar", str(source)),
-            )
-        root = os.path.normcase(os.path.realpath(source))
-        entries = []
-        for dirpath, dirnames, filenames in os.walk(source, onerror=_raise):
-            real_base = os.path.realpath(dirpath)
-            inside = []
-            for name in dirnames:
-                if _is_its_own_place(os.path.join(dirpath, name), real_base):
-                    inside.append(name)
-                else:
-                    log.warning(
-                        "_tar_dir: %s is a link (symlink or junction); not descended",
-                        os.path.join(dirpath, name),
-                    )
-            dirnames[:] = inside
-            base = source / os.path.relpath(dirpath, source)
-            entries.extend(base / name for name in (*dirnames, *filenames))
+        members = _mirror_members(source, who="_tar_dir")
         with tarfile.open(fileobj=buf, mode="w") as tar:
-            for path in sorted(entries):
-                if path.is_symlink():
-                    continue
-                if path.is_dir() or (
-                    path.is_file()
-                    and not _pull_temp(path.name)
-                    and _within(str(path), root)
-                ):
-                    arcname = path.relative_to(source).as_posix()
-                    tar.add(path, arcname=arcname, recursive=False)
+            for path in members:
+                arcname = path.relative_to(source).as_posix()
+                tar.add(path, arcname=arcname, recursive=False)
+    except MirrorIsALink as err:
+        raise RemoteError(
+            None, f"{err}; nothing was sent", ("tar", str(source))
+        ) from err
     except OSError as err:
         raise RemoteError(
             None, f"could not read the pulled transcripts: {err}", ("tar", str(source))
         ) from err
     return buf.getvalue()
+
+
+def copy_mirror(source: Path, dest: Path) -> None:
+    """Install the pulled transcripts dir ``source`` into ``dest`` on THIS PC
+    by the rule ``_tar_dir`` sends it to a node by (``_mirror_members``): the
+    ``recall --local`` twin of ``install_transcripts``. What ``dest`` already
+    holds is kept; a same-name file is replaced by the node's copy.
+    MirrorIsALink when ``source`` is itself a link; any other OSError
+    propagates, possibly after a partial copy that a re-run overwrites."""
+    members = set(_mirror_members(source, who="copy_mirror"))
+
+    def _not_members(folder: str, names: list[str]) -> list[str]:
+        return [name for name in names if Path(folder, name) not in members]
+
+    shutil.copytree(source, dest, ignore=_not_members, dirs_exist_ok=True)
 
 
 def node_realpath(node: Node, path: str, *, timeout_s: float) -> str:

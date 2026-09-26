@@ -10,7 +10,6 @@ pay for ssh and tar).
 from __future__ import annotations
 
 import re
-import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -680,7 +679,7 @@ def _recall_local(
     """Steps 4-5 for ``--local``: install into THIS machine's Claude dir for
     the local folder, clear the placement, print the resume -- never launch
     it, because the user picks the terminal."""
-    from magent import nodes  # heavy subsystem: in-body per policy
+    from magent import nodes, remote_mux  # heavy subsystem: in-body per policy
 
     dest = (
         Path.home() / ".claude" / "projects" / nodes.encoded_project_dir(str(local_dir))
@@ -688,7 +687,14 @@ def _recall_local(
     pulled = nodes.transcripts_dir(held.nick, held.sid)
     if pulled.is_dir():
         try:
-            shutil.copytree(pulled, dest, dirs_exist_ok=True)
+            # --to's rules (cq-G14 M3): no link followed, no pull temp copied.
+            remote_mux.copy_mirror(pulled, dest)
+        except remote_mux.MirrorIsALink as exc:
+            # No re-run fixes a linked mirror: the user must look at it.
+            _fail(
+                f"{exc}; nothing was installed and {name} stays placed on @{held.nick}",
+                1,
+            )
         except OSError as exc:
             _fail(
                 f"could not install the conversation into {dest} ({exc});"

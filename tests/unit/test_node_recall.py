@@ -2179,6 +2179,111 @@ class TestRecallReadsTheNodeMapAsUntrusted:
         assert "api" not in nodes.read_node_map()
 
 
+def _dir_link(link: Path, target: Path) -> None:
+    """A directory link at ``link``: a junction on Windows (no admin needed),
+    a symlink elsewhere."""
+    if sys.platform == "win32":
+        _junction(link, target)
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def _drop_dir_link(link: Path) -> None:
+    """Remove the link only; its target stays."""
+    if sys.platform == "win32":
+        os.rmdir(link)
+    else:
+        link.unlink()
+
+
+class TestTheLocalInstallFollowsTheTarRules:
+    """cq-G14 M3: --local copies the pulled mirror by _tar_dir's rules (the
+    --to path's), through the one helper both use: a mirror that is itself a
+    link is refused, a linked directory inside it is not descended, a symlink
+    is not followed, and a pull temp is never installed."""
+
+    @pytest.fixture
+    def outside(self, tmp_path) -> Path:
+        folder = tmp_path / "dot-ssh"
+        folder.mkdir()
+        (folder / "id_rsa").write_text("the private key\n", encoding="utf-8")
+        return folder
+
+    def test_a_pull_temp_is_never_installed_but_a_real_part_file_is(
+        self, runner, placed_api, node_answers, api_repo
+    ):
+        mirror = nodes.transcripts_dir("second", "api")
+        temp = f"{remote_mux.PULL_TEMP_PREFIX}x1y2{remote_mux.PULL_TEMP_SUFFIX}"
+        (mirror / temp).write_text("half a transcript\n", encoding="utf-8")
+        (mirror / "notes.part").write_text("the user's file\n", encoding="utf-8")
+
+        result = _recall(runner, placed_api, "--local")
+
+        dest = _claude_dir(api_repo)
+        assert result.exit_code == 0
+        assert (dest / f"{SESSION_ID}.jsonl").exists()
+        assert not (dest / temp).exists()
+        assert (dest / "notes.part").exists()
+
+    def test_a_linked_dir_inside_the_mirror_is_not_descended(
+        self, runner, placed_api, node_answers, api_repo, outside
+    ):
+        link = nodes.transcripts_dir("second", "api") / "memory" / "notes"
+        _dir_link(link, outside)
+        try:
+            result = _recall(runner, placed_api, "--local")
+        finally:
+            _drop_dir_link(link)
+
+        dest = _claude_dir(api_repo)
+        assert result.exit_code == 0
+        assert (dest / "memory" / "MEMORY.md").exists()
+        assert not (dest / "memory" / "notes").exists()
+        assert not list(dest.rglob("id_rsa"))
+
+    def test_a_mirror_that_is_itself_a_link_is_refused(
+        self, runner, api_repo, tmp_config, node_answers, outside
+    ):
+        nodes.update_node_map("api", entry("second"))
+        (outside / f"{SESSION_ID}.jsonl").write_text("{}\n", encoding="utf-8")
+        mirror = nodes.transcripts_dir("second", "api")
+        mirror.parent.mkdir(parents=True)
+        _dir_link(mirror, outside)
+        cfg = tmp_config(
+            config_json(
+                ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
+            )
+        )
+        try:
+            result = _recall(runner, cfg, "--local")
+        finally:
+            _drop_dir_link(mirror)
+
+        assert result.exit_code == 1
+        assert "is a link (symlink or junction)" in result.stderr
+        assert "stays placed on @second" in result.stderr
+        assert "Traceback" not in result.output
+        assert "api" in nodes.read_node_map()
+        assert not _claude_dir(api_repo).exists()
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="a file symlink needs admin or developer mode on Windows",
+    )
+    def test_a_symlinked_file_in_the_mirror_is_not_installed(
+        self, runner, placed_api, node_answers, api_repo, outside
+    ):
+        mirror = nodes.transcripts_dir("second", "api")
+        (mirror / "leak.jsonl").symlink_to(outside / "id_rsa")
+
+        result = _recall(runner, placed_api, "--local")
+
+        dest = _claude_dir(api_repo)
+        assert result.exit_code == 0
+        assert (dest / f"{SESSION_ID}.jsonl").exists()
+        assert not (dest / "leak.jsonl").exists()
+
+
 class TestRecallLocalFailureBranches:
     """cq-G14 I2: the killer tests for the partial-failure branches no test
     exercised (15 surviving mutants), landed as the review gave them.
