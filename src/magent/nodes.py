@@ -211,6 +211,10 @@ class UserScope:
     marketplaces: dict[str, str]
     skills: tuple[SkillFile, ...]
     notes: tuple[str, ...] = ()
+    # {node_apply step: error class} for each step fed by a PC file that did
+    # not read. Unknown is not empty: the node leaves that step's item as it
+    # is (U4), so the item's value above says nothing.
+    unread: dict[str, str] = dataclasses.field(default_factory=dict)
 
     def digests(self) -> dict[str, str]:
         """One content hash per shipped item; node_apply skips an item whose
@@ -234,28 +238,38 @@ class UserScope:
         }
 
 
-def _read_object(path: Path, label: str, notes: list[str]) -> dict[str, object]:
-    """``path`` as a JSON object; {} when absent. Unreadable or malformed is a
-    note, never an exception -- provisioning must not die on a PC file."""
+@dataclass(frozen=True)
+class _Unread:
+    """A PC file that exists but did not read as a JSON object. Unknown, never
+    empty: shipped as {}, settings.json would take back everything the PC
+    shipped last time. ``why`` is the error class -- all a screen may show."""
+
+    why: str
+
+
+def _read_object(
+    path: Path, label: str, notes: list[str]
+) -> dict[str, object] | _Unread:
+    """``path`` as a JSON object; {} when it does not exist. Anything else --
+    unreadable, not UTF-8, not JSON, not an object -- is ``_Unread``, never an
+    exception (provisioning must not die on a PC file): a note naming the
+    class, and the path and the error in the log only."""
     try:
-        text = path.read_text(encoding="utf-8")
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
-    except OSError as e:
-        notes.append(f"{label}: unreadable ({e.strerror}), skipped")
-        return {}
-    except UnicodeDecodeError:
-        notes.append(f"{label}: not valid UTF-8, skipped")
-        return {}
-    try:
-        raw = json.loads(text)
-    except ValueError:
-        notes.append(f"{label}: not valid JSON, skipped")
-        return {}
-    if not isinstance(raw, dict):
-        notes.append(f"{label}: not a JSON object, skipped")
-        return {}
-    return raw
+    except (OSError, ValueError) as e:  # UnicodeDecodeError is a ValueError
+        why = type(e).__name__
+        _log.warning("%s could not be read (%s): %s", path, why, e)
+    else:
+        if isinstance(raw, dict):
+            return raw
+        why = "not a JSON object"
+        _log.warning("%s is not a JSON object (a JSON %s)", path, type(raw).__name__)
+    notes.append(
+        f"{label}: could not be read ({why}), so nothing from it ships this time"
+    )
+    return _Unread(why)
 
 
 def _is_local_state_hook(hook: object) -> bool:
@@ -747,33 +761,50 @@ def user_scope(home: Path) -> UserScope:
     """What provisioning ships from the PC whose home is ``home`` (spec §8).
     Reads ONLY ``~/.claude/settings.json``, ``~/.claude.json`` (mcpServers),
     ``~/.claude/.credentials.json`` (mcpOAuth), the plugin marketplace list and
-    ``~/.claude/skills`` -- and runs nothing."""
+    ``~/.claude/skills`` -- and runs nothing. A file that exists but does not
+    read marks every step it feeds ``unread`` (``_Unread``)."""
     notes: list[str] = []
+    unread: dict[str, str] = {}
+
+    def read(path: Path, label: str, *steps: str) -> dict[str, object]:
+        found = _read_object(path, label, notes)
+        if isinstance(found, _Unread):
+            for step in steps:
+                unread.setdefault(step, found.why)
+            return {}
+        return found
+
     claude = home / ".claude"
-    raw_settings = _read_object(claude / "settings.json", "settings.json", notes)
+    raw_settings = read(
+        claude / "settings.json", "settings.json", "settings", "plugins"
+    )
     settings = _shippable_settings(raw_settings, notes)
     servers = _mcp_servers(
-        _read_object(home / ".claude.json", ".claude.json", notes), notes
+        read(home / ".claude.json", ".claude.json", "mcp", "mcp_oauth"), notes
     )
-    oauth = _mcp_oauth(
-        _read_object(claude / ".credentials.json", ".credentials.json", notes),
-        servers,
-        notes,
-    )
+    credentials = read(claude / ".credentials.json", ".credentials.json", "mcp_oauth")
+    # Against an unknown server list, no entry is "for a server not in
+    # mcpServers": nothing is filtered, and nothing noted.
+    oauth = {} if "mcp_oauth" in unread else _mcp_oauth(credentials, servers, notes)
     plugins = _plugins(raw_settings, notes)
-    known = _read_object(
+    known = read(
         claude / "plugins" / "known_marketplaces.json",
         "plugins/known_marketplaces.json",
-        notes,
+        "plugins",
     )
     return UserScope(
         settings=settings,
         mcp_servers=servers,
         mcp_oauth=oauth,
         plugins=plugins,
-        marketplaces=_marketplaces(plugins, raw_settings, known, notes),
+        # Nor is a marketplace "without a remote source" when the list that
+        # names the sources is unknown.
+        marketplaces={}
+        if "plugins" in unread
+        else _marketplaces(plugins, raw_settings, known, notes),
         skills=_skills(claude / "skills", home, notes),
         notes=tuple(notes),
+        unread=unread,
     )
 
 

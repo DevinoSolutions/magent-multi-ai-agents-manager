@@ -10,7 +10,9 @@ last run that finished it cleanly -- the store is ~/.magent/provision.json.
 A step that warned or failed is not recorded, so the next provision looks
 again. The store also keeps what the settings step last shipped (env keys,
 permission rules, extra directories), so what this PC stops shipping is
-taken back from the node; a lost or damaged store takes nothing back. A
+taken back from the node; a lost or damaged store takes nothing back, and
+neither does a PC file the PC could not read (the manifest's ``unread``):
+its step is a skip that writes nothing and forgets nothing. A
 deliberate drop (a hook whose program this node lacks) is a clean result:
 the same payload on the same node drops it again, and ``--force`` (what
 ``magent node setup`` sends) re-looks after a tool is installed.
@@ -158,6 +160,20 @@ def _digest(ctx: Ctx, item: str) -> str:
     digests = ctx.manifest.get("digests")
     value = digests.get(item) if isinstance(digests, dict) else None
     return value if isinstance(value, str) else ""
+
+
+def _unread_on_pc(ctx: Ctx, step: str, what: str, left: str) -> bool:
+    """True, after one skip row, when the PC could not read the file ``step``
+    ships from (the manifest's ``unread``). Unknown is not empty: the step
+    writes nothing and forgets nothing it remembers. The row names the error
+    class the PC sent, never a path."""
+    unread = ctx.manifest.get("unread")
+    if not isinstance(unread, dict) or step not in unread:
+        return False
+    why = unread[step]
+    shown = why if isinstance(why, str) else "unknown"
+    _row(ctx, "skip", step, f"this PC's {what} could not be read ({shown}); {left}")
+    return True
 
 
 def _unchanged(ctx: Ctx, step: str, want: str) -> bool:
@@ -737,7 +753,27 @@ def _record(shipped: dict[str, object]) -> dict[str, object]:
 def _step_settings(ctx: Ctx) -> None:
     """This PC's settings.json over the node's: the PC's keys win, the node's
     others stay unless this PC shipped them before (``_merged``), hooks are rebuilt (``_hooks``), and a
-    statusLine the node cannot run falls back to the node's own."""
+    statusLine the node cannot run falls back to the node's own. Settings the
+    PC could not read, or a payload without a readable settings.json, change
+    nothing: merged as {}, they would take back all the PC shipped before."""
+    if _unread_on_pc(
+        ctx,
+        "settings",
+        "~/.claude/settings.json",
+        "the node's settings are left as they are",
+    ):
+        return
+    source = ctx.work / "settings.json"
+    loaded = _load(source) if source.is_file() else None
+    if not isinstance(loaded, dict):
+        _row(
+            ctx,
+            "fail",
+            "settings",
+            "the payload carries no readable settings.json; the node's settings "
+            "are left as they are",
+        )
+        return
     # Through a symlink (a dotfiles-managed settings.json), not over it; a
     # dangling one is left alone with a warning (``_target``).
     path = _target(
@@ -764,8 +800,7 @@ def _step_settings(ctx: Ctx) -> None:
     if _unchanged(ctx, "settings", want) and wired:
         _row(ctx, "skip", "settings", "unchanged since the last provision")
         return
-    loaded = _load(ctx.work / "settings.json")
-    shipped = loaded if isinstance(loaded, dict) else {}
+    shipped = loaded
     mark = len(ctx.rows)
     perms = shipped.get("permissions")
     if isinstance(perms, dict):
@@ -810,6 +845,10 @@ def _step_mcp(ctx: Ctx) -> None:
     header, and a ``claude`` starting mid-apply reads the old file or the
     new one. The node's claude rewrites this file as it runs, so the merge
     is ``_merge_into``'s: a write of its that lands mid-apply is kept."""
+    if _unread_on_pc(
+        ctx, "mcp", "~/.claude.json", "the node's MCP servers are left as they are"
+    ):
+        return
     loaded = _load(ctx.work / "mcp_servers.json")
     servers = loaded if isinstance(loaded, dict) else {}
     if not servers:
@@ -879,6 +918,10 @@ def _step_mcp_oauth(ctx: Ctx) -> None:
     next time. An entry the node already holds exactly is never rewritten,
     and the merge is ``_merge_into``'s, so a refresh the node's claude
     writes mid-apply is kept."""
+    if _unread_on_pc(
+        ctx, "mcp_oauth", "MCP OAuth entries", "the node's are left as they are"
+    ):
+        return
     loaded = _load(ctx.work / "mcp_oauth.json")
     entries = loaded if isinstance(loaded, dict) else {}
     # A dangling link reads as "no file": named instead, never read as a
@@ -1135,6 +1178,8 @@ SYNCED_MARKETPLACE = "synced"
 def _step_plugins(ctx: Ctx) -> None:
     """Install this PC's enabled plugins the node lacks, at user scope. Never
     ``-y``: it would auto-accept the commands a marketplace declares."""
+    if _unread_on_pc(ctx, "plugins", "plugin list", "nothing is installed this time"):
+        return
     raw = ctx.manifest.get("plugins")
     listed = (
         [p for p in raw if isinstance(p, str) and "@" in p]

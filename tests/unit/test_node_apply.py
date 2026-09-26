@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from magent import node_scripts, remote_mux
+from magent import node_scripts, nodes, remote_mux
 from magent.node_scripts import node_apply
 from magent.nodes import SkillFile, UserScope
 from tests.unit._fake_ssh import FakeSsh, make_fake_ssh
@@ -3106,3 +3106,222 @@ class TestASymlinkedMcpFileIsWrittenThroughItsLink:
             ),
         )
         assert not _credentials(box).exists()
+
+
+def _deny_read(monkeypatch: pytest.MonkeyPatch, denied: Path) -> None:
+    """``denied`` raises PermissionError when read, on every OS (a Windows
+    chmod does not stop a read)."""
+    read_text = Path.read_text
+
+    def guarded(self: Path, *args: object, **kwargs: object) -> str:
+        if self == denied:
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded)
+
+
+def _unreadable_pc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    how: str,
+    rel: str,
+    **files: object,
+) -> UserScope:
+    """The scope ``nodes.user_scope`` builds from a PC home whose file ``rel``
+    exists but does not read as a JSON object (``how``); ``files`` are the
+    home's other files, by home-relative path."""
+    home = tmp_path / "pc"
+    for name, value in files.items():
+        _put(home / name, value)
+    path = home / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if how == "torn":
+        path.write_text('{"env": {"FROM_PC": "x"', encoding="utf-8")
+    elif how == "a-list":
+        path.write_text('[{"env": {"FROM_PC": "x"}}]', encoding="utf-8")
+    else:
+        path.write_text("{}", encoding="utf-8")
+        _deny_read(monkeypatch, path)
+    return nodes.user_scope(home)
+
+
+UNREAD = [
+    ("torn", "JSONDecodeError"),
+    ("a-list", "not a JSON object"),
+    ("denied", "PermissionError"),
+]
+SHIPPED = {
+    "model": "opus",
+    "env": {"FROM_PC": "x"},
+    "permissions": {"allow": ["Bash(rm:*)"], "additionalDirectories": ["/d"]},
+}
+
+
+def _rows(lines: list[remote_mux.ScriptLine], item: str) -> list[remote_mux.ScriptLine]:
+    return [line for line in lines if line.item == item]
+
+
+class TestAnUnreadablePcFileLeavesTheNodeAlone:
+    """Unknown is not empty (U4): a PC file that exists but did not read
+    would, shipped as {}, take back every env key, rule and directory the PC
+    shipped last time. Its steps print one skip row naming the class, write
+    nothing, and keep what they remember -- so the next readable provision
+    still takes back against the right record."""
+
+    @pytest.mark.parametrize(("how", "why"), UNREAD)
+    def test_unread_settings_are_a_skip_row_and_no_node_write(
+        self, box, tmp_path, capsys, monkeypatch, how, why
+    ):
+        _put(_settings(box), {"env": {"NODE_ONLY": "1"}})
+        box.apply(_work(tmp_path, _pc_settings(SHIPPED)))
+        written = _settings(box).read_bytes()
+        remembered = _json(_store(box))
+        capsys.readouterr()
+        scope = _unreadable_pc(tmp_path, monkeypatch, how, ".claude/settings.json")
+        assert box.apply(_work(tmp_path, scope, name="work2")) == 0
+        assert _rows(_lines(capsys), "settings") == [
+            remote_mux.ScriptLine(
+                "skip",
+                "settings",
+                f"this PC's ~/.claude/settings.json could not be read ({why}); "
+                "the node's settings are left as they are",
+            )
+        ]
+        assert _settings(box).read_bytes() == written
+        kept = _json(_store(box))
+        assert isinstance(kept, dict)
+        assert isinstance(remembered, dict)
+        assert kept["shipped"]["settings"] == remembered["shipped"]["settings"]
+        assert kept["digests"]["settings"] == remembered["digests"]["settings"]
+
+    def test_the_next_readable_provision_still_takes_back_what_stopped(
+        self, box, tmp_path, monkeypatch
+    ):
+        box.apply(_work(tmp_path, _pc_settings(SHIPPED)))
+        scope = _unreadable_pc(tmp_path, monkeypatch, "torn", ".claude/settings.json")
+        box.apply(_work(tmp_path, scope, name="work2"))
+        box.apply(_work(tmp_path, _pc_settings({"model": "opus"}), name="work3"))
+        node = _json(_settings(box))
+        assert isinstance(node, dict)
+        assert node["env"] == {}
+        assert node["permissions"]["allow"] == []
+        assert node["permissions"]["additionalDirectories"] == []
+
+    def test_unread_settings_skip_even_when_the_node_has_none(
+        self, box, tmp_path, capsys, monkeypatch
+    ):
+        scope = _unreadable_pc(tmp_path, monkeypatch, "torn", ".claude/settings.json")
+        assert box.apply(_work(tmp_path, scope)) == 0
+        assert _status(_lines(capsys), "settings") == "skip"
+        assert not _settings(box).exists()
+
+    @pytest.mark.parametrize(
+        "damage", [None, "{oops", "[1]"], ids=["missing", "not-json", "not-an-object"]
+    )
+    def test_a_payload_settings_member_that_does_not_read_fails_and_writes_nothing(
+        self, box, tmp_path, capsys, damage
+    ):
+        # The manifest says nothing was unread, yet the member is not an
+        # object: a broken payload, never "the PC ships no settings".
+        box.apply(_work(tmp_path, _pc_settings(SHIPPED)))
+        written = _settings(box).read_bytes()
+        capsys.readouterr()
+        work = _work(tmp_path, _pc_settings({}), name="work2")
+        if damage is None:
+            (work / "settings.json").unlink()
+        else:
+            (work / "settings.json").write_text(damage, encoding="utf-8")
+        assert box.apply(work) == 1
+        assert _rows(_lines(capsys), "settings") == [
+            remote_mux.ScriptLine(
+                "fail",
+                "settings",
+                "the payload carries no readable settings.json; the node's "
+                "settings are left as they are",
+            )
+        ]
+        assert _settings(box).read_bytes() == written
+
+    @pytest.mark.parametrize(("how", "why"), UNREAD)
+    def test_unread_plugins_install_nothing(
+        self, box, tmp_path, capsys, monkeypatch, how, why
+    ):
+        claude = _claude(box, markets=())
+        scope = _unreadable_pc(
+            tmp_path,
+            monkeypatch,
+            how,
+            ".claude/plugins/known_marketplaces.json",
+            **{".claude/settings.json": {"enabledPlugins": {"p@mkt": True}}},
+        )
+        assert box.apply(_work(tmp_path, scope)) == 0
+        assert _rows(_lines(capsys), "plugins") == [
+            remote_mux.ScriptLine(
+                "skip",
+                "plugins",
+                f"this PC's plugin list could not be read ({why}); nothing is "
+                "installed this time",
+            )
+        ]
+        assert claude.calls() == []
+
+    @pytest.mark.parametrize(("how", "why"), UNREAD)
+    def test_an_unread_claude_json_skips_the_servers_and_their_oauth(
+        self, box, tmp_path, capsys, monkeypatch, how, why
+    ):
+        _put(_claude_json(box), {"mcpServers": {"docs": DOCS}})
+        _put(_credentials(box), {"mcpOAuth": {A: {"serverName": "docs"}}})
+        before = (_claude_json(box).read_bytes(), _credentials(box).read_bytes())
+        scope = _unreadable_pc(
+            tmp_path,
+            monkeypatch,
+            how,
+            ".claude.json",
+            **{".claude/.credentials.json": {"mcpOAuth": _oauth()}},
+        )
+        assert box.apply(_work(tmp_path, scope)) == 0
+        lines = _lines(capsys)
+        assert _rows(lines, "mcp") == [
+            remote_mux.ScriptLine(
+                "skip",
+                "mcp",
+                f"this PC's ~/.claude.json could not be read ({why}); the node's "
+                "MCP servers are left as they are",
+            )
+        ]
+        assert _rows(lines, "mcp_oauth") == [
+            remote_mux.ScriptLine(
+                "skip",
+                "mcp_oauth",
+                f"this PC's MCP OAuth entries could not be read ({why}); the "
+                "node's are left as they are",
+            )
+        ]
+        assert (_claude_json(box).read_bytes(), _credentials(box).read_bytes()) == (
+            before
+        )
+
+    @pytest.mark.parametrize(("how", "why"), UNREAD)
+    def test_an_unread_credentials_file_skips_the_oauth_step(
+        self, box, tmp_path, capsys, monkeypatch, how, why
+    ):
+        _put(_credentials(box), {"mcpOAuth": {A: {"serverName": "docs"}}})
+        before = _credentials(box).read_bytes()
+        scope = _unreadable_pc(
+            tmp_path,
+            monkeypatch,
+            how,
+            ".claude/.credentials.json",
+            **{".claude.json": {"mcpServers": {"docs": DOCS}}},
+        )
+        assert box.apply(_work(tmp_path, scope)) == 0
+        assert _rows(_lines(capsys), "mcp_oauth") == [
+            remote_mux.ScriptLine(
+                "skip",
+                "mcp_oauth",
+                f"this PC's MCP OAuth entries could not be read ({why}); the "
+                "node's are left as they are",
+            )
+        ]
+        assert _credentials(box).read_bytes() == before

@@ -742,15 +742,22 @@ def build_payload(
         "plugins": list(scope.plugins),
         "marketplaces": scope.marketplaces,
         "hook_entries": entries,
+        # Steps whose PC file did not read: node_apply leaves them alone.
+        "unread": scope.unread,
     }
     members: list[tuple[str, bytes, int]] = [
         ("manifest.json", _canonical(manifest).encode("utf-8"), 0o600),
         ("mcp_oauth.json", _canonical(scope.mcp_oauth).encode("utf-8"), 0o600),
         ("mcp_servers.json", _canonical(scope.mcp_servers).encode("utf-8"), 0o600),
         ("node_apply.py", node_scripts.source("node_apply.py").encode("utf-8"), 0o600),
-        ("settings.json", _canonical(scope.settings).encode("utf-8"), 0o600),
         ("state-hook.sh", state_hook.encode("utf-8"), 0o700),
     ]
+    # Unread settings are not sent at all: an empty settings.json would read
+    # as "this PC ships nothing" and take back what it shipped before.
+    if "settings" not in scope.unread:
+        members.append(
+            ("settings.json", _canonical(scope.settings).encode("utf-8"), 0o600)
+        )
     members += [
         (f"skills/{f.path}", f.data, 0o700 if f.executable else 0o600)
         for f in scope.skills

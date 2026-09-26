@@ -5,6 +5,7 @@ bash on POSIX; the pool is Linux)."""
 
 from __future__ import annotations
 
+import errno
 import inspect
 import io
 import json
@@ -222,7 +223,16 @@ class TestUserScopeSettingsAndMcp:
         (home / ".claude" / "settings.json").write_text("{nope", encoding="utf-8")
         scope = nodes.user_scope(home)
         assert scope.settings == {}
-        assert scope.notes == ("settings.json: not valid JSON, skipped",)
+        assert scope.unread == {
+            "settings": "JSONDecodeError",
+            "plugins": "JSONDecodeError",
+        }
+        assert scope.notes == (
+            (
+                "settings.json: could not be read (JSONDecodeError), so nothing from "
+                "it ships this time"
+            ),
+        )
 
     def test_user_mcp_servers_come_from_claude_json_alone(self, tmp_path):
         home = _pc_home(
@@ -620,7 +630,16 @@ class TestAMalformedPcFileIsANoteNotACrash:
         (home / ".claude" / "settings.json").write_bytes(b'{"model": "\xff"}')
         scope = nodes.user_scope(home)
         assert scope.settings == {}
-        assert scope.notes == ("settings.json: not valid UTF-8, skipped",)
+        assert scope.unread == {
+            "settings": "UnicodeDecodeError",
+            "plugins": "UnicodeDecodeError",
+        }
+        assert scope.notes == (
+            (
+                "settings.json: could not be read (UnicodeDecodeError), so nothing "
+                "from it ships this time"
+            ),
+        )
 
     def test_a_url_that_does_not_parse(self, tmp_path):
         home = _pc_home(
@@ -646,6 +665,178 @@ class TestAMalformedPcFileIsANoteNotACrash:
         assert scope.notes == (
             "mcpOAuth: 1 entry for servers not in mcpServers left out",
         )
+
+
+def _deny_read(monkeypatch: pytest.MonkeyPatch, denied: Path) -> None:
+    """``denied`` raises PermissionError when read, on every OS (a Windows
+    chmod does not stop a read)."""
+    read_text = Path.read_text
+
+    def guarded(self: Path, *args: object, **kwargs: object) -> str:
+        if self == denied:
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded)
+
+
+# Each way a PC file that EXISTS can fail to read as a JSON object, and the
+# class -- all a screen may show of it.
+UNREAD = [
+    ("torn", "JSONDecodeError"),
+    ("a-list", "not a JSON object"),
+    ("denied", "PermissionError"),
+]
+
+
+def _damage(monkeypatch: pytest.MonkeyPatch, path: Path, how: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if how == "torn":
+        path.write_text('{"env": {"FROM_PC": "x"', encoding="utf-8")
+    elif how == "a-list":
+        path.write_text('[{"env": {"FROM_PC": "x"}}]', encoding="utf-8")
+    else:
+        path.write_text("{}", encoding="utf-8")
+        _deny_read(monkeypatch, path)
+
+
+class TestAnUnreadablePcFileIsUnknownNotEmpty:
+    """A PC file that exists but does not read as a JSON object is UNKNOWN:
+    the steps it feeds are marked unread (the node leaves its copy alone),
+    never shipped as empty -- an empty settings.json takes back everything
+    the PC shipped last time. The screen gets the class; the path and the
+    error text go to the log only."""
+
+    @pytest.mark.parametrize(("how", "why"), UNREAD)
+    def test_settings_json_marks_the_settings_and_the_plugins_unread(
+        self, tmp_path, monkeypatch, caplog, how, why
+    ):
+        home = _pc_home(tmp_path)
+        path = home / ".claude" / "settings.json"
+        _damage(monkeypatch, path, how)
+        caplog.set_level("WARNING")
+        scope = nodes.user_scope(home)
+        assert scope.unread == {"settings": why, "plugins": why}
+        assert scope.notes == (
+            (
+                f"settings.json: could not be read ({why}), so nothing from it ships "
+                "this time"
+            ),
+        )
+        assert str(path) in caplog.text
+
+    @pytest.mark.parametrize(("how", "why"), UNREAD)
+    def test_the_note_never_carries_the_path_or_the_error_text(
+        self, tmp_path, monkeypatch, caplog, how, why
+    ):
+        home = _pc_home(tmp_path)
+        path = home / ".claude" / "settings.json"
+        _damage(monkeypatch, path, how)
+        caplog.set_level("WARNING")
+        scope = nodes.user_scope(home)
+        shown = " ".join(scope.notes)
+        assert str(home) not in shown
+        for detail in ("Permission denied", "Expecting", "line 1", "list"):
+            assert detail not in shown
+        # ... and the log has what the screen does not.
+        detail = {"torn": "line 1", "a-list": "list", "denied": "Permission denied"}
+        assert detail[how] in caplog.text
+
+    @pytest.mark.parametrize("text", ["[1]", '"x"', "null", "3"])
+    def test_a_top_level_that_is_not_an_object_is_unread(self, tmp_path, text):
+        path = tmp_path / "settings.json"
+        path.write_text(text, encoding="utf-8")
+        notes: list[str] = []
+        found = nodes._read_object(path, "settings.json", notes)
+        assert found == nodes._Unread("not a JSON object")
+
+    def test_an_absent_file_reads_as_empty(self, tmp_path):
+        notes: list[str] = []
+        found = nodes._read_object(tmp_path / "settings.json", "settings.json", notes)
+        assert found == {}
+        assert notes == []
+
+    def test_an_absent_settings_file_is_still_empty_not_unread(self, tmp_path):
+        scope = nodes.user_scope(_pc_home(tmp_path, claude_json={}))
+        assert scope.unread == {}
+        assert scope.notes == ()
+
+    @pytest.mark.parametrize(("how", "why"), UNREAD)
+    def test_claude_json_marks_the_servers_and_their_oauth_unread(
+        self, tmp_path, monkeypatch, how, why
+    ):
+        # With the server list unknown, an OAuth entry is not "for a server
+        # not in mcpServers": no such note.
+        home = _pc_home(
+            tmp_path,
+            credentials={"mcpOAuth": {"docs|0": {"serverName": "docs"}}},
+        )
+        _damage(monkeypatch, home / ".claude.json", how)
+        scope = nodes.user_scope(home)
+        assert scope.unread == {"mcp": why, "mcp_oauth": why}
+        assert scope.mcp_oauth == {}
+        assert scope.notes == (
+            (
+                f".claude.json: could not be read ({why}), so nothing from it ships "
+                "this time"
+            ),
+        )
+
+    @pytest.mark.parametrize(("how", "why"), UNREAD)
+    def test_the_credentials_file_marks_the_oauth_entries_unread(
+        self, tmp_path, monkeypatch, how, why
+    ):
+        home = _pc_home(
+            tmp_path,
+            claude_json={
+                "mcpServers": {"docs": {"type": "http", "url": "https://d.example"}}
+            },
+        )
+        _damage(monkeypatch, home / ".claude" / ".credentials.json", how)
+        scope = nodes.user_scope(home)
+        assert scope.unread == {"mcp_oauth": why}
+        assert set(scope.mcp_servers) == {"docs"}
+
+    @pytest.mark.parametrize(("how", "why"), UNREAD)
+    def test_the_marketplace_list_marks_the_plugins_unread(
+        self, tmp_path, monkeypatch, how, why
+    ):
+        # With the list unknown, a marketplace is not "without a remote
+        # source on this PC": no such note, and no source guessed.
+        home = _pc_home(tmp_path, settings={"enabledPlugins": {"p@mkt": True}})
+        _damage(
+            monkeypatch, home / ".claude" / "plugins" / "known_marketplaces.json", how
+        )
+        scope = nodes.user_scope(home)
+        assert scope.unread == {"plugins": why}
+        assert scope.marketplaces == {}
+        assert scope.notes == (
+            (
+                f"plugins/known_marketplaces.json: could not be read ({why}), so "
+                "nothing from it ships this time"
+            ),
+        )
+
+    def test_unread_settings_travel_as_no_member_and_a_manifest_mark(self):
+        scope = _scope(unread={"settings": "PermissionError"})
+        _, infos, data = _unpack(_payload(scope))
+        assert "settings.json" not in infos
+        manifest = json.loads(data["manifest.json"])
+        assert manifest["unread"] == {"settings": "PermissionError"}
+
+    def test_a_readable_scope_ships_its_settings_and_marks_nothing(self):
+        _, _, data = _unpack(_payload(_scope(settings={"model": "opus"})))
+        assert json.loads(data["settings.json"]) == {"model": "opus"}
+        assert json.loads(data["manifest.json"])["unread"] == {}
+
+    def test_a_dropped_program_keeps_the_unread_mark(self):
+        scope = _scope(
+            mcp_servers={"s": {"type": "stdio", "command": "uvx s"}},
+            unread={"settings": "JSONDecodeError"},
+        )
+        kept = nodes.without_missing_programs(scope, found=frozenset())
+        assert kept.mcp_servers == {}
+        assert kept.unread == {"settings": "JSONDecodeError"}
 
 
 class TestUserScopePluginsAndSkills:
