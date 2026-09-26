@@ -2818,6 +2818,101 @@ class TestProvisionShUnderRealBash:
         assert list((tmp_path / "tmp").iterdir()) == []
 
 
+def _hostile_payload(extra: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
+    """A real payload (one skill) with ``extra`` members appended after
+    build_payload's own: what a corrupt or hostile archive would carry."""
+    skill = nodes.SkillFile(path="s/SKILL.md", data=b"# s\n", executable=False)
+    token_line, _, archive = _node_payload(_scope(skills=(skill,))).partition(b"\n")
+    raw = io.BytesIO()
+    with (
+        tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as src,
+        tarfile.open(fileobj=raw, mode="w:gz", format=tarfile.PAX_FORMAT) as out,
+    ):
+        for info in src.getmembers():
+            out.addfile(info, src.extractfile(info))
+        for info, data in extra:
+            out.addfile(info, io.BytesIO(data) if data is not None else None)
+    return token_line + b"\n" + raw.getvalue()
+
+
+def _file_member(name: str) -> tuple[tarfile.TarInfo, bytes]:
+    info = tarfile.TarInfo(name)
+    info.size, info.mode = len(b"ESCAPED"), 0o600
+    return info, b"ESCAPED"
+
+
+def _link_member(name: str, target: str, kind: bytes) -> tuple[tarfile.TarInfo, None]:
+    info = tarfile.TarInfo(name)
+    info.type, info.linkname, info.mode = kind, target, 0o777
+    return info, None
+
+
+# (id, the extra members given tmp_path). The work dir provision.sh unpacks
+# into is tmp_path/tmp/<mktemp>, so "../../../" from skills/ is tmp_path.
+HOSTILE_MEMBERS = [
+    ("dotdot-name", lambda t: [_file_member("skills/../../escape.md")]),
+    ("absolute-name", lambda t: [_file_member(str(t / "escape.md"))]),
+    (
+        "symlink-file-outside",
+        lambda t: [
+            _link_member(
+                "skills/s/leak.md", str(t / "outside" / "secret.md"), tarfile.SYMTYPE
+            )
+        ],
+    ),
+    (
+        "absolute-symlink-folder-then-a-write-through-it",
+        lambda t: [
+            _link_member("skills/t", str(t / "outside"), tarfile.SYMTYPE),
+            _file_member("skills/t/escape.md"),
+        ],
+    ),
+    (
+        "relative-symlink-folder-then-a-write-through-it",
+        lambda t: [
+            _link_member("skills/t", "../../../outside", tarfile.SYMTYPE),
+            _file_member("skills/t/escape.md"),
+        ],
+    ),
+    (
+        "hardlink-outside",
+        lambda t: [
+            _link_member(
+                "skills/s/hl.md", str(t / "outside" / "secret.md"), tarfile.LNKTYPE
+            )
+        ],
+    ),
+    (
+        "hardlink-inside",
+        lambda t: [_link_member("skills/s/hl.md", "settings.json", tarfile.LNKTYPE)],
+    ),
+]
+
+
+# The receiver side of the payload contract, through the real tar: whatever a
+# member's name or link says, nothing lands or links outside the private work
+# dir, and a payload carrying such a member applies NOTHING (one fail row).
+@POSIX_BASH
+class TestAPayloadMemberNeverReachesOutsideTheWorkDir:
+    @pytest.mark.parametrize(
+        "build", [b for _, b in HOSTILE_MEMBERS], ids=[i for i, _ in HOSTILE_MEMBERS]
+    )
+    def test_it_is_refused_whole_and_nothing_escapes(self, tmp_path, build):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.md").write_bytes(b"NODE-SECRET-DECOY")
+        r = _run_provision(tmp_path, _hostile_payload(build(tmp_path)))
+        assert r.returncode == 1, r.stdout
+        assert _rows(r) == {"payload": "fail"}
+        assert [p.name for p in outside.iterdir()] == ["secret.md"]
+        assert (outside / "secret.md").read_bytes() == b"NODE-SECRET-DECOY"
+        assert (outside / "secret.md").stat().st_nlink == 1
+        assert list(tmp_path.rglob("escape.md")) == []
+        assert list((tmp_path / "node").iterdir()) == []
+        assert list((tmp_path / "tmp").iterdir()) == []
+        assert b"NODE-SECRET-DECOY" not in r.stdout + r.stderr
+
+
 @POSIX_BASH
 class TestProgramsShUnderRealBash:
     def test_it_names_what_the_node_resolves_and_what_it_lacks(self, tmp_path):
