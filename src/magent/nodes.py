@@ -236,8 +236,9 @@ def load_node_map_strict() -> dict[str, NodeMapEntry]:
     ``{}`` means exactly one thing here: the file does not exist. A file that
     is momentarily locked (``PermissionError``: the Windows reader racing an
     ``os.replace``) is retried ``_BUSY_RETRIES`` times ``_BUSY_SLEEP_S`` apart,
-    then re-raised; any other ``OSError``, and a torn or non-object file
-    (``ValueError``), propagate. A malformed ENTRY is still dropped alone.
+    then re-raised; any other ``OSError``, and a torn, non-object or too
+    deeply nested file (``ValueError``), propagate. A malformed ENTRY is still
+    dropped alone.
 
     PR-D's ``update_node_map`` MUST read through this for its
     read-modify-write: an unreadable map read as ``{}`` and written back would
@@ -259,6 +260,10 @@ def load_node_map_strict() -> dict[str, NodeMapEntry]:
         # Name the file, as the non-object branch does: "Expecting value: line
         # 1 column 1" alone does not say WHICH file is refusing every write.
         raise ValueError(f"{NODE_MAP_PATH}: {exc}") from exc
+    except RecursionError as e:
+        # json.loads' answer to deep nesting. Re-raised as the ValueError every
+        # caller already catches for a bad file, so none of them needs to know.
+        raise ValueError(f"{NODE_MAP_PATH}: nested too deeply to read") from e
     if not isinstance(raw, dict):
         raise ValueError(f"{NODE_MAP_PATH}: not a JSON object")  # noqa: TRY004  # reason: a non-object file is corrupt DATA, the same family as the JSONDecodeError (a ValueError) a torn file raises; callers catch one type for every bad file
     out: dict[str, NodeMapEntry] = {}
@@ -611,7 +616,8 @@ def read_sessions(nick: str, *, nodes_dir: Path | None = None) -> NodeSessions |
         raw = json.loads(
             sessions_path(nick, nodes_dir=nodes_dir).read_text(encoding="utf-8")
         )
-    except (OSError, ValueError):
+    # RecursionError: json.loads' answer to deep nesting, a corrupt file too.
+    except (OSError, ValueError, RecursionError):
         return None
     if not isinstance(raw, dict):
         return None

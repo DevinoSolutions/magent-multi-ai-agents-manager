@@ -27,6 +27,7 @@ import json
 import logging
 import math
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -70,11 +71,16 @@ _PID_PATH = Path.home() / ".magent" / f"{HEARTBEAT_NAME}.pid"
 # One tick's outcome per node.
 OK = "ok"
 UNREACHABLE = "unreachable"  # ssh transport failure (255) or no answer in time
-FAILED = "failed"  # the node answered, and the answer was not a pull
+# Everything else: a bad answer, a local error (an ssh that will not start, an
+# over-cap reply, a disk write), or a bug ("internal error: <type>").
+FAILED = "failed"
 MISCONFIGURED = "misconfigured"  # the nick does not resolve (D4, no user)
 LOCKED = "locked"  # another pull holds this node right now
 # The UNREACHABLE detail for a node whose pull outlived the tick's wait.
 PULL_STILL_RUNNING = "pull still running"
+# Not an outcome (tick reports it as FAILED): the state _note keeps for a node
+# whose pull raised something unexpected, so its ERROR is logged once.
+_INTERNAL_ERROR = "internal error"
 
 
 def daemon_running() -> bool:
@@ -258,6 +264,12 @@ def state_stores() -> list[tuple[str, str, Path]]:
     return stores
 
 
+class NodeLockHeld(LockHeld):
+    """``node_lock`` could not take ``node-pull-<nick>``: another pull of the
+    same node holds it. Its own type so a caller can tell this contention from
+    a LockHeld raised INSIDE the lock's body, which is some other lock."""
+
+
 @contextlib.contextmanager
 def node_lock(
     nick: str,
@@ -267,18 +279,18 @@ def node_lock(
     now: Callable[[], float] = time.monotonic,
 ) -> Iterator[None]:
     """Hold ``node-pull-<nick>`` for one pull, retrying every
-    ``NODE_LOCK_RETRY_S`` for up to ``wait_s``. LockHeld when it stays taken.
-    Only ACQUIRING is retried: a LockHeld raised inside the body propagates as
-    itself."""
+    ``NODE_LOCK_RETRY_S`` for up to ``wait_s``. NodeLockHeld when it stays
+    taken. Only ACQUIRING is retried: a LockHeld raised inside the body
+    propagates as itself, never as NodeLockHeld."""
     deadline = now() + wait_s
     with contextlib.ExitStack() as stack:
         while True:
             try:
                 stack.enter_context(exclusive_lock(NODE_LOCK_PREFIX + nick))
                 break
-            except LockHeld:
+            except LockHeld as e:
                 if now() >= deadline:
-                    raise
+                    raise NodeLockHeld(*e.args) from e
                 sleep(NODE_LOCK_RETRY_S)
         yield
 
@@ -352,7 +364,9 @@ class Mark:
 def _read_marks(nick: str) -> dict[str, Mark]:
     try:
         raw = json.loads(nodes.pull_marks_path(nick).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    # RecursionError: json.loads' answer to deep nesting -- a corrupt file like
+    # any other, never an internal error (which logs at ERROR, to Sentry).
+    except (OSError, ValueError, RecursionError):
         return {}
     if not isinstance(raw, dict):
         return {}
@@ -361,16 +375,18 @@ def _read_marks(nick: str) -> dict[str, Mark]:
         if not isinstance(sid, str) or not isinstance(value, dict):
             continue
         since, real = value.get("since"), value.get("realpath")
-        if (
-            isinstance(since, bool)
-            or not isinstance(since, (int, float))
-            # Python's json reads NaN and Infinity; neither is a watermark.
-            or not math.isfinite(since)
-        ):
+        if isinstance(since, bool) or not isinstance(since, (int, float)):
             continue
-        out[sid] = Mark(
-            since=float(since), realpath=real if isinstance(real, str) else None
-        )
+        # json.loads accepts NaN/Infinity and arbitrarily long integers; neither
+        # is a time, and float() of a 309+-digit int raises OverflowError. A bad
+        # mark is no mark: that session is pulled from the beginning.
+        try:
+            since_f = float(since)
+        except OverflowError:
+            continue
+        if not math.isfinite(since_f):
+            continue
+        out[sid] = Mark(since=since_f, realpath=real if isinstance(real, str) else None)
     return out
 
 
@@ -401,26 +417,15 @@ def _next_mark(
       put (a failed file is asked for again next tick);
     - its transcripts were never requested under the current real path (a
       first sight, a moved directory): from zero;
-    - otherwise: from the node's own clock at scan time, minus the overlap
-      (``_since_after``)."""
+    - otherwise: ``remote_mux.next_since``, the watermark rule ``pull``
+      shares -- the node's clock at scan time minus the overlap, a truncated
+      reply's resume point, or 0.0 when the node's clock is behind the mark."""
     real = snap.realpaths.get(sid)
     if real is None or sid in snap.failed_sids:
         return old if old is not None else Mark(since=0.0, realpath=real)
     if spec.project_dir is None or old is None or old.realpath != real:
         return Mark(since=0.0, realpath=real)
-    return Mark(since=_since_after(old.since, snap.now), realpath=real)
-
-
-def _since_after(old_since: float, node_now: float) -> float:
-    """The next watermark from the node's scan clock, minus the overlap. A
-    node clock that jumped forward and came back leaves ``old_since`` in its
-    future, and files stamped before it would never be asked for again: a
-    watermark that would move BACKWARDS starts the transcripts over from 0.0.
-
-    After the E8 x E14 merge, ``_next_mark`` delegates to
-    ``remote_mux.next_since`` and this reset belongs inside it."""
-    since = node_now - remote_mux.WATERMARK_OVERLAP_S
-    return 0.0 if since < old_since else since
+    return Mark(since=remote_mux.next_since(snap, sid, old.since), realpath=real)
 
 
 def _prune_state(nick: str, sid: str, keep: Collection[str]) -> None:
@@ -504,14 +509,29 @@ def _append_sample(
         fh.write((b"\n" if torn else b"") + row.encode("utf-8") + b"\n")
 
 
+# C0 and C1 control characters and DEL, minus tab: a node's stderr is its own
+# words, and an ESC sequence in it must not reach a terminal tailing the log.
+_CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]")
+
+
 def _last_line(text: str) -> str:
+    """The last non-blank line of a node's stderr, with every control
+    character but tab shown as ``?``."""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return lines[-1] if lines else ""
+    return _CONTROL.sub("?", lines[-1]) if lines else ""
 
 
 def _classify(e: remote_mux.RemoteError) -> tuple[str, str]:
-    detail = _last_line(e.stderr_tail) or f"rc={e.rc}"
-    if e.rc is None or e.rc == SSH_TRANSPORT_RC:
+    """UNREACHABLE only when the node could not be reached (ssh's transport rc
+    255) or never answered (``timed_out``). Every other rc-None error -- a
+    reply over the cap, a local ssh that would not start -- is FAILED.
+
+    The detail is stderr's last line, except over the cap: there the child's
+    last words follow magent's ``reply exceeded N bytes``, and the cap is why
+    the pull failed, so that first line wins."""
+    text = e.stderr_tail.split("\n", 1)[0] if e.over_cap else e.stderr_tail
+    detail = _last_line(text) or f"rc={e.rc}"
+    if e.timed_out or e.rc == SSH_TRANSPORT_RC:
         return UNREACHABLE, detail
     return FAILED, detail
 
@@ -548,6 +568,7 @@ class NodeSyncer:
         self._local_user = local_user
         self._lock_wait_s = lock_wait_s
         self._warned: set[tuple[str, str]] = set()
+        # The last noted state per nick: an outcome, or _INTERNAL_ERROR.
         self._last: dict[str, str] = {}
         self._last_sample: dict[str, float] = {}
         self._sample_failing: set[str] = set()
@@ -558,6 +579,10 @@ class NodeSyncer:
         self._inflight: dict[str, Future[tuple[str, str]]] = {}
         # When each in-flight pull was submitted, on ``clock`` (monotonic).
         self._submitted: dict[str, float] = {}
+        # A node's unexpected exception, from its worker thread to _note. One
+        # key per nick, and one worker per nick at a time, so no two threads
+        # write the same key.
+        self._errors: dict[str, Exception] = {}
 
     def reconfigure(self, config: MagentConfig) -> None:
         self._config = config
@@ -616,6 +641,7 @@ class NodeSyncer:
         for gone in set(self._inflight) - set(pool):
             if self._inflight[gone].done():
                 self._submitted.pop(gone, None)
+                self._errors.pop(gone, None)
                 self._inflight.pop(gone).result()
         # A node that left the pool is forgotten, so one re-added while still
         # down is warned about again rather than read as the old state.
@@ -661,48 +687,74 @@ class NodeSyncer:
         local_user: str,
         config: MagentConfig,
     ) -> tuple[str, str]:
-        """One node's pull, reduced to an outcome. Every failure a node (or its
-        config) can produce stops here; anything else is a bug and propagates.
+        """One node's pull, reduced to an outcome. Nothing raises out of here:
+        what a node (or its config) can do has its own outcome, and anything
+        else is a bug in this PC's code, which fails THIS node alone as
+        ``internal error: <type>`` and hands the exception to ``_note``.
 
         ``config`` is the one its tick read: a worker never reads
         ``self._config``, so a reconfigure while a pull runs cannot reach it."""
+        self._errors.pop(nick, None)
         try:
             node = nodes.node_for_nick(config, nick, local_user=local_user)
             with node_lock(nick, wait_s=self._lock_wait_s):
                 self._pull_and_store(node, entries, config)
         except nodes.NodeConfigError as e:
             return MISCONFIGURED, str(e)
-        except LockHeld:
+        except NodeLockHeld:
             return LOCKED, "another pull holds this node"
+        except LockHeld as e:
+            # Raised inside the node lock, so not the node's own lock: nothing
+            # the pull does takes one, which makes it a bug, not contention.
+            return self._internal_error(nick, e)
         except remote_mux.RemoteError as e:
             return _classify(e)
         except OSError as e:
             return FAILED, str(e)
+        except Exception as e:  # noqa: BLE001  # reason: one node's bug must not stop the other nodes' pulls or crash-loop the daemon; _note logs it with its traceback once per state change
+            return self._internal_error(nick, e)
         return OK, ""
+
+    def _internal_error(self, nick: str, e: Exception) -> tuple[str, str]:
+        self._errors[nick] = e
+        return FAILED, f"internal error: {type(e).__name__}"
 
     def _note(self, nick: str, outcome: str, detail: str) -> None:
         """One log line per state CHANGE: a node down for a day is one warning
         and one "reachable again", not 2,880 lines. A locked tick is no state
-        (the other pull is doing the work) and is never logged."""
+        (the other pull is doing the work) and is never logged.
+
+        An internal error is a state of its own, logged at ERROR with its
+        traceback (so Sentry gets one event per change, never one per tick)."""
         if outcome == LOCKED:
             return
+        # Only a finished pull's FAILED carries an internal error. A tick noting
+        # a pull still running must not take the error its worker may be
+        # recording this instant: the tick that collects that pull logs it.
+        error = self._errors.pop(nick, None) if outcome == FAILED else None
+        state = _INTERNAL_ERROR if error is not None else outcome
         prev = self._last.get(nick)
-        self._last[nick] = outcome
-        if outcome == prev:
+        self._last[nick] = state
+        if state == prev:
             return
         log = get_logger(LOG_NAME)
+        if error is not None:
+            log.error("node %s: %s (%s)", nick, outcome, detail, exc_info=error)
+            return
         if outcome == OK:
-            if prev is not None:
+            if prev == UNREACHABLE:
                 log.info("node %s: reachable again", nick)
+            elif prev is not None:
+                log.info("node %s: ok again (was %s)", nick, prev)
             return
         log.warning("node %s: %s (%s)", nick, outcome, detail)
 
-    def _warn_once(self, nick: str, sid: str) -> None:
+    def _warn_once(self, nick: str, sid: str, why: str) -> None:
         if (nick, sid) in self._warned:
             return
         self._warned.add((nick, sid))
         get_logger(LOG_NAME).warning(
-            "node %s: session %r cannot be mirrored on this PC; skipping it", nick, sid
+            "node %s: session %r %s; skipping it", nick, sid, why
         )
 
     def _pull_and_store(
@@ -711,8 +763,13 @@ class NodeSyncer:
         marks = _read_marks(node.nick)
         specs: dict[str, remote_mux.SidPull] = {}
         for sid, entry in sorted(entries.items()):
-            if not remote_mux.pullable_sid(sid) or not entry.remote_root:
-                self._warn_once(node.nick, sid)
+            if not remote_mux.pullable_sid(sid):
+                self._warn_once(node.nick, sid, "cannot be mirrored on this PC")
+                continue
+            if not entry.remote_root:
+                self._warn_once(
+                    node.nick, sid, "has an empty remote_root in the node map"
+                )
                 continue
             specs[sid] = _spec_for(entry, marks.get(sid))
         snap = self._pull(node, specs)
@@ -890,11 +947,12 @@ def final_pull(
     *,
     wait_s: float = FINAL_PULL_WAIT_S,
     local_user: str | None = None,
+    now: Callable[[], float] = time.monotonic,
 ) -> remote_mux.PullResult | None:
     """Pull project ``name``'s node session once more -- ``down`` calls this
     before it kills the session, so the last turn is home. None when the
     project was never placed. Waits up to ``wait_s`` for a daemon tick that
-    holds the node, then raises LockHeld; NodeConfigError, RemoteError and
+    holds the node, then raises NodeLockHeld; NodeConfigError, RemoteError and
     OSError (writing ``pull.json``) also go to the caller, which decides what
     "could not pull" means.
 
@@ -902,7 +960,16 @@ def final_pull(
     empty remote root) is refused as RemoteError(0) before any ssh, so the
     caller never sees parse_pull's ValueError. A pull that could not store
     every file is RemoteError(0) too: returning would tell ``down`` the last
-    turn is home when it is not. A node that reports no real path for the
+    turn is home when it is not.
+
+    A reply cut at ``remote_mux.PULL_MAX_TOTAL_BYTES`` is resumed from its
+    advanced mark, call after call, until one comes back whole -- a backlog
+    bigger than one cap must not make every ``down`` refuse. The same
+    ``wait_s`` deadline (counted from this call) bounds the resuming: a reply
+    still cut when it passes is RemoteError(0), and so, at once, is a cut
+    reply that did not move the mark, so the loop can never spin. Every mark
+    is written before the next call, so another final pull (or a tick)
+    carries on from the last one. A node that reports no real path for the
     session's root (a deleted project) returns normally with a warning -- no
     later pull could do better."""
     entry = nodes.read_node_map().get(name)
@@ -919,21 +986,46 @@ def final_pull(
         raise remote_mux.refused_pull(
             node, {entry.sid: _spec_for(entry, None)}, refusal
         )
+    deadline = now() + wait_s
     with node_lock(entry.nick, wait_s=wait_s):
         marks = _read_marks(entry.nick)
-        mark, spec, snap = _pull_sid(node, entry, marks.get(entry.sid))
+        asked = marks.get(entry.sid)
+        mark, spec, snap = _pull_sid(node, entry, asked)
         snaps = [snap]
         if mark.realpath is not None and spec.project_dir != (
             nodes.encoded_project_dir(mark.realpath)
         ):
             # The transcript dir only became known with this answer.
-            mark, spec, snap = _pull_sid(node, entry, mark)
+            asked = mark
+            mark, spec, snap = _pull_sid(node, entry, asked)
+            snaps.append(snap)
+        stuck = False
+        # Only the last call counts: each one asks again from its own mark.
+        while entry.sid in snap.truncated and entry.sid not in snap.failed_sids:
+            stuck = mark.since <= (asked.since if asked is not None else 0.0)
+            if stuck or now() >= deadline:
+                break
+            marks[entry.sid] = mark
+            _write_marks(entry.nick, marks)
+            asked = mark
+            mark, spec, snap = _pull_sid(node, entry, asked)
             snaps.append(snap)
         marks[entry.sid] = mark
         _write_marks(entry.nick, marks)
     if any(entry.sid in s.failed_sids for s in snaps):
         raise remote_mux.RemoteError(
             0, f"could not store every pulled file of {entry.sid!r}", ("pull.sh",)
+        )
+    if entry.sid in snap.truncated:
+        why = (
+            "without moving its mark"
+            if stuck
+            else f"and was still cut when the deadline passed ({len(snaps)} calls)"
+        )
+        raise remote_mux.RemoteError(
+            0,
+            f"the reply for {entry.sid!r} reached the pull cap {why}; the rest is owed",
+            ("pull.sh",),
         )
     if spec.project_dir is None:
         get_logger(LOG_NAME).warning(

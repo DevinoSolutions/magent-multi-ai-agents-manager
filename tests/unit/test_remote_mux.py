@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import dataclasses
 import inspect
 import io
@@ -13,6 +14,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -133,6 +135,12 @@ class TestRemoteError:
         assert (err.outcome_unknown, err.timed_out) == (True, False)
         err = RemoteError(None, "t", ("ssh",), timed_out=True)
         assert (err.outcome_unknown, err.timed_out) == (False, True)
+
+    def test_it_is_a_timeout_only_when_told(self):
+        # rc None alone is ambiguous (spawn failure, over-cap reply, timeout);
+        # the flag is what node_sync reads as "the node did not answer".
+        assert RemoteError(None, "", ()).timed_out is False
+        assert RemoteError(None, "", (), timed_out=True).timed_out is True
 
 
 class TestTheSshResolver:
@@ -334,6 +342,17 @@ class TestRun:
         assert exc.value.outcome_unknown is True
         assert time.monotonic() - started < 10
 
+    def test_a_client_that_cannot_be_executed_is_not_a_timeout(self, monkeypatch):
+        def denied(*_a: object, **_k: object) -> object:
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: "ssh")
+        monkeypatch.setattr(remote_mux.subprocess, "Popen", denied)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["true"], timeout_s=5, quiet=True)
+        assert (exc.value.rc, exc.value.stderr_tail) == (None, "Permission denied")
+        assert exc.value.timed_out is False
+
     def test_no_ssh_client_is_rc_127_without_spawning(self):
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["true"], timeout_s=5)
@@ -380,6 +399,29 @@ def spawned(monkeypatch):
 # pipe reads.
 CAP = 256 * 1024
 
+# A child that leaves a GRANDCHILD holding its stderr open (inherited; its pid
+# goes to argv[1]), says one line on stderr, then floods stdout. The 90s sleep
+# outlives every bound the call has (timeout_s=60 + two 1s reaps), so the
+# teardown's kill-by-pid always hits the live grandchild, never a pid Windows
+# reused. Not longer: an unbounded-join mutant waits out the whole sleep.
+_HELD_STDERR_CHILD = """\
+import subprocess, sys
+grandchild = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(90)"],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=None,
+)
+with open(sys.argv[1], "w") as f:
+    f.write(str(grandchild.pid))
+sys.stderr.write("boom: disk full\\n")
+sys.stderr.flush()
+block = b"x" * 65536
+while True:
+    sys.stdout.buffer.write(block)
+    sys.stdout.flush()
+"""
+
 
 class TestTheReplyIsBoundedInMemory:
     def test_every_entry_point_defaults_to_the_module_cap(self):
@@ -402,14 +444,16 @@ class TestTheReplyIsBoundedInMemory:
         started = time.monotonic()
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["big"], timeout_s=30, max_stdout_bytes=CAP)
-        assert time.monotonic() - started < 10
+        # Under the 30s timeout, with room for a loaded box (a spawn: 8-10s).
+        assert time.monotonic() - started < 25
         assert exc.value.rc is None
-        assert exc.value.stderr_tail == f"reply exceeded {CAP} bytes"
         # The node ANSWERED (too much), so it is not a silent node -- node_sync
         # reads timed_out as unreachable -- but the command was killed mid-run
         # and may still be running there: a mutation must not be retried.
         assert exc.value.timed_out is False
+        assert exc.value.over_cap is True
         assert exc.value.outcome_unknown is True
+        assert exc.value.stderr_tail.splitlines()[0] == f"reply exceeded {CAP} bytes"
         assert exc.value.command_redacted[0] == "ssh"
         (proc,) = spawned
         assert proc.poll() is not None
@@ -460,6 +504,63 @@ class TestTheReplyIsBoundedInMemory:
         assert result.stdout == body.encode("ascii")
         (call,) = fake_ssh.calls()
         assert call.stdin == payload
+
+    def test_the_over_cap_error_keeps_what_the_child_said_on_stderr(self, fake_ssh):
+        # The likely cause of a flood is the child's last words before it.
+        fake_ssh.set_reply("flood", stderr="boom: disk full\n")
+        fake_ssh.set_mode("flood")
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["flood"], timeout_s=60, max_stdout_bytes=CAP)
+        lines = exc.value.stderr_tail.splitlines()
+        assert lines[0] == f"reply exceeded {CAP} bytes"
+        assert "boom: disk full" in lines[1:]
+
+    def test_the_stderr_wait_after_the_cap_is_bounded_by_the_reap(self, tmp_path):
+        # A grandchild still holds stderr, so it never ends: the over-cap path
+        # must give up after the reap bound and raise without the tail, not
+        # wait out the grandchild's 90s.
+        pidfile = tmp_path / "grandchild.pid"
+        started = time.monotonic()
+        try:
+            with pytest.raises(RemoteError) as exc:
+                remote_mux._spawn(
+                    [sys.executable, "-c", _HELD_STDERR_CHILD, str(pidfile)],
+                    timeout_s=60,
+                    input_bytes=None,
+                    check=True,
+                    shown=("child",),
+                    label="test child",
+                    quiet=True,
+                    max_stdout_bytes=CAP,
+                )
+            elapsed = time.monotonic() - started
+        finally:
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(pidfile.read_text(encoding="utf-8")), signal.SIGTERM)
+        assert exc.value.stderr_tail == f"reply exceeded {CAP} bytes"
+        assert elapsed < 20
+
+    def test_the_drain_drops_what_it_held_once_over_the_cap(self):
+        # Two writes, so the first cap's worth is HELD before the byte that
+        # tips it over arrives: a drain that kept its chunks would hand
+        # them back.
+        cap = 1024
+        r, w = os.pipe()
+        drain = remote_mux._Drain(os.fdopen(r, "rb"), cap, tail=False)
+        drain.start()
+        try:
+            os.write(w, b"a" * cap)
+            deadline = time.monotonic() + 5
+            while drain._held < cap and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert drain._held == cap
+            os.write(w, b"b")
+        finally:
+            os.close(w)
+        drain.join(5)
+        assert not drain.is_alive()
+        assert drain.over
+        assert drain.data() == b""
 
     def test_run_script_hands_its_cap_to_run(self, fake_ssh):
         fake_ssh.set_reply("bash -s", stdout="x" * (CAP + 1))
@@ -948,6 +1049,15 @@ class TestSample:
         assert "got b'bash: awk: command not found\\n'" in exc.value.stderr_tail
         # rc 0: the node answered; the answer was malformed.
         assert exc.value.rc == 0
+
+    def test_a_reply_nested_too_deeply_is_a_remote_error_not_a_crash(self, fake_ssh):
+        # json.loads answers deep nesting with RecursionError, not ValueError;
+        # 200k '[' is far inside the reply cap and still the node's bad answer.
+        fake_ssh.set_reply("bash -s", stdout="[" * 200_000)
+        with pytest.raises(RemoteError, match="not a load sample") as exc:
+            remote_mux.sample(NODE)
+        assert exc.value.rc == 0
+        assert isinstance(exc.value.__cause__, RecursionError)
 
     def test_the_head_of_what_came_back_is_bounded(self, fake_ssh):
         fake_ssh.set_reply("bash -s", stdout="x" * 5000)

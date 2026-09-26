@@ -471,6 +471,15 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "`?` rather than crashing."
         ),
     ),
+    (
+        "magent node sync -d [--once] [--stop]",
+        (
+            "The daemon that pulls transcripts and agent states home and samples "
+            "each node's load. `magent serve` normally keeps it alive; "
+            "`MAGENT_NODE_SYNC=0` stops serve from doing so (a sync run by hand "
+            "still runs)."
+        ),
+    ),
     ("magent config show", "Display current config."),
     ("magent config layout <cols> <rows>", "Set window grid."),
     ("magent config base-dir <path>", "Set projects folder."),
