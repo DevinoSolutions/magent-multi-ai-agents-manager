@@ -2061,6 +2061,24 @@ class TestTheLastPullMustFinish:
         assert "did not answer" not in result.output
         assert node_answers == []
 
+    def test_a_failure_on_this_pc_during_the_pull_is_printed_not_a_traceback(
+        self, runner, placed_api, node_answers, monkeypatch, api_repo
+    ):
+        # cq-G14 M1: final_pull's own writes (the watermark file, the per-node
+        # lock file) raise a plain OSError.
+        def _denied(*a, **k):
+            raise PermissionError(13, "Permission denied", "pull.json")
+
+        monkeypatch.setattr(node_sync, "final_pull", _denied)
+
+        result = _recall(runner, placed_api, "--local")
+
+        _stopped_before_anything(result, api_repo)
+        assert "could not pull from @second" in result.stderr
+        assert "Permission denied" in result.stderr
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert node_answers == []
+
     def test_a_node_that_did_not_answer_still_goes_on(
         self, runner, placed_api, node_is_gone, api_repo
     ):

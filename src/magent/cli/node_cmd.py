@@ -511,6 +511,10 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
             f"the node-sync daemon is still pulling from @{held.nick}; {_RERUN}",
             _EXIT_UNREACHABLE,
         )
+    except OSError as exc:
+        # After LockHeld (an OSError itself): this PC's side of the pull -- the
+        # watermark file, the per-node lock file -- failed (cq-G14 M1).
+        _fail(f"could not pull from @{held.nick} ({exc}); {_RERUN}", 1)
     except nodes.NodeConfigError as exc:
         _note(
             f"@{held.nick} cannot be pulled from ({exc});"
