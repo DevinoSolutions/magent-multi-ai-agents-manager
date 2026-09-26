@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import errno
+import logging
 import threading
 import time
 from collections import defaultdict
@@ -504,6 +505,30 @@ class TestManyNodeProjectsAtOnce:
         assert peak == {"second": 1, "third": 1}
         # ...and all three map entries survived the concurrent writes.
         assert set(nodes.read_node_map()) == {"a1", "a2", "b1"}
+
+    def test_the_nodes_log_is_set_up_before_the_fan_out(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # get_logger is check-then-set: a first call for a name racing in
+        # eight workers stacks a handler per worker, and every nodes.log line
+        # is then written that many times. (conftest's log.reset_logging() hands
+        # every test an unconfigured logger, so this batch makes the first call.)
+        logger = logging.getLogger("magent.nodes")
+        assert logger.handlers == []
+        first: list[threading.Thread] = []
+        real = launch.get_logger
+
+        def spy(name: str) -> logging.Logger:
+            if name == "nodes" and not first:
+                first.append(threading.current_thread())
+            return real(name)
+
+        monkeypatch.setattr(launch, "get_logger", spy)
+        spec = [(f"p{i}", ("second", "third")[i % 2]) for i in range(8)]
+        outcomes = _batch(_config(*_projects(tmp_path, rig, spec)))
+        assert all(o.ok for o in outcomes)
+        assert first == [threading.current_thread()]
+        assert len(logger.handlers) == 1
 
 
 def _no_contact_for(monkeypatch: pytest.MonkeyPatch, rig: NodeRig, *sids: str) -> None:
