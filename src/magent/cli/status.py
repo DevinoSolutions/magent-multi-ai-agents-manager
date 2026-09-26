@@ -17,6 +17,7 @@ by `_render_status`, published additively under `status --json`'s
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 import time
@@ -47,7 +48,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
-    from magent.cli.node_cmd import NodeSyncStop
     from magent.config import MagentConfig
 
 
@@ -753,81 +753,87 @@ def down_cmd(
     remote_rc = 0
     # heavy subsystem: in-body per policy
     from magent import nodes
-    from magent.cli.node_cmd import restop_node_sync_and_say, stop_node_sync_and_say
+    from magent.cli.node_cmd import DownSyncStop
 
-    # A config with no node projects never had one to mention -- unless one is
-    # running, which is always said.
-    say_sync_absent = bool(nodes.node_projects(cfg))
-    sync_first: NodeSyncStop | None = None
-    if remote:
-        from magent.cli.attach import (
-            _remote_down,  # sibling module: every SSH invocation lives in attach
+    # From the first node sync stop to the last, serve's supervisor lock is
+    # held (the ExitStack), so serve cannot restart the daemon in between.
+    with contextlib.ExitStack() as sync_hold:
+        # A config with no node projects never had a daemon to mention --
+        # unless one is running, which is always said.
+        sync = (
+            DownSyncStop(sync_hold, say_absent=bool(nodes.node_projects(cfg)))
+            if do_all
+            else None
         )
-
-        remote_rc = _remote_down(remote, names, group, do_all, stop_srv)
-    elif targets:
-        # A node target is two sessions under one name (PR-D): the local one
-        # it may have left here, which `stop_psmux` kills with the rest of
-        # `targets`, and the one on its node, which only `stop_node_sessions`
-        # dials. Each has exactly one killer; the report folds both halves.
-        stopped, still = stop_psmux(targets)
-        node_stopped: list[str] = []
-        node_still: list[str] = []
-        if node_targets:
-            if do_all:
-                # Before the pulls: a sync tick mid-pull holds node-pull-<nick>,
-                # which down's own final pull would wait out. Killing the daemon
-                # mid-tick is safe -- the OS drops its locks, and marks and
-                # pulled files are replaced atomically. `down --all` only: a
-                # partial down leaves the daemon to the nodes it still serves.
-                sync_first = stop_node_sync_and_say(say_absent=say_sync_absent)
-            node_stopped, node_still = stop_node_sessions(cfg, node_targets)
-        _report_shutdown(stopped, still, node_stopped, node_still)
-        _echo_attach_host_hint(live, placed)
-    else:
-        click.echo(f"  {style('-', dim=True)} No matching sessions in config.")
-
-    if do_all or stop_srv:
-        from magent.upload_server import (
-            stop_server,  # heavy subsystem: in-body per policy
-        )
-
-        if stop_server(cfg.settings.upload_port):
-            click.echo(
-                f"  {style('+', fg='green')} Stopped upload server on port {cfg.settings.upload_port}."
-            )
-        else:
-            click.echo(
-                f"  {style('-', dim=True)} Upload server not running, or could not be stopped (see logs)."
+        if remote:
+            from magent.cli.attach import (
+                _remote_down,  # sibling module: every SSH invocation lives in attach
             )
 
-    from magent.platform import get_platform  # heavy subsystem: in-body per policy
-
-    if do_all and get_platform().supports_hotkey():
-        from magent.hotkey import (
-            stop_listener,  # ImportError off-Windows (hotkey.py guards); must stay lazy
-        )
-
-        if stop_listener():
-            click.echo(f"  {style('+', fg='green')} Stopped the Alt+V listener.")
+            remote_rc = _remote_down(remote, names, group, do_all, stop_srv)
+        elif targets:
+            # A node target is two sessions under one name (PR-D): the local one
+            # it may have left here, which `stop_psmux` kills with the rest of
+            # `targets`, and the one on its node, which only `stop_node_sessions`
+            # dials. Each has exactly one killer; the report folds both halves.
+            stopped, still = stop_psmux(targets)
+            node_stopped: list[str] = []
+            node_still: list[str] = []
+            if node_targets:
+                if sync is not None:
+                    # Before the pulls: a sync tick mid-pull holds
+                    # node-pull-<nick>, which down's own final pull would wait
+                    # out. Killing the daemon mid-tick is safe -- the OS drops
+                    # its locks, and marks and pulled files are replaced
+                    # atomically. `down --all` only: a partial down leaves the
+                    # daemon to the nodes it still serves.
+                    sync.before_pulls()
+                node_stopped, node_still = stop_node_sessions(cfg, node_targets)
+            _report_shutdown(stopped, still, node_stopped, node_still)
+            _echo_attach_host_hint(live, placed)
         else:
-            click.echo(f"  {style('-', dim=True)} Alt+V listener was not running.")
+            click.echo(f"  {style('-', dim=True)} No matching sessions in config.")
 
-    if do_all:
-        from magent.cli.attention_cmd import stop_daemon
+        if do_all or stop_srv:
+            from magent.upload_server import (
+                stop_server,  # heavy subsystem: in-body per policy
+            )
 
-        if stop_daemon():
-            click.echo(f"  {style('+', fg='green')} Stopped the attention daemon.")
-        else:
-            click.echo(f"  {style('-', dim=True)} Attention daemon was not running.")
+            if stop_server(cfg.settings.upload_port):
+                click.echo(
+                    f"  {style('+', fg='green')} Stopped upload server on port {cfg.settings.upload_port}."
+                )
+            else:
+                click.echo(
+                    f"  {style('-', dim=True)} Upload server not running, or could not be stopped (see logs)."
+                )
 
-    if do_all:
-        # Again, now that serve (whose supervisor restarts the daemon) and
-        # attention -d (whose watchdog restarts serve) are down.
-        if sync_first is None:
-            stop_node_sync_and_say(say_absent=say_sync_absent)
-        else:
-            restop_node_sync_and_say(sync_first)
+        from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+        if do_all and get_platform().supports_hotkey():
+            from magent.hotkey import (
+                stop_listener,  # ImportError off-Windows (hotkey.py guards); must stay lazy
+            )
+
+            if stop_listener():
+                click.echo(f"  {style('+', fg='green')} Stopped the Alt+V listener.")
+            else:
+                click.echo(f"  {style('-', dim=True)} Alt+V listener was not running.")
+
+        if do_all:
+            from magent.cli.attention_cmd import stop_daemon
+
+            if stop_daemon():
+                click.echo(f"  {style('+', fg='green')} Stopped the attention daemon.")
+            else:
+                click.echo(
+                    f"  {style('-', dim=True)} Attention daemon was not running."
+                )
+
+        if sync is not None:
+            # Again, now that serve (whose supervisor restarts the daemon) and
+            # attention -d (whose watchdog restarts serve) are down.
+            sync.at_end()
 
     # Last, so the local daemons still stop when the host is unreachable -- but
     # never zero: a failed remote shutdown that exits 0 is the silent no-op this

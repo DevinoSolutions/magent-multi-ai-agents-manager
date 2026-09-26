@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import sys
 import time
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import click
 
@@ -22,6 +22,9 @@ from magent.lockfile import LockHeld
 from magent.paths import find_config
 from magent.style import style
 
+if TYPE_CHECKING:
+    import contextlib
+
 # How long `node sync -d` waits for the detached child to record its pid:
 # ~10 s nominal, returning as soon as it appears or the child exits. A cold
 # child spends seconds importing before it takes the lock (measured 2.5-13 s
@@ -30,22 +33,31 @@ _START_POLLS = 100
 _START_POLL_S = 0.1
 
 
-NodeSyncStop = Literal["stopped", "stuck", "absent"]
+NodeSyncStop = Literal["stopped", "stuck", "absent", "unknown"]
 
 
-def _stop_node_sync() -> NodeSyncStop:
-    """Stop the node sync daemon and name what happened. ``stop_daemon``'s
-    False is two answers -- nothing to stop, or a daemon that outlived the
-    kill -- and only the daemon's lock tells them apart."""
+def _stop_node_sync() -> tuple[NodeSyncStop, str]:
+    """Stop the node sync daemon and name what happened -- with, for
+    "unknown", the error's class. ``stop_daemon``'s False is two answers --
+    nothing to stop, or a daemon that outlived the kill -- and only the
+    daemon's lock tells them apart. A lock file that would not open (Windows
+    answers EACCES while one is pending delete) is "unknown", never "stopped"
+    or "absent": the class goes on screen, the whole error to nodes.log."""
     from magent import node_sync  # heavy subsystem: in-body per policy
 
-    if node_sync.stop_daemon():
-        return "stopped"
-    if node_sync.daemon_running():
-        # False is also "a daemon holds the lock and outlived the stop"
-        # (pid unknown, kill refused, or not dead within the settle).
-        return "stuck"
-    return "absent"
+    try:
+        if node_sync.stop_daemon():
+            return "stopped", ""
+        if node_sync.daemon_running():
+            # False is also "a daemon holds the lock and outlived the stop"
+            # (pid unknown, kill refused, or not dead within the settle).
+            return "stuck", ""
+    except OSError as exc:
+        log.get_logger(node_sync.LOG_NAME).warning(
+            "node sync: could not stop or check the daemon: %s", exc
+        )
+        return "unknown", type(exc).__name__
+    return "absent", ""
 
 
 def _say_stuck() -> None:
@@ -58,16 +70,25 @@ def _say_stuck() -> None:
     )
 
 
+def _say_unknown(cause: str) -> None:
+    click.echo(
+        f"  {style('!', fg='yellow')} Could not tell whether the node sync daemon"
+        f" stopped ({cause}); see nodes.log"
+    )
+
+
 def stop_node_sync_and_say(*, say_absent: bool = True) -> NodeSyncStop:
     """Stop the node sync daemon and say what happened, in the words
     `node sync --stop` and `down --all` share. ``say_absent=False`` keeps
     "was not running" to itself; a daemon that is running is always said.
     Exit codes stay the caller's."""
-    outcome = _stop_node_sync()
+    outcome, cause = _stop_node_sync()
     if outcome == "stopped":
         click.echo(f"  {style('+', fg='green')} Stopped the node sync daemon.")
     elif outcome == "stuck":
         _say_stuck()
+    elif outcome == "unknown":
+        _say_unknown(cause)
     elif say_absent:
         click.echo(f"  {style('-', dim=True)} Node sync daemon was not running.")
     return outcome
@@ -77,19 +98,74 @@ def restop_node_sync_and_say(first: NodeSyncStop) -> NodeSyncStop:
     """``down --all``'s second stop, once serve and ``attention -d`` are down:
     serve's supervisor can restart the daemon while the node pulls run after
     the ``first`` stop. Says only what is news -- a daemon it stopped, or a
-    running one the first stop did not already name. Silent otherwise."""
-    outcome = _stop_node_sync()
-    if outcome == "stopped" and first == "stuck":
-        # The first stop's survivor died after all: no restart to explain.
-        click.echo(f"  {style('+', fg='green')} Stopped the node sync daemon.")
-    elif outcome == "stopped":
+    running one the first stop did not already name, or a stop it could not
+    check. Silent otherwise."""
+    outcome, cause = _stop_node_sync()
+    if outcome == "stopped" and first == "stopped":
         click.echo(
             f"  {style('+', fg='green')} Stopped the node sync daemon again"
             " (serve restarted it during the pulls)."
         )
+    elif outcome == "stopped":
+        # No "again": the first stop's survivor died after all, or the first
+        # found none -- a daemon a supervisor tick spawned just before this
+        # down took its lock, which locked only after the first stop looked.
+        click.echo(f"  {style('+', fg='green')} Stopped the node sync daemon.")
     elif outcome == "stuck" and first != "stuck":
         _say_stuck()
+    elif outcome == "unknown" and first != "unknown":
+        _say_unknown(cause)
     return outcome
+
+
+class DownSyncStop:
+    """``down --all``'s stops of the node sync daemon: the first one just
+    before the node pulls (``before_pulls``, when there are any) and the one
+    after serve and ``attention -d`` are down (``at_end``, always).
+
+    From the first stop until the last, it holds serve's supervisor lock
+    (``node_sync.supervisor_held``, entered on ``hold``), so no serve can
+    restart the daemon in between. A tick that already held the lock may have
+    spawned one that has not locked yet; so may whatever spawned a daemon the
+    first stop found. Only then does ``at_end`` wait for a late daemon
+    (``node_sync.await_late_daemon``) before its stop -- otherwise it stops at
+    once."""
+
+    def __init__(self, hold: contextlib.ExitStack, *, say_absent: bool) -> None:
+        self._hold = hold
+        self._say_absent = say_absent
+        self._held = False
+        self._late = False
+        self._first: NodeSyncStop | None = None
+
+    def _take_hold(self) -> None:
+        from magent import node_sync  # heavy subsystem: in-body per policy
+
+        if not self._held:
+            self._held = True
+            self._late = self._hold.enter_context(node_sync.supervisor_held())
+
+    def before_pulls(self) -> None:
+        from magent import node_sync  # heavy subsystem: in-body per policy
+
+        self._take_hold()
+        try:
+            seen = node_sync.daemon_running()
+        except OSError:
+            seen = True  # unknown is never "no daemon": the end stop waits
+        self._late = seen or self._late
+        self._first = stop_node_sync_and_say(say_absent=self._say_absent)
+
+    def at_end(self) -> None:
+        from magent import node_sync  # heavy subsystem: in-body per policy
+
+        self._take_hold()
+        if self._late:
+            node_sync.await_late_daemon()
+        if self._first is None:
+            stop_node_sync_and_say(say_absent=self._say_absent)
+        else:
+            restop_node_sync_and_say(self._first)
 
 
 @main.group("node", invoke_without_command=True)
@@ -150,7 +226,7 @@ def sync_cmd(
     from magent import node_sync  # heavy subsystem: in-body per policy
 
     if do_stop:
-        if stop_node_sync_and_say() == "stuck":
+        if stop_node_sync_and_say() in ("stuck", "unknown"):
             sys.exit(1)
         return
 

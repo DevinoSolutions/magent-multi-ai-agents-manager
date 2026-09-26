@@ -187,6 +187,84 @@ def stop_daemon(
     return True
 
 
+# How often `down --all` retries serve's supervisor lock while a supervisor
+# tick holds it, and how often it looks for a daemon that took its own lock
+# late. Both waits are bounded by STOP_SETTLE_S.
+SUPERVISOR_RETRY_S = 0.05
+
+
+@contextlib.contextmanager
+def supervisor_held(
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+) -> Iterator[bool]:
+    """Hold serve's supervisor lock (``SUPERVISOR_LOCK_NAME``) for the body,
+    so no ``magent serve`` starts a daemon while ``down --all`` stops it: its
+    ``_supervise_node_sync`` skips every tick it cannot take this lock for.
+
+    Yields True when the lock was contended -- a supervisor tick held it, and
+    a daemon that tick spawned may not have taken its own lock yet -- or could
+    not be taken. A tick holds it for one ``ensure_node_sync``, so the wait is
+    short: ``SUPERVISOR_RETRY_S`` steps up to ``STOP_SETTLE_S``. Not taken by
+    then, the body runs unprotected with a WARNING: stopping the daemon is
+    never skipped for want of the lock."""
+    log = get_logger(LOG_NAME)
+    deadline = now() + STOP_SETTLE_S
+    contended = False
+    with contextlib.ExitStack() as stack:
+        while True:
+            try:
+                stack.enter_context(exclusive_lock(SUPERVISOR_LOCK_NAME))
+            except OSError as exc:
+                # LockHeld is a supervisor tick. Anything else is retried the
+                # same way: Windows answers EACCES while a lock file its last
+                # holder deleted is still pending delete (a scanner's handle).
+                contended = True
+                if now() < deadline:
+                    sleep(SUPERVISOR_RETRY_S)
+                    continue
+                if isinstance(exc, LockHeld):
+                    log.warning(
+                        "node sync: serve's supervisor lock stayed held past"
+                        " %.0fs; stopping the daemon without it",
+                        STOP_SETTLE_S,
+                    )
+                else:
+                    log.warning(
+                        "node sync: could not take serve's supervisor lock"
+                        " (%s); stopping the daemon without it",
+                        exc,
+                    )
+            break
+        yield contended
+
+
+def await_late_daemon(
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+) -> bool:
+    """Look up to ``STOP_SETTLE_S`` for a daemon holding its lock: True as soon
+    as one does and has written its pid. ``ensure_node_sync`` Popens a daemon
+    that takes ``LOCK_NAME`` only once its interpreter is up, so right after a
+    spawn the lock -- the only proof of a daemon -- still reads free. It writes
+    its pid just after the lock, and ``stop_daemon`` kills by pid: stopped in
+    between, it would be called stuck. At the deadline the lock's last answer
+    stands. A probe that could not open the lock file answers nothing and the
+    look goes on; the stop after it asks again."""
+    deadline = now() + STOP_SETTLE_S
+    held = False
+    while True:
+        with contextlib.suppress(OSError):
+            held = daemon_running()
+            if held and daemon_pid() is not None:
+                return True
+        if now() >= deadline:
+            return held
+        sleep(SUPERVISOR_RETRY_S)
+
+
 def wanted(config: MagentConfig) -> bool:
     """Is there anything to sync: a pool, and an enabled project pinned or
     placed on it? A ``"cloud"`` project has no pool node and is not the

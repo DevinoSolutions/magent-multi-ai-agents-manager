@@ -10,16 +10,25 @@ config *discovery* entirely, so no test ever searches the real filesystem.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
+import os
 import sys
+import threading
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
 from magent import agent_state, cli
 from magent.cli import status as status_mod
 from magent.config import SCHEMA_VERSION
+from magent.lockfile import LockHeld, exclusive_lock, lock_path
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 def _no_psmux(monkeypatch):
@@ -1873,6 +1882,160 @@ class TestAStaleNodeSyncDaemonDegradesStatus:
             ), state
 
 
+def _hold_lock_file(path: Path) -> int:
+    """Lock ``path`` (a ``lockfile.lock_path``) on a fresh fd and return it,
+    retrying until the path still names the locked file. exclusive_lock's
+    holder -- every ``daemon_running`` probe -- deletes the file AFTER it lets
+    go: on POSIX an opener in that window can lock an orphaned inode nobody
+    else will open again, and on Windows the open itself fails (EACCES) while
+    the file is pending delete. Those are lockfile properties, not what these
+    pins are about, and a thread here widens the window, so the stand-ins
+    close it."""
+    from magent import lockfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        except PermissionError:
+            time.sleep(0.005)
+            continue
+        if lockfile._try_lock(fd):
+            try:
+                if os.stat(path).st_ino == os.fstat(fd).st_ino:
+                    return fd
+            except FileNotFoundError:
+                pass
+            lockfile._unlock(fd)
+        os.close(fd)
+        time.sleep(0.005)
+    raise AssertionError(f"could not lock {path}")
+
+
+def _let_go(fd: int) -> None:
+    from magent import lockfile
+
+    lockfile._unlock(fd)
+    os.close(fd)
+
+
+def _supervisor_refusals(monkeypatch) -> threading.Event:
+    """Set once ``down`` asked for serve's supervisor lock and was REFUSED,
+    so a stand-in tick holding it lets go after that, however long down took
+    to get there. The real lock is still what is asked and what refuses."""
+    from magent import node_sync
+
+    refused = threading.Event()
+    real_lock = node_sync.exclusive_lock
+
+    @contextlib.contextmanager
+    def spy(name: str) -> Iterator[None]:
+        try:
+            with real_lock(name):
+                yield
+        except LockHeld:
+            if name == node_sync.SUPERVISOR_LOCK_NAME:
+                refused.set()
+            raise
+
+    monkeypatch.setattr(node_sync, "exclusive_lock", spy)
+    return refused
+
+
+class _FakeDaemon:
+    """A node sync daemon on the REAL daemon lock, in a thread: after
+    ``delay`` it takes ``node_sync.LOCK_NAME``, then writes its pid file -- the
+    real daemon's order (``run_sync_loop``), ``pid_gap`` apart -- and holds
+    both until killed. Both paths are bound at construction: a thread that
+    outlived its test must never lock in the next test's HOME."""
+
+    def __init__(self, pid: int, delay: float = 0.0, pid_gap: float = 0.0) -> None:
+        from magent import lockfile, node_sync
+
+        self.pid = pid
+        self.delay = delay
+        self.pid_gap = pid_gap
+        self.lock = lockfile.lock_path(node_sync.LOCK_NAME)
+        self.pid_path = node_sync._PID_PATH
+        self.locked = threading.Event()
+        self.killed = threading.Event()
+        self.gone = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.thread = threading.Thread(target=self._live, daemon=True)
+        self.thread.start()
+
+    def _live(self) -> None:
+        try:
+            if self.killed.wait(self.delay):
+                return  # torn down before it ever started
+            fd = _hold_lock_file(self.lock)
+            try:
+                if self.killed.wait(self.pid_gap):
+                    return
+                self.pid_path.parent.mkdir(parents=True, exist_ok=True)
+                self.pid_path.write_text(str(self.pid))
+                self.locked.set()
+                self.killed.wait(timeout=10)
+            finally:
+                _let_go(fd)
+        finally:
+            self.gone.set()
+
+
+@pytest.fixture
+def daemons(monkeypatch):
+    """Fake daemons by pid: node_sync's kill and pid check see only these, so
+    the REAL stop_daemon stops them (and nothing real is ever signalled)."""
+    from magent import node_sync
+
+    fakes: dict[int, _FakeDaemon] = {}
+
+    def kill(pid: int) -> bool:
+        fake = fakes.get(pid)
+        if fake is None:
+            return False
+        fake.killed.set()
+        return fake.gone.wait(timeout=5)
+
+    monkeypatch.setattr(node_sync, "_kill", kill)
+    monkeypatch.setattr(
+        node_sync,
+        "pid_alive",
+        lambda pid: pid in fakes and not fakes[pid].gone.is_set(),
+    )
+    yield fakes
+    for fake in fakes.values():
+        fake.killed.set()
+    for fake in fakes.values():
+        if fake.thread is not None:
+            fake.thread.join(timeout=5)
+
+
+@pytest.fixture
+def supervisor_tick(monkeypatch):
+    """One REAL serve supervisor tick (``upload_server._supervise_node_sync``)
+    against the REAL supervisor lock, with node sync switched on; only the
+    detached spawn is recorded instead of run."""
+    from magent import launch, upload_server
+
+    monkeypatch.setenv("MAGENT_NODE_SYNC", "1")
+    monkeypatch.setattr("magent.env._cached_env", None)
+    monkeypatch.setattr(launch, "_node_sync_report", launch._NodeSyncReport())
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(launch, "spawn_detached", spawned.append)
+
+    def tick(config_path: str) -> list[list[str]]:
+        stop = threading.Event()
+        stop.set()  # one iteration, then its wait returns at once
+        upload_server._supervise_node_sync(config_path, stop, interval=0.0)
+        return spawned
+
+    return tick
+
+
 class TestDownStopsNodeSessionsWhereTheyRun:
     """PR-D: a node project's id names TWO sessions -- the one on its node,
     and the local one it may have left here before it gained a ``node`` (D9).
@@ -1900,6 +2063,8 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         real_stop=False,
         pull=None,
         sync_daemon=False,
+        real_sync=False,
+        stop_server=None,
     ):
         from magent import node_sync
         from magent.cli import attach as attach_mod
@@ -1950,7 +2115,10 @@ class TestDownStopsNodeSessionsWhereTheyRun:
 
         monkeypatch.setattr(attach_mod, "_ssh_capture", fake_ssh)
         monkeypatch.setattr(attach_mod, "_close_attach_windows", lambda names: 0)
-        monkeypatch.setattr("magent.upload_server.stop_server", lambda port: False)
+        # The moment serve dies, for a test that acts there.
+        monkeypatch.setattr(
+            "magent.upload_server.stop_server", stop_server or (lambda port: False)
+        )
         monkeypatch.setattr("magent.cli.attention_cmd.stop_daemon", lambda: False)
         if sys.platform == "win32":
             monkeypatch.setattr("magent.hotkey.stop_listener", lambda: False)
@@ -1966,14 +2134,18 @@ class TestDownStopsNodeSessionsWhereTheyRun:
             return pull(config, name, **k)
 
         monkeypatch.setattr(node_sync, "final_pull", final_pull)
-        # One answer per stop_daemon call; the last one repeats.
-        stops = [sync_daemon] if isinstance(sync_daemon, bool) else list(sync_daemon)
+        if not real_sync:
+            # One answer per stop_daemon call; the last one repeats.
+            stops = (
+                [sync_daemon] if isinstance(sync_daemon, bool) else list(sync_daemon)
+            )
 
-        def stop_daemon():
-            self.events.append("stop")
-            return stops.pop(0) if len(stops) > 1 else stops[0]
+            def stop_daemon():
+                self.events.append("stop")
+                return stops.pop(0) if len(stops) > 1 else stops[0]
 
-        monkeypatch.setattr(node_sync, "stop_daemon", stop_daemon)
+            monkeypatch.setattr(node_sync, "stop_daemon", stop_daemon)
+        self.cfgpath = cfgpath
         out = runner.invoke(cli.main, ["--config", cfgpath, "down", *argv])
         return out, killed, dialed, sent
 
@@ -2429,8 +2601,8 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         # plain "Stopped" -- serve restarted nothing.
         from magent import node_sync
 
-        running = iter([True, False])
-        monkeypatch.setattr(node_sync, "daemon_running", lambda: next(running))
+        # Held until the end stop's kill lands (the second stop_daemon answer).
+        monkeypatch.setattr(node_sync, "daemon_running", lambda: True)
         monkeypatch.setattr(node_sync, "daemon_pid", lambda: 4242)
         self._hold("api")
         out, *_ = self._run(
@@ -2446,6 +2618,244 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         assert "Could not stop the node sync daemon (pid 4242)." in out.stdout
         assert "Stopped the node sync daemon." in out.stdout
         assert "again" not in out.stdout
+
+    @pytest.mark.parametrize("pid_gap", [0.0, 0.5], ids=["pid-with-lock", "pid-after"])
+    @pytest.mark.parametrize("why", ["seen", "contended"])
+    def test_a_daemon_that_locks_late_is_re_stopped(
+        self, runner, tmp_config, monkeypatch, tmp_path, daemons, why, pid_gap
+    ):
+        # Spawned, but not yet holding its lock when the first stop looked --
+        # the only proof of a daemon reads "none". The end stop waits for it,
+        # but only on a hint that one may be on its way: the first stop found
+        # a daemon (whatever spawned it may spawn another), or a supervisor
+        # tick held serve's lock when down asked for it (that tick may have
+        # spawned one). It waits for its pid too: the kill needs one, and the
+        # daemon writes it just after taking the lock.
+        from magent import node_sync
+
+        late = _FakeDaemon(4302, delay=0.4, pid_gap=pid_gap)
+        daemons[late.pid] = late
+        if why == "seen":
+            first = _FakeDaemon(4301)
+            daemons[first.pid] = first
+            first.start()
+            assert first.locked.wait(5)
+
+            def respawn() -> None:
+                if first.gone.wait(10):
+                    late.start()
+
+            threading.Thread(target=respawn, daemon=True).start()
+        else:
+            ticking = threading.Event()
+            refused = _supervisor_refusals(monkeypatch)
+            supervisor = lock_path(node_sync.SUPERVISOR_LOCK_NAME)
+
+            def tick() -> None:
+                fd = _hold_lock_file(supervisor)
+                ticking.set()
+                refused.wait(10)
+                late.start()
+                _let_go(fd)
+
+            threading.Thread(target=tick, daemon=True).start()
+            assert ticking.wait(5)
+        self._hold("api")
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            real_sync=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert late.killed.is_set(), out.output
+        assert not node_sync.daemon_running()
+        lines = [
+            ln for ln in out.stdout.splitlines() if "node sync daemon" in ln.lower()
+        ]
+        assert [ln.split(None, 1)[1] for ln in lines] == (
+            [
+                "Stopped the node sync daemon.",
+                (
+                    "Stopped the node sync daemon again"
+                    " (serve restarted it during the pulls)."
+                ),
+            ]
+            if why == "seen"
+            else ["Node sync daemon was not running.", "Stopped the node sync daemon."]
+        )
+
+    @pytest.mark.parametrize("nodes_here", [True, False], ids=["pulls", "no-pulls"])
+    def test_with_no_daemon_and_a_free_lock_the_end_stop_does_not_wait(
+        self, runner, tmp_config, monkeypatch, tmp_path, nodes_here
+    ):
+        # Nothing was running and nobody held serve's lock: no hint of a
+        # restart on its way, so the end stop is one stop, not a 2 s poll.
+        from magent import node_sync
+
+        waits: list[None] = []
+        monkeypatch.setattr(
+            node_sync, "await_late_daemon", lambda **_k: waits.append(None) or False
+        )
+        if nodes_here:
+            self._hold("api")
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            real_sync=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert waits == []
+        assert "Node sync daemon was not running." in out.stdout
+
+    @pytest.mark.parametrize("held_at_start", [False, True], ids=["free", "tick-first"])
+    def test_serve_ticking_while_down_all_runs_spawns_no_daemon(
+        self,
+        runner,
+        tmp_config,
+        monkeypatch,
+        tmp_path,
+        supervisor_tick,
+        held_at_start,
+    ):
+        # The race: serve's supervisor ticks after the first stop and before
+        # serve dies, and starts the daemon down just stopped. down holds
+        # serve's supervisor lock from its first stop to its last, so that
+        # tick -- the REAL one, on the REAL lock -- stands down. A tick that
+        # held the lock when down asked for it is waited out, never raced.
+        from magent import node_sync
+
+        if held_at_start:
+            ticking = threading.Event()
+            refused = _supervisor_refusals(monkeypatch)
+            supervisor = lock_path(node_sync.SUPERVISOR_LOCK_NAME)
+
+            def brief_tick() -> None:
+                fd = _hold_lock_file(supervisor)
+                ticking.set()
+                refused.wait(10)
+                _let_go(fd)
+
+            threading.Thread(target=brief_tick, daemon=True).start()
+            assert ticking.wait(5)
+        during: list[list[list[str]]] = []
+
+        def stop_server(port: int) -> bool:
+            during.append(list(supervisor_tick(self.cfgpath)))
+            return False
+
+        self._hold("api")
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            stop_server=stop_server,
+        )
+        assert out.exit_code == 0, out.output
+        assert during == [[]]
+
+    def test_the_same_tick_with_no_down_running_does_spawn_one(
+        self, tmp_config, tmp_path, supervisor_tick
+    ):
+        # The control: without down's hold, that tick spawns the daemon -- so
+        # the pin above sees a hold, not a tick that could never spawn.
+        cfgpath = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {"nodes": {"second": {"host": "h", "user": "amin"}}},
+                "projects": [{"path": str(tmp_path / "api"), "node": "second"}],
+            }
+        )
+        (argv,) = supervisor_tick(cfgpath)
+        assert argv[-2:] == ["node", "sync"]
+
+    def test_a_daemon_check_that_cannot_open_its_lock_keeps_the_node_half(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # The first stop now runs AHEAD of the pulls: a lock file Windows still
+        # has pending delete (EACCES) must not take the node half of down with
+        # it -- and no answer is never "not running". Once is enough to say it.
+        from magent import node_sync
+
+        def unopenable():
+            raise PermissionError(13, "Access is denied")
+
+        waits: list[None] = []
+        monkeypatch.setattr(node_sync, "daemon_running", unopenable)
+        monkeypatch.setattr(
+            node_sync, "await_late_daemon", lambda **_k: waits.append(None) or False
+        )
+        self._hold("api")
+        out, _killed, dialed, _sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            real_sync=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert self.events == ["pull api"]
+        assert dialed == [("second", "api")]
+        assert "Stopped 1 session(s): api" in out.stdout
+        unknown = (
+            "Could not tell whether the node sync daemon stopped (PermissionError);"
+            " see nodes.log"
+        )
+        assert out.stdout.count(unknown) == 1
+        assert "Node sync daemon was not running" not in out.stdout
+        # Unknown is no proof of "none": the end stop waits for a late lock.
+        assert waits == [None]
+
+    def test_a_supervisor_lock_held_past_the_wait_is_warned_and_the_stop_still_runs(
+        self, runner, tmp_config, monkeypatch, tmp_path, caplog
+    ):
+        from magent import node_sync
+        from magent.log import get_logger
+
+        monkeypatch.setattr(node_sync, "STOP_SETTLE_S", 0.3)
+        get_logger(node_sync.LOG_NAME)
+        caplog.set_level(logging.WARNING, logger=f"magent.{node_sync.LOG_NAME}")
+        holding, release = threading.Event(), threading.Event()
+
+        def hold() -> None:
+            with exclusive_lock(node_sync.SUPERVISOR_LOCK_NAME):
+                holding.set()
+                release.wait(10)
+
+        threading.Thread(target=hold, daemon=True).start()
+        assert holding.wait(5)
+        self._hold("api")
+        try:
+            out, *_ = self._run(
+                runner,
+                tmp_config,
+                monkeypatch,
+                ["--all"],
+                projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+                real_stop=True,
+                sync_daemon=(True, False),
+            )
+        finally:
+            release.set()
+        assert out.exit_code == 0, out.output
+        assert self.events == ["stop", "pull api", "stop"]
+        assert "Stopped the node sync daemon." in out.stdout
+        warned = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any("supervisor lock stayed held" in w for w in warned), warned
 
     def test_down_of_one_name_leaves_the_node_sync_daemon_alone(
         self, runner, tmp_config, monkeypatch, tmp_path

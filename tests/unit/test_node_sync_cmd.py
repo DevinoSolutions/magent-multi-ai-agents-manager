@@ -206,6 +206,28 @@ class TestNodeSync:
             result.stdout
         )
 
+    def test_a_lock_that_would_not_open_is_unknown_never_not_running(
+        self, runner, monkeypatch, caplog
+    ):
+        """Windows answers EACCES while a lock file its last holder deleted is
+        still pending delete: no answer is not "no daemon". The class is on
+        screen, the whole error in nodes.log, and it is not a success."""
+        from magent.log import get_logger
+
+        def unopenable():
+            raise PermissionError(13, "Access is denied: 'C:\\\\secret\\\\x.lock'")
+
+        monkeypatch.setattr(node_sync, "daemon_running", unopenable)
+        get_logger(node_sync.LOG_NAME)
+        caplog.set_level("WARNING", logger=f"magent.{node_sync.LOG_NAME}")
+        result = runner.invoke(cli.main, ["node", "sync", "--stop"])
+        assert result.exit_code == 1, result.output
+        assert result.stdout == (
+            "  ! Could not tell whether the node sync daemon stopped"
+            " (PermissionError); see nodes.log\n"
+        )
+        assert any("secret" in r.getMessage() for r in caplog.records)
+
     def test_the_daemon_flag_spawns_the_foreground_loop_detached(
         self, runner, pool_config, monkeypatch
     ):
