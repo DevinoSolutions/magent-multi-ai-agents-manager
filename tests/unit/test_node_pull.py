@@ -208,7 +208,17 @@ class TestParsePull:
         assert _parse(pull_reply(pull_meta(sample=sample)), tmp_path).sample is None
 
     @pytest.mark.parametrize(
-        "now", ["missing", True, "5000", float("nan"), float("inf"), float("-inf")]
+        "now",
+        [
+            "missing",
+            True,
+            "5000",
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            # json keeps it an int; float() of it raises OverflowError.
+            pytest.param(10**309, id="309-digit-int"),
+        ],
     )
     def test_metadata_without_a_clock_is_not_a_pull(self, tmp_path, now):
         meta = pull_meta(now=now)
@@ -360,6 +370,8 @@ class TestWhatDidNotFit:
             ({"api": float("nan")}, {}),
             ({"api": float("inf")}, {}),
             ({"api": float("-inf")}, {}),
+            # A 309-digit int: float() of it raises OverflowError.
+            ({"api": 10**309}, {}),
         ],
     )
     def test_a_resume_that_is_not_a_time_is_dropped(self, tmp_path, raw, seen):

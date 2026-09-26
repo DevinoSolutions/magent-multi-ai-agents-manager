@@ -1574,6 +1574,11 @@ class TestTheTrimNeverStalls:
     def test_a_blank_first_line_is_trimmed(self, placed, rewrites):
         self._run("\n", rewrites)
 
+    def test_a_first_row_whose_ts_overflows_a_float_is_trimmed(self, placed, rewrites):
+        """json.loads keeps a 309-digit ts as an int, and float() of it raises
+        OverflowError: a bad row like any other, never a failed store."""
+        self._run('{"ts": ' + "9" * 309 + "}\n", rewrites)
+
 
 class TestTheLoadSampleEdges:
     def test_the_slack_is_at_least_one_interval(self, placed, rewrites):
