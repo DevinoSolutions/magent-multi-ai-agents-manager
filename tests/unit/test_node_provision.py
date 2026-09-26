@@ -2846,6 +2846,50 @@ class TestSetupShUnderRealBash:
         assert not (state / "apt.log").exists()
         assert list((state / "users").iterdir()) == []
 
+    # -- killers from cq-F13 rounds 3 and 4 ------------------------------------
+
+    def test_a_user_whose_name_ends_anothers_cannot_forge_its_rows(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        home = _existing_user(state, "min")
+        (home / ".profile").write_text(
+            "printf 'did\\tdocker:amin\\tFORGED\\n'\n", encoding="utf-8"
+        )
+        r = _run_setup(env, ("amin", "min"))
+        assert r.returncode == 0, r.stderr
+        assert b"FORGED" not in r.stdout
+
+    def test_a_failed_row_filter_fails_the_run(self, tmp_path):
+        _, env = _setup_box(tmp_path)
+        shims, sysbin = env["PATH"].split(os.pathsep)[:2]
+        awk = os.path.join(shims, "awk")
+        with open(awk, "w", encoding="utf-8", newline="\n") as f:
+            f.write(
+                f"#!{BASH}\n"
+                'for a; do [ "$a" != u=amin ] || { cat >/dev/null; exit 2; }; done\n'
+                f'exec {shlex.quote(os.path.join(sysbin, "awk"))} "$@"\n'
+            )
+        os.chmod(awk, 0o755)
+        r = _run_setup(env)
+        assert r.returncode == 1
+        assert _rows(r)["docker:amin"] == "did"
+
+    def test_a_two_line_version_is_its_first_line_only(self, tmp_path):
+        # The real `gh --version` prints two lines (version, then release URL).
+        _, env = _setup_box(tmp_path)
+        gh = Path(env["PATH"].split(os.pathsep)[0]) / "gh"
+        gh.write_text(
+            f"#!{BASH}\n"
+            "printf 'gh version 2.88.1 (2026-09-01)\\n"
+            "https://github.com/cli/cli/releases/tag/v2.88.1\\n'\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r = _run_setup(env)
+        assert r.returncode == 0, r.stderr
+        (row,) = [line for line in _report(r).lines if line.item == "gh"]
+        assert (row.status, row.detail) == ("skip", "gh version 2.88.1 (2026-09-01)")
+        assert b"releases/tag" not in r.stdout
+
     def test_a_leading_zero_minor_is_decimal(self, tmp_path):
         # `3.08` would be an octal error in a bare (( )) -- the floor reads
         # it as 8.
@@ -2909,6 +2953,23 @@ class TestSetupNode:
             remote_mux.setup_node(
                 NODE, ["amin"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
             )
+
+    def test_a_transport_failure_names_the_users_and_never_the_key(self, fake_ssh):
+        fake_ssh.set_reply(
+            "bash -s", stderr="root@devino-second: Permission denied\n", rc=255
+        )
+        with pytest.raises(RemoteError) as info:
+            remote_mux.setup_node(
+                NODE, ["amin", "bob"], PC_KEY, timeout_s=remote_mux.SETUP_TIMEOUT_S
+            )
+        (call,) = fake_ssh.calls()
+        shown = info.value.command_redacted
+        assert shown[:-1] == ("ssh", *call.argv)
+        assert shown[-2] == _remote(
+            "bash", "-s", "--", remote_mux.SOCKET, "amin", "bob"
+        )
+        assert shown[-1] == f"<stdin: {len(call.stdin)} bytes>"
+        assert PC_KEY.split()[1] not in str(info.value)
 
     def test_a_failed_step_still_returns_every_row_and_key(self, fake_ssh):
         # P1: rc 1 is setup.sh reporting a failed step, not a lost call.
