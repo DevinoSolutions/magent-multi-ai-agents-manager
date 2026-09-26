@@ -1690,11 +1690,12 @@ def _run_node_bring_ups(
     allow_dirty: bool,
     window: bool,
 ) -> list[NodeBringUpOutcome]:
-    """Each project's bring-up on a thread (a clone is minutes of network,
-    not CPU); the per-node lock inside keeps one node serial. At most eight
-    run at once, and one waiting on its node's lock still holds its slot: with
-    more than eight queued for one node ahead of another node's projects, the
-    other node waits for a slot. Outcomes in the order given.
+    """Each project's bring-up on a pool thread (a clone is minutes of
+    network, not CPU), at most eight at once. The per-node lock that keeps one
+    node serial is taken INSIDE a pool slot, so a bring-up waiting on its
+    node's lock still holds its slot: with more than eight queued for one node
+    ahead of another node's projects, that other node waits for a slot however
+    idle it is (head-of-line blocking). Outcomes in the order given.
 
     First, ONCE and before anything is dialed, the WHOLE fleet's node folders
     are checked (X3, ``nodes.remote_root_collisions``): a batch project whose
