@@ -1076,7 +1076,7 @@ class TestUpReportsCasualties:
         monkeypatch.setattr("magent.launch.decorate_psmux_sessions", lambda *a, **k: [])
         monkeypatch.setattr(
             "magent.launch.bring_up_psmux",
-            lambda cfg, only=None, group=None: (list(created), list(failed)),
+            lambda cfg, only=None, group=None, **_k: (list(created), list(failed)),
         )
 
     def test_failed_sessions_are_named(self, runner, tmp_path, monkeypatch):
@@ -3091,3 +3091,58 @@ class TestHostAttachDialsTheSameClientAsItsPanes:
         )
         (argv,) = calls
         assert argv[argv.index("--") + 1] == self._CLIENT
+
+
+class TestUpHandsAllowDirtyToTheDesktopCopy:
+    def test_the_relayed_argv_keeps_allow_dirty(self, runner, tmp_config, monkeypatch):
+        seen: list[list[str]] = []
+        monkeypatch.setattr(
+            "magent.launch.session0_disposition", lambda plat: "handoff"
+        )
+        monkeypatch.setattr(
+            "magent.launch.relay_handoff",
+            lambda plat, argv, timeout_s: seen.append(argv) or 0,
+        )
+        path = tmp_config({"projects": []})
+        result = runner.invoke(cli.main, ["--config", path, "up", "--allow-dirty"])
+        assert result.exit_code == 0
+        assert seen[0][-1] == "--allow-dirty"
+
+
+class TestUpNodeProjectsBesideLiveLocalSessions:
+    """Every local session already up does not mean nothing to do: node
+    projects are never in psmux_status, so they still reach the bring-up --
+    alone, beside no live local id -- and the created node sid is not
+    decorated as a local session."""
+
+    def test_live_local_sessions_do_not_skip_the_node_half(
+        self, runner, tmp_config, monkeypatch
+    ):
+        calls: list[tuple[object, object]] = []
+        decorated: list[list[str]] = []
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: ([{"name": "web", "session": "web"}], [], [{}]),
+        )
+        monkeypatch.setattr(
+            "magent.launch.node_session_ids", lambda cfg, group=None: ["api"]
+        )
+        monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions",
+            lambda names, code_hint=None: decorated.append(list(names)) or [],
+        )
+        monkeypatch.setattr(
+            "magent.launch.bring_up_psmux",
+            lambda cfg, only=None, group=None, **k: (
+                calls.append((only, k.get("allow_dirty"))),
+                (["api"], []),
+            )[1],
+        )
+        path = tmp_config({"projects": []})
+        result = runner.invoke(cli.main, ["--config", path, "up"])
+        assert result.exit_code == 0, result.output
+        assert calls == [(["api"], False)]
+        assert "Brought up 1 session(s): api" in result.stdout
+        assert "already up" not in result.stdout
+        assert decorated == [["web"]]

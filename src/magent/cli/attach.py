@@ -1366,6 +1366,8 @@ def _up_handoff_argv(ctx: click.Context) -> list[str]:
         argv.append("--all")
     if ctx.params.get("revive"):
         argv.append("--revive")
+    if ctx.params.get("allow_dirty"):
+        argv.append("--allow-dirty")
     return argv
 
 
@@ -1390,9 +1392,19 @@ def _up_handoff_argv(ctx: click.Context) -> list[str]:
     is_flag=True,
     help="Re-launch the agent in live sessions whose pane fell back to a bare shell",
 )
+@click.option(
+    "--allow-dirty",
+    is_flag=True,
+    help="Bring node projects up despite a dirty or unpushed tree",
+)
 @click.pass_context
 def up_cmd(
-    ctx: click.Context, as_json: bool, do_all: bool, group: str | None, revive: bool
+    ctx: click.Context,
+    as_json: bool,
+    do_all: bool,
+    group: str | None,
+    revive: bool,
+    allow_dirty: bool,
 ) -> None:
     """Ensure a persistent psmux session per project (host side of `attach`)."""
     config_file = find_config(ctx.obj.get("config_path"))
@@ -1405,6 +1417,7 @@ def up_cmd(
         bring_up_psmux,
         decorate_psmux_sessions,
         decorate_psmux_sessions_async,
+        node_session_ids,
         psmux_status,
         relay_handoff,
         revive_psmux,
@@ -1523,14 +1536,23 @@ def up_cmd(
         if do_all
         else [_as_str(d.get("session")) or _as_str(d.get("name")) for d in down]
     )
+    # Node projects (PR-D) are not psmux sessions: psmux_status never lists
+    # them, so they are always offered to the bring-up, which attaches to a
+    # session already running on its node instead of starting a second one.
+    node_sids = node_session_ids(cfg, group)
     created: list[str] = []
-    if not projects:
+    if not projects and not node_sids:
         where = f" in group '{group}'" if group else ""
         click.echo(f"  {style('!', fg='yellow')} No eligible projects{where}.")
-    elif not do_all and not down:
+    elif not do_all and not down and not node_sids:
         click.echo(f"  {style('+', fg='green')} All {len(up)} session(s) already up.")
     else:
-        created, failed = bring_up_psmux(cfg, only=targets, group=group)
+        created, failed = bring_up_psmux(
+            cfg,
+            only=None if targets is None else [*targets, *node_sids],
+            group=group,
+            allow_dirty=allow_dirty,
+        )
         click.echo(
             f"  {style('+', fg='green')} Brought up {style(str(len(created)), fg='green', bold=True)}"
             f" session(s): {style(', '.join(created) or '(none)', dim=True)}"
@@ -1567,8 +1589,9 @@ def up_cmd(
     # here is what gives a PRE-EXISTING session (made before this feature, or
     # by an older magent) the hints without forcing a recreate. The `--json`
     # branch above does the same for its live sessions. Same host-side `code`
-    # probe as there: one for the batch, not one per session.
-    decorate_psmux_sessions([*live_ids, *created])
+    # probe as there: one for the batch, not one per session. Node sessions
+    # are left out: they live on their node and were decorated there at birth.
+    decorate_psmux_sessions([*live_ids, *(s for s in created if s not in node_sids)])
 
     if cfg.settings.upload_server:
         _maybe_start_upload_server(cfg.settings.upload_port, str(config_file))

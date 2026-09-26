@@ -5,14 +5,16 @@ faked at remote_mux's seam, so nothing here dials anything."""
 from __future__ import annotations
 
 import dataclasses
+import json
 import threading
 import time
 from collections import defaultdict
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
-from magent import attach_client, launch, lockfile, nodes, remote_mux
+from magent import attach_client, cli, launch, lockfile, nodes, remote_mux
 from magent.config import MagentConfig, NodeConfig, ProjectConfig, Settings
 from magent.nodes import LocalGitState, NodeMapEntry
 from magent.remote_mux import BringUpResult, RemoteError
@@ -938,3 +940,61 @@ class TestEveryNodeFailureIsAnOutcomeButABugIsNot:
         )
         outcome = launch.bring_up_node_project(_config(api), api)
         assert outcome.error == "git clone of api failed"
+
+
+class TestUpCommandBringsNodeProjectsUp:
+    def _config_file(self, tmp_path: Path, folder: Path) -> str:
+        path = tmp_path / "magent.config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "projects": [{"path": str(folder), "node": "second"}],
+                    "settings": {
+                        "psmux": False,
+                        "uploadServer": False,
+                        "tools": _TOOLS,
+                        "nodes": {"second": {"host": "devino-second", "user": "amin"}},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def test_a_node_only_config_with_no_psmux_comes_up(
+        self, rig, api, tmp_path, monkeypatch
+    ):
+        # R-D1: exit 0, the sid in "Brought up", the map written, no window.
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        result = CliRunner().invoke(
+            cli.main, ["--config", self._config_file(tmp_path, tmp_path / "api"), "up"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "Brought up 1 session(s): api" in result.stdout
+        assert "api" in nodes.read_node_map()
+        assert rig.windows == []
+
+    def test_allow_dirty_reaches_the_bring_up(self, rig, api, tmp_path, monkeypatch):
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        config = self._config_file(tmp_path, tmp_path / "api")
+        refused = CliRunner().invoke(cli.main, ["--config", config, "up"])
+        assert "--allow-dirty" in refused.stdout
+        allowed = CliRunner().invoke(
+            cli.main, ["--config", config, "up", "--allow-dirty"]
+        )
+        assert "Brought up 1 session(s): api" in allowed.stdout
+
+    def test_a_node_session_is_never_decorated_as_a_local_one(
+        self, rig, api, tmp_path, monkeypatch
+    ):
+        decorated: list[list[str]] = []
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions",
+            lambda names, code_hint=None: decorated.append(list(names)) or [],
+        )
+        CliRunner().invoke(
+            cli.main, ["--config", self._config_file(tmp_path, tmp_path / "api"), "up"]
+        )
+        assert decorated == [[]]
