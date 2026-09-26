@@ -1811,6 +1811,26 @@ by cell, and the test itself runs for real on ubuntu and macOS. Worth trying
 next: pywinpty's WinPTY back end (`PtyProcess.spawn(backend=Backend.WinPTY)`),
 which predates win32-input-mode and may pass the CR through unencoded.
 
+**Auto placement never rebalances (2026-09-24):** an `auto` project stays on
+the node it was placed on until that node leaves `settings.nodes`. A node that
+grows busy keeps its sessions; moving one is a manual
+`magent node recall <project> --to <nick>`. Deliberate: a move stops a live
+session and ships its conversation, which is not something to do behind the
+user's back. If it bites, the fix is a `node plan` hint naming the better node,
+never an automatic move.
+
+**Recall moves Claude Code conversations only (2026-09-24):** `magent node
+recall` refuses a project whose tool is not `claude` (exit 2). Codex has no
+transcript layout magent pulls, and no resume-by-id form recall could print.
+Its sessions come home by git alone: commit and push on the node, pull here.
+
+**A bring-up's repo record knows the commit, not the branch (2026-09-24):**
+`repos.json` written at bring-up carries each repo's sha from `bring_up.sh`,
+with an empty branch and an unknown unpushed count, because the bring-up
+reports only commits. A recall from a node that no longer answers therefore
+prints the last known sha without a branch. A recall from a node that answers
+records the full `repo_status.sh` report and replaces it.
+
 **Attach-pane reconnect is only reachable from a Windows client (2026-08-09):**
 `attach_client.py` itself is OS-agnostic (stdlib + click; the `Popen` in
 `_run_ssh` inherits the console on POSIX exactly as it does on Windows) and its unit tier
