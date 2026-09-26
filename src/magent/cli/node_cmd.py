@@ -30,6 +30,34 @@ _START_POLLS = 100
 _START_POLL_S = 0.1
 
 
+def stop_node_sync_and_say(
+    *, say_absent: bool = True
+) -> Literal["stopped", "stuck", "absent"]:
+    """Stop the node sync daemon and say what happened, in the words
+    `node sync --stop` and `down --all` share. ``stop_daemon``'s False is two
+    answers -- nothing to stop, or a daemon that outlived the kill -- and only
+    the daemon's lock tells them apart. ``say_absent=False`` keeps "was not
+    running" to itself; a daemon that is running is always said. Exit codes
+    stay the caller's."""
+    from magent import node_sync  # heavy subsystem: in-body per policy
+
+    if node_sync.stop_daemon():
+        click.echo(f"  {style('+', fg='green')} Stopped the node sync daemon.")
+        return "stopped"
+    if node_sync.daemon_running():
+        # False is also "a daemon holds the lock and outlived the stop"
+        # (pid unknown, kill refused, or not dead within the settle).
+        pid = node_sync.daemon_pid()
+        click.echo(
+            f"  {style('x', fg='red')} Could not stop the node sync daemon "
+            f"(pid {pid or 'unknown'})."
+        )
+        return "stuck"
+    if say_absent:
+        click.echo(f"  {style('-', dim=True)} Node sync daemon was not running.")
+    return "absent"
+
+
 @main.group("node", invoke_without_command=True)
 @click.pass_context
 def node_group(ctx: click.Context) -> None:
@@ -88,19 +116,8 @@ def sync_cmd(
     from magent import node_sync  # heavy subsystem: in-body per policy
 
     if do_stop:
-        if node_sync.stop_daemon():
-            click.echo(f"  {style('+', fg='green')} Stopped the node sync daemon.")
-        elif node_sync.daemon_running():
-            # False is also "a daemon holds the lock and outlived the stop"
-            # (pid unknown, kill refused, or not dead within the settle).
-            pid = node_sync.daemon_pid()
-            click.echo(
-                f"  {style('x', fg='red')} Could not stop the node sync daemon "
-                f"(pid {pid or 'unknown'})."
-            )
+        if stop_node_sync_and_say() == "stuck":
             sys.exit(1)
-        else:
-            click.echo(f"  {style('-', dim=True)} Node sync daemon was not running.")
         return
 
     config_path = ctx.obj.get("config_path")

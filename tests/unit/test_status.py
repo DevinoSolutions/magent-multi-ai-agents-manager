@@ -2315,6 +2315,30 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         assert out.exit_code == 0, out.output
         assert "Node sync daemon was not running." in out.stdout
 
+    @pytest.mark.parametrize("with_nodes", [True, False], ids=["nodes", "no-nodes"])
+    def test_down_all_names_a_daemon_that_outlived_its_stop(
+        self, runner, tmp_config, monkeypatch, tmp_path, with_nodes
+    ):
+        # stop_daemon's False is also "the kill did not land": the daemon's
+        # lock says which, as `node sync --stop` asks it. Never "was not
+        # running" about a daemon that is -- and never silence either.
+        from magent import node_sync
+
+        monkeypatch.setattr(node_sync, "daemon_running", lambda: True)
+        monkeypatch.setattr(node_sync, "daemon_pid", lambda: 4242)
+        projects = [{"path": str(tmp_path / "api"), "node": "second"}]
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=projects if with_nodes else [],
+            real_stop=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert "Could not stop the node sync daemon (pid 4242)." in out.stdout
+        assert "Node sync daemon was not running." not in out.stdout
+
     def test_down_of_one_name_leaves_the_node_sync_daemon_alone(
         self, runner, tmp_config, monkeypatch, tmp_path
     ):
