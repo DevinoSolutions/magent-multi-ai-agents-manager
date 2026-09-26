@@ -367,6 +367,187 @@ class TestSessionsJson:
         assert result.exit_code == 0
         assert json.loads(result.stdout) == []
 
+    def test_local_rows_carry_node_none(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(
+            tmp_path, pane=f"PS> claude\nFable 5.1 {MID} high", live=["caramel"]
+        )
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        cfg = _cfg(tmp_config, tmp_path, ["caramel", "upup"])
+
+        result = runner.invoke(cli.main, ["--config", cfg, "sessions", "--json"])
+
+        rows = json.loads(result.stdout)
+        # Live and dead alike: the key is on every row, never only some.
+        assert [(r["name"], r["node"]) for r in rows] == [
+            ("caramel", None),
+            ("upup", None),
+        ]
+
+    def test_a_config_without_a_node_never_loads_the_typed_config(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # The raw-loader fast path stays: no load_config, so no version
+        # warning and no typed-validation exit for a config with no node.
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+
+        def _refuse(*_a, **_k):
+            raise AssertionError("load_config called")
+
+        monkeypatch.setattr("magent.cli.config_io.load_config", _refuse)
+        cfg = tmp_config(
+            {
+                "projects": [
+                    {"path": str(tmp_path / "caramel"), "title": "caramel"},
+                    {"path": str(tmp_path / "sky"), "title": "sky", "node": "cloud"},
+                ]
+            }
+        )
+
+        result = runner.invoke(cli.main, ["--config", cfg, "sessions", "--json"])
+
+        assert result.exit_code == 0
+        assert all(r["node"] is None for r in json.loads(result.stdout))
+
+    def _node_config(self, tmp_config, tmp_path, *extra):
+        return tmp_config(
+            {
+                "projects": [
+                    {"path": str(tmp_path / "caramel"), "title": "caramel"},
+                    {"path": str(tmp_path / "api"), "title": "api", "node": "second"},
+                    *extra,
+                ],
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                },
+            }
+        )
+
+    def _node_state(self, monkeypatch, tmp_path, *, ts, cwd="/home/amin/magent/api"):
+        from magent import nodes
+        from magent.nodes import NodeMapEntry
+
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": ts, "sessions": ["api"]}
+        )
+        nodes.update_node_map(
+            "api",
+            NodeMapEntry(
+                nick="second",
+                sid="api",
+                placed_ts=1.0,
+                attached_existing=False,
+                remote_root="~/magent/api",
+                target="amin@devino-second",
+                cwd=cwd,
+            ),
+        )
+
+    def test_a_node_row_names_its_node_and_where_it_runs(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._node_config(tmp_config, tmp_path), "sessions", "--json"],
+        )
+
+        rows = json.loads(result.stdout)
+        assert [r["name"] for r in rows] == ["caramel", "api"]
+        assert rows[1] == {
+            "name": "api",
+            "cwd": "/home/amin/magent/api",
+            "live": True,
+            "state": "live",
+            "model": None,
+            "effort": None,
+            "node": "second",
+        }
+
+    def test_a_fresh_pull_without_the_session_reads_dead(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        from magent import nodes
+
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": time.time(), "sessions": []}
+        )
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._node_config(tmp_config, tmp_path), "sessions", "--json"],
+        )
+
+        row = json.loads(result.stdout)[1]
+        assert (row["live"], row["state"]) == (False, "dead")
+
+    def test_a_stale_node_row_is_live_none_never_false(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=0.0)
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._node_config(tmp_config, tmp_path), "sessions", "--json"],
+        )
+
+        row = json.loads(result.stdout)[1]
+        assert (row["live"], row["state"]) == (None, "stale")
+
+    def test_a_node_row_without_an_absolute_folder_reports_the_remote_root(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time(), cwd="")
+
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._node_config(tmp_config, tmp_path), "sessions", "--json"],
+        )
+
+        assert json.loads(result.stdout)[1]["cwd"] == "~/magent/api"
+
+    def test_an_unplaced_auto_project_is_a_dead_row_with_no_node(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        fake = make_fake_psmux(tmp_path, live=[])
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: fake.path)
+        self._node_state(monkeypatch, tmp_path, ts=time.time())
+        auto = {"path": str(tmp_path / "web"), "title": "web", "node": "auto"}
+
+        result = runner.invoke(
+            cli.main,
+            [
+                "--config",
+                self._node_config(tmp_config, tmp_path, auto),
+                "sessions",
+                "--json",
+            ],
+        )
+
+        assert json.loads(result.stdout)[2] == {
+            "name": "web",
+            "cwd": "",
+            "live": False,
+            "state": "dead",
+            "model": None,
+            "effort": None,
+            "node": None,
+        }
+
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))

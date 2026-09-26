@@ -423,4 +423,52 @@ def _emit_sessions_json(config_path: str | None) -> None:
             for name, row in zip(live_names, pool.map(_row, live_names), strict=True):
                 read[name] = row
     rows = [read[n] if n in read else _row(n) for n in names]
+    for row in rows:
+        row["node"] = None
+    rows += _node_session_rows(config_path)
     click.echo(json.dumps(rows, indent=2))
+
+
+def _node_session_rows(config_path: str | None) -> list[dict[str, object]]:
+    """``sessions --json`` rows for the node projects (PR-D), shaped like the
+    local ones plus ``node``. ``live`` is True / False from the sync daemon's
+    last pull, and None when that pull is stale -- an unreachable node is not
+    a dead session. ``model``/``effort`` stay None: reading a node's pane is
+    an ssh call, and this listing never dials anything.
+
+    The typed config is loaded only when the raw file names a pool node, so
+    every config without one keeps the raw loader's no-version-warning path."""
+    import json
+
+    from magent import nodes  # heavy subsystem: in-body per policy
+
+    config_file = find_config(config_path)
+    if not config_file.exists():
+        return []
+    raw = json.loads(config_file.read_text(encoding="utf-8"))
+    # Raw dict: same rule as config_sessions' node skip (DECISION-15).
+    if not any(
+        isinstance(p, dict) and p.get("node") not in (None, "cloud")
+        for p in raw.get("projects", [])
+    ):
+        return []
+    cfg = _load_config_or_exit(config_file, as_json=True)
+    # The state is nodes.session_rows' (the one answer `status` gives too);
+    # the map is read again only for the folder, which status does not show.
+    entries = nodes.read_node_map()
+    out: list[dict[str, object]] = []
+    for row in nodes.session_rows(cfg, now=time.time()):
+        entry = entries.get(str(row["name"]))
+        state = str(row["state"])
+        out.append(
+            {
+                "name": row["session"],
+                "cwd": (entry.cwd or entry.remote_root) if entry else "",
+                "live": None if state == "stale" else state == "live",
+                "state": state,
+                "model": None,
+                "effort": None,
+                "node": row["node"],
+            }
+        )
+    return out
