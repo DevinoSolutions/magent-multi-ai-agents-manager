@@ -226,8 +226,8 @@ def sync_lines(cfg: MagentConfig, nick: str, *, now: float) -> list[ScriptLine]:
             )
         )
     elif node_sync.wanted(cfg):
-        # The daemon's own "anything to sync?", so this row can never ask for
-        # a daemon that serve would not start.
+        # The daemon's own "anything to sync?" -- serve's config gate. (Serve
+        # also obeys MAGENT_NODE_SYNC=0, which this row does not read.)
         lines.append(
             ScriptLine(
                 "warn",
@@ -248,6 +248,20 @@ def sync_lines(cfg: MagentConfig, nick: str, *, now: float) -> list[ScriptLine]:
         )
     elif not nodes.sessions_stale(snap, pull_interval_s=interval, now=now):
         lines.append(ScriptLine("ok", "snapshot", f"pulled {age:.0f}s ago"))
+    elif snap.ts > now:
+        # sessions_stale reads a ts too far AHEAD as stale as well: this PC's
+        # clock went backwards since the pull, it is not an old snapshot.
+        lines.append(
+            ScriptLine(
+                "warn",
+                "snapshot",
+                (
+                    f"stamped {snap.ts - now:.0f}s in the future, more than "
+                    f"2 x pullIntervalS ({limit}s) -- this PC's clock moved "
+                    "back: its sessions read stale"
+                ),
+            )
+        )
     else:
         lines.append(
             ScriptLine(

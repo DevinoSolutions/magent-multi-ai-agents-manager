@@ -66,6 +66,12 @@ class TestThisPcsSyncRows:
     def test_a_stopped_daemon_warns_while_a_project_runs_on_a_node(self, tmp_config):
         assert _sync(tmp_config, projects=[NODE_PROJECT])[0].status == "warn"
 
+    def test_a_disabled_node_project_does_not_want_the_daemon(self, tmp_config):
+        # The daemon's own predicate (node_sync.wanted): serve would not start
+        # it for a disabled project, so its absence is not a warning.
+        projects = [{**NODE_PROJECT, "enabled": False}]
+        assert _sync(tmp_config, projects=projects)[0].status == "skip"
+
     def test_a_stopped_daemon_is_a_skip_when_no_project_uses_a_node(self, tmp_config):
         assert _sync(tmp_config)[0] == ScriptLine(
             "skip", "sync-daemon", "no project runs on a node"
@@ -81,6 +87,16 @@ class TestThisPcsSyncRows:
         _snapshot("second", time.time() - 61)
         row = _sync(tmp_config)[1]
         assert row.status == "warn"
+        assert "(60s)" in row.detail
+
+    def test_a_snapshot_from_the_future_warns_and_names_the_clock(self, tmp_config):
+        # sessions_stale reads a ts past now + 2 pulls as stale too; the row
+        # must not call that "pulled 0s ago, older than ...".
+        _snapshot("second", time.time() + 120)
+        row = _sync(tmp_config)[1]
+        assert row.status == "warn"
+        assert "ago" not in row.detail
+        assert "in the future" in row.detail
         assert "(60s)" in row.detail
 
     def test_no_snapshot_yet_is_a_skip(self, tmp_config):
