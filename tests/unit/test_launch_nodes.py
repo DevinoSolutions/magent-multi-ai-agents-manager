@@ -2106,11 +2106,42 @@ class TestDownPullsTheLastTurnHomeFirst:
         )
         launch.stop_node_sessions(_config(api), ["api"])
         out = capsys.readouterr().out
-        assert out.count("\n") == 1, out
+        assert out.count("\n") == 2, out  # the announcement, then this line
         assert "last turn not pulled (python3 not found)" in out
         assert "tar: noise" not in out
         assert "bash -s" not in out
         assert "magent node sync --once" in out
+
+    def test_the_pulls_announce_themselves_once(
+        self, rig, tmp_path, monkeypatch, capsys, killed
+    ):
+        # One pull can wait out a held lock and then a slow node -- minutes,
+        # and they run one after another. Like the bring-up's fan-out, `down`
+        # says so before the first, counting only the sessions it will pull.
+        a1, a2, a3 = (
+            ProjectConfig(path=str(tmp_path / n), node="second")
+            for n in ("a1", "a2", "a3")
+        )
+        for name in ("a1", "a2", "a3"):
+            _hold(name)
+        self._pulls(
+            monkeypatch, RemoteError(0, "could not store every pulled file", ("x",))
+        )
+        launch.stop_node_sessions(_config(a1, a2, a3), ["a1", "a2"])
+        out = capsys.readouterr().out
+        assert out.count("Pulling the last turn of 2 node session(s) home...") == 1
+        assert out.count("Pulling") == 1
+        assert out.index("Pulling") < out.index("a1: last turn not pulled")
+        assert out.isascii()
+
+    def test_nothing_to_pull_is_no_announcement(
+        self, rig, api, tmp_path, monkeypatch, capsys, killed
+    ):
+        # A pinned project nobody recorded is killed without a pull: nothing
+        # long is coming, so nothing is announced.
+        self._pulls(monkeypatch, AssertionError("pulled with no entry"))
+        launch.stop_node_sessions(_config(api), ["api"])
+        assert "Pulling" not in capsys.readouterr().out
 
     def test_a_pinned_project_nobody_recorded_is_killed_without_a_pull(
         self, rig, api, monkeypatch, capsys, killed
@@ -2156,7 +2187,7 @@ class TestDownPullsTheLastTurnHomeFirst:
         assert killed == ["api"]
         assert "api" in nodes.load_node_map_strict()
         out = capsys.readouterr().out
-        assert out.count("\n") == 1, out
+        assert out.count("\n") == 2, out  # the announcement, then this line
         assert "api: last turn not pulled (the node map could not be read)" in out
         assert "magent node sync --once" in out
 

@@ -2193,6 +2193,18 @@ def stop_node_sessions(
     except (OSError, ValueError) as exc:
         log.warning("down: node map unreadable, no placement is trusted: %s", exc)
         entries, map_known = {}, False
+    # A pull can wait out a held lock and then a slow node, one session after
+    # another: minutes. Say so before the first (the fan-out rule).
+    due = sum(
+        1
+        for proj in nodes.node_projects(config)
+        if nodes.node_sid(proj) in sids and nodes.placement_of(proj, entries)
+    )
+    if due:
+        click.echo(
+            f"  {style('-', dim=True)} Pulling the last turn of {due} node"
+            " session(s) home..."
+        )
     map_writable = True
     unreachable: set[str] = set()
     no_pull: dict[str, str] = {}
