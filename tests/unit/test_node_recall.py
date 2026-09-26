@@ -23,7 +23,7 @@ from pathlib import Path, PureWindowsPath
 
 import pytest
 
-from magent import cli, launch, node_sync, nodes, remote_mux
+from magent import cli, launch, log, node_sync, nodes, remote_mux
 from magent.cli import node_cmd
 from magent.config import ProjectConfig, load_config
 from magent.lockfile import LockHeld
@@ -1969,6 +1969,10 @@ def _stopped_before_anything(result, api_repo) -> None:
     assert nodes.read_node_map()["api"].nick == "second"
     assert not _claude_dir(api_repo).exists()
     assert "is home" not in result.stdout
+    # cq-G14 m2: the way out is a fix and a re-run -- no flag that skips the
+    # pull, and no `node doctor` (F16's, not on this line).
+    assert "--force" not in result.output
+    assert "node doctor" not in result.output
 
 
 class TestTheLastPullMustFinish:
@@ -2023,6 +2027,13 @@ class TestTheLastPullMustFinish:
         assert "could not be stored on this PC" in result.stderr
         assert "one last time" not in result.stdout
         assert node_answers == []  # no repo read, no kill
+        # cq-G14 m2: a stop that recurs says what to fix -- here the file's
+        # name is in the log remote_mux writes it to, not in the message.
+        assert (
+            f"A file this PC could not store is named in"
+            f" {log.LOG_DIR / f'{node_sync.LOG_NAME}.log'}: close what holds it"
+            " open, or free disk space, first."
+        ) in result.stderr
 
     def test_files_the_reply_had_no_room_for_stop_the_recall(
         self, runner, placed_api, node_answers, node_replies, api_repo
@@ -2035,6 +2046,8 @@ class TestTheLastPullMustFinish:
 
         _stopped_before_anything(result, api_repo)
         assert "1 file(s) did not fit in the reply" in result.stderr
+        # cq-G14 m2: each re-run brings home more (I-R2-1's watermark).
+        assert "A reply that ran out of room needs only another run." in result.stderr
 
     def test_the_rerun_asks_again_from_the_first_owed_file_and_only_then_clears(
         self, runner, placed_api, node_answers, monkeypatch, api_repo
@@ -2114,6 +2127,12 @@ class TestTheLastPullMustFinish:
         # It answered: never reported as a node that did not.
         assert "did not answer" not in result.output
         assert node_answers == []
+        # cq-G14 m2: an error the node keeps giving blocks every recall, so
+        # the stop names the way out.
+        assert (
+            "If it stops here again, fix what it names on @second first"
+            " (python3, free disk space), then run the recall again."
+        ) in result.stderr
 
     @pytest.mark.parametrize(
         "error",

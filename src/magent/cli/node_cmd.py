@@ -550,8 +550,14 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
         return False
     except node_sync.PullUnfinished as exc:
         # Before RemoteError, its base: it answered, and left files behind.
+        # cq-G14 m2: a stop that can recur names its way out. remote_mux logs
+        # the file it could not store (to node_sync's log); the message can't.
+        stored_log = log.LOG_DIR / f"{node_sync.LOG_NAME}.log"
         _fail(
-            f"the last pull from @{held.nick} did not finish ({_tail(exc)}); {_RERUN}",
+            f"the last pull from @{held.nick} did not finish ({_tail(exc)}); {_RERUN}"
+            "\n    A reply that ran out of room needs only another run."
+            f" A file this PC could not store is named in {stored_log}:"
+            " close what holds it open, or free disk space, first.",
             1,
         )
     except remote_mux.RemoteError as exc:
@@ -564,10 +570,13 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
             )
             return False
         if exc.rc not in (255, None):
-            # It answered with an error of its own.
+            # It answered with an error of its own -- one that may come back on
+            # every run (no python3 is rc 3), so the stop names the fix (m2).
             _fail(
                 f"the last pull from @{held.nick} did not finish ({_tail(exc)});"
-                f" {_RERUN}",
+                f" {_RERUN}\n    If it stops here again, fix what it names on"
+                f" @{held.nick} first (python3, free disk space), then run the"
+                " recall again.",
                 1,
             )
         # ssh's own failure (255) or a timeout (rc None, DECISION-19) means the
