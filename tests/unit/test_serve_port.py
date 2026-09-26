@@ -152,8 +152,28 @@ class TestServeOnAHeldPortExitsByName:
     def test_port_in_use_is_a_sentence_and_exit_1(self, runner, tmp_path, monkeypatch):
         from magent.upload_server import PortInUse
 
-        detail = "upload server: port 8034 is already in use or reserved (x)"
+        detail = "upload server: port 8034 is already in use (x)"
         self._raise(monkeypatch, PortInUse(detail))
+        cfg = _write_config(tmp_path / "magent.config.json", port=8034)
+
+        result = runner.invoke(cli.main, ["--config", cfg, "serve"])
+
+        assert result.exit_code == 1
+        # SystemExit, not the PortInUse itself: the shell turned it into a
+        # sentence and an exit code (CliRunner never prints a traceback).
+        assert isinstance(result.exception, SystemExit)
+        assert detail in result.stderr
+
+    def test_no_bindable_address_is_reported_the_same_way(
+        self, runner, tmp_path, monkeypatch
+    ):
+        from magent.upload_server import BindFailed
+
+        detail = (
+            "upload server: no bindable address on port 8034: port 8034 is "
+            "reserved or not permitted on 127.0.0.1 (x); see 'netsh ...'"
+        )
+        self._raise(monkeypatch, BindFailed(detail))
         cfg = _write_config(tmp_path / "magent.config.json", port=8034)
 
         result = runner.invoke(cli.main, ["--config", cfg, "serve"])
@@ -161,20 +181,6 @@ class TestServeOnAHeldPortExitsByName:
         assert result.exit_code == 1
         assert isinstance(result.exception, SystemExit)
         assert detail in result.stderr
-        assert "Traceback" not in result.output
-
-    def test_no_bindable_address_is_reported_the_same_way(
-        self, runner, tmp_path, monkeypatch
-    ):
-        from magent.upload_server import BindFailed
-
-        self._raise(monkeypatch, BindFailed("upload server: no bindable address"))
-        cfg = _write_config(tmp_path / "magent.config.json", port=8034)
-
-        result = runner.invoke(cli.main, ["--config", cfg, "serve"])
-
-        assert result.exit_code == 1
-        assert "no bindable address" in result.stderr
 
     def test_a_crash_of_the_serve_loop_still_propagates(
         self, runner, tmp_path, monkeypatch
