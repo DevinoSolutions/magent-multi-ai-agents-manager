@@ -1785,6 +1785,55 @@ supervised-pane and `--no-mux` `wt` spawns in `cli/attach.py`. Pins:
 TestAttachClientKeepsNestingMarkersButNotALeakedNoColor`, and
 `tests/unit/test_attach.py::TestAttachPanesLoseOnlyALeakedColourOverride`.
 
+### A slow child is not a failed child (2026-09-25)
+
+Both detaching launchers, `attention -d` and the Alt+V listener start
+(`launch.start_hotkey_listener`), learn their child's pid only from the pid
+file the child writes once it is up. Both used to wait a fixed 2 seconds for
+it. On a loaded desktop the daemon took 4.7-11.45s to register (about 1.5s
+idle; the pre-routing build flaked the same way), so `attention -d` printed
+"failed to start" and exited 1 over a daemon that then came up and kept
+running. The serve-watchdog e2e tier went red on it, and its teardown, which
+killed only pids it had learned, left that daemon and the server it supervised
+running.
+
+**One wait, one owner.** `procs.await_registration(child, read_pid, ...)` is the
+launcher-side wait for both callers. It lives in `procs.py` because that stdlib
+leaf is already imported by `launch.py` and by `cli/`: both directions are
+legal, and a src module never imports the cli package (LS-A-001). The window is
+`REGISTRATION_TIMEOUT_S` (20s, about 1.75x the slowest measured start). The
+idle path pays nothing, because the loop returns on the first poll that sees a
+pid. The listener start keeps `not_pid=existing`, so a restart whose kill did
+not take cannot read the old pid back as the new listener.
+
+**An exit ends the wait at once.** A child that exits, for any code including
+the 0 that `magent hotkey` returns when another listener already runs, is
+reported immediately rather than waited out. That check is meaningful on
+Windows because `spawn_detached` Popens `sys.executable`: under a venv that is
+the launcher `python.exe`, which waits for the base interpreter and passes its
+exit code through. The direct child's `poll()` therefore tracks the real
+process.
+
+**The wait never kills the child.** A timeout means "not registered yet", not
+"dead". On the machine this was measured on, the child was usually a few
+seconds from coming up. The launcher still reports failure (rc 1) so a script
+can react, but it leaves the child alone. Killing it would turn a slow start
+into a real failure, which is the bug this fixes.
+
+**The window is a bound.** It is not a knob: there is no env var, because the
+right answer is "long enough for a loaded box, and finite". A child that hangs
+alive without registering must not stall serve's supervisor thread or a `--go`
+launch before tiling. Pins:
+- `tests/unit/test_procs.py::TestAwaitRegistration`
+- `::TestTheWaitNeverEndsTheChild`
+- `::TestTheDefaultWindowIsBounded`
+- the wiring tests in `test_attention_cmd.py::TestTheLauncherWaitsForASlowDaemon`
+  and `test_hotkey.py::TestMaybeStartHotkey`
+
+The detaching e2e tiers carry the other half of the lesson. A failed launch
+must not leak what it started, so the tiers find it by a uuid argv marker, not
+by learned pid (see CLAUDE.md, serve-watchdog tier).
+
 ## 3. Known debt
 
 Ordered roughly by how likely a future change is to collide with it.
