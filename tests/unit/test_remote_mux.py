@@ -1300,6 +1300,12 @@ def _script_run(mode: str) -> str:
 
 @pytest.fixture
 def node_home(fake_ssh, monkeypatch):
+    # Wall-clock bounds sized for a real node, not for the fake ssh shim, which
+    # is a whole Python interpreter per call: under load a 10s probe expired
+    # before the shim answered (test_push_mode_ships_the_files_and_no_memory
+    # failed once that way). A test about the bounds sets its own.
+    monkeypatch.setattr(remote_mux, "PROBE_TIMEOUT_S", 60.0)
+    monkeypatch.setattr(remote_mux, "SCRIPT_TIMEOUT_S", 60.0)
     monkeypatch.setattr(psmux, "code_on_path", lambda: False)
     fake_ssh.set_reply("printenv HOME", stdout="/home/amin\n")
     return fake_ssh
