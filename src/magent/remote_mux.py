@@ -698,15 +698,19 @@ class GhUnavailable:
     token NEVER ships, and ``token_source`` says whether a re-login can fix
     it. ``failed`` is anything else. ``detail`` is gh's own words (its last
     stderr line, or a status entry's ``error``), token shapes scrubbed and
-    capped -- never its stdout, which for a token read is the token."""
+    capped -- never its stdout, which for a token read is the token. It may
+    hold a dial URL, so it is for the log only: ``hint`` and the repr never
+    carry it, and the row site that prints the hint logs it
+    (``_log_gh_refusal``)."""
 
     reason: GhUnavailableReason
     login: str | None = None
-    detail: str = ""
+    detail: str = field(default="", repr=False)
     token_source: str = ""
 
     @property
     def hint(self) -> str:
+        """The repair, in our words and the class only -- never ``detail``."""
         if self.reason == "missing":
             return "gh is not installed on this PC: https://cli.github.com"
         if self.reason == "too-old":
@@ -717,10 +721,9 @@ class GhUnavailable:
             return "gh is not logged in on this PC: gh auth login"
         if self.reason == "unverified":
             who = f" ({self.login})" if self.login else ""
-            said = f" -- gh said: {self.detail}" if self.detail else ""
             return (
                 f"this PC's gh could not verify its github.com login{who}: "
-                f"check this PC's network, then retry{said}"
+                "check this PC's network, then retry"
             )
         if self.reason == "rejected":
             if self.token_source in GH_ENV_TOKEN_SOURCES:
@@ -731,7 +734,18 @@ class GhUnavailable:
             return "github.com rejected this PC's gh login: gh auth login -h github.com"
         if self.reason == "timeout":
             return f"this PC's gh did not answer within {GH_TIMEOUT_S:g}s: retry"
-        return "this PC's gh failed" + (f": {self.detail}" if self.detail else "")
+        return "this PC's gh failed; see the nodes log"
+
+
+def _log_gh_refusal(refusal: GhUnavailable, what: str) -> None:
+    """``refusal``'s class and gh's own (scrubbed) words, into the nodes log:
+    the row that prints its ``hint`` carries neither."""
+    get_logger("nodes").warning(
+        "%s: this PC's gh gave %s: %s",
+        what,
+        refusal.reason,
+        refusal.detail or "no detail",
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -1103,6 +1117,7 @@ def _gh_to_share() -> tuple[str | None, str | None, tuple[ScriptLine, ...]]:
         refusal = token
     if refusal is None or refusal.reason in _GH_SILENT_REASONS:
         return None, None, ()
+    _log_gh_refusal(refusal, "gh token not shared")
     return None, None, (ScriptLine("warn", "gh", f"not shared -- {refusal.hint}"),)
 
 
@@ -1166,6 +1181,7 @@ def register_ssh_key(pubkey: str, *, title: str) -> ScriptLine:
     row; never raises. The key is public, but it rides stdin anyway."""
     account = local_gh_account()
     if isinstance(account, GhUnavailable):
+        _log_gh_refusal(account, "github-key not registered")
         # No gh at all keeps the one wording `node setup` has always printed
         # (and pins); every other reason names its own repair.
         detail = (

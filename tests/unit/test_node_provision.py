@@ -1684,7 +1684,8 @@ class TestThisPcsGh:
             error,
         )
         assert "network" in account.hint
-        assert account.hint.endswith(error)  # gh's own words
+        # gh's own words are kept on the object for the log, never the hint.
+        assert error not in account.hint
         assert "gh auth login" not in account.hint
 
     def test_a_token_github_refused_is_rejected_not_offline(self, fake_gh):
@@ -2272,12 +2273,7 @@ class TestProvision:
         assert json.loads(data["manifest.json"])["gh_login"] is None
         assert (
             ScriptLine(
-                "warn",
-                "gh",
-                (
-                    "not shared -- this PC's gh failed: "
-                    "gh auth token printed something that is not a token"
-                ),
+                "warn", "gh", "not shared -- this PC's gh failed; see the nodes log"
             )
             in report.lines
         )
@@ -4091,6 +4087,109 @@ REFUSED_ADD_STDERR = (
 
 def _adds(gh: FakeSsh) -> list[FakeCall]:
     return [c for c in gh.calls() if c.argv[:2] == ["ssh-key", "add"]]
+
+
+# gh's own words as measured (sp-Forph issue 1): a proxy's dial URL, a keyring
+# error, a failed DNS lookup. None may reach a row or a repr.
+PROXY_REFUSED = (
+    'Get "https://api.github.com/": proxyconnect tcp: '
+    "dial tcp 10.1.2.3:3128: connect: connection refused"
+)
+KEYRING_FAILED = "failed to read keyring: dbus: no such interface"
+NO_SUCH_HOST = (
+    'Get "https://api.github.com/": dial tcp: lookup api.github.com: no such host'
+)
+GH_FAILED_ROW = "not shared -- this PC's gh failed; see the nodes log"
+
+
+def _on_screen(lines: tuple[ScriptLine, ...]) -> str:
+    return "\n".join(f"{x.status}\t{x.item}\t{x.detail}" for x in lines)
+
+
+class TestGhsOwnWordsStayOffTheScreen:
+    """Rows carry our words and the class; gh's scrubbed words go to the nodes
+    log at the row site, and a GhUnavailable's repr never carries them."""
+
+    def test_a_proxy_refusal_is_a_class_only_row(self, fake_ssh, fake_gh, caplog):
+        caplog.set_level("WARNING", logger="magent.nodes")
+        fake_gh.set_reply("auth status", stderr=PROXY_REFUSED + "\n", rc=1)
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        assert ScriptLine("warn", "gh", GH_FAILED_ROW) in report.lines
+        screen = _on_screen(report.lines)
+        for gh_words in ("proxyconnect", "https://", "10.1.2.3", "dial tcp"):
+            assert gh_words not in screen
+        assert PROXY_REFUSED in caplog.text
+        assert "proxyconnect" not in repr(remote_mux.local_gh_account())
+
+    def test_a_keyring_failure_is_a_class_only_row(self, fake_ssh, fake_gh, caplog):
+        caplog.set_level("WARNING", logger="magent.nodes")
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        fake_gh.set_reply("auth token", stderr=KEYRING_FAILED + "\n", rc=1)
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        assert ScriptLine("warn", "gh", GH_FAILED_ROW) in report.lines
+        screen = _on_screen(report.lines)
+        assert "keyring" not in screen
+        assert "dbus" not in screen
+        assert KEYRING_FAILED in caplog.text
+        assert "dbus" not in repr(remote_mux.local_gh_token())
+
+    def test_a_failed_lookup_is_a_class_only_github_key_row(self, fake_gh, caplog):
+        caplog.set_level("WARNING", logger="magent.nodes")
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(
+                None, accounts=[("amin", True, "error", NO_SUCH_HOST)]
+            ),
+        )
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine(
+            "fail",
+            "github-key",
+            (
+                "this PC's gh could not verify its github.com login (amin): "
+                "check this PC's network, then retry"
+            ),
+        )
+        for gh_words in ("https://", "lookup", "no such host", "dial tcp"):
+            assert gh_words not in row.detail
+        assert NO_SUCH_HOST in caplog.text
+        assert "no such host" not in repr(remote_mux.local_gh_account())
+        assert _adds(fake_gh) == []
+
+    def test_a_failed_status_is_a_class_only_github_key_row(self, fake_gh, caplog):
+        caplog.set_level("WARNING", logger="magent.nodes")
+        fake_gh.set_reply("auth status", stderr=PROXY_REFUSED + "\n", rc=1)
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine(
+            "fail", "github-key", "this PC's gh failed; see the nodes log"
+        )
+        assert PROXY_REFUSED in caplog.text
+
+    def test_the_repr_never_carries_gh_s_words(self):
+        refusal = GhUnavailable("failed", detail=PROXY_REFUSED)
+        assert "detail" not in repr(refusal)
+        assert "proxyconnect" not in repr(refusal)
+        # Still kept for the log, and still part of equality.
+        assert refusal.detail == PROXY_REFUSED
+        assert refusal != GhUnavailable("failed", detail="other")
+
+    @pytest.mark.parametrize(
+        "refusal",
+        [
+            GhUnavailable("failed", detail=PROXY_REFUSED),
+            GhUnavailable("unverified", login="amin", detail=NO_SUCH_HOST),
+            GhUnavailable("too-old", detail="unknown flag: --json"),
+            GhUnavailable("not-logged-in", detail="not logged into any GitHub hosts"),
+            GhUnavailable("rejected", login="amin", detail="HTTP 401: Bad credentials"),
+        ],
+    )
+    def test_no_hint_carries_gh_s_words(self, refusal):
+        assert refusal.detail not in refusal.hint
+        assert refusal.hint.isascii()
 
 
 class TestRegisterSshKey:
