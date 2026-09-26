@@ -1591,6 +1591,96 @@ class TestStatusShowsNodeSessions:
         assert "(not placed)" in result.stdout
         assert "dead" in result.stdout
 
+    def test_the_report_prints_the_session_id_not_the_title(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # The map's sid is what runs on the node; the title only names the row.
+        from magent import nodes
+
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"),
+            {"ts": time.time(), "sessions": ["api-old"]},
+        )
+        nodes.update_node_map(
+            "api",
+            nodes.NodeMapEntry(
+                nick="second",
+                sid="api-old",
+                placed_ts=1.0,
+                attached_existing=False,
+                remote_root="/home/amin/magent/api",
+            ),
+        )
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_config, tmp_path), "status"]
+        )
+        assert "api-old" in result.stdout
+        assert "live" in result.stdout
+
+    def test_an_unreadable_node_map_reads_stale_never_dead(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # The cq-D17 probe, end to end: a placed auto project and a pinned one
+        # under a mapped sid, both live, then the map torn in half. Neither
+        # row may read dead or unplaced, status must not raise, and a stale
+        # row still does not degrade the exit.
+        from magent import nodes
+
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        node_map = tmp_path / "node-map.json"
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", node_map)
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"),
+            {"ts": time.time(), "sessions": ["api", "web-old"]},
+        )
+        for name, sid in (("api", "api"), ("web", "web-old")):
+            nodes.update_node_map(
+                name,
+                nodes.NodeMapEntry(
+                    nick="second",
+                    sid=sid,
+                    placed_ts=1.0,
+                    attached_existing=False,
+                    remote_root=f"/home/amin/magent/{name}",
+                ),
+            )
+        for sub in ("api", "web"):
+            (tmp_path / sub).mkdir()
+        cfgpath = tmp_config(
+            {
+                "projects": [
+                    {"path": str(tmp_path / "api"), "title": "api", "node": "auto"},
+                    {"path": str(tmp_path / "web"), "title": "web", "node": "second"},
+                ],
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                },
+            }
+        )
+        text = node_map.read_text(encoding="utf-8")
+        node_map.write_text(text[: len(text) // 2], encoding="utf-8")
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sessions"] == [
+            {"name": "api", "session": "api", "node": None, "state": "stale"},
+            {"name": "web", "session": "web", "node": "second", "state": "stale"},
+        ]
+        human = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+        assert human.exit_code == 0
+        nodes_block = human.stdout.split("Nodes", 1)[1]
+        assert "stale" in nodes_block
+        assert "dead" not in nodes_block
+        assert "(not placed)" not in nodes_block
+        assert "(node unknown)" in nodes_block
+
     def test_a_config_without_node_projects_prints_no_nodes_section(
         self, runner, tmp_config, monkeypatch
     ):
@@ -1606,8 +1696,10 @@ class TestAStaleNodeSyncDaemonDegradesStatus:
     """Exit 3 when a project runs on a node and the sync daemon's heartbeat has
     gone stale: every node row would then be frozen at a pull nobody refreshes.
     A STOPPED daemon is not degraded (serve starts one; with serve off the
-    upload-server line already says so), and without a node project nobody
-    expects a daemon at all. Driven through the real heartbeat file."""
+    upload-server line already says so), and without a node project -- or
+    with the MAGENT_NODE_SYNC switch off -- nobody expects a daemon at all.
+    Driven through the real heartbeat file; the switch is set back on here
+    (conftest turns it off for every tier)."""
 
     def _config(self, tmp_config, tmp_path, *, on_node=True, tool=None):
         project = {"path": str(tmp_path), "title": "api"}
@@ -1638,10 +1730,17 @@ class TestAStaleNodeSyncDaemonDegradesStatus:
     def _status(self, runner, cfgpath, *extra):
         return runner.invoke(cli.main, ["--config", cfgpath, "status", *extra])
 
+    @staticmethod
+    def _switch(monkeypatch, value):
+        """MAGENT_NODE_SYNC, re-read: the env singleton is cached."""
+        monkeypatch.setenv("MAGENT_NODE_SYNC", value)
+        monkeypatch.setattr("magent.env._cached_env", None)
+
     @pytest.fixture(autouse=True)
     def _healthy_otherwise(self, monkeypatch, tmp_path):
         from magent import nodes
 
+        self._switch(monkeypatch, "1")
         _no_psmux(monkeypatch)
         _both_off(monkeypatch)
         monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
@@ -1719,7 +1818,31 @@ class TestAStaleNodeSyncDaemonDegradesStatus:
         result = self._status(runner, cfgpath, "--json")
         assert result.exit_code == 0
         assert json.loads(result.stdout)["node_sync"] == "stopped"
-        assert self._status(runner, cfgpath).exit_code == 0
+        human = self._status(runner, cfgpath)
+        assert human.exit_code == 0
+        # Named, as the JSON names it -- but never as the degraded "stale".
+        assert status_mod.NODE_SYNC_STOPPED_LINE in human.stdout
+        assert "node sync daemon stale" not in human.stdout
+        assert status_mod.NODE_SYNC_REPAIR_HINT not in human.stdout
+
+    def test_the_switch_off_means_no_daemon_is_expected(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # serve's own gate is the switch AND wanted: a heartbeat left by a
+        # daemon that died before MAGENT_NODE_SYNC=0 was set is nobody's, and
+        # "serve starts a fresh one" would be a promise serve never keeps.
+        from magent import log
+
+        self._beat(log.HEARTBEAT_MAX_AGE + 30)
+        self._switch(monkeypatch, "0")
+        cfgpath = self._config(tmp_config, tmp_path)
+        result = self._status(runner, cfgpath, "--json")
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sync"] == "off"
+        human = self._status(runner, cfgpath)
+        assert human.exit_code == 0
+        assert "node sync daemon" not in human.stdout
+        assert "serve starts a fresh one" not in human.stdout
 
     def test_the_verdict_counts_node_sync_alongside_the_other_daemons(self):
         healthy = {
