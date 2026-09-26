@@ -294,6 +294,14 @@ class TestAgainstARealFakePsmuxBinary:
     """End-to-end through a genuine on-disk fake psmux executable: the literal
     text and the slash-command reach a real process exactly as typed."""
 
+    @pytest.fixture(autouse=True)
+    def _patient_capture(self, monkeypatch):
+        # The capture budget in these tests only. The fake is a Python shim;
+        # on a loaded Windows box its start alone has overrun the product's 3s,
+        # and a green parse then failed as "nopane". What a capture timeout
+        # DOES is pinned below with its own, tiny budget.
+        monkeypatch.setattr(psmux, "CAPTURE_PANE_TIMEOUT_S", 60.0)
+
     def test_paste_and_enter_reaches_the_binary(self, tmp_path, monkeypatch):
         monkeypatch.setattr(time, "sleep", lambda *_: None)
         fake = make_fake_psmux(tmp_path)

@@ -27,6 +27,15 @@ def _no_sleep(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda *_: None)
 
 
+@pytest.fixture(autouse=True)
+def _patient_capture(monkeypatch):
+    # The capture budget in these tests only. The fake psmux is a Python shim;
+    # on a loaded Windows box its start alone has overrun the product's 3s, and
+    # green tests failed as "nopane" / exit 0. The tests that pin what a
+    # capture TIMEOUT does set their own tiny budget and a slow fake.
+    monkeypatch.setattr(psmux, "CAPTURE_PANE_TIMEOUT_S", 60.0)
+
+
 def _slow_capture(fake, monkeypatch):
     """Make the fake's capture-pane answer well after a tiny budget."""
     fake.set_capture_delay(1.5)
