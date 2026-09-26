@@ -875,6 +875,30 @@ class TestAnUnreadableLoadHistoryIsSaidNotSilent:
             )
         ]
 
+    def test_a_live_run_whose_reading_fails_says_not_scored(
+        self, unreadable_history, monkeypatch
+    ):
+        # Live, but not sampled: the wording follows the reading, not the run.
+        asked: list[str] = []
+
+        def _no_answer(node):
+            asked.append(node.nick)
+            raise remote_mux.RemoteError(255, "ssh: connect timed out", ("ssh",))
+
+        monkeypatch.setattr(remote_mux, "sample", _no_answer)
+        monkeypatch.setattr("magent.env.local_username", lambda: "amin")
+        seed_history("second", "quiet")
+        cls, _ = unreadable_history("third")
+        config = pool("second", "third", projects=[_auto("api")])
+
+        placed = launch.place_node_projects(config, config.projects, now=NOW)
+
+        assert asked == ["third"], "a live run asks the thin node once"
+        assert [p.node for p in placed.projects] == ["second"]
+        assert placed.notes == [
+            f"@third: its load history is unreadable ({cls}); not scored"
+        ]
+
     def test_the_full_error_goes_to_nodes_log_and_not_the_screen(
         self, remote_samples, unreadable_history, caplog
     ):
