@@ -1352,9 +1352,11 @@ class NodeBringUpOutcome:
     warnings: tuple[str, ...] = ()
 
 
-# One bring-up per node at a time: two sessions' first `new-session` racing to
-# start the node's one tmux server, or two clones into the same root, is not a
-# failure anyone should have to diagnose. Different nodes run in parallel.
+# One bring-up per node at a time, within this process: two sessions' first
+# `new-session` racing to start the node's one tmux server, or two clones into
+# the same root, is not a failure anyone should have to diagnose. Different
+# nodes run in parallel. A threading.Lock does not reach a second magent
+# process; two `magent up`s at once can still race on one node.
 _BRING_UP_LOCKS: dict[str, threading.Lock] = {}
 _BRING_UP_LOCKS_GUARD = threading.Lock()
 
