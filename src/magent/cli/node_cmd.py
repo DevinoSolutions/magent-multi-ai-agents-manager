@@ -33,8 +33,11 @@ if TYPE_CHECKING:
     from magent.nodes import Node
     from magent.remote_mux import RemoteError, ScriptLine
 
-# How long `node sync -d` waits for the detached child to record its pid.
-_START_POLLS = 20
+# How long `node sync -d` waits for the detached child to record its pid:
+# ~10 s nominal, returning as soon as it appears or the child exits. A cold
+# child spends seconds importing before it takes the lock (measured 2.5-13 s
+# on a loaded desktop); one still alive at the deadline is "still starting".
+_START_POLLS = 100
 _START_POLL_S = 0.1
 
 
@@ -59,6 +62,8 @@ def _daemon_state() -> Literal["ok", "stale", "stopped"]:
     """
     from magent import node_sync  # heavy subsystem: in-body per policy
 
+    # One read: a clean stop removing the file between two reads would turn
+    # "stopped" into "stale".
     age = log.heartbeat_age(node_sync.HEARTBEAT_NAME)
     if age is None:
         return "stopped"
@@ -81,11 +86,30 @@ def sync_cmd(
     the last pull for the sessions this PC placed there. `magent serve` keeps it
     running whenever a project has a node; run it by hand to debug.
     """
+    if as_daemon:
+        # Each asks for a different run; doing only one would be a silent guess.
+        for flag, given in (
+            ("--stop", do_stop),
+            ("--once", once),
+            ("--ticks", ticks is not None),
+        ):
+            if given:
+                raise click.UsageError(f"{flag} cannot be combined with -d.", ctx=ctx)
+
     from magent import node_sync  # heavy subsystem: in-body per policy
 
     if do_stop:
         if node_sync.stop_daemon():
             click.echo(f"  {style('+', fg='green')} Stopped the node sync daemon.")
+        elif node_sync.daemon_running():
+            # False is also "a daemon holds the lock and outlived the stop"
+            # (pid unknown, kill refused, or not dead within the settle).
+            pid = node_sync.daemon_pid()
+            click.echo(
+                f"  {style('x', fg='red')} Could not stop the node sync daemon "
+                f"(pid {pid or 'unknown'})."
+            )
+            sys.exit(1)
         else:
             click.echo(f"  {style('-', dim=True)} Node sync daemon was not running.")
         return
@@ -141,7 +165,9 @@ def sync_cmd(
         # The lock is free, so a pid the file names now is a leftover -- maybe
         # a stranger's by now -- and never the child about to be spawned.
         leftover = node_sync.daemon_pid()
-        spawn_detached(node_sync_argv(str(config_path) if config_path else None))
+        child = spawn_detached(
+            node_sync_argv(str(config_path) if config_path else None)
+        )
         for _ in range(_START_POLLS):
             time.sleep(_START_POLL_S)
             pid = node_sync.daemon_pid()
@@ -151,7 +177,27 @@ def sync_cmd(
                     f"{style(f'(pid {pid})', dim=True)}"
                 )
                 return
-        click.echo(f"  {style('x', fg='red')} node sync daemon failed to start")
+            if child.poll() is not None:
+                break
+        # No budget outlasts every cold start (measured 13 s once), so a child
+        # still alive is starting, not failed -- and is never killed for being
+        # slow. On Windows child.pid is the venv launcher, which lives exactly
+        # as long as the interpreter it ran -- hence "launcher": it is the only
+        # pid there is yet, and `--stop` will later name the daemon's own.
+        # Future: share procs.await_registration (fix/serve-watchdog-e2e).
+        if child.poll() is None:
+            click.echo(
+                f"  {style('-', dim=True)} Node sync daemon still starting "
+                + style(
+                    f"(launcher pid {child.pid}) -- see ~/.magent/logs/nodes.log",
+                    dim=True,
+                )
+            )
+            return
+        click.echo(
+            f"  {style('x', fg='red')} node sync daemon failed to start"
+            f" {style('(see ~/.magent/logs/nodes.log)', dim=True)}"
+        )
         sys.exit(1)
 
     # Foreground loop (also the body of the detached child).

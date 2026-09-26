@@ -300,6 +300,28 @@ class TestReadStore:
         assert any(str(mirror / "a.json") in m for m in messages)
         assert any(str(mirror / "b.json") in m for m in messages)
 
+    def test_a_record_nested_too_deep_to_parse_is_skipped_not_raised(
+        self, tmp_path, caplog
+    ):
+        """A mirror's files are the node's (a pull member may be 64 MiB), and
+        json.loads answers deep nesting with RecursionError -- not a
+        ValueError. It must go down the bad-record path like any torn file,
+        in both reads, and never take the valid record beside it along."""
+        mirror = _mirror(tmp_path)
+        (mirror / "a.json").write_text("[" * 200_000, encoding="utf-8")
+        good = {"state": "done", "ts": 1.0, "cwd": "/w/b", "session_id": "s"}
+        _put(mirror, "b.json", good)
+        with caplog.at_level(logging.WARNING, logger="magent.attention"):
+            assert agent_state.read_store(mirror) == [good]
+            assert agent_state.read_store(mirror, strict=True) == [good]
+        named = [
+            r.getMessage()
+            for r in caplog.records
+            if str(mirror / "a.json") in r.getMessage()
+        ]
+        assert len(named) == 1
+        assert "unreadable" in named[0]
+
     def test_reading_a_store_never_sweeps_but_all_states_still_does(self, tmp_path):
         """A node mirror is the node's to age: a record swept here would come
         straight back on the next pull. This PC's own store keeps its sweep,

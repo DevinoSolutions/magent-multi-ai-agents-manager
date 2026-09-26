@@ -8,15 +8,17 @@ is 0 for every test that does not set it back.
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import logging
+import math
 import os
 import re
 import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -34,7 +36,7 @@ from magent.config import (
 from magent.env import get_env
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import get_logger, heartbeat_age, heartbeat_fresh, write_heartbeat
-from magent.nodes import NodeMapEntry, encoded_project_dir
+from magent.nodes import LoadSample, NodeMapEntry, encoded_project_dir
 from tests.unit._pull_reply import SAMPLE, pull_meta, pull_reply
 
 if TYPE_CHECKING:
@@ -234,7 +236,7 @@ class TestTheNodeLock:
         clock = iter([0.0, 0.1, 0.3, 0.6])
         with (
             exclusive_lock("node-pull-second"),
-            pytest.raises(LockHeld),
+            pytest.raises(node_sync.NodeLockHeld),
             node_sync.node_lock(
                 "second", wait_s=0.5, sleep=naps.append, now=lambda: next(clock)
             ),
@@ -247,10 +249,13 @@ class TestTheNodeLock:
             raise AssertionError("slept")
 
         with (
-            pytest.raises(LockHeld, match="inner"),
+            pytest.raises(LockHeld, match="inner") as exc,
             node_sync.node_lock("second", sleep=never),
         ):
             raise LockHeld("inner")
+        # Only a refused ACQUIRE is the node's own lock: the body's LockHeld
+        # is some other lock, and the syncer must not read it as contention.
+        assert not isinstance(exc.value, node_sync.NodeLockHeld)
         with node_sync.node_lock("second"):
             pass
 
@@ -428,6 +433,12 @@ def _capture_nodes_log(caplog: pytest.LogCaptureFixture) -> None:
 
 def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def _errors(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Every ERROR record from the nodes log, and only from it."""
+    name = f"magent.{node_sync.LOG_NAME}"
+    return [r for r in caplog.records if r.name == name and r.levelno >= logging.ERROR]
 
 
 @pytest.fixture
@@ -1191,7 +1202,511 @@ class TestTheMirror:
             json.loads(x)
             for x in nodes.load_path("second").read_text(encoding="utf-8").splitlines()
         ]
-        assert rows == [{**SAMPLE, "ts": 1070.0}, {**SAMPLE, "ts": 4650.0}]
+        # 1000 is past the 1 h window at 4650 but inside its slack (360 s):
+        # still an append. The trim itself: TestTheLoadFileIsAppendedTo.
+        assert rows == [
+            {**SAMPLE, "ts": 1000.0},
+            {**SAMPLE, "ts": 1070.0},
+            {**SAMPLE, "ts": 4650.0},
+        ]
+
+
+def _seed_marks(nick: str = "second", **marks: tuple[float, str]) -> bytes:
+    path = nodes.pull_marks_path(nick)
+    nodes.write_json_atomic(
+        path, {sid: {"since": s, "realpath": r} for sid, (s, r) in marks.items()}
+    )
+    return path.read_bytes()
+
+
+def _two_on_second() -> MagentConfig:
+    nodes.write_node_map({"api": _entry("second", "api"), "db": _entry("second", "db")})
+    return _config(
+        pool={"second": POOL["second"]},
+        projects=[
+            ProjectConfig(path="api", node="second"),
+            ProjectConfig(path="db", node="second"),
+        ],
+    )
+
+
+class TestMarksMoveOnlyAfterAPull:
+    """pull.json is written AFTER a pull lands, never before: a mark advanced
+    optimistically and then left behind by a failed pull would skip files."""
+
+    def test_an_unreachable_node_leaves_the_marks_byte_identical(
+        self, placed, fake_ssh
+    ):
+        before = _seed_marks(api=(10.0, "/home/amin/magent/api"))
+        _answer(fake_ssh, "devino-second", rc=255, stderr=REFUSED)
+        results = node_sync.NodeSyncer(_second_only()).tick()
+        assert results["second"][0] == node_sync.UNREACHABLE
+        assert nodes.pull_marks_path("second").read_bytes() == before
+
+    def test_a_reply_cut_off_before_its_trailer_leaves_the_marks_byte_identical(
+        self, placed, fake_ssh
+    ):
+        before = _seed_marks(api=(10.0, "/home/amin/magent/api"))
+        reply = pull_reply(
+            pull_meta(realpaths={"api": "/home/amin/magent/api"}),
+            {"api/transcripts/a.jsonl": "x\n"},
+        )
+        cut = reply[: reply.rindex(remote_mux.PULL_TRAILER.decode("ascii"))]
+        fake_ssh.set_reply("devino-second", stdout=cut)
+        results = node_sync.NodeSyncer(_second_only()).tick()
+        assert results["second"][0] == node_sync.FAILED
+        assert nodes.pull_marks_path("second").read_bytes() == before
+
+
+class TestMarkAndPruneScope:
+    def test_a_failed_session_keeps_its_mark_while_its_neighbour_advances(self, placed):
+        _seed_marks(api=(10.0, "/ra"), db=(20.0, "/rd"))
+
+        def pull(_node, _sids):
+            return _snapshot(
+                now=9000.0,
+                realpaths={"api": "/ra", "db": "/rd"},
+                failed_sids=frozenset({"api"}),
+            )
+
+        node_sync.NodeSyncer(_two_on_second(), pull=pull).tick()
+        assert _marks() == {
+            "api": {"since": 10.0, "realpath": "/ra"},
+            "db": {"since": 8999.0, "realpath": "/rd"},
+        }
+
+    def test_pruning_one_session_touches_no_other_nodes_mirror_and_no_local_record(
+        self, placed, tmp_path, monkeypatch
+    ):
+        local = tmp_path / "local-state"
+        monkeypatch.setattr(agent_state, "STATE_DIR", local)
+        local.mkdir()
+        (local / "x.json").write_text("{}", encoding="utf-8")
+        other = nodes.state_dir("third", "api")
+        other.mkdir(parents=True)
+        (other / "x.json").write_text("{}", encoding="utf-8")
+        mine = nodes.state_dir("second", "api")
+        mine.mkdir(parents=True)
+        (mine / "x.json").write_text("{}", encoding="utf-8")
+
+        def pull(_node, _sids):
+            return _snapshot(realpaths={"api": "/r"}, state_files={"api": ()})
+
+        node_sync.NodeSyncer(_second_only(), pull=pull).tick()
+        assert not (mine / "x.json").exists()
+        assert (other / "x.json").exists()
+        assert (local / "x.json").exists()
+
+    def test_two_nodes_sampled_in_one_tick_each_get_their_row(self, placed):
+        """The throttle is per node. Third's pull waits until second's row is
+        on disk (plus a beat for the throttle's bookkeeping), so second has
+        always stored first: a throttle shared across nodes would then drop
+        third's row every time, not only when the threads happen to race."""
+
+        def pull(node, _sids):
+            if node.nick == "third":
+                deadline = time.monotonic() + 10
+                while not nodes.load_path("second").exists():
+                    assert time.monotonic() < deadline, "second never stored"
+                    time.sleep(0.01)
+                time.sleep(0.2)
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        node_sync.NodeSyncer(_config(), pull=pull, now=lambda: 1000.0).tick()
+        for nick in ("second", "third"):
+            rows = nodes.load_path(nick).read_text(encoding="utf-8").splitlines()
+            assert [json.loads(r)["ts"] for r in rows] == [1000.0]
+
+
+class TestHostileClocksAndValues:
+    def test_a_nan_or_infinite_mark_reads_as_absent(self, placed):
+        path = nodes.pull_marks_path("second")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '{"api": {"since": NaN, "realpath": "/r"},'
+            ' "db": {"since": Infinity, "realpath": "/r"},'
+            ' "ok": {"since": 5.0, "realpath": "/r"}}',
+            encoding="utf-8",
+        )
+        assert node_sync._read_marks("second") == {
+            "ok": node_sync.Mark(since=5.0, realpath="/r")
+        }
+
+    def test_a_node_clock_that_went_back_past_the_mark_starts_over(self, placed):
+        """A node clock that jumped forward left a mark in its future. When
+        the clock comes back, files stamped before that mark would never be
+        asked for again: the transcripts start over from zero instead."""
+        _seed_marks(api=(4999.0, "/r"))
+
+        def pull(_node, _sids):
+            return _snapshot(now=3000.0, realpaths={"api": "/r"})
+
+        node_sync.NodeSyncer(_second_only(), pull=pull).tick()
+        assert _marks() == {"api": {"since": 0.0, "realpath": "/r"}}
+
+    def test_a_truncated_reply_moves_the_mark_to_its_resume_point(self, placed):
+        """E8's rule through the tick (remote_mux.next_since): holding the
+        mark would ask for the same files, cut the same way, every tick."""
+        _seed_marks(api=(10.0, "/r"))
+
+        def pull(_node, _sids):
+            return _snapshot(
+                realpaths={"api": "/r"},
+                truncated={"api": ("api/transcripts/b.jsonl",)},
+                resume={"api": 500.0},
+            )
+
+        node_sync.NodeSyncer(_second_only(), pull=pull).tick()
+        assert _marks() == {
+            "api": {"since": math.nextafter(500.0, -math.inf), "realpath": "/r"}
+        }
+
+    def test_a_pc_clock_that_steps_back_does_not_starve_samples(self, placed):
+        clock = iter([1000.0, 900.0])
+
+        def pull(_node, _sids):
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        syncer = node_sync.NodeSyncer(
+            _second_only(sample_interval_s=60), pull=pull, now=lambda: next(clock)
+        )
+        syncer.tick()
+        syncer.tick()
+        rows = nodes.load_path("second").read_text(encoding="utf-8").splitlines()
+        # The 900 sample is kept, not starved. The 1000 row now lies in this
+        # PC's future, so the trim that sample triggers drops it
+        # (TestTheTrimNeverStalls).
+        assert [json.loads(r)["ts"] for r in rows] == [900.0]
+
+    def test_a_sample_that_is_not_json_is_logged_and_the_pull_still_counts(
+        self, placed, caplog
+    ):
+        _capture_nodes_log(caplog)
+
+        def pull(_node, _sids):
+            return _snapshot(
+                realpaths={"api": "/r"},
+                sample=LoadSample(**{**SAMPLE, "load1": float("nan")}),
+            )
+
+        results = node_sync.NodeSyncer(_second_only(), pull=pull).tick()
+        assert results["second"] == (node_sync.OK, "")
+        assert not nodes.load_path("second").exists()
+        assert set(_marks()) == {"api"}
+        assert [m for m in _warnings(caplog) if "load sample" in m]
+
+    def test_a_load_file_that_cannot_be_written_does_not_fail_the_tick(
+        self, placed, caplog
+    ):
+        _capture_nodes_log(caplog)
+        nodes.load_path("second").mkdir(parents=True)
+
+        def pull(_node, _sids):
+            return _snapshot(realpaths={"api": "/r"}, sample=LoadSample(**SAMPLE))
+
+        results = node_sync.NodeSyncer(_second_only(), pull=pull).tick()
+        assert results["second"] == (node_sync.OK, "")
+        assert _marks() == {"api": {"since": 0.0, "realpath": "/r"}}
+        assert nodes.read_sessions("second") is not None
+        assert [m for m in _warnings(caplog) if "node second: load sample" in m]
+
+
+WINDOW_S = 3600.0  # history_h=1
+SLACK_S = 360.0  # max(10% of the window, the 60 s sample interval)
+
+
+def _load_ts(nick: str = "second") -> list[float]:
+    out: list[float] = []
+    for line in nodes.load_path(nick).read_text(encoding="utf-8").splitlines():
+        out.append(json.loads(line)["ts"])
+    return out
+
+
+@pytest.fixture
+def rewrites(monkeypatch) -> list[Path]:
+    """Every atomic rewrite of a load.jsonl (pull.json and sessions.json go
+    through the same writer and are not counted)."""
+    seen: list[Path] = []
+    real = nodes.write_text_atomic
+
+    def spy(path: Path, text: str) -> None:
+        if path.name == "load.jsonl":
+            seen.append(path)
+        real(path, text)
+
+    monkeypatch.setattr(nodes, "write_text_atomic", spy)
+    return seen
+
+
+def _sample_at(at: float) -> None:
+    node_sync._append_sample(
+        "second", LoadSample(**SAMPLE), at=at, history_h=1, interval_s=60
+    )
+
+
+class TestTheLoadFileIsAppendedTo:
+    def test_rows_are_appended_without_a_rewrite_inside_the_slack(
+        self, placed, rewrites
+    ):
+        for at in (1000.0, 1060.0, 1000.0 + WINDOW_S + SLACK_S):
+            _sample_at(at)
+        assert _load_ts() == [1000.0, 1060.0, 1000.0 + WINDOW_S + SLACK_S]
+        assert rewrites == []
+
+    def test_a_trim_happens_past_the_slack_and_keeps_only_the_window(
+        self, placed, rewrites
+    ):
+        for at in (1000.0, 1060.0, 4650.0):
+            _sample_at(at)
+        at = 1000.0 + WINDOW_S + SLACK_S + 1
+        _sample_at(at)
+        assert len(rewrites) == 1
+        assert _load_ts() == [4650.0, at]
+        assert min(_load_ts()) >= at - WINDOW_S
+
+    def test_a_long_run_stays_bounded_and_rarely_rewrites(self, placed, rewrites):
+        samples = 600  # ten hours at one sample a minute
+        for i in range(samples):
+            at = 1000.0 + 60 * i
+            _sample_at(at)
+            rows = _load_ts()
+            assert rows[-1] == at
+            assert at - rows[0] <= WINDOW_S + SLACK_S
+        assert 0 < len(rewrites) <= samples // 5
+
+    def test_an_unreadable_first_line_is_trimmed_away(self, placed, rewrites):
+        path = nodes.load_path("second")
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"\xff not json\n")
+        _sample_at(1000.0)
+        assert len(rewrites) == 1
+        assert _load_ts() == [1000.0]
+
+    def test_a_torn_last_row_does_not_swallow_the_next_one(self, placed):
+        path = nodes.load_path("second")
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps({**SAMPLE, "ts": 900.0}) + '\n{"ts": 95', encoding="utf-8"
+        )
+        _sample_at(1000.0)
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert lines[1] == '{"ts": 95'
+        assert json.loads(lines[2])["ts"] == 1000.0
+
+
+class TestATornLoadRowAcrossTicks:
+    def test_a_tick_after_a_torn_row_appends_intact_and_the_trim_drops_the_fragment(
+        self, placed
+    ):
+        """A crash mid-append leaves a partial last line. The next tick's row
+        must start its own line, and the trim pass must skip the fragment."""
+        torn = '{"ts": 95'
+        path = nodes.load_path("second")
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps({**SAMPLE, "ts": 900.0}) + "\n" + torn, encoding="utf-8"
+        )
+        clock = iter([1000.0, 5000.0])
+
+        def pull(_node, _sids):
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        syncer = node_sync.NodeSyncer(
+            _second_only(sample_interval_s=60, history_h=1),
+            pull=pull,
+            now=lambda: next(clock),
+        )
+        syncer.tick()
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert [ln for ln in lines if ln == torn] == [torn]
+        assert [json.loads(ln) for ln in lines if ln != torn] == [
+            {**SAMPLE, "ts": 900.0},
+            {**SAMPLE, "ts": 1000.0},
+        ]
+        syncer.tick()  # 900 is now past the window + slack: a trim
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert [json.loads(ln) for ln in lines] == [{**SAMPLE, "ts": 5000.0}]
+
+
+def _parsed_rows(nick: str = "second") -> list[float | None]:
+    """Every line's ts, None for a line that is not a row."""
+    out: list[float | None] = []
+    for line in nodes.load_path(nick).read_text(encoding="utf-8").splitlines():
+        try:
+            out.append(float(json.loads(line)["ts"]))
+        except (ValueError, KeyError, TypeError):
+            out.append(None)
+    return out
+
+
+# The most rows the file may hold: the window plus its slack, one per minute,
+# and the row just appended.
+MAX_ROWS = int((WINDOW_S + SLACK_S) // 60) + 1
+
+
+class TestTheTrimNeverStalls:
+    """Two first-line states used to switch the trim off for good, and the
+    file then grew by one row a sample, without bound."""
+
+    def _run(self, first_line: str, rewrites: list[Path]) -> None:
+        path = nodes.load_path("second")
+        path.parent.mkdir(parents=True)
+        path.write_text(first_line, encoding="utf-8")
+        samples = 300
+        for i in range(samples):
+            _sample_at(1000.0 + 60 * i)
+        rows = _parsed_rows()
+        assert rewrites, "the trim never ran"
+        # Rare, too: a kept future row would force a rewrite every sample.
+        assert len(rewrites) <= samples // 5
+        assert None not in rows
+        assert len(rows) <= MAX_ROWS
+        now = 1000.0 + 60 * (samples - 1)
+        assert rows[-1] == now
+        assert max(rows) == now  # nothing from the future survives
+
+    def test_a_first_row_from_this_pcs_future_is_trimmed(self, placed, rewrites):
+        """This PC's clock ran ahead, then stepped back: the rows it stamped
+        then are later than now. Waiting for real time to pass them would let
+        the file grow for the whole jump."""
+        self._run(json.dumps({**SAMPLE, "ts": 1_000_000.0}) + "\n", rewrites)
+
+    def test_a_blank_first_line_is_trimmed(self, placed, rewrites):
+        self._run("\n", rewrites)
+
+
+class TestTheLoadSampleEdges:
+    def test_the_slack_is_at_least_one_interval(self, placed, rewrites):
+        """With a 600 s interval the slack is 600 s, not 10% of an hour: a
+        row exactly one window plus one interval old is still inside it, so
+        the append does not rewrite the file."""
+        first, at = 1000.0, 1000.0 + WINDOW_S + 600
+        for ts in (first, at):
+            node_sync._append_sample(
+                "second", LoadSample(**SAMPLE), at=ts, history_h=1, interval_s=600
+            )
+        assert rewrites == []
+        assert _load_ts() == [first, at]
+
+    def test_a_failing_sample_is_tried_once_per_interval(self, placed, monkeypatch):
+        """The throttle is stamped before the append, so a load file that
+        cannot be written is retried per sample interval, not per tick."""
+        nodes.load_path("second").mkdir(parents=True)
+        tried: list[float] = []
+        real = node_sync._append_sample
+
+        def spy(nick, sample, **kw):
+            tried.append(kw["at"])
+            real(nick, sample, **kw)
+
+        monkeypatch.setattr(node_sync, "_append_sample", spy)
+        clock = iter([1000.0, 1010.0])
+
+        def pull(_node, _sids):
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        syncer = node_sync.NodeSyncer(
+            _second_only(sample_interval_s=60), pull=pull, now=lambda: next(clock)
+        )
+        assert syncer.tick()["second"] == (node_sync.OK, "")
+        assert syncer.tick()["second"] == (node_sync.OK, "")
+        assert tried == [1000.0]
+
+    def test_a_broken_load_file_warns_once_and_says_when_it_recovers(
+        self, placed, caplog
+    ):
+        """A daemon ticking on a broken load file must not warn every sample
+        (a day at one a minute is ~1,440 warnings): one on the way in, one
+        INFO on the way out, and nothing while nothing changes."""
+        _capture_nodes_log(caplog)
+        path = nodes.load_path("second")
+        path.mkdir(parents=True)
+        clock = iter(1000.0 + 60 * i for i in range(6))
+
+        def pull(_node, _sids):
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        syncer = node_sync.NodeSyncer(
+            _second_only(sample_interval_s=60), pull=pull, now=lambda: next(clock)
+        )
+        for _ in range(3):
+            assert syncer.tick()["second"] == (node_sync.OK, "")
+        assert len([m for m in _warnings(caplog) if "load sample" in m]) == 1
+        path.rmdir()
+        for _ in range(3):
+            syncer.tick()
+        kept_again = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.INFO and "load samples kept again" in r.getMessage()
+        ]
+        assert kept_again == ["node second: load samples kept again"]
+        assert len([m for m in _warnings(caplog) if "load sample" in m]) == 1
+        assert _load_ts() == [1180.0, 1240.0, 1300.0]
+
+    def test_the_broken_load_file_state_is_per_node(self, placed, caplog):
+        """One node's broken load file must neither silence another node's
+        first warning nor be 'recovered' by another node's good sample."""
+        _capture_nodes_log(caplog)
+        t = [1000.0]
+
+        def pull(_node, _sids):
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        def tick() -> None:
+            results = syncer.tick()
+            assert results == dict.fromkeys(("second", "third"), (node_sync.OK, ""))
+            t[0] += 60
+
+        def said(level: int, text: str) -> list[str]:
+            return sorted(
+                r.getMessage()
+                for r in caplog.records
+                if r.levelno == level and text in r.getMessage()
+            )
+
+        syncer = node_sync.NodeSyncer(
+            _config(sample_interval_s=60), pull=pull, now=lambda: t[0]
+        )
+        nodes.load_path("second").mkdir(parents=True)
+        for _ in range(3):  # second broken, third healthy
+            tick()
+        assert [m.split(":")[0] for m in said(logging.WARNING, "load sample")] == [
+            "node second"
+        ]
+        assert said(logging.INFO, "kept again") == []
+        nodes.load_path("third").unlink()  # third breaks too, second still is
+        nodes.load_path("third").mkdir()
+        tick()
+        assert [m.split(":")[0] for m in said(logging.WARNING, "load sample")] == [
+            "node second",
+            "node third",
+        ]
+        nodes.load_path("second").rmdir()  # second repaired, third still broken
+        for _ in range(2):
+            tick()
+        assert said(logging.INFO, "kept again") == [
+            "node second: load samples kept again"
+        ]
+        assert len(said(logging.WARNING, "load sample")) == 2
+
+    def test_a_first_line_nested_too_deep_is_trimmed_not_raised(self, placed):
+        """json.loads raises RecursionError, not ValueError, on deep nesting.
+        The row reader must read that as "not a row", or the tick fails."""
+        path = nodes.load_path("second")
+        path.parent.mkdir(parents=True)
+        path.write_text("[" * 200_000 + "\n", encoding="utf-8")
+
+        def pull(_node, _sids):
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        syncer = node_sync.NodeSyncer(
+            _second_only(sample_interval_s=60, history_h=1),
+            pull=pull,
+            now=lambda: 1000.0,
+        )
+        assert syncer.tick()["second"] == (node_sync.OK, "")
+        assert _load_ts() == [1000.0]
 
 
 def _recording_pull(seen: list[tuple[str, list[str]]]):
@@ -1249,10 +1764,13 @@ class TestTheLoop:
             )
         assert seen == []
 
-    def test_a_crash_keeps_the_heartbeat_as_its_marker(self, placed, monkeypatch):
-        """The crash is raised by the tick itself, not by a pull: a node's
-        failure is reduced to an outcome inside _sync_node, so only a bug in
-        the loop's own machinery escapes -- and that must crash the loop."""
+    def test_a_crash_keeps_the_heartbeat_as_its_marker(
+        self, placed, monkeypatch, caplog
+    ):
+        """The crash is raised by the tick itself, not by a pull: a bug in the
+        loop's own machinery must crash the loop, logged once at ERROR with
+        its traceback, and leave the heartbeat behind as the marker."""
+        _capture_nodes_log(caplog)
 
         def broken(_self, *, wait_s=None):
             raise ValueError("boom")
@@ -1262,6 +1780,9 @@ class TestTheLoop:
             node_sync.run_sync_loop(_config(), max_ticks=1, pull=_recording_pull([]))
         assert heartbeat_age(node_sync.HEARTBEAT_NAME) is not None
         assert node_sync.daemon_pid() is None
+        (crash,) = _errors(caplog)
+        assert crash.getMessage() == "node sync daemon crashed"
+        assert crash.exc_info is not None
 
     def test_a_changed_config_is_picked_up_between_ticks(self, placed):
         seen: list[tuple[str, list[str]]] = []
@@ -1299,6 +1820,44 @@ class TestTheLoop:
         )
         assert len(seen) == 4
 
+    def test_the_loop_keeps_a_fixed_cadence(self, placed):
+        """The sleep is what is left of the tick interval after the tick, so a
+        slow tick does not push every later one back."""
+        clock = [0.0]
+        slept: list[float] = []
+
+        def pull(node, _sids):
+            if node.nick == "second":
+                clock[0] += 12.0
+            return _snapshot()
+
+        node_sync.run_sync_loop(
+            _config(pull_interval_s=30, sample_interval_s=60),
+            max_ticks=2,
+            sleep=slept.append,
+            clock=lambda: clock[0],
+            pull=pull,
+        )
+        assert slept == [18.0]
+
+    def test_a_tick_longer_than_the_interval_does_not_sleep(self, placed):
+        clock = [0.0]
+        slept: list[float] = []
+
+        def pull(node, _sids):
+            if node.nick == "second":
+                clock[0] += 45.0
+            return _snapshot()
+
+        node_sync.run_sync_loop(
+            _config(pull_interval_s=30, sample_interval_s=60),
+            max_ticks=2,
+            sleep=slept.append,
+            clock=lambda: clock[0],
+            pull=pull,
+        )
+        assert slept == [0.0]
+
     def test_one_tick_refuses_while_the_daemon_holds_the_lock(self, placed):
         with exclusive_lock(node_sync.LOCK_NAME), pytest.raises(LockHeld):
             node_sync.run_once(_config(), pull=_recording_pull([]))
@@ -1333,12 +1892,18 @@ class _RecordingExecutor(ThreadPoolExecutor):
         super().shutdown(wait=wait, cancel_futures=cancel_futures)
 
 
-@pytest.fixture
-def executors(monkeypatch) -> list[_RecordingExecutor]:
+@pytest.fixture(autouse=True)
+def executors(monkeypatch) -> Iterator[list[_RecordingExecutor]]:
+    """Every pull pool a syncer in this module builds is recorded, and every
+    worker is joined at teardown. The join runs BEFORE monkeypatch undoes the
+    NODES_DIR and home redirects (this fixture depends on monkeypatch, so it
+    is torn down first), so a late _store can never write into the real
+    ~/.magent -- the home-isolation law, for threads that outlive a test."""
     made: list[_RecordingExecutor] = []
     monkeypatch.setattr(_RecordingExecutor, "made", made, raising=False)
     monkeypatch.setattr(node_sync, "ThreadPoolExecutor", _RecordingExecutor)
-    return made
+    yield made
+    _drain(made)
 
 
 def _drain(executors: list[_RecordingExecutor]) -> None:
@@ -1348,6 +1913,76 @@ def _drain(executors: list[_RecordingExecutor]) -> None:
         ThreadPoolExecutor.shutdown(e, wait=True)
 
 
+class _Clock:
+    """The syncer's monotonic clock, set by hand."""
+
+    def __init__(self) -> None:
+        self.at = 0.0
+
+    def __call__(self) -> float:
+        return self.at
+
+
+def _running(age: int) -> tuple[str, str]:
+    return (node_sync.UNREACHABLE, f"{node_sync.PULL_STILL_RUNNING} after {age}s")
+
+
+def _wait_out_the_laggard(syncer: node_sync.NodeSyncer, nick: str) -> None:
+    """Block (bounded) until ``nick``'s in-flight pull has ended, so the next
+    tick sees a DONE previous future and takes its between-ticks branch."""
+    (_, pending) = wait([syncer._inflight[nick]], timeout=10)
+    assert not pending, f"{nick}'s released pull never ended"
+
+
+def _hang_then_raise(
+    monkeypatch: pytest.MonkeyPatch, release: threading.Event, error: Exception
+) -> None:
+    """Make _sync_node ITSELF hang for ``second`` until ``release``, then raise
+    ``error`` -- once; later calls run the real _sync_node. Raising here, not
+    from the pull, keeps the error outside any catch-all inside _sync_node."""
+    real = node_sync.NodeSyncer._sync_node
+    raised = threading.Event()
+
+    def sync_node(self, nick, entries, local_user, config):
+        if nick == "second" and not raised.is_set():
+            raised.set()
+            assert release.wait(30), "the test never released the hung pull"
+            raise error
+        return real(self, nick, entries, local_user, config)
+
+    monkeypatch.setattr(node_sync.NodeSyncer, "_sync_node", sync_node)
+
+
+def _reachable_again(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records if "reachable again" in r.getMessage()
+    ]
+
+
+@pytest.fixture
+def healthy_pulls_end_first(monkeypatch) -> None:
+    """Every healthy pull has ENDED before the tick's own bounded wait starts.
+
+    ``tick(wait_s=0.2)`` is a wall-clock race for every node, not only the hung
+    one: on a loaded box (load 24-37 was seen) the healthy node's pull -- a lock
+    and a few atomic writes -- outlasted 0.2 s and read PULL_STILL_RUNNING, the
+    laggard's outcome. So before the tick's wait, this waits (bounded, 30 s)
+    for the first of its pulls to end. With ``_blocking_pull`` exactly one pull
+    is hung until the test releases it, so the first to end is the healthy one,
+    whatever the load. The tick's own wait then runs unchanged, and it still
+    has to return past the hung pull -- the property these tests pin."""
+    real_wait = node_sync.wait
+
+    def settled(fs, timeout=None):
+        fs = list(fs)
+        done, _ = real_wait(fs, timeout=30, return_when=FIRST_COMPLETED)
+        assert done, "no healthy pull ended within 30 s"
+        return real_wait(fs, timeout=timeout)
+
+    monkeypatch.setattr(node_sync, "wait", settled)
+
+
+@pytest.mark.usefixtures("healthy_pulls_end_first")
 class TestAHungNodeDoesNotHoldTheTick:
     """One hung node used to hold every tick for up to PULL_TIMEOUT_S, so every
     healthy node's sessions.json aged past sessions_stale's two pull intervals.
@@ -1358,30 +1993,41 @@ class TestAHungNodeDoesNotHoldTheTick:
     ):
         release = threading.Event()
         dialled: list[str] = []
-        syncer = node_sync.NodeSyncer(_config(), pull=_blocking_pull(release, dialled))
+        clock = _Clock()
+        syncer = node_sync.NodeSyncer(
+            _config(), pull=_blocking_pull(release, dialled), clock=clock
+        )
         try:
             started = time.monotonic()
             first = syncer.tick(wait_s=0.2)
+            clock.at = 7.0
             second = syncer.tick(wait_s=0.2)
             elapsed = time.monotonic() - started
         finally:
             release.set()
             syncer.close()
             _drain(executors)
-        running = (node_sync.UNREACHABLE, node_sync.PULL_STILL_RUNNING)
-        assert first == second == {"second": running, "third": (node_sync.OK, "")}
+        ok = (node_sync.OK, "")
+        assert first == {"second": _running(0), "third": ok}
+        assert second == {"second": _running(7), "third": ok}
         assert elapsed < 10
         # The laggard is not dialled again while its pull is still running.
         assert sorted(dialled) == ["second", "third", "third"]
 
-    def test_the_laggard_reads_ok_on_the_tick_after_it_finishes(
+    def test_a_slow_pull_inside_the_stale_threshold_is_no_news(
         self, placed, caplog, executors
     ):
+        """sessions.json only reads stale past two pull intervals; a pull that
+        is merely slow until then logs nothing, either way."""
         _capture_nodes_log(caplog)
         release = threading.Event()
-        syncer = node_sync.NodeSyncer(_config(), pull=_blocking_pull(release, []))
+        clock = _Clock()
+        syncer = node_sync.NodeSyncer(
+            _config(pull_interval_s=30), pull=_blocking_pull(release, []), clock=clock
+        )
         try:
             syncer.tick(wait_s=0.2)
+            clock.at = 60.0  # == 2 * pull_interval_s: not yet past it
             syncer.tick(wait_s=0.2)
             release.set()
             after = syncer.tick(wait_s=10)
@@ -1390,14 +2036,242 @@ class TestAHungNodeDoesNotHoldTheTick:
             syncer.close()
             _drain(executors)
         assert after == {"second": (node_sync.OK, ""), "third": (node_sync.OK, "")}
+        assert _node_warnings(caplog, "second") == []
+        assert _reachable_again(caplog) == []
+
+    def test_a_pull_past_the_stale_threshold_warns_once_and_recovers_once(
+        self, placed, caplog, executors
+    ):
+        _capture_nodes_log(caplog)
+        release = threading.Event()
+        clock = _Clock()
+        syncer = node_sync.NodeSyncer(
+            _config(pull_interval_s=30), pull=_blocking_pull(release, []), clock=clock
+        )
+        try:
+            syncer.tick(wait_s=0.2)
+            clock.at = 61.0
+            syncer.tick(wait_s=0.2)
+            clock.at = 300.0
+            syncer.tick(wait_s=0.2)
+            release.set()
+            after = syncer.tick(wait_s=10)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+        assert after["second"] == (node_sync.OK, "")
         assert _node_warnings(caplog, "second") == [
-            "node second: unreachable (previous pull still running)"
+            "node second: unreachable (pull still running after 61s)"
         ]
-        assert [
-            r.getMessage()
-            for r in caplog.records
-            if "reachable again" in r.getMessage()
-        ] == ["node second: reachable again"]
+        assert _reachable_again(caplog) == ["node second: reachable again"]
+
+    def test_a_laggard_that_ends_failed_is_logged_then_recovers(
+        self, placed, caplog, executors
+    ):
+        """The laggard's own outcome is news once it ends: FAILED logs its
+        reason, and the next OK logs the recovery. The laggard is waited out
+        BEFORE the next tick, so that tick takes the ended-between-ticks
+        branch every time rather than collecting it in its own wait."""
+        _capture_nodes_log(caplog)
+        release = threading.Event()
+        calls: list[str] = []
+
+        def pull(node, _sids):
+            calls.append(node.nick)
+            if node.nick == "second" and calls.count("second") == 1:
+                assert release.wait(30), "the test never released the hung pull"
+                raise remote_mux.RemoteError(1, "pull.sh: broke\n", ("ssh",))
+            return _snapshot()
+
+        syncer = node_sync.NodeSyncer(_config(), pull=pull, clock=_Clock())
+        try:
+            syncer.tick(wait_s=0.2)
+            release.set()
+            _wait_out_the_laggard(syncer, "second")
+            syncer.tick(wait_s=10)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+        assert _node_warnings(caplog, "second") == [
+            "node second: failed (pull.sh: broke)"
+        ]
+        # E11 (96c51f8): a node back from a failure other than unreachable is
+        # "ok again (was failed)"; "reachable again" names a transport recovery.
+        assert _reachable_again(caplog) == []
+        assert "node second: ok again (was failed)" in [
+            r.getMessage() for r in caplog.records
+        ]
+
+    def test_a_stale_pull_noted_mid_error_leaves_the_error_to_its_collector(
+        self, placed, caplog, executors, monkeypatch
+    ):
+        """The E11 x E13 seam: a tick notes a pull past the stale threshold as
+        unreachable while its worker is recording an internal error. That note
+        must not take the error (it would log "unreachable" at ERROR with a
+        traceback that is not an unreachable node's); the tick that collects
+        the finished pull logs it, once, at ERROR."""
+        _capture_nodes_log(caplog)
+        recorded = threading.Event()
+        release = threading.Event()
+        real = node_sync.NodeSyncer._internal_error
+
+        def internal_error(self, nick, e):
+            out = real(self, nick, e)
+            if nick == "second":
+                recorded.set()
+                assert release.wait(30), "the test never released the worker"
+            return out
+
+        monkeypatch.setattr(node_sync.NodeSyncer, "_internal_error", internal_error)
+
+        def pull(node, _sids):
+            if node.nick == "second":
+                raise KeyError("boom")
+            return _snapshot()
+
+        clock = _Clock()
+        syncer = node_sync.NodeSyncer(
+            _config(pull_interval_s=30), pull=pull, clock=clock
+        )
+        try:
+            syncer.tick(wait_s=0.2)
+            assert recorded.wait(10), "the worker never recorded its error"
+            clock.at = 61.0  # past 2 * pull_interval_s: the running pull is news
+            stale = syncer.tick(wait_s=0.2)
+            release.set()
+            _wait_out_the_laggard(syncer, "second")
+            collected = syncer.tick(wait_s=10)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+        assert stale["second"] == _running(61)
+        assert _node_warnings(caplog, "second") == [
+            "node second: unreachable (pull still running after 61s)"
+        ]
+        assert collected["second"] == (node_sync.FAILED, "internal error: KeyError")
+        (error,) = _node_errors(caplog)
+        assert error.getMessage() == "node second: failed (internal error: KeyError)"
+        assert error.exc_info is not None
+
+    def test_a_node_readded_while_its_old_pull_runs_is_not_dialled_twice(
+        self, placed, executors
+    ):
+        """A removed node's pull is kept until it ends, so re-adding the node
+        finds it instead of starting a second pull beside it."""
+        release = threading.Event()
+        dialled: list[str] = []
+        syncer = node_sync.NodeSyncer(
+            _config(), pull=_blocking_pull(release, dialled), clock=_Clock()
+        )
+        third_only = _config(
+            pool={"third": POOL["third"]},
+            projects=[ProjectConfig(path="web", node="third")],
+        )
+        try:
+            syncer.tick(wait_s=0.2)
+            syncer.reconfigure(third_only)
+            syncer.tick(wait_s=0.2)
+            syncer.reconfigure(_config())
+            back = syncer.tick(wait_s=0.2)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+        assert back["second"] == _running(0)
+        assert dialled.count("second") == 1
+
+    def test_a_removed_nodes_pull_that_raises_still_surfaces(
+        self, placed, executors, monkeypatch
+    ):
+        """No outcome is reported for a node that left the pool, but an error
+        its worker raised is not swallowed: the next tick re-raises it. Raised
+        from _sync_node itself, outside any catch-all inside it, so this pins
+        the gone-node re-raise however _sync_node classifies a pull."""
+        release = threading.Event()
+        _hang_then_raise(monkeypatch, release, ValueError("orphan"))
+        syncer = node_sync.NodeSyncer(
+            _config(), pull=_recording_pull([]), clock=_Clock()
+        )
+        third_only = _config(
+            pool={"third": POOL["third"]},
+            projects=[ProjectConfig(path="web", node="third")],
+        )
+        try:
+            syncer.tick(wait_s=0.2)
+            syncer.reconfigure(third_only)
+            release.set()
+            _wait_out_the_laggard(syncer, "second")
+            with pytest.raises(ValueError, match="orphan"):
+                syncer.tick(wait_s=10)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+
+    def test_a_laggard_stores_under_the_config_its_tick_started_with(
+        self, placed, executors
+    ):
+        """A reconfigure while a pull is running must not reach that pull: it
+        was dialled under the old pool and is stored under the old settings
+        (here the history window, which decides what load.jsonl keeps)."""
+        entered = threading.Event()
+        release = threading.Event()
+        hosts: list[str] = []
+
+        def pull(node, _sids):
+            hosts.append(node.host)
+            if node.nick == "second":
+                entered.set()
+                assert release.wait(30), "the test never released the hung pull"
+            return _snapshot(sample=nodes.LoadSample(**SAMPLE))
+
+        old_row = json.dumps({**SAMPLE, "ts": 1000.0 - 2 * 3600})
+        nodes.write_text_atomic(nodes.load_path("second"), old_row + "\n")
+        moved = {"second": NodeConfig(nick="second", host="devino-moved", user="amin")}
+        syncer = node_sync.NodeSyncer(
+            _config(history_h=24), pull=pull, now=lambda: 1000.0
+        )
+        try:
+            syncer.tick(wait_s=0.2)
+            assert entered.wait(10)
+            syncer.reconfigure(_config(pool=moved, history_h=1))
+        finally:
+            release.set()
+            _drain(executors)
+        rows = [
+            json.loads(x)["ts"]
+            for x in nodes.load_path("second").read_text(encoding="utf-8").splitlines()
+        ]
+        assert "devino-moved" not in hosts
+        assert rows == [1000.0 - 2 * 3600, 1000.0]  # the old 24 h window kept it
+
+    def test_a_laggard_that_raises_surfaces_on_the_next_tick(
+        self, placed, executors, monkeypatch
+    ):
+        """A worker that raises after its tick stopped waiting is re-raised by
+        the next tick -- the loop then crashes, as for any escaping exception.
+        The error is raised by _sync_node itself, outside the try E11
+        (96c51f8) adds a catch-all to, so this still pins the laggard re-raise
+        after that merge. Only the FIRST call raises: the redial is healthy,
+        so only the ended laggard's own result can make this tick raise."""
+        release = threading.Event()
+        _hang_then_raise(monkeypatch, release, ValueError("late"))
+        syncer = node_sync.NodeSyncer(_config(), pull=_recording_pull([]))
+        try:
+            first = syncer.tick(wait_s=0.2)
+            release.set()
+            _wait_out_the_laggard(syncer, "second")
+            with pytest.raises(ValueError, match="late"):
+                syncer.tick(wait_s=10)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+        assert first["second"][0] == node_sync.UNREACHABLE
+        assert first["second"][1].startswith(node_sync.PULL_STILL_RUNNING)
 
     def test_a_smaller_pool_gets_a_new_executor(self, placed, executors):
         syncer = node_sync.NodeSyncer(_config(), pull=_recording_pull([]))
@@ -1410,6 +2284,31 @@ class TestAHungNodeDoesNotHoldTheTick:
         assert [e.max_workers for e in executors] == [2, 1]
         assert executors[0].shutdowns == [(False, False)]
         assert executors[1].shutdowns == [(False, True)]
+
+    def test_ticks_over_the_same_pool_share_one_executor(self, placed, executors):
+        syncer = node_sync.NodeSyncer(_config(), pull=_recording_pull([]))
+        try:
+            syncer.tick()
+            syncer.tick()
+        finally:
+            syncer.close()
+        assert len(executors) == 1
+
+    def test_one_shot_waits_for_every_pull(self, placed):
+        """run_once has no next tick to collect a laggard, so it joins."""
+
+        def slow(_node, _sids):
+            time.sleep(0.3)
+            return _snapshot()
+
+        assert node_sync.run_once(_config(), pull=slow) == {
+            "second": (node_sync.OK, ""),
+            "third": (node_sync.OK, ""),
+        }
+
+    def test_the_daemon_waits_half_a_tick_for_its_pulls(self):
+        cfg = _config(pull_interval_s=30, sample_interval_s=60)
+        assert node_sync.tick_wait_s(cfg) == node_sync.tick_interval_s(cfg) / 2 == 15.0
 
     def test_the_loop_shuts_its_executor_down_without_joining_a_hung_pull(
         self, placed, executors
@@ -1430,6 +2329,14 @@ class TestAHungNodeDoesNotHoldTheTick:
         assert rc == 0
         assert elapsed < 10
         assert shutdowns == [[(False, True)]]
+
+
+def _pull_shown(sid: str, root: str) -> tuple[str, ...]:
+    """The shown form of the first pull final_pull would send for ``sid``
+    on second (as local user amin) -- what a refusal must name exactly."""
+    node = nodes.node_for_nick(_config(), "second", local_user="amin")
+    spec = remote_mux.SidPull(roots=(root,), project_dir=None, since=0.0)
+    return remote_mux._run_shown(node, *remote_mux._pull_call({sid: spec}))
 
 
 class TestTheFinalPull:
@@ -1494,11 +2401,13 @@ class TestTheFinalPull:
     ):
         nodes.write_node_map({"api": _entry("second", sid)})
         with pytest.raises(remote_mux.RemoteError) as info:
-            node_sync.final_pull(_config(), "api")
+            node_sync.final_pull(_config(), "api", local_user="amin")
         assert info.value.rc == 0
         assert info.value.stderr_tail == f"not a pullable session name: {sid!r}"
+        assert info.value.command_redacted == _pull_shown(sid, f"~/magent/{sid}")
         assert info.value.command_redacted[0] == "ssh"
         assert "amin@devino-second" in info.value.command_redacted
+        assert info.value.command_redacted[-1].startswith("<stdin: ")
         assert fake_ssh.calls() == []
 
     def test_a_session_with_an_empty_remote_root_is_refused_before_any_ssh(
@@ -1517,11 +2426,12 @@ class TestTheFinalPull:
             }
         )
         with pytest.raises(remote_mux.RemoteError) as info:
-            node_sync.final_pull(_config(), "api")
+            node_sync.final_pull(_config(), "api", local_user="amin")
         assert info.value.rc == 0
         assert info.value.stderr_tail == (
             "session 'api' has an empty remote_root in the node map"
         )
+        assert info.value.command_redacted == _pull_shown("api", "")
         assert info.value.command_redacted[0] == "ssh"
         assert fake_ssh.calls() == []
 
@@ -1532,3 +2442,658 @@ class TestTheFinalPull:
         assert result is not None
         (call,) = _calls_to(fake_ssh, "devino-second")
         assert set(_payload(call)["sids"]) == {"api-2"}
+
+
+def _scripted_pull(
+    monkeypatch, *snaps: remote_mux.NodeSnapshot, clock: _Clock | None = None
+) -> list[dict]:
+    """final_pull's pulls answered in order by ``snaps``; returns what each
+    call asked for. With ``clock``, each pull takes 60 s of it."""
+    asked: list[dict] = []
+    replies = iter(snaps)
+
+    def pull(_node, sids):
+        asked.append(dict(sids))
+        if clock is not None:
+            clock.at += 60.0
+        return next(replies)
+
+    monkeypatch.setattr(node_sync, "_pull_node", pull)
+    return asked
+
+
+def _cut(resume: float, files: tuple[Path, ...] = ()) -> remote_mux.NodeSnapshot:
+    """A reply for ``api`` cut at the pull cap, owing files from ``resume``."""
+    return _snapshot(
+        realpaths={"api": _REAL},
+        files=files,
+        truncated={"api": ("api/transcripts/owed.jsonl",)},
+        resume={"api": resume},
+    )
+
+
+_REAL = "/home/amin/magent/api"
+
+
+class TestAFinalPullThatDidNotFinish:
+    def test_a_file_that_could_not_be_stored_raises(self, placed, fake_ssh):
+        (nodes.transcripts_dir("second", "api") / "abc.jsonl").mkdir(parents=True)
+        _answer(
+            fake_ssh,
+            "devino-second",
+            meta=pull_meta(realpaths={"api": _REAL}),
+            files={"api/transcripts/abc.jsonl": "x\n"},
+        )
+        with pytest.raises(remote_mux.RemoteError) as info:
+            node_sync.final_pull(_config(), "api")
+        assert info.value.rc == 0
+        assert info.value.stderr_tail == "could not store every pulled file of 'api'"
+        assert info.value.command_redacted == ("pull.sh",)
+
+    def test_a_store_failure_on_the_second_call_raises_too(self, placed, monkeypatch):
+        _scripted_pull(
+            monkeypatch,
+            _snapshot(realpaths={"api": _REAL}),
+            _snapshot(realpaths={"api": _REAL}, failed_sids=frozenset({"api"})),
+        )
+        with pytest.raises(remote_mux.RemoteError, match="could not store"):
+            node_sync.final_pull(_config(), "api")
+
+    def test_a_store_failure_on_the_first_call_raises_after_a_clean_second(
+        self, placed, monkeypatch
+    ):
+        """Only the second call asks for transcripts, but the first one's
+        state records count too: a clean second answer does not absolve it."""
+        asked = _scripted_pull(
+            monkeypatch,
+            _snapshot(realpaths={"api": _REAL}, failed_sids=frozenset({"api"})),
+            _snapshot(realpaths={"api": _REAL}),
+        )
+        with pytest.raises(remote_mux.RemoteError, match="could not store"):
+            node_sync.final_pull(_config(), "api")
+        assert len(asked) == 2
+
+    def test_cut_replies_are_resumed_until_one_comes_back_whole(
+        self, placed, monkeypatch, fake_ssh
+    ):
+        """A backlog bigger than one pull cap is not a refusal: each cut reply
+        is resumed from the mark it advanced, and every file of every chunk
+        is installed. Real pull.sh replies, parsed and stored for real; only
+        the reply changes between calls."""
+        _seed_marks(api=(10.0, _REAL))
+        owed = {"api": ["api/transcripts/owed.jsonl"]}
+        chunks = iter(
+            [
+                ({"truncated": owed, "resume": {"api": 500.0}}, "a"),
+                ({"truncated": owed, "resume": {"api": 800.0}}, "b"),
+                ({}, "c"),
+            ]
+        )
+        asked: list[float] = []
+        real_pull = node_sync._pull_node
+
+        def pull(node, sids):
+            meta, name = next(chunks)
+            _forget_replies(fake_ssh)
+            _answer(
+                fake_ssh,
+                "devino-second",
+                meta=pull_meta(realpaths={"api": _REAL}, **meta),
+                files={f"api/transcripts/{name}.jsonl": f"{name}\n"},
+            )
+            asked.append(sids["api"].since)
+            return real_pull(node, sids)
+
+        monkeypatch.setattr(node_sync, "_pull_node", pull)
+        result = node_sync.final_pull(_config(), "api")
+        assert asked == [
+            10.0,
+            math.nextafter(500.0, -math.inf),
+            math.nextafter(800.0, -math.inf),
+        ]
+        assert result is not None
+        assert len(result.files) == 3
+        home = nodes.transcripts_dir("second", "api")
+        for name in "abc":
+            assert (home / f"{name}.jsonl").read_text(encoding="utf-8") == f"{name}\n"
+        assert _marks() == {
+            "api": {"since": 5000.0 - remote_mux.WATERMARK_OVERLAP_S, "realpath": _REAL}
+        }
+        assert result.since == 5000.0 - remote_mux.WATERMARK_OVERLAP_S
+
+    def test_a_resume_that_stops_moving_the_mark_raises_on_that_call(
+        self, placed, monkeypatch
+    ):
+        """The first cut reply moves the mark, the second names no resume
+        point and does not: asking a third time would get the same reply, so
+        the pull is asked for exactly twice, with plenty of deadline left."""
+        _seed_marks(api=(10.0, _REAL))
+        asked = _scripted_pull(
+            monkeypatch,
+            _cut(500.0),
+            _snapshot(
+                realpaths={"api": _REAL},
+                truncated={"api": ("api/transcripts/owed.jsonl",)},
+            ),
+        )
+        with pytest.raises(remote_mux.RemoteError, match="without moving its mark"):
+            node_sync.final_pull(_config(), "api", wait_s=1e9)
+        assert len(asked) == 2
+        assert _marks() == {
+            "api": {"since": math.nextafter(500.0, -math.inf), "realpath": _REAL}
+        }
+
+    def test_a_reply_still_cut_at_the_deadline_raises_with_the_mark_at_its_resume(
+        self, placed, monkeypatch
+    ):
+        """``wait_s`` bounds the resuming too: every pull here takes 60 s of
+        a 100 s budget, so the second cut reply is the last one asked for.
+        The mark it leaves resumes where that reply stopped."""
+        _seed_marks(api=(10.0, _REAL))
+        clock = _Clock()
+        asked = _scripted_pull(
+            monkeypatch, _cut(500.0), _cut(800.0), _cut(900.0), clock=clock
+        )
+        with pytest.raises(
+            remote_mux.RemoteError, match="still cut when the deadline passed"
+        ) as info:
+            node_sync.final_pull(_config(), "api", wait_s=100.0, now=clock)
+        assert info.value.rc == 0
+        assert len(asked) == 2
+        assert _marks() == {
+            "api": {"since": math.nextafter(800.0, -math.inf), "realpath": _REAL}
+        }
+
+    def test_a_resume_call_that_fails_keeps_the_mark_the_cut_reply_earned(
+        self, placed, monkeypatch
+    ):
+        """Each mark is written before the next call: a resume that dies on
+        the wire leaves the next final pull (or tick) at the first resume
+        point, not back at the mark this final pull started from."""
+        _seed_marks(api=(10.0, _REAL))
+        replies = iter([_cut(500.0)])
+
+        def pull(_node, _sids):
+            reply = next(replies, None)
+            if reply is None:
+                raise remote_mux.RemoteError(255, "Connection reset", ("ssh",))
+            return reply
+
+        monkeypatch.setattr(node_sync, "_pull_node", pull)
+        with pytest.raises(remote_mux.RemoteError, match="Connection reset"):
+            node_sync.final_pull(_config(), "api")
+        assert _marks() == {
+            "api": {"since": math.nextafter(500.0, -math.inf), "realpath": _REAL}
+        }
+
+    def test_a_cut_reply_that_does_not_move_the_mark_raises_at_once(
+        self, placed, monkeypatch
+    ):
+        """A cut reply naming no resume point leaves the mark where it was;
+        asking again would get the same reply, so final_pull raises after ONE
+        call however much of the deadline is left."""
+        before = _seed_marks(api=(10.0, _REAL))
+        asked = _scripted_pull(
+            monkeypatch,
+            _snapshot(
+                realpaths={"api": _REAL},
+                truncated={"api": ("api/transcripts/b.jsonl",)},
+            ),
+        )
+        with pytest.raises(
+            remote_mux.RemoteError, match="without moving its mark"
+        ) as info:
+            node_sync.final_pull(_config(), "api", wait_s=1e9)
+        assert info.value.rc == 0
+        assert len(asked) == 1
+        assert nodes.pull_marks_path("second").read_bytes() == before
+
+    def test_a_cut_first_call_does_not_count_when_the_second_asks_again(
+        self, placed, monkeypatch
+    ):
+        """The second call asks for everything from 0.0, so only its answer
+        says whether every file is home."""
+        asked = _scripted_pull(
+            monkeypatch,
+            _snapshot(
+                realpaths={"api": _REAL},
+                truncated={"api": ("api/state/x.json",)},
+                resume={"api": 1.0},
+            ),
+            _snapshot(realpaths={"api": _REAL}),
+        )
+        result = node_sync.final_pull(_config(), "api")
+        assert len(asked) == 2
+        assert result is not None
+        assert result.since == 9000.0 - remote_mux.WATERMARK_OVERLAP_S
+
+    def test_a_root_the_node_cannot_resolve_is_logged_and_the_pull_returns(
+        self, placed, monkeypatch, caplog
+    ):
+        _capture_nodes_log(caplog)
+        asked = _scripted_pull(monkeypatch, _snapshot())
+        result = node_sync.final_pull(_config(), "api")
+        assert result == remote_mux.PullResult(files=(), since=0.0)
+        assert len(asked) == 1
+        assert _node_warnings(caplog, "second") == [
+            (
+                "node second: final pull of 'api': the node reported no real "
+                "path for its root, so its transcripts were not requested"
+            )
+        ]
+
+    def test_state_records_are_pruned_after_a_stored_pull(self, placed, monkeypatch):
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"), {"api": {"since": 10.0, "realpath": "/r"}}
+        )
+        gone = nodes.state_dir("second", "api") / "gone.json"
+        gone.parent.mkdir(parents=True)
+        gone.write_text("{}", encoding="utf-8")
+        _scripted_pull(
+            monkeypatch, _snapshot(realpaths={"api": "/r"}, state_files={"api": ()})
+        )
+        node_sync.final_pull(_config(), "api")
+        assert not gone.exists()
+
+    def test_state_records_are_kept_when_the_pull_failed(self, placed, monkeypatch):
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"), {"api": {"since": 10.0, "realpath": "/r"}}
+        )
+        gone = nodes.state_dir("second", "api") / "gone.json"
+        gone.parent.mkdir(parents=True)
+        gone.write_text("{}", encoding="utf-8")
+        _scripted_pull(
+            monkeypatch,
+            _snapshot(
+                realpaths={"api": "/r"},
+                state_files={"api": ()},
+                failed_sids=frozenset({"api"}),
+            ),
+        )
+        with pytest.raises(remote_mux.RemoteError):
+            node_sync.final_pull(_config(), "api")
+        assert gone.exists()
+
+
+class TestWhatAFinalPullLeavesBehind:
+    def test_another_sessions_mark_survives(self, placed, monkeypatch):
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"),
+            {
+                "api": {"since": 10.0, "realpath": "/r"},
+                "other": {"since": 7.0, "realpath": "/o"},
+            },
+        )
+        _scripted_pull(monkeypatch, _snapshot(realpaths={"api": "/r"}))
+        node_sync.final_pull(_config(), "api")
+        assert _marks()["other"] == {"since": 7.0, "realpath": "/o"}
+
+    def test_the_second_call_asks_for_the_learned_directory_and_its_files_count(
+        self, placed, monkeypatch
+    ):
+        a, b = Path("a.jsonl"), Path("b.jsonl")
+        asked = _scripted_pull(
+            monkeypatch,
+            _snapshot(realpaths={"api": _REAL}, files=(a,)),
+            _snapshot(realpaths={"api": _REAL}, files=(a, b)),
+        )
+        result = node_sync.final_pull(_config(), "api")
+        assert asked[1]["api"].project_dir == encoded_project_dir(_REAL)
+        assert asked[1]["api"].since == 0.0
+        # Both calls ship the session's state records: each path is listed once.
+        assert result == remote_mux.PullResult(files=(a, b), since=8999.0)
+
+    def test_by_default_it_outwaits_a_daemon_pull_holding_the_node(
+        self, placed, monkeypatch
+    ):
+        """The daemon holds the node lock for one whole pull: up to
+        PULL_TIMEOUT_S, the reap, then the store."""
+        waits: list[float] = []
+
+        @contextlib.contextmanager
+        def lock(_nick, *, wait_s):
+            waits.append(wait_s)
+            yield
+
+        monkeypatch.setattr(node_sync, "node_lock", lock)
+        _scripted_pull(monkeypatch, _snapshot(realpaths={"api": "/r"}))
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"), {"api": {"since": 1.0, "realpath": "/r"}}
+        )
+        node_sync.final_pull(_config(), "api")
+        assert waits == [remote_mux.PULL_TIMEOUT_S + 2.0]
+
+
+def _snap() -> remote_mux.NodeSnapshot:
+    return remote_mux.NodeSnapshot(
+        now=1.0,
+        sessions=(),
+        sample=None,
+        realpaths={},
+        state_files={},
+        files=(),
+        failed_sids=frozenset(),
+    )
+
+
+def _pull_raising(raises: dict[str, BaseException]):
+    """The ``pull=`` seam: raise ``raises[nick]`` for that node (read at call
+    time, so a test can change it between ticks), else an empty snapshot."""
+
+    def pull(node, sids):
+        exc = raises.get(node.nick)
+        if exc is not None:
+            raise exc
+        return _snap()
+
+    return pull
+
+
+def _node_errors(caplog) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.name == "magent.nodes" and r.levelno == logging.ERROR
+    ]
+
+
+class TestABugInOneNodeFailsItAlone:
+    def test_a_bug_in_one_nodes_pull_fails_that_node_and_the_tick_goes_on(self, placed):
+        syncer = node_sync.NodeSyncer(
+            _config(), pull=_pull_raising({"second": KeyError("sid")})
+        )
+        assert syncer.tick() == {
+            "second": (node_sync.FAILED, "internal error: KeyError"),
+            "third": (node_sync.OK, ""),
+        }
+        assert nodes.read_sessions("third") is not None
+
+    def test_a_bug_is_one_error_with_its_traceback_per_state_change(
+        self, placed, caplog
+    ):
+        _capture_nodes_log(caplog)
+        syncer = node_sync.NodeSyncer(
+            _config(), pull=_pull_raising({"second": KeyError("sid")})
+        )
+        syncer.tick()
+        syncer.tick()
+        (record,) = _node_errors(caplog)
+        assert record.getMessage() == "node second: failed (internal error: KeyError)"
+        assert record.exc_info is not None
+        assert record.exc_info[0] is KeyError
+        # The outcome names the type only; the exception's own words ride on
+        # the record's traceback (and so into Sentry), not into tick's result.
+        assert (
+            logging.Formatter()
+            .formatException(record.exc_info)
+            .endswith("KeyError: 'sid'")
+        )
+        assert _node_warnings(caplog, "second") == []
+
+    def test_a_plain_failure_turning_into_a_bug_is_still_reported(self, placed, caplog):
+        _capture_nodes_log(caplog)
+        raises: dict[str, BaseException] = {
+            "second": remote_mux.RemoteError(0, "no MAGENT-PULL header", ("ssh",))
+        }
+        syncer = node_sync.NodeSyncer(_config(), pull=_pull_raising(raises))
+        syncer.tick()
+        raises["second"] = TypeError("bad")
+        syncer.tick()
+        assert _node_warnings(caplog, "second") == [
+            "node second: failed (no MAGENT-PULL header)"
+        ]
+        (record,) = _node_errors(caplog)
+        assert record.getMessage() == "node second: failed (internal error: TypeError)"
+
+    def test_a_lock_held_inside_the_pull_is_a_bug_not_contention(self, placed):
+        results = node_sync.NodeSyncer(
+            _config(), pull=_pull_raising({"second": LockHeld("some other lock")})
+        ).tick()
+        assert results["second"] == (node_sync.FAILED, "internal error: LockHeld")
+
+    def test_an_os_error_fails_that_node_alone(self, placed):
+        results = node_sync.NodeSyncer(
+            _config(), pull=_pull_raising({"second": PermissionError("denied")})
+        ).tick()
+        assert results == {
+            "second": (node_sync.FAILED, "denied"),
+            "third": (node_sync.OK, ""),
+        }
+
+    def test_a_node_back_from_a_failure_is_ok_again_not_reachable_again(
+        self, placed, caplog
+    ):
+        _capture_nodes_log(caplog)
+        raises: dict[str, BaseException] = {
+            "second": remote_mux.RemoteError(0, "no MAGENT-PULL header", ("ssh",))
+        }
+        syncer = node_sync.NodeSyncer(_config(), pull=_pull_raising(raises))
+        syncer.tick()
+        raises.clear()
+        syncer.tick()
+        messages = [r.getMessage() for r in caplog.records]
+        assert "node second: ok again (was failed)" in messages
+        assert not [m for m in messages if "reachable again" in m]
+
+
+class TestWhatCountsAsUnreachable:
+    @pytest.mark.parametrize(
+        ("err", "outcome"),
+        [
+            (
+                remote_mux.RemoteError(255, "Connection refused", ("ssh",)),
+                "unreachable",
+            ),
+            (
+                remote_mux.RemoteError(
+                    None, "timed out after 1s", ("ssh",), timed_out=True
+                ),
+                "unreachable",
+            ),
+            # Both rc None, neither a silent node: an over-cap reply is a node
+            # that answered too much, a spawn failure never left this PC.
+            (
+                remote_mux.RemoteError(None, "reply exceeded 5 bytes", ("ssh",)),
+                "failed",
+            ),
+            (remote_mux.RemoteError(None, "Permission denied", ("ssh",)), "failed"),
+            (remote_mux.RemoteError(1, "boom", ("ssh",)), "failed"),
+        ],
+    )
+    def test_only_a_transport_failure_or_a_timeout_is_unreachable(self, err, outcome):
+        assert node_sync._classify(err)[0] == outcome
+
+    def test_an_over_cap_reply_is_reported_by_its_cap_not_the_childs_last_words(
+        self, fake_ssh
+    ):
+        """The real over-cap error: its stderr is ``reply exceeded N bytes``
+        and then whatever the child said -- on Linux the killed fake's LAST
+        line is its own BrokenPipeError, exactly the noise this rule skips.
+        The cap is why the pull failed, so the log detail names it."""
+        fake_ssh.set_reply("flood", stderr="boom: disk full\n")
+        fake_ssh.set_mode("flood")
+        node = nodes.Node(nick="second", host="devino-second", user="amin", root="~")
+        with pytest.raises(remote_mux.RemoteError) as info:
+            remote_mux.run(node, ["flood"], timeout_s=60, max_stdout_bytes=1024)
+        assert "boom: disk full" in info.value.stderr_tail.splitlines()[1:]
+        assert node_sync._classify(info.value) == (
+            node_sync.FAILED,
+            "reply exceeded 1024 bytes",
+        )
+
+    def test_only_the_flag_marks_an_over_cap_reply_never_the_text(self):
+        """A node whose stderr merely STARTS with the cap's wording is not an
+        over-cap reply: the detail stays its last line."""
+        err = remote_mux.RemoteError(
+            1, "reply exceeded 5 bytes\nthe real error", ("ssh",)
+        )
+        assert node_sync._classify(err) == (node_sync.FAILED, "the real error")
+
+    def test_a_node_cannot_write_terminal_escapes_into_the_log(self, placed, caplog):
+        _capture_nodes_log(caplog)
+        tail = "first\n\x1b]0;pwned\x07\x1b[2Jboom\x7f\tend\x9b"
+        err = remote_mux.RemoteError(1, tail, ("ssh",))
+        results = node_sync.NodeSyncer(
+            _config(), pull=_pull_raising({"second": err})
+        ).tick()
+        assert results["second"] == (node_sync.FAILED, "?]0;pwned??[2Jboom?\tend?")
+        (line,) = _node_warnings(caplog, "second")
+        assert not re.search(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]", line)
+
+
+class TestABadWatermarkIsNoWatermark:
+    @pytest.mark.parametrize(
+        "since",
+        [
+            pytest.param("1" + "0" * 309, id="309-digit-int"),
+            pytest.param("NaN", id="nan"),
+            pytest.param("Infinity", id="inf"),
+            pytest.param("-Infinity", id="-inf"),
+        ],
+    )
+    def test_a_since_that_is_not_a_finite_time_is_absent(self, placed, since):
+        path = nodes.pull_marks_path("second")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Raw text: json.loads accepts each of these, and none is a time.
+        # float() of the 309-digit int raises OverflowError, not ValueError.
+        bad = '{"since": ' + since + ', "realpath": "/home/amin/magent/api"}'
+        path.write_text(
+            '{"api": ' + bad + ', "ok": {"since": 5, "realpath": null}}',
+            encoding="utf-8",
+        )
+        assert node_sync._read_marks("second") == {
+            "ok": node_sync.Mark(since=5.0, realpath=None)
+        }
+
+
+class TestAnEmptyRemoteRoot:
+    def test_a_session_with_no_remote_root_is_skipped_naming_the_field(
+        self, placed, caplog
+    ):
+        _capture_nodes_log(caplog)
+        nodes.write_node_map(
+            {
+                "api": NodeMapEntry(
+                    nick="second",
+                    sid="api",
+                    placed_ts=1.0,
+                    attached_existing=False,
+                    remote_root="",
+                )
+            }
+        )
+        asked: list[set[str]] = []
+
+        def pull(node, sids):
+            asked.append(set(sids))
+            return _snap()
+
+        results = node_sync.NodeSyncer(_config(), pull=pull).tick()
+        assert results["second"] == (node_sync.OK, "")
+        assert asked == [set(), set()]
+        assert _node_warnings(caplog, "second") == [
+            (
+                "node second: session 'api' has an empty remote_root in the "
+                "node map; skipping it"
+            )
+        ]
+
+
+class TestARemovedNodeIsForgotten:
+    def test_a_node_removed_and_re_added_while_down_is_warned_again(
+        self, placed, caplog
+    ):
+        _capture_nodes_log(caplog)
+        down = remote_mux.RemoteError(255, REFUSED, ("ssh",))
+        syncer = node_sync.NodeSyncer(_config(), pull=_pull_raising({"second": down}))
+        syncer.tick()
+        syncer.reconfigure(_config(pool={"third": POOL["third"]}))
+        syncer.tick()
+        syncer.reconfigure(_config())
+        syncer.tick()
+        assert (
+            _node_warnings(caplog, "second")
+            == [f"node second: unreachable ({REFUSED.strip()})"] * 2
+        )
+
+
+# 200k nested arrays: json.loads raises RecursionError, not ValueError.
+_TOO_DEEP = "[" * 200_000
+
+
+class TestJsonNestedTooDeeply:
+    def test_a_node_whose_pull_metadata_nests_too_deeply_has_failed(
+        self, placed, caplog
+    ):
+        """Node-controlled input: a bad answer (FAILED at WARNING), never an
+        internal error at ERROR."""
+        _capture_nodes_log(caplog)
+        reply = (
+            remote_mux.PULL_HEADER
+            + _TOO_DEEP.encode("ascii")
+            + b"\n"
+            + remote_mux.PULL_TRAILER
+            + b"0\n"
+        )
+
+        def pull(node, sids):
+            return remote_mux.parse_pull(
+                reply, dest=nodes.node_dir(node.nick), sids=frozenset(sids)
+            )
+
+        results = node_sync.NodeSyncer(_config(), pull=pull).tick()
+        assert results["second"][0] == node_sync.FAILED
+        assert results["second"][1].startswith("unreadable pull metadata")
+        assert _node_errors(caplog) == []
+
+    def test_a_node_map_nested_too_deeply_does_not_stop_the_tick(self, placed):
+        nodes.NODE_MAP_PATH.write_text(_TOO_DEEP, encoding="utf-8")
+        asked: list[set[str]] = []
+
+        def pull(node, sids):
+            asked.append(set(sids))
+            return _snap()
+
+        results = node_sync.NodeSyncer(_config(), pull=pull).tick()
+        assert results == {"second": (node_sync.OK, ""), "third": (node_sync.OK, "")}
+        assert asked == [set(), set()]
+
+    def test_the_strict_reader_calls_it_a_bad_file(self, placed):
+        """ValueError, the one type every strict caller catches for a bad map
+        (state_stores' attention engine holds its last records on it)."""
+        nodes.NODE_MAP_PATH.write_text(_TOO_DEEP, encoding="utf-8")
+        with pytest.raises(ValueError, match="nested too deeply"):
+            nodes.load_node_map_strict()
+        assert nodes.read_node_map() == {}
+
+    def test_a_watermark_file_nested_too_deeply_is_no_watermark(self, placed):
+        path = nodes.pull_marks_path("second")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_TOO_DEEP, encoding="utf-8")
+        assert node_sync._read_marks("second") == {}
+
+    def test_a_sessions_file_nested_too_deeply_is_no_snapshot(self, placed):
+        path = nodes.sessions_path("second")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_TOO_DEEP, encoding="utf-8")
+        assert nodes.read_sessions("second") is None
+
+    def test_a_node_whose_watermark_file_nests_too_deeply_still_pulls(
+        self, placed, caplog
+    ):
+        """A corrupt local file, not a bug: the node pulls from the beginning,
+        and nothing is logged at ERROR (which would be a Sentry event)."""
+        _capture_nodes_log(caplog)
+        path = nodes.pull_marks_path("second")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_TOO_DEEP, encoding="utf-8")
+        asked: dict[str, dict[str, remote_mux.SidPull]] = {}
+
+        def pull(node, sids):
+            asked[node.nick] = dict(sids)
+            return _snap()
+
+        results = node_sync.NodeSyncer(_config(), pull=pull).tick()
+        assert results["second"] == (node_sync.OK, "")
+        assert asked["second"]["api"].since == 0.0
+        assert _node_errors(caplog) == []
