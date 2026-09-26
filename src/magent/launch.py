@@ -1484,6 +1484,7 @@ def bring_up_node_project(
     allow_dirty: bool = False,
     window: bool = False,
     resume_id: str | None = None,
+    collision: str | None = None,
 ) -> NodeBringUpOutcome:
     """Bring ``proj`` up on its node. ``resume_id`` names the conversation to
     resume (only G's ``recall --to`` passes one, after shipping that
@@ -1495,7 +1496,12 @@ def bring_up_node_project(
     session is already running there, which is attached instead -- then,
     under that node's lock, provision once, build the recipe, run
     ``remote_mux.bring_up``, record the placement and open the window. Never
-    raises for a node, git or config failure: every one is an outcome."""
+    raises for a node, git or config failure: every one is an outcome.
+
+    ``collision`` is the fleet check's refusal for a project that is the
+    RECORDED holder of a folder name another project shares (X3): refused like
+    an unreproducible tree, so a session still running there is attached and
+    keeps it as a warning, and one that is gone is not restarted."""
     # heavy subsystem: in-body per policy (nodes + remote_mux: ssh/git/tar)
     from magent import nodes, remote_mux
     from magent.env import local_username
@@ -1526,6 +1532,8 @@ def bring_up_node_project(
             for state in states
             if (text := nodes.refusal_for(state, allow_dirty=allow_dirty))
         ]
+        if collision is not None:
+            refusals.append(collision)
         if refusals:
             if (
                 held is not None
@@ -1629,11 +1637,13 @@ def bring_up_node_project(
 
 def _placement_recipes(
     config: MagentConfig, projects: list[ProjectConfig]
-) -> dict[str, tuple[str, Recipe]]:
-    """``{sid: (nick, recipe)}`` for every project in ``projects`` whose node
-    folder is already known, from config and the map alone -- no ssh, no git.
-    The recipe carries only what ``nodes.remote_root_collisions`` reads (its
-    project, sid and remote_root). A project that cannot be placed yet (no
+) -> dict[str, tuple[str, Recipe, bool]]:
+    """``{sid: (nick, recipe, holder)}`` for every project in ``projects``
+    whose node folder is already known, from config and the map alone -- no
+    ssh, no git. The recipe carries only what ``nodes.remote_root_collisions``
+    reads (its project, sid and remote_root); ``holder`` is whether the map
+    records the project in that very folder (its bring-up checks the node and
+    the session). A project that cannot be placed yet (no
     folder here or none this user may read, an unplaced ``auto``, a folder
     with no usable name) is left out: its own bring-up names that reason."""
     # heavy subsystem: in-body per policy
@@ -1641,7 +1651,7 @@ def _placement_recipes(
     from magent.env import local_username
 
     held = nodes.read_node_map()
-    out: dict[str, tuple[str, Recipe]] = {}
+    out: dict[str, tuple[str, Recipe, bool]] = {}
     for proj in projects:
         name = nodes.project_name(proj)
         entry = held.get(name)
@@ -1668,6 +1678,7 @@ def _placement_recipes(
                 memory_dir=None,
                 remote_root=remote_root,
             ),
+            entry is not None and entry.remote_root == remote_root,
         )
     return out
 
@@ -1690,7 +1701,10 @@ def _run_node_bring_ups(
     folder name another project -- in this batch or not -- would share is
     refused, naming the other. Fanned out, two clones would race for one
     folder; a batch of one today and another tomorrow would overwrite it.
-    A collision among projects outside the batch refuses nothing here."""
+    A collision among projects outside the batch refuses nothing here. The
+    one member the map already records in that folder is not refused here:
+    its bring-up gets the refusal as ``collision``, so a session of it still
+    running is attached, not reported failed because a newcomer arrived."""
     # heavy subsystem: in-body per policy
     from magent import nodes
 
@@ -1701,14 +1715,14 @@ def _run_node_bring_ups(
     fleet += [proj for proj in projects if nodes.node_sid(proj) not in known]
     placed = _placement_recipes(config, fleet)
     clash: dict[str, str] = {}
-    for group in nodes.remote_root_collisions([r for _, r in placed.values()]):
+    for group in nodes.remote_root_collisions([r for _, r, _ in placed.values()]):
         text = nodes.remote_root_collision_text(group)
         for recipe in group:
             clash[recipe.sid] = text
     outcomes: dict[str, NodeBringUpOutcome] = {}
     for proj in projects:
         sid = nodes.node_sid(proj)
-        if sid in clash:
+        if sid in clash and not placed[sid][2]:
             get_logger("nodes").warning("node project %s refused: %s", sid, clash[sid])
             outcomes[sid] = NodeBringUpOutcome(
                 ok=False, sid=sid, node=placed[sid][0], error=clash[sid]
@@ -1723,6 +1737,7 @@ def _run_node_bring_ups(
                     proj,
                     allow_dirty=allow_dirty,
                     window=window,
+                    collision=clash.get(nodes.node_sid(proj)),
                 )
                 for proj in go
             ]

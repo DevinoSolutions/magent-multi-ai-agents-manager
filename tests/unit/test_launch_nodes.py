@@ -581,6 +581,22 @@ def _twin_apis(tmp_path: Path, rig: NodeRig) -> list[ProjectConfig]:
     return [*out, bystander]
 
 
+def _record(name: str, nick: str, remote_root: str) -> None:
+    """``name`` recorded in the node map as running on ``nick`` in
+    ``remote_root`` -- the holder of that folder, as far as the map knows."""
+    nodes.update_node_map(
+        name,
+        NodeMapEntry(
+            nick=nick,
+            sid=name,
+            placed_ts=1.0,
+            attached_existing=False,
+            remote_root=remote_root,
+            target=f"amin@devino-{nick}",
+        ),
+    )
+
+
 def _batch(config: MagentConfig, **kw: list[str]) -> list[launch.NodeBringUpOutcome]:
     """``bring_up_node_projects`` with its contract as an assertion: a batch
     never raises -- a project the check cannot place is an outcome, not a
@@ -720,6 +736,64 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         assert "'api-y'" in (outcomes[0].error or "")
         assert rig.recipes == []
         assert nodes.read_node_map() == {}
+
+    def test_a_live_holder_keeps_attaching_and_only_the_newcomer_is_refused(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # api-x already runs in ~/magent/api; the user then adds api-y, whose
+        # folder has the same name. Only api-y's clone could overwrite
+        # anything, so only api-y is refused -- api-x attaches, and keeps
+        # the collision as a warning (D10: a refusal a live session makes moot).
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        _record("api-x", "second", "~/magent/api")
+        rig.live = True
+        _no_contact_for(monkeypatch, rig, "api-y")
+        outcomes = _batch(_config(x_api, y_api))
+        holder, newcomer = outcomes
+        assert (holder.sid, holder.ok, holder.attached_existing) == (
+            "api-x",
+            True,
+            True,
+        )
+        assert holder.error is None
+        assert len(holder.warnings) == 1
+        assert "'api-x' and 'api-y' would share" in holder.warnings[0]
+        assert (newcomer.sid, newcomer.ok) == ("api-y", False)
+        assert "'api-x'" in (newcomer.error or "")
+        assert rig.decorated == [("api-x", "second")]
+        assert rig.recipes == []
+
+    def test_a_live_holder_brought_up_alone_still_attaches(self, rig, tmp_path):
+        projs = _twin_apis(tmp_path, rig)
+        _record("api-x", "second", "~/magent/api")
+        rig.live = True
+        (o,) = _batch(_config(*projs), only=["api-x"])
+        assert (o.sid, o.ok, o.attached_existing) == ("api-x", True, True)
+        assert "'api-y'" in o.warnings[0]
+        assert rig.recipes == []
+
+    def test_a_holder_whose_session_is_gone_is_refused_too(self, rig, tmp_path):
+        # Restarting it would clone into a folder the fleet still shares.
+        projs = _twin_apis(tmp_path, rig)
+        _record("api-x", "second", "~/magent/api")
+        outcomes = _batch(_config(*projs), only=["api-x", "api-y"])
+        assert [(o.sid, o.ok) for o in outcomes] == [("api-x", False), ("api-y", False)]
+        assert "'api-x' and 'api-y' would share" in (outcomes[0].error or "")
+        assert rig.recipes == []
+        assert rig.decorated == []
+
+    def test_a_record_of_another_folder_does_not_make_a_holder(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # api-x ran under another folder name once; that session holds
+        # nothing of ~/magent/api, so it is a newcomer to it like api-y.
+        projs = _twin_apis(tmp_path, rig)
+        _record("api-x", "second", "~/magent/old-api")
+        rig.live = True
+        _no_contact_for(monkeypatch, rig, "api-x", "api-y")
+        outcomes = _batch(_config(*projs), only=["api-x", "api-y"])
+        assert [(o.sid, o.ok) for o in outcomes] == [("api-x", False), ("api-y", False)]
+        assert rig.decorated == []
 
     def test_a_collision_entirely_outside_the_batch_blocks_nothing(self, rig, tmp_path):
         projs = _twin_apis(tmp_path, rig)
