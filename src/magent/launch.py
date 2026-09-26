@@ -2013,6 +2013,34 @@ def _placement_recipes(
     return out
 
 
+def _folder_clashes(
+    placed: dict[str, tuple[str, Recipe, bool]],
+    unreadable: OSError | ValueError | None,
+) -> dict[str, str]:
+    """``{sid: why}`` for every member of a group ``placed`` (from
+    ``_placement_recipes``) would share a node folder name in: the X3 text,
+    or -- the map ``unreadable`` -- the map's own reason for a member whose
+    only rivals are auto projects of unknown node. Pure."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    clash: dict[str, str] = {}
+    for group in nodes.remote_root_collisions([r for _, r, _ in placed.values()]):
+        text = nodes.remote_root_collision_text(group)
+        for recipe in group:
+            clash[recipe.sid] = text
+            if unreadable is not None and all(
+                nodes.on_unknown_node(other) for other in group if other is not recipe
+            ):
+                # Its only rivals are auto projects whose node the map would
+                # name: no rename is owed, the map is -- a holder is refused
+                # only because it cannot prove it holds the folder.
+                clash[recipe.sid] = _folder_unknown_text(
+                    unreadable, nodes.folder_leaf(recipe), placed[recipe.sid][0]
+                )
+    return clash
+
+
 def _run_node_bring_ups(
     config: MagentConfig,
     projects: list[ProjectConfig],
@@ -2048,20 +2076,7 @@ def _run_node_bring_ups(
     fleet += [proj for proj in projects if nodes.node_sid(proj) not in known]
     held, unreadable = _node_map_for_placement()
     placed = _placement_recipes(config, fleet, held, map_known=unreadable is None)
-    clash: dict[str, str] = {}
-    for group in nodes.remote_root_collisions([r for _, r, _ in placed.values()]):
-        text = nodes.remote_root_collision_text(group)
-        for recipe in group:
-            clash[recipe.sid] = text
-            if unreadable is not None and all(
-                nodes.on_unknown_node(other) for other in group if other is not recipe
-            ):
-                # Its only rivals are auto projects whose node the map would
-                # name: no rename is owed, the map is -- a holder is refused
-                # only because it cannot prove it holds the folder.
-                clash[recipe.sid] = _folder_unknown_text(
-                    unreadable, nodes.folder_leaf(recipe), placed[recipe.sid][0]
-                )
+    clash = _folder_clashes(placed, unreadable)
     outcomes: dict[str, NodeBringUpOutcome] = {}
     for proj in projects:
         sid = nodes.node_sid(proj)
