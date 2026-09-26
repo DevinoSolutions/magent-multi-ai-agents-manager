@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
-from magent.config import NODE_AUTO, NODE_CLOUD, runs_on_node
+from magent.config import NODE_AUTO, NODE_CLOUD, is_cloud, runs_on_node
 from magent.lockfile import LockHeld, persistent_lock
 from magent.log import get_logger
 from magent.psmux import session_name
@@ -526,7 +526,7 @@ def resolve(
     """
     if proj.node is None:
         raise NodeConfigError(f"{proj.path}: not a node project")
-    if proj.node == NODE_CLOUD:
+    if is_cloud(proj):
         raise NodeConfigError(
             f'{proj.path}: "node": "cloud" runs on the cloud backend, not a pool '
             "machine; it has no Node to resolve"

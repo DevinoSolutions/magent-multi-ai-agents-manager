@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING
 
 from magent import nodes, remote_mux
 from magent.attach_client import SSH_TRANSPORT_RC
-from magent.config import NODE_CLOUD, load_config
+from magent.config import load_config, runs_on_node
 from magent.env import local_username
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import clear_heartbeat, get_logger, run_heartbeat, write_heartbeat
@@ -196,8 +196,7 @@ def wanted(config: MagentConfig) -> bool:
     disabling) the last node project stops the sync even for sessions still
     live on a node. Deliberate (YAGNI); revisit if it bites."""
     return bool(config.settings.nodes) and any(
-        p.enabled and p.node is not None and p.node != NODE_CLOUD
-        for p in config.projects
+        p.enabled and runs_on_node(p) for p in config.projects
     )
 
 
