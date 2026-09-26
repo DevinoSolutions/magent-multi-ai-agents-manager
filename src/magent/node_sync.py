@@ -428,19 +428,23 @@ def _row_ts(line: str) -> float | None:
     return float(ts) if math.isfinite(ts) else None
 
 
-def _needs_trim(path: Path, before: float) -> bool:
-    """Is the file's first row older than ``before``? An unreadable first
-    line counts as old: only a trim clears it, and it would otherwise hold
-    the file untrimmed forever. A missing or empty file needs none."""
+def _needs_trim(path: Path, before: float, at: float) -> bool:
+    """Does the file's first line call for a trim? Only a missing or empty
+    file needs none. Each other first line that is not an in-window row --
+    one older than ``before``, one that does not parse (a blank line
+    included), or one stamped after ``at`` (this PC's clock ran ahead, then
+    stepped back) -- would otherwise stay first and switch the trim off
+    until it aged out, which for the last two is never or the length of the
+    clock jump. The file would grow by a row a sample all that time."""
     try:
         with path.open(encoding="utf-8", errors="replace") as fh:
             first = fh.readline()
     except FileNotFoundError:
         return False
-    if not first.strip():
+    if not first:
         return False
     ts = _row_ts(first)
-    return ts is None or ts < before
+    return ts is None or ts < before or ts > at
 
 
 def _append_sample(
@@ -452,19 +456,22 @@ def _append_sample(
     the history window -- only once its first row is older than the window
     by a slack (the larger of 10% of the window and one sample interval), so
     a trim happens every few samples, not on every one, and the file never
-    holds more than the window plus that slack. Readers skip lines that are
-    not rows, and an append after a torn last row starts a line of its own."""
+    holds more than the window plus that slack. A trim keeps only the rows
+    stamped between the window's start and now: a row from this PC's future
+    carries a clock that was wrong, and is not history. Readers skip lines
+    that are not rows, and an append after a torn last row starts a line of
+    its own."""
     path = nodes.load_path(nick)
     row = json.dumps({**asdict(sample), "ts": at}, allow_nan=False)
     window = history_h * 3600
     cutoff = at - window
     slack = max(window * 0.1, interval_s)
-    if _needs_trim(path, cutoff - slack):
+    if _needs_trim(path, cutoff - slack, at):
         text = path.read_text(encoding="utf-8", errors="replace")
         rows = [
             line
             for line in text.splitlines()
-            if (ts := _row_ts(line)) is not None and ts >= cutoff
+            if (ts := _row_ts(line)) is not None and cutoff <= ts <= at
         ]
         nodes.write_text_atomic(path, "\n".join([*rows, row]) + "\n")
         return

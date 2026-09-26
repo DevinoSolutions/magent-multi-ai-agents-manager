@@ -1314,7 +1314,10 @@ class TestHostileClocksAndValues:
         syncer.tick()
         syncer.tick()
         rows = nodes.load_path("second").read_text(encoding="utf-8").splitlines()
-        assert [json.loads(r)["ts"] for r in rows] == [1000.0, 900.0]
+        # The 900 sample is kept, not starved. The 1000 row now lies in this
+        # PC's future, so the trim that sample triggers drops it
+        # (TestTheTrimNeverStalls).
+        assert [json.loads(r)["ts"] for r in rows] == [900.0]
 
     def test_a_sample_that_is_not_json_is_logged_and_the_pull_still_counts(
         self, placed, caplog
@@ -1464,3 +1467,50 @@ class TestATornLoadRowAcrossTicks:
         syncer.tick()  # 900 is now past the window + slack: a trim
         lines = path.read_text(encoding="utf-8").splitlines()
         assert [json.loads(ln) for ln in lines] == [{**SAMPLE, "ts": 5000.0}]
+
+
+def _parsed_rows(nick: str = "second") -> list[float | None]:
+    """Every line's ts, None for a line that is not a row."""
+    out: list[float | None] = []
+    for line in nodes.load_path(nick).read_text(encoding="utf-8").splitlines():
+        try:
+            out.append(float(json.loads(line)["ts"]))
+        except (ValueError, KeyError, TypeError):
+            out.append(None)
+    return out
+
+
+# The most rows the file may hold: the window plus its slack, one per minute,
+# and the row just appended.
+MAX_ROWS = int((WINDOW_S + SLACK_S) // 60) + 1
+
+
+class TestTheTrimNeverStalls:
+    """Two first-line states used to switch the trim off for good, and the
+    file then grew by one row a sample, without bound."""
+
+    def _run(self, first_line: str, rewrites: list[Path]) -> None:
+        path = nodes.load_path("second")
+        path.parent.mkdir(parents=True)
+        path.write_text(first_line, encoding="utf-8")
+        samples = 300
+        for i in range(samples):
+            _sample_at(1000.0 + 60 * i)
+        rows = _parsed_rows()
+        assert rewrites, "the trim never ran"
+        # Rare, too: a kept future row would force a rewrite every sample.
+        assert len(rewrites) <= samples // 5
+        assert None not in rows
+        assert len(rows) <= MAX_ROWS
+        now = 1000.0 + 60 * (samples - 1)
+        assert rows[-1] == now
+        assert max(rows) == now  # nothing from the future survives
+
+    def test_a_first_row_from_this_pcs_future_is_trimmed(self, placed, rewrites):
+        """This PC's clock ran ahead, then stepped back: the rows it stamped
+        then are later than now. Waiting for real time to pass them would let
+        the file grow for the whole jump."""
+        self._run(json.dumps({**SAMPLE, "ts": 1_000_000.0}) + "\n", rewrites)
+
+    def test_a_blank_first_line_is_trimmed(self, placed, rewrites):
+        self._run("\n", rewrites)
