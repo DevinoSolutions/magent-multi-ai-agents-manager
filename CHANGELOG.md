@@ -17,7 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   claims its port exclusively. A second serve, whether started by hand, by
   `--ensure` or by the watchdog, exits with "port N is already in use" and
   leaves the running server and its pid file alone. Restarting serve right away
-  still works on every OS.
+  still works on every OS. A port Windows has reserved (an excluded port range)
+  is reported as reserved, with the `netsh` command that lists the ranges, not
+  as in use.
 
 ## [3.19.1] - 2026-09-23
 

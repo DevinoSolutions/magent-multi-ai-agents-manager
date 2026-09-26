@@ -1024,32 +1024,54 @@ would fail its bind. On Windows it did not. `ThreadingHTTPServer` sets
 that is already **listening**. Measured: two live servers on one port, both
 logging `listening ... :15505`, with the pid file naming only the later one. The
 watchdog then killed or revived the wrong server, and `/health` was answered by
-whichever one the kernel picked. POSIX `SO_REUSEADDR` never allowed two live
-listeners, so only Windows ever showed it.
+whichever one the kernel picked. Linux `SO_REUSEADDR` never allowed two live
+listeners on the same address, so only Windows ever showed it. (BSD/macOS let a
+specific address coexist with a listening wildcard; not addressed here.)
 
-`_NoFqdnHTTPServer` now owns its bind options (`_claim_port_options`). On
-Windows it sets `SO_EXCLUSIVEADDRUSE` and not `SO_REUSEADDR`, so a second bind
-is refused and a foreign `SO_REUSEADDR` socket cannot steal the port either. On
-POSIX it keeps `SO_REUSEADDR`, which there only lets a restart rebind past the
+`_NoFqdnHTTPServer` now owns its bind options (`_claim_port_options`), set
+before the bind. On Windows it sets `SO_EXCLUSIVEADDRUSE` and not
+`SO_REUSEADDR`, so a second serve is refused. Exclusivity is what refuses a
+`serve --host 0.0.0.0` against a held loopback port. It does not stop a foreign
+program from binding the wildcard over a loopback holder, and a same-address
+`SO_REUSEADDR` socket was refused on this Windows build even before. On POSIX
+it keeps `SO_REUSEADDR`, which on Linux only lets a restart rebind past the
 previous server's `TIME_WAIT` connections. Windows never held a port hostage to
-`TIME_WAIT` (measured with ~20 such connections on the port), so an upgrade
-still restarts serve at once. The branch is a `sys.platform` check, not a
-capability probe: it is socket semantics, not a feature.
+`TIME_WAIT` (measured with ~20 such connections on the port, and again with
+FIN_WAIT_2, a still-ESTABLISHED accepted connection, and a killed server
+process), so an upgrade still restarts serve at once. The branch is a
+`sys.platform` check, not a capability probe: it is socket semantics, not a
+feature.
 
-A bind refused because the port is held (`EADDRINUSE`, or Windows' `WSAEACCES`
-when an exclusive wildcard holder refuses a specific address) raises
-`PortInUse`, not the old generic error. Held on **any** of serve's addresses
-counts: serving only the free ones would be two servers and one pid file again.
-Whatever was already bound is closed, and the pid file is untouched, because ours
-is only written after the bind. It is logged at WARNING, not ERROR. A watchdog or
-`--ensure` spawn that loses the race is **supposed** to end here, so it is not a
-crash for Sentry. The CLI shell prints the reason and exits 1 instead of a
-traceback. An address that cannot be bound for any other reason (a Tailscale IP
-that went away) still degrades with a warning, as before. Pins:
-`tests/unit/test_upload_server.py::TestOnePortOneServer` (real sockets, current
-OS), `TestClaimPortOptions`/`TestPortTaken` (both OSes, fake socket),
-`TestRunServerOnAHeldPort`, and
-`tests/e2e/test_real_upload.py::test_a_second_serve_on_the_same_port_exits_and_leaves_the_first_alone`.
+A bind refused because the port is held raises `PortInUse`, not the old generic
+error. `EADDRINUSE` always means held. Windows' `WSAEACCES` means one of two
+things. It can be an exclusive wildcard holder refusing a specific address, or
+a port Windows has reserved (a Hyper-V / WSL / Docker excluded range, measured
+at 127.0.0.1:17000). A 0.3s connect tells them apart (`_holder_answers`).
+
+- **Something answers:** a holder, so `PortInUse`.
+- **Nothing answers:** a reservation. There is no first server to defer to, so
+  it degrades like any unbindable address. If it was the only address, the fatal
+  "no bindable address" ERROR (what Sentry captures) names the reservation and
+  points at `netsh int ipv4 show excludedportrange protocol=tcp`.
+
+Held on **any** of serve's addresses counts: serving only the free ones would
+be two servers and one pid file again. Whatever was already bound is closed,
+and the pid file is untouched, because ours is only written after the bind. The
+trade-off is on record: a foreign program holding only the Tailscale address
+now keeps loopback down too, where it used to degrade, and the watchdog retries
+at its cooldown pace. `PortInUse` is logged at WARNING, not ERROR. A watchdog
+or `--ensure` spawn that loses the race is **supposed** to end here, so it is
+not a crash for Sentry. The CLI shell prints the reason and exits 1 instead of
+a traceback. An address that cannot be bound for any other reason (a Tailscale
+IP that went away) still degrades with a warning, as before.
+
+Pins:
+- `tests/unit/test_upload_server.py::TestOnePortOneServer` (real sockets,
+  current OS, including the set-before-bind order);
+- `TestClaimPortOptions` / `TestPortTaken` (both OSes, fake socket);
+- `TestHolderAnswers`;
+- `TestRunServerOnAHeldPort` (held, reserved, and reserved-secondary);
+- `tests/e2e/test_real_upload.py::test_a_second_serve_on_the_same_port_exits_and_leaves_the_first_alone`.
 
 ### One liveness enumeration, and a shutdown that verifies (2026-08-18)
 
