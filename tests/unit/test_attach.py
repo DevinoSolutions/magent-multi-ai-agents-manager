@@ -3108,6 +3108,32 @@ class TestUpHandsAllowDirtyToTheDesktopCopy:
         assert result.exit_code == 0
         assert seen[0][-1] == "--allow-dirty"
 
+    def test_a_node_project_is_not_touched_before_the_hand_off(
+        self, runner, tmp_config, monkeypatch
+    ):
+        # The desktop copy owns every bring-up, node projects included: this
+        # Session-0 process only relays, so nothing may be read or started
+        # before relay_handoff -- even with a node project in scope.
+        touched: list[str] = []
+        monkeypatch.setattr(
+            "magent.launch.session0_disposition", lambda plat: "handoff"
+        )
+        monkeypatch.setattr(
+            "magent.launch.relay_handoff", lambda plat, argv, timeout_s: 0
+        )
+        monkeypatch.setattr(
+            "magent.launch.node_session_ids",
+            lambda *a, **k: touched.append("node_session_ids") or ["api"],
+        )
+        monkeypatch.setattr(
+            "magent.launch.bring_up_psmux",
+            lambda *a, **k: touched.append("bring_up_psmux") or ([], []),
+        )
+        path = tmp_config({"projects": []})
+        result = runner.invoke(cli.main, ["--config", path, "up", "--allow-dirty"])
+        assert result.exit_code == 0
+        assert touched == []
+
 
 class TestUpNodeProjectsBesideLiveLocalSessions:
     """Every local session already up does not mean nothing to do: node
@@ -3115,14 +3141,16 @@ class TestUpNodeProjectsBesideLiveLocalSessions:
     alone, beside no live local id -- and the created node sid is not
     decorated as a local session."""
 
-    def test_live_local_sessions_do_not_skip_the_node_half(
-        self, runner, tmp_config, monkeypatch
-    ):
+    def _patch(self, monkeypatch, down=()):
         calls: list[tuple[object, object]] = []
         decorated: list[list[str]] = []
         monkeypatch.setattr(
             "magent.launch.psmux_status",
-            lambda cfg, group=None: ([{"name": "web", "session": "web"}], [], [{}]),
+            lambda cfg, group=None: (
+                [{"name": "web", "session": "web"}],
+                list(down),
+                [{}],
+            ),
         )
         monkeypatch.setattr(
             "magent.launch.node_session_ids", lambda cfg, group=None: ["api"]
@@ -3139,6 +3167,12 @@ class TestUpNodeProjectsBesideLiveLocalSessions:
                 (["api"], []),
             )[1],
         )
+        return calls, decorated
+
+    def test_live_local_sessions_do_not_skip_the_node_half(
+        self, runner, tmp_config, monkeypatch
+    ):
+        calls, decorated = self._patch(monkeypatch)
         path = tmp_config({"projects": []})
         result = runner.invoke(cli.main, ["--config", path, "up"])
         assert result.exit_code == 0, result.output
@@ -3146,3 +3180,14 @@ class TestUpNodeProjectsBesideLiveLocalSessions:
         assert "Brought up 1 session(s): api" in result.stdout
         assert "already up" not in result.stdout
         assert decorated == [["web"]]
+
+    def test_all_recreates_everything_so_only_stays_none(
+        self, runner, tmp_config, monkeypatch
+    ):
+        # --all is "every session", not "the down ones plus the node ones":
+        # narrowing it to node sids would silently skip every local session.
+        calls, _ = self._patch(monkeypatch, down=[{"name": "db", "session": "db"}])
+        path = tmp_config({"projects": []})
+        result = runner.invoke(cli.main, ["--config", path, "up", "--all"])
+        assert result.exit_code == 0, result.output
+        assert calls == [(None, False)]
