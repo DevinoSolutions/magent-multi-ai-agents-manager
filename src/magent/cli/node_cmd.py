@@ -793,7 +793,12 @@ def recall_cmd(ctx: click.Context, project: str, to_local: bool) -> None:
             f"recall moves Claude Code conversations; {name} runs {tool!r}",
             _EXIT_USAGE,
         )
-    held = nodes.read_node_map().get(name)
+    # Strict (cq-G14 M7): the tolerant reader's {} for a busy or torn map
+    # would be the untrue "not placed". Only a missing file means that.
+    try:
+        held = nodes.load_node_map_strict().get(name)
+    except (OSError, ValueError) as exc:
+        _fail(f"could not read the node map ({exc}); run the recall again", 1)
     if held is None:
         _fail(
             f"{name} is not placed on a node -- there is nothing to recall",

@@ -2312,6 +2312,47 @@ class TestTheLocalInstallFollowsTheTarRules:
         assert not (dest / "leak.jsonl").exists()
 
 
+class TestAnUnreadableMapIsNotNotPlaced:
+    """cq-G14 M7: recall reads the map strictly. A map still busy after the
+    reader's retries, or torn, is "could not read" and a re-run -- never the
+    untrue "not placed on a node" the tolerant reader's ``{}`` would say."""
+
+    @pytest.mark.parametrize("damage", ["busy", "torn"])
+    def test_an_unreadable_map_fails_with_run_again(
+        self, runner, placed_api, node_answers, monkeypatch, damage
+    ):
+        if damage == "busy":
+
+            def _busy():
+                raise PermissionError(13, "the file is in use by another process")
+
+            monkeypatch.setattr(nodes, "load_node_map_strict", _busy)
+        else:
+            nodes.NODE_MAP_PATH.write_text('{"api": {"nick": "sec', encoding="utf-8")
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 1, result.output
+        assert "could not read the node map" in result.stderr
+        assert "run the recall again" in result.stderr
+        assert "not placed" not in result.output
+        assert node_answers == []
+        assert "Traceback" not in result.output
+
+    def test_a_map_with_no_file_is_still_not_placed(self, runner, tmp_config, api_repo):
+        cfg = tmp_config(
+            config_json(
+                ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
+            )
+        )
+        assert not nodes.NODE_MAP_PATH.exists()
+
+        result = _recall(runner, cfg, "--local")
+
+        assert result.exit_code == 2
+        assert "api is not placed on a node" in result.stderr
+
+
 class TestRecallResolvesTheFolderTheWayLaunchDoes:
     """cq-G14 M4: --local installs the conversation where a launch will look
     for it. Launch cds to ``launch._resolve_path``'s string -- never a
