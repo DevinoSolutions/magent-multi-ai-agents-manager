@@ -177,9 +177,9 @@ def _node_sync_state(cfg: MagentConfig) -> str:
 
     if not nodes.node_projects(cfg):
         return "off"
-    # One read, exactly as node_cmd._daemon_state reads it (DECISION-17's one
-    # reader). cli/node_cmd.py reaches this branch with the E-int final merge,
-    # which turns these lines into a call to it.
+    # D-MERGE: at the E-int final merge these four lines become a call to
+    # node_cmd._daemon_state(). One read, exactly as it reads (DECISION-17's
+    # one reader); cli/node_cmd.py reaches this branch with that merge.
     age = heartbeat_age(node_sync.HEARTBEAT_NAME)
     if age is None:
         return "stopped"
