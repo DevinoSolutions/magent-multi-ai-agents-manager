@@ -421,20 +421,27 @@ def parse_report(text: str) -> ProvisionReport:
 
 
 def _report_of(
-    result: subprocess.CompletedProcess[bytes], script: str, node: Node
+    result: subprocess.CompletedProcess[bytes],
+    script: str,
+    node: Node,
+    *,
+    args: Sequence[str],
+    stdin: bytes | None,
 ) -> ProvisionReport:
     """A finished script's rows. Exit 255 is ssh's own failure, not the
     script's, and raises; any other non-zero exit with no ``fail`` row gets
     one, so a script that died mid-step can never read as a success.
 
-    The error names the command the way ``run`` does (``_run_shown``): the
-    program, not this PC's path to it, and no client lookup -- a lookup here
-    could turn a transport failure into "ssh not installed"."""
+    ``args`` and ``stdin`` are the ones the ``run_script`` call was given, so
+    the error names exactly what ran (``--force``, the probed programs) the
+    way ``run`` does (``_run_shown`` over ``_script_call``): the program, not
+    this PC's path to it, stdin by its length alone, and no client lookup --
+    a lookup here could turn a transport failure into "ssh not installed"."""
     if result.returncode == SSH_TRANSPORT_RC:
         raise RemoteError(
             SSH_TRANSPORT_RC,
             _tail(result.stderr),
-            _run_shown(node, _script_argv([]), None),
+            _run_shown(node, *_script_call(script, args, stdin)),
         )
     report = parse_report(result.stdout.decode("utf-8", "replace"))
     if result.returncode != 0 and not report.failed:
@@ -592,18 +599,42 @@ PROVISION_TIMEOUT_S = 300.0
 PROGRAMS_TIMEOUT_S = 30.0
 
 
+class ProgramsProbeFailed(Exception):
+    """The programs probe reached the node but did not answer for every name
+    it was asked: it exited non-zero, or left a name without an ``ok`` or
+    ``skip`` row. ``lines`` holds its ``fail`` row(s), one naming
+    ``programs``; the probe proved nothing about the node either way."""
+
+    def __init__(self, lines: tuple[ScriptLine, ...]) -> None:
+        super().__init__("; ".join(line.detail for line in lines))
+        self.lines = lines
+
+
 def node_programs(
     node: Node, programs: Iterable[str], *, timeout_s: float
 ) -> frozenset[str]:
-    """The subset of ``programs`` the node resolves (``command -v``, with
-    ~/.local/bin first, as provision.sh runs). Only program NAMES cross --
-    never a server's env or args. Raises RemoteError when the node is
-    unreachable."""
+    """The subset of ``programs`` the node resolves (an executable file on its
+    PATH, ~/.local/bin first, as provision.sh runs). Only program NAMES cross
+    -- never a server's env or args. Raises RemoteError when the node is
+    unreachable, and ProgramsProbeFailed when the probe ran but did not
+    answer for every name: a failed probe is not "not on the node"."""
     wanted = sorted(set(programs))
     if not wanted:
         return frozenset()
     result = run_script(node, "programs", wanted, timeout_s=timeout_s, check=False)
-    report = _report_of(result, "programs", node)
+    report = _report_of(result, "programs", node, args=wanted, stdin=None)
+    answered = {line.item for line in report.lines if line.status in ("ok", "skip")}
+    unanswered = [program for program in wanted if program not in answered]
+    if report.failed or unanswered:
+        failed = tuple(line for line in report.lines if line.status == "fail")
+        raise ProgramsProbeFailed(
+            failed
+            or (
+                ScriptLine(
+                    "fail", "programs", "no answer for " + ", ".join(unanswered)
+                ),
+            )
+        )
     return frozenset(
         line.item
         for line in report.lines
@@ -622,14 +653,24 @@ def provision(
     A stdio MCP candidate ships only if the node resolves its program: when
     there is one, a ``programs.sh`` probe comes first, and what the node lacks
     is dropped BEFORE the payload exists, so its env never leaves this PC.
+    A probe that fails drops every candidate the same way, and its ``fail``
+    row rides the report (the rest of the scope still applies).
     The report opens with one verdict line per server: the scope's notes as
     ``skip`` rows (what stayed behind, and why), then ``ok`` per shipped one."""
     programs = stdio_programs(user_scope)
+    probe_failed: tuple[ScriptLine, ...] = ()
     if programs:
-        found = node_programs(
-            node, programs.values(), timeout_s=min(timeout_s, PROGRAMS_TIMEOUT_S)
-        )
-        user_scope = without_missing_programs(user_scope, found=found)
+        try:
+            found = node_programs(
+                node, programs.values(), timeout_s=min(timeout_s, PROGRAMS_TIMEOUT_S)
+            )
+        except ProgramsProbeFailed as exc:
+            probe_failed = exc.lines
+            user_scope = without_missing_programs(
+                user_scope, found=frozenset(), unprobed=True
+            )
+        else:
+            user_scope = without_missing_programs(user_scope, found=found)
     account = local_gh_account()
     token = local_gh_token() if account is not None else None
     login = account.login if account is not None and token else None
@@ -639,21 +680,17 @@ def provision(
         gh_login=login,
         state_hook=node_scripts.script("state_hook"),
     )
+    args = ["--force"] if force else []
     result = run_script(
-        node,
-        "provision",
-        ["--force"] if force else [],
-        timeout_s=timeout_s,
-        stdin=payload,
-        check=False,
+        node, "provision", args, timeout_s=timeout_s, stdin=payload, check=False
     )
-    report = _report_of(result, "provision", node)
+    report = _report_of(result, "provision", node, args=args, stdin=payload)
     notes = tuple(ScriptLine("skip", "scope", note) for note in user_scope.notes)
     shipped = tuple(
         ScriptLine("ok", "scope", f"mcp {name}: shipped")
         for name in sorted(user_scope.mcp_servers)
     )
-    return ProvisionReport((*notes, *shipped, *report.lines))
+    return ProvisionReport((*notes, *shipped, *probe_failed, *report.lines))
 
 
 # Either scope lets gh add an ssh key; admin: is what `gh auth refresh` grants.
