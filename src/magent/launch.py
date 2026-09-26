@@ -1848,7 +1848,9 @@ def stop_node_sessions(
             log.warning("down: %s map entry stays: the map could not be written", sid)
             continue
         try:
-            nodes.update_node_map(key, None)
+            # Compare-and-delete: an `up` that re-placed this project while
+            # the kill was in flight keeps its fresh entry.
+            nodes.update_node_map(key, None, expect=entry)
         except (ValueError, OSError) as exc:
             # The kill is proved. A stale entry is harmless: the next bring-up
             # of this project records its placement over it.

@@ -965,6 +965,19 @@ class TestStoppingNodeSessions:
         nodes.NODE_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
         nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
 
+    @pytest.fixture(params=["torn", "busy"])
+    def unreadable(self, request, rig, monkeypatch):
+        # Torn on disk, or intact but locked by another process (a Windows
+        # sharing violation reads as PermissionError): neither is "empty".
+        if request.param == "torn":
+            request.getfixturevalue("torn")
+            return
+
+        def busy() -> dict[str, nodes.NodeMapEntry]:
+            raise PermissionError(13, "The process cannot access the file")
+
+        monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+
     def test_a_killed_session_is_stopped_and_unmapped(self, rig, api, kills):
         _hold("api")
         assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
@@ -1119,26 +1132,43 @@ class TestStoppingNodeSessions:
         assert kills[0] == [("third", sid)]
         assert nodes.read_node_map() == {}
 
+    def test_a_placement_an_up_made_during_the_kill_survives_the_unmap(
+        self, rig, api, monkeypatch
+    ):
+        # `up` re-placed api on third while the kill on second was in flight:
+        # the unmap clears only the entry it stopped, never the fresh one.
+        _hold("api")
+
+        def kill_while_up_replaces(node, sid):
+            _hold("api", nick="third")
+            return True
+
+        monkeypatch.setattr(remote_mux, "kill_session", kill_while_up_replaces)
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert {k: e.nick for k, e in nodes.read_node_map().items()} == {"api": "third"}
+
     # An unreadable map: this answer becomes a report, so the map is never
     # read as "nothing placed" -- whatever it might hold is not claimed.
 
-    def test_with_a_torn_map_an_auto_project_is_a_survivor_nobody_dials(
-        self, rig, tmp_path, kills, torn, nodes_log
+    def test_with_an_unreadable_map_an_auto_project_is_a_survivor_nobody_dials(
+        self, rig, tmp_path, kills, unreadable, nodes_log
     ):
         proj = ProjectConfig(path=str(tmp_path / "web"), node="auto")
         assert launch.stop_node_sessions(_config(proj), ["web"]) == ([], ["web"])
         assert kills[0] == []
         assert any("node map unreadable" in m for m in nodes_log())
 
-    def test_with_a_torn_map_a_pin_answering_not_there_is_a_survivor(
-        self, rig, api, kills, torn
+    def test_with_an_unreadable_map_a_pin_answering_not_there_is_a_survivor(
+        self, rig, api, kills, unreadable
     ):
         # It may run where the lost map placed it: "not on the pin" proves nothing.
         kills[1]["api"] = False
         assert launch.stop_node_sessions(_config(api), ["api"]) == ([], ["api"])
         assert kills[0] == [("second", "api")]
 
-    def test_with_a_torn_map_a_confirmed_kill_is_stopped(self, rig, api, kills, torn):
+    def test_with_an_unreadable_map_a_confirmed_kill_is_stopped(
+        self, rig, api, kills, unreadable
+    ):
         assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
 
     def test_a_torn_map_is_never_rewritten(self, rig, api, kills, torn):

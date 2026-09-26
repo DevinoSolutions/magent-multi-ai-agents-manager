@@ -1840,12 +1840,22 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         assert sent == []
         assert dialed == [("second", "api-2")]
 
-    def test_a_torn_map_is_a_survivor_line_not_nothing_to_stop(
-        self, runner, tmp_config, monkeypatch, tmp_path
+    @pytest.mark.parametrize("state", ["torn", "busy"])
+    def test_an_unreadable_map_is_a_survivor_line_not_nothing_to_stop(
+        self, runner, tmp_config, monkeypatch, tmp_path, state
     ):
         from magent import nodes
 
-        nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+        if state == "torn":
+            nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+        else:
+            # Intact on disk, but another process has it open (Windows).
+            self._hold("web", "third")
+
+            def busy() -> dict[str, nodes.NodeMapEntry]:
+                raise PermissionError(13, "The process cannot access the file")
+
+            monkeypatch.setattr(nodes, "load_node_map_strict", busy)
         out, _killed, dialed, _sent = self._run(
             runner,
             tmp_config,
