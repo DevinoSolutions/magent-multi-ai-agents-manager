@@ -962,6 +962,43 @@ def test_a_windows_ssh_project_terminal_dials_the_panes_client(monkeypatch):
     assert argv[argv.index("/k") + 1] == client
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="WindowsPlatform binds windll at import"
+)
+@pytest.mark.parametrize(
+    "client",
+    [
+        r"C:\Program Files\OpenSSH\ssh.exe",
+        r"C:\Program Files\Git\usr\bin\ssh.exe",
+        r"C:\Tools&Co\ssh.exe",
+    ],
+)
+def test_a_client_path_cmd_would_reparse_reaches_it_as_the_bare_name(
+    monkeypatch, client
+):
+    # `cmd /k` strips the first and last quote of a line that starts with one,
+    # so a quoted C:\Program Files\... argv[0] would eat the remote command's
+    # closing quote, and an unquoted `&` would split the line in two. Only the
+    # PATH fallback yields such a path, and the bare name resolves through that
+    # same PATH to the same client.
+    from magent import attach_client
+    from magent.platform import TerminalLaunchOpts
+    from magent.platform.windows import WindowsPlatform
+
+    argvs: list[list[str]] = []
+    monkeypatch.setattr(attach_client, "find_ssh", lambda: client)
+    monkeypatch.setattr(
+        "magent.platform.windows.subprocess.Popen", lambda a, **k: argvs.append(a)
+    )
+    WindowsPlatform().launch_terminal(
+        TerminalLaunchOpts(
+            title="magent:api", cwd="C:/p", command="claude", ssh_host="u@host"
+        )
+    )
+    (argv,) = argvs
+    assert argv[argv.index("/k") + 1] == "ssh"
+
+
 # --- the ATTACH client is the OTHER rule ------------------------------------
 # `attach_psmux` opens a window that RENDERS an existing session; it hosts no
 # agent and creates nothing. So it keeps the inherited environment -- nesting

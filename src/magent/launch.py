@@ -1440,7 +1440,8 @@ class NodeBringUpOutcome:
     """One node project's bring-up, for the shells to print. ``error`` is the
     whole user-facing reason when ``ok`` is False; ``warnings`` are true but
     non-fatal (an unshippable ``push`` entry, a refusal that was moot because
-    the session was already running)."""
+    the session was already running). ``title`` is the one the attach window
+    opened under -- what tiling places it by -- or None when none opened."""
 
     ok: bool
     sid: str
@@ -1448,11 +1449,14 @@ class NodeBringUpOutcome:
     error: str | None = None
     attached_existing: bool = False
     warnings: tuple[str, ...] = ()
+    title: str | None = None
 
 
-# One bring-up per node at a time: two sessions' first `new-session` racing to
-# start the node's one tmux server, or two clones into the same root, is not a
-# failure anyone should have to diagnose. Different nodes run in parallel.
+# One bring-up per node at a time, within this process: two sessions' first
+# `new-session` racing to start the node's one tmux server, or two clones into
+# the same root, is not a failure anyone should have to diagnose. Different
+# nodes run in parallel. A threading.Lock does not reach a second magent
+# process; two `magent up`s at once can still race on one node.
 _BRING_UP_LOCKS: dict[str, threading.Lock] = {}
 _BRING_UP_LOCKS_GUARD = threading.Lock()
 
@@ -1628,8 +1632,7 @@ def bring_up_node_project(
                 # What is uncommitted HERE does not touch a session already
                 # running there: attach to it, and keep the refusal as a warning.
                 remote_mux.decorate(node, held.sid, nick)
-                if window:
-                    _open_node_window(node, held.sid)
+                title = _open_node_window(node, held.sid) if window else None
                 log.info(
                     "node %s: %s already running; attached despite: %s",
                     nick,
@@ -1642,6 +1645,7 @@ def bring_up_node_project(
                     node=nick,
                     attached_existing=True,
                     warnings=tuple(refusals),
+                    title=title,
                 )
             log.info("node %s: refused %s: %s", nick, sid, refusals)
             return NodeBringUpOutcome(
@@ -1682,10 +1686,12 @@ def bring_up_node_project(
                 cause = str(exc).encode("ascii", "replace").decode("ascii")
                 warnings = (
                     *warnings,
-                    f"up on @{nick} but not recorded ({cause}); re-run magent up",
+                    (
+                        f"up on @{nick} but not recorded ({cause}); re-run magent"
+                        " up from a clean tree or --allow-dirty"
+                    ),
                 )
-        if window:
-            _open_node_window(node, result.sid)
+        title = _open_node_window(node, result.sid) if window else None
         log.info(
             "node %s: %s up (attached_existing=%s)",
             nick,
@@ -1698,12 +1704,21 @@ def bring_up_node_project(
             node=nick,
             attached_existing=result.attached_existing,
             warnings=warnings,
+            title=title,
         )
     except (ValueError, remote_mux.RemoteError, OSError) as exc:
         # ValueError covers NodeConfigError (its subclass) and a recipe that
         # cannot be framed; OSError a local file that vanished mid-read, and
-        # LockHeld (the map held past its wait).
-        log.warning("node %s: bring-up of %s failed: %s", nick or "?", sid, exc)
+        # LockHeld (the map held past its wait). A plain ValueError may also be
+        # a bug wearing an outcome, so it keeps its traceback in the log.
+        log.warning(
+            "node %s: bring-up of %s failed: %s",
+            nick or "?",
+            sid,
+            exc,
+            exc_info=isinstance(exc, ValueError)
+            and not isinstance(exc, nodes.NodeConfigError),
+        )
         return NodeBringUpOutcome(
             ok=False, sid=sid, node=nick, error=_node_error_text(exc)
         )

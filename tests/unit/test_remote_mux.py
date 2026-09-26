@@ -91,6 +91,9 @@ class TestSshArgv:
             remote_mux.ssh_argv(NODE, LS)
         assert exc.value.rc == 127
         assert exc.value.command_redacted[0] == "ssh"
+        # The rule looks past PATH (Windows' own OpenSSH first), so the reason
+        # must not blame PATH alone.
+        assert exc.value.stderr_tail == "no ssh client found"
 
     def test_a_tty_is_requested_only_when_asked(self, fake_ssh):
         assert "-t" not in remote_mux.ssh_argv(NODE, ["x"])
