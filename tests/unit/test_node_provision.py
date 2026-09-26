@@ -1832,10 +1832,14 @@ class TestASkillFileIsShippedWithACaution:
         assert scope.notes == (ENV_NOTE.format("s/.env"),)
 
 
+GONE_NOTE = "skills/bar/gone.md: cannot be read (FileNotFoundError); not shipped"
+
+
 # What the SENDER does with a link -- ~/.claude/skills/foo -> ~/repos/foo, or a
-# file linked inside a skill: it DEREFERENCES. Every skill reaches the payload
-# as a regular-file member, never a link member, so the receiver's
-# regular-files-only rule (F-orphans cf7db4d) never meets one from a real PC.
+# file linked inside a skill -- and with two hard-linked files: it reads each
+# path's CONTENT. Every skill reaches the payload as its own regular-file
+# member, never a link or hard-link member, so node_apply's _off_contract
+# (which refuses the whole payload on either) never meets one from a real PC.
 # A link that cannot be read as a regular file stays behind with a note.
 class TestALinkedSkillShipsAsItsContent:
     @staticmethod
@@ -1850,6 +1854,39 @@ class TestALinkedSkillShipsAsItsContent:
         _skill(skills, "bar/SKILL.md", b"# bar\n")
         _link_file(skills / "bar" / "lib.md", shared)
         return home
+
+    @staticmethod
+    def _every_kind(tmp_path: Path) -> Path:
+        """``_linked``, plus two hard-linked files in one skill (a pnpm-style
+        store) and a dangling link."""
+        home = TestALinkedSkillShipsAsItsContent._linked(tmp_path)
+        bar = home / ".claude" / "skills" / "bar"
+        _skill(bar, "tool.js", b"tool\n")
+        os.link(bar / "tool.js", bar / "tool-copy.js")
+        _link_file(bar / "gone.md", tmp_path / "nowhere")
+        return home
+
+    def test_every_kind_reaches_the_payload_as_regular_members(self, tmp_path):
+        scope = nodes.user_scope(self._every_kind(tmp_path))
+        assert scope.notes == (GONE_NOTE,)
+        payload = remote_mux.build_payload(
+            scope, gh_token=None, gh_login=None, state_hook=HOOK_TEXT
+        )
+        with tarfile.open(
+            fileobj=io.BytesIO(payload.partition(b"\n")[2]), mode="r:gz"
+        ) as tar:
+            members = tar.getmembers()
+            data: dict[str, bytes] = {}
+            for m in members:
+                blob = tar.extractfile(m)
+                assert blob is not None  # a regular file has content to extract
+                data[m.name] = blob.read()
+        # Regular members only -- not even a folder one: tar makes the folders.
+        assert {m.type for m in members} == {tarfile.REGTYPE}
+        assert data["skills/bar/tool.js"] == b"tool\n"
+        assert data["skills/bar/tool-copy.js"] == b"tool\n"
+        assert data["skills/bar/lib.md"] == b"shared\n"
+        assert "skills/bar/gone.md" not in data
 
     def test_every_skill_member_of_the_payload_is_a_regular_file(self, tmp_path):
         scope = nodes.user_scope(self._linked(tmp_path))
@@ -2783,25 +2820,36 @@ class TestProvisionShUnderRealBash:
             home / ".claude" / "skills" / "s" / "run.sh"
         ).stat().st_mode & 0o777 == 0o700
 
-    # A PC's symlinked skills (a folder linked in, a file linked inside one)
-    # land on the node as plain files through the real tar and applier: the
-    # sender dereferences, so the receiver's regular-files-only rule passes.
-    def test_a_linked_skill_lands_as_plain_files(self, tmp_path):
-        home = TestALinkedSkillShipsAsItsContent._linked(tmp_path)
+    # Every kind of link a PC's skills folder holds -- a folder linked in from
+    # outside ~/.claude, a file linked inside a skill, two hard-linked files, a
+    # dangling link -- through the REAL sender, tar and applier: nothing is
+    # refused whole (_off_contract passes), every file lands plain and alone on
+    # its inode, and the dangling link stayed behind with its class-only note.
+    def test_every_kind_of_link_lands_as_plain_files(self, tmp_path):
+        home = TestALinkedSkillShipsAsItsContent._every_kind(tmp_path)
         scope = nodes.user_scope(home)
+        assert scope.notes == (GONE_NOTE,)
         r = _run_provision(tmp_path, _node_payload(scope))
         assert r.returncode == 0, r.stdout + r.stderr
-        assert _rows(r)["skills"] == "did"
+        rows = _rows(r)
+        assert "payload" not in rows
+        assert rows["skills"] == "did"
         landed = tmp_path / "node" / ".claude" / "skills"
         files = sorted(p for p in landed.rglob("*") if not p.is_dir())
         assert [p.relative_to(landed).as_posix() for p in files] == [
             "bar/SKILL.md",
             "bar/lib.md",
+            "bar/tool-copy.js",
+            "bar/tool.js",
             "foo/SKILL.md",
             "foo/run.sh",
         ]
-        assert not any(p.is_symlink() for p in landed.rglob("*"))
+        for p in files:
+            assert not p.is_symlink(), p
+            assert p.stat().st_nlink == 1, p
         assert (landed / "bar" / "lib.md").read_bytes() == b"shared\n"
+        assert (landed / "bar" / "tool-copy.js").read_bytes() == b"tool\n"
+        assert (landed / "foo" / "run.sh").read_bytes() == b"#!/bin/sh\necho foo\n"
 
     def test_the_token_reaches_gh_on_stdin_and_no_argv(self, tmp_path):
         gh = make_fake_ssh(tmp_path, name="gh")
