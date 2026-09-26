@@ -1585,6 +1585,52 @@ class TestTheLoadSampleEdges:
         assert len([m for m in _warnings(caplog) if "load sample" in m]) == 1
         assert _load_ts() == [1180.0, 1240.0, 1300.0]
 
+    def test_the_broken_load_file_state_is_per_node(self, placed, caplog):
+        """One node's broken load file must neither silence another node's
+        first warning nor be 'recovered' by another node's good sample."""
+        _capture_nodes_log(caplog)
+        t = [1000.0]
+
+        def pull(_node, _sids):
+            return _snapshot(sample=LoadSample(**SAMPLE))
+
+        def tick() -> None:
+            results = syncer.tick()
+            assert results == dict.fromkeys(("second", "third"), (node_sync.OK, ""))
+            t[0] += 60
+
+        def said(level: int, text: str) -> list[str]:
+            return sorted(
+                r.getMessage()
+                for r in caplog.records
+                if r.levelno == level and text in r.getMessage()
+            )
+
+        syncer = node_sync.NodeSyncer(
+            _config(sample_interval_s=60), pull=pull, now=lambda: t[0]
+        )
+        nodes.load_path("second").mkdir(parents=True)
+        for _ in range(3):  # second broken, third healthy
+            tick()
+        assert [m.split(":")[0] for m in said(logging.WARNING, "load sample")] == [
+            "node second"
+        ]
+        assert said(logging.INFO, "kept again") == []
+        nodes.load_path("third").unlink()  # third breaks too, second still is
+        nodes.load_path("third").mkdir()
+        tick()
+        assert [m.split(":")[0] for m in said(logging.WARNING, "load sample")] == [
+            "node second",
+            "node third",
+        ]
+        nodes.load_path("second").rmdir()  # second repaired, third still broken
+        for _ in range(2):
+            tick()
+        assert said(logging.INFO, "kept again") == [
+            "node second: load samples kept again"
+        ]
+        assert len(said(logging.WARNING, "load sample")) == 2
+
     def test_a_first_line_nested_too_deep_is_trimmed_not_raised(self, placed):
         """json.loads raises RecursionError, not ValueError, on deep nesting.
         The row reader must read that as "not a row", or the tick fails."""
