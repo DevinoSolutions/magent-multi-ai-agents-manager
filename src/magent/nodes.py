@@ -170,9 +170,9 @@ LOCAL_STATE_HOOK_MARKERS = ("magent-state-hook", "magent.state_hook")
 # syncs its own. The rest are tool droppings, never part of a skill.
 SKILLS_EXCLUDED_TOP = frozenset({"synced"})
 SKILLS_EXCLUDED_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv"})
-# Folders under the PC's home that hold keys and logins: ssh, gpg, AWS, gh,
-# Azure, kubectl, docker. No skill lives in one, so nothing the skills walk reaches
-# -- a folder or a single file, linked or not -- is read from inside one.
+# Folders under the PC's home that hold keys and logins: ssh, gpg, AWS, Azure,
+# gh, kubectl, docker. No skill lives in one, so nothing the skills walk
+# reaches -- a folder or a single file, linked or not -- is read from inside one.
 # Defence in depth, not containment: a link anywhere else still ships.
 SECRET_HOME_DIRS = (
     ".ssh",
