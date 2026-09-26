@@ -2196,7 +2196,39 @@ class TestProvision:
         assert _sent(call).split(b"\n", 1)[0] == TOKEN.encode("ascii")
         _, _, data = _unpack(_sent(call))
         assert json.loads(data["manifest.json"])["gh_login"] == "amin"
-        assert not [line for line in report.lines if line.item == "gh"]
+        # Shared, but never silently: the user sees it was not checked.
+        assert [line for line in report.lines if line.item == "gh"] == [
+            ScriptLine(
+                "warn",
+                "gh",
+                (
+                    "shared unverified -- this PC's gh could not verify its "
+                    "github.com login (offline?); if the node's gh login fails, "
+                    "check this PC's network, then retry"
+                ),
+            )
+        ]
+
+    def test_the_unverified_row_is_our_words_and_gh_s_go_to_the_log(
+        self, fake_ssh, fake_gh, caplog
+    ):
+        said = "dial tcp: lookup api.github.com: no such host"
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(None, accounts=[("amin", True, "error", said)]),
+        )
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
+        caplog.set_level("WARNING", logger="magent.nodes")
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        (row,) = [line for line in report.lines if line.item == "gh"]
+        assert row.detail == remote_mux.GH_SHARED_UNVERIFIED
+        assert row.detail.isascii()
+        assert said not in row.detail
+        assert TOKEN not in row.detail
+        assert said in caplog.text
+        assert TOKEN not in caplog.text
 
     def test_a_rejected_login_shares_nothing_and_says_why(self, fake_ssh, fake_gh):
         fake_gh.set_reply(
