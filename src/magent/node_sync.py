@@ -599,6 +599,8 @@ class NodeSyncer:
         # key per nick, and one worker per nick at a time, so no two threads
         # write the same key.
         self._errors: dict[str, Exception] = {}
+        # The class of what last refused the node map, while it stays unread.
+        self._map_error: str | None = None
 
     def reconfigure(self, config: MagentConfig) -> None:
         self._config = config
@@ -644,9 +646,22 @@ class NodeSyncer:
 
         A node that leaves the pool keeps its running pull until that pull
         ends. Its outcome is then dropped, but an exception it raised still
-        propagates, as any laggard's does."""
+        propagates, as any laggard's does.
+
+        The node map is read STRICTLY. One that cannot be read (busy, torn)
+        is no licence to pull every node with nothing: that wrote each node's
+        marks as ``{}``, and the next readable tick re-pulled every session
+        from zero. Such a tick dials no node and writes nothing; see
+        ``_map_unreadable``."""
+        try:
+            placed = nodes.load_node_map_strict()
+        except (OSError, ValueError) as e:
+            return self._map_unreadable(e)
+        if self._map_error is not None:
+            self._map_error = None
+            get_logger(LOG_NAME).info("node sync: the node map reads again")
         by_nick: dict[str, dict[str, NodeMapEntry]] = {}
-        for entry in nodes.read_node_map().values():
+        for entry in placed.values():
             by_nick.setdefault(entry.nick, {})[entry.sid] = entry
         user = self._local_user if self._local_user is not None else local_username()
         # Defensive: reconfigure runs between ticks on this thread; the local
@@ -695,6 +710,25 @@ class NodeSyncer:
             if nick not in slow:
                 self._note(nick, outcome, detail)
         return results
+
+    def _map_unreadable(self, e: OSError | ValueError) -> dict[str, tuple[str, str]]:
+        """A tick's answer when the node map could not be read: every pool
+        node FAILED, naming the map's class -- so ``node sync --once`` exits 1
+        rather than printing nothing -- with no node dialled and no file
+        written. A pull already in flight is left to the next readable tick.
+
+        One WARNING per episode, class only (the map's error names its path);
+        the ticks it stays unreadable go to DEBUG, and the tick that reads it
+        again says so once. Not ``_note``: one map, not one line per node."""
+        cls = type(e).__name__
+        level = logging.DEBUG if self._map_error == cls else logging.WARNING
+        self._map_error = cls
+        get_logger(LOG_NAME).log(
+            level, "node sync: %s (%s); pulling nothing", MAP_UNREAD, cls
+        )
+        return dict.fromkeys(
+            sorted(self._config.settings.nodes), (FAILED, f"{MAP_UNREAD} ({cls})")
+        )
 
     def _sync_node(
         self,
