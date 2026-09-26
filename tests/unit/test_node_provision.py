@@ -1460,6 +1460,92 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
         assert nodes.SKILLS_MAX_ENTRIES == 20000
 
 
+class TestTheSkillsWalkKnowsASecretWhenItSeesOne:
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b"\xff\xfe" + "KEY=sk-ant-oat01-DECOY\r\n".encode("utf-16-le"),
+            b"\xfe\xff" + "KEY=sk-ant-oat01-DECOY\r\n".encode("utf-16-be"),
+            "KEY=sk-ant-oat01-DECOY\r\n".encode("utf-16-le"),
+        ],
+        ids=["utf-16-le-bom", "utf-16-be-bom", "utf-16-le-no-bom"],
+    )
+    def test_a_utf16_skill_file_holding_a_key_stays_behind(self, tmp_path, data):
+        # Windows PowerShell 5.1's `>` and Out-File write UTF-16LE.
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/SKILL.md")
+        _skill(skills, "s/env.txt", data)
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == (
+            "skills/s/env.txt: holds a Claude credential, never shipped",
+        )
+
+    # The credential scan cannot see an ssh key, a TLS key or a git token, so
+    # these FILE names never ship, at any depth and in any case.
+    def test_secret_file_names_never_ship_at_any_depth(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/SKILL.md")
+        for rel in (
+            "s/.netrc",
+            "s/.git-credentials",
+            "s/id_rsa",
+            "s/id_rsa.pub",
+            "s/deep/Id_Ed25519",
+            "s/tls/cert.PEM",
+        ):
+            _skill(skills, rel, b"SECRET-DECOY")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == tuple(
+            f"skills/{rel}: a secret-bearing name, never shipped"
+            for rel in (
+                "s/.git-credentials",
+                "s/.netrc",
+                "s/id_rsa",
+                "s/id_rsa.pub",
+                "s/deep/Id_Ed25519",
+                "s/tls/cert.PEM",
+            )
+        )
+        assert "DECOY" not in repr(scope)
+
+    @pytest.mark.parametrize("name", ["netrc", "my.netrc", "pem.md", "rsa_id"])
+    def test_a_name_that_only_resembles_one_ships(self, tmp_path, name):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, f"s/{name}")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == [f"s/{name}"]
+        assert scope.notes == ()
+
+    def test_an_innocent_name_linked_to_a_secret_name_stays_behind(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        keys = tmp_path / "dev" / "keys"
+        keys.mkdir(parents=True)
+        (keys / "id_ed25519").write_bytes(b"PRIVATE-KEY-DECOY")
+        _skill(skills, "s/SKILL.md")
+        _link_file(skills / "s" / "key.txt", keys / "id_ed25519")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == (
+            "skills/s/key.txt: a secret-bearing name, never shipped",
+        )
+        assert "DECOY" not in repr(scope)
+
+    def test_azure_is_a_secrets_folder(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/SKILL.md")
+        (home / ".azure").mkdir()
+        (home / ".azure" / "msal_token_cache.json").write_bytes(b"AZURE-DECOY")
+        _link_dir(skills / "az", home / ".azure")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == (
+            "skills/az: resolves into a secrets folder, not followed",
+        )
+        assert "DECOY" not in repr(scope)
+
+
 class TestUserScopeDigests:
     def test_every_item_has_a_digest(self):
         assert set(_scope().digests()) == {

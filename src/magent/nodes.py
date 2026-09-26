@@ -171,10 +171,24 @@ LOCAL_STATE_HOOK_MARKERS = ("magent-state-hook", "magent.state_hook")
 SKILLS_EXCLUDED_TOP = frozenset({"synced"})
 SKILLS_EXCLUDED_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv"})
 # Folders under the PC's home that hold keys and logins: ssh, gpg, AWS, gh,
-# kubectl, docker. No skill lives in one, so nothing the skills walk reaches
+# Azure, kubectl, docker. No skill lives in one, so nothing the skills walk reaches
 # -- a folder or a single file, linked or not -- is read from inside one.
 # Defence in depth, not containment: a link anywhere else still ships.
-SECRET_HOME_DIRS = (".ssh", ".gnupg", ".aws", ".config/gh", ".kube", ".docker")
+SECRET_HOME_DIRS = (
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".azure",
+    ".config/gh",
+    ".kube",
+    ".docker",
+)
+# Secret-bearing FILE names, matched case-insensitively at any depth of the
+# skills walk and on the name a link resolves to: the credential scan cannot
+# see an ssh key, a TLS key or a git token, so these never ship by name.
+SKILLS_SECRET_FILES = frozenset({".netrc", ".git-credentials"})
+SKILLS_SECRET_FILE_PREFIXES = ("id_rsa", "id_ed25519")
+SKILLS_SECRET_FILE_SUFFIXES = (".pem",)
 # user_scope runs on every bring-up and holds every skill byte in memory: a
 # stray asset must not be read whole ...
 SKILL_FILE_MAX_BYTES = 8 * 1024 * 1024
@@ -638,6 +652,10 @@ def _source_refusal(source: str) -> str | None:
 
 
 _CREDENTIAL_BYTES = CLAUDE_CREDENTIAL_MARKER.encode("ascii")
+# Windows PowerShell 5.1's `>` and Out-File write UTF-16LE by default. The LE
+# form also matches a UTF-16BE file: the marker's ASCII continues, so BE bytes
+# read from offset 1 are the LE sequence.
+_CREDENTIAL_BYTES_U16 = CLAUDE_CREDENTIAL_MARKER.encode("utf-16-le")
 
 # How a skill file is opened: never blocking on a FIFO swapped in after its
 # stat. Read off the module, so Windows (which has no O_NONBLOCK, and wants
@@ -748,6 +766,15 @@ def _in_secret_dir(
     return True
 
 
+def _secret_file_name(name: str) -> bool:
+    low = name.lower()
+    return (
+        low in SKILLS_SECRET_FILES
+        or low.startswith(SKILLS_SECRET_FILE_PREFIXES)
+        or low.endswith(SKILLS_SECRET_FILE_SUFFIXES)
+    )
+
+
 @dataclass
 class _SkillsTally:
     """What one skills walk has spent: entries listed, bytes kept, and the
@@ -768,7 +795,11 @@ def _skill_file(
 ) -> SkillFile | None:
     """``path`` (at ``rel_path`` under skills) as a SkillFile, or None with a
     note (or a count in ``tally``) saying why it stays behind."""
-    if _in_secret_dir(rel_path, _real(path), secrets, notes):
+    target = _real(path)
+    if _in_secret_dir(rel_path, target, secrets, notes):
+        return None
+    if _secret_file_name(path.name) or _secret_file_name(os.path.basename(target)):
+        notes.append(f"skills/{_named(rel_path)}: a secret-bearing name, never shipped")
         return None
     if _holds_claude_credential(rel_path):
         notes.append(
@@ -787,7 +818,7 @@ def _skill_file(
     except OSError as e:
         notes.append(f"skills/{_named(rel_path)}: unreadable ({e.strerror})")
         return None
-    if _CREDENTIAL_BYTES in data:
+    if _CREDENTIAL_BYTES in data or _CREDENTIAL_BYTES_U16 in data:
         notes.append(
             f"skills/{_named(rel_path)}: holds a Claude credential, never shipped"
         )
@@ -803,9 +834,12 @@ def _skill_file(
 def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     """Every file under ``~/.claude/skills``, symlinks followed once, sorted by
     path. A file is executable if its mode says so OR it starts with ``#!`` --
-    a Windows PC has no exec bit to read. A file whose bytes (or path) hold a
-    Claude credential stays behind; its note names the path, never the
-    content. A Windows junction is followed exactly like a symlink, on
+    a Windows PC has no exec bit to read. A file whose bytes (ASCII or
+    UTF-16) or path hold a Claude credential stays behind, and so does one
+    whose name, or the name its link resolves to, is a secret file's
+    (``SKILLS_SECRET_FILES`` and kin: an ssh or TLS key, a git token the
+    scan cannot see); a note names the path, never the content. A Windows
+    junction is followed exactly like a symlink, on
     purpose: a link in ``skills`` is one the user made (a repo checked out
     elsewhere is the main case), so it is not contained to the root.
 
