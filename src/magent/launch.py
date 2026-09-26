@@ -914,8 +914,8 @@ def place_node_projects(
 
     The map is read strictly (``_node_map_for_placement``). Unreadable, NO
     ``auto`` project is placed: each is dropped with the map's refusal (in
-    ``refused``, a failure) and a ``"unknown"`` Placement (D17: its node is None), nothing is sampled, and
-    the rest of the fleet goes on.
+    ``refused``, a failure) and an ``"unknown"`` Placement (D17: its node is
+    None), nothing is sampled, and the rest of the fleet goes on.
     """
     from magent import nodes
     from magent.config import NODE_AUTO
