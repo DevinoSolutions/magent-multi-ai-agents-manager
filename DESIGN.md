@@ -1015,6 +1015,42 @@ when the upload server reads DEAD **and** the daemon is off **and** it would
 actually supervise (config on, env not opted out). Suggesting the daemon to
 someone who disabled it would be advice that does nothing.
 
+### One port, one server (2026-09-26)
+
+The watchdog above, `serve --ensure` and a hand-run `magent serve` can each
+start a server while another is still starting, and the design assumed the loser
+would fail its bind. On Windows it did not. `ThreadingHTTPServer` sets
+`SO_REUSEADDR`, and on Windows that option lets a second process bind a port
+that is already **listening**. Measured: two live servers on one port, both
+logging `listening ... :15505`, with the pid file naming only the later one. The
+watchdog then killed or revived the wrong server, and `/health` was answered by
+whichever one the kernel picked. POSIX `SO_REUSEADDR` never allowed two live
+listeners, so only Windows ever showed it.
+
+`_NoFqdnHTTPServer` now owns its bind options (`_claim_port_options`). On
+Windows it sets `SO_EXCLUSIVEADDRUSE` and not `SO_REUSEADDR`, so a second bind
+is refused and a foreign `SO_REUSEADDR` socket cannot steal the port either. On
+POSIX it keeps `SO_REUSEADDR`, which there only lets a restart rebind past the
+previous server's `TIME_WAIT` connections. Windows never held a port hostage to
+`TIME_WAIT` (measured with ~20 such connections on the port), so an upgrade
+still restarts serve at once. The branch is a `sys.platform` check, not a
+capability probe: it is socket semantics, not a feature.
+
+A bind refused because the port is held (`EADDRINUSE`, or Windows' `WSAEACCES`
+when an exclusive wildcard holder refuses a specific address) raises
+`PortInUse`, not the old generic error. Held on **any** of serve's addresses
+counts: serving only the free ones would be two servers and one pid file again.
+Whatever was already bound is closed, and the pid file is untouched, because ours
+is only written after the bind. It is logged at WARNING, not ERROR. A watchdog or
+`--ensure` spawn that loses the race is **supposed** to end here, so it is not a
+crash for Sentry. The CLI shell prints the reason and exits 1 instead of a
+traceback. An address that cannot be bound for any other reason (a Tailscale IP
+that went away) still degrades with a warning, as before. Pins:
+`tests/unit/test_upload_server.py::TestOnePortOneServer` (real sockets, current
+OS), `TestClaimPortOptions`/`TestPortTaken` (both OSes, fake socket),
+`TestRunServerOnAHeldPort`, and
+`tests/e2e/test_real_upload.py::test_a_second_serve_on_the_same_port_exits_and_leaves_the_first_alone`.
+
 ### One liveness enumeration, and a shutdown that verifies (2026-08-18)
 
 Reported twice on a live 46-session Windows host: after `magent down --all`, a
