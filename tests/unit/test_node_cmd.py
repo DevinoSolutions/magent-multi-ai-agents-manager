@@ -963,6 +963,48 @@ class TestNodeSetupUnreachable:
         assert "cannot reach amin@devino-second" in result.stdout
         assert "last step" not in result.stdout
 
+    def test_a_timed_out_root_hop_names_root_the_bound_and_the_step(
+        self, runner, tmp_config, fake_ssh, fake_gh, monkeypatch
+    ):
+        def timed_out(node, users, pubkey, **kwargs):
+            raise _timed_out(900)
+
+        monkeypatch.setattr(remote_mux, "setup_node", timed_out)
+        _pc_key()
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert (
+            "no answer from root@devino-second (timed out after 900s) -- setup "
+            "may still be running there"
+        ) in result.stdout
+
+    def test_a_timed_out_provision_names_the_user_the_bound_and_the_step(
+        self, runner, tmp_config, fake_ssh, fake_gh, monkeypatch
+    ):
+        def timed_out(node, config, *, home, timeout_s, force=False):
+            raise _timed_out(timeout_s)
+
+        monkeypatch.setattr(remote_mux, "provision_node", timed_out)
+        _pc_key()
+        _node_answers(fake_ssh)
+        _gh_can_add_keys(fake_gh)
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert (
+            "no answer from amin@devino-second (timed out after 300s) -- the "
+            "provision may still be running there"
+        ) in result.stdout
+
+    def test_an_unreachable_root_hop_names_root_not_the_user(
+        self, runner, tmp_config, fake_ssh, fake_gh
+    ):
+        _pc_key()
+        fake_ssh.set_reply(
+            "root@devino-second",
+            stderr="root@devino-second: Permission denied (publickey).\n",
+            rc=255,
+        )
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert "cannot reach root@devino-second: " in result.stdout
+
 
 class TestNodeSetupNeverReadsSilenceAsSuccess:
     def test_a_root_hop_that_printed_nothing_fails_each_user(
@@ -1030,3 +1072,19 @@ class TestNodeSetupProvisionsThroughTheOneBody:
             runner, _pool_file(tmp_config), "second", "--user", "amin", "--user", "bob"
         )
         assert seen == [("amin@devino-second", True), ("bob@devino-second", True)]
+
+    def test_provision_gets_its_own_budget_and_this_pcs_home(
+        self, runner, tmp_config, fake_ssh, fake_gh, monkeypatch
+    ):
+        seen: list[tuple[float, Path]] = []
+
+        def fake(node, config, *, home, timeout_s, force=False):
+            seen.append((timeout_s, home))
+            return remote_mux.ProvisionReport(())
+
+        monkeypatch.setattr(remote_mux, "provision_node", fake)
+        _pc_key()
+        _node_answers(fake_ssh)
+        _gh_can_add_keys(fake_gh)
+        _setup(runner, _pool_file(tmp_config), "second")
+        assert seen == [(remote_mux.PROVISION_TIMEOUT_S, Path.home())]
