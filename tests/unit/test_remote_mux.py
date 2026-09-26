@@ -123,6 +123,17 @@ class TestRemoteError:
         assert RemoteError(255, "refused", ("ssh",)).timed_out is False
         assert RemoteError(None, "t", ("ssh",), timed_out=True).timed_out is True
 
+    def test_outcome_unknown_is_its_own_field_false_by_default(self):
+        # Two facts, two fields: timed_out is reachability (node_sync reads it),
+        # outcome_unknown is retry safety (a mutating call's retry reads it).
+        # Neither is derived from the other.
+        assert RemoteError(None, "boom", ("ssh",)).outcome_unknown is False
+        assert RemoteError(1, "boom", ("ssh",)).outcome_unknown is False
+        err = RemoteError(None, "x", ("ssh",), outcome_unknown=True)
+        assert (err.outcome_unknown, err.timed_out) == (True, False)
+        err = RemoteError(None, "t", ("ssh",), timed_out=True)
+        assert (err.outcome_unknown, err.timed_out) == (False, True)
+
 
 class TestTheSshResolver:
     def test_it_reads_path(self, tmp_path, monkeypatch):
@@ -264,6 +275,16 @@ class TestRun:
         # carry the filename, so a Windows-only green proves nothing here.
         assert gone not in logged
 
+    def test_a_spawn_failure_never_ran_so_its_outcome_is_known(
+        self, tmp_path, monkeypatch
+    ):
+        # The one rc-None case where a retry of a mutation is safe.
+        gone = str(tmp_path / "no-such-ssh.exe")
+        monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: gone)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["true"], timeout_s=5)
+        assert (exc.value.timed_out, exc.value.outcome_unknown) == (False, False)
+
     def test_an_exact_tmux_target_reaches_bash_quoted(self, fake_ssh):
         # zsh would expand a bare `=api` as a command lookup; inside the
         # single-quoted bash -c payload the login shell never sees it bare.
@@ -309,6 +330,8 @@ class TestRun:
             remote_mux.run(NODE, ["sleep"], timeout_s=1)
         assert exc.value.rc is None
         assert exc.value.timed_out is True
+        # Killing the local ssh does not stop a non-tty remote command.
+        assert exc.value.outcome_unknown is True
         assert time.monotonic() - started < 10
 
     def test_no_ssh_client_is_rc_127_without_spawning(self):
@@ -316,12 +339,15 @@ class TestRun:
             remote_mux.run(NODE, ["true"], timeout_s=5)
         assert exc.value.rc == 127
         assert exc.value.timed_out is False
+        # Nothing was spawned, so nothing ran: a retry is safe.
+        assert exc.value.outcome_unknown is False
 
     def test_a_failed_command_did_not_time_out(self, fake_ssh):
         fake_ssh.set_reply("false", rc=1)
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["false"], timeout_s=30)
         assert (exc.value.rc, exc.value.timed_out) == (1, False)
+        assert exc.value.outcome_unknown is False
 
     def test_stdin_travels_as_bytes_and_is_named_only_by_its_length(self, fake_ssh):
         fake_ssh.set_reply("cat", rc=1)
@@ -379,6 +405,11 @@ class TestTheReplyIsBoundedInMemory:
         assert time.monotonic() - started < 10
         assert exc.value.rc is None
         assert exc.value.stderr_tail == f"reply exceeded {CAP} bytes"
+        # The node ANSWERED (too much), so it is not a silent node -- node_sync
+        # reads timed_out as unreachable -- but the command was killed mid-run
+        # and may still be running there: a mutation must not be retried.
+        assert exc.value.timed_out is False
+        assert exc.value.outcome_unknown is True
         assert exc.value.command_redacted[0] == "ssh"
         (proc,) = spawned
         assert proc.poll() is not None
@@ -2310,6 +2341,7 @@ class TestEveryLocalGitReadIsBoundedScrubbedAndLockFree:
         assert exc.value.rc is None
         assert "timed out" in exc.value.stderr_tail
         assert exc.value.timed_out is True
+        assert exc.value.outcome_unknown is True
 
 
 _SSH_SHIM = """#!/bin/sh

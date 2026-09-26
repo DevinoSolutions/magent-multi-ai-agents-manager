@@ -140,13 +140,24 @@ class RemoteError(RuntimeError):
     hand secrets to tools by stdin or a credential helper, never a URL (git
     prints a token-bearing remote URL in "fatal: unable to access").
 
-    ``rc`` None means the call never finished, and that covers two opposite
-    cases. After a spawn failure the command never ran. After a timeout the
-    OUTCOME IS UNKNOWN: killing the local ssh does not stop a non-tty remote
-    command, so it may have run to completion (a killed send may have landed).
-    A caller must therefore never retry a mutation blindly on rc None.
-    ``timed_out`` tells the two apart: True only on the timeout path (outcome
-    unknown), False on every other construction (a spawn failure never ran)."""
+    ``rc`` None means the call never finished, and that covers three cases.
+    After a spawn failure the command never ran. After a timeout, and after a
+    reply over the cap, magent killed the local ssh mid-call -- and killing it
+    does not stop a non-tty remote command, so it may still be running or have
+    run to completion (a killed send may have landed): the OUTCOME IS UNKNOWN.
+
+    Two fields answer two different questions, and neither is derived from the
+    other:
+
+    - ``outcome_unknown``: may the remote command have run? True after a
+      timeout and after an over-cap kill. It is what any retry of a MUTATING
+      remote call must read (Plan F's provision): retry blindly only when it is
+      False. A caller must never infer it from rc None alone.
+    - ``timed_out``: did the node go silent? True only on ``_spawn``'s timeout.
+      It is what reachability reads (node_sync counts it as unreachable). An
+      over-cap reply is a node that answered, too much, so it is False there.
+
+    A spawn failure sets neither."""
 
     def __init__(
         self,
@@ -155,9 +166,11 @@ class RemoteError(RuntimeError):
         command_redacted: tuple[str, ...],
         *,
         timed_out: bool = False,
+        outcome_unknown: bool = False,
     ) -> None:
         self.rc = rc
         self.timed_out = timed_out
+        self.outcome_unknown = outcome_unknown
         self.stderr_tail = stderr_tail
         self.command_redacted = command_redacted
         super().__init__(
@@ -390,7 +403,11 @@ def _spawn(
                 "%s timed out after %.1fs: %s", label, timeout_s, shlex.join(shown)
             )
         raise RemoteError(
-            None, f"timed out after {timeout_s:g}s", shown, timed_out=True
+            None,
+            f"timed out after {timeout_s:g}s",
+            shown,
+            timed_out=True,
+            outcome_unknown=True,
         )
     if out.over:
         _kill(proc)
@@ -401,7 +418,14 @@ def _spawn(
                 max_stdout_bytes,
                 shlex.join(shown),
             )
-        raise RemoteError(None, f"reply exceeded {max_stdout_bytes} bytes", shown)
+        # Killed mid-call, so the remote may still be running; but the node
+        # answered, so it is not unreachable (timed_out stays False).
+        raise RemoteError(
+            None,
+            f"reply exceeded {max_stdout_bytes} bytes",
+            shown,
+            outcome_unknown=True,
+        )
     stderr = err.data()
     if check and proc.returncode != 0:
         if not quiet:
