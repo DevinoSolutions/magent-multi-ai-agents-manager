@@ -1840,6 +1840,27 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         assert sent == []
         assert dialed == [("second", "api-2")]
 
+    def test_a_retitled_placed_project_keeps_down_here(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # Placed as "my.web", retitled "my web" since: the name misses, the
+        # recorded sid still names its running session. Found by sid, so it
+        # counts as placed here and never forwards to the attach host.
+        self._hold("my.web", "third", sid="my-web")
+        out, _killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[
+                {"path": str(tmp_path / "web"), "title": "my web", "node": "auto"}
+            ],
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        assert dialed == [("third", "my-web")]
+
     @pytest.mark.parametrize("state", ["torn", "busy"])
     def test_an_unreadable_map_is_a_survivor_line_not_nothing_to_stop(
         self, runner, tmp_config, monkeypatch, tmp_path, state

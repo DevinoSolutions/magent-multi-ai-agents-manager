@@ -1072,9 +1072,10 @@ class TestStoppingNodeSessions:
         assert launch.stop_node_sessions(_config(proj), ["web"]) == ([], ["web"])
         assert kills[0] == []
         assert "web" in nodes.read_node_map()
-        (line,) = nodes_log() or [""]
-        assert line.startswith("down: web not stopped: ")
-        assert "gone" in line
+        lines = nodes_log()
+        assert len(lines) == 1, lines
+        assert lines[0].startswith("down: web not stopped: ")
+        assert "gone" in lines[0]
 
     @pytest.mark.parametrize(
         "exc",
