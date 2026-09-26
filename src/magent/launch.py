@@ -508,9 +508,10 @@ class UploadServerSupervisor:
         """The serve this supervisor last spawned is alive and still inside the
         shared registration window: slow, not failed (DESIGN.md section 2, "A
         slow child is not a failed child"). Measured on a loaded desktop, a serve
-        took ~4.7s to bind, so a short cooldown respawned beside it -- and on
-        Windows that second bind SUCCEEDS (``SO_REUSEADDR``), leaving two live
-        servers on one port and a pid file naming only the last one. Past the
+        took ~4.7s to bind, so a short cooldown respawned beside it. Before the
+        exclusive bind, that second bind SUCCEEDED on Windows (``SO_REUSEADDR``):
+        two live servers on one port. Now it exits with ``PortInUse``, but a
+        spawn that can only fail is still a wasted one. Past the
         window, or once the child has exited, the cooldown alone decides, as it
         always did. The child is never ended here."""
         if self._child is None or self._last_spawn is None:

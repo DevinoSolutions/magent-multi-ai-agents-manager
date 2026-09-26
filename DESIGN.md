@@ -1892,8 +1892,9 @@ launch before tiling. Pins:
 respawns a dead port at the cooldown rate, and the cooldown used to be the only
 thing between a slow serve and a second one. A serve measured 4.7s to bind
 against the e2e tier's 3s cooldown, the watchdog started another beside it, and
-on Windows the second bind succeeds (`SO_REUSEADDR`): two live servers on one
-port, a pid file naming only the later one. Now a serve the supervisor spawned
+on Windows the second bind succeeded (`SO_REUSEADDR`, before "One port, one
+server"): two live servers on one port, a pid file naming only the later one.
+Now a serve the supervisor spawned
 that is still alive inside `REGISTRATION_TIMEOUT_S` counts as starting, not
 failed. Once it exits, or the window runs out, the cooldown decides alone as
 before. The supervisor never ends that child either. At the default 60s cooldown
@@ -1901,8 +1902,9 @@ this guard never engages, because the cooldown check returns first; it matters
 only when the cooldown is both below the 20s window and shorter than a serve's
 startup (the e2e tier's 3s override is one). It is
 not a cure either: a serve measured 28.65s to bind on a loaded desktop, past the
-window, and was doubled all the same. The structural fix is an exclusive bind
-in upload_server, which is not changed here. Pins:
+window, and was doubled all the same. The structural fix is the exclusive bind
+("One port, one server" above): a duplicate now exits with `PortInUse`, and an
+exited child never holds back a respawn. Pins:
 `test_launch.py::TestUploadServerSupervisor`.
 
 The detaching e2e tiers carry the other half of the lesson. A failed launch
