@@ -2747,8 +2747,9 @@ DOCTOR_ITEMS = (
 
 
 # Probes doctor.sh bounds with `timeout`, as (fake, argv match): the four that
-# can stall, plus two of the five version reads. A hung one sleeps past every
-# bound, and past the whole call's before the fix.
+# can stall, plus three of the five version reads (a required tool's, and gh's,
+# which only warns). A hung one sleeps past every bound, and past the whole
+# call's before the fix.
 HUNG_PROBES = {
     "tmux": ("tmux", "list-sessions"),
     "claude": ("claude", "auth status"),
@@ -2756,6 +2757,7 @@ HUNG_PROBES = {
     "df": ("df", "-Pk"),
     "tmux-version": ("tmux", "-V"),
     "git-version": ("git", "--version"),
+    "gh-version": ("gh", "--version"),
 }
 HANG_S = 30.0
 
@@ -3217,6 +3219,8 @@ class TestDoctorShUnderRealBash:
             ("df", "disk", "warn", 4, "df did not answer in 4s under ~/magent"),
             ("tmux-version", "tmux", "fail", 4, "tmux -V timed out after 4s"),
             ("git-version", "git", "fail", 4, "git --version timed out after 4s"),
+            # A hung read has a missing tool's status: gh only warns.
+            ("gh-version", "gh", "warn", 4, "gh --version timed out after 4s"),
         ],
     )
     def test_a_hung_probe_is_its_own_row_inside_the_budget(
