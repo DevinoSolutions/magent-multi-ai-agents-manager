@@ -1807,26 +1807,29 @@ def bring_up_node_project(
 
 def _placement_recipes(
     config: MagentConfig, projects: list[ProjectConfig]
-) -> dict[str, tuple[str, Recipe]]:
-    """``{sid: (nick, recipe)}`` for every project in ``projects`` whose node
-    folder is already known, from config and the map alone -- no ssh, no git.
-    The recipe carries only what ``nodes.remote_root_collisions`` reads (its
-    project, sid and remote_root). A project that cannot be placed yet (no
-    folder here, an unplaced ``auto``, a folder with no usable name) is left
-    out: its own bring-up names that reason."""
+) -> dict[str, tuple[str, Recipe, bool]]:
+    """``{sid: (nick, recipe, holder)}`` for every project in ``projects``
+    whose node folder is already known, from config and the map alone -- no
+    ssh, no git. The recipe carries only what ``nodes.remote_root_collisions``
+    reads (its project, sid and remote_root); ``holder`` is whether the map
+    records the project in that very folder on that very node -- a project
+    re-pinned elsewhere is a newcomer there. A project that cannot be placed
+    yet (no folder here or none this user may read, an unplaced ``auto``, a
+    folder with no usable name) is left out: its own bring-up names that
+    reason."""
     # heavy subsystem: in-body per policy
     from magent import nodes
     from magent.env import local_username
 
     held = nodes.read_node_map()
-    out: dict[str, tuple[str, Recipe]] = {}
+    out: dict[str, tuple[str, Recipe, bool]] = {}
     for proj in projects:
         name = nodes.project_name(proj)
-        project_dir = _node_project_dir(config, proj)
-        if project_dir is None:
-            continue
         entry = held.get(name)
         try:
+            project_dir = _node_project_dir(config, proj)
+            if project_dir is None:
+                continue
             node = nodes.resolve(
                 config,
                 proj,
@@ -1834,7 +1837,7 @@ def _placement_recipes(
                 placed=entry.nick if entry else None,
             )
             remote_root = nodes.remote_root_for(node, project_dir)
-        except nodes.NodeConfigError:
+        except (nodes.NodeConfigError, OSError):
             continue
         out[nodes.node_sid(proj)] = (
             node.nick,
@@ -1846,6 +1849,9 @@ def _placement_recipes(
                 memory_dir=None,
                 remote_root=remote_root,
             ),
+            entry is not None
+            and entry.nick == node.nick
+            and entry.remote_root == remote_root,
         )
     return out
 
@@ -1857,16 +1863,24 @@ def _run_node_bring_ups(
     allow_dirty: bool,
     window: bool,
 ) -> list[NodeBringUpOutcome]:
-    """Each project's bring-up on a thread (a clone is minutes of network,
-    not CPU); the per-node lock inside keeps one node serial. Outcomes in the
-    order given.
+    """Each project's bring-up on a pool thread (a clone is minutes of
+    network, not CPU), at most eight at once. The per-node lock that keeps one
+    node serial is taken INSIDE a pool slot, so a bring-up waiting on its
+    node's lock still holds its slot: with more than eight queued for one node
+    ahead of another node's projects, that other node waits for a slot however
+    idle it is (head-of-line blocking). Outcomes in the order given.
 
     First, ONCE and before anything is dialed, the WHOLE fleet's node folders
     are checked (X3, ``nodes.remote_root_collisions``): a batch project whose
     folder name another project -- in this batch or not -- would share is
     refused, naming the other. Fanned out, two clones would race for one
     folder; a batch of one today and another tomorrow would overwrite it.
-    A collision among projects outside the batch refuses nothing here."""
+    A collision among projects outside the batch refuses nothing here. Only
+    newcomers are refused: the member the map already records in that folder
+    is brought up as usual -- attached if its session runs, restarted in its
+    own folder if not, neither overwriting anyone -- with the collision as a
+    warning, so a healthy session is never reported failed because a newcomer
+    arrived."""
     # heavy subsystem: in-body per policy
     from magent import nodes
 
@@ -1877,14 +1891,14 @@ def _run_node_bring_ups(
     fleet += [proj for proj in projects if nodes.node_sid(proj) not in known]
     placed = _placement_recipes(config, fleet)
     clash: dict[str, str] = {}
-    for group in nodes.remote_root_collisions([r for _, r in placed.values()]):
+    for group in nodes.remote_root_collisions([r for _, r, _ in placed.values()]):
         text = nodes.remote_root_collision_text(group)
         for recipe in group:
             clash[recipe.sid] = text
     outcomes: dict[str, NodeBringUpOutcome] = {}
     for proj in projects:
         sid = nodes.node_sid(proj)
-        if sid in clash:
+        if sid in clash and not placed[sid][2]:
             get_logger("nodes").warning("node project %s refused: %s", sid, clash[sid])
             outcomes[sid] = NodeBringUpOutcome(
                 ok=False, sid=sid, node=placed[sid][0], error=clash[sid]
@@ -1903,7 +1917,11 @@ def _run_node_bring_ups(
                 for proj in go
             ]
             for proj, future in zip(go, futures, strict=True):
-                outcomes[nodes.node_sid(proj)] = future.result()
+                sid = nodes.node_sid(proj)
+                outcome = future.result()
+                if sid in clash:  # the folder's recorded holder
+                    outcome = replace(outcome, warnings=(*outcome.warnings, clash[sid]))
+                outcomes[sid] = outcome
     return [outcomes[nodes.node_sid(proj)] for proj in projects]
 
 
