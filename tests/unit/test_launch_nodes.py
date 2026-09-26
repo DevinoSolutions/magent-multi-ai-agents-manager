@@ -4,15 +4,20 @@ faked at remote_mux's seam, so nothing here dials anything."""
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
 
-from magent import attach_client, launch, lockfile, nodes, remote_mux
+from magent import attach_client, launch, lockfile, node_scripts, nodes, remote_mux
 from magent.config import MagentConfig, NodeConfig, ProjectConfig, Settings
 from magent.nodes import LocalGitState, NodeMapEntry
 from magent.remote_mux import BringUpResult, RemoteError
 from tests.conftest import FakePlatform
+
+# The real body, captured before any NodeRig replaces it: the tests below put
+# it back to drive the whole chain through THE fake ssh.
+real_provision_node = remote_mux.provision_node
 
 _TOOLS = {"claude": "claude --continue"}
 
@@ -69,6 +74,9 @@ class NodeRig:
         )
         monkeypatch.setattr("magent.attach_client.spawn_attach_window", self._window)
         self.error: Exception | None = None
+        self.provisioned: list[str] = []
+        monkeypatch.setattr(remote_mux, "provision_node", self._provision)
+        monkeypatch.setattr(launch, "_PROVISIONED", set())
 
     def _bring_up(self, node, recipe, *, allow_dirty=False, resume_id=None):
         self.recipes.append((node.nick, recipe))
@@ -87,6 +95,10 @@ class NodeRig:
             (target, sid, mux, remote or attach_client.remote_attach_command(sid, mux))
         )
         return f"magent:{sid}"
+
+    def _provision(self, node, config, *, home, timeout_s, force=False):
+        self.provisioned.append(node.nick)
+        return remote_mux.ProvisionReport(())
 
 
 @pytest.fixture
@@ -385,3 +397,83 @@ class TestASessionThatCameUpButWasNotRecordedIsUp:
         )
         assert launch.bring_up_node_project(_config(api), api, window=True).ok
         assert [w[1] for w in rig.windows] == ["api"]
+
+
+def _web(tmp_path: Path, rig: NodeRig) -> ProjectConfig:
+    folder = tmp_path / "web"
+    folder.mkdir()
+    rig.states[folder] = _state(folder)
+    return ProjectConfig(path=str(folder), node="second")
+
+
+class TestTheBringUpProvisionsFirst:
+    def test_the_node_is_provisioned_before_the_session_comes_up(
+        self, rig, api, fake_ssh, monkeypatch
+    ):
+        monkeypatch.setattr(remote_mux, "provision_node", real_provision_node)
+        seen_at_bring_up: list[int] = []
+
+        def bring_up(node, recipe, **kw):
+            seen_at_bring_up.append(len(fake_ssh.calls()))
+            return rig._bring_up(node, recipe, **kw)
+
+        monkeypatch.setattr(remote_mux, "bring_up", bring_up)
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert outcome.ok
+        assert seen_at_bring_up == [1]
+        (call,) = fake_ssh.calls()
+        assert any("devino-second" in arg for arg in call.argv)
+        assert call.stdin.startswith(node_scripts.script("provision").encode("utf-8"))
+        assert "second" in launch._PROVISIONED
+
+    def test_a_second_project_on_the_same_node_does_not_provision_again(
+        self, rig, api, fake_ssh, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(remote_mux, "provision_node", real_provision_node)
+        web = _web(tmp_path, rig)
+        config = _config(api, web)
+        assert launch.bring_up_node_project(config, api).ok
+        assert launch.bring_up_node_project(config, web).ok
+        assert len(fake_ssh.calls()) == 1
+        assert [nick for nick, _ in rig.recipes] == ["second", "second"]
+
+    def test_an_unreachable_node_fails_only_that_project_and_is_retried(
+        self, rig, api, fake_ssh, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(remote_mux, "provision_node", real_provision_node)
+        fake_ssh.set_reply(
+            "bash -s", stderr="ssh: connect to host devino-second: No route\n", rc=255
+        )
+        web = _web(tmp_path, rig)
+        config = _config(api, web)
+        outcome = launch.bring_up_node_project(config, api)
+        assert not outcome.ok
+        assert "No route" in (outcome.error or "")
+        assert rig.recipes == []
+        assert "second" not in launch._PROVISIONED
+        # The node answers again: the NEXT project on it provisions, rather
+        # than taking the failed attempt as done.
+        (fake_ssh.base / "replies.json").unlink()
+        assert launch.bring_up_node_project(config, web).ok
+        assert len(fake_ssh.calls()) == 2
+        assert "second" in launch._PROVISIONED
+
+    def test_a_fail_row_is_logged_and_the_session_still_comes_up(
+        self, rig, api, fake_ssh, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(remote_mux, "provision_node", real_provision_node)
+        fake_ssh.set_reply("bash -s", stdout="fail\tgh\tgh is not installed\n", rc=1)
+        with caplog.at_level(logging.WARNING, logger="magent.nodes"):
+            outcome = launch.bring_up_node_project(_config(api), api)
+        assert outcome.ok
+        assert [nick for nick, _ in rig.recipes] == ["second"]
+        assert "second" in launch._PROVISIONED
+        assert (
+            "magent.nodes",
+            logging.WARNING,
+            "provision second: gh: gh is not installed",
+        ) in caplog.record_tuples
+
+    # D-MERGE: test_dry_run_provisions_nothing (plan F Task 12A) lands with
+    # sub-plan D's Task 12: it needs D12's `desk` / `no_sleep` fixtures and its
+    # "would provision <nick>" dry-run line, neither of which exists yet.

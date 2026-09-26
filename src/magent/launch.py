@@ -1466,15 +1466,30 @@ _PROVISIONED: set[str] = set()
 
 
 def _provision_once(node: Node, config: MagentConfig) -> None:
-    """Make ``node`` able to run a project, at most once per process. Body
-    landed by PR-F (DECISION-24): ``remote_mux.provision_node(node, config,
-    home=Path.home(), timeout_s=remote_mux.PROVISION_TIMEOUT_S)``. Until then a
-    pool machine is provisioned by hand and this only records that it was
-    asked; ``config`` is here from day one so K needs no signature change.
+    """Make ``node`` able to run a project, at most once per process. Runs
+    ``remote_mux.provision_node`` (DECISION-24) and records the node only once
+    that call returns: an unreachable node raises ``RemoteError``, and the
+    next project on it retries. ``config`` is here from day one so K needs no
+    signature change.
     Called under the node's lock, after every refusal -- a refused project
     never provisions anything, and ``--dry-run`` never calls it."""
-    del config  # PR-F's body reads it
+    if node.nick in _PROVISIONED:
+        return
+    # heavy subsystem: in-body per policy (remote_mux: ssh + tar)
+    from magent import remote_mux
+
+    report = remote_mux.provision_node(
+        node, config, home=Path.home(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+    )
+    # Recorded only after a provision that reached the node: an unreachable
+    # node raises above and the next project on it tries again.
     _PROVISIONED.add(node.nick)
+    for line in report.lines:
+        if line.status == "fail":
+            # A fail row never blocks the session (F3); node doctor shows it.
+            get_logger("nodes").warning(
+                "provision %s: %s: %s", node.nick, line.item, line.detail
+            )
 
 
 def _node_project_dir(config: MagentConfig, proj: ProjectConfig) -> Path | None:

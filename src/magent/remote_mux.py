@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from magent import node_scripts, psmux
+from magent import node_scripts, nodes, psmux
 
 # find_ssh is bound by value, not read off attach_client at call time: the
 # conftest guard answers None for attach_client.find_ssh, and this module's own
@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     from collections.abc import Collection, Iterable, Mapping, Sequence
     from typing import IO
 
+    from magent.config import MagentConfig
     from magent.nodes import Node, Recipe, UserScope
 
 # tmux, not psmux: nodes are Linux. One server per node user (`-L magent`,
@@ -728,6 +729,25 @@ def provision(
         for name in sorted(user_scope.mcp_servers)
     )
     return ProvisionReport((*notes, *shipped, *probe_failed, *report.lines))
+
+
+def provision_node(
+    node: Node,
+    config: MagentConfig,
+    *,
+    home: Path,
+    timeout_s: float,
+    force: bool = False,
+) -> ProvisionReport:
+    """THE provisioning body (DECISION-24): ``magent node setup`` and
+    ``launch._provision_once`` both call it. Builds the user scope from
+    ``home`` -- the one place src builds one; plan K swaps that line for its
+    relay seam and drops the ``del`` above it -- then hands it to
+    ``provision``, which probes the node's programs only when a stdio server
+    is in the scope. ``config`` is unread until K lands. Raises RemoteError
+    when the node is unreachable; a failed step is a ``fail`` row."""
+    del config  # plan K's relay swap reads config.settings
+    return provision(node, nodes.user_scope(home), timeout_s=timeout_s, force=force)
 
 
 def has_session(node: Node, sid: str) -> bool | None:
