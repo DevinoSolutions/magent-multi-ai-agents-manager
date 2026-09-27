@@ -125,6 +125,34 @@ class TestInstall:
         assert ours == ["C:/new/magent-state-hook.EXE --source claude"]
         assert "node notify.mjs" in cmds  # foreign hook untouched
 
+    def test_unc_console_script_is_repaired(self, runner, tmp_path, monkeypatch):
+        # A pre-3.1.2 --user install under a folder-redirected AppData wrote a
+        # UNC path: no drive letter, and bash eats it all the same -- so unlike
+        # the module-form swap, the console-script rewrite needs no drive letter.
+        monkeypatch.setattr(
+            hooks_cmd.shutil, "which", lambda _: "C:/new/magent-state-hook.EXE"
+        )
+        stale = (
+            r"\\corp-fs\home$\me\AppData\Roaming\Python\Python314\Scripts"
+            r"\magent-state-hook.exe --source claude"
+        )
+        settings = tmp_path / "settings.json"
+        settings.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "Stop": [{"hooks": [{"type": "command", "command": stale}]}]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = _install(runner, settings)
+        assert "Repaired" in result.output
+        data = json.loads(settings.read_text(encoding="utf-8"))
+        cmds = [h["command"] for e in data["hooks"]["Stop"] for h in e["hooks"]]
+        assert cmds == ["C:/new/magent-state-hook.EXE --source claude"]
+
     def test_reinstall_healthy_reports_already_wired(self, runner, tmp_path):
         settings = tmp_path / "settings.json"
         _install(runner, settings)
