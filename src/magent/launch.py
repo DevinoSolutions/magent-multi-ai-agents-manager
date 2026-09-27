@@ -1781,9 +1781,17 @@ def _provision_once(node: Node, config: MagentConfig) -> None:
         raise
     _PROVISIONED.add(node.nick)
     for line in report.lines:
-        if line.status == "fail":
-            # A fail row never blocks the session (F3); node doctor shows it.
-            log.warning("provision %s: %s: %s", node.nick, line.item, line.detail)
+        if line.status in ("warn", "fail"):
+            # A fail row never blocks the session (F3), and neither row
+            # reaches the screen -- node doctor shows the node's; nodes.log
+            # keeps both, this PC's gh row included.
+            log.warning(
+                "provision %s: %s %s: %s",
+                node.nick,
+                line.status,
+                line.item,
+                line.detail,
+            )
 
 
 def _node_project_dir(config: MagentConfig, proj: ProjectConfig) -> Path | None:

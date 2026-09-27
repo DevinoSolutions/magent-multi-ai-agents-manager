@@ -39,6 +39,7 @@ from magent.nodes import LocalGitState, NodeMapEntry
 from magent.remote_mux import BringUpResult, RemoteError
 from tests.conftest import FakePlatform
 from tests.unit._deny_stat import deny_stat
+from tests.unit._fake_ssh import gh_auth_status
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -3337,7 +3338,8 @@ class TestTheBringUpProvisionsFirst:
         assert outcome.ok
         assert [nick for nick, _ in rig.recipes] == ["second"]
         assert "second" in launch._PROVISIONED
-        # Only the fail row is news; ok/warn/skip rows are node doctor's.
+        # The warn and fail rows are news for nodes.log, in the node's order;
+        # ok/skip rows are node doctor's. The screen shows none of them.
         assert [
             (logger, level, message)
             for logger, level, message in caplog.record_tuples
@@ -3346,9 +3348,38 @@ class TestTheBringUpProvisionsFirst:
             (
                 "magent.nodes",
                 logging.WARNING,
-                "provision second: gh: gh is not installed",
-            )
+                "provision second: warn plugin: marketplace slow",
+            ),
+            (
+                "magent.nodes",
+                logging.WARNING,
+                "provision second: fail gh: gh is not installed",
+            ),
         ]
+
+    def test_this_pcs_gh_warn_row_reaches_nodes_log_on_the_go_path(
+        self, rig, api, fake_ssh, fake_gh, monkeypatch, caplog, capsys
+    ):
+        # The gh row is this PC's, not the node's: a login gh could not verify
+        # (offline) is shared anyway, and says so. `node setup` prints it; a
+        # bring-up keeps F17's quiet screen, so nodes.log is where it lands.
+        token = "gho_FAKE0123456789abcdefTOKEN"
+        monkeypatch.setattr(remote_mux, "provision_node", real_provision_node)
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(None, accounts=[("amin", True, "timeout")]),
+        )
+        fake_gh.set_reply("auth token", stdout=token + "\n")
+        with caplog.at_level(logging.WARNING, logger="magent.nodes"):
+            outcome = launch.bring_up_node_project(_config(api), api)
+        assert outcome.ok
+        assert (
+            "magent.nodes",
+            logging.WARNING,
+            f"provision second: warn gh: {remote_mux.GH_SHARED_UNVERIFIED}",
+        ) in caplog.record_tuples
+        assert token not in caplog.text
+        assert remote_mux.GH_SHARED_UNVERIFIED not in capsys.readouterr().out
 
     def test_dry_run_provisions_nothing(
         self, rig, api, fake_ssh, desk, no_sleep, capsys
