@@ -1427,6 +1427,41 @@ class TestTheWatermark:
         assert _marks() == {"api": {"since": 10.0, "realpath": "/r"}}
         assert (state / "gone.json").exists()
 
+    @pytest.mark.parametrize(
+        ("resume", "held"),
+        [({"api": 50.0}, math.nextafter(50.0, -math.inf)), ({}, 10.0)],
+        ids=["resume", "no-resume"],
+    )
+    def test_a_truncated_tick_asks_again_for_the_files_it_still_owes(
+        self, placed, resume, held
+    ):
+        """cq-G14 I-R2-1: the daemon shares remote_mux.next_since's rule --
+        just under the first owed file, or held without a resume point."""
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"), {"api": {"since": 10.0, "realpath": "/r"}}
+        )
+        asked: list[float] = []
+        replies = iter(
+            [
+                _snapshot(
+                    realpaths={"api": "/r"},
+                    truncated={"api": ("api/transcripts/a.jsonl",)},
+                    resume=resume,
+                ),
+                _snapshot(realpaths={"api": "/r"}),
+            ]
+        )
+
+        def pull(_node, sids):
+            asked.append(sids["api"].since)
+            return next(replies)
+
+        syncer = node_sync.NodeSyncer(_second_only(), pull=pull)
+        syncer.tick()
+        assert _marks() == {"api": {"since": held, "realpath": "/r"}}
+        syncer.tick()
+        assert asked == [10.0, held]
+
     def test_marks_are_dropped_for_sessions_no_longer_placed(self, placed, fake_ssh):
         nodes.write_json_atomic(
             nodes.pull_marks_path("second"), {"gone": {"since": 5.0, "realpath": "/g"}}
@@ -2901,6 +2936,11 @@ class TestTheFinalPull:
         nodes.write_node_map({"api": _entry("second", sid)})
         with pytest.raises(remote_mux.RemoteError) as info:
             node_sync.final_pull(_config(), "api", local_user="amin")
+        assert not isinstance(info.value, node_sync.PullUnfinished)
+        # cq-G14 C-R3-1: a refusal made here, never a node's unreadable answer
+        # -- the recall goes on after the first and stops on the second.
+        assert isinstance(info.value, remote_mux.PullRefused)
+        assert not isinstance(info.value, remote_mux.NotAPull)
         assert info.value.rc == 0
         assert info.value.stderr_tail == f"not a pullable session name: {sid!r}"
         assert info.value.command_redacted == _pull_shown(sid, f"~/magent/{sid}")
@@ -2983,10 +3023,14 @@ class TestAFinalPullThatDidNotFinish:
             meta=pull_meta(realpaths={"api": _REAL}),
             files={"api/transcripts/abc.jsonl": "x\n"},
         )
-        with pytest.raises(remote_mux.RemoteError) as info:
+        with pytest.raises(node_sync.PullUnfinished) as info:
             node_sync.final_pull(_config(), "api")
         assert info.value.rc == 0
-        assert info.value.stderr_tail == "could not store every pulled file of 'api'"
+        assert info.value.stderr_tail == (
+            "the pull did not finish: a file of session 'api' could not be stored"
+            " on this PC"
+        )
+        assert info.value.not_stored is True
         assert info.value.command_redacted == ("pull.sh",)
 
     def test_a_store_failure_on_the_second_call_raises_too(self, placed, monkeypatch):
@@ -2995,7 +3039,7 @@ class TestAFinalPullThatDidNotFinish:
             _snapshot(realpaths={"api": _REAL}),
             _snapshot(realpaths={"api": _REAL}, failed_sids=frozenset({"api"})),
         )
-        with pytest.raises(remote_mux.RemoteError, match="could not store"):
+        with pytest.raises(node_sync.PullUnfinished, match="could not be stored"):
             node_sync.final_pull(_config(), "api")
 
     def test_a_store_failure_on_the_first_call_raises_after_a_clean_second(
@@ -3008,7 +3052,7 @@ class TestAFinalPullThatDidNotFinish:
             _snapshot(realpaths={"api": _REAL}, failed_sids=frozenset({"api"})),
             _snapshot(realpaths={"api": _REAL}),
         )
-        with pytest.raises(remote_mux.RemoteError, match="could not store"):
+        with pytest.raises(node_sync.PullUnfinished, match="could not be stored"):
             node_sync.final_pull(_config(), "api")
         assert len(asked) == 2
 
@@ -3075,7 +3119,7 @@ class TestAFinalPullThatDidNotFinish:
                 truncated={"api": ("api/transcripts/owed.jsonl",)},
             ),
         )
-        with pytest.raises(remote_mux.RemoteError, match="without moving its mark"):
+        with pytest.raises(node_sync.PullUnfinished, match="without moving its mark"):
             node_sync.final_pull(_config(), "api", wait_s=1e9)
         assert len(asked) == 2
         assert _marks() == {
@@ -3096,12 +3140,14 @@ class TestAFinalPullThatDidNotFinish:
             resume={"api": 50.0},
         )
         asked = _scripted_pull(monkeypatch, _cut(500.0), clock_back)
-        with pytest.raises(remote_mux.RemoteError) as info:
+        with pytest.raises(node_sync.PullUnfinished) as info:
             node_sync.final_pull(_config(), "api", wait_s=1e9)
         assert info.value.stderr_tail == (
-            "the reply for 'api' reached the pull cap and moved its mark back;"
-            " the rest is owed"
+            "the pull did not finish: 1 file(s) did not fit in the reply and are"
+            " still on the node (the reply reached the pull cap and moved its mark"
+            " back)"
         )
+        assert info.value.not_stored is False
         assert len(asked) == 2
 
     def test_a_reply_still_cut_at_the_deadline_raises_with_the_mark_at_its_resume(
@@ -3116,7 +3162,7 @@ class TestAFinalPullThatDidNotFinish:
             monkeypatch, _cut(500.0), _cut(800.0), _cut(900.0), clock=clock
         )
         with pytest.raises(
-            remote_mux.RemoteError, match="still cut when the deadline passed"
+            node_sync.PullUnfinished, match="still cut when the deadline passed"
         ) as info:
             node_sync.final_pull(_config(), "api", wait_s=100.0, now=clock)
         assert info.value.rc == 0
@@ -3162,7 +3208,7 @@ class TestAFinalPullThatDidNotFinish:
             ),
         )
         with pytest.raises(
-            remote_mux.RemoteError, match="without moving its mark"
+            node_sync.PullUnfinished, match="without moving its mark"
         ) as info:
             node_sync.final_pull(_config(), "api", wait_s=1e9)
         assert info.value.rc == 0
@@ -3231,7 +3277,7 @@ class TestAFinalPullThatDidNotFinish:
                 failed_sids=frozenset({"api"}),
             ),
         )
-        with pytest.raises(remote_mux.RemoteError):
+        with pytest.raises(node_sync.PullUnfinished):
             node_sync.final_pull(_config(), "api")
         assert gone.exists()
 
@@ -3665,3 +3711,109 @@ class TestJsonNestedTooDeeply:
         assert results["second"] == (node_sync.OK, "")
         assert asked["second"]["api"].since == 0.0
         assert _node_errors(caplog) == []
+
+
+class TestAFinalPullThatDidNotFinishIsNotASuccess:
+    """cq-G14 I1: the caller clears a placement after the last pull, and a
+    cleared placement is never pulled again -- so a pull that left something
+    behind on the node raises instead of returning as if it had finished."""
+
+    @pytest.fixture
+    def answers(self, placed, monkeypatch):
+        """The node answers every pull with the snapshot fields given; its
+        directory is already known, so each final pull is one call."""
+        nodes.write_json_atomic(
+            nodes.pull_marks_path("second"),
+            {"api": {"since": 10.0, "realpath": "/home/amin/magent/api"}},
+        )
+
+        def load(**over):
+            snap = _snapshot(
+                sessions=("api",), realpaths={"api": "/home/amin/magent/api"}, **over
+            )
+            monkeypatch.setattr(node_sync, "_pull_node", lambda node, sids: snap)
+
+        return load
+
+    def test_a_file_that_could_not_be_stored_here_raises(self, answers):
+        answers(failed_sids=frozenset({"api"}))
+        # cq-G14 m1: its own type -- rc 0 also means a refusal made on this PC
+        # and an answer that was not a pull, which a caller must not confuse.
+        with pytest.raises(node_sync.PullUnfinished) as info:
+            node_sync.final_pull(_config(), "api")
+        assert isinstance(info.value, remote_mux.RemoteError)
+        assert info.value.rc == 0
+        assert info.value.stderr_tail == (
+            "the pull did not finish: a file of session 'api' could not be stored"
+            " on this PC"
+        )
+        # cq-G14 m-R3-2: the bare reason and its cause, for a caller's remedy.
+        assert (
+            info.value.why == "a file of session 'api' could not be stored on this PC"
+        )
+        assert info.value.not_stored is True
+        # The watermark held, so the next pull asks for that file again.
+        assert _marks()["api"] == {"since": 10.0, "realpath": "/home/amin/magent/api"}
+
+    def test_files_the_reply_had_no_room_for_raise_naming_how_many(self, answers):
+        answers(
+            truncated={"api": ("api/transcripts/a.jsonl", "api/transcripts/b.jsonl")},
+            resume={"api": 50.0},
+        )
+        with pytest.raises(node_sync.PullUnfinished) as info:
+            node_sync.final_pull(_config(), "api")
+        assert info.value.rc == 0
+        assert (
+            "2 file(s) did not fit in the reply and are still on the node"
+            in info.value.stderr_tail
+        )
+        assert info.value.why == (
+            "2 file(s) did not fit in the reply and are still on the node"
+            " (the reply reached the pull cap without moving its mark)"
+        )
+        assert info.value.not_stored is False
+        # cq-G14 I-R2-1: saved BEFORE the raise, and just under the first file
+        # still owed -- the node's clock would put the owed files behind the
+        # watermark, and no later pull would ask for them.
+        assert _marks()["api"] == {
+            "since": math.nextafter(50.0, -math.inf),
+            "realpath": "/home/amin/magent/api",
+        }
+
+    @pytest.mark.parametrize(
+        ("first", "second"),
+        [
+            ({"failed_sids": frozenset({"api"})}, {}),
+            (
+                {},
+                {"truncated": {"api": ("api/transcripts/a.jsonl",)}},
+            ),
+        ],
+        ids=["first-call", "second-call"],
+    )
+    def test_either_call_of_a_first_sight_pull_can_leave_it_unfinished(
+        self, placed, monkeypatch, first, second
+    ):
+        """cq-G14 m3 (N3a/N3b): a directory seen for the first time takes two
+        calls, and what EITHER left behind makes the pull unfinished."""
+        real = "/home/amin/magent/api"
+        replies = iter(
+            [
+                _snapshot(sessions=("api",), realpaths={"api": real}, **first),
+                _snapshot(sessions=("api",), realpaths={"api": real}, **second),
+            ]
+        )
+        asked: list[str | None] = []
+
+        def pull(_node, sids):
+            asked.append(sids["api"].project_dir)
+            return next(replies)
+
+        monkeypatch.setattr(node_sync, "_pull_node", pull)
+        with pytest.raises(node_sync.PullUnfinished):
+            node_sync.final_pull(_config(), "api")
+        assert asked == [None, encoded_project_dir(real)]
+
+    def test_another_sessions_failure_is_not_this_ones(self, answers):
+        answers(failed_sids=frozenset({"web"}), truncated={"web": ("w",)})
+        assert node_sync.final_pull(_config(), "api") is not None

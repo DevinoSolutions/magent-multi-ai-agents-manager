@@ -158,7 +158,15 @@ HELP_SNAPSHOTS = {
     ): "Usage: main config path [OPTIONS]\n\n  Print the config file path.\n\nOptions:\n  --help  Show this message and exit.\n",
     (
         "node",
-    ): "Usage: main node [OPTIONS] COMMAND [ARGS]...\n\n  Run projects on a pool of Linux machines over ssh.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  sync  Mirror every node's sessions, load and agent state onto this PC.\n",
+    ): "Usage: main node [OPTIONS] COMMAND [ARGS]...\n\n  Run projects on a pool of Linux machines over ssh.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  plan    Show where a node project would run.\n  recall  Bring a node session home and print the command that resumes it.\n  sync    Mirror every node's sessions, load and agent state onto this PC.\n",
+    (
+        "node",
+        "plan",
+    ): "Usage: main node plan [OPTIONS] [PROJECT]\n\n  Show where a node project would run. Writes nothing.\n\n  The same placement a launch makes -- the node-map, the load history and, for a\n  node with too few recent samples, one live reading -- but nothing is recorded\n  and nothing is started.\n\nOptions:\n  --all   Every enabled node project.\n  --help  Show this message and exit.\n",
+    (
+        "node",
+        "recall",
+    ): "Usage: main node recall [OPTIONS] PROJECT\n\n  Bring a node session home and print the command that resumes it.\n\n  Pulls once more, reports the node's last commit per repo, stops the session,\n  installs its conversation and memory where this machine's Claude looks, and\n  clears the placement. A node that does not answer is reported, never fatal:\n  what was already pulled is used.\n\nOptions:\n  --local  Bring the session home and print the command that resumes it.\n  --help   Show this message and exit.\n",
     (
         "node",
         "sync",
@@ -188,7 +196,7 @@ TOP_LEVEL_COMMANDS = [
     "watch",
 ]
 TERMINAL_SUBCOMMANDS = ["install", "status"]
-NODE_SUBCOMMANDS = ["sync"]
+NODE_SUBCOMMANDS = ["plan", "recall", "sync"]
 CONFIG_SUBCOMMANDS = [
     "add",
     "base-dir",

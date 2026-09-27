@@ -23,7 +23,7 @@ import tempfile
 import threading
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
@@ -36,7 +36,7 @@ from magent.sessions.claude import encode_claude_project_path
 from magent.titles import get_leaf_name
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
     from magent.config import MagentConfig, ProjectConfig
 
@@ -193,6 +193,20 @@ def encoded_project_dir(path: str) -> str:
     return encode_claude_project_path(path)
 
 
+def _epoch(value: object) -> float | None:
+    """A timestamp read back from JSON, as a finite float, or None. bool is an
+    int subclass (`"ts": true` is corruption, not 1.0); json.loads accepts
+    NaN/Infinity and arbitrarily long integers, and neither is a time --
+    float() of a 309+-digit int raises instead of saturating."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        out = float(value)
+    except OverflowError:
+        return None
+    return out if math.isfinite(out) else None
+
+
 def _map_entry(raw: object) -> NodeMapEntry | None:
     if not isinstance(raw, dict):
         return None
@@ -200,18 +214,8 @@ def _map_entry(raw: object) -> NodeMapEntry | None:
     ts, attached = raw.get("placed_ts"), raw.get("attached_existing")
     if not (isinstance(nick, str) and isinstance(sid, str) and isinstance(root, str)):
         return None
-    # bool is an int subclass: `"placed_ts": true` is corruption, not 1.0.
-    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
-        return None
-    if not isinstance(attached, bool):
-        return None
-    # json.loads accepts NaN/Infinity and arbitrarily long integers; neither is
-    # a time. float() of a 309+-digit int raises instead of saturating.
-    try:
-        placed_ts = float(ts)
-    except OverflowError:
-        return None
-    if not math.isfinite(placed_ts):
+    placed_ts = _epoch(ts)
+    if placed_ts is None or not isinstance(attached, bool):
         return None
     target, cwd = raw.get("target", ""), raw.get("cwd", "")
     return NodeMapEntry(
@@ -588,6 +592,44 @@ def resolve(
 # Every path reads NODES_DIR at CALL time (never a second import-bound Path),
 # so the test-isolation redirect of NODES_DIR covers all of them.
 
+# A session directory sits beside these per-node files; no sid may take a name.
+_RESERVED_NAMES = frozenset(
+    {"sessions.json", "load.jsonl", "pull.json", "node-map.json"}
+)
+# Every path part must be a legal file name on THIS PC, which may be Windows.
+_UNSAFE_CHARS = re.compile(r'[\x00-\x1f<>:"/\\|?*]')
+# ntpath's reserved set on 3.13 (ntpath.isreserved is 3.13+, so it is copied):
+# the superscript digits count as COM/LPT numbers too.
+_DEVICE_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CONIN$",
+        "CONOUT$",
+        *(f"COM{c}" for c in "123456789¹²³"),
+        *(f"LPT{c}" for c in "123456789¹²³"),
+    }
+)
+
+
+def _safe_part(part: str) -> bool:
+    # A part ending in "." or " " is refused outright (Windows drops them), so
+    # the device check needs only ntpath's: the stem before the FIRST dot,
+    # trailing spaces dropped -- "CON .jsonl" opens the console.
+    return (
+        part not in ("", ".", "..")
+        and _UNSAFE_CHARS.search(part) is None
+        and not part.endswith((".", " "))
+        and part.split(".", 1)[0].rstrip(" ").upper() not in _DEVICE_NAMES
+    )
+
+
+def pullable_sid(sid: str) -> bool:
+    """Can ``sid`` name a directory under ``~/.magent/nodes/<nick>/`` here?"""
+    return _safe_part(sid) and sid not in _RESERVED_NAMES
+
 
 def node_dir(nick: str, *, nodes_dir: Path | None = None) -> Path:
     return (nodes_dir if nodes_dir is not None else NODES_DIR) / nick
@@ -599,14 +641,14 @@ def transcripts_dir(nick: str, sid: str, *, nodes_dir: Path | None = None) -> Pa
     ``sid`` is joined VERBATIM: ``psmux.session_name`` keeps ``/`` and ``\\``,
     so a node-map sid like ``/etc`` would resolve outside the node dir --
     callers (the attention reader, recall) pass it through
-    ``remote_mux.pullable_sid`` first."""
+    ``pullable_sid`` first."""
     return node_dir(nick, nodes_dir=nodes_dir) / sid / "transcripts"
 
 
 def state_dir(nick: str, sid: str, *, nodes_dir: Path | None = None) -> Path:
     """Where the daemon mirrors a node session's agent-state records.
     ``sid`` is joined VERBATIM, exactly as in ``transcripts_dir``: callers
-    pass a node-map sid through ``remote_mux.pullable_sid`` first."""
+    pass a node-map sid through ``pullable_sid`` first."""
     return node_dir(nick, nodes_dir=nodes_dir) / sid / "state"
 
 
@@ -1583,3 +1625,416 @@ def session_rows(config: MagentConfig, *, now: float) -> list[dict[str, object]]
             )
         rows.append({"name": name, "session": sid, "node": nick, "state": state})
     return rows
+
+
+# --- placement for "node": "auto" (spec §11) -----------------------------------
+
+# The auto sentinel is config.NODE_AUTO (B, DECISION-10/22); nodes has no copy.
+# "cloud" is never a candidate: config refuses a pool entry named "cloud", so
+# `place`, which only walks settings.nodes, cannot reach it.
+PLACEMENT_WINDOW_S = 30 * 60
+MIN_WINDOW_SAMPLES = 5
+SPIKE_WEIGHT = 0.5
+SPIKE_RATIO = 1.5
+MEM_WEIGHT = 0.5
+MEM_FLOOR = 0.15
+# DECISION-11: under 10 % free (newest sample) a node is not eligible at all
+# while any other node is above it -- the soft MEM term alone is at most 0.075.
+MEM_HARD_FLOOR = 0.10
+SESSION_WEIGHT = 0.05
+
+
+@dataclass(frozen=True)
+class NodeScore:
+    """One node's §11 score and the terms it is made of (``node plan`` prints
+    every one of them). ``live`` marks a score taken from a live sample;
+    ``below_floor`` a node under ``MEM_HARD_FLOOR`` free memory."""
+
+    nick: str
+    samples: int
+    p75: float
+    spike: float
+    mem: float
+    my_sessions: int
+    score: float
+    live: bool = False
+    below_floor: bool = False
+
+
+def _load_sample(line: str) -> LoadSample | None:
+    try:
+        row = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(row, dict):
+        return None
+    try:
+        sample = LoadSample(
+            ts=float(row["ts"]),
+            nproc=int(row["nproc"]),
+            load1=float(row["load1"]),
+            load5=float(row["load5"]),
+            load15=float(row["load15"]),
+            mem_total_mb=int(row["mem_total_mb"]),
+            mem_avail_mb=int(row["mem_avail_mb"]),
+            my_sessions=int(row["my_sessions"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    return sample
+
+
+def parse_load_lines(lines: Iterable[str]) -> list[LoadSample]:
+    """LoadSamples out of ``load.jsonl`` lines. A malformed line is skipped:
+    the daemon appends while a reader reads, so a torn last line is normal."""
+    return [s for s in (_load_sample(line) for line in lines) if s is not None]
+
+
+def read_load_history(nick: str, *, nodes_dir: Path | None = None) -> list[LoadSample]:
+    """Every sample the daemon kept for ``nick`` (``<nick>/load.jsonl``), or
+    [] when it never sampled that node."""
+    path = load_path(nick, nodes_dir=nodes_dir)  # E's (DECISION-19): one layout owner
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return parse_load_lines(text.splitlines())
+
+
+def in_window(samples: Iterable[LoadSample], *, now: float) -> list[LoadSample]:
+    """The samples placement may use: the last ``PLACEMENT_WINDOW_S``. No
+    upper bound, so a node whose clock runs ahead is not thrown away."""
+    start = now - PLACEMENT_WINDOW_S
+    return [s for s in samples if s.ts >= start]
+
+
+def _p75(values: Sequence[float]) -> float:
+    """75th percentile, linear between the closest ranks (what
+    ``statistics.quantiles(method="inclusive")`` returns -- written out because
+    that needs two points and one live sample is a legitimate window)."""
+    ordered = sorted(values)
+    pos = 0.75 * (len(ordered) - 1)
+    low = int(pos)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (pos - low)
+
+
+def score_node(
+    nick: str,
+    window: Sequence[LoadSample],
+    *,
+    extra_sessions: int = 0,
+    live: bool = False,
+) -> NodeScore | None:
+    """Spec §11 over one node's window; None when there is nothing to score.
+
+    Load is per core, so a 32-core box at load 8 reads as quiet. Memory and my
+    session count come from the NEWEST sample: they are levels, not rates.
+    ``extra_sessions`` counts projects this same pass already put here.
+    """
+    if not window:
+        return None
+    usage = [s.load1 / max(s.nproc, 1) for s in window]
+    p75 = _p75(usage)
+    spike = SPIKE_WEIGHT * max(0.0, max(usage) - SPIKE_RATIO * p75)
+    latest = max(window, key=lambda s: s.ts)
+    mem = 0.0
+    below_floor = False
+    if latest.mem_total_mb > 0:
+        free = latest.mem_avail_mb / latest.mem_total_mb
+        mem = MEM_WEIGHT * max(0.0, MEM_FLOOR - free)
+        below_floor = free < MEM_HARD_FLOOR
+    mine = latest.my_sessions + extra_sessions
+    return NodeScore(
+        nick=nick,
+        samples=len(window),
+        p75=p75,
+        spike=spike,
+        mem=mem,
+        my_sessions=mine,
+        score=p75 + spike + mem + SESSION_WEIGHT * mine,
+        live=live,
+        below_floor=below_floor,
+    )
+
+
+# Why a placement came out the way it did -- a closed vocabulary, printed by
+# `magent node plan` and the launch notes.
+PLACE_REASONS: dict[str, str] = {
+    "kept": "already placed there (node-map.json)",
+    "re-placed": "its node left settings.nodes; placed again by load",
+    "placed": "lowest load score over the last 30 minutes",
+    "no-data": "no node has load samples to score",
+}
+
+
+@dataclass(frozen=True)
+class Placement:
+    """Where an ``auto`` project goes, why, and every score behind it.
+    ``nick`` is None only for ``no-data``. ``note`` is a line to print."""
+
+    nick: str | None
+    reason: str
+    scores: tuple[NodeScore, ...] = ()
+    note: str | None = None
+
+
+def place(
+    config: MagentConfig,
+    samples: Mapping[str, Sequence[LoadSample]],
+    *,
+    now: float,
+    map_entry: str | None,
+    placed: Mapping[str, int] | None = None,
+    live: frozenset[str] = frozenset(),
+) -> Placement:
+    """Spec §11: the lowest score over the last 30 minutes wins; ties go to
+    the node listed first in ``settings.nodes``. A node under
+    ``MEM_HARD_FLOOR`` free memory is not a candidate while any other scored
+    node is above it; when all are below, the score alone decides.
+
+    Pure: it never talks to a node (``placement_samples`` owns the one live
+    reading a sparse node gets). ``map_entry`` is the nick node-map.json already
+    holds for the project -- it wins while that nick is still configured.
+    ``placed`` counts projects this same pass already put on a node, so a batch
+    spreads instead of piling onto one box before its next sample. ``live``
+    names the nodes whose only sample is a live one.
+    """
+    nicks = list(config.settings.nodes)
+    extra = placed or {}
+    scored = tuple(
+        score
+        for nick in nicks
+        if (
+            score := score_node(
+                nick,
+                in_window(samples.get(nick, ()), now=now),
+                extra_sessions=extra.get(nick, 0),
+                live=nick in live,
+            )
+        )
+        is not None
+    )
+    if map_entry is not None and map_entry in config.settings.nodes:
+        return Placement(map_entry, "kept", scored)
+    vanished = (
+        f"{map_entry!r} is no longer in settings.nodes"
+        if map_entry is not None
+        else None
+    )
+    if not scored:
+        return Placement(None, "no-data", scored, vanished)
+    order = {nick: index for index, nick in enumerate(nicks)}
+    candidates = [s for s in scored if not s.below_floor] or list(scored)
+    best = min(candidates, key=lambda s: (round(s.score, 9), order[s.nick]))
+    if vanished is None:
+        return Placement(best.nick, "placed", scored)
+    return Placement(
+        best.nick, "re-placed", scored, f"{vanished}; re-placed on {best.nick!r}"
+    )
+
+
+def placement_samples(
+    config: MagentConfig,
+    *,
+    now: float,
+    live_sample: Callable[[str], LoadSample | None] | None,
+    nodes_dir: Path | None = None,
+) -> tuple[dict[str, list[LoadSample]], frozenset[str]]:
+    """Each configured node's window, ready for ``place``, plus which nodes
+    were read live.
+
+    Spec §11's sparse rule: a node with fewer than ``MIN_WINDOW_SAMPLES`` in
+    the window gets exactly ONE live reading, and that reading is its only
+    sample -- three quiet samples from before someone started a build must not
+    win. ``live_sample`` is the caller's seam to ``remote_mux.sample`` (this
+    module never talks to a node); None -- a dry run -- scores a thin node on
+    what it has. A failed live reading leaves the node unscored.
+    """
+    samples: dict[str, list[LoadSample]] = {}
+    sampled: set[str] = set()
+    for nick in config.settings.nodes:
+        window = in_window(read_load_history(nick, nodes_dir=nodes_dir), now=now)
+        if len(window) >= MIN_WINDOW_SAMPLES or live_sample is None:
+            samples[nick] = window
+            continue
+        reading = live_sample(nick)
+        if reading is None:
+            samples[nick] = []
+            continue
+        samples[nick] = [replace(reading, ts=now)]
+        sampled.add(nick)
+    return samples, frozenset(sampled)
+
+
+# --- resume (spec §12) ----------------------------------------------------------
+
+# A top-level conversation's file is named by its session id (a UUID); the
+# subagent logs beside it are ``agent-<hex>.jsonl`` and are not resumable.
+_SESSION_STEM = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+
+def latest_transcript_id(
+    nick: str, sid: str, *, nodes_dir: Path | None = None
+) -> str | None:
+    """The newest pulled conversation's id, or None when nothing was pulled.
+
+    The file stem IS the session id (verified: every record's ``sessionId``
+    equals it). Newest by mtime -- tar keeps the node's mtimes -- and by name
+    on a tie, so the answer never depends on directory order.
+    """
+    folder = transcripts_dir(nick, sid, nodes_dir=nodes_dir)
+    try:
+        candidates = [p for p in folder.glob("*.jsonl") if _SESSION_STEM.match(p.stem)]
+        newest = max(
+            candidates, key=lambda p: (p.stat().st_mtime, p.name), default=None
+        )
+    except OSError:
+        return None
+    return None if newest is None else newest.stem
+
+
+# --- what a node's repos looked like (spec §12 step 2) --------------------------
+
+
+@dataclass(frozen=True)
+class RepoStatus:
+    """One repo on a node at last contact. ``head == ""`` means no repo was
+    found there; ``dirty``/``unpushed`` None means unknown."""
+
+    remote_dir: str
+    head: str
+    branch: str
+    dirty: bool | None
+    unpushed: int | None
+
+
+@dataclass(frozen=True)
+class RepoRecord:
+    """The last known state of a node session's repos, and where it came from
+    (``bring-up`` or ``recall``) -- so a recall from a node that no longer
+    answers can still say which commit the work was at."""
+
+    ts: float
+    source: str
+    repos: tuple[RepoStatus, ...]
+
+
+# repo_status.sh's stdout is the node's words, so it is bounded here: a session
+# root is one repo or a workspace of a handful, and no field needs more than a
+# path's length. A line past either bound is dropped, never truncated.
+REPO_STATUS_MAX_LINES = 256
+REPO_STATUS_MAX_FIELD = 4096
+# An unpushed count wider than this is not a count git produced for a repo.
+_COUNT_MAX_DIGITS = 9
+# C0, DEL and C1: nothing a node reports may drive the terminal it is shown on.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _count(text: str) -> int | None:
+    # str.isdigit() is true for U+00B2 SUPERSCRIPT TWO (which int() refuses)
+    # and for full-width digits, and int() of thousands of digits is slow and
+    # raises on 3.11+: every one of those reads as unknown.
+    if text.isascii() and text.isdigit() and len(text) <= _COUNT_MAX_DIGITS:
+        return int(text)
+    return None
+
+
+def parse_repo_status(text: str) -> list[RepoStatus]:
+    """``repo_status.sh``'s lines. A line that is not five tab-separated
+    fields, or has a field longer than ``REPO_STATUS_MAX_FIELD``, is not a
+    status line and is dropped; at most ``REPO_STATUS_MAX_LINES`` lines are
+    read. Control characters are stripped from every field. A ``dirty`` token
+    other than ``true``/``false`` (``unknown``, ``missing``) and a count that
+    is not a small ASCII number both mean unknown (None)."""
+    out: list[RepoStatus] = []
+    for line in text.split("\n")[:REPO_STATUS_MAX_LINES]:
+        fields = line.split("\t")
+        if len(fields) != 5 or any(len(f) > REPO_STATUS_MAX_FIELD for f in fields):
+            continue
+        remote_dir, head, branch, dirty, unpushed = (
+            _CONTROL_CHARS.sub("", f) for f in fields
+        )
+        state = {"true": True, "false": False}.get(dirty)
+        out.append(RepoStatus(remote_dir, head, branch, state, _count(unpushed)))
+    return out
+
+
+def repo_record_path(nick: str, sid: str, *, nodes_dir: Path | None = None) -> Path:
+    """``<nick>/<sid>/repos.json``. An unsafe ``sid`` raises NodeConfigError
+    here rather than trusting every caller to have run ``pullable_sid``: the
+    sid comes from the node map, and ``../../x`` must never name a file
+    outside the node's own directory."""
+    if not pullable_sid(sid):
+        raise NodeConfigError(f"not a safe session id for a repo record: {sid!r}")
+    return node_dir(nick, nodes_dir=nodes_dir) / sid / "repos.json"  # E's layout owner
+
+
+def write_repo_record(
+    nick: str, sid: str, record: RepoRecord, *, nodes_dir: Path | None = None
+) -> bool:
+    """Replace ``<nick>/<sid>/repos.json`` through ``write_json_atomic`` (a
+    unique temp file, one replace, no temp left behind). False, with a log
+    line, when nothing was written: an OSError, a non-finite ``ts``
+    (ValueError, since NaN is not JSON), or an unsafe ``sid``
+    (NodeConfigError, also a ValueError). A failed write keeps the old
+    record."""
+    body = {
+        "ts": record.ts,
+        "source": record.source,
+        "repos": [dataclasses.asdict(r) for r in record.repos],
+    }
+    try:
+        write_json_atomic(repo_record_path(nick, sid, nodes_dir=nodes_dir), body)
+    except (OSError, ValueError):
+        get_logger("nodes").warning(
+            "could not write the repo record for %s/%r", nick, sid, exc_info=True
+        )
+        return False
+    return True
+
+
+def _repo_status(row: object) -> RepoStatus | None:
+    if not isinstance(row, dict):
+        return None
+    remote_dir, head, branch = row.get("remote_dir"), row.get("head"), row.get("branch")
+    if not (
+        isinstance(remote_dir, str)
+        and isinstance(head, str)
+        and isinstance(branch, str)
+    ):
+        return None
+    dirty, unpushed = row.get("dirty"), row.get("unpushed")
+    return RepoStatus(
+        remote_dir=remote_dir,
+        head=head,
+        branch=branch,
+        dirty=dirty if isinstance(dirty, bool) else None,
+        unpushed=unpushed
+        if isinstance(unpushed, int) and not isinstance(unpushed, bool)
+        else None,
+    )
+
+
+def read_repo_record(
+    nick: str, sid: str, *, nodes_dir: Path | None = None
+) -> RepoRecord | None:
+    """The stored record, or None when there is none, it is unreadable, its
+    ``ts`` is not a finite number (the node map's rule, ``_epoch``), or the
+    ``sid`` is unsafe (NodeConfigError is a ValueError). A malformed row is
+    dropped on its own."""
+    try:
+        body = json.loads(
+            repo_record_path(nick, sid, nodes_dir=nodes_dir).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    ts, source, rows = _epoch(body.get("ts")), body.get("source"), body.get("repos")
+    if ts is None or not isinstance(source, str) or not isinstance(rows, list):
+        return None
+    repos = tuple(s for s in (_repo_status(r) for r in rows) if s is not None)
+    return RepoRecord(ts=ts, source=source, repos=repos)

@@ -503,15 +503,17 @@ def _next_mark(
     spec: remote_mux.SidPull, old: Mark | None, snap: remote_mux.NodeSnapshot, sid: str
 ) -> Mark:
     """Where this session's next pull starts:
-    - the node did not report it, or one of its files failed to store: stay
-      put (a failed file is asked for again next tick);
+    - the node did not report it: stay put;
     - its transcripts were never requested under the current real path (a
       first sight, a moved directory): from zero;
-    - otherwise: ``remote_mux.next_since``, the watermark rule ``pull``
-      shares -- the node's clock at scan time minus the overlap, a truncated
-      reply's resume point, or 0.0 when the node's clock is behind the mark."""
+    - otherwise: ``remote_mux.next_since`` -- the ONE watermark rule ``pull``
+      shares. A file that failed to store holds the mark; a reply cut short
+      moves it just under the first file still owed, never to the node's
+      clock, which would put the owed files behind it for good (cq-G14
+      I-R2-1; the canonical form of E8's truncated-pull rule); a node clock
+      behind the mark starts it over from 0.0."""
     real = snap.realpaths.get(sid)
-    if real is None or sid in snap.failed_sids:
+    if real is None:
         return old if old is not None else Mark(since=0.0, realpath=real)
     if spec.project_dir is None or old is None or old.realpath != real:
         return Mark(since=0.0, realpath=real)
@@ -1107,6 +1109,27 @@ def run_sync_loop(
     return 0
 
 
+class PullUnfinished(remote_mux.RemoteError):
+    """A final pull the node answered but that left part of the session on it:
+    a file that could not be stored here, or files the last reply had no room
+    for (still owed). Files the node skipped as over the cap or could not read
+    are not counted -- they would be left behind on every pull. rc 0 like the
+    node's other answers, but its own type: rc 0 also means an answer that was
+    not a pull and a refusal made on this PC before any ssh, and a caller that
+    retries this one must not retry those forever (cq-G14 m1).
+
+    ``why`` is the bare reason and ``not_stored`` its cause -- a file this PC
+    could not store (True), or files the reply had no room for (False) -- so a
+    caller can say the reason once and name only the remedy that applies
+    (cq-G14 m-R3-2): another run alone brings home what did not fit, but not a
+    file this PC keeps failing to store."""
+
+    def __init__(self, why: str, *, not_stored: bool) -> None:
+        super().__init__(0, f"the pull did not finish: {why}", ("pull.sh",))
+        self.why = why
+        self.not_stored = not_stored
+
+
 def _pull_sid(
     node: Node, entry: NodeMapEntry, mark: Mark | None
 ) -> tuple[Mark, remote_mux.SidPull, remote_mux.NodeSnapshot]:
@@ -1144,21 +1167,27 @@ def final_pull(
     "could not pull" means.
 
     An entry the daemon's tick would skip (a sid this PC cannot store, an
-    empty remote root) is refused as RemoteError(0) before any ssh, so the
-    caller never sees parse_pull's ValueError. A pull that could not store
-    every file is RemoteError(0) too: returning would tell ``down`` the last
-    turn is home when it is not.
+    empty remote root) is refused as PullRefused (rc 0) before any ssh, so
+    the caller never sees parse_pull's ValueError.
+
+    A pull the node answered but that left part of the session behind -- a
+    file that could not be stored here, or files the reply had no room for
+    -- is PullUnfinished (a RemoteError, rc 0), raised after the watermark
+    is saved (cq-G14 I1, m1): returning would tell ``down`` the last turn
+    is home when it is not, and a caller that clears the placement after
+    this call would never pull the rest. What did land stays in the
+    mirror.
 
     A reply cut at ``remote_mux.PULL_MAX_TOTAL_BYTES`` is resumed from its
     advanced mark, call after call, until one comes back whole -- a backlog
     bigger than one cap must not make every ``down`` refuse. The same
     ``wait_s`` deadline (counted from this call) bounds the resuming: a reply
-    still cut when it passes is RemoteError(0), and so, at once, is a cut
-    reply that did not move the mark forward, so the loop can never spin. Every mark
-    is written before the next call, so another final pull (or a tick)
-    carries on from the last one. A node that reports no real path for the
-    session's root (a deleted project) returns normally with a warning -- no
-    later pull could do better."""
+    still cut when it passes is PullUnfinished, and so, at once, is a cut
+    reply that did not move the mark forward, so the loop can never spin.
+    Every mark is written before the next call, so another final pull (or a
+    tick) carries on from the last one. A node that reports no real path
+    for the session's root (a deleted project) returns normally with a
+    warning -- no later pull could do better."""
     try:
         entry = nodes.load_node_map_strict().get(name)
     except (OSError, ValueError) as e:
@@ -1203,22 +1232,26 @@ def final_pull(
         marks[entry.sid] = mark
         _write_marks(entry.nick, marks)
     if any(entry.sid in s.failed_sids for s in snaps):
-        raise remote_mux.RemoteError(
-            0, f"could not store every pulled file of {entry.sid!r}", ("pull.sh",)
+        raise PullUnfinished(
+            f"a file of session {entry.sid!r} could not be stored on this PC",
+            not_stored=True,
         )
     if entry.sid in snap.truncated:
         # A node whose clock went back answers a mark BEHIND the one asked for.
         behind = asked is not None and mark.since < asked.since
         if not stuck:
-            why = f"and was still cut when the deadline passed ({len(snaps)} calls)"
+            why = (
+                f"and was still cut when the deadline passed, after {len(snaps)} calls"
+            )
         elif behind:
             why = "and moved its mark back"
         else:
             why = "without moving its mark"
-        raise remote_mux.RemoteError(
-            0,
-            f"the reply for {entry.sid!r} reached the pull cap {why}; the rest is owed",
-            ("pull.sh",),
+        owed = len(snap.truncated[entry.sid])
+        raise PullUnfinished(
+            f"{owed} file(s) did not fit in the reply and are still on the node"
+            f" (the reply reached the pull cap {why})",
+            not_stored=False,
         )
     if spec.project_dir is None:
         get_logger(LOG_NAME).warning(

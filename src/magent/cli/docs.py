@@ -480,6 +480,25 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "still runs)."
         ),
     ),
+    # D-MERGE: plan G's row (:3268) also names "which non-git files would be
+    # shipped"; restore it when Task 12's push-set listing lands with D.
+    (
+        "magent node plan <project|--all>",
+        (
+            "Show where a project would be placed (the load-history score per "
+            "node for `auto`). Writes nothing."
+        ),
+    ),
+    # D-MERGE: plan G Task 14's row reads "(--to <nick> | --local)" and names
+    # the move to another node; restore it when Task 15's --to lands with D.
+    (
+        "magent node recall <project> --local",
+        (
+            "Bring a node session home: `--local` prints the `claude --resume` "
+            "to run after a `git pull`. Pulls once more first; a node that does "
+            "not answer is reported, not fatal."
+        ),
+    ),
     ("magent config show", "Display current config."),
     ("magent config layout <cols> <rows>", "Set window grid."),
     ("magent config base-dir <path>", "Set projects folder."),

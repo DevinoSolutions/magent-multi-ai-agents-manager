@@ -22,6 +22,7 @@ leaves ``attach_client``, ``env``, ``log``, ``node_scripts``, ``nodes``,
 from __future__ import annotations
 
 import contextlib
+import filecmp
 import functools
 import io
 import json
@@ -51,16 +52,23 @@ from magent.attach_client import SSH_MISSING_RC, TMUX_SOCKET
 from magent.attach_client import find_ssh as _find_ssh_client
 from magent.env import git_child_env
 from magent.log import get_logger
+
+# pullable_sid is re-exported: its one owner is nodes.py (a leaf that must not
+# reach into this seam), and callers keep saying remote_mux.pullable_sid.
 from magent.nodes import (
     READ_FLAGS,
     LoadSample,
     LocalGitState,
     NodeConfigError,
+    RepoStatus,
+    _safe_part,
     absolute_remote,
     encoded_project_dir,
     node_dir,
+    parse_repo_status,
     path_exists,
     path_is_dir,
+    pullable_sid,
     walk_memory,
 )
 from magent.sessions import build_resume_command
@@ -828,6 +836,11 @@ margin over ``PULL_MAX_TOTAL_BYTES`` is for what pull.sh cannot count: bytes
 a node user's shell rc file prints before the script runs."""
 PULL_COPY_CHUNK_BYTES = 1024 * 1024
 """A member is streamed to disk in chunks of this size, never read whole."""
+PULL_TEMP_PREFIX = "."
+PULL_TEMP_SUFFIX = ".part"
+"""The ONE shape of a pulled file's in-flight temp: ``_write_file`` hands this
+pair to mkstemp and ``_pull_temp`` recognises it, so the writer and the tar
+filter that must never ship a stranded temp cannot drift apart."""
 # The newest mtime believed: ~36,800 years of Unix time, far past any real
 # clock yet inside every platform's time_t, so os.utime cannot overflow. A
 # member outside [0, _MAX_MTIME] (or NaN, or inf) is stored without its mtime.
@@ -837,26 +850,6 @@ _TRAILER_COUNT = re.compile(rb"([0-9]{1,9})\n")
 # file written in the same second as the scan is asked for again, never lost.
 WATERMARK_OVERLAP_S = 1.0
 _PULL_KINDS = frozenset({"transcripts", "state"})
-# A session directory sits beside these per-node files; no sid may take a name.
-_RESERVED_NAMES = frozenset(
-    {"sessions.json", "load.jsonl", "pull.json", "node-map.json"}
-)
-# Every path part must be a legal file name on THIS PC, which may be Windows.
-_UNSAFE_CHARS = re.compile(r'[\x00-\x1f<>:"/\\|?*]')
-# ntpath's reserved set on 3.13 (ntpath.isreserved is 3.13+, so it is copied):
-# the superscript digits count as COM/LPT numbers too.
-_DEVICE_NAMES = frozenset(
-    {
-        "CON",
-        "PRN",
-        "AUX",
-        "NUL",
-        "CONIN$",
-        "CONOUT$",
-        *(f"COM{c}" for c in "123456789¹²³"),
-        *(f"LPT{c}" for c in "123456789¹²³"),
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -940,26 +933,29 @@ def next_since(snap: NodeSnapshot, sid: str, since: float) -> float:
     return max(since, min(math.nextafter(stop, -math.inf), after_scan))
 
 
-def _pull_error(message: str) -> RemoteError:
-    # rc 0: the node answered, and the answer was not a pull.
-    return RemoteError(0, message, ("pull.sh",))
+class NotAPull(RemoteError):
+    """rc 0: the node answered, and the answer was not a pull this PC can read
+    -- another framing version, a truncated or damaged reply, an archive over
+    its cap -- so NOTHING of it was stored. Its own type so a caller can tell
+    it from a ``PullRefused`` (rc 0 as well): a recall must stop on this one,
+    because the node still holds whatever it could not send (cq-G14 C-R3-1).
+    Every other caller sees the same RemoteError(0) as before."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(0, message, ("pull.sh",))
 
 
-def _safe_part(part: str) -> bool:
-    # A part ending in "." or " " is refused outright (Windows drops them), so
-    # the device check needs only ntpath's: the stem before the FIRST dot,
-    # trailing spaces dropped -- "CON .jsonl" opens the console.
-    return (
-        part not in ("", ".", "..")
-        and _UNSAFE_CHARS.search(part) is None
-        and not part.endswith((".", " "))
-        and part.split(".", 1)[0].rstrip(" ").upper() not in _DEVICE_NAMES
-    )
+class PullRefused(RemoteError):
+    """rc 0: a pull refused on this PC before any ssh -- a session name this PC
+    cannot store, an empty remote root. Nothing was asked of the node, and no
+    re-run changes the answer."""
+
+    def __init__(self, message: str, command_redacted: tuple[str, ...]) -> None:
+        super().__init__(0, message, command_redacted)
 
 
-def pullable_sid(sid: str) -> bool:
-    """Can ``sid`` name a directory under ``~/.magent/nodes/<nick>/`` here?"""
-    return _safe_part(sid) and sid not in _RESERVED_NAMES
+def _pull_error(message: str) -> NotAPull:
+    return NotAPull(message)
 
 
 def _str_dict(raw: object) -> dict[str, str]:
@@ -1059,7 +1055,9 @@ def _write_file(path: Path, reader: IO[bytes], mtime: float | None) -> None:
     on every tick. The ``.part`` suffix stays (the tar walker skips it); the
     temp is unlinked on any failure, so none is ever left behind."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, part = tempfile.mkstemp(dir=path.parent, prefix=".", suffix=".part")
+    fd, part = tempfile.mkstemp(
+        dir=path.parent, prefix=PULL_TEMP_PREFIX, suffix=PULL_TEMP_SUFFIX
+    )
     try:
         with open(fd, "wb") as out:
             shutil.copyfileobj(reader, out, length=PULL_COPY_CHUNK_BYTES)
@@ -1193,7 +1191,7 @@ def parse_pull(stdout: bytes, *, dest: Path, sids: Collection[str]) -> NodeSnaps
     mirror dir). Only the requested ``sids`` are believed: their metadata, and
     archive members shaped ``<sid>/transcripts/...`` or ``<sid>/state/<x>.json``
     whose every part is a legal name here. Everything else is dropped with one
-    warning. RemoteError (rc 0) when the reply is not a pull at all -- no
+    warning. NotAPull (a RemoteError, rc 0) when the reply is not a pull at all -- no
     header, no ``PULL_TRAILER`` last line (truncated), a member count that
     disagrees with the trailer, a compressed or unreadable archive, or one
     over ``PULL_MAX_TOTAL_BYTES``. ValueError when a requested sid is not
@@ -1291,12 +1289,12 @@ def _pull_call(sids: Mapping[str, SidPull]) -> tuple[list[str], bytes]:
     )  # `bash -s -- <SOCKET>`: the socket is always $1
 
 
-def refused_pull(node: Node, sids: Mapping[str, SidPull], message: str) -> RemoteError:
+def refused_pull(node: Node, sids: Mapping[str, SidPull], message: str) -> PullRefused:
     """A pull of ``sids`` refused on this PC before any ssh: rc 0, and the
     command it would have run, shown the way every node error shows one
     (``_run_shown``)."""
     argv, input_bytes = _pull_call(sids)
-    return RemoteError(0, message, _run_shown(node, argv, input_bytes))
+    return PullRefused(message, _run_shown(node, argv, input_bytes))
 
 
 def pull_node(
@@ -1312,7 +1310,10 @@ def pull_node(
     RemoteError on a transport failure (255), a timeout (None), a reply over
     ``PULL_MAX_REPLY_BYTES`` (None too -- pull.sh keeps its
     own reply under ``PULL_MAX_TOTAL_BYTES``, so this means a node that did
-    not), a node without python3 (3), or a reply that is not a pull (0)."""
+    not), a node without python3 (3), or a reply that is not a pull (NotAPull, 0).
+    ValueError, after the ssh, when ``sids`` names a session that is not
+    ``pullable_sid`` (``parse_pull`` refuses it: the caller's bug, not the
+    node's)."""
     argv, input_bytes = _pull_call(sids)
     result = run(
         node,
@@ -1910,3 +1911,268 @@ def push_files(node: Node, recipe: Recipe) -> list[str]:
     raw = _deliver(node, "push", recipe, root, payload)
     shipped = raw.get("shipped")
     return [str(s) for s in shipped] if isinstance(shipped, list) else []
+
+
+def _session_root(remote_root: str) -> str:
+    """``remote_root`` as it may be sent to a node script: ``~``, ``~/...`` or
+    absolute. G sends the root UNEXPANDED (the script expands ``~``), so D's
+    check on its own expanded value never sees it (plan G Task 9's forward
+    correction). Anything else -- a relative path, a leading ``-`` read as an
+    option, another user's ``~user`` -- raises NodeConfigError before a
+    connection is opened. So does a ``..`` segment (it walks out of the root
+    it names) and any C0/DEL/C1 control character (a newline or TAB splits
+    the node's report rows; ESC drives the terminal the root is echoed on).
+    A trailing ``/`` is fine."""
+    if not (remote_root == "~" or remote_root.startswith(("~/", "/"))):
+        raise NodeConfigError(
+            f"session root {remote_root!r} is not ~, ~/... or an absolute path "
+            "on the node"
+        )
+    parts = remote_root.split("/")
+    # Per component, not a substring: "~/a..b" is a fine directory name.
+    if ".." in parts:
+        raise NodeConfigError(f"session root {remote_root!r} has a '..' segment")
+    if remote_root.startswith("/") and all(p in ("", ".") for p in parts):
+        raise NodeConfigError(
+            f"session root {remote_root!r} is the node's whole filesystem"
+        )
+    if any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in remote_root):
+        raise NodeConfigError(f"session root {remote_root!r} holds a control character")
+    return remote_root
+
+
+def _stdout_text(done: subprocess.CompletedProcess[bytes]) -> str:
+    return done.stdout.decode("utf-8", "replace")
+
+
+def repo_status(node: Node, remote_root: str, *, timeout_s: float) -> list[RepoStatus]:
+    """Each repo under a node session's cwd, as it is right now (read-only,
+    ``repo_status.sh``). RemoteError when the node does not answer;
+    NodeConfigError, before any dial, for a root ``_session_root`` refuses."""
+    done = run_script(
+        node, "repo_status", [_session_root(remote_root)], timeout_s=timeout_s
+    )
+    return parse_repo_status(_stdout_text(done))
+
+
+# A recall ships a whole conversation directory; the spec's script default.
+INSTALL_TIMEOUT_S = 120.0
+
+
+def _raise(err: OSError) -> None:
+    raise err
+
+
+def _pull_temp(name: str) -> bool:
+    """The pull writer's in-flight temp: mkstemp with ``PULL_TEMP_PREFIX`` and
+    ``PULL_TEMP_SUFFIX`` beside its target (E8), stranded only by a kill
+    mid-write. That exact shape, case included (mkstemp never writes upper
+    case), and nothing wider: a real ``notes.part`` is the user's file."""
+    return name.startswith(PULL_TEMP_PREFIX) and name.endswith(PULL_TEMP_SUFFIX)
+
+
+def _same_path(a: str, b: str) -> bool:
+    return os.path.normcase(a) == os.path.normcase(b)
+
+
+def _is_its_own_place(path: str, real_parent: str) -> bool:
+    """Does ``path`` physically sit where its name says -- inside
+    ``real_parent`` (already resolved) -- rather than being a symlink or a
+    Windows junction to somewhere else? A junction (``mklink /J``, no admin
+    needed) is not ``is_symlink()`` and ``os.walk`` descends it, but
+    ``realpath`` resolves it; that is the only test that sees both."""
+    return _same_path(
+        os.path.realpath(path), os.path.join(real_parent, os.path.basename(path))
+    )
+
+
+def _within(path: str, real_root: str) -> bool:
+    """Is ``path``'s real location ``real_root`` (resolved, normcased) or
+    under it? A different drive is never under it."""
+    real = os.path.normcase(os.path.realpath(path))
+    try:
+        return os.path.commonpath([real, real_root]) == real_root
+    except ValueError:
+        return False
+
+
+class MirrorIsALink(OSError):
+    """A pulled transcripts dir that is itself a symlink or junction to
+    somewhere else: nothing is taken from it."""
+
+
+def _mirror_members(source: Path, *, who: str) -> list[Path]:
+    """What may leave the pulled transcripts dir ``source``, sorted: its
+    regular files and directories -- the ONE rule for both ways a mirror
+    leaves it (``_tar_dir`` to a node, ``copy_mirror`` into this PC's Claude
+    dir). A symlink could name anything on this PC, and a ``.<rand>.part``
+    file is a pull temp (``_pull_temp``). Nothing reached through a link is a
+    member either: ``source`` itself being a symlink or junction raises
+    MirrorIsALink, a linked directory inside it is not descended (logged), and
+    a file whose real path leaves ``source`` is skipped -- two independent
+    layers. OSError when ``source`` cannot be read."""
+    log = get_logger("nodes")
+    if not _is_its_own_place(str(source), os.path.realpath(source.parent)):
+        log.warning("%s: %s is a link (symlink or junction); refused", who, source)
+        raise MirrorIsALink(
+            f"the pulled transcripts dir {source} is a link (symlink or junction)"
+            " to somewhere else"
+        )
+    root = os.path.normcase(os.path.realpath(source))
+    entries = []
+    for dirpath, dirnames, filenames in os.walk(source, onerror=_raise):
+        real_base = os.path.realpath(dirpath)
+        inside = []
+        for name in dirnames:
+            if _is_its_own_place(os.path.join(dirpath, name), real_base):
+                inside.append(name)
+            else:
+                log.warning(
+                    "%s: %s is a link (symlink or junction); not descended",
+                    who,
+                    os.path.join(dirpath, name),
+                )
+        dirnames[:] = inside
+        base = source / os.path.relpath(dirpath, source)
+        entries.extend(base / name for name in (*dirnames, *filenames))
+    return [
+        path
+        for path in sorted(entries)
+        if not path.is_symlink()
+        and (
+            path.is_dir()
+            or (
+                path.is_file()
+                and not _pull_temp(path.name)
+                and _within(str(path), root)
+            )
+        )
+    ]
+
+
+def _tar_dir(source: Path) -> bytes:
+    """An uncompressed tar of ``source``'s CONTENTS (paths relative to it):
+    its ``_mirror_members``, nothing else. A source that cannot be read, or is
+    a link, raises RemoteError with rc None (nothing ran on a node)."""
+    buf = io.BytesIO()
+    try:
+        members = _mirror_members(source, who="_tar_dir")
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            for path in members:
+                arcname = path.relative_to(source).as_posix()
+                tar.add(path, arcname=arcname, recursive=False)
+    except MirrorIsALink as err:
+        raise RemoteError(
+            None, f"{err}; nothing was sent", ("tar", str(source))
+        ) from err
+    except OSError as err:
+        raise RemoteError(
+            None, f"could not read the pulled transcripts: {err}", ("tar", str(source))
+        ) from err
+    return buf.getvalue()
+
+
+def copy_mirror(source: Path, dest: Path) -> tuple[str, ...]:
+    """Install the pulled transcripts dir ``source`` into ``dest`` on THIS PC
+    by the rule ``_tar_dir`` sends it to a node by (``_mirror_members``): the
+    ``recall --local`` twin of ``install_transcripts``. What ``dest`` already
+    holds is kept; a same-name file is replaced by the node's copy, and the
+    names (relative, '/'-separated, sorted) of those whose content DIFFERED
+    are returned for the caller to report. MirrorIsALink when ``source`` is
+    itself a link; any other OSError propagates, possibly after a partial copy
+    that a re-run overwrites."""
+    members = set(_mirror_members(source, who="copy_mirror"))
+    replaced: list[str] = []
+
+    def _not_members(folder: str, names: list[str]) -> list[str]:
+        return [name for name in names if Path(folder, name) not in members]
+
+    def _copy(src: str, dst: str) -> object:
+        if os.path.isfile(dst) and not filecmp.cmp(src, dst, shallow=False):
+            replaced.append(Path(dst).relative_to(dest).as_posix())
+        return shutil.copy2(src, dst)
+
+    shutil.copytree(
+        source, dest, ignore=_not_members, copy_function=_copy, dirs_exist_ok=True
+    )
+    return tuple(sorted(replaced))
+
+
+def node_realpath(node: Node, path: str, *, timeout_s: float) -> str:
+    """The physical path ``path`` names on ``node`` (``~`` expanded, symlinks
+    resolved) -- the string Claude Code there keys its project dir by.
+    NodeConfigError, before any dial, for a path ``_session_root`` refuses."""
+    done = run_script(node, "node_realpath", [_session_root(path)], timeout_s=timeout_s)
+    return _stdout_text(done).strip()
+
+
+@dataclass(frozen=True)
+class InstalledTranscripts:
+    """Where a recall's conversation landed on a node, and the items (files,
+    or a directory where the node has a file) the node already had its own
+    newer or diverged copy of -- those were KEPT, not overwritten
+    (``install_transcripts.sh``). Informational, not a failure."""
+
+    landed: str
+    kept: tuple[str, ...] = ()
+
+    @property
+    def note(self) -> str:
+        """One line naming what was kept, or "" when nothing was. An item, not
+        a file: a directory is KEPT too when the node has a file of that name
+        where the payload has a directory."""
+        if not self.kept:
+            return ""
+        return (
+            f"kept the node's newer/diverged copy of {len(self.kept)} item(s): "
+            + ", ".join(self.kept)
+        )
+
+
+# install_transcripts.sh's own refusals, by exit code. Any other failure (ssh's
+# 255, a timeout, a command that died under `set -e`) passes through as is.
+INSTALL_REFUSALS = {
+    2: "the encoded project dir name is outside the encoder's alphabet",
+    3: "the transcript payload arrived missing or broken; nothing was installed",
+    4: "the node's project dir is a symlink; nothing was installed through it",
+}
+
+
+def _installed(text: str) -> InstalledTranscripts:
+    kept: list[str] = []
+    landed = ""
+    for line in text.splitlines():
+        if line.startswith("KEPT\t"):
+            kept.append(line.removeprefix("KEPT\t"))
+        elif line.strip():
+            landed = line.strip()
+    return InstalledTranscripts(landed=landed, kept=tuple(kept))
+
+
+def install_transcripts(
+    node: Node, remote_root: str, source: Path, *, timeout_s: float
+) -> InstalledTranscripts:
+    """Put a pulled Claude project directory where a session started in
+    ``remote_root`` on ``node`` will look for it (recall --to, spec §12 step
+    4). The name is encoded HERE, by the one encoder, from the node's own
+    physical path; the node only places files, never overwriting work it has
+    that this PC lacks. Returns where it landed and what the node KEPT.
+    NodeConfigError (a root ``_session_root`` refuses) and RemoteError rc None
+    (``source`` cannot be read) both come before any dial; RemoteError when
+    the node refuses -- its reason named from ``INSTALL_REFUSALS`` -- or does
+    not answer."""
+    _session_root(remote_root)
+    payload = _tar_dir(source)
+    name = encoded_project_dir(node_realpath(node, remote_root, timeout_s=timeout_s))
+    try:
+        done = run_script(
+            node, "install_transcripts", [name], timeout_s=timeout_s, stdin=payload
+        )
+    except RemoteError as err:
+        reason = INSTALL_REFUSALS.get(err.rc) if err.rc is not None else None
+        if reason is None:
+            raise
+        raise RemoteError(
+            err.rc, f"{reason}\n{err.stderr_tail}".rstrip(), err.command_redacted
+        ) from err
+    return _installed(_stdout_text(done))

@@ -1704,7 +1704,9 @@ class TestGoBringsNodeProjectsUp:
         monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
         proj = ProjectConfig(path=str(tmp_path), node="auto")
         launch.run_magent(_config(proj), launch.RunOpts(dry_run=True))
-        assert "needs a placement" in capsys.readouterr().out
+        # G's placement phase resolves auto before anything launches, and
+        # names why it found no node (nodes.PLACE_REASONS['no-data']).
+        assert "no node has load samples to score" in capsys.readouterr().out
 
     def test_dry_run_names_a_folder_this_user_may_not_read(
         self, desk, no_sleep, tmp_path, monkeypatch, capsys, caplog
