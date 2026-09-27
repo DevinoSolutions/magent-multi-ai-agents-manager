@@ -194,6 +194,9 @@ def _remember(ctx: Ctx, step: str, want: str, mark: int) -> None:
 
 
 _NOT_AN_OBJECT = "not a JSON object"
+# The class ``_node_object`` gives a node file with no bytes, or only
+# whitespace, in place of JSONDecodeError.
+_EMPTY = "empty"
 
 
 def _member(ctx: Ctx, name: str) -> dict[str, object] | str:
@@ -211,16 +214,27 @@ def _member(ctx: Ctx, name: str) -> dict[str, object] | str:
 def _node_object(path: Path) -> dict[str, object] | str:
     """The node's own JSON file ``path`` as an object; {} when it does not
     exist, so a write creates it. Anything else is the class of why it could
-    not be read, or ``_NOT_AN_OBJECT``: a 0-byte or torn file is unknown --
-    it may be a write the node's claude has in flight -- and merged into as
-    {} it would be overwritten."""
+    not be read -- ``_EMPTY`` for no bytes or only whitespace, so an empty
+    file and a torn one read differently -- or ``_NOT_AN_OBJECT``. An empty
+    or torn file is unknown: it may be a write the node's claude has in
+    flight, and merged into as {} it would be overwritten."""
     try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+        if not text.strip():
+            return _EMPTY
+        loaded = json.loads(text)
     except FileNotFoundError:
         return {}
     except (OSError, ValueError, RecursionError) as e:
         return type(e).__name__
     return loaded if isinstance(loaded, dict) else _NOT_AN_OBJECT
+
+
+def _remedy(why: str) -> str:
+    """What an unknown node file's row adds so it names what clears it. A torn
+    file is a write in flight the next provision outlasts; one that STAYS
+    empty never clears by itself."""
+    return " -- if it stays empty, remove it on the node" if why == _EMPTY else ""
 
 
 def _unread_on_node(ctx: Ctx, item: str, shown: str, why: str) -> None:
@@ -231,7 +245,7 @@ def _unread_on_node(ctx: Ctx, item: str, shown: str, why: str) -> None:
         "warn",
         item,
         f"{shown} on this node could not be read ({why}); left as it is, the "
-        "next provision tries again",
+        f"next provision tries again{_remedy(why)}",
     )
 
 
@@ -1002,7 +1016,7 @@ def _step_mcp_oauth(ctx: Ctx) -> None:
             "mcp_oauth",
             f"~/.claude.json on this node cannot be read ({claude_json}), so its "
             "server list is unknown; this PC's MCP OAuth entries wait for the "
-            "next provision",
+            f"next provision{_remedy(claude_json)}",
         )
         return
     servers = claude_json.get("mcpServers")

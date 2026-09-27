@@ -3436,16 +3436,24 @@ class TestAnUnreadablePcFileLeavesTheNodeAlone:
         assert _credentials(box).read_bytes() == before
 
 
-# Each way a file the NODE owns can exist and still not be read, and the class
-# its row shows. Only a missing file is {} (a write creates it); an empty one
-# is unknown like the rest -- it may be a write the node's claude has in
-# flight, and merged into as {} it would be overwritten.
+# What an unknown node file's row adds when the file is EMPTY: a torn file is
+# a write in flight that the next provision outlasts, but one that stays empty
+# never clears by itself, so the row names what clears it.
+REMEDY = " -- if it stays empty, remove it on the node"
+
+# Each way a file the NODE owns can exist and still not be read, the class its
+# row shows, and what the row adds. Only a missing file is {} (a write creates
+# it); an empty one is unknown like the rest -- it may be a write the node's
+# claude has in flight, and merged into as {} it would be overwritten.
 NODE_UNKNOWN = [
-    ("empty", "JSONDecodeError"),
-    ("whitespace", "JSONDecodeError"),
-    ("not-json", "JSONDecodeError"),
-    ("too-deep", "RecursionError"),
-    ("eio", "OSError"),
+    pytest.param(how, why, tail, id=how)
+    for how, why, tail in [
+        ("empty", "empty", REMEDY),
+        ("whitespace", "empty", REMEDY),
+        ("not-json", "JSONDecodeError", ""),
+        ("too-deep", "RecursionError", ""),
+        ("eio", "OSError", ""),
+    ]
 ]
 
 
@@ -3463,11 +3471,12 @@ def _spoil(monkeypatch: pytest.MonkeyPatch, path: Path, how: str) -> None:
 class TestAnUnreadableNodeFileIsUnknownNotEmpty:
     """U6: a file the node owns that exists but does not read is UNKNOWN,
     never the {} a missing one is. The step prints one warn row naming the
-    class, writes nothing, keeps what it remembers, and the run exits 0."""
+    class, writes nothing, keeps what it remembers, and the run exits 0. An
+    EMPTY file's row also names what clears it; a torn one's does not."""
 
-    @pytest.mark.parametrize(("how", "why"), NODE_UNKNOWN)
+    @pytest.mark.parametrize(("how", "why", "tail"), NODE_UNKNOWN)
     def test_an_unknown_node_server_list_is_named_not_read_as_no_entries(
-        self, box, tmp_path, capsys, monkeypatch, how, why
+        self, box, tmp_path, capsys, monkeypatch, how, why, tail
     ):
         # cq-F17c's repro (9): the payload's server list is broken, so the mcp
         # step leaves ~/.claude.json alone, and the oauth step reads it.
@@ -3485,7 +3494,7 @@ class TestAnUnreadableNodeFileIsUnknownNotEmpty:
                 "mcp_oauth",
                 f"~/.claude.json on this node cannot be read ({why}), so its "
                 "server list is unknown; this PC's MCP OAuth entries wait for the "
-                "next provision",
+                f"next provision{tail}",
             )
         ]
         assert (_claude_json(box).read_bytes(), _credentials(box).read_bytes()) == (
@@ -3493,9 +3502,9 @@ class TestAnUnreadableNodeFileIsUnknownNotEmpty:
         )
         _assert_the_record_is_kept(box, remembered, "mcp_oauth")
 
-    @pytest.mark.parametrize(("how", "why"), NODE_UNKNOWN)
+    @pytest.mark.parametrize(("how", "why", "tail"), NODE_UNKNOWN)
     def test_an_unknown_node_claude_json_is_not_merged_into(
-        self, box, tmp_path, capsys, monkeypatch, how, why
+        self, box, tmp_path, capsys, monkeypatch, how, why, tail
     ):
         box.apply(_work(tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS})))
         remembered = _json(_store(box))
@@ -3509,15 +3518,15 @@ class TestAnUnreadableNodeFileIsUnknownNotEmpty:
                 "warn",
                 "mcp",
                 f"~/.claude.json on this node could not be read ({why}); left as "
-                "it is, the next provision tries again",
+                f"it is, the next provision tries again{tail}",
             )
         ]
         assert _claude_json(box).read_bytes() == written
         _assert_the_record_is_kept(box, remembered, "mcp")
 
-    @pytest.mark.parametrize(("how", "why"), NODE_UNKNOWN)
+    @pytest.mark.parametrize(("how", "why", "tail"), NODE_UNKNOWN)
     def test_an_unknown_node_credentials_file_is_not_merged_into(
-        self, box, tmp_path, capsys, monkeypatch, how, why
+        self, box, tmp_path, capsys, monkeypatch, how, why, tail
     ):
         box.apply(_work(tmp_path, _two()))
         remembered = _json(_store(box))
@@ -3532,15 +3541,15 @@ class TestAnUnreadableNodeFileIsUnknownNotEmpty:
                 "warn",
                 "mcp_oauth",
                 f"~/.claude/.credentials.json on this node could not be read "
-                f"({why}); left as it is, the next provision tries again",
+                f"({why}); left as it is, the next provision tries again{tail}",
             )
         ]
         assert _credentials(box).read_bytes() == written
         _assert_the_record_is_kept(box, remembered, "mcp_oauth")
 
-    @pytest.mark.parametrize(("how", "why"), NODE_UNKNOWN)
+    @pytest.mark.parametrize(("how", "why", "tail"), NODE_UNKNOWN)
     def test_unknown_node_settings_are_not_merged_into(
-        self, box, tmp_path, capsys, monkeypatch, how, why
+        self, box, tmp_path, capsys, monkeypatch, how, why, tail
     ):
         # Merged as {} with the PC now shipping {}, this would also take back
         # every env key, rule and directory the PC shipped before.
@@ -3555,11 +3564,30 @@ class TestAnUnreadableNodeFileIsUnknownNotEmpty:
                 "warn",
                 "settings",
                 f"~/.claude/settings.json on this node could not be read ({why}); "
-                "left as it is, the next provision tries again",
+                f"left as it is, the next provision tries again{tail}",
             )
         ]
         assert _settings(box).read_bytes() == written
         _assert_the_record_is_kept(box, remembered, "settings")
+
+    @pytest.mark.parametrize(
+        ("text", "why"),
+        [
+            (b"", "empty"),
+            (b" \n\t\r\n", "empty"),
+            (b"{", "JSONDecodeError"),
+            (b'{"mcpServers": {"docs": ', "JSONDecodeError"),
+            (b"  \n{oops", "JSONDecodeError"),
+        ],
+        ids=["no-bytes", "only-whitespace", "one-byte", "cut-mid-write", "padded"],
+    )
+    def test_the_node_read_tells_an_empty_file_from_a_torn_one(
+        self, tmp_path, text, why
+    ):
+        # Only NOTHING but whitespace is empty; any other byte makes it torn.
+        path = tmp_path / "node.json"
+        path.write_bytes(text)
+        assert node_apply._node_object(path) == why
 
     def test_a_missing_node_file_is_still_created(self, box, tmp_path, capsys):
         # Only a MISSING file is {}: a fresh node user gets its files.
