@@ -28,7 +28,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
-from magent.config import NODE_AUTO, NODE_CLOUD, is_cloud, runs_on_node
+from magent.config import (
+    _NODE_NICK_RE,
+    NODE_AUTO,
+    NODE_CLOUD,
+    is_cloud,
+    runs_on_node,
+)
 from magent.lockfile import LockHeld, persistent_lock
 from magent.log import get_logger
 from magent.psmux import session_name
@@ -214,6 +220,10 @@ def _map_entry(raw: object) -> NodeMapEntry | None:
     nick, sid, root = raw.get("nick"), raw.get("sid"), raw.get("remote_root")
     ts, attached = raw.get("placed_ts"), raw.get("attached_existing")
     if not (isinstance(nick, str) and isinstance(sid, str) and isinstance(root, str)):
+        return None
+    # The nick becomes a path under NODES_DIR and a word on the screen: one
+    # config's own rule refuses ("../x", an escape sequence) is corruption.
+    if not _NODE_NICK_RE.fullmatch(nick):
         return None
     placed_ts = _epoch(ts)
     if placed_ts is None or not isinstance(attached, bool):

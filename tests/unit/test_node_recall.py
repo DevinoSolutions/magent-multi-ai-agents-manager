@@ -2532,6 +2532,38 @@ class TestRecallReadsTheNodeMapAsUntrusted:
         assert nodes.read_node_map()["api"].sid == sid
         assert not _claude_dir(api_repo).exists()
 
+    @pytest.mark.parametrize("nick", ["../x", "\x1b[31mx"], ids=["traversal", "escape"])
+    def test_a_nick_config_would_refuse_reaches_no_path_and_no_screen(
+        self, runner, api_repo, tmp_config, node_answers, monkeypatch, nick
+    ):
+        # Ruling Decision 1 (a): a bad nick is a malformed entry, so the
+        # project reads as not placed -- and the nick is never joined or shown.
+        joined: list[str] = []
+        real_node_dir = nodes.node_dir
+
+        def _node_dir(n, *, nodes_dir=None):
+            joined.append(n)
+            return real_node_dir(n, nodes_dir=nodes_dir)
+
+        monkeypatch.setattr(nodes, "node_dir", _node_dir)
+        nodes.update_node_map("api", entry(nick))
+        cfg = tmp_config(
+            config_json(
+                ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
+            )
+        )
+
+        result = _recall(runner, cfg, "--local")
+
+        assert result.exit_code == 2
+        assert "not placed on a node" in result.stderr
+        screen = result.stdout + result.stderr
+        assert nick not in screen
+        assert "\x1b" not in screen
+        assert nick not in joined
+        assert node_answers == []
+        assert not _claude_dir(api_repo).exists()
+
     def test_a_remote_root_the_seam_refuses_is_a_note_not_a_traceback(
         self, runner, api_repo, tmp_config, monkeypatch
     ):

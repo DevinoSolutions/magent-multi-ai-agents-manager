@@ -18,7 +18,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from magent import nodes, psmux, remote_mux
+from magent import config, nodes, psmux, remote_mux
 from magent.config import (
     DEFAULT_TOOLS,
     MagentConfig,
@@ -253,6 +253,26 @@ class TestTheNodeMap:
         )
         assert nodes.read_node_map() == {"api": ENTRY}
         assert nodes.load_node_map_strict() == {"api": ENTRY}
+
+    @pytest.mark.parametrize(
+        "nick",
+        ["../x", "\x1b[31mx", "", "Second", "sevenxx", "a/b", "a b"],
+        ids=["traversal", "escape", "empty", "upper", "too-long", "slash", "space"],
+    )
+    def test_a_nick_config_would_refuse_drops_the_entry(self, node_map, nick):
+        # Ruling Decision 1 (a): the nick is joined into a path under
+        # NODES_DIR and printed as @<nick>, so config's rule is the map's rule.
+        bad = json.dumps({**dataclasses.asdict(ENTRY), "nick": nick})
+        node_map.parent.mkdir(parents=True)
+        node_map.write_text(
+            f'{{"api": {_entry_text("1727200000.0")}, "db": {bad}}}',
+            encoding="utf-8",
+        )
+        assert nodes.read_node_map() == {"api": ENTRY}
+        assert nodes.load_node_map_strict() == {"api": ENTRY}
+
+    def test_the_nick_rule_is_configs_own_not_a_copy(self):
+        assert nodes._NODE_NICK_RE is config._NODE_NICK_RE
 
     @pytest.mark.parametrize("attached", [1, 0, "yes", "false", None, [], {}], ids=repr)
     def test_an_attached_flag_that_is_not_a_bool_drops_the_entry(

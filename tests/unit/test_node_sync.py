@@ -229,6 +229,16 @@ class TestStateStores:
         assert repr(bad) in warning
         assert "evil" in warning
 
+    @pytest.mark.parametrize("nick", ["../x", "\x1b[31mx"], ids=["traversal", "escape"])
+    def test_a_nick_config_would_refuse_is_no_store_and_no_label(self, placed, nick):
+        # The label is what `magent watch` prints; the dir is under NODES_DIR.
+        nodes.write_node_map(
+            {"api": _entry("second", "api"), "evil": _entry(nick, "evil")}
+        )
+        assert node_sync.state_stores() == [
+            ("api", "@second", nodes.state_dir("second", "api")),
+        ]
+
 
 class TestTheNodeLock:
     def test_a_held_node_is_waited_for_then_refused(self):
