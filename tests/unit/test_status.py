@@ -2857,7 +2857,7 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         ]
         assert [ln.split(None, 1)[1] for ln in lines] == said
 
-    def test_the_end_re_stop_names_a_daemon_serve_restarted(
+    def test_the_end_re_stop_names_a_daemon_that_started_late(
         self, runner, tmp_config, monkeypatch, tmp_path
     ):
         self._hold("api")
@@ -2878,7 +2878,7 @@ class TestDownStopsNodeSessionsWhereTheyRun:
             in out.stdout
         )
 
-    def test_a_survivor_that_died_by_the_end_is_not_called_a_restart(
+    def test_a_survivor_that_died_by_the_end_is_not_called_late(
         self, runner, tmp_config, monkeypatch, tmp_path
     ):
         # The first stop could not kill it; by the end it is gone. That is the
@@ -2903,7 +2903,7 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         assert "Stopped the node sync daemon." in out.stdout
         assert "again" not in out.stdout
 
-    def test_a_restarted_daemon_the_end_stop_could_not_kill_is_named(
+    def test_a_late_daemon_the_end_stop_could_not_kill_is_named(
         self, runner, tmp_config, monkeypatch, tmp_path
     ):
         # The first stop stopped one; another started late, and the end
