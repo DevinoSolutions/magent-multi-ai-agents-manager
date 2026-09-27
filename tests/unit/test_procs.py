@@ -91,6 +91,95 @@ class TestProcessTree:
             child.wait()
 
 
+class _FakeToolhelp:
+    """kernel32's Toolhelp walk, as ``snapshot_processes`` drives it: each
+    Process32*W call fills the next entry, and the call after the last one
+    fails with ``end_error``.
+
+    The error lands where ctypes really keeps it: in the private copy that
+    ``ctypes.get_last_error`` reads, updated only for functions of a library
+    loaded with ``use_last_error=True``. Python code between two foreign calls
+    may clobber the thread's own last error, so that copy is the only one worth
+    reading."""
+
+    def __init__(self, entries, end_error, *, use_last_error):
+        self._pending = list(entries)
+        self._end_error = end_error
+        self._use_last_error = use_last_error
+        self.last_error = 0
+        self.closed = False
+
+    def CreateToolhelp32Snapshot(self, flags, pid):
+        return 0x1234
+
+    def Process32FirstW(self, snapshot, ref):
+        return self._next_into(ref)
+
+    def Process32NextW(self, snapshot, ref):
+        return self._next_into(ref)
+
+    def CloseHandle(self, handle):
+        self.closed = True
+        return 1
+
+    def _next_into(self, ref):
+        if not self._pending:
+            if self._use_last_error:
+                self.last_error = self._end_error
+            return 0
+        entry = ref._obj
+        entry.szExeFile, entry.th32ProcessID, entry.th32ParentProcessID = (
+            self._pending.pop(0)
+        )
+        return 1
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Toolhelp is win32-only")
+class TestTheSnapshotWalk:
+    """The Toolhelp walk now feeds a SAFETY verdict: ``idle_sessions`` reads
+    "not in the snapshot" as "nothing runs under this pane", and a yes there
+    types into the pane. So only Windows' own end-of-list error may end the
+    walk; a list cut short by any other failure is a failed snapshot."""
+
+    ENTRIES = (("pwsh.exe", 10, 1), ("cmd.exe", 11, 10), ("claude.exe", 12, 11))
+
+    def _kernel32(self, monkeypatch, entries, end_error):
+        """Serve every way the walk could reach kernel32 -- ``windll`` (no
+        private last-error copy) and ``WinDLL(..., use_last_error=True)`` --
+        from one fake walk, and return that walk."""
+        import ctypes
+
+        libraries: list[_FakeToolhelp] = []
+
+        def _load(name, use_last_error=False, **_kw):
+            library = _FakeToolhelp(entries, end_error, use_last_error=use_last_error)
+            libraries.append(library)
+            return library
+
+        monkeypatch.setattr(ctypes, "WinDLL", _load)
+        monkeypatch.setattr(
+            ctypes, "windll", type("_Loader", (), {"kernel32": _load("kernel32")})
+        )
+        monkeypatch.setattr(ctypes, "get_last_error", lambda: libraries[-1].last_error)
+        return libraries
+
+    def test_a_walk_that_reaches_the_end_returns_every_entry(self, monkeypatch):
+        libraries = self._kernel32(
+            monkeypatch,
+            self.ENTRIES,
+            end_error=18,  # ERROR_NO_MORE_FILES
+        )
+        assert snapshot_processes() == list(self.ENTRIES)
+        assert any(library.closed for library in libraries)
+
+    def test_a_walk_that_fails_partway_is_unknown_not_short(self, monkeypatch):
+        # ERROR_GEN_FAILURE after two entries: the agent's entry never came,
+        # and a short list would say nothing runs under the pane.
+        libraries = self._kernel32(monkeypatch, self.ENTRIES[:2], end_error=31)
+        assert snapshot_processes() is None
+        assert any(library.closed for library in libraries)
+
+
 class TestCountProcesses:
     """Enrichment for doctor's psmux-wedge finding: the wedge left psmux.exe
     processes that ignored ``taskkill /F``, so a count corroborates it. It must
