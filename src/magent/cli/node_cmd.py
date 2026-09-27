@@ -696,9 +696,15 @@ RECALL_TIMEOUT_S = 60.0
 
 
 def _tail(exc: RemoteError) -> str:
-    return exc.stderr_tail.strip() or (
-        "timed out" if exc.rc is None else f"exit {exc.rc}"
-    )
+    """A node call's stderr tail as one screen row: each non-blank line
+    as printable ASCII (a node's words must not write to this terminal),
+    joined with "; "; its rc when it said nothing."""
+    from magent import node_sync  # heavy subsystem: in-body per policy
+
+    lines = [line.strip() for line in exc.stderr_tail.splitlines() if line.strip()]
+    if lines:
+        return "; ".join(node_sync.printable(line) for line in lines)
+    return "timed out" if exc.rc is None else f"exit {exc.rc}"
 
 
 def _local_failure(exc: Exception, doing: str) -> str:
@@ -760,7 +766,8 @@ def push_cmd(ctx: click.Context, project: str) -> None:
     try:
         node = nodes.node_for_nick(cfg, nick, local_user=env.local_username())
     except nodes.NodeConfigError as exc:
-        _fail(str(exc), _EXIT_USAGE)
+        # nodes' own words, but they can quote the map's nick.
+        _fail(node_sync.printable(str(exc)), _EXIT_USAGE)
     placed = dataclasses.replace(proj, node=nick)
     try:
         # D's one recipe builder (DECISION-22): the push set a bring-up ships.
@@ -791,13 +798,15 @@ def push_cmd(ctx: click.Context, project: str) -> None:
 
 
 def _source_node(cfg: MagentConfig, held: NodeMapEntry) -> Node | None:
-    from magent import nodes  # heavy subsystem: in-body per policy
+    from magent import node_sync, nodes  # heavy subsystem: in-body per policy
 
     try:
         return nodes.node_for_nick(cfg, held.nick, local_user=env.local_username())
     except nodes.NodeConfigError as exc:
+        # nodes' own words, but they can quote the map's nick.
         _note(
-            f"@{held.nick} cannot be reached from this config ({exc});"
+            f"@{held.nick} cannot be reached from this config"
+            f" ({node_sync.printable(str(exc))});"
             " using what was already pulled"
         )
         return None
@@ -887,7 +896,7 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
         _fail(f"could not pull from @{held.nick} ({type(exc).__name__}); {_RERUN}", 1)
     except nodes.NodeConfigError as exc:
         _note(
-            f"@{held.nick} cannot be pulled from ({exc});"
+            f"@{held.nick} cannot be pulled from ({node_sync.printable(str(exc))});"
             " going on with what was already pulled"
         )
         return False
@@ -986,7 +995,8 @@ def _repo_line(status: RepoStatus) -> str:
 def _report_repos(source: Node | None, held: NodeMapEntry) -> None:
     """Step 2: the node's commit per repo and whether its tree was dirty --
     live when the node answers (and recorded), else the last record."""
-    from magent import nodes, remote_mux  # heavy subsystem: in-body per policy
+    # heavy subsystem: in-body per policy
+    from magent import node_sync, nodes, remote_mux
 
     record = None
     if source is not None:
@@ -999,7 +1009,10 @@ def _report_repos(source: Node | None, held: NodeMapEntry) -> None:
         except nodes.NodeConfigError as exc:
             # The map's remote_root is untrusted too: repo_status refuses a
             # root it will not send, before any dial (plan G Task 9).
-            _note(f"could not read the repos on @{held.nick} ({exc})")
+            _note(
+                f"could not read the repos on @{held.nick}"
+                f" ({node_sync.printable(str(exc))})"
+            )
         else:
             record = nodes.RepoRecord(
                 ts=time.time(), source="recall", repos=tuple(repos)
@@ -1235,7 +1248,7 @@ def _destination(
     """Everything ``--to`` can refuse, checked BEFORE the source session is
     touched: the node and the session root the conversation goes to."""
     # heavy subsystem: in-body per policy
-    from magent import launch, nodes, remote_mux
+    from magent import launch, node_sync, nodes, remote_mux
 
     name = nodes.project_name(proj)
     if to_nick not in cfg.settings.nodes:
@@ -1251,7 +1264,7 @@ def _destination(
     try:
         target = nodes.node_for_nick(cfg, to_nick, local_user=env.local_username())
     except nodes.NodeConfigError as exc:
-        _fail(str(exc), _EXIT_USAGE)
+        _fail(node_sync.printable(str(exc)), _EXIT_USAGE)
     moved = dataclasses.replace(proj, node=to_nick)
     try:
         # D's one recipe builder (DECISION-22), so the root is the one the
@@ -1299,7 +1312,8 @@ def _recall_to(
         except nodes.NodeConfigError as exc:
             # A root the install will not send, refused before any dial.
             _fail(
-                f"could not install the conversation on @{target.nick} ({exc});"
+                f"could not install the conversation on @{target.nick}"
+                f" ({node_sync.printable(str(exc))});"
                 f" {name} stays placed on @{held.nick}",
                 _EXIT_USAGE,
             )

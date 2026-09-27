@@ -2019,8 +2019,15 @@ def _tar_dir(source: Path) -> bytes:
             None, f"{err}; nothing was sent", ("tar", str(source))
         ) from err
     except OSError as err:
+        # The OS's words (and the file's path) go to nodes.log; the error a
+        # recall shows is ours plus the class.
+        get_logger("nodes").warning(
+            "_tar_dir: could not read the pulled transcripts in %s: %s", source, err
+        )
         raise RemoteError(
-            None, f"could not read the pulled transcripts: {err}", ("tar", str(source))
+            None,
+            f"could not read the pulled transcripts ({type(err).__name__})",
+            ("tar", str(source)),
         ) from err
     return buf.getvalue()
 

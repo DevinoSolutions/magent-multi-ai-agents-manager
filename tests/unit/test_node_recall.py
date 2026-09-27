@@ -1176,6 +1176,33 @@ class TestTheTarCarriesOnlyTheConversation:
         assert "link" in caught.value.stderr_tail
         assert fake_ssh.calls() == []
 
+    def test_a_source_this_pc_cannot_read_is_named_by_class_and_never_dials(
+        self, fake_ssh, tmp_path, monkeypatch, caplog
+    ):
+        # The OS's words and the file's path go to nodes.log; the text recall
+        # shows (through _tail) is ours plus the class.
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        error = PermissionError(13, "Access is denied", "C:/Users/me/held.jsonl")
+
+        def _denied(source, *, who):
+            raise error
+
+        monkeypatch.setattr(remote_mux, "_mirror_members", _denied)
+
+        with pytest.raises(remote_mux.RemoteError) as caught:
+            remote_mux.install_transcripts(
+                _NODE, "~/magent/api", _pulled(tmp_path), timeout_s=5
+            )
+
+        assert caught.value.rc is None
+        assert caught.value.stderr_tail == (
+            "could not read the pulled transcripts (PermissionError)"
+        )
+        assert "held.jsonl" not in str(caught.value)
+        assert "Access is denied" not in str(caught.value)
+        assert fake_ssh.calls() == []
+        assert any(str(error) in m for m in _node_logs(caplog)), _node_logs(caplog)
+
     def test_a_path_on_another_drive_is_never_within_the_source(self, tmp_path):
         # cq-G9 J5: on Windows commonpath raises ValueError across drives, and
         # that means "outside", never an escaping exception. Elsewhere the
@@ -3519,6 +3546,61 @@ class TestRecallTo:
         assert node_answers == []
         assert events == []
         assert nodes.read_node_map()["api"].nick == "second"
+
+
+class TestWhatANodeSaysReachesTheScreenAsPrintableAscii:
+    """A node's stderr (every _tail) and nodes' own words -- which can quote
+    the map's nick or root -- are shown through node_sync.printable: ESC and
+    non-ASCII never write to the terminal they are shown on."""
+
+    def test_a_multi_line_stderr_tail_is_one_printable_row(
+        self, runner, placed_api, node_answers, monkeypatch
+    ):
+        def _status(node, root, *, timeout_s):
+            raise remote_mux.RemoteError(
+                1, "fatal: not a repo\n\x1b[2J\u00e9crit", ("ssh",)
+            )
+
+        monkeypatch.setattr(remote_mux, "repo_status", _status)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 0, result.output
+        assert "\x1b" not in result.output
+        assert (
+            "could not read the repos on @second (fatal: not a repo; ?[2J?crit)"
+        ) in result.stdout
+
+    def test_nodes_own_words_are_printable_too(
+        self, runner, placed_api, node_answers, monkeypatch
+    ):
+        def _status(node, root, *, timeout_s):
+            raise nodes.NodeConfigError("root \x1b]0;x\x07~ is refused")
+
+        monkeypatch.setattr(remote_mux, "repo_status", _status)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 0, result.output
+        assert "\x1b" not in result.output and "\x07" not in result.output
+        assert (
+            "could not read the repos on @second (root ?]0;x?~ is refused)"
+        ) in result.stdout
+
+    def test_a_node_the_config_refuses_is_named_in_printable_ascii(
+        self, runner, placed_api, node_answers, monkeypatch
+    ):
+        def _refused(cfg, nick, *, local_user):
+            raise nodes.NodeConfigError("node \x1b[31msecond has no host")
+
+        monkeypatch.setattr(nodes, "node_for_nick", _refused)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert "\x1b" not in result.output
+        assert (
+            "@second cannot be reached from this config (node ?[31msecond has no host)"
+        ) in result.stdout
 
 
 def _node_logs(caplog) -> list[str]:
