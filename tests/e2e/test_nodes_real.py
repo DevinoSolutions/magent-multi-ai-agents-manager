@@ -461,8 +461,6 @@ class TestANodeHostsAProjectEndToEnd:
         _assert_nothing_created(rig)
 
     def test_d07_up_starts_the_session_on_the_node(self, rig: NodeRig) -> None:
-        from magent import psmux
-
         pc = rig.pcs[0]
         rig.reset_shim()
         run = rig.magent("up", tag="up-first")
@@ -491,7 +489,7 @@ class TestANodeHostsAProjectEndToEnd:
             ["git", "-C", rig.remote_dir, "rev-parse", "HEAD"], tag="node-head"
         )
         assert node_head.strip() == local_head
-        # The pane runs in the project folder and wears the node's brand.
+        # The pane runs in the project folder.
         where = rig.tmux(
             "display-message",
             "-p",
@@ -501,12 +499,6 @@ class TestANodeHostsAProjectEndToEnd:
             tag="pane-path",
         )
         assert where.out.strip() == rig.remote_dir, where.show()
-        brand, width = psmux.status_left(NICK)
-        for option, want in (("status-left", brand), ("status-left-length", width)):
-            got = rig.tmux(
-                "show-options", "-v", "-t", f"={rig.sid}", option, tag=option
-            )
-            assert got.out.rstrip("\n") == want, got.show()
 
         # The ignored .env shipped byte for byte at 0600; other ignored files
         # did not.
@@ -530,6 +522,32 @@ class TestANodeHostsAProjectEndToEnd:
         assert (entry.get("nick"), entry.get("sid")) == (NICK, rig.sid), entry
         assert entry.get("cwd") == rig.remote_dir, entry
         rig.passed.add("D7")
+
+    def test_d07b_the_session_wears_the_node_brand(self, rig: NodeRig) -> None:
+        # Its own test, so a cosmetic miss cannot skip the journey behind it.
+        # The session's OWN options, read without -g: a session that never got
+        # them reads empty here instead of showing the global value. The
+        # target is the pane form `=sid:` because tmux resolves set-option and
+        # show-options -t as a PANE target and applies `=` only to the session
+        # part of one: tmux 3.4 answers a bare `=sid` with "no such session".
+        from magent import psmux
+
+        _needs(rig, "D7")
+        brand, brand_len = psmux.status_left(NICK)
+        hints, hints_len = psmux.status_hints(psmux.code_on_path())
+        want = {
+            "status-left": brand,
+            "status-left-length": brand_len,
+            "status-right": hints,
+            "status-right-length": hints_len,
+        }
+        got = {
+            option: rig.tmux(
+                "show-options", "-v", "-t", f"={rig.sid}:", option, tag=option
+            ).out.rstrip("\n")
+            for option in want
+        }
+        assert got == want
 
     def test_d08_a_second_up_attaches_and_starts_nothing(self, rig: NodeRig) -> None:
         _needs(rig, "D7")
