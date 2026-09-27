@@ -3289,6 +3289,35 @@ class TestTheBringUpProvisionsFirst:
         assert attempts == ["second"]
         assert [nick for nick, _ in rig.recipes] == ["second"]
 
+    def test_an_over_cap_provision_fails_that_project_and_is_never_retried(
+        self, rig, api, monkeypatch, tmp_path, caplog
+    ):
+        # RemoteError.outcome_unknown, not timed_out alone: an over-cap reply
+        # killed the local ssh mid-apply too, and a retry would start a second
+        # applier beside the first.
+        attempts: list[str] = []
+
+        def provision_node(node, config, **kw):
+            attempts.append(node.nick)
+            raise RemoteError(None, "reply exceeded 8 bytes", ("ssh",), over_cap=True)
+
+        monkeypatch.setattr(remote_mux, "provision_node", provision_node)
+        web = _web(tmp_path, rig)
+        config = _config(api, web)
+        with caplog.at_level(logging.WARNING, logger="magent.nodes"):
+            first = launch.bring_up_node_project(config, api)
+        assert not first.ok
+        assert first.error == "provisioning: reply exceeded 8 bytes"
+        assert "second" in launch._PROVISIONED
+        assert any(
+            message.startswith("provision @second: outcome unknown (")
+            for _, level, message in caplog.record_tuples
+            if level == logging.WARNING
+        )
+        assert launch.bring_up_node_project(config, web).ok
+        assert attempts == ["second"]
+        assert [nick for nick, _ in rig.recipes] == ["second"]
+
     def test_a_fail_row_is_logged_and_the_session_still_comes_up(
         self, rig, api, fake_ssh, monkeypatch, caplog
     ):

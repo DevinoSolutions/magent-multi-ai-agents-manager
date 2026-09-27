@@ -1747,8 +1747,9 @@ def _provision_once(node: Node, config: MagentConfig) -> None:
     ``remote_mux.provision_node`` (DECISION-24) and records the node once that
     call returns. A ``RemoteError`` is logged and re-raised, failing this
     project: an unreachable node is left unrecorded so the next project on it
-    retries, but a timed-out one is recorded, because its outcome is unknown
-    and a retry would start a second applier beside the first.
+    retries, but one whose outcome is unknown (a timeout, an over-cap reply)
+    is recorded, because a retry would start a second applier beside the
+    first.
     ``config`` is here from day one so K needs no signature change.
     Called under the node's lock, after every refusal -- a refused project
     never provisions anything, and ``--dry-run`` never calls it."""
@@ -1763,11 +1764,10 @@ def _provision_once(node: Node, config: MagentConfig) -> None:
             node, config, home=Path.home(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
         )
     except remote_mux.RemoteError as exc:
-        # D-MERGE: switch to exc.outcome_unknown (RemoteError property, D17)
-        # once D lands -- a kill after an oversize reply is unknown too.
-        if exc.timed_out:
-            # A killed ssh does not stop the apply on the node (RemoteError):
-            # this run never provisions the node again.
+        if exc.outcome_unknown:
+            # A killed ssh -- at the timeout or past the reply cap -- does not
+            # stop the apply on the node (RemoteError): this run never
+            # provisions the node again.
             _PROVISIONED.add(node.nick)
             log.warning(
                 "provision @%s: outcome unknown (%s); not retrying this run",
