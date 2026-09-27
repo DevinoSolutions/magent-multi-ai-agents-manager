@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from magent import agent_state, cli
+from magent import agent_state, cli, psmux
 from magent.cli import status as status_mod
 from tests.unit._fake_panes import fake_process_side, pane_tree
 
@@ -768,6 +768,33 @@ class TestIdleColumnNeedsPositiveProof:
             snapshot_fails=True,
         )
         assert rows["api"]["idle"] is False
+
+    def test_the_verdict_reuses_the_tables_foreground_readings(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _both_off(monkeypatch)
+        (tmp_path / "api").mkdir()
+        _fake_psmux(
+            monkeypatch,
+            [{"name": "api", "session": "api", "group": None}],
+            [{"name": "api", "session": "api", "resolved": str(tmp_path / "api")}],
+            {"api": "pwsh"},
+        )
+        fan_outs: list[list[str]] = []
+        table = psmux.pane_current_commands  # the fake _fake_psmux installed
+
+        def _counting(names, psmux=None):
+            fan_outs.append(list(names))
+            return table(names, psmux=psmux)
+
+        monkeypatch.setattr("magent.psmux.pane_current_commands", _counting)
+        cfgpath = tmp_config({"projects": []})
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
+
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["psmux_sessions"][0]["idle"] is True
+        assert fan_outs == [["api"]]
 
 
 class TestPsmuxSessionsJson:
