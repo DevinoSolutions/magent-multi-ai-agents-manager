@@ -1273,7 +1273,10 @@ def _destination(
     cfg: MagentConfig, proj: ProjectConfig, held: NodeMapEntry, to_nick: str
 ) -> tuple[Node, str]:
     """Everything ``--to`` can refuse, checked BEFORE the source session is
-    touched: the node and the session root the conversation goes to."""
+    touched: the node and the session root the conversation goes to. The
+    move is a placement, so it gets every placement's folder check (X3):
+    a node folder name another project would share is refused here, not
+    after the session is stopped."""
     # heavy subsystem: in-body per policy
     from magent import launch, node_sync, nodes, remote_mux
 
@@ -1302,6 +1305,13 @@ def _destination(
     except (OSError, ValueError, remote_mux.RemoteError) as exc:
         text = _local_failure(exc, f"recall could not build {name}'s recipe")
         _fail(f"cannot build {name}'s recipe ({text})", _EXIT_USAGE)
+    clash = launch.node_folder_refusal(cfg, moved)
+    if clash is not None:
+        _fail(
+            f"cannot move {name} to @{to_nick}: {node_sync.printable(clash)};"
+            " nothing was touched",
+            _EXIT_USAGE,
+        )
     return target, recipe.remote_root
 
 

@@ -3439,6 +3439,59 @@ class TestRecallTo:
         assert f"installed the conversation on @third in {_landed()}" in result.stdout
         assert "kept the node's" not in result.stdout
 
+    def test_a_folder_name_another_project_shares_refuses_before_the_source(
+        self, runner, api_repo, tmp_path, tmp_config, node_answers, moving
+    ):
+        # Flag 3: the move is a placement, so X3 applies. api-y's folder is
+        # also called "api"; on @third api would be a newcomer to that name.
+        events, _ = moving
+        rival = tmp_path / "other" / "api"
+        rival.mkdir(parents=True)
+        nodes.update_node_map("api", entry("second"))
+        write_transcript("second", "api", SESSION_ID, mtime=NOW)
+        cfg = tmp_config(
+            config_json(
+                ("second", "third", "fourth"),
+                [
+                    {"path": str(api_repo), "title": "api", "node": "auto"},
+                    {"path": str(rival), "title": "api-y", "node": "fourth"},
+                ],
+            )
+        )
+
+        result = _invoke_recall_to(runner, cfg, "third")
+
+        assert result.exit_code == 2
+        assert "cannot move api to @third:" in result.stderr
+        assert "'api' and 'api-y' would share" in result.stderr
+        assert "nothing was touched" in result.stderr
+        assert node_answers == []  # no pull, no repo read, no kill
+        assert events == []  # no install, no bring-up
+        assert nodes.read_node_map()["api"].nick == "second"
+
+    def test_a_fleet_with_no_shared_folder_name_moves(
+        self, runner, api_repo, tmp_path, tmp_config, node_answers, moving
+    ):
+        events, _ = moving
+        other = tmp_path / "other" / "web"
+        other.mkdir(parents=True)
+        nodes.update_node_map("api", entry("second"))
+        write_transcript("second", "api", SESSION_ID, mtime=NOW)
+        cfg = tmp_config(
+            config_json(
+                ("second", "third", "fourth"),
+                [
+                    {"path": str(api_repo), "title": "api", "node": "auto"},
+                    {"path": str(other), "title": "web", "node": "third"},
+                ],
+            )
+        )
+
+        result = _invoke_recall_to(runner, cfg, "third")
+
+        assert result.exit_code == 0
+        assert [e[0] for e in events] == ["install", "bring_up"]
+
     def test_the_new_nodes_sync_is_started_as_a_bring_up_starts_it(
         self, runner, placed_api, node_answers, moving, sync_starts
     ):

@@ -2398,6 +2398,44 @@ def _folder_clashes(
     return clash
 
 
+def _fleet_folder_clashes(
+    config: MagentConfig, projects: list[ProjectConfig]
+) -> tuple[dict[str, tuple[str, Recipe, bool]], dict[str, str]]:
+    """X3 over the WHOLE fleet with ``projects`` in it: ``(placed, clash)``,
+    ``_placement_recipes``' ``{sid: (nick, recipe, holder)}`` and
+    ``_folder_clashes``' ``{sid: why}``, read from config and the map alone."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    # A copy in ``projects`` wins over config's: the placement phase hands
+    # over an auto project already turned into a nick, and writes nothing to
+    # the map until it is up -- config's "auto" copy would place nowhere, and
+    # the folder it is about to be cloned into would go unchecked.
+    batch = {nodes.node_sid(proj): proj for proj in projects}
+    listed = nodes.node_projects(config)
+    known = {nodes.node_sid(proj) for proj in listed}
+    fleet = [batch.get(nodes.node_sid(proj), proj) for proj in listed]
+    fleet += [proj for proj in projects if nodes.node_sid(proj) not in known]
+    held, unreadable = _node_map_for_placement()
+    placed = _placement_recipes(config, fleet, held, map_known=unreadable is None)
+    return placed, _folder_clashes(placed, unreadable)
+
+
+def node_folder_refusal(config: MagentConfig, proj: ProjectConfig) -> str | None:
+    """X3 for ONE project about to be placed (``recall --to``'s moved copy):
+    the refusal ``up`` would give it -- a newcomer to a node folder name
+    another project would share -- or None. Config and the map only: no ssh,
+    no git, so a caller can ask before it touches anything."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    placed, clash = _fleet_folder_clashes(config, [proj])
+    sid = nodes.node_sid(proj)
+    if sid in clash and not placed[sid][2]:
+        return clash[sid]
+    return None
+
+
 def _run_node_bring_ups(
     config: MagentConfig,
     projects: list[ProjectConfig],
@@ -2432,18 +2470,7 @@ def _run_node_bring_ups(
 
     if not projects:
         return []
-    # A batch project's copy wins over config's: the placement phase hands
-    # over an auto project already turned into a nick, and writes nothing to
-    # the map until it is up -- config's "auto" copy would place nowhere, and
-    # the folder it is about to be cloned into would go unchecked.
-    batch = {nodes.node_sid(proj): proj for proj in projects}
-    listed = nodes.node_projects(config)
-    known = {nodes.node_sid(proj) for proj in listed}
-    fleet = [batch.get(nodes.node_sid(proj), proj) for proj in listed]
-    fleet += [proj for proj in projects if nodes.node_sid(proj) not in known]
-    held, unreadable = _node_map_for_placement()
-    placed = _placement_recipes(config, fleet, held, map_known=unreadable is None)
-    clash = _folder_clashes(placed, unreadable)
+    placed, clash = _fleet_folder_clashes(config, projects)
     outcomes: dict[str, NodeBringUpOutcome] = {}
     for proj in projects:
         sid = nodes.node_sid(proj)
