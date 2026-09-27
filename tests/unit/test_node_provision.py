@@ -8,6 +8,7 @@ from __future__ import annotations
 import inspect
 import io
 import json
+import logging
 import os
 import re
 import shlex
@@ -1615,6 +1616,20 @@ TOKEN = "gho_FAKE0123456789abcdefTOKEN"
 GhUnavailable = remote_mux.GhUnavailable
 
 
+def _nodes_log(caplog: pytest.LogCaptureFixture) -> str:
+    """The nodes log at WARNING: where gh's words and a refusal's text go,
+    and never higher -- an ERROR record is a Sentry event (sentry.py:
+    event_level=ERROR), and one carries the class and errno only."""
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], [
+        r.getMessage() for r in caplog.records
+    ]
+    return "\n".join(
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "magent.nodes" and r.levelno == logging.WARNING
+    )
+
+
 class TestThisPcsGh:
     def test_no_gh_is_named_missing_for_the_account_and_the_token(self):
         # The autouse _no_real_gh guard: nothing resolved, nothing spawned.
@@ -2235,7 +2250,7 @@ class TestProvision:
         assert row.detail.isascii()
         assert said not in row.detail
         assert TOKEN not in row.detail
-        assert said in caplog.text
+        assert said in _nodes_log(caplog)
         assert TOKEN not in caplog.text
 
     def test_a_rejected_login_shares_nothing_and_says_why(self, fake_ssh, fake_gh):
@@ -2484,7 +2499,7 @@ class TestProvision:
                 "see the nodes log",
             ),
         )
-        assert "gh token has characters the payload cannot frame" in caplog.text
+        assert "gh token has characters the payload cannot frame" in _nodes_log(caplog)
         assert TOKEN not in repr(report)
         assert TOKEN not in caplog.text
 
@@ -2507,7 +2522,7 @@ class TestProvision:
             "not sent -- this PC refused the payload (UnicodeEncodeError); "
             "see the nodes log",
         )
-        assert "surrogates not allowed" in caplog.text
+        assert "surrogates not allowed" in _nodes_log(caplog)
 
     def test_a_scope_whose_only_stdio_command_is_no_program_never_ships_it(
         self, fake_ssh
@@ -4201,7 +4216,7 @@ class TestGhsOwnWordsStayOffTheScreen:
         screen = _on_screen(report.lines)
         for gh_words in ("proxyconnect", "https://", "10.1.2.3", "dial tcp"):
             assert gh_words not in screen
-        assert PROXY_REFUSED in caplog.text
+        assert PROXY_REFUSED in _nodes_log(caplog)
         assert "proxyconnect" not in repr(remote_mux.local_gh_account())
 
     def test_a_keyring_failure_is_a_class_only_row(self, fake_ssh, fake_gh, caplog):
@@ -4215,7 +4230,7 @@ class TestGhsOwnWordsStayOffTheScreen:
         screen = _on_screen(report.lines)
         assert "keyring" not in screen
         assert "dbus" not in screen
-        assert KEYRING_FAILED in caplog.text
+        assert KEYRING_FAILED in _nodes_log(caplog)
         assert "dbus" not in repr(remote_mux.local_gh_token())
 
     def test_a_failed_lookup_is_a_class_only_github_key_row(self, fake_gh, caplog):
@@ -4237,7 +4252,7 @@ class TestGhsOwnWordsStayOffTheScreen:
         )
         for gh_words in ("https://", "lookup", "no such host", "dial tcp"):
             assert gh_words not in row.detail
-        assert NO_SUCH_HOST in caplog.text
+        assert NO_SUCH_HOST in _nodes_log(caplog)
         assert "no such host" not in repr(remote_mux.local_gh_account())
         assert _adds(fake_gh) == []
 
@@ -4248,7 +4263,7 @@ class TestGhsOwnWordsStayOffTheScreen:
         assert row == ScriptLine(
             "fail", "github-key", "this PC's gh failed; see the nodes log"
         )
-        assert PROXY_REFUSED in caplog.text
+        assert PROXY_REFUSED in _nodes_log(caplog)
 
     def test_a_failed_add_is_a_class_only_github_key_row(self, fake_gh, caplog):
         caplog.set_level("WARNING", logger="magent.nodes")
@@ -4258,7 +4273,7 @@ class TestGhsOwnWordsStayOffTheScreen:
         assert row == ScriptLine("fail", "github-key", ADD_FAILED_ROW)
         for gh_words in ("https://", "10.1.2.3", "proxyconnect", "keyring", "dbus"):
             assert gh_words not in row.detail
-        assert f"{ADD_LOGGED} failed: {ADD_REFUSED_LAST}" in caplog.text
+        assert f"{ADD_LOGGED} failed: {ADD_REFUSED_LAST}" in _nodes_log(caplog)
 
     def test_a_failed_add_logs_gh_s_words_scrubbed(self, fake_gh, caplog):
         caplog.set_level("WARNING", logger="magent.nodes")
@@ -4266,7 +4281,8 @@ class TestGhsOwnWordsStayOffTheScreen:
         fake_gh.set_reply("ssh-key add", stderr=f"HTTP 401: bad token {TOKEN}\n", rc=1)
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         assert row == ScriptLine("fail", "github-key", ADD_FAILED_ROW)
-        assert f"{ADD_LOGGED} failed: HTTP 401: bad token <redacted>" in caplog.text
+        logged = _nodes_log(caplog)
+        assert f"{ADD_LOGGED} failed: HTTP 401: bad token <redacted>" in logged
         assert TOKEN not in caplog.text
 
     def test_a_failed_add_of_a_named_class_prints_its_repair(self, fake_gh, caplog):
@@ -4281,7 +4297,7 @@ class TestGhsOwnWordsStayOffTheScreen:
             f"gh ssh-key add failed; {GhUnavailable('too-old').hint}",
         )
         assert "unknown flag" not in row.detail
-        assert f"{ADD_LOGGED} too-old: unknown flag: --type" in caplog.text
+        assert f"{ADD_LOGGED} too-old: unknown flag: --type" in _nodes_log(caplog)
 
     def test_a_failed_add_that_said_nothing_logs_its_exit(self, fake_gh, caplog):
         caplog.set_level("WARNING", logger="magent.nodes")
@@ -4289,7 +4305,7 @@ class TestGhsOwnWordsStayOffTheScreen:
         fake_gh.set_reply("ssh-key add", rc=3)
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         assert row == ScriptLine("fail", "github-key", ADD_FAILED_ROW)
-        assert f"{ADD_LOGGED} failed: exited 3" in caplog.text
+        assert f"{ADD_LOGGED} failed: exited 3" in _nodes_log(caplog)
 
     def test_the_repr_never_carries_gh_s_words(self):
         refusal = GhUnavailable("failed", detail=PROXY_REFUSED)
@@ -4425,7 +4441,7 @@ class TestRegisterSshKey:
         fake_gh.set_reply("ssh-key add", stderr=REFUSED_ADD_STDERR, rc=1)
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         assert row == ScriptLine("fail", "github-key", ADD_FAILED_ROW)
-        assert "key is already in use" in caplog.text
+        assert "key is already in use" in _nodes_log(caplog)
 
     def test_another_key_of_the_same_type_is_not_a_match(self, fake_gh):
         fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
@@ -4499,7 +4515,7 @@ class TestRegisterSshKey:
         fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
         fake_gh.set_reply("ssh-key add", stderr=REFUSED_ADD_STDERR, rc=1)
         remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
-        assert f"{ADD_LOGGED} failed: key is already in use" in caplog.text
+        assert f"{ADD_LOGGED} failed: key is already in use" in _nodes_log(caplog)
         assert "HTTP 422" not in caplog.text
 
     def test_gh_finding_the_key_itself_is_a_skip_not_a_did(self, fake_gh):
