@@ -3010,8 +3010,10 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         said = self._clocked_down(runner, tmp_config, monkeypatch, tmp_path, pulls=True)
         assert late.kills == [4242]
         assert said == [
-            "Could not tell whether the node sync daemon stopped"
-            " (PermissionError); see nodes.log",
+            (
+                "Could not tell whether the node sync daemon stopped"
+                " (PermissionError); see nodes.log"
+            ),
             "Stopped the node sync daemon.",
         ]
 
