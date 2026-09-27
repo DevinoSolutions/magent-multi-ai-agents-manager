@@ -1721,6 +1721,24 @@ class TestThisPcsGh:
         assert account.hint.endswith("gh auth login -h github.com")
         assert "network" not in account.hint
 
+    # Either marker alone is a refusal: a 401 worded some other way, or "Bad
+    # credentials" without its status, must never read as offline and ship.
+    @pytest.mark.parametrize(
+        "error",
+        [
+            "HTTP 401: Requires authentication (https://api.github.com/)",
+            "authentication failed: Bad Credentials",
+        ],
+    )
+    def test_each_refusal_marker_alone_is_rejected(self, fake_gh, error):
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(None, accounts=[("b", True, "error", error)]),
+        )
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, GhUnavailable)
+        assert account.reason == "rejected"
+
     @pytest.mark.parametrize(
         "var",
         ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"],
@@ -1883,6 +1901,13 @@ class TestThisPcsGh:
         )
         assert remote_mux.local_gh_token() == GhUnavailable(
             "not-logged-in", detail="no oauth token found for github.com"
+        )
+
+    def test_gh_s_other_logged_out_wording_is_not_logged_in(self, fake_gh):
+        said = "You are not logged into any GitHub hosts. To log in, run: gh auth login"
+        fake_gh.set_reply("auth token", stderr=said + "\n", rc=1)
+        assert remote_mux.local_gh_token() == GhUnavailable(
+            "not-logged-in", detail=said
         )
 
     def test_a_failed_token_read_with_a_token_on_stdout_is_not_shipped(self, fake_gh):
@@ -2280,6 +2305,32 @@ class TestProvision:
             )
             in report.lines
         )
+
+    def test_a_401_without_bad_credentials_shares_nothing(self, fake_ssh, fake_gh):
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(
+                None,
+                accounts=[("amin", True, "error", "HTTP 401: Requires authentication")],
+            ),
+        )
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        (call,) = fake_ssh.calls()
+        assert _sent(call).startswith(b"\n")
+        assert TOKEN.encode("ascii") not in call.stdin
+        assert [line for line in report.lines if line.item == "gh"] == [
+            ScriptLine(
+                "warn",
+                "gh",
+                (
+                    "not shared -- github.com rejected this PC's gh login: "
+                    "gh auth login -h github.com"
+                ),
+            )
+        ]
 
     def test_a_token_read_that_fails_shares_nothing_and_says_why(
         self, fake_ssh, fake_gh
