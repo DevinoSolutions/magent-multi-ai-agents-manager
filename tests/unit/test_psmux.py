@@ -294,6 +294,93 @@ class TestPaneCurrentCommands:
         assert psmux.pane_current_commands([], psmux="psmux") == {}
 
 
+class _HungProbe:
+    """A pane probe psmux never answers: ``communicate`` waits out whatever
+    budget it is handed, then times out -- what a wedged server does."""
+
+    def __init__(self):
+        self.killed = False
+        self.waited: list[float] = []
+
+    def communicate(self, timeout=None):
+        self.waited.append(timeout or 0.0)
+        time.sleep(max(timeout or 0.0, 0.0))
+        raise subprocess.TimeoutExpired(cmd="psmux", timeout=timeout or 0)
+
+    def poll(self):
+        return None
+
+    def kill(self):
+        self.killed = True
+
+
+class _AnsweredProbe:
+    """A probe that already exited with its answer. Like the real pipe reader,
+    a zero budget can time out before the output is handed over."""
+
+    returncode = 0
+
+    def __init__(self, stdout):
+        self._stdout = stdout
+
+    def communicate(self, timeout=None):
+        if timeout is not None and timeout <= 0:
+            raise subprocess.TimeoutExpired(cmd="psmux", timeout=timeout)
+        return self._stdout, ""
+
+    def poll(self):
+        return 0
+
+    def kill(self):
+        pass
+
+
+class TestTheFanOutWaitsOnOneDeadline:
+    """Every probe is spawned before any is read, so they all run at once --
+    and the WAIT is one budget too. Waiting a full timeout per probe meant a
+    fleet whose psmux hangs cost N x timeout, and that fan-out now sits on the
+    attach path (``up --json --revive`` over ssh) as well as ``status``. A
+    probe still unanswered at the deadline is unknown (``""``), which the idle
+    verdict reads as NOT idle."""
+
+    BUDGET_S = 0.5
+
+    def _fan(self, monkeypatch, probes):
+        queue = list(probes)
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: queue.pop(0))
+        monkeypatch.setattr(psmux, "_FAN_OUT_TIMEOUT_S", self.BUDGET_S, raising=False)
+
+    def test_n_hung_probes_cost_one_budget_not_n(self, monkeypatch):
+        hung = [_HungProbe() for _ in range(4)]
+        self._fan(monkeypatch, hung)
+        names = [f"p{i}" for i in range(4)]
+
+        started = time.monotonic()
+        readings = psmux.pane_current_commands(names, psmux="psmux")
+        elapsed = time.monotonic() - started
+
+        # One budget plus scheduling slack; a per-probe wait is 4 budgets.
+        assert elapsed < self.BUDGET_S * 2.5, elapsed
+        assert readings == dict.fromkeys(names, "")
+        assert all(p.killed for p in hung)
+
+    def test_the_pane_pid_probe_shares_the_bound(self, monkeypatch):
+        self._fan(monkeypatch, [_HungProbe() for _ in range(4)])
+        started = time.monotonic()
+        pids = psmux.pane_pids(["a", "b", "c", "d"], psmux="psmux")
+        assert time.monotonic() - started < self.BUDGET_S * 2.5
+        assert pids == dict.fromkeys("abcd")
+
+    def test_an_answer_that_arrived_in_time_is_still_read(self, monkeypatch):
+        # The hung probe spends the whole budget; the one after it had already
+        # answered, and "answered by the deadline" is not "unknown".
+        self._fan(monkeypatch, [_HungProbe(), _AnsweredProbe("pwsh\n")])
+        assert psmux.pane_current_commands(["a", "b"], psmux="psmux") == {
+            "a": "",
+            "b": "pwsh",
+        }
+
+
 class TestIsIdleCommand:
     """The foreground HINT: one of `idle_sessions`' conditions, never a verdict
     on its own (a live agent running its Bash tool reads `bash`)."""
