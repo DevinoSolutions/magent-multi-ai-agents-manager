@@ -748,6 +748,15 @@ class TestUserScopePluginsAndSkills:
         assert [f.path for f in scope.skills] == ["mine/SKILL.md"]
         assert scope.notes == ("skills/synced: claude.ai-managed copies, not shipped",)
 
+    # claude.ai's copies are a FOLDER; the note is read off the root's own
+    # listing, so a file the user named synced ships with no note of it.
+    def test_a_file_named_synced_is_no_managed_copy(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "synced", b"my notes\n")
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["synced"]
+        assert scope.notes == ()
+
     # A link in ~/.claude/skills is one the user made -- a repo checked out
     # elsewhere is the main case -- so the walk FOLLOWS it out of the root, a
     # Windows junction exactly like a symlink. Deliberately not containment
