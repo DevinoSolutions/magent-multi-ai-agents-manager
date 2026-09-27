@@ -517,6 +517,19 @@ class TestIdleSessions:
             ["api"], psmux="psmux", foreground={"api": "pwsh"}
         ) == {"api"}
 
+    def test_a_session_missing_from_held_readings_is_not_idle(self, monkeypatch):
+        # A caller's held readings that lack a session say nothing about it:
+        # "no reading" must never stand in for "a shell".
+        fake_panes(
+            monkeypatch, foreground={}, pids={"api": 100}, snapshot=pane_tree(100)
+        )
+        monkeypatch.setattr(
+            psmux,
+            "pane_current_commands",
+            lambda names, psmux=None: pytest.fail("re-probed a held reading"),
+        )
+        assert psmux.idle_sessions(["api"], psmux="psmux", foreground={}) == set()
+
     def test_every_registry_agent_and_its_runtime_counts(self, monkeypatch):
         from magent.sessions import agent_image_names
 
@@ -843,6 +856,10 @@ class TestReviveNeverTypesIntoALiveAgent:
             # Codex: its node shim over the native binary.
             ("cmd.exe", "node.exe", "codex.exe", "pwsh.exe"),
             ("cmd.exe", "codex.exe", "bash.exe"),
+            # A human opened a nested shell and started the agent in it: nothing
+            # at depth 1 is a launcher or an agent, so only the whole subtree
+            # sees it.
+            ("pwsh.exe", "claude.exe", "bash.exe"),
         ],
     )
     def test_the_agent_is_found_at_any_depth_under_any_launcher(
