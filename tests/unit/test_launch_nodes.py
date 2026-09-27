@@ -2494,13 +2494,23 @@ class TestABringUpKeepsTheSyncDaemonRunning:
         ]
 
     def test_up_survives_a_daemon_that_cannot_start(self, rig, api, cannot_start):
-        assert launch.bring_up_psmux(_config(api)) == (["api"], [])
+        # An escaping error is a failed ASSERTION here, not a crash of the
+        # test: a guard gone and a broken rig must not read the same.
+        try:
+            got: object = launch.bring_up_psmux(_config(api))
+        except OSError as exc:
+            got = exc
+        assert got == (["api"], [])
         assert any("node sync daemon not started" in m for m in cannot_start())
 
     def test_go_survives_a_daemon_that_cannot_start(
         self, rig, api, cannot_start, desk, no_sleep
     ):
-        assert launch.run_magent(_config(api), launch.RunOpts()) == 0
+        try:
+            got: object = launch.run_magent(_config(api), launch.RunOpts())
+        except OSError as exc:
+            got = exc
+        assert got == 0
         assert any("node sync daemon not started" in m for m in cannot_start())
 
     def test_the_up_command_hands_it_the_file_it_read(
