@@ -941,6 +941,28 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         assert "'api-y'" in (outcomes[0].error or "")
         assert rig.recipes == []
 
+    def test_the_batchs_placed_copy_of_an_auto_project_is_the_one_checked(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # The placement phase hands the batch an auto project already turned
+        # into a nick, and writes nothing to the map until it is up. Config's
+        # copy still says "auto" with no record, which places nowhere: checked
+        # instead of the batch's, api-y would be cloned into the folder api-x
+        # holds on second.
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        placed = dataclasses.replace(y_api, node="second")
+        _no_contact_for(monkeypatch, rig, "api-x", "api-y")
+        outcomes = launch._run_node_bring_ups(
+            _config(x_api, y_api), [x_api, placed], allow_dirty=False, window=False
+        )
+        assert [(o.sid, o.ok, o.node) for o in outcomes] == [
+            ("api-x", False, "second"),
+            ("api-y", False, "second"),
+        ]
+        assert "'api-x' and 'api-y' would share" in (outcomes[1].error or "")
+        assert rig.recipes == []
+
     def test_the_rule_is_asked_once_over_the_whole_fleet(
         self, rig, tmp_path, monkeypatch
     ):

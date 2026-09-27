@@ -2390,8 +2390,14 @@ def _run_node_bring_ups(
 
     if not projects:
         return []
-    fleet = nodes.node_projects(config)
-    known = {nodes.node_sid(proj) for proj in fleet}
+    # A batch project's copy wins over config's: the placement phase hands
+    # over an auto project already turned into a nick, and writes nothing to
+    # the map until it is up -- config's "auto" copy would place nowhere, and
+    # the folder it is about to be cloned into would go unchecked.
+    batch = {nodes.node_sid(proj): proj for proj in projects}
+    listed = nodes.node_projects(config)
+    known = {nodes.node_sid(proj) for proj in listed}
+    fleet = [batch.get(nodes.node_sid(proj), proj) for proj in listed]
     fleet += [proj for proj in projects if nodes.node_sid(proj) not in known]
     held, unreadable = _node_map_for_placement()
     placed = _placement_recipes(config, fleet, held, map_known=unreadable is None)
