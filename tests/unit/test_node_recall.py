@@ -3606,27 +3606,27 @@ class TestWhatANodeSaysReachesTheScreenAsPrintableAscii:
         self, runner, placed_api, node_answers, monkeypatch
     ):
         def _status(node, root, *, timeout_s):
-            return [nodes.RepoStatus(root, "b" * 40, "ma[31min", False, 0)]
+            return [nodes.RepoStatus(root, "b" * 40, "ma\x1b[31min", False, 0)]
 
         monkeypatch.setattr(remote_mux, "repo_status", _status)
 
         result = _recall(runner, placed_api, "--local")
 
         assert result.exit_code == 0, result.output
-        assert "" not in result.output
+        assert "\x1b" not in result.output
         assert f"{'b' * 12} on ma?[31min  clean" in result.stdout
 
     def test_the_names_the_nodes_copy_replaced_are_printable(
         self, runner, placed_api, node_answers, monkeypatch
     ):
         monkeypatch.setattr(
-            remote_mux, "copy_mirror", lambda source, dest: ("[2Jé.jsonl",)
+            remote_mux, "copy_mirror", lambda source, dest: ("\x1b[2J\u00e9.jsonl",)
         )
 
         result = _recall(runner, placed_api, "--local")
 
         assert result.exit_code == 0, result.output
-        assert "" not in result.output
+        assert "\x1b" not in result.output
         assert "with the node's copy: ?[2J?.jsonl" in result.stdout
 
 
