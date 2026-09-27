@@ -10,7 +10,9 @@ What this proves (against a live psmux server, zero stubs):
   working directory back from the live pane;
 * after ``kill_server``, ``pane_cwd`` degrades to ``""`` promptly (well inside
   its 3s subprocess-timeout guard) and ``has_session`` is false -- the exact
-  degradation the guard promises callers that fan this across sessions.
+  degradation the guard promises callers that fan this across sessions;
+* ``psmux.idle_sessions`` reads a real pane as idle only while nothing magent
+  typed into it is running -- see the section above its test.
 
 Skips cleanly when psmux is not installed or the platform has no psmux
 support (macOS/Linux, and CI runners without the binary).
@@ -164,6 +166,165 @@ def test_real_session_pane_cwd_and_kill(tmp_path):
             psmux.kill_server(name)  # idempotent; only ever targets our name
 
     assert not psmux.has_session(name), f"cleanup left psmux session {name!r} alive"
+
+
+# --- idle_sessions against a REAL pane -----------------------------------------
+#
+# The unit tier proves idle_sessions' rule against fake snapshots. This proves
+# the readings the rule rests on are what a real psmux pane produces: that
+# #{pane_pid} is the pane's own shell, and that what magent types into a pane
+# (`cmd /c <command>`, platform/windows.py::_send_argv) sits under that shell
+# for exactly as long as the command runs. Each phase asks twice: the call as
+# revive makes it, and once with the foreground forced to a shell -- the reading
+# measured live while an agent runs its Bash tool -- so the process-tree half is
+# proven on its own instead of hiding behind psmux's foreground filter.
+#
+# This tier has no HOME isolation, so the test touches nothing but its own
+# private -L socket and tmp_path. The session is driven by raw psmux argv
+# against that one socket, not launch_psmux_session (which decorates, verifies
+# and can log under the real ~/.magent), and every process it starts ends on
+# its own bound even if the teardown never runs.
+
+
+def test_real_pane_reads_idle_only_while_nothing_it_launched_runs(tmp_path):
+    from magent.platform.windows import _ps_quote, _send_argv
+    from magent.procs import process_tree, snapshot_processes
+
+    binary = psmux.find_psmux()
+    assert binary is not None  # module pytestmark guarantees it
+    ping = shutil.which("ping")
+    assert ping is not None, "PING.EXE not on PATH"
+    holder_shell = "pwsh" if shutil.which("pwsh") else "powershell"
+
+    unique = uuid.uuid4().hex[:12]
+    name = f"mdrl-idl-{unique}"
+    workdir = tmp_path / f"cwd-{unique}"
+    workdir.mkdir()
+
+    # The launched command: a shell-named child that says it started, then
+    # holds until released (or 120s pass, whatever happens to the test).
+    started = tmp_path / "started"
+    release = tmp_path / "release"
+    hold = tmp_path / "hold.ps1"
+    hold.write_text(
+        f"New-Item -ItemType File -Force -Path {_ps_quote(str(started))} | Out-Null\n"
+        "$until = (Get-Date).AddSeconds(120)\n"
+        f"while (-not (Test-Path -LiteralPath {_ps_quote(str(release))})"
+        " -and (Get-Date) -lt $until) {\n"
+        "    Start-Sleep -Milliseconds 200\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    # The agent image: PING.EXE under the name claude.exe, alive ~9s.
+    stand_in = tmp_path / "claude.exe"
+    shutil.copyfile(ping, stand_in)
+
+    def run(*args: str, env: dict[str, str] | None = None):
+        return subprocess.run(
+            [binary, "-L", name, *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=env,
+        )
+
+    def idle(forced: bool = False) -> bool:
+        foreground = {name: "pwsh"} if forced else None
+        return name in psmux.idle_sessions([name], psmux=binary, foreground=foreground)
+
+    def pane_images() -> list[str]:
+        pid = psmux.pane_pids([name], psmux=binary).get(name)
+        tree = process_tree(pid, snapshot_processes() or []) if pid else None
+        return [image.lower() for image, _pid, _ppid in tree or []]
+
+    def diag() -> str:
+        return (
+            f"foreground={psmux.pane_current_commands([name], psmux=binary)!r}"
+            f" pane tree={pane_images()!r}"
+        )
+
+    created = False
+    try:
+        created = True  # a create that timed out may still have a server up
+        # env=child_env(): psmux's nesting guard refuses new-session from
+        # inside a psmux pane while still exiting 0 (see launch_psmux_session).
+        new = run(
+            "new-session", "-d", "-s", name, "-c", str(workdir), env=psmux.child_env()
+        )
+        assert new.returncode == 0, f"new-session failed: {new.stderr!r}"
+        assert _wait_until(lambda: psmux.has_session(name), timeout=10), (
+            f"psmux session {name!r} never came up"
+        )
+
+        # 1. A pane at rest is idle -- the baseline every later phase departs
+        #    from, and the reading revive acts on.
+        assert _wait_until(idle, timeout=30), (
+            f"a resting pane never read idle: {diag()}"
+        )
+        assert idle(forced=True), f"a resting pane's tree read busy: {diag()}"
+
+        # 2. The launcher: magent's own send argv around a shell-named command.
+        send = _send_argv(
+            binary,
+            PsmuxWindowOpts(
+                window_name=name,
+                cwd=str(workdir),
+                command=(
+                    f'{holder_shell} -NoProfile -ExecutionPolicy Bypass -File "{hold}"'
+                ),
+            ),
+        )
+        subprocess.run(send, capture_output=True, timeout=30, check=False)
+        if not _wait_until(started.exists, timeout=15) and idle():
+            # PSReadLine can swallow keys typed while it initialises (measured
+            # on the bring-up path); one re-send, and only while the pane is
+            # provably still at rest -- the rule revive itself follows.
+            subprocess.run(send, capture_output=True, timeout=30, check=False)
+        assert _wait_until(started.exists, timeout=30), (
+            f"the launched command never ran: {diag()}"
+        )
+        for _ in range(4):
+            assert not idle(), f"a pane running cmd /c <command> read idle: {diag()}"
+            assert not idle(forced=True), (
+                f"a live launcher under the pane's shell read idle: {diag()}"
+            )
+            time.sleep(0.5)
+
+        release.touch()
+        assert _wait_until(idle, timeout=30), (
+            f"the pane never read idle after its command exited: {diag()}"
+        )
+        assert idle(forced=True), f"an exited command's tree read busy: {diag()}"
+
+        # 3. The agent image with no launcher above it: a human who typed the
+        #    agent at the prompt.
+        typed = run(
+            "send-keys",
+            "-t",
+            name,
+            f"& {_ps_quote(str(stand_in))} -n 10 127.0.0.1",
+            "Enter",
+        )
+        assert typed.returncode == 0, f"send-keys failed: {typed.stderr!r}"
+        assert _wait_until(lambda: "claude.exe" in pane_images(), timeout=30), (
+            f"the stand-in agent never started: {diag()}"
+        )
+        assert not idle(), f"a pane running the agent image read idle: {diag()}"
+        assert not idle(forced=True), (
+            f"the agent image under the pane's shell read idle: {diag()}"
+        )
+        assert _wait_until(idle, timeout=45), (
+            f"the pane never read idle after the agent exited: {diag()}"
+        )
+    finally:
+        release.touch()
+        if created:
+            psmux.kill_server(name, psmux=binary)  # only ever targets our name
+
+    assert _wait_until(lambda: not psmux.has_session(name), timeout=5), (
+        f"cleanup left psmux session {name!r} alive"
+    )
 
 
 # --- full chain: create -> attach in a REAL wt window -> teardown -------------
