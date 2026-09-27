@@ -1732,6 +1732,23 @@ def _deny_opening(monkeypatch: pytest.MonkeyPatch, *denied: Path) -> None:
     monkeypatch.setattr(os, "open", fake_open)
 
 
+def _deny_stat(monkeypatch: pytest.MonkeyPatch, *denied: Path) -> None:
+    """``os.stat`` refuses ``denied`` the way a path this user may not reach
+    does (a mode-0 parent, a share that went away). ``Path.is_dir`` asks
+    through it on 3.13 and raises; 3.14's asks ``os.path.isdir``, which
+    swallows the error and says False -- so the seam, unlike a scandir one,
+    sees both ends of that."""
+    real = os.stat
+    refused = {os.path.normcase(str(p)) for p in denied}
+
+    def fake_stat(path: str | os.PathLike[str], *args: object, **kwargs: object):
+        if os.path.normcase(os.fspath(path)) in refused:
+            raise PermissionError(13, "Permission denied DECOY-ERRNO", os.fspath(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", fake_stat)
+
+
 # An unreadable folder or file in the skills walk is neither fatal nor silent:
 # one note each, naming only the error's class (never the OS's text); the full
 # error is in nodes.log; the rest of the walk goes on.
@@ -1764,6 +1781,48 @@ class TestAnUnreadableSkillsFolderIsNamedNotFatal:
         _skill(skills, "a/SKILL.md")
         _deny_listing(monkeypatch, skills)
         scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == ("skills: cannot be read (PermissionError); not shipped",)
+
+    # A skills folder that cannot even be stat'd is an unknown, not "this PC
+    # has no skills": the same one note, the rest of the scope still read.
+    def test_a_skills_folder_that_cannot_be_stat_ed_is_one_note(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "a/SKILL.md")
+        _write_json(home / ".claude" / "settings.json", {"model": "opus"})
+        _deny_stat(monkeypatch, skills)
+        caplog.set_level("WARNING", logger="nodes")
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == ("skills: cannot be read (PermissionError); not shipped",)
+        assert scope.settings == {"model": "opus"}
+        assert "DECOY-ERRNO" not in repr(scope)
+        logged = [r for r in caplog.records if "DECOY-ERRNO" in r.getMessage()]
+        assert [r.levelname for r in logged] == ["WARNING"]
+        assert logged[0].getMessage().startswith("skills: ")
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="a mode-0 folder: POSIX, and root reads it anyway",
+    )
+    @pytest.mark.parametrize("how", ["behind-a-mode-0-folder", "itself-mode-0"])
+    def test_a_real_skills_folder_it_may_not_read(self, tmp_path, how):
+        home, skills = _skills_home(tmp_path)
+        if how == "itself-mode-0":
+            _skill(skills, "s/SKILL.md")
+            locked = skills
+        else:
+            locked = tmp_path / "locked"
+            _skill(locked, "sub/s/SKILL.md")
+            skills.rmdir()
+            _link_dir(skills, locked / "sub")
+        locked.chmod(0)
+        try:
+            scope = _walked(home)
+        finally:
+            locked.chmod(0o700)
         assert scope.skills == ()
         assert scope.notes == ("skills: cannot be read (PermissionError); not shipped",)
 

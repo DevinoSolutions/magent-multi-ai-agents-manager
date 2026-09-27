@@ -926,10 +926,22 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     Bounded, because it runs on every bring-up: only regular files are read
     (``_read_skill``), each at most ``SKILL_FILE_MAX_BYTES`` and all of them
     at most ``SKILLS_MAX_TOTAL_BYTES``, and the walk stops after
-    ``SKILLS_MAX_ENTRIES`` listed entries. A folder it may not list, or a
-    file it may not read, is one note naming the error's class (the log has
-    the rest), and the walk goes on."""
-    if not root.is_dir():
+    ``SKILLS_MAX_ENTRIES`` listed entries. A skills folder it may not reach,
+    a folder it may not list, or a file it may not read, is one note naming
+    the error's class (the log has the rest), and the walk goes on -- never
+    read as a PC with no skills."""
+    # One stat, asked directly: Path.is_dir raises what it cannot ignore on
+    # 3.13 and swallows it on 3.14 -- the walk's end, or "no skills" on a PC
+    # that has them. Only a skills folder that is not there is absent.
+    try:
+        found = os.stat(root)
+    except (FileNotFoundError, NotADirectoryError):
+        return ()
+    except OSError as e:
+        notes.append(f"skills: cannot be read ({type(e).__name__}); not shipped")
+        _log.warning("skills: %s", e)
+        return ()
+    if not stat.S_ISDIR(found.st_mode):
         return ()
     real_root = _real(root)
     fences = _Fences(
@@ -961,8 +973,6 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
             real_root,
         )
         return ()
-    if any((root / top).exists() for top in SKILLS_EXCLUDED_TOP):
-        notes.append("skills/synced: claude.ai-managed copies, not shipped")
     files: list[SkillFile] = []
     seen: set[str] = set()
     tally = _SkillsTally()
@@ -986,6 +996,10 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
             continue
         seen.add(real)
         rel = here.relative_to(root)
+        # Read off the root's own listing: a stat of root/synced is one more
+        # call that a folder it may not search raises from.
+        if rel == Path() and SKILLS_EXCLUDED_TOP.intersection(dirnames):
+            notes.append("skills/synced: claude.ai-managed copies, not shipped")
         # Every entry a folder lists counts, folders first, each list sorted;
         # past the cap the rest of this folder is dropped and the walk stops.
         room = SKILLS_MAX_ENTRIES - tally.entries
