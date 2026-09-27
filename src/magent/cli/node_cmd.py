@@ -406,10 +406,22 @@ def _refuse(message: str, *, as_json: bool = False) -> NoReturn:
 
 def _unreachable(node: Node, exc: RemoteError) -> ScriptLine:
     """ssh's own failure as a row: the target and ssh's last stderr line. A
-    node that went silent is "no answer from", not "cannot reach"."""
+    node that went silent is "no answer from", not "cannot reach"; one whose
+    reply ran past the cap answered, and its row is our words alone."""
     # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
     from magent.remote_mux import ScriptLine
 
+    if exc.over_cap:
+        # The flag, never the tail's first line. What follows that line is
+        # the child's own words: nodes.log's, never the screen's.
+        log.get_logger("nodes").warning(
+            "%s: the reply ran past the size cap: %s", node.target, exc.stderr_tail
+        )
+        return ScriptLine(
+            "fail",
+            "reach",
+            f"{node.target} answered, but its reply ran past the size cap",
+        )
     tail = exc.stderr_tail.strip().splitlines()
     why = tail[-1] if tail else f"rc={exc.rc}"
     # timed_out, not rc None: rc None is also a spawn failure or an over-cap

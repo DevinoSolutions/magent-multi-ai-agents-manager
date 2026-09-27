@@ -587,6 +587,67 @@ class TestTheUnreachableRow:
         assert "cannot reach amin@devino-second: rc=255" in result.stdout
 
 
+def _over_cap(said: str) -> remote_mux.RemoteError:
+    # What remote_mux raises when a reply passes the stdout cap: its own first
+    # line, then the child's last words before the flood.
+    reason = f"reply exceeded {remote_mux.MAX_REPLY_BYTES} bytes"
+    return remote_mux.RemoteError(
+        None, f"{reason}\n{said}" if said else reason, ("ssh",), over_cap=True
+    )
+
+
+class TestAnOverCapReplyIsNotUnreachable:
+    """The node answered -- too much. Not "cannot reach" (the node was
+    reached), not "no answer from" (it answered): our words, from the flag.
+    The child's words after the cap line are the node's, so the log has them
+    and the screen never does."""
+
+    SAID = "doctor.sh: line 12: the node's own words"
+    ROW = ScriptLine(
+        "fail",
+        "reach",
+        "amin@devino-second answered, but its reply ran past the size cap",
+    )
+
+    @pytest.fixture
+    def over_cap(self, monkeypatch):
+        def doctor(node, *, timeout_s):
+            raise _over_cap(self.SAID)
+
+        monkeypatch.setattr(remote_mux, "doctor", doctor)
+
+    @pytest.fixture
+    def nodes_log(self, caplog):
+        log.get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        return lambda: [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "magent.nodes" and r.levelno == logging.WARNING
+        ]
+
+    def test_node_checks_words_it_from_the_flag(self, tmp_config, over_cap, nodes_log):
+        cfg = load_config(_pool_file(tmp_config))
+        rows = node_cmd.node_checks(cfg, "second", now=time.time())
+        assert rows[0] == self.ROW
+        shown = " ".join(f"{row.item} {row.detail}" for row in rows)
+        assert self.SAID not in shown
+        assert "exceeded" not in shown
+        assert "cannot reach" not in shown
+        assert "no answer from" not in shown
+        # ... and nodes.log has what the screen does not.
+        assert any(self.SAID in message for message in nodes_log())
+
+    def test_the_screen_never_carries_the_nodes_words(
+        self, runner, tmp_config, over_cap, nodes_log
+    ):
+        result = _doctor(runner, _pool_file(tmp_config))
+        assert result.exit_code == 1
+        assert self.ROW.detail in result.stdout
+        assert self.SAID not in result.output
+        assert "cannot reach" not in result.output
+
+
 class TestTheSnapshotRow:
     def test_each_node_reads_its_own_snapshot(self, tmp_config):
         _snapshot("fifth", time.time())
