@@ -2320,11 +2320,9 @@ def _keep_node_sync(config: MagentConfig, config_path: str | None) -> None:
     effort: the sessions are up either way, and a daemon that cannot start
     (its lock dir, the spawn) must not cost the bring-up its report or its exit
     code -- ``status`` shows the daemon off, and serve's supervisor retries."""
-    from magent import node_sync  # in-body: same reason as node_sync_enabled
-
     try:
         ensure_node_sync(config, config_path=config_path)
-    except (OSError, node_sync.DaemonLockUnknown) as exc:
+    except OSError as exc:
         get_logger("nodes").warning(
             "node sync daemon not started after the bring-up: %s", exc
         )

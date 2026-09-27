@@ -113,15 +113,15 @@ def stop_node_sync_and_say(*, say_absent: bool = True) -> NodeSyncStop:
 
 def restop_node_sync_and_say(first: NodeSyncStop) -> NodeSyncStop:
     """``down --all``'s second stop, once serve and ``attention -d`` are down:
-    serve's supervisor can restart the daemon while the node pulls run after
-    the ``first`` stop. Says only what is news -- a daemon it stopped, or a
-    running one the first stop did not already name, or a stop it could not
-    check. Silent otherwise."""
+    a daemon that started late -- already on its way when the ``first`` stop
+    looked, and locked only after -- is stopped here. Says only what is news
+    -- a daemon it stopped, or a running one the first stop did not already
+    name, or a stop it could not check. Silent otherwise."""
     outcome, cause = _stop_node_sync()
     if outcome == "stopped" and first == "stopped":
         click.echo(
             f"  {style('+', fg='green')} Stopped the node sync daemon again"
-            " (serve restarted it during the pulls)."
+            " (a daemon that started late)."
         )
     elif outcome == "stopped":
         # No "again": the first stop's survivor died after all, or the first

@@ -918,13 +918,15 @@ class NodeSyncer:
             log.info("node %s: load samples kept again", nick)
 
 
-class DaemonLockUnknown(Exception):
+class DaemonLockUnknown(OSError):
     """A node sync lock file would not open -- Windows answers EACCES while
     one is pending delete -- so whether a daemon runs is unknown, and nothing
-    ran. Raised from that open's error (``error``): by ``run_once`` and
-    ``run_sync_loop`` for the daemon's lock, by ``launch.ensure_node_sync`` for
-    its probe of it, and by serve's supervisor for its own lock -- never for an
-    OSError of a tick or a spawn."""
+    ran. Raised from that open's error (``error``, also its ``__cause__``): by
+    ``run_once`` and ``run_sync_loop`` for the daemon's lock, by
+    ``launch.ensure_node_sync`` for its probe of it, and by serve's supervisor
+    for its own lock -- never for an OSError of a tick or a spawn. It is an
+    OSError itself, so a caller that contains every OSError still contains it;
+    only a caller that names it tells it apart."""
 
     def __init__(self, error: OSError) -> None:
         super().__init__(str(error))

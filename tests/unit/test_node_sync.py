@@ -589,6 +589,12 @@ class TestEnsureNodeSync:
         assert got.__cause__ is denied
         assert spawned == []
 
+    def test_an_unknown_lock_is_still_an_oserror(self):
+        """Every caller that contains an OSError of ensure_node_sync -- the
+        bring-up's best-effort start is one -- still contains an unknown lock.
+        Only a caller that names it (serve's supervisor) tells it apart."""
+        assert issubclass(node_sync.DaemonLockUnknown, OSError)
+
     def test_a_wedge_is_reported_once_and_its_recovery_once(
         self, sync_on, spawned, daemon_lock, caplog
     ):

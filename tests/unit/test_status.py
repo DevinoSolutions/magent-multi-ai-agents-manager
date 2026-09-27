@@ -2717,7 +2717,7 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         assert self.events == ["stop", "pull api", "stop"]
         assert "Stopped the node sync daemon." in out.stdout
         assert (
-            "Stopped the node sync daemon again (serve restarted it during the pulls)."
+            "Stopped the node sync daemon again (a daemon that started late)."
             in out.stdout
         )
 
@@ -2725,7 +2725,7 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         self, runner, tmp_config, monkeypatch, tmp_path
     ):
         # The first stop could not kill it; by the end it is gone. That is the
-        # plain "Stopped" -- serve restarted nothing.
+        # plain "Stopped" -- nothing started late.
         from magent import node_sync
 
         # Held until the end stop's kill lands (the second stop_daemon answer).
@@ -2749,8 +2749,8 @@ class TestDownStopsNodeSessionsWhereTheyRun:
     def test_a_restarted_daemon_the_end_stop_could_not_kill_is_named(
         self, runner, tmp_config, monkeypatch, tmp_path
     ):
-        # The first stop stopped one; serve restarted it during the pulls, and
-        # the end stop's kill did not land. That is news: never silence.
+        # The first stop stopped one; another started late, and the end
+        # stop's kill did not land. That is news: never silence.
         from magent import node_sync
 
         monkeypatch.setattr(node_sync, "daemon_running", lambda: True)
@@ -2822,10 +2822,7 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         assert [ln.split(None, 1)[1] for ln in lines] == (
             [
                 "Stopped the node sync daemon.",
-                (
-                    "Stopped the node sync daemon again"
-                    " (serve restarted it during the pulls)."
-                ),
+                "Stopped the node sync daemon again (a daemon that started late).",
             ]
             if why == "seen"
             else ["Node sync daemon was not running.", "Stopped the node sync daemon."]
@@ -2984,7 +2981,7 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         assert pair.kills == [4242, 4243]
         assert said == [
             "Stopped the node sync daemon.",
-            "Stopped the node sync daemon again (serve restarted it during the pulls).",
+            "Stopped the node sync daemon again (a daemon that started late).",
         ]
         assert clocked_hold.hold_at is not None
         assert clocked_hold.t == pytest.approx(clocked_hold.hold_at + 5.0, abs=0.06)
