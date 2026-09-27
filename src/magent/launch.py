@@ -2339,6 +2339,12 @@ def _final_pull(
             # could not write; ValueError covers NodeConfigError. None of them
             # may abort the down.
             detail, reason = str(exc), _pull_error_text(exc)
+            if isinstance(exc, remote_mux.RemoteError):
+                # The pull's ssh call is quiet: a local ssh that would not
+                # start is its class alone, so this line adds the OS's words.
+                words = remote_mux.os_detail(exc)
+                if words:
+                    detail = f"{exc}: {words}"
             if isinstance(exc, node_sync.NodeMapUnreadable):
                 # Its own text is the shared sentence plus the MAP error's
                 # class (final_pull built it with nodes.map_unread_text): the

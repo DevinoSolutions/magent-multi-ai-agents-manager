@@ -2594,6 +2594,41 @@ class TestDownPullsTheLastTurnHomeFirst:
         monkeypatch.setattr(node_sync, "final_pull", pull)
         return pulled
 
+    def test_a_spawn_failure_logs_the_os_words_never_the_client_path(
+        self, rig, api, monkeypatch, capsys, caplog, killed
+    ):
+        # The pull's ssh call is quiet (the caller reports), so down's WARNING
+        # is the one line carrying the OS's words; the row keeps the class.
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        client = "/opt/secret/ssh"
+
+        def denied(*_a: object, **_k: object) -> object:
+            raise PermissionError(13, "Permission denied", client)
+
+        monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: client)
+        monkeypatch.setattr(remote_mux.subprocess, "Popen", denied)
+        _hold("api")
+        launch.stop_node_sessions(_config(api), ["api"])
+        out = capsys.readouterr().out
+        assert (
+            "api: last turn not pulled (could not start ssh (PermissionError))" in out
+        )
+        assert "Permission denied" not in out
+        assert client not in out
+        logged = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "magent.nodes" and r.levelno == logging.WARNING
+        ]
+        (line,) = [m for m in logged if "final pull of api failed" in m]
+        assert line.endswith(
+            "could not start ssh (PermissionError): errno 13, Permission denied"
+        )
+        assert not any(client in m for m in logged)
+
     def test_the_order_is_pull_then_kill_then_unmap(self, rig, api, monkeypatch):
         # The entry is still mapped while both run -- the pull needs it.
         order: list[tuple[str, str, bool]] = []

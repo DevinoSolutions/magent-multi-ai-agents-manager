@@ -390,6 +390,43 @@ class TestRun:
         # The rc-None case where nothing ran: the flags must not say it may have.
         assert (exc.value.over_cap, exc.value.outcome_unknown) == (False, False)
 
+    def test_a_quiet_spawn_failure_hands_its_callers_the_os_words(self, monkeypatch):
+        # A quiet call (pull_node's) logs nothing itself; os_detail is what its
+        # callers add to their WARNING -- the OS's words, never str(cause),
+        # which on POSIX carries the client's path.
+        client = "/opt/secret/ssh"
+
+        def denied(*_a: object, **_k: object) -> object:
+            raise PermissionError(13, "Permission denied", client)
+
+        monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: client)
+        monkeypatch.setattr(remote_mux.subprocess, "Popen", denied)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["true"], timeout_s=5, quiet=True)
+        assert remote_mux.os_detail(exc.value) == "errno 13, Permission denied"
+        assert client not in remote_mux.os_detail(exc.value)
+
+    def test_the_os_detail_names_a_winerror_when_set(self):
+        cause = OSError(13, "Access is denied")
+        cause.winerror = 5
+        error = RemoteError(None, "could not start ssh (OSError)", ("ssh",))
+        error.__cause__ = cause
+        assert remote_mux.os_detail(error) == "errno 13, winerror 5, Access is denied"
+
+    @pytest.mark.parametrize(
+        "cause",
+        [
+            None,
+            tarfile.ReadError("not a tar archive"),
+            OSError(r"C:\Tools\OpenSSH\ssh.exe is not a valid image"),
+        ],
+        ids=["none", "not-an-os-error", "no-os-words"],
+    )
+    def test_no_os_words_behind_an_error_is_no_detail(self, cause):
+        error = RemoteError(None, "could not start ssh (OSError)", ("ssh",))
+        error.__cause__ = cause
+        assert remote_mux.os_detail(error) == ""
+
     def test_no_ssh_client_is_rc_127_without_spawning(self):
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["true"], timeout_s=5)

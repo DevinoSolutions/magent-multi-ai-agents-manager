@@ -364,6 +364,29 @@ def _finish(
     return True
 
 
+def _os_words(e: OSError) -> str:
+    """An OSError's own words for a log line -- errno, winerror when set,
+    strerror -- and never ``str(e)`` or ``e.filename``: for a spawn on POSIX
+    those carry the client's path, and a log line names the program only."""
+    winerror = getattr(e, "winerror", None)
+    parts = [
+        f"errno {e.errno}" if e.errno is not None else "",
+        f"winerror {winerror}" if winerror is not None else "",
+        e.strerror or "",
+    ]
+    return ", ".join(p for p in parts if p)
+
+
+def os_detail(exc: BaseException) -> str:
+    """The OS's words behind ``exc`` (``_os_words`` of its ``__cause__``) for
+    a caller's WARNING line; "" when that cause is no OSError or has no
+    words. A quiet call (``pull_node``'s) logs nothing itself, and its
+    RemoteError names only the class -- the screen's -- so the callers that
+    log it add this."""
+    cause = exc.__cause__
+    return _os_words(cause) if isinstance(cause, OSError) else ""
+
+
 def _spawn(
     argv: list[str],
     *,
@@ -406,15 +429,13 @@ def _spawn(
         rc = SSH_MISSING_RC if isinstance(e, FileNotFoundError) else None
         reason = f"could not start {shown[0]} ({type(e).__name__})"
         if not quiet:
-            # The OS's words and codes are the log's; still never str(e) or
-            # e.filename, where the path lives.
+            # The OS's words and codes are the log's (a quiet caller adds them
+            # to its own line through os_detail).
+            words = _os_words(e)
             get_logger("nodes").warning(
-                "%s %s: errno %s, winerror %s, %s: %s",
+                "%s %s: %s",
                 label,
-                reason,
-                e.errno,
-                getattr(e, "winerror", None),
-                e.strerror,
+                f"{reason}: {words}" if words else reason,
                 shlex.join(shown),
             )
         raise RemoteError(rc, reason, shown) from e

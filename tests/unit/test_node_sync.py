@@ -3381,6 +3381,30 @@ class TestABugInOneNodeFailsItAlone:
             "third": (node_sync.OK, ""),
         }
 
+    def test_a_spawn_failure_logs_the_os_words_once_never_the_client_path(
+        self, placed, monkeypatch, caplog
+    ):
+        # pull_node's ssh call is quiet (the caller reports), so _note's
+        # WARNING is the one line carrying the OS's words; the detail `node
+        # sync --once` prints keeps the class alone.
+        _capture_nodes_log(caplog)
+        client = "/opt/secret/ssh"
+
+        def denied(*_a: object, **_k: object) -> object:
+            raise PermissionError(13, "Permission denied", client)
+
+        monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: client)
+        monkeypatch.setattr(remote_mux.subprocess, "Popen", denied)
+        syncer = node_sync.NodeSyncer(_config())
+        first = syncer.tick()
+        syncer.tick()
+        shown = "could not start ssh (PermissionError)"
+        assert first["second"] == (node_sync.FAILED, shown)
+        assert _node_warnings(caplog, "second") == [
+            f"node second: failed ({shown}): errno 13, Permission denied"
+        ]
+        assert not any(client in r.getMessage() for r in caplog.records)
+
     def test_an_os_errors_own_words_are_logged_once_not_shown(self, placed, caplog):
         # `node sync --once` prints the detail: the class there, and the OS's
         # words (a path on this PC) in nodes.log -- once per state change,
