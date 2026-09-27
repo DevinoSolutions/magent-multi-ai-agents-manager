@@ -2989,6 +2989,32 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         assert clocked_hold.hold_at is not None
         assert clocked_hold.t == pytest.approx(clocked_hold.hold_at + 5.0, abs=0.06)
 
+    def test_a_held_tick_outlasts_a_first_look_that_could_not_tell(
+        self, runner, tmp_config, monkeypatch, tmp_path, clocked_hold
+    ):
+        # Both hints, and the hold's is the later: a tick held serve's lock,
+        # and the first look could not tell (Windows EACCES on a lock file
+        # pending delete). The pulls are quick, so the look still runs a cold
+        # start past the hold -- STOP_SETTLE_S from the end would miss it.
+        from magent import node_sync
+
+        late = _ClockDaemon(monkeypatch, clocked_hold, after=5.0)
+        refusals = [PermissionError(13, "Access is denied")] * 2
+
+        def running() -> bool:
+            if refusals:
+                raise refusals.pop()
+            return late.running()
+
+        monkeypatch.setattr(node_sync, "daemon_running", running)
+        said = self._clocked_down(runner, tmp_config, monkeypatch, tmp_path, pulls=True)
+        assert late.kills == [4242]
+        assert said == [
+            "Could not tell whether the node sync daemon stopped"
+            " (PermissionError); see nodes.log",
+            "Stopped the node sync daemon.",
+        ]
+
     @pytest.mark.parametrize("first", [True, False], ids=["stopped", "absent"])
     def test_an_end_stop_that_cannot_tell_is_said_after_a_first_stop_that_could(
         self, runner, tmp_config, monkeypatch, tmp_path, first
