@@ -2223,6 +2223,33 @@ class TestTheHooksAreRebuilt:
         assert stop[0] == {"hooks": [_command_hook("notify")]}
         assert "junk" not in _settings(box).read_text(encoding="utf-8")
 
+    # A name read out of the payload's JSON is the PC's, not ours: a "\udce9"
+    # there loads as a lone surrogate, which strict UTF-8 -- provision.sh's
+    # PYTHONIOENCODING, and capsys here -- cannot write. The row escapes it
+    # and only it: a real name like café is written as it is. (The escape is
+    # written into the unpacked payload: the node reads what arrives.)
+    @pytest.mark.parametrize(
+        ("event", "shown"),
+        [("Caf\udce9", "Caf\\udce9"), ("Café", "Café")],
+        ids=["lone-surrogate", "utf-8"],
+    )
+    def test_a_config_name_is_written_as_it_is_unless_utf_8_cannot_carry_it(
+        self, box, tmp_path, capsys, event, shown
+    ):
+        box.add("notify")
+        entry = {"hooks": ["junk", _command_hook("notify")]}
+        work = _work(tmp_path, _pc_settings({"hooks": {"Stop": [entry]}}))
+        (work / "settings.json").write_text(
+            json.dumps({"hooks": {event: [entry]}}), encoding="utf-8"
+        )
+        assert box.apply(work) == 0
+        hooks = [
+            (line.status, line.item, line.detail)
+            for line in _lines(capsys)
+            if line.item.startswith("hook:")
+        ]
+        assert hooks == [("drop", f"hook:{shown}", "it is not a hook object")]
+
     def test_an_entry_keeps_only_its_runnable_hooks(self, box, tmp_path):
         box.add("notify")
         entry = {

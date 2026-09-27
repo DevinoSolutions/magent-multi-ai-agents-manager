@@ -139,13 +139,14 @@ def _say(line: str) -> bool:
     return True
 
 
-def _printable(name: str) -> str:
-    """``name`` -- read off a disk -- with what UTF-8 cannot carry escaped as
-    ``\\udcXX``: a lone surrogate, which is how Python reads a name whose
-    bytes are not UTF-8. provision.sh runs this under PYTHONIOENCODING=utf-8,
-    which is strict: one left raw in a row raises out of ``_say`` and fails
-    the whole step instead of printing its row. Any real name is unchanged."""
-    return name.encode("utf-8", "backslashreplace").decode("utf-8")
+def _printable(line: str) -> str:
+    """``line`` with what UTF-8 cannot carry escaped as ``\\udcXX``: a lone
+    surrogate, which is how Python reads a name off a disk whose bytes are
+    not UTF-8, or a ``"\\udce9"`` out of a JSON file. provision.sh runs this
+    under PYTHONIOENCODING=utf-8, which is strict: one left raw in a row
+    raises out of ``_say`` and fails the whole step instead of printing its
+    row. Anything UTF-8 can carry (``café``) is unchanged."""
+    return line.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 def _row(ctx: Ctx, status: str, item: str, detail: str = "") -> None:
@@ -154,13 +155,15 @@ def _row(ctx: Ctx, status: str, item: str, detail: str = "") -> None:
     the backstop. The row itself is never cut, so a repair hint after a tool's
     output always survives: only the tool's fragment is cut, by ``_last``,
     which masks both itself before it cuts -- so no cut can split a secret
-    before a mask sees it."""
+    before a mask sees it. Every row goes through ``_printable`` here, so no
+    name a row carries -- off a disk or out of the payload -- can fail it."""
     if ctx.token:
         detail = detail.replace(ctx.token, _MASK)
     detail = _unauth(detail)
     ctx.rows.append(status)
     if not ctx.quiet:
-        ctx.quiet = not _say(f"{status}\t{item}\t{' '.join(detail.split())}\n")
+        line = f"{status}\t{item}\t{' '.join(detail.split())}\n"
+        ctx.quiet = not _say(_printable(line))
 
 
 def _digest(ctx: Ctx, item: str) -> str:
@@ -299,8 +302,7 @@ def _target(ctx: Ctx, item: str, path: Path, shown: str, status: str) -> Path | 
         ctx,
         status,
         item,
-        f"{shown} is a dangling link to {_printable(str(real))}; left alone, "
-        "fix or remove it",
+        f"{shown} is a dangling link to {real}; left alone, fix or remove it",
     )
     return None
 
@@ -1017,11 +1019,11 @@ def _step_skills(ctx: Ctx) -> None:
         _row(ctx, "skip", "skills", f"{len(files)} file(s) unchanged")
         return
     for name, link in refused.items():
-        shown = _printable(link.relative_to(dest_root).as_posix())
+        shown = link.relative_to(dest_root).as_posix()
         _row(
             ctx,
             "warn",
-            "skill:" + _printable(name),
+            "skill:" + name,
             f"~/.claude/skills/{shown} is a link; left alone",
         )
     for src, dest in targets:
