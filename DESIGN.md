@@ -1810,13 +1810,35 @@ needs all three of:
 2. the pane's OWN process (`#{pane_pid}`, read by `psmux.pane_pids`) was read,
    is present in the process snapshot, and is itself a shell;
 3. nothing in that process's subtree (`procs.process_tree` over the Toolhelp
-   snapshot, which now carries parent pids) is an agent image.
+   snapshot, which now carries parent pids) is an agent image or a live
+   launcher (`psmux._LAUNCHER_IMAGES`, i.e. `cmd`).
 
 Everything unknown is a no: an unreadable or non-numeric pane pid, a failed
-snapshot, a pane process that is gone by snapshot time. Off Windows there is no
+snapshot, a pane process that is gone by snapshot time, a probe still
+unanswered when the fan-out's deadline passes. Off Windows there is no
 snapshot, so nothing is ever idle there — revive does nothing rather than
 guess. The asymmetry is the point: a false "busy" leaves a dead pane for the
 human to restart, a false "idle" types into a live agent's input.
+
+The launcher rule exists because the image list alone is not the fleet.
+`config.DEFAULT_TOOLS` ships tools with no registry entry and so no image
+(`agy`, `cursor-agent`), and a pane running one of them mid-tool read exactly
+like an idle pane. What every such pane does have is magent's own wrapper:
+every command magent types is `cmd /c <command>` (`platform/windows.py::
+_send_argv`, and revive's own send), and `cmd /c` exits exactly when its
+command does. A live `cmd` under the pane's shell therefore IS the launched
+command, whatever that command's image is called. The agent images still
+matter for the one path with no `cmd` above it: a human who typed `claude` at
+the prompt. The cost errs the safe way — a `cmd` the user started by hand reads
+busy — and a pane whose own shell is `cmd` was never idle to begin with (`cmd`
+is not in `_IDLE_SHELLS`).
+
+The pane probes are bounded as a batch, not one by one. `_display_fan_out`
+spawns every `display-message` before reading any and then waits on ONE
+deadline (`_FAN_OUT_TIMEOUT_S`); a probe still running when it passes is
+killed unread and its session reads unknown, while one that already exited
+gets `_FAN_OUT_DRAIN_S` to hand over its output. The per-probe timeout it
+replaced made a wedged server cost N x timeout across a fleet of N.
 
 The agent images come from the registry, not a second list: each
 `AgentTool` carries `images` (`claude`, `codex`), and
@@ -1828,15 +1850,34 @@ any is read, like `pane_current_commands`) and ONE snapshot per call, paid only
 when some reading is a shell; status passes the readings it already holds for
 its table instead of probing twice.
 
-Two known edges, both measured against the code rather than the fleet. A
-parent-pid walk cannot reach an ORPHAN — an agent whose launching `cmd` was
-killed while it lived — so such a pane can still read idle; a console-process
-check would close that and is not built. And Windows never rewrites a stale
-parent pid, so a recycled pid can pull a stranger into a pane's subtree; that
-only ever errs toward busy. Pins: `tests/unit/test_psmux.py::
-TestReviveNeverTypesIntoALiveAgent`, `tests/unit/test_platform_contract.py::
-TestWindowsSendKeysVerification`, `tests/unit/test_status.py::
-TestIdleColumnNeedsPositiveProof`, `tests/unit/test_procs.py::TestProcessTree`.
+Two known edges, both measured against the code rather than the fleet. Windows
+never rewrites a stale parent pid, so a recycled pid can pull a stranger into a
+pane's subtree; that only ever errs toward busy. The other is the one real
+hole: a parent-pid walk cannot reach an ORPHAN. If an agent's `cmd` is killed
+out of band while the agent lives, the agent keeps the dead `cmd`'s pid as its
+parent, nothing in the snapshot leads from the pane's shell to it, and the
+pane can read idle with the agent still attached to its console. A caller that
+only KILLS what the walk finds is safe there, since it finds nothing to kill.
+A caller that TYPES into the pane is not.
+
+The sound closure is known and deliberately not built in this change: ask the
+pane's CONSOLE who is on it, not the parent pids. A helper started with
+`DETACHED_PROCESS` (it has no console of its own to give up, and the caller's
+console is left alone) calls `AttachConsole(pane_pid)` and then
+`GetConsoleProcessList`. The pane is agent-free only if every process on that
+console is in the pane shell's subtree and none is an agent image or a
+launcher; any failure of the helper reads busy. That check is a prerequisite
+for the idle reaper, which types a mode reset and a resume into panes it has
+emptied, and it should land with it.
+
+Pins: `tests/unit/test_psmux.py::TestReviveNeverTypesIntoALiveAgent`,
+`::TestIdleSessions`, `::TestTheFanOutWaitsOnOneDeadline`,
+`tests/unit/test_platform_contract.py::TestWindowsSendKeysVerification`,
+`tests/unit/test_status.py::TestIdleColumnNeedsPositiveProof`,
+`tests/unit/test_procs.py::TestProcessTree`, and against a real psmux pane on a
+private socket (CI's Windows platform leg only),
+`tests/platform/test_real_psmux.py::
+test_real_pane_reads_idle_only_while_nothing_it_launched_runs`.
 
 ## 3. Known debt
 
