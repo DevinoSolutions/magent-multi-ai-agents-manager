@@ -38,6 +38,9 @@ CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 # the sentinel CreateToolhelp32Snapshot returns when it cannot.
 TH32CS_SNAPPROCESS = 0x00000002
 INVALID_HANDLE_VALUE = -1
+# The one error that means the walk reached the end of the snapshot. Any other
+# failure of Process32NextW is a walk that stopped early.
+_ERROR_NO_MORE_FILES = 18
 
 # OpenProcess rights for ``raise_priority_above_normal``: the minimum pair that
 # lets a same-user, NON-ELEVATED caller read a priority class and set it.
@@ -178,7 +181,8 @@ def session_id_of(pid: int) -> int | None:
 def snapshot_processes() -> list[tuple[str, int, int]] | None:
     """``(image name, pid, parent pid)`` for every live process, or None when
     we could not look -- which is NOT the same as "nothing is running" and must
-    never be rendered as one. Off Windows: always None.
+    never be rendered as one. A walk that fails partway is "could not look"
+    too, never the shorter list it got as far as. Off Windows: always None.
 
     THE one process enumeration in the product, deliberately: every caller
     (``count_processes`` for doctor's wedge count, ``pids_by_image_name`` for
@@ -218,7 +222,9 @@ def snapshot_processes() -> list[tuple[str, int, int]] | None:
             ("szExeFile", wintypes.WCHAR * 260),
         )
 
-    k = ctypes.windll.kernel32
+    # use_last_error: ctypes keeps its own copy of the error each call leaves,
+    # the only one Python code running between two foreign calls cannot clobber.
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
     snapshot = k.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if snapshot == INVALID_HANDLE_VALUE:
         return None
@@ -237,6 +243,12 @@ def snapshot_processes() -> list[tuple[str, int, int]] | None:
                 )
             )
             if not k.Process32NextW(snapshot, ctypes.byref(entry)):
+                # FALSE for any reason but "no more entries" is a walk that
+                # stopped early, and a partial list would read "nothing runs
+                # here" for every process it never reached -- the one way an
+                # unknown could make idle_sessions call a live pane idle.
+                if ctypes.get_last_error() != _ERROR_NO_MORE_FILES:
+                    return None
                 return found
     finally:
         k.CloseHandle(snapshot)
