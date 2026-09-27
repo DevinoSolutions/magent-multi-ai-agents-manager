@@ -4,6 +4,7 @@ faked at remote_mux's seam, so nothing here dials anything."""
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
@@ -17,7 +18,7 @@ from typing import TYPE_CHECKING
 import pytest
 from click.testing import CliRunner
 
-from magent import attach_client, cli, launch, lockfile, nodes, remote_mux
+from magent import attach_client, cli, launch, lockfile, node_sync, nodes, remote_mux
 from magent.config import (
     SCHEMA_VERSION,
     MagentConfig,
@@ -31,9 +32,12 @@ from tests.conftest import FakePlatform
 from tests.unit._deny_stat import deny_stat
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 _TOOLS = {"claude": "claude --continue"}
+# What a final pull that brought the last turn home returns: None is
+# "never placed", which `down` must not read as pulled.
+_PULLED = remote_mux.PullResult(files=(), since=0.0)
 
 
 def _config(*projects: ProjectConfig) -> MagentConfig:
@@ -2149,6 +2153,12 @@ class TestStoppingNodeSessions:
     The local session a node project may have left here is ``stop_psmux``'s
     (D9), never this function's."""
 
+    @pytest.fixture(autouse=True)
+    def _pulled(self, monkeypatch):
+        # Every entry's last turn comes home (Task 16): these pins are about
+        # the kill and the unmap, so the pull before them always succeeds.
+        monkeypatch.setattr(node_sync, "final_pull", lambda config, name, **_k: _PULLED)
+
     @pytest.fixture
     def kills(self, monkeypatch):
         calls: list[tuple[str, str]] = []
@@ -2384,6 +2394,645 @@ class TestStoppingNodeSessions:
     ):
         assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
 
+    def test_with_an_unreadable_map_a_pinned_kill_says_its_last_turn_was_not_pulled(
+        self, rig, api, kills, unreadable, monkeypatch, capsys
+    ):
+        # The pin is known, so the kill stands. Whether the lost map placed it
+        # -- and so whether there was a last turn to pull -- is not: unknown
+        # never reads as "nothing to pull", and the map is left as it was.
+        def untouched(*_a: object, **_k: object) -> None:
+            raise AssertionError("an unreadable map was written")
+
+        monkeypatch.setattr(
+            node_sync,
+            "final_pull",
+            lambda *_a, **_k: pytest.fail("pulled without a readable entry"),
+        )
+        monkeypatch.setattr(nodes, "update_node_map", untouched)
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert kills[0] == [("second", "api")]
+        out = capsys.readouterr().out
+        assert out.count("\n") == 1, out
+        assert "api: last turn not pulled (the node map could not be read)" in out
+        assert (
+            "; if the map placed it, `magent node sync --once` fetches it once the"
+            " map reads again"
+        ) in out
+        assert "kept in the node map" not in out
+
     def test_a_torn_map_is_never_rewritten(self, rig, api, kills, torn):
         launch.stop_node_sessions(_config(api), ["api"])
         assert nodes.NODE_MAP_PATH.read_text(encoding="utf-8") == "{ torn"
+
+
+def _unreachable(timed_out: bool) -> RemoteError:
+    """A pull the node never answered: silent past its bound, or ssh's own
+    transport failure (rc 255)."""
+    if timed_out:
+        return RemoteError(None, "timed out after 120s", ("ssh",), timed_out=True)
+    return RemoteError(
+        255, "ssh: connect to host devino-second port 22: timed out", ("ssh",)
+    )
+
+
+class TestDownPullsTheLastTurnHomeFirst:
+    """R-D6: `down` pulls a placed session's last turn home, THEN kills it,
+    THEN unmaps it. A pull that fails never stops the kill; it keeps the map
+    entry, so `magent node sync --once` can still fetch the transcript, which
+    outlives the tmux session on the node's disk."""
+
+    @pytest.fixture
+    def killed(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(
+            remote_mux, "kill_session", lambda node, sid: calls.append(sid) or True
+        )
+        return calls
+
+    @staticmethod
+    def _pulls(monkeypatch, error: BaseException | None = None) -> list[str]:
+        pulled: list[str] = []
+
+        def pull(config: object, name: str, **_k: object) -> remote_mux.PullResult:
+            pulled.append(name)
+            if error is not None:
+                raise error
+            return _PULLED
+
+        monkeypatch.setattr(node_sync, "final_pull", pull)
+        return pulled
+
+    def test_the_order_is_pull_then_kill_then_unmap(self, rig, api, monkeypatch):
+        # The entry is still mapped while both run -- the pull needs it.
+        order: list[tuple[str, str, bool]] = []
+        _hold("api")
+        monkeypatch.setattr(
+            node_sync,
+            "final_pull",
+            lambda config, name, **_k: (
+                order.append(("pull", name, "api" in nodes.read_node_map())) or _PULLED
+            ),
+        )
+        monkeypatch.setattr(
+            remote_mux,
+            "kill_session",
+            lambda node, sid: (
+                order.append(("kill", sid, "api" in nodes.read_node_map())) or True
+            ),
+        )
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert order == [("pull", "api", True), ("kill", "api", True)]
+        assert nodes.read_node_map() == {}
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            node_sync.NodeLockHeld("node-pull-second lock is held by another process"),
+            RemoteError(255, "ssh: connect to host devino-second: timed out", ("ssh",)),
+            RemoteError(None, "reply exceeded 8 bytes", ("ssh",), over_cap=True),
+            RemoteError(0, "could not store every pulled file of 'api'", ("pull.sh",)),
+            nodes.NodeConfigError("node 'second' is not in settings.nodes"),
+            OSError(28, "No space left on device"),
+        ],
+        ids=["locked", "unreachable", "over-cap", "unstored", "misconfigured", "disk"],
+    )
+    def test_a_failed_pull_still_kills_and_keeps_the_entry(
+        self, rig, api, monkeypatch, capsys, killed, error
+    ):
+        _hold("api")
+        self._pulls(monkeypatch, error)
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert killed == ["api"]
+        assert "api" in nodes.read_node_map()
+        assert "api: last turn not pulled" in capsys.readouterr().out
+
+    def test_the_line_is_the_nodes_last_word_and_names_the_repair(
+        self, rig, api, monkeypatch, capsys, killed
+    ):
+        # One line, not RemoteError's argv plus twenty lines of stderr.
+        _hold("api")
+        self._pulls(
+            monkeypatch,
+            RemoteError(3, "tar: noise\nmagent: python3 not found", ("bash", "-s")),
+        )
+        launch.stop_node_sessions(_config(api), ["api"])
+        out = capsys.readouterr().out
+        assert out.count("\n") == 2, out  # the announcement, then this line
+        assert "last turn not pulled (python3 not found)" in out
+        assert "tar: noise" not in out
+        assert "bash -s" not in out
+        assert "; kept in the node map for `magent node sync --once`" in out
+
+    def test_the_nodes_words_reach_the_screen_as_ascii(
+        self, rig, api, monkeypatch, capsys, killed
+    ):
+        # The cause is the node's own stderr: a non-ASCII byte there would be a
+        # UnicodeEncodeError on a cp1252 pipe, mid-shutdown.
+        _hold("api")
+        self._pulls(
+            monkeypatch,
+            RemoteError(3, "magent: caf\u00e9 \u2026 gone", ("bash", "-s")),
+        )
+        launch.stop_node_sessions(_config(api), ["api"])
+        out = capsys.readouterr().out
+        assert out.isascii()
+        assert "(caf? ? gone)" in out
+
+    @pytest.mark.parametrize(
+        ("error", "shown"),
+        [
+            (
+                PermissionError(
+                    13, "Access is denied", "C:\\Users\\amin\\.magent\\pull.json"
+                ),
+                "(Access is denied)",
+            ),
+            (OSError("could not write C:\\Users\\amin\\x.part"), "(OSError)"),
+        ],
+        ids=["strerror", "bare"],
+    )
+    def test_a_local_error_shows_its_kind_and_logs_its_path(
+        self, rig, api, monkeypatch, capsys, caplog, killed, error, shown
+    ):
+        # A local path is this PC's business, not the screen's: the class (and
+        # an OS message, which never carries the path) on screen, the whole
+        # error in nodes.log.
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        _hold("api")
+        self._pulls(monkeypatch, error)
+        launch.stop_node_sessions(_config(api), ["api"])
+        out = capsys.readouterr().out
+        assert f"api: last turn not pulled {shown}" in out
+        assert "amin" not in out
+        assert any(
+            "amin" in r.getMessage() for r in caplog.records if r.name == "magent.nodes"
+        )
+
+    def test_the_pulls_announce_themselves_once(
+        self, rig, tmp_path, monkeypatch, capsys, killed
+    ):
+        # One pull can wait out a held lock and then a slow node -- minutes,
+        # and they run one after another. Like the bring-up's fan-out, `down`
+        # says so before the first, counting only the sessions it will pull.
+        a1, a2, a3 = (
+            ProjectConfig(path=str(tmp_path / n), node="second")
+            for n in ("a1", "a2", "a3")
+        )
+        for name in ("a1", "a2", "a3"):
+            _hold(name)
+        self._pulls(
+            monkeypatch, RemoteError(0, "could not store every pulled file", ("x",))
+        )
+        launch.stop_node_sessions(_config(a1, a2, a3), ["a1", "a2"])
+        out = capsys.readouterr().out
+        assert out.count("Pulling the last turn of 2 node session(s) home...") == 1
+        assert out.count("Pulling") == 1
+        assert out.index("Pulling") < out.index("a1: last turn not pulled")
+        assert out.isascii()
+
+    def test_nothing_to_pull_is_no_announcement(
+        self, rig, api, tmp_path, monkeypatch, capsys, killed
+    ):
+        # A pinned project nobody recorded is killed without a pull: nothing
+        # long is coming, so nothing is announced.
+        self._pulls(monkeypatch, AssertionError("pulled with no entry"))
+        launch.stop_node_sessions(_config(api), ["api"])
+        assert "Pulling" not in capsys.readouterr().out
+
+    def test_a_pinned_project_nobody_recorded_is_killed_without_a_pull(
+        self, rig, api, monkeypatch, capsys, killed
+    ):
+        # No entry, nothing to pull from: no lock, no ssh, no warning.
+        pulled = self._pulls(monkeypatch, AssertionError("pulled with no entry"))
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert pulled == []
+        assert killed == ["api"]
+        assert "not pulled" not in capsys.readouterr().out
+
+    def test_an_unreadable_map_pulls_nothing(self, rig, api, monkeypatch, killed):
+        nodes.NODE_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+        pulled = self._pulls(monkeypatch, AssertionError("pulled a torn map"))
+        launch.stop_node_sessions(_config(api), ["api"])
+        assert pulled == []
+
+    def test_a_retitled_project_is_pulled_by_its_map_key(
+        self, rig, tmp_path, monkeypatch, killed
+    ):
+        # final_pull looks the entry up by the map key. Asked by the project's
+        # CURRENT name it would find nothing and answer "never placed", and
+        # the last turn would never come home.
+        proj = ProjectConfig(path=str(tmp_path / "web"), title="my web", node="auto")
+        sid = nodes.node_sid(proj)
+        _hold("my.web", nick="third", sid=sid)
+        pulled = self._pulls(monkeypatch)
+        assert launch.stop_node_sessions(_config(proj), [sid]) == ([sid], [])
+        assert pulled == ["my.web"]
+        assert killed == [sid]
+        assert nodes.read_node_map() == {}
+
+    def test_a_pull_that_found_no_entry_is_not_a_pull(
+        self, rig, api, monkeypatch, capsys, killed
+    ):
+        # `down` read the entry strictly; final_pull reads the map again and
+        # finds no entry (another process unmapped it in between), so it
+        # answers None -- "never placed". After a key `down` proved, that is
+        # a pull that did not happen, never one that did.
+        _hold("api")
+        real = nodes.load_node_map_strict
+        reads: list[None] = []
+
+        def vanishing() -> dict[str, NodeMapEntry]:
+            reads.append(None)
+            return real() if len(reads) == 1 else {}
+
+        monkeypatch.setattr(nodes, "load_node_map_strict", vanishing)
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert len(reads) > 1, "final_pull never read the map"
+        assert killed == ["api"]
+        assert "api" in real()
+        out = capsys.readouterr().out
+        assert out.count("\n") == 2, out  # the announcement, then this line
+        assert (
+            "api: last turn not pulled (its node map entry was not found again); "
+        ) in out
+        assert "magent node sync --once" in out
+
+    def test_a_map_torn_under_the_real_final_pull_names_no_path(
+        self, rig, api, monkeypatch, capsys, caplog, killed
+    ):
+        # No fake final_pull: `down`'s own strict read went through, then the
+        # map tore before final_pull's. The line says the map could not be
+        # read -- the parser's words and the map's path go to the log.
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        _hold("api")
+        real = nodes.load_node_map_strict
+        reads: list[None] = []
+
+        def tearing() -> dict[str, NodeMapEntry]:
+            reads.append(None)
+            if len(reads) > 1:
+                raise ValueError(f"{nodes.NODE_MAP_PATH}: Expecting value: line 1")
+            return real()
+
+        monkeypatch.setattr(nodes, "load_node_map_strict", tearing)
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert len(reads) > 1, "final_pull never read the map"
+        assert killed == ["api"]
+        assert "api" in real()
+        out = capsys.readouterr().out
+        assert out.count("\n") == 2, out  # the announcement, then this line
+        assert (
+            "api: last turn not pulled (the node map could not be read (ValueError)); "
+        ) in out
+        assert "node-map.json" not in out
+        assert "Expecting value" not in out
+        (logged,) = [
+            r.getMessage()
+            for r in caplog.records
+            if "final pull of api failed" in r.getMessage()
+        ]
+        assert f"{nodes.NODE_MAP_PATH}: Expecting value" in logged
+
+    def test_a_map_busy_under_the_real_final_pull_keeps_the_entry(
+        self, rig, api, monkeypatch, capsys, caplog, killed
+    ):
+        # No fake final_pull: the real one, with the map a Windows reader
+        # finds locked (a sync tick or an `up` replacing it) after `down`'s
+        # own strict read went through. The OS's words go to the log only.
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        _hold("api")
+        real_read = Path.read_text
+        reads: list[None] = []
+        busy = [True]
+
+        def read_text(self: Path, *a: object, **k: object) -> str:
+            if self == nodes.NODE_MAP_PATH and busy[0]:
+                reads.append(None)
+                if len(reads) > 1:
+                    raise PermissionError(13, "The process cannot access the file")
+            return real_read(self, *a, **k)
+
+        monkeypatch.setattr(Path, "read_text", read_text)
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        busy[0] = False
+        assert len(reads) > 1, "final_pull never read the map"
+        assert killed == ["api"]
+        assert "api" in nodes.load_node_map_strict()
+        out = capsys.readouterr().out
+        assert (
+            "api: last turn not pulled (the node map could not be read"
+            " (PermissionError)); "
+        ) in out
+        assert "cannot access" not in out
+        (logged,) = [
+            r.getMessage()
+            for r in caplog.records
+            if "final pull of api failed" in r.getMessage()
+        ]
+        assert "PermissionError" in logged
+        assert "The process cannot access the file" in logged
+
+    def test_an_unreadable_map_is_not_the_nodes_failure(
+        self, rig, tmp_path, monkeypatch, killed
+    ):
+        # A hung node's later sessions skip their pull; a map that could not
+        # be read once is no fact about the node, so its next session is
+        # still pulled -- and only the one that was not keeps its entry.
+        a1, a2 = (
+            ProjectConfig(path=str(tmp_path / n), node="second") for n in ("a1", "a2")
+        )
+        _hold("a1")
+        _hold("a2")
+        pulled: list[str] = []
+
+        def pull(config: object, name: str, **_k: object) -> remote_mux.PullResult:
+            pulled.append(name)
+            if name == "a1":
+                raise node_sync.NodeMapUnreadable(
+                    nodes.map_unread_text(PermissionError(13, "busy"))
+                )
+            return _PULLED
+
+        monkeypatch.setattr(node_sync, "final_pull", pull)
+        assert launch.stop_node_sessions(_config(a1, a2), ["a1", "a2"]) == (
+            ["a1", "a2"],
+            [],
+        )
+        assert pulled == ["a1", "a2"]
+        assert killed == ["a1", "a2"]
+        assert set(nodes.read_node_map()) == {"a1"}
+
+    @pytest.mark.parametrize("timed_out", [True, False], ids=["silent", "rc255"])
+    def test_a_node_that_did_not_answer_the_pull_is_not_pulled_again(
+        self, rig, tmp_path, monkeypatch, capsys, killed, timed_out
+    ):
+        # One pull timeout per node, not one per project on it -- but every
+        # session there is still killed, and each is told it was not pulled.
+        a1, a2 = (
+            ProjectConfig(path=str(tmp_path / n), node="second") for n in ("a1", "a2")
+        )
+        _hold("a1")
+        _hold("a2")
+        pulled = self._pulls(monkeypatch, _unreachable(timed_out))
+        assert launch.stop_node_sessions(_config(a1, a2), ["a1", "a2"]) == (
+            ["a1", "a2"],
+            [],
+        )
+        assert pulled == ["a1"]
+        assert killed == ["a1", "a2"]
+        assert set(nodes.read_node_map()) == {"a1", "a2"}
+        out = capsys.readouterr().out
+        # The first says what ssh said (rc 255 is a refused key too); the
+        # rest only that the node did not answer.
+        first = _unreachable(timed_out).stderr_tail
+        assert f"a1: last turn not pulled ({first})" in out
+        assert "a2: last turn not pulled (node second did not answer the pull)" in out
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            RemoteError(None, "reply exceeded 8 bytes", ("ssh",), over_cap=True),
+            RemoteError(0, "could not store every pulled file", ("pull.sh",)),
+            OSError(28, "No space left on device"),
+            lockfile.LockHeld("node-marks lock is held by another process"),
+            nodes.NodeConfigError("node 'second' is not in settings.nodes"),
+        ],
+        ids=["over-cap", "unstored", "disk", "other-lock", "misconfigured"],
+    )
+    def test_a_node_that_answered_is_pulled_for_its_next_session(
+        self, rig, tmp_path, monkeypatch, killed, error
+    ):
+        # Reachability reads timed_out and ssh's rc 255 only: a reply over the
+        # cap is a node that answered (outcome_unknown is for mutations). Of
+        # the OSErrors only NodeLockHeld is the node's: a plain LockHeld is some
+        # other lock taken inside the pull (node_sync.NodeLockHeld's own
+        # docstring), and this PC failing to write a pulled file is this
+        # session's. So is a config error.
+        a1, a2 = (
+            ProjectConfig(path=str(tmp_path / n), node="second") for n in ("a1", "a2")
+        )
+        _hold("a1")
+        _hold("a2")
+        pulled = self._pulls(monkeypatch, error)
+        launch.stop_node_sessions(_config(a1, a2), ["a1", "a2"])
+        assert pulled == ["a1", "a2"]
+
+    def test_a_node_whose_pull_lock_is_held_is_waited_on_once(
+        self, rig, tmp_path, monkeypatch, capsys, killed
+    ):
+        # Another magent process holds node-pull-second past the wait (a sync
+        # tick, a bring-up, another down): the first session pays that wait,
+        # the node's other sessions do not -- N sessions, one FINAL_PULL_WAIT_S.
+        # The real final_pull, so the wait counted is the lock's own.
+        waits: list[object] = []
+
+        @contextlib.contextmanager
+        def held(nick: str, **k: object) -> Iterator[None]:
+            waits.append(k.get("wait_s"))
+            raise node_sync.NodeLockHeld(
+                f"node-pull-{nick} lock is held by another process"
+            )
+            yield
+
+        monkeypatch.setattr(node_sync, "node_lock", held)
+        a1, a2 = (
+            ProjectConfig(path=str(tmp_path / n), node="second") for n in ("a1", "a2")
+        )
+        _hold("a1")
+        _hold("a2")
+        assert launch.stop_node_sessions(_config(a1, a2), ["a1", "a2"]) == (
+            ["a1", "a2"],
+            [],
+        )
+        assert waits == [node_sync.FINAL_PULL_WAIT_S]
+        assert killed == ["a1", "a2"]
+        assert set(nodes.read_node_map()) == {"a1", "a2"}
+        out = capsys.readouterr().out
+        busy = (
+            "(node second is busy: another magent process held its pull lock past 122s)"
+        )
+        assert f"a1: last turn not pulled {busy}" in out
+        assert f"a2: last turn not pulled {busy}" in out
+        assert "node-pull-" not in out
+
+    def test_a_node_that_failed_its_pull_does_not_stop_another_nodes(
+        self, rig, tmp_path, monkeypatch, killed
+    ):
+        a1, b1 = (
+            ProjectConfig(path=str(tmp_path / n), node=nick)
+            for n, nick in (("a1", "second"), ("b1", "third"))
+        )
+        _hold("a1")
+        _hold("b1", nick="third")
+        pulled = self._pulls(monkeypatch, _unreachable(True))
+        launch.stop_node_sessions(_config(a1, b1), ["a1", "b1"])
+        assert pulled == ["a1", "b1"]
+
+
+class TestABringUpHoldsTheNodesSyncLock:
+    """Spec section 13: the daemon takes the same per-node lock, so a sync
+    tick never races a bring-up -- across PROCESSES, which the threading lock
+    cannot cover."""
+
+    def test_the_bring_up_runs_inside_node_lock(self, rig, api, monkeypatch):
+        held: list[str] = []
+        waits: list[object] = []
+
+        @contextlib.contextmanager
+        def lock(nick: str, **k: object) -> Iterator[None]:
+            waits.append(k.get("wait_s"))
+            held.append(nick)
+            yield
+            held.append("released")
+
+        inside: list[list[str]] = []
+        real = rig._bring_up
+        monkeypatch.setattr(node_sync, "node_lock", lock)
+        monkeypatch.setattr(
+            remote_mux,
+            "bring_up",
+            lambda node, recipe, **k: (
+                inside.append(list(held)) or real(node, recipe, **k)
+            ),
+        )
+        assert launch.bring_up_node_project(_config(api), api).ok
+        assert inside == [["second"]]
+        assert held == ["second", "released"]
+        # DECISION-19: a bring-up waits one pull, then says the node is busy.
+        assert waits == [remote_mux.PULL_TIMEOUT_S]
+
+    def test_a_node_busy_syncing_is_a_named_outcome(self, rig, api, monkeypatch):
+        @contextlib.contextmanager
+        def busy(nick: str, **_k: object) -> Iterator[None]:
+            raise node_sync.NodeLockHeld(
+                f"node-pull-{nick} lock is held by another process"
+            )
+            yield
+
+        monkeypatch.setattr(node_sync, "node_lock", busy)
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert not outcome.ok
+        # Not "a node sync pull": a bring-up or a down holds this lock too.
+        assert outcome.error == (
+            "node second is busy: another magent process held its pull lock past"
+            " 120s; re-run to try again"
+        )
+        assert rig.recipes == []
+        assert nodes.read_node_map() == {}
+
+
+class TestABringUpKeepsTheSyncDaemonRunning:
+    @pytest.fixture
+    def ensured(self, monkeypatch):
+        seen: list[str | None] = []
+        monkeypatch.setattr(
+            launch,
+            "ensure_node_sync",
+            lambda config, config_path=None: seen.append(config_path) or True,
+        )
+        monkeypatch.setattr("magent.psmux.bring_up", lambda cfg, only, group: ([], []))
+        return seen
+
+    def test_up_starts_it_on_the_same_config_file(self, rig, api, ensured):
+        launch.bring_up_psmux(_config(api), config_path="/cfg/magent.config.json")
+        assert ensured == ["/cfg/magent.config.json"]
+
+    def test_a_bring_up_with_nothing_up_starts_nothing(
+        self, rig, api, ensured, tmp_path
+    ):
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        launch.bring_up_psmux(_config(api))
+        assert ensured == []
+
+    def test_a_config_without_node_projects_never_asks(self, rig, ensured):
+        launch.bring_up_psmux(_config())
+        assert ensured == []
+
+    def test_go_starts_it_too(self, rig, api, ensured, desk, no_sleep):
+        launch.run_magent(_config(api), launch.RunOpts(config_path="/cfg/m.json"))
+        assert ensured == ["/cfg/m.json"]
+
+    def test_go_with_nothing_up_starts_nothing(
+        self, rig, api, ensured, desk, no_sleep, tmp_path
+    ):
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        launch.run_magent(_config(api), launch.RunOpts(config_path="/cfg/m.json"))
+        assert ensured == []
+
+    def test_go_without_a_config_file_passes_none(
+        self, rig, api, ensured, desk, no_sleep
+    ):
+        launch.run_magent(_config(api), launch.RunOpts())
+        assert ensured == [None]
+
+    @pytest.fixture(params=["spawn-refused", "lock-unknown"])
+    def cannot_start(self, monkeypatch, caplog, request):
+        # The spawn refused, or the daemon's lock file would not open (whether
+        # one runs is unknown): after the sessions came up, which must still
+        # be reported.
+        denied = PermissionError(13, "Access is denied")
+        error: Exception = (
+            denied
+            if request.param == "spawn-refused"
+            else node_sync.DaemonLockUnknown(denied)
+        )
+
+        def ensure(config: object, config_path: object = None) -> bool:
+            raise error
+
+        monkeypatch.setattr(launch, "ensure_node_sync", ensure)
+        monkeypatch.setattr("magent.psmux.bring_up", lambda cfg, only, group: ([], []))
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        return lambda: [
+            r.getMessage() for r in caplog.records if r.name == "magent.nodes"
+        ]
+
+    def test_up_survives_a_daemon_that_cannot_start(self, rig, api, cannot_start):
+        # An escaping error is a failed ASSERTION here, not a crash of the
+        # test: a guard gone and a broken rig must not read the same.
+        try:
+            got: object = launch.bring_up_psmux(_config(api))
+        except (OSError, node_sync.DaemonLockUnknown) as exc:
+            got = exc
+        assert got == (["api"], [])
+        assert any("node sync daemon not started" in m for m in cannot_start())
+
+    def test_go_survives_a_daemon_that_cannot_start(
+        self, rig, api, cannot_start, desk, no_sleep
+    ):
+        try:
+            got: object = launch.run_magent(_config(api), launch.RunOpts())
+        except (OSError, node_sync.DaemonLockUnknown) as exc:
+            got = exc
+        assert got == 0
+        assert any("node sync daemon not started" in m for m in cannot_start())
+
+    def test_the_up_command_hands_it_the_file_it_read(
+        self, rig, api, tmp_path, monkeypatch
+    ):
+        seen: list[str | None] = []
+        monkeypatch.setattr(
+            launch,
+            "ensure_node_sync",
+            lambda config, config_path=None: seen.append(config_path) or True,
+        )
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        config = TestUpCommandBringsNodeProjectsUp()._config_file(
+            tmp_path, tmp_path / "api"
+        )
+        result = CliRunner().invoke(cli.main, ["--config", config, "up"])
+        assert result.exit_code == 0, result.output
+        assert seen == [str(Path(config))]

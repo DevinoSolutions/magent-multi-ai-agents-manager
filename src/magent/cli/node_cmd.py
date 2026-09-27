@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import sys
 import time
-from typing import Literal
+from typing import TYPE_CHECKING, Literal, NoReturn
 
 import click
 
@@ -22,12 +22,181 @@ from magent.lockfile import LockHeld
 from magent.paths import find_config
 from magent.style import style
 
+if TYPE_CHECKING:
+    import contextlib
+
 # How long `node sync -d` waits for the detached child to record its pid:
 # ~10 s nominal, returning as soon as it appears or the child exits. A cold
 # child spends seconds importing before it takes the lock (measured 2.5-13 s
 # on a loaded desktop); one still alive at the deadline is "still starting".
 _START_POLLS = 100
 _START_POLL_S = 0.1
+
+
+NodeSyncStop = Literal["stopped", "stuck", "absent", "unknown"]
+
+
+def _stop_node_sync() -> tuple[NodeSyncStop, str]:
+    """Stop the node sync daemon and name what happened -- with, for
+    "unknown", the error's class. ``stop_daemon``'s False is two answers --
+    nothing to stop, or a daemon that outlived the kill -- and only the
+    daemon's lock tells them apart. A lock file that would not open (Windows
+    answers EACCES while one is pending delete) is "unknown", never "stopped"
+    or "absent": the class goes on screen, the whole error to nodes.log."""
+    from magent import node_sync  # heavy subsystem: in-body per policy
+
+    try:
+        if node_sync.stop_daemon():
+            return "stopped", ""
+        if node_sync.daemon_running():
+            # False is also "a daemon holds the lock and outlived the stop"
+            # (pid unknown, kill refused, or not dead within the settle).
+            return "stuck", ""
+    except OSError as exc:
+        log.get_logger(node_sync.LOG_NAME).warning(
+            "node sync: could not stop or check the daemon: %s", exc
+        )
+        return "unknown", type(exc).__name__
+    return "absent", ""
+
+
+def _say_stuck() -> None:
+    from magent import node_sync  # heavy subsystem: in-body per policy
+
+    pid = node_sync.daemon_pid()
+    click.echo(
+        f"  {style('x', fg='red')} Could not stop the node sync daemon "
+        f"(pid {pid or 'unknown'})."
+    )
+
+
+def _say_unknown(cause: str) -> None:
+    click.echo(
+        f"  {style('!', fg='yellow')} Could not tell whether the node sync daemon"
+        f" stopped ({cause}); see nodes.log"
+    )
+
+
+def _exit_running_unknown(exc: OSError) -> NoReturn:
+    """The daemon's lock file would not open (Windows answers EACCES while
+    one is pending delete), so whether a daemon runs is unknown: never "not
+    running", never a traceback. The class goes on screen, the whole error to
+    nodes.log, and it is not a success."""
+    from magent import node_sync  # heavy subsystem: in-body per policy
+
+    log.get_logger(node_sync.LOG_NAME).warning(
+        "node sync: could not tell whether the daemon is running: %s", exc
+    )
+    click.echo(
+        f"  {style('!', fg='yellow')} Could not tell whether the node sync daemon"
+        f" is running ({type(exc).__name__}); see nodes.log"
+    )
+    sys.exit(1)
+
+
+def stop_node_sync_and_say(*, say_absent: bool = True) -> NodeSyncStop:
+    """Stop the node sync daemon and say what happened, in the words
+    `node sync --stop` and `down --all` share. ``say_absent=False`` keeps
+    "was not running" to itself; a daemon that is running is always said.
+    Exit codes stay the caller's."""
+    outcome, cause = _stop_node_sync()
+    if outcome == "stopped":
+        click.echo(f"  {style('+', fg='green')} Stopped the node sync daemon.")
+    elif outcome == "stuck":
+        _say_stuck()
+    elif outcome == "unknown":
+        _say_unknown(cause)
+    elif say_absent:
+        click.echo(f"  {style('-', dim=True)} Node sync daemon was not running.")
+    return outcome
+
+
+def restop_node_sync_and_say(first: NodeSyncStop) -> NodeSyncStop:
+    """``down --all``'s second stop, once serve and ``attention -d`` are down:
+    a daemon that started late -- already on its way when the ``first`` stop
+    looked, and locked only after -- is stopped here. Says only what is news
+    -- a daemon it stopped, or a running one the first stop did not already
+    name, or a stop it could not check. Silent otherwise."""
+    outcome, cause = _stop_node_sync()
+    if outcome == "stopped" and first == "stopped":
+        click.echo(
+            f"  {style('+', fg='green')} Stopped the node sync daemon again"
+            " (a daemon that started late)."
+        )
+    elif outcome == "stopped":
+        # No "again": the first stop's survivor died after all, or the first
+        # found none -- a daemon a supervisor tick spawned just before this
+        # down took its lock, which locked only after the first stop looked.
+        click.echo(f"  {style('+', fg='green')} Stopped the node sync daemon.")
+    elif outcome == "stuck" and first != "stuck":
+        _say_stuck()
+    elif outcome == "unknown" and first != "unknown":
+        _say_unknown(cause)
+    return outcome
+
+
+class DownSyncStop:
+    """``down --all``'s stops of the node sync daemon: the first one just
+    before the node pulls (``before_pulls``, when there are any) and the one
+    after serve and ``attention -d`` are down (``at_end``, always).
+
+    From the first stop until the last, it holds serve's supervisor lock
+    (``node_sync.supervisor_held``, entered on ``hold``), so no serve can
+    restart the daemon in between. Only a hint that a daemon may still be on
+    its way makes ``at_end`` look for a late one
+    (``node_sync.await_late_daemon``) before its stop -- otherwise it stops at
+    once -- and each hint sets how long:
+
+    - a supervisor tick held the lock when down asked for it: the daemon that
+      tick may have spawned locks only once its interpreter is up, so it is
+      looked for until a cold start (``_START_POLLS`` polls) past the hold,
+      however soon the end comes;
+    - the first stop found a daemon: whatever spawned it may spawn another,
+      looked for ``STOP_SETTLE_S`` from the end.
+
+    With both, the later deadline stands."""
+
+    def __init__(self, hold: contextlib.ExitStack, *, say_absent: bool) -> None:
+        self._hold = hold
+        self._say_absent = say_absent
+        self._held = False
+        self._seen = False
+        # A monotonic reading: when a contended hold's look ends.
+        self._held_tick_until: float | None = None
+        self._first: NodeSyncStop | None = None
+
+    def _take_hold(self) -> None:
+        from magent import node_sync  # heavy subsystem: in-body per policy
+
+        if not self._held:
+            self._held = True
+            if self._hold.enter_context(node_sync.supervisor_held()):
+                self._held_tick_until = time.monotonic() + _START_POLLS * _START_POLL_S
+
+    def before_pulls(self) -> None:
+        from magent import node_sync  # heavy subsystem: in-body per policy
+
+        self._take_hold()
+        try:
+            self._seen = node_sync.daemon_running()
+        except OSError:
+            self._seen = True  # unknown is never "no daemon": the end stop waits
+        self._first = stop_node_sync_and_say(say_absent=self._say_absent)
+
+    def at_end(self) -> None:
+        from magent import node_sync  # heavy subsystem: in-body per policy
+
+        self._take_hold()
+        until = self._held_tick_until
+        if self._seen:
+            settle = time.monotonic() + node_sync.STOP_SETTLE_S
+            until = settle if until is None else max(until, settle)
+        if until is not None:
+            node_sync.await_late_daemon(until=until)
+        if self._first is None:
+            stop_node_sync_and_say(say_absent=self._say_absent)
+        else:
+            restop_node_sync_and_say(self._first)
 
 
 @main.group("node", invoke_without_command=True)
@@ -88,19 +257,8 @@ def sync_cmd(
     from magent import node_sync  # heavy subsystem: in-body per policy
 
     if do_stop:
-        if node_sync.stop_daemon():
-            click.echo(f"  {style('+', fg='green')} Stopped the node sync daemon.")
-        elif node_sync.daemon_running():
-            # False is also "a daemon holds the lock and outlived the stop"
-            # (pid unknown, kill refused, or not dead within the settle).
-            pid = node_sync.daemon_pid()
-            click.echo(
-                f"  {style('x', fg='red')} Could not stop the node sync daemon "
-                f"(pid {pid or 'unknown'})."
-            )
+        if stop_node_sync_and_say() in ("stuck", "unknown"):
             sys.exit(1)
-        else:
-            click.echo(f"  {style('-', dim=True)} Node sync daemon was not running.")
         return
 
     config_path = ctx.obj.get("config_path")
@@ -123,6 +281,8 @@ def sync_cmd(
                 "its own next tick is this one."
             )
             return
+        except node_sync.DaemonLockUnknown as exc:
+            _exit_running_unknown(exc.error)
         failed = False
         for nick, (outcome, detail) in sorted(results.items()):
             ok = outcome == node_sync.OK
@@ -136,7 +296,11 @@ def sync_cmd(
 
     # "Running" is the daemon's lock, never its pid file: a pid file outlives
     # a crash and its number is recycled onto strangers (daemon_running).
-    if node_sync.daemon_running():
+    try:
+        running = node_sync.daemon_running()
+    except OSError as exc:
+        _exit_running_unknown(exc)
+    if running:
         existing = node_sync.daemon_pid()
         shown = f"(pid {existing})" if existing else "(pid unknown)"
         click.echo(
@@ -194,8 +358,13 @@ def sync_cmd(
         f"  {style('#', fg='cyan')} Syncing {len(cfg.settings.nodes)} node(s)"
         " -- Ctrl+C to stop."
     )
-    node_sync.run_sync_loop(
-        cfg,
-        max_ticks=ticks,
-        reload=node_sync.ConfigWatch(config_file, cfg, stamp=stamp).current,
-    )
+    try:
+        node_sync.run_sync_loop(
+            cfg,
+            max_ticks=ticks,
+            reload=node_sync.ConfigWatch(config_file, cfg, stamp=stamp).current,
+        )
+    except node_sync.DaemonLockUnknown as exc:
+        # The probe above opened the lock file and this take, right after,
+        # did not: on Windows the probe's own delete can leave it pending.
+        _exit_running_unknown(exc.error)

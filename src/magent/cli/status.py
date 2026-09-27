@@ -17,6 +17,7 @@ by `_render_status`, published additively under `status --json`'s
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 import time
@@ -37,7 +38,7 @@ from magent.cli.ui import (
     _print_names,
     _print_session_overview,
 )
-from magent.log import heartbeat_age, heartbeat_fresh
+from magent.log import get_logger, heartbeat_age, heartbeat_fresh
 from magent.paths import find_config
 from magent.procs import pid_alive
 from magent.psmux import session0_message, session0_server_pids
@@ -546,6 +547,11 @@ def _down_host(explicit: str | None, local_targets: list[str]) -> str | None:
     nothing else, while `attach`'s own goodbye line advertises that exact
     command for stopping the sessions it just opened. On the host itself local
     sessions match, so the auto path never fires there.
+
+    ``local_targets`` counts the node sessions this PC's map placed. A map
+    that could not be read cannot say whether there are any, so ``down_cmd``
+    holds back the auto answer it gets here and acts locally (never an
+    explicit ``--host``).
     """
     if explicit:
         return explicit
@@ -630,28 +636,55 @@ def _node_orphan_targets(
     )
 
 
-def _placed_here(cfg: MagentConfig, node_targets: list[str]) -> list[str]:
-    """The node targets this PC's node map says it placed. Like a live local
-    session, they are work only a LOCAL `down` can reach, so they keep the
-    shutdown off the remembered attach host. A node project that is merely
-    CONFIGURED does not: an attach client sharing the host's config would
-    otherwise never forward `down --all` to the host again.
+def _placed_here(
+    cfg: MagentConfig, node_targets: list[str]
+) -> tuple[list[str], OSError | ValueError | None]:
+    """The node targets this PC's node map says it placed, and -- when the map
+    could not be read -- what refused it. Like a live local
+    session, placed targets are work only a LOCAL `down` can reach, so they
+    keep the shutdown off the remembered attach host. A node project that is
+    merely CONFIGURED does not: an attach client sharing the host's config
+    would otherwise never forward `down --all` to the host again.
 
     ``nodes.placement_of`` is the lookup ``stop_node_sessions`` kills by, so
     "placed here" and "killed there" name the same sessions. The map is read
-    TOLERANTLY on purpose: this is a routing choice, not a report, and an
-    unreadable map routes as it did before PR-D. ``stop_node_sessions`` reads
-    it strictly and names what it could not prove."""
+    STRICTLY: read as "nothing placed", a busy or torn map forwarded `down` to
+    the attach host -- stopping the host's fleet while a node session this PC
+    placed kept running. ``down_cmd`` keeps an unreadable map's shutdown here.
+    """
     if not node_targets:
-        return []
+        return [], None
     from magent import nodes  # leaf, in-body: keeps `magent --help` off its imports
 
-    entries = nodes.read_node_map()
+    try:
+        entries = nodes.load_node_map_strict()
+    except (OSError, ValueError) as exc:
+        # The screen gets the class (``_echo_map_unread_hint``); the whole
+        # error goes to nodes.log HERE, as the node half's own read may find
+        # the map whole again a moment later and log nothing.
+        get_logger("nodes").warning(
+            "down: node map unreadable, placement here unknown: %s", exc
+        )
+        return [], exc
     return [
         nodes.node_sid(p)
         for p in nodes.node_projects(cfg)
         if nodes.node_sid(p) in node_targets and nodes.placement_of(p, entries)
-    ]
+    ], None
+
+
+def _echo_map_unread_hint(last: str, exc: OSError | ValueError) -> None:
+    """One line when an unreadable node map is the only reason `down` stayed
+    here: it may have placed node sessions that only a local `down` reaches,
+    so the remembered attach host was not acted on. Names the map's failure
+    by class only and the command that does reach the host."""
+    from magent import nodes  # leaf, in-body: keeps `magent --help` off its imports
+
+    click.echo(
+        f"  {style('!', fg='yellow')} "
+        f"Acted here, not on {last}: {nodes.map_unread_text(exc)}."
+        f" For the sessions on {last}: magent down --host {last}"
+    )
 
 
 def _echo_attach_host_hint(live: list[str], placed: list[str]) -> None:
@@ -747,63 +780,102 @@ def down_cmd(
     node_targets = _node_orphan_targets(cfg, group, names)
     targets += [s for s in node_targets if s not in targets]
 
-    placed = _placed_here(cfg, node_targets)
+    placed, map_unread = _placed_here(cfg, node_targets)
     remote = _down_host(host, [*live, *placed])
+    # The auto host a forward was held back from, and what refused the map.
+    held_back: tuple[str, OSError | ValueError] | None = None
+    if remote and not host and map_unread is not None:
+        # The auto rule forwards only when nothing here needs a local `down`.
+        # An unreadable map cannot say that: act here, where a node session
+        # this PC placed is reachable, and name the host's command instead.
+        held_back, remote = (remote, map_unread), None
     remote_rc = 0
-    if remote:
-        from magent.cli.attach import (
-            _remote_down,  # sibling module: every SSH invocation lives in attach
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+    from magent.cli.node_cmd import DownSyncStop
+
+    # From the first node sync stop to the last, serve's supervisor lock is
+    # held (the ExitStack), so serve cannot restart the daemon in between.
+    with contextlib.ExitStack() as sync_hold:
+        # A config with no node projects never had a daemon to mention --
+        # unless one is running, which is always said.
+        sync = (
+            DownSyncStop(sync_hold, say_absent=bool(nodes.node_projects(cfg)))
+            if do_all
+            else None
         )
-
-        remote_rc = _remote_down(remote, names, group, do_all, stop_srv)
-    elif targets:
-        # A node target is two sessions under one name (PR-D): the local one
-        # it may have left here, which `stop_psmux` kills with the rest of
-        # `targets`, and the one on its node, which only `stop_node_sessions`
-        # dials. Each has exactly one killer; the report folds both halves.
-        stopped, still = stop_psmux(targets)
-        node_stopped: list[str] = []
-        node_still: list[str] = []
-        if node_targets:
-            node_stopped, node_still = stop_node_sessions(cfg, node_targets)
-        _report_shutdown(stopped, still, node_stopped, node_still)
-        _echo_attach_host_hint(live, placed)
-    else:
-        click.echo(f"  {style('-', dim=True)} No matching sessions in config.")
-
-    if do_all or stop_srv:
-        from magent.upload_server import (
-            stop_server,  # heavy subsystem: in-body per policy
-        )
-
-        if stop_server(cfg.settings.upload_port):
-            click.echo(
-                f"  {style('+', fg='green')} Stopped upload server on port {cfg.settings.upload_port}."
-            )
-        else:
-            click.echo(
-                f"  {style('-', dim=True)} Upload server not running, or could not be stopped (see logs)."
+        if remote:
+            from magent.cli.attach import (
+                _remote_down,  # sibling module: every SSH invocation lives in attach
             )
 
-    from magent.platform import get_platform  # heavy subsystem: in-body per policy
-
-    if do_all and get_platform().supports_hotkey():
-        from magent.hotkey import (
-            stop_listener,  # ImportError off-Windows (hotkey.py guards); must stay lazy
-        )
-
-        if stop_listener():
-            click.echo(f"  {style('+', fg='green')} Stopped the Alt+V listener.")
+            remote_rc = _remote_down(remote, names, group, do_all, stop_srv)
+        elif targets:
+            # A node target is two sessions under one name (PR-D): the local one
+            # it may have left here, which `stop_psmux` kills with the rest of
+            # `targets`, and the one on its node, which only `stop_node_sessions`
+            # dials. Each has exactly one killer; the report folds both halves.
+            stopped, still = stop_psmux(targets)
+            node_stopped: list[str] = []
+            node_still: list[str] = []
+            if node_targets:
+                if sync is not None:
+                    # Before the pulls: a sync tick mid-pull holds
+                    # node-pull-<nick>, which down's own final pull would wait
+                    # out. Killing the daemon mid-tick is safe -- the OS drops
+                    # its locks, and marks and pulled files are replaced
+                    # atomically. `down --all` only: a partial down leaves the
+                    # daemon to the nodes it still serves.
+                    sync.before_pulls()
+                node_stopped, node_still = stop_node_sessions(cfg, node_targets)
+            _report_shutdown(stopped, still, node_stopped, node_still)
+            if held_back is not None:
+                _echo_map_unread_hint(*held_back)
+            else:
+                _echo_attach_host_hint(live, placed)
         else:
-            click.echo(f"  {style('-', dim=True)} Alt+V listener was not running.")
+            click.echo(f"  {style('-', dim=True)} No matching sessions in config.")
 
-    if do_all:
-        from magent.cli.attention_cmd import stop_daemon
+        if do_all or stop_srv:
+            from magent.upload_server import (
+                stop_server,  # heavy subsystem: in-body per policy
+            )
 
-        if stop_daemon():
-            click.echo(f"  {style('+', fg='green')} Stopped the attention daemon.")
-        else:
-            click.echo(f"  {style('-', dim=True)} Attention daemon was not running.")
+            if stop_server(cfg.settings.upload_port):
+                click.echo(
+                    f"  {style('+', fg='green')} Stopped upload server on port {cfg.settings.upload_port}."
+                )
+            else:
+                click.echo(
+                    f"  {style('-', dim=True)} Upload server not running, or could not be stopped (see logs)."
+                )
+
+        from magent.platform import get_platform  # heavy subsystem: in-body per policy
+
+        if do_all and get_platform().supports_hotkey():
+            from magent.hotkey import (
+                stop_listener,  # ImportError off-Windows (hotkey.py guards); must stay lazy
+            )
+
+            if stop_listener():
+                click.echo(f"  {style('+', fg='green')} Stopped the Alt+V listener.")
+            else:
+                click.echo(f"  {style('-', dim=True)} Alt+V listener was not running.")
+
+        if do_all:
+            from magent.cli.attention_cmd import stop_daemon
+
+            if stop_daemon():
+                click.echo(f"  {style('+', fg='green')} Stopped the attention daemon.")
+            else:
+                click.echo(
+                    f"  {style('-', dim=True)} Attention daemon was not running."
+                )
+
+        if sync is not None:
+            # Again, now that serve (whose supervisor restarts the daemon) and
+            # attention -d (whose watchdog restarts serve) are down.
+            sync.at_end()
 
     # Last, so the local daemons still stop when the host is unreachable -- but
     # never zero: a failed remote shutdown that exits 0 is the silent no-op this

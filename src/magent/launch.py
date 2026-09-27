@@ -512,13 +512,22 @@ def ensure_node_sync(config: MagentConfig, config_path: str | None = None) -> bo
     with a stale heartbeat is a wedged daemon -- reported once, left for the
     user (`magent node sync --stop`), never killed from here. The respawn rate
     of a daemon that keeps dying is the caller's interval.
+
+    A lock file that would not open (Windows answers EACCES while one is
+    pending delete) is ``node_sync.DaemonLockUnknown``: whether a daemon runs is
+    unknown, so nothing is spawned, and the caller can tell it from a refused
+    spawn.
     """
     if not node_sync_enabled(config):
         return False
     from magent import node_sync  # in-body: same reason as node_sync_enabled
 
     log = get_logger(node_sync.LOG_NAME)
-    if not node_sync.daemon_running():
+    try:
+        running = node_sync.daemon_running()
+    except OSError as e:
+        raise node_sync.DaemonLockUnknown(e) from e
+    if not running:
         _node_sync_report.wedged = False
         spawn_detached(node_sync_argv(config_path))
         return True
@@ -1366,6 +1375,9 @@ def _bring_up_node_windows(
         config, list(result.node_projects), allow_dirty=opts.allow_dirty, window=True
     )
     _echo_node_outcomes(outcomes)
+    if any(o.ok for o in outcomes):
+        # RunOpts spells "no config file" as "".
+        _keep_node_sync(config, opts.config_path or None)
     windows_expected = plat.supports_attach_windows()
     by_sid = {o.sid: o for o in outcomes}
     targets: list[_Target] = []
@@ -1603,11 +1615,13 @@ def bring_up_psmux(
     group: str | None = None,
     *,
     allow_dirty: bool = False,
+    config_path: str | None = None,
 ) -> tuple[list[str], list[str]]:
     """Delegate to ``psmux.bring_up``, then bring the pool-node projects up
     too (PR-D; no windows -- this is the host side of attach). Returns
     ``(created, failed)`` over both; node outcomes are printed as they are
-    the only place their reasons appear."""
+    the only place their reasons appear. A node session that came up gets the
+    node sync daemon started on ``config_path``, the file this bring-up read."""
     from magent import psmux
 
     created, failed = psmux.bring_up(config, only, group)
@@ -1615,6 +1629,9 @@ def bring_up_psmux(
         config, only=only, group=group, allow_dirty=allow_dirty
     )
     _echo_node_outcomes(outcomes)
+    if any(o.ok for o in outcomes):
+        # The sync daemon reads the same file this bring-up did (E).
+        _keep_node_sync(config, config_path)
     return (
         [*created, *(o.sid for o in outcomes if o.ok)],
         [*failed, *(o.sid for o in outcomes if not o.ok)],
@@ -1793,6 +1810,26 @@ def _node_error_text(exc: Exception) -> str:
     return str(exc)
 
 
+def _node_busy_text(nick: str, waited_s: float) -> str:
+    """A node whose ``node-pull-<nick>`` another magent process (a sync tick,
+    a bring-up, a ``down``) held past ``waited_s`` -- pass the constant the
+    wait itself used, so the figure is the wait that ran out. The bring-up's
+    outcome and ``down``'s not-pulled line both say it this way."""
+    return (
+        f"node {nick} is busy: another magent process held its pull lock"
+        f" past {waited_s:.0f}s"
+    )
+
+
+def _pull_error_text(exc: Exception) -> str:
+    """``_node_error_text`` for ``down``'s not-pulled line, but an OSError is
+    its kind only: its message can name a local path (``nodes.log`` has the
+    whole error). ``strerror`` is the OS's words without the path."""
+    if isinstance(exc, OSError):
+        return exc.strerror or type(exc).__name__
+    return _node_error_text(exc)
+
+
 def _open_node_window(node: Node, sid: str) -> str | None:
     """The attach window for ``sid`` on ``node`` -- C's one wt spawn, running
     the reconnecting supervisor -- and the title it opened under (tiling
@@ -1829,10 +1866,12 @@ def bring_up_node_project(
     ``"auto"``), refuse a tree the node could not reproduce (D7) -- unless its
     session is already running there, which is attached instead -- then,
     under that node's lock, provision once, build the recipe, run
-    ``remote_mux.bring_up``, record the placement and open the window. Never
-    raises for a node, git or config failure: every one is an outcome."""
+    ``remote_mux.bring_up`` -- inside the node sync daemon's lock for that
+    node too, so no pull reads a half-made session -- record the placement and
+    open the window. Never raises for a node, git or config failure: every one
+    is an outcome, a node the sync daemon kept busy past one pull included."""
     # heavy subsystem: in-body per policy (nodes + remote_mux: ssh/git/tar)
-    from magent import nodes, remote_mux
+    from magent import node_sync, nodes, remote_mux
     from magent.env import local_username
 
     log = get_logger("nodes")
@@ -1932,9 +1971,14 @@ def bring_up_node_project(
         with _bring_up_lock(nick):
             _provision_once(node, config)
             recipe = node_recipe(config, proj, node, states)
-            result = remote_mux.bring_up(
-                node, recipe, allow_dirty=allow_dirty, resume_id=resume_id
-            )
+            # Spec section 13: a sync tick holds this same per-node lock for
+            # its pull, across PROCESSES, which _bring_up_lock cannot reach.
+            # DECISION-19: wait out one pull and no longer -- a node still
+            # held past that is hung, and saying so beats stalling the `up`.
+            with node_sync.node_lock(nick, wait_s=remote_mux.PULL_TIMEOUT_S):
+                result = remote_mux.bring_up(
+                    node, recipe, allow_dirty=allow_dirty, resume_id=resume_id
+                )
             warnings = recipe.warnings
             try:
                 nodes.update_node_map(
@@ -1984,6 +2028,17 @@ def bring_up_node_project(
             attached_existing=result.attached_existing,
             warnings=warnings,
             title=title,
+        )
+    except node_sync.NodeLockHeld as exc:
+        log.warning("node %s: bring-up of %s: node busy: %s", nick, sid, exc)
+        return NodeBringUpOutcome(
+            ok=False,
+            sid=sid,
+            node=nick,
+            error=(
+                f"{_node_busy_text(nick, remote_mux.PULL_TIMEOUT_S)};"
+                " re-run to try again"
+            ),
         )
     except (ValueError, remote_mux.RemoteError, OSError) as exc:
         # ValueError covers NodeConfigError (its subclass) and a recipe that
@@ -2204,6 +2259,100 @@ def node_session_ids(config: MagentConfig, group: str | None = None) -> list[str
     return [nodes.node_sid(proj) for proj in nodes.node_projects(config, group)]
 
 
+_KEPT = "kept in the node map for `magent node sync --once`"
+
+
+def _say_not_pulled(sid: str, reason: str, then: str = _KEPT) -> None:
+    """The one line a session whose last turn did not come home gets:
+    ``reason`` is why, ``then`` what is left to fetch it with."""
+    click.echo(
+        f"  {style('!', fg='yellow')} {sid}: last turn not pulled ({reason}); {then}"
+    )
+
+
+def _final_pull(
+    config: MagentConfig, key: str, sid: str, nick: str, no_pull: dict[str, str]
+) -> bool:
+    """Bring map entry ``key``'s last turn home before session ``sid`` is
+    killed (R-D6). False when it could not be pulled -- said on one line; the
+    caller still kills, but keeps the map entry, so ``magent node sync
+    --once`` can fetch the transcript, which outlives the tmux session on the
+    node's disk.
+
+    ``key`` is the map key ``placement_of`` found, never the project's current
+    name: ``final_pull`` looks the entry up by it, and a retitled project's
+    name would find nothing and read as "never placed" -- pulled.
+
+    A node that did not answer a pull (``timed_out``, or ssh's own rc 255:
+    node_sync's UNREACHABLE), and one whose pull lock another magent process
+    held past ``FINAL_PULL_WAIT_S`` (``NodeLockHeld``), joins ``no_pull`` --
+    nick to the reason its later sessions print -- and is not pulled again in
+    this call, so ``down --all`` against a hung or held node costs one wait,
+    not one per project on it. Its sessions are still killed. Every other
+    failure -- a reply over the cap is a node that answered -- is this
+    session's.
+
+    ``final_pull`` re-reads the map strictly. Busy or torn there, it raises
+    NodeMapUnreadable, said with the shared sentence and the map error's class
+    (the whole error goes to nodes.log). Its None ("never placed") after the
+    caller read ``key`` out of the map strictly is the entry vanishing between
+    the two reads -- a concurrent ``down``/``up`` that moved it -- said as "its
+    node map entry was not found again": a pull that did not happen, never
+    one that did."""
+    # heavy subsystem: in-body per policy (node_sync dials the node)
+    from magent import node_sync, remote_mux
+
+    if nick in no_pull:
+        reason = no_pull[nick]
+    else:
+        try:
+            result = node_sync.final_pull(
+                config, key, wait_s=node_sync.FINAL_PULL_WAIT_S
+            )
+        except (OSError, ValueError, remote_mux.RemoteError) as exc:
+            # OSError covers NodeLockHeld (another magent process -- a sync
+            # tick, a bring-up, another down -- held the node past
+            # FINAL_PULL_WAIT_S), NodeMapUnreadable, and a pulled file this PC
+            # could not write; ValueError covers NodeConfigError. None of them
+            # may abort the down.
+            detail, reason = str(exc), _pull_error_text(exc)
+            if isinstance(exc, node_sync.NodeMapUnreadable):
+                # Its own text is the shared sentence plus the MAP error's
+                # class (final_pull built it with nodes.map_unread_text): the
+                # screen's. The error it chains names the path and the
+                # parser's words: the log's. Never _pull_error_text's words
+                # (the wrapper has no strerror, so they would name it), and
+                # never the None branch's: the map, not the entry, went unread.
+                detail, reason = f"{exc}: {exc.__cause__}", str(exc)
+            get_logger("nodes").warning(
+                "down: final pull of %s failed: %s", sid, detail
+            )
+            if isinstance(exc, remote_mux.RemoteError) and (
+                exc.timed_out or exc.rc == attach_client.SSH_TRANSPORT_RC
+            ):
+                # The first line keeps ssh's own reason (rc 255 is also a
+                # refused key); the node's later sessions just skip.
+                no_pull[nick] = f"node {nick} did not answer the pull"
+            elif isinstance(exc, node_sync.NodeLockHeld):
+                # Our words, not the lock's name, on every session of the node.
+                reason = no_pull[nick] = _node_busy_text(
+                    nick, node_sync.FINAL_PULL_WAIT_S
+                )
+            # ASCII end to end: the cause may be the node's or the OS's words.
+            reason = reason.encode("ascii", "replace").decode("ascii")
+        else:
+            if result is not None:
+                return True
+            get_logger("nodes").warning(
+                "down: final pull of %s found no map entry for %r", sid, key
+            )
+            # The entry the strict read found, missing from final_pull's own
+            # strict re-read: no exception, so no class.
+            reason = "its node map entry was not found again"
+    _say_not_pulled(sid, reason)
+    return False
+
+
 def stop_node_sessions(
     config: MagentConfig, sids: list[str]
 ) -> tuple[list[str], list[str]]:
@@ -2228,6 +2377,12 @@ def stop_node_sessions(
     Likewise one unmap that fails stops the rest from queueing on the same
     map lock; their entries stay, which the next bring-up records over.
 
+    Each placed session's last turn is pulled home first (``_final_pull``);
+    one that could not be pulled is still killed, but keeps its map entry. A
+    pinned session behind an unreadable map is killed on its pin with no pull
+    -- there is no entry to pull from -- and says so, since the lost map may
+    have placed it.
+
     The node half only. The LOCAL session a node project may have left here
     (D9) is ``stop_psmux``'s, and the ``down`` shell folds the two halves
     into one report."""
@@ -2243,8 +2398,21 @@ def stop_node_sessions(
     except (OSError, ValueError) as exc:
         log.warning("down: node map unreadable, no placement is trusted: %s", exc)
         entries, map_known = {}, False
+    # A pull can wait out a held lock and then a slow node, one session after
+    # another: minutes. Say so before the first (the fan-out rule).
+    due = sum(
+        1
+        for proj in nodes.node_projects(config)
+        if nodes.node_sid(proj) in sids and nodes.placement_of(proj, entries)
+    )
+    if due:
+        click.echo(
+            f"  {style('-', dim=True)} Pulling the last turn of {due} node"
+            " session(s) home..."
+        )
     map_writable = True
     unreachable: set[str] = set()
+    no_pull: dict[str, str] = {}
     stopped: list[str] = []
     still: list[str] = []
     for proj in nodes.node_projects(config):
@@ -2271,6 +2439,18 @@ def stop_node_sessions(
         if node.nick in unreachable:
             still.append(sid)
             continue
+        # While the entry still names it. No entry in a map that was read is
+        # nothing to pull; no entry in a map that was not is a pull not made.
+        pulled = key is not None and _final_pull(config, key, sid, node.nick, no_pull)
+        if key is None and not map_known:
+            _say_not_pulled(
+                sid,
+                nodes.MAP_UNREAD,
+                then=(
+                    "if the map placed it, `magent node sync --once` fetches it"
+                    " once the map reads again"
+                ),
+            )
         killed = remote_mux.kill_session(node, entry.sid if entry else sid)
         if killed is None:
             log.warning("down: %s not stopped: node %s did not answer", sid, node.nick)
@@ -2284,7 +2464,7 @@ def stop_node_sessions(
                 "down: %s not stopped: not on %s, map unreadable", sid, node.nick
             )
             still.append(sid)
-        if key is None:
+        if not pulled:
             continue
         if not map_writable:
             log.warning("down: %s map entry stays: the map could not be written", sid)
@@ -2299,6 +2479,19 @@ def stop_node_sessions(
             log.warning("down: %s stopped, but its map entry stays: %s", sid, exc)
             map_writable = False
     return stopped, still
+
+
+def _keep_node_sync(config: MagentConfig, config_path: str | None) -> None:
+    """``ensure_node_sync`` after a bring-up put a node session up. Best
+    effort: the sessions are up either way, and a daemon that cannot start
+    (its lock dir, the spawn) must not cost the bring-up its report or its exit
+    code -- ``status`` shows the daemon off, and serve's supervisor retries."""
+    try:
+        ensure_node_sync(config, config_path=config_path)
+    except OSError as exc:
+        get_logger("nodes").warning(
+            "node sync daemon not started after the bring-up: %s", exc
+        )
 
 
 def _echo_node_outcomes(outcomes: list[NodeBringUpOutcome]) -> None:

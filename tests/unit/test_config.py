@@ -1,7 +1,9 @@
+import re
 from pathlib import Path
 
 import pytest
 
+from magent import config as config_module
 from magent.config import SCHEMA_VERSION, ConfigError, MagentConfig, load_config
 from magent.init_config import generate_config, scan_for_projects
 
@@ -449,3 +451,24 @@ class TestTheOneNodeSkipPredicate:
 
         proj = ProjectConfig(path="C:/a/api", node=node)
         assert (is_cloud(proj), runs_on_node(proj)) == (cloud, on_node)
+
+
+class TestNobodyHandRollsTheNodePredicate:
+    """DECISION-15 / 26 ix: typed config asks ``runs_on_node`` / ``is_cloud``,
+    and only config.py spells the comparison. The raw-dict form
+    ``p.get("node") not in (None, "cloud")`` (DECISION-22) does not match."""
+
+    HAND_ROLLED = re.compile(
+        r"""\.node\s*(?:!=|==)\s*(?:NODE_CLOUD|["']cloud["'])|\.node\s+(?:not\s+)?in\s*\(\s*None"""
+    )
+
+    def test_only_config_py_compares_a_node_to_cloud(self):
+        src = Path(config_module.__file__).parent
+        offenders = [
+            f"{path.relative_to(src)}:{n}"
+            for path in sorted(src.rglob("*.py"))
+            if path != src / "config.py"
+            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+            if self.HAND_ROLLED.search(line)
+        ]
+        assert offenders == []

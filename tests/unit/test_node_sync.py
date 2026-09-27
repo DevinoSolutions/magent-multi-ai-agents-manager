@@ -564,6 +564,37 @@ class TestEnsureNodeSync:
         assert "heartbeat is stale" in warning
         assert str(os.getpid()) in warning
 
+    def test_a_lock_that_would_not_open_is_unknown_and_nothing_is_spawned(
+        self, sync_on, spawned, monkeypatch
+    ):
+        """Windows answers EACCES while the lock file is pending delete, so
+        whether a daemon runs is unknown: never "not running" (a spawn could
+        double a live daemon), and never the bare PermissionError, which a
+        caller could not tell from a refused spawn."""
+        denied = PermissionError(13, "Access is denied")
+        real_lock = node_sync.exclusive_lock
+
+        def lock(name: str) -> contextlib.AbstractContextManager[None]:
+            if name == node_sync.LOCK_NAME:
+                raise denied
+            return real_lock(name)
+
+        monkeypatch.setattr(node_sync, "exclusive_lock", lock)
+        try:
+            got: object = launch.ensure_node_sync(_config(), "cfg.json")
+        except (OSError, node_sync.DaemonLockUnknown) as exc:
+            got = exc
+        assert isinstance(got, node_sync.DaemonLockUnknown), got
+        assert got.error is denied
+        assert got.__cause__ is denied
+        assert spawned == []
+
+    def test_an_unknown_lock_is_still_an_oserror(self):
+        """Every caller that contains an OSError of ensure_node_sync -- the
+        bring-up's best-effort start is one -- still contains an unknown lock.
+        Only a caller that names it (serve's supervisor) tells it apart."""
+        assert issubclass(node_sync.DaemonLockUnknown, OSError)
+
     def test_a_wedge_is_reported_once_and_its_recovery_once(
         self, sync_on, spawned, daemon_lock, caplog
     ):
@@ -578,6 +609,18 @@ class TestEnsureNodeSync:
         infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
         assert len([m for m in infos if "fresh again" in m]) == 1
         assert spawned == []
+
+
+def _ensure_on_nodes(monkeypatch) -> None:
+    """serve's tick runs the REAL ensure_node_sync, on a config with node
+    projects (the config file serve reads in these tests names none)."""
+    monkeypatch.setattr(launch, "_node_sync_report", launch._NodeSyncReport())
+    real = launch.ensure_node_sync
+    monkeypatch.setattr(
+        launch,
+        "ensure_node_sync",
+        lambda _cfg, config_path=None: real(_config(), config_path),
+    )
 
 
 def _run_supervisor(
@@ -608,6 +651,163 @@ def _one_tick() -> threading.Event:
     stop = threading.Event()
     stop.set()
     return stop
+
+
+class TestDownHoldsTheSupervisorLock:
+    """``down --all``'s side of serve's supervisor lock: held for the body,
+    waited on briefly, never a reason to skip the stop."""
+
+    def test_a_free_lock_is_held_for_the_body_and_let_go_after(self):
+        with node_sync.supervisor_held() as contended:
+            assert contended is False
+            with (
+                pytest.raises(LockHeld),
+                exclusive_lock(node_sync.SUPERVISOR_LOCK_NAME),
+            ):
+                pass
+        with exclusive_lock(node_sync.SUPERVISOR_LOCK_NAME):
+            pass
+
+    def test_a_lock_that_will_not_open_is_retried_then_run_without(
+        self, monkeypatch, caplog
+    ):
+        # Windows answers EACCES while a lock file is pending delete: retried
+        # like a held lock, and past the wait the body runs unprotected.
+        _capture_nodes_log(caplog)
+        tries: list[str] = []
+
+        def unopenable(name):
+            tries.append(name)
+            raise PermissionError(13, "Access is denied")
+
+        monkeypatch.setattr(node_sync, "exclusive_lock", unopenable)
+        clock = [0.0]
+
+        def sleep(s: float) -> None:
+            clock[0] += s
+
+        ran: list[bool] = []
+        with node_sync.supervisor_held(sleep=sleep, now=lambda: clock[0]) as c:
+            ran.append(c)
+        # Unprotected, so a restart cannot be ruled out: reads as contended.
+        assert ran == [True]
+        assert len(tries) > 1
+        assert set(tries) == {node_sync.SUPERVISOR_LOCK_NAME}
+        (warning,) = _warnings(caplog)
+        assert "could not take serve's supervisor lock" in warning
+        assert "Access is denied" in warning
+
+    def test_a_lock_that_opens_on_a_retry_is_held_after_all(self, monkeypatch):
+        real = node_sync.exclusive_lock
+        answers = iter([PermissionError(13, "Access is denied")])
+
+        def once_pending(name):
+            exc = next(answers, None)
+            if exc is not None:
+                raise exc
+            return real(name)
+
+        monkeypatch.setattr(node_sync, "exclusive_lock", once_pending)
+        with node_sync.supervisor_held(sleep=lambda _s: None) as c:
+            assert c is True
+            with (
+                pytest.raises(LockHeld),
+                exclusive_lock(node_sync.SUPERVISOR_LOCK_NAME),
+            ):
+                pass
+
+    def test_a_probe_that_will_not_open_does_not_end_the_late_look(self, monkeypatch):
+        answers = iter([PermissionError(13, "denied"), False, True])
+
+        def running():
+            answer = next(answers)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        monkeypatch.setattr(node_sync, "daemon_running", running)
+        monkeypatch.setattr(node_sync, "daemon_pid", lambda: 4242)
+        assert node_sync.await_late_daemon(sleep=lambda _s: None)
+
+    def test_a_held_lock_is_waited_on_in_steps_up_to_the_settle(
+        self, monkeypatch, caplog
+    ):
+        _capture_nodes_log(caplog)
+        clock = [0.0]
+        slept: list[float] = []
+
+        def sleep(s: float) -> None:
+            slept.append(s)
+            clock[0] += s
+
+        with (
+            exclusive_lock(node_sync.SUPERVISOR_LOCK_NAME),
+            node_sync.supervisor_held(sleep=sleep, now=lambda: clock[0]) as c,
+        ):
+            assert c is True
+        assert set(slept) == {node_sync.SUPERVISOR_RETRY_S}
+        assert clock[0] == pytest.approx(node_sync.STOP_SETTLE_S, abs=0.06)
+        (warning,) = _warnings(caplog)
+        assert "stayed held past 2s" in warning
+
+    def test_the_late_daemon_wait_is_bounded_and_ends_at_the_lock(self, monkeypatch):
+        clock = [0.0]
+
+        def sleep(s: float) -> None:
+            clock[0] += s
+
+        assert not node_sync.await_late_daemon(sleep=sleep, now=lambda: clock[0])
+        assert clock[0] == pytest.approx(node_sync.STOP_SETTLE_S, abs=0.06)
+        clock[0] = 0.0
+        _record_pid(os.getpid())
+        with exclusive_lock(node_sync.LOCK_NAME):
+            assert node_sync.await_late_daemon(sleep=sleep, now=lambda: clock[0])
+        assert clock[0] == 0.0
+
+    def test_the_late_daemon_wait_ends_at_the_deadline_it_is_given(self):
+        # down's contended hold passes its own deadline: a cold start past
+        # the hold, not STOP_SETTLE_S from now.
+        clock = [0.0]
+
+        def sleep(s: float) -> None:
+            clock[0] += s
+
+        assert not node_sync.await_late_daemon(
+            until=7.0, sleep=sleep, now=lambda: clock[0]
+        )
+        assert clock[0] == pytest.approx(7.0, abs=0.06)
+
+    def test_a_deadline_already_past_still_looks_once(self, monkeypatch):
+        monkeypatch.setattr(node_sync, "daemon_running", lambda: True)
+        monkeypatch.setattr(node_sync, "daemon_pid", lambda: 4242)
+        naps: list[float] = []
+        assert node_sync.await_late_daemon(
+            until=-1.0, sleep=naps.append, now=lambda: 0.0
+        )
+        assert naps == []
+
+    def test_a_daemon_between_its_lock_and_its_pid_is_waited_for(self, monkeypatch):
+        # The daemon locks first and writes its pid after; the stop kills by
+        # pid, so the look lasts until the pid is there too.
+        pids = iter([None, None, 4242])
+        monkeypatch.setattr(node_sync, "daemon_running", lambda: True)
+        monkeypatch.setattr(node_sync, "daemon_pid", lambda: next(pids))
+        naps: list[float] = []
+        assert node_sync.await_late_daemon(sleep=naps.append)
+        assert naps == [node_sync.SUPERVISOR_RETRY_S] * 2
+
+    def test_a_held_lock_with_no_pid_by_the_deadline_still_reads_as_a_daemon(
+        self, monkeypatch
+    ):
+        clock = [0.0]
+
+        def sleep(s: float) -> None:
+            clock[0] += s
+
+        monkeypatch.setattr(node_sync, "daemon_running", lambda: True)
+        monkeypatch.setattr(node_sync, "daemon_pid", lambda: None)
+        assert node_sync.await_late_daemon(sleep=sleep, now=lambda: clock[0])
+        assert clock[0] == pytest.approx(node_sync.STOP_SETTLE_S, abs=0.06)
 
 
 class TestServeSupervisesTheDaemon:
@@ -689,6 +889,96 @@ class TestServeSupervisesTheDaemon:
         with exclusive_lock(node_sync.SUPERVISOR_LOCK_NAME):
             _run_supervisor(path, _one_tick())
         assert any("another server" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("where", ["supervisor-lock", "daemon-lock"])
+    def test_a_lock_pending_delete_is_a_warning_that_skips_one_tick(
+        self, sync_on, tmp_config, monkeypatch, caplog, where
+    ):
+        """Windows answers EACCES while a lock file its last holder deleted is
+        still pending delete: serve's own lock, or the daemon's under the REAL
+        ensure_node_sync. A known transient -- a WARNING naming the class and
+        the errno, never an exception-level record (Sentry's), and the next
+        tick runs."""
+        from magent import upload_server
+
+        _capture_nodes_log(caplog)
+        path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
+        stop = threading.Event()
+        _ensure_on_nodes(monkeypatch)
+        module = upload_server if where == "supervisor-lock" else node_sync
+        refused = (
+            node_sync.SUPERVISOR_LOCK_NAME
+            if where == "supervisor-lock"
+            else node_sync.LOCK_NAME
+        )
+        real_lock = module.exclusive_lock
+        refusals = [PermissionError(13, "Access is denied")]
+
+        def lock(name: str) -> contextlib.AbstractContextManager[None]:
+            if name == refused and refusals:
+                raise refusals.pop()
+            return real_lock(name)
+
+        monkeypatch.setattr(module, "exclusive_lock", lock)
+        spawned: list[list[str]] = []
+
+        def spawn(argv: list[str]) -> None:
+            spawned.append(argv)
+            stop.set()
+
+        monkeypatch.setattr(launch, "spawn_detached", spawn)
+        _run_supervisor(path, stop)
+        assert refusals == []
+        # The refused tick spawned nothing; the next one did.
+        assert spawned == [launch.node_sync_argv(path)]
+        assert _errors(caplog) == []
+        warnings = _warnings(caplog)
+        assert len(warnings) == 1, warnings
+        assert "PermissionError" in warnings[0]
+        assert "errno 13" in warnings[0]
+
+    def test_a_refused_spawn_is_a_failed_check_not_a_skipped_tick(
+        self, sync_on, tmp_config, monkeypatch, caplog
+    ):
+        """Only a lock file that would not open is the known transient. A
+        PermissionError from anywhere else in the tick -- here the spawn -- can
+        persist, so it stays at exception level (Sentry's)."""
+        _capture_nodes_log(caplog)
+        path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
+        _ensure_on_nodes(monkeypatch)
+        spawns: list[list[str]] = []
+
+        def refuse(argv: list[str]) -> None:
+            spawns.append(argv)
+            raise PermissionError(13, "Access is denied")
+
+        monkeypatch.setattr(launch, "spawn_detached", refuse)
+        _run_supervisor(path, _one_tick())
+        assert spawns == [launch.node_sync_argv(path)]
+        errors = _errors(caplog)
+        assert [r.getMessage() for r in errors] == [
+            "node sync supervisor: check failed"
+        ]
+        assert errors[0].exc_info is not None
+        assert not any("tick skipped" in m for m in _warnings(caplog))
+
+    def test_any_other_error_of_a_tick_is_still_logged_at_exception_level(
+        self, sync_on, tmp_config, monkeypatch, caplog
+    ):
+        _capture_nodes_log(caplog)
+        path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
+
+        def ensure(_config, _config_path=None):
+            raise OSError(5, "Input/output error")
+
+        monkeypatch.setattr(launch, "ensure_node_sync", ensure)
+        _run_supervisor(path, _one_tick())
+        errors = _errors(caplog)
+        assert [r.getMessage() for r in errors] == [
+            "node sync supervisor: check failed"
+        ]
+        assert errors[0].exc_info is not None
+        assert _warnings(caplog) == ["node sync supervisor: check failed"]
 
     def test_a_config_lookup_that_raises_is_logged_and_survived(
         self, sync_on, monkeypatch, caplog
@@ -1256,6 +1546,184 @@ class TestMarksMoveOnlyAfterAPull:
         results = node_sync.NodeSyncer(_second_only()).tick()
         assert results["second"][0] == node_sync.FAILED
         assert nodes.pull_marks_path("second").read_bytes() == before
+
+
+def _make_unreadable(state: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Torn on disk, or intact but still locked after the strict read's
+    retries (a Windows reader racing a replace)."""
+    if state == "torn":
+        nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+        return
+
+    def busy() -> dict[str, NodeMapEntry]:
+        raise PermissionError(13, "The process cannot access the file")
+
+    monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+
+
+_UNREADABLE = pytest.mark.parametrize(
+    ("state", "cls"), [("torn", "ValueError"), ("busy", "PermissionError")]
+)
+
+
+class TestAnUnreadableMapPullsNothing:
+    """A tick behind a map it could not read knows nothing about placement.
+    Pulling every node with no session, as if the map were empty, wrote each
+    node's marks as ``{}``: the next readable tick pulled every session from
+    zero. So it pulls nothing and writes nothing, and says so once."""
+
+    @staticmethod
+    def _pull(asked: list[str]):
+        def pull(node, _sids):
+            asked.append(node.nick)
+            return _snapshot(realpaths={"api": "/r"})
+
+        return pull
+
+    def test_a_readable_map_records_marks(self, placed):
+        asked: list[str] = []
+        node_sync.NodeSyncer(_second_only(), pull=self._pull(asked)).tick()
+        assert asked == ["second"]
+        assert _marks() == {"api": {"since": 0.0, "realpath": "/r"}}
+
+    @_UNREADABLE
+    def test_the_marks_stay_byte_identical_and_no_node_is_dialled(
+        self, placed, monkeypatch, state, cls
+    ):
+        before = _seed_marks(api=(10.0, "/r"))
+        _make_unreadable(state, monkeypatch)
+        asked: list[str] = []
+        results = node_sync.NodeSyncer(_config(), pull=self._pull(asked)).tick()
+        assert asked == []
+        assert nodes.pull_marks_path("second").read_bytes() == before
+        assert not nodes.pull_marks_path("third").exists()
+        assert not nodes.sessions_path("second").exists()
+        detail = f"the node map could not be read ({cls})"
+        assert results == {
+            "second": (node_sync.FAILED, detail),
+            "third": (node_sync.FAILED, detail),
+        }
+
+    @_UNREADABLE
+    def test_one_warning_carries_the_maps_error_and_the_recovery_once(
+        self, placed, monkeypatch, caplog, state, cls
+    ):
+        _capture_nodes_log(caplog)
+        _seed_marks(api=(10.0, "/r"))
+        real = nodes.load_node_map_strict
+        _make_unreadable(state, monkeypatch)
+        asked: list[str] = []
+        syncer = node_sync.NodeSyncer(_second_only(), pull=self._pull(asked))
+        syncer.tick()
+        syncer.tick()
+        warnings = _warnings(caplog)
+        assert len(warnings) == 1, warnings
+        # Our words and the class, then the map's own error: its path and the
+        # parser's (or the OS's) words are for nodes.log -- the tick's answer,
+        # which reaches the screen, names the class only.
+        assert warnings[0].startswith(
+            f"node sync: the node map could not be read ({cls}); pulling nothing: "
+        )
+        if state == "torn":
+            assert f"{nodes.NODE_MAP_PATH}: Expecting" in warnings[0]
+        else:
+            assert "The process cannot access the file" in warnings[0]
+        # Readable again: one line says so, and the pull resumes from the
+        # marks the unreadable ticks left alone.
+        monkeypatch.setattr(nodes, "load_node_map_strict", real)
+        nodes.write_node_map({"api": _entry("second", "api")})
+        syncer.tick()
+        syncer.tick()
+        assert asked == ["second", "second"]
+        assert _warnings(caplog) == warnings
+        again = [
+            r.getMessage() for r in caplog.records if "reads again" in r.getMessage()
+        ]
+        assert again == ["node sync: the node map reads again"]
+
+    def test_one_shot_behind_an_unreadable_map_is_a_failure_not_a_silence(self, placed):
+        # `magent node sync --once` exits 1 on any non-OK node: an empty
+        # answer would have printed nothing and exited 0.
+        nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+        results = node_sync.run_once(_config(), pull=self._pull([]))
+        assert set(results) == {"second", "third"}
+        assert {outcome for outcome, _ in results.values()} == {node_sync.FAILED}
+
+    def test_a_new_class_mid_episode_warns_again(self, placed, monkeypatch, caplog):
+        # Torn, then busy: a different refusal is news, not a repeat.
+        _capture_nodes_log(caplog)
+        syncer = node_sync.NodeSyncer(_second_only(), pull=self._pull([]))
+        _make_unreadable("torn", monkeypatch)
+        syncer.tick()
+        _make_unreadable("busy", monkeypatch)
+        syncer.tick()
+        syncer.tick()
+        assert [w.split("; ")[0] for w in _warnings(caplog)] == [
+            "node sync: the node map could not be read (ValueError)",
+            "node sync: the node map could not be read (PermissionError)",
+        ]
+
+    @pytest.mark.usefixtures("healthy_pulls_end_first")
+    def test_a_pull_in_flight_outlives_the_tick_and_the_next_readable_one_collects_it(
+        self, placed, monkeypatch, executors
+    ):
+        # Ruling (c): an unreadable tick leaves a running pull alone -- its
+        # marks untouched, never dialled a second time while it runs -- and
+        # the first readable tick after it ends collects it as any laggard.
+        release = threading.Event()
+        dialled: list[str] = []
+        clock = _Clock()
+        syncer = node_sync.NodeSyncer(
+            _config(), pull=_blocking_pull(release, dialled), clock=clock
+        )
+        before = _seed_marks(api=(10.0, "/r"))
+        real = nodes.load_node_map_strict
+        try:
+            first = syncer.tick(wait_s=0.2)
+            _make_unreadable("busy", monkeypatch)
+            unread = syncer.tick(wait_s=0.2)
+            marks_while_unread = nodes.pull_marks_path("second").read_bytes()
+            monkeypatch.setattr(nodes, "load_node_map_strict", real)
+            clock.at = 7.0
+            third = syncer.tick(wait_s=0.2)
+            release.set()
+            _wait_out_the_laggard(syncer, "second")
+            clock.at = 8.0
+            fourth = syncer.tick(wait_s=10)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
+        ok = (node_sync.OK, "")
+        assert first == {"second": _running(0), "third": ok}
+        assert unread["second"][0] == node_sync.FAILED
+        assert marks_while_unread == before
+        assert third == {"second": _running(7), "third": ok}
+        assert fourth == {"second": ok, "third": ok}
+        # Once for the hung pull, once after it was collected; never between.
+        assert sorted(dialled) == ["second", "second", "third", "third", "third"]
+
+    @pytest.mark.usefixtures("healthy_pulls_end_first")
+    def test_what_a_pull_in_flight_raises_still_surfaces_after_the_tick(
+        self, placed, monkeypatch, executors
+    ):
+        release = threading.Event()
+        _hang_then_raise(monkeypatch, release, ValueError("late"))
+        syncer = node_sync.NodeSyncer(_config(), pull=self._pull([]), clock=_Clock())
+        real = nodes.load_node_map_strict
+        try:
+            syncer.tick(wait_s=0.2)
+            _make_unreadable("busy", monkeypatch)
+            syncer.tick(wait_s=0.2)
+            monkeypatch.setattr(nodes, "load_node_map_strict", real)
+            release.set()
+            _wait_out_the_laggard(syncer, "second")
+            with pytest.raises(ValueError, match="late"):
+                syncer.tick(wait_s=10)
+        finally:
+            release.set()
+            syncer.close()
+            _drain(executors)
 
 
 class TestMarkAndPruneScope:
@@ -2383,6 +2851,32 @@ class TestTheFinalPull:
         assert node_sync.final_pull(_config(), "nowhere") is None
         assert fake_ssh.calls() == []
 
+    @pytest.mark.parametrize(
+        ("state", "cls"), [("torn", "ValueError"), ("busy", "PermissionError")]
+    )
+    def test_an_unreadable_map_raises_and_is_never_read_as_never_placed(
+        self, placed, fake_ssh, monkeypatch, state, cls
+    ):
+        # None is "never placed". A map that could not be read says nothing
+        # about placement, so it is an error the caller must handle -- one
+        # that names the map's failure by class alone, never its path.
+        before = _seed_marks(api=(10.0, "/home/amin/magent/api"))
+        if state == "torn":
+            nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+        else:
+            # Intact on disk, but still locked after the strict read's
+            # retries (a Windows reader racing a replace).
+            def busy() -> dict[str, NodeMapEntry]:
+                raise PermissionError(13, "The process cannot access the file")
+
+            monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+        with pytest.raises(OSError) as info:
+            node_sync.final_pull(_config(), "api")
+        assert type(info.value.__cause__).__name__ == cls
+        assert str(info.value) == f"the node map could not be read ({cls})"
+        assert fake_ssh.calls() == []
+        assert nodes.pull_marks_path("second").read_bytes() == before
+
     def test_a_final_pull_waits_for_the_daemons_tick_then_gives_up(
         self, placed, fake_ssh
     ):
@@ -3074,6 +3568,8 @@ class TestJsonNestedTooDeeply:
         assert _node_errors(caplog) == []
 
     def test_a_node_map_nested_too_deeply_does_not_stop_the_tick(self, placed):
+        # It does not raise out of the tick, and -- like any map the tick
+        # cannot read -- it is no licence to pull every node with nothing.
         nodes.NODE_MAP_PATH.write_text(_TOO_DEEP, encoding="utf-8")
         asked: list[set[str]] = []
 
@@ -3082,8 +3578,12 @@ class TestJsonNestedTooDeeply:
             return _snap()
 
         results = node_sync.NodeSyncer(_config(), pull=pull).tick()
-        assert results == {"second": (node_sync.OK, ""), "third": (node_sync.OK, "")}
-        assert asked == [set(), set()]
+        detail = "the node map could not be read (ValueError)"
+        assert results == {
+            "second": (node_sync.FAILED, detail),
+            "third": (node_sync.FAILED, detail),
+        }
+        assert asked == []
 
     def test_the_strict_reader_calls_it_a_bad_file(self, placed):
         """ValueError, the one type every strict caller catches for a bad map

@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
-from magent.config import NODE_AUTO, NODE_CLOUD, runs_on_node
+from magent.config import NODE_AUTO, NODE_CLOUD, is_cloud, runs_on_node
 from magent.lockfile import LockHeld, persistent_lock
 from magent.log import get_logger
 from magent.psmux import session_name
@@ -295,6 +295,20 @@ def read_node_map() -> dict[str, NodeMapEntry]:
         return {}
 
 
+# What every surface says for a map ``load_node_map_strict`` refused.
+# D-MERGE: Dmap's and Gmap's launch._map_unreadable_text say the same fact as
+# "the node map is unreadable (<Class>)"; at integration they build on
+# map_unread_text instead, so `up` and `down` name it in one phrasing.
+MAP_UNREAD = "the node map could not be read"
+
+
+def map_unread_text(exc: BaseException) -> str:
+    """``MAP_UNREAD`` naming what refused the map by its CLASS only: the
+    error's own text names the map's path and the parser's words, which go
+    to nodes.log, never the screen."""
+    return f"{MAP_UNREAD} ({type(exc).__name__})"
+
+
 def write_node_map(entries: Mapping[str, NodeMapEntry]) -> None:
     """Replace ``node-map.json`` with ``entries`` atomically: a sibling temp
     file unique to this call (``tempfile.mkstemp``), then one ``os.replace``
@@ -544,7 +558,7 @@ def resolve(
     """
     if proj.node is None:
         raise NodeConfigError(f"{proj.path}: not a node project")
-    if proj.node == NODE_CLOUD:
+    if is_cloud(proj):
         raise NodeConfigError(
             f'{proj.path}: "node": "cloud" runs on the cloud backend, not a pool '
             "machine; it has no Node to resolve"

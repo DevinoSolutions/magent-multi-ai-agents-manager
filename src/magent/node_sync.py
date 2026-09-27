@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING
 
 from magent import nodes, remote_mux
 from magent.attach_client import SSH_TRANSPORT_RC
-from magent.config import NODE_CLOUD, load_config
+from magent.config import load_config, runs_on_node
 from magent.env import local_username
 from magent.lockfile import LockHeld, exclusive_lock
 from magent.log import clear_heartbeat, get_logger, run_heartbeat, write_heartbeat
@@ -187,6 +187,88 @@ def stop_daemon(
     return True
 
 
+# How often `down --all` retries serve's supervisor lock while a supervisor
+# tick holds it, and how often it looks for a daemon that took its own lock
+# late. The first wait is bounded by STOP_SETTLE_S; the look, by the deadline
+# its caller gives (await_late_daemon).
+SUPERVISOR_RETRY_S = 0.05
+
+
+@contextlib.contextmanager
+def supervisor_held(
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+) -> Iterator[bool]:
+    """Hold serve's supervisor lock (``SUPERVISOR_LOCK_NAME``) for the body,
+    so no ``magent serve`` starts a daemon while ``down --all`` stops it: its
+    ``_supervise_node_sync`` skips every tick it cannot take this lock for.
+
+    Yields True when the lock was contended -- a supervisor tick held it, and
+    a daemon that tick spawned may not have taken its own lock yet -- or could
+    not be taken. A tick holds it for one ``ensure_node_sync``, so the wait is
+    short: ``SUPERVISOR_RETRY_S`` steps up to ``STOP_SETTLE_S``. Not taken by
+    then, the body runs unprotected with a WARNING: stopping the daemon is
+    never skipped for want of the lock."""
+    log = get_logger(LOG_NAME)
+    deadline = now() + STOP_SETTLE_S
+    contended = False
+    with contextlib.ExitStack() as stack:
+        while True:
+            try:
+                stack.enter_context(exclusive_lock(SUPERVISOR_LOCK_NAME))
+            except OSError as exc:
+                # LockHeld is a supervisor tick. Anything else is retried the
+                # same way: Windows answers EACCES while a lock file its last
+                # holder deleted is still pending delete (a scanner's handle).
+                contended = True
+                if now() < deadline:
+                    sleep(SUPERVISOR_RETRY_S)
+                    continue
+                if isinstance(exc, LockHeld):
+                    log.warning(
+                        "node sync: serve's supervisor lock stayed held past"
+                        " %.0fs; stopping the daemon without it",
+                        STOP_SETTLE_S,
+                    )
+                else:
+                    log.warning(
+                        "node sync: could not take serve's supervisor lock"
+                        " (%s); stopping the daemon without it",
+                        exc,
+                    )
+            break
+        yield contended
+
+
+def await_late_daemon(
+    *,
+    until: float | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+) -> bool:
+    """Look until ``until`` -- a ``now()`` reading; None is ``STOP_SETTLE_S``
+    from now -- for a daemon holding its lock: True as soon as one does and
+    has written its pid. It always looks once, even past ``until``.
+    ``ensure_node_sync`` Popens a daemon that takes ``LOCK_NAME`` only once its
+    interpreter is up, so right after a spawn the lock -- the only proof of a
+    daemon -- still reads free. It writes its pid just after the lock, and
+    ``stop_daemon`` kills by pid: stopped in between, it would be called
+    stuck. At the deadline the lock's last answer stands. A probe that could
+    not open the lock file answers nothing and the look goes on; the stop
+    after it asks again."""
+    deadline = now() + STOP_SETTLE_S if until is None else until
+    held = False
+    while True:
+        with contextlib.suppress(OSError):
+            held = daemon_running()
+            if held and daemon_pid() is not None:
+                return True
+        if now() >= deadline:
+            return held
+        sleep(SUPERVISOR_RETRY_S)
+
+
 def wanted(config: MagentConfig) -> bool:
     """Is there anything to sync: a pool, and an enabled project pinned or
     placed on it? A ``"cloud"`` project has no pool node and is not the
@@ -196,8 +278,7 @@ def wanted(config: MagentConfig) -> bool:
     disabling) the last node project stops the sync even for sessions still
     live on a node. Deliberate (YAGNI); revisit if it bites."""
     return bool(config.settings.nodes) and any(
-        p.enabled and p.node is not None and p.node != NODE_CLOUD
-        for p in config.projects
+        p.enabled and runs_on_node(p) for p in config.projects
     )
 
 
@@ -262,6 +343,15 @@ def state_stores() -> list[tuple[str, str, Path]]:
             continue
         stores.append((project, f"@{e.nick}", nodes.state_dir(e.nick, e.sid)))
     return stores
+
+
+class NodeMapUnreadable(OSError):
+    """``final_pull`` could not read the node map: busy past its retries,
+    torn, or not a JSON object. Whether the project was placed is unknown, so
+    this is never None ("never placed"). An OSError so a caller catching the
+    pull's other OSErrors catches it too; the map's own error is chained, and
+    the message names its class only -- the path and the parser's words stay
+    off the screen."""
 
 
 class NodeLockHeld(LockHeld):
@@ -588,6 +678,8 @@ class NodeSyncer:
         # key per nick, and one worker per nick at a time, so no two threads
         # write the same key.
         self._errors: dict[str, Exception] = {}
+        # The class of what last refused the node map, while it stays unread.
+        self._map_error: str | None = None
 
     def reconfigure(self, config: MagentConfig) -> None:
         self._config = config
@@ -633,9 +725,22 @@ class NodeSyncer:
 
         A node that leaves the pool keeps its running pull until that pull
         ends. Its outcome is then dropped, but an exception it raised still
-        propagates, as any laggard's does."""
+        propagates, as any laggard's does.
+
+        The node map is read STRICTLY. One that cannot be read (busy, torn)
+        is no licence to pull every node with nothing: that wrote each node's
+        marks as ``{}``, and the next readable tick re-pulled every session
+        from zero. Such a tick dials no node and writes nothing; see
+        ``_map_unreadable``."""
+        try:
+            placed = nodes.load_node_map_strict()
+        except (OSError, ValueError) as e:
+            return self._map_unreadable(e)
+        if self._map_error is not None:
+            self._map_error = None
+            get_logger(LOG_NAME).info("node sync: the node map reads again")
         by_nick: dict[str, dict[str, NodeMapEntry]] = {}
-        for entry in nodes.read_node_map().values():
+        for entry in placed.values():
             by_nick.setdefault(entry.nick, {})[entry.sid] = entry
         user = self._local_user if self._local_user is not None else local_username()
         # Defensive: reconfigure runs between ticks on this thread; the local
@@ -684,6 +789,25 @@ class NodeSyncer:
             if nick not in slow:
                 self._note(nick, outcome, detail)
         return results
+
+    def _map_unreadable(self, e: OSError | ValueError) -> dict[str, tuple[str, str]]:
+        """A tick's answer when the node map could not be read: every pool
+        node FAILED, naming the map's class -- so ``node sync --once`` exits 1
+        rather than printing nothing -- with no node dialled and no file
+        written. A pull already in flight is left to the next readable tick.
+
+        The answer names the map's error by class only; the log line carries
+        the whole error (the map's path, the parser's or the OS's words), for
+        whoever opens nodes.log to find what is torn. One WARNING per episode
+        and per change of class -- a new class is news; the ticks it stays
+        unreadable the same way go to DEBUG, and the tick that reads it again
+        says so once. Not ``_note``: one map, not one line per node."""
+        cls = type(e).__name__
+        text = nodes.map_unread_text(e)
+        level = logging.DEBUG if self._map_error == cls else logging.WARNING
+        self._map_error = cls
+        get_logger(LOG_NAME).log(level, "node sync: %s; pulling nothing: %s", text, e)
+        return dict.fromkeys(sorted(self._config.settings.nodes), (FAILED, text))
 
     def _sync_node(
         self,
@@ -837,6 +961,32 @@ class NodeSyncer:
             log.info("node %s: load samples kept again", nick)
 
 
+class DaemonLockUnknown(OSError):
+    """A node sync lock file would not open -- Windows answers EACCES while
+    one is pending delete -- so whether a daemon runs is unknown, and nothing
+    ran. Raised from that open's error (``error``, also its ``__cause__``): by
+    ``run_once`` and ``run_sync_loop`` for the daemon's lock, by
+    ``launch.ensure_node_sync`` for its probe of it, and by serve's supervisor
+    for its own lock -- never for an OSError of a tick or a spawn. It is an
+    OSError itself, so a caller that contains every OSError still contains it;
+    only a caller that names it tells it apart."""
+
+    def __init__(self, error: OSError) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
+def _take_daemon_lock(stack: contextlib.ExitStack) -> None:
+    """Hold ``LOCK_NAME`` on ``stack``. LockHeld when a daemon holds it;
+    DaemonLockUnknown when its file would not open."""
+    try:
+        stack.enter_context(exclusive_lock(LOCK_NAME))
+    except LockHeld:
+        raise
+    except OSError as e:
+        raise DaemonLockUnknown(e) from e
+
+
 def run_once(
     config: MagentConfig,
     *,
@@ -844,9 +994,11 @@ def run_once(
     | None = None,
 ) -> dict[str, tuple[str, str]]:
     """One tick under the daemon's lock (``magent node sync --once``). LockHeld
-    when the daemon is running -- its own next tick is the answer. The tick
-    waits for every pull: a one-shot has no next tick to collect a laggard."""
-    with exclusive_lock(LOCK_NAME):
+    when the daemon is running -- its own next tick is the answer --
+    DaemonLockUnknown when the lock would not open. The tick waits for every
+    pull: a one-shot has no next tick to collect a laggard."""
+    with contextlib.ExitStack() as stack:
+        _take_daemon_lock(stack)
         syncer = NodeSyncer(config, pull=pull)
         try:
             return syncer.tick()
@@ -867,6 +1019,7 @@ def run_sync_loop(
     """The daemon body (``magent node sync``, detached by serve). Returns 0.
 
     - Another daemon holding ``node-sync``: exit quietly.
+    - Its lock file would not open: DaemonLockUnknown, and nothing ran.
     - Otherwise: pid file + heartbeat thread, then tick every
       ``tick_interval_s``, re-reading the config through ``reload`` (None
       keeps the current one) until no project runs on a node. Each tick waits
@@ -879,7 +1032,7 @@ def run_sync_loop(
     log = get_logger(LOG_NAME)
     with contextlib.ExitStack() as stack:
         try:
-            stack.enter_context(exclusive_lock(LOCK_NAME))
+            _take_daemon_lock(stack)
         except LockHeld:
             log.info("node sync: another daemon holds the lock; exiting")
             return 0
@@ -956,7 +1109,9 @@ def final_pull(
 ) -> remote_mux.PullResult | None:
     """Pull project ``name``'s node session once more -- ``down`` calls this
     before it kills the session, so the last turn is home. None when the
-    project was never placed. Waits up to ``wait_s`` for a daemon tick that
+    project was never placed: the map, read STRICTLY, has no entry for it. A
+    map that could not be read raises NodeMapUnreadable -- unknown is never
+    "never placed". Waits up to ``wait_s`` for a daemon tick that
     holds the node, then raises NodeLockHeld; NodeConfigError, RemoteError and
     OSError (writing ``pull.json``) also go to the caller, which decides what
     "could not pull" means.
@@ -977,7 +1132,10 @@ def final_pull(
     carries on from the last one. A node that reports no real path for the
     session's root (a deleted project) returns normally with a warning -- no
     later pull could do better."""
-    entry = nodes.read_node_map().get(name)
+    try:
+        entry = nodes.load_node_map_strict().get(name)
+    except (OSError, ValueError) as e:
+        raise NodeMapUnreadable(nodes.map_unread_text(e)) from e
     if entry is None:
         return None
     user = local_user if local_user is not None else local_username()

@@ -386,6 +386,21 @@ class TestTheStrictRead:
             nodes.load_node_map_strict()
         assert (busy.reads, sleeps) == (1, [])
 
+    def test_what_refused_the_map_is_said_by_its_class_only(self, node_map):
+        # The one sentence every surface prints for a map this read refused.
+        # The error's own text names the map's path and the parser's words:
+        # nodes.log has those, the screen gets the class.
+        node_map.parent.mkdir(parents=True)
+        node_map.write_text("{ torn", encoding="utf-8")
+        with pytest.raises(ValueError) as torn:
+            nodes.load_node_map_strict()
+        assert nodes.map_unread_text(torn.value) == (
+            "the node map could not be read (ValueError)"
+        )
+        assert nodes.map_unread_text(PermissionError(13, "busy")) == (
+            f"{nodes.MAP_UNREAD} (PermissionError)"
+        )
+
 
 class TestTheMapRecordsHowToReachASession:
     def test_target_and_cwd_round_trip(self, node_map):
