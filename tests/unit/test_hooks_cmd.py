@@ -88,9 +88,13 @@ class TestInstall:
         )
         assert "\\" not in hooks_cmd._codex_recipe()
 
-    def test_reinstall_repairs_backslash_command(self, runner, tmp_path):
+    def test_reinstall_repairs_backslash_command(self, runner, tmp_path, monkeypatch):
         # A pre-3.1.2 install wired backslash paths bash cannot run; the
-        # marker-based idempotence must not skip them -- reinstall rewrites.
+        # marker-based idempotence must not skip them -- reinstall rewrites
+        # them to THIS install's command, not a slash-swapped copy of the old.
+        monkeypatch.setattr(
+            hooks_cmd.shutil, "which", lambda _: "C:/new/magent-state-hook.EXE"
+        )
         settings = tmp_path / "settings.json"
         stale = r"c:\users\x\scripts\magent-state-hook.EXE --source claude"
         settings.write_text(
@@ -117,7 +121,7 @@ class TestInstall:
         data = json.loads(settings.read_text(encoding="utf-8"))
         cmds = [h["command"] for e in data["hooks"]["Stop"] for h in e["hooks"]]
         ours = [c for c in cmds if "magent-state-hook" in c]
-        assert len(ours) == 1 and "\\" not in ours[0]
+        assert ours == ["C:/new/magent-state-hook.EXE --source claude"]
         assert "node notify.mjs" in cmds  # foreign hook untouched
 
     def test_reinstall_healthy_reports_already_wired(self, runner, tmp_path):
