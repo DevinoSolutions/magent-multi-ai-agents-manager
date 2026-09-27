@@ -34,7 +34,6 @@ from tests.unit._node_fixtures import (
     NOW,
     OLDER_SESSION_ID,
     SESSION_ID,
-    before_d,
     config_json,
     entry,
     git,
@@ -43,13 +42,10 @@ from tests.unit._node_fixtures import (
     write_transcript,
 )
 
-# D-MERGE: recall's kill branch (D's remote_mux.kill_session, DECISION-26 x;
-# plan G :3853-3874) and `recall --to` (D's recipe builder and bring-up; plan G
-# Task 15, :4173-4266) are gated through _node_fixtures' one D_ATTRS list:
-# needs_d switches the written tests on with D's merge, and they fail until
-# the deferred code lands; before_d retires the pre-D pins.
-_NEEDS_D_KILL = needs_d("kill_session", plan=":3853-3874")
-_BEFORE_D_KILL = before_d("kill_session")
+# D-MERGE: `recall --to` (D's recipe builder and bring-up; plan G Task 15,
+# :4173-4266) is gated through _node_fixtures' one D_ATTRS list: needs_d
+# switches the written tests on with D's merge, and they fail until the
+# deferred code lands.
 _NEEDS_D_MOVE = needs_d(
     "node_recipe",
     "node_git_states",
@@ -1706,8 +1702,7 @@ def node_answers(monkeypatch):
         return True  # D's contract: True killed, False not there, None unknown
 
     monkeypatch.setattr(remote_mux, "repo_status", _status)
-    # D-MERGE: drop raising=False once D's remote_mux.kill_session is merged.
-    monkeypatch.setattr(remote_mux, "kill_session", _kill, raising=False)
+    monkeypatch.setattr(remote_mux, "kill_session", _kill)
     return events
 
 
@@ -1726,10 +1721,7 @@ def node_is_gone(monkeypatch, request):
     monkeypatch.setattr(node_sync, "final_pull", _gone)
     monkeypatch.setattr(remote_mux, "repo_status", _gone)
     # kill_session never raises (D); an unreachable node is never asked anyway.
-    # D-MERGE: drop raising=False once D's remote_mux.kill_session is merged.
-    monkeypatch.setattr(
-        remote_mux, "kill_session", lambda node, sid: None, raising=False
-    )
+    monkeypatch.setattr(remote_mux, "kill_session", lambda node, sid: None)
 
 
 def _claude_dir(path: Path) -> Path:
@@ -1747,31 +1739,12 @@ def _recall(runner, cfg: str, *args: str):
 
 
 class TestRecallLocal:
-    @_NEEDS_D_KILL
     def test_the_steps_run_in_order_pull_report_stop(
         self, runner, placed_api, node_answers
     ):
         _recall(runner, placed_api, "--local")
 
         assert [e[0] for e in node_answers] == ["pull", "repo_status", "kill"]
-
-    # D-MERGE: delete this pin with the kill branch -- it holds only while
-    # D's kill_session is absent: the session is named, never "stopped".
-    @_BEFORE_D_KILL
-    def test_before_d_a_reachable_session_is_named_with_its_stop_command(
-        self, runner, placed_api, node_answers
-    ):
-        result = _recall(runner, placed_api, "--local")
-
-        assert [e[0] for e in node_answers] == ["pull", "repo_status"]
-        assert (
-            "stop it with: ssh amin@devino-second"
-            f" \"tmux -L {remote_mux.SOCKET} kill-session -t '=api'\"" in result.stdout
-        )
-        assert "stopped api" not in result.stdout
-        # Nobody checked, so it is never asserted to be running either.
-        assert "api may still be running on @second" in result.stdout
-        assert "is still running" not in result.stdout
 
     def test_the_last_pull_goes_through_node_syncs_lock(
         self, runner, placed_api, node_answers
@@ -1816,7 +1789,6 @@ class TestRecallLocal:
         assert "Traceback" not in result.output
         assert "is home" not in result.stdout
 
-    @_NEEDS_D_KILL
     def test_stopped_is_said_only_when_the_kill_landed(
         self, runner, placed_api, node_answers
     ):
@@ -1824,7 +1796,6 @@ class TestRecallLocal:
 
         assert "stopped api on @second" in result.stdout
 
-    @_NEEDS_D_KILL
     def test_a_session_that_was_already_gone_is_not_called_stopped(
         self, runner, placed_api, node_answers, monkeypatch
     ):
@@ -1835,7 +1806,6 @@ class TestRecallLocal:
         assert "no such session" in result.stdout
         assert "stopped api" not in result.stdout
 
-    @_NEEDS_D_KILL
     def test_an_unconfirmed_kill_prints_the_quoted_command_that_stops_it(
         self, runner, placed_api, node_answers, monkeypatch
     ):
@@ -2270,7 +2240,7 @@ class TestTheLastPullMustFinish:
         (matched by TYPE, not by rc) is a note -- no re-run clears it, so it
         must never block the recall. It proves nothing about the network, so
         the node stays reachable (m-R3-1, kept by team-lead's ruling): the
-        live repo read is attempted and the stop command is the ssh one (P4)."""
+        live repo read and the kill over ssh are both attempted (P4)."""
 
         def _refused(*a, **k):
             raise remote_mux.PullRefused(
@@ -2287,13 +2257,10 @@ class TestTheLastPullMustFinish:
             " going on with what was already pulled"
         ) in result.stdout
         assert "did not finish" not in result.output
-        assert [e[0] for e in node_answers] == ["repo_status"]
+        assert [e[0] for e in node_answers] == ["repo_status", "kill"]
         assert "repos on @second, now:" in result.stdout
         assert "last known" not in result.stdout
-        assert (
-            "stop it with: ssh amin@devino-second"
-            f" \"tmux -L {remote_mux.SOCKET} kill-session -t '=api'\"" in result.stdout
-        )
+        assert "stopped api on @second" in result.stdout
         assert "api" not in nodes.read_node_map()
 
     def test_an_answer_that_is_not_a_pull_stops_the_recall(
@@ -2491,9 +2458,7 @@ class TestRecallReadsTheNodeMapAsUntrusted:
             lambda *a, **k: remote_mux.PullResult(files=(), since=NOW),
         )
         monkeypatch.setattr(remote_mux, "repo_status", _refused)
-        monkeypatch.setattr(
-            remote_mux, "kill_session", lambda node, sid: None, raising=False
-        )
+        monkeypatch.setattr(remote_mux, "kill_session", lambda node, sid: None)
         nodes.update_node_map("api", entry("second"))
         cfg = tmp_config(
             config_json(
@@ -3134,32 +3099,10 @@ class TestTheStopCommandIsSafeToPaste:
         assert f"{sid} may still be running on @second" in result.stdout
         assert shlex.split(_kill_command(result.stdout)) == _kill_argv(sid)
 
-    # D-MERGE: with D the reachable branch prints this only when kill_session
-    # returns None; the fixture's kill answers True, so this pin goes then.
-    @_BEFORE_D_KILL
-    @pytest.mark.parametrize("sid", _UNQUOTABLE_SIDS)
-    def test_before_d_a_reachable_node_gets_the_two_step_command(
-        self, runner, api_repo, tmp_config, node_answers, sid
-    ):
-        nodes.update_node_map("api", entry("second", sid))
-        cfg = tmp_config(
-            config_json(
-                ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
-            )
-        )
-
-        result = _recall(runner, cfg, "--local")
-
-        assert result.exit_code == 0
-        assert ' "tmux' not in result.stdout
-        assert "ssh amin@devino-second, then run on the node" in result.stdout
-        assert shlex.split(_kill_command(result.stdout)) == _kill_argv(sid)
-
-    # The hostile-sid pin that outlives the pre-D one above (spec-G14 R2): the
+    # The hostile-sid pin for an unconfirmed kill (spec-G14 R2): the
     # plan's own None test uses "api", for which its raw f-string and
     # _kill_hint print the same line, so only a hostile sid catches a merge
     # that pasted the raw f-string over _kill_hint.
-    @_NEEDS_D_KILL
     @pytest.mark.parametrize("sid", _UNQUOTABLE_SIDS)
     def test_an_unconfirmed_kill_of_such_a_sid_prints_the_two_step_command(
         self, runner, api_repo, tmp_config, node_answers, monkeypatch, sid

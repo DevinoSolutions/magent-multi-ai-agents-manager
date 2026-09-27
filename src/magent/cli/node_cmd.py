@@ -42,13 +42,6 @@ if TYPE_CHECKING:
 # D_ATTRS: launch.node_recipe, launch.node_git_states,
 # launch.bring_up_node_project, launch.NodeBringUpOutcome,
 # remote_mux.push_files, remote_mux.kill_session.
-# - recall's kill (Task 14): `_stop_session`'s reachable branch becomes
-#   :3865-3874 (remote_mux.kill_session and its three outcomes) -- that
-#   branch only: keep today's docstring, `source is None` branch and
-#   `_kill_hint`, and do not paste :3853-3864 (the plan's raw `kill`
-#   f-string and the bare unreachable print). On None it prints
-#   `_kill_hint(source.target, held.sid)`, never the plan's raw f-string
-#   (spec-G14 P1). Needs kill_session.
 # - recall --to (Task 15): the option (:3934) and its usage rule; the two
 #   `to_local` guards -- `_local_dir` only for --local (:3960-3962), and
 #   `_recall_local` back under `if local_dir is not None:` with `_recall_to`
@@ -1086,23 +1079,28 @@ def _kill_hint(target: str | None, sid: str) -> str:
 
 def _stop_session(source: Node | None, held: NodeMapEntry) -> None:
     """Step 3, best effort: a session that cannot be stopped is named, with
-    the exact command that stops it."""
+    the exact command that stops it. "stopped" is said only when D's
+    ``kill_session`` returned True (DECISION-26 x); its None -- the call
+    failed -- is unknown, never "stopped" or "gone"."""
+    from magent import remote_mux  # heavy subsystem: in-body per policy
+
     if source is None:
         _note(
             f"{held.sid} may still be running on @{held.nick};"
             f" {_kill_hint(None, held.sid)}"
         )
         return
-    # D-MERGE: plan G :3865-3874 replaces this line with D's
-    # remote_mux.kill_session(source, held.sid) and its three outcomes --
-    # "stopped" only on True, "no such session" on False, and on None the
-    # command from _kill_hint(source.target, held.sid), never the plan's raw
-    # f-string (spec-G14 P1). Until D lands nothing can stop the session from
-    # here, so it is named with the command that does.
-    _note(
-        f"{held.sid} may still be running on @{held.nick};"
-        f" {_kill_hint(source.target, held.sid)}"
-    )
+    killed = remote_mux.kill_session(source, held.sid)
+    if killed is None:
+        _note(
+            f"could not stop {held.sid} on @{held.nick} (unreachable, or the"
+            f" kill failed); it may still be running --"
+            f" {_kill_hint(source.target, held.sid)}"
+        )
+    elif killed:
+        _ok(f"stopped {held.sid} on @{held.nick}")
+    else:
+        _note(f"no such session {held.sid} on @{held.nick}; nothing to stop")
 
 
 def _clear_placement(name: str, held: NodeMapEntry) -> None:
