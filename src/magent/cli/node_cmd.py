@@ -683,11 +683,9 @@ def _outcome_unknown(exc: RemoteError) -> bool:
     """Did ``exc`` kill a call that may have run to the end? A timeout or an
     over-cap reply: killing the local ssh does not stop the remote command.
     setup's row wording and its root-login hint both read this ONE answer, so
-    they can never contradict each other."""
-    # D-MERGE: return exc.outcome_unknown (D17) once D lands; until then the
-    # over-cap case is known only by _spawn's own words (magent's, not the
-    # node's).
-    return exc.timed_out or exc.stderr_tail.startswith("reply exceeded ")
+    they can never contradict each other. The flags, never ``stderr_tail``:
+    that is the node's own words."""
+    return exc.outcome_unknown
 
 
 def _step_failed(node: Node, exc: RemoteError, step: str) -> ScriptLine:

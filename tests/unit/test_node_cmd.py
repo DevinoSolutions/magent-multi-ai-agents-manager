@@ -1084,7 +1084,10 @@ class TestNodeSetupUnreachable:
         # login -- the two can never contradict each other.
         def over_cap(node, users, pubkey, **kwargs):
             raise remote_mux.RemoteError(
-                None, f"reply exceeded {remote_mux.MAX_REPLY_BYTES} bytes", ("ssh",)
+                None,
+                f"reply exceeded {remote_mux.MAX_REPLY_BYTES} bytes",
+                ("ssh",),
+                over_cap=True,
             )
 
         monkeypatch.setattr(remote_mux, "setup_node", over_cap)
@@ -1097,14 +1100,24 @@ class TestNodeSetupUnreachable:
         assert fake_gh.calls() == []
 
     def test_the_real_over_cap_error_reads_as_outcome_unknown(self, fake_ssh):
-        # The predicate knows over-cap by remote_mux's own words until D17's
-        # outcome_unknown: a reworded raise must fail here, not go quiet.
+        # The real raise, end to end: remote_mux flags it, and the predicate
+        # reads that flag (D17's outcome_unknown).
         fake_ssh.set_mode("flood")
         node = nodes.Node(nick="second", host="devino-second", user="root", root="~")
         with pytest.raises(remote_mux.RemoteError) as caught:
             remote_mux.run(node, ["flood"], timeout_s=60, max_stdout_bytes=64 * 1024)
         assert not caught.value.timed_out
+        assert caught.value.over_cap
         assert node_cmd._outcome_unknown(caught.value)
+
+    def test_the_predicate_reads_the_flags_never_the_nodes_words(self):
+        # stderr_tail is the NODE's words: a node that prints "reply exceeded"
+        # did not overflow anything, and an over-cap reply is known by its
+        # flag whatever its first line says.
+        said = remote_mux.RemoteError(1, "reply exceeded 5 bytes", ("ssh",))
+        flagged = remote_mux.RemoteError(None, "", ("ssh",), over_cap=True)
+        assert not node_cmd._outcome_unknown(said)
+        assert node_cmd._outcome_unknown(flagged)
 
     def test_a_spawn_failure_is_not_outcome_unknown(
         self, runner, tmp_config, fake_ssh, fake_gh, monkeypatch
