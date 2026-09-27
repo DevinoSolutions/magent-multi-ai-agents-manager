@@ -2422,7 +2422,11 @@ def _run_node_bring_ups(
     is brought up as usual -- attached if its session runs, restarted in its
     own folder if not, neither overwriting anyone -- with the collision as a
     warning, so a healthy session is never reported failed because a newcomer
-    arrived."""
+    arrived.
+
+    Every project arrives placed: ``place_node_projects`` turns each ``auto``
+    one into a nick or leaves it out (an unreadable map included), so none
+    reaches here still ``auto``."""
     # heavy subsystem: in-body per policy
     from magent import nodes
 
@@ -2443,16 +2447,7 @@ def _run_node_bring_ups(
     outcomes: dict[str, NodeBringUpOutcome] = {}
     for proj in projects:
         sid = nodes.node_sid(proj)
-        if unreadable is not None and proj.node == NODE_AUTO:
-            # Refused HERE, not left to its own bring-up: a map readable
-            # again by then would place it past the check this one failed.
-            get_logger("nodes").warning(
-                "node project %s refused, node map unreadable: %s", sid, unreadable
-            )
-            outcomes[sid] = NodeBringUpOutcome(
-                ok=False, sid=sid, node="", error=_map_unreadable_text(unreadable)
-            )
-        elif sid in clash and not placed[sid][2]:
+        if sid in clash and not placed[sid][2]:
             get_logger("nodes").warning("node project %s refused: %s", sid, clash[sid])
             outcomes[sid] = NodeBringUpOutcome(
                 ok=False, sid=sid, node=placed[sid][0], error=clash[sid]
