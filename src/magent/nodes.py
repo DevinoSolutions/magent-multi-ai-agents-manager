@@ -1410,22 +1410,19 @@ def _memory_state(memory: Path) -> tuple[bool, tuple[str, ...]]:
             f"memory: cannot be read ({type(exc).__name__}); no memory shipped",
         )
 
+    log = get_logger("nodes")
     try:
         if not path_is_dir(memory):
             return False, ()
     except OSError as exc:
-        get_logger("nodes").warning(
-            "memory folder %s cannot be read; skipped: %s", memory, exc
-        )
+        log.warning("memory folder %s cannot be read; skipped: %s", memory, exc)
         return none_shipped(exc)
     unread: list[tuple[Path, OSError]] = []
     for path in walk_memory(memory, lambda where, exc: unread.append((where, exc))):
         try:
             os.close(os.open(path, READ_FLAGS))
         except OSError as exc:
-            get_logger("nodes").warning(
-                "memory file %s cannot be read; skipped: %s", path, exc
-            )
+            log.warning("memory file %s cannot be read; skipped: %s", path, exc)
             unread.append((path, exc))
     warned: list[str] = []
     for where, exc in unread:
