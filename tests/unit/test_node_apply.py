@@ -3250,24 +3250,6 @@ class TestASymlinkedMcpFileIsWrittenThroughItsLink:
         assert link.is_symlink()
         assert not gone.exists()
 
-    def test_a_dangling_claude_json_is_named_by_mcp_oauth_too(
-        self, box, tmp_path, capsys
-    ):
-        # Read as "no file", it would print a misleading "no MCP OAuth entry
-        # for a server this node has".
-        gone = tmp_path / "dotfiles" / ".claude.json"
-        _claude_json(box).symlink_to(gone)
-        box.apply(_work(tmp_path, _two()))
-        (line,) = [line for line in _lines(capsys) if line.item == "mcp_oauth"]
-        assert (line.status, line.detail) == (
-            "warn",
-            (
-                f"~/.claude.json is a dangling link to {gone}; left alone, "
-                "fix or remove it"
-            ),
-        )
-        assert not _credentials(box).exists()
-
     @pytest.mark.skipif(not POSIX, reason="POSIX symlinks and byte names")
     def test_a_dangling_link_to_a_name_not_in_utf_8_is_named_escaped(
         self, box, tmp_path, capsys
@@ -3287,6 +3269,24 @@ class TestASymlinkedMcpFileIsWrittenThroughItsLink:
             "warn",
             (
                 f"~/.claude.json is a dangling link to {shown}; left alone, "
+                "fix or remove it"
+            ),
+        )
+        assert not _credentials(box).exists()
+
+    def test_a_dangling_claude_json_is_named_by_mcp_oauth_too(
+        self, box, tmp_path, capsys
+    ):
+        # Read as "no file", it would print a misleading "no MCP OAuth entry
+        # for a server this node has".
+        gone = tmp_path / "dotfiles" / ".claude.json"
+        _claude_json(box).symlink_to(gone)
+        box.apply(_work(tmp_path, _two()))
+        (line,) = [line for line in _lines(capsys) if line.item == "mcp_oauth"]
+        assert (line.status, line.detail) == (
+            "warn",
+            (
+                f"~/.claude.json is a dangling link to {gone}; left alone, "
                 "fix or remove it"
             ),
         )
