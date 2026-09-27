@@ -210,25 +210,36 @@ class TestInstall:
         assert "Already wired" in again.output
         assert json.loads(settings.read_text(encoding="utf-8"))["hooks"] == before
 
-    def test_reinstall_repairs_backslash_module_form(self, runner, tmp_path):
+    @pytest.mark.parametrize(
+        ("stale", "fixed"),
+        [
+            pytest.param(
+                r'"C:\Program Files\Python314\python.exe" -X utf8 '
+                "-m magent.state_hook --source claude",
+                '"C:/Program Files/Python314/python.exe" -X utf8 '
+                "-m magent.state_hook --source claude",
+                id="quoted",
+            ),
+            pytest.param(
+                r"c:\python314\python.exe -m magent.state_hook --source claude",
+                "c:/python314/python.exe -m magent.state_hook --source claude",
+                id="unquoted-lowercase-drive",
+            ),
+        ],
+    )
+    def test_reinstall_repairs_backslash_module_form(
+        self, runner, tmp_path, stale, fixed
+    ):
         # Recognising the module form must not let a broken one hide behind
         # idempotence -- but the repair fixes only what bash breaks. The module
         # spelling exists to avoid the console script, so it stays a module
         # command: backslashes become forward slashes, every other byte kept.
         settings = tmp_path / "settings.json"
-        stale = (
-            r'"C:\Program Files\Python314\python.exe" -X utf8 '
-            "-m magent.state_hook --source claude"
-        )
         _write_module_form(settings, cmd=stale)
         result = _install(runner, settings)
         assert result.exit_code == 0
         assert "Repaired" in result.output
         assert _repaired_line(result.output).endswith(REPAIR_SUFFIX)
-        fixed = (
-            '"C:/Program Files/Python314/python.exe" -X utf8 '
-            "-m magent.state_hook --source claude"
-        )
         data = json.loads(settings.read_text(encoding="utf-8"))
         for event in EVENTS:
             cmds = [h["command"] for e in data["hooks"][event] for h in e["hooks"]]
@@ -236,6 +247,34 @@ class TestInstall:
         again = _install(runner, settings)
         assert "Already wired" in again.output
         assert json.loads(settings.read_text(encoding="utf-8")) == data
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            pytest.param(
+                r"/Users/me/My\ Venv/bin/python -m magent.state_hook --source claude",
+                id="escaped-space",
+            ),
+            # The interpreter's venv named for the hook: still module form, so
+            # it must not fall through to the console-script rewrite either.
+            pytest.param(
+                r"/opt/magent-state-hook\ env/bin/python "
+                "-m magent.state_hook --source claude",
+                id="hook-named-venv",
+            ),
+        ],
+    )
+    def test_posix_escaped_module_form_is_left_alone(self, runner, tmp_path, cmd):
+        # Off a drive letter a backslash is bash escape syntax, not a Windows
+        # separator: `My\ Venv` runs, and swapping it to `My/ Venv` would turn
+        # a working hook into rc 127. Nothing to repair -- byte for byte.
+        settings = tmp_path / "settings.json"
+        before = _write_module_form(settings, cmd=cmd)
+        result = _install(runner, settings)
+        assert result.exit_code == 0
+        assert "Already wired" in result.output
+        assert "Repaired" not in result.output
+        assert json.loads(settings.read_text(encoding="utf-8"))["hooks"] == before
 
 
 class TestStatus:
