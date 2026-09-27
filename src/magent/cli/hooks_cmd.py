@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -33,6 +34,9 @@ _MARKER = "magent-state-hook"
 # The same writer run as a module (`<python> -m magent.state_hook`), the
 # hand-wired spelling that survives a pip rollback deleting the console script.
 _MODULE_MARKER = "-m magent.state_hook"
+# A Windows drive-letter path (`C:\`): the only backslashes a repair may swap.
+# Anywhere else a backslash is bash escape syntax (`My\ Venv`) and works as is.
+_DRIVE_PATH = re.compile(r"[A-Za-z]:\\")
 
 
 def _is_ours(text: str) -> bool:
@@ -87,7 +91,9 @@ def _repair_entries(entries: list[object], cmd: str) -> bool:
     entry forever). Returns True when something was rewritten.
 
     A module-form command keeps its form: that spelling exists to avoid the
-    console script, so only the backslashes bash would eat are swapped."""
+    console script, so only the backslashes bash would eat are swapped -- and
+    only when it carries a Windows drive-letter path. Any other module-form
+    backslash is escape syntax, left byte for byte."""
     changed = False
     for entry in entries:
         if not isinstance(entry, dict):
@@ -102,8 +108,9 @@ def _repair_entries(entries: list[object], cmd: str) -> bool:
             if not isinstance(c, str) or "\\" not in c:
                 continue
             if _MODULE_MARKER in c:
-                h["command"] = c.replace("\\", "/")
-                changed = True
+                if _DRIVE_PATH.search(c):
+                    h["command"] = c.replace("\\", "/")
+                    changed = True
             elif _MARKER in c:
                 h["command"] = cmd
                 changed = True
