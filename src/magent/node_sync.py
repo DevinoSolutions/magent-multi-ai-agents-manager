@@ -616,6 +616,14 @@ def _last_line(text: str) -> str:
     return _CONTROL.sub("?", lines[-1]) if lines else ""
 
 
+def printable(text: str) -> str:
+    """``text`` as one printable ASCII line for a screen row: ``_last_line``'s
+    rule for control characters, then ASCII end to end, so a lone surrogate
+    or any non-ASCII character is ``?`` too. ESC is ASCII, and a node's words
+    in a row must not write to the terminal they are shown on."""
+    return _CONTROL.sub("?", text).encode("ascii", "replace").decode("ascii")
+
+
 def _classify(e: remote_mux.RemoteError) -> tuple[str, str]:
     """UNREACHABLE only when the node could not be reached (ssh's transport rc
     255) or never answered (``timed_out``). Every other rc-None error -- a

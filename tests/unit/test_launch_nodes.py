@@ -1999,6 +1999,49 @@ class TestTheNodePhaseSaysWhatHappened:
         assert "node project(s)" not in capsys.readouterr().out
 
 
+class TestANodeRowReachesTheScreenPrintable:
+    """A bring-up row carries the node's own words (its last stderr line) and
+    names read off disk. A lone surrogate there is a UnicodeEncodeError in the
+    middle of the bring-up, and a control character is the node writing to
+    this terminal: an OSC sequence retitles the window tiling finds by title.
+    Every row is one line of printable ASCII."""
+
+    @pytest.mark.parametrize(
+        ("text", "shown"),
+        [
+            ("caf\udce9 gone", "caf? gone"),
+            ("café … gone", "caf? ? gone"),
+            ("clone \x1b]0;x\x07failed\r\nfatal", "clone ?]0;x?failed??fatal"),
+        ],
+        ids=["lone-surrogate", "non-ascii", "control"],
+    )
+    def test_an_error_and_a_warning_are_one_printable_line_each(
+        self, capsys, text, shown
+    ):
+        launch._echo_node_outcomes(
+            [
+                launch.NodeBringUpOutcome(False, "api", "second", error=text),
+                launch.NodeBringUpOutcome(True, "web", "second", warnings=(text,)),
+            ]
+        )
+        lines = capsys.readouterr().out.splitlines()
+        assert lines == [
+            f"  x api: {shown}",
+            "  + web @second started",
+            f"    ! {shown}",
+        ]
+        assert all(line.isascii() and line.isprintable() for line in lines)
+
+    def test_the_nodes_stderr_reaches_the_go_screen_printable(
+        self, rig, api, desk, no_sleep, capsys
+    ):
+        rig.error = RemoteError(5, "magent: clone \x1b]0;x\x07failed", ("bring_up",))
+        launch.run_magent(_config(api), launch.RunOpts())
+        out = capsys.readouterr().out
+        assert "  x api: clone ?]0;x?failed\n" in out
+        assert all(line.isprintable() for line in out.splitlines())
+
+
 class TestADryRunReadsTheNodeMapOnce:
     def test_one_read_for_the_whole_run(
         self, rig, tmp_path, desk, no_sleep, monkeypatch
@@ -2540,6 +2583,21 @@ class TestDownPullsTheLastTurnHomeFirst:
         out = capsys.readouterr().out
         assert out.isascii()
         assert "(caf? ? gone)" in out
+
+    def test_the_nodes_control_characters_do_not_reach_the_screen(
+        self, rig, api, monkeypatch, capsys, killed
+    ):
+        # ASCII is not enough: ESC is ASCII, and an OSC sequence in the node's
+        # stderr would retitle this terminal in the middle of the shutdown.
+        _hold("api")
+        self._pulls(
+            monkeypatch,
+            RemoteError(3, "magent: gone\x1b]0;x\x07 now", ("bash", "-s")),
+        )
+        launch.stop_node_sessions(_config(api), ["api"])
+        out = capsys.readouterr().out
+        assert "(gone?]0;x? now)" in out
+        assert all(line.isprintable() for line in out.splitlines())
 
     @pytest.mark.parametrize(
         ("error", "shown"),

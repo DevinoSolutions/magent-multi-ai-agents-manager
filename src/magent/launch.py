@@ -2344,8 +2344,8 @@ def _final_pull(
                 reason = no_pull[nick] = _node_busy_text(
                     nick, node_sync.FINAL_PULL_WAIT_S
                 )
-            # ASCII end to end: the cause may be the node's or the OS's words.
-            reason = reason.encode("ascii", "replace").decode("ascii")
+            # Printable ASCII: the cause may be the node's or the OS's words.
+            reason = node_sync.printable(reason)
         else:
             if result is not None:
                 return True
@@ -2501,6 +2501,9 @@ def _keep_node_sync(config: MagentConfig, config_path: str | None) -> None:
 
 
 def _echo_node_outcomes(outcomes: list[NodeBringUpOutcome]) -> None:
+    # heavy subsystem: in-body per policy
+    from magent.node_sync import printable
+
     for o in outcomes:
         if o.ok:
             verb = "attached" if o.attached_existing else "started"
@@ -2509,6 +2512,9 @@ def _echo_node_outcomes(outcomes: list[NodeBringUpOutcome]) -> None:
                 f"{style('@' + o.node, fg='blue')} {verb}"
             )
         else:
-            click.echo(f"  {style('x', fg='red')} {o.sid}: {o.error}")
+            # The node's last stderr line and names read off disk: one row.
+            click.echo(f"  {style('x', fg='red')} {o.sid}: {printable(o.error or '')}")
         for warning in o.warnings:
-            click.echo(f"    {style('!', fg='yellow')} {style(warning, dim=True)}")
+            click.echo(
+                f"    {style('!', fg='yellow')} {style(printable(warning), dim=True)}"
+            )
