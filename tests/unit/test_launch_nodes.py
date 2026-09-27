@@ -991,8 +991,8 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
 # A pinned project's refusal when its only folder rivals are auto projects
 # an unreadable map hides.
 _FOLDER_UNKNOWN = (
-    "the node map is unreadable ({cls}), so whether 'api' on {nick} is already"
-    " in use is unknown; not brought up"
+    "the node map could not be read ({cls}), so whether 'api' on {nick} is"
+    " already in use is unknown; not brought up"
 )
 
 
@@ -1049,7 +1049,7 @@ class TestAnUnreadableMapPlacesNothingByGuess:
         outcome = launch.bring_up_node_project(_config(web), web)
         assert (outcome.ok, outcome.sid, outcome.node) == (False, "web", "")
         error = outcome.error or ""
-        assert "node map is unreadable" in error
+        assert "node map could not be read" in error
         assert f"({cls})" in error
         # The error CLASS only: never the OS's or the parser's words.
         assert "torn" not in error
@@ -1072,7 +1072,7 @@ class TestAnUnreadableMapPlacesNothingByGuess:
             ("web", True),
         ]
         assert outcomes[0].error == _FOLDER_UNKNOWN.format(cls=cls, nick="second")
-        assert "node map is unreadable" in (outcomes[1].error or "")
+        assert "node map could not be read" in (outcomes[1].error or "")
         assert f"({cls})" in (outcomes[1].error or "")
         assert [(n, r.sid) for n, r in rig.recipes] == [("second", "web")]
 
@@ -1111,7 +1111,7 @@ class TestAnUnreadableMapPlacesNothingByGuess:
         error = outcome.error or ""
         assert "'api-x', 'api-y' and 'api-z' would share" in error
         assert "rename one of them" in error
-        assert "node map is unreadable" not in error
+        assert "node map could not be read" not in error
         assert rig.recipes == []
 
     def test_two_hidden_auto_rivals_still_name_the_map(
@@ -1150,8 +1150,8 @@ class TestAnUnreadableMapPlacesNothingByGuess:
         ]
         assert outcomes[0].error == _FOLDER_UNKNOWN.format(cls=cls, nick="second")
         assert outcomes[1].error == (
-            f"the node map is unreadable ({cls}), so where this auto project runs"
-            " is unknown; not brought up"
+            f"the node map could not be read ({cls}), so where this auto project"
+            " runs is unknown; not brought up"
         )
         # Its node is unknown, and the outcome never guesses one.
         assert outcomes[1].node == ""
@@ -1168,7 +1168,7 @@ class TestAnUnreadableMapPlacesNothingByGuess:
         error = outcomes[0].error or ""
         assert "'api-x' and 'api-y' would share" in error
         assert "rename one of them" in error
-        assert "node map is unreadable" not in error
+        assert "node map could not be read" not in error
 
     def test_a_readable_map_keeps_the_holder_up_beside_its_auto_twin(
         self, rig, tmp_path, monkeypatch
@@ -1190,7 +1190,7 @@ class TestAnUnreadableMapPlacesNothingByGuess:
         )
         (warning,) = holder.warnings
         assert "'api-x' and 'api-y' would share" in warning
-        assert "node map is unreadable" not in warning
+        assert "node map could not be read" not in warning
 
     def test_only_a_known_member_is_given_the_map_reason(self):
         # Two auto projects of unknown node sharing a folder name: neither is
@@ -1244,7 +1244,10 @@ class TestAnUnreadableMapPlacesNothingByGuess:
         # The map is named on screen by its class, once; nodes.log has it all.
         assert outcome.warnings == (
             dirty,
-            f"the node map is unreadable ({cls}); attached to api on its pin @second",
+            (
+                f"the node map could not be read ({cls}); attached to api on its"
+                " pin @second"
+            ),
         )
         assert full() == 1
         assert probes == [("second", "api")]
@@ -1273,7 +1276,7 @@ class TestAnUnreadableMapPlacesNothingByGuess:
         error = outcome.error or ""
         assert "--allow-dirty" in error
         assert error.endswith(
-            f"; the node map is unreadable ({cls}), and api was not found"
+            f"; the node map could not be read ({cls}), and api was not found"
             " running on @second"
         )
         assert "torn" not in error
@@ -1301,7 +1304,7 @@ class TestAnUnreadableMapPlacesNothingByGuess:
         assert launch.bring_up_psmux(_config(pinned, auto)) == (["loc", "a1"], ["w1"])
         out = capsys.readouterr().out
         (line,) = [ln for ln in out.splitlines() if ln.lstrip().startswith("x w1:")]
-        assert "node map is unreadable" in line
+        assert "node map could not be read" in line
 
 
 class TestUpBringsUpNodeProjectsToo:

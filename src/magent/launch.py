@@ -1239,20 +1239,27 @@ def _node_map_for_placement() -> tuple[
 
 
 def _map_unreadable_text(exc: OSError | ValueError) -> str:
-    """An ``auto`` project's one-line refusal under an unreadable map. The
-    error CLASS only: the full error goes to nodes.log."""
+    """An ``auto`` project's one-line refusal under an unreadable map, in the
+    sentence every surface shares (``nodes.map_unread_text``). The error CLASS
+    only: the full error goes to nodes.log."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
     return (
-        f"the node map is unreadable ({type(exc).__name__}), so where this auto"
-        " project runs is unknown; not brought up"
+        f"{nodes.map_unread_text(exc)}, so where this auto project runs is"
+        " unknown; not brought up"
     )
 
 
 def _folder_unknown_text(exc: OSError | ValueError, leaf: str, nick: str) -> str:
     """A pinned project's one-line refusal when its only folder rivals are
     ``auto`` projects an unreadable map hides. The error CLASS only."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
     return (
-        f"the node map is unreadable ({type(exc).__name__}), so whether '{leaf}'"
-        f" on {nick} is already in use is unknown; not brought up"
+        f"{nodes.map_unread_text(exc)}, so whether '{leaf}' on {nick} is already"
+        " in use is unknown; not brought up"
     )
 
 
@@ -1949,9 +1956,8 @@ def bring_up_node_project(
                         *(
                             (
                                 (
-                                    "the node map is unreadable"
-                                    f" ({type(unreadable).__name__}); attached to"
-                                    f" {sid} on its pin @{nick}"
+                                    f"{nodes.map_unread_text(unreadable)};"
+                                    f" attached to {sid} on its pin @{nick}"
                                 ),
                             )
                             if unreadable is not None
@@ -1964,7 +1970,7 @@ def bring_up_node_project(
             error = "; ".join(refusals)
             if unreadable is not None:
                 error += (
-                    f"; the node map is unreadable ({type(unreadable).__name__}),"
+                    f"; {nodes.map_unread_text(unreadable)},"
                     f" and {sid} was not found running on @{nick}"
                 )
             return NodeBringUpOutcome(ok=False, sid=sid, node=nick, error=error)

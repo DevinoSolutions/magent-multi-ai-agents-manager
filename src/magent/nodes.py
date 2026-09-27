@@ -296,9 +296,10 @@ def read_node_map() -> dict[str, NodeMapEntry]:
 
 
 # What every surface says for a map ``load_node_map_strict`` refused.
-# D-MERGE: Dmap's and Gmap's launch._map_unreadable_text say the same fact as
-# "the node map is unreadable (<Class>)"; at integration they build on
-# map_unread_text instead, so `up` and `down` name it in one phrasing.
+# D-MERGE: (G step) Gmap carries its own copy of launch._map_unreadable_text
+# saying "the node map is unreadable (<Class>)"; at the Gmap merge keep
+# launch's one copy, which builds on map_unread_text, and move Gmap's pins to
+# this sentence, so `up` and `down` name it in one phrasing.
 MAP_UNREAD = "the node map could not be read"
 
 
