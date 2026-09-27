@@ -3602,6 +3602,33 @@ class TestWhatANodeSaysReachesTheScreenAsPrintableAscii:
             "@second cannot be reached from this config (node ?[31msecond has no host)"
         ) in result.stdout
 
+    def test_a_repo_line_from_the_node_is_printable(
+        self, runner, placed_api, node_answers, monkeypatch
+    ):
+        def _status(node, root, *, timeout_s):
+            return [nodes.RepoStatus(root, "b" * 40, "ma[31min", False, 0)]
+
+        monkeypatch.setattr(remote_mux, "repo_status", _status)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 0, result.output
+        assert "" not in result.output
+        assert f"{'b' * 12} on ma?[31min  clean" in result.stdout
+
+    def test_the_names_the_nodes_copy_replaced_are_printable(
+        self, runner, placed_api, node_answers, monkeypatch
+    ):
+        monkeypatch.setattr(
+            remote_mux, "copy_mirror", lambda source, dest: ("[2Jé.jsonl",)
+        )
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 0, result.output
+        assert "" not in result.output
+        assert "with the node's copy: ?[2J?.jsonl" in result.stdout
+
 
 def _node_logs(caplog) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.name == "magent.nodes"]

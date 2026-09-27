@@ -1048,7 +1048,8 @@ def _report_repos(source: Node | None, held: NodeMapEntry) -> None:
             f" ({record.source}, {_when(record.ts)}):"
         )
     for status in record.repos:
-        click.echo(f"    {_repo_line(status)}")
+        # The dir, head and branch are the node's reply (or its record).
+        click.echo(f"    {node_sync.printable(_repo_line(status))}")
     if any(s.dirty or s.unpushed for s in record.repos):
         _note(
             f"@{held.nick} holds work that is not pushed; it stays on the node"
@@ -1170,7 +1171,8 @@ def _recall_local(
     """Steps 4-5 for ``--local``: install into THIS machine's Claude dir for
     the local folder, clear the placement, print the resume -- never launch
     it, because the user picks the terminal."""
-    from magent import nodes, remote_mux  # heavy subsystem: in-body per policy
+    # heavy subsystem: in-body per policy
+    from magent import node_sync, nodes, remote_mux
     from magent.sessions import claude  # beside its siblings: one import site
 
     # The store a launch reads for this folder, from the one seam that names it
@@ -1205,9 +1207,10 @@ def _recall_local(
         if replaced:
             # Said aloud, like --to's KEPT lines (cq-G14 M2): a local file the
             # node's copy overwrote is work this PC may have had.
+            # The names come from the node's mirror: printable ASCII only.
             _note(
                 f"replaced {len(replaced)} file(s) already in {dest} with the"
-                f" node's copy: {', '.join(replaced)}"
+                f" node's copy: {node_sync.printable(', '.join(replaced))}"
             )
         _ok(f"installed the conversation into {dest}")
     else:
