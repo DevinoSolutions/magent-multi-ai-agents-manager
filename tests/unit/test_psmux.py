@@ -408,6 +408,20 @@ class TestTheFanOutWaitsOnOneDeadline:
         assert hung.killed
         assert all(waited < self.BUDGET_S * 0.8 for waited in hung.waited), hung.waited
 
+    def test_the_window_is_sized_for_a_loaded_host_and_the_attach_read(self):
+        # Floor: under a spawn storm one display-message routinely runs past
+        # 3 s (FLASH_TIMEOUT_S's measurement), and a spawn storm is exactly
+        # when the bring-up's send-verify reads this fan-out. The window is
+        # paid once per batch, so it can hold several such probes; at 5 s a
+        # slow start read every pane as unknown and the re-send was skipped.
+        assert psmux._FAN_OUT_TIMEOUT_S >= 10
+        # Ceiling: idle_sessions runs two fan-outs back to back (foreground,
+        # then pane pids), and on the attach path it runs inside the ssh
+        # status read of `up --json --revive`.
+        from magent.cli import attach
+
+        assert 2 * psmux._FAN_OUT_TIMEOUT_S < attach._STATUS_TIMEOUT_S
+
 
 class TestIsIdleCommand:
     """The foreground HINT: one of `idle_sessions`' conditions, never a verdict
