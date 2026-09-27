@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from magent import cli, node_scripts, nodes, remote_mux
+from magent import cli, log, node_scripts, nodes, remote_mux
 from magent.cli import hooks_cmd
 from magent.config import MagentConfig
 from magent.nodes import Node, UserScope
@@ -1758,6 +1758,40 @@ class TestAnUnreadableSkillsFolderIsNamedNotFatal:
         assert scope.notes == (
             "skills/a/locked.md: cannot be read (PermissionError); not shipped",
         )
+
+
+def _odd_named_or_skip(path: Path) -> Path:
+    """A skill file at ``path``, whose name holds a lone surrogate -- or a
+    skip where the filesystem refuses such a name (APFS takes UTF-8 only)."""
+    try:
+        _skill(path.parent.parent, f"{path.parent.name}/{path.name}")
+    except (OSError, UnicodeError):
+        pytest.skip("this filesystem refuses a name that is not Unicode")
+    return path
+
+
+# A walked name is the disk's, not ours: on Linux a byte that is not UTF-8
+# decodes to a lone surrogate, and NTFS stores unpaired UTF-16 halves as they
+# are. Strict UTF-8 cannot write one -- the record it rides in must still
+# reach nodes.log, through the REAL handler, with nothing on stderr.
+class TestAWalkedNameThatIsNotUnicodeStillReachesTheLog:
+    def test_an_unreadable_file_so_named_is_logged_escaped(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        assert Path.home() == tmp_path.parent / f"{tmp_path.name}-home"
+        assert log.LOG_DIR.is_relative_to(tmp_path)
+        log.get_logger("nodes")  # the real file handler, under the tmp LOG_DIR
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "a/SKILL.md")
+        odd = _odd_named_or_skip(skills / "b" / "caf\udce9.md")
+        _deny_opening(monkeypatch, odd)
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["a/SKILL.md"]
+        path = log.LOG_DIR / "nodes.log"
+        logged = path.read_text(encoding="utf-8") if path.exists() else ""
+        assert "skills/b/caf\\udce9.md: " in logged
+        assert "WARNING" in logged
+        assert "Logging error" not in capsys.readouterr().err
 
 
 ENV_NOTE = "skills/{}: an env file, shipped -- make sure it holds no secret"

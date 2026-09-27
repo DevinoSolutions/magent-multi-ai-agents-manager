@@ -2199,6 +2199,35 @@ class TestMemoryNeverFollowsALink:
         )
         assert _members(stdin)["memory/MEMORY.md"] == b"- dotfiles\n"
 
+    def test_a_skipped_file_whose_name_is_not_unicode_is_still_logged(
+        self, node_home, tmp_path, monkeypatch, capsys
+    ):
+        # The name is the disk's: a byte that is not UTF-8 decodes to a lone
+        # surrogate on Linux, NTFS keeps unpaired UTF-16 halves as they are.
+        # Strict UTF-8 cannot write one; the skip must still reach nodes.log.
+        assert Path.home() == tmp_path.parent / f"{tmp_path.name}-home"
+        assert log.LOG_DIR.is_relative_to(tmp_path)
+        recipe = _recipe(tmp_path)
+        assert recipe.memory_dir is not None
+        try:
+            (recipe.memory_dir / "caf\udce9.md").write_bytes(b"x" * 100)
+        except (OSError, UnicodeError):
+            pytest.skip("this filesystem refuses a name that is not Unicode")
+        monkeypatch.setattr(remote_mux, "PUSH_FILE_MAX_BYTES", 16)
+        # A handler that cannot encode the record reports it on stderr, with
+        # the chained error -- raw name and all -- and a strict stderr raises
+        # THAT out of logger.warning: memory would have failed the bring-up.
+        try:
+            stdin: bytes | UnicodeError = self._bring_up(node_home, recipe)
+        except UnicodeError as e:
+            stdin = e
+        assert isinstance(stdin, bytes), f"the bring-up raised {type(stdin).__name__}"
+        assert [n for n in _members(stdin) if n.startswith("memory/")] == [
+            "memory/MEMORY.md"
+        ]
+        assert "caf\\udce9.md skipped: " in _nodes_log()
+        assert "Logging error" not in capsys.readouterr().err
+
 
 class TestPushingFilesToARunningProject:
     def test_push_mode_ships_the_files_and_no_memory(self, node_home, tmp_path):

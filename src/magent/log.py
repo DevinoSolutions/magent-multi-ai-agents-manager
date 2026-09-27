@@ -165,6 +165,13 @@ class _SharedRotatingFileHandler(logging.handlers.RotatingFileHandler):
             maxBytes=max_bytes,
             backupCount=backup_count,
             encoding=encoding,
+            # Load-bearing: a record can carry a name read off the disk, and
+            # one holding a lone surrogate (a non-UTF-8 byte on POSIX, an
+            # unpaired UTF-16 half on NTFS) cannot be encoded strictly -- the
+            # stdlib then prints "--- Logging error ---" and DROPS the record.
+            # Escaped, it lands; whatever a call site passes, no record is lost
+            # to its encoding.
+            errors="backslashreplace",
             # Load-bearing: the stream must be opened per record inside the
             # lock, never left open across records, or the rename this class
             # exists to protect is blocked again.
