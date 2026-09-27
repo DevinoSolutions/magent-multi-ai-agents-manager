@@ -39,7 +39,7 @@ from magent.nodes import (
 )
 from magent.sessions import IDE_TOOLS, is_ide_tool
 from tests.conftest import REAL_MAGENT_DIR
-from tests.unit._deny_stat import deny_scandir, deny_stat
+from tests.unit._deny_stat import deny_open, deny_scandir, deny_stat
 
 NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
 
@@ -1877,6 +1877,60 @@ class TestRecipeFor:
             "memory: notes/denied.md cannot be read (PermissionError); skipped",
         )
         assert str(memory / "notes" / "denied.md") in caplog.text
+        assert "Permission denied" in caplog.text
+
+    def _memory_with_locked(self, repo: Path) -> tuple[Path, Path]:
+        memory = _memory_of(repo)
+        memory.mkdir(parents=True)
+        (memory / "MEMORY.md").write_text("- m\n", encoding="utf-8")
+        locked = memory / "locked.md"
+        locked.write_text("- l\n", encoding="utf-8")
+        return memory, locked
+
+    def _recipe(self, repo: Path, state: LocalGitState) -> Recipe:
+        return nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second"),
+            NODE,
+            [state],
+            home=Path.home(),
+            project_dir=repo,
+        )
+
+    def test_a_memory_file_that_stats_but_cannot_be_opened_is_named(
+        self, repo, monkeypatch, caplog
+    ):
+        # Stat-able is not readable: a Windows deny-read ACL leaves the stat
+        # working, so the walk yields the file and only the payload's read
+        # would find out -- in nodes.log, never on screen.
+        memory, locked = self._memory_with_locked(repo)
+        state = _real_state(repo)
+        deny_open(monkeypatch, locked)
+        with caplog.at_level("WARNING", logger="magent.nodes"):
+            recipe = self._recipe(repo, state)
+        assert recipe.memory_dir == memory
+        assert recipe.warnings == (
+            "memory: locked.md cannot be read (PermissionError); skipped",
+        )
+        assert str(locked) in caplog.text
+        assert "Permission denied" in caplog.text
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+    def test_a_real_mode_000_memory_file_is_named(self, repo, caplog):
+        if os.geteuid() == 0:
+            pytest.skip("root opens a mode-000 file: no EACCES to provoke")
+        memory, locked = self._memory_with_locked(repo)
+        state = _real_state(repo)
+        locked.chmod(0)
+        try:
+            with caplog.at_level("WARNING", logger="magent.nodes"):
+                recipe = self._recipe(repo, state)
+        finally:
+            locked.chmod(0o600)
+        assert recipe.memory_dir == memory
+        assert recipe.warnings == (
+            "memory: locked.md cannot be read (PermissionError); skipped",
+        )
+        assert str(locked) in caplog.text
         assert "Permission denied" in caplog.text
 
     def test_no_memory_dir_is_none(self, repo):

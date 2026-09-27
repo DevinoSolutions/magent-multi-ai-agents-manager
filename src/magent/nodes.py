@@ -1254,6 +1254,20 @@ def refusal_for(state: LocalGitState, *, allow_dirty: bool = False) -> str | Non
     return None
 
 
+# How a vetted file is opened -- by the payload (``remote_mux._read_regular``)
+# and by ``_memory_state``'s look at each memory file, so what the recipe
+# finds it cannot open is what the payload cannot read: never through a
+# final-component link, never blocking on a FIFO. Read off the module, so
+# Windows (which has neither flag, and wants O_BINARY) needs no
+# `sys.platform` branch.
+READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_BINARY", 0)
+)
+
+
 def memory_is_link(memory: Path) -> bool:
     """Is the memory folder ``memory`` itself a link? Decided by ``realpath``:
     resolving it must change nothing but its parent's own resolution -- so a
@@ -1334,7 +1348,10 @@ def _memory_state(memory: Path) -> tuple[bool, tuple[str, ...]]:
     class only, with the path and the full error in nodes.log. The walk IS
     the payload's (``walk_memory``), so nothing the payload never walks --
     behind a link, or ``memory`` being one -- is ever named; run here, its
-    warnings reach the screen with the recipe's."""
+    warnings reach the screen with the recipe's. Each file it yields is
+    also opened the payload's way (``READ_FLAGS``) and closed at once:
+    stat-able is not readable -- a Windows deny-read ACL leaves the stat
+    working -- and the payload's own read failure is logged, not shown."""
 
     def none_shipped(exc: OSError) -> tuple[bool, tuple[str, ...]]:
         return False, (
@@ -1350,8 +1367,14 @@ def _memory_state(memory: Path) -> tuple[bool, tuple[str, ...]]:
         )
         return none_shipped(exc)
     unread: list[tuple[Path, OSError]] = []
-    for _ in walk_memory(memory, lambda where, exc: unread.append((where, exc))):
-        pass
+    for path in walk_memory(memory, lambda where, exc: unread.append((where, exc))):
+        try:
+            os.close(os.open(path, READ_FLAGS))
+        except OSError as exc:
+            get_logger("nodes").warning(
+                "memory file %s cannot be read; skipped: %s", path, exc
+            )
+            unread.append((path, exc))
     warned: list[str] = []
     for where, exc in unread:
         if where == memory:

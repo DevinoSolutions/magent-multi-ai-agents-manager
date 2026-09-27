@@ -102,3 +102,21 @@ def deny_scandir(monkeypatch: pytest.MonkeyPatch, *denied: Path) -> None:
         return real_scandir(path)
 
     monkeypatch.setattr(os, "scandir", scandir)
+
+
+def deny_open(monkeypatch: pytest.MonkeyPatch, *denied: Path) -> None:
+    """``os.open`` of each of ``denied`` raises EACCES: a file that stats but
+    cannot be opened -- a Windows deny-read ACL, a POSIX mode-000 file. Every
+    Python 3.10-3.14 looks ``os.open`` up in the os module at call time, so
+    this reaches it; the OS reports that refusal by errno alone (no winerror,
+    Windows included), so neither does this."""
+    names = {str(path) for path in denied}
+    real_open = os.open
+
+    def refusing(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if isinstance(path, (str, os.PathLike)) and os.fspath(path) in names:
+            code = errno.EACCES
+            raise OSError(code, os.strerror(code), os.fspath(path))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", refusing)

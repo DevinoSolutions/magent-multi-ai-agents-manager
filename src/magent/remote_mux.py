@@ -52,6 +52,7 @@ from magent.attach_client import find_ssh as _find_ssh_client
 from magent.env import git_child_env
 from magent.log import get_logger
 from magent.nodes import (
+    READ_FLAGS,
     LoadSample,
     LocalGitState,
     NodeConfigError,
@@ -1661,16 +1662,6 @@ def _push_name(path: Path, local_root: Path) -> tuple[str, Path]:
 PUSH_FILE_MAX_BYTES = 16 * 1024 * 1024
 PAYLOAD_MAX_BYTES = 64 * 1024 * 1024
 
-# How a vetted file is opened: never through a final-component link, never
-# blocking on a FIFO. Read off the module, so Windows (which has neither
-# flag, and wants O_BINARY) needs no `sys.platform` branch.
-_READ_FLAGS = (
-    os.O_RDONLY
-    | getattr(os, "O_NOFOLLOW", 0)
-    | getattr(os, "O_NONBLOCK", 0)
-    | getattr(os, "O_BINARY", 0)
-)
-
 
 def _read_regular(path: Path, *, cap: int, what: str) -> bytes:
     """The bytes of ``path``, which must be a REGULAR file of at most ``cap``
@@ -1688,7 +1679,7 @@ def _read_regular(path: Path, *, cap: int, what: str) -> bytes:
         raise ValueError(f"{what} is not a regular file")
     if before.st_size > cap:
         raise ValueError(f"{what} is {before.st_size} bytes; the cap is {cap}")
-    fd = os.open(path, _READ_FLAGS)
+    fd = os.open(path, READ_FLAGS)
     with os.fdopen(fd, "rb") as handle:
         opened = os.fstat(handle.fileno())
         if not stat.S_ISREG(opened.st_mode):
