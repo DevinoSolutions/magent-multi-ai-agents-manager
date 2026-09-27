@@ -1243,11 +1243,17 @@ def _skill(root: Path, rel: str, data: bytes = b"# skill\n") -> None:
 
 def _scope_or_fail_on_fifo(home: Path, fifo: Path) -> UserScope:
     """``user_scope(home)`` on a worker thread: a walk that blocks opening
-    ``fifo`` fails the test (after unblocking it) instead of hanging it."""
-    result: list[UserScope] = []
-    worker = threading.Thread(
-        target=lambda: result.append(nodes.user_scope(home)), daemon=True
-    )
+    ``fifo`` fails the test (after unblocking it) instead of hanging it, and
+    one that raises fails it by assertion, like ``_walked``."""
+    result: list[UserScope | Exception] = []
+
+    def walk() -> None:
+        try:
+            result.append(nodes.user_scope(home))
+        except Exception as e:  # noqa: BLE001 # reason: handed back to the test verbatim
+            result.append(e)
+
+    worker = threading.Thread(target=walk, daemon=True)
     worker.start()
     worker.join(timeout=10)
     if worker.is_alive():
@@ -1256,15 +1262,17 @@ def _scope_or_fail_on_fifo(home: Path, fifo: Path) -> UserScope:
         worker.join(timeout=5)
         pytest.fail("the walk blocked opening a FIFO")
     (scope,) = result
+    assert isinstance(scope, UserScope), f"the walk stopped: {type(scope).__name__}"
     return scope
 
 
 def _walked(home: Path) -> UserScope:
-    """``user_scope(home)``, where an OSError out of the walk fails the test
-    by assertion: an entry it cannot read is a note, never the walk's end."""
+    """``user_scope(home)``, where anything raised out of the walk fails the
+    test by assertion: an entry it cannot read, or will not ship, is a note,
+    never the walk's end."""
     try:
-        scope: UserScope | OSError = nodes.user_scope(home)
-    except OSError as e:
+        scope: UserScope | Exception = nodes.user_scope(home)
+    except Exception as e:  # noqa: BLE001 # reason: any escape is the walk's end
         scope = e
     assert isinstance(scope, UserScope), f"the walk stopped: {type(scope).__name__}"
     return scope
@@ -1329,25 +1337,33 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
         home, skills = _skills_home(tmp_path)
         _skill(skills, "s/ok", b"1234")
         _skill(skills, "s/big", b"12345")
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         assert [f.path for f in scope.skills] == ["s/ok"]
         assert scope.notes == ("skills/s/big: larger than 4 bytes, not shipped",)
+
+    # A file the walk will not ship is a note: the walk goes on past it (the
+    # sorted walk meets s/big first), and anything raised fails by assertion.
+    def test_an_oversize_file_is_a_note_not_the_walks_end(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILL_FILE_MAX_BYTES", 4)
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/big", b"12345")
+        _skill(skills, "s/ok", b"1234")
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["s/ok"]
 
     def test_the_file_cap_defaults_to_8_mib_and_reads_so(self, tmp_path, monkeypatch):
         assert nodes.SKILL_FILE_MAX_BYTES == 8 * 1024 * 1024
         monkeypatch.setattr(nodes, "SKILL_FILE_MAX_BYTES", 2 * 1024 * 1024)
         home, skills = _skills_home(tmp_path)
         _skill(skills, "s/big", b"x" * (2 * 1024 * 1024 + 1))
-        assert nodes.user_scope(home).notes == (
-            "skills/s/big: larger than 2 MiB, not shipped",
-        )
+        assert _walked(home).notes == ("skills/s/big: larger than 2 MiB, not shipped",)
 
     def test_a_read_is_sized_by_the_file_not_the_cap(self, tmp_path, monkeypatch):
         # A cap-sized read would try to allocate 1 TiB here and fail.
         monkeypatch.setattr(nodes, "SKILL_FILE_MAX_BYTES", 1 << 40)
         home, skills = _skills_home(tmp_path)
         _skill(skills, "s/SKILL.md", b"# small\n")
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         assert scope.skills == (
             nodes.SkillFile(path="s/SKILL.md", data=b"# small\n", executable=False),
         )
@@ -1359,7 +1375,7 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
         _skill(skills, "s/run", b"no shebang\n")
         (skills / "s" / "run").chmod(0o755)
         _skill(skills, "s/SKILL.md", b"# plain\n")
-        assert [(f.path, f.executable) for f in nodes.user_scope(home).skills] == [
+        assert [(f.path, f.executable) for f in _walked(home).skills] == [
             ("s/SKILL.md", False),
             ("s/run", True),
         ]
@@ -1394,7 +1410,7 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
         home, skills = _skills_home(tmp_path)
         _skill(skills, "s/grow", grown)
         self._stats_say_one_byte(monkeypatch, grown)
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         assert scope.skills == (
             nodes.SkillFile(path="s/grow", data=grown, executable=False),
         )
@@ -1407,7 +1423,7 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
         home, skills = _skills_home(tmp_path)
         _skill(skills, "s/grow", grown)
         self._stats_say_one_byte(monkeypatch, grown)
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         assert scope.skills == ()
         assert scope.notes == ("skills/s/grow: larger than 4 bytes, not shipped",)
 
@@ -1471,7 +1487,7 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
 
             monkeypatch.setattr(Path, "stat", path_stat)
         counts = self._count_reads(monkeypatch)
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         assert scope.notes == ("skills/s/grow: larger than 4 bytes, not shipped",)
         assert sum(counts) == expected
         assert sum(counts) <= nodes.SKILL_FILE_MAX_BYTES + nodes._READ_CHUNK + 1
@@ -1483,7 +1499,7 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
         _skill(skills, "s/b", b"123")
         _skill(skills, "s/c", b"12")  # a later, smaller file still fits
         _skill(skills, "s/d", b"123")
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         assert [f.path for f in scope.skills] == ["s/a", "s/c"]
         assert scope.notes == ("skills: 2 files past the 5 bytes total, not shipped",)
 
@@ -1492,7 +1508,7 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
         home, skills = _skills_home(tmp_path)
         _skill(skills, "s/a", b"123")
         _skill(skills, "s/b", b"1")
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         assert [f.path for f in scope.skills] == ["s/a"]
         assert scope.notes == ("skills: 1 file past the 3 bytes total, not shipped",)
 
@@ -1503,7 +1519,7 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
         _skill(skills, "s/b", b"1234")
         _skill(skills, "s/c", b"12")
         counts = self._count_reads(monkeypatch)
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         assert [f.path for f in scope.skills] == ["s/a", "s/c"]
         assert counts == [3, 2]  # s/b was judged by its stat, never opened
 
@@ -1513,7 +1529,7 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
         home, skills = _skills_home(tmp_path)
         _skill(skills, "s/grow", grown)
         self._stats_say_one_byte(monkeypatch, grown)
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         assert scope.skills == ()
         assert scope.notes == ("skills: 1 file past the 100 bytes total, not shipped",)
 
@@ -1522,7 +1538,7 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
         home, skills = _skills_home(tmp_path)
         for name in ("a", "b", "c", "d", "e"):
             _skill(skills, f"s/{name}")
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         # Entries counted: s, s/a, s/b -- the fourth stops the walk.
         assert [f.path for f in scope.skills] == ["s/a", "s/b"]
         assert scope.notes == (
@@ -1540,7 +1556,7 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
             _skill(big, f"f{i:02}")
         _link_dir(skills / "big", big)
         _skill(skills, "zzz/SKILL.md")  # after the link: never reached
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         # A folder's entries count as it is listed: big, zzz, then big/f00
         # and big/f01 -- big/f02 is the fifth.
         assert [f.path for f in scope.skills] == ["big/f00", "big/f01"]
@@ -1556,7 +1572,7 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
         home, skills = _skills_home(tmp_path)
         for rel in ("s/x/f", "s/a", "s/b", "s/c"):
             _skill(skills, rel)
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         # s, then s/x, then s/a -- s/b is the fourth.
         assert [f.path for f in scope.skills] == ["s/a"]
 
@@ -1565,7 +1581,7 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
         home, skills = _skills_home(tmp_path)
         _skill(skills, "a/SKILL.md")
         _link_dir(skills / "z", home / ".ssh")  # would be a note of its own
-        scope = nodes.user_scope(home)
+        scope = _walked(home)
         assert scope.skills == ()
         assert scope.notes == (
             (
