@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -30,6 +31,18 @@ _EVENTS: tuple[str, ...] = (
 # Substring that identifies our entries inside settings.json -- the console
 # script's name, present in any command string that invokes it.
 _MARKER = "magent-state-hook"
+# The same writer run as a module (`<python> -m magent.state_hook`), the
+# hand-wired spelling that survives a pip rollback deleting the console script.
+_MODULE_MARKER = "-m magent.state_hook"
+# A Windows drive-letter path (`C:\`): the only module-form backslashes a repair
+# swaps. Any other backslash is taken as bash escape syntax (`My\ Venv`), so a
+# UNC (`\\host\share`) or mixed-separator (`C:/py\python.exe`) interpreter path
+# is knowingly left alone -- it reads as wired though bash cannot run it.
+_DRIVE_PATH = re.compile(r"[A-Za-z]:\\")
+
+
+def _is_ours(text: str) -> bool:
+    return _MARKER in text or _MODULE_MARKER in text
 
 
 def _default_settings_file() -> Path:
@@ -70,13 +83,20 @@ def _load_settings(path: Path) -> dict[str, object]:
 
 
 def _event_wired(entries: object) -> bool:
-    return isinstance(entries, list) and any(_MARKER in json.dumps(e) for e in entries)
+    return isinstance(entries, list) and any(_is_ours(json.dumps(e)) for e in entries)
 
 
 def _repair_entries(entries: list[object], cmd: str) -> bool:
     """Rewrite any wired magent-state-hook command that bash cannot run -- a
-    backslash path from a pre-3.1.2 install (idempotence would otherwise skip
-    the broken entry forever). Returns True when something was rewritten."""
+    backslash path from a pre-3.1.2 install, or a module-form one with a
+    drive-letter backslash interpreter path (idempotence would otherwise skip
+    the broken entry forever). Returns True when something was rewritten.
+
+    A module-form command keeps its form: that spelling exists to avoid the
+    console script, so only the backslashes bash would eat are swapped -- and
+    only when it carries a Windows drive-letter path. Any other module-form
+    backslash is taken as escape syntax and left byte for byte, which knowingly
+    misses a UNC or mixed-separator interpreter path (see _DRIVE_PATH)."""
     changed = False
     for entry in entries:
         if not isinstance(entry, dict):
@@ -88,7 +108,13 @@ def _repair_entries(entries: list[object], cmd: str) -> bool:
             if not isinstance(h, dict):
                 continue
             c = h.get("command")
-            if isinstance(c, str) and _MARKER in c and "\\" in c:
+            if not isinstance(c, str) or "\\" not in c:
+                continue
+            if _MODULE_MARKER in c:
+                if _DRIVE_PATH.search(c):
+                    h["command"] = c.replace("\\", "/")
+                    changed = True
+            elif _MARKER in c:
                 h["command"] = cmd
                 changed = True
     return changed
@@ -154,7 +180,7 @@ def hooks_install_cmd(settings_file: Path | None) -> None:
     if repaired:
         click.echo(
             f"  {style('+', fg='green', bold=True)} Repaired stale hook command for "
-            f"{', '.join(repaired)} {style('(pre-3.1.2 backslash path)', dim=True)}"
+            f"{', '.join(repaired)} {style('(Windows backslash path)', dim=True)}"
         )
     if added or repaired:
         click.echo(
