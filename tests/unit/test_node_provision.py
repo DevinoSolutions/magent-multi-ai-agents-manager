@@ -1736,14 +1736,27 @@ class TestThisPcsGh:
         [
             "HTTP 401: Requires authentication (https://api.github.com/)",
             "authentication failed: Bad Credentials",
+            # One marker each, past the cap: either one read from the capped
+            # copy must fail its own case.
             (
                 'Get "https://api.github.com/graphql": '
                 + "retrying; " * 20
-                + "HTTP 401: Bad credentials"
+                + "HTTP 401: Requires authentication"
+            ),
+            (
+                'Get "https://api.github.com/graphql": '
+                + "retrying; " * 20
+                + "authentication failed: Bad credentials"
             ),
             "Bearer HTTP 401: Requires authentication",
         ],
-        ids=["401-alone", "bad-credentials-alone", "past-the-cap", "bearer-prefixed"],
+        ids=[
+            "401-alone",
+            "bad-credentials-alone",
+            "past-the-cap-http401",
+            "past-the-cap-bad-credentials",
+            "bearer-prefixed",
+        ],
     )
     def test_each_refusal_marker_alone_is_rejected(self, fake_gh, error):
         fake_gh.set_reply(
