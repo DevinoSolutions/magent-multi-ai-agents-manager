@@ -644,12 +644,43 @@ def _local_dir(cfg: MagentConfig, proj: ProjectConfig) -> Path | None:
     return Path(resolved) if resolved else None
 
 
-# D-MERGE: `_print_push_set` (plan G :3192-3210) and its call at the end of
-# plan_cmd's loop (:3257) need D's launch.node_git_states; they land with D's
-# merge, and test_plan_lists_the_push_set_relative_to_the_project switches on
-# with it. Until then the help does not promise the list: the docstring's
-# first line gets back plan G's "...would run and what it would ship."
-# (:3218) with it.
+def _print_push_set(cfg: MagentConfig, proj: ProjectConfig) -> None:
+    """The non-git files a bring-up of ``proj`` would ship beside the clone,
+    relative to the project: ``nodes.push_set`` over D's local git read, the
+    project's ``push`` entries included -- what the recipe builder ships. A
+    tree that cannot be read is unknown, never "nothing beyond git": its
+    class on screen, the whole error in nodes.log."""
+    # heavy subsystem: in-body per policy
+    from magent import launch, nodes, remote_mux
+
+    project_dir = _local_dir(cfg, proj)
+    if project_dir is None:
+        click.echo(
+            f"    ships  {style('(the project folder is missing here)', dim=True)}"
+        )
+        return
+    try:
+        states = launch.node_git_states(cfg, proj)
+        files = nodes.push_set(
+            project_dir, states, home=Path.home(), extras=tuple(proj.push or ())
+        )
+    except (OSError, ValueError, remote_mux.RemoteError) as exc:
+        log.get_logger("nodes").warning(
+            "plan could not list %s's push set: %s", nodes.project_name(proj), exc
+        )
+        unknown = f"(unknown: {type(exc).__name__}; see nodes.log)"
+        click.echo(f"    ships  {style(unknown, dim=True)}")
+        return
+    if not files:
+        click.echo(f"    ships  {style('nothing beyond git', dim=True)}")
+        return
+    for index, path in enumerate(files):
+        shown = (
+            path.relative_to(project_dir).as_posix()
+            if path.is_relative_to(project_dir)
+            else str(path)
+        )
+        click.echo(f"    {'ships' if index == 0 else '     '}  {shown}")
 
 
 @node_group.command("plan")
@@ -657,7 +688,7 @@ def _local_dir(cfg: MagentConfig, proj: ProjectConfig) -> Path | None:
 @click.option("--all", "all_projects", is_flag=True, help="Every enabled node project.")
 @click.pass_context
 def plan_cmd(ctx: click.Context, project: str | None, all_projects: bool) -> None:
-    """Show where a node project would run. Writes nothing.
+    """Show where a node project would run and what it would ship. Writes nothing.
 
     The same placement a launch makes -- the node-map, the load history and,
     for a node with too few recent samples, one live reading -- but nothing
@@ -702,7 +733,7 @@ def plan_cmd(ctx: click.Context, project: str | None, all_projects: bool) -> Non
         click.echo(_plan_heading(name, proj, placement))
         if placement is not None and placement.scores:
             _print_scores(placement)
-        # D-MERGE: _print_push_set(cfg, proj) goes here (plan G :3257).
+        _print_push_set(cfg, proj)
 
 
 # D-MERGE: `magent node push` (plan G Task 13: push_cmd and _current_nick at

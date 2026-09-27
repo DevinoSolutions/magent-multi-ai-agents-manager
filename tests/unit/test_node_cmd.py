@@ -327,10 +327,7 @@ def _node_user(monkeypatch):
 
 @pytest.fixture
 def no_states(monkeypatch):
-    # D-MERGE: drop raising=False once D's launch.node_git_states is merged.
-    monkeypatch.setattr(
-        "magent.launch.node_git_states", lambda config, proj: [], raising=False
-    )
+    monkeypatch.setattr("magent.launch.node_git_states", lambda config, proj: [])
 
 
 def _project(path: Path, node: str, title: str = "api") -> dict[str, object]:
@@ -549,15 +546,13 @@ class TestNodePlan:
         assert result.exit_code == 0
         assert 'no enabled project has "node" set' in result.stdout
 
-    # D-MERGE: plan G :3000-3012 -- the push set needs D's node_git_states.
-    @needs_d("node_git_states", plan=":3192-3210, :3257")
     def test_plan_lists_the_push_set_relative_to_the_project(
         self, runner, tmp_config, api_dir, no_states, monkeypatch
     ):
         monkeypatch.setattr(
             nodes,
             "push_set",
-            lambda project_dir, states, *, home: (
+            lambda project_dir, states, *, home, extras=(): (
                 api_dir / ".env",
                 api_dir / ".claude" / "settings.local.json",
             ),
@@ -568,6 +563,43 @@ class TestNodePlan:
 
         assert "ships  .env" in result.stdout
         assert ".claude/settings.local.json" in result.stdout
+
+    def test_a_push_entry_is_listed_as_a_bring_up_would_ship_it(
+        self, runner, tmp_config, api_dir, no_states
+    ):
+        # The recipe builder ships a project's `push` entries too; a list
+        # without them would promise less than the bring-up delivers.
+        (api_dir / "notes.txt").write_text("n\n", encoding="utf-8")
+        project = {**_project(api_dir, "second"), "push": ["notes.txt"]}
+        cfg = tmp_config(config_json(("second",), [project]))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "plan", "api"])
+
+        assert result.exit_code == 0
+        assert "ships  notes.txt" in result.stdout
+
+    def test_a_tree_the_plan_cannot_read_is_unknown_by_its_class(
+        self, runner, tmp_config, api_dir, monkeypatch, caplog
+    ):
+        def _unreadable(config, proj):
+            raise PermissionError(13, "Access is denied", str(api_dir))
+
+        monkeypatch.setattr("magent.launch.node_git_states", _unreadable)
+        log.get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        cfg = tmp_config(config_json(("second",), [_project(api_dir, "second")]))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "plan", "api"])
+
+        assert result.exit_code == 0
+        assert "(unknown: PermissionError; see nodes.log)" in result.stdout
+        assert "nothing beyond git" not in result.stdout
+        assert "Access is denied" not in result.stdout
+        assert any(
+            "Access is denied" in r.getMessage()
+            for r in caplog.records
+            if r.name == "magent.nodes"
+        )
 
     def test_plan_for_a_project_without_a_node_exits_2(
         self, runner, tmp_config, api_dir

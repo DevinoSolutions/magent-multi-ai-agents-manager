@@ -158,11 +158,11 @@ HELP_SNAPSHOTS = {
     ): "Usage: main config path [OPTIONS]\n\n  Print the config file path.\n\nOptions:\n  --help  Show this message and exit.\n",
     (
         "node",
-    ): "Usage: main node [OPTIONS] COMMAND [ARGS]...\n\n  Run projects on a pool of Linux machines over ssh.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  plan    Show where a node project would run.\n  recall  Bring a node session home and print the command that resumes it.\n  sync    Mirror every node's sessions, load and agent state onto this PC.\n",
+    ): "Usage: main node [OPTIONS] COMMAND [ARGS]...\n\n  Run projects on a pool of Linux machines over ssh.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  plan    Show where a node project would run and what it would ship.\n  recall  Bring a node session home and print the command that resumes it.\n  sync    Mirror every node's sessions, load and agent state onto this PC.\n",
     (
         "node",
         "plan",
-    ): "Usage: main node plan [OPTIONS] [PROJECT]\n\n  Show where a node project would run. Writes nothing.\n\n  The same placement a launch makes -- the node-map, the load history and, for a\n  node with too few recent samples, one live reading -- but nothing is recorded\n  and nothing is started.\n\nOptions:\n  --all   Every enabled node project.\n  --help  Show this message and exit.\n",
+    ): "Usage: main node plan [OPTIONS] [PROJECT]\n\n  Show where a node project would run and what it would ship. Writes nothing.\n\n  The same placement a launch makes -- the node-map, the load history and, for a\n  node with too few recent samples, one live reading -- but nothing is recorded\n  and nothing is started.\n\nOptions:\n  --all   Every enabled node project.\n  --help  Show this message and exit.\n",
     (
         "node",
         "recall",
