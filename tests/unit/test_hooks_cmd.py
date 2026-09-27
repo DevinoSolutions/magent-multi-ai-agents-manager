@@ -45,9 +45,7 @@ def _write_module_form(settings_file, cmd=MODULE_CMD):
     return hooks
 
 
-# What every repair is: true of a pre-3.1.2 console-script path and of a
-# drive-letter module-form interpreter path alike, unlike a version-specific
-# origin -- and unlike "bash cannot run", which a double-quoted one can.
+# What every repair fixes, console-script and module form alike.
 REPAIR_SUFFIX = "(Windows backslash path)"
 
 
