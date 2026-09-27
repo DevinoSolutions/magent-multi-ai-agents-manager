@@ -1122,12 +1122,18 @@ class PullUnfinished(remote_mux.RemoteError):
     could not store (True), or files the reply had no room for (False) -- so a
     caller can say the reason once and name only the remedy that applies
     (cq-G14 m-R3-2): another run alone brings home what did not fit, but not a
-    file this PC keeps failing to store."""
+    file this PC keeps failing to store.
 
-    def __init__(self, why: str, *, not_stored: bool) -> None:
+    ``stuck`` says the last cut reply did not move the mark forward (or moved
+    it back): asked again from that mark, the node answers the same, so
+    another run alone brings home nothing more either -- only a reply the
+    deadline cut short (``stuck`` False) is helped by one."""
+
+    def __init__(self, why: str, *, not_stored: bool, stuck: bool = False) -> None:
         super().__init__(0, f"the pull did not finish: {why}", ("pull.sh",))
         self.why = why
         self.not_stored = not_stored
+        self.stuck = stuck
 
 
 def _pull_sid(
@@ -1252,6 +1258,7 @@ def final_pull(
             f"{owed} file(s) did not fit in the reply and are still on the node"
             f" (the reply reached the pull cap {why})",
             not_stored=False,
+            stuck=stuck,
         )
     if spec.project_dir is None:
         get_logger(LOG_NAME).warning(

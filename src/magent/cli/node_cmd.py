@@ -932,14 +932,18 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
         if exc.not_stored:
             stored_log = log.LOG_DIR / f"{node_sync.LOG_NAME}.log"
             remedy = (
-                f"A file this PC could not store is named in {stored_log}:"
+                f"\n    A file this PC could not store is named in {stored_log}:"
                 " close what holds it open, or free disk space, first."
             )
+        elif exc.stuck:
+            # Asked again from this mark the node answers the same: no run
+            # alone gets further, so no remedy is promised (cq-G14-r3).
+            remedy = ""
         else:
-            remedy = "A reply that ran out of room needs only another run."
+            remedy = "\n    A reply that ran out of room needs only another run."
         _fail(
             f"the last pull from @{held.nick} did not finish: {exc.why}; {_RERUN}"
-            f"\n    {remedy}",
+            f"{remedy}",
             1,
         )
     except remote_mux.NotAPull as exc:

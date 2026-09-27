@@ -3129,9 +3129,13 @@ class TestAFinalPullThatDidNotFinish:
                 truncated={"api": ("api/transcripts/owed.jsonl",)},
             ),
         )
-        with pytest.raises(node_sync.PullUnfinished, match="without moving its mark"):
+        with pytest.raises(
+            node_sync.PullUnfinished, match="without moving its mark"
+        ) as info:
             node_sync.final_pull(_config(), "api", wait_s=1e9)
         assert len(asked) == 2
+        # Asked a third time the node would answer the same: no remedy.
+        assert info.value.stuck is True
         assert _marks() == {
             "api": {"since": math.nextafter(500.0, -math.inf), "realpath": _REAL}
         }
@@ -3158,6 +3162,7 @@ class TestAFinalPullThatDidNotFinish:
             " back)"
         )
         assert info.value.not_stored is False
+        assert info.value.stuck is True
         assert len(asked) == 2
 
     def test_a_reply_still_cut_at_the_deadline_raises_with_the_mark_at_its_resume(
@@ -3176,6 +3181,8 @@ class TestAFinalPullThatDidNotFinish:
         ) as info:
             node_sync.final_pull(_config(), "api", wait_s=100.0, now=clock)
         assert info.value.rc == 0
+        # Cut by the deadline, not stuck: another run carries on from here.
+        assert info.value.stuck is False
         assert len(asked) == 2
         assert _marks() == {
             "api": {"since": math.nextafter(800.0, -math.inf), "realpath": _REAL}
@@ -3762,6 +3769,7 @@ class TestAFinalPullThatDidNotFinishIsNotASuccess:
             info.value.why == "a file of session 'api' could not be stored on this PC"
         )
         assert info.value.not_stored is True
+        assert info.value.stuck is False
         # The watermark held, so the next pull asks for that file again.
         assert _marks()["api"] == {"since": 10.0, "realpath": "/home/amin/magent/api"}
 
@@ -3782,6 +3790,7 @@ class TestAFinalPullThatDidNotFinishIsNotASuccess:
             " (the reply reached the pull cap without moving its mark)"
         )
         assert info.value.not_stored is False
+        assert info.value.stuck is True
         # cq-G14 I-R2-1: saved BEFORE the raise, and just under the first file
         # still owed -- the node's clock would put the owed files behind the
         # watermark, and no later pull would ask for them.

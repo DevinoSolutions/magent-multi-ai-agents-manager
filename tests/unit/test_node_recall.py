@@ -2266,11 +2266,51 @@ class TestTheLastPullMustFinish:
             f" without moving its mark); {node_cmd._RERUN}"
         ) in result.stderr
         assert "the pull did not finish" not in result.stderr
-        # cq-G14 m2: each re-run brings home more (I-R2-1's watermark).
-        assert "A reply that ran out of room needs only another run." in result.stderr
+        # cq-G14-r3: the mark did not move, so a re-run is asked from the
+        # same mark and answered the same -- no remedy is promised.
+        assert "ran out of room" not in result.stderr
         # m-R3-2: only the remedy that applies -- nothing here to close or free.
         assert "could not store" not in result.stderr
         assert "free disk space" not in result.stderr
+
+    @pytest.mark.parametrize(
+        ("why", "stuck", "promised"),
+        [
+            ("and was still cut when the deadline passed, after 3 calls", False, True),
+            ("and moved its mark back", True, False),
+            ("without moving its mark", True, False),
+        ],
+        ids=["deadline", "moved-back", "not-moved"],
+    )
+    def test_only_a_pull_the_deadline_cut_short_promises_another_run_is_enough(
+        self,
+        runner,
+        placed_api,
+        node_answers,
+        monkeypatch,
+        api_repo,
+        why,
+        stuck,
+        promised,
+    ):
+        # cq-G14-r3: print only the remedy that fits the outcome.
+        def _unfinished(*args, **kwargs):
+            raise node_sync.PullUnfinished(
+                "1 file(s) did not fit in the reply and are still on the node"
+                f" (the reply reached the pull cap {why})",
+                not_stored=False,
+                stuck=stuck,
+            )
+
+        monkeypatch.setattr(node_sync, "final_pull", _unfinished)
+
+        result = _recall(runner, placed_api, "--local")
+
+        _stopped_before_anything(result, api_repo)
+        assert why in result.stderr
+        assert (
+            "A reply that ran out of room needs only another run." in result.stderr
+        ) is promised
 
     def test_the_rerun_asks_again_from_the_first_owed_file_and_only_then_clears(
         self, runner, placed_api, node_answers, monkeypatch, api_repo
