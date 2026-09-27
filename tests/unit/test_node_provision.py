@@ -1889,6 +1889,21 @@ class TestAnUnreadableSkillsFolderIsNamedNotFatal:
         assert scope.skills == ()
         assert scope.notes == ("skills: cannot be read (PermissionError); not shipped",)
 
+    # A skills link that loops on itself cannot be stat'd (ELOOP, a plain
+    # OSError), and pathlib reads that as absent: it is an unknown all the
+    # same, never "this PC has no skills".
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+    def test_a_skills_link_that_loops_on_itself_is_one_note(self, tmp_path, caplog):
+        home, skills = _skills_home(tmp_path)
+        skills.rmdir()
+        skills.symlink_to(skills)
+        caplog.set_level("WARNING", logger="nodes")
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == ("skills: cannot be read (OSError); not shipped",)
+        logged = [r for r in caplog.records if r.getMessage().startswith("skills: ")]
+        assert [r.levelname for r in logged] == ["WARNING"]
+
     @pytest.mark.skipif(
         sys.platform == "win32" or os.geteuid() == 0,
         reason="a mode-0 folder: POSIX, and root reads it anyway",
