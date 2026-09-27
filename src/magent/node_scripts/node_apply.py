@@ -13,7 +13,9 @@ permission rules, extra directories), so what this PC stops shipping is
 taken back from the node; a lost or damaged store takes nothing back, and
 neither does a PC file the PC could not read (the manifest's ``unread``) or
 a payload member that does not read as a JSON object (``_member``): its
-step is a skip that writes nothing and forgets nothing. A
+step is a skip that writes nothing and forgets nothing. The node's own file
+is read as strictly (``_node_object``): only a MISSING one is {}; a 0-byte,
+torn or unreadable one is a warn that writes nothing and forgets nothing. A
 deliberate drop (a hook whose program this node lacks) is a clean result:
 the same payload on the same node drops it again, and ``--force`` (what
 ``magent node setup`` sends) re-looks after a tool is installed.
@@ -191,6 +193,9 @@ def _remember(ctx: Ctx, step: str, want: str, mark: int) -> None:
         ctx.store.pop(step, None)
 
 
+_NOT_AN_OBJECT = "not a JSON object"
+
+
 def _member(ctx: Ctx, name: str) -> dict[str, object] | str:
     """The payload member ``name`` as a JSON object, or the class of why it
     is not one. Strict, unlike ``_load``: the PC always ships this member,
@@ -200,7 +205,34 @@ def _member(ctx: Ctx, name: str) -> dict[str, object] | str:
         loaded = json.loads((ctx.work / name).read_text(encoding="utf-8"))
     except (OSError, ValueError, RecursionError) as e:
         return type(e).__name__
-    return loaded if isinstance(loaded, dict) else "not a JSON object"
+    return loaded if isinstance(loaded, dict) else _NOT_AN_OBJECT
+
+
+def _node_object(path: Path) -> dict[str, object] | str:
+    """The node's own JSON file ``path`` as an object; {} when it does not
+    exist, so a write creates it. Anything else is the class of why it could
+    not be read, or ``_NOT_AN_OBJECT``: a 0-byte or torn file is unknown --
+    it may be a write the node's claude has in flight -- and merged into as
+    {} it would be overwritten."""
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, RecursionError) as e:
+        return type(e).__name__
+    return loaded if isinstance(loaded, dict) else _NOT_AN_OBJECT
+
+
+def _unread_on_node(ctx: Ctx, item: str, shown: str, why: str) -> None:
+    """The warn row for a node file ``_node_object`` could not read: the
+    class on screen, nothing written, nothing the step remembers changed."""
+    _row(
+        ctx,
+        "warn",
+        item,
+        f"{shown} on this node could not be read ({why}); left as it is, the "
+        "next provision tries again",
+    )
 
 
 def _unread_member(ctx: Ctx, step: str, name: str, why: str, left: str) -> None:
@@ -212,10 +244,11 @@ def _unread_member(ctx: Ctx, step: str, name: str, why: str, left: str) -> None:
 
 
 def _load(path: Path) -> object:
-    """A JSON file's value: {} when the file does not exist or is empty
-    (a 0-byte settings.json), None when it cannot be read (a directory
-    there, no permission) or is not JSON. For the node's own files; a
-    payload member is read strictly (``_member``)."""
+    """A JSON file's value: {} when the file does not exist or is empty,
+    None when it cannot be read (a directory there, no permission) or is not
+    JSON. Only for the manifest and the store, where empty and damaged both
+    fail safe; a payload member is read by ``_member``, a node file by
+    ``_node_object``."""
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -343,15 +376,17 @@ def _merge_into(
     """Merge into a JSON object file the node's claude also writes: read it,
     ``change`` it (None: nothing to write), and replace it only if it is
     still what was read -- a write that landed in between is merged again,
-    never overwritten. "did", "skip", or "fail" (its row printed here) when
-    the file is not an object, is a link to nothing, or kept changing."""
+    never overwritten. "did", "skip", "unread" when the file is there but
+    could not be read (``_node_object``: a warn row, nothing written), or
+    "fail" (its row printed here) when it is not an object, is a link to
+    nothing, or kept changing."""
     target = _target(ctx, item, path, shown, "fail")
     if target is None:
         return "fail"
     for _ in range(MERGE_TRIES):
         seen = _stamp(target)
-        node = _load(target)
-        if not isinstance(node, dict):
+        node = _node_object(target)
+        if node == _NOT_AN_OBJECT:
             _row(
                 ctx,
                 "fail",
@@ -359,6 +394,9 @@ def _merge_into(
                 f"{shown} on this node is not a JSON object; fix or remove it",
             )
             return "fail"
+        if isinstance(node, str):
+            _unread_on_node(ctx, item, shown, node)
+            return "unread"
         new = change(node)
         if new is None:
             return "skip"
@@ -796,8 +834,8 @@ def _step_settings(ctx: Ctx) -> None:
     )
     if path is None:
         return
-    node = _load(path)
-    if not isinstance(node, dict):
+    node = _node_object(path)
+    if node == _NOT_AN_OBJECT:
         _row(
             ctx,
             "fail",
@@ -805,6 +843,9 @@ def _step_settings(ctx: Ctx) -> None:
             "~/.claude/settings.json on this node is not a JSON object; "
             "fix or remove it",
         )
+        return
+    if isinstance(node, str):
+        _unread_on_node(ctx, "settings", "~/.claude/settings.json", node)
         return
     want = _digest(ctx, "settings") + ":" + _digest(ctx, "state_hook")
     wired = STATE_HOOK_MARKER in json.dumps(node.get("hooks"))
@@ -951,14 +992,17 @@ def _step_mcp_oauth(ctx: Ctx) -> None:
     )
     if listed is None:
         return
-    claude_json = _load(listed)
-    if not isinstance(claude_json, dict):
+    # Strict: a 0-byte or torn ~/.claude.json is unknown, never a node with
+    # no servers (``_node_object``).
+    claude_json = _node_object(listed)
+    if isinstance(claude_json, str):
         _row(
             ctx,
             "warn",
             "mcp_oauth",
-            "~/.claude.json on this node cannot be read, so its server list is "
-            "unknown; this PC's MCP OAuth entries wait for the next provision",
+            f"~/.claude.json on this node cannot be read ({claude_json}), so its "
+            "server list is unknown; this PC's MCP OAuth entries wait for the "
+            "next provision",
         )
         return
     servers = claude_json.get("mcpServers")
@@ -1010,7 +1054,7 @@ def _step_mcp_oauth(ctx: Ctx) -> None:
         _row(ctx, "skip", "mcp_oauth", f"{len(kept)} entry(ies) unchanged on this PC")
     elif done == "did":
         _row(ctx, "did", "mcp_oauth", f"{written[0]} of {len(kept)} entry(ies)")
-    if done != "fail":
+    if done in ("did", "skip"):
         ctx.store["mcp_oauth"] = want
 
 

@@ -708,14 +708,32 @@ class TestTheSettings:
         box.apply(_work(tmp_path, _pc_settings(pc)))
         assert "statusLine" not in _json(_settings(box))
 
-    def test_a_node_settings_file_that_is_not_json_fails_and_is_left_alone(
+    def test_a_node_settings_file_that_is_not_json_is_unknown_and_left_alone(
         self, box, tmp_path, capsys
     ):
+        # U6: unknown, not a failure of the run -- it may be a write in flight.
         _settings(box).parent.mkdir(parents=True)
         _settings(box).write_text("{oops", encoding="utf-8")
-        assert box.apply(_work(tmp_path)) == 1
-        assert _status(_lines(capsys), "settings") == "fail"
+        assert box.apply(_work(tmp_path)) == 0
+        assert _status(_lines(capsys), "settings") == "warn"
         assert _settings(box).read_text(encoding="utf-8") == "{oops"
+
+    def test_a_node_settings_file_that_is_a_list_fails_and_is_left_alone(
+        self, box, tmp_path, capsys
+    ):
+        # Read fine, and wrong: that does not fix itself.
+        _settings(box).parent.mkdir(parents=True)
+        _settings(box).write_text("[]", encoding="utf-8")
+        assert box.apply(_work(tmp_path)) == 1
+        assert _rows(_lines(capsys), "settings") == [
+            remote_mux.ScriptLine(
+                "fail",
+                "settings",
+                "~/.claude/settings.json on this node is not a JSON object; "
+                "fix or remove it",
+            )
+        ]
+        assert _settings(box).read_text(encoding="utf-8") == "[]"
 
     def test_unchanged_settings_are_skipped(self, box, tmp_path, capsys):
         work = _work(tmp_path, _pc_settings({"model": "opus"}))
@@ -814,14 +832,15 @@ class TestTheMcpServers:
         assert _status(_lines(capsys), "mcp") == "did"
         assert _json(_claude_json(box))["mcpServers"] == {"docs": DOCS}
 
-    def test_a_node_claude_json_that_is_not_json_fails_and_is_left_alone(
+    def test_a_node_claude_json_that_is_not_json_is_unknown_and_left_alone(
         self, box, tmp_path, capsys
     ):
+        # U6: unknown, not a failure of the run -- it may be a write in flight.
         _claude_json(box).write_text("{oops", encoding="utf-8")
         assert (
-            box.apply(_work(tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS}))) == 1
+            box.apply(_work(tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS}))) == 0
         )
-        assert _status(_lines(capsys), "mcp") == "fail"
+        assert _status(_lines(capsys), "mcp") == "warn"
         assert _claude_json(box).read_text(encoding="utf-8") == "{oops"
 
     @pytest.mark.skipif(not POSIX, reason="POSIX file modes")
@@ -897,14 +916,15 @@ class TestTheMcpOAuth:
         assert _status(_lines(capsys), "mcp_oauth") == "skip"
         assert not _credentials(box).exists()
 
-    def test_a_node_credentials_file_that_is_not_json_fails_and_is_left_alone(
+    def test_a_node_credentials_file_that_is_not_json_is_unknown_and_left_alone(
         self, box, tmp_path, capsys
     ):
+        # U6: unknown, not a failure of the run -- it may be a write in flight.
         _credentials(box).parent.mkdir(parents=True)
         _credentials(box).write_text("{oops", encoding="utf-8")
         scope = replace(EMPTY, mcp_servers={"docs": DOCS}, mcp_oauth=_oauth())
-        assert box.apply(_work(tmp_path, scope)) == 1
-        assert _status(_lines(capsys), "mcp_oauth") == "fail"
+        assert box.apply(_work(tmp_path, scope)) == 0
+        assert _status(_lines(capsys), "mcp_oauth") == "warn"
         assert _credentials(box).read_text(encoding="utf-8") == "{oops"
 
     def test_no_oauth_token_or_relay_bearer_is_printed(self, box, tmp_path, capsys):
@@ -2152,16 +2172,6 @@ class TestTheMerge:
             "defaultMode": "acceptEdits",
         }
 
-    @pytest.mark.parametrize("text", [b"", b" \n\t\n"])
-    def test_an_empty_settings_file_is_an_empty_object(
-        self, box, tmp_path, capsys, text
-    ):
-        _settings(box).parent.mkdir(parents=True)
-        _settings(box).write_bytes(text)
-        box.apply(_work(tmp_path, _pc_settings({"model": "opus"})))
-        assert _status(_lines(capsys), "settings") == "did"
-        assert _json(_settings(box))["model"] == "opus"
-
     @pytest.mark.skipif(not POSIX, reason="POSIX symlinks and file modes")
     def test_a_symlinked_settings_file_is_written_through_its_link(self, box, tmp_path):
         real = tmp_path / "dotfiles" / "settings.json"
@@ -2417,7 +2427,7 @@ def _mid_merge(
     """Each time node_apply reads ``path``, the next value in ``writes`` lands
     on it right after the read -- the node's claude writing the file while
     this apply is merging into it."""
-    real = node_apply._load
+    real = node_apply._node_object
     pending = list(writes)
 
     def load(read: Path) -> object:
@@ -2426,7 +2436,7 @@ def _mid_merge(
             _put(path, pending.pop(0))
         return value
 
-    monkeypatch.setattr(node_apply, "_load", load)
+    monkeypatch.setattr(node_apply, "_node_object", load)
 
 
 def _sneak(monkeypatch: pytest.MonkeyPatch, path: Path, how: str) -> str:
@@ -2437,7 +2447,7 @@ def _sneak(monkeypatch: pytest.MonkeyPatch, path: Path, how: str) -> str:
     token = "SNEAK-" + how
     padded = path.read_bytes() + b" " * 64
     path.write_bytes(padded)
-    real = node_apply._load
+    real = node_apply._node_object
     done: list[bool] = []
 
     def load(read: Path) -> object:
@@ -2470,7 +2480,7 @@ def _sneak(monkeypatch: pytest.MonkeyPatch, path: Path, how: str) -> str:
         ) == (how == "ino", how == "size", how == "mtime")
         return value
 
-    monkeypatch.setattr(node_apply, "_load", load)
+    monkeypatch.setattr(node_apply, "_node_object", load)
     return token
 
 
@@ -3424,3 +3434,136 @@ class TestAnUnreadablePcFileLeavesTheNodeAlone:
             )
         ]
         assert _credentials(box).read_bytes() == before
+
+
+# Each way a file the NODE owns can exist and still not be read, and the class
+# its row shows. Only a missing file is {} (a write creates it); an empty one
+# is unknown like the rest -- it may be a write the node's claude has in
+# flight, and merged into as {} it would be overwritten.
+NODE_UNKNOWN = [
+    ("empty", "JSONDecodeError"),
+    ("whitespace", "JSONDecodeError"),
+    ("not-json", "JSONDecodeError"),
+    ("too-deep", "RecursionError"),
+    ("eio", "OSError"),
+]
+
+
+def _spoil(monkeypatch: pytest.MonkeyPatch, path: Path, how: str) -> None:
+    """The node's own file ``path``, there but unreadable the way ``how``
+    names."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if how in _MEMBER_TEXT:
+        path.write_text(_MEMBER_TEXT[how], encoding="utf-8")
+    else:
+        path.write_text("{}", encoding="utf-8")
+        _fail_read(monkeypatch, path, *_READ_ERRORS[how])
+
+
+class TestAnUnreadableNodeFileIsUnknownNotEmpty:
+    """U6: a file the node owns that exists but does not read is UNKNOWN,
+    never the {} a missing one is. The step prints one warn row naming the
+    class, writes nothing, keeps what it remembers, and the run exits 0."""
+
+    @pytest.mark.parametrize(("how", "why"), NODE_UNKNOWN)
+    def test_an_unknown_node_server_list_is_named_not_read_as_no_entries(
+        self, box, tmp_path, capsys, monkeypatch, how, why
+    ):
+        # cq-F17c's repro (9): the payload's server list is broken, so the mcp
+        # step leaves ~/.claude.json alone, and the oauth step reads it.
+        box.apply(_work(tmp_path, _two()))
+        remembered = _json(_store(box))
+        _spoil(monkeypatch, _claude_json(box), how)
+        written = (_claude_json(box).read_bytes(), _credentials(box).read_bytes())
+        capsys.readouterr()
+        work = _work(tmp_path, _two(a="PC-A2", b="PC-B2"), name="work2")
+        _break(monkeypatch, work / "mcp_servers.json", "not-json")
+        assert box.apply(work) == 0
+        assert _rows(_lines(capsys), "mcp_oauth") == [
+            remote_mux.ScriptLine(
+                "warn",
+                "mcp_oauth",
+                f"~/.claude.json on this node cannot be read ({why}), so its "
+                "server list is unknown; this PC's MCP OAuth entries wait for the "
+                "next provision",
+            )
+        ]
+        assert (_claude_json(box).read_bytes(), _credentials(box).read_bytes()) == (
+            written
+        )
+        _assert_the_record_is_kept(box, remembered, "mcp_oauth")
+
+    @pytest.mark.parametrize(("how", "why"), NODE_UNKNOWN)
+    def test_an_unknown_node_claude_json_is_not_merged_into(
+        self, box, tmp_path, capsys, monkeypatch, how, why
+    ):
+        box.apply(_work(tmp_path, replace(EMPTY, mcp_servers={"docs": DOCS})))
+        remembered = _json(_store(box))
+        _spoil(monkeypatch, _claude_json(box), how)
+        written = _claude_json(box).read_bytes()
+        capsys.readouterr()
+        work = _work(tmp_path, replace(EMPTY, mcp_servers=TWO_SERVERS), name="work2")
+        assert box.apply(work) == 0
+        assert _rows(_lines(capsys), "mcp") == [
+            remote_mux.ScriptLine(
+                "warn",
+                "mcp",
+                f"~/.claude.json on this node could not be read ({why}); left as "
+                "it is, the next provision tries again",
+            )
+        ]
+        assert _claude_json(box).read_bytes() == written
+        _assert_the_record_is_kept(box, remembered, "mcp")
+
+    @pytest.mark.parametrize(("how", "why"), NODE_UNKNOWN)
+    def test_an_unknown_node_credentials_file_is_not_merged_into(
+        self, box, tmp_path, capsys, monkeypatch, how, why
+    ):
+        box.apply(_work(tmp_path, _two()))
+        remembered = _json(_store(box))
+        _spoil(monkeypatch, _credentials(box), how)
+        written = _credentials(box).read_bytes()
+        capsys.readouterr()
+        # New tokens: a merge would write them, and remember their shas.
+        work = _work(tmp_path, _two(a="PC-A2", b="PC-B2"), name="work2")
+        assert box.apply(work) == 0
+        assert _rows(_lines(capsys), "mcp_oauth") == [
+            remote_mux.ScriptLine(
+                "warn",
+                "mcp_oauth",
+                f"~/.claude/.credentials.json on this node could not be read "
+                f"({why}); left as it is, the next provision tries again",
+            )
+        ]
+        assert _credentials(box).read_bytes() == written
+        _assert_the_record_is_kept(box, remembered, "mcp_oauth")
+
+    @pytest.mark.parametrize(("how", "why"), NODE_UNKNOWN)
+    def test_unknown_node_settings_are_not_merged_into(
+        self, box, tmp_path, capsys, monkeypatch, how, why
+    ):
+        # Merged as {} with the PC now shipping {}, this would also take back
+        # every env key, rule and directory the PC shipped before.
+        box.apply(_work(tmp_path, _pc_settings(SHIPPED)))
+        remembered = _json(_store(box))
+        _spoil(monkeypatch, _settings(box), how)
+        written = _settings(box).read_bytes()
+        capsys.readouterr()
+        assert box.apply(_work(tmp_path, _pc_settings({}), name="work2")) == 0
+        assert _rows(_lines(capsys), "settings") == [
+            remote_mux.ScriptLine(
+                "warn",
+                "settings",
+                f"~/.claude/settings.json on this node could not be read ({why}); "
+                "left as it is, the next provision tries again",
+            )
+        ]
+        assert _settings(box).read_bytes() == written
+        _assert_the_record_is_kept(box, remembered, "settings")
+
+    def test_a_missing_node_file_is_still_created(self, box, tmp_path, capsys):
+        # Only a MISSING file is {}: a fresh node user gets its files.
+        box.apply(_work(tmp_path, _two()))
+        assert set(_json(_claude_json(box))["mcpServers"]) == {"docs", "wiki"}
+        assert set(_json(_credentials(box))["mcpOAuth"]) == {A, B}
+        assert {line.item: line.status for line in _lines(capsys)}["mcp"] == "did"
