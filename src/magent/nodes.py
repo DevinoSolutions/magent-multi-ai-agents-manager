@@ -1268,7 +1268,7 @@ READ_FLAGS = (
 )
 
 
-def memory_is_link(memory: Path) -> bool:
+def _memory_is_link(memory: Path) -> bool:
     """Is the memory folder ``memory`` itself a link? Decided by ``realpath``:
     resolving it must change nothing but its parent's own resolution -- so a
     link ABOVE it (a dotfiles ``~/.claude``) is not one, and a Windows
@@ -1300,7 +1300,7 @@ def walk_memory(
     that cannot be stat-ed -- is also handed to ``unreadable``, with its
     error."""
     log = get_logger("nodes")
-    if memory_is_link(memory):
+    if _memory_is_link(memory):
         log.warning("memory folder %s is a link; no memory shipped", memory)
         return
     real_mem = Path(os.path.realpath(memory))
