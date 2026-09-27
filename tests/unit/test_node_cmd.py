@@ -356,9 +356,24 @@ class TestTheDoctorNeverReadsSilenceOrACrashAsHealth:
     def test_a_node_that_never_answered_is_a_fail_row(
         self, runner, tmp_config, monkeypatch
     ):
-        # rc None is a timeout or an over-cap reply. Its wording waits on D10's
-        # RemoteError.timed_out (the D-MERGE note at _unreachable); what must
-        # hold today is that it is a failure, never a crash or a pass.
+        # A node that went silent: RemoteError.timed_out (D10) words it, not
+        # rc None -- rc None is also a spawn failure or an over-cap reply.
+        def doctor(node, *, timeout_s):
+            raise _timed_out(timeout_s)
+
+        monkeypatch.setattr(remote_mux, "doctor", doctor)
+        result = _doctor(runner, _pool_file(tmp_config))
+        assert result.exit_code == 1
+        assert (
+            "no answer from amin@devino-second: timed out after "
+            f"{remote_mux.DOCTOR_TIMEOUT_S:g}s"
+        ) in result.stdout
+        assert "cannot reach" not in result.stdout
+
+    def test_a_call_that_never_started_is_still_cannot_reach(
+        self, runner, tmp_config, monkeypatch
+    ):
+        # rc None with no flag set: the call never ran, so nothing went silent.
         def doctor(node, *, timeout_s):
             raise remote_mux.RemoteError(None, "", ("ssh", node.target))
 
