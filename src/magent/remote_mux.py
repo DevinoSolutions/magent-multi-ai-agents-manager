@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from magent import node_scripts, psmux
+from magent import node_scripts, nodes, psmux
 
 # find_ssh is bound by value, not read off attach_client at call time: the
 # conftest guard answers None for attach_client.find_ssh, and this module's own
@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     from collections.abc import Collection, Iterable, Mapping, Sequence
     from typing import IO
 
+    from magent.config import MagentConfig
     from magent.nodes import Node, Recipe, UserScope
 
 # tmux, not psmux: nodes are Linux. One server per node user (`-L magent`,
@@ -791,15 +792,22 @@ def build_payload(
         "plugins": list(scope.plugins),
         "marketplaces": scope.marketplaces,
         "hook_entries": entries,
+        # Steps whose PC file did not read: node_apply leaves them alone.
+        "unread": scope.unread,
     }
     members: list[tuple[str, bytes, int]] = [
         ("manifest.json", _canonical(manifest).encode("utf-8"), 0o600),
         ("mcp_oauth.json", _canonical(scope.mcp_oauth).encode("utf-8"), 0o600),
         ("mcp_servers.json", _canonical(scope.mcp_servers).encode("utf-8"), 0o600),
         ("node_apply.py", node_scripts.source("node_apply.py").encode("utf-8"), 0o600),
-        ("settings.json", _canonical(scope.settings).encode("utf-8"), 0o600),
         ("state-hook.sh", state_hook.encode("utf-8"), 0o700),
     ]
+    # Unread settings are not sent at all: an empty settings.json would read
+    # as "this PC ships nothing" and take back what it shipped before.
+    if "settings" not in scope.unread:
+        members.append(
+            ("settings.json", _canonical(scope.settings).encode("utf-8"), 0o600)
+        )
     members += [
         (f"skills/{f.path}", f.data, 0o700 if f.executable else 0o600)
         for f in scope.skills
@@ -918,6 +926,25 @@ def provision(
         for name in sorted(user_scope.mcp_servers)
     )
     return ProvisionReport((*notes, *shipped, *probe_failed, *report.lines))
+
+
+def provision_node(
+    node: Node,
+    config: MagentConfig,
+    *,
+    home: Path,
+    timeout_s: float,
+    force: bool = False,
+) -> ProvisionReport:
+    """THE provisioning body (DECISION-24): ``magent node setup`` and
+    ``launch._provision_once`` both call it. Builds the user scope from
+    ``home`` -- the one place src builds one; plan K swaps that line for its
+    relay seam and drops the ``del`` above it -- then hands it to
+    ``provision``, which probes the node's programs only when a stdio server
+    is in the scope. ``config`` is unread until K lands. Raises RemoteError
+    when the node is unreachable; a failed step is a ``fail`` row."""
+    del config  # plan K's relay swap reads config.settings
+    return provision(node, nodes.user_scope(home), timeout_s=timeout_s, force=force)
 
 
 SETUP_TIMEOUT_S = 900.0

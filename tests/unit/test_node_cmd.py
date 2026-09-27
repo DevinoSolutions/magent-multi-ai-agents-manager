@@ -8,6 +8,7 @@ import os
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
@@ -17,6 +18,7 @@ from magent.cli import node_cmd
 from magent.config import SCHEMA_VERSION, load_config
 from magent.remote_mux import ProvisionReport, ScriptLine
 from magent.style import style
+from tests.unit._fake_ssh import gh_auth_status
 
 HEALTHY = "ok\ttmux\ttmux 3.4\nok\tclaude-login\tlogged in\n"
 NODE_PROJECT = {"path": "api", "node": "second"}
@@ -579,3 +581,626 @@ class TestTheSnapshotRow:
         _snapshot("second", time.time())
         snap = _rows(_doctor(runner, _pool_file(tmp_config), "--json"))["snapshot"]
         assert snap["status"] == "ok", snap
+
+
+PC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKEPCKEY me@pc"
+NOT_LOGGED_IN = (
+    "fail\tclaude-login\tClaude Code is not logged in here -- "
+    "run once: ssh amin@devino-second claude\n"
+)
+
+
+def _pc_key(name: str = "id_ed25519.pub", text: str = PC_KEY + "\n") -> Path:
+    path = Path.home() / ".ssh" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _node_answers(
+    fake_ssh, *, users=("amin",), setup_extra="", doctor=NOT_LOGGED_IN
+) -> None:
+    """The fake node: root's setup call reports a key per user; provision
+    (`--force`) installs the hook; doctor (`--target`) answers ``doctor``."""
+    keys = "".join(
+        f"key\t{u}\tssh-ed25519 AAAA{u.upper()} magent@devino-second\n" for u in users
+    )
+    fake_ssh.set_reply(
+        "root@devino-second", stdout=f"did\tpackages\tinstalled\n{setup_extra}{keys}"
+    )
+    fake_ssh.set_reply(
+        "--force", stdout="did\tstate_hook\t~/.magent/bin/state-hook.sh\n"
+    )
+    fake_ssh.set_reply("--target", stdout="ok\ttmux\ttmux 3.4\n" + doctor)
+
+
+def _gh_can_add_keys(fake_gh) -> None:
+    fake_gh.set_reply(
+        "auth status", stdout=gh_auth_status("amin", "admin:public_key, repo")
+    )
+
+
+def _setup(runner, cfg: str, *args: str):
+    return runner.invoke(cli.main, ["--config", cfg, "node", "setup", *args])
+
+
+def _targets(fake_ssh) -> list[str]:
+    return [next(a for a in c.argv if "@devino-" in a) for c in fake_ssh.calls()]
+
+
+def _timed_out(seconds: float) -> remote_mux.RemoteError:
+    # What remote_mux raises when it kills a call at its bound.
+    return remote_mux.RemoteError(
+        None, f"timed out after {seconds:g}s", ("ssh",), timed_out=True
+    )
+
+
+class TestNodeSetup:
+    def test_it_sets_up_as_root_then_provisions_and_checks_as_the_user(
+        self, runner, tmp_config, fake_ssh, fake_gh
+    ):
+        _pc_key()
+        _node_answers(fake_ssh)
+        _gh_can_add_keys(fake_gh)
+        _setup(runner, _pool_file(tmp_config), "second")
+        calls = fake_ssh.calls()
+        assert _targets(fake_ssh) == [
+            "root@devino-second",
+            "amin@devino-second",
+            "amin@devino-second",
+        ]
+        assert "--force" in calls[1].argv[-1]
+        assert "--target" in calls[2].argv[-1]
+
+    def test_this_pcs_public_key_is_the_setup_payload(
+        self, runner, tmp_config, fake_ssh
+    ):
+        _pc_key()
+        _node_answers(fake_ssh)
+        _setup(runner, _pool_file(tmp_config), "second")
+        assert fake_ssh.calls()[0].stdin.endswith((PC_KEY + "\n").encode("ascii"))
+
+    def test_the_nodes_key_is_registered_under_a_title_naming_it(
+        self, runner, tmp_config, fake_ssh, fake_gh
+    ):
+        _pc_key()
+        _node_answers(fake_ssh)
+        _gh_can_add_keys(fake_gh)
+        _setup(runner, _pool_file(tmp_config), "second")
+        (add,) = [c for c in fake_gh.calls() if c.argv[:2] == ["ssh-key", "add"]]
+        assert add.argv[add.argv.index("--title") + 1] == "magent amin@devino-second"
+        assert add.stdin == b"ssh-ed25519 AAAAAMIN magent@devino-second\n"
+
+    def test_the_nodes_key_row_is_not_printed(
+        self, runner, tmp_config, fake_ssh, fake_gh
+    ):
+        _pc_key()
+        _node_answers(fake_ssh)
+        _gh_can_add_keys(fake_gh)
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert "AAAAAMIN" not in result.output
+
+    def test_a_missing_claude_login_is_the_one_fail_that_does_not_fail_setup(
+        self, runner, tmp_config, fake_ssh, fake_gh
+    ):
+        _pc_key()
+        _node_answers(fake_ssh)
+        _gh_can_add_keys(fake_gh)
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert result.exit_code == 0, result.output
+        assert (
+            "last step, by hand, once: ssh amin@devino-second claude" in result.stdout
+        )
+
+    def test_a_logged_in_node_gets_no_reminder(
+        self, runner, tmp_config, fake_ssh, fake_gh
+    ):
+        _pc_key()
+        _node_answers(fake_ssh, doctor="ok\tclaude-login\tlogged in\n")
+        _gh_can_add_keys(fake_gh)
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert result.exit_code == 0, result.output
+        assert "last step" not in result.stdout
+        assert "Ready." in result.stdout
+
+    def test_any_other_failed_step_exits_one(
+        self, runner, tmp_config, fake_ssh, fake_gh
+    ):
+        _pc_key()
+        _node_answers(
+            fake_ssh, setup_extra="fail\tdocker:amin\tusermod -aG docker amin failed\n"
+        )
+        _gh_can_add_keys(fake_gh)
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert result.exit_code == 1
+        assert "1 step(s) failed." in result.stdout
+        assert "Ready." not in result.stdout
+
+    def test_no_gh_login_fails_the_github_row_and_setup(
+        self, runner, tmp_config, fake_ssh
+    ):
+        _pc_key()
+        _node_answers(fake_ssh)
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert result.exit_code == 1
+        assert "gh is not logged in on this PC: gh auth login" in result.stdout
+
+    def test_each_user_is_created_and_then_provisioned_as_itself(
+        self, runner, tmp_config, fake_ssh, fake_gh
+    ):
+        _pc_key()
+        _node_answers(fake_ssh, users=("amin", "bob"))
+        _gh_can_add_keys(fake_gh)
+        _setup(
+            runner, _pool_file(tmp_config), "second", "--user", "amin", "--user", "bob"
+        )
+        assert fake_ssh.calls()[0].argv[-1] == (
+            f"bash -c 'bash -s -- {remote_mux.SOCKET} amin bob'"
+        )
+        assert _targets(fake_ssh)[1:] == [
+            "amin@devino-second",
+            "amin@devino-second",
+            "bob@devino-second",
+            "bob@devino-second",
+        ]
+
+    def test_a_user_whose_setup_produced_no_key_goes_no_further(
+        self, runner, tmp_config, fake_ssh, fake_gh
+    ):
+        _pc_key()
+        _node_answers(
+            fake_ssh, users=("amin",), setup_extra="fail\tuser:bob\tuseradd: nope\n"
+        )
+        _gh_can_add_keys(fake_gh)
+        _setup(
+            runner, _pool_file(tmp_config), "second", "--user", "amin", "--user", "bob"
+        )
+        assert "bob@devino-second" not in _targets(fake_ssh)
+
+    def test_the_default_user_is_the_nodes_user(self, runner, tmp_config, fake_ssh):
+        _pc_key()
+        _setup(runner, _pool_file(tmp_config), "second")
+        assert fake_ssh.calls()[0].argv[-1] == (
+            f"bash -c 'bash -s -- {remote_mux.SOCKET} amin'"
+        )
+
+    def test_key_names_the_public_key_to_authorize(self, runner, tmp_config, fake_ssh):
+        other = _pc_key("work.pub", "ssh-ed25519 AAAAWORKKEY me@work\n")
+        _setup(runner, _pool_file(tmp_config), "second", "--key", str(other))
+        assert fake_ssh.calls()[0].stdin.endswith(b"ssh-ed25519 AAAAWORKKEY me@work\n")
+
+    def test_without_key_the_first_default_public_key_is_used(
+        self, runner, tmp_config, fake_ssh
+    ):
+        _pc_key("id_rsa.pub", "ssh-rsa AAAARSAKEY me@pc\n")
+        _pc_key("id_ecdsa.pub", "ecdsa-sha2-nistp256 AAAAECDSAKEY me@pc\n")
+        _setup(runner, _pool_file(tmp_config), "second")
+        assert fake_ssh.calls()[0].stdin.endswith(
+            b"ecdsa-sha2-nistp256 AAAAECDSAKEY me@pc\n"
+        )
+
+    def test_a_key_file_saved_with_a_bom_is_read_without_it(
+        self, runner, tmp_config, fake_ssh
+    ):
+        # Windows PowerShell 5.1's `Set-Content -Encoding UTF8` writes one.
+        _pc_key(text="﻿" + PC_KEY + "\n")
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert "not one ssh public key line" not in result.output
+        payload = fake_ssh.calls()[0].stdin
+        assert payload.endswith((PC_KEY + "\n").encode("ascii"))
+        assert "﻿".encode() not in payload
+
+    def test_a_repeated_user_is_set_up_once_in_first_seen_order(
+        self, runner, tmp_config, fake_ssh, fake_gh
+    ):
+        _pc_key()
+        _node_answers(fake_ssh, users=("bob", "amin"))
+        _gh_can_add_keys(fake_gh)
+        _setup(
+            runner,
+            _pool_file(tmp_config),
+            "second",
+            *("--user", "bob", "--user", "amin", "--user", "bob"),
+        )
+        assert fake_ssh.calls()[0].argv[-1] == (
+            f"bash -c 'bash -s -- {remote_mux.SOCKET} bob amin'"
+        )
+        assert _targets(fake_ssh)[1:] == [
+            "bob@devino-second",
+            "bob@devino-second",
+            "amin@devino-second",
+            "amin@devino-second",
+        ]
+        adds = [c for c in fake_gh.calls() if c.argv[:2] == ["ssh-key", "add"]]
+        assert len(adds) == 2
+
+    def test_the_root_hop_gets_the_budget_that_grows_with_the_users(
+        self, runner, tmp_config, fake_ssh, monkeypatch
+    ):
+        # setup_node's own default (SETUP_TIMEOUT_S + SETUP_PER_USER_S per
+        # user): a budget passed in would cut it for two users or more.
+        budgets: list[float] = []
+        real = remote_mux.run_script
+
+        def spy(node, script, args, **kwargs):
+            if script == "setup":
+                budgets.append(kwargs["timeout_s"])
+            return real(node, script, args, **kwargs)
+
+        monkeypatch.setattr(remote_mux, "run_script", spy)
+        _pc_key()
+        _setup(
+            runner, _pool_file(tmp_config), "second", "--user", "amin", "--user", "bob"
+        )
+        assert budgets == [remote_mux.SETUP_TIMEOUT_S + 2 * remote_mux.SETUP_PER_USER_S]
+
+
+class TestNodeSetupRefusesBeforeAnySsh:
+    def test_no_public_key_names_the_key_option(self, runner, tmp_config, fake_ssh):
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert result.exit_code == 2
+        assert "--key" in result.output
+        assert fake_ssh.calls() == []
+
+    def test_a_private_key_is_refused_and_never_printed(
+        self, runner, tmp_config, fake_ssh
+    ):
+        secret = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ"
+        path = _pc_key(
+            "id_ed25519",
+            (
+                "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+                f"{secret}\n"
+                "-----END OPENSSH PRIVATE KEY-----\n"
+            ),
+        )
+        result = _setup(runner, _pool_file(tmp_config), "second", "--key", str(path))
+        assert result.exit_code == 2
+        assert "PRIVATE key" in result.output
+        assert secret not in result.output
+        assert fake_ssh.calls() == []
+
+    def test_a_line_that_is_not_an_ssh_key_is_refused_and_never_printed(
+        self, runner, tmp_config, fake_ssh
+    ):
+        path = _pc_key("id_ed25519.pub", "hunter2 AAAAWOULDBESECRET\n")
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert result.exit_code == 2
+        assert f"{path} is not one ssh public key line" in result.output
+        assert "hunter2" not in result.output
+        assert "WOULDBESECRET" not in result.output
+        assert fake_ssh.calls() == []
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "ssh-dss AAAAB3NzaC1kc3MAAACBAFAKE me@pc",  # a type setup.sh refuses
+            "ssh-ed25519\tAAAAC3NzaC1lZDI1NTE5AAAAIFAKE me@pc",  # a tab, not a space
+            "ssh-ed25519 AAAA!notbase64 me@pc",
+        ],
+    )
+    def test_a_line_setup_sh_would_refuse_is_refused_here_first(
+        self, runner, tmp_config, fake_ssh, line
+    ):
+        # setup.sh's KEY_RE would refuse it after the root hop (exit 1);
+        # refused here, nothing is sent (exit 2).
+        _pc_key(text=line + "\n")
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert result.exit_code == 2
+        assert "is not one ssh public key line" in result.output
+        assert fake_ssh.calls() == []
+
+    def test_the_key_rule_is_setup_sh_s_key_re(self):
+        # One rule in two languages: bash's [[:cntrl:]] class is spelled out
+        # for Python, and bash anchors with ^...$ where Python fullmatches.
+        text = (
+            Path(node_cmd.__file__).parent.parent / "node_scripts" / "setup.sh"
+        ).read_text(encoding="utf-8")
+        (bash,) = [
+            line.split("=", 1)[1].strip("'")
+            for line in text.splitlines()
+            if line.startswith("KEY_RE=")
+        ]
+        assert bash == (
+            "^"
+            + node_cmd._KEY_RE.pattern.replace(r"[^\x00-\x1f\x7f]", "[^[:cntrl:]]")
+            + "$"
+        )
+
+    def test_two_key_lines_are_refused(self, runner, tmp_config, fake_ssh):
+        _pc_key(text=f"{PC_KEY}\n{PC_KEY}\n")
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert result.exit_code == 2
+        assert "is not one ssh public key line" in result.output
+        assert fake_ssh.calls() == []
+
+    def test_an_unreadable_key_file_names_the_reason(
+        self, runner, tmp_config, fake_ssh
+    ):
+        _pc_key()
+        missing = Path.home() / ".ssh" / "gone.pub"
+        result = _setup(runner, _pool_file(tmp_config), "second", "--key", str(missing))
+        assert result.exit_code == 2
+        assert f"cannot read {missing}: FileNotFoundError" in result.output
+        assert fake_ssh.calls() == []
+
+    def test_a_bad_user_name_is_refused(self, runner, tmp_config, fake_ssh):
+        _pc_key()
+        result = _setup(runner, _pool_file(tmp_config), "second", "--user", "Bob")
+        assert result.exit_code == 2
+        assert "not a valid Unix user name: Bob" in result.output
+        assert fake_ssh.calls() == []
+
+    @pytest.mark.parametrize("name", ["bob$(id)", "bob\n"])
+    def test_a_valid_prefix_is_not_a_valid_name(
+        self, runner, tmp_config, fake_ssh, name
+    ):
+        # The whole name must match: a valid head does not carry the rest.
+        _pc_key()
+        result = _setup(runner, _pool_file(tmp_config), "second", "--user", name)
+        assert result.exit_code == 2
+        assert "not a valid Unix user name" in result.output
+        assert fake_ssh.calls() == []
+
+    def test_root_is_refused_as_a_node_user(self, runner, tmp_config, fake_ssh):
+        # setup.sh refuses it too, but only after the root hop.
+        _pc_key()
+        result = _setup(runner, _pool_file(tmp_config), "second", "--user", "root")
+        assert result.exit_code == 2
+        assert "root is not a node user" in result.output
+        assert fake_ssh.calls() == []
+
+    def test_an_unknown_nick_names_the_pool(self, runner, tmp_config, fake_ssh):
+        _pc_key()
+        result = _setup(runner, _pool_file(tmp_config), "nope")
+        assert result.exit_code == 2
+        # node_for_nick owns the wording.
+        assert "node 'nope' is not in settings.nodes; known nodes: second" in (
+            result.output
+        )
+        assert fake_ssh.calls() == []
+
+
+class TestNodeSetupUnreachable:
+    def test_an_unreachable_root_login_exits_one_and_names_the_check(
+        self, runner, tmp_config, fake_ssh, fake_gh
+    ):
+        _pc_key()
+        fake_ssh.set_reply(
+            "root@devino-second",
+            stderr="root@devino-second: Permission denied (publickey).\n",
+            rc=255,
+        )
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert result.exit_code == 1
+        assert "Permission denied (publickey)." in result.stdout
+        assert "ssh root@devino-second true" in result.stdout
+        assert len(fake_ssh.calls()) == 1
+        assert fake_gh.calls() == []
+
+    def test_a_timed_out_root_hop_may_still_be_running_and_is_not_retried(
+        self, runner, tmp_config, fake_ssh, fake_gh, monkeypatch
+    ):
+        # The outcome is unknown: the root hop may still be running on the
+        # node, so it is neither "unreachable" nor sent again.
+        calls: list[str] = []
+
+        def timed_out(node, users, pubkey, **kwargs):
+            calls.append(node.target)
+            raise _timed_out(900)
+
+        monkeypatch.setattr(remote_mux, "setup_node", timed_out)
+        _pc_key()
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert result.exit_code == 1
+        assert calls == ["amin@devino-second"]
+        assert "may still be running" in result.stdout
+        assert "ssh root@devino-second true" not in result.stdout
+        assert "cannot reach" not in result.stdout
+        assert fake_ssh.calls() == []
+        assert fake_gh.calls() == []
+
+    def test_a_timed_out_provision_may_still_be_running_and_is_not_checked(
+        self, runner, tmp_config, fake_ssh, fake_gh, monkeypatch
+    ):
+        seen: list[str] = []
+
+        def timed_out(node, config, *, home, timeout_s, force=False):
+            seen.append(node.target)
+            raise _timed_out(timeout_s)
+
+        monkeypatch.setattr(remote_mux, "provision_node", timed_out)
+        _pc_key()
+        _node_answers(fake_ssh)
+        _gh_can_add_keys(fake_gh)
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert result.exit_code == 1
+        assert seen == ["amin@devino-second"]
+        assert "may still be running" in result.stdout
+        assert "--target" not in " ".join(c.argv[-1] for c in fake_ssh.calls())
+
+    def test_an_unreachable_user_login_gets_no_login_reminder(
+        self, runner, tmp_config, fake_ssh, fake_gh
+    ):
+        # The doctor never ran: the reach row says why, and a reminder to log
+        # in would name a step nobody has seen is missing.
+        _pc_key()
+        # Registered first: the first matching reply wins.
+        fake_ssh.set_reply("--target", stderr="ssh: Connection reset\n", rc=255)
+        _node_answers(fake_ssh)
+        _gh_can_add_keys(fake_gh)
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert result.exit_code == 1
+        assert "cannot reach amin@devino-second" in result.stdout
+        assert "last step" not in result.stdout
+
+    def test_a_timed_out_root_hop_names_root_the_bound_and_the_step(
+        self, runner, tmp_config, fake_ssh, fake_gh, monkeypatch
+    ):
+        def timed_out(node, users, pubkey, **kwargs):
+            raise _timed_out(900)
+
+        monkeypatch.setattr(remote_mux, "setup_node", timed_out)
+        _pc_key()
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert (
+            "no answer from root@devino-second (timed out after 900s) -- setup "
+            "may still be running there"
+        ) in result.stdout
+
+    def test_a_timed_out_provision_names_the_user_the_bound_and_the_step(
+        self, runner, tmp_config, fake_ssh, fake_gh, monkeypatch
+    ):
+        def timed_out(node, config, *, home, timeout_s, force=False):
+            raise _timed_out(timeout_s)
+
+        monkeypatch.setattr(remote_mux, "provision_node", timed_out)
+        _pc_key()
+        _node_answers(fake_ssh)
+        _gh_can_add_keys(fake_gh)
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert (
+            "no answer from amin@devino-second (timed out after 300s) -- the "
+            "provision may still be running there"
+        ) in result.stdout
+
+    def test_an_unreachable_root_hop_names_root_not_the_user(
+        self, runner, tmp_config, fake_ssh, fake_gh
+    ):
+        _pc_key()
+        fake_ssh.set_reply(
+            "root@devino-second",
+            stderr="root@devino-second: Permission denied (publickey).\n",
+            rc=255,
+        )
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert "cannot reach root@devino-second: " in result.stdout
+
+    def test_an_over_cap_root_hop_may_still_have_run_and_gets_no_login_hint(
+        self, runner, tmp_config, fake_ssh, fake_gh, monkeypatch
+    ):
+        # A reply over the cap is killed mid-run: like a timeout, setup.sh may
+        # have run to the end, so neither the row nor a hint blames the root
+        # login -- the two can never contradict each other.
+        def over_cap(node, users, pubkey, **kwargs):
+            raise remote_mux.RemoteError(
+                None, f"reply exceeded {remote_mux.MAX_REPLY_BYTES} bytes", ("ssh",)
+            )
+
+        monkeypatch.setattr(remote_mux, "setup_node", over_cap)
+        _pc_key()
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert result.exit_code == 1
+        assert "setup may still be running there" in result.stdout
+        assert "cannot reach" not in result.stdout
+        assert "ssh root@devino-second true" not in result.stdout
+        assert fake_gh.calls() == []
+
+    def test_the_real_over_cap_error_reads_as_outcome_unknown(self, fake_ssh):
+        # The predicate knows over-cap by remote_mux's own words until D17's
+        # outcome_unknown: a reworded raise must fail here, not go quiet.
+        fake_ssh.set_mode("flood")
+        node = nodes.Node(nick="second", host="devino-second", user="root", root="~")
+        with pytest.raises(remote_mux.RemoteError) as caught:
+            remote_mux.run(node, ["flood"], timeout_s=60, max_stdout_bytes=64 * 1024)
+        assert not caught.value.timed_out
+        assert node_cmd._outcome_unknown(caught.value)
+
+    def test_a_spawn_failure_is_not_outcome_unknown(
+        self, runner, tmp_config, fake_ssh, fake_gh, monkeypatch
+    ):
+        # rc None too, but the command never ran: a plain failure, hint kept.
+        def no_start(node, users, pubkey, **kwargs):
+            raise remote_mux.RemoteError(None, "Permission denied", ("ssh",))
+
+        monkeypatch.setattr(remote_mux, "setup_node", no_start)
+        _pc_key()
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert result.exit_code == 1
+        assert "cannot reach root@devino-second: Permission denied" in result.stdout
+        assert "may still be running" not in result.stdout
+        assert "ssh root@devino-second true" in result.stdout
+
+
+class TestNodeSetupNeverReadsSilenceAsSuccess:
+    def test_a_root_hop_that_printed_nothing_fails_each_user(
+        self, runner, tmp_config, fake_ssh, fake_gh
+    ):
+        # Exit 0 and not one row (a ForceCommand, a MOTD-only login): setup.sh
+        # never ran, and "Ready." would be a lie.
+        _pc_key()
+        _gh_can_add_keys(fake_gh)
+        result = _setup(
+            runner, _pool_file(tmp_config), "second", "--user", "amin", "--user", "bob"
+        )
+        assert result.exit_code == 1
+        assert "no node key came back for amin" in result.stdout
+        assert "no node key came back for bob" in result.stdout
+        assert "Ready." not in result.stdout
+        assert len(fake_ssh.calls()) == 1
+
+    def test_a_user_whose_failure_has_its_own_row_gets_no_second_one(
+        self, runner, tmp_config, fake_ssh, fake_gh
+    ):
+        _pc_key()
+        _node_answers(
+            fake_ssh, users=("amin",), setup_extra="fail\tuser:bob\tuseradd: nope\n"
+        )
+        _gh_can_add_keys(fake_gh)
+        result = _setup(
+            runner, _pool_file(tmp_config), "second", "--user", "amin", "--user", "bob"
+        )
+        assert "no node key came back" not in result.stdout
+        assert "1 step(s) failed." in result.stdout
+
+    def test_a_doctor_that_printed_nothing_is_a_fail(
+        self, runner, tmp_config, fake_ssh, fake_gh
+    ):
+        _pc_key()
+        fake_ssh.set_reply(
+            "root@devino-second",
+            stdout="key\tamin\tssh-ed25519 AAAAAMIN magent@devino-second\n",
+        )
+        fake_ssh.set_reply("--target", stdout="")
+        _gh_can_add_keys(fake_gh)
+        result = _setup(runner, _pool_file(tmp_config), "second")
+        assert result.exit_code == 1
+        assert "the node printed no doctor rows" in result.stdout
+        assert "Ready." not in result.stdout
+
+
+class TestNodeSetupProvisionsThroughTheOneBody:
+    def test_each_user_is_provisioned_by_provision_node_forced(
+        self, runner, tmp_config, fake_ssh, fake_gh, monkeypatch
+    ):
+        # DECISION-24: setup and the bring-up share remote_mux.provision_node.
+        seen: list[tuple[str, bool]] = []
+
+        def fake(node, config, *, home, timeout_s, force=False):
+            seen.append((node.target, force))
+            return remote_mux.ProvisionReport(())
+
+        monkeypatch.setattr(remote_mux, "provision_node", fake)
+        _pc_key()
+        _node_answers(fake_ssh, users=("amin", "bob"))
+        _gh_can_add_keys(fake_gh)
+        _setup(
+            runner, _pool_file(tmp_config), "second", "--user", "amin", "--user", "bob"
+        )
+        assert seen == [("amin@devino-second", True), ("bob@devino-second", True)]
+
+    def test_provision_gets_its_own_budget_and_this_pcs_home(
+        self, runner, tmp_config, fake_ssh, fake_gh, monkeypatch
+    ):
+        seen: list[tuple[float, Path]] = []
+
+        def fake(node, config, *, home, timeout_s, force=False):
+            seen.append((timeout_s, home))
+            return remote_mux.ProvisionReport(())
+
+        monkeypatch.setattr(remote_mux, "provision_node", fake)
+        _pc_key()
+        _node_answers(fake_ssh)
+        _gh_can_add_keys(fake_gh)
+        _setup(runner, _pool_file(tmp_config), "second")
+        assert seen == [(remote_mux.PROVISION_TIMEOUT_S, Path.home())]

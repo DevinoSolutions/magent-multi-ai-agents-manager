@@ -5,6 +5,8 @@ bash on POSIX; the pool is Linux)."""
 
 from __future__ import annotations
 
+import errno
+import inspect
 import io
 import json
 import os
@@ -21,6 +23,7 @@ import pytest
 
 from magent import cli, node_scripts, nodes, remote_mux
 from magent.cli import hooks_cmd
+from magent.config import MagentConfig
 from magent.nodes import Node, UserScope
 from magent.remote_mux import ProvisionReport, RemoteError, ScriptLine
 from tests.unit._fake_ssh import FakeCall, FakeSsh, gh_auth_status, make_fake_ssh
@@ -220,7 +223,16 @@ class TestUserScopeSettingsAndMcp:
         (home / ".claude" / "settings.json").write_text("{nope", encoding="utf-8")
         scope = nodes.user_scope(home)
         assert scope.settings == {}
-        assert scope.notes == ("settings.json: not valid JSON, skipped",)
+        assert scope.unread == {
+            "settings": "JSONDecodeError",
+            "plugins": "JSONDecodeError",
+        }
+        assert scope.notes == (
+            (
+                "settings.json: could not be read (JSONDecodeError), so nothing from "
+                "it ships this time"
+            ),
+        )
 
     def test_user_mcp_servers_come_from_claude_json_alone(self, tmp_path):
         home = _pc_home(
@@ -618,7 +630,16 @@ class TestAMalformedPcFileIsANoteNotACrash:
         (home / ".claude" / "settings.json").write_bytes(b'{"model": "\xff"}')
         scope = nodes.user_scope(home)
         assert scope.settings == {}
-        assert scope.notes == ("settings.json: not valid UTF-8, skipped",)
+        assert scope.unread == {
+            "settings": "UnicodeDecodeError",
+            "plugins": "UnicodeDecodeError",
+        }
+        assert scope.notes == (
+            (
+                "settings.json: could not be read (UnicodeDecodeError), so nothing "
+                "from it ships this time"
+            ),
+        )
 
     def test_a_url_that_does_not_parse(self, tmp_path):
         home = _pc_home(
@@ -644,6 +665,234 @@ class TestAMalformedPcFileIsANoteNotACrash:
         assert scope.notes == (
             "mcpOAuth: 1 entry for servers not in mcpServers left out",
         )
+
+
+def _fail_read(
+    monkeypatch: pytest.MonkeyPatch, failing: Path, code: int, text: str
+) -> None:
+    """``failing`` raises OSError(``code``) when read, on every OS (a Windows
+    chmod does not stop a read). OSError builds the errno's subclass: EACCES
+    is a PermissionError, EIO has none and stays a plain OSError."""
+    read_text = Path.read_text
+
+    def guarded(self: Path, *args: object, **kwargs: object) -> str:
+        if self == failing:
+            raise OSError(code, text, str(self))
+        return read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded)
+
+
+# Each way a PC file that EXISTS can fail to read as a JSON object, and the
+# class -- all a screen may show of it. "empty" is a 0-byte file: unknown
+# too, never the {} that takes back what the PC shipped before.
+UNREAD = [
+    ("torn", "JSONDecodeError"),
+    ("a-list", "not a JSON object"),
+    ("empty", "JSONDecodeError"),
+    ("denied", "PermissionError"),
+    ("eio", "OSError"),
+]
+_UNREAD_TEXT = {
+    "torn": '{"env": {"FROM_PC": "x"',
+    "a-list": '[{"env": {"FROM_PC": "x"}}]',
+    "empty": "",
+}
+_READ_ERRORS = {
+    "denied": (errno.EACCES, "Permission denied"),
+    "eio": (errno.EIO, "Input/output error"),
+}
+
+
+def _damage(monkeypatch: pytest.MonkeyPatch, path: Path, how: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if how in _UNREAD_TEXT:
+        path.write_text(_UNREAD_TEXT[how], encoding="utf-8")
+    else:
+        path.write_text("{}", encoding="utf-8")
+        _fail_read(monkeypatch, path, *_READ_ERRORS[how])
+
+
+class TestAnUnreadablePcFileIsUnknownNotEmpty:
+    """A PC file that exists but does not read as a JSON object is UNKNOWN:
+    the steps it feeds are marked unread (the node leaves its copy alone),
+    never shipped as empty -- an empty settings.json takes back everything
+    the PC shipped last time. The screen gets the class; the path and the
+    error text go to the log only."""
+
+    @pytest.mark.parametrize(("how", "why"), UNREAD)
+    def test_settings_json_marks_the_settings_and_the_plugins_unread(
+        self, tmp_path, monkeypatch, caplog, how, why
+    ):
+        home = _pc_home(tmp_path)
+        path = home / ".claude" / "settings.json"
+        _damage(monkeypatch, path, how)
+        caplog.set_level("WARNING")
+        scope = nodes.user_scope(home)
+        assert scope.unread == {"settings": why, "plugins": why}
+        assert scope.notes == (
+            (
+                f"settings.json: could not be read ({why}), so nothing from it ships "
+                "this time"
+            ),
+        )
+        assert str(path) in caplog.text
+
+    @pytest.mark.parametrize(("how", "why"), UNREAD)
+    def test_the_note_never_carries_the_path_or_the_error_text(
+        self, tmp_path, monkeypatch, caplog, how, why
+    ):
+        home = _pc_home(tmp_path)
+        path = home / ".claude" / "settings.json"
+        _damage(monkeypatch, path, how)
+        caplog.set_level("WARNING")
+        scope = nodes.user_scope(home)
+        shown = " ".join(scope.notes)
+        assert str(home) not in shown
+        for detail in (
+            "Permission denied",
+            "Input/output error",
+            "Expecting",
+            "line 1",
+            "list",
+        ):
+            assert detail not in shown
+        # ... and the log has what the screen does not.
+        detail = {
+            "torn": "line 1",
+            "a-list": "list",
+            "empty": "line 1",
+            "denied": "Permission denied",
+            "eio": "Input/output error",
+        }
+        assert detail[how] in caplog.text
+
+    @pytest.mark.parametrize(("how", "why"), UNREAD)
+    def test_the_read_answers_the_class_and_never_raises(
+        self, tmp_path, monkeypatch, how, why
+    ):
+        path = tmp_path / "settings.json"
+        _damage(monkeypatch, path, how)
+        notes: list[str] = []
+        try:
+            found: object = nodes._read_object(path, "settings.json", notes)
+        except (OSError, ValueError) as e:  # a raise is this pin's FAILURE
+            found = e
+        assert found == nodes._Unread(why)
+
+    def test_a_file_nested_too_deep_to_parse_is_unread_never_raised(self, tmp_path):
+        # json raises RecursionError -- not a ValueError -- on nesting deeper
+        # than it can parse; provisioning must not die on a PC file.
+        path = tmp_path / "settings.json"
+        path.write_text("[" * 100_000, encoding="utf-8")
+        notes: list[str] = []
+        try:
+            found: object = nodes._read_object(path, "settings.json", notes)
+        except RecursionError as e:  # a raise is this pin's FAILURE
+            found = e
+        assert found == nodes._Unread("RecursionError")
+        assert notes == [
+            (
+                "settings.json: could not be read (RecursionError), so nothing "
+                "from it ships this time"
+            )
+        ]
+
+    @pytest.mark.parametrize("text", ["[1]", '"x"', "null", "3"])
+    def test_a_top_level_that_is_not_an_object_is_unread(self, tmp_path, text):
+        path = tmp_path / "settings.json"
+        path.write_text(text, encoding="utf-8")
+        notes: list[str] = []
+        found = nodes._read_object(path, "settings.json", notes)
+        assert found == nodes._Unread("not a JSON object")
+
+    def test_an_absent_file_reads_as_empty(self, tmp_path):
+        notes: list[str] = []
+        found = nodes._read_object(tmp_path / "settings.json", "settings.json", notes)
+        assert found == {}
+        assert notes == []
+
+    def test_an_absent_settings_file_is_still_empty_not_unread(self, tmp_path):
+        scope = nodes.user_scope(_pc_home(tmp_path, claude_json={}))
+        assert scope.unread == {}
+        assert scope.notes == ()
+
+    @pytest.mark.parametrize(("how", "why"), UNREAD)
+    def test_claude_json_marks_the_servers_and_their_oauth_unread(
+        self, tmp_path, monkeypatch, how, why
+    ):
+        # With the server list unknown, an OAuth entry is not "for a server
+        # not in mcpServers": no such note.
+        home = _pc_home(
+            tmp_path,
+            credentials={"mcpOAuth": {"docs|0": {"serverName": "docs"}}},
+        )
+        _damage(monkeypatch, home / ".claude.json", how)
+        scope = nodes.user_scope(home)
+        assert scope.unread == {"mcp": why, "mcp_oauth": why}
+        assert scope.mcp_oauth == {}
+        assert scope.notes == (
+            (
+                f".claude.json: could not be read ({why}), so nothing from it ships "
+                "this time"
+            ),
+        )
+
+    @pytest.mark.parametrize(("how", "why"), UNREAD)
+    def test_the_credentials_file_marks_the_oauth_entries_unread(
+        self, tmp_path, monkeypatch, how, why
+    ):
+        home = _pc_home(
+            tmp_path,
+            claude_json={
+                "mcpServers": {"docs": {"type": "http", "url": "https://d.example"}}
+            },
+        )
+        _damage(monkeypatch, home / ".claude" / ".credentials.json", how)
+        scope = nodes.user_scope(home)
+        assert scope.unread == {"mcp_oauth": why}
+        assert set(scope.mcp_servers) == {"docs"}
+
+    @pytest.mark.parametrize(("how", "why"), UNREAD)
+    def test_the_marketplace_list_marks_the_plugins_unread(
+        self, tmp_path, monkeypatch, how, why
+    ):
+        # With the list unknown, a marketplace is not "without a remote
+        # source on this PC": no such note, and no source guessed.
+        home = _pc_home(tmp_path, settings={"enabledPlugins": {"p@mkt": True}})
+        _damage(
+            monkeypatch, home / ".claude" / "plugins" / "known_marketplaces.json", how
+        )
+        scope = nodes.user_scope(home)
+        assert scope.unread == {"plugins": why}
+        assert scope.marketplaces == {}
+        assert scope.notes == (
+            (
+                f"plugins/known_marketplaces.json: could not be read ({why}), so "
+                "nothing from it ships this time"
+            ),
+        )
+
+    def test_unread_settings_travel_as_no_member_and_a_manifest_mark(self):
+        scope = _scope(unread={"settings": "PermissionError"})
+        _, infos, data = _unpack(_payload(scope))
+        assert "settings.json" not in infos
+        manifest = json.loads(data["manifest.json"])
+        assert manifest["unread"] == {"settings": "PermissionError"}
+
+    def test_a_readable_scope_ships_its_settings_and_marks_nothing(self):
+        _, _, data = _unpack(_payload(_scope(settings={"model": "opus"})))
+        assert json.loads(data["settings.json"]) == {"model": "opus"}
+        assert json.loads(data["manifest.json"])["unread"] == {}
+
+    def test_a_dropped_program_keeps_the_unread_mark(self):
+        scope = _scope(
+            mcp_servers={"s": {"type": "stdio", "command": "uvx s"}},
+            unread={"settings": "JSONDecodeError"},
+        )
+        kept = nodes.without_missing_programs(scope, found=frozenset())
+        assert kept.mcp_servers == {}
+        assert kept.unread == {"settings": "JSONDecodeError"}
 
 
 class TestUserScopePluginsAndSkills:
@@ -4020,3 +4269,64 @@ class TestDoctorCall:
             NODE.target,
         )
         assert shown[-1] == f"<stdin: {len(call.stdin)} bytes>"
+
+
+class TestProvisionNode:
+    def test_it_ships_the_scope_it_builds_from_home(self, fake_ssh, tmp_path):
+        home = _pc_home(tmp_path, settings={"model": "opus"})
+        remote_mux.provision_node(
+            NODE,
+            MagentConfig(projects=[]),
+            home=home,
+            timeout_s=remote_mux.PROVISION_TIMEOUT_S,
+        )
+        (call,) = fake_ssh.calls()
+        assert call.argv[-1] == _remote("bash", "-s", "--", remote_mux.SOCKET)
+        _, _, data = _unpack(_sent(call))
+        assert json.loads(data["settings.json"]) == {"model": "opus"}
+
+    def test_force_reaches_the_script(self, fake_ssh, tmp_path):
+        remote_mux.provision_node(
+            NODE,
+            MagentConfig(projects=[]),
+            home=_pc_home(tmp_path),
+            timeout_s=remote_mux.PROVISION_TIMEOUT_S,
+            force=True,
+        )
+        (call,) = fake_ssh.calls()
+        assert call.argv[-1] == _remote(
+            "bash", "-s", "--", remote_mux.SOCKET, "--force"
+        )
+
+    def test_the_timeout_is_mandatory(self, fake_ssh, tmp_path):
+        # fake_ssh: were the timeout ever given a default, the call must go
+        # through and fail "DID NOT RAISE", not stop at the refused real ssh.
+        with pytest.raises(TypeError, match="timeout_s"):
+            remote_mux.provision_node(
+                NODE, MagentConfig(projects=[]), home=_pc_home(tmp_path)
+            )
+
+    def test_the_callers_timeout_reaches_provision(self, monkeypatch, tmp_path):
+        seen: list[float] = []
+
+        def provision(node, user_scope, *, timeout_s, force=False):
+            seen.append(timeout_s)
+            return remote_mux.ProvisionReport(())
+
+        monkeypatch.setattr(remote_mux, "provision", provision)
+        remote_mux.provision_node(
+            NODE, MagentConfig(projects=[]), home=_pc_home(tmp_path), timeout_s=123.0
+        )
+        assert seen == [123.0]
+
+    def test_src_builds_a_user_scope_in_exactly_one_place(self):
+        # DECISION-24. Plan K deletes this pin and adds its own when it swaps
+        # the line for mcp_relay.node_user_scope(config.settings, home).
+        src = Path(remote_mux.__file__).parent
+        hits = [
+            (path.relative_to(src).as_posix(), text.count("nodes.user_scope("))
+            for path in sorted(src.rglob("*.py"))
+            if "nodes.user_scope(" in (text := path.read_text(encoding="utf-8"))
+        ]
+        assert hits == [("remote_mux.py", 1)]
+        assert "nodes.user_scope(" in inspect.getsource(remote_mux.provision_node)

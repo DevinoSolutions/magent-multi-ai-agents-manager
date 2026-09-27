@@ -18,7 +18,16 @@ from typing import TYPE_CHECKING
 import pytest
 from click.testing import CliRunner
 
-from magent import attach_client, cli, launch, lockfile, node_sync, nodes, remote_mux
+from magent import (
+    attach_client,
+    cli,
+    launch,
+    lockfile,
+    node_scripts,
+    node_sync,
+    nodes,
+    remote_mux,
+)
 from magent.config import (
     SCHEMA_VERSION,
     MagentConfig,
@@ -33,6 +42,10 @@ from tests.unit._deny_stat import deny_stat
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+
+# The real body, captured before any NodeRig replaces it: the tests below put
+# it back to drive the whole chain through THE fake ssh.
+real_provision_node = remote_mux.provision_node
 
 _TOOLS = {"claude": "claude --continue"}
 # What a final pull that brought the last turn home returns: None is
@@ -92,6 +105,10 @@ class NodeRig:
         )
         monkeypatch.setattr("magent.attach_client.spawn_attach_window", self._window)
         self.error: Exception | None = None
+        self.provisioned: list[str] = []
+        self.provision_timeouts: list[float] = []
+        monkeypatch.setattr(remote_mux, "provision_node", self._provision)
+        monkeypatch.setattr(launch, "_PROVISIONED", set())
 
     def _bring_up(self, node, recipe, *, allow_dirty=False, resume_id=None):
         self.recipes.append((node.nick, recipe))
@@ -110,6 +127,11 @@ class NodeRig:
             (target, sid, mux, remote or attach_client.remote_attach_command(sid, mux))
         )
         return f"magent:{sid}"
+
+    def _provision(self, node, config, *, home, timeout_s, force=False):
+        self.provisioned.append(node.nick)
+        self.provision_timeouts.append(timeout_s)
+        return remote_mux.ProvisionReport(())
 
 
 @pytest.fixture
@@ -3150,3 +3172,155 @@ class TestABringUpKeepsTheSyncDaemonRunning:
         result = CliRunner().invoke(cli.main, ["--config", config, "up"])
         assert result.exit_code == 0, result.output
         assert seen == [str(Path(config))]
+
+
+def _web(tmp_path: Path, rig: NodeRig) -> ProjectConfig:
+    folder = tmp_path / "web"
+    folder.mkdir()
+    rig.states[folder] = _state(folder)
+    return ProjectConfig(path=str(folder), node="second")
+
+
+class TestTheBringUpProvisionsFirst:
+    def test_the_node_is_provisioned_before_the_session_comes_up(
+        self, rig, api, fake_ssh, monkeypatch
+    ):
+        from tests.unit.test_node_provision import _sent, _unpack
+
+        monkeypatch.setattr(remote_mux, "provision_node", real_provision_node)
+        # conftest points the home at tmp: the scope must be built from IT.
+        settings = Path.home() / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+        seen_at_bring_up: list[int] = []
+
+        def bring_up(node, recipe, **kw):
+            seen_at_bring_up.append(len(fake_ssh.calls()))
+            return rig._bring_up(node, recipe, **kw)
+
+        monkeypatch.setattr(remote_mux, "bring_up", bring_up)
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert outcome.ok
+        assert seen_at_bring_up == [1]
+        (call,) = fake_ssh.calls()
+        assert any("devino-second" in arg for arg in call.argv)
+        # A bring-up provisions what changed; only `node setup` forces.
+        assert "--force" not in call.argv[-1]
+        assert call.stdin.startswith(node_scripts.script("provision").encode("utf-8"))
+        _, _, data = _unpack(_sent(call))
+        assert json.loads(data["settings.json"]) == {"model": "opus"}
+        assert "second" in launch._PROVISIONED
+
+    def test_provisioning_gets_its_own_budget(self, rig, api):
+        assert launch.bring_up_node_project(_config(api), api).ok
+        assert rig.provision_timeouts == [remote_mux.PROVISION_TIMEOUT_S]
+
+    def test_a_second_project_on_the_same_node_does_not_provision_again(
+        self, rig, api, fake_ssh, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(remote_mux, "provision_node", real_provision_node)
+        web = _web(tmp_path, rig)
+        config = _config(api, web)
+        assert launch.bring_up_node_project(config, api).ok
+        assert launch.bring_up_node_project(config, web).ok
+        assert len(fake_ssh.calls()) == 1
+        assert [nick for nick, _ in rig.recipes] == ["second", "second"]
+
+    def test_an_unreachable_node_fails_only_that_project_and_is_retried(
+        self, rig, api, fake_ssh, monkeypatch, tmp_path, caplog
+    ):
+        monkeypatch.setattr(remote_mux, "provision_node", real_provision_node)
+        fake_ssh.set_reply(
+            "bash -s", stderr="ssh: connect to host devino-second: No route\n", rc=255
+        )
+        web = _web(tmp_path, rig)
+        config = _config(api, web)
+        with caplog.at_level(logging.WARNING, logger="magent.nodes"):
+            outcome = launch.bring_up_node_project(config, api)
+        assert not outcome.ok
+        assert outcome.error == (
+            "provisioning: ssh: connect to host devino-second: No route"
+        )
+        assert rig.recipes == []
+        assert "second" not in launch._PROVISIONED
+        assert any(
+            message.startswith("provision @second: failed (")
+            for _, level, message in caplog.record_tuples
+            if level == logging.WARNING
+        )
+        # The node answers again: the NEXT project on it provisions, rather
+        # than taking the failed attempt as done.
+        (fake_ssh.base / "replies.json").unlink()
+        assert launch.bring_up_node_project(config, web).ok
+        assert len(fake_ssh.calls()) == 2
+        assert "second" in launch._PROVISIONED
+
+    def test_a_timed_out_provision_fails_that_project_and_is_never_retried(
+        self, rig, api, fake_ssh, monkeypatch, tmp_path, caplog
+    ):
+        # A timeout proves the node answered, but not what the apply did: it
+        # may still be running there, so a retry would start a second one.
+        attempts: list[str] = []
+
+        def provision_node(node, config, **kw):
+            attempts.append(node.nick)
+            return real_provision_node(node, config, **kw)
+
+        monkeypatch.setattr(remote_mux, "provision_node", provision_node)
+        monkeypatch.setattr(remote_mux, "PROVISION_TIMEOUT_S", 1.0)
+        fake_ssh.set_mode("timeout")
+        web = _web(tmp_path, rig)
+        config = _config(api, web)
+        with caplog.at_level(logging.WARNING, logger="magent.nodes"):
+            first = launch.bring_up_node_project(config, api)
+        assert not first.ok
+        assert first.error == "provisioning: timed out after 1s"
+        assert rig.recipes == []
+        assert "second" in launch._PROVISIONED
+        assert any(
+            message.startswith("provision @second: outcome unknown (")
+            and message.endswith("); not retrying this run")
+            for _, level, message in caplog.record_tuples
+            if level == logging.WARNING
+        )
+        # Counted at the seam: on Windows the fake's recorder is orphaned when
+        # a timeout kills it, so fake_ssh.calls() undercounts.
+        assert launch.bring_up_node_project(config, web).ok
+        assert attempts == ["second"]
+        assert [nick for nick, _ in rig.recipes] == ["second"]
+
+    def test_a_fail_row_is_logged_and_the_session_still_comes_up(
+        self, rig, api, fake_ssh, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(remote_mux, "provision_node", real_provision_node)
+        fake_ssh.set_reply(
+            "bash -s",
+            stdout=(
+                "ok\tgit\tgit 2.43\n"
+                "warn\tplugin\tmarketplace slow\n"
+                "skip\tsettings\tunchanged\n"
+                "fail\tgh\tgh is not installed\n"
+            ),
+            rc=1,
+        )
+        with caplog.at_level(logging.DEBUG, logger="magent.nodes"):
+            outcome = launch.bring_up_node_project(_config(api), api)
+        assert outcome.ok
+        assert [nick for nick, _ in rig.recipes] == ["second"]
+        assert "second" in launch._PROVISIONED
+        # Only the fail row is news; ok/warn/skip rows are node doctor's.
+        assert [
+            (logger, level, message)
+            for logger, level, message in caplog.record_tuples
+            if message.startswith("provision second:")
+        ] == [
+            (
+                "magent.nodes",
+                logging.WARNING,
+                "provision second: gh: gh is not installed",
+            )
+        ]
+
+    # D-MERGE: test_dry_run_provisions_nothing (plan F Task 12A) lands with
+    # sub-plan D's Task 12: it needs D12's `desk` / `no_sleep` fixtures and its
+    # "would provision <nick>" dry-run line, neither of which exists yet.

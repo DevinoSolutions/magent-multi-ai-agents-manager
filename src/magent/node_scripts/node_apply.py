@@ -10,7 +10,12 @@ last run that finished it cleanly -- the store is ~/.magent/provision.json.
 A step that warned or failed is not recorded, so the next provision looks
 again. The store also keeps what the settings step last shipped (env keys,
 permission rules, extra directories), so what this PC stops shipping is
-taken back from the node; a lost or damaged store takes nothing back. A
+taken back from the node; a lost or damaged store takes nothing back, and
+neither does a PC file the PC could not read (the manifest's ``unread``) or
+a payload member that does not read as a JSON object (``_member``): its
+step is a skip that writes nothing and forgets nothing. The node's own file
+is read as strictly (``_node_object``): only a MISSING one is {}; a 0-byte,
+torn or unreadable one is a warn that writes nothing and forgets nothing. A
 deliberate drop (a hook whose program this node lacks) is a clean result:
 the same payload on the same node drops it again, and ``--force`` (what
 ``magent node setup`` sends) re-looks after a tool is installed.
@@ -160,6 +165,20 @@ def _digest(ctx: Ctx, item: str) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _unread_on_pc(ctx: Ctx, step: str, what: str, left: str) -> bool:
+    """True, after one skip row, when the PC could not read the file ``step``
+    ships from (the manifest's ``unread``). Unknown is not empty: the step
+    writes nothing and forgets nothing it remembers. The row names the error
+    class the PC sent, never a path."""
+    unread = ctx.manifest.get("unread")
+    if not isinstance(unread, dict) or step not in unread:
+        return False
+    why = unread[step]
+    shown = why if isinstance(why, str) else "unknown"
+    _row(ctx, "skip", step, f"this PC's {what} could not be read ({shown}); {left}")
+    return True
+
+
 def _unchanged(ctx: Ctx, step: str, want: str) -> bool:
     return not ctx.force and ctx.store.get(step) == want
 
@@ -174,10 +193,76 @@ def _remember(ctx: Ctx, step: str, want: str, mark: int) -> None:
         ctx.store.pop(step, None)
 
 
+_NOT_AN_OBJECT = "not a JSON object"
+# The class ``_node_object`` gives a node file with no bytes, or only
+# whitespace, in place of JSONDecodeError.
+_EMPTY = "empty"
+
+
+def _member(ctx: Ctx, name: str) -> dict[str, object] | str:
+    """The payload member ``name`` as a JSON object, or the class of why it
+    is not one. Strict, unlike ``_load``: the PC always ships this member,
+    so a missing, empty or torn one is a broken payload -- unknown, never
+    the {} that reads as "this PC has none"."""
+    try:
+        loaded = json.loads((ctx.work / name).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError) as e:
+        return type(e).__name__
+    return loaded if isinstance(loaded, dict) else _NOT_AN_OBJECT
+
+
+def _node_object(path: Path) -> dict[str, object] | str:
+    """The node's own JSON file ``path`` as an object; {} when it does not
+    exist, so a write creates it. Anything else is the class of why it could
+    not be read -- ``_EMPTY`` for no bytes or only whitespace, so an empty
+    file and a torn one read differently -- or ``_NOT_AN_OBJECT``. An empty
+    or torn file is unknown: it may be a write the node's claude has in
+    flight, and merged into as {} it would be overwritten."""
+    try:
+        text = path.read_text(encoding="utf-8")
+        if not text.strip():
+            return _EMPTY
+        loaded = json.loads(text)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, RecursionError) as e:
+        return type(e).__name__
+    return loaded if isinstance(loaded, dict) else _NOT_AN_OBJECT
+
+
+def _remedy(why: str) -> str:
+    """What an unknown node file's row adds so it names what clears it. A torn
+    file is a write in flight the next provision outlasts; one that STAYS
+    empty never clears by itself."""
+    return " -- if it stays empty, remove it on the node" if why == _EMPTY else ""
+
+
+def _unread_on_node(ctx: Ctx, item: str, shown: str, why: str) -> None:
+    """The warn row for a node file ``_node_object`` could not read: the
+    class on screen, nothing written, nothing the step remembers changed."""
+    _row(
+        ctx,
+        "warn",
+        item,
+        f"{shown} on this node could not be read ({why}); left as it is, the "
+        f"next provision tries again{_remedy(why)}",
+    )
+
+
+def _unread_member(ctx: Ctx, step: str, name: str, why: str, left: str) -> None:
+    """The skip row for a payload member ``_member`` could not read: the
+    class on screen, and the step writes nothing and forgets nothing it
+    remembers -- the same outcome as a PC file the PC could not read
+    (``_unread_on_pc``)."""
+    _row(ctx, "skip", step, f"the payload's {name} could not be read ({why}); {left}")
+
+
 def _load(path: Path) -> object:
-    """A JSON file's value: {} when the file does not exist or is empty
-    (a 0-byte settings.json), None when it cannot be read (a directory
-    there, no permission) or is not JSON."""
+    """A JSON file's value: {} when the file does not exist or is empty,
+    None when it cannot be read (a directory there, no permission) or is not
+    JSON. Only for the manifest and the store, where empty and damaged both
+    fail safe; a payload member is read by ``_member``, a node file by
+    ``_node_object``."""
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -305,15 +390,17 @@ def _merge_into(
     """Merge into a JSON object file the node's claude also writes: read it,
     ``change`` it (None: nothing to write), and replace it only if it is
     still what was read -- a write that landed in between is merged again,
-    never overwritten. "did", "skip", or "fail" (its row printed here) when
-    the file is not an object, is a link to nothing, or kept changing."""
+    never overwritten. "did", "skip", "unread" when the file is there but
+    could not be read (``_node_object``: a warn row, nothing written), or
+    "fail" (its row printed here) when it is not an object, is a link to
+    nothing, or kept changing."""
     target = _target(ctx, item, path, shown, "fail")
     if target is None:
         return "fail"
     for _ in range(MERGE_TRIES):
         seen = _stamp(target)
-        node = _load(target)
-        if not isinstance(node, dict):
+        node = _node_object(target)
+        if node == _NOT_AN_OBJECT:
             _row(
                 ctx,
                 "fail",
@@ -321,6 +408,9 @@ def _merge_into(
                 f"{shown} on this node is not a JSON object; fix or remove it",
             )
             return "fail"
+        if isinstance(node, str):
+            _unread_on_node(ctx, item, shown, node)
+            return "unread"
         new = change(node)
         if new is None:
             return "skip"
@@ -737,7 +827,16 @@ def _record(shipped: dict[str, object]) -> dict[str, object]:
 def _step_settings(ctx: Ctx) -> None:
     """This PC's settings.json over the node's: the PC's keys win, the node's
     others stay unless this PC shipped them before (``_merged``), hooks are rebuilt (``_hooks``), and a
-    statusLine the node cannot run falls back to the node's own."""
+    statusLine the node cannot run falls back to the node's own. Settings the
+    PC could not read, or a payload without a readable settings.json, change
+    nothing: merged as {}, they would take back all the PC shipped before."""
+    left = "the node's settings are left as they are"
+    if _unread_on_pc(ctx, "settings", "~/.claude/settings.json", left):
+        return
+    loaded = _member(ctx, "settings.json")
+    if isinstance(loaded, str):
+        _unread_member(ctx, "settings", "settings.json", loaded, left)
+        return
     # Through a symlink (a dotfiles-managed settings.json), not over it; a
     # dangling one is left alone with a warning (``_target``).
     path = _target(
@@ -749,8 +848,8 @@ def _step_settings(ctx: Ctx) -> None:
     )
     if path is None:
         return
-    node = _load(path)
-    if not isinstance(node, dict):
+    node = _node_object(path)
+    if node == _NOT_AN_OBJECT:
         _row(
             ctx,
             "fail",
@@ -759,13 +858,15 @@ def _step_settings(ctx: Ctx) -> None:
             "fix or remove it",
         )
         return
+    if isinstance(node, str):
+        _unread_on_node(ctx, "settings", "~/.claude/settings.json", node)
+        return
     want = _digest(ctx, "settings") + ":" + _digest(ctx, "state_hook")
     wired = STATE_HOOK_MARKER in json.dumps(node.get("hooks"))
     if _unchanged(ctx, "settings", want) and wired:
         _row(ctx, "skip", "settings", "unchanged since the last provision")
         return
-    loaded = _load(ctx.work / "settings.json")
-    shipped = loaded if isinstance(loaded, dict) else {}
+    shipped = loaded
     mark = len(ctx.rows)
     perms = shipped.get("permissions")
     if isinstance(perms, dict):
@@ -810,8 +911,13 @@ def _step_mcp(ctx: Ctx) -> None:
     header, and a ``claude`` starting mid-apply reads the old file or the
     new one. The node's claude rewrites this file as it runs, so the merge
     is ``_merge_into``'s: a write of its that lands mid-apply is kept."""
-    loaded = _load(ctx.work / "mcp_servers.json")
-    servers = loaded if isinstance(loaded, dict) else {}
+    left = "the node's MCP servers are left as they are"
+    if _unread_on_pc(ctx, "mcp", "~/.claude.json", left):
+        return
+    servers = _member(ctx, "mcp_servers.json")
+    if isinstance(servers, str):
+        _unread_member(ctx, "mcp", "mcp_servers.json", servers, left)
+        return
     if not servers:
         _row(ctx, "skip", "mcp", "this PC has no user MCP servers to share")
         return
@@ -879,8 +985,20 @@ def _step_mcp_oauth(ctx: Ctx) -> None:
     next time. An entry the node already holds exactly is never rewritten,
     and the merge is ``_merge_into``'s, so a refresh the node's claude
     writes mid-apply is kept."""
-    loaded = _load(ctx.work / "mcp_oauth.json")
-    entries = loaded if isinstance(loaded, dict) else {}
+    if _unread_on_pc(
+        ctx, "mcp_oauth", "MCP OAuth entries", "the node's are left as they are"
+    ):
+        return
+    entries = _member(ctx, "mcp_oauth.json")
+    if isinstance(entries, str):
+        _unread_member(
+            ctx,
+            "mcp_oauth",
+            "mcp_oauth.json",
+            entries,
+            "the node's MCP OAuth entries are left as they are",
+        )
+        return
     # A dangling link reads as "no file": named instead, never read as a
     # node with no servers.
     listed = _target(
@@ -888,14 +1006,17 @@ def _step_mcp_oauth(ctx: Ctx) -> None:
     )
     if listed is None:
         return
-    claude_json = _load(listed)
-    if not isinstance(claude_json, dict):
+    # Strict: a 0-byte or torn ~/.claude.json is unknown, never a node with
+    # no servers (``_node_object``).
+    claude_json = _node_object(listed)
+    if isinstance(claude_json, str):
         _row(
             ctx,
             "warn",
             "mcp_oauth",
-            "~/.claude.json on this node cannot be read, so its server list is "
-            "unknown; this PC's MCP OAuth entries wait for the next provision",
+            f"~/.claude.json on this node cannot be read ({claude_json}), so its "
+            "server list is unknown; this PC's MCP OAuth entries wait for the "
+            f"next provision{_remedy(claude_json)}",
         )
         return
     servers = claude_json.get("mcpServers")
@@ -947,7 +1068,7 @@ def _step_mcp_oauth(ctx: Ctx) -> None:
         _row(ctx, "skip", "mcp_oauth", f"{len(kept)} entry(ies) unchanged on this PC")
     elif done == "did":
         _row(ctx, "did", "mcp_oauth", f"{written[0]} of {len(kept)} entry(ies)")
-    if done != "fail":
+    if done in ("did", "skip"):
         ctx.store["mcp_oauth"] = want
 
 
@@ -1135,6 +1256,8 @@ SYNCED_MARKETPLACE = "synced"
 def _step_plugins(ctx: Ctx) -> None:
     """Install this PC's enabled plugins the node lacks, at user scope. Never
     ``-y``: it would auto-accept the commands a marketplace declares."""
+    if _unread_on_pc(ctx, "plugins", "plugin list", "nothing is installed this time"):
+        return
     raw = ctx.manifest.get("plugins")
     listed = (
         [p for p in raw if isinstance(p, str) and "@" in p]

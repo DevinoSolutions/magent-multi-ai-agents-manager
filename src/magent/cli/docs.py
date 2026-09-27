@@ -481,6 +481,16 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
         ),
     ),
     (
+        "magent node setup <nick> [--user U]... [--key F]",
+        (
+            "Prepare a machine once: root is used for this one hop only, to install "
+            "packages, create a per-person user and authorize your key; the node's "
+            "own GitHub key is generated there and never leaves it. Idempotent -- "
+            "every step prints ok/did/skip. The Claude login is NOT done for you: "
+            "run `ssh <user>@<host> claude` once."
+        ),
+    ),
+    (
         "magent node doctor [<nick>]",
         (
             "Check a node: tmux/git/claude/gh on PATH, the Claude login, the "
