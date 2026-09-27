@@ -348,7 +348,7 @@ class TestTheFanOutWaitsOnOneDeadline:
     def _fan(self, monkeypatch, probes):
         queue = list(probes)
         monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: queue.pop(0))
-        monkeypatch.setattr(psmux, "_FAN_OUT_TIMEOUT_S", self.BUDGET_S, raising=False)
+        monkeypatch.setattr(psmux, "_FAN_OUT_TIMEOUT_S", self.BUDGET_S)
 
     def test_n_hung_probes_cost_one_budget_not_n(self, monkeypatch):
         hung = [_HungProbe() for _ in range(4)]

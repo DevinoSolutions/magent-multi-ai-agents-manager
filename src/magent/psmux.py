@@ -725,6 +725,12 @@ def pane_pids(names: list[str], psmux: str | None = None) -> dict[str, int | Non
     return out
 
 
+# The whole pane-probe fan-out's wait budget, and how long a probe that has
+# already exited may take to hand over its output once that budget is spent.
+_FAN_OUT_TIMEOUT_S = 5.0
+_FAN_OUT_DRAIN_S = 0.1
+
+
 def _display_fan_out(names: list[str], fmt: str, psmux: str | None) -> dict[str, str]:
     """``display-message -p <fmt>`` against each session's own pane, every
     probe spawned before any is read; ``""`` for any that failed.
@@ -751,13 +757,24 @@ def _display_fan_out(names: list[str], fmt: str, psmux: str | None) -> dict[str,
         except OSError:
             procs[name] = None
 
+    # ONE deadline for the whole fan-out, not one timeout per probe: the probes
+    # all run at once, so waiting a fresh timeout on each made a hung server
+    # cost N x timeout. Past it, a probe that already exited still hands over
+    # its output (a zero read budget can time out before the pipe is drained);
+    # one still running is unknown and killed unread.
+    deadline = time.monotonic() + _FAN_OUT_TIMEOUT_S
     out: dict[str, str] = {}
     for name, proc in procs.items():
         if proc is None:
             out[name] = ""
             continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 and proc.poll() is None:
+            proc.kill()
+            out[name] = ""
+            continue
         try:
-            stdout, _ = proc.communicate(timeout=5)
+            stdout, _ = proc.communicate(timeout=max(remaining, _FAN_OUT_DRAIN_S))
         except subprocess.SubprocessError:
             proc.kill()
             out[name] = ""
