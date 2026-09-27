@@ -9,6 +9,7 @@ import errno
 import inspect
 import io
 import json
+import logging
 import os
 import re
 import shlex
@@ -337,9 +338,7 @@ class TestUserScopeSettingsAndMcp:
                 "accessToken": "mcp-docs-token",
             }
         }
-        assert scope.notes == (
-            "mcpOAuth: 1 entry for servers not in mcpServers left out",
-        )
+        assert scope.notes == ("mcpOAuth: 1 entry for servers not shipped left out",)
 
     def test_the_claude_login_never_enters_the_scope(self, tmp_path):
         home = _pc_home(
@@ -351,6 +350,18 @@ class TestUserScopeSettingsAndMcp:
 
 LOCAL = "PC-local: its url is a loopback or link-local address"
 PC_PATH = "its command is a path on this PC"
+NOT_A_NAME = "its command is not a plain program name"
+
+
+def _fullwidth(text: str) -> str:
+    """``text`` in full-width forms (U+FF01..U+FF5E): a spelling NFKC folds
+    back to ASCII. Built, not typed, so no ambiguous literal sits in source."""
+    return "".join(chr(ord(c) + 0xFEE0) for c in text)
+
+
+# Invisible characters IDNA maps to nothing (nameprep table B.1).
+SHY = chr(0xAD)  # soft hyphen
+ZWSP = chr(0x200B)  # zero-width space
 
 
 class TestHowEachServerIsClassified:
@@ -398,6 +409,77 @@ class TestHowEachServerIsClassified:
             ({"type": "http"}, "an http server with no url"),
             ({"type": "http", "url": "not a url"}, "its url has no host"),
             ("npx", "not an object"),
+            # Loopback spelled the ways a resolver still accepts (inet_aton
+            # forms, a root-dot FQDN, an IPv4-mapped IPv6 address).
+            ({"type": "http", "url": "http://localhost./mcp"}, LOCAL),
+            ({"type": "http", "url": "http://127.1:9100/mcp"}, LOCAL),
+            ({"type": "http", "url": "http://0x7f000001/mcp"}, LOCAL),
+            ({"type": "http", "url": "http://2130706433/mcp"}, LOCAL),
+            ({"type": "http", "url": "http://0/mcp"}, LOCAL),
+            ({"type": "http", "url": "http://[::ffff:127.0.0.1]/mcp"}, LOCAL),
+            ({"type": "http", "url": "https://dead.beef.example/mcp"}, None),
+            # A PC path anywhere in a word, in cwd, or behind whitespace/quotes.
+            (
+                {
+                    "type": "stdio",
+                    "command": "node",
+                    "args": ["--require=C:\\x\\h.js", "s.js"],
+                },
+                PC_PATH,
+            ),
+            (
+                {
+                    "type": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "x"],
+                    "cwd": "C:\\Users\\me\\proj",
+                },
+                PC_PATH,
+            ),
+            ({"type": "stdio", "command": "node", "args": [" C:\\x.js"]}, PC_PATH),
+            ({"type": "stdio", "command": '"C:/Program Files/x.exe"'}, PC_PATH),
+            (
+                {"type": "stdio", "command": "npx", "args": ["https://x.example/a"]},
+                None,
+            ),
+            # The node's `command -v` gets the first word: it must be a name.
+            ({"type": "stdio", "command": "npx;id"}, NOT_A_NAME),
+            ({"type": "stdio", "command": "$(id)"}, NOT_A_NAME),
+            # Option syntax, a relative path (resolved against the wrong cwd on
+            # the node) and a bare dot (a shell builtin to `command -v`).
+            ({"type": "stdio", "command": "--help"}, NOT_A_NAME),
+            ({"type": "stdio", "command": "./run.sh"}, NOT_A_NAME),
+            ({"type": "stdio", "command": "bin/tool"}, NOT_A_NAME),
+            ({"type": "stdio", "command": "."}, NOT_A_NAME),
+            # An absolute POSIX path is the node's to resolve (command -v).
+            ({"type": "stdio", "command": "/usr/bin/node"}, None),
+            # Loopback behind percent-encoding or full-width characters.
+            ({"type": "http", "url": "http://%31%32%37.0.0.1:3456/mcp"}, LOCAL),
+            (
+                {"type": "http", "url": f"http://{_fullwidth('localhost')}/mcp"},
+                LOCAL,
+            ),
+            (
+                {"type": "http", "url": f"http://{_fullwidth('127')}.0.0.1/mcp"},
+                LOCAL,
+            ),
+            # The ideographic full stop, which IDNA reads as a dot.
+            (
+                {"type": "http", "url": "http://127" + chr(0x3002) + "0.0.1/mcp"},
+                LOCAL,
+            ),
+            # WHATWG (Node) reads "\" as "/" in a special-scheme url: this host
+            # is 127.0.0.1 to the client, remote.example to a naive urlsplit.
+            ({"type": "http", "url": r"http://127.0.0.1\@remote.example/mcp"}, LOCAL),
+            # Characters IDNA maps to nothing: a soft hyphen, a zero-width space.
+            ({"type": "http", "url": f"http://loc{SHY}alhost/mcp"}, LOCAL),
+            ({"type": "http", "url": f"http://lo{ZWSP}calhost/mcp"}, LOCAL),
+            ({"type": "http", "url": f"http://127.0.0.1{SHY}/mcp"}, LOCAL),
+            ({"type": "http", "url": "http://localhost../mcp"}, LOCAL),
+            ({"type": "http", "url": f"http://loc{SHY}alhost../mcp"}, LOCAL),
+            # A mapped-to-nothing character hiding a trailing dot from rstrip.
+            ({"type": "http", "url": f"http://localhost.{SHY}:1/"}, LOCAL),
+            ({"type": "http", "url": f"http://127.0.0.1.{ZWSP}:1/"}, LOCAL),
         ],
     )
     def test_the_reason_a_server_stays_behind(self, spec, reason):
@@ -441,6 +523,37 @@ class TestDroppingWhatTheNodeLacks:
         scope = _scope(mcp_servers={"x": {"type": "stdio", "command": "npx"}})
         assert nodes.without_missing_programs(scope, found=frozenset({"npx"})) == scope
 
+    def test_a_command_that_is_not_a_program_name_is_never_probed_and_never_ships(
+        self,
+    ):
+        # A scope a wrapper (plan K) built without user_scope's filter.
+        scope = _scope(
+            mcp_servers={"x": {"type": "stdio", "command": "npx;id", "env": {"K": "S"}}}
+        )
+        assert nodes.stdio_programs(scope) == {}
+        kept = nodes.without_missing_programs(scope, found=frozenset({"npx;id"}))
+        assert kept.mcp_servers == {}
+        assert kept.notes == (f"mcp x: not shipped -- {NOT_A_NAME}",)
+
+    def test_a_failed_probe_leaves_a_non_program_its_own_reason(self):
+        # F2's _NOT_A_PROGRAM met F12's unprobed note: a probe that died says
+        # nothing about a command that was never a program name.
+        scope = _scope(
+            mcp_servers={
+                "x": {"type": "stdio", "command": "npx"},
+                "y": {"type": "stdio", "command": "npx;id"},
+            }
+        )
+        kept = nodes.without_missing_programs(scope, found=frozenset(), unprobed=True)
+        assert kept.mcp_servers == {}
+        assert kept.notes == (
+            (
+                "mcp x: not shipped -- the node's program probe failed, "
+                "so `npx` is unconfirmed"
+            ),
+            f"mcp y: not shipped -- {NOT_A_NAME}",
+        )
+
 
 # One decoy per credential shape the Claude login can take (D5): an API key, an
 # OAuth access token, an OAuth refresh token. Every test below plants them
@@ -448,30 +561,109 @@ class TestDroppingWhatTheNodeLacks:
 API_DECOY = "sk-ant-api03-DECOY-API"
 OAT_DECOY = "sk-ant-oat01-DECOY-OAT"
 ORT_DECOY = "sk-ant-ort01-DECOY-ORT"
+# Every settings.env / MCP env name that never ships: the Anthropic credential
+# variables, plus the switches and tokens of a non-Anthropic backend.
+BACKEND_ENV = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_VERTEX",
+)
 
 
 class TestTheClaudeLoginNeverShipsUnderAnyName:
-    """The key-name rules (NEVER_SHIPPED_*) cannot see a Claude credential
-    pasted under another name. It is matched by VALUE wherever it sits, and
-    every ANTHROPIC_* entry in settings.env stays behind by name."""
+    """The key-name rule (NEVER_SHIPPED_ENV: exact names) cannot see a Claude
+    credential pasted under another name, so it is also matched by VALUE
+    wherever it sits. Every other ANTHROPIC_* / CLAUDE_* env entry is user
+    configuration and ships by name."""
 
-    def test_every_anthropic_env_entry_stays_behind(self, tmp_path):
+    def test_only_the_named_credential_env_entries_stay_behind(self, tmp_path):
         home = _pc_home(
             tmp_path,
             settings={
                 "env": {
                     "ANTHROPIC_BASE_URL": "https://gateway.example",
+                    "ANTHROPIC_MODEL": "opus",
+                    "CLAUDE_CODE_OAUTH_TOKEN": "t",
                     "ANTHROPIC_CUSTOM_HEADERS": "Authorization: Bearer x",
                     "KEEP": "1",
                 }
             },
         )
         scope = nodes.user_scope(home)
+        assert scope.settings == {
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://gateway.example",
+                "ANTHROPIC_MODEL": "opus",
+                "KEEP": "1",
+            }
+        }
+        assert scope.notes == (
+            "settings.env.ANTHROPIC_CUSTOM_HEADERS: never shipped",
+            "settings.env.CLAUDE_CODE_OAUTH_TOKEN: never shipped",
+        )
+
+    def test_the_deny_lists_are_exactly_these(self):
+        assert frozenset(BACKEND_ENV) == nodes.NEVER_SHIPPED_ENV
+        assert nodes.NEVER_SHIPPED_SETTINGS == (
+            "apiKeyHelper",
+            "awsAuthRefresh",
+            "awsCredentialExport",
+        )
+
+    def test_a_non_anthropic_backend_never_overrides_the_nodes_login(self, tmp_path):
+        # Bedrock/Vertex/Foundry switches and their tokens hold no sk-ant value,
+        # so only the name rule can keep them here (spec §7, D5).
+        home = _pc_home(
+            tmp_path,
+            settings={
+                "awsAuthRefresh": "aws sso login",
+                "awsCredentialExport": "~/bin/creds.sh",
+                "env": dict.fromkeys(BACKEND_ENV, "x") | {"KEEP": "1"},
+            },
+        )
+        scope = nodes.user_scope(home)
         assert scope.settings == {"env": {"KEEP": "1"}}
         assert scope.notes == (
-            "settings.env.ANTHROPIC_BASE_URL: never shipped",
-            "settings.env.ANTHROPIC_CUSTOM_HEADERS: never shipped",
+            "settings.awsAuthRefresh: never shipped",
+            "settings.awsCredentialExport: never shipped",
+            *(f"settings.env.{name}: never shipped" for name in sorted(BACKEND_ENV)),
         )
+
+    @pytest.mark.parametrize("name", BACKEND_ENV)
+    def test_an_mcp_server_carrying_a_named_credential_in_its_env_stays_behind(
+        self, name
+    ):
+        spec = {"type": "stdio", "command": "npx", "env": {name: "gateway-token"}}
+        assert nodes.mcp_skip_reason(spec) == "it holds a Claude credential"
+
+    def test_a_named_credential_in_a_pc_bound_servers_env_keeps_the_transport_reason(
+        self,
+    ):
+        spec = {
+            "type": "stdio",
+            "command": "C:\\x\\srv.exe",
+            "env": {"ANTHROPIC_AUTH_TOKEN": "gateway-token"},
+        }
+        assert nodes.mcp_skip_reason(spec) == PC_PATH
+
+    def test_an_env_name_holding_the_marker_is_never_echoed(self, tmp_path):
+        # A decoy NAME with a benign value: the value rule reads keys too, so
+        # the entry stays behind -- and no note ever spells the name out.
+        home = _pc_home(
+            tmp_path, settings={"env": {"ANTHROPIC_sk-ant-abc": "1", "KEEP": "1"}}
+        )
+        scope = nodes.user_scope(home)
+        assert scope.settings == {"env": {"KEEP": "1"}}
+        assert scope.notes == (
+            "settings.env.(a name holding one): holds a Claude credential, never shipped",
+        )
+        assert "sk-ant-" not in "\n".join(scope.notes)
 
     def test_a_credential_value_in_settings_goes_wherever_it_sits(self, tmp_path):
         home = _pc_home(
@@ -531,6 +723,32 @@ class TestTheClaudeLoginNeverShipsUnderAnyName:
     def test_an_mcp_server_holding_one_stays_behind(self, spec):
         assert nodes.mcp_skip_reason(spec) == "it holds a Claude credential"
 
+    @pytest.mark.parametrize(
+        ("spec", "reason"),
+        [
+            (
+                {
+                    "type": "http",
+                    "url": "http://127.0.0.1:9100/mcp",
+                    "headers": {"x-api-key": API_DECOY},
+                },
+                LOCAL,
+            ),
+            (
+                {
+                    "type": "stdio",
+                    "command": "C:\\x\\srv.exe",
+                    "env": {"ANTHROPIC_API_KEY": API_DECOY},
+                },
+                PC_PATH,
+            ),
+        ],
+    )
+    def test_the_transport_reason_wins_over_the_credential_one(self, spec, reason):
+        # The credential check runs LAST: plan K's relay keys on the loopback
+        # reason, and the server stays on this PC either way.
+        assert nodes.mcp_skip_reason(spec) == reason
+
     def test_that_server_and_its_oauth_never_enter_the_scope(self, tmp_path):
         home = _pc_home(
             tmp_path,
@@ -561,7 +779,7 @@ class TestTheClaudeLoginNeverShipsUnderAnyName:
         }
         assert scope.notes == (
             "mcp llm: not shipped -- it holds a Claude credential",
-            "mcpOAuth: 1 entry for servers not in mcpServers left out",
+            "mcpOAuth: 1 entry for servers not shipped left out",
         )
         assert "DECOY" not in repr(scope)
 
@@ -598,6 +816,15 @@ class TestTheClaudeLoginNeverShipsUnderAnyName:
                     "OTHER": ORT_DECOY,
                 },
                 "permissions": {"allow": [f"Bash(curl -H {API_DECOY})"]},
+                "statusLine": {"type": "command", "command": f"s {ORT_DECOY}"},
+                "hooks": {
+                    "Stop": [
+                        {"hooks": [{"type": "command", "command": f"h {OAT_DECOY}"}]}
+                    ],
+                    f"Ev{API_DECOY}": [
+                        {"hooks": [{"type": "command", "command": "x"}]}
+                    ],
+                },
             },
             claude_json={
                 "oauthAccount": {"accessToken": OAT_DECOY},
@@ -610,17 +837,177 @@ class TestTheClaudeLoginNeverShipsUnderAnyName:
                         "headers": {"k": OAT_DECOY},
                     },
                     "b": {"type": "stdio", "command": "uvx", "env": {"T": ORT_DECOY}},
+                    "c": {"type": "http", "url": f"https://c.example/?k={API_DECOY}"},
+                    "d": {"type": "stdio", "command": "npx", "args": [OAT_DECOY]},
+                    f"srv-{ORT_DECOY}": {"type": "http", "url": "https://n.example"},
+                    "clean": {"type": "http", "url": "https://clean.example"},
                 },
                 "projects": {"C:/x": {"mcpServers": {"p": {"env": {"K": API_DECOY}}}}},
             },
             credentials={
                 "claudeAiOauth": CLAUDE_OAUTH_DECOY,
-                "mcpOAuth": {"a|0": {"serverName": "a", "accessToken": OAT_DECOY}},
+                "mcpOAuth": {
+                    "a|0": {"serverName": "a", "accessToken": OAT_DECOY},
+                    f"clean|{OAT_DECOY}": {"serverName": "clean", "accessToken": "ok"},
+                },
             },
         )
         scope = nodes.user_scope(home)
+        # Not vacuous: the one clean server still ships.
+        assert scope.mcp_servers == {
+            "clean": {"type": "http", "url": "https://clean.example"}
+        }
+        assert scope.mcp_oauth == {}
         assert "DECOY" not in repr(scope)
         assert "sk-ant-" not in repr(scope)
+        assert "sk-ant-" not in "\n".join(scope.notes)
+        assert (
+            "mcp (a name holding one): not shipped -- it holds a Claude credential"
+            in (scope.notes)
+        )
+        assert "mcpOAuth clean: holds a Claude credential, never shipped" in (
+            scope.notes
+        )
+
+    def test_an_oauth_entry_for_another_url_stays_behind(self, tmp_path):
+        # Same server name, a different issuer's url: a stale token, never shipped.
+        home = _pc_home(
+            tmp_path,
+            claude_json={
+                "mcpServers": {
+                    "docs": {"type": "http", "url": "https://docs.example/mcp"}
+                }
+            },
+            credentials={
+                "mcpOAuth": {
+                    "docs|0": {
+                        "serverName": "docs",
+                        "serverUrl": "https://old.example/mcp",
+                    },
+                    "docs|1": {
+                        "serverName": "docs",
+                        "serverUrl": "https://docs.example/mcp",
+                    },
+                }
+            },
+        )
+        scope = nodes.user_scope(home)
+        assert scope.mcp_oauth == {
+            "docs|1": {"serverName": "docs", "serverUrl": "https://docs.example/mcp"}
+        }
+        assert scope.notes == ("mcpOAuth docs: issued for another url, left out",)
+
+    def test_several_stale_entries_for_one_server_are_one_note(self, tmp_path):
+        home = _pc_home(
+            tmp_path,
+            claude_json={
+                "mcpServers": {
+                    "docs": {"type": "http", "url": "https://docs.example/mcp"}
+                }
+            },
+            credentials={
+                "mcpOAuth": {
+                    f"docs|{i}": {
+                        "serverName": "docs",
+                        "serverUrl": f"https://old{i}.example/mcp",
+                    }
+                    for i in range(2)
+                }
+            },
+        )
+        scope = nodes.user_scope(home)
+        assert scope.mcp_oauth == {}
+        assert scope.notes == (
+            "mcpOAuth docs: issued for another url, left out (2 entries)",
+        )
+
+
+# settings.env entries naming an endpoint: shipped as configured when remote,
+# held back when they point at this PC (on the node, 127.0.0.1 is the NODE --
+# claude would send the node user's own bearer to whoever binds that port).
+ENDPOINT_ENV = (
+    "ALL_PROXY",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+)
+
+
+class TestAnEndpointThatPointsAtThisPcNeverShips:
+    def test_the_endpoint_names_are_exactly_these(self):
+        assert frozenset(ENDPOINT_ENV) == nodes.PC_ENDPOINT_ENV
+
+    @pytest.mark.parametrize("name", ENDPOINT_ENV)
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "http://127.0.0.1:3456",
+            "http://localhost.:3456",
+            "http://127.1:3456",
+            "http://%31%32%37.0.0.1:3456",
+            f"http://{_fullwidth('localhost')}:3456",
+            "127.0.0.1:8080",
+            "  127.0.0.1:3456",
+            "http://localhost..:3456",
+            r"http://127.0.0.1\@remote.example",
+            r"127.0.0.1\@remote.example:3128",
+            f"https://loc{SHY}alhost:3456",
+            r"ws://127.0.0.1\@remote.example",
+            r"wss://127.0.0.1\@remote.example",
+            # Not a special scheme: "\" is no separator, so the host is what
+            # follows the "@" -- here this PC.
+            r"socks5://remote.example\@127.0.0.1",
+        ],
+    )
+    def test_a_local_endpoint_stays_behind_with_a_note(self, tmp_path, name, value):
+        home = _pc_home(tmp_path, settings={"env": {name: value, "KEEP": "1"}})
+        scope = nodes.user_scope(home)
+        assert scope.settings == {"env": {"KEEP": "1"}}
+        assert scope.notes == (
+            f"settings.env.{name}: points at this PC, never shipped",
+        )
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "https://gateway.example/v1",
+            "http://10.0.0.5:4000",
+            "proxy.corp.example:3128",
+            # Not a special scheme: the "\" stays in the userinfo, and the
+            # host is remote.example.
+            r"socks5://127.0.0.1\@remote.example",
+        ],
+    )
+    def test_a_remote_endpoint_ships(self, tmp_path, value):
+        home = _pc_home(tmp_path, settings={"env": {"ANTHROPIC_BASE_URL": value}})
+        scope = nodes.user_scope(home)
+        assert scope.settings == {"env": {"ANTHROPIC_BASE_URL": value}}
+        assert scope.notes == ()
+
+    @pytest.mark.parametrize("value", ["http://[::1", "http://", "", 3456, None])
+    def test_an_endpoint_that_names_no_host_stays_behind(self, tmp_path, value):
+        home = _pc_home(tmp_path, settings={"env": {"HTTPS_PROXY": value}})
+        scope = nodes.user_scope(home)
+        assert scope.settings == {"env": {}}
+        assert scope.notes == (
+            "settings.env.HTTPS_PROXY: not a url with a host, never shipped",
+        )
+
+    def test_an_unrelated_local_url_is_the_users_own_business(self, tmp_path):
+        # Only the endpoint names are checked; any other env entry ships.
+        env = {"MY_APP_URL": "http://127.0.0.1:8000"}
+        home = _pc_home(tmp_path, settings={"env": env})
+        assert nodes.user_scope(home).settings == {"env": env}
 
 
 class TestAMalformedPcFileIsANoteNotACrash:
@@ -662,8 +1049,74 @@ class TestAMalformedPcFileIsANoteNotACrash:
         )
         scope = nodes.user_scope(home)
         assert scope.mcp_oauth == {}
+        assert scope.notes == ("mcpOAuth: 1 entry for servers not shipped left out",)
+
+    def test_a_bom_written_by_a_windows_tool_is_read_through(self, tmp_path):
+        home = _pc_home(tmp_path)
+        (home / ".claude").mkdir()
+        (home / ".claude" / "settings.json").write_bytes(
+            b'\xef\xbb\xbf{"model": "opus"}'
+        )
+        scope = nodes.user_scope(home)
+        assert scope.settings == {"model": "opus"}
+        assert scope.notes == ()
+
+    # Past the bound, the depth walk refuses it; far past it, json itself
+    # recurses out first, and that keeps its class.
+    @pytest.mark.parametrize(
+        ("depth", "why"),
+        [
+            (65, "nested deeper than 64 levels"),
+            (500, "nested deeper than 64 levels"),
+            (100_000, "RecursionError"),
+        ],
+    )
+    def test_a_file_nested_too_deep_is_refused_before_it_is_walked(
+        self, tmp_path, depth, why
+    ):
+        home = _pc_home(tmp_path)
+        (home / ".claude").mkdir()
+        (home / ".claude" / "settings.json").write_text(
+            '{"a":' * depth + "1" + "}" * depth, encoding="utf-8"
+        )
+        scope = nodes.user_scope(home)
+        assert scope.settings == {}
+        assert scope.unread == {"settings": why, "plugins": why}
         assert scope.notes == (
-            "mcpOAuth: 1 entry for servers not in mcpServers left out",
+            (
+                f"settings.json: could not be read ({why}), so nothing from it ships "
+                "this time"
+            ),
+        )
+
+    def test_nesting_at_the_limit_still_ships(self, tmp_path):
+        home = _pc_home(tmp_path)
+        (home / ".claude").mkdir()
+        (home / ".claude" / "settings.json").write_text(
+            '{"a":' * 63 + "[1]" + "}" * 63, encoding="utf-8"
+        )
+        scope = nodes.user_scope(home)
+        assert scope.notes == ()
+        assert "a" in scope.settings
+
+    def test_an_unreadable_file_without_an_os_message(self, tmp_path, monkeypatch):
+        home = _pc_home(tmp_path, settings={"model": "opus"})
+        real = type(home).read_text
+
+        def read_text(self: Path, *args: object, **kwargs: object) -> str:
+            if self.name == "settings.json":
+                raise OSError
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(type(home), "read_text", read_text)
+        scope = nodes.user_scope(home)
+        assert scope.settings == {}
+        assert scope.unread == {"settings": "OSError", "plugins": "OSError"}
+        assert scope.notes == (
+            (
+                "settings.json: could not be read (OSError), so nothing from it "
+                "ships this time"
+            ),
         )
 
 
@@ -1428,43 +1881,380 @@ class TestAnExitCodeWithoutARowStillFails:
 
 
 TOKEN = "gho_FAKE0123456789abcdefTOKEN"
+# Fake credential bodies, one per shape the scrub must know.
+FAKE_BODY = "FAKE0123456789abcdefTOKEN"
+LEGACY_HEX = "0123456789abcdef0123456789abcdef01234567"
+FAKE_JWT = "eyJGQUtFIjoxfQ.eyJGQUtFIjoyfQ.RkFLRS1TSUc"
+# A GHES-style token: no prefix, not hex -- only the token itself names it.
+PLAIN_TOKEN = "FakeGhesTokenZq7Wm2Xp9Lk4"
+GhUnavailable = remote_mux.GhUnavailable
+
+
+def _nodes_log(caplog: pytest.LogCaptureFixture) -> str:
+    """The nodes log at WARNING: where gh's words and a refusal's text go,
+    and never higher -- an ERROR record is a Sentry event (sentry.py:
+    event_level=ERROR), and one carries the class and errno only."""
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], [
+        r.getMessage() for r in caplog.records
+    ]
+    return "\n".join(
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "magent.nodes" and r.levelno == logging.WARNING
+    )
 
 
 class TestThisPcsGh:
-    def test_no_gh_is_no_account_and_no_token(self):
+    def test_no_gh_is_named_missing_for_the_account_and_the_token(self):
         # The autouse _no_real_gh guard: nothing resolved, nothing spawned.
-        assert remote_mux.local_gh_account() is None
-        assert remote_mux.local_gh_token() is None
+        account = remote_mux.local_gh_account()
+        assert account == GhUnavailable("missing")
+        assert "not installed" in account.hint
+        assert remote_mux.local_gh_token() == GhUnavailable("missing")
 
     def test_the_active_logged_in_account_is_read(self, fake_gh):
         fake_gh.set_reply(
             "auth status", stdout=gh_auth_status("amin", "repo, admin:public_key")
         )
         assert remote_mux.local_gh_account() == remote_mux.GhAccount(
-            login="amin", scopes=frozenset({"repo", "admin:public_key"})
+            login="amin",
+            scopes=frozenset({"repo", "admin:public_key"}),
+            token_source="keyring",
         )
         (call,) = fake_gh.calls()
-        assert call.argv == ["auth", "status", "--json", "hosts"]
+        # --hostname: an unreachable GHES host never spends the budget.
+        assert call.argv == [
+            "auth", "status", "--active", "--hostname", "github.com", "--json", "hosts",
+        ]  # fmt: skip
 
-    def test_an_inactive_or_failed_account_is_no_account(self, fake_gh):
+    def test_the_active_account_is_found_when_it_is_not_first(self, fake_gh):
         fake_gh.set_reply(
             "auth status",
-            stdout=json.dumps(
-                {
-                    "hosts": {
-                        "github.com": [
-                            {"active": False, "state": "success", "login": "a"},
-                            {"active": True, "state": "error", "login": "b"},
-                        ]
-                    }
-                }
+            stdout=gh_auth_status(
+                "amin", "repo", accounts=[("other", False, "success")]
             ),
         )
-        assert remote_mux.local_gh_account() is None
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, remote_mux.GhAccount)
+        assert account.login == "amin"
 
-    def test_unparseable_status_is_no_account(self, fake_gh):
+    def test_where_the_token_came_from_is_carried(self, fake_gh):
+        # A caller can say "GH_TOKEN from the environment" instead of
+        # advising a gh auth refresh that would not change it.
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status("amin", "repo", token_source="GH_TOKEN"),
+        )
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, remote_mux.GhAccount)
+        assert account.token_source == "GH_TOKEN"
+
+    @pytest.mark.parametrize(
+        ("state", "error"),
+        [
+            ("timeout", "timeout trying to log in to github.com account b"),
+            ("error", "dial tcp: lookup api.github.com: no such host"),
+        ],
+    )
+    def test_an_active_login_gh_could_not_reach_github_is_unverified(
+        self, fake_gh, state, error
+    ):
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(
+                None, accounts=[("a", False, "success"), ("b", True, state, error)]
+            ),
+        )
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, GhUnavailable)
+        assert (account.reason, account.login, account.detail) == (
+            "unverified",
+            "b",
+            error,
+        )
+        assert "network" in account.hint
+        # gh's own words are kept on the object for the log, never the hint.
+        assert error not in account.hint
+        assert "gh auth login" not in account.hint
+
+    def test_a_token_github_refused_is_rejected_not_offline(self, fake_gh):
+        # gh's state "error" also covers HTTP 401: a revoked or invalid token
+        # is not a network problem, and a rejected token never ships.
+        error = "HTTP 401: Bad credentials (https://api.github.com/)"
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(None, accounts=[("b", True, "error", error)]),
+        )
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, GhUnavailable)
+        assert (account.reason, account.login, account.detail) == (
+            "rejected",
+            "b",
+            error,
+        )
+        assert account.hint.endswith("gh auth login -h github.com")
+        assert "network" not in account.hint
+
+    # Either marker alone is a refusal: a 401 worded some other way, or "Bad
+    # credentials" without its status, must never read as offline and ship.
+    # The class is read from gh's whole words, never the kept copy: that one
+    # is capped (a marker past the cap) and masked (a Bearer eats "HTTP").
+    @pytest.mark.parametrize(
+        "error",
+        [
+            "HTTP 401: Requires authentication (https://api.github.com/)",
+            "authentication failed: Bad Credentials",
+            # One marker each, past the cap: either one read from the capped
+            # copy must fail its own case.
+            (
+                'Get "https://api.github.com/graphql": '
+                + "retrying; " * 20
+                + "HTTP 401: Requires authentication"
+            ),
+            (
+                'Get "https://api.github.com/graphql": '
+                + "retrying; " * 20
+                + "authentication failed: Bad credentials"
+            ),
+            "Bearer HTTP 401: Requires authentication",
+        ],
+        ids=[
+            "401-alone",
+            "bad-credentials-alone",
+            "past-the-cap-http401",
+            "past-the-cap-bad-credentials",
+            "bearer-prefixed",
+        ],
+    )
+    def test_each_refusal_marker_alone_is_rejected(self, fake_gh, error):
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(None, accounts=[("b", True, "error", error)]),
+        )
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, GhUnavailable)
+        assert account.reason == "rejected"
+        # Only what is kept for the log is scrubbed and capped.
+        assert account.detail == remote_mux._gh_detail(error)
+        assert len(account.detail) <= remote_mux._GH_DETAIL_MAX
+
+    @pytest.mark.parametrize(
+        "var",
+        ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"],
+    )
+    def test_a_rejected_token_from_the_environment_names_the_variable(
+        self, fake_gh, var
+    ):
+        # A re-login cannot replace a token the environment supplies.
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(
+                None,
+                accounts=[("b", True, "error", "HTTP 401: Bad credentials")],
+                token_source=var,
+            ),
+        )
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, GhUnavailable)
+        assert account.reason == "rejected"
+        assert f"the ${var} in this PC's environment is invalid" in account.hint
+        assert "gh auth login" not in account.hint
+
+    def test_gh_s_error_text_is_capped_and_token_shapes_are_scrubbed(self, fake_gh):
+        error = (
+            "HTTP 500: echo gho_SECRETSECRETSECRET123 github_pat_ABC_def9 " + "x" * 300
+        )
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(None, accounts=[("b", True, "error", error)]),
+        )
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, GhUnavailable)
+        assert "gho_SECRET" not in account.detail
+        assert "github_pat_" not in account.detail
+        assert account.detail.startswith("HTTP 500: echo <redacted> <redacted> x")
+        assert len(account.detail) == 200
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {"active": True, "state": "success", "login": ""},
+            {"active": True, "state": "success"},
+        ],
+    )
+    def test_an_active_verified_entry_with_no_login_is_a_failure(self, fake_gh, entry):
+        fake_gh.set_reply(
+            "auth status", stdout=json.dumps({"hosts": {"github.com": [entry]}})
+        )
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, GhUnavailable)
+        assert account.reason == "failed"
+
+    def test_a_gh_path_that_no_longer_exists_is_missing(self, tmp_path, monkeypatch):
+        gone = str(tmp_path / "nowhere" / "gh")
+        monkeypatch.setattr(remote_mux, "find_gh", lambda: gone)
+        assert remote_mux.local_gh_account() == GhUnavailable("missing")
+
+    def test_a_spawn_failure_s_words_are_scrubbed(self, fake_gh, monkeypatch):
+        def refuse(*_args, **_kwargs):
+            raise RemoteError(None, f"access denied near {TOKEN}", ("gh",))
+
+        monkeypatch.setattr(remote_mux, "_spawn", refuse)
+        token = remote_mux.local_gh_token()
+        assert token == GhUnavailable("failed", detail="access denied near <redacted>")
+
+    def test_a_refusal_s_words_are_scrubbed(self, fake_gh):
+        fake_gh.set_reply("auth token", stderr=f"bad token {TOKEN}\n", rc=1)
+        token = remote_mux.local_gh_token()
+        assert token == GhUnavailable("failed", detail="bad token <redacted>")
+
+    # Every credential shape gh's words could carry, not only the prefixed
+    # ones: GH_TOKEN_PATTERN admits a legacy 40-hex token, and a proxy or a
+    # remote URL can carry a password or a token as userinfo.
+    @pytest.mark.parametrize(
+        ("said", "kept"),
+        [
+            (f"bad token ghs_{FAKE_BODY}", "bad token <redacted>"),
+            (f"bad token ghu_{FAKE_BODY}", "bad token <redacted>"),
+            (f"bad token ghr_{FAKE_BODY}", "bad token <redacted>"),
+            (f"bad token {LEGACY_HEX}", "bad token <redacted>"),
+            (
+                f"Authorization: Bearer {LEGACY_HEX}",
+                "Authorization: Bearer <redacted>",
+            ),
+            (f"authorization: token {FAKE_BODY}", "authorization: token <redacted>"),
+            (
+                "Authorization: Basic dXNlcjpGQUtFLVBBU1NXT1JE",
+                "Authorization: Basic <redacted>",
+            ),
+            (f"sent Bearer {FAKE_JWT} upstream", "sent Bearer <redacted> upstream"),
+            (
+                f'Get "https://x-access-token:{LEGACY_HEX}@github.com/o/r": EOF',
+                'Get "https://<redacted>@github.com/o/r": EOF',
+            ),
+            (
+                "proxyconnect tcp: http://amin:FAKE-PASSWORD@10.1.2.3:3128: refused",
+                "proxyconnect tcp: http://<redacted>@10.1.2.3:3128: refused",
+            ),
+        ],
+        ids=[
+            "ghs",
+            "ghu",
+            "ghr",
+            "legacy-hex",
+            "bearer-header",
+            "token-header",
+            "basic-header",
+            "bare-bearer",
+            "url-token-userinfo",
+            "url-password-userinfo",
+        ],
+    )
+    def test_every_credential_shape_is_scrubbed(self, fake_gh, said, kept):
+        fake_gh.set_reply("auth token", stderr=said + "\n", rc=1)
+        assert remote_mux.local_gh_token() == GhUnavailable("failed", detail=kept)
+
+    def test_the_scrub_leaves_gh_s_plain_words_alone(self, fake_gh):
+        # Anchored on the header: a bare "token" in gh's own words ("token
+        # refresh failed") is no credential, and a URL without userinfo keeps
+        # its host.
+        said = "token refresh failed: see https://github.com/login/device"
+        fake_gh.set_reply("auth token", stderr=said + "\n", rc=1)
+        assert remote_mux.local_gh_token() == GhUnavailable("failed", detail=said)
+
+    def test_the_did_gh_run_wrapper_hands_back_the_result_or_none(self, fake_gh):
+        fake_gh.set_reply("api user", stdout="amin\n", rc=3)
+        result = remote_mux._gh(["api", "user"])
+        assert result is not None
+        assert (result.returncode, result.stdout) == (3, b"amin\n")
+        (call,) = fake_gh.calls()
+        assert call.argv == ["api", "user"]
+
+    def test_the_did_gh_run_wrapper_is_none_without_gh(self):
+        assert remote_mux._gh(["api", "user"]) is None
+
+    def test_offline_the_token_is_still_read(self, fake_gh):
+        # gh auth token reads the stored token without the network: an
+        # unverified login does not stop it from shipping.
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(None, accounts=[("b", True, "timeout")]),
+        )
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, GhUnavailable)
+        assert (account.reason, account.login) == ("unverified", "b")
+        assert remote_mux.local_gh_token() == TOKEN
+
+    def test_no_github_login_is_not_logged_in(self, fake_gh):
+        # Under --json gh exits 0 with empty hosts when nothing is logged in.
+        fake_gh.set_reply("auth status", stdout=gh_auth_status(None))
+        account = remote_mux.local_gh_account()
+        assert account == GhUnavailable("not-logged-in")
+        assert account.hint.endswith("gh auth login")
+
+    def test_only_inactive_accounts_is_not_logged_in(self, fake_gh):
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(None, accounts=[("a", False, "success")]),
+        )
+        assert remote_mux.local_gh_account() == GhUnavailable("not-logged-in")
+
+    def test_a_gh_without_json_status_is_too_old(self, fake_gh):
+        fake_gh.set_reply(
+            "auth status",
+            stderr="unknown flag: --json\n\nUsage:  gh auth status [flags]\n",
+            rc=1,
+        )
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, GhUnavailable)
+        assert account.reason == "too-old"
+        assert "2.81" in account.hint
+
+    def test_a_failed_status_with_valid_json_is_not_an_account(self, fake_gh):
+        # With --json gh always exits 0, so a non-zero exit is gh failing --
+        # whatever it printed.
+        fake_gh.set_reply(
+            "auth status", stdout=gh_auth_status("amin", "repo"), stderr="boom", rc=1
+        )
+        assert remote_mux.local_gh_account() == GhUnavailable("failed", detail="boom")
+
+    def test_unparseable_status_is_a_failure_not_a_missing_login(self, fake_gh):
         fake_gh.set_reply("auth status", stdout="not json")
-        assert remote_mux.local_gh_account() is None
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, GhUnavailable)
+        assert account.reason == "failed"
+        assert "gh auth login" not in account.hint
+
+    def test_a_gh_that_does_not_answer_is_a_timeout(self, fake_gh, monkeypatch):
+        monkeypatch.setattr(remote_mux, "GH_TIMEOUT_S", 0.5)
+        fake_gh.set_mode("timeout")
+        account = remote_mux.local_gh_account()
+        assert account == GhUnavailable("timeout")
+        assert "0.5s" in account.hint
+
+    # RemoteError says whether the call timed out; its wording is not the flag.
+    @pytest.mark.parametrize(
+        ("error", "reason"),
+        [
+            (
+                RemoteError(None, "no answer after 20s", ("gh",), timed_out=True),
+                "timeout",
+            ),
+            (RemoteError(None, "timed out after 20s", ("gh",)), "failed"),
+        ],
+        ids=["flagged-other-words", "same-words-unflagged"],
+    )
+    def test_a_timeout_is_read_from_the_flag_not_the_words(
+        self, fake_gh, monkeypatch, error, reason
+    ):
+        def spawn(*_args: object, **_kwargs: object) -> None:
+            raise error
+
+        monkeypatch.setattr(remote_mux, "_spawn", spawn)
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, GhUnavailable)
+        assert account.reason == reason
 
     def test_the_token_comes_from_gh_auth_token(self, fake_gh):
         fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
@@ -1472,17 +2262,73 @@ class TestThisPcsGh:
         (call,) = fake_gh.calls()
         assert call.argv == ["auth", "token", "--hostname", "github.com"]
 
-    def test_a_failed_token_read_is_no_token(self, fake_gh):
-        fake_gh.set_reply("auth token", stderr="no oauth token", rc=1)
-        assert remote_mux.local_gh_token() is None
+    def test_a_crlf_ended_token_is_read(self, fake_gh):
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\r\n")
+        assert remote_mux.local_gh_token() == TOKEN
 
-    def test_a_token_with_whitespace_inside_is_refused(self, fake_gh):
-        fake_gh.set_reply("auth token", stdout="two words\n")
-        assert remote_mux.local_gh_token() is None
+    def test_a_legacy_hex_token_passes(self, fake_gh):
+        legacy = "0123456789abcdef0123456789abcdef01234567"
+        fake_gh.set_reply("auth token", stdout=legacy + "\n")
+        assert remote_mux.local_gh_token() == legacy
 
-    def test_the_token_never_reaches_the_log(self, fake_gh, caplog):
-        fake_gh.set_reply("auth token", stdout=TOKEN + "\n", rc=1)
-        remote_mux.local_gh_token()
+    def test_no_stored_token_is_not_logged_in(self, fake_gh):
+        fake_gh.set_reply(
+            "auth token", stderr="no oauth token found for github.com\n", rc=1
+        )
+        assert remote_mux.local_gh_token() == GhUnavailable(
+            "not-logged-in", detail="no oauth token found for github.com"
+        )
+
+    def test_gh_s_other_logged_out_wording_is_not_logged_in(self, fake_gh):
+        said = "You are not logged into any GitHub hosts. To log in, run: gh auth login"
+        fake_gh.set_reply("auth token", stderr=said + "\n", rc=1)
+        assert remote_mux.local_gh_token() == GhUnavailable(
+            "not-logged-in", detail=said
+        )
+
+    def test_a_failed_token_read_with_a_token_on_stdout_is_not_shipped(self, fake_gh):
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n", stderr="boom", rc=1)
+        token = remote_mux.local_gh_token()
+        assert isinstance(token, GhUnavailable)
+        assert TOKEN not in repr(token)
+
+    @pytest.mark.parametrize(
+        "stdout",
+        [
+            "two words\n",
+            "﻿" + TOKEN + "\n",  # a BOM
+            TOKEN[:10] + "\x01" + TOKEN[10:] + "\n",  # a control character
+            " " + TOKEN + "\n",
+            TOKEN[:10] + "é" + TOKEN[10:] + "\n",  # non-ASCII
+            "warning\n",  # a stray one-word line
+            TOKEN + "\n" + TOKEN + "\n",
+        ],
+    )
+    def test_anything_but_one_token_is_refused(self, fake_gh, stdout):
+        fake_gh.set_reply("auth token", stdout=stdout)
+        token = remote_mux.local_gh_token()
+        assert token == GhUnavailable(
+            "failed", detail="gh auth token printed something that is not a token"
+        )
+
+    @pytest.mark.parametrize(
+        ("stdout", "stderr", "rc"),
+        [
+            (TOKEN + "\n", "", 0),  # the good read
+            ("﻿" + TOKEN + "\n", "", 0),  # not a token
+            (TOKEN + "\n", f"boom {TOKEN}\n", 1),  # a failed read
+        ],
+    )
+    def test_the_token_never_reaches_the_log(self, fake_gh, caplog, stdout, stderr, rc):
+        # get_logger sets each logger's level on first use: fetch it first,
+        # then open it to DEBUG so nothing is filtered before caplog sees it.
+        remote_mux.get_logger("nodes")
+        caplog.set_level("DEBUG", logger="magent")
+        caplog.set_level("DEBUG", logger="magent.nodes")
+        fake_gh.set_reply("auth token", stdout=stdout, stderr=stderr, rc=rc)
+        result = remote_mux.local_gh_token()
+        if rc != 0:
+            assert TOKEN not in repr(result)
         assert TOKEN not in caplog.text
 
 
@@ -1550,6 +2396,8 @@ class TestThePayload:
         assert data["node_apply.py"].decode("utf-8") == node_scripts.source(
             "node_apply.py"
         )
+        # The node's python3 runs it; a CRLF checkout must still ship LF.
+        assert b"\r" not in data["node_apply.py"]
 
     def test_the_manifest_carries_the_digests_and_what_to_install(self):
         scope = _scope(plugins=("p@mkt",), marketplaces={"mkt": "owner/mkt"})
@@ -1594,6 +2442,108 @@ class TestThePayload:
         holders = [name for name, blob in data.items() if bearer.encode() in blob]
         assert holders == ["mcp_servers.json"]
         assert infos["mcp_servers.json"].mode == 0o600
+
+
+def _two_skills(*, reverse: bool = False) -> UserScope:
+    skills = (
+        nodes.SkillFile(path="a/run.sh", data=b"#!run", executable=True),
+        nodes.SkillFile(path="b/SKILL.md", data=b"# skill", executable=False),
+    )
+    return _scope(skills=skills[::-1] if reverse else skills)
+
+
+class TestThePayloadIsDeterministic:
+    def test_the_gzip_header_carries_no_name_and_no_time(self):
+        _, _, body = _payload().partition(b"\n")
+        assert body[:2] == b"\x1f\x8b"
+        assert body[3] == 0  # FLG: no FNAME, no FEXTRA, no FCOMMENT
+        assert body[4:8] == b"\0\0\0\0"  # MTIME
+
+    def test_every_member_is_a_plain_file_stamped_zero_in_name_order(self):
+        _, infos, _ = _unpack(_payload(_two_skills()))
+        names = list(infos)
+        assert names == sorted(names)
+        for name, info in infos.items():
+            assert info.isreg(), name
+            assert (info.mtime, info.uid, info.gid, info.uname, info.gname) == (
+                0,
+                0,
+                0,
+                "",
+                "",
+            ), name
+            expected = 0o700 if name in {"state-hook.sh", "skills/a/run.sh"} else 0o600
+            assert info.mode == expected, name
+
+    def test_the_skill_order_given_does_not_change_the_bytes(self):
+        forward = _payload(_two_skills())
+        backward = _payload(_two_skills(reverse=True))
+        _, _, before = _unpack(forward)
+        _, _, after = _unpack(backward)
+        assert before["manifest.json"] == after["manifest.json"]
+        assert forward == backward
+
+
+class TestThePayloadOwnsItsFraming:
+    @pytest.mark.parametrize(
+        "token",
+        [
+            TOKEN + "\n__MAGENT_PAYLOAD__",
+            TOKEN + " x",
+            TOKEN + "\0",
+            "gho-" + "a" * 30,
+            "short_token",
+            "a" * 256,
+        ],
+    )
+    def test_a_token_the_first_line_cannot_carry_is_refused(self, token):
+        with pytest.raises(ValueError, match="cannot frame") as exc:
+            _payload(token=token)
+        assert token not in str(exc.value)
+        assert TOKEN not in str(exc.value)
+
+    def test_the_longest_and_shortest_token_still_frame(self):
+        for token in ("a" * 20, "b" * 255):
+            head, _, _ = _unpack(_payload(token=token))
+            assert head == token
+
+    def test_a_token_without_a_login_is_refused(self):
+        with pytest.raises(ValueError, match="both or neither") as exc:
+            _payload(token=TOKEN, login=None)
+        assert TOKEN not in str(exc.value)
+
+    def test_one_rule_reads_the_token_and_frames_it(self, fake_gh, monkeypatch):
+        # F6 reads, F7 frames: one constant, so what gh hands over can always
+        # be framed and nothing else is ever read.
+        monkeypatch.setattr(
+            remote_mux, "GH_TOKEN_PATTERN", re.compile(r"no_token_is_this_one")
+        )
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
+        assert remote_mux.local_gh_token() == remote_mux.GhUnavailable(
+            "failed", detail="gh auth token printed something that is not a token"
+        )
+        with pytest.raises(ValueError, match="cannot frame"):
+            _payload(token=TOKEN)
+
+    @pytest.mark.parametrize(
+        "path", ["../../.bashrc", "/etc/x", "a/./b", "a//b", "a\\b", "", "a\0b", "a/"]
+    )
+    def test_a_skill_path_that_escapes_skills_is_refused(self, path):
+        secret = b"SKILL-BYTES-DECOY"
+        scope = _scope(
+            skills=(nodes.SkillFile(path=path, data=secret, executable=False),)
+        )
+        with pytest.raises(ValueError, match="cannot be a payload member") as exc:
+            _payload(scope)
+        assert repr(path) in str(exc.value)
+        assert secret.decode() not in str(exc.value)
+
+    # A member name is UTF-8 bytes: a name with none (a lone surrogate) is
+    # refused by the one rule, before any digest tries to encode it.
+    def test_a_name_with_no_utf_8_bytes_is_no_payload_member(self):
+        assert not nodes.is_payload_skill_path("s/bad\udcff.md")
+        assert not nodes.is_payload_skill_path("\ud83d/SKILL.md")
+        assert nodes.is_payload_skill_path("s/café.md")
 
 
 # The node scripts run under the pool's bash, on Linux. macOS ships bash 3.2
@@ -1653,6 +2603,238 @@ class TestProvision:
         (call,) = fake_ssh.calls()
         assert TOKEN.encode("ascii") not in call.stdin
         assert all(c.argv[:2] != ["auth", "token"] for c in fake_gh.calls())
+
+    # F6: gh reads its stored token without the network, so a login it could
+    # not verify (offline) is still shared -- the node's own `gh auth login`
+    # checks it. A token github.com REFUSED never is.
+    def test_an_unverified_login_still_shares_its_token(self, fake_ssh, fake_gh):
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(None, accounts=[("amin", True, "timeout")]),
+        )
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        (call,) = fake_ssh.calls()
+        assert _sent(call).split(b"\n", 1)[0] == TOKEN.encode("ascii")
+        _, _, data = _unpack(_sent(call))
+        assert json.loads(data["manifest.json"])["gh_login"] == "amin"
+        # Shared, but never silently: the user sees it was not checked.
+        assert [line for line in report.lines if line.item == "gh"] == [
+            ScriptLine(
+                "warn",
+                "gh",
+                (
+                    "shared unverified -- this PC's gh could not verify its "
+                    "github.com login (offline?); if the node's gh login fails, "
+                    "check this PC's network, then retry"
+                ),
+            )
+        ]
+
+    def test_the_unverified_row_is_our_words_and_gh_s_go_to_the_log(
+        self, fake_ssh, fake_gh, caplog
+    ):
+        said = "dial tcp: lookup api.github.com: no such host"
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(None, accounts=[("amin", True, "error", said)]),
+        )
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
+        caplog.set_level("WARNING", logger="magent.nodes")
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        (row,) = [line for line in report.lines if line.item == "gh"]
+        assert row.detail == remote_mux.GH_SHARED_UNVERIFIED
+        assert row.detail.isascii()
+        assert said not in row.detail
+        assert TOKEN not in row.detail
+        assert said in _nodes_log(caplog)
+        assert TOKEN not in caplog.text
+
+    def test_the_unverified_log_line_never_carries_the_token_it_shares(
+        self, fake_ssh, fake_gh, caplog
+    ):
+        # The token is in hand here, so the line masks it by value: a shape
+        # the scrub cannot know (GHES, no prefix, not hex) is caught too.
+        said = f"dial tcp: token {PLAIN_TOKEN}: i/o timeout"
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(None, accounts=[("amin", True, "error", said)]),
+        )
+        fake_gh.set_reply("auth token", stdout=PLAIN_TOKEN + "\n")
+        caplog.set_level("WARNING", logger="magent.nodes")
+        remote_mux.provision(NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S)
+        (call,) = fake_ssh.calls()
+        assert _sent(call).split(b"\n", 1)[0] == PLAIN_TOKEN.encode("ascii")
+        assert "dial tcp: token <redacted>: i/o timeout" in _nodes_log(caplog)
+        assert PLAIN_TOKEN not in caplog.text
+
+    def test_a_rejected_login_shares_nothing_and_says_why(self, fake_ssh, fake_gh):
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(
+                None,
+                accounts=[("amin", True, "error", "HTTP 401: Bad credentials")],
+            ),
+        )
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        (call,) = fake_ssh.calls()
+        assert TOKEN.encode("ascii") not in call.stdin
+        assert _sent(call).startswith(b"\n")
+        assert all(c.argv[:2] != ["auth", "token"] for c in fake_gh.calls())
+        assert (
+            ScriptLine(
+                "warn",
+                "gh",
+                (
+                    "not shared -- github.com rejected this PC's gh login: "
+                    "gh auth login -h github.com"
+                ),
+            )
+            in report.lines
+        )
+
+    def test_a_401_without_bad_credentials_shares_nothing(self, fake_ssh, fake_gh):
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(
+                None,
+                accounts=[("amin", True, "error", "HTTP 401: Requires authentication")],
+            ),
+        )
+        fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        (call,) = fake_ssh.calls()
+        assert _sent(call).startswith(b"\n")
+        assert TOKEN.encode("ascii") not in call.stdin
+        assert [line for line in report.lines if line.item == "gh"] == [
+            ScriptLine(
+                "warn",
+                "gh",
+                (
+                    "not shared -- github.com rejected this PC's gh login: "
+                    "gh auth login -h github.com"
+                ),
+            )
+        ]
+
+    def test_a_token_read_that_fails_shares_nothing_and_says_why(
+        self, fake_ssh, fake_gh
+    ):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        fake_gh.set_reply("auth token", stdout="warning\n")
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        (call,) = fake_ssh.calls()
+        assert _sent(call).startswith(b"\n")
+        _, _, data = _unpack(_sent(call))
+        assert json.loads(data["manifest.json"])["gh_login"] is None
+        assert (
+            ScriptLine(
+                "warn", "gh", "not shared -- this PC's gh failed; see the nodes log"
+            )
+            in report.lines
+        )
+
+    # gh named a login, then gave no token for it. Two answers that disagree
+    # are never read as a plain absence: a row and a log line, whatever the
+    # token step's reason -- the silent classes are the account step's alone.
+    def test_a_named_login_whose_token_gh_cannot_find_is_never_silent(
+        self, fake_ssh, fake_gh, caplog
+    ):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        fake_gh.set_reply(
+            "auth token", stderr="no oauth token found for github.com\n", rc=1
+        )
+        caplog.set_level("WARNING", logger="magent.nodes")
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        (call,) = fake_ssh.calls()
+        assert _sent(call).startswith(b"\n")
+        assert [line for line in report.lines if line.item == "gh"] == [
+            ScriptLine(
+                "warn",
+                "gh",
+                "not shared -- gh is not logged in on this PC: gh auth login",
+            )
+        ]
+        assert (
+            "gh token not shared: this PC's gh gave not-logged-in: "
+            "no oauth token found for github.com"
+        ) in _nodes_log(caplog)
+
+    def test_a_gh_that_vanishes_after_naming_its_login_is_never_silent(
+        self, fake_ssh, fake_gh, caplog, monkeypatch
+    ):
+        # There for `gh auth status`, gone by `gh auth token`.
+        found = [fake_gh.path]
+        monkeypatch.setattr(
+            remote_mux, "find_gh", lambda: found.pop(0) if found else None
+        )
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        caplog.set_level("WARNING", logger="magent.nodes")
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        assert [c.argv[:2] for c in fake_gh.calls()] == [["auth", "status"]]
+        assert [line for line in report.lines if line.item == "gh"] == [
+            ScriptLine(
+                "warn",
+                "gh",
+                "not shared -- gh is not installed on this PC: https://cli.github.com",
+            )
+        ]
+        assert "gh token not shared: this PC's gh gave missing" in _nodes_log(caplog)
+
+    def test_an_unverified_login_whose_token_read_fails_logs_both_answers(
+        self, fake_ssh, fake_gh, caplog
+    ):
+        said = "dial tcp: lookup api.github.com: no such host"
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(None, accounts=[("amin", True, "error", said)]),
+        )
+        fake_gh.set_reply(
+            "auth token", stderr="no oauth token found for github.com\n", rc=1
+        )
+        caplog.set_level("WARNING", logger="magent.nodes")
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        assert [line for line in report.lines if line.item == "gh"] == [
+            ScriptLine(
+                "warn",
+                "gh",
+                "not shared -- gh is not logged in on this PC: gh auth login",
+            )
+        ]
+        logged = _nodes_log(caplog)
+        assert said in logged
+        assert "no oauth token found for github.com" in logged
+
+    # The node's own gh row already says "no gh login to share".
+    def test_no_gh_adds_no_row_of_this_pcs_own(self, fake_ssh):
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        assert not [line for line in report.lines if line.item == "gh"]
+
+    def test_a_logged_out_gh_adds_no_row_of_this_pcs_own(self, fake_ssh, fake_gh):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status(None))
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        assert not [line for line in report.lines if line.item == "gh"]
 
     def test_force_is_the_scripts_one_argument(self, fake_ssh):
         remote_mux.provision(
@@ -1748,6 +2930,140 @@ class TestProvision:
             in report.lines
         )
         # The verdicts come from the scope AFTER the probe (M22).
+        assert ScriptLine("ok", "scope", "mcp x: shipped") not in report.lines
+
+    # F7: build_payload refuses a skill path it cannot frame. A backslash is a
+    # legal POSIX file name and a wrapper-built scope never passed the walk:
+    # that file stays behind with a note, and the rest still ships.
+    # A lone surrogate is what os.walk hands back for a non-UTF-8 name on a
+    # POSIX PC: it has no UTF-8 bytes to become a member name.
+    @pytest.mark.parametrize(
+        "path", ["a\\b", "../../.bashrc", "/etc/x", "a//b", "s/bad\udcff.md"]
+    )
+    def test_a_skill_path_the_payload_cannot_frame_stays_behind(self, fake_ssh, path):
+        scope = _scope(
+            skills=(
+                nodes.SkillFile(path=path, data=b"BAD-DECOY", executable=False),
+                nodes.SkillFile(path="s/SKILL.md", data=b"# ok", executable=False),
+            )
+        )
+        report = remote_mux.provision(
+            NODE, scope, timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        # No apply call is a refused payload: say so by assertion, not unpack.
+        calls = fake_ssh.calls()
+        assert len(calls) == 1, report.lines
+        (apply,) = calls
+        _, _, data = _unpack(_sent(apply))
+        assert data["skills/s/SKILL.md"] == b"# ok"
+        assert all(b"BAD-DECOY" not in blob for blob in data.values())
+        assert (
+            ScriptLine(
+                "skip",
+                "scope",
+                f"skills/{path!r}: its path cannot travel to a node, not shipped",
+            )
+            in report.lines
+        )
+        assert not report.failed
+
+    @pytest.mark.skipif(
+        sys.platform != "linux", reason="a file name that is not UTF-8 needs Linux"
+    )
+    def test_a_skill_file_named_in_no_utf_8_stays_behind_alone(
+        self, fake_ssh, tmp_path
+    ):
+        home = tmp_path / "pc"
+        skill = home / ".claude" / "skills" / "deploy"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_bytes(b"# ok")
+        bad = os.fsdecode(b"bad\xff.md")
+        (skill / bad).write_bytes(b"BAD-DECOY")
+        report = remote_mux.provision(
+            NODE, nodes.user_scope(home), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        calls = fake_ssh.calls()
+        assert len(calls) == 1, report.lines
+        (apply,) = calls
+        _, _, data = _unpack(_sent(apply))
+        assert data["skills/deploy/SKILL.md"] == b"# ok"
+        assert all(b"BAD-DECOY" not in blob for blob in data.values())
+        name = "deploy/" + bad
+        assert (
+            ScriptLine(
+                "skip",
+                "scope",
+                f"skills/{name!r}: its path cannot travel to a node, not shipped",
+            )
+            in report.lines
+        )
+        assert not report.failed
+
+    def test_a_payload_refused_on_this_pc_is_a_fail_row_not_an_exception(
+        self, fake_ssh, monkeypatch, caplog
+    ):
+        # The last line of defence, reached here through a token gh could
+        # never have handed over: nothing is sent, and the bring-up goes on.
+        # The row is our words and the class; the refusal's own is logged.
+        caplog.set_level("WARNING", logger="magent.nodes")
+        monkeypatch.setattr(
+            remote_mux, "_gh_to_share", lambda: ("amin", TOKEN + " x", ())
+        )
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        assert fake_ssh.calls() == []
+        assert report.lines == (
+            ScriptLine(
+                "fail",
+                "payload",
+                "not sent -- this PC refused the payload (ValueError); "
+                "see the nodes log",
+            ),
+        )
+        assert "gh token has characters the payload cannot frame" in _nodes_log(caplog)
+        assert TOKEN not in repr(report)
+        assert TOKEN not in caplog.text
+
+    def test_a_payload_that_cannot_be_encoded_is_a_class_only_row(
+        self, fake_ssh, caplog
+    ):
+        # A real lone surrogate -- json reads "\ud83d" into one -- has no
+        # UTF-8 bytes to digest: the refusal's text stays off the row.
+        caplog.set_level("WARNING", logger="magent.nodes")
+        report = remote_mux.provision(
+            NODE,
+            _scope(settings={"x": "\ud83d"}),
+            timeout_s=remote_mux.PROVISION_TIMEOUT_S,
+        )
+        assert fake_ssh.calls() == []
+        (row,) = [line for line in report.lines if line.item == "payload"]
+        assert row == ScriptLine(
+            "fail",
+            "payload",
+            "not sent -- this PC refused the payload (UnicodeEncodeError); "
+            "see the nodes log",
+        )
+        assert "surrogates not allowed" in _nodes_log(caplog)
+
+    def test_a_scope_whose_only_stdio_command_is_no_program_never_ships_it(
+        self, fake_ssh
+    ):
+        # A scope a wrapper (plan K) built without user_scope's filter: there
+        # is nothing to probe, and the server still stays behind.
+        spec = {"type": "stdio", "command": "npx;id", "env": {"K": "ENV-DECOY"}}
+        report = remote_mux.provision(
+            NODE,
+            _scope(mcp_servers={"x": spec}),
+            timeout_s=remote_mux.PROVISION_TIMEOUT_S,
+        )
+        (apply,) = fake_ssh.calls()
+        _, _, data = _unpack(_sent(apply))
+        assert json.loads(data["mcp_servers.json"]) == {}
+        assert all(b"ENV-DECOY" not in blob for blob in data.values())
+        assert ScriptLine("skip", "scope", f"mcp x: not shipped -- {NOT_A_NAME}") in (
+            report.lines
+        )
         assert ScriptLine("ok", "scope", "mcp x: shipped") not in report.lines
 
     # M3: a probe that died (a node whose shell profile breaks `set -u`) is not
@@ -2043,6 +3359,34 @@ def _rows(result: subprocess.CompletedProcess[bytes]) -> dict[str, str]:
     return {line.item: line.status for line in report.lines}
 
 
+def _with_members(payload: bytes, *extra: tarfile.TarInfo) -> bytes:
+    """``payload`` re-packed with ``extra`` appended -- members build_payload
+    itself never writes (it refuses such a path), as a hostile or broken PC
+    could send. A regular-file member carries its own name as its bytes."""
+    head, _, body = payload.partition(b"\n")
+    out = io.BytesIO()
+    with (
+        tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as old,
+        tarfile.open(fileobj=out, mode="w:gz") as new,
+    ):
+        for info in old.getmembers():
+            new.addfile(info, old.extractfile(info))
+        for info in extra:
+            data = info.name.encode("utf-8") if info.isfile() else b""
+            info.size = len(data)
+            new.addfile(info, io.BytesIO(data))
+    return head + b"\n" + out.getvalue()
+
+
+def _member(name: str, *, link: str | None = None) -> tarfile.TarInfo:
+    info = tarfile.TarInfo(name)
+    info.mode = 0o600
+    if link is not None:
+        info.type = tarfile.SYMTYPE
+        info.linkname = link
+    return info
+
+
 @POSIX_BASH
 class TestProvisionShUnderRealBash:
     def test_an_empty_pc_provisions_with_no_tool_on_the_node(self, tmp_path):
@@ -2115,6 +3459,48 @@ class TestProvisionShUnderRealBash:
     def test_the_private_work_dir_is_gone_afterwards(self, tmp_path):
         _run_provision(tmp_path, _node_payload())
         assert list((tmp_path / "tmp").iterdir()) == []
+
+    # The receiver's own guard on the skills it unpacks (tri-F ruling 5):
+    # build_payload refuses such a path, but the node cannot assume the
+    # payload was built by it.
+    def test_a_member_that_climbs_out_of_the_work_dir_is_never_unpacked(self, tmp_path):
+        # GNU tar refuses a ".." member by default and exits non-zero, so the
+        # whole payload fails before the applier runs.
+        payload = _with_members(_node_payload(), _member("skills/../../escape.txt"))
+        r = _run_provision(tmp_path, payload)
+        assert r.returncode == 1
+        assert _rows(r) == {"payload": "fail"}
+        assert not list(tmp_path.rglob("escape.txt"))
+
+    def test_a_link_member_in_skills_is_never_read_through(self, tmp_path):
+        # tar does extract a lone link member; the applier refuses it, so the
+        # node's own file is never copied into ~/.claude/skills.
+        node = tmp_path / "node"
+        node.mkdir()
+        (node / "decoy.txt").write_bytes(b"NODE-PRIVATE\n")
+        scope = _scope(
+            skills=(nodes.SkillFile(path="s/SKILL.md", data=b"# s", executable=False),)
+        )
+        payload = _with_members(
+            _node_payload(scope),
+            _member("skills/s/leak.md", link=str(node / "decoy.txt")),
+        )
+        r = _run_provision(tmp_path, payload)
+        assert r.returncode == 1
+        assert _rows(r)["skills"] == "fail"
+        assert "the payload's skills/s/leak.md is a link" in r.stdout.decode("utf-8")
+        assert not (node / ".claude" / "skills").exists()
+        assert (node / "decoy.txt").read_bytes() == b"NODE-PRIVATE\n"
+
+    def test_a_skills_root_that_is_a_link_is_never_walked(self, tmp_path):
+        private = tmp_path / "node" / "private"
+        private.mkdir(parents=True)
+        (private / "secret.md").write_bytes(b"NODE-PRIVATE\n")
+        payload = _with_members(_node_payload(), _member("skills", link=str(private)))
+        r = _run_provision(tmp_path, payload)
+        assert r.returncode == 1
+        assert _rows(r)["skills"] == "fail"
+        assert not (tmp_path / "node" / ".claude" / "skills").exists()
 
     def test_no_python3_is_one_fail_row_naming_the_repair(self, tmp_path):
         r = _run_provision(tmp_path, _node_payload(), python=False)
@@ -3312,12 +4698,194 @@ def _adds(gh: FakeSsh) -> list[FakeCall]:
     return [c for c in gh.calls() if c.argv[:2] == ["ssh-key", "add"]]
 
 
+# gh's own words as measured (sp-Forph issue 1): a proxy's dial URL, a keyring
+# error, a failed DNS lookup. None may reach a row or a repr.
+PROXY_REFUSED = (
+    'Get "https://api.github.com/": proxyconnect tcp: '
+    "dial tcp 10.1.2.3:3128: connect: connection refused"
+)
+KEYRING_FAILED = "failed to read keyring: dbus: no such interface"
+NO_SUCH_HOST = (
+    'Get "https://api.github.com/": dial tcp: lookup api.github.com: no such host'
+)
+GH_FAILED_ROW = "not shared -- this PC's gh failed; see the nodes log"
+# gh ssh-key add behind a proxy on a PC whose keyring is also unreadable: gh
+# warns about the keyring first, then fails the POST.
+ADD_REFUSED_LAST = (
+    'Post "https://api.github.com/user/keys": proxyconnect tcp: '
+    "dial tcp 10.1.2.3:3128: connect: connection refused"
+)
+ADD_REFUSED = f"{KEYRING_FAILED}\n{ADD_REFUSED_LAST}\n"
+ADD_FAILED_ROW = "gh ssh-key add failed; see the nodes log"
+ADD_LOGGED = "github-key not registered (ssh-key add): this PC's gh gave"
+
+
+def _on_screen(lines: tuple[ScriptLine, ...]) -> str:
+    return "\n".join(f"{x.status}\t{x.item}\t{x.detail}" for x in lines)
+
+
+class TestGhsOwnWordsStayOffTheScreen:
+    """Rows carry our words and the class; gh's scrubbed words go to the nodes
+    log at the row site, and a GhUnavailable's repr never carries them."""
+
+    def test_a_proxy_refusal_is_a_class_only_row(self, fake_ssh, fake_gh, caplog):
+        caplog.set_level("WARNING", logger="magent.nodes")
+        fake_gh.set_reply("auth status", stderr=PROXY_REFUSED + "\n", rc=1)
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        assert ScriptLine("warn", "gh", GH_FAILED_ROW) in report.lines
+        screen = _on_screen(report.lines)
+        for gh_words in ("proxyconnect", "https://", "10.1.2.3", "dial tcp"):
+            assert gh_words not in screen
+        assert PROXY_REFUSED in _nodes_log(caplog)
+        assert "proxyconnect" not in repr(remote_mux.local_gh_account())
+
+    def test_a_keyring_failure_is_a_class_only_row(self, fake_ssh, fake_gh, caplog):
+        caplog.set_level("WARNING", logger="magent.nodes")
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        fake_gh.set_reply("auth token", stderr=KEYRING_FAILED + "\n", rc=1)
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        assert ScriptLine("warn", "gh", GH_FAILED_ROW) in report.lines
+        screen = _on_screen(report.lines)
+        assert "keyring" not in screen
+        assert "dbus" not in screen
+        assert KEYRING_FAILED in _nodes_log(caplog)
+        assert "dbus" not in repr(remote_mux.local_gh_token())
+
+    def test_a_failed_lookup_is_a_class_only_github_key_row(self, fake_gh, caplog):
+        caplog.set_level("WARNING", logger="magent.nodes")
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(
+                None, accounts=[("amin", True, "error", NO_SUCH_HOST)]
+            ),
+        )
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine(
+            "fail",
+            "github-key",
+            (
+                "this PC's gh could not verify its github.com login (amin): "
+                "check this PC's network, then retry"
+            ),
+        )
+        for gh_words in ("https://", "lookup", "no such host", "dial tcp"):
+            assert gh_words not in row.detail
+        assert NO_SUCH_HOST in _nodes_log(caplog)
+        assert "no such host" not in repr(remote_mux.local_gh_account())
+        assert _adds(fake_gh) == []
+
+    def test_a_failed_status_is_a_class_only_github_key_row(self, fake_gh, caplog):
+        caplog.set_level("WARNING", logger="magent.nodes")
+        fake_gh.set_reply("auth status", stderr=PROXY_REFUSED + "\n", rc=1)
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine(
+            "fail", "github-key", "this PC's gh failed; see the nodes log"
+        )
+        assert PROXY_REFUSED in _nodes_log(caplog)
+
+    def test_a_failed_add_is_a_class_only_github_key_row(self, fake_gh, caplog):
+        caplog.set_level("WARNING", logger="magent.nodes")
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("ssh-key add", stderr=ADD_REFUSED, rc=1)
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine("fail", "github-key", ADD_FAILED_ROW)
+        for gh_words in ("https://", "10.1.2.3", "proxyconnect", "keyring", "dbus"):
+            assert gh_words not in row.detail
+        assert f"{ADD_LOGGED} failed: {ADD_REFUSED_LAST}" in _nodes_log(caplog)
+
+    def test_a_failed_add_logs_gh_s_words_scrubbed(self, fake_gh, caplog):
+        caplog.set_level("WARNING", logger="magent.nodes")
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("ssh-key add", stderr=f"HTTP 401: bad token {TOKEN}\n", rc=1)
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine("fail", "github-key", ADD_FAILED_ROW)
+        logged = _nodes_log(caplog)
+        assert f"{ADD_LOGGED} failed: HTTP 401: bad token <redacted>" in logged
+        assert TOKEN not in caplog.text
+
+    def test_a_failed_add_of_a_named_class_prints_its_repair(self, fake_gh, caplog):
+        # gh's words name the class; the row carries the class's repair.
+        caplog.set_level("WARNING", logger="magent.nodes")
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("ssh-key add", stderr="unknown flag: --type\n", rc=1)
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine(
+            "fail",
+            "github-key",
+            f"gh ssh-key add failed; {GhUnavailable('too-old').hint}",
+        )
+        assert "unknown flag" not in row.detail
+        assert f"{ADD_LOGGED} too-old: unknown flag: --type" in _nodes_log(caplog)
+
+    def test_a_failed_add_that_said_nothing_logs_its_exit(self, fake_gh, caplog):
+        caplog.set_level("WARNING", logger="magent.nodes")
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
+        fake_gh.set_reply("ssh-key add", rc=3)
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine("fail", "github-key", ADD_FAILED_ROW)
+        assert f"{ADD_LOGGED} failed: exited 3" in _nodes_log(caplog)
+
+    def test_the_repr_never_carries_gh_s_words(self):
+        refusal = GhUnavailable("failed", detail=PROXY_REFUSED)
+        assert "detail" not in repr(refusal)
+        assert "proxyconnect" not in repr(refusal)
+        # Still kept for the log, and still part of equality.
+        assert refusal.detail == PROXY_REFUSED
+        assert refusal != GhUnavailable("failed", detail="other")
+
+    @pytest.mark.parametrize(
+        "refusal",
+        [
+            GhUnavailable("failed", detail=PROXY_REFUSED),
+            GhUnavailable("unverified", login="amin", detail=NO_SUCH_HOST),
+            GhUnavailable("too-old", detail="unknown flag: --json"),
+            GhUnavailable("not-logged-in", detail="not logged into any GitHub hosts"),
+            GhUnavailable("rejected", login="amin", detail="HTTP 401: Bad credentials"),
+        ],
+    )
+    def test_no_hint_carries_gh_s_words(self, refusal):
+        assert refusal.detail not in refusal.hint
+        assert refusal.hint.isascii()
+
+
 class TestRegisterSshKey:
     def test_no_gh_login_on_this_pc_fails_and_names_the_login(self):
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         assert row == ScriptLine(
             "fail", "github-key", "gh is not logged in on this PC: gh auth login"
         )
+
+    # F6: every other reason gh gave no account names its own repair, and no
+    # key is added on an account nobody verified.
+    @pytest.mark.parametrize(
+        ("accounts", "hint"),
+        [
+            (
+                [("amin", True, "error", "HTTP 401: Bad credentials")],
+                "github.com rejected this PC's gh login: gh auth login -h github.com",
+            ),
+            (
+                [("amin", True, "timeout")],
+                (
+                    "this PC's gh could not verify its github.com login (amin): "
+                    "check this PC's network, then retry"
+                ),
+            ),
+        ],
+    )
+    def test_a_login_gh_could_not_vouch_for_names_its_repair(
+        self, fake_gh, accounts, hint
+    ):
+        fake_gh.set_reply(
+            "auth status", stdout=gh_auth_status(None, "", accounts=accounts)
+        )
+        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert row == ScriptLine("fail", "github-key", hint)
+        assert _adds(fake_gh) == []
 
     def test_a_login_without_the_key_scope_names_the_refresh(self, fake_gh):
         fake_gh.set_reply(
@@ -3389,12 +4957,13 @@ class TestRegisterSshKey:
         remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
         assert len(_adds(fake_gh)) == 1
 
-    def test_a_refused_add_fails_with_ghs_own_words(self, fake_gh):
+    def test_a_refused_add_fails_and_logs_ghs_own_words(self, fake_gh, caplog):
+        caplog.set_level("WARNING", logger="magent.nodes")
         fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
         fake_gh.set_reply("ssh-key add", stderr=REFUSED_ADD_STDERR, rc=1)
         row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
-        assert row.status == "fail"
-        assert row.detail.endswith("key is already in use")
+        assert row == ScriptLine("fail", "github-key", ADD_FAILED_ROW)
+        assert "key is already in use" in _nodes_log(caplog)
 
     def test_another_key_of_the_same_type_is_not_a_match(self, fake_gh):
         fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
@@ -3463,13 +5032,13 @@ class TestRegisterSshKey:
         assert "timed out" in caplog.text
         assert f"<stdin: {len(key)} bytes>" in caplog.text
 
-    def test_a_multi_line_refusal_keeps_the_last_line(self, fake_gh):
+    def test_a_multi_line_refusal_logs_the_last_line(self, fake_gh, caplog):
+        caplog.set_level("WARNING", logger="magent.nodes")
         fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", KEY_SCOPES))
         fake_gh.set_reply("ssh-key add", stderr=REFUSED_ADD_STDERR, rc=1)
-        row = remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
-        assert row == ScriptLine(
-            "fail", "github-key", "gh ssh-key add failed: key is already in use"
-        )
+        remote_mux.register_ssh_key(NODE_KEY, title=TITLE)
+        assert f"{ADD_LOGGED} failed: key is already in use" in _nodes_log(caplog)
+        assert "HTTP 422" not in caplog.text
 
     def test_gh_finding_the_key_itself_is_a_skip_not_a_did(self, fake_gh):
         # gh ssh-key add de-duplicates on its own (one unpaginated user/keys

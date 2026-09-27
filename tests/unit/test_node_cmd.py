@@ -382,11 +382,24 @@ class TestTheDoctorNeverReadsSilenceOrACrashAsHealth:
         assert result.exit_code == 1
         assert "cannot reach amin@devino-second: rc=None" in result.stdout
 
+    @pytest.mark.parametrize(
+        ("raised", "named"),
+        [
+            (KeyError("boom"), "KeyError"),
+            (
+                PermissionError(13, "Permission denied", "/srv/boom"),
+                "PermissionError [Errno 13]",
+            ),
+        ],
+        ids=["bug", "oserror"],
+    )
     def test_the_crash_row_s_pointer_to_nodes_log_is_true(
-        self, runner, tmp_config, monkeypatch
+        self, runner, tmp_config, monkeypatch, raised, named
     ):
         # The row says "see ~/.magent/logs/nodes.log": the traceback must be
-        # there, under the nodes logger, with the exception attached (cq-F16).
+        # there, under the nodes logger at WARNING, with the exception attached
+        # (cq-F16). The one ERROR line is a Sentry event, so it names the
+        # class and errno only: an exception's words can quote a host or a path.
         records: list[tuple[str, logging.LogRecord]] = []
 
         class _Keep(logging.Handler):
@@ -405,7 +418,7 @@ class TestTheDoctorNeverReadsSilenceOrACrashAsHealth:
             return logger
 
         def doctor(node, *, timeout_s):
-            raise KeyError("boom")
+            raise raised
 
         monkeypatch.setattr(log, "get_logger", get_logger)
         monkeypatch.setattr(remote_mux, "doctor", doctor)
@@ -415,10 +428,20 @@ class TestTheDoctorNeverReadsSilenceOrACrashAsHealth:
         crashed = [
             r
             for asked, r in records
-            if asked == "nodes" and r.exc_info and r.exc_info[0] is KeyError
+            if asked == "nodes"
+            and r.levelno == logging.WARNING
+            and r.exc_info
+            and r.exc_info[1] is raised
         ]
-        assert crashed, [(a, r.getMessage()) for a, r in records]
+        assert crashed, [(a, r.levelname, r.getMessage()) for a, r in records]
         assert "second" in crashed[0].getMessage()
+        assert "boom" in crashed[0].getMessage()
+        errors = [
+            (asked, r.getMessage(), r.exc_info)
+            for asked, r in records
+            if r.levelno >= logging.ERROR
+        ]
+        assert errors == [("nodes", f"node doctor: a check crashed: {named}", None)]
 
 
 class TestALegacyCodePageStdout:

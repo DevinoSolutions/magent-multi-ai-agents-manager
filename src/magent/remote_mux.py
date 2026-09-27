@@ -43,7 +43,7 @@ import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from magent import node_scripts, nodes, psmux
 
@@ -61,12 +61,14 @@ from magent.nodes import (
     NodeConfigError,
     absolute_remote,
     encoded_project_dir,
+    is_payload_skill_path,
     node_dir,
     path_exists,
     path_is_dir,
     stdio_programs,
     walk_memory,
     without_missing_programs,
+    without_unframable_skills,
 )
 from magent.sessions import build_resume_command
 
@@ -680,6 +682,139 @@ def _report_of(
 
 
 GH_TIMEOUT_S = 20.0
+# `gh auth status --json` arrived in gh 2.81.0 (cli/cli#11544); `--active`
+# (2.57.0, cli/cli#9520) and `--hostname` are older. A gh without any of them
+# exits 1 with "unknown flag".
+GH_MIN_VERSION = "2.81.0"
+# The active github.com account only: --hostname keeps an unreachable GHES
+# host from spending the budget. Under --json gh ALWAYS exits 0 and blanks the
+# token field (cli/cli status.go), so a non-zero exit is gh itself failing.
+GH_STATUS_ARGV = (
+    "auth",
+    "status",
+    "--active",
+    "--hostname",
+    "github.com",
+    "--json",
+    "hosts",
+)
+GH_TOKEN_ARGV = ("auth", "token", "--hostname", "github.com")
+# GitHub's token alphabet: what local_gh_token accepts from gh AND what
+# build_payload will frame as the payload's first line -- one rule, so a
+# token gh hands over can always be framed. No prefix check -- GHES, legacy
+# 40-hex and GH_TOKEN-supplied tokens must pass -- but a BOM, a control
+# character, non-ASCII, a space, a newline (which would end the line early)
+# or a stray one-word line never ships.
+GH_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]{20,255}")
+_GH_NOT_A_TOKEN = "gh auth token printed something that is not a token"
+# Every credential shape in gh's own words (stderr, a status entry's error) is
+# masked before those words are kept for the nodes log, in order:
+# - gh's prefixed tokens, and a legacy 40-hex one (GH_TOKEN_PATTERN admits it);
+# - what follows an Authorization header's scheme, or a bare Bearer -- anchored,
+#   because a plain "token" is gh's own word ("no oauth token found");
+# - a URL's userinfo (https://user:pass@host), in node_apply's _AUTH shape.
+_GH_SCRUBS = (
+    (
+        re.compile(r"(?:gh[opsur]_|github_pat_)[A-Za-z0-9_]+|\b[0-9a-fA-F]{40}\b"),
+        "<redacted>",
+    ),
+    (
+        re.compile(
+            r"(?i)(\bauthorization:\s*(?:bearer|token|basic)\s+|\bbearer\s+)\S+"
+        ),
+        r"\1<redacted>",
+    ),
+    (re.compile(r"(?<=//)[^\s/?#]*@"), "<redacted>@"),
+)
+_GH_DETAIL_MAX = 200
+# gh's tokenSource when the token is an environment variable's: a re-login
+# cannot replace it.
+GH_ENV_TOKEN_SOURCES = frozenset(
+    {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
+)
+
+GhUnavailableReason = Literal[
+    "missing",
+    "too-old",
+    "not-logged-in",
+    "unverified",
+    "rejected",
+    "timeout",
+    "failed",
+]
+
+
+def _gh_detail(text: str) -> str:
+    """gh's own words, safe to keep: credential shapes scrubbed, then capped."""
+    text = text.strip()
+    for pattern, mask in _GH_SCRUBS:
+        text = pattern.sub(mask, text)
+    return text[:_GH_DETAIL_MAX]
+
+
+@dataclass(frozen=True)
+class GhUnavailable:
+    """Why this PC's gh gave no account (or no token), named so a caller
+    prints the repair that fits (``hint``) instead of one generic
+    "gh auth login".
+
+    ``unverified`` is an active login gh could not check -- its state is
+    ``timeout``, or ``error`` for any reason but a refused token (a DNS
+    failure, github.com unreachable); ``login`` names it. ``gh auth token``
+    reads the stored token without the network, so that login's token is
+    still readable and may still ship. ``rejected`` is github.com refusing
+    the token (HTTP 401, "Bad credentials": revoked or invalid): a rejected
+    token NEVER ships, and ``token_source`` says whether a re-login can fix
+    it. ``failed`` is anything else. ``detail`` is gh's own words (its last
+    stderr line, or a status entry's ``error``), credential shapes scrubbed and
+    capped -- never its stdout, which for a token read is the token. It may
+    hold a dial URL, so it is for the log only: ``hint`` and the repr never
+    carry it, and the row site that prints the hint logs it
+    (``_log_gh_refusal``)."""
+
+    reason: GhUnavailableReason
+    login: str | None = None
+    detail: str = field(default="", repr=False)
+    token_source: str = ""
+
+    @property
+    def hint(self) -> str:
+        """The repair, in our words and the class only -- never ``detail``."""
+        if self.reason == "missing":
+            return "gh is not installed on this PC: https://cli.github.com"
+        if self.reason == "too-old":
+            return (
+                f"this PC's gh is too old (gh >= {GH_MIN_VERSION} required): upgrade gh"
+            )
+        if self.reason == "not-logged-in":
+            return "gh is not logged in on this PC: gh auth login"
+        if self.reason == "unverified":
+            who = f" ({self.login})" if self.login else ""
+            return (
+                f"this PC's gh could not verify its github.com login{who}: "
+                "check this PC's network, then retry"
+            )
+        if self.reason == "rejected":
+            if self.token_source in GH_ENV_TOKEN_SOURCES:
+                return (
+                    "github.com rejected this PC's gh token: the "
+                    f"${self.token_source} in this PC's environment is invalid"
+                )
+            return "github.com rejected this PC's gh login: gh auth login -h github.com"
+        if self.reason == "timeout":
+            return f"this PC's gh did not answer within {GH_TIMEOUT_S:g}s: retry"
+        return "this PC's gh failed; see the nodes log"
+
+
+def _log_gh_refusal(refusal: GhUnavailable, what: str) -> None:
+    """``refusal``'s class and gh's own (scrubbed) words, into the nodes log:
+    the row that prints its ``hint`` carries neither."""
+    get_logger("nodes").warning(
+        "%s: this PC's gh gave %s: %s",
+        what,
+        refusal.reason,
+        refusal.detail or "no detail",
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -689,14 +824,16 @@ def find_gh() -> str | None:
     return shutil.which("gh")
 
 
-def _gh(
-    args: list[str], *, input_bytes: bytes | None = None
-) -> subprocess.CompletedProcess[bytes] | None:
-    """One bounded local ``gh`` call; None when gh is missing or could not
-    run. Only argv is ever logged -- a token read's stdout never is."""
+def _gh_call(
+    args: Sequence[str], *, input_bytes: bytes | None = None
+) -> subprocess.CompletedProcess[bytes] | GhUnavailable:
+    """One bounded local ``gh`` call, or why it never finished: ``missing``
+    (no gh, or it vanished before the spawn), ``timeout``, or ``failed`` (any
+    other spawn error). Only argv is ever logged -- a token read's stdout
+    never is."""
     exe = find_gh()
     if exe is None:
-        return None
+        return GhUnavailable("missing")
     try:
         return _spawn(
             [exe, *args],
@@ -706,55 +843,111 @@ def _gh(
             shown=_redacted(["gh", *args], input_bytes),
             label="local gh",
         )
-    except RemoteError:
-        return None
+    except RemoteError as e:
+        if e.rc == SSH_MISSING_RC:
+            return GhUnavailable("missing")
+        if e.timed_out:
+            return GhUnavailable("timeout")
+        return GhUnavailable("failed", detail=_gh_detail(e.stderr_tail))
+
+
+def _gh(
+    args: list[str], *, input_bytes: bytes | None = None
+) -> subprocess.CompletedProcess[bytes] | None:
+    """``_gh_call`` for a caller that only asks "did gh run": None for every
+    ``GhUnavailable``. Its exit code is the caller's to judge."""
+    result = _gh_call(args, input_bytes=input_bytes)
+    return None if isinstance(result, GhUnavailable) else result
+
+
+def _gh_refusal(result: subprocess.CompletedProcess[bytes]) -> GhUnavailable:
+    """A gh call that exited non-zero, named from its stderr."""
+    err = result.stderr.decode("utf-8", "replace").strip().splitlines()
+    detail = _gh_detail(err[-1]) if err else f"exited {result.returncode}"
+    said = "\n".join(err).lower()
+    if "unknown flag" in said:
+        return GhUnavailable("too-old", detail=detail)
+    # "not logged into any GitHub hosts" / "no oauth token found for ..."
+    if "not logged in" in said or "no oauth token" in said:
+        return GhUnavailable("not-logged-in", detail=detail)
+    return GhUnavailable("failed", detail=detail)
 
 
 @dataclass(frozen=True)
 class GhAccount:
+    """The active, verified github.com login of this PC's gh.
+    ``token_source`` is gh's own ``tokenSource`` (``keyring``,
+    ``oauth_token``, ``GH_TOKEN``, ...): a token from the environment is not
+    one ``gh auth refresh`` can change."""
+
     login: str
     scopes: frozenset[str]
+    token_source: str
 
 
-def local_gh_account() -> GhAccount | None:
-    """The active, logged-in github.com account of this PC's gh, or None."""
-    result = _gh(["auth", "status", "--json", "hosts"])
-    if result is None or result.returncode != 0:
-        return None
+def local_gh_account() -> GhAccount | GhUnavailable:
+    """The active github.com account of this PC's gh, or why there is none
+    (``GhUnavailable``). Only an absent login is ``not-logged-in``."""
+    result = _gh_call(GH_STATUS_ARGV)
+    if isinstance(result, GhUnavailable):
+        return result
+    if result.returncode != 0:
+        return _gh_refusal(result)
     try:
         data = json.loads(result.stdout)
     except ValueError:
-        return None
+        return GhUnavailable("failed", detail="gh auth status printed no JSON")
     hosts = data.get("hosts") if isinstance(data, dict) else None
     entries = hosts.get("github.com") if isinstance(hosts, dict) else None
     for entry in entries if isinstance(entries, list) else []:
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or entry.get("active") is not True:
             continue
-        login = entry.get("login")
-        if (
-            entry.get("active") is True
-            and entry.get("state") == "success"
-            and isinstance(login, str)
-            and login
-        ):
-            raw = entry.get("scopes")
-            scopes = raw if isinstance(raw, str) else ""
-            return GhAccount(
-                login=login,
-                scopes=frozenset(s.strip() for s in scopes.split(",") if s.strip()),
+        raw_login = entry.get("login")
+        login = raw_login if isinstance(raw_login, str) and raw_login else None
+        raw_source = entry.get("tokenSource")
+        source = raw_source if isinstance(raw_source, str) else ""
+        state = entry.get("state")
+        if state != "success":
+            raw_error = entry.get("error")
+            said = raw_error if isinstance(raw_error, str) else ""
+            # gh says "timeout" only for a net timeout; "error" covers every
+            # other failure, a refused token among them. Read from gh's whole
+            # words: the kept detail is capped and masked, so a marker could
+            # be cut off or eaten there (and a refused token would then ship).
+            refused = state == "error" and (
+                "HTTP 401" in said or "bad credentials" in said.lower()
             )
-    return None
+            return GhUnavailable(
+                "rejected" if refused else "unverified",
+                login=login,
+                detail=_gh_detail(said),
+                token_source=source,
+            )
+        if login is None:
+            return GhUnavailable("failed", detail="gh auth status named no login")
+        raw_scopes = entry.get("scopes")
+        scopes = raw_scopes if isinstance(raw_scopes, str) else ""
+        return GhAccount(
+            login=login,
+            scopes=frozenset(s.strip() for s in scopes.split(",") if s.strip()),
+            token_source=source,
+        )
+    return GhUnavailable("not-logged-in")
 
 
-def local_gh_token() -> str | None:
-    """This PC's github.com token, or None. It leaves this process only on a
-    node call's stdin (``build_payload``) -- never argv, never a log."""
-    result = _gh(["auth", "token", "--hostname", "github.com"])
-    if result is None or result.returncode != 0:
-        return None
-    token = result.stdout.decode("utf-8", "replace").strip()
-    if not token or any(ch.isspace() for ch in token):
-        return None
+def local_gh_token() -> str | GhUnavailable:
+    """This PC's github.com token, or why there is none. It leaves this
+    process only on a node call's stdin (``build_payload``) -- never argv,
+    never a log, never a ``GhUnavailable``. A non-zero exit ships nothing,
+    whatever stdout held; so does anything but one token on one line."""
+    result = _gh_call(GH_TOKEN_ARGV)
+    if isinstance(result, GhUnavailable):
+        return result
+    if result.returncode != 0:
+        return _gh_refusal(result)
+    token = result.stdout.decode("utf-8", "replace").rstrip("\r\n")
+    if GH_TOKEN_PATTERN.fullmatch(token) is None:
+        return GhUnavailable("failed", detail=_GH_NOT_A_TOKEN)
     return token
 
 
@@ -771,6 +964,14 @@ def _canonical(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _check_skill_path(path: str) -> None:
+    """ValueError unless ``path`` stays under ``skills/`` once it is a tar
+    member (``nodes.is_payload_skill_path``). Names the path, never the
+    file's bytes."""
+    if not is_payload_skill_path(path):
+        raise ValueError(f"skill file path {path!r} cannot be a payload member")
+
+
 def build_payload(
     scope: UserScope,
     *,
@@ -780,7 +981,19 @@ def build_payload(
 ) -> bytes:
     """What follows the sentinel on provision.sh's stdin: the gh token (or an
     empty line) and a gzip tar of the user scope + manifest. Deterministic --
-    identical input, identical bytes. The token is in the first line ONLY."""
+    identical input, identical bytes. The token is in the first line ONLY.
+
+    It owns its framing: ValueError for a token outside
+    ``GH_TOKEN_PATTERN``, for a token without a login, and for a skill path
+    that could name a member outside ``skills/``. No message quotes the
+    token."""
+    if gh_token:
+        if not GH_TOKEN_PATTERN.fullmatch(gh_token):
+            raise ValueError("gh token has characters the payload cannot frame")
+        if gh_login is None:
+            raise ValueError("gh token without a gh login: pass both or neither")
+    for f in scope.skills:
+        _check_skill_path(f.path)
     entries = state_hook_entries()
     digests = scope.digests()
     digests["gh"] = _sha(f"{gh_login}\n{gh_token}") if gh_token else ""
@@ -788,6 +1001,11 @@ def build_payload(
     manifest = {
         "version": PAYLOAD_VERSION,
         "digests": digests,
+        # DEFERRED (13c7ef5's "applier" digest, tri-F ruling 2): the hash of
+        # node_apply.py itself, so a magent upgrade that changes the merge
+        # logic invalidates what the node recorded. Not ported: node_apply
+        # reads no such field, and an unread digest pins nothing. It lands
+        # with a node_apply consumer (e.g. clear the store on a change).
         "gh_login": gh_login if gh_token else None,
         "plugins": list(scope.plugins),
         "marketplaces": scope.marketplaces,
@@ -894,6 +1112,8 @@ def provision(
     ``skip`` rows (what stayed behind, and why), then ``ok`` per shipped one."""
     programs = stdio_programs(user_scope)
     probe_failed: tuple[ScriptLine, ...] = ()
+    found: frozenset[str] = frozenset()
+    unprobed = False
     if programs:
         try:
             found = node_programs(
@@ -901,31 +1121,105 @@ def provision(
             )
         except ProgramsProbeFailed as exc:
             probe_failed = exc.lines
-            user_scope = without_missing_programs(
-                user_scope, found=frozenset(), unprobed=True
-            )
-        else:
-            user_scope = without_missing_programs(user_scope, found=found)
-    account = local_gh_account()
-    token = local_gh_token() if account is not None else None
-    login = account.login if account is not None and token else None
-    payload = build_payload(
-        user_scope,
-        gh_token=token if login else None,
-        gh_login=login,
-        state_hook=node_scripts.script("state_hook"),
-    )
+            unprobed = True
+    # Always, even with nothing to probe: a stdio server whose command is not
+    # a plain program name is never offered to the probe, and only this drops it.
+    user_scope = without_missing_programs(user_scope, found=found, unprobed=unprobed)
+    # A skill name the payload cannot frame leaves that file behind, not the
+    # whole provision.
+    user_scope = without_unframable_skills(user_scope)
+    login, token, gh_rows = _gh_to_share()
+    notes = tuple(ScriptLine("skip", "scope", note) for note in user_scope.notes)
+    try:
+        payload = build_payload(
+            user_scope,
+            gh_token=token,
+            gh_login=login,
+            state_hook=node_scripts.script("state_hook"),
+        )
+    except ValueError as exc:
+        # The last line of defence: a refused payload fails this node's
+        # provision -- a row, never an exception out of a bring-up. The row is
+        # our words and the class; the refusal's own words (which never quote
+        # a token: build_payload owns its framing) go to the log.
+        get_logger("nodes").warning("provision %s: payload refused: %s", node.nick, exc)
+        refused = ScriptLine(
+            "fail",
+            "payload",
+            (
+                f"not sent -- this PC refused the payload ({type(exc).__name__}); "
+                "see the nodes log"
+            ),
+        )
+        return ProvisionReport((*notes, *probe_failed, *gh_rows, refused))
     args = ["--force"] if force else []
     result = run_script(
         node, "provision", args, timeout_s=timeout_s, stdin=payload, check=False
     )
     report = _report_of(result, "provision", node, args=args, stdin=payload)
-    notes = tuple(ScriptLine("skip", "scope", note) for note in user_scope.notes)
     shipped = tuple(
         ScriptLine("ok", "scope", f"mcp {name}: shipped")
         for name in sorted(user_scope.mcp_servers)
     )
-    return ProvisionReport((*notes, *shipped, *probe_failed, *report.lines))
+    return ProvisionReport((*notes, *shipped, *probe_failed, *gh_rows, *report.lines))
+
+
+# No gh, or no login in it: the node's own gh row already says so. The account
+# step's answer only -- a token gh withholds after naming a login never is.
+_GH_SILENT_REASONS = frozenset({"missing", "not-logged-in"})
+# An unverified login's token ships (unknown is not rejected), and says so.
+# Our words only: gh's own detail goes to the log, never onto the row.
+GH_SHARED_UNVERIFIED = (
+    "shared unverified -- this PC's gh could not verify its github.com login "
+    "(offline?); if the node's gh login fails, check this PC's network, then retry"
+)
+
+
+def _gh_to_share() -> tuple[str | None, str | None, tuple[ScriptLine, ...]]:
+    """(login, token, rows) for ``provision``: this PC's github.com login and
+    token when both are known, else (None, None) and -- unless the account
+    step found gh simply absent or logged out -- one ``warn`` row naming the
+    repair. A verified login ships; so does an ``unverified`` one (offline:
+    its stored token is still read) with a ``warn`` row saying it was not
+    checked, never a ``rejected`` one. A row never quotes the token or gh's
+    output."""
+    account = local_gh_account()
+    if isinstance(account, GhAccount):
+        login: str | None = account.login
+    elif account.reason == "unverified":
+        login = account.login
+    else:
+        login = None
+    refusal = account if isinstance(account, GhUnavailable) else None
+    if login is None:
+        if refusal is None or refusal.reason in _GH_SILENT_REASONS:
+            return None, None, ()
+        return _gh_not_shared(refusal)
+    token = local_gh_token()
+    if isinstance(token, str):
+        if refusal is None:
+            return login, token, ()
+        # The token is in hand: mask it by value, whatever its shape.
+        get_logger("nodes").warning(
+            "gh login %s unverified, its token shared anyway: %s",
+            login,
+            (refusal.detail or refusal.reason).replace(token, "<redacted>"),
+        )
+        return login, token, (ScriptLine("warn", "gh", GH_SHARED_UNVERIFIED),)
+    # gh named a login, then gave no token for it: two answers that disagree
+    # are never read as a plain absence, whatever the token step's reason.
+    if refusal is not None:
+        _log_gh_refusal(refusal, f"gh login {login} unverified")
+    return _gh_not_shared(token)
+
+
+def _gh_not_shared(
+    refusal: GhUnavailable,
+) -> tuple[None, None, tuple[ScriptLine, ...]]:
+    """``_gh_to_share``'s answer for a refusal worth a row: gh's words to the
+    log, the class and its repair to the row."""
+    _log_gh_refusal(refusal, "gh token not shared")
+    return None, None, (ScriptLine("warn", "gh", f"not shared -- {refusal.hint}"),)
 
 
 def provision_node(
@@ -987,10 +1281,16 @@ def register_ssh_key(pubkey: str, *, title: str) -> ScriptLine:
     key), once: a key already on the account is a skip. One ``github-key``
     row; never raises. The key is public, but it rides stdin anyway."""
     account = local_gh_account()
-    if account is None:
-        return ScriptLine(
-            "fail", "github-key", "gh is not logged in on this PC: gh auth login"
+    if isinstance(account, GhUnavailable):
+        _log_gh_refusal(account, "github-key not registered")
+        # No gh at all keeps the one wording `node setup` has always printed
+        # (and pins); every other reason names its own repair.
+        detail = (
+            "gh is not logged in on this PC: gh auth login"
+            if account.reason == "missing"
+            else account.hint
         )
+        return ScriptLine("fail", "github-key", detail)
     if not account.scopes:
         # gh prints no scopes for a token it did not mint (GH_TOKEN, a
         # fine-grained PAT); `gh auth refresh` cannot widen those.
@@ -1037,9 +1337,12 @@ def register_ssh_key(pubkey: str, *, title: str) -> ScriptLine:
             "gh ssh-key add did not finish (spawn failure or timeout); rerun to check",
         )
     if added.returncode != 0:
-        err = added.stderr.decode("utf-8", "replace").strip().splitlines()
-        detail = err[-1][:200] if err else f"exited {added.returncode}"
-        return ScriptLine("fail", "github-key", f"gh ssh-key add failed: {detail}")
+        # gh's own words (a dial URL, a keyring error) go to the log; the row
+        # names the class, and the repair where the class has one.
+        refusal = _gh_refusal(added)
+        _log_gh_refusal(refusal, "github-key not registered (ssh-key add)")
+        shown = "see the nodes log" if refusal.reason == "failed" else refusal.hint
+        return ScriptLine("fail", "github-key", f"gh ssh-key add failed; {shown}")
     # gh de-duplicates too, and says so on stderr with exit 0: when our own
     # listing failed, that is the only word that the key was already there.
     if "already exists" in added.stderr.decode("utf-8", "replace"):

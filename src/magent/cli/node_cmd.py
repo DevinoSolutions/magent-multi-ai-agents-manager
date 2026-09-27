@@ -547,6 +547,18 @@ def _doctor_rows(node: Node) -> list[ScriptLine]:
     return remote
 
 
+def _log_crash(nick: str, exc: Exception) -> None:
+    """A node check's crash, into the nodes log twice: the traceback and the
+    exception's words at WARNING (what the crash row points to), and one ERROR
+    line -- a Sentry event -- naming the class and errno only, because an
+    exception's words can quote a host, a path or gh's output."""
+    logger = log.get_logger("nodes")
+    logger.warning("node doctor: checking %s crashed: %s", nick, exc, exc_info=exc)
+    code = getattr(exc, "errno", None)
+    errno = f" [Errno {code}]" if isinstance(code, int) else ""
+    logger.error("node doctor: a check crashed: %s%s", type(exc).__name__, errno)
+
+
 def _checks_or_crash_row(
     cfg: MagentConfig, nick: str, *, now: float
 ) -> list[ScriptLine]:
@@ -559,7 +571,7 @@ def _checks_or_crash_row(
     try:
         return node_checks(cfg, nick, now=now)
     except Exception as exc:  # noqa: BLE001  # reason: one node's bug, of any type, must fail only that node's rows -- the traceback goes to the log
-        log.get_logger("nodes").exception("node doctor: checking %s crashed", nick)
+        _log_crash(nick, exc)
         return [
             ScriptLine(
                 "fail",

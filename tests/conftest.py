@@ -257,12 +257,21 @@ def fake_ssh(tmp_path, monkeypatch):
     return fake
 
 
+# Every fake gh call is a cold cmd.exe (Windows) + interpreter start, ~130ms
+# on an idle box; under a loaded desktop one took past the product's 20s bound
+# and a pin that never meant to test a timeout read the timeout row. A test
+# that does mean it sets its own short GH_TIMEOUT_S, which wins over this.
+FAKE_GH_TIMEOUT_S = 120.0
+
+
 @pytest.fixture
 def fake_gh(tmp_path, monkeypatch):
     """A fake ``gh`` (the one fake, tests/unit/_fake_ssh.py, under another
-    name) wired in as remote_mux's local gh."""
+    name) wired in as remote_mux's local gh, with headroom for a slow spawn
+    (``FAKE_GH_TIMEOUT_S``)."""
     fake = make_fake_ssh(tmp_path, name="gh")
     monkeypatch.setattr("magent.remote_mux.find_gh", lambda: fake.path)
+    monkeypatch.setattr("magent.remote_mux.GH_TIMEOUT_S", FAKE_GH_TIMEOUT_S)
     return fake
 
 
