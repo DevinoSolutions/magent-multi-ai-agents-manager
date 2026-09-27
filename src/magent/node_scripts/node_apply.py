@@ -139,6 +139,15 @@ def _say(line: str) -> bool:
     return True
 
 
+def _printable(name: str) -> str:
+    """``name`` -- read off a disk -- with what UTF-8 cannot carry escaped as
+    ``\\udcXX``: a lone surrogate, which is how Python reads a name whose
+    bytes are not UTF-8. provision.sh runs this under PYTHONIOENCODING=utf-8,
+    which is strict: one left raw in a row raises out of ``_say`` and fails
+    the whole step instead of printing its row. Any real name is unchanged."""
+    return name.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def _row(ctx: Ctx, status: str, item: str, detail: str = "") -> None:
     """One status<TAB>item<TAB>detail line; the detail is flattened onto it,
     and the gh token and any URL's userinfo and query are masked out of it --
@@ -1007,11 +1016,11 @@ def _step_skills(ctx: Ctx) -> None:
         _row(ctx, "skip", "skills", f"{len(files)} file(s) unchanged")
         return
     for name, link in refused.items():
-        shown = link.relative_to(dest_root).as_posix()
+        shown = _printable(link.relative_to(dest_root).as_posix())
         _row(
             ctx,
             "warn",
-            "skill:" + name,
+            "skill:" + _printable(name),
             f"~/.claude/skills/{shown} is a link; left alone",
         )
     for src, dest in targets:

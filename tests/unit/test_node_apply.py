@@ -1321,6 +1321,36 @@ class TestTheSkills:
             "1 file(s) under ~/.claude/skills",
         )
 
+    @pytest.mark.skipif(not POSIX, reason="POSIX symlinks and byte names")
+    def test_a_linked_skill_whose_name_is_not_utf_8_is_named_escaped(
+        self, box, tmp_path, capsys
+    ):
+        # provision.sh runs node_apply under PYTHONIOENCODING=utf-8, which is
+        # strict: the name, raw in the warn row, raised out of _say and failed
+        # the whole step -- the skills beside it were never installed.
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        work = _work(tmp_path, replace(EMPTY, skills=(SKILL,)))
+        odd = work / "skills" / "caf\udce9" / "SKILL.md"
+        try:
+            odd.parent.mkdir()
+            odd.write_bytes(b"# odd\n")
+        except (OSError, UnicodeError):
+            pytest.skip("this filesystem refuses a name that is not UTF-8")
+        _skills(box).mkdir(parents=True)
+        (_skills(box) / "caf\udce9").symlink_to(elsewhere)
+        assert box.apply(work) == 0
+        lines = _lines(capsys)
+        (line,) = [line for line in lines if line.item.startswith("skill:")]
+        assert (line.status, line.item, line.detail) == (
+            "warn",
+            "skill:caf\\udce9",
+            "~/.claude/skills/caf\\udce9 is a link; left alone",
+        )
+        assert list(elsewhere.iterdir()) == []
+        assert _status(lines, "skills") == "did"
+        assert (_skills(box) / "deploy" / "SKILL.md").read_bytes() == SKILL.data
+
     @pytest.mark.skipif(not POSIX, reason="POSIX symlinks")
     def test_a_link_deeper_in_a_skill_is_left_alone(self, box, tmp_path, capsys):
         elsewhere = tmp_path / "elsewhere"
