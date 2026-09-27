@@ -23,11 +23,17 @@ def _isolate_home(tmp_path, monkeypatch):
 
 class _Handle:
     """A real lock-file handle that can run one scripted step right after it
-    is closed -- the instant its holder's lock is let go."""
+    is closed -- the instant its holder's lock is let go -- and one right
+    before its lock call."""
 
     def __init__(self, fh):
         self._fh = fh
         self.after_close = None
+        self.before_lock = None
+
+    @property
+    def closed(self):
+        return self._fh.closed
 
     def fileno(self):
         return self._fh.fileno()
@@ -41,26 +47,58 @@ class _Handle:
 
 class _Opens:
     """Stands in for ``open`` inside ``lockfile``. Every lock file is the real
-    one; ``after[n]`` runs right after the n-th open (from 0) returns, so
-    another taker's move lands at an exact point of an acquire -- no timing."""
+    one; ``after[n]`` runs right after the n-th open (from 0) returns and
+    ``before_lock[n]`` right before that handle's lock call, so another
+    taker's move lands at an exact point of an acquire -- no timing."""
 
     def __init__(self):
         self.handles = []
         self.after = {}
+        self.before_lock = {}
 
     def __call__(self, *args, **kwargs):
         handle = _Handle(_real_open(*args, **kwargs))
         self.handles.append(handle)
+        handle.before_lock = self.before_lock.pop(len(self.handles) - 1, None)
         step = self.after.pop(len(self.handles) - 1, None)
         if step is not None:
             step()
         return handle
+
+    def locking(self, fd):
+        for handle in self.still_open():
+            if handle.before_lock is not None and handle.fileno() == fd:
+                step, handle.before_lock = handle.before_lock, None
+                step()
+
+    def still_open(self):
+        return [h for h in self.handles if not h.closed]
 
 
 @pytest.fixture
 def opens(monkeypatch):
     seam = _Opens()
     monkeypatch.setattr(lockfile, "open", seam, raising=False)
+    if sys.platform == "win32":
+        import msvcrt
+
+        real_locking = msvcrt.locking
+
+        def locking(fd, mode, nbytes):
+            seam.locking(fd)
+            return real_locking(fd, mode, nbytes)
+
+        monkeypatch.setattr(msvcrt, "locking", locking)
+    else:
+        import fcntl
+
+        real_flock = fcntl.flock
+
+        def flock(f, operation):
+            seam.locking(f if isinstance(f, int) else f.fileno())
+            return real_flock(f, operation)
+
+        monkeypatch.setattr(fcntl, "flock", flock)
     return seam
 
 
@@ -170,6 +208,24 @@ class TestExclusiveLockAcrossARelease:
             opens.after[1] = holder.close  # the contender has opened: holder leaves
             assert _enter(contender, "race"), "nobody held it once the holder left"
             assert not _enter(third, "race"), "a third taker got in beside it"
+            # Only the holder keeps a handle: every other attempt closed its own.
+            assert len(opens.still_open()) == 1
+
+    def test_a_holder_that_lets_go_while_the_contender_locks_leaves_one_holder(
+        self, opens
+    ):
+        """The path is asked about only AFTER the lock is taken: asked before,
+        it still named the holder's file, which the holder then deleted."""
+        with (
+            contextlib.ExitStack() as holder,
+            contextlib.ExitStack() as contender,
+            contextlib.ExitStack() as third,
+        ):
+            assert _enter(holder, "race")
+            opens.before_lock[1] = holder.close
+            assert _enter(contender, "race"), "nobody held it once the holder left"
+            assert not _enter(third, "race"), "a third taker got in beside it"
+            assert len(opens.still_open()) == 1
 
     def test_a_contender_that_opened_before_the_holder_let_go_defers_to_a_new_holder(
         self, opens
@@ -193,6 +249,8 @@ class TestExclusiveLockAcrossARelease:
             # The contender left the third taker's file where it was.
             assert lock_path("race").exists()
             assert not _enter(fourth, "race")
+            # Only the third taker keeps a handle; every refused attempt closed.
+            assert opens.still_open() == [opens.handles[2]]
 
     def test_a_contender_that_took_it_the_instant_the_holder_let_go_is_the_only_holder(
         self, opens
@@ -227,6 +285,7 @@ class TestExclusiveLockAcrossARelease:
         with contextlib.ExitStack() as taker:
             assert not _enter(taker, "race")
         assert len(opens.handles) == 3
+        assert opens.still_open() == []
         assert not path.exists()
 
     @pytest.mark.skipif(sys.platform == "win32", reason="the POSIX order")
