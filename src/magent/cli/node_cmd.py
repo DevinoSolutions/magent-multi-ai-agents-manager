@@ -845,8 +845,9 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
     anything is stopped or cleared (cq-G14 I1): a daemon that keeps the node
     past the wait, a node that answered with an error (a nonzero rc), left
     files behind (PullUnfinished, matched by type -- m1) or answered with
-    something that is not a pull (NotAPull -- C-R3-1), and a placement the
-    pull could not read again. A node that did not answer at all, one the
+    something that is not a pull (NotAPull -- C-R3-1), a node map the pull
+    could not read again (NodeMapUnreadable) and an entry it did not find
+    again. A node that did not answer at all, one the
     config cannot pull from, and a pull refused on this PC before any ssh
     (PullRefused) go on with what was already pulled -- the plan's "never
     fatal" rule, which no re-run helps."""
@@ -871,16 +872,27 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
             f"the node-sync daemon is still pulling from @{held.nick}; {_RERUN}",
             _EXIT_UNREACHABLE,
         )
+    except node_sync.NodeMapUnreadable as exc:
+        # Before OSError, its base: D's final_pull (Dsync 08cfa62) re-reads
+        # the map strictly and raises this when it cannot. recall_cmd's rule
+        # for its own read: the MAP error's class only on screen, busy past
+        # the reader's retries is a re-run, torn or any other error names the
+        # repair. The chained error (the path, the parser's words) goes to
+        # nodes.log.
+        cause = exc.__cause__
+        log.get_logger("nodes").warning(
+            "recall's last pull could not read the node map: %s: %s", exc, cause
+        )
+        if isinstance(cause, ValueError) or (
+            isinstance(cause, OSError) and not isinstance(cause, PermissionError)
+        ):
+            _fail(_map_unreadable_fix(cause), 1)
+        _fail(f"{exc}; {_RERUN}", 1)
     except OSError as exc:
         # After LockHeld (an OSError itself): this PC's side of the pull -- the
         # watermark file, the per-node lock file -- failed (cq-G14 M1). The
         # error CLASS only on screen (str(exc) carries a path); the full error
         # goes to nodes.log.
-        # D-MERGE: D's node_sync.final_pull shape (Dsync 08cfa62) wins at
-        # integration: it raises NodeMapUnreadable (an OSError) for a map it
-        # cannot read. This branch must keep the class-only rule for it --
-        # never str(exc) on screen, the full error in nodes.log -- and, as an
-        # unreadable map, it takes _map_unreadable_fix's words, not _RERUN.
         log.get_logger("nodes").warning(
             "recall's last pull from %s failed on this PC: %s", held.nick, exc
         )
@@ -953,9 +965,13 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
         )
         return False
     if pulled is None:
-        # final_pull re-reads the map tolerantly: a map busy past its retries
-        # (or torn, or cleared meanwhile) reads as "never placed".
-        _fail(f"could not read {name}'s placement again for the last pull; {_RERUN}", 1)
+        # D's final_pull reads the map strictly, so None is the entry gone
+        # between recall's read and its own -- another magent moved it
+        # (launch._final_pull's "not found again"): a pull that did not happen.
+        _fail(
+            f"{name}'s node map entry was not found again for the last pull; {_RERUN}",
+            1,
+        )
     _ok(f"pulled {held.sid} from @{held.nick} one last time")
     return True
 

@@ -2167,17 +2167,61 @@ class TestTheLastPullMustFinish:
         assert second.exit_code == 0, second.output
         assert "api" not in nodes.read_node_map()
 
-    def test_a_placement_the_pull_could_not_read_again_stops_the_recall(
+    def test_an_entry_the_pull_did_not_find_again_stops_the_recall(
         self, runner, placed_api, node_answers, monkeypatch, api_repo
     ):
-        # final_pull re-reads the map tolerantly: a busy or torn map is {} and
-        # it answers None, as for a project that was never placed.
+        # D's final_pull reads the map strictly: its None is the entry gone
+        # since recall's own read (another magent moved it).
         monkeypatch.setattr(node_sync, "final_pull", lambda *a, **k: None)
 
         result = _recall(runner, placed_api, "--local")
 
         _stopped_before_anything(result, api_repo)
-        assert "could not read api's placement again" in result.stderr
+        assert "api's node map entry was not found again" in result.stderr
+
+    @pytest.mark.parametrize("damage", ["busy", "torn"])
+    def test_a_map_the_real_pull_cannot_read_again_stops_the_recall(
+        self, runner, placed_api, node_answers, monkeypatch, api_repo, caplog, damage
+    ):
+        # Through D's REAL final_pull: recall's strict read sees the map,
+        # the pull's own strict read meets it busy or torn, and D wraps it
+        # as NodeMapUnreadable. The MAP error's class on screen (never the
+        # wrapper's), its words in nodes.log; busy is a re-run, torn names
+        # the repair.
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        monkeypatch.setattr(node_sync, "final_pull", _REAL_FINAL_PULL)
+        error: OSError | ValueError = {
+            "busy": PermissionError(13, "in use by another process"),
+            "torn": ValueError("Expecting value: line 1 column 9"),
+        }[damage]
+        real_read = nodes.load_node_map_strict
+        reads: list[int] = []
+
+        def _second_read_fails() -> dict[str, nodes.NodeMapEntry]:
+            reads.append(1)
+            if len(reads) == 2:
+                raise error
+            return real_read()
+
+        monkeypatch.setattr(nodes, "load_node_map_strict", _second_read_fails)
+
+        result = _recall(runner, placed_api, "--local")
+
+        cls = type(error).__name__
+        assert result.exit_code == 1, result.output
+        assert "Traceback" not in result.output
+        assert "NodeMapUnreadable" not in result.output
+        assert str(error) not in result.output
+        assert any(str(error) in m for m in _node_logs(caplog)), _node_logs(caplog)
+        if damage == "busy":
+            _stopped_before_anything(result, api_repo)
+            assert f"the node map could not be read ({cls})" in result.stderr
+            assert "move it aside" not in result.output
+        else:
+            assert f"x {_map_fix_line(cls)}" in result.stderr
+            assert not _claude_dir(api_repo).exists()
+            assert nodes.read_node_map()["api"].nick == "second"
+        assert node_answers == []
 
     def test_a_node_that_answered_with_an_error_stops_the_recall(
         self, runner, placed_api, node_answers, monkeypatch, api_repo
