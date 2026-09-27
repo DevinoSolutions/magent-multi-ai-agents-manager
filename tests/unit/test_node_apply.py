@@ -3563,7 +3563,14 @@ class TestAnUnreadableNodeFileIsUnknownNotEmpty:
 
     def test_a_missing_node_file_is_still_created(self, box, tmp_path, capsys):
         # Only a MISSING file is {}: a fresh node user gets its files.
-        box.apply(_work(tmp_path, _two()))
+        assert box.apply(_work(tmp_path, _two())) == 0
+        status = {line.item: line.status for line in _lines(capsys)}
+        assert [status[item] for item in ("settings", "mcp", "mcp_oauth")] == [
+            "did",
+            "did",
+            "did",
+        ]
+        made = (_settings(box), _claude_json(box), _credentials(box))
+        assert [path.is_file() for path in made] == [True, True, True]
         assert set(_json(_claude_json(box))["mcpServers"]) == {"docs", "wiki"}
         assert set(_json(_credentials(box))["mcpOAuth"]) == {A, B}
-        assert {line.item: line.status for line in _lines(capsys)}["mcp"] == "did"
