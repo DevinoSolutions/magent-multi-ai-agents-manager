@@ -1791,8 +1791,9 @@ TestAttachClientKeepsNestingMarkersButNotALeakedNoColor`, and
 
 **Placement reads history, not a reading.** `"node": "auto"` is resolved by
 `launch.place_node_projects`, its own phase between selection and launch, so a
-dispatcher only ever sees a nick; with sub-plan D, `up` runs the same phase
-once before its fan-out so one `up` spreads like `--go`. The score is spec §11
+dispatcher only ever sees a nick; `up` runs the same phase once before its
+fan-out so one `up` spreads like `--go`, and an auto project it cannot place
+fails in its own row with the placer's reason. The score is spec §11
 over the sync daemon's last 30 minutes of samples: the p75 of `load1 / nproc`,
 plus half of how far the window's peak rises above 1.5 times that p75, plus
 half of how far the newest free memory falls below 15%, plus 0.05 per session
@@ -1802,36 +1803,32 @@ fewer than five samples in the window gets exactly one live `sample` call,
 which is then its only sample, and none under `--dry-run` or a tile-only pass;
 a node that does not answer it is left unscored. A single reading would place
 a session on a box that happened to be idle for one second of a bursty minute.
-<!-- D-MERGE: drop "with sub-plan D," when D's `up` fan-out calls place_node_projects. -->
 
 **A placement sticks, and placing writes nothing.** A project stays on its
 node until that node leaves `settings.nodes`; only then is it re-placed, with
 the reason printed. The placement phase never writes `node-map.json`: the
-bring-up (sub-plan D's) records it once it has actually happened, so a failed
+bring-up records it once it has actually happened, so a failed
 launch leaves nothing sticky behind, and `magent node plan` can render the
 very same objects while writing nothing, pinned byte-for-byte. Nothing moves a
-running session on its own; `magent node recall --to` (with sub-plan D) is the
-only mover.
-<!-- D-MERGE: drop "(sub-plan D's)" and "(with sub-plan D)" when D's bring-up writes the node map and recall --to lands. -->
+running session on its own; `magent node recall --to` is the only mover.
 
 **The node decides what a plain re-up resumes.** A session brought up again
-passes no resume id: sub-plan D's `bring_up.sh` runs `claude --continue` over
+passes no resume id: `bring_up.sh` runs `claude --continue` over
 the node's own transcripts, or the fresh form when there are none. The PC's
 pulled copy can be one pull stale, and an explicit `--resume` has no fresh
 fallback on a node that lost the file. `claude --resume <id>` is used only
-where magent installed that conversation first: `recall --to` (with sub-plan
-D; installed by `install_transcripts.sh`, under the name magent's one encoder
+where magent installed that conversation first: `recall --to` (installed
+by `install_transcripts.sh`, under the name magent's one encoder
 gives the node's own `realpath`; the node never encodes) and the resume
 `recall --local` prints.
-<!-- D-MERGE: drop "sub-plan D's" and "with sub-plan D;" when bring_up.sh and recall --to land. -->
 
 **Recall never races the daemon, and a pull it cannot finish stops it.** The
 last pull goes through `node_sync.final_pull`, under the lock the daemon's tick
 holds. The placement is cleared at the end of a recall and a cleared placement
 is never pulled again, so a pull that a re-run could still complete stops the
 recall before anything is stopped, installed or cleared: a node that answered
-with an error, a pull that left files behind, a placement the pull could not
-read again, or a node map another process holds busy or left torn all exit 1
+with an error, a pull that left files behind, a placement the pull no longer
+found, or a node map another process holds busy or left torn all exit 1
 with the project still placed and "run the recall again"; a daemon still
 holding the node past the wait exits 3 the same way. Only a node that does not
 answer at all (ssh's own 255, or a timeout), or one this config cannot pull
@@ -1842,9 +1839,8 @@ because zsh reads a bare `=word` as a command lookup. That command is one
 `ssh <target> "…"` line only for a plain sid; any other sid gets two steps
 (ssh, then run it on the node) with its `'` escaped, since the local shell
 would expand `$(…)`, a backtick or `!` inside the double quotes. "Stopped" is
-printed only when sub-plan D's `remote_mux.kill_session` returned True; until
-D merges, recall cannot stop the session itself and always prints that command.
-<!-- D-MERGE: drop "sub-plan D's" and the "until D merges" clause when kill_session lands (plan G :3865-3874). -->
+printed only when `remote_mux.kill_session` returned True; when the call
+failed, recall says the session may still be running and prints that command.
 
 **`--local` installs by the rules a `--to` send uses.** The local folder is
 the one a launch opens, resolved by `launch._resolve_path` and never
@@ -1886,11 +1882,10 @@ which predates win32-input-mode and may pass the CR through unencoded.
 **Auto placement never rebalances (2026-09-24):** an `auto` project stays on
 the node it was placed on until that node leaves `settings.nodes`. A node that
 grows busy keeps its sessions; moving one is a manual
-`magent node recall <project> --to <nick>` (with sub-plan D). Deliberate: a
+`magent node recall <project> --to <nick>`. Deliberate: a
 move stops a live session and ships its conversation, which is not something
 to do behind the user's back. If it bites, the fix is a `node plan` hint
 naming the better node, never an automatic move.
-<!-- D-MERGE: drop "(with sub-plan D)" when recall --to lands (plan G Task 15). -->
 
 **Recall moves Claude Code conversations only (2026-09-24):** `magent node
 recall` refuses a project whose tool is not `claude` (exit 2). Codex has no
@@ -1898,12 +1893,11 @@ transcript layout magent pulls, and no resume-by-id form recall could print.
 Its sessions come home by git alone: commit and push on the node, pull here.
 
 **A bring-up's repo record knows the commit, not the branch (2026-09-24):**
-`repos.json` written at bring-up (sub-plan D's) carries each repo's sha from
+`repos.json` written at bring-up carries each repo's sha from
 `bring_up.sh`, with an empty branch and an unknown unpushed count, because the
 bring-up reports only commits. A recall from a node that no longer answers
 therefore prints the last known sha without a branch. A recall from a node
 that answers records the full `repo_status.sh` report and replaces it.
-<!-- D-MERGE: drop "(sub-plan D's)" when D's bring-up writes repos.json. -->
 
 **Attach-pane reconnect is only reachable from a Windows client (2026-08-09):**
 `attach_client.py` itself is OS-agnostic (stdlib + click; the `Popen` in

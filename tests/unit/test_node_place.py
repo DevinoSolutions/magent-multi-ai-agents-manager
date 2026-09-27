@@ -1026,8 +1026,8 @@ class TestAnUnreadableMapPlacesNoAutoProject:
             if request.param == "torn":
                 nodes.NODE_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
                 nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
-                # A ValueError, named as the reader names it: JSONDecodeError
-                # here, the plain ValueError once sub-plan D's reader wraps it.
+                # A ValueError, named as the reader names it: D's reader wraps
+                # the JSONDecodeError in a plain ValueError.
                 with pytest.raises(ValueError) as torn:
                     nodes.load_node_map_strict()
                 return type(torn.value).__name__, str(torn.value)
