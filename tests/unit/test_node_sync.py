@@ -564,6 +564,37 @@ class TestEnsureNodeSync:
         assert "heartbeat is stale" in warning
         assert str(os.getpid()) in warning
 
+    def test_a_lock_that_would_not_open_is_unknown_and_nothing_is_spawned(
+        self, sync_on, spawned, monkeypatch
+    ):
+        """Windows answers EACCES while the lock file is pending delete, so
+        whether a daemon runs is unknown: never "not running" (a spawn could
+        double a live daemon), and never the bare PermissionError, which a
+        caller could not tell from a refused spawn."""
+        denied = PermissionError(13, "Access is denied")
+        real_lock = node_sync.exclusive_lock
+
+        def lock(name: str) -> contextlib.AbstractContextManager[None]:
+            if name == node_sync.LOCK_NAME:
+                raise denied
+            return real_lock(name)
+
+        monkeypatch.setattr(node_sync, "exclusive_lock", lock)
+        try:
+            got: object = launch.ensure_node_sync(_config(), "cfg.json")
+        except (OSError, node_sync.DaemonLockUnknown) as exc:
+            got = exc
+        assert isinstance(got, node_sync.DaemonLockUnknown), got
+        assert got.error is denied
+        assert got.__cause__ is denied
+        assert spawned == []
+
+    def test_an_unknown_lock_is_still_an_oserror(self):
+        """Every caller that contains an OSError of ensure_node_sync -- the
+        bring-up's best-effort start is one -- still contains an unknown lock.
+        Only a caller that names it (serve's supervisor) tells it apart."""
+        assert issubclass(node_sync.DaemonLockUnknown, OSError)
+
     def test_a_wedge_is_reported_once_and_its_recovery_once(
         self, sync_on, spawned, daemon_lock, caplog
     ):
@@ -578,6 +609,18 @@ class TestEnsureNodeSync:
         infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
         assert len([m for m in infos if "fresh again" in m]) == 1
         assert spawned == []
+
+
+def _ensure_on_nodes(monkeypatch) -> None:
+    """serve's tick runs the REAL ensure_node_sync, on a config with node
+    projects (the config file serve reads in these tests names none)."""
+    monkeypatch.setattr(launch, "_node_sync_report", launch._NodeSyncReport())
+    real = launch.ensure_node_sync
+    monkeypatch.setattr(
+        launch,
+        "ensure_node_sync",
+        lambda _cfg, config_path=None: real(_config(), config_path),
+    )
 
 
 def _run_supervisor(
@@ -608,6 +651,163 @@ def _one_tick() -> threading.Event:
     stop = threading.Event()
     stop.set()
     return stop
+
+
+class TestDownHoldsTheSupervisorLock:
+    """``down --all``'s side of serve's supervisor lock: held for the body,
+    waited on briefly, never a reason to skip the stop."""
+
+    def test_a_free_lock_is_held_for_the_body_and_let_go_after(self):
+        with node_sync.supervisor_held() as contended:
+            assert contended is False
+            with (
+                pytest.raises(LockHeld),
+                exclusive_lock(node_sync.SUPERVISOR_LOCK_NAME),
+            ):
+                pass
+        with exclusive_lock(node_sync.SUPERVISOR_LOCK_NAME):
+            pass
+
+    def test_a_lock_that_will_not_open_is_retried_then_run_without(
+        self, monkeypatch, caplog
+    ):
+        # Windows answers EACCES while a lock file is pending delete: retried
+        # like a held lock, and past the wait the body runs unprotected.
+        _capture_nodes_log(caplog)
+        tries: list[str] = []
+
+        def unopenable(name):
+            tries.append(name)
+            raise PermissionError(13, "Access is denied")
+
+        monkeypatch.setattr(node_sync, "exclusive_lock", unopenable)
+        clock = [0.0]
+
+        def sleep(s: float) -> None:
+            clock[0] += s
+
+        ran: list[bool] = []
+        with node_sync.supervisor_held(sleep=sleep, now=lambda: clock[0]) as c:
+            ran.append(c)
+        # Unprotected, so a restart cannot be ruled out: reads as contended.
+        assert ran == [True]
+        assert len(tries) > 1
+        assert set(tries) == {node_sync.SUPERVISOR_LOCK_NAME}
+        (warning,) = _warnings(caplog)
+        assert "could not take serve's supervisor lock" in warning
+        assert "Access is denied" in warning
+
+    def test_a_lock_that_opens_on_a_retry_is_held_after_all(self, monkeypatch):
+        real = node_sync.exclusive_lock
+        answers = iter([PermissionError(13, "Access is denied")])
+
+        def once_pending(name):
+            exc = next(answers, None)
+            if exc is not None:
+                raise exc
+            return real(name)
+
+        monkeypatch.setattr(node_sync, "exclusive_lock", once_pending)
+        with node_sync.supervisor_held(sleep=lambda _s: None) as c:
+            assert c is True
+            with (
+                pytest.raises(LockHeld),
+                exclusive_lock(node_sync.SUPERVISOR_LOCK_NAME),
+            ):
+                pass
+
+    def test_a_probe_that_will_not_open_does_not_end_the_late_look(self, monkeypatch):
+        answers = iter([PermissionError(13, "denied"), False, True])
+
+        def running():
+            answer = next(answers)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        monkeypatch.setattr(node_sync, "daemon_running", running)
+        monkeypatch.setattr(node_sync, "daemon_pid", lambda: 4242)
+        assert node_sync.await_late_daemon(sleep=lambda _s: None)
+
+    def test_a_held_lock_is_waited_on_in_steps_up_to_the_settle(
+        self, monkeypatch, caplog
+    ):
+        _capture_nodes_log(caplog)
+        clock = [0.0]
+        slept: list[float] = []
+
+        def sleep(s: float) -> None:
+            slept.append(s)
+            clock[0] += s
+
+        with (
+            exclusive_lock(node_sync.SUPERVISOR_LOCK_NAME),
+            node_sync.supervisor_held(sleep=sleep, now=lambda: clock[0]) as c,
+        ):
+            assert c is True
+        assert set(slept) == {node_sync.SUPERVISOR_RETRY_S}
+        assert clock[0] == pytest.approx(node_sync.STOP_SETTLE_S, abs=0.06)
+        (warning,) = _warnings(caplog)
+        assert "stayed held past 2s" in warning
+
+    def test_the_late_daemon_wait_is_bounded_and_ends_at_the_lock(self, monkeypatch):
+        clock = [0.0]
+
+        def sleep(s: float) -> None:
+            clock[0] += s
+
+        assert not node_sync.await_late_daemon(sleep=sleep, now=lambda: clock[0])
+        assert clock[0] == pytest.approx(node_sync.STOP_SETTLE_S, abs=0.06)
+        clock[0] = 0.0
+        _record_pid(os.getpid())
+        with exclusive_lock(node_sync.LOCK_NAME):
+            assert node_sync.await_late_daemon(sleep=sleep, now=lambda: clock[0])
+        assert clock[0] == 0.0
+
+    def test_the_late_daemon_wait_ends_at_the_deadline_it_is_given(self):
+        # down's contended hold passes its own deadline: a cold start past
+        # the hold, not STOP_SETTLE_S from now.
+        clock = [0.0]
+
+        def sleep(s: float) -> None:
+            clock[0] += s
+
+        assert not node_sync.await_late_daemon(
+            until=7.0, sleep=sleep, now=lambda: clock[0]
+        )
+        assert clock[0] == pytest.approx(7.0, abs=0.06)
+
+    def test_a_deadline_already_past_still_looks_once(self, monkeypatch):
+        monkeypatch.setattr(node_sync, "daemon_running", lambda: True)
+        monkeypatch.setattr(node_sync, "daemon_pid", lambda: 4242)
+        naps: list[float] = []
+        assert node_sync.await_late_daemon(
+            until=-1.0, sleep=naps.append, now=lambda: 0.0
+        )
+        assert naps == []
+
+    def test_a_daemon_between_its_lock_and_its_pid_is_waited_for(self, monkeypatch):
+        # The daemon locks first and writes its pid after; the stop kills by
+        # pid, so the look lasts until the pid is there too.
+        pids = iter([None, None, 4242])
+        monkeypatch.setattr(node_sync, "daemon_running", lambda: True)
+        monkeypatch.setattr(node_sync, "daemon_pid", lambda: next(pids))
+        naps: list[float] = []
+        assert node_sync.await_late_daemon(sleep=naps.append)
+        assert naps == [node_sync.SUPERVISOR_RETRY_S] * 2
+
+    def test_a_held_lock_with_no_pid_by_the_deadline_still_reads_as_a_daemon(
+        self, monkeypatch
+    ):
+        clock = [0.0]
+
+        def sleep(s: float) -> None:
+            clock[0] += s
+
+        monkeypatch.setattr(node_sync, "daemon_running", lambda: True)
+        monkeypatch.setattr(node_sync, "daemon_pid", lambda: None)
+        assert node_sync.await_late_daemon(sleep=sleep, now=lambda: clock[0])
+        assert clock[0] == pytest.approx(node_sync.STOP_SETTLE_S, abs=0.06)
 
 
 class TestServeSupervisesTheDaemon:
@@ -689,6 +889,96 @@ class TestServeSupervisesTheDaemon:
         with exclusive_lock(node_sync.SUPERVISOR_LOCK_NAME):
             _run_supervisor(path, _one_tick())
         assert any("another server" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("where", ["supervisor-lock", "daemon-lock"])
+    def test_a_lock_pending_delete_is_a_warning_that_skips_one_tick(
+        self, sync_on, tmp_config, monkeypatch, caplog, where
+    ):
+        """Windows answers EACCES while a lock file its last holder deleted is
+        still pending delete: serve's own lock, or the daemon's under the REAL
+        ensure_node_sync. A known transient -- a WARNING naming the class and
+        the errno, never an exception-level record (Sentry's), and the next
+        tick runs."""
+        from magent import upload_server
+
+        _capture_nodes_log(caplog)
+        path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
+        stop = threading.Event()
+        _ensure_on_nodes(monkeypatch)
+        module = upload_server if where == "supervisor-lock" else node_sync
+        refused = (
+            node_sync.SUPERVISOR_LOCK_NAME
+            if where == "supervisor-lock"
+            else node_sync.LOCK_NAME
+        )
+        real_lock = module.exclusive_lock
+        refusals = [PermissionError(13, "Access is denied")]
+
+        def lock(name: str) -> contextlib.AbstractContextManager[None]:
+            if name == refused and refusals:
+                raise refusals.pop()
+            return real_lock(name)
+
+        monkeypatch.setattr(module, "exclusive_lock", lock)
+        spawned: list[list[str]] = []
+
+        def spawn(argv: list[str]) -> None:
+            spawned.append(argv)
+            stop.set()
+
+        monkeypatch.setattr(launch, "spawn_detached", spawn)
+        _run_supervisor(path, stop)
+        assert refusals == []
+        # The refused tick spawned nothing; the next one did.
+        assert spawned == [launch.node_sync_argv(path)]
+        assert _errors(caplog) == []
+        warnings = _warnings(caplog)
+        assert len(warnings) == 1, warnings
+        assert "PermissionError" in warnings[0]
+        assert "errno 13" in warnings[0]
+
+    def test_a_refused_spawn_is_a_failed_check_not_a_skipped_tick(
+        self, sync_on, tmp_config, monkeypatch, caplog
+    ):
+        """Only a lock file that would not open is the known transient. A
+        PermissionError from anywhere else in the tick -- here the spawn -- can
+        persist, so it stays at exception level (Sentry's)."""
+        _capture_nodes_log(caplog)
+        path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
+        _ensure_on_nodes(monkeypatch)
+        spawns: list[list[str]] = []
+
+        def refuse(argv: list[str]) -> None:
+            spawns.append(argv)
+            raise PermissionError(13, "Access is denied")
+
+        monkeypatch.setattr(launch, "spawn_detached", refuse)
+        _run_supervisor(path, _one_tick())
+        assert spawns == [launch.node_sync_argv(path)]
+        errors = _errors(caplog)
+        assert [r.getMessage() for r in errors] == [
+            "node sync supervisor: check failed"
+        ]
+        assert errors[0].exc_info is not None
+        assert not any("tick skipped" in m for m in _warnings(caplog))
+
+    def test_any_other_error_of_a_tick_is_still_logged_at_exception_level(
+        self, sync_on, tmp_config, monkeypatch, caplog
+    ):
+        _capture_nodes_log(caplog)
+        path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
+
+        def ensure(_config, _config_path=None):
+            raise OSError(5, "Input/output error")
+
+        monkeypatch.setattr(launch, "ensure_node_sync", ensure)
+        _run_supervisor(path, _one_tick())
+        errors = _errors(caplog)
+        assert [r.getMessage() for r in errors] == [
+            "node sync supervisor: check failed"
+        ]
+        assert errors[0].exc_info is not None
+        assert _warnings(caplog) == ["node sync supervisor: check failed"]
 
     def test_a_config_lookup_that_raises_is_logged_and_survived(
         self, sync_on, monkeypatch, caplog

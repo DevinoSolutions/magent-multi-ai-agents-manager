@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -205,6 +206,108 @@ class TestNodeSync:
         assert f"Could not stop the node sync daemon (pid {stranger.pid})." in (
             result.stdout
         )
+
+    def test_a_lock_that_would_not_open_is_unknown_never_not_running(
+        self, runner, monkeypatch, caplog
+    ):
+        """Windows answers EACCES while a lock file its last holder deleted is
+        still pending delete: no answer is not "no daemon". The class is on
+        screen, the whole error in nodes.log, and it is not a success."""
+        from magent.log import get_logger
+
+        def unopenable():
+            raise PermissionError(13, "Access is denied: 'C:\\\\secret\\\\x.lock'")
+
+        monkeypatch.setattr(node_sync, "daemon_running", unopenable)
+        get_logger(node_sync.LOG_NAME)
+        caplog.set_level("WARNING", logger=f"magent.{node_sync.LOG_NAME}")
+        result = runner.invoke(cli.main, ["node", "sync", "--stop"])
+        assert result.exit_code == 1, result.output
+        assert result.stdout == (
+            "  ! Could not tell whether the node sync daemon stopped"
+            " (PermissionError); see nodes.log\n"
+        )
+        assert any("secret" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        ("flags", "good_opens", "before"),
+        [
+            (["--once"], 0, ""),
+            (["-d"], 0, ""),
+            (["--ticks", "1"], 0, ""),
+            # The probe opened it; the loop's own take, right after, did not.
+            (["--ticks", "1"], 1, "  # Syncing 2 node(s) -- Ctrl+C to stop.\n"),
+        ],
+        ids=["once", "daemon", "foreground-probe", "foreground-loop"],
+    )
+    def test_a_lock_that_would_not_open_is_unknown_and_never_a_traceback(
+        self,
+        runner,
+        pool_config,
+        monkeypatch,
+        caplog,
+        fake_ssh,
+        flags,
+        good_opens,
+        before,
+    ):
+        """Windows answers EACCES while the daemon's lock file is pending
+        delete. Whether a daemon runs is then unknown: never a traceback,
+        never "already running" or a sync -- the class on screen, the whole
+        error in nodes.log, exit 1."""
+        from magent.log import get_logger
+
+        real_lock = node_sync.exclusive_lock
+        opens = [0]
+
+        def pending_delete(name: str):
+            if name == node_sync.LOCK_NAME:
+                opens[0] += 1
+                if opens[0] > good_opens:
+                    raise PermissionError(
+                        13, "Access is denied: 'C:\\\\secret\\\\node-sync.lock'"
+                    )
+            return real_lock(name)
+
+        monkeypatch.setattr(node_sync, "exclusive_lock", pending_delete)
+        monkeypatch.setattr(
+            "magent.launch.spawn_detached", lambda argv: pytest.fail("spawned")
+        )
+        get_logger(node_sync.LOG_NAME)
+        caplog.set_level("WARNING", logger=f"magent.{node_sync.LOG_NAME}")
+        result = runner.invoke(
+            cli.main, ["--config", pool_config, "node", "sync", *flags]
+        )
+        assert not isinstance(result.exception, OSError), result.exception
+        assert result.exit_code == 1, result.output
+        assert result.stdout == before + (
+            "  ! Could not tell whether the node sync daemon is running"
+            " (PermissionError); see nodes.log\n"
+        )
+        assert fake_ssh.calls() == []
+        assert any(
+            r.levelno == logging.WARNING and "secret" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.parametrize(
+        "flags", [["--once"], ["--ticks", "1"]], ids=["once", "foreground-loop"]
+    )
+    def test_an_oserror_of_the_tick_itself_is_not_an_unknown_daemon(
+        self, runner, pool_config, monkeypatch, flags
+    ):
+        """Only the lock's open is "could not tell": an OSError the tick
+        raised under a lock it did take stays itself."""
+
+        def full_disk(self, *, wait_s=None):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(node_sync.NodeSyncer, "tick", full_disk)
+        result = runner.invoke(
+            cli.main, ["--config", pool_config, "node", "sync", *flags]
+        )
+        assert isinstance(result.exception, OSError)
+        assert "Could not tell" not in result.stdout
 
     def test_the_daemon_flag_spawns_the_foreground_loop_detached(
         self, runner, pool_config, monkeypatch

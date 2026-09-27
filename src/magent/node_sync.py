@@ -187,6 +187,88 @@ def stop_daemon(
     return True
 
 
+# How often `down --all` retries serve's supervisor lock while a supervisor
+# tick holds it, and how often it looks for a daemon that took its own lock
+# late. The first wait is bounded by STOP_SETTLE_S; the look, by the deadline
+# its caller gives (await_late_daemon).
+SUPERVISOR_RETRY_S = 0.05
+
+
+@contextlib.contextmanager
+def supervisor_held(
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+) -> Iterator[bool]:
+    """Hold serve's supervisor lock (``SUPERVISOR_LOCK_NAME``) for the body,
+    so no ``magent serve`` starts a daemon while ``down --all`` stops it: its
+    ``_supervise_node_sync`` skips every tick it cannot take this lock for.
+
+    Yields True when the lock was contended -- a supervisor tick held it, and
+    a daemon that tick spawned may not have taken its own lock yet -- or could
+    not be taken. A tick holds it for one ``ensure_node_sync``, so the wait is
+    short: ``SUPERVISOR_RETRY_S`` steps up to ``STOP_SETTLE_S``. Not taken by
+    then, the body runs unprotected with a WARNING: stopping the daemon is
+    never skipped for want of the lock."""
+    log = get_logger(LOG_NAME)
+    deadline = now() + STOP_SETTLE_S
+    contended = False
+    with contextlib.ExitStack() as stack:
+        while True:
+            try:
+                stack.enter_context(exclusive_lock(SUPERVISOR_LOCK_NAME))
+            except OSError as exc:
+                # LockHeld is a supervisor tick. Anything else is retried the
+                # same way: Windows answers EACCES while a lock file its last
+                # holder deleted is still pending delete (a scanner's handle).
+                contended = True
+                if now() < deadline:
+                    sleep(SUPERVISOR_RETRY_S)
+                    continue
+                if isinstance(exc, LockHeld):
+                    log.warning(
+                        "node sync: serve's supervisor lock stayed held past"
+                        " %.0fs; stopping the daemon without it",
+                        STOP_SETTLE_S,
+                    )
+                else:
+                    log.warning(
+                        "node sync: could not take serve's supervisor lock"
+                        " (%s); stopping the daemon without it",
+                        exc,
+                    )
+            break
+        yield contended
+
+
+def await_late_daemon(
+    *,
+    until: float | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+) -> bool:
+    """Look until ``until`` -- a ``now()`` reading; None is ``STOP_SETTLE_S``
+    from now -- for a daemon holding its lock: True as soon as one does and
+    has written its pid. It always looks once, even past ``until``.
+    ``ensure_node_sync`` Popens a daemon that takes ``LOCK_NAME`` only once its
+    interpreter is up, so right after a spawn the lock -- the only proof of a
+    daemon -- still reads free. It writes its pid just after the lock, and
+    ``stop_daemon`` kills by pid: stopped in between, it would be called
+    stuck. At the deadline the lock's last answer stands. A probe that could
+    not open the lock file answers nothing and the look goes on; the stop
+    after it asks again."""
+    deadline = now() + STOP_SETTLE_S if until is None else until
+    held = False
+    while True:
+        with contextlib.suppress(OSError):
+            held = daemon_running()
+            if held and daemon_pid() is not None:
+                return True
+        if now() >= deadline:
+            return held
+        sleep(SUPERVISOR_RETRY_S)
+
+
 def wanted(config: MagentConfig) -> bool:
     """Is there anything to sync: a pool, and an enabled project pinned or
     placed on it? A ``"cloud"`` project has no pool node and is not the
@@ -879,6 +961,32 @@ class NodeSyncer:
             log.info("node %s: load samples kept again", nick)
 
 
+class DaemonLockUnknown(OSError):
+    """A node sync lock file would not open -- Windows answers EACCES while
+    one is pending delete -- so whether a daemon runs is unknown, and nothing
+    ran. Raised from that open's error (``error``, also its ``__cause__``): by
+    ``run_once`` and ``run_sync_loop`` for the daemon's lock, by
+    ``launch.ensure_node_sync`` for its probe of it, and by serve's supervisor
+    for its own lock -- never for an OSError of a tick or a spawn. It is an
+    OSError itself, so a caller that contains every OSError still contains it;
+    only a caller that names it tells it apart."""
+
+    def __init__(self, error: OSError) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
+def _take_daemon_lock(stack: contextlib.ExitStack) -> None:
+    """Hold ``LOCK_NAME`` on ``stack``. LockHeld when a daemon holds it;
+    DaemonLockUnknown when its file would not open."""
+    try:
+        stack.enter_context(exclusive_lock(LOCK_NAME))
+    except LockHeld:
+        raise
+    except OSError as e:
+        raise DaemonLockUnknown(e) from e
+
+
 def run_once(
     config: MagentConfig,
     *,
@@ -886,9 +994,11 @@ def run_once(
     | None = None,
 ) -> dict[str, tuple[str, str]]:
     """One tick under the daemon's lock (``magent node sync --once``). LockHeld
-    when the daemon is running -- its own next tick is the answer. The tick
-    waits for every pull: a one-shot has no next tick to collect a laggard."""
-    with exclusive_lock(LOCK_NAME):
+    when the daemon is running -- its own next tick is the answer --
+    DaemonLockUnknown when the lock would not open. The tick waits for every
+    pull: a one-shot has no next tick to collect a laggard."""
+    with contextlib.ExitStack() as stack:
+        _take_daemon_lock(stack)
         syncer = NodeSyncer(config, pull=pull)
         try:
             return syncer.tick()
@@ -909,6 +1019,7 @@ def run_sync_loop(
     """The daemon body (``magent node sync``, detached by serve). Returns 0.
 
     - Another daemon holding ``node-sync``: exit quietly.
+    - Its lock file would not open: DaemonLockUnknown, and nothing ran.
     - Otherwise: pid file + heartbeat thread, then tick every
       ``tick_interval_s``, re-reading the config through ``reload`` (None
       keeps the current one) until no project runs on a node. Each tick waits
@@ -921,7 +1032,7 @@ def run_sync_loop(
     log = get_logger(LOG_NAME)
     with contextlib.ExitStack() as stack:
         try:
-            stack.enter_context(exclusive_lock(LOCK_NAME))
+            _take_daemon_lock(stack)
         except LockHeld:
             log.info("node sync: another daemon holds the lock; exiting")
             return 0

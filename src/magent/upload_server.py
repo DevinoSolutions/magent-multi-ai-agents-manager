@@ -1534,7 +1534,7 @@ def _supervise_node_sync(
     # heavy subsystem: in-body per policy. launch owns the spawn recipe; this
     # module must not import the cli package (LS-A-001).
     from magent.launch import ensure_node_sync, node_sync_env_enabled
-    from magent.node_sync import SUPERVISOR_LOCK_NAME, ConfigWatch
+    from magent.node_sync import SUPERVISOR_LOCK_NAME, ConfigWatch, DaemonLockUnknown
     from magent.paths import find_config
 
     log = get_logger("nodes")
@@ -1560,10 +1560,26 @@ def _supervise_node_sync(
                             "node sync supervisor: another server is supervising "
                             "the daemon"
                         )
+                    except OSError as e:
+                        # Its file would not open: skipped below, like the
+                        # daemon's lock under ensure_node_sync.
+                        raise DaemonLockUnknown(e) from e
                     # else, not a `continue` in the except: that would skip
                     # stop_event.wait(interval) below and spin the thread.
                     else:
                         ensure_node_sync(config, config_path)
+        except DaemonLockUnknown as exc:
+            # A lock file -- this one, or the daemon's -- would not open:
+            # Windows answers EACCES while one is still pending delete. Known
+            # and transient: not a failed check, and the next tick tries again.
+            # A PermissionError from anywhere else (the config, the spawn) can
+            # persist, and stays a failed check below.
+            log.warning(
+                "node sync supervisor: tick skipped (%s, errno %s): %s",
+                type(exc.error).__name__,
+                exc.error.errno,
+                exc.error,
+            )
         except Exception:
             log.exception("node sync supervisor: check failed")
         if stop_event.wait(interval):
