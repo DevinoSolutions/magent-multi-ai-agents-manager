@@ -1838,7 +1838,14 @@ spawns every `display-message` before reading any and then waits on ONE
 deadline (`_FAN_OUT_TIMEOUT_S`); a probe still running when it passes is
 killed unread and its session reads unknown, while one that already exited
 gets `_FAN_OUT_DRAIN_S` to hand over its output. The per-probe timeout it
-replaced made a wedged server cost N x timeout across a fleet of N.
+replaced made a wedged server cost N x timeout across a fleet of N. Because
+the window is paid once, it is sized for a loaded host, not an idle one: 10 s.
+Under a spawn storm a single `display-message` runs past 3 s (the measurement
+behind `FLASH_TIMEOUT_S`), and a storm is exactly when the send-verify reads
+the fan-out. At 5 s one slow start read every pane as unknown and skipped the
+re-send. The ceiling is the attach path: `idle_sessions` runs two fan-outs
+back to back, and on attach it runs inside the 30 s ssh read of
+`up --json --revive`.
 
 The agent images come from the registry, not a second list: each
 `AgentTool` carries `images` (`claude`, `codex`), and

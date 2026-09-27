@@ -727,7 +727,12 @@ def pane_pids(names: list[str], psmux: str | None = None) -> dict[str, int | Non
 
 # The whole pane-probe fan-out's wait budget, and how long a probe that has
 # already exited may take to hand over its output once that budget is spent.
-_FAN_OUT_TIMEOUT_S = 5.0
+# Paid once per batch, so it is sized for a loaded host: under a spawn storm a
+# single display-message runs past 3 s (see FLASH_TIMEOUT_S), and a spawn storm
+# is exactly when the bring-up's send-verify reads this. The ceiling is the
+# attach path: idle_sessions runs two fan-outs inside `up --json --revive`'s
+# 30 s ssh status read.
+_FAN_OUT_TIMEOUT_S = 10.0
 _FAN_OUT_DRAIN_S = 0.1
 
 
