@@ -2119,19 +2119,25 @@ def clocked_hold(monkeypatch) -> _Clock:
 
 class _ClockDaemon:
     """A node sync daemon on a ``_Clock``: from ``after`` seconds past down's
-    hold it holds its lock, pid 4242, until it is killed. It stands in for
-    node_sync's lock probe, pid, kill and pid check, so the REAL stop_daemon
-    stops it."""
+    hold it holds its lock, pid 4242, until it is killed. With ``again``, a
+    second one (pid 4243) holds it from ``again`` seconds past the hold once
+    the first is killed, until it is killed too. It stands in for node_sync's
+    lock probe, pid, kill and pid check, so the REAL stop_daemon stops it."""
 
-    def __init__(self, monkeypatch, clock: _Clock, after: float) -> None:
+    def __init__(
+        self, monkeypatch, clock: _Clock, after: float, again: float | None = None
+    ) -> None:
         from magent import node_sync
 
         self.clock = clock
         self.after = after
+        self.again = again
         self.kills: list[int] = []
         monkeypatch.setattr(node_sync, "daemon_running", self.running)
         monkeypatch.setattr(
-            node_sync, "daemon_pid", lambda: 4242 if self.running() else None
+            node_sync,
+            "daemon_pid",
+            lambda: (4243 if self.kills else 4242) if self.running() else None,
         )
         monkeypatch.setattr(node_sync, "_kill", self.kill)
         monkeypatch.setattr(node_sync, "pid_alive", lambda pid: self.running())
@@ -2142,10 +2148,14 @@ class _ClockDaemon:
 
     def running(self) -> bool:
         hold_at = self.clock.hold_at
+        if hold_at is None:
+            return False
+        if not self.kills:
+            return self.clock.t >= hold_at + self.after
         return (
-            not self.kills
-            and hold_at is not None
-            and self.clock.t >= hold_at + self.after
+            self.again is not None
+            and len(self.kills) == 1
+            and self.clock.t >= hold_at + self.again
         )
 
 
@@ -2961,6 +2971,23 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         assert clocked_hold.t == pytest.approx(
             clocked_hold.hold_at + 30.0 + node_sync.STOP_SETTLE_S, abs=0.06
         )
+
+    def test_with_both_hints_the_holds_later_deadline_stands(
+        self, runner, tmp_config, monkeypatch, tmp_path, clocked_hold
+    ):
+        # Both hints, and this time the hold's look ends later: the first stop
+        # kills the daemon it found, the held tick's own daemon locks 5 s after
+        # the hold, and the end comes at once. STOP_SETTLE_S from the end would
+        # give up at 2 s and leave it running.
+        pair = _ClockDaemon(monkeypatch, clocked_hold, after=0.0, again=5.0)
+        said = self._clocked_down(runner, tmp_config, monkeypatch, tmp_path, pulls=True)
+        assert pair.kills == [4242, 4243]
+        assert said == [
+            "Stopped the node sync daemon.",
+            "Stopped the node sync daemon again (serve restarted it during the pulls).",
+        ]
+        assert clocked_hold.hold_at is not None
+        assert clocked_hold.t == pytest.approx(clocked_hold.hold_at + 5.0, abs=0.06)
 
     @pytest.mark.parametrize("first", [True, False], ids=["stopped", "absent"])
     def test_an_end_stop_that_cannot_tell_is_said_after_a_first_stop_that_could(

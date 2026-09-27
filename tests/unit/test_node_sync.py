@@ -889,9 +889,10 @@ class TestServeSupervisesTheDaemon:
         _run_supervisor(path, stop)
         assert ensured == ([False] if where == "supervisor-lock" else [denied, False])
         assert _errors(caplog) == []
-        (warning,) = _warnings(caplog)
-        assert "PermissionError" in warning
-        assert "errno 13" in warning
+        warnings = _warnings(caplog)
+        assert len(warnings) == 1, warnings
+        assert "PermissionError" in warnings[0]
+        assert "errno 13" in warnings[0]
 
     def test_any_other_error_of_a_tick_is_still_logged_at_exception_level(
         self, sync_on, tmp_config, monkeypatch, caplog
@@ -904,9 +905,11 @@ class TestServeSupervisesTheDaemon:
 
         monkeypatch.setattr(launch, "ensure_node_sync", ensure)
         _run_supervisor(path, _one_tick())
-        (error,) = _errors(caplog)
-        assert error.getMessage() == "node sync supervisor: check failed"
-        assert error.exc_info is not None
+        errors = _errors(caplog)
+        assert [r.getMessage() for r in errors] == [
+            "node sync supervisor: check failed"
+        ]
+        assert errors[0].exc_info is not None
         assert _warnings(caplog) == ["node sync supervisor: check failed"]
 
     def test_a_config_lookup_that_raises_is_logged_and_survived(

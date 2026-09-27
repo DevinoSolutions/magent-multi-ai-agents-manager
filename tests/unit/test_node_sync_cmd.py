@@ -290,8 +290,11 @@ class TestNodeSync:
             for r in caplog.records
         )
 
+    @pytest.mark.parametrize(
+        "flags", [["--once"], ["--ticks", "1"]], ids=["once", "foreground-loop"]
+    )
     def test_an_oserror_of_the_tick_itself_is_not_an_unknown_daemon(
-        self, runner, pool_config, monkeypatch
+        self, runner, pool_config, monkeypatch, flags
     ):
         """Only the lock's open is "could not tell": an OSError the tick
         raised under a lock it did take stays itself."""
@@ -301,7 +304,7 @@ class TestNodeSync:
 
         monkeypatch.setattr(node_sync.NodeSyncer, "tick", full_disk)
         result = runner.invoke(
-            cli.main, ["--config", pool_config, "node", "sync", "--once"]
+            cli.main, ["--config", pool_config, "node", "sync", *flags]
         )
         assert isinstance(result.exception, OSError)
         assert "Could not tell" not in result.stdout
