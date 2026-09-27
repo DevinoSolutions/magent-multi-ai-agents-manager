@@ -2413,7 +2413,10 @@ class TestProvision:
         report = remote_mux.provision(
             NODE, scope, timeout_s=remote_mux.PROVISION_TIMEOUT_S
         )
-        (apply,) = fake_ssh.calls()
+        # No apply call is a refused payload: say so by assertion, not unpack.
+        calls = fake_ssh.calls()
+        assert len(calls) == 1, report.lines
+        (apply,) = calls
         _, _, data = _unpack(_sent(apply))
         assert data["skills/s/SKILL.md"] == b"# ok"
         assert all(b"BAD-DECOY" not in blob for blob in data.values())
@@ -2442,7 +2445,9 @@ class TestProvision:
         report = remote_mux.provision(
             NODE, nodes.user_scope(home), timeout_s=remote_mux.PROVISION_TIMEOUT_S
         )
-        (apply,) = fake_ssh.calls()
+        calls = fake_ssh.calls()
+        assert len(calls) == 1, report.lines
+        (apply,) = calls
         _, _, data = _unpack(_sent(apply))
         assert data["skills/deploy/SKILL.md"] == b"# ok"
         assert all(b"BAD-DECOY" not in blob for blob in data.values())
