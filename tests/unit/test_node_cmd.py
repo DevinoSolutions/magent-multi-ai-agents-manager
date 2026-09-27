@@ -1176,27 +1176,40 @@ class TestNodeSetupUnreachable:
         assert "cannot reach root@devino-second: " in result.stdout
 
     def test_an_over_cap_root_hop_may_still_have_run_and_gets_no_login_hint(
-        self, runner, tmp_config, fake_ssh, fake_gh, monkeypatch
+        self, runner, tmp_config, fake_ssh, fake_gh, monkeypatch, caplog
     ):
         # A reply over the cap is killed mid-run: like a timeout, setup.sh may
         # have run to the end, so neither the row nor a hint blames the root
-        # login -- the two can never contradict each other.
+        # login -- the two can never contradict each other. But the node
+        # ANSWERED (too much): not "no answer from", and the child's words
+        # after the cap line are the node's -- nodes.log's, never the screen's.
+        said = "setup.sh: line 40: the node's own words"
+
         def over_cap(node, users, pubkey, **kwargs):
-            raise remote_mux.RemoteError(
-                None,
-                f"reply exceeded {remote_mux.MAX_REPLY_BYTES} bytes",
-                ("ssh",),
-                over_cap=True,
-            )
+            raise _over_cap(said)
 
         monkeypatch.setattr(remote_mux, "setup_node", over_cap)
+        log.get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
         _pc_key()
         result = _setup(runner, _pool_file(tmp_config), "second")
         assert result.exit_code == 1
-        assert "setup may still be running there" in result.stdout
+        assert (
+            "root@devino-second answered, but its reply ran past the size cap -- "
+            "setup may still be running there: rerun magent node setup once it "
+            "has finished (every step is idempotent)"
+        ) in result.stdout
+        assert said not in result.output
+        assert "exceeded" not in result.output
+        assert "no answer from" not in result.stdout
         assert "cannot reach" not in result.stdout
         assert "ssh root@devino-second true" not in result.stdout
         assert fake_gh.calls() == []
+        assert any(
+            said in r.getMessage()
+            for r in caplog.records
+            if r.name == "magent.nodes" and r.levelno == logging.WARNING
+        )
 
     def test_the_real_over_cap_error_reads_as_outcome_unknown(self, fake_ssh):
         # The real raise, end to end: remote_mux flags it, and the predicate

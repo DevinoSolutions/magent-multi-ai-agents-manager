@@ -722,14 +722,29 @@ def _step_failed(node: Node, exc: RemoteError, step: str) -> ScriptLine:
 
     if not _outcome_unknown(exc):
         return _unreachable(node, exc)
+    rerun = (
+        f"{step} may still be running there: rerun magent node setup once it has "
+        "finished (every step is idempotent)"
+    )
+    if exc.over_cap:
+        # The node answered, too much. The tail after its first line is the
+        # child's own words: nodes.log's, never the screen's.
+        log.get_logger("nodes").warning(
+            "%s: %s: the reply ran past the size cap: %s",
+            node.target,
+            step,
+            exc.stderr_tail,
+        )
+        return ScriptLine(
+            "fail",
+            "reach",
+            f"{node.target} answered, but its reply ran past the size cap -- {rerun}",
+        )
+    # A timeout's tail is our own "timed out after Ns".
     return ScriptLine(
         "fail",
         "reach",
-        (
-            f"no answer from {node.target} ({exc.stderr_tail.strip()}) -- {step} "
-            "may still be running there: rerun magent node setup once it has "
-            "finished (every step is idempotent)"
-        ),
+        f"no answer from {node.target} ({exc.stderr_tail.strip()}) -- {rerun}",
     )
 
 
