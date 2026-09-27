@@ -182,8 +182,10 @@ def test_real_session_pane_cwd_and_kill(tmp_path):
 # This tier has no HOME isolation, so the test touches nothing but its own
 # private -L socket and tmp_path. The session is driven by raw psmux argv
 # against that one socket, not launch_psmux_session (which decorates, verifies
-# and can log under the real ~/.magent), and every process it starts ends on
-# its own bound even if the teardown never runs.
+# and can log under the real ~/.magent). The two commands it types into the
+# pane end on their own bounds even if the teardown never runs; the psmux
+# server and its pane shell do not, and die only by the finally block's
+# kill_server -- the same posture as the lifecycle test above.
 
 
 def test_real_pane_reads_idle_only_while_nothing_it_launched_runs(tmp_path):
@@ -215,7 +217,8 @@ def test_real_pane_reads_idle_only_while_nothing_it_launched_runs(tmp_path):
         "}\n",
         encoding="utf-8",
     )
-    # The agent image: PING.EXE under the name claude.exe, alive ~9s.
+    # The agent image: PING.EXE under the name claude.exe, alive ~19s -- room
+    # for a tree poll and two idle reads on a loaded runner.
     stand_in = tmp_path / "claude.exe"
     shutil.copyfile(ping, stand_in)
 
@@ -303,7 +306,7 @@ def test_real_pane_reads_idle_only_while_nothing_it_launched_runs(tmp_path):
             "send-keys",
             "-t",
             name,
-            f"& {_ps_quote(str(stand_in))} -n 10 127.0.0.1",
+            f"& {_ps_quote(str(stand_in))} -n 20 127.0.0.1",
             "Enter",
         )
         assert typed.returncode == 0, f"send-keys failed: {typed.stderr!r}"
