@@ -918,6 +918,28 @@ class NodeSyncer:
             log.info("node %s: load samples kept again", nick)
 
 
+class DaemonLockUnknown(Exception):
+    """The daemon's lock file would not open -- Windows answers EACCES while
+    one is pending delete -- so whether a daemon runs is unknown, and nothing
+    ran. ``run_once`` and ``run_sync_loop`` raise it from that open's error
+    (``error``), never for an OSError of a tick."""
+
+    def __init__(self, error: OSError) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
+def _take_daemon_lock(stack: contextlib.ExitStack) -> None:
+    """Hold ``LOCK_NAME`` on ``stack``. LockHeld when a daemon holds it;
+    DaemonLockUnknown when its file would not open."""
+    try:
+        stack.enter_context(exclusive_lock(LOCK_NAME))
+    except LockHeld:
+        raise
+    except OSError as e:
+        raise DaemonLockUnknown(e) from e
+
+
 def run_once(
     config: MagentConfig,
     *,
@@ -925,9 +947,11 @@ def run_once(
     | None = None,
 ) -> dict[str, tuple[str, str]]:
     """One tick under the daemon's lock (``magent node sync --once``). LockHeld
-    when the daemon is running -- its own next tick is the answer. The tick
-    waits for every pull: a one-shot has no next tick to collect a laggard."""
-    with exclusive_lock(LOCK_NAME):
+    when the daemon is running -- its own next tick is the answer --
+    DaemonLockUnknown when the lock would not open. The tick waits for every
+    pull: a one-shot has no next tick to collect a laggard."""
+    with contextlib.ExitStack() as stack:
+        _take_daemon_lock(stack)
         syncer = NodeSyncer(config, pull=pull)
         try:
             return syncer.tick()
@@ -948,6 +972,7 @@ def run_sync_loop(
     """The daemon body (``magent node sync``, detached by serve). Returns 0.
 
     - Another daemon holding ``node-sync``: exit quietly.
+    - Its lock file would not open: DaemonLockUnknown, and nothing ran.
     - Otherwise: pid file + heartbeat thread, then tick every
       ``tick_interval_s``, re-reading the config through ``reload`` (None
       keeps the current one) until no project runs on a node. Each tick waits
@@ -960,7 +985,7 @@ def run_sync_loop(
     log = get_logger(LOG_NAME)
     with contextlib.ExitStack() as stack:
         try:
-            stack.enter_context(exclusive_lock(LOCK_NAME))
+            _take_daemon_lock(stack)
         except LockHeld:
             log.info("node sync: another daemon holds the lock; exiting")
             return 0

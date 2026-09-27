@@ -847,6 +847,68 @@ class TestServeSupervisesTheDaemon:
             _run_supervisor(path, _one_tick())
         assert any("another server" in r.getMessage() for r in caplog.records)
 
+    @pytest.mark.parametrize("where", ["supervisor-lock", "daemon-lock"])
+    def test_a_lock_pending_delete_is_a_warning_that_skips_one_tick(
+        self, sync_on, tmp_config, monkeypatch, caplog, where
+    ):
+        """Windows answers EACCES while a lock file its last holder deleted is
+        still pending delete: serve's own lock, or the daemon's under
+        ensure_node_sync. A known transient -- a WARNING naming the class and
+        the errno, never an exception-level record (Sentry's), and the next
+        tick runs."""
+        from magent import upload_server
+
+        _capture_nodes_log(caplog)
+        path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
+        stop = threading.Event()
+        denied = PermissionError(13, "Access is denied")
+        answers: list[BaseException | bool] = [False]
+        if where == "supervisor-lock":
+            real_lock = upload_server.exclusive_lock
+            refusals = [denied]
+
+            def lock(name: str):
+                if name == node_sync.SUPERVISOR_LOCK_NAME and refusals:
+                    raise refusals.pop()
+                return real_lock(name)
+
+            monkeypatch.setattr(upload_server, "exclusive_lock", lock)
+        else:
+            answers.insert(0, denied)
+        ensured: list[BaseException | bool] = []
+
+        def ensure(_config, config_path=None):
+            answer = answers.pop(0)
+            ensured.append(answer)
+            if isinstance(answer, BaseException):
+                raise answer
+            stop.set()
+            return answer
+
+        monkeypatch.setattr(launch, "ensure_node_sync", ensure)
+        _run_supervisor(path, stop)
+        assert ensured == ([False] if where == "supervisor-lock" else [denied, False])
+        assert _errors(caplog) == []
+        (warning,) = _warnings(caplog)
+        assert "PermissionError" in warning
+        assert "errno 13" in warning
+
+    def test_any_other_error_of_a_tick_is_still_logged_at_exception_level(
+        self, sync_on, tmp_config, monkeypatch, caplog
+    ):
+        _capture_nodes_log(caplog)
+        path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
+
+        def ensure(_config, _config_path=None):
+            raise OSError(5, "Input/output error")
+
+        monkeypatch.setattr(launch, "ensure_node_sync", ensure)
+        _run_supervisor(path, _one_tick())
+        (error,) = _errors(caplog)
+        assert error.getMessage() == "node sync supervisor: check failed"
+        assert error.exc_info is not None
+        assert _warnings(caplog) == ["node sync supervisor: check failed"]
+
     def test_a_config_lookup_that_raises_is_logged_and_survived(
         self, sync_on, monkeypatch, caplog
     ):

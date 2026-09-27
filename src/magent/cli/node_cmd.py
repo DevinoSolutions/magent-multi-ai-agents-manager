@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import sys
 import time
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, NoReturn
 
 import click
 
@@ -75,6 +75,23 @@ def _say_unknown(cause: str) -> None:
         f"  {style('!', fg='yellow')} Could not tell whether the node sync daemon"
         f" stopped ({cause}); see nodes.log"
     )
+
+
+def _exit_running_unknown(exc: OSError) -> NoReturn:
+    """The daemon's lock file would not open (Windows answers EACCES while
+    one is pending delete), so whether a daemon runs is unknown: never "not
+    running", never a traceback. The class goes on screen, the whole error to
+    nodes.log, and it is not a success."""
+    from magent import node_sync  # heavy subsystem: in-body per policy
+
+    log.get_logger(node_sync.LOG_NAME).warning(
+        "node sync: could not tell whether the daemon is running: %s", exc
+    )
+    click.echo(
+        f"  {style('!', fg='yellow')} Could not tell whether the node sync daemon"
+        f" is running ({type(exc).__name__}); see nodes.log"
+    )
+    sys.exit(1)
 
 
 def stop_node_sync_and_say(*, say_absent: bool = True) -> NodeSyncStop:
@@ -264,6 +281,8 @@ def sync_cmd(
                 "its own next tick is this one."
             )
             return
+        except node_sync.DaemonLockUnknown as exc:
+            _exit_running_unknown(exc.error)
         failed = False
         for nick, (outcome, detail) in sorted(results.items()):
             ok = outcome == node_sync.OK
@@ -277,7 +296,11 @@ def sync_cmd(
 
     # "Running" is the daemon's lock, never its pid file: a pid file outlives
     # a crash and its number is recycled onto strangers (daemon_running).
-    if node_sync.daemon_running():
+    try:
+        running = node_sync.daemon_running()
+    except OSError as exc:
+        _exit_running_unknown(exc)
+    if running:
         existing = node_sync.daemon_pid()
         shown = f"(pid {existing})" if existing else "(pid unknown)"
         click.echo(
@@ -335,8 +358,13 @@ def sync_cmd(
         f"  {style('#', fg='cyan')} Syncing {len(cfg.settings.nodes)} node(s)"
         " -- Ctrl+C to stop."
     )
-    node_sync.run_sync_loop(
-        cfg,
-        max_ticks=ticks,
-        reload=node_sync.ConfigWatch(config_file, cfg, stamp=stamp).current,
-    )
+    try:
+        node_sync.run_sync_loop(
+            cfg,
+            max_ticks=ticks,
+            reload=node_sync.ConfigWatch(config_file, cfg, stamp=stamp).current,
+        )
+    except node_sync.DaemonLockUnknown as exc:
+        # The probe above opened the lock file and this take, right after,
+        # did not: on Windows the probe's own delete can leave it pending.
+        _exit_running_unknown(exc.error)

@@ -1564,6 +1564,16 @@ def _supervise_node_sync(
                     # stop_event.wait(interval) below and spin the thread.
                     else:
                         ensure_node_sync(config, config_path)
+        except PermissionError as exc:
+            # Windows answers EACCES while a lock file -- this one, or the
+            # daemon's under ensure_node_sync -- is still pending delete. Known
+            # and transient: not a failed check, and the next tick tries again.
+            log.warning(
+                "node sync supervisor: tick skipped (%s, errno %s): %s",
+                type(exc).__name__,
+                exc.errno,
+                exc,
+            )
         except Exception:
             log.exception("node sync supervisor: check failed")
         if stop_event.wait(interval):
