@@ -42,20 +42,6 @@ if TYPE_CHECKING:
 # D_ATTRS: launch.node_recipe, launch.node_git_states,
 # launch.bring_up_node_project, launch.NodeBringUpOutcome,
 # remote_mux.push_files, remote_mux.kill_session.
-# - recall --to (Task 15): the option (:3934) and its usage rule; the two
-#   `to_local` guards -- `_local_dir` only for --local (:3960-3962), and
-#   `_recall_local` back under `if local_dir is not None:` with `_recall_to`
-#   as its `elif` (:3969-3970, :4252-4266); `_destination` and `_recall_to`
-#   (:4173-4249), which need `import dataclasses` (above) and add `nodes` to
-#   their in-body `from magent import launch, remote_mux` like every other
-#   function here -- the plan's code reads a module-level `nodes`; the recall
-#   docs row's "(--to <nick> | --local)" wording in cli/docs.py; regenerate the
-#   help snapshots in tests/unit/test_cli_structure.py -- the ("node",
-#   "recall") entry and, if the docstring changes, the ("node",) group's
-#   short help. Needs node_recipe, node_git_states, bring_up_node_project,
-#   NodeBringUpOutcome.
-# - `Path` is a RUNTIME import (recall builds paths at run time); keep it out
-#   of TYPE_CHECKING when D's imports are merged.
 # Exit criterion: after D merges,
 #   uv run pytest tests/unit/test_node_cmd.py tests/unit/test_node_recall.py -rs
 # shows no skip reason containing "D-MERGE", and
@@ -493,10 +479,12 @@ def sync_cmd(
 #     installed, the placement not cleared;
 # 2 = nothing to act on (unknown project, not a node project, a push of a
 #     project not placed yet, a recipe that cannot be built, a recall of a
-#     project the node-map does not place, bad destination);
+#     project the node-map does not place, bad destination -- an unknown
+#     node, the one it is on, a pinned project, a root the install refuses);
 # 3 = the node could not be acted on: recall's last pull finding the
-#     node-sync daemon still holding that node's lock, and a node that did not
-#     take push's files.
+#     node-sync daemon still holding that node's lock, a node that did not
+#     take push's files, and recall --to's new node refusing the install or
+#     failing the bring-up.
 # A plan that places a project nowhere is an answer, not a failure: it exits
 # 0. A node that does not answer during recall --local is a note, never an
 # exit: recall goes on with what was already pulled. So is a last pull that
@@ -1237,26 +1225,132 @@ def _recall_local(
     )
 
 
-# D-MERGE: `recall --to NICK` (plan G Task 15) moves the session through D's
-# recipe builder and bring-up, so until D lands a recall can only go home.
-# With D it lands as:
-# - the option at :3934, and the usage rule "pass exactly one of --to <nick>
-#   or --local";
-# - `_destination` and `_recall_to` (:4173-4249), `_destination` called
-#   before the heading and `_recall_to` as the `elif` after `_recall_local`
-#   (:4252-4266);
-# - the two `to_local` guards come back with it: `local_dir = _local_dir(cfg,
-#   proj) if to_local else None` with its refusal (:3960-3962), and `if
-#   local_dir is not None: _recall_local(...)` (:3969-3970). Today
-#   `_local_dir` runs unconditionally, so without them a --to recall of a
-#   project with no local clone would wrongly exit 2;
-# - per the forward correction at :4015, `_recall_to` reads
-#   `InstalledTranscripts.landed` for the directory it names and prints
-#   `.note` (the kept-items line) when it is non-empty -- never the object;
-# - the sid check below already covers --to (:3976).
-# tests/unit/test_node_recall.py::TestRecallTo is written and switches on then.
+def _destination(
+    cfg: MagentConfig, proj: ProjectConfig, held: NodeMapEntry, to_nick: str
+) -> tuple[Node, str]:
+    """Everything ``--to`` can refuse, checked BEFORE the source session is
+    touched: the node and the session root the conversation goes to."""
+    # heavy subsystem: in-body per policy
+    from magent import launch, nodes, remote_mux
+
+    name = nodes.project_name(proj)
+    if to_nick not in cfg.settings.nodes:
+        _fail(f"no node named {to_nick!r} in settings.nodes", _EXIT_USAGE)
+    if to_nick == held.nick:
+        _fail(f"{name} is already on @{to_nick}", _EXIT_USAGE)
+    if proj.node != NODE_AUTO:
+        _fail(
+            f'{name} is pinned to @{proj.node} in config; change its "node" to'
+            f' "{to_nick}" (or "auto") to move it',
+            _EXIT_USAGE,
+        )
+    try:
+        target = nodes.node_for_nick(cfg, to_nick, local_user=env.local_username())
+    except nodes.NodeConfigError as exc:
+        _fail(str(exc), _EXIT_USAGE)
+    moved = dataclasses.replace(proj, node=to_nick)
+    try:
+        # D's one recipe builder (DECISION-22), so the root is the one the
+        # bring-up will record.
+        recipe = launch.node_recipe(
+            cfg, moved, target, launch.node_git_states(cfg, moved)
+        )
+    except (OSError, ValueError, remote_mux.RemoteError) as exc:
+        text = _local_failure(exc, f"recall could not build {name}'s recipe")
+        _fail(f"cannot build {name}'s recipe ({text})", _EXIT_USAGE)
+    return target, recipe.remote_root
+
+
+def _recall_to(
+    cfg: MagentConfig,
+    proj: ProjectConfig,
+    held: NodeMapEntry,
+    target: Node,
+    remote_root: str,
+    resume_id: str | None,
+) -> None:
+    """Steps 4-5 for ``--to``: install on the new node, clear the placement,
+    then the normal bring-up resuming the newest conversation (G-C8: its own
+    ssh call, so D's bring_up.sh is untouched). A refused install keeps the
+    OLD placement -- `magent up` resumes it where it was."""
+    # heavy subsystem: in-body per policy
+    from magent import launch, node_sync, nodes, remote_mux
+
+    name = nodes.project_name(proj)
+    if resume_id is not None:
+        try:
+            installed = remote_mux.install_transcripts(
+                target,
+                remote_root,
+                nodes.transcripts_dir(held.nick, held.sid),
+                timeout_s=remote_mux.INSTALL_TIMEOUT_S,
+            )
+        except remote_mux.RemoteError as exc:
+            _fail(
+                f"could not install the conversation on @{target.nick}"
+                f" ({_tail(exc)}); {name} stays placed on @{held.nick} --"
+                f" `magent up {name}` resumes it there",
+                _EXIT_UNREACHABLE,
+            )
+        except nodes.NodeConfigError as exc:
+            # A root the install will not send, refused before any dial.
+            _fail(
+                f"could not install the conversation on @{target.nick} ({exc});"
+                f" {name} stays placed on @{held.nick}",
+                _EXIT_USAGE,
+            )
+        # The node's reply (where it landed, what it kept): printable ASCII
+        # only on this screen. Forward correction (plan G :4015): the line
+        # names .landed and prints .note, never the object.
+        _ok(
+            f"installed the conversation on @{target.nick} in"
+            f" {node_sync.printable(installed.landed)}"
+        )
+        if installed.note:
+            _note(node_sync.printable(installed.note))
+    else:
+        _note(
+            f"nothing was ever pulled from @{held.nick} for {held.sid};"
+            f" {name} starts fresh on @{target.nick}"
+        )
+    # A held map lock stops the move here, before the bring-up.
+    _clear_placement(name, held)
+    outcome = launch.bring_up_node_project(
+        cfg, dataclasses.replace(proj, node=target.nick), resume_id=resume_id
+    )
+    if not outcome.ok:
+        # The error can be the node's last stderr line (D's _node_error_text).
+        installed_there = (
+            " The conversation is installed there;" if resume_id is not None else ""
+        )
+        _fail(
+            f"bring-up on @{target.nick} failed:"
+            f" {node_sync.printable(outcome.error or 'see nodes.log')}."
+            f"{installed_there} `magent up {name}` tries again"
+            " (auto placement chooses by load)",
+            _EXIT_UNREACHABLE,
+        )
+    for warning in outcome.warnings:
+        _note(node_sync.printable(warning))
+    if outcome.attached_existing:
+        # D attached to a session already running there: nothing was resumed.
+        _ok(f"{name} was already running on @{target.nick}; attached to it")
+        return
+    _ok(
+        f"{name} runs on @{target.nick}"
+        + (f", resuming {resume_id}" if resume_id else "")
+    )
+
+
 @node_group.command("recall")
 @click.argument("project")
+@click.option(
+    "--to",
+    "to_nick",
+    default=None,
+    metavar="NICK",
+    help="Move the session to this node and resume it there.",
+)
 @click.option(
     "--local",
     "to_local",
@@ -1264,18 +1358,20 @@ def _recall_local(
     help="Bring the session home and print the command that resumes it.",
 )
 @click.pass_context
-def recall_cmd(ctx: click.Context, project: str, to_local: bool) -> None:
-    """Bring a node session home and print the command that resumes it.
+def recall_cmd(
+    ctx: click.Context, project: str, to_nick: str | None, to_local: bool
+) -> None:
+    """Bring a node session home, or move it to another node.
 
     Pulls once more, reports the node's last commit per repo, stops the
-    session, installs its conversation and memory where this machine's
+    session, installs its conversation and memory where the destination's
     Claude looks, and clears the placement. A node that does not answer is
     reported, never fatal: what was already pulled is used.
     """
     from magent import nodes  # heavy subsystem: in-body per policy
 
-    if not to_local:
-        raise click.UsageError("pass --local")
+    if (to_nick is not None) == to_local:
+        raise click.UsageError("pass exactly one of --to <nick> or --local")
     cfg = _load_config_or_exit(find_config(ctx.obj.get("config_path")))
     proj = _node_project_or_exit(cfg, project)
     name = nodes.project_name(proj)
@@ -1319,13 +1415,16 @@ def recall_cmd(ctx: click.Context, project: str, to_local: bool) -> None:
             " machine cannot store; nothing was touched",
             _EXIT_USAGE,
         )
-    local_dir = _local_dir(cfg, proj)
-    if local_dir is None:
+    local_dir = _local_dir(cfg, proj) if to_local else None
+    if to_local and local_dir is None:
         _fail(
             f"{proj.path} does not exist on this machine -- clone it first,"
             " then recall",
             _EXIT_USAGE,
         )
+    destination = (
+        _destination(cfg, proj, held, to_nick) if to_nick is not None else None
+    )
     click.echo(
         f"\n  {style(f'magent node recall {name}', bold=True)}"
         f" {style(f'(from @{held.nick})', dim=True)}"
@@ -1335,4 +1434,8 @@ def recall_cmd(ctx: click.Context, project: str, to_local: bool) -> None:
     _report_repos(source if reachable else None, held)
     _stop_session(source if reachable else None, held)
     resume_id = nodes.latest_transcript_id(held.nick, held.sid)
-    _recall_local(held, name, local_dir, resume_id)
+    if local_dir is not None:
+        _recall_local(held, name, local_dir, resume_id)
+    elif destination is not None:
+        target, remote_root = destination
+        _recall_to(cfg, proj, held, target, remote_root, resume_id)

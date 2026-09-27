@@ -37,21 +37,8 @@ from tests.unit._node_fixtures import (
     config_json,
     entry,
     git,
-    needs_d,
     pool,
     write_transcript,
-)
-
-# D-MERGE: `recall --to` (D's recipe builder and bring-up; plan G Task 15,
-# :4173-4266) is gated through _node_fixtures' one D_ATTRS list: needs_d
-# switches the written tests on with D's merge, and they fail until the
-# deferred code lands.
-_NEEDS_D_MOVE = needs_d(
-    "node_recipe",
-    "node_git_states",
-    "bring_up_node_project",
-    "NodeBringUpOutcome",
-    plan=":4173-4266",
 )
 
 
@@ -1728,12 +1715,6 @@ def _claude_dir(path: Path) -> Path:
     return Path.home() / ".claude" / "projects" / nodes.encoded_project_dir(str(path))
 
 
-def _recall_has_to() -> bool:
-    """Whether `node recall` has grown Task 15's --to (it needs D)."""
-    recall = cli.main.commands["node"].commands["recall"]
-    return any(p.name == "to_nick" for p in recall.params)
-
-
 def _recall(runner, cfg: str, *args: str):
     return runner.invoke(cli.main, ["--config", cfg, "node", "recall", "api", *args])
 
@@ -1977,18 +1958,7 @@ class TestRecallLocal:
 
     @pytest.mark.parametrize(
         "flags",
-        [
-            [],
-            # D-MERGE: --to arrives with plan G Task 15 (D's bring-up); until
-            # then this case would pass on "No such option", not on the rule.
-            pytest.param(
-                ["--local", "--to", "third"],
-                marks=pytest.mark.skipif(
-                    not _recall_has_to(),
-                    reason="D-MERGE: --to lands with plan G Task 15",
-                ),
-            ),
-        ],
+        [[], ["--local", "--to", "third"]],
     )
     def test_exactly_one_destination_is_required(
         self, runner, placed_api, node_answers, flags
@@ -3165,15 +3135,7 @@ def _invoke_recall_to(runner, cfg: str, nick: str):
     )
 
 
-@_NEEDS_D_MOVE
 class TestRecallTo:
-    @pytest.fixture(autouse=True)
-    def _the_option_has_landed(self):
-        # D-MERGE: once D's attributes exist this class runs; without Task
-        # 15's --to, three of its refusals would pass on click's "No such
-        # option" exit 2. Every test here fails loudly until the option lands.
-        assert _recall_has_to(), "recall --to has not landed (plan G :3934)"
-
     def test_the_conversation_is_installed_on_the_new_node_then_resumed_there(
         self, runner, placed_api, node_answers, moving
     ):
@@ -3349,6 +3311,172 @@ class TestRecallTo:
         assert "'../escaped'" in result.stderr
         assert node_answers == []
         assert events == []
+
+    def test_what_the_node_says_about_the_install_is_printable_ascii(
+        self, runner, placed_api, node_answers, moving, monkeypatch
+    ):
+        # The landed path and the kept names are the node's reply: ESC and
+        # non-ASCII never reach this terminal (node_sync.printable).
+        installed = remote_mux.InstalledTranscripts(
+            landed="/home/amin/.claude/projects/\x1b[31mapi",
+            kept=("\u00e9t\u00e9.jsonl",),
+        )
+        monkeypatch.setattr(
+            remote_mux,
+            "install_transcripts",
+            lambda node, remote_root, source, *, timeout_s: installed,
+        )
+
+        result = _invoke_recall_to(runner, placed_api, "third")
+
+        assert result.exit_code == 0
+        assert "\x1b" not in result.output
+        assert "in /home/amin/.claude/projects/?[31mapi" in result.stdout
+        assert "copy of 1 item(s): ?t?.jsonl" in result.stdout
+
+    def test_a_failed_bring_up_shows_the_nodes_words_as_printable_ascii(
+        self, runner, placed_api, node_answers, moving, monkeypatch
+    ):
+        monkeypatch.setattr(
+            launch,
+            "bring_up_node_project",
+            lambda config, proj, *, resume_id=None, **_k: launch.NodeBringUpOutcome(
+                ok=False, sid="api", node=proj.node, error="clone \x1b]0;x\x07failed"
+            ),
+        )
+
+        result = _invoke_recall_to(runner, placed_api, "third")
+
+        assert result.exit_code == 3
+        assert "\x1b" not in result.output and "\x07" not in result.output
+        assert "bring-up on @third failed: clone ?]0;x?failed." in result.stderr
+
+    def test_the_bring_ups_warnings_are_shown(
+        self, runner, placed_api, node_answers, moving, monkeypatch
+    ):
+        # D's warnings are true but non-fatal -- "up but not recorded" among
+        # them, which the user must see to re-run.
+        monkeypatch.setattr(
+            launch,
+            "bring_up_node_project",
+            lambda config, proj, *, resume_id=None, **_k: launch.NodeBringUpOutcome(
+                ok=True,
+                sid="api",
+                node=proj.node,
+                warnings=("up on @third but not recorded (LockHeld); re-run",),
+            ),
+        )
+
+        result = _invoke_recall_to(runner, placed_api, "third")
+
+        assert result.exit_code == 0
+        assert "up on @third but not recorded (LockHeld); re-run" in result.stdout
+        assert "api runs on @third, resuming" in result.stdout
+
+    def test_a_session_already_running_there_is_attached_never_resumed(
+        self, runner, placed_api, node_answers, moving, monkeypatch
+    ):
+        monkeypatch.setattr(
+            launch,
+            "bring_up_node_project",
+            lambda config, proj, *, resume_id=None, **_k: launch.NodeBringUpOutcome(
+                ok=True, sid="api", node=proj.node, attached_existing=True
+            ),
+        )
+
+        result = _invoke_recall_to(runner, placed_api, "third")
+
+        assert result.exit_code == 0
+        assert "api was already running on @third; attached to it" in result.stdout
+        assert "resuming" not in result.stdout
+
+    def test_a_root_the_install_refuses_is_a_usage_error_that_keeps_the_placement(
+        self, runner, placed_api, node_answers, moving, monkeypatch
+    ):
+        events, _ = moving
+
+        def _bad_root(node, remote_root, source, *, timeout_s):
+            raise nodes.NodeConfigError("session root '..' is not under ~")
+
+        monkeypatch.setattr(remote_mux, "install_transcripts", _bad_root)
+
+        result = _invoke_recall_to(runner, placed_api, "third")
+
+        assert result.exit_code == 2
+        assert "Traceback" not in result.output
+        assert "session root '..' is not under ~" in result.stderr
+        assert "api stays placed on @second" in result.stderr
+        assert nodes.read_node_map()["api"].nick == "second"
+        assert [e for e in events if e[0] == "bring_up"] == []
+
+    def test_nothing_pulled_installs_nothing_and_starts_fresh(
+        self, runner, api_repo, tmp_config, node_answers, moving
+    ):
+        events, _ = moving
+        nodes.update_node_map("api", entry("second"))
+        cfg = tmp_config(
+            config_json(
+                ("second", "third"),
+                [{"path": str(api_repo), "title": "api", "node": "auto"}],
+            )
+        )
+
+        result = _invoke_recall_to(runner, cfg, "third")
+
+        assert result.exit_code == 0
+        assert events == [("bring_up", "third", None)]
+        assert "api starts fresh on @third" in result.stdout
+        assert "api runs on @third\n" in result.stdout
+
+    def test_a_failed_fresh_bring_up_never_claims_an_install(
+        self, runner, api_repo, tmp_config, node_answers, moving, monkeypatch
+    ):
+        nodes.update_node_map("api", entry("second"))
+        cfg = tmp_config(
+            config_json(
+                ("second", "third"),
+                [{"path": str(api_repo), "title": "api", "node": "auto"}],
+            )
+        )
+        monkeypatch.setattr(
+            launch,
+            "bring_up_node_project",
+            lambda config, proj, *, resume_id=None, **_k: launch.NodeBringUpOutcome(
+                ok=False, sid="api", node=proj.node, error="no python3"
+            ),
+        )
+
+        result = _invoke_recall_to(runner, cfg, "third")
+
+        assert result.exit_code == 3
+        assert "bring-up on @third failed: no python3." in result.stderr
+        assert "installed there" not in result.output
+
+    def test_a_recipe_this_pc_cannot_build_is_named_by_class_before_the_move(
+        self, runner, placed_api, node_answers, moving, monkeypatch, caplog
+    ):
+        # The git read failing on this PC: the class on screen, the whole
+        # error (a local path) in nodes.log, and the source never touched.
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        events, _ = moving
+        error = PermissionError(13, "Access is denied", "C:/Users/me/api/.git")
+
+        def _denied(config, proj):
+            raise error
+
+        monkeypatch.setattr(launch, "node_git_states", _denied)
+
+        result = _invoke_recall_to(runner, placed_api, "third")
+
+        assert result.exit_code == 2
+        assert (
+            "cannot build api's recipe (local error: PermissionError; see nodes.log)"
+        ) in result.stderr
+        assert "C:/Users/me" not in result.output
+        assert any(str(error) in m for m in _node_logs(caplog)), _node_logs(caplog)
+        assert node_answers == []
+        assert events == []
+        assert nodes.read_node_map()["api"].nick == "second"
 
 
 def _node_logs(caplog) -> list[str]:

@@ -495,14 +495,13 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "session."
         ),
     ),
-    # D-MERGE: plan G Task 14's row reads "(--to <nick> | --local)" and names
-    # the move to another node; restore it when Task 15's --to lands with D.
     (
-        "magent node recall <project> --local",
+        "magent node recall <project> (--to <nick> | --local)",
         (
-            "Bring a node session home: `--local` prints the `claude --resume` "
-            "to run after a `git pull`. Pulls once more first; a node that does "
-            "not answer is reported, not fatal."
+            "Bring a node session home (`--local` prints the `claude --resume` "
+            "to run after a `git pull`) or move it to another node and resume it "
+            "there. Pulls once more first; a node that does not answer is "
+            "reported, not fatal."
         ),
     ),
     ("magent config show", "Display current config."),

@@ -158,7 +158,7 @@ HELP_SNAPSHOTS = {
     ): "Usage: main config path [OPTIONS]\n\n  Print the config file path.\n\nOptions:\n  --help  Show this message and exit.\n",
     (
         "node",
-    ): "Usage: main node [OPTIONS] COMMAND [ARGS]...\n\n  Run projects on a pool of Linux machines over ssh.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  plan    Show where a node project would run and what it would ship.\n  push    Re-ship a project's non-git files (.env* etc.) to its node.\n  recall  Bring a node session home and print the command that resumes it.\n  sync    Mirror every node's sessions, load and agent state onto this PC.\n",
+    ): "Usage: main node [OPTIONS] COMMAND [ARGS]...\n\n  Run projects on a pool of Linux machines over ssh.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  plan    Show where a node project would run and what it would ship.\n  push    Re-ship a project's non-git files (.env* etc.) to its node.\n  recall  Bring a node session home, or move it to another node.\n  sync    Mirror every node's sessions, load and agent state onto this PC.\n",
     (
         "node",
         "plan",
@@ -170,7 +170,7 @@ HELP_SNAPSHOTS = {
     (
         "node",
         "recall",
-    ): "Usage: main node recall [OPTIONS] PROJECT\n\n  Bring a node session home and print the command that resumes it.\n\n  Pulls once more, reports the node's last commit per repo, stops the session,\n  installs its conversation and memory where this machine's Claude looks, and\n  clears the placement. A node that does not answer is reported, never fatal:\n  what was already pulled is used.\n\nOptions:\n  --local  Bring the session home and print the command that resumes it.\n  --help   Show this message and exit.\n",
+    ): "Usage: main node recall [OPTIONS] PROJECT\n\n  Bring a node session home, or move it to another node.\n\n  Pulls once more, reports the node's last commit per repo, stops the session,\n  installs its conversation and memory where the destination's Claude looks, and\n  clears the placement. A node that does not answer is reported, never fatal:\n  what was already pulled is used.\n\nOptions:\n  --to NICK  Move the session to this node and resume it there.\n  --local    Bring the session home and print the command that resumes it.\n  --help     Show this message and exit.\n",
     (
         "node",
         "sync",
