@@ -247,9 +247,7 @@ def test_real_pane_reads_idle_only_while_nothing_it_launched_runs(tmp_path):
             f" pane tree={pane_images()!r}"
         )
 
-    created = False
     try:
-        created = True  # a create that timed out may still have a server up
         # env=child_env(): psmux's nesting guard refuses new-session from
         # inside a psmux pane while still exiting 0 (see launch_psmux_session).
         new = run(
@@ -322,8 +320,9 @@ def test_real_pane_reads_idle_only_while_nothing_it_launched_runs(tmp_path):
         )
     finally:
         release.touch()
-        if created:
-            psmux.kill_server(name, psmux=binary)  # only ever targets our name
+        # Unconditional: a new-session that failed or timed out may still have
+        # left a server up. Only ever targets our own -L name.
+        psmux.kill_server(name, psmux=binary)
 
     assert _wait_until(lambda: not psmux.has_session(name), timeout=5), (
         f"cleanup left psmux session {name!r} alive"

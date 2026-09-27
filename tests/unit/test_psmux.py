@@ -204,6 +204,10 @@ class _FakePopen:
             raise subprocess.TimeoutExpired(cmd="psmux", timeout=timeout or 0)
         return self._stdout, ""
 
+    def poll(self):
+        # A probe built to time out is one psmux never answered: still running.
+        return None if self._timeout else self.returncode
+
     def kill(self):
         self.killed = True
 
