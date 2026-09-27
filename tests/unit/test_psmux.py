@@ -335,6 +335,19 @@ class _AnsweredProbe:
         pass
 
 
+class _LateProbe(_AnsweredProbe):
+    """A probe that answers, but only after ``delay`` of the budget it is
+    handed has gone by."""
+
+    def __init__(self, stdout, delay):
+        super().__init__(stdout)
+        self._delay = delay
+
+    def communicate(self, timeout=None):
+        time.sleep(self._delay)
+        return super().communicate(timeout)
+
+
 class TestTheFanOutWaitsOnOneDeadline:
     """Every probe is spawned before any is read, so they all run at once --
     and the WAIT is one budget too. Waiting a full timeout per probe meant a
@@ -379,6 +392,21 @@ class TestTheFanOutWaitsOnOneDeadline:
             "a": "",
             "b": "pwsh",
         }
+
+    def test_a_late_answer_does_not_buy_the_next_probe_a_fresh_budget(
+        self, monkeypatch
+    ):
+        # The first probe answers after most of the budget; the hung one after
+        # it may only have what is left. A fresh full timeout here is how the
+        # "one budget" worst case quietly becomes two.
+        hung = _HungProbe()
+        self._fan(monkeypatch, [_LateProbe("pwsh\n", self.BUDGET_S * 0.6), hung])
+        assert psmux.pane_current_commands(["a", "b"], psmux="psmux") == {
+            "a": "pwsh",
+            "b": "",
+        }
+        assert hung.killed
+        assert all(waited < self.BUDGET_S * 0.8 for waited in hung.waited), hung.waited
 
 
 class TestIsIdleCommand:
