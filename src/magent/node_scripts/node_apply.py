@@ -299,7 +299,8 @@ def _target(ctx: Ctx, item: str, path: Path, shown: str, status: str) -> Path | 
         ctx,
         status,
         item,
-        f"{shown} is a dangling link to {real}; left alone, fix or remove it",
+        f"{shown} is a dangling link to {_printable(str(real))}; left alone, "
+        "fix or remove it",
     )
     return None
 

@@ -3267,3 +3267,27 @@ class TestASymlinkedMcpFileIsWrittenThroughItsLink:
             ),
         )
         assert not _credentials(box).exists()
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX symlinks and byte names")
+    def test_a_dangling_link_to_a_name_not_in_utf_8_is_named_escaped(
+        self, box, tmp_path, capsys
+    ):
+        # The link's target is read off the node's disk; raw in the row, a
+        # lone surrogate raised out of _say under provision.sh's strict
+        # PYTHONIOENCODING=utf-8 and the step failed with that class instead.
+        gone = tmp_path / "dot\udce9" / ".claude.json"
+        try:
+            _claude_json(box).symlink_to(gone)
+        except (OSError, UnicodeError):
+            pytest.skip("this filesystem refuses a name that is not UTF-8")
+        box.apply(_work(tmp_path, _two()))
+        (line,) = [line for line in _lines(capsys) if line.item == "mcp_oauth"]
+        shown = str(gone).replace("\udce9", "\\udce9")
+        assert (line.status, line.detail) == (
+            "warn",
+            (
+                f"~/.claude.json is a dangling link to {shown}; left alone, "
+                "fix or remove it"
+            ),
+        )
+        assert not _credentials(box).exists()
