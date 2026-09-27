@@ -46,8 +46,9 @@ def _write_module_form(settings_file, cmd=MODULE_CMD):
 
 
 # What every repair is: true of a pre-3.1.2 console-script path and of a
-# module-form interpreter path alike, unlike a version-specific origin.
-REPAIR_SUFFIX = "(backslash path bash cannot run)"
+# drive-letter module-form interpreter path alike, unlike a version-specific
+# origin -- and unlike "bash cannot run", which a double-quoted one can.
+REPAIR_SUFFIX = "(Windows backslash path)"
 
 
 def _repaired_line(output):
