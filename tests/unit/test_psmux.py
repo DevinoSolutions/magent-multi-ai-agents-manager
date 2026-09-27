@@ -1188,6 +1188,10 @@ class TestControlCommandsInheritTheEnvironment:
             def communicate(self, timeout=None):
                 return "claude", ""
 
+            def poll(self):
+                # Answers at once, so it has always exited by the time it's asked.
+                return self.returncode
+
         def _popen(cmd, **kwargs):
             seen.append(kwargs.get("env"))
             return _Proc()
