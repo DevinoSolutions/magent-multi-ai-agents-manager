@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import dataclasses
+import errno
 import importlib.util
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import MISSING
 from pathlib import Path, PurePosixPath
 
@@ -36,6 +39,7 @@ from magent.nodes import (
 )
 from magent.sessions import IDE_TOOLS, is_ide_tool
 from tests.conftest import REAL_MAGENT_DIR
+from tests.unit._deny_stat import deny_open, deny_scandir, deny_stat
 
 NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
 
@@ -1191,6 +1195,15 @@ def _real_state(repo: Path) -> LocalGitState:
     return _state(repo, remote_mux.ignored_paths(repo, timeout_s=30, label="test"))
 
 
+def _raised_or(work):
+    """``work()``'s answer, or the OSError it raised: a pin compares either
+    against what it expects, so "it raised" fails as a wrong answer."""
+    try:
+        return work()
+    except OSError as exc:
+        return exc
+
+
 class TestGitsIgnoredListing:
     def test_a_wholly_ignored_directory_is_one_entry(self, repo):
         listing = remote_mux.ignored_paths(repo, timeout_s=30, label="test")
@@ -1240,6 +1253,76 @@ class TestGitsIgnoredListing:
         assert err.value.command_redacted[0] == "git"
 
 
+class TestUnknownIsNeverAbsent:
+    """``nodes.path_mode`` answers "nothing there" only when the OS said so;
+    anything it cannot tell raises, on every Python -- 3.14's Path.is_dir/
+    is_file/exists answer False for every OSError instead."""
+
+    def test_a_folder_a_file_and_nothing(self, tmp_path):
+        (tmp_path / "f").write_text("x", encoding="utf-8")
+        mode = nodes.path_mode(tmp_path)
+        assert mode is not None
+        assert stat.S_ISDIR(mode)
+        assert nodes.path_is_dir(tmp_path)
+        assert not nodes.path_is_file(tmp_path)
+        assert nodes.path_is_file(tmp_path / "f")
+        assert not nodes.path_is_dir(tmp_path / "f")
+        assert nodes.path_mode(tmp_path / "gone") is None
+        assert not nodes.path_exists(tmp_path / "gone")
+        assert not nodes.path_is_dir(tmp_path / "gone")
+
+    def test_under_a_file_is_nothing(self, tmp_path):
+        (tmp_path / "f").write_text("x", encoding="utf-8")
+        assert nodes.path_mode(tmp_path / "f" / "x") is None
+
+    def test_a_name_the_os_cannot_hold_is_nothing(self, tmp_path):
+        assert nodes.path_mode(tmp_path / "a\0b") is None
+
+    @pytest.mark.parametrize("code", [errno.ENOENT, errno.ENOTDIR, errno.ELOOP])
+    def test_no_such_entry_is_nothing(self, tmp_path, monkeypatch, code):
+        deny_stat(monkeypatch, tmp_path, code=code)
+        assert nodes.path_mode(tmp_path) is None
+
+    @pytest.mark.parametrize(
+        "code", [errno.EACCES, errno.EPERM, errno.EIO, errno.EBADF]
+    )
+    def test_what_cannot_be_told_raises(self, tmp_path, monkeypatch, code):
+        # EBADF included: 3.10-3.13's pathlib read it as "not there".
+        deny_stat(monkeypatch, tmp_path, code=code)
+        with pytest.raises(OSError) as exc:
+            nodes.path_mode(tmp_path)
+        assert exc.value.errno == code
+        # Worded as the OS words it: no "[WinError None]" a real one never has.
+        assert str(exc.value) == str(OSError(code, os.strerror(code), str(tmp_path)))
+        for check in (nodes.path_exists, nodes.path_is_dir, nodes.path_is_file):
+            with pytest.raises(OSError):
+                check(tmp_path)
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows error codes")
+    def test_a_drive_that_is_not_ready_raises_and_a_bad_name_is_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        # ERROR_NOT_READY is a drive with no medium, a network share gone
+        # quiet: unknown. ERROR_INVALID_NAME is a name that cannot exist.
+        deny_stat(monkeypatch, tmp_path, winerror=21)
+        with pytest.raises(OSError):
+            nodes.path_mode(tmp_path)
+        deny_stat(monkeypatch, tmp_path, winerror=123)
+        assert nodes.path_mode(tmp_path) is None
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+    def test_a_real_folder_this_user_may_not_search_raises(self, tmp_path):
+        if os.geteuid() == 0:
+            pytest.skip("root searches a mode-0 folder: no EACCES to provoke")
+        (tmp_path / "locked" / "api").mkdir(parents=True)
+        (tmp_path / "locked").chmod(0)
+        try:
+            with pytest.raises(PermissionError):
+                nodes.path_is_dir(tmp_path / "locked" / "api")
+        finally:
+            (tmp_path / "locked").chmod(0o700)
+
+
 class TestPushSet:
     def test_gitignored_env_files_ship_at_any_depth(self, repo):
         shipped = nodes.push_set(repo, [_real_state(repo)], home=Path.home())
@@ -1267,6 +1350,46 @@ class TestPushSet:
         shipped = nodes.push_set(repo, [_real_state(repo)], home=Path.home())
         assert repo / "notes.txt" not in shipped
 
+    def test_a_listed_file_that_cannot_be_read_is_skipped_and_named(
+        self, repo, monkeypatch, caplog
+    ):
+        # git listed it, so it is a snapshot claim: skipped as before, but
+        # never in silence -- the class on screen, path and error in the log.
+        env = (repo / ".env").resolve()
+        state = _real_state(repo)
+        deny_stat(monkeypatch, env)
+        with caplog.at_level("WARNING", logger="magent.nodes"):
+            shipped, warned = nodes._push(repo, [state], home=Path.home(), extras=())
+        assert repo / ".env" not in shipped
+        assert repo / "apps" / "web" / ".env.local" in shipped
+        assert warned == ("push: .env cannot be read (PermissionError); skipped",)
+        assert str(env) in caplog.text
+        assert "Permission denied" in caplog.text
+
+    def test_a_listed_file_gone_since_the_listing_is_skipped_silently(self, tmp_path):
+        shipped, warned = nodes._push(
+            tmp_path, [_state(tmp_path, (".env",))], home=Path.home(), extras=()
+        )
+        assert (shipped, warned) == ((), ())
+
+    @pytest.mark.parametrize("listed", [".claude/", ".claude/settings.local.json"])
+    def test_local_settings_that_cannot_be_read_are_skipped_and_named(
+        self, tmp_path, monkeypatch, listed
+    ):
+        # One file, one outcome, however git listed it (the folder, or the
+        # file): skipped like any listed file, and said so -- never absent.
+        (tmp_path / ".claude").mkdir()
+        settings = tmp_path / ".claude" / "settings.local.json"
+        settings.write_text("{}", encoding="utf-8")
+        deny_stat(monkeypatch, settings.resolve())
+        pushed = _raised_or(
+            lambda: nodes._push(
+                tmp_path, [_state(tmp_path, (listed,))], home=Path.home(), extras=()
+            )
+        )
+        warning = "push: .claude/settings.local.json cannot be read (PermissionError)"
+        assert pushed == ((), (f"{warning}; skipped",))
+
     def test_a_wholly_ignored_claude_dir_still_ships_its_local_settings(self, tmp_path):
         (tmp_path / ".claude").mkdir()
         (tmp_path / ".claude" / "settings.local.json").write_text(
@@ -1288,6 +1411,34 @@ class TestPushSet:
             workspace, [_state(workspace / "api", ())], home=Path.home()
         )
         assert shipped == (workspace / ".env", workspace / "CLAUDE.local.md")
+
+    @pytest.mark.parametrize("name", [".env", "CLAUDE.local.md"])
+    def test_a_workspace_roots_own_file_that_cannot_be_read_is_an_error(
+        self, tmp_path, monkeypatch, name
+    ):
+        # Not "no such file": a push that silently leaves a .env home would
+        # bring the project up without its secrets.
+        workspace = tmp_path / "ws"
+        (workspace / "api").mkdir(parents=True)
+        (workspace / name).write_text("X=1\n", encoding="utf-8")
+        deny_stat(monkeypatch, workspace / name)
+        with pytest.raises(PermissionError):
+            nodes.push_set(workspace, [_state(workspace / "api", ())], home=Path.home())
+
+    def test_a_workspace_root_file_that_never_ships_is_never_read(
+        self, tmp_path, monkeypatch
+    ):
+        # Only a candidate is looked at: an unreadable README is not a push,
+        # so it cannot fail one.
+        workspace = tmp_path / "ws"
+        (workspace / "api").mkdir(parents=True)
+        (workspace / ".env").write_text("X=1\n", encoding="utf-8")
+        (workspace / "README.md").write_text("r\n", encoding="utf-8")
+        deny_stat(monkeypatch, workspace / "README.md")
+        shipped = nodes.push_set(
+            workspace, [_state(workspace / "api", ())], home=Path.home()
+        )
+        assert shipped == (workspace / ".env",)
 
     def test_a_project_reached_through_a_link_never_ships_a_tracked_file(
         self, repo, tmp_path
@@ -1329,6 +1480,19 @@ class TestPushSet:
         (home / ".ssh").mkdir(parents=True)
         (home / ".ssh" / ".env").write_text("K=1\n", encoding="utf-8")
         assert nodes.push_set(home, [_state(home, (".ssh/.env",))], home=home) == ()
+
+    def test_a_git_hit_in_a_credential_store_is_refused_before_it_is_looked_at(
+        self, tmp_path, monkeypatch
+    ):
+        # Refused on its resolved NAME, never stat-ed: a stat error in there
+        # would otherwise put a path inside ~/.ssh on screen.
+        home = tmp_path / "home"
+        (home / ".ssh").mkdir(parents=True)
+        (home / ".ssh" / ".env").write_text("K=1\n", encoding="utf-8")
+        deny_stat(monkeypatch, (home / ".ssh" / ".env").resolve())
+        assert nodes._push(
+            home, [_state(home, (".ssh/.env",))], home=home, extras=()
+        ) == ((), ())
 
     def test_the_answer_is_sorted_and_unique(self, repo):
         shipped = nodes.push_set(
@@ -1484,6 +1648,15 @@ class TestPushExtras:
         assert nodes._is_forbidden(PurePosixPath("/h/.NetRC"), forbidden)
         assert not nodes._is_forbidden(PurePosixPath("/h/.sshx/id"), forbidden)
         assert not nodes._is_forbidden(PurePosixPath("/h/.netrc.d/x"), forbidden)
+
+    def test_an_extra_that_cannot_be_read_is_an_error_not_missing(
+        self, repo, monkeypatch
+    ):
+        # "does not exist" would be a guess: the file is there, unread.
+        (repo / "locked.json").write_text("{}", encoding="utf-8")
+        deny_stat(monkeypatch, (repo / "locked.json").resolve())
+        with pytest.raises(PermissionError):
+            nodes.push_warnings(repo, ["locked.json"], home=Path.home())
 
     def test_an_extra_directory_is_a_warning(self, repo):
         assert nodes.push_warnings(repo, ["apps"], home=Path.home()) == (
@@ -1650,6 +1823,163 @@ class TestRecipeFor:
             project_dir=repo,
         )
         assert recipe.memory_dir == memory
+
+    def test_a_memory_dir_that_cannot_be_read_is_named_not_fatal(
+        self, repo, monkeypatch
+    ):
+        # Memory never fails a bring-up, and an unreadable folder is not
+        # "no memory" either: it is shipped as none, and said so.
+        memory = (
+            Path.home()
+            / ".claude"
+            / "projects"
+            / nodes.encoded_project_dir(str(repo))
+            / "memory"
+        )
+        memory.mkdir(parents=True)
+        deny_stat(monkeypatch, memory)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second"),
+            NODE,
+            [_real_state(repo)],
+            home=Path.home(),
+            project_dir=repo,
+        )
+        assert recipe.memory_dir is None
+        assert recipe.warnings == (
+            "memory: cannot be read (PermissionError); no memory shipped",
+        )
+
+    def test_a_memory_subfolder_that_cannot_be_listed_is_named_not_fatal(
+        self, repo, monkeypatch, caplog
+    ):
+        # os.walk skips a folder it cannot list without a word; the rest of
+        # memory still ships, and the skip is said (class only on screen).
+        memory = (
+            Path.home()
+            / ".claude"
+            / "projects"
+            / nodes.encoded_project_dir(str(repo))
+            / "memory"
+        )
+        (memory / "sub").mkdir(parents=True)
+        state = _real_state(repo)
+        deny_scandir(monkeypatch, memory / "sub")
+        with caplog.at_level("WARNING", logger="magent.nodes"):
+            recipe = nodes.recipe_for(
+                ProjectConfig(path=str(repo), node="second"),
+                NODE,
+                [state],
+                home=Path.home(),
+                project_dir=repo,
+            )
+        assert recipe.memory_dir == memory
+        assert recipe.warnings == (
+            "memory: sub cannot be read (PermissionError); skipped",
+        )
+        assert str(memory / "sub") in caplog.text
+
+    def test_a_memory_folder_that_cannot_be_listed_ships_none_and_says_so(
+        self, repo, monkeypatch
+    ):
+        memory = (
+            Path.home()
+            / ".claude"
+            / "projects"
+            / nodes.encoded_project_dir(str(repo))
+            / "memory"
+        )
+        memory.mkdir(parents=True)
+        state = _real_state(repo)
+        deny_scandir(monkeypatch, memory)
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second"),
+            NODE,
+            [state],
+            home=Path.home(),
+            project_dir=repo,
+        )
+        assert recipe.memory_dir is None
+        assert recipe.warnings == (
+            "memory: cannot be read (PermissionError); no memory shipped",
+        )
+
+    def test_a_memory_file_that_cannot_be_read_is_named_like_a_folder(
+        self, repo, monkeypatch, caplog
+    ):
+        memory = _memory_of(repo)
+        (memory / "notes").mkdir(parents=True)
+        (memory / "notes" / "denied.md").write_text("- d\n", encoding="utf-8")
+        state = _real_state(repo)
+        deny_stat(monkeypatch, memory / "notes" / "denied.md")
+        with caplog.at_level("WARNING", logger="magent.nodes"):
+            recipe = nodes.recipe_for(
+                ProjectConfig(path=str(repo), node="second"),
+                NODE,
+                [state],
+                home=Path.home(),
+                project_dir=repo,
+            )
+        assert recipe.memory_dir == memory
+        assert recipe.warnings == (
+            "memory: notes/denied.md cannot be read (PermissionError); skipped",
+        )
+        assert str(memory / "notes" / "denied.md") in caplog.text
+        assert "Permission denied" in caplog.text
+
+    def _memory_with_locked(self, repo: Path) -> tuple[Path, Path]:
+        memory = _memory_of(repo)
+        memory.mkdir(parents=True)
+        (memory / "MEMORY.md").write_text("- m\n", encoding="utf-8")
+        locked = memory / "locked.md"
+        locked.write_text("- l\n", encoding="utf-8")
+        return memory, locked
+
+    def _recipe(self, repo: Path, state: LocalGitState) -> Recipe:
+        return nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second"),
+            NODE,
+            [state],
+            home=Path.home(),
+            project_dir=repo,
+        )
+
+    def test_a_memory_file_that_stats_but_cannot_be_opened_is_named(
+        self, repo, monkeypatch, caplog
+    ):
+        # Stat-able is not readable: a Windows deny-read ACL leaves the stat
+        # working, so the walk yields the file and only the payload's read
+        # would find out -- in nodes.log, never on screen.
+        memory, locked = self._memory_with_locked(repo)
+        state = _real_state(repo)
+        deny_open(monkeypatch, locked)
+        with caplog.at_level("WARNING", logger="magent.nodes"):
+            recipe = self._recipe(repo, state)
+        assert recipe.memory_dir == memory
+        assert recipe.warnings == (
+            "memory: locked.md cannot be read (PermissionError); skipped",
+        )
+        assert str(locked) in caplog.text
+        assert "Permission denied" in caplog.text
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+    def test_a_real_mode_000_memory_file_is_named(self, repo, caplog):
+        if os.geteuid() == 0:
+            pytest.skip("root opens a mode-000 file: no EACCES to provoke")
+        memory, locked = self._memory_with_locked(repo)
+        state = _real_state(repo)
+        locked.chmod(0)
+        try:
+            with caplog.at_level("WARNING", logger="magent.nodes"):
+                recipe = self._recipe(repo, state)
+        finally:
+            locked.chmod(0o600)
+        assert recipe.memory_dir == memory
+        assert recipe.warnings == (
+            "memory: locked.md cannot be read (PermissionError); skipped",
+        )
+        assert str(locked) in caplog.text
+        assert "Permission denied" in caplog.text
 
     def test_no_memory_dir_is_none(self, repo):
         recipe = nodes.recipe_for(
@@ -2032,6 +2362,120 @@ class TestRecipeFor:
         )
         assert recipe.repos[0].url == url
         assert recipe.warnings == ()
+
+
+def _memory_of(project_dir: Path) -> Path:
+    return (
+        Path.home()
+        / ".claude"
+        / "projects"
+        / nodes.encoded_project_dir(str(project_dir))
+        / "memory"
+    )
+
+
+def _folder_link(link: Path, target: Path) -> None:
+    """A folder link at ``link`` -> ``target``: a junction on Windows -- the
+    link a standard user makes, and one ``os.walk`` descends -- else a
+    symlink."""
+    if sys.platform == "win32":
+        import _winapi  # reason: Windows-only stdlib, reached only on win32
+
+        _winapi.CreateJunction(str(target), str(link))
+        return
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("this account cannot create symlinks")
+
+
+class _Overran(Exception):
+    """Raised into a walk past its budget: not an OSError, so no onerror
+    swallows it, and a pin that fails stops the walk instead of hanging."""
+
+
+def _within(monkeypatch, seconds: float, work):
+    """``work()``, or None when it had not returned within ``seconds``: every
+    ``os.scandir`` past the budget raises ``_Overran``."""
+    deadline = time.monotonic() + seconds
+    real_scandir = os.scandir
+
+    def scandir(path: object = ".") -> object:
+        if time.monotonic() > deadline:
+            raise _Overran
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    try:
+        return work()
+    except _Overran:
+        return None
+
+
+class TestTheRecipeWalksMemoryAsThePayloadDoes:
+    """The recipe's memory warnings come from the payload's own walk: a folder
+    the payload never walks (behind a link, or memory being one) is never
+    named on screen, and a link back into memory cannot keep the walk -- which
+    runs under the node's bring-up lock -- from returning."""
+
+    def _up(self, repo: Path, state: LocalGitState) -> tuple[Recipe, list[str]]:
+        recipe = nodes.recipe_for(
+            ProjectConfig(path=str(repo), node="second"),
+            NODE,
+            [state],
+            home=Path.home(),
+            project_dir=repo,
+        )
+        shipped = [
+            name
+            for name, _ in remote_mux._files(recipe, memory=True)
+            if name.startswith("memory/")
+        ]
+        return recipe, shipped
+
+    def test_memory_that_is_itself_a_link_is_never_walked(
+        self, repo, tmp_path, monkeypatch
+    ):
+        real = tmp_path / "real-memory"
+        (real / "sub").mkdir(parents=True)
+        (real / "MEMORY.md").write_text("- m\n", encoding="utf-8")
+        memory = _memory_of(repo)
+        memory.parent.mkdir(parents=True)
+        _folder_link(memory, real)
+        state = _real_state(repo)
+        deny_scandir(monkeypatch, memory / "sub")
+        recipe, shipped = self._up(repo, state)
+        assert (recipe.warnings, shipped) == ((), [])
+
+    def test_a_link_inside_memory_is_never_walked(self, repo, tmp_path, monkeypatch):
+        outside = tmp_path / "outside"
+        (outside / "locked").mkdir(parents=True)
+        memory = _memory_of(repo)
+        memory.mkdir(parents=True)
+        (memory / "MEMORY.md").write_text("- m\n", encoding="utf-8")
+        _folder_link(memory / "elsewhere", outside)
+        state = _real_state(repo)
+        deny_scandir(monkeypatch, memory / "elsewhere" / "locked")
+        recipe, shipped = self._up(repo, state)
+        assert (recipe.warnings, shipped) == ((), ["memory/MEMORY.md"])
+
+    @pytest.mark.parametrize("links", [("a",), ("a", "b")])
+    def test_a_link_back_into_memory_still_returns(self, repo, monkeypatch, links):
+        # Descended, one link back is a path that grows until the OS refuses
+        # it (a garbage warning); two double the folders at every level, and
+        # the walk never returns.
+        memory = _memory_of(repo)
+        memory.mkdir(parents=True)
+        (memory / "MEMORY.md").write_text("- m\n", encoding="utf-8")
+        for name in links:
+            _folder_link(memory / name, memory)
+        state = _real_state(repo)
+        start = time.monotonic()
+        walked = _within(monkeypatch, 2.0, lambda: self._up(repo, state))
+        assert walked is not None, "the memory walk did not return within 2s"
+        assert time.monotonic() - start < 2.0
+        recipe, shipped = walked
+        assert (recipe.warnings, shipped) == ((), ["memory/MEMORY.md"])
 
 
 D_NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")

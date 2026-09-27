@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
 import json
 import math
 import os
 import re
+import stat
 import tempfile
 import threading
 import time
@@ -34,7 +36,7 @@ from magent.sessions.claude import encode_claude_project_path
 from magent.titles import get_leaf_name
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
     from magent.config import MagentConfig, ProjectConfig
 
@@ -700,11 +702,10 @@ def _from_git_listing(repo: Path, ignored: tuple[str, ...]) -> list[Path]:
         if entry.endswith("/"):
             # A wholly ignored directory is never descended (node_modules is
             # not a push); only a fixed path that lives inside it can ship.
-            found += [
-                repo / fixed
-                for fixed in _PUSH_FIXED
-                if fixed.startswith(entry) and (repo / fixed).is_file()
-            ]
+            # Listed unlooked-at: _push judges it like any git hit (the
+            # credential stores first), so one file has one outcome however
+            # git listed it -- an unreadable one warns, a missing one is none.
+            found += [repo / fixed for fixed in _PUSH_FIXED if fixed.startswith(entry)]
         elif _is_env_file(entry.rsplit("/", 1)[-1]) or entry in _PUSH_FIXED:
             # git emits '/' on every OS, like the _PUSH_FIXED literals.
             found.append(repo / entry)
@@ -736,6 +737,52 @@ def _resolved(path: Path) -> Path:
         raise NodeConfigError(f"{path}: cannot be resolved ({exc})") from exc
 
 
+# The stat errors that mean "nothing is there": no such entry, a parent that
+# is a file, a symlink loop, or a name Windows cannot hold (ERROR_INVALID_NAME,
+# ERROR_CANT_RESOLVE_FILENAME). Every other OSError -- a folder this user may
+# not read, a drive that is not ready -- is unknown, and unknown is never
+# absent: ``path_mode`` raises it.
+_ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP})
+_ABSENT_WINERRORS = frozenset({123, 1921})
+
+
+def path_mode(path: Path) -> int | None:
+    """``path``'s ``st_mode`` (symlinks followed); None when nothing is there.
+    Raises OSError when that cannot be told. The one existence check on the
+    node path: from Python 3.14 ``Path.is_dir``/``is_file``/``exists`` answer
+    False for EVERY OSError (on Windows they no longer stat at all), where
+    3.10-3.13 raised -- an unreadable folder would read "not there" on one
+    version and fail on another. ``os.stat`` answers alike on all of them."""
+    try:
+        return os.stat(path).st_mode
+    except ValueError:
+        return None  # a name the OS cannot hold (an embedded NUL)
+    except OSError as exc:
+        if (
+            exc.errno in _ABSENT_ERRNOS
+            or getattr(exc, "winerror", None) in _ABSENT_WINERRORS
+        ):
+            return None
+        raise
+
+
+def path_exists(path: Path) -> bool:
+    """``Path.exists`` that raises when it cannot tell (``path_mode``)."""
+    return path_mode(path) is not None
+
+
+def path_is_dir(path: Path) -> bool:
+    """``Path.is_dir`` that raises when it cannot tell (``path_mode``)."""
+    mode = path_mode(path)
+    return mode is not None and stat.S_ISDIR(mode)
+
+
+def path_is_file(path: Path) -> bool:
+    """``Path.is_file`` that raises when it cannot tell (``path_mode``)."""
+    mode = path_mode(path)
+    return mode is not None and stat.S_ISREG(mode)
+
+
 def _workspace_root_files(project_dir: Path) -> list[Path]:
     # A workspace root is not a repo, so git lists nothing there -- its own env
     # files and local Claude settings would otherwise never leave this PC.
@@ -743,8 +790,8 @@ def _workspace_root_files(project_dir: Path) -> list[Path]:
         entries = list(project_dir.iterdir())
     except (OSError, ValueError) as exc:
         raise NodeConfigError(f"{project_dir}: cannot be listed ({exc})") from exc
-    found = [p for p in entries if p.is_file() and _is_env_file(p.name)]
-    found += [project_dir / f for f in _PUSH_FIXED if (project_dir / f).is_file()]
+    found = [p for p in entries if _is_env_file(p.name) and path_is_file(p)]
+    found += [project_dir / f for f in _PUSH_FIXED if path_is_file(project_dir / f)]
     return found
 
 
@@ -801,13 +848,14 @@ def _shippable_git_target(
 ) -> Path | None:
     """A path git's listing reported is a snapshot claim: its resolved target
     (symlinks followed) when it is a regular file now and not a credential
-    store's, else None."""
+    store's, else None -- gone since the listing included. Raises OSError when
+    whether it is a file cannot be told (``path_mode``): the caller skips it
+    too, but says so."""
     target = _try_resolve(path)
-    # os.path.isfile never raises (a stat error is "not a file" on every
-    # Python), which Path.is_file only guarantees from 3.13 on.
-    if target is None or not os.path.isfile(target) or _is_forbidden(target, forbidden):
+    if target is None or _is_forbidden(target, forbidden):
         return None
-    return target
+    mode = path_mode(target)
+    return target if mode is not None and stat.S_ISREG(mode) else None
 
 
 def _listed_name(hit: Path, repo: Path, root: Path) -> str:
@@ -838,9 +886,9 @@ def _classify_extras(
             warnings.append(f"push: {extra} is outside the project; skipped")
         elif _is_forbidden(target, forbidden):
             warnings.append(f"push: {extra} is never pushed (credentials); skipped")
-        elif target.is_dir():
+        elif (mode := path_mode(target)) is not None and stat.S_ISDIR(mode):
             warnings.append(f"push: {extra} is a directory; list its files; skipped")
-        elif not target.is_file():
+        elif mode is None or not stat.S_ISREG(mode):
             warnings.append(f"push: {extra} does not exist; skipped")
         else:
             shipped.append(_named_path(project_dir, extra, target, root))
@@ -924,7 +972,17 @@ def _push(
     warnings: list[str] = []
     for state in states:
         for hit in _from_git_listing(state.path, state.ignored):
-            target = _shippable_git_target(hit, forbidden)
+            try:
+                target = _shippable_git_target(hit, forbidden)
+            except OSError as exc:
+                # Still skipped -- a listed file is a snapshot claim -- but
+                # never silently: the class on screen, the rest in the log.
+                name = _listed_name(hit, state.path, root)
+                get_logger("nodes").warning("push file %s: %s", hit, exc)
+                warnings.append(
+                    f"push: {name} cannot be read ({type(exc).__name__}); skipped"
+                )
+                continue
             if target is None:
                 continue
             # git DESCENDS a junction/directory link (Git for Windows lists
@@ -1234,6 +1292,141 @@ def refusal_for(state: LocalGitState, *, allow_dirty: bool = False) -> str | Non
     return None
 
 
+# How a vetted file is opened -- by the payload (``remote_mux._read_regular``)
+# and by ``_memory_state``'s look at each memory file, so what the recipe
+# finds it cannot open is what the payload cannot read: never through a
+# final-component link, never blocking on a FIFO. Read off the module, so
+# Windows (which has neither flag, and wants O_BINARY) needs no
+# `sys.platform` branch.
+READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_BINARY", 0)
+)
+
+
+def _memory_is_link(memory: Path) -> bool:
+    """Is the memory folder ``memory`` itself a link? Decided by ``realpath``:
+    resolving it must change nothing but its parent's own resolution -- so a
+    link ABOVE it (a dotfiles ``~/.claude``) is not one, and a Windows
+    junction, which is no symlink to pathlib, is."""
+    real = Path(os.path.realpath(memory))
+    return real != Path(os.path.realpath(memory.parent)) / memory.name
+
+
+def walk_memory(
+    memory: Path, unreadable: Callable[[Path, OSError], None] | None = None
+) -> Iterator[Path]:
+    """Every REGULAR file under the memory folder ``memory`` that may ship, in
+    walk order. THE memory walk: the payload's (``remote_mux._memory_files``)
+    and the recipe's (``_memory_state``) are this one, so the recipe can only
+    ever name what the payload walks. A link is never followed -- not a file
+    link, not a folder link, and not ``memory`` itself being one (nothing is
+    walked): the folder is Claude's, and a link in it can name ``~/.ssh``.
+
+    "A link" is decided by ``realpath``, not ``is_symlink``: a Windows
+    junction -- which any standard user can make -- is not a symlink to
+    pathlib, and ``os.walk(followlinks=False)`` descends into one (a junction
+    back to ``memory`` would keep it from ever returning). A subfolder is kept
+    only when resolving it changes nothing but its parent's own resolution:
+    then it is no link and, folder by folder, lies inside ``memory``'s
+    realpath. Every file must resolve inside the resolved folder too.
+
+    What is skipped is logged, never raised: a bring-up never fails because
+    of memory. What cannot be READ -- a folder that cannot be listed, a file
+    that cannot be stat-ed -- is also handed to ``unreadable``, with its
+    error."""
+    log = get_logger("nodes")
+    if _memory_is_link(memory):
+        log.warning("memory folder %s is a link; no memory shipped", memory)
+        return
+    real_mem = Path(os.path.realpath(memory))
+
+    def cannot_list(exc: OSError) -> None:
+        # os.walk's default is to skip a folder it cannot list in silence.
+        where = Path(exc.filename) if exc.filename else memory
+        log.warning("memory folder %s cannot be read; skipped: %s", where, exc)
+        if unreadable is not None:
+            unreadable(where, exc)
+
+    for dirpath, dirnames, filenames in os.walk(memory, onerror=cannot_list):
+        base = Path(dirpath)
+        real_base = Path(os.path.realpath(base))
+        kept: list[str] = []
+        for name in dirnames:
+            if Path(os.path.realpath(base / name)) == real_base / name:
+                kept.append(name)
+            else:
+                log.warning("memory link %s skipped", base / name)
+        dirnames[:] = kept  # os.walk descends only into what is left
+        for name in filenames:
+            path = base / name
+            try:
+                regular = not path.is_symlink() and path_is_file(path)
+            except OSError as exc:
+                # Named, not taken for "not a file" (Python 3.14's is_file).
+                log.warning("memory file %s cannot be read; skipped: %s", path, exc)
+                if unreadable is not None:
+                    unreadable(path, exc)
+                continue
+            if not regular:
+                log.warning("memory entry %s is not a regular file; skipped", path)
+                continue
+            if not Path(os.path.realpath(path)).is_relative_to(real_mem):
+                log.warning("memory entry %s resolves outside memory; skipped", path)
+                continue
+            yield path
+
+
+def _memory_state(memory: Path) -> tuple[bool, tuple[str, ...]]:
+    """Whether the memory folder ``memory`` ships, and one warning per part of
+    it that cannot be read. Never raises: a bring-up never fails because of
+    memory, and nor does an unreadable folder pass for none -- each is named,
+    class only, with the path and the full error in nodes.log. The walk IS
+    the payload's (``walk_memory``), so nothing the payload never walks --
+    behind a link, or ``memory`` being one -- is ever named; run here, its
+    warnings reach the screen with the recipe's. Each file it yields is
+    also opened the payload's way (``READ_FLAGS``) and closed at once:
+    stat-able is not readable -- a Windows deny-read ACL leaves the stat
+    working -- and the payload's own read failure is logged, not shown."""
+
+    def none_shipped(exc: OSError) -> tuple[bool, tuple[str, ...]]:
+        return False, (
+            f"memory: cannot be read ({type(exc).__name__}); no memory shipped",
+        )
+
+    try:
+        if not path_is_dir(memory):
+            return False, ()
+    except OSError as exc:
+        get_logger("nodes").warning(
+            "memory folder %s cannot be read; skipped: %s", memory, exc
+        )
+        return none_shipped(exc)
+    unread: list[tuple[Path, OSError]] = []
+    for path in walk_memory(memory, lambda where, exc: unread.append((where, exc))):
+        try:
+            os.close(os.open(path, READ_FLAGS))
+        except OSError as exc:
+            get_logger("nodes").warning(
+                "memory file %s cannot be read; skipped: %s", path, exc
+            )
+            unread.append((path, exc))
+    warned: list[str] = []
+    for where, exc in unread:
+        if where == memory:
+            return none_shipped(exc)
+        # walk_memory names every folder by joining onto ``memory``.
+        rel = (
+            where.relative_to(memory).as_posix()
+            if where.is_relative_to(memory)
+            else where.name
+        )
+        warned.append(f"memory: {rel} cannot be read ({type(exc).__name__}); skipped")
+    return True, tuple(warned)
+
+
 def recipe_for(
     proj: ProjectConfig,
     node: Node,
@@ -1302,14 +1495,15 @@ def recipe_for(
     memory = (
         home / ".claude" / "projects" / encoded_project_dir(str(project_dir)) / "memory"
     )
+    has_memory, memory_warned = _memory_state(memory)
     return Recipe(
         project=project,
         sid=session_name(project),
         repos=tuple(repos),
         push_files=push_files,
-        memory_dir=memory if memory.is_dir() else None,
+        memory_dir=memory if has_memory else None,
         remote_root=remote_root,
-        warnings=(*repo_warnings, *push_warned),
+        warnings=(*repo_warnings, *push_warned, *memory_warned),
         local_root=root,
     )
 

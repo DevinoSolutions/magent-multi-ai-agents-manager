@@ -5,7 +5,6 @@ faked at remote_mux's seam, so nothing here dials anything."""
 from __future__ import annotations
 
 import dataclasses
-import errno
 import json
 import logging
 import subprocess
@@ -29,9 +28,9 @@ from magent.config import (
 from magent.nodes import LocalGitState, NodeMapEntry
 from magent.remote_mux import BringUpResult, RemoteError
 from tests.conftest import FakePlatform
+from tests.unit._deny_stat import deny_stat
 
 if TYPE_CHECKING:
-    import os
     from collections.abc import Callable
 
 _TOOLS = {"claude": "claude --continue"}
@@ -786,19 +785,14 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         locked.mkdir(parents=True)
         rig.states[locked] = _state(locked)
         z = ProjectConfig(path=str(locked), node="second")
-        real_stat = Path.stat
-
-        def stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
-            if str(self) == str(locked):
-                raise PermissionError(errno.EACCES, "Access is denied", str(self))
-            return real_stat(self, follow_symlinks=follow_symlinks)
-
-        monkeypatch.setattr(Path, "stat", stat)
+        deny_stat(monkeypatch, locked)
         alone = _batch(_config(good, z), only=["a1"])
         assert [(o.sid, o.ok) for o in alone] == [("a1", True)]
         both = _batch(_config(good, z))
         assert [(o.sid, o.ok) for o in both] == [("a1", True), ("z", False)]
-        assert "Access is denied" in (both[1].error or "")
+        # Named as unreadable -- not "not found on this PC", which is what
+        # Python 3.14's Path.is_dir alone would have said.
+        assert "Permission denied" in (both[1].error or "")
 
     def test_a_collision_with_a_project_outside_the_batch_still_refuses(
         self, rig, tmp_path, monkeypatch
@@ -1348,6 +1342,25 @@ class TestUpBringsUpNodeProjectsToo:
         (warning,) = [line for line in out.splitlines() if "--allow-dirty" in line]
         assert warning.lstrip().startswith("! ")
 
+    def test_an_unreadable_push_file_fails_only_its_own_project(
+        self, rig, tmp_path, monkeypatch, capsys
+    ):
+        # Raising for a push candidate that cannot be read is contained: that
+        # project's outcome is a failure, the other node project and the
+        # local fleet still come up, and nothing raises out of `up`.
+        good, locked = _projects(tmp_path, rig, [("a1", "second"), ("z", "second")])
+        secret = tmp_path / "z" / "sa.json"
+        secret.write_text("{}", encoding="utf-8")
+        locked = dataclasses.replace(locked, push=["sa.json"])
+        deny_stat(monkeypatch, secret.resolve())
+        monkeypatch.setattr(
+            "magent.psmux.bring_up", lambda cfg, only, group: (["loc"], [])
+        )
+        created, failed = launch.bring_up_psmux(_config(good, locked))
+        assert (created, failed) == (["loc", "a1"], ["z"])
+        assert [recipe.sid for _, recipe in rig.recipes] == ["a1"]
+        assert "Permission denied" in capsys.readouterr().out
+
     def test_allow_dirty_reaches_the_node_bring_up(self, rig, tmp_path, monkeypatch):
         projs = _projects(tmp_path, rig, [("a1", "second")])
         rig.states[tmp_path / "a1"] = _state(tmp_path / "a1", dirty=True)
@@ -1628,6 +1641,19 @@ class TestGoBringsNodeProjectsUp:
         proj = ProjectConfig(path=str(tmp_path), node="auto")
         launch.run_magent(_config(proj), launch.RunOpts(dry_run=True))
         assert "needs a placement" in capsys.readouterr().out
+
+    def test_dry_run_names_a_folder_this_user_may_not_read(
+        self, desk, no_sleep, tmp_path, monkeypatch, capsys
+    ):
+        # The preview says why, as the real run's outcome would, rather than
+        # raising out of `--dry-run`.
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        deny_stat(monkeypatch, locked)
+        proj = ProjectConfig(path=str(locked), node="second")
+        assert launch.run_magent(_config(proj), launch.RunOpts(dry_run=True)) == 0
+        assert "Permission denied" in capsys.readouterr().out
 
     def test_a_window_already_open_is_not_brought_up_again(
         self, rig, api, no_sleep, monkeypatch

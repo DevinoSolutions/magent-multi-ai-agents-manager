@@ -661,14 +661,20 @@ class _Target:
     is_new: bool
 
 
-def _resolve_path(raw: str, base_dir: str | None) -> str | None:
+def _candidate_path(raw: str, base_dir: str | None) -> str | None:
+    """Where ``raw`` would be, expanded and joined to ``base_dir`` when it
+    is relative; None when relative with no base. Touches no disk."""
     expanded = os.path.expandvars(os.path.expanduser(raw))
     if Path(expanded).is_absolute():
-        return expanded if Path(expanded).is_dir() else None
+        return expanded
     if base_dir:
-        joined = os.path.join(base_dir, expanded)
-        return joined if Path(joined).is_dir() else None
+        return os.path.join(base_dir, expanded)
     return None
+
+
+def _resolve_path(raw: str, base_dir: str | None) -> str | None:
+    candidate = _candidate_path(raw, base_dir)
+    return candidate if candidate and Path(candidate).is_dir() else None
 
 
 def _expand_base_dir(base_dir: str) -> str:
@@ -1288,8 +1294,9 @@ def _echo_node_dry_run(
     from magent import nodes
     from magent.env import local_username
 
-    project_dir = _node_project_dir(config, proj) or Path(proj.path)
     try:
+        # A folder this user may not read is named, like a bad pin.
+        project_dir = _node_project_dir(config, proj) or Path(proj.path)
         node = nodes.resolve(
             config,
             proj,
@@ -1299,7 +1306,7 @@ def _echo_node_dry_run(
         # Inside the try: a folder with no usable name is refused here too,
         # and a dry run names that reason rather than raising it.
         folder = nodes.remote_root_for(node, project_dir)
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         click.echo(f"      {style('x', fg='red')} {exc}")
         return
     click.echo(style(f"      -> {node.target}:{folder}", dim=True))
@@ -1717,9 +1724,20 @@ def _provision_once(node: Node, config: MagentConfig) -> None:
 
 
 def _node_project_dir(config: MagentConfig, proj: ProjectConfig) -> Path | None:
+    """``proj``'s folder on this PC; None when it is not there. A folder this
+    user may not read RAISES OSError instead (``nodes.path_is_dir``): from
+    Python 3.14 ``Path.is_dir`` answers False for every OSError, which would
+    call an unreadable folder "not found on this PC" there and raise on
+    3.10-3.13. Unknown is never absent, on any version."""
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
     base_dir = _expand_base_dir(config.base_dir) if config.base_dir else None
-    resolved = _resolve_path(proj.path, base_dir)
-    return Path(resolved) if resolved else None
+    candidate = _candidate_path(proj.path, base_dir)
+    if candidate is None:
+        return None
+    path = Path(candidate)
+    return path if nodes.path_is_dir(path) else None
 
 
 def node_git_states(config: MagentConfig, proj: ProjectConfig) -> list[LocalGitState]:
