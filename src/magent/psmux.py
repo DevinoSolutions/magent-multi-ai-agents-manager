@@ -684,6 +684,15 @@ _IDLE_SHELLS: frozenset[str] = frozenset(
     {"pwsh", "powershell", "bash", "zsh", "fish", "sh", "dash", "nu", "ksh", "tcsh"}
 )
 
+# What magent wraps every command it types into a pane in: ``cmd /c <command>``
+# (``platform/windows.py::_send_argv`` and ``revive_sessions`` here). ``cmd /c``
+# exits exactly when its command does, so a live one under the pane's shell IS
+# the launched command, whatever that command's own image is called -- which is
+# what keeps a shipped tool with no registry image (agy, cursor-agent) from
+# reading idle while it runs. The agent images still matter: a human who typed
+# ``claude`` at the prompt has no cmd above it.
+_LAUNCHER_IMAGES: frozenset[str] = frozenset({"cmd"})
+
 
 def pane_current_command(name: str, psmux: str | None = None) -> str:
     """Return the active pane's foreground command (``pwsh``, ``claude``, ...).
@@ -839,7 +848,9 @@ def idle_sessions(
     2. the pane's own process (``#{pane_pid}``) was read, is in the process
        snapshot, and is itself a shell;
     3. nothing in that process's subtree is an agent image
-       (``sessions.agent_image_names``).
+       (``sessions.agent_image_names``) or a live launcher
+       (``_LAUNCHER_IMAGES`` -- the ``cmd /c`` magent typed, alive exactly as
+       long as the tool it started, registry image or not).
 
     Anything unknown is a no -- an unreadable pid, a failed snapshot (always,
     off Windows), a pane process gone by the time of the snapshot: never inject
@@ -868,14 +879,14 @@ def idle_sessions(
     snapshot = snapshot_processes()
     if snapshot is None:
         return set()
-    agents = agent_image_names()
+    running = agent_image_names() | _LAUNCHER_IMAGES
     idle: set[str] = set()
     for name in shells:
         pid = pids.get(name)
         tree = process_tree(pid, snapshot) if pid is not None else None
         if not tree or not is_idle_command(tree[0][0]):
             continue
-        if not any(_image_stem(image) in agents for image, _pid, _ppid in tree):
+        if not any(_image_stem(image) in running for image, _pid, _ppid in tree):
             idle.add(name)
     return idle
 
