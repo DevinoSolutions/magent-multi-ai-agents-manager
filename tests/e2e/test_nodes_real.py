@@ -632,6 +632,8 @@ class TestANodeHostsAProjectEndToEnd:
         marks_after = rig.marks()[rig.sid]
         assert str(marks_after["since"]) != str(marks_before["since"])
         assert float(str(marks_after["since"])) > float(str(marks_before["since"]))
+        # D-MERGE: (L step) once the picker snapshot lands on this line,
+        # `magent sessions --json` must list this sid with "node": "loop".
 
     def test_d12_an_attach_pane_survives_a_killed_connection(
         self, rig: NodeRig
