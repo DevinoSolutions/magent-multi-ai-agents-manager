@@ -185,6 +185,37 @@ class TestInstall:
         stop_cmds = json.dumps(data["hooks"]["Stop"])
         assert "notify.mjs" in stop_cmds and "magent-state-hook" in stop_cmds
 
+    @pytest.mark.parametrize(
+        "ours",
+        [
+            pytest.param(MODULE_CMD, id="module-form"),
+            pytest.param(
+                r"c:\users\x\scripts\magent-state-hook.EXE --source claude",
+                id="stale-console-script",
+            ),
+        ],
+    )
+    def test_foreign_backslash_hook_beside_ours_is_untouched(
+        self, runner, tmp_path, ours
+    ):
+        # A wired event is walked hook by hook for repair; a foreign hook with
+        # a Windows path (anotifier's `node "C:\..."`) is not ours to rewrite.
+        foreign = r'node "C:\ProgramData\anotifier\notify.mjs" --event stop'
+        settings = tmp_path / "settings.json"
+        hooks = {
+            event: [
+                {"hooks": [{"type": "command", "command": ours}]},
+                {"hooks": [{"type": "command", "command": foreign}]},
+            ]
+            for event in EVENTS
+        }
+        settings.write_text(json.dumps({"hooks": hooks}), encoding="utf-8")
+        assert _install(runner, settings).exit_code == 0
+        data = json.loads(settings.read_text(encoding="utf-8"))
+        for event in EVENTS:
+            cmds = [h["command"] for e in data["hooks"][event] for h in e["hooks"]]
+            assert cmds.count(foreign) == 1, cmds
+
     def test_prints_codex_recipe(self, runner, tmp_path):
         result = _install(runner, tmp_path / "settings.json")
         assert "notify = [" in result.output and "--source" in result.output
