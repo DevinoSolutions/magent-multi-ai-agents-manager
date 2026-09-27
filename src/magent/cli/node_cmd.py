@@ -815,6 +815,30 @@ def _source_node(cfg: MagentConfig, held: NodeMapEntry) -> Node | None:
 _RERUN = "nothing was stopped or cleared -- run the recall again"
 
 
+def _resume_id(held: NodeMapEntry) -> str | None:
+    """The newest pulled conversation's id, read BEFORE the session is
+    stopped: a pulled folder that cannot be listed is unknown, never "nothing
+    was ever pulled" (inv-unknown) -- ``--to`` would start the session fresh
+    and ``--local`` print a bare ``claude``, leaving the conversation behind.
+    So the recall stops here with nothing stopped or cleared. The error CLASS
+    only on screen; the full error goes to nodes.log. The folder is magent's
+    own path, built from a checked nick and sid."""
+    from magent import nodes  # heavy subsystem: in-body per policy
+
+    try:
+        return nodes.latest_transcript_id(held.nick, held.sid)
+    except OSError as exc:
+        folder = nodes.transcripts_dir(held.nick, held.sid)
+        log.get_logger("nodes").warning(
+            "recall could not list the conversations in %s: %s", folder, exc
+        )
+        _fail(
+            f"could not list the conversations pulled from @{held.nick} in"
+            f" {folder} ({type(exc).__name__}); {_RERUN}",
+            1,
+        )
+
+
 def _map_unreadable_fix(exc: OSError | ValueError) -> str:
     """The line for a node map that is there and cannot be read: a re-run
     alone would only read it again. No magent command rewrites or rebuilds
@@ -1453,8 +1477,8 @@ def recall_cmd(
     source = _source_node(cfg, held)
     reachable = source is not None and _final_pull(cfg, name, held)
     _report_repos(source if reachable else None, held)
+    resume_id = _resume_id(held)
     _stop_session(source if reachable else None, held)
-    resume_id = nodes.latest_transcript_id(held.nick, held.sid)
     if local_dir is not None:
         _recall_local(held, name, local_dir, resume_id)
     elif destination is not None:

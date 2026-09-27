@@ -123,6 +123,40 @@ class TestTheResumeId:
     def test_nothing_pulled_means_no_resume_id(self):
         assert nodes.latest_transcript_id("second", "api") is None
 
+    def test_a_folder_holding_no_conversation_means_no_resume_id(self):
+        folder = nodes.transcripts_dir("second", "api")
+        (folder / "memory").mkdir(parents=True)
+
+        assert nodes.latest_transcript_id("second", "api") is None
+
+    def test_a_file_where_the_folder_should_be_is_an_error_not_nothing_pulled(
+        self,
+    ):
+        # inv-unknown: recall would start the session fresh on a None.
+        folder = nodes.transcripts_dir("second", "api")
+        folder.parent.mkdir(parents=True)
+        folder.write_text("", encoding="utf-8")
+
+        with pytest.raises(OSError):
+            nodes.latest_transcript_id("second", "api")
+
+    def test_a_folder_this_user_may_not_list_is_an_error_not_nothing_pulled(
+        self, monkeypatch
+    ):
+        write_transcript("second", "api", SESSION_ID, mtime=NOW)
+        folder = nodes.transcripts_dir("second", "api")
+        real_iterdir = Path.iterdir
+
+        def iterdir(self):
+            if self == folder:
+                raise PermissionError(13, "Access is denied", str(self))
+            return real_iterdir(self)
+
+        monkeypatch.setattr(Path, "iterdir", iterdir)
+
+        with pytest.raises(PermissionError):
+            nodes.latest_transcript_id("second", "api")
+
     def test_a_trailing_newline_is_never_part_of_a_resume_id(self):
         # The id lands on a `claude --resume` line, where a newline is an
         # Enter. Windows cannot put one in a file name, so the pattern itself
@@ -143,10 +177,10 @@ class TestTheResumeId:
         stand_in.write_text("{}\n", encoding="utf-8")
         os.utime(stand_in, (NOW, NOW))
         smuggled = folder / f"{SESSION_ID}\n.jsonl"
-        real_glob, real_stat = Path.glob, Path.stat
+        real_iterdir, real_stat = Path.iterdir, Path.stat
 
-        def glob(self, pattern, *args, **kwargs):
-            yield from real_glob(self, pattern, *args, **kwargs)
+        def iterdir(self):
+            yield from real_iterdir(self)
             if self == folder:
                 yield smuggled
 
@@ -154,7 +188,7 @@ class TestTheResumeId:
             target = stand_in if self == smuggled else self
             return real_stat(target, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "glob", glob)
+        monkeypatch.setattr(Path, "iterdir", iterdir)
         monkeypatch.setattr(Path, "stat", stat)
 
         assert nodes.latest_transcript_id("second", "api") == OLDER_SESSION_ID
@@ -1792,6 +1826,53 @@ def _claude_dir(path: Path) -> Path:
 
 def _recall(runner, cfg: str, *args: str):
     return runner.invoke(cli.main, ["--config", cfg, "node", "recall", "api", *args])
+
+
+def _unlistable_pull() -> Path:
+    """A file where api's pulled-conversations folder should be: a folder
+    that is there and cannot be listed."""
+    folder = nodes.transcripts_dir("second", "api")
+    shutil.rmtree(folder)
+    folder.write_text("", encoding="utf-8")
+    return folder
+
+
+class TestAnUnlistablePullStopsTheRecallBeforeTheStop:
+    """Flag 4 (inv-unknown): a pulled folder that cannot be listed is not
+    "nothing was ever pulled". Read that way, the recall would stop the
+    session and then start it fresh (--to) or print a bare `claude`
+    (--local), leaving the conversation behind. It stops first instead."""
+
+    def test_local_names_the_folder_and_stops_nothing(
+        self, runner, placed_api, node_answers
+    ):
+        folder = _unlistable_pull()
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 1
+        assert (
+            f"could not list the conversations pulled from @second in {folder}"
+            " (NotADirectoryError); nothing was stopped or cleared"
+        ) in result.stderr
+        assert "nothing was ever pulled" not in result.stdout + result.stderr
+        assert "kill" not in [e[0] for e in node_answers]
+        assert nodes.read_node_map()["api"].nick == "second"
+
+    def test_to_moves_nothing_and_stops_nothing(
+        self, runner, placed_api, node_answers, moving
+    ):
+        events, _ = moving
+        _unlistable_pull()
+
+        result = _invoke_recall_to(runner, placed_api, "third")
+
+        assert result.exit_code == 1
+        assert "could not list the conversations pulled from @second" in result.stderr
+        assert "starts fresh" not in result.stdout + result.stderr
+        assert "kill" not in [e[0] for e in node_answers]
+        assert events == []
+        assert nodes.read_node_map()["api"].nick == "second"
 
 
 class TestRecallLocal:

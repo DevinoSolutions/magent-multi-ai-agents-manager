@@ -1986,7 +1986,13 @@ _SESSION_STEM = re.compile(
 def latest_transcript_id(
     nick: str, sid: str, *, nodes_dir: Path | None = None
 ) -> str | None:
-    """The newest pulled conversation's id, or None when nothing was pulled.
+    """The newest pulled conversation's id, or None when nothing was pulled:
+    no folder, or none of its files is a conversation.
+
+    A folder that is there but cannot be listed (no access, a file where the
+    folder should be) RAISES its ``OSError``: that is unknown, never "nothing
+    was pulled" (inv-unknown) -- recall would start the session fresh on it
+    and leave the conversation behind.
 
     The file stem IS the session id (verified: every record's ``sessionId``
     equals it). "Newest" means most recently active ON THE NODE: tar keeps the
@@ -2001,8 +2007,9 @@ def latest_transcript_id(
     """
     folder = transcripts_dir(nick, sid, nodes_dir=nodes_dir)
     try:
-        paths = list(folder.glob("*.jsonl"))
-    except OSError:
+        # iterdir, not glob: glob answers an unreadable folder with nothing.
+        paths = [path for path in folder.iterdir() if path.suffix == ".jsonl"]
+    except FileNotFoundError:
         return None
     candidates: list[tuple[float, str, str]] = []
     for path in paths:
