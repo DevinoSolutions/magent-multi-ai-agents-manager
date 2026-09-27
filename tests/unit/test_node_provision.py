@@ -898,6 +898,65 @@ class TestUserScopePluginsAndSkills:
         )
         assert "not followed" in caplog.text
 
+    # "Above" by every spelling of where the skills folder lives: as the user
+    # sees it, as it resolves, AND where ~/.claude resolves. With a home
+    # reached through a link (FreeBSD's /home -> usr/home, Fedora Atomic's
+    # var/home) or a ~/.claude kept in a dotfiles repo, a link to that home or
+    # that repo is above neither of the first two -- and it holds the session
+    # transcripts and the history.
+    @staticmethod
+    def _transcripts(claude: Path) -> None:
+        _skill(claude, "projects/p/s.jsonl", b"TRANSCRIPT-DECOY")
+        _skill(claude, "history.jsonl", b"HISTORY-DECOY")
+
+    def test_a_home_reached_through_a_link_is_above_its_skills_folder(self, tmp_path):
+        real_home = tmp_path / "var" / "home" / "amin"
+        self._transcripts(real_home / ".claude")
+        _skill(real_home, "notes/private.md", b"PRIVATE-DECOY")
+        (tmp_path / "home").mkdir()
+        home = tmp_path / "home" / "amin"
+        _link_dir(home, real_home)
+        _link_dir(home / ".claude" / "skills", home)
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == (
+            "skills: links to a folder it must not read, not followed",
+        )
+        assert "DECOY" not in repr(scope)
+
+    def test_a_skills_folder_linked_to_the_repo_holding_claude_ships_nothing(
+        self, tmp_path
+    ):
+        home = _pc_home(tmp_path)
+        dot = tmp_path / "dot"
+        self._transcripts(dot / "claude")
+        _skill(dot, "myskill/SKILL.md")
+        _link_dir(home / ".claude", dot / "claude")
+        _link_dir(dot / "claude" / "skills", dot)
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == (
+            "skills: links to a folder it must not read, not followed",
+        )
+        assert "DECOY" not in repr(scope)
+
+    def test_a_link_inside_to_the_repo_holding_claude_is_above_too(self, tmp_path):
+        home = _pc_home(tmp_path)
+        dot = tmp_path / "dot"
+        self._transcripts(dot / "claude")
+        _skill(dot, "private.md", b"PRIVATE-DECOY")
+        _link_dir(home / ".claude", dot / "claude")
+        repo = tmp_path / "repo"
+        _skill(repo, "s/SKILL.md")
+        _link_dir(dot / "claude" / "skills", repo)
+        _link_dir(repo / "x", dot)
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == (
+            "skills/x: links to a folder above the skills folder, not followed",
+        )
+        assert "DECOY" not in repr(scope)
+
     # Defence in depth beside the ancestor rule: nothing inside a well-known
     # secrets folder under the scope's home is read, a folder or one file.
     @pytest.mark.parametrize(

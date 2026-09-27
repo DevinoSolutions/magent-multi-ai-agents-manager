@@ -906,8 +906,10 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
 
     Three kinds of target are never followed, each pruned with a note and a
     WARNING naming the link. A folder ABOVE the skills folder -- ``~/.claude``,
-    ``~``, ``/`` -- is no skill: it is the walk reading the whole home.
-    Nothing inside one of ``home``'s ``SECRET_HOME_DIRS`` is read, folder or
+    ``~``, ``/`` -- is no skill: it is the walk reading the whole home. Above
+    where it is named, where it resolves, or where ``~/.claude`` resolves --
+    so a home reached through a link, or a ``~/.claude`` kept in a dotfiles
+    repo that skills links back to, is above it too. Nothing inside one of ``home``'s ``SECRET_HOME_DIRS`` is read, folder or
     single file, however it was reached. And nothing in ``~/.claude`` outside
     the skills folder is read either -- the session transcripts, the history,
     the login. Both sides of every comparison are resolved first, so a
@@ -929,31 +931,34 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     the rest), and the walk goes on."""
     if not root.is_dir():
         return ()
-    # The unresolved root counts too: with ~/.claude a junction elsewhere, a
-    # link to ~ is above the path the user sees, not the resolved one.
-    anchors = (os.path.normcase(os.path.abspath(root)), _real(root))
+    real_root = _real(root)
     fences = _Fences(
         secrets=tuple(_real(home / d) for d in SECRET_HOME_DIRS),
         claude=_real(home / ".claude"),
-        root=anchors[1],
+        root=real_root,
     )
     # ~/.claude/skills resolved where ~/.claude resolves: anywhere else in
     # ~/.claude (the transcripts, say) is no skills folder.
     own = os.path.normcase(os.path.join(fences.claude, "skills"))
-    if _above(anchors[1], anchors[0]) or any(
-        _within(s, anchors[1]) for s in fences.secrets
+    # Where the skills folder sits, by every spelling: as the user sees it,
+    # as it resolves, and where ~/.claude resolves. A home reached through a
+    # link (/home -> usr/home) or a ~/.claude kept in a dotfiles repo puts a
+    # link to that home or that repo above only the third.
+    anchors = (os.path.normcase(os.path.abspath(root)), real_root, own)
+    if any(_above(real_root, anchor) for anchor in anchors) or any(
+        _within(s, real_root) for s in fences.secrets
     ):
         notes.append("skills: links to a folder it must not read, not followed")
-        _log.warning("%s links to %s: not followed", root, anchors[1])
+        _log.warning("%s links to %s: not followed", root, real_root)
         return ()
-    if _within(fences.claude, anchors[1]) and anchors[1] != own:
+    if _within(fences.claude, real_root) and real_root != own:
         notes.append(
             "skills: resolves into ~/.claude outside ~/.claude/skills, not shipped"
         )
         _log.warning(
             "%s resolves to %s, in ~/.claude outside ~/.claude/skills: not shipped",
             root,
-            anchors[1],
+            real_root,
         )
         return ()
     if any((root / top).exists() for top in SKILLS_EXCLUDED_TOP):
