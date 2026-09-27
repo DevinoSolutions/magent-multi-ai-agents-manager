@@ -919,10 +919,12 @@ class NodeSyncer:
 
 
 class DaemonLockUnknown(Exception):
-    """The daemon's lock file would not open -- Windows answers EACCES while
+    """A node sync lock file would not open -- Windows answers EACCES while
     one is pending delete -- so whether a daemon runs is unknown, and nothing
-    ran. ``run_once`` and ``run_sync_loop`` raise it from that open's error
-    (``error``), never for an OSError of a tick."""
+    ran. Raised from that open's error (``error``): by ``run_once`` and
+    ``run_sync_loop`` for the daemon's lock, by ``launch.ensure_node_sync`` for
+    its probe of it, and by serve's supervisor for its own lock -- never for an
+    OSError of a tick or a spawn."""
 
     def __init__(self, error: OSError) -> None:
         super().__init__(str(error))

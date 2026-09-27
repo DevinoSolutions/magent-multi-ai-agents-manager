@@ -512,13 +512,22 @@ def ensure_node_sync(config: MagentConfig, config_path: str | None = None) -> bo
     with a stale heartbeat is a wedged daemon -- reported once, left for the
     user (`magent node sync --stop`), never killed from here. The respawn rate
     of a daemon that keeps dying is the caller's interval.
+
+    A lock file that would not open (Windows answers EACCES while one is
+    pending delete) is ``node_sync.DaemonLockUnknown``: whether a daemon runs is
+    unknown, so nothing is spawned, and the caller can tell it from a refused
+    spawn.
     """
     if not node_sync_enabled(config):
         return False
     from magent import node_sync  # in-body: same reason as node_sync_enabled
 
     log = get_logger(node_sync.LOG_NAME)
-    if not node_sync.daemon_running():
+    try:
+        running = node_sync.daemon_running()
+    except OSError as e:
+        raise node_sync.DaemonLockUnknown(e) from e
+    if not running:
         _node_sync_report.wedged = False
         spawn_detached(node_sync_argv(config_path))
         return True
@@ -2311,9 +2320,11 @@ def _keep_node_sync(config: MagentConfig, config_path: str | None) -> None:
     effort: the sessions are up either way, and a daemon that cannot start
     (its lock dir, the spawn) must not cost the bring-up its report or its exit
     code -- ``status`` shows the daemon off, and serve's supervisor retries."""
+    from magent import node_sync  # in-body: same reason as node_sync_enabled
+
     try:
         ensure_node_sync(config, config_path=config_path)
-    except OSError as exc:
+    except (OSError, node_sync.DaemonLockUnknown) as exc:
         get_logger("nodes").warning(
             "node sync daemon not started after the bring-up: %s", exc
         )

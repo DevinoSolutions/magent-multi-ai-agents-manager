@@ -564,6 +564,31 @@ class TestEnsureNodeSync:
         assert "heartbeat is stale" in warning
         assert str(os.getpid()) in warning
 
+    def test_a_lock_that_would_not_open_is_unknown_and_nothing_is_spawned(
+        self, sync_on, spawned, monkeypatch
+    ):
+        """Windows answers EACCES while the lock file is pending delete, so
+        whether a daemon runs is unknown: never "not running" (a spawn could
+        double a live daemon), and never the bare PermissionError, which a
+        caller could not tell from a refused spawn."""
+        denied = PermissionError(13, "Access is denied")
+        real_lock = node_sync.exclusive_lock
+
+        def lock(name: str) -> contextlib.AbstractContextManager[None]:
+            if name == node_sync.LOCK_NAME:
+                raise denied
+            return real_lock(name)
+
+        monkeypatch.setattr(node_sync, "exclusive_lock", lock)
+        try:
+            got: object = launch.ensure_node_sync(_config(), "cfg.json")
+        except (OSError, node_sync.DaemonLockUnknown) as exc:
+            got = exc
+        assert isinstance(got, node_sync.DaemonLockUnknown), got
+        assert got.error is denied
+        assert got.__cause__ is denied
+        assert spawned == []
+
     def test_a_wedge_is_reported_once_and_its_recovery_once(
         self, sync_on, spawned, daemon_lock, caplog
     ):
@@ -578,6 +603,18 @@ class TestEnsureNodeSync:
         infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
         assert len([m for m in infos if "fresh again" in m]) == 1
         assert spawned == []
+
+
+def _ensure_on_nodes(monkeypatch) -> None:
+    """serve's tick runs the REAL ensure_node_sync, on a config with node
+    projects (the config file serve reads in these tests names none)."""
+    monkeypatch.setattr(launch, "_node_sync_report", launch._NodeSyncReport())
+    real = launch.ensure_node_sync
+    monkeypatch.setattr(
+        launch,
+        "ensure_node_sync",
+        lambda _cfg, config_path=None: real(_config(), config_path),
+    )
 
 
 def _run_supervisor(
@@ -852,7 +889,7 @@ class TestServeSupervisesTheDaemon:
         self, sync_on, tmp_config, monkeypatch, caplog, where
     ):
         """Windows answers EACCES while a lock file its last holder deleted is
-        still pending delete: serve's own lock, or the daemon's under
+        still pending delete: serve's own lock, or the daemon's under the REAL
         ensure_node_sync. A known transient -- a WARNING naming the class and
         the errno, never an exception-level record (Sentry's), and the next
         tick runs."""
@@ -861,38 +898,63 @@ class TestServeSupervisesTheDaemon:
         _capture_nodes_log(caplog)
         path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
         stop = threading.Event()
-        denied = PermissionError(13, "Access is denied")
-        answers: list[BaseException | bool] = [False]
-        if where == "supervisor-lock":
-            real_lock = upload_server.exclusive_lock
-            refusals = [denied]
+        _ensure_on_nodes(monkeypatch)
+        module = upload_server if where == "supervisor-lock" else node_sync
+        refused = (
+            node_sync.SUPERVISOR_LOCK_NAME
+            if where == "supervisor-lock"
+            else node_sync.LOCK_NAME
+        )
+        real_lock = module.exclusive_lock
+        refusals = [PermissionError(13, "Access is denied")]
 
-            def lock(name: str):
-                if name == node_sync.SUPERVISOR_LOCK_NAME and refusals:
-                    raise refusals.pop()
-                return real_lock(name)
+        def lock(name: str) -> contextlib.AbstractContextManager[None]:
+            if name == refused and refusals:
+                raise refusals.pop()
+            return real_lock(name)
 
-            monkeypatch.setattr(upload_server, "exclusive_lock", lock)
-        else:
-            answers.insert(0, denied)
-        ensured: list[BaseException | bool] = []
+        monkeypatch.setattr(module, "exclusive_lock", lock)
+        spawned: list[list[str]] = []
 
-        def ensure(_config, config_path=None):
-            answer = answers.pop(0)
-            ensured.append(answer)
-            if isinstance(answer, BaseException):
-                raise answer
+        def spawn(argv: list[str]) -> None:
+            spawned.append(argv)
             stop.set()
-            return answer
 
-        monkeypatch.setattr(launch, "ensure_node_sync", ensure)
+        monkeypatch.setattr(launch, "spawn_detached", spawn)
         _run_supervisor(path, stop)
-        assert ensured == ([False] if where == "supervisor-lock" else [denied, False])
+        assert refusals == []
+        # The refused tick spawned nothing; the next one did.
+        assert spawned == [launch.node_sync_argv(path)]
         assert _errors(caplog) == []
         warnings = _warnings(caplog)
         assert len(warnings) == 1, warnings
         assert "PermissionError" in warnings[0]
         assert "errno 13" in warnings[0]
+
+    def test_a_refused_spawn_is_a_failed_check_not_a_skipped_tick(
+        self, sync_on, tmp_config, monkeypatch, caplog
+    ):
+        """Only a lock file that would not open is the known transient. A
+        PermissionError from anywhere else in the tick -- here the spawn -- can
+        persist, so it stays at exception level (Sentry's)."""
+        _capture_nodes_log(caplog)
+        path = tmp_config({"version": SCHEMA_VERSION, "projects": []})
+        _ensure_on_nodes(monkeypatch)
+        spawns: list[list[str]] = []
+
+        def refuse(argv: list[str]) -> None:
+            spawns.append(argv)
+            raise PermissionError(13, "Access is denied")
+
+        monkeypatch.setattr(launch, "spawn_detached", refuse)
+        _run_supervisor(path, _one_tick())
+        assert spawns == [launch.node_sync_argv(path)]
+        errors = _errors(caplog)
+        assert [r.getMessage() for r in errors] == [
+            "node sync supervisor: check failed"
+        ]
+        assert errors[0].exc_info is not None
+        assert not any("tick skipped" in m for m in _warnings(caplog))
 
     def test_any_other_error_of_a_tick_is_still_logged_at_exception_level(
         self, sync_on, tmp_config, monkeypatch, caplog

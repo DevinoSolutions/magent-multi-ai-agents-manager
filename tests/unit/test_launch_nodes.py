@@ -2476,12 +2476,20 @@ class TestABringUpKeepsTheSyncDaemonRunning:
         launch.run_magent(_config(api), launch.RunOpts())
         assert ensured == [None]
 
-    @pytest.fixture
-    def cannot_start(self, monkeypatch, caplog):
-        # The daemon's lock dir unwritable, or the spawn refused: after the
-        # sessions came up, which must still be reported.
+    @pytest.fixture(params=["spawn-refused", "lock-unknown"])
+    def cannot_start(self, monkeypatch, caplog, request):
+        # The spawn refused, or the daemon's lock file would not open (whether
+        # one runs is unknown): after the sessions came up, which must still
+        # be reported.
+        denied = PermissionError(13, "Access is denied")
+        error: Exception = (
+            denied
+            if request.param == "spawn-refused"
+            else node_sync.DaemonLockUnknown(denied)
+        )
+
         def ensure(config: object, config_path: object = None) -> bool:
-            raise PermissionError(13, "Access is denied")
+            raise error
 
         monkeypatch.setattr(launch, "ensure_node_sync", ensure)
         monkeypatch.setattr("magent.psmux.bring_up", lambda cfg, only, group: ([], []))
@@ -2498,7 +2506,7 @@ class TestABringUpKeepsTheSyncDaemonRunning:
         # test: a guard gone and a broken rig must not read the same.
         try:
             got: object = launch.bring_up_psmux(_config(api))
-        except OSError as exc:
+        except (OSError, node_sync.DaemonLockUnknown) as exc:
             got = exc
         assert got == (["api"], [])
         assert any("node sync daemon not started" in m for m in cannot_start())
@@ -2508,7 +2516,7 @@ class TestABringUpKeepsTheSyncDaemonRunning:
     ):
         try:
             got: object = launch.run_magent(_config(api), launch.RunOpts())
-        except OSError as exc:
+        except (OSError, node_sync.DaemonLockUnknown) as exc:
             got = exc
         assert got == 0
         assert any("node sync daemon not started" in m for m in cannot_start())
