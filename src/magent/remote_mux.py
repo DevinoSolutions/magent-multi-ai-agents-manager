@@ -777,7 +777,7 @@ def _gh_call(
     except RemoteError as e:
         if e.rc == SSH_MISSING_RC:
             return GhUnavailable("missing")
-        if e.stderr_tail.startswith("timed out after "):  # _spawn's own words
+        if e.timed_out:
             return GhUnavailable("timeout")
         return GhUnavailable("failed", detail=_gh_detail(e.stderr_tail))
 

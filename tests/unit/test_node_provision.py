@@ -1880,6 +1880,29 @@ class TestThisPcsGh:
         assert account == GhUnavailable("timeout")
         assert "0.5s" in account.hint
 
+    # RemoteError says whether the call timed out; its wording is not the flag.
+    @pytest.mark.parametrize(
+        ("error", "reason"),
+        [
+            (
+                RemoteError(None, "no answer after 20s", ("gh",), timed_out=True),
+                "timeout",
+            ),
+            (RemoteError(None, "timed out after 20s", ("gh",)), "failed"),
+        ],
+        ids=["flagged-other-words", "same-words-unflagged"],
+    )
+    def test_a_timeout_is_read_from_the_flag_not_the_words(
+        self, fake_gh, monkeypatch, error, reason
+    ):
+        def spawn(*_args: object, **_kwargs: object) -> None:
+            raise error
+
+        monkeypatch.setattr(remote_mux, "_spawn", spawn)
+        account = remote_mux.local_gh_account()
+        assert isinstance(account, GhUnavailable)
+        assert account.reason == reason
+
     def test_the_token_comes_from_gh_auth_token(self, fake_gh):
         fake_gh.set_reply("auth token", stdout=TOKEN + "\n")
         assert remote_mux.local_gh_token() == TOKEN
