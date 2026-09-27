@@ -710,6 +710,19 @@ class TestIdleColumnNeedsPositiveProof:
         # The pane next to it has no agent under it: that one IS idle.
         assert rows["web"]["idle"] is True
 
+    def test_a_tool_outside_the_registry_is_not_idle(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        rows = self._rows(
+            runner,
+            tmp_config,
+            tmp_path,
+            monkeypatch,
+            {"api": "bash"},
+            trees={"api": ("cmd.exe", "cursor-agent.exe", "bash.exe")},
+        )
+        assert rows["api"]["idle"] is False
+
     def test_the_human_table_shows_the_tool_not_idle(
         self, runner, tmp_config, tmp_path, monkeypatch
     ):

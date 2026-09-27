@@ -24,7 +24,8 @@ from typing import ClassVar
 import pytest
 
 from magent import psmux
-from magent.config import MagentConfig, ProjectConfig, Settings
+from magent.config import DEFAULT_TOOLS, MagentConfig, ProjectConfig, Settings
+from magent.sessions import AGENT_TOOLS
 from tests.unit._fake_panes import fake_panes, pane_tree
 
 
@@ -443,6 +444,20 @@ class TestIdleSessions:
         )
         assert psmux.idle_sessions(names, psmux="psmux") == set()
 
+    def test_a_live_launcher_is_the_command_magent_typed(self, monkeypatch):
+        # A cmd under the pane's shell with an image no list knows below it is
+        # still the launched command; the bare pane beside it is idle.
+        fake_panes(
+            monkeypatch,
+            foreground={"api": "bash", "web": "pwsh"},
+            pids={"api": 100, "web": 200},
+            snapshot=[
+                *pane_tree(100, "cmd.exe", "some-future-agent.exe", "bash.exe"),
+                *pane_tree(200),
+            ],
+        )
+        assert psmux.idle_sessions(["api", "web"], psmux="psmux") == {"web"}
+
     def test_off_windows_nothing_is_ever_idle(self, monkeypatch):
         # No process snapshot exists off Windows, so no proof can exist either.
         fake_panes(
@@ -677,6 +692,11 @@ class TestReviveSessions:
         assert psmux.revive_sessions(cfg) == []
 
 
+# Shipped in DEFAULT_TOOLS (and the README) with no AGENT_TOOLS entry, so no
+# registry image names their process: today agy and cursor-agent.
+_UNREGISTERED_TOOLS = sorted(set(DEFAULT_TOOLS) - set(AGENT_TOOLS))
+
+
 class TestReviveNeverTypesIntoALiveAgent:
     """``#{pane_current_command}`` is the pane's FOREGROUND DESCENDANT, not the
     pane's own process. While Claude Code runs a tool it reads ``bash`` (the
@@ -691,7 +711,7 @@ class TestReviveNeverTypesIntoALiveAgent:
     only the pane probes and the process snapshot substituted.
     """
 
-    def _revive(self, monkeypatch, *, foreground, pids, snapshot):
+    def _revive(self, monkeypatch, *, foreground, pids, snapshot, tool="claude"):
         sent: list[tuple[str, tuple[str, ...]]] = []
         monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
         monkeypatch.setattr(psmux, "has_session", lambda name, psmux=None: True)
@@ -704,7 +724,7 @@ class TestReviveNeverTypesIntoALiveAgent:
         probes = fake_panes(
             monkeypatch, foreground=foreground, pids=pids, snapshot=snapshot
         )
-        cfg = _cfg([ProjectConfig(path=f"/a/{n}", tool="claude") for n in foreground])
+        cfg = _cfg([ProjectConfig(path=f"/a/{n}", tool=tool) for n in foreground])
         return psmux.revive_sessions(cfg), sent, probes
 
     @pytest.mark.parametrize(
@@ -745,6 +765,38 @@ class TestReviveNeverTypesIntoALiveAgent:
         )
         assert revived == []
         assert sent == []
+
+    @pytest.mark.parametrize("tool", _UNREGISTERED_TOOLS)
+    def test_a_shipped_tool_outside_the_registry_is_not_idle_while_it_runs(
+        self, monkeypatch, tool
+    ):
+        # magent's own launch shape: it typed `cmd /c <command>` into the pane,
+        # and cmd /c lives exactly as long as its command -- so a live cmd under
+        # the pane's shell IS the launched tool, whatever its image is called.
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": "bash"},
+            pids={"api": 100},
+            snapshot=pane_tree(100, "cmd.exe", f"{tool}.exe", "bash.exe"),
+            tool=tool,
+        )
+        assert revived == []
+        assert sent == []
+
+    @pytest.mark.parametrize("tool", _UNREGISTERED_TOOLS)
+    def test_a_shipped_tool_outside_the_registry_is_revived_once_it_is_gone(
+        self, monkeypatch, tool
+    ):
+        # cmd /c exited with its command: the pane's shell has nothing under it.
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=pane_tree(100),
+            tool=tool,
+        )
+        assert revived == ["api"]
+        assert tool in sent[0][1][0]
 
     def test_a_pane_with_no_agent_under_it_is_still_revived(self, monkeypatch):
         # The case revive exists for: the agent exited and the pane's pwsh is

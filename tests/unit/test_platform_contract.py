@@ -581,6 +581,16 @@ class TestWindowsSendKeysVerification:
         )
         assert len(_sends_for(calls, "api")) == 1
 
+    def test_a_tool_outside_the_registry_is_never_re_sent(self, monkeypatch):
+        # agy ships in DEFAULT_TOOLS with no registry image. The live
+        # `cmd /c agy` under the pane's shell is the launched command itself.
+        calls, _ = _drive_bring_up(
+            monkeypatch,
+            pane_states={"api": ["bash"]},
+            pane_trees={"api": ("cmd.exe", "agy.exe", "bash.exe")},
+        )
+        assert len(_sends_for(calls, "api")) == 1
+
     def test_an_unreadable_pane_pid_is_never_re_sent(self, monkeypatch):
         calls, _ = _drive_bring_up(
             monkeypatch, pane_states={"api": ["pwsh"]}, pane_pids={"api": None}
