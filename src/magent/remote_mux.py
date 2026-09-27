@@ -1105,7 +1105,8 @@ def provision(
     return ProvisionReport((*notes, *shipped, *probe_failed, *gh_rows, *report.lines))
 
 
-# No gh, or no login in it: the node's own gh row already says so.
+# No gh, or no login in it: the node's own gh row already says so. The account
+# step's answer only -- a token gh withholds after naming a login never is.
 _GH_SILENT_REASONS = frozenset({"missing", "not-logged-in"})
 # An unverified login's token ships (unknown is not rejected), and says so.
 # Our words only: gh's own detail goes to the log, never onto the row.
@@ -1117,11 +1118,12 @@ GH_SHARED_UNVERIFIED = (
 
 def _gh_to_share() -> tuple[str | None, str | None, tuple[ScriptLine, ...]]:
     """(login, token, rows) for ``provision``: this PC's github.com login and
-    token when both are known, else (None, None) and -- unless gh is simply
-    absent or logged out -- one ``warn`` row naming the repair. A verified
-    login ships; so does an ``unverified`` one (offline: its stored token is
-    still read) with a ``warn`` row saying it was not checked, never a
-    ``rejected`` one. A row never quotes the token or gh's output."""
+    token when both are known, else (None, None) and -- unless the account
+    step found gh simply absent or logged out -- one ``warn`` row naming the
+    repair. A verified login ships; so does an ``unverified`` one (offline:
+    its stored token is still read) with a ``warn`` row saying it was not
+    checked, never a ``rejected`` one. A row never quotes the token or gh's
+    output."""
     account = local_gh_account()
     if isinstance(account, GhAccount):
         login: str | None = account.login
@@ -1130,21 +1132,33 @@ def _gh_to_share() -> tuple[str | None, str | None, tuple[ScriptLine, ...]]:
     else:
         login = None
     refusal = account if isinstance(account, GhUnavailable) else None
-    if login is not None:
-        token = local_gh_token()
-        if isinstance(token, str):
-            if refusal is None:
-                return login, token, ()
-            # The token is in hand: mask it by value, whatever its shape.
-            get_logger("nodes").warning(
-                "gh login %s unverified, its token shared anyway: %s",
-                login,
-                (refusal.detail or refusal.reason).replace(token, "<redacted>"),
-            )
-            return login, token, (ScriptLine("warn", "gh", GH_SHARED_UNVERIFIED),)
-        refusal = token
-    if refusal is None or refusal.reason in _GH_SILENT_REASONS:
-        return None, None, ()
+    if login is None:
+        if refusal is None or refusal.reason in _GH_SILENT_REASONS:
+            return None, None, ()
+        return _gh_not_shared(refusal)
+    token = local_gh_token()
+    if isinstance(token, str):
+        if refusal is None:
+            return login, token, ()
+        # The token is in hand: mask it by value, whatever its shape.
+        get_logger("nodes").warning(
+            "gh login %s unverified, its token shared anyway: %s",
+            login,
+            (refusal.detail or refusal.reason).replace(token, "<redacted>"),
+        )
+        return login, token, (ScriptLine("warn", "gh", GH_SHARED_UNVERIFIED),)
+    # gh named a login, then gave no token for it: two answers that disagree
+    # are never read as a plain absence, whatever the token step's reason.
+    if refusal is not None:
+        _log_gh_refusal(refusal, f"gh login {login} unverified")
+    return _gh_not_shared(token)
+
+
+def _gh_not_shared(
+    refusal: GhUnavailable,
+) -> tuple[None, None, tuple[ScriptLine, ...]]:
+    """``_gh_to_share``'s answer for a refusal worth a row: gh's words to the
+    log, the class and its repair to the row."""
     _log_gh_refusal(refusal, "gh token not shared")
     return None, None, (ScriptLine("warn", "gh", f"not shared -- {refusal.hint}"),)
 

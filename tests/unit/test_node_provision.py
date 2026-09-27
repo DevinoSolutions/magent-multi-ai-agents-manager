@@ -2450,6 +2450,83 @@ class TestProvision:
             in report.lines
         )
 
+    # gh named a login, then gave no token for it. Two answers that disagree
+    # are never read as a plain absence: a row and a log line, whatever the
+    # token step's reason -- the silent classes are the account step's alone.
+    def test_a_named_login_whose_token_gh_cannot_find_is_never_silent(
+        self, fake_ssh, fake_gh, caplog
+    ):
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        fake_gh.set_reply(
+            "auth token", stderr="no oauth token found for github.com\n", rc=1
+        )
+        caplog.set_level("WARNING", logger="magent.nodes")
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        (call,) = fake_ssh.calls()
+        assert _sent(call).startswith(b"\n")
+        assert [line for line in report.lines if line.item == "gh"] == [
+            ScriptLine(
+                "warn",
+                "gh",
+                "not shared -- gh is not logged in on this PC: gh auth login",
+            )
+        ]
+        assert (
+            "gh token not shared: this PC's gh gave not-logged-in: "
+            "no oauth token found for github.com"
+        ) in _nodes_log(caplog)
+
+    def test_a_gh_that_vanishes_after_naming_its_login_is_never_silent(
+        self, fake_ssh, fake_gh, caplog, monkeypatch
+    ):
+        # There for `gh auth status`, gone by `gh auth token`.
+        found = [fake_gh.path]
+        monkeypatch.setattr(
+            remote_mux, "find_gh", lambda: found.pop(0) if found else None
+        )
+        fake_gh.set_reply("auth status", stdout=gh_auth_status("amin", "repo"))
+        caplog.set_level("WARNING", logger="magent.nodes")
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        assert [c.argv[:2] for c in fake_gh.calls()] == [["auth", "status"]]
+        assert [line for line in report.lines if line.item == "gh"] == [
+            ScriptLine(
+                "warn",
+                "gh",
+                "not shared -- gh is not installed on this PC: https://cli.github.com",
+            )
+        ]
+        assert "gh token not shared: this PC's gh gave missing" in _nodes_log(caplog)
+
+    def test_an_unverified_login_whose_token_read_fails_logs_both_answers(
+        self, fake_ssh, fake_gh, caplog
+    ):
+        said = "dial tcp: lookup api.github.com: no such host"
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(None, accounts=[("amin", True, "error", said)]),
+        )
+        fake_gh.set_reply(
+            "auth token", stderr="no oauth token found for github.com\n", rc=1
+        )
+        caplog.set_level("WARNING", logger="magent.nodes")
+        report = remote_mux.provision(
+            NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+        assert [line for line in report.lines if line.item == "gh"] == [
+            ScriptLine(
+                "warn",
+                "gh",
+                "not shared -- gh is not logged in on this PC: gh auth login",
+            )
+        ]
+        logged = _nodes_log(caplog)
+        assert said in logged
+        assert "no oauth token found for github.com" in logged
+
     # The node's own gh row already says "no gh login to share".
     def test_no_gh_adds_no_row_of_this_pcs_own(self, fake_ssh):
         report = remote_mux.provision(
