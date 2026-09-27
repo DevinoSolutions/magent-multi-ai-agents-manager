@@ -1638,9 +1638,7 @@ class TestTheRepoRecordFileIsCheckedOnTheWayInAndOut:
 
 @pytest.fixture
 def api_repo(tmp_path) -> Path:
-    """The local checkout a node project points at: a real (tmp) git repo.
-
-    D-MERGE: plan G Task 8 (:1865-1872) appends this same fixture; keep one."""
+    """The local checkout a node project points at: a real (tmp) git repo."""
     repo = tmp_path / "api"
     repo.mkdir()
     git(repo, "init", "-b", "main")

@@ -16,32 +16,11 @@ import pytest
 from magent import cli, log, node_sync, nodes, remote_mux
 from magent.nodes import LocalGitState
 from tests.unit._node_fixtures import (
-    D_ATTRS,
-    before_d,
     config_json,
     entry,
     git,
-    needs_d,
     seed_history,
 )
-
-# D-MERGE: tests that wait on sub-plan D are gated through _node_fixtures'
-# one D_ATTRS list (needs_d); D's merge switches them on by itself, and they
-# fail until the deferred code named in node_cmd.py's D-MERGE index lands.
-
-
-class TestTheOneDGate:
-    def test_a_name_outside_the_one_list_is_refused_not_silently_skipped(self):
-        # A typo (or a D rename) would otherwise keep a test skipped forever.
-        with pytest.raises(KeyError, match="D_ATTRS"):
-            needs_d("kill_sessions", plan=":1")
-        with pytest.raises(KeyError, match="D_ATTRS"):
-            before_d("kill_sessions")
-
-    def test_every_gate_says_d_merge_so_the_exit_criterion_sees_it(self):
-        for name in D_ATTRS:
-            for mark in (needs_d(name, plan=":1"), before_d(name)):
-                assert mark.kwargs["reason"].startswith("D-MERGE: ")
 
 
 def _nodes_tree() -> dict[str, bytes]:

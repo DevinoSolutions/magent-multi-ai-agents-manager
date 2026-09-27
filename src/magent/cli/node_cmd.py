@@ -36,18 +36,6 @@ if TYPE_CHECKING:
     from magent.nodes import Node, NodeMapEntry, Placement, RepoStatus
     from magent.remote_mux import RemoteError
 
-# D-MERGE: index -- everything plan G defers to sub-plan D's merge, in one
-# place (the local D-MERGE notes below mark each insertion point). The tests
-# that wait on D are gated through ONE list, tests/unit/_node_fixtures.py's
-# D_ATTRS: launch.node_recipe, launch.node_git_states,
-# launch.bring_up_node_project, launch.NodeBringUpOutcome,
-# remote_mux.push_files, remote_mux.kill_session.
-# Exit criterion: after D merges,
-#   uv run pytest tests/unit/test_node_cmd.py tests/unit/test_node_recall.py -rs
-# shows no skip reason containing "D-MERGE", and
-#   git grep -n D-MERGE -- src tests
-# comes back empty.
-
 # How long `node sync -d` waits for the detached child to record its pid:
 # ~10 s nominal, returning as soon as it appears or the child exits. A cold
 # child spends seconds importing before it takes the lock (measured 2.5-13 s
