@@ -201,9 +201,9 @@ def _psmux_sessions(
     client attaches to -- so a report that stops at the daemons says nothing
     about the actual work. Liveness is already settled by ``psmux_status``'s
     fan-out; the added cost is one ``#{pane_current_command}`` probe per live
-    session, sent as a single unbounded fan-out
-    (``psmux.pane_current_commands``), so 40 sessions stay ~one psmux
-    round-trip. ``idle`` is the verdict revive acts on (``psmux.idle_sessions``,
+    session, sent as a single fan-out -- every probe at once, one shared
+    deadline (``psmux.pane_current_commands``) -- so 40 sessions stay ~one
+    psmux round-trip. ``idle`` is the verdict revive acts on (``psmux.idle_sessions``,
     handed those same readings), which adds one pane-pid fan-out and one
     process snapshot only when some pane reads as a bare shell -- a shell in
     the foreground is often a live agent's tool, so the reading alone never
