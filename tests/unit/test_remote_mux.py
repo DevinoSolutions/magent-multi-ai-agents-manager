@@ -272,10 +272,12 @@ class TestRun:
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["true"], timeout_s=5)
         assert gone not in str(exc.value)
-        assert gone not in exc.value.stderr_tail
+        # The program and the class: never the path, never the OS's words
+        # ("No such file or directory" / "The system cannot find the file").
+        assert exc.value.stderr_tail == "could not start ssh (FileNotFoundError)"
 
     def test_a_spawn_failure_with_no_os_words_is_named_by_its_class(self, monkeypatch):
-        # No strerror to fall back on: the class, never str(e) and its path.
+        # No strerror either: still the class, never str(e) and its path.
         def refuse(*_a: object, **_k: object) -> None:
             raise OSError(r"C:\Tools\OpenSSH\ssh.exe is not a valid image")
 
@@ -283,15 +285,16 @@ class TestRun:
         monkeypatch.setattr(remote_mux.subprocess, "Popen", refuse)
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["true"], timeout_s=5)
-        assert exc.value.stderr_tail == "OSError"
+        assert exc.value.stderr_tail == "could not start ssh (OSError)"
         assert "OpenSSH" not in str(exc.value)
+        assert "valid image" not in str(exc.value)
 
     def test_a_spawn_failure_is_logged_like_any_other_failure(
         self, tmp_path, monkeypatch
     ):
         gone = str(tmp_path / "no-such-ssh.exe")
         monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: gone)
-        with pytest.raises(RemoteError):
+        with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["true"], timeout_s=5)
         logged = (log.LOG_DIR / "nodes.log").read_text(encoding="utf-8")
         (line,) = [
@@ -300,6 +303,11 @@ class TestRun:
             if "WARNING" in ln and "could not start" in ln
         ]
         assert NODE.target in line
+        # The OS's words and code the screen never shows are the log's.
+        cause = exc.value.__cause__
+        assert isinstance(cause, FileNotFoundError)
+        assert f"errno {cause.errno}" in line
+        assert f"{cause.strerror}" in line
         # Only discriminates on POSIX: Windows' CreateProcess OSErrors never
         # carry the filename, so a Windows-only green proves nothing here.
         assert gone not in logged
@@ -373,7 +381,11 @@ class TestRun:
         monkeypatch.setattr(remote_mux.subprocess, "Popen", denied)
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["true"], timeout_s=5, quiet=True)
-        assert (exc.value.rc, exc.value.stderr_tail) == (None, "Permission denied")
+        assert (exc.value.rc, exc.value.stderr_tail) == (
+            None,
+            "could not start ssh (PermissionError)",
+        )
+        assert "Permission denied" not in str(exc.value)
         assert exc.value.timed_out is False
         # The rc-None case where nothing ran: the flags must not say it may have.
         assert (exc.value.over_cap, exc.value.outcome_unknown) == (False, False)
@@ -1227,21 +1239,28 @@ class TestWhichReposMakeTheProject:
         with pytest.raises(RemoteError) as exc:
             remote_mux.repo_paths(tmp_path)
         assert exc.value.rc is None
-        assert "Permission denied" in exc.value.stderr_tail
-        assert str(tmp_path) in str(exc.value)
+        # The folder is the user's own configured project, so it is named;
+        # the OS's words are not ours, so only their class is.
+        assert exc.value.stderr_tail == f"cannot read {tmp_path} (PermissionError)"
+        assert "Permission denied" not in str(exc.value)
+        logged = (log.LOG_DIR / "nodes.log").read_text(encoding="utf-8")
+        (line,) = [ln for ln in logged.splitlines() if "repo lookup failed" in ln]
+        assert "WARNING" in line
+        assert "Permission denied" in line
 
     def test_an_error_with_no_os_words_is_named_by_its_class(
         self, tmp_path, monkeypatch
     ):
-        # strerror is the OS's words without a path; an OSError with none
-        # would put its whole str() on screen. The class there, it in the log.
+        # An OSError with no strerror is named by its class too; its str()
+        # (which can name another path) goes to the log.
         def broken(self):
             raise OSError(r"C:\Users\amin\ws: gone")
 
         monkeypatch.setattr(Path, "iterdir", broken)
         with pytest.raises(RemoteError) as exc:
             remote_mux.repo_paths(tmp_path)
-        assert exc.value.stderr_tail == f"cannot read {tmp_path}: OSError"
+        assert exc.value.stderr_tail == f"cannot read {tmp_path} (OSError)"
+        assert "ws: gone" not in str(exc.value)
         logged = (log.LOG_DIR / "nodes.log").read_text(encoding="utf-8")
         assert r"C:\Users\amin\ws: gone" in logged
 
@@ -1256,7 +1275,8 @@ class TestWhichReposMakeTheProject:
         with pytest.raises(RemoteError) as exc:
             remote_mux.repo_paths(tmp_path)
         assert exc.value.rc is None
-        assert "Permission denied" in exc.value.stderr_tail
+        assert exc.value.stderr_tail == f"cannot read {tmp_path} (PermissionError)"
+        assert "Permission denied" not in str(exc.value)
 
     def test_a_repo_whose_git_cannot_be_read_is_an_error_not_no_repo(
         self, tmp_path, monkeypatch
@@ -1265,7 +1285,8 @@ class TestWhichReposMakeTheProject:
         deny_stat(monkeypatch, tmp_path / ".git")
         with pytest.raises(RemoteError) as exc:
             remote_mux.repo_paths(tmp_path)
-        assert "Permission denied" in exc.value.stderr_tail
+        assert exc.value.stderr_tail == f"cannot read {tmp_path} (PermissionError)"
+        assert "Permission denied" not in str(exc.value)
 
     def test_a_drive_that_is_not_ready_is_an_error_not_empty(
         self, tmp_path, monkeypatch
@@ -1288,7 +1309,8 @@ class TestWhichReposMakeTheProject:
                 remote_mux.repo_paths(tmp_path)
         finally:
             (tmp_path / "web").chmod(0o700)
-        assert "Permission denied" in exc.value.stderr_tail
+        assert exc.value.stderr_tail == f"cannot read {tmp_path} (PermissionError)"
+        assert "Permission denied" not in str(exc.value)
 
 
 @needs_git

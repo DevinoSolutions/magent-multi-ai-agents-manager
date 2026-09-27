@@ -779,11 +779,15 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         assert rig.recipes == []
 
     def test_a_folder_the_scan_cannot_read_is_that_projects_outcome(
-        self, rig, tmp_path, monkeypatch
+        self, rig, tmp_path, monkeypatch, caplog
     ):
         # One node project's folder this user may not stat (another profile, a
         # deny ACL) must not take `up` of any other project down with it --
         # the fleet scan reads every folder, asked for or not.
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
         (good,) = _projects(tmp_path, rig, [("a1", "second")])
         locked = tmp_path / "locked" / "z"
         locked.mkdir(parents=True)
@@ -798,6 +802,15 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         # Python 3.14's Path.is_dir alone would have said -- by its class: the
         # OS's words carry the folder's path, and those are nodes.log's.
         assert both[1].error == "local error: PermissionError; see nodes.log"
+        assert "Permission denied" not in both[1].error
+        assert str(locked) not in both[1].error
+        # str(OSError) reprs its filename.
+        assert any(
+            "Permission denied" in r.getMessage()
+            and repr(str(locked)) in r.getMessage()
+            for r in caplog.records
+            if r.name == "magent.nodes" and r.levelno == logging.WARNING
+        )
 
     def test_a_collision_with_a_project_outside_the_batch_still_refuses(
         self, rig, tmp_path, monkeypatch
@@ -1351,11 +1364,15 @@ class TestUpBringsUpNodeProjectsToo:
         assert warning.lstrip().startswith("! ")
 
     def test_an_unreadable_push_file_fails_only_its_own_project(
-        self, rig, tmp_path, monkeypatch, capsys
+        self, rig, tmp_path, monkeypatch, capsys, caplog
     ):
         # Raising for a push candidate that cannot be read is contained: that
         # project's outcome is a failure, the other node project and the
         # local fleet still come up, and nothing raises out of `up`.
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
         good, locked = _projects(tmp_path, rig, [("a1", "second"), ("z", "second")])
         secret = tmp_path / "z" / "sa.json"
         secret.write_text("{}", encoding="utf-8")
@@ -1369,7 +1386,16 @@ class TestUpBringsUpNodeProjectsToo:
         assert [recipe.sid for _, recipe in rig.recipes] == ["a1"]
         out = capsys.readouterr().out
         assert "  x z: local error: PermissionError; see nodes.log\n" in out
+        # Neither the OS's words nor the file's path reach the screen; the log
+        # has both.
         assert "Permission denied" not in out
+        assert "sa.json" not in out
+        logged = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "magent.nodes" and r.levelno == logging.WARNING
+        ]
+        assert any("Permission denied" in m and "sa.json" in m for m in logged)
 
     def test_allow_dirty_reaches_the_node_bring_up(self, rig, tmp_path, monkeypatch):
         projs = _projects(tmp_path, rig, [("a1", "second")])
@@ -1525,6 +1551,8 @@ class TestEveryNodeFailureIsAnOutcomeButABugIsNot:
         outcome = launch.bring_up_node_project(_config(api), api)
         assert outcome.ok is False
         assert outcome.error == "local error: PermissionError; see nodes.log"
+        assert "Permission denied" not in outcome.error
+        assert "sa.json" not in outcome.error
         (record,) = [r for r in caplog.records if "failed" in r.getMessage()]
         assert record.getMessage().endswith(f"failed: {rig.error}")
 
@@ -1539,6 +1567,8 @@ class TestEveryNodeFailureIsAnOutcomeButABugIsNot:
         rig.error = error
         outcome = launch.bring_up_node_project(_config(api), api)
         assert outcome.error == r"C:\ws\api: cannot be resolved (OSError)"
+        # The configured project path is named; the OS's words are not.
+        assert "symbolic links" not in outcome.error
         (record,) = [r for r in caplog.records if "failed" in r.getMessage()]
         assert record.getMessage().endswith(
             r"C:\ws\api: cannot be resolved (OSError):"
@@ -1694,8 +1724,11 @@ class TestGoBringsNodeProjectsUp:
         out = capsys.readouterr().out
         assert "      x local error: PermissionError; see nodes.log\n" in out
         assert "Permission denied" not in out
+        assert str(locked) not in out
+        # str(OSError) reprs its filename.
         assert any(
             "Permission denied" in r.getMessage()
+            and repr(str(locked)) in r.getMessage()
             for r in caplog.records
             if r.levelno == logging.WARNING
         )
@@ -2653,24 +2686,30 @@ class TestDownPullsTheLastTurnHomeFirst:
         assert all(line.isprintable() for line in out.splitlines())
 
     @pytest.mark.parametrize(
-        ("error", "shown"),
+        ("error", "shown", "os_words"),
         [
             (
                 PermissionError(
                     13, "Access is denied", "C:\\Users\\amin\\.magent\\pull.json"
                 ),
-                "(Access is denied)",
+                "(PermissionError)",
+                "Access is denied",
             ),
-            (OSError("could not write C:\\Users\\amin\\x.part"), "(OSError)"),
+            (
+                OSError("could not write C:\\Users\\amin\\x.part"),
+                "(OSError)",
+                "could not write",
+            ),
         ],
         ids=["strerror", "bare"],
     )
     def test_a_local_error_shows_its_kind_and_logs_its_path(
-        self, rig, api, monkeypatch, capsys, caplog, killed, error, shown
+        self, rig, api, monkeypatch, capsys, caplog, killed, error, shown, os_words
     ):
-        # A local path is this PC's business, not the screen's: the class (and
-        # an OS message, which never carries the path) on screen, the whole
-        # error in nodes.log.
+        # A local path is this PC's business, not the screen's, and the OS's
+        # words (strerror: localized, per platform) are not ours: the class on
+        # screen, the whole error in nodes.log. (integ-D ruling: this overrides
+        # D16's strerror on this row.)
         from magent.log import get_logger
 
         get_logger("nodes")  # sets the level; caplog must come after
@@ -2681,9 +2720,13 @@ class TestDownPullsTheLastTurnHomeFirst:
         out = capsys.readouterr().out
         assert f"api: last turn not pulled {shown}" in out
         assert "amin" not in out
-        assert any(
-            "amin" in r.getMessage() for r in caplog.records if r.name == "magent.nodes"
-        )
+        assert os_words not in out
+        logged = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "magent.nodes" and r.levelno == logging.WARNING
+        ]
+        assert any("amin" in m and os_words in m for m in logged)
 
     def test_the_pulls_announce_themselves_once(
         self, rig, tmp_path, monkeypatch, capsys, killed

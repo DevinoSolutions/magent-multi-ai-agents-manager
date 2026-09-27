@@ -1845,10 +1845,11 @@ def _node_busy_text(nick: str, waited_s: float) -> str:
 
 def _pull_error_text(exc: Exception) -> str:
     """``_node_error_text`` for ``down``'s not-pulled line, but an OSError is
-    its kind only: its message can name a local path (``nodes.log`` has the
-    whole error). ``strerror`` is the OS's words without the path."""
+    its class only: its message can name a local path, and its ``strerror`` is
+    the OS's words (localized, per platform), not ours. ``nodes.log`` has the
+    whole error."""
     if isinstance(exc, OSError):
-        return exc.strerror or type(exc).__name__
+        return type(exc).__name__
     return _node_error_text(exc)
 
 
@@ -2343,8 +2344,8 @@ def _final_pull(
                 # class (final_pull built it with nodes.map_unread_text): the
                 # screen's. The error it chains names the path and the
                 # parser's words: the log's. Never _pull_error_text's words
-                # (the wrapper has no strerror, so they would name it), and
-                # never the None branch's: the map, not the entry, went unread.
+                # (the wrapper's class, not the map error's), and never the
+                # None branch's: the map, not the entry, went unread.
                 detail, reason = f"{exc}: {exc.__cause__}", str(exc)
             get_logger("nodes").warning(
                 "down: final pull of %s failed: %s", sid, detail
@@ -2360,7 +2361,7 @@ def _final_pull(
                 reason = no_pull[nick] = _node_busy_text(
                     nick, node_sync.FINAL_PULL_WAIT_S
                 )
-            # Printable ASCII: the cause may be the node's or the OS's words.
+            # Printable ASCII: the reason may be the node's words or a path.
             reason = node_sync.printable(reason)
         else:
             if result is not None:

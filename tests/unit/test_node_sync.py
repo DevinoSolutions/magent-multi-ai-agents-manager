@@ -3391,6 +3391,8 @@ class TestABugInOneNodeFailsItAlone:
         first = syncer.tick()
         syncer.tick()
         assert first["second"] == (node_sync.FAILED, "local error: PermissionError")
+        assert "Permission denied" not in first["second"][1]
+        assert "a.jsonl" not in first["second"][1]
         assert _node_warnings(caplog, "second") == [
             f"node second: failed (local error: PermissionError): {denied}"
         ]

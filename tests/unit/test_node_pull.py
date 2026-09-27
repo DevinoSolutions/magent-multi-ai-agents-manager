@@ -115,6 +115,7 @@ class TestParsePull:
         assert info.value.rc == 0
         # Its class only: `node sync --once` prints this line.
         assert info.value.stderr_tail == "unreadable pull metadata (RecursionError)"
+        assert str(info.value.__cause__) not in str(info.value)
 
     def test_unreadable_metadata_logs_the_parsers_words(self, tmp_path, caplog):
         caplog.set_level(logging.WARNING, logger="magent.nodes")
@@ -122,6 +123,7 @@ class TestParsePull:
         with pytest.raises(RemoteError) as info:
             parse_pull(reply, dest=tmp_path, sids=frozenset())
         assert info.value.stderr_tail == "unreadable pull metadata (JSONDecodeError)"
+        assert str(info.value.__cause__) not in str(info.value)
         (record,) = [r for r in caplog.records if "metadata" in r.getMessage()]
         assert record.levelno == logging.WARNING
         assert str(info.value.__cause__) in record.getMessage()
@@ -268,6 +270,7 @@ class TestParsePull:
         assert info.value.stderr_tail == (
             f"unreadable pull archive ({type(cause).__name__})"
         )
+        assert str(cause) not in str(info.value)
         (record,) = [r for r in caplog.records if "archive" in r.getMessage()]
         assert record.levelno == logging.WARNING
         assert str(cause) in record.getMessage()

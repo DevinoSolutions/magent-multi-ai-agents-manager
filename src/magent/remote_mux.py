@@ -399,15 +399,23 @@ def _spawn(
     except OSError as e:
         # A FileNotFoundError is the client vanishing between find_ssh and the
         # spawn (or its cached path going stale): the same "not installed" as
-        # no client at all. strerror, not str(e): CPython's POSIX
-        # _execute_child puts the client's path in str(e), and an error or a
-        # log line names the program only.
+        # no client at all. The program and the class: strerror is the OS's
+        # words (localized, per platform), not ours, and CPython's POSIX
+        # _execute_child puts the client's path in str(e) -- an error or a log
+        # line names the program only.
         rc = SSH_MISSING_RC if isinstance(e, FileNotFoundError) else None
-        # No strerror: the class, never str(e) -- it is where the path lives.
-        reason = e.strerror or type(e).__name__
+        reason = f"could not start {shown[0]} ({type(e).__name__})"
         if not quiet:
+            # The OS's words and codes are the log's; still never str(e) or
+            # e.filename, where the path lives.
             get_logger("nodes").warning(
-                "%s could not start (%s): %s", label, reason, shlex.join(shown)
+                "%s %s: errno %s, winerror %s, %s: %s",
+                label,
+                reason,
+                e.errno,
+                getattr(e, "winerror", None),
+                e.strerror,
+                shlex.join(shown),
             )
         raise RemoteError(rc, reason, shown) from e
     if input_bytes is not None and proc.stdin is not None:
@@ -1471,9 +1479,10 @@ def repo_paths(project_dir: Path) -> list[Path]:
             if path_is_dir(child) and path_exists(child / ".git")
         )
     except OSError as e:
-        # strerror is the OS's words without a path; lacking it, the class.
-        # The whole error is logged.
-        reason = f"cannot read {project_dir}: {e.strerror or type(e).__name__}"
+        # The folder is the user's own configured project, so it is named;
+        # strerror is the OS's words (localized, per platform), not ours, so
+        # only the class is. The whole error is logged.
+        reason = f"cannot read {project_dir} ({type(e).__name__})"
         get_logger("nodes").warning(
             "repo lookup failed: cannot read %s: %s", project_dir, e
         )

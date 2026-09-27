@@ -1459,6 +1459,8 @@ class TestPushSet:
         with pytest.raises(NodeConfigError) as err:
             nodes.push_set(workspace, [_state(workspace / "api", ())], home=Path.home())
         assert str(err.value) == f"{workspace}: cannot be listed (PermissionError)"
+        # The configured workspace is named; the OS's words are not.
+        assert "Permission denied" not in str(err.value)
         assert err.value.__cause__ is denied
 
     def test_a_workspace_root_file_that_never_ships_is_never_read(
@@ -2200,6 +2202,7 @@ class TestRecipeFor:
         # The message reaches the screen, so it names the OS error by class;
         # chained, the traceback and nodes.log still show the OS's own words.
         assert str(err.value) == f"{tmp_path}: cannot be resolved (OSError)"
+        assert "symbolic links" not in str(err.value)
         assert err.value.__cause__ is raised[0]
 
     def test_a_nul_in_the_project_path_is_a_config_error_naming_it(self, tmp_path):
