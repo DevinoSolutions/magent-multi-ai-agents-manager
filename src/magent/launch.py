@@ -856,12 +856,21 @@ class NodePlacements:
     one is dropped), the lines to print, and each auto project's Placement --
     `magent node plan` renders these same objects. ``notes`` are advisories;
     ``refused`` are failures -- an auto project not brought up because where
-    it runs is unknown -- printed as a red ``x`` like ``up``'s."""
+    it runs is unknown -- printed as a red ``x`` like ``up``'s.
+
+    The same facts per project, for a caller that reports each project
+    on its own row (``bring_up_node_projects``' outcomes): ``unplaced``
+    maps each dropped auto project's name to why it was not launched --
+    the words ``refused``/``notes`` print after the name -- and
+    ``history_notes`` are the notes about a node's unreadable load
+    history, which every project scored in this pass rests on."""
 
     projects: list[ProjectConfig]
     notes: list[str]
     placements: dict[str, NodePlacement]
     refused: list[str] = dataclasses.field(default_factory=list)
+    unplaced: dict[str, str] = dataclasses.field(default_factory=dict)
+    history_notes: tuple[str, ...] = ()
 
 
 def _kept(
@@ -951,14 +960,15 @@ def place_node_projects(
         get_logger("nodes").warning(
             "auto placement skipped, node map unreadable: %s", unreadable
         )
+        unknown = {
+            nodes.project_name(p): _map_unreadable_text(unreadable) for p in auto
+        }
         return NodePlacements(
             [p for p in projects if p.node != NODE_AUTO],
             [],
-            {nodes.project_name(p): nodes.Placement(None, "unknown") for p in auto},
-            refused=[
-                f"{nodes.project_name(p)}: {_map_unreadable_text(unreadable)}"
-                for p in auto
-            ],
+            {name: nodes.Placement(None, "unknown") for name in unknown},
+            refused=[f"{name}: {text}" for name, text in unknown.items()],
+            unplaced=unknown,
         )
     when = time.time() if now is None else now
     samples: dict[str, list[LoadSample]] = {}
@@ -974,11 +984,13 @@ def place_node_projects(
     spread: dict[str, int] = {}
     out: list[ProjectConfig] = []
     # An unreadable history is unknown, not "never sampled": said, class only.
-    notes: list[str] = [
+    history_notes = tuple(
         f"@{nick}: its load history is unreadable ({type(exc).__name__});"
         + (" scored on one live reading" if nick in sampled else " not scored")
         for nick, exc in unreadable_history.items()
-    ]
+    )
+    notes: list[str] = list(history_notes)
+    unplaced: dict[str, str] = {}
     chosen: dict[str, NodePlacement] = {}
     for proj in projects:
         if proj.node != NODE_AUTO:
@@ -998,17 +1010,20 @@ def place_node_projects(
         if placement.note:
             notes.append(f"{name}: {placement.note}")
         if placement.nick is None:
-            notes.append(
-                f"{name}: not launched -- {_unplaced_reason(samples, live=live)};"
+            unplaced[name] = (
+                f"not launched -- {_unplaced_reason(samples, live=live)};"
                 ' pin a node with "node": "<nick>"'
             )
+            notes.append(f"{name}: {unplaced[name]}")
             continue
         # A kept project's session is already running there and already counts
         # in that node's my_sessions; adding it to the spread would count it twice.
         if placement.reason != "kept":
             spread[placement.nick] = spread.get(placement.nick, 0) + 1
         out.append(dataclasses.replace(proj, node=placement.nick))
-    return NodePlacements(out, notes, chosen)
+    return NodePlacements(
+        out, notes, chosen, unplaced=unplaced, history_notes=history_notes
+    )
 
 
 @dataclass(frozen=True)
@@ -2450,7 +2465,14 @@ def bring_up_node_projects(
     window: bool = False,
 ) -> list[NodeBringUpOutcome]:
     """Bring up every node project in scope. ``only`` holds session ids, the
-    same currency as ``psmux.bring_up``'s -- a local id in it is ignored."""
+    same currency as ``psmux.bring_up``'s -- a local id in it is ignored.
+
+    Every ``"auto"`` project becomes a nick first, as ONE batch, so a
+    single ``up`` spreads across equal nodes exactly as ``--go`` does
+    (G-C12). An auto project that cannot be placed is a failed outcome
+    saying why (``place_node_projects``' own words), never a silent
+    drop; what the placement said about a project rides on its outcome
+    as warnings, which the callers print."""
     # heavy subsystem: in-body per policy
     from magent import nodes
 
@@ -2459,7 +2481,39 @@ def bring_up_node_projects(
         for proj in nodes.node_projects(config, group)
         if only is None or nodes.node_sid(proj) in only
     ]
-    return _run_node_bring_ups(config, projects, allow_dirty=allow_dirty, window=window)
+    placed = place_node_projects(config, projects)
+    # node_projects keeps one project per session id, and the placer keeps
+    # their order: the fan-out's outcomes line up with `chosen`'s.
+    chosen = {nodes.node_sid(proj): proj for proj in placed.projects}
+    ready = iter(
+        _run_node_bring_ups(
+            config, list(chosen.values()), allow_dirty=allow_dirty, window=window
+        )
+    )
+    outcomes: list[NodeBringUpOutcome] = []
+    for proj in projects:
+        name, sid = nodes.project_name(proj), nodes.node_sid(proj)
+        placement = placed.placements.get(name)
+        said: tuple[str, ...] = ()
+        if placement is not None:
+            # A kept project was not scored: the load history is not why
+            # it runs where it does.
+            if placement.reason != "kept":
+                said = placed.history_notes
+            if placement.note:
+                said = (*said, placement.note)
+        if sid not in chosen:
+            outcomes.append(
+                NodeBringUpOutcome(
+                    ok=False, sid=sid, error=placed.unplaced[name], warnings=said
+                )
+            )
+            continue
+        outcome = next(ready)
+        if said:
+            outcome = replace(outcome, warnings=(*said, *outcome.warnings))
+        outcomes.append(outcome)
+    return outcomes
 
 
 def node_session_ids(config: MagentConfig, group: str | None = None) -> list[str]:

@@ -399,7 +399,8 @@ class TestAFailureIsAnOutcomeNeverACrash:
     def test_an_auto_project_with_no_placement_fails_with_the_resolve_text(
         self, rig, tmp_path
     ):
-        # G-C12: `up` does not place; until PR-G's placer lands this is the answer.
+        # G-C12: `up` and --go place before they bring up; a project that
+        # reaches bring_up_node_project still unplaced gets resolve's words.
         folder = tmp_path / "web"
         folder.mkdir()
         proj = ProjectConfig(path=str(folder), node="auto")
@@ -765,8 +766,11 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         ids=["missing-folder", "unplaced-auto"],
     )
     def test_a_project_the_scan_skips_does_not_hide_a_later_pair(
-        self, rig, tmp_path, make
+        self, rig, tmp_path, make, monkeypatch
     ):
+        # G-C12: the unplaced auto one is the placer's refusal now, after a
+        # live reading that none answers.
+        monkeypatch.setattr(remote_mux, "sample", lambda node: None)
         (tmp_path / "web2").mkdir()
         x_api, y_api, _web = _twin_apis(tmp_path, rig)
         outcomes = _batch(_config(make(tmp_path), x_api, y_api))
@@ -1000,8 +1004,9 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
                 "not found on this PC",
             ),
             (
+                # G-C12: `up` places first, so the placer's words name it.
                 lambda tmp: ProjectConfig(path=str(tmp / "web2"), node="auto"),
-                "needs a placement",
+                'pin a node with "node": "<nick>"',
             ),
             (
                 lambda tmp: ProjectConfig(path=tmp.anchor, node="second", title="rt"),
@@ -1011,10 +1016,13 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         ids=["missing-folder", "unplaced-auto", "drive-root"],
     )
     def test_a_project_the_check_cannot_place_fails_on_its_own(
-        self, rig, tmp_path, make, reason
+        self, rig, tmp_path, make, reason, monkeypatch
     ):
         # No folder name to compare is not a collision: that project's own
         # bring-up names its reason, and the rest of the batch goes ahead.
+        # The auto one has no load history, so the placer asks for a live
+        # reading: none answers.
+        monkeypatch.setattr(remote_mux, "sample", lambda node: None)
         (tmp_path / "web2").mkdir()
         (good,) = _projects(tmp_path, rig, [("a1", "second")])
         odd = make(tmp_path)

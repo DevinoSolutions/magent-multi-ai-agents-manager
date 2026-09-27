@@ -20,13 +20,14 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 from pathlib import Path, PureWindowsPath
 
 import pytest
 
-from magent import cli, launch, log, node_sync, nodes, remote_mux
+from magent import attach_client, cli, launch, log, node_sync, nodes, remote_mux
 from magent.cli import node_cmd
-from magent.config import ProjectConfig, load_config
+from magent.config import NODE_AUTO, ProjectConfig, load_config
 from magent.lockfile import LockHeld
 from magent.nodes import LocalGitState
 from magent.sessions import claude as claude_sessions
@@ -38,6 +39,7 @@ from tests.unit._node_fixtures import (
     entry,
     git,
     pool,
+    seed_history,
     write_transcript,
 )
 
@@ -3801,3 +3803,251 @@ class TestRecallSaysUnknownNeverAbsentOrATraceback:
         assert "held.jsonl" not in result.output
         assert any(str(error) in m for m in _node_logs(caplog)), _node_logs(caplog)
         assert "api" in nodes.read_node_map()
+
+
+# --- `up` places auto projects before its fan-out (plan G Task 8, G-C12) -----
+
+
+def _git_state(path: Path) -> LocalGitState:
+    return LocalGitState(
+        path=path,
+        url=f"git@github.com:amin/{path.name}.git",
+        branch="main",
+        dirty=False,
+        unpushed=False,
+        detached=False,
+    )
+
+
+@pytest.fixture
+def pipeline(monkeypatch, api_repo):
+    """Every outward seam of launch.bring_up_node_project on a stub, recording
+    what ``remote_mux.bring_up`` was asked for. Each project's git state is its
+    OWN folder's: D's fleet-wide folder check (X3) refuses two projects that
+    would share one node folder name."""
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        launch, "node_git_states", lambda config, proj: [_git_state(Path(proj.path))]
+    )
+    # F's body (DECISION-24) provisions over ssh; these tests are not about it.
+    monkeypatch.setattr(launch, "_provision_once", lambda node, config: None)
+    monkeypatch.setattr(attach_client, "spawn_attach_window", lambda *a, **k: 4242)
+    monkeypatch.setattr(launch, "ensure_node_sync", lambda *a, **k: True)
+    monkeypatch.setattr("magent.env.local_username", lambda: "amin")
+
+    def _bring_up(node, recipe, *, resume_id=None, **_k):
+        calls.append({"nick": node.nick, "sid": recipe.sid, "resume_id": resume_id})
+        return remote_mux.BringUpResult(
+            sid=recipe.sid,
+            attached_existing=False,
+            commits={recipe.sid: "a" * 40},
+            cwd=f"/home/amin/magent/{recipe.sid}",
+        )
+
+    monkeypatch.setattr(remote_mux, "bring_up", _bring_up)
+    return calls
+
+
+def _api(api_repo: Path, node: str) -> ProjectConfig:
+    return ProjectConfig(path=str(api_repo), title="api", node=node)
+
+
+def _web(tmp_path: Path) -> ProjectConfig:
+    repo = tmp_path / "web"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    return ProjectConfig(path=str(repo), title="web", node=NODE_AUTO)
+
+
+def _unreadable_history(nick: str) -> str:
+    """``nick``'s load.jsonl as bytes that are not UTF-8; the class name that
+    reading it raises."""
+    path = nodes.load_path(nick)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\xff\xfe not utf-8 \x80\x81\n")
+    with pytest.raises(ValueError) as info:
+        path.read_text(encoding="utf-8")
+    return type(info.value).__name__
+
+
+class TestUpPlacesAutoProjectsBeforeItsFanOut:
+    def test_an_auto_project_brought_up_by_up_goes_to_the_best_node(
+        self, pipeline, api_repo
+    ):
+        seed_history("second", "bursty", now=time.time() + 30)
+        seed_history("third", "quiet", now=time.time() + 30)
+        config = pool("second", "third", projects=[_api(api_repo, NODE_AUTO)])
+
+        outcomes = launch.bring_up_node_projects(config)
+
+        assert [o.ok for o in outcomes] == [True]
+        assert pipeline[0]["nick"] == "third"
+
+    def test_two_auto_projects_in_one_up_spread_across_equal_nodes(
+        self, pipeline, api_repo, tmp_path
+    ):
+        seed_history("second", "quiet", now=time.time() + 30)
+        seed_history("third", "quiet", now=time.time() + 30)
+        config = pool(
+            "second", "third", projects=[_api(api_repo, NODE_AUTO), _web(tmp_path)]
+        )
+
+        outcomes = launch.bring_up_node_projects(config)
+
+        # The fan-out runs on threads; the pairs, not their order, are the fact.
+        assert sorted((c["sid"], c["nick"]) for c in pipeline) == [
+            ("api", "second"),
+            ("web", "third"),
+        ]
+        assert [(o.sid, o.ok, o.node) for o in outcomes] == [
+            ("api", True, "second"),
+            ("web", True, "third"),
+        ]
+
+    def test_an_auto_project_with_nowhere_to_go_fails_without_raising(
+        self, pipeline, api_repo, monkeypatch
+    ):
+        def _refused(node):
+            raise remote_mux.RemoteError(
+                255, "Connection refused", ("ssh", "devino-second")
+            )
+
+        monkeypatch.setattr(remote_mux, "sample", _refused)
+        config = pool("second", projects=[_api(api_repo, NODE_AUTO)])
+
+        (outcome,) = launch.bring_up_node_projects(config)
+
+        assert outcome.ok is False
+        assert outcome.sid == "api"
+        # place_node_projects' own words, the ones --go prints after the name.
+        assert outcome.error == (
+            "not launched -- live reading failed for second"
+            " (see ~/.magent/logs/launch.log);"
+            ' pin a node with "node": "<nick>"'
+        )
+        assert pipeline == []
+
+    def test_a_re_placement_reaches_the_printed_outcome(self, pipeline, api_repo):
+        nodes.update_node_map("api", entry("fourth"))
+        seed_history("second", "quiet", now=time.time() + 30)
+        config = pool("second", projects=[_api(api_repo, NODE_AUTO)])
+
+        (outcome,) = launch.bring_up_node_projects(config)
+
+        assert pipeline[0]["nick"] == "second"
+        assert (
+            "'fourth' is no longer in settings.nodes; re-placed on 'second'"
+            in outcome.warnings
+        )
+
+    def test_up_places_before_it_brings_up(self, pipeline, api_repo, monkeypatch):
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        monkeypatch.setattr(remote_mux, "has_session", lambda node, sid: False)
+        monkeypatch.setattr(remote_mux, "list_sessions", lambda node: [])
+        seed_history("second", "bursty", now=time.time() + 30)
+        seed_history("third", "quiet", now=time.time() + 30)
+        config = pool("second", "third", projects=[_api(api_repo, NODE_AUTO)])
+
+        created, _failed = launch.bring_up_psmux(config, only=["api"])
+
+        assert pipeline[0]["nick"] == "third"
+        assert "api" in created
+
+    def test_a_project_not_placed_keeps_its_row_among_the_placed_ones(
+        self, pipeline, api_repo, tmp_path, monkeypatch
+    ):
+        # web's own node is gone and nothing is scored: web fails in its own
+        # row; api (pinned) still comes up, and each outcome is its own.
+        monkeypatch.setattr(remote_mux, "sample", lambda node: None)
+        nodes.update_node_map("web", entry("fourth", sid="web"))
+        config = pool("second", projects=[_web(tmp_path), _api(api_repo, "second")])
+
+        outcomes = launch.bring_up_node_projects(config)
+
+        assert [(o.sid, o.ok) for o in outcomes] == [("web", False), ("api", True)]
+        assert "pin a node" in (outcomes[0].error or "")
+        # The note about its vanished node rides on the failed row too.
+        assert outcomes[0].warnings == ("'fourth' is no longer in settings.nodes",)
+        assert outcomes[1].warnings == ()
+        assert [c["sid"] for c in pipeline] == ["api"]
+
+    def test_an_unreadable_map_fails_the_auto_project_with_the_maps_words(
+        self, pipeline, api_repo, monkeypatch
+    ):
+        # inv-unknown: "where it runs is unknown" is never "no node has data".
+        monkeypatch.setattr(
+            launch,
+            "_node_map_for_placement",
+            lambda: ({}, PermissionError(13, "Access is denied", "node-map.json")),
+        )
+        config = pool("second", projects=[_api(api_repo, NODE_AUTO)])
+
+        (outcome,) = launch.bring_up_node_projects(config)
+
+        assert outcome.ok is False
+        assert outcome.error == launch._map_unreadable_text(
+            PermissionError(13, "Access is denied", "node-map.json")
+        )
+        assert "pin a node" not in (outcome.error or "")
+        assert pipeline == []
+
+    def test_an_unreadable_load_history_is_said_on_the_outcome(
+        self, pipeline, api_repo, monkeypatch
+    ):
+        # --go prints it as a note; `up` has only outcome rows to say it on.
+        monkeypatch.setattr(remote_mux, "sample", lambda node: None)
+        seed_history("second", "quiet", now=time.time() + 30)
+        cls = _unreadable_history("third")
+        config = pool("second", "third", projects=[_api(api_repo, NODE_AUTO)])
+
+        (outcome,) = launch.bring_up_node_projects(config)
+
+        assert (outcome.ok, outcome.node) == (True, "second")
+        assert outcome.warnings == (
+            f"@third: its load history is unreadable ({cls}); not scored",
+        )
+
+    def test_a_kept_project_does_not_carry_the_load_history_note(
+        self, pipeline, api_repo, tmp_path, monkeypatch
+    ):
+        # api stays where the map has it; only web was scored this pass.
+        monkeypatch.setattr(remote_mux, "sample", lambda node: None)
+        nodes.update_node_map("api", entry("second"))
+        seed_history("second", "quiet", now=time.time() + 30)
+        cls = _unreadable_history("third")
+        config = pool(
+            "second", "third", projects=[_api(api_repo, NODE_AUTO), _web(tmp_path)]
+        )
+
+        api, web = launch.bring_up_node_projects(config)
+
+        assert (api.ok, api.node, api.warnings) == (True, "second", ())
+        assert web.ok is True
+        assert web.warnings == (
+            f"@third: its load history is unreadable ({cls}); not scored",
+        )
+
+
+class TestABringUpNeverInventsAResumeId:
+    def test_a_placed_project_brought_up_again_lets_the_node_pick(
+        self, pipeline, api_repo
+    ):
+        nodes.update_node_map("api", entry("second"))
+        write_transcript("second", "api", SESSION_ID, mtime=NOW)
+        config = pool("second", projects=[_api(api_repo, "second")])
+
+        launch.bring_up_node_project(config, config.projects[0])
+
+        # None: bring_up.sh runs --continue over the NODE's own transcripts,
+        # else the fresh form. A pulled id can be one pull stale, and an
+        # explicit --resume has no fresh fallback on a node that lost the file.
+        assert pipeline[0]["resume_id"] is None
+
+    def test_an_explicit_resume_id_is_passed_through(self, pipeline, api_repo):
+        config = pool("second", projects=[_api(api_repo, "second")])
+
+        launch.bring_up_node_project(
+            config, config.projects[0], resume_id=OLDER_SESSION_ID
+        )
+
+        assert pipeline[0]["resume_id"] == OLDER_SESSION_ID
