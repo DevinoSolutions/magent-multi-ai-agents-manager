@@ -1613,6 +1613,12 @@ class TestAnExitCodeWithoutARowStillFails:
 
 
 TOKEN = "gho_FAKE0123456789abcdefTOKEN"
+# Fake credential bodies, one per shape the scrub must know.
+FAKE_BODY = "FAKE0123456789abcdefTOKEN"
+LEGACY_HEX = "0123456789abcdef0123456789abcdef01234567"
+FAKE_JWT = "eyJGQUtFIjoxfQ.eyJGQUtFIjoyfQ.RkFLRS1TSUc"
+# A GHES-style token: no prefix, not hex -- only the token itself names it.
+PLAIN_TOKEN = "FakeGhesTokenZq7Wm2Xp9Lk4"
 GhUnavailable = remote_mux.GhUnavailable
 
 
@@ -1808,6 +1814,58 @@ class TestThisPcsGh:
         fake_gh.set_reply("auth token", stderr=f"bad token {TOKEN}\n", rc=1)
         token = remote_mux.local_gh_token()
         assert token == GhUnavailable("failed", detail="bad token <redacted>")
+
+    # Every credential shape gh's words could carry, not only the prefixed
+    # ones: GH_TOKEN_PATTERN admits a legacy 40-hex token, and a proxy or a
+    # remote URL can carry a password or a token as userinfo.
+    @pytest.mark.parametrize(
+        ("said", "kept"),
+        [
+            (f"bad token ghs_{FAKE_BODY}", "bad token <redacted>"),
+            (f"bad token ghu_{FAKE_BODY}", "bad token <redacted>"),
+            (f"bad token ghr_{FAKE_BODY}", "bad token <redacted>"),
+            (f"bad token {LEGACY_HEX}", "bad token <redacted>"),
+            (
+                f"Authorization: Bearer {LEGACY_HEX}",
+                "Authorization: Bearer <redacted>",
+            ),
+            (f"authorization: token {FAKE_BODY}", "authorization: token <redacted>"),
+            (
+                "Authorization: Basic dXNlcjpGQUtFLVBBU1NXT1JE",
+                "Authorization: Basic <redacted>",
+            ),
+            (f"sent Bearer {FAKE_JWT} upstream", "sent Bearer <redacted> upstream"),
+            (
+                f'Get "https://x-access-token:{LEGACY_HEX}@github.com/o/r": EOF',
+                'Get "https://<redacted>@github.com/o/r": EOF',
+            ),
+            (
+                "proxyconnect tcp: http://amin:FAKE-PASSWORD@10.1.2.3:3128: refused",
+                "proxyconnect tcp: http://<redacted>@10.1.2.3:3128: refused",
+            ),
+        ],
+        ids=[
+            "ghs",
+            "ghu",
+            "ghr",
+            "legacy-hex",
+            "bearer-header",
+            "token-header",
+            "basic-header",
+            "bare-bearer",
+            "url-token-userinfo",
+            "url-password-userinfo",
+        ],
+    )
+    def test_every_credential_shape_is_scrubbed(self, fake_gh, said, kept):
+        fake_gh.set_reply("auth token", stderr=said + "\n", rc=1)
+        assert remote_mux.local_gh_token() == GhUnavailable("failed", detail=kept)
+
+    def test_the_scrub_leaves_gh_s_plain_words_alone(self, fake_gh):
+        # Anchored on the header: "no oauth token found" is no credential.
+        said = "token refresh failed: see https://github.com/login/device"
+        fake_gh.set_reply("auth token", stderr=said + "\n", rc=1)
+        assert remote_mux.local_gh_token() == GhUnavailable("failed", detail=said)
 
     def test_the_did_gh_run_wrapper_hands_back_the_result_or_none(self, fake_gh):
         fake_gh.set_reply("api user", stdout="amin\n", rc=3)
@@ -2300,6 +2358,24 @@ class TestProvision:
         assert TOKEN not in row.detail
         assert said in _nodes_log(caplog)
         assert TOKEN not in caplog.text
+
+    def test_the_unverified_log_line_never_carries_the_token_it_shares(
+        self, fake_ssh, fake_gh, caplog
+    ):
+        # The token is in hand here, so the line masks it by value: a shape
+        # the scrub cannot know (GHES, no prefix, not hex) is caught too.
+        said = f"dial tcp: token {PLAIN_TOKEN}: i/o timeout"
+        fake_gh.set_reply(
+            "auth status",
+            stdout=gh_auth_status(None, accounts=[("amin", True, "error", said)]),
+        )
+        fake_gh.set_reply("auth token", stdout=PLAIN_TOKEN + "\n")
+        caplog.set_level("WARNING", logger="magent.nodes")
+        remote_mux.provision(NODE, _scope(), timeout_s=remote_mux.PROVISION_TIMEOUT_S)
+        (call,) = fake_ssh.calls()
+        assert _sent(call).split(b"\n", 1)[0] == PLAIN_TOKEN.encode("ascii")
+        assert "dial tcp: token <redacted>: i/o timeout" in _nodes_log(caplog)
+        assert PLAIN_TOKEN not in caplog.text
 
     def test_a_rejected_login_shares_nothing_and_says_why(self, fake_ssh, fake_gh):
         fake_gh.set_reply(

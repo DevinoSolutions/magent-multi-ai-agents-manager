@@ -657,9 +657,25 @@ GH_TOKEN_ARGV = ("auth", "token", "--hostname", "github.com")
 # or a stray one-word line never ships.
 GH_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]{20,255}")
 _GH_NOT_A_TOKEN = "gh auth token printed something that is not a token"
-# A token-shaped run in gh's own words (stderr, a status entry's error) is
-# replaced before those words are kept: they reach hints, rows and logs.
-_GH_TOKENISH_RE = re.compile(r"(gh[opsur]_|github_pat_)[A-Za-z0-9_]+")
+# Every credential shape in gh's own words (stderr, a status entry's error) is
+# masked before those words are kept for the nodes log, in order:
+# - gh's prefixed tokens, and a legacy 40-hex one (GH_TOKEN_PATTERN admits it);
+# - what follows an Authorization header's scheme, or a bare Bearer -- anchored,
+#   because a plain "token" is gh's own word ("no oauth token found");
+# - a URL's userinfo (https://user:pass@host), in node_apply's _AUTH shape.
+_GH_SCRUBS = (
+    (
+        re.compile(r"(?:gh[opsur]_|github_pat_)[A-Za-z0-9_]+|\b[0-9a-fA-F]{40}\b"),
+        "<redacted>",
+    ),
+    (
+        re.compile(
+            r"(?i)(\bauthorization:\s*(?:bearer|token|basic)\s+|\bbearer\s+)\S+"
+        ),
+        r"\1<redacted>",
+    ),
+    (re.compile(r"(?<=//)[^\s/?#]*@"), "<redacted>@"),
+)
 _GH_DETAIL_MAX = 200
 # gh's tokenSource when the token is an environment variable's: a re-login
 # cannot replace it.
@@ -679,8 +695,11 @@ GhUnavailableReason = Literal[
 
 
 def _gh_detail(text: str) -> str:
-    """gh's own words, safe to keep: token shapes scrubbed, then capped."""
-    return _GH_TOKENISH_RE.sub("<redacted>", text.strip())[:_GH_DETAIL_MAX]
+    """gh's own words, safe to keep: credential shapes scrubbed, then capped."""
+    text = text.strip()
+    for pattern, mask in _GH_SCRUBS:
+        text = pattern.sub(mask, text)
+    return text[:_GH_DETAIL_MAX]
 
 
 @dataclass(frozen=True)
@@ -697,7 +716,7 @@ class GhUnavailable:
     the token (HTTP 401, "Bad credentials": revoked or invalid): a rejected
     token NEVER ships, and ``token_source`` says whether a re-login can fix
     it. ``failed`` is anything else. ``detail`` is gh's own words (its last
-    stderr line, or a status entry's ``error``), token shapes scrubbed and
+    stderr line, or a status entry's ``error``), credential shapes scrubbed and
     capped -- never its stdout, which for a token read is the token. It may
     hold a dial URL, so it is for the log only: ``hint`` and the repr never
     carry it, and the row site that prints the hint logs it
@@ -1116,10 +1135,11 @@ def _gh_to_share() -> tuple[str | None, str | None, tuple[ScriptLine, ...]]:
         if isinstance(token, str):
             if refusal is None:
                 return login, token, ()
+            # The token is in hand: mask it by value, whatever its shape.
             get_logger("nodes").warning(
                 "gh login %s unverified, its token shared anyway: %s",
                 login,
-                refusal.detail or refusal.reason,
+                (refusal.detail or refusal.reason).replace(token, "<redacted>"),
             )
             return login, token, (ScriptLine("warn", "gh", GH_SHARED_UNVERIFIED),)
         refusal = token
