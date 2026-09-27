@@ -2648,6 +2648,34 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         assert "Stopped the node sync daemon." in out.stdout
         assert "again" not in out.stdout
 
+    def test_a_restarted_daemon_the_end_stop_could_not_kill_is_named(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # The first stop stopped one; serve restarted it during the pulls, and
+        # the end stop's kill did not land. That is news: never silence.
+        from magent import node_sync
+
+        monkeypatch.setattr(node_sync, "daemon_running", lambda: True)
+        monkeypatch.setattr(node_sync, "daemon_pid", lambda: 4242)
+        self._hold("api")
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+            sync_daemon=(True, False),
+        )
+        assert out.exit_code == 0, out.output
+        lines = [
+            ln for ln in out.stdout.splitlines() if "node sync daemon" in ln.lower()
+        ]
+        assert [ln.split(None, 1)[1] for ln in lines] == [
+            "Stopped the node sync daemon.",
+            "Could not stop the node sync daemon (pid 4242).",
+        ]
+
     @pytest.mark.parametrize("pid_gap", [0.0, 0.5], ids=["pid-with-lock", "pid-after"])
     @pytest.mark.parametrize("why", ["seen", "contended"])
     def test_a_daemon_that_locks_late_is_re_stopped(
