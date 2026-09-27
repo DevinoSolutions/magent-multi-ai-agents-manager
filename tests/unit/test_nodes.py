@@ -701,6 +701,7 @@ class TestTheMapWriterIsSerializedAcrossProcesses:
             except subprocess.TimeoutExpired:
                 holder.kill()
                 holder.wait(timeout=30)
+            holder.stdout.close()
         assert nodes.update_node_map("api", ENTRY) == {"api": ENTRY}
         assert nodes.read_node_map() == {"api": ENTRY}
 
