@@ -757,6 +757,15 @@ class TestUserScopePluginsAndSkills:
         assert [f.path for f in scope.skills] == ["synced"]
         assert scope.notes == ()
 
+    # Only the TOP-level synced folder is claude.ai's: one deeper is the
+    # user's, and ships with no note.
+    def test_a_nested_folder_named_synced_ships_with_no_note(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "a/synced/x.md")
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["a/synced/x.md"]
+        assert scope.notes == ()
+
     # A link in ~/.claude/skills is one the user made -- a repo checked out
     # elsewhere is the main case -- so the walk FOLLOWS it out of the root, a
     # Windows junction exactly like a symlink. Deliberately not containment
@@ -966,6 +975,46 @@ class TestUserScopePluginsAndSkills:
         )
         assert "DECOY" not in repr(scope)
 
+    # Only the spelling the user sees catches the OneDrive layout: ~/.claude a
+    # link elsewhere and skills a link back to ~, which is above neither where
+    # the skills folder resolves (~ itself) nor the skills folder where
+    # ~/.claude resolves.
+    def test_skills_linked_to_home_while_claude_links_elsewhere_ships_nothing(
+        self, tmp_path
+    ):
+        home = _pc_home(tmp_path)
+        _skill(home, "notes/private.md", b"PRIVATE-DECOY")
+        onedrive = tmp_path / "OneDrive" / ".claude"
+        self._transcripts(onedrive)
+        _link_dir(home / ".claude", onedrive)
+        _link_dir(onedrive / "skills", home)
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == (
+            "skills: links to a folder it must not read, not followed",
+        )
+        assert "DECOY" not in repr(scope)
+
+    # Only where the skills folder resolves catches a link inside it back to
+    # the repo it lives in: that repo is above neither ~/.claude/skills as
+    # named nor the skills folder where ~/.claude resolves.
+    def test_a_link_inside_a_linked_skills_folder_to_its_repo_is_not_followed(
+        self, tmp_path
+    ):
+        home = _pc_home(tmp_path)
+        (home / ".claude").mkdir()
+        repo = tmp_path / "dotfiles"
+        _skill(repo, "skills/s/SKILL.md")
+        _skill(repo, "private.md", b"PRIVATE-DECOY")
+        _link_dir(home / ".claude" / "skills", repo / "skills")
+        _link_dir(repo / "skills" / "up", repo)
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == (
+            "skills/up: links to a folder above the skills folder, not followed",
+        )
+        assert "DECOY" not in repr(scope)
+
     # Defence in depth beside the ancestor rule: nothing inside a well-known
     # secrets folder under the scope's home is read, a folder or one file.
     @pytest.mark.parametrize(
@@ -1162,6 +1211,9 @@ class TestAMarketplaceSourceNeverCarriesAPassword:
             "https://:ghp_DECOY@git.example/m.git",
             "ssh://git:DECOY@git.example/m.git",
             "https::https://bob:ghp_DECOY@git.example/m.git",
+            # The password runs from the first ':' to the LAST '@': a login
+            # holding an '@' (an email) still reads as carrying a password.
+            "https://bob@corp.example:ghp_DECOY@git.example/m.git",
         ],
     )
     def test_a_userinfo_password_stays_behind(self, tmp_path, url):
@@ -1865,6 +1917,23 @@ class TestAnUnreadableSkillsFolderIsNamedNotFatal:
         logged = [r for r in caplog.records if "DECOY-ERRNO" in r.getMessage()]
         assert [r.levelname for r in logged] == ["WARNING"]
         assert logged[0].getMessage().startswith("skills: ")
+
+    # The other side of that line: a skills folder that is not there is
+    # absent, with no note -- a ~/.claude that is a file (POSIX's stat says
+    # ENOTDIR, Windows' says FileNotFoundError) or a skills that is a file.
+    def test_a_claude_that_is_a_file_has_no_skills_folder(self, tmp_path):
+        home = _pc_home(tmp_path)
+        (home / ".claude").write_bytes(b"not a folder")
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert [n for n in scope.notes if n.startswith("skills")] == []
+
+    def test_a_skills_file_is_no_skills_folder(self, tmp_path):
+        home = _pc_home(tmp_path)
+        _skill(home, ".claude/skills", b"a file")
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == ()
 
     @pytest.mark.skipif(
         sys.platform == "win32" or os.geteuid() == 0,
