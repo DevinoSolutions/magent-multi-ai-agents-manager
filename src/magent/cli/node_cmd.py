@@ -1,29 +1,38 @@
 """`magent node`: run projects on a pool of Linux machines over ssh.
 
-This module starts with `node sync`, the daemon that mirrors the pool onto
-this PC; the other subcommands arrive with their own sub-plans. Exit codes and
-lines live here, the work in magent.node_sync (imported in-body: the
-registration hub imports every command module, and `magent --help` must not
-pay for ssh and tar).
+This module holds `node sync`, the daemon that mirrors the pool onto this PC,
+and `node doctor`; the other subcommands arrive with their own sub-plans. Exit
+codes and lines live here, the work in magent.node_sync, magent.nodes and
+magent.remote_mux (imported in-body: the registration hub imports every
+command module, and `magent --help` must not pay for ssh and tar).
 """
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Literal, NoReturn
 
 import click
 
-from magent import log
+from magent import env, log
 from magent.cli.app import main
 from magent.cli.config_io import _load_config_or_exit
+from magent.cli.fleet_cmd import _stdout_safe
 from magent.lockfile import LockHeld
 from magent.paths import find_config
 from magent.style import style
 
 if TYPE_CHECKING:
     import contextlib
+    from collections.abc import Sequence
+
+    from magent.config import MagentConfig
+    from magent.nodes import Node
+    from magent.remote_mux import RemoteError, ScriptLine
 
 # How long `node sync -d` waits for the detached child to record its pid:
 # ~10 s nominal, returning as soon as it appears or the child exits. A cold
@@ -368,3 +377,246 @@ def sync_cmd(
         # The probe above opened the lock file and this take, right after,
         # did not: on Windows the probe's own delete can leave it pending.
         _exit_running_unknown(exc.error)
+
+
+# One mark per row status, shared by node setup and node doctor.
+_ROW_MARKS: dict[str, tuple[str, str]] = {
+    "ok": ("+", "green"),
+    "did": ("+", "cyan"),
+    "skip": ("-", "white"),
+    "drop": ("-", "yellow"),
+    "warn": ("!", "yellow"),
+    "fail": ("x", "red"),
+    "key": ("*", "cyan"),
+}
+
+
+def _refuse(message: str, *, as_json: bool = False) -> NoReturn:
+    """A request magent cannot act on (unknown nick, bad argument): exit 2,
+    before anything reaches a node."""
+    if as_json:
+        click.echo(json.dumps({"ok": False, "error": message}))
+    else:
+        click.echo(f"Error: {message}", err=True)
+    sys.exit(2)
+
+
+def _unreachable(node: Node, exc: RemoteError) -> ScriptLine:
+    """ssh's own failure as a row: the target and ssh's last stderr line."""
+    # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
+    from magent.remote_mux import ScriptLine
+
+    tail = exc.stderr_tail.strip().splitlines()
+    why = tail[-1] if tail else f"rc={exc.rc}"
+    # D-MERGE: once D10 merges, word a timeout off RemoteError.timed_out
+    # ("no answer from", not "cannot reach"); rc None alone also means an
+    # over-cap reply, so it is not the signal.
+    return ScriptLine("fail", "reach", f"cannot reach {node.target}: {why}")
+
+
+def _print_rows(lines: Sequence[ScriptLine]) -> None:
+    width = max((len(line.item) for line in lines), default=0)
+    for line in lines:
+        mark, color = _ROW_MARKS.get(line.status, ("?", "white"))
+        quiet = line.status in ("ok", "skip")
+        # A row's item and detail are the NODE's words (_stdout_safe's reason).
+        click.echo(
+            f"    {style(mark, fg=color, bold=True)} "
+            f"{_stdout_safe(line.item):<{width}}  "
+            f"{style(_stdout_safe(line.detail), dim=quiet)}"
+        )
+
+
+def sync_lines(cfg: MagentConfig, nick: str, *, now: float) -> list[ScriptLine]:
+    """This PC's half of a node's health: is the sync daemon alive, and how old
+    is the sessions snapshot it last pulled from ``nick``. Reads only."""
+    # heavy subsystem: in-body per policy (ssh/tar; --help never pays)
+    from magent import node_sync, nodes
+    from magent.remote_mux import ScriptLine
+
+    lines: list[ScriptLine] = []
+    state = _daemon_state()
+    if state == "ok":
+        lines.append(ScriptLine("ok", "sync-daemon", "running"))
+    elif state == "stale":
+        lines.append(
+            ScriptLine(
+                "warn", "sync-daemon", "its heartbeat is stale -- see: magent status"
+            )
+        )
+    elif node_sync.wanted(cfg):
+        # The daemon's own "anything to sync?" -- serve's config gate. (Serve
+        # also obeys MAGENT_NODE_SYNC=0, which this row does not read.)
+        lines.append(
+            ScriptLine(
+                "warn",
+                "sync-daemon",
+                "not running -- magent serve starts it while a project runs on a node",
+            )
+        )
+    else:
+        lines.append(ScriptLine("skip", "sync-daemon", "no project runs on a node"))
+    # E's reader and E's staleness rule; F does not parse sessions.json itself.
+    snap = nodes.read_sessions(nick)
+    interval = cfg.settings.node_sync.pull_interval_s
+    limit = 2 * interval
+    age = 0.0 if snap is None else max(0.0, now - snap.ts)
+    if snap is None:
+        lines.append(
+            ScriptLine("skip", "snapshot", "no sessions snapshot from this node yet")
+        )
+    elif not nodes.sessions_stale(snap, pull_interval_s=interval, now=now):
+        lines.append(ScriptLine("ok", "snapshot", f"pulled {age:.0f}s ago"))
+    elif snap.ts > now:
+        # sessions_stale reads a ts too far AHEAD as stale as well: this PC's
+        # clock went backwards since the pull, it is not an old snapshot.
+        lines.append(
+            ScriptLine(
+                "warn",
+                "snapshot",
+                (
+                    f"stamped {snap.ts - now:.0f}s in the future, more than "
+                    f"2 x pullIntervalS ({limit}s) -- this PC's clock moved "
+                    "back: its sessions read stale"
+                ),
+            )
+        )
+    else:
+        lines.append(
+            ScriptLine(
+                "warn",
+                "snapshot",
+                (
+                    f"pulled {age:.0f}s ago, older than 2 x pullIntervalS ({limit}s): "
+                    "its sessions read stale"
+                ),
+            )
+        )
+    return lines
+
+
+def node_checks(cfg: MagentConfig, nick: str, *, now: float) -> list[ScriptLine]:
+    """Every health row for ``nick``: the node's own (doctor.sh, one ssh call),
+    then this PC's sync rows. An unreachable node is one ``fail reach`` row;
+    every expected failure is a row, and ``_checks_or_crash_row`` turns a bug
+    into one too. Read-only: it never provisions (DECISION-24 wires
+    provisioning into ``node setup`` and the bring-up, not the doctor)."""
+    # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
+    from magent import nodes, remote_mux
+    from magent.remote_mux import ScriptLine
+
+    try:
+        node = nodes.node_for_nick(cfg, nick, local_user=env.local_username())
+    except nodes.NodeConfigError as exc:
+        return [ScriptLine("fail", "config", str(exc))]
+    # This PC's rows first, at `now`: doctor.sh can take a minute, and a
+    # snapshot the daemon pulls meanwhile is stamped after `now` -- read later,
+    # a healthy node would read as a clock that moved back.
+    local = sync_lines(cfg, nick, now=now)
+    try:
+        remote = list(
+            remote_mux.doctor(node, timeout_s=remote_mux.DOCTOR_TIMEOUT_S).lines
+        )
+    except remote_mux.RemoteError as exc:
+        remote = [_unreachable(node, exc)]
+    if not remote:
+        # Exit 0 and not one row: a ForceCommand, a MOTD-only login -- doctor.sh
+        # never ran, and silence is not health.
+        remote = [
+            ScriptLine(
+                "fail",
+                "doctor",
+                "the node printed no doctor rows -- a restricted login (ForceCommand)?",
+            )
+        ]
+    return [*remote, *local]
+
+
+def _checks_or_crash_row(
+    cfg: MagentConfig, nick: str, *, now: float
+) -> list[ScriptLine]:
+    """``node_checks``, with a bug of any type turned into that node's one
+    ``fail doctor`` row: one node's crash must not take every other node's rows
+    down with a traceback."""
+    # heavy subsystem: in-body per policy (remote_mux: ssh/tar; --help never pays)
+    from magent.remote_mux import ScriptLine
+
+    try:
+        return node_checks(cfg, nick, now=now)
+    except Exception as exc:  # noqa: BLE001  # reason: one node's bug, of any type, must fail only that node's rows -- the traceback goes to the log
+        log.get_logger("nodes").exception("node doctor: checking %s crashed", nick)
+        return [
+            ScriptLine(
+                "fail",
+                "doctor",
+                (
+                    f"the check itself crashed ({type(exc).__name__}) -- "
+                    "see ~/.magent/logs/nodes.log"
+                ),
+            )
+        ]
+
+
+def doctor_report(cfg: MagentConfig, nicks: list[str]) -> dict[str, list[ScriptLine]]:
+    """``node_checks`` for each nick, concurrently -- one ssh each, so N nodes
+    cost one DOCTOR_TIMEOUT_S -- keyed in the order given."""
+    if not nicks:
+        return {}
+    now = time.time()
+    with ThreadPoolExecutor(max_workers=len(nicks)) as pool:
+        results = list(pool.map(lambda n: _checks_or_crash_row(cfg, n, now=now), nicks))
+    return dict(zip(nicks, results, strict=True))
+
+
+@node_group.command("doctor")
+@click.argument("nick", required=False)
+@click.option("--json", "as_json", is_flag=True, help="Print the rows as JSON")
+@click.pass_context
+def node_doctor_cmd(ctx: click.Context, nick: str | None, as_json: bool) -> None:
+    """Check a node, or every node: tools, the Claude login, the node's GitHub
+    key, locale, disk, and this PC's sync daemon and snapshot.
+
+    Exit 0 when nothing failed (warnings allowed), 1 when a check failed,
+    2 when NICK is not in settings.nodes.
+    """
+    from magent import nodes  # heavy subsystem: in-body per policy
+
+    cfg = _load_config_or_exit(find_config(ctx.obj.get("config_path")), as_json=as_json)
+    if nick is not None and nick not in cfg.settings.nodes:
+        # Only a nick outside the pool is a bad REQUEST (exit 2); a pool node
+        # whose user cannot resolve is a broken node, its `fail config` row
+        # below. node_for_nick owns the wording, and for this nick it raises.
+        try:
+            nodes.node_for_nick(cfg, nick, local_user=env.local_username())
+        except nodes.NodeConfigError as exc:
+            _refuse(str(exc), as_json=as_json)
+    nicks = [nick] if nick is not None else list(cfg.settings.nodes)
+    report = doctor_report(cfg, nicks)
+    failures = sum(
+        1 for lines in report.values() for line in lines if line.status == "fail"
+    )
+    if as_json:
+        body = {
+            n: [dataclasses.asdict(line) for line in lines]
+            for n, lines in report.items()
+        }
+        click.echo(json.dumps({"ok": True, "failures": failures, "nodes": body}))
+        sys.exit(1 if failures else 0)
+    if not nicks:
+        click.echo(
+            f"  {style('-', dim=True)} no nodes configured -- add one under"
+            " settings.nodes, then run: magent node setup <nick>"
+        )
+        return
+    click.echo(f"  {style('magent node doctor', bold=True)}")
+    for n, lines in report.items():
+        click.echo()
+        click.echo(
+            f"  {style(n, bold=True)}  {style(cfg.settings.nodes[n].host, dim=True)}"
+        )
+        _print_rows(lines)
+    click.echo()
+    if failures:
+        click.echo(f"  {style(f'{failures} check(s) failed.', fg='red', bold=True)}")
+        sys.exit(1)
+    click.echo(f"  {style('No failures.', fg='green', bold=True)}")

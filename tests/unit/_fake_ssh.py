@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 _RECORDER = """\
-import hashlib, json, os, sys, time
+import hashlib, json, os, signal, sys, time
 from pathlib import Path
 
 BASE = Path(r"<<BASE>>")
@@ -83,6 +83,11 @@ line = " ".join(args)
 replies = json.loads((BASE / "replies.json").read_text(encoding="utf-8")) if (BASE / "replies.json").exists() else []
 for match, reply in replies:
     if match in line:
+        # A reply may first hang (a probe the caller must bound itself), and
+        # may ignore TERM while it does (only KILL ends it).
+        if reply.get("ignore_term"):
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(reply.get("hang_s", 0))
         # Raw UTF-8 bytes: sys.stdout.write() on Windows encodes to the console
         # code page and mangles non-ASCII -- the fleet tier's cp1252 defect.
         sys.stdout.buffer.write(reply["stdout"].encode("utf-8"))
@@ -113,17 +118,37 @@ class FakeSsh:
     base: Path
 
     def set_reply(
-        self, match: str, *, stdout: str = "", stderr: str = "", rc: int = 0
+        self,
+        match: str,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+        rc: int = 0,
+        hang_s: float = 0.0,
+        ignore_term: bool = False,
     ) -> None:
-        """Answer every call whose space-joined argv contains ``match``. The
-        first registered match wins; an unmatched call exits 0, silent."""
+        """Answer every call whose space-joined argv contains ``match``, after
+        sleeping ``hang_s`` (one hung call, where ``set_mode("timeout")`` hangs
+        them all) -- deaf to SIGTERM while it does if ``ignore_term``. The first
+        registered match wins; an unmatched call exits 0, silent."""
         replies_path = self.base / "replies.json"
         replies = (
             json.loads(replies_path.read_text(encoding="utf-8"))
             if replies_path.exists()
             else []
         )
-        replies.append([match, {"stdout": stdout, "stderr": stderr, "rc": rc}])
+        replies.append(
+            [
+                match,
+                {
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "rc": rc,
+                    "hang_s": hang_s,
+                    "ignore_term": ignore_term,
+                },
+            ]
+        )
         replies_path.write_text(json.dumps(replies), encoding="utf-8")
 
     def set_mode(self, mode: str) -> None:
@@ -175,3 +200,24 @@ def make_fake_ssh(tmp_path: Path, *, name: str = "ssh") -> FakeSsh:
         )
         launcher.chmod(0o755)
     return FakeSsh(path=str(launcher), base=base)
+
+
+def gh_auth_status(login: str, scopes: str) -> str:
+    """The stdout of ``gh auth status --json hosts`` (gh 2.88) for one active,
+    logged-in github.com account -- the reply a fake ``gh`` gives."""
+    return json.dumps(
+        {
+            "hosts": {
+                "github.com": [
+                    {
+                        "active": True,
+                        "host": "github.com",
+                        "login": login,
+                        "scopes": scopes,
+                        "state": "success",
+                        "tokenSource": "keyring",
+                    }
+                ]
+            }
+        }
+    )

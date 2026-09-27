@@ -22,7 +22,10 @@ leaves ``attach_client``, ``env``, ``log``, ``node_scripts``, ``nodes``,
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import functools
+import gzip
+import hashlib
 import io
 import json
 import math
@@ -47,7 +50,7 @@ from magent import node_scripts, psmux
 # find_ssh is bound by value, not read off attach_client at call time: the
 # conftest guard answers None for attach_client.find_ssh, and this module's own
 # find_ssh is the seam every remote_mux test fakes (fake_ssh repoints it).
-from magent.attach_client import SSH_MISSING_RC, TMUX_SOCKET
+from magent.attach_client import SSH_MISSING_RC, SSH_TRANSPORT_RC, TMUX_SOCKET
 from magent.attach_client import find_ssh as _find_ssh_client
 from magent.env import git_child_env
 from magent.log import get_logger
@@ -61,15 +64,17 @@ from magent.nodes import (
     node_dir,
     path_exists,
     path_is_dir,
+    stdio_programs,
     walk_memory,
+    without_missing_programs,
 )
 from magent.sessions import build_resume_command
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Mapping, Sequence
+    from collections.abc import Collection, Iterable, Mapping, Sequence
     from typing import IO
 
-    from magent.nodes import Node, Recipe
+    from magent.nodes import Node, Recipe, UserScope
 
 # tmux, not psmux: nodes are Linux. One server per node user (`-L magent`,
 # D10). The name has one owner, attach_client, whose pane attaches to it; this
@@ -89,6 +94,41 @@ BRING_UP_TIMEOUT_S = 600.0
 # line and reads the payload (JSON, a tarball) after it. Never a temp file on
 # the node, never an argument.
 PAYLOAD_SENTINEL = "__MAGENT_PAYLOAD__"
+
+# The Claude Code lifecycle events the node's state hook is wired into: the
+# same six `magent hooks install` wires on this PC. A src module may not import
+# the cli package (LS-A-001), so this is a copy -- drift-pinned against
+# cli/hooks_cmd._EVENTS by tests/unit/test_node_provision.py.
+HOOK_EVENTS = (
+    "UserPromptSubmit",
+    "PostToolUse",
+    "Stop",
+    "Notification",
+    "SessionStart",
+    "SessionEnd",
+)
+# The node-side hook command. provision.sh installs node_scripts/state_hook.sh
+# at this path; Claude Code runs hook commands through a POSIX shell, so $HOME
+# expands.
+NODE_STATE_HOOK_COMMAND = '"$HOME/.magent/bin/state-hook.sh" --source claude'
+
+
+def state_hook_entries(
+    command: str = NODE_STATE_HOOK_COMMAND,
+) -> dict[str, dict[str, object]]:
+    """One settings.json hook entry per event, in exactly the shape `magent
+    hooks install` writes (pinned by test) -- PostToolUse alone carries the
+    ``"*"`` matcher."""
+    entries: dict[str, dict[str, object]] = {}
+    for event in HOOK_EVENTS:
+        entry: dict[str, object] = {
+            "hooks": [{"type": "command", "command": command, "timeout": 10}]
+        }
+        if event == "PostToolUse":
+            entry = {"matcher": "*", **entry}
+        entries[event] = entry
+    return entries
+
 
 # remote_mux's OWN option set -- not attach_client.SSH_CONNECTION_OPTS, which is
 # scoped to the interactive attach pane and allows a 20s connect, i.e. longer
@@ -531,6 +571,7 @@ def run_script(
     *,
     timeout_s: float,
     stdin: bytes | None = None,
+    check: bool = True,
     max_stdout_bytes: int = MAX_REPLY_BYTES,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run the packaged ``node_scripts/<script>.sh`` on ``node`` as
@@ -539,7 +580,9 @@ def run_script(
     added here, on every call; ``args`` never carry it. Secrets belong in
     ``stdin``; ``args`` are argv, visible to the node's process table and to
     logs. A failure's ``stderr_tail`` is the script's own words (see
-    ``RemoteError``): a script must never echo its payload.
+    ``RemoteError``): a script must never echo its payload. ``check=False``
+    hands a non-zero exit back instead of raising: a script that reports its
+    own failures in rows exits 1 and still has rows to read.
     ``max_stdout_bytes`` goes to ``run`` as is.
 
     Refused before any ssh: ValueError for a script in
@@ -554,8 +597,448 @@ def run_script(
         argv_remote,
         timeout_s=timeout_s,
         input_bytes=framed,
+        check=check,
         max_stdout_bytes=max_stdout_bytes,
     )
+
+
+# The row vocabulary every provisioning script prints: status<TAB>item<TAB>
+# detail, one per line. Any other stdout line is a tool's chatter, ignored.
+REPORT_STATUSES = frozenset({"ok", "did", "skip", "drop", "warn", "fail", "key"})
+
+
+@dataclass(frozen=True)
+class ScriptLine:
+    status: str
+    item: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class ProvisionReport:
+    """What a node script said, row by row, in order."""
+
+    lines: tuple[ScriptLine, ...]
+
+    @property
+    def failed(self) -> bool:
+        return any(line.status == "fail" for line in self.lines)
+
+    @property
+    def changed(self) -> bool:
+        return any(line.status in ("did", "drop") for line in self.lines)
+
+    def keys(self) -> dict[str, str]:
+        """``key`` rows (setup.sh): Unix user -> that user's node public key."""
+        return {line.item: line.detail for line in self.lines if line.status == "key"}
+
+
+def parse_report(text: str) -> ProvisionReport:
+    """The rows in ``text``, in order. A line is a row when it splits on its
+    first two tabs into a known status and a non-empty item; the detail keeps
+    any further tabs. Everything else is a tool's chatter and is dropped."""
+    lines: list[ScriptLine] = []
+    for raw in text.splitlines():
+        parts = raw.rstrip("\r").split("\t", 2)
+        if len(parts) >= 2 and parts[0] in REPORT_STATUSES and parts[1]:
+            lines.append(
+                ScriptLine(parts[0], parts[1], parts[2] if len(parts) == 3 else "")
+            )
+    return ProvisionReport(tuple(lines))
+
+
+def _report_of(
+    result: subprocess.CompletedProcess[bytes],
+    script: str,
+    node: Node,
+    *,
+    args: Sequence[str],
+    stdin: bytes | None,
+) -> ProvisionReport:
+    """A finished script's rows. Exit 255 is ssh's own failure, not the
+    script's, and raises; any other non-zero exit with no ``fail`` row gets
+    one, so a script that died mid-step can never read as a success.
+
+    ``args`` and ``stdin`` are the ones the ``run_script`` call was given, so
+    the error names exactly what ran (``--force``, the probed programs) the
+    way ``run`` does (``_run_shown`` over ``_script_call``): the program, not
+    this PC's path to it, stdin by its length alone, and no client lookup --
+    a lookup here could turn a transport failure into "ssh not installed"."""
+    if result.returncode == SSH_TRANSPORT_RC:
+        raise RemoteError(
+            SSH_TRANSPORT_RC,
+            _tail(result.stderr),
+            _run_shown(node, *_script_call(script, args, stdin)),
+        )
+    report = parse_report(result.stdout.decode("utf-8", "replace"))
+    if result.returncode != 0 and not report.failed:
+        err = result.stderr.decode("utf-8", "replace").strip().splitlines()
+        detail = f"exited {result.returncode}" + (f": {err[-1][:200]}" if err else "")
+        report = ProvisionReport((*report.lines, ScriptLine("fail", script, detail)))
+    return report
+
+
+GH_TIMEOUT_S = 20.0
+
+
+@functools.lru_cache(maxsize=1)
+def find_gh() -> str | None:
+    """This PC's ``gh``. Only provisioning uses it: to share the PC's GitHub
+    login with a node and to register a node's key."""
+    return shutil.which("gh")
+
+
+def _gh(
+    args: list[str], *, input_bytes: bytes | None = None
+) -> subprocess.CompletedProcess[bytes] | None:
+    """One bounded local ``gh`` call; None when gh is missing or could not
+    run. Only argv is ever logged -- a token read's stdout never is."""
+    exe = find_gh()
+    if exe is None:
+        return None
+    try:
+        return _spawn(
+            [exe, *args],
+            timeout_s=GH_TIMEOUT_S,
+            input_bytes=input_bytes,
+            check=False,
+            shown=_redacted(["gh", *args], input_bytes),
+            label="local gh",
+        )
+    except RemoteError:
+        return None
+
+
+@dataclass(frozen=True)
+class GhAccount:
+    login: str
+    scopes: frozenset[str]
+
+
+def local_gh_account() -> GhAccount | None:
+    """The active, logged-in github.com account of this PC's gh, or None."""
+    result = _gh(["auth", "status", "--json", "hosts"])
+    if result is None or result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        return None
+    hosts = data.get("hosts") if isinstance(data, dict) else None
+    entries = hosts.get("github.com") if isinstance(hosts, dict) else None
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        login = entry.get("login")
+        if (
+            entry.get("active") is True
+            and entry.get("state") == "success"
+            and isinstance(login, str)
+            and login
+        ):
+            raw = entry.get("scopes")
+            scopes = raw if isinstance(raw, str) else ""
+            return GhAccount(
+                login=login,
+                scopes=frozenset(s.strip() for s in scopes.split(",") if s.strip()),
+            )
+    return None
+
+
+def local_gh_token() -> str | None:
+    """This PC's github.com token, or None. It leaves this process only on a
+    node call's stdin (``build_payload``) -- never argv, never a log."""
+    result = _gh(["auth", "token", "--hostname", "github.com"])
+    if result is None or result.returncode != 0:
+        return None
+    token = result.stdout.decode("utf-8", "replace").strip()
+    if not token or any(ch.isspace() for ch in token):
+        return None
+    return token
+
+
+# node_apply refuses a manifest of another version (its MANIFEST_VERSION is
+# pinned equal to this by test).
+PAYLOAD_VERSION = 1
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _canonical(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def build_payload(
+    scope: UserScope,
+    *,
+    gh_token: str | None,
+    gh_login: str | None,
+    state_hook: str,
+) -> bytes:
+    """What follows the sentinel on provision.sh's stdin: the gh token (or an
+    empty line) and a gzip tar of the user scope + manifest. Deterministic --
+    identical input, identical bytes. The token is in the first line ONLY."""
+    entries = state_hook_entries()
+    digests = scope.digests()
+    digests["gh"] = _sha(f"{gh_login}\n{gh_token}") if gh_token else ""
+    digests["state_hook"] = _sha(state_hook + _canonical(entries))
+    manifest = {
+        "version": PAYLOAD_VERSION,
+        "digests": digests,
+        "gh_login": gh_login if gh_token else None,
+        "plugins": list(scope.plugins),
+        "marketplaces": scope.marketplaces,
+        "hook_entries": entries,
+    }
+    members: list[tuple[str, bytes, int]] = [
+        ("manifest.json", _canonical(manifest).encode("utf-8"), 0o600),
+        ("mcp_oauth.json", _canonical(scope.mcp_oauth).encode("utf-8"), 0o600),
+        ("mcp_servers.json", _canonical(scope.mcp_servers).encode("utf-8"), 0o600),
+        ("node_apply.py", node_scripts.source("node_apply.py").encode("utf-8"), 0o600),
+        ("settings.json", _canonical(scope.settings).encode("utf-8"), 0o600),
+        ("state-hook.sh", state_hook.encode("utf-8"), 0o700),
+    ]
+    members += [
+        (f"skills/{f.path}", f.data, 0o700 if f.executable else 0o600)
+        for f in scope.skills
+    ]
+    raw = io.BytesIO()
+    with (
+        gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz,
+        tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar,
+    ):
+        for name, data, mode in sorted(members):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = mode
+            info.mtime = 0
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            tar.addfile(info, io.BytesIO(data))
+    return (gh_token or "").encode("utf-8") + b"\n" + raw.getvalue()
+
+
+# A provision applies the whole user scope (plugins install, marketplaces
+# clone); the program probe ahead of it is one `command -v` per name.
+PROVISION_TIMEOUT_S = 300.0
+PROGRAMS_TIMEOUT_S = 30.0
+
+
+class ProgramsProbeFailed(Exception):
+    """The programs probe reached the node but did not answer for every name
+    it was asked: it exited non-zero, or left a name without an ``ok`` or
+    ``skip`` row. ``lines`` holds its ``fail`` row(s), one naming
+    ``programs``; the probe proved nothing about the node either way."""
+
+    def __init__(self, lines: tuple[ScriptLine, ...]) -> None:
+        super().__init__("; ".join(line.detail for line in lines))
+        self.lines = lines
+
+
+def node_programs(
+    node: Node, programs: Iterable[str], *, timeout_s: float
+) -> frozenset[str]:
+    """The subset of ``programs`` the node resolves (an executable file on its
+    PATH, ~/.local/bin first, as provision.sh runs). Only program NAMES cross
+    -- never a server's env or args. Raises RemoteError when the node is
+    unreachable, and ProgramsProbeFailed when the probe ran but did not
+    answer for every name: a failed probe is not "not on the node"."""
+    wanted = sorted(set(programs))
+    if not wanted:
+        return frozenset()
+    result = run_script(node, "programs", wanted, timeout_s=timeout_s, check=False)
+    report = _report_of(result, "programs", node, args=wanted, stdin=None)
+    answered = {line.item for line in report.lines if line.status in ("ok", "skip")}
+    unanswered = [program for program in wanted if program not in answered]
+    if report.failed or unanswered:
+        failed = tuple(line for line in report.lines if line.status == "fail")
+        raise ProgramsProbeFailed(
+            failed
+            or (
+                ScriptLine(
+                    "fail", "programs", "no answer for " + ", ".join(unanswered)
+                ),
+            )
+        )
+    return frozenset(
+        line.item
+        for line in report.lines
+        if line.status == "ok" and line.item in wanted
+    )
+
+
+def provision(
+    node: Node, user_scope: UserScope, *, timeout_s: float, force: bool = False
+) -> ProvisionReport:
+    """Lay ``user_scope`` onto ``node`` in ONE apply call: provision.sh unpacks
+    the payload and node_apply applies it. This PC's gh token is shared only
+    when gh names the account it belongs to, and it rides stdin. ``force``
+    re-applies unchanged items (``magent node setup`` sends it).
+
+    A stdio MCP candidate ships only if the node resolves its program: when
+    there is one, a ``programs.sh`` probe comes first, and what the node lacks
+    is dropped BEFORE the payload exists, so its env never leaves this PC.
+    A probe that fails drops every candidate the same way, and its ``fail``
+    row rides the report (the rest of the scope still applies).
+    The report opens with one verdict line per server: the scope's notes as
+    ``skip`` rows (what stayed behind, and why), then ``ok`` per shipped one."""
+    programs = stdio_programs(user_scope)
+    probe_failed: tuple[ScriptLine, ...] = ()
+    if programs:
+        try:
+            found = node_programs(
+                node, programs.values(), timeout_s=min(timeout_s, PROGRAMS_TIMEOUT_S)
+            )
+        except ProgramsProbeFailed as exc:
+            probe_failed = exc.lines
+            user_scope = without_missing_programs(
+                user_scope, found=frozenset(), unprobed=True
+            )
+        else:
+            user_scope = without_missing_programs(user_scope, found=found)
+    account = local_gh_account()
+    token = local_gh_token() if account is not None else None
+    login = account.login if account is not None and token else None
+    payload = build_payload(
+        user_scope,
+        gh_token=token if login else None,
+        gh_login=login,
+        state_hook=node_scripts.script("state_hook"),
+    )
+    args = ["--force"] if force else []
+    result = run_script(
+        node, "provision", args, timeout_s=timeout_s, stdin=payload, check=False
+    )
+    report = _report_of(result, "provision", node, args=args, stdin=payload)
+    notes = tuple(ScriptLine("skip", "scope", note) for note in user_scope.notes)
+    shipped = tuple(
+        ScriptLine("ok", "scope", f"mcp {name}: shipped")
+        for name in sorted(user_scope.mcp_servers)
+    )
+    return ProvisionReport((*notes, *shipped, *probe_failed, *report.lines))
+
+
+SETUP_TIMEOUT_S = 900.0
+# Each user adds a login, a Claude install and a key to the one root hop.
+SETUP_PER_USER_S = 240.0
+
+
+def setup_node(
+    node: Node,
+    users: Sequence[str],
+    pubkey: str,
+    *,
+    timeout_s: float | None = None,
+) -> ProvisionReport:
+    """Run setup.sh as ``root@<host>`` -- the one root hop. ``users`` are the
+    Unix users to create (argv; setup.sh validates them before it changes
+    anything), ``pubkey`` is this PC's public key (the payload). Each user's
+    node GitHub key comes back as a ``key`` row: ``report.keys()``.
+    ``timeout_s`` defaults to ``SETUP_TIMEOUT_S`` plus ``SETUP_PER_USER_S``
+    per user."""
+    names = list(users)
+    if timeout_s is None:
+        timeout_s = SETUP_TIMEOUT_S + SETUP_PER_USER_S * len(names)
+    root = dataclasses.replace(node, user="root")
+    payload = (pubkey.strip() + "\n").encode("utf-8")
+    result = run_script(
+        root, "setup", names, timeout_s=timeout_s, stdin=payload, check=False
+    )
+    return _report_of(result, "setup", root, args=names, stdin=payload)
+
+
+# Either scope lets gh add an ssh key; admin: is what `gh auth refresh` grants.
+SSH_KEY_SCOPES = frozenset({"admin:public_key", "write:public_key"})
+# ssh-ed25519/ssh-rsa, ecdsa-sha2-*, sk-ssh-ed25519@openssh.com/sk-ecdsa-*.
+SSH_KEY_TYPE_PREFIXES = ("ssh-", "ecdsa-", "sk-")
+
+
+def register_ssh_key(pubkey: str, *, title: str) -> ScriptLine:
+    """Add a node's public key to this PC's GitHub account (gh, authentication
+    key), once: a key already on the account is a skip. One ``github-key``
+    row; never raises. The key is public, but it rides stdin anyway."""
+    account = local_gh_account()
+    if account is None:
+        return ScriptLine(
+            "fail", "github-key", "gh is not logged in on this PC: gh auth login"
+        )
+    if not account.scopes:
+        # gh prints no scopes for a token it did not mint (GH_TOKEN, a
+        # fine-grained PAT); `gh auth refresh` cannot widen those.
+        return ScriptLine(
+            "fail",
+            "github-key",
+            (
+                "gh reports no token scopes (a GH_TOKEN/fine-grained token?): "
+                "use a classic token with admin:public_key, or gh auth login"
+            ),
+        )
+    if not account.scopes & SSH_KEY_SCOPES:
+        return ScriptLine(
+            "fail",
+            "github-key",
+            (
+                f"this PC's gh login ({account.login}) cannot add ssh keys: "
+                "gh auth refresh -h github.com -s admin:public_key"
+            ),
+        )
+    # A public key line opens with its type; anything else (a PEM private key
+    # pasted by mistake) never leaves this PC.
+    parts = pubkey.split()
+    if len(parts) < 2 or not parts[0].startswith(SSH_KEY_TYPE_PREFIXES):
+        return ScriptLine("fail", "github-key", "not an ssh public key line")
+    listed = _gh(["api", "--paginate", "user/keys", "--jq", ".[].key"])
+    if (
+        listed is not None
+        and listed.returncode == 0
+        and parts[1] in listed.stdout.decode("utf-8", "replace").split()
+    ):
+        return ScriptLine(
+            "skip", "github-key", f"already registered to {account.login}"
+        )
+    added = _gh(
+        ["ssh-key", "add", "-", "--title", title, "--type", "authentication"],
+        input_bytes=(" ".join(parts) + "\n").encode("utf-8"),
+    )
+    if added is None:
+        # A timed-out add may still have landed (RemoteError's rc None).
+        return ScriptLine(
+            "fail",
+            "github-key",
+            "gh ssh-key add did not finish (spawn failure or timeout); rerun to check",
+        )
+    if added.returncode != 0:
+        err = added.stderr.decode("utf-8", "replace").strip().splitlines()
+        detail = err[-1][:200] if err else f"exited {added.returncode}"
+        return ScriptLine("fail", "github-key", f"gh ssh-key add failed: {detail}")
+    # gh de-duplicates too, and says so on stderr with exit 0: when our own
+    # listing failed, that is the only word that the key was already there.
+    if "already exists" in added.stderr.decode("utf-8", "replace"):
+        return ScriptLine(
+            "skip", "github-key", f"already registered to {account.login}"
+        )
+    return ScriptLine(
+        "did", "github-key", f"registered to {account.login} as {title!r}"
+    )
+
+
+# doctor.sh bounds every probe (claude 8s, github 12s, tmux 4s, df 4s, and
+# 4s for each of its five version reads, each plus a 2s kill grace): 66s if
+# all of them hang at once, plus the ssh connect. 60s could not hold that.
+DOCTOR_TIMEOUT_S = 90.0
+
+
+def doctor(node: Node, *, timeout_s: float) -> ProvisionReport:
+    """doctor.sh's rows for ``node``. The script is read-only apart from
+    known_hosts TOFU (its github.com probe) and exits 0 whatever it finds;
+    ssh's own failure (255) raises, and an unreachable node is the caller's
+    row to print. The tmux socket is not an argument here: run_script passes
+    ``SOCKET`` first on every call (DECISION-26 ii)."""
+    args = ["--root", node.root, "--target", node.target]
+    result = run_script(node, "doctor", args, timeout_s=timeout_s, check=False)
+    return _report_of(result, "doctor", node, args=args, stdin=None)
 
 
 def has_session(node: Node, sid: str) -> bool | None:
