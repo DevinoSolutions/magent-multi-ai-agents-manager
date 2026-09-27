@@ -927,6 +927,29 @@ class NodeRig:
             explain=self.diag,
         )
 
+    def drop_pty_connections(self) -> Run:
+        """Kill the NODE side of every pty ssh connection the node user holds:
+        a dropped network as the PC's ssh sees it -- the server end goes away,
+        ssh exits 255, the attach client redials. Killing the LOCAL ssh would
+        not be a drop at all: the client probes, finds the session alive and
+        reads it as a detach, by design (``attach_client.verdict``).
+
+        Only pty connections are titled ``@pts/``; the product's own remote
+        calls, this one included, run without a pty (``@notty``) and survive.
+        The ``^`` keeps this command's own bash, whose argv carries the
+        pattern, from matching itself. rc 0: something was killed."""
+        return self.node.run(
+            [
+                "pkill",
+                "-KILL",
+                "-u",
+                self.user.name,
+                "-f",
+                "^sshd(-session)?: [^ ]+@pts/",
+            ],
+            tag="drop-pty",
+        )
+
     # -- diagnostics and teardown ------------------------------------------
 
     def diag(self) -> str:

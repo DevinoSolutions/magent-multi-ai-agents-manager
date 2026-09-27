@@ -664,7 +664,8 @@ class TestANodeHostsAProjectEndToEnd:
             before = token()
             pty.send_line(f"poke {before}")
             pty.expect(f"MARK-{before}", 30)
-            _kill_ssh_carrying(rig.sid)
+            dropped = rig.drop_pty_connections()
+            assert dropped.rc == 0, dropped.show()
             pty.expect("reconnecting", 30)
             # The redraw after the redial shows the same pane.
             pty.expect(f"MARK-{before}", 60)
