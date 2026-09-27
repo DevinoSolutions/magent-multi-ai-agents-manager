@@ -38,6 +38,9 @@ CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 # the sentinel CreateToolhelp32Snapshot returns when it cannot.
 TH32CS_SNAPPROCESS = 0x00000002
 INVALID_HANDLE_VALUE = -1
+# The one error that means the walk reached the end of the snapshot. Any other
+# failure of Process32NextW is a walk that stopped early.
+_ERROR_NO_MORE_FILES = 18
 
 # OpenProcess rights for ``raise_priority_above_normal``: the minimum pair that
 # lets a same-user, NON-ELEVATED caller read a priority class and set it.
@@ -175,14 +178,16 @@ def session_id_of(pid: int) -> int | None:
     return int(sid.value) if ok else None
 
 
-def snapshot_processes() -> list[tuple[str, int]] | None:
-    """``(image name, pid)`` for every live process, or None when we could not
-    look -- which is NOT the same as "nothing is running" and must never be
-    rendered as one. Off Windows: always None.
+def snapshot_processes() -> list[tuple[str, int, int]] | None:
+    """``(image name, pid, parent pid)`` for every live process, or None when
+    we could not look -- which is NOT the same as "nothing is running" and must
+    never be rendered as one. A walk that fails partway is "could not look"
+    too, never the shorter list it got as far as. Off Windows: always None.
 
-    THE one process enumeration in the product, deliberately: both callers
+    THE one process enumeration in the product, deliberately: every caller
     (``count_processes`` for doctor's wedge count, ``pids_by_image_name`` for
-    the psmux priority sweep) want the same Toolhelp walk over the same struct,
+    the psmux priority sweep, ``process_tree`` for the idle-pane proof in
+    ``psmux.idle_sessions``) wants the same Toolhelp walk over the same struct,
     and a second copy of a Windows process primitive is exactly how one of them
     silently rots -- the lesson ``spawn_unjobbed`` already encodes.
 
@@ -217,7 +222,9 @@ def snapshot_processes() -> list[tuple[str, int]] | None:
             ("szExeFile", wintypes.WCHAR * 260),
         )
 
-    k = ctypes.windll.kernel32
+    # use_last_error: ctypes keeps its own copy of the error each call leaves,
+    # the only one Python code running between two foreign calls cannot clobber.
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
     snapshot = k.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if snapshot == INVALID_HANDLE_VALUE:
         return None
@@ -226,13 +233,61 @@ def snapshot_processes() -> list[tuple[str, int]] | None:
         entry.dwSize = ctypes.sizeof(_ProcessEntry32)
         if not k.Process32FirstW(snapshot, ctypes.byref(entry)):
             return None
-        found: list[tuple[str, int]] = []
+        found: list[tuple[str, int, int]] = []
         while True:
-            found.append((entry.szExeFile, int(entry.th32ProcessID)))
+            found.append(
+                (
+                    entry.szExeFile,
+                    int(entry.th32ProcessID),
+                    int(entry.th32ParentProcessID),
+                )
+            )
             if not k.Process32NextW(snapshot, ctypes.byref(entry)):
+                # FALSE for any reason but "no more entries" is a walk that
+                # stopped early, and a partial list would read "nothing runs
+                # here" for every process it never reached -- the one way an
+                # unknown could make idle_sessions call a live pane idle.
+                if ctypes.get_last_error() != _ERROR_NO_MORE_FILES:
+                    return None
                 return found
     finally:
         k.CloseHandle(snapshot)
+
+
+def process_tree(
+    root: int, entries: Iterable[tuple[str, int, int]]
+) -> list[tuple[str, int, int]] | None:
+    """``root`` and every process descended from it, root first, out of one
+    ``snapshot_processes`` result -- or None when ``root`` is not in it.
+
+    Pure: it walks the entries it is handed and asks the OS nothing, so ONE
+    snapshot answers for every root a caller has (the idle-pane check reads a
+    whole fleet's panes off one). None means "that process was not there",
+    which a caller must treat as unknown, never as "nothing runs under it".
+
+    Parent pids are only as good as Windows keeps them: a process whose parent
+    exited keeps the dead parent's pid, so an orphan is unreachable from here,
+    and a reused pid can adopt strangers. The walk tolerates the cycles reuse
+    can create; a caller asking "does anything I care about run under this
+    root" gets an answer that errs toward yes on reuse and can miss an orphan.
+    """
+    items = list(entries)
+    root_entry = next((e for e in items if e[1] == root), None)
+    if root_entry is None:
+        return None
+    children: dict[int, list[tuple[str, int, int]]] = {}
+    for entry in items:
+        children.setdefault(entry[2], []).append(entry)
+    tree = [root_entry]
+    seen = {root}
+    frontier = [root]
+    while frontier:
+        for entry in children.get(frontier.pop(), ()):
+            if entry[1] not in seen:
+                seen.add(entry[1])
+                tree.append(entry)
+                frontier.append(entry[1])
+    return tree
 
 
 def count_processes(exe_name: str) -> int | None:
@@ -243,7 +298,7 @@ def count_processes(exe_name: str) -> int | None:
     if entries is None:
         return None
     wanted = exe_name.casefold()
-    return sum(1 for name, _pid in entries if name.casefold() == wanted)
+    return sum(1 for name, _pid, _ppid in entries if name.casefold() == wanted)
 
 
 def pids_by_image_name(names: Iterable[str]) -> list[int]:
@@ -254,7 +309,9 @@ def pids_by_image_name(names: Iterable[str]) -> list[int]:
     """
     wanted = {name.casefold() for name in names}
     return [
-        pid for name, pid in snapshot_processes() or () if name.casefold() in wanted
+        pid
+        for name, pid, _ppid in snapshot_processes() or ()
+        if name.casefold() in wanted
     ]
 
 

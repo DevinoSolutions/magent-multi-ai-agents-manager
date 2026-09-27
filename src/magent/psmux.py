@@ -684,53 +684,70 @@ _IDLE_SHELLS: frozenset[str] = frozenset(
     {"pwsh", "powershell", "bash", "zsh", "fish", "sh", "dash", "nu", "ksh", "tcsh"}
 )
 
-
-def pane_current_command(name: str, psmux: str | None = None) -> str:
-    """Return the active pane's foreground command (``pwsh``, ``claude``, ...).
-
-    The explicit ``-t <name>`` is REQUIRED: without it ``display-message``
-    answers for the *calling client's own* pane, and magent commands are often
-    run from inside a psmux session -- ``capture_pane`` passes ``-t`` for the
-    same reason. Same guards as ``pane_cwd``: bounded, decode-tolerant, and
-    any OSError/SubprocessError swallowed to ``""``.
-    """
-    binary = psmux or find_psmux()
-    if not binary:
-        return ""
-    try:
-        result = subprocess.run(
-            [
-                binary,
-                "-L",
-                name,
-                "display-message",
-                "-t",
-                name,
-                "-p",
-                "#{pane_current_command}",
-            ],
-            capture_output=True,
-            timeout=3,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            creationflags=_SPAWN_FLAGS,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    else:
-        return (result.stdout or "").strip() if result.returncode == 0 else ""
+# What magent wraps every command it types into a pane in: ``cmd /c <command>``
+# (``platform/windows.py::_send_argv`` and ``revive_sessions`` here). ``cmd /c``
+# exits exactly when its command does, so a live one under the pane's shell IS
+# the launched command, whatever that command's own image is called -- which is
+# what keeps a shipped tool with no registry image (agy, cursor-agent) from
+# reading idle while it runs. The agent images still matter: a human who typed
+# ``claude`` at the prompt has no cmd above it.
+_LAUNCHER_IMAGES: frozenset[str] = frozenset({"cmd"})
 
 
 def pane_current_commands(names: list[str], psmux: str | None = None) -> dict[str, str]:
-    """``pane_current_command`` for many sessions in ONE process fan-out.
+    """Each session's pane foreground command (``pwsh``, ``claude``, ...), for
+    many sessions in ONE process fan-out.
 
     Every probe is spawned before any is read -- the shape the picker's
     liveness sweep already uses -- so a caller building a table over 40 live
     sessions pays roughly one psmux round-trip instead of 40 sequential ones.
-    Guarded exactly like the single-session form: bounded, decode-tolerant, and
-    a failed, hung, or unlaunchable probe degrades to ``""`` for that session
-    rather than propagating.
+    Bounded and decode-tolerant: a failed, hung, or unlaunchable probe degrades
+    to ``""`` for that session rather than propagating.
+    """
+    return _display_fan_out(names, "#{pane_current_command}", psmux)
+
+
+def pane_pids(names: list[str], psmux: str | None = None) -> dict[str, int | None]:
+    """``#{pane_pid}`` -- the pane's OWN process, not its foreground -- for many
+    sessions in one fan-out; None where it could not be read.
+
+    Same fan-out and guards as ``pane_current_commands`` (surrounding
+    whitespace is stripped). Anything that is not then a positive integer is
+    None: a caller must never walk a process tree from a pid it guessed.
+    """
+    out: dict[str, int | None] = {}
+    for name, raw in _display_fan_out(names, "#{pane_pid}", psmux).items():
+        try:
+            pid = int(raw)
+        except ValueError:
+            pid = 0
+        out[name] = pid if pid > 0 else None
+    return out
+
+
+# The whole pane-probe fan-out's wait budget, and how long a probe that has
+# already exited may take to hand over its output once that budget is spent.
+# Paid once per batch, so it is sized for a loaded host: under a spawn storm a
+# single display-message runs past 3 s (see FLASH_TIMEOUT_S), and a spawn storm
+# is exactly when the bring-up's send-verify reads this. Ceiling: idle_sessions
+# runs two of these fan-outs back to back, so 2x this bounds idle_sessions'
+# SHARE of attach's 30 s `up --json --revive` ssh read, not the read itself.
+# The rest of that path has no finite bound to sum: live_sessions' sweep
+# before it is unbounded on purpose (a slow server must not read dead),
+# revive_sessions' has_session pool runs ceil(n/16) waves in series, and each
+# send_keys after it may take SEND_KEYS_TIMEOUT_S (20 s) per pane.
+_FAN_OUT_TIMEOUT_S = 10.0
+_FAN_OUT_DRAIN_S = 0.1
+
+
+def _display_fan_out(names: list[str], fmt: str, psmux: str | None) -> dict[str, str]:
+    """``display-message -p <fmt>`` against each session's own pane, every
+    probe spawned before any is read; ``""`` for any that failed.
+
+    The explicit ``-t <name>`` is REQUIRED: without it ``display-message``
+    answers for the *calling client's own* pane, and magent commands are often
+    run from inside a psmux session -- ``capture_pane`` passes ``-t`` for the
+    same reason.
     """
     binary = psmux or find_psmux()
     if not binary or not names:
@@ -739,16 +756,7 @@ def pane_current_commands(names: list[str], psmux: str | None = None) -> dict[st
     for name in names:
         try:
             procs[name] = subprocess.Popen(
-                [
-                    binary,
-                    "-L",
-                    name,
-                    "display-message",
-                    "-t",
-                    name,
-                    "-p",
-                    "#{pane_current_command}",
-                ],
+                [binary, "-L", name, "display-message", "-t", name, "-p", fmt],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 encoding="utf-8",
@@ -758,13 +766,24 @@ def pane_current_commands(names: list[str], psmux: str | None = None) -> dict[st
         except OSError:
             procs[name] = None
 
+    # ONE deadline for the whole fan-out, not one timeout per probe: the probes
+    # all run at once, so waiting a fresh timeout on each made a hung server
+    # cost N x timeout. Past it, a probe that already exited still hands over
+    # its output (a zero read budget can time out before the pipe is drained);
+    # one still running is unknown and killed unread.
+    deadline = time.monotonic() + _FAN_OUT_TIMEOUT_S
     out: dict[str, str] = {}
     for name, proc in procs.items():
         if proc is None:
             out[name] = ""
             continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 and proc.poll() is None:
+            proc.kill()
+            out[name] = ""
+            continue
         try:
-            stdout, _ = proc.communicate(timeout=5)
+            stdout, _ = proc.communicate(timeout=max(remaining, _FAN_OUT_DRAIN_S))
         except subprocess.SubprocessError:
             proc.kill()
             out[name] = ""
@@ -773,30 +792,98 @@ def pane_current_commands(names: list[str], psmux: str | None = None) -> dict[st
     return out
 
 
-def is_idle_command(raw: str) -> bool:
-    """True when a ``#{pane_current_command}`` reading is a bare shell.
+def _image_stem(raw: str) -> str:
+    """``C:\\x\\PWSH.EXE`` -> ``pwsh``: the leaf name, lower-cased, ``.exe``
+    dropped -- the one spelling foreground readings and process image names are
+    both compared in."""
+    leaf = raw.strip().replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return leaf.removesuffix(".exe")
 
-    Split out of ``agent_idle`` so a caller that already holds a pane's
-    foreground command (``status``'s session table) classifies it without
-    paying a second psmux round-trip. An empty or unreadable reading is False
-    on purpose -- see ``agent_idle``.
+
+def is_idle_command(raw: str) -> bool:
+    """True when a ``#{pane_current_command}`` reading (or a process image
+    name) is a bare shell.
+
+    A HINT, never a verdict: psmux reports the pane's foreground DESCENDANT, so
+    a live agent running its Bash tool reads ``bash`` -- ``idle_sessions`` is
+    the only place a pane is called idle, and this is one of its conditions.
+    An empty or unreadable reading is False on purpose.
     """
     stripped = raw.strip()
     if not stripped:
         return False
-    leaf = stripped.replace("\\", "/").rsplit("/", 1)[-1]
-    if leaf.lower().endswith(".exe"):
-        leaf = leaf[: -len(".exe")]
-    return leaf.lower() in _IDLE_SHELLS
+    return _image_stem(stripped) in _IDLE_SHELLS
 
 
-def agent_idle(name: str, psmux: str | None = None) -> bool:
-    """True when the session's pane rests at a bare shell -- its agent is gone.
+def idle_sessions(
+    names: list[str],
+    psmux: str | None = None,
+    *,
+    foreground: Mapping[str, str] | None = None,
+) -> set[str]:
+    """The sessions among ``names`` whose agent is POSITIVELY gone: the pane
+    rests at its shell with no agent anywhere under it.
 
-    An empty or unreadable reading is False on purpose: never inject keystrokes
-    into a pane whose state we could not establish.
+    THE one answer to "is this session's agent alive". ``revive_sessions``,
+    the bring-up's send-keys verification and status's idle column all read
+    it, because on a yes each of them types into the pane or tells the user
+    they may.
+
+    ``#{pane_current_command}`` cannot say so on its own. psmux reports the
+    pane's foreground DESCENDANT, so while Claude Code runs a tool the reading
+    is ``bash`` (its Bash tool), ``pwsh``, ``grep`` or an MCP server -- with
+    claude.exe alive under the pane (measured live: 4 of 31 sessions read that
+    way, and revive would have typed ``cmd /c claude --continue`` + Enter into
+    each). A yes therefore needs all three of:
+
+    1. the foreground reading is a bare shell (``is_idle_command``) -- still a
+       necessary condition, since a pane in the user's own program is not a
+       pane at its prompt either, and a cheap filter: a session that fails it
+       costs no further probe;
+    2. the pane's own process (``#{pane_pid}``) was read, is in the process
+       snapshot, and is itself a shell;
+    3. nothing in that process's subtree is an agent image
+       (``sessions.agent_image_names``) or a live launcher
+       (``_LAUNCHER_IMAGES`` -- the ``cmd /c`` magent typed, alive exactly as
+       long as the tool it started, registry image or not).
+
+    Anything unknown is a no -- an unreadable pid, a failed snapshot (always,
+    off Windows), a pane process gone by the time of the snapshot: never inject
+    keystrokes into a pane whose state we could not establish.
+
+    Batched: one ``pane_pids`` fan-out and ONE process snapshot for the whole
+    call, paid only when some reading is a shell. A caller that already holds
+    the foreground readings (status's table) passes them as ``foreground``
+    instead of paying for that fan-out twice.
     """
-    return is_idle_command(pane_current_command(name, psmux=psmux))
+    readings = (
+        foreground
+        if foreground is not None
+        else pane_current_commands(names, psmux=psmux)
+    )
+    shells = [name for name in names if is_idle_command(readings.get(name, ""))]
+    if not shells:
+        return set()
+
+    # In-body, like every procs/sessions use in this module: keeps this leaf
+    # importing only magent.log at load time.
+    from magent.procs import process_tree, snapshot_processes
+    from magent.sessions import agent_image_names
+
+    pids = pane_pids(shells, psmux=psmux)
+    snapshot = snapshot_processes()
+    if snapshot is None:
+        return set()
+    running = agent_image_names() | _LAUNCHER_IMAGES
+    idle: set[str] = set()
+    for name in shells:
+        pid = pids.get(name)
+        tree = process_tree(pid, snapshot) if pid is not None else None
+        if not tree or not is_idle_command(tree[0][0]):
+            continue
+        if not any(_image_stem(image) in running for image, _pid, _ppid in tree):
+            idle.add(name)
+    return idle
 
 
 # How long one status-line flash may take before we give up on it.
@@ -1594,9 +1681,11 @@ def revive_sessions(
 
     A session whose agent was Ctrl-C'ed (or whose original send-keys died)
     still answers ``has-session``, so ``up``/``attach`` reuse it and hand the
-    user a window parked at a bare prompt forever. Candidates are probed
-    concurrently -- the check is two psmux round-trips per session and a large
-    config would otherwise serialize them. Returns the session ids revived.
+    user a window parked at a bare prompt forever. Liveness is probed
+    concurrently (a large config would otherwise serialize a round-trip per
+    session), then the live ones get ONE ``idle_sessions`` verdict -- the only
+    thing that may put keystrokes into a pane, since typed into a LIVE agent
+    the resume command is a submitted prompt. Returns the session ids revived.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1614,18 +1703,19 @@ def revive_sessions(
     if not candidates:
         return []
 
-    def _revivable(p: dict[str, object]) -> bool:
-        sid = _field_str(p, "session")
-        return has_session(sid, psmux=binary) and agent_idle(sid, psmux=binary)
+    def _live(p: dict[str, object]) -> bool:
+        return has_session(_field_str(p, "session"), psmux=binary)
 
     with ThreadPoolExecutor(max_workers=16) as pool:
-        flags = list(pool.map(_revivable, candidates))
+        flags = list(pool.map(_live, candidates))
+    live = [p for p, ok in zip(candidates, flags, strict=True) if ok]
+    idle = idle_sessions([_field_str(p, "session") for p in live], psmux=binary)
 
     revived: list[str] = []
-    for p, ok in zip(candidates, flags, strict=True):
-        if not ok:
-            continue
+    for p in live:
         sid = _field_str(p, "session")
+        if sid not in idle:
+            continue
         # The configured command already IS the resume command -- claude's
         # registry default is ``claude --continue``, which picks the dead
         # pane's conversation back up. ``sessions.build_resume_command`` is
