@@ -909,10 +909,11 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     ``~``, ``/`` -- is no skill: it is the walk reading the whole home. Above
     where it is named, where it resolves, or where ``~/.claude`` resolves --
     so a home reached through a link, or a ``~/.claude`` kept in a dotfiles
-    repo that skills links back to, is above it too. Nothing inside one of ``home``'s ``SECRET_HOME_DIRS`` is read, folder or
-    single file, however it was reached. And nothing in ``~/.claude`` outside
-    the skills folder is read either -- the session transcripts, the history,
-    the login. Both sides of every comparison are resolved first, so a
+    repo that skills links back to, is above it too. Nothing inside one of
+    ``home``'s ``SECRET_HOME_DIRS`` is read, folder or single file, however
+    it was reached. And nothing in ``~/.claude`` outside the skills folder
+    is read either -- the session transcripts, the history, the login. Both
+    sides of every comparison are resolved first, so a
     ``~/.ssh`` or ``~/.claude`` that is itself a junction elsewhere (OneDrive
     setups) is still recognised. A skills folder that is itself such a link
     ships nothing -- one resolving elsewhere in ~/.claude (a ``skills-v2``)
