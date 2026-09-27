@@ -5,6 +5,53 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.19.2] - 2026-09-27
+
+### Fixed
+
+- **Reviving a session no longer types into an agent that is still working.**
+  `magent up` restarts the agent in any live session whose pane has fallen
+  back to a bare shell: the interactive `up` always does, `up --revive` asks
+  for it, and `magent attach` asks for it on the host every time it connects.
+  It judged "fallen back to a shell" from the command psmux reports for the
+  pane, and psmux reports whatever is running in the pane's foreground,
+  however deep. While Claude Code runs a tool, that reads as `bash`, `pwsh`,
+  `grep` or an MCP server, with the agent still alive underneath. On a live
+  31-session fleet, 4 sessions read as idle mid-turn, and revive would have
+  typed a second start command into each one's prompt. A pane now counts as
+  idle only on positive proof: its own process is a shell, and nothing
+  running under it is an agent or a command magent launched. Anything magent
+  cannot read counts as busy, so the worst case is a dead pane left for you
+  to restart. The same rule decides whether a bring-up re-sends a start
+  command and what `magent status` shows in its `idle` column. The pane
+  checks also share one 10-second deadline, so a multiplexer that stops
+  answering no longer costs a full timeout per session. Off Windows there is
+  no process snapshot to read, so nothing counts as idle and revive leaves
+  every pane alone.
+
+- **Claude agent states update again when the hooks run
+  `python -m magent.state_hook`.** That module form is wired by hand,
+  typically where a pip rollback deleted the `magent-state-hook` command. It
+  ran, exited successfully and recorded nothing, because the module had no
+  entry point, so every Claude state that `magent attention`, `magent watch`
+  and `magent status` show went stale while every hook reported success. The
+  module form now records states exactly as `magent-state-hook` does.
+  `magent hooks status` and `magent hooks install` also recognise
+  module-form entries as magent's own: `install` no longer adds a duplicate
+  entry beside them, and its repair of Windows backslash paths keeps a
+  module-form hook in the module form.
+
+  The fix takes effect once this version is installed into the Python the
+  hooks actually call. Until then, don't run `magent hooks install` on such
+  a machine: older versions don't recognise the module form and add a
+  duplicate entry.
+
+### Changed
+
+- Development tooling and CI were refreshed (`ty` 0.0.80 → 0.0.82, the
+  locked `ruff`, `playwright` and `sentry-sdk` versions, and
+  `tailscale/github-action`). Nothing in the installed package changes.
+
 ## [3.19.1] - 2026-09-23
 
 ### Fixed
@@ -1348,6 +1395,7 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.19.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.1...v3.19.2
 [3.19.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.0...v3.19.1
 [3.19.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.18.1...v3.19.0
 [3.18.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.18.0...v3.18.1
