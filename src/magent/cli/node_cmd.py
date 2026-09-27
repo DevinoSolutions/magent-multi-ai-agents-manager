@@ -288,7 +288,9 @@ def sync_cmd(
             ok = outcome == node_sync.OK
             failed = failed or not ok
             mark = style("+", fg="green") if ok else style("x", fg="red")
-            tail = f"  {detail}" if detail else ""
+            # Printable ASCII: a detail can be a node's words, and a cp1252
+            # console cannot encode every character.
+            tail = f"  {node_sync.printable(detail)}" if detail else ""
             click.echo(f"  {mark} @{nick}  {outcome}{tail}")
         if failed:
             sys.exit(1)
