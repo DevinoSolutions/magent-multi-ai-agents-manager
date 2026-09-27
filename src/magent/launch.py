@@ -2198,6 +2198,29 @@ def bring_up_node_project(
                 result = remote_mux.bring_up(
                     node, recipe, allow_dirty=allow_dirty, resume_id=resume_id
                 )
+                # What the node's repos were at this bring-up, for a later
+                # recall from a node that no longer answers. A fresh bring-up
+                # just checked the trees clean (bring_up.sh refuses a dirty
+                # one); an attach checked nothing. A record that cannot be
+                # written is logged and keeps the old one (write_repo_record).
+                nodes.write_repo_record(
+                    nick,
+                    result.sid,
+                    nodes.RepoRecord(
+                        ts=time.time(),
+                        source="bring-up",
+                        repos=tuple(
+                            nodes.RepoStatus(
+                                remote_dir=repo,
+                                head=sha,
+                                branch="",
+                                dirty=None if result.attached_existing else False,
+                                unpushed=None,
+                            )
+                            for repo, sha in sorted(result.commits.items())
+                        ),
+                    ),
+                )
             warnings = recipe.warnings
             try:
                 nodes.update_node_map(

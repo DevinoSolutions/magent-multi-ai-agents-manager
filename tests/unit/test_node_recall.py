@@ -322,6 +322,54 @@ class TestTheRepoRecord:
             nodes.RepoStatus("~/magent/api", "b" * 40, "main", False, 0)
         ]
 
+    def test_the_bring_up_records_the_commits_it_found(self, pipeline, api_repo):
+        config = pool("second", projects=[_api(api_repo, "second")])
+
+        launch.bring_up_node_project(config, config.projects[0])
+
+        record = nodes.read_repo_record("second", "api")
+        assert record is not None
+        assert record.source == "bring-up"
+        assert record.repos == (nodes.RepoStatus("api", "a" * 40, "", False, None),)
+
+    def test_an_attach_records_the_commit_but_not_a_clean_tree(
+        self, pipeline, api_repo, monkeypatch
+    ):
+        # The session was already running: nothing checked its trees.
+        def _attached(node, recipe, **_k):
+            return remote_mux.BringUpResult(
+                sid=recipe.sid,
+                attached_existing=True,
+                commits={"api": "a" * 40},
+                cwd="/home/amin/magent/api",
+            )
+
+        monkeypatch.setattr(remote_mux, "bring_up", _attached)
+        config = pool("second", projects=[_api(api_repo, "second")])
+
+        launch.bring_up_node_project(config, config.projects[0])
+
+        record = nodes.read_repo_record("second", "api")
+        assert record is not None
+        assert record.repos == (nodes.RepoStatus("api", "a" * 40, "", None, None),)
+
+    def test_a_record_that_cannot_be_written_is_not_a_failed_bring_up(
+        self, pipeline, api_repo, caplog
+    ):
+        # The session IS up; the record's own log line says what was lost.
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        blocker = nodes.node_dir("second") / "api"
+        blocker.parent.mkdir(parents=True, exist_ok=True)
+        blocker.write_text("not a folder", encoding="utf-8")
+        config = pool("second", projects=[_api(api_repo, "second")])
+
+        outcome = launch.bring_up_node_project(config, config.projects[0])
+
+        assert (outcome.ok, outcome.warnings) == (True, ())
+        assert any(
+            "could not write the repo record" in m for m in _node_logs(caplog)
+        ), _node_logs(caplog)
+
 
 @pytest.mark.skipif(
     sys.platform == "win32", reason="node scripts run under a Linux node's bash"
