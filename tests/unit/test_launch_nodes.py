@@ -32,6 +32,7 @@ from tests.conftest import FakePlatform
 
 if TYPE_CHECKING:
     import os
+    from collections.abc import Callable
 
 _TOOLS = {"claude": "claude --continue"}
 
@@ -314,8 +315,10 @@ class TestD7RefusesWhatTheNodeCouldNotReproduce:
         assert seen == ["second"]
 
     def test_a_refused_tree_with_its_session_alive_attaches_instead(
-        self, rig, api, tmp_path
+        self, rig, api, tmp_path, caplog
     ):
+        from magent.log import get_logger
+
         # The running session is not affected by what is uncommitted HERE.
         nodes.update_node_map(
             "api",
@@ -330,9 +333,19 @@ class TestD7RefusesWhatTheNodeCouldNotReproduce:
         )
         rig.live = True
         rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
         outcome = launch.bring_up_node_project(_config(api), api)
         assert (outcome.ok, outcome.attached_existing) == (True, True)
-        assert any("--allow-dirty" in w for w in outcome.warnings)
+        # The refusal alone: a readable map says nothing about the map, on
+        # screen or in nodes.log.
+        (dirty,) = [w for w in outcome.warnings if "--allow-dirty" in w]
+        assert outcome.warnings == (dirty,)
+        assert not [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "magent.nodes" and "looked up on its pin" in r.getMessage()
+        ]
         assert rig.decorated == [("api", "second")]
         assert rig.recipes == []
 
@@ -437,6 +450,41 @@ class TestASessionThatCameUpButWasNotRecordedIsUp:
         # tree would be refused: the repair says how not to be.
         assert "clean tree or --allow-dirty" in warning
         assert warning.isascii()
+
+    @pytest.mark.parametrize(
+        ("exc", "cls"),
+        [
+            (
+                ValueError(r"C:\Users\me\.magent\nodes\node-map.json: Expecting value"),
+                "ValueError",
+            ),
+            (
+                PermissionError(13, "Access is denied", r"C:\x\node-map.json"),
+                "PermissionError",
+            ),
+            (lockfile.LockHeld("node-map is held"), "LockHeld"),
+        ],
+        ids=["torn", "busy", "held"],
+    )
+    def test_the_screen_gets_the_class_and_nodes_log_the_error(
+        self, rig, api, monkeypatch, caplog, exc, cls
+    ):
+        from magent.log import get_logger
+
+        def no_map(*_a: object, **_k: object) -> dict[str, NodeMapEntry]:
+            raise exc
+
+        monkeypatch.setattr(nodes, "update_node_map", no_map)
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        outcome = launch.bring_up_node_project(_config(api), api)
+        (warning,) = [w for w in outcome.warnings if "not recorded" in w]
+        assert warning == (
+            f"up on @second but not recorded ({cls}); re-run magent up from a"
+            " clean tree or --allow-dirty"
+        )
+        logged = [r.getMessage() for r in caplog.records if r.name == "magent.nodes"]
+        assert f"node second: api up but not recorded in the node map: {exc}" in logged
 
     def test_the_window_still_opens(self, rig, api, monkeypatch):
         def no_map(*_a: object, **_k: object) -> dict[str, NodeMapEntry]:
@@ -603,6 +651,22 @@ def _record(name: str, nick: str, remote_root: str) -> None:
             remote_root=remote_root,
             target=f"amin@devino-{nick}",
         ),
+    )
+
+
+def _looked_up_on_its_pin(caplog: pytest.LogCaptureFixture) -> Callable[[], int]:
+    """With the map already unreadable: a counter of the magent.nodes records
+    carrying the WHOLE error a reader meets (its words, not only its class)
+    for the pinned project api looked up on second."""
+    from magent.log import get_logger
+
+    with pytest.raises((OSError, ValueError)) as err:
+        nodes.load_node_map_strict()
+    line = f"node second: api looked up on its pin, node map unreadable: {err.value}"
+    get_logger("nodes")  # sets the level; caplog must come after
+    caplog.set_level("WARNING", logger="magent.nodes")
+    return lambda: sum(
+        r.name == "magent.nodes" and r.getMessage() == line for r in caplog.records
     )
 
 
@@ -926,6 +990,322 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         assert [nick for nick, _ in rig.recipes] == ["second"]
 
 
+# A pinned project's refusal when its only folder rivals are auto projects
+# an unreadable map hides.
+_FOLDER_UNKNOWN = (
+    "the node map is unreadable ({cls}), so whether 'api' on {nick} is already"
+    " in use is unknown; not brought up"
+)
+
+
+class TestAnUnreadableMapPlacesNothingByGuess:
+    """A torn or busy node map is UNKNOWN, never "nothing is placed". Read as
+    ``{}``, an ``auto`` project running on a node looks unplaced: the fleet
+    check leaves it out, and a newcomer sharing its folder name is dialed
+    into that very folder. Every placement decision reads the map strictly;
+    unreadable, an ``auto`` project is refused naming the map, a pinned one
+    keeps its pin, and the rest of the batch comes up."""
+
+    @pytest.fixture(params=["torn", "busy"])
+    def unreadable_map(self, request, rig, monkeypatch):
+        """Make the map unreadable -- AFTER the test recorded what it holds --
+        and return the error class a reader then meets."""
+
+        def make() -> str:
+            if request.param == "torn":
+                nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+                return "ValueError"
+
+            def busy() -> dict[str, NodeMapEntry]:
+                raise PermissionError(13, "The process cannot access the file")
+
+            monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+            return "PermissionError"
+
+        return make
+
+    def test_a_newcomer_is_not_dialed_into_the_folder_an_auto_project_may_hold(
+        self, rig, tmp_path, unreadable_map
+    ):
+        # api-y (auto) runs on second in ~/magent/api. The map that says so is
+        # unreadable, so where api-y runs is unknown -- which must never read
+        # as "nowhere": api-x shares its folder name and stays refused.
+        x_api, y_api, web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        _record("api-y", "second", "~/magent/api")
+        rig.live = True
+        cls = unreadable_map()
+        outcomes = _batch(_config(x_api, y_api, web), only=["api-x", "web"])
+        assert [(o.sid, o.ok) for o in outcomes] == [("api-x", False), ("web", True)]
+        # Its only rival is hidden by the map, so the map is the reason.
+        assert outcomes[0].error == _FOLDER_UNKNOWN.format(cls=cls, nick="second")
+        assert [(n, r.sid) for n, r in rig.recipes] == [("second", "web")]
+
+    def test_an_auto_project_is_refused_naming_the_map_and_nothing_is_dialed(
+        self, rig, tmp_path, unreadable_map
+    ):
+        (web,) = _projects(tmp_path, rig, [("web", "auto")])
+        _record("web", "third", "~/magent/web")
+        rig.live = True
+        cls = unreadable_map()
+        outcome = launch.bring_up_node_project(_config(web), web)
+        assert (outcome.ok, outcome.sid, outcome.node) == (False, "web", "")
+        error = outcome.error or ""
+        assert "node map is unreadable" in error
+        assert f"({cls})" in error
+        # The error CLASS only: never the OS's or the parser's words.
+        assert "torn" not in error
+        assert "cannot access" not in error
+        assert "\n" not in error
+        assert rig.recipes == []
+        assert rig.decorated == []
+
+    def test_in_a_batch_the_auto_project_names_the_map_and_its_twin_the_clash(
+        self, rig, tmp_path, unreadable_map
+    ):
+        x_api, y_api, web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        _record("api-y", "second", "~/magent/api")
+        cls = unreadable_map()
+        outcomes = _batch(_config(x_api, y_api, web))
+        assert [(o.sid, o.ok) for o in outcomes] == [
+            ("api-x", False),
+            ("api-y", False),
+            ("web", True),
+        ]
+        assert outcomes[0].error == _FOLDER_UNKNOWN.format(cls=cls, nick="second")
+        assert "node map is unreadable" in (outcomes[1].error or "")
+        assert f"({cls})" in (outcomes[1].error or "")
+        assert [(n, r.sid) for n, r in rig.recipes] == [("second", "web")]
+
+    def test_a_holder_refused_only_for_an_unknown_auto_twin_names_the_map(
+        self, rig, tmp_path, unreadable_map
+    ):
+        # api-x holds second:~/magent/api and is live; api-y (auto) holds
+        # third:~/magent/api. Without the map api-x cannot prove it is the
+        # holder, so it stays refused -- but the reason is the map, never
+        # "rename one of them" for a fleet that is fine once it reads again.
+        x_api, y_api, web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        _record("api-x", "second", "~/magent/api")
+        _record("api-y", "third", "~/magent/api")
+        rig.live = True
+        cls = unreadable_map()
+        outcomes = _batch(_config(x_api, y_api, web), only=["api-x", "web"])
+        assert [(o.sid, o.ok) for o in outcomes] == [("api-x", False), ("web", True)]
+        assert outcomes[0].error == _FOLDER_UNKNOWN.format(cls=cls, nick="second")
+        assert [(n, r.sid) for n, r in rig.recipes] == [("second", "web")]
+
+    def test_a_clash_with_a_known_project_keeps_the_rename_text(
+        self, rig, tmp_path, unreadable_map
+    ):
+        # api-z (pinned, known) shares the leaf too: that clash is real
+        # whatever the map says, so its text is the X3 one.
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        z_dir = tmp_path / "z" / "api"
+        z_dir.mkdir(parents=True)
+        rig.states[z_dir] = _state(z_dir)
+        z_api = ProjectConfig(path=str(z_dir), node="third", title="api-z")
+        unreadable_map()
+        (outcome,) = _batch(_config(x_api, y_api, z_api), only=["api-x"])
+        assert (outcome.sid, outcome.ok) == ("api-x", False)
+        error = outcome.error or ""
+        assert "'api-x', 'api-y' and 'api-z' would share" in error
+        assert "rename one of them" in error
+        assert "node map is unreadable" not in error
+        assert rig.recipes == []
+
+    def test_two_hidden_auto_rivals_still_name_the_map(
+        self, rig, tmp_path, unreadable_map
+    ):
+        x_api, y_api, web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        w_dir = tmp_path / "w" / "api"
+        w_dir.mkdir(parents=True)
+        rig.states[w_dir] = _state(w_dir)
+        w_api = ProjectConfig(path=str(w_dir), node="auto", title="api-w")
+        _record("api-x", "second", "~/magent/api")
+        _record("api-y", "third", "~/magent/api")
+        _record("api-w", "second", "~/magent/api")
+        rig.live = True
+        cls = unreadable_map()
+        outcomes = _batch(_config(x_api, y_api, w_api, web), only=["api-x", "web"])
+        assert [(o.sid, o.ok) for o in outcomes] == [("api-x", False), ("web", True)]
+        assert outcomes[0].error == _FOLDER_UNKNOWN.format(cls=cls, nick="second")
+        assert [(n, r.sid) for n, r in rig.recipes] == [("second", "web")]
+
+    def test_the_holder_and_its_hidden_auto_twin_in_one_batch_both_name_the_map(
+        self, rig, tmp_path, unreadable_map
+    ):
+        x_api, y_api, web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        _record("api-x", "second", "~/magent/api")
+        _record("api-y", "third", "~/magent/api")
+        rig.live = True
+        cls = unreadable_map()
+        outcomes = _batch(_config(x_api, y_api, web))
+        assert [(o.sid, o.ok) for o in outcomes] == [
+            ("api-x", False),
+            ("api-y", False),
+            ("web", True),
+        ]
+        assert outcomes[0].error == _FOLDER_UNKNOWN.format(cls=cls, nick="second")
+        assert outcomes[1].error == (
+            f"the node map is unreadable ({cls}), so where this auto project runs"
+            " is unknown; not brought up"
+        )
+        # Its node is unknown, and the outcome never guesses one.
+        assert outcomes[1].node == ""
+        assert [(n, r.sid) for n, r in rig.recipes] == [("second", "web")]
+
+    def test_two_pinned_twins_keep_the_rename_text(self, rig, tmp_path, unreadable_map):
+        # No auto project in the group: the clash is real whatever the map says.
+        x_api, y_api, web = _twin_apis(tmp_path, rig)
+        _record("api-x", "second", "~/magent/api")
+        rig.live = True
+        unreadable_map()
+        outcomes = _batch(_config(x_api, y_api, web), only=["api-x", "web"])
+        assert [(o.sid, o.ok) for o in outcomes] == [("api-x", False), ("web", True)]
+        error = outcomes[0].error or ""
+        assert "'api-x' and 'api-y' would share" in error
+        assert "rename one of them" in error
+        assert "node map is unreadable" not in error
+
+    def test_a_readable_map_keeps_the_holder_up_beside_its_auto_twin(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # The same fleet with the map readable: api-x proves it holds
+        # second:~/magent/api and attaches, told of the clash as a warning.
+        x_api, y_api, web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        _record("api-x", "second", "~/magent/api")
+        _record("api-y", "third", "~/magent/api")
+        rig.live = True
+        _attached_when_live(monkeypatch, rig)
+        outcomes = _batch(_config(x_api, y_api, web), only=["api-x", "web"])
+        holder = outcomes[0]
+        assert (holder.sid, holder.ok, holder.attached_existing) == (
+            "api-x",
+            True,
+            True,
+        )
+        (warning,) = holder.warnings
+        assert "'api-x' and 'api-y' would share" in warning
+        assert "node map is unreadable" not in warning
+
+    def test_only_a_known_member_is_given_the_map_reason(self):
+        # Two auto projects of unknown node sharing a folder name: neither is
+        # a member whose node is known, so neither gets the map text (whose
+        # "on <node>" would name no node) -- each keeps the X3 text.
+        def unknown(sid: str) -> tuple[str, nodes.Recipe, bool]:
+            return (
+                "",
+                nodes.Recipe(
+                    project=sid,
+                    sid=sid,
+                    repos=(),
+                    push_files=(),
+                    memory_dir=None,
+                    remote_root=f"{nodes.UNKNOWN_NODE_ROOT}/api",
+                ),
+                False,
+            )
+
+        placed = {"api-y": unknown("api-y"), "api-w": unknown("api-w")}
+        clash = launch._folder_clashes(placed, ValueError("torn"))
+        text = nodes.remote_root_collision_text(
+            (placed["api-y"][1], placed["api-w"][1])
+        )
+        assert clash == {"api-y": text, "api-w": text}
+
+    def test_a_dirty_pinned_project_attaches_to_its_running_session(
+        self, rig, api, tmp_path, monkeypatch, caplog, unreadable_map
+    ):
+        # The map cannot say it runs there, so its pin and its own session id
+        # are asked: running, the uncommitted tree here does not touch it.
+        _record("api", "second", "~/magent/api")
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        probes: list[tuple[str, str]] = []
+
+        def has_session(node: nodes.Node, sid: str) -> bool | None:
+            probes.append((node.nick, sid))
+            return True
+
+        monkeypatch.setattr(remote_mux, "has_session", has_session)
+        cls = unreadable_map()
+        full = _looked_up_on_its_pin(caplog)
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert (outcome.ok, outcome.node, outcome.attached_existing) == (
+            True,
+            "second",
+            True,
+        )
+        assert outcome.error is None
+        (dirty,) = [w for w in outcome.warnings if "--allow-dirty" in w]
+        # The map is named on screen by its class, once; nodes.log has it all.
+        assert outcome.warnings == (
+            dirty,
+            f"the node map is unreadable ({cls}); attached to api on its pin @second",
+        )
+        assert full() == 1
+        assert probes == [("second", "api")]
+        assert rig.decorated == [("api", "second")]
+        assert rig.recipes == []
+
+    @pytest.mark.parametrize("live", [False, None], ids=["not-running", "no-answer"])
+    def test_a_dirty_pinned_project_not_found_running_is_refused_naming_the_map(
+        self, rig, api, tmp_path, monkeypatch, caplog, unreadable_map, live
+    ):
+        _record("api", "second", "~/magent/api")
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        probes: list[tuple[str, str]] = []
+
+        def has_session(node: nodes.Node, sid: str) -> bool | None:
+            probes.append((node.nick, sid))
+            return live
+
+        monkeypatch.setattr(remote_mux, "has_session", has_session)
+        cls = unreadable_map()
+        full = _looked_up_on_its_pin(caplog)
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert (outcome.ok, outcome.node) == (False, "second")
+        # The screen names the class; the error it stands for is in nodes.log.
+        assert full() == 1
+        error = outcome.error or ""
+        assert "--allow-dirty" in error
+        assert error.endswith(
+            f"; the node map is unreadable ({cls}), and api was not found"
+            " running on @second"
+        )
+        assert "torn" not in error
+        assert "cannot access" not in error
+        assert probes == [("second", "api")]
+        assert rig.decorated == []
+        assert rig.recipes == []
+
+    def test_a_pinned_project_keeps_its_pin(self, rig, api, unreadable_map):
+        _record("api", "third", "~/magent/api")
+        unreadable_map()
+        (outcome,) = _batch(_config(api))
+        assert (outcome.ok, outcome.node) == (True, "second")
+        assert [(n, r.sid) for n, r in rig.recipes] == [("second", "api")]
+
+    def test_the_local_fleet_and_the_pinned_node_projects_still_come_up(
+        self, rig, tmp_path, monkeypatch, capsys, unreadable_map
+    ):
+        pinned, auto = _projects(tmp_path, rig, [("a1", "second"), ("w1", "auto")])
+        _record("w1", "third", "~/magent/w1")
+        unreadable_map()
+        monkeypatch.setattr(
+            "magent.psmux.bring_up", lambda cfg, only, group: (["loc"], [])
+        )
+        assert launch.bring_up_psmux(_config(pinned, auto)) == (["loc", "a1"], ["w1"])
+        out = capsys.readouterr().out
+        (line,) = [ln for ln in out.splitlines() if ln.lstrip().startswith("x w1:")]
+        assert "node map is unreadable" in line
+
+
 class TestUpBringsUpNodeProjectsToo:
     def test_local_and_node_results_are_merged_and_node_lines_printed(
         self, rig, tmp_path, monkeypatch, capsys
@@ -1104,10 +1484,12 @@ class TestEveryNodeFailureIsAnOutcomeButABugIsNot:
         monkeypatch.setattr(nodes, "update_node_map", held)
         outcome = launch.bring_up_node_project(_config(api), api)
         # The node said yes before the map write failed: the session is up,
-        # so the outcome is ok with a repair warning naming the cause (6688a69).
+        # so the outcome is ok with a repair warning naming the cause (6688a69)
+        # -- by its class; its words are nodes.log's.
         assert (outcome.ok, outcome.node, outcome.error) == (True, "second", None)
         (warning,) = [w for w in outcome.warnings if "not recorded" in w]
-        assert "held by another writer" in warning
+        assert "(LockHeld)" in warning
+        assert "held by another writer" not in warning
         assert not launch._bring_up_lock("second").locked()
 
     def test_an_unreadable_push_file_is_an_outcome(self, rig, api):
