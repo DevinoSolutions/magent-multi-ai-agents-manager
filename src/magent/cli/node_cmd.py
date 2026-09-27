@@ -125,17 +125,27 @@ class DownSyncStop:
 
     From the first stop until the last, it holds serve's supervisor lock
     (``node_sync.supervisor_held``, entered on ``hold``), so no serve can
-    restart the daemon in between. A tick that already held the lock may have
-    spawned one that has not locked yet; so may whatever spawned a daemon the
-    first stop found. Only then does ``at_end`` wait for a late daemon
+    restart the daemon in between. Only a hint that a daemon may still be on
+    its way makes ``at_end`` look for a late one
     (``node_sync.await_late_daemon``) before its stop -- otherwise it stops at
-    once."""
+    once -- and each hint sets how long:
+
+    - a supervisor tick held the lock when down asked for it: the daemon that
+      tick may have spawned locks only once its interpreter is up, so it is
+      looked for until a cold start (``_START_POLLS`` polls) past the hold,
+      however soon the end comes;
+    - the first stop found a daemon: whatever spawned it may spawn another,
+      looked for ``STOP_SETTLE_S`` from the end.
+
+    With both, the later deadline stands."""
 
     def __init__(self, hold: contextlib.ExitStack, *, say_absent: bool) -> None:
         self._hold = hold
         self._say_absent = say_absent
         self._held = False
-        self._late = False
+        self._seen = False
+        # A monotonic reading: when a contended hold's look ends.
+        self._held_tick_until: float | None = None
         self._first: NodeSyncStop | None = None
 
     def _take_hold(self) -> None:
@@ -143,25 +153,29 @@ class DownSyncStop:
 
         if not self._held:
             self._held = True
-            self._late = self._hold.enter_context(node_sync.supervisor_held())
+            if self._hold.enter_context(node_sync.supervisor_held()):
+                self._held_tick_until = time.monotonic() + _START_POLLS * _START_POLL_S
 
     def before_pulls(self) -> None:
         from magent import node_sync  # heavy subsystem: in-body per policy
 
         self._take_hold()
         try:
-            seen = node_sync.daemon_running()
+            self._seen = node_sync.daemon_running()
         except OSError:
-            seen = True  # unknown is never "no daemon": the end stop waits
-        self._late = seen or self._late
+            self._seen = True  # unknown is never "no daemon": the end stop waits
         self._first = stop_node_sync_and_say(say_absent=self._say_absent)
 
     def at_end(self) -> None:
         from magent import node_sync  # heavy subsystem: in-body per policy
 
         self._take_hold()
-        if self._late:
-            node_sync.await_late_daemon()
+        until = self._held_tick_until
+        if self._seen:
+            settle = time.monotonic() + node_sync.STOP_SETTLE_S
+            until = settle if until is None else max(until, settle)
+        if until is not None:
+            node_sync.await_late_daemon(until=until)
         if self._first is None:
             stop_node_sync_and_say(say_absent=self._say_absent)
         else:

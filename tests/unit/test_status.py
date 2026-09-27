@@ -13,11 +13,13 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -2061,6 +2063,92 @@ def supervisor_tick(monkeypatch):
     return tick
 
 
+class _Clock:
+    """A fake monotonic clock: a sleep moves it on, and nothing waits.
+    ``hold_at`` is the reading at which ``down`` took serve's supervisor
+    lock (``clocked_hold``)."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+        self.hold_at: float | None = None
+
+    def now(self) -> float:
+        return self.t
+
+    def sleep(self, s: float) -> None:
+        self.t += s
+
+
+@pytest.fixture
+def clocked_hold(monkeypatch) -> _Clock:
+    """``down``'s node sync stops on a ``_Clock``: serve's supervisor lock is
+    refused once -- a tick held it -- then taken, and down's wait for that
+    lock and its look for a late daemon both run on the clock."""
+    from magent import node_sync
+    from magent.cli import node_cmd
+
+    clock = _Clock()
+    monkeypatch.setattr(
+        node_cmd, "time", SimpleNamespace(monotonic=clock.now, sleep=clock.sleep)
+    )
+    real_held = node_sync.supervisor_held
+    real_wait = node_sync.await_late_daemon
+    monkeypatch.setattr(
+        node_sync,
+        "supervisor_held",
+        lambda **k: real_held(sleep=clock.sleep, now=clock.now, **k),
+    )
+    monkeypatch.setattr(
+        node_sync,
+        "await_late_daemon",
+        lambda **k: real_wait(sleep=clock.sleep, now=clock.now, **k),
+    )
+    real_lock = node_sync.exclusive_lock
+    refusals = [LockHeld("the supervisor lock is held by another process")]
+
+    def lock(name: str) -> contextlib.AbstractContextManager[None]:
+        if name == node_sync.SUPERVISOR_LOCK_NAME:
+            if refusals:
+                raise refusals.pop()
+            clock.hold_at = clock.t
+        return real_lock(name)
+
+    monkeypatch.setattr(node_sync, "exclusive_lock", lock)
+    return clock
+
+
+class _ClockDaemon:
+    """A node sync daemon on a ``_Clock``: from ``after`` seconds past down's
+    hold it holds its lock, pid 4242, until it is killed. It stands in for
+    node_sync's lock probe, pid, kill and pid check, so the REAL stop_daemon
+    stops it."""
+
+    def __init__(self, monkeypatch, clock: _Clock, after: float) -> None:
+        from magent import node_sync
+
+        self.clock = clock
+        self.after = after
+        self.kills: list[int] = []
+        monkeypatch.setattr(node_sync, "daemon_running", self.running)
+        monkeypatch.setattr(
+            node_sync, "daemon_pid", lambda: 4242 if self.running() else None
+        )
+        monkeypatch.setattr(node_sync, "_kill", self.kill)
+        monkeypatch.setattr(node_sync, "pid_alive", lambda pid: self.running())
+
+    def kill(self, pid: int) -> bool:
+        self.kills.append(pid)
+        return True
+
+    def running(self) -> bool:
+        hold_at = self.clock.hold_at
+        return (
+            not self.kills
+            and hold_at is not None
+            and self.clock.t >= hold_at + self.after
+        )
+
+
 class TestDownStopsNodeSessionsWhereTheyRun:
     """PR-D: a node project's id names TWO sessions -- the one on its node,
     and the local one it may have left here before it gained a ``node`` (D9).
@@ -2765,6 +2853,115 @@ class TestDownStopsNodeSessionsWhereTheyRun:
             "Stopped the node sync daemon."
         ]
 
+    def _clocked_down(self, runner, tmp_config, monkeypatch, tmp_path, *, pulls, **k):
+        """``down --all`` on a ``clocked_hold``: with ``pulls``, one node
+        session is pulled at the end; without, no project has a node."""
+        if pulls:
+            self._hold("api")
+        project = {"path": str(tmp_path / "api"), "node": "second"}
+        out, *_ = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[project] if pulls else [{"path": str(tmp_path / "web")}],
+            real_stop=True,
+            real_sync=True,
+            **k,
+        )
+        assert out.exit_code == 0, out.output
+        return [
+            ln.split(None, 1)[1]
+            for ln in out.stdout.splitlines()
+            if "node sync daemon" in ln.lower()
+        ]
+
+    @pytest.mark.parametrize("pulls", [True, False], ids=["pulls", "no-pulls"])
+    def test_a_daemon_a_held_tick_spawned_is_stopped_however_soon_the_end_comes(
+        self, runner, tmp_config, monkeypatch, tmp_path, clocked_hold, pulls
+    ):
+        # A tick held serve's lock when down asked for it, so it may have just
+        # spawned a daemon -- which locks only once its interpreter is up,
+        # seconds later (a cold start). The end stop comes at once here, and
+        # still finds it: the look is counted from the hold, not from the end.
+        late = _ClockDaemon(monkeypatch, clocked_hold, after=5.0)
+        said = self._clocked_down(
+            runner, tmp_config, monkeypatch, tmp_path, pulls=pulls
+        )
+        assert late.kills == [4242]
+        assert said == (
+            ["Node sync daemon was not running.", "Stopped the node sync daemon."]
+            if pulls
+            else ["Stopped the node sync daemon."]
+        )
+        # Found the moment it locked; the rest of the look was not waited out.
+        assert clocked_hold.hold_at is not None
+        assert clocked_hold.t == pytest.approx(clocked_hold.hold_at + 5.0, abs=0.06)
+
+    @pytest.mark.parametrize("pulls", [True, False], ids=["pulls", "no-pulls"])
+    def test_a_held_tick_is_looked_after_for_a_cold_start_past_the_hold(
+        self, runner, tmp_config, monkeypatch, tmp_path, clocked_hold, pulls
+    ):
+        # No daemon ever comes: the look ends one cold start after the hold
+        # (node sync -d's own start budget), and the stop finds nothing.
+        from magent.cli import node_cmd
+
+        never = _ClockDaemon(monkeypatch, clocked_hold, after=math.inf)
+        said = self._clocked_down(
+            runner, tmp_config, monkeypatch, tmp_path, pulls=pulls
+        )
+        assert never.kills == []
+        assert said == (["Node sync daemon was not running."] if pulls else [])
+        budget = node_cmd._START_POLLS * node_cmd._START_POLL_S
+        assert clocked_hold.hold_at is not None
+        assert clocked_hold.t == pytest.approx(clocked_hold.hold_at + budget, abs=0.06)
+
+    def test_after_pulls_longer_than_a_cold_start_the_end_stop_does_not_wait(
+        self, runner, tmp_config, monkeypatch, tmp_path, clocked_hold
+    ):
+        # 30 s of pulls: a daemon the held tick spawned would have locked long
+        # ago, so the end stop asks once and does not wait.
+        from magent import node_sync
+
+        _ClockDaemon(monkeypatch, clocked_hold, after=math.inf)
+        pulled = node_sync.remote_mux.PullResult(files=(), since=0.0)
+
+        def slow_pull(config, name, **_k):
+            clocked_hold.sleep(30.0)
+            return pulled
+
+        said = self._clocked_down(
+            runner, tmp_config, monkeypatch, tmp_path, pulls=True, pull=slow_pull
+        )
+        assert said == ["Node sync daemon was not running."]
+        assert clocked_hold.hold_at is not None
+        assert clocked_hold.t == pytest.approx(clocked_hold.hold_at + 30.0)
+
+    def test_a_daemon_the_first_stop_found_is_still_looked_after_from_the_end(
+        self, runner, tmp_config, monkeypatch, tmp_path, clocked_hold
+    ):
+        # Both hints at once: the tick held serve's lock AND the first stop
+        # found a daemon. After 30 s of pulls the hold's look is long over,
+        # but the found daemon's is not: it runs STOP_SETTLE_S from the end.
+        from magent import node_sync
+
+        found = _ClockDaemon(monkeypatch, clocked_hold, after=0.0)
+        pulled = node_sync.remote_mux.PullResult(files=(), since=0.0)
+
+        def slow_pull(config, name, **_k):
+            clocked_hold.sleep(30.0)
+            return pulled
+
+        said = self._clocked_down(
+            runner, tmp_config, monkeypatch, tmp_path, pulls=True, pull=slow_pull
+        )
+        assert found.kills == [4242]
+        assert said == ["Stopped the node sync daemon."]
+        assert clocked_hold.hold_at is not None
+        assert clocked_hold.t == pytest.approx(
+            clocked_hold.hold_at + 30.0 + node_sync.STOP_SETTLE_S, abs=0.06
+        )
+
     @pytest.mark.parametrize("first", [True, False], ids=["stopped", "absent"])
     def test_an_end_stop_that_cannot_tell_is_said_after_a_first_stop_that_could(
         self, runner, tmp_config, monkeypatch, tmp_path, first
@@ -2839,6 +3036,10 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         # tick -- the REAL one, on the REAL lock -- stands down. A tick that
         # held the lock when down asked for it is waited out, never raced.
         if held_at_start:
+            from magent.cli import node_cmd
+
+            # No daemon comes: the end stop's look for one is kept short.
+            monkeypatch.setattr(node_cmd, "_START_POLLS", 3)
             _tick_holding_serves_lock(monkeypatch, spawns=None)
         during: list[list[list[str]]] = []
 
@@ -2927,9 +3128,11 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         # while it is pending delete: either way the stops run, unprotected,
         # and nodes.log says why.
         from magent import node_sync
+        from magent.cli import node_cmd
         from magent.log import get_logger
 
         monkeypatch.setattr(node_sync, "STOP_SETTLE_S", 0.3)
+        monkeypatch.setattr(node_cmd, "_START_POLLS", 3)
         get_logger(node_sync.LOG_NAME)
         caplog.set_level(logging.WARNING, logger=f"magent.{node_sync.LOG_NAME}")
         release = threading.Event()

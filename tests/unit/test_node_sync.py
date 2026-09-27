@@ -721,6 +721,28 @@ class TestDownHoldsTheSupervisorLock:
             assert node_sync.await_late_daemon(sleep=sleep, now=lambda: clock[0])
         assert clock[0] == 0.0
 
+    def test_the_late_daemon_wait_ends_at_the_deadline_it_is_given(self):
+        # down's contended hold passes its own deadline: a cold start past
+        # the hold, not STOP_SETTLE_S from now.
+        clock = [0.0]
+
+        def sleep(s: float) -> None:
+            clock[0] += s
+
+        assert not node_sync.await_late_daemon(
+            until=7.0, sleep=sleep, now=lambda: clock[0]
+        )
+        assert clock[0] == pytest.approx(7.0, abs=0.06)
+
+    def test_a_deadline_already_past_still_looks_once(self, monkeypatch):
+        monkeypatch.setattr(node_sync, "daemon_running", lambda: True)
+        monkeypatch.setattr(node_sync, "daemon_pid", lambda: 4242)
+        naps: list[float] = []
+        assert node_sync.await_late_daemon(
+            until=-1.0, sleep=naps.append, now=lambda: 0.0
+        )
+        assert naps == []
+
     def test_a_daemon_between_its_lock_and_its_pid_is_waited_for(self, monkeypatch):
         # The daemon locks first and writes its pid after; the stop kills by
         # pid, so the look lasts until the pid is there too.

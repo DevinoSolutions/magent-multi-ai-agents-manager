@@ -189,7 +189,8 @@ def stop_daemon(
 
 # How often `down --all` retries serve's supervisor lock while a supervisor
 # tick holds it, and how often it looks for a daemon that took its own lock
-# late. Both waits are bounded by STOP_SETTLE_S.
+# late. The first wait is bounded by STOP_SETTLE_S; the look, by the deadline
+# its caller gives (await_late_daemon).
 SUPERVISOR_RETRY_S = 0.05
 
 
@@ -242,18 +243,21 @@ def supervisor_held(
 
 def await_late_daemon(
     *,
+    until: float | None = None,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.monotonic,
 ) -> bool:
-    """Look up to ``STOP_SETTLE_S`` for a daemon holding its lock: True as soon
-    as one does and has written its pid. ``ensure_node_sync`` Popens a daemon
-    that takes ``LOCK_NAME`` only once its interpreter is up, so right after a
-    spawn the lock -- the only proof of a daemon -- still reads free. It writes
-    its pid just after the lock, and ``stop_daemon`` kills by pid: stopped in
-    between, it would be called stuck. At the deadline the lock's last answer
-    stands. A probe that could not open the lock file answers nothing and the
-    look goes on; the stop after it asks again."""
-    deadline = now() + STOP_SETTLE_S
+    """Look until ``until`` -- a ``now()`` reading; None is ``STOP_SETTLE_S``
+    from now -- for a daemon holding its lock: True as soon as one does and
+    has written its pid. It always looks once, even past ``until``.
+    ``ensure_node_sync`` Popens a daemon that takes ``LOCK_NAME`` only once its
+    interpreter is up, so right after a spawn the lock -- the only proof of a
+    daemon -- still reads free. It writes its pid just after the lock, and
+    ``stop_daemon`` kills by pid: stopped in between, it would be called
+    stuck. At the deadline the lock's last answer stands. A probe that could
+    not open the lock file answers nothing and the look goes on; the stop
+    after it asks again."""
+    deadline = now() + STOP_SETTLE_S if until is None else until
     held = False
     while True:
         with contextlib.suppress(OSError):
