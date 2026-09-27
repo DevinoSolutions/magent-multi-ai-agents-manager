@@ -42,9 +42,10 @@ if TYPE_CHECKING:
 
 NICK = "loop"
 # One wall clock for a module's node stages (see _pty.Budget). The healthy D
-# path is estimated at ~3.5 minutes; the job's timeout-minutes sits well above
-# this, so a slow stage lands as a FAILURE with its output, never a cancel.
-NODES_BUDGET_S = 420.0
+# path measured 38-47 s in a 4-CPU ubuntu container; the job's timeout-minutes
+# sits well above this, so a slow stage lands as a FAILURE with its output,
+# never a cancel.
+NODES_BUDGET_S = 300.0
 # Teardown gets its own allowance, whatever the module's budget has left: a
 # user that is never deleted is a leak on the runner, and the timeouts below
 # must still fire when the module budget is spent.
