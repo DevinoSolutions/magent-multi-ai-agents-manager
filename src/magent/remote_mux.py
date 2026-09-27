@@ -403,7 +403,8 @@ def _spawn(
         # _execute_child puts the client's path in str(e), and an error or a
         # log line names the program only.
         rc = SSH_MISSING_RC if isinstance(e, FileNotFoundError) else None
-        reason = e.strerror or str(e)
+        # No strerror: the class, never str(e) -- it is where the path lives.
+        reason = e.strerror or type(e).__name__
         if not quiet:
             get_logger("nodes").warning(
                 "%s could not start (%s): %s", label, reason, shlex.join(shown)
@@ -1140,7 +1141,10 @@ def _extract(
     # ValueError/OverflowError: a header field this module did not foresee
     # still ends as a pull error, never an escape past the RemoteError contract.
     except (tarfile.TarError, EOFError, OSError, ValueError, OverflowError) as e:
-        raise _pull_error(f"unreadable pull archive: {e}") from e
+        # The class only: `node sync --once` prints this, and an OSError here
+        # can name a path on this PC. Its words are nodes.log's.
+        log.warning("node pull: unreadable pull archive: %s", e)
+        raise _pull_error(f"unreadable pull archive ({type(e).__name__})") from e
     return tuple(files), frozenset(failed | oversized)
 
 
@@ -1182,7 +1186,9 @@ def parse_pull(stdout: bytes, *, dest: Path, sids: Collection[str]) -> NodeSnaps
     # RecursionError: json.loads' answer to deep nesting (200k '[' fit well
     # inside the reply cap). The node's bad answer, not a bug on this PC.
     except (ValueError, RecursionError) as e:
-        raise _pull_error(f"unreadable pull metadata: {e}") from e
+        # By class, as the archive's error is; the parser's words are logged.
+        get_logger("nodes").warning("node pull: unreadable pull metadata: %s", e)
+        raise _pull_error(f"unreadable pull metadata ({type(e).__name__})") from e
     if not isinstance(meta, dict):
         raise _pull_error("pull metadata is not an object")
     # json.loads accepts NaN and Infinity (a NaN watermark, which
@@ -1465,8 +1471,12 @@ def repo_paths(project_dir: Path) -> list[Path]:
             if path_is_dir(child) and path_exists(child / ".git")
         )
     except OSError as e:
-        reason = f"cannot read {project_dir}: {e.strerror or e}"
-        get_logger("nodes").warning("repo lookup failed: %s", reason)
+        # strerror is the OS's words without a path; lacking it, the class.
+        # The whole error is logged.
+        reason = f"cannot read {project_dir}: {e.strerror or type(e).__name__}"
+        get_logger("nodes").warning(
+            "repo lookup failed: cannot read %s: %s", project_dir, e
+        )
         raise RemoteError(None, reason, ("repo_paths", str(project_dir))) from e
 
 

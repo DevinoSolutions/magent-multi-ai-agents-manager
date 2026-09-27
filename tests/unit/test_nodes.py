@@ -1440,6 +1440,27 @@ class TestPushSet:
         with pytest.raises(PermissionError):
             nodes.push_set(workspace, [_state(workspace / "api", ())], home=Path.home())
 
+    def test_a_workspace_root_that_cannot_be_listed_is_named_by_class(
+        self, tmp_path, monkeypatch
+    ):
+        # The message reaches the screen, so it names the OS error by class,
+        # chained for the traceback and nodes.log.
+        workspace = tmp_path / "ws"
+        (workspace / "api").mkdir(parents=True)
+        denied = PermissionError(13, "Permission denied", str(workspace))
+        real = Path.iterdir
+
+        def iterdir(self: Path) -> object:
+            if self == workspace:
+                raise denied
+            return real(self)
+
+        monkeypatch.setattr(Path, "iterdir", iterdir)
+        with pytest.raises(NodeConfigError) as err:
+            nodes.push_set(workspace, [_state(workspace / "api", ())], home=Path.home())
+        assert str(err.value) == f"{workspace}: cannot be listed (PermissionError)"
+        assert err.value.__cause__ is denied
+
     def test_a_workspace_root_file_that_never_ships_is_never_read(
         self, tmp_path, monkeypatch
     ):
@@ -2176,8 +2197,9 @@ class TestRecipeFor:
                     home=Path.home(),
                     project_dir=tmp_path,
                 )
-        assert "Too many levels of symbolic links" in str(err.value)
-        # Chained, not re-worded: the traceback still shows the OS's own error.
+        # The message reaches the screen, so it names the OS error by class;
+        # chained, the traceback and nodes.log still show the OS's own words.
+        assert str(err.value) == f"{tmp_path}: cannot be resolved (OSError)"
         assert err.value.__cause__ is raised[0]
 
     def test_a_nul_in_the_project_path_is_a_config_error_naming_it(self, tmp_path):

@@ -3377,9 +3377,24 @@ class TestABugInOneNodeFailsItAlone:
             _config(), pull=_pull_raising({"second": PermissionError("denied")})
         ).tick()
         assert results == {
-            "second": (node_sync.FAILED, "denied"),
+            "second": (node_sync.FAILED, "local error: PermissionError"),
             "third": (node_sync.OK, ""),
         }
+
+    def test_an_os_errors_own_words_are_logged_once_not_shown(self, placed, caplog):
+        # `node sync --once` prints the detail: the class there, and the OS's
+        # words (a path on this PC) in nodes.log -- once per state change,
+        # like every other failure, not once per tick.
+        _capture_nodes_log(caplog)
+        denied = PermissionError(13, "Permission denied", r"C:\Users\amin\a.jsonl")
+        syncer = node_sync.NodeSyncer(_config(), pull=_pull_raising({"second": denied}))
+        first = syncer.tick()
+        syncer.tick()
+        assert first["second"] == (node_sync.FAILED, "local error: PermissionError")
+        assert _node_warnings(caplog, "second") == [
+            f"node second: failed (local error: PermissionError): {denied}"
+        ]
+        assert "a.jsonl" in str(denied)
 
     def test_a_node_back_from_a_failure_is_ok_again_not_reachable_again(
         self, placed, caplog

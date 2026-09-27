@@ -274,6 +274,18 @@ class TestRun:
         assert gone not in str(exc.value)
         assert gone not in exc.value.stderr_tail
 
+    def test_a_spawn_failure_with_no_os_words_is_named_by_its_class(self, monkeypatch):
+        # No strerror to fall back on: the class, never str(e) and its path.
+        def refuse(*_a: object, **_k: object) -> None:
+            raise OSError(r"C:\Tools\OpenSSH\ssh.exe is not a valid image")
+
+        monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: "ssh")
+        monkeypatch.setattr(remote_mux.subprocess, "Popen", refuse)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["true"], timeout_s=5)
+        assert exc.value.stderr_tail == "OSError"
+        assert "OpenSSH" not in str(exc.value)
+
     def test_a_spawn_failure_is_logged_like_any_other_failure(
         self, tmp_path, monkeypatch
     ):
@@ -1217,6 +1229,21 @@ class TestWhichReposMakeTheProject:
         assert exc.value.rc is None
         assert "Permission denied" in exc.value.stderr_tail
         assert str(tmp_path) in str(exc.value)
+
+    def test_an_error_with_no_os_words_is_named_by_its_class(
+        self, tmp_path, monkeypatch
+    ):
+        # strerror is the OS's words without a path; an OSError with none
+        # would put its whole str() on screen. The class there, it in the log.
+        def broken(self):
+            raise OSError(r"C:\Users\amin\ws: gone")
+
+        monkeypatch.setattr(Path, "iterdir", broken)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.repo_paths(tmp_path)
+        assert exc.value.stderr_tail == f"cannot read {tmp_path}: OSError"
+        logged = (log.LOG_DIR / "nodes.log").read_text(encoding="utf-8")
+        assert r"C:\Users\amin\ws: gone" in logged
 
     def test_a_workspace_repo_that_cannot_be_read_fails_it_not_left_out(
         self, tmp_path, monkeypatch

@@ -795,8 +795,9 @@ class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
         both = _batch(_config(good, z))
         assert [(o.sid, o.ok) for o in both] == [("a1", True), ("z", False)]
         # Named as unreadable -- not "not found on this PC", which is what
-        # Python 3.14's Path.is_dir alone would have said.
-        assert "Permission denied" in (both[1].error or "")
+        # Python 3.14's Path.is_dir alone would have said -- by its class: the
+        # OS's words carry the folder's path, and those are nodes.log's.
+        assert both[1].error == "local error: PermissionError; see nodes.log"
 
     def test_a_collision_with_a_project_outside_the_batch_still_refuses(
         self, rig, tmp_path, monkeypatch
@@ -1366,7 +1367,9 @@ class TestUpBringsUpNodeProjectsToo:
         created, failed = launch.bring_up_psmux(_config(good, locked))
         assert (created, failed) == (["loc", "a1"], ["z"])
         assert [recipe.sid for _, recipe in rig.recipes] == ["a1"]
-        assert "Permission denied" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "  x z: local error: PermissionError; see nodes.log\n" in out
+        assert "Permission denied" not in out
 
     def test_allow_dirty_reaches_the_node_bring_up(self, rig, tmp_path, monkeypatch):
         projs = _projects(tmp_path, rig, [("a1", "second")])
@@ -1512,11 +1515,35 @@ class TestEveryNodeFailureIsAnOutcomeButABugIsNot:
         assert "held by another writer" not in warning
         assert not launch._bring_up_lock("second").locked()
 
-    def test_an_unreadable_push_file_is_an_outcome(self, rig, api):
-        rig.error = PermissionError(13, "Permission denied")
+    def test_an_unreadable_push_file_is_an_outcome(self, rig, api, caplog):
+        # The class on screen; the OS's words and the path are nodes.log's.
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        rig.error = PermissionError(13, "Permission denied", r"C:\Users\amin\sa.json")
         outcome = launch.bring_up_node_project(_config(api), api)
         assert outcome.ok is False
-        assert "Permission denied" in (outcome.error or "")
+        assert outcome.error == "local error: PermissionError; see nodes.log"
+        (record,) = [r for r in caplog.records if "failed" in r.getMessage()]
+        assert record.getMessage().endswith(f"failed: {rig.error}")
+
+    def test_a_config_error_logs_the_os_error_under_it(self, rig, api, caplog):
+        # nodes' own words on screen, the chained OS error in nodes.log.
+        from magent.log import get_logger
+
+        get_logger("nodes")
+        caplog.set_level("WARNING", logger="magent.nodes")
+        error = nodes.NodeConfigError(r"C:\ws\api: cannot be resolved (OSError)")
+        error.__cause__ = OSError(62, "Too many levels of symbolic links")
+        rig.error = error
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert outcome.error == r"C:\ws\api: cannot be resolved (OSError)"
+        (record,) = [r for r in caplog.records if "failed" in r.getMessage()]
+        assert record.getMessage().endswith(
+            r"C:\ws\api: cannot be resolved (OSError):"
+            " [Errno 62] Too many levels of symbolic links"
+        )
 
     def test_the_recipes_warnings_reach_the_outcome(self, rig, api, monkeypatch):
         real = launch.node_recipe
@@ -1650,17 +1677,43 @@ class TestGoBringsNodeProjectsUp:
         assert "needs a placement" in capsys.readouterr().out
 
     def test_dry_run_names_a_folder_this_user_may_not_read(
-        self, desk, no_sleep, tmp_path, monkeypatch, capsys
+        self, desk, no_sleep, tmp_path, monkeypatch, capsys, caplog
     ):
         # The preview says why, as the real run's outcome would, rather than
-        # raising out of `--dry-run`.
+        # raising out of `--dry-run` -- by class, with the OS's words logged.
+        from magent.log import get_logger
+
+        get_logger("nodes")
+        caplog.set_level("WARNING", logger="magent.nodes")
         monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
         locked = tmp_path / "locked"
         locked.mkdir()
         deny_stat(monkeypatch, locked)
         proj = ProjectConfig(path=str(locked), node="second")
         assert launch.run_magent(_config(proj), launch.RunOpts(dry_run=True)) == 0
-        assert "Permission denied" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "      x local error: PermissionError; see nodes.log\n" in out
+        assert "Permission denied" not in out
+        assert any(
+            "Permission denied" in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+
+    def test_dry_run_says_a_config_error_in_printable_ascii(
+        self, desk, no_sleep, tmp_path, monkeypatch, capsys
+    ):
+        # A folder name off a POSIX disk can hold a lone surrogate; the preview
+        # must not die of it any more than the run's own row does.
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+
+        def refuse(*_a: object, **_k: object) -> object:
+            raise nodes.NodeConfigError("caf\udce9\x1b[2J: no usable name")
+
+        monkeypatch.setattr(nodes, "resolve", refuse)
+        proj = ProjectConfig(path=str(tmp_path), node="second")
+        assert launch.run_magent(_config(proj), launch.RunOpts(dry_run=True)) == 0
+        assert "      x caf??[2J: no usable name\n" in capsys.readouterr().out
 
     def test_a_window_already_open_is_not_brought_up_again(
         self, rig, api, no_sleep, monkeypatch

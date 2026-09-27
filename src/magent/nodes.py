@@ -745,11 +745,15 @@ def _try_resolve(path: Path) -> Path | None:
 
 def _resolved(path: Path) -> Path:
     """``path`` resolved, or a NodeConfigError naming it, chained to the OS's
-    own error: a recipe cannot place a repo it cannot locate."""
+    own error: a recipe cannot place a repo it cannot locate. The message
+    reaches the screen, so it names that error by class; its words (another
+    path among them) are the chained cause's, for nodes.log."""
     try:
         return path.resolve()
     except _RESOLVE_ERRORS as exc:
-        raise NodeConfigError(f"{path}: cannot be resolved ({exc})") from exc
+        raise NodeConfigError(
+            f"{path}: cannot be resolved ({type(exc).__name__})"
+        ) from exc
 
 
 # The stat errors that mean "nothing is there": no such entry, a parent that
@@ -804,7 +808,10 @@ def _workspace_root_files(project_dir: Path) -> list[Path]:
     try:
         entries = list(project_dir.iterdir())
     except (OSError, ValueError) as exc:
-        raise NodeConfigError(f"{project_dir}: cannot be listed ({exc})") from exc
+        # By class, chained, as ``_resolved`` does.
+        raise NodeConfigError(
+            f"{project_dir}: cannot be listed ({type(exc).__name__})"
+        ) from exc
     found = [p for p in entries if _is_env_file(p.name) and path_is_file(p)]
     found += [project_dir / f for f in _PUSH_FIXED if path_is_file(project_dir / f)]
     return found

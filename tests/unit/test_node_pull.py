@@ -113,6 +113,18 @@ class TestParsePull:
         with pytest.raises(RemoteError, match="unreadable pull metadata") as info:
             parse_pull(reply, dest=tmp_path, sids=frozenset())
         assert info.value.rc == 0
+        # Its class only: `node sync --once` prints this line.
+        assert info.value.stderr_tail == "unreadable pull metadata (RecursionError)"
+
+    def test_unreadable_metadata_logs_the_parsers_words(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        reply = PULL_HEADER + b"{not json\n" + PULL_TRAILER + b"0\n"
+        with pytest.raises(RemoteError) as info:
+            parse_pull(reply, dest=tmp_path, sids=frozenset())
+        assert info.value.stderr_tail == "unreadable pull metadata (JSONDecodeError)"
+        (record,) = [r for r in caplog.records if "metadata" in r.getMessage()]
+        assert record.levelno == logging.WARNING
+        assert str(info.value.__cause__) in record.getMessage()
 
     def test_a_banner_before_the_header_is_ignored(self, tmp_path):
         reply = "Welcome to devino-second!\n" + pull_reply(pull_meta(sessions=["api"]))
@@ -239,7 +251,8 @@ class TestParsePull:
         with pytest.raises(RemoteError, match="sessions is not a list of names"):
             _parse(pull_reply(meta), tmp_path)
 
-    def test_a_corrupt_archive_is_a_pull_error(self, tmp_path):
+    def test_a_corrupt_archive_is_a_pull_error(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
         reply = (
             PULL_HEADER
             + b'{"now": 1.0, "sessions": []}\n'
@@ -247,8 +260,17 @@ class TestParsePull:
             + PULL_TRAILER
             + b"1\n"
         )
-        with pytest.raises(RemoteError, match="unreadable pull archive"):
+        with pytest.raises(RemoteError, match="unreadable pull archive") as info:
             parse_pull(reply, dest=tmp_path, sids=frozenset({"api"}))
+        # Its class on screen (an OSError here can name a path on this PC);
+        # its words in nodes.log.
+        cause = info.value.__cause__
+        assert info.value.stderr_tail == (
+            f"unreadable pull archive ({type(cause).__name__})"
+        )
+        (record,) = [r for r in caplog.records if "archive" in r.getMessage()]
+        assert record.levelno == logging.WARNING
+        assert str(cause) in record.getMessage()
 
     def test_a_session_whose_file_cannot_be_stored_fails_alone(self, tmp_path, caplog):
         caplog.set_level(logging.WARNING, logger="magent.nodes")

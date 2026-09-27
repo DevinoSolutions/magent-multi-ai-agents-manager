@@ -1309,6 +1309,7 @@ def _echo_node_dry_run(
     # heavy subsystem: in-body per policy
     from magent import nodes
     from magent.env import local_username
+    from magent.node_sync import printable
 
     try:
         # A folder this user may not read is named, like a bad pin.
@@ -1323,7 +1324,13 @@ def _echo_node_dry_run(
         # and a dry run names that reason rather than raising it.
         folder = nodes.remote_root_for(node, project_dir)
     except (ValueError, OSError) as exc:
-        click.echo(f"      {style('x', fg='red')} {exc}")
+        # The row the real run's outcome would show (``_node_error_text``).
+        if isinstance(exc, OSError):
+            get_logger("nodes").warning("dry run: %s: %s", nodes.node_sid(proj), exc)
+            text = _local_error_text(exc)
+        else:
+            text = printable(str(exc))
+        click.echo(f"      {style('x', fg='red')} {text}")
         return
     click.echo(style(f"      -> {node.target}:{folder}", dim=True))
     # DECISION-24: the real run provisions first (``_provision_once``).
@@ -1807,14 +1814,22 @@ def node_recipe(
 def _node_error_text(exc: Exception) -> str:
     """The one line a user sees for a failed node bring-up: a RemoteError's
     last stderr line (bring_up.sh writes its reason there, prefixed
-    ``magent:``), anything else's message."""
+    ``magent:``), an OSError's class (its message names a path on this PC;
+    ``nodes.log`` has it), anything else's message -- nodes' own words."""
     # heavy subsystem: in-body per policy
     from magent.remote_mux import RemoteError
 
     if isinstance(exc, RemoteError):
         lines = exc.stderr_tail.strip().splitlines()
         return lines[-1].removeprefix("magent: ") if lines else f"exit {exc.rc}"
+    if isinstance(exc, OSError):
+        return _local_error_text(exc)
     return str(exc)
+
+
+def _local_error_text(exc: OSError) -> str:
+    """A node row's words for an OSError raised on this PC: its class only."""
+    return f"local error: {type(exc).__name__}; see nodes.log"
 
 
 def _node_busy_text(nick: str, waited_s: float) -> str:
@@ -2055,7 +2070,8 @@ def bring_up_node_project(
             "node %s: bring-up of %s failed: %s",
             nick or "?",
             sid,
-            exc,
+            # A NodeConfigError names the OS error under it by class alone.
+            exc if exc.__cause__ is None else f"{exc}: {exc.__cause__}",
             exc_info=isinstance(exc, ValueError)
             and not isinstance(exc, nodes.NodeConfigError),
         )
