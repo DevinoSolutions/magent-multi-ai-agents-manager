@@ -34,8 +34,10 @@ _MARKER = "magent-state-hook"
 # The same writer run as a module (`<python> -m magent.state_hook`), the
 # hand-wired spelling that survives a pip rollback deleting the console script.
 _MODULE_MARKER = "-m magent.state_hook"
-# A Windows drive-letter path (`C:\`): the only backslashes a repair may swap.
-# Anywhere else a backslash is bash escape syntax (`My\ Venv`) and works as is.
+# A Windows drive-letter path (`C:\`): the only module-form backslashes a repair
+# swaps. Any other backslash is taken as bash escape syntax (`My\ Venv`), so a
+# UNC (`\\host\share`) or mixed-separator (`C:/py\python.exe`) interpreter path
+# is knowingly left alone -- it reads as wired though bash cannot run it.
 _DRIVE_PATH = re.compile(r"[A-Za-z]:\\")
 
 
@@ -87,13 +89,14 @@ def _event_wired(entries: object) -> bool:
 def _repair_entries(entries: list[object], cmd: str) -> bool:
     """Rewrite any wired magent-state-hook command that bash cannot run -- a
     backslash path from a pre-3.1.2 install, or a module-form one with a
-    backslash interpreter path (idempotence would otherwise skip the broken
-    entry forever). Returns True when something was rewritten.
+    drive-letter backslash interpreter path (idempotence would otherwise skip
+    the broken entry forever). Returns True when something was rewritten.
 
     A module-form command keeps its form: that spelling exists to avoid the
     console script, so only the backslashes bash would eat are swapped -- and
     only when it carries a Windows drive-letter path. Any other module-form
-    backslash is escape syntax, left byte for byte."""
+    backslash is taken as escape syntax and left byte for byte, which knowingly
+    misses a UNC or mixed-separator interpreter path (see _DRIVE_PATH)."""
     changed = False
     for entry in entries:
         if not isinstance(entry, dict):
