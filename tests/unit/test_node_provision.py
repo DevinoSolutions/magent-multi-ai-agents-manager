@@ -17,12 +17,13 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
-from magent import cli, node_scripts, nodes, remote_mux
+from magent import cli, log, node_scripts, nodes, remote_mux
 from magent.cli import hooks_cmd
 from magent.config import MagentConfig
 from magent.nodes import Node, UserScope
@@ -1447,6 +1448,24 @@ class TestUserScopePluginsAndSkills:
         assert [f.path for f in scope.skills] == ["mine/SKILL.md"]
         assert scope.notes == ("skills/synced: claude.ai-managed copies, not shipped",)
 
+    # claude.ai's copies are a FOLDER; the note is read off the root's own
+    # listing, so a file the user named synced ships with no note of it.
+    def test_a_file_named_synced_is_no_managed_copy(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "synced", b"my notes\n")
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["synced"]
+        assert scope.notes == ()
+
+    # Only the TOP-level synced folder is claude.ai's: one deeper is the
+    # user's, and ships with no note.
+    def test_a_nested_folder_named_synced_ships_with_no_note(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "a/synced/x.md")
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["a/synced/x.md"]
+        assert scope.notes == ()
+
     # A link in ~/.claude/skills is one the user made -- a repo checked out
     # elsewhere is the main case -- so the walk FOLLOWS it out of the root, a
     # Windows junction exactly like a symlink. Deliberately not containment
@@ -1596,6 +1615,105 @@ class TestUserScopePluginsAndSkills:
             "skills: links to a folder it must not read, not followed",
         )
         assert "not followed" in caplog.text
+
+    # "Above" by every spelling of where the skills folder lives: as the user
+    # sees it, as it resolves, AND where ~/.claude resolves. With a home
+    # reached through a link (FreeBSD's /home -> usr/home, Fedora Atomic's
+    # var/home) or a ~/.claude kept in a dotfiles repo, a link to that home or
+    # that repo is above neither of the first two -- and it holds the session
+    # transcripts and the history.
+    @staticmethod
+    def _transcripts(claude: Path) -> None:
+        _skill(claude, "projects/p/s.jsonl", b"TRANSCRIPT-DECOY")
+        _skill(claude, "history.jsonl", b"HISTORY-DECOY")
+
+    def test_a_home_reached_through_a_link_is_above_its_skills_folder(self, tmp_path):
+        real_home = tmp_path / "var" / "home" / "amin"
+        self._transcripts(real_home / ".claude")
+        _skill(real_home, "notes/private.md", b"PRIVATE-DECOY")
+        (tmp_path / "home").mkdir()
+        home = tmp_path / "home" / "amin"
+        _link_dir(home, real_home)
+        _link_dir(home / ".claude" / "skills", home)
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == (
+            "skills: links to a folder it must not read, not followed",
+        )
+        assert "DECOY" not in repr(scope)
+
+    def test_a_skills_folder_linked_to_the_repo_holding_claude_ships_nothing(
+        self, tmp_path
+    ):
+        home = _pc_home(tmp_path)
+        dot = tmp_path / "dot"
+        self._transcripts(dot / "claude")
+        _skill(dot, "myskill/SKILL.md")
+        _link_dir(home / ".claude", dot / "claude")
+        _link_dir(dot / "claude" / "skills", dot)
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == (
+            "skills: links to a folder it must not read, not followed",
+        )
+        assert "DECOY" not in repr(scope)
+
+    def test_a_link_inside_to_the_repo_holding_claude_is_above_too(self, tmp_path):
+        home = _pc_home(tmp_path)
+        dot = tmp_path / "dot"
+        self._transcripts(dot / "claude")
+        _skill(dot, "private.md", b"PRIVATE-DECOY")
+        _link_dir(home / ".claude", dot / "claude")
+        repo = tmp_path / "repo"
+        _skill(repo, "s/SKILL.md")
+        _link_dir(dot / "claude" / "skills", repo)
+        _link_dir(repo / "x", dot)
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == (
+            "skills/x: links to a folder above the skills folder, not followed",
+        )
+        assert "DECOY" not in repr(scope)
+
+    # Only the spelling the user sees catches the OneDrive layout: ~/.claude a
+    # link elsewhere and skills a link back to ~, which is above neither where
+    # the skills folder resolves (~ itself) nor the skills folder where
+    # ~/.claude resolves.
+    def test_skills_linked_to_home_while_claude_links_elsewhere_ships_nothing(
+        self, tmp_path
+    ):
+        home = _pc_home(tmp_path)
+        _skill(home, "notes/private.md", b"PRIVATE-DECOY")
+        onedrive = tmp_path / "OneDrive" / ".claude"
+        self._transcripts(onedrive)
+        _link_dir(home / ".claude", onedrive)
+        _link_dir(onedrive / "skills", home)
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == (
+            "skills: links to a folder it must not read, not followed",
+        )
+        assert "DECOY" not in repr(scope)
+
+    # Only where the skills folder resolves catches a link inside it back to
+    # the repo it lives in: that repo is above neither ~/.claude/skills as
+    # named nor the skills folder where ~/.claude resolves.
+    def test_a_link_inside_a_linked_skills_folder_to_its_repo_is_not_followed(
+        self, tmp_path
+    ):
+        home = _pc_home(tmp_path)
+        (home / ".claude").mkdir()
+        repo = tmp_path / "dotfiles"
+        _skill(repo, "skills/s/SKILL.md")
+        _skill(repo, "private.md", b"PRIVATE-DECOY")
+        _link_dir(home / ".claude" / "skills", repo / "skills")
+        _link_dir(repo / "skills" / "up", repo)
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == (
+            "skills/up: links to a folder above the skills folder, not followed",
+        )
+        assert "DECOY" not in repr(scope)
 
     # Defence in depth beside the ancestor rule: nothing inside a well-known
     # secrets folder under the scope's home is read, a folder or one file.
@@ -1759,6 +1877,1168 @@ class TestUserScopePluginsAndSkills:
         assert "DECOY" not in repr(scope)
 
 
+# The node passes a marketplace source to `claude plugin marketplace add` as an
+# ARGUMENT, readable in `ps` by every user of a shared node: a credential in
+# its URL never leaves this PC. The rule is the one a project's git remote is
+# stripped by (nodes._without_credentials): over any scheme but ssh the whole
+# userinfo is a credential -- GitHub takes a token as the user name -- over
+# ssh only a password is. Each refusal names the fix.
+CREDENTIAL_FIX = "put the credential in git's credential helper, not the URL"
+PASSWORD_REFUSED = (
+    "marketplace mkt: its source URL carries a password, never shipped -- "
+    + CREDENTIAL_FIX
+)
+USER_REFUSED = (
+    "marketplace mkt: its source URL carries a user name (often a token), never "
+    "shipped -- " + CREDENTIAL_FIX
+)
+
+
+class TestAMarketplaceSourceNeverCarriesAPassword:
+    def _scope_for(self, tmp_path: Path, url: str) -> UserScope:
+        return nodes.user_scope(
+            _pc_home(
+                tmp_path,
+                settings={"enabledPlugins": {"p@mkt": True}},
+                known_marketplaces={"mkt": {"source": {"source": "git", "url": url}}},
+            )
+        )
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://bob:ghp_DECOY@git.example/m.git",
+            "https://:ghp_DECOY@git.example/m.git",
+            "ssh://git:DECOY@git.example/m.git",
+            "https::https://bob:ghp_DECOY@git.example/m.git",
+            # The password runs from the first ':' to the LAST '@': a login
+            # holding an '@' (an email) still reads as carrying a password.
+            "https://bob@corp.example:ghp_DECOY@git.example/m.git",
+        ],
+    )
+    def test_a_userinfo_password_stays_behind(self, tmp_path, url):
+        scope = self._scope_for(tmp_path, url)
+        assert scope.marketplaces == {}
+        assert scope.notes == (PASSWORD_REFUSED,)
+        assert "DECOY" not in repr(scope)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://ghp_DECOY@github.com/o/m.git",  # GitHub: token as user name
+            "https://ghp_DECOY:@github.com/o/m.git",  # an empty password
+            "http://bob_DECOY@git.example/m.git",
+            "git+https://ghp_DECOY@github.com/o/m.git",
+            "HTTPS://ghp_DECOY@github.com/o/m.git",
+            "git://ghp_DECOY@git.example/m.git",  # not ssh: the login is no ssh user
+            "https::https://ghp_DECOY@github.com/o/m.git",  # git's helper form
+            "https://ghp_DECOY@[::1/m.git",  # userinfo before a broken host
+        ],
+    )
+    def test_any_user_name_off_ssh_stays_behind(self, tmp_path, url):
+        scope = self._scope_for(tmp_path, url)
+        assert scope.marketplaces == {}
+        assert scope.notes == (USER_REFUSED,)
+        assert "DECOY" not in repr(scope)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "git@github.com:owner/m.git",
+            "ssh://git@github.com/owner/m.git",
+            "git+ssh://git@github.com/owner/m.git",
+            "https://github.com/owner/m.git",
+            "https://:@github.com/owner/m.git",  # a userinfo of only ':'
+        ],
+    )
+    def test_the_ssh_user_and_a_plain_url_ship(self, tmp_path, url):
+        scope = self._scope_for(tmp_path, url)
+        assert scope.marketplaces == {"mkt": url}
+        assert scope.notes == ()
+
+    def test_a_source_that_does_not_parse_stays_behind(self, tmp_path):
+        scope = self._scope_for(tmp_path, "https://[::1/m.git")
+        assert scope.marketplaces == {}
+        assert scope.notes == (
+            "marketplace mkt: its source URL does not parse, never shipped",
+        )
+
+    # One policy: whatever the git-remote rule would strip, the marketplace
+    # rule refuses, and nothing else.
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://u:p@h/r",
+            "https://u@h/r",
+            "ssh://u:p@h/r",
+            "ssh://u@h/r",
+            "git://u@h/r",
+            "file://u@h/r",
+            "https://h/r",
+            "u@h:r",
+            "ext::ssh -p 22 u@h",
+        ],
+    )
+    def test_the_rule_is_the_git_remote_rule(self, tmp_path, url):
+        refused = self._scope_for(tmp_path, url).marketplaces == {}
+        assert refused == nodes._without_credentials(url)[1]
+
+
+def _skills_home(tmp_path: Path) -> tuple[Path, Path]:
+    """A PC home with ~/.ssh and ~/.aws planted, and its empty skills root."""
+    home = _pc_home(tmp_path)
+    (home / ".ssh").mkdir()
+    (home / ".ssh" / "id_ed25519").write_bytes(b"PRIVATE-KEY-DECOY")
+    (home / ".aws").mkdir()
+    (home / ".aws" / "credentials").write_bytes(b"AWS-DECOY")
+    skills = home / ".claude" / "skills"
+    skills.mkdir(parents=True)
+    return home, skills
+
+
+def _skill(root: Path, rel: str, data: bytes = b"# skill\n") -> None:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
+def _scope_or_fail_on_fifo(home: Path, fifo: Path) -> UserScope:
+    """``user_scope(home)`` on a worker thread: a walk that blocks opening
+    ``fifo`` fails the test (after unblocking it) instead of hanging it, and
+    one that raises fails it by assertion, like ``_walked``."""
+    result: list[UserScope | Exception] = []
+
+    def walk() -> None:
+        try:
+            result.append(nodes.user_scope(home))
+        except Exception as e:  # noqa: BLE001 # reason: handed back to the test verbatim
+            result.append(e)
+
+    worker = threading.Thread(target=walk, daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+    if worker.is_alive():
+        # Unblock the reader stuck in open() so the thread can end.
+        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        worker.join(timeout=5)
+        pytest.fail("the walk blocked opening a FIFO")
+    (scope,) = result
+    assert isinstance(scope, UserScope), f"the walk stopped: {type(scope).__name__}"
+    return scope
+
+
+def _walked(home: Path) -> UserScope:
+    """``user_scope(home)``, where anything raised out of the walk fails the
+    test by assertion: an entry it cannot read, or will not ship, is a note,
+    never the walk's end."""
+    try:
+        scope: UserScope | Exception = nodes.user_scope(home)
+    except Exception as e:  # noqa: BLE001 # reason: any escape is the walk's end
+        scope = e
+    assert isinstance(scope, UserScope), f"the walk stopped: {type(scope).__name__}"
+    return scope
+
+
+class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
+    @pytest.mark.skipif(sys.platform == "win32", reason="no FIFOs on Windows")
+    def test_a_fifo_is_not_read(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/SKILL.md")
+        os.mkfifo(skills / "s" / "pipe")  # reading it would block forever
+        scope = _scope_or_fail_on_fifo(home, skills / "s" / "pipe")
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == ("skills/s/pipe: not a regular file, not shipped",)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="no FIFOs on Windows")
+    def test_a_fifo_is_never_even_opened(self, tmp_path, monkeypatch):
+        # Opening a device can do something of its own (a tape rewinds): the
+        # stat before the open keeps the walk from ever opening one.
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/SKILL.md")
+        fifo = skills / "s" / "pipe"
+        os.mkfifo(fifo)
+        opened: list[str] = []
+        real_open = os.open
+
+        def spy(path, *args, **kwargs):
+            opened.append(os.path.basename(path))
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(nodes.os, "open", spy)
+        scope = _scope_or_fail_on_fifo(home, fifo)
+        assert scope.notes == ("skills/s/pipe: not a regular file, not shipped",)
+        assert "SKILL.md" in opened
+        assert "pipe" not in opened
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="no FIFOs on Windows")
+    def test_a_file_swapped_for_a_fifo_after_the_stat_does_not_hang(
+        self, tmp_path, monkeypatch
+    ):
+        # The pre-read stat is made to lie (a regular file), so only the
+        # O_NONBLOCK open + fstat re-check stand between the walk and a
+        # forever-blocked open().
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/SKILL.md")
+        fifo = skills / "s" / "pipe"
+        os.mkfifo(fifo)
+        regular = skills / "s" / "SKILL.md"
+        real_stat = Path.stat
+
+        def lying_stat(self, *args, **kwargs):
+            target = regular if self == fifo else self
+            return real_stat(target, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", lying_stat)
+        scope = _scope_or_fail_on_fifo(home, fifo)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == ("skills/s/pipe: not a regular file, not shipped",)
+
+    def test_a_file_over_the_per_file_cap_is_not_read(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILL_FILE_MAX_BYTES", 4)
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/ok", b"1234")
+        _skill(skills, "s/big", b"12345")
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["s/ok"]
+        assert scope.notes == ("skills/s/big: larger than 4 bytes, not shipped",)
+
+    # A file the walk will not ship is a note: the walk goes on past it (the
+    # sorted walk meets s/big first), and anything raised fails by assertion.
+    def test_an_oversize_file_is_a_note_not_the_walks_end(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILL_FILE_MAX_BYTES", 4)
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/big", b"12345")
+        _skill(skills, "s/ok", b"1234")
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["s/ok"]
+
+    def test_the_file_cap_defaults_to_8_mib_and_reads_so(self, tmp_path, monkeypatch):
+        assert nodes.SKILL_FILE_MAX_BYTES == 8 * 1024 * 1024
+        monkeypatch.setattr(nodes, "SKILL_FILE_MAX_BYTES", 2 * 1024 * 1024)
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/big", b"x" * (2 * 1024 * 1024 + 1))
+        assert _walked(home).notes == ("skills/s/big: larger than 2 MiB, not shipped",)
+
+    def test_a_read_is_sized_by_the_file_not_the_cap(self, tmp_path, monkeypatch):
+        # A cap-sized read would try to allocate 1 TiB here and fail.
+        monkeypatch.setattr(nodes, "SKILL_FILE_MAX_BYTES", 1 << 40)
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/SKILL.md", b"# small\n")
+        scope = _walked(home)
+        assert scope.skills == (
+            nodes.SkillFile(path="s/SKILL.md", data=b"# small\n", executable=False),
+        )
+        assert scope.notes == ()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="no exec bit on Windows")
+    def test_the_exec_bit_is_read_off_the_file(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/run", b"no shebang\n")
+        (skills / "s" / "run").chmod(0o755)
+        _skill(skills, "s/SKILL.md", b"# plain\n")
+        assert [(f.path, f.executable) for f in _walked(home).skills] == [
+            ("s/SKILL.md", False),
+            ("s/run", True),
+        ]
+
+    @staticmethod
+    def _stats_say_one_byte(monkeypatch, grown: bytes) -> None:
+        """Both stats report 1 byte for the file holding ``grown``: it 'grew'
+        after them, so only reading on past the stat size sees the rest."""
+        real_path_stat = Path.stat
+        real_fstat = os.fstat
+
+        def shrink(st: os.stat_result) -> os.stat_result:
+            return os.stat_result((*st[:6], 1, *st[7:10]))
+
+        def path_stat(self, *args, **kwargs):
+            st = real_path_stat(self, *args, **kwargs)
+            return shrink(st) if self.name == "grow" else st
+
+        def fstat(fd):
+            st = real_fstat(fd)
+            return shrink(st) if st.st_size == len(grown) else st
+
+        monkeypatch.setattr(Path, "stat", path_stat)
+        monkeypatch.setattr(nodes.os, "fstat", fstat)
+
+    def test_a_file_that_grew_after_its_fstat_is_read_whole(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "SKILL_FILE_MAX_BYTES", 1 << 40)
+        monkeypatch.setattr(nodes, "_READ_CHUNK", 100)  # several chunks
+        grown = bytes(range(256)) * 3 + b"end"  # 771 bytes, a unique size
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/grow", grown)
+        self._stats_say_one_byte(monkeypatch, grown)
+        scope = _walked(home)
+        assert scope.skills == (
+            nodes.SkillFile(path="s/grow", data=grown, executable=False),
+        )
+
+    def test_a_file_that_grew_past_the_cap_is_still_refused(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "SKILL_FILE_MAX_BYTES", 4)
+        grown = bytes(range(256)) * 3 + b"end"
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/grow", grown)
+        self._stats_say_one_byte(monkeypatch, grown)
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == ("skills/s/grow: larger than 4 bytes, not shipped",)
+
+    @staticmethod
+    def _count_reads(monkeypatch) -> list[int]:
+        """Every byte count a skill file's ``read`` returns. The size check
+        refuses a too-big file either way; this pins that the read itself
+        stayed bounded."""
+        counts: list[int] = []
+        real_fdopen = os.fdopen
+
+        class Counting:
+            def __init__(self, f):
+                self.f = f
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.f.close()
+
+            def fileno(self):
+                return self.f.fileno()
+
+            def read(self, n=-1):
+                data = self.f.read(n)
+                counts.append(len(data))
+                return data
+
+        monkeypatch.setattr(
+            nodes.os, "fdopen", lambda *a, **k: Counting(real_fdopen(*a, **k))
+        )
+        return counts
+
+    @pytest.mark.parametrize(
+        ("fstat_lies", "expected"),
+        [
+            (True, 102),  # 2 bytes, then one 100-byte chunk takes it past 4
+            (False, 5),  # the real fstat size is clamped to the cap: 4 + 1
+        ],
+        ids=["grew-after-both-stats", "grew-after-the-path-stat-only"],
+    )
+    def test_a_grown_file_is_read_no_further_than_the_cap(
+        self, tmp_path, monkeypatch, fstat_lies, expected
+    ):
+        monkeypatch.setattr(nodes, "SKILL_FILE_MAX_BYTES", 4)
+        monkeypatch.setattr(nodes, "_READ_CHUNK", 100)
+        grown = bytes(range(256)) * 3 + b"end"  # 771 bytes
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/grow", grown)
+        if fstat_lies:
+            self._stats_say_one_byte(monkeypatch, grown)
+        else:
+            real_path_stat = Path.stat
+
+            def path_stat(self, *args, **kwargs):
+                st = real_path_stat(self, *args, **kwargs)
+                if self.name != "grow":
+                    return st
+                return os.stat_result((*st[:6], 1, *st[7:10]))
+
+            monkeypatch.setattr(Path, "stat", path_stat)
+        counts = self._count_reads(monkeypatch)
+        scope = _walked(home)
+        assert scope.notes == ("skills/s/grow: larger than 4 bytes, not shipped",)
+        assert sum(counts) == expected
+        assert sum(counts) <= nodes.SKILL_FILE_MAX_BYTES + nodes._READ_CHUNK + 1
+
+    # Read on in chunks after both stats said 1 byte, it lands EXACTLY on the
+    # cap: still past it, so never shipped truncated to the cap's length.
+    def test_a_grown_file_that_reaches_the_cap_exactly_is_never_shipped_truncated(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "SKILL_FILE_MAX_BYTES", 102)
+        monkeypatch.setattr(nodes, "_READ_CHUNK", 100)
+        grown = bytes(range(256)) * 3 + b"end"  # 771 bytes
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/grow", grown)
+        self._stats_say_one_byte(monkeypatch, grown)
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == ("skills/s/grow: larger than 102 bytes, not shipped",)
+
+    def test_the_running_total_is_capped_with_one_note(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_TOTAL_BYTES", 5)
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/a", b"123")
+        _skill(skills, "s/b", b"123")
+        _skill(skills, "s/c", b"12")  # a later, smaller file still fits
+        _skill(skills, "s/d", b"123")
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["s/a", "s/c"]
+        assert scope.notes == ("skills: 2 files past the 5 bytes total, not shipped",)
+
+    def test_one_file_past_the_total_reads_singular(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_TOTAL_BYTES", 3)
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/a", b"123")
+        _skill(skills, "s/b", b"1")
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["s/a"]
+        assert scope.notes == ("skills: 1 file past the 3 bytes total, not shipped",)
+
+    def test_a_file_past_the_total_is_never_read(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_TOTAL_BYTES", 5)
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/a", b"123")
+        _skill(skills, "s/b", b"1234")
+        _skill(skills, "s/c", b"12")
+        counts = self._count_reads(monkeypatch)
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["s/a", "s/c"]
+        assert counts == [3, 2]  # s/b was judged by its stat, never opened
+
+    def test_a_file_that_grew_past_the_total_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_TOTAL_BYTES", 100)
+        grown = bytes(range(256)) * 3 + b"end"
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/grow", grown)
+        self._stats_say_one_byte(monkeypatch, grown)
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == ("skills: 1 file past the 100 bytes total, not shipped",)
+
+    def test_the_walk_stops_at_the_entry_cap(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_ENTRIES", 3)
+        home, skills = _skills_home(tmp_path)
+        for name in ("a", "b", "c", "d", "e"):
+            _skill(skills, f"s/{name}")
+        scope = _walked(home)
+        # Entries counted: s, s/a, s/b -- the fourth stops the walk.
+        assert [f.path for f in scope.skills] == ["s/a", "s/b"]
+        assert scope.notes == (
+            (
+                "skills: more than 3 entries; the walk stopped there and the rest is "
+                "not shipped"
+            ),
+        )
+
+    # The cap is a ceiling, not a limit it must stay under: s, s/a, s/b is
+    # exactly 3 entries, and ships whole.
+    def test_a_tree_of_exactly_the_entry_cap_ships_whole(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_ENTRIES", 3)
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/a")
+        _skill(skills, "s/b")
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["s/a", "s/b"]
+        assert scope.notes == ()
+
+    def test_the_entry_cap_stops_a_linked_tree_too(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_ENTRIES", 4)
+        home, skills = _skills_home(tmp_path)
+        big = tmp_path / "big"
+        for i in range(50):
+            _skill(big, f"f{i:02}")
+        _link_dir(skills / "big", big)
+        _skill(skills, "zzz/SKILL.md")  # after the link: never reached
+        scope = _walked(home)
+        # A folder's entries count as it is listed: big, zzz, then big/f00
+        # and big/f01 -- big/f02 is the fifth.
+        assert [f.path for f in scope.skills] == ["big/f00", "big/f01"]
+        assert scope.notes == (
+            (
+                "skills: more than 4 entries; the walk stopped there and the rest is "
+                "not shipped"
+            ),
+        )
+
+    def test_a_folders_subfolders_count_before_its_files(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_ENTRIES", 3)
+        home, skills = _skills_home(tmp_path)
+        for rel in ("s/x/f", "s/a", "s/b", "s/c"):
+            _skill(skills, rel)
+        scope = _walked(home)
+        # s, then s/x, then s/a -- s/b is the fourth.
+        assert [f.path for f in scope.skills] == ["s/a"]
+
+    def test_an_entry_past_the_cap_is_not_even_judged(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_ENTRIES", 1)
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "a/SKILL.md")
+        _link_dir(skills / "z", home / ".ssh")  # would be a note of its own
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == (
+            (
+                "skills: more than 1 entries; the walk stopped there and the rest is "
+                "not shipped"
+            ),
+        )
+
+    # Folders that already fill the cap leave NO room for the files beside
+    # them -- never a negative slice that reads most of them anyway.
+    def test_files_beside_folders_that_fill_the_cap_are_never_read(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_ENTRIES", 1)
+        home, skills = _skills_home(tmp_path)
+        for rel in ("a/SKILL.md", "b/SKILL.md", "f1.md", "f2.md", "f3.md"):
+            _skill(skills, rel)
+        scope = _walked(home)
+        assert scope.skills == ()
+
+    def test_the_caps_default_to_64_mib_and_20000_entries(self):
+        assert nodes.SKILLS_MAX_TOTAL_BYTES == 64 * 1024 * 1024
+        assert nodes.SKILLS_MAX_ENTRIES == 20000
+
+
+class TestTheSkillsWalkKnowsASecretWhenItSeesOne:
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b"\xff\xfe" + "KEY=sk-ant-oat01-DECOY\r\n".encode("utf-16-le"),
+            b"\xfe\xff" + "KEY=sk-ant-oat01-DECOY\r\n".encode("utf-16-be"),
+            "KEY=sk-ant-oat01-DECOY\r\n".encode("utf-16-le"),
+        ],
+        ids=["utf-16-le-bom", "utf-16-be-bom", "utf-16-le-no-bom"],
+    )
+    def test_a_utf16_skill_file_holding_a_key_stays_behind(self, tmp_path, data):
+        # Windows PowerShell 5.1's `>` and Out-File write UTF-16LE.
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/SKILL.md")
+        _skill(skills, "s/env.txt", data)
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == (
+            "skills/s/env.txt: holds a Claude credential, never shipped",
+        )
+
+    # The credential scan cannot see an ssh key, a TLS key or a git token, so
+    # these FILE names never ship, at any depth and in any case.
+    def test_secret_file_names_never_ship_at_any_depth(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/SKILL.md")
+        for rel in (
+            "s/.netrc",
+            "s/.git-credentials",
+            "s/id_rsa",
+            "s/id_rsa.pub",
+            "s/deep/Id_Ed25519",
+            "s/tls/cert.PEM",
+        ):
+            _skill(skills, rel, b"SECRET-DECOY")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == tuple(
+            f"skills/{rel}: a secret-bearing name, never shipped"
+            for rel in (
+                "s/.git-credentials",
+                "s/.netrc",
+                "s/id_rsa",
+                "s/id_rsa.pub",
+                "s/deep/Id_Ed25519",
+                "s/tls/cert.PEM",
+            )
+        )
+        assert "DECOY" not in repr(scope)
+
+    @pytest.mark.parametrize("name", ["netrc", "my.netrc", "pem.md", "rsa_id"])
+    def test_a_name_that_only_resembles_one_ships(self, tmp_path, name):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, f"s/{name}")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == [f"s/{name}"]
+        assert scope.notes == ()
+
+    def test_a_secret_name_linked_to_an_innocent_one_stays_behind(self, tmp_path):
+        # A key kept under any name, linked in as id_rsa: the name says it.
+        home, skills = _skills_home(tmp_path)
+        keys = tmp_path / "dev" / "keys"
+        keys.mkdir(parents=True)
+        (keys / "work.txt").write_bytes(b"PRIVATE-KEY-DECOY")
+        _skill(skills, "s/SKILL.md")
+        _link_file(skills / "s" / "id_rsa", keys / "work.txt")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == ("skills/s/id_rsa: a secret-bearing name, never shipped",)
+        assert "DECOY" not in repr(scope)
+
+    def test_an_innocent_name_linked_to_a_secret_name_stays_behind(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        keys = tmp_path / "dev" / "keys"
+        keys.mkdir(parents=True)
+        (keys / "id_ed25519").write_bytes(b"PRIVATE-KEY-DECOY")
+        _skill(skills, "s/SKILL.md")
+        _link_file(skills / "s" / "key.txt", keys / "id_ed25519")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == (
+            "skills/s/key.txt: a secret-bearing name, never shipped",
+        )
+        assert "DECOY" not in repr(scope)
+
+    def test_a_name_holding_the_marker_is_never_echoed_nor_read(
+        self, tmp_path, monkeypatch
+    ):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "sk-ant-api03-DECOY/SKILL.md")
+        _skill(skills, "s/sk-ant-oat01-DECOY.md")
+        _skill(skills, "s/SKILL.md")
+        counts = TestTheSkillsWalkReadsOnlyBoundedRegularFiles._count_reads(monkeypatch)
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == (
+            "skills/(a name holding one): holds a Claude credential, never shipped",
+            "skills/(a name holding one): holds a Claude credential, never shipped",
+        )
+        assert "DECOY" not in repr(scope)
+        assert counts == [len(b"# skill\n")]  # only s/SKILL.md was opened
+
+    def test_a_dangling_link_is_a_note(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _link_file(skills / "gone", tmp_path / "nowhere")
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == (
+            "skills/gone: cannot be read (FileNotFoundError); not shipped",
+        )
+
+    def test_azure_is_a_secrets_folder(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/SKILL.md")
+        (home / ".azure").mkdir()
+        (home / ".azure" / "msal_token_cache.json").write_bytes(b"AZURE-DECOY")
+        _link_dir(skills / "az", home / ".azure")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == (
+            "skills/az: resolves into a secrets folder, not followed",
+        )
+        assert "DECOY" not in repr(scope)
+
+
+def _deny_listing(monkeypatch: pytest.MonkeyPatch, *denied: Path) -> None:
+    """``os.scandir`` -- what ``os.walk`` lists a folder with -- refuses
+    ``denied`` the way a folder this user may not read does."""
+    real = os.scandir
+    refused = {os.path.normcase(str(p)) for p in denied}
+
+    def scandir(path: str | os.PathLike[str] = ".") -> object:
+        if os.path.normcase(os.fspath(path)) in refused:
+            raise PermissionError(13, "Permission denied DECOY-ERRNO", os.fspath(path))
+        return real(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+
+
+def _deny_opening(monkeypatch: pytest.MonkeyPatch, *denied: Path) -> None:
+    """``os.open`` -- what ``_read_skill`` opens a skill file with -- refuses
+    ``denied`` the way a file this user may not read does."""
+    real = os.open
+    refused = {os.path.normcase(str(p)) for p in denied}
+
+    def fake_open(path: str | os.PathLike[str], *args: int, **kwargs: int) -> int:
+        if os.path.normcase(os.fspath(path)) in refused:
+            raise PermissionError(13, "Permission denied DECOY-ERRNO", os.fspath(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", fake_open)
+
+
+def _deny_stat(monkeypatch: pytest.MonkeyPatch, *denied: Path) -> None:
+    """``os.stat`` refuses ``denied`` the way a path this user may not reach
+    does (a mode-0 parent, a share that went away). ``Path.is_dir`` asks
+    through it on 3.13 and raises; 3.14's asks ``os.path.isdir``, which
+    swallows the error and says False -- so the seam, unlike a scandir one,
+    sees both ends of that."""
+    real = os.stat
+    refused = {os.path.normcase(str(p)) for p in denied}
+
+    def fake_stat(path: str | os.PathLike[str], *args: object, **kwargs: object):
+        if os.path.normcase(os.fspath(path)) in refused:
+            raise PermissionError(13, "Permission denied DECOY-ERRNO", os.fspath(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", fake_stat)
+
+
+# An unreadable folder or file in the skills walk is neither fatal nor silent:
+# one note each, naming only the error's class (never the OS's text); the full
+# error is in nodes.log; the rest of the walk goes on.
+class TestAnUnreadableSkillsFolderIsNamedNotFatal:
+    def test_one_note_per_folder_and_the_walk_goes_on(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        home, skills = _skills_home(tmp_path)
+        for rel in ("a/SKILL.md", "b/x/f.md", "b/y/g.md", "c/SKILL.md"):
+            _skill(skills, rel)
+        _deny_listing(monkeypatch, skills / "b" / "x", skills / "c")
+        caplog.set_level("WARNING", logger="nodes")
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["a/SKILL.md", "b/y/g.md"]
+        assert scope.notes == (
+            "skills/b/x: cannot be read (PermissionError); not shipped",
+            "skills/c: cannot be read (PermissionError); not shipped",
+        )
+        assert "DECOY-ERRNO" not in repr(scope)
+        logged = [
+            r.getMessage() for r in caplog.records if "DECOY-ERRNO" in r.getMessage()
+        ]
+        assert len(logged) == 2
+        assert all(r.levelname == "WARNING" for r in caplog.records)
+
+    def test_an_unreadable_skills_folder_itself_is_one_note(
+        self, tmp_path, monkeypatch
+    ):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "a/SKILL.md")
+        _deny_listing(monkeypatch, skills)
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == ("skills: cannot be read (PermissionError); not shipped",)
+
+    # A skills folder that cannot even be stat'd is an unknown, not "this PC
+    # has no skills": the same one note, the rest of the scope still read.
+    def test_a_skills_folder_that_cannot_be_stat_ed_is_one_note(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "a/SKILL.md")
+        _write_json(home / ".claude" / "settings.json", {"model": "opus"})
+        _deny_stat(monkeypatch, skills)
+        caplog.set_level("WARNING", logger="nodes")
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == ("skills: cannot be read (PermissionError); not shipped",)
+        assert scope.settings == {"model": "opus"}
+        assert "DECOY-ERRNO" not in repr(scope)
+        logged = [r for r in caplog.records if "DECOY-ERRNO" in r.getMessage()]
+        assert [r.levelname for r in logged] == ["WARNING"]
+        assert logged[0].getMessage().startswith("skills: ")
+
+    # The other side of that line: a skills folder that is not there is
+    # absent, with no note -- a ~/.claude that is a file (POSIX's stat says
+    # ENOTDIR, Windows' says FileNotFoundError) or a skills that is a file.
+    def test_a_claude_that_is_a_file_has_no_skills_folder(self, tmp_path):
+        home = _pc_home(tmp_path)
+        (home / ".claude").write_bytes(b"not a folder")
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert [n for n in scope.notes if n.startswith("skills")] == []
+
+    def test_a_skills_file_is_no_skills_folder(self, tmp_path):
+        home = _pc_home(tmp_path)
+        _skill(home, ".claude/skills", b"a file")
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == ()
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="a mode-0 folder: POSIX, and root reads it anyway",
+    )
+    @pytest.mark.parametrize("how", ["behind-a-mode-0-folder", "itself-mode-0"])
+    def test_a_real_skills_folder_it_may_not_read(self, tmp_path, how):
+        home, skills = _skills_home(tmp_path)
+        if how == "itself-mode-0":
+            _skill(skills, "s/SKILL.md")
+            locked = skills
+        else:
+            locked = tmp_path / "locked"
+            _skill(locked, "sub/s/SKILL.md")
+            skills.rmdir()
+            _link_dir(skills, locked / "sub")
+        locked.chmod(0)
+        try:
+            scope = _walked(home)
+        finally:
+            locked.chmod(0o700)
+        assert scope.skills == ()
+        assert scope.notes == ("skills: cannot be read (PermissionError); not shipped",)
+
+    # A skills link that loops on itself cannot be stat'd (ELOOP, a plain
+    # OSError), and pathlib reads that as absent: it is an unknown all the
+    # same, never "this PC has no skills".
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+    def test_a_skills_link_that_loops_on_itself_is_one_note(self, tmp_path, caplog):
+        home, skills = _skills_home(tmp_path)
+        skills.rmdir()
+        skills.symlink_to(skills)
+        caplog.set_level("WARNING", logger="nodes")
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == ("skills: cannot be read (OSError); not shipped",)
+        logged = [r for r in caplog.records if r.getMessage().startswith("skills: ")]
+        assert [r.levelname for r in logged] == ["WARNING"]
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="a mode-0 folder: POSIX, and root reads it anyway",
+    )
+    def test_a_real_mode_0_folder(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "a/SKILL.md")
+        _skill(skills, "locked/SKILL.md")
+        (skills / "locked").chmod(0)
+        try:
+            scope = _walked(home)
+        finally:
+            (skills / "locked").chmod(0o700)
+        assert [f.path for f in scope.skills] == ["a/SKILL.md"]
+        assert scope.notes == (
+            "skills/locked: cannot be read (PermissionError); not shipped",
+        )
+
+    def test_an_unreadable_file_is_one_note_and_the_rest_ships(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        home, skills = _skills_home(tmp_path)
+        for rel in ("a/SKILL.md", "b/SKILL.md", "b/locked.md"):
+            _skill(skills, rel)
+        _deny_opening(monkeypatch, skills / "b" / "locked.md")
+        caplog.set_level("WARNING", logger="nodes")
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["a/SKILL.md", "b/SKILL.md"]
+        assert scope.notes == (
+            "skills/b/locked.md: cannot be read (PermissionError); not shipped",
+        )
+        assert "DECOY-ERRNO" not in repr(scope)
+        logged = [r for r in caplog.records if "DECOY-ERRNO" in r.getMessage()]
+        assert [r.levelname for r in logged] == ["WARNING"]
+        assert logged[0].getMessage().startswith("skills/b/locked.md: ")
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="a mode-0 file: POSIX, and root reads it anyway",
+    )
+    def test_a_real_mode_0_file(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "a/SKILL.md")
+        _skill(skills, "a/locked.md")
+        (skills / "a" / "locked.md").chmod(0)
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["a/SKILL.md"]
+        assert scope.notes == (
+            "skills/a/locked.md: cannot be read (PermissionError); not shipped",
+        )
+
+
+def _odd_named_or_skip(path: Path) -> Path:
+    """A skill file at ``path``, whose name holds a lone surrogate -- or a
+    skip where the filesystem refuses such a name (APFS takes UTF-8 only)."""
+    try:
+        _skill(path.parent.parent, f"{path.parent.name}/{path.name}")
+    except (OSError, UnicodeError):
+        pytest.skip("this filesystem refuses a name that is not Unicode")
+    return path
+
+
+# A walked name is the disk's, not ours: on Linux a byte that is not UTF-8
+# decodes to a lone surrogate, and NTFS stores unpaired UTF-16 halves as they
+# are. Strict UTF-8 cannot write one -- the record it rides in must still
+# reach nodes.log, through the REAL handler, with nothing on stderr.
+class TestAWalkedNameThatIsNotUnicodeStillReachesTheLog:
+    def test_an_unreadable_file_so_named_is_logged_escaped(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        assert Path.home() == tmp_path.parent / f"{tmp_path.name}-home"
+        assert log.LOG_DIR.is_relative_to(tmp_path)
+        log.get_logger("nodes")  # the real file handler, under the tmp LOG_DIR
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "a/SKILL.md")
+        odd = _odd_named_or_skip(skills / "b" / "caf\udce9.md")
+        _deny_opening(monkeypatch, odd)
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["a/SKILL.md"]
+        path = log.LOG_DIR / "nodes.log"
+        logged = path.read_text(encoding="utf-8") if path.exists() else ""
+        assert "skills/b/caf\\udce9.md: " in logged
+        assert "WARNING" in logged
+        assert "Logging error" not in capsys.readouterr().err
+
+
+ENV_NOTE = "skills/{}: an env file, shipped -- make sure it holds no secret"
+
+
+# Two cautions that never stop a file: it ships verbatim, with a note in our
+# words. A `#!` line ending in CR names an interpreter ("bash\r") the node
+# cannot exec.
+class TestASkillFileIsShippedWithACaution:
+    def test_a_crlf_shebang_ships_verbatim_with_a_note(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        data = b"#!/usr/bin/env bash\r\necho hi\r\n"
+        _skill(skills, "s/run.sh", data)
+        scope = nodes.user_scope(home)
+        assert scope.skills == (
+            nodes.SkillFile(path="s/run.sh", data=data, executable=True),
+        )
+        assert scope.notes == (
+            "skills/s/run.sh: CRLF line endings; will not run on a node",
+        )
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b"# notes\r\nfrom Windows\r\n",  # CRLF, but nothing runs it
+            b"#!/usr/bin/env bash\necho hi\n",  # a shebang, LF
+            b"echo\r\n#!/bin/sh\r\n",  # a `#!` that is not the first line
+            b"#!/bin/sh\necho hi\r\n",  # only the `#!` line names what is exec'd
+        ],
+        ids=[
+            "crlf-markdown",
+            "lf-shebang",
+            "shebang-not-first",
+            "lf-shebang-crlf-body",
+        ],
+    )
+    def test_no_note_when_nothing_would_exec_a_cr(self, tmp_path, data):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/f", data)
+        scope = nodes.user_scope(home)
+        assert [f.data for f in scope.skills] == [data]
+        assert scope.notes == ()
+
+    # An env file ships -- a skill may need one -- but the credential scan
+    # only knows Claude's keys, so the user is told to look. "Env file" is the
+    # push set's rule (nodes._is_env_file), one policy.
+    def test_an_env_file_ships_with_a_note(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/.env.local", b"PORT=1\n")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/.env.local"]
+        assert scope.notes == (ENV_NOTE.format("s/.env.local"),)
+
+    @pytest.mark.parametrize("name", [".envrc", "env.txt", "x.env", ".environment"])
+    def test_only_the_push_sets_env_names_are_noted(self, tmp_path, name):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, f"s/{name}", b"PORT=1\n")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == [f"s/{name}"]
+        assert scope.notes == ()
+
+    # By either name: the one it ships under, or the one its link resolves to.
+    # The note is our words and the skills path; where the link resolves is
+    # in nodes.log only.
+    def test_a_link_to_an_env_file_is_noted_and_logged(self, tmp_path, caplog):
+        home, skills = _skills_home(tmp_path)
+        real = tmp_path / "project" / ".env"
+        real.parent.mkdir()
+        real.write_bytes(b"PORT=1\n")
+        (skills / "s").mkdir()
+        _link_file(skills / "s" / "config", real)
+        caplog.set_level("WARNING", logger="nodes")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/config"]
+        assert scope.notes == (ENV_NOTE.format("s/config"),)
+        assert "project" not in repr(scope.notes)
+        logged = [r.getMessage() for r in caplog.records if "project" in r.getMessage()]
+        assert len(logged) == 1
+        assert logged[0].startswith("skills/s/config")
+
+    def test_an_env_named_link_to_another_file_is_noted(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        real = tmp_path / "project" / "vars.txt"
+        real.parent.mkdir()
+        real.write_bytes(b"PORT=1\n")
+        (skills / "s").mkdir()
+        _link_file(skills / "s" / ".env", real)
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/.env"]
+        assert scope.notes == (ENV_NOTE.format("s/.env"),)
+
+
+GONE_NOTE = "skills/bar/gone.md: cannot be read (FileNotFoundError); not shipped"
+
+
+# What the SENDER does with a link -- ~/.claude/skills/foo -> ~/repos/foo, or a
+# file linked inside a skill -- and with two hard-linked files: it reads each
+# path's CONTENT. Every skill reaches the payload as its own regular-file
+# member, never a link or hard-link member, so node_apply's _off_contract
+# (which refuses the whole payload on either) never meets one from a real PC.
+# A link that cannot be read as a regular file stays behind with a note.
+class TestALinkedSkillShipsAsItsContent:
+    @staticmethod
+    def _linked(tmp_path: Path) -> Path:
+        home, skills = _skills_home(tmp_path)
+        repo = tmp_path / "repos" / "foo"
+        _skill(repo, "SKILL.md", b"# foo\n")
+        _skill(repo, "run.sh", b"#!/bin/sh\necho foo\n")
+        _link_dir(skills / "foo", repo)
+        shared = tmp_path / "repos" / "shared.md"
+        shared.write_bytes(b"shared\n")
+        _skill(skills, "bar/SKILL.md", b"# bar\n")
+        _link_file(skills / "bar" / "lib.md", shared)
+        return home
+
+    @staticmethod
+    def _every_kind(tmp_path: Path) -> Path:
+        """``_linked``, plus two hard-linked files in one skill (a pnpm-style
+        store) and a dangling link."""
+        home = TestALinkedSkillShipsAsItsContent._linked(tmp_path)
+        bar = home / ".claude" / "skills" / "bar"
+        _skill(bar, "tool.js", b"tool\n")
+        os.link(bar / "tool.js", bar / "tool-copy.js")
+        _link_file(bar / "gone.md", tmp_path / "nowhere")
+        return home
+
+    def test_every_kind_reaches_the_payload_as_regular_members(self, tmp_path):
+        scope = nodes.user_scope(self._every_kind(tmp_path))
+        assert scope.notes == (GONE_NOTE,)
+        payload = remote_mux.build_payload(
+            scope, gh_token=None, gh_login=None, state_hook=HOOK_TEXT
+        )
+        with tarfile.open(
+            fileobj=io.BytesIO(payload.partition(b"\n")[2]), mode="r:gz"
+        ) as tar:
+            members = tar.getmembers()
+            # Regular members only -- not even a folder one: tar makes the
+            # folders. Checked before any is read: tarfile resolves a link
+            # member's target on extractfile.
+            assert {m.type for m in members} == {tarfile.REGTYPE}
+            data: dict[str, bytes] = {}
+            for m in members:
+                blob = tar.extractfile(m)
+                assert blob is not None  # a regular file has content to extract
+                data[m.name] = blob.read()
+        assert data["skills/bar/tool.js"] == b"tool\n"
+        assert data["skills/bar/tool-copy.js"] == b"tool\n"
+        assert data["skills/bar/lib.md"] == b"shared\n"
+        assert "skills/bar/gone.md" not in data
+
+    def test_every_skill_member_of_the_payload_is_a_regular_file(self, tmp_path):
+        scope = nodes.user_scope(self._linked(tmp_path))
+        assert scope.notes == ()
+        payload = remote_mux.build_payload(
+            scope, gh_token=None, gh_login=None, state_hook=HOOK_TEXT
+        )
+        with tarfile.open(
+            fileobj=io.BytesIO(payload.partition(b"\n")[2]), mode="r:gz"
+        ) as tar:
+            members = [m for m in tar.getmembers() if m.name.startswith("skills/")]
+            assert all(m.isreg() for m in members)  # before extractfile follows one
+            data: dict[str, bytes] = {}
+            for m in members:
+                blob = tar.extractfile(m)
+                assert blob is not None  # a regular file has content to extract
+                data[m.name] = blob.read()
+        assert [m.name for m in members] == [
+            "skills/bar/SKILL.md",
+            "skills/bar/lib.md",
+            "skills/foo/SKILL.md",
+            "skills/foo/run.sh",
+        ]
+        assert data["skills/bar/lib.md"] == b"shared\n"
+        assert data["skills/foo/run.sh"] == b"#!/bin/sh\necho foo\n"
+
+    def test_a_link_to_itself_is_a_note(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/SKILL.md")
+        _link_file(skills / "s" / "loop", skills / "s" / "loop")
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert len(scope.notes) == 1
+        # The class differs by OS (ELOOP is a bare OSError); the words do not.
+        assert re.fullmatch(
+            r"skills/s/loop: cannot be read \(\w+\); not shipped", scope.notes[0]
+        )
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs")
+    def test_a_link_to_a_fifo_is_a_note_and_never_opened(self, tmp_path):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/SKILL.md")
+        fifo = tmp_path / "pipe"
+        os.mkfifo(fifo)
+        _link_file(skills / "s" / "p", fifo)
+        scope = _scope_or_fail_on_fifo(home, fifo)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == ("skills/s/p: not a regular file, not shipped",)
+
+
+CLAUDE_ELSEWHERE = "links into ~/.claude outside the skills folder, not followed"
+ROOT_IN_CLAUDE = "resolves into ~/.claude outside ~/.claude/skills, not shipped"
+
+
+# ~/.claude holds session transcripts (projects/), history and the login --
+# never a skill. A link from skills into any of it is pruned, a folder or one
+# file: defence in depth beside the secrets folders (ruling A), not
+# containment -- a link anywhere else still ships.
+class TestTheSkillsWalkNeverReadsTheRestOfClaude:
+    @staticmethod
+    def _claude_home(tmp_path: Path) -> tuple[Path, Path]:
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/SKILL.md")
+        _skill(home / ".claude", "projects/p/session.jsonl", b"TRANSCRIPT-DECOY")
+        _skill(home / ".claude", "history.jsonl", b"HISTORY-DECOY")
+        return home, skills
+
+    def test_a_link_to_the_transcripts_is_pruned_with_a_warning(self, tmp_path, caplog):
+        home, skills = self._claude_home(tmp_path)
+        _link_dir(skills / "p", home / ".claude" / "projects")
+        caplog.set_level("WARNING")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == (f"skills/p: {CLAUDE_ELSEWHERE}",)
+        assert "skills/p resolves to" in caplog.text
+        assert "DECOY" not in repr(scope)
+
+    def test_a_linked_file_from_claude_is_pruned(self, tmp_path):
+        home, skills = self._claude_home(tmp_path)
+        _link_file(skills / "s" / "h.md", home / ".claude" / "history.jsonl")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == (f"skills/s/h.md: {CLAUDE_ELSEWHERE}",)
+        assert "DECOY" not in repr(scope)
+
+    def test_a_skills_folder_that_is_a_link_into_claude_ships_nothing(self, tmp_path):
+        home = _pc_home(tmp_path)
+        _skill(home / ".claude", "projects/p/session.jsonl", b"TRANSCRIPT-DECOY")
+        _link_dir(home / ".claude" / "skills", home / ".claude" / "projects")
+        scope = nodes.user_scope(home)
+        assert scope.skills == ()
+        assert scope.notes == (f"skills: {ROOT_IN_CLAUDE}",)
+
+    # Even a sibling that holds real skills (~/.claude/skills-v2): anywhere in
+    # ~/.claude but its own skills folder is refused, and never silently. The
+    # note is our words and the why; the path is in nodes.log only.
+    def test_a_skills_folder_linked_to_a_sibling_says_why_and_logs_where(
+        self, tmp_path, caplog
+    ):
+        home = _pc_home(tmp_path)
+        _skill(home / ".claude", "skills-v2/s/SKILL.md")
+        _link_dir(home / ".claude" / "skills", home / ".claude" / "skills-v2")
+        caplog.set_level("WARNING", logger="nodes")
+        scope = nodes.user_scope(home)
+        assert scope.skills == ()
+        assert scope.notes == (f"skills: {ROOT_IN_CLAUDE}",)
+        assert "skills-v2" not in repr(scope.notes)
+        logged = [r for r in caplog.records if "skills-v2" in r.getMessage()]
+        assert [r.levelname for r in logged] == ["WARNING"]
+        assert "outside ~/.claude/skills" in logged[0].getMessage()
+
+    # Both sides resolved: with ~/.claude a junction elsewhere (OneDrive
+    # setups), the transcripts it points at are still recognised, and its own
+    # skills folder still ships.
+    def test_a_claude_folder_that_is_itself_a_link_is_still_recognised(self, tmp_path):
+        home = _pc_home(tmp_path)
+        real_claude = tmp_path / "synced" / "claude"
+        _skill(real_claude, "skills/s/SKILL.md")
+        _skill(real_claude, "projects/p/session.jsonl", b"TRANSCRIPT-DECOY")
+        _link_dir(home / ".claude", real_claude)
+        _link_dir(real_claude / "skills" / "p", real_claude / "projects")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["s/SKILL.md"]
+        assert scope.notes == (f"skills/p: {CLAUDE_ELSEWHERE}",)
+
+    def test_a_link_within_the_skills_folder_still_ships(self, tmp_path):
+        home, skills = self._claude_home(tmp_path)
+        _link_dir(skills / "alias", skills / "s")
+        scope = nodes.user_scope(home)
+        assert [f.path for f in scope.skills] == ["alias/SKILL.md"]
+        assert scope.notes == ()
+
+
 class TestUserScopeDigests:
     def test_every_item_has_a_digest(self):
         assert set(_scope().digests()) == {
@@ -1791,6 +3071,34 @@ class TestUserScopeDigests:
 
     def test_notes_are_not_content(self):
         assert _scope(notes=("x",)).digests() == _scope().digests()
+
+    def test_the_digests_of_a_fixed_scope_are_pinned(self):
+        # node_apply compares these against its store: a changed recipe
+        # re-applies every item on every node, so the recipe is pinned here.
+        scope = _scope(
+            settings={"model": "opus"},
+            mcp_servers={"docs": {"type": "http", "url": "https://d.example/mcp"}},
+            mcp_oauth={"docs|0": {"serverName": "docs", "accessToken": "a"}},
+            plugins=("p@m",),
+            marketplaces={"m": "o/r"},
+            skills=(
+                nodes.SkillFile(path="s/SKILL.md", data=b"hi\n", executable=False),
+            ),
+        )
+        assert scope.digests() == {
+            "settings": "3b6166240df66a70606cf24065eb39d43048ce465a20deb9a7f65f070e0a674f",
+            "mcp": "dfa62cd94f1032a3199bf6e40bf7681d825a23078b904a69c6278d30a8e0e809",
+            "mcp_oauth": "b2b19799465ba10dd77c783cc3eacf7a11af103fe57791e1e23b068f0eef1917",
+            "plugins": "85b832210adf34d3128cac1730d9be0882d43ca2b8590b2a412ade40c8cee3d8",
+            "skills": "451484a8c8fc1af1ef8995411aaf485ef15f4aec1e192236008f33ef9e80b4d2",
+        }
+
+    def test_flipping_the_exec_bit_changes_the_skills_digest(self):
+        def digest(executable: bool) -> str:
+            skill = nodes.SkillFile(path="s/run.sh", data=b"x", executable=executable)
+            return _scope(skills=(skill,)).digests()["skills"]
+
+        assert digest(True) != digest(False)
 
 
 NODE = Node(nick="second", host="devino-second", user="amin", root="~/magent")
@@ -3424,6 +4732,37 @@ class TestProvisionShUnderRealBash:
             home / ".claude" / "skills" / "s" / "run.sh"
         ).stat().st_mode & 0o777 == 0o700
 
+    # Every kind of link a PC's skills folder holds -- a folder linked in from
+    # outside ~/.claude, a file linked inside a skill, two hard-linked files, a
+    # dangling link -- through the REAL sender, tar and applier: nothing is
+    # refused whole (_off_contract passes), every file lands plain and alone on
+    # its inode, and the dangling link stayed behind with its class-only note.
+    def test_every_kind_of_link_lands_as_plain_files(self, tmp_path):
+        home = TestALinkedSkillShipsAsItsContent._every_kind(tmp_path)
+        scope = nodes.user_scope(home)
+        assert scope.notes == (GONE_NOTE,)
+        r = _run_provision(tmp_path, _node_payload(scope))
+        assert r.returncode == 0, r.stdout + r.stderr
+        rows = _rows(r)
+        assert "payload" not in rows
+        assert rows["skills"] == "did"
+        landed = tmp_path / "node" / ".claude" / "skills"
+        files = sorted(p for p in landed.rglob("*") if not p.is_dir())
+        assert [p.relative_to(landed).as_posix() for p in files] == [
+            "bar/SKILL.md",
+            "bar/lib.md",
+            "bar/tool-copy.js",
+            "bar/tool.js",
+            "foo/SKILL.md",
+            "foo/run.sh",
+        ]
+        for p in files:
+            assert not p.is_symlink(), p
+            assert p.stat().st_nlink == 1, p
+        assert (landed / "bar" / "lib.md").read_bytes() == b"shared\n"
+        assert (landed / "bar" / "tool-copy.js").read_bytes() == b"tool\n"
+        assert (landed / "foo" / "run.sh").read_bytes() == b"#!/bin/sh\necho foo\n"
+
     def test_the_token_reaches_gh_on_stdin_and_no_argv(self, tmp_path):
         gh = make_fake_ssh(tmp_path, name="gh")
         _run_provision(tmp_path, _node_payload(token=TOKEN), fakes=(gh,))
@@ -3487,8 +4826,9 @@ class TestProvisionShUnderRealBash:
         )
         r = _run_provision(tmp_path, payload)
         assert r.returncode == 1
-        assert _rows(r)["skills"] == "fail"
-        assert "the payload's skills/s/leak.md is a link" in r.stdout.decode("utf-8")
+        assert _rows(r) == {"payload": "fail"}
+        out = r.stdout.decode("utf-8")
+        assert "a link or a special file ('skills/s/leak.md')" in out
         assert not (node / ".claude" / "skills").exists()
         assert (node / "decoy.txt").read_bytes() == b"NODE-PRIVATE\n"
 
@@ -3499,7 +4839,7 @@ class TestProvisionShUnderRealBash:
         payload = _with_members(_node_payload(), _member("skills", link=str(private)))
         r = _run_provision(tmp_path, payload)
         assert r.returncode == 1
-        assert _rows(r)["skills"] == "fail"
+        assert _rows(r) == {"payload": "fail"}
         assert not (tmp_path / "node" / ".claude" / "skills").exists()
 
     def test_no_python3_is_one_fail_row_naming_the_repair(self, tmp_path):
@@ -3696,6 +5036,101 @@ class TestProvisionShUnderRealBash:
         hook = home / ".magent" / "bin" / "state-hook.sh"
         assert hook.read_text(encoding="utf-8") == HOOK_TEXT
         assert list((tmp_path / "tmp").iterdir()) == []
+
+
+def _hostile_payload(extra: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
+    """A real payload (one skill) with ``extra`` members appended after
+    build_payload's own: what a corrupt or hostile archive would carry."""
+    skill = nodes.SkillFile(path="s/SKILL.md", data=b"# s\n", executable=False)
+    token_line, _, archive = _node_payload(_scope(skills=(skill,))).partition(b"\n")
+    raw = io.BytesIO()
+    with (
+        tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as src,
+        tarfile.open(fileobj=raw, mode="w:gz", format=tarfile.PAX_FORMAT) as out,
+    ):
+        for info in src.getmembers():
+            out.addfile(info, src.extractfile(info))
+        for info, data in extra:
+            out.addfile(info, io.BytesIO(data) if data is not None else None)
+    return token_line + b"\n" + raw.getvalue()
+
+
+def _file_member(name: str) -> tuple[tarfile.TarInfo, bytes]:
+    info = tarfile.TarInfo(name)
+    info.size, info.mode = len(b"ESCAPED"), 0o600
+    return info, b"ESCAPED"
+
+
+def _link_member(name: str, target: str, kind: bytes) -> tuple[tarfile.TarInfo, None]:
+    info = tarfile.TarInfo(name)
+    info.type, info.linkname, info.mode = kind, target, 0o777
+    return info, None
+
+
+# (id, the extra members given tmp_path). The work dir provision.sh unpacks
+# into is tmp_path/tmp/<mktemp>, so "../../../" from skills/ is tmp_path.
+HOSTILE_MEMBERS = [
+    ("dotdot-name", lambda t: [_file_member("skills/../../escape.md")]),
+    ("absolute-name", lambda t: [_file_member(str(t / "escape.md"))]),
+    (
+        "symlink-file-outside",
+        lambda t: [
+            _link_member(
+                "skills/s/leak.md", str(t / "outside" / "secret.md"), tarfile.SYMTYPE
+            )
+        ],
+    ),
+    (
+        "absolute-symlink-folder-then-a-write-through-it",
+        lambda t: [
+            _link_member("skills/t", str(t / "outside"), tarfile.SYMTYPE),
+            _file_member("skills/t/escape.md"),
+        ],
+    ),
+    (
+        "relative-symlink-folder-then-a-write-through-it",
+        lambda t: [
+            _link_member("skills/t", "../../../outside", tarfile.SYMTYPE),
+            _file_member("skills/t/escape.md"),
+        ],
+    ),
+    (
+        "hardlink-outside",
+        lambda t: [
+            _link_member(
+                "skills/s/hl.md", str(t / "outside" / "secret.md"), tarfile.LNKTYPE
+            )
+        ],
+    ),
+    (
+        "hardlink-inside",
+        lambda t: [_link_member("skills/s/hl.md", "settings.json", tarfile.LNKTYPE)],
+    ),
+]
+
+
+# The receiver side of the payload contract, through the real tar: whatever a
+# member's name or link says, nothing lands or links outside the private work
+# dir, and a payload carrying such a member applies NOTHING (one fail row).
+@POSIX_BASH
+class TestAPayloadMemberNeverReachesOutsideTheWorkDir:
+    @pytest.mark.parametrize(
+        "build", [b for _, b in HOSTILE_MEMBERS], ids=[i for i, _ in HOSTILE_MEMBERS]
+    )
+    def test_it_is_refused_whole_and_nothing_escapes(self, tmp_path, build):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.md").write_bytes(b"NODE-SECRET-DECOY")
+        r = _run_provision(tmp_path, _hostile_payload(build(tmp_path)))
+        assert r.returncode == 1, r.stdout
+        assert _rows(r) == {"payload": "fail"}
+        assert [p.name for p in outside.iterdir()] == ["secret.md"]
+        assert (outside / "secret.md").read_bytes() == b"NODE-SECRET-DECOY"
+        assert (outside / "secret.md").stat().st_nlink == 1
+        assert list(tmp_path.rglob("escape.md")) == []
+        assert list((tmp_path / "node").iterdir()) == []
+        assert list((tmp_path / "tmp").iterdir()) == []
+        assert b"NODE-SECRET-DECOY" not in r.stdout + r.stderr
 
 
 @POSIX_BASH

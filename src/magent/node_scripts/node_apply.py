@@ -144,19 +144,31 @@ def _say(line: str) -> bool:
     return True
 
 
+def _printable(line: str) -> str:
+    """``line`` with what UTF-8 cannot carry escaped as ``\\udcXX``: a lone
+    surrogate, which is how Python reads a name off a disk whose bytes are
+    not UTF-8, or a ``"\\udce9"`` out of a JSON file. provision.sh runs this
+    under PYTHONIOENCODING=utf-8, which is strict: one left raw in a row
+    raises out of ``_say`` and fails the whole step instead of printing its
+    row. Anything UTF-8 can carry (``café``) is unchanged."""
+    return line.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def _row(ctx: Ctx, status: str, item: str, detail: str = "") -> None:
     """One status<TAB>item<TAB>detail line; the detail is flattened onto it,
     and the gh token and any URL's userinfo and query are masked out of it --
     the backstop. The row itself is never cut, so a repair hint after a tool's
     output always survives: only the tool's fragment is cut, by ``_last``,
     which masks both itself before it cuts -- so no cut can split a secret
-    before a mask sees it."""
+    before a mask sees it. Every row goes through ``_printable`` here, so no
+    name a row carries -- off a disk or out of the payload -- can fail it."""
     if ctx.token:
         detail = detail.replace(ctx.token, _MASK)
     detail = _unauth(detail)
     ctx.rows.append(status)
     if not ctx.quiet:
-        ctx.quiet = not _say(f"{status}\t{item}\t{' '.join(detail.split())}\n")
+        line = f"{status}\t{item}\t{' '.join(detail.split())}\n"
+        ctx.quiet = not _say(_printable(line))
 
 
 def _digest(ctx: Ctx, item: str) -> str:
@@ -1083,23 +1095,6 @@ def _link_on_the_way(dest_root: Path, dest: Path) -> Path | None:
     return None
 
 
-def _not_plain(root: Path) -> str | None:
-    """The payload name of the first entry under the unpacked ``skills/`` --
-    ``root`` itself included -- that is a link or anything but a folder or a
-    regular file; None when there is none. build_payload ships regular files
-    only, and provision.sh's tar refuses a member that climbs out with
-    ``..``. But tar extracts a link member as a link, and ``is_file`` would
-    read the node's own file through it into ~/.claude/skills."""
-    if root.is_symlink():
-        return "skills"
-    if not root.is_dir():
-        return None
-    for path in sorted(root.rglob("*")):
-        if path.is_symlink() or not (path.is_dir() or path.is_file()):
-            return "skills/" + path.relative_to(root).as_posix()
-    return None
-
-
 def _step_skills(ctx: Ctx) -> None:
     """This PC's ~/.claude/skills files onto the node's, exec bit kept. One
     way, like settings: a skill removed on the PC stays here. Each file goes
@@ -1107,20 +1102,8 @@ def _step_skills(ctx: Ctx) -> None:
     never written through. A symlinked DIRECTORY is refused instead -- a
     write below it would land outside ~/.claude/skills: ~/.claude/skills
     itself a link leaves the whole step alone, and a link anywhere inside a
-    skill leaves that whole skill alone. Either is a warn naming the link.
-
-    The payload side is checked too (``_not_plain``): a link or special file
-    in the unpacked ``skills/`` fails the step and applies nothing."""
+    skill leaves that whole skill alone. Either is a warn naming the link."""
     root = ctx.work / "skills"
-    odd = _not_plain(root)
-    if odd is not None:
-        _row(
-            ctx,
-            "fail",
-            "skills",
-            f"the payload's {odd} is a link or special file; nothing applied",
-        )
-        return
     files = sorted(p for p in root.rglob("*") if p.is_file()) if root.is_dir() else []
     if not files:
         _row(ctx, "skip", "skills", "this PC has no skills to share")
@@ -1375,11 +1358,64 @@ STEPS: tuple[tuple[str, Callable[[Ctx], None]], ...] = (
 )
 
 
+# What remote_mux.build_payload puts at the top of the archive (pinned equal to
+# it by tests/unit/test_node_apply.py); everything else lives under skills/.
+PAYLOAD_FILES = frozenset(
+    {
+        "manifest.json",
+        "mcp_oauth.json",
+        "mcp_servers.json",
+        "node_apply.py",
+        "settings.json",
+        "state-hook.sh",
+    }
+)
+
+
+def _unlisted(exc: OSError) -> None:
+    raise exc
+
+
+def _off_contract(work: Path) -> str | None:
+    """Why the payload unpacked in ``work`` is not one build_payload makes, or
+    None. provision.sh's tar keeps an absolute or ``..`` member NAME inside
+    ``work``, but writes a symbolic or hard link member as one and lays down
+    any name it is given. So: folders and plain files only, each file ONE
+    link to its data (a hard link member shares it), ``PAYLOAD_FILES`` at the
+    top and everything else under ``skills/``. Nothing is followed or opened
+    to tell -- ``lstat`` only."""
+    try:
+        for dirpath, dirnames, filenames in os.walk(str(work), onerror=_unlisted):
+            for name in sorted(dirnames + filenames):
+                path = Path(dirpath) / name
+                rel = path.relative_to(work)
+                st = os.lstat(str(path))
+                folder = stat.S_ISDIR(st.st_mode)
+                plain = stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+                shown = ascii(rel.as_posix())
+                if not (folder or plain):
+                    return f"it holds a link or a special file ({shown})"
+                top = rel.parts[0]
+                if not (top == "skills" and (folder or len(rel.parts) > 1)) and not (
+                    plain and len(rel.parts) == 1 and top in PAYLOAD_FILES
+                ):
+                    return f"it holds an entry outside skills/ ({shown})"
+    except OSError as exc:
+        return f"it cannot be listed ({type(exc).__name__})"
+    return None
+
+
 def run(*, work: Path, home: Path, path: str, token: str, force: bool) -> int:
     """Apply the payload unpacked in ``work`` to ``home``. 1 when any step
-    failed, else 0. The store is saved even when a step raised; a store that
-    cannot be saved is its own ``fail`` row. A PC that stops reading
-    mid-apply loses the rows after that, never the steps."""
+    failed, else 0. A payload build_payload could not have made
+    (``_off_contract``) is refused whole before any step reads it. The store
+    is saved even when a step raised; a store that cannot be saved is its own
+    ``fail`` row. A PC that stops reading mid-apply loses the rows after
+    that, never the steps."""
+    odd = _off_contract(work)
+    if odd is not None:
+        _say(f"fail\tpayload\tthe payload is refused: {odd}; nothing applied\n")
+        return 1
     manifest = _load(work / "manifest.json")
     if not isinstance(manifest, dict) or manifest.get("version") != MANIFEST_VERSION:
         _say(

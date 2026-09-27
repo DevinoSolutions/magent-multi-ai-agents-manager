@@ -163,6 +163,32 @@ class TestSharedRotatingHandler:
         assert text.count("log interlock unavailable") == 1  # once per process
         assert "WARNING" in text
 
+    def test_a_lone_surrogate_is_escaped_never_lost(self, capsys):
+        """A name read off the disk can hold a lone surrogate -- a POSIX byte
+        that is not UTF-8 (surrogateescape), an unpaired UTF-16 half on NTFS.
+        Strict UTF-8 cannot encode one: the stdlib prints "--- Logging error
+        ---" and DROPS the record. Whatever a call site passes, the record
+        lands, with the character escaped -- and the file stays UTF-8."""
+        log.LOG_DIR.mkdir(parents=True, exist_ok=True)
+        handler = log._SharedRotatingFileHandler(
+            log.LOG_DIR / "shared.log", max_bytes=0, backup_count=0, encoding="utf-8"
+        )
+        try:
+            for name in ("caf\udce9", "after"):
+                handler.handle(
+                    logging.makeLogRecord(
+                        {"msg": "skills/%s: skipped", "args": (name,)}
+                    )
+                )
+        finally:
+            handler.close()
+
+        data = (log.LOG_DIR / "shared.log").read_bytes()
+        assert b"skills/caf\\udce9: skipped" in data
+        assert b"skills/after: skipped" in data
+        assert data.decode("utf-8").count("\n") == 2
+        assert "Logging error" not in capsys.readouterr().err
+
 
 class TestLogLevelFromEnv:
     """P2-01: get_logger honors MAGENT_LOG_LEVEL. It was validated in the

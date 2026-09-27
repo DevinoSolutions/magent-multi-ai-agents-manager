@@ -209,15 +209,38 @@ LOCAL_STATE_HOOK_MARKERS = ("magent-state-hook", "magent.state_hook")
 # syncs its own. The rest are tool droppings, never part of a skill.
 SKILLS_EXCLUDED_TOP = frozenset({"synced"})
 SKILLS_EXCLUDED_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv"})
-# Folders under the PC's home that hold keys and logins: ssh, gpg, AWS, gh,
-# kubectl, docker. No skill lives in one, so nothing the skills walk reaches
-# -- a folder or a single file, linked or not -- is read from inside one.
+# Folders under the PC's home that hold keys and logins: ssh, gpg, AWS, Azure,
+# gh, kubectl, docker. No skill lives in one, so nothing the skills walk
+# reaches -- a folder or a single file, linked or not -- is read from inside one.
 # Defence in depth, not containment: a link anywhere else still ships.
-SECRET_HOME_DIRS = (".ssh", ".gnupg", ".aws", ".config/gh", ".kube", ".docker")
+SECRET_HOME_DIRS = (
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".azure",
+    ".config/gh",
+    ".kube",
+    ".docker",
+)
 # A PC file nested deeper than this is refused whole, before anything walks it
 # (deepcopy and the credential scan recurse; a hostile or corrupt file must
 # not crash provisioning). Claude Code's own files are a handful of levels.
 MAX_JSON_DEPTH = 64
+# Secret-bearing FILE names, matched case-insensitively at any depth of the
+# skills walk and on the name a link resolves to: the credential scan cannot
+# see an ssh key, a TLS key or a git token, so these never ship by name.
+SKILLS_SECRET_FILES = frozenset({".netrc", ".git-credentials"})
+SKILLS_SECRET_FILE_PREFIXES = ("id_rsa", "id_ed25519")
+SKILLS_SECRET_FILE_SUFFIXES = (".pem",)
+# user_scope runs on every bring-up and holds every skill byte in memory: a
+# stray asset must not be read whole ...
+SKILL_FILE_MAX_BYTES = 8 * 1024 * 1024
+# ... and the total is bounded too: past it a file stays behind, counted into
+# one note (a later, smaller file may still fit).
+SKILLS_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+# A link to a huge (non-home) tree must not make every bring-up walk it: the
+# walk stops after this many directory entries, with one note.
+SKILLS_MAX_ENTRIES = 20000
 
 
 @dataclass(frozen=True)
@@ -845,8 +868,10 @@ def _marketplaces(
 ) -> dict[str, str]:
     """A remote source for every marketplace an enabled plugin comes from:
     the CLI's known list first, then ``settings.extraKnownMarketplaces``. A
-    source that holds a Claude credential (a token in a git URL) stays behind
-    with a note that never quotes it."""
+    source that holds a Claude credential (a token in a git URL) or any other
+    URL credential stays behind with a note that never quotes it: the node
+    passes the source to ``claude plugin marketplace add`` as an ARGUMENT,
+    readable by every user of a shared node."""
     extra_raw = settings.get("extraKnownMarketplaces")
     extra: dict[str, object] = extra_raw if isinstance(extra_raw, dict) else {}
     found: dict[str, str] = {}
@@ -856,20 +881,119 @@ def _marketplaces(
         )
         if source is None:
             notes.append(
-                f"marketplace {name}: no remote source on this PC; its plugins "
-                "may not install on a node"
+                f"marketplace {_named(name)}: no remote source on this PC; its "
+                "plugins may not install on a node"
             )
-        elif _holds_claude_credential(source):
-            notes.append(
-                f"marketplace {name}: its source holds a Claude credential, "
-                "never shipped"
-            )
-        else:
+            continue
+        refusal = _source_refusal(source)
+        if refusal is None:
             found[name] = source
+        else:
+            notes.append(f"marketplace {_named(name)}: {refusal}")
     return found
 
 
+_CREDENTIAL_FIX = "put the credential in git's credential helper, not the URL"
+
+
+def _source_refusal(source: str) -> str | None:
+    """Why a marketplace source must not leave this PC, or None. A URL
+    credential is judged by the rule a project's git remote is stripped by
+    (``_without_credentials``), so the two can never disagree: over any scheme
+    but ssh the WHOLE userinfo is one -- GitHub takes a token as the user
+    name, ``https://ghp_...@github.com/o/m.git`` -- and over ssh only a
+    password is (``git@host:path`` and ``ssh://git@host/...`` ship). A URL
+    credential's refusal names the fix."""
+    if _holds_claude_credential(source):
+        return "its source holds a Claude credential, never shipped"
+    if _without_credentials(source)[1]:
+        what = (
+            "a password"
+            if _userinfo_password(source)
+            else "a user name (often a token)"
+        )
+        return f"its source URL carries {what}, never shipped -- {_CREDENTIAL_FIX}"
+    try:
+        urllib.parse.urlsplit(source)
+    except ValueError:  # an unbalanced IPv6 bracket, say
+        return "its source URL does not parse, never shipped"
+    return None
+
+
 _CREDENTIAL_BYTES = CLAUDE_CREDENTIAL_MARKER.encode("ascii")
+# Windows PowerShell 5.1's `>` and Out-File write UTF-16LE by default. The LE
+# form also matches a UTF-16BE file: the marker's ASCII continues, so BE bytes
+# read from offset 1 are the LE sequence.
+_CREDENTIAL_BYTES_U16 = CLAUDE_CREDENTIAL_MARKER.encode("utf-16-le")
+
+# How a skill file is opened: never blocking on a FIFO swapped in after its
+# stat. Read off the module, so Windows (which has no O_NONBLOCK, and wants
+# O_BINARY) needs no `sys.platform` branch. Unlike remote_mux's push read
+# there is no O_NOFOLLOW: a linked skill file is followed on purpose.
+_SKILL_READ_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+)
+# A skill file that grew after its fstat is read on in chunks of this size.
+_READ_CHUNK = 64 * 1024
+
+
+class _NotShipped(ValueError):
+    """A skill file ``_read_skill`` will not ship; the message is the note's
+    reason (never the content)."""
+
+
+class _PastTotal(_NotShipped):
+    """A skill file that does not fit what is left of
+    ``SKILLS_MAX_TOTAL_BYTES``: counted, not noted one by one."""
+
+
+def _size(n: int) -> str:
+    mib = 1024 * 1024
+    return f"{n // mib} MiB" if n >= mib and n % mib == 0 else f"{n} bytes"
+
+
+def _check_size(size: int, room: int) -> None:
+    if size > SKILL_FILE_MAX_BYTES:
+        raise _NotShipped(f"larger than {_size(SKILL_FILE_MAX_BYTES)}, not shipped")
+    if size > room:
+        raise _PastTotal
+
+
+def _read_skill(path: Path, *, room: int) -> tuple[bytes, int]:
+    """The bytes and mode of ``path``, a REGULAR file of at most
+    ``SKILL_FILE_MAX_BYTES`` and at most ``room`` (what the skills total has
+    left: ``_PastTotal``), or ``_NotShipped``; OSError when it cannot be
+    read. The same three checks as ``remote_mux._read_regular`` (which this
+    leaf cannot import), because each alone has a hole: a stat before opening
+    (a FIFO or a device is never opened -- reading one blocks every bring-up
+    for good -- and an oversize file never read), an ``fstat`` on what was
+    opened (it may have been swapped for a FIFO in between; the non-blocking
+    open is what lets the walk get that far), and a bounded read (it may have
+    grown). The read is sized by the ``fstat``, not the cap -- a cap-sized
+    read allocates the cap for every tiny file -- and one byte past that size
+    shows a file that grew; it is then read on, a chunk at a time, only until
+    it is past the cap."""
+    before = path.stat()
+    if not stat.S_ISREG(before.st_mode):
+        raise _NotShipped("not a regular file, not shipped")
+    _check_size(before.st_size, room)
+    fd = os.open(path, _SKILL_READ_FLAGS)
+    with os.fdopen(fd, "rb") as f:
+        opened = os.fstat(f.fileno())
+        if not stat.S_ISREG(opened.st_mode):
+            raise _NotShipped("not a regular file, not shipped")
+        size = min(opened.st_size, SKILL_FILE_MAX_BYTES)
+        data = f.read(size + 1)
+        if len(data) > size:
+            grown = bytearray(data)  # linear growth, one copy at the end
+            while len(grown) <= SKILL_FILE_MAX_BYTES:
+                chunk = f.read(_READ_CHUNK)
+                if not chunk:
+                    break
+                grown += chunk
+            data = bytes(grown)
+    _check_size(len(data), room)
+    return data, opened.st_mode
 
 
 def _real(path: str | Path) -> str:
@@ -911,43 +1035,223 @@ def _in_secret_dir(
     return True
 
 
+@dataclass(frozen=True)
+class _Fences:
+    """Where the skills walk never reads, every path resolved: ``home``'s
+    ``SECRET_HOME_DIRS``, and ``claude`` (``~/.claude``) outside ``root``
+    (the skills folder)."""
+
+    secrets: tuple[str, ...]
+    claude: str
+    root: str
+
+
+def _fenced(rel_path: str, target: str, fences: _Fences, notes: list[str]) -> bool:
+    """``target`` (resolved) is behind one of ``fences``: noted, WARNING
+    logged, and True so the caller skips it. ``~/.claude`` outside the skills
+    folder holds the session transcripts (``projects/``), the history and the
+    login -- never a skill."""
+    if _in_secret_dir(rel_path, target, fences.secrets, notes):
+        return True
+    if not _within(fences.claude, target) or _within(fences.root, target):
+        return False
+    name = _named(rel_path)
+    notes.append(
+        f"skills/{name}: links into ~/.claude outside the skills folder, not followed"
+    )
+    _log.warning(
+        "skills/%s resolves to %s, in ~/.claude outside the skills folder: "
+        "not followed",
+        name,
+        target,
+    )
+    return True
+
+
+def _secret_file_name(name: str) -> bool:
+    low = name.lower()
+    return (
+        low in SKILLS_SECRET_FILES
+        or low.startswith(SKILLS_SECRET_FILE_PREFIXES)
+        or low.endswith(SKILLS_SECRET_FILE_SUFFIXES)
+    )
+
+
+@dataclass
+class _SkillsTally:
+    """What one skills walk has spent: entries listed, bytes kept, and the
+    files the total cap turned away -- counted into ONE note, since a big
+    tree past the cap would otherwise bury every other note."""
+
+    entries: int = 0
+    total: int = 0
+    past_total: int = 0
+
+
+def _skill_file(
+    path: Path,
+    rel_path: str,
+    fences: _Fences,
+    tally: _SkillsTally,
+    notes: list[str],
+) -> SkillFile | None:
+    """``path`` (at ``rel_path`` under skills) as a SkillFile, or None with a
+    note (or a count in ``tally``) saying why it stays behind."""
+    target = _real(path)
+    if _fenced(rel_path, target, fences, notes):
+        return None
+    if _secret_file_name(path.name) or _secret_file_name(os.path.basename(target)):
+        notes.append(f"skills/{_named(rel_path)}: a secret-bearing name, never shipped")
+        return None
+    if _holds_claude_credential(rel_path):
+        notes.append(
+            f"skills/{_named(rel_path)}: holds a Claude credential, never shipped"
+        )
+        return None
+    try:
+        data, mode = _read_skill(path, room=SKILLS_MAX_TOTAL_BYTES - tally.total)
+    except _PastTotal:
+        # A later, smaller file may still fit.
+        tally.past_total += 1
+        return None
+    except _NotShipped as e:
+        notes.append(f"skills/{_named(rel_path)}: {e}")
+        return None
+    except OSError as e:
+        # Same rule as an unlistable folder: the class on screen, the OS's
+        # text (and the path it may carry) in the log only.
+        notes.append(
+            f"skills/{_named(rel_path)}: cannot be read ({type(e).__name__}); "
+            "not shipped"
+        )
+        _log.warning("skills/%s: %s", _named(rel_path), e)
+        return None
+    if _CREDENTIAL_BYTES in data or _CREDENTIAL_BYTES_U16 in data:
+        notes.append(
+            f"skills/{_named(rel_path)}: holds a Claude credential, never shipped"
+        )
+        return None
+    tally.total += len(data)
+    shebang = data.startswith(b"#!")
+    # Shipped verbatim either way: a note, never a rewrite of the user's file.
+    if shebang and data.split(b"\n", 1)[0].endswith(b"\r"):
+        notes.append(
+            f"skills/{_named(rel_path)}: CRLF line endings; will not run on a node"
+        )
+    # The credential scan knows only Claude's keys; an env file may hold any.
+    if _is_env_file(path.name) or _is_env_file(os.path.basename(target)):
+        notes.append(
+            f"skills/{_named(rel_path)}: an env file, shipped -- make sure it "
+            "holds no secret"
+        )
+        _log.warning("skills/%s is the env file %s: shipped", _named(rel_path), target)
+    return SkillFile(
+        path=rel_path,
+        data=data,
+        executable=bool(mode & stat.S_IXUSR) or shebang,
+    )
+
+
 def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
     """Every file under ``~/.claude/skills``, symlinks followed once, sorted by
     path. A file is executable if its mode says so OR it starts with ``#!`` --
-    a Windows PC has no exec bit to read. A file whose bytes (or path) hold a
-    Claude credential stays behind; its note names the path, never the
-    content. A Windows junction is followed exactly like a symlink, on
+    a Windows PC has no exec bit to read. A file whose bytes (ASCII or
+    UTF-16) or path hold a Claude credential stays behind, and so does one
+    whose name, or the name its link resolves to, is a secret file's
+    (``SKILLS_SECRET_FILES`` and kin: an ssh or TLS key, a git token the
+    scan cannot see); a note names the path, never the content. Two files
+    ship with a caution instead: a ``#!`` line ending in CR (it will not run
+    on a node) and an env file by either name (the scan cannot vouch for
+    it). A Windows junction is followed exactly like a symlink, on
     purpose: a link in ``skills`` is one the user made (a repo checked out
     elsewhere is the main case), so it is not contained to the root.
 
-    Two kinds of target are never followed, each pruned with a note and a
+    Three kinds of target are never followed, each pruned with a note and a
     WARNING naming the link. A folder ABOVE the skills folder -- ``~/.claude``,
-    ``~``, ``/`` -- is no skill: it is the walk reading the whole home. And
-    nothing inside one of ``home``'s ``SECRET_HOME_DIRS`` is read, folder or
-    single file, however it was reached. Both sides of every comparison are
-    resolved first, so a ``~/.ssh`` that is itself a junction elsewhere
-    (OneDrive setups) is still recognised. A skills folder that is itself
-    such a link ships nothing.
+    ``~``, ``/`` -- is no skill: it is the walk reading the whole home. Above
+    where it is named, where it resolves, or where ``~/.claude`` resolves --
+    so a home reached through a link, or a ``~/.claude`` kept in a dotfiles
+    repo that skills links back to, is above it too. Nothing inside one of
+    ``home``'s ``SECRET_HOME_DIRS`` is read, folder or single file, however
+    it was reached. And nothing in ``~/.claude`` outside the skills folder
+    is read either -- the session transcripts, the history, the login. Both
+    sides of every comparison are resolved first, so a
+    ``~/.ssh`` or ``~/.claude`` that is itself a junction elsewhere (OneDrive
+    setups) is still recognised. A skills folder that is itself such a link
+    ships nothing -- one resolving elsewhere in ~/.claude (a ``skills-v2``)
+    with a note of its own; the path is in the log only.
 
     That is defence in depth, NOT containment: a link to any other folder
     (``~/private-notes``) ships what it holds, deliberately -- the user put
     it there. One real directory linked under two names ships once, under
-    the name the sorted, depth-first walk reaches first."""
-    if not root.is_dir():
+    the name the sorted, depth-first walk reaches first.
+
+    Bounded, because it runs on every bring-up: only regular files are read
+    (``_read_skill``), each at most ``SKILL_FILE_MAX_BYTES`` and all of them
+    at most ``SKILLS_MAX_TOTAL_BYTES``, and the walk stops after
+    ``SKILLS_MAX_ENTRIES`` listed entries. A skills folder it may not reach,
+    a folder it may not list, or a file it may not read, is one note naming
+    the error's class (the log has the rest), and the walk goes on -- never
+    read as a PC with no skills."""
+    # One stat, asked directly: Path.is_dir raises what it cannot ignore on
+    # 3.13 and swallows it on 3.14 -- the walk's end, or "no skills" on a PC
+    # that has them. Only a skills folder that is not there is absent.
+    try:
+        found = os.stat(root)
+    except (FileNotFoundError, NotADirectoryError):
         return ()
-    # The unresolved root counts too: with ~/.claude a junction elsewhere, a
-    # link to ~ is above the path the user sees, not the resolved one.
-    anchors = (os.path.normcase(os.path.abspath(root)), _real(root))
-    secrets = tuple(_real(home / d) for d in SECRET_HOME_DIRS)
-    if _above(anchors[1], anchors[0]) or any(_within(s, anchors[1]) for s in secrets):
+    except OSError as e:
+        notes.append(f"skills: cannot be read ({type(e).__name__}); not shipped")
+        _log.warning("skills: %s", e)
+        return ()
+    if not stat.S_ISDIR(found.st_mode):
+        return ()
+    real_root = _real(root)
+    fences = _Fences(
+        secrets=tuple(_real(home / d) for d in SECRET_HOME_DIRS),
+        claude=_real(home / ".claude"),
+        root=real_root,
+    )
+    # ~/.claude/skills resolved where ~/.claude resolves: anywhere else in
+    # ~/.claude (the transcripts, say) is no skills folder.
+    own = os.path.normcase(os.path.join(fences.claude, "skills"))
+    # Where the skills folder sits, by every spelling: as the user sees it,
+    # as it resolves, and where ~/.claude resolves. A home reached through a
+    # link (/home -> usr/home) or a ~/.claude kept in a dotfiles repo puts a
+    # link to that home or that repo above only the third.
+    anchors = (os.path.normcase(os.path.abspath(root)), real_root, own)
+    if any(_above(real_root, anchor) for anchor in anchors) or any(
+        _within(s, real_root) for s in fences.secrets
+    ):
         notes.append("skills: links to a folder it must not read, not followed")
-        _log.warning("%s links to %s: not followed", root, anchors[1])
+        _log.warning("%s links to %s: not followed", root, real_root)
         return ()
-    if any((root / top).exists() for top in SKILLS_EXCLUDED_TOP):
-        notes.append("skills/synced: claude.ai-managed copies, not shipped")
+    if _within(fences.claude, real_root) and real_root != own:
+        notes.append(
+            "skills: resolves into ~/.claude outside ~/.claude/skills, not shipped"
+        )
+        _log.warning(
+            "%s resolves to %s, in ~/.claude outside ~/.claude/skills: not shipped",
+            root,
+            real_root,
+        )
+        return ()
     files: list[SkillFile] = []
     seen: set[str] = set()
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+    tally = _SkillsTally()
+
+    def unreadable(exc: OSError) -> None:
+        # A folder it may not list is neither fatal nor silent: one note with
+        # the error's class only, the whole error in the log, and the walk
+        # goes on without it.
+        rel = Path(exc.filename or root).relative_to(root).as_posix()
+        name = "skills" if rel == "." else f"skills/{_named(rel)}"
+        notes.append(f"{name}: cannot be read ({type(exc).__name__}); not shipped")
+        _log.warning("%s: %s", name, exc)
+
+    for dirpath, dirnames, filenames in os.walk(
+        root, onerror=unreadable, followlinks=True
+    ):
         here = Path(dirpath)
         real = os.path.realpath(here)
         if real in seen:
@@ -955,8 +1259,18 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
             continue
         seen.add(real)
         rel = here.relative_to(root)
+        # Read off the root's own listing: a stat of root/synced is one more
+        # call that a folder it may not search raises from.
+        if rel == Path() and SKILLS_EXCLUDED_TOP.intersection(dirnames):
+            notes.append("skills/synced: claude.ai-managed copies, not shipped")
+        # Every entry a folder lists counts, folders first, each list sorted;
+        # past the cap the rest of this folder is dropped and the walk stops.
+        room = SKILLS_MAX_ENTRIES - tally.entries
+        tally.entries += len(dirnames) + len(filenames)
+        listed_dirs = sorted(dirnames)[:room]
+        listed_files = sorted(filenames)[: max(room - len(dirnames), 0)]
         kept: list[str] = []
-        for d in sorted(dirnames):
+        for d in listed_dirs:
             if d in SKILLS_EXCLUDED_DIRS or (
                 rel == Path() and d in SKILLS_EXCLUDED_TOP
             ):
@@ -974,34 +1288,27 @@ def _skills(root: Path, home: Path, notes: list[str]) -> tuple[SkillFile, ...]:
                     target,
                 )
                 continue
-            if _in_secret_dir((rel / d).as_posix(), target, secrets, notes):
+            if _fenced((rel / d).as_posix(), target, fences, notes):
                 continue
             kept.append(d)
         dirnames[:] = kept
-        for name in sorted(filenames):
-            path = here / name
+        for name in listed_files:
             rel_path = (rel / name).as_posix()
-            if _in_secret_dir(rel_path, _real(path), secrets, notes):
-                continue
-            try:
-                data = path.read_bytes()
-                mode = path.stat().st_mode
-            except OSError as e:
-                notes.append(f"skills/{_named(rel_path)}: unreadable ({e.strerror})")
-                continue
-            if _CREDENTIAL_BYTES in data or _holds_claude_credential(rel_path):
-                notes.append(
-                    f"skills/{_named(rel_path)}: holds a Claude credential, "
-                    "never shipped"
-                )
-                continue
-            files.append(
-                SkillFile(
-                    path=rel_path,
-                    data=data,
-                    executable=bool(mode & stat.S_IXUSR) or data.startswith(b"#!"),
-                )
+            skill = _skill_file(here / name, rel_path, fences, tally, notes)
+            if skill is not None:
+                files.append(skill)
+        if tally.entries > SKILLS_MAX_ENTRIES:
+            notes.append(
+                f"skills: more than {SKILLS_MAX_ENTRIES} entries; the walk "
+                "stopped there and the rest is not shipped"
             )
+            break
+    if tally.past_total:
+        noun = "file" if tally.past_total == 1 else "files"
+        notes.append(
+            f"skills: {tally.past_total} {noun} past the "
+            f"{_size(SKILLS_MAX_TOTAL_BYTES)} total, not shipped"
+        )
     return tuple(sorted(files, key=lambda f: f.path))
 
 
@@ -2001,18 +2308,39 @@ def _without_credentials(url: str) -> tuple[str, bool]:
     credential. A userinfo holding nothing but ':' (or an ssh password that
     is empty) is no credential: the URL is left byte-for-byte and not
     reported as stripped. A stripped URL's scheme is lowercased."""
+    peeled = _peeled(url)
+    if peeled is None:
+        return url, False
+    prefix, address = peeled
+    stripped = _without_userinfo_secret(address)
+    if stripped is None:
+        return url, False
+    return f"{prefix}{stripped}", True
+
+
+def _peeled(url: str) -> tuple[str, str] | None:
+    """``url``'s stacked ``<transport>::`` prefix and the ``scheme://``
+    address under it (see ``_without_credentials``), or None when there is no
+    such address."""
     prefix = ""
     address = url
     while _SCHEME_URL.fullmatch(address) is None:
         transport = _TRANSPORT_URL.fullmatch(address)
         if transport is None:
-            return url, False
+            return None
         prefix += f"{transport.group(1)}::"
         address = transport.group(2)
-    stripped = _without_userinfo_secret(address)
-    if stripped is None:
-        return url, False
-    return f"{prefix}{stripped}", True
+    return prefix, address
+
+
+def _userinfo_password(url: str) -> str:
+    """The password in ``url``'s userinfo (the part after its first ':'), ""
+    when it has none. Read by the rules of ``_without_credentials``."""
+    peeled = _peeled(url)
+    match = _SCHEME_URL.fullmatch(peeled[1]) if peeled is not None else None
+    if match is None:
+        return ""
+    return match.group(2).rpartition("@")[0].partition(":")[2]
 
 
 def _without_userinfo_secret(url: str) -> str | None:

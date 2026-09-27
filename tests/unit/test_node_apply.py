@@ -553,6 +553,148 @@ class TestTheRun:
         assert login.stdin == (TOKEN + "\n").encode()
 
 
+ONE_SKILL = SkillFile(path="s/a.md", data=b"a", executable=False)
+
+
+def _nothing_applied(box: Box, capsys: pytest.CaptureFixture[str]) -> str:
+    """The one row a refused payload prints, after checking it is the only
+    one and that no step touched the home."""
+    lines = _lines(capsys)
+    assert [(line.status, line.item) for line in lines] == [("fail", "payload")]
+    assert list(box.home.iterdir()) == []
+    return lines[0].detail
+
+
+# The receiver's half of the payload contract (build_payload is the sender's):
+# provision.sh's tar keeps an absolute or `..` member NAME inside the work
+# dir, but writes a symbolic or hard link member as one, and lays down any
+# name it is given. node_apply refuses the whole payload before any step reads
+# through such an entry: plain files (one link each) and folders only, the
+# PAYLOAD_FILES at the top and everything else under skills/.
+class TestAnOffContractPayloadIsRefusedWhole:
+    def test_the_top_level_names_are_build_payloads(self, tmp_path):
+        payload = remote_mux.build_payload(
+            replace(EMPTY, skills=(ONE_SKILL,)),
+            gh_token=None,
+            gh_login=None,
+            state_hook=HOOK_TEXT,
+        )
+        with tarfile.open(
+            fileobj=io.BytesIO(payload.partition(b"\n")[2]), mode="r:gz"
+        ) as tar:
+            names = tar.getnames()
+        top = {n for n in names if "/" not in n}
+        # The list is what MAY sit at the top: a sender that leaves
+        # settings.json out (its PC settings did not read) is on contract.
+        assert top <= node_apply.PAYLOAD_FILES
+        assert node_apply.PAYLOAD_FILES - top <= {"settings.json"}
+        assert {n.split("/")[0] for n in names if "/" in n} == {"skills"}
+
+    def test_a_real_payload_passes(self, box, tmp_path, capsys):
+        work = _work(tmp_path, replace(EMPTY, skills=(ONE_SKILL,)))
+        assert box.apply(work) == 0
+        assert "payload" not in {line.item for line in _lines(capsys)}
+
+    def test_a_listed_file_may_be_absent(self, tmp_path):
+        work = _work(tmp_path, replace(EMPTY, skills=(ONE_SKILL,)))
+        (work / "settings.json").unlink()
+        assert node_apply._off_contract(work) is None
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX symlinks")
+    def test_a_symlinked_skill_file_is_refused(self, box, tmp_path, capsys):
+        secret = tmp_path / "outside" / "secret.md"
+        secret.parent.mkdir()
+        secret.write_bytes(b"NODE-SECRET-DECOY")
+        work = _work(tmp_path, replace(EMPTY, skills=(ONE_SKILL,)))
+        (work / "skills" / "s" / "leak.md").symlink_to(secret)
+        assert box.apply(work) == 1
+        assert "a link or a special file" in _nothing_applied(box, capsys)
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX symlinks")
+    def test_a_symlinked_skill_folder_is_refused(self, box, tmp_path, capsys):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.md").write_bytes(b"NODE-SECRET-DECOY")
+        work = _work(tmp_path, replace(EMPTY, skills=(ONE_SKILL,)))
+        (work / "skills" / "t").symlink_to(outside, target_is_directory=True)
+        assert box.apply(work) == 1
+        assert "a link or a special file" in _nothing_applied(box, capsys)
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX symlinks")
+    def test_a_symlinked_top_level_file_is_refused(self, box, tmp_path, capsys):
+        other = tmp_path / "other.json"
+        other.write_text("{}", encoding="utf-8")
+        work = _work(tmp_path)
+        (work / "settings.json").unlink()
+        (work / "settings.json").symlink_to(other)
+        assert box.apply(work) == 1
+        assert "a link or a special file" in _nothing_applied(box, capsys)
+
+    def test_a_hard_linked_file_is_refused(self, box, tmp_path, capsys):
+        work = _work(tmp_path, replace(EMPTY, skills=(ONE_SKILL,)))
+        os.link(work / "settings.json", work / "skills" / "s" / "b.md")
+        assert box.apply(work) == 1
+        assert "a link or a special file" in _nothing_applied(box, capsys)
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX FIFOs")
+    def test_a_fifo_is_refused_and_never_opened(self, box, tmp_path, capsys):
+        work = _work(tmp_path, replace(EMPTY, skills=(ONE_SKILL,)))
+        os.mkfifo(work / "skills" / "s" / "pipe.md")
+        assert box.apply(work) == 1
+        assert "a link or a special file" in _nothing_applied(box, capsys)
+
+    @pytest.mark.parametrize(
+        "stray", ["notes.txt", "home/amin/.bashrc", "tmp/abs/escape.md"]
+    )
+    def test_anything_outside_skills_is_refused(self, box, tmp_path, capsys, stray):
+        # An absolute member name lands here, under the work dir, tar-stripped.
+        work = _work(tmp_path)
+        (work / stray).parent.mkdir(parents=True, exist_ok=True)
+        (work / stray).write_bytes(b"stray")
+        assert box.apply(work) == 1
+        assert "outside skills/" in _nothing_applied(box, capsys)
+
+    def test_a_folder_it_cannot_list_is_refused(
+        self, box, tmp_path, capsys, monkeypatch
+    ):
+        work = _work(tmp_path, replace(EMPTY, skills=(ONE_SKILL,)))
+        denied = os.path.normcase(str(work / "skills" / "s"))
+        real = os.scandir
+
+        def scandir(path: str = ".") -> object:
+            if os.path.normcase(os.fspath(path)) == denied:
+                raise PermissionError(13, "Permission denied", path)
+            return real(path)
+
+        monkeypatch.setattr(os, "scandir", scandir)
+        assert box.apply(work) == 1
+        assert "cannot be listed (PermissionError)" in _nothing_applied(box, capsys)
+
+    def test_skills_as_a_file_is_refused(self, box, tmp_path, capsys):
+        work = _work(tmp_path)
+        (work / "skills").write_bytes(b"not a folder")
+        assert box.apply(work) == 1
+        assert "outside skills/" in _nothing_applied(box, capsys)
+
+    # By name, not by prefix: a top-level folder that merely starts with
+    # "skills" is outside skills/.
+    def test_a_sibling_named_like_skills_is_refused(self, box, tmp_path, capsys):
+        work = _work(tmp_path)
+        (work / "skills2").mkdir()
+        (work / "skills2" / "x.md").write_bytes(b"x")
+        assert box.apply(work) == 1
+        lines = _lines(capsys)
+        assert [(line.status, line.item) for line in lines] == [("fail", "payload")]
+        assert "outside skills/ ('skills2')" in lines[0].detail
+
+    @pytest.mark.skipif(not POSIX, reason="a tab in a file name: POSIX")
+    def test_a_name_is_shown_escaped(self, box, tmp_path, capsys):
+        work = _work(tmp_path)
+        (work / "a\tb").write_bytes(b"stray")
+        assert box.apply(work) == 1
+        assert "'a\\tb'" in _nothing_applied(box, capsys)
+
+
 def _settings(box: Box) -> Path:
     return box.home / ".claude" / "settings.json"
 
@@ -1210,6 +1352,36 @@ class TestTheSkills:
             "1 file(s) under ~/.claude/skills",
         )
 
+    @pytest.mark.skipif(not POSIX, reason="POSIX symlinks and byte names")
+    def test_a_linked_skill_whose_name_is_not_utf_8_is_named_escaped(
+        self, box, tmp_path, capsys
+    ):
+        # provision.sh runs node_apply under PYTHONIOENCODING=utf-8, which is
+        # strict: the name, raw in the warn row, raised out of _say and failed
+        # the whole step -- the skills beside it were never installed.
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        work = _work(tmp_path, replace(EMPTY, skills=(SKILL,)))
+        odd = work / "skills" / "caf\udce9" / "SKILL.md"
+        try:
+            odd.parent.mkdir()
+            odd.write_bytes(b"# odd\n")
+        except (OSError, UnicodeError):
+            pytest.skip("this filesystem refuses a name that is not UTF-8")
+        _skills(box).mkdir(parents=True)
+        (_skills(box) / "caf\udce9").symlink_to(elsewhere)
+        assert box.apply(work) == 0
+        lines = _lines(capsys)
+        (line,) = [line for line in lines if line.item.startswith("skill:")]
+        assert (line.status, line.item, line.detail) == (
+            "warn",
+            "skill:caf\\udce9",
+            "~/.claude/skills/caf\\udce9 is a link; left alone",
+        )
+        assert list(elsewhere.iterdir()) == []
+        assert _status(lines, "skills") == "did"
+        assert (_skills(box) / "deploy" / "SKILL.md").read_bytes() == SKILL.data
+
     @pytest.mark.skipif(not POSIX, reason="POSIX symlinks")
     def test_a_link_deeper_in_a_skill_is_left_alone(self, box, tmp_path, capsys):
         elsewhere = tmp_path / "elsewhere"
@@ -1275,13 +1447,11 @@ class TestTheSkills:
         work = _work(tmp_path, replace(EMPTY, skills=(SKILL, RUNNER)))
         (work / "skills" / "deploy" / "leak.md").symlink_to(decoy)
         assert box.apply(work) == 1
-        (line,) = [line for line in _lines(capsys) if line.item == "skills"]
-        assert (line.status, line.detail) == (
-            "fail",
-            (
-                "the payload's skills/deploy/leak.md is a link or special file; "
-                "nothing applied"
-            ),
+        lines = _lines(capsys)
+        assert [(line.status, line.item) for line in lines] == [("fail", "payload")]
+        assert lines[0].detail == (
+            "the payload is refused: it holds a link or a special file "
+            "('skills/deploy/leak.md'); nothing applied"
         )
         assert not _skills(box).exists()
 
@@ -1295,9 +1465,9 @@ class TestTheSkills:
         work = _work(tmp_path)
         (work / "skills").symlink_to(private)
         assert box.apply(work) == 1
-        (line,) = [line for line in _lines(capsys) if line.item == "skills"]
-        assert line.status == "fail"
-        assert line.detail.startswith("the payload's skills is a link")
+        lines = _lines(capsys)
+        assert [(line.status, line.item) for line in lines] == [("fail", "payload")]
+        assert "a link or a special file ('skills')" in lines[0].detail
         assert not _skills(box).exists()
 
     @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs")
@@ -1305,7 +1475,9 @@ class TestTheSkills:
         work = _work(tmp_path, replace(EMPTY, skills=(SKILL,)))
         os.mkfifo(work / "skills" / "deploy" / "pipe")
         assert box.apply(work) == 1
-        assert _status(_lines(capsys), "skills") == "fail"
+        lines = _lines(capsys)
+        assert [(line.status, line.item) for line in lines] == [("fail", "payload")]
+        assert "('skills/deploy/pipe')" in lines[0].detail
         assert not _skills(box).exists()
 
 
@@ -2115,6 +2287,33 @@ class TestTheHooksAreRebuilt:
         stop = _json(_settings(box))["hooks"]["Stop"]
         assert stop[0] == {"hooks": [_command_hook("notify")]}
         assert "junk" not in _settings(box).read_text(encoding="utf-8")
+
+    # A name read out of the payload's JSON is the PC's, not ours: a "\udce9"
+    # there loads as a lone surrogate, which strict UTF-8 -- provision.sh's
+    # PYTHONIOENCODING, and capsys here -- cannot write. The row escapes it
+    # and only it: a real name like café is written as it is. (The escape is
+    # written into the unpacked payload: the node reads what arrives.)
+    @pytest.mark.parametrize(
+        ("event", "shown"),
+        [("Caf\udce9", "Caf\\udce9"), ("Café", "Café")],
+        ids=["lone-surrogate", "utf-8"],
+    )
+    def test_a_config_name_is_written_as_it_is_unless_utf_8_cannot_carry_it(
+        self, box, tmp_path, capsys, event, shown
+    ):
+        box.add("notify")
+        entry = {"hooks": ["junk", _command_hook("notify")]}
+        work = _work(tmp_path, _pc_settings({"hooks": {"Stop": [entry]}}))
+        (work / "settings.json").write_text(
+            json.dumps({"hooks": {event: [entry]}}), encoding="utf-8"
+        )
+        assert box.apply(work) == 0
+        hooks = [
+            (line.status, line.item, line.detail)
+            for line in _lines(capsys)
+            if line.item.startswith("hook:")
+        ]
+        assert hooks == [("drop", f"hook:{shown}", "it is not a hook object")]
 
     def test_an_entry_keeps_only_its_runnable_hooks(self, box, tmp_path):
         box.add("notify")
@@ -3143,6 +3342,30 @@ class TestASymlinkedMcpFileIsWrittenThroughItsLink:
         assert str(gone) in line.detail
         assert link.is_symlink()
         assert not gone.exists()
+
+    @pytest.mark.skipif(not POSIX, reason="POSIX symlinks and byte names")
+    def test_a_dangling_link_to_a_name_not_in_utf_8_is_named_escaped(
+        self, box, tmp_path, capsys
+    ):
+        # The link's target is read off the node's disk; raw in the row, a
+        # lone surrogate raised out of _say under provision.sh's strict
+        # PYTHONIOENCODING=utf-8 and the step failed with that class instead.
+        gone = tmp_path / "dot\udce9" / ".claude.json"
+        try:
+            _claude_json(box).symlink_to(gone)
+        except (OSError, UnicodeError):
+            pytest.skip("this filesystem refuses a name that is not UTF-8")
+        box.apply(_work(tmp_path, _two()))
+        (line,) = [line for line in _lines(capsys) if line.item == "mcp_oauth"]
+        shown = str(gone).replace("\udce9", "\\udce9")
+        assert (line.status, line.detail) == (
+            "warn",
+            (
+                f"~/.claude.json is a dangling link to {shown}; left alone, "
+                "fix or remove it"
+            ),
+        )
+        assert not _credentials(box).exists()
 
     def test_a_dangling_claude_json_is_named_by_mcp_oauth_too(
         self, box, tmp_path, capsys
