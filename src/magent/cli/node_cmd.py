@@ -297,12 +297,18 @@ def _node_rows(cfg: MagentConfig, *, now: float) -> list[list[str]]:
     daemon = _daemon_state()
     local_user = env.local_username()
     # The same windows placement reads; None: a table never samples live.
-    windows, _ = nodes.placement_samples(cfg, now=now, live_sample=None)
+    unreadable: dict[str, OSError | ValueError] = {}
+    windows, _ = nodes.placement_samples(
+        cfg, now=now, live_sample=None, on_unreadable=unreadable.__setitem__
+    )
     rows: list[list[str]] = []
     for nick, conf in cfg.settings.nodes.items():
         window = windows.get(nick, [])
         score = nodes.score_node(nick, window)
         load, mem, mine = "no data", "-", "-"
+        if nick in unreadable:
+            # Unknown, never "no data": the class only, the rest is in nodes.log.
+            load = f"unreadable ({type(unreadable[nick]).__name__})"
         if score is not None:
             load = f"{score.p75:.2f} ({score.samples})"
             mine = str(score.my_sessions)
@@ -556,6 +562,13 @@ def _plan_heading(name: str, proj: ProjectConfig, placement: Placement | None) -
 
     if proj.node != NODE_AUTO:
         return f"  {style(name, bold=True)}  pinned -> @{proj.node}"
+    if placement is not None and placement.reason == "unknown":
+        # D17: the map could not be read, so the node is unknown -- never a
+        # guess, and never "nowhere" (it may be running somewhere).
+        return (
+            f"  {style(name, bold=True)}  auto -> (node unknown)"
+            f"  {style('(' + nodes.PLACE_REASONS['unknown'] + ')', dim=True)}"
+        )
     if placement is None or placement.nick is None:
         return (
             f"  {style(name, bold=True)}  auto -> nowhere"
@@ -671,6 +684,9 @@ def plan_cmd(ctx: click.Context, project: str | None, all_projects: bool) -> Non
     )
     for note in placed.notes:
         _note(note)
+    for line in placed.refused:
+        # A launch would fail these (red x), so plan says so the same way.
+        click.echo(f"  {style('x', fg='red')} {line}")
     for proj in chosen:
         name = nodes.project_name(proj)
         click.echo()
@@ -723,6 +739,20 @@ def _source_node(cfg: MagentConfig, held: NodeMapEntry) -> Node | None:
 _RERUN = "nothing was stopped or cleared -- run the recall again"
 
 
+def _map_unreadable_fix(exc: OSError | ValueError) -> str:
+    """The line for a node map that is there and cannot be read: a re-run
+    alone would only read it again. No magent command rewrites or rebuilds
+    node-map.json, so the repair is the user's -- fix it or move it aside,
+    never delete it: it is the only record of where each project runs. The
+    error CLASS only: the full error goes to nodes.log."""
+    from magent import nodes  # heavy subsystem: in-body per policy
+
+    return (
+        f"the node map at {nodes.NODE_MAP_PATH} is unreadable"
+        f" ({type(exc).__name__}); fix or move it aside, then run the recall again"
+    )
+
+
 def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
     """Step 1: one last pull, through node_sync's per-node lock -- the lock the
     daemon's tick holds -- so it never races a running daemon (DECISION-26
@@ -764,8 +794,18 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
         )
     except OSError as exc:
         # After LockHeld (an OSError itself): this PC's side of the pull -- the
-        # watermark file, the per-node lock file -- failed (cq-G14 M1).
-        _fail(f"could not pull from @{held.nick} ({exc}); {_RERUN}", 1)
+        # watermark file, the per-node lock file -- failed (cq-G14 M1). The
+        # error CLASS only on screen (str(exc) carries a path); the full error
+        # goes to nodes.log.
+        # D-MERGE: D's node_sync.final_pull shape (Dsync 08cfa62) wins at
+        # integration: it raises NodeMapUnreadable (an OSError) for a map it
+        # cannot read. This branch must keep the class-only rule for it --
+        # never str(exc) on screen, the full error in nodes.log -- and, as an
+        # unreadable map, it takes _map_unreadable_fix's words, not _RERUN.
+        log.get_logger("nodes").warning(
+            "recall's last pull from %s failed on this PC: %s", held.nick, exc
+        )
+        _fail(f"could not pull from @{held.nick} ({type(exc).__name__}); {_RERUN}", 1)
     except nodes.NodeConfigError as exc:
         _note(
             f"@{held.nick} cannot be pulled from ({exc});"
@@ -884,7 +924,23 @@ def _report_repos(source: Node | None, held: NodeMapEntry) -> None:
             nodes.write_repo_record(held.nick, held.sid, record)
             click.echo(f"  repos on @{held.nick}, now:")
     if record is None:
-        record = nodes.read_repo_record(held.nick, held.sid)
+        try:
+            record = nodes.read_repo_record(held.nick, held.sid)
+        except (OSError, ValueError) as exc:
+            # There, but unreadable: unknown, never "never recorded". The
+            # error CLASS only on screen; the full error goes to nodes.log.
+            log.get_logger("nodes").warning(
+                "recall could not read the repo record for %s/%s: %s",
+                held.nick,
+                held.sid,
+                exc,
+            )
+            _note(
+                f"the commit record for {held.sid} on @{held.nick} is unreadable"
+                f" ({type(exc).__name__}) -- check the node before relying on"
+                " `git pull`"
+            )
+            return
         if record is None:
             _note(
                 f"no commit was ever recorded for {held.sid} on @{held.nick} --"
@@ -953,17 +1009,31 @@ def _stop_session(source: Node | None, held: NodeMapEntry) -> None:
 
 def _clear_placement(name: str, held: NodeMapEntry) -> None:
     """Drop ``name`` from the node map through D's one writer. A lock another
-    process keeps past its wait (``LockHeld``, an OSError -- DECISION-13) or a
-    failed write is a printed failure, never a traceback. By then the session
-    is already stopped, so a re-run only redoes the install and the clear."""
+    process keeps past its wait (``LockHeld``, an OSError -- DECISION-13), a
+    map that is busy or torn by now (the strict read's OSError / ValueError)
+    or a failed write is a printed failure, never a traceback. By then the
+    session is already stopped, so a re-run only redoes the install and the
+    clear -- once the map can be read: a torn one (ValueError) is named with
+    its repair (``_map_unreadable_fix``). The error CLASS only on screen: the
+    full error goes to nodes.log."""
     from magent import nodes  # heavy subsystem: in-body per policy
 
     try:
         nodes.update_node_map(name, None)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        log.get_logger("nodes").warning(
+            "recall could not clear %s's placement: %s", name, exc
+        )
+        if isinstance(exc, ValueError):
+            _fail(
+                f"could not clear {name}'s placement on @{held.nick}:"
+                f" {_map_unreadable_fix(exc)}",
+                1,
+            )
+        # A lock or a busy map (OSError) passes: a re-run is the whole remedy.
         _fail(
-            f"could not clear {name}'s placement on @{held.nick} ({exc});"
-            " run the recall again",
+            f"could not clear {name}'s placement on @{held.nick}"
+            f" ({type(exc).__name__}); run the recall again",
             1,
         )
 
@@ -1020,9 +1090,15 @@ def _recall_local(
                 1,
             )
         except OSError as exc:
+            # The error CLASS only on screen (str(exc) carries a path); the
+            # full error goes to nodes.log.
+            log.get_logger("nodes").warning(
+                "recall could not install the conversation into %s: %s", dest, exc
+            )
             _fail(
-                f"could not install the conversation into {dest} ({exc});"
-                f" {name} stays placed on @{held.nick} -- run the recall again",
+                f"could not install the conversation into {dest}"
+                f" ({type(exc).__name__}); {name} stays placed on @{held.nick}"
+                " -- run the recall again",
                 1,
             )
         if replaced:
@@ -1122,7 +1198,17 @@ def recall_cmd(ctx: click.Context, project: str, to_local: bool) -> None:
     try:
         held = nodes.load_node_map_strict().get(name)
     except (OSError, ValueError) as exc:
-        _fail(f"could not read the node map ({exc}); run the recall again", 1)
+        # The error CLASS only on screen: str(exc) carries the parser's text.
+        log.get_logger("nodes").warning("recall could not read the node map: %s", exc)
+        if isinstance(exc, PermissionError):
+            # What the strict reader re-raises once its busy retries run out:
+            # another process holds the map, and a re-run is the remedy.
+            _fail(
+                f"could not read the node map ({type(exc).__name__});"
+                " run the recall again",
+                1,
+            )
+        _fail(_map_unreadable_fix(exc), 1)
     if held is None:
         _fail(
             f"{name} is not placed on a node -- there is nothing to recall",

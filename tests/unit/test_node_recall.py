@@ -12,6 +12,7 @@ of a transcript IS its session id; subagent logs (agent-*.jsonl, anything under
 from __future__ import annotations
 
 import io
+import logging
 import math
 import os
 import shlex
@@ -137,6 +138,99 @@ class TestTheResumeId:
     def test_nothing_pulled_means_no_resume_id(self):
         assert nodes.latest_transcript_id("second", "api") is None
 
+    def test_a_trailing_newline_is_never_part_of_a_resume_id(self):
+        # The id lands on a `claude --resume` line, where a newline is an
+        # Enter. Windows cannot put one in a file name, so the pattern itself
+        # is pinned, on every OS.
+        assert nodes._SESSION_STEM.fullmatch(SESSION_ID + "\n") is None
+        assert nodes._SESSION_STEM.fullmatch(SESSION_ID) is not None
+
+    def test_a_newline_suffixed_name_never_comes_back_as_the_resume_id(
+        self, monkeypatch
+    ):
+        # The same law through the real call site: a listing that yields
+        # "<uuid>\n.jsonl" (legal on a POSIX node, impossible to create on
+        # Windows, hence the patched listing) must not win, even as the
+        # newest regular file in the folder.
+        write_transcript("second", "api", OLDER_SESSION_ID, mtime=NOW - 600)
+        folder = nodes.transcripts_dir("second", "api")
+        stand_in = folder / "stand-in.txt"
+        stand_in.write_text("{}\n", encoding="utf-8")
+        os.utime(stand_in, (NOW, NOW))
+        smuggled = folder / f"{SESSION_ID}\n.jsonl"
+        real_glob, real_stat = Path.glob, Path.stat
+
+        def glob(self, pattern, *args, **kwargs):
+            yield from real_glob(self, pattern, *args, **kwargs)
+            if self == folder:
+                yield smuggled
+
+        def stat(self, *args, **kwargs):
+            target = stand_in if self == smuggled else self
+            return real_stat(target, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "glob", glob)
+        monkeypatch.setattr(Path, "stat", stat)
+
+        assert nodes.latest_transcript_id("second", "api") == OLDER_SESSION_ID
+
+    def test_an_overlong_stem_is_never_a_resume_id(self):
+        # 300 + ".jsonl" is past the 255-character name limit of NTFS and
+        # ext4 alike, so it can only be pinned against the pattern.
+        assert nodes._SESSION_STEM.fullmatch("x" * 300) is None
+        assert nodes._SESSION_STEM.fullmatch(SESSION_ID * 2) is None
+
+    @pytest.mark.parametrize(
+        "hostile",
+        [
+            "$(id)",
+            "a;b",
+            "-x",
+            "a b",
+            SESSION_ID + " --dangerously-skip-permissions",
+            SESSION_ID.upper(),
+            SESSION_ID[:-1],
+            "x" * 200,
+        ],
+        ids=[
+            "subst",
+            "semicolon",
+            "dash",
+            "space",
+            "uuid-plus-flag",
+            "uppercase",
+            "short",
+            "long",
+        ],
+    )
+    def test_a_stem_that_is_not_a_whole_uuid_is_never_a_resume_id(self, hostile):
+        write_transcript("second", "api", OLDER_SESSION_ID, mtime=NOW - 600)
+        write_transcript("second", "api", hostile, mtime=NOW)
+
+        assert nodes.latest_transcript_id("second", "api") == OLDER_SESSION_ID
+
+    def test_one_vanished_file_does_not_blank_the_whole_folder(self, monkeypatch):
+        write_transcript("second", "api", OLDER_SESSION_ID, mtime=NOW - 600)
+        gone = write_transcript("second", "api", SESSION_ID, mtime=NOW)
+        real_stat = Path.stat
+
+        def stat(self, *args, **kwargs):
+            if self.name == gone.name:
+                raise FileNotFoundError(str(self))
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat)
+
+        assert nodes.latest_transcript_id("second", "api") == OLDER_SESSION_ID
+
+    def test_a_directory_named_like_a_transcript_never_counts(self):
+        write_transcript("second", "api", OLDER_SESSION_ID, mtime=NOW - 600)
+        impostor = nodes.transcripts_dir("second", "api") / f"{SESSION_ID}.jsonl"
+        impostor.mkdir()
+        os.utime(impostor, (NOW, NOW))
+
+        assert nodes.latest_transcript_id("second", "api") == OLDER_SESSION_ID
+
 
 _NODE = nodes.Node(nick="second", host="devino-second", user="amin", root="~/magent")
 
@@ -212,12 +306,14 @@ class TestTheRepoRecord:
         assert nodes.write_repo_record("second", "api", record) is True
         assert nodes.read_repo_record("second", "api") == record
 
-    def test_a_torn_record_reads_as_none(self):
+    def test_a_torn_record_raises_never_reads_as_no_record(self):
+        # inv-unknown: there but unreadable is unknown, not "never recorded".
         path = nodes.repo_record_path("second", "api")
         path.parent.mkdir(parents=True)
         path.write_text('{"ts": 1, "sou', encoding="utf-8")
 
-        assert nodes.read_repo_record("second", "api") is None
+        with pytest.raises(ValueError):
+            nodes.read_repo_record("second", "api")
 
     def test_repo_status_runs_the_packaged_script_on_the_session_root(
         self, monkeypatch
@@ -1446,10 +1542,11 @@ class TestTheRepoRecordFileIsCheckedOnTheWayInAndOut:
     @pytest.mark.parametrize(
         "ts", ["true", "NaN", "Infinity", "-Infinity", "1" + "0" * 400, '"1"', "null"]
     )
-    def test_a_timestamp_that_is_not_a_finite_number_reads_as_none(self, ts):
+    def test_a_timestamp_that_is_not_a_finite_number_is_not_a_record(self, ts):
         _raw_record(f'{{"ts": {ts}, "source": "recall", "repos": []}}')
 
-        assert nodes.read_repo_record("second", "api") is None
+        with pytest.raises(ValueError):
+            nodes.read_repo_record("second", "api")
 
     def test_an_integer_timestamp_reads_back_as_a_float(self):
         _raw_record('{"ts": 5, "source": "recall", "repos": []}')
@@ -1460,15 +1557,17 @@ class TestTheRepoRecordFileIsCheckedOnTheWayInAndOut:
         assert type(record.ts) is float
         assert record.ts == 5.0
 
-    def test_a_body_that_is_not_an_object_reads_as_none(self):
+    def test_a_body_that_is_not_an_object_is_not_a_record(self):
         _raw_record("[]")
 
-        assert nodes.read_repo_record("second", "api") is None
+        with pytest.raises(ValueError):
+            nodes.read_repo_record("second", "api")
 
-    def test_a_source_that_is_not_a_string_reads_as_none(self):
+    def test_a_source_that_is_not_a_string_is_not_a_record(self):
         _raw_record('{"ts": 5, "source": 3, "repos": []}')
 
-        assert nodes.read_repo_record("second", "api") is None
+        with pytest.raises(ValueError):
+            nodes.read_repo_record("second", "api")
 
     @pytest.mark.parametrize(
         ("dirty", "unpushed"), [('"yes"', "true"), ("1", "1.5"), ("null", '"2"')]
@@ -1546,7 +1645,8 @@ class TestTheRepoRecordFileIsCheckedOnTheWayInAndOut:
         record = nodes.RepoRecord(ts=NOW, source="recall", repos=())
 
         assert nodes.write_repo_record("second", "../../../escaped", record) is False
-        assert nodes.read_repo_record("second", "../../../escaped") is None
+        with pytest.raises(nodes.NodeConfigError):
+            nodes.read_repo_record("second", "../../../escaped")
         assert not list(tmp_path.rglob("repos.json"))
 
 
@@ -2282,10 +2382,32 @@ class TestTheLastPullMustFinish:
         result = _recall(runner, placed_api, "--local")
 
         _stopped_before_anything(result, api_repo)
-        assert "could not pull from @second" in result.stderr
-        assert "Permission denied" in result.stderr
+        assert "could not pull from @second (PermissionError)" in result.stderr
         assert result.exception is None or isinstance(result.exception, SystemExit)
         assert node_answers == []
+
+    def test_a_failure_on_this_pc_during_the_pull_names_the_class_only(
+        self, runner, placed_api, node_answers, monkeypatch, caplog
+    ):
+        # inv-unknown: the error CLASS on screen, the full error in nodes.log --
+        # str(exc) carries this PC's path.
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        error = PermissionError(13, "Permission denied", "C:/Users/me/pull.json")
+
+        def _denied(*a, **k):
+            raise error
+
+        monkeypatch.setattr(node_sync, "final_pull", _denied)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 1, result.output
+        assert "(PermissionError)" in result.stderr
+        assert "run the recall again" in result.stderr
+        assert str(error) not in result.output
+        assert "Permission denied" not in result.output
+        assert "pull.json" not in result.output
+        assert any(str(error) in m for m in _node_logs(caplog)), _node_logs(caplog)
 
     def test_a_node_that_did_not_answer_still_goes_on(
         self, runner, placed_api, node_is_gone, api_repo
@@ -2561,8 +2683,9 @@ class TestTheLocalInstallFollowsTheTarRules:
 
 class TestAnUnreadableMapIsNotNotPlaced:
     """cq-G14 M7: recall reads the map strictly. A map still busy after the
-    reader's retries, or torn, is "could not read" and a re-run -- never the
-    untrue "not placed on a node" the tolerant reader's ``{}`` would say."""
+    reader's retries is "could not read" and a re-run; a torn one is
+    "unreadable" and its repair -- never the untrue "not placed on a node"
+    the tolerant reader's ``{}`` would say."""
 
     @pytest.mark.parametrize("damage", ["busy", "torn"])
     def test_an_unreadable_map_fails_with_run_again(
@@ -2580,7 +2703,8 @@ class TestAnUnreadableMapIsNotNotPlaced:
         result = _recall(runner, placed_api, "--local")
 
         assert result.exit_code == 1, result.output
-        assert "could not read the node map" in result.stderr
+        unreadable = "could not read the node map" if damage == "busy" else "unreadable"
+        assert unreadable in result.stderr
         assert "run the recall again" in result.stderr
         assert "not placed" not in result.output
         assert node_answers == []
@@ -3282,3 +3406,176 @@ class TestRecallTo:
         assert "'../escaped'" in result.stderr
         assert node_answers == []
         assert events == []
+
+
+def _node_logs(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == "magent.nodes"]
+
+
+def _map_fix_line(cls: str) -> str:
+    """Recall's words for a node map that is there and cannot be read: no
+    magent command rebuilds it, so the repair is named, never deletion."""
+    return (
+        f"the node map at {nodes.NODE_MAP_PATH} is unreadable ({cls});"
+        " fix or move it aside, then run the recall again"
+    )
+
+
+class TestRecallSaysUnknownNeverAbsentOrATraceback:
+    """inv-unknown U3: what recall cannot read is UNKNOWN. A map unreadable at
+    the clear step -- after the session was stopped and the conversation
+    installed -- is a printed failure naming what to run, never a traceback;
+    every unreadable-map line names the error CLASS only, the full error goes
+    to nodes.log; and a commit record that is there but cannot be read is not
+    "never recorded"."""
+
+    @staticmethod
+    def _damage_map(damage: str, monkeypatch) -> tuple[str, str]:
+        """Make the map unreadable; ``(class name, str(error))`` a reader meets."""
+        if damage == "torn":
+            nodes.NODE_MAP_PATH.write_text('{"api": {"nick": "sec', encoding="utf-8")
+            with pytest.raises(ValueError) as torn:
+                nodes.load_node_map_strict()
+            return type(torn.value).__name__, str(torn.value)
+        error = {
+            "busy": PermissionError(13, "the file is in use by another process"),
+            # Any other OSError: there, not busy -- a re-run meets it again.
+            "io-error": OSError(5, "Input/output error"),
+        }[damage]
+
+        def _unreadable() -> dict[str, nodes.NodeMapEntry]:
+            raise error
+
+        monkeypatch.setattr(nodes, "load_node_map_strict", _unreadable)
+        return type(error).__name__, str(error)
+
+    @pytest.mark.parametrize("damage", ["busy", "torn"])
+    def test_a_map_unreadable_at_the_clear_is_a_printed_failure(
+        self, runner, placed_api, node_answers, monkeypatch, caplog, damage
+    ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        real_update = nodes.update_node_map
+        seen: dict[str, str] = {}
+
+        def _update(project, entry, **kwargs):
+            # Readable for recall's own strict read; unreadable by the clear.
+            seen["cls"], seen["detail"] = self._damage_map(damage, monkeypatch)
+            return real_update(project, entry, **kwargs)
+
+        monkeypatch.setattr(nodes, "update_node_map", _update)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exception is None or isinstance(result.exception, SystemExit), (
+            result.output
+        )
+        assert result.exit_code == 1, result.output
+        assert "could not clear api's placement" in result.stderr
+        assert f"({seen['cls']})" in result.stderr
+        assert "run the recall again" in result.stderr
+        assert "Traceback" not in result.output
+        assert seen["detail"] not in result.output
+        assert any(seen["detail"] in m for m in _node_logs(caplog)), _node_logs(caplog)
+        if damage == "torn":
+            # A re-run alone would only meet the same torn map: name the repair.
+            assert (
+                "could not clear api's placement on @second:"
+                f" {_map_fix_line(seen['cls'])}"
+            ) in result.stderr
+        else:
+            assert "move it aside" not in result.output
+        assert "delete" not in result.output.lower()
+
+    @pytest.mark.parametrize("damage", ["busy", "torn", "io-error"])
+    def test_an_unreadable_map_at_the_start_names_the_class_only(
+        self, runner, placed_api, node_answers, monkeypatch, caplog, damage
+    ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        cls, detail = self._damage_map(damage, monkeypatch)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 1, result.output
+        assert f"({cls})" in result.stderr
+        assert detail not in result.output
+        assert any(detail in m for m in _node_logs(caplog)), _node_logs(caplog)
+
+    @pytest.mark.parametrize("damage", ["busy", "torn", "io-error"])
+    def test_an_unreadable_map_at_the_start_names_its_repair_busy_a_rerun(
+        self, runner, placed_api, node_answers, monkeypatch, damage
+    ):
+        cls, _ = self._damage_map(damage, monkeypatch)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 1, result.output
+        rerun = f"could not read the node map ({cls}); run the recall again"
+        if damage == "busy":
+            # Busy past the reader's retries: another process holds it.
+            assert rerun in result.stderr
+            assert "move it aside" not in result.output
+        else:
+            # Torn, or any OSError but busy: a re-run alone meets it again.
+            assert f"x {_map_fix_line(cls)}" in result.stderr
+            assert rerun not in result.output
+        assert "delete" not in result.output.lower()
+        assert node_answers == []
+
+    @pytest.mark.parametrize(
+        "damage", ["torn", "unopenable", "not-an-object", "not-a-record"]
+    )
+    def test_an_unreadable_commit_record_is_not_never_recorded(
+        self, runner, placed_api, node_is_gone, caplog, damage
+    ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        path = nodes.repo_record_path("second", "api")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        body = {
+            "torn": '{"ts": 5, "sour',
+            "not-an-object": "[]",
+            # Valid JSON, but a ts that is not a number: not a record either.
+            "not-a-record": '{"ts": "5", "source": "recall", "repos": []}',
+        }
+        if damage == "unopenable":
+            path.mkdir()  # there, and it cannot be read
+        else:
+            path.write_text(body[damage], encoding="utf-8")
+        # What the reader itself raises: the log must carry all of it.
+        with pytest.raises((OSError, ValueError)) as info:
+            nodes.read_repo_record("second", "api")
+        cls, detail = type(info.value).__name__, str(info.value)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert "no commit was ever recorded" not in result.stdout
+        assert (
+            f"the commit record for api on @second is unreadable ({cls})"
+            in result.stdout
+        )
+        assert "check the node before relying on `git pull`" in result.stdout
+        assert detail not in result.output
+        assert any(detail in m for m in _node_logs(caplog)), _node_logs(caplog)
+
+    def test_a_failed_install_names_the_class_only(
+        self, runner, placed_api, node_answers, monkeypatch, caplog
+    ):
+        # The same rule as the last pull's: str(exc) carries a path of this PC.
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        error = PermissionError(13, "Access is denied", "C:/Users/me/held.jsonl")
+
+        def _denied(source, dest):
+            raise error
+
+        monkeypatch.setattr(remote_mux, "copy_mirror", _denied)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 1, result.output
+        assert "could not install the conversation into " in result.stderr
+        assert (
+            "(PermissionError); api stays placed on @second -- run the recall again"
+        ) in result.stderr
+        assert str(error) not in result.output
+        assert "held.jsonl" not in result.output
+        assert any(str(error) in m for m in _node_logs(caplog)), _node_logs(caplog)
+        assert "api" in nodes.read_node_map()

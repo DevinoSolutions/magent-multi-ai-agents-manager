@@ -760,6 +760,8 @@ def run_magent(config: MagentConfig, opts: RunOpts) -> int:
     )
     for note in placements.notes:
         click.echo(f"  {style('!', fg='yellow')} {style(note, dim=True)}")
+    for line in placements.refused:
+        click.echo(f"  {style('x', fg='red')} {line}")
     projects = placements.projects
 
     base_dir = config.base_dir
@@ -852,11 +854,14 @@ class NodePlacements:
     """What the placement phase hands the launch phase (spec §11): the
     projects with every ``"auto"`` replaced by a concrete nick (an unplaceable
     one is dropped), the lines to print, and each auto project's Placement --
-    `magent node plan` renders these same objects."""
+    `magent node plan` renders these same objects. ``notes`` are advisories;
+    ``refused`` are failures -- an auto project not brought up because where
+    it runs is unknown -- printed as a red ``x`` like ``up``'s."""
 
     projects: list[ProjectConfig]
     notes: list[str]
     placements: dict[str, NodePlacement]
+    refused: list[str] = dataclasses.field(default_factory=list)
 
 
 def _kept(
@@ -875,6 +880,10 @@ def _live_sampler(config: MagentConfig) -> Callable[[str], LoadSample | None]:
 
     user = env.local_username()
     log = get_logger("launch")
+    # Warm remote_mux's own logger here, on the calling thread: get_logger is
+    # check-then-set, so two first calls racing on sampler worker threads
+    # could each attach a handler and double every "nodes" line.
+    get_logger("nodes")
 
     def sample(nick: str) -> LoadSample | None:
         try:
@@ -886,6 +895,22 @@ def _live_sampler(config: MagentConfig) -> Callable[[str], LoadSample | None]:
         return reading
 
     return sample
+
+
+def _unplaced_reason(samples: dict[str, list[LoadSample]], *, live: bool) -> str:
+    """Why no node could be scored, named per cause. ``samples`` is
+    ``placement_samples``' output, where a node ends up with no sample only
+    when its window was empty and either no live reading was allowed (a dry
+    run or a tile-only pass -- the wording fits both) or the live reading
+    failed -- a thin node always gets one."""
+    from magent import nodes
+
+    blank = ", ".join(nick for nick, window in samples.items() if not window)
+    if not blank:
+        return nodes.PLACE_REASONS["no-data"]
+    if not live:
+        return f"no live reading taken: {blank} would take a live reading at launch"
+    return f"live reading failed for {blank} (see ~/.magent/logs/launch.log)"
 
 
 def place_node_projects(
@@ -905,6 +930,13 @@ def place_node_projects(
     never opens a connection: a thin node is then scored on what it has.
     Only ``auto`` is ever placed: local, pinned and ``cloud`` projects
     (DECISION-15; ``cloud`` is pin-only) pass through untouched.
+
+    The map is read strictly (``_node_map_for_placement``). Unreadable, NO
+    ``auto`` project is placed: each is dropped with the map's refusal (in
+    ``refused``, a failure) and an ``"unknown"`` Placement (D17: its node is
+    None), nothing is sampled, and the rest of the fleet goes on. A node
+    whose load history cannot be read is placed on as if it had none (one
+    live reading, or unscored in a dry run) and named in ``notes``.
     """
     from magent import nodes
     from magent.config import NODE_AUTO
@@ -912,17 +944,41 @@ def place_node_projects(
     auto = [p for p in projects if p.node == NODE_AUTO]
     if not auto:
         return NodePlacements(list(projects), [], {})
+    entries, unreadable = _node_map_for_placement()
+    if unreadable is not None:
+        # Read as {}, an auto project already running on a node would be
+        # scored onto a fresh one: a second session while the first runs.
+        get_logger("nodes").warning(
+            "auto placement skipped, node map unreadable: %s", unreadable
+        )
+        return NodePlacements(
+            [p for p in projects if p.node != NODE_AUTO],
+            [],
+            {nodes.project_name(p): nodes.Placement(None, "unknown") for p in auto},
+            refused=[
+                f"{nodes.project_name(p)}: {_map_unreadable_text(unreadable)}"
+                for p in auto
+            ],
+        )
     when = time.time() if now is None else now
-    entries = nodes.read_node_map()
     samples: dict[str, list[LoadSample]] = {}
     sampled: frozenset[str] = frozenset()
+    unreadable_history: dict[str, OSError | ValueError] = {}
     if not all(_kept(config, entries, p) for p in auto):
         samples, sampled = nodes.placement_samples(
-            config, now=when, live_sample=_live_sampler(config) if live else None
+            config,
+            now=when,
+            live_sample=_live_sampler(config) if live else None,
+            on_unreadable=unreadable_history.__setitem__,
         )
     spread: dict[str, int] = {}
     out: list[ProjectConfig] = []
-    notes: list[str] = []
+    # An unreadable history is unknown, not "never sampled": said, class only.
+    notes: list[str] = [
+        f"@{nick}: its load history is unreadable ({type(exc).__name__});"
+        + (" scored on one live reading" if nick in sampled else " not scored")
+        for nick, exc in unreadable_history.items()
+    ]
     chosen: dict[str, NodePlacement] = {}
     for proj in projects:
         if proj.node != NODE_AUTO:
@@ -943,10 +999,12 @@ def place_node_projects(
             notes.append(f"{name}: {placement.note}")
         if placement.nick is None:
             notes.append(
-                f"{name}: not launched -- {nodes.PLACE_REASONS['no-data']};"
+                f"{name}: not launched -- {_unplaced_reason(samples, live=live)};"
                 ' pin a node with "node": "<nick>"'
             )
             continue
+        # A kept project's session is already running there and already counts
+        # in that node's my_sessions; adding it to the spread would count it twice.
         if placement.reason != "kept":
             spread[placement.nick] = spread.get(placement.nick, 0) + 1
         out.append(dataclasses.replace(proj, node=placement.nick))
@@ -1346,7 +1404,7 @@ def _node_map_snapshot(
 def _node_map_for_placement() -> tuple[
     dict[str, NodeMapEntry], OSError | ValueError | None
 ]:
-    """The node map for a decision that places something: ``(entries,
+    """The node map for a decision that places or stops something: ``(entries,
     None)``, or ``({}, the error)`` when it cannot be read -- torn, or still
     busy after its retries. Never ``read_node_map``'s ``{}``: an unreadable
     map is UNKNOWN, not "nothing is placed", and read as empty an ``auto``
@@ -2545,12 +2603,12 @@ def stop_node_sessions(
     from magent.env import local_username
 
     log = get_logger("nodes")
-    try:
-        entries = nodes.load_node_map_strict()
-        map_known = True
-    except (OSError, ValueError) as exc:
-        log.warning("down: node map unreadable, no placement is trusted: %s", exc)
-        entries, map_known = {}, False
+    entries, unreadable = _node_map_for_placement()
+    map_known = unreadable is None
+    if unreadable is not None:
+        log.warning(
+            "down: node map unreadable, no placement is trusted: %s", unreadable
+        )
     # A pull can wait out a held lock and then a slow node, one session after
     # another: minutes. Say so before the first (the fan-out rule).
     due = sum(

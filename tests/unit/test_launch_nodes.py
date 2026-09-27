@@ -1705,8 +1705,12 @@ class TestGoBringsNodeProjectsUp:
         proj = ProjectConfig(path=str(tmp_path), node="auto")
         launch.run_magent(_config(proj), launch.RunOpts(dry_run=True))
         # G's placement phase resolves auto before anything launches, and
-        # names why it found no node (nodes.PLACE_REASONS['no-data']).
-        assert "no node has load samples to score" in capsys.readouterr().out
+        # names why it found no node: a dry run takes no live reading, so
+        # the empty windows say what the real run would do (launch.
+        # _unplaced_reason).
+        out = capsys.readouterr().out
+        assert "no live reading taken:" in out
+        assert "would take a live reading at launch" in out
 
     def test_dry_run_names_a_folder_this_user_may_not_read(
         self, desk, no_sleep, tmp_path, monkeypatch, capsys, caplog

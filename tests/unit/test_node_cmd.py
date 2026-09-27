@@ -216,6 +216,21 @@ class TestTheNodeTable:
 
         assert "no data" in result.stdout
 
+    def test_an_unreadable_history_says_unreadable_not_no_data(
+        self, runner, tmp_config
+    ):
+        # Unknown, not "never sampled": the file is there and cannot be read.
+        path = nodes.load_path("second")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\xff\xfe not utf-8 \x80\x81\n")
+        cfg = tmp_config(config_json(("second",), []))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node"])
+
+        assert result.exit_code == 0, result.output
+        assert "unreadable (UnicodeDecodeError)" in _row(result.stdout, "second")
+        assert "no data" not in result.stdout
+
     def test_the_daemon_column_reads_the_sync_heartbeat(self, runner, tmp_config):
         log.write_heartbeat(node_sync.HEARTBEAT_NAME)
         cfg = tmp_config(config_json(("second",), []))
@@ -461,6 +476,33 @@ class TestNodePlan:
             f"api  auto -> nowhere ({nodes.PLACE_REASONS['no-data']})" in result.stdout
         )
         assert "'third' is no longer in settings.nodes" in result.stdout
+
+    @pytest.mark.parametrize("unreadable", ["torn", "busy"])
+    def test_plan_says_node_unknown_when_the_map_cannot_be_read(
+        self, runner, tmp_config, api_dir, no_states, monkeypatch, unreadable
+    ):
+        # api runs on third; the map that says so cannot be read, so plan must
+        # neither guess a node nor claim there is no load data (D17).
+        monkeypatch.setattr(remote_mux, "sample", lambda node: None)
+        seed_history("second", "quiet", now=time.time() + 30)
+        nodes.update_node_map("api", entry("third"))
+        if unreadable == "torn":
+            nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+        else:
+
+            def busy() -> dict[str, nodes.NodeMapEntry]:
+                raise PermissionError(13, "The process cannot access the file")
+
+            monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+        cfg = tmp_config(config_json(("second", "third"), [_project(api_dir, "auto")]))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "plan", "api"])
+
+        assert result.exit_code == 0
+        assert "api  auto -> (node unknown)" in result.stdout
+        assert "@second" not in result.stdout
+        # The refusal a launch would print, as the same failure line.
+        assert "x api: the node map could not be read" in result.stdout
 
     def test_plan_for_an_unknown_project_exits_2(self, runner, tmp_config, api_dir):
         cfg = tmp_config(config_json(("second",), [_project(api_dir, "auto")]))

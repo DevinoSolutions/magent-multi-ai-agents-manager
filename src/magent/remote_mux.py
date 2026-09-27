@@ -54,13 +54,18 @@ from magent.env import git_child_env
 from magent.log import get_logger
 
 # pullable_sid is re-exported: its one owner is nodes.py (a leaf that must not
-# reach into this seam), and callers keep saying remote_mux.pullable_sid.
+# reach into this seam), and callers keep saying remote_mux.pullable_sid. The
+# one load-sample parse is the leaf's too (with its _finite, which parse_pull
+# also reads the node's clock and resume points through); sample() and
+# parse_pull call it.
 from magent.nodes import (
     READ_FLAGS,
     LoadSample,
     LocalGitState,
     NodeConfigError,
     RepoStatus,
+    _finite,
+    _load_sample,
     _safe_part,
     absolute_remote,
     encoded_project_dir,
@@ -716,59 +721,6 @@ def decorate(node: Node, sid: str, nick: str) -> bool:
     return result.returncode == 0
 
 
-def _finite(value: object) -> float:
-    """``value`` as a float. Three refusals:
-
-    - TypeError for a non-number. A bool and a numeric string both count:
-      json's ``true`` is a Python bool (an int subclass), and ``sample.sh``
-      prints bare numbers, so ``"1.5"`` is not a reading. The isinstance
-      guard is also what narrows ``object`` for ty.
-    - ValueError for NaN or an infinity: json accepts them, the snapshot
-      writer does not.
-    - OverflowError for an int too large for a float (json has no bound on
-      an integer's digits)."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"not a number: {value!r}")
-    number = float(value)
-    if not math.isfinite(number):
-        raise ValueError(f"non-finite reading: {number}")
-    return number
-
-
-def _integral(value: object) -> int:
-    """``value`` as an int, as strict as ``_finite``: TypeError for a
-    non-number (a bool and a str included), ValueError for a float that is
-    not finite or not whole (``16.9``). A whole float (``16.0``) is taken."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"not a number: {value!r}")
-    if isinstance(value, int):
-        return value
-    if not math.isfinite(value) or not value.is_integer():
-        raise ValueError(f"not a whole reading: {value}")
-    return int(value)
-
-
-def _load_sample(raw: object) -> LoadSample:
-    """``magent_sample``'s JSON object as a LoadSample -- the ONE parse, shared
-    by ``sample()`` and ``parse_pull``. KeyError, TypeError, ValueError or
-    OverflowError when it is not one: a JSON list or string is a TypeError,
-    and every field goes through ``_finite``/``_integral``, whose refusals
-    (non-number, bool, string, NaN, infinity, fractional count, an integer too
-    large for a float) are those exceptions."""
-    if not isinstance(raw, dict):
-        raise TypeError(f"expected an object, got {type(raw).__name__}")
-    return LoadSample(
-        ts=_finite(raw["ts"]),
-        nproc=_integral(raw["nproc"]),
-        load1=_finite(raw["load1"]),
-        load5=_finite(raw["load5"]),
-        load15=_finite(raw["load15"]),
-        mem_total_mb=_integral(raw["mem_total_mb"]),
-        mem_avail_mb=_integral(raw["mem_avail_mb"]),
-        my_sessions=_integral(raw["my_sessions"]),
-    )
-
-
 def sample(node: Node) -> LoadSample:
     """One load reading from ``node`` (``sample.sh``). RemoteError when the node
     can't be reached, or answers something that is not a sample -- rc 0 on
@@ -781,8 +733,9 @@ def sample(node: Node) -> LoadSample:
         reading = _load_sample(json.loads(result.stdout.decode("utf-8", "replace")))
     # OverflowError is an ArithmeticError, not a ValueError: float() of a
     # 401-digit integer overflows. (`1e400` parses to inf, a ValueError from
-    # _finite/_integral.) RecursionError is json.loads' answer to deep nesting,
-    # which fits easily inside the reply cap: the node's bad answer too.
+    # nodes._finite/_integral.) RecursionError is json.loads' answer to deep
+    # nesting, which fits easily inside the reply cap: the node's bad answer
+    # too.
     except (ValueError, KeyError, TypeError, OverflowError, RecursionError) as e:
         shown = _run_shown(node, *_script_call("sample", [], None))
         raise RemoteError(

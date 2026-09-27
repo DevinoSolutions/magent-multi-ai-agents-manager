@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
@@ -300,10 +301,6 @@ def read_node_map() -> dict[str, NodeMapEntry]:
 
 
 # What every surface says for a map ``load_node_map_strict`` refused.
-# D-MERGE: (G step) Gmap carries its own copy of launch._map_unreadable_text
-# saying "the node map is unreadable (<Class>)"; at the Gmap merge keep
-# launch's one copy, which builds on map_unread_text, and move Gmap's pins to
-# this sentence, so `up` and `down` name it in one phrasing.
 MAP_UNREAD = "the node map could not be read"
 
 
@@ -1661,49 +1658,103 @@ class NodeScore:
     below_floor: bool = False
 
 
-def _load_sample(line: str) -> LoadSample | None:
-    try:
-        row = json.loads(line)
-    except ValueError:
-        return None
-    if not isinstance(row, dict):
-        return None
-    try:
-        sample = LoadSample(
-            ts=float(row["ts"]),
-            nproc=int(row["nproc"]),
-            load1=float(row["load1"]),
-            load5=float(row["load5"]),
-            load15=float(row["load15"]),
-            mem_total_mb=int(row["mem_total_mb"]),
-            mem_avail_mb=int(row["mem_avail_mb"]),
-            my_sessions=int(row["my_sessions"]),
-        )
-    except (KeyError, TypeError, ValueError):
-        return None
-    return sample
+def _finite(value: object) -> float:
+    """``value`` as a float. Three refusals:
+
+    - TypeError for a non-number. A bool and a numeric string both count:
+      json's ``true`` is a Python bool (an int subclass), and ``sample.sh``
+      prints bare numbers, so ``"1.5"`` is not a reading. The isinstance
+      guard is also what narrows ``object`` for ty.
+    - ValueError for NaN or an infinity: json accepts them, the snapshot
+      writer does not.
+    - OverflowError for an int too large for a float (json has no bound on
+      an integer's digits)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"not a number: {value!r}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"non-finite reading: {number}")
+    return number
+
+
+def _integral(value: object) -> int:
+    """``value`` as an int, as strict as ``_finite``: TypeError for a
+    non-number (a bool and a str included), ValueError for a float that is
+    not finite or not whole (``16.9``), OverflowError for an int too large
+    for a float. A whole float (``16.0``) is taken.
+
+    The overflow bound is the scorer's: every count ends up in float
+    arithmetic (load per core, the free-memory fraction), so a count json
+    parsed as a 401-digit int is refused HERE, where every caller already
+    catches OverflowError, rather than crashing ``score_node`` later."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"not a number: {value!r}")
+    if isinstance(value, int):
+        float(value)  # OverflowError past a float's range; the value stays exact
+        return value
+    if not math.isfinite(value) or not value.is_integer():
+        raise ValueError(f"not a whole reading: {value}")
+    return int(value)
+
+
+def _load_sample(raw: object) -> LoadSample:
+    """``magent_sample``'s JSON object as a LoadSample -- the ONE parse, shared
+    by ``remote_mux.sample()``, ``remote_mux.parse_pull`` and
+    ``read_load_history``. KeyError, TypeError, ValueError or OverflowError
+    when it is not one: a JSON list or string is a TypeError, and every field
+    goes through ``_finite``/``_integral``, whose refusals (non-number, bool,
+    string, NaN, infinity, fractional count, an integer too large for a
+    float) are those exceptions."""
+    if not isinstance(raw, dict):
+        raise TypeError(f"expected an object, got {type(raw).__name__}")
+    return LoadSample(
+        ts=_finite(raw["ts"]),
+        nproc=_integral(raw["nproc"]),
+        load1=_finite(raw["load1"]),
+        load5=_finite(raw["load5"]),
+        load15=_finite(raw["load15"]),
+        mem_total_mb=_integral(raw["mem_total_mb"]),
+        mem_avail_mb=_integral(raw["mem_avail_mb"]),
+        my_sessions=_integral(raw["my_sessions"]),
+    )
 
 
 def parse_load_lines(lines: Iterable[str]) -> list[LoadSample]:
-    """LoadSamples out of ``load.jsonl`` lines. A malformed line is skipped:
-    the daemon appends while a reader reads, so a torn last line is normal."""
-    return [s for s in (_load_sample(line) for line in lines) if s is not None]
+    """LoadSamples out of ``load.jsonl`` lines, through the one strict parse.
+    A line it refuses is skipped, never fatal: the daemon appends while a
+    reader reads, so a torn last line is normal, and one bad reading must not
+    take the whole placement pass down with it."""
+    samples: list[LoadSample] = []
+    for line in lines:
+        try:
+            samples.append(_load_sample(json.loads(line)))
+        # RecursionError: json.loads' answer to deep nesting, which is not a
+        # ValueError -- a corrupt line like any other.
+        except (KeyError, TypeError, ValueError, OverflowError, RecursionError):
+            continue
+    return samples
 
 
 def read_load_history(nick: str, *, nodes_dir: Path | None = None) -> list[LoadSample]:
     """Every sample the daemon kept for ``nick`` (``<nick>/load.jsonl``), or
-    [] when it never sampled that node."""
+    [] when it never sampled that node -- the file does not exist. A file
+    that is there and cannot be read (any other OSError, or bytes that are
+    not UTF-8: UnicodeDecodeError, a ValueError) raises: that is unknown,
+    not "never sampled"."""
     path = load_path(nick, nodes_dir=nodes_dir)  # E's (DECISION-19): one layout owner
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except FileNotFoundError:
         return []
     return parse_load_lines(text.splitlines())
 
 
 def in_window(samples: Iterable[LoadSample], *, now: float) -> list[LoadSample]:
     """The samples placement may use: the last ``PLACEMENT_WINDOW_S``. No
-    upper bound, so a node whose clock runs ahead is not thrown away."""
+    upper bound: every ts is stamped on THIS PC's clock (node_sync), so a
+    sample past ``now`` is only ever a few seconds ahead of the caller's own
+    reading of the clock (tests seed at ``time.time() + 30`` for that
+    reason), never a node's clock drifting."""
     start = now - PLACEMENT_WINDOW_S
     return [s for s in samples if s.ts >= start]
 
@@ -1728,23 +1779,31 @@ def score_node(
 ) -> NodeScore | None:
     """Spec §11 over one node's window; None when there is nothing to score.
 
-    Load is per core, so a 32-core box at load 8 reads as quiet. Memory and my
-    session count come from the NEWEST sample: they are levels, not rates.
-    ``extra_sessions`` counts projects this same pass already put here.
+    Load is per core (``load1``, spec §11's ``u``), so a 32-core box at load 8
+    reads as quiet. Memory and my session count come from the NEWEST sample:
+    they are levels, not rates. Two samples sharing the newest ts resolve to
+    the worse one (less free memory, then more of my sessions), so the score
+    never depends on the order they were read in. ``extra_sessions`` counts
+    projects this same pass already put here.
+
+    A negative reading is clamped to zero -- load per core, the free-memory
+    fraction and my session count alike -- so a broken sampler can make a
+    node look idle at best, never better than idle, and never win placement
+    on an impossible number.
     """
     if not window:
         return None
-    usage = [s.load1 / max(s.nproc, 1) for s in window]
+    usage = [max(0.0, s.load1 / max(s.nproc, 1)) for s in window]
     p75 = _p75(usage)
     spike = SPIKE_WEIGHT * max(0.0, max(usage) - SPIKE_RATIO * p75)
-    latest = max(window, key=lambda s: s.ts)
+    latest = max(window, key=lambda s: (s.ts, -s.mem_avail_mb, s.my_sessions))
     mem = 0.0
     below_floor = False
     if latest.mem_total_mb > 0:
-        free = latest.mem_avail_mb / latest.mem_total_mb
+        free = max(0.0, latest.mem_avail_mb / latest.mem_total_mb)
         mem = MEM_WEIGHT * max(0.0, MEM_FLOOR - free)
         below_floor = free < MEM_HARD_FLOOR
-    mine = latest.my_sessions + extra_sessions
+    mine = max(0, latest.my_sessions) + extra_sessions
     return NodeScore(
         nick=nick,
         samples=len(window),
@@ -1765,13 +1824,15 @@ PLACE_REASONS: dict[str, str] = {
     "re-placed": "its node left settings.nodes; placed again by load",
     "placed": "lowest load score over the last 30 minutes",
     "no-data": "no node has load samples to score",
+    "unknown": f"{MAP_UNREAD}, so where it runs is unknown",
 }
 
 
 @dataclass(frozen=True)
 class Placement:
     """Where an ``auto`` project goes, why, and every score behind it.
-    ``nick`` is None only for ``no-data``. ``note`` is a line to print."""
+    ``nick`` is None only for ``no-data`` and ``unknown`` (the map could not
+    be read). ``note`` is a line to print."""
 
     nick: str | None
     reason: str
@@ -1826,6 +1887,8 @@ def place(
         return Placement(None, "no-data", scored, vanished)
     order = {nick: index for index, nick in enumerate(nicks)}
     candidates = [s for s in scored if not s.below_floor] or list(scored)
+    # round(..., 9): scores equal up to float noise from summing the terms tie
+    # exactly, so config order decides, not the last bit.
     best = min(candidates, key=lambda s: (round(s.score, 9), order[s.nick]))
     if vanished is None:
         return Placement(best.nick, "placed", scored)
@@ -1840,6 +1903,7 @@ def placement_samples(
     now: float,
     live_sample: Callable[[str], LoadSample | None] | None,
     nodes_dir: Path | None = None,
+    on_unreadable: Callable[[str, OSError | ValueError], None] | None = None,
 ) -> tuple[dict[str, list[LoadSample]], frozenset[str]]:
     """Each configured node's window, ready for ``place``, plus which nodes
     were read live.
@@ -1850,15 +1914,46 @@ def placement_samples(
     win. ``live_sample`` is the caller's seam to ``remote_mux.sample`` (this
     module never talks to a node); None -- a dry run -- scores a thin node on
     what it has. A failed live reading leaves the node unscored.
+
+    The sparse nodes are probed at once, one thread each, so a pool where
+    every node is thin (a fresh install, the sync daemon off) costs one probe
+    timeout before launch, not one per node. ``live_sample`` signals an
+    unreachable node by returning None, which leaves that node unscored; it
+    must not raise for that. Anything it does raise propagates (the caller's
+    wrapper is where a transport error becomes None). The live reading is
+    deliberately NOT appended to ``load.jsonl``: the sync daemon owns sampling
+    and that file has one writer, so a second placement pass inside the
+    window probes the node again.
+
+    A history that cannot be read is an empty window, so the sparse rule
+    applies to it; it is logged in full to nodes.log and handed to
+    ``on_unreadable`` so the caller can SAY so -- unknown, never read as
+    "the daemon never sampled this node".
     """
+    windows: dict[str, list[LoadSample]] = {}
+    for nick in config.settings.nodes:
+        try:
+            history = read_load_history(nick, nodes_dir=nodes_dir)
+        except (OSError, ValueError) as exc:
+            get_logger("nodes").warning(
+                "load history for node %s is unreadable: %s", nick, exc
+            )
+            if on_unreadable is not None:
+                on_unreadable(nick, exc)
+            history = []
+        windows[nick] = in_window(history, now=now)
+    sparse = [nick for nick, w in windows.items() if len(w) < MIN_WINDOW_SAMPLES]
+    readings: dict[str, LoadSample | None] = {}
+    if live_sample is not None and sparse:
+        with ThreadPoolExecutor(max_workers=len(sparse)) as executor:
+            readings = dict(zip(sparse, executor.map(live_sample, sparse), strict=True))
     samples: dict[str, list[LoadSample]] = {}
     sampled: set[str] = set()
-    for nick in config.settings.nodes:
-        window = in_window(read_load_history(nick, nodes_dir=nodes_dir), now=now)
-        if len(window) >= MIN_WINDOW_SAMPLES or live_sample is None:
+    for nick, window in windows.items():
+        if nick not in readings:
             samples[nick] = window
             continue
-        reading = live_sample(nick)
+        reading = readings[nick]
         if reading is None:
             samples[nick] = []
             continue
@@ -1871,8 +1966,10 @@ def placement_samples(
 
 # A top-level conversation's file is named by its session id (a UUID); the
 # subagent logs beside it are ``agent-<hex>.jsonl`` and are not resumable.
+# Always ``fullmatch``: the id lands on a ``claude --resume`` line, and ``$``
+# (or ``match``) would let a trailing newline -- an Enter -- ride along.
 _SESSION_STEM = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 )
 
 
@@ -1882,18 +1979,33 @@ def latest_transcript_id(
     """The newest pulled conversation's id, or None when nothing was pulled.
 
     The file stem IS the session id (verified: every record's ``sessionId``
-    equals it). Newest by mtime -- tar keeps the node's mtimes -- and by name
-    on a tie, so the answer never depends on directory order.
+    equals it). "Newest" means most recently active ON THE NODE: tar keeps the
+    node's mtimes, so the pulled file carries them. A member stored without a
+    usable mtime gets the local pull time instead and can win -- rare, and
+    still a valid id. A tie breaks by name, so the answer never depends on
+    directory order.
+
+    Only a regular file whose stem is a whole UUID counts. Each candidate is
+    stat'ed on its own: one file vanishing mid-pull is skipped, it does not
+    blank the answer for the whole folder.
     """
     folder = transcripts_dir(nick, sid, nodes_dir=nodes_dir)
     try:
-        candidates = [p for p in folder.glob("*.jsonl") if _SESSION_STEM.match(p.stem)]
-        newest = max(
-            candidates, key=lambda p: (p.stat().st_mtime, p.name), default=None
-        )
+        paths = list(folder.glob("*.jsonl"))
     except OSError:
         return None
-    return None if newest is None else newest.stem
+    candidates: list[tuple[float, str, str]] = []
+    for path in paths:
+        if _SESSION_STEM.fullmatch(path.stem) is None:
+            continue
+        try:
+            info = path.stat()
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode):
+            candidates.append((info.st_mtime, path.name, path.stem))
+    newest = max(candidates, default=None)
+    return None if newest is None else newest[2]
 
 
 # --- what a node's repos looked like (spec §12 step 2) --------------------------
@@ -2021,20 +2133,23 @@ def _repo_status(row: object) -> RepoStatus | None:
 def read_repo_record(
     nick: str, sid: str, *, nodes_dir: Path | None = None
 ) -> RepoRecord | None:
-    """The stored record, or None when there is none, it is unreadable, its
-    ``ts`` is not a finite number (the node map's rule, ``_epoch``), or the
-    ``sid`` is unsafe (NodeConfigError is a ValueError). A malformed row is
-    dropped on its own."""
+    """The stored record, or an error -- never a guess. None means exactly
+    one thing: there is no record file. A file that cannot be read raises
+    its OSError; one that is torn or not UTF-8, is not a record -- not an
+    object, a ``ts`` that is not a finite number (the node map's rule,
+    ``_epoch``), a bad ``source`` or ``repos`` -- or an unsafe ``sid``
+    (NodeConfigError) raises a ValueError. Unknown is never read as "no
+    record was ever written". A malformed row is dropped on its own."""
+    path = repo_record_path(nick, sid, nodes_dir=nodes_dir)
     try:
-        body = json.loads(
-            repo_record_path(nick, sid, nodes_dir=nodes_dir).read_text(encoding="utf-8")
-        )
-    except (OSError, ValueError):
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return None
+    body = json.loads(text)
     if not isinstance(body, dict):
-        return None
+        raise ValueError(f"{path}: not a JSON object")  # noqa: TRY004  # reason: corrupt DATA, the same family as a torn file's JSONDecodeError; callers catch one type for every bad file
     ts, source, rows = _epoch(body.get("ts")), body.get("source"), body.get("repos")
     if ts is None or not isinstance(source, str) or not isinstance(rows, list):
-        return None
+        raise ValueError(f"{path}: not a repo record")
     repos = tuple(s for s in (_repo_status(r) for r in rows) if s is not None)
     return RepoRecord(ts=ts, source=source, repos=repos)
