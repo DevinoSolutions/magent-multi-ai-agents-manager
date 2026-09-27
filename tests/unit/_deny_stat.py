@@ -26,13 +26,18 @@ if TYPE_CHECKING:
 
 def py314_pathlib(monkeypatch: pytest.MonkeyPatch) -> None:
     """Python 3.14's existence contract on every version: ``Path.is_dir``/
-    ``is_file``/``exists`` and ``os.path.isdir``/``isfile``/``exists`` answer
-    False for ANY error. Each asks ``os.stat`` at call time, so it meets
-    ``deny_stat`` on every version too (3.10's Path bound ``os.stat`` at
-    import; 3.14's skip it on Windows)."""
+    ``is_file``/``exists``/``is_symlink`` and ``os.path.isdir``/``isfile``/
+    ``exists``/``islink`` answer False for ANY error. Each asks ``os.stat``
+    at call time, so it meets ``deny_stat`` on every version too (3.10's Path
+    bound ``os.stat`` at import; 3.14's skip it on Windows). ``is_symlink``
+    is here because 3.11-3.13 route it through ``os.stat`` and RAISE: a
+    ``not path.is_symlink() and path.is_file()`` revert then fails the way
+    the vetted check does, and passes a pin 3.14 fails."""
 
-    def answers(test: Callable[[int], bool]) -> Callable[..., bool]:
-        def check(path: object, *, follow_symlinks: bool = True) -> bool:
+    def answers(
+        test: Callable[[int], bool], *, follow: bool = True
+    ) -> Callable[..., bool]:
+        def check(path: object, *, follow_symlinks: bool = follow) -> bool:
             try:
                 mode = os.stat(path, follow_symlinks=follow_symlinks).st_mode
             except (OSError, ValueError):
@@ -43,9 +48,20 @@ def py314_pathlib(monkeypatch: pytest.MonkeyPatch) -> None:
 
     is_dir, is_file = answers(stat.S_ISDIR), answers(stat.S_ISREG)
     exists = answers(lambda _mode: True)
-    for name, check in (("is_dir", is_dir), ("is_file", is_file), ("exists", exists)):
+    is_link = answers(stat.S_ISLNK, follow=False)
+    for name, check in (
+        ("is_dir", is_dir),
+        ("is_file", is_file),
+        ("exists", exists),
+        ("is_symlink", is_link),
+    ):
         monkeypatch.setattr(Path, name, check)
-    for name, check in (("isdir", is_dir), ("isfile", is_file), ("exists", exists)):
+    for name, check in (
+        ("isdir", is_dir),
+        ("isfile", is_file),
+        ("exists", exists),
+        ("islink", is_link),
+    ):
         monkeypatch.setattr(os.path, name, check)
 
 
