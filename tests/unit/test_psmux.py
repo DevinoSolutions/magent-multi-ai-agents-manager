@@ -412,7 +412,7 @@ class TestTheFanOutWaitsOnOneDeadline:
         assert hung.killed
         assert all(waited < self.BUDGET_S * 0.8 for waited in hung.waited), hung.waited
 
-    def test_the_window_is_sized_for_a_loaded_host_and_the_attach_read(self):
+    def test_the_window_fits_a_loaded_host_and_its_share_of_the_attach_read(self):
         # Floor: under a spawn storm one display-message routinely runs past
         # 3 s (FLASH_TIMEOUT_S's measurement), and a spawn storm is exactly
         # when the bring-up's send-verify reads this fan-out. The window is
@@ -420,8 +420,11 @@ class TestTheFanOutWaitsOnOneDeadline:
         # slow start read every pane as unknown and the re-send was skipped.
         assert psmux._FAN_OUT_TIMEOUT_S >= 10
         # Ceiling: idle_sessions runs two fan-outs back to back (foreground,
-        # then pane pids), and on the attach path it runs inside the ssh
-        # status read of `up --json --revive`.
+        # then pane pids), so this bounds its SHARE of attach's 30 s
+        # `up --json --revive` ssh read, not the read: the has-session probes
+        # before it are unbounded on purpose (live_sessions' docstring) and
+        # each send_keys after it may take 20 s, so the whole path has no
+        # finite bound for a pin to hold.
         from magent.cli import attach
 
         assert 2 * psmux._FAN_OUT_TIMEOUT_S < attach._STATUS_TIMEOUT_S

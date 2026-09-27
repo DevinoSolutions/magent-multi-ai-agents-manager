@@ -729,9 +729,13 @@ def pane_pids(names: list[str], psmux: str | None = None) -> dict[str, int | Non
 # already exited may take to hand over its output once that budget is spent.
 # Paid once per batch, so it is sized for a loaded host: under a spawn storm a
 # single display-message runs past 3 s (see FLASH_TIMEOUT_S), and a spawn storm
-# is exactly when the bring-up's send-verify reads this. The ceiling is the
-# attach path: idle_sessions runs two fan-outs inside `up --json --revive`'s
-# 30 s ssh status read.
+# is exactly when the bring-up's send-verify reads this. Ceiling: idle_sessions
+# runs two of these fan-outs back to back, so 2x this bounds idle_sessions'
+# SHARE of attach's 30 s `up --json --revive` ssh read, not the read itself.
+# The rest of that path has no finite bound to sum: live_sessions' sweep
+# before it is unbounded on purpose (a slow server must not read dead),
+# revive_sessions' has_session pool runs ceil(n/16) waves in series, and each
+# send_keys after it may take SEND_KEYS_TIMEOUT_S (20 s) per pane.
 _FAN_OUT_TIMEOUT_S = 10.0
 _FAN_OUT_DRAIN_S = 0.1
 

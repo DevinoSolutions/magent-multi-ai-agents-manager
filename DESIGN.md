@@ -1843,9 +1843,19 @@ the window is paid once, it is sized for a loaded host, not an idle one: 10 s.
 Under a spawn storm a single `display-message` runs past 3 s (the measurement
 behind `FLASH_TIMEOUT_S`), and a storm is exactly when the send-verify reads
 the fan-out. At 5 s one slow start read every pane as unknown and skipped the
-re-send. The ceiling is the attach path: `idle_sessions` runs two fan-outs
-back to back, and on attach it runs inside the 30 s ssh read of
-`up --json --revive`.
+re-send. On attach the window bounds a share, not the whole read:
+`idle_sessions` runs two fan-outs back to back, so 2 x 10 s bounds its SHARE
+of the 30 s ssh read of `up --json --revive`, not that read. The rest of the
+path has no finite bound to sum — `live_sessions`' sweep before it is
+unbounded on purpose (a slow server must not read dead), revive's
+`has_session` pool runs ceil(n/16) waves in series, and each `send_keys` after
+it may take `SEND_KEYS_TIMEOUT_S` (20 s) per pane.
+
+The snapshot the verdict rests on is complete or it is nothing: a Toolhelp
+walk ends only on `ERROR_NO_MORE_FILES`, and a `Process32NextW` that fails
+for any other reason makes `procs.snapshot_processes` return None (unknown,
+so not idle) rather than the shorter list it reached — a partial list would
+read "nothing runs here" for every process the walk never got to.
 
 The agent images come from the registry, not a second list: each
 `AgentTool` carries `images` (`claude`, `codex`), and
