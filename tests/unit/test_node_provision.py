@@ -1492,6 +1492,21 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
         assert sum(counts) == expected
         assert sum(counts) <= nodes.SKILL_FILE_MAX_BYTES + nodes._READ_CHUNK + 1
 
+    # Read on in chunks after both stats said 1 byte, it lands EXACTLY on the
+    # cap: still past it, so never shipped truncated to the cap's length.
+    def test_a_grown_file_that_reaches_the_cap_exactly_is_never_shipped_truncated(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "SKILL_FILE_MAX_BYTES", 102)
+        monkeypatch.setattr(nodes, "_READ_CHUNK", 100)
+        grown = bytes(range(256)) * 3 + b"end"  # 771 bytes
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/grow", grown)
+        self._stats_say_one_byte(monkeypatch, grown)
+        scope = _walked(home)
+        assert scope.skills == ()
+        assert scope.notes == ("skills/s/grow: larger than 102 bytes, not shipped",)
+
     def test_the_running_total_is_capped_with_one_note(self, tmp_path, monkeypatch):
         monkeypatch.setattr(nodes, "SKILLS_MAX_TOTAL_BYTES", 5)
         home, skills = _skills_home(tmp_path)
@@ -1548,6 +1563,17 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
             ),
         )
 
+    # The cap is a ceiling, not a limit it must stay under: s, s/a, s/b is
+    # exactly 3 entries, and ships whole.
+    def test_a_tree_of_exactly_the_entry_cap_ships_whole(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_ENTRIES", 3)
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "s/a")
+        _skill(skills, "s/b")
+        scope = _walked(home)
+        assert [f.path for f in scope.skills] == ["s/a", "s/b"]
+        assert scope.notes == ()
+
     def test_the_entry_cap_stops_a_linked_tree_too(self, tmp_path, monkeypatch):
         monkeypatch.setattr(nodes, "SKILLS_MAX_ENTRIES", 4)
         home, skills = _skills_home(tmp_path)
@@ -1589,6 +1615,18 @@ class TestTheSkillsWalkReadsOnlyBoundedRegularFiles:
                 "not shipped"
             ),
         )
+
+    # Folders that already fill the cap leave NO room for the files beside
+    # them -- never a negative slice that reads most of them anyway.
+    def test_files_beside_folders_that_fill_the_cap_are_never_read(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(nodes, "SKILLS_MAX_ENTRIES", 1)
+        home, skills = _skills_home(tmp_path)
+        for rel in ("a/SKILL.md", "b/SKILL.md", "f1.md", "f2.md", "f3.md"):
+            _skill(skills, rel)
+        scope = _walked(home)
+        assert scope.skills == ()
 
     def test_the_caps_default_to_64_mib_and_20000_entries(self):
         assert nodes.SKILLS_MAX_TOTAL_BYTES == 64 * 1024 * 1024

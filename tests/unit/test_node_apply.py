@@ -676,6 +676,17 @@ class TestAnOffContractPayloadIsRefusedWhole:
         assert box.apply(work) == 1
         assert "outside skills/" in _nothing_applied(box, capsys)
 
+    # By name, not by prefix: a top-level folder that merely starts with
+    # "skills" is outside skills/.
+    def test_a_sibling_named_like_skills_is_refused(self, box, tmp_path, capsys):
+        work = _work(tmp_path)
+        (work / "skills2").mkdir()
+        (work / "skills2" / "x.md").write_bytes(b"x")
+        assert box.apply(work) == 1
+        lines = _lines(capsys)
+        assert [(line.status, line.item) for line in lines] == [("fail", "payload")]
+        assert "outside skills/ ('skills2')" in lines[0].detail
+
     @pytest.mark.skipif(not POSIX, reason="a tab in a file name: POSIX")
     def test_a_name_is_shown_escaped(self, box, tmp_path, capsys):
         work = _work(tmp_path)
