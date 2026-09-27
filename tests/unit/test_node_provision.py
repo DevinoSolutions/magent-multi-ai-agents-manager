@@ -1729,12 +1729,21 @@ class TestThisPcsGh:
 
     # Either marker alone is a refusal: a 401 worded some other way, or "Bad
     # credentials" without its status, must never read as offline and ship.
+    # The class is read from gh's whole words, never the kept copy: that one
+    # is capped (a marker past the cap) and masked (a Bearer eats "HTTP").
     @pytest.mark.parametrize(
         "error",
         [
             "HTTP 401: Requires authentication (https://api.github.com/)",
             "authentication failed: Bad Credentials",
+            (
+                'Get "https://api.github.com/graphql": '
+                + "retrying; " * 20
+                + "HTTP 401: Bad credentials"
+            ),
+            "Bearer HTTP 401: Requires authentication",
         ],
+        ids=["401-alone", "bad-credentials-alone", "past-the-cap", "bearer-prefixed"],
     )
     def test_each_refusal_marker_alone_is_rejected(self, fake_gh, error):
         fake_gh.set_reply(
@@ -1744,6 +1753,9 @@ class TestThisPcsGh:
         account = remote_mux.local_gh_account()
         assert isinstance(account, GhUnavailable)
         assert account.reason == "rejected"
+        # Only what is kept for the log is scrubbed and capped.
+        assert account.detail == remote_mux._gh_detail(error)
+        assert len(account.detail) <= remote_mux._GH_DETAIL_MAX
 
     @pytest.mark.parametrize(
         "var",
@@ -1862,7 +1874,9 @@ class TestThisPcsGh:
         assert remote_mux.local_gh_token() == GhUnavailable("failed", detail=kept)
 
     def test_the_scrub_leaves_gh_s_plain_words_alone(self, fake_gh):
-        # Anchored on the header: "no oauth token found" is no credential.
+        # Anchored on the header: a bare "token" in gh's own words ("token
+        # refresh failed") is no credential, and a URL without userinfo keeps
+        # its host.
         said = "token refresh failed: see https://github.com/login/device"
         fake_gh.set_reply("auth token", stderr=said + "\n", rc=1)
         assert remote_mux.local_gh_token() == GhUnavailable("failed", detail=said)

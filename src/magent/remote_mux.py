@@ -859,16 +859,18 @@ def local_gh_account() -> GhAccount | GhUnavailable:
         state = entry.get("state")
         if state != "success":
             raw_error = entry.get("error")
-            detail = _gh_detail(raw_error if isinstance(raw_error, str) else "")
+            said = raw_error if isinstance(raw_error, str) else ""
             # gh says "timeout" only for a net timeout; "error" covers every
-            # other failure, a refused token among them.
+            # other failure, a refused token among them. Read from gh's whole
+            # words: the kept detail is capped and masked, so a marker could
+            # be cut off or eaten there (and a refused token would then ship).
             refused = state == "error" and (
-                "HTTP 401" in detail or "bad credentials" in detail.lower()
+                "HTTP 401" in said or "bad credentials" in said.lower()
             )
             return GhUnavailable(
                 "rejected" if refused else "unverified",
                 login=login,
-                detail=detail,
+                detail=_gh_detail(said),
                 token_source=source,
             )
         if login is None:
