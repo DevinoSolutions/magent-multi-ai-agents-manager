@@ -3334,7 +3334,21 @@ def _landed() -> str:
 
 
 @pytest.fixture
-def moving(monkeypatch, api_repo):
+def sync_starts(monkeypatch) -> list[str | None]:
+    """Each config path the node sync daemon was asked to start on -- never
+    a real spawn."""
+    starts: list[str | None] = []
+
+    def _ensure(config, config_path=None):
+        starts.append(config_path)
+        return True
+
+    monkeypatch.setattr(launch, "ensure_node_sync", _ensure)
+    return starts
+
+
+@pytest.fixture
+def moving(monkeypatch, api_repo, sync_starts):
     """recall --to's two outward calls after the source steps, recorded."""
     events: list[tuple[object, ...]] = []
     state = LocalGitState(
@@ -3424,6 +3438,47 @@ class TestRecallTo:
         assert result.exit_code == 0
         assert f"installed the conversation on @third in {_landed()}" in result.stdout
         assert "kept the node's" not in result.stdout
+
+    def test_the_new_nodes_sync_is_started_as_a_bring_up_starts_it(
+        self, runner, placed_api, node_answers, moving, sync_starts
+    ):
+        # Flag 2: `up` and --go leave the node sync running once a node
+        # session is up; a moved session is one, on the config this recall read.
+        result = _invoke_recall_to(runner, placed_api, "third")
+
+        assert result.exit_code == 0
+        assert sync_starts == [str(Path(placed_api))]
+
+    def test_a_failed_bring_up_starts_no_sync(
+        self, runner, placed_api, node_answers, moving, sync_starts, monkeypatch
+    ):
+        monkeypatch.setattr(
+            launch,
+            "bring_up_node_project",
+            lambda config, proj, *, resume_id=None, **_k: launch.NodeBringUpOutcome(
+                ok=False, sid="api", node=proj.node, error="no route"
+            ),
+        )
+
+        result = _invoke_recall_to(runner, placed_api, "third")
+
+        assert result.exit_code == 3
+        assert sync_starts == []
+
+    def test_a_sync_that_cannot_start_costs_the_move_nothing(
+        self, runner, placed_api, node_answers, moving, monkeypatch
+    ):
+        # _keep_node_sync's contract, as for a bring-up: best effort.
+        def _refused(config, config_path=None):
+            raise PermissionError(13, "Access is denied", "node-sync.lock")
+
+        monkeypatch.setattr(launch, "ensure_node_sync", _refused)
+
+        result = _invoke_recall_to(runner, placed_api, "third")
+
+        assert result.exit_code == 0
+        assert "api runs on @third" in result.stdout
+        assert "Access is denied" not in result.output
 
     def test_the_old_placement_is_cleared_before_the_bring_up_records_the_new_one(
         self, runner, placed_api, node_answers, moving

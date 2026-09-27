@@ -1312,11 +1312,14 @@ def _recall_to(
     target: Node,
     remote_root: str,
     resume_id: str | None,
+    config_path: str,
 ) -> None:
     """Steps 4-5 for ``--to``: install on the new node, clear the placement,
     then the normal bring-up resuming the newest conversation (G-C8: its own
     ssh call, so D's bring_up.sh is untouched). A refused install keeps the
-    OLD placement -- `magent up` resumes it where it was."""
+    OLD placement -- `magent up` resumes it where it was. A session up on
+    the new node gets the node sync every bring-up leaves running, started
+    on ``config_path``, the file this recall read."""
     # heavy subsystem: in-body per policy
     from magent import launch, node_sync, nodes, remote_mux
 
@@ -1375,6 +1378,9 @@ def _recall_to(
             " (auto placement chooses by load)",
             _EXIT_UNREACHABLE,
         )
+    # What `up` and --go do once a node session is up: only a running daemon
+    # pulls it from here on.
+    launch._keep_node_sync(cfg, config_path)
     for warning in outcome.warnings:
         _note(node_sync.printable(warning))
     if outcome.attached_existing:
@@ -1417,7 +1423,8 @@ def recall_cmd(
 
     if (to_nick is not None) == to_local:
         raise click.UsageError("pass exactly one of --to <nick> or --local")
-    cfg = _load_config_or_exit(find_config(ctx.obj.get("config_path")))
+    config_file = find_config(ctx.obj.get("config_path"))
+    cfg = _load_config_or_exit(config_file)
     proj = _node_project_or_exit(cfg, project)
     name = nodes.project_name(proj)
     if is_cloud(proj):
@@ -1483,4 +1490,4 @@ def recall_cmd(
         _recall_local(held, name, local_dir, resume_id)
     elif destination is not None:
         target, remote_root = destination
-        _recall_to(cfg, proj, held, target, remote_root, resume_id)
+        _recall_to(cfg, proj, held, target, remote_root, resume_id, str(config_file))
