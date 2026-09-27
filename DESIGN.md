@@ -1801,8 +1801,8 @@ revive would have typed a second agent's command line into each one's prompt.
 The rule now: a pane is idle only on POSITIVE proof, and the one place that
 decides it is `psmux.idle_sessions`. All three consumers read it —
 `revive_sessions`, `WindowsPlatform._verify_sends_landed` and
-`cli/status.py::_psmux_sessions` — and `agent_idle` is a one-session wrapper
-over it. A yes needs all three of:
+`cli/status.py::_psmux_sessions` — and nothing else classifies a pane. A yes
+needs all three of:
 
 1. the foreground reading is a bare shell (`is_idle_command`) — kept, because
    a pane in the user's own program is not at its prompt either, and as a

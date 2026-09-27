@@ -564,7 +564,7 @@ class TestWindowsSendKeysVerification:
 
     def test_an_unreadable_pane_is_never_re_sent(self, monkeypatch):
         # A probe that could not answer is not evidence of a dead pane --
-        # same posture as psmux.agent_idle, which is False on an empty read.
+        # same posture as psmux.idle_sessions, which is False on an empty read.
         calls, _ = _drive_bring_up(monkeypatch, pane_states={"api": [""]})
         assert len(_sends_for(calls, "api")) == 1
 

@@ -137,52 +137,11 @@ class TestPaneCwd:
         assert psmux.pane_cwd("sess") == ""
 
 
-class TestPaneCurrentCommand:
-    def test_targets_the_named_session_explicitly(self, monkeypatch):
-        # Regression pin: without `-t <name>`, display-message answers for the
-        # CALLING client's own pane -- and magent commands are routinely run
-        # from inside a psmux session, so revive would read the wrong pane.
-        captured: dict[str, object] = {}
+class TestTheForegroundReading:
+    """The foreground reading is still a NECESSARY condition of idle: a pane
+    whose pwsh is readable and has nothing under it is idle only while the
+    reading is a bare shell."""
 
-        def _fake_run(cmd, **kwargs):
-            captured["cmd"] = cmd
-            captured.update(kwargs)
-            return _FakeCompleted(returncode=0, stdout="pwsh\n")
-
-        monkeypatch.setattr(subprocess, "run", _fake_run)
-
-        assert psmux.pane_current_command("sess", psmux="psmux") == "pwsh"
-        cmd = captured["cmd"]
-        assert cmd[:4] == ["psmux", "-L", "sess", "display-message"]
-        assert cmd[cmd.index("-t") + 1] == "sess"
-        assert "#{pane_current_command}" in cmd
-        assert captured["timeout"] == 3
-        assert captured["encoding"] == "utf-8"
-        assert captured["errors"] == "replace"
-        assert captured["check"] is False
-
-    def test_nonzero_returncode_returns_empty(self, monkeypatch):
-        monkeypatch.setattr(
-            subprocess,
-            "run",
-            lambda cmd, **kw: _FakeCompleted(returncode=1, stdout="pwsh"),
-        )
-        assert psmux.pane_current_command("sess", psmux="psmux") == ""
-
-    def test_subprocess_failure_returns_empty(self, monkeypatch):
-        monkeypatch.setattr(
-            subprocess,
-            "run",
-            lambda cmd, **kw: (_ for _ in ()).throw(OSError("no psmux")),
-        )
-        assert psmux.pane_current_command("sess", psmux="psmux") == ""
-
-    def test_no_binary_returns_empty(self, monkeypatch):
-        monkeypatch.setattr(psmux, "find_psmux", lambda: None)
-        assert psmux.pane_current_command("sess") == ""
-
-
-class TestAgentIdle:
     @pytest.mark.parametrize(
         ("foreground", "idle"),
         [
@@ -215,7 +174,7 @@ class TestAgentIdle:
             pids={"sess": 100},
             snapshot=pane_tree(100),
         )
-        assert psmux.agent_idle("sess", psmux="psmux") is idle
+        assert (psmux.idle_sessions(["sess"], psmux="psmux") == {"sess"}) is idle
 
     def test_a_shell_reading_over_a_live_agent_is_not_idle(self, monkeypatch):
         fake_panes(
@@ -224,7 +183,7 @@ class TestAgentIdle:
             pids={"sess": 100},
             snapshot=pane_tree(100, "cmd.exe", "claude.exe", "bash.exe"),
         )
-        assert psmux.agent_idle("sess", psmux="psmux") is False
+        assert psmux.idle_sessions(["sess"], psmux="psmux") == set()
 
 
 class _FakePopen:
@@ -291,6 +250,9 @@ class TestPaneCurrentCommands:
         ]
 
     def test_targets_each_session_explicitly(self, monkeypatch):
+        # Regression pin: without `-t <name>`, display-message answers for the
+        # CALLING client's own pane -- and magent commands are routinely run
+        # from inside a psmux session, so revive would read the wrong pane.
         argvs: list[list[str]] = []
 
         def _fake_popen(cmd, **kwargs):
@@ -340,7 +302,7 @@ class TestIsIdleCommand:
         ("reading", "idle"),
         [("pwsh", True), ("C:\\x\\bash.exe", True), ("claude", False), ("", False)],
     )
-    def test_classification_matches_agent_idle(self, reading, idle):
+    def test_classification(self, reading, idle):
         assert psmux.is_idle_command(reading) is idle
 
 
@@ -1042,7 +1004,6 @@ class TestControlCommandsInheritTheEnvironment:
             lambda: psmux.send_keys("api", "claude", "Enter", psmux="psmux"),
             lambda: psmux.pane_cwd("api", psmux="psmux"),
             lambda: psmux.capture_pane("api", psmux="psmux"),
-            lambda: psmux.pane_current_command("api", psmux="psmux"),
             lambda: psmux.detach_client("api", psmux="psmux"),
             lambda: psmux.flash_message("api", "hi", 100, psmux="psmux"),
         ],
@@ -1064,7 +1025,8 @@ class TestControlCommandsInheritTheEnvironment:
             )
         ) == {None}
 
-    def test_the_pane_command_fan_out_inherits_too(self, monkeypatch):
+    @pytest.mark.parametrize("fan_out", [psmux.pane_current_commands, psmux.pane_pids])
+    def test_the_pane_probe_fan_outs_inherit_too(self, monkeypatch, fan_out):
         seen: list[object] = []
 
         class _Proc:
@@ -1078,7 +1040,7 @@ class TestControlCommandsInheritTheEnvironment:
             return _Proc()
 
         monkeypatch.setattr(subprocess, "Popen", _popen)
-        psmux.pane_current_commands(["api"], psmux="psmux")
+        fan_out(["api"], psmux="psmux")
         assert seen == [None]
 
     def test_the_accessor_preserves_the_rest_of_the_environment(self, monkeypatch):

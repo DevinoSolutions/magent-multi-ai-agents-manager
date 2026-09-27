@@ -83,14 +83,7 @@ def fake_panes(
 ) -> PaneProbes:
     """Every pane probe answered from tables: ``foreground`` is each session's
     ``#{pane_current_command}`` ("" = unreadable), plus ``fake_process_side``.
-
-    Every foreground primitive answers from the same table, so a pin states the
-    VERDICT, not which primitive the code happens to call.
     """
-    monkeypatch.setattr(
-        "magent.psmux.pane_current_command",
-        lambda name, psmux=None: foreground.get(name, ""),
-    )
     monkeypatch.setattr(
         "magent.psmux.pane_current_commands",
         lambda names, psmux=None: {n: foreground.get(n, "") for n in names},

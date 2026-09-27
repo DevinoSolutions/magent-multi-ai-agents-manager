@@ -694,52 +694,15 @@ _IDLE_SHELLS: frozenset[str] = frozenset(
 _LAUNCHER_IMAGES: frozenset[str] = frozenset({"cmd"})
 
 
-def pane_current_command(name: str, psmux: str | None = None) -> str:
-    """Return the active pane's foreground command (``pwsh``, ``claude``, ...).
-
-    The explicit ``-t <name>`` is REQUIRED: without it ``display-message``
-    answers for the *calling client's own* pane, and magent commands are often
-    run from inside a psmux session -- ``capture_pane`` passes ``-t`` for the
-    same reason. Same guards as ``pane_cwd``: bounded, decode-tolerant, and
-    any OSError/SubprocessError swallowed to ``""``.
-    """
-    binary = psmux or find_psmux()
-    if not binary:
-        return ""
-    try:
-        result = subprocess.run(
-            [
-                binary,
-                "-L",
-                name,
-                "display-message",
-                "-t",
-                name,
-                "-p",
-                "#{pane_current_command}",
-            ],
-            capture_output=True,
-            timeout=3,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            creationflags=_SPAWN_FLAGS,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    else:
-        return (result.stdout or "").strip() if result.returncode == 0 else ""
-
-
 def pane_current_commands(names: list[str], psmux: str | None = None) -> dict[str, str]:
-    """``pane_current_command`` for many sessions in ONE process fan-out.
+    """Each session's pane foreground command (``pwsh``, ``claude``, ...), for
+    many sessions in ONE process fan-out.
 
     Every probe is spawned before any is read -- the shape the picker's
     liveness sweep already uses -- so a caller building a table over 40 live
     sessions pays roughly one psmux round-trip instead of 40 sequential ones.
-    Guarded exactly like the single-session form: bounded, decode-tolerant, and
-    a failed, hung, or unlaunchable probe degrades to ``""`` for that session
-    rather than propagating.
+    Bounded and decode-tolerant: a failed, hung, or unlaunchable probe degrades
+    to ``""`` for that session rather than propagating.
     """
     return _display_fan_out(names, "#{pane_current_command}", psmux)
 
@@ -764,7 +727,13 @@ def pane_pids(names: list[str], psmux: str | None = None) -> dict[str, int | Non
 
 def _display_fan_out(names: list[str], fmt: str, psmux: str | None) -> dict[str, str]:
     """``display-message -p <fmt>`` against each session's own pane, every
-    probe spawned before any is read; ``""`` for any that failed."""
+    probe spawned before any is read; ``""`` for any that failed.
+
+    The explicit ``-t <name>`` is REQUIRED: without it ``display-message``
+    answers for the *calling client's own* pane, and magent commands are often
+    run from inside a psmux session -- ``capture_pane`` passes ``-t`` for the
+    same reason.
+    """
     binary = psmux or find_psmux()
     if not binary or not names:
         return dict.fromkeys(names, "")
@@ -889,12 +858,6 @@ def idle_sessions(
         if not any(_image_stem(image) in running for image, _pid, _ppid in tree):
             idle.add(name)
     return idle
-
-
-def agent_idle(name: str, psmux: str | None = None) -> bool:
-    """``idle_sessions`` for one session: True only when its agent is
-    positively gone."""
-    return name in idle_sessions([name], psmux=psmux)
 
 
 # How long one status-line flash may take before we give up on it.
