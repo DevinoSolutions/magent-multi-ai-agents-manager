@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from magent import cli, log, node_sync, nodes, remote_mux
+from magent.nodes import LocalGitState
 from tests.unit._node_fixtures import (
     D_ATTRS,
     before_d,
@@ -699,8 +700,21 @@ class TestNodePlan:
         assert result.exit_code == 2
 
 
-# D-MERGE: plan G Task 13 (:3298-3380) -- written now, switched on by D's merge.
-@needs_d("node_recipe", "node_git_states", "push_files", plan=":3390-3449")
+@pytest.fixture
+def one_repo(monkeypatch, api_dir):
+    """api_dir as the one repo D's git read finds: its recipe builder refuses
+    a project with none (a node clones the project from its origin)."""
+    state = LocalGitState(
+        path=api_dir,
+        url="git@github.com:amin/api.git",
+        branch="main",
+        dirty=False,
+        unpushed=False,
+        detached=False,
+    )
+    monkeypatch.setattr("magent.launch.node_git_states", lambda config, proj: [state])
+
+
 @pytest.mark.usefixtures("_node_user")
 class TestNodePush:
     @pytest.fixture
@@ -715,7 +729,7 @@ class TestNodePush:
         return calls
 
     def test_push_ships_the_push_set_to_the_placed_node(
-        self, runner, tmp_config, api_dir, no_states, shipped
+        self, runner, tmp_config, api_dir, one_repo, shipped
     ):
         nodes.update_node_map("api", entry("third"))
         cfg = tmp_config(config_json(("second", "third"), [_project(api_dir, "auto")]))
@@ -727,7 +741,7 @@ class TestNodePush:
         assert "shipped 2 file(s) to @third: .env, apps/web/.env.local" in result.stdout
 
     def test_push_for_a_pinned_project_goes_to_its_pin(
-        self, runner, tmp_config, api_dir, no_states, shipped
+        self, runner, tmp_config, api_dir, one_repo, shipped
     ):
         cfg = tmp_config(config_json(("second",), [_project(api_dir, "second")]))
 
@@ -736,7 +750,7 @@ class TestNodePush:
         assert shipped == [("second", "api")]
 
     def test_push_for_an_unplaced_auto_project_exits_2(
-        self, runner, tmp_config, api_dir, no_states, shipped
+        self, runner, tmp_config, api_dir, one_repo, shipped
     ):
         cfg = tmp_config(config_json(("second",), [_project(api_dir, "auto")]))
 
@@ -747,7 +761,7 @@ class TestNodePush:
         assert "magent up api" in result.stderr
 
     def test_push_to_a_node_that_does_not_answer_exits_3_with_its_reason(
-        self, runner, tmp_config, api_dir, no_states, monkeypatch
+        self, runner, tmp_config, api_dir, one_repo, monkeypatch
     ):
         def _refuse(node, recipe):
             raise remote_mux.RemoteError(
@@ -765,7 +779,7 @@ class TestNodePush:
         assert "Connection refused" in result.stderr
 
     def test_push_with_nothing_to_ship_says_so(
-        self, runner, tmp_config, api_dir, no_states, monkeypatch
+        self, runner, tmp_config, api_dir, one_repo, monkeypatch
     ):
         monkeypatch.setattr(remote_mux, "push_files", lambda node, recipe: [])
         cfg = tmp_config(config_json(("second",), [_project(api_dir, "second")]))
@@ -776,7 +790,7 @@ class TestNodePush:
         assert "nothing to ship" in result.stdout
 
     def test_push_for_a_cloud_project_is_refused_before_any_node_is_touched(
-        self, runner, tmp_config, api_dir, no_states, shipped
+        self, runner, tmp_config, api_dir, one_repo, shipped
     ):
         cfg = tmp_config(config_json(("second",), [_project(api_dir, "cloud")]))
 
@@ -785,3 +799,72 @@ class TestNodePush:
         assert result.exit_code == 2
         assert "runs in the cloud" in result.stderr
         assert shipped == []
+
+    def test_push_with_the_node_map_unreadable_is_unknown_not_unplaced(
+        self, runner, tmp_config, api_dir, one_repo, shipped, caplog
+    ):
+        nodes.NODE_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+        log.get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        cfg = tmp_config(config_json(("second",), [_project(api_dir, "auto")]))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "push", "api"])
+
+        assert result.exit_code == 1
+        assert shipped == []
+        assert "the node map could not be read (ValueError)" in result.stderr
+        assert "so where api runs is unknown" in result.stderr
+        assert "not placed yet" not in result.stderr
+        # The parser's own words go to the log, never the screen.
+        assert "Expecting" not in result.stderr
+        assert any(
+            "Expecting" in r.getMessage()
+            for r in caplog.records
+            if r.name == "magent.nodes"
+        )
+
+    def test_push_of_a_project_with_no_repo_names_the_recipe_refusal(
+        self, runner, tmp_config, api_dir, no_states, shipped
+    ):
+        # D's recipe builder: a node clones the project, so a project with no
+        # repo has no recipe -- and nothing is dialed.
+        cfg = tmp_config(config_json(("second",), [_project(api_dir, "second")]))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "push", "api"])
+
+        assert result.exit_code == 2
+        assert "cannot build api's recipe" in result.stderr
+        assert "has no git repo" in result.stderr
+        assert shipped == []
+
+    def test_a_file_refused_on_this_pc_is_named_by_its_class(
+        self, runner, tmp_config, api_dir, one_repo, monkeypatch
+    ):
+        def _refuse(node, recipe):
+            raise PermissionError(13, "Access is denied", str(api_dir / ".env"))
+
+        monkeypatch.setattr(remote_mux, "push_files", _refuse)
+        cfg = tmp_config(config_json(("second",), [_project(api_dir, "second")]))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "push", "api"])
+
+        assert result.exit_code == 1
+        assert "could not ship api's files" in result.stderr
+        assert "PermissionError" in result.stderr
+        assert "Access is denied" not in result.stderr
+        assert "Traceback" not in result.output
+
+    def test_the_nodes_list_of_shipped_files_reaches_the_screen_printable(
+        self, runner, tmp_config, api_dir, one_repo, monkeypatch
+    ):
+        monkeypatch.setattr(
+            remote_mux, "push_files", lambda node, recipe: ["\x1b[31m.env", "é.env"]
+        )
+        cfg = tmp_config(config_json(("second",), [_project(api_dir, "second")]))
+
+        result = runner.invoke(cli.main, ["--config", cfg, "node", "push", "api"])
+
+        assert result.exit_code == 0
+        assert "shipped 2 file(s) to @second: ?[31m.env, ?.env" in result.stdout
+        assert "\x1b" not in result.stdout

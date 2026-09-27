@@ -9,6 +9,7 @@ pay for ssh and tar).
 
 from __future__ import annotations
 
+import dataclasses
 import re
 import sys
 import time
@@ -41,21 +42,6 @@ if TYPE_CHECKING:
 # D_ATTRS: launch.node_recipe, launch.node_git_states,
 # launch.bring_up_node_project, launch.NodeBringUpOutcome,
 # remote_mux.push_files, remote_mux.kill_session.
-# - plan (Task 12): `_print_push_set` (plan G :3192-3210) and its call at the
-#   end of plan_cmd's loop (:3257). Needs node_git_states. When it lands,
-#   restore the push-set wording in three places: plan_cmd's docstring first
-#   line (:3218), the ("node",) and ("node", "plan") help snapshots in
-#   tests/unit/test_cli_structure.py, and plan's row in cli/docs.py (:3268).
-# - push (Task 13): `_current_nick` and `push_cmd` (:3390-3440) and the docs
-#   row "magent node push <project>" after plan's row in cli/docs.py
-#   (:3444-3449). Needs node_recipe, node_git_states, push_files. When it
-#   lands:
-#   - `_tail` (:3398-3399) already landed with recall (T14); do not re-add it;
-#   - add `import dataclasses` (push_cmd, and recall --to's `_destination`
-#     and `_recall_to`, call `dataclasses.replace`);
-#   - `RemoteError` stays under TYPE_CHECKING (already there, for `_tail`);
-#   - `_current_nick` and `push_cmd` import `nodes` in-body like every other
-#     function here -- the plan's code reads a module-level `nodes`.
 # - recall's kill (Task 14): `_stop_session`'s reachable branch becomes
 #   :3865-3874 (remote_mux.kill_session and its three outcomes) -- that
 #   branch only: keep today's docstring, `source is None` branch and
@@ -506,18 +492,18 @@ def sync_cmd(
 
 # Exit codes:
 # 1 = a step failed: `node sync --once` with a node that did not sync, `node
-#     sync -d` whose daemon did not start, and recall's failures -- the node
-#     map unreadable, the last pull failing on this PC or left unfinished (a
-#     node that ANSWERED with a nonzero rc is this too, cq-G14 I1, not 3), the
+#     sync -d` whose daemon did not start, push with the node map unreadable
+#     or a file refused on this PC, and recall's failures -- the node map
+#     unreadable, the last pull failing on this PC or left unfinished (a node
+#     that ANSWERED with a nonzero rc is this too, cq-G14 I1, not 3), the
 #     placement unreadable for it, a linked mirror, the conversation not
 #     installed, the placement not cleared;
-# 2 = nothing to act on (unknown project, not a node project, a recall of a
+# 2 = nothing to act on (unknown project, not a node project, a push of a
+#     project not placed yet, a recipe that cannot be built, a recall of a
 #     project the node-map does not place, bad destination);
-# 3 = the node could not be acted on: today only recall's last pull finding
-#     the node-sync daemon still holding that node's lock. D-MERGE: push and
-#     recall --to add the node-side 3s -- a node that did not take the files
-#     (plan G :3432), did not take the conversation (:4231) or did not bring
-#     the session up (:4247).
+# 3 = the node could not be acted on: recall's last pull finding the
+#     node-sync daemon still holding that node's lock, and a node that did not
+#     take push's files.
 # A plan that places a project nowhere is an answer, not a failure: it exits
 # 0. A node that does not answer during recall --local is a note, never an
 # exit: recall goes on with what was already pulled. So is a last pull that
@@ -736,14 +722,6 @@ def plan_cmd(ctx: click.Context, project: str | None, all_projects: bool) -> Non
         _print_push_set(cfg, proj)
 
 
-# D-MERGE: `magent node push` (plan G Task 13: push_cmd and _current_nick at
-# :3390-3440, its docs row at :3444-3449) re-ships through D's recipe builder
-# and delivery -- launch.node_recipe, launch.node_git_states and
-# remote_mux.push_files -- so the whole command lands with D's merge. `_tail`
-# (:3398-3399) already landed with recall (T14); do not re-add it.
-# tests/unit/test_node_cmd.py::TestNodePush is written and switches on then.
-
-
 # repo_status on a node that answers: a quick read, never a fetch.
 RECALL_TIMEOUT_S = 60.0
 
@@ -752,6 +730,95 @@ def _tail(exc: RemoteError) -> str:
     return exc.stderr_tail.strip() or (
         "timed out" if exc.rc is None else f"exit {exc.rc}"
     )
+
+
+def _local_failure(exc: Exception, doing: str) -> str:
+    """The words for a failure on THIS PC (the git read, a file, the config)
+    while ``doing``: a bring-up's one line for it (``launch._node_error_text``
+    -- ours for a config error, the class only for an OSError) as printable
+    ASCII, and the whole error in nodes.log."""
+    # heavy subsystem: in-body per policy
+    from magent import launch, node_sync
+
+    log.get_logger("nodes").warning("%s: %s", doing, exc)
+    return node_sync.printable(launch._node_error_text(exc))
+
+
+def _current_nick(proj: ProjectConfig) -> str | None:
+    """Where a node project runs now: its pin, or its node-map placement.
+    The map is read strictly, so one that cannot be read raises (OSError /
+    ValueError) -- unknown, never "not placed"."""
+    from magent import nodes  # heavy subsystem: in-body per policy
+
+    if proj.node != NODE_AUTO:
+        return proj.node
+    held = nodes.load_node_map_strict().get(nodes.project_name(proj))
+    return held.nick if held else None
+
+
+@node_group.command("push")
+@click.argument("project")
+@click.pass_context
+def push_cmd(ctx: click.Context, project: str) -> None:
+    """Re-ship a project's non-git files (.env* etc.) to its node."""
+    # heavy subsystem: in-body per policy
+    from magent import launch, node_sync, nodes, remote_mux
+
+    cfg = _load_config_or_exit(find_config(ctx.obj.get("config_path")))
+    proj = _node_project_or_exit(cfg, project)
+    name = nodes.project_name(proj)
+    if is_cloud(proj):
+        # DECISION-15: no node to push to. J11m replaces this refusal with its
+        # by-hand hand-off (_push_cloud).
+        _fail(
+            f"{name} runs in the cloud; there is no node to push its files to",
+            _EXIT_USAGE,
+        )
+    try:
+        nick = _current_nick(proj)
+    except (OSError, ValueError) as exc:
+        log.get_logger("nodes").warning("push could not read the node map: %s", exc)
+        _fail(
+            f"{nodes.map_unread_text(exc)}, so where {name} runs is unknown;"
+            " nothing was shipped",
+            1,
+        )
+    if nick is None:
+        _fail(
+            f"{name} is not placed yet -- `magent up {name}` places and starts it",
+            _EXIT_USAGE,
+        )
+    try:
+        node = nodes.node_for_nick(cfg, nick, local_user=env.local_username())
+    except nodes.NodeConfigError as exc:
+        _fail(str(exc), _EXIT_USAGE)
+    placed = dataclasses.replace(proj, node=nick)
+    try:
+        # D's one recipe builder (DECISION-22): the push set a bring-up ships.
+        recipe = launch.node_recipe(
+            cfg, placed, node, launch.node_git_states(cfg, placed)
+        )
+    except (OSError, ValueError, remote_mux.RemoteError) as exc:
+        text = _local_failure(exc, f"push could not build {name}'s recipe")
+        _fail(f"cannot build {name}'s recipe ({text})", _EXIT_USAGE)
+    try:
+        shipped = remote_mux.push_files(node, recipe)
+    except remote_mux.RemoteError as exc:
+        _fail(f"@{nick} did not take the files ({_tail(exc)})", _EXIT_UNREACHABLE)
+    except (OSError, ValueError) as exc:
+        # Refused on this PC before the files left (a file that will not
+        # read, a root the node script would not be sent).
+        text = _local_failure(exc, f"push could not ship {name}'s files")
+        _fail(f"could not ship {name}'s files ({text})", 1)
+    if not shipped:
+        click.echo(
+            f"  {style('-', dim=True)} nothing to ship for {name}:"
+            " no ignored .env*, local settings or push entries"
+        )
+        return
+    # The names are the node's reply: printable ASCII only on this screen.
+    listed = node_sync.printable(", ".join(shipped))
+    _ok(f"shipped {len(shipped)} file(s) to @{nick}: {listed}")
 
 
 def _source_node(cfg: MagentConfig, held: NodeMapEntry) -> Node | None:

@@ -488,6 +488,13 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "nothing."
         ),
     ),
+    (
+        "magent node push <project>",
+        (
+            "Re-ship a project's non-git files (`.env*` etc.) to its running node "
+            "session."
+        ),
+    ),
     # D-MERGE: plan G Task 14's row reads "(--to <nick> | --local)" and names
     # the move to another node; restore it when Task 15's --to lands with D.
     (
