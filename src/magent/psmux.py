@@ -914,8 +914,11 @@ _STATUS_BRAND = "#[bold,fg=green] magent #[default]"
 # ...and the width budget has to travel with it. tmux truncates status-left at
 # `status-left-length` (default 10, but a personal conf may set it far tighter),
 # so setting the brand without the length can render it mid-word. Style
-# directives don't count toward the limit; " magent " is 8 columns.
-_STATUS_BRAND_LEN = "10"
+# directives don't count toward the limit; " magent " is 8 cells, and the
+# length carries 2 more of headroom -- the 10 every local session has always
+# been given.
+_STATUS_BRAND_CELLS = 8
+_STATUS_LEFT_HEADROOM = 2
 
 # What a raw F2 says when it actually reaches psmux. See `decoration_argv` for
 # why this can never double-fire on a Windows attach window. Pure ASCII for the
@@ -931,7 +934,7 @@ _F2_FALLBACK_MSG = (
 # `#I:#W#F`, and with one window per session (magent's invariant) the `0:`
 # index is pure noise stealing bar columns from the name. Verified live on
 # psmux 3.3.8: `set -g window-status-format "#W"` renders exactly the name.
-_WINDOW_STATUS_FORMAT = "#W"
+WINDOW_STATUS_FORMAT = "#W"
 
 # ...and the name itself is width-budgeted like every other bar element. A
 # 30-char project name eats the whole bar; longer than this renders as the
@@ -981,16 +984,73 @@ def status_hints(code_hint: bool) -> tuple[str, str]:
     return _STATUS_HINTS_F1, _STATUS_HINTS_F1_LEN
 
 
+def _check_brand_nick(nick: str) -> None:
+    """Refuse a nick the status line cannot carry verbatim. The brand is a tmux
+    FORMAT string, so a ``#`` would be expanded on every redraw (``#(cmd)`` runs
+    a command, ``#[...]`` restyles the bar), and a non-ASCII or non-printable
+    glyph (a raw newline, a tab, a control character) breaks the "cells ==
+    len" law. Config validates nicks, but the typed view is lenient and not
+    every caller's nick went through ``settings.nodes``."""
+    if not nick or not nick.isascii() or not nick.isprintable() or "#" in nick:
+        msg = (
+            f"status brand nick must be non-empty printable ASCII without '#': {nick!r}"
+        )
+        raise ValueError(msg)
+
+
+def _brand_cells(nick: str | None) -> int:
+    """The brand's visible width in cells for ``nick`` (see ``status_brand``)."""
+    if nick is None:
+        return _STATUS_BRAND_CELLS
+    _check_brand_nick(nick)
+    return _STATUS_BRAND_CELLS + len(f"@{nick} ")
+
+
+def status_brand(nick: str | None) -> tuple[str, str]:
+    """The status-left brand and its width in cells. ``None`` is a session on
+    THIS machine: today's brand, byte for byte. A nick is a session running on
+    that pool machine (the nodes feature), branded ``magent @<nick>`` so a
+    window says where its agent actually is. ASCII only, same law as the hints:
+    the cell count is ``len``, and a wide glyph here would desync the bar.
+
+    Raises ``ValueError`` for an empty, non-ASCII or ``#``-bearing nick."""
+    cells = _brand_cells(nick)
+    if nick is None:
+        return _STATUS_BRAND, str(cells)
+    return _STATUS_BRAND + f"@{nick} ", str(cells)
+
+
+def status_left(nick: str | None) -> tuple[str, str]:
+    """``status-left`` and ``status-left-length`` for a session: the brand and
+    its cells plus the headroom every session gets. The one place both
+    multiplexers read it from, so a psmux bar and a node's tmux bar cannot
+    budget the brand differently."""
+    brand, _ = status_brand(nick)
+    return brand, str(_brand_cells(nick) + _STATUS_LEFT_HEADROOM)
+
+
+def f2_binding_argv(prefix: list[str], code_hint: bool) -> list[str]:
+    """The F2 half of a decoration, after ``prefix`` (``[psmux, "-L", name]``
+    here, ``[tmux, "-L", "magent"]`` on a node). See ``decoration_argv`` for why
+    an advertised F2 binds a fallback message and an unadvertised one is
+    unbound."""
+    if code_hint:
+        return [*prefix, "bind", "-n", "F2", "display-message", _F2_FALLBACK_MSG]
+    return [*prefix, "unbind-key", "-n", "F2"]
+
+
 def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
     """The psmux commands that brand ``name`` and advertise its window hotkeys.
 
-    Six of them: magent *owns* F1 -> detach-client per session (the hint has to
-    be truthful on a machine with no personal ``bind -n F1`` in ~/.tmux.conf,
-    and owning the binding keeps the existing "back to the picker" semantics
-    rather than changing them), the status-right carries the hint text plus the
-    width budget it needs, the status-left carries the product brand plus
-    the width budget *it* needs, and the sixth is the F2 fallback below. Each
-    half sets its text and its length together or neither: a personal conf with
+    Ten of them. The first six: magent *owns* F1 -> detach-client per session
+    (the hint has to be truthful on a machine with no personal ``bind -n F1``
+    in ~/.tmux.conf, and owning the binding keeps the existing "back to the
+    picker" semantics rather than changing them), the status-right carries
+    the hint text plus the width budget it needs, the status-left carries
+    the product brand plus the width budget *it* needs, and the sixth is the
+    F2 fallback below. The last four own the window name and its status-bar
+    entry (see the inline comments). Each half sets its text and its length
+    together or neither: a personal conf with
     a tighter ``status-*-length`` would truncate the other half mid-label. All
     are ``-L <name>``-scoped, so they land on that session's own server and
     override whatever its tmux.conf set at start-up.
@@ -1023,17 +1083,14 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
     key nothing advertises any more.
     """
     hints, hints_len = status_hints(code_hint)
-    f2 = (
-        [psmux, "-L", name, "bind", "-n", "F2", "display-message", _F2_FALLBACK_MSG]
-        if code_hint
-        else [psmux, "-L", name, "unbind-key", "-n", "F2"]
-    )
+    brand, brand_len = status_left(None)
+    f2 = f2_binding_argv([psmux, "-L", name], code_hint)
     return [
         [psmux, "-L", name, "bind", "-n", "F1", "detach-client"],
         [psmux, "-L", name, "set", "-g", "status-right", hints],
         [psmux, "-L", name, "set", "-g", "status-right-length", hints_len],
-        [psmux, "-L", name, "set", "-g", "status-left", _STATUS_BRAND],
-        [psmux, "-L", name, "set", "-g", "status-left-length", _STATUS_BRAND_LEN],
+        [psmux, "-L", name, "set", "-g", "status-left", brand],
+        [psmux, "-L", name, "set", "-g", "status-left-length", brand_len],
         f2,
         # The window NAME is magent's too (same doctrine as window titles):
         # psmux's automatic-rename shows the pane's current command, so the bar
@@ -1050,7 +1107,7 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
         [psmux, "-L", name, "set", "-g", "automatic-rename", "off"],
         # ...and the entry renders as the name alone: no `0:` index (one
         # window per session makes it noise), no flags suffix.
-        [psmux, "-L", name, "set", "-g", "window-status-format", _WINDOW_STATUS_FORMAT],
+        [psmux, "-L", name, "set", "-g", "window-status-format", WINDOW_STATUS_FORMAT],
         [
             psmux,
             "-L",
@@ -1058,7 +1115,7 @@ def decoration_argv(name: str, psmux: str, code_hint: bool) -> list[list[str]]:
             "set",
             "-g",
             "window-status-current-format",
-            _WINDOW_STATUS_FORMAT,
+            WINDOW_STATUS_FORMAT,
         ],
     ]
 
@@ -1277,8 +1334,8 @@ def eligible_projects(
     """Projects that map to a persistent psmux session.
 
     A project is eligible when it is enabled, runs a CLI agent (not an IDE),
-    and is local (no ``host``). When ``group`` is given, only projects tagged
-    with that group (case-insensitive) are returned.
+    and is local (no ``host``, no pool ``node``). When ``group`` is given,
+    only projects tagged with that group (case-insensitive) are returned.
 
     The ``cmd`` each entry carries is fresh-start aware: a project directory
     with no stored session for its tool gets the configured command WITHOUT its
@@ -1297,6 +1354,7 @@ def eligible_projects(
     mapping, and the default None, both mean the tool's own default store,
     which is byte-for-byte today's probe for every project.
     """
+    from magent.config import runs_on_node
     from magent.launch import _expand_base_dir, _resolve_path
     from magent.sessions import build_start_command, is_ide_tool
     from magent.titles import get_leaf_name
@@ -1316,6 +1374,11 @@ def eligible_projects(
         if is_ide_tool(tool):
             continue
         if proj.host:
+            continue
+        # A pool-node project runs on that node's tmux, never in a local psmux
+        # session (PR-D). A cloud project is a local pane and stays eligible
+        # (DECISION-15).
+        if runs_on_node(proj):
             continue
         leaf = proj.title or get_leaf_name(proj.path)
         sid = session_name(leaf)
@@ -1673,6 +1736,9 @@ def config_sessions(config_path: str | None) -> list[dict[str, object]]:
             continue
         tool = p.get("tool", default_tool)
         if isinstance(tool, str) and is_ide_tool(tool):
+            continue
+        # Raw dict: same rule as eligible_projects' node skip (DECISION-15).
+        if p.get("node") not in (None, "cloud"):
             continue
         proj_name = p.get("title") or Path(p["path"]).name
         out.append(

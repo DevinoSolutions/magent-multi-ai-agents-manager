@@ -152,7 +152,7 @@ class TestEveryRowNamesARealCommand:
 # shape, and recursing would demand a row per member. A new open map belongs
 # here deliberately -- until it is added the pin fails naming its members,
 # which is the loud version of the same decision.
-_OPEN_MAPS = frozenset({"tools"})
+_OPEN_MAPS = frozenset({"tools", "nodes"})
 
 
 def _emitted_settings_keys() -> list[str]:

@@ -132,6 +132,15 @@ class MagentEnv(BaseSettings):
     # 42 agents alive in Session 0, unkillable from the desktop and holding
     # every session name the user's own bring-up wanted.
     session0_policy: Literal["handoff", "allow", "refuse"] = "handoff"
+    # Should `magent serve` keep the node sync daemon (a detached
+    # `magent node sync`) alive? (default: 1 / on.) The daemon pulls every node session's
+    # transcripts and agent state home each settings.nodeSync.pullIntervalS,
+    # which is what makes a session on a pool machine durable and resumable
+    # anywhere; it is only ever started when some project has `node` set. Set
+    # to 0 to run the daemon yourself. Like hotkey_supervisor, upload_supervisor
+    # and psmux_boost, 0 is also a TEST-ISOLATION law: a test that starts a real
+    # serve would otherwise start a daemon that dials real machines over ssh.
+    node_sync: bool = True
 
     @model_validator(mode="after")
     def _no_unknown_magent_vars(self) -> MagentEnv:
@@ -203,6 +212,17 @@ def localappdata_dir() -> Path:
 
 def editor_command() -> str:
     return os.environ.get("EDITOR", "xdg-open")
+
+
+def local_username() -> str:
+    """The login name of the user running magent: USERNAME on Windows, USER on
+    POSIX, "" when neither is set.
+
+    Host-infrastructure, like ``is_ssh_login``: the OS sets it, nobody
+    configures it. A node's ``user`` falls back to it at use time
+    (``nodes.resolve``) and it is never written back into the config.
+    """
+    return os.environ.get("USERNAME") or os.environ.get("USER") or ""
 
 
 # The variables OpenSSH exports into every login it serves. SSH_CONNECTION and
@@ -446,6 +466,50 @@ def attach_client_env() -> dict[str, str] | None:
         key: value
         for key, value in os.environ.items()
         if key.upper() not in _PRESENTATION_VARS
+    }
+
+
+# Git's repo-LOCATING variables: exactly what `git rev-parse --local-env-vars`
+# prints (git 2.52; pinned against the installed git by test_env_schema.py).
+# A git hook exports GIT_DIR -- an ABSOLUTE path inside a worktree -- and every
+# git child of that hook inherits it. A local read aimed by ``-C <path>`` must
+# not be silently answered by the repo the hook was fired in instead.
+GIT_LOCAL_ENV_VARS = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+)
+
+
+def git_child_env() -> dict[str, str]:
+    """The process environment minus ``GIT_LOCAL_ENV_VARS``: THE seam for a
+    local git child that names its repo with ``-C``.
+
+    The incident this closes: magent's launch path (and its test suite, via
+    the husky pre-push gate) can run inside a git hook or an agent's tool
+    shell. With the hook's GIT_DIR inherited, ``git -C <project> status``
+    reads the HOOK's repo, and a test fixture's ``git init --bare`` rewrote a
+    real repo's shared config to ``core.bare=true``. Everything else --
+    PATH, HOME, GIT_CEILING_DIRECTORIES, the user's config -- survives: those
+    bound or configure a search, they do not aim one. (GIT_CONFIG_KEY_<n> /
+    GIT_CONFIG_VALUE_<n> are inert once GIT_CONFIG_COUNT is gone.) Matched on
+    the upper-cased name, as Windows env keys are case-insensitive."""
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() not in GIT_LOCAL_ENV_VARS
     }
 
 

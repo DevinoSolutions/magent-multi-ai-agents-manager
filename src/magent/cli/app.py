@@ -63,6 +63,11 @@ from magent.paths import find_config
     is_flag=True,
     help="With --attach-to: one plain SSH window per project (no psmux/tmux)",
 )
+@click.option(
+    "--allow-dirty",
+    is_flag=True,
+    help="Node projects: start despite a dirty or unpushed tree",
+)
 # package_name (not a resolved literal) so click reads the distribution
 # metadata inside the --version callback only -- see magent/__init__.py.
 @click.version_option(package_name="magent-multi-ai-agents-manager")
@@ -82,6 +87,7 @@ def main(
     attach_host: str | None,
     attach_port: int,
     attach_no_mux: bool,
+    allow_dirty: bool,
 ) -> None:
     """Open every project in its own terminal and auto-tile across all monitors."""
     ctx.ensure_object(dict)
@@ -246,6 +252,7 @@ def main(
             group=group,
             config_path=str(config_file),
             only=only,
+            allow_dirty=allow_dirty,
         ),
     )
     if rc:

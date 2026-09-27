@@ -17,11 +17,17 @@ from __future__ import annotations
 import io
 import os
 import subprocess
+import sys
 from typing import NamedTuple
 
 import pytest
 
 from magent import attach_client
+
+# By value, at import: conftest's _no_real_ssh patches the MODULE attributes,
+# so these names still hold the real resolver for the tests that prove it.
+from magent.attach_client import _system_directory as real_system_directory
+from magent.attach_client import find_ssh as real_find_ssh
 
 
 class _Completed(NamedTuple):
@@ -389,7 +395,10 @@ class TestSupervise:
         monkeypatch.setattr(attach_client.shutil, "which", lambda _n: None)
         rc = attach_client.supervise("user@host", "psmux -L api attach", "api")
         assert rc == attach_client.SSH_MISSING_RC
-        assert "ssh is not on PATH" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        # The rule looks past PATH (Windows' own OpenSSH first).
+        assert "no ssh client found -- cannot attach" in out
+        assert "PATH" not in out
 
     def test_a_missing_ssh_binary_mid_loop_does_not_traceback(self, monkeypatch):
         # _run_ssh translates FileNotFoundError into an exit code so the pane
@@ -1235,3 +1244,109 @@ class TestTheTmuxMultiplexer:
         monkeypatch.setattr(attach_client, "_run_ssh", no_dial)
         with pytest.raises(ValueError, match="screen"):
             attach_client.supervise("user@host", "remote", "api", mux="screen")
+
+
+class TestOneSshClientForTheProbeAndThePane:
+    """``find_ssh`` is THE rule for which ssh client magent runs, shared with
+    ``remote_mux``: Windows' own OpenSSH first, PATH only as the fallback. Two
+    clients on one PC share ``~/.ssh`` but not the agent (the Windows agent is
+    a named pipe, MSYS ssh asks ``SSH_AUTH_SOCK``), so a bring-up that
+    succeeded through one could open a pane that fails through the other.
+    Every test here fakes the system directory -- none resolves a real ssh."""
+
+    @pytest.fixture
+    def system(self, tmp_path, monkeypatch):
+        system = tmp_path / "System32"
+        (system / "OpenSSH").mkdir(parents=True)
+        monkeypatch.setattr(attach_client, "_system_directory", lambda: system)
+        return system
+
+    def test_the_system_openssh_wins_over_path(self, system, monkeypatch):
+        (system / "OpenSSH" / "ssh.exe").write_bytes(b"")
+        monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/msys/bin/ssh")
+        assert real_find_ssh() == str(system / "OpenSSH" / "ssh.exe")
+
+    def test_path_is_the_fallback_without_a_system_openssh(self, system, monkeypatch):
+        monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/msys/bin/ssh")
+        assert real_find_ssh() == "/msys/bin/ssh"
+
+    def test_a_folder_named_ssh_exe_is_not_a_client(self, system, monkeypatch):
+        (system / "OpenSSH" / "ssh.exe").mkdir()
+        monkeypatch.setattr(attach_client.shutil, "which", lambda _n: None)
+        assert real_find_ssh() is None
+
+    def test_no_system_directory_reads_path(self, monkeypatch):
+        monkeypatch.setattr(attach_client, "_system_directory", lambda: None)
+        monkeypatch.setattr(attach_client.shutil, "which", lambda _n: "/usr/bin/ssh")
+        assert real_find_ssh() == "/usr/bin/ssh"
+
+    def test_the_system_directory_is_windows_own(self):
+        found = real_system_directory()
+        if sys.platform == "win32":
+            assert found is not None
+            assert (found / "kernel32.dll").is_file()
+        else:
+            assert found is None
+
+    def test_the_pane_and_the_probe_dial_the_resolved_client(self, monkeypatch):
+        client = r"C:\Windows\System32\OpenSSH\ssh.exe"
+        monkeypatch.setattr(attach_client, "find_ssh", lambda: client)
+        assert attach_client.ssh_argv("amin@h", "tmux attach")[0] == client
+        assert attach_client.session_probe_argv("amin@h", "api", "tmux")[0] == client
+        assert (
+            attach_client.pane_command("amin@h", "api", None, mux="tmux")[0] == client
+        )
+
+    def test_no_client_found_leaves_the_bare_name_for_the_spawn_to_report(
+        self, monkeypatch
+    ):
+        # Resolved nowhere: the spawn's own "not found" (SSH_MISSING_RC in
+        # _run_ssh, PROBE_FAILED in the probe) stays the one missing-client path.
+        monkeypatch.setattr(attach_client, "find_ssh", lambda: None)
+        assert attach_client.ssh_argv("amin@h", "tmux attach")[0] == "ssh"
+        assert attach_client.session_probe_argv("amin@h", "api", "tmux")[0] == "ssh"
+
+    def test_supervise_dials_the_system_client_with_none_on_path(self, monkeypatch):
+        client = r"C:\Windows\System32\OpenSSH\ssh.exe"
+        dialled: list[list[str]] = []
+        monkeypatch.setattr(attach_client, "find_ssh", lambda: client)
+        monkeypatch.setattr(
+            attach_client.shutil, "which", lambda name: name if name == client else None
+        )
+
+        def fake_run(argv, **_kwargs):
+            dialled.append(list(argv))
+            return _dial(0)
+
+        monkeypatch.setattr(attach_client, "_run_ssh", fake_run)
+        rc = attach_client.supervise(
+            "amin@h", "tmux attach", "api", mux="tmux", reconnect=False
+        )
+        assert rc == 0
+        assert [argv[0] for argv in dialled] == [client]
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="GetSystemDirectoryW is win32")
+    def test_a_failed_system_directory_probe_reads_as_none(self, monkeypatch):
+        import ctypes
+
+        monkeypatch.setattr(
+            ctypes.windll.kernel32, "GetSystemDirectoryW", lambda _buf, _n: 0
+        )
+        assert real_system_directory() is None
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="GetSystemDirectoryW is win32")
+    @pytest.mark.parametrize("needed", [260, 300])
+    def test_a_system_directory_too_long_for_the_buffer_reads_as_none(
+        self, monkeypatch, needed
+    ):
+        # Too small a buffer is answered with the size it NEEDS (terminator
+        # included), and what the buffer holds then is undefined -- a partial
+        # path, never one to build ssh.exe's location from.
+        import ctypes
+
+        def partial(buf, _n):
+            buf.value = r"C:\Windo"
+            return needed
+
+        monkeypatch.setattr(ctypes.windll.kernel32, "GetSystemDirectoryW", partial)
+        assert real_system_directory() is None

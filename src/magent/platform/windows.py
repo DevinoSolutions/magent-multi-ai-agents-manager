@@ -12,6 +12,7 @@ from ctypes import POINTER, WINFUNCTYPE, byref, create_unicode_buffer, windll
 from pathlib import Path
 from typing import Literal
 
+from magent.attach_client import ssh_program
 from magent.grid import MonitorRect, Rect
 from magent.log import get_logger
 from magent.platform import (
@@ -77,6 +78,10 @@ _NUDGE_SETTLE_S = 0.15
 # than stall the flow; a timeout is reported as "we could not look", and the
 # caller then leaves every window alone.
 _PROC_SCAN_TIMEOUT_S = 10.0
+
+# Characters that make `cmd /k` quote-strip or re-parse an argv[0]; an ssh
+# client path carrying one is handed to cmd as its bare name instead.
+_CMD_METACHARS = frozenset(' &()^%!"')
 
 # --- Session-0 desktop hand-off (see run_on_desktop) --------------------------
 # Scratch root for one per-call directory holding the launcher script and its
@@ -559,6 +564,9 @@ class WindowsPlatform(Platform):
     def supports_wt_keybindings(self) -> bool:
         return True
 
+    def supports_attach_windows(self) -> bool:
+        return True
+
     def set_window_title(self, handle: object, title: str) -> bool:
         return bool(user32.SetWindowTextW(handle, title))
 
@@ -622,7 +630,17 @@ class WindowsPlatform(Platform):
             # is a single, cleanly-quoted token. Building one `ssh ... "..."`
             # string and handing it to `cmd /k` double-nests the quotes, which
             # cmd mangles (the inner quotes leak to the remote shell).
-            args.extend(["--", "cmd", "/k", "ssh", "-t", opts.ssh_host, remote])
+            # argv[0] by attach_client's rule, so this pane dials the same
+            # client (and agent) as the attach panes and the node calls.
+            client = ssh_program()
+            # `cmd /k` strips the first and last quote of a line that starts
+            # with one, so a client path that needs quoting (C:\Program Files)
+            # would eat the remote command's closing quote, and one carrying
+            # `&` or `^` is re-parsed by cmd. Only the PATH fallback yields
+            # such a path, and the bare name finds it again.
+            if any(c in _CMD_METACHARS for c in client):
+                client = "ssh"
+            args.extend(["--", "cmd", "/k", client, "-t", opts.ssh_host, remote])
         else:
             args.extend(["--", "cmd", "/k", opts.command])
 

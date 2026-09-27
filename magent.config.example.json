@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "baseDir": "C:/Users/you/projects",
   "layout": {
     "columns": 2,
@@ -28,6 +28,12 @@
       "stalenessNeedsInputS": 3600.0,
       "debounceS": 300.0,
       "stateTtlDays": 14
+    },
+    "nodes": {},
+    "nodeSync": {
+      "pullIntervalS": 30,
+      "sampleIntervalS": 60,
+      "historyH": 24
     },
     "tools": {
       "claude": "claude --continue",

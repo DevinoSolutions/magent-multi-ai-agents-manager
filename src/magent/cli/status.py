@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from typing import TYPE_CHECKING, NamedTuple
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -43,6 +44,7 @@ from magent.psmux import session0_message, session0_server_pids
 from magent.style import style
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
     from magent.config import MagentConfig
@@ -59,6 +61,13 @@ LISTENER_REPAIR_HINT = "magent down --all, then magent serve (or magent attach)"
 # server stays dead until a human notices -- which is precisely the failure
 # that supervision exists to end.
 UPLOAD_WATCHDOG_HINT = "magent attention -d  (it revives a dead upload server)"
+
+# A stale node sync daemon still holds its lock, so nothing replaces it:
+# `serve` leaves a wedged one for the user (launch.ensure_node_sync says the
+# same), and starts a fresh one once it is stopped.
+NODE_SYNC_REPAIR_HINT = "magent node sync --stop  (magent serve starts a fresh one)"
+# Expected (serve would spawn one) but not running: not degraded, but named.
+NODE_SYNC_STOPPED_LINE = "node sync daemon stopped  (magent serve starts one)"
 
 
 def _health_check(port: int) -> bool:
@@ -155,6 +164,28 @@ def _attention_state() -> str:
     if daemon_pid():
         return "on" if heartbeat_fresh("attention") else "stale"
     return "crashed" if heartbeat_age("attention") is not None else "off"
+
+
+def _node_sync_state(cfg: MagentConfig) -> str:
+    """The node sync daemon, judged against whether one is EXPECTED: "off" when
+    serve would not spawn one, else ``node_cmd._daemon_state``'s "ok" /
+    "stale" / "stopped". "Would serve spawn one" is serve's OWN predicate,
+    ``launch.node_sync_enabled`` -- the ``MAGENT_NODE_SYNC`` switch AND
+    ``node_sync.wanted`` -- so a leftover heartbeat under a switched-off
+    daemon is not a daemon anyone expects, and the repair hint's "serve starts
+    a fresh one" is only ever shown when serve will.
+
+    Only "stale" degrades (``_is_degraded``): every node row is then frozen at
+    a pull nobody refreshes. "stopped" does not -- `serve` starts a daemon
+    within its supervise interval, with serve off the upload-server line
+    already says so, and the spec promises exit 3 for a stale daemon only.
+    """
+    from magent import launch  # heavy subsystem: in-body per policy
+    from magent.cli.node_cmd import _daemon_state  # DECISION-17's one reader
+
+    if not launch.node_sync_enabled(cfg):
+        return "off"
+    return _daemon_state()
 
 
 def _agents_snapshot(cfg: MagentConfig) -> list[dict[str, object]]:
@@ -263,6 +294,7 @@ def _gather_status(cfg: MagentConfig) -> dict[str, str]:
         "upload_server": upload,
         "listener": _listener_state(upload),
         "attention": _attention_state(),
+        "node_sync": _node_sync_state(cfg),
     }
 
 
@@ -271,6 +303,7 @@ def _is_degraded(status: dict[str, str]) -> bool:
         status["upload_server"] == "dead"
         or status["listener"] in ("stale", "dead")
         or status["attention"] in ("stale", "crashed")
+        or status["node_sync"] == "stale"
     )
 
 
@@ -332,9 +365,43 @@ def _render_status(config_file: Path) -> StatusReport:
         click.echo(
             f"\n  {style(str(len(down)), fg='yellow', bold=True)} not running  {style('(' + preview + ')', dim=True)}"
         )
+    status = _gather_status(cfg)
+    # Node sessions (PR-D): read from the sync daemon's last pull, never over
+    # ssh -- a stale row is a node this PC has not heard from, not a dead one.
+    # heavy subsystem: in-body per policy
+    from magent import nodes
+
+    node_rows = nodes.session_rows(cfg, now=time.time())
+    # The daemon behind those rows: stale freezes every one of them, which is
+    # what makes it the one node state that degrades (_node_sync_state). Named
+    # even with no rows -- a node-pinned IDE project has none, yet serve still
+    # runs the daemon for it. A stopped one is named too (dim, not degraded):
+    # the JSON says so, and every row will drift to stale until serve starts it.
+    sync_stale = status["node_sync"] == "stale"
+    sync_stopped = status["node_sync"] == "stopped"
+    if node_rows or sync_stale or sync_stopped:
+        click.echo(f"\n  {style('Nodes', bold=True)}")
+    tint = {"live": "green", "stale": "yellow", "dead": "red"}
+    for node_row in node_rows:
+        state = str(node_row["state"])
+        # No node is "not placed" only when that is KNOWN (dead); a stale row
+        # without one is an auto project behind an unreadable node map.
+        unplaced = "(not placed)" if state == "dead" else "(node unknown)"
+        node = f"@{node_row['node']}" if node_row["node"] else unplaced
+        click.echo(
+            f"    {node_row['session']}  {style(node, fg='blue')}  {style(state, fg=tint[state])}"
+        )
+    if sync_stale:
+        click.echo(
+            f"  {style('node sync daemon stale  (heartbeat expired)', fg='red', bold=True)}"
+        )
+        click.echo(
+            f"  {style('Repair:', dim=True)} {style(NODE_SYNC_REPAIR_HINT, bold=True)}"
+        )
+    if sync_stopped:
+        click.echo(f"  {style(NODE_SYNC_STOPPED_LINE, dim=True)}")
     _divider()
 
-    status = _gather_status(cfg)
     upload_labels = {
         "on": style(f"ON  port {cfg.settings.upload_port}", fg="green", bold=True),
         "dead": style(
@@ -456,6 +523,12 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
         # Session 0 is a fact about the machine, not about magent's daemons, so
         # it changes neither the envelope's shape nor the exit contract.
         payload["psmux_session0"] = len(session0_server_pids())
+        # Additive, like psmux_sessions: a dead or stale node session is a row
+        # state, never a degraded daemon; only the sync daemon's own
+        # `node_sync` field can degrade (exit 3).
+        from magent import nodes  # heavy subsystem: in-body per policy
+
+        payload["node_sessions"] = nodes.session_rows(cfg, now=time.time())
         click.echo(json.dumps(payload))
         sys.exit(3 if _is_degraded(status) else 0)
 
@@ -485,26 +558,47 @@ def _down_host(explicit: str | None, local_targets: list[str]) -> str | None:
     return _read_last_host()
 
 
-def _report_shutdown(stopped: list[str], still: list[str]) -> None:
+def _report_shutdown(
+    stopped: Sequence[str],
+    still: Sequence[str],
+    node_stopped: Sequence[str] = (),
+    node_still: Sequence[str] = (),
+) -> None:
     """Say what was PROVED stopped, and say the survivors loudly.
 
     The old line was ``Stopped {len(targets)} session(s)`` off the list the
     command had *tried* -- printed verbatim on a machine where 11 of the 46 it
     claimed were still alive and attachable. A shutdown report that cannot be
     wrong about the world is not a report.
+
+    ``node_stopped``/``node_still`` are a node project's other half (PR-D):
+    its session ON THE NODE, beside the local one the same id may have left
+    here (D9, in ``stopped``/``still``). Two sessions, one name, one report:
+    a name is claimed stopped only when neither half kept it running, and
+    "nothing to stop" is said only when neither half found anything.
     """
-    if stopped:
+    survivors = {*still, *node_still}
+    claimed = [
+        s for s in dict.fromkeys([*stopped, *node_stopped]) if s not in survivors
+    ]
+    if claimed:
         click.echo(
-            f"  {style('+', fg='green')} Stopped {style(str(len(stopped)), fg='green', bold=True)}"
-            f" session(s): {style(', '.join(stopped), dim=True)}"
+            f"  {style('+', fg='green')} Stopped {style(str(len(claimed)), fg='green', bold=True)}"
+            f" session(s): {style(', '.join(claimed), dim=True)}"
         )
-    elif not still:
+    elif not survivors:
         click.echo(f"  {style('-', dim=True)} No running sessions to stop.")
     if still:
         click.echo(
             f"  {style('x', fg='red')} {style(str(len(still)), fg='red', bold=True)}"
             f" session(s) would NOT stop: {style(', '.join(still), fg='red')}"
             f" {style('(two kill attempts each -- see ~/.magent/logs/launch.log)', dim=True)}"
+        )
+    if node_still:
+        click.echo(
+            f"  {style('x', fg='red')} {style(str(len(node_still)), fg='red', bold=True)}"
+            f" session(s) would NOT stop: {style(', '.join(node_still), fg='red')}"
+            f" {style('(not confirmed on its node -- see ~/.magent/logs/nodes.log)', dim=True)}"
         )
 
 
@@ -514,6 +608,76 @@ def _select_targets(pool: list[str], names: tuple[str, ...]) -> list[str]:
         return list(pool)
     wanted = {n.lower() for n in names}
     return [n for n in pool if n.lower() in wanted]
+
+
+def _node_orphan_targets(
+    cfg: MagentConfig, group: str | None, names: tuple[str, ...]
+) -> list[str]:
+    """The in-scope node projects' session ids, for a LOCAL `down` to kill.
+
+    A node project runs on its node, so ``psmux_status`` never lists it. But a
+    project that ran HERE before it gained a ``node`` left its local psmux
+    session behind, and no other surface can reach that session any more.
+    ``nodes.node_sid`` is the derivation ``eligible_projects`` uses, so the id
+    cannot drift; ``config.py`` refuses a local project sharing it, so this
+    never kills a local project's session. A socket with no server is a no-op
+    kill and the re-probe claims nothing for it.
+    """
+    from magent import nodes  # leaf, in-body: keeps `magent --help` off its imports
+
+    return _select_targets(
+        [nodes.node_sid(p) for p in nodes.node_projects(cfg, group)], names
+    )
+
+
+def _placed_here(cfg: MagentConfig, node_targets: list[str]) -> list[str]:
+    """The node targets this PC's node map says it placed. Like a live local
+    session, they are work only a LOCAL `down` can reach, so they keep the
+    shutdown off the remembered attach host. A node project that is merely
+    CONFIGURED does not: an attach client sharing the host's config would
+    otherwise never forward `down --all` to the host again.
+
+    ``nodes.placement_of`` is the lookup ``stop_node_sessions`` kills by, so
+    "placed here" and "killed there" name the same sessions. The map is read
+    TOLERANTLY on purpose: this is a routing choice, not a report, and an
+    unreadable map routes as it did before PR-D. ``stop_node_sessions`` reads
+    it strictly and names what it could not prove."""
+    if not node_targets:
+        return []
+    from magent import nodes  # leaf, in-body: keeps `magent --help` off its imports
+
+    entries = nodes.read_node_map()
+    return [
+        nodes.node_sid(p)
+        for p in nodes.node_projects(cfg)
+        if nodes.node_sid(p) in node_targets and nodes.placement_of(p, entries)
+    ]
+
+
+def _echo_attach_host_hint(live: list[str], placed: list[str]) -> None:
+    """One dim line when node sessions THIS PC placed are the only reason
+    `down` stayed local: without them it would have acted on the remembered
+    attach host, so name the command that still does. Called on the local
+    branch only (an explicit ``--host`` never gets here); ``not placed`` just
+    spares a second read of the last-host store that already said None."""
+    if live or not placed:
+        return
+    from magent.cli.attach import (
+        _read_last_host,  # sibling module: one last-attach-host store
+    )
+
+    last = _read_last_host()
+    if last:
+        click.echo(
+            f"  {style('-', dim=True)} "
+            + style(
+                # Never "Stopped": this line follows the report whatever it
+                # said, survivors and "nothing to stop" included.
+                f"Acted here, not on {last} (this PC placed node sessions)."
+                f" For the sessions on {last}: magent down --host {last}",
+                dim=True,
+            )
+        )
 
 
 @main.command("down")
@@ -553,6 +717,7 @@ def down_cmd(
 
     from magent.launch import (  # heavy subsystem: in-body per policy
         psmux_status,
+        stop_node_sessions,
         stop_psmux,
     )
 
@@ -576,8 +741,14 @@ def down_cmd(
     targets = _select_targets(
         [_as_str(p.get("session")) or _as_str(p.get("name")) for p in projects], names
     )
+    # Only a LOCAL down reaches them: the remote branch forwards the command,
+    # and the host runs this same rule against its own config. The `not in`
+    # is belt-and-braces: load_config refuses a node sid shared with a local one.
+    node_targets = _node_orphan_targets(cfg, group, names)
+    targets += [s for s in node_targets if s not in targets]
 
-    remote = _down_host(host, live)
+    placed = _placed_here(cfg, node_targets)
+    remote = _down_host(host, [*live, *placed])
     remote_rc = 0
     if remote:
         from magent.cli.attach import (
@@ -586,7 +757,17 @@ def down_cmd(
 
         remote_rc = _remote_down(remote, names, group, do_all, stop_srv)
     elif targets:
-        _report_shutdown(*stop_psmux(targets))
+        # A node target is two sessions under one name (PR-D): the local one
+        # it may have left here, which `stop_psmux` kills with the rest of
+        # `targets`, and the one on its node, which only `stop_node_sessions`
+        # dials. Each has exactly one killer; the report folds both halves.
+        stopped, still = stop_psmux(targets)
+        node_stopped: list[str] = []
+        node_still: list[str] = []
+        if node_targets:
+            node_stopped, node_still = stop_node_sessions(cfg, node_targets)
+        _report_shutdown(stopped, still, node_stopped, node_still)
+        _echo_attach_host_hint(live, placed)
     else:
         click.echo(f"  {style('-', dim=True)} No matching sessions in config.")
 

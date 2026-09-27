@@ -17,6 +17,7 @@ import pytest
 
 from magent import cli
 from magent.cli.mobile import _FALLBACK_UPLOAD_PORT, _configured_upload_port
+from magent.config import SCHEMA_VERSION
 from tests.conftest import FakePlatform
 
 
@@ -27,7 +28,7 @@ def _write_config(path, port=None, extra_settings=None):
     if extra_settings:
         settings.update(extra_settings)
     path.write_text(
-        json.dumps({"version": 3, "projects": [], "settings": settings}),
+        json.dumps({"version": SCHEMA_VERSION, "projects": [], "settings": settings}),
         encoding="utf-8",
     )
     return str(path)

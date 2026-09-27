@@ -19,6 +19,7 @@ from magent.cli import (  # noqa: F401  # reason: side-effect import — runs ea
     hooks_cmd,
     menu,
     mobile,
+    node_cmd,
     session_picker,
     status,
     terminal_cmd,

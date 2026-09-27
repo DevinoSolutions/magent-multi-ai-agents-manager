@@ -526,14 +526,36 @@ def _do_upload(server_url: str, project: str, ssh_host: str | None = None) -> No
     )
 
 
+# What cmd.exe treats as syntax on a batch file's command line. list2cmdline
+# quotes an argument only for whitespace, so `&|<>^` outside quotes split or
+# redirect the command, `%VAR%` expands even inside quotes, and `\"` is not an
+# escape to cmd.exe. `!` expands under delayed expansion. A Windows folder may
+# legitimately be named `R&D`; a remote POSIX one may even carry a control
+# character, and cmd.exe ends the command at a LF (_cmd_would_mangle).
+_CMD_METACHARS = frozenset('&|<>^%"!')
+
+
+def _cmd_would_mangle(argv: list[str]) -> bool:
+    """True when ``argv`` names a batch file (``code.cmd``) and any element --
+    the shim's own path included -- carries a cmd.exe metacharacter or a
+    control character (below 0x20, or DEL). There is no quoting that makes such an
+    argv safe through ``cmd.exe /c``, so F2 refuses it; an ``.exe`` (or a
+    POSIX ``code``) takes its argv verbatim and is never refused."""
+    if not argv[0].lower().endswith((".cmd", ".bat")):
+        return False
+    return any(
+        ch in _CMD_METACHARS or ch < " " or ch == "\x7f" for arg in argv for ch in arg
+    )
+
+
 def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
     """Open the focused project's folder in VS Code, off the hook callback.
 
     Threaded for the same reason as ``_do_upload``: the /api/sessions round
     trip must never block a system-wide keyboard hook. Every failure mode --
     server down, project absent from the payload, no folder on the entry, no
-    ``code`` on PATH -- is a log line, a status-line flash, and a no-op; the
-    listener has to outlive all of them.
+    ``code`` on PATH, a folder ``code.cmd`` cannot pass -- is a log line, a
+    status-line flash, and a no-op; the listener has to outlive all of them.
     """
     log = get_logger("hotkey")
     try:
@@ -545,21 +567,49 @@ def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
                 server_url, project, "F2: 'code' not found on PATH", tint=FLASH_TINT_ERR
             )
             return
-        with urlopen(f"{server_url}/api/sessions", timeout=10) as resp:
-            payload = json.loads(resp.read())
-        folder = folder_for_session(payload, project)
-        if not folder:
-            log.warning("F2: no folder for project=%s in /api/sessions", project)
+        # A pool-node project (PR-D): its folder is on the node, and the node
+        # map says which one and where -- no server round trip. The user stays
+        # in the authority: magent resolved it and the ssh config may not know
+        # it (D4). A cloud placement has no ssh target and falls through.
+        # heavy subsystem: in-body per policy
+        from magent import nodes
+
+        hit = nodes.open_target(project, nodes.read_node_map())
+        if hit is not None:
+            ssh_host, folder = hit
+            argv = build_code_open_command(folder, ssh_host, code_bin, keep_user=True)
+        else:
+            with urlopen(f"{server_url}/api/sessions", timeout=10) as resp:
+                payload = json.loads(resp.read())
+            folder = folder_for_session(payload, project)
+            if not folder:
+                log.warning("F2: no folder for project=%s in /api/sessions", project)
+                flash_async(
+                    server_url,
+                    project,
+                    f"F2: no folder known for {project} (host magent too old?)",
+                    tint=FLASH_TINT_ERR,
+                )
+                return
+            argv = build_code_open_command(folder, ssh_host, code_bin)
+        # code is code.cmd on Windows; shutil.which resolves the .cmd, and
+        # CreateProcess runs a .cmd through `cmd.exe /c`, which re-parses the
+        # command line. Refuse an argv it would mangle rather than open the
+        # wrong folder and flash success (_cmd_would_mangle).
+        if _cmd_would_mangle(argv):
+            log.warning(
+                "F2: not opening project=%s: argv %r has a character %s cannot pass",
+                project,
+                argv,
+                code_bin,
+            )
             flash_async(
                 server_url,
                 project,
-                f"F2: no folder known for {project} (host magent too old?)",
+                "F2: folder name has a character code.cmd can't pass",
                 tint=FLASH_TINT_ERR,
             )
             return
-        # code is code.cmd on Windows; shutil.which resolves the .cmd and
-        # Popen on that resolved path runs it without a shell.
-        #
         # `env=`: same reason as the platform backends' launch_vscode. This
         # listener is a long-lived descendant of whatever shell started magent,
         # so it carries that shell's agent-session markers for days; the editor
@@ -575,7 +625,7 @@ def _do_open_code(server_url: str, project: str, ssh_host: str | None) -> None:
         # psmux._SPAWN_FLAGS; this module is win32-only, so the stdlib
         # constant is always present.
         subprocess.Popen(
-            build_code_open_command(folder, ssh_host, code_bin),
+            argv,
             env=spawn_child_env(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,

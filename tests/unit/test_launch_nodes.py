@@ -1,0 +1,1981 @@
+"""The launch-side half of running a project on a pool node (PR-D): the D7
+refusals, the per-node lock, the map write, the window -- with the node itself
+faked at remote_mux's seam, so nothing here dials anything."""
+
+from __future__ import annotations
+
+import dataclasses
+import errno
+import json
+import logging
+import subprocess
+import threading
+import time
+from collections import defaultdict
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import pytest
+from click.testing import CliRunner
+
+from magent import attach_client, cli, launch, lockfile, nodes, remote_mux
+from magent.config import (
+    SCHEMA_VERSION,
+    MagentConfig,
+    NodeConfig,
+    ProjectConfig,
+    Settings,
+)
+from magent.nodes import LocalGitState, NodeMapEntry
+from magent.remote_mux import BringUpResult, RemoteError
+from tests.conftest import FakePlatform
+
+if TYPE_CHECKING:
+    import os
+
+_TOOLS = {"claude": "claude --continue"}
+
+
+def _config(*projects: ProjectConfig) -> MagentConfig:
+    return MagentConfig(
+        projects=list(projects),
+        settings=Settings(
+            tools=dict(_TOOLS),
+            psmux=False,
+            upload_server=False,
+            nodes={
+                "second": NodeConfig(nick="second", host="devino-second", user="amin"),
+                "third": NodeConfig(nick="third", host="devino-third", user="amin"),
+            },
+        ),
+    )
+
+
+def _state(path: Path, **kw: bool) -> LocalGitState:
+    return LocalGitState(
+        path=path,
+        url="git@github.com:me/api.git",
+        branch="main",
+        dirty=kw.get("dirty", False),
+        unpushed=kw.get("unpushed", False),
+        detached=False,
+    )
+
+
+class NodeRig:
+    """Fakes remote_mux's four node calls and records what reached them."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        self.recipes: list[tuple[str, object]] = []
+        self.decorated: list[tuple[str, str]] = []
+        self.windows: list[tuple[str, str, str, str]] = []
+        self.live = False
+        self.states: dict[Path, LocalGitState] = {}
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        monkeypatch.setattr(remote_mux, "bring_up", self._bring_up)
+        monkeypatch.setattr(remote_mux, "has_session", lambda node, sid: self.live)
+        monkeypatch.setattr(
+            remote_mux,
+            "decorate",
+            lambda node, sid, nick: self.decorated.append((sid, nick)),
+        )
+        monkeypatch.setattr(
+            launch,
+            "node_git_states",
+            lambda config, proj: [
+                s for p, s in self.states.items() if str(p) == proj.path
+            ],
+        )
+        monkeypatch.setattr("magent.attach_client.spawn_attach_window", self._window)
+        self.error: Exception | None = None
+
+    def _bring_up(self, node, recipe, *, allow_dirty=False, resume_id=None):
+        self.recipes.append((node.nick, recipe))
+        if self.error is not None:
+            raise self.error
+        return BringUpResult(
+            sid=recipe.sid,
+            attached_existing=False,
+            cwd=f"/home/amin/magent/{Path(recipe.remote_root).name}",
+        )
+
+    def _window(self, target, sid, *, mux, remote=None, reconnect=True):
+        # The real spawn derives the pane's command from ``mux`` when
+        # ``remote`` is left out; record what the pane would really run.
+        self.windows.append(
+            (target, sid, mux, remote or attach_client.remote_attach_command(sid, mux))
+        )
+        return f"magent:{sid}"
+
+
+@pytest.fixture
+def rig(monkeypatch, tmp_path):
+    return NodeRig(monkeypatch, tmp_path)
+
+
+@pytest.fixture
+def api(tmp_path, rig):
+    folder = tmp_path / "api"
+    folder.mkdir()
+    rig.states[folder] = _state(folder)
+    return ProjectConfig(path=str(folder), node="second")
+
+
+class TestACleanProjectComesUpOnItsNode:
+    def test_it_is_brought_up_and_recorded_in_the_map(self, rig, api):
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert outcome == launch.NodeBringUpOutcome(ok=True, sid="api", node="second")
+        entry = nodes.read_node_map()["api"]
+        assert (entry.nick, entry.sid, entry.target, entry.cwd, entry.remote_root) == (
+            "second",
+            "api",
+            "amin@devino-second",
+            "/home/amin/magent/api",
+            "~/magent/api",
+        )
+
+    def test_an_explicit_resume_id_reaches_the_node_and_none_lets_it_pick(
+        self, rig, api, monkeypatch
+    ):
+        seen: list[str | None] = []
+
+        def fake(node, recipe, *, allow_dirty=False, resume_id=None):
+            seen.append(resume_id)
+            return BringUpResult(sid=recipe.sid, attached_existing=False, cwd="/n/api")
+
+        monkeypatch.setattr(remote_mux, "bring_up", fake)
+        uuid = "8f14e45f-ceea-467a-9b36-0c4b0f8d2c11"
+        launch.bring_up_node_project(_config(api), api, resume_id=uuid)
+        launch.bring_up_node_project(_config(api), api)
+        assert seen == [uuid, None]
+
+    def test_the_recipe_carries_the_tool_its_command_and_the_fresh_form(
+        self, rig, api, tmp_path
+    ):
+        launch.bring_up_node_project(_config(api), api)
+        nick, recipe = rig.recipes[0]
+        assert nick == "second"
+        assert (recipe.tool, recipe.command, recipe.fresh_command) == (
+            "claude",
+            "claude --continue",
+            "claude",
+        )
+        assert recipe.local_root == tmp_path / "api"
+
+    def test_no_window_unless_asked(self, rig, api, monkeypatch):
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+        launch.bring_up_node_project(_config(api), api)
+        assert rig.windows == []
+
+    def test_the_window_attaches_through_the_supervisor(self, rig, api, monkeypatch):
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+        launch.bring_up_node_project(_config(api), api, window=True)
+        assert rig.windows == [
+            ("amin@devino-second", "api", "tmux", "tmux -L magent attach -t '=api'")
+        ]
+
+    def test_a_platform_without_attach_windows_opens_none(self, rig, api, monkeypatch):
+        monkeypatch.setattr(launch, "get_platform", FakePlatform)
+        assert launch.bring_up_node_project(_config(api), api, window=True).ok
+        assert rig.windows == []
+
+    def test_a_window_that_cannot_spawn_does_not_fail_the_bring_up(
+        self, rig, api, monkeypatch
+    ):
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+
+        def no_wt(*_a: object, **_k: object) -> str:
+            raise FileNotFoundError("wt")
+
+        monkeypatch.setattr("magent.attach_client.spawn_attach_window", no_wt)
+        assert launch.bring_up_node_project(_config(api), api, window=True).ok
+        assert "api" in nodes.read_node_map()
+
+
+class TestTheWindowTitleIsTheOneTheSpawnUsed:
+    """``_open_node_window`` hands back the title C's real spawn opened the
+    window under -- the value tiling (Task 12) matches on -- and None when the
+    platform cannot open attach windows. The real ``spawn_attach_window`` runs;
+    only its ``wt`` Popen and the supervisor lookup are faked."""
+
+    _NODE = nodes.Node(
+        nick="second", host="devino-second", user="amin", root="~/magent"
+    )
+
+    def _spawned(self, monkeypatch) -> list[list[str]]:
+        argvs: list[list[str]] = []
+        monkeypatch.setattr(attach_client, "client_exe", lambda: None)
+        monkeypatch.setattr(
+            attach_client.subprocess, "Popen", lambda a, **k: argvs.append(a)
+        )
+        return argvs
+
+    def test_it_returns_the_title_the_window_opened_under(self, monkeypatch):
+        argvs = self._spawned(monkeypatch)
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+        title = launch._open_node_window(self._NODE, "api")
+        assert title == "magent:api"
+        (argv,) = argvs
+        assert argv[argv.index("--title") + 1] == title
+
+    def test_no_attach_windows_means_no_title_and_no_spawn(self, monkeypatch):
+        argvs = self._spawned(monkeypatch)
+        monkeypatch.setattr(launch, "get_platform", FakePlatform)
+        assert launch._open_node_window(self._NODE, "api") is None
+        assert argvs == []
+
+
+class TestTheOutcomeCarriesTheWindowsTitle:
+    """Tiling (Task 12) places node windows by the title the spawn used, so
+    the outcome hands it on -- and None whenever no window opened."""
+
+    @pytest.fixture
+    def windows(self, monkeypatch):
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+
+    def test_a_fresh_bring_up_names_the_window_it_opened(self, rig, api, windows):
+        outcome = launch.bring_up_node_project(_config(api), api, window=True)
+        assert outcome.title == "magent:api"
+
+    def test_attaching_instead_names_the_window_too(self, rig, api, tmp_path, windows):
+        _hold("api")
+        rig.live = True
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        outcome = launch.bring_up_node_project(_config(api), api, window=True)
+        assert (outcome.attached_existing, outcome.title) == (True, "magent:api")
+
+    def test_no_window_asked_is_no_title(self, rig, api, windows):
+        assert launch.bring_up_node_project(_config(api), api).title is None
+
+    def test_a_window_that_failed_to_spawn_is_no_title(
+        self, rig, api, monkeypatch, windows
+    ):
+        def no_wt(*_a: object, **_k: object) -> str:
+            raise FileNotFoundError("wt")
+
+        monkeypatch.setattr("magent.attach_client.spawn_attach_window", no_wt)
+        outcome = launch.bring_up_node_project(_config(api), api, window=True)
+        assert (outcome.ok, outcome.title) == (True, None)
+
+    def test_a_failed_bring_up_is_no_title(self, rig, api, windows):
+        rig.error = RemoteError(5, "magent: clone failed", ("bring_up",))
+        outcome = launch.bring_up_node_project(_config(api), api, window=True)
+        assert (outcome.ok, outcome.title) == (False, None)
+        assert rig.windows == []
+
+
+class TestD7RefusesWhatTheNodeCouldNotReproduce:
+    def test_a_dirty_tree_names_allow_dirty_and_nothing_is_dialed(
+        self, rig, api, tmp_path
+    ):
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert not outcome.ok
+        assert outcome.error is not None
+        assert "dirty" in outcome.error
+        assert "--allow-dirty" in outcome.error
+        assert rig.recipes == []
+        assert nodes.read_node_map() == {}
+
+    def test_unpushed_commits_name_the_push(self, rig, api, tmp_path):
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", unpushed=True)
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert outcome.error is not None
+        assert "git push -u origin main" in outcome.error
+
+    def test_allow_dirty_goes_through(self, rig, api, tmp_path):
+        rig.states[tmp_path / "api"] = _state(
+            tmp_path / "api", dirty=True, unpushed=True
+        )
+        assert launch.bring_up_node_project(_config(api), api, allow_dirty=True).ok
+
+    def test_provisioning_never_runs_for_a_refused_project(
+        self, rig, api, tmp_path, monkeypatch
+    ):
+        seen: list[str] = []
+        monkeypatch.setattr(
+            launch, "_provision_once", lambda node, config: seen.append(node.nick)
+        )
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        launch.bring_up_node_project(_config(api), api)
+        assert seen == []
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api")
+        launch.bring_up_node_project(_config(api), api)
+        assert seen == ["second"]
+
+    def test_a_refused_tree_with_its_session_alive_attaches_instead(
+        self, rig, api, tmp_path
+    ):
+        # The running session is not affected by what is uncommitted HERE.
+        nodes.update_node_map(
+            "api",
+            NodeMapEntry(
+                nick="second",
+                sid="api",
+                placed_ts=1.0,
+                attached_existing=False,
+                remote_root="~/magent/api",
+                target="amin@devino-second",
+            ),
+        )
+        rig.live = True
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert (outcome.ok, outcome.attached_existing) == (True, True)
+        assert any("--allow-dirty" in w for w in outcome.warnings)
+        assert rig.decorated == [("api", "second")]
+        assert rig.recipes == []
+
+    def test_a_project_with_no_repo_is_refused(self, rig, api, tmp_path):
+        del rig.states[tmp_path / "api"]
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert outcome.error is not None
+        assert "no git repository" in outcome.error
+
+    def test_a_folder_missing_on_this_pc_is_refused(self, rig, tmp_path):
+        gone = ProjectConfig(path=str(tmp_path / "gone"), node="second")
+        outcome = launch.bring_up_node_project(_config(gone), gone)
+        assert outcome.error is not None
+        assert "not found on this PC" in outcome.error
+
+    def test_an_unknown_tool_is_refused(self, rig, tmp_path):
+        folder = tmp_path / "x"
+        folder.mkdir()
+        rig.states[folder] = _state(folder)
+        proj = ProjectConfig(path=str(folder), node="second", tool="aider")
+        outcome = launch.bring_up_node_project(_config(proj), proj)
+        assert (
+            outcome.error
+            == f"{folder}: unknown tool 'aider' (add under settings.tools)"
+        )
+
+
+class TestAFailureIsAnOutcomeNeverACrash:
+    def test_a_node_side_refusal_reads_as_its_own_message(self, rig, api):
+        rig.error = RemoteError(
+            3,
+            "magent: ~/magent/api has uncommitted changes on the node; ... or pass --allow-dirty",
+            ("bring_up",),
+        )
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert outcome.error is not None
+        assert outcome.error.startswith("~/magent/api has uncommitted changes")
+        assert nodes.read_node_map() == {}
+
+    def test_an_unreachable_node_is_an_outcome(self, rig, api):
+        rig.error = RemoteError(
+            None, "ssh: connect to host devino-second: timed out", ("ssh",)
+        )
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert (outcome.ok, outcome.node) == (False, "second")
+        assert "timed out" in (outcome.error or "")
+
+    def test_an_auto_project_with_no_placement_fails_with_the_resolve_text(
+        self, rig, tmp_path
+    ):
+        # G-C12: `up` does not place; until PR-G's placer lands this is the answer.
+        folder = tmp_path / "web"
+        folder.mkdir()
+        proj = ProjectConfig(path=str(folder), node="auto")
+        outcome = launch.bring_up_node_project(_config(proj), proj)
+        assert "needs a placement" in (outcome.error or "")
+
+    def test_an_auto_project_goes_where_the_map_placed_it(self, rig, tmp_path):
+        folder = tmp_path / "web"
+        folder.mkdir()
+        rig.states[folder] = _state(folder)
+        nodes.update_node_map(
+            "web",
+            NodeMapEntry(
+                nick="third",
+                sid="web",
+                placed_ts=1.0,
+                attached_existing=False,
+                remote_root="~/magent/web",
+            ),
+        )
+        proj = ProjectConfig(path=str(folder), node="auto")
+        assert launch.bring_up_node_project(_config(proj), proj).node == "third"
+        assert rig.recipes[0][0] == "third"
+
+
+class TestASessionThatCameUpButWasNotRecordedIsUp:
+    """The node said yes, then the map write failed (another writer held the
+    lock past its wait, or the map was unreadable): the session IS running
+    there, so the outcome says so -- ok, with a warning naming what was lost
+    and how to repair it -- never a failure that invites a second bring-up."""
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            lockfile.LockHeld("node-map is held"),
+            ValueError("node-map.json: not valid JSON"),
+        ],
+    )
+    def test_it_is_ok_with_a_repair_warning(self, rig, api, monkeypatch, exc):
+        def no_map(*_a: object, **_k: object) -> dict[str, NodeMapEntry]:
+            raise exc
+
+        monkeypatch.setattr(nodes, "update_node_map", no_map)
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert outcome.ok is True
+        assert outcome.error is None
+        (warning,) = [w for w in outcome.warnings if "not recorded" in w]
+        assert warning.startswith("up on @second but not recorded")
+        assert "re-run magent up" in warning
+        # Unrecorded, a re-run has no held session to attach to, so a dirty
+        # tree would be refused: the repair says how not to be.
+        assert "clean tree or --allow-dirty" in warning
+        assert warning.isascii()
+
+    def test_the_window_still_opens(self, rig, api, monkeypatch):
+        def no_map(*_a: object, **_k: object) -> dict[str, NodeMapEntry]:
+            raise lockfile.LockHeld("node-map is held")
+
+        monkeypatch.setattr(nodes, "update_node_map", no_map)
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+        assert launch.bring_up_node_project(_config(api), api, window=True).ok
+        assert [w[1] for w in rig.windows] == ["api"]
+
+
+def _projects(
+    tmp_path: Path, rig: NodeRig, spec: list[tuple[str, str]]
+) -> list[ProjectConfig]:
+    out = []
+    for name, nick in spec:
+        folder = tmp_path / name
+        folder.mkdir()
+        rig.states[folder] = _state(folder)
+        out.append(ProjectConfig(path=str(folder), node=nick))
+    return out
+
+
+class TestManyNodeProjectsAtOnce:
+    def test_outcomes_come_back_in_config_order(self, rig, tmp_path):
+        projs = _projects(
+            tmp_path, rig, [("a1", "second"), ("b1", "third"), ("a2", "second")]
+        )
+        outcomes = launch.bring_up_node_projects(_config(*projs))
+        assert [o.sid for o in outcomes] == ["a1", "b1", "a2"]
+
+    def test_only_is_a_list_of_session_ids(self, rig, tmp_path):
+        projs = _projects(tmp_path, rig, [("a1", "second"), ("b1", "third")])
+        outcomes = launch.bring_up_node_projects(
+            _config(*projs), only=["b1", "local-api"]
+        )
+        assert [o.sid for o in outcomes] == ["b1"]
+
+    def test_nothing_to_do_is_an_empty_list(self, rig):
+        assert launch.bring_up_node_projects(_config()) == []
+
+    def test_one_node_is_serial_and_two_nodes_are_parallel(
+        self, rig, tmp_path, monkeypatch
+    ):
+        projs = _projects(
+            tmp_path, rig, [("a1", "second"), ("a2", "second"), ("b1", "third")]
+        )
+        active: dict[str, int] = defaultdict(int)
+        peak: dict[str, int] = defaultdict(int)
+        guard = threading.Lock()
+        # a1 (second) and b1 (third) must be inside bring_up AT THE SAME TIME:
+        # a global lock would time the barrier out.
+        barrier = threading.Barrier(2, timeout=10)
+
+        def fake(node, recipe, *, allow_dirty=False, resume_id=None):
+            with guard:
+                active[node.nick] += 1
+                peak[node.nick] = max(peak[node.nick], active[node.nick])
+            try:
+                if recipe.sid in ("a1", "b1"):
+                    barrier.wait()
+                time.sleep(0.05)
+            finally:
+                with guard:
+                    active[node.nick] -= 1
+            return BringUpResult(
+                sid=recipe.sid, attached_existing=False, cwd=f"/n/{recipe.sid}"
+            )
+
+        monkeypatch.setattr(remote_mux, "bring_up", fake)
+        outcomes = launch.bring_up_node_projects(_config(*projs))
+        assert all(o.ok for o in outcomes)
+        assert peak == {"second": 1, "third": 1}
+        # ...and all three map entries survived the concurrent writes.
+        assert set(nodes.read_node_map()) == {"a1", "a2", "b1"}
+
+    def test_window_reaches_every_bring_up_in_the_batch(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # `up` never asks for windows; `--go` (Task 12) does, through here.
+        projs = _projects(tmp_path, rig, [("a1", "second"), ("b1", "third")])
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+        outcomes = launch.bring_up_node_projects(_config(*projs), window=True)
+        assert [(o.sid, o.title) for o in outcomes] == [
+            ("a1", "magent:a1"),
+            ("b1", "magent:b1"),
+        ]
+        assert sorted(sid for _, sid, _, _ in rig.windows) == ["a1", "b1"]
+
+    def test_a_fanned_out_batch_leaves_the_nodes_log_one_handler(self, rig, tmp_path):
+        # The workers make the batch's first get_logger("nodes") calls, all at
+        # once (conftest's log.reset_logging() hands every test an unconfigured
+        # logger); a stacked handler per worker would write every line 8 times.
+        logger = logging.getLogger("magent.nodes")
+        assert logger.handlers == []
+        spec = [(f"p{i}", ("second", "third")[i % 2]) for i in range(8)]
+        outcomes = _batch(_config(*_projects(tmp_path, rig, spec)))
+        assert all(o.ok for o in outcomes)
+        assert len(logger.handlers) == 1
+
+
+def _no_contact_for(monkeypatch: pytest.MonkeyPatch, rig: NodeRig, *sids: str) -> None:
+    """Fail loudly on anything a bring-up does for ``sids`` past the fleet
+    check -- the ssh calls, the local git read -- while every other project
+    still reaches the rig's fakes."""
+    refused = set(sids)
+
+    def guard(sid: str) -> None:
+        if sid in refused:
+            raise AssertionError(f"{sid} must be refused before any bring-up")
+
+    real_git = launch.node_git_states
+
+    def git_states(config: MagentConfig, proj: ProjectConfig) -> list[LocalGitState]:
+        guard(nodes.node_sid(proj))
+        return real_git(config, proj)
+
+    def bring_up(node, recipe, *, allow_dirty=False, resume_id=None):
+        guard(recipe.sid)
+        return rig._bring_up(node, recipe, allow_dirty=allow_dirty, resume_id=resume_id)
+
+    def has_session(node: nodes.Node, sid: str) -> bool:
+        guard(sid)
+        return rig.live
+
+    def decorate(node: nodes.Node, sid: str, nick: str) -> None:
+        guard(sid)
+        rig.decorated.append((sid, nick))
+
+    monkeypatch.setattr(launch, "node_git_states", git_states)
+    monkeypatch.setattr(remote_mux, "bring_up", bring_up)
+    monkeypatch.setattr(remote_mux, "has_session", has_session)
+    monkeypatch.setattr(remote_mux, "decorate", decorate)
+
+
+def _twin_apis(tmp_path: Path, rig: NodeRig) -> list[ProjectConfig]:
+    """Two projects whose LOCAL folders share the leaf name ``api`` -- on two
+    different nodes, because the rule is fleet-wide (auto may co-locate
+    them later) -- plus a bystander with a folder of its own."""
+    out = []
+    for parent, title, nick in (("x", "api-x", "second"), ("y", "api-y", "third")):
+        folder = tmp_path / parent / "api"
+        folder.mkdir(parents=True)
+        rig.states[folder] = _state(folder)
+        out.append(ProjectConfig(path=str(folder), node=nick, title=title))
+    (bystander,) = _projects(tmp_path, rig, [("web", "second")])
+    return [*out, bystander]
+
+
+def _record(name: str, nick: str, remote_root: str) -> None:
+    """``name`` recorded in the node map as running on ``nick`` in
+    ``remote_root`` -- the holder of that folder, as far as the map knows."""
+    nodes.update_node_map(
+        name,
+        NodeMapEntry(
+            nick=nick,
+            sid=name,
+            placed_ts=1.0,
+            attached_existing=False,
+            remote_root=remote_root,
+            target=f"amin@devino-{nick}",
+        ),
+    )
+
+
+def _attached_when_live(monkeypatch: pytest.MonkeyPatch, rig: NodeRig) -> None:
+    """The node's own answer for a session already running: bring_up.sh
+    attaches to it instead of starting one (``attached_existing``)."""
+    real = remote_mux.bring_up
+
+    def bring_up(node, recipe, **kw):
+        return dataclasses.replace(real(node, recipe, **kw), attached_existing=rig.live)
+
+    monkeypatch.setattr(remote_mux, "bring_up", bring_up)
+
+
+def _batch(config: MagentConfig, **kw: list[str]) -> list[launch.NodeBringUpOutcome]:
+    """``bring_up_node_projects`` with its contract as an assertion: a batch
+    never raises -- a project the check cannot place is an outcome, not a
+    crash that takes its siblings down with it."""
+    try:
+        return launch.bring_up_node_projects(config, **kw)
+    except Exception as exc:
+        raise AssertionError(f"a node batch must never raise: {exc!r}") from exc
+
+
+class TestTwoProjectsThatWouldShareANodeFolderAreRefusedFirst:
+    """X3: before the fan-out, the batch is checked against the WHOLE fleet's
+    node folders (``nodes.remote_root_collisions``) -- one clone would
+    otherwise overwrite the other's folder, now or on a later ``up``. Only a
+    batch project in a colliding group is refused; the rest come up."""
+
+    def test_the_colliding_members_are_refused_and_the_rest_come_up(
+        self, rig, tmp_path, monkeypatch
+    ):
+        projs = _twin_apis(tmp_path, rig)
+        _no_contact_for(monkeypatch, rig, "api-x", "api-y")
+        outcomes = _batch(_config(*projs))
+        assert [(o.sid, o.ok) for o in outcomes] == [
+            ("api-x", False),
+            ("api-y", False),
+            ("web", True),
+        ]
+        for o in outcomes[:2]:
+            assert o.error is not None
+            assert "'api-x' and 'api-y' would share the node folder name 'api'" in (
+                o.error
+            )
+            assert "rename one of them" in o.error
+        assert [o.node for o in outcomes] == ["second", "third", "second"]
+        assert [recipe.sid for _, recipe in rig.recipes] == ["web"]
+        assert set(nodes.read_node_map()) == {"web"}
+
+    def test_a_refusal_keeps_its_place_in_the_batch(self, rig, tmp_path, monkeypatch):
+        # Refused before the fan-out, but reported where the batch put them.
+        x_api, y_api, web = _twin_apis(tmp_path, rig)
+        _no_contact_for(monkeypatch, rig, "api-x", "api-y")
+        outcomes = _batch(_config(web, x_api, y_api))
+        assert [(o.sid, o.ok) for o in outcomes] == [
+            ("web", True),
+            ("api-x", False),
+            ("api-y", False),
+        ]
+
+    def test_an_auto_project_the_map_placed_collides_like_a_pinned_one(
+        self, rig, tmp_path
+    ):
+        # The map places api-y on third, under a folder it no longer uses --
+        # a record of the very folder would make api-y its holder instead.
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        y_api.node = "auto"
+        _record("api-y", "third", "~/magent/old-api")
+        outcomes = _batch(_config(x_api, y_api))
+        assert [(o.sid, o.ok, o.node) for o in outcomes] == [
+            ("api-x", False, "second"),
+            ("api-y", False, "third"),
+        ]
+        assert rig.recipes == []
+
+    def test_a_title_that_is_not_a_session_id_is_still_refused(self, rig, tmp_path):
+        # The refusal is keyed by session id, which a title only becomes once
+        # sanitized: "API X" runs as API-X.
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        x_api.title, y_api.title = "API X", "API Y"
+        outcomes = _batch(_config(x_api, y_api))
+        assert [(o.sid, o.ok) for o in outcomes] == [("API-X", False), ("API-Y", False)]
+        assert rig.recipes == []
+
+    @pytest.mark.parametrize(
+        "make",
+        [
+            lambda tmp: ProjectConfig(path=str(tmp / "gone"), node="second"),
+            lambda tmp: ProjectConfig(path=str(tmp / "web2"), node="auto"),
+        ],
+        ids=["missing-folder", "unplaced-auto"],
+    )
+    def test_a_project_the_scan_skips_does_not_hide_a_later_pair(
+        self, rig, tmp_path, make
+    ):
+        (tmp_path / "web2").mkdir()
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        outcomes = _batch(_config(make(tmp_path), x_api, y_api))
+        assert [o.ok for o in outcomes] == [False, False, False]
+        assert ["would share" in (o.error or "") for o in outcomes] == [
+            False,
+            True,
+            True,
+        ]
+        assert rig.recipes == []
+
+    def test_a_folder_the_scan_cannot_read_is_that_projects_outcome(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # One node project's folder this user may not stat (another profile, a
+        # deny ACL) must not take `up` of any other project down with it --
+        # the fleet scan reads every folder, asked for or not.
+        (good,) = _projects(tmp_path, rig, [("a1", "second")])
+        locked = tmp_path / "locked" / "z"
+        locked.mkdir(parents=True)
+        rig.states[locked] = _state(locked)
+        z = ProjectConfig(path=str(locked), node="second")
+        real_stat = Path.stat
+
+        def stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            if str(self) == str(locked):
+                raise PermissionError(errno.EACCES, "Access is denied", str(self))
+            return real_stat(self, follow_symlinks=follow_symlinks)
+
+        monkeypatch.setattr(Path, "stat", stat)
+        alone = _batch(_config(good, z), only=["a1"])
+        assert [(o.sid, o.ok) for o in alone] == [("a1", True)]
+        both = _batch(_config(good, z))
+        assert [(o.sid, o.ok) for o in both] == [("a1", True), ("z", False)]
+        assert "Access is denied" in (both[1].error or "")
+
+    def test_a_collision_with_a_project_outside_the_batch_still_refuses(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # `magent up api-x` today and `magent up api-y` tomorrow would each be
+        # a batch of one: only the fleet sees that they share a folder.
+        projs = _twin_apis(tmp_path, rig)
+        _no_contact_for(monkeypatch, rig, "api-x", "api-y")
+        outcomes = _batch(_config(*projs), only=["api-x"])
+        assert [(o.sid, o.ok) for o in outcomes] == [("api-x", False)]
+        assert "'api-y'" in (outcomes[0].error or "")
+        assert rig.recipes == []
+        assert nodes.read_node_map() == {}
+
+    def test_a_live_holder_keeps_attaching_and_only_the_newcomer_is_refused(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # api-x already runs in ~/magent/api; the user then adds api-y, whose
+        # folder has the same name. Only api-y's clone could overwrite
+        # anything, so only api-y is refused -- api-x attaches, and is told
+        # of the clash as a warning.
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        _record("api-x", "second", "~/magent/api")
+        rig.live = True
+        _no_contact_for(monkeypatch, rig, "api-y")
+        _attached_when_live(monkeypatch, rig)
+        outcomes = _batch(_config(x_api, y_api))
+        holder, newcomer = outcomes
+        assert (holder.sid, holder.ok, holder.attached_existing) == (
+            "api-x",
+            True,
+            True,
+        )
+        assert holder.error is None
+        assert len(holder.warnings) == 1
+        assert "'api-x' and 'api-y' would share" in holder.warnings[0]
+        assert (newcomer.sid, newcomer.ok) == ("api-y", False)
+        assert "'api-x'" in (newcomer.error or "")
+        assert [(n, r.sid, r.remote_root) for n, r in rig.recipes] == [
+            ("second", "api-x", "~/magent/api")
+        ]
+
+    def test_a_live_holder_brought_up_alone_still_attaches(
+        self, rig, tmp_path, monkeypatch
+    ):
+        projs = _twin_apis(tmp_path, rig)
+        _record("api-x", "second", "~/magent/api")
+        _attached_when_live(monkeypatch, rig)
+        rig.live = True
+        (o,) = _batch(_config(*projs), only=["api-x"])
+        assert (o.sid, o.ok, o.attached_existing) == ("api-x", True, True)
+        assert len(o.warnings) == 1
+        assert "'api-y'" in o.warnings[0]
+
+    def test_a_holder_whose_session_is_gone_is_restarted_in_its_own_folder(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # The folder is the holder's recorded placement and the newcomer is
+        # refused, so a restart there overwrites no one; it is still told.
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        _record("api-x", "second", "~/magent/api")
+        _no_contact_for(monkeypatch, rig, "api-y")
+        holder, newcomer = _batch(_config(x_api, y_api))
+        assert (holder.sid, holder.ok, holder.attached_existing) == (
+            "api-x",
+            True,
+            False,
+        )
+        assert holder.error is None
+        assert len(holder.warnings) == 1
+        assert "'api-x' and 'api-y' would share" in holder.warnings[0]
+        assert (newcomer.sid, newcomer.ok) == ("api-y", False)
+        assert "'api-x'" in (newcomer.error or "")
+        assert [(n, r.sid, r.remote_root) for n, r in rig.recipes] == [
+            ("second", "api-x", "~/magent/api")
+        ]
+        assert set(nodes.read_node_map()) == {"api-x"}
+
+    def test_a_record_on_another_node_does_not_make_a_holder(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # api-x ran in ~/magent/api on second, then was re-pinned to third,
+        # where api-y holds ~/magent/api. On third api-x is a newcomer: taking
+        # it for a holder would dial both into one folder.
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        x_api.node = "third"
+        _record("api-x", "second", "~/magent/api")
+        _record("api-y", "third", "~/magent/api")
+        _no_contact_for(monkeypatch, rig, "api-x")
+        newcomer, holder = _batch(_config(x_api, y_api))
+        assert (newcomer.sid, newcomer.ok, newcomer.node) == ("api-x", False, "third")
+        assert "'api-y'" in (newcomer.error or "")
+        assert (holder.sid, holder.ok) == ("api-y", True)
+        assert [(n, r.sid, r.remote_root) for n, r in rig.recipes] == [
+            ("third", "api-y", "~/magent/api")
+        ]
+
+    def test_a_record_of_another_folder_does_not_make_a_holder(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # api-x ran under another folder name once; that session holds
+        # nothing of ~/magent/api, so it is a newcomer to it like api-y.
+        projs = _twin_apis(tmp_path, rig)
+        _record("api-x", "second", "~/magent/old-api")
+        rig.live = True
+        _no_contact_for(monkeypatch, rig, "api-x", "api-y")
+        outcomes = _batch(_config(*projs), only=["api-x", "api-y"])
+        assert [(o.sid, o.ok) for o in outcomes] == [("api-x", False), ("api-y", False)]
+        assert rig.decorated == []
+
+    def test_a_collision_entirely_outside_the_batch_blocks_nothing(self, rig, tmp_path):
+        projs = _twin_apis(tmp_path, rig)
+        outcomes = _batch(_config(*projs), only=["web"])
+        assert [(o.sid, o.ok, o.error) for o in outcomes] == [("web", True, None)]
+
+    def test_a_batch_project_the_fleet_does_not_list_is_still_checked(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # The fleet is the enabled node projects; a caller handing over one it
+        # does not list (here a disabled one) must not slip past the check.
+        x_api, y_api, _web = _twin_apis(tmp_path, rig)
+        x_api.enabled = False
+        _no_contact_for(monkeypatch, rig, "api-x")
+        outcomes = launch._run_node_bring_ups(
+            _config(x_api, y_api), [x_api], allow_dirty=False, window=False
+        )
+        assert [(o.sid, o.ok) for o in outcomes] == [("api-x", False)]
+        assert "'api-y'" in (outcomes[0].error or "")
+        assert rig.recipes == []
+
+    def test_the_rule_is_asked_once_over_the_whole_fleet(
+        self, rig, tmp_path, monkeypatch
+    ):
+        projs = _projects(
+            tmp_path, rig, [("a1", "second"), ("b1", "third"), ("a2", "second")]
+        )
+        calls: list[list[str]] = []
+        real = nodes.remote_root_collisions
+
+        def spy(recipes):
+            calls.append([r.remote_root for r in recipes])
+            return real(recipes)
+
+        monkeypatch.setattr(nodes, "remote_root_collisions", spy)
+        outcomes = _batch(_config(*projs), only=["b1"])
+        assert [o.sid for o in outcomes] == ["b1"]
+        assert calls == [["~/magent/a1", "~/magent/b1", "~/magent/a2"]]
+
+    def test_up_prints_the_collision_and_counts_only_the_pair_failed(
+        self, rig, tmp_path, monkeypatch, capsys
+    ):
+        projs = _twin_apis(tmp_path, rig)
+        _no_contact_for(monkeypatch, rig, "api-x", "api-y")
+        monkeypatch.setattr("magent.psmux.bring_up", lambda cfg, only, group: ([], []))
+        assert launch.bring_up_psmux(_config(*projs)) == (["web"], ["api-x", "api-y"])
+        out = capsys.readouterr().out
+        assert "api-x: projects 'api-x' and 'api-y' would share" in out
+        assert "web @second started" in out
+
+    @pytest.mark.parametrize(
+        ("make", "reason"),
+        [
+            (
+                lambda tmp: ProjectConfig(path=str(tmp / "gone"), node="second"),
+                "not found on this PC",
+            ),
+            (
+                lambda tmp: ProjectConfig(path=str(tmp / "web2"), node="auto"),
+                "needs a placement",
+            ),
+            (
+                lambda tmp: ProjectConfig(path=tmp.anchor, node="second", title="rt"),
+                "no git repository",
+            ),
+        ],
+        ids=["missing-folder", "unplaced-auto", "drive-root"],
+    )
+    def test_a_project_the_check_cannot_place_fails_on_its_own(
+        self, rig, tmp_path, make, reason
+    ):
+        # No folder name to compare is not a collision: that project's own
+        # bring-up names its reason, and the rest of the batch goes ahead.
+        (tmp_path / "web2").mkdir()
+        (good,) = _projects(tmp_path, rig, [("a1", "second")])
+        odd = make(tmp_path)
+        outcomes = _batch(_config(odd, good))
+        assert [o.ok for o in outcomes] == [False, True]
+        assert reason in (outcomes[0].error or "")
+        assert [nick for nick, _ in rig.recipes] == ["second"]
+
+
+class TestUpBringsUpNodeProjectsToo:
+    def test_local_and_node_results_are_merged_and_node_lines_printed(
+        self, rig, tmp_path, monkeypatch, capsys
+    ):
+        projs = _projects(tmp_path, rig, [("a1", "second"), ("a2", "second")])
+        rig.states[tmp_path / "a2"] = _state(tmp_path / "a2", dirty=True)
+        monkeypatch.setattr(
+            "magent.psmux.bring_up", lambda cfg, only, group: (["loc"], ["bad"])
+        )
+        created, failed = launch.bring_up_psmux(_config(*projs))
+        assert (created, failed) == (["loc", "a1"], ["bad", "a2"])
+        out = capsys.readouterr().out
+        assert "a1 @second started" in out
+        assert "a2: " in out
+        assert "--allow-dirty" in out
+
+    def test_an_attached_session_reads_attached_and_its_warnings_print(
+        self, rig, api, tmp_path, monkeypatch, capsys
+    ):
+        # D10: a refusal made moot by a live session is a warning, as is a
+        # session that came up but was not recorded -- both reach the user
+        # only through this echo.
+        nodes.update_node_map(
+            "api",
+            NodeMapEntry(
+                nick="second",
+                sid="api",
+                placed_ts=1.0,
+                attached_existing=False,
+                remote_root="~/magent/api",
+                target="amin@devino-second",
+            ),
+        )
+        rig.live = True
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        monkeypatch.setattr("magent.psmux.bring_up", lambda cfg, only, group: ([], []))
+        assert launch.bring_up_psmux(_config(api)) == (["api"], [])
+        out = capsys.readouterr().out
+        assert "api @second attached" in out
+        (warning,) = [line for line in out.splitlines() if "--allow-dirty" in line]
+        assert warning.lstrip().startswith("! ")
+
+    def test_allow_dirty_reaches_the_node_bring_up(self, rig, tmp_path, monkeypatch):
+        projs = _projects(tmp_path, rig, [("a1", "second")])
+        rig.states[tmp_path / "a1"] = _state(tmp_path / "a1", dirty=True)
+        monkeypatch.setattr("magent.psmux.bring_up", lambda cfg, only, group: ([], []))
+        assert launch.bring_up_psmux(_config(*projs), allow_dirty=True) == (["a1"], [])
+
+    def test_up_never_opens_a_window(self, rig, tmp_path, monkeypatch):
+        # `up` is the host side of attach, often run over ssh.
+        projs = _projects(tmp_path, rig, [("a1", "second")])
+        monkeypatch.setattr("magent.psmux.bring_up", lambda cfg, only, group: ([], []))
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+        launch.bring_up_psmux(_config(*projs))
+        assert rig.windows == []
+
+    def test_only_reaches_the_node_half(self, rig, tmp_path, monkeypatch):
+        # `magent up` without --all and the menu's `u` pass the down-list: a
+        # node project outside it is never dialed, cloned or provisioned.
+        projs = _projects(tmp_path, rig, [("a1", "second"), ("b1", "third")])
+        monkeypatch.setattr("magent.psmux.bring_up", lambda cfg, only, group: ([], []))
+        assert launch.bring_up_psmux(_config(*projs), only=["b1"]) == (["b1"], [])
+        assert [recipe.sid for _, recipe in rig.recipes] == ["b1"]
+        assert launch.bring_up_psmux(_config(*projs), only=["local-x"]) == ([], [])
+        assert [recipe.sid for _, recipe in rig.recipes] == ["b1"]
+
+    def test_group_reaches_the_node_half(self, rig, tmp_path, monkeypatch):
+        # `up --group work` brings up that group's node projects and no other.
+        work, other = _projects(tmp_path, rig, [("w1", "second"), ("o1", "third")])
+        work.group = "work"
+        monkeypatch.setattr("magent.psmux.bring_up", lambda cfg, only, group: ([], []))
+        assert launch.bring_up_psmux(_config(work, other), group="WORK") == (["w1"], [])
+        assert [recipe.sid for _, recipe in rig.recipes] == ["w1"]
+
+    def test_node_session_ids_follow_the_group_filter(self, rig, tmp_path):
+        a = ProjectConfig(path=str(tmp_path / "a"), node="second", group="work")
+        b = ProjectConfig(path=str(tmp_path / "b"), node="second")
+        assert launch.node_session_ids(_config(a, b), group="WORK") == ["a"]
+
+
+def _hold(name: str, nick: str = "second", sid: str | None = None) -> None:
+    nodes.update_node_map(
+        name,
+        NodeMapEntry(
+            nick=nick,
+            sid=sid or name,
+            placed_ts=1.0,
+            attached_existing=False,
+            remote_root=f"~/magent/{name}",
+            target=f"amin@devino-{nick}",
+        ),
+    )
+
+
+class TestTheNodeLockCoversTheDialNotTheWindow:
+    def test_the_bring_up_runs_under_its_nodes_lock(self, rig, api, monkeypatch):
+        held: list[bool] = []
+        real = rig._bring_up
+
+        def spy(node, recipe, **kw):
+            held.append(launch._bring_up_lock(node.nick).locked())
+            return real(node, recipe, **kw)
+
+        monkeypatch.setattr(remote_mux, "bring_up", spy)
+        assert launch.bring_up_node_project(_config(api), api).ok
+        assert held == [True]
+        assert not launch._bring_up_lock("second").locked()
+
+    def test_the_window_opens_after_the_lock_is_released(self, rig, api, monkeypatch):
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+        held: list[bool] = []
+        real = rig._window
+
+        def spy(target, sid, **kw):
+            held.append(launch._bring_up_lock("second").locked())
+            return real(target, sid, **kw)
+
+        monkeypatch.setattr("magent.attach_client.spawn_attach_window", spy)
+        assert launch.bring_up_node_project(_config(api), api, window=True).ok
+        assert held == [False]
+
+    def test_a_failed_bring_up_releases_the_lock(self, rig, api):
+        rig.error = RemoteError(5, "magent: clone failed", ("bring_up",))
+        assert not launch.bring_up_node_project(_config(api), api).ok
+        assert not launch._bring_up_lock("second").locked()
+
+    def test_one_lock_per_node(self):
+        assert launch._bring_up_lock("second") is launch._bring_up_lock("second")
+        assert launch._bring_up_lock("second") is not launch._bring_up_lock("third")
+
+
+class TestTheAttachInsteadPathIsNarrow:
+    def test_a_session_held_on_another_node_does_not_excuse_a_dirty_tree(
+        self, rig, api, tmp_path
+    ):
+        _hold("api", nick="third")
+        rig.live = True
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert (outcome.ok, outcome.attached_existing) == (False, False)
+        assert rig.decorated == []
+
+    def test_a_probe_that_failed_is_not_a_live_session(self, rig, api, tmp_path):
+        _hold("api")
+        rig.live = None  # has_session's "the PROBE failed" answer
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert (outcome.ok, outcome.attached_existing) == (False, False)
+        assert rig.decorated == []
+
+    def test_attaching_instead_opens_the_window_on_the_held_session(
+        self, rig, api, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            launch, "get_platform", lambda: FakePlatform(supports_attach_windows=True)
+        )
+        _hold("api")
+        rig.live = True
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        outcome = launch.bring_up_node_project(_config(api), api, window=True)
+        assert outcome.attached_existing
+        assert rig.windows == [
+            ("amin@devino-second", "api", "tmux", "tmux -L magent attach -t '=api'")
+        ]
+
+
+class TestEveryNodeFailureIsAnOutcomeButABugIsNot:
+    def test_a_map_held_past_its_wait_is_an_outcome(self, rig, api, monkeypatch):
+        def held(*_a: object, **_k: object) -> None:
+            raise lockfile.LockHeld("the node map is held by another writer")
+
+        monkeypatch.setattr(nodes, "update_node_map", held)
+        outcome = launch.bring_up_node_project(_config(api), api)
+        # The node said yes before the map write failed: the session is up,
+        # so the outcome is ok with a repair warning naming the cause (6688a69).
+        assert (outcome.ok, outcome.node, outcome.error) == (True, "second", None)
+        (warning,) = [w for w in outcome.warnings if "not recorded" in w]
+        assert "held by another writer" in warning
+        assert not launch._bring_up_lock("second").locked()
+
+    def test_an_unreadable_push_file_is_an_outcome(self, rig, api):
+        rig.error = PermissionError(13, "Permission denied")
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert outcome.ok is False
+        assert "Permission denied" in (outcome.error or "")
+
+    def test_the_recipes_warnings_reach_the_outcome(self, rig, api, monkeypatch):
+        real = launch.node_recipe
+        monkeypatch.setattr(
+            launch,
+            "node_recipe",
+            lambda *a: dataclasses.replace(real(*a), warnings=("push: .env skipped",)),
+        )
+        assert launch.bring_up_node_project(_config(api), api).warnings == (
+            "push: .env skipped",
+        )
+
+    def test_a_bug_is_not_swallowed_into_an_outcome(self, rig, api):
+        rig.error = TypeError("a real bug")
+        with pytest.raises(TypeError):
+            launch.bring_up_node_project(_config(api), api)
+
+    def test_an_unexpected_value_error_is_logged_with_its_traceback(
+        self, rig, api, caplog
+    ):
+        # A plain ValueError is an outcome (a recipe that cannot be framed) but
+        # also possibly a bug: the log keeps the traceback to tell them apart.
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        rig.error = ValueError("cannot frame the recipe")
+        assert not launch.bring_up_node_project(_config(api), api).ok
+        (record,) = [r for r in caplog.records if "failed" in r.getMessage()]
+        assert record.exc_info
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            nodes.NodeConfigError("second: unknown node"),
+            RemoteError(5, "magent: clone failed", ("bring_up",)),
+            PermissionError(13, "Permission denied"),
+        ],
+    )
+    def test_an_expected_failure_is_logged_without_one(self, rig, api, caplog, exc):
+        from magent.log import get_logger
+
+        get_logger("nodes")
+        caplog.set_level("WARNING", logger="magent.nodes")
+        rig.error = exc
+        assert not launch.bring_up_node_project(_config(api), api).ok
+        (record,) = [r for r in caplog.records if "failed" in r.getMessage()]
+        assert not record.exc_info
+
+    def test_the_nodes_last_stderr_line_is_the_reason(self, rig, api):
+        rig.error = RemoteError(
+            5,
+            "Cloning into 'api'...\nfatal: repository not found\n"
+            "magent: git clone of api failed",
+            ("bring_up",),
+        )
+        outcome = launch.bring_up_node_project(_config(api), api)
+        assert outcome.error == "git clone of api failed"
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    # Same device as test_launch.py's fake_sleep: tiling's retry loop and the
+    # launch delay both sleep through the shared `time` module.
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+
+@pytest.fixture
+def desk(monkeypatch):
+    plat = FakePlatform(supports_attach_windows=True)
+    monkeypatch.setattr(launch, "get_platform", lambda: plat)
+    return plat
+
+
+class TestGoBringsNodeProjectsUp:
+    def test_a_node_project_is_listed_with_its_node_badge_and_brought_up(
+        self, rig, api, desk, no_sleep, capsys
+    ):
+        rc = launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "[@second]" in out
+        assert "api @second started" in out
+        assert rig.windows == [
+            ("amin@devino-second", "api", "tmux", "tmux -L magent attach -t '=api'")
+        ]
+        assert "api" in nodes.read_node_map()
+
+    def test_a_dirty_tree_is_refused_with_no_ssh_and_no_map_entry(
+        self, rig, api, desk, no_sleep, tmp_path, capsys
+    ):
+        # R-D2.
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        assert launch.run_magent(_config(api), launch.RunOpts()) == 0
+        out = capsys.readouterr().out
+        assert "dirty" in out
+        assert "--allow-dirty" in out
+        assert rig.recipes == []
+        assert rig.windows == []
+        assert nodes.read_node_map() == {}
+
+    def test_allow_dirty_reaches_the_bring_up(self, rig, api, desk, no_sleep, tmp_path):
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        launch.run_magent(_config(api), launch.RunOpts(allow_dirty=True))
+        assert [nick for nick, _ in rig.recipes] == ["second"]
+
+    def test_dry_run_names_the_target_folder_and_touches_nothing(
+        self, api, desk, no_sleep, tmp_path, monkeypatch, capsys
+    ):
+        # R-D3 + R-D4: <root>/<local folder name>, no ssh, no git, no map.
+        def forbidden(*_a: object, **_k: object) -> None:
+            raise AssertionError("--dry-run must not start a process or provision")
+
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        monkeypatch.setattr(subprocess, "Popen", forbidden)
+        monkeypatch.setattr(subprocess, "run", forbidden)
+        monkeypatch.setattr(launch, "_provision_once", forbidden)
+        assert launch.run_magent(_config(api), launch.RunOpts(dry_run=True)) == 0
+        out = capsys.readouterr().out
+        assert "-> amin@devino-second:~/magent/api" in out
+        # DECISION-24: what the real run would do first, said and not done.
+        assert "would provision second" in out
+        assert not (tmp_path / "node-map.json").exists()
+
+    def test_dry_run_prints_why_an_auto_project_has_no_target(
+        self, desk, no_sleep, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        proj = ProjectConfig(path=str(tmp_path), node="auto")
+        launch.run_magent(_config(proj), launch.RunOpts(dry_run=True))
+        assert "needs a placement" in capsys.readouterr().out
+
+    def test_a_window_already_open_is_not_brought_up_again(
+        self, rig, api, no_sleep, monkeypatch
+    ):
+        plat = FakePlatform(supports_attach_windows=True)
+        plat._register_window("magent:api")
+        monkeypatch.setattr(launch, "get_platform", lambda: plat)
+        launch.run_magent(_config(api), launch.RunOpts())
+        assert rig.recipes == []
+
+    def test_an_ide_project_with_a_node_stays_local(
+        self, rig, tmp_path, desk, no_sleep, capsys
+    ):
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        proj = ProjectConfig(path=str(folder), node="second", tool="code")
+        launch.run_magent(_config(proj), launch.RunOpts(dry_run=True))
+        assert "[@second]" not in capsys.readouterr().out
+        assert rig.recipes == []
+
+
+class TestTheGoFlagIsPlumbed:
+    def test_allow_dirty_reaches_run_opts(self, tmp_config, monkeypatch):
+        seen: list[launch.RunOpts] = []
+        monkeypatch.setattr(
+            launch, "run_magent", lambda cfg, opts: seen.append(opts) or 0
+        )
+        path = tmp_config({"version": SCHEMA_VERSION, "projects": [{"path": "."}]})
+        result = CliRunner().invoke(
+            cli.main, ["--config", path, "--go", "--all", "--allow-dirty"]
+        )
+        assert result.exit_code == 0, result.output
+        assert seen[0].allow_dirty is True
+
+
+def _spawn_titled(desk: FakePlatform, title: str):
+    """A ``spawn_attach_window`` stand-in whose window really appears on the
+    desk, under ``title`` -- deliberately NOT ``make_title(sid)``, so a tile
+    pass that rebuilt the title from the sid would hunt a window that does not
+    exist and print "not found"."""
+
+    def spawn(target, sid, *, mux, remote=None, reconnect=True):
+        desk._register_window(title)
+        return title
+
+    return spawn
+
+
+def _placed_names(out: str) -> list[str]:
+    return [
+        line.split()[1]
+        for line in out.splitlines()
+        if line.lstrip().startswith("+ ") and "-> screen" in line
+    ]
+
+
+class TestGoTilesNodeWindowsByTheTitleTheSpawnReturned:
+    """D12: a node window is placed by the title ``spawn_attach_window``
+    handed back through ``NodeBringUpOutcome.title``, never one rebuilt from
+    the session id -- and a project with no window coming is not waited on."""
+
+    def test_the_window_is_placed_by_the_returned_title(
+        self, rig, api, desk, no_sleep, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(
+            "magent.attach_client.spawn_attach_window",
+            _spawn_titled(desk, "magent:api-at-second"),
+        )
+        assert launch.run_magent(_config(api), launch.RunOpts(retile_all=True)) == 0
+        out = capsys.readouterr().out
+        assert "not found" not in out
+        assert _placed_names(out) == ["api"]
+        assert [h for h, _rect in desk.moved] == [desk._windows["magent:api-at-second"]]
+
+    def test_a_badged_title_still_places_it(
+        self, rig, api, desk, no_sleep, monkeypatch, capsys
+    ):
+        # The attention daemon may badge the window before the tile pass runs;
+        # matching by parsed name, like every magent window, survives that.
+        def spawn(target, sid, *, mux, remote=None, reconnect=True):
+            desk._register_window("magent:[!] api")
+            return "magent:api"
+
+        monkeypatch.setattr("magent.attach_client.spawn_attach_window", spawn)
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        assert "not found" not in capsys.readouterr().out
+        assert len(desk.moved) == 1
+
+    def test_a_title_outside_the_grammar_is_placed_by_exact_match(
+        self, rig, api, desk, no_sleep, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(
+            "magent.attach_client.spawn_attach_window",
+            _spawn_titled(desk, "api on second"),
+        )
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        assert "not found" not in capsys.readouterr().out
+        assert [h for h, _rect in desk.moved] == [desk._windows["api on second"]]
+
+    def test_a_refused_project_is_not_waited_for(
+        self, rig, api, desk, no_sleep, tmp_path, capsys
+    ):
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        assert "not found" not in capsys.readouterr().out
+        assert desk.moved == []
+
+    def test_a_window_that_failed_to_open_is_not_waited_for(
+        self, rig, api, desk, no_sleep, monkeypatch, capsys
+    ):
+        def no_wt(*_a: object, **_k: object) -> str:
+            raise FileNotFoundError("wt")
+
+        monkeypatch.setattr("magent.attach_client.spawn_attach_window", no_wt)
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        out = capsys.readouterr().out
+        assert "api @second started" in out
+        assert "not found" not in out
+
+    def test_a_platform_without_attach_windows_waits_for_none(
+        self, rig, api, no_sleep, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(launch, "get_platform", FakePlatform)
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        out = capsys.readouterr().out
+        assert "api @second started" in out
+        assert "not found" not in out
+
+    def test_the_node_window_keeps_its_config_order_slot(
+        self, rig, api, desk, no_sleep, tmp_path, monkeypatch, capsys
+    ):
+        # Config order is slot order: the rebuilt node target stays where the
+        # launch loop put it, between the two local windows.
+        before = ProjectConfig(path=str(tmp_path / "a-local"))
+        after = ProjectConfig(path=str(tmp_path / "z-local"))
+        for proj in (before, after):
+            Path(proj.path).mkdir()
+        monkeypatch.setattr(
+            "magent.attach_client.spawn_attach_window",
+            _spawn_titled(desk, "magent:api-at-second"),
+        )
+        launch.run_magent(_config(before, api, after), launch.RunOpts(retile_all=True))
+        assert _placed_names(capsys.readouterr().out) == ["a-local", "api", "z-local"]
+
+
+class TestGoWarnsOnceWhenNodeWindowsCannotReconnect:
+    """``spawn_attach_window`` degrades a missing supervisor to a bare-ssh
+    pane silently, by design: the batch caller -- ``--go``'s node phase --
+    says so once, whatever the number of windows."""
+
+    def test_one_warning_for_the_whole_batch(
+        self, rig, tmp_path, desk, no_sleep, monkeypatch, capsys
+    ):
+        projs = _projects(tmp_path, rig, [("a1", "second"), ("b1", "third")])
+        monkeypatch.setattr(attach_client, "client_exe", lambda: None)
+        launch.run_magent(_config(*projs), launch.RunOpts())
+        out = capsys.readouterr().out
+        assert out.count("will not auto-reconnect") == 1
+        assert attach_client.CLIENT_EXE_NAME in out
+        assert len(rig.windows) == 2
+
+    def test_no_warning_when_the_supervisor_is_there(
+        self, rig, api, desk, no_sleep, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(attach_client, "client_exe", lambda: "C:/x/client.exe")
+        launch.run_magent(_config(api), launch.RunOpts())
+        assert "auto-reconnect" not in capsys.readouterr().out
+
+    def test_no_warning_where_no_window_can_open(
+        self, rig, api, no_sleep, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(launch, "get_platform", FakePlatform)
+        monkeypatch.setattr(attach_client, "client_exe", lambda: None)
+        launch.run_magent(_config(api), launch.RunOpts())
+        assert "auto-reconnect" not in capsys.readouterr().out
+
+    def test_no_warning_without_a_node_bring_up(
+        self, rig, api, no_sleep, monkeypatch, capsys
+    ):
+        plat = FakePlatform(supports_attach_windows=True)
+        plat._register_window("magent:api")
+        monkeypatch.setattr(launch, "get_platform", lambda: plat)
+        monkeypatch.setattr(attach_client, "client_exe", lambda: None)
+        launch.run_magent(_config(api), launch.RunOpts())
+        assert "auto-reconnect" not in capsys.readouterr().out
+
+
+class TestADryRunPreviewsOnlyWhatTheRunWillDo:
+    """cq-D12 I1/M2: the preview is the real run's first step, so it appears
+    exactly where the real run would queue a bring-up -- never for a window
+    already open, never under a re-tile -- and it reads the map's placement."""
+
+    def test_an_open_window_is_not_previewed(
+        self, rig, api, no_sleep, monkeypatch, capsys
+    ):
+        plat = FakePlatform(supports_attach_windows=True)
+        plat._register_window("magent:api")
+        monkeypatch.setattr(launch, "get_platform", lambda: plat)
+        launch.run_magent(_config(api), launch.RunOpts(dry_run=True, retile_all=True))
+        out = capsys.readouterr().out
+        assert "would provision" not in out
+        assert "-> amin@devino-second" not in out
+
+    def test_a_retile_is_not_previewed(self, rig, api, desk, no_sleep, capsys):
+        launch.run_magent(
+            _config(api), launch.RunOpts(dry_run=True, retile_all=True, tile_only=True)
+        )
+        assert "would provision" not in capsys.readouterr().out
+
+    def test_an_auto_project_is_badged_and_previewed_on_its_placed_node(
+        self, rig, tmp_path, desk, no_sleep, capsys
+    ):
+        folder = tmp_path / "web"
+        folder.mkdir()
+        rig.states[folder] = _state(folder)
+        nodes.update_node_map(
+            "web",
+            NodeMapEntry(
+                nick="third",
+                sid="web",
+                placed_ts=0.0,
+                attached_existing=False,
+                remote_root="~/magent/web",
+                target="amin@devino-third",
+                cwd="/home/amin/magent/web",
+            ),
+        )
+        proj = ProjectConfig(path=str(folder), node="auto")
+        launch.run_magent(_config(proj), launch.RunOpts(dry_run=True))
+        out = capsys.readouterr().out
+        assert "[@third]" in out
+        assert "-> amin@devino-third:~/magent/web" in out
+        assert "would provision third" in out
+
+    def test_a_relative_path_under_base_dir_names_its_folder(
+        self, rig, tmp_path, desk, no_sleep, capsys
+    ):
+        base = tmp_path / "base"
+        (base / "svc").mkdir(parents=True)
+        proj = ProjectConfig(path="svc", node="second", title="renamed")
+        cfg = _config(proj)
+        cfg.base_dir = str(base)
+        launch.run_magent(cfg, launch.RunOpts(dry_run=True))
+        assert "-> amin@devino-second:~/magent/svc" in capsys.readouterr().out
+
+
+class TestARetileOrAnOpenWindowDialsNoNode:
+    """cq-D12 I3/M1: "tile what is open" never starts remote work, and the
+    already-open probe keys on the SANITIZED sid -- the name the window is
+    titled with -- so a spaced title cannot re-bring-up a live project."""
+
+    def test_a_tile_only_run_never_brings_a_node_project_up(
+        self, rig, api, desk, no_sleep
+    ):
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True, tile_only=True))
+        assert rig.recipes == []
+        assert rig.windows == []
+
+    def test_a_spaced_title_probes_the_sid_window(
+        self, rig, tmp_path, no_sleep, monkeypatch
+    ):
+        folder = tmp_path / "gh"
+        folder.mkdir()
+        rig.states[folder] = _state(folder)
+        proj = ProjectConfig(path=str(folder), node="second", title="GitHub Ads")
+        assert nodes.node_sid(proj) != "GitHub Ads"
+        plat = FakePlatform(supports_attach_windows=True)
+        plat._register_window("magent:" + nodes.node_sid(proj))
+        monkeypatch.setattr(launch, "get_platform", lambda: plat)
+        launch.run_magent(_config(proj), launch.RunOpts(retile_all=True))
+        assert rig.recipes == []
+
+
+class TestTheNodePhaseSaysWhatHappened:
+    """cq-D12 I2/M4: a bring-up that came up but whose window did not open is
+    named on screen (tiling's "not found" no longer says it, by design), and a
+    fan-out that can run for minutes announces itself first."""
+
+    def test_a_window_that_did_not_open_is_said_once(
+        self, rig, api, desk, no_sleep, monkeypatch, capsys
+    ):
+        def no_wt(*_a: object, **_k: object) -> str:
+            raise FileNotFoundError("wt")
+
+        monkeypatch.setattr("magent.attach_client.spawn_attach_window", no_wt)
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        out = capsys.readouterr().out
+        lines = [ln for ln in out.splitlines() if "did not open" in ln]
+        assert len(lines) == 1, out
+        line = lines[0]
+        assert line.lstrip().startswith("! api @second: ")
+        assert "nodes.log" in line
+        assert "magent --go" in line
+        assert line.isascii()
+
+    def test_nothing_is_said_where_no_window_was_meant_to_open(
+        self, rig, api, no_sleep, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(launch, "get_platform", FakePlatform)
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        assert "did not open" not in capsys.readouterr().out
+
+    def test_a_refused_bring_up_is_not_said_to_be_a_missing_window(
+        self, rig, api, desk, no_sleep, tmp_path, capsys
+    ):
+        # Its own "x api: ..." line already says why; no window was ever due.
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        out = capsys.readouterr().out
+        assert "api: " in out
+        assert "did not open" not in out
+
+    def test_an_opened_window_is_not_said_missing(
+        self, rig, api, desk, no_sleep, capsys
+    ):
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        assert "did not open" not in capsys.readouterr().out
+
+    def test_the_fan_out_announces_itself_once(
+        self, rig, tmp_path, desk, no_sleep, capsys
+    ):
+        projs = _projects(tmp_path, rig, [("a1", "second"), ("b1", "third")])
+        launch.run_magent(_config(*projs), launch.RunOpts())
+        out = capsys.readouterr().out
+        assert out.count("Bringing up 2 node project(s)...") == 1
+        assert out.index("Bringing up") < out.index("a1 @second started")
+        assert out.isascii()
+
+    def test_no_node_project_queued_is_no_announcement(
+        self, rig, api, no_sleep, monkeypatch, capsys
+    ):
+        plat = FakePlatform(supports_attach_windows=True)
+        plat._register_window("magent:api")
+        monkeypatch.setattr(launch, "get_platform", lambda: plat)
+        launch.run_magent(_config(api), launch.RunOpts())
+        assert "node project(s)" not in capsys.readouterr().out
+
+
+class TestADryRunReadsTheNodeMapOnce:
+    def test_one_read_for_the_whole_run(
+        self, rig, tmp_path, desk, no_sleep, monkeypatch
+    ):
+        # cq-D12 M5: the badge and the preview of every node project answer
+        # from ONE snapshot of the map, not two reads per project.
+        projs = _projects(tmp_path, rig, [("a1", "second"), ("b1", "third")])
+        reads: list[None] = []
+        real = nodes.read_node_map
+
+        def counting() -> dict[str, NodeMapEntry]:
+            reads.append(None)
+            return real()
+
+        monkeypatch.setattr(nodes, "read_node_map", counting)
+        launch.run_magent(_config(*projs), launch.RunOpts(dry_run=True))
+        assert len(reads) == 1
+
+    def test_a_run_without_node_projects_never_reads_it(
+        self, rig, tmp_path, desk, no_sleep, monkeypatch
+    ):
+        local = tmp_path / "local"
+        local.mkdir()
+
+        def forbidden() -> dict[str, NodeMapEntry]:
+            raise AssertionError("no node project: the map is not read")
+
+        monkeypatch.setattr(nodes, "read_node_map", forbidden)
+        launch.run_magent(
+            _config(ProjectConfig(path=str(local))), launch.RunOpts(dry_run=True)
+        )
+
+
+class TestTheExactFallbackIsExact:
+    def test_a_window_merely_containing_the_title_is_not_the_one_moved(
+        self, rig, api, desk, no_sleep, monkeypatch
+    ):
+        # cq-D12 M3: a decoy whose title CONTAINS the returned one is on the
+        # desk first; only the window titled exactly that is placed.
+        desk._register_window("xx api on second xx")
+        monkeypatch.setattr(
+            "magent.attach_client.spawn_attach_window",
+            _spawn_titled(desk, "api on second"),
+        )
+        launch.run_magent(_config(api), launch.RunOpts(retile_all=True))
+        assert [h for h, _r in desk.moved] == [desk._windows["api on second"]]
+
+
+class TestUpCommandBringsNodeProjectsUp:
+    def _config_file(
+        self, tmp_path: Path, folder: Path, group: str | None = None
+    ) -> str:
+        proj: dict[str, object] = {"path": str(folder), "node": "second"}
+        if group:
+            proj["group"] = group
+        path = tmp_path / "magent.config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "projects": [proj],
+                    "settings": {
+                        "psmux": False,
+                        "uploadServer": False,
+                        "tools": _TOOLS,
+                        "nodes": {"second": {"host": "devino-second", "user": "amin"}},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def test_a_node_only_config_with_no_psmux_comes_up(
+        self, rig, api, tmp_path, monkeypatch
+    ):
+        # R-D1: exit 0, the sid in "Brought up", the map written, no window.
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        result = CliRunner().invoke(
+            cli.main, ["--config", self._config_file(tmp_path, tmp_path / "api"), "up"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "Brought up 1 session(s): api" in result.stdout
+        assert "api" in nodes.read_node_map()
+        assert rig.windows == []
+
+    def test_allow_dirty_reaches_the_bring_up(self, rig, api, tmp_path, monkeypatch):
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        rig.states[tmp_path / "api"] = _state(tmp_path / "api", dirty=True)
+        config = self._config_file(tmp_path, tmp_path / "api")
+        refused = CliRunner().invoke(cli.main, ["--config", config, "up"])
+        assert "--allow-dirty" in refused.stdout
+        allowed = CliRunner().invoke(
+            cli.main, ["--config", config, "up", "--allow-dirty"]
+        )
+        assert "Brought up 1 session(s): api" in allowed.stdout
+
+    def test_a_node_session_is_never_decorated_as_a_local_one(
+        self, rig, api, tmp_path, monkeypatch
+    ):
+        decorated: list[list[str]] = []
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        monkeypatch.setattr(
+            "magent.launch.decorate_psmux_sessions",
+            lambda names, code_hint=None: decorated.append(list(names)) or [],
+        )
+        result = CliRunner().invoke(
+            cli.main, ["--config", self._config_file(tmp_path, tmp_path / "api"), "up"]
+        )
+        # The node sid really was created -- so [] means it was filtered out,
+        # not that nothing came up to decorate.
+        assert result.exit_code == 0, result.output
+        assert "Brought up 1 session(s): api" in result.stdout
+        assert decorated == [[]]
+
+    def test_a_node_project_outside_the_group_is_out_of_scope(
+        self, rig, api, tmp_path, monkeypatch
+    ):
+        # -g scopes the node half at the shell too: a node project in another
+        # group must not turn "all already up" into an empty bring-up run.
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        monkeypatch.setattr(
+            "magent.launch.psmux_status",
+            lambda cfg, group=None: ([{"name": "web", "session": "web"}], [], [{}]),
+        )
+        monkeypatch.setattr("magent.launch.revive_psmux", lambda *a, **k: [])
+        monkeypatch.setattr("magent.launch.decorate_psmux_sessions", lambda *a, **k: [])
+        config = self._config_file(tmp_path, tmp_path / "api", group="backend")
+        result = CliRunner().invoke(
+            cli.main, ["--config", config, "up", "-g", "frontend"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "All 1 session(s) already up." in result.stdout
+        assert rig.recipes == []
+
+    def test_an_unreachable_node_points_at_the_nodes_log(
+        self, rig, api, tmp_path, monkeypatch
+    ):
+        # A node casualty's reason (and any traceback) is logged by the
+        # "nodes" logger, so the casualty line must send the reader there.
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda: None)
+        rig.error = RemoteError(
+            255, "ssh: connect to host devino-second: timed out", ("bring_up",)
+        )
+        result = CliRunner().invoke(
+            cli.main, ["--config", self._config_file(tmp_path, tmp_path / "api"), "up"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "1 session(s) failed to come up: api" in result.stdout
+        assert "(see ~/.magent/logs/nodes.log on the host)" in result.stdout
+        assert "launch.log" not in result.stdout
+
+
+class TestStoppingNodeSessions:
+    """``down``'s node half: each node session is killed ON ITS NODE, once.
+    The local session a node project may have left here is ``stop_psmux``'s
+    (D9), never this function's."""
+
+    @pytest.fixture
+    def kills(self, monkeypatch):
+        calls: list[tuple[str, str]] = []
+        answers: dict[str, bool | None] = {}
+
+        def kill(node, sid):
+            calls.append((node.nick, sid))
+            return answers.get(sid, True)
+
+        monkeypatch.setattr(remote_mux, "kill_session", kill)
+        return calls, answers
+
+    @pytest.fixture
+    def nodes_log(self, caplog):
+        # The survivor line sends the user to nodes.log: what lands THERE.
+        from magent.log import get_logger
+
+        get_logger("nodes")  # sets the level; caplog must come after
+        caplog.set_level("WARNING", logger="magent.nodes")
+        return lambda: [
+            r.getMessage() for r in caplog.records if r.name == "magent.nodes"
+        ]
+
+    @pytest.fixture
+    def torn(self, rig):
+        nodes.NODE_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+
+    @pytest.fixture(params=["torn", "busy"])
+    def unreadable(self, request, rig, monkeypatch):
+        # Torn on disk, or intact but locked by another process (a Windows
+        # sharing violation reads as PermissionError): neither is "empty".
+        if request.param == "torn":
+            request.getfixturevalue("torn")
+            return
+
+        def busy() -> dict[str, nodes.NodeMapEntry]:
+            raise PermissionError(13, "The process cannot access the file")
+
+        monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+
+    def test_a_killed_session_is_stopped_and_unmapped(self, rig, api, kills):
+        _hold("api")
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert kills[0] == [("second", "api")]
+        assert nodes.read_node_map() == {}
+
+    def test_a_session_that_was_already_gone_is_neither_and_unmapped(
+        self, rig, api, kills
+    ):
+        _hold("api")
+        kills[1]["api"] = False
+        assert launch.stop_node_sessions(_config(api), ["api"]) == ([], [])
+        assert nodes.read_node_map() == {}
+
+    def test_an_unreachable_node_keeps_the_entry_and_names_the_survivor(
+        self, rig, api, kills, nodes_log
+    ):
+        _hold("api")
+        kills[1]["api"] = None
+        assert launch.stop_node_sessions(_config(api), ["api"]) == ([], ["api"])
+        assert "api" in nodes.read_node_map()
+        assert nodes_log() == ["down: api not stopped: node second did not answer"]
+
+    def test_a_pinned_project_nobody_recorded_is_still_asked_and_never_mapped(
+        self, rig, api, kills
+    ):
+        # Another PC (or a lost map) may have started it: the pin says where.
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert kills[0] == [("second", "api")]
+        assert nodes.read_node_map() == {}
+
+    def test_an_unrecorded_kill_never_takes_the_map_lock(
+        self, rig, api, kills, monkeypatch
+    ):
+        # No entry, nothing to clear: a torn or held map is never touched.
+        writes: list[str] = []
+        monkeypatch.setattr(
+            nodes, "update_node_map", lambda name, entry, **_k: writes.append(name)
+        )
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert writes == []
+
+    def test_an_auto_project_that_was_never_placed_is_skipped(
+        self, rig, tmp_path, kills
+    ):
+        proj = ProjectConfig(path=str(tmp_path / "web"), node="auto")
+        assert launch.stop_node_sessions(_config(proj), ["web"]) == ([], [])
+        assert kills[0] == []
+
+    def test_an_auto_project_is_killed_where_the_map_placed_it(
+        self, rig, tmp_path, kills
+    ):
+        proj = ProjectConfig(path=str(tmp_path / "web"), node="auto")
+        _hold("web", nick="third")
+        assert launch.stop_node_sessions(_config(proj), ["web"]) == (["web"], [])
+        assert kills[0] == [("third", "web")]
+
+    def test_the_map_wins_over_a_pin_changed_since_the_bring_up(self, rig, api, kills):
+        _hold("api", nick="third")
+        launch.stop_node_sessions(_config(api), ["api"])
+        assert kills[0] == [("third", "api")]
+
+    def test_the_recorded_sid_is_the_one_killed(self, rig, api, kills):
+        _hold("api", sid="api-2")
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert kills[0] == [("second", "api-2")]
+
+    def test_ids_outside_the_list_are_left_running(self, rig, api, tmp_path, kills):
+        other = ProjectConfig(path=str(tmp_path / "web"), node="second")
+        launch.stop_node_sessions(_config(api, other), ["web"])
+        assert kills[0] == [("second", "web")]
+
+    def test_a_node_that_failed_once_is_not_dialed_again(self, rig, tmp_path, kills):
+        # `down --all` against a powered-off node costs one probe timeout,
+        # not one per project on it; another node is still asked.
+        a1, a2, b1 = (
+            ProjectConfig(path=str(tmp_path / n), node=nick)
+            for n, nick in (("a1", "second"), ("a2", "second"), ("b1", "third"))
+        )
+        kills[1].update({"a1": None, "a2": None})
+        assert launch.stop_node_sessions(_config(a1, a2, b1), ["a1", "a2", "b1"]) == (
+            ["b1"],
+            ["a1", "a2"],
+        )
+        assert kills[0] == [("second", "a1"), ("third", "b1")]
+
+    def test_a_placement_the_config_can_no_longer_name_is_a_survivor(
+        self, rig, tmp_path, kills, nodes_log
+    ):
+        proj = ProjectConfig(path=str(tmp_path / "web"), node="auto")
+        _hold("web", nick="gone")
+        assert launch.stop_node_sessions(_config(proj), ["web"]) == ([], ["web"])
+        assert kills[0] == []
+        assert "web" in nodes.read_node_map()
+        lines = nodes_log()
+        assert len(lines) == 1, lines
+        assert lines[0].startswith("down: web not stopped: ")
+        assert "gone" in lines[0]
+
+    @pytest.mark.parametrize(
+        "exc",
+        [lockfile.LockHeld("the node map is held"), ValueError("node-map.json: torn")],
+        ids=["held", "torn"],
+    )
+    def test_a_map_that_cannot_be_rewritten_does_not_unclaim_the_kill(
+        self, rig, api, kills, monkeypatch, exc
+    ):
+        _hold("api")
+
+        def held(*_a: object, **_k: object) -> None:
+            raise exc
+
+        monkeypatch.setattr(nodes, "update_node_map", held)
+        outcome: object
+        try:
+            outcome = launch.stop_node_sessions(_config(api), ["api"])
+        except (ValueError, OSError) as escaped:  # `down` crashing after a proven kill
+            outcome = escaped
+        assert outcome == (["api"], [])
+
+    def test_one_unmap_that_fails_stops_the_rest_from_waiting_on_the_lock(
+        self, rig, tmp_path, kills, monkeypatch
+    ):
+        # A held map lock costs MAP_LOCK_WAIT_S per attempt: one, not one per
+        # placed project. Every kill still counts.
+        a1, a2 = (
+            ProjectConfig(path=str(tmp_path / n), node="second") for n in ("a1", "a2")
+        )
+        _hold("a1")
+        _hold("a2")
+        tries: list[str] = []
+
+        def held(name: str, *_a: object, **_k: object) -> None:
+            tries.append(name)
+            raise lockfile.LockHeld("the node map is held")
+
+        monkeypatch.setattr(nodes, "update_node_map", held)
+        assert launch.stop_node_sessions(_config(a1, a2), ["a1", "a2"]) == (
+            ["a1", "a2"],
+            [],
+        )
+        assert tries == ["a1"]
+
+    def test_a_retitled_project_is_found_by_its_recorded_sid(
+        self, rig, tmp_path, kills
+    ):
+        # The title changed, its session id did not: the map key is the old
+        # title, and the session it records still runs. Found, killed, unmapped.
+        proj = ProjectConfig(path=str(tmp_path / "web"), title="my web", node="auto")
+        sid = nodes.node_sid(proj)
+        _hold("my.web", nick="third", sid=sid)
+        assert launch.stop_node_sessions(_config(proj), [sid]) == ([sid], [])
+        assert kills[0] == [("third", sid)]
+        assert nodes.read_node_map() == {}
+
+    def test_a_placement_an_up_made_during_the_kill_survives_the_unmap(
+        self, rig, api, monkeypatch
+    ):
+        # `up` re-placed api on third while the kill on second was in flight:
+        # the unmap clears only the entry it stopped, never the fresh one.
+        _hold("api")
+
+        def kill_while_up_replaces(node, sid):
+            _hold("api", nick="third")
+            return True
+
+        monkeypatch.setattr(remote_mux, "kill_session", kill_while_up_replaces)
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+        assert {k: e.nick for k, e in nodes.read_node_map().items()} == {"api": "third"}
+
+    # An unreadable map: this answer becomes a report, so the map is never
+    # read as "nothing placed" -- whatever it might hold is not claimed.
+
+    def test_with_an_unreadable_map_an_auto_project_is_a_survivor_nobody_dials(
+        self, rig, tmp_path, kills, unreadable, nodes_log
+    ):
+        proj = ProjectConfig(path=str(tmp_path / "web"), node="auto")
+        assert launch.stop_node_sessions(_config(proj), ["web"]) == ([], ["web"])
+        assert kills[0] == []
+        assert any("node map unreadable" in m for m in nodes_log())
+
+    def test_with_an_unreadable_map_a_pin_answering_not_there_is_a_survivor(
+        self, rig, api, kills, unreadable
+    ):
+        # It may run where the lost map placed it: "not on the pin" proves nothing.
+        kills[1]["api"] = False
+        assert launch.stop_node_sessions(_config(api), ["api"]) == ([], ["api"])
+        assert kills[0] == [("second", "api")]
+
+    def test_with_an_unreadable_map_a_confirmed_kill_is_stopped(
+        self, rig, api, kills, unreadable
+    ):
+        assert launch.stop_node_sessions(_config(api), ["api"]) == (["api"], [])
+
+    def test_a_torn_map_is_never_rewritten(self, rig, api, kills, torn):
+        launch.stop_node_sessions(_config(api), ["api"])
+        assert nodes.NODE_MAP_PATH.read_text(encoding="utf-8") == "{ torn"

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import logging
 import os
 import re
@@ -1149,6 +1150,102 @@ def _visible_cells(status: str) -> int:
     )
 
 
+class TestTodaysDecorationIsPinned:
+    """Characterization, written green BEFORE the brand grows a node suffix: the
+    ten decoration argvs of a LOCAL session, restated literally. The node work
+    builds the same vocabulary for tmux; a diff here means it changed psmux."""
+
+    @pytest.mark.parametrize("code_hint", [True, False])
+    def test_the_ten_argvs_are_byte_identical(self, code_hint):
+        fallback = (
+            "F2 opens VS Code only from a magent window on Windows"
+            " (hotkey listener not running in this client)"
+        )
+        f2 = (
+            ["psmux", "-L", "api", "bind", "-n", "F2", "display-message", fallback]
+            if code_hint
+            else ["psmux", "-L", "api", "unbind-key", "-n", "F2"]
+        )
+        hint = _EXPECTED_HINT if code_hint else _EXPECTED_HINT_F1_ONLY
+        assert psmux.decoration_argv("api", "psmux", code_hint) == [
+            ["psmux", "-L", "api", "bind", "-n", "F1", "detach-client"],
+            ["psmux", "-L", "api", "set", "-g", "status-right", hint],
+            [
+                "psmux",
+                "-L",
+                "api",
+                "set",
+                "-g",
+                "status-right-length",
+                "40" if code_hint else "22",
+            ],
+            [
+                "psmux",
+                "-L",
+                "api",
+                "set",
+                "-g",
+                "status-left",
+                "#[bold,fg=green] magent #[default]",
+            ],
+            ["psmux", "-L", "api", "set", "-g", "status-left-length", "10"],
+            f2,
+            ["psmux", "-L", "api", "rename-window", "-t", "api", "api"],
+            ["psmux", "-L", "api", "set", "-g", "automatic-rename", "off"],
+            ["psmux", "-L", "api", "set", "-g", "window-status-format", "#W"],
+            ["psmux", "-L", "api", "set", "-g", "window-status-current-format", "#W"],
+        ]
+
+
+_BRAND = "#[bold,fg=green] magent #[default]"
+
+
+class TestTheBrandNamesTheNode:
+    """A node session's status line says where it runs: `magent @second`.
+    A local session's brand is today's, byte for byte."""
+
+    def test_a_local_session_keeps_todays_brand(self):
+        assert psmux.status_brand(None) == (_BRAND, "8")
+
+    def test_a_node_session_says_which_node_it_runs_on(self):
+        assert psmux.status_brand("second") == (_BRAND + "@second ", "16")
+
+    @pytest.mark.parametrize("nick", [None, "second", "cloud", "a", "a b"])
+    def test_the_cell_count_is_exactly_the_visible_width(self, nick):
+        text, cells = psmux.status_brand(nick)
+        assert int(cells) == _visible_cells(text)
+
+    @pytest.mark.parametrize("nick", [None, "second", "cloud", "a"])
+    def test_the_brand_is_pure_ascii(self, nick):
+        assert psmux.status_brand(nick)[0].isascii()
+
+    @pytest.mark.parametrize("nick", ["#(x)", "é", "", "x\ny", "\t"])
+    def test_a_nick_tmux_would_expand_or_mis_measure_is_refused(self, nick):
+        # `#(x)` would run `x` on every redraw, `é` breaks cells == len, an
+        # empty nick brands the bar with a bare `@`, and a raw newline or tab
+        # is ASCII but not printable, so it also breaks cells == len.
+        with pytest.raises(ValueError, match="status brand nick"):
+            psmux.status_brand(nick)
+        with pytest.raises(ValueError, match="status brand nick"):
+            psmux.status_left(nick)
+
+    @pytest.mark.parametrize(
+        ("nick", "length"), [(None, "10"), ("second", "18"), ("cloud", "17")]
+    )
+    def test_status_left_is_the_brand_plus_two_cells_of_headroom(self, nick, length):
+        text, cells = psmux.status_brand(nick)
+        assert psmux.status_left(nick) == (text, length)
+        assert int(length) == int(cells) + 2
+
+    @pytest.mark.parametrize("code_hint", [True, False])
+    def test_the_f2_binding_is_the_decorations_sixth_command(self, code_hint):
+        local = psmux.decoration_argv("api", "psmux", code_hint)[5]
+        assert psmux.f2_binding_argv(["psmux", "-L", "api"], code_hint) == local
+        tmux = psmux.f2_binding_argv(["tmux", "-L", "magent"], code_hint)
+        assert tmux[:3] == ["tmux", "-L", "magent"]
+        assert tmux[3:] == local[3:]
+
+
 class TestDecorateSession:
     """The status-line hints (badged `F1`/`F2` keys with spelled-out labels),
     the product-owned `bind -n F1 detach-client`, and the product-owned
@@ -1284,7 +1381,8 @@ class TestDecorateSession:
     def test_status_left_length_fits_the_brand(self):
         # The number is only correct relative to the brand text; pin the
         # relationship, not just the two literals.
-        assert int(psmux._STATUS_BRAND_LEN) >= len(" magent ")
+        text, length = psmux.status_left(None)
+        assert int(length) >= _visible_cells(text)
 
     @pytest.mark.parametrize("code_hint", [True, False])
     def test_status_right_length_fits_the_hint(self, code_hint):
@@ -2123,3 +2221,108 @@ class TestEveryOneShotSpawnHidesItsConsole:
             assert psmux._SPAWN_FLAGS == subprocess.CREATE_NO_WINDOW
         else:
             assert psmux._SPAWN_FLAGS == 0
+
+
+class TestANodeProjectIsNotALocalSession:
+    """A project pinned to a pool node runs THERE; every local psmux path
+    (bring-up, status, revive, the upload server's session list) skips it.
+    Cloud projects are not pool projects and stay local (DECISION-15)."""
+
+    def _config(self, tmp_path):
+        for name in ("api", "web", "sky", "auto"):
+            (tmp_path / name).mkdir()
+        return MagentConfig(
+            projects=[
+                ProjectConfig(path=str(tmp_path / "api")),
+                ProjectConfig(path=str(tmp_path / "web"), node="second"),
+                ProjectConfig(path=str(tmp_path / "sky"), node="cloud"),
+                ProjectConfig(path=str(tmp_path / "auto"), node="auto"),
+            ]
+        )
+
+    def test_eligible_projects_skips_pinned_and_auto_node_projects(self, tmp_path):
+        names = [p["name"] for p in psmux.eligible_projects(self._config(tmp_path))]
+        assert names == ["api", "sky"]
+
+    def test_config_sessions_skips_them_too(self, tmp_path):
+        cfg = tmp_path / "magent.config.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "projects": [
+                        {"path": str(tmp_path / "api")},
+                        {"path": str(tmp_path / "web"), "node": "second"},
+                        {"path": str(tmp_path / "sky"), "node": "cloud"},
+                        {"path": str(tmp_path / "auto"), "node": "auto"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert [s["name"] for s in psmux.config_sessions(str(cfg))] == ["api", "sky"]
+
+    @pytest.mark.parametrize(
+        ("node", "local"),
+        [(None, True), ("cloud", True), ("auto", False), ("second", False)],
+    )
+    def test_the_typed_and_raw_paths_agree(self, tmp_path, node, local):
+        """``eligible_projects`` (typed) and ``config_sessions`` (raw dict)
+        spell the skip twice; ONE config file read both ways must list the
+        same projects, or the upload server and `status` disagree."""
+        from magent.config import SCHEMA_VERSION, load_config
+
+        for name in ("api", "web"):
+            (tmp_path / name).mkdir()
+        web: dict[str, object] = {"path": str(tmp_path / "web")}
+        if node is not None:
+            web["node"] = node
+        cfg = tmp_path / "magent.config.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "version": SCHEMA_VERSION,
+                    "settings": {"nodes": {"second": {"host": "devino-second"}}},
+                    "projects": [{"path": str(tmp_path / "api")}, web],
+                }
+            ),
+            encoding="utf-8",
+        )
+        typed = [p["name"] for p in psmux.eligible_projects(load_config(str(cfg)))]
+        raw = [s["name"] for s in psmux.config_sessions(str(cfg))]
+        assert typed == raw
+        assert typed == (["api", "web"] if local else ["api"])
+
+    def test_the_node_skip_runs_before_the_first_wins_dedupe(self, tmp_path):
+        """A node project listed FIRST must not claim the session id and hide
+        the local project that shares it. ``load_config`` refuses that pair
+        (config.py's session-name check); a config built in code skips it, and
+        so does the raw path below."""
+        for name in ("a", "b"):
+            (tmp_path / name / "api").mkdir(parents=True)
+        cfg = MagentConfig(
+            projects=[
+                ProjectConfig(path=str(tmp_path / "a" / "api"), node="second"),
+                ProjectConfig(path=str(tmp_path / "b" / "api")),
+            ]
+        )
+        [entry] = psmux.eligible_projects(cfg)
+        assert entry["path"] == str(tmp_path / "b" / "api")
+
+    def test_the_raw_path_keeps_the_local_twin_of_a_node_project(self, tmp_path):
+        # config_sessions skips validation, so the refused pair can reach it.
+        for name in ("a", "b"):
+            (tmp_path / name / "api").mkdir(parents=True)
+        cfg = tmp_path / "magent.config.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "projects": [
+                        {"path": str(tmp_path / "a" / "api"), "node": "second"},
+                        {"path": str(tmp_path / "b" / "api")},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        [entry] = psmux.config_sessions(str(cfg))
+        assert entry["path"] == str(tmp_path / "b" / "api")

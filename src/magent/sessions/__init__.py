@@ -8,11 +8,13 @@ from magent.log import get_logger
 from magent.sessions.claude import (
     build_claude_resume,
     claude_fresh_command,
+    claude_fresh_form,
     get_claude_session_ids,
 )
 from magent.sessions.codex import (
     build_codex_resume,
     codex_fresh_command,
+    codex_fresh_form,
     get_codex_session_ids,
 )
 
@@ -34,8 +36,16 @@ class AgentTool:
     resume_command: Callable[[str, str | None], str] | None = None
     # (base_cmd, project_dir, config_dir) -> the command to run when that
     # directory has NO prior session for this tool to resume in that store, or
-    # None to run base_cmd unchanged. See `build_start_command`.
+    # None to run base_cmd unchanged. See `build_start_command`. Equals
+    # `fresh_form` plus a probe of the local session store.
     fresh_command: Callable[[str, str, Path | None], str | None] | None = None
+    # base_cmd -> the command with its implicit resume dropped (claude's
+    # `--continue`, codex's `resume --last`), WITHOUT asking any store whether
+    # there is something to resume; None when base_cmd carries no implicit
+    # resume to drop. For a session whose store is elsewhere (a pool node: the
+    # nodes feature ships both forms and the node picks). Unset for a tool that
+    # has no implicit-resume form at all.
+    fresh_form: Callable[[str], str | None] | None = None
     happy: bool = False  # can be wrapped with `happy` for mobile access
 
     @property
@@ -48,12 +58,14 @@ AGENT_TOOLS: dict[str, AgentTool] = {
         session_ids=get_claude_session_ids,
         resume_command=build_claude_resume,
         fresh_command=claude_fresh_command,
+        fresh_form=claude_fresh_form,
         happy=True,
     ),
     "codex": AgentTool(
         session_ids=get_codex_session_ids,
         resume_command=build_codex_resume,
         fresh_command=codex_fresh_command,
+        fresh_form=codex_fresh_form,
         happy=True,
     ),
 }
@@ -133,6 +145,18 @@ def build_start_command(
     return fresh
 
 
+def fresh_start_command(tool: str, base_cmd: str) -> str | None:
+    """``tool``'s fresh form of ``base_cmd`` (see ``AgentTool.fresh_form``), or
+    None. Unlike ``build_start_command`` this never probes a store.
+
+    None means base_cmd carries no implicit resume to drop; the caller ships
+    base_cmd alone."""
+    caps = AGENT_TOOLS.get(tool)
+    if caps is None or caps.fresh_form is None:
+        return None
+    return caps.fresh_form(base_cmd)
+
+
 # --- IDE tools (REC-F4) -------------------------------------------------------
 # The IDE mirror of AGENT_TOOLS: tools launched as an IDE window instead of a
 # CLI agent in a terminal. The dict is the single source of truth — adding an
@@ -193,7 +217,7 @@ def folder_for_session(payload: object, project: str) -> str | None:
 
 
 def build_code_open_command(
-    folder: str, ssh_host: str | None, code_bin: str
+    folder: str, ssh_host: str | None, code_bin: str, *, keep_user: bool = False
 ) -> list[str]:
     """argv that opens ``folder`` in VS Code, locally or over Remote-SSH.
 
@@ -204,12 +228,20 @@ def build_code_open_command(
     resolves the login user from the machine's own ssh config (that is also
     what makes a plain ``Host`` alias work), and a target that is only a
     ``user@`` with no host degrades to a local open rather than a broken URI.
+
+    ``keep_user`` keeps a ``user@`` in the authority -- a pool node's user is
+    resolved by magent and may not exist in the ssh config (the nodes
+    feature). A target with no hostname still opens locally either way, and
+    one with an empty user (``@host``) keeps only the hostname.
     """
     args = [code_bin]
     if ssh_host:
-        host = ssh_host.split("@", 1)[1] if "@" in ssh_host else ssh_host
-        if host:
-            args.extend(["--remote", f"ssh-remote+{host}"])
+        user, at, host_part = ssh_host.partition("@")
+        hostname = host_part if at else ssh_host
+        if hostname:
+            # An empty user (`@host`) would build `ssh-remote+@host`.
+            authority = ssh_host if keep_user and user else hostname
+            args.extend(["--remote", f"ssh-remote+{authority}"])
     args.append(folder)
     return args
 

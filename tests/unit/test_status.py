@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 from magent import agent_state, cli
 from magent.cli import status as status_mod
+from magent.config import SCHEMA_VERSION
 
 
 def _no_psmux(monkeypatch):
@@ -378,9 +380,11 @@ class TestJson:
             "upload_server": "on",
             "listener": "off",
             "attention": "off",
+            "node_sync": "off",
             "agents": [],
             "psmux_sessions": [],
             "psmux_session0": 0,
+            "node_sessions": [],
         }
 
     def test_degraded_emits_parseable_status_and_exit_3(
@@ -403,9 +407,11 @@ class TestJson:
             "upload_server": "dead",
             "listener": "off",
             "attention": "off",
+            "node_sync": "off",
             "agents": [],
             "psmux_sessions": [],
             "psmux_session0": 0,
+            "node_sessions": [],
         }
 
 
@@ -1068,6 +1074,180 @@ class TestDownStopsWhatItPromisesAndReportsWhatItProved:
         assert "Stopped" not in out.output.split("Upload server")[0]
 
 
+class TestDownStopsANodeProjectsOrphanedLocalSession:
+    """A project ran here, then gained ``"node": "second"``. From then on every
+    local psmux path skips it (it runs on the node), so its old LOCAL session
+    vanished from status, the picker and `down` -- alive and unstoppable.
+
+    `down` acting locally therefore also targets the in-scope node projects'
+    session ids. Killing a socket with no server is a no-op, and the report
+    names only what the re-probe PROVED stopped, so a node project with no
+    local session costs nothing and claims nothing.
+    """
+
+    def _run(self, runner, tmp_config, monkeypatch, argv, *, projects, live_local):
+        cfgpath = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {"nodes": {"second": {"host": "devino-second"}}},
+                "projects": projects,
+            }
+        )
+        # The REAL psmux_status -- it is the thing that hides the node project.
+        # Only the psmux binary is substituted: its lookup and its liveness probe.
+        monkeypatch.setattr("magent.psmux.find_psmux", lambda *a, **k: "psmux")
+        monkeypatch.setattr(
+            "magent.psmux.live_sessions",
+            lambda names, *a, **k: [n for n in names if n in live_local],
+        )
+        killed: list[list[str]] = []
+
+        def fake_stop(targets):
+            killed.append(list(targets))
+            return [t for t in targets if t in live_local], []
+
+        monkeypatch.setattr("magent.launch.stop_psmux", fake_stop)
+        # PR-D: `down` now also asks each node for its own session. These tests
+        # pin the LOCAL half, so the node half answers "not running there";
+        # TestDownStopsNodeSessionsWhereTheyRun owns the node half.
+        self.node_calls: list[list[str]] = []
+
+        def no_node_session(cfg, sids):
+            self.node_calls.append(list(sids))
+            return [], []
+
+        monkeypatch.setattr("magent.launch.stop_node_sessions", no_node_session)
+        monkeypatch.setattr("magent.cli.attach._read_last_host", lambda: None)
+        monkeypatch.setattr("magent.upload_server.stop_server", lambda port: False)
+        monkeypatch.setattr("magent.cli.attention_cmd.stop_daemon", lambda: False)
+        if sys.platform == "win32":
+            monkeypatch.setattr("magent.hotkey.stop_listener", lambda: False)
+        out = runner.invoke(cli.main, ["--config", cfgpath, "down", *argv])
+        return out, killed
+
+    def test_down_all_stops_the_orphaned_local_session(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            live_local={"api"},
+        )
+        assert out.exit_code == 0, out.output
+        assert killed == [["api"]]
+        assert "Stopped 1 session(s): api" in out.output
+
+    def test_a_node_project_with_no_local_session_is_tried_but_never_claimed(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            live_local=set(),
+        )
+        assert out.exit_code == 0, out.output
+        assert killed == [["api"]]
+        assert "No running sessions to stop." in out.output
+        assert "Stopped" not in out.output.split("Upload server")[0]
+        assert "would NOT stop" not in out.output
+
+    def test_local_and_node_targets_go_to_one_stop_call(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        (tmp_path / "web").mkdir()
+        out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[
+                {"path": str(tmp_path / "web")},
+                {"path": str(tmp_path / "api"), "node": "second"},
+            ],
+            live_local={"web", "api"},
+        )
+        assert out.exit_code == 0, out.output
+        assert killed == [["web", "api"]]
+        assert self.node_calls == [["api"]]  # a local id is never dialed
+        assert "Stopped 2 session(s): web, api" in out.output
+
+    @pytest.mark.parametrize(("name", "expected"), [("api", "api"), ("web", "web")])
+    def test_a_named_down_selects_node_sids_like_any_other(
+        self, runner, tmp_config, monkeypatch, tmp_path, name, expected
+    ):
+        (tmp_path / "web").mkdir()
+        _out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            [name],
+            projects=[
+                {"path": str(tmp_path / "web")},
+                {"path": str(tmp_path / "api"), "node": "second"},
+            ],
+            live_local={"web", "api"},
+        )
+        assert killed == [[expected]]
+
+    def test_the_group_scope_applies_to_node_projects(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        _out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--group", "a"],
+            projects=[
+                {"path": str(tmp_path / "api"), "node": "second", "group": "a"},
+                {"path": str(tmp_path / "db"), "node": "second", "group": "b"},
+            ],
+            live_local={"api", "db"},
+        )
+        assert killed == [["api"]]
+
+    def test_a_cloud_project_is_already_a_local_target_and_not_doubled(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        (tmp_path / "sky").mkdir()
+        _out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "sky"), "node": "cloud"}],
+            live_local={"sky"},
+        )
+        assert killed == [["sky"]]
+
+    def test_forwarding_to_a_host_kills_nothing_here(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        from magent.cli import attach as attach_mod
+
+        monkeypatch.setattr(
+            attach_mod,
+            "_ssh_capture",
+            lambda target, remote_cmd, timeout=30, stdin_text=None: (0, "", ""),
+        )
+        monkeypatch.setattr(attach_mod, "_close_attach_windows", lambda names: 0)
+        _out, killed = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--host", "user@box", "--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            live_local={"api"},
+        )
+        assert killed == []
+        assert self.node_calls == []
+
+
 class TestDownActsOnTheAttachHost:
     """`magent down` on an attach CLIENT used to be a near no-op: there are no
     local psmux sessions on a laptop, so it stopped the local Alt+V listener and
@@ -1310,3 +1490,814 @@ class TestSessionZeroServers:
         result = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
 
         assert json.loads(result.stdout)["psmux_session0"] == 3
+
+
+class TestStatusShowsNodeSessions:
+    """A node session's row comes from the sync daemon's last pull, never
+    from a live ssh call -- and a stale one is a row state, not a degraded
+    daemon, so the 0/1/3 exit contract is untouched."""
+
+    def _config(self, tmp_config, tmp_path):
+        return tmp_config(
+            {
+                "projects": [{"path": str(tmp_path), "title": "api", "node": "second"}],
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                },
+            }
+        )
+
+    def _snapshot(self, monkeypatch, tmp_path, ts):
+        from magent import nodes
+
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": ts, "sessions": ["api"]}
+        )
+
+    def test_json_carries_the_node_and_its_state(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        self._snapshot(monkeypatch, tmp_path, ts=time.time())
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._config(tmp_config, tmp_path), "status", "--json"],
+        )
+        assert json.loads(result.stdout)["node_sessions"] == [
+            {"name": "api", "session": "api", "node": "second", "state": "live"}
+        ]
+
+    def test_the_node_key_sits_right_after_psmux_session0(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        self._snapshot(monkeypatch, tmp_path, ts=time.time())
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._config(tmp_config, tmp_path), "status", "--json"],
+        )
+        keys = list(json.loads(result.stdout))
+        assert keys[keys.index("psmux_session0") + 1] == "node_sessions"
+
+    def test_an_unreachable_node_reads_stale_and_is_not_degraded(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        self._snapshot(monkeypatch, tmp_path, ts=0.0)
+        result = runner.invoke(
+            cli.main,
+            ["--config", self._config(tmp_config, tmp_path), "status", "--json"],
+        )
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sessions"][0]["state"] == "stale"
+
+    def test_the_report_lists_them_with_their_node(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        self._snapshot(monkeypatch, tmp_path, ts=time.time())
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_config, tmp_path), "status"]
+        )
+        assert "Nodes" in result.stdout
+        assert "api" in result.stdout
+        assert "@second" in result.stdout
+        assert "live" in result.stdout
+
+    def test_a_stale_report_row_does_not_degrade_the_exit(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        self._snapshot(monkeypatch, tmp_path, ts=0.0)
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_config, tmp_path), "status"]
+        )
+        assert result.exit_code == 0
+        assert "stale" in result.stdout
+
+    def test_an_unplaced_auto_project_reads_not_placed(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        self._snapshot(monkeypatch, tmp_path, ts=time.time())
+        cfg = tmp_config(
+            {
+                "projects": [{"path": str(tmp_path), "title": "new", "node": "auto"}],
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                },
+            }
+        )
+        result = runner.invoke(cli.main, ["--config", cfg, "status"])
+        assert "(not placed)" in result.stdout
+        assert "dead" in result.stdout
+
+    def test_the_report_prints_the_session_id_not_the_title(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # The map's sid is what runs on the node; the title only names the row.
+        from magent import nodes
+
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"),
+            {"ts": time.time(), "sessions": ["api-old"]},
+        )
+        nodes.update_node_map(
+            "api",
+            nodes.NodeMapEntry(
+                nick="second",
+                sid="api-old",
+                placed_ts=1.0,
+                attached_existing=False,
+                remote_root="/home/amin/magent/api",
+            ),
+        )
+        result = runner.invoke(
+            cli.main, ["--config", self._config(tmp_config, tmp_path), "status"]
+        )
+        assert "api-old" in result.stdout
+        assert "live" in result.stdout
+
+    def test_an_unreadable_node_map_reads_stale_never_dead(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # The cq-D17 probe, end to end: a placed auto project and a pinned one
+        # under a mapped sid, both live, then the map torn in half. Neither
+        # row may read dead or unplaced, status must not raise, and a stale
+        # row still does not degrade the exit.
+        from magent import nodes
+
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        node_map = tmp_path / "node-map.json"
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", node_map)
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"),
+            {"ts": time.time(), "sessions": ["api", "web-old"]},
+        )
+        for name, sid in (("api", "api"), ("web", "web-old")):
+            nodes.update_node_map(
+                name,
+                nodes.NodeMapEntry(
+                    nick="second",
+                    sid=sid,
+                    placed_ts=1.0,
+                    attached_existing=False,
+                    remote_root=f"/home/amin/magent/{name}",
+                ),
+            )
+        for sub in ("api", "web"):
+            (tmp_path / sub).mkdir()
+        cfgpath = tmp_config(
+            {
+                "projects": [
+                    {"path": str(tmp_path / "api"), "title": "api", "node": "auto"},
+                    {"path": str(tmp_path / "web"), "title": "web", "node": "second"},
+                ],
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                },
+            }
+        )
+        text = node_map.read_text(encoding="utf-8")
+        node_map.write_text(text[: len(text) // 2], encoding="utf-8")
+
+        result = runner.invoke(cli.main, ["--config", cfgpath, "status", "--json"])
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sessions"] == [
+            {"name": "api", "session": "api", "node": None, "state": "stale"},
+            {"name": "web", "session": "web", "node": "second", "state": "stale"},
+        ]
+        human = runner.invoke(cli.main, ["--config", cfgpath, "status"])
+        assert human.exit_code == 0
+        nodes_block = human.stdout.split("Nodes", 1)[1]
+        assert "stale" in nodes_block
+        assert "dead" not in nodes_block
+        assert "(not placed)" not in nodes_block
+        assert "(node unknown)" in nodes_block
+
+    def test_a_config_without_node_projects_prints_no_nodes_section(
+        self, runner, tmp_config, monkeypatch
+    ):
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        result = runner.invoke(
+            cli.main, ["--config", tmp_config({"projects": []}), "status"]
+        )
+        assert "Nodes" not in result.stdout
+
+
+class TestAStaleNodeSyncDaemonDegradesStatus:
+    """Exit 3 when a project runs on a node and the sync daemon's heartbeat has
+    gone stale: every node row would then be frozen at a pull nobody refreshes.
+    A STOPPED daemon is not degraded (serve starts one; with serve off the
+    upload-server line already says so), and without a node project -- or
+    with the MAGENT_NODE_SYNC switch off -- nobody expects a daemon at all.
+    Driven through the real heartbeat file; the switch is set back on here
+    (conftest turns it off for every tier)."""
+
+    def _config(self, tmp_config, tmp_path, *, on_node=True, tool=None):
+        project = {"path": str(tmp_path), "title": "api"}
+        if on_node:
+            project["node"] = "second"
+        if tool:
+            project["tool"] = tool
+        return tmp_config(
+            {
+                "projects": [project],
+                "settings": {
+                    "nodes": {"second": {"host": "devino-second", "user": "amin"}}
+                },
+            }
+        )
+
+    def _beat(self, age_s):
+        """The daemon's heartbeat, last touched ``age_s`` seconds ago."""
+        import os
+
+        from magent import log, node_sync
+
+        log.write_heartbeat(node_sync.HEARTBEAT_NAME)
+        path = log.HEARTBEAT_DIR / f"{node_sync.HEARTBEAT_NAME}.heartbeat"
+        then = time.time() - age_s
+        os.utime(path, (then, then))
+
+    def _status(self, runner, cfgpath, *extra):
+        return runner.invoke(cli.main, ["--config", cfgpath, "status", *extra])
+
+    @staticmethod
+    def _switch(monkeypatch, value):
+        """MAGENT_NODE_SYNC, re-read: the env singleton is cached."""
+        monkeypatch.setenv("MAGENT_NODE_SYNC", value)
+        monkeypatch.setattr("magent.env._cached_env", None)
+
+    @pytest.fixture(autouse=True)
+    def _healthy_otherwise(self, monkeypatch, tmp_path):
+        from magent import nodes
+
+        self._switch(monkeypatch, "1")
+        _no_psmux(monkeypatch)
+        _both_off(monkeypatch)
+        monkeypatch.setattr("magent.cli.status._health_check", lambda port: True)
+        monkeypatch.setattr(nodes, "NODES_DIR", tmp_path / "nodes")
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+
+    def test_stale_with_a_node_project_exits_3_and_says_so(
+        self, runner, tmp_config, tmp_path
+    ):
+        from magent import log
+
+        self._beat(log.HEARTBEAT_MAX_AGE + 30)
+        result = self._status(runner, self._config(tmp_config, tmp_path), "--json")
+        assert result.exit_code == 3
+        assert json.loads(result.stdout)["node_sync"] == "stale"
+
+    def test_the_report_names_the_stale_daemon_and_its_repair(
+        self, runner, tmp_config, tmp_path
+    ):
+        from magent import log
+
+        self._beat(log.HEARTBEAT_MAX_AGE + 30)
+        result = self._status(runner, self._config(tmp_config, tmp_path))
+        assert result.exit_code == 3
+        assert "node sync daemon stale" in result.stdout
+        assert status_mod.NODE_SYNC_REPAIR_HINT in result.stdout
+        assert "magent node sync --stop" in status_mod.NODE_SYNC_REPAIR_HINT
+
+    def test_stale_without_a_node_project_changes_nothing(
+        self, runner, tmp_config, tmp_path
+    ):
+        from magent import log
+
+        self._beat(log.HEARTBEAT_MAX_AGE + 30)
+        cfgpath = self._config(tmp_config, tmp_path, on_node=False)
+        result = self._status(runner, cfgpath, "--json")
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sync"] == "off"
+        human = self._status(runner, cfgpath)
+        assert human.exit_code == 0
+        assert "node sync daemon stale" not in human.stdout
+
+    def test_status_expects_a_daemon_exactly_when_serve_spawns_one(
+        self, runner, tmp_config, tmp_path
+    ):
+        # A node-pinned IDE project has no node SESSION (it stays on this PC),
+        # but serve still spawns the daemon for it (node_sync.wanted) -- so a
+        # stale one is degraded, and is named even with no Nodes rows to show.
+        from magent import log
+
+        self._beat(log.HEARTBEAT_MAX_AGE + 30)
+        cfgpath = self._config(tmp_config, tmp_path, tool="code")
+        result = self._status(runner, cfgpath, "--json")
+        assert result.exit_code == 3
+        payload = json.loads(result.stdout)
+        assert (payload["node_sync"], payload["node_sessions"]) == ("stale", [])
+        human = self._status(runner, cfgpath)
+        assert human.exit_code == 3
+        assert "Nodes" in human.stdout
+        assert "node sync daemon stale" in human.stdout
+        assert status_mod.NODE_SYNC_REPAIR_HINT in human.stdout
+
+    def test_a_fresh_heartbeat_is_ok_and_exits_0(self, runner, tmp_config, tmp_path):
+        self._beat(1)
+        cfgpath = self._config(tmp_config, tmp_path)
+        result = self._status(runner, cfgpath, "--json")
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sync"] == "ok"
+        human = self._status(runner, cfgpath)
+        assert human.exit_code == 0
+        assert "node sync daemon stale" not in human.stdout
+
+    def test_a_stopped_daemon_is_not_degraded(self, runner, tmp_config, tmp_path):
+        cfgpath = self._config(tmp_config, tmp_path)
+        result = self._status(runner, cfgpath, "--json")
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sync"] == "stopped"
+        human = self._status(runner, cfgpath)
+        assert human.exit_code == 0
+        # Named, as the JSON names it -- but never as the degraded "stale".
+        assert status_mod.NODE_SYNC_STOPPED_LINE in human.stdout
+        assert "node sync daemon stale" not in human.stdout
+        assert status_mod.NODE_SYNC_REPAIR_HINT not in human.stdout
+
+    def test_the_switch_off_means_no_daemon_is_expected(
+        self, runner, tmp_config, tmp_path, monkeypatch
+    ):
+        # serve's own gate is the switch AND wanted: a heartbeat left by a
+        # daemon that died before MAGENT_NODE_SYNC=0 was set is nobody's, and
+        # "serve starts a fresh one" would be a promise serve never keeps.
+        from magent import log
+
+        self._beat(log.HEARTBEAT_MAX_AGE + 30)
+        self._switch(monkeypatch, "0")
+        cfgpath = self._config(tmp_config, tmp_path)
+        result = self._status(runner, cfgpath, "--json")
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["node_sync"] == "off"
+        human = self._status(runner, cfgpath)
+        assert human.exit_code == 0
+        assert "node sync daemon" not in human.stdout
+        assert "serve starts a fresh one" not in human.stdout
+
+    def test_the_verdict_counts_node_sync_alongside_the_other_daemons(self):
+        healthy = {
+            "upload_server": "on",
+            "listener": "on",
+            "attention": "on",
+        }
+        for state, degraded in (
+            ("stale", True),
+            ("ok", False),
+            ("stopped", False),
+            ("off", False),
+        ):
+            assert (
+                status_mod._is_degraded({**healthy, "node_sync": state}) is degraded
+            ), state
+
+
+class TestDownStopsNodeSessionsWhereTheyRun:
+    """PR-D: a node project's id names TWO sessions -- the one on its node,
+    and the local one it may have left here before it gained a ``node`` (D9).
+    `down` kills each exactly once, on its own path (``stop_psmux`` here,
+    ``remote_mux.kill_session`` there), and reports the id once: never "No
+    running sessions to stop." above "Stopped 1 session(s): api"."""
+
+    @pytest.fixture(autouse=True)
+    def _map(self, monkeypatch, tmp_path):
+        from magent import nodes
+
+        monkeypatch.setattr(nodes, "NODE_MAP_PATH", tmp_path / "node-map.json")
+
+    def _run(
+        self,
+        runner,
+        tmp_config,
+        monkeypatch,
+        argv,
+        *,
+        projects,
+        live_local=frozenset(),
+        answers=None,
+        last_host=None,
+        real_stop=False,
+    ):
+        from magent.cli import attach as attach_mod
+
+        cfgpath = tmp_config(
+            {
+                "version": SCHEMA_VERSION,
+                "settings": {
+                    "nodes": {
+                        "second": {"host": "devino-second", "user": "amin"},
+                        "third": {"host": "devino-third", "user": "amin"},
+                    }
+                },
+                "projects": projects,
+            }
+        )
+        killed: list[list[str]] = []
+        if real_stop:
+            # The REAL stop_psmux on a machine with no psmux at all: it answers
+            # ([], []) -- the half that used to print "No running sessions to
+            # stop." above the node half's "Stopped".
+            monkeypatch.setattr("magent.psmux.find_psmux", lambda *a, **k: None)
+        else:
+            monkeypatch.setattr("magent.psmux.find_psmux", lambda *a, **k: "psmux")
+            monkeypatch.setattr(
+                "magent.psmux.live_sessions",
+                lambda names, *a, **k: [n for n in names if n in live_local],
+            )
+
+            def fake_stop(targets):
+                killed.append(list(targets))
+                return [t for t in targets if t in live_local], []
+
+            monkeypatch.setattr("magent.launch.stop_psmux", fake_stop)
+        dialed: list[tuple[str, str]] = []
+
+        def kill(node, sid):
+            dialed.append((node.nick, sid))
+            return (answers or {}).get(sid, True)
+
+        monkeypatch.setattr("magent.remote_mux.kill_session", kill)
+        monkeypatch.setattr(attach_mod, "_read_last_host", lambda: last_host)
+        sent: list[tuple[str, str]] = []
+
+        def fake_ssh(target, remote_cmd, timeout=30, stdin_text=None):
+            sent.append((target, remote_cmd))
+            return 0, "", ""
+
+        monkeypatch.setattr(attach_mod, "_ssh_capture", fake_ssh)
+        monkeypatch.setattr(attach_mod, "_close_attach_windows", lambda names: 0)
+        monkeypatch.setattr("magent.upload_server.stop_server", lambda port: False)
+        monkeypatch.setattr("magent.cli.attention_cmd.stop_daemon", lambda: False)
+        if sys.platform == "win32":
+            monkeypatch.setattr("magent.hotkey.stop_listener", lambda: False)
+        out = runner.invoke(cli.main, ["--config", cfgpath, "down", *argv])
+        return out, killed, dialed, sent
+
+    @staticmethod
+    def _hold(name, nick="second", sid=None):
+        from magent import nodes
+        from magent.nodes import NodeMapEntry
+
+        nodes.update_node_map(
+            name,
+            NodeMapEntry(
+                nick=nick,
+                sid=sid or name,
+                placed_ts=1.0,
+                attached_existing=False,
+                remote_root=f"~/magent/{name}",
+            ),
+        )
+
+    @staticmethod
+    def _session_lines(out):
+        return out.output.split("Upload server")[0]
+
+    def test_the_node_half_is_the_only_report_when_nothing_runs_here(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # THE regression: the local half found nothing, the node half killed
+        # api. One truthful line -- not "No running sessions", then "Stopped".
+        from magent import nodes
+
+        self._hold("api")
+        out, _killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["api"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            real_stop=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert dialed == [("second", "api")]
+        assert sent == []
+        lines = self._session_lines(out)
+        assert "No running sessions to stop." not in lines
+        assert lines.count("Stopped") == 1
+        assert "Stopped 1 session(s): api" in lines
+        assert nodes.read_node_map() == {}
+
+    def test_an_orphan_here_and_a_session_there_are_two_kills_and_one_name(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        self._hold("api")
+        out, killed, dialed, _sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            live_local={"api"},
+        )
+        assert out.exit_code == 0, out.output
+        # Each session exactly once, each on its own path.
+        assert killed == [["api"]]
+        assert dialed == [("second", "api")]
+        lines = self._session_lines(out)
+        assert lines.count("Stopped") == 1
+        assert "Stopped 1 session(s): api" in lines
+
+    def test_local_and_node_sessions_share_one_stopped_line(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        (tmp_path / "web").mkdir()
+        self._hold("api")
+        out, killed, dialed, _sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[
+                {"path": str(tmp_path / "web")},
+                {"path": str(tmp_path / "api"), "node": "second"},
+            ],
+            live_local={"web"},
+        )
+        assert killed == [["web", "api"]]
+        assert dialed == [("second", "api")]
+        assert "Stopped 2 session(s): web, api" in self._session_lines(out)
+
+    def test_a_node_that_cannot_be_asked_is_named_and_never_claimed(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # The local orphan died, but the node session may still be running:
+        # the name is a survivor -- not a stop, and not "nothing to stop".
+        from magent import nodes
+
+        self._hold("api")
+        out, _killed, _dialed, _sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["api"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            live_local={"api"},
+            answers={"api": None},
+        )
+        assert out.exit_code == 0, out.output
+        lines = self._session_lines(out)
+        assert "1 session(s) would NOT stop: api" in lines
+        assert "nodes.log" in lines
+        assert "Stopped" not in lines
+        assert "No running sessions to stop." not in lines
+        assert "api" in nodes.read_node_map()
+
+    def test_nothing_anywhere_still_says_so(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        out, killed, dialed, _sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            answers={"api": False},
+        )
+        assert killed == [["api"]]
+        assert dialed == [("second", "api")]
+        lines = self._session_lines(out)
+        assert "No running sessions to stop." in lines
+        assert "Stopped" not in lines
+
+    def test_a_session_placed_from_here_keeps_down_off_the_attach_host(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # Nothing psmux-live here, but this PC's node map placed api: only a
+        # LOCAL down reaches it, so the remembered host must not take over --
+        # and the user is told how to reach the host's sessions anyway.
+        self._hold("api")
+        out, _killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        assert dialed == [("second", "api")]
+        hints = [ln for ln in out.output.splitlines() if "--host" in ln]
+        assert len(hints) == 1, out.output
+        assert "magent down --host me@host" in hints[0]
+
+    @pytest.mark.parametrize(
+        ("answer", "report"),
+        [
+            (None, "1 session(s) would NOT stop: api"),
+            (False, "No running sessions to stop."),
+        ],
+        ids=["unreachable", "already-gone"],
+    )
+    def test_the_hint_never_claims_a_stop_the_report_did_not(
+        self, runner, tmp_config, monkeypatch, tmp_path, answer, report
+    ):
+        # The hint follows the report whatever it said: after a survivor or
+        # "nothing to stop", a hint reading "Stopped" would be the very
+        # contradiction the folded report exists to remove.
+        self._hold("api")
+        out, _killed, _dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            answers={"api": answer},
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        lines = self._session_lines(out)
+        assert report in lines
+        assert "magent down --host me@host" in lines
+        assert "Stopped" not in lines
+
+    def test_a_placement_with_no_remembered_host_prints_no_hint(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        self._hold("api")
+        out, _killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+        )
+        assert out.exit_code == 0, out.output
+        assert (sent, dialed) == ([], [("second", "api")])
+        assert "--host" not in out.output
+
+    def test_a_down_that_live_sessions_keep_local_prints_no_hint(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # Local work was running: `down` was local before PR-D too, so the
+        # placement is not the reason and there is nothing new to say.
+        (tmp_path / "web").mkdir()
+        self._hold("api")
+        out, _killed, _dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[
+                {"path": str(tmp_path / "web")},
+                {"path": str(tmp_path / "api"), "node": "second"},
+            ],
+            live_local={"web"},
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        assert "--host" not in out.output
+
+    def test_a_node_project_only_in_config_still_forwards_to_the_attach_host(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # An attach client sharing the host's config holds no placement: its
+        # `down --all` is still the host's, exactly as before PR-D.
+        out, killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == [("me@host", "magent down --all")]
+        assert killed == []
+        assert dialed == []
+
+    def test_an_explicit_host_dials_no_node(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        self._hold("api")
+        out, killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--host", "u@h", "--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            live_local={"api"},
+        )
+        assert sent == [("u@h", "magent down --all")]
+        assert killed == []
+        assert dialed == []
+        assert "magent down --host" not in out.output
+
+    def test_where_down_acts_and_what_it_kills_read_one_placement(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # The map records api under a session id other than the derived one:
+        # the node half kills that one, so `down` must also count it as
+        # placed here and stay off the attach host.
+        self._hold("api", sid="api-2")
+        out, _killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        assert dialed == [("second", "api-2")]
+
+    def test_a_retitled_placed_project_keeps_down_here(
+        self, runner, tmp_config, monkeypatch, tmp_path
+    ):
+        # Placed as "my.web", retitled "my web" since: the name misses, the
+        # recorded sid still names its running session. Found by sid, so it
+        # counts as placed here and never forwards to the attach host.
+        self._hold("my.web", "third", sid="my-web")
+        out, _killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[
+                {"path": str(tmp_path / "web"), "title": "my web", "node": "auto"}
+            ],
+            last_host="me@host",
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        assert dialed == [("third", "my-web")]
+
+    @pytest.mark.parametrize("state", ["torn", "busy"])
+    def test_an_unreadable_map_is_a_survivor_line_not_nothing_to_stop(
+        self, runner, tmp_config, monkeypatch, tmp_path, state
+    ):
+        from magent import nodes
+
+        if state == "torn":
+            nodes.NODE_MAP_PATH.write_text("{ torn", encoding="utf-8")
+        else:
+            # Intact on disk, but another process has it open (Windows).
+            self._hold("web", "third")
+
+            def busy() -> dict[str, nodes.NodeMapEntry]:
+                raise PermissionError(13, "The process cannot access the file")
+
+            monkeypatch.setattr(nodes, "load_node_map_strict", busy)
+        out, _killed, dialed, _sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "web"), "node": "auto"}],
+        )
+        assert out.exit_code == 0, out.output
+        assert dialed == []
+        lines = self._session_lines(out)
+        assert "1 session(s) would NOT stop: web" in lines
+        assert "No running sessions to stop." not in lines
+
+
+class TestTheShutdownReportFoldsBothHalves:
+    """``_report_shutdown`` directly: one name, two sessions, no line that
+    contradicts another."""
+
+    def _report(self, capsys, *halves):
+        status_mod._report_shutdown(*halves)
+        return capsys.readouterr().out
+
+    def test_a_local_survivor_is_never_claimed_by_a_node_stop(self, capsys):
+        out = self._report(capsys, [], ["api"], ["api"], [])
+        assert "Stopped" not in out
+        assert out.count("would NOT stop: api") == 1
+        assert "launch.log" in out
+
+    def test_survivors_on_both_halves_each_get_their_reason(self, capsys):
+        out = self._report(capsys, [], ["api"], [], ["api"])
+        assert out.count("would NOT stop: api") == 2
+        assert "launch.log" in out
+        assert "nodes.log" in out
+        assert "Stopped" not in out
+        assert "No running sessions" not in out
+
+    def test_no_node_half_prints_what_it_always_did(self, capsys):
+        assert self._report(capsys, ["web"], []) == ("  + Stopped 1 session(s): web\n")

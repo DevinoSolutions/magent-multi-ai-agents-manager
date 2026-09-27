@@ -138,13 +138,18 @@ def engine_from_config(cfg: MagentConfig) -> attention.AttentionEngine:
     config-driven windows as the daemon, not the module defaults. The name_map
     is derived from the enabled projects. Daemon-only concerns (renderers, ntfy
     topic) stay at the daemon call site; this helper covers the config-derived
-    kwargs common to all three surfaces."""
-    from magent import attention  # heavy subsystem: in-body per policy
+    kwargs common to all three surfaces. When a project runs on a node, the
+    engine also reads each placed node session's mirrored state store
+    (node_sync.state_stores)."""
+    from magent import attention, node_sync  # heavy subsystem: in-body per policy
 
     return attention.AttentionEngine(
         attention.name_map_from_projects(name_pairs_from_config(cfg)),
         staleness=staleness_from_config(cfg),
         debounce_s=cfg.settings.attention.debounce_s,
+        # Node sessions' states, pulled home by `magent node sync`, keyed by
+        # the node map (project -> nick, sid) and named by their project.
+        extra_stores=node_sync.state_stores if node_sync.wanted(cfg) else None,
     )
 
 

@@ -33,6 +33,28 @@ _PROJECT_FIELD_DOCS: list[tuple[str, str, str, str]] = [
         "none",
         'List of window objects `{"name", "tool", "command"}` with per-window tool/command overrides. Legacy `int` / `["name1", "name2"]` forms still parse (normalized by `magent config migrate`).',
     ),
+    (
+        "node",
+        "string",
+        "none",
+        (
+            "Run this project's session on a pool machine: a nick from "
+            '`settings.nodes`, `"auto"` to place it by load history, or `"cloud"` '
+            "for a Claude cloud session (needs no pool entry). A node holds a git "
+            "clone at your current branch. Exclusive with `host`."
+        ),
+    ),
+    (
+        "push",
+        "list",
+        "none",
+        (
+            "Extra files (relative to the project) shipped to the node at bring-up, "
+            "on top of the auto-detected gitignored `.env*`, "
+            "`.claude/settings.local.json`, `CLAUDE.local.md` and `.mcp.json`. A "
+            "missing file is a warning, not an error."
+        ),
+    ),
 ]
 
 
@@ -168,6 +190,40 @@ _SETTINGS_FIELD_DOCS: list[tuple[str, str, str, str]] = [
             "Days a session's state record survives in `~/.magent/state/` before "
             "the sweep deletes it."
         ),
+    ),
+    (
+        "nodes",
+        "object",
+        "`{}`",
+        (
+            'Pool machines a project can run on, keyed by nick: `{"second": {"host": '
+            '"build-box", "user": "alice", "root": "~/magent"}}`. A nick is 1-6 '
+            "characters of `a-z`, `0-9` and `-` (it is drawn in the status bar); "
+            "`auto` and `cloud` are reserved. `user` defaults to your local username at use time; "
+            "`root` is where project clones live on the node."
+        ),
+    ),
+    (
+        "nodeSync.pullIntervalS",
+        "int",
+        "`30`",
+        (
+            "Seconds between the sync daemon's pulls of node transcripts and agent "
+            "state. Every pull is one ssh connection per node, so a shorter interval "
+            "costs connections, not just freshness."
+        ),
+    ),
+    (
+        "nodeSync.sampleIntervalS",
+        "int",
+        "`60`",
+        'Seconds between node load samples; `"node": "auto"` placement reads this history.',
+    ),
+    (
+        "nodeSync.historyH",
+        "int",
+        "`24`",
+        "Hours of load history kept per node for placement.",
     ),
 ]
 
@@ -413,6 +469,15 @@ _CLI_COMMAND_DOCS: list[tuple[str, str]] = [
             "Print the last lines of a session's pane, a read-only glance (`-n` for "
             "how many). Safe to redirect: glyphs this console cannot encode become "
             "`?` rather than crashing."
+        ),
+    ),
+    (
+        "magent node sync -d [--once] [--stop]",
+        (
+            "The daemon that pulls transcripts and agent states home and samples "
+            "each node's load. `magent serve` normally keeps it alive; "
+            "`MAGENT_NODE_SYNC=0` stops serve from doing so (a sync run by hand "
+            "still runs)."
         ),
     ),
     ("magent config show", "Display current config."),

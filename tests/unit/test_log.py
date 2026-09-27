@@ -10,6 +10,7 @@ import logging
 import logging.handlers
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -36,6 +37,31 @@ class TestGetLogger:
         log_file = log.LOG_DIR / "upload.log"
         assert log_file.exists()
         assert "hello from test" in log_file.read_text(encoding="utf-8")
+
+    def test_first_use_from_many_threads_attaches_one_handler(self, monkeypatch):
+        # A first call for a name can come from a thread pool (the node
+        # bring-up fan-out); a check-then-set race would stack a handler per
+        # thread and write every record that many times.
+        real = log._SharedRotatingFileHandler
+
+        def slow(*a, **kw):
+            time.sleep(0.05)  # hold the race window open for every thread
+            return real(*a, **kw)
+
+        monkeypatch.setattr(log, "_SharedRotatingFileHandler", slow)
+        barrier = threading.Barrier(8, timeout=10)
+
+        def first_use() -> None:
+            barrier.wait()
+            log.get_logger("race")
+
+        threads = [threading.Thread(target=first_use) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert not any(t.is_alive() for t in threads)
+        assert len(logging.getLogger("magent.race").handlers) == 1
 
     def test_mkdir_failure_falls_back_to_null_handler(self, monkeypatch):
         def _raise(*a, **k):
