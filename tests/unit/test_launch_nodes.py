@@ -3321,6 +3321,12 @@ class TestTheBringUpProvisionsFirst:
             )
         ]
 
-    # D-MERGE: test_dry_run_provisions_nothing (plan F Task 12A) lands with
-    # sub-plan D's Task 12: it needs D12's `desk` / `no_sleep` fixtures and its
-    # "would provision <nick>" dry-run line, neither of which exists yet.
+    def test_dry_run_provisions_nothing(
+        self, rig, api, fake_ssh, desk, no_sleep, capsys
+    ):
+        # Plan F Task 12A: the preview says what the real run would do first,
+        # and neither provisions nor dials anything.
+        assert launch.run_magent(_config(api), launch.RunOpts(dry_run=True)) == 0
+        assert "would provision second" in capsys.readouterr().out
+        assert rig.provisioned == []
+        assert fake_ssh.calls() == []
