@@ -137,6 +137,99 @@ class TestTheResumeId:
     def test_nothing_pulled_means_no_resume_id(self):
         assert nodes.latest_transcript_id("second", "api") is None
 
+    def test_a_trailing_newline_is_never_part_of_a_resume_id(self):
+        # The id lands on a `claude --resume` line, where a newline is an
+        # Enter. Windows cannot put one in a file name, so the pattern itself
+        # is pinned, on every OS.
+        assert nodes._SESSION_STEM.fullmatch(SESSION_ID + "\n") is None
+        assert nodes._SESSION_STEM.fullmatch(SESSION_ID) is not None
+
+    def test_a_newline_suffixed_name_never_comes_back_as_the_resume_id(
+        self, monkeypatch
+    ):
+        # The same law through the real call site: a listing that yields
+        # "<uuid>\n.jsonl" (legal on a POSIX node, impossible to create on
+        # Windows, hence the patched listing) must not win, even as the
+        # newest regular file in the folder.
+        write_transcript("second", "api", OLDER_SESSION_ID, mtime=NOW - 600)
+        folder = nodes.transcripts_dir("second", "api")
+        stand_in = folder / "stand-in.txt"
+        stand_in.write_text("{}\n", encoding="utf-8")
+        os.utime(stand_in, (NOW, NOW))
+        smuggled = folder / f"{SESSION_ID}\n.jsonl"
+        real_glob, real_stat = Path.glob, Path.stat
+
+        def glob(self, pattern, *args, **kwargs):
+            yield from real_glob(self, pattern, *args, **kwargs)
+            if self == folder:
+                yield smuggled
+
+        def stat(self, *args, **kwargs):
+            target = stand_in if self == smuggled else self
+            return real_stat(target, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "glob", glob)
+        monkeypatch.setattr(Path, "stat", stat)
+
+        assert nodes.latest_transcript_id("second", "api") == OLDER_SESSION_ID
+
+    def test_an_overlong_stem_is_never_a_resume_id(self):
+        # 300 + ".jsonl" is past the 255-character name limit of NTFS and
+        # ext4 alike, so it can only be pinned against the pattern.
+        assert nodes._SESSION_STEM.fullmatch("x" * 300) is None
+        assert nodes._SESSION_STEM.fullmatch(SESSION_ID * 2) is None
+
+    @pytest.mark.parametrize(
+        "hostile",
+        [
+            "$(id)",
+            "a;b",
+            "-x",
+            "a b",
+            SESSION_ID + " --dangerously-skip-permissions",
+            SESSION_ID.upper(),
+            SESSION_ID[:-1],
+            "x" * 200,
+        ],
+        ids=[
+            "subst",
+            "semicolon",
+            "dash",
+            "space",
+            "uuid-plus-flag",
+            "uppercase",
+            "short",
+            "long",
+        ],
+    )
+    def test_a_stem_that_is_not_a_whole_uuid_is_never_a_resume_id(self, hostile):
+        write_transcript("second", "api", OLDER_SESSION_ID, mtime=NOW - 600)
+        write_transcript("second", "api", hostile, mtime=NOW)
+
+        assert nodes.latest_transcript_id("second", "api") == OLDER_SESSION_ID
+
+    def test_one_vanished_file_does_not_blank_the_whole_folder(self, monkeypatch):
+        write_transcript("second", "api", OLDER_SESSION_ID, mtime=NOW - 600)
+        gone = write_transcript("second", "api", SESSION_ID, mtime=NOW)
+        real_stat = Path.stat
+
+        def stat(self, *args, **kwargs):
+            if self.name == gone.name:
+                raise FileNotFoundError(str(self))
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat)
+
+        assert nodes.latest_transcript_id("second", "api") == OLDER_SESSION_ID
+
+    def test_a_directory_named_like_a_transcript_never_counts(self):
+        write_transcript("second", "api", OLDER_SESSION_ID, mtime=NOW - 600)
+        impostor = nodes.transcripts_dir("second", "api") / f"{SESSION_ID}.jsonl"
+        impostor.mkdir()
+        os.utime(impostor, (NOW, NOW))
+
+        assert nodes.latest_transcript_id("second", "api") == OLDER_SESSION_ID
+
 
 _NODE = nodes.Node(nick="second", host="devino-second", user="amin", root="~/magent")
 

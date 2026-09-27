@@ -851,6 +851,10 @@ def _live_sampler(config: MagentConfig) -> Callable[[str], LoadSample | None]:
 
     user = env.local_username()
     log = get_logger("launch")
+    # Warm remote_mux's own logger here, on the calling thread: get_logger is
+    # check-then-set, so two first calls racing on sampler worker threads
+    # could each attach a handler and double every "nodes" line.
+    get_logger("nodes")
 
     def sample(nick: str) -> LoadSample | None:
         try:
@@ -892,6 +896,22 @@ def _map_unreadable_text(exc: OSError | ValueError) -> str:
         f"the node map is unreadable ({type(exc).__name__}), so where this auto"
         " project runs is unknown; not brought up"
     )
+
+
+def _unplaced_reason(samples: dict[str, list[LoadSample]], *, live: bool) -> str:
+    """Why no node could be scored, named per cause. ``samples`` is
+    ``placement_samples``' output, where a node ends up with no sample only
+    when its window was empty and either no live reading was allowed (a dry
+    run or a tile-only pass -- the wording fits both) or the live reading
+    failed -- a thin node always gets one."""
+    from magent import nodes
+
+    blank = ", ".join(nick for nick, window in samples.items() if not window)
+    if not blank:
+        return nodes.PLACE_REASONS["no-data"]
+    if not live:
+        return f"no live reading taken: {blank} would take a live reading at launch"
+    return f"live reading failed for {blank} (see ~/.magent/logs/launch.log)"
 
 
 def place_node_projects(
@@ -980,10 +1000,12 @@ def place_node_projects(
             notes.append(f"{name}: {placement.note}")
         if placement.nick is None:
             notes.append(
-                f"{name}: not launched -- {nodes.PLACE_REASONS['no-data']};"
+                f"{name}: not launched -- {_unplaced_reason(samples, live=live)};"
                 ' pin a node with "node": "<nick>"'
             )
             continue
+        # A kept project's session is already running there and already counts
+        # in that node's my_sessions; adding it to the spread would count it twice.
         if placement.reason != "kept":
             spread[placement.nick] = spread.get(placement.nick, 0) + 1
         out.append(dataclasses.replace(proj, node=placement.nick))
