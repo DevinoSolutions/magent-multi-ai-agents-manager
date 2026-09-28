@@ -2150,6 +2150,10 @@ INSTALL_REFUSALS = {
         " was installed; check that the node user has a home it can write to"
     ),
 }
+# What starts each line of a refusal that carries the OS's reason
+# (install_transcripts.sh's said_why). Those are the OS's words: nodes.log's,
+# never the screen's.
+INSTALL_REASON_TAG = "install_transcripts.sh: reason: "
 
 
 def _installed(text: str) -> InstalledTranscripts:
@@ -2173,8 +2177,8 @@ def install_transcripts(
     that this PC lacks. Returns where it landed and what the node KEPT.
     NodeConfigError (a root ``_session_root`` refuses) and RemoteError rc None
     (``source`` cannot be read) both come before any dial; RemoteError when
-    the node refuses -- its reason named from ``INSTALL_REFUSALS`` -- or does
-    not answer."""
+    the node refuses -- its reason named from ``INSTALL_REFUSALS``, the OS's
+    words it tagged left to nodes.log -- or does not answer."""
     _session_root(remote_root)
     payload = _tar_dir(source)
     name = encoded_project_dir(node_realpath(node, remote_root, timeout_s=timeout_s))
@@ -2186,7 +2190,21 @@ def install_transcripts(
         reason = INSTALL_REFUSALS.get(err.rc) if err.rc is not None else None
         if reason is None:
             raise
+        # The node's whole tail is the log's, %r so that it cannot write a
+        # line of its own there. The screen keeps every line of it but the
+        # tagged ones: those are the OS's words.
+        get_logger("nodes").warning(
+            "node %s: install_transcripts.sh refused (rc=%s): %r",
+            node.nick,
+            err.rc,
+            err.stderr_tail,
+        )
+        shown = "\n".join(
+            line
+            for line in err.stderr_tail.split("\n")
+            if not line.startswith(INSTALL_REASON_TAG)
+        )
         raise RemoteError(
-            err.rc, f"{reason}\n{err.stderr_tail}".rstrip(), err.command_redacted
+            err.rc, f"{reason}\n{shown}".rstrip(), err.command_redacted
         ) from err
     return _installed(_stdout_text(done))

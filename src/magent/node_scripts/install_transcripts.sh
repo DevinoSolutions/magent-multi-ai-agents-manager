@@ -65,18 +65,29 @@ under_a_file() {
   return 1
 }
 
+# Tag the OS's reason for a refusal: the last line of a failed command's own
+# words ($1), after its last ": " -- where GNU and BSD tools both put it. One
+# line under remote_mux.INSTALL_REASON_TAG, which magent logs and never shows.
+said_why() {
+  local nl=$'\n' why
+  why=${1##*$nl}
+  printf 'install_transcripts.sh: reason: %s\n' "${why##*: }" >&2
+}
+
 # Make folder $1 owner-only unless it is there already (the node's own is
 # left as it is); its parent must exist. A default ACL can only narrow
 # mkdir's mode, never widen it, and the chmod makes it exact. A mkdir that
 # fails with the folder there after all lost a race to another install,
-# whose private_dir made it: success, as mkdir -p had it. Any other failure
-# -- no folder, or one made that the chmod could not restrict -- is said in
-# this script's words (mkdir's stay off the screen) and returns 1; each
-# caller refuses with exit 5. chmod's -- comes before the mode: BSD chmod
-# (macOS) stops reading options at the mode, so a -- after it is a file.
+# whose private_dir made it: success, as mkdir -p had it, and not a word.
+# Any other failure -- no folder, or one made that the chmod could not
+# restrict -- is said in this script's words and returns 1; each caller
+# refuses with exit 5. mkdir's own words never come through: said_why tags
+# the OS's reason in them for the log. chmod's -- comes before the mode: BSD
+# chmod (macOS) stops reading options at the mode, so a -- after it is a file.
 private_dir() {
+  local why
   [ -d "$1" ] && return 0
-  if mkdir -m 700 -- "$1" 2>/dev/null; then
+  if why=$(mkdir -m 700 -- "$1" 2>&1); then
     chmod -- 700 "$1" && return 0
     printf 'install_transcripts.sh: cannot restrict folder %s to its owner; no file installed\n' \
       "$1" >&2
@@ -84,6 +95,7 @@ private_dir() {
     return 0
   else
     printf 'install_transcripts.sh: cannot make folder %s; no file installed\n' "$1" >&2
+    said_why "$why"
   fi
   return 1
 }

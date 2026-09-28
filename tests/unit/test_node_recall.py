@@ -1307,7 +1307,8 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
     ):
         # The one parent private_dir does not make: the home itself. A node
         # user with no home is a broken account, so the install refuses,
-        # where mkdir -p used to make the home too.
+        # where mkdir -p used to make the home too. The OS's reason follows,
+        # tagged for the log (remote_mux keeps it off the screen).
         home = tmp_path / "nodehome"
 
         done = _node_run(
@@ -1320,6 +1321,7 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
             == (
                 f"install_transcripts.sh: cannot make folder {home}/.claude;"
                 " no file installed\n"
+                f"{remote_mux.INSTALL_REASON_TAG}No such file or directory\n"
             ).encode()
         )
         assert not home.exists()
@@ -1336,9 +1338,11 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
 
         done = _node_run(self._call(monkeypatch), home)
 
+        # Not a refusal, so not a word: mkdir's "File exists" is dropped with
+        # no reason line, as there is nothing for the log to explain.
         assert done.returncode == 0, done.stderr
         assert self._modes(home) == _LANDED_OWNER_ONLY
-        assert b"mkdir" not in done.stderr
+        assert done.stderr == b""
         dest = home / ".claude" / "projects" / _ENCODED
         assert (dest / f"{SESSION_ID}.jsonl").read_text(encoding="utf-8") == (
             _PULLED_JSONL
@@ -1349,8 +1353,9 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
         self, monkeypatch, tmp_path, rel
     ):
         # Each place private_dir runs: a mkdir that fails and leaves no
-        # folder refuses the install before any file is placed, and mkdir's
-        # own words stay off the screen.
+        # folder refuses the install before any file is placed. mkdir's own
+        # line never comes through; the OS's reason in it does, tagged, and
+        # remote_mux logs that line and keeps it off the screen.
         home = tmp_path / "nodehome"
         home.mkdir()
         refused = f"{home}/{rel}"
@@ -1364,6 +1369,7 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
             == (
                 f"install_transcripts.sh: cannot make folder {refused};"
                 " no file installed\n"
+                f"{remote_mux.INSTALL_REASON_TAG}Permission denied\n"
             ).encode()
         )
         assert [p for p in home.rglob("*") if not p.is_dir()] == []
@@ -1463,7 +1469,14 @@ class TestAnAbsoluteRootIsInstalledThroughTheEncoder:
 
 
 class TestTheInstallResultAndRefusals:
-    def _fake(self, monkeypatch, *, stdout: bytes = b"", rc: int = 0) -> list[str]:
+    def _fake(
+        self,
+        monkeypatch,
+        *,
+        stdout: bytes = b"",
+        rc: int = 0,
+        said: str = "node said no",
+    ) -> list[str]:
         calls: list[str] = []
 
         def _run_script(node, script, args, *, timeout_s, stdin=None, **_k):
@@ -1473,9 +1486,7 @@ class TestTheInstallResultAndRefusals:
                     [], 0, b"/home/amin/magent/api\n", b""
                 )
             if rc:
-                raise remote_mux.RemoteError(
-                    rc, "node said no", ("ssh", "devino-second")
-                )
+                raise remote_mux.RemoteError(rc, said, ("ssh", "devino-second"))
             return subprocess.CompletedProcess([], 0, stdout, b"")
 
         monkeypatch.setattr(remote_mux, "run_script", _run_script)
@@ -1543,7 +1554,10 @@ class TestTheInstallResultAndRefusals:
         assert words in str(caught.value)
         assert "node said no" in caught.value.stderr_tail
 
-    def test_any_other_failure_passes_through_unchanged(self, monkeypatch, tmp_path):
+    def test_any_other_failure_passes_through_unchanged(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
         self._fake(monkeypatch, rc=1)
 
         with pytest.raises(remote_mux.RemoteError) as caught:
@@ -1552,6 +1566,93 @@ class TestTheInstallResultAndRefusals:
             )
 
         assert caught.value.stderr_tail == "node said no"
+        assert _node_logs(caplog) == []
+
+    # A refusal as install_transcripts.sh says it (G-S1): its own line, then
+    # the OS's reason on a line of its own under the tag.
+    _REFUSED = (
+        "install_transcripts.sh: cannot make folder /home/amin/.claude;"
+        " no file installed"
+    )
+    _SAID = f"{_REFUSED}\n{remote_mux.INSTALL_REASON_TAG}Permission denied"
+
+    def test_the_os_reason_goes_to_the_log_and_never_the_screen(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        self._fake(monkeypatch, rc=5, said=self._SAID)
+
+        with pytest.raises(remote_mux.RemoteError) as caught:
+            remote_mux.install_transcripts(
+                _NODE, "~/magent/api", _pulled(tmp_path), timeout_s=5
+            )
+
+        # The screen: the refusal, then the script's own line -- the row a
+        # recall showed before the reason was said at all, byte for byte.
+        assert caught.value.stderr_tail == (
+            f"{remote_mux.INSTALL_REFUSALS[5]}\n{self._REFUSED}"
+        )
+        assert "Permission denied" not in str(caught.value)
+        # The log: the node's whole tail, escaped.
+        assert _node_logs(caplog) == [
+            f"node second: install_transcripts.sh refused (rc=5): {self._SAID!r}"
+        ]
+
+    @pytest.mark.parametrize("rc", sorted(remote_mux.INSTALL_REFUSALS))
+    def test_every_refusal_logs_the_nodes_whole_tail(
+        self, monkeypatch, tmp_path, caplog, rc
+    ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        self._fake(monkeypatch, rc=rc, said=self._SAID)
+
+        with pytest.raises(remote_mux.RemoteError):
+            remote_mux.install_transcripts(
+                _NODE, "~/magent/api", _pulled(tmp_path), timeout_s=5
+            )
+
+        assert _node_logs(caplog) == [
+            f"node second: install_transcripts.sh refused (rc={rc}): {self._SAID!r}"
+        ]
+
+    def test_only_the_lines_that_start_with_the_tag_leave_the_screen(
+        self, monkeypatch, tmp_path
+    ):
+        tag = remote_mux.INSTALL_REASON_TAG
+        self._fake(
+            monkeypatch,
+            rc=4,
+            said=f"first\n{tag}one\n  {tag}indented\nsaid: {tag}inside\n{tag}two\nlast",
+        )
+
+        with pytest.raises(remote_mux.RemoteError) as caught:
+            remote_mux.install_transcripts(
+                _NODE, "~/magent/api", _pulled(tmp_path), timeout_s=5
+            )
+
+        # Every other line stays, in order, as the node said it.
+        assert caught.value.stderr_tail == (
+            f"{remote_mux.INSTALL_REFUSALS[4]}\nfirst\n  {tag}indented\n"
+            f"said: {tag}inside\nlast"
+        )
+
+    def test_a_node_cannot_write_a_log_line_of_its_own(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        forged = (
+            f"{remote_mux.INSTALL_REASON_TAG}denied\n"
+            "2026-09-30 WARNING magent.nodes: forged\r\x1b[2J\u2028\x85x"
+        )
+        self._fake(monkeypatch, rc=5, said=forged)
+
+        with pytest.raises(remote_mux.RemoteError):
+            remote_mux.install_transcripts(
+                _NODE, "~/magent/api", _pulled(tmp_path), timeout_s=5
+            )
+
+        (logged,) = _node_logs(caplog)
+        assert "forged" in logged
+        assert not set(logged) & set("\n\r\x1b\u2028\x85")
 
 
 class TestTheTarCarriesOnlyTheConversation:
@@ -4085,6 +4186,10 @@ def _landed() -> str:
     return f"/home/amin/.claude/projects/{encoded}"
 
 
+# The real one, for a test that puts it back under `moving`'s stub.
+_REAL_INSTALL = remote_mux.install_transcripts
+
+
 @pytest.fixture
 def sync_starts(monkeypatch) -> list[str | None]:
     """Each config path the node sync daemon was asked to start on -- never
@@ -4319,6 +4424,43 @@ class TestRecallTo:
         assert nodes.read_node_map()["api"].nick == "second"
         assert "magent up api" in result.stderr
         assert [e for e in events if e[0] == "bring_up"] == []
+
+    def test_a_refusals_os_reason_is_logged_and_the_row_is_the_scripts_words(
+        self, runner, placed_api, node_answers, moving, monkeypatch, caplog
+    ):
+        # G-S1 end to end: the real install_transcripts under a node that
+        # refuses as install_transcripts.sh does. The row carries magent's
+        # refusal and the script's line; the OS's reason is nodes.log's.
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
+        refused = (
+            "install_transcripts.sh: cannot make folder /home/amin/.claude;"
+            " no file installed"
+        )
+
+        def _run_script(node, script, args, *, timeout_s, stdin=None, **_k):
+            if script == "node_realpath":
+                return subprocess.CompletedProcess(
+                    [], 0, b"/home/amin/magent/api\n", b""
+                )
+            raise remote_mux.RemoteError(
+                5,
+                f"{refused}\n{remote_mux.INSTALL_REASON_TAG}Permission denied",
+                ("ssh", "devino-third"),
+            )
+
+        monkeypatch.setattr(remote_mux, "install_transcripts", _REAL_INSTALL)
+        monkeypatch.setattr(remote_mux, "run_script", _run_script)
+
+        result = _invoke_recall_to(runner, placed_api, "third")
+
+        assert result.exit_code == 3
+        assert (
+            f"could not install the conversation on @third"
+            f" ({remote_mux.INSTALL_REFUSALS[5]}; {refused});"
+            " api stays placed on @second -- `magent up api` resumes it there"
+        ) in result.stderr
+        assert "Permission denied" not in result.output
+        assert any("Permission denied" in m for m in _node_logs(caplog))
 
     def test_a_failed_bring_up_exits_3_saying_the_conversation_is_installed(
         self, runner, placed_api, node_answers, moving, monkeypatch
