@@ -671,13 +671,14 @@ class NodeUser:
 
 def _discard(root: Remote, name: str, owner: str) -> None:
     """Delete the user a failed ``create`` may have left, by its stamp. Its
-    own failure goes to stderr, never up: the create's failure is the one
-    the report is about, and it is re-raised as it was."""
+    own failure -- a timeout (``Failed``), no ssh at all (``OSError``), or a
+    refusal -- goes to stderr, never up: the create's failure is the one the
+    report is about, and it is re-raised as it was."""
     try:
         gone = root.script(
             _DELETE_USER, name, owner, tag="userdel", timeout=CLEANUP_TIMEOUT_S
         )
-    except pytest.fail.Exception as exc:
+    except (pytest.fail.Exception, OSError) as exc:
         sys.stderr.write(f"cleanup of node user {name} failed: {exc}\n")
         return
     if gone.rc != 0:
@@ -1323,7 +1324,7 @@ class NodeRig:
                 )
         try:
             deleted = self.user.delete()
-        except pytest.fail.Exception as exc:
+        except (pytest.fail.Exception, OSError) as exc:
             problems.append(f"node user {self.user.name} not deleted: {exc}")
         else:
             if deleted.rc != 0:

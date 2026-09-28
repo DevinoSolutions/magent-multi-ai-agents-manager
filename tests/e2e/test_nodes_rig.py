@@ -459,10 +459,18 @@ class TestTheRootHopDeletesOnlyTheUserThisRunMade:
         [
             {"create": _run(1)},
             {"create": _run(0, "useradd said something else\n")},
+            # The answer is the WHOLE last line, not a uid/home inside one.
+            {"create": _run(0, "useradd: warning: 1001 /home/x\n")},
             {"create": _run(0)},
             {"bootstrap": _run(4)},
         ],
-        ids=["useradd-failed", "answer-unparsed", "answer-empty", "bootstrap-failed"],
+        ids=[
+            "useradd-failed",
+            "answer-unparsed",
+            "answer-embedded",
+            "answer-empty",
+            "bootstrap-failed",
+        ],
     )
     def test_any_other_way_out_deletes_by_the_stamp_too(
         self,
@@ -499,20 +507,38 @@ class TestTheRootHopDeletesOnlyTheUserThisRunMade:
         first.delete()
         assert hop.calls[-1] == _Call("root@mdssh", "delete", (first.name, first.owner))
 
+    @pytest.mark.parametrize(
+        "delete",
+        [
+            pytest.fail.Exception("ssh-userdel: timed out after 60s"),
+            FileNotFoundError("ssh"),
+        ],
+        ids=["timed-out", "no-ssh"],
+    )
     def test_a_cleanup_that_fails_leaves_the_creates_failure_as_the_report(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
+        delete: BaseException,
     ) -> None:
-        _FakeHop(
-            monkeypatch,
-            bootstrap=_run(4),
-            delete=pytest.fail.Exception("ssh-userdel: timed out after 60s"),
-        )
+        _FakeHop(monkeypatch, bootstrap=_run(4), delete=delete)
         with pytest.raises(pytest.fail.Exception, match="could not bootstrap"):
             _create(tmp_path)
         assert "cleanup of node user" in capsys.readouterr().err
+
+    def test_a_cleanup_the_root_hop_refuses_is_reported(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # rc 5: the stamp did not match, so the user may still be there.
+        _FakeHop(monkeypatch, bootstrap=_run(4), delete=_run(5))
+        with pytest.raises(pytest.fail.Exception, match="could not bootstrap"):
+            _create(tmp_path)
+        err = capsys.readouterr().err
+        assert "cleanup of node user" in err and "rc=5" in err, err
 
 
 # ---------------------------------------------------------------------------
@@ -648,18 +674,28 @@ class TestCloseKillsOnlyWhatItOwns:
             "serve pid 78",
         ]
 
-    def test_a_timed_out_user_delete_is_a_problem_not_a_raise(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize(
+        ("delete", "said"),
+        [
+            (
+                pytest.fail.Exception("ssh-userdel: timed out after 60s"),
+                "ssh-userdel: timed out after 60s",
+            ),
+            (FileNotFoundError("ssh"), "ssh"),
+        ],
+        ids=["timed-out", "no-ssh"],
+    )
+    def test_a_failed_user_delete_is_a_problem_not_a_raise(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        delete: BaseException,
+        said: str,
     ) -> None:
         problems, _ = self._close(
-            tmp_path,
-            monkeypatch,
-            cmdline=lambda cfg: b"",
-            delete=pytest.fail.Exception("ssh-userdel: timed out after 60s"),
+            tmp_path, monkeypatch, cmdline=lambda cfg: b"", delete=delete
         )
-        assert problems[-1] == (
-            "node user mgnabcde not deleted: ssh-userdel: timed out after 60s"
-        )
+        assert problems[-1] == f"node user mgnabcde not deleted: {said}"
 
 
 class TestDiagNamesEveryRead:
