@@ -2267,6 +2267,26 @@ change):
   tiles into a hard-coded `compute_grid(monitors, 2, 1)` regardless of the
   config's `layout.columns`/`layout.rows`, unlike the launch path which
   reads the configured grid.
+- **The test home isolation leaves `find_config`'s CWD door open.**
+  `tests/conftest.py::_isolate_magent_home` moves the HOME family, `APPDATA`
+  and `XDG_CONFIG_HOME` into tmp, which closes the last candidate
+  `find_config(None)` tries (`env.config_base()/magent/config.json`). The
+  first two candidates are relative to the CWD, `./magent.config.json` and
+  then `./scripts/magent.config.json`, and the fixture does not move the
+  CWD. `magent.config.json` is gitignored precisely because a personal one
+  lives at a checkout root, so a test that forgets `--config`, run from
+  such a checkout, loads the developer's own config. The only guard is the
+  convention that CLI tests pass `--config <tmp_path>`; a global
+  `chdir(tmp_path)` would break the tests that rely on a repo-root CWD. The
+  cheapest fix is a guard-A-style tripwire that fails any test whose
+  `find_config(None)` resolves under the repo root while the redirect is
+  active.
+- **The home tripwire stops at the HOME family.** Guard B inspects only
+  `HOME`/`USERPROFILE` in an explicit child `env=`, so a child env carrying
+  the real `APPDATA` or `XDG_CONFIG_HOME` passes it. Guard A's
+  `_REAL_STATE_ROOTS` is `~/.magent` and `~/.claude`, without
+  `REAL_APPDATA/magent`, so an import-bound Path under the real Windows
+  config directory is not flagged.
 
 ## 4. Change guide
 
