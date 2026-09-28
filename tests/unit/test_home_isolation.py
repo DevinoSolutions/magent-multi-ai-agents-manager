@@ -144,16 +144,11 @@ _REAL_LOOKING_XDG_CONFIG_HOME = REAL_HOME / ".config"
 def _exported_xdg_config_home():
     # Class-scoped, so it runs BEFORE conftest's function-scoped redirect: the
     # variable is genuinely ambient when the redirect fires, the way a shell
-    # export is.
-    previous = os.environ.get("XDG_CONFIG_HOME")
-    os.environ["XDG_CONFIG_HOME"] = str(_REAL_LOOKING_XDG_CONFIG_HOME)
-    try:
+    # export is. Its own MonkeyPatch context, because the `monkeypatch` fixture
+    # is function-scoped; the context restores the prior value (or its absence).
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setenv("XDG_CONFIG_HOME", str(_REAL_LOOKING_XDG_CONFIG_HOME))
         yield
-    finally:
-        if previous is None:
-            os.environ.pop("XDG_CONFIG_HOME", None)
-        else:
-            os.environ["XDG_CONFIG_HOME"] = previous
 
 
 @pytest.mark.usefixtures("_exported_xdg_config_home")
