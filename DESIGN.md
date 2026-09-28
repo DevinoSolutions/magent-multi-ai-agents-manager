@@ -1675,6 +1675,21 @@ the OS has nothing left to ask. `rc.txt` came back EMPTY on every run until
 that line existed, and the hand-off then reported an "unreadable exit code" for
 commands that had succeeded.
 
+A second one, on the reading side: `rc.txt` EXISTING is not the exit code being
+WRITTEN. `Set-Content` creates the file, then writes, and refuses readers until
+it closes -- measured, 298 of 300 first reads after the file appeared were a
+sharing violation. The poll treated that read as final and reported the same
+"unreadable exit code ''" for succeeded commands, a windows-latest unit flake
+on five unrelated PRs. So rc.txt goes through the same reader as pid.txt
+(`_read_recorded_int`), and only a COMPLETE integer ends the wait -- complete
+meaning ended by the newline `Set-Content` writes after every value, so the
+`1` of `12` can never be final. While rc.txt is present the lost-child check
+stands down: a launcher still writing it has not lost anything. A present
+rc.txt that stays anything else past `_HANDOFF_RC_GRACE_S` (10s) or the budget
+gets one last, decisive read, and failing that is its own answer -- the
+command finished and we cannot say how -- distinct from "never started",
+"lost its child" and "may still be running".
+
 **`schtasks` comes from the system directory, not PATH.** `run_on_desktop` is
 reached from an ssh login, and letting that login's PATH choose what runs as
 the logged-on user would turn a hand-off into an execution primitive for
@@ -1722,12 +1737,15 @@ otherwise bring up a different config's projects). It exports
 landed in Session 0 again cannot recurse -- a recursion whose every level
 writes a scheduled task. And it writes `pid.txt` the moment `Start-Process`
 returns and `rc.txt` only after `WaitForExit`, which is what lets the poll tell
-three failures apart: no pid after the start grace means Task Scheduler never
-ran the task, a pid that is gone with no rc means the launcher lost its child
-and nothing is coming, and neither is the caller's budget simply running out.
-On that last one the delegated child is deliberately NOT killed: a bring-up
-still running on the desktop is doing the work that was asked for, and the pid
-is a number Windows recycles freely.
+four failures apart: no pid after the start grace means Task Scheduler never
+ran the task; a pid that is gone with no rc.txt means the launcher lost its
+child and nothing is coming; an rc.txt that is there but never reads as a
+complete integer means the command finished and its exit code is lost (see the
+reading-side trap above -- rc.txt existing is not the code being written); and
+none of those is the caller's budget simply running out. On that last one the
+delegated child is deliberately NOT killed: a bring-up still running on the
+desktop is doing the work that was asked for, and the pid is a number Windows
+recycles freely.
 
 Diagnostics are the other half: `doctor`'s `psmux-session0` check and one
 `status` stderr line count psmux servers still stranded there (by image name
@@ -1784,6 +1802,117 @@ supervised-pane and `--no-mux` `wt` spawns in `cli/attach.py`. Pins:
 `tests/unit/test_platform_contract.py::
 TestAttachClientKeepsNestingMarkersButNotALeakedNoColor`, and
 `tests/unit/test_attach.py::TestAttachPanesLoseOnlyALeakedColourOverride`.
+
+### An idle pane is proven, not read off the foreground (2026-09-26)
+
+`magent up --revive` (and the interactive `up`, which revives without the flag)
+types `cmd /c claude --continue` + Enter into every live session whose agent
+has fallen back to a bare shell. The bring-up's send-keys verification re-sends
+the start command on the same signal, and `status` prints an `idle` column from
+it. That signal was `#{pane_current_command}` read as a shell — and psmux
+reports the pane's foreground DESCENDANT, not the pane's own process. While
+Claude Code runs a tool the reading is `bash` (its Bash tool), `pwsh`, `grep`
+or an MCP server, with claude.exe alive under the pane. Measured live on a
+31-session fleet: 4 sessions read idle while their agent was mid-turn, and
+revive would have typed a second agent's command line into each one's prompt.
+
+The rule now: a pane is idle only on POSITIVE proof, and the one place that
+decides it is `psmux.idle_sessions`. All three consumers read it —
+`revive_sessions`, `WindowsPlatform._verify_sends_landed` and
+`cli/status.py::_psmux_sessions` — and nothing else classifies a pane. A yes
+needs all three of:
+
+1. the foreground reading is a bare shell (`is_idle_command`) — kept, because
+   a pane in the user's own program is not at its prompt either, and as a
+   cheap filter: a session that fails it costs no further probe;
+2. the pane's OWN process (`#{pane_pid}`, read by `psmux.pane_pids`) was read,
+   is present in the process snapshot, and is itself a shell;
+3. nothing in that process's subtree (`procs.process_tree` over the Toolhelp
+   snapshot, which now carries parent pids) is an agent image or a live
+   launcher (`psmux._LAUNCHER_IMAGES`, i.e. `cmd`).
+
+Everything unknown is a no: an unreadable or non-numeric pane pid, a failed
+snapshot, a pane process that is gone by snapshot time, a probe still
+unanswered when the fan-out's deadline passes. Off Windows there is no
+snapshot, so nothing is ever idle there — revive does nothing rather than
+guess. The asymmetry is the point: a false "busy" leaves a dead pane for the
+human to restart, a false "idle" types into a live agent's input.
+
+The launcher rule exists because the image list alone is not the fleet.
+`config.DEFAULT_TOOLS` ships tools with no registry entry and so no image
+(`agy`, `cursor-agent`), and a pane running one of them mid-tool read exactly
+like an idle pane. What every such pane does have is magent's own wrapper:
+every command magent types is `cmd /c <command>` (`platform/windows.py::
+_send_argv`, and revive's own send), and `cmd /c` exits exactly when its
+command does. A live `cmd` under the pane's shell therefore IS the launched
+command, whatever that command's image is called. The agent images still
+matter for the one path with no `cmd` above it: a human who typed `claude` at
+the prompt. The cost errs the safe way — a `cmd` the user started by hand reads
+busy — and a pane whose own shell is `cmd` was never idle to begin with (`cmd`
+is not in `_IDLE_SHELLS`).
+
+The pane probes are bounded as a batch, not one by one. `_display_fan_out`
+spawns every `display-message` before reading any and then waits on ONE
+deadline (`_FAN_OUT_TIMEOUT_S`); a probe still running when it passes is
+killed unread and its session reads unknown, while one that already exited
+gets `_FAN_OUT_DRAIN_S` to hand over its output. The per-probe timeout it
+replaced made a wedged server cost N x timeout across a fleet of N. Because
+the window is paid once, it is sized for a loaded host, not an idle one: 10 s.
+Under a spawn storm a single `display-message` runs past 3 s (the measurement
+behind `FLASH_TIMEOUT_S`), and a storm is exactly when the send-verify reads
+the fan-out. At 5 s one slow start read every pane as unknown and skipped the
+re-send. On attach the window bounds a share, not the whole read:
+`idle_sessions` runs two fan-outs back to back, so 2 x 10 s bounds its SHARE
+of the 30 s ssh read of `up --json --revive`, not that read. The rest of the
+path has no finite bound to sum — `live_sessions`' sweep before it is
+unbounded on purpose (a slow server must not read dead), revive's
+`has_session` pool runs ceil(n/16) waves in series, and each `send_keys` after
+it may take `SEND_KEYS_TIMEOUT_S` (20 s) per pane.
+
+The snapshot the verdict rests on is complete or it is nothing: a Toolhelp
+walk ends only on `ERROR_NO_MORE_FILES`, and a `Process32NextW` that fails
+for any other reason makes `procs.snapshot_processes` return None (unknown,
+so not idle) rather than the shorter list it reached — a partial list would
+read "nothing runs here" for every process the walk never got to.
+
+The agent images come from the registry, not a second list: each
+`AgentTool` carries `images` (`claude`, `codex`), and
+`sessions.agent_image_names()` adds `AGENT_RUNTIME_IMAGES` (`node`, the npm
+shim either agent can run under). A snapshot carries image names, never
+command lines, so ANY node under a pane counts — the reading that errs toward
+busy. The cost is batched: one `pane_pids` fan-out (every probe spawned before
+any is read, like `pane_current_commands`) and ONE snapshot per call, paid only
+when some reading is a shell; status passes the readings it already holds for
+its table instead of probing twice.
+
+Two known edges, both measured against the code rather than the fleet. Windows
+never rewrites a stale parent pid, so a recycled pid can pull a stranger into a
+pane's subtree; that only ever errs toward busy. The other is the one real
+hole: a parent-pid walk cannot reach an ORPHAN. If an agent's `cmd` is killed
+out of band while the agent lives, the agent keeps the dead `cmd`'s pid as its
+parent, nothing in the snapshot leads from the pane's shell to it, and the
+pane can read idle with the agent still attached to its console. A caller that
+only KILLS what the walk finds is safe there, since it finds nothing to kill.
+A caller that TYPES into the pane is not.
+
+The sound closure is known and deliberately not built in this change: ask the
+pane's CONSOLE who is on it, not the parent pids. A helper started with
+`DETACHED_PROCESS` (it has no console of its own to give up, and the caller's
+console is left alone) calls `AttachConsole(pane_pid)` and then
+`GetConsoleProcessList`. The pane is agent-free only if every process on that
+console is in the pane shell's subtree and none is an agent image or a
+launcher; any failure of the helper reads busy. That check is a prerequisite
+for the idle reaper, which types a mode reset and a resume into panes it has
+emptied, and it should land with it.
+
+Pins: `tests/unit/test_psmux.py::TestReviveNeverTypesIntoALiveAgent`,
+`::TestIdleSessions`, `::TestTheFanOutWaitsOnOneDeadline`,
+`tests/unit/test_platform_contract.py::TestWindowsSendKeysVerification`,
+`tests/unit/test_status.py::TestIdleColumnNeedsPositiveProof`,
+`tests/unit/test_procs.py::TestProcessTree`, and against a real psmux pane on a
+private socket (CI's Windows platform leg only),
+`tests/platform/test_real_psmux.py::
+test_real_pane_reads_idle_only_while_nothing_it_launched_runs`.
 
 ## 3. Known debt
 
@@ -2156,6 +2285,28 @@ change):
   tiles into a hard-coded `compute_grid(monitors, 2, 1)` regardless of the
   config's `layout.columns`/`layout.rows`, unlike the launch path which
   reads the configured grid.
+- **The test home isolation leaves `find_config`'s CWD door open.**
+  `tests/conftest.py::_isolate_magent_home` moves the HOME family, `APPDATA`
+  and `XDG_CONFIG_HOME` into tmp, which closes the last candidate
+  `find_config(None)` tries (`env.config_base()/magent/config.json`). The
+  first two candidates are relative to the CWD, `./magent.config.json` and
+  then `./scripts/magent.config.json`, and the fixture does not move the
+  CWD. `magent.config.json` is gitignored precisely because a personal one
+  lives at a checkout root, so a test that forgets `--config`, run from
+  such a checkout, loads the developer's own config. The only guard is the
+  convention that CLI tests pass `--config <tmp_path>`; a global
+  `chdir(tmp_path)` would break the tests that rely on a repo-root CWD. The
+  cheapest fix is a guard-A-style tripwire that fails any test whose
+  `find_config(None)` resolves under the repo root while the redirect is
+  active.
+- **The home tripwire stops at the HOME family.** Guard B inspects only
+  `HOME`/`USERPROFILE` in an explicit child `env=`, so a child env carrying
+  the real `APPDATA` or `XDG_CONFIG_HOME` passes it. Guard A's
+  `_REAL_STATE_ROOTS` is `~/.magent` and `~/.claude`, without the real
+  config base (`REAL_APPDATA/magent` on Windows, `~/.config/magent` or an
+  exported `$XDG_CONFIG_HOME/magent` on Linux, `~/Library/Application
+  Support/magent` on macOS), so an import-bound Path under any of them is
+  not flagged.
 
 ## 4. Change guide
 

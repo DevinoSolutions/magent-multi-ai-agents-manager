@@ -24,7 +24,9 @@ from typing import ClassVar
 import pytest
 
 from magent import psmux
-from magent.config import MagentConfig, ProjectConfig, Settings
+from magent.config import DEFAULT_TOOLS, MagentConfig, ProjectConfig, Settings
+from magent.sessions import AGENT_TOOLS
+from tests.unit._fake_panes import fake_panes, pane_tree
 
 
 class _FakeCompleted:
@@ -181,52 +183,11 @@ class TestPaneCwd:
         assert psmux.pane_cwd("sess") == ""
 
 
-class TestPaneCurrentCommand:
-    def test_targets_the_named_session_explicitly(self, monkeypatch):
-        # Regression pin: without `-t <name>`, display-message answers for the
-        # CALLING client's own pane -- and magent commands are routinely run
-        # from inside a psmux session, so revive would read the wrong pane.
-        captured: dict[str, object] = {}
+class TestTheForegroundReading:
+    """The foreground reading is still a NECESSARY condition of idle: a pane
+    whose pwsh is readable and has nothing under it is idle only while the
+    reading is a bare shell."""
 
-        def _fake_run(cmd, **kwargs):
-            captured["cmd"] = cmd
-            captured.update(kwargs)
-            return _FakeCompleted(returncode=0, stdout="pwsh\n")
-
-        monkeypatch.setattr(subprocess, "run", _fake_run)
-
-        assert psmux.pane_current_command("sess", psmux="psmux") == "pwsh"
-        cmd = captured["cmd"]
-        assert cmd[:4] == ["psmux", "-L", "sess", "display-message"]
-        assert cmd[cmd.index("-t") + 1] == "sess"
-        assert "#{pane_current_command}" in cmd
-        assert captured["timeout"] == 3
-        assert captured["encoding"] == "utf-8"
-        assert captured["errors"] == "replace"
-        assert captured["check"] is False
-
-    def test_nonzero_returncode_returns_empty(self, monkeypatch):
-        monkeypatch.setattr(
-            subprocess,
-            "run",
-            lambda cmd, **kw: _FakeCompleted(returncode=1, stdout="pwsh"),
-        )
-        assert psmux.pane_current_command("sess", psmux="psmux") == ""
-
-    def test_subprocess_failure_returns_empty(self, monkeypatch):
-        monkeypatch.setattr(
-            subprocess,
-            "run",
-            lambda cmd, **kw: (_ for _ in ()).throw(OSError("no psmux")),
-        )
-        assert psmux.pane_current_command("sess", psmux="psmux") == ""
-
-    def test_no_binary_returns_empty(self, monkeypatch):
-        monkeypatch.setattr(psmux, "find_psmux", lambda: None)
-        assert psmux.pane_current_command("sess") == ""
-
-
-class TestAgentIdle:
     @pytest.mark.parametrize(
         ("foreground", "idle"),
         [
@@ -251,10 +212,24 @@ class TestAgentIdle:
         ],
     )
     def test_classification(self, monkeypatch, foreground, idle):
-        monkeypatch.setattr(
-            psmux, "pane_current_command", lambda name, psmux=None: foreground
+        # A pane whose pwsh is readable and has nothing under it: the
+        # foreground reading is the only thing that varies.
+        fake_panes(
+            monkeypatch,
+            foreground={"sess": foreground},
+            pids={"sess": 100},
+            snapshot=pane_tree(100),
         )
-        assert psmux.agent_idle("sess", psmux="psmux") is idle
+        assert (psmux.idle_sessions(["sess"], psmux="psmux") == {"sess"}) is idle
+
+    def test_a_shell_reading_over_a_live_agent_is_not_idle(self, monkeypatch):
+        fake_panes(
+            monkeypatch,
+            foreground={"sess": "bash"},
+            pids={"sess": 100},
+            snapshot=pane_tree(100, "cmd.exe", "claude.exe", "bash.exe"),
+        )
+        assert psmux.idle_sessions(["sess"], psmux="psmux") == set()
 
 
 class _FakePopen:
@@ -274,6 +249,10 @@ class _FakePopen:
         if self._timeout:
             raise subprocess.TimeoutExpired(cmd="psmux", timeout=timeout or 0)
         return self._stdout, ""
+
+    def poll(self):
+        # A probe built to time out is one psmux never answered: still running.
+        return None if self._timeout else self.returncode
 
     def kill(self):
         self.killed = True
@@ -321,6 +300,9 @@ class TestPaneCurrentCommands:
         ]
 
     def test_targets_each_session_explicitly(self, monkeypatch):
+        # Regression pin: without `-t <name>`, display-message answers for the
+        # CALLING client's own pane -- and magent commands are routinely run
+        # from inside a psmux session, so revive would read the wrong pane.
         argvs: list[list[str]] = []
 
         def _fake_popen(cmd, **kwargs):
@@ -362,16 +344,283 @@ class TestPaneCurrentCommands:
         assert psmux.pane_current_commands([], psmux="psmux") == {}
 
 
+class _HungProbe:
+    """A pane probe psmux never answers: ``communicate`` waits out whatever
+    budget it is handed, then times out -- what a wedged server does."""
+
+    def __init__(self):
+        self.killed = False
+        self.waited: list[float] = []
+
+    def communicate(self, timeout=None):
+        self.waited.append(timeout or 0.0)
+        time.sleep(max(timeout or 0.0, 0.0))
+        raise subprocess.TimeoutExpired(cmd="psmux", timeout=timeout or 0)
+
+    def poll(self):
+        return None
+
+    def kill(self):
+        self.killed = True
+
+
+class _AnsweredProbe:
+    """A probe that already exited with its answer. Like the real pipe reader,
+    a zero budget can time out before the output is handed over."""
+
+    returncode = 0
+
+    def __init__(self, stdout):
+        self._stdout = stdout
+
+    def communicate(self, timeout=None):
+        if timeout is not None and timeout <= 0:
+            raise subprocess.TimeoutExpired(cmd="psmux", timeout=timeout)
+        return self._stdout, ""
+
+    def poll(self):
+        return 0
+
+    def kill(self):
+        pass
+
+
+class _LateProbe(_AnsweredProbe):
+    """A probe that answers, but only after ``delay`` of the budget it is
+    handed has gone by."""
+
+    def __init__(self, stdout, delay):
+        super().__init__(stdout)
+        self._delay = delay
+
+    def communicate(self, timeout=None):
+        time.sleep(self._delay)
+        return super().communicate(timeout)
+
+
+class TestTheFanOutWaitsOnOneDeadline:
+    """Every probe is spawned before any is read, so they all run at once --
+    and the WAIT is one budget too. Waiting a full timeout per probe meant a
+    fleet whose psmux hangs cost N x timeout, and that fan-out now sits on the
+    attach path (``up --json --revive`` over ssh) as well as ``status``. A
+    probe still unanswered at the deadline is unknown (``""``), which the idle
+    verdict reads as NOT idle."""
+
+    BUDGET_S = 0.5
+
+    def _fan(self, monkeypatch, probes):
+        queue = list(probes)
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: queue.pop(0))
+        monkeypatch.setattr(psmux, "_FAN_OUT_TIMEOUT_S", self.BUDGET_S)
+
+    def test_n_hung_probes_cost_one_budget_not_n(self, monkeypatch):
+        hung = [_HungProbe() for _ in range(4)]
+        self._fan(monkeypatch, hung)
+        names = [f"p{i}" for i in range(4)]
+
+        started = time.monotonic()
+        readings = psmux.pane_current_commands(names, psmux="psmux")
+        elapsed = time.monotonic() - started
+
+        # One budget plus scheduling slack; a per-probe wait is 4 budgets.
+        assert elapsed < self.BUDGET_S * 2.5, elapsed
+        assert readings == dict.fromkeys(names, "")
+        assert all(p.killed for p in hung)
+
+    def test_the_pane_pid_probe_shares_the_bound(self, monkeypatch):
+        self._fan(monkeypatch, [_HungProbe() for _ in range(4)])
+        started = time.monotonic()
+        pids = psmux.pane_pids(["a", "b", "c", "d"], psmux="psmux")
+        assert time.monotonic() - started < self.BUDGET_S * 2.5
+        assert pids == dict.fromkeys("abcd")
+
+    def test_an_answer_that_arrived_in_time_is_still_read(self, monkeypatch):
+        # The hung probe spends the whole budget; the one after it had already
+        # answered, and "answered by the deadline" is not "unknown".
+        self._fan(monkeypatch, [_HungProbe(), _AnsweredProbe("pwsh\n")])
+        assert psmux.pane_current_commands(["a", "b"], psmux="psmux") == {
+            "a": "",
+            "b": "pwsh",
+        }
+
+    def test_a_late_answer_does_not_buy_the_next_probe_a_fresh_budget(
+        self, monkeypatch
+    ):
+        # The first probe answers after most of the budget; the hung one after
+        # it may only have what is left. A fresh full timeout here is how the
+        # "one budget" worst case quietly becomes two.
+        hung = _HungProbe()
+        self._fan(monkeypatch, [_LateProbe("pwsh\n", self.BUDGET_S * 0.6), hung])
+        assert psmux.pane_current_commands(["a", "b"], psmux="psmux") == {
+            "a": "pwsh",
+            "b": "",
+        }
+        assert hung.killed
+        assert all(waited < self.BUDGET_S * 0.8 for waited in hung.waited), hung.waited
+
+    def test_the_window_fits_a_loaded_host_and_its_share_of_the_attach_read(self):
+        # Floor: under a spawn storm one display-message routinely runs past
+        # 3 s (FLASH_TIMEOUT_S's measurement), and a spawn storm is exactly
+        # when the bring-up's send-verify reads this fan-out. The window is
+        # paid once per batch, so it can hold several such probes; at 5 s a
+        # slow start read every pane as unknown and the re-send was skipped.
+        assert psmux._FAN_OUT_TIMEOUT_S >= 10
+        # Ceiling: idle_sessions runs two fan-outs back to back (foreground,
+        # then pane pids), so this bounds its SHARE of attach's 30 s
+        # `up --json --revive` ssh read, not the read: the has-session probes
+        # before it are unbounded on purpose (live_sessions' docstring) and
+        # each send_keys after it may take 20 s, so the whole path has no
+        # finite bound for a pin to hold.
+        from magent.cli import attach
+
+        assert 2 * psmux._FAN_OUT_TIMEOUT_S < attach._STATUS_TIMEOUT_S
+
+
 class TestIsIdleCommand:
-    """`agent_idle` now delegates here, so a caller that already holds the
-    reading (status's session table) classifies it without a second probe."""
+    """The foreground HINT: one of `idle_sessions`' conditions, never a verdict
+    on its own (a live agent running its Bash tool reads `bash`)."""
 
     @pytest.mark.parametrize(
         ("reading", "idle"),
         [("pwsh", True), ("C:\\x\\bash.exe", True), ("claude", False), ("", False)],
     )
-    def test_classification_matches_agent_idle(self, reading, idle):
+    def test_classification(self, reading, idle):
         assert psmux.is_idle_command(reading) is idle
+
+
+class TestPanePids:
+    """`#{pane_pid}` is the pane's OWN process -- the root the idle proof walks
+    from -- read with the same fan-out and guards as the foreground probe."""
+
+    def _fan(self, monkeypatch, results):
+        argvs: list[list[str]] = []
+        events: list[str] = []
+
+        def _fake_popen(cmd, **kwargs):
+            argvs.append(cmd)
+            events.append(f"spawn:{cmd[2]}")
+            stdout, rc = results.get(cmd[2], ("", 0))
+            return _FakePopen(cmd[2], stdout, rc, events)
+
+        monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+        return argvs, events
+
+    def test_reads_each_sessions_own_pane_in_one_fan_out(self, monkeypatch):
+        argvs, events = self._fan(monkeypatch, {"a": ("35948 \n", 0), "b": ("7", 0)})
+        assert psmux.pane_pids(["a", "b"], psmux="psmux") == {"a": 35948, "b": 7}
+        assert events == ["spawn:a", "spawn:b", "read:a", "read:b"]
+        cmd = argvs[0]
+        assert cmd[:4] == ["psmux", "-L", "a", "display-message"]
+        assert cmd[cmd.index("-t") + 1] == "a"
+        assert cmd[-1] == "#{pane_pid}"
+
+    @pytest.mark.parametrize("raw", ["", "AMIN", "0", "-4", "12x"])
+    def test_anything_but_a_positive_pid_is_unreadable(self, monkeypatch, raw):
+        # An empty or garbled reading must never become a root to walk from:
+        # unreadable is the one answer that keeps the pane out of revive.
+        self._fan(monkeypatch, {"a": (raw, 0)})
+        assert psmux.pane_pids(["a"], psmux="psmux") == {"a": None}
+
+    def test_a_failed_probe_is_unreadable(self, monkeypatch):
+        self._fan(monkeypatch, {"a": ("35948", 1)})
+        assert psmux.pane_pids(["a"], psmux="psmux") == {"a": None}
+
+    def test_no_binary_reads_nothing(self, monkeypatch):
+        monkeypatch.setattr(psmux, "find_psmux", lambda: None)
+        assert psmux.pane_pids(["a"]) == {"a": None}
+
+
+class TestIdleSessions:
+    """The one seam every consumer reads. The consumer-level pins live in
+    TestReviveNeverTypesIntoALiveAgent (and the bring-up/status suites); these
+    pin the seam's own cost and inputs."""
+
+    def test_no_shell_reading_costs_no_pid_probe_and_no_snapshot(self, monkeypatch):
+        probes = fake_panes(
+            monkeypatch,
+            foreground={"api": "claude", "web": "cmd"},
+            pids={"api": 100, "web": 200},
+            snapshot=[*pane_tree(100), *pane_tree(200)],
+        )
+        assert psmux.idle_sessions(["api", "web"], psmux="psmux") == set()
+        assert probes.pid_probes == []
+        assert probes.snapshots == []
+
+    def test_only_the_shell_readings_are_pid_probed(self, monkeypatch):
+        probes = fake_panes(
+            monkeypatch,
+            foreground={"api": "pwsh", "web": "claude"},
+            pids={"api": 100, "web": 200},
+            snapshot=[*pane_tree(100), *pane_tree(200, "claude.exe")],
+        )
+        assert psmux.idle_sessions(["api", "web"], psmux="psmux") == {"api"}
+        assert probes.pid_probes == [["api"]]
+
+    def test_held_readings_are_not_probed_again(self, monkeypatch):
+        # status already holds every pane's foreground reading for its table.
+        fake_panes(
+            monkeypatch, foreground={}, pids={"api": 100}, snapshot=pane_tree(100)
+        )
+        monkeypatch.setattr(
+            psmux,
+            "pane_current_commands",
+            lambda names, psmux=None: pytest.fail("re-probed a held reading"),
+        )
+        assert psmux.idle_sessions(
+            ["api"], psmux="psmux", foreground={"api": "pwsh"}
+        ) == {"api"}
+
+    def test_a_session_missing_from_held_readings_is_not_idle(self, monkeypatch):
+        # A caller's held readings that lack a session say nothing about it:
+        # "no reading" must never stand in for "a shell".
+        fake_panes(
+            monkeypatch, foreground={}, pids={"api": 100}, snapshot=pane_tree(100)
+        )
+        monkeypatch.setattr(
+            psmux,
+            "pane_current_commands",
+            lambda names, psmux=None: pytest.fail("re-probed a held reading"),
+        )
+        assert psmux.idle_sessions(["api"], psmux="psmux", foreground={}) == set()
+
+    def test_every_registry_agent_and_its_runtime_counts(self, monkeypatch):
+        from magent.sessions import agent_image_names
+
+        agents = sorted(agent_image_names())
+        names = [f"p{i}" for i in range(len(agents))]
+        pids = {n: 100 * (i + 1) for i, n in enumerate(names)}
+        fake_panes(
+            monkeypatch,
+            foreground=dict.fromkeys(names, "bash"),
+            pids=pids,
+            snapshot=[
+                e
+                for n, image in zip(names, agents, strict=True)
+                for e in pane_tree(pids[n], f"{image.upper()}.EXE", "bash.exe")
+            ],
+        )
+        assert psmux.idle_sessions(names, psmux="psmux") == set()
+
+    def test_a_live_launcher_is_the_command_magent_typed(self, monkeypatch):
+        # A cmd under the pane's shell with an image no list knows below it is
+        # still the launched command; the bare pane beside it is idle.
+        fake_panes(
+            monkeypatch,
+            foreground={"api": "bash", "web": "pwsh"},
+            pids={"api": 100, "web": 200},
+            snapshot=[
+                *pane_tree(100, "cmd.exe", "some-future-agent.exe", "bash.exe"),
+                *pane_tree(200),
+            ],
+        )
+        assert psmux.idle_sessions(["api", "web"], psmux="psmux") == {"web"}
+
+    def test_off_windows_nothing_is_ever_idle(self, monkeypatch):
+        # No process snapshot exists off Windows, so no proof can exist either.
+        fake_panes(
+            monkeypatch, foreground={"api": "bash"}, pids={"api": 100}, snapshot=None
+        )
+        assert psmux.idle_sessions(["api"], psmux="psmux") == set()
 
 
 def _cfg(projects, **settings):
@@ -539,7 +788,18 @@ class TestReviveSessions:
         sent: list[tuple] = []
         monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
         monkeypatch.setattr(psmux, "has_session", lambda name, psmux=None: True)
-        monkeypatch.setattr(psmux, "agent_idle", lambda name, psmux=None: name in idle)
+        # An idle pane is a pwsh with nothing under it; a busy one runs claude.
+        pids = {"api": 100, "web": 200}
+        fake_panes(
+            monkeypatch,
+            foreground={n: "pwsh" if n in idle else "claude" for n in pids},
+            pids=pids,
+            snapshot=[
+                e
+                for n, pid in pids.items()
+                for e in pane_tree(pid, *(() if n in idle else ("claude.exe",)))
+            ],
+        )
 
         def _fake_send(name, *keys, target=None, psmux=None):
             sent.append((name, keys, target))
@@ -587,6 +847,207 @@ class TestReviveSessions:
         monkeypatch.setattr(psmux, "find_psmux", lambda: None)
         cfg = _cfg([ProjectConfig(path="/a/api", tool="claude")])
         assert psmux.revive_sessions(cfg) == []
+
+
+# Shipped in DEFAULT_TOOLS (and the README) with no AGENT_TOOLS entry, so no
+# registry image names their process: today agy and cursor-agent.
+_UNREGISTERED_TOOLS = sorted(set(DEFAULT_TOOLS) - set(AGENT_TOOLS))
+
+
+class TestReviveNeverTypesIntoALiveAgent:
+    """``#{pane_current_command}`` is the pane's FOREGROUND DESCENDANT, not the
+    pane's own process. While Claude Code runs a tool it reads ``bash`` (the
+    Bash tool's child), ``grep``, an MCP server -- or ``pwsh`` -- with
+    claude.exe alive above it. Measured live: ``status --json`` called 4 of 31
+    sessions idle with claude.exe running in every one, and revive acted on the
+    same verdict by typing ``cmd /c claude --continue`` + Enter -- which, into a
+    live agent, is a submitted prompt.
+
+    Idle now needs positive proof: the pane's own process readable, and no
+    agent anywhere under it. Driven through the real ``revive_sessions`` with
+    only the pane probes and the process snapshot substituted.
+    """
+
+    def _revive(self, monkeypatch, *, foreground, pids, snapshot, tool="claude"):
+        sent: list[tuple[str, tuple[str, ...]]] = []
+        monkeypatch.setattr(psmux, "find_psmux", lambda: "psmux")
+        monkeypatch.setattr(psmux, "has_session", lambda name, psmux=None: True)
+
+        def _fake_send(name, *keys, target=None, psmux=None):
+            sent.append((name, keys))
+            return True
+
+        monkeypatch.setattr(psmux, "send_keys", _fake_send)
+        probes = fake_panes(
+            monkeypatch, foreground=foreground, pids=pids, snapshot=snapshot
+        )
+        cfg = _cfg([ProjectConfig(path=f"/a/{n}", tool=tool) for n in foreground])
+        return psmux.revive_sessions(cfg), sent, probes
+
+    @pytest.mark.parametrize(
+        "foreground", ["bash", "pwsh", "grep", "github-mcp-server"]
+    )
+    def test_a_tool_in_the_foreground_is_not_a_dead_agent(
+        self, monkeypatch, foreground
+    ):
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": foreground},
+            pids={"api": 100},
+            snapshot=pane_tree(100, "cmd.exe", "claude.exe", f"{foreground}.exe"),
+        )
+        assert revived == []
+        assert sent == []
+
+    @pytest.mark.parametrize(
+        "chain",
+        [
+            # A human typed `claude` at the pane's prompt: depth 1, no cmd.
+            ("claude.exe", "bash.exe"),
+            # An npm-installed Claude Code runs as node, not claude.exe.
+            ("cmd.exe", "node.exe", "bash.exe"),
+            # Codex: its node shim over the native binary.
+            ("cmd.exe", "node.exe", "codex.exe", "pwsh.exe"),
+            ("cmd.exe", "codex.exe", "bash.exe"),
+            # A human opened a nested shell and started the agent in it: nothing
+            # at depth 1 is a launcher or an agent, so only the whole subtree
+            # sees it.
+            ("pwsh.exe", "claude.exe", "bash.exe"),
+        ],
+    )
+    def test_the_agent_is_found_at_any_depth_under_any_launcher(
+        self, monkeypatch, chain
+    ):
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": chain[-1].removesuffix(".exe")},
+            pids={"api": 100},
+            snapshot=pane_tree(100, *chain),
+        )
+        assert revived == []
+        assert sent == []
+
+    @pytest.mark.parametrize("tool", _UNREGISTERED_TOOLS)
+    def test_a_shipped_tool_outside_the_registry_is_not_idle_while_it_runs(
+        self, monkeypatch, tool
+    ):
+        # magent's own launch shape: it typed `cmd /c <command>` into the pane,
+        # and cmd /c lives exactly as long as its command -- so a live cmd under
+        # the pane's shell IS the launched tool, whatever its image is called.
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": "bash"},
+            pids={"api": 100},
+            snapshot=pane_tree(100, "cmd.exe", f"{tool}.exe", "bash.exe"),
+            tool=tool,
+        )
+        assert revived == []
+        assert sent == []
+
+    @pytest.mark.parametrize("tool", _UNREGISTERED_TOOLS)
+    def test_a_shipped_tool_outside_the_registry_is_revived_once_it_is_gone(
+        self, monkeypatch, tool
+    ):
+        # cmd /c exited with its command: the pane's shell has nothing under it.
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=pane_tree(100),
+            tool=tool,
+        )
+        assert revived == ["api"]
+        assert tool in sent[0][1][0]
+
+    def test_a_pane_with_no_agent_under_it_is_still_revived(self, monkeypatch):
+        # The case revive exists for: the agent exited and the pane's pwsh is
+        # back at its prompt. A live agent in ANOTHER pane of the same snapshot
+        # is not this pane's agent.
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": "pwsh", "web": "bash"},
+            pids={"api": 100, "web": 200},
+            snapshot=[
+                *pane_tree(100),
+                *pane_tree(200, "cmd.exe", "claude.exe", "bash.exe"),
+            ],
+        )
+        assert revived == ["api"]
+        assert [name for name, _keys in sent] == ["api"]
+        assert "claude --continue" in sent[0][1][0]
+        assert sent[0][1][-1] == "Enter"
+
+    def test_a_program_in_the_foreground_is_not_idle_even_with_no_agent(
+        self, monkeypatch
+    ):
+        # The foreground reading stays a NECESSARY condition: a pane running a
+        # user's own program (no agent anywhere) is not a pane at its prompt,
+        # and typing a command into that program's stdin is no better.
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": "python"},
+            pids={"api": 100},
+            snapshot=pane_tree(100, "python.exe"),
+        )
+        assert revived == []
+        assert sent == []
+
+    def test_an_unreadable_pane_pid_is_not_idle(self, monkeypatch):
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": None},
+            snapshot=pane_tree(100),
+        )
+        assert revived == []
+        assert sent == []
+
+    def test_a_failed_process_snapshot_is_not_idle(self, monkeypatch):
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=None,
+        )
+        assert revived == []
+        assert sent == []
+
+    def test_a_pane_process_gone_from_the_snapshot_is_not_idle(self, monkeypatch):
+        # The pid was read, then the process was gone by the snapshot: nothing
+        # is known about that pane any more.
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=pane_tree(300),
+        )
+        assert revived == []
+        assert sent == []
+
+    def test_a_pane_pid_that_is_not_a_shell_is_not_idle(self, monkeypatch):
+        # A pid that names something other than the pane's shell (reused
+        # between the read and the snapshot) says nothing about the pane.
+        revived, sent, _ = self._revive(
+            monkeypatch,
+            foreground={"api": "pwsh"},
+            pids={"api": 100},
+            snapshot=[("notepad.exe", 100, 4)],
+        )
+        assert revived == []
+        assert sent == []
+
+    def test_one_pid_fan_out_and_one_snapshot_serve_the_whole_round(self, monkeypatch):
+        names = ["api", "web", "docs"]
+        pids = {n: 100 * (i + 1) for i, n in enumerate(names)}
+        revived, _, probes = self._revive(
+            monkeypatch,
+            foreground=dict.fromkeys(names, "pwsh"),
+            pids=pids,
+            snapshot=[e for pid in pids.values() for e in pane_tree(pid)],
+        )
+        assert sorted(revived) == sorted(names)
+        assert len(probes.snapshots) == 1
+        assert [sorted(p) for p in probes.pid_probes] == [sorted(names)]
 
 
 class TestHasSessionTimeout:
@@ -742,7 +1203,6 @@ class TestControlCommandsInheritTheEnvironment:
             lambda: psmux.send_keys("api", "claude", "Enter", psmux="psmux"),
             lambda: psmux.pane_cwd("api", psmux="psmux"),
             lambda: psmux.capture_pane("api", psmux="psmux"),
-            lambda: psmux.pane_current_command("api", psmux="psmux"),
             lambda: psmux.detach_client("api", psmux="psmux"),
             lambda: psmux.flash_message("api", "hi", 100, psmux="psmux"),
         ],
@@ -764,7 +1224,8 @@ class TestControlCommandsInheritTheEnvironment:
             )
         ) == {None}
 
-    def test_the_pane_command_fan_out_inherits_too(self, monkeypatch):
+    @pytest.mark.parametrize("fan_out", [psmux.pane_current_commands, psmux.pane_pids])
+    def test_the_pane_probe_fan_outs_inherit_too(self, monkeypatch, fan_out):
         seen: list[object] = []
 
         class _Proc:
@@ -773,12 +1234,16 @@ class TestControlCommandsInheritTheEnvironment:
             def communicate(self, timeout=None):
                 return "claude", ""
 
+            def poll(self):
+                # Answers at once, so it has always exited by the time it's asked.
+                return self.returncode
+
         def _popen(cmd, **kwargs):
             seen.append(kwargs.get("env"))
             return _Proc()
 
         monkeypatch.setattr(subprocess, "Popen", _popen)
-        psmux.pane_current_commands(["api"], psmux="psmux")
+        fan_out(["api"], psmux="psmux")
         assert seen == [None]
 
     def test_the_accessor_preserves_the_rest_of_the_environment(self, monkeypatch):

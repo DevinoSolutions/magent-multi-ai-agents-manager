@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
+import sys
 
 import pytest
 
@@ -257,3 +260,60 @@ class TestMain:
         monkeypatch.setattr(agent_state, "write_state", _boom)
         monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_claude_event("Stop"))))
         assert state_hook.main([]) == 0
+
+
+class TestModuleForm:
+    """``python -m magent.state_hook`` must RUN the hook, not merely import it.
+
+    The module form is how a settings.json gets wired when the console script
+    can't be trusted to exist -- a pip rollback deleted a real machine's
+    ``magent-state-hook.exe``, so its hooks were rewired to ``py -3.14 -m
+    magent.state_hook --source claude``. Without an entry block that command
+    imports the module and exits 0 having written nothing: every hook
+    "succeeds" and the store silently goes stale. Only a real interpreter can
+    see that -- ``main()`` called in-process never exercises the entry block.
+    """
+
+    def test_module_form_writes_a_record(self, tmp_path, monkeypatch):
+        # The child computes its own STATE_DIR from Path.home() at import, so
+        # the whole HOME family points it at tmp, plus the isolation pins every
+        # explicit child env= carries.
+        home = tmp_path / "home"
+        home.mkdir()
+        drive, tail = os.path.splitdrive(str(home))
+        child_env = {
+            **os.environ,
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "HOMEDRIVE": drive,
+            "HOMEPATH": tail or os.sep,
+            "MAGENT_HOTKEY_SUPERVISOR": "0",
+            "MAGENT_UPLOAD_SUPERVISOR": "0",
+            "MAGENT_PSMUX_BOOST": "0",
+            "MAGENT_SESSION0_POLICY": "allow",
+        }
+        cwd = str(tmp_path / "proj")
+        payload = _claude_event(
+            "UserPromptSubmit",
+            cwd=cwd,
+            transcript_path=str(tmp_path / "sid-1.jsonl"),
+            permission_mode="default",
+            prompt="fix the failing build",
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-m", "magent.state_hook", "--source", "claude"],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=child_env,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        monkeypatch.setattr(agent_state, "STATE_DIR", home / ".magent" / "state")
+        rec = agent_state.state_for(cwd)
+        assert rec is not None, "module form exited 0 but wrote no record"
+        assert rec["state"] == agent_state.WORKING
+        assert rec["session_id"] == "sid-1"
