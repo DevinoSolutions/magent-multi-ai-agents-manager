@@ -6,6 +6,7 @@ bash on POSIX; the pool is Linux)."""
 from __future__ import annotations
 
 import errno
+import hashlib
 import inspect
 import io
 import json
@@ -4333,27 +4334,6 @@ class TestProvision:
         assert TOKEN not in repr(report)
         assert TOKEN not in caplog.text
 
-    def test_a_payload_that_cannot_be_encoded_is_a_class_only_row(
-        self, fake_ssh, caplog
-    ):
-        # A real lone surrogate -- json reads "\ud83d" into one -- has no
-        # UTF-8 bytes to digest: the refusal's text stays off the row.
-        caplog.set_level("WARNING", logger="magent.nodes")
-        report = remote_mux.provision(
-            NODE,
-            _scope(settings={"x": "\ud83d"}),
-            timeout_s=remote_mux.PROVISION_TIMEOUT_S,
-        )
-        assert fake_ssh.calls() == []
-        (row,) = [line for line in report.lines if line.item == "payload"]
-        assert row == ScriptLine(
-            "fail",
-            "payload",
-            "not sent -- this PC refused the payload (UnicodeEncodeError); "
-            "see the nodes log",
-        )
-        assert "surrogates not allowed" in _nodes_log(caplog)
-
     def test_a_scope_whose_only_stdio_command_is_no_program_never_ships_it(
         self, fake_ssh
     ):
@@ -4541,6 +4521,247 @@ class TestProvision:
         assert TOKEN not in str(info.value)
         assert "timed out" in caplog.text
         assert TOKEN not in caplog.text
+
+
+_HTTP = {"type": "http", "url": "https://example.com/mcp"}
+
+
+def _applied(fake_ssh, report: ProvisionReport) -> tuple[dict, dict[str, bytes]]:
+    """The one apply call's manifest and members. A refused payload makes no
+    call at all, and fails here by assertion."""
+    calls = fake_ssh.calls()
+    assert len(calls) == 1, report.lines
+    _, _, data = _unpack(_sent(calls[0]))
+    return json.loads(data["manifest.json"]), data
+
+
+def _unread_row(label: str) -> ScriptLine:
+    return ScriptLine(
+        "skip",
+        "scope",
+        f"{label}: could not be read (UnicodeEncodeError), so nothing from it "
+        "ships this time",
+    )
+
+
+def _surrogate_named_server() -> UserScope:
+    return _scope(
+        settings={"model": "opus"},
+        mcp_servers={
+            "srv\udc80": {"type": "http", "url": "https://example.com/mcp"},
+            "ok": {"type": "http", "url": "https://example.com/mcp2"},
+        },
+        mcp_oauth={"ok|1": {"serverName": "ok", "accessToken": "tok"}},
+    )
+
+
+# A string with no UTF-8 form -- a lone surrogate, which json reads a
+# "\udXXX" escape into -- can be neither digested nor framed. It leaves its
+# item unread (the node leaves that step as it is, F17) and the rest still
+# ships: never the whole payload refused for it.
+class TestTextWithNoUtf8FormLeavesOnlyItsItemUnread:
+    @staticmethod
+    def _provision(scope: UserScope) -> ProvisionReport:
+        return remote_mux.provision(
+            NODE, scope, timeout_s=remote_mux.PROVISION_TIMEOUT_S
+        )
+
+    @staticmethod
+    def _settings_scope() -> UserScope:
+        return _scope(
+            settings={"env": {"X": "SECRET-DECOY\ud83d"}, "model": "opus"},
+            mcp_servers={"ok": _HTTP},
+        )
+
+    def test_a_settings_value_leaves_settings_unread_and_the_rest_ships(self, fake_ssh):
+        report = self._provision(self._settings_scope())
+        manifest, data = _applied(fake_ssh, report)
+        assert manifest["unread"] == {"settings": "UnicodeEncodeError"}
+        # An empty settings.json would take back what the PC shipped before.
+        assert "settings.json" not in data
+        assert json.loads(data["mcp_servers.json"]) == {"ok": _HTTP}
+        assert _unread_row("settings.json") in report.lines
+        assert ScriptLine("ok", "scope", "mcp ok: shipped") in report.lines
+        assert not [line for line in report.lines if line.item == "payload"]
+
+    def test_the_log_names_where_and_never_the_value(self, fake_ssh, caplog):
+        caplog.set_level("DEBUG", logger="magent.nodes")
+        report = self._provision(self._settings_scope())
+        _, data = _applied(fake_ssh, report)
+        assert (
+            "settings: 'env.X' holds text with no UTF-8 form; not sent"
+            in _nodes_log(caplog).splitlines()
+        )
+        assert "SECRET-DECOY" not in caplog.text
+        assert "SECRET-DECOY" not in repr(report)
+        assert all(b"SECRET-DECOY" not in blob for blob in data.values())
+
+    def test_a_server_name_leaves_mcp_unread_and_oauth_is_judged_alone(self, fake_ssh):
+        report = self._provision(_surrogate_named_server())
+        manifest, data = _applied(fake_ssh, report)
+        assert manifest["unread"] == {"mcp": "UnicodeEncodeError"}
+        assert json.loads(data["mcp_servers.json"]) == {}
+        # The server list READ: filtering the oauth entries against it was
+        # sound, so they are not unknown -- only what holds such text is.
+        assert json.loads(data["mcp_oauth.json"]) == {
+            "ok|1": {"serverName": "ok", "accessToken": "tok"}
+        }
+        assert json.loads(data["settings.json"]) == {"model": "opus"}
+        assert not [line for line in report.lines if line.detail.endswith(": shipped")]
+        assert _unread_row(".claude.json") in report.lines
+
+    def test_a_server_the_programs_rule_drops_never_makes_mcp_unread(self, fake_ssh):
+        # Judged AFTER the programs rule: the server it drops takes its text
+        # with it, and what is left ships.
+        bad = {"type": "stdio", "command": "npx;id", "env": {"K": "v\ud83d"}}
+        report = self._provision(_scope(mcp_servers={"bad": bad, "ok": _HTTP}))
+        manifest, data = _applied(fake_ssh, report)
+        assert manifest["unread"] == {}
+        assert json.loads(data["mcp_servers.json"]) == {"ok": _HTTP}
+        assert (
+            ScriptLine("skip", "scope", f"mcp bad: not shipped -- {NOT_A_NAME}")
+            in report.lines
+        )
+
+    def test_an_oauth_value_leaves_oauth_unread_and_mcp_ships(self, fake_ssh, caplog):
+        caplog.set_level("DEBUG", logger="magent.nodes")
+        report = self._provision(
+            _scope(
+                mcp_servers={"ok": _HTTP},
+                mcp_oauth={
+                    "ok|1": {"serverName": "ok", "accessToken": "TOKEN-DECOY\udcff"}
+                },
+            )
+        )
+        manifest, data = _applied(fake_ssh, report)
+        assert manifest["unread"] == {"mcp_oauth": "UnicodeEncodeError"}
+        assert json.loads(data["mcp_oauth.json"]) == {}
+        assert json.loads(data["mcp_servers.json"]) == {"ok": _HTTP}
+        assert ScriptLine("ok", "scope", "mcp ok: shipped") in report.lines
+        assert _unread_row(".credentials.json") in report.lines
+        assert (
+            "mcp_oauth: 'ok|1.accessToken' holds text with no UTF-8 form; not sent"
+            in _nodes_log(caplog).splitlines()
+        )
+        assert "TOKEN-DECOY" not in caplog.text
+        assert "TOKEN-DECOY" not in repr(report)
+        assert all(b"TOKEN-DECOY" not in blob for blob in data.values())
+
+    @pytest.mark.parametrize(
+        ("plugins", "marketplaces"),
+        [
+            (("p\ud83d@mkt",), {"mkt": "https://h/x.git"}),
+            (("p@mkt",), {"mkt": "https://h/\udc80.git"}),
+        ],
+        ids=["plugin-id", "marketplace-source"],
+    )
+    def test_a_plugin_id_or_source_leaves_the_plugin_list_unread(
+        self, fake_ssh, plugins, marketplaces
+    ):
+        report = self._provision(
+            _scope(
+                settings={"model": "opus"}, plugins=plugins, marketplaces=marketplaces
+            )
+        )
+        manifest, data = _applied(fake_ssh, report)
+        assert manifest["unread"] == {"plugins": "UnicodeEncodeError"}
+        # The manifest carries the list verbatim: marked alone, it would
+        # still be sent.
+        assert (manifest["plugins"], manifest["marketplaces"]) == ([], {})
+        assert json.loads(data["settings.json"]) == {"model": "opus"}
+        assert _unread_row("the plugin list") in report.lines
+
+    def test_valid_non_ascii_text_ships_byte_for_byte_as_before(self, fake_ssh):
+        # The fix changes no bytes: a node's stored digest still matches.
+        settings = {
+            "env": {"NOTE": "\u65e5\u672c\u8a9e"},
+            "statusLine": {"type": "command", "command": "echo caf\u00e9 \U0001f600"},
+        }
+        report = self._provision(_scope(settings=settings))
+        manifest, data = _applied(fake_ssh, report)
+        canonical = json.dumps(
+            settings, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        assert manifest["unread"] == {}
+        assert manifest["digests"]["settings"] == hashlib.sha256(canonical).hexdigest()
+        assert data["settings.json"] == canonical
+
+    def test_a_settings_file_escaping_a_lone_half_is_left_unread(
+        self, fake_ssh, tmp_path
+    ):
+        # Through the real read: the file is pure ASCII on disk, and json
+        # turns its escape into the lone surrogate.
+        home = tmp_path / "pc"
+        (home / ".claude").mkdir(parents=True)
+        (home / ".claude" / "settings.json").write_text(
+            '{"env": {"X": "\\ud83d"}, "model": "opus"}', encoding="ascii"
+        )
+        _write_json(home / ".claude.json", {"mcpServers": {"ok": _HTTP}})
+        report = self._provision(_walked(home))
+        manifest, data = _applied(fake_ssh, report)
+        assert manifest["unread"] == {"settings": "UnicodeEncodeError"}
+        assert "settings.json" not in data
+        assert json.loads(data["mcp_servers.json"]) == {"ok": _HTTP}
+        assert _unread_row("settings.json") in report.lines
+        assert ScriptLine("ok", "scope", "mcp ok: shipped") in report.lines
+        assert not [line for line in report.lines if line.item == "payload"]
+
+    def test_claudes_own_state_in_claude_json_never_holds_mcp_back(
+        self, fake_ssh, tmp_path
+    ):
+        # projects.* is Claude's, never shipped: a lone half there is the
+        # likeliest one of all, and must cost nothing.
+        home = tmp_path / "pc"
+        home.mkdir()
+        (home / ".claude.json").write_text(
+            '{"mcpServers": {"ok": {"type": "http", "url": '
+            '"https://example.com/mcp"}}, "projects": {"C:/x": {"history": '
+            '[{"display": "cut \\ud83d"}]}}}',
+            encoding="ascii",
+        )
+        report = self._provision(_walked(home))
+        manifest, data = _applied(fake_ssh, report)
+        assert manifest["unread"] == {}
+        assert json.loads(data["mcp_servers.json"]) == {"ok": _HTTP}
+        assert ScriptLine("ok", "scope", "mcp ok: shipped") in report.lines
+
+    def test_a_walked_skill_named_with_a_lone_half_stays_behind_alone(
+        self, fake_ssh, tmp_path
+    ):
+        home, skills = _skills_home(tmp_path)
+        _skill(skills, "ok/SKILL.md", b"# ok")
+        _odd_named_or_skip(skills / "hi\ud800" / "SKILL.md")
+        report = self._provision(_walked(home))
+        _, data = _applied(fake_ssh, report)
+        assert [name for name in data if name.startswith("skills/")] == [
+            "skills/ok/SKILL.md"
+        ]
+        assert (
+            ScriptLine(
+                "skip",
+                "scope",
+                "skills/'hi\\ud800/SKILL.md': its path cannot travel to a node, "
+                "not shipped",
+            )
+            in report.lines
+        )
+
+    def test_the_warning_reaches_nodes_log_through_the_real_handler(
+        self, fake_ssh, tmp_path, capsys
+    ):
+        assert Path.home() == tmp_path.parent / f"{tmp_path.name}-home"
+        assert log.LOG_DIR.is_relative_to(tmp_path)
+        log.get_logger("nodes")  # the real file handler, under the tmp LOG_DIR
+        _applied(fake_ssh, self._provision(_surrogate_named_server()))
+        path = log.LOG_DIR / "nodes.log"
+        logged = path.read_text(encoding="utf-8") if path.exists() else ""
+        lines = [line for line in logged.splitlines() if "no UTF-8 form" in line]
+        assert len(lines) == 1, logged
+        assert " WARNING " in lines[0]
+        assert lines[0].endswith(
+            "mcp: 'srv\\udc80' holds text with no UTF-8 form; not sent"
+        )
+        assert "Logging error" not in capsys.readouterr().err
 
 
 def _sysbin(

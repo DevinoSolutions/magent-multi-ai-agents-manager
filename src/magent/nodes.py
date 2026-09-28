@@ -347,10 +347,14 @@ def _read_object(
             _log.warning(
                 "%s is not a JSON object (a JSON %s)", path, type(raw).__name__
             )
-    notes.append(
-        f"{label}: could not be read ({why}), so nothing from it ships this time"
-    )
+    notes.append(_unread_note(label, why))
     return _Unread(why)
+
+
+def _unread_note(label: str, why: str) -> str:
+    """The note for a PC source left unread: ``label`` names it, ``why`` is
+    the class -- all a screen may show."""
+    return f"{label}: could not be read ({why}), so nothing from it ships this time"
 
 
 def _nests_deeper_than(value: object, limit: int) -> bool:
@@ -764,6 +768,90 @@ def without_unframable_skills(scope: UserScope) -> UserScope:
                 for f in bad
             ),
         ),
+    )
+
+
+# Every item ``UserScope.digests`` hashes, by the node_apply step it feeds,
+# and the source its note names -- F17's words for a PC file left unread.
+_ITEM_SOURCES = {
+    "settings": "settings.json",
+    "mcp": ".claude.json",
+    "mcp_oauth": ".credentials.json",
+    "plugins": "the plugin list",
+}
+
+
+def _no_utf8_at(value: object) -> tuple[str, ...] | None:
+    """The key path to the first string in ``value`` -- a key or a value --
+    that has no UTF-8 form, or None when every one has. json reads a
+    ``\\udXXX`` escape into a lone surrogate, which has none. Tested the
+    sink's own way (``str.encode``), so this can never disagree with
+    ``_digest``. The path is keys only, each through ``_named``: never a
+    value. An explicit stack, like ``_nests_deeper_than``."""
+    stack: list[tuple[object, tuple[str, ...]]] = [(value, ())]
+    while stack:
+        item, path = stack.pop()
+        if isinstance(item, str):
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError:
+                return path
+            continue
+        children: list[tuple[object, tuple[str, ...]]] = []
+        if isinstance(item, dict):
+            for key, child in item.items():
+                at = (*path, _named(key))
+                children += [(key, at), (child, at)]
+        elif isinstance(item, (list, tuple)):
+            children = [(child, (*path, str(i))) for i, child in enumerate(item)]
+        stack.extend(reversed(children))  # popped in the item's own order
+    return None
+
+
+def without_unsendable_items(scope: UserScope) -> UserScope:
+    """``scope`` with every item ``digests`` hashes that holds text with no
+    UTF-8 form (``_no_utf8_at``) left unread: marked in ``unread``, so the
+    node leaves that step as it is (U4), and emptied -- the manifest carries
+    the plugin list verbatim, and every member encodes its item. The rest
+    still ships. One rule per step, never per entry: a settings.json short
+    of one key would read as "absent" on the node and take it back.
+
+    The note names the source and the class; the log names the step and
+    where, never the value -- an env or mcpOAuth value can be a credential.
+    A scope a wrapper (plan K) built never passed ``user_scope``, and is
+    judged here the same."""
+    items: dict[str, object] = {
+        "settings": scope.settings,
+        "mcp": scope.mcp_servers,
+        "mcp_oauth": scope.mcp_oauth,
+        "plugins": {"plugins": list(scope.plugins), "marketplaces": scope.marketplaces},
+    }
+    refused: list[str] = []
+    for step, item in items.items():
+        at = _no_utf8_at(item)
+        if at is not None:
+            _log.warning(
+                "%s: %r holds text with no UTF-8 form; not sent", step, ".".join(at)
+            )
+            refused.append(step)
+    if not refused:
+        return scope
+    unread = dict(scope.unread)
+    notes = list(scope.notes)
+    for step in refused:
+        # A step already unread has its note, naming its own class.
+        if step not in unread:
+            unread[step] = UnicodeEncodeError.__name__
+            notes.append(_unread_note(_ITEM_SOURCES[step], unread[step]))
+    return replace(
+        scope,
+        settings={} if "settings" in refused else scope.settings,
+        mcp_servers={} if "mcp" in refused else scope.mcp_servers,
+        mcp_oauth={} if "mcp_oauth" in refused else scope.mcp_oauth,
+        plugins=() if "plugins" in refused else scope.plugins,
+        marketplaces={} if "plugins" in refused else scope.marketplaces,
+        notes=tuple(notes),
+        unread=unread,
     )
 
 

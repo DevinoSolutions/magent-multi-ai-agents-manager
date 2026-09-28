@@ -69,6 +69,7 @@ from magent.nodes import (
     walk_memory,
     without_missing_programs,
     without_unframable_skills,
+    without_unsendable_items,
 )
 from magent.sessions import build_resume_command
 
@@ -1128,6 +1129,9 @@ def provision(
     # A skill name the payload cannot frame leaves that file behind, not the
     # whole provision.
     user_scope = without_unframable_skills(user_scope)
+    # Text with no UTF-8 form leaves its item unread, not the whole payload
+    # refused. After the programs rule: a server it drops takes its text too.
+    user_scope = without_unsendable_items(user_scope)
     login, token, gh_rows = _gh_to_share()
     notes = tuple(ScriptLine("skip", "scope", note) for note in user_scope.notes)
     try:
@@ -2445,12 +2449,18 @@ def _archive_name(rel: str) -> str:
     name is refused (ValueError) when it is absolute or has an empty, ``.``
     or ``..`` segment. A control character is refused too: the node's shell
     strips a trailing newline in ``$(...)``, so ``.env\\n`` would resolve as
-    ``.env`` (the node refuses it as well)."""
+    ``.env`` (the node refuses it as well). So is a name with no UTF-8 form:
+    one that is not UTF-8 on disk arrives as lone surrogates, which tar
+    writes as other bytes (``\\udc80`` as 0x80) or not at all."""
     name = rel.replace("\\", "/")
     if any(part in ("", ".", "..") for part in name.split("/")):
         raise ValueError(f"{rel!r} cannot name a file inside the project")
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
         raise ValueError(f"{rel!r} has a control character in its name")
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError as e:
+        raise ValueError(f"{rel!r} has no UTF-8 form to be named by on the node") from e
     return name
 
 
