@@ -5994,6 +5994,29 @@ class TestSetupShUnderRealBash:
             "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
         }
 
+    def test_a_pub_without_its_private_key_is_a_fail_row_not_a_key(self, tmp_path):
+        # Its `key` row would register on GitHub a key whose private half is
+        # not on the node: setup would say ok on a node that cannot clone. The
+        # user's .pub is left as it was, and no key is generated beside it.
+        state, env = _setup_box(tmp_path)
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        pub = ssh_dir / "id_ed25519.pub"
+        pub.write_bytes(b"ssh-ed25519 AAAAOLDKEY old@box\n")
+        r = _run_setup(env)
+        assert self._row(r, "node-key:amin") == (
+            "fail",
+            (
+                "id_ed25519.pub in ~/.ssh has no private key beside it;"
+                " remove the .pub and rerun"
+            ),
+        )
+        assert set(_report(r).keys()) == set()
+        assert pub.read_bytes() == b"ssh-ed25519 AAAAOLDKEY old@box\n"
+        assert not (ssh_dir / "id_ed25519").exists()
+        assert _keygen_calls(state) == []
+        assert r.returncode == 1
+
     # -- mutation killers (cq-F13) --------------------------------------------
 
     def test_a_failed_installer_download_fails_claude_and_keeps_the_key(self, tmp_path):
