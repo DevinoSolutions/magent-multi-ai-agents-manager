@@ -57,7 +57,8 @@ if TYPE_CHECKING:
 MANIFEST_VERSION = 1
 # A node file or payload member nested deeper than this is refused before
 # json parses it (``_text_nests_deeper_than``). Pinned equal to
-# nodes.MAX_JSON_DEPTH -- the PC's own bound -- by tests/unit/test_node_apply.py.
+# json_depth.MAX_JSON_DEPTH -- the PC's own bound -- by
+# tests/unit/test_node_apply.py.
 MAX_JSON_DEPTH = 64
 # The installed state hook, under $HOME. remote_mux.NODE_STATE_HOOK_COMMAND
 # runs it (pinned by test), so a settings hook naming it is magent's own.
@@ -214,18 +215,19 @@ _NOT_AN_OBJECT = "not a JSON object"
 # whitespace, in place of JSONDecodeError.
 _EMPTY = "empty"
 # The class a node file or payload member nested past ``MAX_JSON_DEPTH``
-# reads as, whatever the parser would have raised -- the nodes.py wording.
+# reads as, whatever the parser would have raised -- json_depth.TOO_DEEP's
+# wording.
 _TOO_DEEP = f"nested deeper than {MAX_JSON_DEPTH} levels"
 # A JSON string (its escapes read; an unterminated one runs to the end, as
 # json reads it) or one bracket: all ``_text_nests_deeper_than`` reads. A
-# copy of nodes._JSON_NESTING_TOKEN, pinned equal by
+# copy of json_depth._JSON_NESTING_TOKEN, pinned equal by
 # tests/unit/test_node_apply.py -- change the two together.
 _JSON_NESTING_TOKEN = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"?|[\[\]{}]', re.DOTALL)
 
 
-# A byte-identical copy of nodes._text_nests_deeper_than (nothing from magent
-# is installed here), pinned by tests/unit/test_node_apply.py -- change the
-# two together.
+# A byte-identical copy of json_depth._text_nests_deeper_than (nothing from
+# magent is installed here), pinned by tests/unit/test_node_apply.py --
+# change the two together.
 def _text_nests_deeper_than(text: str, limit: int) -> bool:
     """True when the JSON ``text`` opens more than ``limit`` arrays/objects
     inside one another, read before json.loads sees it. json.loads recurses

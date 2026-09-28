@@ -34,6 +34,7 @@ from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
 from magent.config import NODE_AUTO, NODE_CLOUD, is_cloud, runs_on_node
+from magent.json_depth import MAX_JSON_DEPTH, TOO_DEEP, nests_too_deep
 from magent.lockfile import LockHeld, persistent_lock
 from magent.log import get_logger
 from magent.psmux import session_name
@@ -222,15 +223,6 @@ SECRET_HOME_DIRS = (
     ".kube",
     ".docker",
 )
-# A PC file nested deeper than this is refused whole, before anything walks it
-# (deepcopy and the credential scan recurse; a hostile or corrupt file must
-# not crash provisioning). Claude Code's own files are a handful of levels.
-# node_apply.py refuses the node's files by the same bound (pinned equal by
-# tests/unit/test_node_apply.py), and every reader of node JSON here refuses
-# by it too (``nests_too_deep``).
-MAX_JSON_DEPTH = 64
-# What each of them says of a file nested past it.
-TOO_DEEP = f"nested deeper than {MAX_JSON_DEPTH} levels"
 # Secret-bearing FILE names, matched case-insensitively at any depth of the
 # skills walk and on the name a link resolves to: the credential scan cannot
 # see an ssh key, a TLS key or a git token, so these never ship by name.
@@ -325,14 +317,14 @@ def _read_object(
     path: Path, label: str, notes: list[str]
 ) -> dict[str, object] | _Unread:
     """``path`` as a JSON object; {} when it does not exist. Anything else --
-    unreadable, not UTF-8, not JSON, nested deeper than ``MAX_JSON_DEPTH``,
-    not an object -- is ``_Unread``, never an exception (provisioning must not
-    die on a PC file): a note naming the class, and the path and the error in
-    the log only."""
+    unreadable, not UTF-8, not JSON, nested deeper than ``MAX_JSON_DEPTH``
+    (deepcopy and the credential scan recurse), not an object -- is
+    ``_Unread``, never an exception (provisioning must not die on a PC file):
+    a note naming the class, and the path and the error in the log only."""
     try:
         # utf-8-sig: a Windows tool may have written a BOM.
         text = path.read_text(encoding="utf-8-sig")
-        too_deep = _text_nests_deeper_than(text, MAX_JSON_DEPTH)
+        too_deep = nests_too_deep(text)
         raw = None if too_deep else json.loads(text)
     except FileNotFoundError:
         return {}
@@ -381,44 +373,6 @@ def _nests_deeper_than(value: object, limit: int) -> bool:
             return True
         stack.extend((child, depth + 1) for child in children)
     return False
-
-
-# A JSON string (its escapes read; an unterminated one runs to the end, as
-# json reads it) or one bracket: all ``_text_nests_deeper_than`` reads. The
-# unrolled loop cannot backtrack: its two parts never start on the same
-# character, and the closing quote is optional, so no match ever fails.
-_JSON_NESTING_TOKEN = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"?|[\[\]{}]', re.DOTALL)
-
-
-# node_apply.py carries a byte-identical copy of this and of the pattern above
-# -- it runs on the node, where nothing from magent is installed -- pinned by
-# tests/unit/test_node_apply.py: change them together.
-def _text_nests_deeper_than(text: str, limit: int) -> bool:
-    """True when the JSON ``text`` opens more than ``limit`` arrays/objects
-    inside one another, read before json.loads sees it. json.loads recurses
-    once per level, and what stops it far past the bound depends on the C
-    stack -- RecursionError on one runner, JSONDecodeError or a whole parse
-    on another -- so the refusal is this scan's, the same on every
-    interpreter and OS. A bracket inside a string is not nesting."""
-    depth = 0
-    for match in _JSON_NESTING_TOKEN.finditer(text):
-        token = match.group()
-        if token in ("[", "{"):
-            depth += 1
-            if depth > limit:
-                return True
-        elif token in ("]", "}"):
-            depth -= 1
-    return False
-
-
-def nests_too_deep(text: str) -> bool:
-    """``_text_nests_deeper_than`` at ``MAX_JSON_DEPTH``: what every reader of
-    node JSON -- the pull, the sample, the mirror's records, the node map,
-    the marks, the sessions and load files -- asks before json.loads, so each
-    refuses past the bound (saying ``TOO_DEEP`` where it says anything) the
-    same on every stack."""
-    return _text_nests_deeper_than(text, MAX_JSON_DEPTH)
 
 
 def _is_local_state_hook(hook: object) -> bool:

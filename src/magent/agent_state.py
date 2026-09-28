@@ -7,8 +7,8 @@ events (Claude Code via hooks, Codex via its ``notify`` program, ...) writes
 here; the session picker reads here. That keeps status detection out of the
 terminal (no scraping) and uniform across agent types.
 
-Deliberately dependency-light (stdlib only) so the hook handler that imports it
-adds negligible latency to every turn.
+Deliberately dependency-light (stdlib, plus the stdlib-only json_depth leaf) so
+the hook handler that imports it adds negligible latency to every turn.
 """
 
 from __future__ import annotations
@@ -20,6 +20,8 @@ import os
 import sys
 import time
 from pathlib import Path
+
+from magent.json_depth import TOO_DEEP, nests_too_deep
 
 STATE_DIR = Path.home() / ".magent" / "state"
 
@@ -188,7 +190,7 @@ def _warn_bad_record(path: Path, why: str) -> None:
 def read_store(root: Path, *, strict: bool = False) -> list[dict[str, object]]:
     """Every readable record in the store at ``root`` -- this PC's, or a node
     session's mirror under ``~/.magent/nodes``. Corrupt, non-object and
-    too deeply nested (``nodes.MAX_JSON_DEPTH``) files are skipped and named
+    too deeply nested (``json_depth.MAX_JSON_DEPTH``) files are skipped and named
     once (``_warn_bad_record``). Never sweeps: a mirror
     is the node's to age, and a record deleted here would come back on the
     next pull. A missing or unreadable directory is an empty store (unreadable
@@ -224,9 +226,6 @@ def read_store(root: Path, *, strict: bool = False) -> list[dict[str, object]]:
                 "agent-state: %s is unreadable (%s)", root, exc
             )
         return records
-    # lazy: the hook imports this module on every turn (see the docstring).
-    from magent.nodes import TOO_DEEP, nests_too_deep
-
     for p in paths:
         try:
             text = p.read_text(encoding="utf-8")

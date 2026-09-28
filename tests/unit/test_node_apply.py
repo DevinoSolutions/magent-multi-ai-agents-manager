@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from magent import node_scripts, nodes, remote_mux
+from magent import json_depth, node_scripts, nodes, remote_mux
 from magent.node_scripts import node_apply
 from magent.nodes import SkillFile, UserScope
 from tests.unit._fake_ssh import FakeSsh, make_fake_ssh
@@ -141,18 +141,20 @@ class TestTheApplierIsShippable:
     def test_it_reads_the_manifest_version_the_payload_writes(self):
         assert node_apply.MANIFEST_VERSION == remote_mux.PAYLOAD_VERSION
 
-    # nodes owns the bound and the scan; nothing from magent is installed on
-    # the node, so this module carries copies -- the same bytes, the same
-    # wording nodes' reader gives.
+    # json_depth owns the bound and the scan; nothing from magent is installed
+    # on the node, so this module carries copies -- the same bytes, the same
+    # wording the PC's readers give.
     def test_it_refuses_nesting_by_the_pcs_bound_and_scan(self):
-        assert node_apply.MAX_JSON_DEPTH == nodes.MAX_JSON_DEPTH
+        assert node_apply.MAX_JSON_DEPTH == json_depth.MAX_JSON_DEPTH
         assert inspect.getsource(node_apply._text_nests_deeper_than) == (
-            inspect.getsource(nodes._text_nests_deeper_than)
+            inspect.getsource(json_depth._text_nests_deeper_than)
         )
         assert node_apply._JSON_NESTING_TOKEN.pattern == (
-            nodes._JSON_NESTING_TOKEN.pattern
+            json_depth._JSON_NESTING_TOKEN.pattern
         )
-        assert node_apply._JSON_NESTING_TOKEN.flags == nodes._JSON_NESTING_TOKEN.flags
+        assert node_apply._JSON_NESTING_TOKEN.flags == (
+            json_depth._JSON_NESTING_TOKEN.flags
+        )
         # The literal test_node_provision pins for nodes' reader.
         assert node_apply._TOO_DEEP == TOO_DEEP
 

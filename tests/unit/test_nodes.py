@@ -232,23 +232,6 @@ class TestTheNodeMap:
         node_map.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
         assert nodes.read_node_map() == {}
 
-
-class TestEveryNodeJsonReaderSharesOneBound:
-    def test_the_bound_and_its_words(self):
-        assert nodes.MAX_JSON_DEPTH == 64
-        assert nodes.TOO_DEEP == "nested deeper than 64 levels"
-
-    @pytest.mark.parametrize(
-        ("text", "deeper"),
-        [
-            pytest.param("[" * 64 + "]" * 64, False, id="64"),
-            pytest.param("[" * 65 + "]" * 65, True, id="65"),
-            pytest.param('["' + "[" * 100, False, id="unclosed-string"),
-        ],
-    )
-    def test_nests_too_deep_is_the_scan_at_the_bound(self, text, deeper):
-        assert nodes.nests_too_deep(text) is deeper
-
     @pytest.mark.parametrize(
         "bad",
         [

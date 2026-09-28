@@ -37,7 +37,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from magent import nodes, remote_mux
+from magent import json_depth, nodes, remote_mux
 from magent.attach_client import SSH_TRANSPORT_RC
 from magent.config import load_config, runs_on_node
 from magent.env import local_username
@@ -455,7 +455,7 @@ def _read_marks(nick: str) -> dict[str, Mark]:
     try:
         text = nodes.pull_marks_path(nick).read_text(encoding="utf-8")
         # Nested past the bound is no marks, refused before json parses it.
-        raw = None if nodes.nests_too_deep(text) else json.loads(text)
+        raw = None if json_depth.nests_too_deep(text) else json.loads(text)
     # RecursionError: the backstop for any nesting the scan did not refuse --
     # a corrupt file like any other, never an internal error (which logs at
     # ERROR, to Sentry).
@@ -538,7 +538,7 @@ def _row_ts(line: str) -> float | None:
     """A load.jsonl row's ts, or None for a line that is not a row."""
     try:
         # Nested past the bound is no row, refused before json parses it.
-        row = None if nodes.nests_too_deep(line) else json.loads(line)
+        row = None if json_depth.nests_too_deep(line) else json.loads(line)
     # RecursionError: the backstop for any nesting the scan did not refuse.
     except (ValueError, RecursionError):
         return None

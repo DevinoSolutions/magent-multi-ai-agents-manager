@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from magent import cli, log, node_scripts, nodes, remote_mux
+from magent import cli, json_depth, log, node_scripts, nodes, remote_mux
 from magent.cli import hooks_cmd
 from magent.config import MagentConfig
 from magent.node_scripts import node_apply
@@ -1159,14 +1159,14 @@ _PARSED_DEPTHS = [
 
 
 _SCANS = [
-    pytest.param(nodes._text_nests_deeper_than, id="nodes"),
+    pytest.param(json_depth._text_nests_deeper_than, id="json_depth"),
     pytest.param(node_apply._text_nests_deeper_than, id="node_apply"),
 ]
 
 
 class TestTheDepthScanReadsNestingNotText:
-    """The scan every node-JSON read runs before json parses (nodes', and
-    node_apply's pinned copy): only a bracket outside a string nests,
+    """The scan every node-JSON read runs before json parses (json_depth's,
+    and node_apply's pinned copy): only a bracket outside a string nests,
     exactly MAX_JSON_DEPTH levels still read, and size is never depth."""
 
     @pytest.mark.parametrize("scan", _SCANS)
@@ -1183,7 +1183,7 @@ class TestTheDepthScanReadsNestingNotText:
         ],
     )
     def test_it_counts_brackets_outside_strings(self, scan, text, deeper):
-        assert scan(text, nodes.MAX_JSON_DEPTH) is deeper
+        assert scan(text, json_depth.MAX_JSON_DEPTH) is deeper
 
     # Linear: a flat multi-MB array, and the inputs a backtracking string
     # pattern chokes on (a long run of escapes, an unclosed string of them).
@@ -1204,7 +1204,7 @@ class TestTheDepthScanReadsNestingNotText:
     def test_it_is_linear(self, scan, build):
         text = build()
         start = time.perf_counter()
-        assert scan(text, nodes.MAX_JSON_DEPTH) is False
+        assert scan(text, json_depth.MAX_JSON_DEPTH) is False
         # Generous, so it never flakes: tens of ms here.
         assert time.perf_counter() - start < 10.0
 
@@ -1212,7 +1212,8 @@ class TestTheDepthScanReadsNestingNotText:
     @pytest.mark.parametrize(("text", "deeper"), _PARSED_DEPTHS)
     def test_it_agrees_with_the_walk_of_what_json_parsed(self, text, deeper):
         assert (
-            nodes._nests_deeper_than(json.loads(text), nodes.MAX_JSON_DEPTH) is deeper
+            nodes._nests_deeper_than(json.loads(text), json_depth.MAX_JSON_DEPTH)
+            is deeper
         )
 
 
@@ -1361,7 +1362,7 @@ class TestAnUnreadablePcFileIsUnknownNotEmpty:
     def test_the_walk_still_refuses_what_the_scan_let_through(
         self, tmp_path, monkeypatch
     ):
-        monkeypatch.setattr(nodes, "_text_nests_deeper_than", lambda text, limit: False)
+        monkeypatch.setattr(nodes, "nests_too_deep", lambda text: False)
         path = tmp_path / "settings.json"
         path.write_text('{"a":' * 65 + "1" + "}" * 65, encoding="utf-8")
         assert nodes._read_object(path, "settings.json", []) == nodes._Unread(
@@ -1374,7 +1375,7 @@ class TestAnUnreadablePcFileIsUnknownNotEmpty:
         def loads(text: str) -> object:
             raise RecursionError("maximum recursion depth exceeded")
 
-        monkeypatch.setattr(nodes, "_text_nests_deeper_than", lambda text, limit: False)
+        monkeypatch.setattr(nodes, "nests_too_deep", lambda text: False)
         monkeypatch.setattr(nodes, "json", types.SimpleNamespace(loads=loads))
         path = tmp_path / "settings.json"
         path.write_text("[]", encoding="utf-8")

@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from magent import node_scripts, nodes, psmux
+from magent import json_depth, node_scripts, nodes, psmux
 
 # find_ssh is bound by value, not read off attach_client at call time: the
 # conftest guard answers None for attach_client.find_ssh, and this module's own
@@ -1620,8 +1620,8 @@ def sample(node: Node) -> LoadSample:
     text = result.stdout.decode("utf-8", "replace")
     # Refused before json parses it, the same on every stack: deep nesting
     # fits easily inside the reply cap.
-    if nodes.nests_too_deep(text):
-        raise _not_a_sample(node, result, nodes.TOO_DEEP)
+    if json_depth.nests_too_deep(text):
+        raise _not_a_sample(node, result, json_depth.TOO_DEEP)
     try:
         reading = _load_sample(json.loads(text))
     # OverflowError is an ArithmeticError, not a ValueError: float() of a
@@ -2073,7 +2073,7 @@ def parse_pull(stdout: bytes, *, dest: Path, sids: Collection[str]) -> NodeSnaps
     meta_line, _, archive = framed.partition(b"\n")
     try:
         text = meta_line.decode("utf-8")
-        too_deep = nodes.nests_too_deep(text)
+        too_deep = json_depth.nests_too_deep(text)
         meta = None if too_deep else json.loads(text)
     # RecursionError: the backstop for any nesting the scan did not refuse.
     # The node's bad answer, not a bug on this PC.
@@ -2085,9 +2085,9 @@ def parse_pull(stdout: bytes, *, dest: Path, sids: Collection[str]) -> NodeSnaps
         # Refused before json parses it (200k '[' fit well inside the reply
         # cap), in the same words on every stack.
         get_logger("nodes").warning(
-            "node pull: unreadable pull metadata: %s", nodes.TOO_DEEP
+            "node pull: unreadable pull metadata: %s", json_depth.TOO_DEEP
         )
-        raise _pull_error(f"unreadable pull metadata ({nodes.TOO_DEEP})")
+        raise _pull_error(f"unreadable pull metadata ({json_depth.TOO_DEEP})")
     if not isinstance(meta, dict):
         raise _pull_error("pull metadata is not an object")
     # json.loads accepts NaN and Infinity (a NaN watermark, which
