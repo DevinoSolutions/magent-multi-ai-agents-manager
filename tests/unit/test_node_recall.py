@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import os
+import re
 import shlex
 import shutil
 import struct
@@ -1069,17 +1070,70 @@ class TestTheInstallNeverOverwritesTheNodesWork:
 # shadows the builtin right after its strict-mode line.
 _STRICT = b"\nset -euo pipefail\n"
 _UMASK_IGNORED = b"umask() { builtin umask 000; }; builtin umask 000\n"
+# Every way a script could slip that shadow: the builtin reached directly,
+# the shadow unset, or the builtin disabled.
+_UMASK_BYPASS = re.compile(
+    rb"\b(?:builtin|command)\s+umask\b"
+    rb"|\bunset\s+(?:-f\s+)?umask\b"
+    rb"|\benable\s+-n\s+umask\b"
+)
+# The frame's own sentinel line. lib.sh names the sentinel too, but never on
+# a line of its own.
+_SENTINEL_LINE = b"\n" + remote_mux.PAYLOAD_SENTINEL.encode("ascii") + b"\n"
 
 
 def _as_if_under_a_default_acl(
     call: tuple[list[str], bytes],
 ) -> tuple[list[str], bytes]:
     argv, stdin = call
-    # A script that called the builtin directly would slip the shadow, and
-    # every pin below would pass for the wrong reason.
-    assert b"builtin umask" not in stdin
-    assert _STRICT in stdin
+    # A script that slipped the shadow would keep its own umask, and every
+    # pin below would pass for the wrong reason. Only the script half is
+    # read: past the sentinel line is the tar, bytes rather than bash.
+    script, framed, _ = stdin.partition(_SENTINEL_LINE)
+    assert framed, "no payload sentinel line"
+    assert _UMASK_BYPASS.search(script) is None, _UMASK_BYPASS.search(script)
+    assert _STRICT in script
     return argv, stdin.replace(_STRICT, _STRICT + _UMASK_IGNORED, 1)
+
+
+class TestTheDefaultAclModelCannotBeSlipped:
+    """The model stands for a default ACL only while every umask call the
+    script makes is the shadow's. These run everywhere: a script that could
+    slip it fails here even where bash never runs."""
+
+    def test_the_shipped_script_is_modelled(self, monkeypatch):
+        _, stdin = _as_if_under_a_default_acl(
+            _node_call(
+                monkeypatch, "install_transcripts", [_ENCODED], _open_modes_tar()
+            )
+        )
+
+        assert stdin.count(_UMASK_IGNORED) == 1
+
+    @pytest.mark.parametrize(
+        "slip",
+        [
+            b"builtin umask 077",
+            b"command umask 077",
+            b"unset -f umask",
+            b"unset umask",
+            b"enable -n umask",
+        ],
+    )
+    def test_a_script_that_could_slip_the_shadow_is_refused(self, slip):
+        stdin = b"#!/usr/bin/env bash" + _STRICT + slip + _SENTINEL_LINE + b"tar"
+
+        with pytest.raises(AssertionError):
+            _as_if_under_a_default_acl((["bash"], stdin))
+
+    def test_the_payload_is_not_read_as_bash(self):
+        # Any bytes may follow the sentinel line: a tar is data.
+        script = b"#!/usr/bin/env bash" + _STRICT + b"umask 077"
+        stdin = script + _SENTINEL_LINE + b"command umask 077"
+
+        _, modelled = _as_if_under_a_default_acl((["bash"], stdin))
+
+        assert modelled.count(_UMASK_IGNORED) == 1
 
 
 # What a Windows PC's _tar_dir sent before its owner-only filter, and what an
