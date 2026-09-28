@@ -492,6 +492,9 @@ time.sleep(90)
 
 # A child that leaves that grandchild behind, waits for its pid file (so the
 # teardown never finds it missing), says argv[2] on stderr, then floods stdout.
+# When the reader stops at the cap the child leaves WITHOUT a word: Python's
+# BrokenPipeError traceback would land on stderr after argv[2], racing the
+# kill, and glue itself to a half-written last line.
 _HELD_STDERR_CHILD = (
     f"GRANDCHILD = {_HELD_STDERR_GRANDCHILD!r}\n"
     """\
@@ -508,9 +511,12 @@ while not os.path.exists(sys.argv[1]) and time.monotonic() < deadline:
 sys.stderr.write(sys.argv[2])
 sys.stderr.flush()
 block = b"x" * 65536
-while True:
-    sys.stdout.buffer.write(block)
-    sys.stdout.flush()
+try:
+    while True:
+        sys.stdout.buffer.write(block)
+        sys.stdout.flush()
+except OSError:
+    os._exit(1)
 """
 )
 
@@ -661,6 +667,23 @@ class TestTheReplyIsBoundedInMemory:
         error, _ = self._flood_past_a_held_stderr(tmp_path)
         assert "boom: disk full" in error.stderr_tail.splitlines()[1:]
 
+    @pytest.fixture(params=["as-it-comes", "pipe-closed-first"])
+    def kill_order(self, request, monkeypatch):
+        """What the child meets first after the cap: the kill (usually) or
+        the pipe the reader closed. ``pipe-closed-first`` holds the kill back,
+        so the child always writes into the closed pipe first -- the order a
+        loaded box produced, where the child's words must still be just what
+        it said."""
+        if request.param == "pipe-closed-first":
+            kill = remote_mux._kill
+
+            def late_kill(proc: subprocess.Popen[bytes]) -> None:
+                time.sleep(1.5)
+                kill(proc)
+
+            monkeypatch.setattr(remote_mux, "_kill", late_kill)
+
+    @pytest.mark.usefixtures("kill_order")
     def test_a_stderr_held_open_mid_line_never_hands_over_the_fragment(self, tmp_path):
         # The stream is still open, so its last line may be half-written: only
         # whole lines are the child's words, and the row shows the last one.
@@ -673,6 +696,7 @@ class TestTheReplyIsBoundedInMemory:
         assert "writing blo" not in error.stderr_tail
         assert launch._node_error_text(error) == "boom: disk full"
 
+    @pytest.mark.usefixtures("kill_order")
     def test_a_stderr_held_open_before_a_whole_line_gives_no_reason(self, tmp_path):
         # No line has ended yet: the cap is the whole story, never a fragment.
         error, _ = self._flood_past_a_held_stderr(tmp_path, said="writing blo")
