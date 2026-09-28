@@ -1855,11 +1855,12 @@ copy changed is named, because it may be work this PC had.
 
 **Not yet measured (plan G Task 16, a user-run probe):** whether
 `claude --resume <id>` resumes a conversation installed under another
-folder's name. Until it is measured, `recall --local` prints the exact
-command, `claude --resume <id>`, and under it a `resume by hand` line: run
-`claude --resume` in the project's folder and pick the conversation from
-the list. `recall --to` starts the moved session on the new node with
-`claude --resume <id>`.
+folder's name. Until it is measured, when the conversation's id is known,
+`recall --local` prints the exact command, `claude --resume <id>`, and
+under it a `resume by hand` line: run `claude --resume` in the project's
+folder and pick the conversation from the list; with no id it prints plain
+`claude`. `recall --to` starts the moved session on the new node with
+`claude --resume <id>`, or fresh when no conversation was pulled.
 
 ## 3. Known debt
 
