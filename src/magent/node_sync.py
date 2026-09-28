@@ -1127,7 +1127,9 @@ class PullUnfinished(remote_mux.RemoteError):
     ``stuck`` says the last cut reply did not move the mark forward (or moved
     it back): asked again from that mark, the node answers the same, so
     another run alone brings home nothing more either -- only a reply the
-    deadline cut short (``stuck`` False) is helped by one."""
+    deadline cut short (``stuck`` False) is helped by one. ``final_pull``
+    logs a stuck pull's two marks to nodes.log at WARNING, for a caller to
+    point at."""
 
     def __init__(self, why: str, *, not_stored: bool, stuck: bool = False) -> None:
         super().__init__(0, f"the pull did not finish: {why}", ("pull.sh",))
@@ -1253,6 +1255,20 @@ def final_pull(
             why = "and moved its mark back"
         else:
             why = "without moving its mark"
+        if stuck:
+            # What no screen line carries: the mark asked from and the one
+            # answered, to tell a node's clock from a node stuck on one file.
+            get_logger(LOG_NAME).warning(
+                (
+                    "node %s: final pull of %r reached the pull cap %s: asked from"
+                    " mark %r, the node answered %r"
+                ),
+                entry.nick,
+                entry.sid,
+                why,
+                asked.since if asked is not None else None,
+                mark.since,
+            )
         owed = len(snap.truncated[entry.sid])
         raise PullUnfinished(
             f"{owed} file(s) did not fit in the reply and are still on the node"

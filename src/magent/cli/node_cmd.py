@@ -929,16 +929,20 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
         # cq-G14 m2: a stop that can recur names its way out -- m-R3-2: the
         # reason once, and only the way out that applies. remote_mux logs the
         # file it could not store (to node_sync's log); the message can't.
+        node_log = log.LOG_DIR / f"{node_sync.LOG_NAME}.log"
         if exc.not_stored:
-            stored_log = log.LOG_DIR / f"{node_sync.LOG_NAME}.log"
             remedy = (
-                f"\n    A file this PC could not store is named in {stored_log}:"
+                f"\n    A file this PC could not store is named in {node_log}:"
                 " close what holds it open, or free disk space, first."
             )
         elif exc.stuck:
             # Asked again from this mark the node answers the same: no run
-            # alone gets further, so no remedy is promised (cq-G14-r3).
-            remedy = ""
+            # alone gets further, so none is promised (cq-G14-r3) -- only where
+            # final_pull logged the two marks.
+            remedy = (
+                "\n    The mark the node was asked from and the one it answered"
+                f" are in {node_log}."
+            )
         else:
             remedy = "\n    A reply that ran out of room needs only another run."
         _fail(

@@ -2250,10 +2250,12 @@ class TestTheLastPullMustFinish:
         ) in result.stderr
         # m-R3-2: only the remedy that applies -- another run alone won't do.
         assert "ran out of room" not in result.stderr
+        assert _marks_line() not in result.stderr
 
     def test_files_the_reply_had_no_room_for_stop_the_recall(
-        self, runner, placed_api, node_answers, node_replies, api_repo
+        self, runner, placed_api, node_answers, node_replies, api_repo, caplog
     ):
+        caplog.set_level(logging.WARNING, logger="magent.nodes")
         node_replies(
             truncated={"api": ("api/transcripts/big.jsonl",)}, resume={"api": NOW}
         )
@@ -2271,6 +2273,10 @@ class TestTheLastPullMustFinish:
         # cq-G14-r3: the mark did not move, so a re-run is asked from the
         # same mark and answered the same -- no remedy is promised.
         assert "ran out of room" not in result.stderr
+        assert "another run" not in result.stderr
+        # Round-2 ruling: where to look instead -- final_pull logged both marks.
+        assert _marks_line() in result.stderr
+        assert any("asked from mark" in m for m in _node_logs(caplog))
         # m-R3-2: only the remedy that applies -- nothing here to close or free.
         assert "could not store" not in result.stderr
         assert "free disk space" not in result.stderr
@@ -2313,6 +2319,10 @@ class TestTheLastPullMustFinish:
         assert (
             "A reply that ran out of room needs only another run." in result.stderr
         ) is promised
+        # Round-2 ruling: a stuck pull names nodes.log, where its marks are,
+        # and never says another run would do.
+        assert ("another run" in result.stderr) is promised
+        assert (_marks_line() in result.stderr) is stuck
 
     def test_the_rerun_asks_again_from_the_first_owed_file_and_only_then_clears(
         self, runner, placed_api, node_answers, monkeypatch, api_repo
@@ -3455,6 +3465,14 @@ def moving(monkeypatch, api_repo, sync_starts):
     monkeypatch.setattr(remote_mux, "install_transcripts", _install)
     monkeypatch.setattr(launch, "bring_up_node_project", _bring_up)
     return events, state
+
+
+def _marks_line() -> str:
+    """A stuck last pull's remedy: where final_pull logged both marks."""
+    return (
+        "The mark the node was asked from and the one it answered are in"
+        f" {log.LOG_DIR / f'{node_sync.LOG_NAME}.log'}."
+    )
 
 
 def _invoke_recall_to(runner, cfg: str, nick: str):

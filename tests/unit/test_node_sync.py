@@ -3128,11 +3128,12 @@ class TestAFinalPullThatDidNotFinish:
         assert result.since == 5000.0 - remote_mux.WATERMARK_OVERLAP_S
 
     def test_a_resume_that_stops_moving_the_mark_raises_on_that_call(
-        self, placed, monkeypatch
+        self, placed, monkeypatch, caplog
     ):
         """The first cut reply moves the mark, the second names no resume
         point and does not: asking a third time would get the same reply, so
         the pull is asked for exactly twice, with plenty of deadline left."""
+        _capture_nodes_log(caplog)
         _seed_marks(api=(10.0, _REAL))
         asked = _scripted_pull(
             monkeypatch,
@@ -3152,13 +3153,21 @@ class TestAFinalPullThatDidNotFinish:
         assert _marks() == {
             "api": {"since": math.nextafter(500.0, -math.inf), "realpath": _REAL}
         }
+        # Round-2 ruling: both marks in nodes.log, where the recall points.
+        mark = math.nextafter(500.0, -math.inf)
+        assert any(
+            "without moving its mark" in w
+            and f"asked from mark {mark!r}, the node answered {mark!r}" in w
+            for w in _warnings(caplog)
+        ), _warnings(caplog)
 
     def test_a_resume_that_moves_the_mark_back_says_so_and_stops(
-        self, placed, monkeypatch
+        self, placed, monkeypatch, caplog
     ):
         """A node whose clock went back behind the mark resets it to 0.0
         (``remote_mux.next_since``): that stops the loop like a mark that did
         not move, and the error says which of the two it was."""
+        _capture_nodes_log(caplog)
         _seed_marks(api=(10.0, _REAL))
         clock_back = _snapshot(
             now=100.0,
@@ -3177,13 +3186,20 @@ class TestAFinalPullThatDidNotFinish:
         assert info.value.not_stored is False
         assert info.value.stuck is True
         assert len(asked) == 2
+        asked_from = math.nextafter(500.0, -math.inf)
+        assert any(
+            "and moved its mark back" in w
+            and f"asked from mark {asked_from!r}, the node answered 0.0" in w
+            for w in _warnings(caplog)
+        ), _warnings(caplog)
 
     def test_a_reply_still_cut_at_the_deadline_raises_with_the_mark_at_its_resume(
-        self, placed, monkeypatch
+        self, placed, monkeypatch, caplog
     ):
         """``wait_s`` bounds the resuming too: every pull here takes 60 s of
         a 100 s budget, so the second cut reply is the last one asked for.
         The mark it leaves resumes where that reply stopped."""
+        _capture_nodes_log(caplog)
         _seed_marks(api=(10.0, _REAL))
         clock = _Clock()
         asked = _scripted_pull(
@@ -3197,6 +3213,8 @@ class TestAFinalPullThatDidNotFinish:
         # Cut by the deadline, not stuck: another run carries on from here.
         assert info.value.stuck is False
         assert len(asked) == 2
+        # The marks moved: nothing for nodes.log to explain.
+        assert not any("asked from mark" in w for w in _warnings(caplog))
         assert _marks() == {
             "api": {"since": math.nextafter(800.0, -math.inf), "realpath": _REAL}
         }
