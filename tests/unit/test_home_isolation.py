@@ -112,6 +112,29 @@ class TestAForgottenConfigFlagStaysInTmp:
             assert not found.is_relative_to(REAL_APPDATA), found
 
 
+# LOCALAPPDATA as this process inherited it, read at collection: before any
+# fixture runs, so it is the value the redirect deliberately leaves alone.
+_INHERITED_LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="LOCALAPPDATA is Windows-only")
+class TestLocalAppDataStaysInherited:
+    """The one AppData variable the redirect must NOT move.
+
+    ``psmux.find_psmux`` falls back to ``%LOCALAPPDATA%\\psmux\\psmux.exe``,
+    where the psmux release zip installs, so a dev box whose psmux is not on
+    PATH finds its real install through this variable. The tmp home's own
+    ``AppData\\Local`` exists for the Win32 known-folder lookup, which never
+    reads it. CI puts psmux on PATH, so no other test notices a redirect of
+    LOCALAPPDATA: this is the pin that does.
+    """
+
+    def test_localappdata_is_the_inherited_one(self):
+        resolved = env.localappdata_dir()
+        assert resolved == Path(_INHERITED_LOCALAPPDATA)
+        assert not resolved.is_relative_to(Path.home()), resolved
+
+
 # What a POSIX login (or a CI runner) typically exports: the real home's own
 # config dir. Moving HOME does not move an explicit XDG_CONFIG_HOME.
 _REAL_LOOKING_XDG_CONFIG_HOME = REAL_HOME / ".config"
