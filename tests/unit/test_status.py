@@ -2099,6 +2099,28 @@ class TestANodeMapTheSyncCannotReadIsShownAsSyncPaused:
             {"name": "api", "session": "api", "node": "second", "state": "live"}
         ]
 
+    def test_a_malformed_map_under_a_live_daemon_is_paused_and_exits_3(
+        self, runner, tmp_config, tmp_path
+    ):
+        # The case the pause is for: the daemon is up and heartbeating --
+        # node_sync reads ok -- and pulls nothing. Its heartbeat must not hide
+        # the pause.
+        from magent import log, node_sync
+
+        cfgpath = self._config(tmp_config, tmp_path)
+        self._malformed()
+        log.write_heartbeat(node_sync.HEARTBEAT_NAME)
+
+        result = self._status(runner, cfgpath)
+        as_json = self._status(runner, cfgpath, "--json")
+
+        assert result.exit_code == 3, result.output
+        assert "node sync paused" in result.stdout
+        assert as_json.exit_code == 3, as_json.output
+        payload = json.loads(as_json.stdout)
+        assert payload["node_sync"] == "ok"
+        assert payload["node_sync_paused"] == {"error": "ValueError", "entry": "api"}
+
     @pytest.mark.parametrize(
         ("damage", "paused"),
         [
