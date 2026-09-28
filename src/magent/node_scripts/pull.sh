@@ -117,7 +117,10 @@ def state_records():
                 continue
             with fh:
                 rec = json.loads(fh.read(STATE_MAX_BYTES + 1).decode("utf-8"))
-        except (OSError, ValueError):
+        # RecursionError: a record nested past what json recurses through
+        # fits well inside the size cap. One bad record is skipped like a torn
+        # one; raised, it would end every pull of this node until removed.
+        except (OSError, ValueError, RecursionError):
             continue
         cwd = rec.get("cwd") if isinstance(rec, dict) else None
         if isinstance(cwd, str):

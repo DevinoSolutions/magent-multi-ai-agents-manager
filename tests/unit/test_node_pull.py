@@ -1476,6 +1476,23 @@ class TestPullShOnARealBash:
         assert snap.state_files == {"api": ("ok.json",)}
         assert _stored(tmp_path / "pc") == ["api/state/ok.json"]
 
+    def test_a_record_nested_too_deeply_to_parse_is_skipped_not_fatal(self, tmp_path):
+        # Under the size cap, and deeper than a node python before 3.14
+        # recurses through: RecursionError, not a ValueError (measured on
+        # 3.12 at 8 MB, 16 MB and unlimited stacks; 3.14 reads to the end, a
+        # ValueError). Anything running as the node user can write one; it
+        # must not end every pull of the node.
+        real, pdir, _ = self._project(tmp_path)
+        state = tmp_path / "node" / ".magent" / "state"
+        state.mkdir(parents=True)
+        (state / "deep.json").write_text("[" * 65_000, encoding="utf-8")
+        (state / "ok.json").write_text(
+            json.dumps({"state": "working", "ts": 1, "cwd": real}), encoding="utf-8"
+        )
+        snap = self._pull(tmp_path, pdir)  # asserts pull.sh exited 0
+        assert snap.state_files == {"api": ("ok.json",)}
+        assert _stored(tmp_path / "pc") == ["api/state/ok.json"]
+
     def test_only_regular_transcript_files_ship(self, tmp_path):
         _, pdir, proj = self._project(tmp_path)
         secret = tmp_path / "node" / "secret"
