@@ -535,7 +535,14 @@ class TestRunOnDesktopOnWindows:
         # One directory per call, deleted on success -- so a machine that hands
         # off all day does not accumulate a launcher script per bring-up.
         for _ in range(3):
-            self._plat().run_on_desktop([sys.executable, "-c", "pass"], timeout_s=60)
+            result = self._plat().run_on_desktop(
+                [sys.executable, "-c", "pass"], timeout_s=60
+            )
+            # Every call must have SUCCEEDED for "no growth" to mean anything:
+            # a failed hand-off keeps its directory on purpose, so a harness
+            # stall (the fake schtasks timing out under load) fails here, as
+            # the failure it is, instead of below as "the root grew".
+            assert result.rc == 0, result.detail
 
         assert list(_scratch_root(fake_schtasks).iterdir()) == []
 
