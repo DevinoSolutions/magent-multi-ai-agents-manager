@@ -6203,6 +6203,46 @@ class TestSetupShUnderRealBash:
         assert b"Operation not permitted" not in r.stdout + r.stderr
         assert r.returncode == 0, r.stderr
 
+    def test_a_repair_is_reported_even_when_the_derive_then_fails(self, tmp_path):
+        # The chmod has already run, and the next run reads 0600: this row is
+        # the only one that can say the key was open.
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        key = state / "home" / "amin" / ".ssh" / "id_ed25519"
+        key.chmod(0o644)
+        (key.parent / "id_ed25519.pub").unlink()
+        (state / "keygen-y-fail").touch()
+        r = _run_setup(env)
+        assert self._row(r, "node-key:amin") == (
+            "fail",
+            (
+                f'ssh-keygen -y: Load key "{key}": invalid format;'
+                " id_ed25519 made owner-only: it was 0644, now 0600"
+            ),
+        )
+        assert key.stat().st_mode & 0o777 == 0o600
+        assert set(_report(r).keys()) == set()
+        assert r.returncode == 1
+
+    def test_a_repair_is_reported_even_when_ssh_keygen_is_missing(self, tmp_path):
+        state, env = _setup_box(tmp_path, without=("ssh-keygen",))
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        key = ssh_dir / "id_ed25519"
+        key.write_bytes(b"FAKE PRIVATE KEY x\n")
+        key.chmod(0o644)
+        r = _run_setup(env)
+        assert self._row(r, "node-key:amin") == (
+            "fail",
+            (
+                "ssh-keygen is not installed (Debian/Ubuntu package openssh-client);"
+                " id_ed25519 made owner-only: it was 0644, now 0600"
+            ),
+        )
+        assert key.stat().st_mode & 0o777 == 0o600
+        assert set(_report(r).keys()) == set()
+        assert r.returncode == 1
+
     @pytest.mark.parametrize(
         ("existing", "detail"),
         [
