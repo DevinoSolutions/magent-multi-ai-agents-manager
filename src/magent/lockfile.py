@@ -120,7 +120,7 @@ def _still_named(path: Path, fh: IO[str]) -> bool:
     """True when ``path`` still names the file ``fh`` has open. A path that
     is gone (ENOENT) names nothing: False."""
     try:
-        return os.stat(path).st_ino == os.fstat(fh.fileno()).st_ino
+        return os.path.samestat(os.stat(path), os.fstat(fh.fileno()))
     except FileNotFoundError:
         return False
 
