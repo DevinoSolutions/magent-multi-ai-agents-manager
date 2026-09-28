@@ -668,12 +668,15 @@ def decoration_args(sid: str, nick: str, code_hint: bool) -> list[list[str]]:
     """The ten decoration commands of a node session: the SAME vocabulary as
     ``psmux.decoration_argv`` (status hints, the F1/F2 bindings, the window
     name rule), with the brand naming the node. One server hosts every node
-    session, so the per-session options are scoped with ``-t =sid`` (and the
-    window ones with ``=sid:``) rather than ``-g``, where psmux's
-    server-per-session model allows a global."""
+    session, so the options are scoped with ``-t =sid:`` rather than ``-g``,
+    where psmux's server-per-session model allows a global. The colon is
+    load-bearing: ``set``/``setw``/``rename-window`` take a PANE or WINDOW
+    target, where a bare ``=sid`` is no session ("no such session: =sid") --
+    ``=sid:`` is the exact session and its current window. Only session-target
+    commands (``has-session``, ``kill-session``, ``attach``) take ``=sid``."""
     hints, hints_len = psmux.status_hints(code_hint)
     brand, brand_len = psmux.status_left(nick)
-    target, window = f"={sid}", f"={sid}:"
+    target = f"={sid}:"
     fmt = psmux.WINDOW_STATUS_FORMAT
     return [
         tmux_argv("bind", "-n", "F1", "detach-client"),
@@ -682,10 +685,10 @@ def decoration_args(sid: str, nick: str, code_hint: bool) -> list[list[str]]:
         tmux_argv("set", "-t", target, "status-left", brand),
         tmux_argv("set", "-t", target, "status-left-length", brand_len),
         psmux.f2_binding_argv(tmux_argv(), code_hint),
-        tmux_argv("rename-window", "-t", window, psmux.window_display_name(sid)),
-        tmux_argv("setw", "-t", window, "automatic-rename", "off"),
-        tmux_argv("setw", "-t", window, "window-status-format", fmt),
-        tmux_argv("setw", "-t", window, "window-status-current-format", fmt),
+        tmux_argv("rename-window", "-t", target, psmux.window_display_name(sid)),
+        tmux_argv("setw", "-t", target, "automatic-rename", "off"),
+        tmux_argv("setw", "-t", target, "window-status-format", fmt),
+        tmux_argv("setw", "-t", target, "window-status-current-format", fmt),
     ]
 
 

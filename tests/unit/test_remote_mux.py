@@ -1623,10 +1623,13 @@ class TestANodeSessionIsDecoratedLikeALocalOne:
         assert node[5][3:] == local[5][3:]
         brand, brand_len = psmux.status_left("second")
         hints, hints_len = psmux.status_hints(code_hint)
-        assert node[1][3:] == ["set", "-t", "=api", "status-right", hints]
-        assert node[2][3:] == ["set", "-t", "=api", "status-right-length", hints_len]
-        assert node[3][3:] == ["set", "-t", "=api", "status-left", brand]
-        assert node[4][3:] == ["set", "-t", "=api", "status-left-length", brand_len]
+        # `set -t` takes a PANE target: a bare `=api` is read as a pane and
+        # fails ("no such session: =api"), and the script's `|| true` hid
+        # it. `=api:` is the exact session, and its current pane.
+        assert node[1][3:] == ["set", "-t", "=api:", "status-right", hints]
+        assert node[2][3:] == ["set", "-t", "=api:", "status-right-length", hints_len]
+        assert node[3][3:] == ["set", "-t", "=api:", "status-left", brand]
+        assert node[4][3:] == ["set", "-t", "=api:", "status-left-length", brand_len]
         assert node[6][3:] == [
             "rename-window",
             "-t",
@@ -3204,10 +3207,10 @@ class TestBringUpShOnARealShell:
         remote_mux.bring_up(rig["node"], rig["recipe"])
         log = self._log(rig)
         assert (
-            "-L magent set -t =api status-left #[bold,fg=green] magent #[default]@second"
+            "-L magent set -t =api: status-left #[bold,fg=green] magent #[default]@second"
             in log
         )
-        assert "-L magent set -t =api status-left-length 18" in log
+        assert "-L magent set -t =api: status-left-length 18" in log
 
     def test_an_encoded_name_outside_the_alphabet_is_exit_2(self, rig):
         with pytest.raises(RemoteError) as info:
