@@ -448,8 +448,9 @@ class TestANodeHostsAProjectEndToEnd:
         run = rig.magent("--go", "--dry-run", tag="go-dry-run")
         if run.rc == 2 and "No monitors detected" in run.said:
             # A headless runner has no monitor to plan a grid on, and the
-            # preview stops there -- before the node rows. Ledger: the node
-            # half of --go --dry-run is unproven off a desktop.
+            # preview stops there -- before the node rows. DESIGN.md known
+            # debt: "The node launch preview is not exercised on a headless
+            # runner".
             _emit_ci_warning(
                 capsys,
                 "nodes-e2e: --go --dry-run not exercised",

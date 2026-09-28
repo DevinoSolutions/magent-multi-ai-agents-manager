@@ -2030,6 +2030,27 @@ reporting a false exit 4 on it; and `magent peek` died with `UnicodeEncodeError`
 whenever stdout was redirected on Windows, because a pane carries the AGENT's
 glyphs and a redirected stdout is cp1252.
 
+**The node launch preview is not exercised on a headless runner
+(2026-09-27):** the nodes e2e tier (`tests/e2e/test_nodes_real.py`, marker
+`nodes_real`, the non-required `nodes-e2e` ubuntu job, gated on
+`MDTEST_NODES_REAL=1`) drives the real CLI against a real loopback node for the
+whole journey except its D6 step, which is a loud `::warning` skip there. D6
+runs `magent --go --dry-run` and expects the node project's `@<nick>` row with
+nothing created on the node. But `run_magent` plans the monitor grid before it
+reads any project, and a runner with no X display has no monitor for
+`xrandr --query` to report, so the preview exits 2 at "No monitors detected"
+before the first node row. The preview itself is pinned in the unit tier:
+`tests/unit/test_launch_nodes.py`'s `--dry-run` tests run it on a
+`FakePlatform` that has a monitor, and
+`test_dry_run_names_the_target_folder_and_touches_nothing` makes every
+`subprocess` call raise and asserts no node map is written, so a node preview
+that reached for ssh or git fails there. What the skip leaves
+unproven is only the installed entry point's own rendering of those rows and
+the on-node "created nothing" check. The likely closure is to run the job
+under `.github/actions/setup-virtual-displays`, the Xvfb screen the platform
+and end-to-end legs already use; untried. Until then the skip stays loud, never
+a green pass.
+
 **Ten findings carried open into the next audit cycle** (deliberately
 triaged out of the fix pass that produced this document, not overlooked):
 
