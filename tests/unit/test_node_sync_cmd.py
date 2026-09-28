@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
+from click.testing import CliRunner
 
 from magent import cli, log, node_sync, nodes
 from magent.cli import node_cmd
@@ -151,6 +152,27 @@ class TestNodeSync:
         assert result.exit_code == 1, result.output
         assert "@second  unreachable" in result.stdout
         assert "@third  ok" in result.stdout
+
+    @pytest.mark.parametrize("charset", ["utf-8", "cp1252"])
+    def test_once_prints_a_detail_as_one_printable_ascii_row(
+        self, pool_config, monkeypatch, charset
+    ):
+        # A detail can carry a node's own words: a control character (ESC
+        # opens a terminal sequence) and non-ASCII that a cp1252 console
+        # cannot encode ("→" is not in cp1252: a UnicodeEncodeError).
+        detail = "café → \x1b]0;pwned\x07 refused"
+        monkeypatch.setattr(
+            node_sync,
+            "run_once",
+            lambda cfg: {"second": (node_sync.FAILED, detail)},
+        )
+        result = CliRunner(charset=charset).invoke(
+            cli.main, ["--config", pool_config, "node", "sync", "--once"]
+        )
+        assert isinstance(result.exception, SystemExit), result.exception
+        assert result.exit_code == 1
+        assert result.stdout == "  x @second  failed  caf? ? ?]0;pwned? refused\n"
+        assert result.stdout.isascii()
 
     def test_once_while_the_daemon_runs_defers_to_its_tick(
         self, runner, pool_config, fake_ssh, daemon_lock

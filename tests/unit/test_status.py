@@ -2703,6 +2703,47 @@ class TestDownStopsNodeSessionsWhereTheyRun:
         if state == "torn":
             assert any(str(nodes.NODE_MAP_PATH) in m for m in logged), logged
 
+    @pytest.mark.parametrize(
+        "error",
+        [ValueError("Expecting value"), PermissionError(13, "busy")],
+        ids=["torn", "busy"],
+    )
+    def test_a_held_back_down_all_stops_the_sync_daemon_before_the_pull(
+        self, runner, tmp_config, monkeypatch, tmp_path, error
+    ):
+        # Held back from the host by a map it could not read, `down --all`
+        # acts here -- and is still `down --all` here: the daemon stops before
+        # the pull (a sync tick mid-pull holds the node-pull lock the final
+        # pull would wait out), and again at the end. The map heals at once,
+        # so the node half reads the entry and pulls.
+        from magent import nodes
+
+        self._hold("api")
+        real = nodes.load_node_map_strict
+        reads: list[None] = []
+
+        def heals() -> dict[str, nodes.NodeMapEntry]:
+            reads.append(None)
+            if len(reads) == 1:
+                raise error
+            return real()
+
+        monkeypatch.setattr(nodes, "load_node_map_strict", heals)
+        out, _killed, dialed, sent = self._run(
+            runner,
+            tmp_config,
+            monkeypatch,
+            ["--all"],
+            projects=[{"path": str(tmp_path / "api"), "node": "second"}],
+            last_host="me@host",
+            sync_daemon=True,
+        )
+        assert out.exit_code == 0, out.output
+        assert sent == []
+        assert "magent down --host me@host" in out.output
+        assert dialed == [("second", "api")]
+        assert self.events == ["stop", "pull api", "stop"]
+
     @pytest.mark.parametrize("state", ["torn", "busy"])
     def test_an_unreadable_map_leaves_an_explicit_host_in_charge(
         self, runner, tmp_config, monkeypatch, tmp_path, state

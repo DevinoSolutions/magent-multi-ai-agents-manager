@@ -686,9 +686,11 @@ class NodeSyncer:
         # key per nick, and one worker per nick at a time, so no two threads
         # write the same key.
         self._errors: dict[str, Exception] = {}
-        # A node's OSError from this PC, the same way: the outcome names its
-        # class, and _note's WARNING carries its words.
-        self._local: dict[str, OSError] = {}
+        # What _note's WARNING adds to a FAILED node's line, from its worker
+        # the same way. The outcome names a class only: this carries a local
+        # OSError's words, or the OS's words behind a local ssh that would not
+        # start (remote_mux.os_detail; never the client's path).
+        self._words: dict[str, str] = {}
         # The class of what last refused the node map, while it stays unread.
         self._map_error: str | None = None
 
@@ -763,7 +765,7 @@ class NodeSyncer:
             if self._inflight[gone].done():
                 self._submitted.pop(gone, None)
                 self._errors.pop(gone, None)
-                self._local.pop(gone, None)
+                self._words.pop(gone, None)
                 self._inflight.pop(gone).result()
         # A node that left the pool is forgotten, so one re-added while still
         # down is warned about again rather than read as the old state.
@@ -836,7 +838,7 @@ class NodeSyncer:
         ``config`` is the one its tick read: a worker never reads
         ``self._config``, so a reconfigure while a pull runs cannot reach it."""
         self._errors.pop(nick, None)
-        self._local.pop(nick, None)
+        self._words.pop(nick, None)
         try:
             node = nodes.node_for_nick(config, nick, local_user=local_user)
             with node_lock(nick, wait_s=self._lock_wait_s):
@@ -850,11 +852,16 @@ class NodeSyncer:
             # the pull does takes one, which makes it a bug, not contention.
             return self._internal_error(nick, e)
         except remote_mux.RemoteError as e:
+            # pull_node's call is quiet: a local ssh that would not start is
+            # its class alone, so this node's WARNING carries the OS's words.
+            words = remote_mux.os_detail(e)
+            if words:
+                self._words[nick] = words
             return _classify(e)
         except OSError as e:
             # `node sync --once` prints the detail, and this one can name a
             # path on this PC: the class there, the words in nodes.log.
-            self._local[nick] = e
+            self._words[nick] = str(e)
             return FAILED, f"local error: {type(e).__name__}"
         except Exception as e:  # noqa: BLE001  # reason: one node's bug must not stop the other nodes' pulls or crash-loop the daemon; _note logs it with its traceback once per state change
             return self._internal_error(nick, e)
@@ -877,7 +884,7 @@ class NodeSyncer:
         # a pull still running must not take the error its worker may be
         # recording this instant: the tick that collects that pull logs it.
         error = self._errors.pop(nick, None) if outcome == FAILED else None
-        local = self._local.pop(nick, None) if outcome == FAILED else None
+        words = self._words.pop(nick, None) if outcome == FAILED else None
         state = _INTERNAL_ERROR if error is not None else outcome
         prev = self._last.get(nick)
         self._last[nick] = state
@@ -893,8 +900,8 @@ class NodeSyncer:
             elif prev is not None:
                 log.info("node %s: ok again (was %s)", nick, prev)
             return
-        if local is not None:
-            log.warning("node %s: %s (%s): %s", nick, outcome, detail, local)
+        if words:
+            log.warning("node %s: %s (%s): %s", nick, outcome, detail, words)
             return
         log.warning("node %s: %s (%s)", nick, outcome, detail)
 

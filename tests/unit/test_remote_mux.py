@@ -17,16 +17,18 @@ import shlex
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
 import time
 from importlib import resources
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
-from magent import attach_client, log, node_scripts, nodes, psmux, remote_mux
+from magent import attach_client, launch, log, node_scripts, nodes, psmux, remote_mux
 from magent.attach_client import SSH_CONNECTION_OPTS
 from magent.nodes import LoadSample, Node, NodeConfigError, Recipe, RepoSpec
 from magent.remote_mux import RemoteError
@@ -272,10 +274,12 @@ class TestRun:
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["true"], timeout_s=5)
         assert gone not in str(exc.value)
-        assert gone not in exc.value.stderr_tail
+        # The program and the class: never the path, never the OS's words
+        # ("No such file or directory" / "The system cannot find the file").
+        assert exc.value.stderr_tail == "could not start ssh (FileNotFoundError)"
 
     def test_a_spawn_failure_with_no_os_words_is_named_by_its_class(self, monkeypatch):
-        # No strerror to fall back on: the class, never str(e) and its path.
+        # No strerror either: still the class, never str(e) and its path.
         def refuse(*_a: object, **_k: object) -> None:
             raise OSError(r"C:\Tools\OpenSSH\ssh.exe is not a valid image")
 
@@ -283,15 +287,16 @@ class TestRun:
         monkeypatch.setattr(remote_mux.subprocess, "Popen", refuse)
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["true"], timeout_s=5)
-        assert exc.value.stderr_tail == "OSError"
+        assert exc.value.stderr_tail == "could not start ssh (OSError)"
         assert "OpenSSH" not in str(exc.value)
+        assert "valid image" not in str(exc.value)
 
     def test_a_spawn_failure_is_logged_like_any_other_failure(
         self, tmp_path, monkeypatch
     ):
         gone = str(tmp_path / "no-such-ssh.exe")
         monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: gone)
-        with pytest.raises(RemoteError):
+        with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["true"], timeout_s=5)
         logged = (log.LOG_DIR / "nodes.log").read_text(encoding="utf-8")
         (line,) = [
@@ -300,6 +305,11 @@ class TestRun:
             if "WARNING" in ln and "could not start" in ln
         ]
         assert NODE.target in line
+        # The OS's words and code the screen never shows are the log's.
+        cause = exc.value.__cause__
+        assert isinstance(cause, FileNotFoundError)
+        assert f"errno {cause.errno}" in line
+        assert f"{cause.strerror}" in line
         # Only discriminates on POSIX: Windows' CreateProcess OSErrors never
         # carry the filename, so a Windows-only green proves nothing here.
         assert gone not in logged
@@ -373,10 +383,51 @@ class TestRun:
         monkeypatch.setattr(remote_mux.subprocess, "Popen", denied)
         with pytest.raises(RemoteError) as exc:
             remote_mux.run(NODE, ["true"], timeout_s=5, quiet=True)
-        assert (exc.value.rc, exc.value.stderr_tail) == (None, "Permission denied")
+        assert (exc.value.rc, exc.value.stderr_tail) == (
+            None,
+            "could not start ssh (PermissionError)",
+        )
+        assert "Permission denied" not in str(exc.value)
         assert exc.value.timed_out is False
         # The rc-None case where nothing ran: the flags must not say it may have.
         assert (exc.value.over_cap, exc.value.outcome_unknown) == (False, False)
+
+    def test_a_quiet_spawn_failure_hands_its_callers_the_os_words(self, monkeypatch):
+        # A quiet call (pull_node's) logs nothing itself; os_detail is what its
+        # callers add to their WARNING -- the OS's words, never str(cause),
+        # which on POSIX carries the client's path.
+        client = "/opt/secret/ssh"
+
+        def denied(*_a: object, **_k: object) -> object:
+            raise PermissionError(13, "Permission denied", client)
+
+        monkeypatch.setattr("magent.remote_mux.find_ssh", lambda: client)
+        monkeypatch.setattr(remote_mux.subprocess, "Popen", denied)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux.run(NODE, ["true"], timeout_s=5, quiet=True)
+        assert remote_mux.os_detail(exc.value) == "errno 13, Permission denied"
+        assert client not in remote_mux.os_detail(exc.value)
+
+    def test_the_os_detail_names_a_winerror_when_set(self):
+        cause = OSError(13, "Access is denied")
+        cause.winerror = 5
+        error = RemoteError(None, "could not start ssh (OSError)", ("ssh",))
+        error.__cause__ = cause
+        assert remote_mux.os_detail(error) == "errno 13, winerror 5, Access is denied"
+
+    @pytest.mark.parametrize(
+        "cause",
+        [
+            None,
+            tarfile.ReadError("not a tar archive"),
+            OSError(r"C:\Tools\OpenSSH\ssh.exe is not a valid image"),
+        ],
+        ids=["none", "not-an-os-error", "no-os-words"],
+    )
+    def test_no_os_words_behind_an_error_is_no_detail(self, cause):
+        error = RemoteError(None, "could not start ssh (OSError)", ("ssh",))
+        error.__cause__ = cause
+        assert remote_mux.os_detail(error) == ""
 
     def test_no_ssh_client_is_rc_127_without_spawning(self):
         with pytest.raises(RemoteError) as exc:
@@ -424,28 +475,44 @@ def spawned(monkeypatch):
 # pipe reads.
 CAP = 256 * 1024
 
-# A child that leaves a GRANDCHILD holding its stderr open (inherited; its pid
-# goes to argv[1]), says one line on stderr, then floods stdout. The 90s sleep
-# outlives every bound the call has (timeout_s=60 + two 1s reaps), so the
-# teardown's kill-by-pid always hits the live grandchild, never a pid Windows
-# reused. Not longer: an unbounded-join mutant waits out the whole sleep.
-_HELD_STDERR_CHILD = """\
-import subprocess, sys
-grandchild = subprocess.Popen(
-    [sys.executable, "-c", "import time; time.sleep(90)"],
+# The GRANDCHILD that holds a child's stderr open (inherited). It writes its
+# OWN pid to argv[1], whole or not at all: on Windows sys.executable may be a
+# launcher, and the pid to kill is the sleeping interpreter's, not whatever
+# Popen.pid names. The 90s sleep outlives every bound the call has
+# (timeout_s=60 + two 1s reaps), so the teardown's kill-by-pid always hits the
+# live grandchild, never a pid Windows reused. Not longer: an unbounded-join
+# mutant waits out the whole sleep.
+_HELD_STDERR_GRANDCHILD = """\
+import os, sys, time
+with open(sys.argv[1] + ".tmp", "w") as f:
+    f.write(str(os.getpid()))
+os.replace(sys.argv[1] + ".tmp", sys.argv[1])
+time.sleep(90)
+"""
+
+# A child that leaves that grandchild behind, waits for its pid file (so the
+# teardown never finds it missing), says argv[2] on stderr, then floods stdout.
+_HELD_STDERR_CHILD = (
+    f"GRANDCHILD = {_HELD_STDERR_GRANDCHILD!r}\n"
+    """\
+import os, subprocess, sys, time
+subprocess.Popen(
+    [sys.executable, "-c", GRANDCHILD, sys.argv[1]],
     stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
     stderr=None,
 )
-with open(sys.argv[1], "w") as f:
-    f.write(str(grandchild.pid))
-sys.stderr.write("boom: disk full\\n")
+deadline = time.monotonic() + 30
+while not os.path.exists(sys.argv[1]) and time.monotonic() < deadline:
+    time.sleep(0.01)
+sys.stderr.write(sys.argv[2])
 sys.stderr.flush()
 block = b"x" * 65536
 while True:
     sys.stdout.buffer.write(block)
     sys.stdout.flush()
 """
+)
 
 
 class TestTheReplyIsBoundedInMemory:
@@ -553,16 +620,18 @@ class TestTheReplyIsBoundedInMemory:
         assert lines[0] == f"reply exceeded {CAP} bytes"
         assert "boom: disk full" in lines[1:]
 
-    def test_the_stderr_wait_after_the_cap_is_bounded_by_the_reap(self, tmp_path):
-        # A grandchild still holds stderr, so it never ends: the over-cap path
-        # must give up after the reap bound and raise without the tail, not
-        # wait out the grandchild's 90s.
+    def _flood_past_a_held_stderr(
+        self, tmp_path, said: str = "boom: disk full\n"
+    ) -> tuple[RemoteError, float]:
+        """_HELD_STDERR_CHILD's over-cap error after it said ``said``, and how
+        long it took. The teardown kills the grandchild's own pid, once, and
+        only if the grandchild wrote it."""
         pidfile = tmp_path / "grandchild.pid"
         started = time.monotonic()
         try:
             with pytest.raises(RemoteError) as exc:
                 remote_mux._spawn(
-                    [sys.executable, "-c", _HELD_STDERR_CHILD, str(pidfile)],
+                    [sys.executable, "-c", _HELD_STDERR_CHILD, str(pidfile), said],
                     timeout_s=60,
                     input_bytes=None,
                     check=True,
@@ -575,8 +644,93 @@ class TestTheReplyIsBoundedInMemory:
         finally:
             with contextlib.suppress(OSError, ValueError):
                 os.kill(int(pidfile.read_text(encoding="utf-8")), signal.SIGTERM)
-        assert exc.value.stderr_tail == f"reply exceeded {CAP} bytes"
+        return exc.value, elapsed
+
+    def test_the_stderr_wait_after_the_cap_is_bounded_by_the_reap(self, tmp_path):
+        # A grandchild still holds stderr, so it never ends: the over-cap path
+        # must give up after the reap bound, not wait out the grandchild's 90s.
+        error, elapsed = self._flood_past_a_held_stderr(tmp_path)
+        assert error.stderr_tail.splitlines()[0] == f"reply exceeded {CAP} bytes"
         assert elapsed < 20
+
+    def test_a_stderr_held_open_still_hands_over_the_childs_words(self, tmp_path):
+        # The words were read before the cap; only the stream's END waits on
+        # the grandchild. Dropping them made the error depend on how fast some
+        # other process exits -- the fake ssh's flake on a loaded Windows box,
+        # where kill() takes cmd.exe and the interpreter behind it holds stderr.
+        error, _ = self._flood_past_a_held_stderr(tmp_path)
+        assert "boom: disk full" in error.stderr_tail.splitlines()[1:]
+
+    def test_a_stderr_held_open_mid_line_never_hands_over_the_fragment(self, tmp_path):
+        # The stream is still open, so its last line may be half-written: only
+        # whole lines are the child's words, and the row shows the last one.
+        error, _ = self._flood_past_a_held_stderr(
+            tmp_path, said="boom: disk full\nwriting blo"
+        )
+        lines = error.stderr_tail.splitlines()
+        assert lines[0] == f"reply exceeded {CAP} bytes"
+        assert "boom: disk full" in lines[1:]
+        assert "writing blo" not in error.stderr_tail
+        assert launch._node_error_text(error) == "boom: disk full"
+
+    def test_a_stderr_held_open_before_a_whole_line_gives_no_reason(self, tmp_path):
+        # No line has ended yet: the cap is the whole story, never a fragment.
+        error, _ = self._flood_past_a_held_stderr(tmp_path, said="writing blo")
+        assert error.stderr_tail == f"reply exceeded {CAP} bytes"
+        assert launch._node_error_text(error) == f"reply exceeded {CAP} bytes"
+
+    def test_a_stderr_that_ended_keeps_its_last_line_without_a_newline(self):
+        # An ENDED stream was not cut off mid-write, so its last line is whole
+        # even unterminated: only a stream still open is trimmed. The base
+        # interpreter, not sys.executable: on Windows that is a venv launcher
+        # holding its own copy of the pipe, so the stream would end only once
+        # the kill reached through it.
+        child = (
+            "import os, sys\n"
+            "sys.stderr.write('boom: disk full')\n"
+            "sys.stderr.flush()\n"
+            "os.close(2)\n"
+            "block = b'x' * 65536\n"
+            "while True:\n"
+            "    sys.stdout.buffer.write(block)\n"
+            "    sys.stdout.flush()\n"
+        )
+        python = getattr(sys, "_base_executable", sys.executable)
+        with pytest.raises(RemoteError) as exc:
+            remote_mux._spawn(
+                [python, "-I", "-c", child],
+                timeout_s=60,
+                input_bytes=None,
+                check=True,
+                shown=("child",),
+                label="test child",
+                quiet=True,
+                max_stdout_bytes=CAP,
+            )
+        assert exc.value.over_cap
+        assert launch._node_error_text(exc.value) == "boom: disk full"
+
+    def test_the_drain_hands_over_what_arrived_before_the_stream_ends(self):
+        # A data() taken mid-read is what has arrived, and the read goes on
+        # from empty: exactly the cap (16 bytes) is held first, so a drain
+        # that kept counting the handed-over bytes would trim past its last
+        # chunk.
+        r, w = os.pipe()
+        drain = remote_mux._Drain(os.fdopen(r, "rb"), 16, tail=True)
+        drain.start()
+        try:
+            os.write(w, b"boom: disk full\n")
+            deadline = time.monotonic() + 5
+            while drain._held < 16 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert drain.is_alive()
+            assert drain.data() == b"boom: disk full\n"
+            os.write(w, b"more\n")
+        finally:
+            os.close(w)
+        drain.join(5)
+        assert not drain.is_alive()
+        assert drain.data() == b"more\n"
 
     def test_the_drain_drops_what_it_held_once_over_the_cap(self):
         # Two writes, so the first cap's worth is HELD before the byte that
@@ -1227,21 +1381,28 @@ class TestWhichReposMakeTheProject:
         with pytest.raises(RemoteError) as exc:
             remote_mux.repo_paths(tmp_path)
         assert exc.value.rc is None
-        assert "Permission denied" in exc.value.stderr_tail
-        assert str(tmp_path) in str(exc.value)
+        # The folder is the user's own configured project, so it is named;
+        # the OS's words are not ours, so only their class is.
+        assert exc.value.stderr_tail == f"cannot read {tmp_path} (PermissionError)"
+        assert "Permission denied" not in str(exc.value)
+        logged = (log.LOG_DIR / "nodes.log").read_text(encoding="utf-8")
+        (line,) = [ln for ln in logged.splitlines() if "repo lookup failed" in ln]
+        assert "WARNING" in line
+        assert "Permission denied" in line
 
     def test_an_error_with_no_os_words_is_named_by_its_class(
         self, tmp_path, monkeypatch
     ):
-        # strerror is the OS's words without a path; an OSError with none
-        # would put its whole str() on screen. The class there, it in the log.
+        # An OSError with no strerror is named by its class too; its str()
+        # (which can name another path) goes to the log.
         def broken(self):
             raise OSError(r"C:\Users\amin\ws: gone")
 
         monkeypatch.setattr(Path, "iterdir", broken)
         with pytest.raises(RemoteError) as exc:
             remote_mux.repo_paths(tmp_path)
-        assert exc.value.stderr_tail == f"cannot read {tmp_path}: OSError"
+        assert exc.value.stderr_tail == f"cannot read {tmp_path} (OSError)"
+        assert "ws: gone" not in str(exc.value)
         logged = (log.LOG_DIR / "nodes.log").read_text(encoding="utf-8")
         assert r"C:\Users\amin\ws: gone" in logged
 
@@ -1256,7 +1417,8 @@ class TestWhichReposMakeTheProject:
         with pytest.raises(RemoteError) as exc:
             remote_mux.repo_paths(tmp_path)
         assert exc.value.rc is None
-        assert "Permission denied" in exc.value.stderr_tail
+        assert exc.value.stderr_tail == f"cannot read {tmp_path} (PermissionError)"
+        assert "Permission denied" not in str(exc.value)
 
     def test_a_repo_whose_git_cannot_be_read_is_an_error_not_no_repo(
         self, tmp_path, monkeypatch
@@ -1265,7 +1427,8 @@ class TestWhichReposMakeTheProject:
         deny_stat(monkeypatch, tmp_path / ".git")
         with pytest.raises(RemoteError) as exc:
             remote_mux.repo_paths(tmp_path)
-        assert "Permission denied" in exc.value.stderr_tail
+        assert exc.value.stderr_tail == f"cannot read {tmp_path} (PermissionError)"
+        assert "Permission denied" not in str(exc.value)
 
     def test_a_drive_that_is_not_ready_is_an_error_not_empty(
         self, tmp_path, monkeypatch
@@ -1288,7 +1451,8 @@ class TestWhichReposMakeTheProject:
                 remote_mux.repo_paths(tmp_path)
         finally:
             (tmp_path / "web").chmod(0o700)
-        assert "Permission denied" in exc.value.stderr_tail
+        assert exc.value.stderr_tail == f"cannot read {tmp_path} (PermissionError)"
+        assert "Permission denied" not in str(exc.value)
 
 
 @needs_git
@@ -1530,10 +1694,13 @@ class TestANodeSessionIsDecoratedLikeALocalOne:
         assert node[5][3:] == local[5][3:]
         brand, brand_len = psmux.status_left("second")
         hints, hints_len = psmux.status_hints(code_hint)
-        assert node[1][3:] == ["set", "-t", "=api", "status-right", hints]
-        assert node[2][3:] == ["set", "-t", "=api", "status-right-length", hints_len]
-        assert node[3][3:] == ["set", "-t", "=api", "status-left", brand]
-        assert node[4][3:] == ["set", "-t", "=api", "status-left-length", brand_len]
+        # `set -t` takes a PANE target: a bare `=api` is read as a pane and
+        # fails ("no such session: =api"), and the script's `|| true` hid
+        # it. `=api:` is the exact session, and its current pane.
+        assert node[1][3:] == ["set", "-t", "=api:", "status-right", hints]
+        assert node[2][3:] == ["set", "-t", "=api:", "status-right-length", hints_len]
+        assert node[3][3:] == ["set", "-t", "=api:", "status-left", brand]
+        assert node[4][3:] == ["set", "-t", "=api:", "status-left-length", brand_len]
         assert node[6][3:] == [
             "rename-window",
             "-t",
@@ -2837,6 +3004,21 @@ class TestTheScriptLiterals:
         main = node_scripts._read("bring_up").split("\nmain() {", 1)[1]
         assert 0 <= main.index("umask 077") < main.index("tar -x")
 
+    def test_a_folder_the_payload_lands_in_is_made_0700_outright(self):
+        # A default ACL on a parent makes the kernel IGNORE the umask for a
+        # new folder (GitHub's runner homes carry one), so the mode is stated
+        # on each folder the script creates, never left to `umask 077`. And
+        # never `mkdir -p -m 700`: -p gives -m to the last folder only.
+        text = node_scripts._read("bring_up")
+        helper = _shell_function(text, "mkdir_private")
+        assert "mkdir -m 700 -- " in helper
+        assert "mkdir -p" not in helper
+        for name in ("copy_tree", "seed_memory"):
+            body = _shell_function(text, name)
+            assert "mkdir_private " in body
+            assert "umask" not in body
+            assert "mkdir " not in body
+
     def test_the_archive_is_never_extracted_with_absolute_names(self):
         text = node_scripts._read("bring_up")
         assert not re.search(r"\btar\b[^\n]*(\s-P\b|--absolute-names)", text)
@@ -2884,6 +3066,56 @@ def _link(name: str, target: str, kind: bytes = tarfile.SYMTYPE) -> tarfile.TarI
 
 def _tree(path: Path) -> list[str]:
     return sorted(str(p.relative_to(path)) for p in path.rglob("*"))
+
+
+def _shell_function(text: str, name: str) -> str:
+    """The code of the shell function ``name`` in a node script, without its
+    comment lines."""
+    found = re.search(rf"\n{name}\(\) \{{\n(.*?)\n\}}\n", text, re.DOTALL)
+    assert found, f"no {name}() in the script"
+    lines = found.group(1).splitlines()
+    return "\n".join(line for line in lines if not line.lstrip().startswith("#"))
+
+
+def _grant_by_default_acl(path: Path) -> None:
+    """Give ``path`` a default ACL of u::rwx g::r-x o::r-x -- the shape a
+    GitHub runner home carries -- written as the kernel's own xattr, so no
+    setfacl is needed. Where the filesystem keeps no POSIX ACLs, or keeps one
+    that does not override the umask, there is nothing to prove."""
+    user_obj, group_obj, other, no_id = 0x01, 0x04, 0x20, 0xFFFFFFFF
+    blob = struct.pack("<I", 2) + b"".join(
+        struct.pack("<HHI", tag, perm, no_id)
+        for tag, perm in ((user_obj, 7), (group_obj, 5), (other, 5))
+    )
+    try:
+        os.setxattr(path, "system.posix_acl_default", blob)
+    except OSError as exc:
+        _no_real_acl(f"no POSIX default ACL on this filesystem: {exc}")
+    probe = path / ".acl-probe"
+    mask = os.umask(0o077)
+    try:
+        probe.mkdir()
+    finally:
+        os.umask(mask)
+    mode = stat.S_IMODE(probe.stat().st_mode)
+    probe.rmdir()
+    if mode == 0o700:
+        _no_real_acl("a default ACL here does not override the umask")
+
+
+def _no_real_acl(reason: str) -> NoReturn:
+    # A skip on a dev box; on CI a runner that cannot carry the canary is a
+    # provisioning bug, never a quiet pass.
+    if os.environ.get("GITHUB_ACTIONS"):
+        pytest.fail(reason)
+    pytest.skip(reason)
+
+
+# Shadows the script's own `umask` with one pinned to 000. The most
+# permissive default ACL leaves a new folder exactly its creation's mode
+# argument, which is what umask 000 leaves: owner-only here is owner-only
+# under EVERY default ACL, on any filesystem, with no setfacl.
+_UMASK_000 = "umask() { builtin umask 000; }\nbuiltin umask 000\n"
 
 
 @pytest.mark.skipif(
@@ -3273,10 +3505,10 @@ class TestBringUpShOnARealShell:
         remote_mux.bring_up(rig["node"], rig["recipe"])
         log = self._log(rig)
         assert (
-            "-L magent set -t =api status-left #[bold,fg=green] magent #[default]@second"
+            "-L magent set -t =api: status-left #[bold,fg=green] magent #[default]@second"
             in log
         )
-        assert "-L magent set -t =api status-left-length 18" in log
+        assert "-L magent set -t =api: status-left-length 18" in log
 
     def test_an_encoded_name_outside_the_alphabet_is_exit_2(self, rig):
         with pytest.raises(RemoteError) as info:
@@ -3475,12 +3707,84 @@ class TestBringUpShOnARealShell:
         ] == []
 
     def test_a_folder_created_on_the_way_is_owner_only(self, rig):
-        # umask 077 covers the folders copy_tree makes, not only the files.
+        # The folders copy_tree makes are 0700, not only the files 0600.
         root = rig["root"]
         root.mkdir(parents=True)
         self._push_raw(rig, _raw_payload(("project/sub/.env", b"K=V\n")))
         assert stat.S_IMODE((root / "sub").stat().st_mode) == 0o700
         assert (root / "sub" / ".env").read_bytes() == b"K=V\n"
+
+    @pytest.fixture(params=["umask-000-model", "real-acl"])
+    def ignored_umask(self, request, monkeypatch):
+        """What a default ACL on a parent does to a new folder: the umask
+        stops counting. ``umask-000-model`` is the deterministic gate (see
+        ``_UMASK_000``); ``real-acl`` is the canary that the model matches
+        the kernel. Returns the step that readies a parent folder."""
+        if request.param == "real-acl":
+            return _grant_by_default_acl
+        script = node_scripts.script
+
+        def blind(name: str) -> str:
+            head, sep, rest = script(name).partition("\nset -euo pipefail\n")
+            assert sep, f"{name}.sh has no `set -euo pipefail` line"
+            return head + sep + _UMASK_000 + rest
+
+        monkeypatch.setattr(node_scripts, "script", blind)
+        return lambda path: None
+
+    def test_a_default_acl_cannot_widen_a_folder_created_on_the_way(
+        self, rig, ignored_umask
+    ):
+        # A default ACL on the parent makes the kernel ignore the umask: under
+        # `umask 077` alone, sub/ and sub/deeper/ came out 0755, listable by
+        # anyone. The file itself stays 0600 either way (mktemp).
+        root = rig["root"]
+        root.mkdir(parents=True)
+        ignored_umask(root)
+        self._push_raw(rig, _raw_payload(("project/sub/deeper/.env", b"K=V\n")))
+        modes = [
+            stat.S_IMODE(p.stat().st_mode)
+            for p in (
+                root / "sub",
+                root / "sub" / "deeper",
+                root / "sub" / "deeper" / ".env",
+            )
+        ]
+        assert modes == [0o700, 0o700, 0o600]
+
+    def test_a_folder_already_on_the_node_keeps_its_own_mode(self, rig):
+        # Only a folder the script made is 0700: one that was already there is
+        # the node's own, and a push is no reason to chmod it.
+        root = rig["root"]
+        (root / "sub").mkdir(parents=True)
+        root.chmod(0o751)
+        (root / "sub").chmod(0o755)
+        self._push_raw(rig, _raw_payload(("project/sub/deeper/.env", b"K=V\n")))
+        modes = [
+            stat.S_IMODE(p.stat().st_mode)
+            for p in (root, root / "sub", root / "sub" / "deeper")
+        ]
+        assert modes == [0o751, 0o755, 0o700]
+
+    def test_a_default_acl_cannot_widen_the_seeded_memory_folders(
+        self, rig, ignored_umask
+    ):
+        # The seed lands under ~/.claude, on a home that may carry a default
+        # ACL: every folder the seed creates is 0700, and ~/.claude, already
+        # there, keeps its own mode.
+        home = Path.home()
+        ignored_umask(home)
+        claude = home / ".claude"
+        claude.mkdir()
+        claude.chmod(0o755)
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        store = claude / "projects" / rig["enc"]
+        modes = [
+            stat.S_IMODE(p.stat().st_mode)
+            for p in (claude, claude / "projects", store, store / "memory")
+        ]
+        assert modes == [0o755, 0o700, 0o700, 0o700]
+        assert stat.S_IMODE((store / "memory" / "MEMORY.md").stat().st_mode) == 0o600
 
     def test_a_failed_decoration_still_starts_the_session(self, rig):
         # The one step allowed to fail: a bare status line is not a failed

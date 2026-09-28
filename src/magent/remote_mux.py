@@ -323,14 +323,19 @@ class _Drain(threading.Thread):
     it held, sets ``over`` and closes the pipe -- so a writer still filling it
     fails instead of blocking forever. Tail mode (stderr): the oldest bytes are
     dropped instead, and the read runs to the end. Only this thread closes the
-    pipe, so no close ever races a read. ``over`` and ``data`` are read once
-    the thread has finished."""
+    pipe, so no close ever races a read. ``over`` is read once the thread has
+    finished. ``data`` HANDS OVER what is held and forgets it -- a second call
+    returns only what arrived since -- and may be taken before the thread has
+    finished, as what has arrived so far: a grandchild can hold a pipe open
+    long after the child is gone."""
 
     def __init__(self, pipe: IO[bytes] | None, cap: int, *, tail: bool) -> None:
         super().__init__(daemon=True)
         self._pipe = pipe
         self._cap = cap
         self._tail = tail
+        # _chunks and _held are shared with a data() taken mid-read.
+        self._lock = threading.Lock()
         self._chunks: deque[bytes] = deque()
         self._held = 0
         self.over = False
@@ -350,19 +355,22 @@ class _Drain(threading.Thread):
         # os.read, not the buffered object: it returns what is there now, so
         # a trickle is seen as it arrives.
         while chunk := os.read(fd, _READ_CHUNK_BYTES):
-            if not self._tail and self._held + len(chunk) > self._cap:
-                self.over = True
-                self._chunks.clear()
-                self._held = 0
-                return
-            self._chunks.append(chunk)
-            self._held += len(chunk)
-            while self._tail and self._held - len(self._chunks[0]) >= self._cap:
-                self._held -= len(self._chunks.popleft())
+            with self._lock:
+                if not self._tail and self._held + len(chunk) > self._cap:
+                    self.over = True
+                    self._chunks.clear()
+                    self._held = 0
+                    return
+                self._chunks.append(chunk)
+                self._held += len(chunk)
+                while self._tail and self._held - len(self._chunks[0]) >= self._cap:
+                    self._held -= len(self._chunks.popleft())
 
     def data(self) -> bytes:
-        held = b"".join(self._chunks)
-        self._chunks.clear()
+        with self._lock:
+            held = b"".join(self._chunks)
+            self._chunks.clear()
+            self._held = 0
         return held[-self._cap :] if self._tail else held
 
 
@@ -408,6 +416,29 @@ def _finish(
     return True
 
 
+def _os_words(e: OSError) -> str:
+    """An OSError's own words for a log line -- errno, winerror when set,
+    strerror -- and never ``str(e)`` or ``e.filename``: for a spawn on POSIX
+    those carry the client's path, and a log line names the program only."""
+    winerror = getattr(e, "winerror", None)
+    parts = [
+        f"errno {e.errno}" if e.errno is not None else "",
+        f"winerror {winerror}" if winerror is not None else "",
+        e.strerror or "",
+    ]
+    return ", ".join(p for p in parts if p)
+
+
+def os_detail(exc: BaseException) -> str:
+    """The OS's words behind ``exc`` (``_os_words`` of its ``__cause__``) for
+    a caller's WARNING line; "" when that cause is no OSError or has no
+    words. A quiet call (``pull_node``'s) logs nothing itself, and its
+    RemoteError names only the class -- the screen's -- so the callers that
+    log it add this."""
+    cause = exc.__cause__
+    return _os_words(cause) if isinstance(cause, OSError) else ""
+
+
 def _spawn(
     argv: list[str],
     *,
@@ -443,15 +474,21 @@ def _spawn(
     except OSError as e:
         # A FileNotFoundError is the client vanishing between find_ssh and the
         # spawn (or its cached path going stale): the same "not installed" as
-        # no client at all. strerror, not str(e): CPython's POSIX
-        # _execute_child puts the client's path in str(e), and an error or a
-        # log line names the program only.
+        # no client at all. The program and the class: strerror is the OS's
+        # words (localized, per platform), not ours, and CPython's POSIX
+        # _execute_child puts the client's path in str(e) -- an error or a log
+        # line names the program only.
         rc = SSH_MISSING_RC if isinstance(e, FileNotFoundError) else None
-        # No strerror: the class, never str(e) -- it is where the path lives.
-        reason = e.strerror or type(e).__name__
+        reason = f"could not start {shown[0]} ({type(e).__name__})"
         if not quiet:
+            # The OS's words and codes are the log's (a quiet caller adds them
+            # to its own line through os_detail).
+            words = _os_words(e)
             get_logger("nodes").warning(
-                "%s could not start (%s): %s", label, reason, shlex.join(shown)
+                "%s %s: %s",
+                label,
+                f"{reason}: {words}" if words else reason,
+                shlex.join(shown),
             )
         raise RemoteError(rc, reason, shown) from e
     if input_bytes is not None and proc.stdin is not None:
@@ -484,10 +521,18 @@ def _spawn(
                 shlex.join(shown),
             )
         reason = f"reply exceeded {max_stdout_bytes} bytes"
-        # What the child said before it flooded is the likely cause. Only if
-        # stderr ends within the reap bound: a grandchild may still hold it.
+        # What the child said before it flooded is the likely cause. stderr
+        # gets the reap bound to end -- time too for words already in the pipe
+        # to be read -- and what it delivered is reported either way: a
+        # grandchild may hold it open long after the child is gone, and the
+        # words already read are no less the child's. A stream still open may
+        # end mid-line, though, and a fragment is no reason: only whole lines
+        # are kept. Asked BEFORE the handover, so a stream that ends between
+        # the two is trimmed, never a half-line kept.
         err.join(_REAP_TIMEOUT_S)
-        said = "" if err.is_alive() else _tail(err.data())
+        ended = not err.is_alive()
+        held = err.data()
+        said = _tail(held if ended else held[: held.rfind(b"\n") + 1])
         # Killed mid-call, so the remote may still be running; but the node
         # answered, so it is not unreachable (timed_out stays False).
         raise RemoteError(
@@ -1448,12 +1493,15 @@ def decoration_args(sid: str, nick: str, code_hint: bool) -> list[list[str]]:
     """The ten decoration commands of a node session: the SAME vocabulary as
     ``psmux.decoration_argv`` (status hints, the F1/F2 bindings, the window
     name rule), with the brand naming the node. One server hosts every node
-    session, so the per-session options are scoped with ``-t =sid`` (and the
-    window ones with ``=sid:``) rather than ``-g``, where psmux's
-    server-per-session model allows a global."""
+    session, so the options are scoped with ``-t =sid:`` rather than ``-g``,
+    where psmux's server-per-session model allows a global. The colon is
+    load-bearing: ``set``/``setw``/``rename-window`` take a PANE or WINDOW
+    target, where a bare ``=sid`` is no session ("no such session: =sid") --
+    ``=sid:`` is the exact session and its current window. Only session-target
+    commands (``has-session``, ``kill-session``, ``attach``) take ``=sid``."""
     hints, hints_len = psmux.status_hints(code_hint)
     brand, brand_len = psmux.status_left(nick)
-    target, window = f"={sid}", f"={sid}:"
+    target = f"={sid}:"
     fmt = psmux.WINDOW_STATUS_FORMAT
     return [
         tmux_argv("bind", "-n", "F1", "detach-client"),
@@ -1462,10 +1510,10 @@ def decoration_args(sid: str, nick: str, code_hint: bool) -> list[list[str]]:
         tmux_argv("set", "-t", target, "status-left", brand),
         tmux_argv("set", "-t", target, "status-left-length", brand_len),
         psmux.f2_binding_argv(tmux_argv(), code_hint),
-        tmux_argv("rename-window", "-t", window, psmux.window_display_name(sid)),
-        tmux_argv("setw", "-t", window, "automatic-rename", "off"),
-        tmux_argv("setw", "-t", window, "window-status-format", fmt),
-        tmux_argv("setw", "-t", window, "window-status-current-format", fmt),
+        tmux_argv("rename-window", "-t", target, psmux.window_display_name(sid)),
+        tmux_argv("setw", "-t", target, "automatic-rename", "off"),
+        tmux_argv("setw", "-t", target, "window-status-format", fmt),
+        tmux_argv("setw", "-t", target, "window-status-current-format", fmt),
     ]
 
 
@@ -2300,9 +2348,10 @@ def repo_paths(project_dir: Path) -> list[Path]:
             if path_is_dir(child) and path_exists(child / ".git")
         )
     except OSError as e:
-        # strerror is the OS's words without a path; lacking it, the class.
-        # The whole error is logged.
-        reason = f"cannot read {project_dir}: {e.strerror or type(e).__name__}"
+        # The folder is the user's own configured project, so it is named;
+        # strerror is the OS's words (localized, per platform), not ours, so
+        # only the class is. The whole error is logged.
+        reason = f"cannot read {project_dir} ({type(e).__name__})"
         get_logger("nodes").warning(
             "repo lookup failed: cannot read %s: %s", project_dir, e
         )
