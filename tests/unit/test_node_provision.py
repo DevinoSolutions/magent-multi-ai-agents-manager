@@ -5347,6 +5347,7 @@ SETUP_TOOLS = (
     "mktemp",
     "sleep",
     "timeout",
+    "stat",  # the fake ssh-keygen's permission check, not setup.sh
 )
 
 # Each shim is `#!<bash>` + `STATE=<dir>` + its body. The state directory is
@@ -5440,11 +5441,17 @@ while [ "$#" -gt 0 ]; do
 done
 if [ -n "$y" ]; then
   if [ -e "$STATE/keygen-y-fail" ]; then echo "Load key \\"$f\\": invalid format" >&2; exit 255; fi
+  # sshkey_perm_ok: a key its group or others can read is refused, not loaded.
+  m=$(stat -c %a "$f") || exit 255
+  if [ $((8#$m & 8#077)) -ne 0 ]; then echo "Load key \\"$f\\": bad permissions" >&2; exit 255; fi
   printf 'ssh-ed25519 AAAAFAKENODEKEY %s\\n' "$(cut -d' ' -f4- "$f")"
   exit 0
 fi
 if [ -e "$f" ]; then echo "$f already exists. Overwrite (y/n)?" >&2; exit 1; fi
 printf 'FAKE PRIVATE KEY %s\\n' "$c" > "$f"
+# keygen-acl: OpenSSH >= 8.2 writes the key as umask 077 over open(0644), and a
+# default ACL on ~/.ssh overrides the umask (measured on a hosted runner: 0644).
+[ ! -e "$STATE/keygen-acl" ] || chmod 644 "$f"
 printf 'ssh-ed25519 AAAAFAKENODEKEY %s\\n' "$c" > "$f.pub"
 """,
     "hostname": "echo devino-second\n",
@@ -6001,6 +6008,70 @@ class TestSetupShUnderRealBash:
         assert _rows(r)["node-key:amin"] == "fail"
         assert not (ssh_dir / "id_ed25519.pub").exists()
         assert set(_report(r).keys()) == set()
+
+    # -- the node key under a default ACL (F-ACL-1) ----------------------------
+
+    def test_the_node_key_is_owner_only_even_when_keygen_leaves_it_open(self, tmp_path):
+        # ssh-keygen leaves the key 0644 under a default ACL (keygen-acl), and
+        # ssh then refuses it: the node could never clone.
+        state, env = _setup_box(tmp_path)
+        (state / "keygen-acl").touch()
+        r = _run_setup(env)
+        ssh_dir = state / "home" / "amin" / ".ssh"
+        assert (ssh_dir / "id_ed25519").stat().st_mode & 0o777 == 0o600
+        assert ssh_dir.stat().st_mode & 0o777 == 0o700
+        assert _rows(r)["node-key:amin"] == "did"
+        assert _report(r).keys() == {
+            "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+        }
+        assert r.returncode == 0, r.stderr
+
+    def test_a_rerun_repairs_an_open_node_key(self, tmp_path):
+        # A key an earlier setup left open is made private BEFORE the lost .pub
+        # is derived from it: `ssh-keygen -y` refuses an open key, as ssh does.
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        ssh_dir = state / "home" / "amin" / ".ssh"
+        (ssh_dir / "id_ed25519").chmod(0o644)
+        (ssh_dir / "id_ed25519.pub").unlink()
+        r = _run_setup(env)
+        assert (ssh_dir / "id_ed25519").stat().st_mode & 0o777 == 0o600
+        assert _rows(r)["node-key:amin"] == "did"
+        assert _report(r).keys() == {
+            "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+        }
+        assert r.returncode == 0, r.stderr
+
+    def test_a_rerun_repairs_an_open_node_key_whose_pub_is_intact(self, tmp_path):
+        # Every run, not only the runs that derive: the skip branch reads no
+        # key, and would leave it open for good.
+        state, env = _setup_box(tmp_path)
+        _run_setup(env)
+        ssh_dir = state / "home" / "amin" / ".ssh"
+        (ssh_dir / "id_ed25519").chmod(0o644)
+        r = _run_setup(env)
+        assert (ssh_dir / "id_ed25519").stat().st_mode & 0o777 == 0o600
+        assert _rows(r)["node-key:amin"] == "skip"
+        assert r.returncode == 0, r.stderr
+
+    def test_a_symlinked_node_key_never_reaches_its_target(self, tmp_path):
+        # chmod follows a link: magent does not change a file it did not make.
+        state, env = _setup_box(tmp_path)
+        victim = tmp_path / "victim-key"
+        victim.write_bytes(b"x\n")
+        victim.chmod(0o644)
+        ssh_dir = _existing_user(state, "amin") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        (ssh_dir / "id_ed25519").symlink_to(victim)
+        (ssh_dir / "id_ed25519.pub").write_text(
+            "ssh-ed25519 AAAAFAKENODEKEY me@box\n", encoding="utf-8"
+        )
+        r = _run_setup(env)
+        assert victim.stat().st_mode & 0o777 == 0o644
+        assert victim.read_bytes() == b"x\n"
+        assert _rows(r)["node-key:amin"] == "fail"
+        assert set(_report(r).keys()) == set()
+        assert r.returncode == 1
 
     # -- bounded version probes (impl-F14) -------------------------------------
 
