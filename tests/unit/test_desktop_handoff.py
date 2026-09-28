@@ -317,6 +317,24 @@ pytestmark_win = pytest.mark.skipif(
 )
 
 
+def _ascii_interpreter() -> str:
+    """This interpreter's path in a form a batch file can hold: pure ASCII.
+
+    cmd reads a ``.cmd`` file in the OEM code page, so a non-ASCII path
+    written into one reaches ``CreateProcess`` as mojibake. The 8.3 short
+    name is ASCII by construction; a volume with 8.3 names turned off keeps
+    the long one, and a non-ASCII long one then has no form the shim can run.
+    """
+    import ctypes  # win-only: ctypes.windll doesn't exist off Windows
+
+    buffer = ctypes.create_unicode_buffer(1024)
+    size = ctypes.windll.kernel32.GetShortPathNameW(sys.executable, buffer, 1024)
+    path = buffer.value if 0 < size < 1024 else sys.executable
+    if not path.isascii():
+        pytest.skip(f"no ASCII form of {sys.executable!a} (8.3 names are off here)")
+    return path
+
+
 @pytest.fixture
 def fake_schtasks(tmp_path, monkeypatch):
     """A recording ``schtasks`` that REALLY runs the launcher script.
@@ -332,19 +350,32 @@ def fake_schtasks(tmp_path, monkeypatch):
     would prove only that the code calls functions. The fake owns the
     scheduler, never the launcher.
 
+    The shim is pure ASCII and lives under a NON-ASCII directory, on purpose:
+    cmd reads a ``.cmd`` file in the OEM code page, so it finds its helper
+    through ``%~dp0`` (which cmd expands from the real path, not the file's
+    bytes) and runs this interpreter by its ASCII short name. No environment
+    variable carries either -- nothing for product code to read.
+
     The scratch ROOT is redirected into tmp_path as well. ``run_on_desktop``
     deliberately leaves its directory behind on failure and names it in
     ``detail``, so the tests that drive the failure paths would otherwise
     accumulate residue in the machine's real temp directory on every run.
+    And so is the caller's working directory, which the desktop copy runs in:
+    a real child must never run in the checkout, where anything it writes
+    relative to its cwd lands in the repository.
     """
-    bin_dir = tmp_path / "fakebin"
+    bin_dir = tmp_path / "fake bin Ñ т"
     bin_dir.mkdir()
-    helper = bin_dir / "schtasks_helper.py"
-    helper.write_text(_FAKE_SCHTASKS, encoding="utf-8")
+    (bin_dir / "schtasks_helper.py").write_text(_FAKE_SCHTASKS, encoding="utf-8")
     fake = bin_dir / "schtasks.cmd"
+    # -I: the helper imports json, and a test may hand the task a PYTHONPATH
+    # that shadows it -- the fake scheduler must not be what that breaks.
     fake.write_text(
-        f'@echo off\r\n"{sys.executable}" "{helper}" %*\r\nexit /b %ERRORLEVEL%\r\n',
-        encoding="utf-8",
+        (
+            f'@echo off\r\n"{_ascii_interpreter()}" -I "%~dp0schtasks_helper.py" %*'
+            "\r\nexit /b %ERRORLEVEL%\r\n"
+        ),
+        encoding="ascii",
     )
     monkeypatch.setattr("magent.platform.windows._schtasks_exe", lambda: str(fake))
     scratch = tmp_path / "systemp"
@@ -352,6 +383,9 @@ def fake_schtasks(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "magent.platform.windows.tempfile.gettempdir", lambda: str(scratch)
     )
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    monkeypatch.chdir(caller)
     return bin_dir
 
 
@@ -406,6 +440,23 @@ class TestRunOnDesktopOnWindows:
             monkeypatch.delenv(name, raising=False)
 
         assert self._plat().logon_session_is_interactive() is True
+
+    def test_the_fake_scheduler_runs_from_a_non_ascii_directory(self, fake_schtasks):
+        # Every test in this class stands on the shim, so it must not be the
+        # thing a non-ASCII temp root breaks: its bytes are ASCII (cmd reads
+        # them in the OEM code page), and it finds its helper from its own
+        # invocation path.
+        shim = (fake_schtasks / "schtasks.cmd").read_bytes()
+        assert not str(fake_schtasks).isascii()
+        assert shim.isascii()
+        assert b"%~dp0schtasks_helper.py" in shim
+
+        result = self._plat().run_on_desktop(
+            [sys.executable, "-c", "pass"], timeout_s=60
+        )
+
+        assert result.rc == 0, result.detail
+        assert [c[0] for c in _calls(fake_schtasks)] == ["/Create", "/Run", "/Delete"]
 
     def test_the_command_really_runs_and_its_streams_come_back(self, fake_schtasks):
         result = self._plat().run_on_desktop(
@@ -793,7 +844,13 @@ class TestTheLauncherReallyRuns:
             encoding=_HANDOFF_SCRIPT_ENCODING,
         )
 
-        subprocess.run([*_HANDOFF_SHELL.split(), str(script)], check=True, timeout=120)
+        # Never the checkout as the cwd: PowerShell writes relative to it.
+        subprocess.run(
+            [*_HANDOFF_SHELL.split(), str(script)],
+            check=True,
+            timeout=120,
+            cwd=tmp_path,
+        )
 
         assert out.read_text(encoding="utf-8").strip() == "ok"
         assert rc.read_text(encoding="utf-8").strip() == "0"
