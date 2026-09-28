@@ -6761,6 +6761,78 @@ class TestSetupShUnderRealBash:
         assert set(_report(r).keys()) == set()
         assert r.returncode == 1
 
+    @pytest.mark.parametrize(
+        ("key_mode", "note"),
+        [
+            (None, ""),
+            (0o600, ""),
+            (0o644, "; id_ed25519 made owner-only: it was 0644, now 0600"),
+        ],
+        ids=["generate", "derive", "derive-over-an-open-key"],
+    )
+    def test_a_dangling_node_key_pub_is_never_written_through(
+        self, tmp_path, key_mode, note
+    ):
+        # `-f` is false for a dangling link, so the .pub reads as lost: the
+        # derive's `> "$id.pub"` and ssh-keygen's own .pub write would create
+        # the link's target. A key beside it is still made owner-only first.
+        state, env = _setup_box(tmp_path)
+        target = tmp_path / "elsewhere" / "planted.pub"
+        target.parent.mkdir()
+        ssh_dir = _existing_user(state, "demo") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        key = ssh_dir / "id_ed25519"
+        if key_mode is not None:
+            key.write_bytes(b"FAKE PRIVATE KEY magent@devino-second\n")
+            key.chmod(key_mode)
+        pub = ssh_dir / "id_ed25519.pub"
+        pub.symlink_to(target)
+        r = _run_setup(env)
+        assert not target.exists()
+        assert pub.is_symlink()
+        assert os.readlink(pub) == str(target)
+        assert _keygen_calls(state) == []
+        assert self._row(r, "node-key:demo") == (
+            "fail",
+            (
+                "demo's id_ed25519.pub is a dangling symlink;"
+                " magent does not write through it" + note
+            ),
+        )
+        if key_mode is None:
+            assert not key.exists()
+        else:
+            assert key.read_bytes() == b"FAKE PRIVATE KEY magent@devino-second\n"
+            assert key.stat().st_mode & 0o777 == 0o600
+        assert set(_report(r).keys()) == set()
+        assert r.returncode == 1
+
+    def test_a_live_symlinked_node_key_pub_is_only_read(self, tmp_path):
+        # A dotfile manager's .pub: the link resolves, so it is read like a
+        # file and reported, never written, and the phase stays ok.
+        state, env = _setup_box(tmp_path)
+        target = tmp_path / "dotfiles" / "id_ed25519.pub"
+        target.parent.mkdir()
+        target.write_bytes(b"ssh-ed25519 AAAADOTFILEKEY demo@dotfiles\n")
+        ssh_dir = _existing_user(state, "demo") / ".ssh"
+        ssh_dir.mkdir(mode=0o700)
+        key = ssh_dir / "id_ed25519"
+        key.write_bytes(b"FAKE PRIVATE KEY demo@dotfiles\n")
+        key.chmod(0o600)
+        pub = ssh_dir / "id_ed25519.pub"
+        pub.symlink_to(target)
+        r = _run_setup(env)
+        assert self._row(r, "node-key:demo") == (
+            "skip",
+            "id_ed25519 already in ~/.ssh",
+        )
+        assert _report(r).keys() == {"demo": "ssh-ed25519 AAAADOTFILEKEY demo@dotfiles"}
+        assert target.read_bytes() == b"ssh-ed25519 AAAADOTFILEKEY demo@dotfiles\n"
+        assert pub.is_symlink()
+        assert os.readlink(pub) == str(target)
+        assert _keygen_calls(state) == []
+        assert r.returncode == 0, r.stderr
+
     def test_a_directory_named_like_the_node_key_keeps_its_mode(self, tmp_path):
         # `-f`, not `-e`: chmod 600 would take a directory's x bit.
         state, env = _setup_box(tmp_path)
