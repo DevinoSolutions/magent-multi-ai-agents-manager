@@ -430,6 +430,25 @@ class TestRunOnDesktopOnWindows:
 
         assert Path(result.stdout.strip()) == Path.cwd()
 
+    def test_a_non_ascii_working_directory_survives_the_script_file(
+        self, fake_schtasks, tmp_path, monkeypatch
+    ):
+        # Windows PowerShell 5.1 reads a `-File` script with no BOM in the ANSI
+        # code page, so a UTF-8 run.ps1 turned this directory into mojibake and
+        # the desktop copy never started. The child prints ascii() of its cwd,
+        # so its own console encoding cannot blur the comparison.
+        where = tmp_path / "caf\u00e9 \u4e2d"
+        where.mkdir()
+        monkeypatch.chdir(where)
+
+        result = self._plat().run_on_desktop(
+            [sys.executable, "-c", "import os; print(ascii(os.getcwd()))"],
+            timeout_s=60,
+        )
+
+        assert result.rc == 0, result.detail
+        assert result.stdout.strip() == ascii(str(where))
+
     def test_the_scheduler_argv_is_the_verified_recipe(self, fake_schtasks):
         self._plat().run_on_desktop([sys.executable, "-c", "pass"], timeout_s=60)
 

@@ -1069,9 +1069,12 @@ class WindowsPlatform(Platform):
         pid_file, rc_file = work / "pid.txt", work / "rc.txt"
         try:
             work.mkdir(parents=True, exist_ok=True)
+            # WITH a BOM: Windows PowerShell 5.1 reads a `-File` script that has
+            # none in the ANSI code page, which turns every non-ASCII character
+            # of a path or an argument into mojibake.
             script.write_text(
                 _handoff_script(argv, str(Path.cwd()), out, err, pid_file, rc_file),
-                encoding="utf-8",
+                encoding="utf-8-sig",
             )
         except OSError as exc:
             return HandoffResult(
