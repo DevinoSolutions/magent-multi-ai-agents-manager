@@ -280,8 +280,10 @@ class _Drain(threading.Thread):
     fails instead of blocking forever. Tail mode (stderr): the oldest bytes are
     dropped instead, and the read runs to the end. Only this thread closes the
     pipe, so no close ever races a read. ``over`` is read once the thread has
-    finished; ``data`` may be taken sooner, as what has arrived so far -- a
-    grandchild can hold a pipe open long after the child is gone."""
+    finished. ``data`` HANDS OVER what is held and forgets it -- a second call
+    returns only what arrived since -- and may be taken before the thread has
+    finished, as what has arrived so far: a grandchild can hold a pipe open
+    long after the child is gone."""
 
     def __init__(self, pipe: IO[bytes] | None, cap: int, *, tail: bool) -> None:
         super().__init__(daemon=True)
