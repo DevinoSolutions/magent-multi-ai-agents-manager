@@ -151,9 +151,13 @@ def _load_json_object(text: str) -> dict[str, object]:
 
 
 def _escaped(text: str) -> str:
-    """``text`` as pure-ASCII escape text (a lone surrogate reads ``\\ud83d``),
-    so a message quoting it prints on any stream in any code page."""
-    return text.encode("ascii", "backslashreplace").decode("ascii")
+    """``text`` as printable-ASCII escape text, so a message quoting it prints
+    on any stream in any code page and does nothing to the terminal. A lone
+    surrogate reads ``\\ud83d``, a control character ``\\x1b`` (an ESC in a
+    config could otherwise retitle the window or recolor the line), and a
+    backslash doubles, as the JSON file spells it, so a literal ``\\ud83d``
+    in a Windows path cannot read like the surrogate."""
+    return text.encode("unicode_escape").decode("ascii")
 
 
 def _refuse_text_with_no_utf8_form(document: dict[str, object]) -> None:
