@@ -30,6 +30,10 @@ REAL_MAGENT_DIR = REAL_HOME / ".magent"
 # on Windows the pytest tmp root lives at %LOCALAPPDATA%\Temp, i.e. inside it.
 # These are the trees a leaking test actually damages.
 _REAL_STATE_ROOTS = (REAL_MAGENT_DIR, REAL_HOME / ".claude")
+# The inherited APPDATA, captured here for the same reason. On Windows it IS
+# env.config_base(), so the developer's real config sits at
+# REAL_APPDATA\magent\config.json. None where it is unset (off Windows).
+REAL_APPDATA = Path(os.environ["APPDATA"]) if os.environ.get("APPDATA") else None
 
 # Tests under this directory keep the machine's own home. tests/platform is the
 # CI-only tier that drives REAL windows, monitors and psmux against the session

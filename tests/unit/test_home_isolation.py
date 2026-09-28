@@ -24,9 +24,10 @@ from pathlib import Path
 
 import pytest
 
-from magent import lockfile
+from magent import env, lockfile, paths
 from tests.conftest import (
     PLAYWRIGHT_BROWSERS_PATH,
+    REAL_APPDATA,
     REAL_HOME,
     REAL_MAGENT_DIR,
     _env_points_at_real_home,
@@ -67,6 +68,48 @@ class TestTheRedirectHolds:
             taken = Path.home() / ".magent" / "home-isolation-pin.lock"
             assert taken.exists()
             assert not (REAL_MAGENT_DIR / "home-isolation-pin.lock").exists()
+
+
+win32_only = pytest.mark.skipif(
+    sys.platform != "win32", reason="APPDATA is the config base on Windows only"
+)
+
+
+class TestAForgottenConfigFlagStaysInTmp:
+    """A test that forgets ``--config`` must never find the developer's real
+    config.
+
+    With no ``--config`` and nothing in the cwd, ``paths.find_config`` falls
+    back to ``env.config_base() / "magent" / "config.json"``, and on Windows
+    ``config_base()`` is ``%APPDATA%``: inherited, i.e. the developer's real
+    Roaming folder, where a live ``config.json`` sits on a dev box. Moving
+    USERPROFILE does not move it. ``vscode_storage_base()`` reads the same
+    variable, so ``discover`` would scan the real VS Code workspace storage.
+    """
+
+    def test_appdata_is_the_tmp_homes_roaming_folder(self):
+        # Every OS: where APPDATA is unset, appdata_dir() falls back to
+        # exactly this path, so the redirect and the fallback agree.
+        assert env.appdata_dir() == Path.home() / "AppData" / "Roaming"
+
+    @win32_only
+    def test_the_appdata_bases_never_reach_the_real_appdata(self):
+        for base in (env.config_base(), env.vscode_storage_base()):
+            assert base.is_relative_to(Path.home()), base
+            if REAL_APPDATA is not None:
+                assert not base.is_relative_to(REAL_APPDATA), base
+
+    @win32_only
+    def test_find_config_without_a_flag_resolves_inside_the_tmp_home(
+        self, tmp_path, monkeypatch
+    ):
+        # A neutral cwd: find_config tries ./magent.config.json first, and
+        # this pin is about the fallback behind it.
+        monkeypatch.chdir(tmp_path)
+        found = paths.find_config(None)
+        assert found == Path.home() / "AppData" / "Roaming" / "magent" / "config.json"
+        if REAL_APPDATA is not None:
+            assert not found.is_relative_to(REAL_APPDATA), found
 
 
 class TestToolCachesSurviveTheRedirect:
