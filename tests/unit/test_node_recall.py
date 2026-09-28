@@ -1838,6 +1838,13 @@ def node_is_gone(monkeypatch, request):
     monkeypatch.setattr(remote_mux, "kill_session", lambda node, sid: None)
 
 
+# What a successful recall --local says last (round-2 ruling).
+_KEEPS_ITS_COPY = (
+    "@second keeps its copy: a later bring-up there continues the node's"
+    " conversation, not the turns added here"
+)
+
+
 def _claude_dir(path: Path) -> Path:
     return Path.home() / ".claude" / "projects" / nodes.encoded_project_dir(str(path))
 
@@ -2115,6 +2122,42 @@ class TestRecallLocal:
         assert f'    cd "{api_repo}"\n    claude\n' in result.stdout
         assert "--resume" not in result.stdout
         assert "&&" not in result.stdout
+
+    @pytest.mark.parametrize(
+        "pulled", [True, False], ids=["conversation", "nothing-pulled"]
+    )
+    def test_a_recall_says_the_node_keeps_its_copy(
+        self, runner, api_repo, tmp_config, node_answers, pulled
+    ):
+        # Round-2 ruling: recall copies, it never takes the node's store
+        # away -- a later bring-up there resumes the node's own conversation.
+        nodes.update_node_map("api", entry("second"))
+        if pulled:
+            write_transcript("second", "api", SESSION_ID, mtime=NOW)
+        cfg = tmp_config(
+            config_json(
+                ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
+            )
+        )
+
+        result = _recall(runner, cfg, "--local")
+
+        assert result.exit_code == 0
+        assert result.stdout.count(_KEEPS_ITS_COPY) == 1
+        assert f"  ! {_KEEPS_ITS_COPY}\n" in result.stdout
+
+    def test_a_stopped_recall_says_nothing_about_the_nodes_copy(
+        self, runner, placed_api, node_answers, monkeypatch
+    ):
+        def _held(*args, **kwargs):
+            raise LockHeld("node-sync lock is held by another process")
+
+        monkeypatch.setattr(node_sync, "final_pull", _held)
+
+        result = _recall(runner, placed_api, "--local")
+
+        assert result.exit_code == 3
+        assert "keeps its copy" not in result.output
 
     def test_a_memory_only_pull_is_installed_and_claude_starts_fresh(
         self, runner, memory_only, node_answers, api_repo, monkeypatch

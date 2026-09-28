@@ -1273,15 +1273,21 @@ def _recall_local(
         click.echo(style("    (cmd.exe: use cd /d)", dim=True))
     if resume_id is None:
         click.echo("    claude")
-        return
-    click.echo(f"    claude --resume {resume_id}")
-    click.echo(
-        style(
-            f"  If claude says it cannot find that conversation, it is on disk at"
-            f" {dest / (resume_id + '.jsonl')}; resume by hand: run `claude --resume`"
-            f" in {local_dir} and pick it from the list.",
-            dim=True,
+    else:
+        click.echo(f"    claude --resume {resume_id}")
+        click.echo(
+            style(
+                f"  If claude says it cannot find that conversation, it is on disk"
+                f" at {dest / (resume_id + '.jsonl')}; resume by hand: run"
+                f" `claude --resume` in {local_dir} and pick it from the list.",
+                dim=True,
+            )
         )
+    # A recall copies: the node's store is untouched, and a bring-up there
+    # resumes from it (`claude --continue`), never from this PC's turns.
+    _note(
+        f"@{held.nick} keeps its copy: a later bring-up there continues the"
+        " node's conversation, not the turns added here"
     )
 
 
