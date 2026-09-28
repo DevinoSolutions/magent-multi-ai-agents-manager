@@ -27,7 +27,8 @@
 # Exit codes: 2 the name is outside the encoder's alphabet; 3 the payload is
 # missing or broken; 4 the destination (or a directory inside it the payload
 # needs) is a symlink, which could point anywhere; 5 a folder it needs could
-# not be made (a node user with no home, say), before any file is placed.
+# not be made (a node user with no home, say) or restricted to its owner,
+# before any file is placed.
 #
 # The name was computed by magent's one encoder (nodes.encoded_project_dir);
 # this script only refuses anything outside that encoder's alphabet, so a bad
@@ -69,16 +70,20 @@ under_a_file() {
 # mkdir's mode, never widen it, and the chmod makes it exact. A mkdir that
 # fails with the folder there after all lost a race to another install,
 # whose private_dir made it: success, as mkdir -p had it. Any other failure
-# is said in this script's words (mkdir's stay off the screen) and returns
-# 1; each caller refuses with exit 5.
+# -- no folder, or one made that the chmod could not restrict -- is said in
+# this script's words (mkdir's stay off the screen) and returns 1; each
+# caller refuses with exit 5.
 private_dir() {
   [ -d "$1" ] && return 0
   if mkdir -m 700 -- "$1" 2>/dev/null; then
     chmod 700 -- "$1" && return 0
+    printf 'install_transcripts.sh: cannot restrict folder %s to its owner; no file installed\n' \
+      "$1" >&2
   elif [ -d "$1" ]; then
     return 0
+  else
+    printf 'install_transcripts.sh: cannot make folder %s; no file installed\n' "$1" >&2
   fi
-  printf 'install_transcripts.sh: cannot make folder %s; no file installed\n' "$1" >&2
   return 1
 }
 

@@ -1172,14 +1172,15 @@ _DEFAULT_ACL_RWX_FOR_ALL = struct.pack("<I", 2) + b"".join(
 )
 
 
-def _mkdir_shim(tmp_path: Path, monkeypatch, body: str) -> None:
-    """A ``mkdir`` ahead of the real one on PATH. ``body`` runs with the
-    folder private_dir asked for in $last and the real mkdir in $real."""
-    real = shutil.which("mkdir")
+def _path_shim(tmp_path: Path, monkeypatch, program: str, body: str) -> None:
+    """A ``program`` ahead of the real one on PATH. ``body`` runs with its
+    last argument -- the folder private_dir asked for -- in $last and the
+    real program in $real."""
+    real = shutil.which(program)
     assert real is not None
     shim_dir = tmp_path / "shim"
     shim_dir.mkdir()
-    shim = shim_dir / "mkdir"
+    shim = shim_dir / program
     shim.write_text(
         f"#!/bin/sh\nreal={shlex.quote(real)}\nfor last; do :; done\n{body}",
         encoding="utf-8",
@@ -1197,16 +1198,30 @@ _LOSES_THE_RACE = (
 )
 
 
-def _refuses(folder: str) -> str:
-    """A mkdir that fails on ``folder`` and leaves nothing there, and is the
-    real one for every other folder."""
+_MKDIR_REFUSED = "mkdir: cannot create directory '$last': Permission denied"
+_CHMOD_REFUSED = "chmod: changing permissions of '$last': Operation not permitted"
+
+
+def _refuses(folder: str, said: str) -> str:
+    """A program that fails on ``folder``, saying ``said`` and changing
+    nothing there, and is the real one for every other path."""
     return (
         f'case "$last" in {shlex.quote(folder)})\n'
-        "  echo \"mkdir: cannot create directory '$last': Permission denied\" >&2\n"
+        f'  echo "{said}" >&2\n'
         "  exit 1 ;;\n"
         "esac\n"
         'exec "$real" "$@"\n'
     )
+
+
+# Each place private_dir runs: the two parents before the payload is read,
+# the destination, and a folder inside it.
+_PRIVATE_DIR_SITES = (
+    ".claude",
+    ".claude/projects",
+    f".claude/projects/{_ENCODED}",
+    f".claude/projects/{_ENCODED}/{SESSION_ID}/subagents",
+)
 
 
 # Everything under the node home's ~/.claude after a good install of that tar.
@@ -1233,8 +1248,9 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
     carries: every payload item is chmodded before it moves, and every folder
     the script makes is private_dir's. private_dir keeps what mkdir -p
     tolerated -- a folder another install made first is not a failure --
-    and a folder it really cannot make is refused as exit 5, in the
-    script's own words: mkdir's never reach the screen."""
+    and a folder it really cannot make, or made but cannot restrict to its
+    owner, is refused as exit 5, in the script's own words: mkdir's never
+    reach the screen."""
 
     @staticmethod
     def _modes(home: Path) -> dict[str, str]:
@@ -1316,7 +1332,7 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
         # moment earlier. mkdir -p shrugged that off; private_dir must too.
         home = tmp_path / "nodehome"
         home.mkdir()
-        _mkdir_shim(tmp_path, monkeypatch, _LOSES_THE_RACE)
+        _path_shim(tmp_path, monkeypatch, "mkdir", _LOSES_THE_RACE)
 
         done = _node_run(self._call(monkeypatch), home)
 
@@ -1328,15 +1344,7 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
             _PULLED_JSONL
         )
 
-    @pytest.mark.parametrize(
-        "rel",
-        [
-            ".claude",
-            ".claude/projects",
-            f".claude/projects/{_ENCODED}",
-            f".claude/projects/{_ENCODED}/{SESSION_ID}/subagents",
-        ],
-    )
+    @pytest.mark.parametrize("rel", _PRIVATE_DIR_SITES)
     def test_a_folder_that_cannot_be_made_is_refused_in_the_scripts_words(
         self, monkeypatch, tmp_path, rel
     ):
@@ -1346,7 +1354,7 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
         home = tmp_path / "nodehome"
         home.mkdir()
         refused = f"{home}/{rel}"
-        _mkdir_shim(tmp_path, monkeypatch, _refuses(refused))
+        _path_shim(tmp_path, monkeypatch, "mkdir", _refuses(refused, _MKDIR_REFUSED))
 
         done = _node_run(self._call(monkeypatch), home)
 
@@ -1358,6 +1366,30 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
                 " no file installed\n"
             ).encode()
         )
+        assert [p for p in home.rglob("*") if not p.is_dir()] == []
+
+    @pytest.mark.parametrize("rel", _PRIVATE_DIR_SITES)
+    def test_a_folder_made_but_not_restricted_is_refused_as_such(
+        self, monkeypatch, tmp_path, rel
+    ):
+        # mkdir made the folder; the chmod that makes it exactly owner-only
+        # failed. The refusal names that, not a folder it could not make.
+        home = tmp_path / "nodehome"
+        home.mkdir()
+        refused = f"{home}/{rel}"
+        _path_shim(tmp_path, monkeypatch, "chmod", _refuses(refused, _CHMOD_REFUSED))
+
+        done = _node_run(self._call(monkeypatch), home)
+
+        assert done.returncode == 5
+        assert (
+            done.stderr.splitlines()[-1]
+            == (
+                f"install_transcripts.sh: cannot restrict folder {refused} to its"
+                " owner; no file installed"
+            ).encode()
+        )
+        assert b"cannot make folder" not in done.stderr
         assert [p for p in home.rglob("*") if not p.is_dir()] == []
 
     @pytest.mark.skipif(
