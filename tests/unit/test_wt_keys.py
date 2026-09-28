@@ -275,34 +275,90 @@ class TestNestedPastTheParsersDepth:
         assert "not found" not in result.output
         assert path.read_bytes() == _NESTED.encode("utf-8")
 
-    # Nesting is not JSONC: the comments-and-trailing-commas hint would send
-    # the file's owner looking for syntax that is not there.
 
-    def test_install_refuses_without_the_jsonc_hint(self, runner, tmp_path):
-        path = self._nested(tmp_path)
+_NOT_A_SYNTAX_ERROR = [
+    pytest.param(_NESTED.encode("utf-8"), id="nested"),
+    pytest.param(b'{"actions": "\xff"}', id="not-utf8"),
+    pytest.param(b"[]", id="not-an-object"),
+]
+_A_SYNTAX_ERROR = '{\n  // Windows Terminal allows comments\n  "actions": [],\n}\n'
+
+
+class TestTheJsoncHintFollowsOnlyASyntaxError:
+    """Windows Terminal's JSONC (comments, trailing commas) explains exactly
+    one refusal: a JSON syntax error. A file nested past the parser's depth,
+    one that is not UTF-8 and one that parses but is not an object are none
+    of that, and the hint would send their owner looking for syntax that is
+    not there."""
+
+    @staticmethod
+    def _plant(tmp_path, content):
+        path = tmp_path / "settings.json"
+        path.write_bytes(content)
+        return path
+
+    @staticmethod
+    def _reason(path):
+        with pytest.raises(wt_keys.SettingsParseError) as caught:
+            wt_keys.load_settings(path)
+        return str(caught.value)
+
+    @pytest.mark.parametrize("content", _NOT_A_SYNTAX_ERROR)
+    def test_install_refuses_without_the_hint(self, runner, tmp_path, content):
+        path = self._plant(tmp_path, content)
 
         result = _install(runner, path)
 
-        assert result.stderr == (
-            f"  x Cannot edit {path}: settings.json is nested too deeply to parse\n"
-        )
+        assert result.exit_code == 1
+        assert result.stderr == f"  x Cannot edit {path}: {self._reason(path)}\n"
         assert result.stdout.startswith(
             "  magent never rewrites a file it could not read. "
             "Add this by hand instead:\n\n    "
         )
         assert "comments" not in result.output
         assert "JSONC" not in result.output
+        assert path.read_bytes() == content
 
-    def test_status_reports_without_the_jsonc_hint(self, runner, tmp_path):
-        path = self._nested(tmp_path)
+    @pytest.mark.parametrize("content", _NOT_A_SYNTAX_ERROR)
+    def test_status_reports_without_the_hint(self, runner, tmp_path, content):
+        path = self._plant(tmp_path, content)
 
         result = _status(runner, path)
 
         assert result.output == (
             f"  {path}\n"
-            "  ! unreadable: settings.json is nested too deeply to parse\n"
+            f"  ! unreadable: {self._reason(path)}\n"
             "  magent will not rewrite a file it cannot parse. Run\n"
             "  `magent terminal install` for the snippet to paste by hand.\n"
+        )
+
+    def test_a_syntax_error_keeps_the_hint_byte_for_byte_on_install(
+        self, runner, tmp_path
+    ):
+        path = self._plant(tmp_path, _A_SYNTAX_ERROR.encode())
+
+        result = _install(runner, path)
+
+        assert result.stderr == f"  x Cannot edit {path}: {self._reason(path)}\n"
+        assert result.stdout.startswith(
+            "  Windows Terminal accepts comments and trailing commas; the\n"
+            "  stdlib JSON parser does not, and magent never rewrites a file\n"
+            "  it could not read. Add this by hand instead:\n\n    "
+        )
+
+    def test_a_syntax_error_keeps_the_hint_byte_for_byte_on_status(
+        self, runner, tmp_path
+    ):
+        path = self._plant(tmp_path, _A_SYNTAX_ERROR.encode())
+
+        result = _status(runner, path)
+
+        assert result.output == (
+            f"  {path}\n"
+            f"  ! unreadable: {self._reason(path)}\n"
+            "  Windows Terminal allows JSONC; magent will not rewrite a\n"
+            "  file it cannot parse. Run `magent terminal install` for the\n"
+            "  snippet to paste by hand.\n"
         )
 
 
