@@ -216,11 +216,18 @@ user_claude() {
 
 # Never a second node key over the first: GitHub may already hold it. A lost
 # .pub is derived again from the private key.
+# The key is chmod 600 on every run and again once generated: ssh-keygen's 0600
+# is umask 077 over open(0644) (OpenSSH >= 8.2), which a default ACL on ~/.ssh
+# overrides, and ssh (and `ssh-keygen -y`) refuses a key others can read.
 # shellcheck disable=SC2317  # invoked through `declare -f` in run_user_phase
 user_node_key() {
   local u=$1 out pub ssh="$HOME/.ssh" id="$HOME/.ssh/id_ed25519"
-  if [ -h "$ssh" ]; then
-    say fail "node-key:$u" "$u's .ssh is a symlink; magent does not write through it"
+  if [ -h "$ssh" ] || [ -h "$id" ]; then
+    say fail "node-key:$u" "$u's .ssh or its id_ed25519 is a symlink; magent does not write through it"
+    return 1
+  fi
+  if [ -f "$id" ] && ! chmod 600 "$id" 2>/dev/null; then
+    say fail "node-key:$u" "could not make ~/.ssh/id_ed25519 owner-only (0600); ssh refuses an open key"
     return 1
   fi
   if [ -f "$id.pub" ]; then
@@ -237,6 +244,10 @@ user_node_key() {
     say did "node-key:$u" "id_ed25519.pub derived again from the private key in ~/.ssh"
   elif out=$( { { [ -d "$ssh" ] || mkdir -m 700 "$ssh"; } &&
       ssh-keygen -q -t ed25519 -N "" -C "magent@$(hostname)" -f "$id"; } 2>&1 ); then
+    if ! chmod 600 "$id" 2>/dev/null; then
+      say fail "node-key:$u" "could not make the new ~/.ssh/id_ed25519 owner-only (0600); ssh refuses an open key"
+      return 1
+    fi
     say did "node-key:$u" "id_ed25519 generated in ~/.ssh (the private key never leaves this node)"
   else
     say fail "node-key:$u" "ssh-keygen: ${out##*$'\n'}"
