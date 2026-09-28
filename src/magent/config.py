@@ -17,7 +17,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import click
 
@@ -160,6 +160,30 @@ def _escaped(text: str) -> str:
     return text.encode("unicode_escape").decode("ascii")
 
 
+class _Step(NamedTuple):
+    """One step of a field's JSON path -- an object key or a list index --
+    linked to the step before it; ``None`` above the first is the document."""
+
+    up: _Step | None
+    to: str | int
+
+
+def _where(at: _Step | None) -> str:
+    """``at`` spelled the way _warn_unknown_keys names a field
+    (``projects[0].title``); the document itself is ``""``."""
+    steps: list[str | int] = []
+    while at is not None:
+        steps.append(at.to)
+        at = at.up
+    where = ""
+    for to in reversed(steps):
+        if isinstance(to, int):
+            where = f"{where}[{to}]"
+        else:
+            where = f"{where}.{to}" if where else to
+    return where
+
+
 def _refuse_text_with_no_utf8_form(document: dict[str, object]) -> None:
     """Raise ConfigError at the first string in ``document`` -- a value or a
     key, at any depth -- that has no UTF-8 form.
@@ -178,26 +202,35 @@ def _refuse_text_with_no_utf8_form(document: dict[str, object]) -> None:
     accepts nesting deeper than the recursion limit and such a file has always
     loaded, so the check must not be what turns it into a traceback. Children
     go on the stack reversed, so strings are met in document order -- each key
-    just before its value -- and the one refused is the first in the file."""
-    stack: list[tuple[object, str]] = [(document, "")]
+    just before its value -- and the one refused is the first in the file.
+
+    An entry carries its path as a _Step, not as a spelled-out label: a deep
+    document's later siblings wait on the stack while the walk descends, and a
+    full label apiece made that quadratic in the depth (450 MB for a 155 KB
+    file). Only the refused string's label is ever spelled out."""
+    # (node, its path -- for a key, its object's path --, whether it is a key)
+    stack: list[tuple[object, _Step | None, bool]] = [(document, None, False)]
     while stack:
-        node, where = stack.pop()
+        node, at, is_key = stack.pop()
         if isinstance(node, str):
             try:
                 node.encode("utf-8")
             except UnicodeEncodeError as e:
+                where = _where(at)
+                if is_key:
+                    where = f"a key in {where or 'the config'}"
                 raise ConfigError(
                     f"{_escaped(where)} has text with no UTF-8 form"
                     f" ({type(e).__name__}): '{_escaped(node)}'"
                 ) from e
         elif isinstance(node, dict):
-            children: list[tuple[object, str]] = []
+            children: list[tuple[object, _Step | None, bool]] = []
             for key, value in node.items():
-                children.append((key, f"a key in {where or 'the config'}"))
-                children.append((value, f"{where}.{key}" if where else key))
+                children.append((key, at, True))
+                children.append((value, _Step(at, key), False))
             stack.extend(reversed(children))
         elif isinstance(node, list):
-            items = [(item, f"{where}[{i}]") for i, item in enumerate(node)]
+            items = [(item, _Step(at, i), False) for i, item in enumerate(node)]
             stack.extend(reversed(items))
 
 
