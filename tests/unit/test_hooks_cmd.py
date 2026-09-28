@@ -14,6 +14,10 @@ from magent.cli import hooks_cmd
 
 EVENTS = list(hooks_cmd._EVENTS)
 
+# A settings file nested past the JSON parser's depth: json.loads raises
+# RecursionError on it, which is not a ValueError.
+_NESTED = '{"hooks": ' + "[" * 200_000 + "]" * 200_000 + "}"
+
 
 @pytest.fixture(autouse=True)
 def _isolate_state(tmp_path, monkeypatch):
@@ -253,6 +257,18 @@ class TestInstall:
         assert result.exit_code == 1
         assert settings.read_text(encoding="utf-8") == "not json {"
 
+    def test_settings_nested_past_the_parsers_depth_exits_one(self, runner, tmp_path):
+        # json.loads raises RecursionError there, not ValueError: it must be
+        # the same named refusal, never a traceback, and the file is untouched.
+        settings = tmp_path / "settings.json"
+        settings.write_text(_NESTED, encoding="utf-8")
+        result = _install(runner, settings)
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        assert f"Cannot edit {settings}: " in result.stderr
+        assert "nested too deeply" in result.stderr
+        assert settings.read_text(encoding="utf-8") == _NESTED
+
     def test_module_form_is_not_duplicated(self, runner, tmp_path):
         # A module-form entry IS the state hook: adding the console script
         # beside it would run the writer twice per event.
@@ -336,6 +352,18 @@ class TestInstall:
 
 
 class TestStatus:
+    def test_settings_nested_past_the_parsers_depth_read_as_unwired(
+        self, runner, tmp_path
+    ):
+        settings = tmp_path / "settings.json"
+        settings.write_text(_NESTED, encoding="utf-8")
+        result = runner.invoke(
+            cli.main, ["hooks", "status", "--settings-file", str(settings)]
+        )
+        assert result.exit_code == 0, result.exception
+        for event in EVENTS:
+            assert f"x {event}" in result.output
+
     def test_unwired_events_marked_and_empty_store_reported(self, runner, tmp_path):
         result = runner.invoke(
             cli.main,

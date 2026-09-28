@@ -76,7 +76,12 @@ def _codex_recipe() -> str:
 def _load_settings(path: Path) -> dict[str, object]:
     if not path.exists():
         return {}
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except RecursionError as exc:
+        # JSON nested past the parser's depth. Every caller catches ValueError
+        # for a file it cannot use, and this is one.
+        raise ValueError("settings.json is nested too deeply to parse") from exc
     if not isinstance(data, dict):
         raise TypeError("settings.json is not a JSON object")
     return data
