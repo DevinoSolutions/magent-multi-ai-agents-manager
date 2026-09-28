@@ -124,8 +124,9 @@ def _force_utf8_console() -> None:
     consoles that default to a legacy code page. Best-effort: the expected
     OS/attribute errors (redirected stdout, missing console) are suppressed so a
     cosmetic failure never crashes the CLI; an unexpected error still surfaces.
-    ``errors`` is passed again because reconfiguring the encoding alone resets
-    it to strict, undoing the entry point's escape (app.py)."""
+    The stream's own ``errors`` is passed back because reconfiguring the
+    encoding alone resets it to strict, undoing whatever handler the entry
+    point gave stdout (app.py's ``magent.escape``)."""
     if sys.platform != "win32":
         return
     with contextlib.suppress(OSError, AttributeError):
@@ -135,7 +136,7 @@ def _force_utf8_console() -> None:
     with contextlib.suppress(OSError, AttributeError, ValueError):
         reconfigure = getattr(sys.stdout, "reconfigure", None)
         if reconfigure is not None:
-            reconfigure(encoding="utf-8", errors="backslashreplace")
+            reconfigure(encoding="utf-8", errors=sys.stdout.errors)
 
 
 def _print_qr(url: str) -> None:

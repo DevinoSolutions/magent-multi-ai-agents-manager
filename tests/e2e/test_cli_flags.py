@@ -53,10 +53,11 @@ class TestCliFlags:
         assert "No config found" in result.stderr or "config" in result.stderr.lower()
 
     def test_a_name_the_piped_stdout_cannot_hold_prints_as_an_escape(self, tmp_path):
-        # A redirected Windows stdout is the ANSI code page with strict
-        # errors. PYTHONIOENCODING forces that on the CHILD so every OS's leg
-        # runs this, not only Windows. One CJK project name used to end the
-        # command with rc 1 and a UnicodeEncodeError traceback.
+        # A redirected Windows stdout is the ANSI code page with a handler
+        # that raises on it. PYTHONIOENCODING forces that on the CHILD so
+        # every OS's leg runs this, not only Windows. One CJK project name
+        # used to end the command with rc 1 and a UnicodeEncodeError
+        # traceback.
         cfg = tmp_path / "magent.config.json"
         cfg.write_text(
             json.dumps({"projects": [{"path": str(tmp_path / "café 中文")}]})
@@ -70,6 +71,40 @@ class TestCliFlags:
         # The accent is cp1252's own byte, as before; only what cp1252 lacks
         # is escaped.
         assert b"caf\xe9 \\u4e2d\\u6587" in result.stdout
+
+    def test_a_path_byte_that_is_not_utf8_prints_back_as_that_byte(self, tmp_path):
+        # Python's UTF-8 mode (and a POSIX C.UTF-8 locale) reads a non-UTF-8
+        # byte in argv as a lone U+DC80..U+DCFF and writes it back as the
+        # same byte, so a script piping `magent config path` gets the real
+        # path. The escape must not turn that byte into the text "\udcff".
+        # The argv carries the lone surrogate itself: POSIX encodes it back
+        # into the byte, and Windows passes it through as an unpaired UTF-16
+        # unit, so the child's argv holds the same character on every OS.
+        cfg = str(tmp_path / "x\udcff.json")
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONIOENCODING"}
+        env["PYTHONUTF8"] = "1"
+        result = subprocess.run(
+            [sys.executable, "-m", "magent", "--config", cfg, "config", "path"],
+            capture_output=True,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.rstrip(b"\r\n").endswith(b"x\xff.json")
+
+    def test_stderr_escapes_too_so_the_error_is_still_the_error(self, tmp_path):
+        # stderr has always been backslashreplace, which is why only stdout
+        # needed the entry point's handler. A diagnostic naming a path the
+        # code page lacks stays the command's own verdict, not a traceback.
+        missing = tmp_path / "\u4e2d" / "magent.config.json"
+        result = subprocess.run(
+            [sys.executable, "-m", "magent", "--config", str(missing), "config", "cat"],
+            capture_output=True,
+            env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+        )
+        assert result.returncode == 1
+        assert b"cannot read" in result.stderr
+        assert b"\\u4e2d" in result.stderr
+        assert b"Traceback" not in result.stderr
 
     def test_invalid_json_exits_nonzero(self, tmp_path):
         bad = tmp_path / "bad.json"
