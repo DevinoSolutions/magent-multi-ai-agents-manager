@@ -475,21 +475,37 @@ def spawned(monkeypatch):
 # pipe reads.
 CAP = 256 * 1024
 
-# A child that leaves a GRANDCHILD holding its stderr open (inherited; its pid
-# goes to argv[1]), says one line on stderr, then floods stdout. The 90s sleep
-# outlives every bound the call has (timeout_s=60 + two 1s reaps), so the
-# teardown's kill-by-pid always hits the live grandchild, never a pid Windows
-# reused. Not longer: an unbounded-join mutant waits out the whole sleep.
-_HELD_STDERR_CHILD = """\
-import subprocess, sys
-grandchild = subprocess.Popen(
-    [sys.executable, "-c", "import time; time.sleep(90)"],
+# The GRANDCHILD that holds a child's stderr open (inherited). It writes its
+# OWN pid to argv[1], whole or not at all: on Windows sys.executable may be a
+# launcher, and the pid to kill is the sleeping interpreter's, not whatever
+# Popen.pid names. The 90s sleep outlives every bound the call has
+# (timeout_s=60 + two 1s reaps), so the teardown's kill-by-pid always hits the
+# live grandchild, never a pid Windows reused. Not longer: an unbounded-join
+# mutant waits out the whole sleep.
+_HELD_STDERR_GRANDCHILD = """\
+import os, sys, time
+with open(sys.argv[1] + ".tmp", "w") as f:
+    f.write(str(os.getpid()))
+os.replace(sys.argv[1] + ".tmp", sys.argv[1])
+time.sleep(90)
+"""
+
+# A child that leaves that grandchild behind, waits for its pid file (so the
+# teardown never finds it missing), says one line on stderr, then floods
+# stdout.
+_HELD_STDERR_CHILD = (
+    f"GRANDCHILD = {_HELD_STDERR_GRANDCHILD!r}\n"
+    """\
+import os, subprocess, sys, time
+subprocess.Popen(
+    [sys.executable, "-c", GRANDCHILD, sys.argv[1]],
     stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
     stderr=None,
 )
-with open(sys.argv[1], "w") as f:
-    f.write(str(grandchild.pid))
+deadline = time.monotonic() + 30
+while not os.path.exists(sys.argv[1]) and time.monotonic() < deadline:
+    time.sleep(0.01)
 sys.stderr.write("boom: disk full\\n")
 sys.stderr.flush()
 block = b"x" * 65536
@@ -497,6 +513,7 @@ while True:
     sys.stdout.buffer.write(block)
     sys.stdout.flush()
 """
+)
 
 
 class TestTheReplyIsBoundedInMemory:
@@ -605,7 +622,9 @@ class TestTheReplyIsBoundedInMemory:
         assert "boom: disk full" in lines[1:]
 
     def _flood_past_a_held_stderr(self, tmp_path) -> tuple[RemoteError, float]:
-        """_HELD_STDERR_CHILD's over-cap error, and how long it took."""
+        """_HELD_STDERR_CHILD's over-cap error, and how long it took. The
+        teardown kills the grandchild's own pid, once, and only if the
+        grandchild wrote it."""
         pidfile = tmp_path / "grandchild.pid"
         started = time.monotonic()
         try:
