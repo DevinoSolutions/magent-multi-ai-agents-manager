@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import types
 from importlib import resources
 from pathlib import Path
 from typing import NoReturn
@@ -2108,6 +2109,52 @@ class TestOneConnectionBringsAProjectUp:
         node_home.set_reply("bash -s --", stdout="hello\n")
         with pytest.raises(RemoteError, match="not a bring-up result"):
             remote_mux.bring_up(NODE, _recipe(tmp_path))
+
+    def test_blank_output_is_a_remote_error_not_a_crash(self, node_home, tmp_path):
+        # No last line to read is no result, never an IndexError out of `up`.
+        node_home.set_reply("bash -s --", stdout="\n  \n")
+        with pytest.raises(RemoteError, match="not a bring-up result"):
+            remote_mux.bring_up(NODE, _recipe(tmp_path))
+
+    # Refused before json parses it, whatever json would do with it on this
+    # stack: raise RecursionError out of the bring-up worker (aborting the
+    # whole `up`), or -- one level past the bound, beside a good result's
+    # fields -- parse it whole. Still the node's bad answer: this node's row.
+    @pytest.mark.parametrize(
+        "last_line",
+        [
+            pytest.param("[" * 200_000, id="200k-open"),
+            pytest.param(
+                json.dumps(_RESULT)[:-1] + ', "junk": ' + "[" * 64 + "]" * 64 + "}",
+                id="65-deep-beside-a-good-result",
+            ),
+        ],
+    )
+    def test_a_result_nested_too_deeply_is_a_remote_error_not_a_crash(
+        self, node_home, tmp_path, last_line
+    ):
+        node_home.set_reply("bash -s --", stdout="cloning...\n" + last_line + "\n")
+        with pytest.raises(RemoteError, match="not a bring-up result") as info:
+            remote_mux.bring_up(NODE, _recipe(tmp_path))
+        # rc 0: the node answered; the answer was malformed.
+        assert info.value.rc == 0
+
+    # The backstop behind the scan: a RecursionError out of the parse is no
+    # result, never a raise.
+    def test_a_recursion_error_the_scan_let_through_is_no_result_never_raised(
+        self, monkeypatch
+    ):
+        def loads(text: str) -> object:
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr(remote_mux.json_depth, "nests_too_deep", lambda text: False)
+        monkeypatch.setattr(remote_mux, "json", types.SimpleNamespace(loads=loads))
+        done = subprocess.CompletedProcess([], 0, stdout=b"{}\n", stderr=b"")
+        try:
+            found: object = remote_mux._parse_result(done)
+        except RecursionError as e:  # a raise is this pin's FAILURE
+            found = e
+        assert found is None
 
     def test_a_home_refusal_names_the_probe_that_ran(
         self, fake_ssh, patient_probe, tmp_path

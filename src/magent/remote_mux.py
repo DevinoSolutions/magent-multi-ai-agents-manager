@@ -2733,9 +2733,16 @@ def _parse_result(
     read is not a success."""
     text = result.stdout.decode("utf-8", "replace")
     lines = [line for line in text.splitlines() if line.strip()]
+    # Refused before json parses it, the same on every stack: 200k '[' fit
+    # well inside the reply cap, and a RecursionError out of a bring-up
+    # worker would abort the whole `up`, not refuse this one node.
+    if not lines or json_depth.nests_too_deep(lines[-1]):
+        return None
     try:
-        parsed = json.loads(lines[-1]) if lines else None
-    except ValueError:
+        parsed = json.loads(lines[-1])
+    # RecursionError: the backstop for any nesting the scan did not refuse.
+    # The node's bad answer, not a bug on this PC.
+    except (ValueError, RecursionError):
         return None
     return parsed if isinstance(parsed, dict) else None
 
