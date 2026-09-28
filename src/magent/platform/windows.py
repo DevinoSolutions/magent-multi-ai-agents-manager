@@ -364,9 +364,19 @@ def _read_handoff_text(path: Path) -> str:
     first because a child in Python's UTF-8 mode writes it, and ANSI text that
     also parses as UTF-8 is already mojibake (``Ã©``). ``mbcs`` is the ANSI
     code page whatever Python's own UTF-8 mode says; it exists only on Windows,
-    the only place this module imports. ``errors="replace"`` on that last step:
-    this text is RELAYED to a human, and a mojibake character in a diagnostic
-    is strictly better than losing the diagnostic to a UnicodeDecodeError.
+    the only place this module imports (its module-level ``windll`` import fails
+    anywhere else, so the LookupError ``mbcs`` would raise there is
+    unreachable). ``errors="replace"`` on that last step: this text is RELAYED
+    to a human, and a mojibake character in a diagnostic is strictly better
+    than losing the diagnostic to a UnicodeDecodeError. A character the code
+    page cannot hold never reaches this file raw: a magent child writes it as
+    an escape (``\\u4e2d``, see ``cli/app.py``), relayed as written.
+
+    Known limit: the fallback is WHOLE-FILE. One byte that is not UTF-8
+    anywhere decodes the entire file as ANSI, so a UTF-8 child whose output
+    also holds such a byte -- or whose last character was cut mid-sequence
+    because a timeout read the file while it was still being written -- reads
+    as mojibake throughout. Accepted: the text is a relayed diagnostic.
     """
     try:
         try:
