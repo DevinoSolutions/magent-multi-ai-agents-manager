@@ -11,6 +11,7 @@ of a transcript IS its session id; subagent logs (agent-*.jsonl, anything under
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import logging
@@ -3643,19 +3644,72 @@ class TestRecallTo:
     def test_a_failed_bring_up_exits_3_saying_the_conversation_is_installed(
         self, runner, placed_api, node_answers, moving, monkeypatch
     ):
+        # The race the pre-check cannot close: the tree was clean when the
+        # move was checked and is dirty by the bring-up, whose own D7 refusal
+        # is the backstop. The conversation is on @third by then, and says so.
+        events, state = moving
+        edited: list[bool] = []
         monkeypatch.setattr(
             launch,
-            "bring_up_node_project",
-            lambda config, proj, *, resume_id=None, **_k: launch.NodeBringUpOutcome(
-                ok=False, sid="api", node=proj.node, error="local tree is dirty"
-            ),
+            "node_git_states",
+            lambda config, proj: [dataclasses.replace(state, dirty=bool(edited))],
         )
+        install = remote_mux.install_transcripts  # moving's recording stub
+
+        def _install_while_a_file_is_saved(*args, **kwargs):
+            edited.append(True)
+            return install(*args, **kwargs)
+
+        def _bring_up(config, proj, *, resume_id=None, **_k):
+            # D's D7 check, as bring_up_node_project makes it.
+            refusals = [
+                text
+                for tree in launch.node_git_states(config, proj)
+                if (text := nodes.refusal_for(tree))
+            ]
+            return launch.NodeBringUpOutcome(
+                ok=not refusals,
+                sid="api",
+                node=proj.node,
+                error="; ".join(refusals) or None,
+            )
+
+        monkeypatch.setattr(
+            remote_mux, "install_transcripts", _install_while_a_file_is_saved
+        )
+        monkeypatch.setattr(launch, "bring_up_node_project", _bring_up)
 
         result = _invoke_recall_to(runner, placed_api, "third")
 
         assert result.exit_code == 3
-        assert "local tree is dirty" in result.stderr
+        assert "uncommitted changes (dirty tree)" in result.stderr
         assert "installed there" in result.stderr
+        assert [e[0] for e in events] == ["install"]
+
+    @pytest.mark.parametrize(
+        "change", [{"dirty": True}, {"unpushed": True}], ids=["dirty", "unpushed"]
+    )
+    def test_a_tree_the_node_cannot_reproduce_refuses_before_the_source(
+        self, runner, placed_api, node_answers, moving, monkeypatch, change
+    ):
+        # Round-2 ruling: the bring-up's own D7 check, in its words, made
+        # before the source is stopped. Made only after, the session ran
+        # nowhere: stopped on @second, refused on @third.
+        events, state = moving
+        tree = dataclasses.replace(state, **change)
+        monkeypatch.setattr(launch, "node_git_states", lambda config, proj: [tree])
+        refusal = nodes.refusal_for(tree)
+        assert refusal is not None
+
+        result = _invoke_recall_to(runner, placed_api, "third")
+
+        assert result.exit_code == 2
+        assert (
+            f"x cannot move api to @third: {refusal}; nothing was touched"
+        ) in result.stderr
+        assert node_answers == []  # no pull, no repo read, no kill
+        assert events == []  # no install, no bring-up
+        assert nodes.read_node_map()["api"].nick == "second"
 
     def test_a_held_map_lock_stops_the_move_before_the_bring_up(
         self, runner, placed_api, node_answers, moving, monkeypatch

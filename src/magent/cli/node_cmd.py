@@ -1280,7 +1280,9 @@ def _destination(
     touched: the node and the session root the conversation goes to. The
     move is a placement, so it gets every placement's folder check (X3):
     a node folder name another project would share is refused here, not
-    after the session is stopped."""
+    after the session is stopped. So is a tree the node cannot reproduce
+    (the bring-up's D7 check, in its words); the bring-up still makes it,
+    for a tree that changes in between."""
     # heavy subsystem: in-body per policy
     from magent import launch, node_sync, nodes, remote_mux
 
@@ -1301,14 +1303,22 @@ def _destination(
         _fail(node_sync.printable(str(exc)), _EXIT_USAGE)
     moved = dataclasses.replace(proj, node=to_nick)
     try:
+        states = launch.node_git_states(cfg, moved)
         # D's one recipe builder (DECISION-22), so the root is the one the
         # bring-up will record.
-        recipe = launch.node_recipe(
-            cfg, moved, target, launch.node_git_states(cfg, moved)
-        )
+        recipe = launch.node_recipe(cfg, moved, target, states)
     except (OSError, ValueError, remote_mux.RemoteError) as exc:
         text = _local_failure(exc, f"recall could not build {name}'s recipe")
         _fail(f"cannot build {name}'s recipe ({text})", _EXIT_USAGE)
+    # Made only by the bring-up, this refusal came after the source was
+    # stopped: the session then ran nowhere.
+    refusals = [why for state in states if (why := nodes.refusal_for(state))]
+    if refusals:
+        _fail(
+            f"cannot move {name} to @{to_nick}:"
+            f" {node_sync.printable('; '.join(refusals))}; nothing was touched",
+            _EXIT_USAGE,
+        )
     clash = launch.node_folder_refusal(cfg, moved)
     if clash is not None:
         _fail(
