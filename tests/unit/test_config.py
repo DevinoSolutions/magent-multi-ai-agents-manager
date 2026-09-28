@@ -449,8 +449,15 @@ class TestTextWithNoUtf8FormIsRefusedAtLoad:
                 "projects[0].title",
                 {"projects": [{"path": "a", "title": _LONE}, {"path": _LONE}]},
             ),
+            # Deeper but earlier beats shallower but later: depth-first, not
+            # breadth-first, is "first in the file".
+            ("projects[0].title", {**_one(title=_LONE), "baseDir": _LONE}),
         ],
-        ids=["a-key-before-its-value", "an-earlier-list-item"],
+        ids=[
+            "a-key-before-its-value",
+            "an-earlier-list-item",
+            "a-deeper-earlier-string",
+        ],
     )
     def test_the_first_offending_string_in_the_file_is_the_one_named(
         self, tmp_config, where, config
