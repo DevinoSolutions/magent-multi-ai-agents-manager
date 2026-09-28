@@ -1091,7 +1091,7 @@ def _real(path: str | Path) -> str:
 
 def _within(parent: str, child: str) -> bool:
     """``child`` is ``parent`` or below it (both absolute), compared by path
-    component -- ``C:\\Users\\amind2`` is not inside ``C:\\Users\\amind`` --
+    component -- ``C:\\Users\\alice2`` is not inside ``C:\\Users\\alice`` --
     and by case where the OS ignores it. Paths on different Windows drives
     share nothing."""
     parent, child = os.path.normcase(parent), os.path.normcase(child)
@@ -1865,7 +1865,7 @@ def resolve(
     passed in so this stays pure. A node with no ``user`` runs as the local
     user, lowercased to match the per-person node account convention (D4). That
     derived name must be a login ssh can use (a Windows ``USERNAME`` such as
-    ``"Amin Dhouib"`` is not), and it may never be root -- running sessions as
+    ``"Alice Smith"`` is not), and it may never be root -- running sessions as
     root has to be written down.
     """
     if proj.node is None:

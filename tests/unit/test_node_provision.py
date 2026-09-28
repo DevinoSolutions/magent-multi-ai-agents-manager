@@ -1750,10 +1750,10 @@ class TestUserScopePluginsAndSkills:
 
     # By path component, never by string prefix.
     def test_a_sibling_sharing_a_name_prefix_is_not_an_ancestor(self, tmp_path):
-        inside = str(tmp_path / "amind2" / ".claude" / "skills")
-        assert not nodes._above(str(tmp_path / "amind"), inside)
-        assert not nodes._within(str(tmp_path / "amind"), inside)
-        assert nodes._within(str(tmp_path / "amind2"), inside)
+        inside = str(tmp_path / "alice2" / ".claude" / "skills")
+        assert not nodes._above(str(tmp_path / "alice"), inside)
+        assert not nodes._within(str(tmp_path / "alice"), inside)
+        assert nodes._within(str(tmp_path / "alice2"), inside)
 
     @pytest.mark.skipif(sys.platform != "win32", reason="drive letters are Windows'")
     def test_drive_letter_case_is_ignored_and_another_drive_shares_nothing(self):

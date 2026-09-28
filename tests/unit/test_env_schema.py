@@ -625,9 +625,9 @@ class TestLocalUsername:
     absent. The OS sets it; nobody configures it."""
 
     def test_the_windows_name_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("USERNAME", "amind")
+        monkeypatch.setenv("USERNAME", "alice")
         monkeypatch.setenv("USER", "someone-else")
-        assert env_module.local_username() == "amind"
+        assert env_module.local_username() == "alice"
 
     def test_the_posix_name_is_the_fallback(
         self, monkeypatch: pytest.MonkeyPatch
