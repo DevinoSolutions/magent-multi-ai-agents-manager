@@ -175,6 +175,22 @@ class TestMigrateConfigFile:
         )
         assert Path(path).read_bytes() == before
 
+    def test_migrate_refuses_before_it_reshapes_anything(self, tmp_config):
+        # The refusal names the field the FILE holds. A v2 legacy window is a
+        # bare string; checked after migrate_raw, it would be named by its v3
+        # shape, projects[0].windows[0].name, which the file does not contain.
+        path = tmp_config(
+            {"version": 2, "projects": [{"path": "api", "windows": ["x\ud83d"]}]}
+        )
+        before = Path(path).read_bytes()
+        with pytest.raises(ConfigError) as exc:
+            migrate_config_file(path)
+        assert str(exc.value) == (
+            "projects[0].windows[0] has text with no UTF-8 form (UnicodeEncodeError):"
+            " 'x\\ud83d'"
+        )
+        assert Path(path).read_bytes() == before
+
 
 class TestMigrate2To3Windows:
     """Characterization pins for _migrate_2_to_3, which normalizes the v2
