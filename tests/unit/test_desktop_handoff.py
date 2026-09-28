@@ -787,6 +787,9 @@ class TestTheExitCodeIsFinalOnlyAsAnInteger:
 
         assert result.rc == 7, result.detail
         assert result.detail == ""
+        # A full success, not a success-shaped report: the scratch directory
+        # goes, like on any hand-off that got its exit code back.
+        assert not work.exists()
 
     def test_a_partial_exit_code_is_not_yet_an_answer(self, handoff, hold):
         # The "1" of "12": a value without the line end Set-Content writes
