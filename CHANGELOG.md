@@ -5,6 +5,118 @@ All notable changes to magent are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.20.0] - UNRELEASED
+
+## [3.20.0rc1] - 2026-09-28
+
+### Added
+
+- **Nodes: run a project's whole agent session on another machine, with git as
+  the source of truth.** List a pool machine (a *node*) once under
+  `settings.nodes` -- `{"<nick>": {"host": "...", "user": "...", "root":
+  "~/magent"}}`, a nick being up to six of `a-z`, `0-9` and `-` -- and pin a
+  project to it with `"node": "<nick>"` (exclusive with `host`). `magent --go`
+  and `magent up` then bring that project up ON the node over ssh: the node
+  holds a `git clone` of it at your current branch under `root`, your folder is
+  never mirrored, and work comes home the way it already does, by the agent
+  committing and pushing. A bring-up refuses a repo with no `origin`, a
+  detached HEAD or a branch with no commits, and a dirty or unpushed tree
+  unless you pass `--allow-dirty` (the node then gets origin's copy, without
+  those edits). The session runs under tmux on the node (`tmux -L magent`,
+  tmux 3.2 or newer), and its window here is the same reconnecting
+  `magent-attach-client` pane `magent attach` opens.
+
+  Every bring-up ships, one way: the project's gitignored `.env*`,
+  `.claude/settings.local.json`, `CLAUDE.local.md` and `.mcp.json`, its Claude
+  auto-memory, anything in the project's new `push` list, and your user scope
+  -- the `gh` token, Claude `settings.json` less what only works on this PC,
+  the user MCP servers the node can reach or run and their OAuth entries,
+  plugins and skills. The Claude login itself is never copied (its refresh
+  token is single-holder): log in once per node with `ssh <user>@<host>
+  claude`.
+
+- **`magent node setup <nick>`, `magent node doctor` and `magent node sync`.**
+  `node setup` prepares a machine once -- packages, a per-person Unix user
+  (`--user`, repeatable), your ssh key, Claude Code and the node's own GitHub
+  key, then the user scope and a check -- logging in as `root@<host>` for that
+  one hop only; every step prints `ok`, `did` or `skip`, so it is safe to
+  re-run. Registering the node's GitHub key needs this PC's `gh` to hold
+  `admin:public_key` (`gh auth refresh -h github.com -s admin:public_key`).
+  `node doctor [<nick>] [--json]` checks a node without changing it: tools, the
+  Claude login, the GitHub key, locale, disk, and this PC's sync daemon (exit 0
+  healthy, 1 when a check failed, 2 for a nick not in `settings.nodes`), and
+  `magent doctor` gains a `nodes` row that is a warning at worst. `node sync`
+  mirrors every node's session list, a load sample, and the Claude transcripts
+  and agent state of the sessions this PC placed there into `~/.magent/nodes/`,
+  one ssh per node every `settings.nodeSync.pullIntervalS` (30 s); `magent
+  serve` keeps it running whenever a project has a node (`-d` detaches it by
+  hand, `--once` runs one tick, `--stop` stops it).
+
+- **Node sessions show up where local ones do.** `magent status` and `magent
+  sessions --json` list each node session with its node, `magent attention`
+  and `magent watch` read node agents' states, and a node session's status bar
+  wears `magent @<nick>`. `magent down` pulls a node session one last time
+  before it stops it, and `down --all` includes node sessions and stops the
+  sync daemon.
+
+- **Config schema v4**: `settings.nodes`, `settings.nodeSync`
+  (`pullIntervalS`, `sampleIntervalS`, `historyH`) and a project's `node` and
+  `push`. A version 3 config still loads, with the usual warning until `magent
+  config migrate` stamps it.
+
+### Fixed
+
+- **Projects whose path has a `.` or `_` in it continue their Claude
+  conversation again.** magent named the directory Claude Code files a
+  project's sessions under by a rule that kept `.` and `_`; Claude replaces
+  every character outside `A-Z`, `a-z` and `0-9` (the drive colon included) and
+  cuts a name over 200 characters with a hash suffix. For every such project
+  magent looked in the wrong directory, so the fresh-start probe dropped
+  `--continue` and the agent opened a new conversation instead of continuing,
+  and project discovery did not match its sessions to it. The rule is now
+  Claude Code's own, checked against a real session store (295 of 297
+  directories; the other two were sessions that changed directory mid-run).
+
+- **On Windows, every ssh magent opens uses one client: Windows' own OpenSSH
+  first, `ssh` on PATH only as the fallback.** That covers a `host` project's
+  terminal, `magent attach`'s panes, its host status poll and bring-up hop, and
+  `--no-mux` panes. Each used to run whatever `ssh` PATH offered first, so
+  under Git Bash one connection could go through MSYS ssh and the next through
+  Windows' OpenSSH -- which share `~/.ssh` but not the ssh agent -- and a PC
+  with Windows' OpenSSH but no `ssh` on PATH was warned at launch that it had
+  no ssh client. If you relied on a different ssh earlier on PATH, magent now
+  uses Windows' own whenever it is installed.
+
+- **F2 no longer opens the wrong folder for a project whose path holds a
+  cmd.exe metacharacter.** On Windows `code` is `code.cmd`, which runs through
+  `cmd.exe` and re-parses its command line, so a folder named with `&`, `|`,
+  `<`, `>`, `^`, `%`, `"` or `!` (or a control character) could open something
+  else while the status line flashed success. F2 now refuses such a folder and
+  flashes `F2: folder name has a character code.cmd can't pass`. An `.exe`
+  editor, or `code` off Windows, is unaffected.
+
+- **On Linux and macOS, two `magent attention -d` daemons can no longer run at
+  once.** A second daemon, refused because one was already running, deleted the
+  running one's lock file on its way out, so a third could take a fresh lock
+  beside it; and a lock taken on a file its holder had just deleted is now
+  taken again rather than kept.
+
+- **Sentry reports no longer carry local variables.** With
+  `MAGENT_SENTRY_DSN` set, sentry-sdk 2.x attached every frame's local
+  variables to an error report, scrubbing them by key name only. magent now
+  turns that off (`include_local_variables=False`).
+
+### Known issues
+
+- A node reply cut at the output cap can show a half-written last stderr line
+  as its reason, when the node-side writer dies at the closed pipe after the
+  cap. Fixed in the next release candidate.
+- `"node": "auto"` is accepted but not placed yet: a fresh `auto` project's
+  bring-up refuses it ("needs a placement"), so pin the project to a nick in
+  this release.
+- `"node": "cloud"` is reserved, and in this release it runs as an ordinary
+  local session.
+
 ## [3.19.2] - 2026-09-27
 
 ### Fixed
@@ -1395,6 +1507,8 @@ tool, every screen.
   notifications (`toast`) and QR rendering (`qr`). Sentry error reporting is
   env-gated via `MAGENT_SENTRY_DSN`.
 
+[3.20.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.2...v3.20.0
+[3.20.0rc1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.2...v3.20.0rc1
 [3.19.2]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.1...v3.19.2
 [3.19.1]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.19.0...v3.19.1
 [3.19.0]: https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/compare/v3.18.1...v3.19.0
