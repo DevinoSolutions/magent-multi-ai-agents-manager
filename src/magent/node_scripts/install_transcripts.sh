@@ -16,8 +16,13 @@
 #     printed so magent can say so
 # A node FILE where the payload has a directory is KEPT (reported once), and
 # every payload file beneath it is KEPT too; the rest still lands, exit 0.
-# Nothing is ever deleted. Everything created is private (umask 077; tar never
-# restores the payload's owner or modes).
+# Nothing is ever deleted. Everything it creates is owner-only by an explicit
+# mode, never by the umask alone: a default ACL on the node user's home makes
+# the kernel ignore the umask, and tar gives each item the mode its ARCHIVE
+# entry names (0666/0777 from a Windows PC or an older magent). So every
+# payload item is chmodded (folders 0700, files 0600) before anything moves,
+# and every folder this script makes is private_dir's. tar never restores
+# the payload's owner.
 #
 # Exit codes: 2 the name is outside the encoder's alphabet; 3 the payload is
 # missing or broken; 4 the destination (or a directory inside it the payload
@@ -46,7 +51,7 @@ is_prefix() {
 
 # Is some ancestor of relative path $2 (not $2 itself) a non-directory under
 # $1? find lists a directory before its children, so that ancestor has
-# already been reported KEPT, and mkdir -p beneath it would fail.
+# already been reported KEPT, and private_dir beneath it would fail.
 under_a_file() {
   local up="$2"
   while [ "${up%/*}" != "$up" ]; do
@@ -57,6 +62,11 @@ under_a_file() {
   done
   return 1
 }
+
+# Make folder $1 owner-only unless it is there already (the node's own is
+# left as it is); its parent must exist. A default ACL can only narrow
+# mkdir's mode, never widen it, and the chmod makes it exact.
+private_dir() { [ -d "$1" ] || { mkdir -m 700 -- "$1" && chmod 700 -- "$1"; }; }
 
 main() {
   local name="${1:-}" projects dest src rel target
@@ -73,13 +83,18 @@ main() {
     printf 'install_transcripts.sh: %s is a symlink; not installing through it\n' "$dest" >&2
     return 4
   fi
-  mkdir -p "$projects"
+  private_dir "$HOME/.claude"
+  private_dir "$projects"
   tmp="$(mktemp -d "$projects/.magent-install.XXXXXX")"
   trap 'rm -rf "$tmp"' EXIT
   if ! magent_payload | tar --no-same-owner --no-same-permissions -xf - -C "$tmp"; then
     printf 'install_transcripts.sh: the payload is missing or broken; nothing installed\n' >&2
     return 3
   fi
+  # Owner-only whatever the archive said, before anything moves. Two
+  # commands, not one && list: set -e would not see the first one fail.
+  find "$tmp" -type d -exec chmod 700 {} +
+  find "$tmp" -type f -exec chmod 600 {} +
 
   # Every directory the payload needs, checked before anything is placed.
   while IFS= read -r -d '' src; do
@@ -90,7 +105,7 @@ main() {
     fi
   done < <(find "$tmp" -mindepth 1 -type d -print0)
 
-  mkdir -p "$dest"
+  private_dir "$dest"
   while IFS= read -r -d '' src; do
     rel="${src#"$tmp"/}"
     if under_a_file "$dest" "$rel"; then
@@ -98,7 +113,7 @@ main() {
     elif [ -e "$dest/$rel" ] && [ ! -d "$dest/$rel" ]; then
       printf 'KEPT\t%s\n' "$rel"  # a file where the payload has a directory
     else
-      mkdir -p "$dest/$rel"
+      private_dir "$dest/$rel"  # its parent came earlier: find lists it first
     fi
   done < <(find "$tmp" -mindepth 1 -type d -print0)
 

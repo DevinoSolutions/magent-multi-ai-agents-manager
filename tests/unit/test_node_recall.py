@@ -1062,6 +1062,187 @@ class TestTheInstallNeverOverwritesTheNodesWork:
         )
 
 
+# audit-acl S2's model of the worst default ACL: one granting every class rwx
+# gives a new file or folder exactly the mode ARGUMENT of the call that makes
+# it -- what umask 000 gives. The script sets umask 077 itself, so the harness
+# shadows the builtin right after its strict-mode line.
+_STRICT = b"\nset -euo pipefail\n"
+_UMASK_IGNORED = b"umask() { builtin umask 000; }; builtin umask 000\n"
+
+
+def _as_if_under_a_default_acl(
+    call: tuple[list[str], bytes],
+) -> tuple[list[str], bytes]:
+    argv, stdin = call
+    # A script that called the builtin directly would slip the shadow, and
+    # every pin below would pass for the wrong reason.
+    assert b"builtin umask" not in stdin
+    assert _STRICT in stdin
+    return argv, stdin.replace(_STRICT, _STRICT + _UMASK_IGNORED, 1)
+
+
+# What a Windows PC's _tar_dir sent before its owner-only filter, and what an
+# older PC build still sends: every file 0o666, every folder 0o777.
+_OPEN_MEMBERS: tuple[tuple[str, bytes | None], ...] = (
+    ("memory", None),
+    ("memory/MEMORY.md", b"- remember\n"),
+    (SESSION_ID, None),
+    (f"{SESSION_ID}/subagents", None),
+    (f"{SESSION_ID}/subagents/agent-a1.jsonl", b"{}\n"),
+    (f"{SESSION_ID}.jsonl", _PULLED_JSONL.encode()),
+)
+
+
+def _open_modes_tar() -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        for name, data in _OPEN_MEMBERS:
+            info = tarfile.TarInfo(name)
+            if data is None:
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o777
+                tar.addfile(info)
+            else:
+                info.size = len(data)
+                info.mode = 0o666
+                tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+# Everything under the node home's ~/.claude after a good install of that tar.
+_LANDED_OWNER_ONLY = {
+    ".claude": "0o700",
+    ".claude/projects": "0o700",
+    f".claude/projects/{_ENCODED}": "0o700",
+    f".claude/projects/{_ENCODED}/memory": "0o700",
+    f".claude/projects/{_ENCODED}/memory/MEMORY.md": "0o600",
+    f".claude/projects/{_ENCODED}/{SESSION_ID}": "0o700",
+    f".claude/projects/{_ENCODED}/{SESSION_ID}/subagents": "0o700",
+    f".claude/projects/{_ENCODED}/{SESSION_ID}/subagents/agent-a1.jsonl": "0o600",
+    f".claude/projects/{_ENCODED}/{SESSION_ID}.jsonl": "0o600",
+}
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="node scripts run under a Linux node's bash"
+)
+class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
+    """audit-acl S2: only the umask kept recall --to's transcripts private, and
+    a default ACL on the node user's home makes the kernel ignore it. What
+    lands is owner-only by an explicit mode, whatever modes the payload
+    carries: every payload item is chmodded before it moves, and every folder
+    the script makes is private_dir's."""
+
+    @staticmethod
+    def _modes(home: Path) -> dict[str, str]:
+        # Everything under ~/.claude: a leftover temp dir would show up too.
+        claude = home / ".claude"
+        return {
+            path.relative_to(home).as_posix(): oct(path.lstat().st_mode & 0o777)
+            for path in [claude, *claude.rglob("*")]
+        }
+
+    @staticmethod
+    def _call(monkeypatch) -> tuple[list[str], bytes]:
+        return _node_call(
+            monkeypatch, "install_transcripts", [_ENCODED], _open_modes_tar()
+        )
+
+    def test_open_payload_modes_land_owner_only_when_the_umask_is_ignored(
+        self, monkeypatch, tmp_path
+    ):
+        # A fresh node user: ~/.claude does not exist yet, so every folder on
+        # the way is the script's own -- each made before its children, as
+        # find lists a folder before what is inside it.
+        home = tmp_path / "nodehome"
+        home.mkdir()
+
+        done = _node_run(
+            _as_if_under_a_default_acl(self._call(monkeypatch)), home, umask=0
+        )
+
+        assert done.returncode == 0, done.stderr
+        assert self._modes(home) == _LANDED_OWNER_ONLY
+        dest = home / ".claude" / "projects" / _ENCODED
+        assert (dest / f"{SESSION_ID}.jsonl").read_text(encoding="utf-8") == (
+            _PULLED_JSONL
+        )
+
+    def test_a_folder_the_node_already_has_is_left_as_it_is(
+        self, monkeypatch, tmp_path
+    ):
+        # private_dir makes what is missing and leaves the node's own alone.
+        home = tmp_path / "nodehome"
+        (home / ".claude").mkdir(parents=True)
+        (home / ".claude").chmod(0o755)
+
+        done = _node_run(
+            _as_if_under_a_default_acl(self._call(monkeypatch)), home, umask=0
+        )
+
+        assert done.returncode == 0, done.stderr
+        assert self._modes(home) == {**_LANDED_OWNER_ONLY, ".claude": "0o755"}
+
+    def test_a_home_that_does_not_exist_is_not_made_and_nothing_lands(
+        self, monkeypatch, tmp_path
+    ):
+        # The one parent private_dir does not make: the home itself. It
+        # fails (set -e), where mkdir -p used to make the home too.
+        home = tmp_path / "nodehome"
+
+        done = _node_run(
+            _as_if_under_a_default_acl(self._call(monkeypatch)), home, umask=0
+        )
+
+        assert done.returncode == 1
+        assert not home.exists()
+
+    @pytest.mark.skipif(
+        sys.platform != "linux", reason="a default ACL is set with Linux's setfacl"
+    )
+    def test_a_real_default_acl_is_what_the_umask_model_stands_for(
+        self, monkeypatch, tmp_path
+    ):
+        # The canary: the model above, against the thing it models. The home
+        # carries a default ACL granting every class rwx (the hosted runners'
+        # homes carry ACLs), and the script keeps its own umask 077. A Linux
+        # CI runner that cannot set one is a provisioning bug: it FAILS there.
+        on_ci = os.environ.get("GITHUB_ACTIONS") == "true"
+        setfacl = shutil.which("setfacl")
+        if setfacl is None:
+            if on_ci:
+                pytest.fail("Linux CI runner without setfacl (the acl package)")
+            pytest.skip("needs setfacl (the acl package)")
+        home = tmp_path / "nodehome"
+        home.mkdir()
+        acl = subprocess.run(
+            [setfacl, "-d", "-m", "u::rwx,g::rwx,o::rwx", str(home)],
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        if acl.returncode != 0:
+            if on_ci:
+                pytest.fail(f"setfacl refused a default ACL: {acl.stderr!r}")
+            pytest.skip("this filesystem refuses a default ACL")
+        # The premise: under it, a umask 077 create is NOT owner-only.
+        subprocess.run(
+            ["bash", "-c", "umask 077; : > probe; mkdir probedir"],
+            cwd=home,
+            check=True,
+            timeout=30,
+        )
+        assert oct((home / "probe").stat().st_mode & 0o777) == "0o666"
+        assert oct((home / "probedir").stat().st_mode & 0o777) == "0o777"
+        (home / "probe").unlink()
+        (home / "probedir").rmdir()
+
+        done = _node_run(self._call(monkeypatch), home, umask=0o022)
+
+        assert done.returncode == 0, done.stderr
+        assert self._modes(home) == _LANDED_OWNER_ONLY
+
+
 class TestAnAbsoluteRootIsInstalledThroughTheEncoder:
     def test_an_absolute_root_travels_through_realpath_and_the_encoder(
         self, monkeypatch, tmp_path
