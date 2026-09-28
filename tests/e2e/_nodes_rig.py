@@ -132,9 +132,9 @@ def child_env(
 
     ``os.environ`` minus every MAGENT_* (the user's Sentry DSN included), the
     gh tokens, the Anthropic and Claude harness variables; the whole HOME
-    family at ``pc_home``; the pins that exist in the schema; the canaries;
-    ``extra_path`` first on PATH. ``sync`` flips MAGENT_NODE_SYNC on, for the
-    legs that exercise the sync supervisor."""
+    family and XDG_CONFIG_HOME at ``pc_home``; the pins that exist in the
+    schema; the canaries; ``extra_path`` first on PATH. ``sync`` flips
+    MAGENT_NODE_SYNC on, for the legs that exercise the sync supervisor."""
     env = {
         k: v
         for k, v in os.environ.items()
@@ -148,6 +148,9 @@ def child_env(
         HOMEDRIVE=drive,
         HOMEPATH=tail or os.sep,
         GH_CONFIG_DIR=str(pc_home / "gh"),
+        # Linux config lookups go through XDG before HOME: the runner's own
+        # would otherwise pass straight through.
+        XDG_CONFIG_HOME=str(pc_home / ".config"),
     )
     if sys.platform == "win32":
         env.update(
@@ -198,6 +201,15 @@ def node_wire_or_skip() -> Wire:
     a provisioning bug and FAILS -- a runner without tmux, the stub or the
     ssh wire must not read as coverage (the fleet-tier rule)."""
     if os.environ.get(GATE_VAR) != "1":
+        # No ci.yml selection reaches these tests (theirs all require the e2e
+        # marker, which the journey lacks): only the nodes-e2e job collects
+        # them there, so a CI run without the gate is a lost or misspelled
+        # variable -- which must not read green with zero node coverage.
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            pytest.fail(
+                f"node-hosting tier selected on CI without {GATE_VAR}=1: the "
+                "nodes-e2e workflow step lost (or misspelled) its gate variable"
+            )
         pytest.skip(
             f"node-hosting tier: gated on {GATE_VAR}=1 (the nodes-e2e workflow "
             "sets it on a CI runner; never set it on a dev box)"
@@ -598,10 +610,15 @@ def install_stand_in(dest: Path) -> None:
     shutil.copyfile(Path(str(claude.__file__)), dest / "claude_encoding.py")
 
 
-def git_env(wire: Wire) -> dict[str, str]:
+def git_env(wire: Wire, home: Path) -> dict[str, str]:
     """The harness's own git: an explicit ssh with the test key and BatchMode,
-    and no repo variables inherited from whatever launched pytest."""
+    no repo variables inherited from whatever launched pytest, and ``home``
+    for HOME and XDG_CONFIG_HOME. The rig is module-scoped, so it runs
+    OUTSIDE conftest's per-test HOME redirect: an inherited HOME here is the
+    runner's real one, and git would read its real ``~/.gitconfig``."""
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+    env["HOME"] = str(home)
+    env["XDG_CONFIG_HOME"] = str(home / ".config")
     env["GIT_SSH_COMMAND"] = shlex.join(
         [
             "ssh",
@@ -799,7 +816,7 @@ class NodeRig:
             self.out,
             "git",
             clamp(self.budget, want, f"git {args[0]}"),
-            env=git_env(self.wire),
+            env=git_env(self.wire, self.base),
             cwd=cwd,
         )
         if run.rc != 0:

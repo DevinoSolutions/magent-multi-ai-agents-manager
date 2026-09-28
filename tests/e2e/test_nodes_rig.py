@@ -58,6 +58,49 @@ class TestEveryStageIsUnderTheBudget:
 
 
 # ---------------------------------------------------------------------------
+# The gate: a clean skip off CI, never a quiet one on it
+# ---------------------------------------------------------------------------
+
+
+class TestTheGateSkipsOnlyOffCi:
+    def test_without_the_gate_a_dev_box_skips(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(rig.GATE_VAR, raising=False)
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+        with pytest.raises(pytest.skip.Exception, match=rig.GATE_VAR):
+            rig.node_wire_or_skip()
+
+    def test_without_the_gate_a_ci_run_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A nodes-e2e step that lost its variable must not read green.
+        monkeypatch.delenv(rig.GATE_VAR, raising=False)
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        with pytest.raises(pytest.fail.Exception, match=rig.GATE_VAR):
+            rig.node_wire_or_skip()
+
+
+# ---------------------------------------------------------------------------
+# The harness's own git
+# ---------------------------------------------------------------------------
+
+
+class TestTheHarnessGitReadsNoRealConfig:
+    def test_home_and_xdg_are_the_run_base_and_no_repo_var_leaks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The rig is module-scoped: conftest's per-test redirect is not in
+        # force while it builds, so git_env itself must aim HOME.
+        monkeypatch.setenv("GIT_DIR", "/elsewhere/.git")
+        wire = rig.Wire(port="2222", key=tmp_path / "id", host="mdssh")
+        env = rig.git_env(wire, tmp_path)
+        assert env["HOME"] == str(tmp_path)
+        assert env["XDG_CONFIG_HOME"] == str(tmp_path / ".config")
+        assert "GIT_DIR" not in env
+
+
+# ---------------------------------------------------------------------------
 # NodeUser.create against a recording root hop
 # ---------------------------------------------------------------------------
 

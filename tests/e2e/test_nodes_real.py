@@ -244,6 +244,7 @@ class TestEveryPcChildCarriesTheIsolationPins:
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "elsewhere"))
         env = child_env(tmp_path)
         assert env["HOME"] == env["USERPROFILE"] == str(tmp_path)
+        assert env["XDG_CONFIG_HOME"] == str(tmp_path / ".config")
         assert "GH_TOKEN" not in env
         assert "CLAUDE_CONFIG_DIR" not in env
         for name, value in CANARIES.items():
@@ -319,6 +320,10 @@ class TestAnUnreachableNodeIsAFailedProbe:
 # ---------------------------------------------------------------------------
 
 
+# Module scope runs OUTSIDE conftest's HOME redirect (_isolate_magent_home is
+# function-scoped): HOME here is the runner's real one and no MAGENT_* pin is
+# set. So every child the rig starts carries an explicit env= (child_env,
+# git_env), and nothing in build() or close() may call magent in-process.
 @pytest.fixture(scope="module")
 def rig(tmp_path_factory: pytest.TempPathFactory) -> Iterator[NodeRig]:
     wire = node_wire_or_skip()
