@@ -315,9 +315,9 @@ def _settle_exit_code(
     done). The command FINISHED and we cannot say how, so no exit code is
     fabricated -- but its output, complete by now, is relayed.
 
-    ``detail`` names what that read saw, in our words: a file still held by
-    its writer and a launcher that wrote no value are different bugs. The OS's
-    own text for a failed read goes to the log, not the screen.
+    ``detail`` names what that read saw, in our words: a file that refused the
+    read and a launcher that wrote no value are different bugs. The OS's own
+    text for a failed read goes to the log, not the screen.
     """
     out, err, _pid, rc_file = files
     try:
@@ -329,8 +329,10 @@ def _settle_exit_code(
             waited_s,
             exc,
         )
+        # Say only what is known: errno 13 is usually Set-Content's share
+        # lock, but an ACL denial and a delete-pending file raise it too.
         why = (
-            "was still held by the writer"
+            "was locked or refused"
             if isinstance(exc, PermissionError)
             else "could not be read"
         )

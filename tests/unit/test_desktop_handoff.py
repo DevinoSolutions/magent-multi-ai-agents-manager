@@ -836,10 +836,12 @@ class TestTheExitCodeIsFinalOnlyAsAnInteger:
         assert result.rc == 7, result.detail
         assert clock.now > _HANDOFF_EXIT_GRACE_S
 
-    # What the last read saw, in our words: a held file, a launcher that wrote
-    # no value, and a value cut short are different bugs.
+    # What the last read saw, in our words: a refused read, a launcher that
+    # wrote no value, and a value cut short are different bugs. "Refused", not
+    # "held by the writer": errno 13 is also an ACL denial or a delete-pending
+    # file, so the words claim no more than the error does.
     _SEEN: ClassVar[dict[str, str]] = {
-        "locked": "rc.txt was still held by the writer (PermissionError)",
+        "locked": "rc.txt was locked or refused (PermissionError)",
         "shared": "rc.txt was empty",
         "partial": "rc.txt held '1', not a complete exit code",
     }
