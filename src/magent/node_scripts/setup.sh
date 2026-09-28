@@ -223,7 +223,7 @@ user_claude() {
 # 0700 first: `mkdir -p` under that same ACL makes it 0777.
 # shellcheck disable=SC2317  # invoked through `declare -f` in run_user_phase
 user_node_key() {
-  local u=$1 out pub mode made="" ssh="$HOME/.ssh" id="$HOME/.ssh/id_ed25519"
+  local u=$1 out pub mode pad made="" ssh="$HOME/.ssh" id="$HOME/.ssh/id_ed25519"
   if [ -h "$ssh" ] || [ -h "$id" ]; then
     say fail "node-key:$u" "$u's .ssh or its id_ed25519 is a symlink; magent does not write through it"
     return 1
@@ -237,10 +237,19 @@ user_node_key() {
       say fail "node-key:$u" "could not make ~/.ssh/id_ed25519 owner-only (0600); ssh refuses an open key"
       return 1
     fi
+    # %a drops leading zeros (0 for 0000): the old mode reads four digits
+    # wide, and only a group or other bit (the last two) was an exposure.
+    pad=000$mode
     case $mode in
       600) ;;
       "") made="id_ed25519 made owner-only (0600): its earlier mode could not be read" ;;
-      *) made="id_ed25519 made owner-only: it was 0$mode, now 0600" ;;
+      *)
+        if [ "${pad: -2}" = 00 ]; then
+          made="id_ed25519 set to 0600 (it was ${pad: -4}, already owner-only)"
+        else
+          made="id_ed25519 made owner-only: it was ${pad: -4}, now 0600"
+        fi
+        ;;
     esac
   fi
   if [ -f "$id.pub" ]; then
