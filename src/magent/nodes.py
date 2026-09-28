@@ -671,9 +671,18 @@ def _safe_part(part: str) -> bool:
     )
 
 
+# A sid is printed as well as joined: DEL and the C1 controls are refused
+# with C0 (node_sync._CONTROL's range) -- 0x9b is a CSI to a terminal.
+_DEL_OR_C1 = re.compile(r"[\x7f-\x9f]")
+
+
 def pullable_sid(sid: str) -> bool:
     """Can ``sid`` name a directory under ``~/.magent/nodes/<nick>/`` here?"""
-    return _safe_part(sid) and sid not in _RESERVED_NAMES
+    return (
+        _safe_part(sid)
+        and sid not in _RESERVED_NAMES
+        and _DEL_OR_C1.search(sid) is None
+    )
 
 
 def node_dir(nick: str, *, nodes_dir: Path | None = None) -> Path:

@@ -2793,6 +2793,27 @@ class TestRecallReadsTheNodeMapAsUntrusted:
         assert nodes.read_node_map()["api"].sid == sid
         assert not _claude_dir(api_repo).exists()
 
+    @pytest.mark.parametrize("sid", ["a\x7fb", "a\x9b2Jb"], ids=["del", "c1-csi"])
+    def test_a_sid_holding_del_or_c1_is_refused_before_anything(
+        self, runner, api_repo, tmp_config, node_answers, sid
+    ):
+        # cq-Gint F5: refused like a C0 sid, and named by its repr only.
+        nodes.update_node_map("api", entry("second", sid))
+        cfg = tmp_config(
+            config_json(
+                ("second",), [{"path": str(api_repo), "title": "api", "node": "auto"}]
+            )
+        )
+
+        result = _recall(runner, cfg, "--local")
+
+        assert result.exit_code == 2
+        assert repr(sid) in result.stderr
+        assert sid[1] not in result.output
+        assert node_answers == []
+        assert nodes.read_node_map()["api"].sid == sid
+        assert not _claude_dir(api_repo).exists()
+
     @pytest.mark.parametrize("nick", ["../x", "\x1b[31mx"], ids=["traversal", "escape"])
     def test_a_nick_config_would_refuse_reaches_no_path_and_no_screen(
         self, runner, api_repo, tmp_config, node_answers, monkeypatch, nick

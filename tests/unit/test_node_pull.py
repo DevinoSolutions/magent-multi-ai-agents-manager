@@ -854,6 +854,14 @@ class TestWhichSessionsCanBeMirrored:
             ("..", False),
             ("", False),
             ("a/b", False),
+            # A sid is printed too: DEL and every C1 control are refused
+            # as C0 is (0x9b is a CSI); 0x7e is the last character kept.
+            ("a\x1bb", False),
+            ("a\x7fb", False),
+            ("a\x80b", False),
+            ("a\x9b2Jb", False),
+            ("a\x9fb", False),
+            ("a~b", True),
         ],
     )
     def test_a_session_name_must_be_a_directory_name_on_this_pc(self, sid, ok):
