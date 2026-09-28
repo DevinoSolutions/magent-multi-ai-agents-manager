@@ -598,6 +598,32 @@ class TestASettingsFileMagentCannotWrite:
             settings.chmod(0o644)
         self._assert_refused_untouched(result, settings)
 
+    def test_a_refusal_leaves_a_temp_file_it_did_not_make(self, runner, tmp_path):
+        # The cleanup is for this call's own temp file. One already beside a
+        # file refused before the write began is the user's to keep.
+        settings = self._plant(tmp_path)
+        theirs = settings.with_suffix(".tmp")
+        theirs.write_bytes(b"the user's own")
+        settings.chmod(0o444)
+        try:
+            if os.access(settings, os.W_OK):
+                pytest.skip("this user can write a read-only file (root)")
+            result = _install(runner, settings)
+        finally:
+            settings.chmod(0o644)
+
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        assert result.stderr == (
+            f"  x Cannot edit {settings}: could not be written (PermissionError)\n"
+        )
+        assert settings.read_bytes() == _VALID
+        assert theirs.read_bytes() == b"the user's own"
+        assert sorted(p.name for p in settings.parent.iterdir()) == [
+            "settings.json",
+            "settings.tmp",
+        ]
+
     def test_a_read_only_file_is_refused_where_the_rename_would_succeed(
         self, runner, tmp_path, monkeypatch
     ):

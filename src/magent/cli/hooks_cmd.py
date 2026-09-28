@@ -209,24 +209,32 @@ def _write_settings(path: Path, data: dict[str, object]) -> str | None:
     back 0644; the temp file is born owner-only instead, so the keys are never
     in a file anyone else can open, and given the old mode just before the
     replace. A first install keeps the umask default.
+
+    A failed write removes only the temp file this call made: a settings.tmp
+    already there is removed once the write begins (it would bring its own
+    mode), but a refusal before that -- the probe's -- leaves it alone.
     """
     tmp = path.with_suffix(".tmp")
+    ours = False
     try:
         existing = path.stat() if path.exists() else None
         if existing is not None:
             with path.open("r+b"):
                 pass
-            # Born here: a leftover temp file would bring its own mode.
-            tmp.unlink(missing_ok=True)
-            tmp.touch(mode=0o600)
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Born here: a leftover temp file would bring its own mode.
+        tmp.unlink(missing_ok=True)
+        ours = True
+        if existing is not None:
+            tmp.touch(mode=0o600)
         tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
         if existing is not None:
             os.chmod(tmp, stat.S_IMODE(existing.st_mode))
         os.replace(tmp, path)
     except OSError as exc:
-        with contextlib.suppress(OSError):
-            tmp.unlink(missing_ok=True)
+        if ours:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
         return f"could not be written ({type(exc).__name__})"
     return None
 
