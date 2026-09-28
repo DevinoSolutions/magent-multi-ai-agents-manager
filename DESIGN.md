@@ -1675,6 +1675,17 @@ the OS has nothing left to ask. `rc.txt` came back EMPTY on every run until
 that line existed, and the hand-off then reported an "unreadable exit code" for
 commands that had succeeded.
 
+A second one, on the reading side: `rc.txt` EXISTING is not the exit code being
+WRITTEN. `Set-Content` creates the file, then writes, and refuses readers until
+it closes -- measured, 298 of 300 first reads after the file appeared were a
+sharing violation. The poll treated that read as final and reported the same
+"unreadable exit code ''" for succeeded commands, a windows-latest unit flake
+on five unrelated PRs. So rc.txt goes through the same reader as pid.txt
+(`_read_recorded_int`): only a well-formed integer ends the wait. A present
+rc.txt that stays anything else past `_HANDOFF_RC_GRACE_S` (10s) or the budget
+is its own answer -- the command finished and we cannot say how -- distinct
+from "never started", "lost its child" and "may still be running".
+
 **`schtasks` comes from the system directory, not PATH.** `run_on_desktop` is
 reached from an ssh login, and letting that login's PATH choose what runs as
 the logged-on user would turn a hand-off into an execution primitive for
