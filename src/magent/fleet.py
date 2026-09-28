@@ -122,11 +122,23 @@ def classify_state(pane: str) -> str:
     return "idle"
 
 
+# The state of a pane whose capture ran out the clock. Deliberately NOT
+# ``classify_state``'s "nopane": nothing was read, so nothing is known -- on a
+# loaded box a live, busy agent's capture can take longer than the budget.
+TIMEOUT_STATE = "timeout"
+
+
 def read_state(name: str, *, psmux_bin: str | None = None) -> dict[str, object]:
-    """Capture ``name``'s pane once and return ``{state, model, effort}``."""
-    pane = psmux.capture_pane(name, psmux=psmux_bin)
-    model, effort = parse_footer(pane)
-    return {"state": classify_state(pane), "model": model, "effort": effort}
+    """Capture ``name``'s pane once and return ``{state, model, effort}``.
+
+    ``state`` is ``classify_state``'s vocabulary, plus ``TIMEOUT_STATE`` when
+    the capture did not answer in time.
+    """
+    capture = psmux.read_pane(name, psmux=psmux_bin)
+    if capture.timed_out:
+        return {"state": TIMEOUT_STATE, "model": None, "effort": None}
+    model, effort = parse_footer(capture.text)
+    return {"state": classify_state(capture.text), "model": model, "effort": effort}
 
 
 # --- Name resolution --------------------------------------------------------
