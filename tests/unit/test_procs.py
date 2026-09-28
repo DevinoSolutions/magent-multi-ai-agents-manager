@@ -25,10 +25,161 @@ from magent.procs import (
     current_session_id,
     pid_alive,
     pids_by_image_name,
+    process_tree,
     raise_priority_above_normal,
     session_id_of,
+    snapshot_processes,
     spawn_unjobbed,
 )
+
+
+class TestProcessTree:
+    """The subtree walk behind "is an agent still under this pane". Pure over a
+    snapshot, so the shapes a live Toolhelp list takes are pinned here without
+    reading one; the one real-process pin below uses a child it spawned."""
+
+    SNAPSHOT = (
+        ("psmux.exe", 1, 0),
+        ("pwsh.exe", 10, 1),
+        ("cmd.exe", 11, 10),
+        ("claude.exe", 12, 11),
+        ("bash.exe", 13, 12),
+        ("pwsh.exe", 20, 1),  # a sibling pane: not ours
+        ("node.exe", 21, 20),
+    )
+
+    def test_it_walks_every_depth_under_the_root(self):
+        tree = process_tree(10, self.SNAPSHOT)
+        assert tree is not None
+        assert [pid for _image, pid, _ppid in tree] == [10, 11, 12, 13]
+
+    def test_the_root_comes_first(self):
+        # idle_sessions asks "is the pane's own process a shell" of tree[0].
+        tree = process_tree(12, self.SNAPSHOT)
+        assert tree is not None
+        assert tree[0] == ("claude.exe", 12, 11)
+
+    def test_siblings_and_ancestors_are_not_the_subtree(self):
+        tree = process_tree(20, self.SNAPSHOT)
+        assert tree is not None
+        assert {pid for _image, pid, _ppid in tree} == {20, 21}
+
+    def test_a_root_missing_from_the_snapshot_is_unknown_not_empty(self):
+        # "The pane process is gone" and "nothing runs under it" are different
+        # claims; only the second may make a pane idle.
+        assert process_tree(99, self.SNAPSHOT) is None
+
+    def test_a_parent_cycle_terminates(self):
+        # Windows recycles pids and never rewrites a parent pid, so a stale
+        # parent link can close a loop; the walk must still end.
+        cyclic = [("a.exe", 1, 2), ("b.exe", 2, 1), ("c.exe", 3, 2)]
+        tree = process_tree(1, cyclic)
+        assert tree is not None
+        assert sorted(pid for _image, pid, _ppid in tree) == [1, 2, 3]
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Toolhelp is win32-only")
+    def test_the_real_snapshot_carries_parent_pids(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            snapshot = snapshot_processes()
+            assert snapshot is not None
+            tree = process_tree(os.getpid(), snapshot)
+            assert tree is not None
+            assert child.pid in {
+                pid for _image, pid, ppid in tree if ppid == os.getpid()
+            }
+        finally:
+            child.kill()
+            child.wait()
+
+
+class _FakeToolhelp:
+    """kernel32's Toolhelp walk, as ``snapshot_processes`` drives it: each
+    Process32*W call fills the next entry, and the call after the last one
+    fails with ``end_error``.
+
+    The error lands where ctypes really keeps it: in the private copy that
+    ``ctypes.get_last_error`` reads, updated only for functions of a library
+    loaded with ``use_last_error=True``. Python code between two foreign calls
+    may clobber the thread's own last error, so that copy is the only one worth
+    reading."""
+
+    def __init__(self, entries, end_error, *, use_last_error):
+        self._pending = list(entries)
+        self._end_error = end_error
+        self._use_last_error = use_last_error
+        self.last_error = 0
+        self.closed = False
+
+    def CreateToolhelp32Snapshot(self, flags, pid):
+        return 0x1234
+
+    def Process32FirstW(self, snapshot, ref):
+        return self._next_into(ref)
+
+    def Process32NextW(self, snapshot, ref):
+        return self._next_into(ref)
+
+    def CloseHandle(self, handle):
+        self.closed = True
+        return 1
+
+    def _next_into(self, ref):
+        if not self._pending:
+            if self._use_last_error:
+                self.last_error = self._end_error
+            return 0
+        entry = ref._obj
+        entry.szExeFile, entry.th32ProcessID, entry.th32ParentProcessID = (
+            self._pending.pop(0)
+        )
+        return 1
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Toolhelp is win32-only")
+class TestTheSnapshotWalk:
+    """The Toolhelp walk now feeds a SAFETY verdict: ``idle_sessions`` reads
+    "not in the snapshot" as "nothing runs under this pane", and a yes there
+    types into the pane. So only Windows' own end-of-list error may end the
+    walk; a list cut short by any other failure is a failed snapshot."""
+
+    ENTRIES = (("pwsh.exe", 10, 1), ("cmd.exe", 11, 10), ("claude.exe", 12, 11))
+
+    def _kernel32(self, monkeypatch, entries, end_error):
+        """Serve every way the walk could reach kernel32 -- ``windll`` (no
+        private last-error copy) and ``WinDLL(..., use_last_error=True)`` --
+        from one fake walk, and return that walk."""
+        import ctypes
+
+        libraries: list[_FakeToolhelp] = []
+
+        def _load(name, use_last_error=False, **_kw):
+            library = _FakeToolhelp(entries, end_error, use_last_error=use_last_error)
+            libraries.append(library)
+            return library
+
+        monkeypatch.setattr(ctypes, "WinDLL", _load)
+        monkeypatch.setattr(
+            ctypes, "windll", type("_Loader", (), {"kernel32": _load("kernel32")})
+        )
+        monkeypatch.setattr(ctypes, "get_last_error", lambda: libraries[-1].last_error)
+        return libraries
+
+    def test_a_walk_that_reaches_the_end_returns_every_entry(self, monkeypatch):
+        libraries = self._kernel32(
+            monkeypatch,
+            self.ENTRIES,
+            end_error=18,  # ERROR_NO_MORE_FILES
+        )
+        assert snapshot_processes() == list(self.ENTRIES)
+        assert any(library.closed for library in libraries)
+
+    def test_a_walk_that_fails_partway_is_unknown_not_short(self, monkeypatch):
+        # ERROR_GEN_FAILURE after two entries: the agent's entry never came,
+        # and a short list would say nothing runs under the pane.
+        libraries = self._kernel32(monkeypatch, self.ENTRIES[:2], end_error=31)
+        assert snapshot_processes() is None
+        assert any(library.closed for library in libraries)
 
 
 class TestCountProcesses:
