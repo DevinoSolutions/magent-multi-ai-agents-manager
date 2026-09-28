@@ -1884,6 +1884,15 @@ class TestAStaleNodeSyncDaemonDegradesStatus:
             assert (
                 status_mod._is_degraded({**healthy, "node_sync": state}) is degraded
             ), state
+        # Q1 ruling: a sync paused on an unreadable node map degrades
+        # too, whatever its heartbeat says.
+        for state in ("ok", "stopped"):
+            assert (
+                status_mod._is_degraded(
+                    {**healthy, "node_sync": state}, sync_paused=True
+                )
+                is True
+            ), state
 
 
 # One readable node-map entry, as update_node_map writes it.
@@ -1902,8 +1911,9 @@ class TestANodeMapTheSyncCannotReadIsShownAsSyncPaused:
     (node_sync's _map_unreadable dials no node). Visible, never silent:
     status names the pause, the entry through node_sync.printable and the
     repair, and --json carries it additively. A busy map is a moment the next
-    tick retries, not a pause. The exit is unchanged: among the node checks
-    only a stale daemon degrades (_node_sync_state)."""
+    tick retries, not a pause. Degraded, exit 3 (the Q1 ruling on the
+    round-2 report-back): like a stale daemon, a pause freezes every node
+    row until a human repairs something (_node_sync_state)."""
 
     @pytest.fixture(autouse=True)
     def _sync_expected(self, monkeypatch, tmp_path):
@@ -1954,7 +1964,8 @@ class TestANodeMapTheSyncCannotReadIsShownAsSyncPaused:
 
         result = self._status(runner, cfgpath)
 
-        assert result.exit_code == 0, result.output
+        # Degraded (Q1), and the reason is on screen with its repair.
+        assert result.exit_code == 3, result.output
         assert (
             "node sync paused  (the node map could not be read (ValueError):"
             " entry 'api' is malformed; nothing is pulled from any node)"
@@ -1985,7 +1996,8 @@ class TestANodeMapTheSyncCannotReadIsShownAsSyncPaused:
         result = self._status(runner, cfgpath)
         as_json = self._status(runner, cfgpath, "--json")
 
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 3, result.output
+        assert as_json.exit_code == 3, as_json.output
         assert f"entry '{shown}' is malformed" in result.stdout
         assert f"fix entry '{shown}' in" in result.stdout
         assert json.loads(as_json.stdout)["node_sync_paused"] == {
@@ -2003,7 +2015,7 @@ class TestANodeMapTheSyncCannotReadIsShownAsSyncPaused:
 
         result = self._status(runner, cfgpath)
 
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 3, result.output
         assert (
             "node sync paused  (the node map could not be read (ValueError);"
             " nothing is pulled from any node)"
@@ -2061,6 +2073,32 @@ class TestANodeMapTheSyncCannotReadIsShownAsSyncPaused:
         assert "node sync paused" not in result.stdout
         assert json.loads(as_json.stdout)["node_sync_paused"] is None
 
+    def test_a_healthy_map_with_a_live_daemon_exits_0(
+        self, runner, tmp_config, tmp_path
+    ):
+        # The other side of the Q1 ruling: a readable map, a fresh heartbeat
+        # and a fresh pull listing the session -- nothing is degraded.
+        from magent import log, node_sync, nodes
+
+        cfgpath = self._config(tmp_config, tmp_path)
+        self._write_map({"api": _MAP_ENTRY})
+        nodes.write_json_atomic(
+            nodes.sessions_path("second"), {"ts": time.time(), "sessions": ["api"]}
+        )
+        log.write_heartbeat(node_sync.HEARTBEAT_NAME)
+
+        result = self._status(runner, cfgpath)
+        as_json = self._status(runner, cfgpath, "--json")
+
+        assert result.exit_code == 0, result.output
+        assert "node sync paused" not in result.stdout
+        assert as_json.exit_code == 0, as_json.output
+        payload = json.loads(as_json.stdout)
+        assert (payload["node_sync"], payload["node_sync_paused"]) == ("ok", None)
+        assert payload["node_sessions"] == [
+            {"name": "api", "session": "api", "node": "second", "state": "live"}
+        ]
+
     @pytest.mark.parametrize(
         ("damage", "paused"),
         [
@@ -2068,7 +2106,7 @@ class TestANodeMapTheSyncCannotReadIsShownAsSyncPaused:
             ("torn", {"error": "ValueError", "entry": None}),
         ],
     )
-    def test_json_carries_the_pause_additively_and_keeps_the_exit(
+    def test_json_carries_the_pause_and_exits_3(
         self, runner, tmp_config, tmp_path, damage, paused
     ):
         from magent import nodes
@@ -2081,7 +2119,8 @@ class TestANodeMapTheSyncCannotReadIsShownAsSyncPaused:
 
         result = self._status(runner, cfgpath, "--json")
 
-        assert result.exit_code == 0, result.output
+        # Degraded (Q1), with the reason in the payload.
+        assert result.exit_code == 3, result.output
         payload = json.loads(result.stdout)
         assert payload["node_sync_paused"] == paused
         assert payload["node_sync"] == "stopped"
