@@ -290,7 +290,10 @@ def _deep_config(tmp_path: Path, leaf: str) -> tuple[str, str]:
         json.loads(text)
     except RecursionError:
         # 3.10/3.11 count json's own nesting against the same limit, so a file
-        # this deep never loaded there and never reaches the walk.
+        # this deep never loaded there and never reaches the walk. On 3.12+ it
+        # must load: a skip there would hide the very walk these pins prove.
+        if sys.version_info >= (3, 12):
+            raise
         pytest.skip("json.loads refuses this depth itself on this Python")
     cfg_file = tmp_path / "magent.config.json"
     cfg_file.write_text(text, encoding="utf-8")
