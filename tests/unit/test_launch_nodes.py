@@ -2693,7 +2693,10 @@ class TestDownPullsTheLastTurnHomeFirst:
             node_sync.NodeLockHeld("node-pull-second lock is held by another process"),
             RemoteError(255, "ssh: connect to host devino-second: timed out", ("ssh",)),
             RemoteError(None, "reply exceeded 8 bytes", ("ssh",), over_cap=True),
-            RemoteError(0, "could not store every pulled file of 'api'", ("pull.sh",)),
+            node_sync.PullUnfinished(
+                "a file of session 'api' could not be stored on this PC",
+                not_stored=True,
+            ),
             nodes.NodeConfigError("node 'second' is not in settings.nodes"),
             OSError(28, "No space left on device"),
         ],
@@ -2708,6 +2711,25 @@ class TestDownPullsTheLastTurnHomeFirst:
         assert killed == ["api"]
         assert "api" in nodes.read_node_map()
         assert "api: last turn not pulled" in capsys.readouterr().out
+
+    def test_a_file_this_pc_could_not_store_is_named_in_the_row(
+        self, rig, api, monkeypatch, capsys, killed
+    ):
+        # node_sync's own error, said once: the row reads its words.
+        _hold("api")
+        self._pulls(
+            monkeypatch,
+            node_sync.PullUnfinished(
+                "a file of session 'api' could not be stored on this PC",
+                not_stored=True,
+            ),
+        )
+        launch.stop_node_sessions(_config(api), ["api"])
+        assert (
+            "api: last turn not pulled (the pull did not finish: a file of"
+            " session 'api' could not be stored on this PC); kept in the node"
+            " map for `magent node sync --once`"
+        ) in capsys.readouterr().out
 
     def test_the_line_is_the_nodes_last_word_and_names_the_repair(
         self, rig, api, monkeypatch, capsys, killed
@@ -2812,7 +2834,11 @@ class TestDownPullsTheLastTurnHomeFirst:
         for name in ("a1", "a2", "a3"):
             _hold(name)
         self._pulls(
-            monkeypatch, RemoteError(0, "could not store every pulled file", ("x",))
+            monkeypatch,
+            node_sync.PullUnfinished(
+                "a file of session 'a1' could not be stored on this PC",
+                not_stored=True,
+            ),
         )
         launch.stop_node_sessions(_config(a1, a2, a3), ["a1", "a2"])
         out = capsys.readouterr().out
@@ -3030,7 +3056,10 @@ class TestDownPullsTheLastTurnHomeFirst:
         "error",
         [
             RemoteError(None, "reply exceeded 8 bytes", ("ssh",), over_cap=True),
-            RemoteError(0, "could not store every pulled file", ("pull.sh",)),
+            node_sync.PullUnfinished(
+                "a file of session 'a1' could not be stored on this PC",
+                not_stored=True,
+            ),
             OSError(28, "No space left on device"),
             lockfile.LockHeld("node-marks lock is held by another process"),
             nodes.NodeConfigError("node 'second' is not in settings.nodes"),
