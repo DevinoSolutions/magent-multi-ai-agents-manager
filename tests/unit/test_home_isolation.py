@@ -359,6 +359,9 @@ class TestTheTmpHomeResolvesItsKnownFolders:
             cwd=tmp_path,
             capture_output=True,
             encoding="utf-8",
+            # A failing child's stderr need not be UTF-8; a strict decode
+            # would lose the diagnostic the assert below prints.
+            errors="replace",
             timeout=60,
             check=False,
         )
@@ -389,6 +392,8 @@ class TestTheTmpHomeResolvesItsKnownFolders:
             cwd=tmp_path,
             capture_output=True,
             encoding="utf-8",
+            # Only stdout is reconfigured: a traceback on stderr is cp1252.
+            errors="replace",
             timeout=60,
             check=False,
         )
