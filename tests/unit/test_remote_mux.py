@@ -1659,6 +1659,7 @@ _RESULT = {
     "attached_existing": False,
     "cwd": _ROOT,
     "commits": {_ROOT: "0123abcd"},
+    "dirty": {_ROOT: True},
     "shipped": [".env"],
 }
 
@@ -1836,7 +1837,20 @@ class TestOneConnectionBringsAProjectUp:
             commits={_ROOT: "0123abcd"},
             cwd=_ROOT,
             shipped=(".env",),
+            dirty={_ROOT: True},
         )
+
+    def test_a_tree_flag_that_is_not_a_bool_is_left_unknown(self, node_home, tmp_path):
+        # A folder missing from ``dirty`` is unknown on the PC, never
+        # clean: only a real true/false says the tree was read.
+        _answers(node_home, {**_RESULT, "dirty": {_ROOT: "false", "/x": None}})
+        assert remote_mux.bring_up(NODE, _recipe(tmp_path)).dirty == {}
+
+    def test_a_result_without_tree_flags_leaves_every_tree_unknown(
+        self, node_home, tmp_path
+    ):
+        _answers(node_home, {k: v for k, v in _RESULT.items() if k != "dirty"})
+        assert remote_mux.bring_up(NODE, _recipe(tmp_path)).dirty == {}
 
     def test_an_attach_to_a_live_session_is_reported(self, node_home, tmp_path):
         _answers(node_home, {**_RESULT, "attached_existing": True})
@@ -2951,6 +2965,43 @@ class TestBringUpShOnARealShell:
         # ...and --allow-dirty starts it anyway, leaving the edit alone.
         remote_mux.bring_up(rig["node"], rig["recipe"], allow_dirty=True)
         assert (rig["root"] / "README.md").read_bytes() == b"edited on the node\n"
+
+    def _unshipped(self, rig) -> Recipe:
+        # No push file lands in the clone: its tree is exactly origin's.
+        return dataclasses.replace(rig["recipe"], push_files=())
+
+    def test_a_clean_tree_is_reported_clean(self, rig):
+        result = remote_mux.bring_up(rig["node"], self._unshipped(rig))
+        assert result.dirty == {str(rig["root"]): False}
+
+    def test_an_untracked_file_is_reported_dirty_and_not_refused(self, rig):
+        # The refusal ignores untracked files; the report counts them, as
+        # repo_status.sh does -- "clean" would say they are not there.
+        remote_mux.bring_up(rig["node"], self._unshipped(rig))
+        (rig["state"] / "sessions" / "api").unlink()
+        (rig["root"] / "notes.txt").write_bytes(b"node only\n")
+        result = remote_mux.bring_up(rig["node"], self._unshipped(rig))
+        assert result.attached_existing is False
+        assert result.dirty == {str(rig["root"]): True}
+
+    def test_a_shipped_file_git_does_not_ignore_reads_as_dirty(self, rig):
+        # Read after the ship: the tree the session starts on, which is
+        # what repo_status.sh would report at that moment.
+        result = remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert git(rig["root"], "status", "--porcelain") == "?? .env"
+        assert result.dirty == {str(rig["root"]): True}
+
+    def test_allow_dirty_reports_no_tree_state(self, rig):
+        # --allow-dirty looks at nothing, so it claims nothing either way.
+        result = remote_mux.bring_up(
+            rig["node"], self._unshipped(rig), allow_dirty=True
+        )
+        assert result.commits != {}
+        assert result.dirty == {}
+
+    def test_an_attach_reports_no_tree_state(self, rig):
+        (rig["state"] / "sessions" / "api").write_bytes(b"cwd=/x\ncmd=old\n")
+        assert remote_mux.bring_up(rig["node"], rig["recipe"]).dirty == {}
 
     def _up_then_stop(self, rig) -> Path:
         # A first bring-up, then the session gone: the next one reaches git.

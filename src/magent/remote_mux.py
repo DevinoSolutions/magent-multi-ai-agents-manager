@@ -1530,13 +1530,19 @@ class BringUpResult:
     """What ``bring_up.sh`` reported. ``cwd`` is the node's ABSOLUTE project
     folder (``Recipe.remote_root`` keeps ``~``); ``commits`` maps each repo's
     absolute folder to the commit it now has checked out; ``shipped`` lists the
-    project-relative files written beside the clone."""
+    project-relative files written beside the clone. ``dirty`` maps a repo
+    folder to whether ``git status --porcelain`` listed anything once the
+    files were shipped -- untracked files included, ``repo_status.sh``'s
+    rule, though only tracked changes refuse a bring-up. A folder missing
+    from it was not read (an attach, ``--allow-dirty``, a status that
+    failed): unknown, never clean."""
 
     sid: str
     attached_existing: bool
     commits: dict[str, str] = field(default_factory=dict)
     cwd: str = ""
     shipped: tuple[str, ...] = ()
+    dirty: dict[str, bool] = field(default_factory=dict)
 
 
 # bring_up.sh's header format version; the script refuses anything else.
@@ -1838,6 +1844,7 @@ def bring_up(
     payload = _payload(header=header, decorate=decorate_text, files=files)
     raw = _deliver(node, "up", recipe, root, payload)
     commits, cwd, shipped = raw.get("commits"), raw.get("cwd"), raw.get("shipped")
+    dirty = raw.get("dirty")
     return BringUpResult(
         sid=recipe.sid,
         attached_existing=raw.get("attached_existing") is True,
@@ -1848,6 +1855,11 @@ def bring_up(
         ),
         cwd=cwd if isinstance(cwd, str) and _clean_absolute(cwd) else root,
         shipped=tuple(str(s) for s in shipped) if isinstance(shipped, list) else (),
+        dirty=(
+            {str(k): v for k, v in dirty.items() if isinstance(v, bool)}
+            if isinstance(dirty, dict)
+            else {}
+        ),
     )
 
 
