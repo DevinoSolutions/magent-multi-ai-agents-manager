@@ -105,7 +105,14 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
     1. the module-level path constants magent binds at import (LOG_DIR &c),
     2. the HOME family in the process environment, which covers every
        call-time ``Path.home()`` (``lockfile.exclusive_lock`` is one) AND
-       every child process, since they inherit ``os.environ``,
+       every child process, since they inherit ``os.environ``. With it go
+       ``APPDATA`` (to ``<home>/AppData/Roaming``) and ``XDG_CONFIG_HOME``
+       (to ``<home>/.config``), the variables ``env.config_base()`` reads
+       instead of ~, so a test that forgets ``--config`` cannot find the
+       real config. The empty ``<home>/AppData/Local`` and
+       ``<home>/AppData/Roaming`` folders are created for the Windows
+       known-folder lookups, which need them to exist. ``LOCALAPPDATA``
+       stays inherited on purpose (``find_psmux``'s fallback),
     3. the import-bound ``~/.magent`` constants layer 2 is too late for.
 
     Layer 2 is the one that was missing, and its absence is not theoretical: a
