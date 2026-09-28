@@ -127,6 +127,14 @@ _TR_MAX_CHARS = 261
 # Task Scheduler inside the logged-on user's session, against the user's own
 # PATH, not against the possibly-hostile PATH of an ssh login.
 _HANDOFF_SHELL = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File"
+# The script that shell runs is written WITH a BOM. Windows PowerShell 5.1
+# decodes a `-File` script that has none in the ANSI code page, which turns
+# every non-ASCII character of a path or an argument into mojibake -- and can
+# end a literal early: the UTF-8 bytes of U+00D1 (C3 91) and U+0442 (D1 82)
+# each hold one that cp1252 reads as a typographic single quote. One constant,
+# because the tests that run a launcher script stage it with this too; a copy
+# written any other way is not the file production runs.
+_HANDOFF_SCRIPT_ENCODING = "utf-8-sig"
 
 
 def _schtasks_exe() -> str | None:
@@ -1069,12 +1077,10 @@ class WindowsPlatform(Platform):
         pid_file, rc_file = work / "pid.txt", work / "rc.txt"
         try:
             work.mkdir(parents=True, exist_ok=True)
-            # WITH a BOM: Windows PowerShell 5.1 reads a `-File` script that has
-            # none in the ANSI code page, which turns every non-ASCII character
-            # of a path or an argument into mojibake.
+            # WITH a BOM -- see _HANDOFF_SCRIPT_ENCODING.
             script.write_text(
                 _handoff_script(argv, str(Path.cwd()), out, err, pid_file, rc_file),
-                encoding="utf-8-sig",
+                encoding=_HANDOFF_SCRIPT_ENCODING,
             )
         except OSError as exc:
             return HandoffResult(

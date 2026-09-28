@@ -1,9 +1,12 @@
 """Parse PowerShell with PowerShell's own parser, and never run it.
 
 A quoting test that compares strings only proves what WE believe the quote
-rules are. This asks PowerShell. The text goes through
-``[System.Management.Automation.Language.Parser]::ParseInput``, which builds
-the syntax tree and executes nothing, and every command in the tree comes back
+rules are. This asks PowerShell. ``parse`` hands text to
+``[System.Management.Automation.Language.Parser]::ParseInput``; ``parse_file``
+hands a FILE to ``::ParseFile``, which decodes it exactly as
+``powershell.exe -File`` does (a BOM picks the encoding; without one, Windows
+PowerShell 5.1 reads the ANSI code page). Either way the parser builds the
+syntax tree and executes nothing, and every command in the tree comes back
 with its elements: parameters by name, string constants with their parsed
 VALUE and quote kind. Windows only (``powershell.exe``); the output is ASCII
 (base64 for every value), so no console code page can bend it.
@@ -21,10 +24,17 @@ if TYPE_CHECKING:
 
 # Only .NET calls and language keywords: no cmdlet, so nothing autoloads a
 # module (which is what writes a ModuleAnalysisCache under the redirected home).
-_PARSER = r"""
+# Each reader leaves $ast and $errors behind for _EMIT.
+_READ_TEXT = r"""
 $text = [IO.File]::ReadAllText($env:PS_PARSE_INPUT, [Text.Encoding]::UTF8)
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors)
+"""
+_READ_FILE = r"""
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:PS_PARSE_INPUT, [ref]$tokens, [ref]$errors)
+"""
+_EMIT = r"""
 function b64([string]$s) { [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($s)) }
 foreach ($e in $errors) { [Console]::Out.WriteLine("error`t" + (b64 $e.Message)) }
 $isCommand = { param($n) $n -is [System.Management.Automation.Language.CommandAst] }
@@ -58,7 +68,19 @@ def parse(text: str, tmp_path: Path) -> Parsed:
     """PowerShell's own parse of ``text``. Nothing in ``text`` is executed."""
     src = tmp_path / "parse-input.ps1"
     src.write_text(text, encoding="utf-8")
-    encoded = base64.b64encode(_PARSER.encode("utf-16-le")).decode("ascii")
+    return _run(_READ_TEXT, src, tmp_path)
+
+
+def parse_file(path: Path, tmp_path: Path) -> Parsed:
+    """PowerShell's own parse of the file at ``path``, decoded the way
+    ``powershell.exe -File`` decodes it -- so what is tested is the bytes on
+    disk, encoding included, not the text we meant to write. Nothing in it is
+    executed."""
+    return _run(_READ_FILE, path, tmp_path)
+
+
+def _run(reader: str, src: Path, tmp_path: Path) -> Parsed:
+    encoded = base64.b64encode((reader + _EMIT).encode("utf-16-le")).decode("ascii")
     proc = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
         capture_output=True,

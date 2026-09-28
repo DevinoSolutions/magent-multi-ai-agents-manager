@@ -35,7 +35,7 @@ from magent.launch import (
 )
 from magent.platform import HandoffResult, Platform
 from tests.conftest import FakePlatform
-from tests.unit._ps_parse import argument_of
+from tests.unit._ps_parse import argument_of, parse_file
 from tests.unit._ps_parse import parse as parse_powershell
 
 # Every code point PowerShell's tokenizer ends a single-quoted literal on:
@@ -265,6 +265,9 @@ def value(flag):
 mode = args[0].lower() if args else ""
 name = value("/tn")
 if mode == "/create":
+    if os.environ.get("MDTEST_HANDOFF_CREATE_FAILS") == "1":
+        print("ERROR: Access is denied.", file=sys.stderr)
+        sys.exit(1)
     tasks[name] = value("/tr")
     state.write_text(json.dumps(tasks), encoding="utf-8")
 elif mode == "/run":
@@ -275,18 +278,29 @@ elif mode == "/run":
         # DEVNULL on all three, or this fake is not faithful: a child that
         # inherits our captured pipes keeps them open, so the CALLER's
         # `subprocess.run(capture_output=True)` blocks until the task finishes
-        # and /run stops being the fire-and-forget real schtasks is.
-        subprocess.Popen(
+        # and /run stops being the fire-and-forget real schtasks is. And a cwd
+        # of our own, because a real task starts in system32, never in the
+        # caller's directory: a launcher that dropped -WorkingDirectory must
+        # not pass by inheriting the right one.
+        launcher = subprocess.Popen(
             spec,
             shell=True,
+            cwd=here,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        (here / f"{name}.pid").write_text(str(launcher.pid), encoding="utf-8")
 elif mode == "/query":
-    # Real schtasks prints a table; only the status word is ever read.
+    # Real schtasks prints a table; only the status word is ever read. Like
+    # the real one it says Running while the task's launcher is alive, so a
+    # short start grace abandons only a launcher that is gone.
+    from magent.procs import pid_alive
+
+    pid_file = here / f"{name}.pid"
+    pid = int(pid_file.read_text(encoding="utf-8")) if pid_file.exists() else None
     print("TaskName   Next Run Time   Status")
-    print(f"{name}   N/A   Ready")
+    print(f"{name}   N/A   {'Running' if pid_alive(pid) else 'Ready'}")
 elif mode == "/delete":
     tasks.pop(name, None)
     state.write_text(json.dumps(tasks), encoding="utf-8")
@@ -440,6 +454,11 @@ class TestRunOnDesktopOnWindows:
         where = tmp_path / "caf\u00e9 \u4e2d"
         where.mkdir()
         monkeypatch.chdir(where)
+        # A launcher that never reaches Start-Process never writes pid.txt, so
+        # a red run waits out the start grace: seconds, not the default 30.
+        # Safe for a green one on a slow box, because the fake's /Query says
+        # Running for as long as the launcher is alive.
+        monkeypatch.setattr("magent.platform.windows._HANDOFF_START_GRACE_S", 5.0)
 
         result = self._plat().run_on_desktop(
             [sys.executable, "-c", "import os; print(ascii(os.getcwd()))"],
@@ -730,18 +749,23 @@ class TestTheLauncherReallyRuns:
     has a space in it."""
 
     def test_a_path_with_spaces_survives_both_layers(self, tmp_path):
-        from magent.platform.windows import _HANDOFF_SHELL, _handoff_script
+        from magent.platform.windows import (
+            _HANDOFF_SCRIPT_ENCODING,
+            _HANDOFF_SHELL,
+            _handoff_script,
+        )
 
         work = tmp_path / "a b c"
         work.mkdir()
         script = work / "run.ps1"
         out, err = work / "out.txt", work / "err.txt"
         pid, rc = work / "pid.txt", work / "rc.txt"
+        # Staged exactly as run_on_desktop stages it, encoding included.
         script.write_text(
             _handoff_script(
                 [sys.executable, "-c", "print('ok')"], str(work), out, err, pid, rc
             ),
-            encoding="utf-8",
+            encoding=_HANDOFF_SCRIPT_ENCODING,
         )
 
         subprocess.run([*_HANDOFF_SHELL.split(), str(script)], check=True, timeout=120)
@@ -749,3 +773,100 @@ class TestTheLauncherReallyRuns:
         assert out.read_text(encoding="utf-8").strip() == "ok"
         assert rc.read_text(encoding="utf-8").strip() == "0"
         assert pid.read_text(encoding="utf-8").strip().isdigit()
+
+
+_PY = r"C:\Python\python.exe"
+
+# (argv, name of the caller's directory). Every case carries U+0442 or U+4E2D,
+# which a cp1252 writer cannot encode at all and which a script without a BOM
+# turns into mojibake under -File -- so each one is red against both writers.
+_STAGED_CASES = {
+    "non-ascii-argv": (
+        ["C:\\Caf\u00e9\\python.exe", "-m", "magent", "up", "caf\u00e9 \u00d1 \u0442"],
+        "work",
+    ),
+    "every-single-quote": (
+        [_PY, "-m", "magent", "up", "a'b\u2018c\u2019d\u201ae\u201bf \u0442"],
+        "work",
+    ),
+    "config-typographic-quote": (
+        [_PY, "-m", "magent", "--config", "C:\\A\u2019B\\\u4e2d\\magent.json", "up"],
+        "work",
+    ),
+    "config-non-ascii-space": (
+        [_PY, "-m", "magent", "--config", "C:\\\u00d1 \u0442\\magent.json", "up"],
+        "work",
+    ),
+    "cwd-non-ascii-quote": ([_PY, "-m", "magent", "up"], "\u00d1\u2019s \u0442"),
+}
+
+
+@pytestmark_win
+class TestTheStagedScriptParsesBackToTheArgv:
+    """The run.ps1 ``run_on_desktop`` REALLY stages, read the way -File reads it.
+
+    ``ParseFile`` decodes a file exactly as ``powershell.exe -File`` does and
+    executes nothing, so this parses the bytes production wrote rather than
+    the text we meant them to hold. /Create fails, so the scratch directory is
+    kept as evidence and nothing runs. Windows PowerShell 5.1 reads a script
+    with no BOM in the ANSI code page, where the UTF-8 bytes of U+00D1 and
+    U+0442 each hold a typographic single quote -- and that parses with NO
+    error and different values, which is why every literal is compared, not
+    just the error count.
+    """
+
+    @pytest.mark.parametrize(
+        ("argv", "cwd_name"), list(_STAGED_CASES.values()), ids=list(_STAGED_CASES)
+    )
+    def test_every_literal_is_what_was_asked_for(
+        self, fake_schtasks, tmp_path, monkeypatch, argv, cwd_name
+    ):
+        from magent.platform.windows import WindowsPlatform
+
+        monkeypatch.setenv("MDTEST_HANDOFF_CREATE_FAILS", "1")
+        # The redirects and both Set-Content targets live under the scratch
+        # root, so a non-ASCII root puts them through the same encoding.
+        root = tmp_path / "T\u00ebmp \u00d1 \u0442"
+        root.mkdir()
+        monkeypatch.setattr(
+            "magent.platform.windows.tempfile.gettempdir", lambda: str(root)
+        )
+        cwd = tmp_path / cwd_name
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+
+        result = WindowsPlatform().run_on_desktop(argv, timeout_s=60)
+
+        # Staged, then refused: the task was never run, only cleaned up.
+        assert result.rc is None
+        assert "schtasks /Create exited 1" in result.detail
+        assert [c[0] for c in _calls(fake_schtasks)] == ["/Create", "/Delete"]
+        (work,) = (root / "magent-handoff").iterdir()
+        assert str(work) in result.detail
+
+        parsed = parse_file(work / "run.ps1", tmp_path)
+
+        assert parsed.errors == []
+        # No fragment of any value parsed as a command of its own.
+        assert [c[0][-1] for c in parsed.commands] == [
+            "Start-Process",
+            "Set-Content",
+            "Set-Content",
+        ]
+        (start,) = parsed.named("Start-Process")
+        expected = {
+            "FilePath": argv[0],
+            # ONE literal holding the whole command line, not a list.
+            "ArgumentList": subprocess.list2cmdline(argv[1:]),
+            "WorkingDirectory": str(cwd),
+            "RedirectStandardOutput": str(work / "out.txt"),
+            "RedirectStandardError": str(work / "err.txt"),
+        }
+        assert {name: argument_of(start, name) for name in expected} == {
+            name: ("const", "SingleQuoted", value) for name, value in expected.items()
+        }
+        # pid.txt first, rc.txt last.
+        assert [argument_of(c, "LiteralPath") for c in parsed.named("Set-Content")] == [
+            ("const", "SingleQuoted", str(work / "pid.txt")),
+            ("const", "SingleQuoted", str(work / "rc.txt")),
+        ]
