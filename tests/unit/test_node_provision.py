@@ -5449,6 +5449,9 @@ if [ -n "$y" ]; then
   exit 0
 fi
 if [ -e "$f" ]; then echo "$f already exists. Overwrite (y/n)?" >&2; exit 1; fi
+# The mode of ~/.ssh while the key is written: an open key is guarded only by
+# its directory until setup chmods it.
+stat -c %a "${f%/*}" > "$STATE/keygen-dir-mode"
 printf 'FAKE PRIVATE KEY %s\\n' "$c" > "$f"
 # keygen-acl: OpenSSH >= 8.2 writes the key as umask 077 over open(0644), and a
 # default ACL on ~/.ssh overrides the umask (measured on a hosted runner: 0644).
@@ -5542,15 +5545,18 @@ def _existing_user(state: Path, name: str, *, uid: int | None = None) -> Path:
     return home
 
 
-def _fails_on_the_node_key(tmp_path: Path, tool: str) -> None:
-    """``tool`` fails for a ``~/.ssh/id_ed25519`` argument and is the real one
-    for any other: the shims come first on the fake box's PATH."""
+def _fails_on_the_node_key(
+    tmp_path: Path, tool: str, pattern: str = "*/.ssh/id_ed25519"
+) -> None:
+    """``tool`` fails for an argument matching the shell ``pattern`` (the node
+    key, or ``*/.ssh`` for its directory) and is the real one for any other:
+    the shims come first on the fake box's PATH."""
     real = shutil.which(tool)
     assert real is not None, f"{tool} is not on this runner"
     shim = tmp_path / "shims" / tool
     shim.write_text(
         f"#!{BASH}\n"
-        'for a; do case "$a" in */.ssh/id_ed25519)\n'
+        f'for a; do case "$a" in {pattern})\n'
         f'  echo "{tool}: $a: Operation not permitted" >&2; exit 1 ;; esac; done\n'
         f'exec {shlex.quote(real)} "$@"\n',
         encoding="utf-8",
@@ -5563,6 +5569,16 @@ def _keygen_calls(state: Path) -> list[str]:
     """Every argv the fake ssh-keygen was run with, in order."""
     log = state / "keygen.log"
     return log.read_text("utf-8").splitlines() if log.exists() else []
+
+
+def _authorized_ssh_dir(state: Path, mode: int) -> Path:
+    """amin's ~/.ssh at ``mode``, already authorizing this PC's key: setup's
+    authorized_keys step skips it, so leaves the mode as it found it."""
+    ssh_dir = _existing_user(state, "amin") / ".ssh"
+    ssh_dir.mkdir()
+    (ssh_dir / "authorized_keys").write_text(PC_KEY + "\n", encoding="utf-8")
+    ssh_dir.chmod(mode)
+    return ssh_dir
 
 
 @POSIX_BASH
@@ -6233,6 +6249,55 @@ class TestSetupShUnderRealBash:
         assert blocker.stat().st_mode & 0o777 == 0o755
         assert _rows(r)["node-key:amin"] == "fail"
         assert set(_report(r).keys()) == set()
+        assert r.returncode == 1
+
+    @pytest.mark.parametrize("mode", [0o755, 0o777], ids=["0755", "0777"])
+    def test_ssh_is_owner_only_before_the_node_key_is_generated_in_it(
+        self, tmp_path, mode
+    ):
+        # The new key is open until its chmod (keygen-acl), and meanwhile only
+        # its directory keeps others out. `mkdir -p` under a default ACL makes
+        # ~/.ssh 0777, and an authorized_keys already in it leaves it be.
+        state, env = _setup_box(tmp_path)
+        (state / "keygen-acl").touch()
+        ssh_dir = _authorized_ssh_dir(state, mode)
+        r = _run_setup(env)
+        assert _rows(r)["authorized_keys:amin"] == "skip"
+        assert (state / "keygen-dir-mode").read_text("utf-8") == "700\n"
+        assert ssh_dir.stat().st_mode & 0o777 == 0o700
+        assert (ssh_dir / "id_ed25519").stat().st_mode & 0o777 == 0o600
+        assert _rows(r)["node-key:amin"] == "did"
+        assert _report(r).keys() == {
+            "amin": "ssh-ed25519 AAAAFAKENODEKEY magent@devino-second"
+        }
+        assert r.returncode == 0, r.stderr
+
+    def test_an_ssh_dir_that_cannot_be_made_owner_only_gets_no_node_key(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        ssh_dir = _authorized_ssh_dir(state, 0o755)
+        _fails_on_the_node_key(tmp_path, "chmod", "*/.ssh")
+        r = _run_setup(env)
+        assert self._row(r, "node-key:amin") == (
+            "fail",
+            "could not make ~/.ssh owner-only (0700) for the new key",
+        )
+        assert _keygen_calls(state) == []
+        assert not (ssh_dir / "id_ed25519").exists()
+        assert set(_report(r).keys()) == set()
+        assert b"Operation not permitted" not in r.stdout + r.stderr
+        assert r.returncode == 1
+
+    def test_an_ssh_path_that_is_a_file_gets_magents_own_fail_row(self, tmp_path):
+        state, env = _setup_box(tmp_path)
+        (_existing_user(state, "amin") / ".ssh").write_bytes(b"x\n")
+        r = _run_setup(env)
+        assert self._row(r, "node-key:amin") == (
+            "fail",
+            "could not make ~/.ssh owner-only (0700) for the new key",
+        )
+        assert _keygen_calls(state) == []
+        assert set(_report(r).keys()) == set()
+        assert b"File exists" not in r.stdout + r.stderr
         assert r.returncode == 1
 
     # -- bounded version probes (impl-F14) -------------------------------------
