@@ -232,10 +232,14 @@ def _psmux_sessions(
     The agents themselves live inside these sessions -- they are what an SSH
     client attaches to -- so a report that stops at the daemons says nothing
     about the actual work. Liveness is already settled by ``psmux_status``'s
-    fan-out; the only added cost is one ``#{pane_current_command}`` probe per
-    live session, and those go out as a single unbounded fan-out
-    (``psmux.pane_current_commands``), so 40 sessions stay ~one psmux
-    round-trip. Agent states come from the same store the picker reads, so the
+    fan-out; the added cost is one ``#{pane_current_command}`` probe per live
+    session, sent as a single fan-out -- every probe at once, one shared
+    deadline (``psmux.pane_current_commands``) -- so 40 sessions stay ~one
+    psmux round-trip. ``idle`` is the verdict revive acts on (``psmux.idle_sessions``,
+    handed those same readings), which adds one pane-pid fan-out and one
+    process snapshot only when some pane reads as a bare shell -- a shell in
+    the foreground is often a live agent's tool, so the reading alone never
+    says idle. Agent states come from the same store the picker reads, so the
     two surfaces can never disagree -- which is why ``staleness`` is a required
     argument and not a default: the same config windows the `agents` array ages
     with (``_agents_snapshot`` -> ``engine_from_config``) must age this column,
@@ -250,6 +254,7 @@ def _psmux_sessions(
         return []
     binary = psmux_mod.find_psmux() or ""
     apps = psmux_mod.pane_current_commands(sids, psmux=binary or None)
+    idle = psmux_mod.idle_sessions(sids, psmux=binary or None, foreground=apps)
     resolved = {psmux_mod.socket_id(p): _as_str(p.get("resolved")) for p in projects}
     states = _session_states(_session_cwds(binary, sids, resolved), staleness)
     rows: list[dict[str, object]] = []
@@ -260,7 +265,7 @@ def _psmux_sessions(
             {
                 "name": sid,
                 "app": app,
-                "idle": psmux_mod.is_idle_command(app),
+                "idle": sid in idle,
                 # "" (never None) when the store has no record, so a JSON
                 # consumer treats it as a plain string field -- the same
                 # convention psmux.config_sessions uses for "resolved".

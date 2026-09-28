@@ -103,7 +103,11 @@ class TestTheSweepOnlyTouchesPsmux:
         monkeypatch.setattr(
             procs,
             "snapshot_processes",
-            lambda: [("PSMUX.EXE", 10), ("pSmUx.ExE", 11), ("notepad.exe", 12)],
+            lambda: [
+                ("PSMUX.EXE", 10, 1),
+                ("pSmUx.ExE", 11, 1),
+                ("notepad.exe", 12, 1),
+            ],
         )
 
         assert procs.pids_by_image_name({"psmux.exe"}) == [10, 11]

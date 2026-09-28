@@ -1,6 +1,6 @@
 [project]
 name = "magent-multi-ai-agents-manager"
-version = "3.19.1"
+version = "3.19.2"
 description = "Launch each project's AI coding agent in its own terminal, auto-tiled across every monitor"
 readme = "README.md"
 license = "AGPL-3.0"
@@ -87,15 +87,15 @@ Issues = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/issu
 Changelog = "https://github.com/DevinoSolutions/magent-multi-ai-agents-manager/blob/main/CHANGELOG.md"
 
 [build-system]
-# hatchling 1.32.0 (2026-08-11) started emitting Metadata-Version 2.5, which
-# the pinned gh-action-pypi-publish rejects at upload time (its bundled
-# packaging==26.2 predates 2.5 support; packaging 26.3, 2026-08-04, is the
-# first that knows it) — the v3.11.1 tag run failed exactly there while the
-# build job's own `twine check --strict` (unpinned, packaging 26.3) passed.
-# Cap the backend so artifacts stay Metadata-Version 2.4 end-to-end; lift the
-# cap once a Dependabot bump of pypa/gh-action-pypi-publish ships packaging
-# >= 26.3 in its runtime.txt.
-requires = ["hatchling<1.33"]
+# hatchling 1.32.0 (2026-08-11) started emitting Metadata-Version 2.5. The
+# v3.11.1 tag run failed on it at publish time: gh-action-pypi-publish v1.14.0
+# bundled packaging==25.0, which rejects 2.5, while the build job's own
+# `twine check --strict` (unpinned, newer packaging) passed. The pin is now
+# v1.14.2, whose packaging==26.2 accepts 2.5 in `twine check`, but no 2.5 upload
+# to PyPI has been proven, so the cap keeps artifacts at Metadata-Version 2.4
+# (what every release from v3.11.1 on shipped). Dependabot #227 lifted it early;
+# lift it only in a change that proves a 2.5 upload.
+requires = ["hatchling<1.32"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

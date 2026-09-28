@@ -47,6 +47,10 @@ class AgentTool:
     # has no implicit-resume form at all.
     fresh_form: Callable[[str], str | None] | None = None
     happy: bool = False  # can be wrapped with `happy` for mobile access
+    # Process image names (no ".exe", any case) a RUNNING instance of this
+    # agent carries. `psmux.idle_sessions` never calls a pane idle while one of
+    # these -- or an AGENT_RUNTIME_IMAGES host -- runs anywhere under it.
+    images: tuple[str, ...] = ()
 
     @property
     def multi_window(self) -> bool:
@@ -60,6 +64,7 @@ AGENT_TOOLS: dict[str, AgentTool] = {
         fresh_command=claude_fresh_command,
         fresh_form=claude_fresh_form,
         happy=True,
+        images=("claude",),
     ),
     "codex": AgentTool(
         session_ids=get_codex_session_ids,
@@ -67,8 +72,25 @@ AGENT_TOOLS: dict[str, AgentTool] = {
         fresh_command=codex_fresh_command,
         fresh_form=codex_fresh_form,
         happy=True,
+        images=("codex",),
     ),
 }
+
+# Runtimes an agent can equally run UNDER, as a script rather than its own
+# binary: an npm-installed Claude Code is node.exe running cli.js, and codex's
+# npm shim is node.exe over the native binary. A process snapshot carries image
+# names only, never command lines, so any process on one of these counts as
+# possibly the agent -- the reading that errs toward "not idle".
+AGENT_RUNTIME_IMAGES: frozenset[str] = frozenset({"node"})
+
+
+def agent_image_names() -> frozenset[str]:
+    """Every image name (lower-case, no ".exe") that may be a running agent:
+    each AGENT_TOOLS entry's ``images`` plus AGENT_RUNTIME_IMAGES. Read at call
+    time, so a registry entry stays the only edit a new agent needs."""
+    return AGENT_RUNTIME_IMAGES | {
+        image.lower() for tool in AGENT_TOOLS.values() for image in tool.images
+    }
 
 
 def build_resume_command(tool: str, base_cmd: str, session_id: str | None) -> str:
