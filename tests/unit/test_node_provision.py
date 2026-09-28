@@ -1852,19 +1852,19 @@ class TestUserScopePluginsAndSkills:
         )
         assert "DECOY" not in repr(scope)
 
-    # Only the spelling the user sees catches the OneDrive layout: ~/.claude a
-    # link elsewhere and skills a link back to ~, which is above neither where
-    # the skills folder resolves (~ itself) nor the skills folder where
-    # ~/.claude resolves.
+    # Only the spelling the user sees catches a cloud-synced profile layout:
+    # ~/.claude a link elsewhere and skills a link back to ~, which is above
+    # neither where the skills folder resolves (~ itself) nor the skills
+    # folder where ~/.claude resolves.
     def test_skills_linked_to_home_while_claude_links_elsewhere_ships_nothing(
         self, tmp_path
     ):
         home = _pc_home(tmp_path)
         _skill(home, "notes/private.md", b"PRIVATE-DECOY")
-        onedrive = tmp_path / "OneDrive" / ".claude"
-        self._transcripts(onedrive)
-        _link_dir(home / ".claude", onedrive)
-        _link_dir(onedrive / "skills", home)
+        synced = tmp_path / "synced" / ".claude"
+        self._transcripts(synced)
+        _link_dir(home / ".claude", synced)
+        _link_dir(synced / "skills", home)
         scope = _walked(home)
         assert scope.skills == ()
         assert scope.notes == (
@@ -1934,7 +1934,8 @@ class TestUserScopePluginsAndSkills:
         assert "skills/x/key resolves to" in caplog.text
 
     # Both sides are resolved: a ~/.ssh that is itself a junction elsewhere
-    # (OneDrive setups) still names the folder a skills link lands in.
+    # (cloud-synced profile setups) still names the folder a skills link
+    # lands in.
     def test_a_secrets_folder_that_is_itself_a_link_is_still_recognised(self, tmp_path):
         home = _pc_home(tmp_path)
         skills = home / ".claude" / "skills"
@@ -3194,9 +3195,9 @@ class TestTheSkillsWalkNeverReadsTheRestOfClaude:
         assert [r.levelname for r in logged] == ["WARNING"]
         assert "outside ~/.claude/skills" in logged[0].getMessage()
 
-    # Both sides resolved: with ~/.claude a junction elsewhere (OneDrive
-    # setups), the transcripts it points at are still recognised, and its own
-    # skills folder still ships.
+    # Both sides resolved: with ~/.claude a junction elsewhere (cloud-synced
+    # profile setups), the transcripts it points at are still recognised, and
+    # its own skills folder still ships.
     def test_a_claude_folder_that_is_itself_a_link_is_still_recognised(self, tmp_path):
         home = _pc_home(tmp_path)
         real_claude = tmp_path / "synced" / "claude"
