@@ -230,6 +230,7 @@ user_node_key() {
   fi
   # The row says whether the chmod changed anything (GNU stat: nodes are
   # Debian/Ubuntu). A mode stat cannot read is a repair, never a clean skip.
+  # A fail row after it carries the note too: the next run reads 0600.
   if [ -f "$id" ]; then
     mode=$(stat -c %a "$id" 2>/dev/null) || mode=""
     if ! chmod 600 "$id" 2>/dev/null; then
@@ -253,12 +254,12 @@ user_node_key() {
       say skip "node-key:$u" "id_ed25519 already in ~/.ssh"
     fi
   elif ! command -v ssh-keygen >/dev/null 2>&1; then
-    say fail "node-key:$u" "ssh-keygen is not installed (Debian/Ubuntu package openssh-client)"
+    say fail "node-key:$u" "ssh-keygen is not installed (Debian/Ubuntu package openssh-client)${made:+; $made}"
     return 1
   elif [ -f "$id" ]; then
     if ! out=$(ssh-keygen -y -P "" -f "$id" 2>&1 > "$id.pub"); then
       rm -f -- "$id.pub"
-      say fail "node-key:$u" "ssh-keygen -y: ${out##*$'\n'}"
+      say fail "node-key:$u" "ssh-keygen -y: ${out##*$'\n'}${made:+; $made}"
       return 1
     fi
     say did "node-key:$u" "id_ed25519.pub derived again from the private key in ~/.ssh${made:+; $made}"
