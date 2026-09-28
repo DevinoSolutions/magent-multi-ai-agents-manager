@@ -62,7 +62,10 @@ def read_state(cwd):
     try:
         with open(record_path(cwd), encoding="utf-8") as fh:
             rec = json.load(fh)
-    except (OSError, ValueError):
+    # RecursionError: a record nested past what json recurses through reads
+    # as no record, so this tool call overwrites it. Raised, the catch-all at
+    # the end would swallow it on every tool call: the state would freeze.
+    except (OSError, ValueError, RecursionError):
         return None
     return rec if isinstance(rec, dict) else None
 
