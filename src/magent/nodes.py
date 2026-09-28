@@ -1865,7 +1865,7 @@ def resolve(
     passed in so this stays pure. A node with no ``user`` runs as the local
     user, lowercased to match the per-person node account convention (D4). That
     derived name must be a login ssh can use (a Windows ``USERNAME`` such as
-    ``"Alice Smith"`` is not), and it may never be root -- running sessions as
+    ``"Alice Example"`` is not), and it may never be root -- running sessions as
     root has to be written down.
     """
     if proj.node is None:

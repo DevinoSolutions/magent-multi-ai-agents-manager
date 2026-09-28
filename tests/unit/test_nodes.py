@@ -882,7 +882,7 @@ class TestResolve:
 
     @pytest.mark.parametrize(
         ("local_user", "derived"),
-        [("Alice Smith", "alice smith"), (" ", " "), ("1amin", "1amin")],
+        [("Alice Example", "alice example"), (" ", " "), ("1amin", "1amin")],
     )
     def test_a_derived_user_ssh_cannot_log_in_as_is_refused(self, local_user, derived):
         # A Windows USERNAME may hold a space; whitespace passes `if not user`.
@@ -897,7 +897,7 @@ class TestResolve:
     def test_an_explicit_user_is_not_second_guessed(self):
         pool = _pool({"sixth": NodeConfig(nick="sixth", host="h", user="Svc.Account")})
         node = nodes.resolve(
-            pool, ProjectConfig(path="api", node="sixth"), local_user="Alice Smith"
+            pool, ProjectConfig(path="api", node="sixth"), local_user="Alice Example"
         )
         assert node.user == "Svc.Account"
 
@@ -954,7 +954,7 @@ class TestANickResolvesLikeAProject:
 
     @pytest.mark.parametrize(
         ("local_user", "derived"),
-        [("Alice Smith", "alice smith"), (" ", " "), ("1amin", "1amin")],
+        [("Alice Example", "alice example"), (" ", " "), ("1amin", "1amin")],
     )
     def test_a_derived_user_ssh_cannot_log_in_as_is_refused_by_nick(
         self, local_user, derived
@@ -977,10 +977,10 @@ class TestANickResolvesLikeAProject:
             ("", r"^settings\.nodes\.third\.user is not set"),
             ("root", r"^settings\.nodes\.third: magent is running as root"),
             (
-                "Alice Smith",
+                "Alice Example",
                 (
                     r"^settings\.nodes\.third\.user is not set and the local "
-                    r"username 'Alice Smith' is not a node login"
+                    r"username 'Alice Example' is not a node login"
                 ),
             ),
         ],
