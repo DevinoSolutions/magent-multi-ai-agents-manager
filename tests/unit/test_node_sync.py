@@ -3515,6 +3515,31 @@ class TestWhatCountsAsUnreachable:
         assert not re.search(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]", line)
 
 
+class TestAnEscapedLineIsWhatTheNodeSaid:
+    def test_a_literal_escape_and_the_byte_it_names_log_differently(self):
+        # A node that printed the four characters \x1b did not send ESC: a
+        # backslash is escaped too, so the log tells the two apart.
+        assert node_sync.escaped(r"\x1b") == r"\\x1b"
+        assert node_sync.escaped("\x1b") == r"\x1b"
+
+    @pytest.mark.parametrize(
+        "said",
+        [
+            pytest.param(r"\x1b", id="literal-escape"),
+            pytest.param("\x1b]0;x\x07boom", id="real-esc"),
+            pytest.param(r"C:\Users\demo\a.jsonl", id="windows-path"),
+            pytest.param("bad \ufffd byte", id="u-fffd"),
+            # A lone surrogate is its \ud800 escape, which decodes back to it.
+            pytest.param("hi\ud800", id="lone-surrogate"),
+            pytest.param("first\n\tsecond", id="newline-and-tab"),
+        ],
+    )
+    def test_an_escaped_line_decodes_back_to_what_the_node_said(self, said):
+        line = node_sync.escaped(said)
+        assert all(" " <= c <= "~" for c in line)
+        assert line.encode("ascii").decode("unicode_escape") == said
+
+
 class TestABadWatermarkIsNoWatermark:
     @pytest.mark.parametrize(
         "since",

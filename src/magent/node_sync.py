@@ -633,10 +633,15 @@ def escaped(text: str) -> str:
     """``text`` as one line for the log, where ``printable`` would drop
     characters: each one outside printable ASCII becomes its escape -- a
     newline ``\\n``, ESC ``\\x1b``, U+FFFD (what a byte that was not UTF-8
-    decoded to) ``\\ufffd``. A node's words in nodes.log must neither split a
-    record nor write to a terminal tailing it."""
+    decoded to) ``\\ufffd`` -- and so does a backslash, ``\\\\``, or a node
+    that printed the four characters ``\\x1b`` would log as one that sent
+    ESC. A node's words in nodes.log must neither split a record nor write to
+    a terminal tailing it, and ``unicode_escape`` decodes the line back to
+    them."""
     return "".join(
-        c if " " <= c <= "~" else c.encode("unicode_escape").decode("ascii")
+        c
+        if " " <= c <= "~" and c != "\\"
+        else c.encode("unicode_escape").decode("ascii")
         for c in text
     )
 
