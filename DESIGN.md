@@ -2284,9 +2284,11 @@ change):
 - **The home tripwire stops at the HOME family.** Guard B inspects only
   `HOME`/`USERPROFILE` in an explicit child `env=`, so a child env carrying
   the real `APPDATA` or `XDG_CONFIG_HOME` passes it. Guard A's
-  `_REAL_STATE_ROOTS` is `~/.magent` and `~/.claude`, without
-  `REAL_APPDATA/magent`, so an import-bound Path under the real Windows
-  config directory is not flagged.
+  `_REAL_STATE_ROOTS` is `~/.magent` and `~/.claude`, without the real
+  config base (`REAL_APPDATA/magent` on Windows, `~/.config/magent` or an
+  exported `$XDG_CONFIG_HOME/magent` on Linux, `~/Library/Application
+  Support/magent` on macOS), so an import-bound Path under any of them is
+  not flagged.
 
 ## 4. Change guide
 
