@@ -6,7 +6,9 @@ report over the wired events + state store.
 from __future__ import annotations
 
 import json
+import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -498,6 +500,98 @@ class TestASettingsFileMagentCannotUnderstand:
         )
 
         assert result.stderr.startswith(f"  {style('x', fg='red')} {settings}: ")
+
+
+# A settings.json install can read and wire, holding a key it must not leak.
+_VALID = b"{" + _ENV + b'"model": "keep-me"}'
+
+
+class TestASettingsFileMagentCannotWrite:
+    """install used to die on the write side with a traceback -- measured: a
+    read-only settings.json on Windows fails os.replace with PermissionError
+    -- and left its settings.tmp behind. A write that fails is refused the way
+    a read that fails is: our words, exit 1, the file byte-identical, nothing
+    beside it."""
+
+    @staticmethod
+    def _plant(tmp_path):
+        settings = tmp_path / "claude" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_bytes(_VALID)
+        return settings
+
+    @staticmethod
+    def _assert_refused_untouched(result, settings):
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        assert result.stdout == ""
+        assert result.stderr == (
+            f"  x Cannot edit {settings}: could not be written (PermissionError)\n"
+        )
+        assert _where_the_secret_survives(result.exception) == []
+        assert settings.read_bytes() == _VALID
+        assert [p.name for p in settings.parent.iterdir()] == ["settings.json"]
+
+    def test_a_failed_replace_removes_the_temp_file(
+        self, runner, tmp_path, monkeypatch
+    ):
+        settings = self._plant(tmp_path)
+        real_replace = os.replace
+        temp_files = []
+
+        def replace(src, dst):
+            if Path(dst) != settings:
+                return real_replace(src, dst)
+            # Recorded so the cleanup assertion is not vacuous: the temp file
+            # really was written before the replace failed.
+            temp_files.append((Path(src).name, Path(src).is_file()))
+            raise PermissionError(13, "Access is denied")
+
+        monkeypatch.setattr(os, "replace", replace)
+
+        result = _install(runner, settings)
+
+        assert temp_files == [("settings.tmp", True)]
+        self._assert_refused_untouched(result, settings)
+
+    def test_a_read_only_file_is_refused_untouched(self, runner, tmp_path):
+        settings = self._plant(tmp_path)
+        # 0444 on POSIX; on Windows it sets the read-only attribute.
+        settings.chmod(0o444)
+        try:
+            if os.access(settings, os.W_OK):
+                pytest.skip("this user can write a read-only file (root)")
+            result = _install(runner, settings)
+            # Still read-only: POSIX renames over a 0444 file as freely as
+            # over any other, and the replacement would come back writable.
+            assert not os.access(settings, os.W_OK)
+        finally:
+            settings.chmod(0o644)
+        self._assert_refused_untouched(result, settings)
+
+    def test_a_read_only_file_is_refused_where_the_rename_would_succeed(
+        self, runner, tmp_path, monkeypatch
+    ):
+        # POSIX's rename, stood in on every OS: it ignores the destination's
+        # mode. The refusal must not lean on Windows refusing the replace.
+        settings = self._plant(tmp_path)
+        real_replace = os.replace
+
+        def replace(src, dst):
+            if Path(dst) == settings:
+                os.chmod(dst, 0o644)
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", replace)
+        settings.chmod(0o444)
+        try:
+            if os.access(settings, os.W_OK):
+                pytest.skip("this user can write a read-only file (root)")
+            result = _install(runner, settings)
+            assert not os.access(settings, os.W_OK)
+        finally:
+            settings.chmod(0o644)
+        self._assert_refused_untouched(result, settings)
 
 
 class TestStatus:

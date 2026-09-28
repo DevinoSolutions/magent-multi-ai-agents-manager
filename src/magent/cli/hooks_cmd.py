@@ -7,6 +7,7 @@ store is.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -151,30 +152,18 @@ def _repair_entries(entries: list[object], cmd: str) -> bool:
     return changed
 
 
-@main.group("hooks")
-def hooks_group() -> None:
-    """Wire agent lifecycle hooks that feed the session-state store."""
+def _wire_settings(path: Path) -> tuple[list[str], list[str]] | str:
+    """Merge one magent-state-hook entry per event into the settings.json at
+    ``path`` and write it back: the events (added, repaired), or why the file
+    cannot be edited.
 
-
-@hooks_group.command("install")
-@click.option(
-    "--settings-file",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Claude Code settings.json to edit (default: ~/.claude/settings.json).",
-)
-def hooks_install_cmd(settings_file: Path | None) -> None:
-    """Add magent's state hook to Claude Code so session states stay accurate.
-
-    Merges one magent-state-hook entry per lifecycle event into settings.json
-    (idempotent; existing hooks are preserved). Prints the Codex notify recipe
-    -- ~/.codex/config.toml is TOML, edited by hand.
+    Returned, never raised, for _load_settings's reason: the command raises
+    SystemExit, and the traceback keeps that frame's locals alive -- so the
+    parsed file, API keys and all, lives only in this one.
     """
-    path = settings_file or _default_settings_file()
     data = _load_settings(path)
     if isinstance(data, str):
-        click.echo(f"  {style('x', fg='red')} Cannot edit {path}: {data}", err=True)
-        raise SystemExit(1)
+        return data
 
     # _load_settings refused any other shape: these defaults only fill in what
     # is absent.
@@ -200,11 +189,61 @@ def hooks_install_cmd(settings_file: Path | None) -> None:
         entries.append(entry)
         added.append(event)
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    problem = _write_settings(path, data)
+    return (added, repaired) if problem is None else problem
 
+
+def _write_settings(path: Path, data: dict[str, object]) -> str | None:
+    """Replace the settings.json at ``path`` with ``data``: None, or what
+    stopped the write in our words plus the error's class. A failed write
+    removes its temp file (best effort), leaving nothing beside the file.
+
+    The file itself is opened for writing first: POSIX renames over a
+    read-only file as freely as over any other (a rename is the directory's
+    business), so the replace alone would overwrite a settings.json the user
+    made read-only -- and hand it back writable.
+    """
+    tmp = path.with_suffix(".tmp")
+    try:
+        if path.exists():
+            with path.open("r+b"):
+                pass
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        return f"could not be written ({type(exc).__name__})"
+    return None
+
+
+@main.group("hooks")
+def hooks_group() -> None:
+    """Wire agent lifecycle hooks that feed the session-state store."""
+
+
+@hooks_group.command("install")
+@click.option(
+    "--settings-file",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Claude Code settings.json to edit (default: ~/.claude/settings.json).",
+)
+def hooks_install_cmd(settings_file: Path | None) -> None:
+    """Add magent's state hook to Claude Code so session states stay accurate.
+
+    Merges one magent-state-hook entry per lifecycle event into settings.json
+    (idempotent; existing hooks are preserved). Prints the Codex notify recipe
+    -- ~/.codex/config.toml is TOML, edited by hand.
+    """
+    path = settings_file or _default_settings_file()
+    wired = _wire_settings(path)
+    if isinstance(wired, str):
+        click.echo(f"  {style('x', fg='red')} Cannot edit {path}: {wired}", err=True)
+        raise SystemExit(1)
+
+    added, repaired = wired
     if added:
         click.echo(
             f"  {style('+', fg='green', bold=True)} Wired {', '.join(added)} in {style(str(path), dim=True)}"
