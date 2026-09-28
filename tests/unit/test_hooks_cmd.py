@@ -6,6 +6,7 @@ report over the wired events + state store.
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -351,19 +352,96 @@ class TestInstall:
         assert json.loads(settings.read_text(encoding="utf-8"))["hooks"] == before
 
 
-class TestStatus:
-    def test_settings_nested_past_the_parsers_depth_read_as_unwired(
-        self, runner, tmp_path
+_UNUSABLE = [
+    pytest.param(b"not json {", "not valid JSON (JSONDecodeError)", id="not-json"),
+    pytest.param(
+        b'{"hooks": "\xff"}', "not valid UTF-8 (UnicodeDecodeError)", id="not-utf8"
+    ),
+    pytest.param(
+        _NESTED.encode(), "nested too deeply to parse (RecursionError)", id="nested"
+    ),
+    pytest.param(b"[]", "not a JSON object", id="not-an-object"),
+    pytest.param(
+        b'{"hooks": [], "model": "keep-me"}',
+        '"hooks" is not a JSON object',
+        id="hooks-not-an-object",
+    ),
+    pytest.param(
+        b'{"hooks": {"Stop": {"type": "command", "command": "mine"}}}',
+        '"hooks.Stop" is not a JSON array',
+        id="event-not-an-array",
+    ),
+    # A directory where the file should be: a real OSError on every OS.
+    pytest.param(
+        None,
+        "could not be read "
+        f"({'PermissionError' if sys.platform == 'win32' else 'IsADirectoryError'})",
+        id="unreadable",
+    ),
+]
+
+
+class TestASettingsFileMagentCannotUnderstand:
+    """status used to read any of these as "every event unwired", and install
+    either died with a traceback (OSError) or quietly REWROTE the file,
+    replacing a non-object ``hooks`` or a non-array event value with its own.
+    The wt_keys law applies: a file magent cannot safely understand is
+    refused, never rewritten -- and never reported as something it is not."""
+
+    @staticmethod
+    def _plant(tmp_path, content):
+        settings = tmp_path / "claude" / "settings.json"
+        settings.parent.mkdir()
+        if content is None:
+            settings.mkdir()
+        else:
+            settings.write_bytes(content)
+        return settings
+
+    @pytest.mark.parametrize(("content", "reason"), _UNUSABLE)
+    def test_install_refuses_and_leaves_it_byte_identical(
+        self, runner, tmp_path, content, reason
     ):
-        settings = tmp_path / "settings.json"
-        settings.write_text(_NESTED, encoding="utf-8")
+        settings = self._plant(tmp_path, content)
+
+        result = _install(runner, settings)
+
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        assert result.stdout == ""
+        assert result.stderr == f"  x Cannot edit {settings}: {reason}\n"
+        # Our words alone: a parser error's .doc is the whole file.
+        refusal = result.exception.__cause__
+        assert refusal.__cause__ is None
+        assert refusal.__context__ is None
+        if content is None:
+            assert list(settings.iterdir()) == []
+        else:
+            assert settings.read_bytes() == content
+        # Nothing written beside it either: no temp file, no backup.
+        assert [p.name for p in settings.parent.iterdir()] == ["settings.json"]
+
+    @pytest.mark.parametrize(("content", "reason"), _UNUSABLE)
+    def test_status_names_the_problem_instead_of_reading_it_as_unwired(
+        self, runner, tmp_path, content, reason
+    ):
+        settings = self._plant(tmp_path, content)
+
         result = runner.invoke(
             cli.main, ["hooks", "status", "--settings-file", str(settings)]
         )
-        assert result.exit_code == 0, result.exception
-        for event in EVENTS:
-            assert f"x {event}" in result.output
 
+        assert result.exit_code == 0, result.exception
+        lines = result.output.splitlines()
+        assert lines[0] == f"  ! Cannot tell what is wired in {settings}: {reason}"
+        for event in EVENTS:
+            assert f"x {event}" not in result.output
+            assert f"+ {event}" not in result.output
+        # The store half of the report still runs.
+        assert "State store is empty" in result.output
+
+
+class TestStatus:
     def test_unwired_events_marked_and_empty_store_reported(self, runner, tmp_path):
         result = runner.invoke(
             cli.main,

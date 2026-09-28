@@ -73,18 +73,47 @@ def _codex_recipe() -> str:
     return f'notify = [{json.dumps(_hook_exe())}, "--source", "codex"]'
 
 
+class _UnusableSettings(Exception):
+    """settings.json exists, but magent cannot safely understand it."""
+
+
 def _load_settings(path: Path) -> dict[str, object]:
+    """The parsed settings.json, or {} when there is none.
+
+    Raises _UnusableSettings, in our words plus the error's class, for a file
+    magent cannot safely understand: unreadable, not UTF-8, not JSON, nested
+    past the parser's depth, or not the shape Claude Code writes -- ``hooks``
+    an object, each of our events' values an array. install refuses such a
+    file untouched (the wt_keys law: a file magent cannot read is never
+    rewritten; before this, a wrong-shaped ``hooks`` was silently replaced),
+    and status says so instead of reporting every event unwired.
+
+    Raised after the try statement, so no parser error rides along: a
+    JSONDecodeError's ``.doc`` is the whole file.
+    """
     if not path.exists():
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError as exc:
+        problem = f"not valid UTF-8 ({type(exc).__name__})"
+    except ValueError as exc:
+        problem = f"not valid JSON ({type(exc).__name__})"
     except RecursionError as exc:
-        # JSON nested past the parser's depth. Every caller catches ValueError
-        # for a file it cannot use, and this is one.
-        raise ValueError("settings.json is nested too deeply to parse") from exc
-    if not isinstance(data, dict):
-        raise TypeError("settings.json is not a JSON object")
-    return data
+        problem = f"nested too deeply to parse ({type(exc).__name__})"
+    except OSError as exc:
+        problem = f"could not be read ({type(exc).__name__})"
+    else:
+        if not isinstance(data, dict):
+            problem = "not a JSON object"
+        elif not isinstance(hooks := data.get("hooks", {}), dict):
+            problem = '"hooks" is not a JSON object'
+        else:
+            wrong = [e for e in _EVENTS if not isinstance(hooks.get(e, []), list)]
+            if not wrong:
+                return data
+            problem = f'"hooks.{wrong[0]}" is not a JSON array'
+    raise _UnusableSettings(problem)
 
 
 def _event_wired(entries: object) -> bool:
@@ -147,10 +176,12 @@ def hooks_install_cmd(settings_file: Path | None) -> None:
     path = settings_file or _default_settings_file()
     try:
         data = _load_settings(path)
-    except (ValueError, TypeError) as exc:
+    except _UnusableSettings as exc:
         click.echo(f"  {style('x', fg='red')} Cannot edit {path}: {exc}", err=True)
         raise SystemExit(1) from exc
 
+    # _load_settings refused any other shape: these defaults only fill in what
+    # is absent.
     hooks_raw = data.get("hooks")
     hooks: dict[str, object] = hooks_raw if isinstance(hooks_raw, dict) else {}
     data["hooks"] = hooks
@@ -214,14 +245,20 @@ def hooks_status_cmd(settings_file: Path | None) -> None:
     path = settings_file or _default_settings_file()
     try:
         data = _load_settings(path)
-    except (ValueError, TypeError):
-        data = {}
-    hooks = data.get("hooks")
-    hooks_map = hooks if isinstance(hooks, dict) else {}
-    for event in _EVENTS:
-        wired = _event_wired(hooks_map.get(event))
-        mark = style("+", fg="green", bold=True) if wired else style("x", fg="red")
-        click.echo(f"  {mark} {event}")
+    except _UnusableSettings as exc:
+        # Never per-event rows here: "x" would claim every event is unwired,
+        # which a file magent cannot read says nothing about.
+        click.echo(
+            f"  {style('!', fg='yellow', bold=True)} Cannot tell what is wired in "
+            f"{path}: {exc}"
+        )
+    else:
+        hooks = data.get("hooks")
+        hooks_map = hooks if isinstance(hooks, dict) else {}
+        for event in _EVENTS:
+            wired = _event_wired(hooks_map.get(event))
+            mark = style("+", fg="green", bold=True) if wired else style("x", fg="red")
+            click.echo(f"  {mark} {event}")
     click.echo()
     records = agent_state.all_states()
     if not records:
