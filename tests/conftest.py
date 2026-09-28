@@ -121,6 +121,18 @@ def _isolate_magent_home(request, tmp_path, monkeypatch):
         # answers. Same lifetime, no collisions with the fixture's own tree.
         home = tmp_path.parent / f"{tmp_path.name}-home"
         home.mkdir(exist_ok=True)
+        # The profile folders the Windows known-folder lookups name. The
+        # USERPROFILE redirect below moves those folders into this home, but
+        # the lookup also checks that the folder EXISTS: against an empty home
+        # .NET's GetFolderPath('LocalApplicationData') answers '' in a
+        # powershell.exe child, its ModuleAnalysisCache path turns
+        # CWD-relative, and a long-lived hand-off launcher wrote
+        # Microsoft\Windows\PowerShell\ModuleAnalysisCache into the repo
+        # checkout. LOCALAPPDATA/APPDATA stay inherited: the lookup does not
+        # read them, and find_psmux's %LOCALAPPDATA%\psmux fallback must still
+        # find the real install. Empty dirs; harmless off Windows.
+        (home / "AppData" / "Local").mkdir(parents=True, exist_ok=True)
+        (home / "AppData" / "Roaming").mkdir(parents=True, exist_ok=True)
         drive, tail = os.path.splitdrive(str(home))
         values = (str(home), str(home), drive, tail or os.sep)
         for var, value in zip(_HOME_VARS, values, strict=True):
