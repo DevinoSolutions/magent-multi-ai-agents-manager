@@ -150,10 +150,8 @@ def gated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv(port, "2222")
     monkeypatch.setenv(key, str(tmp_path / "id"))
     monkeypatch.setenv(host, "mdssh")
-    monkeypatch.setattr(rig, "sys", SimpleNamespace(platform="linux"))
-    monkeypatch.setattr(
-        rig, "shutil", SimpleNamespace(which=lambda tool: f"/usr/bin/{tool}")
-    )
+    monkeypatch.setattr(rig, "_platform", lambda: "linux")
+    monkeypatch.setattr(rig, "_which", lambda tool: f"/usr/bin/{tool}")
     stub = tmp_path / "claude"
     stub.write_bytes(rig.STUB_SRC.read_bytes())
     monkeypatch.setattr(rig, "STUB", stub)
@@ -183,7 +181,7 @@ class TestTheOpenGateFailsOnEveryMissingPiece:
         self, gated: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         del gated
-        monkeypatch.setattr(rig, "sys", SimpleNamespace(platform="darwin"))
+        monkeypatch.setattr(rig, "_platform", lambda: "darwin")
         got = _outcome(rig.node_wire_or_skip)
         assert got.startswith("failed:") and "darwin" in got, got
 
@@ -195,9 +193,7 @@ class TestTheOpenGateFailsOnEveryMissingPiece:
     ) -> None:
         del gated
         monkeypatch.setattr(
-            rig,
-            "shutil",
-            SimpleNamespace(which=lambda t: None if t == tool else f"/usr/bin/{t}"),
+            rig, "_which", lambda t: None if t == tool else f"/usr/bin/{t}"
         )
         got = _outcome(rig.node_wire_or_skip)
         assert got.startswith(f"failed: {tool} not on PATH"), got
@@ -526,6 +522,14 @@ class TestTheRootHopDeletesOnlyTheUserThisRunMade:
 _DAEMON_PID = 4242
 
 
+def _subprocess_with(run: Callable[..., object]) -> SimpleNamespace:
+    """The rig's ``subprocess``, whole, with ``run`` replaced. Patching
+    ``rig.subprocess.run`` would replace the one module every caller in this
+    process shares; this rebinds the rig's own name for it alone."""
+    surface = {name: getattr(subprocess, name) for name in subprocess.__all__}
+    return SimpleNamespace(**{**surface, "run": run})
+
+
 def _offline_rig(tmp_path: Path) -> rig.NodeRig:
     """A NodeRig with one PC and no node behind it: every child it would
     start is the caller's fake."""
@@ -572,9 +576,11 @@ class TestCloseKillsOnlyWhatItOwns:
         _FakeHop(monkeypatch, **answers)
         # `node sync --stop` answers at once; the daemon is still there.
         monkeypatch.setattr(
-            rig.subprocess,
-            "run",
-            lambda argv, **_: subprocess.CompletedProcess(argv, 0, b"", b""),
+            rig,
+            "subprocess",
+            _subprocess_with(
+                lambda argv, **_: subprocess.CompletedProcess(argv, 0, b"", b"")
+            ),
         )
         monkeypatch.setattr(rig, "_alive", lambda pid: pid == _DAEMON_PID)
         monkeypatch.setattr(rig, "_cmdline", lambda pid: cmdline(pc.cfg))
@@ -681,7 +687,7 @@ class TestDiagNamesEveryRead:
             remotes.append(argv[-1])
             return subprocess.CompletedProcess(argv, 0, b"node says\n", b"")
 
-        monkeypatch.setattr(rig.subprocess, "run", node)
+        monkeypatch.setattr(rig, "subprocess", _subprocess_with(node))
         mirror = built.mirror_dir(built.pcs[0])
         mirror.mkdir(parents=True)
         (mirror / "a.jsonl").write_bytes(b"12345")
@@ -709,7 +715,7 @@ class TestDiagNamesEveryRead:
             time.sleep(timeout)
             raise subprocess.TimeoutExpired(argv, timeout)
 
-        monkeypatch.setattr(rig.subprocess, "run", wedged)
+        monkeypatch.setattr(rig, "subprocess", _subprocess_with(wedged))
         started = time.monotonic()
         text = built.diag()
         took = time.monotonic() - started

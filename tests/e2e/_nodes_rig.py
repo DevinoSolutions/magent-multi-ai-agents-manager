@@ -214,6 +214,17 @@ def ssh_wire_or_skip() -> Wire:
     return Wire(port=port, key=Path(key), host=host)
 
 
+def _platform() -> str:
+    """The runner's platform, behind the gate's own seam: its pins replace
+    this, not the ``sys`` every other function here reads."""
+    return sys.platform
+
+
+def _which(tool: str) -> str | None:
+    """A tool on PATH, behind the gate's own seam (as ``_platform``)."""
+    return shutil.which(tool)
+
+
 def node_wire_or_skip() -> Wire:
     """The gate of every node-hosting test: ``MDTEST_NODES_REAL=1`` (set only
     by the nodes-e2e workflow). Once it is on, a missing piece of the node is
@@ -241,13 +252,14 @@ def node_wire_or_skip() -> Wire:
             f"{GATE_VAR}=1 but {', '.join(missing)} unset: setup-ssh-server did "
             "not run or failed, so there is no node to test"
         )
-    if sys.platform != "linux":
+    platform = _platform()
+    if platform != "linux":
         pytest.fail(
-            f"{GATE_VAR}=1 on {sys.platform}: a node is a Linux box; the "
+            f"{GATE_VAR}=1 on {platform}: a node is a Linux box; the "
             "node-hosting tier runs on the ubuntu runner only"
         )
     for tool in ("ssh", "tmux", "git", "python3", "ssh-keygen", "ssh-keyscan"):
-        if shutil.which(tool) is None:
+        if _which(tool) is None:
             pytest.fail(f"{tool} not on PATH on the node runner: a provisioning bug")
     if not STUB.is_file():
         pytest.fail(
