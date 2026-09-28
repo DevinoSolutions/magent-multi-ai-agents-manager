@@ -1302,15 +1302,21 @@ def _recall_local(
 
 
 def _destination(
-    cfg: MagentConfig, proj: ProjectConfig, held: NodeMapEntry, to_nick: str
+    cfg: MagentConfig,
+    proj: ProjectConfig,
+    held: NodeMapEntry,
+    to_nick: str,
+    *,
+    allow_dirty: bool,
 ) -> tuple[Node, str]:
     """Everything ``--to`` can refuse, checked BEFORE the source session is
     touched: the node and the session root the conversation goes to. The
     move is a placement, so it gets every placement's folder check (X3):
     a node folder name another project would share is refused here, not
     after the session is stopped. So is a tree the node cannot reproduce
-    (the bring-up's D7 check, in its words); the bring-up still makes it,
-    for a tree that changes in between."""
+    (the bring-up's D7 check, in its words -- under ``allow_dirty``, as for
+    ``up``, only what no flag can fix); the bring-up still makes it, for a
+    tree that changes in between."""
     # heavy subsystem: in-body per policy
     from magent import launch, node_sync, nodes, remote_mux
 
@@ -1340,7 +1346,11 @@ def _destination(
         _fail(f"cannot build {name}'s recipe ({text})", _EXIT_USAGE)
     # Made only by the bring-up, this refusal came after the source was
     # stopped: the session then ran nowhere.
-    refusals = [why for state in states if (why := nodes.refusal_for(state))]
+    refusals = [
+        why
+        for state in states
+        if (why := nodes.refusal_for(state, allow_dirty=allow_dirty))
+    ]
     if refusals:
         _fail(
             f"cannot move {name} to @{to_nick}:"
@@ -1365,13 +1375,17 @@ def _recall_to(
     remote_root: str,
     resume_id: str | None,
     config_path: str,
+    *,
+    allow_dirty: bool,
 ) -> None:
     """Steps 4-5 for ``--to``: install on the new node, clear the placement,
     then the normal bring-up resuming the newest conversation (G-C8: its own
     ssh call, so D's bring_up.sh is untouched). A refused install keeps the
     OLD placement -- `magent up` resumes it where it was. A session up on
     the new node gets the node sync every bring-up leaves running, started
-    on ``config_path``, the file this recall read."""
+    on ``config_path``, the file this recall read. ``allow_dirty`` is
+    ``up``'s: the bring-up skips its dirty check and records the tree as
+    unknown."""
     # heavy subsystem: in-body per policy
     from magent import launch, node_sync, nodes, remote_mux
 
@@ -1427,7 +1441,10 @@ def _recall_to(
     # A held map lock stops the move here, before the bring-up.
     _clear_placement(name, held)
     outcome = launch.bring_up_node_project(
-        cfg, dataclasses.replace(proj, node=target.nick), resume_id=resume_id
+        cfg,
+        dataclasses.replace(proj, node=target.nick),
+        resume_id=resume_id,
+        allow_dirty=allow_dirty,
     )
     if not outcome.ok:
         # The error can be the node's last stderr line (D's _node_error_text).
@@ -1471,9 +1488,18 @@ def _recall_to(
     is_flag=True,
     help="Bring the session home and print the command that resumes it.",
 )
+@click.option(
+    "--allow-dirty",
+    is_flag=True,
+    help="Bring node projects up despite a dirty or unpushed tree",
+)
 @click.pass_context
 def recall_cmd(
-    ctx: click.Context, project: str, to_nick: str | None, to_local: bool
+    ctx: click.Context,
+    project: str,
+    to_nick: str | None,
+    to_local: bool,
+    allow_dirty: bool,
 ) -> None:
     """Bring a node session home, or move it to another node.
 
@@ -1486,6 +1512,9 @@ def recall_cmd(
 
     if (to_nick is not None) == to_local:
         raise click.UsageError("pass exactly one of --to <nick> or --local")
+    if allow_dirty and to_local:
+        # --local brings nothing up, so the flag would be ignored.
+        raise click.UsageError("--allow-dirty goes with --to <nick>")
     config_file = find_config(ctx.obj.get("config_path"))
     cfg = _load_config_or_exit(config_file)
     proj = _node_project_or_exit(cfg, project)
@@ -1538,7 +1567,9 @@ def recall_cmd(
             _EXIT_USAGE,
         )
     destination = (
-        _destination(cfg, proj, held, to_nick) if to_nick is not None else None
+        _destination(cfg, proj, held, to_nick, allow_dirty=allow_dirty)
+        if to_nick is not None
+        else None
     )
     click.echo(
         f"\n  {style(f'magent node recall {name}', bold=True)}"
@@ -1553,4 +1584,13 @@ def recall_cmd(
         _recall_local(held, name, local_dir, resume_id)
     elif destination is not None:
         target, remote_root = destination
-        _recall_to(cfg, proj, held, target, remote_root, resume_id, str(config_file))
+        _recall_to(
+            cfg,
+            proj,
+            held,
+            target,
+            remote_root,
+            resume_id,
+            str(config_file),
+            allow_dirty=allow_dirty,
+        )

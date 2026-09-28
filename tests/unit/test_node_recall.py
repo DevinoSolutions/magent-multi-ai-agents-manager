@@ -3740,9 +3740,10 @@ def _marks_line() -> str:
     )
 
 
-def _invoke_recall_to(runner, cfg: str, nick: str):
+def _invoke_recall_to(runner, cfg: str, nick: str, *extra: str):
     return runner.invoke(
-        cli.main, ["--config", cfg, "node", "recall", "api", "--to", nick]
+        cli.main,
+        ["--config", cfg, "node", "recall", "api", "--to", nick, *extra],
     )
 
 
@@ -4009,6 +4010,113 @@ class TestRecallTo:
         assert result.exit_code == 1
         assert "could not clear api's placement" in result.stderr
         assert [e for e in events if e[0] == "bring_up"] == []
+
+    @pytest.mark.parametrize(
+        "change", [{"dirty": True}, {"unpushed": True}], ids=["dirty", "unpushed"]
+    )
+    def test_allow_dirty_moves_a_tree_the_check_would_refuse(
+        self, runner, placed_api, node_answers, moving, monkeypatch, change
+    ):
+        # Round-2 ruling 1: the flag the refusal names exists on recall --to,
+        # with up's meaning, and reaches the pre-check and the bring-up.
+        events, state = moving
+        tree = dataclasses.replace(state, **change)
+        monkeypatch.setattr(launch, "node_git_states", lambda config, proj: [tree])
+        asked: list[bool] = []
+
+        def _bring_up(config, proj, *, resume_id=None, allow_dirty=False, **_k):
+            asked.append(allow_dirty)
+            events.append(("bring_up", proj.node, resume_id))
+            return launch.NodeBringUpOutcome(ok=True, sid="api", node=proj.node)
+
+        monkeypatch.setattr(launch, "bring_up_node_project", _bring_up)
+
+        result = _invoke_recall_to(runner, placed_api, "third", "--allow-dirty")
+
+        assert result.exit_code == 0, result.output
+        assert [e[0] for e in events] == ["install", "bring_up"]
+        assert asked == [True]
+        assert "nothing was touched" not in result.output
+        assert "api runs on @third, resuming" in result.stdout
+
+    def test_without_allow_dirty_the_bring_up_still_checks_the_tree(
+        self, runner, placed_api, node_answers, moving, monkeypatch
+    ):
+        # The flag is passed, never hard-wired: a plain move asks the
+        # bring-up to make its own check (the race backstop).
+        asked: list[bool] = []
+
+        def _bring_up(config, proj, *, resume_id=None, allow_dirty=False, **_k):
+            asked.append(allow_dirty)
+            return launch.NodeBringUpOutcome(ok=True, sid="api", node=proj.node)
+
+        monkeypatch.setattr(launch, "bring_up_node_project", _bring_up)
+
+        result = _invoke_recall_to(runner, placed_api, "third")
+
+        assert result.exit_code == 0, result.output
+        assert asked == [False]
+
+    @pytest.mark.parametrize(
+        ("change", "words"),
+        [
+            ({"url": ""}, "no 'origin' remote"),
+            ({"detached": True}, "HEAD is detached"),
+            ({"no_commits": True}, "has no commits yet"),
+        ],
+        ids=["no-origin", "detached", "no-commits"],
+    )
+    def test_allow_dirty_still_refuses_what_no_flag_can_fix(
+        self, runner, placed_api, node_answers, moving, monkeypatch, change, words
+    ):
+        # up's meaning: the node gets origin's copy, so the flag cannot
+        # conjure an origin, a branch or a first commit.
+        events, state = moving
+        tree = dataclasses.replace(state, **change)
+        monkeypatch.setattr(launch, "node_git_states", lambda config, proj: [tree])
+
+        result = _invoke_recall_to(runner, placed_api, "third", "--allow-dirty")
+
+        assert result.exit_code == 2
+        assert words in result.stderr
+        assert "nothing was touched" in result.stderr
+        assert node_answers == []
+        assert events == []
+        assert nodes.read_node_map()["api"].nick == "second"
+
+    def test_allow_dirty_goes_with_to_only(self, runner, placed_api, node_answers):
+        # --local brings nothing up: a flag it would ignore is refused.
+        result = _recall(runner, placed_api, "--local", "--allow-dirty")
+
+        assert result.exit_code == 2
+        assert "--allow-dirty goes with --to" in result.output
+        assert node_answers == []
+        assert nodes.read_node_map()["api"].nick == "second"
+
+    def test_a_move_with_allow_dirty_records_the_tree_as_unknown(
+        self, runner, placed_api, node_answers, pipeline, monkeypatch, api_repo
+    ):
+        # cq-Gint F1 through the REAL bring-up: it skipped the dirty check,
+        # so the record never says clean, whatever the script reported.
+        dirty = dataclasses.replace(_git_state(api_repo), dirty=True)
+        monkeypatch.setattr(launch, "node_git_states", lambda config, proj: [dirty])
+        monkeypatch.setattr(
+            remote_mux,
+            "install_transcripts",
+            lambda node, remote_root, source, *, timeout_s: (
+                remote_mux.InstalledTranscripts(landed=_landed())
+            ),
+        )
+
+        result = _invoke_recall_to(runner, placed_api, "third", "--allow-dirty")
+
+        assert result.exit_code == 0, result.output
+        assert [(c["nick"], c["resume_id"]) for c in pipeline] == [
+            ("third", SESSION_ID)
+        ]
+        record = nodes.read_repo_record("third", "api")
+        assert record is not None
+        assert [(r.remote_dir, r.dirty) for r in record.repos] == [("api", None)]
 
     def test_an_unknown_node_exits_2_before_anything_is_touched(
         self, runner, placed_api, node_answers, moving
