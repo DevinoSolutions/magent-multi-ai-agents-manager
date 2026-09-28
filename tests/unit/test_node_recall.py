@@ -3545,6 +3545,107 @@ class TestTheStopCommandIsSafeToPaste:
         assert shlex.split(_kill_command(result.stdout)) == _kill_argv(sid)
 
 
+# pullable_sid admits any printable non-ASCII character (psmux.session_name
+# keeps them) and the map is untrusted: U+202E reverses the text after it on
+# screen. Every recall line shows the sid as node_sync.printable does (F5).
+_BIDI_SID = "api\u202ekcatta"
+_BIDI_SHOWN = "api?kcatta"
+
+
+def _bidi_config(tmp_config, api_repo: Path, *nicks: str) -> str:
+    return tmp_config(
+        config_json(
+            nicks or ("second",),
+            [{"path": str(api_repo), "title": "api", "node": "auto"}],
+        )
+    )
+
+
+class TestRecallShowsTheMapsSidAsPrintableAscii:
+    def test_on_an_unreachable_nodes_lines(
+        self, runner, api_repo, tmp_config, node_is_gone
+    ):
+        nodes.update_node_map("api", entry("second", _BIDI_SID))
+
+        result = _recall(runner, _bidi_config(tmp_config, api_repo), "--local")
+
+        assert result.exit_code == 0, result.output
+        assert "\u202e" not in result.output
+        assert (
+            f"no commit was ever recorded for {_BIDI_SHOWN} on @second"
+        ) in result.stdout
+        assert f"{_BIDI_SHOWN} may still be running on @second" in result.stdout
+        assert f"kill-session -t '={_BIDI_SHOWN}'" in result.stdout
+        assert (
+            f"nothing was ever pulled from @second for {_BIDI_SHOWN}"
+        ) in result.stdout
+
+    def test_on_the_unreadable_record_line(
+        self, runner, api_repo, tmp_config, node_is_gone
+    ):
+        nodes.update_node_map("api", entry("second", _BIDI_SID))
+        path = nodes.repo_record_path("second", _BIDI_SID)
+        path.parent.mkdir(parents=True)
+        path.write_text('{"ts": 1, "sou', encoding="utf-8")
+
+        result = _recall(runner, _bidi_config(tmp_config, api_repo), "--local")
+
+        assert result.exit_code == 0, result.output
+        assert "\u202e" not in result.output
+        assert (
+            f"the commit record for {_BIDI_SHOWN} on @second is unreadable"
+        ) in result.stdout
+
+    @pytest.mark.parametrize(
+        ("killed", "line"),
+        [
+            (True, f"stopped {_BIDI_SHOWN} on @second"),
+            (False, f"no such session {_BIDI_SHOWN} on @second; nothing to stop"),
+            (None, f"could not stop {_BIDI_SHOWN} on @second"),
+        ],
+        ids=["stopped", "not-there", "unknown"],
+    )
+    def test_on_a_reachable_nodes_lines(
+        self, runner, api_repo, tmp_config, node_answers, monkeypatch, killed, line
+    ):
+        monkeypatch.setattr(remote_mux, "kill_session", lambda node, sid: killed)
+        nodes.update_node_map("api", entry("second", _BIDI_SID))
+
+        result = _recall(runner, _bidi_config(tmp_config, api_repo), "--local")
+
+        assert result.exit_code == 0, result.output
+        assert "\u202e" not in result.output
+        assert f"pulled {_BIDI_SHOWN} from @second one last time" in result.stdout
+        assert line in result.stdout
+
+    def test_on_the_no_remote_root_line(
+        self, runner, api_repo, tmp_config, node_answers
+    ):
+        held = dataclasses.replace(entry("second", _BIDI_SID), remote_root="")
+        nodes.update_node_map("api", held)
+
+        result = _recall(runner, _bidi_config(tmp_config, api_repo), "--local")
+
+        assert result.exit_code == 0, result.output
+        assert "\u202e" not in result.output
+        assert f"no remote root for {_BIDI_SHOWN})" in result.stdout
+
+    def test_on_the_recall_to_lines(
+        self, runner, api_repo, tmp_config, node_answers, moving
+    ):
+        nodes.update_node_map("api", entry("second", _BIDI_SID))
+        cfg = _bidi_config(tmp_config, api_repo, "second", "third")
+
+        result = _invoke_recall_to(runner, cfg, "third")
+
+        assert result.exit_code == 0, result.output
+        assert "\u202e" not in result.output
+        assert (
+            f"nothing was ever pulled from @second for {_BIDI_SHOWN};"
+            " api starts fresh on @third"
+        ) in result.stdout
+
+
 # --- magent node recall --to (plan G Task 15) ----------------------------------
 
 

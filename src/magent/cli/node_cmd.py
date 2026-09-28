@@ -884,7 +884,8 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
         # re-run can fix it: it is a note.
         _note(
             f"@{held.nick} cannot be pulled from (the node map has no remote"
-            f" root for {held.sid}); going on with what was already pulled"
+            f" root for {node_sync.printable(held.sid)}); going on with what"
+            " was already pulled"
         )
         return False
     try:
@@ -1002,7 +1003,7 @@ def _final_pull(cfg: MagentConfig, name: str, held: NodeMapEntry) -> bool:
             f"{name}'s node map entry was not found again for the last pull; {_RERUN}",
             1,
         )
-    _ok(f"pulled {held.sid} from @{held.nick} one last time")
+    _ok(f"pulled {node_sync.printable(held.sid)} from @{held.nick} one last time")
     return True
 
 
@@ -1065,14 +1066,16 @@ def _report_repos(source: Node | None, held: NodeMapEntry) -> None:
                 exc,
             )
             _note(
-                f"the commit record for {held.sid} on @{held.nick} is unreadable"
+                f"the commit record for {node_sync.printable(held.sid)} on"
+                f" @{held.nick} is unreadable"
                 f" ({type(exc).__name__}) -- check the node before relying on"
                 " `git pull`"
             )
             return
         if record is None:
             _note(
-                f"no commit was ever recorded for {held.sid} on @{held.nick} --"
+                f"no commit was ever recorded for {node_sync.printable(held.sid)}"
+                f" on @{held.nick} --"
                 " check the node before relying on `git pull`"
             )
             return
@@ -1121,25 +1124,26 @@ def _stop_session(source: Node | None, held: NodeMapEntry) -> None:
     the exact command that stops it. "stopped" is said only when D's
     ``kill_session`` returned True (DECISION-26 x); its None -- the call
     failed -- is unknown, never "stopped" or "gone"."""
-    from magent import remote_mux  # heavy subsystem: in-body per policy
+    # heavy subsystem: in-body per policy
+    from magent import node_sync, remote_mux
 
+    # The map is untrusted: its sid reaches the screen, the stop command
+    # included, as printable ASCII. The kill itself names the real one.
+    sid = node_sync.printable(held.sid)
     if source is None:
-        _note(
-            f"{held.sid} may still be running on @{held.nick};"
-            f" {_kill_hint(None, held.sid)}"
-        )
+        _note(f"{sid} may still be running on @{held.nick}; {_kill_hint(None, sid)}")
         return
     killed = remote_mux.kill_session(source, held.sid)
     if killed is None:
         _note(
-            f"could not stop {held.sid} on @{held.nick} (unreachable, or the"
+            f"could not stop {sid} on @{held.nick} (unreachable, or the"
             f" kill failed); it may still be running --"
-            f" {_kill_hint(source.target, held.sid)}"
+            f" {_kill_hint(source.target, sid)}"
         )
     elif killed:
-        _ok(f"stopped {held.sid} on @{held.nick}")
+        _ok(f"stopped {sid} on @{held.nick}")
     else:
-        _note(f"no such session {held.sid} on @{held.nick}; nothing to stop")
+        _note(f"no such session {sid} on @{held.nick}; nothing to stop")
 
 
 def _clear_placement(name: str, held: NodeMapEntry) -> None:
@@ -1256,8 +1260,9 @@ def _recall_local(
         _ok(f"installed {what} into {dest}")
     else:
         _note(
-            f"nothing was ever pulled from @{held.nick} for {held.sid};"
-            " there is no conversation to install"
+            f"nothing was ever pulled from @{held.nick} for"
+            f" {node_sync.printable(held.sid)}; there is no conversation"
+            " to install"
         )
     _clear_placement(name, held)
     click.echo(
@@ -1405,13 +1410,15 @@ def _recall_to(
             _note(node_sync.printable(installed.note))
         if resume_id is None:
             _note(
-                f"no conversation was pulled from @{held.nick} for {held.sid};"
+                f"no conversation was pulled from @{held.nick} for"
+                f" {node_sync.printable(held.sid)};"
                 f" {name} starts fresh on @{target.nick}"
             )
     else:
         _note(
-            f"nothing was ever pulled from @{held.nick} for {held.sid};"
-            f" {name} starts fresh on @{target.nick}"
+            f"nothing was ever pulled from @{held.nick} for"
+            f" {node_sync.printable(held.sid)}; {name} starts fresh on"
+            f" @{target.nick}"
         )
     # A held map lock stops the move here, before the bring-up.
     _clear_placement(name, held)
