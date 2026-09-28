@@ -34,15 +34,40 @@ jobs:
     name: "Build (sdist + wheel)"
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      # "true" for a PEP 440 pre-release tag (v3.20.0rc1, v3.20.0a1, v3.20.0b2,
+      # v3.20.0.dev1), "false" for a final one. Empty on workflow_dispatch,
+      # which never reaches github-release.
+      prerelease: ${{ steps.classify.outputs.prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.13"
-      # `build` + `twine` are ad-hoc release tooling, deliberately NOT pyproject
-      # extras (same stance as tests/dist and dependency-audit, which install
-      # their tooling per-job).
-      - run: python -m pip install --upgrade build twine
+      # `build` + `twine` + `packaging` are ad-hoc release tooling, deliberately
+      # NOT pyproject extras (same stance as tests/dist and dependency-audit,
+      # which install their tooling per-job).
+      - run: python -m pip install --upgrade build twine packaging
+      # A pre-release must never become the repo's "Latest" GitHub release, so
+      # github-release needs to know which kind of tag this is. PEP 440 decides
+      # (packaging), not a regex; a tag it cannot parse fails the build here,
+      # before anything is published under a guess.
+      - name: Classify the tag (PEP 440 pre-release?)
+        id: classify
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          from packaging.version import Version
+
+          tag = os.environ["TAG"]
+          prerelease = Version(tag.removeprefix("v")).is_prerelease
+          print(f"{tag}: prerelease={prerelease}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"prerelease={str(prerelease).lower()}\n")
+          PY
       - name: Build sdist + wheel
         run: python -m build
       - name: Validate distribution metadata
@@ -163,13 +188,23 @@ jobs:
         with:
           name: dist
           path: dist
+      # A final release runs exactly the command it always has. A pre-release
+      # adds `--prerelease --latest=false`, so an rc never becomes "Latest".
+      # Anything but true/false fails rather than defaulting to a final release.
       - name: Create GitHub Release with generated notes
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "${{ github.ref_name }}"
-          dist/*
-          --repo "${{ github.repository }}"
-          --title "${{ github.ref_name }}"
-          --generate-notes
-          --verify-tag
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          case "$PRERELEASE" in
+            true) kind=(--prerelease --latest=false) ;;
+            false) kind=() ;;
+            *) echo "::error::build.outputs.prerelease is '$PRERELEASE', expected true or false"; exit 1 ;;
+          esac
+          gh release create "${{ github.ref_name }}" \
+            dist/* \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            --verify-tag \
+            "${kind[@]}"

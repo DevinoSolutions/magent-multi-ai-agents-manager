@@ -116,8 +116,14 @@ The `github-release` job publishes GitHub's **auto-generated** notes — no manu
 release step is required. For a curated changelog, edit the Release after the run
 finishes and paste in the matching `CHANGELOG.md` section.
 
-> Pre-release tags work too: a PEP 440 pre-release version (e.g. `1.1.0rc1`,
-> tagged `v1.1.0rc1`) matches `v*`, and PyPI/`pip` treat it as a pre-release.
+> **Pre-releases** use the same steps with a PEP 440 pre-release version: set
+> `version = "X.Y.0rc1"` in `pyproject.toml` and tag `vX.Y.0rc1` (the tag and
+> the version must match — the pipeline publishes the `pyproject.toml` version,
+> not the tag). The `build` job classifies the tag with `packaging`
+> (`a`/`b`/`rc`/`.dev` all count), and `github-release` then marks the Release
+> as a pre-release that never becomes **Latest**. PyPI and `pip` treat the
+> version as a pre-release too: a plain `pip install` skips it, so testers need
+> `pip install --pre magent-multi-ai-agents-manager` or an exact `==X.Y.0rc1`.
 
 ---
 
