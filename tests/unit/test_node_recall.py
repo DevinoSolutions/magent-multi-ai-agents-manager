@@ -19,6 +19,7 @@ import math
 import os
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -1109,6 +1110,14 @@ def _open_modes_tar() -> bytes:
     return buf.getvalue()
 
 
+# u::rwx,g::rwx,o::rwx as the kernel stores a POSIX default ACL -- the
+# system.posix_acl_default xattr setfacl writes: version 2, then one
+# (tag, perm, id) entry each for the owner, the group and everyone else.
+_DEFAULT_ACL_RWX_FOR_ALL = struct.pack("<I", 2) + b"".join(
+    struct.pack("<HHI", tag, 0o7, 0xFFFFFFFF) for tag in (0x01, 0x04, 0x20)
+)
+
+
 # Everything under the node home's ~/.claude after a good install of that tar.
 _LANDED_OWNER_ONLY = {
     ".claude": "0o700",
@@ -1198,33 +1207,24 @@ class TestWhatLandsIsOwnerOnlyUnderAnyDefaultAcl:
         assert not home.exists()
 
     @pytest.mark.skipif(
-        sys.platform != "linux", reason="a default ACL is set with Linux's setfacl"
+        sys.platform != "linux", reason="a POSIX default ACL xattr is Linux's"
     )
     def test_a_real_default_acl_is_what_the_umask_model_stands_for(
         self, monkeypatch, tmp_path
     ):
         # The canary: the model above, against the thing it models. The home
         # carries a default ACL granting every class rwx (the hosted runners'
-        # homes carry ACLs), and the script keeps its own umask 077. A Linux
-        # CI runner that cannot set one is a provisioning bug: it FAILS there.
-        on_ci = os.environ.get("GITHUB_ACTIONS") == "true"
-        setfacl = shutil.which("setfacl")
-        if setfacl is None:
-            if on_ci:
-                pytest.fail("Linux CI runner without setfacl (the acl package)")
-            pytest.skip("needs setfacl (the acl package)")
+        # homes carry ACLs), set as the kernel's own xattr -- no acl package
+        # needed -- and the script keeps its own umask 077. A Linux CI runner
+        # that cannot set one is a provisioning bug: it FAILS there.
         home = tmp_path / "nodehome"
         home.mkdir()
-        acl = subprocess.run(
-            [setfacl, "-d", "-m", "u::rwx,g::rwx,o::rwx", str(home)],
-            capture_output=True,
-            check=False,
-            timeout=30,
-        )
-        if acl.returncode != 0:
-            if on_ci:
-                pytest.fail(f"setfacl refused a default ACL: {acl.stderr!r}")
-            pytest.skip("this filesystem refuses a default ACL")
+        try:
+            os.setxattr(home, "system.posix_acl_default", _DEFAULT_ACL_RWX_FOR_ALL)
+        except OSError as err:
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                pytest.fail(f"a Linux CI runner refused a default ACL: {err!r}")
+            pytest.skip(f"this filesystem refuses a default ACL ({err.strerror})")
         # The premise: under it, a umask 077 create is NOT owner-only.
         subprocess.run(
             ["bash", "-c", "umask 077; : > probe; mkdir probedir"],
