@@ -219,6 +219,8 @@ user_claude() {
 # The key is chmod 600 on every run and again once generated: ssh-keygen's 0600
 # is umask 077 over open(0644) (OpenSSH >= 8.2), which a default ACL on ~/.ssh
 # overrides, and ssh (and `ssh-keygen -y`) refuses a key others can read.
+# Until that chmod, only ~/.ssh keeps others from a new key, so ~/.ssh is made
+# 0700 first: `mkdir -p` under that same ACL makes it 0777.
 # shellcheck disable=SC2317  # invoked through `declare -f` in run_user_phase
 user_node_key() {
   local u=$1 out pub mode made="" ssh="$HOME/.ssh" id="$HOME/.ssh/id_ed25519"
@@ -256,8 +258,10 @@ user_node_key() {
       return 1
     fi
     say did "node-key:$u" "id_ed25519.pub derived again from the private key in ~/.ssh${made:+; $made}"
-  elif out=$( { { [ -d "$ssh" ] || mkdir -m 700 "$ssh"; } &&
-      ssh-keygen -q -t ed25519 -N "" -C "magent@$(hostname)" -f "$id"; } 2>&1 ); then
+  elif ! { { [ -d "$ssh" ] || mkdir -m 700 "$ssh"; } && chmod 700 "$ssh"; } 2>/dev/null; then
+    say fail "node-key:$u" "could not make ~/.ssh owner-only (0700) for the new key"
+    return 1
+  elif out=$(ssh-keygen -q -t ed25519 -N "" -C "magent@$(hostname)" -f "$id" 2>&1); then
     if ! chmod 600 "$id" 2>/dev/null; then
       say fail "node-key:$u" "could not make the new ~/.ssh/id_ed25519 owner-only (0600); ssh refuses an open key"
       return 1
