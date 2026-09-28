@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -50,6 +51,24 @@ class TestCliFlags:
         )
         assert result.returncode != 0
         assert "No config found" in result.stderr or "config" in result.stderr.lower()
+
+    def test_an_env_file_that_is_not_utf8_exits_one_without_a_traceback(self):
+        # conftest points the whole HOME family at tmp and the child inherits
+        # it, so the child's import-time env.ENV_FILE is THIS ~/.magent/.env.
+        # A real process, because CliRunner never prints a traceback at all.
+        env_file = Path.home() / ".magent" / ".env"
+        env_file.parent.mkdir(parents=True, exist_ok=True)
+        env_file.write_bytes(b"MAGENT_LOG_LEVEL=\xff\xfe\n")
+        # `docs` only prints: had the env gate let it through, it would have
+        # written markdown to stdout and touched nothing else.
+        result = subprocess.run(
+            [sys.executable, "-m", "magent", "docs"],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1
+        assert f"{env_file} is not valid UTF-8" in result.stderr
+        assert "Traceback" not in result.stderr
 
     def test_invalid_json_exits_nonzero(self, tmp_path):
         bad = tmp_path / "bad.json"

@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from magent import cli, wt_keys
+from magent import env as env_module
 from magent import psmux as psmux_mod
 from magent.cli import doctor
 from magent.cli.doctor import (
@@ -71,6 +72,35 @@ class TestCheckEnv:
             if key.upper().startswith("MAGENT_"):
                 monkeypatch.delenv(key, raising=False)
         assert doctor._check_env()[0] == OK
+
+    def test_an_env_file_that_is_not_utf8_fails_naming_it(self):
+        env_module.ENV_FILE.write_bytes(b"MAGENT_LOG_LEVEL=\xff\xfe\n")
+        status, detail = doctor._check_env()
+        assert status == FAIL
+        assert f"{env_module.ENV_FILE} is not valid UTF-8" in detail
+
+    def test_an_env_file_that_is_not_utf8_leaves_every_other_check_running(
+        self, monkeypatch, tmp_config
+    ):
+        # Driven below the CLI: the group callback refuses a bad env before
+        # any subcommand runs. The sentry check reads get_env() again, and
+        # _run_checks has no per-check guard, so it has to survive the file
+        # too or the checklist dies at the first check after env.
+        fp = FakePlatform()
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+        monkeypatch.setattr("magent.cli.background._probe_port", lambda _p: False)
+        monkeypatch.setattr("magent.cli.background._running_upload_port", lambda: None)
+        env_module.ENV_FILE.write_bytes(b"MAGENT_LOG_LEVEL=\xff\xfe\n")
+        config_file = Path(
+            tmp_config({"version": SCHEMA_VERSION, "projects": [{"path": "api"}]})
+        )
+
+        checks = {c["name"]: c for c in doctor._run_checks(config_file)}
+
+        assert checks["env"]["status"] == FAIL
+        assert "is not valid UTF-8" in checks["env"]["detail"]
+        assert checks["sentry"]["detail"].startswith("skipped")
+        assert "upload port" in checks
 
 
 class TestCheckAgentTools:

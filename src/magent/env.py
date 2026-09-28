@@ -27,6 +27,7 @@ from pydantic import (
     ValidationError,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 from pydantic_settings import BaseSettings
 
 # magent's own dotenv file — module attribute (not baked into model_config)
@@ -156,8 +157,37 @@ def get_env() -> MagentEnv:
     """Return the validated env singleton (instantiated on first call)."""
     global _cached_env  # noqa: PLW0603  # reason: module-level cache singleton pattern
     if _cached_env is None:
-        _cached_env = MagentEnv(_env_file=ENV_FILE)
+        try:
+            _cached_env = MagentEnv(_env_file=ENV_FILE)
+        except UnicodeDecodeError as exc:
+            raise _env_file_not_utf8() from exc
     return _cached_env
+
+
+def _env_file_not_utf8() -> ValidationError:
+    """ENV_FILE is not UTF-8, as a ValidationError naming the file.
+
+    The dotenv read raises UnicodeDecodeError, which is not a ValidationError,
+    so it walked straight past every caller and killed each command with a
+    traceback. It IS an invalid environment, and every get_env() caller
+    already handles ValidationError: the CLI refuses in one line, doctor
+    FAILs its env check, and the daemons' readers fall back to defaults. A new
+    exception type would be a new traceback at each caller that missed it.
+    The empty ``loc`` makes ``validation_error_items`` show the message as-is.
+    """
+    return ValidationError.from_exception_data(
+        MagentEnv.__name__,
+        [
+            {
+                "type": PydanticCustomError(
+                    "env_file_not_utf8",
+                    "{path} is not valid UTF-8",
+                    {"path": str(ENV_FILE)},
+                ),
+                "input": str(ENV_FILE),
+            }
+        ],
+    )
 
 
 def validation_error_items(exc: ValidationError) -> list[tuple[str, str]]:

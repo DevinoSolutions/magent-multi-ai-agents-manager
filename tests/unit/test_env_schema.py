@@ -6,6 +6,7 @@ A new env var without an .env.example update = red gate.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
@@ -14,7 +15,7 @@ import pytest
 from click.testing import CliRunner
 from pydantic import ValidationError
 
-from magent import cli
+from magent import cli, log
 from magent import env as env_module
 from magent.env import MagentEnv
 
@@ -539,6 +540,56 @@ class TestEnvFileIsMagentsOwn:
         env_module.ENV_FILE.write_text("MAGENT_LOG_LEVEL=DEBUG\n", encoding="utf-8")
 
         assert env_module.get_env().log_level == "DEBUG"
+
+
+class TestUndecodableEnvFile:
+    """An ENV_FILE that is not valid UTF-8 made the dotenv read raise
+    UnicodeDecodeError, which no caller catches: every magent command died
+    with a traceback. It is an invalid environment like any other, so it
+    fails the same clean way."""
+
+    NOT_UTF8 = b"MAGENT_LOG_LEVEL=\xff\xfe\n"
+
+    def test_get_env_raises_the_error_every_caller_already_catches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Every get_env() call site catches ValidationError, several of them to
+        # degrade to a default (logging must never crash the process it
+        # observes). A new exception type would be a traceback at each one.
+        _clear_magent_env(monkeypatch)
+        env_module.ENV_FILE.write_bytes(self.NOT_UTF8)
+
+        with pytest.raises(ValidationError) as caught:
+            env_module.get_env()
+
+        assert env_module.validation_error_items(caught.value) == [
+            ("", f"{env_module.ENV_FILE} is not valid UTF-8")
+        ]
+
+    def test_the_log_level_reader_degrades_instead_of_crashing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The sharpest of those callers: logging must never crash the process
+        # it observes, so a bad file falls back to INFO like a bad variable.
+        _clear_magent_env(monkeypatch)
+        env_module.ENV_FILE.write_bytes(self.NOT_UTF8)
+
+        assert log._configured_level() == logging.INFO
+
+    def test_a_command_exits_one_naming_the_file_not_a_traceback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _clear_magent_env(monkeypatch)
+        env_module.ENV_FILE.write_bytes(self.NOT_UTF8)
+
+        # `docs` only prints: had the env gate let it through, it would have
+        # written markdown to stdout and touched nothing else.
+        result = CliRunner().invoke(cli.main, ["docs"])
+
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        assert f"{env_module.ENV_FILE} is not valid UTF-8" in result.stderr
+        assert "Traceback" not in result.output
 
 
 class TestSession0Policy:
