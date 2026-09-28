@@ -1344,13 +1344,16 @@ The price is one lock + one open/close per record: **13 µs → 235 µs** on thi
 box. These are lifecycle logs at a few records a second, not a request stream,
 so the cost is unobservable and the correctness is not.
 
-Two loudness rules ride along, both stricter than the stdlib's. A rotation that
+Three loudness rules ride along, all stricter than the stdlib's. A rotation that
 still fails **writes the record anyway** and reports the rotation failure through
 `handleError` (the stdlib drops the record instead). A lock that cannot be taken
 within `_LOCK_TIMEOUT_S` degrades to an unlocked write — keeping the record,
 which is the whole point — and says so once per process **in the log file
 itself**, because that is the only channel a detached daemon has and reaching for
-`get_logger` from inside a handler would recurse.
+`get_logger` from inside a handler would recurse. And a record that cannot be
+encoded — a filename carrying a lone surrogate — **lands escaped, never
+dropped**: the stream is opened with `errors="backslashreplace"`, where the
+stdlib's strict default prints `--- Logging error ---` and loses the record.
 
 The public seam is unchanged (`get_logger(name)`, one handler, still a
 `RotatingFileHandler`, still `<name>.log` + `<name>.log.N`), so no consumer
@@ -1675,6 +1678,21 @@ the OS has nothing left to ask. `rc.txt` came back EMPTY on every run until
 that line existed, and the hand-off then reported an "unreadable exit code" for
 commands that had succeeded.
 
+A second one, on the reading side: `rc.txt` EXISTING is not the exit code being
+WRITTEN. `Set-Content` creates the file, then writes, and refuses readers until
+it closes -- measured, 298 of 300 first reads after the file appeared were a
+sharing violation. The poll treated that read as final and reported the same
+"unreadable exit code ''" for succeeded commands, a windows-latest unit flake
+on five unrelated PRs. So rc.txt goes through the same reader as pid.txt
+(`_read_recorded_int`), and only a COMPLETE integer ends the wait -- complete
+meaning ended by the newline `Set-Content` writes after every value, so the
+`1` of `12` can never be final. While rc.txt is present the lost-child check
+stands down: a launcher still writing it has not lost anything. A present
+rc.txt that stays anything else past `_HANDOFF_RC_GRACE_S` (10s) or the budget
+gets one last, decisive read, and failing that is its own answer -- the
+command finished and we cannot say how -- distinct from "never started",
+"lost its child" and "may still be running".
+
 **`schtasks` comes from the system directory, not PATH.** `run_on_desktop` is
 reached from an ssh login, and letting that login's PATH choose what runs as
 the logged-on user would turn a hand-off into an execution primitive for
@@ -1722,12 +1740,15 @@ otherwise bring up a different config's projects). It exports
 landed in Session 0 again cannot recurse -- a recursion whose every level
 writes a scheduled task. And it writes `pid.txt` the moment `Start-Process`
 returns and `rc.txt` only after `WaitForExit`, which is what lets the poll tell
-three failures apart: no pid after the start grace means Task Scheduler never
-ran the task, a pid that is gone with no rc means the launcher lost its child
-and nothing is coming, and neither is the caller's budget simply running out.
-On that last one the delegated child is deliberately NOT killed: a bring-up
-still running on the desktop is doing the work that was asked for, and the pid
-is a number Windows recycles freely.
+four failures apart: no pid after the start grace means Task Scheduler never
+ran the task; a pid that is gone with no rc.txt means the launcher lost its
+child and nothing is coming; an rc.txt that is there but never reads as a
+complete integer means the command finished and its exit code is lost (see the
+reading-side trap above -- rc.txt existing is not the code being written); and
+none of those is the caller's budget simply running out. On that last one the
+delegated child is deliberately NOT killed: a bring-up still running on the
+desktop is doing the work that was asked for, and the pid is a number Windows
+recycles freely.
 
 Diagnostics are the other half: `doctor`'s `psmux-session0` check and one
 `status` stderr line count psmux servers still stranded there (by image name
@@ -2267,6 +2288,28 @@ change):
   tiles into a hard-coded `compute_grid(monitors, 2, 1)` regardless of the
   config's `layout.columns`/`layout.rows`, unlike the launch path which
   reads the configured grid.
+- **The test home isolation leaves `find_config`'s CWD door open.**
+  `tests/conftest.py::_isolate_magent_home` moves the HOME family, `APPDATA`
+  and `XDG_CONFIG_HOME` into tmp, which closes the last candidate
+  `find_config(None)` tries (`env.config_base()/magent/config.json`). The
+  first two candidates are relative to the CWD, `./magent.config.json` and
+  then `./scripts/magent.config.json`, and the fixture does not move the
+  CWD. `magent.config.json` is gitignored precisely because a personal one
+  lives at a checkout root, so a test that forgets `--config`, run from
+  such a checkout, loads the developer's own config. The only guard is the
+  convention that CLI tests pass `--config <tmp_path>`; a global
+  `chdir(tmp_path)` would break the tests that rely on a repo-root CWD. The
+  cheapest fix is a guard-A-style tripwire that fails any test whose
+  `find_config(None)` resolves under the repo root while the redirect is
+  active.
+- **The home tripwire stops at the HOME family.** Guard B inspects only
+  `HOME`/`USERPROFILE` in an explicit child `env=`, so a child env carrying
+  the real `APPDATA` or `XDG_CONFIG_HOME` passes it. Guard A's
+  `_REAL_STATE_ROOTS` is `~/.magent` and `~/.claude`, without the real
+  config base (`REAL_APPDATA/magent` on Windows, `~/.config/magent` or an
+  exported `$XDG_CONFIG_HOME/magent` on Linux, `~/Library/Application
+  Support/magent` on macOS), so an import-bound Path under any of them is
+  not flagged.
 
 ## 4. Change guide
 
