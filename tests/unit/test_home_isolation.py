@@ -14,10 +14,12 @@ needs pins. These assert on the real seams the redirect uses -- a real
 
 from __future__ import annotations
 
+import ctypes
 import os
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -131,6 +133,60 @@ print(path.value if hr == 0 else f"HRESULT 0x{hr & 0xFFFFFFFF:08X}")
 ctypes.windll.ole32.CoTaskMemFree(path)
 """
 
+_FOLDERID_LOCAL_APPDATA = "F1B32785-6FBA-4FCF-9D55-7B8E7F157091"
+_FOLDERID_ROAMING_APPDATA = "3EB685DB-65F9-4CF6-A03A-E3EF65729F3D"
+
+
+def _real_known_folder(folder_id: str) -> Path | None:
+    """The same lookup, made in THIS process at import -- i.e. at collection,
+    before any fixture has redirected the profile. None off Windows or when
+    the folder does not resolve."""
+    if sys.platform != "win32":
+        return None
+    guid = (ctypes.c_char * 16).from_buffer_copy(uuid.UUID(folder_id).bytes_le)
+    path = ctypes.c_wchar_p()
+    hr = ctypes.windll.shell32.SHGetKnownFolderPath(guid, 0, None, ctypes.byref(path))
+    try:
+        return Path(path.value) if hr == 0 and path.value else None
+    finally:
+        ctypes.windll.ole32.CoTaskMemFree(path)
+
+
+def _redirected_off_profile(folder: Path | None, profile: Path) -> bool:
+    """True only on a POSITIVE detection: the folder resolved, somewhere that
+    is not under the profile. An unresolved folder is not a reason to skip."""
+    return folder is not None and not folder.is_relative_to(profile)
+
+
+# GPO folder redirection can move Roaming AppData (never Local) to a share.
+# The registry then names that share outright, not %USERPROFILE%\..., so the
+# lookup answers it under ANY USERPROFILE -- the tmp home included -- and the
+# Roaming pins could only fail there. No leak is possible on such a profile
+# either: the lookup resolves, just not into tmp. Only the Roaming pins
+# consult this; the Local ones guard the actual cache leak and never skip.
+_REAL_ROAMING_APPDATA = _real_known_folder(_FOLDERID_ROAMING_APPDATA)
+roaming_in_profile = pytest.mark.skipif(
+    _redirected_off_profile(_REAL_ROAMING_APPDATA, REAL_HOME),
+    reason=(
+        f"this profile's Roaming AppData is redirected to {_REAL_ROAMING_APPDATA}, "
+        f"outside {REAL_HOME}, so the lookup answers it under any USERPROFILE"
+    ),
+)
+
+
+class TestTheRoamingSkipIsADetection:
+    """The skip above must fire on a redirected profile and nowhere else --
+    a detector that is wrong in the other direction silently retires a pin."""
+
+    def test_a_folder_under_the_profile_runs_the_pins(self, tmp_path):
+        assert not _redirected_off_profile(tmp_path / "AppData" / "Roaming", tmp_path)
+
+    def test_a_folder_off_the_profile_skips_them(self, tmp_path):
+        assert _redirected_off_profile(tmp_path / "share" / "Roaming", tmp_path / "me")
+
+    def test_an_unresolved_folder_runs_the_pins(self, tmp_path):
+        assert not _redirected_off_profile(None, tmp_path)
+
 
 @pytest.mark.skipif(
     sys.platform != "win32", reason="the Windows known-folder API; POSIX has none"
@@ -152,11 +208,18 @@ class TestTheTmpHomeResolvesItsKnownFolders:
     ``AppData\\Roaming`` on its own at startup (measured), so its
     ApplicationData answer is right even against an empty home; the direct
     Win32 lookup has no such side effect, so it is the pin that holds each
-    folder to the fixture.
+    folder to the fixture. The Roaming cases skip only on a profile that
+    redirects Roaming AppData off itself (``roaming_in_profile``).
     """
 
     @pytest.mark.skipif(_POWERSHELL is None, reason="powershell.exe not on PATH")
-    @pytest.mark.parametrize("folder", ["LocalApplicationData", "ApplicationData"])
+    @pytest.mark.parametrize(
+        "folder",
+        [
+            "LocalApplicationData",
+            pytest.param("ApplicationData", marks=roaming_in_profile),
+        ],
+    )
     def test_a_powershell_child_resolves_it_inside_the_tmp_home(self, tmp_path, folder):
         assert _POWERSHELL is not None  # narrowed by the skipif above
         r = subprocess.run(
@@ -188,8 +251,10 @@ class TestTheTmpHomeResolvesItsKnownFolders:
     @pytest.mark.parametrize(
         ("folder", "folder_id"),
         [
-            ("LocalAppData", "F1B32785-6FBA-4FCF-9D55-7B8E7F157091"),
-            ("RoamingAppData", "3EB685DB-65F9-4CF6-A03A-E3EF65729F3D"),
+            ("LocalAppData", _FOLDERID_LOCAL_APPDATA),
+            pytest.param(
+                "RoamingAppData", _FOLDERID_ROAMING_APPDATA, marks=roaming_in_profile
+            ),
         ],
     )
     def test_the_win32_lookup_resolves_it_inside_the_tmp_home(
