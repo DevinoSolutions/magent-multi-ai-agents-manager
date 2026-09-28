@@ -2880,6 +2880,15 @@ class TestTheScriptLiterals:
             assert "umask" not in body
             assert "mkdir " not in body
 
+    def test_a_folder_that_appears_meanwhile_is_already_there(self):
+        # Another bring-up may make a folder between the walk and the mkdir:
+        # that is "already there", not a failure, and mkdir's words stay off
+        # the screen (the rig proves both on a real shell).
+        helper = _shell_function(node_scripts._read("bring_up"), "mkdir_private")
+        assert 'mkdir -m 700 -- "$dir" 2>/dev/null || [ -d "$dir" ] || return 1' in (
+            helper
+        )
+
     def test_the_archive_is_never_extracted_with_absolute_names(self):
         text = node_scripts._read("bring_up")
         assert not re.search(r"\btar\b[^\n]*(\s-P\b|--absolute-names)", text)
@@ -2977,6 +2986,49 @@ def _no_real_acl(reason: str) -> NoReturn:
 # argument, which is what umask 000 leaves: owner-only here is owner-only
 # under EVERY default ACL, on any filesystem, with no setfacl.
 _UMASK_000 = "umask() { builtin umask 000; }\nbuiltin umask 000\n"
+
+
+# The mkdir shims of test_node_recall.py (integ-G, fa44f46), same shapes.
+def _mkdir_shim(tmp_path: Path, monkeypatch, body: str) -> None:
+    """A ``mkdir`` ahead of the real one on PATH. ``body`` runs with the
+    folder private_dir asked for in $last and the real mkdir in $real."""
+    real = shutil.which("mkdir")
+    assert real is not None
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "mkdir"
+    shim.write_text(
+        f"#!/bin/sh\nreal={shlex.quote(real)}\nfor last; do :; done\n{body}",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ['PATH']}")
+
+
+# Another install makes the folder first -- 0700, as its private_dir would
+# -- so this one's mkdir finds it there and fails: the race mkdir -p hid.
+_LOSES_THE_RACE = (
+    '"$real" -m 700 -- "$last" || exit 2\n'
+    "echo \"mkdir: cannot create directory '$last': File exists\" >&2\n"
+    "exit 1\n"
+)
+
+
+def _refuses(folder: str) -> str:
+    """A mkdir that fails on ``folder`` and leaves nothing there, and is the
+    real one for every other folder."""
+    return (
+        f'case "$last" in {shlex.quote(folder)})\n'
+        "  echo \"mkdir: cannot create directory '$last': Permission denied\" >&2\n"
+        "  exit 1 ;;\n"
+        "esac\n"
+        'exec "$real" "$@"\n'
+    )
+
+
+# bring_up.sh's mkdir_private is its only `mkdir -m`: every other mkdir there
+# (the scratch folder beside the payload) is the real one.
+_ONLY_MKDIR_PRIVATE = '[ "$1" = -m ] || exec "$real" "$@"\n'
 
 
 @pytest.mark.skipif(
@@ -3689,6 +3741,80 @@ class TestBringUpShOnARealShell:
         ]
         assert modes == [0o755, 0o700, 0o700, 0o700]
         assert stat.S_IMODE((store / "memory" / "MEMORY.md").stat().st_mode) == 0o600
+
+    def test_a_folder_another_bring_up_made_first_is_not_a_refusal(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # One person's two PCs bring up at once on a fresh node: every folder
+        # the walk found missing, the other mkdir_private made (0700) a moment
+        # before this mkdir ran. mkdir -p shrugged that off; so must this, and
+        # mkdir's "File exists" never reaches the screen.
+        root = rig["root"]
+        root.mkdir(parents=True)
+        _mkdir_shim(tmp_path, monkeypatch, _ONLY_MKDIR_PRIVATE + _LOSES_THE_RACE)
+        result = self._push_raw(
+            rig, _raw_payload(("project/sub/deeper/.env", b"K=V\n"))
+        )
+        assert result.returncode == 0
+        assert b"mkdir" not in result.stderr
+        assert json.loads(result.stdout)["shipped"] == ["sub/deeper/.env"]
+        modes = [
+            stat.S_IMODE(p.stat().st_mode)
+            for p in (
+                root / "sub",
+                root / "sub" / "deeper",
+                root / "sub" / "deeper" / ".env",
+            )
+        ]
+        assert modes == [0o700, 0o700, 0o600]
+
+    def test_a_seed_folder_another_bring_up_made_first_is_not_a_refusal(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # The seed's walk, from a home with no ~/.claude yet, loses the same
+        # race on every folder: the bring-up goes on and the seed lands.
+        _mkdir_shim(tmp_path, monkeypatch, _ONLY_MKDIR_PRIVATE + _LOSES_THE_RACE)
+        remote_mux.bring_up(rig["node"], rig["recipe"])
+        claude = Path.home() / ".claude"
+        memory = claude / "projects" / rig["enc"] / "memory"
+        assert (memory / "MEMORY.md").read_bytes() == b"- remember\n"
+        modes = [
+            stat.S_IMODE(p.stat().st_mode)
+            for p in (claude, claude / "projects", memory.parent, memory)
+        ]
+        assert modes == [0o700] * 4
+
+    def test_a_folder_that_cannot_be_made_is_refused_in_the_scripts_words(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # A mkdir that really fails, and leaves nothing: the push dies with
+        # exit 5 and the script's own line, mkdir's words off the screen, and
+        # nothing written.
+        root = rig["root"]
+        root.mkdir(parents=True)
+        _mkdir_shim(tmp_path, monkeypatch, _refuses(f"{root}/sub"))
+        with pytest.raises(RemoteError) as info:
+            self._push_raw(rig, _raw_payload(("project/sub/deeper/.env", b"K=V\n")))
+        assert info.value.rc == 5
+        assert (
+            info.value.stderr_tail
+            == "magent: cannot create a folder for sub/deeper/.env"
+        )
+        assert _tree(root) == []
+
+    def test_a_seed_folder_that_cannot_be_made_is_refused_in_the_scripts_words(
+        self, rig, tmp_path, monkeypatch
+    ):
+        # The seed's own refusal: exit 5 before any session starts, the
+        # script's own line, and no memory written.
+        dest = Path.home() / ".claude" / "projects" / rig["enc"] / "memory"
+        _mkdir_shim(tmp_path, monkeypatch, _refuses(str(dest)))
+        with pytest.raises(RemoteError) as info:
+            remote_mux.bring_up(rig["node"], rig["recipe"])
+        assert info.value.rc == 5
+        assert info.value.stderr_tail == f"magent: cannot create {dest}"
+        assert not dest.exists()
+        assert not (rig["state"] / "sessions" / "api").exists()
 
     def test_a_failed_decoration_still_starts_the_session(self, rig):
         # The one step allowed to fail: a bare status line is not a failed
