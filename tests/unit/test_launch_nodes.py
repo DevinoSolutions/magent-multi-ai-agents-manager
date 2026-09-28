@@ -3458,6 +3458,27 @@ class TestTextWithNoUtf8FormReachesTheRowInOurWords:
         assert failed.endswith("surrogates not allowed")
         assert len(real_node.calls()) == 1
 
+    def test_the_failed_line_lands_escaped_in_nodes_log(
+        self, real_node, api, tmp_path, capsys
+    ):
+        # The sid reaches that WARNING raw (%s). f512ba7's handler is what
+        # writes it as escape text on disk; a strict one would drop the line.
+        from magent import log
+
+        assert log.LOG_DIR.is_relative_to(tmp_path)
+        titled = dataclasses.replace(api, title="api\ud83d")
+        assert not launch.bring_up_node_project(_config(titled), titled).ok
+        path = log.LOG_DIR / "nodes.log"
+        logged = path.read_text(encoding="utf-8") if path.exists() else ""
+        lines = [line for line in logged.splitlines() if "bring-up of" in line]
+        assert len(lines) == 1, logged
+        assert " WARNING " in lines[0]
+        assert (
+            "node second: bring-up of api\\ud83d failed: the project's session "
+            "name has text with no UTF-8 form (UnicodeEncodeError): "
+        ) in lines[0]
+        assert "Logging error" not in capsys.readouterr().err
+
     def test_attaching_to_a_session_so_named_still_attaches(
         self, real_node, rig, api, tmp_path, caplog
     ):
