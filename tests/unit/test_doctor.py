@@ -74,10 +74,14 @@ class TestCheckEnv:
         assert doctor._check_env()[0] == OK
 
     def test_an_env_file_that_is_not_utf8_fails_naming_it(self):
+        # Exact: the item has no field name, so nothing may precede the path.
         env_module.ENV_FILE.write_bytes(b"MAGENT_LOG_LEVEL=\xff\xfe\n")
         status, detail = doctor._check_env()
         assert status == FAIL
-        assert f"{env_module.ENV_FILE} is not valid UTF-8" in detail
+        assert detail == (
+            f"invalid environment variable(s): {env_module.ENV_FILE} is not "
+            "valid UTF-8 (UnicodeDecodeError); re-save it as UTF-8 (see .env.example)"
+        )
 
     def test_an_env_file_that_is_not_utf8_leaves_every_other_check_running(
         self, monkeypatch, tmp_config

@@ -159,30 +159,40 @@ def get_env() -> MagentEnv:
     if _cached_env is None:
         try:
             _cached_env = MagentEnv(_env_file=ENV_FILE)
-        except UnicodeDecodeError as exc:
-            raise _env_file_not_utf8() from exc
+        except (UnicodeDecodeError, OSError) as exc:
+            raise _env_file_unusable(exc) from exc
     return _cached_env
 
 
-def _env_file_not_utf8() -> ValidationError:
-    """ENV_FILE is not UTF-8, as a ValidationError naming the file.
+def _env_file_unusable(exc: UnicodeDecodeError | OSError) -> ValidationError:
+    """ENV_FILE could not be used, as a ValidationError naming the file.
 
-    The dotenv read raises UnicodeDecodeError, which is not a ValidationError,
-    so it walked straight past every caller and killed each command with a
-    traceback. It IS an invalid environment, and every get_env() caller
-    already handles ValidationError: the CLI refuses in one line, doctor
-    FAILs its env check, and the daemons' readers fall back to defaults. A new
-    exception type would be a new traceback at each caller that missed it.
-    The empty ``loc`` makes ``validation_error_items`` show the message as-is.
+    The dotenv read raises UnicodeDecodeError for a file that is not UTF-8 and
+    an OSError (PermissionError) for one it cannot read. Neither is a
+    ValidationError, so each walked straight past every caller and killed the
+    command with a traceback. Both ARE an invalid environment, and every
+    get_env() caller already handles ValidationError: the CLI refuses in one
+    line, doctor FAILs its env check, and the daemons' readers fall back to
+    their defaults. A new exception type would be a new traceback at each
+    caller that missed it. (A directory never gets here: pydantic-settings
+    reads the file only when it ``is_file()``.)
+
+    Our words and the exception's class only -- never the offending bytes or
+    the decode position; the caller chains the original for Sentry. The empty
+    ``loc`` makes ``validation_error_items`` show the message as-is, and the
+    one ``{message}`` key keeps a brace in the path literal.
     """
+    if isinstance(exc, UnicodeDecodeError):
+        problem = f"is not valid UTF-8 ({type(exc).__name__}); re-save it as UTF-8"
+    else:
+        problem = f"could not be read ({type(exc).__name__})"
+    message = f"{ENV_FILE} {problem}"
     return ValidationError.from_exception_data(
         MagentEnv.__name__,
         [
             {
                 "type": PydanticCustomError(
-                    "env_file_not_utf8",
-                    "{path} is not valid UTF-8",
-                    {"path": str(ENV_FILE)},
+                    "env_file_unusable", "{message}", {"message": message}
                 ),
                 "input": str(ENV_FILE),
             }

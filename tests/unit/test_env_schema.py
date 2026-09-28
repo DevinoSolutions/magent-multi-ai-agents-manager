@@ -6,18 +6,24 @@ A new env var without an .env.example update = red gate.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
+import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from click.testing import CliRunner
 from pydantic import ValidationError
 
-from magent import cli, log
+from magent import cli, log, psmux
 from magent import env as env_module
 from magent.env import MagentEnv
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 _ROOT = Path(__file__).resolve().parents[2]
 _ENV_EXAMPLE = _ROOT / ".env.example"
@@ -542,45 +548,92 @@ class TestEnvFileIsMagentsOwn:
         assert env_module.get_env().log_level == "DEBUG"
 
 
-class TestUndecodableEnvFile:
-    """An ENV_FILE that is not valid UTF-8 made the dotenv read raise
-    UnicodeDecodeError, which no caller catches: every magent command died
-    with a traceback. It is an invalid environment like any other, so it
-    fails the same clean way."""
+_NOT_UTF8 = b"MAGENT_LOG_LEVEL=\xff\xfe\n"
 
-    NOT_UTF8 = b"MAGENT_LOG_LEVEL=\xff\xfe\n"
 
-    def test_get_env_raises_the_error_every_caller_already_catches(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+@contextlib.contextmanager
+def _read_denied(path: Path) -> Iterator[None]:
+    """A REAL PermissionError on reading ``path``, on every OS the unit tier
+    runs on: a byte-range lock held by another handle on Windows (where a mode
+    bit does not stop a read), mode 000 elsewhere."""
+    size = path.stat().st_size
+    if sys.platform == "win32":
+        import msvcrt
+
+        with path.open("r+b") as holder:
+            msvcrt.locking(holder.fileno(), msvcrt.LK_NBLCK, size)
+            try:
+                yield
+            finally:
+                holder.seek(0)
+                msvcrt.locking(holder.fileno(), msvcrt.LK_UNLCK, size)
+    else:
+        if os.geteuid() == 0:
+            pytest.skip("root reads a mode-000 file regardless")
+        path.chmod(0)
+        try:
+            yield
+        finally:
+            path.chmod(0o600)
+
+
+class TestAnUnusableEnvFile:
+    """An ENV_FILE that is not valid UTF-8, or that cannot be read at all,
+    raised UnicodeDecodeError / PermissionError out of the dotenv read, which
+    no caller catches: every magent command died with a traceback. Each is an
+    invalid environment like any other, so it fails the same clean way."""
+
+    def test_not_utf8_raises_the_error_every_caller_already_catches(self) -> None:
         # Every get_env() call site catches ValidationError, several of them to
         # degrade to a default (logging must never crash the process it
         # observes). A new exception type would be a traceback at each one.
-        _clear_magent_env(monkeypatch)
-        env_module.ENV_FILE.write_bytes(self.NOT_UTF8)
+        env_module.ENV_FILE.write_bytes(_NOT_UTF8)
 
         with pytest.raises(ValidationError) as caught:
             env_module.get_env()
 
         assert env_module.validation_error_items(caught.value) == [
-            ("", f"{env_module.ENV_FILE} is not valid UTF-8")
+            (
+                "",
+                (
+                    f"{env_module.ENV_FILE} is not valid UTF-8 "
+                    "(UnicodeDecodeError); re-save it as UTF-8"
+                ),
+            )
         ]
+        # Chained, so the real cause survives for Sentry.
+        assert isinstance(caught.value.__cause__, UnicodeDecodeError)
 
-    def test_the_log_level_reader_degrades_instead_of_crashing(
+    def test_an_unreadable_file_raises_it_too(self) -> None:
+        env_module.ENV_FILE.write_text("MAGENT_LOG_LEVEL=DEBUG\n", encoding="utf-8")
+
+        with (
+            _read_denied(env_module.ENV_FILE),
+            pytest.raises(ValidationError) as caught,
+        ):
+            env_module.get_env()
+
+        assert env_module.validation_error_items(caught.value) == [
+            ("", f"{env_module.ENV_FILE} could not be read (PermissionError)")
+        ]
+        assert isinstance(caught.value.__cause__, PermissionError)
+
+    def test_a_directory_is_skipped_like_a_missing_file(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # The sharpest of those callers: logging must never crash the process
-        # it observes, so a bad file falls back to INFO like a bad variable.
-        _clear_magent_env(monkeypatch)
-        env_module.ENV_FILE.write_bytes(self.NOT_UTF8)
+        # pydantic-settings reads an env file only when it is_file() --
+        # measured, and pinned so an upgrade that changes it shows up here.
+        env_module.ENV_FILE.mkdir()
+        monkeypatch.setenv("MAGENT_LOG_LEVEL", "DEBUG")
 
-        assert log._configured_level() == logging.INFO
+        assert env_module.get_env().log_level == "DEBUG"
 
-    def test_a_command_exits_one_naming_the_file_not_a_traceback(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _clear_magent_env(monkeypatch)
-        env_module.ENV_FILE.write_bytes(self.NOT_UTF8)
+    def test_the_refusal_is_exactly_our_words(self) -> None:
+        # The whole of stderr: one item line -- no stray ": " from the empty
+        # loc, and never the offending bytes or the decode position -- then
+        # app.py's trailer, which every invalid environment shares.
+        env_module.ENV_FILE.write_bytes(_NOT_UTF8)
+        path = env_module.ENV_FILE
 
         # `docs` only prints: had the env gate let it through, it would have
         # written markdown to stdout and touched nothing else.
@@ -588,8 +641,62 @@ class TestUndecodableEnvFile:
 
         assert result.exit_code == 1
         assert isinstance(result.exception, SystemExit)
-        assert f"{env_module.ENV_FILE} is not valid UTF-8" in result.stderr
-        assert "Traceback" not in result.output
+        assert result.stdout == ""
+        assert result.stderr == (
+            f"{path} is not valid UTF-8 (UnicodeDecodeError); re-save it as UTF-8\n"
+            f"Fix the environment variable(s) above (see .env.example; "
+            f"env file: {path}).\n"
+        )
+
+    def test_an_unreadable_file_is_refused_the_same_way(self) -> None:
+        env_module.ENV_FILE.write_text("MAGENT_LOG_LEVEL=DEBUG\n", encoding="utf-8")
+        path = env_module.ENV_FILE
+
+        with _read_denied(path):
+            result = CliRunner().invoke(cli.main, ["docs"])
+
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        assert result.stderr == (
+            f"{path} could not be read (PermissionError)\n"
+            f"Fix the environment variable(s) above (see .env.example; "
+            f"env file: {path}).\n"
+        )
+
+    @pytest.mark.parametrize("unusable", ["not-utf8", "unreadable"])
+    def test_the_readers_degrade_exactly_as_for_an_invalid_variable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        unusable: str,
+    ) -> None:
+        # The "same clean failure" contract at the readers that must never
+        # crash: logging, and a supervisor gate. conftest pins
+        # MAGENT_PSMUX_BOOST=0, so boost_enabled() is True only when degraded.
+        def degraded() -> tuple[tuple[int, bool], list[str]]:
+            monkeypatch.setattr(env_module, "_cached_env", None)
+            caplog.clear()
+            with caplog.at_level("WARNING", logger="magent.launch"):
+                outcome = (log._configured_level(), psmux.boost_enabled())
+            return outcome, [r.getMessage() for r in caplog.records]
+
+        monkeypatch.setenv("MAGENT_LOG_LEVEL", "NOT-A-LEVEL")
+        invalid_variable = degraded()
+        monkeypatch.delenv("MAGENT_LOG_LEVEL")
+
+        if unusable == "not-utf8":
+            env_module.ENV_FILE.write_bytes(_NOT_UTF8)
+            unusable_file = degraded()
+        else:
+            env_module.ENV_FILE.write_text("MAGENT_LOG_LEVEL=DEBUG\n", "utf-8")
+            with _read_denied(env_module.ENV_FILE):
+                unusable_file = degraded()
+
+        assert unusable_file == invalid_variable
+        assert invalid_variable == (
+            (logging.INFO, True),
+            ["psmux boost: environment did not validate; boosting anyway"],
+        )
 
 
 class TestSession0Policy:
