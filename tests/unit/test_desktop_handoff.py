@@ -871,6 +871,38 @@ class TestTheExitCodeIsFinalOnlyAsAnInteger:
         self._assert_unreadable_answer(result, work, mode, 0.5)
         assert clock.now >= 0.5
 
+    def test_the_os_words_go_to_the_log_never_the_screen(
+        self, handoff, hold, caplog, capsys
+    ):
+        # What the OS said about the refused read is worth keeping -- in
+        # launch.log, where a bug report can quote it. The screen gets our
+        # words and the exception class: in `detail`, and in the line the
+        # relay prints from it.
+        work, files, _ = handoff
+        hold(files[3], "locked")
+        with pytest.raises(PermissionError) as refused:
+            files[3].read_text(encoding="utf-8")
+        os_words = refused.value.strerror
+        assert os_words
+
+        with caplog.at_level("WARNING", logger="magent.launch"):
+            result = self._await(work, files, timeout_s=60)
+
+        logged = [r for r in caplog.records if r.name == "magent.launch"]
+        assert [r.levelname for r in logged] == ["WARNING"]
+        assert "rc.txt unreadable" in logged[0].getMessage()
+        assert os_words in logged[0].getMessage()
+        assert os_words not in result.detail
+
+        relay_handoff(
+            FakePlatform(supports_handoff=True, handoff_result=result),
+            ["x"],
+            timeout_s=5,
+        )
+        screen = capsys.readouterr()
+        assert result.detail in screen.err
+        assert os_words not in screen.out + screen.err
+
     def _assert_unreadable_answer(self, result, work, mode, waited):
         assert result.rc is None
         # rc.txt exists only after WaitForExit, so the command FINISHED: not
