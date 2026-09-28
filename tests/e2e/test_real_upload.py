@@ -353,6 +353,48 @@ def test_oversized_body_gets_real_413_envelope_not_a_reset(serve):
     assert json.loads(raw) == {"ok": False, "error": "File too large"}
 
 
+def test_a_second_serve_on_the_same_port_exits_and_leaves_the_first_alone(serve):
+    """On Windows a second serve used to bind the held port and co-listen in
+    silence (SO_REUSEADDR). It must now exit at once, by name, and the first
+    server must keep its port and its pid file."""
+    pid_file = serve.home / ".magent" / f"upload_server-{serve.port}.pid"
+    before = pid_file.read_text(encoding="utf-8").strip()
+
+    second = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "magent",
+            "--config",
+            str(serve.cfg),
+            "serve",
+            "-p",
+            str(serve.port),
+            "--host",
+            "127.0.0.1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=serve.env,
+    )
+    try:
+        stdout, stderr = second.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        second.kill()
+        stdout, stderr = second.communicate(timeout=30)
+        pytest.fail(
+            "the second serve was still running after 60s -- it bound the held "
+            f"port\n{serve._diagnostics()}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        )
+
+    assert second.returncode == 1, f"stdout:\n{stdout}\nstderr:\n{stderr}"
+    assert "already in use" in stderr
+    assert "Traceback" not in stderr
+    assert pid_file.read_text(encoding="utf-8").strip() == before
+    assert _health_ok(serve.port), "the first server stopped answering"
+
+
 def test_garbage_content_length_gets_real_400_envelope(serve):
     conn = serve.connect(timeout=60)
     try:

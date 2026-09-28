@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import types
 from typing import ClassVar
 
 from magent import agent_state, cli, config, log
@@ -175,6 +176,105 @@ class TestDaemonPrereqValidation:
 
         assert result.exit_code == 0, result.output
         assert "running" in result.output
+
+
+class _RunningChild:
+    """A detached child that is still starting: ``poll()`` says alive. Records
+    every attempt to end it -- the launcher must never make one."""
+
+    def __init__(self) -> None:
+        self.ended: list[str] = []
+
+    def poll(self) -> int | None:
+        return None
+
+    def kill(self) -> None:
+        self.ended.append("kill")
+
+    def terminate(self) -> None:
+        self.ended.append("terminate")
+
+    def send_signal(self, sig: int) -> None:
+        self.ended.append(f"signal {sig}")
+
+
+class _GuardedClock:
+    """Stands in for ``procs.time``: ``sleep`` advances ``monotonic``. A wait
+    that never closes FAILS here instead of hanging the suite."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        assert self.now < 120.0, "the registration wait never closed"
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+class TestTheLauncherWaitsForASlowDaemon:
+    """`attention -d` exited 1 "failed to start" over a daemon that came up at
+    4.7s on a loaded desktop, because it only waited 2s. The launcher's answer
+    must be about the daemon, not about how busy the machine was. (The window
+    itself is pinned in test_procs.py; this pins that `-d` goes through it.)"""
+
+    def test_a_daemon_that_registers_after_five_seconds_is_running(
+        self, runner, monkeypatch, tmp_path, tmp_config
+    ):
+        fp = FakePlatform(supports_attention=True)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+        pid_file = tmp_path / "attention.pid"
+        monkeypatch.setattr(attention_cmd, "_PID_PATH", pid_file)
+        monkeypatch.setattr("magent.launch.spawn_detached", lambda _a: _RunningChild())
+        # procs' own clock only, never the global time module: each 0.1s poll
+        # advances it, so the window is measured in simulated seconds.
+        clock = {"now": 0.0}
+
+        def sleep(seconds: float) -> None:
+            clock["now"] += seconds
+            if clock["now"] >= 5.0:  # the measured slow start, well past 2s
+                pid_file.write_text(str(os.getpid()))
+
+        monkeypatch.setattr(
+            "magent.procs.time",
+            types.SimpleNamespace(sleep=sleep, monotonic=lambda: clock["now"]),
+        )
+
+        # A current-schema config, so a failure message leads with the verdict
+        # rather than a schema-version warning.
+        config_path = tmp_config(
+            {"version": config.SCHEMA_VERSION, "projects": [{"path": "api"}]}
+        )
+        result = runner.invoke(
+            cli.main, ["--config", config_path, "attention", "--daemon"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert f"(pid {os.getpid()})" in result.output
+
+    def test_a_daemon_that_never_registers_is_reported_but_not_killed(
+        self, runner, monkeypatch, tmp_path, tmp_config
+    ):
+        # The ruling: the launcher never ends a daemon that may be about to
+        # come up. It says "failed to start" and leaves the child alone.
+        fp = FakePlatform(supports_attention=True)
+        monkeypatch.setattr("magent.platform.get_platform", lambda: fp)
+        monkeypatch.setattr(attention_cmd, "_PID_PATH", tmp_path / "attention.pid")
+        child = _RunningChild()
+        monkeypatch.setattr("magent.launch.spawn_detached", lambda _a: child)
+        monkeypatch.setattr("magent.procs.time", _GuardedClock())
+
+        config_path = tmp_config(
+            {"version": config.SCHEMA_VERSION, "projects": [{"path": "api"}]}
+        )
+        result = runner.invoke(
+            cli.main, ["--config", config_path, "attention", "--daemon"]
+        )
+
+        assert result.exit_code == 1
+        assert "failed to start" in result.stdout
+        assert child.ended == []
 
 
 class TestHeartbeatLifecycle:

@@ -1336,7 +1336,6 @@ class TestMaybeStartHotkeySshHost:
     """The spawned listener's argv carries --ssh-host only when there is one."""
 
     def _args(self, monkeypatch, ssh_host):
-        import magent.launch as launch_mod
         from magent.cli import background
 
         spawned: list[list[str]] = []
@@ -1345,8 +1344,31 @@ class TestMaybeStartHotkeySshHost:
             def supports_hotkey(self) -> bool:
                 return True
 
+        ended: list[str] = []
+
+        class _Exited:
+            # The child is only here for its argv; an exited one ends the
+            # registration wait on its first poll. Any attempt to end it is
+            # recorded, so a regression fails the assertion below rather than
+            # erroring on a missing method.
+            def poll(self) -> int:
+                return 0
+
+            def kill(self) -> None:
+                ended.append("kill")
+
+            def terminate(self) -> None:
+                ended.append("terminate")
+
+            def send_signal(self, sig: int) -> None:
+                ended.append(f"signal {sig}")
+
+        def _spawn(args: list[str]) -> _Exited:
+            spawned.append(args)
+            return _Exited()
+
         monkeypatch.setattr("magent.platform.get_platform", _FakePlat)
-        monkeypatch.setattr("magent.launch.spawn_detached", spawned.append)
+        monkeypatch.setattr("magent.launch.spawn_detached", _spawn)
 
         fake = types.ModuleType("magent.hotkey")
         fake.listener_pid = lambda: None
@@ -1357,9 +1379,21 @@ class TestMaybeStartHotkeySshHost:
         monkeypatch.setitem(sys.modules, "magent.hotkey", fake)
         # The spawn recipe itself moved to launch.start_hotkey_listener so the
         # launch path can share it; background is now just the capability gate.
-        monkeypatch.setattr(launch_mod.time, "sleep", lambda s: None)
+        # `_Exited` ends the registration wait on its first poll; procs' own
+        # clock (never the global time module) is simulated anyway, so a wait
+        # that did not end costs no real seconds.
+        clock = {"now": 0.0}
+
+        def _sleep(seconds: float) -> None:
+            clock["now"] += seconds
+
+        monkeypatch.setattr(
+            "magent.procs.time",
+            types.SimpleNamespace(sleep=_sleep, monotonic=lambda: clock["now"]),
+        )
 
         background._maybe_start_hotkey("http://h:8033", ssh_host)
+        assert ended == []  # the launcher never ends the child it spawned
         return spawned[0]
 
     def test_ssh_host_is_passed_through(self, monkeypatch):
