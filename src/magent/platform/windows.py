@@ -358,13 +358,21 @@ def _settle_exit_code(
 def _read_handoff_text(path: Path) -> str:
     """Read one of the shim's output files; absent or unreadable reads empty.
 
-    ``errors="replace"`` rather than a codepage guess: the child's console
-    encoding is the machine's, this text is RELAYED to a human, and a mojibake
-    character in a diagnostic is strictly better than losing the diagnostic to a
-    UnicodeDecodeError.
+    UTF-8 first, then the ANSI code page. The child's stdout is a FILE, so a
+    default Python child writes it in the ANSI code page, not UTF-8, and reading
+    that as UTF-8 relayed every accented letter as U+FFFD. UTF-8 still goes
+    first because a child in Python's UTF-8 mode writes it, and ANSI text that
+    also parses as UTF-8 is already mojibake (``Ã©``). ``mbcs`` is the ANSI
+    code page whatever Python's own UTF-8 mode says; it exists only on Windows,
+    the only place this module imports. ``errors="replace"`` on that last step:
+    this text is RELAYED to a human, and a mojibake character in a diagnostic
+    is strictly better than losing the diagnostic to a UnicodeDecodeError.
     """
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
+        try:
+            return path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return path.read_text(encoding="mbcs", errors="replace")
     except OSError:
         return ""
 

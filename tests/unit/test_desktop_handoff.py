@@ -419,6 +419,19 @@ class TestRunOnDesktopOnWindows:
         assert "hello out" in result.stdout
         assert "hello err" in result.stderr
 
+    def test_an_accent_the_child_wrote_comes_back_intact(self, fake_schtasks):
+        # The desktop copy's stdout is a FILE, so Python writes it in the ANSI
+        # code page, not UTF-8 -- and reading it back as UTF-8 relayed every
+        # accented letter in a project name or path as U+FFFD. The accent is a
+        # Python escape so the child's ARGV stays ASCII: this pins the output
+        # leg alone.
+        result = self._plat().run_on_desktop(
+            [sys.executable, "-c", "print('caf\\u00e9')"], timeout_s=60
+        )
+
+        assert result.rc == 0, result.detail
+        assert result.stdout.strip() == "café"
+
     def test_the_child_can_never_hand_off_again(self, fake_schtasks):
         # A hand-off that landed in Session 0 again and handed off in turn
         # would be a recursion whose every level writes a scheduled task.
@@ -931,6 +944,37 @@ class TestTheExitCodeIsFinalOnlyAsAnInteger:
         assert "hello err" in result.stderr
         assert work.exists()
         assert f"scratch left at {work}" in result.detail
+
+
+@pytestmark_win
+class TestTheRelayedTextDecodes:
+    """out.txt and err.txt hold whatever encoding the CHILD chose, and the
+    reader has to take both answers a Python child can give."""
+
+    def test_utf8_is_read_as_utf8(self, tmp_path):
+        from magent.platform.windows import _read_handoff_text
+
+        out = tmp_path / "out.txt"
+        # A child in Python's UTF-8 mode writes this. Tried first, so the
+        # ANSI fallback can never turn it into mojibake.
+        out.write_bytes("café 中\r\n".encode())
+
+        assert _read_handoff_text(out) == "café 中\n"
+
+    def test_the_ansi_code_page_is_the_fallback(self, tmp_path):
+        from magent.platform.windows import _read_handoff_text
+
+        out = tmp_path / "out.txt"
+        # What a default child writes into a redirected stdout: the ANSI code
+        # page (mbcs), which is not valid UTF-8 as soon as it holds an accent.
+        out.write_bytes("café\r\n".encode("mbcs"))
+
+        assert _read_handoff_text(out) == "café\n"
+
+    def test_an_absent_file_still_reads_empty(self, tmp_path):
+        from magent.platform.windows import _read_handoff_text
+
+        assert _read_handoff_text(tmp_path / "out.txt") == ""
 
 
 @pytestmark_win
