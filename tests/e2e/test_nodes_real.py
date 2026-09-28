@@ -872,16 +872,17 @@ class TestANodeHostsAProjectEndToEnd:
     ) -> None:
         _needs(rig, "D10")
         _needs(rig, "D14")
-        # A live sync daemon pulls on its own: the final-pull check below
-        # would pass without down's pull.
-        pid = rig.live_daemon()
-        if pid is not None:
+        # A live sync daemon pulls on its own, and so can one a still-running
+        # serve starts mid-stage: the final-pull check below would pass
+        # without down's pull.
+        pullers = ", ".join(rig.self_pullers())
+        if pullers:
             if "D15" not in rig.passed:
                 pytest.skip(
-                    f"prerequisite D15 did not pass and left sync daemon pid {pid} "
-                    "running: down's own final pull cannot be told apart from it"
+                    f"prerequisite D15 did not pass and left {pullers} running: "
+                    "down's own final pull cannot be told apart from theirs"
                 )
-            pytest.fail(f"sync daemon pid {pid} still running after D15 stopped it")
+            pytest.fail(f"{pullers} still running after D15 stopped them")
         tok = token()
         rig.poke(tok)
         rig.reset_shim()

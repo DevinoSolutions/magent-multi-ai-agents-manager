@@ -1047,6 +1047,15 @@ class NodeRig:
             return None
         return pid if is_sync_daemon(_cmdline(pid), pc.cfg) else None
 
+    def self_pullers(self) -> list[str]:
+        """What on the PC side pulls from the node on its own: this PC's live
+        ``node sync`` daemon, and a spawned serve still running (its
+        supervisor can start a daemon at any moment). A stage that checks a
+        pull of its own needs none of them."""
+        pid = self.live_daemon()
+        found = [] if pid is None else [f"sync daemon pid {pid}"]
+        return found + [f"serve pid {p.pid}" for p in self.spawned if p.poll() is None]
+
     def shim_calls(self) -> list[list[str]]:
         return read_shim(self.shim_log)
 

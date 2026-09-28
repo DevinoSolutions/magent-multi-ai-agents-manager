@@ -621,6 +621,27 @@ class TestCloseKillsOnlyWhatItOwns:
         monkeypatch.setattr(rig, "_cmdline", lambda pid: ours)
         assert built.live_daemon() == _DAEMON_PID
 
+    def test_a_still_running_serve_pulls_on_its_own_too(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # D13 reads this: serve's supervisor can start a daemon mid-stage.
+        built = _offline_rig(tmp_path)
+        assert built.self_pullers() == []
+        exited = SimpleNamespace(pid=77, poll=lambda: 0)
+        running = SimpleNamespace(pid=78, poll=lambda: None)
+        built.spawned.extend([exited, running])
+        assert built.self_pullers() == ["serve pid 78"]
+        pc = built.pcs[0]
+        (pc.home / ".magent" / "node-sync.pid").write_text(
+            f"{_DAEMON_PID}\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(rig, "alive", lambda pid, budget: pid == _DAEMON_PID)
+        monkeypatch.setattr(rig, "_cmdline", lambda pid: _daemon_cmdline(str(pc.cfg)))
+        assert built.self_pullers() == [
+            f"sync daemon pid {_DAEMON_PID}",
+            "serve pid 78",
+        ]
+
     def test_a_timed_out_user_delete_is_a_problem_not_a_raise(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
