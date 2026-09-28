@@ -1775,6 +1775,22 @@ def placed_api(api_repo, tmp_config):
 
 
 @pytest.fixture
+def memory_only(api_repo, tmp_config):
+    """api is auto-placed on @second, and all that was ever pulled is its
+    memory: a folder with no conversation to resume."""
+    nodes.update_node_map("api", entry("second"))
+    memory = nodes.transcripts_dir("second", "api") / "memory"
+    memory.mkdir(parents=True)
+    (memory / "MEMORY.md").write_text("- remember\n", encoding="utf-8")
+    return tmp_config(
+        config_json(
+            ("second", "third"),
+            [{"path": str(api_repo), "title": "api", "node": "auto"}],
+        )
+    )
+
+
+@pytest.fixture
 def node_answers(monkeypatch):
     """A reachable @second: records each remote step in order."""
     events: list[tuple[object, ...]] = []
@@ -2099,6 +2115,24 @@ class TestRecallLocal:
         assert f'    cd "{api_repo}"\n    claude\n' in result.stdout
         assert "--resume" not in result.stdout
         assert "&&" not in result.stdout
+
+    def test_a_memory_only_pull_is_installed_and_claude_starts_fresh(
+        self, runner, memory_only, node_answers, api_repo, monkeypatch
+    ):
+        # Round-2 ruling: what was pulled is installed with or without a
+        # conversation in it -- and is never called one.
+        monkeypatch.chdir(api_repo)
+
+        result = _recall(runner, memory_only, "--local")
+
+        dest = _claude_dir(api_repo)
+        assert result.exit_code == 0
+        assert (dest / "memory" / "MEMORY.md").read_text(
+            encoding="utf-8"
+        ) == "- remember\n"
+        assert f"installed what was pulled into {dest}" in result.stdout
+        assert "the conversation" not in result.stdout
+        assert f'    cd "{api_repo}"\n    claude\n' in result.stdout
 
     def test_a_project_that_is_not_placed_exits_2(
         self, runner, api_repo, tmp_config, node_answers
@@ -3919,6 +3953,28 @@ class TestRecallTo:
         assert result.exit_code == 0
         assert events == [("bring_up", "third", None)]
         assert "api starts fresh on @third" in result.stdout
+        assert "api runs on @third\n" in result.stdout
+
+    def test_a_memory_only_pull_is_installed_and_the_session_starts_fresh(
+        self, runner, memory_only, node_answers, moving
+    ):
+        # Round-2 ruling: --local installs a pulled folder that holds only
+        # memory/, so --to does too; with no conversation, none is resumed.
+        events, _ = moving
+
+        result = _invoke_recall_to(runner, memory_only, "third")
+
+        assert result.exit_code == 0
+        assert [e[0] for e in events] == ["install", "bring_up"]
+        assert events[0][3] == nodes.transcripts_dir("second", "api")
+        assert events[1] == ("bring_up", "third", None)
+        assert f"installed what was pulled on @third in {_landed()}" in result.stdout
+        assert (
+            "no conversation was pulled from @second for api;"
+            " api starts fresh on @third"
+        ) in result.stdout
+        assert "the conversation" not in result.stdout
+        assert "nothing was ever pulled" not in result.stdout
         assert "api runs on @third\n" in result.stdout
 
     def test_a_failed_fresh_bring_up_never_claims_an_install(

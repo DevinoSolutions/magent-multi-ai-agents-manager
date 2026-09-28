@@ -1194,6 +1194,13 @@ def _shell_folder() -> Path | None:
         return None
 
 
+def _pulled_what(resume_id: str | None) -> str:
+    """What a recall installs, as its lines name it: a pulled folder with no
+    conversation in it (memory/ only) is installed all the same, and never
+    called one."""
+    return "the conversation" if resume_id is not None else "what was pulled"
+
+
 def _recall_local(
     held: NodeMapEntry,
     name: str,
@@ -1214,6 +1221,7 @@ def _recall_local(
     # config dir here instead of None, or recall installs into the wrong store.
     dest = claude._projects_dir(None, str(local_dir))
     pulled = nodes.transcripts_dir(held.nick, held.sid)
+    what = _pulled_what(resume_id)
     if pulled.is_dir():
         try:
             # --to's rules (cq-G14 M3): no link followed, no pull temp copied.
@@ -1228,10 +1236,10 @@ def _recall_local(
             # The error CLASS only on screen (str(exc) carries a path); the
             # full error goes to nodes.log.
             log.get_logger("nodes").warning(
-                "recall could not install the conversation into %s: %s", dest, exc
+                "recall could not install %s into %s: %s", what, dest, exc
             )
             _fail(
-                f"could not install the conversation into {dest}"
+                f"could not install {what} into {dest}"
                 f" ({type(exc).__name__}); {name} stays placed on @{held.nick}"
                 " -- run the recall again",
                 1,
@@ -1244,7 +1252,7 @@ def _recall_local(
                 f"replaced {len(replaced)} file(s) already in {dest} with the"
                 f" node's copy: {node_sync.printable(', '.join(replaced))}"
             )
-        _ok(f"installed the conversation into {dest}")
+        _ok(f"installed {what} into {dest}")
     else:
         _note(
             f"nothing was ever pulled from @{held.nick} for {held.sid};"
@@ -1352,17 +1360,21 @@ def _recall_to(
     from magent import launch, node_sync, nodes, remote_mux
 
     name = nodes.project_name(proj)
-    if resume_id is not None:
+    pulled = nodes.transcripts_dir(held.nick, held.sid)
+    what = _pulled_what(resume_id)
+    # What --local installs, --to installs: the whole pulled folder, its
+    # memory/ too when no conversation came with it.
+    if pulled.is_dir():
         try:
             installed = remote_mux.install_transcripts(
                 target,
                 remote_root,
-                nodes.transcripts_dir(held.nick, held.sid),
+                pulled,
                 timeout_s=remote_mux.INSTALL_TIMEOUT_S,
             )
         except remote_mux.RemoteError as exc:
             _fail(
-                f"could not install the conversation on @{target.nick}"
+                f"could not install {what} on @{target.nick}"
                 f" ({_tail(exc)}); {name} stays placed on @{held.nick} --"
                 f" `magent up {name}` resumes it there",
                 _EXIT_UNREACHABLE,
@@ -1370,7 +1382,7 @@ def _recall_to(
         except nodes.NodeConfigError as exc:
             # A root the install will not send, refused before any dial.
             _fail(
-                f"could not install the conversation on @{target.nick}"
+                f"could not install {what} on @{target.nick}"
                 f" ({node_sync.printable(str(exc))});"
                 f" {name} stays placed on @{held.nick}",
                 _EXIT_USAGE,
@@ -1379,11 +1391,16 @@ def _recall_to(
         # only on this screen. Forward correction (plan G :4015): the line
         # names .landed and prints .note, never the object.
         _ok(
-            f"installed the conversation on @{target.nick} in"
+            f"installed {what} on @{target.nick} in"
             f" {node_sync.printable(installed.landed)}"
         )
         if installed.note:
             _note(node_sync.printable(installed.note))
+        if resume_id is None:
+            _note(
+                f"no conversation was pulled from @{held.nick} for {held.sid};"
+                f" {name} starts fresh on @{target.nick}"
+            )
     else:
         _note(
             f"nothing was ever pulled from @{held.nick} for {held.sid};"
