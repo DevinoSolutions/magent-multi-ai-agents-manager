@@ -301,7 +301,14 @@ class SettingsParseError(RuntimeError):
     round-tripping it through ``json.dump`` would silently delete the user's
     comments, and guessing at a repair could corrupt a working terminal. The
     caller prints the manual snippet instead.
+
+    ``maybe_jsonc`` is False when JSONC cannot be the explanation, and the
+    callers then leave out the comments-and-trailing-commas hint.
     """
+
+    def __init__(self, reason: str, *, maybe_jsonc: bool = True) -> None:
+        super().__init__(reason)
+        self.maybe_jsonc = maybe_jsonc
 
 
 def load_settings(path: Path) -> dict[str, object]:
@@ -312,7 +319,10 @@ def load_settings(path: Path) -> dict[str, object]:
     except RecursionError as exc:
         # JSON nested past the parser's depth. Not a ValueError, but a file we
         # cannot parse all the same, and every caller refuses those by name.
-        raise SettingsParseError("settings.json is nested too deeply to parse") from exc
+        # Not JSONC either: no comment or trailing comma nests anything.
+        raise SettingsParseError(
+            "settings.json is nested too deeply to parse", maybe_jsonc=False
+        ) from exc
     if not isinstance(data, dict):
         raise SettingsParseError("settings.json is not a JSON object")
     return data

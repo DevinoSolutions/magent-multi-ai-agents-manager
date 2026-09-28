@@ -219,6 +219,9 @@ class TestJsoncRefusal:
         assert "sendInput" in result.output
         assert CTRL_W_ESCAPE in result.output
         assert ESC_CR_ESCAPE in result.output
+        assert "Windows Terminal accepts comments and trailing commas" in (
+            result.output
+        )
 
     def test_status_reports_unreadable_without_writing(self, runner, tmp_path):
         path = tmp_path / "settings.json"
@@ -226,6 +229,7 @@ class TestJsoncRefusal:
         result = _status(runner, path)
         assert result.exit_code == 0
         assert "unreadable" in result.output
+        assert "Windows Terminal allows JSONC" in result.output
 
 
 class TestNestedPastTheParsersDepth:
@@ -270,6 +274,36 @@ class TestNestedPastTheParsersDepth:
         assert "shift+enter" not in result.output
         assert "not found" not in result.output
         assert path.read_bytes() == _NESTED.encode("utf-8")
+
+    # Nesting is not JSONC: the comments-and-trailing-commas hint would send
+    # the file's owner looking for syntax that is not there.
+
+    def test_install_refuses_without_the_jsonc_hint(self, runner, tmp_path):
+        path = self._nested(tmp_path)
+
+        result = _install(runner, path)
+
+        assert result.stderr == (
+            f"  x Cannot edit {path}: settings.json is nested too deeply to parse\n"
+        )
+        assert result.stdout.startswith(
+            "  magent never rewrites a file it could not read. "
+            "Add this by hand instead:\n\n    "
+        )
+        assert "comments" not in result.output
+        assert "JSONC" not in result.output
+
+    def test_status_reports_without_the_jsonc_hint(self, runner, tmp_path):
+        path = self._nested(tmp_path)
+
+        result = _status(runner, path)
+
+        assert result.output == (
+            f"  {path}\n"
+            "  ! unreadable: settings.json is nested too deeply to parse\n"
+            "  magent will not rewrite a file it cannot parse. Run\n"
+            "  `magent terminal install` for the snippet to paste by hand.\n"
+        )
 
 
 class TestBackup:
