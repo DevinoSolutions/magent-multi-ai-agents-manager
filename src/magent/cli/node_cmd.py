@@ -1,10 +1,10 @@
 """`magent node`: run projects on a pool of Linux machines over ssh.
 
-This module starts with `node sync`, the daemon that mirrors the pool onto
-this PC; the other subcommands arrive with their own sub-plans. Exit codes and
-lines live here, the work in magent.node_sync (imported in-body: the
-registration hub imports every command module, and `magent --help` must not
-pay for ssh and tar).
+The bare group prints the pool; its subcommands are `node sync` (the daemon
+that mirrors the pool onto this PC), `plan`, `push` and `recall`. Exit codes
+and lines live here, the work in magent.node_sync, nodes, remote_mux and
+launch (imported in-body: the registration hub imports every command module,
+and `magent --help` must not pay for ssh and tar).
 """
 
 from __future__ import annotations
