@@ -521,10 +521,12 @@ except OSError:
 )
 
 # A child with no grandchild that says argv[1] on stderr, then floods stdout.
-# When the reader stops at the cap it keeps stderr open and waits: the stream
-# ends only when the kill reaches it, as ssh's own stderr does.
-_KILLED_STDERR_CHILD = """\
-import sys, time
+# When the reader stops at the cap, argv[2] says how its stderr ends: "killed"
+# keeps it open and waits, so it ends only when the kill reaches it, as ssh's
+# own stderr does; "dies-at-the-pipe" leaves at once without a word, ending it
+# ON ITS OWN -- but after the cap, as a writer killed by SIGPIPE does.
+_PLAIN_STDERR_CHILD = """\
+import os, sys, time
 sys.stderr.write(sys.argv[1])
 sys.stderr.flush()
 block = b"x" * 65536
@@ -533,7 +535,9 @@ try:
         sys.stdout.buffer.write(block)
         sys.stdout.flush()
 except OSError:
-    time.sleep(60)
+    if sys.argv[2] == "killed":
+        time.sleep(60)
+    os._exit(1)
 """
 
 
@@ -683,7 +687,9 @@ class TestTheReplyIsBoundedInMemory:
         error, _ = self._flood_past_a_held_stderr(tmp_path)
         assert "boom: disk full" in error.stderr_tail.splitlines()[1:]
 
-    @pytest.fixture(params=["as-it-comes", "pipe-closed-first", "kill-read-first"])
+    @pytest.fixture(
+        params=["as-it-comes", "pipe-closed-first", "kill-read-first", "main-late"]
+    )
     def kill_order(self, request, monkeypatch):
         """What comes first after the cap. ``pipe-closed-first`` holds the kill
         back, so the child always writes into the pipe the reader closed first
@@ -691,7 +697,10 @@ class TestTheReplyIsBoundedInMemory:
         be just what it said. ``kill-read-first`` lets the kill land in full
         before _spawn goes on: a stream the kill ended has been read to its
         end, and looks just like one that ended on its own to any question
-        asked after the kill."""
+        asked after the kill. ``main-late`` holds _spawn back once the cap is
+        passed, before it kills anything: a writer that dies at the closed
+        pipe has ended its stream ON ITS OWN by then -- after the cap, which
+        no question about "ended yet?" can tell from before it."""
         kill = remote_mux._kill
         if request.param == "pipe-closed-first":
 
@@ -707,6 +716,21 @@ class TestTheReplyIsBoundedInMemory:
                 time.sleep(0.5)
 
             monkeypatch.setattr(remote_mux, "_kill", settled_kill)
+        elif request.param == "main-late":
+            finish = remote_mux._finish
+
+            def late_finish(
+                proc: subprocess.Popen[bytes],
+                out: remote_mux._Drain,
+                err: remote_mux._Drain,
+                timeout_s: float,
+            ) -> bool:
+                done = finish(proc, out, err, timeout_s)
+                if out.over:
+                    time.sleep(1.0)
+                return done
+
+            monkeypatch.setattr(remote_mux, "_finish", late_finish)
 
     @pytest.mark.usefixtures("kill_order")
     def test_a_stderr_held_open_mid_line_never_hands_over_the_fragment(self, tmp_path):
@@ -729,11 +753,15 @@ class TestTheReplyIsBoundedInMemory:
         assert launch._node_error_text(error) == f"reply exceeded {CAP} bytes"
 
     @pytest.mark.usefixtures("kill_order")
-    def test_a_stderr_the_kill_ended_mid_line_never_hands_over_the_fragment(self):
-        # No grandchild: the kill ends the stream, as it ends ssh's own. That
-        # is no end of the child's saying -- the kill cut it off wherever it
-        # was -- so the half line goes just as from a stream still open. The
-        # base interpreter, for the reason the next pin gives.
+    @pytest.mark.parametrize("ending", ["killed", "dies-at-the-pipe"])
+    def test_a_stderr_that_ended_after_the_cap_never_hands_over_the_fragment(
+        self, ending
+    ):
+        # No grandchild: the stream ends after the cap, by the kill (as ssh's
+        # own does) or by the writer dying at the pipe the cap closed. Neither
+        # is the end of the child's saying -- it was cut off wherever it was
+        # -- so the half line goes just as from a stream still open. The base
+        # interpreter, for the reason the next pin gives.
         python = getattr(sys, "_base_executable", sys.executable)
         with pytest.raises(RemoteError) as exc:
             remote_mux._spawn(
@@ -741,8 +769,9 @@ class TestTheReplyIsBoundedInMemory:
                     python,
                     "-I",
                     "-c",
-                    _KILLED_STDERR_CHILD,
+                    _PLAIN_STDERR_CHILD,
                     "boom: disk full\nwriting blo",
+                    ending,
                 ],
                 timeout_s=60,
                 input_bytes=None,
@@ -760,19 +789,19 @@ class TestTheReplyIsBoundedInMemory:
         assert launch._node_error_text(exc.value) == "boom: disk full"
 
     def test_a_stderr_that_ended_keeps_its_last_line_without_a_newline(self):
-        # A stream that ended BEFORE the kill was not cut off mid-write, so its
+        # A stream that ended BEFORE the cap was not cut off mid-write, so its
         # last line is whole even unterminated: any other is trimmed. The child
         # pauses after closing it, so the stream has ended well before the
-        # flood can reach the cap: the pause sets the order, not a race. The base
-        # interpreter, not sys.executable: on Windows that is a venv launcher
-        # holding its own copy of the pipe, so the stream would end only once
-        # the kill reached through it.
+        # flood can reach the cap: the pause sets the order, not a race. The
+        # base interpreter, not sys.executable: on Windows that is a venv
+        # launcher holding its own copy of the pipe, so the stream would end
+        # only once the kill reached through it.
         child = (
             "import os, sys, time\n"
             "sys.stderr.write('boom: disk full')\n"
             "sys.stderr.flush()\n"
             "os.close(2)\n"
-            "time.sleep(0.2)\n"
+            "time.sleep(0.3)\n"
             "block = b'x' * 65536\n"
             "while True:\n"
             "    sys.stdout.buffer.write(block)\n"

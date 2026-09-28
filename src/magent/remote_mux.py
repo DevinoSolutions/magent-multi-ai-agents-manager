@@ -283,7 +283,9 @@ class _Drain(threading.Thread):
     finished. ``data`` HANDS OVER what is held and forgets it -- a second call
     returns only what arrived since -- and may be taken before the thread has
     finished, as what has arrived so far: a grandchild can hold a pipe open
-    long after the child is gone."""
+    long after the child is gone. ``over_at`` and ``ended_at`` stamp, on the
+    monotonic clock, the read that passed the cap and the end of the read --
+    so one drain can say whether its stream ended before another's cap."""
 
     def __init__(self, pipe: IO[bytes] | None, cap: int, *, tail: bool) -> None:
         super().__init__(daemon=True)
@@ -295,6 +297,8 @@ class _Drain(threading.Thread):
         self._chunks: deque[bytes] = deque()
         self._held = 0
         self.over = False
+        self.over_at: float | None = None
+        self.ended_at: float | None = None
 
     def run(self) -> None:
         if self._pipe is None:
@@ -304,6 +308,8 @@ class _Drain(threading.Thread):
             with contextlib.suppress(OSError):
                 self._read(self._pipe.fileno())
         finally:
+            # After the last chunk is held: all this drain will ever hold.
+            self.ended_at = time.monotonic()
             with contextlib.suppress(OSError):
                 self._pipe.close()
 
@@ -314,6 +320,7 @@ class _Drain(threading.Thread):
             with self._lock:
                 if not self._tail and self._held + len(chunk) > self._cap:
                     self.over = True
+                    self.over_at = time.monotonic()
                     self._chunks.clear()
                     self._held = 0
                     return
@@ -468,10 +475,6 @@ def _spawn(
             timed_out=True,
         )
     if out.over:
-        # Had stderr ended on its OWN? Asked before the kill: after it every
-        # stream has ended, and one the kill ended was cut off wherever the
-        # writer was -- mid-line, just like one still held open.
-        ended = not err.is_alive()
         _kill(proc)
         if not quiet:
             get_logger("nodes").warning(
@@ -486,12 +489,20 @@ def _spawn(
         # to be read -- and what it delivered is reported either way: a
         # grandchild may hold it open long after the child is gone, and the
         # words already read are no less the child's. Only a stream that ended
-        # before the kill is whole to its last byte; any other may stop
-        # mid-line, and a fragment is no reason: only its whole lines are
-        # kept. One that ends on its own between the question and the kill is
-        # trimmed too -- a last line omitted, never a half-line kept.
+        # BEFORE the cap is whole to its last byte: the child had finished
+        # saying it. One that ended after -- by the kill, or by a writer dead
+        # at the pipe the cap closed -- or is still open may stop mid-line,
+        # and a fragment is no reason: only its whole lines are kept. The
+        # drains' own clocks say which came first; a tie, or a drain that
+        # read its end late, trims -- a last line omitted, never a half-line
+        # kept.
         err.join(_REAP_TIMEOUT_S)
         held = err.data()
+        ended = (
+            err.ended_at is not None
+            and out.over_at is not None
+            and err.ended_at < out.over_at
+        )
         said = _tail(held if ended else held[: held.rfind(b"\n") + 1])
         # Killed mid-call, so the remote may still be running; but the node
         # answered, so it is not unreachable (timed_out stays False).
